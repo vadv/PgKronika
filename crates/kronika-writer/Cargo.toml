@@ -1,6 +1,6 @@
 [package]
 name = "kronika-writer"
-description = "Write path: string interner, buffers, parts journal, merge and seal"
+description = "Writer-side segment state and active.parts journal"
 publish = false
 version.workspace = true
 edition.workspace = true

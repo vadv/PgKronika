@@ -1,15 +1,17 @@
 //! File-backed `active.parts` journal.
 //!
 //! `kronika-format` defines frame bytes and recovery classification. This
-//! module handles the file: durable appends with `fdatasync`, truncation of a
-//! torn tail on open, and reads for the merge path.
+//! module handles the file: validated appends, file sync, recovery on open,
+//! truncation of an incomplete final frame, and reads for later merging.
 //!
 //! Recovery policy:
 //!
-//! - a torn tail is normal after a crash: the file is truncated to the
-//!   last valid frame and writing continues;
-//! - middle damage and a quarantined tail are reported in [`OpenReport`];
-//! - quarantined bytes stay on disk, and new frames are appended after them.
+//! - an incomplete final frame is normal after a crash: the file is truncated
+//!   to the last valid frame and writing continues;
+//! - damage in the middle of the file, or damage at the end that is not a
+//!   partial write, is reported in [`OpenReport`];
+//! - damaged bytes that cannot be repaired stay on disk, and new frames are
+//!   appended after them.
 
 use std::error::Error;
 use std::fmt;
@@ -34,9 +36,10 @@ pub enum JournalError {
         /// The configured limit, bytes.
         max: u64,
     },
-    /// The part is not a valid mini-PGM: writing it would poison the
-    /// journal, because recovery would classify the frame as damaged
-    /// and drop the part.
+    /// The part is not a valid mini-PGM.
+    ///
+    /// Writing it would make the next recovery scan classify the frame as
+    /// damaged and skip the part.
     InvalidPart(PartError),
     /// The part reference does not point into the current journal, e.g.
     /// it was kept across a [`Journal::reset`].
@@ -87,12 +90,12 @@ impl From<std::io::Error> for JournalError {
 pub struct OpenReport {
     /// Valid parts and damaged regions found during recovery.
     pub scan: ScanReport,
-    /// Whether a torn tail was truncated.
+    /// Whether recovery truncated an incomplete final frame.
     pub truncated_torn_tail: bool,
 }
 
 impl OpenReport {
-    /// Return whether recovery found damage other than an ordinary torn tail.
+    /// Return whether recovery found damage other than an incomplete final frame.
     #[must_use]
     pub fn has_media_damage(&self) -> bool {
         self.scan
@@ -104,13 +107,12 @@ impl OpenReport {
 
 /// Open `active.parts` file.
 ///
-/// Each appended frame is written and `fdatasync`ed before [`Journal::append`]
-/// returns.
+/// Each appended frame is written and synced before [`Journal::append`] returns.
 #[derive(Debug)]
 pub struct Journal {
     file: File,
     /// Append position: either the end of the last valid frame or the end of a
-    /// preserved quarantined tail.
+    /// damaged final region kept for diagnostics.
     end: usize,
     limits: JournalLimits,
     parts: Vec<PartRef>,
@@ -119,9 +121,9 @@ pub struct Journal {
 impl Journal {
     /// Open or create the journal at `path`, then scan it for recovery.
     ///
-    /// A torn tail is truncated immediately and the file is synced. Other
-    /// damaged regions are reported but left on disk; new frames are appended
-    /// after them.
+    /// An incomplete final frame is truncated immediately and the file is
+    /// synced. Other damaged regions are reported but left on disk; new frames
+    /// are appended after them.
     ///
     /// # Errors
     ///
@@ -139,11 +141,11 @@ impl Journal {
         let bytes = std::fs::read(path)?;
         let scan = scan_journal(&bytes, limits);
 
-        let torn = scan
+        let has_incomplete_final_frame = scan
             .damages
             .last()
             .is_some_and(|damage| damage.kind == kronika_format::DamageKind::TornTail);
-        let end = if torn {
+        let end = if has_incomplete_final_frame {
             file.set_len(scan.valid_len as u64)?;
             file.sync_data()?;
             scan.valid_len
@@ -159,7 +161,7 @@ impl Journal {
         };
         let report = OpenReport {
             scan,
-            truncated_torn_tail: torn,
+            truncated_torn_tail: has_incomplete_final_frame,
         };
         Ok((journal, report))
     }
@@ -179,18 +181,18 @@ impl Journal {
                 max: self.limits.max_part_len,
             });
         }
-        // An invalid body would be framed and synced fine, but the next
-        // recovery scan would classify the frame as damaged and drop it:
-        // a writer bug upstream must fail loudly here instead.
+        // An invalid body would be framed and synced, but the next recovery
+        // scan would report the frame as damage and skip it. Treat that as a
+        // writer bug and fail before writing.
         validate_part(part).map_err(JournalError::InvalidPart)?;
 
         let header = FrameHeader { part_len }.encode();
         if let Err(err) = self.write_frame(&header, part) {
             // Roll the file back so a half-written frame from a transient
-            // I/O error does not survive as permanent garbage that later
-            // appends would bury and recovery would report as damage.
-            // Best effort: if the truncation also fails, the next open
-            // truncates the torn frame anyway.
+            // I/O error does not remain on disk where later appends would
+            // push it into the middle of the journal.
+            // If truncation also fails, the next open truncates the
+            // incomplete frame.
             self.file.set_len(self.end as u64).ok();
             return Err(err.into());
         }
@@ -245,7 +247,7 @@ impl Journal {
         Ok(body)
     }
 
-    /// Empty the journal after a successful seal.
+    /// Empty the journal after a segment has been completed successfully.
     ///
     /// # Errors
     ///
@@ -341,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn torn_tail_is_truncated_on_open() {
+    fn incomplete_final_frame_is_truncated_on_open() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = temp_journal_path(&dir);
         let part = sample_part();
@@ -353,11 +355,11 @@ mod tests {
 
         // Simulate a crash mid-append: a complete header, half a body.
         let mut file = OpenOptions::new().append(true).open(&path).expect("raw");
-        let torn = FrameHeader {
+        let partial_frame_header = FrameHeader {
             part_len: part.len() as u64,
         }
         .encode();
-        file.write_all(&torn).expect("write");
+        file.write_all(&partial_frame_header).expect("write");
         file.write_all(&part[..part.len() / 2]).expect("write");
         drop(file);
 
@@ -369,12 +371,12 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&path).expect("metadata").len(),
             valid_len as u64,
-            "the torn frame is gone from disk"
+            "the incomplete frame is gone from disk"
         );
     }
 
     #[test]
-    fn quarantined_tail_is_preserved_and_appendable() {
+    fn damaged_final_region_is_preserved_and_appendable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = temp_journal_path(&dir);
         let part = sample_part();
@@ -385,13 +387,13 @@ mod tests {
 
         // Media damage at the end: a full frame with a corrupted header,
         // not a truncation.
-        let mut garbage = FrameHeader {
+        let mut bad_header = FrameHeader {
             part_len: part.len() as u64,
         }
         .encode();
-        garbage[0] ^= 0xFF;
+        bad_header[0] ^= 0xFF;
         let mut file = OpenOptions::new().append(true).open(&path).expect("raw");
-        file.write_all(&garbage).expect("write");
+        file.write_all(&bad_header).expect("write");
         file.write_all(&part).expect("write");
         drop(file);
         let damaged_len = std::fs::metadata(&path).expect("metadata").len();
@@ -404,12 +406,12 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&path).expect("metadata").len(),
             damaged_len,
-            "quarantined bytes stay on disk for diagnostics"
+            "damaged bytes stay on disk for diagnostics"
         );
 
-        // New frames land after the quarantined region and are found by
-        // resynchronization on the next recovery.
-        let appended = journal.append(&part).expect("append after quarantine");
+        // New frames are appended after the damaged region and found on the
+        // next recovery scan.
+        let appended = journal.append(&part).expect("append after damage");
         drop(journal);
         let (mut journal, report) = Journal::open(&path, small_limits()).expect("rescan");
         assert!(report.has_media_damage());
@@ -453,8 +455,8 @@ mod tests {
         let path = temp_journal_path(&dir);
 
         let (mut journal, _) = Journal::open(&path, small_limits()).expect("open");
-        // A valid-by-size but garbage body would be framed and synced,
-        // then silently dropped as damage by the next recovery scan.
+        // A valid-by-size but invalid body would be framed and synced, then
+        // reported as damage and skipped by the next recovery scan.
         assert!(matches!(
             journal.append(b""),
             Err(JournalError::InvalidPart(_))

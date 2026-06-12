@@ -1,8 +1,8 @@
 //! Writer-side state for building PGM segments.
 //!
-//! The implemented pieces today are the per-segment string interner and the
-//! `active.parts` journal. Later steps add per-type buffers, merge, seal, and
-//! Parquet encoding.
+//! The crate currently contains the per-segment string interner and the
+//! `active.parts` journal. Later steps add per-type buffers, part merging,
+//! segment completion, and Parquet encoding.
 
 mod interner;
 mod journal;

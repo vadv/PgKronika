@@ -2,42 +2,58 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-writer` is the collector's write path: everything between data
-sources and a sealed `.pgm` segment. `kronika-format` defines the byte
-layout; this crate keeps the write-time state needed to produce it.
+`kronika-writer` keeps collector state while a segment is being written. It sits
+between data sources and a finished `.pgm` segment. `kronika-format` defines
+the bytes on disk; this crate decides when writer state is flushed to disk and
+what must remain in memory while the segment is being built.
 
-## Implemented Scope
+## Current Contents
 
 The crate currently exposes:
 
-- `Interner` — the per-segment string interner over
+- `Interner`, the per-segment string interner over
   `kronika_format::SegmentDicts`;
-- `Journal` — the file-backed `active.parts` journal.
+- `Journal`, the file-backed `active.parts` journal.
 
-The interner keeps memory bounded while preserving dictionary placement rules:
+## Interner
 
-- the current window stores full bytes for values that have not yet been
-  flushed to the journal;
-- the flushed map stores only value identity and placement requirements for
-  values already written to `active.parts`;
-- `flush_window()` writes the current window through a caller-provided journal
-  callback, then keeps only hashes and placement requirements;
-- `seal()` returns the residual window plus placement directives for flushed
-  values, then starts the next segment empty;
-- `stats()` — dictionary sizes for the collector's self-metrics.
+`Interner` has two layers.
+
+The window is the current dictionary batch in memory. It keeps full bytes for
+values that have not yet been written to `active.parts`.
+
+Flushed entries track values already written to the journal. They keep length,
+a SHA-256 prefix, and placement requirements, but not the original text. That
+lets repeated SQL texts and plans be deduplicated without keeping every byte in
+memory until the segment is finished.
+
+`flush_window()` calls the provided write function with the current window. If
+the write succeeds, the window is converted into flushed entries and cleared.
+If the write fails, the window is left unchanged.
+
+`seal()` returns the remaining window and final placement directives for values
+already written to the journal. The next segment starts with an empty interner.
+`stats()` reports dictionary sizes for collector metrics.
 
 A failed interning call (collision, placement conflict) changes neither
-the window nor the flushed map.
+the window nor the flushed entries.
 
-The journal appends mini-PGM parts as `PGMP` frames. Opening an existing journal
-runs the recovery scan from `kronika-format`:
+## Journal
 
-- a torn tail is truncated and writing continues;
-- middle damage and a quarantined tail are reported in `OpenReport`;
-- `append()` writes one frame and syncs the file before returning;
-- `reset()` empties the journal after a successful seal.
+`Journal` appends mini-PGM parts as `PGMP` frames and syncs each frame before
+returning. Opening an existing journal runs the recovery scan from
+`kronika-format`.
 
-## Not Here Yet
+If the last frame was only partly written, the file is truncated to the last
+valid frame and writing continues. Damage in the middle of the file, or damage
+at the end that is not a partial write, is reported in `OpenReport` and left on
+disk for diagnostics.
 
-Per-type buffers, merge, seal, and Parquet encoding arrive in later steps. The
-dictionary and frame-byte rules are defined in `kronika-format`.
+`append()` writes one frame. `reset()` clears the journal after a segment has
+been completed successfully.
+
+## Not Implemented Yet
+
+Per-type buffers, part merging, segment completion, and Parquet encoding arrive
+in later steps. Dictionary placement and journal frame validation are defined in
+`kronika-format`.
