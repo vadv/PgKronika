@@ -1,6 +1,6 @@
 [package]
 name = "kronika-writer"
-description = "pgKronika internal crate"
+description = "Write path: string interner, buffers, parts journal, merge and seal"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-format = { path = "../kronika-format" }
 
 [lints]
 workspace = true

@@ -1,4 +1,4 @@
-//! Property tests for the end catalog (`docs/testing.md`, "Property").
+//! Property tests for the end catalog.
 //!
 //! Two invariants: any catalog survives an encode/decode roundtrip, and
 //! any single-byte corruption of the encoded bytes is detected. Detection
@@ -9,9 +9,11 @@
 use kronika_format::{Catalog, Entry, TAIL_INDEX_LEN, TailIndex};
 use proptest::prelude::*;
 
-// Dev-dependency of unit tests; anchored for the
+// Dependencies of other targets of this crate; anchored for the
 // `unused_crate_dependencies` lint, which checks each target separately.
 use crc as _;
+use sha2 as _;
+use xxhash_rust as _;
 
 fn entry_strategy() -> impl Strategy<Value = Entry> {
     (
