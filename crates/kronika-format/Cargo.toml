@@ -1,6 +1,6 @@
 [package]
 name = "kronika-format"
-description = "pgKronika internal crate"
+description = "PGM container primitives: end catalog, tail index, CRC32C"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -9,6 +9,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+crc = "3"
+
+[dev-dependencies]
+proptest = "1"
 
 [lints]
 workspace = true
