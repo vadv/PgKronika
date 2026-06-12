@@ -2,6 +2,8 @@
 //!
 //! A generated catalog must survive encode/decode. Flipping one byte in the
 //! encoded catalog should make decoding fail.
+//! Detection relies on CRC32C, so a missed corruption is theoretically
+//! possible but unlikely in these generated cases.
 
 use kronika_format::{Catalog, Entry, TAIL_INDEX_LEN, TailIndex};
 use proptest::prelude::*;

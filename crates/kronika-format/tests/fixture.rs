@@ -2,6 +2,8 @@
 //!
 //! The fixture catches drift that a write-then-read roundtrip can miss,
 //! because an encoder and decoder can share the same bug.
+//! The bytes were generated independently from the documented layout and
+//! checked against the canonical CRC32C test vector.
 //!
 //! Layout of the 88-byte file:
 //!

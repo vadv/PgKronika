@@ -33,8 +33,10 @@ enum Op {
 
 /// A conflict-free batch of interning calls.
 ///
-/// A value may appear more than once with compatible requirements. Shuffling
-/// such a batch must not change the final dictionaries.
+/// A value may appear more than once with compatible requirements. This keeps
+/// requirement merging in the generated cases while excluding placement
+/// conflicts that are covered by unit tests. Shuffling such a batch must not
+/// change the final dictionaries.
 fn conflict_free_batch() -> impl Strategy<Value = Vec<(Vec<u8>, Op)>> {
     let value_with_ops = proptest::collection::vec(any::<u8>(), 0..32).prop_flat_map(|bytes| {
         let blob_family = proptest::collection::vec(
