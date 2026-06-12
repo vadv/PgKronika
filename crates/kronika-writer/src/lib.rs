@@ -1,4 +1,10 @@
 //! Write path: string interner, per-type buffers, parts journal, merge and seal.
 //!
-//! See `docs/architecture.md` for the workspace layout and the dependency
-//! rules between crates, and `docs/segment-format.md` for the PGM format.
+//! The crate's scope and its boundary with `kronika-format` (which defines
+//! the byte layout this crate produces) are documented in this crate's
+//! README.md. Buffers, the `active.parts` journal, merge and seal arrive
+//! in later steps.
+
+mod interner;
+
+pub use interner::Interner;
