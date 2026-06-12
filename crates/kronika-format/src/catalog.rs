@@ -254,14 +254,13 @@ impl Catalog {
             });
         }
 
-        // The CRC field participates in the checksum as zeroes. The copy is
-        // one short-lived allocation per segment open; clarity wins over
-        // an incremental-digest micro-optimization here.
+        // The CRC field participates in the checksum as zeroes. Computed
+        // incrementally: decode runs once per part during journal recovery,
+        // and cloning the whole catalog block here would double the peak
+        // memory of that path.
         let stored_crc = u32_at(meta, META_CRC_OFFSET);
-        let mut zeroed = bytes.to_vec();
         let crc_at = bytes.len() - META_LEN + META_CRC_OFFSET;
-        zeroed[crc_at..crc_at + 4].fill(0);
-        let computed = crc32c(&zeroed);
+        let computed = crate::crc::crc32c_with_zeroed_field(bytes, crc_at);
         if stored_crc != computed {
             return Err(DecodeError::BadCrc {
                 stored: stored_crc,

@@ -352,6 +352,10 @@ impl ScanReport {
 ///
 /// The scan walks frames forward, validates every part as a mini-PGM, and
 /// records valid parts plus damaged regions.
+///
+/// The buffer is caller-provided and fully resident. Never read a journal
+/// file into memory to call this: the file-backed journal in
+/// `kronika-writer` streams the same scan with a one-part buffer.
 #[must_use]
 pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
     let mut report = ScanReport::default();

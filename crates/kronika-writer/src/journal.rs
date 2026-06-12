@@ -14,12 +14,13 @@
 //!   appended after them.
 //!
 //! Recovery streams the file frame by frame instead of loading it into
-//! memory: peak memory is one part (bounded by `max_part_len`), a small
-//! search window during resynchronization, and 16 bytes of directory per
-//! recovered frame — never the journal bytes themselves. The journal size
-//! is capped by [`JournalConfig::max_journal_len`]: when an append would
-//! grow the file past the cap, it fails with [`JournalError::Full`], which
-//! is the signal to merge early and reset.
+//! memory: peak memory is one part plus its decoded catalog — at most
+//! twice `max_part_len`, reached only by a pathological all-catalog part —
+//! plus a small search window during resynchronization and 16 bytes of
+//! directory per recovered frame; never the journal bytes themselves. The
+//! journal size is capped by [`JournalConfig::max_journal_len`]: when an
+//! append would grow the file past the cap, it fails with
+//! [`JournalError::Full`], which is the signal to merge early and reset.
 
 use std::error::Error;
 use std::fmt;
@@ -143,20 +144,28 @@ impl From<std::io::Error> for JournalError {
 }
 
 /// Result of opening and scanning a journal file.
+///
+/// Recovered parts are not duplicated here — [`Journal::parts`] owns the
+/// directory. The report carries only the damage findings.
 #[derive(Debug)]
 pub struct OpenReport {
-    /// Valid parts and damaged regions found during recovery.
-    pub scan: ScanReport,
+    /// Damaged regions found during recovery, in journal order.
+    pub damages: Vec<DamageRegion>,
     /// Whether recovery truncated an incomplete final frame.
     pub truncated_torn_tail: bool,
 }
 
 impl OpenReport {
+    /// Return whether recovery found no damage of any kind.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.damages.is_empty()
+    }
+
     /// Return whether recovery found damage other than an incomplete final frame.
     #[must_use]
     pub fn has_media_damage(&self) -> bool {
-        self.scan
-            .damages
+        self.damages
             .iter()
             .any(|damage| damage.kind != DamageKind::TornTail)
     }
@@ -179,10 +188,10 @@ impl Journal {
     /// Open or create the journal at `path`, then scan it for recovery.
     ///
     /// The recovery scan streams the file frame by frame; it holds at most
-    /// one part in memory, plus a 16-byte directory entry per recovered
-    /// frame. An incomplete final frame is truncated immediately and the
-    /// file is synced. Other damaged regions are reported but left on
-    /// disk; new frames are appended after them.
+    /// one part and its decoded catalog in memory, plus a 16-byte
+    /// directory entry per recovered frame. An incomplete final frame is
+    /// truncated immediately and the file is synced. Other damaged regions
+    /// are reported but left on disk; new frames are appended after them.
     ///
     /// # Errors
     ///
@@ -204,8 +213,8 @@ impl Journal {
             ))
         })?;
         let mut scan = scan_file(&file, file_len, config.limits, RESYNC_CHUNK)?;
-        // The parts directory lives twice for a moment (journal + report);
-        // dropping the push-growth slack keeps the duplication honest.
+        // The directory is the only per-frame state kept after recovery;
+        // dropping the push-growth slack keeps it at exactly 16 B per part.
         scan.parts.shrink_to_fit();
 
         let has_incomplete_final_frame = scan
@@ -224,10 +233,10 @@ impl Journal {
             file,
             end,
             config,
-            parts: scan.parts.clone(),
+            parts: scan.parts,
         };
         let report = OpenReport {
-            scan,
+            damages: scan.damages,
             truncated_torn_tail: has_incomplete_final_frame,
         };
         Ok((journal, report))
@@ -677,7 +686,7 @@ mod tests {
         let part = sample_part();
 
         let (mut journal, report) = Journal::open(&path, small_config()).expect("open");
-        assert!(report.scan.is_clean());
+        assert!(report.is_clean());
         let first = journal.append(&part).expect("append");
         let second = journal.append(&part).expect("append");
         assert_eq!(journal.parts(), &[first, second]);
@@ -686,7 +695,7 @@ mod tests {
         // Reopen: the recovery scan finds both parts, clean.
         drop(journal);
         let (journal, report) = Journal::open(&path, small_config()).expect("reopen");
-        assert!(report.scan.is_clean());
+        assert!(report.is_clean());
         assert!(!report.truncated_torn_tail);
         assert_eq!(journal.parts().len(), 2);
         assert_eq!(journal.read_part(second).expect("read"), part);
@@ -751,7 +760,7 @@ mod tests {
         let (mut journal, report) = Journal::open(&path, small_config()).expect("recover");
         assert!(report.has_media_damage());
         assert!(!report.truncated_torn_tail);
-        assert_eq!(report.scan.damages[0].kind, DamageKind::QuarantinedTail);
+        assert_eq!(report.damages[0].kind, DamageKind::QuarantinedTail);
         assert_eq!(journal.parts().len(), 1);
         assert_eq!(
             std::fs::metadata(&path).expect("metadata").len(),

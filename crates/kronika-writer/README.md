@@ -43,9 +43,11 @@ the window nor the flushed entries.
 `Journal` appends mini-PGM parts as `PGMP` frames and syncs each frame before
 returning. Opening an existing journal runs the recovery scan.
 
-Recovery streams the file frame by frame: peak memory is one part (bounded
-by `max_part_len`) plus a small sliding window during resynchronization,
-never the whole journal. The streaming scanner is pinned to the in-memory
+Recovery streams the file frame by frame: peak memory is one part plus its
+decoded catalog (at most twice `max_part_len`, reached only by a
+pathological all-catalog part), a small sliding window during
+resynchronization, and 16 bytes of directory per recovered frame — never
+the whole journal. The streaming scanner is pinned to the in-memory
 scanner of `kronika-format` by an equivalence test.
 
 If the last frame was only partly written, the file is truncated to the last
