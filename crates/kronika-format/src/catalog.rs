@@ -7,6 +7,17 @@
 //!
 //! All integers are little-endian. Catalog entry offsets are absolute file
 //! offsets from the start of the segment.
+//!
+//! ```text
+//! catalog entry: 32 B       metadata: 40 B            tail index: 8 B
+//!   type_id        u32        min_ts          i64       catalog_len u32
+//!   flags          u32        max_ts          i64       magic       "PGM1"
+//!   offset         u64        source_id       u64
+//!   len            u64        entry_count     u32
+//!   rows           u32        format_version  u32
+//!   crc32c         u32        crc32c          u32
+//!                             reserved        u32
+//! ```
 
 use std::error::Error;
 use std::fmt;

@@ -2,7 +2,8 @@
 //!
 //! Each text or byte value gets a [`StrId`] and is stored once in either
 //! `dict.strings` or `dict.blobs`. `dict.hot_strings` duplicates selected
-//! short strings so readers can resolve common labels from tail data.
+//! short strings so readers can resolve common labels without loading larger
+//! dictionary entries.
 //!
 //! Placement is based on accumulated requirements for a value: size-based
 //! routing, registry-forced blob placement, and strict or optional hot-cache
@@ -195,7 +196,7 @@ pub enum Placement {
 pub enum HotMark {
     /// Never requested hot.
     None,
-    /// Best-effort hot (event labels).
+    /// Soft hot request (event labels).
     Soft,
     /// Strict hot (chart headers, catalog `source_id`).
     Hard,
@@ -248,11 +249,10 @@ struct Requirements {
     /// size, e.g. query plans.
     blob: bool,
     /// The strict part of the hot contract: the value must be readable
-    /// from the tail cache (chart headers, catalog `source_id`).
+    /// from `dict.hot_strings` (chart headers, catalog `source_id`).
     hot_hard: bool,
-    /// The best-effort part of the hot contract: duplicate into the tail
-    /// cache when placement allows it; otherwise leave it out of the
-    /// cache without failing.
+    /// Soft hot request: duplicate into `dict.hot_strings` when placement
+    /// allows it; otherwise leave it out without failing.
     hot_soft: bool,
 }
 
@@ -435,7 +435,7 @@ impl SegmentDicts {
             .map(|(id, stored)| (*id, stored.bytes.as_slice()))
     }
 
-    /// Per-entry snapshots in `str_id` order, for the write path.
+    /// Per-entry snapshots in `str_id` order, for the writer.
     pub fn entries(&self) -> impl Iterator<Item = EntrySnapshot<'_>> {
         self.entries.iter().map(|(id, stored)| EntrySnapshot {
             str_id: *id,
@@ -494,7 +494,7 @@ impl SegmentDicts {
         self.try_insert(id, bytes, req)
     }
 
-    /// The single write path. Public `intern*` methods only hash and
+    /// The single insertion path. Public `intern*` methods only hash and
     /// delegate here, so the zero-id and collision rules are testable
     /// without a known xxh3 preimage.
     ///

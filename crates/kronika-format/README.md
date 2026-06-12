@@ -16,7 +16,7 @@ It does not know how section bodies are encoded. Parquet sections, events,
 charts, storage backends, and I/O are handled by other crates. This README
 describes the container subset implemented by this crate.
 
-## Implemented Scope
+## Current Contents
 
 The crate currently exposes:
 
@@ -146,15 +146,16 @@ and never enters a dictionary. `StrId` only represents non-zero ids:
 - `dict.strings` — values shorter than `blob_threshold` (default 4 KiB);
 - `dict.blobs` — larger values, plus values the registry forces into blobs
   regardless of size (e.g. query plans, via `intern_blob`);
-- `dict.hot_strings` — a duplicating tail cache, always a subset of
+- `dict.hot_strings` — a duplicate cache for frequently needed short strings,
+  always a subset of
   `dict.strings`.
 
 Placement is decided by the set of requirements accumulated per value,
 never by call order: interning the same values with the same requirements
 in any order yields identical dictionaries. A value required both hot and
-in blobs is a typed `PlacementConflict` error. A best-effort hot request
-(`intern_hot_best_effort`, for event labels) returns the id plus a flag
-that says whether the value was added to `dict.hot_strings`.
+in blobs is a typed `PlacementConflict` error. A soft hot request
+(`intern_hot_best_effort`, for event labels) returns the id plus a flag that
+says whether the value was added to `dict.hot_strings`.
 
 A value longer than `truncate_limit` (default 1 MiB) keeps only a prefix
 of exactly that length; `str_id`, `full_len`, and `full_sha256` are always
@@ -195,11 +196,11 @@ index, catalog CRC, section bounds, and section CRCs.
 - damaged regions and their classification;
 - the valid prefix length.
 
-A torn tail means the last frame was cut off by the end of the buffer. It is
-safe for the writer to truncate the file to `valid_len` and continue. Middle
-damage means a later valid frame was found; parts before and after it are kept.
-A quarantined tail means the scanner found damage at the end and no later valid
-frame within the search window.
+An incomplete final frame means the writer was interrupted before the last
+frame was fully written. It is safe to truncate the file to `valid_len` and
+continue. Middle damage means a later valid frame was found; parts before and
+after the damaged region are kept. Final damage means the scanner found damage
+at the end and no later valid frame.
 
 ## Open Questions
 
@@ -226,10 +227,10 @@ the scanner first tries the boundary implied by a sane frame header, then
 searches to the end of the buffer, so frames appended after a damaged
 region are always rediscovered, however large the region is.
 
-These numbers should be settled by measuring sets of real segments and journals:
-dictionary sizes, tail sizes, truncation frequency, and part sizes. Until
-then they are constructor parameters of `DictLimits` and `JournalLimits`,
-with defaults as starting values.
+These numbers should be settled by measuring real segments and journals:
+dictionary sizes, catalog sizes, truncation frequency, and part sizes. Until
+then they are constructor parameters of `DictLimits` and `JournalLimits`, with
+defaults as starting values.
 
 ## Tests
 
@@ -256,7 +257,8 @@ encoding and HOT block headers here.
 Code that needs collector state, domain knowledge, or external I/O stays above
 this layer:
 
-- `kronika-writer` manages the string interner, buffers, merge, and seal logic;
+- `kronika-writer` manages the string interner, buffers, merge, and segment
+  completion logic;
 - `kronika-reader` opens segments, reads sections, and manages caches;
 - `kronika-registry` defines `type_id` meaning and section schemas;
 - `kronika-derive` and `kronika-writer` handle Parquet schemas and encoding;

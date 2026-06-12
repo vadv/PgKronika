@@ -1,7 +1,7 @@
 //! `active.parts` journal frames.
 //!
 //! The journal is an append-only sequence of `PGMP` frames. Each frame wraps
-//! one mini-part: a self-contained mini-PGM segment. This module defines the
+//! one self-contained mini-PGM segment. This module defines the
 //! frame bytes and scans an in-memory journal buffer; file I/O belongs to
 //! `kronika-writer`.
 //!
@@ -15,12 +15,12 @@
 //!
 //! Recovery rules:
 //!
-//! - a frame cut off by the end of the buffer is a torn write: the
-//!   journal is valid up to that frame, the tail is truncated;
-//! - a corrupted frame followed by a valid one is middle damage: valid parts
-//!   before and after are both kept;
-//! - a corrupted frame with no valid frame after it quarantines the
-//!   tail and reports the problem.
+//! - an incomplete final frame is normal after a crash: the journal is valid
+//!   up to that frame, and the writer may truncate the file there;
+//! - a damaged frame followed by a valid one is middle damage: valid parts
+//!   before and after the damaged region are both kept;
+//! - damage at the end with no later valid frame is reported and left on disk
+//!   for diagnostics.
 
 use std::error::Error;
 use std::fmt;
@@ -310,9 +310,9 @@ pub struct DamageRegion {
 /// Classification of a damaged journal region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DamageKind {
-    /// A frame cut off by the end of the buffer: a torn write. Normal
-    /// after a crash; the journal is truncated to `from` and writing
-    /// continues. Loss is bounded by one unfinished part.
+    /// An incomplete final frame. Normal after a crash; the journal is
+    /// truncated to `from` and writing continues. Loss is bounded by one
+    /// unfinished part.
     TornTail,
     /// A damaged frame with a valid frame after it.
     ///
@@ -322,9 +322,9 @@ pub enum DamageKind {
         /// Offset of the next valid frame.
         resumed_at: usize,
     },
-    /// A damaged frame with no valid frame found within the search window.
+    /// Damage at the end of the journal with no later valid frame.
     ///
-    /// The tail cannot be trusted.
+    /// These bytes stay on disk for diagnostics.
     QuarantinedTail,
 }
 
@@ -336,7 +336,7 @@ pub struct ScanReport {
     /// Damaged regions in journal order; empty for a clean journal.
     pub damages: Vec<DamageRegion>,
     /// Length of the journal prefix ending at the last valid frame.
-    /// After a torn tail this is the truncation point.
+    /// After an incomplete final frame this is the truncation point.
     pub valid_len: usize,
 }
 
@@ -383,11 +383,10 @@ pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
                     pos = next;
                     continue;
                 }
-                // Nothing valid follows. A fully present frame with a
-                // sane header that ends exactly at the buffer end is a
-                // torn write (e.g. pages reached disk out of order during
-                // a crash): the journal is truncated before it. A frame
-                // whose extent is unknowable quarantines the tail.
+                // Nothing valid follows. A fully present frame with a sane
+                // header that ends exactly at the buffer end is treated like
+                // an interrupted write: truncate before it. If the frame
+                // extent is unknowable, keep the final damaged bytes.
                 let kind = if implied_end == Some(bytes.len()) {
                     DamageKind::TornTail
                 } else {
@@ -408,7 +407,7 @@ enum FrameCheck {
     Valid { body_len: usize },
     /// The frame is cut off by the end of the buffer: header and length
     /// are plausible (or the header itself is incomplete), nothing
-    /// follows. A torn write, not media damage.
+    /// follows. This is an incomplete write, not media damage.
     Torn,
     /// The frame is damaged: bad magic, bad header CRC, an absurd
     /// length, or a part that fails container validation. When the
@@ -604,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_tail_is_a_torn_write() {
+    fn incomplete_final_frame_keeps_the_valid_prefix() {
         let part = sample_part();
         let mut journal = frame(&part);
         let full = frame(&part);
@@ -643,14 +642,14 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_header_of_the_last_frame_quarantines_the_tail() {
+    fn corrupted_final_header_is_reported_without_truncation() {
         let part = sample_part();
         let one = frame(&part);
         let mut journal = Vec::new();
         journal.extend_from_slice(&one);
         journal.extend_from_slice(&one);
-        // Corrupt the second frame's header magic: the frame extent is
-        // unknowable and nothing valid follows.
+        // Corrupt the second frame's header magic: recovery cannot know where
+        // that frame ends, and nothing valid follows it.
         let target = one.len();
         journal[target] ^= 0xFF;
 
@@ -662,15 +661,15 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_body_of_the_last_frame_is_a_torn_write() {
+    fn corrupted_final_body_with_intact_header_is_recoverable() {
         let part = sample_part();
         let one = frame(&part);
         let mut journal = Vec::new();
         journal.extend_from_slice(&one);
         journal.extend_from_slice(&one);
-        // The header is intact and the frame ends exactly at the buffer
-        // end, but the body is garbage: pages reached disk out of order
-        // during a crash. A torn write, truncated like any other.
+        // The header is intact and the frame ends exactly at the buffer end,
+        // but the body is invalid. Treat it like an interrupted write and
+        // keep only the valid prefix.
         let target = one.len() + FRAME_HEADER_LEN + 5;
         journal[target] ^= 0x01;
 
@@ -730,9 +729,8 @@ mod tests {
 
     #[test]
     fn resync_searches_to_the_end_of_the_buffer() {
-        // A long quarantine-like garbage region followed by a valid
-        // frame: the search must not give up early, or frames appended
-        // after damage would be lost on reopen.
+        // A long damaged region followed by a valid frame: the search must
+        // not give up early, or later appends would be lost on reopen.
         let part = sample_part();
         let mut journal = frame(&part);
         journal.extend_from_slice(&[0xAB_u8; 2048]);
@@ -744,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_length_claim_is_damage_not_torn() {
+    fn oversized_length_claim_is_final_damage() {
         let part = sample_part();
         let mut journal = frame(&part);
         // A frame claiming a part over the configured limit, with a
