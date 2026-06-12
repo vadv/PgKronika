@@ -8,10 +8,11 @@
 - catalog entries;
 - catalog metadata;
 - tail index;
-- CRC32C.
+- CRC32C;
+- `str_id` and the per-segment dictionary model.
 
-It does not know how section bodies are encoded. Parquet sections, dictionaries,
-events, charts, storage backends, and I/O live in other crates. This README is
+It does not know how section bodies are encoded. Parquet sections, events,
+charts, storage backends, and I/O live in other crates. This README is
 the local contract for the container subset implemented by this crate.
 
 ## Implemented Scope
@@ -24,10 +25,12 @@ The crate currently exposes:
 - `Catalog`, the decoded end catalog and metadata;
 - `TailIndex`, the final 8-byte pointer to the catalog;
 - `DecodeError`, typed catalog and tail-index decode errors;
-- `crc32c`, the checksum used by the container.
+- `crc32c`, the checksum used by the container;
+- `StrId`, the interned string id (`xxh3_64`);
+- `SegmentDicts` with `DictLimits`, `BlobEntry`, `Resolved`, `DictStats`,
+  and the `DictError` / `InvalidLimits` error types.
 
-Later implementation steps add dictionaries, HOT block headers, and
-`active.parts` frames.
+Later implementation steps add HOT block headers and `active.parts` frames.
 
 ## File Layout
 
@@ -124,6 +127,69 @@ All container checksums use CRC32C, the Castagnoli polynomial
 (`CRC_32_ISCSI`). The catalog checksum is computed over catalog entries and
 metadata with the metadata `crc32c` field set to zero.
 
+## String Ids and Dictionaries
+
+Every text value of a segment — SQL, plans, object names, `cmdline`, event
+payloads, chart series names — is referenced by `str_id = xxh3_64(bytes)`
+and stored once in the segment dictionaries. Zero is reserved as the
+"no value" sentinel: an input that hashes to zero is treated as a collision
+and never enters a dictionary. `StrId` is a non-zero newtype; raw on-disk
+`u64` fields (such as `Catalog::source_id`) convert through
+`StrId::from_raw` / `StrId::get`.
+
+`SegmentDicts` models the three dictionaries of one segment:
+
+- `dict.strings` — values shorter than `blob_threshold` (default 4 KiB);
+- `dict.blobs` — larger values, plus values the registry forces into blobs
+  regardless of size (e.g. query plans, via `intern_blob`);
+- `dict.hot_strings` — a duplicating tail cache, always a subset of
+  `dict.strings`.
+
+Placement is decided by the set of requirements accumulated per value,
+never by call order: interning the same values with the same requirements
+in any order yields identical dictionaries. A value required both hot and
+in blobs is a typed `PlacementConflict` error; a best-effort hot request
+(`intern_hot_best_effort`, for event labels) silently degrades instead.
+
+A value longer than `truncate_limit` (default 1 MiB) keeps only a prefix
+of exactly that length; `str_id`, `full_len`, and `full_sha256` are always
+computed over the full original value. Deduplication and collision checks
+for truncated entries therefore compare `(full_len, full_sha256)` rather
+than the stored prefix.
+
+A `str_id` collision inside one segment is unrecoverable by design: the
+writer aborts the segment (`DictError::Collision`). Both default limits
+are starting values of open format questions, so they are parameters of
+`DictLimits`, not constants baked into the logic.
+
+Encoding the dictionaries into on-disk section bytes is deliberately not
+here yet; it arrives with the typed section codecs.
+
+## Open Questions
+
+Two sizes in the dictionary model are starting values, not settled format
+decisions. Code in this crate points here instead of pinning them:
+
+- **`blob_threshold`, default 4 KiB** — the boundary between
+  `dict.strings` and `dict.blobs`. It trades read behavior: everything in
+  `dict.strings` is loaded eagerly when a segment is opened, while blobs
+  are fetched on demand. A threshold set too high bloats the eager part
+  with rarely-needed values; too low pushes common labels into the lazy
+  path and adds round trips.
+- **`truncate_limit`, default 1 MiB** — the size above which only a
+  prefix of a value is stored (with `full_sha256` keeping the identity of
+  the original). It caps the damage a single giant plan or query text can
+  do to segment size. Too low loses diagnostic detail; too high lets one
+  value dominate a segment.
+
+Both numbers can only be settled by measuring real segment corpora —
+dictionary sizes, tail sizes, and the hit rate of truncation on
+production-like data. Until then they are constructor parameters of
+`DictLimits` (validated as `0 < blob_threshold <= truncate_limit`) with
+`DEFAULT_BLOB_THRESHOLD` / `DEFAULT_TRUNCATE_LIMIT` as the starting
+values, so settling them later is a configuration change, not a format
+change.
+
 ## Tests
 
 - `tests/fixture.rs` decodes and re-encodes a byte-exact minimal segment fixture.
@@ -131,12 +197,17 @@ metadata with the metadata `crc32c` field set to zero.
   layout.
 - `tests/property.rs` checks encode/decode roundtrips and single-byte corruption
   detection for generated catalogs.
+- `tests/dict_property.rs` checks the dictionary contract on random data:
+  every issued id resolves, the dictionaries stay disjoint, hot is a subset
+  of strings, re-interning is idempotent, and placement is independent of
+  call order.
 
 ## Crate Boundaries
 
 This crate contains only the byte layouts shared by writers and readers. Today
-that means the end catalog, tail index, and CRC32C. Later steps add dictionary
-sections, HOT block headers, and `active.parts` journal frames here.
+that means the end catalog, tail index, CRC32C, `str_id`, and the dictionary
+model. Later steps add dictionary section encoding, HOT block headers, and
+`active.parts` journal frames here.
 
 Code that needs collector state, domain knowledge, or external I/O stays above
 this layer:

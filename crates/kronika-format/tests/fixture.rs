@@ -1,8 +1,8 @@
 //! Byte-exact fixture test.
 //!
 //! `fixtures/minimal.pgm` is a minimal PGM segment computed by hand from
-//! `docs/segment-format.md` (a Python reference implementation, checked
-//! against the canonical CRC32C test vector, produced the bytes). A
+//! the byte-layout tables in README.md (a Python reference implementation,
+//! checked against the canonical CRC32C test vector, produced the bytes). A
 //! write-then-read roundtrip cannot catch the writer and the reader
 //! drifting from the specification together; this fixture can.
 //!
@@ -17,10 +17,12 @@
 //! ```
 
 use kronika_format::{Catalog, Entry, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
-// Dev-dependencies of other test targets; anchored for the
+// Dependencies of other targets of this crate; anchored for the
 // `unused_crate_dependencies` lint, which checks each target separately.
 use crc as _;
 use proptest as _;
+use sha2 as _;
+use xxhash_rust as _;
 
 const SEGMENT: &[u8] = include_bytes!("fixtures/minimal.pgm");
 
