@@ -1,4 +1,5 @@
-//! Class-10 chart formulas, shared by segment seal, `/metrics` and web-side recompute.
+//! Class-10 chart formulas.
 //!
-//! See `docs/architecture.md` for the workspace layout and the dependency
-//! rules between crates, and `docs/segment-format.md` for the PGM format.
+//! This crate will contain the shared chart calculations used when sealing
+//! segments, exporting `/metrics`, and recomputing chart series in the web
+//! process. Public API docs will be added here as the crate is implemented.

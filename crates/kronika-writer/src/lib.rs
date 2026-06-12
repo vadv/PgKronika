@@ -1,10 +1,11 @@
-//! Write path: string interner, per-type buffers, parts journal, merge and seal.
+//! Writer-side state for building PGM segments.
 //!
-//! The crate's scope and its boundary with `kronika-format` (which defines
-//! the byte layout this crate produces) are documented in this crate's
-//! README.md. Buffers, the `active.parts` journal, merge and seal arrive
-//! in later steps.
+//! The implemented pieces today are the per-segment string interner and the
+//! `active.parts` journal. Later steps add per-type buffers, merge, seal, and
+//! Parquet encoding.
 
 mod interner;
+mod journal;
 
-pub use interner::Interner;
+pub use interner::{FlushedEntry, Interner, SealedSegment};
+pub use journal::{Journal, JournalError, OpenReport};

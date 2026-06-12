@@ -11,25 +11,33 @@ layout; this crate keeps the write-time state needed to produce it.
 The crate currently exposes:
 
 - `Interner` — the per-segment string interner over
-  `kronika_format::SegmentDicts`.
+  `kronika_format::SegmentDicts`;
+- `Journal` — the file-backed `active.parts` journal.
 
-The interner adds what only the write path needs on top of the dictionary
-model:
+The interner keeps memory bounded while preserving dictionary placement rules:
 
-- `take_new()` — ids first interned since the previous call. This is the
-  dictionary content of the next mini-part: a mini-part dictionary holds
-  the strings first seen in its flush window.
-- `seal()` — hands the segment dictionaries to the seal path and starts
-  the next segment empty. The collector seals early under interner growth
-  pressure precisely so the next segment starts with an empty interner.
+- the current window stores full bytes for values that have not yet been
+  flushed to the journal;
+- the flushed map stores only value identity and placement requirements for
+  values already written to `active.parts`;
+- `flush_window()` writes the current window through a caller-provided journal
+  callback, then keeps only hashes and placement requirements;
+- `seal()` returns the residual window plus placement directives for flushed
+  values, then starts the next segment empty;
 - `stats()` — dictionary sizes for the collector's self-metrics.
 
 A failed interning call (collision, placement conflict) changes neither
-the dictionaries nor the list of new ids.
+the window nor the flushed map.
+
+The journal appends mini-PGM parts as `PGMP` frames. Opening an existing journal
+runs the recovery scan from `kronika-format`:
+
+- a torn tail is truncated and writing continues;
+- middle damage and a quarantined tail are reported in `OpenReport`;
+- `append()` writes one frame and syncs the file before returning;
+- `reset()` empties the journal after a successful seal.
 
 ## Not Here Yet
 
-Per-type buffers, the `active.parts` journal, merge, seal, and Parquet
-encoding arrive in later steps. The dictionary contract itself — routing,
-truncation, collision rules — is defined in `kronika-format` and documented
-there.
+Per-type buffers, merge, seal, and Parquet encoding arrive in later steps. The
+dictionary and frame-byte rules are defined in `kronika-format`.

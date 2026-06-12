@@ -1,4 +1,5 @@
-//! Code generation: type definition to Parquet schema, encoder, decoder and golden tests.
+//! Code generation for typed sections.
 //!
-//! See `docs/architecture.md` for the workspace layout and the dependency
-//! rules between crates, and `docs/segment-format.md` for the PGM format.
+//! This crate will generate Parquet schemas, encoders, decoders, and golden
+//! tests from registry type definitions. Public API docs will be added here
+//! as the crate is implemented.
