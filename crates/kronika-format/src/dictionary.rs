@@ -4,12 +4,12 @@
 //! "String Ids and Dictionaries"): which dictionary a value lands in,
 //! how oversized values are truncated, and which inputs are collisions.
 //! Encoding the dictionaries into on-disk section bytes is a later step;
-//! this module owns only the contract:
+//! this module defines only the contract:
 //!
 //! - every issued [`StrId`] resolves within the same [`SegmentDicts`];
-//! - one id never lives in `strings` and `blobs` at the same time;
+//! - one id is never stored in `strings` and `blobs` at the same time;
 //! - `hot_strings` is a subset of `strings` — it is a duplicating tail
-//!   cache, not a third source of truth;
+//!   cache, not another dictionary with separate values;
 //! - a value larger than the truncation limit keeps only a prefix, while
 //!   `str_id` and `full_sha256` are computed over the full original value.
 //!
@@ -181,9 +181,9 @@ pub struct BlobEntry<'a> {
 /// A resolved dictionary value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolved<'a> {
-    /// The value lives in `dict.strings` and is stored in full.
+    /// The value is stored in `dict.strings` and kept in full.
     Str(&'a [u8]),
-    /// The value lives in `dict.blobs` and may be truncated.
+    /// The value is stored in `dict.blobs` and may be truncated.
     Blob(BlobEntry<'a>),
 }
 
@@ -214,7 +214,8 @@ struct Requirements {
     /// from the tail cache (chart headers, catalog `source_id`).
     hot_hard: bool,
     /// The best-effort part of the hot contract: duplicate into the tail
-    /// cache if placement allows, silently skip otherwise.
+    /// cache when placement allows it; otherwise leave it out of the
+    /// cache without failing.
     hot_soft: bool,
 }
 
@@ -239,8 +240,8 @@ impl Stored {
     }
 
     /// Whether the value is in `dict.hot_strings`. A soft hot request on
-    /// a blob-placed value degrades to nothing, per the best-effort part
-    /// of the contract; a hard one is rejected before getting here.
+    /// a blob-placed value does not add it to the hot cache; a hard one is
+    /// rejected before getting here.
     const fn is_hot(&self) -> bool {
         !self.is_blob() && (self.req.hot_hard || self.req.hot_soft)
     }
@@ -325,8 +326,8 @@ impl SegmentDicts {
     }
 
     /// Intern a value of the best-effort hot contract: short event labels
-    /// are duplicated into the tail cache, large values silently stay
-    /// only in the full dictionaries.
+    /// are duplicated into the tail cache, while large values stay only in
+    /// the full dictionaries.
     ///
     /// Returns the id and whether the value is in `dict.hot_strings`
     /// after this call.
@@ -663,11 +664,12 @@ mod tests {
     }
 
     #[test]
-    fn soft_hot_degrades_without_error() {
+    fn soft_hot_skips_hot_cache_for_blob_without_error() {
         let value = b"label";
 
         // Soft hot first, forced blob later: the value moves to blobs and
-        // the soft mark degrades to nothing, in either call order.
+        // the soft hot mark does not add it to the hot cache, in either
+        // call order.
         let mut dicts = SegmentDicts::new(small_limits());
         let (id, hot) = dicts.intern_hot_best_effort(value).expect("soft hot");
         assert!(hot, "short value lands in strings, so it is hot");
@@ -680,7 +682,7 @@ mod tests {
         let mut dicts = SegmentDicts::new(small_limits());
         dicts.intern_blob(value).expect("forced blob first");
         let (_, hot) = dicts.intern_hot_best_effort(value).expect("soft hot later");
-        assert!(!hot, "blob-placed value silently skips the hot cache");
+        assert!(!hot, "blob-placed value stays out of the hot cache");
         assert_eq!(dicts.hot_strings().count(), 0);
     }
 

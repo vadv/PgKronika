@@ -12,8 +12,8 @@
 - `str_id` and the per-segment dictionary model.
 
 It does not know how section bodies are encoded. Parquet sections, events,
-charts, storage backends, and I/O live in other crates. This README is
-the local contract for the container subset implemented by this crate.
+charts, storage backends, and I/O are handled by other crates. This README
+describes the container subset implemented by this crate.
 
 ## Implemented Scope
 
@@ -133,9 +133,9 @@ Every text value of a segment — SQL, plans, object names, `cmdline`, event
 payloads, chart series names — is referenced by `str_id = xxh3_64(bytes)`
 and stored once in the segment dictionaries. Zero is reserved as the
 "no value" sentinel: an input that hashes to zero is treated as a collision
-and never enters a dictionary. `StrId` is a non-zero newtype; raw on-disk
-`u64` fields (such as `Catalog::source_id`) convert through
-`StrId::from_raw` / `StrId::get`.
+and never enters a dictionary. `StrId` only represents non-zero ids:
+`StrId::from_raw(0)` returns `None`, and `StrId::get()` returns the raw
+`u64` written on disk.
 
 `SegmentDicts` models the three dictionaries of one segment:
 
@@ -148,8 +148,9 @@ and never enters a dictionary. `StrId` is a non-zero newtype; raw on-disk
 Placement is decided by the set of requirements accumulated per value,
 never by call order: interning the same values with the same requirements
 in any order yields identical dictionaries. A value required both hot and
-in blobs is a typed `PlacementConflict` error; a best-effort hot request
-(`intern_hot_best_effort`, for event labels) silently degrades instead.
+in blobs is a typed `PlacementConflict` error. A best-effort hot request
+(`intern_hot_best_effort`, for event labels) returns the id plus a flag
+that says whether the value was added to `dict.hot_strings`.
 
 A value longer than `truncate_limit` (default 1 MiB) keeps only a prefix
 of exactly that length; `str_id`, `full_len`, and `full_sha256` are always
@@ -162,8 +163,8 @@ writer aborts the segment (`DictError::Collision`). Both default limits
 are starting values of open format questions, so they are parameters of
 `DictLimits`, not constants baked into the logic.
 
-Encoding the dictionaries into on-disk section bytes is deliberately not
-here yet; it arrives with the typed section codecs.
+Encoding dictionaries into on-disk section bytes is left for the typed
+section codecs.
 
 ## Open Questions
 
@@ -173,16 +174,16 @@ decisions. Code in this crate points here instead of pinning them:
 - **`blob_threshold`, default 4 KiB** — the boundary between
   `dict.strings` and `dict.blobs`. It trades read behavior: everything in
   `dict.strings` is loaded eagerly when a segment is opened, while blobs
-  are fetched on demand. A threshold set too high bloats the eager part
-  with rarely-needed values; too low pushes common labels into the lazy
-  path and adds round trips.
+  are fetched on demand. A threshold set too high makes the eagerly loaded
+  dictionary too large; too low pushes common labels into the lazy path and
+  adds round trips.
 - **`truncate_limit`, default 1 MiB** — the size above which only a
   prefix of a value is stored (with `full_sha256` keeping the identity of
-  the original). It caps the damage a single giant plan or query text can
-  do to segment size. Too low loses diagnostic detail; too high lets one
+  the original). It limits how much space a single giant plan or query text
+  can take in a segment. Too low loses diagnostic detail; too high lets one
   value dominate a segment.
 
-Both numbers can only be settled by measuring real segment corpora —
+Both numbers can only be settled by measuring sets of real segments:
 dictionary sizes, tail sizes, and the hit rate of truncation on
 production-like data. Until then they are constructor parameters of
 `DictLimits` (validated as `0 < blob_threshold <= truncate_limit`) with
@@ -216,5 +217,5 @@ this layer:
 - `kronika-reader` opens segments, reads sections, and manages caches;
 - `kronika-registry` defines `type_id` meaning and section schemas;
 - `kronika-derive` and `kronika-writer` handle Parquet schemas and encoding;
-- `kronika-store*` owns local, HTTP, and S3 storage access;
+- `kronika-store*` handles local, HTTP, and S3 storage access;
 - `kronika-source-*` collects data from PostgreSQL, OS, cgroup, and logs.

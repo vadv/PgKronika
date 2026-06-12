@@ -1,6 +1,6 @@
 //! The collector's string interner: segment lifecycle over [`SegmentDicts`].
 //!
-//! The dictionary contract itself lives in `kronika-format` and is
+//! The dictionary contract itself is defined in `kronika-format` and is
 //! documented there; this module adds what only the write path needs
 //! (this crate's README.md): which values are new since the last
 //! mini-part flush, dictionary sizes for self-metrics, and the reset on
@@ -11,11 +11,11 @@ use kronika_format::{DictError, DictLimits, DictStats, SegmentDicts, StrId};
 /// Per-segment string interner.
 ///
 /// All `intern*` methods are the deduplicating methods of
-/// [`SegmentDicts`] plus novelty tracking: ids first seen since the
+/// [`SegmentDicts`] plus tracking for new ids: ids first seen since the
 /// previous [`Interner::take_new`] call are the dictionary content of
 /// the next mini-part — a mini-part dictionary holds the strings first
 /// seen in its window (README.md, "Implemented Scope"). A failed call
-/// changes neither the dictionaries nor the novelty list.
+/// changes neither the dictionaries nor the list of new ids.
 #[derive(Debug)]
 pub struct Interner {
     dicts: SegmentDicts,
@@ -86,8 +86,8 @@ impl Interner {
     /// taken id) can still move a value between `strings` and `blobs`.
     /// So the mini-part encoder must resolve the ids before further
     /// interning, and the seal path must take placement from the live
-    /// dictionaries — placement recorded in already-flushed mini-parts
-    /// is not authoritative.
+    /// dictionaries, not from placement recorded in already-flushed
+    /// mini-parts.
     #[must_use = "dropping the result loses the dictionary content of a mini-part window"]
     pub fn take_new(&mut self) -> Vec<StrId> {
         std::mem::take(&mut self.fresh)
@@ -126,8 +126,8 @@ impl Interner {
         Ok(id)
     }
 
-    /// Novelty is detected by dictionary growth: a repeat or a pure
-    /// requirement upgrade does not grow the map and is not news.
+    /// New ids are detected by dictionary growth: a repeat or a pure
+    /// requirement upgrade does not grow the map.
     fn note_new(&mut self, before: usize, id: StrId) {
         if self.dicts.len() > before {
             self.fresh.push(id);
