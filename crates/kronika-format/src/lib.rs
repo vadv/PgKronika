@@ -1,7 +1,7 @@
 //! PGM container primitives: end catalog, tail index, CRC32C, `str_id`,
 //! dictionaries.
 //!
-//! This crate owns the byte layout of the PGM container and nothing else:
+//! This crate defines the byte layout of the PGM container and nothing else:
 //! no Parquet, no I/O, no knowledge of section contents. The layout and
 //! the contracts are documented in this crate's README.md; every
 //! structure here points back to its README section. HOT block headers
@@ -33,8 +33,8 @@ pub use dictionary::{
 };
 pub use str_id::StrId;
 
-/// Magic bytes `PGM1`. They open the file and close the tail index, so both
-/// the first and the last four bytes of a segment are recognizable
+/// Magic bytes `PGM1`. They open the file and close the tail index, so either
+/// end of a segment can be checked quickly
 /// (README.md, "File Layout").
 pub const MAGIC: [u8; 4] = *b"PGM1";
 

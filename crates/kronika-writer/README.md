@@ -3,8 +3,8 @@
 [Русская версия](README.ru.md)
 
 `kronika-writer` is the collector's write path: everything between data
-sources and a sealed `.pgm` segment. The byte layout it produces is owned
-by `kronika-format`; this crate owns the runtime state of writing.
+sources and a sealed `.pgm` segment. `kronika-format` defines the byte
+layout; this crate keeps the write-time state needed to produce it.
 
 ## Implemented Scope
 
@@ -25,11 +25,11 @@ model:
 - `stats()` — dictionary sizes for the collector's self-metrics.
 
 A failed interning call (collision, placement conflict) changes neither
-the dictionaries nor the novelty list.
+the dictionaries nor the list of new ids.
 
 ## Not Here Yet
 
 Per-type buffers, the `active.parts` journal, merge, seal, and Parquet
 encoding arrive in later steps. The dictionary contract itself — routing,
-truncation, collision rules — lives in `kronika-format` and is documented
+truncation, collision rules — is defined in `kronika-format` and documented
 there.

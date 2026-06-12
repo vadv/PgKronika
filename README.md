@@ -16,7 +16,7 @@ product yet.
 
 - Keep recent diagnostic history close to the database host.
 - Make every segment independently readable: schemas, offsets, dictionaries,
-  events, and precomputed chart points live in the same file.
+  events, and precomputed chart points are stored in the same file.
 - Preserve high-cardinality PostgreSQL detail without pushing it into
   Prometheus metrics.
 - Support offline incident analysis by copying segment files and opening them
@@ -48,9 +48,9 @@ docs/      design documents
 xtask/     workspace maintenance commands
 ```
 
-The `docs/` directory is design context, not the final source of truth for
+The `docs/` directory is design context, not the final reference for
 implemented code. As crates are implemented, their local README files, rustdoc,
-and tests become the current contract for the implemented subset.
+and tests describe the behavior that is already present in code.
 
 Useful design notes:
 
