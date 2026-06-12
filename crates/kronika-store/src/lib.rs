@@ -1,5 +1,4 @@
-//! Segment storage abstractions.
+//! `SegmentStore` trait with `LocalDir` and `FileSet` implementations.
 //!
-//! This crate will define the common segment-store API and local
-//! implementations such as directory-backed storage and explicit file sets.
-//! Public API docs will be added here as the crate is implemented.
+//! See `docs/architecture.md` for the workspace layout and the dependency
+//! rules between crates, and `docs/segment-format.md` for the PGM format.

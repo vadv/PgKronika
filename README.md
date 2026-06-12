@@ -48,8 +48,9 @@ docs/      design documents
 xtask/     workspace maintenance commands
 ```
 
-The `docs/` directory keeps design notes and history. Implemented behavior is
-documented next to the code: crate README files, rustdoc, and tests.
+The `docs/` directory is design context, not the final reference for
+implemented code. As crates are implemented, their local README files, rustdoc,
+and tests describe the behavior that is already present in code.
 
 Useful design notes:
 

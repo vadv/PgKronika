@@ -1,5 +1,4 @@
-//! Counter deltas and reset handling.
+//! Rates, baseline reconstruction and reset rules for cumulative counters.
 //!
-//! This crate will turn cumulative counters into rates, reconstruct baselines,
-//! and apply reset rules. Public API docs will be added here as the crate is
-//! implemented.
+//! See `docs/architecture.md` for the workspace layout and the dependency
+//! rules between crates, and `docs/segment-format.md` for the PGM format.
