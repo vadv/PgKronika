@@ -68,13 +68,11 @@ const RULES: &[(&str, &[&str])] = &[
 ];
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("check-deps") => check_deps(),
-        _ => {
-            eprintln!("usage: cargo run -p xtask -- check-deps");
-            std::process::exit(2);
-        }
+    if std::env::args().nth(1).as_deref() == Some("check-deps") {
+        check_deps();
+    } else {
+        eprintln!("usage: cargo run -p xtask -- check-deps");
+        std::process::exit(2);
     }
 }
 
