@@ -8,6 +8,14 @@
 //! Placement is based on accumulated requirements for a value: size-based
 //! routing, registry-forced blob placement, and strict or optional hot-cache
 //! placement. The final placement is independent of call order.
+//!
+//! The core invariants are:
+//!
+//! - every issued [`StrId`] resolves inside the same [`SegmentDicts`];
+//! - one id is never stored in both `dict.strings` and `dict.blobs`;
+//! - `dict.hot_strings` is always a subset of `dict.strings`;
+//! - truncated values keep `str_id`, `full_len`, and `full_sha256` for the
+//!   full original value, not only for the stored prefix.
 
 use std::collections::BTreeMap;
 use std::error::Error;
