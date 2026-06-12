@@ -1,4 +1,4 @@
-//! OS collectors: `/proc`, `/sys` and cgroup.
+//! Operating-system collectors.
 //!
-//! See `docs/architecture.md` for the workspace layout and the dependency
-//! rules between crates, and `docs/segment-format.md` for the PGM format.
+//! This crate will collect `/proc`, `/sys`, and cgroup data for the local
+//! host. Public API docs will be added here as the crate is implemented.
