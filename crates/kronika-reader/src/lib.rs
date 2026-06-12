@@ -1,4 +1,5 @@
-//! Read path: segment catalog, tail reads, dictionary and `str_id` LRU caches, drill-down.
+//! Segment read path.
 //!
-//! See `docs/architecture.md` for the workspace layout and the dependency
-//! rules between crates, and `docs/segment-format.md` for the PGM format.
+//! This crate will open segment catalogs, read byte ranges, keep dictionary
+//! and `str_id` caches, and serve drill-down queries. Public API docs will be
+//! added here as the crate is implemented.
