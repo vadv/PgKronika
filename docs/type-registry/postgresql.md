@@ -1,0 +1,769 @@
+# Класс 1: PostgreSQL
+
+PostgreSQL-источники занимают диапазон `1_001_001` - `1_099_999`.
+
+## Сводная таблица
+
+| `type_id` | Источник | Период | Семантика | Сортировка |
+|-----------|----------|----------|-----------|------------|
+| `1_001_001` | `pg_stat_activity` | 5 с | `snapshot_full` | `(ts, pid)` |
+| `1_002_001` | `pg_stat_statements` | 30 с | `changed` | `(queryid, dbid, userid, ts)` |
+| `1_003_001` | `pg_store_plans`, форк ossc | 5 мин | `changed` | `(queryid, planid, ts)` |
+| `1_004_001` | `pg_store_plans`, форк vadv | 5 мин | `changed` | `(queryid, planid, ts)` |
+| `1_005_001` | `pg_stat_database` | базовый шаг | `snapshot_full` | `(datid, ts)` |
+| `1_006_001` | `pg_stat_bgwriter` + `pg_stat_checkpointer` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_007_001` | `pg_stat_wal` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_008_001` | `pg_stat_archiver` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_009_001` | `pg_stat_io` | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
+| `1_010_001` | агрегат `pg_prepared_xacts` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_011_001` | `pg_locks`, дерево ожиданий | по факту | `conditional_full` | `(ts, root_pid, depth)` |
+| `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `snapshot_full` | `(ts, pid)` |
+| `1_013_001` | `pg_stat_user_tables` + `pg_statio_user_tables` | 30 с | `changed` | `(datname, relid, ts)` |
+| `1_014_001` | `pg_stat_user_indexes` + `pg_statio_user_indexes` | 30 с | `changed` | `(datname, indexrelid, ts)` |
+| `1_015_001` | replication: статус инстанса | 30 с | `snapshot_full` | `(ts)` |
+| `1_016_001` | replication: реплики primary | 30 с | `snapshot_full` | `(application_name, client_addr, pid, ts)` |
+| `1_017_001` | replication: слоты | 30 с | `snapshot_full` | `(slot_name, ts)` |
+| `1_018_001` | wraparound | 30 с | `snapshot_full` | `(datname, ts)` |
+| `1_019_001` | `pg_settings` | сегмент + 1 ч | `on_change` | `(name)` |
+| `1_020_001` | `reset_metadata` | сегмент | `snapshot_full` | `(ts)` |
+| `1_021_001` | `instance_metadata` | сегмент | `snapshot_full` | `(ts)` |
+| `1_022_001` | log: ошибки, сгруппированные | поток | `event_stream` | `(ts)` |
+| `1_023_001` | coverage | 30 с | `snapshot_full` | `(source_type_id, ts)` |
+| `1_024_001` | log: checkpoints | поток | `event_stream` | `(ts)` |
+| `1_025_001` | log: autovacuum/autoanalyze | поток | `event_stream` | `(ts)` |
+| `1_026_001` | log: slow queries | поток | `event_stream` | `(ts)` |
+| `1_027_001` | log: lock waits | поток | `event_stream` | `(ts)` |
+| `1_028_001` | log: server lifecycle | поток | `event_stream` | `(ts)` |
+
+## `1_001_001` `pg_stat_activity`
+
+Один из самых горячих типов. Сортировка `time-first` выбрана осознанно: состав
+строк между снимками нестабилен, поэтому сортировка по сущности даёт мало
+пользы. Внутри одного снимка хорошо сжимаются состояния,
+типы ожидания, имена баз и похожие label-колонки.
+
+```text
+ts                 ts    T
+pid                i32   L
+datname            str   L
+usename            str   L
+application_name   str   L
+client_addr        str   L   // текст; пустая строка = local
+backend_type       str   L
+state              str   L   // active | idle | idle in transaction | ...
+wait_event_type    str?  L   // NULL, если backend не ждет
+wait_event         str?  L
+query              str   L   // текст через словарь, усечение на коллекторе
+query_id           i64   L   // pg queryid, 0 при compute_query_id=off
+backend_start      ts    G
+xact_start         ts?   G   // NULL вне транзакции
+query_start        ts    G
+state_change       ts    G
+```
+
+Кандидаты для v2: `leader_pid`, `backend_xid`, `backend_xmin_age`.
+
+## `1_002_001` `pg_stat_statements`
+
+Собирается top-N по `total_exec_time DESC`. Значение по умолчанию для лимита —
+500, должно быть настройкой коллектора. Для каждого усеченного сбора пишется
+coverage-строка `1_023_001` с `source_type_id = 1_002_001`, `max_n`,
+`order_by = "total_exec_time"` и cutoff-значением последней собранной строки.
+
+Тексты запросов получаются отдельным запросом только для новых `queryid`.
+Основной сбор должен использовать `pg_stat_statements(showtext := false)`, а
+тексты добираться точечно. Это уменьшает передачу повторяющихся SQL и хорошо
+ложится на интернер.
+
+Версионность PostgreSQL:
+
+- до PG13 используются старые имена вроде `total_time`;
+- `total_plan_time`, `wal_records`, `wal_bytes` отсутствуют до PG13 и пишутся
+  как `NULL`, а не как ноль.
+
+```text
+ts                  ts    T
+queryid             i64   L
+dbid                u32   L
+userid              u32   L
+datname             str   L
+usename             str   L
+query               str   L   // через словарь; усечение коллектора
+calls               i64   C
+total_exec_time     f64   C   // ms
+min_exec_time       f64   G
+max_exec_time       f64   G
+mean_exec_time      f64   G
+stddev_exec_time    f64   G
+total_plan_time     f64?  C   // NULL < PG13
+rows                i64   C
+shared_blks_hit     i64   C
+shared_blks_read    i64   C
+shared_blks_dirtied i64   C
+shared_blks_written i64   C
+local_blks_read     i64   C
+local_blks_written  i64   C
+temp_blks_read      i64   C
+temp_blks_written   i64   C
+wal_records         i64?  C   // NULL < PG13
+wal_bytes           i64?  C   // NULL < PG13
+is_baseline         bool  L
+```
+
+## `1_003_001` и `1_004_001` `pg_store_plans`
+
+Есть два несовместимых расширения с одним именем:
+
+- `1_003_001` — `ossc-db/pg_store_plans`;
+- `1_004_001` — vadv-форк.
+
+Схемы и способ получения текста плана различаются, поэтому используются разные
+`type_id`. Форк определяется при старте по сигнатурам функций.
+
+Собирается top-N по `total_time DESC`, базовый лимит — 500 строк. Для усеченных
+сборов пишется coverage `1_023_001`.
+
+Нормализованная раскладка:
+
+```text
+ts                              ts    T
+queryid                         i64   L
+planid                          i64   L
+dbid                            u32   L
+userid                          u32   L
+datname                         str   L
+usename                         str   L
+plan                            str   L   // текст плана через dict.blobs
+calls                           i64   C
+total_time                      f64   C
+min_time                        f64   G
+max_time                        f64   G
+mean_time                       f64   G
+stddev_time                     f64   G
+rows                            i64   C
+shared_blks_hit                 i64   C
+shared_blks_read                i64   C
+shared_blks_dirtied             i64   C
+shared_blks_written             i64   C
+local_blks_read                 i64   C
+local_blks_written              i64   C
+temp_blks_read                  i64   C
+temp_blks_written               i64   C
+blk_read_time                   f64   C   // vadv: shared + local + temp
+blk_write_time                  f64   C
+first_call                      ts    G
+last_call                       ts    G
+is_baseline                     bool  L
+```
+
+## `1_005_001` `pg_stat_database`
+
+```text
+ts                       ts    T
+datid                    u32   L
+datname                  str   L
+xact_commit              i64   C
+xact_rollback            i64   C
+blks_read                i64   C
+blks_hit                 i64   C
+tup_returned             i64   C
+tup_fetched              i64   C
+tup_inserted             i64   C
+tup_updated              i64   C
+tup_deleted              i64   C
+conflicts                i64   C
+temp_files               i64   C
+temp_bytes               i64   C
+deadlocks                i64   C
+checksum_failures        i64?  C   // NULL без data_checksums
+blk_read_time            f64   C   // 0 без track_io_timing, см. reset_metadata
+blk_write_time           f64   C
+session_time             f64?  C   // NULL < PG14
+active_time              f64?  C
+idle_in_transaction_time f64?  C
+sessions                 i64?  C
+sessions_abandoned       i64?  C
+sessions_fatal           i64?  C
+sessions_killed          i64?  C
+```
+
+## `1_006_001` `pg_stat_bgwriter` + `pg_stat_checkpointer`
+
+Синглтон. На PG17+ часть колонок переехала в `pg_stat_checkpointer`; коллектор
+склеивает данные обратно в одну строку.
+
+```text
+ts                    ts   T
+checkpoints_timed     i64  C
+checkpoints_req       i64  C
+checkpoint_write_time f64  C
+checkpoint_sync_time  f64  C
+buffers_checkpoint    i64  C
+buffers_clean         i64  C
+maxwritten_clean      i64  C
+buffers_backend       i64? C   // NULL на PG17+
+buffers_backend_fsync i64? C   // NULL на PG17+
+buffers_alloc         i64  C
+```
+
+## `1_007_001` `pg_stat_wal`
+
+PG14+.
+
+```text
+ts               ts   T
+wal_records      i64  C
+wal_fpi          i64  C
+wal_bytes        i64  C   // numeric в PG, приводится к i64
+wal_buffers_full i64  C
+wal_write        i64  C
+wal_sync         i64  C
+wal_write_time   f64  C
+wal_sync_time    f64  C
+stats_reset      ts   G
+```
+
+## `1_008_001` `pg_stat_archiver`
+
+```text
+ts                 ts   T
+archived_count     i64  C
+last_archived_wal  str? L
+last_archived_time ts?  G
+failed_count       i64  C
+last_failed_wal    str? L
+last_failed_time   ts?  G
+stats_reset        ts   G
+```
+
+## `1_009_001` `pg_stat_io`
+
+PG16+. Сущность — тройка `(backend_type, object, context)`, обычно 30-50 строк
+за один регулярный сбор.
+
+```text
+ts              ts   T
+backend_type    str  L
+object          str  L   // relation | temp relation | wal
+context         str  L   // normal | vacuum | bulkread | bulkwrite
+reads           i64  C
+read_time       f64  C
+writes          i64  C
+write_time      f64  C
+writebacks      i64  C
+writeback_time  f64  C
+extends         i64  C
+extend_time     f64  C
+op_bytes        i64  L
+hits            i64  C
+evictions       i64  C
+reuses          i64  C
+fsyncs          i64  C
+fsync_time      f64  C
+```
+
+## `1_010_001` агрегат `pg_prepared_xacts`
+
+```text
+ts               ts   T
+count            i32  G
+max_age_seconds  i64  G
+```
+
+Этого достаточно, чтобы предупредить о забытом 2PC. Полная таблица prepared
+transactions может стать отдельным типом, если понадобится детализация.
+
+## `1_011_001` `pg_locks`, дерево ожиданий
+
+`conditional_full`. Пишется только при наличии ожиданий. Перед тяжелым
+рекурсивным CTE выполняется дешевая предварительная проверка по
+`pg_stat_activity` с кэшем около 1 секунды. Если предварительная проверка не
+нашла ожиданий, секция может отсутствовать; код чтения трактует это как пустое
+дерево ожиданий в этом окне, а не как неизвестное состояние.
+
+```text
+ts                ts    T
+root_pid          i32   L
+depth             i32   L
+pid               i32   L
+datname           str   L
+usename           str   L
+state             str   L
+wait_event_type   str?  L
+wait_event        str?  L
+query             str   L
+application_name  str   L
+backend_type      str   L
+xact_start        ts?   G
+query_start       ts    G
+state_change      ts    G
+lock_type         str   L
+lock_mode         str   L
+lock_granted      bool  L
+lock_target       str   L
+```
+
+Секция может отсутствовать в большинстве сегментов. Для этого источника это
+нормально и входит в контракт `conditional_full`.
+
+## `1_012_001` `pg_stat_progress_vacuum`
+
+```text
+ts                  ts   T
+pid                 i32  L
+datname             str  L
+relid               u32  L
+phase               str  L
+heap_blks_total     i64  G
+heap_blks_scanned   i64  G
+heap_blks_vacuumed  i64  G
+index_vacuum_count  i64  G
+max_dead_tuples     i64? G   // NULL на PG17+
+num_dead_tuples     i64? G   // NULL на PG17+
+dead_tuple_bytes    i64? G   // NULL < PG17
+indexes_total       i64? G   // NULL < PG17
+indexes_processed   i64? G   // NULL < PG17
+```
+
+`heap_blks_scanned` и `heap_blks_vacuumed` монотонны внутри одного vacuum, но
+остаются полями класса `G`: между запусками они сбрасываются.
+
+## `1_013_001` `pg_stat_user_tables` + `pg_statio_user_tables`
+
+Собирается отдельно по каждой базе через пул соединений: одно соединение на
+базу, обновление пула раз в 10 минут. Явный `PGDATABASE` отключает режим
+нескольких баз. Источник собирается top-N, значение по умолчанию — 500 строк.
+Порядок отбора фиксируется в coverage `order_by`; базовый вариант:
+`greatest(seq_scan, idx_scan, n_tup_ins + n_tup_upd + n_tup_del, size_bytes)
+DESC`. `pg_statio_user_tables` сливается с основной статистикой по `relid`.
+
+В `changed`-семантике поля класса `G`, например `n_live_tup`, сами по себе
+изменением не считаются, если не сработал `always_include`.
+
+```text
+ts                              ts    T
+datname                         str   L
+relid                           u32   L
+schemaname                      str   L
+relname                         str   L
+tablespace                      str   L
+seq_scan                        i64   C
+seq_tup_read                    i64   C
+idx_scan                        i64   C
+idx_tup_fetch                   i64   C
+n_tup_ins                       i64   C
+n_tup_upd                       i64   C
+n_tup_del                       i64   C
+n_tup_hot_upd                   i64   C
+n_live_tup                      i64   G
+n_dead_tup                      i64   G
+vacuum_count                    i64   C
+autovacuum_count                i64   C
+analyze_count                   i64   C
+autoanalyze_count               i64   C
+last_vacuum                     ts?   G
+last_autovacuum                 ts?   G
+last_analyze                    ts?   G
+last_autoanalyze                ts?   G
+size_bytes                      i64   G
+toast_bytes                     i64   G
+toast_n_live_tup                i64   G
+toast_n_dead_tup                i64   G
+toast_last_autovacuum           ts?   G
+n_mod_since_analyze             i64   G
+n_ins_since_vacuum              i64   G
+heap_blks_read                  i64   C
+heap_blks_hit                   i64   C
+idx_blks_read                   i64   C
+idx_blks_hit                    i64   C
+toast_blks_read                 i64   C
+toast_blks_hit                  i64   C
+tidx_blks_read                  i64   C
+tidx_blks_hit                   i64   C
+is_baseline                     bool  L
+```
+
+## `1_014_001` `pg_stat_user_indexes` + `pg_statio_user_indexes`
+
+Собирается top-N, значение по умолчанию — 500 строк. Порядок отбора фиксируется
+в coverage `order_by`; базовый вариант:
+`greatest(idx_scan, idx_tup_read, size_bytes) DESC`.
+
+```text
+ts             ts    T
+datname        str   L
+indexrelid     u32   L
+relid          u32   L
+schemaname     str   L
+relname        str   L
+indexrelname   str   L
+tablespace     str   L
+amname         str   L
+indexdef       str   L
+idx_scan       i64   C
+idx_tup_read   i64   C
+idx_tup_fetch  i64   C
+size_bytes     i64   G
+last_idx_scan  ts?   G
+indisunique    bool  L
+indisprimary   bool  L
+indisvalid     bool  L
+idx_blks_read  i64   C
+idx_blks_hit   i64   C
+is_baseline    bool  L
+```
+
+## `1_015_001` - `1_017_001` replication
+
+Старая вложенная структура разложена на три плоских типа. Это упрощает код
+чтения и снижает зависимость от поддержки Parquet nested-схем.
+
+### `1_015_001` статус инстанса
+
+```text
+ts                        ts    T
+is_in_recovery            bool  G
+timeline_id               i32   G
+synchronous_standby_names str   L
+synchronous_commit        str   L
+replay_lag_s              i64?  G
+standby_receive_lsn       i64?  G   // LSN как u64-байты
+standby_replay_lsn        i64?  G
+standby_last_replay_at    ts?   G
+current_wal_lsn           i64?  G
+```
+
+Для standby `replay_lag_s = 0`, если receive LSN равен replay LSN.
+
+### `1_016_001` реплики primary
+
+```text
+ts                ts    T
+pid               i32   L
+usename           str   L
+application_name  str   L
+client_addr       str?  L
+state             str   L
+sync_state        str   L
+sent_lsn          i64   G
+write_lsn         i64   G
+flush_lsn         i64   G
+replay_lsn        i64   G
+write_lag_us      i64?  G
+flush_lag_us      i64?  G
+replay_lag_us     i64?  G
+```
+
+### `1_017_001` replication slots
+
+```text
+ts                  ts    T
+slot_name           str   L
+plugin              str?  L
+slot_type           str   L
+active              bool  G
+restart_lsn         i64   G
+confirmed_flush_lsn i64?  G
+retained_bytes      i64?  G
+wal_status          str   G   // reserved | extended | lost, PG13+
+```
+
+## `1_018_001` wraparound
+
+```text
+ts       ts   T
+datname  str  L
+age      i64  G   // age(datfrozenxid)
+```
+
+## `1_019_001` `pg_settings`
+
+`on_change`, политика материализации `every_segment_last_known`. Около 350 строк
+и около 11 КБ на снимок. Источник пишется при старте, при изменении и один раз
+в каждый сегмент как актуальная копия. Это сохраняет самодостаточность сегмента:
+коду чтения не нужно искать настройки в предыдущих сегментах.
+
+```text
+ts              ts    T
+name            str   L
+setting         str   L
+unit            str?  L
+source          str   L
+sourcefile      str?  L
+sourceline      i32?  L
+pending_restart bool  L
+context         str   L
+vartype         str   L
+boot_val        str   L
+reset_val       str   L
+```
+
+## `1_020_001` `reset_metadata`
+
+Служебная секция, обязательная в каждом сегменте. Это не метрика для графика,
+а контекст для механизма сравнения: код чтения использует её, чтобы отличать
+настоящий reset счётчиков от потери данных, переполнения или ошибки кода
+записи.
+
+Зачем это нужно:
+
+- разрывать вычисление скоростей на границах рестарта PostgreSQL;
+- объяснять отрицательные дельты C-счётчиков после `pg_stat_reset()`,
+  `pg_stat_statements_reset()` и аналогичных reset-функций;
+- понимать, доступны ли `pg_stat_statements` и `pg_store_plans`, и какой
+  версии их схемы;
+- корректно интерпретировать `query_id` и IO-time колонки, зависящие от GUC.
+
+Секция содержит одну строку на сегмент. `ts` — время чтения метаданных. Все поля
+типа `ts` хранятся в `i64 unix usec`. Если источник отдаёт
+`timestamp with time zone`, коллектор должен умножить `EXTRACT(EPOCH)` на
+`1_000_000`.
+
+```text
+ts                             ts    T
+postmaster_start_time          ts    G
+pg_stat_database_reset_max_at  ts    G
+pg_stat_statements_reset_at    ts?   G
+pg_store_plans_reset_at        ts?   G
+pg_stat_bgwriter_reset_at      ts?   G
+pg_stat_checkpointer_reset_at  ts?   G
+pg_stat_wal_reset_at           ts?   G
+pg_stat_archiver_reset_at      ts    G
+pg_stat_io_reset_at            ts?   G
+ext_pg_stat_statements_version str?  L
+ext_pg_store_plans_version     str?  L
+compute_query_id               str?  L
+track_io_timing                bool? L
+```
+
+Семантика полей:
+
+| Поле | Значение |
+|------|----------|
+| `postmaster_start_time` | время старта postmaster; изменение означает рестарт PostgreSQL |
+| `pg_stat_database_reset_max_at` | максимум `stats_reset` из `pg_stat_database`; грубый маркер reset на уровне базы |
+| `pg_stat_statements_reset_at` | reset `pg_stat_statements`; `NULL`, если расширение или `pg_stat_statements_info` недоступны |
+| `pg_store_plans_reset_at` | reset `pg_store_plans`; `NULL`, если расширение, информационное представление/функция или форк этого не поддерживает |
+| `pg_stat_bgwriter_reset_at` | reset bgwriter-статистики; `NULL`, если представление или поле недоступны |
+| `pg_stat_checkpointer_reset_at` | reset checkpointer-статистики; `NULL` до PG17 |
+| `pg_stat_wal_reset_at` | reset WAL-статистики; `NULL` до появления `pg_stat_wal` |
+| `pg_stat_archiver_reset_at` | reset archiver-статистики |
+| `pg_stat_io_reset_at` | reset `pg_stat_io`; `NULL` до PG16 |
+| `ext_pg_stat_statements_version` | версия расширения или `NULL`, если расширение не установлено в доступных БД |
+| `ext_pg_store_plans_version` | версия расширения или `NULL` |
+| `compute_query_id` | значение GUC; при `off`/`NULL` `query_id` нельзя считать надежным ключом |
+| `track_io_timing` | если `false`, `blk_*_time` остаются нулевыми и не означают «быстрый IO»; `NULL`, если GUC недоступен |
+
+Правила для кода чтения:
+
+- Если `postmaster_start_time` изменился, все PostgreSQL C-счётчики считаются
+  начавшимися заново.
+- Если любой `*_reset_at` увеличился между соседними точками, скорость для
+  связанных C-счётчиков не считается через эту границу.
+- Если C-счётчик дал отрицательную дельту, а подходящий `*_reset_at` не
+  изменился или недоступен, код чтения всё равно должен разорвать ряд и пометить
+  reset как неподтвержденный.
+- `NULL` в `*_reset_at` означает «источник недоступен», а не unix epoch.
+- `pg_stat_database_reset_max_at` — грубый маркер. Он подтверждает, что был
+  reset статистики на уровне базы, но не говорит, какая именно база сброшена.
+  Если понадобится точная атрибуция, будущая версия должна добавить
+  `stats_reset` по каждой базе в `1_005_001` или отдельный служебный тип.
+
+Соответствие reset-полей типам:
+
+| Типы | Reset-поле |
+|------|------------|
+| `1_002_001` | `pg_stat_statements_reset_at` |
+| `1_003_001`, `1_004_001` | `pg_store_plans_reset_at` |
+| `1_005_001` | `pg_stat_database_reset_max_at` |
+| `1_006_001` | `pg_stat_bgwriter_reset_at`, `pg_stat_checkpointer_reset_at` |
+| `1_007_001` | `pg_stat_wal_reset_at` |
+| `1_008_001` | `pg_stat_archiver_reset_at` |
+| `1_009_001` | `pg_stat_io_reset_at` |
+| все PostgreSQL C-счётчики | `postmaster_start_time` |
+
+## `1_021_001` `instance_metadata`
+
+Служебная секция, обязательная в каждом сегменте с PostgreSQL или OS-снимками.
+
+```text
+ts                    ts    T
+hostname              str   L
+node_self_id          str   L
+pg_version_num        i32   L
+kernel_version        str   L
+pg_system_identifier  i64   L
+clock_ticks_per_sec   i64   L   // sysconf(_SC_CLK_TCK), нужно для ticks
+page_size_bytes       i64   L
+boot_id               str   L   // /proc/sys/kernel/random/boot_id
+btime                 ts    L   // /proc/stat btime
+```
+
+`pg_system_identifier` переживает рестарты и меняется при `initdb`.
+`clock_ticks_per_sec`, `page_size_bytes`, `boot_id` и `btime` делают OS-секции
+самодостаточными: код чтения не должен знать эти значения из внешней
+конфигурации.
+
+## Логовые типы `1_022_001`, `1_024_001` - `1_028_001`
+
+Конвейер чтения логов общий для всех логовых типов:
+
+- читатель логов отслеживает ротацию по inode и усечение файла;
+- лимиты чтения: 10 000 строк за проход, 64 КБ на строку;
+- поддерживаются `stderr` и `csvlog`;
+- `stderr` парсится поиском по ключевым словам и не требует фиксированного
+  `log_line_prefix`;
+- поддерживаются английская и русская локали PostgreSQL;
+- строки продолжения, начинающиеся с пробела или таба, присоединяются к
+  предыдущему событию.
+
+Читатель логов хранит устойчивую позицию чтения отдельно от PGM-сегмента:
+
+```text
+path
+dev
+inode
+offset
+last_ts
+parser_kind
+partial_event_state
+```
+
+Позиция чтения обновляется после успешной записи mini-part. При `copytruncate`,
+ротации через переименование или смене inode читатель логов должен либо
+продолжить с сохранённого offset, либо сгенерировать `collector_gap`, если часть лога могла
+быть потеряна. При перегрузке нельзя бесконечно копить строки в памяти: после
+превышения лимита строки отбрасываются, а коллектор пишет диагностическое
+событие и счётчик отброшенных строк.
+
+Каждый тип `1_024_001` - `1_028_001` порождает тонкое событие в таймлайне
+класса 2. Интерфейс получает метку из хвоста сегмента, а детали читает из
+типизированной секции.
+
+### `1_022_001` log: ошибки
+
+Ошибки группируются по нормализованному шаблону (`pattern`): кавычки, числа и
+скобки заменяются на `...`, длина шаблона ограничена 256 символами. `STATEMENT`
+после ошибки даёт SQL.
+
+Окно агрегации ошибок — интервал сброса mini-part. Внутри окна строки с
+одинаковым `(severity, sqlstate, pattern)` схлопываются в одну с суммарным
+`count`; `message` и `statement` берутся из первого экземпляра.
+
+```text
+ts          ts    T
+severity    u8    L   // WARNING | ERROR | FATAL | PANIC
+sqlstate    str   L
+pattern     str   L
+message     str   L   // первый сырой экземпляр в окне агрегации
+statement   str?  L
+count       u32   G   // повторов шаблона за окно агрегации
+```
+
+### `1_024_001` log: checkpoints
+
+Из строк `checkpoint starting` и `checkpoint complete`, включая русскую
+локаль. Для `checkpoint complete` строка продолжения не требуется: все данные
+в одной строке.
+
+```text
+ts               ts   T
+kind             u8   L   // 0=starting 1=complete 2=too_frequent
+reason           str? L
+buffers_written  i64? G
+write_time_ms    f64? G
+sync_time_ms     f64? G
+total_time_ms    f64? G
+distance_kb      i64? G
+estimate_kb      i64? G
+wal_added        i64? G
+wal_removed      i64? G
+wal_recycled     i64? G
+sync_files       i64? G
+longest_sync_s   f64? G
+average_sync_s   f64? G
+interval_s       i64? G
+```
+
+Дублирование с `1_006_001` намеренное: счётчики дают агрегат, лог даёт
+детализацию по отдельному checkpoint.
+
+### `1_025_001` log: autovacuum / autoanalyze
+
+Из строк `automatic vacuum/analyze of table ...` и строк продолжения с
+buffer usage, rates, system usage, tuples, pages и WAL usage.
+
+```text
+ts                 ts    T
+is_analyze         bool  L
+table_name         str   L
+elapsed_s          f64   G
+tuples_removed     i64   G
+pages_removed      i64   G
+buffer_hits        i64   G
+buffer_misses      i64   G
+buffer_dirtied     i64   G
+avg_read_rate_mbs  f64   G
+avg_write_rate_mbs f64   G
+cpu_user_s         f64   G
+cpu_system_s       f64   G
+wal_records        i64   G
+wal_fpi            i64   G
+wal_bytes          i64   G
+```
+
+Дублирование с `1_012_001` намеренное: progress показывает живой ход, лог —
+стоимость завершенного прохода.
+
+### `1_026_001` log: slow queries
+
+Из `duration: X ms statement: SQL`.
+
+```text
+ts           ts   T
+duration_ms  f64  G
+sql          str  L   // усечение 64 КБ при чтении лога
+```
+
+### `1_027_001` log: lock waits
+
+Из `process N still waiting for ShareLock ... after Y ms`.
+
+```text
+ts            ts   T
+waiting_pid   i32  L
+lock_type     str  L
+wait_ms       f64  G
+```
+
+### `1_028_001` log: server lifecycle
+
+Crash, shutdown, ready. Для crash из `DETAIL` извлекается SQL упавшего процесса,
+если PostgreSQL его записал.
+
+```text
+ts          ts   T
+kind        u8   L   // crash | shutdown | ready | ...
+pid         i32  L
+signal      i32  L
+detail_sql  str? L
+```
+
+## `1_023_001` coverage
+
+Без coverage top-N источники выглядят как полные данные. Пишется по одной
+строке на каждый усеченный источник.
+
+```text
+ts              ts    T
+source_type_id  u32   L
+total           u32   G   // строк в источнике
+collected       u32   G   // строк записано
+max_n           u32   L   // лимит коллектора
+order_by        str   L   // метрика/выражение отбора
+cutoff_value    f64?  G   // NULL, если cutoff неизвестен
+reason          u8    L   // 0=top_n, 1=timeout, 2=permission, 3=other
+```
+
+Coverage не делает top-N источник полным. Он только сообщает коду чтения, какую
+часть источника видел коллектор и почему остальное отсутствует.

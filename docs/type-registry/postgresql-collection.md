@@ -1,0 +1,325 @@
+# Приёмы сбора PostgreSQL
+
+Этот файл фиксирует приёмы из первой реализации, которые должны сохраниться при
+переходе на PGM. Это не байтовая раскладка типов, а контракт поведения
+коллектора.
+
+## Общие правила
+
+- Каждый SQL-запрос коллектора начинается с комментария-маркера
+  `/* reftool:xxx */`. Маркер нужен, чтобы исключать собственные запросы
+  коллектора из `pg_stat_activity`, `pg_stat_statements` и аналитики.
+- Текущие маркеры: `act`, `pgs`, `pgp`, `sys`, `cov`, `cfg`, `rep`, `ext`,
+  `lck`.
+- Запросы к системным каталогам выполняются через `query_with_lock_retry`:
+  DDL может временно держать lock на каталогах.
+- При ошибке соединения сбрасывается клиент и весь кэш окружения:
+  `server_version_num`, версии расширений, наличие функций и прочие признаки.
+- Multidb-режим использует по одному соединению на каждую не-template базу с
+  `datallowconn`. Пул обновляется примерно раз в 10 минут.
+- Явный `PGDATABASE` отключает режим нескольких баз.
+
+## Права PostgreSQL
+
+Коллектор должен работать с минимально достаточными правами. `pg_monitor`
+может использоваться как простой профиль развёртывания, но для рабочей
+установки желателен набор минимальных прав.
+
+| Источник | Минимальное требование | Деградация |
+|----------|------------------------|------------|
+| `pg_stat_activity`, wait events, locks | доступ к `pg_stat_*`; для чужих запросов может требоваться `pg_read_all_stats` или `pg_monitor` | скрытые поля пишутся `NULL`, генерируется permission-событие |
+| `pg_stat_statements` | расширение установлено, права на view/function | тип отсутствует, version поля в `reset_metadata` = `NULL` |
+| `pg_store_plans` | расширение установлено в одной из БД пула, права на view/function | тип отсутствует или plan/reset поля `NULL` |
+| `pg_settings` | доступ к `pg_settings`; часть sourcefile может быть скрыта | скрытые поля `NULL` |
+| представления репликации | права на `pg_stat_replication`, `pg_replication_slots`; часто нужна роль мониторинга | типы репликации отсутствуют или частично `NULL` |
+| PostgreSQL logs | файловый доступ к `log_directory` или sidecar shipping | логовые event_stream-типы отсутствуют, генерируется permission-событие |
+
+Нули не используются как замена недоступных значений. Недоступность источника
+должна быть видна в metadata, событии или self-metrics коллектора.
+
+## `1_001_001` activity
+
+```sql
+/* reftool:act */
+SELECT
+  pid,
+  datname,
+  usename,
+  application_name,
+  host(client_addr) AS client_addr,
+  state,
+  LEFT(query, :max_text_len) AS query,
+  query_id,
+  wait_event_type,
+  wait_event,
+  backend_type,
+  backend_start,
+  xact_start,
+  query_start,
+  state_change,
+  now() AS collected_at
+FROM pg_stat_activity;
+```
+
+`query_id` доступен не на всех версиях PostgreSQL и при
+`compute_query_id = off` может быть нулем.
+
+## `1_002_001` statements: двухфазный сбор текстов
+
+Фаза 1: статистика без текстов.
+
+```sql
+/* reftool:pgs */
+SELECT
+  s.userid,
+  s.dbid,
+  s.queryid,
+  COALESCE(d.datname, '') AS datname,
+  COALESCE(r.rolname, '') AS usename,
+  s.calls,
+  s.total_exec_time,
+  ...
+FROM pg_stat_statements(showtext := false) s
+LEFT JOIN pg_database d ON d.oid = s.dbid
+LEFT JOIN pg_roles r ON r.oid = s.userid
+ORDER BY total_exec_time DESC
+LIMIT :max_statements;
+```
+
+Для PG < 13 используются старые имена колонок, например `total_time`.
+
+Фаза 2: тексты только для `queryid`, которых ещё нет в интернер-кэше.
+
+```sql
+/* reftool:pgs */
+SELECT
+  queryid,
+  LEFT(query, :max_text_len) AS query
+FROM pg_stat_statements
+WHERE queryid = ANY($1);
+```
+
+Расширение `pg_stat_statements` ищется по всем базам пула: оно может быть
+установлено не в основной базе. Версия расширения перепроверяется примерно раз
+в 5 минут.
+
+## `1_003_001` / `1_004_001` store_plans
+
+Fork определяется при старте по наличию функций в `pg_proc`.
+
+- ossc: план доступен готовой колонкой `s.plan`;
+- vadv-форк: план реконструируется через
+  `pg_store_plans_textplan(pg_store_plans_get_plan(userid, dbid, queryid, planid))`.
+
+Время IO у vadv-форка нормализуется как сумма shared, local и temp
+`blk_*_time`.
+
+## `1_011_001` дерево ожиданий lock
+
+Сбор двухступенчатый.
+
+Ступень 1: дешевая предварительная проверка с кэшем около 1 секунды.
+
+```sql
+/* reftool:lck */
+SELECT EXISTS (
+  SELECT 1
+  FROM pg_stat_activity
+  WHERE wait_event_type = 'Lock'
+);
+```
+
+Ступень 2: рекурсивный CTE выполняется только если предварительная проверка
+нашла ожидания.
+
+```sql
+WITH RECURSIVE blockers AS (
+  SELECT
+    pid,
+    pg_blocking_pids(pid) AS blocked_by,
+    1 AS depth,
+    pid AS root_pid
+  FROM pg_stat_activity
+  WHERE cardinality(pg_blocking_pids(pid)) > 0
+
+  UNION ALL
+  ...
+) SELECT ...
+LIMIT :max_rows;
+```
+
+CTE должен подниматься к корням блокировок и джойниться с `pg_locks`, чтобы
+получить тип, режим и цель lock.
+
+## `1_013_001` / `1_014_001` tables и indexes
+
+Для таблиц выполняются два запроса на базу:
+
+- `pg_stat_user_tables` с top-N и размером через `pg_total_relation_size`;
+- `pg_statio_user_tables`.
+
+Результаты объединяются на коллекторе по `relid`. Отдельный дешёвый запрос
+`count(*)` даёт coverage для `1_023_001`.
+
+Для индексов схема аналогична:
+
+- `pg_stat_user_indexes`;
+- `pg_statio_user_indexes`;
+- `pg_get_indexdef`;
+- `pg_am.amname`;
+- флаги из `pg_index`.
+
+## `1_006_001` bgwriter и checkpointer
+
+PG <= 16: читается `pg_stat_bgwriter`.
+
+PG 17+: читаются `pg_stat_checkpointer` и `pg_stat_bgwriter`, затем данные
+склеиваются в одну строку. Колонки `buffers_backend` и
+`buffers_backend_fsync`, удалённые из PostgreSQL, пишутся как `NULL`.
+
+## `1_020_001` reset metadata
+
+`reset_metadata` собирается минимум один раз на сегмент, лучше дважды: при
+открытии сегмента и перед запечатыванием. В секцию пишется последнее
+наблюденное значение. Если между двумя чтениями изменился `postmaster_start_time`
+или один из `*_reset_at`, коллектор дополнительно генерирует событие
+`stats_reset` или `pg_restart`.
+
+Все SQL timestamp-значения переводятся в `unix usec`. Запросы ниже не являются
+одним монолитным SQL: коллектор выполняет только те фрагменты, которые
+поддерживаются текущей версией PostgreSQL и установленными расширениями.
+
+```sql
+-- выражение-шаблон
+(EXTRACT(EPOCH FROM ts_value) * 1000000)::bigint
+```
+
+`NULL` сохраняется как `NULL`; подставлять `0` запрещено.
+
+### Базовые поля
+
+```sql
+SELECT
+  (EXTRACT(EPOCH FROM pg_postmaster_start_time()) * 1000000)::bigint
+    AS postmaster_start_time;
+
+SELECT
+  (EXTRACT(EPOCH FROM MAX(stats_reset)) * 1000000)::bigint
+    AS pg_stat_database_reset_max_at
+FROM pg_stat_database;
+
+SELECT
+  MAX(extversion) FILTER (WHERE extname = 'pg_stat_statements')
+    AS ext_pg_stat_statements_version,
+  MAX(extversion) FILTER (WHERE extname = 'pg_store_plans')
+    AS ext_pg_store_plans_version
+FROM pg_extension
+WHERE extname IN ('pg_stat_statements', 'pg_store_plans');
+
+SELECT
+  current_setting('compute_query_id', true) AS compute_query_id,
+  current_setting('track_io_timing', true)::bool AS track_io_timing;
+```
+
+`compute_query_id` отсутствует на старых версиях PostgreSQL; в этом случае
+`current_setting(..., true)` вернет `NULL`.
+
+### `pg_stat_statements`
+
+`pg_stat_statements_info` доступен только в pgss >= 1.9. Запрос выполняется
+только если `to_regclass('pg_stat_statements_info') IS NOT NULL`; иначе поле
+`pg_stat_statements_reset_at` пишется как `NULL`.
+
+```sql
+SELECT
+  (EXTRACT(EPOCH FROM stats_reset) * 1000000)::bigint
+    AS pg_stat_statements_reset_at
+FROM pg_stat_statements_info;
+```
+
+### `pg_store_plans`
+
+У ossc `pg_store_plans` есть `pg_store_plans_info.stats_reset`.
+Информационное представление и одноименная функция доступны только в базе, где
+выполнен `CREATE EXTENSION`, хотя статистика собирается по серверу в целом.
+Коллектор должен выполнять запрос в любой доступной базе, где найдено
+расширение.
+
+Если форк не предоставляет `pg_store_plans_info` или у текущего пользователя
+нет доступа, `pg_store_plans_reset_at` пишется как `NULL`.
+
+```sql
+SELECT
+  (EXTRACT(EPOCH FROM stats_reset) * 1000000)::bigint
+    AS pg_store_plans_reset_at
+FROM pg_store_plans_info;
+```
+
+### Глобальные представления статистики PostgreSQL
+
+Эти поля нужны для объяснения reset глобальных C-счётчиков. Запросы выполняются
+только на версиях PostgreSQL, где соответствующее представление и колонка
+существуют.
+
+```sql
+SELECT
+  (EXTRACT(EPOCH FROM stats_reset) * 1000000)::bigint
+    AS pg_stat_bgwriter_reset_at
+FROM pg_stat_bgwriter;
+
+-- PG17+
+SELECT
+  (EXTRACT(EPOCH FROM stats_reset) * 1000000)::bigint
+    AS pg_stat_checkpointer_reset_at
+FROM pg_stat_checkpointer;
+
+-- PG14+
+SELECT
+  (EXTRACT(EPOCH FROM stats_reset) * 1000000)::bigint
+    AS pg_stat_wal_reset_at
+FROM pg_stat_wal;
+
+SELECT
+  (EXTRACT(EPOCH FROM stats_reset) * 1000000)::bigint
+    AS pg_stat_archiver_reset_at
+FROM pg_stat_archiver;
+
+-- PG16+. В pg_stat_io несколько строк, временная метка reset общая; берём MAX.
+SELECT
+  (EXTRACT(EPOCH FROM MAX(stats_reset)) * 1000000)::bigint
+    AS pg_stat_io_reset_at
+FROM pg_stat_io;
+```
+
+### Как это использует код чтения
+
+Пример: в `pg_stat_statements.calls` было `100000`, стало `20`. Это
+отрицательная дельта C-счётчика. Если между точками увеличился
+`pg_stat_statements_reset_at`, код чтения разрывает ряд и начинает считать
+скорость с новой базы. Если `pg_stat_statements_reset_at` недоступен, ряд всё равно
+разрывается, но reset помечается как неподтвержденный метаданными.
+
+Аналогично, если изменился `postmaster_start_time`, код чтения не считает
+скорость через границу рестарта ни для одного PostgreSQL C-счётчика.
+
+## `1_015_001` - `1_017_001` replication
+
+Роль инстанса определяется через `pg_is_in_recovery()`.
+
+Standby lag считается с поправкой на idle primary:
+
+- если `pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn()`, lag равен 0;
+- иначе используется `now() - pg_last_xact_replay_timestamp()`.
+
+Без этой поправки на простаивающем primary lag ложно растёт.
+
+На primary читаются:
+
+- `pg_stat_replication`;
+- `pg_replication_slots`.
+
+`retained_bytes` слота считается как:
+
+```sql
+pg_current_wal_lsn() - restart_lsn
+```
