@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kronika-format",
+    "crates/kronika-derive",
+    "crates/kronika-registry",
+    "crates/kronika-writer",
+    "crates/kronika-store",
+    "crates/kronika-store-http",
+    "crates/kronika-store-s3",
+    "crates/kronika-reader",
+    "crates/kronika-diff",
+    "crates/kronika-charts",
+    "crates/kronika-source-pg",
+    "crates/kronika-source-os",
+    "crates/kronika-source-log",
+    "bins/pg_kronika-collector",
+    "bins/pg_kronika-web",
+    "bins/pg_kronika-archiver",
+    "bins/pg_kronika-dump",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/vadv/PgKronika"
+
+# Crates are internal: the release is a single archive of four binaries,
+# nothing is published to crates.io (docs/architecture.md, "Versioning").
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
