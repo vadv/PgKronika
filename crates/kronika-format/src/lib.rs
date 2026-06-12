@@ -17,6 +17,11 @@
 mod catalog;
 mod crc;
 
+// proptest is used by tests/property.rs only; anchored for the
+// `unused_crate_dependencies` lint, which checks each target separately.
+#[cfg(test)]
+use proptest as _;
+
 pub use catalog::{Catalog, DecodeError, ENTRY_LEN, Entry, META_LEN, TAIL_INDEX_LEN, TailIndex};
 pub use crc::crc32c;
 

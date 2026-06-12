@@ -8,7 +8,7 @@
 //! archiver does not need a rebuild when data types are added.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Command;
+use std::process::{Command, ExitCode};
 
 /// Allowed internal (workspace) crates per binary, including transitive
 /// dependencies. Keep in sync with `docs/architecture.md`; a change here
@@ -67,12 +67,12 @@ const RULES: &[(&str, &[&str])] = &[
     ),
 ];
 
-fn main() {
+fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("check-deps") {
-        check_deps();
+        check_deps()
     } else {
         eprintln!("usage: cargo run -p xtask -- check-deps");
-        std::process::exit(2);
+        ExitCode::from(2)
     }
 }
 
@@ -124,7 +124,7 @@ fn reachable(graph: &BTreeMap<String, BTreeSet<String>>, start: &str) -> BTreeSe
     seen
 }
 
-fn check_deps() {
+fn check_deps() -> ExitCode {
     let graph = workspace_graph();
     let mut violations = Vec::new();
 
@@ -145,11 +145,12 @@ fn check_deps() {
 
     if violations.is_empty() {
         println!("check-deps: ok ({} binaries checked)", RULES.len());
+        ExitCode::SUCCESS
     } else {
         eprintln!("dependency rules from docs/architecture.md are violated:");
         for v in &violations {
             eprintln!("  {v}");
         }
-        std::process::exit(1);
+        ExitCode::FAILURE
     }
 }

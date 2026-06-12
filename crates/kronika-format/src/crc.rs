@@ -11,7 +11,7 @@ const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 /// Every checksum in the PGM container — section bodies, the end catalog,
 /// `active.parts` frame headers — is CRC32C (`docs/segment-format.md`).
 #[must_use]
-pub fn crc32c(bytes: &[u8]) -> u32 {
+pub const fn crc32c(bytes: &[u8]) -> u32 {
     CRC32C.checksum(bytes)
 }
 

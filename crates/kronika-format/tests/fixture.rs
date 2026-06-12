@@ -17,6 +17,10 @@
 //! ```
 
 use kronika_format::{Catalog, Entry, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
+// Dev-dependencies of other test targets; anchored for the
+// `unused_crate_dependencies` lint, which checks each target separately.
+use crc as _;
+use proptest as _;
 
 const SEGMENT: &[u8] = include_bytes!("fixtures/minimal.pgm");
 

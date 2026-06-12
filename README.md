@@ -48,19 +48,22 @@ docs/      design documents
 xtask/     workspace maintenance commands
 ```
 
-Important design documents:
+The `docs/` directory is design context, not the final source of truth for
+implemented code. As crates are implemented, their local README files, rustdoc,
+and tests become the current contract for the implemented subset.
+
+Useful design notes:
 
 - [`docs/architecture.md`](docs/architecture.md) describes the processes,
   deployment shapes, workspace layout, and versioning rules.
-- [`docs/segment-format.md`](docs/segment-format.md) specifies the PGM container
-  format.
-- [`docs/type-registry.md`](docs/type-registry.md) is the entry point for
-  typed PostgreSQL, OS, cgroup, event, dictionary, and chart sections.
+- [`docs/segment-format.md`](docs/segment-format.md) records the original PGM
+  container design.
+- [`docs/type-registry.md`](docs/type-registry.md) records the initial registry
+  design for PostgreSQL, OS, cgroup, event, dictionary, and chart sections.
 - [`docs/testing.md`](docs/testing.md) describes the testing strategy.
 - [`docs/plan.md`](docs/plan.md) records the implementation sequence.
 
-The design documents are currently in Russian. English versions are expected
-after the contracts stabilize.
+Most design notes are currently in Russian.
 
 ## Development
 

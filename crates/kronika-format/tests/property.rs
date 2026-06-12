@@ -9,6 +9,10 @@
 use kronika_format::{Catalog, Entry, TAIL_INDEX_LEN, TailIndex};
 use proptest::prelude::*;
 
+// Dev-dependency of unit tests; anchored for the
+// `unused_crate_dependencies` lint, which checks each target separately.
+use crc as _;
+
 fn entry_strategy() -> impl Strategy<Value = Entry> {
     (
         any::<u32>(),
@@ -36,13 +40,15 @@ fn catalog_strategy() -> impl Strategy<Value = Catalog> {
         any::<u64>(),
         any::<u32>(),
     )
-        .prop_map(|(entries, min_ts, max_ts, source_id, format_version)| Catalog {
-            entries,
-            min_ts,
-            max_ts,
-            source_id,
-            format_version,
-        })
+        .prop_map(
+            |(entries, min_ts, max_ts, source_id, format_version)| Catalog {
+                entries,
+                min_ts,
+                max_ts,
+                source_id,
+                format_version,
+            },
+        )
 }
 
 /// Decode the way a reader does: tail index first, then the catalog bytes
@@ -53,7 +59,7 @@ fn read_back(encoded: &[u8]) -> Result<Catalog, String> {
     }
     let tail_bytes: [u8; TAIL_INDEX_LEN] = encoded[encoded.len() - TAIL_INDEX_LEN..]
         .try_into()
-        .expect("fixed-size tail");
+        .map_err(|_infallible| "fixed-size tail".to_owned())?;
     let tail = TailIndex::decode(tail_bytes).map_err(|e| e.to_string())?;
     let catalog_end = encoded.len() - TAIL_INDEX_LEN;
     let catalog_start = catalog_end
