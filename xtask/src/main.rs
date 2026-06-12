@@ -4,7 +4,7 @@
 //! from `docs/architecture.md` ("Workspace layout"): every internal crate
 //! reachable from a binary must be in that binary's allow list. The rules
 //! exist so that S3 code and cloud credentials never reach the privileged
-//! collector, the PostgreSQL client never reaches the web process, and the
+//! collector, the `PostgreSQL` client never reaches the web process, and the
 //! archiver does not need a rebuild when data types are added.
 
 use std::collections::{BTreeMap, BTreeSet};
