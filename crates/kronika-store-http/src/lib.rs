@@ -1,4 +1,4 @@
-//! `DaemonHttp` client: range reads of segments served by a remote web process.
+//! HTTP-backed segment storage.
 //!
-//! See `docs/architecture.md` for the workspace layout and the dependency
-//! rules between crates, and `docs/segment-format.md` for the PGM format.
+//! This crate will read segment byte ranges from a remote web process. Public
+//! API docs will be added here as the crate is implemented.

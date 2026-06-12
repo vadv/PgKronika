@@ -1,22 +1,12 @@
-//! End catalog and tail index: the entry point for reading a PGM segment.
+//! End catalog and tail index.
 //!
-//! Byte layout is fixed-size and little-endian so that opening a segment
-//! does not depend on a serializer (README.md, "Catalog Entry" and the
-//! sections that follow it):
+//! A reader opens a segment from the end. The last 8 bytes are the tail
+//! index; it gives the byte length of the catalog block immediately before
+//! it. The catalog block contains fixed-size entries followed by fixed-size
+//! segment metadata.
 //!
-//! ```text
-//! entry: 32 B            meta: 40 B              tail index: 8 B
-//!   type_id   u32          min_ts         i64      catalog_len u32
-//!   flags     u32          max_ts         i64      magic       "PGM1"
-//!   offset    u64          source_id      u64
-//!   len       u64          entry_count    u32
-//!   rows      u32          format_version u32
-//!   crc32c    u32          crc32c         u32
-//!                          reserved       u32
-//! ```
-//!
-//! The catalog on disk is `entries × 32 + meta` bytes, immediately followed
-//! by the tail index, which is the last thing in the file.
+//! All integers are little-endian. Catalog entry offsets are absolute file
+//! offsets from the start of the segment.
 
 use std::error::Error;
 use std::fmt;
@@ -33,11 +23,12 @@ pub const TAIL_INDEX_LEN: usize = 8;
 /// Offset of the `crc32c` field inside the meta block.
 const META_CRC_OFFSET: usize = 32;
 
-/// One section of a segment: its type, location and body checksum.
+/// One row in the end catalog.
 ///
-/// A `type_id` may repeat: parts of one logical section in catalog order,
-/// except chart sections, where repeats are different entities
-/// (README.md, "Catalog Entry").
+/// Each row points to one section body and records the checksum of that body.
+/// A `type_id` may repeat: repeated rows are parts of one logical section in
+/// catalog order, except for chart sections where repeated rows describe
+/// different entities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
     /// Section type from the type registry (`kronika-registry`).
@@ -54,7 +45,10 @@ pub struct Entry {
     pub crc32c: u32,
 }
 
-/// The decoded end catalog: section table plus segment-level metadata.
+/// Decoded end catalog.
+///
+/// The catalog contains all section entries and the segment-level metadata
+/// stored after those entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Catalog {
     /// Section table, in on-disk order. Order matters for multi-part
@@ -70,7 +64,9 @@ pub struct Catalog {
     pub format_version: u32,
 }
 
-/// Tail index: the fixed-size pointer at the very end of a segment.
+/// Pointer to the end catalog.
+///
+/// This is always the last 8 bytes of a segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TailIndex {
     /// Length of the catalog (entries + meta) preceding the tail index.
@@ -137,7 +133,7 @@ impl fmt::Display for DecodeError {
 impl Error for DecodeError {}
 
 impl TailIndex {
-    /// Encode into the eight bytes that close a segment file.
+    /// Encode this tail index as its 8-byte on-disk form.
     #[must_use]
     pub fn encode(self) -> [u8; TAIL_INDEX_LEN] {
         let mut out = [0_u8; TAIL_INDEX_LEN];
@@ -146,12 +142,12 @@ impl TailIndex {
         out
     }
 
-    /// Decode from the last eight bytes of a segment file.
+    /// Decode the final 8 bytes of a segment.
     ///
     /// # Errors
     ///
-    /// [`DecodeError::BadTailMagic`] if the magic does not match: the file
-    /// is not a PGM segment or its tail is damaged.
+    /// Returns [`DecodeError::BadTailMagic`] when the trailing magic bytes are
+    /// not `PGM1`.
     pub fn decode(bytes: [u8; TAIL_INDEX_LEN]) -> Result<Self, DecodeError> {
         let [l0, l1, l2, l3, m0, m1, m2, m3] = bytes;
         let magic = [m0, m1, m2, m3];
@@ -164,20 +160,23 @@ impl TailIndex {
 }
 
 impl Catalog {
-    /// On-disk length of entries + meta, without the tail index.
+    /// Length of the catalog block, excluding the tail index.
+    ///
+    /// This is the value stored as `catalog_len` in [`TailIndex`].
     #[must_use]
     pub const fn encoded_len(&self) -> usize {
         self.entries.len() * ENTRY_LEN + META_LEN
     }
 
-    /// Encode entries, meta and the tail index — everything that follows
-    /// the last section body in a segment file.
+    /// Encode catalog entries, metadata, and the tail index.
+    ///
+    /// The returned buffer starts immediately after the last section body and
+    /// ends with the 8-byte tail index.
     ///
     /// # Panics
     ///
-    /// If the encoded catalog does not fit `u32`, i.e. over ~134 million
-    /// entries. A real segment holds well under a thousand sections, so
-    /// this is treated as a writer bug, not a recoverable error.
+    /// Panics if the encoded catalog block does not fit in `u32`. That is a
+    /// writer bug: a valid segment cannot address a larger catalog block.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let catalog_len = u32::try_from(self.encoded_len())
@@ -200,7 +199,7 @@ impl Catalog {
         out.extend_from_slice(&entry_count.to_le_bytes());
         out.extend_from_slice(&self.format_version.to_le_bytes());
         // CRC is computed over the whole catalog with this field zeroed,
-        // then patched in (README.md, "CRC32C").
+        // then patched in.
         let crc_at = out.len();
         out.extend_from_slice(&0_u32.to_le_bytes());
         out.extend_from_slice(&0_u32.to_le_bytes()); // reserved
@@ -211,14 +210,16 @@ impl Catalog {
         out
     }
 
-    /// Decode a catalog from exactly the bytes located by [`TailIndex`]:
-    /// entries + meta, without the tail index itself.
+    /// Decode a catalog block.
+    ///
+    /// `bytes` must contain catalog entries followed by the 40-byte metadata
+    /// block. Do not include the tail index.
     ///
     /// # Errors
     ///
-    /// - [`DecodeError::BadCatalogLen`] — length is not `n × 32 + 40`;
-    /// - [`DecodeError::EntryCountMismatch`] — meta disagrees with length;
-    /// - [`DecodeError::BadCrc`] — the bytes are damaged.
+    /// Returns a [`DecodeError`] when the block length is impossible, the
+    /// stored entry count does not match the block length, or the catalog CRC
+    /// does not match.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         if bytes.len() < META_LEN || !(bytes.len() - META_LEN).is_multiple_of(ENTRY_LEN) {
             return Err(DecodeError::BadCatalogLen {

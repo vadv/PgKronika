@@ -1,137 +1,423 @@
-//! The collector's string interner: segment lifecycle over [`SegmentDicts`].
+//! Per-segment string interner with bounded memory.
 //!
-//! The dictionary contract itself is defined in `kronika-format` and is
-//! documented there; this module adds what only the write path needs
-//! (this crate's README.md): which values are new since the last
-//! mini-part flush, dictionary sizes for self-metrics, and the reset on
-//! segment seal.
+//! The interner keeps two kinds of state:
+//!
+//! - the **window**: a [`SegmentDicts`] with full bytes for values first seen
+//!   since the previous flush;
+//! - the **flushed map**: for every id already written to the journal,
+//!   only its identity — full length, a 16-byte SHA-256 prefix, and the
+//!   accumulated requirement bits. No texts.
+//!
+//! The final segment dictionaries are rebuilt by reading part dictionaries
+//! back from the journal at seal time. Two cases need extra handling:
+//!
+//! - hard-hot values, such as catalog `source_id` and chart headers, are kept
+//!   in memory and inserted into every window;
+//! - when a flushed value gets a stronger requirement, the value enters the
+//!   window again so the next part records the new placement.
 
-use kronika_format::{DictError, DictLimits, DictStats, SegmentDicts, StrId};
+use std::collections::{BTreeMap, HashMap};
+
+use kronika_format::{DictError, DictLimits, DictStats, HotMark, Placement, SegmentDicts, StrId};
+use sha2::{Digest, Sha256};
+
+/// Identity of a value already flushed to the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Flushed {
+    /// Length of the full original value, bytes.
+    full_len: u64,
+    /// First 16 bytes of SHA-256 of the full original value.
+    ///
+    /// This verifies repeated values after the full bytes have been flushed.
+    check: [u8; 16],
+    /// The registry forced this value into `dict.blobs`.
+    blob_required: bool,
+    /// Strict hot requirement.
+    hot_hard: bool,
+    /// Best-effort hot requirement.
+    hot_soft: bool,
+}
+
+impl Flushed {
+    /// Whether `bytes` is the same value this entry was created from.
+    fn matches(&self, bytes: &[u8]) -> bool {
+        self.full_len == bytes.len() as u64 && check16(bytes) == self.check
+    }
+
+    const fn placement(&self, limits: DictLimits) -> Placement {
+        if self.blob_required || self.full_len >= limits.blob_threshold() as u64 {
+            Placement::Blobs
+        } else {
+            Placement::Strings
+        }
+    }
+
+    const fn hot(&self) -> HotMark {
+        if self.hot_hard {
+            HotMark::Hard
+        } else if self.hot_soft {
+            HotMark::Soft
+        } else {
+            HotMark::None
+        }
+    }
+}
+
+/// One interning request, mirroring the four `intern*` entry points.
+#[derive(Debug, Clone, Copy, Default)]
+struct Request {
+    blob_required: bool,
+    hot_hard: bool,
+    hot_soft: bool,
+}
+
+/// First 16 bytes of SHA-256 over `bytes`.
+fn check16(bytes: &[u8]) -> [u8; 16] {
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    let mut out = [0_u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// First 16 bytes of an already computed SHA-256.
+fn first16(digest: [u8; 32]) -> [u8; 16] {
+    let mut out = [0_u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
+}
+
+/// Data returned when the interner finishes a segment.
+#[derive(Debug)]
+pub struct SealedSegment {
+    /// Values not yet flushed to the journal.
+    ///
+    /// The seal path merges this residual window with journal parts.
+    pub window: SegmentDicts,
+    /// Final placement directives for flushed ids, in `str_id` order.
+    pub flushed: Vec<FlushedEntry>,
+}
+
+/// Placement directive for one flushed id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushedEntry {
+    /// The id.
+    pub str_id: StrId,
+    /// Length of the full original value, bytes.
+    pub full_len: u64,
+    /// Final dictionary for the value.
+    pub placement: Placement,
+    /// The hot requirement accumulated for the value.
+    pub hot: HotMark,
+}
 
 /// Per-segment string interner.
 ///
-/// All `intern*` methods are the deduplicating methods of
-/// [`SegmentDicts`] plus tracking for new ids: ids first seen since the
-/// previous [`Interner::take_new`] call are the dictionary content of
-/// the next mini-part — a mini-part dictionary holds the strings first
-/// seen in its window (README.md, "Implemented Scope"). A failed call
-/// changes neither the dictionaries nor the list of new ids.
+/// All `intern*` methods deduplicate against both the window and the flushed
+/// map. A failed call changes no state. Repeats of already-flushed values do
+/// not enter the window again unless they add a stronger placement
+/// requirement.
 #[derive(Debug)]
 pub struct Interner {
-    dicts: SegmentDicts,
-    /// Ids inserted since the last `take_new`, in first-seen order.
-    fresh: Vec<StrId>,
+    window: SegmentDicts,
+    flushed: HashMap<StrId, Flushed>,
+    /// Bytes of hard-hot values inserted into every window.
+    ///
+    /// This stays small because strict-hot values are short headers and source
+    /// ids.
+    hot_pinned: BTreeMap<StrId, Vec<u8>>,
 }
 
 impl Interner {
-    /// Empty interner for a new segment.
+    /// Create an empty interner for a new segment.
     #[must_use]
-    pub const fn new(limits: DictLimits) -> Self {
+    pub fn new(limits: DictLimits) -> Self {
         Self {
-            dicts: SegmentDicts::new(limits),
-            fresh: Vec::new(),
+            window: SegmentDicts::new(limits),
+            flushed: HashMap::new(),
+            hot_pinned: BTreeMap::new(),
         }
     }
 
-    /// Intern with size-based routing. See [`SegmentDicts::intern`].
+    /// Intern with size-based placement.
     ///
     /// # Errors
     ///
-    /// [`DictError::Collision`] — see [`SegmentDicts::intern`].
+    /// Returns [`DictError::Collision`] if the id is already used for a
+    /// different value, or if the input hashes to zero. On error, the interner
+    /// state is unchanged.
     pub fn intern(&mut self, bytes: &[u8]) -> Result<StrId, DictError> {
-        self.track(|dicts| dicts.intern(bytes))
+        self.request(bytes, Request::default()).map(|(id, _)| id)
     }
 
-    /// Intern a registry-forced blob value. See
-    /// [`SegmentDicts::intern_blob`].
+    /// Intern a value that must be stored in `dict.blobs`.
     ///
     /// # Errors
     ///
-    /// [`DictError::Collision`] or [`DictError::PlacementConflict`] — see
-    /// [`SegmentDicts::intern_blob`].
+    /// Returns [`DictError::Collision`] or [`DictError::PlacementConflict`] as
+    /// in [`SegmentDicts::intern_blob`]. On error, the interner state is
+    /// unchanged.
     pub fn intern_blob(&mut self, bytes: &[u8]) -> Result<StrId, DictError> {
-        self.track(|dicts| dicts.intern_blob(bytes))
+        self.request(
+            bytes,
+            Request {
+                blob_required: true,
+                ..Request::default()
+            },
+        )
+        .map(|(id, _)| id)
     }
 
-    /// Intern a strict-hot value. See [`SegmentDicts::intern_hot`].
+    /// Intern a value that must be available in every mini-part hot cache.
+    ///
+    /// The value is kept in memory and inserted into each new window.
     ///
     /// # Errors
     ///
-    /// [`DictError::Collision`] or [`DictError::PlacementConflict`] — see
-    /// [`SegmentDicts::intern_hot`].
+    /// Returns [`DictError::Collision`] or [`DictError::PlacementConflict`] as
+    /// in [`SegmentDicts::intern_hot`]. On error, the interner state is
+    /// unchanged.
     pub fn intern_hot(&mut self, bytes: &[u8]) -> Result<StrId, DictError> {
-        self.track(|dicts| dicts.intern_hot(bytes))
-    }
-
-    /// Intern a best-effort hot value. See
-    /// [`SegmentDicts::intern_hot_best_effort`].
-    ///
-    /// # Errors
-    ///
-    /// [`DictError::Collision`] — see
-    /// [`SegmentDicts::intern_hot_best_effort`].
-    pub fn intern_hot_best_effort(&mut self, bytes: &[u8]) -> Result<(StrId, bool), DictError> {
-        let before = self.dicts.len();
-        let (id, hot) = self.dicts.intern_hot_best_effort(bytes)?;
-        self.note_new(before, id);
-        Ok((id, hot))
-    }
-
-    /// Ids first interned since the previous call: the dictionary content
-    /// of the next mini-part, which holds the strings first seen in its
-    /// flush window. The internal list is drained.
-    ///
-    /// The ids are bare references into [`Self::dicts`], and a later
-    /// requirement upgrade (e.g. [`Self::intern_blob`] of an already
-    /// taken id) can still move a value between `strings` and `blobs`.
-    /// So the mini-part encoder must resolve the ids before further
-    /// interning, and the seal path must take placement from the live
-    /// dictionaries, not from placement recorded in already-flushed
-    /// mini-parts.
-    #[must_use = "dropping the result loses the dictionary content of a mini-part window"]
-    pub fn take_new(&mut self) -> Vec<StrId> {
-        std::mem::take(&mut self.fresh)
-    }
-
-    /// Finish the segment: hand the dictionaries to the seal path and
-    /// start the next segment empty. The collector seals early under
-    /// interner growth pressure precisely so that the next segment starts
-    /// with an empty interner (README.md, "Implemented Scope").
-    pub fn seal(&mut self) -> SegmentDicts {
-        self.fresh.clear();
-        let limits = self.dicts.limits();
-        std::mem::replace(&mut self.dicts, SegmentDicts::new(limits))
-    }
-
-    /// Dictionary sizes for the collector's self-metrics.
-    #[must_use]
-    pub fn stats(&self) -> DictStats {
-        self.dicts.stats()
-    }
-
-    /// Read access to the dictionaries built so far.
-    #[must_use]
-    pub const fn dicts(&self) -> &SegmentDicts {
-        &self.dicts
-    }
-
-    /// Run one interning call and record the id if it is new.
-    fn track(
-        &mut self,
-        op: impl FnOnce(&mut SegmentDicts) -> Result<StrId, DictError>,
-    ) -> Result<StrId, DictError> {
-        let before = self.dicts.len();
-        let id = op(&mut self.dicts)?;
-        self.note_new(before, id);
+        let (id, _) = self.request(
+            bytes,
+            Request {
+                hot_hard: true,
+                ..Request::default()
+            },
+        )?;
+        self.hot_pinned.entry(id).or_insert_with(|| bytes.to_vec());
         Ok(id)
     }
 
-    /// New ids are detected by dictionary growth: a repeat or a pure
-    /// requirement upgrade does not grow the map.
-    fn note_new(&mut self, before: usize, id: StrId) {
-        if self.dicts.len() > before {
-            self.fresh.push(id);
+    /// Intern a value that should be added to `dict.hot_strings` when possible.
+    ///
+    /// Returns the id and whether the value is hot after this call. Large or
+    /// blob-forced values keep their normal placement and return `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DictError::Collision`] as in [`Self::intern`]. On error, the
+    /// interner state is unchanged.
+    pub fn intern_hot_best_effort(&mut self, bytes: &[u8]) -> Result<(StrId, bool), DictError> {
+        self.request(
+            bytes,
+            Request {
+                hot_soft: true,
+                ..Request::default()
+            },
+        )
+    }
+
+    /// Flush the current window to the journal and keep only value identities.
+    ///
+    /// `write` receives the current window dictionaries. Only after it returns
+    /// `Ok` are entries moved into the flushed map and the window cleared. If
+    /// `write` returns `Err`, the window is left unchanged.
+    ///
+    /// Returns the number of entries flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `write` returns. The interner adds no errors of its
+    /// own.
+    pub fn flush_window<E>(
+        &mut self,
+        write: impl FnOnce(&SegmentDicts) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        write(&self.window)?;
+
+        let count = self.window.len();
+        for snap in self.window.entries() {
+            // The stored bytes are the full value when not truncated.
+            let check = snap
+                .full_sha256
+                .map_or_else(|| check16(snap.stored_bytes), first16);
+            self.flushed.insert(
+                snap.str_id,
+                Flushed {
+                    full_len: snap.full_len,
+                    check,
+                    blob_required: snap.blob_required,
+                    hot_hard: snap.hot == HotMark::Hard,
+                    hot_soft: snap.hot == HotMark::Soft,
+                },
+            );
         }
+
+        let limits = self.window.limits();
+        self.window = SegmentDicts::new(limits);
+        // Reinsert hard-hot values so the next mini-part carries them too.
+        // These re-inserts cannot fail: every pinned value already passed
+        // the strict-hot checks once, and the window is empty.
+        for bytes in self.hot_pinned.values() {
+            let _ = self.window.intern_hot(bytes);
+        }
+        Ok(count)
+    }
+
+    /// Finish the segment and start the next segment empty.
+    ///
+    /// Returns the residual window plus placement directives for values already
+    /// flushed to the journal.
+    pub fn seal(&mut self) -> SealedSegment {
+        let limits = self.window.limits();
+        let window = std::mem::replace(&mut self.window, SegmentDicts::new(limits));
+        let flushed = std::mem::take(&mut self.flushed);
+        self.hot_pinned.clear();
+
+        let mut entries: Vec<FlushedEntry> = flushed
+            .iter()
+            .map(|(id, f)| FlushedEntry {
+                str_id: *id,
+                full_len: f.full_len,
+                placement: f.placement(limits),
+                hot: f.hot(),
+            })
+            .collect();
+        entries.sort_by_key(|entry| entry.str_id);
+
+        SealedSegment {
+            window,
+            flushed: entries,
+        }
+    }
+
+    /// Return dictionary sizes across the window and the flushed map.
+    ///
+    /// Byte sizes of flushed values count the stored form after truncation,
+    /// matching what is on disk.
+    #[must_use]
+    pub fn stats(&self) -> DictStats {
+        let limits = self.window.limits();
+        let mut stats = self.window.stats();
+        for (id, f) in &self.flushed {
+            // A re-flushed upgrade is present in both maps; the window copy is
+            // current and already counted.
+            if self.window.resolve(*id).is_some() {
+                continue;
+            }
+            let stored_len = f.full_len.min(limits.truncate_limit() as u64);
+            match f.placement(limits) {
+                Placement::Blobs => {
+                    stats.blob_count += 1;
+                    stats.blob_bytes += stored_len;
+                }
+                Placement::Strings => {
+                    stats.string_count += 1;
+                    stats.string_bytes += stored_len;
+                    if f.hot() != HotMark::None {
+                        stats.hot_count += 1;
+                    }
+                }
+            }
+        }
+        stats
+    }
+
+    /// Return the current window.
+    #[must_use]
+    pub const fn window(&self) -> &SegmentDicts {
+        &self.window
+    }
+
+    /// Return whether the id was interned in this segment.
+    #[must_use]
+    pub fn is_interned(&self, id: StrId) -> bool {
+        self.window.resolve(id).is_some() || self.flushed.contains_key(&id)
+    }
+
+    /// Shared intern path.
+    ///
+    /// Checks the window first, then the flushed map, then inserts into the
+    /// window. All checks run before any mutation.
+    fn request(&mut self, bytes: &[u8], req: Request) -> Result<(StrId, bool), DictError> {
+        let Some(id) = StrId::of(bytes) else {
+            return Err(DictError::Collision { id: 0 });
+        };
+
+        if self.window.resolve(id).is_some() {
+            return self.apply_to_window(bytes, req);
+        }
+
+        if let Some(flushed) = self.flushed.get(&id) {
+            if !flushed.matches(bytes) {
+                return Err(DictError::Collision { id: id.get() });
+            }
+            let merged = Request {
+                blob_required: flushed.blob_required || req.blob_required,
+                hot_hard: flushed.hot_hard || req.hot_hard,
+                hot_soft: flushed.hot_soft || req.hot_soft,
+            };
+            let oversized = flushed.full_len >= self.window.limits().blob_threshold() as u64;
+            if merged.hot_hard && (merged.blob_required || oversized) {
+                return Err(DictError::PlacementConflict { id });
+            }
+            let placement_is_blob = merged.blob_required || oversized;
+            // Only changes that must survive a crash re-enter the
+            // window: placement (forced blob) and the strict hot mark
+            // are rebuilt from part dictionaries at recovery, so the
+            // next part has to record them. A soft hot mark is
+            // best-effort by contract — losing it in a crash is fine —
+            // and on a blob-placed value it never becomes effective, so
+            // neither is worth re-buffering megabytes for.
+            let durable_upgrade = merged.blob_required != flushed.blob_required
+                || merged.hot_hard != flushed.hot_hard;
+            let soft_became_effective = merged.hot_soft != flushed.hot_soft && !placement_is_blob;
+
+            if durable_upgrade {
+                let result = self.apply_to_window(bytes, merged)?;
+                self.record_flushed_bits(id, merged);
+                return Ok(result);
+            }
+            if soft_became_effective {
+                self.record_flushed_bits(id, merged);
+            }
+            // The common case: a repeat of a flushed value does not
+            // re-enter memory.
+            let hot = (merged.hot_hard || merged.hot_soft) && !placement_is_blob;
+            return Ok((id, hot));
+        }
+
+        self.apply_to_window(bytes, req)
+    }
+
+    /// Keep the flushed record in sync with an accepted upgrade, so the
+    /// directives of [`Interner::seal`] are correct even before the next
+    /// flush re-records the value on disk.
+    fn record_flushed_bits(&mut self, id: StrId, merged: Request) {
+        if let Some(entry) = self.flushed.get_mut(&id) {
+            entry.blob_required = merged.blob_required;
+            entry.hot_hard = merged.hot_hard;
+            entry.hot_soft = merged.hot_soft;
+        }
+    }
+
+    /// Apply a request to the window, bit by bit: requirements
+    /// accumulate inside [`SegmentDicts`], so each flag is one call.
+    fn apply_to_window(&mut self, bytes: &[u8], req: Request) -> Result<(StrId, bool), DictError> {
+        // Pre-check the conflict so that a multi-flag request cannot
+        // fail halfway and leave a partially-required entry behind.
+        let oversized = bytes.len() >= self.window.limits().blob_threshold();
+        if req.hot_hard && (req.blob_required || oversized) {
+            return Err(DictError::PlacementConflict {
+                id: StrId::of(bytes).unwrap_or_else(|| unreachable!("checked by request()")),
+            });
+        }
+
+        let id = self.window.intern(bytes)?;
+        if req.blob_required {
+            self.window.intern_blob(bytes)?;
+        }
+        if req.hot_hard {
+            self.window.intern_hot(bytes)?;
+        }
+        let hot = if req.hot_soft {
+            self.window.intern_hot_best_effort(bytes)?.1
+        } else {
+            // A successful hard request is hot by definition; the other
+            // callers discard the flag, so no window scan is needed.
+            req.hot_hard
+        };
+        Ok((id, hot))
     }
 }
 
@@ -145,6 +431,13 @@ mod tests {
         Interner::new(DictLimits::new(8, 16).expect("8 <= 16"))
     }
 
+    /// Flush the window pretending the journal write always succeeds.
+    fn flush_ok(interner: &mut Interner) -> usize {
+        interner
+            .flush_window(|_| Ok::<(), ()>(()))
+            .expect("infallible write")
+    }
+
     #[test]
     fn str_id_is_stable_across_instances() {
         let mut a = small_interner();
@@ -155,63 +448,248 @@ mod tests {
     }
 
     #[test]
-    fn take_new_covers_every_intern_variant() {
+    fn window_holds_only_values_new_since_last_flush() {
         let mut interner = small_interner();
-        let a = interner.intern(b"a").expect("plain");
-        let b = interner.intern_blob(b"plan").expect("forced blob");
-        let c = interner.intern_hot(b"hot").expect("strict hot");
-        let (d, hot) = interner.intern_hot_best_effort(b"label").expect("soft hot");
-        assert!(hot);
-        assert_eq!(interner.take_new(), vec![a, b, c, d]);
+        interner.intern(b"a").expect("interns");
+        interner.intern(b"b").expect("interns");
+        assert_eq!(flush_ok(&mut interner), 2);
+        assert!(interner.window().is_empty());
 
-        // Repeats through any variant are not news.
-        interner.intern_blob(b"plan").expect("re-interns");
-        let _ = interner
-            .intern_hot_best_effort(b"label")
-            .expect("re-interns");
-        assert_eq!(interner.take_new(), Vec::new());
-    }
-
-    #[test]
-    fn take_new_tracks_first_seen_per_window() {
-        let mut interner = small_interner();
-        let a = interner.intern(b"a").expect("interns");
-        let b = interner.intern(b"b").expect("interns");
-        assert_eq!(interner.take_new(), vec![a, b]);
-
-        // A repeat is not news; a new value is.
-        interner.intern(b"a").expect("re-interns");
+        // A repeat of a flushed value does not re-enter memory; a new
+        // value does.
+        let again = interner.intern(b"a").expect("re-interns");
+        assert!(interner.window().resolve(again).is_none());
+        assert!(interner.is_interned(again));
         let c = interner.intern(b"c").expect("interns");
-        assert_eq!(interner.take_new(), vec![c]);
-        assert_eq!(interner.take_new(), Vec::new());
+        assert!(interner.window().resolve(c).is_some());
+        assert_eq!(flush_ok(&mut interner), 1);
     }
 
     #[test]
-    fn failed_intern_leaves_state_unchanged() {
+    fn failed_journal_write_keeps_the_window() {
         let mut interner = small_interner();
-        interner
+        interner.intern(b"value").expect("interns");
+        let err = interner.flush_window(|_| Err::<(), &str>("disk full"));
+        assert_eq!(err, Err("disk full"));
+        assert_eq!(
+            interner.window().len(),
+            1,
+            "the only copy of the bytes must survive a failed write"
+        );
+        // And nothing pretends to be durable: a failed write must leave
+        // the flushed map empty, or seal() would emit directives for
+        // values that exist nowhere in the journal.
+        let sealed = interner.seal();
+        assert!(sealed.flushed.is_empty());
+        assert_eq!(sealed.window.len(), 1);
+    }
+
+    #[test]
+    fn seal_before_the_upgrade_is_reflushed_still_reports_fresh_directives() {
+        // Blob upgrade after a flush, sealed before the next flush: the
+        // directive must already carry the new placement, because the
+        // merge takes placement from directives, not from part dicts.
+        let mut interner = small_interner();
+        let id = interner.intern(b"plan").expect("interns");
+        flush_ok(&mut interner);
+        interner.intern_blob(b"plan").expect("upgrade");
+        let sealed = interner.seal();
+        let entry = sealed
+            .flushed
+            .iter()
+            .find(|entry| entry.str_id == id)
+            .expect("directive");
+        assert_eq!(entry.placement, Placement::Blobs);
+
+        // Same for a strict hot upgrade.
+        let mut interner = small_interner();
+        let id = interner.intern(b"src/42").expect("interns");
+        flush_ok(&mut interner);
+        interner.intern_hot(b"src/42").expect("hot upgrade");
+        let sealed = interner.seal();
+        let entry = sealed
+            .flushed
+            .iter()
+            .find(|entry| entry.str_id == id)
+            .expect("directive");
+        assert_eq!(entry.hot, HotMark::Hard);
+    }
+
+    #[test]
+    fn best_effort_hot_works_across_the_flush_boundary() {
+        let mut interner = small_interner();
+        let (id, hot) = interner.intern_hot_best_effort(b"label").expect("soft hot");
+        assert!(hot);
+        flush_ok(&mut interner);
+
+        // A repeat of the flushed soft-hot value reports hot without
+        // re-entering the window.
+        let (again, hot) = interner.intern_hot_best_effort(b"label").expect("repeat");
+        assert_eq!(again, id);
+        assert!(hot);
+        assert!(interner.window().is_empty());
+
+        // A late soft mark on a flushed plain string updates the
+        // directive without re-buffering the bytes.
+        let plain = interner.intern(b"note").expect("interns");
+        flush_ok(&mut interner);
+        let (_, hot) = interner.intern_hot_best_effort(b"note").expect("soft mark");
+        assert!(hot);
+        assert!(interner.window().is_empty());
+        let sealed = interner.seal();
+        let entry = sealed
+            .flushed
+            .iter()
+            .find(|entry| entry.str_id == plain)
+            .expect("directive");
+        assert_eq!(entry.hot, HotMark::Soft);
+    }
+
+    #[test]
+    fn ineffective_soft_hot_on_a_flushed_blob_is_a_noop() {
+        let mut interner = small_interner();
+        let oversized = b"this value is longer than sixteen bytes";
+        let id = interner.intern(oversized).expect("interns as a blob");
+        flush_ok(&mut interner);
+
+        // A soft mark can never become effective on a blob-placed value:
+        // it must not pull the stored bytes back into memory.
+        let (again, hot) = interner
+            .intern_hot_best_effort(oversized)
+            .expect("soft mark on a blob");
+        assert_eq!(again, id);
+        assert!(!hot);
+        assert!(interner.window().is_empty(), "no re-buffering for a no-op");
+        let sealed = interner.seal();
+        assert_eq!(sealed.flushed[0].hot, HotMark::None);
+    }
+
+    #[test]
+    fn flushed_values_are_verified_not_trusted() {
+        let mut interner = small_interner();
+        let id = interner.intern(b"short").expect("interns");
+        flush_ok(&mut interner);
+
+        // The same value re-interns fine even though its bytes are gone.
+        assert_eq!(interner.intern(b"short").expect("repeat"), id);
+        // Different bytes under the same id would be a collision; the
+        // public path cannot construct one (no known xxh3 preimages), so
+        // the verifier is tested directly.
+        let flushed = Flushed {
+            full_len: 5,
+            check: check16(b"short"),
+            blob_required: false,
+            hot_hard: false,
+            hot_soft: false,
+        };
+        assert!(flushed.matches(b"short"));
+        assert!(!flushed.matches(b"shore"), "same length, different bytes");
+        assert!(!flushed.matches(b"shorter"), "different length");
+    }
+
+    #[test]
+    fn upgrade_of_a_flushed_value_reenters_the_window() {
+        let mut interner = small_interner();
+        let id = interner.intern(b"plan").expect("interns as a string");
+        flush_ok(&mut interner);
+
+        // The registry now requires the same value in dict.blobs: the
+        // next mini-part must record that, so it re-enters the window.
+        let same = interner.intern_blob(b"plan").expect("upgrade");
+        assert_eq!(same, id);
+        assert!(
+            matches!(interner.window().resolve(id), Some(Resolved::Blob(_))),
+            "the window records the upgraded placement"
+        );
+        assert_eq!(flush_ok(&mut interner), 1);
+
+        // After the next flush the directive remains in the flushed map.
+        let sealed = interner.seal();
+        let entry = sealed
+            .flushed
+            .iter()
+            .find(|entry| entry.str_id == id)
+            .expect("flushed directive");
+        assert_eq!(entry.placement, Placement::Blobs);
+    }
+
+    #[test]
+    fn conflicts_on_flushed_values_fail_at_the_call_site() {
+        let mut interner = small_interner();
+        interner.intern_blob(b"plan").expect("forced blob");
+        flush_ok(&mut interner);
+
+        let err = interner
+            .intern_hot(b"plan")
+            .expect_err("hot of a flushed forced-blob value");
+        assert!(matches!(err, DictError::PlacementConflict { .. }));
+        assert!(
+            interner.window().is_empty(),
+            "a rejected upgrade must not re-enter the window"
+        );
+    }
+
+    #[test]
+    fn pinned_hot_values_reach_every_window() {
+        let mut interner = small_interner();
+        let source = interner.intern_hot(b"src/42").expect("strict hot");
+        flush_ok(&mut interner);
+
+        // The fresh window already carries the pinned value, so the next
+        // mini-part resolves its own catalog source_id.
+        assert!(interner.window().resolve(source).is_some());
+        assert_eq!(interner.window().hot_strings().count(), 1);
+        assert_eq!(flush_ok(&mut interner), 1, "the pin is flushed again");
+        assert!(interner.window().resolve(source).is_some());
+    }
+
+    #[test]
+    fn seal_returns_residual_window_and_flushed_directives() {
+        let mut interner = small_interner();
+        let flushed_id = interner.intern(b"flushed").expect("interns");
+        flush_ok(&mut interner);
+        let window_id = interner.intern(b"window").expect("interns");
+
+        let sealed = interner.seal();
+        assert!(sealed.window.resolve(window_id).is_some());
+        assert!(sealed.window.resolve(flushed_id).is_none());
+        assert_eq!(sealed.flushed.len(), 1);
+        assert_eq!(sealed.flushed[0].str_id, flushed_id);
+        assert_eq!(sealed.flushed[0].placement, Placement::Strings);
+
+        // The interner starts the next segment empty.
+        assert!(interner.window().is_empty());
+        assert!(!interner.is_interned(flushed_id));
+        assert_eq!(interner.stats(), DictStats::default());
+    }
+
+    #[test]
+    fn stats_cover_window_and_flushed_without_double_counting() {
+        let mut interner = small_interner();
+        interner.intern(b"one").expect("string");
+        interner.intern_hot(b"hot").expect("hot string");
+        interner.intern(b"longer than the threshold").expect("blob");
+        flush_ok(&mut interner);
+        interner.intern(b"fresh").expect("window string");
+        // An upgrade present in both maps must be counted once.
+        interner.intern_blob(b"one").expect("upgrade");
+
+        let stats = interner.stats();
+        // Strings: "hot" (pinned, in window), "fresh" (window). "one" is
+        // now a blob. Blobs: "one" + the oversized value.
+        assert_eq!(stats.string_count, 2);
+        assert_eq!(stats.blob_count, 2);
+        assert_eq!(stats.hot_count, 1);
+    }
+
+    #[test]
+    fn zero_hash_and_oversized_hot_still_fail_fast() {
+        let mut interner = small_interner();
+        let err = interner
             .intern_hot(b"longer than the eight-byte threshold")
             .expect_err("strict hot of an oversized value");
-        assert_eq!(interner.take_new(), Vec::new());
-        assert_eq!(interner.stats().string_count, 0);
-        assert_eq!(interner.stats().blob_count, 0);
-    }
-
-    #[test]
-    fn seal_hands_over_dicts_and_resets() {
-        let mut interner = small_interner();
-        let id = interner.intern(b"value").expect("interns");
-
-        let dicts = interner.seal();
-        assert!(matches!(dicts.resolve(id), Some(Resolved::Str(b"value"))));
-
-        assert_eq!(interner.stats().string_count, 0);
-        assert_eq!(interner.take_new(), Vec::new());
-        assert!(interner.dicts().is_empty());
-
-        // The next segment starts from scratch but with the same limits.
-        let again = interner.intern(b"value").expect("interns after seal");
-        assert_eq!(again, id, "str_id is content-defined, not per-segment");
-        assert_eq!(interner.take_new(), vec![again]);
+        assert!(matches!(err, DictError::PlacementConflict { .. }));
+        assert!(interner.window().is_empty());
+        assert_eq!(interner.stats(), DictStats::default());
     }
 }

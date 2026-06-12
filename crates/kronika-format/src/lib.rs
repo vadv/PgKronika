@@ -1,23 +1,23 @@
-//! PGM container primitives: end catalog, tail index, CRC32C, `str_id`,
-//! dictionaries.
+//! Byte-level pieces of a PGM segment.
 //!
-//! This crate defines the byte layout of the PGM container and nothing else:
-//! no Parquet, no I/O, no knowledge of section contents. The layout and
-//! the contracts are documented in this crate's README.md; every
-//! structure here points back to its README section. HOT block headers
-//! and `active.parts` frames will be added in later steps.
+//! This crate defines the file structures that writers and readers must share
+//! exactly: the end catalog, tail index, CRC32C checksums, `str_id`,
+//! per-segment dictionaries, and the `active.parts` journal frame format.
 //!
-//! Reading a segment starts from the end of the file:
+//! The crate does not encode Parquet sections, access storage, or know the
+//! meaning of a section body. Higher-level crates handle those jobs.
 //!
-//! 1. [`TailIndex::decode`] on the last [`TAIL_INDEX_LEN`] bytes gives the
-//!    catalog length and validates the magic.
-//! 2. [`Catalog::decode`] on the `catalog_len` bytes right before the tail
-//!    index gives the section table and validates its CRC.
-//! 3. Section bodies are then read by `offset`/`len` from catalog entries.
+//! To open a segment, start at the end of the file:
+//!
+//! 1. Decode the last [`TAIL_INDEX_LEN`] bytes with [`TailIndex::decode`].
+//! 2. Read the catalog bytes immediately before the tail index.
+//! 3. Decode them with [`Catalog::decode`].
+//! 4. Read section bodies using `offset` and `len` from [`Entry`].
 
 mod catalog;
 mod crc;
 mod dictionary;
+mod parts;
 mod str_id;
 
 // proptest is used by tests/property.rs only; anchored for the
@@ -31,14 +31,21 @@ pub use dictionary::{
     BlobEntry, DEFAULT_BLOB_THRESHOLD, DEFAULT_TRUNCATE_LIMIT, DictError, DictLimits, DictStats,
     InvalidLimits, Resolved, SegmentDicts,
 };
+pub use dictionary::{EntrySnapshot, HotMark, Placement};
+pub use parts::{
+    DEFAULT_MAX_PART_LEN, DamageKind, DamageRegion, FRAME_HEADER_LEN, FRAME_MAGIC, FrameError,
+    FrameHeader, JournalLimits, PartError, PartRef, ScanReport, scan_journal, validate_part,
+};
 pub use str_id::StrId;
 
-/// Magic bytes `PGM1`. They open the file and close the tail index, so either
-/// end of a segment can be checked quickly
-/// (README.md, "File Layout").
+/// Segment magic bytes.
+///
+/// A PGM file starts with `PGM1`, and the tail index also ends with `PGM1`.
+/// Readers use the second copy when opening a segment from the end.
 pub const MAGIC: [u8; 4] = *b"PGM1";
 
-/// Current container format version, stored in the catalog meta. Changes
-/// only when the container itself changes; data evolves through new type
-/// ids instead (README.md, "Catalog Metadata").
+/// Version of the container layout.
+///
+/// This number changes only when the container framing changes. Section
+/// schemas evolve through new `type_id` values.
 pub const FORMAT_VERSION: u32 = 1;

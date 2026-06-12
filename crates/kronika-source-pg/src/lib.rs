@@ -1,4 +1,5 @@
 //! `PostgreSQL` collectors.
 //!
-//! See `docs/architecture.md` for the workspace layout and the dependency
-//! rules between crates, and `docs/segment-format.md` for the PGM format.
+//! This crate will collect `PostgreSQL` catalog, statistics, activity, and
+//! configuration data. Public API docs will be added here as the crate is
+//! implemented.

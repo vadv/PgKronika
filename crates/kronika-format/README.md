@@ -9,7 +9,8 @@
 - catalog metadata;
 - tail index;
 - CRC32C;
-- `str_id` and the per-segment dictionary model.
+- `str_id` and the per-segment dictionary model;
+- `active.parts` journal frame validation and scanning.
 
 It does not know how section bodies are encoded. Parquet sections, events,
 charts, storage backends, and I/O are handled by other crates. This README
@@ -28,9 +29,12 @@ The crate currently exposes:
 - `crc32c`, the checksum used by the container;
 - `StrId`, the interned string id (`xxh3_64`);
 - `SegmentDicts` with `DictLimits`, `BlobEntry`, `Resolved`, `DictStats`,
-  and the `DictError` / `InvalidLimits` error types.
+  and the `DictError` / `InvalidLimits` error types;
+- `FrameHeader`, `JournalLimits`, `PartRef`, `ScanReport`, and the
+  `active.parts` validation and scan errors.
 
-Later implementation steps add HOT block headers and `active.parts` frames.
+Later implementation steps add HOT block headers and dictionary section
+encoding.
 
 ## File Layout
 
@@ -166,10 +170,41 @@ are starting values of open format questions, so they are parameters of
 Encoding dictionaries into on-disk section bytes is left for the typed
 section codecs.
 
+## Parts Journal
+
+`active.parts` is an append-only journal of `PGMP` frames. Each frame contains
+a 16-byte header followed by one mini-PGM part.
+
+```text
+frame
+┌─────────────────────────────────────────┐
+│ magic "PGMP"                 4 B        │
+│ part_len                     8 B        │
+│ header_crc32c                4 B        │
+│ part bytes                   part_len   │
+└─────────────────────────────────────────┘
+```
+
+`FrameHeader::decode` validates the frame magic and header CRC. `validate_part`
+checks that the part is a self-contained mini-PGM container: segment magic, tail
+index, catalog CRC, section bounds, and section CRCs.
+
+`scan_journal` walks a journal buffer and returns:
+
+- valid parts in journal order;
+- damaged regions and their classification;
+- the valid prefix length.
+
+A torn tail means the last frame was cut off by the end of the buffer. It is
+safe for the writer to truncate the file to `valid_len` and continue. Middle
+damage means a later valid frame was found; parts before and after it are kept.
+A quarantined tail means the scanner found damage at the end and no later valid
+frame within the search window.
+
 ## Open Questions
 
-Two sizes in the dictionary model are starting values, not settled format
-decisions. Code in this crate points here instead of pinning them:
+Three sizes are starting values, not settled format decisions. Code keeps them
+as configuration, not fixed format constants:
 
 - **`blob_threshold`, default 4 KiB** — the boundary between
   `dict.strings` and `dict.blobs`. It trades read behavior: everything in
@@ -182,14 +217,19 @@ decisions. Code in this crate points here instead of pinning them:
   the original). It limits how much space a single giant plan or query text
   can take in a segment. Too low loses diagnostic detail; too high lets one
   value dominate a segment.
+- **`max_part_len`, default 64 MiB** — the largest part accepted by the
+  `active.parts` scanner. A frame that claims a larger part is treated as
+  damaged.
 
-Both numbers can only be settled by measuring sets of real segments:
-dictionary sizes, tail sizes, and the hit rate of truncation on
-production-like data. Until then they are constructor parameters of
-`DictLimits` (validated as `0 < blob_threshold <= truncate_limit`) with
-`DEFAULT_BLOB_THRESHOLD` / `DEFAULT_TRUNCATE_LIMIT` as the starting
-values, so settling them later is a configuration change, not a format
-change.
+Resynchronization after a damaged frame deliberately has no search window:
+the scanner first tries the boundary implied by a sane frame header, then
+searches to the end of the buffer, so frames appended after a damaged
+region are always rediscovered, however large the region is.
+
+These numbers should be settled by measuring sets of real segments and journals:
+dictionary sizes, tail sizes, truncation frequency, and part sizes. Until
+then they are constructor parameters of `DictLimits` and `JournalLimits`,
+with defaults as starting values.
 
 ## Tests
 
@@ -202,13 +242,16 @@ change.
   every issued id resolves, the dictionaries stay disjoint, hot is a subset
   of strings, re-interning is idempotent, and placement is independent of
   call order.
+- `tests/parts_property.rs` checks `active.parts` recovery: truncation keeps
+  the fully written prefix, and single-byte corruption is reported instead of
+  making a part disappear without a damaged-region record.
 
 ## Crate Boundaries
 
 This crate contains only the byte layouts shared by writers and readers. Today
-that means the end catalog, tail index, CRC32C, `str_id`, and the dictionary
-model. Later steps add dictionary section encoding, HOT block headers, and
-`active.parts` journal frames here.
+that means the end catalog, tail index, CRC32C, `str_id`, the dictionary model,
+and `active.parts` frame validation. Later steps add dictionary section
+encoding and HOT block headers here.
 
 Code that needs collector state, domain knowledge, or external I/O stays above
 this layer:
