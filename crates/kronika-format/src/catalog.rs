@@ -113,7 +113,10 @@ impl fmt::Display for DecodeError {
                 write!(f, "tail index magic is {actual:02x?}, expected \"PGM1\"")
             }
             Self::BadCatalogLen { actual } => {
-                write!(f, "catalog length {actual} is not entries x {ENTRY_LEN} + {META_LEN}")
+                write!(
+                    f,
+                    "catalog length {actual} is not entries x {ENTRY_LEN} + {META_LEN}"
+                )
             }
             Self::EntryCountMismatch { stored, derived } => {
                 write!(
@@ -137,7 +140,7 @@ impl TailIndex {
     /// Encode into the eight bytes that close a segment file.
     #[must_use]
     pub fn encode(self) -> [u8; TAIL_INDEX_LEN] {
-        let mut out = [0u8; TAIL_INDEX_LEN];
+        let mut out = [0_u8; TAIL_INDEX_LEN];
         out[..4].copy_from_slice(&self.catalog_len.to_le_bytes());
         out[4..].copy_from_slice(&MAGIC);
         out
@@ -150,11 +153,12 @@ impl TailIndex {
     /// [`DecodeError::BadTailMagic`] if the magic does not match: the file
     /// is not a PGM segment or its tail is damaged.
     pub fn decode(bytes: [u8; TAIL_INDEX_LEN]) -> Result<Self, DecodeError> {
-        let magic: [u8; 4] = bytes[4..].try_into().expect("fixed split of [u8; 8]");
+        let [l0, l1, l2, l3, m0, m1, m2, m3] = bytes;
+        let magic = [m0, m1, m2, m3];
         if magic != MAGIC {
             return Err(DecodeError::BadTailMagic { actual: magic });
         }
-        let catalog_len = u32::from_le_bytes(bytes[..4].try_into().expect("fixed split"));
+        let catalog_len = u32::from_le_bytes([l0, l1, l2, l3]);
         Ok(Self { catalog_len })
     }
 }
@@ -162,7 +166,7 @@ impl TailIndex {
 impl Catalog {
     /// On-disk length of entries + meta, without the tail index.
     #[must_use]
-    pub fn encoded_len(&self) -> usize {
+    pub const fn encoded_len(&self) -> usize {
         self.entries.len() * ENTRY_LEN + META_LEN
     }
 
@@ -198,8 +202,8 @@ impl Catalog {
         // CRC is computed over the whole catalog with this field zeroed,
         // then patched in (docs/segment-format.md, "End catalog").
         let crc_at = out.len();
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes()); // reserved
         let crc = crc32c(&out);
         out[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
 
@@ -216,15 +220,18 @@ impl Catalog {
     /// - [`DecodeError::EntryCountMismatch`] — meta disagrees with length;
     /// - [`DecodeError::BadCrc`] — the bytes are damaged.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < META_LEN || (bytes.len() - META_LEN) % ENTRY_LEN != 0 {
+        if bytes.len() < META_LEN || !(bytes.len() - META_LEN).is_multiple_of(ENTRY_LEN) {
             return Err(DecodeError::BadCatalogLen {
                 actual: bytes.len(),
             });
         }
-        let derived = u32::try_from((bytes.len() - META_LEN) / ENTRY_LEN)
-            .map_err(|_| DecodeError::BadCatalogLen {
+        // The only possible error is overflow of an absurd length; the
+        // original `TryFromIntError` carries nothing worth keeping.
+        let derived = u32::try_from((bytes.len() - META_LEN) / ENTRY_LEN).map_err(|_overflow| {
+            DecodeError::BadCatalogLen {
                 actual: bytes.len(),
-            })?;
+            }
+        })?;
 
         let meta = &bytes[bytes.len() - META_LEN..];
         let stored_count = u32_at(meta, 24);
@@ -346,11 +353,11 @@ mod tests {
     #[test]
     fn decode_rejects_wrong_length() {
         assert!(matches!(
-            Catalog::decode(&[0u8; META_LEN + 1]),
+            Catalog::decode(&[0_u8; META_LEN + 1]),
             Err(DecodeError::BadCatalogLen { .. })
         ));
         assert!(matches!(
-            Catalog::decode(&[0u8; META_LEN - 1]),
+            Catalog::decode(&[0_u8; META_LEN - 1]),
             Err(DecodeError::BadCatalogLen { .. })
         ));
     }
@@ -361,7 +368,7 @@ mod tests {
         let mut body = encoded[..encoded.len() - TAIL_INDEX_LEN].to_vec();
         // Patch entry_count from 1 to 2; offset 24 within meta.
         let at = body.len() - META_LEN + 24;
-        body[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
+        body[at..at + 4].copy_from_slice(&2_u32.to_le_bytes());
         assert_eq!(
             Catalog::decode(&body),
             Err(DecodeError::EntryCountMismatch {
