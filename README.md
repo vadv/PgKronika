@@ -1,29 +1,86 @@
 # PgKronika
 
-PostgreSQL monitoring with a self-contained, immutable segment format (PGM)
-instead of a TSDB: a collector writes ~10-minute segment files on the database
-host, optionally archives them to S3, and a single web process serves the
-history to humans and AI agents (web UI, MCP, JSON API).
+PgKronika is an experimental PostgreSQL observability system built around
+immutable local segment files instead of a central time-series database.
 
-**Status: design phase.** There is no working code yet; the workspace is a
-skeleton. Design documents live in [`docs/`](docs/) (in Russian for now,
-English translation is planned as they stabilize):
+The collector runs on the database host, reads PostgreSQL, OS, cgroup, and log
+sources, and writes self-contained PGM segment files. A web process reads those
+segments for humans and agents through a web UI, MCP, and JSON API. Optional S3
+archiving is handled by a separate process so cloud credentials do not enter the
+privileged collector.
 
-- [`docs/segment-format.md`](docs/segment-format.md) — the PGM segment format
-- [`docs/type-registry.md`](docs/type-registry.md) — the data type registry
-- [`docs/architecture.md`](docs/architecture.md) — processes and topologies
-- [`docs/testing.md`](docs/testing.md) — testing strategy
-- [`docs/plan.md`](docs/plan.md) — implementation plan
+The project is in the design and skeleton stage. There is no usable monitoring
+product yet.
 
-## Layout
+## Goals
 
-Four binaries (`bins/`) over a set of internal crates (`crates/`). Dependency
-rules between them are part of the architecture and are enforced in CI:
+- Keep recent diagnostic history close to the database host.
+- Make every segment independently readable: schemas, offsets, dictionaries,
+  events, and precomputed chart points live in the same file.
+- Preserve high-cardinality PostgreSQL detail without pushing it into
+  Prometheus metrics.
+- Support offline incident analysis by copying segment files and opening them
+  locally.
+- Keep process responsibilities narrow: collection, reading, archiving, and
+  format diagnostics are separate binaries.
+
+## Architecture
+
+PgKronika is planned as four statically linked binaries:
+
+| Binary | Role |
+| --- | --- |
+| `pg_kronika-collector` | Collects PostgreSQL, OS, cgroup, and log data; writes local PGM segments. |
+| `pg_kronika-web` | Serves the web UI, MCP, and JSON API over segment stores. |
+| `pg_kronika-archiver` | Uploads completed local segments to S3 when that mode is enabled. |
+| `pg_kronika-dump` | Inspects, verifies, extracts, and compares segment files. |
+
+The storage format is PGM: an immutable segment, usually around 10 minutes of
+data, with snapshot sections, dictionaries, events, chart data, and a tail
+catalog for range reads.
+
+## Repository Layout
+
+```text
+bins/      command binaries
+crates/    internal Rust crates
+docs/      design documents
+xtask/     workspace maintenance commands
+```
+
+Important design documents:
+
+- [`docs/architecture.md`](docs/architecture.md) describes the processes,
+  deployment shapes, workspace layout, and versioning rules.
+- [`docs/segment-format.md`](docs/segment-format.md) specifies the PGM container
+  format.
+- [`docs/type-registry.md`](docs/type-registry.md) is the entry point for
+  typed PostgreSQL, OS, cgroup, event, dictionary, and chart sections.
+- [`docs/testing.md`](docs/testing.md) describes the testing strategy.
+- [`docs/plan.md`](docs/plan.md) records the implementation sequence.
+
+The design documents are currently in Russian. English versions are expected
+after the contracts stabilize.
+
+## Development
+
+Install the Rust toolchain selected by [`rust-toolchain.toml`](rust-toolchain.toml),
+then run:
 
 ```sh
+cargo check --workspace
 cargo run -p xtask -- check-deps
 ```
 
+`check-deps` enforces the architectural dependency rules between binaries and
+internal crates. For example, S3 code must not become reachable from the
+collector, and PostgreSQL source code must not become reachable from the web
+process.
+
+The repository currently contains only the workspace skeleton and documentation.
+Implementation starts with the format crate and grows through the vertical slice
+described in [`docs/plan.md`](docs/plan.md).
+
 ## License
 
-[MIT](LICENSE)
+PgKronika is licensed under the [MIT License](LICENSE).
