@@ -1,8 +1,8 @@
 //! End catalog and tail index: the entry point for reading a PGM segment.
 //!
 //! Byte layout is fixed-size and little-endian so that opening a segment
-//! does not depend on a serializer (`docs/segment-format.md`, "End
-//! catalog"):
+//! does not depend on a serializer (README.md, "Catalog Entry" and the
+//! sections that follow it):
 //!
 //! ```text
 //! entry: 32 B            meta: 40 B              tail index: 8 B
@@ -35,12 +35,12 @@ const META_CRC_OFFSET: usize = 32;
 
 /// One section of a segment: its type, location and body checksum.
 ///
-/// A `type_id` may repeat: for snapshot sections that means parts of one
-/// section in catalog order, for chart sections — different entities
-/// (`docs/segment-format.md`, "End catalog").
+/// A `type_id` may repeat: parts of one logical section in catalog order,
+/// except chart sections, where repeats are different entities
+/// (README.md, "Catalog Entry").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
-    /// Section type from the registry (`docs/type-registry.md`).
+    /// Section type from the type registry (`kronika-registry`).
     pub type_id: u32,
     /// Reserved, written as zero.
     pub flags: u32,
@@ -200,7 +200,7 @@ impl Catalog {
         out.extend_from_slice(&entry_count.to_le_bytes());
         out.extend_from_slice(&self.format_version.to_le_bytes());
         // CRC is computed over the whole catalog with this field zeroed,
-        // then patched in (docs/segment-format.md, "End catalog").
+        // then patched in (README.md, "CRC32C").
         let crc_at = out.len();
         out.extend_from_slice(&0_u32.to_le_bytes());
         out.extend_from_slice(&0_u32.to_le_bytes()); // reserved
