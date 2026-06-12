@@ -1,4 +1,5 @@
-//! `PostgreSQL` log reader and parsers for stderr and csvlog formats.
+//! `PostgreSQL` log collectors.
 //!
-//! See `docs/architecture.md` for the workspace layout and the dependency
-//! rules between crates, and `docs/segment-format.md` for the PGM format.
+//! This crate will read `PostgreSQL` stderr and csvlog output and turn log
+//! records into typed source data. Public API docs will be added here as the
+//! crate is implemented.

@@ -1,4 +1,4 @@
-//! S3 segment store.
+//! Optional S3-backed segment storage.
 //!
-//! See `docs/architecture.md` for the workspace layout and the dependency
-//! rules between crates, and `docs/segment-format.md` for the PGM format.
+//! This crate will contain S3 access code for the archiver and remote segment
+//! stores. It must stay outside the collector dependency graph.
