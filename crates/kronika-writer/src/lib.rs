@@ -8,4 +8,4 @@ mod interner;
 mod journal;
 
 pub use interner::{FlushedEntry, Interner, SealedSegment};
-pub use journal::{Journal, JournalError, OpenReport};
+pub use journal::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalConfig, JournalError, OpenReport};

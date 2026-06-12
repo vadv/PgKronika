@@ -41,16 +41,23 @@ the window nor the flushed entries.
 ## Journal
 
 `Journal` appends mini-PGM parts as `PGMP` frames and syncs each frame before
-returning. Opening an existing journal runs the recovery scan from
-`kronika-format`.
+returning. Opening an existing journal runs the recovery scan.
+
+Recovery streams the file frame by frame: peak memory is one part (bounded
+by `max_part_len`) plus a small sliding window during resynchronization,
+never the whole journal. The streaming scanner is pinned to the in-memory
+scanner of `kronika-format` by an equivalence test.
 
 If the last frame was only partly written, the file is truncated to the last
 valid frame and writing continues. Damage in the middle of the file, or damage
 at the end that is not a partial write, is reported in `OpenReport` and left on
 disk for diagnostics.
 
-`append()` writes one frame. `reset()` clears the journal after a segment has
-been completed successfully.
+`append()` writes one frame. The journal size is capped by
+`JournalConfig::max_journal_len` (default 1 GiB, a starting value): when an
+append would exceed the cap it fails with `JournalError::Full`, which is the
+signal to merge the journal into a segment early. `reset()` clears the
+journal after a segment has been completed successfully.
 
 ## Not Implemented Yet
 
