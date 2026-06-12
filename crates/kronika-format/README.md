@@ -168,6 +168,13 @@ writer aborts the segment (`DictError::Collision`). Both default limits
 are starting values of open format questions, so they are parameters of
 `DictLimits`, not constants baked into the logic.
 
+Memory is bounded: total stored bytes are capped by
+`DictLimits::max_total_bytes` (default 64 MiB, sized to the journal frame
+limit). A new value past the cap fails with `DictError::Full` — the signal
+to flush the window into a mini-part. Repeats and requirement upgrades of
+stored values add no bytes; strict-hot values are exempt, because the hot
+contract requires them in every part and the registry bounds their number.
+
 Encoding dictionaries into on-disk section bytes is left for the typed
 section codecs.
 

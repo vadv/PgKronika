@@ -67,6 +67,10 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 cargo = { level = "warn", priority = -1 }
+# Conflicts with rustc's `unreachable_pub` (enabled above): for a
+# crate-internal item in a private module, one lint demands `pub(crate)`
+# and the other calls it redundant. `unreachable_pub` wins.
+redundant_pub_crate = "allow"
 # Hand-picked from `restriction` (the whole group is intentionally not enabled:
 # it contains mutually exclusive lints).
 allow_attributes_without_reason = "warn"

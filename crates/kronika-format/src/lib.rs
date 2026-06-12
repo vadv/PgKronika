@@ -28,8 +28,8 @@ use proptest as _;
 pub use catalog::{Catalog, DecodeError, ENTRY_LEN, Entry, META_LEN, TAIL_INDEX_LEN, TailIndex};
 pub use crc::crc32c;
 pub use dictionary::{
-    BlobEntry, DEFAULT_BLOB_THRESHOLD, DEFAULT_TRUNCATE_LIMIT, DictError, DictLimits, DictStats,
-    InvalidLimits, Resolved, SegmentDicts,
+    BlobEntry, DEFAULT_BLOB_THRESHOLD, DEFAULT_MAX_TOTAL_BYTES, DEFAULT_TRUNCATE_LIMIT, DictError,
+    DictLimits, DictStats, InvalidLimits, Resolved, SegmentDicts,
 };
 pub use dictionary::{EntrySnapshot, HotMark, Placement};
 pub use parts::{

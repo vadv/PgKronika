@@ -35,11 +35,18 @@ pub const DEFAULT_BLOB_THRESHOLD: usize = 4 * 1024;
 /// not a fixed format constant.
 pub const DEFAULT_TRUNCATE_LIMIT: usize = 1024 * 1024;
 
+/// Default cap on the total stored bytes of one dictionary set. A starting
+/// value sized to match the default `active.parts` frame limit: a window
+/// that hits this cap is flushed into one mini-part.
+pub const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
 /// Size limits used while building dictionaries.
 ///
 /// Values shorter than `blob_threshold` go to `dict.strings`. Values at or
 /// above that threshold go to `dict.blobs`. Values longer than
-/// `truncate_limit` keep only a prefix in the segment.
+/// `truncate_limit` keep only a prefix in the segment. The total stored
+/// bytes of the set are capped by `max_total_bytes`: a new value past the
+/// cap fails with [`DictError::Full`], the signal to flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DictLimits {
     /// Values shorter than this go to `dict.strings`, the rest to
@@ -48,25 +55,52 @@ pub struct DictLimits {
     /// Values longer than this keep only a prefix of exactly this length
     /// in the segment (`dict.blobs` truncation).
     truncate_limit: usize,
+    /// Cap on the total stored bytes across both dictionaries.
+    max_total_bytes: usize,
 }
 
 impl DictLimits {
-    /// Build dictionary limits.
+    /// Build dictionary limits with the default total-bytes cap.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidLimits`] unless `0 < blob_threshold <= truncate_limit`.
+    /// Returns [`InvalidLimits`] unless `0 < blob_threshold <=
+    /// truncate_limit <= max_total_bytes`.
     pub const fn new(blob_threshold: usize, truncate_limit: usize) -> Result<Self, InvalidLimits> {
-        if blob_threshold == 0 || blob_threshold > truncate_limit {
-            return Err(InvalidLimits {
-                blob_threshold,
-                truncate_limit,
-            });
-        }
-        Ok(Self {
+        Self::validate(Self {
             blob_threshold,
             truncate_limit,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
         })
+    }
+
+    /// Replace the total-bytes cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidLimits`] if the cap is smaller than
+    /// `truncate_limit`: the set must always be able to hold at least one
+    /// value of the maximum stored size, or a single large value could
+    /// never be interned at all.
+    pub const fn with_max_total_bytes(self, max_total_bytes: usize) -> Result<Self, InvalidLimits> {
+        Self::validate(Self {
+            max_total_bytes,
+            ..self
+        })
+    }
+
+    const fn validate(limits: Self) -> Result<Self, InvalidLimits> {
+        if limits.blob_threshold == 0
+            || limits.blob_threshold > limits.truncate_limit
+            || limits.truncate_limit > limits.max_total_bytes
+        {
+            return Err(InvalidLimits {
+                blob_threshold: limits.blob_threshold,
+                truncate_limit: limits.truncate_limit,
+                max_total_bytes: limits.max_total_bytes,
+            });
+        }
+        Ok(limits)
     }
 
     /// The `dict.strings` / `dict.blobs` boundary, bytes.
@@ -80,6 +114,12 @@ impl DictLimits {
     pub const fn truncate_limit(self) -> usize {
         self.truncate_limit
     }
+
+    /// The cap on total stored bytes, bytes.
+    #[must_use]
+    pub const fn max_total_bytes(self) -> usize {
+        self.max_total_bytes
+    }
 }
 
 impl Default for DictLimits {
@@ -87,6 +127,7 @@ impl Default for DictLimits {
         Self {
             blob_threshold: DEFAULT_BLOB_THRESHOLD,
             truncate_limit: DEFAULT_TRUNCATE_LIMIT,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
         }
     }
 }
@@ -98,15 +139,17 @@ pub struct InvalidLimits {
     pub blob_threshold: usize,
     /// The rejected truncation limit.
     pub truncate_limit: usize,
+    /// The rejected total-bytes cap.
+    pub max_total_bytes: usize,
 }
 
 impl fmt::Display for InvalidLimits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "dictionary limits must satisfy 0 < blob_threshold <= truncate_limit, \
-             got blob_threshold {} and truncate_limit {}",
-            self.blob_threshold, self.truncate_limit
+            "dictionary limits must satisfy 0 < blob_threshold <= truncate_limit \
+             <= max_total_bytes, got {}, {} and {}",
+            self.blob_threshold, self.truncate_limit, self.max_total_bytes
         )
     }
 }
@@ -132,6 +175,18 @@ pub enum DictError {
         /// The id whose requirements cannot all be satisfied.
         id: StrId,
     },
+    /// Storing a new value would push the total stored bytes past
+    /// [`DictLimits::max_total_bytes`].
+    ///
+    /// This is flow control, not corruption: the writer should flush the
+    /// window into a mini-part and retry. Strict-hot values are exempt —
+    /// they are registry-bounded by contract and must reach every part.
+    Full {
+        /// Total stored bytes already held.
+        stored_bytes: usize,
+        /// The configured cap.
+        max: usize,
+    },
 }
 
 impl fmt::Display for DictError {
@@ -154,6 +209,12 @@ impl fmt::Display for DictError {
                     f,
                     "str_id {:#018x} is required both in dict.blobs and in dict.hot_strings",
                     id.get()
+                )
+            }
+            Self::Full { stored_bytes, max } => {
+                write!(
+                    f,
+                    "dictionaries hold {stored_bytes} bytes of the {max} cap; flush the window"
                 )
             }
         }
@@ -295,13 +356,22 @@ impl Stored {
 /// The dictionaries of one segment.
 ///
 /// All `intern*` methods deduplicate: the same bytes always yield the
-/// same [`StrId`] and one stored copy. The only fatal outcomes are a
-/// [`DictError::Collision`] and a [`DictError::PlacementConflict`]; both
-/// leave the dictionaries unchanged.
+/// same [`StrId`] and one stored copy. Failed calls — [`DictError`] in any
+/// variant — leave the dictionaries unchanged.
+///
+/// Memory is bounded: total stored bytes are capped by
+/// [`DictLimits::max_total_bytes`], and a new value past the cap fails
+/// with [`DictError::Full`] — the signal to flush the window. Repeats and
+/// requirement upgrades of stored values add no bytes; strict-hot values
+/// are exempt from the cap because the hot contract requires them in every
+/// part and the registry bounds their number.
 #[derive(Debug, Default)]
 pub struct SegmentDicts {
     limits: DictLimits,
     entries: BTreeMap<StrId, Stored>,
+    /// Total stored bytes across both dictionaries; enforced against
+    /// `limits.max_total_bytes`.
+    stored_bytes: usize,
 }
 
 impl SegmentDicts {
@@ -311,7 +381,14 @@ impl SegmentDicts {
         Self {
             limits,
             entries: BTreeMap::new(),
+            stored_bytes: 0,
         }
+    }
+
+    /// Total stored bytes across both dictionaries.
+    #[must_use]
+    pub const fn stored_bytes(&self) -> usize {
+        self.stored_bytes
     }
 
     /// Return the limits used by this dictionary set.
@@ -535,6 +612,19 @@ impl SegmentDicts {
         if req.hot_hard && (req.blob || oversized) {
             return Err(DictError::PlacementConflict { id });
         }
+        // The total-bytes cap is checked before any mutation. Strict-hot
+        // values are exempt: the hot contract requires them in every part
+        // and the registry bounds their number, so rejecting one here
+        // would break a contract to protect a budget it cannot threaten.
+        let stored_len = bytes.len().min(self.limits.truncate_limit);
+        if !req.hot_hard
+            && self.stored_bytes.saturating_add(stored_len) > self.limits.max_total_bytes
+        {
+            return Err(DictError::Full {
+                stored_bytes: self.stored_bytes,
+                max: self.limits.max_total_bytes,
+            });
+        }
         let truncated = bytes.len() > self.limits.truncate_limit;
         let stored = Stored {
             bytes: if truncated {
@@ -547,6 +637,7 @@ impl SegmentDicts {
             oversized,
             req,
         };
+        self.stored_bytes += stored_len;
         self.entries.insert(id, stored);
         Ok(id)
     }
@@ -596,6 +687,41 @@ mod tests {
         assert!(DictLimits::new(0, 16).is_err());
         assert!(DictLimits::new(32, 16).is_err());
         assert!(DictLimits::new(16, 16).is_ok());
+        // The cap must fit at least one value of the maximum stored size.
+        assert!(
+            DictLimits::new(8, 16)
+                .expect("valid")
+                .with_max_total_bytes(15)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn total_bytes_cap_signals_full() {
+        let limits = DictLimits::new(8, 16)
+            .expect("valid")
+            .with_max_total_bytes(16)
+            .expect("cap fits one value");
+        let mut dicts = SegmentDicts::new(limits);
+
+        dicts.intern(b"0123456789").expect("ten bytes fit the cap");
+        let err = dicts
+            .intern(b"abcdefghij")
+            .expect_err("ten more would exceed the cap");
+        assert_eq!(
+            err,
+            DictError::Full {
+                stored_bytes: 10,
+                max: 16
+            }
+        );
+        assert_eq!(dicts.len(), 1, "a rejected value is not stored");
+
+        // Repeats of stored values add no bytes and stay allowed.
+        dicts.intern(b"0123456789").expect("repeat is free");
+        // Strict-hot values are exempt: registry-bounded by contract.
+        dicts.intern_hot(b"hot").expect("hot bypasses the cap");
+        assert_eq!(dicts.stored_bytes(), 13);
     }
 
     #[test]

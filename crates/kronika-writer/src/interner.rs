@@ -121,11 +121,17 @@ pub struct FlushedEntry {
 #[derive(Debug)]
 pub struct Interner {
     window: SegmentDicts,
+    /// Identities of values already in the journal: ~48 bytes per distinct
+    /// id (plus map overhead) until `seal()`. The count is driven by the
+    /// seal cadence — the journal cap (`JournalError::Full`) forces a merge
+    /// before the journal, and with it this map, can grow without limit.
     flushed: HashMap<StrId, Flushed>,
     /// Bytes of strict-hot values inserted into every window.
     ///
-    /// This stays small because strict-hot values are short headers and source
-    /// ids.
+    /// Bounded by contract, not by data: callers may strict-hot only
+    /// registry-defined header strings (chart headers, the catalog
+    /// `source_id`), each shorter than `blob_threshold`. A data-driven
+    /// strict-hot call is a caller bug.
     hot_pinned: BTreeMap<StrId, Vec<u8>>,
 }
 
@@ -694,5 +700,26 @@ mod tests {
         assert!(matches!(err, DictError::PlacementConflict { .. }));
         assert!(interner.window().is_empty());
         assert_eq!(interner.stats(), DictStats::default());
+    }
+
+    #[test]
+    fn full_window_signals_flush_and_recovers() {
+        let limits = DictLimits::new(8, 16)
+            .expect("valid")
+            .with_max_total_bytes(16)
+            .expect("cap fits one value");
+        let mut interner = Interner::new(limits);
+
+        interner.intern(b"0123456789").expect("fits the window cap");
+        let err = interner
+            .intern(b"abcdefghij")
+            .expect_err("the window is full");
+        assert!(matches!(err, DictError::Full { .. }));
+
+        // The signal means "flush": after the flush the value fits.
+        flush_ok(&mut interner);
+        interner
+            .intern(b"abcdefghij")
+            .expect("fits after the flush");
     }
 }
