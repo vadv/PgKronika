@@ -33,6 +33,12 @@ pub trait Section: Sized {
     /// Takes owned `Bytes` so the reader slices the section in place; the
     /// caller passes a zero-copy slice or a pooled buffer, not a fresh copy.
     ///
+    /// This builds typed rows by transposing the columnar Parquet — one indexed
+    /// read per cell — which fits the typed/convenience use and the roundtrip
+    /// tests. The bulk reader path is [`decode_any`](crate::decode_any): it stays
+    /// columnar (`RecordBatch`) and does no per-row gather, so a large section is
+    /// decoded there, not here.
+    ///
     /// # Errors
     ///
     /// A memory-bound [`CodecError`] if a cap is exceeded, [`CodecError::Parquet`]

@@ -334,6 +334,10 @@ fn semantics_variant(ident: &Ident) -> Ident {
 }
 
 fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
+    // One builder per column, each its own pass over `rows`. For single-row
+    // snapshots this is noise; a one-pass SoA build (fill all builders together)
+    // is deferred until a benchmark on a large section shows the extra passes
+    // matter, since it reshapes the generated encode.
     let builders = columns.iter().map(|c| {
         let field = &c.field;
         let values = match (&c.wrapper, c.nullable) {
