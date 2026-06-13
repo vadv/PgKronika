@@ -247,7 +247,7 @@ pub enum Resolved<'a> {
     Blob(BlobEntry<'a>),
 }
 
-/// Which dictionary an entry currently belongs to.
+/// Current dictionary placement for an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     /// `dict.strings`.
@@ -284,7 +284,7 @@ pub struct EntrySnapshot<'a> {
     pub truncated: bool,
     /// SHA-256 of the full original value; present only when truncated.
     pub full_sha256: Option<[u8; 32]>,
-    /// Which dictionary the entry belongs to under current requirements.
+    /// Current placement after applying the entry requirements.
     pub placement: Placement,
     /// The hot requirement requested for the entry.
     pub hot: HotMark,
@@ -340,7 +340,7 @@ struct Stored {
 }
 
 impl Stored {
-    /// Which dictionary the value belongs to under current requirements.
+    /// Current placement after applying the value requirements.
     const fn is_blob(&self) -> bool {
         self.req.blob || self.oversized
     }
@@ -435,9 +435,9 @@ impl SegmentDicts {
     /// # Errors
     ///
     /// Returns [`DictError::Collision`] as in [`Self::intern`].
-    /// Returns [`DictError::PlacementConflict`] if the value belongs in
-    /// `dict.blobs` by size or by registry requirement. On error,
-    /// dictionaries are left unchanged.
+    /// Returns [`DictError::PlacementConflict`] if size or registry
+    /// requirements place the value in `dict.blobs`. On error, dictionaries
+    /// are left unchanged.
     pub fn intern_hot(&mut self, bytes: &[u8]) -> Result<StrId, DictError> {
         self.insert(
             bytes,
@@ -869,7 +869,7 @@ mod tests {
         // call order.
         let mut dicts = SegmentDicts::new(small_limits());
         let (id, hot) = dicts.intern_hot_best_effort(value).expect("soft hot");
-        assert!(hot, "short value lands in strings, so it is hot");
+        assert!(hot, "short value is string-placed, so it is hot");
         dicts
             .intern_blob(value)
             .expect("forced blob wins over soft hot");

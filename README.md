@@ -9,8 +9,8 @@ segments for humans and agents through a web UI, MCP, and JSON API. Optional S3
 archiving is handled by a separate process so cloud credentials do not enter the
 privileged collector.
 
-The project is in the design and skeleton stage. There is no usable monitoring
-product yet.
+The project is still early: the format, writer, and registry crates are being
+built first. There is no usable monitoring product yet.
 
 ## Goals
 
@@ -79,9 +79,8 @@ internal crates. For example, S3 code must not become reachable from the
 collector, and PostgreSQL source code must not become reachable from the web
 process.
 
-The repository currently contains only the workspace skeleton and documentation.
-Implementation starts with the format crate and grows through the vertical slice
-described in [`docs/plan.md`](docs/plan.md).
+Implementation is moving crate by crate: format primitives first, then writer
+state, type registry, collectors, and finally the serving binaries.
 
 ## License
 
