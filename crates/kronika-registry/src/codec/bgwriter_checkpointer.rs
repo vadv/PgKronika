@@ -15,6 +15,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
@@ -191,19 +192,36 @@ pub fn encode(rows: &[BgwriterCheckpointer]) -> Result<Vec<u8>, CodecError> {
     // Level 3 matches the format's compression guidance for incremental
     // writes. Later writer code can choose a higher level when closing a
     // segment. `try_new(3)` is expected to succeed.
+    //
+    // `set_created_by("")` drops the Arrow-version string, and the writer
+    // options skip the embedded `ARROW:schema` blob: the section schema
+    // lives in the registry, so storing a second copy in every file is pure
+    // overhead and would also make the bytes vary with the Arrow version.
+    // The native Parquet schema (physical types and column layout) stays —
+    // it is what the decoder needs to read the column chunks.
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_max_row_group_size(MAX_SECTION_ROWS)
+        .set_created_by(String::new())
         .build();
+    let options = ArrowWriterOptions::new()
+        .with_properties(props)
+        .with_skip_arrow_metadata(true);
 
     let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
+    let mut writer = ArrowWriter::try_new_with_options(&mut buf, schema, options)?;
     writer.write(&batch)?;
     writer.close()?;
     Ok(buf)
 }
 
 /// Decode a Parquet section body back into rows.
+///
+/// The registry contract is the schema of truth: decode imposes the
+/// contract's columns and types and returns a typed error on any mismatch.
+/// A `type_id` whose bytes do not decode means the writer violated the
+/// contract, so the reader's policy is to skip that section and raise a
+/// diagnostic — not to guess. Decode itself only surfaces the error.
 ///
 /// Layered memory bounds (README.md, "Memory Bounds"): the section byte
 /// length is capped before Parquet reads metadata; the row-group count is
@@ -437,6 +455,26 @@ mod tests {
             decode(&bytes),
             Err(super::CodecError::SectionTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn section_does_not_embed_the_arrow_schema() {
+        // The registry is the schema of truth; arrow-rs would otherwise write
+        // a second copy as an "ARROW:schema" key-value blob. It must not.
+        let bytes = encode(&[pg16_row(1)]).expect("encode");
+        let needle = b"ARROW:schema";
+        assert!(
+            !bytes.windows(needle.len()).any(|w| w == needle),
+            "the embedded Arrow schema blob leaked back into the section"
+        );
+    }
+
+    #[test]
+    fn encode_is_deterministic() {
+        // No Arrow-version string and no embedded schema, so the same rows
+        // encode to the same bytes within one build.
+        let rows = [pg16_row(1), pg17_row(2)];
+        assert_eq!(encode(&rows).expect("a"), encode(&rows).expect("b"));
     }
 
     #[test]
