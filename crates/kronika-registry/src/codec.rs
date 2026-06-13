@@ -420,3 +420,52 @@ pub fn opt_bool(array: &BooleanArray, i: usize) -> Option<bool> {
         Some(array.value(i))
     }
 }
+
+#[cfg(test)]
+mod hygiene_tests {
+    use crate::Section;
+
+    // Fields named like the identifiers the generated encode/decode use
+    // internally (`batch`, `out`, `i`, `rows`, `columns`). This must compile
+    // and roundtrip: a hygiene regression in the derive would break the build.
+    #[derive(Debug, Clone, Copy, PartialEq, Section)]
+    #[section(id = 1_099_001, name = "hygiene probe", semantics = snapshot_full, sort_key("ts"))]
+    struct Weird {
+        #[column(t)]
+        ts: i64,
+        #[column(c)]
+        batch: i64,
+        #[column(c)]
+        out: i64,
+        #[column(c)]
+        i: i64,
+        #[column(c)]
+        rows: Option<i64>,
+        #[column(g)]
+        columns: bool,
+    }
+
+    #[test]
+    fn collision_named_fields_roundtrip() {
+        let want = vec![
+            Weird {
+                ts: 1,
+                batch: 2,
+                out: 3,
+                i: 4,
+                rows: Some(5),
+                columns: true,
+            },
+            Weird {
+                ts: 6,
+                batch: 7,
+                out: 8,
+                i: 9,
+                rows: None,
+                columns: false,
+            },
+        ];
+        let bytes = Weird::encode(&want).expect("encode");
+        assert_eq!(Weird::decode(&bytes).expect("decode"), want);
+    }
+}

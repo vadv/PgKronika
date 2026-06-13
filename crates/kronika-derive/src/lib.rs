@@ -345,21 +345,29 @@ fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
 }
 
 fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
+    // The closure params and loop variable use mixed-site hygiene so a field
+    // named `batch`, `out`, or `i` cannot collide with them: a derive's
+    // call-site identifiers would otherwise be the *same* identifier as the
+    // user's field of that name.
+    let batch = Ident::new("batch", Span::mixed_site());
+    let out = Ident::new("out", Span::mixed_site());
+    let idx = Ident::new("i", Span::mixed_site());
+
     let bindings = columns.iter().map(|c| {
         let field = &c.field;
         let name = &c.name;
         match (&c.arrow_type, c.nullable) {
             (Some(at), false) => quote! {
-                let #field = ::kronika_registry::required_column::<::kronika_registry::#at>(batch, #name)?;
+                let #field = ::kronika_registry::required_column::<::kronika_registry::#at>(#batch, #name)?;
             },
             (Some(at), true) => quote! {
-                let #field = ::kronika_registry::nullable_column::<::kronika_registry::#at>(batch, #name)?;
+                let #field = ::kronika_registry::nullable_column::<::kronika_registry::#at>(#batch, #name)?;
             },
             (None, false) => quote! {
-                let #field = ::kronika_registry::required_bool(batch, #name)?;
+                let #field = ::kronika_registry::required_bool(#batch, #name)?;
             },
             (None, true) => quote! {
-                let #field = ::kronika_registry::nullable_bool(batch, #name)?;
+                let #field = ::kronika_registry::nullable_bool(#batch, #name)?;
             },
         }
     });
@@ -367,18 +375,18 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
     let cells = columns.iter().map(|c| {
         let field = &c.field;
         let value = match (&c.arrow_type, c.nullable) {
-            (Some(_) | None, false) => quote! { #field.value(i) },
-            (Some(_), true) => quote! { ::kronika_registry::opt_primitive(#field, i) },
-            (None, true) => quote! { ::kronika_registry::opt_bool(#field, i) },
+            (Some(_) | None, false) => quote! { #field.value(#idx) },
+            (Some(_), true) => quote! { ::kronika_registry::opt_primitive(#field, #idx) },
+            (None, true) => quote! { ::kronika_registry::opt_bool(#field, #idx) },
         };
         quote! { #field: #value }
     });
 
     quote! {
-        ::kronika_registry::decode_section(bytes, |batch, out| {
+        ::kronika_registry::decode_section(bytes, |#batch, #out| {
             #( #bindings )*
-            for i in 0..batch.num_rows() {
-                out.push(#struct_name { #( #cells ),* });
+            for #idx in 0..#batch.num_rows() {
+                #out.push(#struct_name { #( #cells ),* });
             }
             ::core::result::Result::Ok(())
         })
