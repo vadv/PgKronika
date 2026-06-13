@@ -122,9 +122,9 @@ pub struct FlushedEntry {
 pub struct Interner {
     window: SegmentDicts,
     /// Identities of values already in the journal: ~48 bytes per distinct
-    /// id (plus map overhead) until `seal()`. The count is driven by the
-    /// seal cadence — the journal cap (`JournalError::Full`) forces a merge
-    /// before the journal, and with it this map, can grow without limit.
+    /// id (plus map overhead) until `seal()`. The journal cap
+    /// (`JournalError::Full`) forces a merge before the journal, and with it
+    /// this map, can grow without limit.
     flushed: HashMap<StrId, Flushed>,
     /// Bytes of strict-hot values inserted into every window.
     ///

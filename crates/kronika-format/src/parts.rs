@@ -1,9 +1,8 @@
 //! `active.parts` journal frames.
 //!
 //! The journal is an append-only sequence of `PGMP` frames. Each frame wraps
-//! one self-contained mini-PGM segment. This module defines the
-//! frame bytes and scans an in-memory journal buffer; file I/O belongs to
-//! `kronika-writer`.
+//! one self-contained PGM part. This module defines the frame bytes and scans
+//! an in-memory journal buffer; file I/O is handled by `kronika-writer`.
 //!
 //! ```text
 //! frame: header 16 B + part
@@ -154,12 +153,12 @@ pub enum PartError {
     Catalog(DecodeError),
     /// A catalog entry points outside the section area of the body.
     SectionOutOfBounds {
-        /// `type_id` of the offending entry.
+        /// `type_id` of the entry that failed validation.
         type_id: u32,
     },
     /// A section body does not match its catalog CRC32C.
     SectionCrc {
-        /// `type_id` of the offending entry.
+        /// `type_id` of the entry that failed validation.
         type_id: u32,
         /// CRC stored in the catalog entry.
         stored: u32,

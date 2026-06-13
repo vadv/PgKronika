@@ -145,7 +145,7 @@ impl From<std::io::Error> for JournalError {
 
 /// Result of opening and scanning a journal file.
 ///
-/// Recovered parts are not duplicated here — [`Journal::parts`] owns the
+/// Recovered parts are not duplicated here; [`Journal::parts`] stores the part
 /// directory. The report carries only the damage findings.
 #[derive(Debug)]
 pub struct OpenReport {
@@ -260,7 +260,7 @@ impl Journal {
                 max: self.config.limits.max_part_len,
             });
         }
-        // The cap is flow control for the merge cadence; the first frame is
+        // The cap decides when the writer must merge; the first frame is
         // always allowed so that a tiny cap cannot wedge an empty journal.
         let frame_len = FRAME_HEADER_LEN + part.len();
         if self.end > 0 && self.end + frame_len > self.config.max_journal_len {
@@ -624,14 +624,14 @@ mod tests {
 
         // A final frame with an intact header but corrupted body: the
         // resync finds nothing after it, and the implied frame end at EOF
-        // classifies it as a torn write, not a quarantined tail.
+        // classifies it as a torn write, not unrecoverable trailing damage.
         let mut torn_body = two.clone();
         let last = torn_body.len() - 1;
         torn_body[last] ^= 0x01;
         assert_stream_matches_buffer(&torn_body);
 
         // A trailing header with a valid CRC but an absurd length claim:
-        // unrecoverable, the tail is quarantined.
+        // unrecoverable trailing damage.
         let mut absurd = one.clone();
         absurd.extend_from_slice(
             &FrameHeader {
@@ -641,7 +641,7 @@ mod tests {
         );
         assert_stream_matches_buffer(&absurd);
 
-        // A decoy magic 3 bytes before the real frame: garbage ending in
+        // A decoy magic 3 bytes before the real frame: damaged bytes ending in
         // "PGM" followed by the real frame's "PGMP" creates overlapping
         // magic occurrences, and the scanner must advance by one byte, not
         // by a whole magic length, after the decoy fails.
@@ -661,20 +661,20 @@ mod tests {
             assert_stream_matches_buffer(&corrupted);
         }
 
-        // A long garbage region followed by a valid frame: the sliding
+        // A long damaged region followed by a valid frame: the sliding
         // search must cross many chunk boundaries to find it.
-        let mut garbage_then_frame = one.clone();
-        garbage_then_frame.extend_from_slice(&[0xAB_u8; 257]);
-        garbage_then_frame.extend_from_slice(&one);
-        assert_stream_matches_buffer(&garbage_then_frame);
+        let mut damaged_then_frame = one.clone();
+        damaged_then_frame.extend_from_slice(&[0xAB_u8; 257]);
+        damaged_then_frame.extend_from_slice(&one);
+        assert_stream_matches_buffer(&damaged_then_frame);
 
-        // Garbage that contains stray FRAME_MAGIC bytes positioned to span
+        // Damaged bytes that contain stray FRAME_MAGIC bytes positioned to span
         // chunk boundaries.
         let mut tricky = one.clone();
-        let mut garbage = vec![0xCD_u8; 64];
-        garbage[6..10].copy_from_slice(&FRAME_MAGIC);
-        garbage[31..35].copy_from_slice(&FRAME_MAGIC);
-        tricky.extend_from_slice(&garbage);
+        let mut damaged = vec![0xCD_u8; 64];
+        damaged[6..10].copy_from_slice(&FRAME_MAGIC);
+        damaged[31..35].copy_from_slice(&FRAME_MAGIC);
+        tricky.extend_from_slice(&damaged);
         tricky.extend_from_slice(&one);
         assert_stream_matches_buffer(&tricky);
     }
