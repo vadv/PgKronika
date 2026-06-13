@@ -45,9 +45,13 @@ valid by construction, and no external crate can mint one.
 - `Label` — identity or an attribute of the entity;
 - `Timestamp` — `i64` unix microseconds.
 
-`ColumnType` is the on-disk value type (`I64`, `F64`, `U64`, `Bool`, `Ts`).
-`Semantics` is `SnapshotFull`, `ConditionalFull`, `EventStream`, `Changed`,
-or `OnChange`.
+`ColumnType` is the on-disk value type: the integer and float base types
+(`I8`…`I64`, `U8`…`U64`, `F32`/`F64`), `Bool`, `Ts` (an `i64` timestamp), and
+`StrId` (a `u64` reference into the segment string dictionary — the bytes live
+there, not in the section). A struct field's Rust type sets the column type: a
+`Ts` or `StrId` field maps to that type, and an `Option<T>` field is a nullable
+column. `Semantics` is `SnapshotFull`, `ConditionalFull`, `EventStream`,
+`Changed`, or `OnChange`.
 
 ## Registry Linter
 
@@ -138,6 +142,26 @@ both views and writes one row. Columns removed from PostgreSQL 17
 The whole `1_006_001` codec is its annotated struct plus `#[derive(Section)]`;
 `BgwriterCheckpointer::encode` / `decode` convert a row slice to and from the
 Parquet section body.
+
+## Service Sections
+
+Two types are mandatory in every segment that carries PostgreSQL or OS data, and
+the reader interprets all other sections against them:
+
+- `instance_metadata` (`1_021_001`) — the instance fingerprint: `pg_version_num`,
+  `pg_system_identifier`, hostname, and the OS constants (`clock_ticks_per_sec`,
+  `page_size_bytes`, `boot_id`, `btime`) that make OS sections self-describing.
+- `reset_metadata` (`1_020_001`) — counter-reset context: postmaster start time
+  and per-view reset timestamps (so the diff engine tells a real reset from data
+  loss), plus the extension versions and GUCs (`track_io_timing`,
+  `compute_query_id`) that decide whether a column is present or meaningful.
+
+This is why one codec spans every PostgreSQL version. Version differences are
+nullable columns — `buffers_backend` is `None` on PG17+ — and their meaning
+comes from these sections, not from a new `type_id` per release: `pg_version_num`
+says the column was removed in PG17, and `pg_stat_checkpointer_reset_at` (null
+before PG17) corroborates it. The source version is provenance recorded once per
+segment, not a column repeated in every type.
 
 ## Memory Bounds
 

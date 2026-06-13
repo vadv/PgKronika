@@ -11,7 +11,7 @@
 //! per-type code: the field types give the on-disk types and nullability,
 //! and the `#[column(..)]` class gives the diff/chart role.
 
-use crate::Section;
+use crate::{Section, Ts};
 
 /// One row of type `1_006_001`. Fields absent in `PostgreSQL` 17 are `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
@@ -24,7 +24,7 @@ use crate::Section;
 pub struct BgwriterCheckpointer {
     /// Collection timestamp, unix microseconds.
     #[column(t)]
-    pub ts: i64,
+    pub ts: Ts,
     /// Scheduled checkpoints.
     #[column(c)]
     pub checkpoints_timed: i64,
@@ -60,11 +60,11 @@ pub struct BgwriterCheckpointer {
 #[cfg(test)]
 mod tests {
     use super::BgwriterCheckpointer;
-    use crate::{CodecError, MAX_SECTION_BYTES, MAX_SECTION_ROWS, Section, lint};
+    use crate::{CodecError, MAX_SECTION_BYTES, MAX_SECTION_ROWS, Section, Ts, lint};
 
     fn pg16_row(ts: i64) -> BgwriterCheckpointer {
         BgwriterCheckpointer {
-            ts,
+            ts: Ts(ts),
             checkpoints_timed: 10,
             checkpoints_req: 2,
             checkpoint_write_time: 1234.5,
