@@ -23,6 +23,12 @@ use bytes::Bytes;
 /// `buffer_limit` (a larger one is freed, not pooled). A single in-flight
 /// buffer can still grow to whatever the caller writes; bound that at the call
 /// site (decode rejects inputs above `MAX_SECTION_BYTES`).
+///
+/// Synchronous: `load` and `Loan::drop` take a `std::sync::Mutex` briefly. That
+/// is free for the single-threaded decode loop this feeds; a multi-threaded or
+/// async consumer should measure lock contention — or move to a lock-free
+/// return — before relying on it, and should not treat a `Loan` as cheap to
+/// hold across an `.await`.
 #[derive(Clone, Debug)]
 pub struct BytesPool {
     shared: Arc<Mutex<Shared>>,

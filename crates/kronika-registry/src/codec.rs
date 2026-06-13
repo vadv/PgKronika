@@ -297,15 +297,23 @@ pub struct DecodedSection {
     pub stats: DecodeStats,
 }
 
+/// Parquet read batch size: the reader yields batches of at most this many rows.
+const DECODE_BATCH_SIZE: usize = if MAX_SECTION_ROWS < 8192 {
+    MAX_SECTION_ROWS
+} else {
+    8192
+};
+
 /// Build a reader with every pre-iteration memory bound applied (README.md,
 /// "Memory Bounds"): the byte length is capped before the footer is parsed,
 /// the row-group count after it, and the claimed row count at
 /// [`MAX_SECTION_ROWS`]. Both decode paths share this so neither can omit a cap.
-/// Returns the row-group count alongside the reader for [`DecodeStats`].
+/// Returns the row-group count and the claimed row count alongside the reader —
+/// for [`DecodeStats`], and to preallocate the batch vec.
 ///
 /// Takes owned `Bytes` so the Parquet reader slices the section in place — the
 /// caller's zero-copy slice (or pooled buffer) is reused, not copied.
-fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize), CodecError> {
+fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize, usize), CodecError> {
     if bytes.len() > MAX_SECTION_BYTES {
         return Err(CodecError::SectionTooLarge {
             len: bytes.len(),
@@ -330,9 +338,13 @@ fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize), Code
             max: MAX_SECTION_ROWS,
         });
     }
+    let row_count = claimed_rows.unwrap_or(0);
 
-    let batch_size = MAX_SECTION_ROWS.min(8192);
-    Ok((builder.with_batch_size(batch_size).build()?, groups))
+    Ok((
+        builder.with_batch_size(DECODE_BATCH_SIZE).build()?,
+        groups,
+        row_count,
+    ))
 }
 
 /// Decode a Parquet section body, calling `push_rows` for each read batch.
@@ -351,7 +363,7 @@ pub fn decode_section<Row>(
     bytes: Bytes,
     mut push_rows: impl FnMut(&RecordBatch, &mut Vec<Row>) -> Result<(), CodecError>,
 ) -> Result<Vec<Row>, CodecError> {
-    let (reader, _row_groups) = capped_reader(bytes)?;
+    let (reader, _row_groups, _claimed_rows) = capped_reader(bytes)?;
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch?;
@@ -382,7 +394,7 @@ pub fn decode_section<Row>(
 /// file does not match `contract`; [`CodecError::Parquet`] on malformed Parquet.
 pub fn decode_batches(contract: &TypeContract, bytes: Bytes) -> Result<DecodedSection, CodecError> {
     let bytes_in = bytes.len();
-    let (reader, row_groups) = capped_reader(bytes)?;
+    let (reader, row_groups, claimed_rows) = capped_reader(bytes)?;
 
     let want = arrow_schema(contract);
     let got = reader.schema();
@@ -396,7 +408,7 @@ pub fn decode_batches(contract: &TypeContract, bytes: Bytes) -> Result<DecodedSe
         return Err(CodecError::SchemaMismatch);
     }
 
-    let mut batches = Vec::new();
+    let mut batches = Vec::with_capacity(claimed_rows.div_ceil(DECODE_BATCH_SIZE).max(1));
     let mut rows = 0_usize;
     for batch in reader {
         let batch = batch?;
