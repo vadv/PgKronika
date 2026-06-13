@@ -339,7 +339,7 @@ struct Stored {
 }
 
 impl Stored {
-    /// Current placement after applying the value requirements.
+    /// Whether the value is placed in `dict.blobs` (forced or oversized).
     const fn is_blob(&self) -> bool {
         self.req.blob || self.oversized
     }
