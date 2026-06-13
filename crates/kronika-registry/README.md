@@ -8,7 +8,9 @@ codecs for section bodies. It contains:
 - the `type_id` scheme and `SectionClass`;
 - the type contract: columns, column classes, sort key, collection semantics;
 - the registry linter, which checks the contract invariants;
-- the manual codecs that encode and decode section bodies.
+- `#[derive(Section)]`, which generates a type's contract and codec from
+  its struct;
+- the shared codec runtime that the generated codecs are built on.
 
 ## Type Ids
 
@@ -76,11 +78,27 @@ columns and types and returns a typed error on any mismatch. A `type_id`
 whose bytes do not decode means the writer violated the contract, so the
 reader skips that section and raises a diagnostic rather than guessing.
 
-Codecs are manual for now, one module per type. `kronika-derive` will
-generate them later; until then this crate keeps both the decoder and the
-temporary encoder.
+## Generated Codecs
 
-## Type `1_006_001`
+A type is a struct with `#[derive(Section)]` (`kronika-derive`) — the struct
+is the only per-type code. The derive reads each field's Rust type (the
+on-disk type and nullability) and a `#[column(class)]`, plus a
+`#[section(..)]` header, and generates the contract const and the
+`encode`/`decode` methods. There is no hand-written per-column code to drift
+from the contract.
+
+The framing, compression, and every memory bound live once in the shared
+codec runtime (`encode_section` / `decode_section`); the generated code only
+supplies one column builder/reader per field, so a new type cannot forget a
+bound. Column types map to the narrowest Arrow type that fits (`i32` → 32-bit,
+not 64) to keep sections small. `kronika-derive` is exactly the crate
+`architecture.md` §7 plans: struct → schema, encoder, decoder.
+
+## Example: type `1_006_001`
+
+Types are not documented one section per id in this README — the catalog of
+types is the registry contracts in code. `1_006_001` is kept here as a single
+worked example.
 
 `pg_stat_bgwriter` + `pg_stat_checkpointer`, a single-row snapshot
 (`SnapshotFull`, sort key `(ts)`). PostgreSQL 17 moved some
@@ -88,8 +106,9 @@ temporary encoder.
 both views and writes one row. Columns removed from PostgreSQL 17
 (`buffers_backend`, `buffers_backend_fsync`) are written as `NULL`, not `0`.
 
-`bgwriter_checkpointer::encode` / `decode` convert a row slice to and from
-the Parquet section body.
+The whole `1_006_001` codec is its annotated struct plus `#[derive(Section)]`;
+`BgwriterCheckpointer::encode` / `decode` convert a row slice to and from the
+Parquet section body.
 
 ## Memory Bounds
 
@@ -122,6 +141,6 @@ model of the format.
 
 ## Future Work
 
-`kronika-derive` will generate codecs and golden tests from contracts. More
-types will be added with the next sources. Bloom filters and row-group tuning
-come with the first high-cardinality types that need them.
+`#[derive(Section)]` can also emit a roundtrip golden test per type once
+several types exist. More types are added with the next sources. Bloom filters
+and row-group tuning come with the first high-cardinality types that need them.

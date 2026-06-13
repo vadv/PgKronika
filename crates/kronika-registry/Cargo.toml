@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-derive = { path = "../kronika-derive" }
 arrow-array = "55"
 arrow-schema = "55"
 bytes = "1"

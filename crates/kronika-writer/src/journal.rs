@@ -44,7 +44,7 @@ use kronika_format::{
 /// preserved damaged regions.
 pub const DEFAULT_MAX_JOURNAL_LEN: usize = 1024 * 1024 * 1024;
 
-/// Chunk size of the streaming resynchronization search.
+/// Search-window size for streaming recovery.
 const RESYNC_CHUNK: usize = 1 << 20;
 
 /// Configuration of one journal file.
@@ -88,7 +88,7 @@ pub enum JournalError {
         /// The configured cap, bytes.
         max: usize,
     },
-    /// The part is not a valid mini-PGM.
+    /// The part is not a valid PGM part.
     ///
     /// Writing it would make the next recovery scan classify the frame as
     /// damaged and skip the part.
@@ -116,7 +116,7 @@ impl fmt::Display for JournalError {
                     "journal of {len} bytes would exceed the cap of {max}; merge and reset first"
                 )
             }
-            Self::InvalidPart(err) => write!(f, "part is not a valid mini-PGM: {err}"),
+            Self::InvalidPart(err) => write!(f, "part is not a valid PGM part: {err}"),
             Self::StalePartRef { offset, len } => {
                 write!(
                     f,
@@ -249,7 +249,7 @@ impl Journal {
     /// Returns [`JournalError::PartTooLarge`] if the part exceeds the frame
     /// limit, [`JournalError::Full`] if the journal would exceed its cap
     /// (merge early and [`Journal::reset`]), [`JournalError::InvalidPart`]
-    /// if the body is not a valid mini-PGM, and [`JournalError::Io`] if the
+    /// if the body is not a valid PGM part, and [`JournalError::Io`] if the
     /// write or sync fails. On error, the in-memory journal state is
     /// unchanged.
     pub fn append(&mut self, part: &[u8]) -> Result<PartRef, JournalError> {
@@ -850,7 +850,7 @@ mod tests {
             Err(JournalError::InvalidPart(_))
         ));
         assert!(matches!(
-            journal.append(b"not a mini-PGM at all, just bytes of the right size"),
+            journal.append(b"not a PGM part at all, just bytes of the right size"),
             Err(JournalError::InvalidPart(_))
         ));
         assert!(journal.is_empty());

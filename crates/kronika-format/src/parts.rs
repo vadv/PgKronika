@@ -9,7 +9,7 @@
 //!   frame_magic u32  // ASCII "PGMP"
 //!   part_len    u64
 //!   header_crc  u32  // CRC32C over frame_magic + part_len
-//!   part        ...  // a self-contained mini-PGM
+//!   part        ...  // a self-contained PGM part
 //! ```
 //!
 //! Recovery rules:
@@ -129,7 +129,7 @@ impl fmt::Display for FrameError {
 
 impl Error for FrameError {}
 
-/// Why a part body is not a valid mini-PGM container.
+/// Why a part body is not a valid PGM part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartError {
     /// The body is shorter than magic + empty catalog + tail index.
@@ -171,7 +171,7 @@ impl fmt::Display for PartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooShort { actual } => {
-                write!(f, "part body of {actual} bytes is too short for a mini-PGM")
+                write!(f, "part body of {actual} bytes is too short for a PGM part")
             }
             Self::BadMagic { actual } => {
                 write!(f, "part magic is {actual:02x?}, expected \"PGM1\"")
@@ -200,7 +200,7 @@ impl fmt::Display for PartError {
 
 impl Error for PartError {}
 
-/// Validate a part body as a self-contained mini-PGM container.
+/// Validate a part body as a self-contained PGM part.
 ///
 /// Checks the segment magic, the tail index, the catalog CRC, and that
 /// every catalog entry stays in bounds and matches its section CRC32C.
@@ -349,7 +349,7 @@ impl ScanReport {
 
 /// Scan a journal buffer.
 ///
-/// The scan walks frames forward, validates every part as a mini-PGM, and
+/// The scan walks frames forward, validates every PGM part, and
 /// records valid parts plus damaged regions.
 ///
 /// The buffer is caller-provided and fully resident. Never read a journal

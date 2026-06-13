@@ -27,8 +27,7 @@ use crate::StrId;
 
 /// Default boundary between `dict.strings` and `dict.blobs`, bytes.
 ///
-/// This is a starting value. It should be finalized after measuring real
-/// segment data.
+/// Starting value. Finalize it after measuring real segment data.
 pub const DEFAULT_BLOB_THRESHOLD: usize = 4 * 1024;
 
 /// Default truncation limit for large values, bytes. A starting value,
@@ -448,7 +447,7 @@ impl SegmentDicts {
         )
     }
 
-    /// Intern a value that should be added to `dict.hot_strings` when possible.
+    /// Intern a value and try to add it to `dict.hot_strings`.
     ///
     /// Returns the id and a boolean that is `true` when the value is present in
     /// `dict.hot_strings` after the call. Large values and blob-forced values
