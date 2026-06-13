@@ -59,10 +59,22 @@ tests. It reports:
 
 ## Snapshot Sections
 
-A snapshot section body is a self-contained zstd-compressed Parquet file, as
-required by the container format. `arrow_schema` builds the Arrow schema from
-the contract columns, so codecs use the same column order, Arrow types, and
-nullability as the registry.
+A snapshot section body is a zstd-compressed Parquet file. `arrow_schema`
+builds the Arrow schema from the contract columns, so codecs use the same
+column order, Arrow types, and nullability as the registry.
+
+The registry is the schema of truth, so the section does **not** embed a
+second copy of it: the writer skips the `ARROW:schema` key-value blob that
+arrow-rs writes by default and clears the Arrow-version string. That removes
+a fixed ~1.1 KB per section (about a quarter of a single-row section) and
+makes encoding deterministic. Only the native Parquet schema — the physical
+types and column layout the decoder needs to read the column chunks — stays
+in the file.
+
+Decode treats the contract as authoritative: it imposes the contract's
+columns and types and returns a typed error on any mismatch. A `type_id`
+whose bytes do not decode means the writer violated the contract, so the
+reader skips that section and raises a diagnostic rather than guessing.
 
 Codecs are manual for now, one module per type. `kronika-derive` will
 generate them later; until then this crate keeps both the decoder and the
@@ -92,10 +104,11 @@ read batch. The caps are far above what the current regularly sampled
 single-row sources produce in one segment; they limit writer bugs and
 malformed sections, not normal data.
 
-One residual stays inside Parquet: while decoding a valid-size page it can
-reserve a buffer from the page header. So decode assumes the section CRC has
-already been verified against the catalog, which catches bit rot before this
-point; a fully forged segment is outside what the format protects.
+One risk remains in Parquet decoding itself: a valid-size page can request a
+large buffer from its page header. Callers should pass bytes to `decode` only
+after verifying the section CRC against the catalog. That catches media
+corruption before this point; fully forged segments are outside the protection
+model of the format.
 
 ## Tests
 

@@ -28,7 +28,7 @@ pub const MAX_SECTION_ROWS: usize = 65_536;
 
 /// Maximum accepted section byte length on decode.
 ///
-/// This guard runs before Parquet reads the file metadata, so it bounds the
+/// This check runs before Parquet reads the file metadata, so it bounds the
 /// amount of input Parquet can inspect before the registry checks row counts
 /// and row groups (README.md, "Memory Bounds"). The value is far above the
 /// size of current snapshot sections.
