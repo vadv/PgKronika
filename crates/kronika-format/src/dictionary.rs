@@ -1,23 +1,21 @@
-//! Per-segment dictionaries: `dict.strings`, `dict.blobs`, `dict.hot_strings`.
+//! In-memory dictionaries for one segment.
 //!
-//! This is the in-memory model of the dictionary contract (README.md,
-//! "String Ids and Dictionaries"): which dictionary a value lands in,
-//! how oversized values are truncated, and which inputs are collisions.
-//! Encoding the dictionaries into on-disk section bytes is a later step;
-//! this module defines only the contract:
+//! Each text or byte value gets a [`StrId`] and is stored once in either
+//! `dict.strings` or `dict.blobs`. `dict.hot_strings` duplicates selected
+//! short strings so readers can resolve common labels without loading larger
+//! dictionary entries.
 //!
-//! - every issued [`StrId`] resolves within the same [`SegmentDicts`];
-//! - one id is never stored in `strings` and `blobs` at the same time;
-//! - `hot_strings` is a subset of `strings` — it is a duplicating tail
-//!   cache, not another dictionary with separate values;
-//! - a value larger than the truncation limit keeps only a prefix, while
-//!   `str_id` and `full_sha256` are computed over the full original value.
+//! Placement is based on accumulated requirements for a value: size-based
+//! routing, registry-forced blob placement, and strict or optional hot-cache
+//! placement. The final placement is independent of call order.
 //!
-//! Placement is decided by the *set of requirements* attached to a value
-//! (registry-forced blob, hot), never by call order: interning the same
-//! values with the same requirements in any order yields identical
-//! dictionaries. Incompatible hard requirements are a typed error, since
-//! the segment would violate the contract whichever dictionary won.
+//! The core invariants are:
+//!
+//! - every issued [`StrId`] resolves inside the same [`SegmentDicts`];
+//! - one id is never stored in both `dict.strings` and `dict.blobs`;
+//! - `dict.hot_strings` is always a subset of `dict.strings`;
+//! - truncated values keep `str_id`, `full_len`, and `full_sha256` for the
+//!   full original value, not only for the stored prefix.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -28,15 +26,27 @@ use sha2::{Digest, Sha256};
 use crate::StrId;
 
 /// Default boundary between `dict.strings` and `dict.blobs`, bytes.
-/// A starting value, not a settled format decision — see README.md,
-/// "Open Questions", for what the trade-off is and what would settle it.
+///
+/// This is a starting value. It should be finalized after measuring real
+/// segment data.
 pub const DEFAULT_BLOB_THRESHOLD: usize = 4 * 1024;
 
 /// Default truncation limit for large values, bytes. A starting value,
-/// not a settled format decision — see README.md, "Open Questions".
+/// not a fixed format constant.
 pub const DEFAULT_TRUNCATE_LIMIT: usize = 1024 * 1024;
 
-/// Size knobs of the dictionaries.
+/// Default cap on the total stored bytes of one dictionary set. A starting
+/// value sized to match the default `active.parts` frame limit: a window
+/// that hits this cap is flushed into one mini-part.
+pub const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// Size limits used while building dictionaries.
+///
+/// Values shorter than `blob_threshold` go to `dict.strings`. Values at or
+/// above that threshold go to `dict.blobs`. Values longer than
+/// `truncate_limit` keep only a prefix in the segment. The total stored
+/// bytes of the set are capped by `max_total_bytes`: a new value past the
+/// cap fails with [`DictError::Full`], the signal to flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DictLimits {
     /// Values shorter than this go to `dict.strings`, the rest to
@@ -45,29 +55,52 @@ pub struct DictLimits {
     /// Values longer than this keep only a prefix of exactly this length
     /// in the segment (`dict.blobs` truncation).
     truncate_limit: usize,
+    /// Cap on the total stored bytes across both dictionaries.
+    max_total_bytes: usize,
 }
 
 impl DictLimits {
-    /// Build limits, validating `0 < blob_threshold <= truncate_limit`.
-    ///
-    /// The ordering matters: truncation is defined only for `dict.blobs`,
-    /// so every value longer than the truncation limit must already be
-    /// routed to blobs by the threshold.
+    /// Build dictionary limits with the default total-bytes cap.
     ///
     /// # Errors
     ///
-    /// [`InvalidLimits`] when the ordering above does not hold.
+    /// Returns [`InvalidLimits`] unless `0 < blob_threshold <=
+    /// truncate_limit <= max_total_bytes`.
     pub const fn new(blob_threshold: usize, truncate_limit: usize) -> Result<Self, InvalidLimits> {
-        if blob_threshold == 0 || blob_threshold > truncate_limit {
-            return Err(InvalidLimits {
-                blob_threshold,
-                truncate_limit,
-            });
-        }
-        Ok(Self {
+        Self::validate(Self {
             blob_threshold,
             truncate_limit,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
         })
+    }
+
+    /// Replace the total-bytes cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidLimits`] if the cap is smaller than
+    /// `truncate_limit`: the set must always be able to hold at least one
+    /// value of the maximum stored size, or a single large value could
+    /// never be interned at all.
+    pub const fn with_max_total_bytes(self, max_total_bytes: usize) -> Result<Self, InvalidLimits> {
+        Self::validate(Self {
+            max_total_bytes,
+            ..self
+        })
+    }
+
+    const fn validate(limits: Self) -> Result<Self, InvalidLimits> {
+        if limits.blob_threshold == 0
+            || limits.blob_threshold > limits.truncate_limit
+            || limits.truncate_limit > limits.max_total_bytes
+        {
+            return Err(InvalidLimits {
+                blob_threshold: limits.blob_threshold,
+                truncate_limit: limits.truncate_limit,
+                max_total_bytes: limits.max_total_bytes,
+            });
+        }
+        Ok(limits)
     }
 
     /// The `dict.strings` / `dict.blobs` boundary, bytes.
@@ -81,6 +114,12 @@ impl DictLimits {
     pub const fn truncate_limit(self) -> usize {
         self.truncate_limit
     }
+
+    /// The cap on total stored bytes, bytes.
+    #[must_use]
+    pub const fn max_total_bytes(self) -> usize {
+        self.max_total_bytes
+    }
 }
 
 impl Default for DictLimits {
@@ -88,49 +127,65 @@ impl Default for DictLimits {
         Self {
             blob_threshold: DEFAULT_BLOB_THRESHOLD,
             truncate_limit: DEFAULT_TRUNCATE_LIMIT,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
         }
     }
 }
 
-/// Rejected [`DictLimits`]: the threshold/limit ordering does not hold.
+/// Rejected [`DictLimits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidLimits {
     /// The rejected `dict.strings` / `dict.blobs` boundary.
     pub blob_threshold: usize,
     /// The rejected truncation limit.
     pub truncate_limit: usize,
+    /// The rejected total-bytes cap.
+    pub max_total_bytes: usize,
 }
 
 impl fmt::Display for InvalidLimits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "dictionary limits must satisfy 0 < blob_threshold <= truncate_limit, \
-             got blob_threshold {} and truncate_limit {}",
-            self.blob_threshold, self.truncate_limit
+            "dictionary limits must satisfy 0 < blob_threshold <= truncate_limit \
+             <= max_total_bytes, got {}, {} and {}",
+            self.blob_threshold, self.truncate_limit, self.max_total_bytes
         )
     }
 }
 
 impl Error for InvalidLimits {}
 
-/// Why a value was rejected by the dictionaries.
+/// Why a dictionary update was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DictError {
-    /// One `str_id` corresponds to different byte values. The writer must
-    /// abort the segment (README.md, "String Ids and Dictionaries").
-    /// `id == 0` means the input hashed to zero, which the format
-    /// reserves as "no value" and mandates treating as a collision.
+    /// One `str_id` was assigned to different values.
+    ///
+    /// The writer must abandon the current segment. `id == 0` means the
+    /// input hashed to the reserved zero id.
     Collision {
         /// The contested raw id; `0` for the zero-hash case.
         id: u64,
     },
-    /// Hard requirements on one value are incompatible: it is required
-    /// both in `dict.blobs` (registry-forced or oversized) and in
-    /// `dict.hot_strings` (which must be a subset of `dict.strings`).
+    /// One value has incompatible placement requirements.
+    ///
+    /// A value cannot be required in `dict.blobs` and in `dict.hot_strings`,
+    /// because hot strings must also be present in `dict.strings`.
     PlacementConflict {
         /// The id whose requirements cannot all be satisfied.
         id: StrId,
+    },
+    /// Storing a new value would push the total stored bytes past
+    /// [`DictLimits::max_total_bytes`].
+    ///
+    /// This is flow control, not corruption: the writer should flush the
+    /// window into a mini-part and retry. Strict-hot values are exempt —
+    /// they are registry-bounded by contract and must reach every part.
+    Full {
+        /// Total stored bytes already held.
+        stored_bytes: usize,
+        /// The configured cap.
+        max: usize,
     },
 }
 
@@ -156,14 +211,19 @@ impl fmt::Display for DictError {
                     id.get()
                 )
             }
+            Self::Full { stored_bytes, max } => {
+                write!(
+                    f,
+                    "dictionaries hold {stored_bytes} bytes of the {max} cap; flush the window"
+                )
+            }
         }
     }
 }
 
 impl Error for DictError {}
 
-/// One `dict.blobs` row, mirroring the on-disk schema (README.md,
-/// "String Ids and Dictionaries").
+/// One `dict.blobs` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobEntry<'a> {
     /// Id of the full original value.
@@ -187,7 +247,53 @@ pub enum Resolved<'a> {
     Blob(BlobEntry<'a>),
 }
 
-/// Sizes of the dictionaries, for the collector's self-metrics.
+/// Which dictionary an entry currently belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// `dict.strings`.
+    Strings,
+    /// `dict.blobs`.
+    Blobs,
+}
+
+/// Hot-cache requirement requested for an entry.
+///
+/// Effective `dict.hot_strings` membership also requires
+/// [`Placement::Strings`]. A soft mark on a blob-placed value leaves the value
+/// out of the hot cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotMark {
+    /// Never requested hot.
+    None,
+    /// Soft hot request (event labels).
+    Soft,
+    /// Strict hot (chart headers, catalog `source_id`).
+    Hard,
+}
+
+/// Snapshot used by the writer when flushing a dictionary window.
+#[derive(Debug, Clone, Copy)]
+pub struct EntrySnapshot<'a> {
+    /// Id of the full original value.
+    pub str_id: StrId,
+    /// Stored bytes: the full value, or its prefix when truncated.
+    pub stored_bytes: &'a [u8],
+    /// Length of the full original value, bytes.
+    pub full_len: u64,
+    /// Whether only a prefix of the value is stored.
+    pub truncated: bool,
+    /// SHA-256 of the full original value; present only when truncated.
+    pub full_sha256: Option<[u8; 32]>,
+    /// Which dictionary the entry belongs to under current requirements.
+    pub placement: Placement,
+    /// The hot requirement requested for the entry.
+    pub hot: HotMark,
+    /// Whether the registry forced this value into `dict.blobs`
+    /// regardless of size.
+    pub blob_required: bool,
+}
+
+/// Current dictionary sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DictStats {
     /// Number of `dict.strings` entries.
@@ -202,8 +308,9 @@ pub struct DictStats {
     pub blob_bytes: u64,
 }
 
-/// Requirements attached to one interning call. Requirements accumulate
-/// per value and are never withdrawn, which is what makes the final
+/// Requirements attached to one interning call.
+///
+/// Requirements accumulate per value and are never withdrawn. This makes final
 /// placement independent of call order.
 #[derive(Debug, Clone, Copy, Default)]
 struct Requirements {
@@ -211,11 +318,10 @@ struct Requirements {
     /// size, e.g. query plans.
     blob: bool,
     /// The strict part of the hot contract: the value must be readable
-    /// from the tail cache (chart headers, catalog `source_id`).
+    /// from `dict.hot_strings` (chart headers, catalog `source_id`).
     hot_hard: bool,
-    /// The best-effort part of the hot contract: duplicate into the tail
-    /// cache when placement allows it; otherwise leave it out of the
-    /// cache without failing.
+    /// Soft hot request: duplicate into `dict.hot_strings` when placement
+    /// allows it; otherwise leave it out without failing.
     hot_soft: bool,
 }
 
@@ -247,53 +353,71 @@ impl Stored {
     }
 }
 
-/// The three dictionaries of one segment.
+/// The dictionaries of one segment.
 ///
 /// All `intern*` methods deduplicate: the same bytes always yield the
-/// same [`StrId`] and one stored copy. The only fatal outcomes are a
-/// [`DictError::Collision`] and a [`DictError::PlacementConflict`]; both
-/// leave the dictionaries unchanged.
+/// same [`StrId`] and one stored copy. Failed calls — [`DictError`] in any
+/// variant — leave the dictionaries unchanged.
+///
+/// Memory is bounded: total stored bytes are capped by
+/// [`DictLimits::max_total_bytes`], and a new value past the cap fails
+/// with [`DictError::Full`] — the signal to flush the window. Repeats and
+/// requirement upgrades of stored values add no bytes; strict-hot values
+/// are exempt from the cap because the hot contract requires them in every
+/// part and the registry bounds their number.
 #[derive(Debug, Default)]
 pub struct SegmentDicts {
     limits: DictLimits,
     entries: BTreeMap<StrId, Stored>,
+    /// Total stored bytes across both dictionaries; enforced against
+    /// `limits.max_total_bytes`.
+    stored_bytes: usize,
 }
 
 impl SegmentDicts {
-    /// Empty dictionaries with the given limits.
+    /// Create empty dictionaries with the given limits.
     #[must_use]
     pub const fn new(limits: DictLimits) -> Self {
         Self {
             limits,
             entries: BTreeMap::new(),
+            stored_bytes: 0,
         }
     }
 
-    /// The limits this set was built with.
+    /// Total stored bytes across both dictionaries.
+    #[must_use]
+    pub const fn stored_bytes(&self) -> usize {
+        self.stored_bytes
+    }
+
+    /// Return the limits used by this dictionary set.
     #[must_use]
     pub const fn limits(&self) -> DictLimits {
         self.limits
     }
 
-    /// Intern a value with size-based routing: shorter than the threshold
-    /// goes to `dict.strings`, the rest to `dict.blobs`.
+    /// Intern a value using size-based placement.
     ///
     /// # Errors
     ///
-    /// [`DictError::Collision`] — the id is already taken by different
-    /// bytes, or the input hashed to zero.
+    /// Returns [`DictError::Collision`] if the computed id is already used
+    /// for a different value, or if the input hashes to the reserved zero id.
+    /// On error, dictionaries are left unchanged.
     pub fn intern(&mut self, bytes: &[u8]) -> Result<StrId, DictError> {
         self.insert(bytes, Requirements::default())
     }
 
-    /// Intern a value that the registry requires in `dict.blobs`
-    /// regardless of size, e.g. a query plan.
+    /// Intern a value that must be stored in `dict.blobs` regardless of size.
+    ///
+    /// Use this for values whose registry entry forces blob placement.
     ///
     /// # Errors
     ///
-    /// [`DictError::Collision`] as for [`Self::intern`];
-    /// [`DictError::PlacementConflict`] if the value is already required
-    /// in `dict.hot_strings`.
+    /// Returns [`DictError::Collision`] as in [`Self::intern`].
+    /// Returns [`DictError::PlacementConflict`] if the same value is already
+    /// required in `dict.hot_strings`. On error, dictionaries are left
+    /// unchanged.
     pub fn intern_blob(&mut self, bytes: &[u8]) -> Result<StrId, DictError> {
         self.insert(
             bytes,
@@ -304,17 +428,16 @@ impl SegmentDicts {
         )
     }
 
-    /// Intern a value of the strict hot contract: chart header strings
-    /// (`unit`, `series_names`, `entity`) and the catalog `source_id`
-    /// must be resolvable from the tail cache.
+    /// Intern a value that must be available in `dict.hot_strings`.
+    ///
+    /// Use this only for short values such as chart headers and `source_id`.
     ///
     /// # Errors
     ///
-    /// [`DictError::Collision`] as for [`Self::intern`];
-    /// [`DictError::PlacementConflict`] if the value lands in
-    /// `dict.blobs` — by the registry requirement or by size. The strict
-    /// hot contract is only satisfiable for short strings, so an
-    /// oversized one is a bug in the calling type, not a degradation.
+    /// Returns [`DictError::Collision`] as in [`Self::intern`].
+    /// Returns [`DictError::PlacementConflict`] if the value belongs in
+    /// `dict.blobs` by size or by registry requirement. On error,
+    /// dictionaries are left unchanged.
     pub fn intern_hot(&mut self, bytes: &[u8]) -> Result<StrId, DictError> {
         self.insert(
             bytes,
@@ -325,16 +448,16 @@ impl SegmentDicts {
         )
     }
 
-    /// Intern a value of the best-effort hot contract: short event labels
-    /// are duplicated into the tail cache, while large values stay only in
-    /// the full dictionaries.
+    /// Intern a value that should be added to `dict.hot_strings` when possible.
     ///
-    /// Returns the id and whether the value is in `dict.hot_strings`
-    /// after this call.
+    /// Returns the id and a boolean that is `true` when the value is present in
+    /// `dict.hot_strings` after the call. Large values and blob-forced values
+    /// keep their normal placement and return `false`.
     ///
     /// # Errors
     ///
-    /// [`DictError::Collision`] as for [`Self::intern`].
+    /// Returns [`DictError::Collision`] as in [`Self::intern`]. On error,
+    /// dictionaries are left unchanged.
     pub fn intern_hot_best_effort(&mut self, bytes: &[u8]) -> Result<(StrId, bool), DictError> {
         let id = self.insert(
             bytes,
@@ -358,7 +481,8 @@ impl SegmentDicts {
         })
     }
 
-    /// Number of interned values across both dictionaries.
+    /// Return the number of interned values across `dict.strings` and
+    /// `dict.blobs`.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -370,7 +494,7 @@ impl SegmentDicts {
         self.entries.is_empty()
     }
 
-    /// `dict.strings` rows in `str_id` order (the on-disk sort order).
+    /// Iterate `dict.strings` rows in on-disk sort order.
     pub fn strings(&self) -> impl Iterator<Item = (StrId, &[u8])> {
         self.entries
             .iter()
@@ -378,7 +502,7 @@ impl SegmentDicts {
             .map(|(id, stored)| (*id, stored.bytes.as_slice()))
     }
 
-    /// `dict.blobs` rows in `str_id` order (the on-disk sort order).
+    /// Iterate `dict.blobs` rows in on-disk sort order.
     pub fn blobs(&self) -> impl Iterator<Item = BlobEntry<'_>> {
         self.entries
             .iter()
@@ -386,8 +510,9 @@ impl SegmentDicts {
             .map(|(id, stored)| Self::blob_entry(*id, stored))
     }
 
-    /// `dict.hot_strings` rows in `str_id` order. Always a subset of
-    /// [`Self::strings`].
+    /// Iterate `dict.hot_strings` rows in on-disk sort order.
+    ///
+    /// Every returned id is also present in [`Self::strings`].
     pub fn hot_strings(&self) -> impl Iterator<Item = (StrId, &[u8])> {
         self.entries
             .iter()
@@ -395,7 +520,31 @@ impl SegmentDicts {
             .map(|(id, stored)| (*id, stored.bytes.as_slice()))
     }
 
-    /// Sizes of the dictionaries, for self-metrics.
+    /// Per-entry snapshots in `str_id` order, for the writer.
+    pub fn entries(&self) -> impl Iterator<Item = EntrySnapshot<'_>> {
+        self.entries.iter().map(|(id, stored)| EntrySnapshot {
+            str_id: *id,
+            stored_bytes: &stored.bytes,
+            full_len: stored.full_len as u64,
+            truncated: stored.full_sha256.is_some(),
+            full_sha256: stored.full_sha256,
+            placement: if stored.is_blob() {
+                Placement::Blobs
+            } else {
+                Placement::Strings
+            },
+            hot: if stored.req.hot_hard {
+                HotMark::Hard
+            } else if stored.req.hot_soft {
+                HotMark::Soft
+            } else {
+                HotMark::None
+            },
+            blob_required: stored.req.blob,
+        })
+    }
+
+    /// Return current dictionary sizes.
     #[must_use]
     pub fn stats(&self) -> DictStats {
         let mut stats = DictStats::default();
@@ -430,7 +579,7 @@ impl SegmentDicts {
         self.try_insert(id, bytes, req)
     }
 
-    /// The single write path. Public `intern*` methods only hash and
+    /// The single insertion path. Public `intern*` methods only hash and
     /// delegate here, so the zero-id and collision rules are testable
     /// without a known xxh3 preimage.
     ///
@@ -463,6 +612,19 @@ impl SegmentDicts {
         if req.hot_hard && (req.blob || oversized) {
             return Err(DictError::PlacementConflict { id });
         }
+        // The total-bytes cap is checked before any mutation. Strict-hot
+        // values are exempt: the hot contract requires them in every part
+        // and the registry bounds their number, so rejecting one here
+        // would break a contract to protect a budget it cannot threaten.
+        let stored_len = bytes.len().min(self.limits.truncate_limit);
+        if !req.hot_hard
+            && self.stored_bytes.saturating_add(stored_len) > self.limits.max_total_bytes
+        {
+            return Err(DictError::Full {
+                stored_bytes: self.stored_bytes,
+                max: self.limits.max_total_bytes,
+            });
+        }
         let truncated = bytes.len() > self.limits.truncate_limit;
         let stored = Stored {
             bytes: if truncated {
@@ -475,6 +637,7 @@ impl SegmentDicts {
             oversized,
             req,
         };
+        self.stored_bytes += stored_len;
         self.entries.insert(id, stored);
         Ok(id)
     }
@@ -499,11 +662,10 @@ impl SegmentDicts {
     }
 }
 
-/// The zero hash never becomes a real id: zero is the on-disk "no value"
-/// sentinel, so the format mandates treating it as a collision
-/// (README.md, "String Ids and Dictionaries"). No xxh3 preimage of zero
-/// is known, so this conversion is split out to keep the rule directly
-/// testable.
+/// Convert the optional hash result into a dictionary id.
+///
+/// Zero is the on-disk "no value" sentinel. If `StrId::of` returns `None`,
+/// the caller must treat it as a collision.
 fn id_or_collision(hashed: Option<StrId>) -> Result<StrId, DictError> {
     hashed.ok_or(DictError::Collision { id: 0 })
 }
@@ -525,6 +687,41 @@ mod tests {
         assert!(DictLimits::new(0, 16).is_err());
         assert!(DictLimits::new(32, 16).is_err());
         assert!(DictLimits::new(16, 16).is_ok());
+        // The cap must fit at least one value of the maximum stored size.
+        assert!(
+            DictLimits::new(8, 16)
+                .expect("valid")
+                .with_max_total_bytes(15)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn total_bytes_cap_signals_full() {
+        let limits = DictLimits::new(8, 16)
+            .expect("valid")
+            .with_max_total_bytes(16)
+            .expect("cap fits one value");
+        let mut dicts = SegmentDicts::new(limits);
+
+        dicts.intern(b"0123456789").expect("ten bytes fit the cap");
+        let err = dicts
+            .intern(b"abcdefghij")
+            .expect_err("ten more would exceed the cap");
+        assert_eq!(
+            err,
+            DictError::Full {
+                stored_bytes: 10,
+                max: 16
+            }
+        );
+        assert_eq!(dicts.len(), 1, "a rejected value is not stored");
+
+        // Repeats of stored values add no bytes and stay allowed.
+        dicts.intern(b"0123456789").expect("repeat is free");
+        // Strict-hot values are exempt: registry-bounded by contract.
+        dicts.intern_hot(b"hot").expect("hot bypasses the cap");
+        assert_eq!(dicts.stored_bytes(), 13);
     }
 
     #[test]

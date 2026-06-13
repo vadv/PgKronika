@@ -267,6 +267,8 @@ name = "kronika-writer"
 version = "0.0.0"
 dependencies = [
  "kronika-format",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

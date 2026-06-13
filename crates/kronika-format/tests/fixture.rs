@@ -1,10 +1,9 @@
-//! Byte-exact fixture test.
+//! Byte-exact fixture test for the container framing.
 //!
-//! `fixtures/minimal.pgm` is a minimal PGM segment computed by hand from
-//! the byte-layout tables in README.md (a Python reference implementation,
-//! checked against the canonical CRC32C test vector, produced the bytes). A
-//! write-then-read roundtrip cannot catch the writer and the reader
-//! drifting from the specification together; this fixture can.
+//! The fixture catches drift that a write-then-read roundtrip can miss,
+//! because an encoder and decoder can share the same bug.
+//! The bytes were generated independently from the documented layout and
+//! checked against the canonical CRC32C test vector.
 //!
 //! Layout of the 88-byte file:
 //!
@@ -71,7 +70,7 @@ fn encode_reproduces_fixture_bytes_exactly() {
     let catalog = Catalog::decode(&SEGMENT[catalog_start..SEGMENT.len() - TAIL_INDEX_LEN])
         .expect("valid catalog");
 
-    // encode() returns catalog + tail index, i.e. everything after the
-    // last section body — byte-identical to the fixture.
+    // encode() returns catalog + tail index: everything after the last
+    // section body.
     assert_eq!(catalog.encode(), &SEGMENT[catalog_start..]);
 }
