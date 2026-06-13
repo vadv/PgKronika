@@ -119,6 +119,18 @@ mod tests {
     }
 
     #[test]
+    fn decode_any_reports_stats() {
+        let rows = vec![pg16_row(1_000_000), pg17_row(2_000_000)];
+        let bytes = BgwriterCheckpointer::encode(&rows).expect("encode");
+        let bytes_in = bytes.len();
+        let decoded = crate::decode_any(1_006_001, bytes.into()).expect("decode_any");
+        assert_eq!(decoded.stats.rows, 2);
+        assert_eq!(decoded.stats.bytes_in, bytes_in);
+        assert_eq!(decoded.stats.batches, decoded.batches.len());
+        assert!(decoded.stats.row_groups >= 1);
+    }
+
+    #[test]
     fn empty_section_roundtrips() {
         let bytes = BgwriterCheckpointer::encode(&[]).expect("encode empty");
         assert_eq!(
