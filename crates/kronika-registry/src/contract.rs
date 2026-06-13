@@ -185,7 +185,8 @@ impl Error for LintError {}
 fn lint_contract(contract: &TypeContract, out: &mut Vec<LintError>) {
     let raw = contract.type_id.get();
 
-    // Class digit known; source and version present. Both start at 001.
+    // `source`/`version` number from 001, so 000 is the invalid floor the
+    // `< 1` checks reject (README.md, "Registry Linter").
     if contract.type_id.section_class().is_none()
         || contract.type_id.source() < 1
         || contract.type_id.version() < 1
