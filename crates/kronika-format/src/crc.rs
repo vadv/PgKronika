@@ -1,18 +1,31 @@
-//! CRC32C (Castagnoli) checksum used throughout the PGM container.
+//! CRC32C checksums for PGM bytes.
 
 use crc::{CRC_32_ISCSI, Crc};
 
-/// `CRC_32_ISCSI` is the Castagnoli polynomial, i.e. CRC32C — the same
-/// algorithm hardware-accelerated by SSE4.2 and used by S3 checksums.
+/// Castagnoli CRC32C polynomial.
 const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
-/// CRC32C of `bytes`.
+/// Return the CRC32C checksum of `bytes`.
 ///
-/// Every checksum in the PGM container — section bodies, the end catalog,
-/// `active.parts` frame headers — is CRC32C (README.md, "CRC32C").
+/// PGM uses CRC32C for section bodies, the end catalog, and `active.parts`
+/// frame headers.
 #[must_use]
 pub const fn crc32c(bytes: &[u8]) -> u32 {
     CRC32C.checksum(bytes)
+}
+
+/// Return the CRC32C of `bytes` with the four bytes at `zero_at` treated as
+/// zeroes, without copying the input.
+///
+/// The end catalog stores its own checksum inside the checksummed range;
+/// this computes the over-zeroed-field value incrementally instead of
+/// cloning the whole block to blank the field.
+pub(crate) fn crc32c_with_zeroed_field(bytes: &[u8], zero_at: usize) -> u32 {
+    let mut digest = CRC32C.digest();
+    digest.update(&bytes[..zero_at]);
+    digest.update(&[0_u8; 4]);
+    digest.update(&bytes[zero_at + 4..]);
+    digest.finalize()
 }
 
 #[cfg(test)]

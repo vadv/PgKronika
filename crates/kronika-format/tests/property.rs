@@ -1,10 +1,9 @@
 //! Property tests for the end catalog.
 //!
-//! Two invariants: any catalog survives an encode/decode roundtrip, and
-//! any single-byte corruption of the encoded bytes is detected. Detection
-//! relies on CRC32C, so a missed corruption is theoretically possible with
-//! probability ~2^-32 per case; proptest will not hit that in practice,
-//! and a found counterexample would still be worth investigating.
+//! A generated catalog must survive encode/decode. Flipping one byte in the
+//! encoded catalog should make decoding fail.
+//! Detection relies on CRC32C, so a missed corruption is theoretically
+//! possible but unlikely in these generated cases.
 
 use kronika_format::{Catalog, Entry, TAIL_INDEX_LEN, TailIndex};
 use proptest::prelude::*;

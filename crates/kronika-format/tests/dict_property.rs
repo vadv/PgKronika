@@ -1,9 +1,7 @@
-//! Property tests for the dictionary contract; the invariants are from
-//! README.md, "String Ids and Dictionaries".
+//! Property tests for dictionary placement.
 //!
-//! Small limits (threshold 8, truncation 16) are used so that random
-//! byte vectors exercise all three regimes — plain strings, blobs, and
-//! truncated blobs — without generating large inputs.
+//! The generators use small limits so random byte vectors hit normal strings,
+//! blobs, and truncated blobs without large test inputs.
 
 use kronika_format::{DictLimits, Resolved, SegmentDicts, StrId};
 use proptest::prelude::*;
@@ -21,9 +19,10 @@ fn small_limits() -> DictLimits {
     DictLimits::new(BLOB_THRESHOLD, TRUNCATE_LIMIT).expect("8 <= 16")
 }
 
-/// How a value is requested from the dictionaries. `HotHard` is kept off
-/// values that would land in blobs: that combination is a typed error by
-/// design and is unit-tested separately.
+/// How a value is requested from the dictionaries.
+///
+/// `HotHard` is kept off values that would land in blobs. That combination is
+/// a typed error and has separate unit tests.
 #[derive(Debug, Clone, Copy)]
 enum Op {
     Plain,
@@ -32,17 +31,12 @@ enum Op {
     HotHard,
 }
 
-/// A batch of (value, requirement) entries where hard requirements never
-/// conflict, so every application order must succeed and produce the
-/// same dictionaries.
+/// A conflict-free batch of interning calls.
 ///
-/// One value may appear several times with *different* requirements —
-/// that is the point: the requirement-merge branch of the dictionaries
-/// must be exercised, and shuffling such a batch is what makes the
-/// order-independence property non-trivial. Conflicts are excluded by
-/// drawing all ops of one value from a single compatible family:
-/// `{Plain, Blob, HotSoft}` mix freely, `HotHard` mixes with everything
-/// except `Blob` and only fits values short enough for `dict.strings`.
+/// A value may appear more than once with compatible requirements. This keeps
+/// requirement merging in the generated cases while excluding placement
+/// conflicts that are covered by unit tests. Shuffling such a batch must not
+/// change the final dictionaries.
 fn conflict_free_batch() -> impl Strategy<Value = Vec<(Vec<u8>, Op)>> {
     let value_with_ops = proptest::collection::vec(any::<u8>(), 0..32).prop_flat_map(|bytes| {
         let blob_family = proptest::collection::vec(
@@ -100,8 +94,7 @@ type StringRow = (u64, Vec<u8>);
 /// One `dict.blobs` row: (id, stored bytes, full length, truncated).
 type BlobRow = (u64, Vec<u8>, u64, bool);
 
-/// Full observable state of the dictionaries, for order-independence
-/// comparison.
+/// Full observable dictionary state for order-independence checks.
 fn dump(dicts: &SegmentDicts) -> (Vec<StringRow>, Vec<BlobRow>, Vec<u64>) {
     let strings = dicts
         .strings()
