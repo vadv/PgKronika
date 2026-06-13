@@ -28,6 +28,8 @@ use parquet::file::properties::WriterProperties;
 use crate::contract::{ColumnType, TypeContract};
 
 pub mod bgwriter_checkpointer;
+pub mod instance_metadata;
+pub mod reset_metadata;
 
 /// Maximum rows in one snapshot section.
 ///
@@ -186,7 +188,7 @@ pub fn arrow_schema(contract: &TypeContract) -> SchemaRef {
                 ColumnType::U8 => DataType::UInt8,
                 ColumnType::U16 => DataType::UInt16,
                 ColumnType::U32 => DataType::UInt32,
-                ColumnType::U64 => DataType::UInt64,
+                ColumnType::U64 | ColumnType::StrId => DataType::UInt64,
                 ColumnType::F32 => DataType::Float32,
                 ColumnType::F64 => DataType::Float64,
                 ColumnType::Bool => DataType::Boolean,
@@ -527,7 +529,7 @@ pub fn opt_bool(array: &BooleanArray, i: usize) -> Option<bool> {
 
 #[cfg(test)]
 mod hygiene_tests {
-    use crate::Section;
+    use crate::{Section, Ts};
 
     // Fields named like the identifiers the generated encode/decode use
     // internally (`batch`, `out`, `i`, `rows`, `columns`). This must compile
@@ -536,7 +538,7 @@ mod hygiene_tests {
     #[section(id = 1_099_001, name = "hygiene probe", semantics = snapshot_full, sort_key("ts"))]
     struct Weird {
         #[column(t)]
-        ts: i64,
+        ts: Ts,
         #[column(c)]
         batch: i64,
         #[column(c)]
@@ -553,7 +555,7 @@ mod hygiene_tests {
     fn collision_named_fields_roundtrip() {
         let want = vec![
             Weird {
-                ts: 1,
+                ts: Ts(1),
                 batch: 2,
                 out: 3,
                 i: 4,
@@ -561,7 +563,7 @@ mod hygiene_tests {
                 columns: true,
             },
             Weird {
-                ts: 6,
+                ts: Ts(6),
                 batch: 7,
                 out: 8,
                 i: 9,

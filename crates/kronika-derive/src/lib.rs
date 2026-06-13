@@ -13,7 +13,7 @@
 //! #[derive(Section)]
 //! #[section(id = 1_006_001, name = "pg_stat_bgwriter", semantics = snapshot_full, sort_key("ts"))]
 //! struct BgwriterCheckpointer {
-//!     #[column(t)] ts: i64,
+//!     #[column(t)] ts: Ts,
 //!     #[column(c)] checkpoints_timed: i64,
 //!     #[column(c)] buffers_backend: Option<i64>,
 //! }
@@ -55,6 +55,10 @@ struct ColumnDef {
     /// Arrow primitive type token for the runtime helpers, or `None` for
     /// `bool` (which uses the dedicated boolean helpers).
     arrow_type: Option<Ident>,
+    /// Newtype over the Arrow native value (`Ts`, `StrId`), or `None` when the
+    /// field already is the native type. Encode reads its `.0`; decode wraps the
+    /// decoded value back into it.
+    wrapper: Option<Ident>,
     nullable: bool,
 }
 
@@ -170,7 +174,7 @@ fn parse_column(field: &syn::Field) -> syn::Result<ColumnDef> {
 
     let (inner, nullable) = unwrap_option(&field.ty);
     let inner_ident = type_ident(inner)?;
-    let (column_type, arrow_type) = map_type(&inner_ident, &column_class)?;
+    let (column_type, arrow_type, wrapper) = map_type(&inner_ident, &column_class)?;
 
     Ok(ColumnDef {
         name: field_ident.to_string(),
@@ -178,6 +182,7 @@ fn parse_column(field: &syn::Field) -> syn::Result<ColumnDef> {
         column_type,
         column_class,
         arrow_type,
+        wrapper,
         nullable,
     })
 }
@@ -198,30 +203,35 @@ fn column_class(ident: &Ident) -> syn::Result<Ident> {
     Ok(Ident::new(variant, ident.span()))
 }
 
-/// Map a base-type ident and class to a `ColumnType` variant and the Arrow
-/// primitive type token (or `None` for `bool`).
-fn map_type(ident: &Ident, class: &Ident) -> syn::Result<(Ident, Option<Ident>)> {
+/// Map a field's base-type ident and class to its `ColumnType` variant, the
+/// Arrow native type token (or `None` for `bool`), and the newtype wrapper over
+/// that native value (`Ts`, `StrId`) or `None`.
+fn map_type(ident: &Ident, class: &Ident) -> syn::Result<(Ident, Option<Ident>, Option<Ident>)> {
     let span = ident.span();
     let is_timestamp = class == "Timestamp";
 
-    let (column_type, arrow_type): (&str, Option<&str>) = match ident.to_string().as_str() {
-        "i8" => ("I8", Some("Int8Type")),
-        "i16" => ("I16", Some("Int16Type")),
-        "i32" => ("I32", Some("Int32Type")),
-        "i64" if is_timestamp => ("Ts", Some("Int64Type")),
-        "i64" => ("I64", Some("Int64Type")),
-        "u8" => ("U8", Some("UInt8Type")),
-        "u16" => ("U16", Some("UInt16Type")),
-        "u32" => ("U32", Some("UInt32Type")),
-        "u64" => ("U64", Some("UInt64Type")),
-        "f32" => ("F32", Some("Float32Type")),
-        "f64" => ("F64", Some("Float64Type")),
-        "bool" => ("Bool", None),
+    let (column_type, arrow_type, wrapper): (&str, Option<&str>, Option<&str>) = match ident
+        .to_string()
+        .as_str()
+    {
+        "i8" => ("I8", Some("Int8Type"), None),
+        "i16" => ("I16", Some("Int16Type"), None),
+        "i32" => ("I32", Some("Int32Type"), None),
+        "i64" => ("I64", Some("Int64Type"), None),
+        "u8" => ("U8", Some("UInt8Type"), None),
+        "u16" => ("U16", Some("UInt16Type"), None),
+        "u32" => ("U32", Some("UInt32Type"), None),
+        "u64" => ("U64", Some("UInt64Type"), None),
+        "f32" => ("F32", Some("Float32Type"), None),
+        "f64" => ("F64", Some("Float64Type"), None),
+        "bool" => ("Bool", None, None),
+        "Ts" => ("Ts", Some("Int64Type"), Some("Ts")),
+        "StrId" => ("StrId", Some("UInt64Type"), Some("StrId")),
         other => {
             return Err(syn::Error::new(
                 span,
                 format!(
-                    "unsupported column type `{other}`; expected a base type like i64, u32, f64, bool"
+                    "unsupported column type `{other}`; expected a base type like i64, u32, f64, bool, Ts, StrId"
                 ),
             ));
         }
@@ -230,13 +240,14 @@ fn map_type(ident: &Ident, class: &Ident) -> syn::Result<(Ident, Option<Ident>)>
     if is_timestamp && column_type != "Ts" {
         return Err(syn::Error::new(
             span,
-            "a column of class t (timestamp) must be an i64",
+            "a column of class t (timestamp) must be a `Ts`",
         ));
     }
 
     Ok((
         Ident::new(column_type, span),
         arrow_type.map(|at| Ident::new(at, span)),
+        wrapper.map(|w| Ident::new(w, span)),
     ))
 }
 
@@ -325,7 +336,11 @@ fn semantics_variant(ident: &Ident) -> Ident {
 fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
     let builders = columns.iter().map(|c| {
         let field = &c.field;
-        let values = quote! { rows.iter().map(|r| r.#field) };
+        let values = match (&c.wrapper, c.nullable) {
+            (None, _) => quote! { rows.iter().map(|r| r.#field) },
+            (Some(_), false) => quote! { rows.iter().map(|r| r.#field.0) },
+            (Some(_), true) => quote! { rows.iter().map(|r| r.#field.map(|v| v.0)) },
+        };
         match (&c.arrow_type, c.nullable) {
             (Some(at), false) => quote! {
                 ::kronika_registry::write_required::<::kronika_registry::#at>(#values)
@@ -370,10 +385,14 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
 
     let cells = columns.iter().map(|c| {
         let field = &c.field;
-        let value = match (&c.arrow_type, c.nullable) {
-            (Some(_) | None, false) => quote! { #field.value(#idx) },
-            (Some(_), true) => quote! { ::kronika_registry::opt_primitive(#field, #idx) },
-            (None, true) => quote! { ::kronika_registry::opt_bool(#field, #idx) },
+        let value = match (&c.wrapper, &c.arrow_type, c.nullable) {
+            (Some(w), _, false) => quote! { ::kronika_registry::#w(#field.value(#idx)) },
+            (Some(w), _, true) => quote! {
+                ::kronika_registry::opt_primitive(#field, #idx).map(::kronika_registry::#w)
+            },
+            (None, Some(_) | None, false) => quote! { #field.value(#idx) },
+            (None, Some(_), true) => quote! { ::kronika_registry::opt_primitive(#field, #idx) },
+            (None, None, true) => quote! { ::kronika_registry::opt_bool(#field, #idx) },
         };
         quote! { #field: #value }
     });

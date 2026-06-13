@@ -27,8 +27,8 @@ pub enum ColumnClass {
 ///
 /// The set is the base types of the registry: a column uses the narrowest
 /// type that fits its source so the section stays small (a `pid` is `I32`,
-/// not `I64`). `Ts` is an `i64` unix-microsecond timestamp; `str_id`
-/// references use `U64`.
+/// not `I64`). `Ts` is an `i64` unix-microsecond timestamp; `StrId` is a `u64`
+/// reference into the segment string dictionary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     /// Signed 8-bit integer.
@@ -45,7 +45,7 @@ pub enum ColumnType {
     U16,
     /// Unsigned 32-bit integer.
     U32,
-    /// Unsigned 64-bit integer, including `str_id` references.
+    /// Unsigned 64-bit integer.
     U64,
     /// 32-bit float.
     F32,
@@ -55,7 +55,24 @@ pub enum ColumnType {
     Bool,
     /// Timestamp, `i64` unix microseconds.
     Ts,
+    /// A `u64` reference into the segment string dictionary (the bytes live in
+    /// the dictionary, not the section).
+    StrId,
 }
+
+/// A unix-microseconds timestamp, as carried in a `Ts` column.
+///
+/// A distinct type so a timestamp column is `Ts`, not a bare `i64`, whatever
+/// its [`ColumnClass`] — the collection time is class [`ColumnClass::Timestamp`],
+/// but `postmaster_start_time` and friends are `Ts` gauges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ts(pub i64);
+
+/// A reference into the segment string dictionary, as carried in a `StrId`
+/// column. The dictionary (`kronika-format`) holds the bytes; the section
+/// stores only this id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StrId(pub u64);
 
 /// One column of a typed section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

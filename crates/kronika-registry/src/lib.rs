@@ -19,14 +19,16 @@ mod pool;
 mod section;
 mod type_id;
 
-pub use codec::bgwriter_checkpointer;
 pub use codec::{
     CodecError, DecodeStats, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
     arrow_schema, decode_batches, decode_section, encode_section, nullable_bool, nullable_column,
     opt_bool, opt_primitive, required_bool, required_column, write_bool, write_bool_nullable,
     write_nullable, write_required,
 };
-pub use contract::{Column, ColumnClass, ColumnType, LintError, Semantics, TypeContract, lint};
+pub use codec::{bgwriter_checkpointer, instance_metadata, reset_metadata};
+pub use contract::{
+    Column, ColumnClass, ColumnType, LintError, Semantics, StrId, Ts, TypeContract, lint,
+};
 pub use pool::BytesPool;
 pub use section::Section;
 pub use type_id::{SectionClass, TypeId};
@@ -53,7 +55,11 @@ pub use arrow_array::types::{
 /// reused.
 #[must_use]
 pub const fn registry() -> &'static [TypeContract] {
-    &[bgwriter_checkpointer::BgwriterCheckpointer::CONTRACT]
+    &[
+        bgwriter_checkpointer::BgwriterCheckpointer::CONTRACT,
+        reset_metadata::ResetMetadata::CONTRACT,
+        instance_metadata::InstanceMetadata::CONTRACT,
+    ]
 }
 
 /// Decode a section body by its `type_id`, dispatched through [`registry`].
