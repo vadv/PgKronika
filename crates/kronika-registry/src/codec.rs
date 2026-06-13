@@ -529,11 +529,17 @@ pub fn opt_bool(array: &BooleanArray, i: usize) -> Option<bool> {
 
 #[cfg(test)]
 mod hygiene_tests {
-    use crate::{Section, Ts};
+    use crate::{Section, StrId, Ts};
 
-    // Fields named like the identifiers the generated encode/decode use
-    // internally (`batch`, `out`, `i`, `rows`, `columns`). This must compile
-    // and roundtrip: a hygiene regression in the derive would break the build.
+    // Fields named like the identifiers the generated decode uses internally
+    // (`batch`, `out`, `i`), and fields named exactly like the in-scope value
+    // types (`Ts`, `StrId`). All must compile and roundtrip: decode binds its
+    // column readers to hidden idents, so neither a field name nor a type name
+    // can collide. A hygiene regression would break the build.
+    #[allow(
+        non_snake_case,
+        reason = "fields are deliberately named like the Ts/StrId types to test decode hygiene"
+    )]
     #[derive(Debug, Clone, Copy, PartialEq, Section)]
     #[section(id = 1_099_001, name = "hygiene probe", semantics = snapshot_full, sort_key("ts"))]
     struct Weird {
@@ -549,6 +555,12 @@ mod hygiene_tests {
         rows: Option<i64>,
         #[column(g)]
         columns: bool,
+        #[column(l)]
+        label: StrId,
+        #[column(c)]
+        Ts: i64,
+        #[column(l)]
+        StrId: u64,
     }
 
     #[test]
@@ -561,6 +573,9 @@ mod hygiene_tests {
                 i: 4,
                 rows: Some(5),
                 columns: true,
+                label: StrId(10),
+                Ts: 11,
+                StrId: 12,
             },
             Weird {
                 ts: Ts(6),
@@ -569,6 +584,9 @@ mod hygiene_tests {
                 i: 9,
                 rows: None,
                 columns: false,
+                label: StrId(13),
+                Ts: 14,
+                StrId: 15,
             },
         ];
         let bytes = Weird::encode(&want).expect("encode");
