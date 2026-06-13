@@ -113,11 +113,6 @@ impl TypeContract {
 /// Registry lint error (README.md, "Registry Linter").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintError {
-    /// The type id has an unknown class digit or a zero version.
-    InvalidTypeId {
-        /// The raw id that failed validation.
-        type_id: u32,
-    },
     /// Two contracts share a type id.
     DuplicateTypeId {
         /// The repeated raw id.
@@ -148,12 +143,6 @@ pub enum LintError {
 impl fmt::Display for LintError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidTypeId { type_id } => {
-                write!(
-                    f,
-                    "type_id {type_id} has an unknown class, zero source, or zero version"
-                )
-            }
             Self::DuplicateTypeId { type_id } => {
                 write!(f, "type_id {type_id} is declared more than once")
             }
@@ -184,15 +173,6 @@ impl Error for LintError {}
 /// Check the invariants of one contract, appending findings to `out`.
 fn lint_contract(contract: &TypeContract, out: &mut Vec<LintError>) {
     let raw = contract.type_id.get();
-
-    // `source`/`version` number from 001, so 000 is the invalid floor the
-    // `< 1` checks reject (README.md, "Registry Linter").
-    if contract.type_id.section_class().is_none()
-        || contract.type_id.source() < 1
-        || contract.type_id.version() < 1
-    {
-        out.push(LintError::InvalidTypeId { type_id: raw });
-    }
 
     for &name in contract.sort_key {
         if contract.column(name).is_none() {
@@ -269,7 +249,7 @@ mod tests {
         sort_key: &'static [&'static str],
     ) -> TypeContract {
         TypeContract {
-            type_id: TypeId::declared(type_id),
+            type_id: TypeId::new(type_id).expect("test type_id must be valid"),
             name: "test",
             semantics: Semantics::SnapshotFull,
             columns,
@@ -282,25 +262,6 @@ mod tests {
     fn accepts_a_valid_contract() {
         let c = contract(1_006_001, &[TS, VALUE], &["ts"]);
         assert_eq!(lint(&[c]), Ok(()));
-    }
-
-    #[test]
-    fn rejects_invalid_id() {
-        let c = contract(4_000_001, &[TS], &["ts"]);
-        assert_eq!(
-            lint(&[c]),
-            Err(vec![LintError::InvalidTypeId { type_id: 4_000_001 }])
-        );
-    }
-
-    #[test]
-    fn rejects_zero_source() {
-        // Class 1, version 1, but source 000 — outside the class range.
-        let c = contract(1_000_001, &[TS], &["ts"]);
-        assert_eq!(
-            lint(&[c]),
-            Err(vec![LintError::InvalidTypeId { type_id: 1_000_001 }])
-        );
     }
 
     #[test]

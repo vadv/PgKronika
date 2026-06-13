@@ -60,7 +60,7 @@ pub struct BgwriterCheckpointer {
 #[cfg(test)]
 mod tests {
     use super::BgwriterCheckpointer;
-    use crate::{CodecError, MAX_SECTION_BYTES, MAX_SECTION_ROWS, lint};
+    use crate::{CodecError, MAX_SECTION_BYTES, MAX_SECTION_ROWS, Section, lint};
 
     fn pg16_row(ts: i64) -> BgwriterCheckpointer {
         BgwriterCheckpointer {
