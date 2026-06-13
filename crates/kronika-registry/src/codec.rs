@@ -270,14 +270,40 @@ pub fn encode_section(
 
 // ---- Decode runtime --------------------------------------------------------
 
+/// What a section decode processed, for the caller to export as metrics.
+///
+/// The codec stays free of `tracing`; the reader turns these into RED metrics
+/// (per `type_id`: section size, row and batch counts) at its own layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeStats {
+    /// Input section bytes.
+    pub bytes_in: usize,
+    /// Parquet row groups read.
+    pub row_groups: usize,
+    /// Arrow batches produced.
+    pub batches: usize,
+    /// Rows decoded.
+    pub rows: usize,
+}
+
+/// A decoded section: its Arrow batches and the [`DecodeStats`] for the call.
+#[derive(Debug)]
+pub struct DecodedSection {
+    /// The section's rows, in contract column order.
+    pub batches: Vec<RecordBatch>,
+    /// What the decode processed.
+    pub stats: DecodeStats,
+}
+
 /// Build a reader with every pre-iteration memory bound applied (README.md,
 /// "Memory Bounds"): the byte length is capped before the footer is parsed,
 /// the row-group count after it, and the claimed row count at
 /// [`MAX_SECTION_ROWS`]. Both decode paths share this so neither can omit a cap.
+/// Returns the row-group count alongside the reader for [`DecodeStats`].
 ///
 /// Takes owned `Bytes` so the Parquet reader slices the section in place — the
 /// caller's zero-copy slice (or pooled buffer) is reused, not copied.
-fn capped_reader(bytes: Bytes) -> Result<ParquetRecordBatchReader, CodecError> {
+fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize), CodecError> {
     if bytes.len() > MAX_SECTION_BYTES {
         return Err(CodecError::SectionTooLarge {
             len: bytes.len(),
@@ -304,7 +330,7 @@ fn capped_reader(bytes: Bytes) -> Result<ParquetRecordBatchReader, CodecError> {
     }
 
     let batch_size = MAX_SECTION_ROWS.min(8192);
-    Ok(builder.with_batch_size(batch_size).build()?)
+    Ok((builder.with_batch_size(batch_size).build()?, groups))
 }
 
 /// Decode a Parquet section body, calling `push_rows` for each read batch.
@@ -323,7 +349,7 @@ pub fn decode_section<Row>(
     bytes: Bytes,
     mut push_rows: impl FnMut(&RecordBatch, &mut Vec<Row>) -> Result<(), CodecError>,
 ) -> Result<Vec<Row>, CodecError> {
-    let reader = capped_reader(bytes)?;
+    let (reader, _row_groups) = capped_reader(bytes)?;
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch?;
@@ -342,20 +368,19 @@ pub fn decode_section<Row>(
 ///
 /// The registry-driven counterpart to [`decode_section`]: it takes no concrete
 /// Rust type, so [`decode_any`](crate::decode_any) can dispatch by `type_id`.
-/// Same caps as [`decode_section`]; the returned batches hold the whole section
-/// (bounded by [`MAX_SECTION_ROWS`]). The file schema must match the contract's
-/// [`arrow_schema`] in column set, order, type, and nullability.
+/// Same caps as [`decode_section`]; the [`DecodedSection`] holds the whole
+/// section (bounded by [`MAX_SECTION_ROWS`]) plus its [`DecodeStats`]. The file
+/// schema must match the contract's [`arrow_schema`] in column set, order,
+/// type, and nullability.
 ///
 /// # Errors
 ///
 /// [`CodecError::SectionTooLarge`], [`CodecError::TooManyRowGroups`], or
 /// [`CodecError::TooManyRows`] on a bound; [`CodecError::SchemaMismatch`] if the
 /// file does not match `contract`; [`CodecError::Parquet`] on malformed Parquet.
-pub fn decode_batches(
-    contract: &TypeContract,
-    bytes: Bytes,
-) -> Result<Vec<RecordBatch>, CodecError> {
-    let reader = capped_reader(bytes)?;
+pub fn decode_batches(contract: &TypeContract, bytes: Bytes) -> Result<DecodedSection, CodecError> {
+    let bytes_in = bytes.len();
+    let (reader, row_groups) = capped_reader(bytes)?;
 
     let want = arrow_schema(contract);
     let got = reader.schema();
@@ -370,19 +395,25 @@ pub fn decode_batches(
     }
 
     let mut batches = Vec::new();
-    let mut total = 0_usize;
+    let mut rows = 0_usize;
     for batch in reader {
         let batch = batch?;
-        total += batch.num_rows();
-        if total > MAX_SECTION_ROWS {
+        rows += batch.num_rows();
+        if rows > MAX_SECTION_ROWS {
             return Err(CodecError::TooManyRows {
-                rows: total,
+                rows,
                 max: MAX_SECTION_ROWS,
             });
         }
         batches.push(batch);
     }
-    Ok(batches)
+    let stats = DecodeStats {
+        bytes_in,
+        row_groups,
+        batches: batches.len(),
+        rows,
+    };
+    Ok(DecodedSection { batches, stats })
 }
 
 fn primitive_column<'a, T: ArrowPrimitiveType>(

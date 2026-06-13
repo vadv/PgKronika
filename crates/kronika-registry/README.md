@@ -103,11 +103,12 @@ Each generated codec is an `impl Section for T`, so generic code works over
 shared roundtrip test is written once, not per type.
 
 Reading a segment, the `type_id` is a runtime `u32`, so the reader cannot name
-`T`. `decode_any(type_id, bytes)` dispatches through `registry()` and returns
-the section's Arrow `RecordBatch`es, validated against the contract. It needs
-no concrete type and no per-type `match`, so a new section type costs one
-`registry()` entry and is decodable immediately — the property that lets the
-registry grow to hundreds of types without per-type wiring.
+`T`. `decode_any(type_id, bytes)` dispatches through `registry()` and returns a
+`DecodedSection` — the Arrow `RecordBatch`es plus a `DecodeStats` (input bytes,
+row groups, batches, rows) the reader exports as RED metrics — validated against
+the contract. It needs no concrete type and no per-type `match`, so a new section
+type costs one `registry()` entry and is decodable immediately — the property
+that lets the registry grow to hundreds of types without per-type wiring.
 
 `decode` and `decode_any` take owned `Bytes` and never copy the section — the
 Parquet reader slices it in place. A reader holds the segment once (mmap or one
@@ -172,8 +173,8 @@ the protection model of the format.
   rather than raw Parquet bytes because Arrow metadata and encoding choices can
   change between dependency versions;
 - the generic path: every registered type round-trips an empty section through
-  `decode_any` with no per-type code, and `decode_any` rejects an unregistered
-  `type_id`.
+  `decode_any` with no per-type code; `decode_any` reports decode stats and
+  rejects an unregistered `type_id`.
 
 ## Future Work
 

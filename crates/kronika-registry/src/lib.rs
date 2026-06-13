@@ -21,10 +21,10 @@ mod type_id;
 
 pub use codec::bgwriter_checkpointer;
 pub use codec::{
-    CodecError, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS, arrow_schema, decode_batches,
-    decode_section, encode_section, nullable_bool, nullable_column, opt_bool, opt_primitive,
-    required_bool, required_column, write_bool, write_bool_nullable, write_nullable,
-    write_required,
+    CodecError, DecodeStats, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
+    arrow_schema, decode_batches, decode_section, encode_section, nullable_bool, nullable_column,
+    opt_bool, opt_primitive, required_bool, required_column, write_bool, write_bool_nullable,
+    write_nullable, write_required,
 };
 pub use contract::{Column, ColumnClass, ColumnType, LintError, Semantics, TypeContract, lint};
 pub use pool::BytesPool;
@@ -39,8 +39,6 @@ pub use bytes::Bytes;
 // `#[derive(Section)]` cannot reach the crate-private `TypeId` constructor
 // anyway). The trait above is public; the derive macro is not.
 pub(crate) use kronika_derive::Section;
-
-use arrow_array::RecordBatch;
 
 // Arrow primitive type tokens that `#[derive(Section)]` names in generated
 // codecs, re-exported so a type module needs only this crate in scope.
@@ -62,7 +60,8 @@ pub const fn registry() -> &'static [TypeContract] {
 ///
 /// The registry-driven reader entry point: it takes no concrete type, so a new
 /// section type costs one [`registry`] entry and no per-type `match` here. The
-/// returned batches carry the contract's columns; the bytes are validated
+/// returned [`DecodedSection`] carries the contract's columns and the
+/// [`DecodeStats`] the caller exports as metrics; the bytes are validated
 /// against the contract (README.md, "Section Trait").
 ///
 /// Integrity is the caller's responsibility: this does not verify the section
@@ -77,7 +76,7 @@ pub const fn registry() -> &'static [TypeContract] {
 /// the errors of [`decode_batches`], including every memory-bound cap.
 // TODO(reader): take a verified-section handle once the reader crate exists, so
 // raw bytes cannot reach the Parquet page-header parser by mistake.
-pub fn decode_any(type_id: u32, bytes: Bytes) -> Result<Vec<RecordBatch>, CodecError> {
+pub fn decode_any(type_id: u32, bytes: Bytes) -> Result<DecodedSection, CodecError> {
     let contract = registry()
         .iter()
         .find(|contract| contract.type_id.get() == type_id)
@@ -97,8 +96,8 @@ pub fn lint_registry() -> Result<(), Vec<LintError>> {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::ArrayRef;
     use arrow_array::array::new_empty_array;
-    use arrow_array::{ArrayRef, RecordBatch};
     use bytes::Bytes;
 
     use super::{CodecError, arrow_schema, decode_any, encode_section, lint_registry, registry};
@@ -126,10 +125,17 @@ mod tests {
                 .map(|field| new_empty_array(field.data_type()))
                 .collect();
             let bytes = encode_section(contract, 0, columns).expect("encode empty section");
+            let bytes_in = bytes.len();
             let id = contract.type_id.get();
-            let batches = decode_any(id, bytes.into()).expect("decode_any");
-            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-            assert_eq!(rows, 0, "type {id} should decode to zero rows");
+            let decoded = decode_any(id, bytes.into()).expect("decode_any");
+            assert_eq!(
+                decoded.stats.rows, 0,
+                "type {id} should decode to zero rows"
+            );
+            assert_eq!(
+                decoded.stats.bytes_in, bytes_in,
+                "stats.bytes_in matches input"
+            );
         }
     }
 
