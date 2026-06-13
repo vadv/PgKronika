@@ -18,6 +18,7 @@ use arrow_array::{
     RecordBatchReader,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
@@ -273,15 +274,17 @@ pub fn encode_section(
 /// "Memory Bounds"): the byte length is capped before the footer is parsed,
 /// the row-group count after it, and the claimed row count at
 /// [`MAX_SECTION_ROWS`]. Both decode paths share this so neither can omit a cap.
-fn capped_reader(bytes: &[u8]) -> Result<ParquetRecordBatchReader, CodecError> {
+///
+/// Takes owned `Bytes` so the Parquet reader slices the section in place — the
+/// caller's zero-copy slice (or pooled buffer) is reused, not copied.
+fn capped_reader(bytes: Bytes) -> Result<ParquetRecordBatchReader, CodecError> {
     if bytes.len() > MAX_SECTION_BYTES {
         return Err(CodecError::SectionTooLarge {
             len: bytes.len(),
             max: MAX_SECTION_BYTES,
         });
     }
-    let data = bytes::Bytes::copy_from_slice(bytes);
-    let builder = ParquetRecordBatchReaderBuilder::try_new(data)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
 
     let groups = builder.metadata().num_row_groups();
     if groups > MAX_ROW_GROUPS {
@@ -317,7 +320,7 @@ fn capped_reader(bytes: &[u8]) -> Result<ParquetRecordBatchReader, CodecError> {
 /// [`CodecError::TooManyRows`] if a bound is exceeded; [`CodecError::Parquet`]
 /// on malformed Parquet; whatever `push_rows` returns on a contract mismatch.
 pub fn decode_section<Row>(
-    bytes: &[u8],
+    bytes: Bytes,
     mut push_rows: impl FnMut(&RecordBatch, &mut Vec<Row>) -> Result<(), CodecError>,
 ) -> Result<Vec<Row>, CodecError> {
     let reader = capped_reader(bytes)?;
@@ -350,7 +353,7 @@ pub fn decode_section<Row>(
 /// file does not match `contract`; [`CodecError::Parquet`] on malformed Parquet.
 pub fn decode_batches(
     contract: &TypeContract,
-    bytes: &[u8],
+    bytes: Bytes,
 ) -> Result<Vec<RecordBatch>, CodecError> {
     let reader = capped_reader(bytes)?;
 
@@ -536,6 +539,6 @@ mod hygiene_tests {
             },
         ];
         let bytes = Weird::encode(&want).expect("encode");
-        assert_eq!(Weird::decode(&bytes).expect("decode"), want);
+        assert_eq!(Weird::decode(bytes.into()).expect("decode"), want);
     }
 }

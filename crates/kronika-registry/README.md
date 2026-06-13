@@ -109,6 +109,14 @@ no concrete type and no per-type `match`, so a new section type costs one
 `registry()` entry and is decodable immediately — the property that lets the
 registry grow to hundreds of types without per-type wiring.
 
+`decode` and `decode_any` take owned `Bytes` and never copy the section — the
+Parquet reader slices it in place. A reader holds the segment once (mmap or one
+read) and hands each section a zero-copy slice; a streaming source can reuse
+buffers through `BytesPool`, which returns a buffer to itself when the decoded
+`Bytes` is dropped, so a steady decode loop does not allocate per section. The
+pool covers only the input buffer; the decompressed and Arrow data are inherently
+fresh.
+
 The `Section` trait is public; the `#[derive(Section)]` macro is not. Every
 section type lives in this crate (the derive routes ids through the
 crate-private `TypeId` constructor), so the macro is a registry-internal tool,
@@ -138,18 +146,21 @@ byte length must fit `MAX_SECTION_BYTES`, row groups must fit `MAX_ROW_GROUPS`,
 and both metadata and decoded row counts must fit `MAX_SECTION_ROWS`.
 
 Encode peak memory is the caller's row slice plus one Parquet row group.
-`decode_section` streams — one read batch at a time — so its peak is one bounded
-copy of the section bytes plus one batch. `decode_batches` (and `decode_any`)
-returns the whole section as Arrow batches instead, so its peak is the section
-itself, still bounded at `MAX_SECTION_ROWS` by the same caps. The caps are far
-above what the current regularly sampled single-row sources produce in one
-segment; they limit writer bugs and malformed sections, not normal data.
+`decode` takes owned `Bytes` and does not copy the section — the Parquet reader
+slices it in place. `decode_section` streams, one read batch at a time, so its
+added peak is one batch; `decode_batches` (and `decode_any`) returns the whole
+section as Arrow batches, so its added peak is the section's decoded rows. Both
+are bounded at `MAX_SECTION_ROWS` by the same caps, far above what the current
+regularly sampled single-row sources produce in one segment; they limit writer
+bugs and malformed sections, not normal data.
 
 One risk remains in Parquet decoding itself: a valid-size page can request a
-large buffer from its page header. Callers should pass bytes to `decode` only
-after verifying the section CRC against the catalog. That catches media
-corruption before this point; fully forged segments are outside the protection
-model of the format.
+large buffer from its page header, which the byte cap does not bound. `decode`
+therefore assumes CRC-verified bytes: the part scanner (`kronika-format`
+`validate_part`) checks each section's CRC against the catalog before its bytes
+are located, so the regular read path is covered. A tool decoding raw bytes must
+verify first. This catches media corruption; fully forged segments are outside
+the protection model of the format.
 
 ## Tests
 
