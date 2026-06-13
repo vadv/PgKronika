@@ -114,7 +114,7 @@ mod tests {
         // One section may contain rows from both PostgreSQL layouts.
         let rows = vec![pg16_row(1_000_000), pg17_row(2_000_000)];
         let bytes = BgwriterCheckpointer::encode(&rows).expect("encode");
-        let decoded = BgwriterCheckpointer::decode(&bytes).expect("decode");
+        let decoded = BgwriterCheckpointer::decode(bytes.into()).expect("decode");
         assert_eq!(decoded, rows);
     }
 
@@ -122,7 +122,7 @@ mod tests {
     fn empty_section_roundtrips() {
         let bytes = BgwriterCheckpointer::encode(&[]).expect("encode empty");
         assert_eq!(
-            BgwriterCheckpointer::decode(&bytes).expect("decode empty"),
+            BgwriterCheckpointer::decode(bytes.into()).expect("decode empty"),
             Vec::new()
         );
     }
@@ -132,7 +132,7 @@ mod tests {
         // NULL must not decode to Some(0).
         let row = pg17_row(5);
         let bytes = BgwriterCheckpointer::encode(&[row]).expect("encode");
-        let decoded = BgwriterCheckpointer::decode(&bytes).expect("decode");
+        let decoded = BgwriterCheckpointer::decode(bytes.into()).expect("decode");
         assert_eq!(decoded[0].buffers_backend, None);
     }
 
@@ -178,7 +178,7 @@ mod tests {
     fn decode_rejects_an_oversized_section() {
         let bytes = vec![0_u8; MAX_SECTION_BYTES + 1];
         assert!(matches!(
-            BgwriterCheckpointer::decode(&bytes),
+            BgwriterCheckpointer::decode(bytes.into()),
             Err(CodecError::SectionTooLarge { .. })
         ));
     }
@@ -229,7 +229,7 @@ mod tests {
         writer.close().expect("close");
 
         assert!(matches!(
-            BgwriterCheckpointer::decode(&buf),
+            BgwriterCheckpointer::decode(buf.into()),
             Err(CodecError::NullInRequiredColumn { name: "ts" })
         ));
     }

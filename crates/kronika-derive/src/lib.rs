@@ -100,7 +100,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 ::kronika_registry::encode_section(&Self::CONTRACT, rows.len(), columns)
             }
 
-            fn decode(bytes: &[u8]) -> ::core::result::Result<
+            fn decode(bytes: ::kronika_registry::Bytes) -> ::core::result::Result<
                 ::std::vec::Vec<Self>,
                 ::kronika_registry::CodecError,
             > {

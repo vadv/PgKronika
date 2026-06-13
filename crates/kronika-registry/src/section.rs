@@ -6,6 +6,8 @@
 //! driven by [`registry`](crate::registry), so a new section type costs one
 //! registry entry and no per-type `match` (README.md, "Section Trait").
 
+use bytes::Bytes;
+
 use crate::codec::CodecError;
 use crate::contract::TypeContract;
 
@@ -28,10 +30,13 @@ pub trait Section: Sized {
 
     /// Decode a Parquet section body back into typed rows.
     ///
+    /// Takes owned `Bytes` so the reader slices the section in place; the
+    /// caller passes a zero-copy slice or a pooled buffer, not a fresh copy.
+    ///
     /// # Errors
     ///
     /// A memory-bound [`CodecError`] if a cap is exceeded, [`CodecError::Parquet`]
     /// on malformed Parquet, or a column error if the file does not match
     /// [`CONTRACT`](Section::CONTRACT).
-    fn decode(bytes: &[u8]) -> Result<Vec<Self>, CodecError>;
+    fn decode(bytes: Bytes) -> Result<Vec<Self>, CodecError>;
 }
