@@ -1,8 +1,8 @@
 //! The type contract: schema, column classes, sort key, and collection
 //! semantics attached to every `type_id` (README.md, "Type Contract").
 //!
-//! A section codec must match its contract — the codec tests check this —
-//! and the registry linter checks the cross-type invariants.
+//! A section codec must match its contract; codec tests check that directly.
+//! The registry linter checks rules that span contracts.
 
 use std::error::Error;
 use std::fmt;
@@ -24,14 +24,33 @@ pub enum ColumnClass {
 }
 
 /// The on-disk type of a column value.
+///
+/// The set is the base types of the registry: a column uses the narrowest
+/// type that fits its source so the section stays small (a `pid` is `I32`,
+/// not `I64`). `Ts` is an `i64` unix-microsecond timestamp; `str_id`
+/// references use `U64`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
+    /// Signed 8-bit integer.
+    I8,
+    /// Signed 16-bit integer.
+    I16,
+    /// Signed 32-bit integer.
+    I32,
     /// Signed 64-bit integer.
     I64,
-    /// 64-bit float.
-    F64,
+    /// Unsigned 8-bit integer.
+    U8,
+    /// Unsigned 16-bit integer.
+    U16,
+    /// Unsigned 32-bit integer.
+    U32,
     /// Unsigned 64-bit integer, including `str_id` references.
     U64,
+    /// 32-bit float.
+    F32,
+    /// 64-bit float.
+    F64,
     /// Boolean.
     Bool,
     /// Timestamp, `i64` unix microseconds.
@@ -91,7 +110,7 @@ impl TypeContract {
     }
 }
 
-/// A registry-linter finding (README.md, "Registry Linter").
+/// Registry lint error (README.md, "Registry Linter").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintError {
     /// The type id has an unknown class digit or a zero version.
@@ -132,7 +151,7 @@ impl fmt::Display for LintError {
             Self::InvalidTypeId { type_id } => {
                 write!(
                     f,
-                    "type_id {type_id} has an unknown class or a zero version"
+                    "type_id {type_id} has an unknown class, zero source, or zero version"
                 )
             }
             Self::DuplicateTypeId { type_id } => {
@@ -166,8 +185,7 @@ impl Error for LintError {}
 fn lint_contract(contract: &TypeContract, out: &mut Vec<LintError>) {
     let raw = contract.type_id.get();
 
-    // Class digit known, source within the class (sources start at 001),
-    // version present (semantics.md §5: "matches the class range").
+    // Class digit known; source and version present. Both start at 001.
     if contract.type_id.section_class().is_none()
         || contract.type_id.source() < 1
         || contract.type_id.version() < 1

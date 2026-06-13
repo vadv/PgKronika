@@ -44,9 +44,8 @@ impl SectionClass {
 
 /// A section type id.
 ///
-/// Constructed either checked at runtime ([`TypeId::new`]) or declared in a
-/// registry contract ([`TypeId::declared`], checked later by the registry
-/// linter).
+/// Use [`TypeId::new`] for runtime input. Registry constants use
+/// [`TypeId::declared`] and are checked by the registry linter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeId(u32);
 
@@ -68,7 +67,7 @@ impl TypeId {
         }
     }
 
-    /// Declare a `type_id` in a registry contract without checking it here.
+    /// Declare a `type_id` in a registry contract.
     ///
     /// Registry contracts are `const`, so they cannot use the fallible
     /// [`TypeId::new`]. The registry linter checks these declarations later
