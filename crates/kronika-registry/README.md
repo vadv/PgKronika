@@ -151,17 +151,23 @@ the reader interprets all other sections against them:
 - `instance_metadata` (`1_021_001`) — the instance fingerprint: `pg_version_num`,
   `pg_system_identifier`, hostname, and the OS constants (`clock_ticks_per_sec`,
   `page_size_bytes`, `boot_id`, `btime`) that make OS sections self-describing.
-- `reset_metadata` (`1_020_001`) — counter-reset context: postmaster start time
-  and per-view reset timestamps (so the diff engine tells a real reset from data
-  loss), plus the extension versions and GUCs (`track_io_timing`,
+- `reset_metadata` (`1_020_001`) — the cross-cutting reset context: the global
+  postmaster start time, reset times for views that do not yet have their own
+  section, the extension versions, and the GUCs (`track_io_timing`,
   `compute_query_id`) that decide whether a column is present or meaningful.
+
+A statistics reset is per-view — `pg_stat_reset_shared('bgwriter')` resets only
+that view — and can land mid-segment, so a view that exposes its own
+`stats_reset` carries it per row in its own section (`bgwriter_stats_reset` in
+`1_006_001`), where the diff engine sees the reset between two samples;
+`reset_metadata`, one row per segment, would miss it.
 
 This is why one codec spans every PostgreSQL version. Version differences are
 nullable columns — `buffers_backend` is `None` on PG17+ — and their meaning
 comes from these sections, not from a new `type_id` per release: `pg_version_num`
-says the column was removed in PG17, and `pg_stat_checkpointer_reset_at` (null
-before PG17) corroborates it. The source version is provenance recorded once per
-segment, not a column repeated in every type.
+says the column was removed in PG17, and the row's `checkpointer_stats_reset`
+(null before PG17) corroborates it. The source version is provenance recorded
+once per segment, not a column repeated in every type.
 
 ## Memory Bounds
 
