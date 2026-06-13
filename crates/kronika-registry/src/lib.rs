@@ -15,17 +15,27 @@ extern crate self as kronika_registry;
 
 mod codec;
 mod contract;
+mod section;
 mod type_id;
 
 pub use codec::bgwriter_checkpointer;
 pub use codec::{
-    CodecError, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS, arrow_schema, decode_section,
-    encode_section, nullable_bool, nullable_column, opt_bool, opt_primitive, required_bool,
-    required_column, write_bool, write_bool_nullable, write_nullable, write_required,
+    CodecError, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS, arrow_schema, decode_batches,
+    decode_section, encode_section, nullable_bool, nullable_column, opt_bool, opt_primitive,
+    required_bool, required_column, write_bool, write_bool_nullable, write_nullable,
+    write_required,
 };
 pub use contract::{Column, ColumnClass, ColumnType, LintError, Semantics, TypeContract, lint};
-pub use kronika_derive::Section;
+pub use section::Section;
 pub use type_id::{SectionClass, TypeId};
+
+// The `Section` derive macro is a registry-internal tool: every section type
+// lives in this crate, so it is not part of the public surface (an external
+// `#[derive(Section)]` cannot reach the crate-private `TypeId` constructor
+// anyway). The trait above is public; the derive macro is not.
+pub(crate) use kronika_derive::Section;
+
+use arrow_array::RecordBatch;
 
 // Arrow primitive type tokens that `#[derive(Section)]` names in generated
 // codecs, re-exported so a type module needs only this crate in scope.
@@ -43,6 +53,25 @@ pub const fn registry() -> &'static [TypeContract] {
     &[bgwriter_checkpointer::BgwriterCheckpointer::CONTRACT]
 }
 
+/// Decode a section body by its `type_id`, dispatched through [`registry`].
+///
+/// The registry-driven reader entry point: it takes no concrete type, so a new
+/// section type costs one [`registry`] entry and no per-type `match` here. The
+/// returned batches carry the contract's columns; the bytes are validated
+/// against the contract (README.md, "Section Trait").
+///
+/// # Errors
+///
+/// [`CodecError::UnknownType`] if no registered type has `type_id`; otherwise
+/// the errors of [`decode_batches`], including every memory-bound cap.
+pub fn decode_any(type_id: u32, bytes: &[u8]) -> Result<Vec<RecordBatch>, CodecError> {
+    let contract = registry()
+        .iter()
+        .find(|contract| contract.type_id.get() == type_id)
+        .ok_or(CodecError::UnknownType { type_id })?;
+    decode_batches(contract, bytes)
+}
+
 /// Run the registry linter over every known type.
 ///
 /// # Errors
@@ -55,7 +84,10 @@ pub fn lint_registry() -> Result<(), Vec<LintError>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lint_registry, registry};
+    use arrow_array::array::new_empty_array;
+    use arrow_array::{ArrayRef, RecordBatch};
+
+    use super::{CodecError, arrow_schema, decode_any, encode_section, lint_registry, registry};
 
     #[test]
     fn the_registry_is_clean() {
@@ -65,5 +97,35 @@ mod tests {
     #[test]
     fn registry_is_not_empty() {
         assert!(!registry().is_empty());
+    }
+
+    /// Wiring check for every registered type, with no per-type code: an empty
+    /// section built from the contract schema must encode and decode back
+    /// through `decode_any`. A type added but mis-wired fails here.
+    #[test]
+    fn every_registered_type_decodes_an_empty_section() {
+        for contract in registry() {
+            let schema = arrow_schema(contract);
+            let columns: Vec<ArrayRef> = schema
+                .fields()
+                .iter()
+                .map(|field| new_empty_array(field.data_type()))
+                .collect();
+            let bytes = encode_section(contract, 0, columns).expect("encode empty section");
+            let id = contract.type_id.get();
+            let batches = decode_any(id, &bytes).expect("decode_any");
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(rows, 0, "type {id} should decode to zero rows");
+        }
+    }
+
+    #[test]
+    fn decode_any_rejects_an_unregistered_type() {
+        // Structurally valid (class 2, source 999, version 999) but not in the
+        // registry, so the dispatch must reject it rather than decode garbage.
+        assert!(matches!(
+            decode_any(2_999_999, b""),
+            Err(CodecError::UnknownType { type_id: 2_999_999 })
+        ));
     }
 }

@@ -42,20 +42,26 @@ impl SectionClass {
     }
 }
 
-/// A section type id.
+/// A section type id, `C_SSS_VVV` (README.md, "Type Ids").
 ///
-/// Use [`TypeId::new`] for runtime input. Registry constants use
-/// [`TypeId::declared`] and are checked by the registry linter.
+/// Constructed only inside this crate, by `#[derive(Section)]`: the validating
+/// constructor rejects an unknown class or a zero source or version, so an
+/// invalid id is a compile error and every id in a contract is valid by
+/// construction. External code cannot mint one; the accessors below only
+/// decompose an existing id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeId(u32);
 
 impl TypeId {
-    /// Wrap a raw `type_id` after checking its class, source, and version.
+    /// The sole `TypeId` constructor: wrap a raw id after checking its class,
+    /// source, and version. Crate-private so every id traces back to a
+    /// registered type; `#[derive(Section)]` turns the `None` case into a
+    /// compile error at the contract's `const` site.
     ///
     /// `None` unless the class digit is a known [`SectionClass`], the source
     /// is at least 001, and the version is at least 001 (both start at 001).
     #[must_use]
-    pub const fn new(raw: u32) -> Option<Self> {
+    pub(crate) const fn new(raw: u32) -> Option<Self> {
         let id = Self(raw);
         if SectionClass::from_digit(id.class_digit()).is_some()
             && id.source() >= 1
@@ -65,17 +71,6 @@ impl TypeId {
         } else {
             None
         }
-    }
-
-    /// Declare a `type_id` in a registry contract.
-    ///
-    /// Registry contracts are `const`, so they cannot use the fallible
-    /// [`TypeId::new`]. The registry linter checks these declarations later
-    /// and rejects any contract whose id has an unknown class, a zero source,
-    /// or a zero version (README.md, "Registry Linter").
-    #[must_use]
-    pub const fn declared(raw: u32) -> Self {
-        Self(raw)
     }
 
     /// The raw `type_id` as stored on disk.

@@ -3,8 +3,9 @@
 //! The struct is the single source of truth for one `type_id`. The derive
 //! reads each field's Rust type (the on-disk type and nullability) and a
 //! `#[column(..)]` class, plus a `#[section(..)]` header, and generates the
-//! registry contract and the Parquet encode/decode — every per-type piece
-//! `kronika-registry` used to hand-write. The framing and the memory bounds
+//! `kronika_registry::Section` impl — the contract const and the Parquet
+//! encode/decode — every per-type piece `kronika-registry` used to hand-write.
+//! The framing and the memory bounds
 //! live once in `kronika_registry::codec`; the generated code only supplies
 //! one column builder/reader per field.
 //!
@@ -88,16 +89,10 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let decode = build_decode(struct_name, &columns);
 
     Ok(quote! {
-        impl #struct_name {
+        impl ::kronika_registry::Section for #struct_name {
             #contract
 
-            #[doc = "Encode rows into a Parquet section body."]
-            ///
-            /// # Errors
-            ///
-            /// A `kronika_registry::CodecError` if a row cap is exceeded or
-            /// Parquet writing fails.
-            pub fn encode(rows: &[Self]) -> ::core::result::Result<
+            fn encode(rows: &[Self]) -> ::core::result::Result<
                 ::std::vec::Vec<u8>,
                 ::kronika_registry::CodecError,
             > {
@@ -105,14 +100,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 ::kronika_registry::encode_section(&Self::CONTRACT, rows.len(), columns)
             }
 
-            #[doc = "Decode a Parquet section body back into rows."]
-            ///
-            /// # Errors
-            ///
-            /// A `kronika_registry::CodecError` if a memory bound is exceeded,
-            /// the Parquet is malformed, or the file does not match the
-            /// contract.
-            pub fn decode(bytes: &[u8]) -> ::core::result::Result<
+            fn decode(bytes: &[u8]) -> ::core::result::Result<
                 ::std::vec::Vec<Self>,
                 ::kronika_registry::CodecError,
             > {
@@ -299,10 +287,18 @@ fn build_contract(header: &Header, columns: &[ColumnDef]) -> TokenStream2 {
         }
     });
 
+    // Route the id through `TypeId::new` and panic in the `None` arm. The
+    // constructor is crate-private and this is a `const`, so an invalid
+    // `#[section(id = ...)]` is a compile error, not a lint-time finding
+    // (kronika-registry README, "Type Ids").
     quote! {
-        #[doc = "The registry contract for this type."]
-        pub const CONTRACT: ::kronika_registry::TypeContract = ::kronika_registry::TypeContract {
-            type_id: ::kronika_registry::TypeId::declared(#id),
+        const CONTRACT: ::kronika_registry::TypeContract = ::kronika_registry::TypeContract {
+            type_id: match ::kronika_registry::TypeId::new(#id) {
+                ::core::option::Option::Some(id) => id,
+                ::core::option::Option::None => ::core::panic!(
+                    "section type_id is invalid: unknown class, or a zero source or version"
+                ),
+            },
             name: #name,
             semantics: ::kronika_registry::Semantics::#semantics_variant,
             columns: &[ #( #column_entries ),* ],
