@@ -356,43 +356,47 @@ fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
 }
 
 fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
-    // The closure params and loop variable use mixed-site hygiene so a field
-    // named `batch`, `out`, or `i` cannot collide with them: a derive's
-    // call-site identifiers would otherwise be the *same* identifier as the
-    // user's field of that name.
+    // The closure params, loop variable, and per-column readers all use
+    // mixed-site hygiene so none can collide with a user field or an in-scope
+    // type. The reader bindings deliberately do NOT reuse the field ident: a
+    // `let #field` would shadow a field named `batch`, and — once `Ts`/`StrId`
+    // are in scope — a `let Ts`/`let StrId` cannot shadow those tuple structs
+    // (E0530). The struct literal still keys by the user's field ident.
     let batch = Ident::new("batch", Span::mixed_site());
     let out = Ident::new("out", Span::mixed_site());
     let idx = Ident::new("i", Span::mixed_site());
+    let cols: Vec<Ident> = (0..columns.len())
+        .map(|n| Ident::new(&format!("col{n}"), Span::mixed_site()))
+        .collect();
 
-    let bindings = columns.iter().map(|c| {
-        let field = &c.field;
+    let bindings = columns.iter().zip(&cols).map(|(c, col)| {
         let name = &c.name;
         match (&c.arrow_type, c.nullable) {
             (Some(at), false) => quote! {
-                let #field = ::kronika_registry::required_column::<::kronika_registry::#at>(#batch, #name)?;
+                let #col = ::kronika_registry::required_column::<::kronika_registry::#at>(#batch, #name)?;
             },
             (Some(at), true) => quote! {
-                let #field = ::kronika_registry::nullable_column::<::kronika_registry::#at>(#batch, #name)?;
+                let #col = ::kronika_registry::nullable_column::<::kronika_registry::#at>(#batch, #name)?;
             },
             (None, false) => quote! {
-                let #field = ::kronika_registry::required_bool(#batch, #name)?;
+                let #col = ::kronika_registry::required_bool(#batch, #name)?;
             },
             (None, true) => quote! {
-                let #field = ::kronika_registry::nullable_bool(#batch, #name)?;
+                let #col = ::kronika_registry::nullable_bool(#batch, #name)?;
             },
         }
     });
 
-    let cells = columns.iter().map(|c| {
+    let cells = columns.iter().zip(&cols).map(|(c, col)| {
         let field = &c.field;
         let value = match (&c.wrapper, &c.arrow_type, c.nullable) {
-            (Some(w), _, false) => quote! { ::kronika_registry::#w(#field.value(#idx)) },
+            (Some(w), _, false) => quote! { ::kronika_registry::#w(#col.value(#idx)) },
             (Some(w), _, true) => quote! {
-                ::kronika_registry::opt_primitive(#field, #idx).map(::kronika_registry::#w)
+                ::kronika_registry::opt_primitive(#col, #idx).map(::kronika_registry::#w)
             },
-            (None, Some(_) | None, false) => quote! { #field.value(#idx) },
-            (None, Some(_), true) => quote! { ::kronika_registry::opt_primitive(#field, #idx) },
-            (None, None, true) => quote! { ::kronika_registry::opt_bool(#field, #idx) },
+            (None, Some(_) | None, false) => quote! { #col.value(#idx) },
+            (None, Some(_), true) => quote! { ::kronika_registry::opt_primitive(#col, #idx) },
+            (None, None, true) => quote! { ::kronika_registry::opt_bool(#col, #idx) },
         };
         quote! { #field: #value }
     });
