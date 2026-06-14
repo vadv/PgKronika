@@ -1,6 +1,6 @@
 [package]
 name = "kronika-reader"
-description = "pgKronika internal crate"
+description = "Segment read path: catalog, range reads, CRC-verified decode"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -9,6 +9,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-format = { path = "../kronika-format" }
+kronika-registry = { path = "../kronika-registry" }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
