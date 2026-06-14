@@ -69,6 +69,13 @@ pub enum CodecError {
         /// The enforced cap.
         max: usize,
     },
+    /// The Parquet footer claims a negative (or otherwise unrepresentable) row
+    /// count — a forged section or a writer bug, kept distinct from a real
+    /// over-cap so the two get different operational handling.
+    InvalidRowCount {
+        /// The raw `num_rows` from the footer.
+        raw: i64,
+    },
     /// The section byte length is above [`MAX_SECTION_BYTES`].
     SectionTooLarge {
         /// The byte length that exceeded the cap.
@@ -119,6 +126,9 @@ impl fmt::Display for CodecError {
             Self::TooManyRows { rows, max } => {
                 write!(f, "section has {rows} rows, above the cap of {max}")
             }
+            Self::InvalidRowCount { raw } => {
+                write!(f, "section claims an invalid row count of {raw}")
+            }
             Self::SectionTooLarge { len, max } => {
                 write!(f, "section is {len} bytes, above the cap of {max}")
             }
@@ -147,6 +157,7 @@ impl Error for CodecError {
             Self::Arrow(err) => Some(err),
             Self::Parquet(err) => Some(err),
             Self::TooManyRows { .. }
+            | Self::InvalidRowCount { .. }
             | Self::SectionTooLarge { .. }
             | Self::TooManyRowGroups { .. }
             | Self::MissingColumn { .. }
@@ -331,14 +342,16 @@ fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize, usize
     }
 
     let claimed = builder.metadata().file_metadata().num_rows();
-    let claimed_rows = usize::try_from(claimed).ok();
-    if claimed_rows.is_none_or(|rows| rows > MAX_SECTION_ROWS) {
-        return Err(CodecError::TooManyRows {
-            rows: claimed_rows.unwrap_or(usize::MAX),
-            max: MAX_SECTION_ROWS,
-        });
-    }
-    let row_count = claimed_rows.unwrap_or(0);
+    let row_count = match usize::try_from(claimed) {
+        Ok(rows) if rows <= MAX_SECTION_ROWS => rows,
+        Ok(rows) => {
+            return Err(CodecError::TooManyRows {
+                rows,
+                max: MAX_SECTION_ROWS,
+            });
+        }
+        Err(_) => return Err(CodecError::InvalidRowCount { raw: claimed }),
+    };
 
     Ok((
         builder.with_batch_size(DECODE_BATCH_SIZE).build()?,
