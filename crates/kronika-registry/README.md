@@ -107,11 +107,12 @@ When reading a segment, the `type_id` is known only at read time, so the reader
 cannot name `T`. `decode_any(type_id, section)` selects the contract through
 `registry()` and returns a `DecodedSection`: Arrow `RecordBatch`es plus
 `DecodeStats` (`type_id`, input bytes, row groups, batches, rows), which the
-reader can export as RED metrics. On failure the error carries the same
-`type_id` — `CodecError::Section` (with `bytes_in`) for a decode error,
-`CodecError::UnknownType` for an id absent from the registry — so every outcome
-is labelled with no unlabeled fallthrough. No concrete type and no per-type
-`match` are needed; adding a section type means adding one `registry()` entry.
+reader can export as RED metrics. On failure, `CodecError::Section` keeps the
+same `type_id` for a failed decode and `CodecError::UnknownType` keeps it for an
+id absent from the registry. `CodecError::section_type_id()` returns that label
+without a separate `match` over variants, so every read outcome can be counted
+under `{type_id}`. No concrete type and no per-type `match` are needed; adding a
+section type means adding one `registry()` entry.
 
 `decode` and `decode_any` take a `VerifiedSection`: owned `Bytes` whose CRC was
 checked against the catalog. The bytes are not copied again; the Parquet reader

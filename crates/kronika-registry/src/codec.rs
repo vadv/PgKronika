@@ -136,6 +136,29 @@ pub enum CodecError {
     },
 }
 
+impl CodecError {
+    /// The section `type_id` this error is about, or `None` if it is not tied to
+    /// one section.
+    ///
+    /// `Some` for the two type-tagged decode outcomes: [`UnknownType`] (an id
+    /// absent from the registry) and [`Section`] (a known id whose decode
+    /// failed). Every error [`decode_any`](crate::decode_any) returns is one of
+    /// those, so a caller can label failure metrics with one method call instead
+    /// of matching each variant.
+    ///
+    /// [`UnknownType`]: CodecError::UnknownType
+    /// [`Section`]: CodecError::Section
+    #[must_use]
+    pub const fn section_type_id(&self) -> Option<u32> {
+        match self {
+            Self::UnknownType { type_id } | Self::Section { type_id, .. } => Some(*type_id),
+            // Add new type-tagged variants here so failure metrics keep their
+            // `{type_id}` label.
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for CodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -392,6 +415,31 @@ mod verified_section_tests {
                 got: 7
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod codec_error_tests {
+    use super::CodecError;
+
+    #[test]
+    fn section_type_id_labels_the_two_type_tagged_outcomes_and_nothing_else() {
+        assert_eq!(
+            CodecError::UnknownType { type_id: 5 }.section_type_id(),
+            Some(5)
+        );
+        let wrapped = CodecError::Section {
+            type_id: 7,
+            bytes_in: 64,
+            source: Box::new(CodecError::SchemaMismatch),
+        };
+        assert_eq!(wrapped.section_type_id(), Some(7));
+        assert_eq!(CodecError::SchemaMismatch.section_type_id(), None);
+        assert_eq!(
+            CodecError::TooManyRows { rows: 9, max: 8 }.section_type_id(),
+            None,
+            "errors not tied to one section have no label"
+        );
     }
 }
 

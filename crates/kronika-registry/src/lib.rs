@@ -77,8 +77,8 @@ pub const fn registry() -> &'static [TypeContract] {
 /// types.
 ///
 /// Integrity is in the type: it takes a [`VerifiedSection`], whose only
-/// constructor verifies the section CRC (the crc function injected from the
-/// container layer), so unverified bytes cannot reach the Parquet parser by
+/// constructor verifies the section CRC (the container layer supplies the CRC
+/// function), so unverified bytes cannot reach the Parquet parser by
 /// accident. A segment deliberately rebuilt with a matching CRC is outside the
 /// protection model (README.md, "Memory Bounds").
 ///
@@ -87,8 +87,8 @@ pub const fn registry() -> &'static [TypeContract] {
 /// [`CodecError::UnknownType`] if no registered type has `type_id`; otherwise a
 /// [`CodecError::Section`] wrapping the underlying decode error with `type_id`
 /// and `bytes_in`, so a failure carries the same label as [`DecodeStats`] does
-/// on success. Both error variants carry `type_id`, so a reader can label every
-/// outcome — decoded, unknown, or failed — with no unlabeled fallthrough.
+/// on success. [`CodecError::section_type_id`] returns that label for both error
+/// variants, so metrics code does not need a separate branch per outcome.
 pub fn decode_any(type_id: u32, section: VerifiedSection) -> Result<DecodedSection, CodecError> {
     let contract = registry()
         .iter()
