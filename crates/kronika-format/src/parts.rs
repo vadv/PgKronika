@@ -1,16 +1,15 @@
 //! `active.parts` journal frames.
 //!
 //! The journal is an append-only sequence of `PGMP` frames. Each frame wraps
-//! one self-contained mini-PGM segment. This module defines the
-//! frame bytes and scans an in-memory journal buffer; file I/O belongs to
-//! `kronika-writer`.
+//! one self-contained PGM part. This module defines the frame bytes and scans
+//! an in-memory journal buffer; file I/O is handled by `kronika-writer`.
 //!
 //! ```text
 //! frame: header 16 B + part
 //!   frame_magic u32  // ASCII "PGMP"
 //!   part_len    u64
 //!   header_crc  u32  // CRC32C over frame_magic + part_len
-//!   part        ...  // a self-contained mini-PGM
+//!   part        ...  // a self-contained PGM part
 //! ```
 //!
 //! Recovery rules:
@@ -130,7 +129,7 @@ impl fmt::Display for FrameError {
 
 impl Error for FrameError {}
 
-/// Why a part body is not a valid mini-PGM container.
+/// Why a part body is not a valid PGM part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartError {
     /// The body is shorter than magic + empty catalog + tail index.
@@ -154,12 +153,12 @@ pub enum PartError {
     Catalog(DecodeError),
     /// A catalog entry points outside the section area of the body.
     SectionOutOfBounds {
-        /// `type_id` of the offending entry.
+        /// `type_id` of the entry that failed validation.
         type_id: u32,
     },
     /// A section body does not match its catalog CRC32C.
     SectionCrc {
-        /// `type_id` of the offending entry.
+        /// `type_id` of the entry that failed validation.
         type_id: u32,
         /// CRC stored in the catalog entry.
         stored: u32,
@@ -172,7 +171,7 @@ impl fmt::Display for PartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooShort { actual } => {
-                write!(f, "part body of {actual} bytes is too short for a mini-PGM")
+                write!(f, "part body of {actual} bytes is too short for a PGM part")
             }
             Self::BadMagic { actual } => {
                 write!(f, "part magic is {actual:02x?}, expected \"PGM1\"")
@@ -201,7 +200,7 @@ impl fmt::Display for PartError {
 
 impl Error for PartError {}
 
-/// Validate a part body as a self-contained mini-PGM container.
+/// Validate a part body as a self-contained PGM part.
 ///
 /// Checks the segment magic, the tail index, the catalog CRC, and that
 /// every catalog entry stays in bounds and matches its section CRC32C.
@@ -350,7 +349,7 @@ impl ScanReport {
 
 /// Scan a journal buffer.
 ///
-/// The scan walks frames forward, validates every part as a mini-PGM, and
+/// The scan walks frames forward, validates every PGM part, and
 /// records valid parts plus damaged regions.
 ///
 /// The buffer is caller-provided and fully resident. Never read a journal

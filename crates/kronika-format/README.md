@@ -171,9 +171,10 @@ are starting values of open format questions, so they are parameters of
 Memory is bounded: total stored bytes are capped by
 `DictLimits::max_total_bytes` (default 64 MiB, sized to the journal frame
 limit). A new value past the cap fails with `DictError::Full` — the signal
-to flush the window into a mini-part. Repeats and requirement upgrades of
-stored values add no bytes; strict-hot values are exempt, because the hot
-contract requires them in every part and the registry bounds their number.
+to flush the current window into a journal part. Repeats and requirement
+upgrades of stored values add no bytes; strict-hot values are exempt, because
+the hot contract requires them in every part and the registry bounds their
+number.
 
 Encoding dictionaries into on-disk section bytes is left for the typed
 section codecs.
@@ -181,7 +182,7 @@ section codecs.
 ## Parts Journal
 
 `active.parts` is an append-only journal of `PGMP` frames. Each frame contains
-a 16-byte header followed by one mini-PGM part.
+a 16-byte header followed by one PGM part.
 
 ```text
 frame
@@ -194,7 +195,7 @@ frame
 ```
 
 `FrameHeader::decode` validates the frame magic and header CRC. `validate_part`
-checks that the part is a self-contained mini-PGM container: segment magic, tail
+checks that the part is a self-contained PGM container: segment magic, tail
 index, catalog CRC, section bounds, and section CRCs.
 
 `scan_journal` walks a journal buffer and returns:
@@ -269,5 +270,5 @@ this layer:
 - `kronika-reader` opens segments, reads sections, and manages caches;
 - `kronika-registry` defines `type_id` meaning and section schemas;
 - `kronika-derive` and `kronika-writer` handle Parquet schemas and encoding;
-- `kronika-store*` handles local, HTTP, and S3 storage access;
+- `kronika-store*` handles storage access;
 - `kronika-source-*` collects data from PostgreSQL, OS, cgroup, and logs.
