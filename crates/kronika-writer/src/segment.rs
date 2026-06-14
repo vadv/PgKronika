@@ -193,12 +193,12 @@ fn sync_parent_dir(dest: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use kronika_format::validate_part;
+    use kronika_format::{DictLimits, validate_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::{Bytes, Ts, VerifiedSection, decode_any};
 
     use super::{SealError, seal};
-    use crate::{Journal, JournalConfig, SectionBuffers};
+    use crate::{Interner, Journal, JournalConfig, SectionBuffers, dict};
 
     fn bgwriter(ts: i64) -> BgwriterCheckpointer {
         BgwriterCheckpointer {
@@ -225,7 +225,7 @@ mod tests {
     fn append_window(journal: &mut Journal, ts: i64) {
         let mut buffers = SectionBuffers::new();
         buffers.push(bgwriter(ts));
-        let part = buffers.flush(0).expect("encode").expect("a part");
+        let part = buffers.flush(&[], 0).expect("encode").expect("a part");
         journal.append(&part).expect("append");
     }
 
@@ -265,6 +265,46 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn a_sealed_segment_carries_the_window_dictionary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let segment_path = dir.path().join("d.pgm");
+        let (mut journal, _) =
+            Journal::open(&dir.path().join("active.parts"), JournalConfig::default())
+                .expect("open journal");
+
+        // Intern two short strings and encode the window dictionary.
+        let mut interner = Interner::new(DictLimits::new(4096, 1 << 20).expect("limits"));
+        interner.intern(b"db-host-01").expect("intern");
+        interner.intern(b"node-7").expect("intern");
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+
+        // One data section plus the dictionary in a single part.
+        let mut buffers = SectionBuffers::new();
+        buffers.push(bgwriter(1_000));
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush")
+            .expect("a part");
+        journal.append(&part).expect("append");
+
+        let summary = seal(&journal, &segment_path).expect("seal");
+        assert_eq!(summary.sections, 2, "bgwriter + dict.strings");
+
+        let segment = std::fs::read(&segment_path).expect("read segment");
+        let catalog = validate_part(&segment).expect("segment validates");
+        let dict_entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.type_id == dict::DICT_STRINGS_TYPE_ID)
+            .expect("the dictionary section reached the segment");
+        assert_eq!(dict_entry.rows, 2, "both interned strings");
+        let start = usize::try_from(dict_entry.offset).unwrap();
+        let end = start + usize::try_from(dict_entry.len).unwrap();
+        assert_eq!(&segment[start..start + 4], b"PAR1", "a Parquet dict body");
+        assert_eq!(&segment[end - 4..end], b"PAR1", "intact to its last byte");
     }
 
     #[test]

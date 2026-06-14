@@ -24,12 +24,22 @@ with `push::<T>(row)` for any `T: Section`; the buffers hold one type-erased
 buffer per `type_id`, not a field per type, so a new section type costs one
 `push` and no change here — the property the registry's hundreds of types need.
 
-`flush(source_id)` encodes every buffered type to a Parquet body
+`flush(dict_sections, source_id)` encodes every buffered type to a Parquet body
 (`Section::encode`), reads each type's time range (`Section::ts_range`), and
-calls `kronika_format::build_part` to assemble one PGM part: sections in
-`type_id` order, the catalog time range spanning the buffered rows. It returns
-the part bytes — or `None` when nothing is buffered — for the caller to append to
-the journal, and clears the window.
+calls `kronika_format::build_part` to assemble one PGM part: the data sections in
+`type_id` order, then the `dict_sections` (the COLD-then-WARM segment layout),
+the catalog time range spanning the buffered rows. It returns the part bytes —
+or `None` when nothing is buffered — for the caller to append to the journal, and
+clears the data buffers.
+
+## Dictionary Sections
+
+`dict::encode(window)` turns an interner flush window into `dict.strings` and
+`dict.blobs` Parquet section bodies — one per placement that has entries, sorted
+by `str_id`. These are not registry `Section` types (their columns are
+variable-length binary), so they are encoded directly, but as ordinary section
+bodies a part carries beside the data sections, so snapshot `str_id` columns
+resolve to bytes within the same segment.
 
 ## Interner
 
@@ -93,7 +103,10 @@ changes how bodies are written, not the segment format.
 
 ## Not Implemented Yet
 
-The sort-merge that recompresses repeated sections of one type into a single
-sorted section, and the dictionary sections (`dict.strings` / `dict.blobs`) that
-let string columns resolve, arrive in later steps. Dictionary placement and
-journal frame validation are defined in `kronika-format`.
+Three optimizations of the seal path remain, none changing the segment format:
+the sort-merge that recompresses repeated sections of one type into one sorted
+section; the dictionary merge that deduplicates a strict-hot value repeated
+across parts (parts are otherwise disjoint, so seal copies their dictionaries as
+is); and the `str_id` bloom filter on `dict.strings` for cross-segment lookup.
+Dictionary placement and journal frame validation are defined in
+`kronika-format`.

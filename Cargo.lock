@@ -610,8 +610,11 @@ version = "0.0.0"
 name = "kronika-writer"
 version = "0.0.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "kronika-format",
  "kronika-registry",
+ "parquet",
  "sha2",
  "tempfile",
 ]

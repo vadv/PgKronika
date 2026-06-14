@@ -11,6 +11,9 @@ repository.workspace = true
 [dependencies]
 kronika-format = { path = "../kronika-format" }
 kronika-registry = { path = "../kronika-registry" }
+arrow-array = "55"
+arrow-schema = "55"
+parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
 sha2 = "0.10"
 
 [dev-dependencies]

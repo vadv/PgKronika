@@ -120,24 +120,34 @@ impl SectionBuffers {
         self.by_type.values().all(|buffer| buffer.is_empty())
     }
 
-    /// Encode every buffered type into one PGM part and clear the buffers.
+    /// Encode every buffered type into one PGM part and clear the data buffers.
     ///
-    /// Sections are laid out in `type_id` order, so the part is deterministic. The
-    /// catalog time range is the min/max across the types that carry a timestamp;
-    /// `source_id` is the interned `{cluster_id}/{pg_system_identifier}` id, or 0
-    /// if unset. Returns `None` when nothing is buffered.
+    /// `dict_sections` are the window's `dict.strings` / `dict.blobs` bodies
+    /// (from [`dict::encode`](crate::dict::encode)); they are laid out after the
+    /// data sections, the COLD-then-WARM order of a segment. Data sections come in
+    /// `type_id` order, so the part is deterministic. The catalog time range is
+    /// the min/max across the types that carry a timestamp; `source_id` is the
+    /// interned `{cluster_id}/{pg_system_identifier}` id, or 0 if unset.
+    ///
+    /// Returns `None` when neither data nor dictionary sections are present. Only
+    /// the data buffers are cleared — the caller flushes the interner window so a
+    /// failed journal write keeps it.
     ///
     /// # Errors
     ///
     /// Propagates the [`CodecError`] from encoding any buffered type.
-    pub fn flush(&mut self, source_id: u64) -> Result<Option<Vec<u8>>, CodecError> {
+    pub fn flush(
+        &mut self,
+        dict_sections: &[crate::dict::DictSection],
+        source_id: u64,
+    ) -> Result<Option<Vec<u8>>, CodecError> {
         let encoded: Vec<(u32, EncodedRows)> = self
             .by_type
             .values()
             .filter(|buffer| !buffer.is_empty())
             .map(|buffer| Ok((buffer.section_type_id(), buffer.encode()?)))
             .collect::<Result<_, CodecError>>()?;
-        if encoded.is_empty() {
+        if encoded.is_empty() && dict_sections.is_empty() {
             return Ok(None);
         }
 
@@ -154,7 +164,7 @@ impl SectionBuffers {
             .max()
             .unwrap_or(0);
 
-        let sections: Vec<SectionInput<'_>> = encoded
+        let mut sections: Vec<SectionInput<'_>> = encoded
             .iter()
             .map(|(type_id, section)| SectionInput {
                 type_id: *type_id,
@@ -162,6 +172,11 @@ impl SectionBuffers {
                 body: &section.body,
             })
             .collect();
+        sections.extend(dict_sections.iter().map(|dict| SectionInput {
+            type_id: dict.type_id,
+            rows: dict.rows,
+            body: &dict.body,
+        }));
         let part = build_part(
             &sections,
             PartMeta {
@@ -233,7 +248,7 @@ mod tests {
         assert!(!buffers.is_empty());
 
         let part = buffers
-            .flush(7)
+            .flush(&[], 7)
             .expect("flush encodes the buffered rows")
             .expect("buffered rows produce a part");
         assert!(buffers.is_empty(), "flush clears the window");
@@ -270,6 +285,6 @@ mod tests {
     #[test]
     fn flushing_an_empty_window_yields_no_part() {
         let mut buffers = SectionBuffers::new();
-        assert!(buffers.flush(0).expect("flush ok").is_none());
+        assert!(buffers.flush(&[], 0).expect("flush ok").is_none());
     }
 }
