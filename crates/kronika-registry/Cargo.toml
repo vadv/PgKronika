@@ -11,7 +11,9 @@ repository.workspace = true
 [dependencies]
 kronika-derive = { path = "../kronika-derive" }
 arrow-array = "55"
+arrow-ord = "55"
 arrow-schema = "55"
+arrow-select = "55"
 bytes = "1"
 parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
 

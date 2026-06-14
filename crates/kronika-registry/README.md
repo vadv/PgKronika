@@ -71,6 +71,11 @@ A snapshot section body is a zstd-compressed Parquet file. `arrow_schema`
 builds the Arrow schema from the contract columns, so codecs use the same
 column order, Arrow types, and nullability as the registry.
 
+`encode` sorts the rows by the contract's `sort_key` before writing, so adjacent
+values in a column are alike and compress well. Rows that tie on the key keep an
+unspecified order, and a decode returns the rows in this sorted order rather than
+the order they were passed in.
+
 The registry contract defines the schema, so the section does **not** embed a
 second copy of it. The writer skips the `ARROW:schema` key-value blob that
 arrow-rs writes by default and clears the Arrow-version string. That removes

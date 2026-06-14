@@ -104,6 +104,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-ord"
+version = "55.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6506e3a059e3be23023f587f79c82ef0bcf6d293587e3272d20f2d30b969b5a7"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "arrow-select",
+]
+
+[[package]]
 name = "arrow-schema"
 version = "55.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -561,7 +574,9 @@ name = "kronika-registry"
 version = "0.0.0"
 dependencies = [
  "arrow-array",
+ "arrow-ord",
  "arrow-schema",
+ "arrow-select",
  "bytes",
  "kronika-derive",
  "parquet",

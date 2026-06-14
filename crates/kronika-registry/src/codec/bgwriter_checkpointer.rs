@@ -198,6 +198,20 @@ mod tests {
     }
 
     #[test]
+    fn encode_sorts_rows_by_the_sort_key() {
+        // Rows given out of `ts` order come back sorted: encode orders by the
+        // contract sort key for compression.
+        let bytes = BgwriterCheckpointer::encode(&[pg17_row(2_000_000), pg16_row(1_000_000)])
+            .expect("encode");
+        let decoded =
+            BgwriterCheckpointer::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
+        assert_eq!(
+            decoded.iter().map(|row| row.ts.0).collect::<Vec<_>>(),
+            [1_000_000, 2_000_000]
+        );
+    }
+
+    #[test]
     fn decode_any_reports_stats() {
         let rows = vec![pg16_row(1_000_000), pg17_row(2_000_000)];
         let bytes = BgwriterCheckpointer::encode(&rows).expect("encode");

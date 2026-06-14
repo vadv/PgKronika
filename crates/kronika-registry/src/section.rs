@@ -59,6 +59,10 @@ pub trait Section: crate::sealed::Sealed + Sized {
 /// Encode `rows`, decode the section back, and assert they roundtrip — the
 /// shared codec test the trait exists to enable, so each type's test is one
 /// line, not a custom encode/decode check.
+///
+/// `encode` sorts by the sort key, so a decode returns rows in that order: pass
+/// `rows` already in sort-key order (with distinct keys) so the comparison is
+/// against a defined order.
 #[cfg(test)]
 pub(crate) fn assert_roundtrips<T>(rows: &[T])
 where

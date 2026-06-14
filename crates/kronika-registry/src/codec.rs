@@ -17,7 +17,9 @@ use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch,
     RecordBatchReader,
 };
+use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_select::take::take;
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
@@ -367,6 +369,11 @@ static WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
 /// (README.md, "Snapshot Sections"). Columns must be in contract order, which
 /// [`arrow_schema()`] defines.
 ///
+/// Rows are sorted by the contract's sort key before writing, so adjacent values
+/// in a column are alike and compress well (README.md, "Snapshot Sections"). The
+/// order of rows that tie on the key is unspecified. A decode returns the rows in
+/// this sorted order, not the order they were passed in.
+///
 /// The row cap is re-checked here against the built `RecordBatch`, not a
 /// caller-supplied count, and the finished body is rejected if it exceeds
 /// [`MAX_SECTION_BYTES`] — the same cap decode enforces — so a writer cannot emit
@@ -385,6 +392,7 @@ pub fn encode_section(
     let schema = arrow_schema(contract);
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
     check_row_cap(batch.num_rows())?;
+    let batch = sort_by_sort_key(&batch, contract)?;
 
     let options = ArrowWriterOptions::new()
         .with_properties(WRITER_PROPS.clone())
@@ -402,6 +410,42 @@ pub fn encode_section(
         });
     }
     Ok(buf)
+}
+
+/// Reorder `batch` by the contract's sort-key columns, ascending.
+///
+/// Returns `batch` unchanged when the sort key is empty or there is at most one
+/// row. Rows that tie on the key keep an unspecified order: the sort exists for
+/// compression, not as a stable API (README.md, "Snapshot Sections").
+///
+/// # Errors
+///
+/// [`CodecError::MissingColumn`] if a sort-key name is not a column (a contract
+/// the linter rejects); [`CodecError::Arrow`] if a sort or gather fails.
+fn sort_by_sort_key(
+    batch: &RecordBatch,
+    contract: &TypeContract,
+) -> Result<RecordBatch, CodecError> {
+    if contract.sort_key.is_empty() || batch.num_rows() <= 1 {
+        return Ok(batch.clone());
+    }
+    let mut sort_columns = Vec::with_capacity(contract.sort_key.len());
+    for &name in contract.sort_key {
+        let values = batch
+            .column_by_name(name)
+            .ok_or(CodecError::MissingColumn { name })?;
+        sort_columns.push(SortColumn {
+            values: Arc::clone(values),
+            options: None,
+        });
+    }
+    let indices = lexsort_to_indices(&sort_columns, None)?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| take(column.as_ref(), &indices, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 // ---- Decode shared code ----------------------------------------------------
