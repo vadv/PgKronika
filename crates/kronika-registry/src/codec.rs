@@ -363,8 +363,10 @@ pub fn decode_section<Row>(
     bytes: Bytes,
     mut push_rows: impl FnMut(&RecordBatch, &mut Vec<Row>) -> Result<(), CodecError>,
 ) -> Result<Vec<Row>, CodecError> {
-    let (reader, _row_groups, _claimed_rows) = capped_reader(bytes)?;
-    let mut rows = Vec::new();
+    let (reader, _row_groups, claimed_rows) = capped_reader(bytes)?;
+    // Preallocate from the claimed count (capped at `MAX_SECTION_ROWS`); the
+    // typed gather pushes one row per source row, so this avoids the reallocs.
+    let mut rows = Vec::with_capacity(claimed_rows);
     for batch in reader {
         let batch = batch?;
         if rows.len() + batch.num_rows() > MAX_SECTION_ROWS {
