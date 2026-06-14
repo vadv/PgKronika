@@ -6,9 +6,7 @@
 //! driven by [`registry`](crate::registry), so a new section type costs one
 //! registry entry and no per-type `match` (README.md, "Section Trait").
 
-use bytes::Bytes;
-
-use crate::codec::CodecError;
+use crate::codec::{CodecError, VerifiedSection};
 use crate::contract::TypeContract;
 
 /// A section type: its registry contract plus the Parquet codec for its rows.
@@ -28,10 +26,10 @@ pub trait Section: Sized {
     /// [`CodecError::Parquet`] if Arrow rejects the batch or writing fails.
     fn encode(rows: &[Self]) -> Result<Vec<u8>, CodecError>;
 
-    /// Decode a Parquet section body back into typed rows.
+    /// Decode a section body back into typed rows.
     ///
-    /// Takes owned `Bytes` so the reader slices the section in place; the
-    /// caller passes a zero-copy slice or a pooled buffer, not a fresh copy.
+    /// Takes a [`VerifiedSection`] so the CRC-before-decode boundary is in the
+    /// type: the bytes were checked against the catalog before reaching here.
     ///
     /// This builds typed rows by transposing the columnar Parquet — one indexed
     /// read per cell — which fits the typed/convenience use and the roundtrip
@@ -44,5 +42,5 @@ pub trait Section: Sized {
     /// A memory-bound [`CodecError`] if a cap is exceeded, [`CodecError::Parquet`]
     /// on malformed Parquet, or a column error if the file does not match
     /// [`CONTRACT`](Section::CONTRACT).
-    fn decode(bytes: Bytes) -> Result<Vec<Self>, CodecError>;
+    fn decode(section: VerifiedSection) -> Result<Vec<Self>, CodecError>;
 }

@@ -122,7 +122,9 @@ pub struct BgwriterCheckpointer {
 #[cfg(test)]
 mod tests {
     use super::BgwriterCheckpointer;
-    use crate::{CodecError, MAX_SECTION_BYTES, MAX_SECTION_ROWS, Section, Ts, lint};
+    use crate::{
+        CodecError, MAX_SECTION_BYTES, MAX_SECTION_ROWS, Section, Ts, VerifiedSection, lint,
+    };
 
     fn pg16_row(ts: i64) -> BgwriterCheckpointer {
         BgwriterCheckpointer {
@@ -196,7 +198,8 @@ mod tests {
         // One section may contain rows from both PostgreSQL layouts.
         let rows = vec![pg16_row(1_000_000), pg17_row(2_000_000)];
         let bytes = BgwriterCheckpointer::encode(&rows).expect("encode");
-        let decoded = BgwriterCheckpointer::decode(bytes.into()).expect("decode");
+        let decoded =
+            BgwriterCheckpointer::decode(VerifiedSection::verified(bytes.into())).expect("decode");
         assert_eq!(decoded, rows);
     }
 
@@ -205,7 +208,8 @@ mod tests {
         let rows = vec![pg16_row(1_000_000), pg17_row(2_000_000)];
         let bytes = BgwriterCheckpointer::encode(&rows).expect("encode");
         let bytes_in = bytes.len();
-        let decoded = crate::decode_any(1_006_001, bytes.into()).expect("decode_any");
+        let decoded = crate::decode_any(1_006_001, VerifiedSection::verified(bytes.into()))
+            .expect("decode_any");
         assert_eq!(decoded.stats.rows, 2);
         assert_eq!(decoded.stats.bytes_in, bytes_in);
         assert_eq!(decoded.stats.batches, decoded.batches.len());
@@ -216,7 +220,8 @@ mod tests {
     fn empty_section_roundtrips() {
         let bytes = BgwriterCheckpointer::encode(&[]).expect("encode empty");
         assert_eq!(
-            BgwriterCheckpointer::decode(bytes.into()).expect("decode empty"),
+            BgwriterCheckpointer::decode(VerifiedSection::verified(bytes.into()))
+                .expect("decode empty"),
             Vec::new()
         );
     }
@@ -226,7 +231,8 @@ mod tests {
         // NULL must not decode to Some(0).
         let row = pg17_row(5);
         let bytes = BgwriterCheckpointer::encode(&[row]).expect("encode");
-        let decoded = BgwriterCheckpointer::decode(bytes.into()).expect("decode");
+        let decoded =
+            BgwriterCheckpointer::decode(VerifiedSection::verified(bytes.into())).expect("decode");
         assert_eq!(decoded[0].buffers_backend, None);
     }
 
@@ -272,7 +278,7 @@ mod tests {
     fn decode_rejects_an_oversized_section() {
         let bytes = vec![0_u8; MAX_SECTION_BYTES + 1];
         assert!(matches!(
-            BgwriterCheckpointer::decode(bytes.into()),
+            BgwriterCheckpointer::decode(VerifiedSection::verified(bytes.into())),
             Err(CodecError::SectionTooLarge { .. })
         ));
     }
@@ -323,7 +329,7 @@ mod tests {
         writer.close().expect("close");
 
         assert!(matches!(
-            BgwriterCheckpointer::decode(buf.into()),
+            BgwriterCheckpointer::decode(VerifiedSection::verified(buf.into())),
             Err(CodecError::NullInRequiredColumn { name: "ts" })
         ));
     }

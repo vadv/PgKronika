@@ -104,7 +104,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 ::kronika_registry::encode_section(&Self::CONTRACT, rows.len(), columns)
             }
 
-            fn decode(bytes: ::kronika_registry::Bytes) -> ::core::result::Result<
+            fn decode(section: ::kronika_registry::VerifiedSection) -> ::core::result::Result<
                 ::std::vec::Vec<Self>,
                 ::kronika_registry::CodecError,
             > {
@@ -406,7 +406,7 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
     });
 
     quote! {
-        ::kronika_registry::decode_section(bytes, |#batch, #out| {
+        ::kronika_registry::decode_section(section, |#batch, #out| {
             #( #bindings )*
             for #idx in 0..#batch.num_rows() {
                 #out.push(#struct_name { #( #cells ),* });

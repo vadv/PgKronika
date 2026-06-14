@@ -69,7 +69,7 @@ pub struct ResetMetadata {
 #[cfg(test)]
 mod tests {
     use super::ResetMetadata;
-    use crate::{Section, StrId, Ts, lint};
+    use crate::{Section, StrId, Ts, VerifiedSection, lint};
 
     fn pg17_row() -> ResetMetadata {
         ResetMetadata {
@@ -109,7 +109,8 @@ mod tests {
     fn roundtrip_preserves_values_and_nulls() {
         let rows = vec![pg17_row(), pg15_row()];
         let bytes = ResetMetadata::encode(&rows).expect("encode");
-        let decoded = ResetMetadata::decode(bytes.into()).expect("decode");
+        let decoded =
+            ResetMetadata::decode(VerifiedSection::verified(bytes.into())).expect("decode");
         assert_eq!(decoded, rows);
     }
 }
