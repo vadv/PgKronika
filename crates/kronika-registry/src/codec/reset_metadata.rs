@@ -110,7 +110,7 @@ mod tests {
         let rows = vec![pg17_row(), pg15_row()];
         let bytes = ResetMetadata::encode(&rows).expect("encode");
         let decoded =
-            ResetMetadata::decode(VerifiedSection::verified(bytes.into())).expect("decode");
+            ResetMetadata::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
         assert_eq!(decoded, rows);
     }
 }
