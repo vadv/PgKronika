@@ -65,13 +65,20 @@ pub enum ColumnType {
 /// A distinct type so a timestamp column is `Ts`, not a bare `i64`, whatever
 /// its [`ColumnClass`] — the collection time is class [`ColumnClass::Timestamp`],
 /// but `postmaster_start_time` and friends are `Ts` gauges.
+///
+/// `#[repr(transparent)]` guarantees the same ABI as `i64`, so a future column
+/// build can `cast` a `&[Ts]` to `&[i64]` instead of mapping `.0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
 pub struct Ts(pub i64);
 
 /// A reference into the segment string dictionary, as carried in a `StrId`
 /// column. The dictionary (`kronika-format`) holds the bytes; the section
 /// stores only this id.
+///
+/// `#[repr(transparent)]` guarantees the same ABI as `u64` (see [`Ts`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
 pub struct StrId(pub u64);
 
 /// One column of a typed section.
@@ -103,6 +110,14 @@ pub enum Semantics {
 }
 
 /// The full contract of one `type_id`.
+///
+/// A plain public record with `pub` fields — a caller can build one directly
+/// (for a test, or to feed [`lint`]). Only the [`TypeId`] is valid by
+/// construction (its constructor is crate-private); the rest of a contract
+/// (sort key names match columns, a `Changed` type has `is_baseline`, …) is
+/// checked by [`lint`], not the type system, so a hand-built contract can be
+/// internally inconsistent until it passes the linter. The authoritative set
+/// of contracts is [`registry`](crate::registry).
 #[derive(Debug, Clone, Copy)]
 pub struct TypeContract {
     /// The type id this contract describes.
