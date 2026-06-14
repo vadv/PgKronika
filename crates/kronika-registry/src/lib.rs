@@ -3,8 +3,8 @@
 //! The registry defines what each `type_id` means: class, schema, column
 //! classes, sort key, and collection semantics. Each type is a struct with
 //! `#[derive(Section)]` (`kronika-derive`), which generates its contract and
-//! Parquet codec; this crate owns the shared codec runtime and a linter that
-//! checks the contract invariants.
+//! Parquet codec. This crate also contains shared codec code and a linter that
+//! checks contract invariants.
 //!
 //! See the crate README for the `type_id` scheme, the contract model, the
 //! registry linter, and the snapshot-section format.
@@ -29,19 +29,19 @@ pub use codec::{bgwriter_checkpointer, instance_metadata, reset_metadata};
 pub use contract::{
     Column, ColumnClass, ColumnType, LintError, Semantics, StrId, Ts, TypeContract, lint,
 };
-pub use pool::BytesPool;
+pub use pool::{BytesPool, PoolStats};
 pub use section::Section;
 #[cfg(test)]
 pub(crate) use section::assert_roundtrips;
 pub use type_id::{SectionClass, TypeId};
 
-// One `Bytes` for the decode API and the generated codecs to name.
+// One `Bytes` for the decode API and derived codecs to name.
 pub use bytes::Bytes;
 
-// The `Section` derive macro is a registry-internal tool: every section type
-// lives in this crate, so it is not part of the public surface (an external
-// `#[derive(Section)]` cannot reach the crate-private `TypeId` constructor
-// anyway). The trait above is public; the derive macro is not.
+// The `Section` derive macro is internal to the registry. Every section type is
+// defined in this crate, and an external `#[derive(Section)]` cannot reach the
+// crate-private `TypeId` constructor. The trait above is public; the derive
+// macro is not.
 pub(crate) use kronika_derive::Section;
 
 // Arrow primitive type tokens that `#[derive(Section)]` names in generated
@@ -64,7 +64,7 @@ pub const fn registry() -> &'static [TypeContract] {
     ]
 }
 
-/// Decode a section body by its `type_id`, dispatched through [`registry`].
+/// Decode a section body by selecting its contract from [`registry`].
 ///
 /// The registry-driven reader entry point: it takes no concrete type, so a new
 /// section type costs one [`registry`] entry and no per-type `match` here. The
@@ -72,22 +72,23 @@ pub const fn registry() -> &'static [TypeContract] {
 /// [`DecodeStats`] the caller exports as metrics; the bytes are validated
 /// against the contract (README.md, "Section Trait").
 ///
-/// Dispatch is a linear scan of [`registry`] — negligible at the current size;
+/// Lookup is a linear scan of [`registry`] — negligible at the current size;
 /// a perfect-hash lookup would replace it if the registry grows to hundreds of
 /// types.
 ///
 /// Integrity is in the type: it takes a [`VerifiedSection`], whose only
 /// constructor verifies the section CRC (the crc function injected from the
 /// container layer), so unverified bytes cannot reach the Parquet parser by
-/// accident. A forged segment — a recomputed CRC — is outside the protection
-/// model (README.md, "Memory Bounds").
+/// accident. A segment deliberately rebuilt with a matching CRC is outside the
+/// protection model (README.md, "Memory Bounds").
 ///
 /// # Errors
 ///
 /// [`CodecError::UnknownType`] if no registered type has `type_id`; otherwise a
 /// [`CodecError::Section`] wrapping the underlying decode error with `type_id`
 /// and `bytes_in`, so a failure carries the same label as [`DecodeStats`] does
-/// on success.
+/// on success. Both error variants carry `type_id`, so a reader can label every
+/// outcome — decoded, unknown, or failed — with no unlabeled fallthrough.
 pub fn decode_any(type_id: u32, section: VerifiedSection) -> Result<DecodedSection, CodecError> {
     let contract = registry()
         .iter()
@@ -101,12 +102,12 @@ pub fn decode_any(type_id: u32, section: VerifiedSection) -> Result<DecodedSecti
     })
 }
 
-/// Decode a section read into a pooled buffer — the reader's hot path.
+/// Decode a section read into a pooled buffer.
 ///
 /// `fill` writes the section bytes into a buffer borrowed from `pool` (reused
 /// across calls, so a steady decode loop does not allocate per section); the
 /// bytes are CRC-verified ([`VerifiedSection::verify`], `crc32c` and
-/// `expected_crc` from the catalog) and dispatched through [`decode_any`].
+/// `expected_crc` from the catalog) and passed to [`decode_any`].
 ///
 /// # Errors
 ///
@@ -174,7 +175,7 @@ mod tests {
             assert_eq!(decoded.stats.type_id, id, "stats carries the type_id");
             assert_eq!(
                 decoded.stats.rows, 0,
-                "type {id} should decode to zero rows"
+                "type {id} decoded a non-empty section"
             );
             assert_eq!(
                 decoded.stats.bytes_in, bytes_in,
@@ -194,7 +195,7 @@ mod tests {
             .map(|field| new_empty_array(field.data_type()))
             .collect();
         let encoded = encode_section(contract, 0, columns).expect("encode empty section");
-        // Stand-in crc = byte length; the real reader injects kronika-format's.
+        // Stand-in CRC = byte length; production code passes kronika-format's.
         let crc = |b: &[u8]| u32::try_from(b.len()).unwrap_or(u32::MAX);
         let expected = crc(&encoded);
         let decoded = decode_pooled(&pool, id, expected, crc, |buf| {
@@ -207,7 +208,7 @@ mod tests {
     #[test]
     fn decode_any_rejects_an_unregistered_type() {
         // Structurally valid (class 2, source 999, version 999) but not in the
-        // registry, so the dispatch must reject it rather than decode garbage.
+        // registry, so decode_any must reject it rather than decode garbage.
         assert!(matches!(
             decode_any(2_999_999, VerifiedSection::for_test(Bytes::new())),
             Err(CodecError::UnknownType { type_id: 2_999_999 })

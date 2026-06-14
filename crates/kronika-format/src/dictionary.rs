@@ -36,7 +36,7 @@ pub const DEFAULT_TRUNCATE_LIMIT: usize = 1024 * 1024;
 
 /// Default cap on the total stored bytes of one dictionary set. A starting
 /// value sized to match the default `active.parts` frame limit: a window
-/// that hits this cap is flushed into one mini-part.
+/// that hits this cap is flushed into one journal part.
 pub const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 /// Size limits used while building dictionaries.
@@ -178,7 +178,7 @@ pub enum DictError {
     /// [`DictLimits::max_total_bytes`].
     ///
     /// This is flow control, not corruption: the writer should flush the
-    /// window into a mini-part and retry. Strict-hot values are exempt —
+    /// window into a journal part and retry. Strict-hot values are exempt —
     /// they are registry-bounded by contract and must reach every part.
     Full {
         /// Total stored bytes already held.

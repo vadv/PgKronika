@@ -22,7 +22,7 @@ const fn limits() -> JournalLimits {
     }
 }
 
-/// Build a valid mini-PGM part from random section bodies.
+/// Build a valid PGM part from random section bodies.
 fn build_part(sections: &[Vec<u8>]) -> Vec<u8> {
     let mut part = Vec::new();
     part.extend_from_slice(&MAGIC);

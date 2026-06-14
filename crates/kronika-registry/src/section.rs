@@ -1,8 +1,8 @@
 //! The `Section` trait: the typed codec contract `#[derive(Section)]` writes.
 //!
 //! Generic code — a shared roundtrip test, a future typed ingest helper — works
-//! over `T: Section` instead of naming each type. Runtime dispatch by `type_id`
-//! does not go through this trait: it uses [`decode_any`](crate::decode_any),
+//! over `T: Section` instead of naming each type. Selection by `type_id` does
+//! not go through this trait: it uses [`decode_any`](crate::decode_any),
 //! driven by [`registry`](crate::registry), so a new section type costs one
 //! registry entry and no per-type `match` (README.md, "Section Trait").
 
@@ -11,9 +11,9 @@ use crate::contract::TypeContract;
 
 /// A section type: its registry contract plus the Parquet codec for its rows.
 ///
-/// Implemented only by `#[derive(Section)]`, which lives inside this crate, so
-/// every implementor's [`CONTRACT`](Section::CONTRACT) is valid by construction
-/// (the derive routes the id through the crate-private `TypeId` constructor).
+/// Implemented only by `#[derive(Section)]` inside this crate, so every
+/// implementor's [`CONTRACT`](Section::CONTRACT) is valid by construction (the
+/// derive routes the id through the crate-private `TypeId` constructor).
 pub trait Section: Sized {
     /// The registry contract for this type.
     const CONTRACT: TypeContract;
@@ -47,7 +47,7 @@ pub trait Section: Sized {
 
 /// Encode `rows`, decode the section back, and assert they roundtrip — the
 /// shared codec test the trait exists to enable, so each type's test is one
-/// line, not a hand-written encode/decode.
+/// line, not a custom encode/decode check.
 #[cfg(test)]
 pub(crate) fn assert_roundtrips<T>(rows: &[T])
 where

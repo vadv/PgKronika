@@ -1,13 +1,12 @@
 //! `#[derive(Section)]`: generate a section codec from a typed struct.
 //!
-//! The struct is the single source of truth for one `type_id`. The derive
-//! reads each field's Rust type (the on-disk type and nullability) and a
-//! `#[column(..)]` class, plus a `#[section(..)]` header, and generates the
-//! `kronika_registry::Section` impl — the contract const and the Parquet
-//! encode/decode — every per-type piece `kronika-registry` used to hand-write.
-//! The framing and the memory bounds
-//! live once in `kronika_registry::codec`; the generated code only supplies
-//! one column builder/reader per field.
+//! The annotated struct defines one registry type. The derive reads each
+//! field's Rust type (on-disk type and nullability), its `#[column(..)]` class,
+//! and the `#[section(..)]` header, then generates the
+//! `kronika_registry::Section` impl: the contract const and the Parquet
+//! encode/decode methods. Shared code in `kronika_registry::codec` handles the
+//! framing and memory bounds; generated code only supplies one column
+//! builder/reader per field.
 //!
 //! Column types are matched by their written name (a derive macro sees tokens,
 //! not resolved types): `i8`…`i64`, `u8`…`u64`, `f32`/`f64`, `bool`, `Ts`,
@@ -58,11 +57,11 @@ struct ColumnDef {
     column_type: Ident,
     /// `ColumnClass` variant ident, e.g. `Cumulative`.
     column_class: Ident,
-    /// Arrow primitive type token for the runtime helpers, or `None` for
+    /// Arrow primitive type token for the shared helpers, or `None` for
     /// `bool` (which uses the dedicated boolean helpers).
     arrow_type: Option<Ident>,
-    /// Newtype over the Arrow native value (`Ts`, `StrId`), or `None` when the
-    /// field already is the native type. Encode reads its `.0`; decode wraps the
+    /// Wrapper over the Arrow native value (`Ts`, `StrId`), or `None` when the
+    /// field already is the native type. Encode reads `.0`; decode wraps the
     /// decoded value back into it.
     wrapper: Option<Ident>,
     nullable: bool,
@@ -209,9 +208,8 @@ fn column_class(ident: &Ident) -> syn::Result<Ident> {
     Ok(Ident::new(variant, ident.span()))
 }
 
-/// Map a field's base-type ident and class to its `ColumnType` variant, the
-/// Arrow native type token (or `None` for `bool`), and the newtype wrapper over
-/// that native value (`Ts`, `StrId`) or `None`.
+/// Map a field's base-type ident and class to its `ColumnType`, Arrow type
+/// token, and optional wrapper (`Ts` or `StrId`).
 fn map_type(ident: &Ident, class: &Ident) -> syn::Result<(Ident, Option<Ident>, Option<Ident>)> {
     let span = ident.span();
     let is_timestamp = class == "Timestamp";
@@ -340,10 +338,12 @@ fn semantics_variant(ident: &Ident) -> Ident {
 }
 
 fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
-    // One builder per column, each its own pass over `rows`. For single-row
-    // snapshots this is noise; a one-pass SoA build (fill all builders together)
-    // is deferred until a benchmark on a large section shows the extra passes
-    // matter, since it reshapes the generated encode.
+    // One builder per column, each with its own pass over `rows`. The gather is
+    // inherent: `rows: &[Self]` is an array of structs, so one field is strided
+    // across it — there is no contiguous `&[T]` to hand to Arrow or to
+    // `bytemuck::cast_slice`, even for `#[repr(transparent)]` `Ts`/`StrId`.
+    // Collapsing these passes means taking columnar (SoA) input, an API change
+    // worth making only if a large-section benchmark shows the passes matter.
     let builders = columns.iter().map(|c| {
         let field = &c.field;
         let values = match (&c.wrapper, c.nullable) {
@@ -389,6 +389,12 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
                 let #col = ::kronika_registry::required_column::<::kronika_registry::#at>(#batch, #name)?;
                 let #col = #col.values();
             },
+            // Nullable primitive: kept on the array — `opt_primitive` does the
+            // per-cell null-check then `value(i)`. Deliberately NOT rebound to
+            // `.values()` like the required arm: here the per-cell cost is the
+            // null branch, which the optimizer already inlines, so a values-slice
+            // rebind is unmeasured churn until a large-section benchmark shows it
+            // pays.
             (Some(at), true) => quote! {
                 let #col = ::kronika_registry::nullable_column::<::kronika_registry::#at>(#batch, #name)?;
             },
