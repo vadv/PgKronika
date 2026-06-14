@@ -190,12 +190,12 @@ bugs and malformed sections, not normal data.
 
 One risk remains in Parquet decoding itself: a valid-size page can request a
 large buffer from its page header, which the byte cap does not bound. The decode
-entry points therefore take a `VerifiedSection`, not raw bytes: the part scanner
-(`kronika-format` `validate_part`) checks each section's CRC against the catalog
-and wraps the bytes, so unverified bytes cannot reach the parser by accident.
-The CRC check stays at the container layer — `VerifiedSection::verified` is the
-deliberate assertion that it happened. This catches media corruption; fully
-forged segments are outside the protection model of the format.
+entry points therefore take a `VerifiedSection`, not raw bytes, and its only
+constructor — `VerifiedSection::verify(bytes, expected_crc, crc32c)` — runs the
+check, so unverified bytes cannot reach the parser by accident. The crc function
+is injected (the catalog checksum lives in `kronika-format`), keeping registry
+independent of it. This catches media corruption; a forged segment that
+recomputes the CRC is outside the protection model of the format.
 
 ## Tests
 

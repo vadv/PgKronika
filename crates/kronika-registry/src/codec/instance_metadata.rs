@@ -81,7 +81,7 @@ mod tests {
         let rows = vec![row()];
         let bytes = InstanceMetadata::encode(&rows).expect("encode");
         let decoded =
-            InstanceMetadata::decode(VerifiedSection::verified(bytes.into())).expect("decode");
+            InstanceMetadata::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
         assert_eq!(decoded, rows);
     }
 }

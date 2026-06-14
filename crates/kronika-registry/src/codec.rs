@@ -116,6 +116,14 @@ pub enum CodecError {
     /// A decoded section's schema does not match the contract it was decoded
     /// against (column set, order, types, or nullability).
     SchemaMismatch,
+    /// A section's computed CRC does not match the catalog's, so the bytes are
+    /// corrupt (or not the section the catalog points at).
+    SectionCrcMismatch {
+        /// The CRC the catalog claims.
+        expected: u32,
+        /// The CRC computed over the bytes.
+        got: u32,
+    },
 }
 
 impl fmt::Display for CodecError {
@@ -147,6 +155,12 @@ impl fmt::Display for CodecError {
             Self::SchemaMismatch => {
                 write!(f, "decoded section schema does not match the contract")
             }
+            Self::SectionCrcMismatch { expected, got } => {
+                write!(
+                    f,
+                    "section CRC {got:#010x} does not match the catalog's {expected:#010x}"
+                )
+            }
         }
     }
 }
@@ -164,7 +178,8 @@ impl Error for CodecError {
             | Self::ColumnType { .. }
             | Self::NullInRequiredColumn { .. }
             | Self::UnknownType { .. }
-            | Self::SchemaMismatch => None,
+            | Self::SchemaMismatch
+            | Self::SectionCrcMismatch { .. } => None,
         }
     }
 }
@@ -286,20 +301,41 @@ pub fn encode_section(
 /// Section bytes whose CRC has been checked against the catalog.
 ///
 /// The decode entry points take this, not raw `Bytes`, so the CRC-before-decode
-/// boundary is in the type: a caller cannot pass unverified bytes to the Parquet
-/// page-header parser by accident. It is a marker, not a crypto gate — the CRC
-/// is computed at the container layer (`kronika-format` `validate_part`), which
-/// wraps the bytes once a section is located. [`verified`](VerifiedSection::verified)
-/// is the deliberate "these bytes are catalog-verified" assertion; forged
-/// segments remain outside the protection model (README.md, "Memory Bounds").
+/// boundary is in the type. The only public constructor is
+/// [`verify`](VerifiedSection::verify), which actually runs the check, so a
+/// caller cannot pass unverified bytes to the Parquet page-header parser by
+/// accident. The CRC function is injected (the catalog checksum lives in
+/// `kronika-format`, which registry does not depend on), so the check runs here
+/// without a crc dependency. A caller that recomputes the CRC to match — a
+/// forged segment — is outside the protection model (README.md, "Memory Bounds").
 #[derive(Clone, Debug)]
 pub struct VerifiedSection(Bytes);
 
 impl VerifiedSection {
-    /// Assert that `bytes` had their CRC checked against the catalog — the part
-    /// scanner does this before a section is located — and wrap them for decode.
-    #[must_use]
-    pub const fn verified(bytes: Bytes) -> Self {
+    /// Verify `bytes` against their catalog CRC and wrap them for decode.
+    ///
+    /// `crc32c` computes the section checksum (inject `kronika-format`'s); the
+    /// bytes are wrapped only if it equals `expected`.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::SectionCrcMismatch`] if the computed CRC differs.
+    pub fn verify(
+        bytes: Bytes,
+        expected: u32,
+        crc32c: impl FnOnce(&[u8]) -> u32,
+    ) -> Result<Self, CodecError> {
+        let got = crc32c(&bytes);
+        if got == expected {
+            Ok(Self(bytes))
+        } else {
+            Err(CodecError::SectionCrcMismatch { expected, got })
+        }
+    }
+
+    /// Wrap bytes without a CRC check, for tests that decode their own output.
+    #[cfg(test)]
+    pub(crate) const fn for_test(bytes: Bytes) -> Self {
         Self(bytes)
     }
 
@@ -307,6 +343,27 @@ impl VerifiedSection {
     #[must_use]
     pub fn into_bytes(self) -> Bytes {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod verified_section_tests {
+    use bytes::Bytes;
+
+    use super::{CodecError, VerifiedSection};
+
+    #[test]
+    fn verify_accepts_a_matching_crc_and_rejects_a_mismatch() {
+        let bytes = Bytes::from_static(b"section"); // len 7, the stand-in crc
+        let crc = |b: &[u8]| u32::try_from(b.len()).unwrap_or(u32::MAX);
+        assert!(VerifiedSection::verify(bytes.clone(), 7, crc).is_ok());
+        assert!(matches!(
+            VerifiedSection::verify(bytes, 99, crc),
+            Err(CodecError::SectionCrcMismatch {
+                expected: 99,
+                got: 7
+            })
+        ));
     }
 }
 
@@ -650,7 +707,7 @@ mod hygiene_tests {
         ];
         let bytes = Weird::encode(&want).expect("encode");
         assert_eq!(
-            Weird::decode(VerifiedSection::verified(bytes.into())).expect("decode"),
+            Weird::decode(VerifiedSection::for_test(bytes.into())).expect("decode"),
             want
         );
     }

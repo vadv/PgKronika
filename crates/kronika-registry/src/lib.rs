@@ -74,11 +74,11 @@ pub const fn registry() -> &'static [TypeContract] {
 /// a perfect-hash lookup would replace it if the registry grows to hundreds of
 /// types.
 ///
-/// Integrity is in the type: it takes a [`VerifiedSection`], so raw bytes cannot
-/// reach the Parquet parser by accident. The CRC is checked against the catalog
-/// (`kronika-format` `validate_part`) before the bytes are wrapped; the check
-/// itself stays at the container layer, and forged segments are outside the
-/// protection model (README.md, "Memory Bounds").
+/// Integrity is in the type: it takes a [`VerifiedSection`], whose only
+/// constructor verifies the section CRC (the crc function injected from the
+/// container layer), so unverified bytes cannot reach the Parquet parser by
+/// accident. A forged segment — a recomputed CRC — is outside the protection
+/// model (README.md, "Memory Bounds").
 ///
 /// # Errors
 ///
@@ -139,7 +139,7 @@ mod tests {
             let bytes_in = bytes.len();
             let id = contract.type_id.get();
             let decoded =
-                decode_any(id, VerifiedSection::verified(bytes.into())).expect("decode_any");
+                decode_any(id, VerifiedSection::for_test(bytes.into())).expect("decode_any");
             assert_eq!(
                 decoded.stats.rows, 0,
                 "type {id} should decode to zero rows"
@@ -156,7 +156,7 @@ mod tests {
         // Structurally valid (class 2, source 999, version 999) but not in the
         // registry, so the dispatch must reject it rather than decode garbage.
         assert!(matches!(
-            decode_any(2_999_999, VerifiedSection::verified(Bytes::new())),
+            decode_any(2_999_999, VerifiedSection::for_test(Bytes::new())),
             Err(CodecError::UnknownType { type_id: 2_999_999 })
         ));
     }

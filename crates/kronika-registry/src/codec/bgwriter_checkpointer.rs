@@ -199,7 +199,7 @@ mod tests {
         let rows = vec![pg16_row(1_000_000), pg17_row(2_000_000)];
         let bytes = BgwriterCheckpointer::encode(&rows).expect("encode");
         let decoded =
-            BgwriterCheckpointer::decode(VerifiedSection::verified(bytes.into())).expect("decode");
+            BgwriterCheckpointer::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
         assert_eq!(decoded, rows);
     }
 
@@ -208,7 +208,7 @@ mod tests {
         let rows = vec![pg16_row(1_000_000), pg17_row(2_000_000)];
         let bytes = BgwriterCheckpointer::encode(&rows).expect("encode");
         let bytes_in = bytes.len();
-        let decoded = crate::decode_any(1_006_001, VerifiedSection::verified(bytes.into()))
+        let decoded = crate::decode_any(1_006_001, VerifiedSection::for_test(bytes.into()))
             .expect("decode_any");
         assert_eq!(decoded.stats.rows, 2);
         assert_eq!(decoded.stats.bytes_in, bytes_in);
@@ -220,7 +220,7 @@ mod tests {
     fn empty_section_roundtrips() {
         let bytes = BgwriterCheckpointer::encode(&[]).expect("encode empty");
         assert_eq!(
-            BgwriterCheckpointer::decode(VerifiedSection::verified(bytes.into()))
+            BgwriterCheckpointer::decode(VerifiedSection::for_test(bytes.into()))
                 .expect("decode empty"),
             Vec::new()
         );
@@ -232,7 +232,7 @@ mod tests {
         let row = pg17_row(5);
         let bytes = BgwriterCheckpointer::encode(&[row]).expect("encode");
         let decoded =
-            BgwriterCheckpointer::decode(VerifiedSection::verified(bytes.into())).expect("decode");
+            BgwriterCheckpointer::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
         assert_eq!(decoded[0].buffers_backend, None);
     }
 
@@ -278,7 +278,7 @@ mod tests {
     fn decode_rejects_an_oversized_section() {
         let bytes = vec![0_u8; MAX_SECTION_BYTES + 1];
         assert!(matches!(
-            BgwriterCheckpointer::decode(VerifiedSection::verified(bytes.into())),
+            BgwriterCheckpointer::decode(VerifiedSection::for_test(bytes.into())),
             Err(CodecError::SectionTooLarge { .. })
         ));
     }
@@ -329,7 +329,7 @@ mod tests {
         writer.close().expect("close");
 
         assert!(matches!(
-            BgwriterCheckpointer::decode(VerifiedSection::verified(buf.into())),
+            BgwriterCheckpointer::decode(VerifiedSection::for_test(buf.into())),
             Err(CodecError::NullInRequiredColumn { name: "ts" })
         ));
     }
