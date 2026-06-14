@@ -12,7 +12,7 @@
 //! are inherently fresh; the pool does not touch them.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
 
@@ -66,6 +66,7 @@ struct Counters {
     returned_total: AtomicU64,
     dropped_oversize_total: AtomicU64,
     dropped_full_total: AtomicU64,
+    poisoned_total: AtomicU64,
 }
 
 /// What happened to a buffer returned to the pool, so `Loan::drop` can count it
@@ -98,6 +99,9 @@ pub struct PoolStats {
     pub dropped_oversize_total: u64,
     /// Returns freed because `max_buffers` idle buffers were already parked.
     pub dropped_full_total: u64,
+    /// Times a `load`/return found the lock poisoned by a panicking holder. The
+    /// pool recovers (it has no state invariant), so this is the only trace.
+    pub poisoned_total: u64,
 }
 
 /// A buffer on loan from the pool. It returns to the pool after the last
@@ -126,11 +130,21 @@ impl Drop for Loan {
 }
 
 impl Shared {
+    /// Lock the state, counting a poisoned lock. The pool has no state invariant
+    /// to uphold, so recovering is safe — but the count is the only signal that a
+    /// holder panicked, which `stats()` would otherwise hide.
+    fn lock_state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            self.stats.poisoned_total.fetch_add(1, Ordering::Relaxed);
+            poisoned.into_inner()
+        })
+    }
+
     /// Take a returned buffer back under the lock, retaining it for reuse if it
     /// fits, and report the outcome. A freed buffer is dropped after the lock is
     /// released, not inside the critical section.
     fn take_back(&self, data: Vec<u8>) -> Returned {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.lock_state();
         if data.capacity() > state.buffer_limit {
             drop(state);
             Returned::Oversize
@@ -171,14 +185,7 @@ impl BytesPool {
     /// capacity from a previous loan.
     #[must_use]
     pub fn load(&self, fill: impl FnOnce(&mut Vec<u8>)) -> Bytes {
-        let mut data = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .idle
-            .pop()
-            .unwrap_or_default();
+        let mut data = self.shared.lock_state().idle.pop().unwrap_or_default();
         data.clear();
         fill(&mut data);
         self.shared
@@ -200,11 +207,7 @@ impl BytesPool {
     #[must_use]
     pub fn stats(&self) -> PoolStats {
         let idle = {
-            let state = self
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let state = self.shared.lock_state();
             u64::try_from(state.idle.len()).unwrap_or(u64::MAX)
         };
         let counters = &self.shared.stats;
@@ -214,6 +217,7 @@ impl BytesPool {
             returned_total: counters.returned_total.load(Ordering::Relaxed),
             dropped_oversize_total: counters.dropped_oversize_total.load(Ordering::Relaxed),
             dropped_full_total: counters.dropped_full_total.load(Ordering::Relaxed),
+            poisoned_total: counters.poisoned_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -295,5 +299,6 @@ mod tests {
             stats.dropped_oversize_total, 1,
             "big grew past buffer_limit"
         );
+        assert_eq!(stats.poisoned_total, 0, "no lock was poisoned");
     }
 }

@@ -19,11 +19,24 @@ mod pool;
 mod section;
 mod type_id;
 
+// Seals [`Section`]: the trait has this crate-private supertrait, and only the
+// in-crate `#[derive(Section)]` emits the `Sealed` impl, so no downstream crate
+// can implement `Section` for its own type and forge a registry codec. The
+// module is private; its trait is `pub` only so it can be the supertrait of the
+// public `Section`.
+mod sealed {
+    #[allow(
+        unnameable_types,
+        reason = "sealing Section means Sealed is reachable (as its supertrait) but deliberately not nameable downstream"
+    )]
+    pub trait Sealed {}
+}
+
 pub use codec::{
     CodecError, DecodeStats, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
-    VerifiedSection, arrow_schema, decode_batches, decode_section, encode_section, nullable_bool,
-    nullable_column, opt_bool, opt_primitive, required_bool, required_column, write_bool,
-    write_bool_nullable, write_nullable, write_required,
+    VerifiedSection, arrow_schema, check_row_cap, decode_batches, decode_section, encode_section,
+    nullable_bool, nullable_column, opt_bool, opt_primitive, required_bool, required_column,
+    write_bool, write_bool_nullable, write_nullable, write_required,
 };
 pub use codec::{bgwriter_checkpointer, instance_metadata, reset_metadata};
 pub use contract::{
@@ -109,17 +122,30 @@ pub fn decode_any(type_id: u32, section: VerifiedSection) -> Result<DecodedSecti
 /// bytes are CRC-verified ([`VerifiedSection::verify`], `crc32c` and
 /// `expected_crc` from the catalog) and passed to [`decode_any`].
 ///
+/// `expected_len` is the catalog's claimed section length and is checked against
+/// [`MAX_SECTION_BYTES`] *before* `fill` runs, so a corrupt catalog length is
+/// rejected before it can allocate and hash an oversized buffer — the byte cap is
+/// a preflight here, not a post-read check (README.md, "Memory Bounds").
+///
 /// # Errors
 ///
+/// [`CodecError::SectionTooLarge`] if `expected_len` exceeds the byte cap;
 /// [`CodecError::SectionCrcMismatch`] on a CRC mismatch; otherwise the errors of
 /// [`decode_any`].
 pub fn decode_pooled(
     pool: &BytesPool,
     type_id: u32,
+    expected_len: usize,
     expected_crc: u32,
     crc32c: impl FnOnce(&[u8]) -> u32,
     fill: impl FnOnce(&mut Vec<u8>),
 ) -> Result<DecodedSection, CodecError> {
+    if expected_len > MAX_SECTION_BYTES {
+        return Err(CodecError::SectionTooLarge {
+            len: expected_len,
+            max: MAX_SECTION_BYTES,
+        });
+    }
     let section = VerifiedSection::verify(pool.load(fill), expected_crc, crc32c)?;
     decode_any(type_id, section)
 }
@@ -167,7 +193,7 @@ mod tests {
                 .iter()
                 .map(|field| new_empty_array(field.data_type()))
                 .collect();
-            let bytes = encode_section(contract, 0, columns).expect("encode empty section");
+            let bytes = encode_section(contract, columns).expect("encode empty section");
             let bytes_in = bytes.len();
             let id = contract.type_id.get();
             let decoded =
@@ -194,11 +220,11 @@ mod tests {
             .iter()
             .map(|field| new_empty_array(field.data_type()))
             .collect();
-        let encoded = encode_section(contract, 0, columns).expect("encode empty section");
+        let encoded = encode_section(contract, columns).expect("encode empty section");
         // Stand-in CRC = byte length; production code passes kronika-format's.
         let crc = |b: &[u8]| u32::try_from(b.len()).unwrap_or(u32::MAX);
         let expected = crc(&encoded);
-        let decoded = decode_pooled(&pool, id, expected, crc, |buf| {
+        let decoded = decode_pooled(&pool, id, encoded.len(), expected, crc, |buf| {
             buf.extend_from_slice(&encoded);
         })
         .expect("decode_pooled");

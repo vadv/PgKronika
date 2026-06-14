@@ -112,7 +112,10 @@ same `type_id` for a failed decode and `CodecError::UnknownType` keeps it for an
 id absent from the registry. `CodecError::section_type_id()` returns that label
 without a separate `match` over variants, so every read outcome can be counted
 under `{type_id}`. No concrete type and no per-type `match` are needed; adding a
-section type means adding one `registry()` entry.
+section type means adding one `registry()` entry. Both `T::decode` and
+`decode_any` validate the file schema against the contract — column set, order,
+type, and nullability — so the typed and registry paths accept and reject the
+same bytes.
 
 `decode` and `decode_any` take a `VerifiedSection`: owned `Bytes` whose CRC was
 checked against the catalog. The bytes are not copied again; the Parquet reader
@@ -125,10 +128,12 @@ input buffer; decompressed pages and Arrow arrays are new allocations.
 `dropped_oversize_total` is the signal that `buffer_limit` sits below the section
 size, so the pool has silently degraded to a per-section allocator.
 
-The `Section` trait is public; the `#[derive(Section)]` macro is not. Every
-section type is defined in this crate, and the derive routes ids through the
-crate-private `TypeId` constructor. The macro is an internal registry tool, not
-a public extension point.
+The `Section` trait is public but sealed: a crate-private supertrait that only
+the in-crate `#[derive(Section)]` implements, so `T: Section` always means a
+registry type and no downstream crate can implement it to forge a codec for an
+existing contract. The macro is not public either; the derive routes ids through
+the crate-private `TypeId` constructor, an internal registry tool, not a public
+extension point.
 
 ## Example: type `1_006_001`
 
@@ -139,7 +144,7 @@ worked example.
 `pg_stat_bgwriter` + `pg_stat_checkpointer`, a single-row snapshot
 (`SnapshotFull`, sort key `(ts)`). PostgreSQL 17 reorganized these views: it
 moved and renamed the checkpoint counters into `pg_stat_checkpointer`, added the
-restartpoint counters for hot standby and `slru_written`, and removed
+restartpoint counters for hot standby, and removed
 `buffers_backend` / `buffers_backend_fsync`. The collector reads both views and
 writes one row; each field keeps a stable name and documents its
 per-version source, and a counter the running server lacks is written `NULL`,
@@ -160,7 +165,8 @@ the reader interprets all other sections against them:
 - `reset_metadata` (`1_020_001`) — the cross-cutting reset context: the global
   postmaster start time, reset times for views that do not yet have their own
   section, the extension versions, and the GUCs (`track_io_timing`,
-  `compute_query_id`) that decide whether a column is present or meaningful.
+  `track_wal_io_timing`, `compute_query_id`) that decide whether a column is
+  present or meaningful.
 
 A statistics reset is per view: `pg_stat_reset_shared('bgwriter')` resets only
 that view. It can happen in the middle of a segment, so a view that exposes its
@@ -178,9 +184,13 @@ segment, not repeated as a column in every type.
 ## Memory Bounds
 
 A snapshot section holds at most `MAX_SECTION_ROWS` rows. `encode` rejects a
-larger input slice. `decode` checks the section before materializing rows:
-byte length must fit `MAX_SECTION_BYTES`, row groups must fit `MAX_ROW_GROUPS`,
-and both metadata and decoded row counts must fit `MAX_SECTION_ROWS`.
+larger slice before it builds any column, and rejects a finished body above
+`MAX_SECTION_BYTES` — the same byte cap `decode` enforces — so a writer cannot
+emit a section the reader would refuse. `decode` checks the section before
+materializing rows: byte length must fit `MAX_SECTION_BYTES`, row groups must fit
+`MAX_ROW_GROUPS`, and both metadata and decoded row counts must fit
+`MAX_SECTION_ROWS`. `decode_pooled` checks the catalog's claimed length against
+the byte cap before it reads, so a corrupt length cannot allocate first.
 
 Encode peak memory is the caller's row slice plus one Parquet row group.
 `decode` takes owned `Bytes` and does not copy the section again; the Parquet

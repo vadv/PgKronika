@@ -221,8 +221,10 @@ fn lint_contract(contract: &TypeContract, out: &mut Vec<LintError>) {
     }
 
     for column in contract.columns {
+        // Readers key the time axis on a column literally named `ts`, so a
+        // timestamp column must be a non-nullable `Ts` *and* carry that name.
         if matches!(column.class, ColumnClass::Timestamp)
-            && (column.nullable || !matches!(column.ty, ColumnType::Ts))
+            && (column.nullable || !matches!(column.ty, ColumnType::Ts) || column.name != "ts")
         {
             out.push(LintError::BadTimestampColumn {
                 type_id: raw,
@@ -342,6 +344,26 @@ mod tests {
             Err(vec![LintError::BadTimestampColumn {
                 type_id: 1_006_001,
                 column: "ts"
+            }])
+        );
+    }
+
+    #[test]
+    fn rejects_a_misnamed_timestamp_column() {
+        // A non-nullable `Ts` of class Timestamp, but not named `ts`: readers
+        // key the time axis on the literal name, so the linter must reject it.
+        const COLLECTED_AT: Column = Column {
+            name: "collected_at",
+            ty: ColumnType::Ts,
+            class: ColumnClass::Timestamp,
+            nullable: false,
+        };
+        let c = contract(1_006_001, &[COLLECTED_AT], &["collected_at"]);
+        assert_eq!(
+            lint(&[c]),
+            Err(vec![LintError::BadTimestampColumn {
+                type_id: 1_006_001,
+                column: "collected_at"
             }])
         );
     }

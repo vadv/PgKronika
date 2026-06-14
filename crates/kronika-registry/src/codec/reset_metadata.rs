@@ -65,6 +65,13 @@ pub struct ResetMetadata {
     /// fast IO; `None` if the GUC is unavailable.
     #[column(l)]
     pub track_io_timing: Option<bool>,
+    /// `track_wal_io_timing` GUC, separate from `track_io_timing`: it governs
+    /// `pg_stat_wal.wal_write_time` / `wal_sync_time`, not `pg_stat_io`. If
+    /// `false`, those stay zero and do not mean fast WAL IO. Recorded here so a
+    /// future `pg_stat_wal` section reads a real zero apart from disabled timing
+    /// without its own service-section version. `None` if the GUC is unavailable.
+    #[column(l)]
+    pub track_wal_io_timing: Option<bool>,
 }
 
 #[cfg(test)]
@@ -86,6 +93,7 @@ mod tests {
             ext_pg_store_plans_version: None,
             compute_query_id: Some(StrId(11)),
             track_io_timing: Some(true),
+            track_wal_io_timing: Some(false),
         }
     }
 
@@ -97,6 +105,7 @@ mod tests {
             ext_pg_stat_statements_version: None,
             compute_query_id: None,
             track_io_timing: None,
+            track_wal_io_timing: None,
             ..pg17_row()
         }
     }

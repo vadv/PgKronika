@@ -5,7 +5,7 @@
 //! the checkpoint counters moved from `pg_stat_bgwriter` to
 //! `pg_stat_checkpointer` and several were renamed (`buffers_checkpoint` →
 //! `buffers_written`, now counting restartpoints too); PG17 also added the
-//! restartpoint counters and `slru_written`, and dropped `buffers_backend` /
+//! restartpoint counters and dropped `buffers_backend` /
 //! `buffers_backend_fsync`. Each field keeps one stable name and documents its
 //! per-version source; a column the running server lacks is `None`, in either
 //! direction. Which case applies is read from `instance_metadata`
@@ -41,8 +41,10 @@ pub struct BgwriterCheckpointer {
     #[column(t)]
     pub ts: Ts,
     /// Scheduled checkpoints. `pg_stat_bgwriter.checkpoints_timed` before PG17,
-    /// `pg_stat_checkpointer.num_timed` on PG17+. Same reset split as
-    /// `checkpoint_write_time`.
+    /// `pg_stat_checkpointer.num_timed` on PG17+. The semantics differ: PG16
+    /// counts performed scheduled checkpoints, PG17+ counts both completed and
+    /// skipped (idle) ones, so a delta spanning the upgrade is not comparable.
+    /// Same reset split as `checkpoint_write_time`.
     #[column(c)]
     pub checkpoints_timed: i64,
     /// Requested checkpoints. `checkpoints_req` before PG17,
@@ -65,8 +67,10 @@ pub struct BgwriterCheckpointer {
     pub checkpoint_sync_time: f64,
     /// Buffers written during checkpoints. `pg_stat_bgwriter.buffers_checkpoint`
     /// before PG17; `pg_stat_checkpointer.buffers_written` on PG17+, renamed and
-    /// now including restartpoint writes. Same reset split as
-    /// `checkpoint_write_time`.
+    /// now also counting restartpoint writes. On a standby the PG17 value
+    /// therefore includes restartpoint buffers a PG16 row never had, so a rate
+    /// spanning the upgrade jumps; subtract restartpoint writes to compare. Same
+    /// reset split as `checkpoint_write_time`.
     #[column(c)]
     pub buffers_checkpoint: i64,
     /// Scheduled restartpoints: the checkpoint path on a hot standby.
@@ -82,10 +86,6 @@ pub struct BgwriterCheckpointer {
     /// separate slow WAL replay from lack of incoming WAL.
     #[column(c)]
     pub restartpoints_done: Option<i64>,
-    /// SLRU buffers written by the checkpointer.
-    /// `pg_stat_checkpointer.slru_written`; `None` before PG17.
-    #[column(c)]
-    pub slru_written: Option<i64>,
     /// Buffers written by the background writer
     /// (`pg_stat_bgwriter.buffers_clean`, both versions).
     #[column(c)]
@@ -136,7 +136,6 @@ mod tests {
             restartpoints_timed: None,
             restartpoints_req: None,
             restartpoints_done: None,
-            slru_written: None,
             buffers_clean: 512,
             maxwritten_clean: 3,
             buffers_backend: Some(128),
@@ -154,7 +153,6 @@ mod tests {
             restartpoints_timed: Some(7),
             restartpoints_req: Some(1),
             restartpoints_done: Some(6),
-            slru_written: Some(256),
             checkpointer_stats_reset: Some(Ts(ts - 50_000)),
             ..pg16_row(ts)
         }
@@ -169,7 +167,7 @@ mod tests {
     fn contract_shape_matches_the_source() {
         let c = BgwriterCheckpointer::CONTRACT;
         assert_eq!(c.type_id.get(), 1_006_001);
-        assert_eq!(c.columns.len(), 17);
+        assert_eq!(c.columns.len(), 16);
         assert_eq!(c.sort_key, ["ts"]);
         // `ts` is the sort timestamp. Nullable columns cover PG17-only
         // counters, counters removed from `pg_stat_bgwriter` in PG17, and the
@@ -281,15 +279,18 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_a_null_in_a_required_column() {
+    fn typed_decode_rejects_a_schema_that_does_not_match_the_contract() {
         use std::sync::Arc;
 
         use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
         use parquet::arrow::ArrowWriter;
 
-        // The columns match the contract, but `ts` is nullable and contains
-        // NULL. Required columns must reject NULL rather than read it as zero.
+        // A file with the wrong column set (the pre-PG17 subset, not the full
+        // contract) and a nullable `ts`. The typed `Section::decode` validates
+        // the schema against the contract before reading rows, exactly as
+        // `decode_any` does, so it rejects this with `SchemaMismatch` rather than
+        // silently reading the columns it recognizes by name.
         let i64f = |name: &str, nullable: bool| Field::new(name, DataType::Int64, nullable);
         let f64f = |name: &str| Field::new(name, DataType::Float64, false);
         let schema = Arc::new(Schema::new(vec![
@@ -327,7 +328,7 @@ mod tests {
 
         assert!(matches!(
             BgwriterCheckpointer::decode(VerifiedSection::for_test(buf.into())),
-            Err(CodecError::NullInRequiredColumn { name: "ts" })
+            Err(CodecError::SchemaMismatch)
         ));
     }
 }
