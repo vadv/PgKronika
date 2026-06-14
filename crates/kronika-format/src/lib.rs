@@ -34,7 +34,8 @@ pub use dictionary::{
 pub use dictionary::{EntrySnapshot, HotMark, Placement};
 pub use parts::{
     DEFAULT_MAX_PART_LEN, DamageKind, DamageRegion, FRAME_HEADER_LEN, FRAME_MAGIC, FrameError,
-    FrameHeader, JournalLimits, PartError, PartRef, ScanReport, scan_journal, validate_part,
+    FrameHeader, JournalLimits, PartError, PartMeta, PartRef, ScanReport, SectionInput, build_part,
+    scan_journal, validate_part,
 };
 pub use str_id::StrId;
 

@@ -24,7 +24,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::{Catalog, DecodeError, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
+use crate::{Catalog, DecodeError, Entry, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
 
 /// Magic bytes opening every journal frame.
 pub const FRAME_MAGIC: [u8; 4] = *b"PGMP";
@@ -273,6 +273,80 @@ pub fn validate_part(bytes: &[u8]) -> Result<Catalog, PartError> {
     Ok(catalog)
 }
 
+/// One section to place in a part: its type, row count, and body bytes.
+///
+/// The body is opaque to this crate — a Parquet snapshot or a native block —
+/// and is copied into the part as-is.
+#[derive(Debug, Clone, Copy)]
+pub struct SectionInput<'a> {
+    /// Section type from the type registry (`kronika-registry`).
+    pub type_id: u32,
+    /// Number of rows or records the body holds; recorded in the catalog.
+    pub rows: u32,
+    /// The section body bytes, placed verbatim.
+    pub body: &'a [u8],
+}
+
+/// Segment-level catalog metadata for a part, the fields not derivable from the
+/// section bodies.
+#[derive(Debug, Clone, Copy)]
+pub struct PartMeta {
+    /// Minimal timestamp across the part's rows, unix microseconds.
+    pub min_ts: i64,
+    /// Maximal timestamp across the part's rows, unix microseconds.
+    pub max_ts: i64,
+    /// `str_id` of `{cluster_id}/{pg_system_identifier}`; 0 = not set.
+    pub source_id: u64,
+}
+
+/// Assemble section bodies into a self-contained PGM part.
+///
+/// Lays out [`MAGIC`], the bodies in the given order, then the end catalog —
+/// each entry carries the body's absolute offset and CRC32C — and the tail
+/// index. This is the inverse of [`validate_part`]: the result always passes
+/// `validate_part`, which the round-trip test pins.
+///
+/// `flags` is written as zero and offsets are computed here, so a caller cannot
+/// produce an entry that points outside the body.
+///
+/// # Panics
+///
+/// Panics only if the encoded catalog block does not fit in `u32` (see
+/// [`Catalog::encode`]) — an absurd section count, i.e. a writer bug.
+#[must_use]
+pub fn build_part(sections: &[SectionInput<'_>], meta: PartMeta) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC);
+
+    let entries = sections
+        .iter()
+        .map(|section| {
+            // `offset` is absolute from the part start, where the reader's
+            // `Catalog` entries point; bodies are contiguous after MAGIC.
+            let offset = out.len() as u64;
+            out.extend_from_slice(section.body);
+            Entry {
+                type_id: section.type_id,
+                flags: 0,
+                offset,
+                len: section.body.len() as u64,
+                rows: section.rows,
+                crc32c: crc32c(section.body),
+            }
+        })
+        .collect();
+
+    let catalog = Catalog {
+        entries,
+        min_ts: meta.min_ts,
+        max_ts: meta.max_ts,
+        source_id: meta.source_id,
+        format_version: crate::FORMAT_VERSION,
+    };
+    out.extend_from_slice(&catalog.encode());
+    out
+}
+
 /// Limits used while scanning a journal buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalLimits {
@@ -507,7 +581,7 @@ mod tests {
         part.extend_from_slice(&MAGIC);
         part.extend_from_slice(&section);
         let catalog = Catalog {
-            entries: vec![crate::Entry {
+            entries: vec![Entry {
                 type_id: 1_006_001,
                 flags: 0,
                 offset: 4,
@@ -586,6 +660,81 @@ mod tests {
             validate_part(&corrupted),
             Err(PartError::SectionCrc { .. })
         ));
+    }
+
+    #[test]
+    fn build_part_round_trips_through_validate_part() {
+        let first: &[u8] = b"section-one-body";
+        let second: &[u8] = b"second";
+        let part = build_part(
+            &[
+                SectionInput {
+                    type_id: 1_006_001,
+                    rows: 3,
+                    body: first,
+                },
+                SectionInput {
+                    type_id: 1_021_001,
+                    rows: 1,
+                    body: second,
+                },
+            ],
+            PartMeta {
+                min_ts: 100,
+                max_ts: 900,
+                source_id: 42,
+            },
+        );
+
+        let catalog = validate_part(&part).expect("built part is valid");
+        assert_eq!(catalog.entries.len(), 2);
+        assert_eq!(
+            (catalog.min_ts, catalog.max_ts, catalog.source_id),
+            (100, 900, 42)
+        );
+        assert_eq!(catalog.entries[0].type_id, 1_006_001);
+        assert_eq!(catalog.entries[0].rows, 3);
+        assert_eq!(catalog.entries[0].offset, MAGIC.len() as u64);
+
+        // Each recorded (offset, len) slices back to the exact body that went in.
+        for (entry, body) in catalog.entries.iter().zip([first, second]) {
+            let start = usize::try_from(entry.offset).expect("offset fits usize");
+            let len = usize::try_from(entry.len).expect("len fits usize");
+            assert_eq!(&part[start..start + len], body);
+        }
+    }
+
+    #[test]
+    fn build_part_accepts_no_sections() {
+        let part = build_part(
+            &[],
+            PartMeta {
+                min_ts: 0,
+                max_ts: 0,
+                source_id: 0,
+            },
+        );
+        let catalog = validate_part(&part).expect("empty part is valid");
+        assert!(catalog.entries.is_empty());
+    }
+
+    #[test]
+    fn a_built_part_passes_the_journal_scan() {
+        let part = build_part(
+            &[SectionInput {
+                type_id: 1_006_001,
+                rows: 1,
+                body: b"data",
+            }],
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 0,
+            },
+        );
+        let report = scan_journal(&frame(&part), small_limits());
+        assert!(report.is_clean());
+        assert_eq!(report.parts.len(), 1);
     }
 
     #[test]
@@ -695,7 +844,7 @@ mod tests {
         tricky.extend_from_slice(&MAGIC);
         tricky.extend_from_slice(&inner);
         let catalog = Catalog {
-            entries: vec![crate::Entry {
+            entries: vec![Entry {
                 type_id: 1_000_001,
                 flags: 0,
                 offset: 4,
