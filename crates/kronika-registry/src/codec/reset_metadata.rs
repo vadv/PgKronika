@@ -28,8 +28,11 @@ pub struct ResetMetadata {
     /// Collection timestamp, unix microseconds.
     #[column(t)]
     pub ts: Ts,
-    /// Postmaster start time; a change means `PostgreSQL` restarted, so
-    /// cumulative counters restarted with it.
+    /// Postmaster start time. A change marks a `PostgreSQL` restart, but it is
+    /// context, not a reset marker: cumulative stats survive a clean shutdown and
+    /// reset only on crash recovery, `pg_stat_reset*`, or a base backup / PITR.
+    /// The reset of record is each view's own `stats_reset`; this only dates the
+    /// process.
     #[column(g)]
     pub postmaster_start_time: Ts,
     /// Max `stats_reset` across `pg_stat_database`; a coarse database-level

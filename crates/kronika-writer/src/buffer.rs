@@ -133,6 +133,10 @@ impl SectionBuffers {
     /// the data buffers are cleared — the caller flushes the interner window so a
     /// failed journal write keeps it.
     ///
+    /// The returned bytes are the sole copy of the flushed rows: the buffers are
+    /// cleared, so the caller must durably append them (retrying the same bytes on
+    /// a [`JournalError`](crate::JournalError)) before dropping the value.
+    ///
     /// # Errors
     ///
     /// Propagates the [`CodecError`] from encoding any buffered type.
@@ -152,17 +156,21 @@ impl SectionBuffers {
         }
 
         // The part's time range spans the rows of every type that carries a
-        // timestamp; a part of only timestampless sections records 0..0.
-        let min_ts = encoded
+        // timestamp. A part with no timestamped data — a dictionary-only flush —
+        // records an empty interval (min > max), which `seal`'s min/max fold
+        // ignores, so it cannot drag a segment's `min_ts` down to 0.
+        let lo = encoded
             .iter()
             .filter_map(|(_, section)| section.ts_range.map(|(lo, _)| lo))
-            .min()
-            .unwrap_or(0);
-        let max_ts = encoded
+            .min();
+        let hi = encoded
             .iter()
             .filter_map(|(_, section)| section.ts_range.map(|(_, hi)| hi))
-            .max()
-            .unwrap_or(0);
+            .max();
+        let (min_ts, max_ts) = match (lo, hi) {
+            (Some(lo), Some(hi)) => (lo, hi),
+            _ => (i64::MAX, i64::MIN),
+        };
 
         let mut sections: Vec<SectionInput<'_>> = encoded
             .iter()

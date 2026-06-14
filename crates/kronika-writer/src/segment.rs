@@ -17,6 +17,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, PartError, validate_part};
 
@@ -46,6 +47,14 @@ pub enum SealError {
     Part(PartError),
     /// The journal holds no parts, so there is nothing to seal.
     Empty,
+    /// Two parts carry different non-zero `source_id`s, so the journal mixes
+    /// instances and a single segment cannot honestly label its source.
+    SourceIdMismatch {
+        /// The first non-zero source id seen.
+        expected: u64,
+        /// A later, conflicting source id.
+        got: u64,
+    },
 }
 
 impl fmt::Display for SealError {
@@ -55,6 +64,9 @@ impl fmt::Display for SealError {
             Self::Journal(err) => write!(f, "reading a journal part: {err}"),
             Self::Part(err) => write!(f, "invalid journal part: {err}"),
             Self::Empty => write!(f, "the journal holds no parts to seal"),
+            Self::SourceIdMismatch { expected, got } => {
+                write!(f, "journal mixes source_id {expected} and {got}")
+            }
         }
     }
 }
@@ -65,7 +77,7 @@ impl Error for SealError {
             Self::Io(err) => Some(err),
             Self::Journal(err) => Some(err),
             Self::Part(err) => Some(err),
-            Self::Empty => None,
+            Self::Empty | Self::SourceIdMismatch { .. } => None,
         }
     }
 }
@@ -96,15 +108,22 @@ impl From<JournalError> for SealError {
 /// # Errors
 ///
 /// [`SealError::Empty`] if the journal holds no parts; [`SealError::Part`] if a
-/// part fails container validation; [`SealError::Journal`] or [`SealError::Io`]
-/// on a read or filesystem failure.
+/// part fails container validation; [`SealError::SourceIdMismatch`] if parts
+/// carry conflicting source ids; [`SealError::Journal`] or [`SealError::Io`] on a
+/// read or filesystem failure.
 pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
     if journal.parts().is_empty() {
         return Err(SealError::Empty);
     }
 
     let tmp = tmp_path(dest);
-    let summary = write_tmp(journal, &tmp)?;
+    let summary = match write_tmp(journal, &tmp) {
+        Ok(summary) => summary,
+        Err(err) => {
+            fs::remove_file(&tmp).ok();
+            return Err(err);
+        }
+    };
     // O_EXCL-style publish: hard-link the finished file into place (fails if
     // `dest` exists), then drop the temporary name. The data is already synced.
     if let Err(err) = fs::hard_link(&tmp, dest) {
@@ -118,21 +137,34 @@ pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
     Ok(summary)
 }
 
-/// Append `.tmp` to the segment file name, keeping it in the same directory.
+/// A process-unique temporary path beside `dest`.
+///
+/// The name must never collide with a published segment: `seal` writes it with
+/// `create_new` and hard-links it into place, so a fixed name that happened to be
+/// a leftover hard link to a finished segment would be truncated on the next
+/// `File::create`. The pid plus a per-process counter keeps every attempt
+/// distinct.
 fn tmp_path(dest: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut name = dest.as_os_str().to_owned();
-    name.push(".tmp");
+    name.push(format!(".{}.{seq}.tmp", std::process::id()));
     PathBuf::from(name)
 }
 
 /// Write the merged segment to `tmp` and fsync it. The caller publishes it.
 fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
-    let file = File::create(tmp)?;
+    // `create_new`: never truncate an existing file, so a stale temporary is an
+    // error, not silent data loss.
+    let file = File::options().create_new(true).write(true).open(tmp)?;
     let mut out = BufWriter::new(file);
 
     out.write_all(&MAGIC)?;
     let mut offset = MAGIC.len() as u64;
     let mut entries: Vec<Entry> = Vec::new();
+    // Track the time range as an empty interval (min > max): a part with no
+    // timestamped data leaves it untouched, so a dictionary-only part cannot drag
+    // the segment's `min_ts` down to 0.
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     let mut source_id = 0_u64;
@@ -143,6 +175,12 @@ fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
         min_ts = min_ts.min(catalog.min_ts);
         max_ts = max_ts.max(catalog.max_ts);
         if catalog.source_id != 0 {
+            if source_id != 0 && source_id != catalog.source_id {
+                return Err(SealError::SourceIdMismatch {
+                    expected: source_id,
+                    got: catalog.source_id,
+                });
+            }
             source_id = catalog.source_id;
         }
         for entry in &catalog.entries {
@@ -160,6 +198,13 @@ fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
             entries.push(Entry { offset, ..*entry });
             offset += entry.len;
         }
+    }
+
+    // A segment with no timestamped section anywhere records 0..0, not the empty
+    // sentinel.
+    if min_ts > max_ts {
+        min_ts = 0;
+        max_ts = 0;
     }
 
     let sections = entries.len();
@@ -298,7 +343,7 @@ mod tests {
         let dict_entry = catalog
             .entries
             .iter()
-            .find(|entry| entry.type_id == dict::DICT_STRINGS_TYPE_ID)
+            .find(|entry| entry.type_id == kronika_registry::DICT_STRINGS_TYPE_ID)
             .expect("the dictionary section reached the segment");
         assert_eq!(dict_entry.rows, 2, "both interned strings");
         let start = usize::try_from(dict_entry.offset).unwrap();
