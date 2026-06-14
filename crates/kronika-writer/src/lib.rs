@@ -1,12 +1,15 @@
 //! Writer-side state for building PGM segments.
 //!
 //! The crate buffers typed section rows ([`SectionBuffers`]), interns the
-//! segment's strings ([`Interner`]), appends mini-parts to the `active.parts`
+//! segment's strings ([`Interner`]) and encodes them into `dict.strings` /
+//! `dict.blobs` sections ([`dict`]), appends mini-parts to the `active.parts`
 //! [`Journal`], and seals the journal into an immutable `segment.pgm`
-//! ([`seal`]). The remaining work is an optimization of the seal path: a
-//! sort-merge that recompresses repeated sections of one type into one.
+//! ([`seal`]). The remaining work optimizes the seal path: a sort-merge that
+//! recompresses repeated sections of one type into one, and a dictionary merge
+//! that deduplicates a strict-hot value repeated across parts.
 
 mod buffer;
+pub mod dict;
 mod interner;
 mod journal;
 mod segment;
