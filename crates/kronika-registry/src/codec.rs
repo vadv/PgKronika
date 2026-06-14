@@ -8,9 +8,10 @@
 //! type-independent pieces: Arrow schema construction, row/byte/row-group
 //! limits, and column accessors.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch,
@@ -235,12 +236,26 @@ impl From<parquet::errors::ParquetError> for CodecError {
     }
 }
 
-/// Build the Arrow schema of a section from its contract.
+/// The Arrow schema of a section, in the contract's column order.
 ///
-/// The returned schema uses the contract's column order, Arrow types, and
-/// nullability.
+/// Registry types are memoized by `type_id` — the schema is a pure function of
+/// the `'static` contract — so encode, decode, and the decode schema check share
+/// one `Arc` instead of each rebuilding `Vec<Field>`. A contract absent from the
+/// registry (a hand-built test contract) is built fresh.
 #[must_use]
 pub fn arrow_schema(contract: &TypeContract) -> SchemaRef {
+    static CACHE: LazyLock<HashMap<u32, SchemaRef>> = LazyLock::new(|| {
+        crate::registry()
+            .iter()
+            .map(|contract| (contract.type_id.get(), build_arrow_schema(contract)))
+            .collect()
+    });
+    CACHE
+        .get(&contract.type_id.get())
+        .map_or_else(|| build_arrow_schema(contract), Arc::clone)
+}
+
+fn build_arrow_schema(contract: &TypeContract) -> SchemaRef {
     let fields: Vec<Field> = contract
         .columns
         .iter()
@@ -262,6 +277,20 @@ pub fn arrow_schema(contract: &TypeContract) -> SchemaRef {
         })
         .collect();
     Arc::new(Schema::new(fields))
+}
+
+/// Whether a decoded file's schema matches the contract: same column set, order,
+/// types, and nullability. Both decode paths call this so the typed
+/// `Section::decode` and the registry-driven `decode_any` accept and reject the
+/// same files.
+fn schema_matches(got: &Schema, contract: &TypeContract) -> bool {
+    let want = arrow_schema(contract);
+    got.fields().len() == want.fields().len()
+        && got.fields().iter().zip(want.fields()).all(|(g, w)| {
+            g.name() == w.name()
+                && g.data_type() == w.data_type()
+                && g.is_nullable() == w.is_nullable()
+        })
 }
 
 // ---- Encode shared code ----------------------------------------------------
@@ -292,46 +321,86 @@ pub fn write_bool_nullable(values: impl Iterator<Item = Option<bool>>) -> ArrayR
     Arc::new(values.collect::<BooleanArray>())
 }
 
-/// Encode pre-built columns into a Parquet section body (zstd).
+/// Reject a row count above [`MAX_SECTION_ROWS`] before any columns are built.
 ///
-/// Encode the framing every snapshot codec shares: the row limit, zstd level,
-/// and writer options that strip the redundant `ARROW:schema` blob and clear
-/// the Arrow-version string so output stays small and deterministic
-/// (README.md, "Snapshot Sections"). The columns must be in contract order;
-/// [`arrow_schema()`] checks that against `contract`.
+/// The generated `encode` calls this before materializing Arrow arrays from
+/// `rows`, so an over-cap slice fails fast instead of allocating every column
+/// first; [`encode_section`] re-checks the built batch (README.md, "Memory
+/// Bounds").
 ///
 /// # Errors
 ///
-/// [`CodecError::TooManyRows`] above the cap; [`CodecError::Arrow`] or
-/// [`CodecError::Parquet`] if Arrow rejects the batch or writing fails.
-pub fn encode_section(
-    contract: &TypeContract,
-    row_count: usize,
-    columns: Vec<ArrayRef>,
-) -> Result<Vec<u8>, CodecError> {
-    if row_count > MAX_SECTION_ROWS {
+/// [`CodecError::TooManyRows`] if `rows` exceeds the cap.
+pub const fn check_row_cap(rows: usize) -> Result<(), CodecError> {
+    if rows > MAX_SECTION_ROWS {
         return Err(CodecError::TooManyRows {
-            rows: row_count,
+            rows,
             max: MAX_SECTION_ROWS,
         });
     }
+    Ok(())
+}
 
-    let schema = arrow_schema(contract);
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+/// Initial capacity for the encode buffer. A typical single-row snapshot fits,
+/// so the writer's doubling growth does not run in the common case.
+const ENCODE_BUF_HINT: usize = 4096;
 
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+/// The Parquet writer properties shared by every section: zstd level 3, a single
+/// row group up to the row cap, and an empty `created_by`. Identical per call, so
+/// they are built once instead of reallocating the builder's `String` and `Vec`s
+/// on every encode.
+static WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
+        ))
         .set_max_row_group_size(MAX_SECTION_ROWS)
         .set_created_by(String::new())
-        .build();
+        .build()
+});
+
+/// Encode pre-built columns into a Parquet section body (zstd).
+///
+/// The framing every snapshot codec shares: zstd level, the one-row-group
+/// layout, and writer options that strip the redundant `ARROW:schema` blob and
+/// clear the Arrow-version string so output stays small and deterministic
+/// (README.md, "Snapshot Sections"). Columns must be in contract order, which
+/// [`arrow_schema()`] defines.
+///
+/// The row cap is re-checked here against the built `RecordBatch`, not a
+/// caller-supplied count, and the finished body is rejected if it exceeds
+/// [`MAX_SECTION_BYTES`] — the same cap decode enforces — so a writer cannot emit
+/// a section the reader would refuse (README.md, "Memory Bounds").
+///
+/// # Errors
+///
+/// [`CodecError::TooManyRows`] if the batch exceeds the row cap;
+/// [`CodecError::SectionTooLarge`] if the body exceeds the byte cap;
+/// [`CodecError::Arrow`] or [`CodecError::Parquet`] if Arrow rejects the batch or
+/// writing fails.
+pub fn encode_section(
+    contract: &TypeContract,
+    columns: Vec<ArrayRef>,
+) -> Result<Vec<u8>, CodecError> {
+    let schema = arrow_schema(contract);
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+    check_row_cap(batch.num_rows())?;
+
     let options = ArrowWriterOptions::new()
-        .with_properties(props)
+        .with_properties(WRITER_PROPS.clone())
         .with_skip_arrow_metadata(true);
 
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(ENCODE_BUF_HINT);
     let mut writer = ArrowWriter::try_new_with_options(&mut buf, schema, options)?;
     writer.write(&batch)?;
     writer.close()?;
+
+    if buf.len() > MAX_SECTION_BYTES {
+        return Err(CodecError::SectionTooLarge {
+            len: buf.len(),
+            max: MAX_SECTION_BYTES,
+        });
+    }
     Ok(buf)
 }
 
@@ -441,6 +510,28 @@ mod codec_error_tests {
             "errors not tied to one section have no label"
         );
     }
+
+    #[test]
+    fn required_column_rejects_a_null_so_it_cannot_read_as_zero() {
+        use std::sync::Arc;
+
+        use arrow_array::types::Int64Type;
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        use super::required_column;
+
+        // The schema check rejects a nullable-declared required column up front;
+        // this guards the residual case — a column the contract calls required
+        // whose array still carries a NULL must error, not decode to 0.
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, true)]));
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+        let batch = RecordBatch::try_new(schema, vec![column]).expect("batch");
+        assert!(matches!(
+            required_column::<Int64Type>(&batch, "ts"),
+            Err(CodecError::NullInRequiredColumn { name: "ts" })
+        ));
+    }
 }
 
 /// What a section decode processed, for the caller to export as metrics.
@@ -526,21 +617,30 @@ fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize, usize
 /// Decode a Parquet section body, calling `push_rows` for each read batch.
 ///
 /// Takes a [`VerifiedSection`] so the CRC-before-decode boundary is in the type.
-/// Streams: each batch is dropped after `push_rows`, so peak memory is one batch
-/// plus the decoded rows, both bounded by [`MAX_SECTION_ROWS`]. The caller's
-/// closure only extracts columns and appends rows, so a generated codec cannot
-/// omit a cap.
+/// The file schema is validated against `contract` (column set, order, type,
+/// nullability) before any rows are read — the same check
+/// [`decode_batches`] runs — so the typed `Section::decode` and the
+/// registry-driven [`decode_any`](crate::decode_any) accept and reject the same
+/// bytes. Streams: each batch is dropped after `push_rows`, so peak memory is one
+/// batch plus the decoded rows, both bounded by [`MAX_SECTION_ROWS`]. The
+/// caller's closure only extracts columns and appends rows, so a generated codec
+/// cannot omit a cap.
 ///
 /// # Errors
 ///
 /// [`CodecError::SectionTooLarge`], [`CodecError::TooManyRowGroups`], or
-/// [`CodecError::TooManyRows`] if a bound is exceeded; [`CodecError::Parquet`]
-/// on malformed Parquet; whatever `push_rows` returns on a contract mismatch.
+/// [`CodecError::TooManyRows`] if a bound is exceeded; [`CodecError::SchemaMismatch`]
+/// if the file does not match `contract`; [`CodecError::Parquet`] on malformed
+/// Parquet; whatever `push_rows` returns.
 pub fn decode_section<Row>(
+    contract: &TypeContract,
     section: VerifiedSection,
     mut push_rows: impl FnMut(&RecordBatch, &mut Vec<Row>) -> Result<(), CodecError>,
 ) -> Result<Vec<Row>, CodecError> {
     let (reader, _row_groups, claimed_rows) = capped_reader(section.into_bytes())?;
+    if !schema_matches(&reader.schema(), contract) {
+        return Err(CodecError::SchemaMismatch);
+    }
     // Preallocate from the claimed count (capped at `MAX_SECTION_ROWS`); the
     // typed gather pushes one row per source row, so this avoids the reallocs.
     let mut rows = Vec::with_capacity(claimed_rows);
@@ -580,15 +680,7 @@ pub fn decode_batches(
     let bytes_in = bytes.len();
     let (reader, row_groups, claimed_rows) = capped_reader(bytes)?;
 
-    let want = arrow_schema(contract);
-    let got = reader.schema();
-    let schema_matches = got.fields().len() == want.fields().len()
-        && got.fields().iter().zip(want.fields()).all(|(g, w)| {
-            g.name() == w.name()
-                && g.data_type() == w.data_type()
-                && g.is_nullable() == w.is_nullable()
-        });
-    if !schema_matches {
+    if !schema_matches(&reader.schema(), contract) {
         return Err(CodecError::SchemaMismatch);
     }
 

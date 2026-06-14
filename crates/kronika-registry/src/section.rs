@@ -11,10 +11,12 @@ use crate::contract::TypeContract;
 
 /// A section type: its registry contract plus the Parquet codec for its rows.
 ///
-/// Implemented only by `#[derive(Section)]` inside this crate, so every
-/// implementor's [`CONTRACT`](Section::CONTRACT) is valid by construction (the
-/// derive routes the id through the crate-private `TypeId` constructor).
-pub trait Section: Sized {
+/// Sealed: the supertrait is crate-private and only this crate's
+/// `#[derive(Section)]` emits it, so `T: Section` always means a registry type
+/// whose [`CONTRACT`](Section::CONTRACT) is valid by construction (the derive
+/// routes the id through the crate-private `TypeId` constructor). A downstream
+/// crate cannot implement it to forge a codec for an existing contract.
+pub trait Section: crate::sealed::Sealed + Sized {
     /// The registry contract for this type.
     const CONTRACT: TypeContract;
 

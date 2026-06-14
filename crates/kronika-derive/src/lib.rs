@@ -98,6 +98,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let decode = build_decode(struct_name, &columns);
 
     Ok(quote! {
+        impl ::kronika_registry::sealed::Sealed for #struct_name {}
+
         impl ::kronika_registry::Section for #struct_name {
             #contract
 
@@ -105,8 +107,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 ::std::vec::Vec<u8>,
                 ::kronika_registry::CodecError,
             > {
+                // Reject an over-cap slice before materializing any column, so the
+                // memory bound holds before the allocation, not after.
+                ::kronika_registry::check_row_cap(rows.len())?;
                 let columns = #encode;
-                ::kronika_registry::encode_section(&Self::CONTRACT, rows.len(), columns)
+                ::kronika_registry::encode_section(&Self::CONTRACT, columns)
             }
 
             fn decode(section: ::kronika_registry::VerifiedSection) -> ::core::result::Result<
@@ -423,7 +428,7 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
     });
 
     quote! {
-        ::kronika_registry::decode_section(section, |#batch, #out| {
+        ::kronika_registry::decode_section(&Self::CONTRACT, section, |#batch, #out| {
             #( #bindings )*
             for #idx in 0..#batch.num_rows() {
                 #out.push(#struct_name { #( #cells ),* });
