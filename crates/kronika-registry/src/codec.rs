@@ -124,6 +124,17 @@ pub enum CodecError {
         /// The CRC computed over the bytes.
         got: u32,
     },
+    /// A decode failed for a known `type_id`: wraps the underlying error with
+    /// the label and input size a failure metric needs (the error path has no
+    /// [`DecodeStats`]).
+    Section {
+        /// The section's `type_id`.
+        type_id: u32,
+        /// Input section bytes.
+        bytes_in: usize,
+        /// The underlying decode error.
+        source: Box<Self>,
+    },
 }
 
 impl fmt::Display for CodecError {
@@ -161,6 +172,11 @@ impl fmt::Display for CodecError {
                     "section CRC {got:#010x} does not match the catalog's {expected:#010x}"
                 )
             }
+            Self::Section {
+                type_id,
+                bytes_in,
+                source,
+            } => write!(f, "decoding type {type_id} ({bytes_in} bytes): {source}"),
         }
     }
 }
@@ -180,6 +196,7 @@ impl Error for CodecError {
             | Self::UnknownType { .. }
             | Self::SchemaMismatch
             | Self::SectionCrcMismatch { .. } => None,
+            Self::Section { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -344,6 +361,18 @@ impl VerifiedSection {
     pub fn into_bytes(self) -> Bytes {
         self.0
     }
+
+    /// The section byte length.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the section is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +402,9 @@ mod verified_section_tests {
 /// (per `type_id`: section size, row and batch counts) at its own layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeStats {
+    /// The decoded section's `type_id` — the metric label, present on success
+    /// (the failure label is on [`CodecError::Section`]).
+    pub type_id: u32,
     /// Input section bytes.
     pub bytes_in: usize,
     /// Parquet row groups read.
@@ -526,6 +558,7 @@ pub fn decode_batches(
         batches.push(batch);
     }
     let stats = DecodeStats {
+        type_id: contract.type_id.get(),
         bytes_in,
         row_groups,
         batches: batches.len(),

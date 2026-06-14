@@ -31,6 +31,8 @@ pub use contract::{
 };
 pub use pool::BytesPool;
 pub use section::Section;
+#[cfg(test)]
+pub(crate) use section::assert_roundtrips;
 pub use type_id::{SectionClass, TypeId};
 
 // One `Bytes` for the decode API and the generated codecs to name.
@@ -82,14 +84,43 @@ pub const fn registry() -> &'static [TypeContract] {
 ///
 /// # Errors
 ///
-/// [`CodecError::UnknownType`] if no registered type has `type_id`; otherwise
-/// the errors of [`decode_batches`], including every memory-bound cap.
+/// [`CodecError::UnknownType`] if no registered type has `type_id`; otherwise a
+/// [`CodecError::Section`] wrapping the underlying decode error with `type_id`
+/// and `bytes_in`, so a failure carries the same label as [`DecodeStats`] does
+/// on success.
 pub fn decode_any(type_id: u32, section: VerifiedSection) -> Result<DecodedSection, CodecError> {
     let contract = registry()
         .iter()
         .find(|contract| contract.type_id.get() == type_id)
         .ok_or(CodecError::UnknownType { type_id })?;
-    decode_batches(contract, section)
+    let bytes_in = section.len();
+    decode_batches(contract, section).map_err(|source| CodecError::Section {
+        type_id,
+        bytes_in,
+        source: Box::new(source),
+    })
+}
+
+/// Decode a section read into a pooled buffer — the reader's hot path.
+///
+/// `fill` writes the section bytes into a buffer borrowed from `pool` (reused
+/// across calls, so a steady decode loop does not allocate per section); the
+/// bytes are CRC-verified ([`VerifiedSection::verify`], `crc32c` and
+/// `expected_crc` from the catalog) and dispatched through [`decode_any`].
+///
+/// # Errors
+///
+/// [`CodecError::SectionCrcMismatch`] on a CRC mismatch; otherwise the errors of
+/// [`decode_any`].
+pub fn decode_pooled(
+    pool: &BytesPool,
+    type_id: u32,
+    expected_crc: u32,
+    crc32c: impl FnOnce(&[u8]) -> u32,
+    fill: impl FnOnce(&mut Vec<u8>),
+) -> Result<DecodedSection, CodecError> {
+    let section = VerifiedSection::verify(pool.load(fill), expected_crc, crc32c)?;
+    decode_any(type_id, section)
 }
 
 /// Run the registry linter over every known type.
@@ -109,8 +140,8 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        CodecError, VerifiedSection, arrow_schema, decode_any, encode_section, lint_registry,
-        registry,
+        BytesPool, CodecError, VerifiedSection, arrow_schema, decode_any, decode_pooled,
+        encode_section, lint_registry, registry,
     };
 
     #[test]
@@ -140,6 +171,7 @@ mod tests {
             let id = contract.type_id.get();
             let decoded =
                 decode_any(id, VerifiedSection::for_test(bytes.into())).expect("decode_any");
+            assert_eq!(decoded.stats.type_id, id, "stats carries the type_id");
             assert_eq!(
                 decoded.stats.rows, 0,
                 "type {id} should decode to zero rows"
@@ -149,6 +181,27 @@ mod tests {
                 "stats.bytes_in matches input"
             );
         }
+    }
+
+    #[test]
+    fn decode_pooled_reads_into_a_pooled_buffer_and_decodes() {
+        let pool = BytesPool::new(2, 1 << 20);
+        let contract = &registry()[0];
+        let id = contract.type_id.get();
+        let columns: Vec<ArrayRef> = arrow_schema(contract)
+            .fields()
+            .iter()
+            .map(|field| new_empty_array(field.data_type()))
+            .collect();
+        let encoded = encode_section(contract, 0, columns).expect("encode empty section");
+        // Stand-in crc = byte length; the real reader injects kronika-format's.
+        let crc = |b: &[u8]| u32::try_from(b.len()).unwrap_or(u32::MAX);
+        let expected = crc(&encoded);
+        let decoded = decode_pooled(&pool, id, expected, crc, |buf| {
+            buf.extend_from_slice(&encoded);
+        })
+        .expect("decode_pooled");
+        assert_eq!(decoded.stats.type_id, id);
     }
 
     #[test]

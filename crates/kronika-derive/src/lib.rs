@@ -9,6 +9,12 @@
 //! live once in `kronika_registry::codec`; the generated code only supplies
 //! one column builder/reader per field.
 //!
+//! Column types are matched by their written name (a derive macro sees tokens,
+//! not resolved types): `i8`…`i64`, `u8`…`u64`, `f32`/`f64`, `bool`, `Ts`,
+//! `StrId`, and `Option<…>`. `Ts` and `StrId` must appear under their canonical
+//! names — an alias such as `use Ts as Timestamp` is not recognized and is
+//! rejected as an unsupported type.
+//!
 //! ```ignore
 //! #[derive(Section)]
 //! #[section(id = 1_006_001, name = "pg_stat_bgwriter", semantics = snapshot_full, sort_key("ts"))]
@@ -376,8 +382,12 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
     let bindings = columns.iter().zip(&cols).map(|(c, col)| {
         let name = &c.name;
         match (&c.arrow_type, c.nullable) {
+            // Required primitive: rebind to the values slice, so the row loop
+            // gathers by `slice[i]` (one bounds-check the optimizer can hoist)
+            // instead of `PrimitiveArray::value(i)` per cell.
             (Some(at), false) => quote! {
                 let #col = ::kronika_registry::required_column::<::kronika_registry::#at>(#batch, #name)?;
+                let #col = #col.values();
             },
             (Some(at), true) => quote! {
                 let #col = ::kronika_registry::nullable_column::<::kronika_registry::#at>(#batch, #name)?;
@@ -394,11 +404,12 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
     let cells = columns.iter().zip(&cols).map(|(c, col)| {
         let field = &c.field;
         let value = match (&c.wrapper, &c.arrow_type, c.nullable) {
-            (Some(w), _, false) => quote! { ::kronika_registry::#w(#col.value(#idx)) },
+            (Some(w), _, false) => quote! { ::kronika_registry::#w(#col[#idx]) },
             (Some(w), _, true) => quote! {
                 ::kronika_registry::opt_primitive(#col, #idx).map(::kronika_registry::#w)
             },
-            (None, Some(_) | None, false) => quote! { #col.value(#idx) },
+            (None, Some(_), false) => quote! { #col[#idx] },
+            (None, None, false) => quote! { #col.value(#idx) },
             (None, Some(_), true) => quote! { ::kronika_registry::opt_primitive(#col, #idx) },
             (None, None, true) => quote! { ::kronika_registry::opt_bool(#col, #idx) },
         };

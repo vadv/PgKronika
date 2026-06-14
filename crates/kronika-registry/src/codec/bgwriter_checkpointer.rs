@@ -196,11 +196,7 @@ mod tests {
     #[test]
     fn roundtrip_preserves_values_and_nulls() {
         // One section may contain rows from both PostgreSQL layouts.
-        let rows = vec![pg16_row(1_000_000), pg17_row(2_000_000)];
-        let bytes = BgwriterCheckpointer::encode(&rows).expect("encode");
-        let decoded =
-            BgwriterCheckpointer::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
-        assert_eq!(decoded, rows);
+        crate::assert_roundtrips(&[pg16_row(1_000_000), pg17_row(2_000_000)]);
     }
 
     #[test]
@@ -210,6 +206,7 @@ mod tests {
         let bytes_in = bytes.len();
         let decoded = crate::decode_any(1_006_001, VerifiedSection::for_test(bytes.into()))
             .expect("decode_any");
+        assert_eq!(decoded.stats.type_id, 1_006_001);
         assert_eq!(decoded.stats.rows, 2);
         assert_eq!(decoded.stats.bytes_in, bytes_in);
         assert_eq!(decoded.stats.batches, decoded.batches.len());

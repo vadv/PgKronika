@@ -44,3 +44,16 @@ pub trait Section: Sized {
     /// [`CONTRACT`](Section::CONTRACT).
     fn decode(section: VerifiedSection) -> Result<Vec<Self>, CodecError>;
 }
+
+/// Encode `rows`, decode the section back, and assert they roundtrip — the
+/// shared codec test the trait exists to enable, so each type's test is one
+/// line, not a hand-written encode/decode.
+#[cfg(test)]
+pub(crate) fn assert_roundtrips<T>(rows: &[T])
+where
+    T: Section + PartialEq + std::fmt::Debug,
+{
+    let bytes = T::encode(rows).expect("encode");
+    let decoded = T::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
+    assert_eq!(decoded.as_slice(), rows);
+}
