@@ -116,8 +116,8 @@ pub enum Semantics {
 /// construction (its constructor is crate-private); the rest of a contract
 /// (sort key names match columns, a `Changed` type has `is_baseline`, …) is
 /// checked by [`lint`], not the type system, so a hand-built contract can be
-/// internally inconsistent until it passes the linter. The authoritative set
-/// of contracts is [`registry`](crate::registry).
+/// internally inconsistent until it passes the linter. The registry table is
+/// [`registry`](crate::registry).
 #[derive(Debug, Clone, Copy)]
 pub struct TypeContract {
     /// The type id this contract describes.

@@ -40,7 +40,7 @@ the window nor the flushed entries.
 
 ## Journal
 
-`Journal` appends mini-PGM parts as `PGMP` frames and syncs each frame before
+`Journal` appends PGM parts as `PGMP` frames and syncs each frame before
 returning. Opening an existing journal runs the recovery scan.
 
 Recovery streams the file frame by frame: peak memory is one part plus its

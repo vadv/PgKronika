@@ -1,10 +1,10 @@
-# PgKronika — instructions for Claude
+# PgKronika agent instructions
 
-## Mandatory review rule: memory bounds (OOM check)
+## Standing Review Rule: Memory Bounds
 
-Every review of a diff — manual or multi-agent — MUST include a memory-bounds
-check. This is not optional and applies to every PR. The collector runs on the
-database host; an OOM there is worse than a lost segment.
+Every diff review, manual or automated, must include a memory-bounds check.
+The collector runs on the database host; an out-of-memory failure there is
+worse than a lost segment.
 
 For each new or changed code path the review must answer:
 
@@ -24,18 +24,16 @@ For each new or changed code path the review must answer:
    memory", the review must check that this is literally true, including
    per-item directories, clones, and growth slack.
 
-Multi-agent (adversarial) review workflows must include a dedicated
-memory-bounds reviewer dimension alongside bugs/spec/tests, and findings
-should be verified empirically (allocation counting, pathological inputs)
-where practical.
+Independent review workflows must include a dedicated memory-bounds pass
+alongside bugs, spec, and tests. Verify findings with allocation counting or
+pathological inputs where practical.
 
-## Mandatory review rule: comment quality
+## Standing Review Rule: Comment Quality
 
-Every review of a diff — manual or multi-agent — and every pre-commit pass MUST
-include a comment-quality check, with the same standing as the OOM check. Apply
-the `code-comments` skill (`.claude/skills/code-comments/`); invoke it whenever
-writing or reviewing comments. A comment that restates the code is a defect to
-delete, not decoration to keep.
+Every diff review and pre-commit pass must include a comment-quality check,
+with the same standing as the memory-bounds check. Apply the local
+`code-comments` rules whenever writing or reviewing comments. A comment that
+only restates the code is a defect to delete, not decoration to keep.
 
 For every comment and doc-comment in the diff the review must answer:
 
@@ -53,8 +51,8 @@ For every comment and doc-comment in the diff the review must answer:
    give `# Errors`/`# Panics`/bounds and what the caller can rely on — not a
    narration of the implementation, which is free to change.
 
-Multi-agent (adversarial) review workflows must include a dedicated
-comment-quality reviewer dimension alongside bugs/spec/tests/memory-bounds.
+Independent review workflows must include a dedicated comment-quality pass
+alongside bugs, spec, tests, and memory bounds.
 
 ## Other standing gates
 

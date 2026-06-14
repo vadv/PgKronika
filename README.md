@@ -44,14 +44,15 @@ catalog for range reads.
 ```text
 bins/      command binaries
 crates/    internal Rust crates
-docs/      design documents
+docs/      design notes and archive material
 xtask/     workspace maintenance commands
 ```
 
-The `docs/` directory keeps design notes and history. Implemented behavior is
-documented next to the code: crate README files, rustdoc, and tests.
+Implemented behavior is documented next to the code: crate README files,
+rustdoc, and tests. The `docs/` directory is kept for design history while the
+implementation is still moving.
 
-Useful design notes:
+Current design notes:
 
 - [`docs/architecture.md`](docs/architecture.md) describes the processes,
   deployment shapes, workspace layout, and versioning rules.
@@ -74,10 +75,10 @@ cargo check --workspace
 cargo run -p xtask -- check-deps
 ```
 
-`check-deps` enforces the architectural dependency rules between binaries and
-internal crates. For example, S3 code must not become reachable from the
-collector, and PostgreSQL source code must not become reachable from the web
-process.
+`check-deps` enforces architectural dependency rules between binaries and
+internal crates. For example, storage-backend code must not become reachable
+from the collector, and PostgreSQL source code must not become reachable from
+the web process.
 
 Implementation is moving crate by crate: format primitives first, then writer
 state, type registry, collectors, and finally the serving binaries.

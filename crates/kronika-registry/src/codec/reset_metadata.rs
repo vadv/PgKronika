@@ -1,10 +1,11 @@
 //! Type `1_020_001`: `reset_metadata`, the per-segment counter-reset context
 //! (README.md, "Service Sections").
 //!
-//! Mandatory in every segment. Not a chart metric — context for the diff
-//! engine: it lets the reader tell a real counter reset (`PostgreSQL` restart,
-//! `pg_stat_reset()`) from data loss, and records which extensions and GUCs were
-//! present so version-dependent columns and `NULL`s stay interpretable.
+//! Mandatory in every segment. This is not a chart metric; it is context for
+//! counter diffs. It lets the reader separate a real counter reset
+//! (`PostgreSQL` restart, `pg_stat_reset()`) from data loss, and records which
+//! extensions and GUCs were present so version-dependent columns and `NULL`s
+//! remain interpretable.
 //!
 //! A view that exposes its own `stats_reset` carries it in its own section, per
 //! row, so a mid-segment reset is visible there (see `bgwriter_stats_reset` in
