@@ -54,7 +54,7 @@ pub struct InstanceMetadata {
 #[cfg(test)]
 mod tests {
     use super::InstanceMetadata;
-    use crate::{Section, StrId, Ts, lint};
+    use crate::{Section, StrId, Ts, VerifiedSection, lint};
 
     fn row() -> InstanceMetadata {
         InstanceMetadata {
@@ -80,7 +80,8 @@ mod tests {
     fn roundtrip_preserves_values() {
         let rows = vec![row()];
         let bytes = InstanceMetadata::encode(&rows).expect("encode");
-        let decoded = InstanceMetadata::decode(bytes.into()).expect("decode");
+        let decoded =
+            InstanceMetadata::decode(VerifiedSection::verified(bytes.into())).expect("decode");
         assert_eq!(decoded, rows);
     }
 }

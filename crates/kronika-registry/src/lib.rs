@@ -21,9 +21,9 @@ mod type_id;
 
 pub use codec::{
     CodecError, DecodeStats, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
-    arrow_schema, decode_batches, decode_section, encode_section, nullable_bool, nullable_column,
-    opt_bool, opt_primitive, required_bool, required_column, write_bool, write_bool_nullable,
-    write_nullable, write_required,
+    VerifiedSection, arrow_schema, decode_batches, decode_section, encode_section, nullable_bool,
+    nullable_column, opt_bool, opt_primitive, required_bool, required_column, write_bool,
+    write_bool_nullable, write_nullable, write_required,
 };
 pub use codec::{bgwriter_checkpointer, instance_metadata, reset_metadata};
 pub use contract::{
@@ -74,24 +74,22 @@ pub const fn registry() -> &'static [TypeContract] {
 /// a perfect-hash lookup would replace it if the registry grows to hundreds of
 /// types.
 ///
-/// Integrity is the caller's responsibility: this does not verify the section
-/// CRC. Pass bytes already checked against the catalog — the part scanner
-/// (`kronika-format` `validate_part`) does this before a section is located, so
-/// the regular read path is covered. The type-enforced verified-bytes boundary
-/// belongs to the reader, not the codec (README.md, "Memory Bounds").
+/// Integrity is in the type: it takes a [`VerifiedSection`], so raw bytes cannot
+/// reach the Parquet parser by accident. The CRC is checked against the catalog
+/// (`kronika-format` `validate_part`) before the bytes are wrapped; the check
+/// itself stays at the container layer, and forged segments are outside the
+/// protection model (README.md, "Memory Bounds").
 ///
 /// # Errors
 ///
 /// [`CodecError::UnknownType`] if no registered type has `type_id`; otherwise
 /// the errors of [`decode_batches`], including every memory-bound cap.
-// TODO(reader): take a verified-section handle once the reader crate exists, so
-// raw bytes cannot reach the Parquet page-header parser by mistake.
-pub fn decode_any(type_id: u32, bytes: Bytes) -> Result<DecodedSection, CodecError> {
+pub fn decode_any(type_id: u32, section: VerifiedSection) -> Result<DecodedSection, CodecError> {
     let contract = registry()
         .iter()
         .find(|contract| contract.type_id.get() == type_id)
         .ok_or(CodecError::UnknownType { type_id })?;
-    decode_batches(contract, bytes)
+    decode_batches(contract, section)
 }
 
 /// Run the registry linter over every known type.
@@ -110,7 +108,10 @@ mod tests {
     use arrow_array::array::new_empty_array;
     use bytes::Bytes;
 
-    use super::{CodecError, arrow_schema, decode_any, encode_section, lint_registry, registry};
+    use super::{
+        CodecError, VerifiedSection, arrow_schema, decode_any, encode_section, lint_registry,
+        registry,
+    };
 
     #[test]
     fn the_registry_is_clean() {
@@ -137,7 +138,8 @@ mod tests {
             let bytes = encode_section(contract, 0, columns).expect("encode empty section");
             let bytes_in = bytes.len();
             let id = contract.type_id.get();
-            let decoded = decode_any(id, bytes.into()).expect("decode_any");
+            let decoded =
+                decode_any(id, VerifiedSection::verified(bytes.into())).expect("decode_any");
             assert_eq!(
                 decoded.stats.rows, 0,
                 "type {id} should decode to zero rows"
@@ -154,7 +156,7 @@ mod tests {
         // Structurally valid (class 2, source 999, version 999) but not in the
         // registry, so the dispatch must reject it rather than decode garbage.
         assert!(matches!(
-            decode_any(2_999_999, Bytes::new()),
+            decode_any(2_999_999, VerifiedSection::verified(Bytes::new())),
             Err(CodecError::UnknownType { type_id: 2_999_999 })
         ));
     }

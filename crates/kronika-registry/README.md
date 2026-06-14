@@ -114,13 +114,13 @@ the contract. It needs no concrete type and no per-type `match`, so a new sectio
 type costs one `registry()` entry and is decodable immediately — the property
 that lets the registry grow to hundreds of types without per-type wiring.
 
-`decode` and `decode_any` take owned `Bytes` and never copy the section — the
-Parquet reader slices it in place. A reader holds the segment once (mmap or one
-read) and hands each section a zero-copy slice; a streaming source can reuse
-buffers through `BytesPool`, which returns a buffer to itself when the decoded
-`Bytes` is dropped, so a steady decode loop does not allocate per section. The
-pool covers only the input buffer; the decompressed and Arrow data are inherently
-fresh.
+`decode` and `decode_any` take a `VerifiedSection` — owned `Bytes` whose CRC was
+checked against the catalog — and never copy the section: the Parquet reader
+slices it in place. A reader holds the segment once (mmap or one read) and hands
+each section a zero-copy slice; a streaming source can reuse buffers through
+`BytesPool`, which returns a buffer to itself when the decoded `Bytes` is
+dropped, so a steady decode loop does not allocate per section. The pool covers
+only the input buffer; the decompressed and Arrow data are inherently fresh.
 
 The `Section` trait is public; the `#[derive(Section)]` macro is not. Every
 section type lives in this crate (the derive routes ids through the
@@ -189,12 +189,13 @@ regularly sampled single-row sources produce in one segment; they limit writer
 bugs and malformed sections, not normal data.
 
 One risk remains in Parquet decoding itself: a valid-size page can request a
-large buffer from its page header, which the byte cap does not bound. `decode`
-therefore assumes CRC-verified bytes: the part scanner (`kronika-format`
-`validate_part`) checks each section's CRC against the catalog before its bytes
-are located, so the regular read path is covered. A tool decoding raw bytes must
-verify first. This catches media corruption; fully forged segments are outside
-the protection model of the format.
+large buffer from its page header, which the byte cap does not bound. The decode
+entry points therefore take a `VerifiedSection`, not raw bytes: the part scanner
+(`kronika-format` `validate_part`) checks each section's CRC against the catalog
+and wraps the bytes, so unverified bytes cannot reach the parser by accident.
+The CRC check stays at the container layer — `VerifiedSection::verified` is the
+deliberate assertion that it happened. This catches media corruption; fully
+forged segments are outside the protection model of the format.
 
 ## Tests
 

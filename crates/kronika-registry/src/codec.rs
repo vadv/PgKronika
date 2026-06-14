@@ -283,6 +283,33 @@ pub fn encode_section(
 
 // ---- Decode runtime --------------------------------------------------------
 
+/// Section bytes whose CRC has been checked against the catalog.
+///
+/// The decode entry points take this, not raw `Bytes`, so the CRC-before-decode
+/// boundary is in the type: a caller cannot pass unverified bytes to the Parquet
+/// page-header parser by accident. It is a marker, not a crypto gate — the CRC
+/// is computed at the container layer (`kronika-format` `validate_part`), which
+/// wraps the bytes once a section is located. [`verified`](VerifiedSection::verified)
+/// is the deliberate "these bytes are catalog-verified" assertion; forged
+/// segments remain outside the protection model (README.md, "Memory Bounds").
+#[derive(Clone, Debug)]
+pub struct VerifiedSection(Bytes);
+
+impl VerifiedSection {
+    /// Assert that `bytes` had their CRC checked against the catalog — the part
+    /// scanner does this before a section is located — and wrap them for decode.
+    #[must_use]
+    pub const fn verified(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+
+    /// Unwrap the verified bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
+}
+
 /// What a section decode processed, for the caller to export as metrics.
 ///
 /// The codec stays free of `tracing`; the reader turns these into RED metrics
@@ -362,10 +389,11 @@ fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize, usize
 
 /// Decode a Parquet section body, calling `push_rows` for each read batch.
 ///
-/// Streams: each batch is dropped after `push_rows`, so peak memory is one
-/// batch plus the decoded rows, both bounded by [`MAX_SECTION_ROWS`]. The
-/// caller's closure only extracts columns and appends rows, so a generated
-/// codec cannot omit a cap.
+/// Takes a [`VerifiedSection`] so the CRC-before-decode boundary is in the type.
+/// Streams: each batch is dropped after `push_rows`, so peak memory is one batch
+/// plus the decoded rows, both bounded by [`MAX_SECTION_ROWS`]. The caller's
+/// closure only extracts columns and appends rows, so a generated codec cannot
+/// omit a cap.
 ///
 /// # Errors
 ///
@@ -373,10 +401,10 @@ fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize, usize
 /// [`CodecError::TooManyRows`] if a bound is exceeded; [`CodecError::Parquet`]
 /// on malformed Parquet; whatever `push_rows` returns on a contract mismatch.
 pub fn decode_section<Row>(
-    bytes: Bytes,
+    section: VerifiedSection,
     mut push_rows: impl FnMut(&RecordBatch, &mut Vec<Row>) -> Result<(), CodecError>,
 ) -> Result<Vec<Row>, CodecError> {
-    let (reader, _row_groups, claimed_rows) = capped_reader(bytes)?;
+    let (reader, _row_groups, claimed_rows) = capped_reader(section.into_bytes())?;
     // Preallocate from the claimed count (capped at `MAX_SECTION_ROWS`); the
     // typed gather pushes one row per source row, so this avoids the reallocs.
     let mut rows = Vec::with_capacity(claimed_rows);
@@ -407,7 +435,11 @@ pub fn decode_section<Row>(
 /// [`CodecError::SectionTooLarge`], [`CodecError::TooManyRowGroups`], or
 /// [`CodecError::TooManyRows`] on a bound; [`CodecError::SchemaMismatch`] if the
 /// file does not match `contract`; [`CodecError::Parquet`] on malformed Parquet.
-pub fn decode_batches(contract: &TypeContract, bytes: Bytes) -> Result<DecodedSection, CodecError> {
+pub fn decode_batches(
+    contract: &TypeContract,
+    section: VerifiedSection,
+) -> Result<DecodedSection, CodecError> {
+    let bytes = section.into_bytes();
     let bytes_in = bytes.len();
     let (reader, row_groups, claimed_rows) = capped_reader(bytes)?;
 
@@ -556,7 +588,7 @@ pub fn opt_bool(array: &BooleanArray, i: usize) -> Option<bool> {
 
 #[cfg(test)]
 mod hygiene_tests {
-    use crate::{Section, StrId, Ts};
+    use crate::{Section, StrId, Ts, VerifiedSection};
 
     // Fields named like the identifiers the generated decode uses internally
     // (`batch`, `out`, `i`), and fields named exactly like the in-scope value
@@ -617,6 +649,9 @@ mod hygiene_tests {
             },
         ];
         let bytes = Weird::encode(&want).expect("encode");
-        assert_eq!(Weird::decode(bytes.into()).expect("decode"), want);
+        assert_eq!(
+            Weird::decode(VerifiedSection::verified(bytes.into())).expect("decode"),
+            want
+        );
     }
 }
