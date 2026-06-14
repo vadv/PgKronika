@@ -1,6 +1,6 @@
 //! Per-segment string interner.
 //!
-//! The interner keeps enough bytes to build mini-PGM parts without retaining
+//! The interner keeps enough bytes to build PGM parts without retaining
 //! every string until segment completion. It uses two stores:
 //!
 //! - the **window**: a [`SegmentDicts`] with full bytes for values first seen
@@ -122,9 +122,9 @@ pub struct FlushedEntry {
 pub struct Interner {
     window: SegmentDicts,
     /// Identities of values already in the journal: ~48 bytes per distinct
-    /// id (plus map overhead) until `seal()`. The count is driven by the
-    /// seal cadence — the journal cap (`JournalError::Full`) forces a merge
-    /// before the journal, and with it this map, can grow without limit.
+    /// id (plus map overhead) until `seal()`. The journal cap
+    /// (`JournalError::Full`) forces a merge before the journal, and with it
+    /// this map, can grow without limit.
     flushed: HashMap<StrId, Flushed>,
     /// Bytes of strict-hot values inserted into every window.
     ///
@@ -196,7 +196,7 @@ impl Interner {
         Ok(id)
     }
 
-    /// Intern a value that should be added to `dict.hot_strings` when possible.
+    /// Intern a value and try to add it to `dict.hot_strings`.
     ///
     /// Returns the id and whether the value is hot after this call. Large or
     /// blob-forced values keep their normal placement and return `false`.

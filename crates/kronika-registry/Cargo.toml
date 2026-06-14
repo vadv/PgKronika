@@ -1,6 +1,6 @@
 [package]
 name = "kronika-registry"
-description = "pgKronika internal crate"
+description = "Section type ids, schemas, contracts, and codecs"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -9,6 +9,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-derive = { path = "../kronika-derive" }
+arrow-array = "55"
+arrow-schema = "55"
+bytes = "1"
+parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
 
 [lints]
 workspace = true

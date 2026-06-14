@@ -1,10 +1,10 @@
-# PgKronika — instructions for Claude
+# PgKronika agent instructions
 
-## Mandatory review rule: memory bounds (OOM check)
+## Standing Review Rule: Memory Bounds
 
-Every review of a diff — manual or multi-agent — MUST include a memory-bounds
-check. This is not optional and applies to every PR. The collector runs on the
-database host; an OOM there is worse than a lost segment.
+Every diff review, manual or automated, must include a memory-bounds check.
+The collector runs on the database host; an out-of-memory failure there is
+worse than a lost segment.
 
 For each new or changed code path the review must answer:
 
@@ -24,10 +24,35 @@ For each new or changed code path the review must answer:
    memory", the review must check that this is literally true, including
    per-item directories, clones, and growth slack.
 
-Multi-agent (adversarial) review workflows must include a dedicated
-memory-bounds reviewer dimension alongside bugs/spec/tests, and findings
-should be verified empirically (allocation counting, pathological inputs)
-where practical.
+Independent review workflows must include a dedicated memory-bounds pass
+alongside bugs, spec, and tests. Verify findings with allocation counting or
+pathological inputs where practical.
+
+## Standing Review Rule: Comment Quality
+
+Every diff review and pre-commit pass must include a comment-quality check,
+with the same standing as the memory-bounds check. Apply the local
+`code-comments` rules whenever writing or reviewing comments. A comment that
+only restates the code is a defect to delete, not decoration to keep.
+
+For every comment and doc-comment in the diff the review must answer:
+
+1. **Does it say something the code does not?** A comment that paraphrases the
+   next line is the *what* — delete it. A comment earns its place only by
+   carrying what the code cannot: rationale, an invariant the types don't
+   enforce, a trade-off, a footgun, or a pointer to the contract.
+2. **Will it survive a plausible refactor?** Line-by-line narration goes stale
+   when the code moves. Rewrite to durable intent, or — better — extract a
+   named function so the name carries the meaning the compiler can check.
+3. **Is it terse and at the right density?** No `// Note that`, no preamble, no
+   restating the function name. Dense mechanical code gets no per-line
+   commentary; the one subtle line gets one.
+4. **Do doc-comments state the contract, not the body?** Public `///` items
+   give `# Errors`/`# Panics`/bounds and what the caller can rely on — not a
+   narration of the implementation, which is free to change.
+
+Independent review workflows must include a dedicated comment-quality pass
+alongside bugs, spec, tests, and memory bounds.
 
 ## Other standing gates
 

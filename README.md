@@ -9,8 +9,8 @@ segments for humans and agents through a web UI, MCP, and JSON API. Optional S3
 archiving is handled by a separate process so cloud credentials do not enter the
 privileged collector.
 
-The project is in the design and skeleton stage. There is no usable monitoring
-product yet.
+The project is still early: the format, writer, and registry crates are being
+built first. There is no usable monitoring product yet.
 
 ## Goals
 
@@ -44,14 +44,15 @@ catalog for range reads.
 ```text
 bins/      command binaries
 crates/    internal Rust crates
-docs/      design documents
+docs/      design notes and archive material
 xtask/     workspace maintenance commands
 ```
 
-The `docs/` directory keeps design notes and history. Implemented behavior is
-documented next to the code: crate README files, rustdoc, and tests.
+Implemented behavior is documented next to the code: crate README files,
+rustdoc, and tests. The `docs/` directory is kept for design history while the
+implementation is still moving.
 
-Useful design notes:
+Current design notes:
 
 - [`docs/architecture.md`](docs/architecture.md) describes the processes,
   deployment shapes, workspace layout, and versioning rules.
@@ -74,14 +75,13 @@ cargo check --workspace
 cargo run -p xtask -- check-deps
 ```
 
-`check-deps` enforces the architectural dependency rules between binaries and
-internal crates. For example, S3 code must not become reachable from the
-collector, and PostgreSQL source code must not become reachable from the web
-process.
+`check-deps` enforces architectural dependency rules between binaries and
+internal crates. For example, storage-backend code must not become reachable
+from the collector, and PostgreSQL source code must not become reachable from
+the web process.
 
-The repository currently contains only the workspace skeleton and documentation.
-Implementation starts with the format crate and grows through the vertical slice
-described in [`docs/plan.md`](docs/plan.md).
+Implementation is moving crate by crate: format primitives first, then writer
+state, type registry, collectors, and finally the serving binaries.
 
 ## License
 

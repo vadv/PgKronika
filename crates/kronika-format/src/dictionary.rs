@@ -27,8 +27,7 @@ use crate::StrId;
 
 /// Default boundary between `dict.strings` and `dict.blobs`, bytes.
 ///
-/// This is a starting value. It should be finalized after measuring real
-/// segment data.
+/// Starting value. Finalize it after measuring real segment data.
 pub const DEFAULT_BLOB_THRESHOLD: usize = 4 * 1024;
 
 /// Default truncation limit for large values, bytes. A starting value,
@@ -37,7 +36,7 @@ pub const DEFAULT_TRUNCATE_LIMIT: usize = 1024 * 1024;
 
 /// Default cap on the total stored bytes of one dictionary set. A starting
 /// value sized to match the default `active.parts` frame limit: a window
-/// that hits this cap is flushed into one mini-part.
+/// that hits this cap is flushed into one journal part.
 pub const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 /// Size limits used while building dictionaries.
@@ -179,7 +178,7 @@ pub enum DictError {
     /// [`DictLimits::max_total_bytes`].
     ///
     /// This is flow control, not corruption: the writer should flush the
-    /// window into a mini-part and retry. Strict-hot values are exempt —
+    /// window into a journal part and retry. Strict-hot values are exempt —
     /// they are registry-bounded by contract and must reach every part.
     Full {
         /// Total stored bytes already held.
@@ -247,7 +246,7 @@ pub enum Resolved<'a> {
     Blob(BlobEntry<'a>),
 }
 
-/// Which dictionary an entry currently belongs to.
+/// Current dictionary placement for an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     /// `dict.strings`.
@@ -284,7 +283,7 @@ pub struct EntrySnapshot<'a> {
     pub truncated: bool,
     /// SHA-256 of the full original value; present only when truncated.
     pub full_sha256: Option<[u8; 32]>,
-    /// Which dictionary the entry belongs to under current requirements.
+    /// Current placement after applying the entry requirements.
     pub placement: Placement,
     /// The hot requirement requested for the entry.
     pub hot: HotMark,
@@ -340,7 +339,7 @@ struct Stored {
 }
 
 impl Stored {
-    /// Which dictionary the value belongs to under current requirements.
+    /// Whether the value is placed in `dict.blobs` (forced or oversized).
     const fn is_blob(&self) -> bool {
         self.req.blob || self.oversized
     }
@@ -435,9 +434,9 @@ impl SegmentDicts {
     /// # Errors
     ///
     /// Returns [`DictError::Collision`] as in [`Self::intern`].
-    /// Returns [`DictError::PlacementConflict`] if the value belongs in
-    /// `dict.blobs` by size or by registry requirement. On error,
-    /// dictionaries are left unchanged.
+    /// Returns [`DictError::PlacementConflict`] if size or registry
+    /// requirements place the value in `dict.blobs`. On error, dictionaries
+    /// are left unchanged.
     pub fn intern_hot(&mut self, bytes: &[u8]) -> Result<StrId, DictError> {
         self.insert(
             bytes,
@@ -448,7 +447,7 @@ impl SegmentDicts {
         )
     }
 
-    /// Intern a value that should be added to `dict.hot_strings` when possible.
+    /// Intern a value and try to add it to `dict.hot_strings`.
     ///
     /// Returns the id and a boolean that is `true` when the value is present in
     /// `dict.hot_strings` after the call. Large values and blob-forced values
@@ -869,7 +868,7 @@ mod tests {
         // call order.
         let mut dicts = SegmentDicts::new(small_limits());
         let (id, hot) = dicts.intern_hot_best_effort(value).expect("soft hot");
-        assert!(hot, "short value lands in strings, so it is hot");
+        assert!(hot, "short value is string-placed, so it is hot");
         dicts
             .intern_blob(value)
             .expect("forced blob wins over soft hot");
