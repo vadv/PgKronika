@@ -70,6 +70,10 @@ pub const fn registry() -> &'static [TypeContract] {
 /// [`DecodeStats`] the caller exports as metrics; the bytes are validated
 /// against the contract (README.md, "Section Trait").
 ///
+/// Dispatch is a linear scan of [`registry`] — negligible at the current size;
+/// a perfect-hash lookup would replace it if the registry grows to hundreds of
+/// types.
+///
 /// Integrity is the caller's responsibility: this does not verify the section
 /// CRC. Pass bytes already checked against the catalog — the part scanner
 /// (`kronika-format` `validate_part`) does this before a section is located, so
