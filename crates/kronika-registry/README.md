@@ -134,10 +134,13 @@ types is the registry contracts in code. `1_006_001` is kept here as a single
 worked example.
 
 `pg_stat_bgwriter` + `pg_stat_checkpointer`, a single-row snapshot
-(`SnapshotFull`, sort key `(ts)`). PostgreSQL 17 moved some
-`pg_stat_bgwriter` counters to `pg_stat_checkpointer`; the collector reads
-both views and writes one row. Columns removed from PostgreSQL 17
-(`buffers_backend`, `buffers_backend_fsync`) are written as `NULL`, not `0`.
+(`SnapshotFull`, sort key `(ts)`). PostgreSQL 17 reorganized these views: it
+moved and renamed the checkpoint counters into `pg_stat_checkpointer`, added the
+restartpoint counters (the checkpoint path on a hot standby) and `slru_written`,
+and removed `buffers_backend` / `buffers_backend_fsync`. The collector reads both
+views and writes one row; each field keeps a stable name and documents its
+per-version source, and a counter the running server lacks is written `NULL`,
+not `0` — in either direction.
 
 The whole `1_006_001` codec is its annotated struct plus `#[derive(Section)]`;
 `BgwriterCheckpointer::encode` / `decode` convert a row slice to and from the
