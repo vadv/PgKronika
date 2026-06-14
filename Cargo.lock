@@ -568,6 +568,11 @@ dependencies = [
 [[package]]
 name = "kronika-reader"
 version = "0.0.0"
+dependencies = [
+ "kronika-format",
+ "kronika-registry",
+ "tempfile",
+]
 
 [[package]]
 name = "kronika-registry"
