@@ -77,8 +77,23 @@ append would exceed the cap it fails with `JournalError::Full`, which is the
 signal to merge the journal into a segment early. `reset()` clears the
 journal after a segment has been completed successfully.
 
+## Segment Completion
+
+`seal(journal, dest)` merges the journal's parts into one immutable segment.
+It streams the journal one part at a time — peak memory is one part plus the
+growing catalog, never the whole segment — copies each part's section bodies
+into a sibling `*.tmp`, writes the end catalog, fsyncs, and publishes with a
+hard link so an existing segment is never overwritten. The caller calls
+`Journal::reset` only after `seal` returns `Ok`.
+
+A section type that appears in several parts is kept as repeated catalog entries
+— valid multi-part sections the reader processes in order. Collapsing them into
+one sorted, recompressed section is an optimization of this same path; it
+changes how bodies are written, not the segment format.
+
 ## Not Implemented Yet
 
-Part merging and segment completion — the k-way merge that seals `segment.pgm` —
-arrive in a later step. Dictionary placement and journal frame validation are
-defined in `kronika-format`.
+The sort-merge that recompresses repeated sections of one type into a single
+sorted section, and the dictionary sections (`dict.strings` / `dict.blobs`) that
+let string columns resolve, arrive in later steps. Dictionary placement and
+journal frame validation are defined in `kronika-format`.

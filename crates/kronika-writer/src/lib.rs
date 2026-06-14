@@ -1,17 +1,20 @@
 //! Writer-side state for building PGM segments.
 //!
 //! The crate buffers typed section rows ([`SectionBuffers`]), interns the
-//! segment's strings ([`Interner`]), and appends mini-parts to the `active.parts`
-//! [`Journal`]. Later steps add part merging and segment completion (the k-way
-//! merge that seals `segment.pgm`).
+//! segment's strings ([`Interner`]), appends mini-parts to the `active.parts`
+//! [`Journal`], and seals the journal into an immutable `segment.pgm`
+//! ([`seal`]). The remaining work is an optimization of the seal path: a
+//! sort-merge that recompresses repeated sections of one type into one.
 
 mod buffer;
 mod interner;
 mod journal;
+mod segment;
 
 pub use buffer::SectionBuffers;
 pub use interner::{FlushedEntry, Interner, SealedSegment};
 pub use journal::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalConfig, JournalError, OpenReport};
+pub use segment::{SealError, SealSummary, seal};
 
 #[cfg(test)]
 mod composition_tests {
