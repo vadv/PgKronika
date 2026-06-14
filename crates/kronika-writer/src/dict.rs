@@ -10,23 +10,33 @@
 //! they are encoded here directly, but as ordinary Parquet section bodies that go
 //! into a part beside the data sections.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, RecordBatch, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{EntrySnapshot, Placement, SegmentDicts};
-use kronika_registry::CodecError;
+use kronika_registry::{
+    CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
-/// `type_id` of a `dict.strings` section (class 3, dictionary).
-pub const DICT_STRINGS_TYPE_ID: u32 = 3_001_001;
-/// `type_id` of a `dict.blobs` section.
-pub const DICT_BLOBS_TYPE_ID: u32 = 3_002_001;
+/// Writer properties shared by every dictionary section: zstd-3, the section
+/// row-group cap, and an empty `created_by` — the same settings as the registry
+/// snapshot codec, built once instead of per section.
+static DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
+        ))
+        .set_max_row_group_size(MAX_SECTION_ROWS)
+        .set_created_by(String::new())
+        .build()
+});
 
 /// One encoded dictionary section: its type id, row count, and Parquet body.
 #[derive(Debug, Clone)]
@@ -115,20 +125,38 @@ fn encode_blobs(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, CodecE
 }
 
 /// Write `batch` to a zstd Parquet body and wrap it as a [`DictSection`].
+///
+/// Enforces the same row and byte caps as a registry snapshot section, so a
+/// dictionary the reader could not open (`capped_reader` rejects over-cap
+/// sections) is an error here, not on read.
+///
+/// # Errors
+///
+/// [`CodecError::TooManyRows`] over [`MAX_SECTION_ROWS`];
+/// [`CodecError::SectionTooLarge`] over [`MAX_SECTION_BYTES`];
+/// [`CodecError::Arrow`] or [`CodecError::Parquet`] on a write failure.
 fn section(type_id: u32, batch: &RecordBatch) -> Result<DictSection, CodecError> {
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-        .set_created_by(String::new())
-        .build();
-    let options = ArrowWriterOptions::new()
-        .with_properties(props)
-        .with_skip_arrow_metadata(true);
+    if batch.num_rows() > MAX_SECTION_ROWS {
+        return Err(CodecError::TooManyRows {
+            rows: batch.num_rows(),
+            max: MAX_SECTION_ROWS,
+        });
+    }
 
+    let options = ArrowWriterOptions::new()
+        .with_properties(DICT_WRITER_PROPS.clone())
+        .with_skip_arrow_metadata(true);
     let mut body = Vec::new();
     let mut writer = ArrowWriter::try_new_with_options(&mut body, batch.schema(), options)?;
     writer.write(batch)?;
     writer.close()?;
 
+    if body.len() > MAX_SECTION_BYTES {
+        return Err(CodecError::SectionTooLarge {
+            len: body.len(),
+            max: MAX_SECTION_BYTES,
+        });
+    }
     Ok(DictSection {
         type_id,
         rows: u32::try_from(batch.num_rows()).unwrap_or(u32::MAX),
@@ -139,8 +167,9 @@ fn section(type_id: u32, batch: &RecordBatch) -> Result<DictSection, CodecError>
 #[cfg(test)]
 mod tests {
     use kronika_format::DictLimits;
+    use kronika_registry::{DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID};
 
-    use super::{DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, encode};
+    use super::encode;
     use crate::Interner;
 
     #[test]

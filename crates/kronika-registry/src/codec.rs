@@ -333,7 +333,7 @@ pub fn write_bool_nullable(values: impl Iterator<Item = Option<bool>>) -> ArrayR
 /// # Errors
 ///
 /// [`CodecError::TooManyRows`] if `rows` exceeds the cap.
-pub const fn check_row_cap(rows: usize) -> Result<(), CodecError> {
+pub(crate) const fn check_row_cap(rows: usize) -> Result<(), CodecError> {
     if rows > MAX_SECTION_ROWS {
         return Err(CodecError::TooManyRows {
             rows,
@@ -385,7 +385,7 @@ static WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
 /// [`CodecError::SectionTooLarge`] if the body exceeds the byte cap;
 /// [`CodecError::Arrow`] or [`CodecError::Parquet`] if Arrow rejects the batch or
 /// writing fails.
-pub fn encode_section(
+pub(crate) fn encode_section(
     contract: &TypeContract,
     columns: Vec<ArrayRef>,
 ) -> Result<Vec<u8>, CodecError> {
@@ -676,7 +676,7 @@ fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize, usize
 /// [`CodecError::TooManyRows`] if a bound is exceeded; [`CodecError::SchemaMismatch`]
 /// if the file does not match `contract`; [`CodecError::Parquet`] on malformed
 /// Parquet; whatever `push_rows` returns.
-pub fn decode_section<Row>(
+pub(crate) fn decode_section<Row>(
     contract: &TypeContract,
     section: VerifiedSection,
     mut push_rows: impl FnMut(&RecordBatch, &mut Vec<Row>) -> Result<(), CodecError>,
@@ -716,7 +716,7 @@ pub fn decode_section<Row>(
 /// [`CodecError::SectionTooLarge`], [`CodecError::TooManyRowGroups`], or
 /// [`CodecError::TooManyRows`] on a bound; [`CodecError::SchemaMismatch`] if the
 /// file does not match `contract`; [`CodecError::Parquet`] on malformed Parquet.
-pub fn decode_batches(
+pub(crate) fn decode_batches(
     contract: &TypeContract,
     section: VerifiedSection,
 ) -> Result<DecodedSection, CodecError> {

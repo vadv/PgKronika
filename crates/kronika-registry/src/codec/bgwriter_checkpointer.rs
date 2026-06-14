@@ -42,9 +42,11 @@ pub struct BgwriterCheckpointer {
     pub ts: Ts,
     /// Scheduled checkpoints. `pg_stat_bgwriter.checkpoints_timed` before PG17,
     /// `pg_stat_checkpointer.num_timed` on PG17+. The semantics differ: PG16
-    /// counts performed scheduled checkpoints, PG17+ counts both completed and
-    /// skipped (idle) ones, so a delta spanning the upgrade is not comparable.
-    /// Same reset split as `checkpoint_write_time`.
+    /// counts performed scheduled checkpoints; PG17+ counts both completed and
+    /// skipped (idle) ones, so its rate is not the checkpoint frequency — on an
+    /// idle server it ticks every `checkpoint_timeout` with no work done — and a
+    /// delta spanning the upgrade is not comparable. Same reset split as
+    /// `checkpoint_write_time`.
     #[column(c)]
     pub checkpoints_timed: i64,
     /// Requested checkpoints. `checkpoints_req` before PG17,
@@ -66,11 +68,11 @@ pub struct BgwriterCheckpointer {
     #[column(c)]
     pub checkpoint_sync_time: f64,
     /// Buffers written during checkpoints. `pg_stat_bgwriter.buffers_checkpoint`
-    /// before PG17; `pg_stat_checkpointer.buffers_written` on PG17+, renamed and
-    /// now also counting restartpoint writes. On a standby the PG17 value
-    /// therefore includes restartpoint buffers a PG16 row never had, so a rate
-    /// spanning the upgrade jumps; subtract restartpoint writes to compare. Same
-    /// reset split as `checkpoint_write_time`.
+    /// before PG17; `pg_stat_checkpointer.buffers_written` on PG17+ — a rename,
+    /// not a semantic change. Both already count restartpoint buffer writes on a
+    /// standby (a restartpoint runs the same checkpoint buffer path), so the rate
+    /// is comparable across the upgrade and needs no adjustment. Same reset split
+    /// as `checkpoint_write_time`.
     #[column(c)]
     pub buffers_checkpoint: i64,
     /// Scheduled restartpoints: the checkpoint path on a hot standby.

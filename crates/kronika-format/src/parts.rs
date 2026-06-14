@@ -315,7 +315,12 @@ pub struct PartMeta {
 /// [`Catalog::encode`]) — an absurd section count, i.e. a writer bug.
 #[must_use]
 pub fn build_part(sections: &[SectionInput<'_>], meta: PartMeta) -> Vec<u8> {
-    let mut out = Vec::new();
+    // The exact part length is known up front, so the buffer never reallocates
+    // while copying section bodies.
+    let bodies: usize = sections.iter().map(|section| section.body.len()).sum();
+    let capacity =
+        MAGIC.len() + bodies + sections.len() * crate::ENTRY_LEN + crate::META_LEN + TAIL_INDEX_LEN;
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&MAGIC);
 
     let entries = sections
