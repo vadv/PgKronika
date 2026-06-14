@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 kronika-format = { path = "../kronika-format" }
+kronika-registry = { path = "../kronika-registry" }
 sha2 = "0.10"
 
 [dev-dependencies]

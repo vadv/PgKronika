@@ -96,6 +96,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let contract = build_contract(&header, &columns);
     let encode = build_encode(&columns);
     let decode = build_decode(struct_name, &columns);
+    let ts_range = build_ts_range(&columns);
 
     Ok(quote! {
         impl ::kronika_registry::sealed::Sealed for #struct_name {}
@@ -120,6 +121,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             > {
                 #decode
             }
+
+            #ts_range
         }
     })
 }
@@ -368,6 +371,37 @@ fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
         }
     });
     quote! { ::std::vec![ #( #builders ),* ] }
+}
+
+/// Generate `Section::ts_range`: fold the non-nullable `#[column(t)]` field over
+/// `rows` into `(min, max)`. A type with no such column returns `None`, so the
+/// writer records no time range for it. A nullable or mistyped timestamp column
+/// is left to the registry linter, not turned into a confusing codegen error.
+fn build_ts_range(columns: &[ColumnDef]) -> TokenStream2 {
+    columns
+        .iter()
+        .find(|column| column.column_class == "Timestamp" && !column.nullable)
+        .map_or_else(
+            || {
+                quote! {
+                    fn ts_range(_rows: &[Self]) -> ::core::option::Option<(i64, i64)> {
+                        ::core::option::Option::None
+                    }
+                }
+            },
+            |column| {
+                let field = &column.field;
+                quote! {
+                    fn ts_range(rows: &[Self]) -> ::core::option::Option<(i64, i64)> {
+                        let mut values = rows.iter().map(|row| row.#field.0);
+                        let first = values.next()?;
+                        ::core::option::Option::Some(
+                            values.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v))),
+                        )
+                    }
+                }
+            },
+        )
 }
 
 fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {

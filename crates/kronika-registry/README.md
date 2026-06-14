@@ -100,8 +100,9 @@ as existing types. Column types map to the narrowest Arrow type that fits
 ## Section Trait
 
 Each generated codec is an `impl Section for T`, so generic code works over
-`T: Section` (`CONTRACT`, `encode`, `decode`) instead of naming each type — a
-shared roundtrip test is written once, not per type.
+`T: Section` (`CONTRACT`, `encode`, `decode`, and `ts_range` for the catalog
+time range) instead of naming each type — a shared roundtrip test is written
+once, not per type, and the writer buffers any type without a per-type case.
 
 When reading a segment, the `type_id` is known only at read time, so the reader
 cannot name `T`. `decode_any(type_id, section)` selects the contract through
