@@ -45,6 +45,15 @@ pub trait Section: crate::sealed::Sealed + Sized {
     /// on malformed Parquet, or a column error if the file does not match
     /// [`CONTRACT`](Section::CONTRACT).
     fn decode(section: VerifiedSection) -> Result<Vec<Self>, CodecError>;
+
+    /// The `(min, max)` of this type's timestamp column across `rows`, or `None`
+    /// when the type has no timestamp column.
+    ///
+    /// The writer folds these into the part and segment catalog time range, which
+    /// drives time-range reads and merge idempotency (README.md, "Section Trait").
+    /// The derive reads the `#[column(t)]` field, so a type without one — a
+    /// dictionary or event section — returns `None`.
+    fn ts_range(rows: &[Self]) -> Option<(i64, i64)>;
 }
 
 /// Encode `rows`, decode the section back, and assert they roundtrip — the

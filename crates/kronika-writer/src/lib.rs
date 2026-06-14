@@ -1,12 +1,15 @@
 //! Writer-side state for building PGM segments.
 //!
-//! The crate currently contains the per-segment string interner and the
-//! `active.parts` journal. Later steps add per-type buffers, part merging,
-//! segment completion, and Parquet encoding.
+//! The crate buffers typed section rows ([`SectionBuffers`]), interns the
+//! segment's strings ([`Interner`]), and appends mini-parts to the `active.parts`
+//! [`Journal`]. Later steps add part merging and segment completion (the k-way
+//! merge that seals `segment.pgm`).
 
+mod buffer;
 mod interner;
 mod journal;
 
+pub use buffer::SectionBuffers;
 pub use interner::{FlushedEntry, Interner, SealedSegment};
 pub use journal::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalConfig, JournalError, OpenReport};
 

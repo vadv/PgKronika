@@ -11,9 +11,25 @@ what must remain in memory while the segment is being built.
 
 The crate currently exposes:
 
+- `SectionBuffers`, per-type row buffers that encode a collection window into one
+  PGM part;
 - `Interner`, the per-segment string interner over
   `kronika_format::SegmentDicts`;
 - `Journal`, the file-backed `active.parts` journal.
+
+## Section Buffers
+
+`SectionBuffers` is the collection window. A collection step pushes typed rows
+with `push::<T>(row)` for any `T: Section`; the buffers hold one type-erased
+buffer per `type_id`, not a field per type, so a new section type costs one
+`push` and no change here — the property the registry's hundreds of types need.
+
+`flush(source_id)` encodes every buffered type to a Parquet body
+(`Section::encode`), reads each type's time range (`Section::ts_range`), and
+calls `kronika_format::build_part` to assemble one PGM part: sections in
+`type_id` order, the catalog time range spanning the buffered rows. It returns
+the part bytes — or `None` when nothing is buffered — for the caller to append to
+the journal, and clears the window.
 
 ## Interner
 
@@ -63,6 +79,6 @@ journal after a segment has been completed successfully.
 
 ## Not Implemented Yet
 
-Per-type buffers, part merging, segment completion, and Parquet encoding arrive
-in later steps. Dictionary placement and journal frame validation are defined in
-`kronika-format`.
+Part merging and segment completion — the k-way merge that seals `segment.pgm` —
+arrive in a later step. Dictionary placement and journal frame validation are
+defined in `kronika-format`.

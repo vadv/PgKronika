@@ -596,6 +596,7 @@ name = "kronika-writer"
 version = "0.0.0"
 dependencies = [
  "kronika-format",
+ "kronika-registry",
  "sha2",
  "tempfile",
 ]
