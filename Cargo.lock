@@ -569,8 +569,11 @@ dependencies = [
 name = "kronika-reader"
 version = "0.0.0"
 dependencies = [
+ "arrow-array",
  "kronika-format",
  "kronika-registry",
+ "kronika-writer",
+ "parquet",
  "tempfile",
 ]
 

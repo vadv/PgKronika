@@ -13,16 +13,20 @@
 //! them, and the registry stays free of a `kronika-format` dependency
 //! (kronika-registry README, "Section Trait").
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use arrow_array::{Array, BinaryArray, UInt64Array};
 use kronika_format::{Catalog, DecodeError, Entry, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
 use kronika_registry::{
-    Bytes, CodecError, DecodedSection, MAX_SECTION_BYTES, VerifiedSection, decode_any,
+    Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
+    VerifiedSection, decode_any,
 };
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Upper bound on the end-catalog block, checked before it is read.
 ///
@@ -66,7 +70,8 @@ pub enum ReadError {
         /// The section length claimed by the catalog.
         len: u64,
     },
-    /// A section failed CRC verification or decoding.
+    /// A section failed CRC verification or decoding; a malformed dictionary
+    /// section (bad Parquet, missing columns) arrives here too.
     Codec(CodecError),
 }
 
@@ -143,18 +148,100 @@ impl Segment {
     /// [`ReadError::Codec`] on a CRC mismatch, an unknown `type_id`, or a decode
     /// failure; [`ReadError::Io`] on a read failure.
     pub fn decode(&self, entry: &Entry) -> Result<DecodedSection, ReadError> {
+        decode_any(entry.type_id, self.verified_body(entry)?).map_err(ReadError::Codec)
+    }
+
+    /// Read the segment's dictionary sections into a `str_id` -> bytes map.
+    ///
+    /// Reads every `dict.strings` and `dict.blobs` section and resolves each
+    /// `str_id` to its stored bytes. This loads the dictionaries into memory —
+    /// the segment's string table by design, bounded by the writer's dictionary
+    /// cap (segment-format.md, "Strings and large values").
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::SectionTooLarge`] over the byte cap; [`ReadError::Codec`] on a
+    /// CRC mismatch or a malformed dictionary section; [`ReadError::Io`] on a read
+    /// failure.
+    pub fn dictionary(&self) -> Result<Dictionary, ReadError> {
+        let mut by_id = HashMap::new();
+        for entry in &self.catalog.entries {
+            let value_column = match entry.type_id {
+                DICT_STRINGS_TYPE_ID => "bytes",
+                DICT_BLOBS_TYPE_ID => "stored_bytes",
+                _ => continue,
+            };
+            let body = self.verified_body(entry)?.into_bytes();
+            for (str_id, bytes) in
+                decode_dictionary(&body, value_column).map_err(ReadError::Codec)?
+            {
+                by_id.insert(str_id, bytes);
+            }
+        }
+        Ok(Dictionary { by_id })
+    }
+
+    /// Range-read a section body and CRC-verify it against its catalog entry.
+    fn verified_body(&self, entry: &Entry) -> Result<VerifiedSection, ReadError> {
         let len = usize::try_from(entry.len)
             .ok()
             .filter(|&len| len <= MAX_SECTION_BYTES)
             .ok_or(ReadError::SectionTooLarge { len: entry.len })?;
-
         let mut body = vec![0_u8; len];
         self.file.read_exact_at(&mut body, entry.offset)?;
-
-        let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
-            .map_err(ReadError::Codec)?;
-        decode_any(entry.type_id, verified).map_err(ReadError::Codec)
+        VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c).map_err(ReadError::Codec)
     }
+}
+
+/// A segment's `str_id` -> value-bytes map, built from its dictionary sections.
+#[derive(Debug, Clone, Default)]
+pub struct Dictionary {
+    by_id: HashMap<u64, Vec<u8>>,
+}
+
+impl Dictionary {
+    /// The bytes a `str_id` resolves to, if the segment carries it.
+    #[must_use]
+    pub fn resolve(&self, str_id: u64) -> Option<&[u8]> {
+        self.by_id.get(&str_id).map(Vec::as_slice)
+    }
+
+    /// Number of distinct ids resolved.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    /// Whether the segment carries no dictionary entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+}
+
+/// Decode a dictionary section body into `(str_id, value)` pairs. `value_column`
+/// is `bytes` for `dict.strings`, `stored_bytes` for `dict.blobs`.
+fn decode_dictionary(
+    body: &[u8],
+    value_column: &'static str,
+) -> Result<Vec<(u64, Vec<u8>)>, CodecError> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(body))?.build()?;
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let ids = batch
+            .column_by_name("str_id")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or(CodecError::ColumnType { name: "str_id" })?;
+        let values = batch
+            .column_by_name(value_column)
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or(CodecError::ColumnType { name: value_column })?;
+        for row in 0..batch.num_rows() {
+            out.push((ids.value(row), values.value(row).to_vec()));
+        }
+    }
+    Ok(out)
 }
 
 /// Read and decode the end catalog from the file's tail.
@@ -256,5 +343,52 @@ mod tests {
             Segment::open(&path),
             Err(ReadError::TooSmall { len: 4 })
         ));
+    }
+
+    #[test]
+    fn resolves_interned_strings_from_the_dictionary() {
+        use kronika_format::DictLimits;
+        use kronika_writer::{Interner, dict};
+
+        // The writer interns and encodes the dictionary; the reader resolves it —
+        // the full string round-trip across the write and read paths.
+        let mut interner = Interner::new(DictLimits::new(4096, 1 << 20).expect("limits"));
+        let host = interner.intern(b"db-host-01").expect("intern");
+        let node = interner.intern(b"node-7").expect("intern");
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+
+        let sections: Vec<_> = dict_sections
+            .iter()
+            .map(|section| SectionInput {
+                type_id: section.type_id,
+                rows: section.rows,
+                body: &section.body,
+            })
+            .collect();
+        let bytes = build_part(
+            &sections,
+            PartMeta {
+                min_ts: 0,
+                max_ts: 0,
+                source_id: 0,
+            },
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("d.pgm");
+        std::fs::write(&path, &bytes).expect("write");
+
+        let segment = Segment::open(&path).expect("open");
+        let dictionary = segment.dictionary().expect("read dictionary");
+        assert_eq!(dictionary.len(), 2);
+        assert_eq!(
+            dictionary.resolve(host.get()),
+            Some(b"db-host-01".as_slice())
+        );
+        assert_eq!(dictionary.resolve(node.get()), Some(b"node-7".as_slice()));
+        assert_eq!(
+            dictionary.resolve(999),
+            None,
+            "an absent id resolves to None"
+        );
     }
 }
