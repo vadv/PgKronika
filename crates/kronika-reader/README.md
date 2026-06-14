@@ -27,8 +27,16 @@ injects `kronika_format::crc32c` into `VerifiedSection::verify`, so a tampered o
 rotted body is rejected before the Parquet parser sees it, while the registry
 keeps no dependency on the format crate (the option-C split).
 
+## Resolving Strings
+
+Snapshot columns store a `str_id`, not the string. `Segment::dictionary()` reads
+the segment's `dict.strings` and `dict.blobs` sections (each CRC-verified) into a
+`str_id` -> bytes map, and `Dictionary::resolve(str_id)` returns the stored
+bytes. The dictionary is loaded into memory — the segment's string table by
+design, bounded by the writer's dictionary cap.
+
 ## Not Implemented Yet
 
-String resolution (reading `dict.strings` / `dict.blobs` to map `str_id` to its
-bytes), time-range and drill-down queries, the cross-segment `str_id` cache, and
-the S3 range-read path arrive in later steps.
+Time-range and drill-down queries, the cross-segment `str_id` cache, on-demand
+(rather than eager) `dict.blobs` reads, and the S3 range-read path arrive in
+later steps.
