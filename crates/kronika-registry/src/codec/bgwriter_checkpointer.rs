@@ -1,12 +1,15 @@
 //! Type `1_006_001`: `pg_stat_bgwriter` + `pg_stat_checkpointer`, a
 //! single-row snapshot (README.md, "Example: type `1_006_001`").
 //!
-//! One codec spans every `PostgreSQL` version. A column the running server
-//! lacks is `NULL`, in either direction: PG17 moved the checkpoint counters to
-//! `pg_stat_checkpointer` and dropped `buffers_backend` / `buffers_backend_fsync`
-//! (now `None`), and a future PG-only column would be `None` on older servers.
-//! Which case applies is read from `instance_metadata` (`pg_version_num`), not
-//! encoded as a new `type_id`.
+//! One codec spans every `PostgreSQL` version. PG17 reorganized these stats:
+//! the checkpoint counters moved from `pg_stat_bgwriter` to
+//! `pg_stat_checkpointer` and several were renamed (`buffers_checkpoint` →
+//! `buffers_written`, now counting restartpoints too); PG17 also added the
+//! restartpoint counters and `slru_written`, and dropped `buffers_backend` /
+//! `buffers_backend_fsync`. Each field keeps one stable name and documents its
+//! per-version source; a column the running server lacks is `None`, in either
+//! direction. Which case applies is read from `instance_metadata`
+//! (`pg_version_num`), not encoded as a new `type_id`.
 //!
 //! Statistics reset is per-view: `pg_stat_reset_shared('bgwriter')` or
 //! `('checkpointer')` — or a postmaster restart — zeroes the counters and bumps
@@ -34,34 +37,60 @@ pub struct BgwriterCheckpointer {
     /// Collection timestamp, unix microseconds.
     #[column(t)]
     pub ts: Ts,
-    /// Scheduled checkpoints.
+    /// Scheduled checkpoints. `pg_stat_bgwriter.checkpoints_timed` before PG17,
+    /// `pg_stat_checkpointer.num_timed` on PG17+.
     #[column(c)]
     pub checkpoints_timed: i64,
-    /// Requested checkpoints.
+    /// Requested checkpoints. `checkpoints_req` before PG17,
+    /// `pg_stat_checkpointer.num_requested` on PG17+.
     #[column(c)]
     pub checkpoints_req: i64,
-    /// Time spent writing checkpoints, milliseconds.
+    /// Time writing checkpoints, ms. `checkpoint_write_time` before PG17;
+    /// `pg_stat_checkpointer.write_time` on PG17+, which also covers restartpoints.
     #[column(c)]
     pub checkpoint_write_time: f64,
-    /// Time spent syncing checkpoints, milliseconds.
+    /// Time syncing checkpoints, ms. `checkpoint_sync_time` before PG17;
+    /// `pg_stat_checkpointer.sync_time` on PG17+, which also covers restartpoints.
     #[column(c)]
     pub checkpoint_sync_time: f64,
-    /// Buffers written during checkpoints.
+    /// Buffers written during checkpoints. `pg_stat_bgwriter.buffers_checkpoint`
+    /// before PG17; `pg_stat_checkpointer.buffers_written` on PG17+, renamed and
+    /// now including restartpoint writes.
     #[column(c)]
     pub buffers_checkpoint: i64,
-    /// Buffers written by the background writer.
+    /// Scheduled restartpoints — the checkpoint path on a hot standby.
+    /// `pg_stat_checkpointer.restartpoints_timed`; `None` before PG17.
+    #[column(c)]
+    pub restartpoints_timed: Option<i64>,
+    /// Requested restartpoints. `pg_stat_checkpointer.restartpoints_req`; `None`
+    /// before PG17.
+    #[column(c)]
+    pub restartpoints_req: Option<i64>,
+    /// Completed restartpoints. `pg_stat_checkpointer.restartpoints_done`; `None`
+    /// before PG17. On a standby this is the recovery-checkpoint rate — it tells
+    /// "standby behind on WAL apply" from "primary not sending".
+    #[column(c)]
+    pub restartpoints_done: Option<i64>,
+    /// SLRU buffers written by the checkpointer.
+    /// `pg_stat_checkpointer.slru_written`; `None` before PG17.
+    #[column(c)]
+    pub slru_written: Option<i64>,
+    /// Buffers written by the background writer
+    /// (`pg_stat_bgwriter.buffers_clean`, both versions).
     #[column(c)]
     pub buffers_clean: i64,
-    /// Times the background writer stopped a cleaning scan early.
+    /// Times the background writer stopped a cleaning scan early
+    /// (`pg_stat_bgwriter.maxwritten_clean`, both versions).
     #[column(c)]
     pub maxwritten_clean: i64,
-    /// Buffers written by backends; `None` on PG17+.
+    /// Buffers written by backends; `None` on PG17+, which removed it from
+    /// `pg_stat_bgwriter` (the data moved to `pg_stat_io`).
     #[column(c)]
     pub buffers_backend: Option<i64>,
-    /// Backend fsync calls; `None` on PG17+.
+    /// Backend fsync calls; `None` on PG17+ (removed from `pg_stat_bgwriter`).
     #[column(c)]
     pub buffers_backend_fsync: Option<i64>,
-    /// Buffers allocated.
+    /// Buffers allocated (`pg_stat_bgwriter.buffers_alloc`, both versions).
     #[column(c)]
     pub buffers_alloc: i64,
     /// `pg_stat_bgwriter.stats_reset`: when this view was last reset, by a
@@ -89,6 +118,10 @@ mod tests {
             checkpoint_write_time: 1234.5,
             checkpoint_sync_time: 67.0,
             buffers_checkpoint: 4096,
+            restartpoints_timed: None,
+            restartpoints_req: None,
+            restartpoints_done: None,
+            slru_written: None,
             buffers_clean: 512,
             maxwritten_clean: 3,
             buffers_backend: Some(128),
@@ -103,6 +136,10 @@ mod tests {
         BgwriterCheckpointer {
             buffers_backend: None,
             buffers_backend_fsync: None,
+            restartpoints_timed: Some(7),
+            restartpoints_req: Some(1),
+            restartpoints_done: Some(6),
+            slru_written: Some(256),
             checkpointer_stats_reset: Some(Ts(ts - 50_000)),
             ..pg16_row(ts)
         }
@@ -117,17 +154,21 @@ mod tests {
     fn contract_shape_matches_the_source() {
         let c = BgwriterCheckpointer::CONTRACT;
         assert_eq!(c.type_id.get(), 1_006_001);
-        assert_eq!(c.columns.len(), 13);
+        assert_eq!(c.columns.len(), 17);
         assert_eq!(c.sort_key, ["ts"]);
-        // ts is the sort timestamp; the PG17 casualties and the checkpointer
-        // reset (absent before PG17) are the nullable columns.
+        // ts is the sort timestamp; the PG17-only counters, the PG16 casualties,
+        // and the checkpointer reset are the nullable columns.
         assert_eq!(c.column("ts").map(|col| col.nullable), Some(false));
         assert_eq!(
             c.column("buffers_backend").map(|col| col.nullable),
             Some(true)
         );
         assert_eq!(
-            c.column("bgwriter_stats_reset").map(|col| col.nullable),
+            c.column("restartpoints_done").map(|col| col.nullable),
+            Some(true)
+        );
+        assert_eq!(
+            c.column("buffers_checkpoint").map(|col| col.nullable),
             Some(false)
         );
         assert_eq!(
