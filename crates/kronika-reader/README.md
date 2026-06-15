@@ -30,10 +30,14 @@ keeps no dependency on the format crate (the option-C split).
 ## Resolving Strings
 
 Snapshot columns store a `str_id`, not the string. `Segment::dictionary()` reads
-the segment's `dict.strings` and `dict.blobs` sections (each CRC-verified) into a
-`str_id` -> bytes map, and `Dictionary::resolve(str_id)` returns the stored
-bytes. The dictionary is loaded into memory — the segment's string table by
-design, bounded by the writer's dictionary cap.
+the segment's `dict.strings` and `dict.blobs` sections (each CRC-verified, and
+held to the same row/row-group caps as data sections) into a `str_id` -> value
+map. `Dictionary::resolve(str_id)` returns a `Resolved`: a `String` for a
+`dict.strings` value, or a `Blob` carrying `full_len` and `truncated`, so a
+caller never mistakes a stored prefix for the whole value. When the same id was
+upgraded from a string to a blob across parts, the blob wins. The dictionary is
+loaded into memory — the segment's string table by design, bounded by the
+writer's dictionary cap.
 
 ## Not Implemented Yet
 

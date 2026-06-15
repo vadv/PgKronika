@@ -47,6 +47,10 @@ pub enum SealError {
     Part(PartError),
     /// The journal holds no parts, so there is nothing to seal.
     Empty,
+    /// A segment already exists at `dest`; it is never overwritten. Distinct from
+    /// a generic IO error so a caller can treat an already-published segment as
+    /// success-equivalent (the parts are already on disk).
+    AlreadyExists,
     /// Two parts carry different non-zero `source_id`s, so the journal mixes
     /// instances and a single segment cannot honestly label its source.
     SourceIdMismatch {
@@ -64,6 +68,7 @@ impl fmt::Display for SealError {
             Self::Journal(err) => write!(f, "reading a journal part: {err}"),
             Self::Part(err) => write!(f, "invalid journal part: {err}"),
             Self::Empty => write!(f, "the journal holds no parts to seal"),
+            Self::AlreadyExists => write!(f, "a segment already exists at the destination"),
             Self::SourceIdMismatch { expected, got } => {
                 write!(f, "journal mixes source_id {expected} and {got}")
             }
@@ -77,7 +82,7 @@ impl Error for SealError {
             Self::Io(err) => Some(err),
             Self::Journal(err) => Some(err),
             Self::Part(err) => Some(err),
-            Self::Empty | Self::SourceIdMismatch { .. } => None,
+            Self::Empty | Self::AlreadyExists | Self::SourceIdMismatch { .. } => None,
         }
     }
 }
@@ -127,13 +132,20 @@ pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
     // O_EXCL-style publish: hard-link the finished file into place (fails if
     // `dest` exists), then drop the temporary name. The data is already synced.
     if let Err(err) = fs::hard_link(&tmp, dest) {
-        // Failed publish (commonly: `dest` already exists). Drop the temporary
-        // best-effort and surface the publish error, not the cleanup's.
+        // Failed publish. Drop the temporary best-effort and surface the cause;
+        // an existing destination is its own variant so the caller can tell a
+        // genuine name conflict from other IO errors.
         fs::remove_file(&tmp).ok();
-        return Err(SealError::Io(err));
+        return Err(if err.kind() == io::ErrorKind::AlreadyExists {
+            SealError::AlreadyExists
+        } else {
+            SealError::Io(err)
+        });
     }
-    fs::remove_file(&tmp)?;
+    // fsync the directory so the new link is durable before the temporary name is
+    // dropped — otherwise a crash after `remove_file` could lose the link.
     sync_parent_dir(dest)?;
+    fs::remove_file(&tmp)?;
     Ok(summary)
 }
 
@@ -375,6 +387,6 @@ mod tests {
 
         seal(&journal, &segment_path).expect("first seal");
         let err = seal(&journal, &segment_path).expect_err("must not overwrite");
-        assert!(matches!(err, SealError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists));
+        assert!(matches!(err, SealError::AlreadyExists));
     }
 }

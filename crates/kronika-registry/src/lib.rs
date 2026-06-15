@@ -165,6 +165,14 @@ pub fn decode_pooled(
         });
     }
     let bytes = pool.load(fill);
+    // `fill` is trusted to write the section, but a bug could write past
+    // `expected_len`; cap the buffer before it is hashed, not after, in decode.
+    if bytes.len() > MAX_SECTION_BYTES {
+        return Err(CodecError::SectionTooLarge {
+            len: bytes.len(),
+            max: MAX_SECTION_BYTES,
+        });
+    }
     let bytes_in = bytes.len();
     let section = VerifiedSection::verify(bytes, expected_crc, crc32c).map_err(|source| {
         CodecError::Section {
