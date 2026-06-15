@@ -14,17 +14,20 @@
 //! (kronika-registry README, "Section Trait").
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry as MapEntry;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use arrow_array::{Array, BinaryArray, UInt64Array};
-use kronika_format::{Catalog, DecodeError, Entry, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
+use arrow_array::{Array, BinaryArray, BooleanArray, RecordBatch, UInt64Array};
+use kronika_format::{
+    Catalog, DecodeError, Entry, FORMAT_VERSION, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c,
+};
 use kronika_registry::{
-    Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
-    VerifiedSection, decode_any,
+    Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS,
+    MAX_SECTION_BYTES, MAX_SECTION_ROWS, VerifiedSection, decode_any,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -55,10 +58,31 @@ pub enum ReadError {
         /// The file length found.
         len: u64,
     },
+    /// The file does not start with the segment magic.
+    BadMagic {
+        /// The bytes found at the start of the file.
+        actual: [u8; 4],
+    },
+    /// The catalog declares a container format this build does not read.
+    UnsupportedFormat {
+        /// The `format_version` found.
+        version: u32,
+    },
+    /// A catalog entry points outside the segment's section area.
+    SectionOutOfBounds {
+        /// The entry's `type_id`.
+        type_id: u32,
+    },
+    /// `decode` was called on a dictionary section; use
+    /// [`dictionary`](Segment::dictionary) instead.
+    DictionarySection {
+        /// The dictionary section's `type_id`.
+        type_id: u32,
+    },
     /// The tail index did not decode.
     Tail(DecodeError),
     /// `catalog_len` does not fit between the magic and the tail index, or
-    /// exceeds [`MAX_CATALOG_BYTES`].
+    /// exceeds the catalog cap.
     BadCatalogLen {
         /// `catalog_len` from the tail index.
         catalog_len: u32,
@@ -80,6 +104,18 @@ impl fmt::Display for ReadError {
         match self {
             Self::Io(err) => write!(f, "segment io: {err}"),
             Self::TooSmall { len } => write!(f, "file of {len} bytes is too small for a segment"),
+            Self::BadMagic { actual } => {
+                write!(f, "segment magic is {actual:02x?}, expected \"PGM1\"")
+            }
+            Self::UnsupportedFormat { version } => {
+                write!(f, "segment format_version {version} is not supported")
+            }
+            Self::SectionOutOfBounds { type_id } => {
+                write!(f, "section {type_id} points outside the segment")
+            }
+            Self::DictionarySection { type_id } => {
+                write!(f, "section {type_id} is a dictionary; use dictionary()")
+            }
             Self::Tail(err) => write!(f, "segment tail index: {err}"),
             Self::BadCatalogLen { catalog_len } => {
                 write!(f, "segment catalog_len {catalog_len} does not fit the file")
@@ -97,9 +133,13 @@ impl Error for ReadError {
             Self::Io(err) => Some(err),
             Self::Tail(err) | Self::Catalog(err) => Some(err),
             Self::Codec(err) => Some(err),
-            Self::TooSmall { .. } | Self::BadCatalogLen { .. } | Self::SectionTooLarge { .. } => {
-                None
-            }
+            Self::TooSmall { .. }
+            | Self::BadMagic { .. }
+            | Self::UnsupportedFormat { .. }
+            | Self::SectionOutOfBounds { .. }
+            | Self::DictionarySection { .. }
+            | Self::BadCatalogLen { .. }
+            | Self::SectionTooLarge { .. } => None,
         }
     }
 }
@@ -113,8 +153,8 @@ impl From<std::io::Error> for ReadError {
 impl Segment {
     /// Open a sealed segment and read its end catalog.
     ///
-    /// Reads only the tail index and the catalog block (positional, bounded by
-    /// [`MAX_CATALOG_BYTES`]); section bodies are read later by
+    /// Reads only the tail index and the catalog block (positional, the catalog
+    /// bounded by a cap); section bodies are read later by
     /// [`decode`](Segment::decode).
     ///
     /// # Errors
@@ -148,6 +188,11 @@ impl Segment {
     /// [`ReadError::Codec`] on a CRC mismatch, an unknown `type_id`, or a decode
     /// failure; [`ReadError::Io`] on a read failure.
     pub fn decode(&self, entry: &Entry) -> Result<DecodedSection, ReadError> {
+        if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
+            return Err(ReadError::DictionarySection {
+                type_id: entry.type_id,
+            });
+        }
         decode_any(entry.type_id, self.verified_body(entry)?).map_err(ReadError::Codec)
     }
 
@@ -164,24 +209,37 @@ impl Segment {
     /// CRC mismatch or a malformed dictionary section; [`ReadError::Io`] on a read
     /// failure.
     pub fn dictionary(&self) -> Result<Dictionary, ReadError> {
-        let mut by_id = HashMap::new();
+        let mut by_id: HashMap<u64, Stored> = HashMap::new();
         for entry in &self.catalog.entries {
-            let value_column = match entry.type_id {
-                DICT_STRINGS_TYPE_ID => "bytes",
-                DICT_BLOBS_TYPE_ID => "stored_bytes",
-                _ => continue,
-            };
+            if !matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
+                continue;
+            }
             let body = self.verified_body(entry)?.into_bytes();
-            for (str_id, bytes) in
-                decode_dictionary(&body, value_column).map_err(ReadError::Codec)?
+            for (str_id, value) in
+                decode_dictionary(body, entry.type_id).map_err(ReadError::Codec)?
             {
-                by_id.insert(str_id, bytes);
+                match by_id.entry(str_id) {
+                    MapEntry::Vacant(slot) => {
+                        slot.insert(value);
+                    }
+                    // The same id can sit in an early `dict.strings` and a later
+                    // `dict.blobs` after an upgrade; the blob is authoritative and
+                    // carries the truncation metadata, so it wins.
+                    MapEntry::Occupied(mut slot) => {
+                        if matches!(value, Stored::Blob { .. }) {
+                            slot.insert(value);
+                        }
+                    }
+                }
             }
         }
         Ok(Dictionary { by_id })
     }
 
     /// Range-read a section body and CRC-verify it against its catalog entry.
+    ///
+    /// A CRC mismatch is tagged with the section's `type_id` and size, so a
+    /// failure on a corrupt segment names the section to skip or re-read.
     fn verified_body(&self, entry: &Entry) -> Result<VerifiedSection, ReadError> {
         let len = usize::try_from(entry.len)
             .ok()
@@ -189,21 +247,74 @@ impl Segment {
             .ok_or(ReadError::SectionTooLarge { len: entry.len })?;
         let mut body = vec![0_u8; len];
         self.file.read_exact_at(&mut body, entry.offset)?;
-        VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c).map_err(ReadError::Codec)
+        VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c).map_err(|source| {
+            ReadError::Codec(CodecError::Section {
+                type_id: entry.type_id,
+                bytes_in: len,
+                source: Box::new(source),
+            })
+        })
     }
 }
 
-/// A segment's `str_id` -> value-bytes map, built from its dictionary sections.
+/// A value a `str_id` resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolved<'a> {
+    /// A `dict.strings` value, stored in full.
+    String(&'a [u8]),
+    /// A `dict.blobs` value; `bytes` is a prefix of the original when `truncated`.
+    Blob {
+        /// The stored bytes — a prefix of the original when `truncated`.
+        bytes: &'a [u8],
+        /// Length of the full original value, bytes.
+        full_len: u64,
+        /// Whether `bytes` is only a prefix of the original.
+        truncated: bool,
+    },
+}
+
+/// One stored dictionary value, with a blob's truncation metadata.
+#[derive(Debug, Clone)]
+enum Stored {
+    String(Vec<u8>),
+    Blob {
+        bytes: Vec<u8>,
+        full_len: u64,
+        truncated: bool,
+    },
+}
+
+impl Stored {
+    fn resolved(&self) -> Resolved<'_> {
+        match self {
+            Self::String(bytes) => Resolved::String(bytes),
+            Self::Blob {
+                bytes,
+                full_len,
+                truncated,
+            } => Resolved::Blob {
+                bytes,
+                full_len: *full_len,
+                truncated: *truncated,
+            },
+        }
+    }
+}
+
+/// A segment's `str_id` -> value map, built from its dictionary sections.
 #[derive(Debug, Clone, Default)]
 pub struct Dictionary {
-    by_id: HashMap<u64, Vec<u8>>,
+    by_id: HashMap<u64, Stored>,
 }
 
 impl Dictionary {
-    /// The bytes a `str_id` resolves to, if the segment carries it.
+    /// The value a `str_id` resolves to, if the segment carries it.
+    ///
+    /// A [`Resolved::Blob`] reports `truncated` and `full_len`, so a caller never
+    /// mistakes a stored prefix for the whole value.
     #[must_use]
-    pub fn resolve(&self, str_id: u64) -> Option<&[u8]> {
-        self.by_id.get(&str_id).map(Vec::as_slice)
+    pub fn resolve(&self, str_id: u64) -> Option<Resolved<'_>> {
+        self.by_id.get(&str_id).map(Stored::resolved)
     }
 
     /// Number of distinct ids resolved.
@@ -219,29 +330,103 @@ impl Dictionary {
     }
 }
 
-/// Decode a dictionary section body into `(str_id, value)` pairs. `value_column`
-/// is `bytes` for `dict.strings`, `stored_bytes` for `dict.blobs`.
-fn decode_dictionary(
-    body: &[u8],
-    value_column: &'static str,
-) -> Result<Vec<(u64, Vec<u8>)>, CodecError> {
-    let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(body))?.build()?;
+/// Decode a dictionary section body into `(str_id, value)` pairs.
+///
+/// Enforces the section caps the registry's reader would — row groups and
+/// claimed rows — before reading a column, and rejects a `NULL` in a required
+/// column, so a malformed dictionary cannot grow memory past the bounds or yield
+/// a bogus value. `body` is passed by `Bytes` so the Parquet reader borrows the
+/// same buffer instead of copying it.
+fn decode_dictionary(body: Bytes, type_id: u32) -> Result<Vec<(u64, Stored)>, CodecError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(body)?;
+    let groups = builder.metadata().num_row_groups();
+    if groups > MAX_ROW_GROUPS {
+        return Err(CodecError::TooManyRowGroups {
+            groups,
+            max: MAX_ROW_GROUPS,
+        });
+    }
+    let claimed = builder.metadata().file_metadata().num_rows();
+    match usize::try_from(claimed) {
+        Ok(rows) if rows <= MAX_SECTION_ROWS => {}
+        Ok(rows) => {
+            return Err(CodecError::TooManyRows {
+                rows,
+                max: MAX_SECTION_ROWS,
+            });
+        }
+        Err(_) => return Err(CodecError::InvalidRowCount { raw: claimed }),
+    }
+
+    let is_blob = type_id == DICT_BLOBS_TYPE_ID;
+    let value_column = if is_blob { "stored_bytes" } else { "bytes" };
     let mut out = Vec::new();
-    for batch in reader {
+    for batch in builder.build()? {
         let batch = batch?;
-        let ids = batch
-            .column_by_name("str_id")
-            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-            .ok_or(CodecError::ColumnType { name: "str_id" })?;
-        let values = batch
-            .column_by_name(value_column)
-            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
-            .ok_or(CodecError::ColumnType { name: value_column })?;
-        for row in 0..batch.num_rows() {
-            out.push((ids.value(row), values.value(row).to_vec()));
+        let ids = u64_column(&batch, "str_id")?;
+        let values = binary_column(&batch, value_column)?;
+        if is_blob {
+            let full_len = u64_column(&batch, "full_len")?;
+            let truncated = bool_column(&batch, "truncated")?;
+            for row in 0..batch.num_rows() {
+                out.push((
+                    ids.value(row),
+                    Stored::Blob {
+                        bytes: values.value(row).to_vec(),
+                        full_len: full_len.value(row),
+                        truncated: truncated.value(row),
+                    },
+                ));
+            }
+        } else {
+            for row in 0..batch.num_rows() {
+                out.push((ids.value(row), Stored::String(values.value(row).to_vec())));
+            }
         }
     }
     Ok(out)
+}
+
+fn u64_column<'a>(
+    batch: &'a RecordBatch,
+    name: &'static str,
+) -> Result<&'a UInt64Array, CodecError> {
+    let column = batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+        .ok_or(CodecError::ColumnType { name })?;
+    reject_nulls(column, name).map(|()| column)
+}
+
+fn binary_column<'a>(
+    batch: &'a RecordBatch,
+    name: &'static str,
+) -> Result<&'a BinaryArray, CodecError> {
+    let column = batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+        .ok_or(CodecError::ColumnType { name })?;
+    reject_nulls(column, name).map(|()| column)
+}
+
+fn bool_column<'a>(
+    batch: &'a RecordBatch,
+    name: &'static str,
+) -> Result<&'a BooleanArray, CodecError> {
+    let column = batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+        .ok_or(CodecError::ColumnType { name })?;
+    reject_nulls(column, name).map(|()| column)
+}
+
+/// A dictionary column carries no `NULL`s.
+fn reject_nulls(array: &dyn Array, name: &'static str) -> Result<(), CodecError> {
+    if array.null_count() == 0 {
+        Ok(())
+    } else {
+        Err(CodecError::NullInRequiredColumn { name })
+    }
 }
 
 /// Read and decode the end catalog from the file's tail.
@@ -267,7 +452,34 @@ fn read_catalog(file: &File, len: u64) -> Result<Catalog, ReadError> {
 
     let mut buf = vec![0_u8; tail.catalog_len as usize];
     file.read_exact_at(&mut buf, catalog_at)?;
-    Catalog::decode(&buf).map_err(ReadError::Catalog)
+    let catalog = Catalog::decode(&buf).map_err(ReadError::Catalog)?;
+
+    // Container invariants: the opening magic, a known format version, and every
+    // section confined to the body before the catalog. Checking them at open
+    // turns a malformed file into a typed error here, not a later decode failure.
+    let mut magic = [0_u8; MAGIC.len()];
+    file.read_exact_at(&mut magic, 0)?;
+    if magic != MAGIC {
+        return Err(ReadError::BadMagic { actual: magic });
+    }
+    if catalog.format_version != FORMAT_VERSION {
+        return Err(ReadError::UnsupportedFormat {
+            version: catalog.format_version,
+        });
+    }
+    for entry in &catalog.entries {
+        let in_bounds = entry.offset >= MAGIC.len() as u64
+            && entry
+                .offset
+                .checked_add(entry.len)
+                .is_some_and(|end| end <= catalog_at);
+        if !in_bounds {
+            return Err(ReadError::SectionOutOfBounds {
+                type_id: entry.type_id,
+            });
+        }
+    }
+    Ok(catalog)
 }
 
 #[cfg(test)]
@@ -276,7 +488,7 @@ mod tests {
     use kronika_registry::Section;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 
-    use super::{ReadError, Segment};
+    use super::{ReadError, Resolved, Segment};
 
     /// Write a one-section segment to a temp file. A chartless segment is
     /// structurally a PGM part, so `build_part` writes a valid one.
@@ -382,9 +594,12 @@ mod tests {
         assert_eq!(dictionary.len(), 2);
         assert_eq!(
             dictionary.resolve(host.get()),
-            Some(b"db-host-01".as_slice())
+            Some(Resolved::String(b"db-host-01"))
         );
-        assert_eq!(dictionary.resolve(node.get()), Some(b"node-7".as_slice()));
+        assert_eq!(
+            dictionary.resolve(node.get()),
+            Some(Resolved::String(b"node-7"))
+        );
         assert_eq!(
             dictionary.resolve(999),
             None,

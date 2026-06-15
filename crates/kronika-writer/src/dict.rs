@@ -80,8 +80,24 @@ pub fn encode(window: &SegmentDicts) -> Result<Vec<DictSection>, CodecError> {
     Ok(sections)
 }
 
+/// Reject an over-cap dictionary section before its arrays are built, so an
+/// oversized window fails fast with the row cap instead of allocating first.
+/// Bounding the entry count in `SegmentDicts` itself is a later step; this is the
+/// section-level guard.
+const fn check_dict_rows(rows: usize) -> Result<(), CodecError> {
+    if rows > MAX_SECTION_ROWS {
+        Err(CodecError::TooManyRows {
+            rows,
+            max: MAX_SECTION_ROWS,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// `dict.strings`: `str_id u64, bytes binary`, sorted by `str_id`.
 fn encode_strings(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, CodecError> {
+    check_dict_rows(entries.len())?;
     entries.sort_unstable_by_key(|entry| entry.str_id.get());
     let ids = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.str_id.get()));
     let bytes = BinaryArray::from_iter_values(entries.iter().map(|entry| entry.stored_bytes));
@@ -96,6 +112,7 @@ fn encode_strings(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, Code
 /// `dict.blobs`: `str_id`, `stored_bytes`, `full_len`, `truncated`, and the
 /// optional `full_sha256` present only for truncated values.
 fn encode_blobs(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, CodecError> {
+    check_dict_rows(entries.len())?;
     entries.sort_unstable_by_key(|entry| entry.str_id.get());
     let ids = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.str_id.get()));
     let stored = BinaryArray::from_iter_values(entries.iter().map(|entry| entry.stored_bytes));

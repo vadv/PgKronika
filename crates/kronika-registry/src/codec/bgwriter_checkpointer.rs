@@ -43,10 +43,10 @@ pub struct BgwriterCheckpointer {
     /// Scheduled checkpoints. `pg_stat_bgwriter.checkpoints_timed` before PG17,
     /// `pg_stat_checkpointer.num_timed` on PG17+. The semantics differ: PG16
     /// counts performed scheduled checkpoints; PG17+ counts both completed and
-    /// skipped (idle) ones, so its rate is not the checkpoint frequency — on an
-    /// idle server it ticks every `checkpoint_timeout` with no work done — and a
-    /// delta spanning the upgrade is not comparable. Same reset split as
-    /// `checkpoint_write_time`.
+    /// skipped ones — the checkpointer skips a scheduled checkpoint when no WAL
+    /// was written since the last — so on a quiet server the count includes those
+    /// skips and is not the rate of real checkpoints, and a delta spanning the
+    /// upgrade is not comparable. Same reset split as `checkpoint_write_time`.
     #[column(c)]
     pub checkpoints_timed: i64,
     /// Requested checkpoints. `checkpoints_req` before PG17,
@@ -68,11 +68,12 @@ pub struct BgwriterCheckpointer {
     #[column(c)]
     pub checkpoint_sync_time: f64,
     /// Buffers written during checkpoints. `pg_stat_bgwriter.buffers_checkpoint`
-    /// before PG17; `pg_stat_checkpointer.buffers_written` on PG17+ — a rename,
-    /// not a semantic change. Both already count restartpoint buffer writes on a
-    /// standby (a restartpoint runs the same checkpoint buffer path), so the rate
-    /// is comparable across the upgrade and needs no adjustment. Same reset split
-    /// as `checkpoint_write_time`.
+    /// before PG17; `pg_stat_checkpointer.buffers_written` on PG17+. PG17 made the
+    /// column description explicitly include restartpoint buffer writes on a
+    /// standby; the pre-PG17 docs only said "during checkpoints". The write path
+    /// is the same, but treat a delta spanning the upgrade on a standby as suspect
+    /// rather than assuming exact equivalence. Same reset split as
+    /// `checkpoint_write_time`.
     #[column(c)]
     pub buffers_checkpoint: i64,
     /// Scheduled restartpoints: the checkpoint path on a hot standby.
