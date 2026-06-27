@@ -19,7 +19,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, PartError, validate_part};
+use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, PartError, validate_part_catalog};
 
 use crate::{Journal, JournalError};
 
@@ -183,7 +183,10 @@ fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
 
     for &part_ref in journal.parts() {
         let part = journal.read_part(part_ref)?;
-        let catalog = validate_part(&part).map_err(SealError::Part)?;
+        // Catalog-only validation: the parts were CRC-checked on append, and the
+        // reader re-verifies every section body's CRC on decode, so re-hashing
+        // them here — the dominant seal cost — adds nothing.
+        let catalog = validate_part_catalog(&part).map_err(SealError::Part)?;
         min_ts = min_ts.min(catalog.min_ts);
         max_ts = max_ts.max(catalog.max_ts);
         if catalog.source_id != 0 {
@@ -281,7 +284,7 @@ mod tests {
     /// One collection window: buffer a bgwriter row and append its part.
     fn append_window(journal: &mut Journal, ts: i64) {
         let mut buffers = SectionBuffers::new();
-        buffers.push(bgwriter(ts));
+        buffers.push(bgwriter(ts)).expect("buffer not full");
         let part = buffers.flush(&[], 0).expect("encode").expect("a part");
         journal.append(&part).expect("append");
     }
@@ -340,7 +343,7 @@ mod tests {
 
         // One data section plus the dictionary in a single part.
         let mut buffers = SectionBuffers::new();
-        buffers.push(bgwriter(1_000));
+        buffers.push(bgwriter(1_000)).expect("buffer not full");
         let part = buffers
             .flush(&dict_sections, 0)
             .expect("flush")

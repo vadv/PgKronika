@@ -55,11 +55,13 @@ pub struct BgwriterCheckpointer {
     #[column(c)]
     pub checkpoints_req: i64,
     /// Time writing checkpoints, ms. `pg_stat_bgwriter.checkpoint_write_time`
-    /// before PG17; `pg_stat_checkpointer.write_time` on PG17+ (which also covers
-    /// restartpoints). Rate validity is version-dependent: a delta is valid only
-    /// within one `bgwriter_stats_reset` before PG17, or one
-    /// `checkpointer_stats_reset` on PG17+ — dividing by the wrong reset yields a
-    /// spurious negative or zero after an independent checkpointer reset.
+    /// before PG17; `pg_stat_checkpointer.write_time` on PG17+, which also covers
+    /// restartpoints — so on a standby, where restartpoints dominate, this is
+    /// mostly restartpoint write time despite the `checkpoint_` name. Rate
+    /// validity is version-dependent: a delta is valid only within one
+    /// `bgwriter_stats_reset` before PG17, or one `checkpointer_stats_reset` on
+    /// PG17+ — dividing by the wrong reset yields a spurious negative or zero
+    /// after an independent checkpointer reset.
     #[column(c)]
     pub checkpoint_write_time: f64,
     /// Time syncing checkpoints, ms. `pg_stat_bgwriter.checkpoint_sync_time`
@@ -76,8 +78,11 @@ pub struct BgwriterCheckpointer {
     /// `checkpoint_write_time`.
     #[column(c)]
     pub buffers_checkpoint: i64,
-    /// Scheduled restartpoints: the checkpoint path on a hot standby.
-    /// `pg_stat_checkpointer.restartpoints_timed`; `None` before PG17.
+    /// Scheduled restartpoints, the checkpoint path on a hot standby.
+    /// `pg_stat_checkpointer.restartpoints_timed`; `None` before PG17. PG17 counts
+    /// these "due to timeout or after a failed attempt to perform it", so a
+    /// failed-and-retried restartpoint bumps this without a matching
+    /// `restartpoints_done`.
     #[column(c)]
     pub restartpoints_timed: Option<i64>,
     /// Requested restartpoints. `pg_stat_checkpointer.restartpoints_req`; `None`
