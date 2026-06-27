@@ -17,7 +17,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use kronika_registry::Ts;
 use kronika_source_pg::collect_bgwriter_checkpointer;
 use kronika_writer::{Journal, JournalConfig, SectionBuffers, seal};
 use tokio::signal::unix::{SignalKind, signal};
@@ -96,10 +95,10 @@ async fn snapshot_and_seal(
     out_dir: &Path,
     source_id: u64,
 ) -> Result<PathBuf> {
-    let ts = Ts(now_micros()?);
-    let row = collect_bgwriter_checkpointer(client, ts)
+    let row = collect_bgwriter_checkpointer(client)
         .await
         .context("collect type 1_006_001")?;
+    let ts = row.ts;
 
     let mut buffers = SectionBuffers::new();
     buffers
@@ -118,13 +117,6 @@ async fn snapshot_and_seal(
     // If sealing failed, keep active.parts for writer-side recovery.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
-}
-
-fn now_micros() -> Result<i64> {
-    let since_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock is before the unix epoch")?;
-    i64::try_from(since_epoch.as_micros()).context("unix microseconds overflow i64")
 }
 
 fn announce(line: &str) {

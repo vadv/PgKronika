@@ -39,8 +39,8 @@ Scenario: every version yields a valid bgwriter/checkpointer snapshot
 For each version it calls `collect_bgwriter_checkpointer` (registry type
 `1_006_001`) and checks that:
 
-- the row carries the timestamp the caller passed;
-- counters are non-negative and `bgwriter_stats_reset` is before collection;
+- the row's `ts` is the server's `clock_timestamp()`, near the harness clock;
+- counters are non-negative and `bgwriter_stats_reset` is before that `ts`;
 - the filled and `NULL` columns match the version: PG17+ fills
   `restartpoints_*` and `checkpointer_stats_reset`, but leaves
   `buffers_backend` empty; earlier versions do the reverse.
@@ -58,8 +58,9 @@ Scenario: every version seals a readable segment with section 1_006_001
 For each version the runner spawns `pg_kronika-collector` (path from
 `KRONIKA_COLLECTOR_BIN`) against the cluster, waits for its `ready` line, sends
 `SIGUSR2`, and reads back the `sealed <path>` it prints. It then opens that
-segment with `kronika-reader` and asserts section `1_006_001` decodes to exactly
-one snapshot row. The segment time range must match that row.
+segment with `kronika-reader`, decodes section `1_006_001` typed, and asserts the
+one row's `ts` equals the segment range and its PG17/pre-17 columns survived the
+round-trip.
 
 ## Quick Local Check
 
