@@ -1,22 +1,17 @@
 //! Per-segment string interner.
 //!
-//! The interner keeps enough bytes to build PGM parts without retaining
-//! every string until segment completion. It uses two stores:
+//! The interner keeps enough bytes to build PGM parts without retaining every
+//! string until segment completion. It has two stores:
 //!
-//! - the **window**: a [`SegmentDicts`] with full bytes for values first seen
-//!   since the previous flush;
-//! - **flushed entries**: one record per id already written to the journal,
-//!   with full length, a 16-byte SHA-256 prefix, and accumulated placement
-//!   requirements. The original text is not kept.
+//! - the **window**: full bytes for values first seen since the previous flush;
+//! - **flushed entries**: compact records for ids already written to the
+//!   journal. Original bytes are not kept.
 //!
-//! At segment completion, the writer rebuilds final dictionaries from
-//! journaled part dictionaries and the remaining window. Two cases need extra
-//! handling:
+//! At seal time, final dictionaries are rebuilt from journaled part dictionaries
+//! and the remaining window. Two cases need extra handling:
 //!
-//! - strict-hot values, such as catalog `source_id` and chart headers, are
-//!   kept in memory and inserted into every window;
-//! - when a flushed value gets a stronger requirement, the value enters the
-//!   window again so the next part records the new placement.
+//! - strict-hot values stay in memory and enter every window;
+//! - a stronger requirement for a flushed value re-enters it into the window.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -215,18 +210,16 @@ impl Interner {
         )
     }
 
-    /// Flush the current window to the journal and keep only compact records.
+    /// Flush the current window to the journal.
     ///
-    /// `write` receives the current window dictionaries. Only after it returns
-    /// `Ok` are entries moved into flushed records and the window cleared. If
-    /// `write` returns `Err`, the window is left unchanged.
+    /// Entries move to compact records only after `write` returns `Ok`. On
+    /// error, the window is left unchanged.
     ///
     /// Returns the number of entries flushed.
     ///
     /// # Errors
     ///
-    /// Returns whatever `write` returns. The interner adds no errors of its
-    /// own.
+    /// Returns whatever `write` returns.
     pub fn flush_window<E>(
         &mut self,
         write: impl FnOnce(&SegmentDicts) -> Result<(), E>,
