@@ -4,8 +4,9 @@
 
 `kronika-bdd` is the BDD runner for PostgreSQL integration scenarios. PostgreSQL
 15, 16, and 17 are provided by Nix, booted in parallel, and queried through
-`tokio-postgres`. It checks the test infrastructure itself and runs the
-`source-pg` collector live against every version.
+`tokio-postgres`. It checks the infrastructure itself, runs the `source-pg`
+collector live against every version, and drives the `pg_kronika-collector`
+binary end to end into a sealed segment.
 
 ## What It Runs
 
@@ -47,6 +48,21 @@ For each version it calls `collect_bgwriter_checkpointer` (registry type
 
 This is the live guard on the collector's version dispatch: a query that no
 longer matches a server's catalog fails here, not in production.
+
+`features/collector.feature` also drives the collector binary end to end:
+
+```gherkin
+Scenario: every version seals a readable segment with section 1_006_001
+  Given the PostgreSQL matrix is booted
+  Then every version is collected into a sealed segment with section 1_006_001
+```
+
+For each version the runner spawns `pg_kronika-collector` (path from
+`KRONIKA_COLLECTOR_BIN`) against the cluster, waits for its `ready` line, sends
+`SIGUSR2`, and reads back the `sealed <path>` it prints. It then opens that
+segment with `kronika-reader` and asserts section `1_006_001` decodes to exactly
+the one snapshot row, with the segment's time range pinned to that snapshot. This
+exercises the whole write/read loop — collect, seal, read — in one check.
 
 ## Quick Local Check
 

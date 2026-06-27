@@ -18,14 +18,21 @@
 )]
 
 mod cluster;
+mod collector;
+
+use std::path::Path;
 
 use anyhow::Context;
 use cucumber::{World, given, then};
+use kronika_reader::Segment;
 use kronika_registry::{Ts, bgwriter_checkpointer::BgwriterCheckpointer};
 use kronika_source_pg::collect_bgwriter_checkpointer;
 
 /// First major version that serves `pg_stat_checkpointer`.
 const PG17_MAJOR: u32 = 17;
+
+/// Registry type id of `pg_stat_bgwriter` + `pg_stat_checkpointer` rows.
+const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
@@ -124,6 +131,48 @@ fn check_snapshot(major: u32, ts: Ts, snap: &BgwriterCheckpointer) -> anyhow::Re
             "postgres {major}: pre-PG17 must not fill the checkpointer columns"
         );
     }
+    Ok(())
+}
+
+#[then("every version is collected into a sealed segment with section 1_006_001")]
+async fn every_version_seals_a_segment(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_sealed_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Open the sealed segment and assert it carries exactly the one snapshot row of
+/// section `1_006_001`, decodable through the reader's CRC-checked path. This
+/// closes the collector loop end to end: collect -> seal -> read.
+fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let entry = segment
+        .catalog()
+        .entries
+        .iter()
+        .find(|entry| entry.type_id == BGWRITER_CHECKPOINTER_TYPE_ID)
+        .with_context(|| format!("postgres {major}: segment has no section 1_006_001"))?;
+    let decoded = segment
+        .decode(entry)
+        .with_context(|| format!("postgres {major}: decode section 1_006_001"))?;
+    anyhow::ensure!(
+        decoded.stats.rows == 1,
+        "postgres {major}: section 1_006_001 has {} rows, expected the one snapshot",
+        decoded.stats.rows
+    );
+    // The segment's recorded range is that single snapshot's ts.
+    let catalog = segment.catalog();
+    anyhow::ensure!(
+        catalog.min_ts == catalog.max_ts && catalog.min_ts > 0,
+        "postgres {major}: segment ts range {}..={} is not one positive instant",
+        catalog.min_ts,
+        catalog.max_ts
+    );
     Ok(())
 }
 
