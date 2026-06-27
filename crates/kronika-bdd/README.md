@@ -2,16 +2,14 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-bdd` is the BDD runner for PostgreSQL integration scenarios. Today it
-checks the test infrastructure itself: PostgreSQL 15, 16, and 17 are provided by
-Nix, booted in parallel, and queried through `tokio-postgres`.
-
-It does not test the collector yet. Collector scenarios will be added on top of
-this runner.
+`kronika-bdd` is the BDD runner for PostgreSQL integration scenarios. PostgreSQL
+15, 16, and 17 are provided by Nix, booted in parallel, and queried through
+`tokio-postgres`. It checks the test infrastructure itself and runs the
+`source-pg` collector live against every version.
 
 ## What It Runs
 
-The current feature is `features/smoke.feature`:
+`features/smoke.feature` proves the infrastructure itself:
 
 ```gherkin
 Scenario: every version is reachable
@@ -27,6 +25,28 @@ For each PostgreSQL major version, the runner:
 - waits until the server accepts TCP connections;
 - runs `SHOW server_version`;
 - checks that the reported version matches the expected major version.
+
+`features/collector.feature` runs the `source-pg` collector against the live
+matrix:
+
+```gherkin
+Scenario: every version yields a plausible bgwriter/checkpointer snapshot
+  Given the PostgreSQL matrix is booted
+  Then every version reports plausible bgwriter/checkpointer stats
+```
+
+For each version it calls `collect_bgwriter_checkpointer` (registry type
+`1_006_001`) and checks that:
+
+- the row carries the timestamp the caller passed;
+- counters are non-negative and `bgwriter_stats_reset` is a real instant no
+  later than collection;
+- the filled and `NULL` columns match the version — PG17+ fills the restartpoint
+  and checkpointer-reset columns and drops `buffers_backend`, while earlier
+  versions do the reverse.
+
+This is the live guard on the collector's version dispatch: a query that no
+longer matches a server's catalog fails here, not in production.
 
 ## Quick Local Check
 
@@ -106,3 +126,6 @@ gets a new image tag.
   connections within 30 seconds. The error includes `server.log`.
 - `server_version` mismatch: the process answered, but not as the expected
   PostgreSQL major version.
+- `collect type 1_006_001 ...` or `postgres NN: ...` from the collector
+  scenario: the query did not match the server's catalog, or the snapshot was
+  implausible. The message names the column or version dispatch that disagreed.

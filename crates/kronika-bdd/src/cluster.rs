@@ -125,16 +125,28 @@ impl Cluster {
         )
     }
 
-    /// `server_version` reported by the running cluster.
-    pub(crate) async fn server_version(&self) -> Result<String> {
+    /// Open a connection, spawning the protocol driver that the returned
+    /// [`Conn`] owns and stops on drop.
+    pub(crate) async fn connect(&self) -> Result<Conn> {
         let (client, connection) =
             tokio_postgres::connect(&self.conn_string(), tokio_postgres::NoTls)
                 .await
                 .context("connect")?;
-        let driver = tokio::spawn(connection);
-        let row = client.query_one("SHOW server_version", &[]).await;
-        driver.abort();
-        Ok(row.context("query server_version")?.get(0))
+        Ok(Conn {
+            client,
+            driver: tokio::spawn(connection),
+        })
+    }
+
+    /// `server_version` reported by the running cluster.
+    pub(crate) async fn server_version(&self) -> Result<String> {
+        let conn = self.connect().await?;
+        let row = conn
+            .client()
+            .query_one("SHOW server_version", &[])
+            .await
+            .context("query server_version")?;
+        Ok(row.get(0))
     }
 
     async fn wait_ready(&self) -> Result<()> {
@@ -160,6 +172,29 @@ impl Cluster {
     fn server_log(&self) -> String {
         std::fs::read_to_string(self.data_dir.path().join(SERVER_LOG))
             .unwrap_or_else(|_| "(server log unavailable)".to_owned())
+    }
+}
+
+/// A live connection to a [`Cluster`]: the client plus the spawned task that
+/// drives its wire protocol. Dropping the guard aborts that task, so a step
+/// that opens one connection per cluster leaves no drivers running afterward.
+pub(crate) struct Conn {
+    client: tokio_postgres::Client,
+    /// Held only to abort on drop; a dropped `JoinHandle` would otherwise detach
+    /// the task to run on.
+    driver: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+}
+
+impl Conn {
+    /// The connected client, for issuing collector queries.
+    pub(crate) const fn client(&self) -> &tokio_postgres::Client {
+        &self.client
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.driver.abort();
     }
 }
 
