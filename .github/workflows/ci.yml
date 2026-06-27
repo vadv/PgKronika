@@ -53,3 +53,69 @@ jobs:
         with:
           name: coverage
           path: coverage.json
+
+  # Build the BDD image with Nix once and publish it to GHCR, keyed by a
+  # content hash of its inputs. A machine (or the matrix job below) then only
+  # pulls the prebuilt image — no Nix build, fast cold start. Only Docker is
+  # used; Nix runs inside the nixos/nix build container.
+  bdd-image:
+    name: bdd image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space for the Nix build
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+      - name: Compute content-hash image ref
+        id: meta
+        run: |
+          hash=$(echo -n "${{ hashFiles('flake.lock', 'flake.nix', 'Cargo.lock', 'crates/kronika-bdd/**') }}")
+          repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${repo}/pgkronika-bdd:sha-${hash:0:16}" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push if the tag is absent
+        run: |
+          image="${{ steps.meta.outputs.image }}"
+          if docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "Image $image already exists; skipping build."
+            exit 0
+          fi
+          docker run --rm -v "$PWD":/work \
+            -e NIX_CONFIG="experimental-features = nix-command flakes" \
+            nixos/nix:latest \
+            sh -c 'cd /work && nix build .#image --out-link /tmp/img && /tmp/img' > image.tar
+          docker load -i image.tar
+          docker tag pgkronika-bdd:latest "$image"
+          docker push "$image"
+
+  # The "launch on a new machine" path: pull the prebuilt image and run it.
+  # The image boots the whole PostgreSQL matrix in parallel internally.
+  bdd-matrix:
+    name: bdd matrix
+    needs: bdd-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and run the PostgreSQL matrix
+        run: |
+          docker pull "${{ needs.bdd-image.outputs.image }}"
+          docker run --rm "${{ needs.bdd-image.outputs.image }}"
