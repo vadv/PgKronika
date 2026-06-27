@@ -84,7 +84,7 @@ jobs:
       - name: Compute content-hash image ref
         id: meta
         run: |
-          hash="${{ hashFiles('flake.lock', 'flake.nix', 'rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'bins/*/Cargo.toml', 'xtask/Cargo.toml', 'crates/kronika-bdd/src/**', 'crates/kronika-bdd/features/**') }}"
+          hash="${{ hashFiles('flake.lock', 'flake.nix', 'rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'bins/*/Cargo.toml', 'xtask/Cargo.toml', 'crates/*/src/**', 'bins/*/src/**', 'crates/kronika-bdd/features/**') }}"
           repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           echo "image=ghcr.io/${repo}/pgkronika-bdd:sha-${hash:0:16}" >> "$GITHUB_OUTPUT"
           echo "artifact=pgkronika-bdd-${hash:0:16}" >> "$GITHUB_OUTPUT"

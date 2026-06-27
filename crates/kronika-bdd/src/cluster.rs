@@ -118,7 +118,9 @@ impl Cluster {
         self.major
     }
 
-    fn conn_string(&self) -> String {
+    /// libpq connection string for this cluster, shared by the harness and the
+    /// collector child the end-to-end scenario spawns.
+    pub(crate) fn conn_string(&self) -> String {
         format!(
             "host=127.0.0.1 port={} user=postgres dbname=postgres",
             self.port

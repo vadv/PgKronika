@@ -6,3 +6,7 @@ Feature: Collector reads bgwriter and checkpointer stats
   Scenario: every version yields a plausible bgwriter/checkpointer snapshot
     Given the PostgreSQL matrix is booted
     Then every version reports plausible bgwriter/checkpointer stats
+
+  Scenario: every version seals a readable segment with section 1_006_001
+    Given the PostgreSQL matrix is booted
+    Then every version is collected into a sealed segment with section 1_006_001
