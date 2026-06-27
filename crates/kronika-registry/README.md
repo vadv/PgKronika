@@ -71,6 +71,11 @@ A snapshot section body is a zstd-compressed Parquet file. `arrow_schema`
 builds the Arrow schema from the contract columns, so codecs use the same
 column order, Arrow types, and nullability as the registry.
 
+`encode` sorts the rows by the contract's `sort_key` before writing, so adjacent
+values in a column are alike and compress well. Rows that tie on the key keep an
+unspecified order, and a decode returns the rows in this sorted order rather than
+the order they were passed in.
+
 The registry contract defines the schema, so the section does **not** embed a
 second copy of it. The writer skips the `ARROW:schema` key-value blob that
 arrow-rs writes by default and clears the Arrow-version string. That removes
@@ -100,8 +105,9 @@ as existing types. Column types map to the narrowest Arrow type that fits
 ## Section Trait
 
 Each generated codec is an `impl Section for T`, so generic code works over
-`T: Section` (`CONTRACT`, `encode`, `decode`) instead of naming each type — a
-shared roundtrip test is written once, not per type.
+`T: Section` (`CONTRACT`, `encode`, `decode`, and `ts_range` for the catalog
+time range) instead of naming each type — a shared roundtrip test is written
+once, not per type, and the writer buffers any type without a per-type case.
 
 When reading a segment, the `type_id` is known only at read time, so the reader
 cannot name `T`. `decode_any(type_id, section)` selects the contract through

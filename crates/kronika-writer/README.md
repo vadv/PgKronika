@@ -11,9 +11,38 @@ what must remain in memory while the segment is being built.
 
 The crate currently exposes:
 
+- `SectionBuffers`, per-type row buffers that encode a collection window into one
+  PGM part;
 - `Interner`, the per-segment string interner over
   `kronika_format::SegmentDicts`;
 - `Journal`, the file-backed `active.parts` journal.
+
+## Section Buffers
+
+`SectionBuffers` is the collection window. A collection step pushes typed rows
+with `push::<T>(row)` for any `T: Section`; the buffers hold one type-erased
+buffer per `type_id`, not a field per type, so a new section type costs one
+`push` and no change here — the property the registry's hundreds of types need.
+A type's buffer never grows past one section's rows (`MAX_SECTION_ROWS`): a full
+buffer hands the row back as `Err(row)`, the signal to flush early and push it
+again, so memory is bounded before a flush, not only at `encode`.
+
+`flush(dict_sections, source_id)` encodes every buffered type to a Parquet body
+(`Section::encode`), reads each type's time range (`Section::ts_range`), and
+calls `kronika_format::build_part` to assemble one PGM part: the data sections in
+`type_id` order, then the `dict_sections` (the COLD-then-WARM segment layout),
+the catalog time range spanning the buffered rows. It returns the part bytes —
+or `None` when nothing is buffered — for the caller to append to the journal, and
+clears the data buffers.
+
+## Dictionary Sections
+
+`dict::encode(window)` turns an interner flush window into `dict.strings` and
+`dict.blobs` Parquet section bodies — one per placement that has entries, sorted
+by `str_id`. These are not registry `Section` types (their columns are
+variable-length binary), so they are encoded directly, but as ordinary section
+bodies a part carries beside the data sections, so snapshot `str_id` columns
+resolve to bytes within the same segment.
 
 ## Interner
 
@@ -61,8 +90,26 @@ append would exceed the cap it fails with `JournalError::Full`, which is the
 signal to merge the journal into a segment early. `reset()` clears the
 journal after a segment has been completed successfully.
 
+## Segment Completion
+
+`seal(journal, dest)` merges the journal's parts into one immutable segment.
+It streams the journal one part at a time — peak memory is one part plus the
+growing catalog, never the whole segment — copies each part's section bodies
+into a sibling `*.tmp`, writes the end catalog, fsyncs, and publishes with a
+hard link so an existing segment is never overwritten. The caller calls
+`Journal::reset` only after `seal` returns `Ok`.
+
+A section type that appears in several parts is kept as repeated catalog entries
+— valid multi-part sections the reader processes in order. Collapsing them into
+one sorted, recompressed section is an optimization of this same path; it
+changes how bodies are written, not the segment format.
+
 ## Not Implemented Yet
 
-Per-type buffers, part merging, segment completion, and Parquet encoding arrive
-in later steps. Dictionary placement and journal frame validation are defined in
+Three optimizations of the seal path remain, none changing the segment format:
+the sort-merge that recompresses repeated sections of one type into one sorted
+section; the dictionary merge that deduplicates a strict-hot value repeated
+across parts (parts are otherwise disjoint, so seal copies their dictionaries as
+is); and the `str_id` bloom filter on `dict.strings` for cross-segment lookup.
+Dictionary placement and journal frame validation are defined in
 `kronika-format`.

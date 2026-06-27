@@ -34,11 +34,17 @@ mod sealed {
 
 pub use codec::{
     CodecError, DecodeStats, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
-    VerifiedSection, arrow_schema, check_row_cap, decode_batches, decode_section, encode_section,
-    nullable_bool, nullable_column, opt_bool, opt_primitive, required_bool, required_column,
-    write_bool, write_bool_nullable, write_nullable, write_required,
+    VerifiedSection, arrow_schema, nullable_bool, nullable_column, opt_bool, opt_primitive,
+    required_bool, required_column, write_bool, write_bool_nullable, write_nullable,
+    write_required,
 };
+// The section-body producers are the forge surface of the sealed `Section`
+// contract: only the in-crate `#[derive(Section)]` and codec tests name them, so
+// a neighboring crate cannot assemble a section body under a copied `TypeId`. The
+// per-column helpers above stay public — harmless without this framing — to avoid
+// dead-code noise for column types not yet in the registry.
 pub use codec::{bgwriter_checkpointer, instance_metadata, reset_metadata};
+pub(crate) use codec::{check_row_cap, decode_batches, decode_section, encode_section};
 pub use contract::{
     Column, ColumnClass, ColumnType, LintError, Semantics, StrId, Ts, TypeContract, lint,
 };
@@ -63,6 +69,17 @@ pub use arrow_array::types::{
     Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
     UInt32Type, UInt64Type,
 };
+
+/// `type_id` of a `dict.strings` section (class 3, dictionary).
+///
+/// Dictionary sections are not [`Section`] types — their columns are
+/// variable-length binary, which the typed codec does not model — so they carry
+/// a constant id here, in the registry's type-id namespace, rather than a
+/// registered [`TypeContract`]. `decode_any` does not handle them; a reader
+/// recognizes these ids and decodes the dictionary directly.
+pub const DICT_STRINGS_TYPE_ID: u32 = 3_001_001;
+/// `type_id` of a `dict.blobs` section. See [`DICT_STRINGS_TYPE_ID`].
+pub const DICT_BLOBS_TYPE_ID: u32 = 3_002_001;
 
 /// Every type id known to this build, in registry order.
 ///
@@ -130,8 +147,9 @@ pub fn decode_any(type_id: u32, section: VerifiedSection) -> Result<DecodedSecti
 /// # Errors
 ///
 /// [`CodecError::SectionTooLarge`] if `expected_len` exceeds the byte cap;
-/// [`CodecError::SectionCrcMismatch`] on a CRC mismatch; otherwise the errors of
-/// [`decode_any`].
+/// otherwise the errors of [`decode_any`]. A CRC mismatch is wrapped in
+/// [`CodecError::Section`] with this `type_id`, so the failure carries the metric
+/// label like every other decode outcome.
 pub fn decode_pooled(
     pool: &BytesPool,
     type_id: u32,
@@ -146,7 +164,23 @@ pub fn decode_pooled(
             max: MAX_SECTION_BYTES,
         });
     }
-    let section = VerifiedSection::verify(pool.load(fill), expected_crc, crc32c)?;
+    let bytes = pool.load(fill);
+    // `fill` is trusted to write the section, but a bug could write past
+    // `expected_len`; cap the buffer before it is hashed, not after, in decode.
+    if bytes.len() > MAX_SECTION_BYTES {
+        return Err(CodecError::SectionTooLarge {
+            len: bytes.len(),
+            max: MAX_SECTION_BYTES,
+        });
+    }
+    let bytes_in = bytes.len();
+    let section = VerifiedSection::verify(bytes, expected_crc, crc32c).map_err(|source| {
+        CodecError::Section {
+            type_id,
+            bytes_in,
+            source: Box::new(source),
+        }
+    })?;
     decode_any(type_id, section)
 }
 
