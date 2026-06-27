@@ -85,8 +85,6 @@ PostgreSQL.
 
 ```sh
 export BDD_IMAGE_PREFIX=ghcr.io/vadv/pgkronika
-platform_slug=$(./scripts/bdd-image.sh platform-slug)
-export BDD_CACHE_FROM="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main"
 export BDD_BUILDER_PULL=1
 
 ./scripts/bdd-image.sh build-builder
@@ -104,14 +102,16 @@ export BDD_BUILDER_PULL=1
 Смысл этого образа в том, чтобы платить эту цену один раз на ключ зависимостей и
 переиспользовать результат при правках только в исходном коде.
 
-Чтобы обновить общий кэш образа сборщика с машины, у которой есть право на
-публикацию:
+Чтобы опубликовать образ сборщика с машины, у которой есть право на публикацию:
 
 ```sh
-export BDD_CACHE_TO="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main,mode=max"
 export BDD_BUILDER_PUSH=1
 ./scripts/bdd-image.sh build-builder
 ```
+
+`BDD_CACHE_FROM` и `BDD_CACHE_TO` можно задать отдельно, если нужен отдельный
+BuildKit-кэш в реестре Docker. Обычный путь опирается на сам образ сборщика: так
+мы не публикуем один и тот же большой `/nix/store` два раза.
 
 ## Полный локальный запуск через Nix
 
@@ -133,11 +133,11 @@ docker run --rm pgkronika-bdd:latest
   запуска;
 - `bdd matrix` запускает уже готовый образ.
 
-Для PR из этого же репозитория образ сборщика и BuildKit-кэш лежат в GHCR. Тег
-образа сборщика зависит от ключа зависимостей и платформы, поэтому правка `src/`
-не пересобирает слой с Rust/PostgreSQL-зависимостями. Образ запуска всё ещё
-получает тег по содержимому; если такой образ уже есть, задание пропускает
-сборку до очистки диска.
+Для PR из этого же репозитория образ сборщика лежит в GHCR. Тег образа сборщика
+зависит от ключа зависимостей и платформы, поэтому правка `src/` не пересобирает
+слой с Rust/PostgreSQL-зависимостями. Образ запуска всё ещё получает тег по
+содержимому; если такой образ уже есть, задание пропускает сборку до очистки
+диска.
 
 PR из форка не публикуют образы в GHCR. Они собирают образ сборщика локально и
 передают образ запуска в `bdd matrix` как временный файл.
@@ -158,8 +158,6 @@ bdd:
     - docker buildx create --use
   script:
     - platform_slug=$(./scripts/bdd-image.sh platform-slug)
-    - export BDD_CACHE_FROM="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main"
-    - export BDD_CACHE_TO="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main,mode=max"
     - export BDD_BUILDER_PULL=1 BDD_BUILDER_PUSH=1
     - export BDD_RUNTIME_IMAGE="${BDD_IMAGE_PREFIX}/pgkronika-bdd:${platform_slug}-sha-$(./scripts/bdd-image.sh image-key | cut -c1-16)"
     - ./scripts/bdd-image.sh build-builder
