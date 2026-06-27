@@ -1,17 +1,6 @@
 //! Segment read path.
 //!
-//! [`Segment::open`] reads a sealed `.pgm` file's end catalog; [`Segment::decode`]
-//! reads one section body by its catalog range and decodes it. Reads are
-//! positional and bounded — the catalog (the file tail) and one section at a
-//! time — so opening and reading a segment never loads the whole file
-//! (segment-format.md, "Reading from S3").
-//!
-//! This is where the registry's CRC trust boundary lands in production: the
-//! reader passes [`kronika_format::crc32c`] into
-//! [`VerifiedSection::verify`](kronika_registry::VerifiedSection::verify), so the
-//! section bytes are checked against the catalog before the Parquet parser sees
-//! them, and the registry stays free of a `kronika-format` dependency
-//! (kronika-registry README, "Section Trait").
+//! Open the end catalog, then read section bodies by catalog range.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
@@ -31,17 +20,12 @@ use kronika_registry::{
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-/// Upper bound on the end-catalog block, checked before it is read.
+/// Upper bound on the end-catalog block, checked before allocation.
 ///
-/// The catalog is the segment tail (target ~1 MiB; segment-format.md), so a far
-/// larger `catalog_len` is a corrupt tail index. The bound stops a bad length
-/// from allocating before the catalog CRC can reject it.
+/// A larger `catalog_len` is treated as a corrupt tail index.
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A sealed segment opened for reading.
-///
-/// Holds the open file and the decoded end catalog; section bodies are read on
-/// demand by [`decode`](Segment::decode).
 #[derive(Debug)]
 pub struct Segment {
     file: File,
@@ -152,16 +136,6 @@ impl From<std::io::Error> for ReadError {
 
 impl Segment {
     /// Open a sealed segment and read its end catalog.
-    ///
-    /// Reads only the tail index and the catalog block (positional, the catalog
-    /// bounded by a cap); section bodies are read later by
-    /// [`decode`](Segment::decode).
-    ///
-    /// # Errors
-    ///
-    /// [`ReadError::TooSmall`], [`ReadError::Tail`], [`ReadError::BadCatalogLen`],
-    /// or [`ReadError::Catalog`] if the file is not a valid segment;
-    /// [`ReadError::Io`] on a read failure.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
@@ -177,16 +151,7 @@ impl Segment {
 
     /// Read and decode one section by its catalog `entry`.
     ///
-    /// Reads the body at `entry.offset` (bounded by [`MAX_SECTION_BYTES`]),
-    /// verifies it against `entry.crc32c` with the format checksum, then decodes
-    /// it through the registry. `entry` must come from this segment's
-    /// [`catalog`](Segment::catalog).
-    ///
-    /// # Errors
-    ///
-    /// [`ReadError::SectionTooLarge`] if the entry length is over the cap;
-    /// [`ReadError::Codec`] on a CRC mismatch, an unknown `type_id`, or a decode
-    /// failure; [`ReadError::Io`] on a read failure.
+    /// `entry` must come from this segment's [`catalog`](Segment::catalog).
     pub fn decode(&self, entry: &Entry) -> Result<DecodedSection, ReadError> {
         if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
             return Err(ReadError::DictionarySection {
@@ -198,16 +163,7 @@ impl Segment {
 
     /// Read the segment's dictionary sections into a `str_id` -> bytes map.
     ///
-    /// Reads every `dict.strings` and `dict.blobs` section and resolves each
-    /// `str_id` to its stored bytes. This loads the dictionaries into memory —
-    /// the segment's string table by design, bounded by the writer's dictionary
-    /// cap (segment-format.md, "Strings and large values").
-    ///
-    /// # Errors
-    ///
-    /// [`ReadError::SectionTooLarge`] over the byte cap; [`ReadError::Codec`] on a
-    /// CRC mismatch or a malformed dictionary section; [`ReadError::Io`] on a read
-    /// failure.
+    /// Loads the segment dictionary into memory.
     pub fn dictionary(&self) -> Result<Dictionary, ReadError> {
         let mut by_id: HashMap<u64, Stored> = HashMap::new();
         for entry in &self.catalog.entries {
@@ -222,9 +178,9 @@ impl Segment {
                     MapEntry::Vacant(slot) => {
                         slot.insert(value);
                     }
-                    // The same id can sit in an early `dict.strings` and a later
-                    // `dict.blobs` after an upgrade; the blob is authoritative and
-                    // carries the truncation metadata, so it wins.
+                    // A later part may move the same id from `dict.strings` to
+                    // `dict.blobs`; the blob carries truncation metadata, so it
+                    // wins.
                     MapEntry::Occupied(mut slot) => {
                         if matches!(value, Stored::Blob { .. }) {
                             slot.insert(value);
@@ -236,10 +192,7 @@ impl Segment {
         Ok(Dictionary { by_id })
     }
 
-    /// Range-read a section body and CRC-verify it against its catalog entry.
-    ///
-    /// A CRC mismatch is tagged with the section's `type_id` and size, so a
-    /// failure on a corrupt segment names the section to skip or re-read.
+    /// Read and CRC-check a section body.
     fn verified_body(&self, entry: &Entry) -> Result<VerifiedSection, ReadError> {
         let len = usize::try_from(entry.len)
             .ok()
@@ -309,9 +262,6 @@ pub struct Dictionary {
 
 impl Dictionary {
     /// The value a `str_id` resolves to, if the segment carries it.
-    ///
-    /// A [`Resolved::Blob`] reports `truncated` and `full_len`, so a caller never
-    /// mistakes a stored prefix for the whole value.
     #[must_use]
     pub fn resolve(&self, str_id: u64) -> Option<Resolved<'_>> {
         self.by_id.get(&str_id).map(Stored::resolved)
@@ -332,11 +282,7 @@ impl Dictionary {
 
 /// Decode a dictionary section body into `(str_id, value)` pairs.
 ///
-/// Enforces the section caps the registry's reader would — row groups and
-/// claimed rows — before reading a column, and rejects a `NULL` in a required
-/// column, so a malformed dictionary cannot grow memory past the bounds or yield
-/// a bogus value. `body` is passed by `Bytes` so the Parquet reader borrows the
-/// same buffer instead of copying it.
+/// Applies row-group and row-count caps before reading dictionary columns.
 fn decode_dictionary(body: Bytes, type_id: u32) -> Result<Vec<(u64, Stored)>, CodecError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(body)?;
     let groups = builder.metadata().num_row_groups();
@@ -454,9 +400,8 @@ fn read_catalog(file: &File, len: u64) -> Result<Catalog, ReadError> {
     file.read_exact_at(&mut buf, catalog_at)?;
     let catalog = Catalog::decode(&buf).map_err(ReadError::Catalog)?;
 
-    // Container invariants: the opening magic, a known format version, and every
-    // section confined to the body before the catalog. Checking them at open
-    // turns a malformed file into a typed error here, not a later decode failure.
+    // Check container-level invariants at open, before callers start decoding
+    // individual sections.
     let mut magic = [0_u8; MAGIC.len()];
     file.read_exact_at(&mut magic, 0)?;
     if magic != MAGIC {
@@ -562,8 +507,7 @@ mod tests {
         use kronika_format::DictLimits;
         use kronika_writer::{Interner, dict};
 
-        // The writer interns and encodes the dictionary; the reader resolves it —
-        // the full string round-trip across the write and read paths.
+        // Covers the write/read boundary for segment dictionaries.
         let mut interner = Interner::new(DictLimits::new(4096, 1 << 20).expect("limits"));
         let host = interner.intern(b"db-host-01").expect("intern");
         let node = interner.intern(b"node-7").expect("intern");

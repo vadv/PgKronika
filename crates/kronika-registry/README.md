@@ -104,24 +104,16 @@ as existing types. Column types map to the narrowest Arrow type that fits
 
 ## Section Trait
 
-Each generated codec is an `impl Section for T`, so generic code works over
-`T: Section` (`CONTRACT`, `encode`, `decode`, and `ts_range` for the catalog
-time range) instead of naming each type — a shared roundtrip test is written
-once, not per type, and the writer buffers any type without a per-type case.
+Each generated codec is an `impl Section for T`. Generic code can use
+`CONTRACT`, `encode`, `decode`, and `ts_range` without naming every registered
+type. The shared roundtrip test and the writer's row buffers rely on that.
 
-When reading a segment, the `type_id` is known only at read time, so the reader
-cannot name `T`. `decode_any(type_id, section)` selects the contract through
-`registry()` and returns a `DecodedSection`: Arrow `RecordBatch`es plus
-`DecodeStats` (`type_id`, input bytes, row groups, batches, rows), which the
-reader can export as RED metrics. On failure, `CodecError::Section` keeps the
-same `type_id` for a failed decode and `CodecError::UnknownType` keeps it for an
-id absent from the registry. `CodecError::section_type_id()` returns that label
-without a separate `match` over variants, so every read outcome can be counted
-under `{type_id}`. No concrete type and no per-type `match` are needed; adding a
-section type means adding one `registry()` entry. Both `T::decode` and
-`decode_any` validate the file schema against the contract — column set, order,
-type, and nullability — so the typed and registry paths accept and reject the
-same bytes.
+When reading a segment, only `type_id` is known. `decode_any(type_id, section)`
+selects the contract through `registry()` and returns Arrow `RecordBatch`es plus
+`DecodeStats`. Errors from this path keep the same `type_id`, so read metrics
+can use one label for success and failure. Adding a section type means adding one
+`registry()` entry. `T::decode` and `decode_any` both validate column set, order,
+type, and nullability against the contract.
 
 `decode` and `decode_any` take a `VerifiedSection`: owned `Bytes` whose CRC was
 checked against the catalog. The bytes are not copied again; the Parquet reader
@@ -130,16 +122,13 @@ read) and pass section slices to decode. A source that reads sections one at a
 time can use `decode_pooled`, which fills a `BytesPool` buffer and returns it to
 the pool after the last `Bytes` reference is dropped. The pool covers only the
 input buffer; decompressed pages and Arrow arrays are new allocations.
-`BytesPool::stats()` reports the reuse and drop counters: a climbing
-`dropped_oversize_total` is the signal that `buffer_limit` sits below the section
-size, so the pool has silently degraded to a per-section allocator.
+`BytesPool::stats()` reports reuse and drop counters. If
+`dropped_oversize_total` grows, `buffer_limit` is below real section sizes and
+the pool is no longer reusing those buffers.
 
-The `Section` trait is public but sealed: a crate-private supertrait that only
-the in-crate `#[derive(Section)]` implements, so `T: Section` always means a
-registry type and no downstream crate can implement it to forge a codec for an
-existing contract. The macro is not public either; the derive routes ids through
-the crate-private `TypeId` constructor, an internal registry tool, not a public
-extension point.
+The `Section` trait is public but closed to downstream impls. A private
+supertrait is implemented only by this crate's derive, so `T: Section` means a
+registry type. The derive macro is not exported.
 
 ## Example: type `1_006_001`
 
@@ -207,14 +196,12 @@ decoded rows. Both are bounded at `MAX_SECTION_ROWS` by the same limits, far
 above what the current regularly sampled single-row sources produce in one
 segment; they limit writer bugs and malformed sections, not normal data.
 
-One risk remains in Parquet decoding itself: a valid-size page can request a
-large buffer from its page header, which the byte limit does not bound. The
-decode entry points therefore take a `VerifiedSection`, not raw bytes, and its only
-constructor — `VerifiedSection::verify(bytes, expected_crc, crc32c)` — runs the
-check, so unverified bytes cannot reach the parser by accident. The crc function
-is passed in by the caller because the catalog checksum code is in
-`kronika-format`. This catches media corruption; a segment deliberately rebuilt
-with a matching CRC is outside the protection model of the format.
+One risk remains in Parquet decoding itself: a page can request memory according
+to its own header. The decode entry points therefore take `VerifiedSection`, not
+raw bytes. `VerifiedSection::verify(bytes, expected_crc, crc32c)` checks the
+section CRC before Parquet sees the bytes. This catches media corruption; a
+segment deliberately rebuilt with matching CRCs is outside the format's
+protection model.
 
 ## Tests
 

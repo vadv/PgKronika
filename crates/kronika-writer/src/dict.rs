@@ -1,14 +1,6 @@
 //! `dict.strings` / `dict.blobs` section encoders.
 //!
-//! Snapshot sections store a `str_id` (a `u64` hash) wherever a string would go;
-//! the bytes live once in these dictionary sections (segment-format.md, "Strings
-//! and large values"). The encoder turns a flush window's [`SegmentDicts`] into
-//! Parquet section bodies, one per placement that has entries.
-//!
-//! These are not registry [`Section`](kronika_registry::Section) types — their
-//! columns are variable-length binary, which the typed codec does not model — so
-//! they are encoded here directly, but as ordinary Parquet section bodies that go
-//! into a part beside the data sections.
+//! Encode `dict.strings` and `dict.blobs` section bodies.
 
 use std::sync::{Arc, LazyLock};
 
@@ -25,9 +17,7 @@ use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
-/// Writer properties shared by every dictionary section: zstd-3, the section
-/// row-group cap, and an empty `created_by` — the same settings as the registry
-/// snapshot codec, built once instead of per section.
+/// Parquet writer properties shared by dictionary sections.
 static DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
     WriterProperties::builder()
         .set_compression(Compression::ZSTD(
@@ -49,17 +39,7 @@ pub struct DictSection {
     pub body: Vec<u8>,
 }
 
-/// Encode a flush window's dictionary into section bodies.
-///
-/// Returns one `dict.strings` section and/or one `dict.blobs` section, each
-/// present only when the window has entries of that placement. Entries are
-/// sorted by `str_id` so the section's min/max stats bound point lookups and so
-/// the bytes are deterministic.
-///
-/// # Errors
-///
-/// [`CodecError::Arrow`] or [`CodecError::Parquet`] if Arrow rejects an array or
-/// Parquet writing fails.
+/// Encode a dictionary window into section bodies.
 pub fn encode(window: &SegmentDicts) -> Result<Vec<DictSection>, CodecError> {
     let mut strings: Vec<EntrySnapshot<'_>> = Vec::new();
     let mut blobs: Vec<EntrySnapshot<'_>> = Vec::new();
@@ -80,10 +60,7 @@ pub fn encode(window: &SegmentDicts) -> Result<Vec<DictSection>, CodecError> {
     Ok(sections)
 }
 
-/// Reject an over-cap dictionary section before its arrays are built, so an
-/// oversized window fails fast with the row cap instead of allocating first.
-/// Bounding the entry count in `SegmentDicts` itself is a later step; this is the
-/// section-level guard.
+/// Reject an over-cap dictionary section before Arrow arrays are built.
 const fn check_dict_rows(rows: usize) -> Result<(), CodecError> {
     if rows > MAX_SECTION_ROWS {
         Err(CodecError::TooManyRows {
@@ -141,17 +118,7 @@ fn encode_blobs(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, CodecE
     section(DICT_BLOBS_TYPE_ID, &batch)
 }
 
-/// Write `batch` to a zstd Parquet body and wrap it as a [`DictSection`].
-///
-/// Enforces the same row and byte caps as a registry snapshot section, so a
-/// dictionary the reader could not open (`capped_reader` rejects over-cap
-/// sections) is an error here, not on read.
-///
-/// # Errors
-///
-/// [`CodecError::TooManyRows`] over [`MAX_SECTION_ROWS`];
-/// [`CodecError::SectionTooLarge`] over [`MAX_SECTION_BYTES`];
-/// [`CodecError::Arrow`] or [`CodecError::Parquet`] on a write failure.
+/// Write `batch` to a capped zstd Parquet body.
 fn section(type_id: u32, batch: &RecordBatch) -> Result<DictSection, CodecError> {
     if batch.num_rows() > MAX_SECTION_ROWS {
         return Err(CodecError::TooManyRows {
