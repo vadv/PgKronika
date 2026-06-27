@@ -15,7 +15,7 @@ pub struct ResetMetadata {
     /// Collection timestamp, unix microseconds.
     #[column(t)]
     pub ts: Ts,
-    /// Postmaster start time. A change marks a PostgreSQL restart, not a stats
+    /// Postmaster start time. A change marks a `PostgreSQL` restart, not a stats
     /// reset by itself: cumulative stats survive a clean shutdown.
     #[column(g)]
     pub postmaster_start_time: Ts,

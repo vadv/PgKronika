@@ -68,6 +68,11 @@ pub const fn registry() -> &'static [TypeContract] {
 }
 
 /// Decode a verified section body using the contract selected by `type_id`.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] for unknown `type_id`, schema mismatch, caps, or
+/// Parquet decode failures.
 pub fn decode_any(type_id: u32, section: VerifiedSection) -> Result<DecodedSection, CodecError> {
     let contract = registry()
         .iter()
@@ -82,6 +87,10 @@ pub fn decode_any(type_id: u32, section: VerifiedSection) -> Result<DecodedSecti
 }
 
 /// Decode a section read into a pooled buffer.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when length, CRC, type lookup, or decoding fails.
 pub fn decode_pooled(
     pool: &BytesPool,
     type_id: u32,
@@ -116,6 +125,10 @@ pub fn decode_pooled(
 }
 
 /// Run the registry linter over every known type.
+///
+/// # Errors
+///
+/// Returns all linter errors found in registered contracts.
 pub fn lint_registry() -> Result<(), Vec<LintError>> {
     lint(registry())
 }

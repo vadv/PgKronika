@@ -40,6 +40,10 @@ pub struct DictSection {
 }
 
 /// Encode a dictionary window into section bodies.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when row caps or Parquet encoding fail.
 pub fn encode(window: &SegmentDicts) -> Result<Vec<DictSection>, CodecError> {
     let mut strings: Vec<EntrySnapshot<'_>> = Vec::new();
     let mut blobs: Vec<EntrySnapshot<'_>> = Vec::new();

@@ -13,9 +13,17 @@ pub trait Section: crate::sealed::Sealed + Sized {
     const CONTRACT: TypeContract;
 
     /// Encode `rows` into a Parquet section body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] when rows exceed caps or Parquet encoding fails.
     fn encode(rows: &[Self]) -> Result<Vec<u8>, CodecError>;
 
     /// Decode a verified section body back into typed rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] when schema, caps, or Parquet decoding fail.
     fn decode(section: VerifiedSection) -> Result<Vec<Self>, CodecError>;
 
     /// Timestamp range for catalog metadata.

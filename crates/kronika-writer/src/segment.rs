@@ -89,6 +89,11 @@ impl From<JournalError> for SealError {
 /// Seal journal parts into an immutable segment at `dest`.
 ///
 /// `dest` is never overwritten. Call `Journal::reset` only after `Ok`.
+///
+/// # Errors
+///
+/// Returns [`SealError`] when the journal is empty, a part is invalid, I/O
+/// fails, or `dest` already exists.
 pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
     if journal.parts().is_empty() {
         return Err(SealError::Empty);

@@ -83,6 +83,14 @@ impl SectionBuffers {
     /// Buffer one row of section type `T`.
     ///
     /// Returns `Err(row)` when this type's buffer is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns the input row when this type already reached the row cap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if two `Section` types use the same `type_id`.
     pub fn push<T: Section + 'static>(&mut self, row: T) -> Result<(), T> {
         let type_id = T::CONTRACT.type_id.get();
         let buffer = self
@@ -108,6 +116,10 @@ impl SectionBuffers {
     }
 
     /// Encode buffered rows and dictionary sections into one PGM part.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] when section encoding or part assembly fails.
     pub fn flush(
         &mut self,
         dict_sections: &[crate::dict::DictSection],

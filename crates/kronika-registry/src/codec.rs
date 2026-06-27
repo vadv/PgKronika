@@ -374,6 +374,10 @@ pub struct VerifiedSection(Bytes);
 
 impl VerifiedSection {
     /// Verify `bytes` against their catalog CRC and wrap them for decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::SectionCrcMismatch`] when the CRC differs.
     pub fn verify(
         bytes: Bytes,
         expected: u32,
@@ -623,6 +627,11 @@ fn primitive_column<'a, T: ArrowPrimitiveType>(
 }
 
 /// A required primitive column; rejects `NULL`.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when the column is missing, has a different type, or
+/// contains `NULL`.
 pub fn required_column<'a, T: ArrowPrimitiveType>(
     batch: &'a RecordBatch,
     name: &'static str,
@@ -636,6 +645,10 @@ pub fn required_column<'a, T: ArrowPrimitiveType>(
 }
 
 /// A nullable primitive column.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when the column is missing or has a different type.
 pub fn nullable_column<'a, T: ArrowPrimitiveType>(
     batch: &'a RecordBatch,
     name: &'static str,
@@ -657,6 +670,11 @@ fn boolean_column<'a>(
 }
 
 /// A required boolean column; rejects `NULL`.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when the column is missing, has a different type, or
+/// contains `NULL`.
 pub fn required_bool<'a>(
     batch: &'a RecordBatch,
     name: &'static str,
@@ -670,6 +688,10 @@ pub fn required_bool<'a>(
 }
 
 /// A nullable boolean column.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when the column is missing or has a different type.
 pub fn nullable_bool<'a>(
     batch: &'a RecordBatch,
     name: &'static str,

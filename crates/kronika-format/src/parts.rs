@@ -41,6 +41,10 @@ impl FrameHeader {
     }
 
     /// Decode a frame header; validates magic and header CRC.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError`] when the magic bytes or header CRC are invalid.
     pub fn decode(bytes: [u8; FRAME_HEADER_LEN]) -> Result<Self, FrameError> {
         let (meta, stored_crc) = split_header(&bytes);
         if meta[..4] != FRAME_MAGIC {
@@ -177,6 +181,11 @@ impl fmt::Display for PartError {
 impl Error for PartError {}
 
 /// Validate a self-contained PGM part, including section CRCs.
+///
+/// # Errors
+///
+/// Returns [`PartError`] when framing, catalog, section bounds, or section CRC
+/// checks fail.
 pub fn validate_part(bytes: &[u8]) -> Result<Catalog, PartError> {
     let catalog = decode_and_bound(bytes)?;
     for entry in &catalog.entries {
@@ -202,6 +211,10 @@ pub fn validate_part(bytes: &[u8]) -> Result<Catalog, PartError> {
 /// Validate part framing and catalog without hashing section bodies.
 ///
 /// Use only when section CRCs are checked elsewhere.
+///
+/// # Errors
+///
+/// Returns [`PartError`] when framing, catalog, or section bounds checks fail.
 pub fn validate_part_catalog(bytes: &[u8]) -> Result<Catalog, PartError> {
     decode_and_bound(bytes)
 }

@@ -136,6 +136,10 @@ impl From<std::io::Error> for ReadError {
 
 impl Segment {
     /// Open a sealed segment and read its end catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] on I/O errors or invalid segment framing.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
@@ -152,6 +156,11 @@ impl Segment {
     /// Read and decode one section by its catalog `entry`.
     ///
     /// `entry` must come from this segment's [`catalog`](Segment::catalog).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the section is a dictionary, out of bounds,
+    /// fails CRC, or fails typed decode.
     pub fn decode(&self, entry: &Entry) -> Result<DecodedSection, ReadError> {
         if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
             return Err(ReadError::DictionarySection {
@@ -164,6 +173,11 @@ impl Segment {
     /// Read the segment's dictionary sections into a `str_id` -> bytes map.
     ///
     /// Loads the segment dictionary into memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when a dictionary section cannot be read or
+    /// decoded.
     pub fn dictionary(&self) -> Result<Dictionary, ReadError> {
         let mut by_id: HashMap<u64, Stored> = HashMap::new();
         for entry in &self.catalog.entries {
