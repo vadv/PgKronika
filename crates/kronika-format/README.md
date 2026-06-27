@@ -12,9 +12,8 @@
 - `str_id` and the per-segment dictionary model;
 - `active.parts` journal frame validation and scanning.
 
-It does not know how section bodies are encoded. Parquet sections, events,
-charts, storage backends, and I/O are handled by other crates. This README
-describes the container subset implemented by this crate.
+This crate does not encode section bodies. Parquet sections, events, charts,
+storage, and I/O live in higher-level crates.
 
 ## Current Contents
 
@@ -33,8 +32,7 @@ The crate currently exposes:
 - `FrameHeader`, `JournalLimits`, `PartRef`, `ScanReport`, and the
   `active.parts` validation and scan errors.
 
-Later implementation steps add HOT block headers and dictionary section
-encoding.
+HOT block headers and dictionary section encoding are not in this crate yet.
 
 ## File Layout
 
@@ -163,18 +161,15 @@ computed over the full original value. Deduplication and collision checks
 for truncated entries therefore compare `(full_len, full_sha256)` rather
 than the stored prefix.
 
-A `str_id` collision inside one segment is unrecoverable by design: the
-writer aborts the segment (`DictError::Collision`). Both default limits
-are starting values of open format questions, so they are parameters of
-`DictLimits`, not constants baked into the logic.
+A `str_id` collision inside one segment is unrecoverable by design: the writer
+aborts the segment (`DictError::Collision`). The default limits are tuning
+values, so `DictLimits` keeps them configurable.
 
-Memory is bounded: total stored bytes are capped by
-`DictLimits::max_total_bytes` (default 64 MiB, sized to the journal frame
-limit). A new value past the cap fails with `DictError::Full` — the signal
-to flush the current window into a journal part. Repeats and requirement
-upgrades of stored values add no bytes; strict-hot values are exempt, because
-the hot contract requires them in every part and the registry bounds their
-number.
+`DictLimits::max_total_bytes` caps stored value bytes (default 64 MiB, sized to
+the journal frame limit). A new value past the cap fails with `DictError::Full`;
+the writer should flush the current window into a journal part. Repeats and
+requirement upgrades of stored values add no bytes. Strict-hot values are exempt:
+the registry bounds their number and requires them in every part.
 
 Encoding dictionaries into on-disk section bytes is left for the typed
 section codecs.
@@ -197,16 +192,12 @@ frame
 `FrameHeader::decode` validates the frame magic and header CRC. `validate_part`
 checks that the part is a self-contained PGM container: segment magic, tail
 index, catalog CRC, section bounds, and section CRCs. `validate_part_catalog`
-checks everything except the per-section body CRCs — for callers that verify
-bodies elsewhere (the segment reader re-checks each one on decode), where
-re-hashing every body would be the dominant cost.
+checks everything except per-section body CRCs; use it only when bodies are
+verified elsewhere and recomputing CRCs would dominate the cost.
 
-`build_part` is the inverse of `validate_part`: from a list of `SectionInput`
-(type id, row count, opaque body) and the segment `PartMeta` (min/max ts,
-source id), it lays the bodies out after the magic, records each one's absolute
-offset and CRC32C, and appends the end catalog — producing bytes `validate_part`
-accepts. The writer assembles a mini-part with it before appending to the
-journal.
+`build_part` lays out `SectionInput` bodies after the magic, records each
+absolute offset and CRC32C, and appends the end catalog. The result is a
+self-contained PGM part accepted by `validate_part`.
 
 `scan_journal` walks a journal buffer and returns:
 
@@ -245,10 +236,9 @@ the scanner first tries the boundary implied by a sane frame header, then
 searches to the end of the buffer, so frames appended after a damaged
 region are always rediscovered, however large the region is.
 
-These numbers should be settled by measuring real segments and journals:
-dictionary sizes, catalog sizes, truncation frequency, and part sizes. Until
-then they are constructor parameters of `DictLimits` and `JournalLimits`, with
-defaults as starting values.
+Set these numbers after measuring real segments and journals: dictionary sizes,
+catalog sizes, truncation frequency, and part sizes. Until then they remain
+constructor parameters of `DictLimits` and `JournalLimits`.
 
 ## Tests
 

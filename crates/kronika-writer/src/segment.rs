@@ -1,16 +1,6 @@
 //! Segment completion: merge the journal's parts into one immutable segment.
 //!
-//! The merge streams the journal one part at a time (peak memory is one part,
-//! bounded by `max_part_len`), copies each part's section bodies into
-//! `segment.pgm.tmp`, and writes the end catalog last. The temporary file is
-//! linked into place with `O_EXCL` semantics so an existing segment is never
-//! overwritten (segment-format.md, "Write and merge").
-//!
-//! A part may hold a section type already present in an earlier part; the
-//! sections are copied verbatim and the catalog keeps them as repeated entries,
-//! which the reader processes in order. Merging repeated sections of one type
-//! into a single sorted, recompressed section is a later optimization of this
-//! same path — it changes how bodies are written here, not the segment format.
+//! Streams journal parts into a temporary file and writes the end catalog last.
 
 use std::error::Error;
 use std::fmt;
@@ -47,12 +37,9 @@ pub enum SealError {
     Part(PartError),
     /// The journal holds no parts, so there is nothing to seal.
     Empty,
-    /// A segment already exists at `dest`; it is never overwritten. Distinct from
-    /// a generic IO error so a caller can treat an already-published segment as
-    /// success-equivalent (the parts are already on disk).
+    /// A segment already exists at `dest`; it is never overwritten.
     AlreadyExists,
-    /// Two parts carry different non-zero `source_id`s, so the journal mixes
-    /// instances and a single segment cannot honestly label its source.
+    /// Two parts carry different non-zero `source_id`s.
     SourceIdMismatch {
         /// The first non-zero source id seen.
         expected: u64,
@@ -99,23 +86,14 @@ impl From<JournalError> for SealError {
     }
 }
 
-/// Seal the journal's parts into an immutable segment at `dest`.
+/// Seal journal parts into an immutable segment at `dest`.
 ///
-/// Streams the journal one part at a time, so peak memory is one part plus the
-/// growing catalog, never the whole segment. The segment is written to a sibling
-/// `*.tmp`, flushed, then linked to `dest`; `dest` is never overwritten, so a
-/// segment already present at that path makes this fail with
-/// [`io::ErrorKind::AlreadyExists`] rather than clobbering it.
-///
-/// The caller clears the journal (`Journal::reset`) only after this returns
-/// `Ok`.
+/// `dest` is never overwritten. Call `Journal::reset` only after `Ok`.
 ///
 /// # Errors
 ///
-/// [`SealError::Empty`] if the journal holds no parts; [`SealError::Part`] if a
-/// part fails container validation; [`SealError::SourceIdMismatch`] if parts
-/// carry conflicting source ids; [`SealError::Journal`] or [`SealError::Io`] on a
-/// read or filesystem failure.
+/// Returns [`SealError`] when the journal is empty, a part is invalid, I/O
+/// fails, or `dest` already exists.
 pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
     if journal.parts().is_empty() {
         return Err(SealError::Empty);
@@ -129,12 +107,9 @@ pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
             return Err(err);
         }
     };
-    // O_EXCL-style publish: hard-link the finished file into place (fails if
-    // `dest` exists), then drop the temporary name. The data is already synced.
+    // Hard-link publish fails if `dest` exists. The data file is already synced.
     if let Err(err) = fs::hard_link(&tmp, dest) {
-        // Failed publish. Drop the temporary best-effort and surface the cause;
-        // an existing destination is its own variant so the caller can tell a
-        // genuine name conflict from other IO errors.
+        // Drop the temporary best-effort and keep `AlreadyExists` distinguishable.
         fs::remove_file(&tmp).ok();
         return Err(if err.kind() == io::ErrorKind::AlreadyExists {
             SealError::AlreadyExists
@@ -142,8 +117,7 @@ pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
             SealError::Io(err)
         });
     }
-    // fsync the directory so the new link is durable before the temporary name is
-    // dropped — otherwise a crash after `remove_file` could lose the link.
+    // Make the new link durable before the temporary name is removed.
     sync_parent_dir(dest)?;
     fs::remove_file(&tmp)?;
     Ok(summary)
@@ -151,11 +125,7 @@ pub fn seal(journal: &Journal, dest: &Path) -> Result<SealSummary, SealError> {
 
 /// A process-unique temporary path beside `dest`.
 ///
-/// The name must never collide with a published segment: `seal` writes it with
-/// `create_new` and hard-links it into place, so a fixed name that happened to be
-/// a leftover hard link to a finished segment would be truncated on the next
-/// `File::create`. The pid plus a per-process counter keeps every attempt
-/// distinct.
+/// Uses pid plus a counter so stale temporary names cannot collide.
 fn tmp_path(dest: &Path) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -166,26 +136,22 @@ fn tmp_path(dest: &Path) -> PathBuf {
 
 /// Write the merged segment to `tmp` and fsync it. The caller publishes it.
 fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
-    // `create_new`: never truncate an existing file, so a stale temporary is an
-    // error, not silent data loss.
+    // Never truncate an existing temporary.
     let file = File::options().create_new(true).write(true).open(tmp)?;
     let mut out = BufWriter::new(file);
 
     out.write_all(&MAGIC)?;
     let mut offset = MAGIC.len() as u64;
     let mut entries: Vec<Entry> = Vec::new();
-    // Track the time range as an empty interval (min > max): a part with no
-    // timestamped data leaves it untouched, so a dictionary-only part cannot drag
-    // the segment's `min_ts` down to 0.
+    // Dictionary-only parts leave this empty interval unchanged.
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     let mut source_id = 0_u64;
 
     for &part_ref in journal.parts() {
         let part = journal.read_part(part_ref)?;
-        // Catalog-only validation: the parts were CRC-checked on append, and the
-        // reader re-verifies every section body's CRC on decode, so re-hashing
-        // them here — the dominant seal cost — adds nothing.
+        // Structural validation is enough here; section CRCs were checked on
+        // append and are checked again by readers.
         let catalog = validate_part_catalog(&part).map_err(SealError::Part)?;
         min_ts = min_ts.min(catalog.min_ts);
         max_ts = max_ts.max(catalog.max_ts);
@@ -199,8 +165,7 @@ fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
             source_id = catalog.source_id;
         }
         for entry in &catalog.entries {
-            // validate_part bounded every offset and len by the part length, a
-            // usize, so the body slice is always in range.
+            // `validate_part_catalog` already bounded the body slice.
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "validate_part bounds offset and len by the part length, a usize"
@@ -215,8 +180,7 @@ fn write_tmp(journal: &Journal, tmp: &Path) -> Result<SealSummary, SealError> {
         }
     }
 
-    // A segment with no timestamped section anywhere records 0..0, not the empty
-    // sentinel.
+    // A segment with no timestamped sections records 0..0.
     if min_ts > max_ts {
         min_ts = 0;
         max_ts = 0;
@@ -304,15 +268,13 @@ mod tests {
         assert_eq!(summary.sections, 2, "one bgwriter section per part");
         assert_eq!((summary.min_ts, summary.max_ts), (1_000, 2_000));
 
-        // A chartless segment is structurally a PGM part, so the same validator
-        // checks the magic, the catalog CRC, and every section CRC.
+        // A chartless segment has the same container shape as a PGM part.
         let segment = std::fs::read(&segment_path).expect("read segment");
         assert_eq!(u64::try_from(segment.len()).unwrap(), summary.bytes);
         let catalog = validate_part(&segment).expect("segment validates");
         assert_eq!(catalog.entries.len(), 2);
 
-        // Each repeated bgwriter section decodes back through the registry with
-        // the real CRC check, holding one row apiece.
+        // Repeated sections decode in catalog order.
         for entry in &catalog.entries {
             assert_eq!(entry.type_id, 1_006_001);
             let start = usize::try_from(entry.offset).unwrap();
