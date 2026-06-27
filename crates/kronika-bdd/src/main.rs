@@ -52,7 +52,10 @@ async fn every_version_answers(world: &mut BddWorld) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() {
+    // The image points this at the feature directory in the Nix store; the
+    // default keeps `cargo run` working from the crate root.
+    let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
     // `run_and_exit` sets the process exit code from the scenario outcome, so a
     // failed matrix run fails the container (and CI).
-    BddWorld::cucumber().run_and_exit("features").await;
+    BddWorld::cucumber().run_and_exit(features).await;
 }
