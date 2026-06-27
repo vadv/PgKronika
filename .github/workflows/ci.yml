@@ -79,7 +79,6 @@ jobs:
           platform_slug=$(echo "${BDD_PLATFORM}" | tr '/_' '-')
           repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           echo "builder=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-${deps_hash:0:16}" >> "$GITHUB_OUTPUT"
-          echo "build_cache=ghcr.io/${repo}/pgkronika-bdd-buildcache:${platform_slug}-main" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${repo}/pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}" >> "$GITHUB_OUTPUT"
           echo "artifact=pgkronika-bdd-${platform_slug}-${image_hash:0:16}" >> "$GITHUB_OUTPUT"
           if [ "${BDD_IMAGE_CAN_PUSH}" = "true" ]; then
@@ -122,8 +121,6 @@ jobs:
           export BDD_BUILDER_IMAGE="${{ steps.meta.outputs.builder }}"
           export BDD_BUILDER_PULL=1
           if [ "${{ steps.meta.outputs.transport }}" = "registry" ]; then
-            export BDD_CACHE_FROM="type=registry,ref=${{ steps.meta.outputs.build_cache }}"
-            export BDD_CACHE_TO="type=registry,ref=${{ steps.meta.outputs.build_cache }},mode=max"
             export BDD_BUILDER_PUSH=1
           fi
           ./scripts/bdd-image.sh build-builder

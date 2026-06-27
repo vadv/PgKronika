@@ -82,8 +82,6 @@ From the repository root:
 
 ```sh
 export BDD_IMAGE_PREFIX=ghcr.io/vadv/pgkronika
-platform_slug=$(./scripts/bdd-image.sh platform-slug)
-export BDD_CACHE_FROM="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main"
 export BDD_BUILDER_PULL=1
 
 ./scripts/bdd-image.sh build-builder
@@ -101,13 +99,16 @@ The first builder build after a dependency change is still expensive. The point
 of the builder image is to pay that cost once per dependency key and reuse it
 for later source-only changes.
 
-To refresh the shared builder cache from a machine that is allowed to push:
+To publish the builder image from a machine that is allowed to push:
 
 ```sh
-export BDD_CACHE_TO="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main,mode=max"
 export BDD_BUILDER_PUSH=1
 ./scripts/bdd-image.sh build-builder
 ```
+
+`BDD_CACHE_FROM` and `BDD_CACHE_TO` can still be set for a separate BuildKit
+registry cache, but the default path relies on the builder image itself. That
+avoids publishing the same large Nix store twice.
 
 ## Full Local Run With Local Nix
 
@@ -128,11 +129,11 @@ The GitHub Actions workflow has two BDD jobs:
 - `bdd image` builds or pulls the BDD builder, then builds the runtime image;
 - `bdd matrix` runs the already built image.
 
-For same-repository runs, the builder image and BuildKit cache are stored in
-GHCR. The builder tag is based on the dependency key and platform, so edits in
-`src/` do not rebuild the Rust/PostgreSQL dependency layer. The final runtime
-image is still tagged by content; if that exact image already exists, the job
-skips the build before cleaning disk space.
+For same-repository runs, the builder image is stored in GHCR. The builder tag is
+based on the dependency key and platform, so edits in `src/` do not rebuild the
+Rust/PostgreSQL dependency layer. The final runtime image is still tagged by
+content; if that exact image already exists, the job skips the build before
+cleaning disk space.
 
 Fork pull requests do not push to GHCR. They build the builder locally and pass
 the runtime image to `bdd matrix` as a short-lived artifact.
@@ -153,8 +154,6 @@ bdd:
     - docker buildx create --use
   script:
     - platform_slug=$(./scripts/bdd-image.sh platform-slug)
-    - export BDD_CACHE_FROM="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main"
-    - export BDD_CACHE_TO="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main,mode=max"
     - export BDD_BUILDER_PULL=1 BDD_BUILDER_PUSH=1
     - export BDD_RUNTIME_IMAGE="${BDD_IMAGE_PREFIX}/pgkronika-bdd:${platform_slug}-sha-$(./scripts/bdd-image.sh image-key | cut -c1-16)"
     - ./scripts/bdd-image.sh build-builder
