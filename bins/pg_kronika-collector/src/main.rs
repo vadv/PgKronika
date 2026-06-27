@@ -1,17 +1,13 @@
-//! Collector daemon: snapshot `PostgreSQL` stats into sealed PGM segments.
+//! Collects `PostgreSQL` stats and writes sealed PGM segments.
 //!
-//! This is the only privileged pgKronika process — it runs on the database
-//! host. On `SIGUSR2` it takes one snapshot (currently type `1_006_001`),
-//! encodes it into a journal part, and seals one `<ts>.pgm` segment. Peak memory
-//! is a single snapshot in flight: the writer bounds journal and section sizes,
-//! and the daemon never reads a segment back.
+//! The daemon runs on the database host. Each `SIGUSR2` collects one
+//! `1_006_001` snapshot, appends it to a temporary journal, seals `<ts>.pgm`,
+//! then clears the journal for the next signal.
 //!
-//! Configuration is environment-only, matching the BDD harness:
+//! Environment:
 //! - `KRONIKA_PG_DSN`: libpq connection string for the target server;
 //! - `KRONIKA_OUT_DIR`: directory that receives sealed segments;
-//! - `KRONIKA_SOURCE_ID`: optional `u64` instance id stamped into parts (0 if unset).
-//!
-//! The part/journal/seal contract lives in `crates/kronika-writer/README.md`.
+//! - `KRONIKA_SOURCE_ID`: optional source id, `0` by default.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
@@ -27,7 +23,6 @@ use kronika_writer::{Journal, JournalConfig, SectionBuffers, seal};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
 
-/// Environment configuration; see the module docs for each variable.
 struct Config {
     dsn: String,
     out_dir: PathBuf,
@@ -60,12 +55,10 @@ async fn main() -> Result<()> {
     let (client, connection) = tokio_postgres::connect(&config.dsn, tokio_postgres::NoTls)
         .await
         .context("connect to PostgreSQL")?;
-    // Drive the connection in the background. If it ends, later collects fail and
-    // are logged, but the daemon keeps serving signals.
+    // The client needs the connection future to keep running.
     tokio::spawn(connection);
 
-    // The journal is process-private: each snapshot appends one part, seals a
-    // segment, then resets. Only sealed segments reach the configured out dir.
+    // Keep active.parts private; publish only sealed segments.
     let journal_dir = tempfile::tempdir().context("create the journal directory")?;
     let (mut journal, _report) = Journal::open(
         &journal_dir.path().join("active.parts"),
@@ -77,8 +70,7 @@ async fn main() -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("install the SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("install the SIGINT handler")?;
 
-    // The readiness line lets a supervisor (and the BDD harness) wait until the
-    // daemon is connected and listening before sending the first SIGUSR2.
+    // Supervisors wait for this before sending the first SIGUSR2.
     announce("ready");
 
     loop {
@@ -98,14 +90,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Take one snapshot and seal it into a fresh segment under `out_dir`, returning
-/// the published path.
-///
-/// # Errors
-///
-/// Returns an error if the collection query, encoding, journal append, or seal
-/// fails. The journal is reset only after a successful seal, per the writer
-/// contract.
 async fn snapshot_and_seal(
     client: &Client,
     journal: &mut Journal,
@@ -131,11 +115,11 @@ async fn snapshot_and_seal(
 
     let dest = out_dir.join(format!("{}.pgm", ts.0));
     seal(journal, &dest).context("seal the segment")?;
+    // If sealing failed, keep active.parts for writer-side recovery.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
 }
 
-/// Current unix time in microseconds, the snapshot timestamp.
 fn now_micros() -> Result<i64> {
     let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -143,11 +127,9 @@ fn now_micros() -> Result<i64> {
     i64::try_from(since_epoch.as_micros()).context("unix microseconds overflow i64")
 }
 
-/// Print a status line to stdout and flush it, so a reader blocked on our output
-/// sees each event immediately. Best-effort: a closed stdout never crashes the
-/// collector.
 fn announce(line: &str) {
     let mut stdout = std::io::stdout().lock();
+    // Tests and supervisors wait on complete status lines.
     writeln!(stdout, "{line}")
         .and_then(|()| stdout.flush())
         .ok();

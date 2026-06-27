@@ -1,10 +1,7 @@
-//! Parallel boot of a `PostgreSQL` version matrix.
+//! Boots throwaway `PostgreSQL` clusters for BDD scenarios.
 //!
-//! Each major version runs as a throwaway cluster: a private data directory,
-//! its own loopback TCP port, `fsync` off (a test never needs durability). The
-//! version binaries come from Nix inside the image; the harness learns their
-//! `bin` directories only through `KRONIKA_PG_MATRIX`. Clusters boot
-//! concurrently, so wall-clock cost is one `initdb`, not one per version.
+//! Nix passes each version's `bin` directory through `KRONIKA_PG_MATRIX`.
+//! Clusters run in private data directories with `fsync` disabled.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,10 +12,8 @@ use tempfile::TempDir;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
-/// How long a freshly started `postgres` has to begin accepting connections.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Per-cluster file capturing `postgres` stderr, so a failed start is visible.
 const SERVER_LOG: &str = "server.log";
 
 /// A `PostgreSQL` major version and the `bin` directory that provides its
@@ -66,10 +61,7 @@ pub(crate) async fn boot_matrix(matrix: &[PgBinary]) -> Result<Vec<Cluster>> {
     Ok(clusters)
 }
 
-/// Pick `n` distinct free TCP ports up front. Choosing them serially (not from
-/// the parallel boots) keeps two clusters from racing onto the same port. A
-/// port can still be taken between here and `postgres` binding it — the small
-/// window `pg_doorman`'s suite also accepts — so a boot tolerates that.
+/// Pick distinct ports before parallel startup to avoid self-collisions.
 fn pick_distinct_ports(n: usize) -> Result<Vec<u16>> {
     let mut ports = Vec::with_capacity(n);
     for _ in 0..(n * 20) {
@@ -118,8 +110,6 @@ impl Cluster {
         self.major
     }
 
-    /// libpq connection string for this cluster, shared by the harness and the
-    /// collector child the end-to-end scenario spawns.
     pub(crate) fn conn_string(&self) -> String {
         format!(
             "host=127.0.0.1 port={} user=postgres dbname=postgres",
@@ -127,8 +117,6 @@ impl Cluster {
         )
     }
 
-    /// Open a connection, spawning the protocol driver that the returned
-    /// [`Conn`] owns and stops on drop.
     pub(crate) async fn connect(&self) -> Result<Conn> {
         let (client, connection) =
             tokio_postgres::connect(&self.conn_string(), tokio_postgres::NoTls)
@@ -177,18 +165,13 @@ impl Cluster {
     }
 }
 
-/// A live connection to a [`Cluster`]: the client plus the spawned task that
-/// drives its wire protocol. Dropping the guard aborts that task, so a step
-/// that opens one connection per cluster leaves no drivers running afterward.
 pub(crate) struct Conn {
     client: tokio_postgres::Client,
-    /// Held only to abort on drop; a dropped `JoinHandle` would otherwise detach
-    /// the task to run on.
+    /// Abort on drop; otherwise the protocol driver keeps running.
     driver: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
 }
 
 impl Conn {
-    /// The connected client, for issuing collector queries.
     pub(crate) const fn client(&self) -> &tokio_postgres::Client {
         &self.client
     }
