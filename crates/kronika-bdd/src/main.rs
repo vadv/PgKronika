@@ -52,5 +52,7 @@ async fn every_version_answers(world: &mut BddWorld) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() {
-    BddWorld::run("features").await;
+    // `run_and_exit` sets the process exit code from the scenario outcome, so a
+    // failed matrix run fails the container (and CI).
+    BddWorld::cucumber().run_and_exit("features").await;
 }
