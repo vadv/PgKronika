@@ -91,10 +91,13 @@ jobs:
             echo "Image $image already exists; skipping build."
             exit 0
           fi
+          # Drop .git so Nix treats the checkout as a plain path: the runner
+          # owns the checkout but Nix runs as root in the container, and
+          # libgit2 refuses a repository it sees as "dubiously owned".
           docker run --rm -v "$PWD":/work \
             -e NIX_CONFIG="experimental-features = nix-command flakes" \
             nixos/nix:latest \
-            sh -c 'cd /work && nix build .#image --out-link /tmp/img && /tmp/img' > image.tar
+            sh -c 'rm -rf /work/.git && cd /work && nix build .#image --out-link /tmp/img && /tmp/img' > image.tar
           docker load -i image.tar
           docker tag pgkronika-bdd:latest "$image"
           docker push "$image"
