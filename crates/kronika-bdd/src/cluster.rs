@@ -21,6 +21,9 @@ const BASE_PORT: u16 = 55_432;
 /// How long a freshly started `postgres` has to begin accepting connections.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-cluster file capturing `postgres` stderr, so a failed start is visible.
+const SERVER_LOG: &str = "server.log";
+
 /// A `PostgreSQL` major version and the `bin` directory that provides its
 /// `initdb` and `postgres` (a Nix store path inside the image).
 #[derive(Debug, Clone)]
@@ -75,8 +78,7 @@ pub(crate) struct Cluster {
     /// is dropped. Declared before `data_dir` so it dies before the dir goes.
     #[allow(dead_code, reason = "owned for its Drop side effect, not read")]
     postgres: Child,
-    /// Removed on drop; held so the data directory outlives `postgres`.
-    #[allow(dead_code, reason = "owned for its Drop side effect, not read")]
+    /// Data directory and unix-socket directory; removed on drop.
     data_dir: TempDir,
 }
 
@@ -128,9 +130,20 @@ impl Cluster {
                 sleep(Duration::from_millis(100)).await;
             }
         };
-        timeout(READY_TIMEOUT, probe)
-            .await
-            .with_context(|| format!("postgres {} not ready on port {}", self.major, self.port))
+        if timeout(READY_TIMEOUT, probe).await.is_err() {
+            anyhow::bail!(
+                "postgres {} not ready on port {} within {READY_TIMEOUT:?}; server log:\n{}",
+                self.major,
+                self.port,
+                self.server_log(),
+            );
+        }
+        Ok(())
+    }
+
+    fn server_log(&self) -> String {
+        std::fs::read_to_string(self.data_dir.path().join(SERVER_LOG))
+            .unwrap_or_else(|_| "(server log unavailable)".to_owned())
     }
 }
 
@@ -161,15 +174,22 @@ async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
 }
 
 fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
+    let log = std::fs::File::create(data_dir.join(SERVER_LOG))
+        .with_context(|| format!("create server log for postgres {}", bin.major))?;
     Command::new(bin.bindir.join("postgres"))
         .arg("-D")
+        .arg(data_dir)
+        // The unix socket goes in the writable data dir; the packaged default
+        // (/run/postgresql) does not exist in the minimal image, and postgres
+        // creates a socket even when it only listens on TCP.
+        .arg("-k")
         .arg(data_dir)
         .args(["-c", "listen_addresses=127.0.0.1"])
         .arg("-p")
         .arg(port.to_string())
         .args(["-c", "fsync=off", "-c", "full_page_writes=off"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log))
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn postgres {}", bin.major))
