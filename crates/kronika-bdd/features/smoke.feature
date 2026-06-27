@@ -1,5 +1,7 @@
-Feature: BDD runner smoke
-  Checks that the cucumber suite starts before PostgreSQL scenarios are added.
+Feature: PostgreSQL matrix smoke
+  Every Nix-provided PostgreSQL version boots in parallel and answers a query.
+  This proves the test infrastructure before any collector scenarios are added.
 
-  Scenario: the runner starts
-    Given the harness is running
+  Scenario: every version is reachable
+    Given the PostgreSQL matrix is booted
+    Then every version answers a version query
