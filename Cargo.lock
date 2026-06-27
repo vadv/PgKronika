@@ -1062,6 +1062,8 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "cucumber",
+ "kronika-registry",
+ "kronika-source-pg",
  "portpicker",
  "tempfile",
  "tokio",
