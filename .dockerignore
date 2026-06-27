@@ -1,0 +1,8 @@
+.git
+.direnv
+target
+result
+result-*
+image.tar
+*.tar
+.DS_Store
