@@ -1,0 +1,16 @@
+[package]
+name = "kronika-bdd"
+description = "BDD scenarios for collector integration tests inside Docker"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cucumber = "0.21"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
