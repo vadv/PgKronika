@@ -12,7 +12,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 
 use kronika_format::{PartMeta, SectionInput, build_part};
-use kronika_registry::{CodecError, Section};
+use kronika_registry::{CodecError, MAX_SECTION_ROWS, Section};
 
 /// One section type's buffered rows, erased so [`SectionBuffers`] can hold many
 /// types in one map. The registry assigns one `Section` type per `type_id`, so
@@ -96,22 +96,35 @@ impl SectionBuffers {
     /// The first row of a type creates its buffer; later rows append. No type is
     /// named here, so adding a section type does not change this code.
     ///
+    /// A type's buffer never grows past [`MAX_SECTION_ROWS`] — one section's
+    /// worth — so memory is bounded before a flush, not only after `encode`. When
+    /// the buffer is full the row is handed back as `Err(row)`: the caller flushes
+    /// and pushes it again (`segment-format.md`, "Write and merge").
+    ///
+    /// # Errors
+    ///
+    /// `Err(row)` when this type's buffer already holds [`MAX_SECTION_ROWS`] rows.
+    ///
     /// # Panics
     ///
     /// Never in practice: the downcast would only fail if two `Section` types
     /// shared a `type_id`, which the registry's `TypeId` construction forbids.
-    pub fn push<T: Section + 'static>(&mut self, row: T) {
+    pub fn push<T: Section + 'static>(&mut self, row: T) -> Result<(), T> {
         let type_id = T::CONTRACT.type_id.get();
         let buffer = self
             .by_type
             .entry(type_id)
             .or_insert_with(|| Box::new(RowBuffer::<T> { rows: Vec::new() }));
-        buffer
+        let rows = &mut buffer
             .as_any_mut()
             .downcast_mut::<RowBuffer<T>>()
             .expect("a type_id maps to exactly one Section type")
-            .rows
-            .push(row);
+            .rows;
+        if rows.len() >= MAX_SECTION_ROWS {
+            return Err(row);
+        }
+        rows.push(row);
+        Ok(())
     }
 
     /// Whether no rows are buffered.
@@ -206,7 +219,7 @@ mod tests {
     use kronika_format::{crc32c, validate_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::instance_metadata::InstanceMetadata;
-    use kronika_registry::{Bytes, StrId, Ts, VerifiedSection, decode_any};
+    use kronika_registry::{Bytes, MAX_SECTION_ROWS, StrId, Ts, VerifiedSection, decode_any};
 
     use super::SectionBuffers;
 
@@ -250,9 +263,9 @@ mod tests {
     fn buffers_many_types_and_flushes_one_part() {
         let mut buffers = SectionBuffers::new();
         assert!(buffers.is_empty());
-        buffers.push(bgwriter(1_000));
-        buffers.push(bgwriter(2_000));
-        buffers.push(instance(1_500));
+        buffers.push(bgwriter(1_000)).expect("buffer not full");
+        buffers.push(bgwriter(2_000)).expect("buffer not full");
+        buffers.push(instance(1_500)).expect("buffer not full");
         assert!(!buffers.is_empty());
 
         let part = buffers
@@ -294,5 +307,16 @@ mod tests {
     fn flushing_an_empty_window_yields_no_part() {
         let mut buffers = SectionBuffers::new();
         assert!(buffers.flush(&[], 0).expect("flush ok").is_none());
+    }
+
+    #[test]
+    fn push_bounces_a_row_when_the_type_buffer_is_full() {
+        let mut buffers = SectionBuffers::new();
+        for _ in 0..MAX_SECTION_ROWS {
+            buffers.push(bgwriter(0)).expect("under the cap");
+        }
+        // A full buffer holds one section's worth; the next row comes back for
+        // the caller to flush and retry, so memory stays bounded before a flush.
+        assert!(buffers.push(bgwriter(0)).is_err());
     }
 }

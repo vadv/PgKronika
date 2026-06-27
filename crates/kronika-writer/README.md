@@ -23,6 +23,9 @@ The crate currently exposes:
 with `push::<T>(row)` for any `T: Section`; the buffers hold one type-erased
 buffer per `type_id`, not a field per type, so a new section type costs one
 `push` and no change here — the property the registry's hundreds of types need.
+A type's buffer never grows past one section's rows (`MAX_SECTION_ROWS`): a full
+buffer hands the row back as `Err(row)`, the signal to flush early and push it
+again, so memory is bounded before a flush, not only at `encode`.
 
 `flush(dict_sections, source_id)` encodes every buffered type to a Parquet body
 (`Section::encode`), reads each type's time range (`Section::ts_range`), and

@@ -211,6 +211,48 @@ impl Error for PartError {}
 ///
 /// A typed [`PartError`] naming the first failed check.
 pub fn validate_part(bytes: &[u8]) -> Result<Catalog, PartError> {
+    let catalog = decode_and_bound(bytes)?;
+    for entry in &catalog.entries {
+        // `decode_and_bound` confirmed every section is in range, so the casts
+        // and the slice are safe.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "offset and len fit in usize: both are bounded by the part length"
+        )]
+        let body = &bytes[entry.offset as usize..(entry.offset + entry.len) as usize];
+        let computed = crc32c(body);
+        if computed != entry.crc32c {
+            return Err(PartError::SectionCrc {
+                type_id: entry.type_id,
+                stored: entry.crc32c,
+                computed,
+            });
+        }
+    }
+    Ok(catalog)
+}
+
+/// Validate a part's container structure without re-checking section body CRCs.
+///
+/// Checks the magic, tail index, catalog CRC, and that every section stays in
+/// bounds — but not `crc32c(body)` per section. Use this only when the bodies are
+/// CRC-verified elsewhere (the reader checks each section on decode), as in
+/// segment sealing, where re-hashing every body of every journal part is the
+/// dominant cost. Use [`validate_part`] for recovery, where bodies are not
+/// otherwise verified.
+///
+/// # Errors
+///
+/// A typed [`PartError`] for any structural failure (magic, tail, catalog CRC, or
+/// a section out of bounds).
+pub fn validate_part_catalog(bytes: &[u8]) -> Result<Catalog, PartError> {
+    decode_and_bound(bytes)
+}
+
+/// Decode a part's catalog and confirm every section is in bounds, without
+/// hashing section bodies. Shared by [`validate_part`] and
+/// [`validate_part_catalog`].
+fn decode_and_bound(bytes: &[u8]) -> Result<Catalog, PartError> {
     // Smallest possible part: magic + empty catalog (meta only) + tail.
     let min_len = MAGIC.len() + crate::META_LEN + TAIL_INDEX_LEN;
     if bytes.len() < min_len {
@@ -252,20 +294,6 @@ pub fn validate_part(bytes: &[u8]) -> Result<Catalog, PartError> {
         if !in_bounds {
             return Err(PartError::SectionOutOfBounds {
                 type_id: entry.type_id,
-            });
-        }
-        // Bounds are checked above, so the casts and the slice are safe.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "offset and len fit in usize: both are bounded by the part length"
-        )]
-        let body = &bytes[entry.offset as usize..(entry.offset + entry.len) as usize];
-        let computed = crc32c(body);
-        if computed != entry.crc32c {
-            return Err(PartError::SectionCrc {
-                type_id: entry.type_id,
-                stored: entry.crc32c,
-                computed,
             });
         }
     }
@@ -664,6 +692,27 @@ mod tests {
         assert!(matches!(
             validate_part(&corrupted),
             Err(PartError::SectionCrc { .. })
+        ));
+    }
+
+    #[test]
+    fn catalog_validation_skips_section_body_crc() {
+        // A part whose body is corrupt but whose catalog is intact: the full
+        // check rejects it, the catalog-only check accepts it (the reader
+        // re-verifies bodies on decode).
+        let mut part = sample_part();
+        part[5] ^= 0x01;
+        assert!(matches!(
+            validate_part(&part),
+            Err(PartError::SectionCrc { .. })
+        ));
+        assert!(validate_part_catalog(&part).is_ok());
+        // The catalog-only check still rejects a structural failure.
+        let mut bad_magic = sample_part();
+        bad_magic[0] ^= 0xFF;
+        assert!(matches!(
+            validate_part_catalog(&bad_magic),
+            Err(PartError::BadMagic { .. })
         ));
     }
 
