@@ -1,9 +1,6 @@
-//! Drives the collector binary for end-to-end scenarios.
+//! Drives `pg_kronika-collector` from BDD scenarios.
 //!
-//! Spawns `pg_kronika-collector` (path from `KRONIKA_COLLECTOR_BIN`) against one
-//! cluster, waits for its readiness line, triggers a snapshot with `SIGUSR2`,
-//! and returns the sealed segment path it prints. The child is killed and its
-//! output directory removed when the [`Collector`] guard drops.
+//! `KRONIKA_COLLECTOR_BIN` points to the binary built into the Docker image.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -17,24 +14,18 @@ use tokio::time::{Duration, timeout};
 
 use crate::cluster::Cluster;
 
-/// How long the collector has to print each expected line. Generous: it covers
-/// connecting, one snapshot, and a segment seal with an fsync.
 const COLLECTOR_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Buffered stdout of the collector child, read one status line at a time.
 type ChildLines = Lines<BufReader<ChildStdout>>;
 
-/// A collector child driven against one cluster. Killed on drop (`kill_on_drop`).
 pub(crate) struct Collector {
     child: Child,
     lines: ChildLines,
-    /// Receives sealed segments; removed on drop, after the scenario has read
-    /// the segment back.
+    /// Keep the output directory alive until the scenario opens the segment.
     _out_dir: tempfile::TempDir,
 }
 
 impl Collector {
-    /// Spawn the collector against `cluster` and wait until it reports ready.
     pub(crate) async fn spawn(cluster: &Cluster) -> Result<Self> {
         let bin =
             std::env::var("KRONIKA_COLLECTOR_BIN").context("KRONIKA_COLLECTOR_BIN is not set")?;
@@ -61,7 +52,6 @@ impl Collector {
         })
     }
 
-    /// Trigger one snapshot with `SIGUSR2` and return the sealed segment path.
     pub(crate) async fn snapshot(&mut self) -> Result<PathBuf> {
         let raw = self.child.id().context("collector already exited")?;
         let pid = Pid::from_raw(i32::try_from(raw).context("collector pid out of range")?);
@@ -75,7 +65,6 @@ impl Collector {
     }
 }
 
-/// Read the next status line, failing if it is not exactly `want`.
 async fn expect_line(lines: &mut ChildLines, want: &str) -> Result<()> {
     let line = next_line(lines).await?;
     ensure!(
@@ -85,8 +74,6 @@ async fn expect_line(lines: &mut ChildLines, want: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read one line of collector stdout, bounding the wait so a stuck child fails
-/// the scenario instead of hanging it.
 async fn next_line(lines: &mut ChildLines) -> Result<String> {
     match timeout(COLLECTOR_TIMEOUT, lines.next_line()).await {
         Ok(Ok(Some(line))) => Ok(line),

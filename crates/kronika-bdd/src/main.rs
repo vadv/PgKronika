@@ -1,9 +1,7 @@
-//! BDD runner for collector integration scenarios.
+//! BDD runner for Docker-only integration scenarios.
 //!
-//! The binary runs inside Docker, where Nix supplies the `PostgreSQL` versions.
-//! It is not a `cargo test` target: host `cargo test --workspace` must not need
-//! a database. The matrix to boot is passed in `KRONIKA_PG_MATRIX`; see
-//! [`cluster`].
+//! Nix supplies `PostgreSQL` versions through `KRONIKA_PG_MATRIX`. Host
+//! `cargo test --workspace` stays database-free.
 #![allow(
     clippy::trivial_regex,
     reason = "cucumber step phrases are literal English, matched as plain text, not real regexes"
@@ -28,10 +26,8 @@ use kronika_reader::Segment;
 use kronika_registry::{Ts, bgwriter_checkpointer::BgwriterCheckpointer};
 use kronika_source_pg::collect_bgwriter_checkpointer;
 
-/// First major version that serves `pg_stat_checkpointer`.
 const PG17_MAJOR: u32 = 17;
 
-/// Registry type id of `pg_stat_bgwriter` + `pg_stat_checkpointer` rows.
 const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
@@ -62,7 +58,7 @@ async fn every_version_answers(world: &mut BddWorld) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[then("every version reports plausible bgwriter/checkpointer stats")]
+#[then("every version reports valid bgwriter/checkpointer stats")]
 async fn every_version_reports_stats(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
     for db in &world.clusters {
@@ -76,7 +72,6 @@ async fn every_version_reports_stats(world: &mut BddWorld) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Current unix time in microseconds, the stamp the collector records as `ts`.
 fn now_micros() -> anyhow::Result<i64> {
     let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -84,11 +79,6 @@ fn now_micros() -> anyhow::Result<i64> {
     i64::try_from(since_epoch.as_micros()).context("unix microseconds overflow i64")
 }
 
-/// Assert a snapshot is internally plausible and that its filled and `NULL`
-/// columns match what `major` exposes. The collector returning a row already
-/// proves the query matches the catalog; this pins the version dispatch so a
-/// future catalog change (as PG17 was) fails loudly instead of silently
-/// reading the wrong view.
 fn check_snapshot(major: u32, ts: Ts, snap: &BgwriterCheckpointer) -> anyhow::Result<()> {
     anyhow::ensure!(
         snap.ts == ts,
@@ -99,8 +89,7 @@ fn check_snapshot(major: u32, ts: Ts, snap: &BgwriterCheckpointer) -> anyhow::Re
         snap.checkpoints_timed >= 0 && snap.buffers_clean >= 0 && snap.buffers_alloc >= 0,
         "postgres {major}: a counter came back negative"
     );
-    // stats_reset is set when the cluster initialises, so it is a real instant
-    // no later than the moment we collected.
+    // The reset timestamp must predate the sampled row.
     anyhow::ensure!(
         snap.bgwriter_stats_reset.0 > 0 && snap.bgwriter_stats_reset.0 <= ts.0,
         "postgres {major}: bgwriter_stats_reset {:?} not in (0, {ts:?}]",
@@ -145,9 +134,6 @@ async fn every_version_seals_a_segment(world: &mut BddWorld) -> anyhow::Result<(
     Ok(())
 }
 
-/// Open the sealed segment and assert it carries exactly the one snapshot row of
-/// section `1_006_001`, decodable through the reader's CRC-checked path. This
-/// closes the collector loop end to end: collect -> seal -> read.
 fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
@@ -165,7 +151,7 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
         "postgres {major}: section 1_006_001 has {} rows, expected the one snapshot",
         decoded.stats.rows
     );
-    // The segment's recorded range is that single snapshot's ts.
+    // The scenario sends one signal, so the segment should cover one timestamp.
     let catalog = segment.catalog();
     anyhow::ensure!(
         catalog.min_ts == catalog.max_ts && catalog.min_ts > 0,
@@ -178,10 +164,7 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() {
-    // The image points this at the feature directory in the Nix store; the
-    // default keeps `cargo run` working from the crate root.
+    // Docker uses the Nix-store feature directory; local `cargo run` uses ./features.
     let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
-    // `run_and_exit` sets the process exit code from the scenario outcome, so a
-    // failed matrix run fails the container (and CI).
     BddWorld::cucumber().run_and_exit(features).await;
 }

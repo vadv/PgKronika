@@ -1,9 +1,7 @@
-//! `PostgreSQL` collectors: query stat views into typed registry rows.
+//! `PostgreSQL` collectors.
 //!
-//! The first source is type `1_006_001` (`pg_stat_bgwriter` +
-//! `pg_stat_checkpointer`). PG17 reorganised the checkpoint counters into a new
-//! view, so the query is dispatched on `server_version_num`; the field-by-field
-//! mapping follows the column docs on [`BgwriterCheckpointer`].
+//! Type `1_006_001` stores `pg_stat_bgwriter` data plus the checkpoint counters
+//! that moved to `pg_stat_checkpointer` in `PostgreSQL` 17.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
@@ -12,14 +10,13 @@
 use kronika_registry::{Ts, bgwriter_checkpointer::BgwriterCheckpointer};
 use tokio_postgres::Client;
 
-/// First `server_version_num` that exposes `pg_stat_checkpointer`.
 const PG17: i32 = 170_000;
 
 /// Collect type `1_006_001` from a connected server, stamping the row with `ts`.
 ///
-/// PG17+ reads the checkpoint counters from `pg_stat_checkpointer`; earlier
-/// versions read them from `pg_stat_bgwriter`. Counters a version does not
-/// expose are left `None`, matching the type contract.
+/// `PostgreSQL` 17+ reads checkpoint counters from `pg_stat_checkpointer`.
+/// Earlier versions read them from `pg_stat_bgwriter`; columns they do not
+/// expose are returned as `None`.
 ///
 /// # Errors
 /// Returns the underlying [`tokio_postgres::Error`] if the server cannot be
@@ -39,7 +36,7 @@ pub async fn collect_bgwriter_checkpointer(
     }
 }
 
-/// `pg_stat_bgwriter` layout, `PostgreSQL` 16 and earlier.
+/// `PostgreSQL` 16 and earlier: all counters come from `pg_stat_bgwriter`.
 async fn collect_pre17(
     client: &Client,
     ts: Ts,
@@ -74,7 +71,7 @@ async fn collect_pre17(
     })
 }
 
-/// `pg_stat_checkpointer` + `pg_stat_bgwriter` layout, `PostgreSQL` 17+.
+/// `PostgreSQL` 17+: checkpoint counters moved to `pg_stat_checkpointer`.
 async fn collect_pg17(
     client: &Client,
     ts: Ts,

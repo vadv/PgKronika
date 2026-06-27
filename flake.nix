@@ -44,17 +44,15 @@
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
-          # Build the harness and the collector it drives; the rest of the
-          # workspace is irrelevant. (-p overrides crane's default --locked, so
-          # pass it back explicitly.)
+          # Build only the two binaries used by the Docker BDD suite.
+          # -p overrides crane's default --locked, so pass it back explicitly.
           cargoExtraArgs = "--locked -p kronika-bdd -p pg_kronika-collector";
           doCheck = false;
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        # Both workspace binaries in one store path: the cucumber harness and the
-        # collector daemon its end-to-end scenario spawns.
+        # Keep both binaries in one store path so the BDD runner can spawn the collector.
         bins = craneLib.buildPackage (
           commonArgs
           // {
@@ -67,14 +65,9 @@
         # KRONIKA_FEATURES inside the image.
         features = ./crates/kronika-bdd/features;
 
-        # The whole BDD suite as one small, layered, FROM-scratch image: the
-        # harness and collector binaries, every PostgreSQL version, and the env
-        # wiring them together. postgres runs as the unprivileged `nobody` user (fakeNss
-        # makes the uid resolvable for initdb); a writable /tmp holds the
-        # throwaway data directories. The heavy layers (postgres, toolchain
-        # closure) are content-addressed, so a code change only rebuilds and
-        # repushes the thin top layer. Built with only Docker on the host via
-        # `nix build .#image` (Nix runs inside the build container).
+        # FROM-scratch image for the BDD suite. PostgreSQL runs as nobody; fakeNss
+        # makes that uid resolvable for initdb, and /tmp holds throwaway data dirs.
+        # Code changes rebuild only the thin app layer.
         image = pkgs.dockerTools.streamLayeredImage {
           name = "pgkronika-bdd";
           tag = "latest";

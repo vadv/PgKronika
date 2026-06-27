@@ -2,15 +2,15 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-bdd` is the BDD runner for PostgreSQL integration scenarios. PostgreSQL
-15, 16, and 17 are provided by Nix, booted in parallel, and queried through
-`tokio-postgres`. It checks the infrastructure itself, runs the `source-pg`
-collector live against every version, and drives the `pg_kronika-collector`
-binary end to end into a sealed segment.
+`kronika-bdd` runs PostgreSQL integration scenarios. Nix provides PostgreSQL
+15, 16, and 17; the runner boots them in parallel and connects through
+`tokio-postgres`. The suite checks the cluster setup, calls the `source-pg`
+collector against every version, and runs `pg_kronika-collector` until it writes
+a sealed segment.
 
 ## What It Runs
 
-`features/smoke.feature` proves the infrastructure itself:
+`features/smoke.feature` checks the cluster setup:
 
 ```gherkin
 Scenario: every version is reachable
@@ -27,29 +27,27 @@ For each PostgreSQL major version, the runner:
 - runs `SHOW server_version`;
 - checks that the reported version matches the expected major version.
 
-`features/collector.feature` runs the `source-pg` collector against the live
-matrix:
+`features/collector.feature` calls the `source-pg` collector against the
+running PostgreSQL versions:
 
 ```gherkin
-Scenario: every version yields a plausible bgwriter/checkpointer snapshot
+Scenario: every version yields a valid bgwriter/checkpointer snapshot
   Given the PostgreSQL matrix is booted
-  Then every version reports plausible bgwriter/checkpointer stats
+  Then every version reports valid bgwriter/checkpointer stats
 ```
 
 For each version it calls `collect_bgwriter_checkpointer` (registry type
 `1_006_001`) and checks that:
 
 - the row carries the timestamp the caller passed;
-- counters are non-negative and `bgwriter_stats_reset` is a real instant no
-  later than collection;
-- the filled and `NULL` columns match the version — PG17+ fills the restartpoint
-  and checkpointer-reset columns and drops `buffers_backend`, while earlier
-  versions do the reverse.
+- counters are non-negative and `bgwriter_stats_reset` is before collection;
+- the filled and `NULL` columns match the version: PG17+ fills
+  `restartpoints_*` and `checkpointer_stats_reset`, but leaves
+  `buffers_backend` empty; earlier versions do the reverse.
 
-This is the live guard on the collector's version dispatch: a query that no
-longer matches a server's catalog fails here, not in production.
+This catches a stale query or wrong version branch in the BDD suite.
 
-`features/collector.feature` also drives the collector binary end to end:
+The same feature also starts the collector binary:
 
 ```gherkin
 Scenario: every version seals a readable segment with section 1_006_001
@@ -61,23 +59,23 @@ For each version the runner spawns `pg_kronika-collector` (path from
 `KRONIKA_COLLECTOR_BIN`) against the cluster, waits for its `ready` line, sends
 `SIGUSR2`, and reads back the `sealed <path>` it prints. It then opens that
 segment with `kronika-reader` and asserts section `1_006_001` decodes to exactly
-the one snapshot row, with the segment's time range pinned to that snapshot. This
-exercises the whole write/read loop — collect, seal, read — in one check.
+one snapshot row. The segment time range must match that row.
 
 ## Quick Local Check
 
-This runs only the host-safe unit tests. It does not start PostgreSQL:
+This runs only unit tests. It does not start PostgreSQL:
 
 ```sh
 cargo test -p kronika-bdd
 ```
 
-Use this for parser and harness-code changes. It is not the full matrix test.
+Use this for `KRONIKA_PG_MATRIX` parsing and runner code. It is not the full
+PostgreSQL run.
 
 ## Full Local Run With Docker
 
-This is the same path CI uses, but written safely for a developer checkout. It
-does not require Nix on the host; Nix runs inside a pinned `nixos/nix` image.
+This follows the CI path without writing into the checkout. It does not require
+Nix on the host; Nix runs inside a pinned `nixos/nix` image.
 
 From the repository root:
 
@@ -102,7 +100,7 @@ docker run --rm pgkronika-bdd:latest
 ```
 
 The first command builds the image tarball. The second loads it into Docker. The
-third runs the matrix.
+third runs the PostgreSQL 15, 16, and 17 checks.
 
 `image.tar` is only a local artifact; remove it when it is no longer needed.
 
@@ -140,8 +138,8 @@ gets a new image tag.
   without PostgreSQL binary paths.
 - `postgres ... not ready`: the server failed to start or did not accept TCP
   connections within 30 seconds. The error includes `server.log`.
-- `server_version` mismatch: the process answered, but not as the expected
+- `server_version` mismatch: the process answered, but not with the expected
   PostgreSQL major version.
 - `collect type 1_006_001 ...` or `postgres NN: ...` from the collector
   scenario: the query did not match the server's catalog, or the snapshot was
-  implausible. The message names the column or version dispatch that disagreed.
+  rejected by the checks. The message names the column or version branch.
