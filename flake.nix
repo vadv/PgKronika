@@ -44,10 +44,9 @@
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
-          # Build only the harness; the rest of the workspace is irrelevant to it.
-          cargoExtraArgs = "-p kronika-bdd";
-          # The harness talks to PostgreSQL over TCP with a pure-Rust client,
-          # so no system libraries are needed.
+          # Build only the harness; the rest of the workspace is irrelevant.
+          # (-p overrides crane's default --locked, so pass it back explicitly.)
+          cargoExtraArgs = "--locked -p kronika-bdd";
           doCheck = false;
         };
 
