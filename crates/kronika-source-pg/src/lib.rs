@@ -12,7 +12,11 @@ use tokio_postgres::Client;
 
 const PG17: i32 = 170_000;
 
-/// Collect type `1_006_001` from a connected server, stamping the row with `ts`.
+/// Collect type `1_006_001` from a connected server.
+///
+/// The row's `ts` is the server's `clock_timestamp()`, read in the same query as
+/// the stats, so `stats_reset <= ts` holds on the server and does not depend on
+/// the collector host clock.
 ///
 /// `PostgreSQL` 17+ reads checkpoint counters from `pg_stat_checkpointer`.
 /// Earlier versions read them from `pg_stat_bgwriter`; columns they do not
@@ -23,36 +27,33 @@ const PG17: i32 = 170_000;
 /// queried.
 pub async fn collect_bgwriter_checkpointer(
     client: &Client,
-    ts: Ts,
 ) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
     let version_num: i32 = client
         .query_one("SELECT current_setting('server_version_num')::int", &[])
         .await?
         .get(0);
     if version_num >= PG17 {
-        collect_pg17(client, ts).await
+        collect_pg17(client).await
     } else {
-        collect_pre17(client, ts).await
+        collect_pre17(client).await
     }
 }
 
 /// `PostgreSQL` 16 and earlier: all counters come from `pg_stat_bgwriter`.
-async fn collect_pre17(
-    client: &Client,
-    ts: Ts,
-) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
+async fn collect_pre17(client: &Client) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
     let row = client
         .query_one(
             "SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, \
              checkpoint_sync_time, buffers_checkpoint, buffers_clean, maxwritten_clean, \
              buffers_backend, buffers_backend_fsync, buffers_alloc, \
-             (extract(epoch from stats_reset) * 1e6)::bigint AS stats_reset_us \
+             (extract(epoch from stats_reset) * 1e6)::bigint AS stats_reset_us, \
+             (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us \
              FROM pg_stat_bgwriter",
             &[],
         )
         .await?;
     Ok(BgwriterCheckpointer {
-        ts,
+        ts: Ts(row.get("ts_us")),
         checkpoints_timed: row.get("checkpoints_timed"),
         checkpoints_req: row.get("checkpoints_req"),
         checkpoint_write_time: row.get("checkpoint_write_time"),
@@ -72,23 +73,21 @@ async fn collect_pre17(
 }
 
 /// `PostgreSQL` 17+: checkpoint counters moved to `pg_stat_checkpointer`.
-async fn collect_pg17(
-    client: &Client,
-    ts: Ts,
-) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
+async fn collect_pg17(client: &Client) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
     let row = client
         .query_one(
             "SELECT c.num_timed, c.num_requested, c.write_time, c.sync_time, \
              c.buffers_written, c.restartpoints_timed, c.restartpoints_req, \
              c.restartpoints_done, b.buffers_clean, b.maxwritten_clean, b.buffers_alloc, \
              (extract(epoch from b.stats_reset) * 1e6)::bigint AS bgwriter_reset_us, \
-             (extract(epoch from c.stats_reset) * 1e6)::bigint AS checkpointer_reset_us \
+             (extract(epoch from c.stats_reset) * 1e6)::bigint AS checkpointer_reset_us, \
+             (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us \
              FROM pg_stat_bgwriter b, pg_stat_checkpointer c",
             &[],
         )
         .await?;
     Ok(BgwriterCheckpointer {
-        ts,
+        ts: Ts(row.get("ts_us")),
         checkpoints_timed: row.get("num_timed"),
         checkpoints_req: row.get("num_requested"),
         checkpoint_write_time: row.get("write_time"),
