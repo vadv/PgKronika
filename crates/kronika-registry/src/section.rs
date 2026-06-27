@@ -45,11 +45,24 @@ pub trait Section: crate::sealed::Sealed + Sized {
     /// on malformed Parquet, or a column error if the file does not match
     /// [`CONTRACT`](Section::CONTRACT).
     fn decode(section: VerifiedSection) -> Result<Vec<Self>, CodecError>;
+
+    /// The `(min, max)` of this type's timestamp column across `rows`, or `None`
+    /// when the type has no timestamp column.
+    ///
+    /// The writer folds these into the part and segment catalog time range, which
+    /// drives time-range reads and merge idempotency (README.md, "Section Trait").
+    /// The derive reads the `#[column(t)]` field, so a type without one — a
+    /// dictionary or event section — returns `None`.
+    fn ts_range(rows: &[Self]) -> Option<(i64, i64)>;
 }
 
 /// Encode `rows`, decode the section back, and assert they roundtrip — the
 /// shared codec test the trait exists to enable, so each type's test is one
 /// line, not a custom encode/decode check.
+///
+/// `encode` sorts by the sort key, so a decode returns rows in that order: pass
+/// `rows` already in sort-key order (with distinct keys) so the comparison is
+/// against a defined order.
 #[cfg(test)]
 pub(crate) fn assert_roundtrips<T>(rows: &[T])
 where

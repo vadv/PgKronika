@@ -196,7 +196,17 @@ frame
 
 `FrameHeader::decode` validates the frame magic and header CRC. `validate_part`
 checks that the part is a self-contained PGM container: segment magic, tail
-index, catalog CRC, section bounds, and section CRCs.
+index, catalog CRC, section bounds, and section CRCs. `validate_part_catalog`
+checks everything except the per-section body CRCs — for callers that verify
+bodies elsewhere (the segment reader re-checks each one on decode), where
+re-hashing every body would be the dominant cost.
+
+`build_part` is the inverse of `validate_part`: from a list of `SectionInput`
+(type id, row count, opaque body) and the segment `PartMeta` (min/max ts,
+source id), it lays the bodies out after the magic, records each one's absolute
+offset and CRC32C, and appends the end catalog — producing bytes `validate_part`
+accepts. The writer assembles a mini-part with it before appending to the
+journal.
 
 `scan_journal` walks a journal buffer and returns:
 

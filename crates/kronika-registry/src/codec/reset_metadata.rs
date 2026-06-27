@@ -28,8 +28,11 @@ pub struct ResetMetadata {
     /// Collection timestamp, unix microseconds.
     #[column(t)]
     pub ts: Ts,
-    /// Postmaster start time; a change means `PostgreSQL` restarted, so
-    /// cumulative counters restarted with it.
+    /// Postmaster start time. A change marks a `PostgreSQL` restart, but it is
+    /// context, not a reset marker: cumulative stats survive a clean shutdown and
+    /// reset only on crash recovery, `pg_stat_reset*`, or a base backup / PITR.
+    /// The reset of record is each view's own `stats_reset`; this only dates the
+    /// process.
     #[column(g)]
     pub postmaster_start_time: Ts,
     /// Max `stats_reset` across `pg_stat_database`; a coarse database-level
@@ -99,6 +102,8 @@ mod tests {
 
     fn pg15_row() -> ResetMetadata {
         ResetMetadata {
+            // A distinct, earlier `ts` so the two rows have a defined sort order.
+            ts: Ts(1_000_000),
             // Pre-PG16 and no extensions: io reset absent, ext versions and GUCs
             // unknown.
             pg_stat_io_reset_at: None,
@@ -117,6 +122,8 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_values_and_nulls() {
-        crate::assert_roundtrips(&[pg17_row(), pg15_row()]);
+        // Passed in sort-key (`ts`) order: encode sorts, so a roundtrip returns
+        // the rows in that order.
+        crate::assert_roundtrips(&[pg15_row(), pg17_row()]);
     }
 }

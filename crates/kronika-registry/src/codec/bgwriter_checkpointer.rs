@@ -42,9 +42,11 @@ pub struct BgwriterCheckpointer {
     pub ts: Ts,
     /// Scheduled checkpoints. `pg_stat_bgwriter.checkpoints_timed` before PG17,
     /// `pg_stat_checkpointer.num_timed` on PG17+. The semantics differ: PG16
-    /// counts performed scheduled checkpoints, PG17+ counts both completed and
-    /// skipped (idle) ones, so a delta spanning the upgrade is not comparable.
-    /// Same reset split as `checkpoint_write_time`.
+    /// counts performed scheduled checkpoints; PG17+ counts both completed and
+    /// skipped ones — the checkpointer skips a scheduled checkpoint when no WAL
+    /// was written since the last — so on a quiet server the count includes those
+    /// skips and is not the rate of real checkpoints, and a delta spanning the
+    /// upgrade is not comparable. Same reset split as `checkpoint_write_time`.
     #[column(c)]
     pub checkpoints_timed: i64,
     /// Requested checkpoints. `checkpoints_req` before PG17,
@@ -53,11 +55,13 @@ pub struct BgwriterCheckpointer {
     #[column(c)]
     pub checkpoints_req: i64,
     /// Time writing checkpoints, ms. `pg_stat_bgwriter.checkpoint_write_time`
-    /// before PG17; `pg_stat_checkpointer.write_time` on PG17+ (which also covers
-    /// restartpoints). Rate validity is version-dependent: a delta is valid only
-    /// within one `bgwriter_stats_reset` before PG17, or one
-    /// `checkpointer_stats_reset` on PG17+ — dividing by the wrong reset yields a
-    /// spurious negative or zero after an independent checkpointer reset.
+    /// before PG17; `pg_stat_checkpointer.write_time` on PG17+, which also covers
+    /// restartpoints — so on a standby, where restartpoints dominate, this is
+    /// mostly restartpoint write time despite the `checkpoint_` name. Rate
+    /// validity is version-dependent: a delta is valid only within one
+    /// `bgwriter_stats_reset` before PG17, or one `checkpointer_stats_reset` on
+    /// PG17+ — dividing by the wrong reset yields a spurious negative or zero
+    /// after an independent checkpointer reset.
     #[column(c)]
     pub checkpoint_write_time: f64,
     /// Time syncing checkpoints, ms. `pg_stat_bgwriter.checkpoint_sync_time`
@@ -66,15 +70,19 @@ pub struct BgwriterCheckpointer {
     #[column(c)]
     pub checkpoint_sync_time: f64,
     /// Buffers written during checkpoints. `pg_stat_bgwriter.buffers_checkpoint`
-    /// before PG17; `pg_stat_checkpointer.buffers_written` on PG17+, renamed and
-    /// now also counting restartpoint writes. On a standby the PG17 value
-    /// therefore includes restartpoint buffers a PG16 row never had, so a rate
-    /// spanning the upgrade jumps; subtract restartpoint writes to compare. Same
-    /// reset split as `checkpoint_write_time`.
+    /// before PG17; `pg_stat_checkpointer.buffers_written` on PG17+. PG17 made the
+    /// column description explicitly include restartpoint buffer writes on a
+    /// standby; the pre-PG17 docs only said "during checkpoints". The write path
+    /// is the same, but treat a delta spanning the upgrade on a standby as suspect
+    /// rather than assuming exact equivalence. Same reset split as
+    /// `checkpoint_write_time`.
     #[column(c)]
     pub buffers_checkpoint: i64,
-    /// Scheduled restartpoints: the checkpoint path on a hot standby.
-    /// `pg_stat_checkpointer.restartpoints_timed`; `None` before PG17.
+    /// Scheduled restartpoints, the checkpoint path on a hot standby.
+    /// `pg_stat_checkpointer.restartpoints_timed`; `None` before PG17. PG17 counts
+    /// these "due to timeout or after a failed attempt to perform it", so a
+    /// failed-and-retried restartpoint bumps this without a matching
+    /// `restartpoints_done`.
     #[column(c)]
     pub restartpoints_timed: Option<i64>,
     /// Requested restartpoints. `pg_stat_checkpointer.restartpoints_req`; `None`
@@ -195,6 +203,20 @@ mod tests {
     fn roundtrip_preserves_values_and_nulls() {
         // One section may contain rows from both PostgreSQL layouts.
         crate::assert_roundtrips(&[pg16_row(1_000_000), pg17_row(2_000_000)]);
+    }
+
+    #[test]
+    fn encode_sorts_rows_by_the_sort_key() {
+        // Rows given out of `ts` order come back sorted: encode orders by the
+        // contract sort key for compression.
+        let bytes = BgwriterCheckpointer::encode(&[pg17_row(2_000_000), pg16_row(1_000_000)])
+            .expect("encode");
+        let decoded =
+            BgwriterCheckpointer::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
+        assert_eq!(
+            decoded.iter().map(|row| row.ts.0).collect::<Vec<_>>(),
+            [1_000_000, 2_000_000]
+        );
     }
 
     #[test]
