@@ -1,5 +1,5 @@
 # Only stable options: the toolchain is pinned to stable (rust-toolchain.toml),
-# unstable options would be silently ignored there.
+# unstable options would be ignored there without diagnostics.
 style_edition = "2024"
 newline_style = "Unix"
 use_field_init_shorthand = true

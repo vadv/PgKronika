@@ -1,8 +1,8 @@
 //! File-backed `active.parts` journal.
 //!
-//! `kronika-format` defines frame bytes and recovery classification. This
-//! module handles the file: validated appends, file sync, recovery on open,
-//! truncation of an incomplete final frame, and reads for later merging.
+//! `kronika-format` defines frame bytes and damage classification. This module
+//! validates appends, syncs the file, scans it on open, truncates an incomplete
+//! final frame, and reads parts for merging.
 //!
 //! Recovery policy:
 //!
@@ -13,14 +13,9 @@
 //! - damaged bytes that cannot be repaired stay on disk, and new frames are
 //!   appended after them.
 //!
-//! Recovery streams the file frame by frame instead of loading it into
-//! memory: peak memory is one part plus its decoded catalog — at most
-//! twice `max_part_len`, reached only by a pathological all-catalog part —
-//! plus a small search window during resynchronization and 16 bytes of
-//! directory per recovered frame; never the journal bytes themselves. The
-//! journal size is capped by [`JournalConfig::max_journal_len`]: when an
-//! append would grow the file past the cap, it fails with
-//! [`JournalError::Full`], which is the signal to merge early and reset.
+//! Recovery streams frame by frame. Peak memory is one part, its decoded
+//! catalog, a small resynchronization window, and 16 bytes per recovered frame.
+//! [`JournalError::Full`] tells the caller to merge early and reset.
 
 use std::error::Error;
 use std::fmt;
@@ -36,12 +31,9 @@ use kronika_format::{
 
 /// Default cap for the whole journal file, bytes.
 ///
-/// A starting value, not a settled decision. On overflow
-/// [`Journal::append`] returns [`JournalError::Full`] and the caller is
-/// expected to merge early. The first frame after open/reset is exempt so
-/// a tiny cap cannot wedge an empty journal, so the actual disk bound is
-/// `max(max_journal_len, FRAME_HEADER_LEN + max_part_len)` plus any
-/// preserved damaged regions.
+/// A starting value. [`Journal::append`] returns [`JournalError::Full`] when
+/// this cap is reached. The first frame after open/reset is exempt, so a tiny
+/// cap cannot wedge an empty journal.
 pub const DEFAULT_MAX_JOURNAL_LEN: usize = 1024 * 1024 * 1024;
 
 /// Search-window size for streaming recovery.
@@ -187,11 +179,9 @@ pub struct Journal {
 impl Journal {
     /// Open or create the journal at `path`, then scan it for recovery.
     ///
-    /// The recovery scan streams the file frame by frame; it holds at most
-    /// one part and its decoded catalog in memory, plus a 16-byte
-    /// directory entry per recovered frame. An incomplete final frame is
-    /// truncated immediately and the file is synced. Other damaged regions
-    /// are reported but left on disk; new frames are appended after them.
+    /// An incomplete final frame is truncated immediately. Other damaged
+    /// regions are reported but left on disk; new frames are appended after
+    /// them.
     ///
     /// # Errors
     ///
@@ -246,12 +236,9 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::PartTooLarge`] if the part exceeds the frame
-    /// limit, [`JournalError::Full`] if the journal would exceed its cap
-    /// (merge early and [`Journal::reset`]), [`JournalError::InvalidPart`]
-    /// if the body is not a valid PGM part, and [`JournalError::Io`] if the
-    /// write or sync fails. On error, the in-memory journal state is
-    /// unchanged.
+    /// Returns [`JournalError`] when the part is too large, invalid, the
+    /// journal is full, or the file write/sync fails. On error, in-memory
+    /// state is unchanged.
     pub fn append(&mut self, part: &[u8]) -> Result<PartRef, JournalError> {
         let part_len = part.len() as u64;
         if part_len > self.config.limits.max_part_len {

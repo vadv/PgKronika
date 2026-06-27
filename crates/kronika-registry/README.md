@@ -2,8 +2,8 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-registry` defines what each section `type_id` means and provides the
-codecs for section bodies. It contains:
+`kronika-registry` defines each section `type_id` and the codecs for section
+bodies. It contains:
 
 - the `type_id` scheme and `SectionClass`;
 - the type contract: columns, column classes, sort key, collection semantics;
