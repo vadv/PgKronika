@@ -10,7 +10,10 @@ repository.workspace = true
 
 [dependencies]
 cucumber = "0.21"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time"] }
+tokio-postgres = "0.7"
+anyhow = "1"
+tempfile = "3"
 
 [lints]
 workspace = true
