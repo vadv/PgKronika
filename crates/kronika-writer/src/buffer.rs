@@ -82,11 +82,9 @@ impl SectionBuffers {
 
     /// Buffer one row of section type `T`.
     ///
-    /// Returns `Err(row)` when this type's buffer is full.
-    ///
     /// # Errors
     ///
-    /// Returns the input row when this type already reached the row cap.
+    /// Returns the input row when this type reached the row cap.
     ///
     /// # Panics
     ///

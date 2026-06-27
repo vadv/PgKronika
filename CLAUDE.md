@@ -26,7 +26,7 @@ For each new or changed code path the review must answer:
 
 Independent review workflows must include a dedicated memory-bounds pass
 alongside bugs, spec, and tests. Verify findings with allocation counting or
-pathological inputs where practical.
+malformed inputs where practical.
 
 ## Standing Review Rule: Comment Quality
 

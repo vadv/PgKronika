@@ -1,39 +1,25 @@
-//! A reusable-buffer pool for decode input.
+//! Reusable input buffers for section decode.
 //!
-//! [`decode_section`](crate::decode_section) and [`decode_any`](crate::decode_any)
-//! take owned `Bytes` and do not copy section bytes again; the Parquet reader
-//! borrows from them. A source that reads sections one at a time still needs a
-//! temporary input buffer before decode. This pool hands out buffers that return
-//! to it after the last `Bytes` reference is dropped, so a steady decode loop
-//! reuses a bounded set of buffers instead of allocating per section.
+//! The Parquet reader borrows from owned `Bytes`, so callers still need a
+//! temporary buffer while reading a section body. This pool reuses those input
+//! buffers after the last `Bytes` reference is dropped.
 //!
-//! It only addresses the input buffer. The dominant decode allocations — zstd
-//! decompression output and the Arrow arrays — are the decoded data itself and
-//! are inherently fresh; the pool does not touch them.
+//! It only addresses the input buffer. Zstd output and Arrow arrays are the
+//! decoded data itself; the pool does not touch them.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
 
-/// A pool of reusable input buffers.
+/// A bounded pool of reusable input buffers.
 ///
-/// Retained memory is bounded: the pool holds at most `max_buffers` idle
-/// buffers, and only retains a returned buffer whose capacity is within
-/// `buffer_limit` (a larger one is freed, not pooled). A single in-flight
-/// buffer can still grow to whatever the caller writes; bound that at the call
-/// site (decode rejects inputs above `MAX_SECTION_BYTES`).
+/// The pool keeps at most `max_buffers` idle buffers and frees any returned
+/// buffer whose capacity exceeds `buffer_limit`. A borrowed buffer can still
+/// grow while the caller writes into it; enforce input caps before decode.
 ///
-/// [`stats`](BytesPool::stats) exposes the reuse and drop counters a reader
-/// turns into metrics: a steady `dropped_oversize_total` is the signal that
-/// `buffer_limit` is below the section size, so the pool has silently become a
-/// per-section allocator (README.md, "Section Trait").
-///
-/// Synchronous: `load` and `Loan::drop` take a `std::sync::Mutex` briefly. That
-/// is free for the single-threaded decode loop this feeds; a multi-threaded or
-/// async consumer should measure lock contention — or move to a lock-free
-/// return — before relying on it, and should not treat a `Loan` as cheap to
-/// hold across an `.await`.
+/// `load` and `Loan::drop` briefly take a `std::sync::Mutex`; do not hold a
+/// loan across `.await` without measuring contention.
 #[derive(Clone, Debug)]
 pub struct BytesPool {
     shared: Arc<Shared>,
@@ -85,7 +71,7 @@ enum Returned {
 /// `idle` is the live count of parked buffers (a gauge); the `_total` fields are
 /// monotonic lifetime counters. The reuse rate is `returned_total / loans_total`.
 /// A nonzero-and-climbing `dropped_oversize_total` means `buffer_limit` is below
-/// the section size, so the pool is silently a per-section allocator;
+/// the section size, so the pool allocates per section;
 /// `dropped_full_total` means `max_buffers` is the binding limit instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolStats {
