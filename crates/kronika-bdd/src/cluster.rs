@@ -138,7 +138,15 @@ async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
     let status = Command::new(bin.bindir.join("initdb"))
         .arg("-D")
         .arg(data_dir)
-        .args(["-U", "postgres", "-A", "trust", "--no-sync"])
+        .args([
+            "-U",
+            "postgres",
+            "-A",
+            "trust",
+            "--no-sync",
+            "--locale-provider=libc",
+            "--locale=C",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
