@@ -2,10 +2,10 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-writer` keeps collector state while a segment is being written. It sits
-between data sources and a finished `.pgm` segment. `kronika-format` defines
-the bytes on disk; this crate decides when writer state is flushed to disk and
-what must remain in memory while the segment is being built.
+`kronika-writer` keeps the state needed to build a `.pgm` segment. Data sources
+push rows and strings into this crate; `kronika-format` still defines the byte
+layout. The writer decides when in-memory state becomes a journal part and when
+the journal can be sealed into a segment.
 
 ## Current Contents
 
@@ -19,30 +19,27 @@ The crate currently exposes:
 
 ## Section Buffers
 
-`SectionBuffers` is the collection window. A collection step pushes typed rows
-with `push::<T>(row)` for any `T: Section`; the buffers hold one type-erased
-buffer per `type_id`, not a field per type, so a new section type costs one
-`push` and no change here — the property the registry's hundreds of types need.
-A type's buffer never grows past one section's rows (`MAX_SECTION_ROWS`): a full
-buffer hands the row back as `Err(row)`, the signal to flush early and push it
-again, so memory is bounded before a flush, not only at `encode`.
+`SectionBuffers` holds typed rows until they are written into a part.
+`push::<T>(row)` works for any `T: Section`; internally there is one erased
+buffer per `type_id`. Adding a registry type does not add a new field or branch
+here.
 
-`flush(dict_sections, source_id)` encodes every buffered type to a Parquet body
-(`Section::encode`), reads each type's time range (`Section::ts_range`), and
-calls `kronika_format::build_part` to assemble one PGM part: the data sections in
-`type_id` order, then the `dict_sections` (the COLD-then-WARM segment layout),
-the catalog time range spanning the buffered rows. It returns the part bytes —
-or `None` when nothing is buffered — for the caller to append to the journal, and
-clears the data buffers.
+A buffer for one type stops at `MAX_SECTION_ROWS`. When it is full, `push`
+returns the row as `Err(row)`; the caller flushes and tries that row again.
+
+`flush(dict_sections, source_id)` encodes buffered rows, appends dictionary
+sections after data sections, and returns one PGM part. Data sections are ordered
+by `type_id`; the catalog time range comes from the rows that carry timestamps.
+`None` means there was nothing to write. After a successful flush the data
+buffers are empty.
 
 ## Dictionary Sections
 
-`dict::encode(window)` turns an interner flush window into `dict.strings` and
-`dict.blobs` Parquet section bodies — one per placement that has entries, sorted
-by `str_id`. These are not registry `Section` types (their columns are
-variable-length binary), so they are encoded directly, but as ordinary section
-bodies a part carries beside the data sections, so snapshot `str_id` columns
-resolve to bytes within the same segment.
+`dict::encode(window)` turns the current interner window into `dict.strings` and
+`dict.blobs` section bodies, sorted by `str_id`. These dictionary bodies are not
+registry `Section` types because they store variable-length binary values, but a
+part carries them beside the data sections. Snapshot `str_id` columns then
+resolve within the same segment.
 
 ## Interner
 
@@ -70,34 +67,30 @@ the window nor the flushed entries.
 ## Journal
 
 `Journal` appends PGM parts as `PGMP` frames and syncs each frame before
-returning. Opening an existing journal runs the recovery scan.
+returning. Opening an existing journal scans it for recovery.
 
-Recovery streams the file frame by frame: peak memory is one part plus its
-decoded catalog (at most twice `max_part_len`, reached only by a
-pathological all-catalog part), a small sliding window during
-resynchronization, and 16 bytes of directory per recovered frame — never
-the whole journal. The streaming scanner is pinned to the in-memory
-scanner of `kronika-format` by an equivalence test.
+Recovery reads the file frame by frame. Peak memory is one part plus its decoded
+catalog, a small resync buffer, and 16 bytes per recovered frame. The whole
+journal is never loaded. A test keeps the streaming scanner equivalent to the
+in-memory scanner in `kronika-format`.
 
 If the last frame was only partly written, the file is truncated to the last
 valid frame and writing continues. Damage in the middle of the file, or damage
 at the end that is not a partial write, is reported in `OpenReport` and left on
 disk for diagnostics.
 
-`append()` writes one frame. The journal size is capped by
-`JournalConfig::max_journal_len` (default 1 GiB, a starting value): when an
-append would exceed the cap it fails with `JournalError::Full`, which is the
-signal to merge the journal into a segment early. `reset()` clears the
-journal after a segment has been completed successfully.
+`append()` writes one frame. `JournalConfig::max_journal_len` caps the journal
+size (default 1 GiB). If the next frame would exceed it, `append` returns
+`JournalError::Full`; the caller should seal the current journal first.
+`reset()` clears the journal after the segment has been written successfully.
 
 ## Segment Completion
 
-`seal(journal, dest)` merges the journal's parts into one immutable segment.
-It streams the journal one part at a time — peak memory is one part plus the
-growing catalog, never the whole segment — copies each part's section bodies
-into a sibling `*.tmp`, writes the end catalog, fsyncs, and publishes with a
-hard link so an existing segment is never overwritten. The caller calls
-`Journal::reset` only after `seal` returns `Ok`.
+`seal(journal, dest)` writes the journal parts into one immutable segment. It
+streams one part at a time, copies section bodies into a sibling `*.tmp`, writes
+the end catalog, fsyncs, and publishes with a hard link. An existing destination
+is not overwritten. The caller calls `Journal::reset` only after `seal` returns
+`Ok`.
 
 A section type that appears in several parts is kept as repeated catalog entries
 — valid multi-part sections the reader processes in order. Collapsing them into
@@ -106,10 +99,11 @@ changes how bodies are written, not the segment format.
 
 ## Not Implemented Yet
 
-Three optimizations of the seal path remain, none changing the segment format:
-the sort-merge that recompresses repeated sections of one type into one sorted
-section; the dictionary merge that deduplicates a strict-hot value repeated
-across parts (parts are otherwise disjoint, so seal copies their dictionaries as
-is); and the `str_id` bloom filter on `dict.strings` for cross-segment lookup.
-Dictionary placement and journal frame validation are defined in
-`kronika-format`.
+Remaining work in this crate:
+
+- sort-merge repeated sections of one type into one sorted section;
+- merge duplicate strict-hot dictionary values across parts;
+- add a `str_id` Bloom filter for `dict.strings`.
+
+These changes should not change the segment format. Dictionary placement and
+journal frame validation stay in `kronika-format`.

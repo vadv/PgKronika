@@ -1,28 +1,7 @@
-//! `#[derive(Section)]`: generate a section codec from a typed struct.
+//! `#[derive(Section)]`: generate a registry contract and Parquet codec.
 //!
-//! The annotated struct defines one registry type. The derive reads each
-//! field's Rust type (on-disk type and nullability), its `#[column(..)]` class,
-//! and the `#[section(..)]` header, then generates the
-//! `kronika_registry::Section` impl: the contract const and the Parquet
-//! encode/decode methods. Shared code in `kronika_registry::codec` handles the
-//! framing and memory bounds; generated code only supplies one column
-//! builder/reader per field.
-//!
-//! Column types are matched by their written name (a derive macro sees tokens,
-//! not resolved types): `i8`…`i64`, `u8`…`u64`, `f32`/`f64`, `bool`, `Ts`,
-//! `StrId`, and `Option<…>`. `Ts` and `StrId` must appear under their canonical
-//! names — an alias such as `use Ts as Timestamp` is not recognized and is
-//! rejected as an unsupported type.
-//!
-//! ```ignore
-//! #[derive(Section)]
-//! #[section(id = 1_006_001, name = "pg_stat_bgwriter", semantics = snapshot_full, sort_key("ts"))]
-//! struct BgwriterCheckpointer {
-//!     #[column(t)] ts: Ts,
-//!     #[column(c)] checkpoints_timed: i64,
-//!     #[column(c)] buffers_backend: Option<i64>,
-//! }
-//! ```
+//! Column types are matched by written name (`i64`, `bool`, `Ts`, `StrId`,
+//! `Option<...>`), because proc macros see tokens, not resolved types.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -108,8 +87,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 ::std::vec::Vec<u8>,
                 ::kronika_registry::CodecError,
             > {
-                // Reject an over-cap slice before materializing any column, so the
-                // memory bound holds before the allocation, not after.
+                // Reject over-cap input before building Arrow arrays.
                 ::kronika_registry::check_row_cap(rows.len())?;
                 let columns = #encode;
                 ::kronika_registry::encode_section(&Self::CONTRACT, columns)
@@ -310,10 +288,7 @@ fn build_contract(header: &Header, columns: &[ColumnDef]) -> TokenStream2 {
         }
     });
 
-    // Route the id through `TypeId::new` and panic in the `None` arm. The
-    // constructor is crate-private and this is a `const`, so an invalid
-    // `#[section(id = ...)]` is a compile error, not a lint-time finding
-    // (kronika-registry README, "Type Ids").
+    // `TypeId::new` runs in const context, so an invalid id fails compilation.
     quote! {
         const CONTRACT: ::kronika_registry::TypeContract = ::kronika_registry::TypeContract {
             type_id: match ::kronika_registry::TypeId::new(#id) {
@@ -346,12 +321,8 @@ fn semantics_variant(ident: &Ident) -> Ident {
 }
 
 fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
-    // One builder per column, each with its own pass over `rows`. The gather is
-    // inherent: `rows: &[Self]` is an array of structs, so one field is strided
-    // across it — there is no contiguous `&[T]` to hand to Arrow or to
-    // `bytemuck::cast_slice`, even for `#[repr(transparent)]` `Ts`/`StrId`.
-    // Collapsing these passes means taking columnar (SoA) input, an API change
-    // worth making only if a large-section benchmark shows the passes matter.
+    // One builder per column. Collapsing these passes would require columnar
+    // input; keep the row-slice API until benchmarks say otherwise.
     let builders = columns.iter().map(|c| {
         let field = &c.field;
         let values = match (&c.wrapper, c.nullable) {
@@ -373,10 +344,7 @@ fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
     quote! { ::std::vec![ #( #builders ),* ] }
 }
 
-/// Generate `Section::ts_range`: fold the non-nullable `#[column(t)]` field over
-/// `rows` into `(min, max)`. A type with no such column returns `None`, so the
-/// writer records no time range for it. A nullable or mistyped timestamp column
-/// is left to the registry linter, not turned into a confusing codegen error.
+/// Generate `Section::ts_range` from the non-nullable `#[column(t)]` field.
 fn build_ts_range(columns: &[ColumnDef]) -> TokenStream2 {
     columns
         .iter()
@@ -405,12 +373,8 @@ fn build_ts_range(columns: &[ColumnDef]) -> TokenStream2 {
 }
 
 fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
-    // The closure params, loop variable, and per-column readers all use
-    // mixed-site hygiene so none can collide with a user field or an in-scope
-    // type. The reader bindings deliberately do NOT reuse the field ident: a
-    // `let #field` would shadow a field named `batch`, and — once `Ts`/`StrId`
-    // are in scope — a `let Ts`/`let StrId` cannot shadow those tuple structs
-    // (E0530). The struct literal still keys by the user's field ident.
+    // Mixed-site idents avoid collisions with user fields and in-scope tuple
+    // structs such as `Ts` and `StrId`.
     let batch = Ident::new("batch", Span::mixed_site());
     let out = Ident::new("out", Span::mixed_site());
     let idx = Ident::new("i", Span::mixed_site());
@@ -428,12 +392,7 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
                 let #col = ::kronika_registry::required_column::<::kronika_registry::#at>(#batch, #name)?;
                 let #col = #col.values();
             },
-            // Nullable primitive: kept on the array — `opt_primitive` does the
-            // per-cell null-check then `value(i)`. Deliberately NOT rebound to
-            // `.values()` like the required arm: here the per-cell cost is the
-            // null branch, which the optimizer already inlines, so a values-slice
-            // rebind is unmeasured churn until a large-section benchmark shows it
-            // pays.
+            // Nullable arrays stay intact so `opt_primitive` can check nulls.
             (Some(at), true) => quote! {
                 let #col = ::kronika_registry::nullable_column::<::kronika_registry::#at>(#batch, #name)?;
             },

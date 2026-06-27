@@ -1,12 +1,7 @@
 //! Writer-side state for building PGM segments.
 //!
-//! The crate buffers typed section rows ([`SectionBuffers`]), interns the
-//! segment's strings ([`Interner`]) and encodes them into `dict.strings` /
-//! `dict.blobs` sections ([`dict`]), appends mini-parts to the `active.parts`
-//! [`Journal`], and seals the journal into an immutable `segment.pgm`
-//! ([`seal`]). The remaining work optimizes the seal path: a sort-merge that
-//! recompresses repeated sections of one type into one, and a dictionary merge
-//! that deduplicates a strict-hot value repeated across parts.
+//! Rows and strings accumulate in memory, then become `PGMP` journal frames.
+//! [`seal`] copies those frames into the final `segment.pgm`.
 
 mod buffer;
 pub mod dict;
@@ -21,10 +16,8 @@ pub use segment::{SealError, SealSummary, seal};
 
 #[cfg(test)]
 mod composition_tests {
-    //! A part assembled by `kronika_format::build_part` survives the
-    //! file-backed journal: append, persist, re-read, and re-validate. The
-    //! first proof that the part builder and the `active.parts` journal meet on
-    //! the real file path; bodies stay opaque, as in the format crate.
+    //! Cross-crate check: a part built by `kronika-format` survives the
+    //! file-backed journal unchanged.
 
     use kronika_format::{PartMeta, SectionInput, build_part, validate_part};
 

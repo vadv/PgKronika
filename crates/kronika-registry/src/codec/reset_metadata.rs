@@ -1,17 +1,4 @@
-//! Type `1_020_001`: `reset_metadata`, the per-segment counter-reset context
-//! (README.md, "Service Sections").
-//!
-//! Mandatory in every segment. This is not a chart metric; it is context for
-//! counter diffs. It lets the reader separate a real counter reset
-//! (`PostgreSQL` restart, `pg_stat_reset()`) from data loss, and records which
-//! extensions and GUCs were present so version-dependent columns and `NULL`s
-//! remain interpretable.
-//!
-//! A view that exposes its own `stats_reset` carries it in its own section, per
-//! row, so a mid-segment reset is visible there (see `bgwriter_stats_reset` in
-//! type `1_006_001`). This section holds only the cross-cutting context: the
-//! global postmaster restart, reset times for views without their own section
-//! yet, extension versions, and the GUCs that change how columns are read.
+//! Type `1_020_001`: reset and environment context for a segment.
 
 use crate::{Section, StrId, Ts};
 
@@ -28,11 +15,8 @@ pub struct ResetMetadata {
     /// Collection timestamp, unix microseconds.
     #[column(t)]
     pub ts: Ts,
-    /// Postmaster start time. A change marks a `PostgreSQL` restart, but it is
-    /// context, not a reset marker: cumulative stats survive a clean shutdown and
-    /// reset only on crash recovery, `pg_stat_reset*`, or a base backup / PITR.
-    /// The reset of record is each view's own `stats_reset`; this only dates the
-    /// process.
+    /// Postmaster start time. A change marks a `PostgreSQL` restart, not a stats
+    /// reset by itself: cumulative stats survive a clean shutdown.
     #[column(g)]
     pub postmaster_start_time: Ts,
     /// Max `stats_reset` across `pg_stat_database`; a coarse database-level
@@ -68,11 +52,9 @@ pub struct ResetMetadata {
     /// fast IO; `None` if the GUC is unavailable.
     #[column(l)]
     pub track_io_timing: Option<bool>,
-    /// `track_wal_io_timing` GUC, separate from `track_io_timing`: it governs
-    /// `pg_stat_wal.wal_write_time` / `wal_sync_time`, not `pg_stat_io`. If
-    /// `false`, those stay zero and do not mean fast WAL IO. Recorded here so a
-    /// future `pg_stat_wal` section reads a real zero apart from disabled timing
-    /// without its own service-section version. `None` if the GUC is unavailable.
+    /// `track_wal_io_timing` GUC. If `false`, WAL timing columns stay zero
+    /// because timing is disabled, not because writes are free. `None` if the GUC
+    /// is unavailable.
     #[column(l)]
     pub track_wal_io_timing: Option<bool>,
 }
@@ -102,10 +84,9 @@ mod tests {
 
     fn pg15_row() -> ResetMetadata {
         ResetMetadata {
-            // A distinct, earlier `ts` so the two rows have a defined sort order.
+            // Keep sort order defined.
             ts: Ts(1_000_000),
-            // Pre-PG16 and no extensions: io reset absent, ext versions and GUCs
-            // unknown.
+            // Pre-PG16 and no extensions.
             pg_stat_io_reset_at: None,
             ext_pg_stat_statements_version: None,
             compute_query_id: None,
@@ -122,8 +103,7 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_values_and_nulls() {
-        // Passed in sort-key (`ts`) order: encode sorts, so a roundtrip returns
-        // the rows in that order.
+        // Compare in the order returned by `encode`'s sort key.
         crate::assert_roundtrips(&[pg15_row(), pg17_row()]);
     }
 }

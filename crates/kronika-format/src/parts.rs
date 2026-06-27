@@ -1,25 +1,7 @@
 //! `active.parts` journal frames.
 //!
-//! The journal is an append-only sequence of `PGMP` frames. Each frame wraps
-//! one self-contained PGM part. This module defines the frame bytes and scans
-//! an in-memory journal buffer; file I/O is handled by `kronika-writer`.
-//!
-//! ```text
-//! frame: header 16 B + part
-//!   frame_magic u32  // ASCII "PGMP"
-//!   part_len    u64
-//!   header_crc  u32  // CRC32C over frame_magic + part_len
-//!   part        ...  // a self-contained PGM part
-//! ```
-//!
-//! Recovery rules:
-//!
-//! - an incomplete final frame is normal after a crash: the journal is valid
-//!   up to that frame, and the writer may truncate the file there;
-//! - a damaged frame followed by a valid one is middle damage: valid parts
-//!   before and after the damaged region are both kept;
-//! - damage at the end with no later valid frame is reported and left on disk
-//!   for diagnostics.
+//! File I/O is in `kronika-writer`. This module defines frame bytes and
+//! in-memory recovery.
 
 use std::error::Error;
 use std::fmt;
@@ -58,13 +40,11 @@ impl FrameHeader {
         out
     }
 
-    /// Decode and validate a frame header.
+    /// Decode a frame header; validates magic and header CRC.
     ///
     /// # Errors
     ///
-    /// Returns [`FrameError::BadMagic`] when the magic is not `PGMP`.
-    /// Returns [`FrameError::BadCrc`] when the stored header checksum does
-    /// not match the computed checksum.
+    /// Returns [`FrameError`] when the magic bytes or header CRC are invalid.
     pub fn decode(bytes: [u8; FRAME_HEADER_LEN]) -> Result<Self, FrameError> {
         let (meta, stored_crc) = split_header(&bytes);
         if meta[..4] != FRAME_MAGIC {
@@ -200,16 +180,12 @@ impl fmt::Display for PartError {
 
 impl Error for PartError {}
 
-/// Validate a part body as a self-contained PGM part.
-///
-/// Checks the segment magic, the tail index, the catalog CRC, and that
-/// every catalog entry stays in bounds and matches its section CRC32C.
-/// With section CRCs included, corruption of any single body byte is
-/// detected. Section *contents* stay opaque, as everywhere in this crate.
+/// Validate a self-contained PGM part, including section CRCs.
 ///
 /// # Errors
 ///
-/// A typed [`PartError`] naming the first failed check.
+/// Returns [`PartError`] when framing, catalog, section bounds, or section CRC
+/// checks fail.
 pub fn validate_part(bytes: &[u8]) -> Result<Catalog, PartError> {
     let catalog = decode_and_bound(bytes)?;
     for entry in &catalog.entries {
@@ -232,26 +208,18 @@ pub fn validate_part(bytes: &[u8]) -> Result<Catalog, PartError> {
     Ok(catalog)
 }
 
-/// Validate a part's container structure without re-checking section body CRCs.
+/// Validate part framing and catalog without hashing section bodies.
 ///
-/// Checks the magic, tail index, catalog CRC, and that every section stays in
-/// bounds — but not `crc32c(body)` per section. Use this only when the bodies are
-/// CRC-verified elsewhere (the reader checks each section on decode), as in
-/// segment sealing, where re-hashing every body of every journal part is the
-/// dominant cost. Use [`validate_part`] for recovery, where bodies are not
-/// otherwise verified.
+/// Use only when section CRCs are checked elsewhere.
 ///
 /// # Errors
 ///
-/// A typed [`PartError`] for any structural failure (magic, tail, catalog CRC, or
-/// a section out of bounds).
+/// Returns [`PartError`] when framing, catalog, or section bounds checks fail.
 pub fn validate_part_catalog(bytes: &[u8]) -> Result<Catalog, PartError> {
     decode_and_bound(bytes)
 }
 
-/// Decode a part's catalog and confirm every section is in bounds, without
-/// hashing section bodies. Shared by [`validate_part`] and
-/// [`validate_part_catalog`].
+/// Decode a part catalog and confirm section bounds.
 fn decode_and_bound(bytes: &[u8]) -> Result<Catalog, PartError> {
     // Smallest possible part: magic + empty catalog (meta only) + tail.
     let min_len = MAGIC.len() + crate::META_LEN + TAIL_INDEX_LEN;
@@ -301,10 +269,7 @@ fn decode_and_bound(bytes: &[u8]) -> Result<Catalog, PartError> {
     Ok(catalog)
 }
 
-/// One section to place in a part: its type, row count, and body bytes.
-///
-/// The body is opaque to this crate — a Parquet snapshot or a native block —
-/// and is copied into the part as-is.
+/// One opaque section body to place in a part.
 #[derive(Debug, Clone, Copy)]
 pub struct SectionInput<'a> {
     /// Section type from the type registry (`kronika-registry`).
@@ -329,22 +294,14 @@ pub struct PartMeta {
 
 /// Assemble section bodies into a self-contained PGM part.
 ///
-/// Lays out [`MAGIC`], the bodies in the given order, then the end catalog —
-/// each entry carries the body's absolute offset and CRC32C — and the tail
-/// index. This is the inverse of [`validate_part`]: the result always passes
-/// `validate_part`, which the round-trip test pins.
-///
-/// `flags` is written as zero and offsets are computed here, so a caller cannot
-/// produce an entry that points outside the body.
+/// Offsets and CRCs are computed here.
 ///
 /// # Panics
 ///
-/// Panics only if the encoded catalog block does not fit in `u32` (see
-/// [`Catalog::encode`]) — an absurd section count, i.e. a writer bug.
+/// If the encoded catalog block does not fit in `u32`.
 #[must_use]
 pub fn build_part(sections: &[SectionInput<'_>], meta: PartMeta) -> Vec<u8> {
-    // The exact part length is known up front, so the buffer never reallocates
-    // while copying section bodies.
+    // The exact part length is known up front.
     let bodies: usize = sections.iter().map(|section| section.body.len()).sum();
     let capacity =
         MAGIC.len() + bodies + sections.len() * crate::ENTRY_LEN + crate::META_LEN + TAIL_INDEX_LEN;
@@ -354,8 +311,7 @@ pub fn build_part(sections: &[SectionInput<'_>], meta: PartMeta) -> Vec<u8> {
     let entries = sections
         .iter()
         .map(|section| {
-            // `offset` is absolute from the part start, where the reader's
-            // `Catalog` entries point; bodies are contiguous after MAGIC.
+            // Catalog offsets are absolute from the part start.
             let offset = out.len() as u64;
             out.extend_from_slice(section.body);
             Entry {
@@ -421,9 +377,6 @@ pub enum DamageKind {
     /// unfinished part.
     TornTail,
     /// A damaged frame with a valid frame after it.
-    ///
-    /// Valid parts before and after are both kept. `resumed_at` is where
-    /// scanning continued.
     Middle {
         /// Offset of the next valid frame.
         resumed_at: usize,
@@ -454,14 +407,7 @@ impl ScanReport {
     }
 }
 
-/// Scan a journal buffer.
-///
-/// The scan walks frames forward, validates every PGM part, and
-/// records valid parts plus damaged regions.
-///
-/// The buffer is caller-provided and fully resident. Never read a journal
-/// file into memory to call this: the file-backed journal in
-/// `kronika-writer` streams the same scan with a one-part buffer.
+/// Scan an in-memory journal buffer.
 #[must_use]
 pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
     let mut report = ScanReport::default();
@@ -493,10 +439,8 @@ pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
                     pos = next;
                     continue;
                 }
-                // Nothing valid follows. A fully present frame with a sane
-                // header that ends exactly at the buffer end is treated like
-                // an interrupted write: truncate before it. If the frame
-                // extent is unknowable, keep the final damaged bytes.
+                // A complete-looking final frame with a sane header is treated
+                // like an interrupted write; otherwise keep the damaged tail.
                 let kind = if implied_end == Some(bytes.len()) {
                     DamageKind::TornTail
                 } else {
@@ -519,10 +463,7 @@ enum FrameCheck {
     /// are plausible (or the header itself is incomplete), nothing
     /// follows. This is an incomplete write, not media damage.
     Torn,
-    /// The frame is damaged: bad magic, bad header CRC, an absurd
-    /// length, or a part that fails container validation. When the
-    /// header itself was sane, `implied_end` is where the frame claims
-    /// to end — the most likely place for the next frame to start.
+    /// Damaged frame. `implied_end` is set only if the header gave a sane end.
     Damaged { implied_end: Option<usize> },
 }
 
@@ -556,18 +497,7 @@ fn frame_at(bytes: &[u8], pos: usize, limits: JournalLimits) -> FrameCheck {
     FrameCheck::Valid { body_len }
 }
 
-/// Look for the next valid frame after a damaged one.
-///
-/// When the damaged frame's header was sane, its implied boundary is
-/// tried first: that is where the next frame really starts when only the
-/// part body is corrupted, and it avoids mistaking frame-shaped bytes
-/// *inside* the damaged part (section bodies are opaque and may contain
-/// anything) for a real frame. The byte-wise search that follows runs to
-/// the end of the buffer, so frames appended after a damaged region are
-/// always rediscovered, however large the region is.
-///
-/// A candidate counts only if its header decodes, its length is within
-/// the configured limit, and its part passes full validation.
+/// Find the next valid frame after damage.
 fn resync(
     bytes: &[u8],
     damaged_at: usize,
@@ -888,11 +818,7 @@ mod tests {
 
     #[test]
     fn resync_prefers_the_header_implied_boundary_over_embedded_frames() {
-        // A part whose section body is itself a complete valid frame:
-        // section contents are opaque, so this is legitimate data. If the
-        // outer catalog is corrupted, a byte-wise search would mistake
-        // the embedded frame for a real one and fabricate a part that
-        // was never appended.
+        // The embedded frame is legitimate section data, not a journal frame.
         let inner = frame(&sample_part());
         let mut tricky = Vec::new();
         tricky.extend_from_slice(&MAGIC);

@@ -1,12 +1,4 @@
-//! Per-type row buffers: the writer's collection window before a mini-part.
-//!
-//! A collection step pushes typed rows of many section types into
-//! [`SectionBuffers`]; at a flush they are each encoded to a Parquet body and
-//! assembled into one PGM part (segment-format.md, "Write and merge").
-//!
-//! Type erasure is the point. [`SectionBuffers`] holds one buffer per `type_id`,
-//! not a field per type, so a new section type costs one [`push`](SectionBuffers::push)
-//! call and no change here — the property the registry's hundreds of types need.
+//! Per-type row buffers before a journal part is written.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -14,9 +6,7 @@ use std::collections::BTreeMap;
 use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_registry::{CodecError, MAX_SECTION_ROWS, Section};
 
-/// One section type's buffered rows, erased so [`SectionBuffers`] can hold many
-/// types in one map. The registry assigns one `Section` type per `type_id`, so
-/// the downcast in [`SectionBuffers::push`] is total.
+/// Buffered rows for one section type.
 trait TypeBuffer: Any {
     fn section_type_id(&self) -> u32;
     fn is_empty(&self) -> bool;
@@ -48,8 +38,7 @@ impl<T: Section + 'static> TypeBuffer for RowBuffer<T> {
 
     fn encode(&self) -> Result<EncodedRows, CodecError> {
         let body = T::encode(&self.rows)?;
-        // `encode` enforced the row cap, so the count is below `MAX_SECTION_ROWS`
-        // and fits the catalog's `u32` row field.
+        // `encode` already enforced the row cap; the catalog row field is `u32`.
         let rows = u32::try_from(self.rows.len()).unwrap_or(u32::MAX);
         Ok(EncodedRows {
             body,
@@ -93,22 +82,15 @@ impl SectionBuffers {
 
     /// Buffer one row of section type `T`.
     ///
-    /// The first row of a type creates its buffer; later rows append. No type is
-    /// named here, so adding a section type does not change this code.
-    ///
-    /// A type's buffer never grows past [`MAX_SECTION_ROWS`] — one section's
-    /// worth — so memory is bounded before a flush, not only after `encode`. When
-    /// the buffer is full the row is handed back as `Err(row)`: the caller flushes
-    /// and pushes it again (`segment-format.md`, "Write and merge").
+    /// Returns `Err(row)` when this type's buffer is full.
     ///
     /// # Errors
     ///
-    /// `Err(row)` when this type's buffer already holds [`MAX_SECTION_ROWS`] rows.
+    /// Returns the input row when this type already reached the row cap.
     ///
     /// # Panics
     ///
-    /// Never in practice: the downcast would only fail if two `Section` types
-    /// shared a `type_id`, which the registry's `TypeId` construction forbids.
+    /// Panics if two `Section` types use the same `type_id`.
     pub fn push<T: Section + 'static>(&mut self, row: T) -> Result<(), T> {
         let type_id = T::CONTRACT.type_id.get();
         let buffer = self
@@ -133,26 +115,11 @@ impl SectionBuffers {
         self.by_type.values().all(|buffer| buffer.is_empty())
     }
 
-    /// Encode every buffered type into one PGM part and clear the data buffers.
-    ///
-    /// `dict_sections` are the window's `dict.strings` / `dict.blobs` bodies
-    /// (from [`dict::encode`](crate::dict::encode)); they are laid out after the
-    /// data sections, the COLD-then-WARM order of a segment. Data sections come in
-    /// `type_id` order, so the part is deterministic. The catalog time range is
-    /// the min/max across the types that carry a timestamp; `source_id` is the
-    /// interned `{cluster_id}/{pg_system_identifier}` id, or 0 if unset.
-    ///
-    /// Returns `None` when neither data nor dictionary sections are present. Only
-    /// the data buffers are cleared — the caller flushes the interner window so a
-    /// failed journal write keeps it.
-    ///
-    /// The returned bytes are the sole copy of the flushed rows: the buffers are
-    /// cleared, so the caller must durably append them (retrying the same bytes on
-    /// a [`JournalError`](crate::JournalError)) before dropping the value.
+    /// Encode buffered rows and dictionary sections into one PGM part.
     ///
     /// # Errors
     ///
-    /// Propagates the [`CodecError`] from encoding any buffered type.
+    /// Returns [`CodecError`] when section encoding or part assembly fails.
     pub fn flush(
         &mut self,
         dict_sections: &[crate::dict::DictSection],
@@ -168,10 +135,8 @@ impl SectionBuffers {
             return Ok(None);
         }
 
-        // The part's time range spans the rows of every type that carries a
-        // timestamp. A part with no timestamped data — a dictionary-only flush —
-        // records an empty interval (min > max), which `seal`'s min/max fold
-        // ignores, so it cannot drag a segment's `min_ts` down to 0.
+        // Dictionary-only parts use an empty interval; `seal` ignores it while
+        // folding the segment range.
         let lo = encoded
             .iter()
             .filter_map(|(_, section)| section.ts_range.map(|(lo, _)| lo))
@@ -283,9 +248,7 @@ mod tests {
             "time range spans both bgwriter rows"
         );
 
-        // Each section decodes back through the registry with the real CRC check
-        // injected from the format crate — the first end-to-end exercise of the
-        // CRC trust boundary the registry was built around.
+        // Decode through the registry with the production CRC function.
         let decode_rows = |type_id: u32| -> usize {
             let entry = *catalog
                 .entries
