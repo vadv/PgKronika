@@ -15,9 +15,6 @@ use tempfile::TempDir;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
-/// Loopback port of the first matrix entry; entry *i* listens on `BASE_PORT + i`.
-const BASE_PORT: u16 = 55_432;
-
 /// How long a freshly started `postgres` has to begin accepting connections.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -56,17 +53,36 @@ pub(crate) fn parse_matrix(spec: &str) -> Result<Vec<PgBinary>> {
 
 /// Boot every entry concurrently; entry *i* gets `BASE_PORT + i`.
 pub(crate) async fn boot_matrix(matrix: &[PgBinary]) -> Result<Vec<Cluster>> {
+    let ports = pick_distinct_ports(matrix.len())?;
     let mut set = tokio::task::JoinSet::new();
-    for (i, bin) in matrix.iter().enumerate() {
+    for (bin, port) in matrix.iter().zip(ports) {
         let bin = bin.clone();
-        let offset = u16::try_from(i).context("matrix has more entries than loopback ports")?;
-        set.spawn(async move { Cluster::boot(&bin, BASE_PORT + offset).await });
+        set.spawn(async move { Cluster::boot(&bin, port).await });
     }
     let mut clusters = Vec::with_capacity(matrix.len());
     while let Some(joined) = set.join_next().await {
         clusters.push(joined.context("cluster boot task panicked")??);
     }
     Ok(clusters)
+}
+
+/// Pick `n` distinct free TCP ports up front. Choosing them serially (not from
+/// the parallel boots) keeps two clusters from racing onto the same port. A
+/// port can still be taken between here and `postgres` binding it — the small
+/// window `pg_doorman`'s suite also accepts — so a boot tolerates that.
+fn pick_distinct_ports(n: usize) -> Result<Vec<u16>> {
+    let mut ports = Vec::with_capacity(n);
+    for _ in 0..(n * 20) {
+        if ports.len() == n {
+            break;
+        }
+        let port = portpicker::pick_unused_port().context("no free TCP port available")?;
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    }
+    ensure!(ports.len() == n, "could not find {n} distinct free ports");
+    Ok(ports)
 }
 
 /// A running throwaway cluster.
