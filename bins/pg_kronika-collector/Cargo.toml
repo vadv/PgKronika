@@ -1,6 +1,6 @@
 [package]
 name = "pg_kronika-collector"
-description = "pgKronika binary"
+description = "pgKronika collector daemon: snapshot PostgreSQL stats into sealed PGM segments"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -9,6 +9,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-source-pg = { path = "../../crates/kronika-source-pg" }
+kronika-registry = { path = "../../crates/kronika-registry" }
+kronika-writer = { path = "../../crates/kronika-writer" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-postgres = "0.7"
+anyhow = "1"
+tempfile = "3"
 
 [lints]
 workspace = true
