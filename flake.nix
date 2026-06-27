@@ -59,11 +59,51 @@
             pname = "kronika-bdd";
           }
         );
+
+        # The cucumber feature files; the harness reads this path from
+        # KRONIKA_FEATURES inside the image.
+        features = ./crates/kronika-bdd/features;
+
+        # The whole BDD suite as one small, layered, FROM-scratch image: the
+        # harness binary, every PostgreSQL version, and the env wiring them
+        # together. postgres runs as the unprivileged `nobody` user (fakeNss
+        # makes the uid resolvable for initdb); a writable /tmp holds the
+        # throwaway data directories. The heavy layers (postgres, toolchain
+        # closure) are content-addressed, so a code change only rebuilds and
+        # repushes the thin top layer. Built with only Docker on the host via
+        # `nix build .#image` (Nix runs inside the build container).
+        image = pkgs.dockerTools.streamLayeredImage {
+          name = "pgkronika-bdd";
+          tag = "latest";
+          maxLayers = 120;
+          contents = [
+            kronika-bdd
+            pkgs.postgresql_15
+            pkgs.postgresql_16
+            pkgs.postgresql_17
+            pkgs.dockerTools.fakeNss
+            # initdb shells out via popen, so the scratch image needs /bin/sh.
+            pkgs.dockerTools.binSh
+          ];
+          extraCommands = "mkdir -m 1777 tmp";
+          config = {
+            Entrypoint = [ "${kronika-bdd}/bin/kronika-bdd" ];
+            User = "65534:65534";
+            Env = [
+              "HOME=/tmp"
+              "TMPDIR=/tmp"
+              "LC_ALL=C"
+              "LANG=C"
+              "KRONIKA_FEATURES=${features}"
+              "KRONIKA_PG_MATRIX=15=${pkgs.postgresql_15}/bin;16=${pkgs.postgresql_16}/bin;17=${pkgs.postgresql_17}/bin"
+            ];
+          };
+        };
       in
       {
         packages = {
           default = kronika-bdd;
-          inherit kronika-bdd;
+          inherit kronika-bdd image;
         } // pgMatrix;
 
         devShells.default = craneLib.devShell {
