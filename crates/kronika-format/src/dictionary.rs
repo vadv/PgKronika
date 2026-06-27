@@ -1,13 +1,11 @@
 //! In-memory dictionaries for one segment.
 //!
-//! Each text or byte value gets a [`StrId`] and is stored once in either
-//! `dict.strings` or `dict.blobs`. `dict.hot_strings` duplicates selected
-//! short strings so readers can resolve common labels without loading larger
-//! dictionary entries.
+//! Each value gets a [`StrId`] and one stored copy in `dict.strings` or
+//! `dict.blobs`. `dict.hot_strings` duplicates selected short strings for
+//! labels that readers must resolve cheaply.
 //!
-//! Placement is based on accumulated requirements for a value: size-based
-//! routing, registry-forced blob placement, and strict or optional hot-cache
-//! placement. The final placement is independent of call order.
+//! Placement combines size, registry-forced blob placement, and strict or
+//! optional hot-cache requests. Call order must not change the final result.
 //!
 //! The core invariants are:
 //!
@@ -320,7 +318,7 @@ struct Requirements {
     /// from `dict.hot_strings` (chart headers, catalog `source_id`).
     hot_hard: bool,
     /// Soft hot request: duplicate into `dict.hot_strings` when placement
-    /// allows it; otherwise leave it out without failing.
+    /// permits it; otherwise leave it out without failing.
     hot_soft: bool,
 }
 
@@ -354,16 +352,12 @@ impl Stored {
 
 /// The dictionaries of one segment.
 ///
-/// All `intern*` methods deduplicate: the same bytes always yield the
-/// same [`StrId`] and one stored copy. Failed calls — [`DictError`] in any
-/// variant — leave the dictionaries unchanged.
+/// `intern*` methods deduplicate: the same bytes yield the same [`StrId`] and
+/// one stored copy. Failed calls leave the dictionaries unchanged.
 ///
-/// Memory is bounded: total stored bytes are capped by
-/// [`DictLimits::max_total_bytes`], and a new value past the cap fails
-/// with [`DictError::Full`] — the signal to flush the window. Repeats and
-/// requirement upgrades of stored values add no bytes; strict-hot values
-/// are exempt from the cap because the hot contract requires them in every
-/// part and the registry bounds their number.
+/// Total stored bytes are capped by [`DictLimits::max_total_bytes`]. A new
+/// value past the cap returns [`DictError::Full`], the signal to flush.
+/// Strict-hot values are exempt because the registry bounds their number.
 #[derive(Debug, Default)]
 pub struct SegmentDicts {
     limits: DictLimits,

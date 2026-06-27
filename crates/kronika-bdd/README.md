@@ -1,0 +1,108 @@
+# kronika-bdd
+
+[Русская версия](README.ru.md)
+
+`kronika-bdd` is the BDD runner for PostgreSQL integration scenarios. Today it
+checks the test infrastructure itself: PostgreSQL 15, 16, and 17 are provided by
+Nix, booted in parallel, and queried through `tokio-postgres`.
+
+It does not test the collector yet. Collector scenarios will be added on top of
+this runner.
+
+## What It Runs
+
+The current feature is `features/smoke.feature`:
+
+```gherkin
+Scenario: every version is reachable
+  Given the PostgreSQL matrix is booted
+  Then every version answers a version query
+```
+
+For each PostgreSQL major version, the runner:
+
+- creates a temporary data directory;
+- runs `initdb` with trust auth, C locale, and no sync;
+- starts `postgres` on a free loopback port;
+- waits until the server accepts TCP connections;
+- runs `SHOW server_version`;
+- checks that the reported version matches the expected major version.
+
+## Quick Local Check
+
+This runs only the host-safe unit tests. It does not start PostgreSQL:
+
+```sh
+cargo test -p kronika-bdd
+```
+
+Use this for parser and harness-code changes. It is not the full matrix test.
+
+## Full Local Run With Docker
+
+This is the same path CI uses, but written safely for a developer checkout. It
+does not require Nix on the host; Nix runs inside a pinned `nixos/nix` image.
+
+From the repository root:
+
+```sh
+export NIX_BUILD_IMAGE='docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894'
+
+docker run --rm \
+  -v "$PWD":/work:ro \
+  -e NIX_CONFIG='experimental-features = nix-command flakes' \
+  "$NIX_BUILD_IMAGE" \
+  sh -ceu '
+    mkdir -p /tmp/src
+    tar --exclude=.git --exclude=target --exclude=result --exclude=.direnv \
+      -C /work -cf - . | tar -C /tmp/src -xf -
+    cd /tmp/src
+    nix build .#image --out-link /tmp/img
+    /tmp/img
+  ' > image.tar
+
+docker load -i image.tar
+docker run --rm pgkronika-bdd:latest
+```
+
+The first command builds the image tarball. The second loads it into Docker. The
+third runs the matrix.
+
+`image.tar` is only a local artifact; remove it when it is no longer needed.
+
+## Full Local Run With Local Nix
+
+If Nix is already installed on the host:
+
+```sh
+nix build .#image --out-link result-bdd-image
+./result-bdd-image | docker load
+docker run --rm pgkronika-bdd:latest
+```
+
+Remove `result-bdd-image` when done.
+
+## CI Path
+
+The GitHub Actions workflow has two BDD jobs:
+
+- `bdd image` builds the Nix image once;
+- `bdd matrix` runs the already built image.
+
+For same-repository runs, `bdd image` pushes the image to GHCR under a
+content-hash tag. If the tag already exists, the job skips the expensive build.
+For fork pull requests, the image tarball is uploaded as a short-lived artifact
+instead of being pushed to GHCR.
+
+The content hash includes the flake files, Cargo lockfile, workspace manifests,
+Rust toolchain pin, and BDD source/features. A change to any of those inputs
+gets a new image tag.
+
+## Useful Failures
+
+- `KRONIKA_PG_MATRIX is not set`: the runner was started outside the Nix image
+  without PostgreSQL binary paths.
+- `postgres ... not ready`: the server failed to start or did not accept TCP
+  connections within 30 seconds. The error includes `server.log`.
+- `server_version` mismatch: the process answered, but not as the expected
+  PostgreSQL major version.
