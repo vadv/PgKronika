@@ -51,7 +51,7 @@ pub(crate) fn parse_matrix(spec: &str) -> Result<Vec<PgBinary>> {
         .collect()
 }
 
-/// Boot every entry concurrently; entry *i* gets `BASE_PORT + i`.
+/// Boot every entry concurrently, each on a distinct free loopback port.
 pub(crate) async fn boot_matrix(matrix: &[PgBinary]) -> Result<Vec<Cluster>> {
     let ports = pick_distinct_ports(matrix.len())?;
     let mut set = tokio::task::JoinSet::new();
