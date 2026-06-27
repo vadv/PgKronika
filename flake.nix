@@ -50,7 +50,12 @@
           doCheck = false;
         };
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        cargoArtifacts = craneLib.buildDepsOnly (
+          commonArgs
+          // {
+            pname = "pgkronika-bdd-deps";
+          }
+        );
 
         # Keep both binaries in one store path so the BDD runner can spawn the collector.
         bins = craneLib.buildPackage (
@@ -100,7 +105,7 @@
       {
         packages = {
           default = bins;
-          inherit bins image;
+          inherit bins cargoArtifacts image;
         } // pgMatrix;
 
         devShells.default = craneLib.devShell {

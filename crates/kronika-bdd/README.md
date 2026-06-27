@@ -75,35 +75,39 @@ PostgreSQL run.
 
 ## Full Local Run With Docker
 
-This follows the CI path without writing into the checkout. It does not require
-Nix on the host; Nix runs inside a pinned `nixos/nix` image.
+This path needs Docker with Buildx. Nix stays inside Docker, but it runs from a
+builder image that keeps the Rust, Nix, and PostgreSQL dependency store.
 
 From the repository root:
 
 ```sh
-export NIX_BUILD_IMAGE='docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894'
+export BDD_IMAGE_PREFIX=ghcr.io/vadv/pgkronika
+platform_slug=$(./scripts/bdd-image.sh platform-slug)
+export BDD_CACHE_FROM="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main"
+export BDD_BUILDER_PULL=1
 
-docker run --rm \
-  -v "$PWD":/work:ro \
-  -e NIX_CONFIG='experimental-features = nix-command flakes' \
-  "$NIX_BUILD_IMAGE" \
-  sh -ceu '
-    mkdir -p /tmp/src
-    tar --exclude=.git --exclude=target --exclude=result --exclude=.direnv \
-      -C /work -cf - . | tar -C /tmp/src -xf -
-    cd /tmp/src
-    nix build .#image --out-link /tmp/img
-    /tmp/img
-  ' > image.tar
-
-docker load -i image.tar
-docker run --rm pgkronika-bdd:latest
+./scripts/bdd-image.sh build-builder
+./scripts/bdd-image.sh build-runtime
+./scripts/bdd-image.sh run
 ```
 
-The first command builds the image tarball. The second loads it into Docker. The
-third runs the PostgreSQL 15, 16, and 17 checks.
+`build-builder` pulls `pgkronika-bdd-builder` when the dependency key already
+exists. Otherwise it builds the builder locally, using the registry BuildKit
+cache when available. `build-runtime` uses that builder to create `image.tar`,
+loads `pgkronika-bdd:latest` into Docker, and leaves the tarball in the working
+tree.
 
-`image.tar` is only a local artifact; remove it when it is no longer needed.
+The first builder build after a dependency change is still expensive. The point
+of the builder image is to pay that cost once per dependency key and reuse it
+for later source-only changes.
+
+To refresh the shared builder cache from a machine that is allowed to push:
+
+```sh
+export BDD_CACHE_TO="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main,mode=max"
+export BDD_BUILDER_PUSH=1
+./scripts/bdd-image.sh build-builder
+```
 
 ## Full Local Run With Local Nix
 
@@ -121,17 +125,42 @@ Remove `result-bdd-image` when done.
 
 The GitHub Actions workflow has two BDD jobs:
 
-- `bdd image` builds the Nix image once;
+- `bdd image` builds or pulls the BDD builder, then builds the runtime image;
 - `bdd matrix` runs the already built image.
 
-For same-repository runs, `bdd image` pushes the image to GHCR under a
-content-hash tag. If the tag already exists, the job skips the expensive build.
-For fork pull requests, the image tarball is uploaded as a short-lived artifact
-instead of being pushed to GHCR.
+For same-repository runs, the builder image and BuildKit cache are stored in
+GHCR. The builder tag is based on the dependency key and platform, so edits in
+`src/` do not rebuild the Rust/PostgreSQL dependency layer. The final runtime
+image is still tagged by content; if that exact image already exists, the job
+skips the build before cleaning disk space.
 
-The content hash includes the flake files, Cargo lockfile, workspace manifests,
-Rust toolchain pin, and BDD source/features. A change to any of those inputs
-gets a new image tag.
+Fork pull requests do not push to GHCR. They build the builder locally and pass
+the runtime image to `bdd matrix` as a short-lived artifact.
+
+The same script works in GitLab CI. A minimal job looks like this:
+
+```yaml
+bdd:
+  image: docker:29
+  services:
+    - docker:29-dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    BDD_IMAGE_PREFIX: "$CI_REGISTRY_IMAGE"
+    BDD_PLATFORM: linux/amd64
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker buildx create --use
+  script:
+    - platform_slug=$(./scripts/bdd-image.sh platform-slug)
+    - export BDD_CACHE_FROM="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main"
+    - export BDD_CACHE_TO="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main,mode=max"
+    - export BDD_BUILDER_PULL=1 BDD_BUILDER_PUSH=1
+    - export BDD_RUNTIME_IMAGE="${BDD_IMAGE_PREFIX}/pgkronika-bdd:${platform_slug}-sha-$(./scripts/bdd-image.sh image-key | cut -c1-16)"
+    - ./scripts/bdd-image.sh build-builder
+    - BDD_RUNTIME_PUSH=1 ./scripts/bdd-image.sh build-runtime
+    - ./scripts/bdd-image.sh run "$BDD_RUNTIME_IMAGE"
+```
 
 ## Useful Failures
 

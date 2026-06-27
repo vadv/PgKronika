@@ -8,7 +8,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  NIX_BUILD_IMAGE: docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894
 
 jobs:
   lint:
@@ -55,9 +54,8 @@ jobs:
           name: coverage
           path: coverage.json
 
-  # Build the BDD image with Nix once. Same-repo runs push a content-hash tag to
-  # GHCR; fork PRs upload the tarball as a short-lived artifact.
-  # Only Docker is used; Nix runs inside the nixos/nix build container.
+  # The builder image carries the Nix/Rust/PostgreSQL dependency store. Buildx
+  # keeps that image warm in GHCR; the final BDD image is still tagged by content.
   bdd-image:
     name: bdd image
     runs-on: ubuntu-latest
@@ -70,24 +68,20 @@ jobs:
       transport: ${{ steps.meta.outputs.transport }}
     env:
       BDD_IMAGE_CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      BDD_PLATFORM: linux/amd64
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk space for the Nix build
-        run: |
-          df -h
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/share/boost /opt/ghc
-          if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
-            sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          fi
-          docker system prune -af || true
-          df -h
-      - name: Compute content-hash image ref
+      - name: Compute image refs
         id: meta
         run: |
-          hash="${{ hashFiles('flake.lock', 'flake.nix', 'rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'bins/*/Cargo.toml', 'xtask/Cargo.toml', 'crates/*/src/**', 'bins/*/src/**', 'crates/kronika-bdd/features/**') }}"
+          deps_hash=$(./scripts/bdd-image.sh deps-key)
+          image_hash=$(./scripts/bdd-image.sh image-key)
+          platform_slug=$(echo "${BDD_PLATFORM}" | tr '/_' '-')
           repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
-          echo "image=ghcr.io/${repo}/pgkronika-bdd:sha-${hash:0:16}" >> "$GITHUB_OUTPUT"
-          echo "artifact=pgkronika-bdd-${hash:0:16}" >> "$GITHUB_OUTPUT"
+          echo "builder=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-${deps_hash:0:16}" >> "$GITHUB_OUTPUT"
+          echo "build_cache=ghcr.io/${repo}/pgkronika-bdd-buildcache:${platform_slug}-main" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${repo}/pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}" >> "$GITHUB_OUTPUT"
+          echo "artifact=pgkronika-bdd-${platform_slug}-${image_hash:0:16}" >> "$GITHUB_OUTPUT"
           if [ "${BDD_IMAGE_CAN_PUSH}" = "true" ]; then
             echo "transport=registry" >> "$GITHUB_OUTPUT"
           else
@@ -100,27 +94,51 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build image
+      - name: Check final image
+        id: final_image
         run: |
           image="${{ steps.meta.outputs.image }}"
           if [ "${{ steps.meta.outputs.transport }}" = "registry" ] && docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "Image $image already exists; skipping build."
-            exit 0
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing $image"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-          # Drop .git so Nix treats the checkout as a plain path: the runner
-          # owns the checkout but Nix runs as root in the container, and
-          # libgit2 refuses a repository it sees as "dubiously owned".
-          docker run --rm -v "$PWD":/work \
-            -e NIX_CONFIG="experimental-features = nix-command flakes" \
-            "$NIX_BUILD_IMAGE" \
-            sh -c 'rm -rf /work/.git && cd /work && nix build .#image --out-link /tmp/img && /tmp/img' > image.tar
-          docker load -i image.tar
+      - name: Free disk space for the Nix build
+        if: steps.final_image.outputs.exists != 'true'
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/share/boost /opt/ghc
+          if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
+            sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          fi
+          docker system prune -af || true
+          df -h
+      - uses: docker/setup-buildx-action@v3
+        if: steps.final_image.outputs.exists != 'true'
+      - name: Build BDD builder
+        if: steps.final_image.outputs.exists != 'true'
+        run: |
+          export BDD_BUILDER_IMAGE="${{ steps.meta.outputs.builder }}"
+          export BDD_BUILDER_PULL=1
           if [ "${{ steps.meta.outputs.transport }}" = "registry" ]; then
-            docker tag pgkronika-bdd:latest "$image"
-            docker push "$image"
+            export BDD_CACHE_FROM="type=registry,ref=${{ steps.meta.outputs.build_cache }}"
+            export BDD_CACHE_TO="type=registry,ref=${{ steps.meta.outputs.build_cache }},mode=max"
+            export BDD_BUILDER_PUSH=1
           fi
+          ./scripts/bdd-image.sh build-builder
+      - name: Build image
+        if: steps.final_image.outputs.exists != 'true'
+        run: |
+          export BDD_BUILDER_IMAGE="${{ steps.meta.outputs.builder }}"
+          export BDD_RUNTIME_IMAGE="${{ steps.meta.outputs.image }}"
+          export BDD_OUTPUT_TAR=image.tar
+          if [ "${{ steps.meta.outputs.transport }}" = "registry" ]; then
+            export BDD_RUNTIME_PUSH=1
+          fi
+          ./scripts/bdd-image.sh build-runtime
       - name: Upload BDD image artifact
-        if: steps.meta.outputs.transport == 'artifact'
+        if: steps.meta.outputs.transport == 'artifact' && steps.final_image.outputs.exists != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.artifact }}

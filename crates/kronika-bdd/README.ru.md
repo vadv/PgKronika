@@ -77,35 +77,41 @@ cargo test -p kronika-bdd
 
 ## Полный локальный запуск через Docker
 
-Это тот же путь, что в CI, но без записи в рабочую копию. Nix на локальной
-машине не нужен: он запускается внутри закреплённого образа `nixos/nix`.
+Нужен Docker с Buildx. Nix остаётся внутри Docker, но запускается уже не из
+пустого `nixos/nix`, а из образа сборщика. В нём лежат зависимости Rust, Nix и
+PostgreSQL.
 
 Из корня репозитория:
 
 ```sh
-export NIX_BUILD_IMAGE='docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894'
+export BDD_IMAGE_PREFIX=ghcr.io/vadv/pgkronika
+platform_slug=$(./scripts/bdd-image.sh platform-slug)
+export BDD_CACHE_FROM="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main"
+export BDD_BUILDER_PULL=1
 
-docker run --rm \
-  -v "$PWD":/work:ro \
-  -e NIX_CONFIG='experimental-features = nix-command flakes' \
-  "$NIX_BUILD_IMAGE" \
-  sh -ceu '
-    mkdir -p /tmp/src
-    tar --exclude=.git --exclude=target --exclude=result --exclude=.direnv \
-      -C /work -cf - . | tar -C /tmp/src -xf -
-    cd /tmp/src
-    nix build .#image --out-link /tmp/img
-    /tmp/img
-  ' > image.tar
-
-docker load -i image.tar
-docker run --rm pgkronika-bdd:latest
+./scripts/bdd-image.sh build-builder
+./scripts/bdd-image.sh build-runtime
+./scripts/bdd-image.sh run
 ```
 
-Первая команда собирает tar-файл с образом. Вторая загружает его в Docker.
-Третья запускает проверку PostgreSQL 15, 16 и 17.
+`build-builder` берёт `pgkronika-bdd-builder` из реестра Docker, если там уже есть
+образ с тем же ключом зависимостей. Если такого образа нет, команда собирает его
+локально и использует BuildKit-кэш из реестра, когда он доступен.
+`build-runtime` собирает `image.tar`, загружает `pgkronika-bdd:latest` в Docker и
+оставляет tar-файл в рабочей копии.
 
-`image.tar` — только локальный файл; после проверки его можно удалить.
+Первая сборка образа сборщика после изменения зависимостей всё равно дорогая.
+Смысл этого образа в том, чтобы платить эту цену один раз на ключ зависимостей и
+переиспользовать результат при правках только в исходном коде.
+
+Чтобы обновить общий кэш образа сборщика с машины, у которой есть право на
+публикацию:
+
+```sh
+export BDD_CACHE_TO="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main,mode=max"
+export BDD_BUILDER_PUSH=1
+./scripts/bdd-image.sh build-builder
+```
 
 ## Полный локальный запуск через Nix
 
@@ -123,17 +129,43 @@ docker run --rm pgkronika-bdd:latest
 
 В GitHub Actions есть два BDD-задания:
 
-- `bdd image` один раз собирает образ Docker через Nix;
+- `bdd image` собирает или берёт из реестра образ сборщика, затем собирает образ
+  запуска;
 - `bdd matrix` запускает уже готовый образ.
 
-Для PR из этого же репозитория `bdd image` публикует образ в GHCR под тегом,
-основанным на хэше содержимого. Если такой тег уже есть, дорогая сборка
-пропускается. Для PR из форка tar-файл с образом передаётся через GitHub
-Actions как временный файл, без публикации в GHCR.
+Для PR из этого же репозитория образ сборщика и BuildKit-кэш лежат в GHCR. Тег
+образа сборщика зависит от ключа зависимостей и платформы, поэтому правка `src/`
+не пересобирает слой с Rust/PostgreSQL-зависимостями. Образ запуска всё ещё
+получает тег по содержимому; если такой образ уже есть, задание пропускает
+сборку до очистки диска.
 
-Хэш содержимого включает файлы flake, `Cargo.lock`, `Cargo.toml`,
-закреплённую версию Rust, исходники `kronika-bdd` и Gherkin-файлы. Изменение
-любого из этих входов даёт новый тег образа.
+PR из форка не публикуют образы в GHCR. Они собирают образ сборщика локально и
+передают образ запуска в `bdd matrix` как временный файл.
+
+Тот же скрипт можно использовать в GitLab CI:
+
+```yaml
+bdd:
+  image: docker:29
+  services:
+    - docker:29-dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    BDD_IMAGE_PREFIX: "$CI_REGISTRY_IMAGE"
+    BDD_PLATFORM: linux/amd64
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker buildx create --use
+  script:
+    - platform_slug=$(./scripts/bdd-image.sh platform-slug)
+    - export BDD_CACHE_FROM="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main"
+    - export BDD_CACHE_TO="type=registry,ref=${BDD_IMAGE_PREFIX}/pgkronika-bdd-buildcache:${platform_slug}-main,mode=max"
+    - export BDD_BUILDER_PULL=1 BDD_BUILDER_PUSH=1
+    - export BDD_RUNTIME_IMAGE="${BDD_IMAGE_PREFIX}/pgkronika-bdd:${platform_slug}-sha-$(./scripts/bdd-image.sh image-key | cut -c1-16)"
+    - ./scripts/bdd-image.sh build-builder
+    - BDD_RUNTIME_PUSH=1 ./scripts/bdd-image.sh build-runtime
+    - ./scripts/bdd-image.sh run "$BDD_RUNTIME_IMAGE"
+```
 
 ## Полезные ошибки
 
