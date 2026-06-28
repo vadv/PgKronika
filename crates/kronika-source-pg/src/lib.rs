@@ -10,25 +10,44 @@
 use kronika_registry::{Ts, bgwriter_checkpointer::BgwriterCheckpointer};
 use tokio_postgres::Client;
 
-const PG17: i32 = 170_000;
-
-/// Collect type `1_006_001` from a connected server.
+/// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->
+/// `17`.
 ///
-/// `ts` comes from the server's `clock_timestamp()` in the same query as the
-/// counters. PG17+ reads checkpoint counters from `pg_stat_checkpointer`; older
-/// versions read them from `pg_stat_bgwriter`.
+/// The server reports `server_version` in the connection handshake, so the
+/// caller reads it once from `Connection::parameter("server_version")` — no
+/// query — and it cannot change while the connection lives (a major upgrade
+/// restarts the server and drops the connection). Returns `None` if the
+/// parameter is absent or has no leading version number.
+#[must_use]
+pub fn server_major(server_version: Option<&str>) -> Option<u32> {
+    let text = server_version?.trim_start();
+    let mut digits = String::new();
+    for c in text.chars() {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        digits.push(c);
+    }
+    digits.parse().ok()
+}
+
+/// Collect type `1_006_001` from a connected server of major version `major`.
+///
+/// `major` comes from the handshake (see [`server_major`]), so collection makes
+/// one query and never asks the server for its version. `PostgreSQL` 17 split
+/// the checkpoint counters into `pg_stat_checkpointer`; 17+ reads them there,
+/// older versions from `pg_stat_bgwriter`. `ts` is the server's
+/// `clock_timestamp()`, taken in the same query as the counters.
 ///
 /// # Errors
 /// Returns the underlying [`tokio_postgres::Error`] if the server cannot be
 /// queried.
 pub async fn collect_bgwriter_checkpointer(
     client: &Client,
+    major: u32,
 ) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
-    let version_num: i32 = client
-        .query_one("SELECT current_setting('server_version_num')::int", &[])
-        .await?
-        .get(0);
-    if version_num >= PG17 {
+    // PG17 is the only catalog boundary this type cares about.
+    if major >= 17 {
         collect_pg17(client).await
     } else {
         collect_pre17(client).await

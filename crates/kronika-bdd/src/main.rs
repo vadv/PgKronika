@@ -66,7 +66,15 @@ async fn every_version_reports_stats(world: &mut BddWorld) -> anyhow::Result<()>
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
     for db in &world.clusters {
         let conn = db.connect().await?;
-        let snapshot = collect_bgwriter_checkpointer(conn.client())
+        let major = conn
+            .major()
+            .with_context(|| format!("postgres {}: server reported no version", db.major()))?;
+        anyhow::ensure!(
+            major == db.major(),
+            "postgres {}: handshake reported major {major} instead",
+            db.major()
+        );
+        let snapshot = collect_bgwriter_checkpointer(conn.client(), major)
             .await
             .with_context(|| format!("collect type 1_006_001 on postgres {}", db.major()))?;
         check_snapshot(db.major(), now_micros()?, &snapshot)?;
