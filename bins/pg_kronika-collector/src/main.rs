@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use kronika_format::DictLimits;
 use kronika_registry::StrId;
+use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
     to_v1, to_v2, to_v3,
@@ -116,16 +117,30 @@ async fn snapshot_and_seal(
         .await
         .context("collect type 1_006_001")?;
     let ts = bgwriter.ts;
-    let (version, rows) = collect_activity(client, major)
+    let (activity_version, activity_rows) = collect_activity(client, major)
         .await
         .context("collect pg_stat_activity")?;
+    let (database_version, database_rows) = collect_database(client, major)
+        .await
+        .context("collect pg_stat_database")?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
     buffers
         .push(bgwriter)
         .map_err(|_row| anyhow::anyhow!("section buffer full for bgwriter"))?;
-    push_activity(&mut buffers, &mut interner, version, &rows)?;
+    push_activity(
+        &mut buffers,
+        &mut interner,
+        activity_version,
+        &activity_rows,
+    )?;
+    push_database(
+        &mut buffers,
+        &mut interner,
+        database_version,
+        &database_rows,
+    )?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -175,14 +190,37 @@ fn push_activity(
     Ok(())
 }
 
-/// Buffer one typed activity row, mapping a full buffer to an error.
+/// Intern each row's `datname` and buffer it as the version's section type.
+///
+/// # Errors
+/// Returns an error if `datname` cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_database(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    version: DatabaseVersion,
+    rows: &[DatabaseRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        match version {
+            DatabaseVersion::V1 => buffer_row(buffers, database::to_v1(row, &mut intern)?)?,
+            DatabaseVersion::V2 => buffer_row(buffers, database::to_v2(row, &mut intern)?)?,
+            DatabaseVersion::V3 => buffer_row(buffers, database::to_v3(row, &mut intern)?)?,
+            DatabaseVersion::V4 => buffer_row(buffers, database::to_v4(row, &mut intern)?)?,
+        }
+    }
+    Ok(())
+}
+
+/// Buffer one typed snapshot row, mapping a full buffer to an error.
 fn buffer_row<S: kronika_registry::Section + 'static>(
     buffers: &mut SectionBuffers,
     row: S,
 ) -> Result<()> {
     buffers
         .push(row)
-        .map_err(|_row| anyhow::anyhow!("section buffer full for pg_stat_activity"))
+        .map_err(|_row| anyhow::anyhow!("section buffer is full"))
 }
 
 fn announce(line: &str) {
@@ -194,7 +232,8 @@ fn announce(line: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{activity_dict_limits, push_activity};
+    use super::{activity_dict_limits, push_activity, push_database};
+    use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
     use kronika_source_pg::{ActivityRow, ActivityVersion};
     use kronika_writer::{Interner, SectionBuffers, dict};
 
@@ -250,6 +289,77 @@ mod tests {
                 .iter()
                 .any(|entry| entry.type_id == 1_001_003),
             "the part carries the pg_stat_activity section"
+        );
+    }
+
+    fn db_row(datid: u32) -> DatabaseRow {
+        DatabaseRow {
+            ts: 1_000,
+            datid,
+            datname: if datid == 0 {
+                None
+            } else {
+                Some("appdb".to_owned())
+            },
+            numbackends: 4,
+            xact_commit: 100,
+            xact_rollback: 2,
+            blks_read: 4_000,
+            blks_hit: 90_000,
+            tup_returned: 500,
+            tup_fetched: 400,
+            tup_inserted: 50,
+            tup_updated: 30,
+            tup_deleted: 10,
+            conflicts: 0,
+            temp_files: 1,
+            temp_bytes: 8_192,
+            deadlocks: 0,
+            blk_read_time: 12.5,
+            blk_write_time: 3.0,
+            stats_reset: Some(1_500),
+            checksum_failures: Some(0),
+            checksum_last_failure: None,
+            session_time: Some(1_000.0),
+            active_time: Some(250.0),
+            idle_in_transaction_time: Some(50.0),
+            sessions: Some(7),
+            sessions_abandoned: Some(1),
+            sessions_fatal: Some(0),
+            sessions_killed: Some(0),
+            parallel_workers_to_launch: Some(9),
+            parallel_workers_launched: Some(8),
+        }
+    }
+
+    #[test]
+    fn push_database_buffers_rows_and_interns_datname() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_database(
+            &mut buffers,
+            &mut interner,
+            DatabaseVersion::V4,
+            &[db_row(0), db_row(1)],
+        )
+        .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "rows were buffered");
+
+        // The non-shared row's datname should be interned, and the part should
+        // contain the V4 database section.
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(!dict_sections.is_empty(), "datname was interned");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_005_004),
+            "the part carries the pg_stat_database section"
         );
     }
 }
