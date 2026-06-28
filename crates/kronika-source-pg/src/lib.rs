@@ -1,5 +1,140 @@
 //! `PostgreSQL` collectors.
 //!
-//! This crate will collect `PostgreSQL` catalog, statistics, activity, and
-//! configuration data. Public API docs will be added here as the crate is
-//! implemented.
+//! Type `1_006_001` stores `pg_stat_bgwriter` data plus the checkpoint counters
+//! that moved to `pg_stat_checkpointer` in `PostgreSQL` 17.
+#![allow(
+    clippy::multiple_crate_versions,
+    reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
+)]
+
+use kronika_registry::{Ts, bgwriter_checkpointer::BgwriterCheckpointer};
+use tokio_postgres::Client;
+
+/// Prefix a query literal with the kronika marker (SQL-transparency rule): the
+/// statement then shows in `pg_stat_activity` and the server log as kronika, its
+/// version, and this source file.
+macro_rules! marked {
+    ($sql:literal) => {
+        concat!(
+            "/* pg_kronika:",
+            env!("CARGO_PKG_VERSION"),
+            " crates/kronika-source-pg/src/lib.rs */ ",
+            $sql,
+        )
+    };
+}
+
+/// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->
+/// `17`.
+///
+/// The server reports `server_version` in the connection handshake, so the
+/// caller reads it once from `Connection::parameter("server_version")` — no
+/// query — and it cannot change while the connection lives (a major upgrade
+/// restarts the server and drops the connection). Returns `None` if the
+/// parameter is absent or has no leading version number.
+#[must_use]
+pub fn server_major(server_version: Option<&str>) -> Option<u32> {
+    let text = server_version?.trim_start();
+    let mut digits = String::new();
+    for c in text.chars() {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        digits.push(c);
+    }
+    digits.parse().ok()
+}
+
+/// Collect type `1_006_001` from a connected server of major version `major`.
+///
+/// `major` comes from the handshake (see [`server_major`]), so collection makes
+/// one query and never asks the server for its version. `PostgreSQL` 17 split
+/// the checkpoint counters into `pg_stat_checkpointer`; 17+ reads them there,
+/// older versions from `pg_stat_bgwriter`. `ts` is the server's
+/// `clock_timestamp()`, taken in the same query as the counters.
+///
+/// # Errors
+/// Returns the underlying [`tokio_postgres::Error`] if the server cannot be
+/// queried.
+pub async fn collect_bgwriter_checkpointer(
+    client: &Client,
+    major: u32,
+) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
+    // PG17 is the only catalog boundary this type cares about.
+    if major >= 17 {
+        collect_pg17(client).await
+    } else {
+        collect_pre17(client).await
+    }
+}
+
+/// `PostgreSQL` 16 and earlier: all counters come from `pg_stat_bgwriter`.
+async fn collect_pre17(client: &Client) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            marked!(
+                "SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, \
+                 checkpoint_sync_time, buffers_checkpoint, buffers_clean, maxwritten_clean, \
+                 buffers_backend, buffers_backend_fsync, buffers_alloc, \
+                 (extract(epoch from stats_reset) * 1e6)::bigint AS stats_reset_us, \
+                 (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us \
+                 FROM pg_stat_bgwriter"
+            ),
+            &[],
+        )
+        .await?;
+    Ok(BgwriterCheckpointer {
+        ts: Ts(row.get("ts_us")),
+        checkpoints_timed: row.get("checkpoints_timed"),
+        checkpoints_req: row.get("checkpoints_req"),
+        checkpoint_write_time: row.get("checkpoint_write_time"),
+        checkpoint_sync_time: row.get("checkpoint_sync_time"),
+        buffers_checkpoint: row.get("buffers_checkpoint"),
+        restartpoints_timed: None,
+        restartpoints_req: None,
+        restartpoints_done: None,
+        buffers_clean: row.get("buffers_clean"),
+        maxwritten_clean: row.get("maxwritten_clean"),
+        buffers_backend: Some(row.get("buffers_backend")),
+        buffers_backend_fsync: Some(row.get("buffers_backend_fsync")),
+        buffers_alloc: row.get("buffers_alloc"),
+        bgwriter_stats_reset: Ts(row.get("stats_reset_us")),
+        checkpointer_stats_reset: None,
+    })
+}
+
+/// `PostgreSQL` 17+: checkpoint counters moved to `pg_stat_checkpointer`.
+async fn collect_pg17(client: &Client) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            marked!(
+                "SELECT c.num_timed, c.num_requested, c.write_time, c.sync_time, \
+                 c.buffers_written, c.restartpoints_timed, c.restartpoints_req, \
+                 c.restartpoints_done, b.buffers_clean, b.maxwritten_clean, b.buffers_alloc, \
+                 (extract(epoch from b.stats_reset) * 1e6)::bigint AS bgwriter_reset_us, \
+                 (extract(epoch from c.stats_reset) * 1e6)::bigint AS checkpointer_reset_us, \
+                 (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us \
+                 FROM pg_stat_bgwriter b, pg_stat_checkpointer c"
+            ),
+            &[],
+        )
+        .await?;
+    Ok(BgwriterCheckpointer {
+        ts: Ts(row.get("ts_us")),
+        checkpoints_timed: row.get("num_timed"),
+        checkpoints_req: row.get("num_requested"),
+        checkpoint_write_time: row.get("write_time"),
+        checkpoint_sync_time: row.get("sync_time"),
+        buffers_checkpoint: row.get("buffers_written"),
+        restartpoints_timed: Some(row.get("restartpoints_timed")),
+        restartpoints_req: Some(row.get("restartpoints_req")),
+        restartpoints_done: Some(row.get("restartpoints_done")),
+        buffers_clean: row.get("buffers_clean"),
+        maxwritten_clean: row.get("maxwritten_clean"),
+        buffers_backend: None,
+        buffers_backend_fsync: None,
+        buffers_alloc: row.get("buffers_alloc"),
+        bgwriter_stats_reset: Ts(row.get("bgwriter_reset_us")),
+        checkpointer_stats_reset: Some(Ts(row.get("checkpointer_reset_us"))),
+    })
+}
