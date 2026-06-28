@@ -5,13 +5,9 @@ FROM docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 WORKDIR /work
 
-# Build the dependency store from the real workspace, not a hand-rolled stub
-# tree. crane's `cargoArtifacts` ignores `.rs` content and the source file set,
-# so a builder baked from one source snapshot stays valid for every later
-# source-only change; only a manifest/lock/flake change (the deps key) rebuilds
-# it. A stub tree does not reproduce crane's dummy source exactly, so it bakes a
-# `cargoArtifacts` derivation the real `nix build .#image` never reuses — which
-# silently defeated the whole builder image.
+# Use the real workspace so crane computes the same `cargoArtifacts` derivation
+# that `nix build .#image` reuses. Manifest, lockfile, flake, or Dockerfile
+# changes get a new builder tag; source-only changes can reuse the old one.
 COPY . .
 
 RUN nix build \

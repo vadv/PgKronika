@@ -39,13 +39,14 @@ Scenario: every version yields a valid bgwriter/checkpointer snapshot
 For each version it calls `collect_bgwriter_checkpointer` (registry type
 `1_006_001`) and checks that:
 
-- the row's `ts` is the server's `clock_timestamp()`, near the harness clock;
+- the row's `ts` is the server's `clock_timestamp()`, near the runner clock;
 - counters are non-negative and `bgwriter_stats_reset` is before that `ts`;
 - the filled and `NULL` columns match the version: PG17+ fills
   `restartpoints_*` and `checkpointer_stats_reset`, but leaves
   `buffers_backend` empty; earlier versions do the reverse.
 
-This catches a stale query or wrong version branch in the BDD suite.
+This fails when the SQL no longer matches a catalog layout or the version
+dispatch selects the wrong branch.
 
 The same feature also starts the collector binary:
 
@@ -75,8 +76,8 @@ PostgreSQL run.
 
 ## Full Local Run With Docker
 
-This path needs Docker with Buildx. Nix stays inside Docker, but it runs from a
-builder image that keeps the Rust, Nix, and PostgreSQL dependency store.
+This path needs Docker with Buildx. Nix runs inside Docker. The builder image
+stores the Rust and PostgreSQL dependency build.
 
 From the repository root:
 
@@ -89,15 +90,13 @@ export BDD_BUILDER_PULL=1
 ./scripts/bdd-image.sh run
 ```
 
-`build-builder` pulls `pgkronika-bdd-builder` when the dependency key already
-exists. Otherwise it builds the builder locally, using the registry BuildKit
-cache when available. `build-runtime` uses that builder to create `image.tar`,
-loads `pgkronika-bdd:latest` into Docker, and leaves the tarball in the working
-tree.
+`build-builder` pulls `pgkronika-bdd-builder` when the dependency key exists in
+the registry. Otherwise it builds the image locally. `build-runtime` uses that
+builder to create `image.tar`, loads `pgkronika-bdd:latest` into Docker, and
+leaves the tarball in the working tree.
 
-The first builder build after a dependency change is still expensive. The point
-of the builder image is to pay that cost once per dependency key and reuse it
-for later source-only changes.
+The first builder build after a dependency change is still expensive. Later
+source-only changes reuse the same builder image.
 
 To publish the builder image from a machine that is allowed to push:
 
@@ -106,9 +105,9 @@ export BDD_BUILDER_PUSH=1
 ./scripts/bdd-image.sh build-builder
 ```
 
-`BDD_CACHE_FROM` and `BDD_CACHE_TO` can still be set for a separate BuildKit
-registry cache, but the default path relies on the builder image itself. That
-avoids publishing the same large Nix store twice.
+`BDD_CACHE_FROM` and `BDD_CACHE_TO` can still point to a separate BuildKit
+registry cache. The default path relies on the builder image itself and avoids a
+second upload of the same Nix store.
 
 ## Full Local Run With Local Nix
 

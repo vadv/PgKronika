@@ -81,20 +81,17 @@ fn now_micros() -> anyhow::Result<i64> {
     i64::try_from(since_epoch.as_micros()).context("unix microseconds overflow i64")
 }
 
-/// Plausibility of a freshly collected snapshot. `ts` now comes from the
-/// server's `clock_timestamp()`, so we check it sits near the harness clock
-/// (same host) instead of equalling a value we passed in.
+/// Basic invariants for a row read directly from PostgreSQL.
 fn check_snapshot(major: u32, host_now: i64, snap: &BgwriterCheckpointer) -> anyhow::Result<()> {
     anyhow::ensure!(
         snap.ts.0 > 0 && (snap.ts.0 - host_now).abs() < 300_000_000,
-        "postgres {major}: snapshot ts {} is not within 5 min of the harness clock {host_now}",
+        "postgres {major}: snapshot ts {} is not within 5 min of the runner clock {host_now}",
         snap.ts.0
     );
     anyhow::ensure!(
         snap.checkpoints_timed >= 0 && snap.buffers_clean >= 0 && snap.buffers_alloc >= 0,
         "postgres {major}: a counter came back negative"
     );
-    // The reset timestamp must predate the sampled row.
     anyhow::ensure!(
         snap.bgwriter_stats_reset.0 > 0 && snap.bgwriter_stats_reset.0 <= snap.ts.0,
         "postgres {major}: bgwriter_stats_reset {} not in (0, {}]",
@@ -104,10 +101,8 @@ fn check_snapshot(major: u32, host_now: i64, snap: &BgwriterCheckpointer) -> any
     assert_version_columns(major, snap)
 }
 
-/// The version-specific column shape, asserted on both the live snapshot and the
-/// row read back from a sealed segment: PG17+ fills the restartpoint and
-/// checkpointer-reset columns and drops `buffers_backend`; earlier versions do
-/// the reverse.
+/// PG17 moved checkpoint fields out of `pg_stat_bgwriter`; older versions keep
+/// the old column set.
 fn assert_version_columns(major: u32, snap: &BgwriterCheckpointer) -> anyhow::Result<()> {
     if major >= PG17_MAJOR {
         anyhow::ensure!(
@@ -158,12 +153,10 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
         .find(|entry| entry.type_id == BGWRITER_CHECKPOINTER_TYPE_ID)
         .with_context(|| format!("postgres {major}: segment has no section 1_006_001"))?;
 
-    // Decode the body typed, so the end-to-end check covers the values that
-    // survived collect -> seal -> read, not just that a section is present.
+    // Check typed values, not just section presence.
     let row = decode_sealed_row(path, entry)
         .with_context(|| format!("postgres {major}: read back section 1_006_001"))?;
 
-    // One signal -> one row, so the body's ts is the whole segment range.
     anyhow::ensure!(
         row.ts.0 > 0 && row.ts.0 == catalog.min_ts && row.ts.0 == catalog.max_ts,
         "postgres {major}: row ts {} disagrees with segment range {}..={}",
@@ -180,9 +173,7 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     assert_version_columns(major, &row)
 }
 
-/// Read just one section's bytes from the sealed segment, CRC-check them, and
-/// decode the single typed row. Reads only the catalog-bounded section, never
-/// the whole file.
+/// Read the catalog-bounded section and decode its single typed row.
 fn decode_sealed_row(path: &Path, entry: &Entry) -> anyhow::Result<BgwriterCheckpointer> {
     use std::os::unix::fs::FileExt;
 
@@ -209,7 +200,6 @@ fn decode_sealed_row(path: &Path, entry: &Entry) -> anyhow::Result<BgwriterCheck
 
 #[tokio::main]
 async fn main() {
-    // Docker uses the Nix-store feature directory; local `cargo run` uses ./features.
     let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
     BddWorld::cucumber().run_and_exit(features).await;
 }

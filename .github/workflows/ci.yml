@@ -54,8 +54,8 @@ jobs:
           name: coverage
           path: coverage.json
 
-  # The builder image carries the Nix/Rust/PostgreSQL dependency store. Buildx
-  # keeps that image warm in GHCR; the final BDD image is still tagged by content.
+  # Build the BDD runtime image from a dependency image keyed by platform and
+  # manifest inputs.
   bdd-image:
     name: bdd image
     runs-on: ubuntu-latest
@@ -142,8 +142,7 @@ jobs:
           path: image.tar
           retention-days: 1
 
-  # The "launch on a new machine" path: pull or load the image and run it. The
-  # image boots the whole PostgreSQL matrix in parallel internally.
+  # Run the built image on a separate runner.
   bdd-matrix:
     name: bdd matrix
     needs: bdd-image

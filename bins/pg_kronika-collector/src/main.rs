@@ -54,10 +54,10 @@ async fn main() -> Result<()> {
     let (client, connection) = tokio_postgres::connect(&config.dsn, tokio_postgres::NoTls)
         .await
         .context("connect to PostgreSQL")?;
-    // The client needs the connection future to keep running.
+    // tokio-postgres drives I/O through this future.
     tokio::spawn(connection);
 
-    // Keep active.parts private; publish only sealed segments.
+    // Only sealed segments leave this process.
     let journal_dir = tempfile::tempdir().context("create the journal directory")?;
     let (mut journal, _report) = Journal::open(
         &journal_dir.path().join("active.parts"),
@@ -69,7 +69,6 @@ async fn main() -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("install the SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("install the SIGINT handler")?;
 
-    // Supervisors wait for this before sending the first SIGUSR2.
     announce("ready");
 
     loop {
@@ -114,14 +113,13 @@ async fn snapshot_and_seal(
 
     let dest = out_dir.join(format!("{}.pgm", ts.0));
     seal(journal, &dest).context("seal the segment")?;
-    // If sealing failed, keep active.parts for writer-side recovery.
+    // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
 }
 
 fn announce(line: &str) {
     let mut stdout = std::io::stdout().lock();
-    // Tests and supervisors wait on complete status lines.
     writeln!(stdout, "{line}")
         .and_then(|()| stdout.flush())
         .ok();

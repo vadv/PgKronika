@@ -14,13 +14,9 @@ const PG17: i32 = 170_000;
 
 /// Collect type `1_006_001` from a connected server.
 ///
-/// The row's `ts` is the server's `clock_timestamp()`, read in the same query as
-/// the stats, so `stats_reset <= ts` holds on the server and does not depend on
-/// the collector host clock.
-///
-/// `PostgreSQL` 17+ reads checkpoint counters from `pg_stat_checkpointer`.
-/// Earlier versions read them from `pg_stat_bgwriter`; columns they do not
-/// expose are returned as `None`.
+/// `ts` comes from the server's `clock_timestamp()` in the same query as the
+/// counters. PG17+ reads checkpoint counters from `pg_stat_checkpointer`; older
+/// versions read them from `pg_stat_bgwriter`.
 ///
 /// # Errors
 /// Returns the underlying [`tokio_postgres::Error`] if the server cannot be
