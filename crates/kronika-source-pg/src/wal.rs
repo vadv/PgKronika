@@ -1,0 +1,150 @@
+//! `pg_stat_wal` collection for types `1_007_001` / `1_007_002`.
+//!
+//! The view exists from PG14; on PG 10-13 there is no source and collection
+//! returns `None`. PG18 removed the WAL write/sync counters and their timings
+//! (they moved to `pg_stat_io`), so the major version selects both the SQL and
+//! the layout. The row is all numeric, so nothing is interned. The typed layout
+//! lives in `kronika-registry` (`PgStatWalV1` / `PgStatWalV2`).
+
+use kronika_registry::Ts;
+use kronika_registry::pg_stat_wal::{PgStatWalV1, PgStatWalV2};
+use tokio_postgres::Client;
+
+/// Prefix a query literal with the kronika marker (SQL-transparency rule).
+macro_rules! marked {
+    ($sql:literal) => {
+        concat!(
+            "/* pg_kronika:",
+            env!("CARGO_PKG_VERSION"),
+            " crates/kronika-source-pg/src/wal.rs */ ",
+            $sql,
+        )
+    };
+}
+
+/// The `pg_stat_wal` layout selected by the server major version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalVersion {
+    /// PG 14-17: type `1_007_001` (with write/sync counters and timings).
+    V1,
+    /// PG 18: type `1_007_002` (generation counters only).
+    V2,
+}
+
+/// Select the layout for a server major version, or `None` before PG14 where
+/// `pg_stat_wal` does not exist.
+#[must_use]
+pub const fn wal_version(major: u32) -> Option<WalVersion> {
+    if major >= 18 {
+        Some(WalVersion::V2)
+    } else if major >= 14 {
+        Some(WalVersion::V1)
+    } else {
+        None
+    }
+}
+
+/// The SQL for one layout.
+///
+/// Each query carries the kronika marker. `ts` is one `statement_timestamp()`
+/// for the snapshot; `wal_bytes` (`numeric`) and `stats_reset` come back cast to
+/// `int8`.
+#[must_use]
+pub const fn wal_query(version: WalVersion) -> &'static str {
+    match version {
+        WalVersion::V1 => marked!(
+            "SELECT wal_records, wal_fpi, wal_bytes::int8 AS wal_bytes, wal_buffers_full, \
+             wal_write, wal_sync, wal_write_time, wal_sync_time, \
+             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
+             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+             FROM pg_stat_wal"
+        ),
+        WalVersion::V2 => marked!(
+            "SELECT wal_records, wal_fpi, wal_bytes::int8 AS wal_bytes, wal_buffers_full, \
+             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
+             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+             FROM pg_stat_wal"
+        ),
+    }
+}
+
+/// One `pg_stat_wal` snapshot in the version's typed layout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WalSnapshot {
+    /// PG 14-17 layout.
+    V1(PgStatWalV1),
+    /// PG 18 layout.
+    V2(PgStatWalV2),
+}
+
+fn v1_from_pg(row: &tokio_postgres::Row) -> PgStatWalV1 {
+    PgStatWalV1 {
+        ts: Ts(row.get("ts_us")),
+        wal_records: row.get("wal_records"),
+        wal_fpi: row.get("wal_fpi"),
+        wal_bytes: row.get("wal_bytes"),
+        wal_buffers_full: row.get("wal_buffers_full"),
+        wal_write: row.get("wal_write"),
+        wal_sync: row.get("wal_sync"),
+        wal_write_time: row.get("wal_write_time"),
+        wal_sync_time: row.get("wal_sync_time"),
+        stats_reset: row.get::<_, Option<i64>>("stats_reset_us").map(Ts),
+    }
+}
+
+fn v2_from_pg(row: &tokio_postgres::Row) -> PgStatWalV2 {
+    PgStatWalV2 {
+        ts: Ts(row.get("ts_us")),
+        wal_records: row.get("wal_records"),
+        wal_fpi: row.get("wal_fpi"),
+        wal_bytes: row.get("wal_bytes"),
+        wal_buffers_full: row.get("wal_buffers_full"),
+        stats_reset: row.get::<_, Option<i64>>("stats_reset_us").map(Ts),
+    }
+}
+
+/// Collect the single `pg_stat_wal` row, or `None` before PG14 where the view
+/// does not exist.
+///
+/// # Errors
+/// Returns the [`tokio_postgres::Error`] if the query fails.
+pub async fn collect_wal(
+    client: &Client,
+    major: u32,
+) -> Result<Option<WalSnapshot>, tokio_postgres::Error> {
+    let Some(version) = wal_version(major) else {
+        return Ok(None);
+    };
+    let row = client.query_one(wal_query(version), &[]).await?;
+    Ok(Some(match version {
+        WalVersion::V1 => WalSnapshot::V1(v1_from_pg(&row)),
+        WalVersion::V2 => WalSnapshot::V2(v2_from_pg(&row)),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WalVersion, wal_query, wal_version};
+
+    #[test]
+    fn version_appears_at_pg14_and_changes_at_pg18() {
+        assert_eq!(wal_version(10), None);
+        assert_eq!(wal_version(13), None);
+        assert_eq!(wal_version(14), Some(WalVersion::V1));
+        assert_eq!(wal_version(17), Some(WalVersion::V1));
+        assert_eq!(wal_version(18), Some(WalVersion::V2));
+    }
+
+    #[test]
+    fn query_includes_version_specific_columns() {
+        assert!(wal_query(WalVersion::V1).contains("wal_write_time"));
+        assert!(wal_query(WalVersion::V1).contains("wal_sync"));
+        assert!(!wal_query(WalVersion::V2).contains("wal_write"));
+        assert!(!wal_query(WalVersion::V2).contains("wal_sync"));
+        for version in [WalVersion::V1, WalVersion::V2] {
+            assert!(wal_query(version).contains("pg_stat_wal"));
+            assert!(wal_query(version).contains("pg_kronika"));
+            assert!(wal_query(version).contains("wal_bytes"));
+        }
+    }
+}
