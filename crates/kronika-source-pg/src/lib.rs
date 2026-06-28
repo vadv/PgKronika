@@ -70,8 +70,8 @@ pub async fn collect_bgwriter_checkpointer(
     }
 }
 
-/// `pg_stat_statements_info` (which carries `stats_reset`) exists since the
-/// extension version 1.9.
+/// `pg_stat_statements_info.stats_reset` is available in pg_stat_statements
+/// 1.9 and newer.
 fn pg_stat_statements_has_info(version: Option<&str>) -> bool {
     let Some(version) = version else {
         return false;
@@ -82,15 +82,16 @@ fn pg_stat_statements_has_info(version: Option<&str>) -> bool {
     (major, minor) >= (1, 9)
 }
 
-/// Collect type `1_020_001` (reset/restart context), one row per segment.
+/// Collect one `1_020_001` reset_metadata row for the segment being sealed.
 ///
-/// Two queries: detect the relevant extensions (always safe), then one
-/// consolidated query whose optional `stats_reset` sources are gated by `major`
-/// and extension presence — referencing a view that does not exist errors even
-/// inside a subquery, so the gate decides the query text, not a `CASE`.
+/// The first query reads installed extension versions. The second query is
+/// assembled from the views that exist on this server. PostgreSQL resolves
+/// relation names before `CASE` branches run, so unsupported views must be left
+/// out of the SQL text.
 ///
-/// The three `StrId` string columns (extension versions, `compute_query_id`) are
-/// left `None` here; they need the dictionary interner, which lands separately.
+/// Dictionary-backed string fields are not written yet: extension versions and
+/// `compute_query_id` stay `None` until dictionary support is wired into the
+/// writer path.
 ///
 /// # Errors
 /// Returns the underlying [`tokio_postgres::Error`] if the server cannot be
@@ -119,7 +120,7 @@ pub async fn collect_reset_metadata(
         }
     }
 
-    // Gate the optional reset sources by version / extension presence.
+    // Keep unsupported views out of the SQL text.
     let io = if major >= 16 {
         "(SELECT (extract(epoch from max(stats_reset)) * 1e6)::bigint FROM pg_stat_io)"
     } else {
@@ -141,8 +142,8 @@ pub async fn collect_reset_metadata(
             env!("CARGO_PKG_VERSION"),
             " crates/kronika-source-pg/src/lib.rs */ "
         ),
-        // The two non-Option reset columns coalesce to postmaster start time:
-        // if stats were never reset (a fresh cluster), that is when they began.
+        // Required reset timestamps use postmaster start time when PostgreSQL
+        // reports NULL because the stats have never been reset.
         "SELECT (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us, \
          (extract(epoch from pg_postmaster_start_time()) * 1e6)::bigint AS postmaster_us, \
          (SELECT (extract(epoch from coalesce(max(stats_reset), pg_postmaster_start_time())) * 1e6)::bigint FROM pg_stat_database) AS db_reset_us, \
@@ -169,7 +170,7 @@ pub async fn collect_reset_metadata(
         pg_stat_wal_reset_at: row.get::<_, Option<i64>>("wal_reset_us").map(Ts),
         pg_stat_archiver_reset_at: Ts(row.get("archiver_reset_us")),
         pg_stat_io_reset_at: row.get::<_, Option<i64>>("io_reset_us").map(Ts),
-        // String columns need the interner; filled in a follow-up.
+        // Filled after dictionary-backed string fields are available here.
         ext_pg_stat_statements_version: None,
         ext_pg_store_plans_version: None,
         compute_query_id: None,

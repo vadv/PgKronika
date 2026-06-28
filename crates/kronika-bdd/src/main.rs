@@ -159,7 +159,7 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let catalog = segment.catalog();
     let (min, max) = (catalog.min_ts, catalog.max_ts);
 
-    // Section 1_006_001: typed values survived collect -> seal -> read.
+    // Verify the typed row, not only the catalog entry.
     let bg_entry = find_section(&catalog.entries, BGWRITER_CHECKPOINTER_TYPE_ID, major)?;
     let bgwriter: BgwriterCheckpointer = decode_sealed_row(path, bg_entry)
         .with_context(|| format!("postgres {major}: read back section 1_006_001"))?;
@@ -176,7 +176,7 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     );
     assert_version_columns(major, &bgwriter)?;
 
-    // Section 1_020_001 must be in every segment (registry contract).
+    // reset_metadata is mandatory for sealed PostgreSQL segments.
     let reset_entry = find_section(&catalog.entries, RESET_METADATA_TYPE_ID, major)?;
     let reset: ResetMetadata = decode_sealed_row(path, reset_entry)
         .with_context(|| format!("postgres {major}: read back section 1_020_001"))?;
@@ -194,7 +194,6 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// First catalog entry of `type_id`, or a context error naming the version.
 fn find_section(entries: &[Entry], type_id: u32, major: u32) -> anyhow::Result<&Entry> {
     entries
         .iter()
@@ -202,7 +201,7 @@ fn find_section(entries: &[Entry], type_id: u32, major: u32) -> anyhow::Result<&
         .with_context(|| format!("postgres {major}: segment has no section {type_id}"))
 }
 
-/// Read the catalog-bounded section and decode its single typed row.
+/// Read a one-row section through the same CRC and typed decoder paths as readers.
 fn decode_sealed_row<T: Section>(path: &Path, entry: &Entry) -> anyhow::Result<T> {
     use std::os::unix::fs::FileExt;
 
