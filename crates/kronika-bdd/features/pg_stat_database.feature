@@ -1,9 +1,8 @@
 Feature: Collector reads pg_stat_database
-  The source-pg collector reads pg_stat_database into the version's layout
-  (type 1_005_003 on PG 14-17, type 1_005_004 on PG 18) and seals it. The
-  scenario reads the rows back, checks the shared-objects row (datid=0, null
-  datname), and resolves a real database's datname through the dictionary.
+  The collector seals pg_stat_database rows using the layout selected by the
+  PostgreSQL major version. The shared-objects row keeps datid=0 and a null
+  datname; database rows keep dictionary-backed names.
 
-  Scenario: every version seals a readable pg_stat_database section
+  Scenario: matrix clusters seal dictionary-backed pg_stat_database rows
     Given the PostgreSQL matrix is booted
-    Then every version seals a segment whose pg_stat_database rows resolve through the dictionary
+    Then each matrix cluster seals pg_stat_database rows with dictionary-backed names

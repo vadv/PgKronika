@@ -115,7 +115,8 @@ pub struct PgStatDatabaseV4 {
 }
 
 /// Type `1_005_003`: `pg_stat_database` on PG 14-17 (V2 plus session
-/// statistics, no parallel-worker counters). Columns match [`PgStatDatabaseV4`].
+/// statistics, no parallel-worker counters). Column meanings match
+/// [`PgStatDatabaseV4`] for fields present in this layout.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_005_003,
@@ -211,7 +212,8 @@ pub struct PgStatDatabaseV3 {
 }
 
 /// Type `1_005_002`: `pg_stat_database` on PG 12-13 (V1 plus checksum columns,
-/// no session statistics). Columns match [`PgStatDatabaseV4`].
+/// no session statistics). Column meanings match [`PgStatDatabaseV4`] for
+/// fields present in this layout.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_005_002,
@@ -286,7 +288,8 @@ pub struct PgStatDatabaseV2 {
 }
 
 /// Type `1_005_001`: `pg_stat_database` on PG 10-11 (base layout, no checksum or
-/// session columns). Columns match [`PgStatDatabaseV4`].
+/// session columns). Column meanings match [`PgStatDatabaseV4`] for fields
+/// present in this layout.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_005_001,
@@ -422,7 +425,7 @@ mod tests {
 
     #[test]
     fn v4_roundtrip_preserves_values_and_nulls() {
-        // datid 0 (shared row, datname None) sorts before a real database.
+        // The shared-objects row sorts before database rows.
         crate::assert_roundtrips(&[v4_row(1_000, 0), v4_row(1_000, 5)]);
     }
 

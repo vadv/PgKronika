@@ -320,7 +320,7 @@ fn decode_activity_rows(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStat
     PgStatActivityV3::decode(verified).context("typed decode of section 1_001_003")
 }
 
-#[then("every version seals a segment whose pg_stat_database rows resolve through the dictionary")]
+#[then("each matrix cluster seals pg_stat_database rows with dictionary-backed names")]
 async fn every_version_seals_database(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
     for db in &world.clusters {
@@ -331,12 +331,9 @@ async fn every_version_seals_database(world: &mut BddWorld) -> anyhow::Result<()
     Ok(())
 }
 
-/// Read back the sealed `pg_stat_database` section and resolve a database name.
-///
-/// The matrix runs PG15-17 (V3) and PG18 (V4); the check decodes the matching
-/// layout, confirms one snapshot timestamp, finds the `datid = 0` shared row
-/// with a null datname, and resolves a real database's datname through the
-/// segment dictionary.
+/// Decode the sealed `pg_stat_database` section for the selected layout, then
+/// check one snapshot timestamp, the shared row, and dictionary-backed database
+/// names.
 fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
@@ -436,14 +433,14 @@ fn check_database_rows(
         "postgres {major}: shared-objects row has a non-null datname"
     );
 
-    // A real database resolves its datname through the dictionary.
+    // A `datid != 0` row must resolve its `datname` through the dictionary.
     let real = rows
         .iter()
         .find(|row| row.0 != 0)
-        .with_context(|| format!("postgres {major}: no real database row"))?;
+        .with_context(|| format!("postgres {major}: no datid != 0 database row"))?;
     let datname = real
         .1
-        .with_context(|| format!("postgres {major}: a real database has a null datname"))?;
+        .with_context(|| format!("postgres {major}: datid != 0 row has a null datname"))?;
     match dict.resolve(datname.0) {
         Some(Resolved::String(bytes)) => anyhow::ensure!(
             !bytes.is_empty(),

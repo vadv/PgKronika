@@ -344,10 +344,10 @@ mod tests {
         .expect("push interns and buffers");
         assert!(!buffers.is_empty(), "rows were buffered");
 
-        // The datid=1 row's datname reached the dictionary; the part carries the
-        // database section under type 1_005_004.
+        // The non-shared row's datname should be interned, and the part should
+        // contain the V4 database section.
         let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
-        assert!(!dict_sections.is_empty(), "datname reached the dictionary");
+        assert!(!dict_sections.is_empty(), "datname was interned");
         let part = buffers
             .flush(&dict_sections, 0)
             .expect("flush encodes the window")
