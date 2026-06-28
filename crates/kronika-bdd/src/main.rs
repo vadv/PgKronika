@@ -28,6 +28,7 @@ use kronika_registry::{
     Bytes, MAX_SECTION_BYTES, Section, StrId, VerifiedSection,
     bgwriter_checkpointer::BgwriterCheckpointer,
     pg_stat_activity::PgStatActivityV3,
+    pg_stat_archiver::PgStatArchiver,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
 };
@@ -46,6 +47,7 @@ const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
 
 const PG_STAT_IO_V1_TYPE_ID: u32 = 1_009_001;
 const PG_STAT_IO_V2_TYPE_ID: u32 = 1_009_002;
+const PG_STAT_ARCHIVER_TYPE_ID: u32 = 1_008_001;
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
@@ -470,6 +472,17 @@ async fn every_version_handles_io(world: &mut BddWorld) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[then("every version seals a single-row pg_stat_archiver section")]
+async fn every_version_seals_archiver(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_archiver_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
 /// Read back the `pg_stat_io` section per the major's layout.
 ///
 /// Before PG16 the view does not exist and neither layout may appear. On PG16-17
@@ -632,6 +645,85 @@ fn check_io_stats_reset(
         }
     }
     Ok(())
+}
+
+/// Read back the single `pg_stat_archiver` row and resolve WAL names when set.
+fn assert_archiver_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let catalog = segment.catalog();
+    let entry = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.type_id == PG_STAT_ARCHIVER_TYPE_ID)
+        .with_context(|| format!("postgres {major}: segment has no section 1_008_001"))?;
+    let rows = decode_archiver(path, entry)
+        .with_context(|| format!("postgres {major}: read back section 1_008_001"))?;
+    anyhow::ensure!(
+        rows.len() == 1,
+        "postgres {major}: pg_stat_archiver is a singleton, got {} rows",
+        rows.len()
+    );
+    let row = rows[0];
+    ensure_ts_in_segment_range(
+        major,
+        "section 1_008_001",
+        row.ts.0,
+        catalog.min_ts,
+        catalog.max_ts,
+    )?;
+    anyhow::ensure!(
+        row.archived_count >= 0 && row.failed_count >= 0,
+        "postgres {major}: archiver counters came back negative"
+    );
+    if let Some(reset) = row.stats_reset {
+        anyhow::ensure!(
+            reset.0 <= row.ts.0,
+            "postgres {major}: archiver stats_reset {} is after snapshot ts {}",
+            reset.0,
+            row.ts.0
+        );
+    }
+    if row.last_archived_wal.is_some() || row.last_failed_wal.is_some() {
+        let dict = segment
+            .dictionary()
+            .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+        resolve_archiver_wal(major, &dict, "last_archived_wal", row.last_archived_wal)?;
+        resolve_archiver_wal(major, &dict, "last_failed_wal", row.last_failed_wal)?;
+    }
+    Ok(())
+}
+
+fn resolve_archiver_wal(
+    major: u32,
+    dict: &Dictionary,
+    field: &str,
+    wal: Option<StrId>,
+) -> anyhow::Result<()> {
+    if let Some(wal) = wal {
+        anyhow::ensure!(
+            matches!(dict.resolve(wal.0), Some(Resolved::String(_))),
+            "postgres {major}: {field} str_id {} did not resolve through the dictionary",
+            wal.0
+        );
+    }
+    Ok(())
+}
+
+/// Read the catalog-bounded section and decode its typed rows.
+fn decode_archiver(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStatArchiver>> {
+    use std::os::unix::fs::FileExt;
+
+    let len = usize::try_from(entry.len).context("section len overflows usize")?;
+    anyhow::ensure!(
+        len <= MAX_SECTION_BYTES,
+        "section of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
+    );
+    let mut body = vec![0_u8; len];
+    std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
+    let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
+        .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
+    PgStatArchiver::decode(verified).context("typed decode of section 1_008_001")
 }
 
 #[tokio::main]
