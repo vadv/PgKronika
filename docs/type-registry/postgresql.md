@@ -6,7 +6,9 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 
 | `type_id` | Источник | Период | Семантика | Сортировка |
 |-----------|----------|----------|-----------|------------|
-| `1_001_001` | `pg_stat_activity` | 5 с | `snapshot_full` | `(ts, pid)` |
+| `1_001_001` | `pg_stat_activity` (PG 10-12) | базовый шаг | `snapshot_full` | `(ts, pid)` |
+| `1_001_002` | `pg_stat_activity` (PG 13) | базовый шаг | `snapshot_full` | `(ts, pid)` |
+| `1_001_003` | `pg_stat_activity` (PG 14-18) | базовый шаг | `snapshot_full` | `(ts, pid)` |
 | `1_002_001` | `pg_stat_statements` | 30 с | `changed` | `(queryid, dbid, userid, ts)` |
 | `1_003_001` | `pg_store_plans`, форк ossc | 5 мин | `changed` | `(queryid, planid, ts)` |
 | `1_004_001` | `pg_store_plans`, форк vadv | 5 мин | `changed` | `(queryid, planid, ts)` |
@@ -35,33 +37,68 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_027_001` | log: lock waits | поток | `event_stream` | `(ts)` |
 | `1_028_001` | log: server lifecycle | поток | `event_stream` | `(ts)` |
 
-## `1_001_001` `pg_stat_activity`
+## `1_001_001` / `1_001_002` / `1_001_003` `pg_stat_activity`
 
 Один из самых горячих типов. Сортировка `time-first` выбрана осознанно: состав
 строк между снимками нестабилен, поэтому сортировка по сущности даёт мало
-пользы. Внутри одного снимка хорошо сжимаются состояния,
-типы ожидания, имена баз и похожие label-колонки.
+пользы. Внутри одного снимка хорошо сжимаются состояния, типы ожидания, имена
+баз и похожие label-колонки.
+
+Снимок берётся целиком, включая фоновые backend'ы (`walwriter`, `checkpointer`,
+автовакуум и прочие): у них нет базы, пользователя, состояния и текущего
+запроса, поэтому соответствующие колонки `NULL`. `ts` — единое серверное время
+снимка (`statement_timestamp()`), одно на все строки. `client_addr` хранится
+текстом, пустая строка — локальное соединение. `backend_xid` и `backend_xmin`
+хранятся как возраст (`age()`, число транзакций): возраст `backend_xmin` — прямой
+сигнал удержания горизонта vacuum и приближения wraparound. Текст запроса идёт
+через словарь с усечением на коллекторе по серверному `track_activity_query_size`.
+
+### Версии раскладки
+
+Схема `pg_stat_activity` в диапазоне PG 10–18 менялась дважды, поэтому источник
+раскладывается на три версии формата (правило: `type_id` точно характеризует
+схему):
+
+| `type_id` | Версии PostgreSQL | Отличие |
+|-----------|-------------------|---------|
+| `1_001_001` | 10, 11, 12 | базовая раскладка |
+| `1_001_002` | 13 | `+ leader_pid` |
+| `1_001_003` | 14, 15, 16, 17, 18 | `+ leader_pid`, `+ query_id` |
+
+Live-BDD прогоняется на доступных в nixpkgs мажорах (15–18 — все в `1_001_003`);
+раскладки `1_001_001` и `1_001_002` (PG 10–13, вне матрицы) проверяются
+golden-кодеками.
+
+### Раскладка `1_001_003` (PG 14–18)
 
 ```text
 ts                 ts    T
 pid                i32   L
-datname            str   L
-usename            str   L
+leader_pid         i32?  L   // лидер группы параллельных воркеров; NULL вне параллелизма
+datname            str?  L   // NULL у фоновых backend
+usename            str?  L   // NULL у фоновых backend
 application_name   str   L
 client_addr        str   L   // текст; пустая строка = local
 backend_type       str   L
-state              str   L   // active | idle | idle in transaction | ...
-wait_event_type    str?  L   // NULL, если backend не ждет
+state              str?  L   // active | idle | idle in transaction | ...; NULL у фоновых
+wait_event_type    str?  L   // NULL, если backend не ждёт
 wait_event         str?  L
-query              str   L   // текст через словарь, усечение на коллекторе
-query_id           i64   L   // pg queryid, 0 при compute_query_id=off
+query              str?  L   // через словарь, усечение на коллекторе; NULL у фоновых
+query_id           i64?  L   // pg queryid; NULL при compute_query_id=off или без запроса
+backend_xid_age    i64?  G   // age(backend_xid); NULL без присвоенного xid
+backend_xmin_age   i64?  G   // age(backend_xmin); удержание горизонта vacuum
 backend_start      ts    G
 xact_start         ts?   G   // NULL вне транзакции
-query_start        ts    G
-state_change       ts    G
+query_start        ts?   G   // NULL у фоновых
+state_change       ts?   G   // NULL у фоновых
 ```
 
-Кандидаты для v2: `leader_pid`, `backend_xid`, `backend_xmin_age`.
+`1_001_002` — та же раскладка без `query_id`. `1_001_001` — без `query_id` и без
+`leader_pid`.
+
+Осознанно отложено: 1-секундный ASH-сэмпл активных строк (для AAS и профиля
+коротких ожиданий) — отдельный тип; дерево блокировок (`pg_blocking_pids`) — тип
+`1_011_001`.
 
 ## `1_002_001` `pg_stat_statements`
 
