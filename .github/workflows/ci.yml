@@ -62,15 +62,19 @@ jobs:
       deps_hash: ${{ steps.meta.outputs.deps_hash }}
       image_hash: ${{ steps.meta.outputs.image_hash }}
       platform_slug: ${{ steps.meta.outputs.platform_slug }}
+      branch_name: ${{ steps.meta.outputs.branch_name }}
+      branch_slug: ${{ steps.meta.outputs.branch_slug }}
       builder: ${{ steps.meta.outputs.builder }}
-      builder_seed: ${{ steps.meta.outputs.builder_seed }}
+      builder_branch_cache: ${{ steps.meta.outputs.builder_branch_cache }}
+      builder_main_cache: ${{ steps.meta.outputs.builder_main_cache }}
       image: ${{ steps.meta.outputs.image }}
       artifact: ${{ steps.meta.outputs.artifact }}
       transport: ${{ steps.meta.outputs.transport }}
-      can_update_seed: ${{ steps.meta.outputs.can_update_seed }}
+      is_main_branch: ${{ steps.meta.outputs.is_main_branch }}
     env:
       BDD_IMAGE_CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      BDD_BUILDER_CAN_UPDATE_SEED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      BDD_BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+      BDD_BRANCH_IS_MAIN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       BDD_PLATFORM: linux/amd64
     steps:
       - uses: actions/checkout@v4
@@ -80,16 +84,20 @@ jobs:
           deps_hash=$(./scripts/bdd-image.sh deps-key)
           image_hash=$(./scripts/bdd-image.sh image-key)
           platform_slug=$(echo "${BDD_PLATFORM}" | tr '/_' '-')
+          branch_slug=$(./scripts/bdd-image.sh branch-slug "${BDD_BRANCH_NAME}")
           repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           {
             echo "deps_hash=${deps_hash:0:16}"
             echo "image_hash=${image_hash:0:16}"
             echo "platform_slug=${platform_slug}"
+            echo "branch_name=${BDD_BRANCH_NAME}"
+            echo "branch_slug=${branch_slug}"
             echo "builder=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-${deps_hash:0:16}"
-            echo "builder_seed=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-seed-v1"
+            echo "builder_branch_cache=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-branch-${branch_slug}"
+            echo "builder_main_cache=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-branch-main"
             echo "image=ghcr.io/${repo}/pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}"
             echo "artifact=pgkronika-bdd-${platform_slug}-${image_hash:0:16}"
-            echo "can_update_seed=${BDD_BUILDER_CAN_UPDATE_SEED}"
+            echo "is_main_branch=${BDD_BRANCH_IS_MAIN}"
             if [ "${BDD_IMAGE_CAN_PUSH}" = "true" ]; then
               echo "transport=registry"
             else
@@ -142,17 +150,17 @@ jobs:
       - uses: docker/setup-buildx-action@v3
         if: needs.bdd-meta.outputs.transport == 'registry' && steps.final_image.outputs.exists != 'true'
       - name: Build BDD builder
-        if: needs.bdd-meta.outputs.transport == 'registry' && (steps.final_image.outputs.exists != 'true' || needs.bdd-meta.outputs.can_update_seed == 'true')
+        if: needs.bdd-meta.outputs.transport == 'registry' && (steps.final_image.outputs.exists != 'true' || needs.bdd-meta.outputs.is_main_branch == 'true')
         run: |
           export BDD_BUILDER_IMAGE="${{ needs.bdd-meta.outputs.builder }}"
-          export BDD_BUILDER_SEED_IMAGE="${{ needs.bdd-meta.outputs.builder_seed }}"
+          export BDD_BRANCH_NAME="${{ needs.bdd-meta.outputs.branch_name }}"
+          export BDD_BUILDER_BRANCH_IMAGE="${{ needs.bdd-meta.outputs.builder_branch_cache }}"
+          export BDD_BUILDER_MAIN_IMAGE="${{ needs.bdd-meta.outputs.builder_main_cache }}"
           export BDD_BUILDER_PULL=1
           if [ "${{ needs.bdd-meta.outputs.transport }}" = "registry" ]; then
             export BDD_BUILDER_PUSH=1
           fi
-          if [ "${{ needs.bdd-meta.outputs.can_update_seed }}" = "true" ]; then
-            export BDD_BUILDER_UPDATE_SEED=1
-          fi
+          export BDD_BUILDER_UPDATE_BRANCH_CACHE=1
           ./scripts/bdd-image.sh build-builder
       - name: Skip registry builder for artifact transport
         if: needs.bdd-meta.outputs.transport == 'artifact'
@@ -206,7 +214,9 @@ jobs:
         if: needs.bdd-meta.outputs.transport == 'artifact' && steps.final_image.outputs.exists != 'true'
         run: |
           export BDD_BUILDER_IMAGE="${{ needs.bdd-meta.outputs.builder }}"
-          export BDD_BUILDER_SEED_IMAGE="${{ needs.bdd-meta.outputs.builder_seed }}"
+          export BDD_BRANCH_NAME="${{ needs.bdd-meta.outputs.branch_name }}"
+          export BDD_BUILDER_BRANCH_IMAGE="${{ needs.bdd-meta.outputs.builder_branch_cache }}"
+          export BDD_BUILDER_MAIN_IMAGE="${{ needs.bdd-meta.outputs.builder_main_cache }}"
           export BDD_BUILDER_PULL=1
           ./scripts/bdd-image.sh build-builder
       - name: Build image
