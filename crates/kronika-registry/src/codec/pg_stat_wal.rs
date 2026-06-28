@@ -1,8 +1,9 @@
 //! Type `1_007_001` / `1_007_002`: `pg_stat_wal`.
 //!
 //! Cluster-wide WAL generation counters, a single row available from PG14. PG18
-//! removed the per-backend WAL write/sync counters and their timings (the data
-//! moved to `pg_stat_io` WAL rows), so the source maps to two layout versions.
+//! removed the WAL write/sync counters and their timings from `pg_stat_wal`
+//! (the data moved to `pg_stat_io` WAL rows), so the source maps to two layout
+//! versions.
 
 use crate::{Section, Ts};
 
