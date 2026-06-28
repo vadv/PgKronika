@@ -217,9 +217,9 @@ is_baseline                     bool  L
 | `1_005_003` | 14, 15, 16, 17 | `+` session-статистика (7 колонок) |
 | `1_005_004` | 18 | `+ parallel_workers_to_launch`, `+ parallel_workers_launched` |
 
-Live-BDD прогоняется на мажорах из nixpkgs: PG 15–17 — это `1_005_003`, PG 18 —
-`1_005_004`; раскладки `1_005_001` / `1_005_002` (PG 10–13, вне матрицы)
-проверяются golden-кодеками.
+BDD в CI прогоняется на мажорах из nixpkgs: PG 15–17 — это `1_005_003`, PG 18 —
+`1_005_004`. Раскладки `1_005_001` / `1_005_002` (PG 10–13, вне матрицы)
+покрыты golden-кодеками.
 
 ### Раскладка `1_005_004` (PG 18)
 
@@ -243,22 +243,21 @@ temp_bytes                  i64   C
 deadlocks                   i64   C
 blk_read_time               f64   C   // 0 без track_io_timing
 blk_write_time              f64   C
-checksum_failures           i64   C   // S2+ (PG12)
-checksum_last_failure       ts?   G   // S2+; NULL, если ошибок не было
-session_time                f64   C   // S3+ (PG14)
+checksum_failures           i64   C   // PG12+
+checksum_last_failure       ts?   G   // PG12+; NULL, если ошибок не было
+session_time                f64   C   // PG14+
 active_time                 f64   C
 idle_in_transaction_time    f64   C
 sessions                    i64   C
 sessions_abandoned          i64   C
 sessions_fatal              i64   C
 sessions_killed             i64   C
-parallel_workers_to_launch  i64   C   // S4+ (PG18)
+parallel_workers_to_launch  i64   C   // PG18+
 parallel_workers_launched   i64   C
 ```
 
 `1_005_003` — без двух parallel-колонок. `1_005_002` — без parallel и без
-session-статистики. `1_005_001` — без всего перечисленного (базовое ядро до
-`blk_write_time`).
+session-статистики. `1_005_001` заканчивается на `blk_write_time`.
 
 ## `1_006_001` `pg_stat_bgwriter` + `pg_stat_checkpointer`
 

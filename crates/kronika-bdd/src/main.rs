@@ -174,8 +174,7 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let row = decode_sealed_row(path, entry)
         .with_context(|| format!("postgres {major}: read back section 1_006_001"))?;
 
-    // The segment now carries several sections, each with its own ts, so the
-    // bgwriter row sits within the segment range, not exactly at both ends.
+    // Section timestamps must fall inside the catalog range for the segment.
     anyhow::ensure!(
         row.ts.0 > 0 && row.ts.0 >= catalog.min_ts && row.ts.0 <= catalog.max_ts,
         "postgres {major}: row ts {} outside segment range {}..={}",
@@ -318,7 +317,7 @@ async fn every_version_seals_database(world: &mut BddWorld) -> anyhow::Result<()
     Ok(())
 }
 
-/// Read back the sealed `pg_stat_database` section and resolve a datname.
+/// Read back the sealed `pg_stat_database` section and resolve a database name.
 ///
 /// The matrix runs PG15-17 (V3) and PG18 (V4); the check decodes the matching
 /// layout, confirms one snapshot timestamp, finds the `datid = 0` shared row
@@ -384,7 +383,7 @@ fn decode_db_section<T: Section>(
     T::decode(verified).context("typed decode of the pg_stat_database section")
 }
 
-/// Shared invariants over the decoded `(datid, datname, ts)` projection.
+/// Shared invariants for the decoded `(datid, datname, ts)` projection.
 fn check_database_rows(
     major: u32,
     dict: &Dictionary,
@@ -403,7 +402,7 @@ fn check_database_rows(
         "postgres {major}: snapshot rows carry differing ts"
     );
 
-    // PG12+ adds the shared-objects row (datid=0) with a null datname.
+    // PG12+ adds a shared-objects row with `datid = 0` and no `datname`.
     let shared = rows
         .iter()
         .find(|row| row.0 == 0)
