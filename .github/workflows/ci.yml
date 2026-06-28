@@ -142,7 +142,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
         if: needs.bdd-meta.outputs.transport == 'registry' && steps.final_image.outputs.exists != 'true'
       - name: Build BDD builder
-        if: needs.bdd-meta.outputs.transport == 'registry' && steps.final_image.outputs.exists != 'true'
+        if: needs.bdd-meta.outputs.transport == 'registry' && (steps.final_image.outputs.exists != 'true' || needs.bdd-meta.outputs.can_update_seed == 'true')
         run: |
           export BDD_BUILDER_IMAGE="${{ needs.bdd-meta.outputs.builder }}"
           export BDD_BUILDER_SEED_IMAGE="${{ needs.bdd-meta.outputs.builder_seed }}"
