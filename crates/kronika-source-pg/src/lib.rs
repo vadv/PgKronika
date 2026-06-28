@@ -70,7 +70,7 @@ pub async fn collect_bgwriter_checkpointer(
     }
 }
 
-/// `pg_stat_statements_info.stats_reset` is available in pg_stat_statements
+/// `pg_stat_statements_info.stats_reset` is available in `pg_stat_statements`
 /// 1.9 and newer.
 fn pg_stat_statements_has_info(version: Option<&str>) -> bool {
     let Some(version) = version else {
@@ -82,10 +82,10 @@ fn pg_stat_statements_has_info(version: Option<&str>) -> bool {
     (major, minor) >= (1, 9)
 }
 
-/// Collect one `1_020_001` reset_metadata row for the segment being sealed.
+/// Collect one `1_020_001` `reset_metadata` row for the segment being sealed.
 ///
 /// The first query reads installed extension versions. The second query is
-/// assembled from the views that exist on this server. PostgreSQL resolves
+/// assembled from the views that exist on this server. `PostgreSQL` resolves
 /// relation names before `CASE` branches run, so unsupported views must be left
 /// out of the SQL text.
 ///
