@@ -24,6 +24,12 @@ macro_rules! marked {
     };
 }
 
+mod activity;
+pub use activity::{
+    ActivityRow, ActivityVersion, activity_query, activity_version, collect_activity, to_v1, to_v2,
+    to_v3,
+};
+
 /// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->
 /// `17`.
 ///

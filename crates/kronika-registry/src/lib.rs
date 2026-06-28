@@ -29,7 +29,7 @@ pub use codec::{
     write_required,
 };
 // Only the in-crate derive and tests need the shared section-body entry points.
-pub use codec::{bgwriter_checkpointer, instance_metadata, reset_metadata};
+pub use codec::{bgwriter_checkpointer, instance_metadata, pg_stat_activity, reset_metadata};
 pub(crate) use codec::{check_row_cap, decode_batches, decode_section, encode_section};
 pub use contract::{
     Column, ColumnClass, ColumnType, LintError, Semantics, StrId, Ts, TypeContract, lint,
@@ -61,6 +61,9 @@ pub const DICT_BLOBS_TYPE_ID: u32 = 3_002_001;
 #[must_use]
 pub const fn registry() -> &'static [TypeContract] {
     &[
+        pg_stat_activity::PgStatActivityV1::CONTRACT,
+        pg_stat_activity::PgStatActivityV2::CONTRACT,
+        pg_stat_activity::PgStatActivityV3::CONTRACT,
         bgwriter_checkpointer::BgwriterCheckpointer::CONTRACT,
         reset_metadata::ResetMetadata::CONTRACT,
         instance_metadata::InstanceMetadata::CONTRACT,

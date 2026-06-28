@@ -1584,6 +1584,8 @@ name = "pg_kronika-collector"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "kronika-format",
+ "kronika-registry",
  "kronika-source-pg",
  "kronika-writer",
  "tempfile",

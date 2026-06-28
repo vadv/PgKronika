@@ -1,5 +1,5 @@
 {
-  description = "PgKronika BDD image for PostgreSQL 15-17";
+  description = "PgKronika BDD image for PostgreSQL 15-18";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -36,6 +36,7 @@
           postgresql_15 = pkgs.postgresql_15;
           postgresql_16 = pkgs.postgresql_16;
           postgresql_17 = pkgs.postgresql_17;
+          postgresql_18 = pkgs.postgresql_18;
         };
 
         commonArgs = {
@@ -76,6 +77,7 @@
             pkgs.postgresql_15
             pkgs.postgresql_16
             pkgs.postgresql_17
+            pkgs.postgresql_18
             pkgs.dockerTools.fakeNss
             # initdb uses popen, so the scratch image needs /bin/sh.
             pkgs.dockerTools.binSh
@@ -91,7 +93,7 @@
               "LANG=C"
               "KRONIKA_FEATURES=${features}"
               "KRONIKA_COLLECTOR_BIN=${bins}/bin/pg_kronika-collector"
-              "KRONIKA_PG_MATRIX=15=${pkgs.postgresql_15}/bin;16=${pkgs.postgresql_16}/bin;17=${pkgs.postgresql_17}/bin"
+              "KRONIKA_PG_MATRIX=15=${pkgs.postgresql_15}/bin;16=${pkgs.postgresql_16}/bin;17=${pkgs.postgresql_17}/bin;18=${pkgs.postgresql_18}/bin"
             ];
           };
         };

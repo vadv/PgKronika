@@ -9,6 +9,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-format = { path = "../../crates/kronika-format" }
+kronika-registry = { path = "../../crates/kronika-registry" }
 kronika-source-pg = { path = "../../crates/kronika-source-pg" }
 kronika-writer = { path = "../../crates/kronika-writer" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
