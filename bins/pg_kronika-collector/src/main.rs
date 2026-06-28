@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use kronika_format::DictLimits;
 use kronika_registry::StrId;
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
+use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
     to_v1, to_v2, to_v3,
@@ -123,6 +124,9 @@ async fn snapshot_and_seal(
     let (database_version, database_rows) = collect_database(client, major)
         .await
         .context("collect pg_stat_database")?;
+    let wal = collect_wal(client, major)
+        .await
+        .context("collect pg_stat_wal")?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -141,6 +145,13 @@ async fn snapshot_and_seal(
         database_version,
         &database_rows,
     )?;
+    // pg_stat_wal is a single all-numeric row with no strings to intern; absent
+    // before PG14, where collection returned `None`.
+    match wal {
+        Some(WalSnapshot::V1(row)) => buffer_row(&mut buffers, row)?,
+        Some(WalSnapshot::V2(row)) => buffer_row(&mut buffers, row)?,
+        None => {}
+    }
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers

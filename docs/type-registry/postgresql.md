@@ -17,7 +17,8 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_005_003` | `pg_stat_database` (PG 14-17) | базовый шаг | `snapshot_full` | `(datid, ts)` |
 | `1_005_004` | `pg_stat_database` (PG 18) | базовый шаг | `snapshot_full` | `(datid, ts)` |
 | `1_006_001` | `pg_stat_bgwriter` + `pg_stat_checkpointer` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_007_001` | `pg_stat_wal` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_007_001` | `pg_stat_wal` (PG 14-17) | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_007_002` | `pg_stat_wal` (PG 18) | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_008_001` | `pg_stat_archiver` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_009_001` | `pg_stat_io` | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
 | `1_010_001` | агрегат `pg_prepared_xacts` | базовый шаг | `snapshot_full` | `(ts)` |
@@ -278,9 +279,9 @@ buffers_backend_fsync i64? C   // NULL на PG17+
 buffers_alloc         i64  C
 ```
 
-## `1_007_001` `pg_stat_wal`
+## `1_007_001` / `1_007_002` `pg_stat_wal`
 
-PG14+.
+Синглтон, доступен с PG14. Раскладка `1_007_001` (PG 14-17):
 
 ```text
 ts               ts   T
@@ -290,10 +291,15 @@ wal_bytes        i64  C   // numeric в PG, приводится к i64
 wal_buffers_full i64  C
 wal_write        i64  C
 wal_sync         i64  C
-wal_write_time   f64  C
-wal_sync_time    f64  C
-stats_reset      ts   G
+wal_write_time   f64  C   // 0 без track_wal_io_timing
+wal_sync_time    f64  C   // 0 без track_wal_io_timing
+stats_reset      ts?  G
 ```
+
+`1_007_002` (PG 18) убирает `wal_write`, `wal_sync`, `wal_write_time`,
+`wal_sync_time`: объём и тайминги WAL-ввода-вывода переехали в `pg_stat_io`
+(`object = wal`). Остаются `wal_records`, `wal_fpi`, `wal_bytes`,
+`wal_buffers_full`, `stats_reset`.
 
 ## `1_008_001` `pg_stat_archiver`
 
