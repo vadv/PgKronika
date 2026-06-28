@@ -1,10 +1,9 @@
 //! Stats-reset context per segment, family `1_020`.
 //!
-//! Lets a reader tell whether a counter was reset between two segments, so a
-//! delta across the reset is not mistaken for real activity. The columns are
-//! reset timestamps only: extension versions live once per segment in
-//! `instance_metadata`, and GUCs live in the settings family — neither is
-//! smeared across stats types (see the `type_id` rule in the crate README).
+//! Readers use these timestamps to reject deltas that cross a statistics reset.
+//! The family stores reset timestamps only: extension versions live once per
+//! segment in `instance_metadata`, and GUCs live in the settings family (see the
+//! `type_id` rule in the crate README).
 //!
 //! `pg_stat_io` arrived in `PostgreSQL` 16, so its reset is a schema difference,
 //! not a nullable value: [`ResetMetadata`] = `1_020_001` (PG 15) omits it,
@@ -13,7 +12,7 @@
 
 use crate::{Section, Ts};
 
-/// One row of type `1_020_001`: reset context on `PostgreSQL` 15 (no
+/// One `1_020_001` row: reset context on `PostgreSQL` 15 (no
 /// `pg_stat_io`). One row per segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(
@@ -50,7 +49,7 @@ pub struct ResetMetadata {
     pub pg_store_plans_reset_at: Option<Ts>,
 }
 
-/// One row of type `1_020_002`: reset context on `PostgreSQL` 16+, identical to
+/// One `1_020_002` row: reset context on `PostgreSQL` 16+, identical to
 /// [`ResetMetadata`] plus the `pg_stat_io` reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(

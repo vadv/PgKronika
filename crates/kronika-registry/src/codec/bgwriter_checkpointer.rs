@@ -1,17 +1,18 @@
 //! Background-writer / checkpointer activity, family `1_006`.
 //!
-//! `PostgreSQL` 17 split the combined `pg_stat_bgwriter` into `pg_stat_bgwriter`
-//! plus `pg_stat_checkpointer`, renamed the checkpoint counters, and moved the
-//! backend-write counters to `pg_stat_io`. The two layouts are distinct schemas,
-//! so each gets its own `type_id` (see the `type_id` rule in the crate README):
+//! `PostgreSQL` 17 split the combined `pg_stat_bgwriter` view into
+//! `pg_stat_bgwriter` plus `pg_stat_checkpointer`, renamed checkpoint counters,
+//! and moved the backend-write counters to `pg_stat_io`. The two layouts are
+//! distinct schemas, so each gets its own `type_id` (see the `type_id` rule in
+//! the crate README):
 //! [`Bgwriter`] = `1_006_001` (PG 15–16), [`BgwriterCheckpointer`] = `1_006_002`
 //! (PG 17+). The collector emits exactly one, chosen by major version; neither
 //! carries a column the other lacks.
 
 use crate::{Section, Ts};
 
-/// One row of type `1_006_001`: `pg_stat_bgwriter` on `PostgreSQL` 15–16, where
-/// checkpoint and background-writer counters still share one view.
+/// One `1_006_001` row: `pg_stat_bgwriter` on `PostgreSQL` 15-16, where
+/// checkpoint and background-writer counters share one view.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_006_001,
@@ -60,7 +61,7 @@ pub struct Bgwriter {
     pub stats_reset: Ts,
 }
 
-/// One row of type `1_006_002`: `pg_stat_checkpointer` joined with the slimmed
+/// One `1_006_002` row: `pg_stat_checkpointer` joined with the slimmed
 /// `pg_stat_bgwriter` on `PostgreSQL` 17+.
 ///
 /// Counter names follow PG17's catalogs, not the 15–16 names: `num_timed` counts

@@ -37,33 +37,32 @@ Scenario: every version yields a valid bgwriter/checkpointer snapshot
   Then every version reports valid bgwriter/checkpointer stats
 ```
 
-Для каждой версии она вызывает `collect_bgwriter_checkpointer` (тип реестра
-`1_006_001`) и проверяет, что:
+Основная версия выбирает точный коллектор и `type_id`: PG 15-16 вызывают
+`collect_bgwriter` (`1_006_001`), PG 17 вызывает `collect_checkpointer`
+(`1_006_002`). Для каждой версии сценарий проверяет, что:
 
 - `ts` строки — это `clock_timestamp()` сервера, близкий к времени процесса,
   который запускает тесты;
-- счётчики неотрицательны, а `bgwriter_stats_reset` — момент не позже этого `ts`;
-- заполненные и `NULL`-колонки соответствуют версии: PG17+ заполняет
-  `restartpoints_*` и `checkpointer_stats_reset`, но оставляет пустым
-  `buffers_backend`; более ранние версии — наоборот.
+- счётчики неотрицательны, а `stats_reset` представления не позже этого `ts`.
 
-Так сценарий ловит устаревший SQL-запрос или неверную ветку для версии
-PostgreSQL.
+Так сценарий ловит SQL, который больше не совпадает с каталогом, или выбор
+неверного типа.
 
 Этот же файл запускает исполняемый файл коллектора:
 
 ```gherkin
-Scenario: every version seals a readable segment with section 1_006_001
+Scenario: every version seals a readable segment with its version's sections
   Given the PostgreSQL matrix is booted
-  Then every version is collected into a sealed segment with section 1_006_001
+  Then every version is collected into a sealed segment with its version's sections
 ```
 
 Для каждой версии программа запускает `pg_kronika-collector` (путь из
 `KRONIKA_COLLECTOR_BIN`), ждёт строку `ready`, посылает `SIGUSR2` и читает
-строку `sealed <path>`. Затем она открывает сегмент через `kronika-reader`,
-декодирует секцию `1_006_001` типизированно и проверяет, что `ts` единственной
-строки равен диапазону сегмента, а её колонки для PG17 и более ранних версий
-сохранились после записи и чтения.
+строку `sealed <path>`. Затем она открывает сегмент через `kronika-reader` и
+типизированно декодирует точные секции для этой основной версии: семейство
+bgwriter (`1_006_001` или `1_006_002`) и контекст сбросов (`1_020_001` или
+`1_020_002`). Сценарий проверяет, что `ts` каждой строки попадает в диапазон
+сегмента, а типизированные значения сохранились после записи и чтения.
 
 ## Быстрая проверка на локальной машине
 
@@ -172,6 +171,7 @@ bdd:
   30 секунд. В ошибку добавляется `server.log`.
 - `server_version` mismatch: процесс ответил, но не той основной версией
   PostgreSQL.
-- `collect type 1_006_001 ...` или `postgres NN: ...` из сценария коллектора:
-  запрос не совпал с каталогом сервера либо снимок не прошёл проверку.
-  Сообщение называет колонку или ветку для версии PostgreSQL.
+- `collect type 1_006_...`, `collect type 1_020_...` или `postgres NN: ...` из
+  сценария коллектора: запрос не совпал с каталогом сервера либо декодированная
+  секция не прошла проверку. Сообщение называет тип, колонку или основную
+  версию PostgreSQL.

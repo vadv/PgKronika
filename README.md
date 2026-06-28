@@ -42,6 +42,27 @@ The storage format is PGM: an immutable segment with snapshot sections,
 dictionaries, events, chart data, and an end catalog. Segments are meant to be
 copied, verified, and opened without contacting the original database host.
 
+## Accepted Decisions
+
+- A section `type_id` names the exact schema stored in the section. If a
+  PostgreSQL major version changes a view's columns or moves counters to another
+  view, PgKronika allocates a new schema variant (`C_SSS_VVV`) instead of using
+  nullable version columns. `NULL` means a runtime-absent value, not "absent in
+  this PostgreSQL version".
+- The collector reads the PostgreSQL major version once from the connection
+  handshake and dispatches to the collector whose codec matches that version's
+  schema. Current splits are `1_006_001` for `pg_stat_bgwriter` on PG 15-16,
+  `1_006_002` for `pg_stat_checkpointer` plus the slimmed `pg_stat_bgwriter` on
+  PG 17+, `1_020_001` for reset context on PG 15, and `1_020_002` for reset
+  context on PG 16+ with `pg_stat_io`.
+- Segment-level context stays in service sections. PostgreSQL and extension
+  versions belong in `instance_metadata`; reset timestamps belong in
+  `reset_metadata`; settings and GUCs belong in the settings family once it is
+  added. Stats sections do not repeat that context in every row.
+- Crate READMEs and rustdoc next to the implementation are the contract
+  documentation. The `docs/` directory is design history while the code is still
+  changing.
+
 ## Repository Layout
 
 ```text

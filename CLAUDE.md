@@ -56,14 +56,13 @@ alongside bugs, spec, tests, and memory bounds.
 
 ## Standing Design Rule: type_id Exactly Characterizes Schema
 
-A `type_id` must fully and exactly characterize the data it stores — the precise
-set of fields and what they mean. When a source's schema differs across
-PostgreSQL major versions (a view's columns change, or a view appears/moves —
-`pg_stat_bgwriter` → `pg_stat_checkpointer` in PG17), the versions MUST get
-DISTINCT type_ids, incrementing the last triplet of `X_FFF_VVV` (`FFF` the metric
-family, `VVV` the schema variant): e.g. `1_010_001` = PG10, `1_010_002` =
-PG11–16, `1_010_003` = PG17. This is exact self-description, not legacy handling
-— a reader knows the full schema from the type_id alone, with no version logic.
+A `type_id` must name the exact schema it stores: the fields and their meaning.
+When a source schema differs across PostgreSQL major versions (a view's columns
+change, or counters move from `pg_stat_bgwriter` to `pg_stat_checkpointer` in
+PG17), each schema gets its own `type_id` by incrementing the last triplet of
+`X_FFF_VVV` (`FFF` the metric family, `VVV` the schema variant): for example,
+`1_010_001` = PG10, `1_010_002` = PG11-16, `1_010_003` = PG17. A reader must
+know the full schema from `type_id` alone, with no version logic.
 
 Consequences, enforced in review:
 
@@ -71,11 +70,10 @@ Consequences, enforced in review:
    exist on this major version" is forbidden — split the type_id instead.
    `Option` stays only for genuinely runtime-NULL values and install-dependent
    extension columns; those are not version-shape differences.
-2. **No in-type `if server_version`.** A collector must not branch to merge two
-   version shapes into one type with optional/absent fields. The version selects
-   which exact type_id to emit; each type_id's codec and collector have a fixed,
-   version-specific schema. A clean version→type_id dispatch is correct; merging
-   shapes is not.
+2. **No in-type `if server_version`.** A collector must not merge two version
+   shapes into one type with optional/absent fields. The server version selects
+   which `type_id` to emit; each `type_id`'s codec and collector have one fixed
+   schema. A version-to-`type_id` dispatch is correct; merged shapes are not.
 3. **Allocate variants up front.** When porting or adding a type, determine the
    exact source schema for each target major, group identical-schema majors
    under one type_id, and allocate a new `VVV` where the schema changes.

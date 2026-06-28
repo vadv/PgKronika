@@ -34,8 +34,7 @@ use kronika_source_pg::{collect_bgwriter, collect_checkpointer};
 const PG16_MAJOR: u32 = 16;
 const PG17_MAJOR: u32 = 17;
 
-/// Background-writer family `type_id` for `major`: PG17 split the catalog into
-/// its own schema, so each major writes a distinct type.
+/// Background-writer/checkpointer contract expected for a `PostgreSQL` major.
 const fn bgwriter_type_id(major: u32) -> u32 {
     if major >= PG17_MAJOR {
         1_006_002
@@ -44,7 +43,7 @@ const fn bgwriter_type_id(major: u32) -> u32 {
     }
 }
 
-/// Reset-context family `type_id` for `major`: PG16 added `pg_stat_io`.
+/// Reset-context contract expected for a `PostgreSQL` major.
 const fn reset_type_id(major: u32) -> u32 {
     if major >= PG16_MAJOR {
         1_020_002
@@ -94,8 +93,8 @@ async fn every_version_reports_stats(world: &mut BddWorld) -> anyhow::Result<()>
             "postgres {}: handshake reported major {major} instead",
             db.major()
         );
-        // The major picks the exact collector and type_id, not a branch inside
-        // one merged type.
+        // The major selects a collector with a fixed contract; there is no
+        // merged row type with nullable columns used only for version gaps.
         let host_now = now_micros()?;
         if major >= PG17_MAJOR {
             let snap = collect_checkpointer(conn.client())
@@ -183,8 +182,8 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let catalog = segment.catalog();
     let (min, max) = (catalog.min_ts, catalog.max_ts);
 
-    // Background-writer family: the exact type_id for this major must be present,
-    // and its typed row reads back through the reader's CRC + decode path.
+    // The sealed segment must contain the contract selected for this major, and
+    // the row must survive the same CRC + typed decode path used by readers.
     let bg_id = bgwriter_type_id(major);
     let bg_entry = find_section(&catalog.entries, bg_id, major)?;
     let bg_ts = if major >= PG17_MAJOR {
@@ -205,7 +204,7 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     };
     ensure_ts_in_range(major, "bgwriter", bg_ts, min, max)?;
 
-    // Reset-context family: mandatory in every segment, exact type_id per major.
+    // Reset context is mandatory and version-shaped: PG16+ carries pg_stat_io.
     let reset_id = reset_type_id(major);
     let reset_entry = find_section(&catalog.entries, reset_id, major)?;
     let reset_ts = if major >= PG16_MAJOR {
@@ -253,7 +252,7 @@ fn ensure_ts_in_range(major: u32, what: &str, ts: i64, min: i64, max: i64) -> an
     Ok(())
 }
 
-/// Required `reset_metadata` timestamps that both versions carry.
+/// Shared sanity check for both reset-context variants.
 fn ensure_reset_metadata(major: u32, postmaster: i64, archiver_reset: i64) -> anyhow::Result<()> {
     anyhow::ensure!(
         postmaster > 0 && archiver_reset > 0,

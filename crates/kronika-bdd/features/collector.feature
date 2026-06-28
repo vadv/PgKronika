@@ -1,7 +1,7 @@
 Feature: Collector reads bgwriter and checkpointer stats
   The source-pg collector reads the bgwriter family (1_006_001 on PG15/16,
   1_006_002 on PG17) and reset context (1_020_001 on PG15, 1_020_002 on PG16+).
-  Each major writes its exact type_id, never one merged type.
+  Each major writes the type_id that matches its source schema.
 
   Scenario: every version yields a valid bgwriter/checkpointer snapshot
     Given the PostgreSQL matrix is booted

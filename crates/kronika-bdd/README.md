@@ -57,8 +57,8 @@ Scenario: every version seals a readable segment with its version's sections
 For each version the runner spawns `pg_kronika-collector` (path from
 `KRONIKA_COLLECTOR_BIN`) against the cluster, waits for its `ready` line, sends
 `SIGUSR2`, and reads back the `sealed <path>` it prints. It then opens that
-segment with `kronika-reader` and decodes — typed — the exact sections that major
-writes: the bgwriter family (`1_006_001` or `1_006_002`) and reset context
+segment with `kronika-reader` and decodes the exact sections for that major with
+typed codecs: the bgwriter family (`1_006_001` or `1_006_002`) and reset context
 (`1_020_001` or `1_020_002`). It asserts each row's `ts` falls in the segment
 range and the typed values survived the round-trip.
 
@@ -167,6 +167,7 @@ bdd:
   connections within 30 seconds. The error includes `server.log`.
 - `server_version` mismatch: the process answered, but not with the expected
   PostgreSQL major version.
-- `collect type 1_006_001 ...` or `postgres NN: ...` from the collector
-  scenario: the query did not match the server's catalog, or the snapshot was
-  rejected by the checks. The message names the column or version branch.
+- `collect type 1_006_...`, `collect type 1_020_...`, or `postgres NN: ...`
+  from the collector scenario: the query did not match the server's catalog, or
+  the decoded section failed its checks. The message names the type, column, or
+  PostgreSQL major version.

@@ -1,10 +1,10 @@
 //! `PostgreSQL` collectors.
 //!
-//! One collector per exact schema, not per metric: where a catalog differs
-//! across major versions, each version has its own `type_id` and its own
-//! collector (see the `type_id` rule in the registry README). The caller reads the
-//! major version once from the handshake ([`server_major`]) and calls the
-//! matching collector — `1_006_001`/`1_006_002` for background-writer stats,
+//! Collectors are split by on-disk schema. When `PostgreSQL` changes a catalog
+//! shape across major versions, each shape gets its own `type_id` and collector
+//! (see the `type_id` rule in the registry README). The caller reads the major
+//! version once from the handshake ([`server_major`]) and calls the matching
+//! collector: `1_006_001`/`1_006_002` for background-writer stats and
 //! `1_020_001`/`1_020_002` for reset context.
 #![allow(
     clippy::multiple_crate_versions,
@@ -145,10 +145,11 @@ fn pg_stat_statements_has_info(version: Option<&str>) -> bool {
     (major, minor) >= (1, 9)
 }
 
-/// Which optional reset sources this instance exposes: whether
-/// `pg_stat_statements_info` is present (extension ≥ 1.9) and whether
-/// `pg_store_plans` is installed. Presence is install config, not a version
-/// shape, so it gates a subquery rather than the `type_id`.
+/// Optional reset sources exposed by this instance.
+///
+/// Extension presence is install configuration, not a `PostgreSQL` version
+/// schema difference, so it gates subqueries inside the reset-context collector
+/// instead of selecting a different `type_id`.
 async fn detect_reset_extensions(client: &Client) -> Result<(bool, bool), tokio_postgres::Error> {
     let rows = client
         .query(
@@ -175,9 +176,11 @@ async fn detect_reset_extensions(client: &Client) -> Result<(bool, bool), tokio_
     ))
 }
 
-/// Build the consolidated reset-context query. `with_io` adds the `pg_stat_io`
-/// reset (PG16+). The required resets coalesce to postmaster start time so a
-/// fresh cluster with `NULL` `stats_reset` does not produce a NULL.
+/// Build the reset-context query for the selected schema.
+///
+/// `with_io` adds the PG16+ `pg_stat_io` reset. Required reset timestamps
+/// coalesce to postmaster start time so a fresh cluster does not produce NULL
+/// for non-nullable contract fields.
 fn reset_metadata_sql(pgss_has_info: bool, has_store_plans: bool, with_io: bool) -> String {
     let pgss = if pgss_has_info {
         "(SELECT (extract(epoch from stats_reset) * 1e6)::bigint FROM pg_stat_statements_info)"

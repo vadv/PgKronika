@@ -30,28 +30,26 @@ construction, and external crates cannot create one.
 
 ## Schema Exactness
 
-A `type_id` fully and exactly characterizes the data it stores: the precise set
-of columns and what they mean. The variant digits `VVV` are a *schema* version,
-not a release number. When a source's schema differs across PostgreSQL major
-versions — a view's columns change, or a view appears or moves, like the
-checkpoint counters leaving `pg_stat_bgwriter` for `pg_stat_checkpointer` in
-PG17 — each version gets a distinct `type_id`, incrementing `VVV`: `1_010_001`
-for PG10, `1_010_002` for PG11–16, `1_010_003` for PG17.
+A `type_id` names the exact schema stored in a section: its columns and their
+meaning. The variant digits `VVV` are a schema version, not a release counter.
+When a PostgreSQL major version changes a source schema — a view's columns
+change, or counters move from `pg_stat_bgwriter` to `pg_stat_checkpointer` in
+PG17 — PgKronika allocates a new `type_id`: `1_010_001` for PG10,
+`1_010_002` for PG11-16, `1_010_003` for PG17.
 
-A reader knows a section's full schema from its `type_id` alone, with no version
-logic. Two consequences:
+A reader can derive the full section schema from `type_id` alone. That gives two
+rules:
 
-- A column never means "absent on this version." A version-specific column lives
-  only in the `type_id`s whose version has it; a missing column is a missing
-  `type_id`, not a `NULL`. `NULL` still encodes a genuinely runtime-absent value,
-  such as an extension that is not installed — that is install config, not a
-  version-shape difference.
-- The collector maps the connected major version to the exact `type_id` and its
-  exact codec. There is no in-type `if server_version` and no merged type whose
-  columns are valid only on some versions.
+- Do not encode "this column does not exist on this PostgreSQL version" as
+  `NULL`. A version-specific column belongs only to the `type_id`s whose source
+  schema contains it. `NULL` is still valid for runtime absence, such as an
+  extension not being installed.
+- Do not hide version branches inside one merged codec. The collector maps the
+  connected major version to the matching `type_id`, and that codec has one
+  fixed schema.
 
-The exact PostgreSQL and extension versions are recorded once per segment in
-`instance_metadata`, never repeated as a column in every section.
+PostgreSQL and extension versions are recorded once per segment in
+`instance_metadata`, not repeated as columns in every section.
 
 ## Type Contract
 
@@ -161,10 +159,10 @@ Types are not documented one section per id in this README — the catalog of
 types is the registry contracts in code. The `1_006` family is the worked
 example of [Schema Exactness](#schema-exactness).
 
-PostgreSQL 17 reorganized these views: it moved and renamed the checkpoint
-counters into `pg_stat_checkpointer`, added the restartpoint counters for hot
-standby, and moved `buffers_backend` / `buffers_backend_fsync` to `pg_stat_io`.
-That is a different schema, so it is a different `type_id`:
+PostgreSQL 17 changed the source schema: checkpoint counters moved to
+`pg_stat_checkpointer`, restartpoint counters appeared for hot standby, and
+`buffers_backend` / `buffers_backend_fsync` moved to `pg_stat_io`. That creates
+two contracts:
 
 - `1_006_001` (`Bgwriter`) — `pg_stat_bgwriter` on PG 15–16: the combined view,
   with `buffers_backend` / `buffers_backend_fsync` and one `stats_reset`.
@@ -172,10 +170,9 @@ That is a different schema, so it is a different `type_id`:
   `pg_stat_bgwriter` on PG 17+: `num_timed` / `num_requested`, the restartpoint
   counters, and a `stats_reset` for each view, with no `buffers_backend`.
 
-Each struct has exactly its version's columns — no nullable "absent here" field
-and no `if server_version` — and `encode` / `decode` convert a row slice to and
-from the Parquet section body. The collector emits one or the other by major
-version.
+Each struct contains only the columns present in that PostgreSQL schema. There
+is no nullable "absent here" field and no `if server_version` inside the codec.
+The collector chooses the contract by major version before it encodes rows.
 
 ## Service Sections
 
@@ -189,8 +186,8 @@ the reader interprets all other sections against them:
   cross-cutting reset context: the postmaster start time and the per-view reset
   times (`pg_stat_database`, `pg_stat_wal`, `pg_stat_archiver`, and `pg_stat_io`
   on PG 16+). It carries reset timestamps only; extension versions live in
-  `instance_metadata` and GUCs live in the settings family, so neither is smeared
-  across stats types. `pg_stat_io` arrived in PG16, so its reset is a schema
+  `instance_metadata` and GUCs live in the settings family, so neither is
+  repeated across stats types. `pg_stat_io` arrived in PG16, so its reset is a schema
   difference — a second `type_id`, not a nullable column.
 
 A statistics reset is per view: `pg_stat_reset_shared('bgwriter')` resets only
@@ -238,11 +235,11 @@ protection model.
 - `type_id` decomposition and validation;
 - the registry linter, with one test per finding;
 - the `1_006` and `1_020` family codecs: each variant's exact contract shape
-  (no version-`NULL` columns), exact value roundtrip, extension `NULL` remaining
-  distinct from zero, Parquet file framing, and the row, byte, and row-group
-  limits. The roundtrip fixture compares decoded values rather than raw Parquet
-  bytes because Arrow metadata and encoding choices can change between dependency
-  versions;
+  (no version-only nullable columns), exact value roundtrip, extension `NULL`
+  remaining distinct from zero, Parquet file framing, and the row, byte, and
+  row-group limits. The roundtrip fixture compares decoded values rather than
+  raw Parquet bytes because Arrow metadata and encoding choices can change
+  between dependency versions;
 - the generic path: every registered type round-trips an empty section through
   `decode_any` with no per-type code; `decode_any` reports decode stats and
   rejects an unregistered `type_id`.

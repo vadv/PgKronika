@@ -1,8 +1,9 @@
 //! Collects `PostgreSQL` stats and writes sealed PGM segments.
 //!
-//! The daemon runs on the database host. Each `SIGUSR2` collects one
-//! `1_006_001` snapshot, appends it to a temporary journal, seals `<ts>.pgm`,
-//! then clears the journal for the next signal.
+//! The daemon runs on the database host. Each collection cycle captures the
+//! version-specific sections from the enabled `PostgreSQL` sources, appends them
+//! to a temporary journal, seals `<ts>.pgm`, then clears the journal for the
+//! next cycle.
 //!
 //! Environment:
 //! - `KRONIKA_PG_DSN`: libpq connection string for the target server;
@@ -103,7 +104,7 @@ async fn main() -> Result<()> {
 
 #[allow(
     clippy::future_not_send,
-    reason = "awaited inline in the signal loop, never spawned across threads, so holding the non-Send SectionBuffers across the per-family collect awaits is sound"
+    reason = "SectionBuffers stays in the signal-loop future, never in tokio::spawn"
 )]
 async fn snapshot_and_seal(
     client: &Client,
@@ -114,8 +115,8 @@ async fn snapshot_and_seal(
 ) -> Result<PathBuf> {
     let mut buffers = SectionBuffers::new();
 
-    // Background-writer family: PG17 split the catalog, so each major writes its
-    // own exact type_id (see the registry's `type_id` rule).
+    // PG17 changed this family's source schema, so emit the matching type_id
+    // instead of one merged cross-version row.
     let ts = if major >= 17 {
         let row = collect_checkpointer(client)
             .await
@@ -136,7 +137,7 @@ async fn snapshot_and_seal(
         ts
     };
 
-    // Reset-context family: PG16 added pg_stat_io, again a separate type_id.
+    // `pg_stat_io` appeared in PG16, so reset context has a second contract.
     if major >= 16 {
         let row = collect_reset_metadata_io(client)
             .await
