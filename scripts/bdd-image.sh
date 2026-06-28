@@ -13,6 +13,8 @@ Commands:
   image-key      Print the key for the final BDD image.
   platform       Print the Docker platform used for the builder image.
   platform-slug  Print the platform as a Docker tag fragment.
+  branch-slug [name]
+                 Print a branch name as a Docker tag fragment.
   build-builder  Build or pull the BDD builder image.
   build-runtime  Build image.tar with the builder image and load it into Docker.
   run [image]    Run the BDD image.
@@ -20,19 +22,22 @@ Commands:
 Environment:
   BDD_IMAGE_PREFIX   Registry prefix, default ghcr.io/vadv/pgkronika.
   BDD_PLATFORM       Docker platform. Defaults to the local Docker server platform.
+  BDD_BRANCH_NAME    Branch name used for the mutable branch cache.
   BDD_BUILDER_IMAGE  Builder image tag. Defaults to <prefix>/pgkronika-bdd-builder:deps-<platform>-<deps-key>.
-  BDD_BUILDER_SEED_IMAGE
-                     Seed image tag. Defaults to <prefix>/pgkronika-bdd-builder:deps-<platform>-seed-v1.
-  BDD_NIX_BASE_IMAGE Pinned Nix image used when no seed is available.
+  BDD_BUILDER_BRANCH_IMAGE
+                     Mutable builder cache for BDD_BRANCH_NAME.
+  BDD_BUILDER_MAIN_IMAGE
+                     Mutable builder cache for main.
+  BDD_NIX_BASE_IMAGE Pinned Nix image used when no branch cache is available.
   BDD_RUNTIME_IMAGE  Runtime image tag. Defaults to pgkronika-bdd:latest.
   BDD_CACHE_FROM     Optional buildx cache source, for example type=registry,ref=...
   BDD_CACHE_TO       Optional buildx cache target, for example type=registry,ref=...,mode=max.
   BDD_BUILDER_PULL   Set to 1 to pull an existing builder image before building.
   BDD_BUILDER_PUSH   Set to 1 to push the builder image after building.
-  BDD_BUILDER_USE_SEED
+  BDD_BUILDER_USE_BRANCH_CACHE
                      Set to 0 to build a missing builder from BDD_NIX_BASE_IMAGE.
-  BDD_BUILDER_UPDATE_SEED
-                     Set to 1 to retag a pushed builder as the seed image.
+  BDD_BUILDER_UPDATE_BRANCH_CACHE
+                     Set to 1 to retag a pulled or pushed builder as the branch cache.
   BDD_RUNTIME_PUSH   Set to 1 to push BDD_RUNTIME_IMAGE after building.
   BDD_OUTPUT_TAR     Tarball path for build-runtime, default image.tar.
 EOF
@@ -129,6 +134,37 @@ platform_slug() {
   platform | tr '/_' '-'
 }
 
+branch_name() {
+  if [ -n "${BDD_BRANCH_NAME:-}" ]; then
+    printf '%s' "$BDD_BRANCH_NAME"
+    return
+  fi
+
+  local branch
+  branch=$(git branch --show-current 2>/dev/null || true)
+  printf '%s' "${branch:-main}"
+}
+
+branch_slug() {
+  local raw=${1:-$(branch_name)}
+  local slug hash
+
+  slug=$(printf '%s' "$raw" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')
+  if [ -z "$slug" ]; then
+    slug=branch
+  fi
+
+  if [ "${#slug}" -gt 80 ]; then
+    hash=$(printf '%s' "$raw" | sha256_stream)
+    slug="${slug:0:67}-${hash:0:12}"
+    slug=$(printf '%s' "$slug" | sed -E 's/-+$//')
+  fi
+
+  printf '%s' "$slug"
+}
+
 image_prefix() {
   printf '%s' "${BDD_IMAGE_PREFIX:-ghcr.io/vadv/pgkronika}"
 }
@@ -141,12 +177,20 @@ builder_image() {
   printf '%s/pgkronika-bdd-builder:deps-%s-%s' "$(image_prefix)" "$(platform_slug)" "$(short_key "$(deps_key)")"
 }
 
-builder_seed_image() {
-  if [ -n "${BDD_BUILDER_SEED_IMAGE:-}" ]; then
-    printf '%s' "$BDD_BUILDER_SEED_IMAGE"
+builder_branch_image() {
+  if [ -n "${BDD_BUILDER_BRANCH_IMAGE:-}" ]; then
+    printf '%s' "$BDD_BUILDER_BRANCH_IMAGE"
     return
   fi
-  printf '%s/pgkronika-bdd-builder:deps-%s-seed-v1' "$(image_prefix)" "$(platform_slug)"
+  printf '%s/pgkronika-bdd-builder:deps-%s-branch-%s' "$(image_prefix)" "$(platform_slug)" "$(branch_slug)"
+}
+
+builder_main_image() {
+  if [ -n "${BDD_BUILDER_MAIN_IMAGE:-}" ]; then
+    printf '%s' "$BDD_BUILDER_MAIN_IMAGE"
+    return
+  fi
+  printf '%s/pgkronika-bdd-builder:deps-%s-branch-main' "$(image_prefix)" "$(platform_slug)"
 }
 
 runtime_image() {
@@ -178,52 +222,63 @@ append_summary() {
   fi
 }
 
-update_builder_seed() {
-  local image=$1 seed=$2
-  if [ "${BDD_BUILDER_UPDATE_SEED:-0}" = "1" ]; then
-    docker_cmd tag "$image" "$seed"
-    docker_cmd push "$seed"
-    append_summary "- updated seed: yes"
+update_builder_branch_cache() {
+  local image=$1 branch_cache=$2
+  if [ "${BDD_BUILDER_UPDATE_BRANCH_CACHE:-0}" = "1" ]; then
+    docker_cmd tag "$image" "$branch_cache"
+    docker_cmd push "$branch_cache"
+    append_summary "- updated branch cache: yes"
   else
-    append_summary "- updated seed: no"
+    append_summary "- updated branch cache: no"
   fi
 }
 
 builder_base_image() {
-  local seed seed_digest
-  if [ "${BDD_BUILDER_USE_SEED:-1}" != "1" ]; then
+  local branch_cache main_cache image digest previous=
+  if [ "${BDD_BUILDER_USE_BRANCH_CACHE:-1}" != "1" ]; then
     printf '%s' "$NIX_BASE_IMAGE"
     return
   fi
 
-  seed=$(builder_seed_image)
-  if docker_cmd manifest inspect "$seed" >/dev/null 2>&1; then
-    seed_digest=$(resolve_image_digest_ref "$seed" || true)
-    if [ -n "$seed_digest" ]; then
-      printf '%s' "$seed_digest"
-      return
+  branch_cache=$(builder_branch_image)
+  main_cache=$(builder_main_image)
+
+  for image in "$branch_cache" "$main_cache"; do
+    if [ "$image" = "$previous" ]; then
+      continue
     fi
-    echo "Seed image exists but its digest could not be resolved; using $NIX_BASE_IMAGE" >&2
-  fi
+    previous=$image
+
+    if docker_cmd manifest inspect "$image" >/dev/null 2>&1; then
+      digest=$(resolve_image_digest_ref "$image" || true)
+      if [ -n "$digest" ]; then
+        printf '%s' "$digest"
+        return
+      fi
+      echo "Builder cache image exists but its digest could not be resolved; using the next cache source" >&2
+    fi
+  done
 
   printf '%s' "$NIX_BASE_IMAGE"
 }
 
 build_builder() {
-  local root image seed base
+  local root image branch_cache main_cache base
   root=$(repo_root)
   image=$(builder_image)
-  seed=$(builder_seed_image)
+  branch_cache=$(builder_branch_image)
+  main_cache=$(builder_main_image)
 
   append_summary "## BDD builder"
   append_summary ""
   append_summary "- exact: \`$image\`"
-  append_summary "- seed: \`$seed\`"
+  append_summary "- branch cache: \`$branch_cache\`"
+  append_summary "- main cache: \`$main_cache\`"
 
   if [ "${BDD_BUILDER_PULL:-0}" = "1" ] && docker_cmd manifest inspect "$image" >/dev/null 2>&1; then
     append_summary "- exact hit: yes"
     docker_cmd pull "$image"
-    update_builder_seed "$image" "$seed"
+    update_builder_branch_cache "$image" "$branch_cache"
     return
   fi
 
@@ -253,12 +308,12 @@ build_builder() {
     if docker_cmd manifest inspect "$image" >/dev/null 2>&1; then
       append_summary "- pushed exact: no, tag appeared before push"
       docker_cmd pull "$image"
-      update_builder_seed "$image" "$seed"
+      update_builder_branch_cache "$image" "$branch_cache"
       return
     fi
     docker_cmd push "$image"
     append_summary "- pushed exact: yes"
-    update_builder_seed "$image" "$seed"
+    update_builder_branch_cache "$image" "$branch_cache"
   fi
 }
 
@@ -311,6 +366,11 @@ case "$cmd" in
     ;;
   platform-slug)
     platform_slug
+    printf '\n'
+    ;;
+  branch-slug)
+    shift
+    branch_slug "${1:-}"
     printf '\n'
     ;;
   build-builder)
