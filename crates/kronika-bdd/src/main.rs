@@ -23,11 +23,14 @@ use std::path::Path;
 use anyhow::Context;
 use cucumber::{World, given, then};
 use kronika_format::{Entry, crc32c};
-use kronika_reader::{Resolved, Segment};
+use kronika_reader::{Dictionary, Resolved, Segment};
 use kronika_registry::{
-    Bytes, MAX_SECTION_BYTES, Section, VerifiedSection,
-    bgwriter_checkpointer::BgwriterCheckpointer, pg_stat_activity::PgStatActivityV3,
+    Bytes, MAX_SECTION_BYTES, Section, StrId, VerifiedSection,
+    bgwriter_checkpointer::BgwriterCheckpointer,
+    pg_stat_activity::PgStatActivityV3,
+    pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
 };
+use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
 
 const PG17_MAJOR: u32 = 17;
@@ -35,6 +38,9 @@ const PG17_MAJOR: u32 = 17;
 const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
 
 const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
+
+const PG_STAT_DATABASE_V3_TYPE_ID: u32 = 1_005_003;
+const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
@@ -168,9 +174,11 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let row = decode_sealed_row(path, entry)
         .with_context(|| format!("postgres {major}: read back section 1_006_001"))?;
 
+    // The segment now carries several sections, each with its own ts, so the
+    // bgwriter row sits within the segment range, not exactly at both ends.
     anyhow::ensure!(
-        row.ts.0 > 0 && row.ts.0 == catalog.min_ts && row.ts.0 == catalog.max_ts,
-        "postgres {major}: row ts {} disagrees with segment range {}..={}",
+        row.ts.0 > 0 && row.ts.0 >= catalog.min_ts && row.ts.0 <= catalog.max_ts,
+        "postgres {major}: row ts {} outside segment range {}..={}",
         row.ts.0,
         catalog.min_ts,
         catalog.max_ts
@@ -297,6 +305,133 @@ fn decode_activity_rows(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStat
     let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
         .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
     PgStatActivityV3::decode(verified).context("typed decode of section 1_001_003")
+}
+
+#[then("every version seals a segment whose pg_stat_database rows resolve through the dictionary")]
+async fn every_version_seals_database(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_database_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Read back the sealed `pg_stat_database` section and resolve a datname.
+///
+/// The matrix runs PG15-17 (V3) and PG18 (V4); the check decodes the matching
+/// layout, confirms one snapshot timestamp, finds the `datid = 0` shared row
+/// with a null datname, and resolves a real database's datname through the
+/// segment dictionary.
+fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    match database_version(major) {
+        DatabaseVersion::V4 => {
+            let rows =
+                decode_db_section::<PgStatDatabaseV4>(path, &segment, PG_STAT_DATABASE_V4_TYPE_ID)
+                    .with_context(|| format!("postgres {major}: read back section 1_005_004"))?;
+            check_database_rows(
+                major,
+                &dict,
+                rows.iter().map(|r| (r.datid, r.datname, r.ts.0)),
+            )
+        }
+        DatabaseVersion::V3 => {
+            let rows =
+                decode_db_section::<PgStatDatabaseV3>(path, &segment, PG_STAT_DATABASE_V3_TYPE_ID)
+                    .with_context(|| format!("postgres {major}: read back section 1_005_003"))?;
+            check_database_rows(
+                major,
+                &dict,
+                rows.iter().map(|r| (r.datid, r.datname, r.ts.0)),
+            )
+        }
+        other => {
+            anyhow::bail!("postgres {major}: matrix version maps to {other:?}, expected V3 or V4")
+        }
+    }
+}
+
+/// Read the catalog-bounded section and decode its typed rows.
+fn decode_db_section<T: Section>(
+    path: &Path,
+    segment: &Segment,
+    type_id: u32,
+) -> anyhow::Result<Vec<T>> {
+    use std::os::unix::fs::FileExt;
+
+    let entry = segment
+        .catalog()
+        .entries
+        .iter()
+        .find(|entry| entry.type_id == type_id)
+        .with_context(|| format!("segment has no section {type_id}"))?;
+    let len = usize::try_from(entry.len).context("section len overflows usize")?;
+    anyhow::ensure!(
+        len <= MAX_SECTION_BYTES,
+        "section of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
+    );
+    let mut body = vec![0_u8; len];
+    std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
+
+    let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
+        .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
+    T::decode(verified).context("typed decode of the pg_stat_database section")
+}
+
+/// Shared invariants over the decoded `(datid, datname, ts)` projection.
+fn check_database_rows(
+    major: u32,
+    dict: &Dictionary,
+    rows: impl Iterator<Item = (u32, Option<StrId>, i64)>,
+) -> anyhow::Result<()> {
+    let rows: Vec<_> = rows.collect();
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "postgres {major}: pg_stat_database section decoded to no rows"
+    );
+
+    // One statement_timestamp() covers the whole snapshot.
+    let ts = rows[0].2;
+    anyhow::ensure!(
+        rows.iter().all(|row| row.2 == ts),
+        "postgres {major}: snapshot rows carry differing ts"
+    );
+
+    // PG12+ adds the shared-objects row (datid=0) with a null datname.
+    let shared = rows
+        .iter()
+        .find(|row| row.0 == 0)
+        .with_context(|| format!("postgres {major}: no datid=0 shared-objects row"))?;
+    anyhow::ensure!(
+        shared.1.is_none(),
+        "postgres {major}: shared-objects row has a non-null datname"
+    );
+
+    // A real database resolves its datname through the dictionary.
+    let real = rows
+        .iter()
+        .find(|row| row.0 != 0)
+        .with_context(|| format!("postgres {major}: no real database row"))?;
+    let datname = real
+        .1
+        .with_context(|| format!("postgres {major}: a real database has a null datname"))?;
+    match dict.resolve(datname.0) {
+        Some(Resolved::String(bytes)) => anyhow::ensure!(
+            !bytes.is_empty(),
+            "postgres {major}: datname resolved to an empty string"
+        ),
+        other => anyhow::bail!(
+            "postgres {major}: datname str_id {} did not resolve to a string: {other:?}",
+            datname.0
+        ),
+    }
+    Ok(())
 }
 
 #[tokio::main]
