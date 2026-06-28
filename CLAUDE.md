@@ -62,3 +62,78 @@ alongside bugs, spec, tests, and memory bounds.
   paths (the design archive in `docs/` will be deleted).
 - Crate READMEs are the contract documentation: English `README.md` with a
   Russian `README.ru.md` mirror, kept in sync.
+
+## Playbook: adding a `pg_stat_*` snapshot metric (Step 7)
+
+Reverse-engineering the pattern is what costs time, not the change itself. Copy
+a reference type instead of rediscovering the wiring.
+
+**Reference types (copy these, don't start blank):**
+
+- `1_006_001` bgwriter — single-row, numeric only, version split by `Option`
+  columns. Files: `kronika-registry/src/codec/bgwriter_checkpointer.rs`,
+  `kronika-source-pg/src/lib.rs` (`collect_bgwriter_checkpointer`).
+- `1_001_00x` pg_stat_activity — **multi-row, version-grouped `type_id`s,
+  string interning**. The reference for anything with rows and text. Files:
+  `kronika-registry/src/codec/pg_stat_activity.rs`,
+  `kronika-source-pg/src/activity.rs`, the `push_activity`/`activity_dict_limits`
+  block in `pg_kronika-collector/src/main.rs`, and the
+  `pg_stat_activity.feature` + `assert_activity_section` BDD pair.
+
+**Five places to change (in this order — doc leads code):**
+
+1. `docs/type-registry/postgresql.md` — summary table row(s) + the type section.
+   One `type_id` per version group when the catalog schema differs across majors
+   (monotonic column adds → separate versions, **not** one type with `Option`
+   version columns; that is the registry discipline).
+2. `kronika-registry/src/codec/<name>.rs` — one `#[derive(Section)]` struct per
+   version. `#[section(id=, name=, semantics=snapshot_full, sort_key("ts",...))]`,
+   fields `#[column(t|c|g|l)]`. `t` = `Ts`, non-null, must be named `ts` (linter).
+   `Option<T>` → nullable. Types: `i8..u64`, `f32/f64`, `bool`, `Ts`, `StrId`.
+   Wire it: `codec.rs` `pub mod <name>;`; `lib.rs` add the module to the
+   `pub use codec::{...}` line and the `CONTRACT`s to `registry()`.
+3. `kronika-source-pg/src/<name>.rs` — depends only on `registry` +
+   `tokio-postgres`. Own `marked!` macro (path = this file). Shape:
+   `enum Version`, `const fn <name>_version(major) -> Version`,
+   `const fn <name>_query(version) -> &'static str` (wrapped in `marked!`),
+   `pub struct <Name>Row` (owned `String`/`Option<String>`/numbers),
+   `pub fn to_vN<E>(row, mut intern: impl FnMut(&[u8]) -> Result<StrId, E>) -> Result<TypeVN, E>`
+   (interner injected as a closure — keeps this crate free of the writer; the
+   mapping is then a pure fn, golden-testable with a fake intern), and
+   `pub async fn collect_<name>(client, major) -> Result<(Version, Vec<<Name>Row>), tokio_postgres::Error>`.
+   Add `mod <name>;` + `pub use` to `lib.rs`.
+4. `pg_kronika-collector/src/main.rs` — in `snapshot_and_seal` run **all**
+   `collect_*().await` first, *then* build `SectionBuffers`/`Interner` (they are
+   not `Send`; holding them across an await breaks the async fn). Buffer via
+   `match version`, interning with the closure
+   `|b| interner.intern(b).map(|id| StrId(id.get()))`
+   (`kronika_format::StrId` is `NonZeroU64` → `.get()`; `kronika_registry::StrId`
+   is plain `u64`). Then `dict::encode(interner.window())` →
+   `buffers.flush(&dict_sections, source_id)`. `DictLimits::new(4096, 64*1024)`
+   `.and_then(|l| l.with_max_total_bytes(16<<20))` — caps collector memory.
+5. `kronika-bdd/` — `features/<name>.feature` scenario + a `then` step. Verify
+   via `Segment::open`, `catalog().entries.find(type_id)`,
+   `VerifiedSection::verify(Bytes, crc, crc32c)` + `TypeVN::decode`, and
+   `segment.dictionary().resolve(str_id.0)` → `Some(Resolved::String(bytes))`
+   to prove the string path end-to-end. Add the major to `flake.nix` `pgMatrix`,
+   image `contents`, and `KRONIKA_PG_MATRIX` if extending the version matrix.
+
+**Gotchas that cost time here:**
+
+- clippy `-D warnings`: backtick code terms in doc/`//!` (`doc_markdown`); first
+  doc paragraph = one sentence then a blank line (`too_long_first_doc_paragraph`);
+  a test fake-interner returning `Result<StrId, Infallible>` needs
+  `#[allow(clippy::unnecessary_wraps)]` (it must match the fallible interner
+  signature `to_vN` expects).
+- `kronika-source-pg` has **no** README; do not reference "crate README" in its
+  rustdoc. The registry README documents types via code (bgwriter is the single
+  worked example) — new types need no README section.
+- `nix` is unavailable on the dev host (only `docker`/`podman`). BDD live runs in
+  CI only; locally just check that `kronika-bdd` compiles + passes clippy. Only
+  the layout matching the in-matrix majors is exercised live; older version
+  layouts are golden-codec-only.
+- SQL must be approved by the owner before coding (standing rule).
+
+**Then:** workspace gate (`fmt --check`, `clippy --workspace --all-targets -D
+warnings`, `test --workspace`, `xtask check-deps`) → pre-commit review agent
+(global rule) → Russian commit → PR.
