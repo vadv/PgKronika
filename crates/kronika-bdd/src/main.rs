@@ -81,7 +81,7 @@ fn now_micros() -> anyhow::Result<i64> {
     i64::try_from(since_epoch.as_micros()).context("unix microseconds overflow i64")
 }
 
-/// Basic invariants for a row read directly from PostgreSQL.
+/// Basic invariants for a row read directly from `PostgreSQL`.
 fn check_snapshot(major: u32, host_now: i64, snap: &BgwriterCheckpointer) -> anyhow::Result<()> {
     anyhow::ensure!(
         snap.ts.0 > 0 && (snap.ts.0 - host_now).abs() < 300_000_000,
