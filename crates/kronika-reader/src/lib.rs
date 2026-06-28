@@ -445,7 +445,7 @@ fn read_catalog(file: &File, len: u64) -> Result<Catalog, ReadError> {
 mod tests {
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_registry::Section;
-    use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::bgwriter_checkpointer::Bgwriter;
 
     use super::{ReadError, Resolved, Segment};
 
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn opens_a_segment_and_decodes_a_section() {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode empty section");
+        let body = Bgwriter::encode(&[]).expect("encode empty section");
         let (_dir, path) = segment_with(&body, 1_006_001, 0);
 
         let segment = Segment::open(&path).expect("open");
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn a_corrupted_section_body_fails_the_crc_check() {
-        let body = BgwriterCheckpointer::encode(&[]).expect("encode");
+        let body = Bgwriter::encode(&[]).expect("encode");
         let (_dir, path) = segment_with(&body, 1_006_001, 0);
 
         // Flip a byte inside the section body, just past the segment magic.

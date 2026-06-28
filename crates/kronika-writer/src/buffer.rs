@@ -189,21 +189,19 @@ mod tests {
     fn bgwriter(ts: i64) -> BgwriterCheckpointer {
         BgwriterCheckpointer {
             ts: Ts(ts),
-            checkpoints_timed: 10,
-            checkpoints_req: 2,
-            checkpoint_write_time: 1.0,
-            checkpoint_sync_time: 2.0,
-            buffers_checkpoint: 4096,
-            restartpoints_timed: None,
-            restartpoints_req: None,
-            restartpoints_done: None,
+            num_timed: 10,
+            num_requested: 2,
+            restartpoints_timed: 0,
+            restartpoints_req: 0,
+            restartpoints_done: 0,
+            write_time: 1.0,
+            sync_time: 2.0,
+            buffers_written: 4096,
             buffers_clean: 512,
             maxwritten_clean: 3,
-            buffers_backend: Some(128),
-            buffers_backend_fsync: Some(0),
             buffers_alloc: 9000,
             bgwriter_stats_reset: Ts(ts - 100),
-            checkpointer_stats_reset: None,
+            checkpointer_stats_reset: Ts(ts - 50),
         }
     }
 
@@ -260,7 +258,7 @@ mod tests {
                 VerifiedSection::verify(body, entry.crc32c, crc32c).expect("catalog crc matches");
             decode_any(type_id, verified).expect("decode").stats.rows
         };
-        assert_eq!(decode_rows(1_006_001), 2);
+        assert_eq!(decode_rows(1_006_002), 2);
         assert_eq!(decode_rows(1_021_001), 1);
     }
 

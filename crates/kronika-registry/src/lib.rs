@@ -61,8 +61,10 @@ pub const DICT_BLOBS_TYPE_ID: u32 = 3_002_001;
 #[must_use]
 pub const fn registry() -> &'static [TypeContract] {
     &[
+        bgwriter_checkpointer::Bgwriter::CONTRACT,
         bgwriter_checkpointer::BgwriterCheckpointer::CONTRACT,
         reset_metadata::ResetMetadata::CONTRACT,
+        reset_metadata::ResetMetadataIo::CONTRACT,
         instance_metadata::InstanceMetadata::CONTRACT,
     ]
 }

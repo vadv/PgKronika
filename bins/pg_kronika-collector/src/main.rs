@@ -17,7 +17,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use kronika_source_pg::{collect_bgwriter_checkpointer, collect_reset_metadata, server_major};
+use kronika_source_pg::{
+    collect_bgwriter, collect_checkpointer, collect_reset_metadata, collect_reset_metadata_io,
+    server_major,
+};
 use kronika_writer::{Journal, JournalConfig, SectionBuffers, seal};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
@@ -98,6 +101,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "awaited inline in the signal loop, never spawned across threads, so holding the non-Send SectionBuffers across the per-family collect awaits is sound"
+)]
 async fn snapshot_and_seal(
     client: &Client,
     major: u32,
@@ -105,21 +112,46 @@ async fn snapshot_and_seal(
     out_dir: &Path,
     source_id: u64,
 ) -> Result<PathBuf> {
-    let bgwriter = collect_bgwriter_checkpointer(client, major)
-        .await
-        .context("collect type 1_006_001")?;
-    let reset = collect_reset_metadata(client, major)
-        .await
-        .context("collect type 1_020_001")?;
-    let ts = bgwriter.ts;
-
     let mut buffers = SectionBuffers::new();
-    buffers
-        .push(bgwriter)
-        .map_err(|_row| anyhow::anyhow!("bgwriter section buffer full for one row"))?;
-    buffers
-        .push(reset)
-        .map_err(|_row| anyhow::anyhow!("reset_metadata section buffer full for one row"))?;
+
+    // Background-writer family: PG17 split the catalog, so each major writes its
+    // own exact type_id (see the registry's `type_id` rule).
+    let ts = if major >= 17 {
+        let row = collect_checkpointer(client)
+            .await
+            .context("collect type 1_006_002")?;
+        let ts = row.ts;
+        buffers
+            .push(row)
+            .map_err(|_row| anyhow::anyhow!("section 1_006_002 buffer full for one row"))?;
+        ts
+    } else {
+        let row = collect_bgwriter(client)
+            .await
+            .context("collect type 1_006_001")?;
+        let ts = row.ts;
+        buffers
+            .push(row)
+            .map_err(|_row| anyhow::anyhow!("section 1_006_001 buffer full for one row"))?;
+        ts
+    };
+
+    // Reset-context family: PG16 added pg_stat_io, again a separate type_id.
+    if major >= 16 {
+        let row = collect_reset_metadata_io(client)
+            .await
+            .context("collect type 1_020_002")?;
+        buffers
+            .push(row)
+            .map_err(|_row| anyhow::anyhow!("section 1_020_002 buffer full for one row"))?;
+    } else {
+        let row = collect_reset_metadata(client)
+            .await
+            .context("collect type 1_020_001")?;
+        buffers
+            .push(row)
+            .map_err(|_row| anyhow::anyhow!("section 1_020_001 buffer full for one row"))?;
+    }
     let part = buffers
         .flush(&[], source_id)
         .context("encode the collection window")?

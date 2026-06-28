@@ -227,21 +227,19 @@ mod tests {
     fn bgwriter(ts: i64) -> BgwriterCheckpointer {
         BgwriterCheckpointer {
             ts: Ts(ts),
-            checkpoints_timed: 10,
-            checkpoints_req: 2,
-            checkpoint_write_time: 1.0,
-            checkpoint_sync_time: 2.0,
-            buffers_checkpoint: 4096,
-            restartpoints_timed: None,
-            restartpoints_req: None,
-            restartpoints_done: None,
+            num_timed: 10,
+            num_requested: 2,
+            restartpoints_timed: 0,
+            restartpoints_req: 0,
+            restartpoints_done: 0,
+            write_time: 1.0,
+            sync_time: 2.0,
+            buffers_written: 4096,
             buffers_clean: 512,
             maxwritten_clean: 3,
-            buffers_backend: Some(128),
-            buffers_backend_fsync: Some(0),
             buffers_alloc: 9000,
             bgwriter_stats_reset: Ts(ts - 100),
-            checkpointer_stats_reset: None,
+            checkpointer_stats_reset: Ts(ts - 50),
         }
     }
 
@@ -276,14 +274,14 @@ mod tests {
 
         // Repeated sections decode in catalog order.
         for entry in &catalog.entries {
-            assert_eq!(entry.type_id, 1_006_001);
+            assert_eq!(entry.type_id, 1_006_002);
             let start = usize::try_from(entry.offset).unwrap();
             let len = usize::try_from(entry.len).unwrap();
             let body = Bytes::copy_from_slice(&segment[start..start + len]);
             let verified = VerifiedSection::verify(body, entry.crc32c, kronika_format::crc32c)
                 .expect("section crc matches");
             assert_eq!(
-                decode_any(1_006_001, verified).expect("decode").stats.rows,
+                decode_any(1_006_002, verified).expect("decode").stats.rows,
                 1
             );
         }

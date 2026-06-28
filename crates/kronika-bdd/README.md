@@ -36,32 +36,31 @@ Scenario: every version yields a valid bgwriter/checkpointer snapshot
   Then every version reports valid bgwriter/checkpointer stats
 ```
 
-For each version it calls `collect_bgwriter_checkpointer` (registry type
-`1_006_001`) and checks that:
+The major version selects the exact collector and `type_id`: PG 15–16 call
+`collect_bgwriter` (`1_006_001`), PG 17 calls `collect_checkpointer`
+(`1_006_002`). For each version it checks that:
 
 - the row's `ts` is the server's `clock_timestamp()`, near the runner clock;
-- counters are non-negative and `bgwriter_stats_reset` is before that `ts`;
-- the filled and `NULL` columns match the version: PG17+ fills
-  `restartpoints_*` and `checkpointer_stats_reset`, but leaves
-  `buffers_backend` empty; earlier versions do the reverse.
+- counters are non-negative and the view's `stats_reset` is before that `ts`.
 
 This fails when the SQL no longer matches a catalog layout or the version
-dispatch selects the wrong branch.
+dispatch selects the wrong type.
 
 The same feature also starts the collector binary:
 
 ```gherkin
-Scenario: every version seals a readable segment with section 1_006_001
+Scenario: every version seals a readable segment with its version's sections
   Given the PostgreSQL matrix is booted
-  Then every version is collected into a sealed segment with section 1_006_001
+  Then every version is collected into a sealed segment with its version's sections
 ```
 
 For each version the runner spawns `pg_kronika-collector` (path from
 `KRONIKA_COLLECTOR_BIN`) against the cluster, waits for its `ready` line, sends
 `SIGUSR2`, and reads back the `sealed <path>` it prints. It then opens that
-segment with `kronika-reader`, decodes section `1_006_001` typed, and asserts the
-one row's `ts` equals the segment range and its PG17/pre-17 columns survived the
-round-trip.
+segment with `kronika-reader` and decodes — typed — the exact sections that major
+writes: the bgwriter family (`1_006_001` or `1_006_002`) and reset context
+(`1_020_001` or `1_020_002`). It asserts each row's `ts` falls in the segment
+range and the typed values survived the round-trip.
 
 ## Quick Local Check
 

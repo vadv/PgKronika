@@ -26,14 +26,32 @@ use kronika_format::{Entry, crc32c};
 use kronika_reader::Segment;
 use kronika_registry::{
     Bytes, MAX_SECTION_BYTES, Section, VerifiedSection,
-    bgwriter_checkpointer::BgwriterCheckpointer, reset_metadata::ResetMetadata,
+    bgwriter_checkpointer::{Bgwriter, BgwriterCheckpointer},
+    reset_metadata::{ResetMetadata, ResetMetadataIo},
 };
-use kronika_source_pg::collect_bgwriter_checkpointer;
+use kronika_source_pg::{collect_bgwriter, collect_checkpointer};
 
+const PG16_MAJOR: u32 = 16;
 const PG17_MAJOR: u32 = 17;
 
-const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
-const RESET_METADATA_TYPE_ID: u32 = 1_020_001;
+/// Background-writer family `type_id` for `major`: PG17 split the catalog into
+/// its own schema, so each major writes a distinct type.
+const fn bgwriter_type_id(major: u32) -> u32 {
+    if major >= PG17_MAJOR {
+        1_006_002
+    } else {
+        1_006_001
+    }
+}
+
+/// Reset-context family `type_id` for `major`: PG16 added `pg_stat_io`.
+const fn reset_type_id(major: u32) -> u32 {
+    if major >= PG16_MAJOR {
+        1_020_002
+    } else {
+        1_020_001
+    }
+}
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
@@ -76,10 +94,20 @@ async fn every_version_reports_stats(world: &mut BddWorld) -> anyhow::Result<()>
             "postgres {}: handshake reported major {major} instead",
             db.major()
         );
-        let snapshot = collect_bgwriter_checkpointer(conn.client(), major)
-            .await
-            .with_context(|| format!("collect type 1_006_001 on postgres {}", db.major()))?;
-        check_snapshot(db.major(), now_micros()?, &snapshot)?;
+        // The major picks the exact collector and type_id, not a branch inside
+        // one merged type.
+        let host_now = now_micros()?;
+        if major >= PG17_MAJOR {
+            let snap = collect_checkpointer(conn.client())
+                .await
+                .with_context(|| format!("collect type 1_006_002 on postgres {major}"))?;
+            check_checkpointer(major, host_now, &snap)?;
+        } else {
+            let snap = collect_bgwriter(conn.client())
+                .await
+                .with_context(|| format!("collect type 1_006_001 on postgres {major}"))?;
+            check_bgwriter(major, host_now, &snap)?;
+        }
     }
     Ok(())
 }
@@ -91,58 +119,54 @@ fn now_micros() -> anyhow::Result<i64> {
     i64::try_from(since_epoch.as_micros()).context("unix microseconds overflow i64")
 }
 
-/// Basic invariants for a row read directly from `PostgreSQL`.
-fn check_snapshot(major: u32, host_now: i64, snap: &BgwriterCheckpointer) -> anyhow::Result<()> {
+/// A directly-collected `ts` must be positive and within 5 minutes of the runner
+/// clock (server and runner share the container clock).
+fn check_collection_ts(major: u32, host_now: i64, ts: i64) -> anyhow::Result<()> {
     anyhow::ensure!(
-        snap.ts.0 > 0 && (snap.ts.0 - host_now).abs() < 300_000_000,
-        "postgres {major}: snapshot ts {} is not within 5 min of the runner clock {host_now}",
-        snap.ts.0
+        ts > 0 && (ts - host_now).abs() < 300_000_000,
+        "postgres {major}: snapshot ts {ts} is not within 5 min of the runner clock {host_now}"
     );
+    Ok(())
+}
+
+/// Invariants for a `1_006_001` row (`pg_stat_bgwriter`, PG 15–16).
+fn check_bgwriter(major: u32, host_now: i64, snap: &Bgwriter) -> anyhow::Result<()> {
+    check_collection_ts(major, host_now, snap.ts.0)?;
     anyhow::ensure!(
         snap.checkpoints_timed >= 0 && snap.buffers_clean >= 0 && snap.buffers_alloc >= 0,
         "postgres {major}: a counter came back negative"
     );
     anyhow::ensure!(
-        snap.bgwriter_stats_reset.0 > 0 && snap.bgwriter_stats_reset.0 <= snap.ts.0,
-        "postgres {major}: bgwriter_stats_reset {} not in (0, {}]",
-        snap.bgwriter_stats_reset.0,
+        snap.stats_reset.0 > 0 && snap.stats_reset.0 <= snap.ts.0,
+        "postgres {major}: stats_reset {} not in (0, {}]",
+        snap.stats_reset.0,
         snap.ts.0
     );
-    assert_version_columns(major, snap)
-}
-
-/// PG17 moved checkpoint fields out of `pg_stat_bgwriter`; older versions keep
-/// the old column set.
-fn assert_version_columns(major: u32, snap: &BgwriterCheckpointer) -> anyhow::Result<()> {
-    if major >= PG17_MAJOR {
-        anyhow::ensure!(
-            snap.restartpoints_timed.is_some()
-                && snap.restartpoints_req.is_some()
-                && snap.restartpoints_done.is_some()
-                && snap.checkpointer_stats_reset.is_some(),
-            "postgres {major}: PG17+ checkpointer columns came back NULL"
-        );
-        anyhow::ensure!(
-            snap.buffers_backend.is_none() && snap.buffers_backend_fsync.is_none(),
-            "postgres {major}: PG17 dropped buffers_backend, but the snapshot has it"
-        );
-    } else {
-        anyhow::ensure!(
-            snap.buffers_backend.is_some() && snap.buffers_backend_fsync.is_some(),
-            "postgres {major}: pre-PG17 buffers_backend came back NULL"
-        );
-        anyhow::ensure!(
-            snap.restartpoints_timed.is_none()
-                && snap.restartpoints_req.is_none()
-                && snap.restartpoints_done.is_none()
-                && snap.checkpointer_stats_reset.is_none(),
-            "postgres {major}: pre-PG17 must not fill the checkpointer columns"
-        );
-    }
     Ok(())
 }
 
-#[then("every version is collected into a sealed segment with section 1_006_001")]
+/// Invariants for a `1_006_002` row (`pg_stat_checkpointer` + `pg_stat_bgwriter`,
+/// PG 17+).
+fn check_checkpointer(
+    major: u32,
+    host_now: i64,
+    snap: &BgwriterCheckpointer,
+) -> anyhow::Result<()> {
+    check_collection_ts(major, host_now, snap.ts.0)?;
+    anyhow::ensure!(
+        snap.num_timed >= 0 && snap.restartpoints_done >= 0 && snap.buffers_alloc >= 0,
+        "postgres {major}: a counter came back negative"
+    );
+    anyhow::ensure!(
+        snap.checkpointer_stats_reset.0 > 0 && snap.checkpointer_stats_reset.0 <= snap.ts.0,
+        "postgres {major}: checkpointer_stats_reset {} not in (0, {}]",
+        snap.checkpointer_stats_reset.0,
+        snap.ts.0
+    );
+    Ok(())
+}
+
+#[then("every version is collected into a sealed segment with its version's sections")]
 async fn every_version_seals_a_segment(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
     for db in &world.clusters {
@@ -159,37 +183,81 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let catalog = segment.catalog();
     let (min, max) = (catalog.min_ts, catalog.max_ts);
 
-    // Verify the typed row, not only the catalog entry.
-    let bg_entry = find_section(&catalog.entries, BGWRITER_CHECKPOINTER_TYPE_ID, major)?;
-    let bgwriter: BgwriterCheckpointer = decode_sealed_row(path, bg_entry)
-        .with_context(|| format!("postgres {major}: read back section 1_006_001"))?;
-    anyhow::ensure!(
-        min > 0 && min <= bgwriter.ts.0 && bgwriter.ts.0 <= max,
-        "postgres {major}: bgwriter ts {} outside segment range {min}..={max}",
-        bgwriter.ts.0
-    );
-    anyhow::ensure!(
-        bgwriter.bgwriter_stats_reset.0 > 0 && bgwriter.bgwriter_stats_reset.0 <= bgwriter.ts.0,
-        "postgres {major}: bgwriter_stats_reset {} not in (0, {}]",
-        bgwriter.bgwriter_stats_reset.0,
-        bgwriter.ts.0
-    );
-    assert_version_columns(major, &bgwriter)?;
+    // Background-writer family: the exact type_id for this major must be present,
+    // and its typed row reads back through the reader's CRC + decode path.
+    let bg_id = bgwriter_type_id(major);
+    let bg_entry = find_section(&catalog.entries, bg_id, major)?;
+    let bg_ts = if major >= PG17_MAJOR {
+        let row: BgwriterCheckpointer = decode_sealed_row(path, bg_entry)
+            .with_context(|| format!("postgres {major}: read back section {bg_id}"))?;
+        ensure_reset_before(
+            major,
+            "checkpointer_stats_reset",
+            row.checkpointer_stats_reset.0,
+            row.ts.0,
+        )?;
+        row.ts.0
+    } else {
+        let row: Bgwriter = decode_sealed_row(path, bg_entry)
+            .with_context(|| format!("postgres {major}: read back section {bg_id}"))?;
+        ensure_reset_before(major, "stats_reset", row.stats_reset.0, row.ts.0)?;
+        row.ts.0
+    };
+    ensure_ts_in_range(major, "bgwriter", bg_ts, min, max)?;
 
-    // reset_metadata is mandatory for sealed PostgreSQL segments.
-    let reset_entry = find_section(&catalog.entries, RESET_METADATA_TYPE_ID, major)?;
-    let reset: ResetMetadata = decode_sealed_row(path, reset_entry)
-        .with_context(|| format!("postgres {major}: read back section 1_020_001"))?;
+    // Reset-context family: mandatory in every segment, exact type_id per major.
+    let reset_id = reset_type_id(major);
+    let reset_entry = find_section(&catalog.entries, reset_id, major)?;
+    let reset_ts = if major >= PG16_MAJOR {
+        let row: ResetMetadataIo = decode_sealed_row(path, reset_entry)
+            .with_context(|| format!("postgres {major}: read back section {reset_id}"))?;
+        ensure_reset_metadata(
+            major,
+            row.postmaster_start_time.0,
+            row.pg_stat_archiver_reset_at.0,
+        )?;
+        anyhow::ensure!(
+            row.pg_stat_io_reset_at.0 > 0,
+            "postgres {major}: pg_stat_io_reset_at is not set"
+        );
+        row.ts.0
+    } else {
+        let row: ResetMetadata = decode_sealed_row(path, reset_entry)
+            .with_context(|| format!("postgres {major}: read back section {reset_id}"))?;
+        ensure_reset_metadata(
+            major,
+            row.postmaster_start_time.0,
+            row.pg_stat_archiver_reset_at.0,
+        )?;
+        row.ts.0
+    };
+    ensure_ts_in_range(major, "reset_metadata", reset_ts, min, max)?;
+    Ok(())
+}
+
+/// A reset timestamp must be positive and not in the future relative to `ts`.
+fn ensure_reset_before(major: u32, field: &str, reset: i64, ts: i64) -> anyhow::Result<()> {
     anyhow::ensure!(
-        reset.postmaster_start_time.0 > 0
-            && reset.pg_stat_database_reset_max_at.0 > 0
-            && reset.pg_stat_archiver_reset_at.0 > 0,
-        "postgres {major}: reset_metadata carries implausible timestamps"
+        reset > 0 && reset <= ts,
+        "postgres {major}: {field} {reset} not in (0, {ts}]"
     );
+    Ok(())
+}
+
+/// A section's `ts` must fall inside the sealed segment's time range.
+fn ensure_ts_in_range(major: u32, what: &str, ts: i64, min: i64, max: i64) -> anyhow::Result<()> {
     anyhow::ensure!(
-        min <= reset.ts.0 && reset.ts.0 <= max,
-        "postgres {major}: reset_metadata ts {} outside segment range {min}..={max}",
-        reset.ts.0
+        min > 0 && min <= ts && ts <= max,
+        "postgres {major}: {what} ts {ts} outside segment range {min}..={max}"
+    );
+    Ok(())
+}
+
+/// Required `reset_metadata` timestamps that both versions carry.
+fn ensure_reset_metadata(major: u32, postmaster: i64, archiver_reset: i64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        postmaster > 0 && archiver_reset > 0,
+        "postgres {major}: reset_metadata carries implausible timestamps"
     );
     Ok(())
 }
