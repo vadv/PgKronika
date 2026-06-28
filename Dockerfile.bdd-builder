@@ -5,55 +5,14 @@ FROM docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 WORKDIR /work
 
-COPY flake.nix flake.lock rust-toolchain.toml Cargo.toml Cargo.lock ./
-COPY xtask/Cargo.toml xtask/Cargo.toml
-COPY bins/pg_kronika-archiver/Cargo.toml bins/pg_kronika-archiver/Cargo.toml
-COPY bins/pg_kronika-collector/Cargo.toml bins/pg_kronika-collector/Cargo.toml
-COPY bins/pg_kronika-dump/Cargo.toml bins/pg_kronika-dump/Cargo.toml
-COPY bins/pg_kronika-web/Cargo.toml bins/pg_kronika-web/Cargo.toml
-COPY crates/kronika-bdd/Cargo.toml crates/kronika-bdd/Cargo.toml
-COPY crates/kronika-charts/Cargo.toml crates/kronika-charts/Cargo.toml
-COPY crates/kronika-derive/Cargo.toml crates/kronika-derive/Cargo.toml
-COPY crates/kronika-diff/Cargo.toml crates/kronika-diff/Cargo.toml
-COPY crates/kronika-format/Cargo.toml crates/kronika-format/Cargo.toml
-COPY crates/kronika-reader/Cargo.toml crates/kronika-reader/Cargo.toml
-COPY crates/kronika-registry/Cargo.toml crates/kronika-registry/Cargo.toml
-COPY crates/kronika-source-log/Cargo.toml crates/kronika-source-log/Cargo.toml
-COPY crates/kronika-source-os/Cargo.toml crates/kronika-source-os/Cargo.toml
-COPY crates/kronika-source-pg/Cargo.toml crates/kronika-source-pg/Cargo.toml
-COPY crates/kronika-store/Cargo.toml crates/kronika-store/Cargo.toml
-COPY crates/kronika-store-http/Cargo.toml crates/kronika-store-http/Cargo.toml
-COPY crates/kronika-store-s3/Cargo.toml crates/kronika-store-s3/Cargo.toml
-COPY crates/kronika-writer/Cargo.toml crates/kronika-writer/Cargo.toml
-
-RUN set -eu; \
-  for dir in \
-    crates/kronika-charts \
-    crates/kronika-derive \
-    crates/kronika-diff \
-    crates/kronika-format \
-    crates/kronika-reader \
-    crates/kronika-registry \
-    crates/kronika-source-log \
-    crates/kronika-source-os \
-    crates/kronika-source-pg \
-    crates/kronika-store \
-    crates/kronika-store-http \
-    crates/kronika-store-s3 \
-    crates/kronika-writer \
-    xtask; do \
-      mkdir -p "$dir/src"; \
-      printf '\n' > "$dir/src/lib.rs"; \
-    done; \
-  for dir in \
-    bins/pg_kronika-archiver \
-    bins/pg_kronika-collector \
-    bins/pg_kronika-dump \
-    bins/pg_kronika-web \
-    crates/kronika-bdd; do \
-      mkdir -p "$dir/src"; \
-      printf 'fn main() {}\n' > "$dir/src/main.rs"; \
-    done
+# Build the dependency store from the real workspace, not a hand-rolled stub
+# tree. crane's `cargoArtifacts` ignores `.rs` content and the source file set,
+# so a builder baked from one source snapshot stays valid for every later
+# source-only change; only a manifest/lock/flake change (the deps key) rebuilds
+# it. A stub tree does not reproduce crane's dummy source exactly, so it bakes a
+# `cargoArtifacts` derivation the real `nix build .#image` never reuses — which
+# silently defeated the whole builder image.
+COPY . .
 
 RUN nix build \
     .#cargoArtifacts \
