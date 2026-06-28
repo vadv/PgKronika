@@ -132,8 +132,29 @@ a reference type instead of rediscovering the wiring.
   CI only; locally just check that `kronika-bdd` compiles + passes clippy. Only
   the layout matching the in-matrix majors is exercised live; older version
   layouts are golden-codec-only.
-- SQL must be approved by the owner before coding (standing rule).
+- SQL is the implementer's call (no owner pre-approval) — decide it per the
+  registry discipline; the DBA review below is the safety net.
 
 **Then:** workspace gate (`fmt --check`, `clippy --workspace --all-targets -D
-warnings`, `test --workspace`, `xtask check-deps`) → pre-commit review agent
-(global rule) → Russian commit → PR.
+warnings`, `test --workspace`, `xtask check-deps`) → Russian commit → **mandatory
+pre-PR review panel** → PR.
+
+**Pre-PR review panel** (run on the staged diff before the PR is opened; every
+metric PR goes through it):
+
+1. **Rust performance** — hot paths, allocations, needless clones, per-row
+   work, and async overhead in the collect path.
+2. **Rust anti-OOM / memory** — what enters process RAM; nothing sized by the
+   database (row counts, query text, result sets) may be materialized whole
+   without an enforced cap. The collector runs on the DB host: OOM there is
+   worse than a lost segment.
+3. **PostgreSQL DBA** — confirm that the metrics are correct and complete
+   across PG 10-18, version handling is right, and the SQL is idiomatic and
+   safe (no injection, correct casts, NULL handling).
+4. **Linux performance / observability** — confirm that these are the right
+   system and PostgreSQL signals, modelled with correct semantics (counter vs
+   gauge, units, and the operator view they need).
+
+Plus the standing comment-quality, language, test, and commit-focus review.
+Fix every blocker the panel raises and re-run the relevant check before
+opening the PR.
