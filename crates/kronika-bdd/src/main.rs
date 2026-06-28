@@ -206,6 +206,53 @@ fn decode_sealed_row(path: &Path, entry: &Entry) -> anyhow::Result<BgwriterCheck
     Ok(row)
 }
 
+#[then("kronika queries are tagged in pg_stat_activity")]
+async fn queries_are_tagged(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        // One connection runs a marked collector query, then stays idle — so its
+        // backend's last statement in pg_stat_activity is that marked query.
+        let probe = db.connect().await?;
+        let major = probe
+            .major()
+            .with_context(|| format!("postgres {}: server reported no version", db.major()))?;
+        collect_bgwriter_checkpointer(probe.client(), major)
+            .await
+            .with_context(|| format!("collect on postgres {}", db.major()))?;
+
+        // A second connection sees how the first one appears to the server.
+        let observer = db.connect().await?;
+        let row = observer
+            .client()
+            .query_one(
+                concat!(
+                    "/* pg_kronika:",
+                    env!("CARGO_PKG_VERSION"),
+                    " crates/kronika-bdd/src/main.rs */ ",
+                    "SELECT application_name, query FROM pg_stat_activity \
+                     WHERE application_name LIKE 'pg_kronika%' AND pid <> pg_backend_pid() \
+                     ORDER BY query_start DESC NULLS LAST LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .with_context(|| format!("postgres {}: read pg_stat_activity", db.major()))?;
+        let app_name: String = row.get("application_name");
+        let query: String = row.get("query");
+        anyhow::ensure!(
+            app_name.starts_with("pg_kronika-"),
+            "postgres {}: application_name {app_name:?} is not a kronika name",
+            db.major()
+        );
+        anyhow::ensure!(
+            query.contains("/* pg_kronika:"),
+            "postgres {}: query carries no kronika marker: {query:?}",
+            db.major()
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
