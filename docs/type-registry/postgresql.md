@@ -16,7 +16,8 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_006_001` | `pg_stat_bgwriter` + `pg_stat_checkpointer` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_007_001` | `pg_stat_wal` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_008_001` | `pg_stat_archiver` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_009_001` | `pg_stat_io` | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
+| `1_009_001` | `pg_stat_io` (PG 16-17) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
+| `1_009_002` | `pg_stat_io` (PG 18) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
 | `1_010_001` | агрегат `pg_prepared_xacts` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_011_001` | `pg_locks`, дерево ожиданий | по факту | `conditional_full` | `(ts, root_pid, depth)` |
 | `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `snapshot_full` | `(ts, pid)` |
@@ -273,30 +274,93 @@ last_failed_time   ts?  G
 stats_reset        ts   G
 ```
 
-## `1_009_001` `pg_stat_io`
+## `1_009_001` / `1_009_002` `pg_stat_io`
 
-PG16+. Сущность — тройка `(backend_type, object, context)`, обычно 30-50 строк
-за один регулярный сбор.
+PG16+ (на PG 10–15 представления нет — источник пропускается). Сущность — тройка
+`(backend_type, object, context)`, обычно 30–50 строк за сбор. Счётчики и
+тайминги — `NULL`, а не `0`, для комбинаций, которые backend не порождает (`NULL`
+≠ нулевая активность). При выключенном `track_io_timing` тайминги приходят как `0`, а не `NULL` (в PG18
+для строк `object = wal` — при `track_wal_io_timing`). `stats_reset` хранится в
+строке.
+
+Пропускная способность (байты) считается по-разному на двух раскладках:
+
+- PG16–17 (`1_009_001`): `rate(reads) * op_bytes`, аналогично для `writes` и
+  `extends`. `op_bytes` — фиксированный размер блока (обычно 8192), это **gauge,
+  а не счётчик**: брать от него `rate` бессмысленно (он почти константа).
+- PG18 (`1_009_002`): напрямую `rate(read_bytes)`, `rate(write_bytes)`,
+  `rate(extend_bytes)` — `op_bytes` убран, потому что размер I/O-операции стал
+  переменным.
+
+Байтовые счётчики PG18 (`*_bytes`) имеют тип `numeric` и приводятся к `i64`:
+`i64` вмещает ~8 ЭиБ, чего реальный кластер за свой uptime не достигает. На
+теоретическом переполнении сбор упадёт с ошибкой (сегмент потеряется, но
+коллектор не запишет искажённое значение) — clamp или nullable не вводим.
+
+### Версии раскладки
+
+Схема `pg_stat_io` менялась в PG18 неаддитивно (добавлены байтовые счётчики,
+удалён `op_bytes`), поэтому две версии формата:
+
+| `type_id` | Версии PostgreSQL | Отличие |
+|-----------|-------------------|---------|
+| `1_009_001` | 16, 17 | `op_bytes`, без байтовых счётчиков |
+| `1_009_002` | 18 | `+ read_bytes`, `+ write_bytes`, `+ extend_bytes`; `- op_bytes`; новые `object = wal`, `context = init` |
+
+Live-BDD: PG 16–17 → `1_009_001`, PG 18 → `1_009_002` (обе раскладки в матрице
+nixpkgs); на PG 15 секции `pg_stat_io` нет.
+
+### Раскладка `1_009_001` (PG 16–17)
 
 ```text
-ts              ts   T
-backend_type    str  L
-object          str  L   // relation | temp relation | wal
-context         str  L   // normal | vacuum | bulkread | bulkwrite
-reads           i64  C
-read_time       f64  C
-writes          i64  C
-write_time      f64  C
-writebacks      i64  C
-writeback_time  f64  C
-extends         i64  C
-extend_time     f64  C
-op_bytes        i64  L
-hits            i64  C
-evictions       i64  C
-reuses          i64  C
-fsyncs          i64  C
-fsync_time      f64  C
+ts              ts    T
+backend_type    str   L
+object          str   L   // relation | temp relation
+context         str   L   // normal | vacuum | bulkread | bulkwrite
+reads           i64?  C
+read_time       f64?  C
+writes          i64?  C
+write_time      f64?  C
+writebacks      i64?  C
+writeback_time  f64?  C
+extends         i64?  C
+extend_time     f64?  C
+op_bytes        i64?  G   // размер блока (8192), не счётчик: байты = (reads+writes+extends)*op_bytes
+hits            i64?  C
+evictions       i64?  C
+reuses          i64?  C
+fsyncs          i64?  C
+fsync_time      f64?  C
+stats_reset     ts?   G
+```
+
+### Раскладка `1_009_002` (PG 18)
+
+Без `op_bytes`, с байтовыми счётчиками рядом со счётчиками операций; `object`
+получает значение `wal`, `context` — `init`.
+
+```text
+ts              ts    T
+backend_type    str   L
+object          str   L   // relation | temp relation | wal
+context         str   L   // normal | vacuum | bulkread | bulkwrite | init
+reads           i64?  C
+read_bytes      i64?  C
+read_time       f64?  C
+writes          i64?  C
+write_bytes     i64?  C
+write_time      f64?  C
+writebacks      i64?  C
+writeback_time  f64?  C
+extends         i64?  C
+extend_bytes    i64?  C
+extend_time     f64?  C
+hits            i64?  C
+evictions       i64?  C
+reuses          i64?  C
+fsyncs          i64?  C
+fsync_time      f64?  C
+stats_reset     ts?   G
 ```
 
 ## `1_010_001` агрегат `pg_prepared_xacts`
