@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use kronika_source_pg::{collect_bgwriter_checkpointer, server_major};
+use kronika_source_pg::{collect_bgwriter_checkpointer, collect_reset_metadata, server_major};
 use kronika_writer::{Journal, JournalConfig, SectionBuffers, seal};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
@@ -105,15 +105,21 @@ async fn snapshot_and_seal(
     out_dir: &Path,
     source_id: u64,
 ) -> Result<PathBuf> {
-    let row = collect_bgwriter_checkpointer(client, major)
+    let bgwriter = collect_bgwriter_checkpointer(client, major)
         .await
         .context("collect type 1_006_001")?;
-    let ts = row.ts;
+    let reset = collect_reset_metadata(client, major)
+        .await
+        .context("collect type 1_020_001")?;
+    let ts = bgwriter.ts;
 
     let mut buffers = SectionBuffers::new();
     buffers
-        .push(row)
-        .map_err(|_row| anyhow::anyhow!("section buffer full for a single row"))?;
+        .push(bgwriter)
+        .map_err(|_row| anyhow::anyhow!("bgwriter section buffer full for one row"))?;
+    buffers
+        .push(reset)
+        .map_err(|_row| anyhow::anyhow!("reset_metadata section buffer full for one row"))?;
     let part = buffers
         .flush(&[], source_id)
         .context("encode the collection window")?

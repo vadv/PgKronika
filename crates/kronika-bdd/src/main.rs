@@ -25,13 +25,15 @@ use cucumber::{World, given, then};
 use kronika_format::{Entry, crc32c};
 use kronika_reader::Segment;
 use kronika_registry::{
-    Bytes, MAX_SECTION_BYTES, Section, VerifiedSection, bgwriter_checkpointer::BgwriterCheckpointer,
+    Bytes, MAX_SECTION_BYTES, Section, VerifiedSection,
+    bgwriter_checkpointer::BgwriterCheckpointer, reset_metadata::ResetMetadata,
 };
 use kronika_source_pg::collect_bgwriter_checkpointer;
 
 const PG17_MAJOR: u32 = 17;
 
 const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
+const RESET_METADATA_TYPE_ID: u32 = 1_020_001;
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
@@ -155,34 +157,53 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
     let catalog = segment.catalog();
-    let entry = catalog
-        .entries
-        .iter()
-        .find(|entry| entry.type_id == BGWRITER_CHECKPOINTER_TYPE_ID)
-        .with_context(|| format!("postgres {major}: segment has no section 1_006_001"))?;
+    let (min, max) = (catalog.min_ts, catalog.max_ts);
 
-    // Check typed values, not just section presence.
-    let row = decode_sealed_row(path, entry)
+    // Section 1_006_001: typed values survived collect -> seal -> read.
+    let bg_entry = find_section(&catalog.entries, BGWRITER_CHECKPOINTER_TYPE_ID, major)?;
+    let bgwriter: BgwriterCheckpointer = decode_sealed_row(path, bg_entry)
         .with_context(|| format!("postgres {major}: read back section 1_006_001"))?;
-
     anyhow::ensure!(
-        row.ts.0 > 0 && row.ts.0 == catalog.min_ts && row.ts.0 == catalog.max_ts,
-        "postgres {major}: row ts {} disagrees with segment range {}..={}",
-        row.ts.0,
-        catalog.min_ts,
-        catalog.max_ts
+        min > 0 && min <= bgwriter.ts.0 && bgwriter.ts.0 <= max,
+        "postgres {major}: bgwriter ts {} outside segment range {min}..={max}",
+        bgwriter.ts.0
     );
     anyhow::ensure!(
-        row.bgwriter_stats_reset.0 > 0 && row.bgwriter_stats_reset.0 <= row.ts.0,
+        bgwriter.bgwriter_stats_reset.0 > 0 && bgwriter.bgwriter_stats_reset.0 <= bgwriter.ts.0,
         "postgres {major}: bgwriter_stats_reset {} not in (0, {}]",
-        row.bgwriter_stats_reset.0,
-        row.ts.0
+        bgwriter.bgwriter_stats_reset.0,
+        bgwriter.ts.0
     );
-    assert_version_columns(major, &row)
+    assert_version_columns(major, &bgwriter)?;
+
+    // Section 1_020_001 must be in every segment (registry contract).
+    let reset_entry = find_section(&catalog.entries, RESET_METADATA_TYPE_ID, major)?;
+    let reset: ResetMetadata = decode_sealed_row(path, reset_entry)
+        .with_context(|| format!("postgres {major}: read back section 1_020_001"))?;
+    anyhow::ensure!(
+        reset.postmaster_start_time.0 > 0
+            && reset.pg_stat_database_reset_max_at.0 > 0
+            && reset.pg_stat_archiver_reset_at.0 > 0,
+        "postgres {major}: reset_metadata carries implausible timestamps"
+    );
+    anyhow::ensure!(
+        min <= reset.ts.0 && reset.ts.0 <= max,
+        "postgres {major}: reset_metadata ts {} outside segment range {min}..={max}",
+        reset.ts.0
+    );
+    Ok(())
+}
+
+/// First catalog entry of `type_id`, or a context error naming the version.
+fn find_section(entries: &[Entry], type_id: u32, major: u32) -> anyhow::Result<&Entry> {
+    entries
+        .iter()
+        .find(|entry| entry.type_id == type_id)
+        .with_context(|| format!("postgres {major}: segment has no section {type_id}"))
 }
 
 /// Read the catalog-bounded section and decode its single typed row.
-fn decode_sealed_row(path: &Path, entry: &Entry) -> anyhow::Result<BgwriterCheckpointer> {
+fn decode_sealed_row<T: Section>(path: &Path, entry: &Entry) -> anyhow::Result<T> {
     use std::os::unix::fs::FileExt;
 
     let len = usize::try_from(entry.len).context("section len overflows usize")?;
@@ -195,8 +216,8 @@ fn decode_sealed_row(path: &Path, entry: &Entry) -> anyhow::Result<BgwriterCheck
 
     let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
         .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
-    let mut rows = BgwriterCheckpointer::decode(verified)
-        .context("typed decode of section 1_006_001")?
+    let mut rows = T::decode(verified)
+        .context("typed section decode")?
         .into_iter();
     let row = rows.next().context("section decoded to no rows")?;
     anyhow::ensure!(

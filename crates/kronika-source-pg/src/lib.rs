@@ -7,7 +7,9 @@
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
 )]
 
-use kronika_registry::{Ts, bgwriter_checkpointer::BgwriterCheckpointer};
+use kronika_registry::{
+    Ts, bgwriter_checkpointer::BgwriterCheckpointer, reset_metadata::ResetMetadata,
+};
 use tokio_postgres::Client;
 
 /// Prefix a query literal with the kronika marker (SQL-transparency rule): the
@@ -66,6 +68,114 @@ pub async fn collect_bgwriter_checkpointer(
     } else {
         collect_pre17(client).await
     }
+}
+
+/// `pg_stat_statements_info` (which carries `stats_reset`) exists since the
+/// extension version 1.9.
+fn pg_stat_statements_has_info(version: Option<&str>) -> bool {
+    let Some(version) = version else {
+        return false;
+    };
+    let mut parts = version.split('.');
+    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (major, minor) >= (1, 9)
+}
+
+/// Collect type `1_020_001` (reset/restart context), one row per segment.
+///
+/// Two queries: detect the relevant extensions (always safe), then one
+/// consolidated query whose optional `stats_reset` sources are gated by `major`
+/// and extension presence — referencing a view that does not exist errors even
+/// inside a subquery, so the gate decides the query text, not a `CASE`.
+///
+/// The three `StrId` string columns (extension versions, `compute_query_id`) are
+/// left `None` here; they need the dictionary interner, which lands separately.
+///
+/// # Errors
+/// Returns the underlying [`tokio_postgres::Error`] if the server cannot be
+/// queried.
+pub async fn collect_reset_metadata(
+    client: &Client,
+    major: u32,
+) -> Result<ResetMetadata, tokio_postgres::Error> {
+    let ext_rows = client
+        .query(
+            marked!(
+                "SELECT extname, extversion FROM pg_extension \
+                 WHERE extname IN ('pg_stat_statements', 'pg_store_plans')"
+            ),
+            &[],
+        )
+        .await?;
+    let mut pgss_version: Option<String> = None;
+    let mut has_store_plans = false;
+    for row in &ext_rows {
+        let name: String = row.get("extname");
+        if name == "pg_stat_statements" {
+            pgss_version = Some(row.get("extversion"));
+        } else if name == "pg_store_plans" {
+            has_store_plans = true;
+        }
+    }
+
+    // Gate the optional reset sources by version / extension presence.
+    let io = if major >= 16 {
+        "(SELECT (extract(epoch from max(stats_reset)) * 1e6)::bigint FROM pg_stat_io)"
+    } else {
+        "NULL::bigint"
+    };
+    let pgss = if pg_stat_statements_has_info(pgss_version.as_deref()) {
+        "(SELECT (extract(epoch from stats_reset) * 1e6)::bigint FROM pg_stat_statements_info)"
+    } else {
+        "NULL::bigint"
+    };
+    let store_plans = if has_store_plans {
+        "(SELECT (extract(epoch from stats_reset) * 1e6)::bigint FROM pg_store_plans_info)"
+    } else {
+        "NULL::bigint"
+    };
+    let sql = [
+        concat!(
+            "/* pg_kronika:",
+            env!("CARGO_PKG_VERSION"),
+            " crates/kronika-source-pg/src/lib.rs */ "
+        ),
+        // The two non-Option reset columns coalesce to postmaster start time:
+        // if stats were never reset (a fresh cluster), that is when they began.
+        "SELECT (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us, \
+         (extract(epoch from pg_postmaster_start_time()) * 1e6)::bigint AS postmaster_us, \
+         (SELECT (extract(epoch from coalesce(max(stats_reset), pg_postmaster_start_time())) * 1e6)::bigint FROM pg_stat_database) AS db_reset_us, \
+         (SELECT (extract(epoch from stats_reset) * 1e6)::bigint FROM pg_stat_wal) AS wal_reset_us, \
+         (SELECT (extract(epoch from coalesce(stats_reset, pg_postmaster_start_time())) * 1e6)::bigint FROM pg_stat_archiver) AS archiver_reset_us, ",
+        io,
+        " AS io_reset_us, ",
+        pgss,
+        " AS pgss_reset_us, ",
+        store_plans,
+        " AS store_plans_reset_us, \
+         (current_setting('track_io_timing', true) = 'on') AS track_io_timing, \
+         (current_setting('track_wal_io_timing', true) = 'on') AS track_wal_io_timing",
+    ]
+    .concat();
+    let row = client.query_one(sql.as_str(), &[]).await?;
+
+    Ok(ResetMetadata {
+        ts: Ts(row.get("ts_us")),
+        postmaster_start_time: Ts(row.get("postmaster_us")),
+        pg_stat_database_reset_max_at: Ts(row.get("db_reset_us")),
+        pg_stat_statements_reset_at: row.get::<_, Option<i64>>("pgss_reset_us").map(Ts),
+        pg_store_plans_reset_at: row.get::<_, Option<i64>>("store_plans_reset_us").map(Ts),
+        pg_stat_wal_reset_at: row.get::<_, Option<i64>>("wal_reset_us").map(Ts),
+        pg_stat_archiver_reset_at: Ts(row.get("archiver_reset_us")),
+        pg_stat_io_reset_at: row.get::<_, Option<i64>>("io_reset_us").map(Ts),
+        // String columns need the interner; filled in a follow-up.
+        ext_pg_stat_statements_version: None,
+        ext_pg_store_plans_version: None,
+        compute_query_id: None,
+        track_io_timing: row.get("track_io_timing"),
+        track_wal_io_timing: row.get("track_wal_io_timing"),
+    })
 }
 
 /// `PostgreSQL` 16 and earlier: all counters come from `pg_stat_bgwriter`.
