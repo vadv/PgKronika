@@ -30,6 +30,8 @@ pub use activity::{
     to_v3,
 };
 
+pub mod io;
+
 /// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->
 /// `17`.
 ///
