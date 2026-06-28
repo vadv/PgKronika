@@ -377,7 +377,11 @@ fn row_from_pg(row: &tokio_postgres::Row, version: DatabaseVersion) -> DatabaseR
         blk_read_time: row.get("blk_read_time"),
         blk_write_time: row.get("blk_write_time"),
         stats_reset: row.get("stats_reset_us"),
-        checksum_failures: has_checksum.then(|| row.get("checksum_failures")),
+        checksum_failures: if has_checksum {
+            row.get::<_, Option<i64>>("checksum_failures")
+        } else {
+            None
+        },
         checksum_last_failure: if has_checksum {
             row.get("checksum_last_failure_us")
         } else {
