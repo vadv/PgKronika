@@ -317,6 +317,7 @@ mod tests {
             deadlocks: 0,
             blk_read_time: 12.5,
             blk_write_time: 3.0,
+            stats_reset: Some(1_500),
             checksum_failures: Some(0),
             checksum_last_failure: None,
             session_time: Some(1_000.0),

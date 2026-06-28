@@ -1,10 +1,10 @@
 //! `pg_stat_database` collection for types `1_005_001`..`1_005_004`.
 //!
-//! The view is strictly additive across PG 10-18: checksum columns arrived in
-//! PG12, session statistics in PG14, parallel-worker counters in PG18, so the
-//! major version selects both the SQL and the layout. Collection returns raw
-//! owned rows; the caller interns `datname` into the segment dictionary. The
-//! typed layout lives in `kronika-registry` (`PgStatDatabaseV1`..`V4`).
+//! In PG 10-18 the `pg_stat_database` column set only grows: checksum columns
+//! arrive in PG12, session statistics in PG14, and parallel-worker counters in
+//! PG18. The major version selects both the SQL and the layout. Collection
+//! returns owned rows; the caller interns `datname` into the segment dictionary.
+//! The typed layout lives in `kronika-registry` (`PgStatDatabaseV1`..`V4`).
 
 use kronika_registry::pg_stat_database::{
     PgStatDatabaseV1, PgStatDatabaseV2, PgStatDatabaseV3, PgStatDatabaseV4,
@@ -58,7 +58,8 @@ pub const fn database_version(major: u32) -> DatabaseVersion {
 ///
 /// Each query carries the kronika marker and selects only the columns that
 /// version stores. `ts` is one `statement_timestamp()` for the whole snapshot;
-/// `checksum_last_failure` comes back as unix microseconds.
+/// timestamp columns (`stats_reset`, `checksum_last_failure`) come back as unix
+/// microseconds.
 #[must_use]
 pub const fn database_query(version: DatabaseVersion) -> &'static str {
     match version {
@@ -68,6 +69,7 @@ pub const fn database_query(version: DatabaseVersion) -> &'static str {
              tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, \
              conflicts, temp_files, temp_bytes, deadlocks, \
              blk_read_time, blk_write_time, \
+             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
              FROM pg_stat_database"
         ),
@@ -77,6 +79,7 @@ pub const fn database_query(version: DatabaseVersion) -> &'static str {
              tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, \
              conflicts, temp_files, temp_bytes, deadlocks, \
              blk_read_time, blk_write_time, \
+             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
              checksum_failures, \
              (extract(epoch from checksum_last_failure) * 1e6)::int8 AS checksum_last_failure_us, \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
@@ -88,6 +91,7 @@ pub const fn database_query(version: DatabaseVersion) -> &'static str {
              tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, \
              conflicts, temp_files, temp_bytes, deadlocks, \
              blk_read_time, blk_write_time, \
+             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
              checksum_failures, \
              (extract(epoch from checksum_last_failure) * 1e6)::int8 AS checksum_last_failure_us, \
              session_time, active_time, idle_in_transaction_time, \
@@ -101,6 +105,7 @@ pub const fn database_query(version: DatabaseVersion) -> &'static str {
              tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, \
              conflicts, temp_files, temp_bytes, deadlocks, \
              blk_read_time, blk_write_time, \
+             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
              checksum_failures, \
              (extract(epoch from checksum_last_failure) * 1e6)::int8 AS checksum_last_failure_us, \
              session_time, active_time, idle_in_transaction_time, \
@@ -156,6 +161,8 @@ pub struct DatabaseRow {
     pub blk_read_time: f64,
     /// Block write time, ms.
     pub blk_write_time: f64,
+    /// Last statistics reset, unix microseconds; `None` if never.
+    pub stats_reset: Option<i64>,
     /// Checksum failures (V2+).
     pub checksum_failures: Option<i64>,
     /// Last checksum failure, unix microseconds (V2+).
@@ -219,6 +226,7 @@ pub fn to_v4<E>(
         deadlocks: row.deadlocks,
         blk_read_time: row.blk_read_time,
         blk_write_time: row.blk_write_time,
+        stats_reset: row.stats_reset.map(Ts),
         checksum_failures: row.checksum_failures.unwrap_or(0),
         checksum_last_failure: row.checksum_last_failure.map(Ts),
         session_time: row.session_time.unwrap_or(0.0),
@@ -261,6 +269,7 @@ pub fn to_v3<E>(
         deadlocks: row.deadlocks,
         blk_read_time: row.blk_read_time,
         blk_write_time: row.blk_write_time,
+        stats_reset: row.stats_reset.map(Ts),
         checksum_failures: row.checksum_failures.unwrap_or(0),
         checksum_last_failure: row.checksum_last_failure.map(Ts),
         session_time: row.session_time.unwrap_or(0.0),
@@ -301,6 +310,7 @@ pub fn to_v2<E>(
         deadlocks: row.deadlocks,
         blk_read_time: row.blk_read_time,
         blk_write_time: row.blk_write_time,
+        stats_reset: row.stats_reset.map(Ts),
         checksum_failures: row.checksum_failures.unwrap_or(0),
         checksum_last_failure: row.checksum_last_failure.map(Ts),
     })
@@ -334,6 +344,7 @@ pub fn to_v1<E>(
         deadlocks: row.deadlocks,
         blk_read_time: row.blk_read_time,
         blk_write_time: row.blk_write_time,
+        stats_reset: row.stats_reset.map(Ts),
     })
 }
 
@@ -365,6 +376,7 @@ fn row_from_pg(row: &tokio_postgres::Row, version: DatabaseVersion) -> DatabaseR
         deadlocks: row.get("deadlocks"),
         blk_read_time: row.get("blk_read_time"),
         blk_write_time: row.get("blk_write_time"),
+        stats_reset: row.get("stats_reset_us"),
         checksum_failures: has_checksum.then(|| row.get("checksum_failures")),
         checksum_last_failure: if has_checksum {
             row.get("checksum_last_failure_us")
@@ -442,6 +454,7 @@ mod tests {
             deadlocks: 0,
             blk_read_time: 12.5,
             blk_write_time: 3.0,
+            stats_reset: Some(1_500),
             checksum_failures: Some(0),
             checksum_last_failure: None,
             session_time: Some(1_000.0),

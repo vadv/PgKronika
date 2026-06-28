@@ -1,9 +1,9 @@
 //! Type `1_005_001`..`1_005_004`: `pg_stat_database`.
 //!
-//! Per-database counters. The view is strictly additive across PG 10-18:
-//! `checksum_failures`/`checksum_last_failure` arrived in PG12, session
-//! statistics in PG14, and the parallel-worker counters in PG18, so the source
-//! maps to four layout versions.
+//! Per-database counters. In PG 10-18 the column set only grows:
+//! `checksum_failures`/`checksum_last_failure` arrive in PG12, session
+//! statistics in PG14, and the parallel-worker counters in PG18. The source
+//! maps those catalog layouts to four layout versions.
 
 use crate::{Section, StrId, Ts};
 
@@ -79,6 +79,9 @@ pub struct PgStatDatabaseV4 {
     /// Time spent writing blocks, ms; zero without `track_io_timing`.
     #[column(c)]
     pub blk_write_time: f64,
+    /// Time of the last statistics reset for this database; `None` if never.
+    #[column(g)]
+    pub stats_reset: Option<Ts>,
     /// Data-page checksum failures.
     #[column(c)]
     pub checksum_failures: i64,
@@ -182,6 +185,9 @@ pub struct PgStatDatabaseV3 {
     /// Time spent writing blocks, ms; zero without `track_io_timing`.
     #[column(c)]
     pub blk_write_time: f64,
+    /// Time of the last statistics reset for this database; `None` if never.
+    #[column(g)]
+    pub stats_reset: Option<Ts>,
     /// Data-page checksum failures.
     #[column(c)]
     pub checksum_failures: i64,
@@ -279,6 +285,9 @@ pub struct PgStatDatabaseV2 {
     /// Time spent writing blocks, ms; zero without `track_io_timing`.
     #[column(c)]
     pub blk_write_time: f64,
+    /// Time of the last statistics reset for this database; `None` if never.
+    #[column(g)]
+    pub stats_reset: Option<Ts>,
     /// Data-page checksum failures.
     #[column(c)]
     pub checksum_failures: i64,
@@ -355,6 +364,9 @@ pub struct PgStatDatabaseV1 {
     /// Time spent writing blocks, ms; zero without `track_io_timing`.
     #[column(c)]
     pub blk_write_time: f64,
+    /// Time of the last statistics reset for this database; `None` if never.
+    #[column(g)]
+    pub stats_reset: Option<Ts>,
 }
 
 #[cfg(test)]
@@ -387,6 +399,7 @@ mod tests {
             deadlocks: 0,
             blk_read_time: 12.5,
             blk_write_time: 3.0,
+            stats_reset: Some(Ts(ts - 5)),
             checksum_failures: 0,
             checksum_last_failure: None,
             session_time: 1_000.0,
@@ -410,7 +423,7 @@ mod tests {
     fn v4_contract_shape_matches_the_registry() {
         let c = PgStatDatabaseV4::CONTRACT;
         assert_eq!(c.type_id.get(), 1_005_004);
-        assert_eq!(c.columns.len(), 30);
+        assert_eq!(c.columns.len(), 31);
         assert_eq!(c.sort_key, ["datid", "ts"]);
         assert_eq!(c.column("ts").map(|col| col.nullable), Some(false));
         assert_eq!(c.column("datid").map(|col| col.nullable), Some(false));
@@ -468,6 +481,7 @@ mod tests {
             deadlocks: 0,
             blk_read_time: 12.5,
             blk_write_time: 3.0,
+            stats_reset: Some(Ts(ts - 5)),
             checksum_failures: 0,
             checksum_last_failure: Some(Ts(ts - 1)),
             session_time: 1_000.0,
@@ -484,7 +498,7 @@ mod tests {
     fn v3_contract_has_session_without_parallel() {
         let c = PgStatDatabaseV3::CONTRACT;
         assert_eq!(c.type_id.get(), 1_005_003);
-        assert_eq!(c.columns.len(), 28);
+        assert_eq!(c.columns.len(), 29);
         assert!(c.column("session_time").is_some());
         assert!(c.column("parallel_workers_launched").is_none());
         assert_eq!(lint(&[c]), Ok(()));
@@ -516,6 +530,7 @@ mod tests {
             deadlocks: 0,
             blk_read_time: 12.5,
             blk_write_time: 3.0,
+            stats_reset: Some(Ts(ts - 5)),
             checksum_failures: 0,
             checksum_last_failure: None,
         }
@@ -525,7 +540,7 @@ mod tests {
     fn v2_contract_has_checksum_without_session() {
         let c = PgStatDatabaseV2::CONTRACT;
         assert_eq!(c.type_id.get(), 1_005_002);
-        assert_eq!(c.columns.len(), 21);
+        assert_eq!(c.columns.len(), 22);
         assert!(c.column("checksum_failures").is_some());
         assert!(c.column("session_time").is_none());
         assert_eq!(lint(&[c]), Ok(()));
@@ -557,6 +572,7 @@ mod tests {
             deadlocks: 0,
             blk_read_time: 12.5,
             blk_write_time: 3.0,
+            stats_reset: Some(Ts(ts - 5)),
         }
     }
 
@@ -564,7 +580,7 @@ mod tests {
     fn v1_contract_is_the_base_layout() {
         let c = PgStatDatabaseV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_005_001);
-        assert_eq!(c.columns.len(), 19);
+        assert_eq!(c.columns.len(), 20);
         assert!(c.column("checksum_failures").is_none());
         assert!(c.column("session_time").is_none());
         assert_eq!(lint(&[c]), Ok(()));

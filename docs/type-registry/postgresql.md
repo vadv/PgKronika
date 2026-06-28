@@ -202,8 +202,8 @@ is_baseline                     bool  L
 представление добавляет агрегатную строку `datid = 0` (shared-объекты кластера)
 с `datname = NULL`. `ts` — единое серверное время снимка
 (`statement_timestamp()`). `numbackends` — мгновенное число коннектов (gauge).
-`stats_reset` здесь не дублируется: время сброса хранится в `reset_metadata`
-(`1_020_001`).
+`stats_reset` — время последнего сброса статистики этой БД (`NULL`, если не
+сбрасывалась).
 `blk_read_time` / `blk_write_time` равны нулю без `track_io_timing`.
 
 ### Версии раскладки
@@ -242,6 +242,7 @@ temp_bytes                  i64   C
 deadlocks                   i64   C
 blk_read_time               f64   C   // 0 без track_io_timing
 blk_write_time              f64   C
+stats_reset                 ts?   G   // время сброса статистики БД; NULL без сброса
 checksum_failures           i64   C   // PG12+
 checksum_last_failure       ts?   G   // PG12+; NULL, если ошибок не было
 session_time                f64   C   // PG14+
@@ -256,7 +257,7 @@ parallel_workers_launched   i64   C
 ```
 
 `1_005_003` — без двух parallel-колонок. `1_005_002` — без parallel и без
-session-статистики. `1_005_001` заканчивается на `blk_write_time`.
+session-статистики. `1_005_001` заканчивается на `stats_reset`.
 
 ## `1_006_001` `pg_stat_bgwriter` + `pg_stat_checkpointer`
 
