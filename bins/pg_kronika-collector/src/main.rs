@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use kronika_source_pg::collect_bgwriter_checkpointer;
+use kronika_source_pg::{collect_bgwriter_checkpointer, server_major};
 use kronika_writer::{Journal, JournalConfig, SectionBuffers, seal};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
@@ -54,6 +54,9 @@ async fn main() -> Result<()> {
     let (client, connection) = tokio_postgres::connect(&config.dsn, tokio_postgres::NoTls)
         .await
         .context("connect to PostgreSQL")?;
+    // The server reports its version in the handshake; read it once, no query.
+    let major = server_major(connection.parameter("server_version"))
+        .context("server did not report a parseable server_version")?;
     // tokio-postgres drives I/O through this future.
     tokio::spawn(connection);
 
@@ -74,7 +77,7 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             Some(()) = sigusr2.recv() => {
-                match snapshot_and_seal(&client, &mut journal, &config.out_dir, config.source_id)
+                match snapshot_and_seal(&client, major, &mut journal, &config.out_dir, config.source_id)
                     .await
                 {
                     Ok(dest) => announce(&format!("sealed {}", dest.display())),
@@ -90,11 +93,12 @@ async fn main() -> Result<()> {
 
 async fn snapshot_and_seal(
     client: &Client,
+    major: u32,
     journal: &mut Journal,
     out_dir: &Path,
     source_id: u64,
 ) -> Result<PathBuf> {
-    let row = collect_bgwriter_checkpointer(client)
+    let row = collect_bgwriter_checkpointer(client, major)
         .await
         .context("collect type 1_006_001")?;
     let ts = row.ts;

@@ -122,8 +122,12 @@ impl Cluster {
             tokio_postgres::connect(&self.conn_string(), tokio_postgres::NoTls)
                 .await
                 .context("connect")?;
+        // Read the server version from the handshake before the connection moves
+        // into its driver task.
+        let major = kronika_source_pg::server_major(connection.parameter("server_version"));
         Ok(Conn {
             client,
+            major,
             driver: tokio::spawn(connection),
         })
     }
@@ -167,6 +171,8 @@ impl Cluster {
 
 pub(crate) struct Conn {
     client: tokio_postgres::Client,
+    /// Server major version from the handshake, e.g. `Some(17)`.
+    major: Option<u32>,
     /// Abort on drop; otherwise the protocol driver keeps running.
     driver: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
 }
@@ -174,6 +180,10 @@ pub(crate) struct Conn {
 impl Conn {
     pub(crate) const fn client(&self) -> &tokio_postgres::Client {
         &self.client
+    }
+
+    pub(crate) const fn major(&self) -> Option<u32> {
+        self.major
     }
 }
 
