@@ -1,6 +1,6 @@
 [package]
 name = "kronika-source-pg"
-description = "pgKronika internal crate"
+description = "PostgreSQL collectors: query stat views into typed registry rows"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -9,6 +9,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-registry = { path = "../kronika-registry" }
+tokio-postgres = "0.7"
 
 [lints]
 workspace = true

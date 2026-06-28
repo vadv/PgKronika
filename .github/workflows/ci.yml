@@ -8,7 +8,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  NIX_BUILD_IMAGE: docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894
 
 jobs:
   lint:
@@ -27,6 +26,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p xtask -- check-deps
+      - run: bash scripts/test-bdd-image.sh
 
   test:
     name: test
@@ -55,24 +55,82 @@ jobs:
           name: coverage
           path: coverage.json
 
-  # Build the BDD image with Nix once. Same-repo runs push a content-hash tag to
-  # GHCR; fork PRs upload the tarball as a short-lived artifact.
-  # Only Docker is used; Nix runs inside the nixos/nix build container.
-  bdd-image:
-    name: bdd image
+  bdd-meta:
+    name: bdd metadata
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     outputs:
+      deps_hash: ${{ steps.meta.outputs.deps_hash }}
+      image_hash: ${{ steps.meta.outputs.image_hash }}
+      platform_slug: ${{ steps.meta.outputs.platform_slug }}
+      builder: ${{ steps.meta.outputs.builder }}
+      builder_seed: ${{ steps.meta.outputs.builder_seed }}
       image: ${{ steps.meta.outputs.image }}
       artifact: ${{ steps.meta.outputs.artifact }}
       transport: ${{ steps.meta.outputs.transport }}
+      can_update_seed: ${{ steps.meta.outputs.can_update_seed }}
     env:
       BDD_IMAGE_CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      BDD_BUILDER_CAN_UPDATE_SEED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      BDD_PLATFORM: linux/amd64
     steps:
       - uses: actions/checkout@v4
+      - name: Compute image refs
+        id: meta
+        run: |
+          deps_hash=$(./scripts/bdd-image.sh deps-key)
+          image_hash=$(./scripts/bdd-image.sh image-key)
+          platform_slug=$(echo "${BDD_PLATFORM}" | tr '/_' '-')
+          repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "deps_hash=${deps_hash:0:16}"
+            echo "image_hash=${image_hash:0:16}"
+            echo "platform_slug=${platform_slug}"
+            echo "builder=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-${deps_hash:0:16}"
+            echo "builder_seed=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-seed-v1"
+            echo "image=ghcr.io/${repo}/pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}"
+            echo "artifact=pgkronika-bdd-${platform_slug}-${image_hash:0:16}"
+            echo "can_update_seed=${BDD_BUILDER_CAN_UPDATE_SEED}"
+            if [ "${BDD_IMAGE_CAN_PUSH}" = "true" ]; then
+              echo "transport=registry"
+            else
+              echo "transport=artifact"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+  bdd-builder:
+    name: bdd builder
+    needs: bdd-meta
+    runs-on: ubuntu-latest
+    concurrency:
+      group: bdd-builder-${{ needs.bdd-meta.outputs.platform_slug }}-${{ needs.bdd-meta.outputs.deps_hash }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BDD_PLATFORM: linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        if: needs.bdd-meta.outputs.transport == 'registry'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check final image
+        id: final_image
+        if: needs.bdd-meta.outputs.transport == 'registry'
+        run: |
+          image="${{ needs.bdd-meta.outputs.image }}"
+          if docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing $image"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Free disk space for the Nix build
+        if: needs.bdd-meta.outputs.transport == 'registry' && steps.final_image.outputs.exists != 'true'
         run: |
           df -h
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/share/boost /opt/ghc
@@ -81,54 +139,95 @@ jobs:
           fi
           docker system prune -af || true
           df -h
-      - name: Compute content-hash image ref
-        id: meta
+      - uses: docker/setup-buildx-action@v3
+        if: needs.bdd-meta.outputs.transport == 'registry' && steps.final_image.outputs.exists != 'true'
+      - name: Build BDD builder
+        if: needs.bdd-meta.outputs.transport == 'registry' && steps.final_image.outputs.exists != 'true'
         run: |
-          hash="${{ hashFiles('flake.lock', 'flake.nix', 'rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'bins/*/Cargo.toml', 'xtask/Cargo.toml', 'crates/kronika-bdd/src/**', 'crates/kronika-bdd/features/**') }}"
-          repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
-          echo "image=ghcr.io/${repo}/pgkronika-bdd:sha-${hash:0:16}" >> "$GITHUB_OUTPUT"
-          echo "artifact=pgkronika-bdd-${hash:0:16}" >> "$GITHUB_OUTPUT"
-          if [ "${BDD_IMAGE_CAN_PUSH}" = "true" ]; then
-            echo "transport=registry" >> "$GITHUB_OUTPUT"
-          else
-            echo "transport=artifact" >> "$GITHUB_OUTPUT"
+          export BDD_BUILDER_IMAGE="${{ needs.bdd-meta.outputs.builder }}"
+          export BDD_BUILDER_SEED_IMAGE="${{ needs.bdd-meta.outputs.builder_seed }}"
+          export BDD_BUILDER_PULL=1
+          if [ "${{ needs.bdd-meta.outputs.transport }}" = "registry" ]; then
+            export BDD_BUILDER_PUSH=1
           fi
+          if [ "${{ needs.bdd-meta.outputs.can_update_seed }}" = "true" ]; then
+            export BDD_BUILDER_UPDATE_SEED=1
+          fi
+          ./scripts/bdd-image.sh build-builder
+      - name: Skip registry builder for artifact transport
+        if: needs.bdd-meta.outputs.transport == 'artifact'
+        run: echo "Artifact transport builds its local builder in the bdd-image job."
+
+  bdd-image:
+    name: bdd image
+    needs: [bdd-meta, bdd-builder]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ needs.bdd-meta.outputs.image }}
+      artifact: ${{ needs.bdd-meta.outputs.artifact }}
+      transport: ${{ needs.bdd-meta.outputs.transport }}
+    env:
+      BDD_PLATFORM: linux/amd64
+    steps:
+      - uses: actions/checkout@v4
       - name: Log in to GHCR
-        if: steps.meta.outputs.transport == 'registry'
+        if: needs.bdd-meta.outputs.transport == 'registry'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build image
+      - name: Check final image
+        id: final_image
         run: |
-          image="${{ steps.meta.outputs.image }}"
-          if [ "${{ steps.meta.outputs.transport }}" = "registry" ] && docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "Image $image already exists; skipping build."
-            exit 0
+          image="${{ needs.bdd-meta.outputs.image }}"
+          if [ "${{ needs.bdd-meta.outputs.transport }}" = "registry" ] && docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing $image"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-          # Drop .git so Nix treats the checkout as a plain path: the runner
-          # owns the checkout but Nix runs as root in the container, and
-          # libgit2 refuses a repository it sees as "dubiously owned".
-          docker run --rm -v "$PWD":/work \
-            -e NIX_CONFIG="experimental-features = nix-command flakes" \
-            "$NIX_BUILD_IMAGE" \
-            sh -c 'rm -rf /work/.git && cd /work && nix build .#image --out-link /tmp/img && /tmp/img' > image.tar
-          docker load -i image.tar
-          if [ "${{ steps.meta.outputs.transport }}" = "registry" ]; then
-            docker tag pgkronika-bdd:latest "$image"
-            docker push "$image"
+      - name: Free disk space for the Nix build
+        if: steps.final_image.outputs.exists != 'true'
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/share/boost /opt/ghc
+          if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
+            sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           fi
+          docker system prune -af || true
+          df -h
+      - uses: docker/setup-buildx-action@v3
+        if: needs.bdd-meta.outputs.transport == 'artifact' && steps.final_image.outputs.exists != 'true'
+      - name: Build local BDD builder
+        if: needs.bdd-meta.outputs.transport == 'artifact' && steps.final_image.outputs.exists != 'true'
+        run: |
+          export BDD_BUILDER_IMAGE="${{ needs.bdd-meta.outputs.builder }}"
+          export BDD_BUILDER_SEED_IMAGE="${{ needs.bdd-meta.outputs.builder_seed }}"
+          export BDD_BUILDER_PULL=1
+          ./scripts/bdd-image.sh build-builder
+      - name: Build image
+        if: steps.final_image.outputs.exists != 'true'
+        run: |
+          export BDD_BUILDER_IMAGE="${{ needs.bdd-meta.outputs.builder }}"
+          export BDD_RUNTIME_IMAGE="${{ needs.bdd-meta.outputs.image }}"
+          export BDD_OUTPUT_TAR=image.tar
+          if [ "${{ needs.bdd-meta.outputs.transport }}" = "registry" ]; then
+            export BDD_RUNTIME_PUSH=1
+          fi
+          ./scripts/bdd-image.sh build-runtime
       - name: Upload BDD image artifact
-        if: steps.meta.outputs.transport == 'artifact'
+        if: needs.bdd-meta.outputs.transport == 'artifact' && steps.final_image.outputs.exists != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.meta.outputs.artifact }}
+          name: ${{ needs.bdd-meta.outputs.artifact }}
           path: image.tar
           retention-days: 1
 
-  # The "launch on a new machine" path: pull or load the image and run it. The
-  # image boots the whole PostgreSQL matrix in parallel internally.
+  # Run the built image on a separate runner.
   bdd-matrix:
     name: bdd matrix
     needs: bdd-image

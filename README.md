@@ -70,9 +70,9 @@ internal crates. For example, storage-backend code must not become reachable
 from the collector, and PostgreSQL source code must not become reachable from
 the web process.
 
-The Docker-only PostgreSQL BDD matrix can be run locally too. See
-[crates/kronika-bdd/README.md](crates/kronika-bdd/README.md) for the quick
-local test, full Docker run, full local Nix run, and CI flow.
+The PostgreSQL BDD matrix can run locally, in GitHub Actions, and in GitLab CI.
+See [crates/kronika-bdd/README.md](crates/kronika-bdd/README.md) for the quick
+local test, Docker/Buildx flow, local Nix flow, and CI examples.
 
 The implementation is moving crate by crate: format primitives, writer state,
 type registry, collectors, and then serving binaries.
