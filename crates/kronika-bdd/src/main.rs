@@ -168,13 +168,13 @@ fn assert_sealed_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let row = decode_sealed_row(path, entry)
         .with_context(|| format!("postgres {major}: read back section 1_006_001"))?;
 
-    anyhow::ensure!(
-        row.ts.0 > 0 && row.ts.0 == catalog.min_ts && row.ts.0 == catalog.max_ts,
-        "postgres {major}: row ts {} disagrees with segment range {}..={}",
+    ensure_ts_in_segment_range(
+        major,
+        "section 1_006_001",
         row.ts.0,
         catalog.min_ts,
-        catalog.max_ts
-    );
+        catalog.max_ts,
+    )?;
     anyhow::ensure!(
         row.bgwriter_stats_reset.0 > 0 && row.bgwriter_stats_reset.0 <= row.ts.0,
         "postgres {major}: bgwriter_stats_reset {} not in (0, {}]",
@@ -251,12 +251,13 @@ fn assert_activity_section(major: u32, path: &Path) -> anyhow::Result<()> {
         rows.iter().all(|row| row.ts.0 == ts),
         "postgres {major}: snapshot rows carry differing ts"
     );
-    anyhow::ensure!(
-        ts >= catalog.min_ts && ts <= catalog.max_ts,
-        "postgres {major}: activity ts {ts} outside segment range {}..={}",
+    ensure_ts_in_segment_range(
+        major,
+        "section 1_001_003",
+        ts,
         catalog.min_ts,
-        catalog.max_ts
-    );
+        catalog.max_ts,
+    )?;
 
     let dict = segment
         .dictionary()
@@ -278,6 +279,20 @@ fn assert_activity_section(major: u32, path: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
         saw_collector,
         "postgres {major}: the collector's own backend was not found in the snapshot"
+    );
+    Ok(())
+}
+
+fn ensure_ts_in_segment_range(
+    major: u32,
+    section: &str,
+    ts: i64,
+    min_ts: i64,
+    max_ts: i64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        ts > 0 && ts >= min_ts && ts <= max_ts,
+        "postgres {major}: {section} ts {ts} outside segment range {min_ts}..={max_ts}"
     );
     Ok(())
 }
