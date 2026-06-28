@@ -118,10 +118,16 @@ impl Cluster {
     }
 
     pub(crate) async fn connect(&self) -> Result<Conn> {
-        let (client, connection) =
-            tokio_postgres::connect(&self.conn_string(), tokio_postgres::NoTls)
-                .await
-                .context("connect")?;
+        let mut pg_config: tokio_postgres::Config = self
+            .conn_string()
+            .parse()
+            .context("parse connection string")?;
+        // Name us in pg_stat_activity (SQL-transparency rule).
+        pg_config.application_name(concat!("pg_kronika-bdd/", env!("CARGO_PKG_VERSION")));
+        let (client, connection) = pg_config
+            .connect(tokio_postgres::NoTls)
+            .await
+            .context("connect")?;
         // Read the server version from the handshake before the connection moves
         // into its driver task.
         let major = kronika_source_pg::server_major(connection.parameter("server_version"));
@@ -137,7 +143,15 @@ impl Cluster {
         let conn = self.connect().await?;
         let row = conn
             .client()
-            .query_one("SHOW server_version", &[])
+            .query_one(
+                concat!(
+                    "/* pg_kronika:",
+                    env!("CARGO_PKG_VERSION"),
+                    " crates/kronika-bdd/src/cluster.rs */ ",
+                    "SHOW server_version"
+                ),
+                &[],
+            )
             .await
             .context("query server_version")?;
         Ok(row.get(0))

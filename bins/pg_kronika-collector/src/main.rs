@@ -51,7 +51,14 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
 
-    let (client, connection) = tokio_postgres::connect(&config.dsn, tokio_postgres::NoTls)
+    let mut pg_config: tokio_postgres::Config = config
+        .dsn
+        .parse()
+        .context("parse KRONIKA_PG_DSN as a connection string")?;
+    // Name us in pg_stat_activity (SQL-transparency rule).
+    pg_config.application_name(concat!("pg_kronika-collector/", env!("CARGO_PKG_VERSION")));
+    let (client, connection) = pg_config
+        .connect(tokio_postgres::NoTls)
         .await
         .context("connect to PostgreSQL")?;
     // The server reports its version in the handshake; read it once, no query.

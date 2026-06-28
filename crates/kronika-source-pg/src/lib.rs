@@ -10,6 +10,20 @@
 use kronika_registry::{Ts, bgwriter_checkpointer::BgwriterCheckpointer};
 use tokio_postgres::Client;
 
+/// Prefix a query literal with the kronika marker (SQL-transparency rule): the
+/// statement then shows in `pg_stat_activity` and the server log as kronika, its
+/// version, and this source file.
+macro_rules! marked {
+    ($sql:literal) => {
+        concat!(
+            "/* pg_kronika:",
+            env!("CARGO_PKG_VERSION"),
+            " crates/kronika-source-pg/src/lib.rs */ ",
+            $sql,
+        )
+    };
+}
+
 /// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->
 /// `17`.
 ///
@@ -58,12 +72,14 @@ pub async fn collect_bgwriter_checkpointer(
 async fn collect_pre17(client: &Client) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
     let row = client
         .query_one(
-            "SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, \
-             checkpoint_sync_time, buffers_checkpoint, buffers_clean, maxwritten_clean, \
-             buffers_backend, buffers_backend_fsync, buffers_alloc, \
-             (extract(epoch from stats_reset) * 1e6)::bigint AS stats_reset_us, \
-             (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us \
-             FROM pg_stat_bgwriter",
+            marked!(
+                "SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, \
+                 checkpoint_sync_time, buffers_checkpoint, buffers_clean, maxwritten_clean, \
+                 buffers_backend, buffers_backend_fsync, buffers_alloc, \
+                 (extract(epoch from stats_reset) * 1e6)::bigint AS stats_reset_us, \
+                 (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us \
+                 FROM pg_stat_bgwriter"
+            ),
             &[],
         )
         .await?;
@@ -91,13 +107,15 @@ async fn collect_pre17(client: &Client) -> Result<BgwriterCheckpointer, tokio_po
 async fn collect_pg17(client: &Client) -> Result<BgwriterCheckpointer, tokio_postgres::Error> {
     let row = client
         .query_one(
-            "SELECT c.num_timed, c.num_requested, c.write_time, c.sync_time, \
-             c.buffers_written, c.restartpoints_timed, c.restartpoints_req, \
-             c.restartpoints_done, b.buffers_clean, b.maxwritten_clean, b.buffers_alloc, \
-             (extract(epoch from b.stats_reset) * 1e6)::bigint AS bgwriter_reset_us, \
-             (extract(epoch from c.stats_reset) * 1e6)::bigint AS checkpointer_reset_us, \
-             (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us \
-             FROM pg_stat_bgwriter b, pg_stat_checkpointer c",
+            marked!(
+                "SELECT c.num_timed, c.num_requested, c.write_time, c.sync_time, \
+                 c.buffers_written, c.restartpoints_timed, c.restartpoints_req, \
+                 c.restartpoints_done, b.buffers_clean, b.maxwritten_clean, b.buffers_alloc, \
+                 (extract(epoch from b.stats_reset) * 1e6)::bigint AS bgwriter_reset_us, \
+                 (extract(epoch from c.stats_reset) * 1e6)::bigint AS checkpointer_reset_us, \
+                 (extract(epoch from clock_timestamp()) * 1e6)::bigint AS ts_us \
+                 FROM pg_stat_bgwriter b, pg_stat_checkpointer c"
+            ),
             &[],
         )
         .await?;
