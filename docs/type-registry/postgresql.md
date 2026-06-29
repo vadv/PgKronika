@@ -205,13 +205,13 @@ is_baseline                     bool  L
 сбрасывалась).
 `blk_read_time` / `blk_write_time` равны нулю без `track_io_timing`.
 
-Каждая строка обогащается данными из каталога `pg_database` (`LEFT JOIN` по
-`oid = datid`): возрасты wraparound `frozen_xid_age` / `min_mxid_age`, размер
-базы `database_size_bytes`, лимит коннектов `datconnlimit` и флаги
-`datallowconn` / `datistemplate`. У строки shared-объектов (`datid = 0`) нет
-записи в `pg_database`, поэтому эти колонки `NULL`. Headroom до аварийного
-autovacuum и насыщение лимита коннектов (`numbackends / datconnlimit`) —
-производные и считаются на чтении.
+Дополнительные поля берутся из `pg_database` через `LEFT JOIN` по `oid = datid`:
+возрасты wraparound `frozen_xid_age` / `min_mxid_age`, размер базы
+`database_size_bytes`, лимит коннектов `datconnlimit` и флаги `datallowconn` /
+`datistemplate`. Для строки shared-объектов (`datid = 0`) соединение не находит
+строку `pg_database`, поэтому эти колонки `NULL`. Headroom до аварийного
+autovacuum и насыщение лимита коннектов (`numbackends / datconnlimit`) считаются
+на чтении.
 
 ### Версии раскладки
 
@@ -224,9 +224,9 @@ autovacuum и насыщение лимита коннектов (`numbackends /
 | `1_005_003` | 14, 15, 16, 17 | `+` session-статистика (7 колонок) |
 | `1_005_004` | 18 | `+ parallel_workers_to_launch`, `+ parallel_workers_launched` |
 
-Обогащение из `pg_database` (6 колонок: `frozen_xid_age`, `min_mxid_age`,
+Шесть `pg_database`-полей (`frozen_xid_age`, `min_mxid_age`,
 `database_size_bytes`, `datconnlimit`, `datallowconn`, `datistemplate`)
-одинаково во всех раскладках — оно не зависит от мажорной версии.
+присутствуют во всех раскладках и не зависят от мажорной версии.
 
 BDD покрывает раскладки `1_005_003` и `1_005_004`. `1_005_001` / `1_005_002`
 покрыты golden-кодеками.
@@ -273,10 +273,9 @@ parallel_workers_to_launch  i64   C   // PG18+
 parallel_workers_launched   i64   C
 ```
 
-Раскладки различаются только версионным хвостом после обогащения: `1_005_003`
-— без двух parallel-колонок, `1_005_002` — без parallel и session-статистики,
-`1_005_001` — только базовые счётчики и обогащение. Шесть `pg_database`-колонок
-присутствуют во всех четырёх.
+Версионные отличия остаются в хвосте раскладки: `1_005_003` — без двух
+parallel-колонок, `1_005_002` — без parallel и session-статистики,
+`1_005_001` — только базовые счётчики и `pg_database`-поля.
 
 ## `1_006_001` `pg_stat_bgwriter` + `pg_stat_checkpointer`
 

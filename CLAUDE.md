@@ -65,9 +65,9 @@ alongside bugs, spec, tests, and memory bounds.
 
 ## Standing Rule: Multi-database collection
 
-A collector run must cover **every** database in the instance, not only the one
-named in the DSN. Classifying a metric's source view on this axis is the first
-decision when adding any metric — not optional, not deferrable.
+Metric design must state whether the source is instance-wide or database-local.
+Collector snapshots should cover every database in the instance unless
+configuration explicitly limits collection to one database.
 
 - **Instance-wide** — one connection returns rows for the whole cluster.
   `pg_stat_database`, `pg_stat_activity`, `pg_database` (wraparound), `pg_locks`,
@@ -77,13 +77,11 @@ decision when adding any metric — not optional, not deferrable.
   Collect once on the main connection; where the view names the owning database,
   label the row with `datname`.
 - **Database-local** — the view shows only objects of the connected database, and
-  the same `relname` lives in other databases invisibly. `pg_stat_user_tables` /
+  the same `relname` can exist in other databases. `pg_stat_user_tables` /
   `all_tables`, `pg_stat_user_indexes`, `pg_statio_user_*`,
   `pg_stat_user_functions`, bloat (`pg_class`/`pg_namespace`), object sizes.
-  Collect by connecting to each database; **every row carries a non-nullable
-  `datname: StrId`** taken from the connection. A database-local metric run on a
-  single connection silently drops every database but the DSN's — a correctness
-  bug, not a coverage gap.
+  Collect by connecting to each database; every row carries a non-nullable
+  `datname: StrId` taken from the connection.
 
 **Which databases, and how.** Keep a session open to every database that accepts
 connections — `pg_database WHERE datallowconn AND NOT datistemplate` — minus an
@@ -119,10 +117,10 @@ StrId` to the schema and a per-database collection loop; instance-wide does not.
 1. `docs/type-registry/postgresql.md` — summary table row(s) + the type section.
    A new version (`VVV`) is for a *PostgreSQL catalog* difference across majors
    (monotonic column adds → separate versions, **not** one type with `Option`
-   version columns; that is the registry discipline). An enrichment column that is
-   identical on every major goes into the existing layouts in place — pre-release,
-   no `VVV` bump, since no stored segments must stay readable. Layouts freeze at
-   the first release.
+   version columns; that is the registry discipline). Before the first release,
+   an enrichment column that is identical on every supported major can be added
+   to existing layouts without a new `VVV`. After the first release, layout
+   changes require a new version.
 2. `kronika-registry/src/codec/<name>.rs` — one `#[derive(Section)]` struct per
    version. `#[section(id=, name=, semantics=snapshot_full, sort_key("ts",...))]`,
    fields `#[column(t|c|g|l)]`. `t` = `Ts`, non-null, must be named `ts` (linter).

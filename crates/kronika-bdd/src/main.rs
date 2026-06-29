@@ -320,7 +320,9 @@ fn decode_activity_rows(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStat
     PgStatActivityV3::decode(verified).context("typed decode of section 1_001_003")
 }
 
-#[then("each matrix cluster seals pg_stat_database rows with dictionary-backed names")]
+#[then(
+    "each matrix cluster seals pg_stat_database rows with catalog fields and dictionary-backed names"
+)]
 async fn every_version_seals_database(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
     for db in &world.clusters {
@@ -332,8 +334,8 @@ async fn every_version_seals_database(world: &mut BddWorld) -> anyhow::Result<()
 }
 
 /// Decode the sealed `pg_stat_database` section for the selected layout, then
-/// check one snapshot timestamp, the shared row, and dictionary-backed database
-/// names.
+/// check one snapshot timestamp, the shared row, dictionary-backed database
+/// names, and `pg_database` catalog fields.
 fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
@@ -402,7 +404,7 @@ fn decode_db_section<T: Section>(
     T::decode(verified).context("typed decode of the pg_stat_database section")
 }
 
-/// Shared invariants for the decoded `(datid, datname, ts)` projection.
+/// Shared invariants for the decoded database rows.
 fn check_database_rows(
     major: u32,
     dict: &Dictionary,
