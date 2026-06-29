@@ -214,20 +214,34 @@ primary, — желательный режим).
 
 ## 7. Конфигурация (env)
 
-| Переменная | Дефолт | Назначение |
-|---|---|---|
-| `KRONIKA_PG_DSN` | — | базовая строка подключения |
-| `KRONIKA_PG_EXCLUDE_DATABASES` | пусто | список баз через `;`, исключить из обхода |
-| `KRONIKA_PG_POOL_REFRESH_SECS` | `600` | интервал refresh пула |
-| `KRONIKA_PG_STATEMENT_TIMEOUT_MS` | `15000` | лёгкие запросы (фикс) |
-| `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` | `60000` | потолок адаптивного таймаута тяжёлых запросов |
-| `KRONIKA_PG_LOCK_TIMEOUT_MS` | `1000` | ожидание блокировки (быстро отступить от чужого DDL) |
-| `KRONIKA_PG_SIZE_INTERVAL_SECS` | `600` | частота редкого size-цикла |
-| `KRONIKA_PG_MAX_TABLES` | `500` | top-N per база для класса B |
+| Переменная | Дефолт | Назначение | Статус |
+|---|---|---|---|
+| `KRONIKA_PG_DSN` | — | базовая строка подключения (key=value или URI) | есть |
+| `KRONIKA_OUT_DIR` | — | каталог для запечатанных сегментов | есть |
+| `KRONIKA_SOURCE_ID` | `0` | идентификатор источника в каждом сегменте (см. ниже) | есть |
+| `KRONIKA_PG_STATEMENT_TIMEOUT_MS` | `15000` | таймаут лёгких запросов | есть |
+| `KRONIKA_PG_LOCK_TIMEOUT_MS` | `1000` | ожидание блокировки (валидируется `< statement_timeout`) | есть |
+| `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS` | `10000` | idle-in-transaction | есть |
+| `KRONIKA_PG_EXCLUDE_DATABASES` | пусто | список баз через `;`, исключить из обхода | есть |
+| `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` | `60000` | потолок адаптивного таймаута тяжёлых запросов | план (size-цикл) |
+| `KRONIKA_PG_SIZE_INTERVAL_SECS` | `600` | частота редкого size-цикла | план |
+| `KRONIKA_PG_MAX_TABLES` | `500` | top-N per база для класса B | план |
+| `KRONIKA_PG_MAX_DATABASES` | `20` | потолок per-db соединений | план (сейчас константа `DEFAULT_MAX_DATABASES`) |
+
+**`KRONIKA_SOURCE_ID` — footgun дефолта.** Запечатывание сегмента отказывается
+смешивать два *ненулевых* `source_id`, но дефолт `0` из этой проверки исключён.
+Два коллектора с дефолтным `0`, пишущие в один `KRONIKA_OUT_DIR`, молча сольют
+данные в общие сегменты. В любой multi-collector раскладке задавайте уникальный
+ненулевой id на источник. (Поведение самого дефолта — кандидат на пересмотр:
+обязательный id / авто-вывод из `host:port`.)
 
 ## 8. Что сознательно НЕ делаем
 
-- Лимит на число соединений пула — `max_connections` это забота оператора.
+- Безлимитный обход всех баз — отказались. Пул держит не больше
+  `DEFAULT_MAX_DATABASES` (20) живых per-db соединений; базы сверх лимита остаются
+  в `uncovered`. Это константа: env-ручка появится вместе с production
+  refresh-циклом. Соотношение лимита и `max_connections` инстанса — забота
+  оператора.
 - `default_transaction_read_only=on` — искусственное ограничение, ломает гибкость
   и не нужно для SELECT-сбора.
 - Retry запроса при блокировке — пропуск снимка дешевле.
@@ -255,3 +269,33 @@ primary, — желательный режим).
 4. Первый потребитель пула — `pg_stat_user_tables` (класс B): top-N, skip locked,
    relpages-размер, метка `datname`.
 5. Size-цикл для размера базы — отдельно.
+
+## 11. Статус реализации — PR #29 (library scaffolding)
+
+PR #29 даёт пул как **библиотеку** (`kronika-source-pg::pool`), а не как
+работающий per-db сбор в демоне. Граница важна для ревью и эксплуатации.
+
+**Реализовано и под тестами:**
+- `ConnectionPool`: главное соединение, `ensure_main` (переоткрытие после
+  failover с проверкой мажора до подмены), per-db соединения с abort драйвера на
+  drop, cap `DEFAULT_MAX_DATABASES`.
+- `build_config`: структурный `tokio_postgres::Config` (key=value и URI),
+  `application_name`, keepalives, session-таймауты; валидация `lock < statement`.
+- enumerate (CONNECT-фильтр, стабильный порядок по имени), `refresh` (reconcile +
+  prune мёртвых по `is_closed`), coverage (`expected`/`uncovered`).
+- Live-BDD: пул открывает соединение к каждой базе матрицы PG 15–18.
+
+**НЕ в этом PR (следующий эпик — потребитель `pg_stat_user_tables`):**
+- Вызов `pool.refresh()` в цикле демона — коллектор пока собирает только
+  instance-wide метрики через `pool.main()`; per-db соединения живут в API.
+- Полный health-check (active-ping half-open) поверх `is_closed`-prune;
+  reconnect+retry одного снимка после failover.
+- Runtime-сигналы покрытия в сегмент (discovered/connected/uncovered, refresh
+  duration, connect failures, cap overflow).
+- Backoff против retry-storm при массовом отказе per-db коннектов; параллельный
+  per-db connect (сейчас последовательный).
+- Приоритет крупных баз при превышении cap (из кэша size-цикла, не из discovery).
+- Size-цикл (`pg_database_size`), `KRONIKA_PG_MAX_DATABASES` как env,
+  single-database режим, default-excludes (`rdsadmin`/`cloudsqladmin`/
+  `alloydbadmin`), include-regex, idle/LRU закрытие, бенчмарки 10/100/1000 баз.
+- Пересмотр дефолта `KRONIKA_SOURCE_ID=0` (см. §7).

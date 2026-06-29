@@ -1284,7 +1284,8 @@ async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> an
     };
     for db in &world.clusters {
         let dsn = db.conn_string();
-        let mut pool = ConnectionPool::connect(&dsn, session, HashSet::new()).await?;
+        let mut pool =
+            ConnectionPool::connect(&dsn, "pg_kronika-bdd", session, HashSet::new()).await?;
         pool.refresh(Duration::from_secs(0), DEFAULT_MAX_DATABASES)
             .await?;
         anyhow::ensure!(

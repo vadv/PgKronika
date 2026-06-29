@@ -5,12 +5,20 @@
 //! the journal after a successful seal.
 //!
 //! Environment:
-//! - `KRONIKA_PG_DSN`: libpq connection string for the target server;
+//! - `KRONIKA_PG_DSN`: libpq connection string (key=value or URI) for the target
+//!   server;
 //! - `KRONIKA_OUT_DIR`: directory that receives sealed segments;
-//! - `KRONIKA_SOURCE_ID`: optional source id, `0` by default;
+//! - `KRONIKA_SOURCE_ID`: `u64` stamped into every sealed segment to identify
+//!   the source (default `0`). Sealing refuses to mix two *non-zero* source ids
+//!   in one segment, so distinct collectors sharing a `KRONIKA_OUT_DIR` must use
+//!   distinct non-zero ids. The default `0` is exempt from that check: two
+//!   collectors left at `0` writing to the same directory merge their data
+//!   silently. Set a unique non-zero id per source in any multi-collector setup;
 //! - `KRONIKA_PG_STATEMENT_TIMEOUT_MS`: statement timeout in ms, default 15000;
-//! - `KRONIKA_PG_LOCK_TIMEOUT_MS`: lock timeout in ms, default 1000;
-//! - `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS`: idle-in-transaction timeout in ms, default 10000;
+//! - `KRONIKA_PG_LOCK_TIMEOUT_MS`: lock timeout in ms, default 1000 (must be
+//!   below the statement timeout, else it never fires; validated at startup);
+//! - `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS`: idle-in-transaction timeout in ms,
+//!   default 10000;
 //! - `KRONIKA_PG_EXCLUDE_DATABASES`: semicolon-separated list of databases to skip.
 #![allow(
     clippy::multiple_crate_versions,
@@ -63,10 +71,6 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
 impl Config {
     fn from_env() -> Result<Self> {
         let dsn = std::env::var("KRONIKA_PG_DSN").context("KRONIKA_PG_DSN is not set")?;
-        let dsn = format!(
-            "{dsn} application_name=pg_kronika-collector/{}",
-            env!("CARGO_PKG_VERSION")
-        );
         let out_dir = std::env::var("KRONIKA_OUT_DIR")
             .context("KRONIKA_OUT_DIR is not set")?
             .into();
@@ -76,6 +80,7 @@ impl Config {
             lock_timeout_ms: env_u64("KRONIKA_PG_LOCK_TIMEOUT_MS", 1_000)?,
             idle_in_tx_timeout_ms: env_u64("KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS", 10_000)?,
         };
+        session.validate().context("invalid session timeouts")?;
         let exclude_databases: HashSet<String> = std::env::var("KRONIKA_PG_EXCLUDE_DATABASES")
             .unwrap_or_default()
             .split(';')
@@ -103,6 +108,7 @@ async fn main() -> Result<()> {
 
     let mut pool = ConnectionPool::connect(
         &config.dsn,
+        &format!("pg_kronika-collector/{}", env!("CARGO_PKG_VERSION")),
         config.session,
         config.exclude_databases.clone(),
     )

@@ -13,14 +13,14 @@ use tokio_postgres::{Client, NoTls};
 
 use crate::server_major;
 
-/// Connectable, non-template databases, largest first (ties broken by name for
-/// a stable order). Size ordering lets the pool prefer the largest databases
-/// when the connectable set exceeds the cap.
+/// Connectable, non-template databases in a stable name order. Name ordering is
+/// cheap and deterministic; ranking by size would pull per-database filesystem
+/// I/O into every discovery.
 pub const ENUMERATE_SQL: &str = "/* pg_kronika pool */ SELECT datname \
     FROM pg_catalog.pg_database \
     WHERE datallowconn AND NOT datistemplate \
       AND pg_catalog.has_database_privilege(datname, 'CONNECT') \
-    ORDER BY pg_catalog.pg_database_size(oid) DESC, datname";
+    ORDER BY datname";
 
 /// Maximum per-database connections the pool opens by default.
 pub const DEFAULT_MAX_DATABASES: usize = 20;
@@ -41,23 +41,61 @@ pub struct SessionConfig {
     pub idle_in_tx_timeout_ms: u64,
 }
 
+impl SessionConfig {
+    /// Reject timeout settings that would silently disable a guard.
+    ///
+    /// `lock_timeout_ms` must be below `statement_timeout_ms`, otherwise a lock
+    /// wait is cut short by `statement_timeout` and `lock_timeout` never fires.
+    /// A zero value disables the corresponding `PostgreSQL` timeout, which a
+    /// 24/7 collector must never do.
+    ///
+    /// # Errors
+    /// Fails if any timeout is zero or `lock_timeout_ms >= statement_timeout_ms`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.statement_timeout_ms != 0,
+            "statement_timeout must be non-zero; 0 disables the query time limit"
+        );
+        anyhow::ensure!(
+            self.lock_timeout_ms != 0,
+            "lock_timeout must be non-zero; 0 disables the lock wait limit"
+        );
+        anyhow::ensure!(
+            self.idle_in_tx_timeout_ms != 0,
+            "idle_in_transaction_session_timeout must be non-zero; 0 disables the idle limit"
+        );
+        anyhow::ensure!(
+            self.lock_timeout_ms < self.statement_timeout_ms,
+            "lock_timeout ({}) must be below statement_timeout ({}); otherwise statement_timeout \
+             fires first and lock_timeout never triggers",
+            self.lock_timeout_ms,
+            self.statement_timeout_ms
+        );
+        Ok(())
+    }
+}
+
 /// Build a connection config from the base DSN with session settings applied.
-/// `dbname` overrides the target database for per-db connections.
+/// `dbname` overrides the target database for per-db connections. A non-empty
+/// `application_name` is set as the connection's `application_name`.
 ///
 /// Settings go through structured `tokio_postgres::Config` setters (not string
-/// concatenation), so any libpq DSN form — key=value or URI — is handled, and
-/// `application_name` carried in `base_dsn` is preserved.
+/// concatenation), so any libpq DSN form — key=value or URI — is handled.
 ///
 /// # Errors
 /// Fails if `base_dsn` is not a parseable connection string.
 fn build_config(
     base_dsn: &str,
+    application_name: &str,
     session: &SessionConfig,
     dbname: Option<&str>,
 ) -> anyhow::Result<tokio_postgres::Config> {
     let mut cfg: tokio_postgres::Config = base_dsn.parse().context("parse DSN")?;
     if let Some(db) = dbname {
         cfg.dbname(db);
+    }
+    if !application_name.is_empty() {
+        cfg.application_name(application_name);
     }
     cfg.connect_timeout(Duration::from_secs(5));
     cfg.keepalives(true);
@@ -73,7 +111,7 @@ fn build_config(
     Ok(cfg)
 }
 
-/// Drop excluded databases, preserving the input order (largest first).
+/// Drop excluded databases, preserving the input name order.
 fn select_targets<S: std::hash::BuildHasher>(
     names: Vec<String>,
     exclude: &HashSet<String, S>,
@@ -84,9 +122,9 @@ fn select_targets<S: std::hash::BuildHasher>(
         .collect()
 }
 
-/// List connectable databases — largest first — minus the configured exclude
-/// set. The cap is applied later, by `refresh`, so coverage can report the
-/// databases left out.
+/// List connectable databases in name order, minus the configured exclude set.
+/// The cap is applied later, by `refresh`, so coverage can report the databases
+/// left out.
 ///
 /// # Errors
 /// Returns an error if the enumeration query fails.
@@ -168,6 +206,7 @@ impl Drop for DatabaseConn {
 #[derive(Debug)]
 pub struct ConnectionPool {
     base_dsn: String,
+    application_name: String,
     session: SessionConfig,
     exclude: HashSet<String>,
     main: Client,
@@ -185,7 +224,9 @@ async fn open(
     let (client, connection) = cfg.connect(NoTls).await.context("connect")?;
     let major = server_major(connection.parameter("server_version"));
     let handle = tokio::spawn(async move {
-        drop(connection.await);
+        if let Err(err) = connection.await {
+            eprintln!("pg_kronika: connection driver error: {err}");
+        }
     });
     Ok((client, handle, major))
 }
@@ -197,14 +238,16 @@ impl ConnectionPool {
     /// Fails if the main connection cannot be established or reports no version.
     pub async fn connect(
         base_dsn: &str,
+        application_name: &str,
         session: SessionConfig,
         exclude: HashSet<String>,
     ) -> anyhow::Result<Self> {
-        let cfg = build_config(base_dsn, &session, None)?;
+        let cfg = build_config(base_dsn, application_name, &session, None)?;
         let (main, main_conn, major) = open(cfg).await?;
         let server_major = major.context("server reported no parseable server_version")?;
         Ok(Self {
             base_dsn: base_dsn.to_owned(),
+            application_name: application_name.to_owned(),
             session,
             exclude,
             main,
@@ -235,13 +278,15 @@ impl ConnectionPool {
     }
 
     /// Reconcile per-db clients with the current connectable databases, capped
-    /// at `max_databases` and preferring the largest databases.
+    /// at `max_databases`.
     ///
-    /// Skips work until `interval` elapses unless the pool is empty. When the
-    /// connectable set exceeds the cap, the smaller databases beyond it are left
-    /// uncovered (reported by `uncovered`), not an error. Failed per-db connects
-    /// are logged and retried on the next refresh. Order is not stable; callers
-    /// should use `datname`.
+    /// The cap keeps the first `max_databases` in name order; databases beyond it
+    /// are left uncovered (reported by `uncovered`), not an error. Preferring
+    /// specific databases under the cap is a future size-cycle concern, not done
+    /// here. Skips work until `interval` elapses unless the pool is empty.
+    /// Clients closed by a failover or restart are dropped and reopened. Failed
+    /// per-db connects are logged and retried on the next refresh. Order is not
+    /// stable; callers should use `datname`.
     ///
     /// # Errors
     /// Fails if enumerating databases fails.
@@ -257,7 +302,7 @@ impl ConnectionPool {
         if expected.len() > max_databases {
             eprintln!(
                 "pg_kronika: {} connectable databases exceed the cap ({max_databases}); \
-                 covering the {max_databases} largest, leaving {} uncovered",
+                 covering the first {max_databases} in name order, leaving {} uncovered",
                 expected.len(),
                 expected.len() - max_databases
             );
@@ -268,13 +313,18 @@ impl ConnectionPool {
             .map(String::as_str)
             .collect();
         self.per_db
-            .retain(|c| connect_set.contains(c.datname.as_str()));
+            .retain(|c| !c.client().is_closed() && connect_set.contains(c.datname.as_str()));
         let have: HashSet<String> = self.per_db.iter().map(|c| c.datname.clone()).collect();
         for db in expected.iter().take(max_databases) {
             if have.contains(db) {
                 continue;
             }
-            let cfg = build_config(&self.base_dsn, &self.session, Some(db.as_str()))?;
+            let cfg = build_config(
+                &self.base_dsn,
+                &self.application_name,
+                &self.session,
+                Some(db.as_str()),
+            )?;
             match open(cfg).await {
                 Ok((client, conn, _)) => {
                     self.per_db.push(DatabaseConn {
@@ -297,10 +347,16 @@ impl ConnectionPool {
         &self.target
     }
 
-    /// Expected databases with no live connection (failed/locked out).
+    /// Expected databases with no live connection (failed, locked out, or closed
+    /// by a failover). A closed client does not count as covering its database.
     #[must_use]
     pub fn uncovered(&self) -> Vec<String> {
-        let have: HashSet<&str> = self.per_db.iter().map(|c| c.datname.as_str()).collect();
+        let have: HashSet<&str> = self
+            .per_db
+            .iter()
+            .filter(|c| !c.client().is_closed())
+            .map(|c| c.datname.as_str())
+            .collect();
         self.target
             .iter()
             .filter(|d| !have.contains(d.as_str()))
@@ -319,7 +375,7 @@ impl ConnectionPool {
         if !self.main.is_closed() {
             return Ok(());
         }
-        let cfg = build_config(&self.base_dsn, &self.session, None)?;
+        let cfg = build_config(&self.base_dsn, &self.application_name, &self.session, None)?;
         let (client, conn, major) = open(cfg).await?;
         let Some(major) = major else {
             conn.abort();
@@ -369,8 +425,11 @@ mod tests {
         assert!(ENUMERATE_SQL.contains("datallowconn"));
         assert!(ENUMERATE_SQL.contains("NOT datistemplate"));
         assert!(ENUMERATE_SQL.contains("has_database_privilege"));
-        assert!(ENUMERATE_SQL.contains("pg_database_size"));
-        assert!(ENUMERATE_SQL.contains("DESC"));
+        assert!(ENUMERATE_SQL.contains("ORDER BY datname"));
+        assert!(
+            !ENUMERATE_SQL.contains("pg_database_size"),
+            "discovery must not pull per-database size"
+        );
     }
 
     fn test_session() -> SessionConfig {
@@ -383,7 +442,7 @@ mod tests {
 
     #[test]
     fn build_config_sets_keepalives_retries_without_jit() {
-        let cfg = build_config("host=h dbname=postgres user=u", &test_session(), None)
+        let cfg = build_config("host=h dbname=postgres user=u", "", &test_session(), None)
             .expect("a valid DSN must build");
         assert_eq!(cfg.get_keepalives_retries(), Some(3));
         let options = cfg.get_options().unwrap_or_default();
@@ -398,9 +457,10 @@ mod tests {
     }
 
     #[test]
-    fn build_config_overrides_dbname_and_preserves_application_name() {
+    fn build_config_sets_dbname_and_application_name() {
         let cfg = build_config(
-            "host=h dbname=postgres application_name=pg_kronika-collector/9.9",
+            "host=h dbname=postgres",
+            "pg_kronika-collector/9.9",
             &test_session(),
             Some("payments"),
         )
@@ -410,16 +470,66 @@ mod tests {
     }
 
     #[test]
+    fn build_config_handles_uri_dsn() {
+        // A URI DSN once corrupted by ` application_name=...` string concatenation;
+        // the structured setter keeps it parseable.
+        let cfg = build_config(
+            "postgresql://h/postgres",
+            "pg_kronika-collector/9.9",
+            &test_session(),
+            Some("payments"),
+        )
+        .expect("a URI DSN must build");
+        assert_eq!(cfg.get_dbname(), Some("payments"));
+        assert_eq!(cfg.get_application_name(), Some("pg_kronika-collector/9.9"));
+    }
+
+    #[test]
     fn build_config_rejects_unparseable_dsn() {
-        assert!(build_config("host=h port=not_a_number", &test_session(), None).is_err());
+        assert!(build_config("host=h port=not_a_number", "", &test_session(), None).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_a_sane_config() {
+        assert!(test_session().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_lock_at_or_above_statement() {
+        let mut session = test_session();
+        session.lock_timeout_ms = session.statement_timeout_ms;
+        assert!(session.validate().is_err());
+        session.lock_timeout_ms = session.statement_timeout_ms + 1;
+        assert!(session.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_timeout() {
+        let zeroed = [
+            SessionConfig {
+                statement_timeout_ms: 0,
+                ..test_session()
+            },
+            SessionConfig {
+                lock_timeout_ms: 0,
+                ..test_session()
+            },
+            SessionConfig {
+                idle_in_tx_timeout_ms: 0,
+                ..test_session()
+            },
+        ];
+        for session in zeroed {
+            assert!(session.validate().is_err());
+        }
     }
 
     #[test]
     fn select_targets_drops_excluded_preserving_order() {
         let names = vec!["big".to_owned(), "mid".to_owned(), "small".to_owned()];
         let exclude: HashSet<String> = ["mid".to_owned()].into();
-        // Largest-first order from the query is preserved, so the cap applied
-        // later in refresh keeps the largest databases.
+        // Name order from the query is preserved, so the cap applied later in
+        // refresh keeps the first databases in name order.
         assert_eq!(select_targets(names, &exclude), ["big", "small"]);
     }
 }
