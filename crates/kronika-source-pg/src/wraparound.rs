@@ -1,15 +1,13 @@
 //! `wraparound` collection for type `1_018_001`.
 //!
-//! Per-database transaction-ID and multixact age toward wraparound, read from
-//! `pg_database`. Every database is included — a frozen idle database such as
-//! `template0` can hold the cluster's largest age. Collection returns owned rows;
-//! the caller interns `datname` into the segment dictionary.
+//! Per-database XID and multixact wraparound ages from `pg_database`.
+//! Includes databases that reject connections; the caller interns `datname`.
 
 use kronika_registry::wraparound::WraparoundAge;
 use kronika_registry::{StrId, Ts};
 use tokio_postgres::Client;
 
-/// Prefix a query literal with the kronika marker (SQL-transparency rule).
+/// SQL transparency marker for collector queries.
 macro_rules! marked {
     ($sql:literal) => {
         concat!(
@@ -21,7 +19,7 @@ macro_rules! marked {
     };
 }
 
-/// One raw `wraparound` row; `datname` is owned and interned by the caller.
+/// Collected row before `datname` interning.
 #[derive(Debug, Clone)]
 pub struct WraparoundRow {
     /// Snapshot time, unix microseconds.
@@ -50,15 +48,12 @@ pub fn to_wraparound<E>(
     })
 }
 
-/// Collect both wraparound ages for every database.
+/// Collect both wraparound ages from every row in `pg_database`.
 ///
-/// All databases are read, including ones that disallow connections: their
-/// `datfrozenxid` / `datminmxid` still age and bound the cluster's wraparound
-/// headroom on each axis. `ts` is one `statement_timestamp()` for the whole
-/// snapshot.
+/// `ts` is one `statement_timestamp()` for the whole snapshot.
 ///
 /// # Errors
-/// Returns the [`tokio_postgres::Error`] if the query fails.
+/// Returns `PostgreSQL` query errors.
 pub async fn collect_wraparound(
     client: &Client,
 ) -> Result<Vec<WraparoundRow>, tokio_postgres::Error> {

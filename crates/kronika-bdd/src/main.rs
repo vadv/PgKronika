@@ -468,9 +468,7 @@ async fn every_version_seals_wraparound(world: &mut BddWorld) -> anyhow::Result<
     Ok(())
 }
 
-/// Decode the sealed `wraparound` section, then check one snapshot timestamp,
-/// non-negative ages, and dictionary-backed database names. Every cluster has at
-/// least the template and default databases, so the section is never empty.
+/// Check timestamp, non-negative ages, and dictionary-backed `datname`.
 fn assert_wraparound_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;

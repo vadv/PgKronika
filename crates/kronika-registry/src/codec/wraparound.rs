@@ -1,20 +1,11 @@
-//! Type `1_018_001`: per-database transaction-ID and multixact age toward
-//! wraparound.
+//! Type `1_018_001`: per-database wraparound ages.
 //!
-//! One row per database in `pg_database`, carrying the two independent wraparound
-//! distances: `age(datfrozenxid)` and `mxid_age(datminmxid)`. Stable across
-//! PG 10-18.
+//! One row per `pg_database` row: `age(datfrozenxid)` and
+//! `mxid_age(datminmxid)`.
 
 use crate::{Section, StrId, Ts};
 
-/// Type `1_018_001`: one database's distance toward wraparound on both axes.
-///
-/// `age` is `age(datfrozenxid)` — transaction IDs since the database's freeze
-/// point — and `mxid_age` is `mxid_age(datminmxid)`, the independent multixact
-/// axis. Each climbs toward its own emergency-vacuum threshold
-/// (`autovacuum_freeze_max_age` / `autovacuum_multixact_freeze_max_age`) and
-/// ultimately the ~2^31 wraparound limit; a frozen idle database such as
-/// `template0` often holds the cluster's largest age.
+/// Type `1_018_001`: wraparound age by database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(
     id = 1_018_001,
@@ -29,12 +20,10 @@ pub struct WraparoundAge {
     /// Database name, interned into the segment dictionary.
     #[column(l)]
     pub datname: StrId,
-    /// Transaction IDs elapsed since the database's freeze point
-    /// (`age(datfrozenxid)`).
+    /// XID age (`age(datfrozenxid)`).
     #[column(g)]
     pub age: i64,
-    /// Multixact IDs elapsed since the database's multixact freeze point
-    /// (`mxid_age(datminmxid)`) — the second, independent wraparound axis.
+    /// Multixact age (`mxid_age(datminmxid)`).
     #[column(g)]
     pub mxid_age: i64,
 }
@@ -71,8 +60,6 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_values() {
-        // Several databases in one snapshot, including a large XID age and a
-        // multixact age that diverges from it.
         crate::assert_roundtrips(&[
             row(1_000_000, 1, 150_000_000, 5_000_000),
             row(1_000_000, 2, 42, 0),
