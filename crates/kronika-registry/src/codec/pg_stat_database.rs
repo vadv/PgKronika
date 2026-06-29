@@ -17,8 +17,9 @@ use crate::{Section, StrId, Ts};
 ///
 /// One row per database, plus the `datid = 0` shared-objects row (PG12+) whose
 /// `datname` is `None`. `ts` is one `statement_timestamp()` for the snapshot;
-/// `numbackends` is the instantaneous connection count and is `None` for the
-/// shared-objects row. `blk_read_time` / `blk_write_time` are zero unless
+/// `numbackends` is the instantaneous connection count. The layout keeps it
+/// nullable for the documented shared-row `NULL`, but PG12+ system view
+/// definitions return `0` for that row. `blk_read_time` / `blk_write_time` are zero unless
 /// `track_io_timing` is on.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
@@ -37,7 +38,7 @@ pub struct PgStatDatabaseV4 {
     /// Database name; `None` for the shared-objects row.
     #[column(l)]
     pub datname: Option<StrId>,
-    /// Backends currently connected to this database; `None` for the shared-objects row.
+    /// Backends currently connected to this database; nullable for documented shared-row behavior.
     #[column(g)]
     pub numbackends: Option<i32>,
     /// Committed transactions.
@@ -158,7 +159,7 @@ pub struct PgStatDatabaseV3 {
     /// Database name; `None` for the shared-objects row.
     #[column(l)]
     pub datname: Option<StrId>,
-    /// Backends currently connected to this database; `None` for the shared-objects row.
+    /// Backends currently connected to this database; nullable for documented shared-row behavior.
     #[column(g)]
     pub numbackends: Option<i32>,
     /// Committed transactions.
@@ -273,7 +274,7 @@ pub struct PgStatDatabaseV2 {
     /// Database name; `None` for the shared-objects row.
     #[column(l)]
     pub datname: Option<StrId>,
-    /// Backends currently connected to this database; `None` for the shared-objects row.
+    /// Backends currently connected to this database; nullable for documented shared-row behavior.
     #[column(g)]
     pub numbackends: Option<i32>,
     /// Committed transactions.
@@ -367,7 +368,7 @@ pub struct PgStatDatabaseV1 {
     /// Database name; `None` for the shared-objects row.
     #[column(l)]
     pub datname: Option<StrId>,
-    /// Backends currently connected to this database; `None` for the shared-objects row.
+    /// Backends currently connected to this database; nullable for documented shared-row behavior.
     #[column(g)]
     pub numbackends: Option<i32>,
     /// Committed transactions.
@@ -449,7 +450,7 @@ mod tests {
             } else {
                 Some(StrId(datid.into()))
             },
-            numbackends: if datid == 0 { None } else { Some(3) },
+            numbackends: if datid == 0 { Some(0) } else { Some(3) },
             xact_commit: 100,
             xact_rollback: 2,
             blks_read: 4_000,
@@ -530,12 +531,12 @@ mod tests {
     }
 
     #[test]
-    fn v4_shared_row_datname_is_null() {
+    fn v4_shared_row_preserves_numbackends_and_null_catalog_fields() {
         let bytes = PgStatDatabaseV4::encode(&[v4_row(5, 0)]).expect("encode");
         let decoded =
             PgStatDatabaseV4::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
         assert_eq!(decoded[0].datname, None);
-        assert_eq!(decoded[0].numbackends, None);
+        assert_eq!(decoded[0].numbackends, Some(0));
         assert_eq!(decoded[0].checksum_last_failure, None);
         assert_eq!(decoded[0].frozen_xid_age, None);
         assert_eq!(decoded[0].min_mxid_age, None);
