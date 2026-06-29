@@ -30,7 +30,11 @@ pub use activity::{
     to_v3,
 };
 
+pub mod archiver;
 pub mod database;
+pub mod io;
+
+pub mod wal;
 
 pub mod prepared_xacts;
 
