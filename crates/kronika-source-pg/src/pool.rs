@@ -30,7 +30,10 @@ pub fn replace_dbname(dsn: &str, datname: &str) -> String {
 /// Session GUCs applied to every pool connection (main and per-db) via the
 /// connection string, so they take effect before the first query.
 #[derive(Debug, Clone, Copy)]
-#[allow(clippy::struct_field_names, reason = "field names follow PostgreSQL GUC naming convention")]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names follow PostgreSQL GUC naming convention"
+)]
 pub struct SessionConfig {
     /// Maximum query execution time in milliseconds.
     pub statement_timeout_ms: u64,
@@ -60,6 +63,44 @@ pub fn apply_session_dsn(base_dsn: &str, cfg: &SessionConfig) -> String {
          keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3",
         session_options(cfg)
     )
+}
+
+/// Adaptive `statement_timeout` for heavy queries (sizes/schema): one per
+/// `PgKronika` instance, ratchets up only.
+///
+/// The server-side timeout is a backstop — Postgres kills the query even if
+/// the collector hangs or is OOM. The caller calls `grow` only on a `57014`
+/// (`statement_timeout`) kill; on `55P03` (`lock_timeout`) it does NOT — that
+/// is a foreign lock, not query cost.
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveTimeout {
+    current_ms: u64,
+    cap_ms: u64,
+}
+
+impl AdaptiveTimeout {
+    /// Create a new instance; clamps `start_ms` to `cap_ms` if it exceeds it.
+    #[must_use]
+    pub fn new(start_ms: u64, cap_ms: u64) -> Self {
+        Self {
+            current_ms: start_ms.min(cap_ms),
+            cap_ms,
+        }
+    }
+    /// Current timeout value in milliseconds.
+    #[must_use]
+    pub const fn current_ms(&self) -> u64 {
+        self.current_ms
+    }
+    /// Double, clamped to the cap. No-op at the cap.
+    pub fn grow(&mut self) {
+        self.current_ms = self.current_ms.saturating_mul(2).min(self.cap_ms);
+    }
+    /// Returns `true` when the timeout has reached the cap.
+    #[must_use]
+    pub const fn at_cap(&self) -> bool {
+        self.current_ms >= self.cap_ms
+    }
 }
 
 #[cfg(test)]
@@ -107,5 +148,25 @@ mod tests {
                 && d.contains("keepalives_idle=30")
                 && d.contains("connect_timeout=5")
         );
+    }
+
+    #[test]
+    fn adaptive_doubles_up_to_cap() {
+        let mut t = AdaptiveTimeout::new(15_000, 60_000);
+        assert_eq!(t.current_ms(), 15_000);
+        t.grow();
+        assert_eq!(t.current_ms(), 30_000);
+        t.grow();
+        assert_eq!(t.current_ms(), 60_000);
+        t.grow();
+        assert_eq!(t.current_ms(), 60_000);
+        assert!(t.at_cap());
+    }
+
+    #[test]
+    fn adaptive_start_above_cap_clamps() {
+        let t = AdaptiveTimeout::new(120_000, 60_000);
+        assert_eq!(t.current_ms(), 60_000);
+        assert!(t.at_cap());
     }
 }
