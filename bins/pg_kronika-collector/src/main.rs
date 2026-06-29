@@ -19,10 +19,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use kronika_format::DictLimits;
 use kronika_registry::StrId;
+use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
+use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
+use kronika_source_pg::prepared_xacts::{
+    PreparedXactsRow, collect_prepared_xacts, to_prepared_xacts,
+};
 use kronika_source_pg::progress_vacuum::{
     ProgressVacuumRow, collect_progress_vacuum, to_progress_vacuum,
 };
+use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
     to_v1, to_v2, to_v3,
@@ -129,6 +135,19 @@ async fn snapshot_and_seal(
     let progress_vacuum_rows = collect_progress_vacuum(client, major)
         .await
         .context("collect pg_stat_progress_vacuum")?;
+    let prepared_rows = collect_prepared_xacts(client)
+        .await
+        .context("collect pg_prepared_xacts")?;
+    let wal = collect_wal(client, major)
+        .await
+        .context("collect pg_stat_wal")?;
+    // pg_stat_io exists from PG16; `None` on older majors.
+    let io = collect_io(client, major)
+        .await
+        .context("collect pg_stat_io")?;
+    let archiver = collect_archiver(client)
+        .await
+        .context("collect pg_stat_archiver")?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -148,6 +167,17 @@ async fn snapshot_and_seal(
         &database_rows,
     )?;
     push_progress_vacuum(&mut buffers, &mut interner, &progress_vacuum_rows)?;
+    push_prepared_xacts(&mut buffers, &mut interner, &prepared_rows)?;
+    // pg_stat_wal has one all-numeric row; PG10-13 produce no row.
+    match wal {
+        Some(WalSnapshot::V1(row)) => buffer_row(&mut buffers, row)?,
+        Some(WalSnapshot::V2(row)) => buffer_row(&mut buffers, row)?,
+        None => {}
+    }
+    if let Some((io_version, io_rows)) = &io {
+        push_io(&mut buffers, &mut interner, *io_version, io_rows)?;
+    }
+    push_archiver(&mut buffers, &mut interner, &archiver)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -220,6 +250,11 @@ fn push_database(
     Ok(())
 }
 
+/// Intern each row's labels and buffer it as the progress-vacuum section.
+///
+/// # Errors
+/// Returns an error if a label cannot be interned (dictionary full) or a
+/// section buffer is full.
 fn push_progress_vacuum(
     buffers: &mut SectionBuffers,
     interner: &mut Interner,
@@ -228,6 +263,58 @@ fn push_progress_vacuum(
     for row in rows {
         let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
         buffer_row(buffers, to_progress_vacuum(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
+/// Intern each row's `datname` and buffer it as the prepared-xacts section.
+///
+/// # Errors
+/// Returns an error if `datname` cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_prepared_xacts(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[PreparedXactsRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_prepared_xacts(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
+/// Intern WAL file names and buffer the singleton `pg_stat_archiver` row.
+///
+/// # Errors
+/// Returns an error if a WAL name cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_archiver(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    row: &ArchiverRow,
+) -> Result<()> {
+    let intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+    buffer_row(buffers, to_archiver(row, intern)?)
+}
+
+/// Intern each row's label strings and buffer it as the version's section type.
+///
+/// # Errors
+/// Returns an error if a label cannot be interned (dictionary full) or a section
+/// buffer is full.
+fn push_io(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    version: IoVersion,
+    rows: &[IoRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        match version {
+            IoVersion::V1 => buffer_row(buffers, io::to_v1(row, &mut intern)?)?,
+            IoVersion::V2 => buffer_row(buffers, io::to_v2(row, &mut intern)?)?,
+        }
     }
     Ok(())
 }
@@ -251,8 +338,15 @@ fn announce(line: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{activity_dict_limits, push_activity, push_database};
+    use super::{
+        activity_dict_limits, push_activity, push_archiver, push_database, push_io,
+        push_prepared_xacts, push_progress_vacuum,
+    };
+    use kronika_source_pg::archiver::ArchiverRow;
     use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
+    use kronika_source_pg::io::{IoRow, IoVersion};
+    use kronika_source_pg::prepared_xacts::PreparedXactsRow;
+    use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
     use kronika_source_pg::{ActivityRow, ActivityVersion};
     use kronika_writer::{Interner, SectionBuffers, dict};
 
@@ -379,6 +473,188 @@ mod tests {
                 .iter()
                 .any(|entry| entry.type_id == 1_005_004),
             "the part carries the pg_stat_database section"
+        );
+    }
+
+    fn io_row(object: &str) -> IoRow {
+        IoRow {
+            ts: 1_000,
+            backend_type: "client backend".to_owned(),
+            object: object.to_owned(),
+            context: "normal".to_owned(),
+            reads: Some(100),
+            read_bytes: Some(819_200),
+            read_time: Some(12.5),
+            writes: Some(50),
+            write_bytes: Some(409_600),
+            write_time: Some(3.0),
+            writebacks: Some(0),
+            writeback_time: None,
+            extends: Some(7),
+            extend_bytes: Some(57_344),
+            extend_time: None,
+            op_bytes: Some(8192),
+            hits: Some(9000),
+            evictions: Some(2),
+            reuses: None,
+            fsyncs: Some(1),
+            fsync_time: None,
+            stats_reset: Some(500),
+        }
+    }
+
+    fn archiver_row() -> ArchiverRow {
+        ArchiverRow {
+            ts: 1_000,
+            archived_count: 3,
+            last_archived_wal: Some("00000001000000000000000A".to_owned()),
+            last_archived_time: Some(900),
+            failed_count: 1,
+            last_failed_wal: Some("00000001000000000000000B".to_owned()),
+            last_failed_time: Some(950),
+            stats_reset: None,
+        }
+    }
+
+    fn prepared_row() -> PreparedXactsRow {
+        PreparedXactsRow {
+            ts: 1_000,
+            datname: "appdb".to_owned(),
+            prepared_count: 1,
+            max_age_us: 50_000,
+            max_xid_age_tx: 4,
+        }
+    }
+
+    fn progress_vacuum_row(phase: &str) -> ProgressVacuumRow {
+        ProgressVacuumRow {
+            ts: 1_000,
+            pid: 42,
+            datid: 16_385,
+            datname: "appdb".to_owned(),
+            relid: 16_384,
+            is_autovacuum: true,
+            phase: phase.to_owned(),
+            heap_blks_total: 10_000,
+            heap_blks_scanned: 4_200,
+            heap_blks_vacuumed: 4_000,
+            index_vacuum_count: 1,
+            max_dead_tuples: Some(291_271),
+            num_dead_tuples: Some(120_000),
+            max_dead_tuple_bytes: None,
+            dead_tuple_bytes: None,
+            num_dead_item_ids: None,
+            indexes_total: None,
+            indexes_processed: None,
+            delay_time: None,
+        }
+    }
+
+    #[test]
+    fn push_progress_vacuum_buffers_rows_and_interns_labels() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_progress_vacuum(
+            &mut buffers,
+            &mut interner,
+            &[progress_vacuum_row("scanning heap")],
+        )
+        .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "row was buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(!dict_sections.is_empty(), "labels reached the dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_012_001),
+            "the part carries the pg_stat_progress_vacuum section"
+        );
+    }
+
+    #[test]
+    fn push_prepared_xacts_buffers_rows_and_interns_datname() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_prepared_xacts(&mut buffers, &mut interner, &[prepared_row()])
+            .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "row was buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(!dict_sections.is_empty(), "datname reached the dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_010_001),
+            "the part carries the pg_prepared_xacts section"
+        );
+    }
+
+    #[test]
+    fn push_archiver_buffers_row_and_interns_wal_names() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_archiver(&mut buffers, &mut interner, &archiver_row())
+            .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "row was buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(
+            !dict_sections.is_empty(),
+            "wal names reached the dictionary"
+        );
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_008_001),
+            "the part carries the pg_stat_archiver section"
+        );
+    }
+
+    #[test]
+    fn push_io_buffers_rows_and_interns_labels() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_io(
+            &mut buffers,
+            &mut interner,
+            IoVersion::V2,
+            &[io_row("relation"), io_row("wal")],
+        )
+        .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "rows were buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(!dict_sections.is_empty(), "labels reached the dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_009_002),
+            "the part carries the pg_stat_io section"
         );
     }
 }

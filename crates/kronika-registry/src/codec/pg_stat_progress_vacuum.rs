@@ -1,6 +1,6 @@
 //! Type `1_012_001`: `pg_stat_progress_vacuum`.
 //!
-//! One row per backend running `VACUUM`. An empty view produces no section.
+//! One row per backend running `VACUUM`; absence means no active rows.
 
 use crate::{Section, StrId, Ts};
 
@@ -11,7 +11,7 @@ use crate::{Section, StrId, Ts};
 #[section(
     id = 1_012_001,
     name = "pg_stat_progress_vacuum",
-    semantics = snapshot_full,
+    semantics = conditional_full,
     sort_key("ts", "pid")
 )]
 pub struct PgStatProgressVacuum {
@@ -21,12 +21,18 @@ pub struct PgStatProgressVacuum {
     /// Process id of the backend running this vacuum.
     #[column(l)]
     pub pid: i32,
+    /// OID of the database being vacuumed.
+    #[column(l)]
+    pub datid: u32,
     /// Database being vacuumed, interned in the segment dictionary.
     #[column(l)]
     pub datname: StrId,
     /// OID of the table being vacuumed.
     #[column(l)]
     pub relid: u32,
+    /// Whether the backend is an autovacuum worker.
+    #[column(l)]
+    pub is_autovacuum: bool,
     /// Current vacuum phase, such as `scanning heap`, interned.
     #[column(l)]
     pub phase: StrId,
@@ -71,14 +77,16 @@ pub struct PgStatProgressVacuum {
 #[cfg(test)]
 mod tests {
     use super::PgStatProgressVacuum;
-    use crate::{Section, StrId, Ts, VerifiedSection, lint};
+    use crate::{Section, Semantics, StrId, Ts, VerifiedSection, lint};
 
     fn pre17_row(ts: i64, pid: i32) -> PgStatProgressVacuum {
         PgStatProgressVacuum {
             ts: Ts(ts),
             pid,
+            datid: 16_385,
             datname: StrId(7),
             relid: 16_384,
+            is_autovacuum: false,
             phase: StrId(9),
             heap_blks_total: 10_000,
             heap_blks_scanned: 4_200,
@@ -124,9 +132,15 @@ mod tests {
     fn contract_shape_matches_the_source() {
         let c = PgStatProgressVacuum::CONTRACT;
         assert_eq!(c.type_id.get(), 1_012_001);
-        assert_eq!(c.columns.len(), 17);
+        assert_eq!(c.semantics, Semantics::ConditionalFull);
+        assert_eq!(c.columns.len(), 19);
         assert_eq!(c.sort_key, ["ts", "pid"]);
         assert_eq!(c.column("pid").map(|col| col.nullable), Some(false));
+        assert_eq!(c.column("datid").map(|col| col.nullable), Some(false));
+        assert_eq!(
+            c.column("is_autovacuum").map(|col| col.nullable),
+            Some(false)
+        );
         assert_eq!(
             c.column("heap_blks_total").map(|col| col.nullable),
             Some(false)
