@@ -33,9 +33,9 @@ pub struct ResetMetadata {
     /// `pg_stat_wal` reset; `None` before `pg_stat_wal` existed.
     #[column(g)]
     pub pg_stat_wal_reset_at: Option<Ts>,
-    /// `pg_stat_archiver` reset.
+    /// `pg_stat_archiver` reset; `None` if the server returns no reset time.
     #[column(g)]
-    pub pg_stat_archiver_reset_at: Ts,
+    pub pg_stat_archiver_reset_at: Option<Ts>,
     /// `pg_stat_io` reset; `None` before PG16.
     #[column(g)]
     pub pg_stat_io_reset_at: Option<Ts>,
@@ -72,7 +72,7 @@ mod tests {
             pg_stat_statements_reset_at: Some(Ts(1_700_000_400_000_000)),
             pg_store_plans_reset_at: None,
             pg_stat_wal_reset_at: Some(Ts(1_700_000_200_000_000)),
-            pg_stat_archiver_reset_at: Ts(1_700_000_100_000_000),
+            pg_stat_archiver_reset_at: Some(Ts(1_700_000_100_000_000)),
             pg_stat_io_reset_at: Some(Ts(1_700_000_600_000_000)),
             ext_pg_stat_statements_version: Some(StrId(10)),
             ext_pg_store_plans_version: None,
@@ -87,6 +87,7 @@ mod tests {
             // Keep sort order defined.
             ts: Ts(1_000_000),
             // Pre-PG16 and no extensions.
+            pg_stat_archiver_reset_at: None,
             pg_stat_io_reset_at: None,
             ext_pg_stat_statements_version: None,
             compute_query_id: None,

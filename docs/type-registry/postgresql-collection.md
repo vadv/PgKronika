@@ -308,10 +308,11 @@ FROM pg_stat_io;
 
 Standby lag считается с поправкой на idle primary:
 
-- если `pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn()`, lag равен 0;
+- если receive LSN и replay LSN оба не `NULL` и равны, lag равен 0;
 - иначе используется `now() - pg_last_xact_replay_timestamp()`.
 
-Без этой поправки на простаивающем primary lag ложно растёт.
+Без этой поправки на простаивающем primary lag ложно растёт. Если LSN или время
+последнего replay неизвестны, lag остаётся `NULL`.
 
 На primary читаются:
 

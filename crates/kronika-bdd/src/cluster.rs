@@ -233,7 +233,14 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
         .args(["-c", "listen_addresses=127.0.0.1"])
         .arg("-p")
         .arg(port.to_string())
-        .args(["-c", "fsync=off", "-c", "full_page_writes=off"])
+        .args([
+            "-c",
+            "fsync=off",
+            "-c",
+            "full_page_writes=off",
+            "-c",
+            "max_prepared_transactions=16",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .kill_on_drop(true)
