@@ -7,14 +7,21 @@
 //! Environment:
 //! - `KRONIKA_PG_DSN`: libpq connection string for the target server;
 //! - `KRONIKA_OUT_DIR`: directory that receives sealed segments;
-//! - `KRONIKA_SOURCE_ID`: optional source id, `0` by default.
+//! - `KRONIKA_SOURCE_ID`: optional source id, `0` by default;
+//! - `KRONIKA_PG_STATEMENT_TIMEOUT_MS`: statement timeout in ms, default 15000;
+//! - `KRONIKA_PG_LOCK_TIMEOUT_MS`: lock timeout in ms, default 1000;
+//! - `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS`: idle-in-transaction timeout in ms, default 10000;
+//! - `KRONIKA_PG_EXCLUDE_DATABASES`: semicolon-separated list of databases to skip;
+//! - `KRONIKA_PG_POOL_REFRESH_SECS`: pool refresh interval in seconds, default 600.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
 )]
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use kronika_format::DictLimits;
@@ -22,6 +29,7 @@ use kronika_registry::StrId;
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
 use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
+use kronika_source_pg::pool::{ConnectionPool, SessionConfig};
 use kronika_source_pg::prepared_xacts::{
     PreparedXactsRow, collect_prepared_xacts, to_prepared_xacts,
 };
@@ -33,8 +41,8 @@ use kronika_source_pg::replication_instance::{
 };
 use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
-    ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
-    to_v1, to_v2, to_v3,
+    ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, to_v1, to_v2,
+    to_v3,
 };
 use kronika_writer::{Interner, Journal, JournalConfig, SectionBuffers, dict, seal};
 use tokio::signal::unix::{SignalKind, signal};
@@ -44,22 +52,57 @@ struct Config {
     dsn: String,
     out_dir: PathBuf,
     source_id: u64,
+    session: SessionConfig,
+    exclude_databases: HashSet<String>,
+    // Reserved for future per-db pool refresh scheduling.
+    #[allow(
+        dead_code,
+        reason = "consumed by pool.refresh() in the per-db collection task, not yet wired"
+    )]
+    pool_refresh: Duration,
+}
+
+fn env_u64(key: &str, default: u64) -> Result<u64> {
+    std::env::var(key).map_or_else(
+        |_| Ok(default),
+        |v| v.parse().with_context(|| format!("{key} is not a u64")),
+    )
 }
 
 impl Config {
     fn from_env() -> Result<Self> {
         let dsn = std::env::var("KRONIKA_PG_DSN").context("KRONIKA_PG_DSN is not set")?;
+        let dsn = format!(
+            "{dsn} application_name=pg_kronika-collector/{}",
+            env!("CARGO_PKG_VERSION")
+        );
         let out_dir = std::env::var("KRONIKA_OUT_DIR")
             .context("KRONIKA_OUT_DIR is not set")?
             .into();
-        let source_id = match std::env::var("KRONIKA_SOURCE_ID") {
-            Ok(value) => value.parse().context("KRONIKA_SOURCE_ID is not a u64")?,
-            Err(_) => 0,
+        let source_id = env_u64("KRONIKA_SOURCE_ID", 0)?;
+        let session = SessionConfig {
+            statement_timeout_ms: env_u64("KRONIKA_PG_STATEMENT_TIMEOUT_MS", 15_000)?,
+            lock_timeout_ms: env_u64("KRONIKA_PG_LOCK_TIMEOUT_MS", 1_000)?,
+            idle_in_tx_timeout_ms: env_u64("KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS", 10_000)?,
         };
+        let exclude_databases: HashSet<String> = std::env::var("KRONIKA_PG_EXCLUDE_DATABASES")
+            .unwrap_or_default()
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !exclude_databases.is_empty() {
+            eprintln!("pg_kronika: excluding databases: {exclude_databases:?}");
+        }
+        let pool_refresh = Duration::from_secs(env_u64("KRONIKA_PG_POOL_REFRESH_SECS", 600)?);
         Ok(Self {
             dsn,
             out_dir,
             source_id,
+            session,
+            exclude_databases,
+            pool_refresh,
         })
     }
 }
@@ -69,21 +112,13 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
 
-    let mut pg_config: tokio_postgres::Config = config
-        .dsn
-        .parse()
-        .context("parse KRONIKA_PG_DSN as a connection string")?;
-    // Set application_name for SQL transparency.
-    pg_config.application_name(concat!("pg_kronika-collector/", env!("CARGO_PKG_VERSION")));
-    let (client, connection) = pg_config
-        .connect(tokio_postgres::NoTls)
-        .await
-        .context("connect to PostgreSQL")?;
-    // The server reports its version in the handshake; read it once, no query.
-    let major = server_major(connection.parameter("server_version"))
-        .context("server did not report a parseable server_version")?;
-    // tokio-postgres drives I/O through this future.
-    tokio::spawn(connection);
+    let mut pool = ConnectionPool::connect(
+        &config.dsn,
+        config.session,
+        config.exclude_databases.clone(),
+    )
+    .await
+    .context("connect pool")?;
 
     // Only sealed segments leave this process.
     let journal_dir = tempfile::tempdir().context("create the journal directory")?;
@@ -102,7 +137,12 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             Some(()) = sigusr2.recv() => {
-                match snapshot_and_seal(&client, major, &mut journal, &config.out_dir, config.source_id)
+                if let Err(err) = pool.ensure_main().await {
+                    eprintln!("pg_kronika-collector: main reconnect failed: {err:#}");
+                    continue;
+                }
+                let major = pool.server_major();
+                match snapshot_and_seal(pool.main(), major, &mut journal, &config.out_dir, config.source_id)
                     .await
                 {
                     Ok(dest) => announce(&format!("sealed {}", dest.display())),
