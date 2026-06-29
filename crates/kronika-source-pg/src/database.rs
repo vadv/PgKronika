@@ -64,55 +64,79 @@ pub const fn database_version(major: u32) -> DatabaseVersion {
 pub const fn database_query(version: DatabaseVersion) -> &'static str {
     match version {
         DatabaseVersion::V1 => marked!(
-            "SELECT datid, datname::text AS datname, numbackends, \
-             xact_commit, xact_rollback, blks_read, blks_hit, \
-             tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, \
-             conflicts, temp_files, temp_bytes, deadlocks, \
-             blk_read_time, blk_write_time, \
-             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
+            "SELECT sd.datid, sd.datname::text AS datname, sd.numbackends, \
+             sd.xact_commit, sd.xact_rollback, sd.blks_read, sd.blks_hit, \
+             sd.tup_returned, sd.tup_fetched, sd.tup_inserted, sd.tup_updated, sd.tup_deleted, \
+             sd.conflicts, sd.temp_files, sd.temp_bytes, sd.deadlocks, \
+             sd.blk_read_time, sd.blk_write_time, \
+             (extract(epoch from sd.stats_reset) * 1e6)::int8 AS stats_reset_us, \
+             age(d.datfrozenxid)::int8 AS frozen_xid_age, \
+             mxid_age(d.datminmxid)::int8 AS min_mxid_age, \
+             pg_database_size(d.oid)::int8 AS database_size_bytes, \
+             d.datconnlimit AS datconnlimit, \
+             d.datallowconn AS datallowconn, \
+             d.datistemplate AS datistemplate, \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
-             FROM pg_stat_database"
+             FROM pg_stat_database sd LEFT JOIN pg_database d ON d.oid = sd.datid"
         ),
         DatabaseVersion::V2 => marked!(
-            "SELECT datid, datname::text AS datname, numbackends, \
-             xact_commit, xact_rollback, blks_read, blks_hit, \
-             tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, \
-             conflicts, temp_files, temp_bytes, deadlocks, \
-             blk_read_time, blk_write_time, \
-             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
-             checksum_failures, \
-             (extract(epoch from checksum_last_failure) * 1e6)::int8 AS checksum_last_failure_us, \
+            "SELECT sd.datid, sd.datname::text AS datname, sd.numbackends, \
+             sd.xact_commit, sd.xact_rollback, sd.blks_read, sd.blks_hit, \
+             sd.tup_returned, sd.tup_fetched, sd.tup_inserted, sd.tup_updated, sd.tup_deleted, \
+             sd.conflicts, sd.temp_files, sd.temp_bytes, sd.deadlocks, \
+             sd.blk_read_time, sd.blk_write_time, \
+             (extract(epoch from sd.stats_reset) * 1e6)::int8 AS stats_reset_us, \
+             age(d.datfrozenxid)::int8 AS frozen_xid_age, \
+             mxid_age(d.datminmxid)::int8 AS min_mxid_age, \
+             pg_database_size(d.oid)::int8 AS database_size_bytes, \
+             d.datconnlimit AS datconnlimit, \
+             d.datallowconn AS datallowconn, \
+             d.datistemplate AS datistemplate, \
+             sd.checksum_failures, \
+             (extract(epoch from sd.checksum_last_failure) * 1e6)::int8 AS checksum_last_failure_us, \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
-             FROM pg_stat_database"
+             FROM pg_stat_database sd LEFT JOIN pg_database d ON d.oid = sd.datid"
         ),
         DatabaseVersion::V3 => marked!(
-            "SELECT datid, datname::text AS datname, numbackends, \
-             xact_commit, xact_rollback, blks_read, blks_hit, \
-             tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, \
-             conflicts, temp_files, temp_bytes, deadlocks, \
-             blk_read_time, blk_write_time, \
-             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
-             checksum_failures, \
-             (extract(epoch from checksum_last_failure) * 1e6)::int8 AS checksum_last_failure_us, \
-             session_time, active_time, idle_in_transaction_time, \
-             sessions, sessions_abandoned, sessions_fatal, sessions_killed, \
+            "SELECT sd.datid, sd.datname::text AS datname, sd.numbackends, \
+             sd.xact_commit, sd.xact_rollback, sd.blks_read, sd.blks_hit, \
+             sd.tup_returned, sd.tup_fetched, sd.tup_inserted, sd.tup_updated, sd.tup_deleted, \
+             sd.conflicts, sd.temp_files, sd.temp_bytes, sd.deadlocks, \
+             sd.blk_read_time, sd.blk_write_time, \
+             (extract(epoch from sd.stats_reset) * 1e6)::int8 AS stats_reset_us, \
+             age(d.datfrozenxid)::int8 AS frozen_xid_age, \
+             mxid_age(d.datminmxid)::int8 AS min_mxid_age, \
+             pg_database_size(d.oid)::int8 AS database_size_bytes, \
+             d.datconnlimit AS datconnlimit, \
+             d.datallowconn AS datallowconn, \
+             d.datistemplate AS datistemplate, \
+             sd.checksum_failures, \
+             (extract(epoch from sd.checksum_last_failure) * 1e6)::int8 AS checksum_last_failure_us, \
+             sd.session_time, sd.active_time, sd.idle_in_transaction_time, \
+             sd.sessions, sd.sessions_abandoned, sd.sessions_fatal, sd.sessions_killed, \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
-             FROM pg_stat_database"
+             FROM pg_stat_database sd LEFT JOIN pg_database d ON d.oid = sd.datid"
         ),
         DatabaseVersion::V4 => marked!(
-            "SELECT datid, datname::text AS datname, numbackends, \
-             xact_commit, xact_rollback, blks_read, blks_hit, \
-             tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, \
-             conflicts, temp_files, temp_bytes, deadlocks, \
-             blk_read_time, blk_write_time, \
-             (extract(epoch from stats_reset) * 1e6)::int8 AS stats_reset_us, \
-             checksum_failures, \
-             (extract(epoch from checksum_last_failure) * 1e6)::int8 AS checksum_last_failure_us, \
-             session_time, active_time, idle_in_transaction_time, \
-             sessions, sessions_abandoned, sessions_fatal, sessions_killed, \
-             parallel_workers_to_launch, parallel_workers_launched, \
+            "SELECT sd.datid, sd.datname::text AS datname, sd.numbackends, \
+             sd.xact_commit, sd.xact_rollback, sd.blks_read, sd.blks_hit, \
+             sd.tup_returned, sd.tup_fetched, sd.tup_inserted, sd.tup_updated, sd.tup_deleted, \
+             sd.conflicts, sd.temp_files, sd.temp_bytes, sd.deadlocks, \
+             sd.blk_read_time, sd.blk_write_time, \
+             (extract(epoch from sd.stats_reset) * 1e6)::int8 AS stats_reset_us, \
+             age(d.datfrozenxid)::int8 AS frozen_xid_age, \
+             mxid_age(d.datminmxid)::int8 AS min_mxid_age, \
+             pg_database_size(d.oid)::int8 AS database_size_bytes, \
+             d.datconnlimit AS datconnlimit, \
+             d.datallowconn AS datallowconn, \
+             d.datistemplate AS datistemplate, \
+             sd.checksum_failures, \
+             (extract(epoch from sd.checksum_last_failure) * 1e6)::int8 AS checksum_last_failure_us, \
+             sd.session_time, sd.active_time, sd.idle_in_transaction_time, \
+             sd.sessions, sd.sessions_abandoned, sd.sessions_fatal, sd.sessions_killed, \
+             sd.parallel_workers_to_launch, sd.parallel_workers_launched, \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
-             FROM pg_stat_database"
+             FROM pg_stat_database sd LEFT JOIN pg_database d ON d.oid = sd.datid"
         ),
     }
 }
@@ -185,6 +209,18 @@ pub struct DatabaseRow {
     pub parallel_workers_to_launch: Option<i64>,
     /// Parallel workers launched (V4+).
     pub parallel_workers_launched: Option<i64>,
+    /// Age of `datfrozenxid` in transactions; `None` for the shared-objects row.
+    pub frozen_xid_age: Option<i64>,
+    /// Age of `datminmxid` in multixacts; `None` for the shared-objects row.
+    pub min_mxid_age: Option<i64>,
+    /// On-disk database size in bytes; `None` for the shared-objects row.
+    pub database_size_bytes: Option<i64>,
+    /// Per-database connection limit (`-1` unlimited); `None` for the shared-objects row.
+    pub datconnlimit: Option<i32>,
+    /// Whether the database accepts connections; `None` for the shared-objects row.
+    pub datallowconn: Option<bool>,
+    /// Whether the database is a template; `None` for the shared-objects row.
+    pub datistemplate: Option<bool>,
 }
 
 /// Intern an optional string, preserving `None`.
@@ -238,6 +274,12 @@ pub fn to_v4<E>(
         sessions_killed: row.sessions_killed.unwrap_or(0),
         parallel_workers_to_launch: row.parallel_workers_to_launch.unwrap_or(0),
         parallel_workers_launched: row.parallel_workers_launched.unwrap_or(0),
+        frozen_xid_age: row.frozen_xid_age,
+        min_mxid_age: row.min_mxid_age,
+        database_size_bytes: row.database_size_bytes,
+        datconnlimit: row.datconnlimit,
+        datallowconn: row.datallowconn,
+        datistemplate: row.datistemplate,
     })
 }
 
@@ -279,6 +321,12 @@ pub fn to_v3<E>(
         sessions_abandoned: row.sessions_abandoned.unwrap_or(0),
         sessions_fatal: row.sessions_fatal.unwrap_or(0),
         sessions_killed: row.sessions_killed.unwrap_or(0),
+        frozen_xid_age: row.frozen_xid_age,
+        min_mxid_age: row.min_mxid_age,
+        database_size_bytes: row.database_size_bytes,
+        datconnlimit: row.datconnlimit,
+        datallowconn: row.datallowconn,
+        datistemplate: row.datistemplate,
     })
 }
 
@@ -313,6 +361,12 @@ pub fn to_v2<E>(
         stats_reset: row.stats_reset.map(Ts),
         checksum_failures: row.checksum_failures.unwrap_or(0),
         checksum_last_failure: row.checksum_last_failure.map(Ts),
+        frozen_xid_age: row.frozen_xid_age,
+        min_mxid_age: row.min_mxid_age,
+        database_size_bytes: row.database_size_bytes,
+        datconnlimit: row.datconnlimit,
+        datallowconn: row.datallowconn,
+        datistemplate: row.datistemplate,
     })
 }
 
@@ -345,6 +399,12 @@ pub fn to_v1<E>(
         blk_read_time: row.blk_read_time,
         blk_write_time: row.blk_write_time,
         stats_reset: row.stats_reset.map(Ts),
+        frozen_xid_age: row.frozen_xid_age,
+        min_mxid_age: row.min_mxid_age,
+        database_size_bytes: row.database_size_bytes,
+        datconnlimit: row.datconnlimit,
+        datallowconn: row.datallowconn,
+        datistemplate: row.datistemplate,
     })
 }
 
@@ -396,6 +456,12 @@ fn row_from_pg(row: &tokio_postgres::Row, version: DatabaseVersion) -> DatabaseR
         sessions_killed: has_session.then(|| row.get("sessions_killed")),
         parallel_workers_to_launch: has_parallel.then(|| row.get("parallel_workers_to_launch")),
         parallel_workers_launched: has_parallel.then(|| row.get("parallel_workers_launched")),
+        frozen_xid_age: row.get("frozen_xid_age"),
+        min_mxid_age: row.get("min_mxid_age"),
+        database_size_bytes: row.get("database_size_bytes"),
+        datconnlimit: row.get("datconnlimit"),
+        datallowconn: row.get("datallowconn"),
+        datistemplate: row.get("datistemplate"),
     }
 }
 
@@ -470,6 +536,16 @@ mod tests {
             sessions_killed: Some(0),
             parallel_workers_to_launch: Some(9),
             parallel_workers_launched: Some(8),
+            frozen_xid_age: if datid == 0 { None } else { Some(150_000_000) },
+            min_mxid_age: if datid == 0 { None } else { Some(5_000_000) },
+            database_size_bytes: if datid == 0 {
+                None
+            } else {
+                Some(1_073_741_824)
+            },
+            datconnlimit: if datid == 0 { None } else { Some(-1) },
+            datallowconn: if datid == 0 { None } else { Some(true) },
+            datistemplate: if datid == 0 { None } else { Some(false) },
         }
     }
 
@@ -500,6 +576,9 @@ mod tests {
         ] {
             assert!(database_query(v).contains("pg_stat_database"));
             assert!(database_query(v).contains("pg_kronika"));
+            assert!(database_query(v).contains("frozen_xid_age"));
+            assert!(database_query(v).contains("pg_database_size"));
+            assert!(database_query(v).contains("LEFT JOIN pg_database"));
         }
     }
 
@@ -514,6 +593,9 @@ mod tests {
         assert_eq!(r.checksum_failures, 0);
         assert_eq!(r.checksum_last_failure, None);
         assert_eq!(r.parallel_workers_launched, 8);
+        assert_eq!(r.frozen_xid_age, Some(150_000_000));
+        assert_eq!(r.datconnlimit, Some(-1));
+        assert_eq!(r.datallowconn, Some(true));
     }
 
     #[test]
@@ -521,6 +603,8 @@ mod tests {
         let r = to_v4(&sample_row(0), fake_intern).expect("intern");
         assert_eq!(r.datid, 0);
         assert_eq!(r.datname, None);
+        assert_eq!(r.frozen_xid_age, None);
+        assert_eq!(r.datallowconn, None);
     }
 
     #[test]

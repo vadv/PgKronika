@@ -28,7 +28,6 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_015_001` | replication: статус инстанса | 30 с | `snapshot_full` | `(ts)` |
 | `1_016_001` | replication: реплики primary | 30 с | `snapshot_full` | `(application_name, client_addr, pid, ts)` |
 | `1_017_001` | replication: слоты | 30 с | `snapshot_full` | `(slot_name, ts)` |
-| `1_018_001` | wraparound | 30 с | `snapshot_full` | `(datname, ts)` |
 | `1_019_001` | `pg_settings` | сегмент + 1 ч | `on_change` | `(name)` |
 | `1_020_001` | `reset_metadata` | сегмент | `snapshot_full` | `(ts)` |
 | `1_021_001` | `instance_metadata` | сегмент | `snapshot_full` | `(ts)` |
@@ -206,6 +205,14 @@ is_baseline                     bool  L
 сбрасывалась).
 `blk_read_time` / `blk_write_time` равны нулю без `track_io_timing`.
 
+Каждая строка обогащается данными из каталога `pg_database` (`LEFT JOIN` по
+`oid = datid`): возрасты wraparound `frozen_xid_age` / `min_mxid_age`, размер
+базы `database_size_bytes`, лимит коннектов `datconnlimit` и флаги
+`datallowconn` / `datistemplate`. У строки shared-объектов (`datid = 0`) нет
+записи в `pg_database`, поэтому эти колонки `NULL`. Headroom до аварийного
+autovacuum и насыщение лимита коннектов (`numbackends / datconnlimit`) —
+производные и считаются на чтении.
+
 ### Версии раскладки
 
 В PG 10–18 колонки только добавлялись; удалений и переименований не было:
@@ -216,6 +223,10 @@ is_baseline                     bool  L
 | `1_005_002` | 12, 13 | `+ checksum_failures`, `+ checksum_last_failure` |
 | `1_005_003` | 14, 15, 16, 17 | `+` session-статистика (7 колонок) |
 | `1_005_004` | 18 | `+ parallel_workers_to_launch`, `+ parallel_workers_launched` |
+
+Обогащение из `pg_database` (6 колонок: `frozen_xid_age`, `min_mxid_age`,
+`database_size_bytes`, `datconnlimit`, `datallowconn`, `datistemplate`)
+одинаково во всех раскладках — оно не зависит от мажорной версии.
 
 BDD покрывает раскладки `1_005_003` и `1_005_004`. `1_005_001` / `1_005_002`
 покрыты golden-кодеками.
@@ -243,6 +254,12 @@ deadlocks                   i64   C
 blk_read_time               f64   C   // 0 без track_io_timing
 blk_write_time              f64   C
 stats_reset                 ts?   G   // время сброса статистики БД; NULL без сброса
+frozen_xid_age              i64?  G   // age(datfrozenxid); NULL у shared-строки
+min_mxid_age                i64?  G   // mxid_age(datminmxid); NULL у shared-строки
+database_size_bytes         i64?  G   // pg_database_size(oid); NULL у shared-строки
+datconnlimit                i32?  G   // лимит коннектов БД, -1 = без лимита; NULL у shared
+datallowconn                bool? L   // принимает ли БД подключения; NULL у shared
+datistemplate               bool? L   // шаблонная ли БД; NULL у shared
 checksum_failures           i64   C   // PG12+
 checksum_last_failure       ts?   G   // PG12+; NULL, если ошибок не было
 session_time                f64   C   // PG14+
@@ -256,8 +273,10 @@ parallel_workers_to_launch  i64   C   // PG18+
 parallel_workers_launched   i64   C
 ```
 
-`1_005_003` — без двух parallel-колонок. `1_005_002` — без parallel и без
-session-статистики. `1_005_001` заканчивается на `stats_reset`.
+Раскладки различаются только версионным хвостом после обогащения: `1_005_003`
+— без двух parallel-колонок, `1_005_002` — без parallel и session-статистики,
+`1_005_001` — только базовые счётчики и обогащение. Шесть `pg_database`-колонок
+присутствуют во всех четырёх.
 
 ## `1_006_001` `pg_stat_bgwriter` + `pg_stat_checkpointer`
 
@@ -538,14 +557,6 @@ restart_lsn         i64   G
 confirmed_flush_lsn i64?  G
 retained_bytes      i64?  G
 wal_status          str   G   // reserved | extended | lost, PG13+
-```
-
-## `1_018_001` wraparound
-
-```text
-ts       ts   T
-datname  str  L
-age      i64  G   // age(datfrozenxid)
 ```
 
 ## `1_019_001` `pg_settings`

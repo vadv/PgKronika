@@ -351,7 +351,8 @@ fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
                 "section 1_005_004",
                 segment.catalog().min_ts,
                 segment.catalog().max_ts,
-                rows.iter().map(|r| (r.datid, r.datname, r.ts.0)),
+                rows.iter()
+                    .map(|r| (r.datid, r.datname, r.ts.0, r.frozen_xid_age)),
             )
         }
         DatabaseVersion::V3 => {
@@ -364,7 +365,8 @@ fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
                 "section 1_005_003",
                 segment.catalog().min_ts,
                 segment.catalog().max_ts,
-                rows.iter().map(|r| (r.datid, r.datname, r.ts.0)),
+                rows.iter()
+                    .map(|r| (r.datid, r.datname, r.ts.0, r.frozen_xid_age)),
             )
         }
         other => {
@@ -407,7 +409,7 @@ fn check_database_rows(
     section: &str,
     min_ts: i64,
     max_ts: i64,
-    rows: impl Iterator<Item = (u32, Option<StrId>, i64)>,
+    rows: impl Iterator<Item = (u32, Option<StrId>, i64, Option<i64>)>,
 ) -> anyhow::Result<()> {
     let rows: Vec<_> = rows.collect();
     anyhow::ensure!(
@@ -432,6 +434,10 @@ fn check_database_rows(
         shared.1.is_none(),
         "postgres {major}: shared-objects row has a non-null datname"
     );
+    anyhow::ensure!(
+        shared.3.is_none(),
+        "postgres {major}: shared-objects row has a non-null frozen_xid_age"
+    );
 
     // A `datid != 0` row must resolve its `datname` through the dictionary.
     let real = rows
@@ -451,6 +457,10 @@ fn check_database_rows(
             datname.0
         ),
     }
+    anyhow::ensure!(
+        real.3.is_some(),
+        "postgres {major}: datid != 0 row has a null frozen_xid_age"
+    );
     Ok(())
 }
 

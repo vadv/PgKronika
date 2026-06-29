@@ -63,6 +63,36 @@ alongside bugs, spec, tests, and memory bounds.
 - Crate READMEs are the contract documentation: English `README.md` with a
   Russian `README.ru.md` mirror, kept in sync.
 
+## Standing Rule: Multi-database collection
+
+A collector run must cover **every** database in the instance, not only the one
+named in the DSN. Classifying a metric's source view on this axis is the first
+decision when adding any metric — not optional, not deferrable.
+
+- **Instance-wide** — one connection returns rows for the whole cluster.
+  `pg_stat_database`, `pg_stat_activity`, `pg_database` (wraparound), `pg_locks`,
+  `pg_prepared_xacts`, `pg_stat_statements` (rows carry `dbid`),
+  `pg_stat_progress_*` (rows carry `datid`), and the cluster counters with no
+  owning database (`bgwriter`, `wal`, `archiver`, `io`, `replication`, slots).
+  Collect once on the main connection; where the view names the owning database,
+  label the row with `datname`.
+- **Database-local** — the view shows only objects of the connected database, and
+  the same `relname` lives in other databases invisibly. `pg_stat_user_tables` /
+  `all_tables`, `pg_stat_user_indexes`, `pg_statio_user_*`,
+  `pg_stat_user_functions`, bloat (`pg_class`/`pg_namespace`), object sizes.
+  Collect by connecting to each database; **every row carries a non-nullable
+  `datname: StrId`** taken from the connection. A database-local metric run on a
+  single connection silently drops every database but the DSN's — a correctness
+  bug, not a coverage gap.
+
+**Which databases, and how.** Keep a session open to every database that accepts
+connections — `pg_database WHERE datallowconn AND NOT datistemplate` — minus an
+explicit exclude list from config. Sessions persist across snapshots and are
+refreshed as databases appear or disappear. A database that refuses or errors is
+skipped for that snapshot and never aborts the others. An explicit
+single-database config (`PGDATABASE` / DSN `dbname=`) restricts the run to that
+one database.
+
 ## Playbook: adding a `pg_stat_*` snapshot metric (Step 7)
 
 Reverse-engineering the pattern is what costs time, not the change itself. Copy
@@ -80,18 +110,27 @@ a reference type instead of rediscovering the wiring.
   block in `pg_kronika-collector/src/main.rs`, and the
   `pg_stat_activity.feature` + `assert_activity_section` BDD pair.
 
+**First, classify the metric** (see *Standing Rule: Multi-database collection*):
+instance-wide or database-local? Database-local adds a non-nullable `datname:
+StrId` to the schema and a per-database collection loop; instance-wide does not.
+
 **Five places to change (in this order — doc leads code):**
 
 1. `docs/type-registry/postgresql.md` — summary table row(s) + the type section.
-   One `type_id` per version group when the catalog schema differs across majors
+   A new version (`VVV`) is for a *PostgreSQL catalog* difference across majors
    (monotonic column adds → separate versions, **not** one type with `Option`
-   version columns; that is the registry discipline).
+   version columns; that is the registry discipline). An enrichment column that is
+   identical on every major goes into the existing layouts in place — pre-release,
+   no `VVV` bump, since no stored segments must stay readable. Layouts freeze at
+   the first release.
 2. `kronika-registry/src/codec/<name>.rs` — one `#[derive(Section)]` struct per
    version. `#[section(id=, name=, semantics=snapshot_full, sort_key("ts",...))]`,
    fields `#[column(t|c|g|l)]`. `t` = `Ts`, non-null, must be named `ts` (linter).
    `Option<T>` → nullable. Types: `i8..u64`, `f32/f64`, `bool`, `Ts`, `StrId`.
    Wire it: `codec.rs` `pub mod <name>;`; `lib.rs` add the module to the
    `pub use codec::{...}` line and the `CONTRACT`s to `registry()`.
+   Database-local metric: add `datname: StrId` (non-nullable, `#[column(l)]`) and
+   lead `sort_key` with it, so rows are keyed per database.
 3. `kronika-source-pg/src/<name>.rs` — depends only on `registry` +
    `tokio-postgres`. Own `marked!` macro (path = this file). Shape:
    `enum Version`, `const fn <name>_version(major) -> Version`,
@@ -111,6 +150,9 @@ a reference type instead of rediscovering the wiring.
    is plain `u64`). Then `dict::encode(interner.window())` →
    `buffers.flush(&dict_sections, source_id)`. `DictLimits::new(4096, 64*1024)`
    `.and_then(|l| l.with_max_total_bytes(16<<20))` — caps collector memory.
+   Database-local metric: call `collect_<name>` once per open database session and
+   intern that session's `datname` into every row. Run every session's
+   `collect_*().await` before building the (non-`Send`) `Interner`/`SectionBuffers`.
 5. `kronika-bdd/` — `features/<name>.feature` scenario + a `then` step. Verify
    via `Segment::open`, `catalog().entries.find(type_id)`,
    `VerifiedSection::verify(Bytes, crc, crc32c)` + `TypeVN::decode`, and
