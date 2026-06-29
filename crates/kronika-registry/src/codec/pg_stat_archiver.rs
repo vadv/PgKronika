@@ -1,13 +1,10 @@
 //! Type `1_008_001`: `pg_stat_archiver`.
 //!
-//! WAL-archiver progress, one row, stable across PG 10-18.
+//! WAL archiver singleton.
 
 use crate::{Section, StrId, Ts};
 
-/// Type `1_008_001`: `pg_stat_archiver`, one row of WAL-archiver progress.
-///
-/// The last-archived and last-failed WAL file names go through the dictionary;
-/// they are `None` until the first archive or failure.
+/// Type `1_008_001`: `pg_stat_archiver`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(
     id = 1_008_001,
