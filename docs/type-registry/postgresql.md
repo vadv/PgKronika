@@ -400,16 +400,17 @@ indexes_processed     i64? G   // PG17+
 delay_time            f64? G   // PG18+
 ```
 
-Одна строка на backend, выполняющий `VACUUM` (autovacuum в том числе; `VACUUM
-FULL` сюда не попадает). Представление пусто, когда vacuum не идёт, — секция
-тогда отсутствует. PG17 заменил поштучный учёт мёртвых кортежей
-(`max_dead_tuples` / `num_dead_tuples`) на байтовый TID-store
-(`max_dead_tuple_bytes` / `dead_tuple_bytes` + `num_dead_item_ids`) и добавил
-прогресс по индексам; это смена единиц, а не переименование, поэтому колонки
-эпох держатся раздельно. PG18 добавил `delay_time`. `datid` (oid БД) не берётся: идентификацию несёт
-`datname`, а связь с `pg_stat_activity` идёт по `pid`. `heap_blks_scanned` /
-`heap_blks_vacuumed` монотонны внутри одного vacuum, но класс `G`: между
-запусками сбрасываются.
+Одна строка на backend, выполняющий `VACUUM`, включая autovacuum. `VACUUM FULL`
+сюда не попадает. Если `pg_stat_progress_vacuum` пусто, секция отсутствует.
+
+PG17 заменил счётчики мёртвых кортежей (`max_dead_tuples` / `num_dead_tuples`)
+на байтовый TID-store (`max_dead_tuple_bytes` / `dead_tuple_bytes`) и
+`num_dead_item_ids`; эти колонки не объединяются, потому что единицы измерения
+разные. PG17 также добавил прогресс по индексам, PG18 — `delay_time`.
+
+`datid` (OID БД) не сохраняется: идентификацию несёт `datname`, а связь с
+`pg_stat_activity` идёт по `pid`. `heap_blks_scanned` / `heap_blks_vacuumed`
+монотонны внутри одного vacuum, но класс `G`: между запусками сбрасываются.
 
 ## `1_013_001` `pg_stat_user_tables` + `pg_statio_user_tables`
 

@@ -1,21 +1,14 @@
 //! Type `1_012_001`: `pg_stat_progress_vacuum`.
 //!
-//! One row per backend running `VACUUM` (autovacuum workers included; `VACUUM
-//! FULL` is reported elsewhere). PG17 replaced the tuple-count dead-tuple
-//! accounting with a byte-based TID store and added index-progress counters;
-//! PG18 added `delay_time`. Version-specific columns are stored as `None` on the
-//! versions that lack them, so one layout spans PG 10-18.
+//! One row per backend running `VACUUM`; the collector writes no section when
+//! the view is empty. Fields absent on the server version stay `None`.
 
 use crate::{Section, StrId, Ts};
 
-/// One row of type `1_012_001`. Fields absent in the server's major version are
-/// `None`.
+/// Type `1_012_001`: one `pg_stat_progress_vacuum` row.
 ///
-/// The dead-tuple columns differ by era: PG 10-16 report counts
-/// (`max_dead_tuples` / `num_dead_tuples`); PG17+ report the TID store in bytes
-/// (`max_dead_tuple_bytes` / `dead_tuple_bytes`) plus `num_dead_item_ids`. These
-/// are not renames — the units changed — so they are kept as distinct columns.
-/// `indexes_total` / `indexes_processed` arrive in PG17, `delay_time` in PG18.
+/// PG 10-16 report dead tuples as counts. PG17+ reports TID-store bytes and
+/// item ids, so the eras use separate nullable columns. PG18 adds `delay_time`.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_012_001,
@@ -30,13 +23,13 @@ pub struct PgStatProgressVacuum {
     /// Process id of the backend running this vacuum.
     #[column(l)]
     pub pid: i32,
-    /// Database being vacuumed, interned into the segment dictionary.
+    /// Database being vacuumed, interned in the segment dictionary.
     #[column(l)]
     pub datname: StrId,
-    /// Oid of the table being vacuumed.
+    /// OID of the table being vacuumed.
     #[column(l)]
     pub relid: u32,
-    /// Current vacuum phase (e.g. `scanning heap`), interned.
+    /// Current vacuum phase, such as `scanning heap`, interned.
     #[column(l)]
     pub phase: StrId,
     /// Heap blocks in the table at scan start.
@@ -61,8 +54,7 @@ pub struct PgStatProgressVacuum {
     /// Dead-tuple TID store capacity in bytes (PG17+); `None` before PG17.
     #[column(g)]
     pub max_dead_tuple_bytes: Option<i64>,
-    /// Bytes the dead-tuple TID store currently holds (PG17+); `None` before
-    /// PG17.
+    /// Bytes the dead-tuple TID store holds (PG17+); `None` before PG17.
     #[column(g)]
     pub dead_tuple_bytes: Option<i64>,
     /// Dead item identifiers collected (PG17+); `None` before PG17.
