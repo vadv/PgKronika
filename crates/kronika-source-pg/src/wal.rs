@@ -42,7 +42,9 @@ pub const fn wal_version(major: u32) -> Option<WalVersion> {
 
 /// The SQL for one layout.
 ///
-/// `ts` is one `statement_timestamp()`; `wal_bytes` is cast to `int8`.
+/// `ts` is one `statement_timestamp()`. `wal_bytes` is `numeric` in
+/// `PostgreSQL`; casting to `int8` makes overflow fail collection instead of
+/// truncating.
 #[must_use]
 pub const fn wal_query(version: WalVersion) -> &'static str {
     match version {
@@ -138,7 +140,7 @@ mod tests {
         for version in [WalVersion::V1, WalVersion::V2] {
             assert!(wal_query(version).contains("pg_stat_wal"));
             assert!(wal_query(version).contains("pg_kronika"));
-            assert!(wal_query(version).contains("wal_bytes"));
+            assert!(wal_query(version).contains("wal_bytes::int8 AS wal_bytes"));
         }
     }
 }

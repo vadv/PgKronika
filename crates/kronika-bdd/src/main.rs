@@ -28,10 +28,13 @@ use kronika_registry::{
     Bytes, MAX_SECTION_BYTES, Section, StrId, VerifiedSection,
     bgwriter_checkpointer::BgwriterCheckpointer,
     pg_stat_activity::PgStatActivityV3,
+    pg_stat_archiver::PgStatArchiver,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
+    pg_stat_io::{PgStatIoV1, PgStatIoV2},
     pg_stat_wal::{PgStatWalV1, PgStatWalV2},
 };
 use kronika_source_pg::database::{DatabaseVersion, database_version};
+use kronika_source_pg::io::{IoVersion, io_version};
 use kronika_source_pg::wal::{WalVersion, wal_version};
 use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
 
@@ -46,6 +49,10 @@ const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
 
 const PG_STAT_WAL_V1_TYPE_ID: u32 = 1_007_001;
 const PG_STAT_WAL_V2_TYPE_ID: u32 = 1_007_002;
+
+const PG_STAT_IO_V1_TYPE_ID: u32 = 1_009_001;
+const PG_STAT_IO_V2_TYPE_ID: u32 = 1_009_002;
+const PG_STAT_ARCHIVER_TYPE_ID: u32 = 1_008_001;
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
@@ -476,38 +483,268 @@ async fn every_version_seals_wal(world: &mut BddWorld) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Check selected layout, timestamp, single-row shape, and non-negative counters.
+#[then("every version handles pg_stat_io per its layout, resolving labels through the dictionary")]
+async fn every_version_handles_io(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_io_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+#[then("every version seals a single-row pg_stat_archiver section")]
+async fn every_version_seals_archiver(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_archiver_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Check selected layout, timestamp, singleton shape, reset, and counters.
 fn assert_wal_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
     let min_ts = segment.catalog().min_ts;
     let max_ts = segment.catalog().max_ts;
+    let has = |type_id: u32| {
+        segment
+            .catalog()
+            .entries
+            .iter()
+            .any(|entry| entry.type_id == type_id)
+    };
     match wal_version(major) {
         Some(WalVersion::V1) => {
+            anyhow::ensure!(
+                !has(PG_STAT_WAL_V2_TYPE_ID),
+                "postgres {major}: PG14-17 sealed the PG18 wal layout 1_007_002"
+            );
             let rows = decode_section_rows::<PgStatWalV1>(path, &segment, PG_STAT_WAL_V1_TYPE_ID)
                 .with_context(|| format!("postgres {major}: read back section 1_007_001"))?;
             let row = single_wal_row(major, rows)?;
             ensure_ts_in_segment_range(major, "section 1_007_001", row.ts.0, min_ts, max_ts)?;
             anyhow::ensure!(
                 row.wal_records >= 0
+                    && row.wal_fpi >= 0
                     && row.wal_bytes >= 0
                     && row.wal_buffers_full >= 0
                     && row.wal_write >= 0
                     && row.wal_sync >= 0,
                 "postgres {major}: a pg_stat_wal counter came back negative"
             );
+            anyhow::ensure!(
+                row.wal_write_time.is_finite()
+                    && row.wal_write_time >= 0.0
+                    && row.wal_sync_time.is_finite()
+                    && row.wal_sync_time >= 0.0,
+                "postgres {major}: pg_stat_wal timing came back invalid"
+            );
+            check_wal_stats_reset(major, row.stats_reset.map(|ts| ts.0), row.ts.0)?;
         }
         Some(WalVersion::V2) => {
+            anyhow::ensure!(
+                !has(PG_STAT_WAL_V1_TYPE_ID),
+                "postgres {major}: PG18 sealed the PG14-17 wal layout 1_007_001"
+            );
             let rows = decode_section_rows::<PgStatWalV2>(path, &segment, PG_STAT_WAL_V2_TYPE_ID)
                 .with_context(|| format!("postgres {major}: read back section 1_007_002"))?;
             let row = single_wal_row(major, rows)?;
             ensure_ts_in_segment_range(major, "section 1_007_002", row.ts.0, min_ts, max_ts)?;
             anyhow::ensure!(
-                row.wal_records >= 0 && row.wal_bytes >= 0 && row.wal_buffers_full >= 0,
+                row.wal_records >= 0
+                    && row.wal_fpi >= 0
+                    && row.wal_bytes >= 0
+                    && row.wal_buffers_full >= 0,
                 "postgres {major}: a pg_stat_wal counter came back negative"
             );
+            check_wal_stats_reset(major, row.stats_reset.map(|ts| ts.0), row.ts.0)?;
         }
-        None => anyhow::bail!("postgres {major}: matrix version predates pg_stat_wal (PG14+)"),
+        None => {
+            anyhow::ensure!(
+                !has(PG_STAT_WAL_V1_TYPE_ID) && !has(PG_STAT_WAL_V2_TYPE_ID),
+                "postgres {major}: pg_stat_wal section present before PG14"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `stats_reset`, when present, must not be after the snapshot ts.
+fn check_wal_stats_reset(major: u32, reset: Option<i64>, ts: i64) -> anyhow::Result<()> {
+    if let Some(reset) = reset {
+        anyhow::ensure!(
+            reset <= ts,
+            "postgres {major}: wal stats_reset {reset} is after snapshot ts {ts}"
+        );
+    }
+    Ok(())
+}
+
+/// Read back the `pg_stat_io` section per the major's layout.
+///
+/// Before PG16 the view does not exist and neither layout may appear. On PG16-17
+/// it is `1_009_001` (with `op_bytes`), on PG18 `1_009_002` (per-op byte
+/// counters); only the version's own layout may be sealed. The check decodes the
+/// rows, confirms one snapshot timestamp, the layout-specific columns, that any
+/// `stats_reset` precedes the snapshot, and resolves the labels.
+fn assert_io_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let has = |type_id: u32| {
+        segment
+            .catalog()
+            .entries
+            .iter()
+            .any(|entry| entry.type_id == type_id)
+    };
+    let Some(version) = io_version(major) else {
+        anyhow::ensure!(
+            !has(PG_STAT_IO_V1_TYPE_ID) && !has(PG_STAT_IO_V2_TYPE_ID),
+            "postgres {major}: pg_stat_io section present, but the view does not exist before PG16"
+        );
+        return Ok(());
+    };
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    match version {
+        IoVersion::V1 => {
+            anyhow::ensure!(
+                !has(PG_STAT_IO_V2_TYPE_ID),
+                "postgres {major}: PG16-17 sealed the PG18 io layout 1_009_002"
+            );
+            let rows = decode_io_section::<PgStatIoV1>(path, &segment, PG_STAT_IO_V1_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_009_001"))?;
+            anyhow::ensure!(
+                rows.iter().any(|r| r.op_bytes.is_some()),
+                "postgres {major}: V1 io rows carry no op_bytes"
+            );
+            check_io_stats_reset(
+                major,
+                rows.iter().map(|r| (r.stats_reset.map(|t| t.0), r.ts.0)),
+            )?;
+            check_io_rows(
+                major,
+                &dict,
+                rows.iter()
+                    .map(|r| (r.backend_type, r.object, r.context, r.ts.0)),
+            )
+        }
+        IoVersion::V2 => {
+            anyhow::ensure!(
+                !has(PG_STAT_IO_V1_TYPE_ID),
+                "postgres {major}: PG18 sealed the PG16-17 io layout 1_009_001"
+            );
+            let rows = decode_io_section::<PgStatIoV2>(path, &segment, PG_STAT_IO_V2_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_009_002"))?;
+            anyhow::ensure!(
+                rows.iter()
+                    .any(|r| r.read_bytes.is_some() || r.write_bytes.is_some()),
+                "postgres {major}: V2 io rows carry no byte counters"
+            );
+            check_io_stats_reset(
+                major,
+                rows.iter().map(|r| (r.stats_reset.map(|t| t.0), r.ts.0)),
+            )?;
+            check_io_rows(
+                major,
+                &dict,
+                rows.iter()
+                    .map(|r| (r.backend_type, r.object, r.context, r.ts.0)),
+            )
+        }
+    }
+}
+
+/// Read the catalog-bounded section and decode its typed rows.
+fn decode_io_section<T: Section>(
+    path: &Path,
+    segment: &Segment,
+    type_id: u32,
+) -> anyhow::Result<Vec<T>> {
+    use std::os::unix::fs::FileExt;
+
+    let entry = segment
+        .catalog()
+        .entries
+        .iter()
+        .find(|entry| entry.type_id == type_id)
+        .with_context(|| format!("segment has no section {type_id}"))?;
+    let len = usize::try_from(entry.len).context("section len overflows usize")?;
+    anyhow::ensure!(
+        len <= MAX_SECTION_BYTES,
+        "section of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
+    );
+    let mut body = vec![0_u8; len];
+    std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
+
+    let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
+        .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
+    T::decode(verified).context("typed decode of the pg_stat_io section")
+}
+
+/// Shared invariants over the decoded `(backend_type, object, context, ts)`
+/// projection: one snapshot ts, every label resolves, at least one relation row.
+fn check_io_rows(
+    major: u32,
+    dict: &Dictionary,
+    rows: impl Iterator<Item = (StrId, StrId, StrId, i64)>,
+) -> anyhow::Result<()> {
+    let rows: Vec<_> = rows.collect();
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "postgres {major}: pg_stat_io section decoded to no rows"
+    );
+    let ts = rows[0].3;
+    anyhow::ensure!(
+        rows.iter().all(|row| row.3 == ts),
+        "postgres {major}: snapshot rows carry differing ts"
+    );
+
+    let mut saw_relation = false;
+    for (backend_type, object, context, _) in &rows {
+        for (label, id) in [
+            ("backend_type", backend_type),
+            ("object", object),
+            ("context", context),
+        ] {
+            match dict.resolve(id.0) {
+                Some(Resolved::String(bytes)) => {
+                    if label == "object" && bytes == b"relation".as_slice() {
+                        saw_relation = true;
+                    }
+                }
+                other => anyhow::bail!(
+                    "postgres {major}: {label} str_id {} did not resolve to a string: {other:?}",
+                    id.0
+                ),
+            }
+        }
+    }
+    anyhow::ensure!(
+        saw_relation,
+        "postgres {major}: no pg_stat_io row for object=relation"
+    );
+    Ok(())
+}
+
+/// `stats_reset`, when present, must not be after the snapshot ts.
+fn check_io_stats_reset(
+    major: u32,
+    rows: impl Iterator<Item = (Option<i64>, i64)>,
+) -> anyhow::Result<()> {
+    for (reset, ts) in rows {
+        if let Some(reset) = reset {
+            anyhow::ensure!(
+                reset <= ts,
+                "postgres {major}: io stats_reset {reset} is after snapshot ts {ts}"
+            );
+        }
     }
     Ok(())
 }
@@ -523,6 +760,85 @@ fn single_wal_row<T>(major: u32, rows: Vec<T>) -> anyhow::Result<T> {
         "postgres {major}: pg_stat_wal section decoded to multiple rows"
     );
     Ok(row)
+}
+
+/// Check singleton shape, counters, timestamp, and optional WAL-name dictionary ids.
+fn assert_archiver_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let catalog = segment.catalog();
+    let entry = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.type_id == PG_STAT_ARCHIVER_TYPE_ID)
+        .with_context(|| format!("postgres {major}: segment has no section 1_008_001"))?;
+    let rows = decode_archiver(path, entry)
+        .with_context(|| format!("postgres {major}: read back section 1_008_001"))?;
+    anyhow::ensure!(
+        rows.len() == 1,
+        "postgres {major}: pg_stat_archiver is a singleton, got {} rows",
+        rows.len()
+    );
+    let row = rows[0];
+    ensure_ts_in_segment_range(
+        major,
+        "section 1_008_001",
+        row.ts.0,
+        catalog.min_ts,
+        catalog.max_ts,
+    )?;
+    anyhow::ensure!(
+        row.archived_count >= 0 && row.failed_count >= 0,
+        "postgres {major}: archiver counters came back negative"
+    );
+    if let Some(reset) = row.stats_reset {
+        anyhow::ensure!(
+            reset.0 <= row.ts.0,
+            "postgres {major}: archiver stats_reset {} is after snapshot ts {}",
+            reset.0,
+            row.ts.0
+        );
+    }
+    if row.last_archived_wal.is_some() || row.last_failed_wal.is_some() {
+        let dict = segment
+            .dictionary()
+            .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+        resolve_archiver_wal(major, &dict, "last_archived_wal", row.last_archived_wal)?;
+        resolve_archiver_wal(major, &dict, "last_failed_wal", row.last_failed_wal)?;
+    }
+    Ok(())
+}
+
+fn resolve_archiver_wal(
+    major: u32,
+    dict: &Dictionary,
+    field: &str,
+    wal: Option<StrId>,
+) -> anyhow::Result<()> {
+    if let Some(wal) = wal {
+        anyhow::ensure!(
+            matches!(dict.resolve(wal.0), Some(Resolved::String(_))),
+            "postgres {major}: {field} str_id {} did not resolve through the dictionary",
+            wal.0
+        );
+    }
+    Ok(())
+}
+
+/// Read the catalog-bounded section and decode its typed rows.
+fn decode_archiver(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStatArchiver>> {
+    use std::os::unix::fs::FileExt;
+
+    let len = usize::try_from(entry.len).context("section len overflows usize")?;
+    anyhow::ensure!(
+        len <= MAX_SECTION_BYTES,
+        "section of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
+    );
+    let mut body = vec![0_u8; len];
+    std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
+    let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
+        .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
+    PgStatArchiver::decode(verified).context("typed decode of section 1_008_001")
 }
 
 #[tokio::main]
