@@ -29,6 +29,7 @@ use kronika_registry::{
     bgwriter_checkpointer::BgwriterCheckpointer,
     pg_stat_activity::PgStatActivityV3,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
+    wraparound::WraparoundAge,
 };
 use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
@@ -41,6 +42,8 @@ const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
 
 const PG_STAT_DATABASE_V3_TYPE_ID: u32 = 1_005_003;
 const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
+
+const PG_WRAPAROUND_TYPE_ID: u32 = 1_018_001;
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
@@ -397,7 +400,7 @@ fn decode_db_section<T: Section>(
 
     let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
         .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
-    T::decode(verified).context("typed decode of the pg_stat_database section")
+    T::decode(verified).with_context(|| format!("typed decode of section {type_id}"))
 }
 
 /// Shared invariants for the decoded `(datid, datname, ts)` projection.
@@ -450,6 +453,68 @@ fn check_database_rows(
             "postgres {major}: datname str_id {} did not resolve to a string: {other:?}",
             datname.0
         ),
+    }
+    Ok(())
+}
+
+#[then("each matrix cluster seals per-database wraparound ages")]
+async fn every_version_seals_wraparound(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_wraparound_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Decode the sealed `wraparound` section, then check one snapshot timestamp,
+/// non-negative ages, and dictionary-backed database names. Every cluster has at
+/// least the template and default databases, so the section is never empty.
+fn assert_wraparound_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    let rows = decode_db_section::<WraparoundAge>(path, &segment, PG_WRAPAROUND_TYPE_ID)
+        .with_context(|| format!("postgres {major}: read back section 1_018_001"))?;
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "postgres {major}: wraparound section decoded to no rows"
+    );
+
+    // One statement_timestamp() covers the whole snapshot.
+    let ts = rows[0].ts.0;
+    anyhow::ensure!(
+        rows.iter().all(|row| row.ts.0 == ts),
+        "postgres {major}: snapshot rows carry differing ts"
+    );
+    ensure_ts_in_segment_range(
+        major,
+        "section 1_018_001",
+        ts,
+        segment.catalog().min_ts,
+        segment.catalog().max_ts,
+    )?;
+
+    for row in &rows {
+        anyhow::ensure!(
+            row.age >= 0 && row.mxid_age >= 0,
+            "postgres {major}: wraparound age {} / mxid_age {} is negative",
+            row.age,
+            row.mxid_age
+        );
+        match dict.resolve(row.datname.0) {
+            Some(Resolved::String(bytes)) => anyhow::ensure!(
+                !bytes.is_empty(),
+                "postgres {major}: datname resolved to an empty string"
+            ),
+            other => anyhow::bail!(
+                "postgres {major}: datname str_id {} did not resolve to a string: {other:?}",
+                row.datname.0
+            ),
+        }
     }
     Ok(())
 }

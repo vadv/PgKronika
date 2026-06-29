@@ -26,6 +26,7 @@ pub mod instance_metadata;
 pub mod pg_stat_activity;
 pub mod pg_stat_database;
 pub mod reset_metadata;
+pub mod wraparound;
 
 /// Maximum rows in one snapshot section.
 ///

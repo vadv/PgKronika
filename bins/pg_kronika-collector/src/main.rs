@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use kronika_format::DictLimits;
 use kronika_registry::StrId;
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
+use kronika_source_pg::wraparound::{WraparoundRow, collect_wraparound, to_wraparound};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
     to_v1, to_v2, to_v3,
@@ -123,6 +124,9 @@ async fn snapshot_and_seal(
     let (database_version, database_rows) = collect_database(client, major)
         .await
         .context("collect pg_stat_database")?;
+    let wraparound_rows = collect_wraparound(client)
+        .await
+        .context("collect wraparound ages")?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -141,6 +145,7 @@ async fn snapshot_and_seal(
         database_version,
         &database_rows,
     )?;
+    push_wraparound(&mut buffers, &mut interner, &wraparound_rows)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -209,6 +214,23 @@ fn push_database(
             DatabaseVersion::V3 => buffer_row(buffers, database::to_v3(row, &mut intern)?)?,
             DatabaseVersion::V4 => buffer_row(buffers, database::to_v4(row, &mut intern)?)?,
         }
+    }
+    Ok(())
+}
+
+/// Intern each row's `datname` and buffer it as a wraparound section row.
+///
+/// # Errors
+/// Returns an error if `datname` cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_wraparound(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[WraparoundRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_wraparound(row, &mut intern)?)?;
     }
     Ok(())
 }

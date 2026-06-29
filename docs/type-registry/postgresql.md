@@ -543,10 +543,18 @@ wal_status          str   G   // reserved | extended | lost, PG13+
 ## `1_018_001` wraparound
 
 ```text
-ts       ts   T
-datname  str  L
-age      i64  G   // age(datfrozenxid)
+ts        ts   T
+datname   str  L
+age       i64  G   // age(datfrozenxid)
+mxid_age  i64  G   // mxid_age(datminmxid)
 ```
+
+Две независимые оси wraparound: `age` (XID) и `mxid_age` (multixact), у каждой
+свой порог аварийного autovacuum (`autovacuum_freeze_max_age` /
+`autovacuum_multixact_freeze_max_age`). Берётся по всем базам `pg_database`,
+включая `template0` и базы, запрещающие подключения: их `datfrozenxid` /
+`datminmxid` тоже стареют и ограничивают запас. Запас кластера — максимум по
+базам на каждой оси (на чтении).
 
 ## `1_019_001` `pg_settings`
 
