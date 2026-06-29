@@ -40,6 +40,8 @@ pub mod prepared_xacts;
 
 pub mod progress_vacuum;
 
+pub mod replication_instance;
+
 /// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->
 /// `17`.
 ///

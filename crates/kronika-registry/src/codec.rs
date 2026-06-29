@@ -30,6 +30,7 @@ pub mod pg_stat_database;
 pub mod pg_stat_io;
 pub mod pg_stat_progress_vacuum;
 pub mod pg_stat_wal;
+pub mod replication_instance;
 pub mod reset_metadata;
 
 /// Maximum rows in one snapshot section.
