@@ -342,7 +342,9 @@ fn decode_activity_rows(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStat
     PgStatActivityV3::decode(verified).context("typed decode of section 1_001_003")
 }
 
-#[then("each matrix cluster seals pg_stat_database rows with dictionary-backed names")]
+#[then(
+    "each matrix cluster seals pg_stat_database rows with catalog fields and dictionary-backed names"
+)]
 async fn every_version_seals_database(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
     for db in &world.clusters {
@@ -354,8 +356,8 @@ async fn every_version_seals_database(world: &mut BddWorld) -> anyhow::Result<()
 }
 
 /// Decode the sealed `pg_stat_database` section for the selected layout, then
-/// check one snapshot timestamp, the shared row, and dictionary-backed database
-/// names.
+/// check one snapshot timestamp, the shared row, dictionary-backed database
+/// names, and `pg_database` catalog fields.
 fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
@@ -376,7 +378,17 @@ fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
                 "section 1_005_004",
                 segment.catalog().min_ts,
                 segment.catalog().max_ts,
-                rows.iter().map(|r| (r.datid, r.datname, r.ts.0)),
+                rows.iter().map(|r| DatabaseObservation {
+                    datid: r.datid,
+                    datname: r.datname,
+                    ts: r.ts.0,
+                    numbackends: r.numbackends,
+                    frozen_xid_age: r.frozen_xid_age,
+                    min_mxid_age: r.min_mxid_age,
+                    datconnlimit: r.datconnlimit,
+                    datallowconn: r.datallowconn,
+                    datistemplate: r.datistemplate,
+                }),
             )
         }
         DatabaseVersion::V3 => {
@@ -392,13 +404,37 @@ fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
                 "section 1_005_003",
                 segment.catalog().min_ts,
                 segment.catalog().max_ts,
-                rows.iter().map(|r| (r.datid, r.datname, r.ts.0)),
+                rows.iter().map(|r| DatabaseObservation {
+                    datid: r.datid,
+                    datname: r.datname,
+                    ts: r.ts.0,
+                    numbackends: r.numbackends,
+                    frozen_xid_age: r.frozen_xid_age,
+                    min_mxid_age: r.min_mxid_age,
+                    datconnlimit: r.datconnlimit,
+                    datallowconn: r.datallowconn,
+                    datistemplate: r.datistemplate,
+                }),
             )
         }
         other => {
             anyhow::bail!("postgres {major}: matrix version maps to {other:?}, expected V3 or V4")
         }
     }
+}
+
+/// Database row fields covered by the live BDD matrix for V3/V4 layouts.
+#[derive(Debug, Clone, Copy)]
+struct DatabaseObservation {
+    datid: u32,
+    datname: Option<StrId>,
+    ts: i64,
+    numbackends: Option<i32>,
+    frozen_xid_age: Option<i64>,
+    min_mxid_age: Option<i64>,
+    datconnlimit: Option<i32>,
+    datallowconn: Option<bool>,
+    datistemplate: Option<bool>,
 }
 
 /// Read the catalog-bounded section and decode its typed rows.
@@ -428,14 +464,14 @@ fn decode_section_rows<T: Section>(
     T::decode(verified).context("typed decode of the sealed section")
 }
 
-/// Shared invariants for the decoded `(datid, datname, ts)` projection.
+/// Shared invariants for the decoded database rows.
 fn check_database_rows(
     major: u32,
     dict: &Dictionary,
     section: &str,
     min_ts: i64,
     max_ts: i64,
-    rows: impl Iterator<Item = (u32, Option<StrId>, i64)>,
+    rows: impl Iterator<Item = DatabaseObservation>,
 ) -> anyhow::Result<()> {
     let rows: Vec<_> = rows.collect();
     anyhow::ensure!(
@@ -444,9 +480,9 @@ fn check_database_rows(
     );
 
     // One statement_timestamp() covers the whole snapshot.
-    let ts = rows[0].2;
+    let ts = rows[0].ts;
     anyhow::ensure!(
-        rows.iter().all(|row| row.2 == ts),
+        rows.iter().all(|row| row.ts == ts),
         "postgres {major}: snapshot rows carry differing ts"
     );
     ensure_ts_in_segment_range(major, section, ts, min_ts, max_ts)?;
@@ -454,30 +490,85 @@ fn check_database_rows(
     // PG12+ adds a shared-objects row with `datid = 0` and no `datname`.
     let shared = rows
         .iter()
-        .find(|row| row.0 == 0)
+        .find(|row| row.datid == 0)
         .with_context(|| format!("postgres {major}: no datid=0 shared-objects row"))?;
     anyhow::ensure!(
-        shared.1.is_none(),
+        shared.datname.is_none(),
         "postgres {major}: shared-objects row has a non-null datname"
     );
+    anyhow::ensure!(
+        shared.numbackends.is_none(),
+        "postgres {major}: shared-objects row has a non-null numbackends"
+    );
+    anyhow::ensure!(
+        shared.frozen_xid_age.is_none(),
+        "postgres {major}: shared-objects row has a non-null frozen_xid_age"
+    );
+    anyhow::ensure!(
+        shared.min_mxid_age.is_none(),
+        "postgres {major}: shared-objects row has a non-null min_mxid_age"
+    );
+    anyhow::ensure!(
+        shared.datconnlimit.is_none()
+            && shared.datallowconn.is_none()
+            && shared.datistemplate.is_none(),
+        "postgres {major}: shared-objects row has non-null pg_database flags"
+    );
 
-    // A `datid != 0` row must resolve its `datname` through the dictionary.
-    let real = rows
-        .iter()
-        .find(|row| row.0 != 0)
-        .with_context(|| format!("postgres {major}: no datid != 0 database row"))?;
-    let datname = real
-        .1
-        .with_context(|| format!("postgres {major}: datid != 0 row has a null datname"))?;
-    match dict.resolve(datname.0) {
-        Some(Resolved::String(bytes)) => anyhow::ensure!(
-            !bytes.is_empty(),
-            "postgres {major}: datname resolved to an empty string"
-        ),
-        other => anyhow::bail!(
-            "postgres {major}: datname str_id {} did not resolve to a string: {other:?}",
-            datname.0
-        ),
+    let real_rows: Vec<_> = rows.iter().filter(|row| row.datid != 0).collect();
+    anyhow::ensure!(
+        !real_rows.is_empty(),
+        "postgres {major}: no datid != 0 database row"
+    );
+
+    for real in real_rows {
+        let datname = real.datname.with_context(|| {
+            format!(
+                "postgres {major}: datid {} row has a null datname",
+                real.datid
+            )
+        })?;
+        match dict.resolve(datname.0) {
+            Some(Resolved::String(bytes)) => anyhow::ensure!(
+                !bytes.is_empty(),
+                "postgres {major}: datid {} datname resolved to an empty string",
+                real.datid
+            ),
+            other => anyhow::bail!(
+                "postgres {major}: datname str_id {} did not resolve to a string: {other:?}",
+                datname.0
+            ),
+        }
+        anyhow::ensure!(
+            real.numbackends.is_some(),
+            "postgres {major}: datid {} row has a null numbackends",
+            real.datid
+        );
+        anyhow::ensure!(
+            real.frozen_xid_age.is_some(),
+            "postgres {major}: datid {} row has a null frozen_xid_age",
+            real.datid
+        );
+        anyhow::ensure!(
+            real.min_mxid_age.is_some(),
+            "postgres {major}: datid {} row has a null min_mxid_age",
+            real.datid
+        );
+        anyhow::ensure!(
+            real.datconnlimit.is_some(),
+            "postgres {major}: datid {} row has a null datconnlimit",
+            real.datid
+        );
+        anyhow::ensure!(
+            real.datallowconn.is_some(),
+            "postgres {major}: datid {} row has a null datallowconn",
+            real.datid
+        );
+        anyhow::ensure!(
+            real.datistemplate.is_some(),
+            "postgres {major}: datid {} row has a null datistemplate",
+            real.datid
+        );
     }
     Ok(())
 }

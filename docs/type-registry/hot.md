@@ -104,6 +104,13 @@ cgroup memory events.
 `replay_lag` из `1_015_001`; на primary пишется отдельный экземпляр на реплику
 из `1_016_001`, `entity = application_name/client_addr`. `1_015_001` не
 заменяет детализацию по репликам и не несёт retained WAL по слотам.
+Для wraparound-графиков XID-возраст и MXID-возраст не смешиваются в одну шкалу.
+`frozen_xid_age` агрегируется как `max(frozen_xid_age)`, `min_mxid_age` — как
+`max(min_mxid_age)`, оба по строкам реальных баз; `NULL` shared-строки
+игнорируется. `10_018_001` — XID-график; MXID требует отдельного `type_id`.
+Headroom считается отдельно: для XID
+`autovacuum_freeze_max_age - frozen_xid_age`, для MXID
+`autovacuum_multixact_freeze_max_age - min_mxid_age`.
 
 Производные серии, например `latency = time_delta / ops_delta`, считаются при
 запечатывании сегмента. В секции графика они уже лежат как готовые точки и

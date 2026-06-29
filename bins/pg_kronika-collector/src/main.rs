@@ -436,7 +436,7 @@ mod tests {
             } else {
                 Some("appdb".to_owned())
             },
-            numbackends: 4,
+            numbackends: if datid == 0 { None } else { Some(4) },
             xact_commit: 100,
             xact_rollback: 2,
             blks_read: 4_000,
@@ -464,6 +464,11 @@ mod tests {
             sessions_killed: Some(0),
             parallel_workers_to_launch: Some(9),
             parallel_workers_launched: Some(8),
+            frozen_xid_age: if datid == 0 { None } else { Some(150_000_000) },
+            min_mxid_age: if datid == 0 { None } else { Some(5_000_000) },
+            datconnlimit: if datid == 0 { None } else { Some(-1) },
+            datallowconn: if datid == 0 { None } else { Some(true) },
+            datistemplate: if datid == 0 { None } else { Some(false) },
         }
     }
 
