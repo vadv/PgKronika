@@ -27,6 +27,7 @@ use kronika_reader::{Dictionary, Resolved, Segment};
 use kronika_registry::{
     Bytes, MAX_SECTION_BYTES, Section, StrId, VerifiedSection,
     bgwriter_checkpointer::BgwriterCheckpointer,
+    pg_prepared_xacts::PgPreparedXacts,
     pg_stat_activity::PgStatActivityV3,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
 };
@@ -41,6 +42,8 @@ const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
 
 const PG_STAT_DATABASE_V3_TYPE_ID: u32 = 1_005_003;
 const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
+
+const PG_PREPARED_XACTS_TYPE_ID: u32 = 1_010_001;
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
@@ -452,6 +455,87 @@ fn check_database_rows(
         ),
     }
     Ok(())
+}
+
+#[then("each matrix cluster seals per-database pg_prepared_xacts rows")]
+async fn every_version_seals_prepared(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_prepared_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Decode the sealed `pg_prepared_xacts` section if present and check each
+/// per-database row: ts in the segment range, a dictionary-backed `datname`, a
+/// positive count, and a non-negative age. An idle cluster prepares nothing, so
+/// no rows and no section — that is valid, not a failure.
+fn assert_prepared_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let catalog = segment.catalog();
+    let Some(entry) = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.type_id == PG_PREPARED_XACTS_TYPE_ID)
+    else {
+        // No two-phase commits pending (the default): no rows, no section.
+        return Ok(());
+    };
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    let rows = decode_prepared_rows(path, entry)
+        .with_context(|| format!("postgres {major}: read back section 1_010_001"))?;
+    for row in &rows {
+        ensure_ts_in_segment_range(
+            major,
+            "section 1_010_001",
+            row.ts.0,
+            catalog.min_ts,
+            catalog.max_ts,
+        )?;
+        anyhow::ensure!(
+            row.prepared_count >= 1,
+            "postgres {major}: per-database row has non-positive prepared_count {}",
+            row.prepared_count
+        );
+        anyhow::ensure!(
+            row.max_age_us >= 0,
+            "postgres {major}: negative max_age_us {}",
+            row.max_age_us
+        );
+        match dict.resolve(row.datname.0) {
+            Some(Resolved::String(bytes)) => anyhow::ensure!(
+                !bytes.is_empty(),
+                "postgres {major}: datname resolved to an empty string"
+            ),
+            other => anyhow::bail!(
+                "postgres {major}: datname str_id {} did not resolve to a string: {other:?}",
+                row.datname.0
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Read the catalog-bounded section and decode its typed rows.
+fn decode_prepared_rows(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgPreparedXacts>> {
+    use std::os::unix::fs::FileExt;
+
+    let len = usize::try_from(entry.len).context("section len overflows usize")?;
+    anyhow::ensure!(
+        len <= MAX_SECTION_BYTES,
+        "section of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
+    );
+    let mut body = vec![0_u8; len];
+    std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
+
+    let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
+        .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
+    PgPreparedXacts::decode(verified).context("typed decode of section 1_010_001")
 }
 
 #[tokio::main]
