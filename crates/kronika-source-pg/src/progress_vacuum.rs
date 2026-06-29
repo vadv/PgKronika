@@ -50,42 +50,52 @@ pub const fn progress_vacuum_version(major: u32) -> ProgressVacuumVersion {
 pub const fn progress_vacuum_query(version: ProgressVacuumVersion) -> &'static str {
     match version {
         ProgressVacuumVersion::Pre17 => marked!(
-            "SELECT pid, datname, relid, phase, \
-             heap_blks_total, heap_blks_scanned, heap_blks_vacuumed, index_vacuum_count, \
-             max_dead_tuples, num_dead_tuples, \
+            "SELECT v.pid, v.datid, v.datname, v.relid, v.phase, \
+             COALESCE(a.backend_type = 'autovacuum worker', false) AS is_autovacuum, \
+             v.heap_blks_total, v.heap_blks_scanned, v.heap_blks_vacuumed, \
+             v.index_vacuum_count, v.max_dead_tuples, v.num_dead_tuples, \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
-             FROM pg_stat_progress_vacuum"
+             FROM pg_stat_progress_vacuum v \
+             LEFT JOIN pg_stat_activity a ON a.pid = v.pid"
         ),
         ProgressVacuumVersion::Pg17 => marked!(
-            "SELECT pid, datname, relid, phase, \
-             heap_blks_total, heap_blks_scanned, heap_blks_vacuumed, index_vacuum_count, \
-             max_dead_tuple_bytes, dead_tuple_bytes, num_dead_item_ids, \
-             indexes_total, indexes_processed, \
+            "SELECT v.pid, v.datid, v.datname, v.relid, v.phase, \
+             COALESCE(a.backend_type = 'autovacuum worker', false) AS is_autovacuum, \
+             v.heap_blks_total, v.heap_blks_scanned, v.heap_blks_vacuumed, \
+             v.index_vacuum_count, v.max_dead_tuple_bytes, v.dead_tuple_bytes, \
+             v.num_dead_item_ids, v.indexes_total, v.indexes_processed, \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
-             FROM pg_stat_progress_vacuum"
+             FROM pg_stat_progress_vacuum v \
+             LEFT JOIN pg_stat_activity a ON a.pid = v.pid"
         ),
         ProgressVacuumVersion::Pg18 => marked!(
-            "SELECT pid, datname, relid, phase, \
-             heap_blks_total, heap_blks_scanned, heap_blks_vacuumed, index_vacuum_count, \
-             max_dead_tuple_bytes, dead_tuple_bytes, num_dead_item_ids, \
-             indexes_total, indexes_processed, delay_time, \
+            "SELECT v.pid, v.datid, v.datname, v.relid, v.phase, \
+             COALESCE(a.backend_type = 'autovacuum worker', false) AS is_autovacuum, \
+             v.heap_blks_total, v.heap_blks_scanned, v.heap_blks_vacuumed, \
+             v.index_vacuum_count, v.max_dead_tuple_bytes, v.dead_tuple_bytes, \
+             v.num_dead_item_ids, v.indexes_total, v.indexes_processed, v.delay_time, \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
-             FROM pg_stat_progress_vacuum"
+             FROM pg_stat_progress_vacuum v \
+             LEFT JOIN pg_stat_activity a ON a.pid = v.pid"
         ),
     }
 }
 
 /// Collected row before interning; version-specific fields are nullable.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ProgressVacuumRow {
     /// Snapshot time, unix microseconds.
     pub ts: i64,
     /// Backend process id.
     pub pid: i32,
+    /// Database OID.
+    pub datid: u32,
     /// Database name.
     pub datname: String,
     /// Table OID.
     pub relid: u32,
+    /// Whether the backend is an autovacuum worker.
+    pub is_autovacuum: bool,
     /// Vacuum phase.
     pub phase: String,
     /// Heap blocks in the table at scan start.
@@ -125,8 +135,10 @@ pub fn to_progress_vacuum<E>(
     Ok(PgStatProgressVacuum {
         ts: Ts(row.ts),
         pid: row.pid,
+        datid: row.datid,
         datname: intern(row.datname.as_bytes())?,
         relid: row.relid,
+        is_autovacuum: row.is_autovacuum,
         phase: intern(row.phase.as_bytes())?,
         heap_blks_total: row.heap_blks_total,
         heap_blks_scanned: row.heap_blks_scanned,
@@ -150,8 +162,10 @@ fn row_from_pg(row: &tokio_postgres::Row, version: ProgressVacuumVersion) -> Pro
     ProgressVacuumRow {
         ts: row.get("ts_us"),
         pid: row.get("pid"),
+        datid: row.get("datid"),
         datname: row.get("datname"),
         relid: row.get("relid"),
+        is_autovacuum: row.get("is_autovacuum"),
         phase: row.get("phase"),
         heap_blks_total: row.get("heap_blks_total"),
         heap_blks_scanned: row.get("heap_blks_scanned"),
@@ -207,8 +221,10 @@ mod tests {
         ProgressVacuumRow {
             ts: 2_000,
             pid: 4242,
+            datid: 16_385,
             datname: "appdb".to_owned(),
             relid: 16_384,
+            is_autovacuum: true,
             phase: "scanning heap".to_owned(),
             heap_blks_total: 10_000,
             heap_blks_scanned: 4_200,
@@ -247,6 +263,9 @@ mod tests {
         assert!(pg18.contains("delay_time"));
         for sql in [pre17, pg17, pg18] {
             assert!(sql.contains("pg_stat_progress_vacuum"));
+            assert!(sql.contains("v.datid"));
+            assert!(sql.contains("pg_stat_activity"));
+            assert!(sql.contains("is_autovacuum"));
             assert!(sql.contains("pg_kronika"));
         }
     }
@@ -255,7 +274,9 @@ mod tests {
     fn to_progress_vacuum_interns_labels_and_keeps_columns() {
         let out = to_progress_vacuum(&pre17_raw(), fake_intern).expect("intern");
         assert_eq!(out.pid, 4242);
+        assert_eq!(out.datid, 16_385);
         assert_eq!(out.datname, fake_intern(b"appdb").unwrap());
+        assert!(out.is_autovacuum);
         assert_eq!(out.phase, fake_intern(b"scanning heap").unwrap());
         assert_eq!(out.num_dead_tuples, Some(120_000));
         assert_eq!(out.dead_tuple_bytes, None);

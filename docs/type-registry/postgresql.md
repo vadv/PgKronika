@@ -17,12 +17,14 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_005_003` | `pg_stat_database` (PG 14-17) | базовый шаг | `snapshot_full` | `(datid, ts)` |
 | `1_005_004` | `pg_stat_database` (PG 18) | базовый шаг | `snapshot_full` | `(datid, ts)` |
 | `1_006_001` | `pg_stat_bgwriter` + `pg_stat_checkpointer` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_007_001` | `pg_stat_wal` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_007_001` | `pg_stat_wal` (PG 14-17) | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_007_002` | `pg_stat_wal` (PG 18) | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_008_001` | `pg_stat_archiver` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_009_001` | `pg_stat_io` | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
-| `1_010_001` | агрегат `pg_prepared_xacts` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_009_001` | `pg_stat_io` (PG 16-17) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
+| `1_009_002` | `pg_stat_io` (PG 18) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
+| `1_010_001` | `pg_prepared_xacts` по базам | базовый шаг | `snapshot_full` | `(datname, ts)` |
 | `1_011_001` | `pg_locks`, дерево ожиданий | по факту | `conditional_full` | `(ts, root_pid, depth)` |
-| `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `snapshot_full` | `(ts, pid)` |
+| `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `conditional_full` | `(ts, pid)` |
 | `1_013_001` | `pg_stat_user_tables` + `pg_statio_user_tables` | 30 с | `changed` | `(datname, relid, ts)` |
 | `1_014_001` | `pg_stat_user_indexes` + `pg_statio_user_indexes` | 30 с | `changed` | `(datname, indexrelid, ts)` |
 | `1_015_001` | replication: статус инстанса | 30 с | `snapshot_full` | `(ts)` |
@@ -278,22 +280,26 @@ buffers_backend_fsync i64? C   // NULL на PG17+
 buffers_alloc         i64  C
 ```
 
-## `1_007_001` `pg_stat_wal`
+## `1_007_001` / `1_007_002` `pg_stat_wal`
 
-PG14+.
+Синглтон, доступен с PG14. Раскладка `1_007_001` (PG 14-17):
 
 ```text
 ts               ts   T
 wal_records      i64  C
 wal_fpi          i64  C
-wal_bytes        i64  C   // numeric в PG, приводится к i64
+wal_bytes        i64  C   // numeric в PG; cast к i64, overflow = ошибка сбора
 wal_buffers_full i64  C
 wal_write        i64  C
 wal_sync         i64  C
-wal_write_time   f64  C
-wal_sync_time    f64  C
-stats_reset      ts   G
+wal_write_time   f64  C   // 0 без track_wal_io_timing
+wal_sync_time    f64  C   // 0 без track_wal_io_timing
+stats_reset      ts?  G
 ```
+
+`1_007_002` (PG 18) оставляет `wal_records`, `wal_fpi`, `wal_bytes`,
+`wal_buffers_full`, `stats_reset`: write/sync-поля больше не приходят из
+`pg_stat_wal`; их продолжает покрывать `pg_stat_io` по строкам `object = wal`.
 
 ## `1_008_001` `pg_stat_archiver`
 
@@ -305,45 +311,127 @@ last_archived_time ts?  G
 failed_count       i64  C
 last_failed_wal    str? L
 last_failed_time   ts?  G
-stats_reset        ts   G
+stats_reset        ts?  G
 ```
 
-## `1_009_001` `pg_stat_io`
+Синглтон для PG 10–18. Имена WAL-файлов идут через словарь.
+`last_archived_wal` не является границей архивной сохранности: PostgreSQL
+предупреждает, что более старые WAL могут ещё не быть заархивированы.
 
-PG16+. Сущность — тройка `(backend_type, object, context)`, обычно 30-50 строк
-за один регулярный сбор.
+## `1_009_001` / `1_009_002` `pg_stat_io`
+
+PG16+ (на PG 10–15 представления нет — источник пропускается). Сущность — тройка
+`(backend_type, object, context)`, обычно 30–50 строк за сбор. Счётчики и
+тайминги — `NULL`, а не `0`, для комбинаций, которые backend не порождает (`NULL`
+≠ нулевая активность). При выключенном `track_io_timing` тайминги приходят как `0`, а не `NULL` (в PG18
+для строк `object = wal` — при `track_wal_io_timing`). `stats_reset` хранится в
+строке.
+
+Пропускная способность (байты) считается по-разному на двух раскладках:
+
+- PG16–17 (`1_009_001`): `rate(reads) * op_bytes`, аналогично для `writes` и
+  `extends`. `op_bytes` — фиксированный размер блока (обычно 8192), это **gauge,
+  а не счётчик**: брать от него `rate` бессмысленно (он почти константа).
+- PG18 (`1_009_002`): напрямую `rate(read_bytes)`, `rate(write_bytes)`,
+  `rate(extend_bytes)` — `op_bytes` убран, потому что размер I/O-операции стал
+  переменным.
+
+Байтовые счётчики PG18 (`*_bytes`) имеют тип `numeric` и приводятся к `i64`:
+`i64` вмещает ~8 ЭиБ, чего реальный кластер за свой uptime не достигает. На
+теоретическом переполнении сбор упадёт с ошибкой (сегмент потеряется, но
+коллектор не запишет искажённое значение) — clamp или nullable не вводим.
+
+### Версии раскладки
+
+Схема `pg_stat_io` менялась в PG18 неаддитивно (добавлены байтовые счётчики,
+удалён `op_bytes`), поэтому две версии формата:
+
+| `type_id` | Версии PostgreSQL | Отличие |
+|-----------|-------------------|---------|
+| `1_009_001` | 16, 17 | `op_bytes`, без байтовых счётчиков |
+| `1_009_002` | 18 | `+ read_bytes`, `+ write_bytes`, `+ extend_bytes`; `- op_bytes`; новые `object = wal`, `context = init` |
+
+Live-BDD: PG 16–17 → `1_009_001`, PG 18 → `1_009_002` (обе раскладки в матрице
+nixpkgs); на PG 15 секции `pg_stat_io` нет.
+
+### Раскладка `1_009_001` (PG 16–17)
+
+```text
+ts              ts    T
+backend_type    str   L
+object          str   L   // relation | temp relation
+context         str   L   // normal | vacuum | bulkread | bulkwrite
+reads           i64?  C
+read_time       f64?  C
+writes          i64?  C
+write_time      f64?  C
+writebacks      i64?  C
+writeback_time  f64?  C
+extends         i64?  C
+extend_time     f64?  C
+op_bytes        i64?  G   // размер блока (8192), не счётчик: байты = (reads+writes+extends)*op_bytes
+hits            i64?  C
+evictions       i64?  C
+reuses          i64?  C
+fsyncs          i64?  C
+fsync_time      f64?  C
+stats_reset     ts?   G
+```
+
+### Раскладка `1_009_002` (PG 18)
+
+Без `op_bytes`, с байтовыми счётчиками рядом со счётчиками операций; `object`
+получает значение `wal`, `context` — `init`.
+
+```text
+ts              ts    T
+backend_type    str   L
+object          str   L   // relation | temp relation | wal
+context         str   L   // normal | vacuum | bulkread | bulkwrite | init
+reads           i64?  C
+read_bytes      i64?  C
+read_time       f64?  C
+writes          i64?  C
+write_bytes     i64?  C
+write_time      f64?  C
+writebacks      i64?  C
+writeback_time  f64?  C
+extends         i64?  C
+extend_bytes    i64?  C
+extend_time     f64?  C
+hits            i64?  C
+evictions       i64?  C
+reuses          i64?  C
+fsyncs          i64?  C
+fsync_time      f64?  C
+stats_reset     ts?   G
+```
+
+## `1_010_001` `pg_prepared_xacts` по базам
 
 ```text
 ts              ts   T
-backend_type    str  L
-object          str  L   // relation | temp relation | wal
-context         str  L   // normal | vacuum | bulkread | bulkwrite
-reads           i64  C
-read_time       f64  C
-writes          i64  C
-write_time      f64  C
-writebacks      i64  C
-writeback_time  f64  C
-extends         i64  C
-extend_time     f64  C
-op_bytes        i64  L
-hits            i64  C
-evictions       i64  C
-reuses          i64  C
-fsyncs          i64  C
-fsync_time      f64  C
+datname         str  L   // база, где висят prepared-транзакции
+prepared_count  i64  G   // число prepared-транзакций в базе
+max_age_us      i64  G   // wall-clock возраст старейшей prepared-транзакции, микросекунды
+max_xid_age_tx  i64  G   // максимальный age(transaction), транзакции
 ```
 
-## `1_010_001` агрегат `pg_prepared_xacts`
+Одна строка на базу с prepared-транзакциями (двухфазный коммит), `GROUP BY
+database`. Если prepared-транзакций нет, секция отсутствует; это означает ноль
+prepared-транзакций, а не ошибку сбора. По умолчанию
+`max_prepared_transactions = 0`, и 2PC выключен. Забытый 2PC удерживает горизонт
+xmin и блокирует vacuum в своей базе, поэтому `datname` обязателен.
 
-```text
-ts               ts   T
-count            i32  G
-max_age_seconds  i64  G
-```
+`prepared_count` — размер группы. `max_age_us` — wall-clock возраст старейшей
+prepared-транзакции в микросекундах, рассчитанный от `clock_timestamp()` и
+зажатый снизу нулём. `max_xid_age_tx` — максимальный `age(transaction)` в
+транзакциях; это XID-сигнал удержания горизонта. `pg_prepared_xacts` при чтении
+кратко блокирует и копирует состояние transaction manager; reset-семантики у
+источника нет.
 
-Этого достаточно, чтобы предупредить о забытом 2PC. Полная таблица prepared
-transactions может стать отдельным типом, если понадобится детализация.
+Детализация по транзакциям (`gid`, `owner`, `transaction`) может стать отдельным
+типом, если понадобится.
 
 ## `1_011_001` `pg_locks`, дерево ожиданий
 
@@ -380,18 +468,24 @@ lock_target       str   L
 
 ## `1_012_001` `pg_stat_progress_vacuum`
 
+`conditional_full`. Секция пишется только когда `pg_stat_progress_vacuum`
+содержит строки. Отсутствие секции означает ноль активных `VACUUM` в момент
+снимка, а не ошибку сбора.
+
 ```text
 ts                    ts   T
 pid                   i32  L
+datid                 u32  L
 datname               str  L
 relid                 u32  L
+is_autovacuum         bool L
 phase                 str  L
-heap_blks_total       i64  G
-heap_blks_scanned     i64  G
-heap_blks_vacuumed    i64  G
+heap_blks_total       i64  G   // блоки heap
+heap_blks_scanned     i64  G   // блоки heap
+heap_blks_vacuumed    i64  G   // блоки heap
 index_vacuum_count    i64  G
-max_dead_tuples       i64? G   // PG10-16
-num_dead_tuples       i64? G   // PG10-16
+max_dead_tuples       i64? G   // PG10-16, tuples
+num_dead_tuples       i64? G   // PG10-16, tuples
 max_dead_tuple_bytes  i64? G   // PG17+
 dead_tuple_bytes      i64? G   // PG17+
 num_dead_item_ids     i64? G   // PG17+
@@ -401,16 +495,18 @@ delay_time            f64? G   // PG18+
 ```
 
 Одна строка на backend, выполняющий `VACUUM`, включая autovacuum. `VACUUM FULL`
-сюда не попадает. Если `pg_stat_progress_vacuum` пусто, секция отсутствует.
+сюда не попадает. `is_autovacuum` вычисляется по `pg_stat_activity.backend_type =
+'autovacuum worker'`; ручной `VACUUM` хранится с `is_autovacuum = false`.
 
 PG17 заменил `max_dead_tuples` / `num_dead_tuples` на
 `max_dead_tuple_bytes`, `dead_tuple_bytes` и `num_dead_item_ids`; единицы
 измерения разные, поэтому поля не объединяются. PG17 также добавил прогресс по
 индексам, PG18 — `delay_time`.
 
-`datid` (OID БД) не сохраняется: идентификацию несёт `datname`, а связь с
-`pg_stat_activity` идёт по `pid`. `heap_blks_scanned` / `heap_blks_vacuumed`
-монотонны внутри одного vacuum, но класс `G`: между запусками сбрасываются.
+`datid` нужен вместе с `datname`: `relid` локален в базе, а имя базы может быть
+переименовано. Связь с `pg_stat_activity` идёт по `pid` внутри того же снимка.
+`heap_blks_scanned` / `heap_blks_vacuumed` монотонны внутри одного vacuum, но
+класс `G`: между запусками сбрасываются.
 
 ## `1_013_001` `pg_stat_user_tables` + `pg_statio_user_tables`
 
@@ -612,7 +708,7 @@ pg_store_plans_reset_at        ts?   G
 pg_stat_bgwriter_reset_at      ts?   G
 pg_stat_checkpointer_reset_at  ts?   G
 pg_stat_wal_reset_at           ts?   G
-pg_stat_archiver_reset_at      ts    G
+pg_stat_archiver_reset_at      ts?   G
 pg_stat_io_reset_at            ts?   G
 ext_pg_stat_statements_version str?  L
 ext_pg_store_plans_version     str?  L
@@ -631,7 +727,7 @@ track_io_timing                bool? L
 | `pg_stat_bgwriter_reset_at` | reset bgwriter-статистики; `NULL`, если представление или поле недоступны |
 | `pg_stat_checkpointer_reset_at` | reset checkpointer-статистики; `NULL` до PG17 |
 | `pg_stat_wal_reset_at` | reset WAL-статистики; `NULL` до появления `pg_stat_wal` |
-| `pg_stat_archiver_reset_at` | reset archiver-статистики |
+| `pg_stat_archiver_reset_at` | reset archiver-статистики; `NULL`, если сервер не вернул время сброса |
 | `pg_stat_io_reset_at` | reset `pg_stat_io`; `NULL` до PG16 |
 | `ext_pg_stat_statements_version` | версия расширения или `NULL`, если расширение не установлено в доступных БД |
 | `ext_pg_store_plans_version` | версия расширения или `NULL` |
@@ -661,9 +757,9 @@ track_io_timing                bool? L
 | `1_003_001`, `1_004_001` | `pg_store_plans_reset_at` |
 | `1_005_001` | `pg_stat_database_reset_max_at` |
 | `1_006_001` | `pg_stat_bgwriter_reset_at`, `pg_stat_checkpointer_reset_at` |
-| `1_007_001` | `pg_stat_wal_reset_at` |
+| `1_007_001`, `1_007_002` | `pg_stat_wal_reset_at` |
 | `1_008_001` | `pg_stat_archiver_reset_at` |
-| `1_009_001` | `pg_stat_io_reset_at` |
+| `1_009_001`, `1_009_002` | `pg_stat_io_reset_at` |
 | все PostgreSQL C-счётчики | `postmaster_start_time` |
 
 ## `1_021_001` `instance_metadata`
