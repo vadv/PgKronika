@@ -306,8 +306,12 @@ last_archived_time ts?  G
 failed_count       i64  C
 last_failed_wal    str? L
 last_failed_time   ts?  G
-stats_reset        ts   G
+stats_reset        ts?  G
 ```
+
+Синглтон для PG 10–18. Имена WAL-файлов идут через словарь.
+`last_archived_wal` не является границей архивной сохранности: PostgreSQL
+предупреждает, что более старые WAL могут ещё не быть заархивированы.
 
 ## `1_009_001` / `1_009_002` `pg_stat_io`
 
@@ -664,7 +668,7 @@ pg_store_plans_reset_at        ts?   G
 pg_stat_bgwriter_reset_at      ts?   G
 pg_stat_checkpointer_reset_at  ts?   G
 pg_stat_wal_reset_at           ts?   G
-pg_stat_archiver_reset_at      ts    G
+pg_stat_archiver_reset_at      ts?   G
 pg_stat_io_reset_at            ts?   G
 ext_pg_stat_statements_version str?  L
 ext_pg_store_plans_version     str?  L
@@ -683,7 +687,7 @@ track_io_timing                bool? L
 | `pg_stat_bgwriter_reset_at` | reset bgwriter-статистики; `NULL`, если представление или поле недоступны |
 | `pg_stat_checkpointer_reset_at` | reset checkpointer-статистики; `NULL` до PG17 |
 | `pg_stat_wal_reset_at` | reset WAL-статистики; `NULL` до появления `pg_stat_wal` |
-| `pg_stat_archiver_reset_at` | reset archiver-статистики |
+| `pg_stat_archiver_reset_at` | reset archiver-статистики; `NULL`, если сервер не вернул время сброса |
 | `pg_stat_io_reset_at` | reset `pg_stat_io`; `NULL` до PG16 |
 | `ext_pg_stat_statements_version` | версия расширения или `NULL`, если расширение не установлено в доступных БД |
 | `ext_pg_store_plans_version` | версия расширения или `NULL` |
