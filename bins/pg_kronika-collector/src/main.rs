@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use kronika_format::DictLimits;
 use kronika_registry::StrId;
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
+use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
     to_v1, to_v2, to_v3,
@@ -123,6 +124,10 @@ async fn snapshot_and_seal(
     let (database_version, database_rows) = collect_database(client, major)
         .await
         .context("collect pg_stat_database")?;
+    // pg_stat_io exists from PG16; `None` on older majors.
+    let io = collect_io(client, major)
+        .await
+        .context("collect pg_stat_io")?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -141,6 +146,9 @@ async fn snapshot_and_seal(
         database_version,
         &database_rows,
     )?;
+    if let Some((io_version, io_rows)) = &io {
+        push_io(&mut buffers, &mut interner, *io_version, io_rows)?;
+    }
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -213,6 +221,27 @@ fn push_database(
     Ok(())
 }
 
+/// Intern each row's label strings and buffer it as the version's section type.
+///
+/// # Errors
+/// Returns an error if a label cannot be interned (dictionary full) or a section
+/// buffer is full.
+fn push_io(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    version: IoVersion,
+    rows: &[IoRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        match version {
+            IoVersion::V1 => buffer_row(buffers, io::to_v1(row, &mut intern)?)?,
+            IoVersion::V2 => buffer_row(buffers, io::to_v2(row, &mut intern)?)?,
+        }
+    }
+    Ok(())
+}
+
 /// Buffer one typed snapshot row, mapping a full buffer to an error.
 fn buffer_row<S: kronika_registry::Section + 'static>(
     buffers: &mut SectionBuffers,
@@ -232,8 +261,9 @@ fn announce(line: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{activity_dict_limits, push_activity, push_database};
+    use super::{activity_dict_limits, push_activity, push_database, push_io};
     use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
+    use kronika_source_pg::io::{IoRow, IoVersion};
     use kronika_source_pg::{ActivityRow, ActivityVersion};
     use kronika_writer::{Interner, SectionBuffers, dict};
 
@@ -360,6 +390,62 @@ mod tests {
                 .iter()
                 .any(|entry| entry.type_id == 1_005_004),
             "the part carries the pg_stat_database section"
+        );
+    }
+
+    fn io_row(object: &str) -> IoRow {
+        IoRow {
+            ts: 1_000,
+            backend_type: "client backend".to_owned(),
+            object: object.to_owned(),
+            context: "normal".to_owned(),
+            reads: Some(100),
+            read_bytes: Some(819_200),
+            read_time: Some(12.5),
+            writes: Some(50),
+            write_bytes: Some(409_600),
+            write_time: Some(3.0),
+            writebacks: Some(0),
+            writeback_time: None,
+            extends: Some(7),
+            extend_bytes: Some(57_344),
+            extend_time: None,
+            op_bytes: Some(8192),
+            hits: Some(9000),
+            evictions: Some(2),
+            reuses: None,
+            fsyncs: Some(1),
+            fsync_time: None,
+            stats_reset: Some(500),
+        }
+    }
+
+    #[test]
+    fn push_io_buffers_rows_and_interns_labels() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_io(
+            &mut buffers,
+            &mut interner,
+            IoVersion::V2,
+            &[io_row("relation"), io_row("wal")],
+        )
+        .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "rows were buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(!dict_sections.is_empty(), "labels reached the dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_009_002),
+            "the part carries the pg_stat_io section"
         );
     }
 }
