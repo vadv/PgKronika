@@ -488,6 +488,7 @@ fn check_database_rows(
     ensure_ts_in_segment_range(major, section, ts, min_ts, max_ts)?;
 
     // PG12+ adds a shared-objects row with `datid = 0` and no `datname`.
+    // PostgreSQL docs allow NULL `numbackends`, while PG12+ source returns 0.
     let shared = rows
         .iter()
         .find(|row| row.datid == 0)
@@ -496,10 +497,12 @@ fn check_database_rows(
         shared.datname.is_none(),
         "postgres {major}: shared-objects row has a non-null datname"
     );
-    anyhow::ensure!(
-        shared.numbackends.is_none(),
-        "postgres {major}: shared-objects row has a non-null numbackends"
-    );
+    if let Some(numbackends) = shared.numbackends {
+        anyhow::ensure!(
+            numbackends >= 0,
+            "postgres {major}: shared-objects row has a negative numbackends"
+        );
+    }
     anyhow::ensure!(
         shared.frozen_xid_age.is_none(),
         "postgres {major}: shared-objects row has a non-null frozen_xid_age"

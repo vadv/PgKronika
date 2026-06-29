@@ -202,9 +202,10 @@ is_baseline                     bool  L
 
 Секция хранит снимок `pg_stat_database` целиком: одна строка на базу. С PG12
 представление добавляет агрегатную строку `datid = 0` (shared-объекты кластера)
-с `datname = NULL` и `numbackends = NULL`. `ts` — единое серверное время снимка
-(`statement_timestamp()`). `numbackends` — мгновенное число коннектов (gauge)
-для строк реальных баз.
+с `datname = NULL`. `ts` — единое серверное время снимка
+(`statement_timestamp()`). `numbackends` — мгновенное число коннектов (gauge).
+Раскладка оставляет `numbackends` nullable: документация PostgreSQL описывает
+`NULL` для shared-строки, а исходный SQL представления PG12+ возвращает `0`.
 `stats_reset` — время последнего сброса статистики этой БД (`NULL`, если не
 сбрасывалась).
 `blk_read_time` / `blk_write_time` равны нулю без `track_io_timing`.
@@ -251,7 +252,7 @@ BDD покрывает раскладки `1_005_003` и `1_005_004`. `1_005_001
 ts                          ts    T
 datid                       u32   L
 datname                     str?  L   // NULL у строки shared-объектов (datid=0)
-numbackends                 i32?  G   // NULL у строки shared-объектов
+numbackends                 i32?  G   // NULL или 0 у строки shared-объектов
 xact_commit                 i64   C
 xact_rollback               i64   C
 blks_read                   i64   C
