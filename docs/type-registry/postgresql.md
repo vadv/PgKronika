@@ -17,7 +17,8 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_005_003` | `pg_stat_database` (PG 14-17) | базовый шаг | `snapshot_full` | `(datid, ts)` |
 | `1_005_004` | `pg_stat_database` (PG 18) | базовый шаг | `snapshot_full` | `(datid, ts)` |
 | `1_006_001` | `pg_stat_bgwriter` + `pg_stat_checkpointer` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_007_001` | `pg_stat_wal` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_007_001` | `pg_stat_wal` (PG 14-17) | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_007_002` | `pg_stat_wal` (PG 18) | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_008_001` | `pg_stat_archiver` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_009_001` | `pg_stat_io` (PG 16-17) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
 | `1_009_002` | `pg_stat_io` (PG 18) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
@@ -279,22 +280,26 @@ buffers_backend_fsync i64? C   // NULL на PG17+
 buffers_alloc         i64  C
 ```
 
-## `1_007_001` `pg_stat_wal`
+## `1_007_001` / `1_007_002` `pg_stat_wal`
 
-PG14+.
+Синглтон, доступен с PG14. Раскладка `1_007_001` (PG 14-17):
 
 ```text
 ts               ts   T
 wal_records      i64  C
 wal_fpi          i64  C
-wal_bytes        i64  C   // numeric в PG, приводится к i64
+wal_bytes        i64  C   // numeric в PG; cast к i64, overflow = ошибка сбора
 wal_buffers_full i64  C
 wal_write        i64  C
 wal_sync         i64  C
-wal_write_time   f64  C
-wal_sync_time    f64  C
-stats_reset      ts   G
+wal_write_time   f64  C   // 0 без track_wal_io_timing
+wal_sync_time    f64  C   // 0 без track_wal_io_timing
+stats_reset      ts?  G
 ```
+
+`1_007_002` (PG 18) оставляет `wal_records`, `wal_fpi`, `wal_bytes`,
+`wal_buffers_full`, `stats_reset`: write/sync-поля больше не приходят из
+`pg_stat_wal`; их продолжает покрывать `pg_stat_io` по строкам `object = wal`.
 
 ## `1_008_001` `pg_stat_archiver`
 
@@ -717,7 +722,7 @@ track_io_timing                bool? L
 | `1_003_001`, `1_004_001` | `pg_store_plans_reset_at` |
 | `1_005_001` | `pg_stat_database_reset_max_at` |
 | `1_006_001` | `pg_stat_bgwriter_reset_at`, `pg_stat_checkpointer_reset_at` |
-| `1_007_001` | `pg_stat_wal_reset_at` |
+| `1_007_001`, `1_007_002` | `pg_stat_wal_reset_at` |
 | `1_008_001` | `pg_stat_archiver_reset_at` |
 | `1_009_001`, `1_009_002` | `pg_stat_io_reset_at` |
 | все PostgreSQL C-счётчики | `postmaster_start_time` |

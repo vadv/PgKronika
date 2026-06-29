@@ -34,6 +34,8 @@ pub mod archiver;
 pub mod database;
 pub mod io;
 
+pub mod wal;
+
 /// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->
 /// `17`.
 ///

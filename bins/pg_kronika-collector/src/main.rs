@@ -22,6 +22,7 @@ use kronika_registry::StrId;
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
 use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
+use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
     to_v1, to_v2, to_v3,
@@ -125,6 +126,9 @@ async fn snapshot_and_seal(
     let (database_version, database_rows) = collect_database(client, major)
         .await
         .context("collect pg_stat_database")?;
+    let wal = collect_wal(client, major)
+        .await
+        .context("collect pg_stat_wal")?;
     // pg_stat_io exists from PG16; `None` on older majors.
     let io = collect_io(client, major)
         .await
@@ -150,6 +154,12 @@ async fn snapshot_and_seal(
         database_version,
         &database_rows,
     )?;
+    // pg_stat_wal has one all-numeric row; PG10-13 produce no row.
+    match wal {
+        Some(WalSnapshot::V1(row)) => buffer_row(&mut buffers, row)?,
+        Some(WalSnapshot::V2(row)) => buffer_row(&mut buffers, row)?,
+        None => {}
+    }
     if let Some((io_version, io_rows)) = &io {
         push_io(&mut buffers, &mut interner, *io_version, io_rows)?;
     }

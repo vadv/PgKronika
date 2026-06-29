@@ -31,9 +31,11 @@ use kronika_registry::{
     pg_stat_archiver::PgStatArchiver,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
+    pg_stat_wal::{PgStatWalV1, PgStatWalV2},
 };
 use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::io::{IoVersion, io_version};
+use kronika_source_pg::wal::{WalVersion, wal_version};
 use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
 
 const PG17_MAJOR: u32 = 17;
@@ -44,6 +46,9 @@ const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
 
 const PG_STAT_DATABASE_V3_TYPE_ID: u32 = 1_005_003;
 const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
+
+const PG_STAT_WAL_V1_TYPE_ID: u32 = 1_007_001;
+const PG_STAT_WAL_V2_TYPE_ID: u32 = 1_007_002;
 
 const PG_STAT_IO_V1_TYPE_ID: u32 = 1_009_001;
 const PG_STAT_IO_V2_TYPE_ID: u32 = 1_009_002;
@@ -349,9 +354,12 @@ fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
     match database_version(major) {
         DatabaseVersion::V4 => {
-            let rows =
-                decode_db_section::<PgStatDatabaseV4>(path, &segment, PG_STAT_DATABASE_V4_TYPE_ID)
-                    .with_context(|| format!("postgres {major}: read back section 1_005_004"))?;
+            let rows = decode_section_rows::<PgStatDatabaseV4>(
+                path,
+                &segment,
+                PG_STAT_DATABASE_V4_TYPE_ID,
+            )
+            .with_context(|| format!("postgres {major}: read back section 1_005_004"))?;
             check_database_rows(
                 major,
                 &dict,
@@ -362,9 +370,12 @@ fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
             )
         }
         DatabaseVersion::V3 => {
-            let rows =
-                decode_db_section::<PgStatDatabaseV3>(path, &segment, PG_STAT_DATABASE_V3_TYPE_ID)
-                    .with_context(|| format!("postgres {major}: read back section 1_005_003"))?;
+            let rows = decode_section_rows::<PgStatDatabaseV3>(
+                path,
+                &segment,
+                PG_STAT_DATABASE_V3_TYPE_ID,
+            )
+            .with_context(|| format!("postgres {major}: read back section 1_005_003"))?;
             check_database_rows(
                 major,
                 &dict,
@@ -381,7 +392,7 @@ fn assert_database_section(major: u32, path: &Path) -> anyhow::Result<()> {
 }
 
 /// Read the catalog-bounded section and decode its typed rows.
-fn decode_db_section<T: Section>(
+fn decode_section_rows<T: Section>(
     path: &Path,
     segment: &Segment,
     type_id: u32,
@@ -404,7 +415,7 @@ fn decode_db_section<T: Section>(
 
     let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
         .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
-    T::decode(verified).context("typed decode of the pg_stat_database section")
+    T::decode(verified).context("typed decode of the sealed section")
 }
 
 /// Shared invariants for the decoded `(datid, datname, ts)` projection.
@@ -461,6 +472,17 @@ fn check_database_rows(
     Ok(())
 }
 
+#[then("each matrix cluster seals a single-row pg_stat_wal section")]
+async fn every_version_seals_wal(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_wal_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
 #[then("every version handles pg_stat_io per its layout, resolving labels through the dictionary")]
 async fn every_version_handles_io(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
@@ -479,6 +501,86 @@ async fn every_version_seals_archiver(world: &mut BddWorld) -> anyhow::Result<()
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
         assert_archiver_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Check selected layout, timestamp, singleton shape, reset, and counters.
+fn assert_wal_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let min_ts = segment.catalog().min_ts;
+    let max_ts = segment.catalog().max_ts;
+    let has = |type_id: u32| {
+        segment
+            .catalog()
+            .entries
+            .iter()
+            .any(|entry| entry.type_id == type_id)
+    };
+    match wal_version(major) {
+        Some(WalVersion::V1) => {
+            anyhow::ensure!(
+                !has(PG_STAT_WAL_V2_TYPE_ID),
+                "postgres {major}: PG14-17 sealed the PG18 wal layout 1_007_002"
+            );
+            let rows = decode_section_rows::<PgStatWalV1>(path, &segment, PG_STAT_WAL_V1_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_007_001"))?;
+            let row = single_wal_row(major, rows)?;
+            ensure_ts_in_segment_range(major, "section 1_007_001", row.ts.0, min_ts, max_ts)?;
+            anyhow::ensure!(
+                row.wal_records >= 0
+                    && row.wal_fpi >= 0
+                    && row.wal_bytes >= 0
+                    && row.wal_buffers_full >= 0
+                    && row.wal_write >= 0
+                    && row.wal_sync >= 0,
+                "postgres {major}: a pg_stat_wal counter came back negative"
+            );
+            anyhow::ensure!(
+                row.wal_write_time.is_finite()
+                    && row.wal_write_time >= 0.0
+                    && row.wal_sync_time.is_finite()
+                    && row.wal_sync_time >= 0.0,
+                "postgres {major}: pg_stat_wal timing came back invalid"
+            );
+            check_wal_stats_reset(major, row.stats_reset.map(|ts| ts.0), row.ts.0)?;
+        }
+        Some(WalVersion::V2) => {
+            anyhow::ensure!(
+                !has(PG_STAT_WAL_V1_TYPE_ID),
+                "postgres {major}: PG18 sealed the PG14-17 wal layout 1_007_001"
+            );
+            let rows = decode_section_rows::<PgStatWalV2>(path, &segment, PG_STAT_WAL_V2_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_007_002"))?;
+            let row = single_wal_row(major, rows)?;
+            ensure_ts_in_segment_range(major, "section 1_007_002", row.ts.0, min_ts, max_ts)?;
+            anyhow::ensure!(
+                row.wal_records >= 0
+                    && row.wal_fpi >= 0
+                    && row.wal_bytes >= 0
+                    && row.wal_buffers_full >= 0,
+                "postgres {major}: a pg_stat_wal counter came back negative"
+            );
+            check_wal_stats_reset(major, row.stats_reset.map(|ts| ts.0), row.ts.0)?;
+        }
+        None => {
+            anyhow::ensure!(
+                !has(PG_STAT_WAL_V1_TYPE_ID) && !has(PG_STAT_WAL_V2_TYPE_ID),
+                "postgres {major}: pg_stat_wal section present before PG14"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `stats_reset`, when present, must not be after the snapshot ts.
+fn check_wal_stats_reset(major: u32, reset: Option<i64>, ts: i64) -> anyhow::Result<()> {
+    if let Some(reset) = reset {
+        anyhow::ensure!(
+            reset <= ts,
+            "postgres {major}: wal stats_reset {reset} is after snapshot ts {ts}"
+        );
     }
     Ok(())
 }
@@ -647,6 +749,19 @@ fn check_io_stats_reset(
     Ok(())
 }
 
+/// Extract the one row a `pg_stat_wal` snapshot must hold.
+fn single_wal_row<T>(major: u32, rows: Vec<T>) -> anyhow::Result<T> {
+    let mut rows = rows.into_iter();
+    let row = rows
+        .next()
+        .with_context(|| format!("postgres {major}: pg_stat_wal section decoded to no rows"))?;
+    anyhow::ensure!(
+        rows.next().is_none(),
+        "postgres {major}: pg_stat_wal section decoded to multiple rows"
+    );
+    Ok(row)
+}
+
 /// Check singleton shape, counters, timestamp, and optional WAL-name dictionary ids.
 fn assert_archiver_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
@@ -730,4 +845,24 @@ fn decode_archiver(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStatArchi
 async fn main() {
     let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
     BddWorld::cucumber().run_and_exit(features).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_wal_row;
+
+    #[test]
+    fn single_wal_row_accepts_exactly_one() {
+        assert_eq!(single_wal_row(15, vec![42_i32]).expect("one row"), 42);
+    }
+
+    #[test]
+    fn single_wal_row_rejects_no_rows() {
+        assert!(single_wal_row::<i32>(15, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn single_wal_row_rejects_multiple_rows() {
+        assert!(single_wal_row(15, vec![1_i32, 2]).is_err());
+    }
 }
