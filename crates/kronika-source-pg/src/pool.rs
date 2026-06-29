@@ -169,15 +169,12 @@ impl Drop for DatabaseConn {
 pub struct ConnectionPool {
     base_dsn: String,
     session: SessionConfig,
-    #[allow(dead_code, reason = "consumed by refresh in the next task")]
     exclude: HashSet<String>,
     main: Client,
     main_conn: JoinHandle<()>,
     server_major: u32,
     per_db: Vec<DatabaseConn>,
-    #[allow(dead_code, reason = "consumed by refresh in the next task")]
     target: Vec<String>,
-    #[allow(dead_code, reason = "consumed by refresh in the next task")]
     last_refresh: Instant,
 }
 
@@ -234,6 +231,62 @@ impl ConnectionPool {
     #[must_use]
     pub const fn server_major(&self) -> u32 {
         self.server_major
+    }
+
+    /// Reconcile the per-db pool with the live database list. Cheap to call
+    /// every snapshot: works only once `interval` elapsed (or while the pool is
+    /// empty). A database that fails to connect is logged and skipped — it
+    /// retries next refresh. Pool order is not stable; address by `datname`.
+    ///
+    /// # Errors
+    /// Fails only if enumerating databases on the main connection fails.
+    pub async fn refresh(&mut self, interval: std::time::Duration) -> anyhow::Result<()> {
+        if !self.per_db.is_empty() && self.last_refresh.elapsed() < interval {
+            return Ok(());
+        }
+        let target = enumerate_databases(&self.main, &self.exclude)
+            .await
+            .context("enumerate databases")?;
+        let target_set: HashSet<&str> = target.iter().map(String::as_str).collect();
+        self.per_db
+            .retain(|c| target_set.contains(c.datname.as_str()));
+        let have: HashSet<String> = self.per_db.iter().map(|c| c.datname.clone()).collect();
+        for db in &target {
+            if have.contains(db) {
+                continue;
+            }
+            let dsn = apply_session_dsn(&replace_dbname(&self.base_dsn, db), &self.session);
+            match open(&dsn).await {
+                Ok((client, conn, _)) => {
+                    self.per_db.push(DatabaseConn {
+                        datname: db.clone(),
+                        client,
+                        conn,
+                    });
+                }
+                Err(err) => eprintln!("pg_kronika: per-db connect to {db} failed: {err:#}"),
+            }
+        }
+        self.target = target;
+        self.last_refresh = Instant::now();
+        Ok(())
+    }
+
+    /// Databases the pool last expected to cover.
+    #[must_use]
+    pub fn expected(&self) -> &[String] {
+        &self.target
+    }
+
+    /// Expected databases with no live connection (failed/locked out).
+    #[must_use]
+    pub fn uncovered(&self) -> Vec<String> {
+        let have: HashSet<&str> = self.per_db.iter().map(|c| c.datname.as_str()).collect();
+        self.target
+            .iter()
+            .filter(|d| !have.contains(d.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// Reopen the main connection if it died (failover/restart). Refreshes
