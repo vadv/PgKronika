@@ -12,7 +12,10 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_002_001` | `pg_stat_statements` | 30 с | `changed` | `(queryid, dbid, userid, ts)` |
 | `1_003_001` | `pg_store_plans`, форк ossc | 5 мин | `changed` | `(queryid, planid, ts)` |
 | `1_004_001` | `pg_store_plans`, форк vadv | 5 мин | `changed` | `(queryid, planid, ts)` |
-| `1_005_001` | `pg_stat_database` | базовый шаг | `snapshot_full` | `(datid, ts)` |
+| `1_005_001` | `pg_stat_database` (PG 10-11) | базовый шаг | `snapshot_full` | `(datid, ts)` |
+| `1_005_002` | `pg_stat_database` (PG 12-13) | базовый шаг | `snapshot_full` | `(datid, ts)` |
+| `1_005_003` | `pg_stat_database` (PG 14-17) | базовый шаг | `snapshot_full` | `(datid, ts)` |
+| `1_005_004` | `pg_stat_database` (PG 18) | базовый шаг | `snapshot_full` | `(datid, ts)` |
 | `1_006_001` | `pg_stat_bgwriter` + `pg_stat_checkpointer` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_007_001` | `pg_stat_wal` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_008_001` | `pg_stat_archiver` | базовый шаг | `snapshot_full` | `(ts)` |
@@ -194,36 +197,68 @@ last_call                       ts    G
 is_baseline                     bool  L
 ```
 
-## `1_005_001` `pg_stat_database`
+## `1_005_001` / `1_005_002` / `1_005_003` / `1_005_004` `pg_stat_database`
+
+Секция хранит снимок `pg_stat_database` целиком: одна строка на базу. С PG12
+представление добавляет агрегатную строку `datid = 0` (shared-объекты кластера)
+с `datname = NULL`. `ts` — единое серверное время снимка
+(`statement_timestamp()`). `numbackends` — мгновенное число коннектов (gauge).
+`stats_reset` — время последнего сброса статистики этой БД (`NULL`, если не
+сбрасывалась).
+`blk_read_time` / `blk_write_time` равны нулю без `track_io_timing`.
+
+### Версии раскладки
+
+В PG 10–18 колонки только добавлялись; удалений и переименований не было:
+
+| `type_id` | Версии PostgreSQL | Отличие |
+|-----------|-------------------|---------|
+| `1_005_001` | 10, 11 | базовая раскладка |
+| `1_005_002` | 12, 13 | `+ checksum_failures`, `+ checksum_last_failure` |
+| `1_005_003` | 14, 15, 16, 17 | `+` session-статистика (7 колонок) |
+| `1_005_004` | 18 | `+ parallel_workers_to_launch`, `+ parallel_workers_launched` |
+
+BDD покрывает раскладки `1_005_003` и `1_005_004`. `1_005_001` / `1_005_002`
+покрыты golden-кодеками.
+
+### Раскладка `1_005_004` (PG 18)
 
 ```text
-ts                       ts    T
-datid                    u32   L
-datname                  str   L
-xact_commit              i64   C
-xact_rollback            i64   C
-blks_read                i64   C
-blks_hit                 i64   C
-tup_returned             i64   C
-tup_fetched              i64   C
-tup_inserted             i64   C
-tup_updated              i64   C
-tup_deleted              i64   C
-conflicts                i64   C
-temp_files               i64   C
-temp_bytes               i64   C
-deadlocks                i64   C
-checksum_failures        i64?  C   // NULL без data_checksums
-blk_read_time            f64   C   // 0 без track_io_timing, см. reset_metadata
-blk_write_time           f64   C
-session_time             f64?  C   // NULL < PG14
-active_time              f64?  C
-idle_in_transaction_time f64?  C
-sessions                 i64?  C
-sessions_abandoned       i64?  C
-sessions_fatal           i64?  C
-sessions_killed          i64?  C
+ts                          ts    T
+datid                       u32   L
+datname                     str?  L   // NULL у строки shared-объектов (datid=0)
+numbackends                 i32   G
+xact_commit                 i64   C
+xact_rollback               i64   C
+blks_read                   i64   C
+blks_hit                    i64   C
+tup_returned                i64   C
+tup_fetched                 i64   C
+tup_inserted                i64   C
+tup_updated                 i64   C
+tup_deleted                 i64   C
+conflicts                   i64   C
+temp_files                  i64   C
+temp_bytes                  i64   C
+deadlocks                   i64   C
+blk_read_time               f64   C   // 0 без track_io_timing
+blk_write_time              f64   C
+stats_reset                 ts?   G   // время сброса статистики БД; NULL без сброса
+checksum_failures           i64   C   // PG12+
+checksum_last_failure       ts?   G   // PG12+; NULL, если ошибок не было
+session_time                f64   C   // PG14+
+active_time                 f64   C
+idle_in_transaction_time    f64   C
+sessions                    i64   C
+sessions_abandoned          i64   C
+sessions_fatal              i64   C
+sessions_killed             i64   C
+parallel_workers_to_launch  i64   C   // PG18+
+parallel_workers_launched   i64   C
 ```
+
+`1_005_003` — без двух parallel-колонок. `1_005_002` — без parallel и без
+session-статистики. `1_005_001` заканчивается на `stats_reset`.
 
 ## `1_006_001` `pg_stat_bgwriter` + `pg_stat_checkpointer`
 
@@ -680,7 +715,7 @@ track_io_timing                bool? L
 | `1_006_001` | `pg_stat_bgwriter_reset_at`, `pg_stat_checkpointer_reset_at` |
 | `1_007_001` | `pg_stat_wal_reset_at` |
 | `1_008_001` | `pg_stat_archiver_reset_at` |
-| `1_009_001` | `pg_stat_io_reset_at` |
+| `1_009_001`, `1_009_002` | `pg_stat_io_reset_at` |
 | все PostgreSQL C-счётчики | `postmaster_start_time` |
 
 ## `1_021_001` `instance_metadata`
