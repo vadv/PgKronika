@@ -675,10 +675,10 @@ async fn every_cluster_pools_databases(world: &mut BddWorld) -> anyhow::Result<(
   coverage), чтобы недосбор был виден при разборе, а не только в stderr.
 - **Первый потребитель — `pg_stat_user_tables`** (класс B): top-N, skip locked,
   relpages-размер, метка `datname`. Отдельный план.
-- **Size-цикл** и пересмотр `database_size_bytes` (#27). Учесть: при обёртке
-  size-запроса в транзакцию `idle_in_transaction_session_timeout` (10s) меньше
-  потолка heavy-таймаута (60s) — выставлять idle-timeout локально или не
-  оборачивать в явный BEGIN.
+- **Size-цикл для размера базы.** Учесть: при обёртке size-запроса в
+  транзакцию `idle_in_transaction_session_timeout` (10s) меньше потолка
+  heavy-таймаута (60s) — выставлять idle-timeout локально или не оборачивать в
+  явный BEGIN.
 - **Reconcile-сценарий BDD** (создать/удалить базу → пул догоняет) здесь не
   покрыт. Добавить, когда появится дешёвый способ проверить это в матрице.
 - **Режим одной базы** (`PGDATABASE`/явный `dbname=` → пул из одной базы).

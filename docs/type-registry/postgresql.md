@@ -202,11 +202,30 @@ is_baseline                     bool  L
 
 Секция хранит снимок `pg_stat_database` целиком: одна строка на базу. С PG12
 представление добавляет агрегатную строку `datid = 0` (shared-объекты кластера)
-с `datname = NULL`. `ts` — единое серверное время снимка
-(`statement_timestamp()`). `numbackends` — мгновенное число коннектов (gauge).
+с `datname = NULL` и `numbackends = NULL`. `ts` — единое серверное время снимка
+(`statement_timestamp()`). `numbackends` — мгновенное число коннектов (gauge)
+для строк реальных баз.
 `stats_reset` — время последнего сброса статистики этой БД (`NULL`, если не
 сбрасывалась).
 `blk_read_time` / `blk_write_time` равны нулю без `track_io_timing`.
+
+Дополнительные поля берутся из `pg_database` через `LEFT JOIN` по `oid = datid`:
+возрасты wraparound `frozen_xid_age` / `min_mxid_age`, лимит коннектов
+`datconnlimit` и флаги `datallowconn` / `datistemplate`. Для строки
+shared-объектов (`datid = 0`) соединение не находит строку `pg_database`,
+поэтому эти колонки `NULL`. Поля читаются из общих каталогов и не требуют
+подключения к целевой базе.
+
+`datconnlimit = -1` означает отсутствие лимита. В PG18 `-2` означает invalid
+database. Насыщение лимита считается только при `datallowconn = true`,
+`datistemplate = false`, `datconnlimit > 0` и `numbackends IS NOT NULL`:
+`numbackends / datconnlimit`. Для остальных строк конечного лимита нет.
+
+`frozen_xid_age` и `min_mxid_age` — разные шкалы. XID-график считает
+`max(frozen_xid_age)` по реальным базам; MXID-график считает
+`max(min_mxid_age)` по реальным базам. `NULL` shared-строки игнорируется.
+Headroom считается отдельно: `autovacuum_freeze_max_age - frozen_xid_age` и
+`autovacuum_multixact_freeze_max_age - min_mxid_age`.
 
 ### Версии раскладки
 
@@ -219,6 +238,10 @@ is_baseline                     bool  L
 | `1_005_003` | 14, 15, 16, 17 | `+` session-статистика (7 колонок) |
 | `1_005_004` | 18 | `+ parallel_workers_to_launch`, `+ parallel_workers_launched` |
 
+Пять `pg_database`-полей (`frozen_xid_age`, `min_mxid_age`, `datconnlimit`,
+`datallowconn`, `datistemplate`)
+присутствуют во всех раскладках и не зависят от мажорной версии.
+
 BDD покрывает раскладки `1_005_003` и `1_005_004`. `1_005_001` / `1_005_002`
 покрыты golden-кодеками.
 
@@ -228,7 +251,7 @@ BDD покрывает раскладки `1_005_003` и `1_005_004`. `1_005_001
 ts                          ts    T
 datid                       u32   L
 datname                     str?  L   // NULL у строки shared-объектов (datid=0)
-numbackends                 i32   G
+numbackends                 i32?  G   // NULL у строки shared-объектов
 xact_commit                 i64   C
 xact_rollback               i64   C
 blks_read                   i64   C
@@ -245,6 +268,11 @@ deadlocks                   i64   C
 blk_read_time               f64   C   // 0 без track_io_timing
 blk_write_time              f64   C
 stats_reset                 ts?   G   // время сброса статистики БД; NULL без сброса
+frozen_xid_age              i64?  G   // age(datfrozenxid); NULL у shared-строки
+min_mxid_age                i64?  G   // mxid_age(datminmxid); NULL у shared-строки
+datconnlimit                i32?  G   // -1 без лимита; PG18 -2 invalid database; NULL у shared
+datallowconn                bool? L   // принимает ли БД подключения; NULL у shared
+datistemplate               bool? L   // шаблонная ли БД; NULL у shared
 checksum_failures           i64   C   // PG12+
 checksum_last_failure       ts?   G   // PG12+; NULL, если ошибок не было
 session_time                f64   C   // PG14+
@@ -258,8 +286,9 @@ parallel_workers_to_launch  i64   C   // PG18+
 parallel_workers_launched   i64   C
 ```
 
-`1_005_003` — без двух parallel-колонок. `1_005_002` — без parallel и без
-session-статистики. `1_005_001` заканчивается на `stats_reset`.
+Версионные отличия остаются в хвосте раскладки: `1_005_003` — без двух
+parallel-колонок, `1_005_002` — без parallel и session-статистики,
+`1_005_001` — только базовые счётчики и `pg_database`-поля.
 
 ## `1_006_001` `pg_stat_bgwriter` + `pg_stat_checkpointer`
 
