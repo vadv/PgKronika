@@ -381,24 +381,35 @@ lock_target       str   L
 ## `1_012_001` `pg_stat_progress_vacuum`
 
 ```text
-ts                  ts   T
-pid                 i32  L
-datname             str  L
-relid               u32  L
-phase               str  L
-heap_blks_total     i64  G
-heap_blks_scanned   i64  G
-heap_blks_vacuumed  i64  G
-index_vacuum_count  i64  G
-max_dead_tuples     i64? G   // NULL на PG17+
-num_dead_tuples     i64? G   // NULL на PG17+
-dead_tuple_bytes    i64? G   // NULL < PG17
-indexes_total       i64? G   // NULL < PG17
-indexes_processed   i64? G   // NULL < PG17
+ts                    ts   T
+pid                   i32  L
+datname               str  L
+relid                 u32  L
+phase                 str  L
+heap_blks_total       i64  G
+heap_blks_scanned     i64  G
+heap_blks_vacuumed    i64  G
+index_vacuum_count    i64  G
+max_dead_tuples       i64? G   // PG10-16
+num_dead_tuples       i64? G   // PG10-16
+max_dead_tuple_bytes  i64? G   // PG17+
+dead_tuple_bytes      i64? G   // PG17+
+num_dead_item_ids     i64? G   // PG17+
+indexes_total         i64? G   // PG17+
+indexes_processed     i64? G   // PG17+
+delay_time            f64? G   // PG18+
 ```
 
-`heap_blks_scanned` и `heap_blks_vacuumed` монотонны внутри одного vacuum, но
-остаются полями класса `G`: между запусками они сбрасываются.
+Одна строка на backend, выполняющий `VACUUM` (autovacuum в том числе; `VACUUM
+FULL` сюда не попадает). Представление пусто, когда vacuum не идёт, — секция
+тогда отсутствует. PG17 заменил поштучный учёт мёртвых кортежей
+(`max_dead_tuples` / `num_dead_tuples`) на байтовый TID-store
+(`max_dead_tuple_bytes` / `dead_tuple_bytes` + `num_dead_item_ids`) и добавил
+прогресс по индексам; это смена единиц, а не переименование, поэтому колонки
+эпох держатся раздельно. PG18 добавил `delay_time`. `datid` (oid БД) не берётся: идентификацию несёт
+`datname`, а связь с `pg_stat_activity` идёт по `pid`. `heap_blks_scanned` /
+`heap_blks_vacuumed` монотонны внутри одного vacuum, но класс `G`: между
+запусками сбрасываются.
 
 ## `1_013_001` `pg_stat_user_tables` + `pg_statio_user_tables`
 
