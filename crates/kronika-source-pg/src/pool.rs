@@ -1,10 +1,8 @@
-//! Multi-database connection pool: one main connection for instance-wide
-//! metrics (reopened on failover), one per database for database-local
-//! metrics.
+//! Connection pool for `PostgreSQL` collection.
 //!
-//! Pool setup returns `anyhow::Result`; per-query errors stay
-//! `tokio_postgres::Error` via the handed-out `Client`, so callers can match
-//! SQLSTATE 57014/55P03.
+//! The main connection serves instance-wide metrics. Per-database connections
+//! serve database-local metrics. Setup errors use `anyhow::Result`; query
+//! errors stay as `tokio_postgres::Error` so callers can inspect SQLSTATE.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -15,8 +13,7 @@ use tokio_postgres::{Client, NoTls};
 
 use crate::server_major;
 
-/// Databases this role may actually connect to (not just `datallowconn`),
-/// templates excluded, deterministic order.
+/// Connectable, non-template databases in deterministic order.
 pub const ENUMERATE_SQL: &str = "/* pg_kronika pool */ SELECT datname \
     FROM pg_catalog.pg_database \
     WHERE datallowconn AND NOT datistemplate \
@@ -76,8 +73,9 @@ pub struct SessionConfig {
     pub idle_in_tx_timeout_ms: u64,
 }
 
-/// `jit=off`: collector queries are short, JIT costs more than it saves.
-/// `lock_timeout` must stay below `statement_timeout` or it never fires.
+/// `PostgreSQL` session options for collector queries.
+///
+/// `lock_timeout` must stay below `statement_timeout` to fire first.
 #[must_use]
 pub fn session_options(cfg: &SessionConfig) -> String {
     format!(
@@ -87,8 +85,7 @@ pub fn session_options(cfg: &SessionConfig) -> String {
     )
 }
 
-/// Append session options and keepalives to a base DSN. Keepalives let a dead
-/// connection to a failed primary surface in seconds, not the system default.
+/// Append session options and TCP keepalives to a base DSN.
 #[must_use]
 pub fn apply_session_dsn(base_dsn: &str, cfg: &SessionConfig) -> String {
     format!(
@@ -98,13 +95,10 @@ pub fn apply_session_dsn(base_dsn: &str, cfg: &SessionConfig) -> String {
     )
 }
 
-/// Adaptive `statement_timeout` for heavy queries (sizes/schema): one per
-/// `PgKronika` instance, ratchets up only.
+/// Adaptive `statement_timeout` for heavy database-local queries.
 ///
-/// The server-side timeout is a backstop — Postgres kills the query even if
-/// the collector hangs or is OOM. The caller calls `grow` only on a `57014`
-/// (`statement_timeout`) kill; on `55P03` (`lock_timeout`) it does NOT — that
-/// is a foreign lock, not query cost.
+/// Call `grow` after SQLSTATE `57014` (`statement_timeout`). Do not grow after
+/// `55P03` (`lock_timeout`); that indicates lock contention, not query cost.
 #[derive(Debug, Clone, Copy)]
 pub struct AdaptiveTimeout {
     current_ms: u64,
@@ -112,7 +106,7 @@ pub struct AdaptiveTimeout {
 }
 
 impl AdaptiveTimeout {
-    /// Create a new instance; clamps `start_ms` to `cap_ms` if it exceeds it.
+    /// Construct a timeout, clamping `start_ms` to `cap_ms`.
     #[must_use]
     pub fn new(start_ms: u64, cap_ms: u64) -> Self {
         Self {
@@ -136,9 +130,9 @@ impl AdaptiveTimeout {
     }
 }
 
-/// One per-database connection. The spawned connection-future is aborted on
-/// drop (a dropped `JoinHandle` does NOT cancel the task by itself), so a
-/// removed database leaves no driver task running.
+/// Per-database client plus its driver task.
+///
+/// Drop aborts the driver because dropping a `JoinHandle` detaches the task.
 #[derive(Debug)]
 pub struct DatabaseConn {
     /// Name of the database this connection targets.
@@ -161,10 +155,9 @@ impl Drop for DatabaseConn {
     }
 }
 
-/// Pool: one main connection (instance-wide) plus one per database.
+/// Connection pool state for one `PostgreSQL` instance.
 ///
-/// `target` is the last enumerated database set, so coverage (which databases
-/// were reachable) is computable from pool state.
+/// `target` records the last enumerated database set used by coverage accessors.
 #[derive(Debug)]
 pub struct ConnectionPool {
     base_dsn: String,
@@ -178,7 +171,7 @@ pub struct ConnectionPool {
     last_refresh: Instant,
 }
 
-/// Open a connection with the session DSN already applied; spawn its driver.
+/// Open a connection with session settings applied and spawn its driver.
 async fn open(dsn: &str) -> anyhow::Result<(Client, JoinHandle<()>, Option<u32>)> {
     let cfg: tokio_postgres::Config = dsn.parse().context("parse DSN")?;
     let (client, connection) = cfg.connect(NoTls).await.context("connect")?;
@@ -233,10 +226,11 @@ impl ConnectionPool {
         self.server_major
     }
 
-    /// Reconcile the per-db pool with the live database list. Cheap to call
-    /// every snapshot: works only once `interval` elapsed (or while the pool is
-    /// empty). A database that fails to connect is logged and skipped — it
-    /// retries next refresh. Pool order is not stable; address by `datname`.
+    /// Reconcile per-db clients with current connectable databases.
+    ///
+    /// Skips work until `interval` elapses unless the pool is empty. Failed
+    /// per-db connects are logged and retried on the next refresh. Order is not
+    /// stable; callers should use `datname`.
     ///
     /// # Errors
     /// Fails only if enumerating databases on the main connection fails.
@@ -289,10 +283,10 @@ impl ConnectionPool {
             .collect()
     }
 
-    /// Reopen the main connection if it died (failover/restart). Refreshes
-    /// `server_major` from the new handshake. Call before every snapshot —
-    /// without it a collector survives a primary failover as a live-but-blind
-    /// process and would tag metrics with a stale major.
+    /// Reopen the main connection after failover or restart.
+    ///
+    /// Refreshes `server_major` from the new handshake. Call before each
+    /// snapshot so recovered collectors use the new server version.
     ///
     /// # Errors
     /// Fails if reconnection fails or the new server reports no version.
@@ -312,8 +306,7 @@ impl ConnectionPool {
 
 impl Drop for ConnectionPool {
     fn drop(&mut self) {
-        // Per-db drivers self-abort via DatabaseConn::drop when per_db drops;
-        // only the bare main handle needs an explicit abort here.
+        // DatabaseConn::drop aborts per-db drivers; abort only the main driver here.
         self.main_conn.abort();
     }
 }

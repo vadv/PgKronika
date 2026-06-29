@@ -1269,8 +1269,8 @@ fn decode_archiver(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStatArchi
         .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
     PgStatArchiver::decode(verified).context("typed decode of section 1_008_001")
 }
-#[then("each matrix cluster pools one connection per database")]
-async fn every_cluster_pools_databases(world: &mut BddWorld) -> anyhow::Result<()> {
+#[then("each matrix cluster opens per-database pool connections")]
+async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> anyhow::Result<()> {
     use kronika_source_pg::pool::{ConnectionPool, SessionConfig, enumerate_databases};
     use std::collections::HashSet;
     use std::time::Duration;
@@ -1286,19 +1286,19 @@ async fn every_cluster_pools_databases(world: &mut BddWorld) -> anyhow::Result<(
         pool.refresh(Duration::from_secs(0)).await?;
         anyhow::ensure!(
             !pool.per_db().is_empty(),
-            "postgres {}: empty pool",
+            "postgres {}: no per-db connections",
             db.major()
         );
         anyhow::ensure!(
             pool.uncovered().is_empty(),
-            "postgres {}: uncovered {:?}",
+            "postgres {}: databases without pool connection: {:?}",
             db.major(),
             pool.uncovered()
         );
         let names = enumerate_databases(pool.main(), &HashSet::new()).await?;
         anyhow::ensure!(
             !names.iter().any(|n| n == "template0" || n == "template1"),
-            "postgres {}: enumeration leaked a template db",
+            "postgres {}: template database was enumerated",
             db.major()
         );
     }

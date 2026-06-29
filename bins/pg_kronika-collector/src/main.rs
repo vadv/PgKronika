@@ -54,10 +54,10 @@ struct Config {
     source_id: u64,
     session: SessionConfig,
     exclude_databases: HashSet<String>,
-    // Reserved for future per-db pool refresh scheduling.
+    // Parsed with pool config; per-db collection will call `refresh`.
     #[allow(
         dead_code,
-        reason = "consumed by pool.refresh() in the per-db collection task, not yet wired"
+        reason = "parsed with pool config; consumed when per-db collection calls pool.refresh()"
     )]
     pool_refresh: Duration,
 }
