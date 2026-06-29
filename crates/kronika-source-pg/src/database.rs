@@ -149,7 +149,10 @@ pub struct DatabaseRow {
     pub datid: u32,
     /// Database name (`None` for the shared-objects row).
     pub datname: Option<String>,
-    /// Backends connected to this database; `None` for the shared-objects row.
+    /// Backends connected to this database.
+    ///
+    /// Upstream docs allow `NULL` for the shared-objects row, while PG12+
+    /// view definitions return `0`; preserve the server value.
     pub numbackends: Option<i32>,
     /// Committed transactions.
     pub xact_commit: i64,
@@ -497,7 +500,7 @@ mod tests {
             } else {
                 Some("appdb".to_owned())
             },
-            numbackends: if datid == 0 { None } else { Some(4) },
+            numbackends: if datid == 0 { Some(0) } else { Some(4) },
             xact_commit: 100,
             xact_rollback: 2,
             blks_read: 4_000,
@@ -585,11 +588,11 @@ mod tests {
     }
 
     #[test]
-    fn to_v4_shared_row_has_null_catalog_fields() {
+    fn to_v4_shared_row_preserves_numbackends_and_null_catalog_fields() {
         let r = to_v4(&sample_row(0), fake_intern).expect("intern");
         assert_eq!(r.datid, 0);
         assert_eq!(r.datname, None);
-        assert_eq!(r.numbackends, None);
+        assert_eq!(r.numbackends, Some(0));
         assert_eq!(r.frozen_xid_age, None);
         assert_eq!(r.min_mxid_age, None);
         assert_eq!(r.datconnlimit, None);
