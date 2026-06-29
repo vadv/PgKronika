@@ -23,6 +23,7 @@ use crate::contract::{ColumnType, TypeContract};
 
 pub mod bgwriter_checkpointer;
 pub mod instance_metadata;
+pub mod pg_prepared_xacts;
 pub mod pg_stat_activity;
 pub mod pg_stat_archiver;
 pub mod pg_stat_database;
