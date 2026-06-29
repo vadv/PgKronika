@@ -498,6 +498,8 @@ is_in_recovery            bool  G
 timeline_id               i32   G
 synchronous_standby_names str   L
 synchronous_commit        str   L
+sender_host               str?  L   // primary standby'я (pg_stat_wal_receiver)
+connected_replicas        i32   G   // число подключённых стримящих реплик
 replay_lag_s              i64?  G
 standby_receive_lsn       i64?  G   // LSN как u64-байты
 standby_replay_lsn        i64?  G
@@ -506,6 +508,9 @@ current_wal_lsn           i64?  G
 ```
 
 Для standby `replay_lag_s = 0`, если receive LSN равен replay LSN.
+`sender_host` — из `pg_stat_wal_receiver` (PG11+ колонка `sender_host`, PG10 —
+`conninfo`); NULL вне стримящего standby. `connected_replicas` — `count(*)` по
+`pg_stat_replication`.
 
 ### `1_016_001` реплики primary
 
