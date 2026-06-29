@@ -72,7 +72,6 @@ pub const fn database_query(version: DatabaseVersion) -> &'static str {
              (extract(epoch from sd.stats_reset) * 1e6)::int8 AS stats_reset_us, \
              age(d.datfrozenxid)::int8 AS frozen_xid_age, \
              mxid_age(d.datminmxid)::int8 AS min_mxid_age, \
-             pg_database_size(d.oid)::int8 AS database_size_bytes, \
              d.datconnlimit AS datconnlimit, \
              d.datallowconn AS datallowconn, \
              d.datistemplate AS datistemplate, \
@@ -88,7 +87,6 @@ pub const fn database_query(version: DatabaseVersion) -> &'static str {
              (extract(epoch from sd.stats_reset) * 1e6)::int8 AS stats_reset_us, \
              age(d.datfrozenxid)::int8 AS frozen_xid_age, \
              mxid_age(d.datminmxid)::int8 AS min_mxid_age, \
-             pg_database_size(d.oid)::int8 AS database_size_bytes, \
              d.datconnlimit AS datconnlimit, \
              d.datallowconn AS datallowconn, \
              d.datistemplate AS datistemplate, \
@@ -106,7 +104,6 @@ pub const fn database_query(version: DatabaseVersion) -> &'static str {
              (extract(epoch from sd.stats_reset) * 1e6)::int8 AS stats_reset_us, \
              age(d.datfrozenxid)::int8 AS frozen_xid_age, \
              mxid_age(d.datminmxid)::int8 AS min_mxid_age, \
-             pg_database_size(d.oid)::int8 AS database_size_bytes, \
              d.datconnlimit AS datconnlimit, \
              d.datallowconn AS datallowconn, \
              d.datistemplate AS datistemplate, \
@@ -126,7 +123,6 @@ pub const fn database_query(version: DatabaseVersion) -> &'static str {
              (extract(epoch from sd.stats_reset) * 1e6)::int8 AS stats_reset_us, \
              age(d.datfrozenxid)::int8 AS frozen_xid_age, \
              mxid_age(d.datminmxid)::int8 AS min_mxid_age, \
-             pg_database_size(d.oid)::int8 AS database_size_bytes, \
              d.datconnlimit AS datconnlimit, \
              d.datallowconn AS datallowconn, \
              d.datistemplate AS datistemplate, \
@@ -153,8 +149,8 @@ pub struct DatabaseRow {
     pub datid: u32,
     /// Database name (`None` for the shared-objects row).
     pub datname: Option<String>,
-    /// Backends connected to this database.
-    pub numbackends: i32,
+    /// Backends connected to this database; `None` for the shared-objects row.
+    pub numbackends: Option<i32>,
     /// Committed transactions.
     pub xact_commit: i64,
     /// Rolled-back transactions.
@@ -213,8 +209,6 @@ pub struct DatabaseRow {
     pub frozen_xid_age: Option<i64>,
     /// Age of `datminmxid` in multixacts; `None` for the shared-objects row.
     pub min_mxid_age: Option<i64>,
-    /// On-disk database size in bytes; `None` for the shared-objects row.
-    pub database_size_bytes: Option<i64>,
     /// Per-database connection limit (`-1` unlimited); `None` for the shared-objects row.
     pub datconnlimit: Option<i32>,
     /// Whether the database accepts connections; `None` for the shared-objects row.
@@ -276,7 +270,6 @@ pub fn to_v4<E>(
         parallel_workers_launched: row.parallel_workers_launched.unwrap_or(0),
         frozen_xid_age: row.frozen_xid_age,
         min_mxid_age: row.min_mxid_age,
-        database_size_bytes: row.database_size_bytes,
         datconnlimit: row.datconnlimit,
         datallowconn: row.datallowconn,
         datistemplate: row.datistemplate,
@@ -323,7 +316,6 @@ pub fn to_v3<E>(
         sessions_killed: row.sessions_killed.unwrap_or(0),
         frozen_xid_age: row.frozen_xid_age,
         min_mxid_age: row.min_mxid_age,
-        database_size_bytes: row.database_size_bytes,
         datconnlimit: row.datconnlimit,
         datallowconn: row.datallowconn,
         datistemplate: row.datistemplate,
@@ -363,7 +355,6 @@ pub fn to_v2<E>(
         checksum_last_failure: row.checksum_last_failure.map(Ts),
         frozen_xid_age: row.frozen_xid_age,
         min_mxid_age: row.min_mxid_age,
-        database_size_bytes: row.database_size_bytes,
         datconnlimit: row.datconnlimit,
         datallowconn: row.datallowconn,
         datistemplate: row.datistemplate,
@@ -401,7 +392,6 @@ pub fn to_v1<E>(
         stats_reset: row.stats_reset.map(Ts),
         frozen_xid_age: row.frozen_xid_age,
         min_mxid_age: row.min_mxid_age,
-        database_size_bytes: row.database_size_bytes,
         datconnlimit: row.datconnlimit,
         datallowconn: row.datallowconn,
         datistemplate: row.datistemplate,
@@ -458,7 +448,6 @@ fn row_from_pg(row: &tokio_postgres::Row, version: DatabaseVersion) -> DatabaseR
         parallel_workers_launched: has_parallel.then(|| row.get("parallel_workers_launched")),
         frozen_xid_age: row.get("frozen_xid_age"),
         min_mxid_age: row.get("min_mxid_age"),
-        database_size_bytes: row.get("database_size_bytes"),
         datconnlimit: row.get("datconnlimit"),
         datallowconn: row.get("datallowconn"),
         datistemplate: row.get("datistemplate"),
@@ -508,7 +497,7 @@ mod tests {
             } else {
                 Some("appdb".to_owned())
             },
-            numbackends: 4,
+            numbackends: if datid == 0 { None } else { Some(4) },
             xact_commit: 100,
             xact_rollback: 2,
             blks_read: 4_000,
@@ -538,11 +527,6 @@ mod tests {
             parallel_workers_launched: Some(8),
             frozen_xid_age: if datid == 0 { None } else { Some(150_000_000) },
             min_mxid_age: if datid == 0 { None } else { Some(5_000_000) },
-            database_size_bytes: if datid == 0 {
-                None
-            } else {
-                Some(1_073_741_824)
-            },
             datconnlimit: if datid == 0 { None } else { Some(-1) },
             datallowconn: if datid == 0 { None } else { Some(true) },
             datistemplate: if datid == 0 { None } else { Some(false) },
@@ -577,7 +561,7 @@ mod tests {
             assert!(database_query(v).contains("pg_stat_database"));
             assert!(database_query(v).contains("pg_kronika"));
             assert!(database_query(v).contains("frozen_xid_age"));
-            assert!(database_query(v).contains("pg_database_size"));
+            assert!(!database_query(v).contains(concat!("pg_database", "_size")));
             assert!(database_query(v).contains("LEFT JOIN pg_database"));
         }
     }
@@ -588,23 +572,29 @@ mod tests {
         assert_eq!(r.ts.0, 2_000);
         assert_eq!(r.datid, 5);
         assert_eq!(r.datname, Some(fake_intern(b"appdb").unwrap()));
-        assert_eq!(r.numbackends, 4);
+        assert_eq!(r.numbackends, Some(4));
         assert!((r.blk_read_time - 12.5).abs() < f64::EPSILON);
         assert_eq!(r.checksum_failures, 0);
         assert_eq!(r.checksum_last_failure, None);
         assert_eq!(r.parallel_workers_launched, 8);
         assert_eq!(r.frozen_xid_age, Some(150_000_000));
+        assert_eq!(r.min_mxid_age, Some(5_000_000));
         assert_eq!(r.datconnlimit, Some(-1));
         assert_eq!(r.datallowconn, Some(true));
+        assert_eq!(r.datistemplate, Some(false));
     }
 
     #[test]
-    fn to_v4_shared_row_has_null_datname() {
+    fn to_v4_shared_row_has_null_catalog_fields() {
         let r = to_v4(&sample_row(0), fake_intern).expect("intern");
         assert_eq!(r.datid, 0);
         assert_eq!(r.datname, None);
+        assert_eq!(r.numbackends, None);
         assert_eq!(r.frozen_xid_age, None);
+        assert_eq!(r.min_mxid_age, None);
+        assert_eq!(r.datconnlimit, None);
         assert_eq!(r.datallowconn, None);
+        assert_eq!(r.datistemplate, None);
     }
 
     #[test]

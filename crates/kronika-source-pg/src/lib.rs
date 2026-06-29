@@ -30,7 +30,17 @@ pub use activity::{
     to_v3,
 };
 
+pub mod archiver;
 pub mod database;
+pub mod io;
+
+pub mod wal;
+
+pub mod prepared_xacts;
+
+pub mod progress_vacuum;
+
+pub mod replication_instance;
 
 /// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->
 /// `17`.

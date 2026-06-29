@@ -7,9 +7,8 @@
 //!
 //! Every layout also carries the same `pg_database`-derived columns, joined by
 //! `oid = datid`: the `frozen_xid_age`/`min_mxid_age` wraparound ages,
-//! `database_size_bytes`, `datconnlimit`, and the `datallowconn`/`datistemplate`
-//! flags. They are `None` for the shared-objects row, which has no `pg_database`
-//! entry.
+//! `datconnlimit`, and the `datallowconn`/`datistemplate` flags. They are
+//! `None` for the shared-objects row, which has no `pg_database` entry.
 
 use crate::{Section, StrId, Ts};
 
@@ -18,8 +17,9 @@ use crate::{Section, StrId, Ts};
 ///
 /// One row per database, plus the `datid = 0` shared-objects row (PG12+) whose
 /// `datname` is `None`. `ts` is one `statement_timestamp()` for the snapshot;
-/// `numbackends` is the instantaneous connection count; `blk_read_time` /
-/// `blk_write_time` are zero unless `track_io_timing` is on.
+/// `numbackends` is the instantaneous connection count and is `None` for the
+/// shared-objects row. `blk_read_time` / `blk_write_time` are zero unless
+/// `track_io_timing` is on.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_005_004,
@@ -37,9 +37,9 @@ pub struct PgStatDatabaseV4 {
     /// Database name; `None` for the shared-objects row.
     #[column(l)]
     pub datname: Option<StrId>,
-    /// Backends currently connected to this database.
+    /// Backends currently connected to this database; `None` for the shared-objects row.
     #[column(g)]
-    pub numbackends: i32,
+    pub numbackends: Option<i32>,
     /// Committed transactions.
     #[column(c)]
     pub xact_commit: i64,
@@ -94,9 +94,6 @@ pub struct PgStatDatabaseV4 {
     /// Age of `datminmxid` in multixacts; `None` for the shared-objects row.
     #[column(g)]
     pub min_mxid_age: Option<i64>,
-    /// On-disk size of the database in bytes; `None` for the shared-objects row.
-    #[column(g)]
-    pub database_size_bytes: Option<i64>,
     /// Per-database connection limit; `-1` is unlimited, `None` for the shared-objects row.
     #[column(g)]
     pub datconnlimit: Option<i32>,
@@ -161,9 +158,9 @@ pub struct PgStatDatabaseV3 {
     /// Database name; `None` for the shared-objects row.
     #[column(l)]
     pub datname: Option<StrId>,
-    /// Backends currently connected to this database.
+    /// Backends currently connected to this database; `None` for the shared-objects row.
     #[column(g)]
-    pub numbackends: i32,
+    pub numbackends: Option<i32>,
     /// Committed transactions.
     #[column(c)]
     pub xact_commit: i64,
@@ -218,9 +215,6 @@ pub struct PgStatDatabaseV3 {
     /// Age of `datminmxid` in multixacts; `None` for the shared-objects row.
     #[column(g)]
     pub min_mxid_age: Option<i64>,
-    /// On-disk size of the database in bytes; `None` for the shared-objects row.
-    #[column(g)]
-    pub database_size_bytes: Option<i64>,
     /// Per-database connection limit; `-1` is unlimited, `None` for the shared-objects row.
     #[column(g)]
     pub datconnlimit: Option<i32>,
@@ -279,9 +273,9 @@ pub struct PgStatDatabaseV2 {
     /// Database name; `None` for the shared-objects row.
     #[column(l)]
     pub datname: Option<StrId>,
-    /// Backends currently connected to this database.
+    /// Backends currently connected to this database; `None` for the shared-objects row.
     #[column(g)]
-    pub numbackends: i32,
+    pub numbackends: Option<i32>,
     /// Committed transactions.
     #[column(c)]
     pub xact_commit: i64,
@@ -336,9 +330,6 @@ pub struct PgStatDatabaseV2 {
     /// Age of `datminmxid` in multixacts; `None` for the shared-objects row.
     #[column(g)]
     pub min_mxid_age: Option<i64>,
-    /// On-disk size of the database in bytes; `None` for the shared-objects row.
-    #[column(g)]
-    pub database_size_bytes: Option<i64>,
     /// Per-database connection limit; `-1` is unlimited, `None` for the shared-objects row.
     #[column(g)]
     pub datconnlimit: Option<i32>,
@@ -376,9 +367,9 @@ pub struct PgStatDatabaseV1 {
     /// Database name; `None` for the shared-objects row.
     #[column(l)]
     pub datname: Option<StrId>,
-    /// Backends currently connected to this database.
+    /// Backends currently connected to this database; `None` for the shared-objects row.
     #[column(g)]
-    pub numbackends: i32,
+    pub numbackends: Option<i32>,
     /// Committed transactions.
     #[column(c)]
     pub xact_commit: i64,
@@ -433,9 +424,6 @@ pub struct PgStatDatabaseV1 {
     /// Age of `datminmxid` in multixacts; `None` for the shared-objects row.
     #[column(g)]
     pub min_mxid_age: Option<i64>,
-    /// On-disk size of the database in bytes; `None` for the shared-objects row.
-    #[column(g)]
-    pub database_size_bytes: Option<i64>,
     /// Per-database connection limit; `-1` is unlimited, `None` for the shared-objects row.
     #[column(g)]
     pub datconnlimit: Option<i32>,
@@ -461,7 +449,7 @@ mod tests {
             } else {
                 Some(StrId(datid.into()))
             },
-            numbackends: 3,
+            numbackends: if datid == 0 { None } else { Some(3) },
             xact_commit: 100,
             xact_rollback: 2,
             blks_read: 4_000,
@@ -491,11 +479,6 @@ mod tests {
             parallel_workers_launched: 8,
             frozen_xid_age: if datid == 0 { None } else { Some(150_000_000) },
             min_mxid_age: if datid == 0 { None } else { Some(5_000_000) },
-            database_size_bytes: if datid == 0 {
-                None
-            } else {
-                Some(1_073_741_824)
-            },
             datconnlimit: if datid == 0 { None } else { Some(-1) },
             datallowconn: if datid == 0 { None } else { Some(true) },
             datistemplate: if datid == 0 { None } else { Some(false) },
@@ -511,11 +494,12 @@ mod tests {
     fn v4_contract_shape_matches_the_registry() {
         let c = PgStatDatabaseV4::CONTRACT;
         assert_eq!(c.type_id.get(), 1_005_004);
-        assert_eq!(c.columns.len(), 37);
+        assert_eq!(c.columns.len(), 36);
         assert_eq!(c.sort_key, ["datid", "ts"]);
         assert_eq!(c.column("ts").map(|col| col.nullable), Some(false));
         assert_eq!(c.column("datid").map(|col| col.nullable), Some(false));
         assert_eq!(c.column("datname").map(|col| col.nullable), Some(true));
+        assert_eq!(c.column("numbackends").map(|col| col.nullable), Some(true));
         assert_eq!(
             c.column("checksum_last_failure").map(|col| col.nullable),
             Some(true)
@@ -551,10 +535,13 @@ mod tests {
         let decoded =
             PgStatDatabaseV4::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
         assert_eq!(decoded[0].datname, None);
+        assert_eq!(decoded[0].numbackends, None);
         assert_eq!(decoded[0].checksum_last_failure, None);
         assert_eq!(decoded[0].frozen_xid_age, None);
-        assert_eq!(decoded[0].database_size_bytes, None);
+        assert_eq!(decoded[0].min_mxid_age, None);
+        assert_eq!(decoded[0].datconnlimit, None);
         assert_eq!(decoded[0].datallowconn, None);
+        assert_eq!(decoded[0].datistemplate, None);
     }
 
     fn v3_row(ts: i64, datid: u32) -> PgStatDatabaseV3 {
@@ -562,7 +549,7 @@ mod tests {
             ts: Ts(ts),
             datid,
             datname: Some(StrId(1)),
-            numbackends: 3,
+            numbackends: Some(3),
             xact_commit: 100,
             xact_rollback: 2,
             blks_read: 4_000,
@@ -590,7 +577,6 @@ mod tests {
             sessions_killed: 0,
             frozen_xid_age: Some(150_000_000),
             min_mxid_age: Some(5_000_000),
-            database_size_bytes: Some(1_073_741_824),
             datconnlimit: Some(-1),
             datallowconn: Some(true),
             datistemplate: Some(false),
@@ -601,7 +587,7 @@ mod tests {
     fn v3_contract_has_session_without_parallel() {
         let c = PgStatDatabaseV3::CONTRACT;
         assert_eq!(c.type_id.get(), 1_005_003);
-        assert_eq!(c.columns.len(), 35);
+        assert_eq!(c.columns.len(), 34);
         assert!(c.column("session_time").is_some());
         assert!(c.column("parallel_workers_launched").is_none());
         assert_eq!(lint(&[c]), Ok(()));
@@ -617,7 +603,7 @@ mod tests {
             ts: Ts(ts),
             datid,
             datname: Some(StrId(1)),
-            numbackends: 3,
+            numbackends: Some(3),
             xact_commit: 100,
             xact_rollback: 2,
             blks_read: 4_000,
@@ -638,7 +624,6 @@ mod tests {
             checksum_last_failure: None,
             frozen_xid_age: Some(150_000_000),
             min_mxid_age: Some(5_000_000),
-            database_size_bytes: Some(1_073_741_824),
             datconnlimit: Some(-1),
             datallowconn: Some(true),
             datistemplate: Some(false),
@@ -649,7 +634,7 @@ mod tests {
     fn v2_contract_has_checksum_without_session() {
         let c = PgStatDatabaseV2::CONTRACT;
         assert_eq!(c.type_id.get(), 1_005_002);
-        assert_eq!(c.columns.len(), 28);
+        assert_eq!(c.columns.len(), 27);
         assert!(c.column("checksum_failures").is_some());
         assert!(c.column("session_time").is_none());
         assert_eq!(lint(&[c]), Ok(()));
@@ -665,7 +650,7 @@ mod tests {
             ts: Ts(ts),
             datid,
             datname: Some(StrId(1)),
-            numbackends: 3,
+            numbackends: Some(3),
             xact_commit: 100,
             xact_rollback: 2,
             blks_read: 4_000,
@@ -684,7 +669,6 @@ mod tests {
             stats_reset: Some(Ts(ts - 5)),
             frozen_xid_age: Some(150_000_000),
             min_mxid_age: Some(5_000_000),
-            database_size_bytes: Some(1_073_741_824),
             datconnlimit: Some(-1),
             datallowconn: Some(true),
             datistemplate: Some(false),
@@ -695,7 +679,7 @@ mod tests {
     fn v1_contract_is_the_base_layout() {
         let c = PgStatDatabaseV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_005_001);
-        assert_eq!(c.columns.len(), 26);
+        assert_eq!(c.columns.len(), 25);
         assert!(c.column("checksum_failures").is_none());
         assert!(c.column("session_time").is_none());
         assert_eq!(lint(&[c]), Ok(()));
