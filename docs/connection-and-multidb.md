@@ -1,257 +1,164 @@
-# Сбор со всех баз инстанса: соединения, сессии, размеры
+# Сбор по базам: соединения и граница PR #29
 
-Версия: draft-1, 2026-06-29. Статус: дизайн для реализации.
+Статус: контракт PR #29, 2026-06-29.
 
-Документ фиксирует, как коллектор подключается к PostgreSQL, какие
-session-настройки выставляет, как обходит все базы инстанса и как собирает
-дорогие по стоимости данные (размеры). Решения опираются на rpglot (рабочий
-референс в проде) и на практики зрелых мониторингов (postgres_exporter,
-pganalyze, pgwatch, Datadog, pgmonitor, Percona PMM).
+Документ описывает подключение коллектора к PostgreSQL, session-настройки,
+перечисление баз и границу текущего PR. PR добавляет библиотечный слой для
+database-local метрик; сами database-local метрики и вызов per-db refresh из
+демона в него не входят.
 
-## 1. Контекст и термины
+## Классы метрик
 
-Коллектор обязан собирать метрики со **всех** баз инстанса, а не только из той,
-что указана в DSN (см. `CLAUDE.md`, Standing Rule: Multi-database collection).
-Метрики делятся на два класса:
-
-- **Класс A — instance-wide.** Одно соединение отдаёт строки по всему кластеру:
+- **Instance-wide.** Одно соединение видит строки по всему инстансу:
   `pg_stat_database`, `pg_stat_activity`, `pg_stat_io`, `pg_stat_wal`,
   `pg_stat_bgwriter`, `pg_stat_archiver`, `pg_prepared_xacts`,
-  `pg_stat_progress_*`, replication. Все текущие метрики — класс A.
-- **Класс B — database-local.** View видны только из той базы, к которой
-  подключён: `pg_stat_user_tables`/`indexes`, `pg_statio_*`,
-  `pg_stat_user_functions`, размеры объектов, bloat. Чтобы покрыть все базы,
-  нужно подключиться к каждой. Этих метрик пока нет — multi-db инфраструктура
-  готовит почву под них.
+  `pg_stat_progress_*`, replication. Текущий демон собирает этот класс через
+  главное соединение пула.
+- **Database-local.** Данные видны только из выбранной базы:
+  `pg_stat_user_tables`, `pg_stat_user_indexes`, `pg_statio_*`,
+  `pg_stat_user_functions`, размеры объектов, bloat. Для полного покрытия нужен
+  клиент на каждую базу, которую роль коллектора может открыть.
 
-Пул соединений нужен только классу B. Класс A работает через одно главное
-соединение и этим дизайном не затрагивается.
+## Модель соединений
 
-## 2. Модель соединений
-
-### 2.1 Клиент
-
-PgKronika на `tokio-postgres` (async). rpglot — на синхронном `postgres` 0.19;
-его механику переносим, но модель адаптируем под async: каждое соединение —
-пара `(Client, Connection)`, где `Connection` — это future, который надо
-`tokio::spawn` и хэндл которого надо хранить, чтобы корректно гасить при
-удалении базы из пула.
-
-### 2.2 Структуры
+PgKronika использует `tokio-postgres`. Каждое соединение состоит из `Client` и
+driver-задачи: она запускается через `tokio::spawn`, а `JoinHandle` хранится для
+явного `abort` при удалении соединения из пула.
 
 ```text
 DatabaseConn {
     datname: String,
-    client:  Client,
-    conn:    JoinHandle<()>,   // заспавненный connection-future; abort при drop
+    client: Client,
+    conn: JoinHandle<()>,
 }
 
 ConnectionPool {
-    base_dsn:     String,
-    main:         Client,            // класс A
-    per_db:       Vec<DatabaseConn>, // класс B, по одной на базу
-    exclude:      HashSet<String>,
+    base_dsn: String,
+    application_name: String,
+    session: SessionConfig,
+    exclude: HashSet<String>,
+    main: Client,
+    main_conn: JoinHandle<()>,
+    server_major: u32,
+    per_db: Vec<DatabaseConn>,
+    target: Vec<String>,
     last_refresh: Instant,
 }
 ```
 
-Модуль живёт в `kronika-source-pg` (по `check-deps` коллектор может на него
-зависеть; пул — часть механики сбора, не бинаря).
+`ConnectionPool::connect` открывает главное соединение. Per-db соединения
+создаёт `refresh(interval, max_databases)`.
 
-### 2.3 Постоянные коннекты ко всем базам
+## Подключение
 
-Решение: держим **постоянное** соединение к каждой принимающей подключения базе,
-переиспользуем между снимками. Лимита на число соединений **нет** —
-`max_connections` это забота оператора, а не коллектора. Это прямой паритет с
-rpglot.
+DSN разбирается через `tokio_postgres::Config`, поэтому поддерживаются оба
+формата: `key=value` и URI. Параметры не дописываются строковой склейкой:
 
-### 2.4 Enumeration
+- `dbname` задаётся структурным setter для per-db соединений;
+- `application_name` задаётся через `Config::application_name`;
+- `connect_timeout=5`;
+- TCP keepalive: `idle=30`, `interval=10`, `retries=3`;
+- startup options: `statement_timeout`, `lock_timeout`,
+  `idle_in_transaction_session_timeout`.
+
+JIT не настраивается в startup options: PostgreSQL 10 не знает этот GUC, а
+текущий PR сохраняет совместимость с PG10.
+
+## Session-настройки
+
+| Параметр | Дефолт | Способ | Контракт |
+|---|---:|---|---|
+| `statement_timeout` | `15000` ms | startup options | ограничивает лёгкие collector-запросы |
+| `lock_timeout` | `1000` ms | startup options | должен быть меньше `statement_timeout` |
+| `idle_in_transaction_session_timeout` | `10000` ms | startup options | закрывает зависшую idle-in-transaction сессию |
+| `application_name` | `pg_kronika-collector/<version>` | connection param | видимость в `pg_stat_activity` |
+| TCP keepalive | `30/10/3` | connection param | быстрее обнаруживает разрыв TCP-сессии |
+
+`SessionConfig::validate` отклоняет нулевые timeout-значения и
+`lock_timeout >= statement_timeout`.
+
+## Перечисление баз
+
+`ENUMERATE_SQL` возвращает базы в стабильном порядке по имени:
 
 ```sql
-SELECT datname FROM pg_catalog.pg_database
-WHERE datallowconn AND NOT datistemplate
+SELECT datname
+FROM pg_catalog.pg_database
+WHERE datallowconn
+  AND NOT datistemplate
+  AND pg_catalog.has_database_privilege(datname, 'CONNECT')
 ORDER BY datname
 ```
 
-Минус exclude-список из конфига. `replace_dbname` подменяет `dbname=` в
-`base_dsn` под каждую базу (libpq key=value: найти токен `dbname=`, заменить;
-если нет — дописать).
+Фильтр `CONNECT` нужен, чтобы refresh не открывал заведомо недоступные базы и
+не создавал `FATAL` в серверном логе. Exclude-список применяется после SQL.
 
-### 2.5 Refresh пула
+Discovery не вызывает `pg_database_size()`: refresh не должен добавлять
+filesystem I/O к каждому циклу.
 
-Вызывается перед каждым снимком, но реально работает раз в `pool_refresh_interval`
-(дефолт 10 мин, как rpglot). На срабатывании:
+## Refresh и coverage
 
-1. enumerate → целевой набор баз (минус exclude);
-2. новые базы → `connect` + `spawn`, добавить в `per_db`;
-3. исчезнувшие → drop (abort connection-future);
-4. существующие → health-check лёгким `SELECT` (`simple_query` с маркером);
-   мёртвые пересоздать.
+`refresh(interval, max_databases)`:
 
-### 2.6 Single-database режим
+1. пропускает работу, пока `interval` не истёк, если в пуле уже есть per-db
+   соединения;
+2. перечисляет все ожидаемые базы;
+3. оставляет в `per_db` только открытые соединения, которые попадают в cap;
+4. открывает недостающие соединения для первых `max_databases` баз в порядке
+   имени;
+5. сохраняет полный список `expected`, включая базы сверх cap.
 
-Если в DSN задан явный `dbname=` (или выставлен `PGDATABASE`) — enumeration
-выключается, пул состоит из одной этой базы. Поведение совпадает с обычным
-одно-инстансным коллектором.
+Если баз больше cap, лишние базы остаются в `uncovered`; это не ошибка refresh.
+`DEFAULT_MAX_DATABASES` сейчас равен `20`, env-переменной для него пока нет.
 
-## 3. Session-настройки
+`uncovered()` возвращает ожидаемые базы без живого клиента: недоступные,
+закрытые после failover или оставшиеся за cap.
 
-Применяются ко **всем** соединениям пула (main и per-db) одинаково. То, что
-известно до запросов, — через `options='-c ...'` в строке подключения (атомарно,
-до первого запроса, без лишнего round-trip). Дифференцированный по классам
-запросов `statement_timeout` — через `SET` перед группой запросов.
+## Failover
 
-| Параметр | Значение (дефолт) | Зачем коллектору | Способ |
-|---|---|---|---|
-| `statement_timeout` (лёгкие) | `15s` фикс | не залипнуть на счётчике/`pg_stat_*` | `options=` |
-| `statement_timeout` (тяжёлые: размеры/схема) | адаптивный: старт `15s`, ×2 до потолка `60s` (env) | серверный предохранитель; сам дорастает до реальной стоимости на инстансе, не угадывается фиксом | `SET` перед группой (см. §3.1) |
-| `lock_timeout` | `1s` | observability не ждёт блокировку (за DDL/vacuum); строго `< statement_timeout`, иначе бесполезен | `options=` |
-| `idle_in_transaction_session_timeout` | `10s` | страховка: не держать `idle in transaction` и не блокировать autovacuum | `options=` |
-| `jit` | `off` | короткие частые запросы — JIT-компиляция дороже выполнения | `options=` |
-| `application_name` | `pg_kronika-collector/<ver>` | видимость в `pg_stat_activity`, самоучёт соединений | conn param (уже есть) |
-| `connect_timeout` | `5` | «ждать бесконечно» по умолчанию вредно для коллектора | conn param |
-| TCP keepalives | `idle=30, interval=10, count=3` | при failover мёртвый коннект к упавшему primary иначе висит до системного дефолта (~2ч); пробел у всех конкурентов | conn param |
+Перед snapshot демон вызывает `ensure_main()`. Если главное соединение закрыто,
+пул открывает новое, проверяет `server_version` из handshake и только после
+этого заменяет клиент и driver handle. Так snapshot после failover использует
+актуальный PostgreSQL major.
 
-**read-only НЕ форсим.** `default_transaction_read_only=on` не ставит ни один из
-изученных мониторингов: полагаются на SELECT-природу сбора. Принудительный
-read-only — искусственное ограничение (та же логика, что с `max_connections`), и
-коллектор штатно работает на реплике, где сессия и так read-only.
+Per-db refresh удаляет закрытые клиенты по `Client::is_closed()` и пробует
+открыть их заново. Active ping для half-open соединений в PR #29 не входит.
 
-**search_path:** все запросы квалифицируют `pg_catalog.*` напрямую (защита от
-hijacking через подменённый search_path). Отдельный `SET search_path` нужен был
-бы только для `SECURITY DEFINER` функций, которых у нас нет.
-
-### 3.1 Адаптивный statement_timeout для тяжёлых запросов
-
-`statement_timeout` — это **серверный предохранитель**: PostgreSQL сам прибьёт
-запрос, даже если коллектор завис, словил OOM или умер и отменять некому. Это
-нижний слой; поверх него клиентский tokio-таймаут (чуть больше серверного) — на
-случай, если сервер почему-то не прибил, чтобы коллектор не висел в `await`.
-
-Угадывать таймаут тяжёлых запросов фиксом плохо: на одном инстансе мало, на
-другом много. Поэтому для тяжёлого класса (размеры, schema, bloat) таймаут
-**адаптивный, один на весь PgKronika-инстанс** (не дробится по метрике или базе):
-
-- старт 15s, при убийстве запроса по таймауту — ×2, до потолка (дефолт 60s,
-  `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`); ratchet только вверх, состояние в памяти
-  (после рестарта — разогрев заново; size-цикл редкий, это терпимо);
-- **различать причину убийства по SQLSTATE**: `57014` (убит по
-  `statement_timeout`) → запрос реально долгий → растим; `55P03`
-  (`lock_not_available`, убит по `lock_timeout`) → проблема в чужом локе, не в
-  стоимости → пропускаем базу на этом цикле, таймаут НЕ трогаем;
-- упёрлись в потолок и всё равно не уложились — лог + пропуск (для размеров —
-  fallback на relpages); сервер не держим дольше потолка.
-
-## 4. Реплика / standby
-
-Коллектор штатно работает на standby (снимать метрики с реплики, не грузить
-primary, — желательный режим).
-
-- Recovery-статус: `SELECT pg_catalog.pg_is_in_recovery()` раз за цикл,
-  кэшировать (~5 мин).
-- **Ветвление внутри SQL** (`CASE pg_is_in_recovery() THEN
-  pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END`) — переживает failover
-  без переконфигурации; робастнее, чем переключение наборов метрик по роли. Уже
-  применяется в метрике replication.
-- Функции, недоступные в recovery (`pg_current_wal_lsn()` и пр.), не вызываются
-  на standby — отдают NULL через `CASE`.
-- На реплике собираем всё штатно — отдельного «не собирать на standby» режима
-  нет: реплика обычный источник.
-
-## 5. Размеры — отдельная политика
-
-Главный урок ресёрча: `pg_database_size()` / `pg_total_relation_size()` делают
-`stat()` файлов на диске; на террабайтной базе с сотнями тысяч relations это
-секунды-минуты и не влезает в обычный `statement_timeout`. Percona PMM зовёт их
-без ограничений и **убивается на больших базах**; остальные защищаются.
-
-Политика PgKronika:
-
-1. **Размеры — отдельный редкий цикл** (дефолт 5-10 мин), не с частотой
-   счётчиков. Размер на диске меняется медленно — собирать его каждые N секунд
-   бессмысленно и опасно. Это снимает основную долю риска.
-2. **Дешёвый путь по умолчанию — `relpages`:**
-   ```sql
-   SELECT pg_catalog.current_setting('block_size')::int8 * pg_catalog.sum(relpages)
-   FROM pg_catalog.pg_class WHERE relpersistence <> 't'
-   ```
-   каталожный read без `stat()`, миллисекунды независимо от размера базы.
-   Минус: `relpages` обновляется только VACUUM/ANALYZE; на свежей таблице до
-   первого ANALYZE занижен (вплоть до нуля). Для трендов и «кто самый большой»
-   приемлемо, для точного учёта — нет.
-3. **Точный размер — редко**, отдельной задачей с увеличенным `statement_timeout`
-   (`300s`), чтобы не убивался общим лимитом и не валил остальные метрики.
-4. **Per-table (класс B):** top-N по размеру (`ORDER BY ... LIMIT N`, дефолт N≈500
-   как rpglot) и **обязательно пропуск залоченных** таблиц — `pg_relation_size`
-   берёт `AccessShareLock` и встанет за `AccessExclusiveLock` от DDL:
-   ```sql
-   AND NOT EXISTS (
-     SELECT 1 FROM pg_catalog.pg_locks
-     WHERE locktype='relation' AND mode='AccessExclusiveLock'
-       AND granted AND relation = c.oid)
-   ```
-5. **Размер базы целиком:** `pg_database_size()` (один вызов) дешевле суммы
-   `pg_total_relation_size` по таблицам, но всё равно дорог. Если per-table
-   размеры всё равно собираются — суммировать на стороне коллектора (путь
-   pganalyze), не доплачивать вторым проходом.
-
-**Следствие:** размер базы не входит в частый `pg_stat_database`. Его собирает
-только редкий size-цикл с адаптивным таймаутом (§3.1). Точный
-`pg_database_size()` остаётся вариантом для этого цикла; на очень большой базе,
-где он не укладывается даже в потолок 60s, fallback — relpages-оценка.
-
-## 6. Отказоустойчивость
-
-- **Отказ одной базы не валит сбор остальных:** per-db обход с `continue` +
-  логом (rpglot-паттерн).
-- **Retry на блокировке НЕ делаем.** Для read-only мониторинга это избыточно:
-  пропустить один снимок дешевле, чем нагружать БД повторами (паттерн
-  `lock_timeout`+retry — для DDL/миграций, не для сбора). Отход от rpglot здесь
-  осознанный, подтверждён практикой конкурентов (retry не делает никто).
-- **Разрыв соединения:** `tokio-postgres` завершает connection-future →
-  health-check на следующем refresh пересоздаёт. Главное соединение
-  переподключается лениво.
-
-## 7. Конфигурация (env)
+## Переменные окружения коллектора
 
 | Переменная | Дефолт | Назначение |
-|---|---|---|
-| `KRONIKA_PG_DSN` | — | базовая строка подключения |
-| `KRONIKA_PG_EXCLUDE_DATABASES` | пусто | список баз через `;`, исключить из обхода |
-| `KRONIKA_PG_POOL_REFRESH_SECS` | `600` | интервал refresh пула |
-| `KRONIKA_PG_STATEMENT_TIMEOUT_MS` | `15000` | лёгкие запросы (фикс) |
-| `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` | `60000` | потолок адаптивного таймаута тяжёлых запросов |
-| `KRONIKA_PG_LOCK_TIMEOUT_MS` | `1000` | ожидание блокировки (быстро отступить от чужого DDL) |
-| `KRONIKA_PG_SIZE_INTERVAL_SECS` | `600` | частота редкого size-цикла |
-| `KRONIKA_PG_MAX_TABLES` | `500` | top-N per база для класса B |
+|---|---:|---|
+| `KRONIKA_PG_DSN` | нет | базовая строка подключения, `key=value` или URI |
+| `KRONIKA_OUT_DIR` | нет | каталог для запечатанных сегментов |
+| `KRONIKA_SOURCE_ID` | `0` | идентификатор источника в сегменте |
+| `KRONIKA_PG_STATEMENT_TIMEOUT_MS` | `15000` | `statement_timeout` |
+| `KRONIKA_PG_LOCK_TIMEOUT_MS` | `1000` | `lock_timeout` |
+| `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS` | `10000` | `idle_in_transaction_session_timeout` |
+| `KRONIKA_PG_EXCLUDE_DATABASES` | пусто | базы для исключения, разделитель `;` |
 
-## 8. Что сознательно НЕ делаем
+`KRONIKA_SOURCE_ID=0` опасен для нескольких коллекторов с общим
+`KRONIKA_OUT_DIR`: проверка смешивания source id не различает два дефолтных
+нулевых источника. Для multi-collector раскладки задавайте уникальный ненулевой
+id каждому источнику.
 
-- Лимит на число соединений пула — `max_connections` это забота оператора.
-- `default_transaction_read_only=on` — искусственное ограничение, ломает гибкость
-  и не нужно для SELECT-сбора.
-- Retry запроса при блокировке — пропуск снимка дешевле.
-- Поднимать `work_mem` вслепую — системные запросы с `LIMIT` влезают в дефолт;
-  env-override на экзотику.
-- Режим «не собирать на реплике» (`skip_if_replica`) — реплика обычный источник.
+## Что не входит в PR #29
 
-## 9. Принятые решения по открытым вопросам
+- Вызов `pool.refresh()` в цикле демона. Демон пока использует `pool.main()` для
+  instance-wide метрик.
+- Сбор `pg_stat_user_tables` и других database-local метрик.
+- Запись coverage в сегмент.
+- Active ping для half-open per-db соединений.
+- Backoff при массовом отказе per-db подключений.
+- Параллельное открытие per-db соединений.
+- Приоритет крупных баз при превышении cap.
+- Size-цикл, `pg_database_size()` и применение `AdaptiveTimeout` к запросам.
+- Env-переменная для `DEFAULT_MAX_DATABASES`.
+- Single-database режим, default-excludes и include-regex.
 
-1. **Таймауты**: лёгкие — фикс 15s; тяжёлые — адаптивные с потолком 60s (env,
-   §3.1); `lock_timeout` — фикс 1s.
-2. **Размер базы целиком**: редкий size-цикл под адаптивным таймаутом;
-   relpages-fallback при недостижимости точного размера.
-3. **`skip_if_replica`**: не вводим — на реплике собираем всё.
-4. **Адаптивный таймаут**: гранулярность — один на PgKronika-инстанс; ratchet до
-   потолка; различение причин убийства по `57014`/`55P03`.
+## Проверка в PR
 
-## 10. Порядок реализации
-
-1. `ConnectionPool` в `kronika-source-pg`: enumerate, `replace_dbname`, refresh,
-   health-check, drop. Session-настройки через `options=` + `SET`.
-2. Автономные тесты пула (поднимается, обходит базы матрицы, переживает
-   удаление/добавление базы) — до первой метрики класса B.
-3. Реплика: детект recovery, ветвление в SQL уже есть в replication.
-4. Первый потребитель пула — `pg_stat_user_tables` (класс B): top-N, skip locked,
-   relpages-размер, метка `datname`.
-5. Size-цикл для размера базы — отдельно.
+- Unit-тесты `kronika-source-pg::pool` проверяют session config, PG10-safe
+  startup options без `jit`, URI DSN, `application_name`, validation и SQL
+  enumeration.
+- Live-BDD проверяет, что пул открывает per-db соединения для матричных
+  PostgreSQL кластеров и не перечисляет template-базы.
