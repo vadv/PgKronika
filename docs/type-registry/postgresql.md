@@ -403,10 +403,10 @@ delay_time            f64? G   // PG18+
 Одна строка на backend, выполняющий `VACUUM`, включая autovacuum. `VACUUM FULL`
 сюда не попадает. Если `pg_stat_progress_vacuum` пусто, секция отсутствует.
 
-PG17 заменил счётчики мёртвых кортежей (`max_dead_tuples` / `num_dead_tuples`)
-на байтовый TID-store (`max_dead_tuple_bytes` / `dead_tuple_bytes`) и
-`num_dead_item_ids`; эти колонки не объединяются, потому что единицы измерения
-разные. PG17 также добавил прогресс по индексам, PG18 — `delay_time`.
+PG17 заменил `max_dead_tuples` / `num_dead_tuples` на
+`max_dead_tuple_bytes`, `dead_tuple_bytes` и `num_dead_item_ids`; единицы
+измерения разные, поэтому поля не объединяются. PG17 также добавил прогресс по
+индексам, PG18 — `delay_time`.
 
 `datid` (OID БД) не сохраняется: идентификацию несёт `datname`, а связь с
 `pg_stat_activity` идёт по `pid`. `heap_blks_scanned` / `heap_blks_vacuumed`

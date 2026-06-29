@@ -458,7 +458,7 @@ fn check_database_rows(
     Ok(())
 }
 
-#[then("each matrix cluster accepts optional pg_stat_progress_vacuum rows")]
+#[then("each matrix cluster accepts optional pg_stat_progress_vacuum sections")]
 async fn every_version_accepts_progress_vacuum(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
     for db in &world.clusters {

@@ -1,15 +1,14 @@
 //! `pg_stat_progress_vacuum` collection for type `1_012_001`.
 //!
-//! One row per backend running `VACUUM`; the view is empty when no vacuum runs.
-//! The server major selects the SQL; fields absent from that catalog version
-//! become `None`. Collection returns owned rows; the caller interns `datname`
-//! and `phase` into the segment dictionary.
+//! One row per backend running `VACUUM`. An empty view produces no section.
+//! Query shape follows the server major; the caller interns `datname` and
+//! `phase`.
 
 use kronika_registry::pg_stat_progress_vacuum::PgStatProgressVacuum;
 use kronika_registry::{StrId, Ts};
 use tokio_postgres::Client;
 
-/// Prefix a query literal with the kronika marker (SQL-transparency rule).
+/// SQL transparency marker for collector queries.
 macro_rules! marked {
     ($sql:literal) => {
         concat!(
@@ -32,10 +31,7 @@ pub enum ProgressVacuumVersion {
     Pg18,
 }
 
-/// Select the column set for a server major.
-///
-/// PG17 replaced the dead-tuple counters with a byte-based TID store; PG18 added
-/// `delay_time`.
+/// Map a server major to its column set.
 #[must_use]
 pub const fn progress_vacuum_version(major: u32) -> ProgressVacuumVersion {
     if major >= 18 {
@@ -49,8 +45,7 @@ pub const fn progress_vacuum_version(major: u32) -> ProgressVacuumVersion {
 
 /// SQL for one column set.
 ///
-/// Each query carries the kronika marker and selects only the columns that
-/// version exposes. `ts` is one `statement_timestamp()` for the whole snapshot.
+/// `ts` is one `statement_timestamp()` for the whole snapshot.
 #[must_use]
 pub const fn progress_vacuum_query(version: ProgressVacuumVersion) -> &'static str {
     match version {
@@ -80,10 +75,7 @@ pub const fn progress_vacuum_query(version: ProgressVacuumVersion) -> &'static s
     }
 }
 
-/// Raw `pg_stat_progress_vacuum` row before string interning.
-///
-/// Labels are owned; the caller interns them. Columns absent from the selected
-/// query are `None`.
+/// Collected row before interning; version-specific fields are nullable.
 #[derive(Debug, Clone)]
 pub struct ProgressVacuumRow {
     /// Snapshot time, unix microseconds.
@@ -179,7 +171,7 @@ fn row_from_pg(row: &tokio_postgres::Row, version: ProgressVacuumVersion) -> Pro
 /// Collect every in-progress vacuum, or an empty vector when none runs.
 ///
 /// # Errors
-/// Returns the [`tokio_postgres::Error`] if the query fails.
+/// Returns `PostgreSQL` query errors.
 pub async fn collect_progress_vacuum(
     client: &Client,
     major: u32,
