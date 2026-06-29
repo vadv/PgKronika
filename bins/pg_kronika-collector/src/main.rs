@@ -22,6 +22,9 @@ use kronika_registry::StrId;
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
 use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
+use kronika_source_pg::prepared_xacts::{
+    PreparedXactsRow, collect_prepared_xacts, to_prepared_xacts,
+};
 use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
@@ -126,6 +129,9 @@ async fn snapshot_and_seal(
     let (database_version, database_rows) = collect_database(client, major)
         .await
         .context("collect pg_stat_database")?;
+    let prepared_rows = collect_prepared_xacts(client)
+        .await
+        .context("collect pg_prepared_xacts")?;
     let wal = collect_wal(client, major)
         .await
         .context("collect pg_stat_wal")?;
@@ -154,6 +160,7 @@ async fn snapshot_and_seal(
         database_version,
         &database_rows,
     )?;
+    push_prepared_xacts(&mut buffers, &mut interner, &prepared_rows)?;
     // pg_stat_wal has one all-numeric row; PG10-13 produce no row.
     match wal {
         Some(WalSnapshot::V1(row)) => buffer_row(&mut buffers, row)?,
@@ -236,6 +243,23 @@ fn push_database(
     Ok(())
 }
 
+/// Intern each row's `datname` and buffer it as the prepared-xacts section.
+///
+/// # Errors
+/// Returns an error if `datname` cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_prepared_xacts(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[PreparedXactsRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_prepared_xacts(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
 /// Intern WAL file names and buffer the singleton `pg_stat_archiver` row.
 ///
 /// # Errors
@@ -290,10 +314,14 @@ fn announce(line: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{activity_dict_limits, push_activity, push_archiver, push_database, push_io};
+    use super::{
+        activity_dict_limits, push_activity, push_archiver, push_database, push_io,
+        push_prepared_xacts,
+    };
     use kronika_source_pg::archiver::ArchiverRow;
     use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
     use kronika_source_pg::io::{IoRow, IoVersion};
+    use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::{ActivityRow, ActivityVersion};
     use kronika_writer::{Interner, SectionBuffers, dict};
 
@@ -461,6 +489,40 @@ mod tests {
             last_failed_time: Some(950),
             stats_reset: None,
         }
+    }
+
+    fn prepared_row() -> PreparedXactsRow {
+        PreparedXactsRow {
+            ts: 1_000,
+            datname: "appdb".to_owned(),
+            prepared_count: 1,
+            max_age_us: 50_000,
+            max_xid_age_tx: 4,
+        }
+    }
+
+    #[test]
+    fn push_prepared_xacts_buffers_rows_and_interns_datname() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_prepared_xacts(&mut buffers, &mut interner, &[prepared_row()])
+            .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "row was buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(!dict_sections.is_empty(), "datname reached the dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_010_001),
+            "the part carries the pg_prepared_xacts section"
+        );
     }
 
     #[test]

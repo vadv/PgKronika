@@ -22,7 +22,7 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_008_001` | `pg_stat_archiver` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_009_001` | `pg_stat_io` (PG 16-17) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
 | `1_009_002` | `pg_stat_io` (PG 18) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
-| `1_010_001` | агрегат `pg_prepared_xacts` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_010_001` | `pg_prepared_xacts` по базам | базовый шаг | `snapshot_full` | `(datname, ts)` |
 | `1_011_001` | `pg_locks`, дерево ожиданий | по факту | `conditional_full` | `(ts, root_pid, depth)` |
 | `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `snapshot_full` | `(ts, pid)` |
 | `1_013_001` | `pg_stat_user_tables` + `pg_statio_user_tables` | 30 с | `changed` | `(datname, relid, ts)` |
@@ -407,16 +407,31 @@ fsync_time      f64?  C
 stats_reset     ts?   G
 ```
 
-## `1_010_001` агрегат `pg_prepared_xacts`
+## `1_010_001` `pg_prepared_xacts` по базам
 
 ```text
-ts               ts   T
-count            i32  G
-max_age_seconds  i64  G
+ts              ts   T
+datname         str  L   // база, где висят prepared-транзакции
+prepared_count  i64  G   // число prepared-транзакций в базе
+max_age_us      i64  G   // wall-clock возраст старейшей prepared-транзакции, микросекунды
+max_xid_age_tx  i64  G   // максимальный age(transaction), транзакции
 ```
 
-Этого достаточно, чтобы предупредить о забытом 2PC. Полная таблица prepared
-transactions может стать отдельным типом, если понадобится детализация.
+Одна строка на базу с prepared-транзакциями (двухфазный коммит), `GROUP BY
+database`. Если prepared-транзакций нет, секция отсутствует; это означает ноль
+prepared-транзакций, а не ошибку сбора. По умолчанию
+`max_prepared_transactions = 0`, и 2PC выключен. Забытый 2PC удерживает горизонт
+xmin и блокирует vacuum в своей базе, поэтому `datname` обязателен.
+
+`prepared_count` — размер группы. `max_age_us` — wall-clock возраст старейшей
+prepared-транзакции в микросекундах, рассчитанный от `clock_timestamp()` и
+зажатый снизу нулём. `max_xid_age_tx` — максимальный `age(transaction)` в
+транзакциях; это XID-сигнал удержания горизонта. `pg_prepared_xacts` при чтении
+кратко блокирует и копирует состояние transaction manager; reset-семантики у
+источника нет.
+
+Детализация по транзакциям (`gid`, `owner`, `transaction`) может стать отдельным
+типом, если понадобится.
 
 ## `1_011_001` `pg_locks`, дерево ожиданий
 
