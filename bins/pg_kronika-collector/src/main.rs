@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use kronika_format::DictLimits;
 use kronika_registry::StrId;
+use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
 use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
 use kronika_source_pg::{
@@ -128,6 +129,9 @@ async fn snapshot_and_seal(
     let io = collect_io(client, major)
         .await
         .context("collect pg_stat_io")?;
+    let archiver = collect_archiver(client)
+        .await
+        .context("collect pg_stat_archiver")?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -149,6 +153,7 @@ async fn snapshot_and_seal(
     if let Some((io_version, io_rows)) = &io {
         push_io(&mut buffers, &mut interner, *io_version, io_rows)?;
     }
+    push_archiver(&mut buffers, &mut interner, &archiver)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -221,6 +226,20 @@ fn push_database(
     Ok(())
 }
 
+/// Intern WAL file names and buffer the singleton `pg_stat_archiver` row.
+///
+/// # Errors
+/// Returns an error if a WAL name cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_archiver(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    row: &ArchiverRow,
+) -> Result<()> {
+    let intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+    buffer_row(buffers, to_archiver(row, intern)?)
+}
+
 /// Intern each row's label strings and buffer it as the version's section type.
 ///
 /// # Errors
@@ -261,7 +280,8 @@ fn announce(line: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{activity_dict_limits, push_activity, push_database, push_io};
+    use super::{activity_dict_limits, push_activity, push_archiver, push_database, push_io};
+    use kronika_source_pg::archiver::ArchiverRow;
     use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
     use kronika_source_pg::io::{IoRow, IoVersion};
     use kronika_source_pg::{ActivityRow, ActivityVersion};
@@ -418,6 +438,46 @@ mod tests {
             fsync_time: None,
             stats_reset: Some(500),
         }
+    }
+
+    fn archiver_row() -> ArchiverRow {
+        ArchiverRow {
+            ts: 1_000,
+            archived_count: 3,
+            last_archived_wal: Some("00000001000000000000000A".to_owned()),
+            last_archived_time: Some(900),
+            failed_count: 1,
+            last_failed_wal: Some("00000001000000000000000B".to_owned()),
+            last_failed_time: Some(950),
+            stats_reset: None,
+        }
+    }
+
+    #[test]
+    fn push_archiver_buffers_row_and_interns_wal_names() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_archiver(&mut buffers, &mut interner, &archiver_row())
+            .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "row was buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(
+            !dict_sections.is_empty(),
+            "wal names reached the dictionary"
+        );
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_008_001),
+            "the part carries the pg_stat_archiver section"
+        );
     }
 
     #[test]
