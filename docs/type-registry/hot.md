@@ -81,7 +81,7 @@ cgroup memory events.
 | `10_002_001` | TPS | `0` | `commit`, `rollback` | `tx/s` | `1` | `rate` | `1_005_001` |
 | `10_003_001` | blocks | `0` | `read`, `hit` | `blk/s` | `1` | `rate` | `1_005_001` |
 | `10_004_001` | tuples | `0` | `ins`, `upd`, `del` | `tup/s` | `1` | `rate` | `1_005_001` |
-| `10_005_001` | WAL bytes | `0` | `bytes` | `B/s` | `1` | `rate` | `1_007_001` |
+| `10_005_001` | WAL bytes | `0` | `bytes` | `B/s` | `1` | `rate` | `1_007_001`, `1_007_002` |
 | `10_006_001` | backends by state | `0` | `active`, `idle_in_xact`, `waiting` | `n` | `0` | `gauge` | `1_001_001` |
 | `10_007_001` | host CPU | `0` | `user`, `system`, `iowait`, `steal` | `%` | `0` | `derived` | `1_102_001` |
 | `10_008_001` | host memory | `0` | `used`, `cached`, `available` | `B` | `0` | `gauge` | `1_104_001` |
@@ -95,7 +95,7 @@ cgroup memory events.
 | `10_016_001` | autovacuum | `0` | `running` | `n` | `0` | `gauge` | `1_012_001` |
 | `10_017_001` | replication lag | standby: `0`; primary: `application_name/client_addr` | `replay_lag` | `s` | `0` | `gauge` | `1_015_001` + `1_016_001` |
 | `10_018_001` | wraparound headroom | `0` | `max_age` | `xid` | `0` | `gauge` | `1_018_001` |
-| `10_019_001` | WAL records | `0` | `records`, `fpi` | `ops/s` | `1` | `rate` | `1_007_001` |
+| `10_019_001` | WAL records | `0` | `records`, `fpi` | `ops/s` | `1` | `rate` | `1_007_001`, `1_007_002` |
 
 Для `10_010_001` пишется отдельный экземпляр на устройство, `entity = device`.
 Для `10_017_001` на standby пишется один экземпляр `entity = 0` с
