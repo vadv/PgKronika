@@ -1298,8 +1298,7 @@ async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> an
             db.major(),
             pool.uncovered()
         );
-        let names =
-            enumerate_databases(pool.main(), &HashSet::new(), DEFAULT_MAX_DATABASES).await?;
+        let names = enumerate_databases(pool.main(), &HashSet::new()).await?;
         anyhow::ensure!(
             !names.iter().any(|n| n == "template0" || n == "template1"),
             "postgres {}: template database was enumerated",

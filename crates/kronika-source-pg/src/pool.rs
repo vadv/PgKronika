@@ -13,12 +13,14 @@ use tokio_postgres::{Client, NoTls};
 
 use crate::server_major;
 
-/// Connectable, non-template databases in deterministic order.
+/// Connectable, non-template databases, largest first (ties broken by name for
+/// a stable order). Size ordering lets the pool prefer the largest databases
+/// when the connectable set exceeds the cap.
 pub const ENUMERATE_SQL: &str = "/* pg_kronika pool */ SELECT datname \
     FROM pg_catalog.pg_database \
     WHERE datallowconn AND NOT datistemplate \
       AND pg_catalog.has_database_privilege(datname, 'CONNECT') \
-    ORDER BY datname";
+    ORDER BY pg_catalog.pg_database_size(oid) DESC, datname";
 
 /// Maximum per-database connections the pool opens by default.
 pub const DEFAULT_MAX_DATABASES: usize = 20;
@@ -71,46 +73,33 @@ fn build_config(
     Ok(cfg)
 }
 
-/// Apply the exclude set and enforce the database cap on enumerated names.
-///
-/// # Errors
-/// Returns an error if more than `max_databases` connectable databases remain
-/// after exclusion — narrow the set via the exclude list rather than have the
-/// collector silently open an unbounded number of backends.
+/// Drop excluded databases, preserving the input order (largest first).
 fn select_targets<S: std::hash::BuildHasher>(
     names: Vec<String>,
     exclude: &HashSet<String, S>,
-    max_databases: usize,
-) -> anyhow::Result<Vec<String>> {
-    let targets: Vec<String> = names
+) -> Vec<String> {
+    names
         .into_iter()
         .filter(|db| !exclude.contains(db))
-        .collect();
-    anyhow::ensure!(
-        targets.len() <= max_databases,
-        "connectable databases ({}) exceed the cap ({}); narrow the set via KRONIKA_PG_EXCLUDE_DATABASES",
-        targets.len(),
-        max_databases
-    );
-    Ok(targets)
+        .collect()
 }
 
-/// List target databases for the pool, minus the configured exclude set.
+/// List connectable databases — largest first — minus the configured exclude
+/// set. The cap is applied later, by `refresh`, so coverage can report the
+/// databases left out.
 ///
 /// # Errors
-/// Returns an error if the query fails or the connectable database count
-/// exceeds `max_databases` after filtering.
+/// Returns an error if the enumeration query fails.
 pub async fn enumerate_databases<S: std::hash::BuildHasher + Sync>(
     client: &Client,
     exclude: &HashSet<String, S>,
-    max_databases: usize,
 ) -> anyhow::Result<Vec<String>> {
     let rows = client
         .query(ENUMERATE_SQL, &[])
         .await
         .context("enumerate databases query")?;
     let names: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    select_targets(names, exclude, max_databases)
+    Ok(select_targets(names, exclude))
 }
 
 /// Adaptive `statement_timeout` for heavy database-local queries.
@@ -245,15 +234,17 @@ impl ConnectionPool {
         self.server_major
     }
 
-    /// Reconcile per-db clients with current connectable databases.
+    /// Reconcile per-db clients with the current connectable databases, capped
+    /// at `max_databases` and preferring the largest databases.
     ///
-    /// Skips work until `interval` elapses unless the pool is empty. Failed
-    /// per-db connects are logged and retried on the next refresh. Order is not
-    /// stable; callers should use `datname`.
+    /// Skips work until `interval` elapses unless the pool is empty. When the
+    /// connectable set exceeds the cap, the smaller databases beyond it are left
+    /// uncovered (reported by `uncovered`), not an error. Failed per-db connects
+    /// are logged and retried on the next refresh. Order is not stable; callers
+    /// should use `datname`.
     ///
     /// # Errors
-    /// Fails if enumerating databases fails or the connectable count exceeds
-    /// `max_databases` after applying the exclude set.
+    /// Fails if enumerating databases fails.
     pub async fn refresh(
         &mut self,
         interval: Duration,
@@ -262,16 +253,28 @@ impl ConnectionPool {
         if !self.per_db.is_empty() && self.last_refresh.elapsed() < interval {
             return Ok(());
         }
-        let target = enumerate_databases(&self.main, &self.exclude, max_databases).await?;
-        let target_set: HashSet<&str> = target.iter().map(String::as_str).collect();
+        let expected = enumerate_databases(&self.main, &self.exclude).await?;
+        if expected.len() > max_databases {
+            eprintln!(
+                "pg_kronika: {} connectable databases exceed the cap ({max_databases}); \
+                 covering the {max_databases} largest, leaving {} uncovered",
+                expected.len(),
+                expected.len() - max_databases
+            );
+        }
+        let connect_set: HashSet<&str> = expected
+            .iter()
+            .take(max_databases)
+            .map(String::as_str)
+            .collect();
         self.per_db
-            .retain(|c| target_set.contains(c.datname.as_str()));
+            .retain(|c| connect_set.contains(c.datname.as_str()));
         let have: HashSet<String> = self.per_db.iter().map(|c| c.datname.clone()).collect();
-        for db in &target {
+        for db in expected.iter().take(max_databases) {
             if have.contains(db) {
                 continue;
             }
-            let cfg = build_config(&self.base_dsn, &self.session, Some(db))?;
+            let cfg = build_config(&self.base_dsn, &self.session, Some(db.as_str()))?;
             match open(cfg).await {
                 Ok((client, conn, _)) => {
                     self.per_db.push(DatabaseConn {
@@ -283,7 +286,7 @@ impl ConnectionPool {
                 Err(err) => eprintln!("pg_kronika: per-db connect to {db} failed: {err:#}"),
             }
         }
-        self.target = target;
+        self.target = expected;
         self.last_refresh = Instant::now();
         Ok(())
     }
@@ -366,7 +369,8 @@ mod tests {
         assert!(ENUMERATE_SQL.contains("datallowconn"));
         assert!(ENUMERATE_SQL.contains("NOT datistemplate"));
         assert!(ENUMERATE_SQL.contains("has_database_privilege"));
-        assert!(ENUMERATE_SQL.contains("ORDER BY datname"));
+        assert!(ENUMERATE_SQL.contains("pg_database_size"));
+        assert!(ENUMERATE_SQL.contains("DESC"));
     }
 
     fn test_session() -> SessionConfig {
@@ -411,25 +415,11 @@ mod tests {
     }
 
     #[test]
-    fn select_targets_filters_excluded_names() {
-        let names = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
-        let exclude: HashSet<String> = ["b".to_owned()].into();
-        let targets = select_targets(names, &exclude, 10).expect("under cap");
-        assert_eq!(targets, ["a", "c"]);
-    }
-
-    #[test]
-    fn select_targets_accepts_exactly_max() {
-        let names: Vec<String> = (0..5).map(|i| format!("db{i}")).collect();
-        let exclude = HashSet::new();
-        let targets = select_targets(names, &exclude, 5).expect("at cap");
-        assert_eq!(targets.len(), 5);
-    }
-
-    #[test]
-    fn select_targets_rejects_over_cap() {
-        let names: Vec<String> = (0..6).map(|i| format!("db{i}")).collect();
-        let exclude = HashSet::new();
-        assert!(select_targets(names, &exclude, 5).is_err());
+    fn select_targets_drops_excluded_preserving_order() {
+        let names = vec!["big".to_owned(), "mid".to_owned(), "small".to_owned()];
+        let exclude: HashSet<String> = ["mid".to_owned()].into();
+        // Largest-first order from the query is preserved, so the cap applied
+        // later in refresh keeps the largest databases.
+        assert_eq!(select_targets(names, &exclude), ["big", "small"]);
     }
 }
