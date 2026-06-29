@@ -7,8 +7,13 @@
 //! SQLSTATE 57014/55P03.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
-use tokio_postgres::Client;
+use anyhow::Context;
+use tokio::task::JoinHandle;
+use tokio_postgres::{Client, NoTls};
+
+use crate::server_major;
 
 /// Databases this role may actually connect to (not just `datallowconn`),
 /// templates excluded, deterministic order.
@@ -128,6 +133,135 @@ impl AdaptiveTimeout {
     #[must_use]
     pub const fn at_cap(&self) -> bool {
         self.current_ms >= self.cap_ms
+    }
+}
+
+/// One per-database connection. The spawned connection-future is aborted on
+/// drop (a dropped `JoinHandle` does NOT cancel the task by itself), so a
+/// removed database leaves no driver task running.
+#[derive(Debug)]
+pub struct DatabaseConn {
+    /// Name of the database this connection targets.
+    pub datname: String,
+    client: Client,
+    conn: JoinHandle<()>,
+}
+
+impl DatabaseConn {
+    /// Returns the underlying client for issuing queries.
+    #[must_use]
+    pub const fn client(&self) -> &Client {
+        &self.client
+    }
+}
+
+impl Drop for DatabaseConn {
+    fn drop(&mut self) {
+        self.conn.abort();
+    }
+}
+
+/// Pool: one main connection (instance-wide) plus one per database.
+///
+/// `target` is the last enumerated database set, so coverage (which databases
+/// were reachable) is computable from pool state.
+#[derive(Debug)]
+pub struct ConnectionPool {
+    base_dsn: String,
+    session: SessionConfig,
+    #[allow(dead_code, reason = "consumed by refresh in the next task")]
+    exclude: HashSet<String>,
+    main: Client,
+    main_conn: JoinHandle<()>,
+    server_major: u32,
+    per_db: Vec<DatabaseConn>,
+    #[allow(dead_code, reason = "consumed by refresh in the next task")]
+    target: Vec<String>,
+    #[allow(dead_code, reason = "consumed by refresh in the next task")]
+    last_refresh: Instant,
+}
+
+/// Open a connection with the session DSN already applied; spawn its driver.
+async fn open(dsn: &str) -> anyhow::Result<(Client, JoinHandle<()>, Option<u32>)> {
+    let cfg: tokio_postgres::Config = dsn.parse().context("parse DSN")?;
+    let (client, connection) = cfg.connect(NoTls).await.context("connect")?;
+    let major = server_major(connection.parameter("server_version"));
+    let handle = tokio::spawn(async move {
+        drop(connection.await);
+    });
+    Ok((client, handle, major))
+}
+
+impl ConnectionPool {
+    /// Open the main connection. The per-db pool is filled by `refresh`.
+    ///
+    /// # Errors
+    /// Fails if the main connection cannot be established or reports no version.
+    pub async fn connect(
+        base_dsn: &str,
+        session: SessionConfig,
+        exclude: HashSet<String>,
+    ) -> anyhow::Result<Self> {
+        let dsn = apply_session_dsn(base_dsn, &session);
+        let (main, main_conn, major) = open(&dsn).await?;
+        let server_major = major.context("server reported no parseable server_version")?;
+        Ok(Self {
+            base_dsn: base_dsn.to_owned(),
+            session,
+            exclude,
+            main,
+            main_conn,
+            server_major,
+            per_db: Vec::new(),
+            target: Vec::new(),
+            last_refresh: Instant::now(),
+        })
+    }
+
+    /// Returns the main (instance-wide) client.
+    #[must_use]
+    pub const fn main(&self) -> &Client {
+        &self.main
+    }
+
+    /// Returns the per-database connections opened by the last `refresh`.
+    #[must_use]
+    pub fn per_db(&self) -> &[DatabaseConn] {
+        &self.per_db
+    }
+
+    /// Returns the `PostgreSQL` major version detected at connection time.
+    #[must_use]
+    pub const fn server_major(&self) -> u32 {
+        self.server_major
+    }
+
+    /// Reopen the main connection if it died (failover/restart). Refreshes
+    /// `server_major` from the new handshake. Call before every snapshot —
+    /// without it a collector survives a primary failover as a live-but-blind
+    /// process and would tag metrics with a stale major.
+    ///
+    /// # Errors
+    /// Fails if reconnection fails or the new server reports no version.
+    pub async fn ensure_main(&mut self) -> anyhow::Result<()> {
+        if !self.main.is_closed() {
+            return Ok(());
+        }
+        let dsn = apply_session_dsn(&self.base_dsn, &self.session);
+        let (client, conn, major) = open(&dsn).await?;
+        self.main_conn.abort();
+        self.main = client;
+        self.main_conn = conn;
+        self.server_major = major.context("server reported no parseable server_version")?;
+        Ok(())
+    }
+}
+
+impl Drop for ConnectionPool {
+    fn drop(&mut self) {
+        // Per-db drivers self-abort via DatabaseConn::drop when per_db drops;
+        // only the bare main handle needs an explicit abort here.
+        self.main_conn.abort();
     }
 }
 
