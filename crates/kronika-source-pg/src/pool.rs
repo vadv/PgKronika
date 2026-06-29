@@ -13,9 +13,9 @@ use tokio_postgres::{Client, NoTls};
 
 use crate::server_major;
 
-/// Connectable, non-template databases in a stable name order. Name ordering is
-/// cheap and deterministic; ranking by size would pull per-database filesystem
-/// I/O into every discovery.
+/// Connectable, non-template databases in stable name order.
+///
+/// Name ordering avoids per-database size checks during refresh.
 pub const ENUMERATE_SQL: &str = "/* pg_kronika pool */ SELECT datname \
     FROM pg_catalog.pg_database \
     WHERE datallowconn AND NOT datistemplate \
@@ -42,12 +42,11 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
-    /// Reject timeout settings that would silently disable a guard.
+    /// Reject timeout settings that disable a guard.
     ///
     /// `lock_timeout_ms` must be below `statement_timeout_ms`, otherwise a lock
     /// wait is cut short by `statement_timeout` and `lock_timeout` never fires.
-    /// A zero value disables the corresponding `PostgreSQL` timeout, which a
-    /// 24/7 collector must never do.
+    /// A zero value disables the corresponding `PostgreSQL` timeout.
     ///
     /// # Errors
     /// Fails if any timeout is zero or `lock_timeout_ms >= statement_timeout_ms`.
@@ -79,8 +78,8 @@ impl SessionConfig {
 /// `dbname` overrides the target database for per-db connections. A non-empty
 /// `application_name` is set as the connection's `application_name`.
 ///
-/// Settings go through structured `tokio_postgres::Config` setters (not string
-/// concatenation), so any libpq DSN form — key=value or URI — is handled.
+/// Settings go through structured `tokio_postgres::Config` setters, so both
+/// key=value and URI DSNs are handled without string concatenation.
 ///
 /// # Errors
 /// Fails if `base_dsn` is not a parseable connection string.
@@ -102,8 +101,7 @@ fn build_config(
     cfg.keepalives_idle(Duration::from_secs(30));
     cfg.keepalives_interval(Duration::from_secs(10));
     cfg.keepalives_retries(3);
-    // jit omitted from startup options: the jit GUC predates PG11, and the
-    // collector's short queries would not benefit from it.
+    // Keep jit out of startup options: PG10 rejects the GUC.
     cfg.options(format!(
         "-c statement_timeout={} -c lock_timeout={} -c idle_in_transaction_session_timeout={}",
         session.statement_timeout_ms, session.lock_timeout_ms, session.idle_in_tx_timeout_ms
@@ -280,13 +278,12 @@ impl ConnectionPool {
     /// Reconcile per-db clients with the current connectable databases, capped
     /// at `max_databases`.
     ///
-    /// The cap keeps the first `max_databases` in name order; databases beyond it
-    /// are left uncovered (reported by `uncovered`), not an error. Preferring
-    /// specific databases under the cap is a future size-cycle concern, not done
-    /// here. Skips work until `interval` elapses unless the pool is empty.
-    /// Clients closed by a failover or restart are dropped and reopened. Failed
-    /// per-db connects are logged and retried on the next refresh. Order is not
-    /// stable; callers should use `datname`.
+    /// The cap keeps the first `max_databases` in name order. Databases beyond it
+    /// remain in `uncovered`; this is not a refresh error. Skips work until
+    /// `interval` elapses unless the pool is empty. Clients closed by failover or
+    /// restart are dropped and reopened. Failed per-db connects are logged and
+    /// retried on the next refresh. Order is not stable; callers should use
+    /// `datname`.
     ///
     /// # Errors
     /// Fails if enumerating databases fails.
@@ -471,8 +468,7 @@ mod tests {
 
     #[test]
     fn build_config_handles_uri_dsn() {
-        // A URI DSN once corrupted by ` application_name=...` string concatenation;
-        // the structured setter keeps it parseable.
+        // Structured setters keep URI DSNs parseable.
         let cfg = build_config(
             "postgresql://h/postgres",
             "pg_kronika-collector/9.9",
