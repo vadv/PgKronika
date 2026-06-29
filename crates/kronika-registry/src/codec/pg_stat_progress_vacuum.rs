@@ -1,14 +1,12 @@
 //! Type `1_012_001`: `pg_stat_progress_vacuum`.
 //!
-//! One row per backend running `VACUUM`; the collector writes no section when
-//! the view is empty. Fields absent on the server version stay `None`.
+//! One row per backend running `VACUUM`. An empty view produces no section.
 
 use crate::{Section, StrId, Ts};
 
-/// Type `1_012_001`: one `pg_stat_progress_vacuum` row.
+/// Type `1_012_001`: `pg_stat_progress_vacuum`.
 ///
-/// PG 10-16 report dead tuples as counts. PG17+ reports TID-store bytes and
-/// item ids, so the eras use separate nullable columns. PG18 adds `delay_time`.
+/// Nullable columns preserve `PostgreSQL` catalog-era differences.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_012_001,
@@ -44,30 +42,28 @@ pub struct PgStatProgressVacuum {
     /// Completed index-vacuum cycles.
     #[column(g)]
     pub index_vacuum_count: i64,
-    /// Dead tuples that fit before an index cycle is forced (PG 10-16); `None`
-    /// on PG17+.
+    /// Dead-tuple capacity (PG10-16).
     #[column(g)]
     pub max_dead_tuples: Option<i64>,
-    /// Dead tuples collected in the current cycle (PG 10-16); `None` on PG17+.
+    /// Dead tuples collected in the current cycle (PG10-16).
     #[column(g)]
     pub num_dead_tuples: Option<i64>,
-    /// Dead-tuple TID store capacity in bytes (PG17+); `None` before PG17.
+    /// Dead-tuple TID store capacity, bytes (PG17+).
     #[column(g)]
     pub max_dead_tuple_bytes: Option<i64>,
-    /// Bytes the dead-tuple TID store holds (PG17+); `None` before PG17.
+    /// Dead-tuple TID store usage, bytes (PG17+).
     #[column(g)]
     pub dead_tuple_bytes: Option<i64>,
-    /// Dead item identifiers collected (PG17+); `None` before PG17.
+    /// Dead item identifiers collected (PG17+).
     #[column(g)]
     pub num_dead_item_ids: Option<i64>,
-    /// Indexes to process in this cycle (PG17+); `None` before PG17.
+    /// Indexes to process in this cycle (PG17+).
     #[column(g)]
     pub indexes_total: Option<i64>,
-    /// Indexes processed in this cycle (PG17+); `None` before PG17.
+    /// Indexes processed in this cycle (PG17+).
     #[column(g)]
     pub indexes_processed: Option<i64>,
-    /// Time asleep on cost-based delay, ms (PG18+); `None` before PG18 and `0`
-    /// without `track_cost_delay_timing`.
+    /// Cost-delay sleep time, ms (PG18+).
     #[column(g)]
     pub delay_time: Option<f64>,
 }
