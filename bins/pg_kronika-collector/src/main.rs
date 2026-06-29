@@ -436,7 +436,7 @@ mod tests {
             } else {
                 Some("appdb".to_owned())
             },
-            numbackends: if datid == 0 { None } else { Some(4) },
+            numbackends: if datid == 0 { Some(0) } else { Some(4) },
             xact_commit: 100,
             xact_rollback: 2,
             blks_read: 4_000,
