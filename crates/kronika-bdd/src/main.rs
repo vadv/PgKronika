@@ -29,13 +29,17 @@ use kronika_registry::{
     bgwriter_checkpointer::BgwriterCheckpointer,
     pg_stat_activity::PgStatActivityV3,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
+    pg_stat_progress_vacuum::PgStatProgressVacuum,
 };
 use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
 
 const PG17_MAJOR: u32 = 17;
+const PG18_MAJOR: u32 = 18;
 
 const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
+
+const PG_STAT_PROGRESS_VACUUM_TYPE_ID: u32 = 1_012_001;
 
 const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
 
@@ -450,6 +454,93 @@ fn check_database_rows(
             "postgres {major}: datname str_id {} did not resolve to a string: {other:?}",
             datname.0
         ),
+    }
+    Ok(())
+}
+
+#[then("each matrix cluster validates pg_stat_progress_vacuum rows when a vacuum runs")]
+async fn every_version_validates_progress_vacuum(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_progress_vacuum_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Validate the sealed `pg_stat_progress_vacuum` section when present. The view
+/// is empty unless a VACUUM runs, so the section may be absent — a valid state;
+/// the typed layout itself is covered by codec roundtrip tests. When present
+/// (e.g. autovacuum overlapped the snapshot), every row carries one snapshot ts,
+/// resolvable labels, and the major version's dead-tuple columns while the other
+/// era's columns stay NULL.
+fn assert_progress_vacuum_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let catalog = segment.catalog();
+    if !catalog
+        .entries
+        .iter()
+        .any(|entry| entry.type_id == PG_STAT_PROGRESS_VACUUM_TYPE_ID)
+    {
+        return Ok(());
+    }
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    let rows =
+        decode_db_section::<PgStatProgressVacuum>(path, &segment, PG_STAT_PROGRESS_VACUUM_TYPE_ID)
+            .with_context(|| format!("postgres {major}: read back section 1_012_001"))?;
+    let Some(first) = rows.first() else {
+        return Ok(());
+    };
+
+    let ts = first.ts.0;
+    anyhow::ensure!(
+        rows.iter().all(|row| row.ts.0 == ts),
+        "postgres {major}: snapshot rows carry differing ts"
+    );
+    ensure_ts_in_segment_range(
+        major,
+        "section 1_012_001",
+        ts,
+        catalog.min_ts,
+        catalog.max_ts,
+    )?;
+
+    for row in &rows {
+        anyhow::ensure!(
+            row.pid > 0,
+            "postgres {major}: progress-vacuum pid {} is not positive",
+            row.pid
+        );
+        for (label, id) in [("datname", row.datname.0), ("phase", row.phase.0)] {
+            match dict.resolve(id) {
+                Some(Resolved::String(bytes)) => anyhow::ensure!(
+                    !bytes.is_empty(),
+                    "postgres {major}: {label} resolved to an empty string"
+                ),
+                other => anyhow::bail!(
+                    "postgres {major}: {label} str_id {id} did not resolve to a string: {other:?}"
+                ),
+            }
+        }
+        if major >= PG17_MAJOR {
+            anyhow::ensure!(
+                row.dead_tuple_bytes.is_some() && row.max_dead_tuples.is_none(),
+                "postgres {major}: PG17+ row must use the byte-era dead-tuple columns"
+            );
+        } else {
+            anyhow::ensure!(
+                row.max_dead_tuples.is_some() && row.dead_tuple_bytes.is_none(),
+                "postgres {major}: pre-PG17 row must use the count-era dead-tuple columns"
+            );
+        }
+        anyhow::ensure!(
+            row.delay_time.is_some() == (major >= PG18_MAJOR),
+            "postgres {major}: delay_time presence must match PG18+"
+        );
     }
     Ok(())
 }

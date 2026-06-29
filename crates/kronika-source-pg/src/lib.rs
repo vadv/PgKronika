@@ -32,6 +32,8 @@ pub use activity::{
 
 pub mod database;
 
+pub mod progress_vacuum;
+
 /// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->
 /// `17`.
 ///

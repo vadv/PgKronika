@@ -20,6 +20,9 @@ use anyhow::{Context, Result};
 use kronika_format::DictLimits;
 use kronika_registry::StrId;
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
+use kronika_source_pg::progress_vacuum::{
+    ProgressVacuumRow, collect_progress_vacuum, to_progress_vacuum,
+};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
     to_v1, to_v2, to_v3,
@@ -123,6 +126,9 @@ async fn snapshot_and_seal(
     let (database_version, database_rows) = collect_database(client, major)
         .await
         .context("collect pg_stat_database")?;
+    let progress_vacuum_rows = collect_progress_vacuum(client, major)
+        .await
+        .context("collect pg_stat_progress_vacuum")?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -141,6 +147,7 @@ async fn snapshot_and_seal(
         database_version,
         &database_rows,
     )?;
+    push_progress_vacuum(&mut buffers, &mut interner, &progress_vacuum_rows)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -209,6 +216,24 @@ fn push_database(
             DatabaseVersion::V3 => buffer_row(buffers, database::to_v3(row, &mut intern)?)?,
             DatabaseVersion::V4 => buffer_row(buffers, database::to_v4(row, &mut intern)?)?,
         }
+    }
+    Ok(())
+}
+
+/// Intern each row's `datname` and `phase` and buffer it as a progress-vacuum
+/// section row.
+///
+/// # Errors
+/// Returns an error if a label cannot be interned (dictionary full) or a section
+/// buffer is full.
+fn push_progress_vacuum(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[ProgressVacuumRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_progress_vacuum(row, &mut intern)?)?;
     }
     Ok(())
 }
