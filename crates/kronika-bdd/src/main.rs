@@ -647,7 +647,7 @@ fn check_io_stats_reset(
     Ok(())
 }
 
-/// Read back the single `pg_stat_archiver` row and resolve WAL names when set.
+/// Check singleton shape, counters, timestamp, and optional WAL-name dictionary ids.
 fn assert_archiver_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;

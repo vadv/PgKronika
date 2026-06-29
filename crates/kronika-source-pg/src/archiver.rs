@@ -1,13 +1,12 @@
 //! `pg_stat_archiver` collection for type `1_008_001`.
 //!
-//! One row, stable across PG 10-18; the caller interns the WAL file names. The
-//! typed layout lives in `kronika-registry` (`PgStatArchiver`).
+//! One row; the caller interns WAL file names.
 
 use kronika_registry::pg_stat_archiver::PgStatArchiver;
 use kronika_registry::{StrId, Ts};
 use tokio_postgres::Client;
 
-/// Prefix a query literal with the kronika marker (SQL-transparency rule).
+/// SQL transparency marker for collector queries.
 macro_rules! marked {
     ($sql:literal) => {
         concat!(
@@ -29,8 +28,7 @@ const QUERY: &str = marked!(
      FROM pg_stat_archiver"
 );
 
-/// One raw `pg_stat_archiver` row. WAL names are owned; the caller interns them.
-/// See [`PgStatArchiver`] for column meaning.
+/// Collected row before WAL-name interning.
 #[derive(Debug, Clone)]
 pub struct ArchiverRow {
     /// Snapshot time, unix microseconds.
@@ -85,7 +83,7 @@ pub fn to_archiver<E>(
 /// Collect the single `pg_stat_archiver` row (present on every PG 10-18).
 ///
 /// # Errors
-/// Returns the [`tokio_postgres::Error`] if the query fails.
+/// Returns `PostgreSQL` query errors.
 pub async fn collect_archiver(client: &Client) -> Result<ArchiverRow, tokio_postgres::Error> {
     let row = client.query_one(QUERY, &[]).await?;
     Ok(ArchiverRow {

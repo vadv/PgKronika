@@ -462,7 +462,10 @@ mod tests {
         assert!(!buffers.is_empty(), "row was buffered");
 
         let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
-        assert!(!dict_sections.is_empty(), "wal names reached the dictionary");
+        assert!(
+            !dict_sections.is_empty(),
+            "wal names reached the dictionary"
+        );
         let part = buffers
             .flush(&dict_sections, 0)
             .expect("flush encodes the window")
