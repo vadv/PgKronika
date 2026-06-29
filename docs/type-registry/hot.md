@@ -98,6 +98,8 @@ cgroup memory events.
 | `10_019_001` | WAL records | `0` | `records`, `fpi` | `ops/s` | `1` | `rate` | `1_007_001`, `1_007_002` |
 
 Для `10_010_001` пишется отдельный экземпляр на устройство, `entity = device`.
+Для `10_016_001` серия `running` равна числу строк `1_012_001` с
+`is_autovacuum = true`; отсутствие секции `1_012_001` даёт `0`.
 Для `10_017_001` на standby пишется один экземпляр `entity = 0` с
 `replay_lag`; на primary пишется отдельный экземпляр на реплику,
 `entity = application_name/client_addr`.

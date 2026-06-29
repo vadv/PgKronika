@@ -25,6 +25,9 @@ use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
 use kronika_source_pg::prepared_xacts::{
     PreparedXactsRow, collect_prepared_xacts, to_prepared_xacts,
 };
+use kronika_source_pg::progress_vacuum::{
+    ProgressVacuumRow, collect_progress_vacuum, to_progress_vacuum,
+};
 use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
@@ -129,6 +132,9 @@ async fn snapshot_and_seal(
     let (database_version, database_rows) = collect_database(client, major)
         .await
         .context("collect pg_stat_database")?;
+    let progress_vacuum_rows = collect_progress_vacuum(client, major)
+        .await
+        .context("collect pg_stat_progress_vacuum")?;
     let prepared_rows = collect_prepared_xacts(client)
         .await
         .context("collect pg_prepared_xacts")?;
@@ -160,6 +166,7 @@ async fn snapshot_and_seal(
         database_version,
         &database_rows,
     )?;
+    push_progress_vacuum(&mut buffers, &mut interner, &progress_vacuum_rows)?;
     push_prepared_xacts(&mut buffers, &mut interner, &prepared_rows)?;
     // pg_stat_wal has one all-numeric row; PG10-13 produce no row.
     match wal {
@@ -243,6 +250,23 @@ fn push_database(
     Ok(())
 }
 
+/// Intern each row's labels and buffer it as the progress-vacuum section.
+///
+/// # Errors
+/// Returns an error if a label cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_progress_vacuum(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[ProgressVacuumRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_progress_vacuum(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
 /// Intern each row's `datname` and buffer it as the prepared-xacts section.
 ///
 /// # Errors
@@ -316,12 +340,13 @@ fn announce(line: &str) {
 mod tests {
     use super::{
         activity_dict_limits, push_activity, push_archiver, push_database, push_io,
-        push_prepared_xacts,
+        push_prepared_xacts, push_progress_vacuum,
     };
     use kronika_source_pg::archiver::ArchiverRow;
     use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
     use kronika_source_pg::io::{IoRow, IoVersion};
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
+    use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
     use kronika_source_pg::{ActivityRow, ActivityVersion};
     use kronika_writer::{Interner, SectionBuffers, dict};
 
@@ -499,6 +524,58 @@ mod tests {
             max_age_us: 50_000,
             max_xid_age_tx: 4,
         }
+    }
+
+    fn progress_vacuum_row(phase: &str) -> ProgressVacuumRow {
+        ProgressVacuumRow {
+            ts: 1_000,
+            pid: 42,
+            datid: 16_385,
+            datname: "appdb".to_owned(),
+            relid: 16_384,
+            is_autovacuum: true,
+            phase: phase.to_owned(),
+            heap_blks_total: 10_000,
+            heap_blks_scanned: 4_200,
+            heap_blks_vacuumed: 4_000,
+            index_vacuum_count: 1,
+            max_dead_tuples: Some(291_271),
+            num_dead_tuples: Some(120_000),
+            max_dead_tuple_bytes: None,
+            dead_tuple_bytes: None,
+            num_dead_item_ids: None,
+            indexes_total: None,
+            indexes_processed: None,
+            delay_time: None,
+        }
+    }
+
+    #[test]
+    fn push_progress_vacuum_buffers_rows_and_interns_labels() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_progress_vacuum(
+            &mut buffers,
+            &mut interner,
+            &[progress_vacuum_row("scanning heap")],
+        )
+        .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "row was buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(!dict_sections.is_empty(), "labels reached the dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_012_001),
+            "the part carries the pg_stat_progress_vacuum section"
+        );
     }
 
     #[test]
