@@ -1,18 +1,10 @@
 //! Type `1_007_001` / `1_007_002`: `pg_stat_wal`.
 //!
-//! Cluster-wide WAL generation counters, a single row available from PG14. PG18
-//! removed the WAL write/sync counters and their timings from `pg_stat_wal`
-//! (the data moved to `pg_stat_io` WAL rows), so the source maps to two layout
-//! versions.
+//! Cluster-wide WAL counters. `1_007_002` removes PG18 write/sync fields.
 
 use crate::{Section, Ts};
 
 /// Type `1_007_001`: `pg_stat_wal` on PG 14-17.
-///
-/// One cluster-wide row. `wal_bytes` is a `numeric` in the view, stored as
-/// `i64`. `wal_write_time` / `wal_sync_time` are `0.0` unless
-/// `track_wal_io_timing` is on. `stats_reset` is `None` only on a server whose
-/// WAL statistics were never reset.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_007_001,
@@ -54,10 +46,6 @@ pub struct PgStatWalV1 {
 }
 
 /// Type `1_007_002`: `pg_stat_wal` on PG 18.
-///
-/// PG18 dropped `wal_write`, `wal_sync`, `wal_write_time`, and `wal_sync_time`;
-/// the WAL I/O volume and timing now live in `pg_stat_io` (`object = wal`). The
-/// remaining generation counters keep the semantics of [`PgStatWalV1`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(
     id = 1_007_002,
@@ -139,7 +127,6 @@ mod tests {
 
         let v2 = PgStatWalV2::CONTRACT;
         assert_eq!(v2.type_id.get(), 1_007_002);
-        // PG18 dropped the four write/sync columns.
         assert_eq!(v2.columns.len(), 6);
         assert_eq!(v2.column("wal_write"), None);
         assert_eq!(v2.column("stats_reset").map(|col| col.nullable), Some(true));
@@ -153,7 +140,6 @@ mod tests {
 
     #[test]
     fn nulls_survive_distinct_from_zero() {
-        // A never-reset server keeps stats_reset NULL, not Some(Ts(0)).
         let bytes = PgStatWalV2::encode(&[v2_row(5)]).expect("encode");
         let decoded = PgStatWalV2::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
         assert_eq!(decoded[0].stats_reset, None);
