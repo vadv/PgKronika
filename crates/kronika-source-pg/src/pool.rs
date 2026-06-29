@@ -6,6 +6,34 @@
 //! `tokio_postgres::Error` via the handed-out `Client`, so callers can match
 //! SQLSTATE 57014/55P03.
 
+use std::collections::HashSet;
+
+use tokio_postgres::Client;
+
+/// Databases this role may actually connect to (not just `datallowconn`),
+/// templates excluded, deterministic order.
+pub const ENUMERATE_SQL: &str = "/* pg_kronika pool */ SELECT datname \
+    FROM pg_catalog.pg_database \
+    WHERE datallowconn AND NOT datistemplate \
+      AND pg_catalog.has_database_privilege(datname, 'CONNECT') \
+    ORDER BY datname";
+
+/// List target databases for the pool, minus the configured exclude set.
+///
+/// # Errors
+/// Returns the [`tokio_postgres::Error`] if the query fails.
+pub async fn enumerate_databases<S: std::hash::BuildHasher + Sync>(
+    client: &Client,
+    exclude: &HashSet<String, S>,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    let rows = client.query(ENUMERATE_SQL, &[]).await?;
+    Ok(rows
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .filter(|db| !exclude.contains(db))
+        .collect())
+}
+
 /// Replace (or append) `dbname=` in a libpq key=value connection string.
 #[must_use]
 pub fn replace_dbname(dsn: &str, datname: &str) -> String {
@@ -168,5 +196,13 @@ mod tests {
         let t = AdaptiveTimeout::new(120_000, 60_000);
         assert_eq!(t.current_ms(), 60_000);
         assert!(t.at_cap());
+    }
+
+    #[test]
+    fn enumerate_sql_filters_templates_noconn_and_privilege() {
+        assert!(ENUMERATE_SQL.contains("datallowconn"));
+        assert!(ENUMERATE_SQL.contains("NOT datistemplate"));
+        assert!(ENUMERATE_SQL.contains("has_database_privilege"));
+        assert!(ENUMERATE_SQL.contains("ORDER BY datname"));
     }
 }
