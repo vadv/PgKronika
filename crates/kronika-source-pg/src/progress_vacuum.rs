@@ -1,10 +1,9 @@
 //! `pg_stat_progress_vacuum` collection for type `1_012_001`.
 //!
 //! One row per backend running `VACUUM`; the view is empty when no vacuum runs.
-//! PG17 swapped the tuple-count dead-tuple columns for a byte-based TID store and
-//! added index-progress counters; PG18 added `delay_time`. The major version
-//! selects the SQL; absent columns become `None`. Collection returns owned rows;
-//! the caller interns `datname` and `phase` into the segment dictionary.
+//! The server major selects the SQL; fields absent from that catalog version
+//! become `None`. Collection returns owned rows; the caller interns `datname`
+//! and `phase` into the segment dictionary.
 
 use kronika_registry::pg_stat_progress_vacuum::PgStatProgressVacuum;
 use kronika_registry::{StrId, Ts};
@@ -22,7 +21,7 @@ macro_rules! marked {
     };
 }
 
-/// The `pg_stat_progress_vacuum` column set selected by the server major version.
+/// The `pg_stat_progress_vacuum` column set for one server major.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressVacuumVersion {
     /// PG 10-16: tuple-count dead-tuple columns.
@@ -33,7 +32,7 @@ pub enum ProgressVacuumVersion {
     Pg18,
 }
 
-/// Select the column set for a server major version.
+/// Select the column set for a server major.
 ///
 /// PG17 replaced the dead-tuple counters with a byte-based TID store; PG18 added
 /// `delay_time`.
@@ -48,7 +47,7 @@ pub const fn progress_vacuum_version(major: u32) -> ProgressVacuumVersion {
     }
 }
 
-/// The SQL for one column set.
+/// SQL for one column set.
 ///
 /// Each query carries the kronika marker and selects only the columns that
 /// version exposes. `ts` is one `statement_timestamp()` for the whole snapshot.
@@ -81,10 +80,10 @@ pub const fn progress_vacuum_query(version: ProgressVacuumVersion) -> &'static s
     }
 }
 
-/// One raw `pg_stat_progress_vacuum` row, a version-agnostic superset.
+/// Raw `pg_stat_progress_vacuum` row before string interning.
 ///
-/// Label strings are owned; the caller interns them. Columns absent from the
-/// version are `None`. See [`PgStatProgressVacuum`] for meaning.
+/// Labels are owned; the caller interns them. Columns absent from the selected
+/// query are `None`.
 #[derive(Debug, Clone)]
 pub struct ProgressVacuumRow {
     /// Snapshot time, unix microseconds.
@@ -93,15 +92,15 @@ pub struct ProgressVacuumRow {
     pub pid: i32,
     /// Database name.
     pub datname: String,
-    /// Table oid.
+    /// Table OID.
     pub relid: u32,
     /// Vacuum phase.
     pub phase: String,
-    /// Heap blocks total.
+    /// Heap blocks in the table at scan start.
     pub heap_blks_total: i64,
-    /// Heap blocks scanned.
+    /// Heap blocks scanned in this vacuum.
     pub heap_blks_scanned: i64,
-    /// Heap blocks vacuumed.
+    /// Heap blocks vacuumed in this vacuum.
     pub heap_blks_vacuumed: i64,
     /// Index-vacuum cycles completed.
     pub index_vacuum_count: i64,
@@ -152,7 +151,6 @@ pub fn to_progress_vacuum<E>(
     })
 }
 
-/// Read a raw row from a result row using the version's column set.
 fn row_from_pg(row: &tokio_postgres::Row, version: ProgressVacuumVersion) -> ProgressVacuumRow {
     let pre17 = matches!(version, ProgressVacuumVersion::Pre17);
     let pg17_plus = !pre17;

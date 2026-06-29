@@ -458,24 +458,18 @@ fn check_database_rows(
     Ok(())
 }
 
-#[then("each matrix cluster validates pg_stat_progress_vacuum rows when a vacuum runs")]
-async fn every_version_validates_progress_vacuum(world: &mut BddWorld) -> anyhow::Result<()> {
+#[then("each matrix cluster accepts optional pg_stat_progress_vacuum rows")]
+async fn every_version_accepts_progress_vacuum(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
     for db in &world.clusters {
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
-        assert_progress_vacuum_section(db.major(), &segment)?;
+        assert_optional_progress_vacuum_section(db.major(), &segment)?;
     }
     Ok(())
 }
 
-/// Validate the sealed `pg_stat_progress_vacuum` section when present. The view
-/// is empty unless a VACUUM runs, so the section may be absent — a valid state;
-/// the typed layout itself is covered by codec roundtrip tests. When present
-/// (e.g. autovacuum overlapped the snapshot), every row carries one snapshot ts,
-/// resolvable labels, and the major version's dead-tuple columns while the other
-/// era's columns stay NULL.
-fn assert_progress_vacuum_section(major: u32, path: &Path) -> anyhow::Result<()> {
+fn assert_optional_progress_vacuum_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
     let catalog = segment.catalog();

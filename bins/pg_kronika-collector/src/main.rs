@@ -220,12 +220,6 @@ fn push_database(
     Ok(())
 }
 
-/// Intern each row's `datname` and `phase` and buffer it as a progress-vacuum
-/// section row.
-///
-/// # Errors
-/// Returns an error if a label cannot be interned (dictionary full) or a section
-/// buffer is full.
 fn push_progress_vacuum(
     buffers: &mut SectionBuffers,
     interner: &mut Interner,
