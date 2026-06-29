@@ -20,7 +20,7 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_007_001` | `pg_stat_wal` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_008_001` | `pg_stat_archiver` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_009_001` | `pg_stat_io` | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
-| `1_010_001` | агрегат `pg_prepared_xacts` | базовый шаг | `snapshot_full` | `(ts)` |
+| `1_010_001` | `pg_prepared_xacts` по базам | базовый шаг | `snapshot_full` | `(datname, ts)` |
 | `1_011_001` | `pg_locks`, дерево ожиданий | по факту | `conditional_full` | `(ts, root_pid, depth)` |
 | `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `snapshot_full` | `(ts, pid)` |
 | `1_013_001` | `pg_stat_user_tables` + `pg_statio_user_tables` | 30 с | `changed` | `(datname, relid, ts)` |
@@ -334,16 +334,21 @@ fsyncs          i64  C
 fsync_time      f64  C
 ```
 
-## `1_010_001` агрегат `pg_prepared_xacts`
+## `1_010_001` `pg_prepared_xacts` по базам
 
 ```text
-ts               ts   T
-count            i32  G
-max_age_seconds  i64  G
+ts              ts   T
+datname         str  L   // база, где висят prepared-транзакции
+prepared_count  i64  G
+max_age_us      i64  G   // возраст старейшей prepared-транзакции, микросекунды
 ```
 
-Этого достаточно, чтобы предупредить о забытом 2PC. Полная таблица prepared
-transactions может стать отдельным типом, если понадобится детализация.
+Одна строка на базу с prepared-транзакциями (двухфазный коммит), `GROUP BY
+database`. Без них строк нет — по умолчанию `max_prepared_transactions = 0`, и
+2PC выключен. Забытый 2PC удерживает горизонт xmin и блокирует vacuum в СВОЕЙ
+базе, поэтому `datname` обязателен — иначе непонятно, где тушить. Возраст в
+микросекундах (не в дробных секундах). Детализация по транзакциям (`gid`,
+`owner`) может стать отдельным типом, если понадобится.
 
 ## `1_011_001` `pg_locks`, дерево ожиданий
 
