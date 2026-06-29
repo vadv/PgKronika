@@ -600,20 +600,38 @@ is_baseline    bool  L
 
 ### `1_015_001` статус инстанса
 
+Тип описывает роль инстанса, его синхронные настройки, upstream WAL receiver и
+позицию применения на standby. Это не источник для удержания WAL: слоты,
+retained bytes и детализация по репликам остаются в `1_016_001` и `1_017_001`.
+Текстовые поля обрезаются в SQL до 4096 байт до интернирования.
+
 ```text
-ts                        ts    T
-is_in_recovery            bool  G
-timeline_id               i32   G
-synchronous_standby_names str   L
-synchronous_commit        str   L
-replay_lag_s              i64?  G
-standby_receive_lsn       i64?  G   // LSN как u64-байты
-standby_replay_lsn        i64?  G
-standby_last_replay_at    ts?   G
-current_wal_lsn           i64?  G
+ts                         ts    T
+is_in_recovery             bool  G
+timeline_id                i32   G
+synchronous_standby_names  str   L
+synchronous_commit         str   L
+wal_receiver_status        str?  L   // pg_stat_wal_receiver.status
+sender_host                str?  L   // upstream host standby
+sender_port                i32?  G
+slot_name                  str?  L
+streaming_replicas         i32   G   // pg_stat_replication rows with state='streaming'
+replay_lag_s               i64?  G
+standby_receive_lsn        i64?  G   // signed byte offset from 0/0
+standby_replay_lsn         i64?  G
+standby_last_replay_at     ts?   G
+current_wal_lsn            i64?  G   // pg_current_wal_lsn(), WAL write location
+latest_end_lsn             i64?  G
+latest_end_time            ts?   G
+received_tli               i32?  G
 ```
 
-Для standby `replay_lag_s = 0`, если receive LSN равен replay LSN.
+Для standby `replay_lag_s = 0`, только если receive LSN и replay LSN оба известны
+и равны. Если LSN или timestamp применения неизвестны, значение остаётся `NULL`.
+`sender_host` — из `pg_stat_wal_receiver.sender_host` на PG11+; на PG10 из
+байтово ограниченного `conninfo` извлекается `host`, при отсутствии — `hostaddr`.
+Сырой `conninfo` не хранится. LSN-смещения хранятся как `i64`; если PostgreSQL
+вернул значение выше `i64::MAX`, оно насыщается до `i64::MAX`.
 
 ### `1_016_001` реплики primary
 

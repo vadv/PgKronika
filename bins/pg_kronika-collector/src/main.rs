@@ -28,6 +28,9 @@ use kronika_source_pg::prepared_xacts::{
 use kronika_source_pg::progress_vacuum::{
     ProgressVacuumRow, collect_progress_vacuum, to_progress_vacuum,
 };
+use kronika_source_pg::replication_instance::{
+    ReplicationInstanceRow, collect_replication_instance, to_replication_instance,
+};
 use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
@@ -148,6 +151,9 @@ async fn snapshot_and_seal(
     let archiver = collect_archiver(client)
         .await
         .context("collect pg_stat_archiver")?;
+    let replication_instance_row = collect_replication_instance(client, major)
+        .await
+        .context("collect replication instance status")?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -178,6 +184,7 @@ async fn snapshot_and_seal(
         push_io(&mut buffers, &mut interner, *io_version, io_rows)?;
     }
     push_archiver(&mut buffers, &mut interner, &archiver)?;
+    push_replication_instance(&mut buffers, &mut interner, &replication_instance_row)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -248,6 +255,20 @@ fn push_database(
         }
     }
     Ok(())
+}
+
+/// Intern the two settings strings and buffer the instance replication row.
+///
+/// # Errors
+/// Returns an error if a setting cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_replication_instance(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    row: &ReplicationInstanceRow,
+) -> Result<()> {
+    let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+    buffer_row(buffers, to_replication_instance(row, &mut intern)?)
 }
 
 /// Intern each row's labels and buffer it as the progress-vacuum section.
@@ -340,13 +361,14 @@ fn announce(line: &str) {
 mod tests {
     use super::{
         activity_dict_limits, push_activity, push_archiver, push_database, push_io,
-        push_prepared_xacts, push_progress_vacuum,
+        push_prepared_xacts, push_progress_vacuum, push_replication_instance,
     };
     use kronika_source_pg::archiver::ArchiverRow;
     use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
     use kronika_source_pg::io::{IoRow, IoVersion};
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
+    use kronika_source_pg::replication_instance::ReplicationInstanceRow;
     use kronika_source_pg::{ActivityRow, ActivityVersion};
     use kronika_writer::{Interner, SectionBuffers, dict};
 
@@ -550,6 +572,29 @@ mod tests {
         }
     }
 
+    fn replication_instance_row() -> ReplicationInstanceRow {
+        ReplicationInstanceRow {
+            ts: 1_000,
+            is_in_recovery: true,
+            timeline_id: 2,
+            synchronous_standby_names: b"*".to_vec(),
+            synchronous_commit: b"remote_apply".to_vec(),
+            wal_receiver_status: Some(b"streaming".to_vec()),
+            sender_host: Some(b"primary.local".to_vec()),
+            sender_port: Some(5432),
+            slot_name: Some(b"standby_a".to_vec()),
+            streaming_replicas: 0,
+            replay_lag_s: Some(1),
+            standby_receive_lsn: Some(1_024),
+            standby_replay_lsn: Some(1_024),
+            standby_last_replay_at: Some(900),
+            current_wal_lsn: None,
+            latest_end_lsn: Some(1_024),
+            latest_end_time: Some(950),
+            received_tli: Some(2),
+        }
+    }
+
     #[test]
     fn push_progress_vacuum_buffers_rows_and_interns_labels() {
         let mut buffers = SectionBuffers::new();
@@ -655,6 +700,33 @@ mod tests {
                 .iter()
                 .any(|entry| entry.type_id == 1_009_002),
             "the part carries the pg_stat_io section"
+        );
+    }
+
+    #[test]
+    fn push_replication_instance_buffers_row_and_interns_labels() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_replication_instance(&mut buffers, &mut interner, &replication_instance_row())
+            .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "row was buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(
+            !dict_sections.is_empty(),
+            "replication labels reached the dictionary"
+        );
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_015_001),
+            "the part carries the replication_instance section"
         );
     }
 }
