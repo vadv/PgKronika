@@ -1,16 +1,13 @@
 //! `pg_stat_wal` collection for types `1_007_001` / `1_007_002`.
 //!
-//! The view exists from PG14; on PG 10-13 there is no source and collection
-//! returns `None`. PG18 removed the WAL write/sync counters and their timings
-//! (they moved to `pg_stat_io`), so the major version selects both the SQL and
-//! the layout. The row is all numeric, so nothing is interned. The typed layout
-//! lives in `kronika-registry` (`PgStatWalV1` / `PgStatWalV2`).
+//! PG14+ cluster-wide WAL counters. PG18 uses the V2 layout after write/sync
+//! fields moved to `pg_stat_io`.
 
 use kronika_registry::Ts;
 use kronika_registry::pg_stat_wal::{PgStatWalV1, PgStatWalV2};
 use tokio_postgres::Client;
 
-/// Prefix a query literal with the kronika marker (SQL-transparency rule).
+/// SQL transparency marker for collector queries.
 macro_rules! marked {
     ($sql:literal) => {
         concat!(
@@ -22,7 +19,7 @@ macro_rules! marked {
     };
 }
 
-/// The `pg_stat_wal` layout selected by the server major version.
+/// `pg_stat_wal` layout for a server major.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalVersion {
     /// PG 14-17: type `1_007_001` (with write/sync counters and timings).
@@ -31,8 +28,7 @@ pub enum WalVersion {
     V2,
 }
 
-/// Select the layout for a server major version, or `None` before PG14 where
-/// `pg_stat_wal` does not exist.
+/// Return the WAL layout, or `None` before PG14.
 #[must_use]
 pub const fn wal_version(major: u32) -> Option<WalVersion> {
     if major >= 18 {
@@ -46,9 +42,7 @@ pub const fn wal_version(major: u32) -> Option<WalVersion> {
 
 /// The SQL for one layout.
 ///
-/// Each query carries the kronika marker. `ts` is one `statement_timestamp()`
-/// for the snapshot; `wal_bytes` (`numeric`) and `stats_reset` come back cast to
-/// `int8`.
+/// `ts` is one `statement_timestamp()`; `wal_bytes` is cast to `int8`.
 #[must_use]
 pub const fn wal_query(version: WalVersion) -> &'static str {
     match version {
@@ -107,7 +101,7 @@ fn v2_from_pg(row: &tokio_postgres::Row) -> PgStatWalV2 {
 /// does not exist.
 ///
 /// # Errors
-/// Returns the [`tokio_postgres::Error`] if the query fails.
+/// Returns `PostgreSQL` query errors.
 pub async fn collect_wal(
     client: &Client,
     major: u32,

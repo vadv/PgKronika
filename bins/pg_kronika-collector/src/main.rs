@@ -145,8 +145,7 @@ async fn snapshot_and_seal(
         database_version,
         &database_rows,
     )?;
-    // pg_stat_wal is a single all-numeric row with no strings to intern; absent
-    // before PG14, where collection returned `None`.
+    // pg_stat_wal has one all-numeric row; PG10-13 produce no row.
     match wal {
         Some(WalSnapshot::V1(row)) => buffer_row(&mut buffers, row)?,
         Some(WalSnapshot::V2(row)) => buffer_row(&mut buffers, row)?,

@@ -296,10 +296,9 @@ wal_sync_time    f64  C   // 0 без track_wal_io_timing
 stats_reset      ts?  G
 ```
 
-`1_007_002` (PG 18) убирает `wal_write`, `wal_sync`, `wal_write_time`,
-`wal_sync_time`: объём и тайминги WAL-ввода-вывода переехали в `pg_stat_io`
-(`object = wal`). Остаются `wal_records`, `wal_fpi`, `wal_bytes`,
-`wal_buffers_full`, `stats_reset`.
+`1_007_002` (PG 18) оставляет `wal_records`, `wal_fpi`, `wal_bytes`,
+`wal_buffers_full`, `stats_reset`: write/sync-поля ушли из `pg_stat_wal` в
+`pg_stat_io` (`object = wal`).
 
 ## `1_008_001` `pg_stat_archiver`
 

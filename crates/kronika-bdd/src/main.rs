@@ -476,10 +476,7 @@ async fn every_version_seals_wal(world: &mut BddWorld) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Decode the sealed `pg_stat_wal` section for the selected layout and check the
-/// single row: ts inside the segment range and non-negative generation counters.
-/// PG18 (`WalVersion::V2`) dropped the write/sync counters, so only V1 carries
-/// them.
+/// Check selected layout, timestamp, single-row shape, and non-negative counters.
 fn assert_wal_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let segment =
         Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
