@@ -5,7 +5,7 @@
 //! errors stay as `tokio_postgres::Error` so callers can inspect SQLSTATE.
 
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::task::JoinHandle;
@@ -20,45 +20,11 @@ pub const ENUMERATE_SQL: &str = "/* pg_kronika pool */ SELECT datname \
       AND pg_catalog.has_database_privilege(datname, 'CONNECT') \
     ORDER BY datname";
 
-/// List target databases for the pool, minus the configured exclude set.
-///
-/// # Errors
-/// Returns the [`tokio_postgres::Error`] if the query fails.
-pub async fn enumerate_databases<S: std::hash::BuildHasher + Sync>(
-    client: &Client,
-    exclude: &HashSet<String, S>,
-) -> Result<Vec<String>, tokio_postgres::Error> {
-    let rows = client.query(ENUMERATE_SQL, &[]).await?;
-    Ok(rows
-        .iter()
-        .map(|r| r.get::<_, String>(0))
-        .filter(|db| !exclude.contains(db))
-        .collect())
-}
-
-/// Replace (or append) `dbname=` in a libpq key=value connection string.
-#[must_use]
-pub fn replace_dbname(dsn: &str, datname: &str) -> String {
-    let mut found = false;
-    let mut parts: Vec<String> = dsn
-        .split_whitespace()
-        .map(|tok| {
-            if tok.starts_with("dbname=") {
-                found = true;
-                format!("dbname={datname}")
-            } else {
-                tok.to_owned()
-            }
-        })
-        .collect();
-    if !found {
-        parts.push(format!("dbname={datname}"));
-    }
-    parts.join(" ")
-}
+/// Maximum per-database connections the pool opens by default.
+pub const DEFAULT_MAX_DATABASES: usize = 20;
 
 /// Session GUCs applied to every pool connection (main and per-db) via the
-/// connection string, so they take effect before the first query.
+/// connection config, so they take effect before the first query.
 #[derive(Debug, Clone, Copy)]
 #[allow(
     clippy::struct_field_names,
@@ -73,26 +39,78 @@ pub struct SessionConfig {
     pub idle_in_tx_timeout_ms: u64,
 }
 
-/// `PostgreSQL` session options for collector queries.
+/// Build a connection config from the base DSN with session settings applied.
+/// `dbname` overrides the target database for per-db connections.
 ///
-/// `lock_timeout` must stay below `statement_timeout` to fire first.
-#[must_use]
-pub fn session_options(cfg: &SessionConfig) -> String {
-    format!(
-        "options='-c statement_timeout={} -c lock_timeout={} \
-         -c idle_in_transaction_session_timeout={} -c jit=off'",
-        cfg.statement_timeout_ms, cfg.lock_timeout_ms, cfg.idle_in_tx_timeout_ms
-    )
+/// Settings go through structured `tokio_postgres::Config` setters (not string
+/// concatenation), so any libpq DSN form — key=value or URI — is handled, and
+/// `application_name` carried in `base_dsn` is preserved.
+///
+/// # Errors
+/// Fails if `base_dsn` is not a parseable connection string.
+fn build_config(
+    base_dsn: &str,
+    session: &SessionConfig,
+    dbname: Option<&str>,
+) -> anyhow::Result<tokio_postgres::Config> {
+    let mut cfg: tokio_postgres::Config = base_dsn.parse().context("parse DSN")?;
+    if let Some(db) = dbname {
+        cfg.dbname(db);
+    }
+    cfg.connect_timeout(Duration::from_secs(5));
+    cfg.keepalives(true);
+    cfg.keepalives_idle(Duration::from_secs(30));
+    cfg.keepalives_interval(Duration::from_secs(10));
+    cfg.keepalives_retries(3);
+    // jit omitted from startup options: the jit GUC predates PG11, and the
+    // collector's short queries would not benefit from it.
+    cfg.options(format!(
+        "-c statement_timeout={} -c lock_timeout={} -c idle_in_transaction_session_timeout={}",
+        session.statement_timeout_ms, session.lock_timeout_ms, session.idle_in_tx_timeout_ms
+    ));
+    Ok(cfg)
 }
 
-/// Append session options and TCP keepalives to a base DSN.
-#[must_use]
-pub fn apply_session_dsn(base_dsn: &str, cfg: &SessionConfig) -> String {
-    format!(
-        "{base_dsn} {} connect_timeout=5 \
-         keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3",
-        session_options(cfg)
-    )
+/// Apply the exclude set and enforce the database cap on enumerated names.
+///
+/// # Errors
+/// Returns an error if more than `max_databases` connectable databases remain
+/// after exclusion — narrow the set via the exclude list rather than have the
+/// collector silently open an unbounded number of backends.
+fn select_targets<S: std::hash::BuildHasher>(
+    names: Vec<String>,
+    exclude: &HashSet<String, S>,
+    max_databases: usize,
+) -> anyhow::Result<Vec<String>> {
+    let targets: Vec<String> = names
+        .into_iter()
+        .filter(|db| !exclude.contains(db))
+        .collect();
+    anyhow::ensure!(
+        targets.len() <= max_databases,
+        "connectable databases ({}) exceed the cap ({}); narrow the set via KRONIKA_PG_EXCLUDE_DATABASES",
+        targets.len(),
+        max_databases
+    );
+    Ok(targets)
+}
+
+/// List target databases for the pool, minus the configured exclude set.
+///
+/// # Errors
+/// Returns an error if the query fails or the connectable database count
+/// exceeds `max_databases` after filtering.
+pub async fn enumerate_databases<S: std::hash::BuildHasher + Sync>(
+    client: &Client,
+    exclude: &HashSet<String, S>,
+    max_databases: usize,
+) -> anyhow::Result<Vec<String>> {
+    let rows = client
+        .query(ENUMERATE_SQL, &[])
+        .await
+        .context("enumerate databases query")?;
+    let names: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+    select_targets(names, exclude, max_databases)
 }
 
 /// Adaptive `statement_timeout` for heavy database-local queries.
@@ -171,9 +189,10 @@ pub struct ConnectionPool {
     last_refresh: Instant,
 }
 
-/// Open a connection with session settings applied and spawn its driver.
-async fn open(dsn: &str) -> anyhow::Result<(Client, JoinHandle<()>, Option<u32>)> {
-    let cfg: tokio_postgres::Config = dsn.parse().context("parse DSN")?;
+/// Open a connection from a structured config and spawn its driver.
+async fn open(
+    cfg: tokio_postgres::Config,
+) -> anyhow::Result<(Client, JoinHandle<()>, Option<u32>)> {
     let (client, connection) = cfg.connect(NoTls).await.context("connect")?;
     let major = server_major(connection.parameter("server_version"));
     let handle = tokio::spawn(async move {
@@ -192,8 +211,8 @@ impl ConnectionPool {
         session: SessionConfig,
         exclude: HashSet<String>,
     ) -> anyhow::Result<Self> {
-        let dsn = apply_session_dsn(base_dsn, &session);
-        let (main, main_conn, major) = open(&dsn).await?;
+        let cfg = build_config(base_dsn, &session, None)?;
+        let (main, main_conn, major) = open(cfg).await?;
         let server_major = major.context("server reported no parseable server_version")?;
         Ok(Self {
             base_dsn: base_dsn.to_owned(),
@@ -233,14 +252,17 @@ impl ConnectionPool {
     /// stable; callers should use `datname`.
     ///
     /// # Errors
-    /// Fails only if enumerating databases on the main connection fails.
-    pub async fn refresh(&mut self, interval: std::time::Duration) -> anyhow::Result<()> {
+    /// Fails if enumerating databases fails or the connectable count exceeds
+    /// `max_databases` after applying the exclude set.
+    pub async fn refresh(
+        &mut self,
+        interval: Duration,
+        max_databases: usize,
+    ) -> anyhow::Result<()> {
         if !self.per_db.is_empty() && self.last_refresh.elapsed() < interval {
             return Ok(());
         }
-        let target = enumerate_databases(&self.main, &self.exclude)
-            .await
-            .context("enumerate databases")?;
+        let target = enumerate_databases(&self.main, &self.exclude, max_databases).await?;
         let target_set: HashSet<&str> = target.iter().map(String::as_str).collect();
         self.per_db
             .retain(|c| target_set.contains(c.datname.as_str()));
@@ -249,8 +271,8 @@ impl ConnectionPool {
             if have.contains(db) {
                 continue;
             }
-            let dsn = apply_session_dsn(&replace_dbname(&self.base_dsn, db), &self.session);
-            match open(&dsn).await {
+            let cfg = build_config(&self.base_dsn, &self.session, Some(db))?;
+            match open(cfg).await {
                 Ok((client, conn, _)) => {
                     self.per_db.push(DatabaseConn {
                         datname: db.clone(),
@@ -294,12 +316,16 @@ impl ConnectionPool {
         if !self.main.is_closed() {
             return Ok(());
         }
-        let dsn = apply_session_dsn(&self.base_dsn, &self.session);
-        let (client, conn, major) = open(&dsn).await?;
+        let cfg = build_config(&self.base_dsn, &self.session, None)?;
+        let (client, conn, major) = open(cfg).await?;
+        let Some(major) = major else {
+            conn.abort();
+            anyhow::bail!("server reported no parseable server_version");
+        };
         self.main_conn.abort();
         self.main = client;
         self.main_conn = conn;
-        self.server_major = major.context("server reported no parseable server_version")?;
+        self.server_major = major;
         Ok(())
     }
 }
@@ -314,49 +340,6 @@ impl Drop for ConnectionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn replaces_existing_dbname() {
-        assert_eq!(
-            replace_dbname("host=h dbname=old user=u", "new"),
-            "host=h dbname=new user=u"
-        );
-    }
-
-    #[test]
-    fn appends_when_absent() {
-        assert_eq!(
-            replace_dbname("host=h user=u", "new"),
-            "host=h user=u dbname=new"
-        );
-    }
-
-    #[test]
-    fn session_options_carry_timeouts_and_jit_off() {
-        let cfg = SessionConfig {
-            statement_timeout_ms: 15_000,
-            lock_timeout_ms: 1_000,
-            idle_in_tx_timeout_ms: 10_000,
-        };
-        let o = session_options(&cfg);
-        assert!(o.contains("statement_timeout=15000") && o.contains("lock_timeout=1000"));
-        assert!(o.contains("idle_in_transaction_session_timeout=10000") && o.contains("jit=off"));
-    }
-
-    #[test]
-    fn apply_session_dsn_adds_keepalives() {
-        let cfg = SessionConfig {
-            statement_timeout_ms: 15_000,
-            lock_timeout_ms: 1_000,
-            idle_in_tx_timeout_ms: 10_000,
-        };
-        let d = apply_session_dsn("host=h dbname=d", &cfg);
-        assert!(
-            d.starts_with("host=h dbname=d ")
-                && d.contains("keepalives_idle=30")
-                && d.contains("connect_timeout=5")
-        );
-    }
 
     #[test]
     fn adaptive_doubles_up_to_cap() {
@@ -384,5 +367,69 @@ mod tests {
         assert!(ENUMERATE_SQL.contains("NOT datistemplate"));
         assert!(ENUMERATE_SQL.contains("has_database_privilege"));
         assert!(ENUMERATE_SQL.contains("ORDER BY datname"));
+    }
+
+    fn test_session() -> SessionConfig {
+        SessionConfig {
+            statement_timeout_ms: 15_000,
+            lock_timeout_ms: 1_000,
+            idle_in_tx_timeout_ms: 10_000,
+        }
+    }
+
+    #[test]
+    fn build_config_sets_keepalives_retries_without_jit() {
+        let cfg = build_config("host=h dbname=postgres user=u", &test_session(), None)
+            .expect("a valid DSN must build");
+        assert_eq!(cfg.get_keepalives_retries(), Some(3));
+        let options = cfg.get_options().unwrap_or_default();
+        assert!(
+            options.contains("statement_timeout=15000"),
+            "session timeouts must reach startup options: {options}"
+        );
+        assert!(
+            !options.contains("jit"),
+            "jit must stay out of startup options for PG10 safety: {options}"
+        );
+    }
+
+    #[test]
+    fn build_config_overrides_dbname_and_preserves_application_name() {
+        let cfg = build_config(
+            "host=h dbname=postgres application_name=pg_kronika-collector/9.9",
+            &test_session(),
+            Some("payments"),
+        )
+        .expect("a valid DSN must build");
+        assert_eq!(cfg.get_dbname(), Some("payments"));
+        assert_eq!(cfg.get_application_name(), Some("pg_kronika-collector/9.9"));
+    }
+
+    #[test]
+    fn build_config_rejects_unparseable_dsn() {
+        assert!(build_config("host=h port=not_a_number", &test_session(), None).is_err());
+    }
+
+    #[test]
+    fn select_targets_filters_excluded_names() {
+        let names = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let exclude: HashSet<String> = ["b".to_owned()].into();
+        let targets = select_targets(names, &exclude, 10).expect("under cap");
+        assert_eq!(targets, ["a", "c"]);
+    }
+
+    #[test]
+    fn select_targets_accepts_exactly_max() {
+        let names: Vec<String> = (0..5).map(|i| format!("db{i}")).collect();
+        let exclude = HashSet::new();
+        let targets = select_targets(names, &exclude, 5).expect("at cap");
+        assert_eq!(targets.len(), 5);
+    }
+
+    #[test]
+    fn select_targets_rejects_over_cap() {
+        let names: Vec<String> = (0..6).map(|i| format!("db{i}")).collect();
+        let exclude = HashSet::new();
+        assert!(select_targets(names, &exclude, 5).is_err());
     }
 }

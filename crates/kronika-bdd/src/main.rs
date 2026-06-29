@@ -1271,7 +1271,9 @@ fn decode_archiver(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStatArchi
 }
 #[then("each matrix cluster opens per-database pool connections")]
 async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> anyhow::Result<()> {
-    use kronika_source_pg::pool::{ConnectionPool, SessionConfig, enumerate_databases};
+    use kronika_source_pg::pool::{
+        ConnectionPool, DEFAULT_MAX_DATABASES, SessionConfig, enumerate_databases,
+    };
     use std::collections::HashSet;
     use std::time::Duration;
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
@@ -1283,7 +1285,8 @@ async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> an
     for db in &world.clusters {
         let dsn = db.conn_string();
         let mut pool = ConnectionPool::connect(&dsn, session, HashSet::new()).await?;
-        pool.refresh(Duration::from_secs(0)).await?;
+        pool.refresh(Duration::from_secs(0), DEFAULT_MAX_DATABASES)
+            .await?;
         anyhow::ensure!(
             !pool.per_db().is_empty(),
             "postgres {}: no per-db connections",
@@ -1295,7 +1298,8 @@ async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> an
             db.major(),
             pool.uncovered()
         );
-        let names = enumerate_databases(pool.main(), &HashSet::new()).await?;
+        let names =
+            enumerate_databases(pool.main(), &HashSet::new(), DEFAULT_MAX_DATABASES).await?;
         anyhow::ensure!(
             !names.iter().any(|n| n == "template0" || n == "template1"),
             "postgres {}: template database was enumerated",

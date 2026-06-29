@@ -11,17 +11,11 @@
 //! - `KRONIKA_PG_STATEMENT_TIMEOUT_MS`: statement timeout in ms, default 15000;
 //! - `KRONIKA_PG_LOCK_TIMEOUT_MS`: lock timeout in ms, default 1000;
 //! - `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS`: idle-in-transaction timeout in ms, default 10000;
-//! - `KRONIKA_PG_EXCLUDE_DATABASES`: semicolon-separated list of databases to skip;
-//! - `KRONIKA_PG_POOL_REFRESH_SECS`: pool refresh interval in seconds, default 600.
+//! - `KRONIKA_PG_EXCLUDE_DATABASES`: semicolon-separated list of databases to skip.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
 )]
-
-use std::collections::HashSet;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use kronika_format::DictLimits;
@@ -45,6 +39,9 @@ use kronika_source_pg::{
     to_v3,
 };
 use kronika_writer::{Interner, Journal, JournalConfig, SectionBuffers, dict, seal};
+use std::collections::HashSet;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
 
@@ -54,12 +51,6 @@ struct Config {
     source_id: u64,
     session: SessionConfig,
     exclude_databases: HashSet<String>,
-    // Parsed with pool config; per-db collection will call `refresh`.
-    #[allow(
-        dead_code,
-        reason = "parsed with pool config; consumed when per-db collection calls pool.refresh()"
-    )]
-    pool_refresh: Duration,
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -95,14 +86,12 @@ impl Config {
         if !exclude_databases.is_empty() {
             eprintln!("pg_kronika: excluding databases: {exclude_databases:?}");
         }
-        let pool_refresh = Duration::from_secs(env_u64("KRONIKA_PG_POOL_REFRESH_SECS", 600)?);
         Ok(Self {
             dsn,
             out_dir,
             source_id,
             session,
             exclude_databases,
-            pool_refresh,
         })
     }
 }
