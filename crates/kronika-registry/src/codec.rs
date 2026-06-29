@@ -25,6 +25,7 @@ pub mod bgwriter_checkpointer;
 pub mod instance_metadata;
 pub mod pg_stat_activity;
 pub mod pg_stat_database;
+pub mod replication_instance;
 pub mod reset_metadata;
 
 /// Maximum rows in one snapshot section.

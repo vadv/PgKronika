@@ -29,6 +29,7 @@ use kronika_registry::{
     bgwriter_checkpointer::BgwriterCheckpointer,
     pg_stat_activity::PgStatActivityV3,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
+    replication_instance::ReplicationInstance,
 };
 use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
@@ -41,6 +42,8 @@ const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
 
 const PG_STAT_DATABASE_V3_TYPE_ID: u32 = 1_005_003;
 const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
+
+const PG_REPLICATION_INSTANCE_TYPE_ID: u32 = 1_015_001;
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
@@ -450,6 +453,84 @@ fn check_database_rows(
             "postgres {major}: datname str_id {} did not resolve to a string: {other:?}",
             datname.0
         ),
+    }
+    Ok(())
+}
+
+#[then("each matrix cluster seals its replication instance status")]
+async fn every_version_seals_replication_instance(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_replication_instance_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Decode the sealed instance-replication section: one row, ts in range, a
+/// positive timeline, and the standalone-primary shape (not in recovery,
+/// `current_wal_lsn` set, standby columns NULL). The standby shape is covered by
+/// codec roundtrip tests, since the matrix runs standalone primaries.
+fn assert_replication_instance_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let catalog = segment.catalog();
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    let rows =
+        decode_db_section::<ReplicationInstance>(path, &segment, PG_REPLICATION_INSTANCE_TYPE_ID)
+            .with_context(|| format!("postgres {major}: read back section 1_015_001"))?;
+    anyhow::ensure!(
+        rows.len() == 1,
+        "postgres {major}: expected one replication-instance row, got {}",
+        rows.len()
+    );
+    let row = &rows[0];
+    ensure_ts_in_segment_range(
+        major,
+        "section 1_015_001",
+        row.ts.0,
+        catalog.min_ts,
+        catalog.max_ts,
+    )?;
+    anyhow::ensure!(
+        row.timeline_id >= 1,
+        "postgres {major}: timeline_id {} is not positive",
+        row.timeline_id
+    );
+    anyhow::ensure!(
+        !row.is_in_recovery,
+        "postgres {major}: a standalone cluster reports being in recovery"
+    );
+    anyhow::ensure!(
+        row.current_wal_lsn.is_some(),
+        "postgres {major}: a primary reports no current_wal_lsn"
+    );
+    anyhow::ensure!(
+        row.standby_receive_lsn.is_none()
+            && row.standby_replay_lsn.is_none()
+            && row.replay_lag_s.is_none()
+            && row.standby_last_replay_at.is_none()
+            && row.sender_host.is_none(),
+        "postgres {major}: a primary must not fill the standby columns"
+    );
+    anyhow::ensure!(
+        row.connected_replicas == 0,
+        "postgres {major}: a standalone cluster reports {} connected replicas",
+        row.connected_replicas
+    );
+    // synchronous_standby_names defaults to an empty string, so resolution must
+    // accept an empty value — only the dictionary lookup itself must succeed.
+    for (label, id) in [
+        ("synchronous_standby_names", row.synchronous_standby_names.0),
+        ("synchronous_commit", row.synchronous_commit.0),
+    ] {
+        anyhow::ensure!(
+            matches!(dict.resolve(id), Some(Resolved::String(_))),
+            "postgres {major}: {label} str_id {id} did not resolve to a string"
+        );
     }
     Ok(())
 }

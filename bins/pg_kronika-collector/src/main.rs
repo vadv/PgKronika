@@ -20,6 +20,9 @@ use anyhow::{Context, Result};
 use kronika_format::DictLimits;
 use kronika_registry::StrId;
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
+use kronika_source_pg::replication_instance::{
+    ReplicationInstanceRow, collect_replication_instance, to_replication_instance,
+};
 use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, server_major,
     to_v1, to_v2, to_v3,
@@ -123,6 +126,9 @@ async fn snapshot_and_seal(
     let (database_version, database_rows) = collect_database(client, major)
         .await
         .context("collect pg_stat_database")?;
+    let replication_instance_row = collect_replication_instance(client, major)
+        .await
+        .context("collect replication instance status")?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -141,6 +147,7 @@ async fn snapshot_and_seal(
         database_version,
         &database_rows,
     )?;
+    push_replication_instance(&mut buffers, &mut interner, &replication_instance_row)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -211,6 +218,20 @@ fn push_database(
         }
     }
     Ok(())
+}
+
+/// Intern the two settings strings and buffer the instance replication row.
+///
+/// # Errors
+/// Returns an error if a setting cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_replication_instance(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    row: &ReplicationInstanceRow,
+) -> Result<()> {
+    let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+    buffer_row(buffers, to_replication_instance(row, &mut intern)?)
 }
 
 /// Buffer one typed snapshot row, mapping a full buffer to an error.
