@@ -31,7 +31,8 @@ pub use codec::{
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{
     bgwriter_checkpointer, instance_metadata, pg_prepared_xacts, pg_stat_activity,
-    pg_stat_archiver, pg_stat_database, pg_stat_io, pg_stat_wal, reset_metadata,
+    pg_stat_archiver, pg_stat_database, pg_stat_io, pg_stat_progress_vacuum, pg_stat_wal,
+    reset_metadata,
 };
 pub(crate) use codec::{check_row_cap, decode_batches, decode_section, encode_section};
 pub use contract::{
@@ -78,6 +79,7 @@ pub const fn registry() -> &'static [TypeContract] {
         pg_stat_wal::PgStatWalV2::CONTRACT,
         pg_stat_archiver::PgStatArchiver::CONTRACT,
         pg_prepared_xacts::PgPreparedXacts::CONTRACT,
+        pg_stat_progress_vacuum::PgStatProgressVacuum::CONTRACT,
         reset_metadata::ResetMetadata::CONTRACT,
         instance_metadata::InstanceMetadata::CONTRACT,
     ]

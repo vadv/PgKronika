@@ -24,7 +24,7 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_009_002` | `pg_stat_io` (PG 18) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
 | `1_010_001` | `pg_prepared_xacts` по базам | базовый шаг | `snapshot_full` | `(datname, ts)` |
 | `1_011_001` | `pg_locks`, дерево ожиданий | по факту | `conditional_full` | `(ts, root_pid, depth)` |
-| `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `snapshot_full` | `(ts, pid)` |
+| `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `conditional_full` | `(ts, pid)` |
 | `1_013_001` | `pg_stat_user_tables` + `pg_statio_user_tables` | 30 с | `changed` | `(datname, relid, ts)` |
 | `1_014_001` | `pg_stat_user_indexes` + `pg_statio_user_indexes` | 30 с | `changed` | `(datname, indexrelid, ts)` |
 | `1_015_001` | replication: статус инстанса | 30 с | `snapshot_full` | `(ts)` |
@@ -468,25 +468,45 @@ lock_target       str   L
 
 ## `1_012_001` `pg_stat_progress_vacuum`
 
+`conditional_full`. Секция пишется только когда `pg_stat_progress_vacuum`
+содержит строки. Отсутствие секции означает ноль активных `VACUUM` в момент
+снимка, а не ошибку сбора.
+
 ```text
-ts                  ts   T
-pid                 i32  L
-datname             str  L
-relid               u32  L
-phase               str  L
-heap_blks_total     i64  G
-heap_blks_scanned   i64  G
-heap_blks_vacuumed  i64  G
-index_vacuum_count  i64  G
-max_dead_tuples     i64? G   // NULL на PG17+
-num_dead_tuples     i64? G   // NULL на PG17+
-dead_tuple_bytes    i64? G   // NULL < PG17
-indexes_total       i64? G   // NULL < PG17
-indexes_processed   i64? G   // NULL < PG17
+ts                    ts   T
+pid                   i32  L
+datid                 u32  L
+datname               str  L
+relid                 u32  L
+is_autovacuum         bool L
+phase                 str  L
+heap_blks_total       i64  G   // блоки heap
+heap_blks_scanned     i64  G   // блоки heap
+heap_blks_vacuumed    i64  G   // блоки heap
+index_vacuum_count    i64  G
+max_dead_tuples       i64? G   // PG10-16, tuples
+num_dead_tuples       i64? G   // PG10-16, tuples
+max_dead_tuple_bytes  i64? G   // PG17+
+dead_tuple_bytes      i64? G   // PG17+
+num_dead_item_ids     i64? G   // PG17+
+indexes_total         i64? G   // PG17+
+indexes_processed     i64? G   // PG17+
+delay_time            f64? G   // PG18+
 ```
 
-`heap_blks_scanned` и `heap_blks_vacuumed` монотонны внутри одного vacuum, но
-остаются полями класса `G`: между запусками они сбрасываются.
+Одна строка на backend, выполняющий `VACUUM`, включая autovacuum. `VACUUM FULL`
+сюда не попадает. `is_autovacuum` вычисляется по `pg_stat_activity.backend_type =
+'autovacuum worker'`; ручной `VACUUM` хранится с `is_autovacuum = false`.
+
+PG17 заменил `max_dead_tuples` / `num_dead_tuples` на
+`max_dead_tuple_bytes`, `dead_tuple_bytes` и `num_dead_item_ids`; единицы
+измерения разные, поэтому поля не объединяются. PG17 также добавил прогресс по
+индексам, PG18 — `delay_time`.
+
+`datid` нужен вместе с `datname`: `relid` локален в базе, а имя базы может быть
+переименовано. Связь с `pg_stat_activity` идёт по `pid` внутри того же снимка.
+`heap_blks_scanned` / `heap_blks_vacuumed` монотонны внутри одного vacuum, но
+класс `G`: между запусками сбрасываются.
 
 ## `1_013_001` `pg_stat_user_tables` + `pg_statio_user_tables`
 
