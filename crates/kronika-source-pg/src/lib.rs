@@ -34,6 +34,7 @@ pub mod archiver;
 pub mod database;
 pub mod io;
 
+pub mod pool;
 pub mod wal;
 
 pub mod prepared_xacts;

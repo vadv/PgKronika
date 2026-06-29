@@ -9,7 +9,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow = "1"
 kronika-registry = { path = "../kronika-registry" }
+tokio = { version = "1", features = ["rt"] }
 tokio-postgres = "0.7"
 
 [lints]
