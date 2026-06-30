@@ -8,11 +8,11 @@
 //!
 //! Candidate selection is purely mechanical: the union of top-N tables by raw
 //! columns (read activity, write volume, size, dead tuples, transaction-id age,
-//! multixact age), so an extreme table — including one near wraparound — is
-//! never dropped. The collector records and bounds its output; judging whether a
-//! value is dangerous is the analyzer's job. Collection returns owned rows; the
-//! caller interns the strings into the segment dictionary. The typed layout
-//! lives in `kronika-registry` (`PgStatUserTablesV1`..`V4`).
+//! multixact age). Age axes let old tables be selected even without foreground
+//! activity. The collector records and bounds its output; threshold decisions
+//! belong to the analyzer. Collection returns owned rows; the caller interns the
+//! strings into the segment dictionary. The typed layout is defined in
+//! `kronika-registry` (`PgStatUserTablesV1`..`V4`).
 
 use kronika_registry::pg_stat_user_tables::{
     PgStatUserTablesV1, PgStatUserTablesV2, PgStatUserTablesV3, PgStatUserTablesV4,
@@ -70,10 +70,10 @@ pub const fn user_tables_version(major: u32) -> UserTablesVersion {
 /// volume, size, dead tuples, transaction-id age, multixact age). The write axis
 /// orders by `n_tup_ins + n_tup_upd + n_tup_del` so a write-only table is kept
 /// even on PG16+, where the activity axis is `GREATEST(last_seq_scan,
-/// last_idx_scan)` (read recency). The collector only records the most extreme
-/// rows per axis and bounds its own output; whether any value is dangerous is
-/// the analyzer's job, not the collector's. `ts` is one `statement_timestamp()`
-/// for the snapshot; the `last_*` columns come back as unix microseconds.
+/// last_idx_scan)` (read recency). The collector records the highest-ranked
+/// rows per axis and bounds its own output; threshold decisions belong to the
+/// analyzer. `ts` is one `statement_timestamp()` for the snapshot; the `last_*`
+/// columns come back as unix microseconds.
 #[allow(
     clippy::too_many_lines,
     reason = "four full per-version SQL literals; splitting the match hurts readability"
@@ -368,19 +368,19 @@ pub struct UserTablesRow {
     pub mxid_age: i64,
     /// Planner row estimate (`pg_class.reltuples`).
     pub reltuples: i64,
-    /// Heap blocks read from disk.
+    /// Heap block reads reported by `pg_statio_user_tables`.
     pub heap_blks_read: i64,
     /// Heap buffer hits.
     pub heap_blks_hit: i64,
-    /// Index blocks read; `None` when the table has no indexes.
+    /// Index block reads; `None` when the table has no indexes.
     pub idx_blks_read: Option<i64>,
     /// Index buffer hits; `None` when the table has no indexes.
     pub idx_blks_hit: Option<i64>,
-    /// TOAST blocks read; `None` when no TOAST relation.
+    /// TOAST block reads; `None` when no TOAST relation.
     pub toast_blks_read: Option<i64>,
     /// TOAST buffer hits; `None` when no TOAST relation.
     pub toast_blks_hit: Option<i64>,
-    /// TOAST-index blocks read; `None` when no TOAST relation.
+    /// TOAST-index block reads; `None` when no TOAST relation.
     pub tidx_blks_read: Option<i64>,
     /// TOAST-index buffer hits; `None` when no TOAST relation.
     pub tidx_blks_hit: Option<i64>,
@@ -808,8 +808,8 @@ mod tests {
             assert!(q.contains("LEFT JOIN pg_statio_user_tables"));
             assert!(q.contains("AS main_fork_bytes"));
             // Candidate selection is mechanical top-N by raw columns, including
-            // transaction-id and multixact age, so an extreme table is never
-            // dropped. No thresholds, no GUC-based "danger" verdict in the SQL.
+            // transaction-id and multixact age. No thresholds or GUC-based
+            // verdicts belong in the SQL.
             assert!(q.contains("ORDER BY age(c.relfrozenxid) DESC"));
             assert!(q.contains("ORDER BY mxid_age(c.relminmxid) DESC"));
             // The write axis keeps a write-only table even when the activity axis

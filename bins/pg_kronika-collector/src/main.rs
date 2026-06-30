@@ -21,9 +21,9 @@
 //!   default 10000;
 //! - `KRONIKA_PG_EXCLUDE_DATABASES`: semicolon-separated list of databases to skip;
 //! - `KRONIKA_PG_MAX_TABLES`: per-axis top-N row count for `pg_stat_user_tables`
-//!   candidate selection, default 500. Each mechanical axis (activity, size,
-//!   dead tuples, transaction-id age, multixact age) contributes up to this many
-//!   tables before the union;
+//!   candidate selection, default 500. Each mechanical axis (read activity,
+//!   write volume, size, dead tuples, transaction-id age, multixact age)
+//!   contributes up to this many tables before the union;
 //! - `KRONIKA_PG_POOL_REFRESH_SECS`: minimum interval between connection-pool
 //!   refreshes (per-database connection reconciliation), default 600;
 //! - `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`: cap for the adaptive `statement_timeout`
