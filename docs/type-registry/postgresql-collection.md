@@ -153,13 +153,13 @@ CTE должен подниматься к корням блокировок и 
 
 ## `1_013_001` / `1_014_001` tables и indexes
 
-Для таблиц выполняются два запроса на базу:
-
-- `pg_stat_user_tables` с top-N и размером через `pg_total_relation_size`;
-- `pg_statio_user_tables`.
-
-Результаты объединяются на коллекторе по `relid`. Отдельный дешёвый запрос
-`count(*)` даёт coverage для `1_023_001`.
+Для таблиц выполняется один запрос на базу (через пул соединений, итерация по
+`per_db()`): `pg_stat_user_tables` с `LEFT JOIN pg_statio_user_tables` по `relid`,
+размерами через `pg_relation_size`/`pg_total_relation_size` и `xid_age`/`mxid_age`/
+`reltuples` из `pg_class`. Отбор кандидатов — две стратегии: top-N по объёму
+(активность ∪ `relpages` ∪ `n_dead_tup`) и порог опасности по формулам autovacuum
+плюс wraparound (см. `1_013` в `postgresql.md`). Запрос идёт под адаптивным
+`statement_timeout`. coverage в `1_023_001` — будущий эпик.
 
 Для индексов схема аналогична:
 

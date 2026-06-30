@@ -111,8 +111,13 @@ impl Cluster {
     }
 
     pub(crate) fn conn_string(&self) -> String {
+        self.conn_string_db("postgres")
+    }
+
+    /// Connection string targeting a specific database on this cluster.
+    pub(crate) fn conn_string_db(&self, dbname: &str) -> String {
         format!(
-            "host=127.0.0.1 port={} user=postgres dbname=postgres",
+            "host=127.0.0.1 port={} user=postgres dbname={dbname}",
             self.port
         )
     }
