@@ -59,8 +59,10 @@ pub const fn user_tables_version(major: u32) -> UserTablesVersion {
 /// The SQL for one layout.
 ///
 /// `$1` is the per-axis top-N row count; `$2` is the wraparound warn fraction of
-/// `autovacuum_freeze_max_age`/`autovacuum_multixact_freeze_max_age`. The danger
-/// branch reuses the live autovacuum GUCs through `current_setting`. `ts` is one
+/// `autovacuum_freeze_max_age`/`autovacuum_multixact_freeze_max_age`, cast to
+/// `float8` in SQL — without the cast `int8 * $2` makes the server infer `$2` as
+/// `int8` and reject the `f64` bind. The danger branch reuses the live autovacuum
+/// GUCs through `current_setting`. `ts` is one
 /// `statement_timestamp()` for the snapshot; the `last_*` columns come back as
 /// unix microseconds.
 #[allow(
@@ -91,8 +93,8 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                UNION \
                (SELECT t.relid FROM pg_stat_user_tables t \
                   JOIN pg_class c ON c.oid = t.relid CROSS JOIN s \
-                  WHERE age(c.relfrozenxid)::int8 > (s.afma * $2)::int8 \
-                     OR mxid_age(c.relminmxid)::int8 > (s.amfma * $2)::int8 \
+                  WHERE age(c.relfrozenxid)::int8 > (s.afma * $2::float8)::int8 \
+                     OR mxid_age(c.relminmxid)::int8 > (s.amfma * $2::float8)::int8 \
                      OR t.n_dead_tup > s.vac_t + s.vac_sf * c.reltuples \
                      OR t.n_mod_since_analyze > s.ana_t + s.ana_sf * c.reltuples) \
              ) \
@@ -147,8 +149,8 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                UNION \
                (SELECT t.relid FROM pg_stat_user_tables t \
                   JOIN pg_class c ON c.oid = t.relid CROSS JOIN s \
-                  WHERE age(c.relfrozenxid)::int8 > (s.afma * $2)::int8 \
-                     OR mxid_age(c.relminmxid)::int8 > (s.amfma * $2)::int8 \
+                  WHERE age(c.relfrozenxid)::int8 > (s.afma * $2::float8)::int8 \
+                     OR mxid_age(c.relminmxid)::int8 > (s.amfma * $2::float8)::int8 \
                      OR t.n_dead_tup > s.vac_t + s.vac_sf * c.reltuples \
                      OR t.n_ins_since_vacuum > s.ins_t + s.ins_sf * c.reltuples \
                      OR t.n_mod_since_analyze > s.ana_t + s.ana_sf * c.reltuples) \
@@ -203,8 +205,8 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                UNION \
                (SELECT t.relid FROM pg_stat_user_tables t \
                   JOIN pg_class c ON c.oid = t.relid CROSS JOIN s \
-                  WHERE age(c.relfrozenxid)::int8 > (s.afma * $2)::int8 \
-                     OR mxid_age(c.relminmxid)::int8 > (s.amfma * $2)::int8 \
+                  WHERE age(c.relfrozenxid)::int8 > (s.afma * $2::float8)::int8 \
+                     OR mxid_age(c.relminmxid)::int8 > (s.amfma * $2::float8)::int8 \
                      OR t.n_dead_tup > s.vac_t + s.vac_sf * c.reltuples \
                      OR t.n_ins_since_vacuum > s.ins_t + s.ins_sf * c.reltuples \
                      OR t.n_mod_since_analyze > s.ana_t + s.ana_sf * c.reltuples) \
@@ -683,6 +685,9 @@ mod tests {
             assert!(q.contains("LEFT JOIN pg_statio_user_tables"));
             assert!(q.contains("relfrozenxid"));
             assert!(q.contains("autovacuum_freeze_max_age"));
+            // The wraparound fraction param must be pinned to float8; otherwise
+            // `int8 * $2` makes the server infer $2 as int8 and reject the f64 bind.
+            assert!(q.contains("$2::float8"));
         }
         // V1 omits the PG13+ insert-vacuum danger term.
         assert!(
