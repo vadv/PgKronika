@@ -201,7 +201,9 @@ async fn collect_user_tables_all(
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
     for db in pool.per_db() {
         loop {
-            // Heavy size functions can be slow; widen statement_timeout for this query only.
+            // The heavy size functions can be slow, so this query runs under a
+            // wider statement_timeout. SET persists on the connection: it stays
+            // in effect until the next database's SET overwrites it.
             db.client()
                 .batch_execute(&format!("SET statement_timeout = {}", heavy.current_ms()))
                 .await
@@ -213,6 +215,15 @@ async fn collect_user_tables_all(
                 }
                 Err(err) if is_sqlstate(&err, "57014") && !heavy.at_cap() => {
                     heavy.grow(); // statement_timeout hit; retry this database wider
+                }
+                Err(err) if is_sqlstate(&err, "55P03") => {
+                    // lock_not_available: another session holds a conflicting lock.
+                    // Label it distinctly so contention is not read as a query bug.
+                    eprintln!(
+                        "pg_kronika-collector: skip user_tables for {} (lock_not_available): {err}",
+                        db.datname
+                    );
+                    break;
                 }
                 Err(err) => {
                     eprintln!(
@@ -393,6 +404,9 @@ fn push_user_tables(
                 }
                 UserTablesVersion::V3 => {
                     buffer_row(buffers, user_tables::to_v3(row, datname, &mut intern)?)?;
+                }
+                UserTablesVersion::V4 => {
+                    buffer_row(buffers, user_tables::to_v4(row, datname, &mut intern)?)?;
                 }
             }
         }
@@ -683,7 +697,11 @@ mod tests {
             last_autoanalyze: None,
             last_seq_scan: None,
             last_idx_scan: None,
-            size_bytes: 8_192,
+            total_vacuum_time: None,
+            total_autovacuum_time: None,
+            total_analyze_time: None,
+            total_autoanalyze_time: None,
+            main_fork_bytes: 8_192,
             toast_bytes: None,
             toast_n_live_tup: None,
             toast_n_dead_tup: None,
