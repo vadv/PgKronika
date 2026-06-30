@@ -21,7 +21,7 @@ mod collector;
 use std::path::Path;
 
 use anyhow::Context;
-use cucumber::{World, given, then};
+use cucumber::{World, event, given, then};
 use kronika_format::{Entry, crc32c};
 use kronika_reader::{Dictionary, Resolved, Segment};
 use kronika_registry::{
@@ -637,11 +637,17 @@ async fn seed_user_table_database(db: &cluster::Cluster, datname: &str) -> anyho
                 "CREATE TABLE IF NOT EXISTS kronika_ut_probe (id int primary key, payload text); \
                  INSERT INTO kronika_ut_probe \
                    SELECT g, repeat('x', 16) FROM generate_series(1, 200) g \
-                   ON CONFLICT (id) DO NOTHING; \
-                 VACUUM ANALYZE kronika_ut_probe;",
+                   ON CONFLICT (id) DO NOTHING;",
             )
             .await
-            .with_context(|| format!("postgres {}: seed table in {datname}", db.major()))
+            .with_context(|| format!("postgres {}: seed table in {datname}", db.major()))?;
+        // VACUUM cannot run inside a transaction block, and a multi-statement
+        // simple query executes as one implicit transaction — so VACUUM ANALYZE
+        // must be its own statement.
+        client
+            .batch_execute("VACUUM ANALYZE kronika_ut_probe;")
+            .await
+            .with_context(|| format!("postgres {}: vacuum analyze in {datname}", db.major()))
     }
     .await;
     driver.abort();
@@ -1510,7 +1516,36 @@ async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> an
 #[tokio::main]
 async fn main() {
     let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
-    BddWorld::cucumber().run_and_exit(features).await;
+    // On a failed scenario, dump each booted cluster's PostgreSQL server log so
+    // CI shows the server-side cause (e.g. a rejected statement) instead of only
+    // the opaque step panic. PostgreSQL logs errors regardless of DEBUG.
+    BddWorld::cucumber()
+        .after(|_feature, _rule, _scenario, ev, world| {
+            Box::pin(async move {
+                if !matches!(
+                    ev,
+                    event::ScenarioFinished::StepFailed(..)
+                        | event::ScenarioFinished::BeforeHookFailed(_)
+                ) {
+                    return;
+                }
+                if let event::ScenarioFinished::StepFailed(_, _, err) = ev {
+                    eprintln!("=== BDD step failed: {err} ===");
+                }
+                if let Some(world) = world {
+                    for cluster in &world.clusters {
+                        eprintln!(
+                            "=== postgres {} server.log ===\n{}\n=== end postgres {} server.log ===",
+                            cluster.major(),
+                            cluster.server_log(),
+                            cluster.major(),
+                        );
+                    }
+                }
+            })
+        })
+        .run_and_exit(features)
+        .await;
 }
 
 #[cfg(test)]
