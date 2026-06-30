@@ -155,25 +155,25 @@ pub struct PgStatUserTablesV4 {
     /// Planner row estimate (`pg_class.reltuples`); `-1` means never analyzed (PG14+).
     #[column(g)]
     pub reltuples: i64,
-    /// Heap blocks read from disk.
+    /// Heap block reads reported by `pg_statio_user_tables`.
     #[column(c)]
     pub heap_blks_read: i64,
     /// Heap buffer hits.
     #[column(c)]
     pub heap_blks_hit: i64,
-    /// Index blocks read; `None` when the table has no indexes.
+    /// Index block reads; `None` when the table has no indexes.
     #[column(c)]
     pub idx_blks_read: Option<i64>,
     /// Index buffer hits; `None` when the table has no indexes.
     #[column(c)]
     pub idx_blks_hit: Option<i64>,
-    /// TOAST blocks read; `None` when no TOAST relation.
+    /// TOAST block reads; `None` when no TOAST relation.
     #[column(c)]
     pub toast_blks_read: Option<i64>,
     /// TOAST buffer hits; `None` when no TOAST relation.
     #[column(c)]
     pub toast_blks_hit: Option<i64>,
-    /// TOAST-index blocks read; `None` when no TOAST relation.
+    /// TOAST-index block reads; `None` when no TOAST relation.
     #[column(c)]
     pub tidx_blks_read: Option<i64>,
     /// TOAST-index buffer hits; `None` when no TOAST relation.
@@ -309,25 +309,25 @@ pub struct PgStatUserTablesV3 {
     /// Planner row estimate (`pg_class.reltuples`); `-1` means never analyzed (PG14+).
     #[column(g)]
     pub reltuples: i64,
-    /// Heap blocks read from disk.
+    /// Heap block reads reported by `pg_statio_user_tables`.
     #[column(c)]
     pub heap_blks_read: i64,
     /// Heap buffer hits.
     #[column(c)]
     pub heap_blks_hit: i64,
-    /// Index blocks read; `None` when the table has no indexes.
+    /// Index block reads; `None` when the table has no indexes.
     #[column(c)]
     pub idx_blks_read: Option<i64>,
     /// Index buffer hits; `None` when the table has no indexes.
     #[column(c)]
     pub idx_blks_hit: Option<i64>,
-    /// TOAST blocks read; `None` when no TOAST relation.
+    /// TOAST block reads; `None` when no TOAST relation.
     #[column(c)]
     pub toast_blks_read: Option<i64>,
     /// TOAST buffer hits; `None` when no TOAST relation.
     #[column(c)]
     pub toast_blks_hit: Option<i64>,
-    /// TOAST-index blocks read; `None` when no TOAST relation.
+    /// TOAST-index block reads; `None` when no TOAST relation.
     #[column(c)]
     pub tidx_blks_read: Option<i64>,
     /// TOAST-index buffer hits; `None` when no TOAST relation.
@@ -451,25 +451,25 @@ pub struct PgStatUserTablesV2 {
     /// Planner row estimate (`pg_class.reltuples`); `-1` means never analyzed (PG14+).
     #[column(g)]
     pub reltuples: i64,
-    /// Heap blocks read from disk.
+    /// Heap block reads reported by `pg_statio_user_tables`.
     #[column(c)]
     pub heap_blks_read: i64,
     /// Heap buffer hits.
     #[column(c)]
     pub heap_blks_hit: i64,
-    /// Index blocks read; `None` when the table has no indexes.
+    /// Index block reads; `None` when the table has no indexes.
     #[column(c)]
     pub idx_blks_read: Option<i64>,
     /// Index buffer hits; `None` when the table has no indexes.
     #[column(c)]
     pub idx_blks_hit: Option<i64>,
-    /// TOAST blocks read; `None` when no TOAST relation.
+    /// TOAST block reads; `None` when no TOAST relation.
     #[column(c)]
     pub toast_blks_read: Option<i64>,
     /// TOAST buffer hits; `None` when no TOAST relation.
     #[column(c)]
     pub toast_blks_hit: Option<i64>,
-    /// TOAST-index blocks read; `None` when no TOAST relation.
+    /// TOAST-index block reads; `None` when no TOAST relation.
     #[column(c)]
     pub tidx_blks_read: Option<i64>,
     /// TOAST-index buffer hits; `None` when no TOAST relation.
@@ -590,25 +590,25 @@ pub struct PgStatUserTablesV1 {
     /// Planner row estimate (`pg_class.reltuples`); `-1` means never analyzed (PG14+).
     #[column(g)]
     pub reltuples: i64,
-    /// Heap blocks read from disk.
+    /// Heap block reads reported by `pg_statio_user_tables`.
     #[column(c)]
     pub heap_blks_read: i64,
     /// Heap buffer hits.
     #[column(c)]
     pub heap_blks_hit: i64,
-    /// Index blocks read; `None` when the table has no indexes.
+    /// Index block reads; `None` when the table has no indexes.
     #[column(c)]
     pub idx_blks_read: Option<i64>,
     /// Index buffer hits; `None` when the table has no indexes.
     #[column(c)]
     pub idx_blks_hit: Option<i64>,
-    /// TOAST blocks read; `None` when no TOAST relation.
+    /// TOAST block reads; `None` when no TOAST relation.
     #[column(c)]
     pub toast_blks_read: Option<i64>,
     /// TOAST buffer hits; `None` when no TOAST relation.
     #[column(c)]
     pub toast_blks_hit: Option<i64>,
-    /// TOAST-index blocks read; `None` when no TOAST relation.
+    /// TOAST-index block reads; `None` when no TOAST relation.
     #[column(c)]
     pub tidx_blks_read: Option<i64>,
     /// TOAST-index buffer hits; `None` when no TOAST relation.
