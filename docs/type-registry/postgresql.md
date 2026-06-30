@@ -551,15 +551,18 @@ SQLSTATE 57014 — расширить и повторить базу, иначе
 Три версии по росту каталога: `n_ins_since_vacuum` появился в PG13 (V2),
 `n_tup_newpage_upd` и `last_seq_scan`/`last_idx_scan` — в PG16 (V3).
 
-Отбор кандидатов — две стратегии в одном `WITH` (N по умолчанию 500, env
-`KRONIKA_PG_MAX_TABLES`):
+Отбор кандидатов — чисто механический: объединение top-N таблиц по сырым
+колонкам (N по умолчанию 500, env `KRONIKA_PG_MAX_TABLES`):
 
-- объём (top-N, паритет с reftool): активность ∪ `relpages` ∪ `n_dead_tup`;
-- опасность (порог, СВЕРХ floor reftool): все таблицы, перешедшие линию по
-  собственным формулам autovacuum (vacuum/insert/analyze просрочены) или по
-  wraparound — `age(relfrozenxid)`/`mxid_age(relminmxid)` выше доли
-  `autovacuum_freeze_max_age` (env `KRONIKA_PG_WRAPAROUND_WARN_FRACTION` = 0.8).
-  В здоровой базе порог даёт ноль строк; при угрозе — все опасные независимо от N.
+- активность: `seq_scan + idx_scan + n_tup_ins/upd/del` (PG16+ — `GREATEST(last_seq_scan, last_idx_scan)`);
+- размер: `pg_class.relpages`;
+- bloat: `n_dead_tup`;
+- xid-возраст: `age(relfrozenxid)` DESC — старейшие первыми, таблица у wraparound не теряется;
+- multixact-возраст: `mxid_age(relminmxid)` DESC.
+
+Коллектор пишет крайние строки по каждой оси и ограничивает свой объём; оценку
+«опасно или нет» делает модуль анализа на чтении — порогов и вердиктов в
+коллекторе нет.
 
 `pg_statio_user_tables` сливается в строку через `LEFT JOIN` по `relid`;
 `xid_age`/`mxid_age`/`reltuples` берутся из `pg_class` тем же запросом. `datid`

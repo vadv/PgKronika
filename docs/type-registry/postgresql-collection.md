@@ -156,10 +156,10 @@ CTE должен подниматься к корням блокировок и 
 Для таблиц выполняется один запрос на базу (через пул соединений, итерация по
 `per_db()`): `pg_stat_user_tables` с `LEFT JOIN pg_statio_user_tables` по `relid`,
 размерами через `pg_relation_size`/`pg_total_relation_size` и `xid_age`/`mxid_age`/
-`reltuples` из `pg_class`. Отбор кандидатов — две стратегии: top-N по объёму
-(активность ∪ `relpages` ∪ `n_dead_tup`) и порог опасности по формулам autovacuum
-плюс wraparound (см. `1_013` в `postgresql.md`). Запрос идёт под адаптивным
-`statement_timeout`. coverage в `1_023_001` — будущий эпик.
+`reltuples` из `pg_class`. Отбор кандидатов — чисто механический: top-N по сырым
+колонкам (активность ∪ `relpages` ∪ `n_dead_tup` ∪ `age(relfrozenxid)` ∪
+`mxid_age(relminmxid)`), без порогов и вердиктов (см. `1_013` в `postgresql.md`).
+Запрос идёт под адаптивным `statement_timeout`. coverage в `1_023_001` — будущий эпик.
 
 Для индексов схема аналогична:
 
