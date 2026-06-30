@@ -1,10 +1,10 @@
-# pg_stat_user_tables (1_003) Implementation Plan
+# pg_stat_user_tables (1_013) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add the first database-local (class B) metric — per-table statistics from `pg_stat_user_tables` joined with `pg_statio_user_tables` and `pg_class`, collected from every database via the connection pool.
 
-**Architecture:** Three schema versions (`1_003_001..003`) following the registry's monotonic-add discipline. Candidate selection blends reftool's volume top-N (activity ∪ size ∪ bloat) with a threshold "danger" branch built from PostgreSQL's own autovacuum trigger formulas plus table-level wraparound. The daemon wires `pool.refresh()`, iterates `pool.per_db()`, and applies the existing `AdaptiveTimeout` to the heavy query.
+**Architecture:** Three schema versions (`1_013_001..003`) following the registry's monotonic-add discipline. Candidate selection blends reftool's volume top-N (activity ∪ size ∪ bloat) with a threshold "danger" branch built from PostgreSQL's own autovacuum trigger formulas plus table-level wraparound. The daemon wires `pool.refresh()`, iterates `pool.per_db()`, and applies the existing `AdaptiveTimeout` to the heavy query.
 
 **Tech Stack:** Rust, tokio-postgres, arrow/parquet codec (`#[derive(Section)]`), kronika-writer interner.
 
@@ -44,7 +44,7 @@
 - Modify: `crates/kronika-registry/src/lib.rs:32-36` (add `pg_stat_user_tables` to the `pub use codec::{...}` list) and `crates/kronika-registry/src/lib.rs:67-86` (add three `CONTRACT`s to `registry()`)
 
 **Interfaces:**
-- Produces: `PgStatUserTablesV1` (`1_003_001`), `PgStatUserTablesV2` (`1_003_002`), `PgStatUserTablesV3` (`1_003_003`), each implementing `Section`.
+- Produces: `PgStatUserTablesV1` (`1_013_001`), `PgStatUserTablesV2` (`1_013_002`), `PgStatUserTablesV3` (`1_013_003`), each implementing `Section`.
 
 - [ ] **Step 1: Write the failing contract tests**
 
@@ -54,7 +54,7 @@ In `crates/kronika-registry/src/codec/pg_stat_user_tables.rs`, add a `#[cfg(test
 #[test]
 fn v3_contract_shape() {
     let c = PgStatUserTablesV3::CONTRACT;
-    assert_eq!(c.type_id.get(), 1_003_003);
+    assert_eq!(c.type_id.get(), 1_013_003);
     assert_eq!(c.columns.len(), 46);
     assert_eq!(c.sort_key, ["datid", "relid", "ts"]);
     assert_eq!(c.column("ts").map(|col| col.nullable), Some(false));
@@ -70,7 +70,7 @@ fn v3_contract_shape() {
 #[test]
 fn v2_drops_pg16_columns() {
     let c = PgStatUserTablesV2::CONTRACT;
-    assert_eq!(c.type_id.get(), 1_003_002);
+    assert_eq!(c.type_id.get(), 1_013_002);
     assert_eq!(c.columns.len(), 43);
     assert!(c.column("n_ins_since_vacuum").is_some());
     assert!(c.column("n_tup_newpage_upd").is_none());
@@ -80,7 +80,7 @@ fn v2_drops_pg16_columns() {
 #[test]
 fn v1_is_base_layout() {
     let c = PgStatUserTablesV1::CONTRACT;
-    assert_eq!(c.type_id.get(), 1_003_001);
+    assert_eq!(c.type_id.get(), 1_013_001);
     assert_eq!(c.columns.len(), 42);
     assert!(c.column("n_ins_since_vacuum").is_none());
     assert_eq!(lint(&[c]), Ok(()));
@@ -101,7 +101,7 @@ Header doc-comment (English) explaining the catalog growth: `n_ins_since_vacuum`
 ```rust
 use crate::{Section, StrId, Ts};
 
-/// Type `1_003_003`: `pg_stat_user_tables` on PG 16-18 (V2 plus
+/// Type `1_013_003`: `pg_stat_user_tables` on PG 16-18 (V2 plus
 /// `n_tup_newpage_upd` and the `last_seq_scan`/`last_idx_scan` timestamps).
 ///
 /// One row per selected table per database. `idx_*` columns are `None` when the
@@ -109,7 +109,7 @@ use crate::{Section, StrId, Ts};
 /// relation; `last_*` timestamps are `None` when the event never happened.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
-    id = 1_003_003,
+    id = 1_013_003,
     name = "pg_stat_user_tables",
     semantics = snapshot_full,
     sort_key("datid", "relid", "ts")
@@ -256,9 +256,9 @@ pub struct PgStatUserTablesV3 {
 }
 ```
 
-`PgStatUserTablesV2` (`id = 1_003_002`, 43 fields): copy V3 verbatim, then delete the three PG16 fields — `n_tup_newpage_upd`, `last_seq_scan`, `last_idx_scan`.
+`PgStatUserTablesV2` (`id = 1_013_002`, 43 fields): copy V3 verbatim, then delete the three PG16 fields — `n_tup_newpage_upd`, `last_seq_scan`, `last_idx_scan`.
 
-`PgStatUserTablesV1` (`id = 1_003_001`, 42 fields): copy V2, then delete `n_ins_since_vacuum`.
+`PgStatUserTablesV1` (`id = 1_013_001`, 42 fields): copy V2, then delete `n_ins_since_vacuum`.
 
 Keep the same `#[section(...)]` block (only the `id` changes) and the same per-field doc-comments.
 
@@ -285,7 +285,7 @@ cargo fmt && cargo clippy -p kronika-registry -- --deny warnings
 git add crates/kronika-registry/src/codec/pg_stat_user_tables.rs crates/kronika-registry/src/codec.rs crates/kronika-registry/src/lib.rs
 git commit -m "Реестр: схема pg_stat_user_tables в трёх версиях" \
   -m "Что требовалось: типы сегмента для статистики таблиц по версиям каталога PG10-18." \
-  -m "Суть: type_id 1_003_001..003 — V1 (PG10-12), V2 (+n_ins_since_vacuum, PG13-15), V3 (+n_tup_newpage_upd, last_seq_scan/last_idx_scan, PG16-18). statio-колонки и xid/mxid-age слиты в строку таблицы; NULL для «нет индексов/TOAST» и «никогда»."
+  -m "Суть: type_id 1_013_001..003 — V1 (PG10-12), V2 (+n_ins_since_vacuum, PG13-15), V3 (+n_tup_newpage_upd, last_seq_scan/last_idx_scan, PG16-18). statio-колонки и xid/mxid-age слиты в строку таблицы; NULL для «нет индексов/TOAST» и «никогда»."
 ```
 
 ---
@@ -613,7 +613,7 @@ git commit -m "Сбор pg_stat_user_tables по версиям PG10-18" \
 
 - [ ] **Step 1: Write the failing collector unit test**
 
-Add `push_user_tables` and a test mirroring `push_database` (`main.rs:510-539`): build two `UserTablesRow`, push as `UserTablesVersion::V3`, flush, assert the part carries `type_id == 1_003_003`. Add a `ut_row(relid)` builder in the test module.
+Add `push_user_tables` and a test mirroring `push_database` (`main.rs:510-539`): build two `UserTablesRow`, push as `UserTablesVersion::V3`, flush, assert the part carries `type_id == 1_013_003`. Add a `ut_row(relid)` builder in the test module.
 
 - [ ] **Step 2: Run, verify fail** — `cargo test -p pg_kronika-collector push_user_tables` → compile error.
 
@@ -754,18 +754,18 @@ Feature: pg_stat_user_tables collection
   Scenario: tables are collected per database with datname separation
     Given a cluster with databases "kronika_a" and "kronika_b", each holding a seeded table
     When the collector snapshots pg_stat_user_tables across the pool
-    Then the segment carries 1_003 rows from both "kronika_a" and "kronika_b"
+    Then the segment carries 1_013 rows from both "kronika_a" and "kronika_b"
     And each row resolves its datname, schemaname and relname through the dictionary
 
   Scenario: a table near xid wraparound is selected despite no activity
     Given a database with an idle table whose relfrozenxid age exceeds 80% of autovacuum_freeze_max_age
     When the collector snapshots pg_stat_user_tables
-    Then that table appears in the 1_003 rows
+    Then that table appears in the 1_013 rows
 ```
 
 - [ ] **Step 2: Implement the step**
 
-In the bdd binary, add a step that connects a pool to the matrix cluster, `refresh()`es, iterates `per_db()`, runs `collect_user_tables`, builds a segment (reuse the existing collector-path helper or `SectionBuffers`), then `Segment::open` → `catalog().entries.find(type_id == 1_003_00x)` → `VerifiedSection::verify` → `PgStatUserTablesV*::decode` → assert rows from both databases and `segment.dictionary().resolve(str_id.0)` yields the names. For scenario 2, seed an aged table (the matrix helper can `SET` a low `autovacuum_freeze_max_age` on a database or consume xids); assert the relid is present.
+In the bdd binary, add a step that connects a pool to the matrix cluster, `refresh()`es, iterates `per_db()`, runs `collect_user_tables`, builds a segment (reuse the existing collector-path helper or `SectionBuffers`), then `Segment::open` → `catalog().entries.find(type_id == 1_013_00x)` → `VerifiedSection::verify` → `PgStatUserTablesV*::decode` → assert rows from both databases and `segment.dictionary().resolve(str_id.0)` yields the names. For scenario 2, seed an aged table (the matrix helper can `SET` a low `autovacuum_freeze_max_age` on a database or consume xids); assert the relid is present.
 
 - [ ] **Step 3: Run BDD** — `cargo test -p kronika-bdd` (or the project's BDD runner over `KRONIKA_PG_MATRIX`). Expected: PASS on PG15-18.
 
@@ -776,7 +776,7 @@ cargo fmt && cargo clippy -p kronika-bdd -- --deny warnings
 git add crates/kronika-bdd/
 git commit -m "BDD: pg_stat_user_tables по нескольким базам и danger-выборка" \
   -m "Что требовалось: подтвердить разделение по datname и попадание опасной таблицы в выборку." \
-  -m "Суть: сценарии проверяют строки 1_003 из двух баз с резолвом строк через словарь и отбор простаивающей таблицы у порога wraparound."
+  -m "Суть: сценарии проверяют строки 1_013 из двух баз с резолвом строк через словарь и отбор простаивающей таблицы у порога wraparound."
 ```
 
 ---
@@ -784,7 +784,7 @@ git commit -m "BDD: pg_stat_user_tables по нескольким базам и 
 ## Task 5: Documentation
 
 **Files:**
-- Modify: `docs/type-registry/postgresql.md` (summary table rows for `1_003_001..003` + a type section describing the schema, the two candidate strategies, and the version split)
+- Modify: `docs/type-registry/postgresql.md` (summary table rows for `1_013_001..003` + a type section describing the schema, the two candidate strategies, and the version split)
 - Modify: `docs/type-registry/postgresql-collection.md` (collection notes: per-db iteration, candidate SQL, adaptive timeout, env knobs)
 - Modify: `bins/pg_kronika-collector/src/main.rs` module doc (`//!`) — add the four new env vars (`KRONIKA_PG_MAX_TABLES`, `KRONIKA_PG_WRAPAROUND_WARN_FRACTION`, `KRONIKA_PG_POOL_REFRESH_SECS`, `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`)
 
@@ -797,7 +797,7 @@ git commit -m "BDD: pg_stat_user_tables по нескольким базам и 
 ```bash
 git add docs/type-registry/ bins/pg_kronika-collector/src/main.rs
 git commit -m "Документация: тип pg_stat_user_tables и env коллектора" \
-  -m "Что требовалось: описать схему 1_003, стратегию отбора и новые переменные окружения." \
+  -m "Что требовалось: описать схему 1_013, стратегию отбора и новые переменные окружения." \
   -m "Суть: реестр и заметки сбора описывают двухстратегийный отбор (top-N плюс пороги autovacuum/wraparound) и параметры KRONIKA_PG_MAX_TABLES, WRAPAROUND_WARN_FRACTION, POOL_REFRESH_SECS, HEAVY_TIMEOUT_CAP_MS."
 ```
 

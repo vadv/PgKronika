@@ -33,7 +33,9 @@ use kronika_registry::{
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
     pg_stat_progress_vacuum::PgStatProgressVacuum,
-    pg_stat_user_tables::{PgStatUserTablesV1, PgStatUserTablesV2, PgStatUserTablesV3},
+    pg_stat_user_tables::{
+        PgStatUserTablesV1, PgStatUserTablesV2, PgStatUserTablesV3, PgStatUserTablesV4,
+    },
     pg_stat_wal::{PgStatWalV1, PgStatWalV2},
     replication_instance::ReplicationInstance,
 };
@@ -56,6 +58,7 @@ const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
 const PG_STAT_USER_TABLES_V1_TYPE_ID: u32 = 1_013_001;
 const PG_STAT_USER_TABLES_V2_TYPE_ID: u32 = 1_013_002;
 const PG_STAT_USER_TABLES_V3_TYPE_ID: u32 = 1_013_003;
+const PG_STAT_USER_TABLES_V4_TYPE_ID: u32 = 1_013_004;
 
 /// Databases seeded by the user-tables scenario; each gets one probe table.
 const SEEDED_DATABASES: [&str; 2] = ["kronika_ut_a", "kronika_ut_b"];
@@ -676,6 +679,20 @@ fn assert_user_tables_section(major: u32, path: &Path) -> anyhow::Result<()> {
     let min_ts = segment.catalog().min_ts;
     let max_ts = segment.catalog().max_ts;
     let observations = match user_tables_version(major) {
+        UserTablesVersion::V4 => decode_section_rows::<PgStatUserTablesV4>(
+            path,
+            &segment,
+            PG_STAT_USER_TABLES_V4_TYPE_ID,
+        )
+        .with_context(|| format!("postgres {major}: read back section 1_013_004"))?
+        .iter()
+        .map(|r| UserTableObservation {
+            datname: r.datname,
+            schemaname: r.schemaname,
+            relname: r.relname,
+            ts: r.ts.0,
+        })
+        .collect::<Vec<_>>(),
         UserTablesVersion::V3 => decode_section_rows::<PgStatUserTablesV3>(
             path,
             &segment,

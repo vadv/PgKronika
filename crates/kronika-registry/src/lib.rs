@@ -71,6 +71,7 @@ pub const fn registry() -> &'static [TypeContract] {
         pg_stat_user_tables::PgStatUserTablesV1::CONTRACT,
         pg_stat_user_tables::PgStatUserTablesV2::CONTRACT,
         pg_stat_user_tables::PgStatUserTablesV3::CONTRACT,
+        pg_stat_user_tables::PgStatUserTablesV4::CONTRACT,
         pg_stat_database::PgStatDatabaseV1::CONTRACT,
         pg_stat_database::PgStatDatabaseV2::CONTRACT,
         pg_stat_database::PgStatDatabaseV3::CONTRACT,
