@@ -21,12 +21,9 @@
 //!   default 10000;
 //! - `KRONIKA_PG_EXCLUDE_DATABASES`: semicolon-separated list of databases to skip;
 //! - `KRONIKA_PG_MAX_TABLES`: per-axis top-N row count for `pg_stat_user_tables`
-//!   candidate selection, default 500. Each of the activity, size, and bloat axes
-//!   contributes up to this many tables before the union; the danger branch adds
-//!   tables regardless of this cap;
-//! - `KRONIKA_PG_WRAPAROUND_WARN_FRACTION`: fraction of
-//!   `autovacuum_freeze_max_age` / `autovacuum_multixact_freeze_max_age` at which
-//!   an idle table enters the `pg_stat_user_tables` danger branch, default 0.8;
+//!   candidate selection, default 500. Each mechanical axis (activity, size,
+//!   dead tuples, transaction-id age, multixact age) contributes up to this many
+//!   tables before the union;
 //! - `KRONIKA_PG_POOL_REFRESH_SECS`: minimum interval between connection-pool
 //!   refreshes (per-database connection reconciliation), default 600;
 //! - `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`: cap for the adaptive `statement_timeout`
@@ -75,8 +72,6 @@ struct Config {
     exclude_databases: HashSet<String>,
     /// Per-axis top-N row count for `pg_stat_user_tables` candidate selection.
     max_tables: i64,
-    /// Wraparound warn fraction of `autovacuum_*_freeze_max_age` for the danger branch.
-    wrap_fraction: f64,
     /// Minimum interval between connection-pool refreshes, seconds.
     pool_refresh_secs: u64,
     /// Cap for the adaptive `statement_timeout` of the heavy per-table query, ms.
@@ -87,13 +82,6 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
     std::env::var(key).map_or_else(
         |_| Ok(default),
         |v| v.parse().with_context(|| format!("{key} is not a u64")),
-    )
-}
-
-fn env_f64(key: &str, default: f64) -> Result<f64> {
-    std::env::var(key).map_or_else(
-        |_| Ok(default),
-        |v| v.parse().with_context(|| format!("{key} is not an f64")),
     )
 }
 
@@ -122,7 +110,6 @@ impl Config {
         }
         let max_tables = i64::try_from(env_u64("KRONIKA_PG_MAX_TABLES", 500)?)
             .context("KRONIKA_PG_MAX_TABLES exceeds i64")?;
-        let wrap_fraction = env_f64("KRONIKA_PG_WRAPAROUND_WARN_FRACTION", 0.8)?;
         let pool_refresh_secs = env_u64("KRONIKA_PG_POOL_REFRESH_SECS", 600)?;
         let heavy_timeout_cap_ms = env_u64("KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS", 60_000)?;
         Ok(Self {
@@ -132,7 +119,6 @@ impl Config {
             session,
             exclude_databases,
             max_tables,
-            wrap_fraction,
             pool_refresh_secs,
             heavy_timeout_cap_ms,
         })
@@ -220,9 +206,7 @@ async fn collect_user_tables_all(
                 .batch_execute(&format!("SET statement_timeout = {}", heavy.current_ms()))
                 .await
                 .ok();
-            match collect_user_tables(db.client(), major, config.max_tables, config.wrap_fraction)
-                .await
-            {
+            match collect_user_tables(db.client(), major, config.max_tables).await {
                 Ok((version, rows)) => {
                     user_tables.push((db.datname.clone(), version, rows));
                     break;

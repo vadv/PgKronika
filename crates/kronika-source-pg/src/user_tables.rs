@@ -5,12 +5,13 @@
 //! `n_tup_newpage_upd` plus the `last_seq_scan`/`last_idx_scan` timestamps in
 //! PG16. The major version selects both the SQL and the layout.
 //!
-//! Candidate selection blends a volume top-N (activity, size, bloat) with a
-//! threshold "danger" branch built from `PostgreSQL`'s own autovacuum trigger
-//! formulas plus table-level wraparound, so a small idle table near wraparound
-//! is collected even when it never enters any top-N. Collection returns owned
-//! rows; the caller interns the strings into the segment dictionary. The typed
-//! layout lives in `kronika-registry` (`PgStatUserTablesV1`..`V3`).
+//! Candidate selection is purely mechanical: the union of top-N tables by raw
+//! columns (activity, size, dead tuples, transaction-id age, multixact age), so
+//! an extreme table — including one near wraparound — is never dropped. The
+//! collector records and bounds its output; judging whether a value is dangerous
+//! is the analyzer's job. Collection returns owned rows; the caller interns the
+//! strings into the segment dictionary. The typed layout lives in
+//! `kronika-registry` (`PgStatUserTablesV1`..`V3`).
 
 use kronika_registry::pg_stat_user_tables::{
     PgStatUserTablesV1, PgStatUserTablesV2, PgStatUserTablesV3,
@@ -58,11 +59,11 @@ pub const fn user_tables_version(major: u32) -> UserTablesVersion {
 
 /// The SQL for one layout.
 ///
-/// `$1` is the per-axis top-N row count; `$2` is the wraparound warn fraction of
-/// `autovacuum_freeze_max_age`/`autovacuum_multixact_freeze_max_age`, cast to
-/// `float8` in SQL — without the cast `int8 * $2` makes the server infer `$2` as
-/// `int8` and reject the `f64` bind. The danger branch reuses the live autovacuum
-/// GUCs through `current_setting`. `ts` is one
+/// `$1` is the per-axis top-N row count. Candidate selection is purely
+/// mechanical — the union of top-N tables by raw columns (activity, size, dead
+/// tuples, transaction-id age, multixact age). The collector only records the
+/// most extreme rows per axis and bounds its own output; whether any value is
+/// dangerous is the analyzer's job, not the collector's. `ts` is one
 /// `statement_timestamp()` for the snapshot; the `last_*` columns come back as
 /// unix microseconds.
 #[allow(
@@ -73,15 +74,7 @@ pub const fn user_tables_version(major: u32) -> UserTablesVersion {
 pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
     match version {
         UserTablesVersion::V1 => marked!(
-            "WITH s AS ( \
-               SELECT current_setting('autovacuum_freeze_max_age')::int8 AS afma, \
-                      current_setting('autovacuum_multixact_freeze_max_age')::int8 AS amfma, \
-                      current_setting('autovacuum_vacuum_threshold')::int8 AS vac_t, \
-                      current_setting('autovacuum_vacuum_scale_factor')::float8 AS vac_sf, \
-                      current_setting('autovacuum_analyze_threshold')::int8 AS ana_t, \
-                      current_setting('autovacuum_analyze_scale_factor')::float8 AS ana_sf \
-             ), \
-             candidates AS ( \
+            "WITH candidates AS ( \
                (SELECT relid FROM pg_stat_user_tables \
                   ORDER BY COALESCE(seq_scan,0) + COALESCE(idx_scan,0) + COALESCE(n_tup_ins,0) \
                          + COALESCE(n_tup_upd,0) + COALESCE(n_tup_del,0) DESC LIMIT $1) \
@@ -91,12 +84,11 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                UNION \
                (SELECT relid FROM pg_stat_user_tables ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t \
-                  JOIN pg_class c ON c.oid = t.relid CROSS JOIN s \
-                  WHERE age(c.relfrozenxid)::int8 > (s.afma * $2::float8)::int8 \
-                     OR mxid_age(c.relminmxid)::int8 > (s.amfma * $2::float8)::int8 \
-                     OR t.n_dead_tup > s.vac_t + s.vac_sf * c.reltuples \
-                     OR t.n_mod_since_analyze > s.ana_t + s.ana_sf * c.reltuples) \
+               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+                  ORDER BY age(c.relfrozenxid) DESC LIMIT $1) \
+               UNION \
+               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+                  ORDER BY mxid_age(c.relminmxid) DESC LIMIT $1) \
              ) \
              SELECT \
                (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())::oid AS datid, \
@@ -127,17 +119,7 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
              LEFT JOIN pg_statio_user_tables io ON io.relid = t.relid"
         ),
         UserTablesVersion::V2 => marked!(
-            "WITH s AS ( \
-               SELECT current_setting('autovacuum_freeze_max_age')::int8 AS afma, \
-                      current_setting('autovacuum_multixact_freeze_max_age')::int8 AS amfma, \
-                      current_setting('autovacuum_vacuum_threshold')::int8 AS vac_t, \
-                      current_setting('autovacuum_vacuum_scale_factor')::float8 AS vac_sf, \
-                      current_setting('autovacuum_vacuum_insert_threshold')::int8 AS ins_t, \
-                      current_setting('autovacuum_vacuum_insert_scale_factor')::float8 AS ins_sf, \
-                      current_setting('autovacuum_analyze_threshold')::int8 AS ana_t, \
-                      current_setting('autovacuum_analyze_scale_factor')::float8 AS ana_sf \
-             ), \
-             candidates AS ( \
+            "WITH candidates AS ( \
                (SELECT relid FROM pg_stat_user_tables \
                   ORDER BY COALESCE(seq_scan,0) + COALESCE(idx_scan,0) + COALESCE(n_tup_ins,0) \
                          + COALESCE(n_tup_upd,0) + COALESCE(n_tup_del,0) DESC LIMIT $1) \
@@ -147,13 +129,11 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                UNION \
                (SELECT relid FROM pg_stat_user_tables ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t \
-                  JOIN pg_class c ON c.oid = t.relid CROSS JOIN s \
-                  WHERE age(c.relfrozenxid)::int8 > (s.afma * $2::float8)::int8 \
-                     OR mxid_age(c.relminmxid)::int8 > (s.amfma * $2::float8)::int8 \
-                     OR t.n_dead_tup > s.vac_t + s.vac_sf * c.reltuples \
-                     OR t.n_ins_since_vacuum > s.ins_t + s.ins_sf * c.reltuples \
-                     OR t.n_mod_since_analyze > s.ana_t + s.ana_sf * c.reltuples) \
+               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+                  ORDER BY age(c.relfrozenxid) DESC LIMIT $1) \
+               UNION \
+               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+                  ORDER BY mxid_age(c.relminmxid) DESC LIMIT $1) \
              ) \
              SELECT \
                (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())::oid AS datid, \
@@ -184,17 +164,7 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
              LEFT JOIN pg_statio_user_tables io ON io.relid = t.relid"
         ),
         UserTablesVersion::V3 => marked!(
-            "WITH s AS ( \
-               SELECT current_setting('autovacuum_freeze_max_age')::int8 AS afma, \
-                      current_setting('autovacuum_multixact_freeze_max_age')::int8 AS amfma, \
-                      current_setting('autovacuum_vacuum_threshold')::int8 AS vac_t, \
-                      current_setting('autovacuum_vacuum_scale_factor')::float8 AS vac_sf, \
-                      current_setting('autovacuum_vacuum_insert_threshold')::int8 AS ins_t, \
-                      current_setting('autovacuum_vacuum_insert_scale_factor')::float8 AS ins_sf, \
-                      current_setting('autovacuum_analyze_threshold')::int8 AS ana_t, \
-                      current_setting('autovacuum_analyze_scale_factor')::float8 AS ana_sf \
-             ), \
-             candidates AS ( \
+            "WITH candidates AS ( \
                (SELECT relid FROM pg_stat_user_tables \
                   ORDER BY GREATEST(last_seq_scan, last_idx_scan) DESC NULLS LAST LIMIT $1) \
                UNION \
@@ -203,13 +173,11 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                UNION \
                (SELECT relid FROM pg_stat_user_tables ORDER BY COALESCE(n_dead_tup, 0) DESC LIMIT $1) \
                UNION \
-               (SELECT t.relid FROM pg_stat_user_tables t \
-                  JOIN pg_class c ON c.oid = t.relid CROSS JOIN s \
-                  WHERE age(c.relfrozenxid)::int8 > (s.afma * $2::float8)::int8 \
-                     OR mxid_age(c.relminmxid)::int8 > (s.amfma * $2::float8)::int8 \
-                     OR t.n_dead_tup > s.vac_t + s.vac_sf * c.reltuples \
-                     OR t.n_ins_since_vacuum > s.ins_t + s.ins_sf * c.reltuples \
-                     OR t.n_mod_since_analyze > s.ana_t + s.ana_sf * c.reltuples) \
+               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+                  ORDER BY age(c.relfrozenxid) DESC LIMIT $1) \
+               UNION \
+               (SELECT t.relid FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+                  ORDER BY mxid_age(c.relminmxid) DESC LIMIT $1) \
              ) \
              SELECT \
                (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())::oid AS datid, \
@@ -569,8 +537,7 @@ pub fn to_v1<E>(
 /// Collect a `pg_stat_user_tables` snapshot for one database connection.
 ///
 /// Returns the layout version and raw rows; the caller interns the strings and
-/// builds the typed rows. `max_tables` is the per-axis top-N row count;
-/// `wrap_fraction` is the wraparound warn fraction for the danger branch.
+/// builds the typed rows. `max_tables` is the per-axis top-N row count.
 ///
 /// # Errors
 /// Returns the [`tokio_postgres::Error`] if the query fails.
@@ -578,11 +545,10 @@ pub async fn collect_user_tables(
     client: &Client,
     major: u32,
     max_tables: i64,
-    wrap_fraction: f64,
 ) -> Result<(UserTablesVersion, Vec<UserTablesRow>), tokio_postgres::Error> {
     let version = user_tables_version(major);
     let rows = client
-        .query(user_tables_query(version), &[&max_tables, &wrap_fraction])
+        .query(user_tables_query(version), &[&max_tables])
         .await?;
     let parsed = rows.iter().map(|row| row_from_pg(row, version)).collect();
     Ok((version, parsed))
@@ -683,20 +649,13 @@ mod tests {
             assert!(q.contains("pg_kronika"));
             assert!(q.contains("pg_stat_user_tables"));
             assert!(q.contains("LEFT JOIN pg_statio_user_tables"));
-            assert!(q.contains("relfrozenxid"));
-            assert!(q.contains("autovacuum_freeze_max_age"));
-            // The wraparound fraction param must be pinned to float8; otherwise
-            // `int8 * $2` makes the server infer $2 as int8 and reject the f64 bind.
-            assert!(q.contains("$2::float8"));
+            // Candidate selection is mechanical top-N by raw columns, including
+            // transaction-id and multixact age, so an extreme table is never
+            // dropped. No thresholds, no GUC-based "danger" verdict in the SQL.
+            assert!(q.contains("ORDER BY age(c.relfrozenxid) DESC"));
+            assert!(q.contains("ORDER BY mxid_age(c.relminmxid) DESC"));
+            assert!(!q.contains("current_setting"));
         }
-        // V1 omits the PG13+ insert-vacuum danger term.
-        assert!(
-            !user_tables_query(UserTablesVersion::V1)
-                .contains("autovacuum_vacuum_insert_threshold")
-        );
-        assert!(
-            user_tables_query(UserTablesVersion::V2).contains("autovacuum_vacuum_insert_threshold")
-        );
     }
 
     #[test]
