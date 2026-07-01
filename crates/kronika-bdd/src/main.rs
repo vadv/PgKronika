@@ -684,13 +684,13 @@ async fn seed_user_table_database(db: &cluster::Cluster, datname: &str) -> anyho
     result
 }
 
-/// Build a predicate long enough for `pg_get_indexdef` to exceed the collector cap.
+/// Build a predicate whose `pg_get_indexdef` text exceeds the collector cap.
 fn long_partial_index_predicate() -> String {
-    let ids = (1..=1_500)
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("payload IS NOT NULL AND id NOT IN ({ids})")
+    // A large IN-list makes old PostgreSQL versions reject the pg_index row as
+    // too wide. One long text constant keeps the catalog tuple smaller while the
+    // deparsed index definition still exceeds the SQL-side cap.
+    let literal = "x".repeat(5_200);
+    format!("payload IS NOT NULL AND payload <> '{literal}'")
 }
 
 /// Database row fields covered by the live BDD matrix for user-tables layouts.
@@ -966,7 +966,7 @@ fn check_user_indexes_rows(
         let schemaname = resolve_string(major, dict, "schemaname", row.schemaname.0)?;
         let indexrelname = resolve_string(major, dict, "indexrelname", row.indexrelname.0)?;
         let amname = resolve_string(major, dict, "amname", row.amname.0)?;
-        let indexdef = resolve_string(major, dict, "indexdef", row.indexdef.0)?;
+        let indexdef = resolve_dictionary_bytes(major, dict, "indexdef", row.indexdef.0)?;
         anyhow::ensure!(
             !schemaname.is_empty(),
             "postgres {major}: schemaname resolved to an empty string"
@@ -1049,6 +1049,21 @@ fn resolve_string(major: u32, dict: &Dictionary, label: &str, id: u64) -> anyhow
         Some(Resolved::String(bytes)) => Ok(bytes.to_vec()),
         other => anyhow::bail!(
             "postgres {major}: {label} str_id {id} did not resolve to a string: {other:?}"
+        ),
+    }
+}
+
+/// Resolve a dictionary id stored either in `dict.strings` or `dict.blobs`.
+fn resolve_dictionary_bytes(
+    major: u32,
+    dict: &Dictionary,
+    label: &str,
+    id: u64,
+) -> anyhow::Result<Vec<u8>> {
+    match dict.resolve(id) {
+        Some(Resolved::String(bytes) | Resolved::Blob { bytes, .. }) => Ok(bytes.to_vec()),
+        other => anyhow::bail!(
+            "postgres {major}: {label} str_id {id} did not resolve to bytes: {other:?}"
         ),
     }
 }
