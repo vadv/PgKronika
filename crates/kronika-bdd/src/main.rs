@@ -33,6 +33,7 @@ use kronika_registry::{
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
     pg_stat_progress_vacuum::PgStatProgressVacuum,
+    pg_stat_user_indexes::{PgStatUserIndexesV1, PgStatUserIndexesV2},
     pg_stat_user_tables::{
         PgStatUserTablesV1, PgStatUserTablesV2, PgStatUserTablesV3, PgStatUserTablesV4,
     },
@@ -41,6 +42,7 @@ use kronika_registry::{
 };
 use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::io::{IoVersion, io_version};
+use kronika_source_pg::user_indexes::{UserIndexesVersion, user_indexes_version};
 use kronika_source_pg::user_tables::{UserTablesVersion, user_tables_version};
 use kronika_source_pg::wal::{WalVersion, wal_version};
 use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
@@ -59,6 +61,9 @@ const PG_STAT_USER_TABLES_V1_TYPE_ID: u32 = 1_013_001;
 const PG_STAT_USER_TABLES_V2_TYPE_ID: u32 = 1_013_002;
 const PG_STAT_USER_TABLES_V3_TYPE_ID: u32 = 1_013_003;
 const PG_STAT_USER_TABLES_V4_TYPE_ID: u32 = 1_013_004;
+
+const PG_STAT_USER_INDEXES_V1_TYPE_ID: u32 = 1_014_001;
+const PG_STAT_USER_INDEXES_V2_TYPE_ID: u32 = 1_014_002;
 
 /// Databases seeded by the user-tables scenario; each gets one probe table.
 const SEEDED_DATABASES: [&str; 2] = ["kronika_ut_a", "kronika_ut_b"];
@@ -782,6 +787,146 @@ fn check_user_tables_rows(
         anyhow::ensure!(
             seeded_with_probe.contains(datname.as_bytes()),
             "postgres {major}: no kronika_ut_probe row for database {datname}"
+        );
+    }
+    Ok(())
+}
+
+#[then(
+    "each matrix cluster seals pg_stat_user_indexes rows from two seeded databases with dictionary-backed names"
+)]
+async fn every_version_seals_user_indexes(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        for datname in SEEDED_DATABASES {
+            seed_user_table_database(db, datname).await?;
+        }
+        // The collector refreshes the pool on SIGUSR2, so the seeded databases
+        // are enumerated and walked in this snapshot.
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_user_indexes_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Index row fields covered by the live BDD matrix for user-indexes layouts.
+#[derive(Debug, Clone, Copy)]
+struct UserIndexObservation {
+    datname: StrId,
+    schemaname: StrId,
+    indexrelname: StrId,
+    amname: StrId,
+    indexdef: StrId,
+    indisprimary: bool,
+    ts: i64,
+}
+
+/// Decode the sealed `pg_stat_user_indexes` section for the selected layout, then
+/// check one snapshot timestamp, that the two seeded databases both contributed
+/// the probe table's primary-key index, and that the label strings resolve
+/// through the dictionary.
+fn assert_user_indexes_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    let min_ts = segment.catalog().min_ts;
+    let max_ts = segment.catalog().max_ts;
+    let observations = match user_indexes_version(major) {
+        UserIndexesVersion::V2 => decode_section_rows::<PgStatUserIndexesV2>(
+            path,
+            &segment,
+            PG_STAT_USER_INDEXES_V2_TYPE_ID,
+        )
+        .with_context(|| format!("postgres {major}: read back section 1_014_002"))?
+        .iter()
+        .map(|r| UserIndexObservation {
+            datname: r.datname,
+            schemaname: r.schemaname,
+            indexrelname: r.indexrelname,
+            amname: r.amname,
+            indexdef: r.indexdef,
+            indisprimary: r.indisprimary,
+            ts: r.ts.0,
+        })
+        .collect::<Vec<_>>(),
+        UserIndexesVersion::V1 => decode_section_rows::<PgStatUserIndexesV1>(
+            path,
+            &segment,
+            PG_STAT_USER_INDEXES_V1_TYPE_ID,
+        )
+        .with_context(|| format!("postgres {major}: read back section 1_014_001"))?
+        .iter()
+        .map(|r| UserIndexObservation {
+            datname: r.datname,
+            schemaname: r.schemaname,
+            indexrelname: r.indexrelname,
+            amname: r.amname,
+            indexdef: r.indexdef,
+            indisprimary: r.indisprimary,
+            ts: r.ts.0,
+        })
+        .collect::<Vec<_>>(),
+    };
+    check_user_indexes_rows(major, &dict, min_ts, max_ts, &observations)
+}
+
+/// Shared invariants over the decoded user-indexes rows.
+fn check_user_indexes_rows(
+    major: u32,
+    dict: &Dictionary,
+    min_ts: i64,
+    max_ts: i64,
+    rows: &[UserIndexObservation],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "postgres {major}: pg_stat_user_indexes section decoded to no rows"
+    );
+
+    for row in rows {
+        ensure_ts_in_segment_range(major, "section 1_014", row.ts, min_ts, max_ts)?;
+    }
+
+    // The probe table has a primary key, so both seeded databases must contribute
+    // its pkey index. datname is the discriminator: the index name is identical.
+    let mut seeded_with_pkey: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for row in rows {
+        let datname = resolve_string(major, dict, "datname", row.datname.0)?;
+        let schemaname = resolve_string(major, dict, "schemaname", row.schemaname.0)?;
+        let indexrelname = resolve_string(major, dict, "indexrelname", row.indexrelname.0)?;
+        let amname = resolve_string(major, dict, "amname", row.amname.0)?;
+        let indexdef = resolve_string(major, dict, "indexdef", row.indexdef.0)?;
+        anyhow::ensure!(
+            !schemaname.is_empty(),
+            "postgres {major}: schemaname resolved to an empty string"
+        );
+        if indexrelname == b"kronika_ut_probe_pkey"
+            && SEEDED_DATABASES
+                .iter()
+                .any(|name| name.as_bytes() == datname.as_slice())
+        {
+            anyhow::ensure!(
+                row.indisprimary,
+                "postgres {major}: kronika_ut_probe_pkey is not flagged as a primary key"
+            );
+            anyhow::ensure!(
+                amname == b"btree",
+                "postgres {major}: kronika_ut_probe_pkey amname is not btree"
+            );
+            anyhow::ensure!(
+                indexdef.windows(6).any(|w| w == b"CREATE"),
+                "postgres {major}: kronika_ut_probe_pkey indexdef is not a CREATE statement"
+            );
+            seeded_with_pkey.insert(datname);
+        }
+    }
+    for datname in SEEDED_DATABASES {
+        anyhow::ensure!(
+            seeded_with_pkey.contains(datname.as_bytes()),
+            "postgres {major}: no kronika_ut_probe_pkey row for database {datname}"
         );
     }
     Ok(())
