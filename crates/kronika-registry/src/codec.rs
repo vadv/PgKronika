@@ -5,8 +5,10 @@ use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, LazyLock};
 
+use arrow_array::builder::{Int32Builder, ListBuilder};
+use arrow_array::types::Int32Type;
 use arrow_array::{
-    Array, ArrayRef, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch,
+    Array, ArrayRef, ArrowPrimitiveType, BooleanArray, ListArray, PrimitiveArray, RecordBatch,
     RecordBatchReader,
 };
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};
@@ -249,6 +251,9 @@ fn build_arrow_schema(contract: &TypeContract) -> SchemaRef {
                 ColumnType::F32 => DataType::Float32,
                 ColumnType::F64 => DataType::Float64,
                 ColumnType::Bool => DataType::Boolean,
+                ColumnType::ListI32 => {
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+                }
             };
             Field::new(column.name, data_type, column.nullable)
         })
@@ -273,6 +278,62 @@ fn schema_matches(got: &Schema, contract: &TypeContract) -> bool {
 #[must_use]
 pub fn write_required<T: ArrowPrimitiveType>(values: impl Iterator<Item = T::Native>) -> ArrayRef {
     Arc::new(PrimitiveArray::<T>::from_iter_values(values))
+}
+
+/// Build an Arrow `List<Int32>` column, one list per row (empty vec = empty
+/// list, never `NULL`).
+#[must_use]
+pub fn write_list_i32(rows: impl Iterator<Item = Vec<i32>>) -> ArrayRef {
+    let mut builder = ListBuilder::new(Int32Builder::new());
+    for row in rows {
+        for value in row {
+            builder.values().append_value(value);
+        }
+        builder.append(true);
+    }
+    Arc::new(builder.finish())
+}
+
+/// A decoded `List<Int32>` column.
+#[derive(Debug)]
+pub struct ListColumn<'a> {
+    array: &'a ListArray,
+}
+
+impl ListColumn<'_> {
+    /// The list at row `i` as an owned `Vec<i32>`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is out of bounds for the column.
+    #[must_use]
+    pub fn value(&self, i: usize) -> Vec<i32> {
+        let values = self.array.value(i);
+        let ints = values
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Int32Type>>()
+            .expect("list child is Int32");
+        (0..ints.len()).map(|j| ints.value(j)).collect()
+    }
+}
+
+/// Borrow a `List<Int32>` column by name.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when the column is missing or is not a `List<Int32>`.
+pub fn read_list_i32<'a>(
+    batch: &'a RecordBatch,
+    name: &'static str,
+) -> Result<ListColumn<'a>, CodecError> {
+    let column = batch
+        .column_by_name(name)
+        .ok_or(CodecError::MissingColumn { name })?;
+    let array = column
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or(CodecError::ColumnType { name })?;
+    Ok(ListColumn { array })
 }
 
 /// Build a nullable primitive column; `None` becomes a `NULL` cell.
@@ -730,6 +791,57 @@ pub fn opt_bool(array: &BooleanArray, i: usize) -> Option<bool> {
         None
     } else {
         Some(array.value(i))
+    }
+}
+
+#[cfg(test)]
+mod list_i32_tests {
+    use std::sync::Arc;
+
+    use arrow_array::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::{read_list_i32, write_list_i32};
+
+    #[test]
+    fn list_i32_roundtrips() {
+        let arr = write_list_i32(vec![vec![1, 2, 3], vec![], vec![0, 7]].into_iter());
+        let field = Field::new(
+            "blocked_by",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            false,
+        );
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr]).expect("batch");
+        let col = read_list_i32(&batch, "blocked_by").expect("read");
+        assert_eq!(col.value(0), vec![1, 2, 3]);
+        assert_eq!(col.value(1), Vec::<i32>::new());
+        assert_eq!(col.value(2), vec![0, 7]);
+    }
+
+    #[test]
+    fn derive_list_i32_section_roundtrips() {
+        use crate::Ts;
+
+        #[derive(Debug, Clone, PartialEq, Eq, crate::Section)]
+        #[section(id = 1_099_002, name = "list_probe", semantics = snapshot_full, sort_key("ts"))]
+        struct Probe {
+            #[column(t)]
+            ts: Ts,
+            #[column(l)]
+            edges: Vec<i32>,
+        }
+
+        crate::assert_roundtrips(&[
+            Probe {
+                ts: Ts(10),
+                edges: vec![1, 2],
+            },
+            Probe {
+                ts: Ts(20),
+                edges: vec![],
+            },
+        ]);
     }
 }
 

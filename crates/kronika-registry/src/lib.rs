@@ -23,10 +23,10 @@ mod sealed {
 }
 
 pub use codec::{
-    CodecError, DecodeStats, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
-    VerifiedSection, arrow_schema, nullable_bool, nullable_column, opt_bool, opt_primitive,
-    required_bool, required_column, write_bool, write_bool_nullable, write_nullable,
-    write_required,
+    CodecError, DecodeStats, DecodedSection, ListColumn, MAX_ROW_GROUPS, MAX_SECTION_BYTES,
+    MAX_SECTION_ROWS, VerifiedSection, arrow_schema, nullable_bool, nullable_column, opt_bool,
+    opt_primitive, read_list_i32, required_bool, required_column, write_bool, write_bool_nullable,
+    write_list_i32, write_nullable, write_required,
 };
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{

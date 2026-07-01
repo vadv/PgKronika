@@ -164,6 +164,22 @@ fn parse_column(field: &syn::Field) -> syn::Result<ColumnDef> {
     let column_class = column_class(&class_ident)?;
 
     let (inner, nullable) = unwrap_option(&field.ty);
+
+    // `Vec<i32>` is not a bare ident, so it has its own branch: a list column is
+    // never NULL (an empty vec is an empty list) and needs no Arrow scalar type
+    // or wrapper.
+    if is_vec_i32(inner) {
+        return Ok(ColumnDef {
+            name: field_ident.to_string(),
+            field: field_ident,
+            column_type: Ident::new("ListI32", Span::call_site()),
+            column_class,
+            arrow_type: None,
+            wrapper: None,
+            nullable: false,
+        });
+    }
+
     let inner_ident = type_ident(inner)?;
     let (column_type, arrow_type, wrapper) = map_type(&inner_ident, &column_class)?;
 
@@ -255,6 +271,25 @@ fn unwrap_option(ty: &Type) -> (&Type, bool) {
     (ty, false)
 }
 
+/// True for a `Vec<i32>` field type.
+fn is_vec_i32(ty: &Type) -> bool {
+    let Type::Path(path) = ty else { return false };
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Vec" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    matches!(
+        args.args.first(),
+        Some(syn::GenericArgument::Type(inner))
+            if type_ident(inner).is_ok_and(|ident| ident == "i32")
+    )
+}
+
 /// The single path-segment ident of a simple type like `i64`.
 fn type_ident(ty: &Type) -> syn::Result<Ident> {
     if let Type::Path(path) = ty
@@ -325,6 +360,11 @@ fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
     // input; keep the row-slice API until benchmarks say otherwise.
     let builders = columns.iter().map(|c| {
         let field = &c.field;
+        if c.column_type == "ListI32" {
+            return quote! {
+                ::kronika_registry::write_list_i32(rows.iter().map(|r| r.#field.clone()))
+            };
+        }
         let values = match (&c.wrapper, c.nullable) {
             (None, _) => quote! { rows.iter().map(|r| r.#field) },
             (Some(_), false) => quote! { rows.iter().map(|r| r.#field.0) },
@@ -384,6 +424,9 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
 
     let bindings = columns.iter().zip(&cols).map(|(c, col)| {
         let name = &c.name;
+        if c.column_type == "ListI32" {
+            return quote! { let #col = ::kronika_registry::read_list_i32(#batch, #name)?; };
+        }
         match (&c.arrow_type, c.nullable) {
             // Required primitive: rebind to the values slice, so the row loop
             // gathers by `slice[i]` (one bounds-check the optimizer can hoist)
@@ -407,6 +450,9 @@ fn build_decode(struct_name: &Ident, columns: &[ColumnDef]) -> TokenStream2 {
 
     let cells = columns.iter().zip(&cols).map(|(c, col)| {
         let field = &c.field;
+        if c.column_type == "ListI32" {
+            return quote! { #field: #col.value(#idx) };
+        }
         let value = match (&c.wrapper, &c.arrow_type, c.nullable) {
             (Some(w), _, false) => quote! { ::kronika_registry::#w(#col[#idx]) },
             (Some(w), _, true) => quote! {
