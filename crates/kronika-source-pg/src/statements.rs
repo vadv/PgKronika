@@ -2,8 +2,8 @@
 //!
 //! The extension exposes instance-wide rows: one row per `(userid, dbid,
 //! queryid)` and, from extension 1.9, also per `toplevel`. The `dbid`
-//! distinguishes databases, so one query from any database with the extension
-//! installed returns every database's statements. The layout is chosen by the
+//! identifies the execution database, so one query from a database with the
+//! extension installed reads the shared rows. The layout is chosen by the
 //! *extension* version reported by `pg_extension`, not the server major, because
 //! the extension can be pinned independently of the server.
 //!
@@ -818,9 +818,11 @@ pub async fn statements_extversion(
 
 /// Collect a `pg_stat_statements` snapshot from one connection.
 ///
-/// The view is instance-wide, so this runs once against whichever connection has
-/// the extension installed. Returns the raw rows; the caller interns the strings
-/// and builds the typed rows. `max_statements` is the per-axis top-N row count.
+/// Runs against one selected connection with the extension installed.
+///
+/// Returns the raw instance-wide rows; the caller owns source selection, caches
+/// the chosen connection, interns the strings, and builds typed rows.
+/// `max_statements` is the per-axis top-N row count.
 ///
 /// # Errors
 /// Returns the [`tokio_postgres::Error`] if the query fails.
