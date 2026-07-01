@@ -43,6 +43,7 @@ pub mod progress_vacuum;
 
 pub mod replication_instance;
 
+pub mod user_indexes;
 pub mod user_tables;
 
 /// Major version from the `server_version` startup parameter, e.g. `"17.2"` ->

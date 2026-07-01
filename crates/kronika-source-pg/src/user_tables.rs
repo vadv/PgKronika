@@ -63,6 +63,14 @@ pub const fn user_tables_version(major: u32) -> UserTablesVersion {
     }
 }
 
+/// Number of top-N axes every layout unions in `user_tables_query`.
+///
+/// Each version unions six `UNION` branches, each limited to the per-axis top-N:
+/// read activity, write volume, `pg_class.relpages` size, dead tuples,
+/// `age(relfrozenxid)`, and `mxid_age(relminmxid)`. Callers use this to bound
+/// `DEFAULT_MAX_DATABASES * axes * max_tables` against the section row cap.
+pub const TABLE_TOPN_AXES: i64 = 6;
+
 /// The SQL for one layout.
 ///
 /// `$1` is the per-axis top-N row count. Candidate selection is purely

@@ -33,6 +33,7 @@ use kronika_registry::{
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
     pg_stat_progress_vacuum::PgStatProgressVacuum,
+    pg_stat_user_indexes::{PgStatUserIndexesV1, PgStatUserIndexesV2},
     pg_stat_user_tables::{
         PgStatUserTablesV1, PgStatUserTablesV2, PgStatUserTablesV3, PgStatUserTablesV4,
     },
@@ -41,6 +42,7 @@ use kronika_registry::{
 };
 use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::io::{IoVersion, io_version};
+use kronika_source_pg::user_indexes::{UserIndexesVersion, indexdef_max_len, user_indexes_version};
 use kronika_source_pg::user_tables::{UserTablesVersion, user_tables_version};
 use kronika_source_pg::wal::{WalVersion, wal_version};
 use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
@@ -59,6 +61,9 @@ const PG_STAT_USER_TABLES_V1_TYPE_ID: u32 = 1_013_001;
 const PG_STAT_USER_TABLES_V2_TYPE_ID: u32 = 1_013_002;
 const PG_STAT_USER_TABLES_V3_TYPE_ID: u32 = 1_013_003;
 const PG_STAT_USER_TABLES_V4_TYPE_ID: u32 = 1_013_004;
+
+const PG_STAT_USER_INDEXES_V1_TYPE_ID: u32 = 1_014_001;
+const PG_STAT_USER_INDEXES_V2_TYPE_ID: u32 = 1_014_002;
 
 /// Databases seeded by the user-tables scenario; each gets one probe table.
 const SEEDED_DATABASES: [&str; 2] = ["kronika_ut_a", "kronika_ut_b"];
@@ -635,13 +640,19 @@ async fn seed_user_table_database(db: &cluster::Cluster, datname: &str) -> anyho
         .with_context(|| format!("postgres {}: connect to {datname}", db.major()))?;
     let driver = tokio::spawn(connection);
     let result = async {
+        let long_predicate = long_partial_index_predicate();
+        let seed_sql = format!(
+            "CREATE TABLE IF NOT EXISTS kronika_ut_probe (id int primary key, payload text); \
+             INSERT INTO kronika_ut_probe \
+               SELECT g, repeat('x', 16) FROM generate_series(1, 200) g \
+               ON CONFLICT (id) DO NOTHING; \
+             DROP INDEX IF EXISTS kronika_ut_probe_long_idx; \
+             CREATE INDEX kronika_ut_probe_long_idx \
+               ON kronika_ut_probe (lower(payload || '_' || id::text)) \
+               WHERE {long_predicate};",
+        );
         client
-            .batch_execute(
-                "CREATE TABLE IF NOT EXISTS kronika_ut_probe (id int primary key, payload text); \
-                 INSERT INTO kronika_ut_probe \
-                   SELECT g, repeat('x', 16) FROM generate_series(1, 200) g \
-                   ON CONFLICT (id) DO NOTHING;",
-            )
+            .batch_execute(&seed_sql)
             .await
             .with_context(|| format!("postgres {}: seed table in {datname}", db.major()))?;
         // VACUUM cannot run inside a transaction block, and a multi-statement
@@ -650,11 +661,36 @@ async fn seed_user_table_database(db: &cluster::Cluster, datname: &str) -> anyho
         client
             .batch_execute("VACUUM ANALYZE kronika_ut_probe;")
             .await
-            .with_context(|| format!("postgres {}: vacuum analyze in {datname}", db.major()))
+            .with_context(|| format!("postgres {}: vacuum analyze in {datname}", db.major()))?;
+        if db.major() >= 16 {
+            client
+                .batch_execute(
+                    "BEGIN; \
+                     SET LOCAL enable_seqscan = off; \
+                     SELECT payload FROM kronika_ut_probe WHERE id = 1; \
+                     COMMIT;",
+                )
+                .await
+                .with_context(|| format!("postgres {}: scan pkey in {datname}", db.major()))?;
+            client
+                .batch_execute("SELECT pg_stat_force_next_flush();")
+                .await
+                .with_context(|| format!("postgres {}: flush stats in {datname}", db.major()))?;
+        }
+        Ok(())
     }
     .await;
     driver.abort();
     result
+}
+
+/// Build a predicate whose `pg_get_indexdef` text exceeds the collector cap.
+fn long_partial_index_predicate() -> String {
+    // A large IN-list makes old PostgreSQL versions reject the pg_index row as
+    // too wide. One long text constant keeps the catalog tuple smaller while the
+    // deparsed index definition still exceeds the SQL-side cap.
+    let literal = "x".repeat(5_200);
+    format!("payload IS NOT NULL AND payload <> '{literal}'")
 }
 
 /// Database row fields covered by the live BDD matrix for user-tables layouts.
@@ -787,12 +823,247 @@ fn check_user_tables_rows(
     Ok(())
 }
 
+#[then(
+    "each matrix cluster seals pg_stat_user_indexes rows from two seeded databases with dictionary-backed names"
+)]
+async fn every_version_seals_user_indexes(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        for datname in SEEDED_DATABASES {
+            seed_user_table_database(db, datname).await?;
+        }
+        // The collector refreshes the pool on SIGUSR2, so the seeded databases
+        // are enumerated and walked in this snapshot.
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_user_indexes_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Index row fields covered by the live BDD matrix for user-indexes layouts.
+#[derive(Debug, Clone, Copy)]
+struct UserIndexObservation {
+    datname: StrId,
+    schemaname: StrId,
+    indexrelname: StrId,
+    amname: StrId,
+    indexdef: StrId,
+    indisprimary: bool,
+    indisexclusion: bool,
+    indisready: bool,
+    main_fork_bytes: i64,
+    idx_blks_read: i64,
+    idx_blks_hit: i64,
+    /// Scan recency in unix microseconds on V2 (PG16+); `None` on V1 layouts and
+    /// when the index has never been scanned.
+    last_idx_scan: Option<i64>,
+    ts: i64,
+}
+
+/// Decode the sealed `pg_stat_user_indexes` section for the selected layout, then
+/// check one snapshot timestamp, that the two seeded databases both contributed
+/// the probe table's primary-key index, and that the label strings resolve
+/// through the dictionary.
+fn assert_user_indexes_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    let min_ts = segment.catalog().min_ts;
+    let max_ts = segment.catalog().max_ts;
+    let observations = match user_indexes_version(major) {
+        UserIndexesVersion::V2 => decode_section_rows::<PgStatUserIndexesV2>(
+            path,
+            &segment,
+            PG_STAT_USER_INDEXES_V2_TYPE_ID,
+        )
+        .with_context(|| format!("postgres {major}: read back section 1_014_002"))?
+        .iter()
+        .map(|r| UserIndexObservation {
+            datname: r.datname,
+            schemaname: r.schemaname,
+            indexrelname: r.indexrelname,
+            amname: r.amname,
+            indexdef: r.indexdef,
+            indisprimary: r.indisprimary,
+            indisexclusion: r.indisexclusion,
+            indisready: r.indisready,
+            main_fork_bytes: r.main_fork_bytes,
+            idx_blks_read: r.idx_blks_read,
+            idx_blks_hit: r.idx_blks_hit,
+            last_idx_scan: r.last_idx_scan.map(|t| t.0),
+            ts: r.ts.0,
+        })
+        .collect::<Vec<_>>(),
+        UserIndexesVersion::V1 => decode_section_rows::<PgStatUserIndexesV1>(
+            path,
+            &segment,
+            PG_STAT_USER_INDEXES_V1_TYPE_ID,
+        )
+        .with_context(|| format!("postgres {major}: read back section 1_014_001"))?
+        .iter()
+        .map(|r| UserIndexObservation {
+            datname: r.datname,
+            schemaname: r.schemaname,
+            indexrelname: r.indexrelname,
+            amname: r.amname,
+            indexdef: r.indexdef,
+            indisprimary: r.indisprimary,
+            indisexclusion: r.indisexclusion,
+            indisready: r.indisready,
+            main_fork_bytes: r.main_fork_bytes,
+            idx_blks_read: r.idx_blks_read,
+            idx_blks_hit: r.idx_blks_hit,
+            last_idx_scan: None,
+            ts: r.ts.0,
+        })
+        .collect::<Vec<_>>(),
+    };
+    check_user_indexes_rows(major, &dict, min_ts, max_ts, &observations)
+}
+
+/// Shared invariants over the decoded user-indexes rows.
+fn check_user_indexes_rows(
+    major: u32,
+    dict: &Dictionary,
+    min_ts: i64,
+    max_ts: i64,
+    rows: &[UserIndexObservation],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "postgres {major}: pg_stat_user_indexes section decoded to no rows"
+    );
+
+    for row in rows {
+        ensure_ts_in_segment_range(major, "section 1_014", row.ts, min_ts, max_ts)?;
+        // The buffer counters are COALESCE'd to 0 in SQL, so they always decode as
+        // a non-negative i64 even when pg_statio has no row yet.
+        anyhow::ensure!(
+            row.idx_blks_read >= 0 && row.idx_blks_hit >= 0,
+            "postgres {major}: an index buffer counter came back negative"
+        );
+        // last_idx_scan is a V2-only column; it must be absent below PG16.
+        if major < 16 {
+            anyhow::ensure!(
+                row.last_idx_scan.is_none(),
+                "postgres {major}: pre-PG16 row carries a last_idx_scan value"
+            );
+        }
+    }
+
+    // The probe table has a primary key, so both seeded databases must contribute
+    // its pkey index. datname is the discriminator: the index name is identical.
+    let mut seeded_with_pkey: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    // The long-expression index must also survive, with its (truncated) definition
+    // resolving to a non-empty CREATE statement.
+    let mut seeded_with_long_index: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::new();
+    for row in rows {
+        let datname = resolve_string(major, dict, "datname", row.datname.0)?;
+        let schemaname = resolve_string(major, dict, "schemaname", row.schemaname.0)?;
+        let indexrelname = resolve_string(major, dict, "indexrelname", row.indexrelname.0)?;
+        let amname = resolve_string(major, dict, "amname", row.amname.0)?;
+        let indexdef = resolve_dictionary_bytes(major, dict, "indexdef", row.indexdef.0)?;
+        anyhow::ensure!(
+            !schemaname.is_empty(),
+            "postgres {major}: schemaname resolved to an empty string"
+        );
+        let seeded = SEEDED_DATABASES
+            .iter()
+            .any(|name| name.as_bytes() == datname.as_slice());
+        if indexrelname == b"kronika_ut_probe_pkey" && seeded {
+            anyhow::ensure!(
+                row.indisprimary,
+                "postgres {major}: kronika_ut_probe_pkey is not flagged as a primary key"
+            );
+            // A plain primary key is a ready, non-exclusion index.
+            anyhow::ensure!(
+                !row.indisexclusion,
+                "postgres {major}: a plain pkey is flagged as an exclusion index"
+            );
+            anyhow::ensure!(
+                row.indisready,
+                "postgres {major}: a live pkey is not flagged as ready"
+            );
+            anyhow::ensure!(
+                amname == b"btree",
+                "postgres {major}: kronika_ut_probe_pkey amname is not btree"
+            );
+            anyhow::ensure!(
+                indexdef.windows(6).any(|w| w == b"CREATE"),
+                "postgres {major}: kronika_ut_probe_pkey indexdef is not a CREATE statement"
+            );
+            // The probe table carries rows, so its pkey has real storage.
+            anyhow::ensure!(
+                row.main_fork_bytes > 0,
+                "postgres {major}: kronika_ut_probe_pkey main_fork_bytes is not positive"
+            );
+            if major >= 16 {
+                anyhow::ensure!(
+                    row.last_idx_scan.is_some(),
+                    "postgres {major}: kronika_ut_probe_pkey has no last_idx_scan after a forced pkey scan"
+                );
+            }
+            seeded_with_pkey.insert(datname.clone());
+        }
+        if indexrelname == b"kronika_ut_probe_long_idx" && seeded {
+            anyhow::ensure!(
+                !indexdef.is_empty() && indexdef.windows(6).any(|w| w == b"CREATE"),
+                "postgres {major}: kronika_ut_probe_long_idx indexdef did not survive truncation"
+            );
+            let indexdef_cap =
+                usize::try_from(indexdef_max_len()).context("indexdef cap fits usize")?;
+            anyhow::ensure!(
+                indexdef.len() == indexdef_cap,
+                "postgres {major}: kronika_ut_probe_long_idx indexdef len {} is not the cap {indexdef_cap}",
+                indexdef.len()
+            );
+            if major >= 16 {
+                anyhow::ensure!(
+                    row.last_idx_scan.is_none(),
+                    "postgres {major}: never-scanned kronika_ut_probe_long_idx has last_idx_scan"
+                );
+            }
+            seeded_with_long_index.insert(datname);
+        }
+    }
+    for datname in SEEDED_DATABASES {
+        anyhow::ensure!(
+            seeded_with_pkey.contains(datname.as_bytes()),
+            "postgres {major}: no kronika_ut_probe_pkey row for database {datname}"
+        );
+        anyhow::ensure!(
+            seeded_with_long_index.contains(datname.as_bytes()),
+            "postgres {major}: no kronika_ut_probe_long_idx row for database {datname}"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve a dictionary id to its bytes or fail with context.
 fn resolve_string(major: u32, dict: &Dictionary, label: &str, id: u64) -> anyhow::Result<Vec<u8>> {
     match dict.resolve(id) {
         Some(Resolved::String(bytes)) => Ok(bytes.to_vec()),
         other => anyhow::bail!(
             "postgres {major}: {label} str_id {id} did not resolve to a string: {other:?}"
+        ),
+    }
+}
+
+/// Resolve a dictionary id stored either in `dict.strings` or `dict.blobs`.
+fn resolve_dictionary_bytes(
+    major: u32,
+    dict: &Dictionary,
+    label: &str,
+    id: u64,
+) -> anyhow::Result<Vec<u8>> {
+    match dict.resolve(id) {
+        Some(Resolved::String(bytes) | Resolved::Blob { bytes, .. }) => Ok(bytes.to_vec()),
+        other => anyhow::bail!(
+            "postgres {major}: {label} str_id {id} did not resolve to bytes: {other:?}"
         ),
     }
 }
