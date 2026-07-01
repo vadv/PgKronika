@@ -5,7 +5,7 @@
 //! and the directed edges are carried in the `blocked_by` list column
 //! (`pg_blocking_pids(pid)` deduplicated). Roots have an empty `blocked_by`.
 //! `depth` is the distance from a root in the blocking component (`min(depth)`
-//! shortest path); a convenience scalar, `blocked_by` is authoritative.
+//! shortest path); `blocked_by` carries the edge set.
 //! `root_pid` identifies which root anchors this node's blocking component.
 //!
 //! The section splits into two layout versions because `waitstart` was added to
@@ -36,7 +36,7 @@ pub struct PgLocksV2 {
     #[column(l)]
     pub blocked_by: Vec<i32>,
     /// Distance from a root in the blocking component (`min(depth)` shortest
-    /// path); a convenience scalar, `blocked_by` is authoritative.
+    /// path); `blocked_by` carries the edge set.
     #[column(g)]
     pub depth: i32,
     /// A root of this node's blocking component.
@@ -118,7 +118,7 @@ pub struct PgLocksV2 {
     /// Whether the awaited lock was taken via the fast path.
     #[column(l)]
     pub lock_fastpath: Option<bool>,
-    /// Human-readable target (rpglot-style), best effort.
+    /// Human-readable target, best effort.
     #[column(l)]
     pub lock_target: Option<StrId>,
     /// Lock-wait start (PG14+); nullable even while waiting.
@@ -147,7 +147,7 @@ pub struct PgLocksV1 {
     #[column(l)]
     pub blocked_by: Vec<i32>,
     /// Distance from a root in the blocking component (`min(depth)` shortest
-    /// path); a convenience scalar, `blocked_by` is authoritative.
+    /// path); `blocked_by` carries the edge set.
     #[column(g)]
     pub depth: i32,
     /// A root of this node's blocking component.
@@ -229,7 +229,7 @@ pub struct PgLocksV1 {
     /// Whether the awaited lock was taken via the fast path.
     #[column(l)]
     pub lock_fastpath: Option<bool>,
-    /// Human-readable target (rpglot-style), best effort.
+    /// Human-readable target, best effort.
     #[column(l)]
     pub lock_target: Option<StrId>,
 }

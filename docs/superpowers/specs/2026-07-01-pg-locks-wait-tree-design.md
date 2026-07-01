@@ -3,8 +3,8 @@
 **Goal:** record the PostgreSQL lock-wait blocking graph as raw data. The
 read-side analyzer or web reader reconstructs and visualizes the wait tree from
 the stored nodes, edges, and lock context. This is an instance-wide (class A)
-metric. Compared with rpglot's single version-agnostic query, this design keeps
-transitive edges, multi-blocker fan-out, and PG14+ `waitstart`.
+metric. The section preserves transitive edges, multi-blocker fan-out, and PG14+
+`waitstart`.
 
 **Non-goal (read side, out of scope):** tree layout, urgency coloring,
 "kill/wait" verdicts, cycle detection, and deadlock reporting. The collector is
@@ -18,7 +18,7 @@ timeline, and table.
   `waitstart`, added in PG14):
   - `1_011_001` - PG10-13 (no `waitstart`; the read side derives wait duration
     from `state_change` or `query_start`).
-  - `1_011_002` - PG14-18 (adds `waitstart`, the authoritative lock-wait start).
+  - `1_011_002` - PG14-18 (adds `waitstart`, the recorded lock-wait start).
   The `locktype` value-domain changes (`speculative token` -> `spectoken` in
   PG13, `applytransaction` in PG16) are data changes, not schema forks. They are
   values of an existing column and are recorded verbatim.
@@ -34,18 +34,17 @@ timeline, and table.
 `pg_blocking_pids(pid)` returns an array: a waiter can have several blockers, and
 a snapshot can contain a cycle before PostgreSQL resolves a deadlock. The section
 stores a directed graph, not a single-parent tree. Acyclic snapshots can be
-rendered as forests or DAGs, but the authoritative model is the edge list.
+rendered as forests or DAGs; readers should use the edge list as the graph.
 
 - **One row per backend** in the blocking component: waiters and their transitive
   blockers up to the roots, including holders that are not themselves waiting.
 - **`blocked_by`** - the full deduplicated `pg_blocking_pids(pid)` value as a
-  **`list<i32>` column**. This stores the raw edges and requires codec support
-  for array columns (see "Codec prerequisite"). The array may contain `0`, which
+  **`list<i32>` column**. This stores the raw edges and uses registry codec
+  support for array columns (see "Codec support"). The array may contain `0`, which
   means a prepared-transaction holder with no live backend.
-- **`depth` and `root_pid`** - traversal-derived convenience scalars. They let the
+- **`depth` and `root_pid`** - traversal-derived fields. They let the
   reader build a simple tree layout without client-side recursion. For DAG nodes,
-  they describe the primary path; `blocked_by` remains the authoritative edge
-  set.
+  they describe the primary path; `blocked_by` remains the edge set.
 - Because `blocked_by` is `Vec<i32>`, the row struct is `Clone` but not `Copy`
   (unlike rows for other metrics). It can derive `Eq` because it has no `f64`
   fields.
@@ -61,7 +60,7 @@ rendered as forests or DAGs, but the authoritative model is the edge list.
   This is a common blocking case. `pg_blocking_pids` resolves the edge, and
   recording `locktype`, `transactionid`, `mode`, and the holder's `backend_xid`
   lets the analyzer explain it as a row-lock wait rather than a table-lock wait.
-- advisory locks; they are heavyweight locks and are fully resolved.
+- advisory locks; they are heavyweight locks resolved by `pg_blocking_pids`.
 
 **OUT**:
 
@@ -74,9 +73,9 @@ rendered as forests or DAGs, but the authoritative model is the edge list.
 - **Deadlocks** - periodic snapshots do not report deadlocks. PostgreSQL's
   detector usually breaks the cycle after `deadlock_timeout` (default 1 s), and a
   snapshot cannot identify the victim. Deadlocks belong in logs
-  (`log_lock_waits` and the deadlock report). The collector still must be
-  cycle-safe: if a cycle is sampled before resolution, it appears as mutual
-  `blocked_by` edges, and the recursive query must terminate.
+  (`log_lock_waits` and the deadlock report). If a cycle is sampled before
+  resolution, it appears as mutual `blocked_by` edges; the recursive query keeps
+  traversal bounded.
 
 ## Columns (`1_011_002` superset; `1_011_001` = same minus `waitstart`)
 
@@ -90,8 +89,8 @@ Node and backend context (from `pg_stat_activity`):
 ts                 ts        T
 pid                i32       L
 blocked_by         list<i32> L   // deduped pg_blocking_pids; [] for roots; may contain 0 (prepared xact)
-depth              i32       G   // distance from a root (convenience, from CTE)
-root_pid           i32       L   // a root of this node's component (convenience)
+depth              i32       G   // distance from a root, from the CTE
+root_pid           i32       L   // a root of this node's component
 datid              u32       L
 datname            str       L
 usename            str?      L   // NULL for some background backends
@@ -123,21 +122,19 @@ lock_page          i32?      G
 lock_tuple         i16?      G
 lock_transactionid i64?      L   // xid being waited on (row-lock pattern); raw xid
 lock_fastpath      bool?     L
-lock_target        str?      L   // human-readable target (rpglot-style), best effort
-waitstart          ts?       G   // PG14+ (1_011_002 only); exact lock-wait start; nullable even when granted = false
+lock_target        str?      L   // human-readable target, best effort
+waitstart          ts?       G   // PG14+ (1_011_002 only); recorded lock-wait start; nullable even when granted = false
 ```
 
 **Cross-database relname limitation:** `pg_locks` is cluster-wide, but `pg_class`
 is per database. A relation lock in another database can be recorded only as
 `lock_relation` (OID) plus `datid`; `lock_relname` is resolved only for relations
 in the connected database and is NULL otherwise. Raw OID and `datid` are always
-recorded. The reader can resolve names if it has per-database catalogs. rpglot has
-the same limitation.
+recorded. The reader can resolve names if it has per-database catalogs.
 
 ## Collection mechanics
 
-Collection has two stages. The shape is similar to rpglot's collector, but uses
-version-specific queries:
+Collection has two stages:
 
 1. **Precheck (cheap):** `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE
    wait_event_type = 'Lock')`. If there are no lock waits, no section is written.
@@ -145,7 +142,7 @@ version-specific queries:
    `wait_event_type = 'Lock'`; compute each waiter's `pg_blocking_pids(pid)`;
    climb transitively to the roots; gather every backend in the component; join
    `pg_stat_activity` for node context, `LEFT JOIN pg_locks` for the awaited
-   `granted = false` lock, and `LEFT JOIN pg_class`/`pg_database` for best-effort
+   `granted = false` lock, and `LEFT JOIN pg_class`/`pg_database` for available
    names. Apply the max-rows cap with `LIMIT`.
 
 - Call `pg_blocking_pids` only for backends that are waiting on `Lock`, not for
@@ -158,10 +155,9 @@ version-specific queries:
   Startup validation keeps it under `MAX_SECTION_ROWS` (65536).
 - The query is wrapped in the file's `marked!` macro for SQL transparency.
 
-## Codec prerequisite - `list<i32>` column support
+## Codec support - `list<i32>` columns
 
-The registry codec currently supports only scalar columns. `blocked_by` requires
-an Arrow `List<Int32>` column. This adds prerequisite work:
+`blocked_by` uses an Arrow `List<Int32>` column. This requires:
 
 - a new column class or type in the `#[derive(Section)]` macro for `Vec<i32>`;
 - encode (`ListArray` builder) and decode paths in `codec.rs`;
@@ -192,14 +188,3 @@ answers, cycle verdicts, or deadlock verdicts. `depth`, `root_pid`, any
 `is_cycle`-style interpretation, and urgency coloring belong in the analyzer or
 reader. The collector records raw nodes, raw `blocked_by` edges, and raw
 `pg_locks` context.
-
-## Differences from rpglot
-
-- explicit `blocked_by` edges (rpglot stores only `depth` and `root_pid`, which
-  cannot reconstruct the exact graph or fan-out);
-- `waitstart` (PG14+) for exact wait duration;
-- `backend_xid_age` and `backend_xmin_age` for long-held transaction and
-  vacuum-horizon context;
-- lock semantics that keep the row-lock `transactionid` pattern legible, exclude
-  `LWLock` and `SIReadLock`, and use cycle-safe traversal instead of a
-  `wait_event_type = 'Lock'` self-join.

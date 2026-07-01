@@ -3,7 +3,7 @@ Feature: Collector reads the pg_locks wait tree
   blocking component gets one row, and the directed edges live in the blocked_by
   list. A waiter points at the backend that blocks it; the blocker is a root with
   an empty blocked_by. An idle cluster has no waits, so the section is absent. The
-  live matrix covers PG 14-18 (the PG10-13 layout is covered by a codec golden).
+  Live BDD covers PG 14-18; codec tests cover the PG10-13 layout.
 
   Scenario: a blocking chain is recorded as a wait tree
     Given the PostgreSQL matrix is booted

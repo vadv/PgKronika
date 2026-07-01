@@ -186,8 +186,8 @@ pub struct LocksRow {
     pub pid: i32,
     /// Deduped `pg_blocking_pids(pid)`; empty for roots; may contain `0`.
     pub blocked_by: Vec<i32>,
-    /// Distance from a root in the blocking component (`min(depth)`); a
-    /// convenience scalar for the primary path, `blocked_by` stays authoritative.
+    /// Distance from a root in the blocking component (`min(depth)`);
+    /// `blocked_by` carries the edge set.
     pub depth: i32,
     /// A root of this node's blocking component.
     pub root_pid: i32,
