@@ -10,24 +10,44 @@
 //! is never dropped. The union also captures never-used indexes through the size
 //! axis (`pg_class.relpages`), so the analyzer can flag them from the recorded
 //! `relpages` and `idx_scan` without the collector passing a `WHERE idx_scan = 0`
-//! verdict. Collection returns owned rows; the caller interns the strings into
-//! the segment dictionary. The typed layout lives in `kronika-registry`
-//! (`PgStatUserIndexesV1`..`V2`).
+//! verdict. Each axis breaks ties on `indexrelid` for a stable top-N. On PG16+ a
+//! scan-recency axis (`last_idx_scan`) is added, filtered to indexes that have
+//! been scanned so it never fills its slots with never-scanned indexes. Collection
+//! returns owned rows; the caller interns the strings into the segment dictionary.
+//! The typed layout lives in `kronika-registry` (`PgStatUserIndexesV1`..`V2`).
 
 use kronika_registry::pg_stat_user_indexes::{PgStatUserIndexesV1, PgStatUserIndexesV2};
 use kronika_registry::{StrId, Ts};
 use tokio_postgres::Client;
 
-/// Prefix a query literal with the kronika marker (SQL-transparency rule).
+/// Prefix a query (one or more literal fragments) with the kronika marker
+/// (SQL-transparency rule). Multiple fragments let a shared literal, such as the
+/// indexdef cap, be spliced into the middle of the query at compile time.
 macro_rules! marked {
-    ($sql:literal) => {
+    ($($sql:expr),+ $(,)?) => {
         concat!(
             "/* pg_kronika:",
             env!("CARGO_PKG_VERSION"),
             " crates/kronika-source-pg/src/user_indexes.rs */ ",
-            $sql,
+            $($sql),+
         )
     };
+}
+
+/// Cap on the `pg_get_indexdef` text, bounding the String before tokio-postgres
+/// materializes it (a partial index over a large expression can be arbitrarily
+/// long). Consistent with query-text truncation elsewhere. The literal is shared
+/// with the SQL through [`indexdef_max_len`].
+macro_rules! indexdef_max_len {
+    () => {
+        "5000"
+    };
+}
+
+/// The `pg_get_indexdef` text cap, as an integer for tests and callers.
+#[must_use]
+pub const fn indexdef_max_len() -> i64 {
+    5000
 }
 
 /// The `pg_stat_user_indexes` layout selected by the server major version.
@@ -51,42 +71,46 @@ pub const fn user_indexes_version(major: u32) -> UserIndexesVersion {
     }
 }
 
-/// The SQL for one layout.
+/// Worst-case number of top-N axes any layout unions in `user_indexes_query`.
 ///
-/// `$1` is the per-axis top-N row count. Candidate selection is purely
-/// mechanical — the union of top-N indexes by raw columns (scan count, tuples
-/// read, size). The size axis (`pg_class.relpages`) keeps a large but unused
-/// index, so the analyzer can derive "big and never scanned" from the recorded
-/// `relpages` and `idx_scan`; the collector applies no threshold and no
-/// `WHERE idx_scan = 0` verdict. V2 adds a scan-recency axis
-/// (`last_idx_scan DESC NULLS LAST`). `ts` is one `statement_timestamp()` for the
-/// snapshot; `last_idx_scan` comes back as unix microseconds.
+/// V2 (PG16+) has the most: `idx_scan`, `idx_tup_read`, `pg_class.relpages`, and
+/// `last_idx_scan` recency — four `UNION` branches, each limited to the per-axis
+/// top-N. Callers use this to bound `DEFAULT_MAX_DATABASES * axes * max_indexes`
+/// against the section row cap.
+pub const INDEX_TOPN_AXES: i64 = 4;
+
+/// The SQL for one layout; `$1` is the per-axis top-N row count. See the module
+/// doc for the candidate-selection rationale.
 #[must_use]
 pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
     match version {
         UserIndexesVersion::V1 => marked!(
             "WITH candidates AS ( \
-               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_scan, 0) DESC LIMIT $1) \
+               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_scan, 0) DESC, indexrelid LIMIT $1) \
                UNION \
-               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_tup_read, 0) DESC LIMIT $1) \
+               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_tup_read, 0) DESC, indexrelid LIMIT $1) \
                UNION \
                (SELECT i.indexrelid FROM pg_stat_user_indexes i JOIN pg_class c ON c.oid = i.indexrelid \
-                  ORDER BY c.relpages DESC LIMIT $1) \
+                  ORDER BY c.relpages DESC, i.indexrelid LIMIT $1) \
              ) \
              SELECT \
                (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())::oid AS datid, \
                i.indexrelid, i.relid, \
                i.schemaname::text AS schemaname, i.relname::text AS relname, \
                i.indexrelname::text AS indexrelname, \
-               COALESCE(ts.spcname, 'pg_default')::text AS tablespace, \
+               COALESCE(ts.spcname, (SELECT spcname FROM pg_catalog.pg_tablespace WHERE oid = (SELECT dattablespace FROM pg_catalog.pg_database WHERE datname = current_database())))::text AS tablespace, \
                i.idx_scan, i.idx_tup_read, i.idx_tup_fetch, \
                pg_relation_size(i.indexrelid)::int8 AS main_fork_bytes, \
                COALESCE(ix.indisunique, false) AS indisunique, \
                COALESCE(ix.indisprimary, false) AS indisprimary, \
                COALESCE(ix.indisvalid, false) AS indisvalid, \
+               COALESCE(ix.indisexclusion, false) AS indisexclusion, \
+               COALESCE(ix.indisready, false) AS indisready, \
                COALESCE(am.amname, '')::text AS amname, \
-               COALESCE(pg_get_indexdef(i.indexrelid), '')::text AS indexdef, \
-               io.idx_blks_read, io.idx_blks_hit, \
+               COALESCE(left(pg_get_indexdef(i.indexrelid), ",
+            indexdef_max_len!(),
+            "), '')::text AS indexdef, \
+               COALESCE(io.idx_blks_read, 0) AS idx_blks_read, COALESCE(io.idx_blks_hit, 0) AS idx_blks_hit, \
                (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
              FROM pg_stat_user_indexes i \
              JOIN candidates cand ON cand.indexrelid = i.indexrelid \
@@ -98,30 +122,35 @@ pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
         ),
         UserIndexesVersion::V2 => marked!(
             "WITH candidates AS ( \
-               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_scan, 0) DESC LIMIT $1) \
+               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_scan, 0) DESC, indexrelid LIMIT $1) \
                UNION \
-               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_tup_read, 0) DESC LIMIT $1) \
+               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY COALESCE(idx_tup_read, 0) DESC, indexrelid LIMIT $1) \
                UNION \
                (SELECT i.indexrelid FROM pg_stat_user_indexes i JOIN pg_class c ON c.oid = i.indexrelid \
-                  ORDER BY c.relpages DESC LIMIT $1) \
+                  ORDER BY c.relpages DESC, i.indexrelid LIMIT $1) \
                UNION \
-               (SELECT indexrelid FROM pg_stat_user_indexes ORDER BY last_idx_scan DESC NULLS LAST LIMIT $1) \
+               (SELECT indexrelid FROM pg_stat_user_indexes WHERE last_idx_scan IS NOT NULL \
+                  ORDER BY last_idx_scan DESC, indexrelid LIMIT $1) \
              ) \
              SELECT \
                (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())::oid AS datid, \
                i.indexrelid, i.relid, \
                i.schemaname::text AS schemaname, i.relname::text AS relname, \
                i.indexrelname::text AS indexrelname, \
-               COALESCE(ts.spcname, 'pg_default')::text AS tablespace, \
+               COALESCE(ts.spcname, (SELECT spcname FROM pg_catalog.pg_tablespace WHERE oid = (SELECT dattablespace FROM pg_catalog.pg_database WHERE datname = current_database())))::text AS tablespace, \
                i.idx_scan, i.idx_tup_read, i.idx_tup_fetch, \
                pg_relation_size(i.indexrelid)::int8 AS main_fork_bytes, \
                (extract(epoch from i.last_idx_scan) * 1e6)::int8 AS last_idx_scan_us, \
                COALESCE(ix.indisunique, false) AS indisunique, \
                COALESCE(ix.indisprimary, false) AS indisprimary, \
                COALESCE(ix.indisvalid, false) AS indisvalid, \
+               COALESCE(ix.indisexclusion, false) AS indisexclusion, \
+               COALESCE(ix.indisready, false) AS indisready, \
                COALESCE(am.amname, '')::text AS amname, \
-               COALESCE(pg_get_indexdef(i.indexrelid), '')::text AS indexdef, \
-               io.idx_blks_read, io.idx_blks_hit, \
+               COALESCE(left(pg_get_indexdef(i.indexrelid), ",
+            indexdef_max_len!(),
+            "), '')::text AS indexdef, \
+               COALESCE(io.idx_blks_read, 0) AS idx_blks_read, COALESCE(io.idx_blks_hit, 0) AS idx_blks_hit, \
                (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
              FROM pg_stat_user_indexes i \
              JOIN candidates cand ON cand.indexrelid = i.indexrelid \
@@ -138,6 +167,10 @@ pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
 ///
 /// Numbers are owned directly; strings are interned by the caller. Columns
 /// absent from the version are `None`. See [`PgStatUserIndexesV2`] for meaning.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent pg_index flag column, not interdependent state"
+)]
 #[derive(Debug, Clone)]
 pub struct UserIndexesRow {
     /// Snapshot time, unix microseconds.
@@ -154,7 +187,7 @@ pub struct UserIndexesRow {
     pub relname: String,
     /// Index name.
     pub indexrelname: String,
-    /// Tablespace name (`pg_default` for the default tablespace).
+    /// Tablespace name; the current database default when `reltablespace = 0`.
     pub tablespace: String,
     /// Index scans.
     pub idx_scan: i64,
@@ -172,6 +205,10 @@ pub struct UserIndexesRow {
     pub indisprimary: bool,
     /// Whether the index is valid for queries.
     pub indisvalid: bool,
+    /// Whether the index enforces an exclusion constraint.
+    pub indisexclusion: bool,
+    /// Whether the index is ready for inserts.
+    pub indisready: bool,
     /// Access method name.
     pub amname: String,
     /// `pg_get_indexdef` reconstruction of the index definition.
@@ -202,6 +239,8 @@ fn row_from_pg(row: &tokio_postgres::Row, version: UserIndexesVersion) -> UserIn
         indisunique: row.get("indisunique"),
         indisprimary: row.get("indisprimary"),
         indisvalid: row.get("indisvalid"),
+        indisexclusion: row.get("indisexclusion"),
+        indisready: row.get("indisready"),
         amname: row.get("amname"),
         indexdef: row.get("indexdef"),
         idx_blks_read: row.get("idx_blks_read"),
@@ -236,6 +275,8 @@ pub fn to_v2<E>(
         indisunique: row.indisunique,
         indisprimary: row.indisprimary,
         indisvalid: row.indisvalid,
+        indisexclusion: row.indisexclusion,
+        indisready: row.indisready,
         amname: intern(row.amname.as_bytes())?,
         indexdef: intern(row.indexdef.as_bytes())?,
         idx_blks_read: row.idx_blks_read,
@@ -269,6 +310,8 @@ pub fn to_v1<E>(
         indisunique: row.indisunique,
         indisprimary: row.indisprimary,
         indisvalid: row.indisvalid,
+        indisexclusion: row.indisexclusion,
+        indisready: row.indisready,
         amname: intern(row.amname.as_bytes())?,
         indexdef: intern(row.indexdef.as_bytes())?,
         idx_blks_read: row.idx_blks_read,
@@ -299,7 +342,8 @@ pub async fn collect_user_indexes(
 #[cfg(test)]
 mod tests {
     use super::{
-        UserIndexesRow, UserIndexesVersion, to_v1, to_v2, user_indexes_query, user_indexes_version,
+        UserIndexesRow, UserIndexesVersion, indexdef_max_len, to_v1, to_v2, user_indexes_query,
+        user_indexes_version,
     };
     use kronika_registry::StrId;
     use std::convert::Infallible;
@@ -335,6 +379,8 @@ mod tests {
             indisunique: true,
             indisprimary: true,
             indisvalid: true,
+            indisexclusion: false,
+            indisready: true,
             amname: "btree".to_owned(),
             indexdef: "CREATE UNIQUE INDEX accounts_pkey ON public.accounts USING btree (id)"
                 .to_owned(),
@@ -356,6 +402,11 @@ mod tests {
     fn query_has_version_specific_columns_and_marker() {
         assert!(!user_indexes_query(UserIndexesVersion::V1).contains("last_idx_scan"));
         assert!(user_indexes_query(UserIndexesVersion::V2).contains("last_idx_scan"));
+        // The recency axis skips never-scanned indexes so it does not fill its
+        // slots arbitrarily; they are still caught by the relpages/size axis.
+        assert!(
+            user_indexes_query(UserIndexesVersion::V2).contains("WHERE last_idx_scan IS NOT NULL")
+        );
         for v in [UserIndexesVersion::V1, UserIndexesVersion::V2] {
             let q = user_indexes_query(v);
             assert!(q.contains("pg_kronika"));
@@ -365,15 +416,38 @@ mod tests {
             assert!(q.contains("LEFT JOIN pg_index"));
             assert!(q.contains("pg_get_indexdef"));
             assert!(q.contains("AS main_fork_bytes"));
-            // Candidate selection is mechanical top-N by raw columns. The size
-            // axis captures big unused indexes without a WHERE-verdict.
             assert!(q.contains("ORDER BY COALESCE(idx_scan, 0) DESC"));
             assert!(q.contains("ORDER BY COALESCE(idx_tup_read, 0) DESC"));
             assert!(q.contains("ORDER BY c.relpages DESC"));
+            // The indexdef String is bounded in SQL before materialization.
+            assert!(q.contains("left(pg_get_indexdef"));
+            assert!(q.contains("5000"));
+            // The database default tablespace is the fallback, not a pg_default
+            // literal, so an object with reltablespace = 0 in a non-pg_default
+            // default is labelled correctly.
+            assert!(q.contains("dattablespace"));
+            assert!(!q.contains("'pg_default'"));
+            // The two exclusion/ready flags are recorded alongside the others.
+            assert!(q.contains("indisexclusion"));
+            assert!(q.contains("indisready"));
+            // A statio race cannot surface a NULL that panics the i64 decode.
+            assert!(q.contains("COALESCE(io.idx_blks_read, 0)"));
+            assert!(q.contains("COALESCE(io.idx_blks_hit, 0)"));
+            // Every axis breaks ties on indexrelid for a deterministic top-N.
+            assert!(q.contains(", indexrelid LIMIT $1"));
             // No threshold "big-unused" verdict, no GUC-based branch in the SQL.
             assert!(!q.contains("idx_scan = 0"));
             assert!(!q.contains("current_setting"));
         }
+    }
+
+    #[test]
+    fn indexdef_cap_matches_sql_literal() {
+        // The integer cap and the literal spliced into the SQL must agree.
+        assert_eq!(indexdef_max_len(), 5000);
+        assert!(
+            user_indexes_query(UserIndexesVersion::V1).contains(&indexdef_max_len().to_string())
+        );
     }
 
     #[test]
@@ -384,6 +458,8 @@ mod tests {
         assert_eq!(r.datname, fake_intern(b"appdb").unwrap());
         assert_eq!(r.last_idx_scan.map(|t| t.0), Some(1_900));
         assert!(r.indisprimary);
+        assert!(!r.indisexclusion);
+        assert!(r.indisready);
         assert_eq!(r.amname, fake_intern(b"btree").unwrap());
         assert_eq!(r.main_fork_bytes, 16_384);
     }
