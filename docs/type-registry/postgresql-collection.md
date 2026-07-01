@@ -7,17 +7,17 @@
 ## Общие правила
 
 - Каждый SQL-запрос коллектора начинается с комментария-маркера
-  `/* reftool:xxx */`. Маркер нужен, чтобы исключать собственные запросы
-  коллектора из `pg_stat_activity`, `pg_stat_statements` и аналитики.
-- Текущие маркеры: `act`, `pgs`, `pgp`, `sys`, `cov`, `cfg`, `rep`, `ext`,
-  `lck`.
+  `/* pg_kronika:<version> <source-file> */`. Маркер нужен, чтобы исключать
+  собственные запросы коллектора из `pg_stat_activity`, `pg_stat_statements` и
+  аналитики.
 - Запросы к системным каталогам выполняются через `query_with_lock_retry`:
   DDL может временно держать lock на каталогах.
 - При ошибке соединения сбрасывается клиент и весь кэш окружения:
   `server_version_num`, версии расширений, наличие функций и прочие признаки.
 - Multidb-режим использует по одному соединению на каждую не-template базу с
   `datallowconn`. Пул обновляется примерно раз в 10 минут.
-- Явный `PGDATABASE` отключает режим нескольких баз.
+- Режима одной базы нет: `dbname`/`PGDATABASE` из DSN задаёт только стартовый
+  коннект, а per-db соединения всё равно открываются по всем базам.
 
 ## Права PostgreSQL
 
@@ -40,7 +40,7 @@
 ## `1_001_001` activity
 
 ```sql
-/* reftool:act */
+/* pg_kronika:<version> <source-file> */
 SELECT
   pid,
   datname,
@@ -69,7 +69,7 @@ FROM pg_stat_activity;
 Фаза 1: статистика без текстов.
 
 ```sql
-/* reftool:pgs */
+/* pg_kronika:<version> <source-file> */
 SELECT
   s.userid,
   s.dbid,
@@ -91,7 +91,7 @@ LIMIT :max_statements;
 Фаза 2: тексты только для `queryid`, которых ещё нет в интернер-кэше.
 
 ```sql
-/* reftool:pgs */
+/* pg_kronika:<version> <source-file> */
 SELECT
   queryid,
   LEFT(query, :max_text_len) AS query
@@ -121,7 +121,7 @@ Fork определяется при старте по наличию функц
 Ступень 1: дешевая предварительная проверка с кэшем около 1 секунды.
 
 ```sql
-/* reftool:lck */
+/* pg_kronika:<version> <source-file> */
 SELECT EXISTS (
   SELECT 1
   FROM pg_stat_activity
@@ -151,7 +151,7 @@ LIMIT :max_rows;
 CTE должен подниматься к корням блокировок и джойниться с `pg_locks`, чтобы
 получить тип, режим и цель lock.
 
-## `1_013_001` / `1_014_001` tables и indexes
+## `1_013_001`..`1_013_004` / `1_014_001`..`1_014_002` tables и indexes
 
 Для таблиц выполняется один запрос на базу (через пул соединений, итерация по
 `per_db()`): `pg_stat_user_tables` с `LEFT JOIN pg_statio_user_tables` по `relid`,
@@ -164,13 +164,27 @@ dead tuples `n_dead_tup` ∪ `age(relfrozenxid)` ∪ `mxid_age(relminmxid)`), б
 (промах/попадание буфера), а не I/O ОС или блочного устройства. Запрос идёт под
 адаптивным `statement_timeout`. coverage в `1_023_001` — будущий эпик.
 
-Для индексов схема аналогична:
+Для индексов (`1_014`) схема аналогична и симметрична таблицам: один запрос на
+базу по `per_db()` под тем же адаптивным `statement_timeout`, свой env
+`KRONIKA_PG_MAX_INDEXES` как per-axis top-N (отдельно от `KRONIKA_PG_MAX_TABLES`).
+Источники строки:
 
 - `pg_stat_user_indexes`;
-- `pg_statio_user_indexes`;
-- `pg_get_indexdef`;
-- `pg_am.amname`;
-- флаги из `pg_index`.
+- `pg_statio_user_indexes` (`idx_blks_read`/`idx_blks_hit` под `COALESCE(..., 0)`,
+  `LEFT JOIN` по `indexrelid` — гонка каталога и статистики не даст `NULL`);
+- `main_fork_bytes` = `pg_relation_size(indexrelid)`;
+- `left(pg_get_indexdef(indexrelid), 5000)` — обрезка на уровне SQL;
+- `pg_am.amname` через `pg_class.relam`;
+- флаги `indisunique`/`indisprimary`/`indisvalid`/`indisexclusion`/`indisready` из
+  `pg_index`.
+
+Отбор кандидатов — чисто механический top-N по сырым колонкам (`idx_scan` ∪
+`idx_tup_read` ∪ `pg_class.relpages`; PG16+ ещё `last_idx_scan` с
+`WHERE last_idx_scan IS NOT NULL`), каждая ось с `indexrelid` последним ключом
+`ORDER BY` для детерминированного top-N, без порогов и вердиктов. Ось `relpages`
+ловит большие неиспользуемые индексы — вывод «большой и ни разу не сканировался»
+делает модуль анализа на чтении, а не `WHERE idx_scan = 0` в коллекторе (см.
+`1_014` в `postgresql.md`).
 
 ## `1_006_001` bgwriter и checkpointer
 
