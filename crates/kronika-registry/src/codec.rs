@@ -29,6 +29,7 @@ pub mod pg_stat_archiver;
 pub mod pg_stat_database;
 pub mod pg_stat_io;
 pub mod pg_stat_progress_vacuum;
+pub mod pg_stat_user_indexes;
 pub mod pg_stat_user_tables;
 pub mod pg_stat_wal;
 pub mod replication_instance;

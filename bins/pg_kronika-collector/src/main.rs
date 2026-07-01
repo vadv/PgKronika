@@ -20,10 +20,11 @@
 //! - `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS`: idle-in-transaction timeout in ms,
 //!   default 10000;
 //! - `KRONIKA_PG_EXCLUDE_DATABASES`: semicolon-separated list of databases to skip;
-//! - `KRONIKA_PG_MAX_TABLES`: per-axis top-N row count for `pg_stat_user_tables`
-//!   candidate selection, default 500. Each mechanical axis (read activity,
-//!   write volume, size, dead tuples, transaction-id age, multixact age)
-//!   contributes up to this many tables before the union;
+//! - `KRONIKA_PG_MAX_TABLES`: per-axis top-N row count for the relation top-N
+//!   (`pg_stat_user_tables` and `pg_stat_user_indexes`) candidate selection,
+//!   default 500. Each mechanical axis (tables: read activity, write volume,
+//!   size, dead tuples, transaction-id age, multixact age; indexes: scans,
+//!   tuples read, size) contributes up to this many rows before the union;
 //! - `KRONIKA_PG_POOL_REFRESH_SECS`: minimum interval between connection-pool
 //!   refreshes (per-database connection reconciliation), default 600;
 //! - `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`: cap for the adaptive `statement_timeout`
@@ -52,6 +53,9 @@ use kronika_source_pg::progress_vacuum::{
 use kronika_source_pg::replication_instance::{
     ReplicationInstanceRow, collect_replication_instance, to_replication_instance,
 };
+use kronika_source_pg::user_indexes::{
+    self, UserIndexesRow, UserIndexesVersion, collect_user_indexes,
+};
 use kronika_source_pg::user_tables::{self, UserTablesRow, UserTablesVersion, collect_user_tables};
 use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
@@ -70,7 +74,8 @@ struct Config {
     source_id: u64,
     session: SessionConfig,
     exclude_databases: HashSet<String>,
-    /// Per-axis top-N row count for `pg_stat_user_tables` candidate selection.
+    /// Per-axis top-N row count for the relation top-N candidate selection
+    /// (`pg_stat_user_tables` and `pg_stat_user_indexes`).
     max_tables: i64,
     /// Minimum interval between connection-pool refreshes, seconds.
     pool_refresh_secs: u64,
@@ -238,6 +243,59 @@ async fn collect_user_tables_all(
     user_tables
 }
 
+/// Collect `pg_stat_user_indexes` from every pool database, returning owned rows.
+///
+/// Mirrors [`collect_user_tables_all`]: all awaits finish here so the caller can
+/// intern without holding the `!Send` `Interner` across an await. The size query
+/// runs under an adaptive `statement_timeout`: SQLSTATE `57014` widens it and
+/// retries the same database until the cap; any other error logs and skips that
+/// database so one bad database does not lose the whole segment.
+async fn collect_user_indexes_all(
+    pool: &ConnectionPool,
+    major: u32,
+    config: &Config,
+) -> Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)> {
+    let mut user_indexes = Vec::new();
+    let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
+    for db in pool.per_db() {
+        loop {
+            // pg_relation_size over many indexes can be slow, so this query runs
+            // under a wider statement_timeout. SET persists on the connection: it
+            // stays in effect until the next database's SET overwrites it.
+            db.client()
+                .batch_execute(&format!("SET statement_timeout = {}", heavy.current_ms()))
+                .await
+                .ok();
+            match collect_user_indexes(db.client(), major, config.max_tables).await {
+                Ok((version, rows)) => {
+                    user_indexes.push((db.datname.clone(), version, rows));
+                    break;
+                }
+                Err(err) if is_sqlstate(&err, "57014") && !heavy.at_cap() => {
+                    heavy.grow(); // statement_timeout hit; retry this database wider
+                }
+                Err(err) if is_sqlstate(&err, "55P03") => {
+                    // lock_not_available: another session holds a conflicting lock.
+                    // Label it distinctly so contention is not read as a query bug.
+                    eprintln!(
+                        "pg_kronika-collector: skip user_indexes for {} (lock_not_available): {err}",
+                        db.datname
+                    );
+                    break;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "pg_kronika-collector: skip user_indexes for {}: {err}",
+                        db.datname
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    user_indexes
+}
+
 async fn snapshot_and_seal(
     pool: &ConnectionPool,
     major: u32,
@@ -278,6 +336,7 @@ async fn snapshot_and_seal(
         .context("collect replication instance status")?;
 
     let user_tables = collect_user_tables_all(pool, major, config).await;
+    let user_indexes = collect_user_indexes_all(pool, major, config).await;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -310,6 +369,7 @@ async fn snapshot_and_seal(
     push_archiver(&mut buffers, &mut interner, &archiver)?;
     push_replication_instance(&mut buffers, &mut interner, &replication_instance_row)?;
     push_user_tables(&mut buffers, &mut interner, &user_tables)?;
+    push_user_indexes(&mut buffers, &mut interner, &user_indexes)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -407,6 +467,32 @@ fn push_user_tables(
                 }
                 UserTablesVersion::V4 => {
                     buffer_row(buffers, user_tables::to_v4(row, datname, &mut intern)?)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Intern each index row's strings and buffer it as the version's section type.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_user_indexes(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    collected: &[(String, UserIndexesVersion, Vec<UserIndexesRow>)],
+) -> Result<()> {
+    for (datname, version, rows) in collected {
+        for row in rows {
+            let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+            match version {
+                UserIndexesVersion::V1 => {
+                    buffer_row(buffers, user_indexes::to_v1(row, datname, &mut intern)?)?;
+                }
+                UserIndexesVersion::V2 => {
+                    buffer_row(buffers, user_indexes::to_v2(row, datname, &mut intern)?)?;
                 }
             }
         }
@@ -523,7 +609,8 @@ fn announce(line: &str) {
 mod tests {
     use super::{
         activity_dict_limits, push_activity, push_archiver, push_database, push_io,
-        push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_user_tables,
+        push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_user_indexes,
+        push_user_tables,
     };
     use kronika_source_pg::archiver::ArchiverRow;
     use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
@@ -531,6 +618,7 @@ mod tests {
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
     use kronika_source_pg::replication_instance::ReplicationInstanceRow;
+    use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion};
     use kronika_source_pg::user_tables::{UserTablesRow, UserTablesVersion};
     use kronika_source_pg::{ActivityRow, ActivityVersion};
     use kronika_writer::{Interner, SectionBuffers, dict};
@@ -751,6 +839,66 @@ mod tests {
                 .iter()
                 .any(|entry| entry.type_id == 1_013_003),
             "the part carries the pg_stat_user_tables section"
+        );
+    }
+
+    fn ui_row(indexrelid: u32) -> UserIndexesRow {
+        UserIndexesRow {
+            ts: 1_000,
+            datid: 5,
+            indexrelid,
+            relid: indexrelid - 1,
+            schemaname: "public".to_owned(),
+            relname: "accounts".to_owned(),
+            indexrelname: "accounts_pkey".to_owned(),
+            tablespace: "pg_default".to_owned(),
+            idx_scan: 120,
+            idx_tup_read: 3_400,
+            idx_tup_fetch: 3_000,
+            main_fork_bytes: 16_384,
+            last_idx_scan: Some(900),
+            indisunique: true,
+            indisprimary: true,
+            indisvalid: true,
+            amname: "btree".to_owned(),
+            indexdef: "CREATE UNIQUE INDEX accounts_pkey ON public.accounts USING btree (id)"
+                .to_owned(),
+            idx_blks_read: 40,
+            idx_blks_hit: 9_000,
+        }
+    }
+
+    #[test]
+    fn push_user_indexes_buffers_rows_and_interns_strings() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_user_indexes(
+            &mut buffers,
+            &mut interner,
+            &[(
+                "appdb".to_owned(),
+                UserIndexesVersion::V2,
+                vec![ui_row(16_385), ui_row(16_387)],
+            )],
+        )
+        .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "rows were buffered");
+
+        // The buffered rows use dictionary ids, and the part carries the V2
+        // user-indexes section.
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(!dict_sections.is_empty(), "strings reached the dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_014_002),
+            "the part carries the pg_stat_user_indexes section"
         );
     }
 

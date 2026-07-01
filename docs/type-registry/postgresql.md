@@ -29,7 +29,8 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_013_002` | `pg_stat_user_tables` + statio (PG 13-15) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
 | `1_013_003` | `pg_stat_user_tables` + statio (PG 16-17) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
 | `1_013_004` | `pg_stat_user_tables` + statio (PG 18) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
-| `1_014_001` | `pg_stat_user_indexes` + `pg_statio_user_indexes` | 30 с | `changed` | `(datname, indexrelid, ts)` |
+| `1_014_001` | `pg_stat_user_indexes` + statio (PG 10-15) | 30 с | `snapshot_full` | `(datid, indexrelid, ts)` |
+| `1_014_002` | `pg_stat_user_indexes` + statio (PG 16-18) | 30 с | `snapshot_full` | `(datid, indexrelid, ts)` |
 | `1_015_001` | replication: статус инстанса | 30 с | `snapshot_full` | `(ts)` |
 | `1_016_001` | replication: реплики primary | 30 с | `snapshot_full` | `(application_name, client_addr, pid, ts)` |
 | `1_017_001` | replication: слоты | 30 с | `snapshot_full` | `(slot_name, ts)` |
@@ -642,14 +643,56 @@ tidx_blks_read                  i64?  C
 tidx_blks_hit                   i64?  C
 ```
 
-## `1_014_001` `pg_stat_user_indexes` + `pg_statio_user_indexes`
+## `1_014_001`..`1_014_002` `pg_stat_user_indexes` + `pg_statio_user_indexes`
 
-Собирается top-N, значение по умолчанию — 500 строк. Порядок отбора фиксируется
-в coverage `order_by`; базовый вариант:
-`greatest(idx_scan, idx_tup_read, size_bytes) DESC`.
+Класс-B сосед `1_013` (`pg_stat_user_tables`): та же схема сбора по каждой базе
+через пул соединений (один коннект на базу, обновление пула раз в 10 минут, env
+`KRONIKA_PG_POOL_REFRESH_SECS`). Явный `PGDATABASE` отключает режим нескольких
+баз. Запрос идёт под тем же адаптивным `statement_timeout` (старт 15 с, ×2 до
+`KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` = 60 с; SQLSTATE 57014 — расширить и повторить
+базу, иначе пропустить).
+
+Две версии по росту каталога: `last_idx_scan` появился в PG16 (V2). PG17 и PG18
+в `pg_stat_all_indexes` не добавили ничего — в отличие от таблиц, у индексов нет
+колонок тайминга.
+
+Отбор кандидатов — чисто механический: объединение top-N индексов по сырым
+колонкам (N по умолчанию 500, тот же env `KRONIKA_PG_MAX_TABLES` — это per-axis
+top-N для relation top-N, отдельного env нет):
+
+- `idx_scan` DESC;
+- `idx_tup_read` DESC;
+- размер: `pg_class.relpages` DESC (JOIN по `indexrelid`) — ловит большие
+  индексы, в том числе неиспользуемые;
+- PG16+: `last_idx_scan` DESC NULLS LAST (давность сканирования).
+
+Категория «большой и ни разу не сканировался» из reftool (`WHERE idx_scan = 0`)
+не переносится — это вердикт. Коллектор пишет `relpages` (через размер) и
+`idx_scan`, а «неиспользуемый большой индекс» выводит модуль анализа на чтении.
+
+`pg_statio_user_indexes` сливается в строку через `LEFT JOIN` по `indexrelid`;
+`main_fork_bytes` = `pg_relation_size(indexrelid)` (только main fork, без TOAST —
+у индекса его нет); `amname` берётся из `pg_am` через `pg_class.relam`; флаги
+`indisunique`/`indisprimary`/`indisvalid` — из `pg_index`; определение —
+`pg_get_indexdef(indexrelid)`. `datid` нужен вместе с `datname` как стабильный
+числовой ключ (базу могут переименовать) и для join к `pg_stat_database`.
+`last_idx_scan` = `NULL` означает «ни разу не сканировали» — не ноль.
+`idx_blks_read`/`idx_blks_hit` — счётчики shared-буферов PostgreSQL (попадание в
+кэш буферов против промаха), а не I/O блочного устройства или ОС.
+
+Семантика `snapshot_full` (как у `1_013`): каждый цикл отдаёт все отобранные
+строки. Ряд разрежённый — отсутствие индекса в снимке означает, что он не попал
+в top-N, а не ноль; сбросы статистики по всей базе видны через
+`pg_stat_database.stats_reset` (`1_005`) по join на `datid`. `changed`-семантика
+(слать только изменившиеся строки + baseline-маркер, экономия для
+высококардинальных tables/indexes) — отдельный будущий эпик, требует
+delta-инфраструктуры, которой пока нет.
+
+Раскладка V2 (надмножество; V1 без `last_idx_scan`):
 
 ```text
 ts             ts    T
+datid          u32   L
 datname        str   L
 indexrelid     u32   L
 relid          u32   L
@@ -657,19 +700,18 @@ schemaname     str   L
 relname        str   L
 indexrelname   str   L
 tablespace     str   L
-amname         str   L
-indexdef       str   L
 idx_scan       i64   C
 idx_tup_read   i64   C
 idx_tup_fetch  i64   C
-size_bytes     i64   G
-last_idx_scan  ts?   G
+main_fork_bytes i64  G   // pg_relation_size(indexrelid)
+last_idx_scan  ts?   G   // PG16+, NULL = ни разу
 indisunique    bool  L
 indisprimary   bool  L
 indisvalid     bool  L
-idx_blks_read  i64   C
-idx_blks_hit   i64   C
-is_baseline    bool  L
+amname         str   L
+indexdef       str   L
+idx_blks_read  i64   C   // shared-буферы: промах, не диск/ОС
+idx_blks_hit   i64   C   // shared-буферы: попадание
 ```
 
 ## `1_015_001` - `1_017_001` replication
