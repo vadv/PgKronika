@@ -6,8 +6,9 @@
 //! two layout versions.
 //!
 //! Each layout merges `pg_statio_user_indexes` (the buffer-I/O counters), the
-//! `pg_index` flags (`indisunique`/`indisprimary`/`indisvalid`), the access
-//! method name from `pg_am`, and `pg_get_indexdef` into the same row.
+//! `pg_index` flags (`indisunique`/`indisprimary`/`indisvalid`/`indisexclusion`/
+//! `indisready`), the access method name from `pg_am`, and `pg_get_indexdef` into
+//! the same row.
 
 use crate::{Section, StrId, Ts};
 
@@ -16,6 +17,10 @@ use crate::{Section, StrId, Ts};
 /// One row per selected index per database. `last_idx_scan` is `None` when the
 /// index has never been scanned. Every column is an integer, `StrId`, or `bool`,
 /// so the layout derives `Eq`.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent pg_index flag column, not interdependent state"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(
     id = 1_014_002,
@@ -48,7 +53,7 @@ pub struct PgStatUserIndexesV2 {
     /// Index name.
     #[column(l)]
     pub indexrelname: StrId,
-    /// Tablespace name; `pg_default` when the index uses the default tablespace.
+    /// Tablespace name; the current database default when `reltablespace = 0`.
     #[column(l)]
     pub tablespace: StrId,
     /// Index scans.
@@ -75,16 +80,22 @@ pub struct PgStatUserIndexesV2 {
     /// Whether the index is valid for queries.
     #[column(l)]
     pub indisvalid: bool,
+    /// Whether the index enforces an exclusion constraint.
+    #[column(l)]
+    pub indisexclusion: bool,
+    /// Whether the index is ready for inserts.
+    #[column(l)]
+    pub indisready: bool,
     /// Access method name (`btree`, `hash`, `gin`, ...).
     #[column(l)]
     pub amname: StrId,
     /// `pg_get_indexdef` reconstruction of the index definition.
     #[column(l)]
     pub indexdef: StrId,
-    /// Index blocks read from disk.
+    /// Shared-buffer misses for index blocks.
     #[column(c)]
     pub idx_blks_read: i64,
-    /// Index buffer hits.
+    /// Shared-buffer hits for index blocks.
     #[column(c)]
     pub idx_blks_hit: i64,
 }
@@ -92,6 +103,10 @@ pub struct PgStatUserIndexesV2 {
 /// Type `1_014_001`: `pg_stat_user_indexes` on PG 10-15 (base layout, no
 /// `last_idx_scan`). Column meanings match [`PgStatUserIndexesV2`] for fields
 /// present in this layout.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent pg_index flag column, not interdependent state"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(
     id = 1_014_001,
@@ -124,7 +139,7 @@ pub struct PgStatUserIndexesV1 {
     /// Index name.
     #[column(l)]
     pub indexrelname: StrId,
-    /// Tablespace name; `pg_default` when the index uses the default tablespace.
+    /// Tablespace name; the current database default when `reltablespace = 0`.
     #[column(l)]
     pub tablespace: StrId,
     /// Index scans.
@@ -148,16 +163,22 @@ pub struct PgStatUserIndexesV1 {
     /// Whether the index is valid for queries.
     #[column(l)]
     pub indisvalid: bool,
+    /// Whether the index enforces an exclusion constraint.
+    #[column(l)]
+    pub indisexclusion: bool,
+    /// Whether the index is ready for inserts.
+    #[column(l)]
+    pub indisready: bool,
     /// Access method name (`btree`, `hash`, `gin`, ...).
     #[column(l)]
     pub amname: StrId,
     /// `pg_get_indexdef` reconstruction of the index definition.
     #[column(l)]
     pub indexdef: StrId,
-    /// Index blocks read from disk.
+    /// Shared-buffer misses for index blocks.
     #[column(c)]
     pub idx_blks_read: i64,
-    /// Index buffer hits.
+    /// Shared-buffer hits for index blocks.
     #[column(c)]
     pub idx_blks_hit: i64,
 }
@@ -186,6 +207,8 @@ mod tests {
             indisunique: true,
             indisprimary: true,
             indisvalid: true,
+            indisexclusion: false,
+            indisready: true,
             amname: StrId(5),
             indexdef: StrId(6),
             idx_blks_read: 40,
@@ -197,7 +220,7 @@ mod tests {
     fn v2_contract_shape() {
         let c = PgStatUserIndexesV2::CONTRACT;
         assert_eq!(c.type_id.get(), 1_014_002);
-        assert_eq!(c.columns.len(), 21);
+        assert_eq!(c.columns.len(), 23);
         assert_eq!(c.sort_key, ["datid", "indexrelid", "ts"]);
         assert_eq!(c.column("ts").map(|col| col.nullable), Some(false));
         assert_eq!(c.column("indexrelid").map(|col| col.nullable), Some(false));
@@ -209,6 +232,11 @@ mod tests {
         assert!(c.column("main_fork_bytes").is_some());
         assert!(c.column("size_bytes").is_none());
         assert!(c.column("indisunique").is_some());
+        assert_eq!(
+            c.column("indisexclusion").map(|col| col.nullable),
+            Some(false)
+        );
+        assert_eq!(c.column("indisready").map(|col| col.nullable), Some(false));
         assert!(c.column("amname").is_some());
         assert!(c.column("indexdef").is_some());
         assert_eq!(lint(&[c]), Ok(()));
@@ -218,11 +246,13 @@ mod tests {
     fn v1_is_base_layout() {
         let c = PgStatUserIndexesV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_014_001);
-        assert_eq!(c.columns.len(), 20);
+        assert_eq!(c.columns.len(), 22);
         assert_eq!(c.sort_key, ["datid", "indexrelid", "ts"]);
         assert!(c.column("last_idx_scan").is_none());
         assert!(c.column("main_fork_bytes").is_some());
         assert!(c.column("idx_blks_hit").is_some());
+        assert!(c.column("indisexclusion").is_some());
+        assert!(c.column("indisready").is_some());
         assert_eq!(lint(&[c]), Ok(()));
     }
 
@@ -260,5 +290,7 @@ mod tests {
         assert_eq!(decoded[0].last_idx_scan, None);
         assert_eq!(decoded[0].main_fork_bytes, 16_384);
         assert!(decoded[0].indisprimary);
+        assert!(!decoded[0].indisexclusion);
+        assert!(decoded[0].indisready);
     }
 }

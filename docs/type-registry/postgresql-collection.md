@@ -16,7 +16,8 @@
   `server_version_num`, версии расширений, наличие функций и прочие признаки.
 - Multidb-режим использует по одному соединению на каждую не-template базу с
   `datallowconn`. Пул обновляется примерно раз в 10 минут.
-- Явный `PGDATABASE` отключает режим нескольких баз.
+- Режима одной базы нет: `dbname`/`PGDATABASE` из DSN задаёт только стартовый
+  коннект, а per-db соединения всё равно открываются по всем базам.
 
 ## Права PostgreSQL
 
@@ -39,7 +40,7 @@
 ## `1_001_001` activity
 
 ```sql
-/* pg_kronika:... */
+/* pg_kronika:<version> <source-file> */
 SELECT
   pid,
   datname,
@@ -77,7 +78,7 @@ FROM pg_stat_activity;
 Раскладка выбирается по версии расширения, а не по мажору сервера. Проба:
 
 ```sql
-/* pg_kronika:... */
+/* pg_kronika:<version> <source-file> */
 SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements';
 ```
 
@@ -88,7 +89,7 @@ SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements';
 Один запрос со встроенным усечением текста (без второй фазы):
 
 ```sql
-/* pg_kronika:... */
+/* pg_kronika:<version> <source-file> */
 WITH candidates AS (
   (SELECT userid, dbid, queryid FROM pg_stat_statements
      ORDER BY total_exec_time DESC NULLS LAST LIMIT $1)
@@ -136,7 +137,7 @@ Fork определяется при старте по наличию функц
 Ступень 1: дешевая предварительная проверка с кэшем около 1 секунды.
 
 ```sql
-/* pg_kronika:... */
+/* pg_kronika:<version> <source-file> */
 SELECT EXISTS (
   SELECT 1
   FROM pg_stat_activity
@@ -181,21 +182,26 @@ dead tuples `n_dead_tup` ∪ `age(relfrozenxid)` ∪ `mxid_age(relminmxid)`), б
 `1_023_001`.
 
 Для индексов (`1_014`) схема аналогична и симметрична таблицам: один запрос на
-базу по `per_db()` под тем же адаптивным `statement_timeout`, тот же env
-`KRONIKA_PG_MAX_TABLES` как per-axis top-N. Источники строки:
+базу по `per_db()` под тем же адаптивным `statement_timeout`, свой env
+`KRONIKA_PG_MAX_INDEXES` как per-axis top-N (отдельно от `KRONIKA_PG_MAX_TABLES`).
+Источники строки:
 
 - `pg_stat_user_indexes`;
-- `pg_statio_user_indexes` (`idx_blks_read`/`idx_blks_hit`, `LEFT JOIN` по `indexrelid`);
+- `pg_statio_user_indexes` (`idx_blks_read`/`idx_blks_hit` под `COALESCE(..., 0)`,
+  `LEFT JOIN` по `indexrelid` — гонка каталога и статистики не даст `NULL`);
 - `main_fork_bytes` = `pg_relation_size(indexrelid)`;
-- `pg_get_indexdef(indexrelid)`;
+- `left(pg_get_indexdef(indexrelid), 5000)` — обрезка на уровне SQL;
 - `pg_am.amname` через `pg_class.relam`;
-- флаги `indisunique`/`indisprimary`/`indisvalid` из `pg_index`.
+- флаги `indisunique`/`indisprimary`/`indisvalid`/`indisexclusion`/`indisready` из
+  `pg_index`.
 
 Отбор кандидатов — чисто механический top-N по сырым колонкам (`idx_scan` ∪
-`idx_tup_read` ∪ `pg_class.relpages`; PG16+ ещё `last_idx_scan DESC NULLS LAST`),
-без порогов и вердиктов. Ось `relpages` ловит большие неиспользуемые индексы —
-вывод «большой и ни разу не сканировался» делает модуль анализа на чтении, а не
-`WHERE idx_scan = 0` в коллекторе (см. `1_014` в `postgresql.md`).
+`idx_tup_read` ∪ `pg_class.relpages`; PG16+ ещё `last_idx_scan` с
+`WHERE last_idx_scan IS NOT NULL`), каждая ось с `indexrelid` последним ключом
+`ORDER BY` для детерминированного top-N, без порогов и вердиктов. Ось `relpages`
+ловит большие неиспользуемые индексы — вывод «большой и ни разу не сканировался»
+делает модуль анализа на чтении, а не `WHERE idx_scan = 0` в коллекторе (см.
+`1_014` в `postgresql.md`).
 
 ## `1_006_001` bgwriter и checkpointer
 
