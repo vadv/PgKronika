@@ -29,8 +29,9 @@ Both layouts include backend context from `pg_stat_activity`, the awaited
 - transaction context: `backend_xid_age`, `backend_xmin_age`, `backend_start`,
   `xact_start`, `query_start`, `state_change`;
 - awaited lock context: `lock_locktype`, `lock_mode`, `lock_granted`,
-  `lock_relation`, `lock_relname`, `lock_page`, `lock_tuple`,
-  `lock_transactionid`, `lock_fastpath`, `lock_target`;
+  `lock_database`, `lock_relation`, `lock_relname`, `lock_page`, `lock_tuple`,
+  `lock_virtualxid`, `lock_transactionid`, `lock_classid`, `lock_objid`,
+  `lock_objsubid`, `lock_fastpath`, `lock_target`;
 - PG 14+ wait timing: `waitstart`.
 
 `blocked_by` may contain `0`, PostgreSQL's marker for a prepared-transaction
@@ -47,7 +48,9 @@ not get its own row in the section.
 - `#[derive(Section)]` support for `Vec<i32>` fields;
 - codec roundtrip coverage for empty lists, multi-element lists, and `0`.
 
-The list itself is non-nullable. An empty `Vec<i32>` represents a root node.
+The list itself and its child values are non-nullable. An empty `Vec<i32>`
+represents a normal backend root; rootless fallback anchors may still have
+non-empty `blocked_by`.
 
 ## Collector query
 
@@ -57,12 +60,15 @@ Collection has two stages:
 2. If a lock wait exists, run the version-specific recursive CTE.
 
 The CTE starts from lock-waiting backends, reads each waiter's
-`pg_blocking_pids(pid)`, walks blockers transitively to the roots, joins backend
-context, and joins the first non-granted `pg_locks` row for the awaited lock.
+`pg_blocking_pids(pid)` once, guards waiters/edges/backend nodes, walks from
+real roots, prepared-xact `root_pid = 0` anchors, and rootless fallback anchors,
+joins backend context, and joins a deterministic non-granted `pg_locks` row for
+the awaited lock.
 
 The PG 14+ query uses SQL `CYCLE`. The PG 10-13 query uses a manual path array
-guard. Both queries cap the result with `KRONIKA_PG_MAX_LOCK_ROWS` (default
-`1000`), validated at startup against `MAX_SECTION_ROWS`.
+guard. `KRONIKA_PG_MAX_LOCK_ROWS` (default `1000`, minimum `1`) is a graph-size
+guard, not a final `LIMIT`; if it trips, `1_011` is skipped for that snapshot
+instead of writing a truncated graph.
 
 ## Scope
 

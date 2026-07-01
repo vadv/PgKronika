@@ -134,8 +134,7 @@ Fork определяется при старте по наличию функц
 
 Сбор двухступенчатый. Класс A — соединение из `pool.main()`.
 
-**Ступень 1:** дешёвая предварительная проверка по `pg_stat_activity` с кэшем
-около 1 секунды.
+**Ступень 1:** дешёвая предварительная проверка по `pg_stat_activity`.
 
 ```sql
 /* pg_kronika:<version> <source-file> */
@@ -153,46 +152,70 @@ SELECT EXISTS (
 Если предварительная проверка не нашла ожиданий, ступень 2 не выполняется;
 секция в сегмент не пишется.
 
-**Ступень 2:** cycle-safe рекурсивный CTE поднимается от заблокированных
-backend'ов к корням через `pg_blocking_pids`, дедуплицирует узлы и
-джойнится с `pg_locks NOT GRANTED`, чтобы получить тип, режим и цель
-ожидаемой блокировки. `LEFT JOIN pg_locks` по `pid` и `NOT granted`
-даёт ожидаемый lock конкретного backend'а.
+**Ступень 2:** один statement-снимок строит список waiters, один раз вызывает
+`pg_blocking_pids(pid)` для каждого waiter, дедуплицирует `blocked_by`, проверяет
+guard объёма и только затем запускает cycle-safe рекурсию. Узлы джойнятся с
+детерминированным `DISTINCT ON (pid)` по `pg_locks NOT GRANTED`, чтобы получить
+тип, режим и цель ожидаемой блокировки.
 
-```sql
+```text
 WITH RECURSIVE
-  waiters AS (SELECT pid, pg_blocking_pids(pid) AS bp
-              FROM pg_stat_activity WHERE wait_event_type = 'Lock'),
+  waiters_raw AS (
+    SELECT pid, pg_blocking_pids(pid) AS bp
+    FROM pg_stat_activity
+    WHERE wait_event_type = 'Lock'
+  ),
+  waiters AS (
+    SELECT pid, dedup(bp) AS bp
+    FROM waiters_raw
+  ),
   edges AS (SELECT pid AS waiter, b AS blocker FROM waiters, unnest(bp) AS b),
-  roots AS (SELECT DISTINCT blocker AS pid FROM edges
-            WHERE blocker <> 0 AND blocker NOT IN (SELECT pid FROM waiters)),
-  tree AS (SELECT pid, 0 AS depth, pid AS root_pid FROM roots
-           UNION ALL
-           SELECT e.waiter, t.depth + 1, t.root_pid
-           FROM tree t JOIN edges e ON e.blocker = t.pid)
-           CYCLE pid SET is_cycle USING path,  -- PG14+; PG10-13: WHERE NOT ... = ANY(path)
-  nodes AS (SELECT pid, min(depth) AS depth,
-                   (array_agg(root_pid ORDER BY depth))[1] AS root_pid
-            FROM tree GROUP BY pid)
+  guard AS (
+    SELECT count(waiters) <= :max_rows
+       AND count(edges) <= :max_rows
+       AND count(nodes) <= :max_rows AS ok
+  ),
+  primary_tree AS (
+    -- real backend roots plus prepared-xact root_pid=0 anchors
+  ) CYCLE pid SET is_cycle USING path, -- PG14+; PG10-13: manual path guard
+  fallback_tree AS (
+    -- rootless/cyclic components not reached from primary_tree
+  ) CYCLE pid SET is_cycle USING fallback_path,
+  nodes AS (SELECT deterministic_anchor(primary_tree, fallback_tree)),
+  waiting_locks AS (
+    SELECT DISTINCT ON (pid) *
+    FROM pg_locks
+    WHERE NOT granted
+    ORDER BY pid, locktype, mode, database NULLS FIRST, relation NULLS FIRST,
+             page NULLS FIRST, tuple NULLS FIRST, virtualxid NULLS FIRST,
+             transactionid NULLS FIRST, classid NULLS FIRST, objid NULLS FIRST,
+             objsubid NULLS FIRST, fastpath
+  )
 SELECT n.pid, n.depth, n.root_pid, /* + backend- и lock-колонки */
-       pg_blocking_pids(n.pid) AS blocked_by
+       coalesce(w.bp, ARRAY[]::int[]) AS blocked_by
 FROM nodes n JOIN pg_stat_activity USING (pid)
-LEFT JOIN pg_locks l ON l.pid = n.pid AND NOT l.granted
-LIMIT :max_rows;
+LEFT JOIN waiters w ON w.pid = n.pid
+LEFT JOIN waiting_locks l ON l.pid = n.pid;
 ```
 
-Семена рекурсии — корни (блокеры, сами не ждущие), от них спуск к ждущим.
-PID `0` в `blocked_by` — подготовленная (двухфазная) транзакция: её владелец
-виден в `pg_locks`, но строки в `pg_stat_activity` нет, поэтому она исключена
-из `roots` и не имеет собственной строки-узла — остаётся только внутри
-массивов `blocked_by`.
+Первичные семена рекурсии — backend-корни (блокеры, сами не ждущие) и
+prepared-xact якоря `root_pid = 0`. PID `0` не получает синтетическую
+`pg_stat_activity`-строку, но waiter за prepared-xact сохраняется с
+`blocked_by`, содержащим `0`. Если компонент не достижим из backend-корня или
+PID `0`, fallback-обход выбирает детерминированный backend-якорь, поэтому чистые
+циклы/окна дедлока не пропадают.
 
 Имя таблицы (`lock_relname`) берётся через `pg_class`, когда отношение видно из
-базы подключения коллектора. Блокировки в других базах кластера дают пустое
-имя при сохранённом `lock_relation`.
+базы подключения коллектора или относится к shared-каталогу
+(`pg_locks.database = current_database_oid OR 0`). Блокировки в других базах
+кластера дают пустое имя при сохранённых raw-полях `lock_database` и
+`lock_relation`.
 
-Лимит строк результата — `KRONIKA_PG_MAX_LOCK_ROWS` (по умолчанию 1000).
-Отдельная coverage-строка для усечений пока не пишется.
+`KRONIKA_PG_MAX_LOCK_ROWS` (по умолчанию `1000`, минимум `1`) — guard на
+waiters, edges и backend nodes, а не финальный `LIMIT`. Если guard срабатывает,
+`1_011` в этом снимке не пишется, коллектор логирует waiters/edges/nodes и
+продолжает запечатывать остальные секции. Ошибка или timeout lock-query ведут к
+такой же деградации только для `1_011`.
 
 ## `1_013_001`..`1_013_004` / `1_014_001`..`1_014_002` tables и indexes
 

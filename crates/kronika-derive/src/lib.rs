@@ -360,9 +360,10 @@ fn build_encode(columns: &[ColumnDef]) -> TokenStream2 {
     // input; keep the row-slice API until benchmarks say otherwise.
     let builders = columns.iter().map(|c| {
         let field = &c.field;
+        let name = &c.name;
         if c.column_type == "ListI32" {
             return quote! {
-                ::kronika_registry::write_list_i32(rows.iter().map(|r| r.#field.clone()))
+                ::kronika_registry::write_list_i32(#name, rows.iter().map(|r| r.#field.clone()))?
             };
         }
         let values = match (&c.wrapper, c.nullable) {

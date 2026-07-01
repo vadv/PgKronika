@@ -100,6 +100,9 @@ pub struct PgLocksV2 {
     /// recorded for completeness.
     #[column(l)]
     pub lock_granted: Option<bool>,
+    /// Database oid from the awaited `pg_locks` row.
+    #[column(l)]
+    pub lock_database: Option<u32>,
     /// Relation oid of the awaited lock (relation/page/tuple/extend).
     #[column(l)]
     pub lock_relation: Option<u32>,
@@ -112,9 +115,21 @@ pub struct PgLocksV2 {
     /// Tuple offset of a tuple lock target.
     #[column(g)]
     pub lock_tuple: Option<i16>,
+    /// Virtual transaction id for `virtualxid` locks.
+    #[column(l)]
+    pub lock_virtualxid: Option<StrId>,
     /// Transaction id being awaited (row-lock pattern), raw xid.
     #[column(l)]
     pub lock_transactionid: Option<i64>,
+    /// Class oid for object locks.
+    #[column(l)]
+    pub lock_classid: Option<u32>,
+    /// Object oid for object locks.
+    #[column(l)]
+    pub lock_objid: Option<u32>,
+    /// Object sub-id for object locks.
+    #[column(l)]
+    pub lock_objsubid: Option<i16>,
     /// Whether the awaited lock was taken via the fast path.
     #[column(l)]
     pub lock_fastpath: Option<bool>,
@@ -211,6 +226,9 @@ pub struct PgLocksV1 {
     /// recorded for completeness.
     #[column(l)]
     pub lock_granted: Option<bool>,
+    /// Database oid from the awaited `pg_locks` row.
+    #[column(l)]
+    pub lock_database: Option<u32>,
     /// Relation oid of the awaited lock (relation/page/tuple/extend).
     #[column(l)]
     pub lock_relation: Option<u32>,
@@ -223,9 +241,21 @@ pub struct PgLocksV1 {
     /// Tuple offset of a tuple lock target.
     #[column(g)]
     pub lock_tuple: Option<i16>,
+    /// Virtual transaction id for `virtualxid` locks.
+    #[column(l)]
+    pub lock_virtualxid: Option<StrId>,
     /// Transaction id being awaited (row-lock pattern), raw xid.
     #[column(l)]
     pub lock_transactionid: Option<i64>,
+    /// Class oid for object locks.
+    #[column(l)]
+    pub lock_classid: Option<u32>,
+    /// Object oid for object locks.
+    #[column(l)]
+    pub lock_objid: Option<u32>,
+    /// Object sub-id for object locks.
+    #[column(l)]
+    pub lock_objsubid: Option<i16>,
     /// Whether the awaited lock was taken via the fast path.
     #[column(l)]
     pub lock_fastpath: Option<bool>,
@@ -266,11 +296,16 @@ mod tests {
             lock_locktype: None,
             lock_mode: None,
             lock_granted: None,
+            lock_database: None,
             lock_relation: None,
             lock_relname: None,
             lock_page: None,
             lock_tuple: None,
+            lock_virtualxid: None,
             lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
             lock_fastpath: None,
             lock_target: None,
             waitstart: None,
@@ -304,11 +339,16 @@ mod tests {
             lock_locktype: None,
             lock_mode: None,
             lock_granted: None,
+            lock_database: None,
             lock_relation: None,
             lock_relname: None,
             lock_page: None,
             lock_tuple: None,
+            lock_virtualxid: None,
             lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
             lock_fastpath: None,
             lock_target: None,
         }
@@ -318,7 +358,7 @@ mod tests {
     fn v2_contract_shape() {
         let c = PgLocksV2::CONTRACT;
         assert_eq!(c.type_id.get(), 1_011_002);
-        assert_eq!(c.columns.len(), 32);
+        assert_eq!(c.columns.len(), 37);
         assert_eq!(c.sort_key, ["root_pid", "depth", "pid"]);
         assert_eq!(c.column("ts").map(|col| col.nullable), Some(false));
         assert_eq!(
@@ -339,7 +379,16 @@ mod tests {
             Some((crate::ColumnType::I32, true))
         );
         assert_eq!(
+            c.column("lock_virtualxid")
+                .map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::StrId, true))
+        );
+        assert_eq!(
             c.column("lock_tuple").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::I16, true))
+        );
+        assert_eq!(
+            c.column("lock_objsubid").map(|col| (col.ty, col.nullable)),
             Some((crate::ColumnType::I16, true))
         );
         assert_eq!(
@@ -353,7 +402,7 @@ mod tests {
     fn v1_drops_waitstart() {
         let c = PgLocksV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_011_001);
-        assert_eq!(c.columns.len(), 31);
+        assert_eq!(c.columns.len(), 36);
         assert!(c.column("waitstart").is_none());
         assert!(c.column("blocked_by").is_some());
         assert_eq!(
@@ -365,7 +414,16 @@ mod tests {
             Some((crate::ColumnType::I32, true))
         );
         assert_eq!(
+            c.column("lock_virtualxid")
+                .map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::StrId, true))
+        );
+        assert_eq!(
             c.column("lock_tuple").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::I16, true))
+        );
+        assert_eq!(
+            c.column("lock_objsubid").map(|col| (col.ty, col.nullable)),
             Some((crate::ColumnType::I16, true))
         );
         assert_eq!(
@@ -387,11 +445,16 @@ mod tests {
         waiter.lock_locktype = Some(StrId(10));
         waiter.lock_mode = Some(StrId(11));
         waiter.lock_granted = Some(false);
+        waiter.lock_database = Some(16_384);
         waiter.lock_relation = Some(12_345);
         waiter.lock_relname = Some(StrId(12));
         waiter.lock_page = Some(42);
         waiter.lock_tuple = Some(7);
+        waiter.lock_virtualxid = Some(StrId(14));
         waiter.lock_transactionid = Some(999_999);
+        waiter.lock_classid = Some(1_250);
+        waiter.lock_objid = Some(12_345);
+        waiter.lock_objsubid = Some(2);
         waiter.lock_fastpath = Some(false);
         waiter.lock_target = Some(StrId(13));
         waiter.waitstart = Some(Ts(999_000));
@@ -434,10 +497,15 @@ mod tests {
             r.lock_locktype = Some(StrId(20));
             r.lock_mode = Some(StrId(21));
             r.lock_granted = Some(false);
+            r.lock_database = Some(16_384);
             r.lock_relation = Some(54_321);
             r.lock_page = Some(3);
             r.lock_tuple = Some(11);
+            r.lock_virtualxid = Some(StrId(22));
             r.lock_transactionid = Some(42);
+            r.lock_classid = Some(1_250);
+            r.lock_objid = Some(54_321);
+            r.lock_objsubid = Some(4);
             r.lock_fastpath = Some(false);
             r
         };
@@ -452,12 +520,22 @@ mod tests {
         assert_eq!(decoded[1].waitstart, None);
         assert_eq!(decoded[0].lock_relation, Some(54_321));
         assert_eq!(decoded[1].lock_relation, None);
+        assert_eq!(decoded[0].lock_database, Some(16_384));
+        assert_eq!(decoded[1].lock_database, None);
         assert_eq!(decoded[0].lock_granted, Some(false));
         assert_eq!(decoded[1].lock_granted, None);
         assert_eq!(decoded[0].lock_page, Some(3));
         assert_eq!(decoded[1].lock_page, None);
         assert_eq!(decoded[0].lock_tuple, Some(11));
         assert_eq!(decoded[1].lock_tuple, None);
+        assert_eq!(decoded[0].lock_virtualxid, Some(StrId(22)));
+        assert_eq!(decoded[1].lock_virtualxid, None);
+        assert_eq!(decoded[0].lock_classid, Some(1_250));
+        assert_eq!(decoded[1].lock_classid, None);
+        assert_eq!(decoded[0].lock_objid, Some(54_321));
+        assert_eq!(decoded[1].lock_objid, None);
+        assert_eq!(decoded[0].lock_objsubid, Some(4));
+        assert_eq!(decoded[1].lock_objsubid, None);
         assert_eq!(decoded[0].lock_fastpath, Some(false));
         assert_eq!(decoded[1].lock_fastpath, None);
     }
@@ -475,11 +553,16 @@ mod tests {
         waiter.lock_locktype = Some(StrId(10));
         waiter.lock_mode = Some(StrId(11));
         waiter.lock_granted = Some(false);
+        waiter.lock_database = Some(16_384);
         waiter.lock_relation = Some(12_345);
         waiter.lock_relname = Some(StrId(12));
         waiter.lock_page = Some(42);
         waiter.lock_tuple = Some(7);
+        waiter.lock_virtualxid = Some(StrId(14));
         waiter.lock_transactionid = Some(999_999);
+        waiter.lock_classid = Some(1_250);
+        waiter.lock_objid = Some(12_345);
+        waiter.lock_objsubid = Some(2);
         waiter.lock_fastpath = Some(false);
         waiter.lock_target = Some(StrId(13));
         // Blocked behind a prepared-transaction holder: pg_blocking_pids yields 0.

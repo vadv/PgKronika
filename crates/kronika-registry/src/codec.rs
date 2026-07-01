@@ -54,6 +54,12 @@ pub const MAX_SECTION_BYTES: usize = 8 * 1024 * 1024;
 /// Decode rejects excessive row groups before reading column data.
 pub const MAX_ROW_GROUPS: usize = 16;
 
+/// Maximum `List<Int32>` child values accepted in one row.
+pub(crate) const MAX_LIST_I32_VALUES_PER_ROW: usize = 4096;
+
+/// Maximum `List<Int32>` child values accepted in one section.
+pub(crate) const MAX_LIST_I32_VALUES_PER_SECTION: usize = MAX_SECTION_ROWS * 4;
+
 /// Why a section failed to encode or decode.
 #[derive(Debug)]
 pub enum CodecError {
@@ -104,6 +110,15 @@ pub enum CodecError {
     NullInRequiredColumn {
         /// The column name.
         name: &'static str,
+    },
+    /// A `List<Int32>` column holds more child values than the codec accepts.
+    TooManyListValues {
+        /// The column name.
+        name: &'static str,
+        /// The child value count that exceeded the cap.
+        values: usize,
+        /// The enforced cap.
+        max: usize,
     },
     /// No registered type has the requested `type_id`.
     UnknownType {
@@ -170,6 +185,12 @@ impl fmt::Display for CodecError {
                     "decoded column {name:?} has a NULL but the contract forbids it"
                 )
             }
+            Self::TooManyListValues { name, values, max } => {
+                write!(
+                    f,
+                    "List<Int32> column {name:?} has {values} child values, above the cap of {max}"
+                )
+            }
             Self::UnknownType { type_id } => write!(f, "no registered type has id {type_id}"),
             Self::SchemaMismatch => {
                 write!(f, "decoded section schema does not match the contract")
@@ -201,6 +222,7 @@ impl Error for CodecError {
             | Self::MissingColumn { .. }
             | Self::ColumnType { .. }
             | Self::NullInRequiredColumn { .. }
+            | Self::TooManyListValues { .. }
             | Self::UnknownType { .. }
             | Self::SchemaMismatch
             | Self::SectionCrcMismatch { .. } => None,
@@ -253,7 +275,7 @@ fn build_arrow_schema(contract: &TypeContract) -> SchemaRef {
                 ColumnType::F64 => DataType::Float64,
                 ColumnType::Bool => DataType::Boolean,
                 ColumnType::ListI32 => {
-                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, false)))
                 }
             };
             Field::new(column.name, data_type, column.nullable)
@@ -281,18 +303,49 @@ pub fn write_required<T: ArrowPrimitiveType>(values: impl Iterator<Item = T::Nat
     Arc::new(PrimitiveArray::<T>::from_iter_values(values))
 }
 
-/// Build an Arrow `List<Int32>` column, one list per row (empty vec = empty
-/// list, never `NULL`).
-#[must_use]
-pub fn write_list_i32(rows: impl Iterator<Item = Vec<i32>>) -> ArrayRef {
-    let mut builder = ListBuilder::new(Int32Builder::new());
+/// Build an Arrow `List<Int32>` column, one list per row.
+///
+/// Empty vectors become empty lists; required list columns are never `NULL` and
+/// never contain `NULL` child values.
+///
+/// # Errors
+/// Returns [`CodecError`] if the child value count exceeds the row or section
+/// cap.
+pub fn write_list_i32(
+    name: &'static str,
+    rows: impl Iterator<Item = Vec<i32>>,
+) -> Result<ArrayRef, CodecError> {
+    let item = Arc::new(Field::new("item", DataType::Int32, false));
+    let mut builder = ListBuilder::new(Int32Builder::new()).with_field(item);
+    let mut total = 0_usize;
     for row in rows {
+        if row.len() > MAX_LIST_I32_VALUES_PER_ROW {
+            return Err(CodecError::TooManyListValues {
+                name,
+                values: row.len(),
+                max: MAX_LIST_I32_VALUES_PER_ROW,
+            });
+        }
+        total = total
+            .checked_add(row.len())
+            .ok_or(CodecError::TooManyListValues {
+                name,
+                values: usize::MAX,
+                max: MAX_LIST_I32_VALUES_PER_SECTION,
+            })?;
+        if total > MAX_LIST_I32_VALUES_PER_SECTION {
+            return Err(CodecError::TooManyListValues {
+                name,
+                values: total,
+                max: MAX_LIST_I32_VALUES_PER_SECTION,
+            });
+        }
         for value in row {
             builder.values().append_value(value);
         }
         builder.append(true);
     }
-    Arc::new(builder.finish())
+    Ok(Arc::new(builder.finish()))
 }
 
 /// A decoded `List<Int32>` column.
@@ -334,7 +387,66 @@ pub fn read_list_i32<'a>(
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or(CodecError::ColumnType { name })?;
+    validate_list_i32_array(array, name)?;
     Ok(ListColumn { array })
+}
+
+fn validate_list_i32_batch(batch: &RecordBatch, name: &'static str) -> Result<usize, CodecError> {
+    let column = batch
+        .column_by_name(name)
+        .ok_or(CodecError::MissingColumn { name })?;
+    let array = column
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or(CodecError::ColumnType { name })?;
+    validate_list_i32_array(array, name)
+}
+
+fn validate_list_i32_array(array: &ListArray, name: &'static str) -> Result<usize, CodecError> {
+    if array.null_count() != 0 {
+        return Err(CodecError::NullInRequiredColumn { name });
+    }
+
+    let mut total = 0_usize;
+    for i in 0..array.len() {
+        let len = usize::try_from(array.value_length(i)).map_err(|_err| {
+            CodecError::TooManyListValues {
+                name,
+                values: usize::MAX,
+                max: MAX_LIST_I32_VALUES_PER_ROW,
+            }
+        })?;
+        if len > MAX_LIST_I32_VALUES_PER_ROW {
+            return Err(CodecError::TooManyListValues {
+                name,
+                values: len,
+                max: MAX_LIST_I32_VALUES_PER_ROW,
+            });
+        }
+        total = total
+            .checked_add(len)
+            .ok_or(CodecError::TooManyListValues {
+                name,
+                values: usize::MAX,
+                max: MAX_LIST_I32_VALUES_PER_SECTION,
+            })?;
+        if total > MAX_LIST_I32_VALUES_PER_SECTION {
+            return Err(CodecError::TooManyListValues {
+                name,
+                values: total,
+                max: MAX_LIST_I32_VALUES_PER_SECTION,
+            });
+        }
+        let values = array.value(i);
+        let ints = values
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Int32Type>>()
+            .ok_or(CodecError::ColumnType { name })?;
+        if ints.null_count() != 0 {
+            return Err(CodecError::NullInRequiredColumn { name });
+        }
+    }
+    Ok(total)
 }
 
 /// Build a nullable primitive column; `None` becomes a `NULL` cell.
@@ -635,6 +747,13 @@ pub(crate) fn decode_section<Row>(
     if !schema_matches(&reader.schema(), contract) {
         return Err(CodecError::SchemaMismatch);
     }
+    let list_columns: Vec<&'static str> = contract
+        .columns
+        .iter()
+        .filter(|column| column.ty == ColumnType::ListI32)
+        .map(|column| column.name)
+        .collect();
+    let mut list_child_values = vec![0_usize; list_columns.len()];
     // Claimed rows are capped above; typed gather pushes one row per source row.
     let mut rows = Vec::with_capacity(claimed_rows);
     for batch in reader {
@@ -644,6 +763,24 @@ pub(crate) fn decode_section<Row>(
                 rows: rows.len() + batch.num_rows(),
                 max: MAX_SECTION_ROWS,
             });
+        }
+        for (i, &name) in list_columns.iter().enumerate() {
+            let values = validate_list_i32_batch(&batch, name)?;
+            list_child_values[i] =
+                list_child_values[i]
+                    .checked_add(values)
+                    .ok_or(CodecError::TooManyListValues {
+                        name,
+                        values: usize::MAX,
+                        max: MAX_LIST_I32_VALUES_PER_SECTION,
+                    })?;
+            if list_child_values[i] > MAX_LIST_I32_VALUES_PER_SECTION {
+                return Err(CodecError::TooManyListValues {
+                    name,
+                    values: list_child_values[i],
+                    max: MAX_LIST_I32_VALUES_PER_SECTION,
+                });
+            }
         }
         push_rows(&batch, &mut rows)?;
     }
@@ -663,6 +800,13 @@ pub(crate) fn decode_batches(
         return Err(CodecError::SchemaMismatch);
     }
 
+    let list_columns: Vec<&'static str> = contract
+        .columns
+        .iter()
+        .filter(|column| column.ty == ColumnType::ListI32)
+        .map(|column| column.name)
+        .collect();
+    let mut list_child_values = vec![0_usize; list_columns.len()];
     let mut batches = Vec::with_capacity(claimed_rows.div_ceil(DECODE_BATCH_SIZE).max(1));
     let mut rows = 0_usize;
     for batch in reader {
@@ -673,6 +817,24 @@ pub(crate) fn decode_batches(
                 rows,
                 max: MAX_SECTION_ROWS,
             });
+        }
+        for (i, &name) in list_columns.iter().enumerate() {
+            let values = validate_list_i32_batch(&batch, name)?;
+            list_child_values[i] =
+                list_child_values[i]
+                    .checked_add(values)
+                    .ok_or(CodecError::TooManyListValues {
+                        name,
+                        values: usize::MAX,
+                        max: MAX_LIST_I32_VALUES_PER_SECTION,
+                    })?;
+            if list_child_values[i] > MAX_LIST_I32_VALUES_PER_SECTION {
+                return Err(CodecError::TooManyListValues {
+                    name,
+                    values: list_child_values[i],
+                    max: MAX_LIST_I32_VALUES_PER_SECTION,
+                });
+            }
         }
         batches.push(batch);
     }
@@ -799,17 +961,26 @@ pub fn opt_bool(array: &BooleanArray, i: usize) -> Option<bool> {
 mod list_i32_tests {
     use std::sync::Arc;
 
+    use arrow_array::ListArray;
     use arrow_array::RecordBatch;
+    use arrow_array::types::Int32Type;
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::{read_list_i32, write_list_i32};
+    use super::{
+        CodecError, MAX_LIST_I32_VALUES_PER_ROW, MAX_LIST_I32_VALUES_PER_SECTION, read_list_i32,
+        write_list_i32,
+    };
 
     #[test]
     fn list_i32_roundtrips() {
-        let arr = write_list_i32(vec![vec![1, 2, 3], vec![], vec![0, 7]].into_iter());
+        let arr = write_list_i32(
+            "blocked_by",
+            vec![vec![1, 2, 3], vec![], vec![0, 7]].into_iter(),
+        )
+        .expect("write");
         let field = Field::new(
             "blocked_by",
-            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
             false,
         );
         let batch =
@@ -818,6 +989,76 @@ mod list_i32_tests {
         assert_eq!(col.value(0), vec![1, 2, 3]);
         assert_eq!(col.value(1), Vec::<i32>::new());
         assert_eq!(col.value(2), vec![0, 7]);
+    }
+
+    #[test]
+    fn list_i32_rejects_null_list() {
+        let arr = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(1)]),
+            None,
+        ]));
+        let field = Field::new(
+            "blocked_by",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        );
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr]).expect("batch");
+        assert!(matches!(
+            read_list_i32(&batch, "blocked_by"),
+            Err(CodecError::NullInRequiredColumn { name: "blocked_by" })
+        ));
+    }
+
+    #[test]
+    fn list_i32_rejects_null_child_value() {
+        let arr = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([Some(
+            vec![Some(1), None],
+        )]));
+        let field = Field::new(
+            "blocked_by",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            false,
+        );
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr]).expect("batch");
+        assert!(matches!(
+            read_list_i32(&batch, "blocked_by"),
+            Err(CodecError::NullInRequiredColumn { name: "blocked_by" })
+        ));
+    }
+
+    #[test]
+    fn list_i32_rejects_oversized_row() {
+        let err = write_list_i32(
+            "blocked_by",
+            [vec![0; MAX_LIST_I32_VALUES_PER_ROW + 1]].into_iter(),
+        )
+        .expect_err("oversized row rejected");
+        assert!(matches!(
+            err,
+            CodecError::TooManyListValues {
+                name: "blocked_by",
+                values,
+                max: MAX_LIST_I32_VALUES_PER_ROW
+            } if values == MAX_LIST_I32_VALUES_PER_ROW + 1
+        ));
+    }
+
+    #[test]
+    fn list_i32_rejects_oversized_section() {
+        let row = vec![0; MAX_LIST_I32_VALUES_PER_ROW];
+        let rows = (0..=(MAX_LIST_I32_VALUES_PER_SECTION / MAX_LIST_I32_VALUES_PER_ROW))
+            .map(|_| row.clone());
+        let err = write_list_i32("blocked_by", rows).expect_err("oversized section rejected");
+        assert!(matches!(
+            err,
+            CodecError::TooManyListValues {
+                name: "blocked_by",
+                values,
+                max: MAX_LIST_I32_VALUES_PER_SECTION
+            } if values > MAX_LIST_I32_VALUES_PER_SECTION
+        ));
     }
 
     #[test]

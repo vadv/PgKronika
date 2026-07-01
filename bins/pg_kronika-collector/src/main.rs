@@ -36,8 +36,9 @@
 //! - `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`: cap for the adaptive `statement_timeout`
 //!   of the heavy per-table size query, default 60000. A `57014` (query canceled)
 //!   widens the timeout and retries the same database until this cap;
-//! - `KRONIKA_PG_MAX_LOCK_ROWS`: maximum rows returned by the lock-wait tree
-//!   query, default 1000. The section is skipped entirely when no waits exist.
+//! - `KRONIKA_PG_MAX_LOCK_ROWS`: lock-wait graph guard, default 1000. The
+//!   section is skipped when no waits exist or when waiters, edges, or nodes
+//!   exceed this value.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
@@ -103,7 +104,7 @@ struct Config {
     pool_refresh_secs: u64,
     /// Cap for the adaptive `statement_timeout` of the heavy per-table query, ms.
     heavy_timeout_cap_ms: u64,
-    /// Maximum rows returned by the lock-wait tree query.
+    /// Maximum lock-wait waiters, edges, and nodes accepted for one section.
     max_lock_rows: i64,
 }
 
@@ -235,6 +236,10 @@ fn validate_heavy_cap(heavy_timeout_cap_ms: u64) -> Result<()> {
 /// [`MAX_SECTION_ROWS`].
 fn validate_max_lock_rows(max_lock_rows: i64) -> Result<()> {
     let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
+    anyhow::ensure!(
+        max_lock_rows > 0,
+        "KRONIKA_PG_MAX_LOCK_ROWS must be greater than 0"
+    );
     anyhow::ensure!(
         max_lock_rows <= cap,
         "KRONIKA_PG_MAX_LOCK_ROWS ({max_lock_rows}) exceeds the {cap}-row section cap; \
@@ -753,18 +758,7 @@ async fn snapshot_and_seal(
     let replication_instance_row = collect_replication_instance(client, major)
         .await
         .context("collect replication instance status")?;
-    let lock_rows = match lock_waits_exist(client).await {
-        Ok(true) => collect_locks(client, major, config.max_lock_rows)
-            .await
-            .context("collect pg_locks wait tree")?,
-        Ok(false) => Vec::new(),
-        Err(err) => {
-            eprintln!(
-                "pg_kronika-collector: lock-wait precheck failed; skipping section 1_011: {err}"
-            );
-            Vec::new()
-        }
-    };
+    let lock_rows = collect_lock_rows(client, major, config.max_lock_rows).await;
 
     let user_tables = collect_user_tables_all(pool, major, config).await;
     let user_indexes = collect_user_indexes_all(pool, major, config).await;
@@ -828,6 +822,41 @@ async fn snapshot_and_seal(
     // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
+}
+
+/// Collect lock-wait rows or degrade by skipping only section `1_011`.
+async fn collect_lock_rows(client: &Client, major: u32, max_lock_rows: i64) -> Vec<LocksRow> {
+    match lock_waits_exist(client).await {
+        Ok(true) => match collect_locks(client, major, max_lock_rows).await {
+            Ok(snapshot) => {
+                if let Some(skipped) = snapshot.skipped {
+                    eprintln!(
+                        "pg_kronika-collector: skipping section 1_011 for this snapshot; \
+                         lock-wait graph exceeds KRONIKA_PG_MAX_LOCK_ROWS={} \
+                         (waiters={}, edges={}, nodes={})",
+                        skipped.max_rows, skipped.waiters, skipped.edges, skipped.nodes
+                    );
+                    Vec::new()
+                } else {
+                    snapshot.rows
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "pg_kronika-collector: pg_locks wait-tree collection failed; \
+                     skipping section 1_011 for this snapshot: {err}"
+                );
+                Vec::new()
+            }
+        },
+        Ok(false) => Vec::new(),
+        Err(err) => {
+            eprintln!(
+                "pg_kronika-collector: lock-wait precheck failed; skipping section 1_011: {err}"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Limits for interned activity strings.
@@ -1804,6 +1833,12 @@ mod tests {
         assert!(err.to_string().contains("KRONIKA_PG_MAX_LOCK_ROWS"));
     }
 
+    #[test]
+    fn max_lock_rows_validation_rejects_zero() {
+        let err = validate_max_lock_rows(0).expect_err("zero disables the graph guard");
+        assert!(err.to_string().contains("greater than 0"));
+    }
+
     fn locks_root_row() -> LocksRow {
         LocksRow {
             ts: 1_000_000,
@@ -1830,11 +1865,16 @@ mod tests {
             lock_locktype: None,
             lock_mode: None,
             lock_granted: None,
+            lock_database: None,
             lock_relation: None,
             lock_relname: None,
             lock_page: None,
             lock_tuple: None,
+            lock_virtualxid: None,
             lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
             lock_fastpath: None,
             lock_target: None,
             waitstart: None,

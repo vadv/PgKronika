@@ -88,9 +88,9 @@ Node and backend context (from `pg_stat_activity`):
 ```text
 ts                 ts        T
 pid                i32       L
-blocked_by         list<i32> L   // deduped pg_blocking_pids; [] for roots; may contain 0 (prepared xact)
-depth              i32       G   // distance from a root, from the CTE
-root_pid           i32       L   // a root of this node's component
+blocked_by         list<i32> L   // deduped pg_blocking_pids; may contain 0 (prepared xact)
+depth              i32       G   // distance from the selected component anchor
+root_pid           i32       L   // backend anchor, or 0 for prepared-xact components
 datid              u32       L
 datname            str       L
 usename            str?      L   // NULL for some background backends
@@ -116,11 +116,16 @@ non-waiting roots):
 lock_locktype      str?      L   // relation | transactionid | tuple | advisory | ...
 lock_mode          str?      L   // AccessExclusiveLock | ShareLock | ...
 lock_granted       bool?     L   // always false for the awaited row (recorded for completeness)
+lock_database      u32?      L   // pg_locks.database
 lock_relation      u32?      L   // relation OID (relation/page/tuple/extend locks)
 lock_relname       str?      L   // resolved only for current_database's relations (see limitation)
 lock_page          i32?      G
 lock_tuple         i16?      G
+lock_virtualxid    str?      L   // pg_locks.virtualxid
 lock_transactionid i64?      L   // xid being waited on (row-lock pattern); raw xid
+lock_classid       u32?      L   // pg_locks.classid
+lock_objid         u32?      L   // pg_locks.objid
+lock_objsubid      i16?      L   // pg_locks.objsubid
 lock_fastpath      bool?     L
 lock_target        str?      L   // human-readable target, best effort
 waitstart          ts?       G   // PG14+ (1_011_002 only); recorded lock-wait start; nullable even when granted = false
@@ -128,9 +133,10 @@ waitstart          ts?       G   // PG14+ (1_011_002 only); recorded lock-wait s
 
 **Cross-database relname limitation:** `pg_locks` is cluster-wide, but `pg_class`
 is per database. A relation lock in another database can be recorded only as
-`lock_relation` (OID) plus `datid`; `lock_relname` is resolved only for relations
-in the connected database and is NULL otherwise. Raw OID and `datid` are always
-recorded. The reader can resolve names if it has per-database catalogs.
+`lock_database` plus `lock_relation`; `lock_relname` is resolved only when
+`pg_locks.database` is the connected database or `0` for shared catalogs. Raw
+OIDs are always recorded. The reader can resolve names if it has per-database
+catalogs.
 
 ## Collection mechanics
 
@@ -139,20 +145,24 @@ Collection has two stages:
 1. **Precheck (cheap):** `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE
    wait_event_type = 'Lock')`. If there are no lock waits, no section is written.
 2. **Recursive CTE (only if waits exist):** seed from backends where
-   `wait_event_type = 'Lock'`; compute each waiter's `pg_blocking_pids(pid)`;
-   climb transitively to the roots; gather every backend in the component; join
-   `pg_stat_activity` for node context, `LEFT JOIN pg_locks` for the awaited
-   `granted = false` lock, and `LEFT JOIN pg_class`/`pg_database` for available
-   names. Apply the max-rows cap with `LIMIT`.
+   `wait_event_type = 'Lock'`; compute each waiter's `pg_blocking_pids(pid)`
+   once; guard waiters, edges, and backend nodes against
+   `KRONIKA_PG_MAX_LOCK_ROWS`; traverse from real roots, prepared-xact
+   `root_pid = 0` anchors, and fallback anchors for rootless/cyclic components;
+   join `pg_stat_activity` for node context, deterministic `pg_locks NOT
+   GRANTED` rows for awaited locks, and `pg_class` only when relation names are
+   visible from the connected database.
 
 - Call `pg_blocking_pids` only for backends that are waiting on `Lock`, not for
   every backend. It takes exclusive access to the lock manager's shared state.
 - Deduplicate each array; parallel queries can duplicate leader PIDs.
 - **Cycle-safe:** `1_011_002` (PG14+) uses the SQL `CYCLE` clause; `1_011_001`
   (PG10-13) uses a manual `NOT pid = ANY(path)` guard.
-- **PID 0** (prepared-transaction blocker) is kept as an opaque root node.
-- **Volume knob:** `KRONIKA_PG_MAX_LOCK_ROWS` (default 1000) caps the section.
-  Startup validation keeps it under `MAX_SECTION_ROWS` (65536).
+- **PID 0** (prepared-transaction blocker) is kept as an opaque edge endpoint
+  and `root_pid = 0` anchor; no synthetic backend row is emitted.
+- **Volume knob:** `KRONIKA_PG_MAX_LOCK_ROWS` (default 1000, minimum 1) guards
+  waiters, edges, and backend nodes. If it trips, section `1_011` is skipped for
+  that snapshot instead of writing a truncated graph.
 - The query is wrapped in the file's `marked!` macro for SQL transparency.
 
 ## Codec support - `list<i32>` columns

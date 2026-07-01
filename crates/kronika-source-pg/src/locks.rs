@@ -1,9 +1,9 @@
 //! `PostgreSQL` lock-wait tree collection (type `1_011`).
 //!
-//! Class A: one connection sees all backends cluster-wide. Two-stage — a cheap
-//! `EXISTS` precheck gates a cycle-safe recursive CTE over `pg_blocking_pids`.
-//! The collector records raw nodes plus `blocked_by` edges; the read side builds
-//! and interprets the tree. No thresholds or verdicts live here — `depth` and
+//! Class A: one connection sees all backends cluster-wide. A cheap `EXISTS`
+//! precheck gates a guarded recursive CTE over `pg_blocking_pids`. The collector
+//! records raw nodes plus `blocked_by` edges; the read side builds and
+//! interprets the tree. No thresholds or verdicts live here — `depth` and
 //! `root_pid` are structural traversal outputs.
 //!
 //! The layout splits on the PG14 `waitstart` column: V1 (PG10-13) has no
@@ -76,28 +76,75 @@ pub const fn locks_query(version: LocksVersion) -> &'static str {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the SQL literal is kept contiguous so tests can check the collected statement"
+)]
 const fn locks_query_v2() -> &'static str {
     marked!(
         "WITH RECURSIVE \
          snap AS (SELECT statement_timestamp() AS ts), \
-         waiters AS (SELECT a.pid, pg_blocking_pids(a.pid) AS bp \
-                     FROM pg_stat_activity a WHERE a.wait_event_type = 'Lock'), \
+         current_db AS (SELECT oid FROM pg_database WHERE datname = current_database()), \
+         waiters_raw AS (SELECT a.pid, pg_blocking_pids(a.pid) AS bp \
+                         FROM pg_stat_activity a WHERE a.wait_event_type = 'Lock'), \
+         waiters AS (SELECT wr.pid, \
+                            COALESCE((SELECT array_agg(DISTINCT b ORDER BY b) \
+                                      FROM unnest(wr.bp) AS b), ARRAY[]::int[]) AS bp \
+                     FROM waiters_raw wr), \
          edges AS (SELECT w.pid AS waiter, b AS blocker \
                    FROM waiters w, unnest(w.bp) AS b), \
-         roots AS (SELECT DISTINCT e.blocker AS pid FROM edges e \
-                   WHERE e.blocker <> 0 AND e.blocker NOT IN (SELECT pid FROM waiters)), \
-         tree AS (SELECT r.pid, 0 AS depth, r.pid AS root_pid FROM roots r \
+         node_ids AS (SELECT pid FROM waiters UNION SELECT blocker FROM edges WHERE blocker <> 0), \
+         counts AS (SELECT (SELECT count(*) FROM waiters)::int8 AS waiters, \
+                           (SELECT count(*) FROM edges)::int8 AS edges, \
+                           (SELECT count(*) FROM node_ids)::int8 AS nodes), \
+         guard AS (SELECT waiters, edges, nodes, $1::int8 AS max_rows, \
+                          waiters <= $1::int8 AND edges <= $1::int8 AND nodes <= $1::int8 AS ok \
+                   FROM counts), \
+         real_roots AS (SELECT DISTINCT e.blocker AS pid FROM edges e \
+                        WHERE e.blocker <> 0 AND NOT EXISTS \
+                          (SELECT 1 FROM waiters w WHERE w.pid = e.blocker)), \
+         primary_seeds(pid, depth, root_pid, root_priority) AS ( \
+           SELECT r.pid, 0, r.pid, 0 FROM real_roots r JOIN guard g ON g.ok \
+           UNION ALL \
+           SELECT DISTINCT e.waiter, 1, 0, 1 FROM edges e JOIN guard g ON g.ok WHERE e.blocker = 0), \
+         primary_tree(pid, depth, root_pid, root_priority) AS ( \
+           SELECT pid, depth, root_pid, root_priority FROM primary_seeds \
+           UNION ALL \
+           SELECT e.waiter, t.depth + 1, t.root_pid, t.root_priority \
+           FROM primary_tree t JOIN edges e ON e.blocker = t.pid JOIN guard g ON g.ok \
+           WHERE t.depth < g.max_rows) \
+           CYCLE pid SET is_cycle USING path, \
+         primary_nodes AS (SELECT DISTINCT pid FROM primary_tree WHERE NOT is_cycle), \
+         fallback_seeds(pid, depth, root_pid, root_priority) AS ( \
+           SELECT w.pid, 0, w.pid, 2 FROM waiters w JOIN guard g ON g.ok \
+           WHERE NOT EXISTS (SELECT 1 FROM primary_nodes pn WHERE pn.pid = w.pid)), \
+         fallback_tree(pid, depth, root_pid, root_priority) AS ( \
+           SELECT pid, depth, root_pid, root_priority FROM fallback_seeds \
+           UNION ALL \
+           SELECT e.waiter, t.depth + 1, t.root_pid, t.root_priority \
+           FROM fallback_tree t JOIN edges e ON e.blocker = t.pid JOIN guard g ON g.ok \
+           WHERE t.depth < g.max_rows) \
+           CYCLE pid SET is_cycle USING fallback_path, \
+         tree AS (SELECT pid, depth, root_pid, root_priority FROM primary_tree WHERE NOT is_cycle \
                   UNION ALL \
-                  SELECT e.waiter, t.depth + 1, t.root_pid \
-                  FROM tree t JOIN edges e ON e.blocker = t.pid) \
-                  CYCLE pid SET is_cycle USING path, \
-         nodes AS (SELECT pid, min(depth) AS depth, \
-                          (array_agg(root_pid ORDER BY depth))[1] AS root_pid \
-                   FROM tree GROUP BY pid) \
-         SELECT n.pid, n.depth, n.root_pid, \
-           COALESCE((SELECT array_agg(DISTINCT b ORDER BY b) \
-                     FROM unnest(pg_blocking_pids(n.pid)) b), ARRAY[]::int[]) AS blocked_by, \
-           coalesce(a.datid, 0) AS datid, coalesce(a.datname::text, '') AS datname, a.usename::text AS usename, \
+                  SELECT pid, depth, root_pid, root_priority FROM fallback_tree WHERE NOT is_cycle), \
+         nodes AS (SELECT DISTINCT ON (pid) pid, depth, root_pid \
+                   FROM tree \
+                   ORDER BY pid, root_priority, \
+                     CASE WHEN root_priority = 2 THEN root_pid ELSE depth END, \
+                     CASE WHEN root_priority = 2 THEN depth ELSE root_pid END), \
+         waiting_locks AS (SELECT DISTINCT ON (pid) pid, locktype, database, relation, page, tuple, \
+                                  virtualxid, transactionid, classid, objid, objsubid, mode, \
+                                  granted, fastpath, waitstart \
+                           FROM pg_locks WHERE NOT granted \
+                           ORDER BY pid, locktype, mode, database NULLS FIRST, relation NULLS FIRST, \
+                                    page NULLS FIRST, tuple NULLS FIRST, virtualxid NULLS FIRST, \
+                                    transactionid NULLS FIRST, classid NULLS FIRST, objid NULLS FIRST, \
+                                    objsubid NULLS FIRST, fastpath), \
+         out AS (SELECT false AS kronika_skipped, g.waiters AS kronika_waiters, \
+           g.edges AS kronika_edges, g.nodes AS kronika_nodes, n.pid, n.depth, n.root_pid, \
+           COALESCE(w.bp, ARRAY[]::int[]) AS blocked_by, \
+           coalesce(a.datid, 0::oid) AS datid, coalesce(a.datname::text, '') AS datname, a.usename::text AS usename, \
            coalesce(a.application_name, '') AS application_name, \
            coalesce(host(a.client_addr), '') AS client_addr, \
            coalesce(a.backend_type, '') AS backend_type, a.state, \
@@ -110,45 +157,110 @@ const fn locks_query_v2() -> &'static str {
            (extract(epoch FROM a.query_start) * 1e6)::int8 AS query_start_us, \
            (extract(epoch FROM a.state_change) * 1e6)::int8 AS state_change_us, \
            l.locktype AS lock_locktype, l.mode AS lock_mode, l.granted AS lock_granted, \
-           l.relation AS lock_relation, c.relname::text AS lock_relname, \
+           l.database AS lock_database, l.relation AS lock_relation, c.relname::text AS lock_relname, \
            l.page AS lock_page, l.tuple AS lock_tuple, \
-           l.transactionid::text::int8 AS lock_transactionid, l.fastpath AS lock_fastpath, \
-           (l.locktype || coalesce(':' || c.relname, '')) AS lock_target, \
+           l.virtualxid::text AS lock_virtualxid, l.transactionid::text::int8 AS lock_transactionid, \
+           l.classid AS lock_classid, l.objid AS lock_objid, l.objsubid AS lock_objsubid, \
+           l.fastpath AS lock_fastpath, \
+           (l.locktype || coalesce(':' || c.relname, ':' || l.relation::text, \
+                                   ':' || l.transactionid::text, ':' || l.virtualxid::text, \
+                                   ':' || l.classid::text || '/' || l.objid::text || '/' || l.objsubid::text, '')) AS lock_target, \
            (extract(epoch FROM l.waitstart) * 1e6)::int8 AS waitstart_us, \
            (extract(epoch FROM snap.ts) * 1e6)::int8 AS ts_us \
-         FROM nodes n CROSS JOIN snap \
+         FROM nodes n CROSS JOIN snap CROSS JOIN guard g \
          JOIN pg_stat_activity a ON a.pid = n.pid \
-         LEFT JOIN LATERAL (SELECT lk.locktype, lk.mode, lk.granted, lk.relation, lk.page, \
-                                   lk.tuple, lk.transactionid, lk.fastpath, lk.waitstart \
-                            FROM pg_locks lk WHERE lk.pid = n.pid AND NOT lk.granted LIMIT 1) l ON true \
-         LEFT JOIN pg_class c ON c.oid = l.relation \
-         ORDER BY n.root_pid, n.depth, n.pid \
-         LIMIT $1"
+         LEFT JOIN waiters w ON w.pid = n.pid \
+         LEFT JOIN waiting_locks l ON l.pid = n.pid \
+         LEFT JOIN current_db db ON true \
+         LEFT JOIN pg_class c ON c.oid = l.relation AND (l.database = db.oid OR l.database = 0::oid) \
+         WHERE g.ok) \
+         SELECT * FROM out \
+         UNION ALL \
+         SELECT true AS kronika_skipped, g.waiters, g.edges, g.nodes, NULL::int4 AS pid, \
+           NULL::int4 AS depth, NULL::int4 AS root_pid, NULL::int4[] AS blocked_by, \
+           NULL::oid AS datid, NULL::text AS datname, NULL::text AS usename, \
+           NULL::text AS application_name, NULL::text AS client_addr, NULL::text AS backend_type, \
+           NULL::text AS state, NULL::text AS wait_event_type, NULL::text AS wait_event, \
+           NULL::text AS query, NULL::int8 AS backend_xid_age, NULL::int8 AS backend_xmin_age, \
+           NULL::int8 AS backend_start_us, NULL::int8 AS xact_start_us, NULL::int8 AS query_start_us, \
+           NULL::int8 AS state_change_us, NULL::text AS lock_locktype, NULL::text AS lock_mode, \
+           NULL::bool AS lock_granted, NULL::oid AS lock_database, NULL::oid AS lock_relation, \
+           NULL::text AS lock_relname, NULL::int4 AS lock_page, NULL::int2 AS lock_tuple, \
+           NULL::text AS lock_virtualxid, NULL::int8 AS lock_transactionid, NULL::oid AS lock_classid, \
+           NULL::oid AS lock_objid, NULL::int2 AS lock_objsubid, NULL::bool AS lock_fastpath, \
+           NULL::text AS lock_target, NULL::int8 AS waitstart_us, NULL::int8 AS ts_us \
+         FROM guard g WHERE NOT g.ok \
+         ORDER BY kronika_skipped, root_pid, depth, pid"
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the SQL literal is kept contiguous so tests can check the collected statement"
+)]
 const fn locks_query_v1() -> &'static str {
     marked!(
         "WITH RECURSIVE \
          snap AS (SELECT statement_timestamp() AS ts), \
-         waiters AS (SELECT a.pid, pg_blocking_pids(a.pid) AS bp \
-                     FROM pg_stat_activity a WHERE a.wait_event_type = 'Lock'), \
+         current_db AS (SELECT oid FROM pg_database WHERE datname = current_database()), \
+         waiters_raw AS (SELECT a.pid, pg_blocking_pids(a.pid) AS bp \
+                         FROM pg_stat_activity a WHERE a.wait_event_type = 'Lock'), \
+         waiters AS (SELECT wr.pid, \
+                            COALESCE((SELECT array_agg(DISTINCT b ORDER BY b) \
+                                      FROM unnest(wr.bp) AS b), ARRAY[]::int[]) AS bp \
+                     FROM waiters_raw wr), \
          edges AS (SELECT w.pid AS waiter, b AS blocker \
                    FROM waiters w, unnest(w.bp) AS b), \
-         roots AS (SELECT DISTINCT e.blocker AS pid FROM edges e \
-                   WHERE e.blocker <> 0 AND e.blocker NOT IN (SELECT pid FROM waiters)), \
-         tree AS (SELECT r.pid, 0 AS depth, r.pid AS root_pid, ARRAY[r.pid] AS path FROM roots r \
+         node_ids AS (SELECT pid FROM waiters UNION SELECT blocker FROM edges WHERE blocker <> 0), \
+         counts AS (SELECT (SELECT count(*) FROM waiters)::int8 AS waiters, \
+                           (SELECT count(*) FROM edges)::int8 AS edges, \
+                           (SELECT count(*) FROM node_ids)::int8 AS nodes), \
+         guard AS (SELECT waiters, edges, nodes, $1::int8 AS max_rows, \
+                          waiters <= $1::int8 AND edges <= $1::int8 AND nodes <= $1::int8 AS ok \
+                   FROM counts), \
+         real_roots AS (SELECT DISTINCT e.blocker AS pid FROM edges e \
+                        WHERE e.blocker <> 0 AND NOT EXISTS \
+                          (SELECT 1 FROM waiters w WHERE w.pid = e.blocker)), \
+         primary_seeds(pid, depth, root_pid, root_priority, path) AS ( \
+           SELECT r.pid, 0, r.pid, 0, ARRAY[r.pid] FROM real_roots r JOIN guard g ON g.ok \
+           UNION ALL \
+           SELECT DISTINCT e.waiter, 1, 0, 1, ARRAY[e.waiter] FROM edges e JOIN guard g ON g.ok WHERE e.blocker = 0), \
+         primary_tree(pid, depth, root_pid, root_priority, path) AS ( \
+           SELECT pid, depth, root_pid, root_priority, path FROM primary_seeds \
+           UNION ALL \
+           SELECT e.waiter, t.depth + 1, t.root_pid, t.root_priority, t.path || e.waiter \
+           FROM primary_tree t JOIN edges e ON e.blocker = t.pid JOIN guard g ON g.ok \
+           WHERE t.depth < g.max_rows AND NOT e.waiter = ANY(t.path)), \
+         primary_nodes AS (SELECT DISTINCT pid FROM primary_tree), \
+         fallback_seeds(pid, depth, root_pid, root_priority, path) AS ( \
+           SELECT w.pid, 0, w.pid, 2, ARRAY[w.pid] FROM waiters w JOIN guard g ON g.ok \
+           WHERE NOT EXISTS (SELECT 1 FROM primary_nodes pn WHERE pn.pid = w.pid)), \
+         fallback_tree(pid, depth, root_pid, root_priority, path) AS ( \
+           SELECT pid, depth, root_pid, root_priority, path FROM fallback_seeds \
+           UNION ALL \
+           SELECT e.waiter, t.depth + 1, t.root_pid, t.root_priority, t.path || e.waiter \
+           FROM fallback_tree t JOIN edges e ON e.blocker = t.pid JOIN guard g ON g.ok \
+           WHERE t.depth < g.max_rows AND NOT e.waiter = ANY(t.path)), \
+         tree AS (SELECT pid, depth, root_pid, root_priority FROM primary_tree \
                   UNION ALL \
-                  SELECT e.waiter, t.depth + 1, t.root_pid, t.path || e.waiter AS path \
-                  FROM tree t JOIN edges e ON e.blocker = t.pid \
-                  WHERE NOT e.waiter = ANY(t.path)), \
-         nodes AS (SELECT pid, min(depth) AS depth, \
-                          (array_agg(root_pid ORDER BY depth))[1] AS root_pid \
-                   FROM tree GROUP BY pid) \
-         SELECT n.pid, n.depth, n.root_pid, \
-           COALESCE((SELECT array_agg(DISTINCT b ORDER BY b) \
-                     FROM unnest(pg_blocking_pids(n.pid)) b), ARRAY[]::int[]) AS blocked_by, \
-           coalesce(a.datid, 0) AS datid, coalesce(a.datname::text, '') AS datname, a.usename::text AS usename, \
+                  SELECT pid, depth, root_pid, root_priority FROM fallback_tree), \
+         nodes AS (SELECT DISTINCT ON (pid) pid, depth, root_pid \
+                   FROM tree \
+                   ORDER BY pid, root_priority, \
+                     CASE WHEN root_priority = 2 THEN root_pid ELSE depth END, \
+                     CASE WHEN root_priority = 2 THEN depth ELSE root_pid END), \
+         waiting_locks AS (SELECT DISTINCT ON (pid) pid, locktype, database, relation, page, tuple, \
+                                  virtualxid, transactionid, classid, objid, objsubid, mode, \
+                                  granted, fastpath \
+                           FROM pg_locks WHERE NOT granted \
+                           ORDER BY pid, locktype, mode, database NULLS FIRST, relation NULLS FIRST, \
+                                    page NULLS FIRST, tuple NULLS FIRST, virtualxid NULLS FIRST, \
+                                    transactionid NULLS FIRST, classid NULLS FIRST, objid NULLS FIRST, \
+                                    objsubid NULLS FIRST, fastpath), \
+         out AS (SELECT false AS kronika_skipped, g.waiters AS kronika_waiters, \
+           g.edges AS kronika_edges, g.nodes AS kronika_nodes, n.pid, n.depth, n.root_pid, \
+           COALESCE(w.bp, ARRAY[]::int[]) AS blocked_by, \
+           coalesce(a.datid, 0::oid) AS datid, coalesce(a.datname::text, '') AS datname, a.usename::text AS usename, \
            coalesce(a.application_name, '') AS application_name, \
            coalesce(host(a.client_addr), '') AS client_addr, \
            coalesce(a.backend_type, '') AS backend_type, a.state, \
@@ -161,19 +273,39 @@ const fn locks_query_v1() -> &'static str {
            (extract(epoch FROM a.query_start) * 1e6)::int8 AS query_start_us, \
            (extract(epoch FROM a.state_change) * 1e6)::int8 AS state_change_us, \
            l.locktype AS lock_locktype, l.mode AS lock_mode, l.granted AS lock_granted, \
-           l.relation AS lock_relation, c.relname::text AS lock_relname, \
+           l.database AS lock_database, l.relation AS lock_relation, c.relname::text AS lock_relname, \
            l.page AS lock_page, l.tuple AS lock_tuple, \
-           l.transactionid::text::int8 AS lock_transactionid, l.fastpath AS lock_fastpath, \
-           (l.locktype || coalesce(':' || c.relname, '')) AS lock_target, \
+           l.virtualxid::text AS lock_virtualxid, l.transactionid::text::int8 AS lock_transactionid, \
+           l.classid AS lock_classid, l.objid AS lock_objid, l.objsubid AS lock_objsubid, \
+           l.fastpath AS lock_fastpath, \
+           (l.locktype || coalesce(':' || c.relname, ':' || l.relation::text, \
+                                   ':' || l.transactionid::text, ':' || l.virtualxid::text, \
+                                   ':' || l.classid::text || '/' || l.objid::text || '/' || l.objsubid::text, '')) AS lock_target, \
            (extract(epoch FROM snap.ts) * 1e6)::int8 AS ts_us \
-         FROM nodes n CROSS JOIN snap \
+         FROM nodes n CROSS JOIN snap CROSS JOIN guard g \
          JOIN pg_stat_activity a ON a.pid = n.pid \
-         LEFT JOIN LATERAL (SELECT lk.locktype, lk.mode, lk.granted, lk.relation, lk.page, \
-                                   lk.tuple, lk.transactionid, lk.fastpath \
-                            FROM pg_locks lk WHERE lk.pid = n.pid AND NOT lk.granted LIMIT 1) l ON true \
-         LEFT JOIN pg_class c ON c.oid = l.relation \
-         ORDER BY n.root_pid, n.depth, n.pid \
-         LIMIT $1"
+         LEFT JOIN waiters w ON w.pid = n.pid \
+         LEFT JOIN waiting_locks l ON l.pid = n.pid \
+         LEFT JOIN current_db db ON true \
+         LEFT JOIN pg_class c ON c.oid = l.relation AND (l.database = db.oid OR l.database = 0::oid) \
+         WHERE g.ok) \
+         SELECT * FROM out \
+         UNION ALL \
+         SELECT true AS kronika_skipped, g.waiters, g.edges, g.nodes, NULL::int4 AS pid, \
+           NULL::int4 AS depth, NULL::int4 AS root_pid, NULL::int4[] AS blocked_by, \
+           NULL::oid AS datid, NULL::text AS datname, NULL::text AS usename, \
+           NULL::text AS application_name, NULL::text AS client_addr, NULL::text AS backend_type, \
+           NULL::text AS state, NULL::text AS wait_event_type, NULL::text AS wait_event, \
+           NULL::text AS query, NULL::int8 AS backend_xid_age, NULL::int8 AS backend_xmin_age, \
+           NULL::int8 AS backend_start_us, NULL::int8 AS xact_start_us, NULL::int8 AS query_start_us, \
+           NULL::int8 AS state_change_us, NULL::text AS lock_locktype, NULL::text AS lock_mode, \
+           NULL::bool AS lock_granted, NULL::oid AS lock_database, NULL::oid AS lock_relation, \
+           NULL::text AS lock_relname, NULL::int4 AS lock_page, NULL::int2 AS lock_tuple, \
+           NULL::text AS lock_virtualxid, NULL::int8 AS lock_transactionid, NULL::oid AS lock_classid, \
+           NULL::oid AS lock_objid, NULL::int2 AS lock_objsubid, NULL::bool AS lock_fastpath, \
+           NULL::text AS lock_target, NULL::int8 AS ts_us \
+         FROM guard g WHERE NOT g.ok \
+         ORDER BY kronika_skipped, root_pid, depth, pid"
     )
 }
 
@@ -230,6 +362,8 @@ pub struct LocksRow {
     /// Whether the awaited lock is granted; always false for the awaited row,
     /// recorded for completeness.
     pub lock_granted: Option<bool>,
+    /// Database oid from the awaited `pg_locks` row.
+    pub lock_database: Option<u32>,
     /// Relation oid of the awaited lock.
     pub lock_relation: Option<u32>,
     /// Relation name, resolved only for the connected database.
@@ -238,14 +372,45 @@ pub struct LocksRow {
     pub lock_page: Option<i32>,
     /// Tuple offset of a tuple lock target.
     pub lock_tuple: Option<i16>,
+    /// Virtual transaction id for `virtualxid` locks.
+    pub lock_virtualxid: Option<String>,
     /// Transaction id being awaited (row-lock pattern), raw xid.
     pub lock_transactionid: Option<i64>,
+    /// Class oid for object locks.
+    pub lock_classid: Option<u32>,
+    /// Object oid for object locks.
+    pub lock_objid: Option<u32>,
+    /// Object sub-id for object locks.
+    pub lock_objsubid: Option<i16>,
     /// Whether the awaited lock was taken via the fast path.
     pub lock_fastpath: Option<bool>,
     /// Human-readable target, best effort.
     pub lock_target: Option<String>,
     /// Lock-wait start (PG14+); `None` on V1 or while not yet timed.
     pub waitstart: Option<i64>,
+}
+
+/// Lock graph skipped because it exceeded the configured guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocksSkipped {
+    /// Waiting backends seen by the guarded query.
+    pub waiters: i64,
+    /// Edges returned by `pg_blocking_pids` across those waiters.
+    pub edges: i64,
+    /// Backend nodes that would be emitted, excluding PID `0`.
+    pub nodes: i64,
+    /// The configured `KRONIKA_PG_MAX_LOCK_ROWS` value.
+    pub max_rows: i64,
+}
+
+/// Result of a lock-wait collection query.
+#[derive(Debug, Clone)]
+pub struct LocksSnapshot {
+    /// Rows to encode into section `1_011`.
+    pub rows: Vec<LocksRow>,
+    /// Present when the graph exceeded the configured guard and no section
+    /// rows should be emitted for this snapshot.
+    pub skipped: Option<LocksSkipped>,
 }
 
 /// Intern an optional string, preserving `None`.
@@ -295,11 +460,16 @@ pub fn to_v2<E>(
         lock_locktype: opt(&mut intern, row.lock_locktype.as_deref())?,
         lock_mode: opt(&mut intern, row.lock_mode.as_deref())?,
         lock_granted: row.lock_granted,
+        lock_database: row.lock_database,
         lock_relation: row.lock_relation,
         lock_relname: opt(&mut intern, row.lock_relname.as_deref())?,
         lock_page: row.lock_page,
         lock_tuple: row.lock_tuple,
+        lock_virtualxid: opt(&mut intern, row.lock_virtualxid.as_deref())?,
         lock_transactionid: row.lock_transactionid,
+        lock_classid: row.lock_classid,
+        lock_objid: row.lock_objid,
+        lock_objsubid: row.lock_objsubid,
         lock_fastpath: row.lock_fastpath,
         lock_target: opt(&mut intern, row.lock_target.as_deref())?,
         waitstart: row.waitstart.map(Ts),
@@ -339,11 +509,16 @@ pub fn to_v1<E>(
         lock_locktype: opt(&mut intern, row.lock_locktype.as_deref())?,
         lock_mode: opt(&mut intern, row.lock_mode.as_deref())?,
         lock_granted: row.lock_granted,
+        lock_database: row.lock_database,
         lock_relation: row.lock_relation,
         lock_relname: opt(&mut intern, row.lock_relname.as_deref())?,
         lock_page: row.lock_page,
         lock_tuple: row.lock_tuple,
+        lock_virtualxid: opt(&mut intern, row.lock_virtualxid.as_deref())?,
         lock_transactionid: row.lock_transactionid,
+        lock_classid: row.lock_classid,
+        lock_objid: row.lock_objid,
+        lock_objsubid: row.lock_objsubid,
         lock_fastpath: row.lock_fastpath,
         lock_target: opt(&mut intern, row.lock_target.as_deref())?,
     })
@@ -377,11 +552,16 @@ fn row_from_pg(row: &tokio_postgres::Row, version: LocksVersion) -> LocksRow {
         lock_locktype: row.get("lock_locktype"),
         lock_mode: row.get("lock_mode"),
         lock_granted: row.get("lock_granted"),
+        lock_database: row.get("lock_database"),
         lock_relation: row.get("lock_relation"),
         lock_relname: row.get("lock_relname"),
         lock_page: row.get("lock_page"),
         lock_tuple: row.get("lock_tuple"),
+        lock_virtualxid: row.get("lock_virtualxid"),
         lock_transactionid: row.get("lock_transactionid"),
+        lock_classid: row.get("lock_classid"),
+        lock_objid: row.get("lock_objid"),
+        lock_objsubid: row.get("lock_objsubid"),
         lock_fastpath: row.get("lock_fastpath"),
         lock_target: row.get("lock_target"),
         waitstart: match version {
@@ -393,8 +573,9 @@ fn row_from_pg(row: &tokio_postgres::Row, version: LocksVersion) -> LocksRow {
 
 /// Collect the lock-wait tree. Caller runs [`lock_waits_exist`] first.
 ///
-/// The versioned recursive CTE gathers the blocking component: one row per
-/// backend, `blocked_by` edges deduped, capped at `max_rows`.
+/// The versioned recursive CTE gathers one row per backend with deduped
+/// `blocked_by` edges. If waiters, edges, or backend nodes exceed `max_rows`,
+/// the snapshot is returned as skipped instead of truncated.
 ///
 /// # Errors
 /// Returns the [`tokio_postgres::Error`] if the query fails.
@@ -402,10 +583,27 @@ pub async fn collect_locks(
     client: &Client,
     major: u32,
     max_rows: i64,
-) -> Result<Vec<LocksRow>, tokio_postgres::Error> {
+) -> Result<LocksSnapshot, tokio_postgres::Error> {
     let version = locks_version(major);
     let rows = client.query(locks_query(version), &[&max_rows]).await?;
-    Ok(rows.iter().map(|row| row_from_pg(row, version)).collect())
+    let mut locks_rows = Vec::with_capacity(rows.len());
+    let mut skipped = None;
+    for row in &rows {
+        if row.get("kronika_skipped") {
+            skipped = Some(LocksSkipped {
+                waiters: row.get("kronika_waiters"),
+                edges: row.get("kronika_edges"),
+                nodes: row.get("kronika_nodes"),
+                max_rows,
+            });
+        } else {
+            locks_rows.push(row_from_pg(row, version));
+        }
+    }
+    Ok(LocksSnapshot {
+        rows: locks_rows,
+        skipped,
+    })
 }
 
 #[cfg(test)]
@@ -441,11 +639,16 @@ mod tests {
             lock_locktype: None,
             lock_mode: None,
             lock_granted: None,
+            lock_database: None,
             lock_relation: None,
             lock_relname: None,
             lock_page: None,
             lock_tuple: None,
+            lock_virtualxid: None,
             lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
             lock_fastpath: None,
             lock_target: None,
             waitstart: None,
@@ -463,11 +666,16 @@ mod tests {
             lock_locktype: Some("relation".to_owned()),
             lock_mode: Some("AccessExclusiveLock".to_owned()),
             lock_granted: Some(false),
+            lock_database: Some(16_384),
             lock_relation: Some(12_345),
             lock_relname: Some("orders".to_owned()),
             lock_page: Some(42),
             lock_tuple: Some(7),
+            lock_virtualxid: Some("3/42".to_owned()),
             lock_transactionid: Some(999_999),
+            lock_classid: Some(1_250),
+            lock_objid: Some(12_345),
+            lock_objsubid: Some(2),
             lock_fastpath: Some(false),
             lock_target: Some("relation:orders".to_owned()),
             waitstart: Some(998_000),
@@ -491,6 +699,7 @@ mod tests {
         assert!(q.contains("= ANY(")); // manual path cycle guard
         assert!(!q.contains("waitstart"));
         assert!(q.contains("pg_kronika:")); // marker present
+        assert!(!q.contains("LIMIT $1"));
     }
 
     #[test]
@@ -499,12 +708,53 @@ mod tests {
         assert!(q.contains("waitstart"));
         assert!(q.contains("CYCLE")); // SQL CYCLE clause
         assert!(q.contains("pg_blocking_pids"));
+        assert!(q.contains("waiting_locks AS"));
     }
 
     #[test]
-    fn both_queries_take_the_max_rows_bind() {
-        assert!(locks_query(LocksVersion::V1).contains("LIMIT $1"));
-        assert!(locks_query(LocksVersion::V2).contains("LIMIT $1"));
+    fn both_queries_guard_cardinality_without_final_limit() {
+        assert!(locks_query(LocksVersion::V1).contains("waiters <= $1::int8"));
+        assert!(locks_query(LocksVersion::V2).contains("waiters <= $1::int8"));
+        assert!(locks_query(LocksVersion::V1).contains("kronika_skipped"));
+        assert!(locks_query(LocksVersion::V2).contains("kronika_skipped"));
+    }
+
+    #[test]
+    fn both_queries_reuse_waiter_blocked_by_snapshot() {
+        assert_eq!(
+            locks_query(LocksVersion::V1)
+                .matches("pg_blocking_pids")
+                .count(),
+            1
+        );
+        assert_eq!(
+            locks_query(LocksVersion::V2)
+                .matches("pg_blocking_pids")
+                .count(),
+            1
+        );
+        assert!(locks_query(LocksVersion::V1).contains("COALESCE(w.bp"));
+        assert!(locks_query(LocksVersion::V2).contains("COALESCE(w.bp"));
+    }
+
+    #[test]
+    fn both_queries_keep_prepared_and_rootless_components() {
+        let v1 = locks_query(LocksVersion::V1);
+        let v2 = locks_query(LocksVersion::V2);
+        assert!(v1.contains("SELECT DISTINCT e.waiter, 1, 0, 1"));
+        assert!(v2.contains("SELECT DISTINCT e.waiter, 1, 0, 1"));
+        assert!(v1.contains("fallback_seeds"));
+        assert!(v2.contains("fallback_seeds"));
+    }
+
+    #[test]
+    fn both_queries_resolve_relation_names_only_for_visible_databases() {
+        assert!(
+            locks_query(LocksVersion::V1).contains("l.database = db.oid OR l.database = 0::oid")
+        );
+        assert!(
+            locks_query(LocksVersion::V2).contains("l.database = db.oid OR l.database = 0::oid")
+        );
     }
 
     /// Deterministic stand-in for the segment interner (assigns ids in order).
@@ -536,10 +786,15 @@ mod tests {
         assert_eq!(v.depth, 1);
         assert_eq!(v.wait_event_type, Some(intern(b"Lock").unwrap()));
         assert_eq!(v.lock_relation, Some(12_345));
+        assert_eq!(v.lock_database, Some(16_384));
         assert_eq!(v.lock_granted, Some(false));
         assert_eq!(v.lock_page, Some(42));
         assert_eq!(v.lock_tuple, Some(7));
+        assert_eq!(v.lock_virtualxid, Some(intern(b"3/42").unwrap()));
         assert_eq!(v.lock_transactionid, Some(999_999));
+        assert_eq!(v.lock_classid, Some(1_250));
+        assert_eq!(v.lock_objid, Some(12_345));
+        assert_eq!(v.lock_objsubid, Some(2));
         assert_eq!(v.lock_fastpath, Some(false));
         assert_eq!(v.waitstart.map(|t| t.0), Some(998_000));
         assert_eq!(v.backend_xid_age, Some(7));
@@ -553,7 +808,12 @@ mod tests {
         assert_eq!(v1.pid, v2.pid);
         assert_eq!(v1.blocked_by, v2.blocked_by);
         assert_eq!(v1.lock_target, v2.lock_target);
+        assert_eq!(v1.lock_database, v2.lock_database);
+        assert_eq!(v1.lock_virtualxid, v2.lock_virtualxid);
         assert_eq!(v1.lock_transactionid, v2.lock_transactionid);
+        assert_eq!(v1.lock_classid, v2.lock_classid);
+        assert_eq!(v1.lock_objid, v2.lock_objid);
+        assert_eq!(v1.lock_objsubid, v2.lock_objsubid);
         assert_eq!(v1.lock_granted, v2.lock_granted);
         assert_eq!(v1.lock_page, v2.lock_page);
         assert_eq!(v1.lock_tuple, v2.lock_tuple);
