@@ -130,11 +130,12 @@ Fork определяется при старте по наличию функц
 Время IO у vadv-форка нормализуется как сумма shared, local и temp
 `blk_*_time`.
 
-## `1_011_001` дерево ожиданий lock
+## `1_011_001` / `1_011_002` граф ожиданий lock
 
-Сбор двухступенчатый.
+Сбор двухступенчатый. Класс A — соединение из `pool.main()`.
 
-Ступень 1: дешевая предварительная проверка с кэшем около 1 секунды.
+**Ступень 1:** дешёвая предварительная проверка по `pg_stat_activity` с кэшем
+около 1 секунды.
 
 ```sql
 /* pg_kronika:<version> <source-file> */
@@ -145,27 +146,53 @@ SELECT EXISTS (
 );
 ```
 
-Ступень 2: рекурсивный CTE выполняется только если предварительная проверка
-нашла ожидания.
+`pg_blocking_pids` вызывается только для backend'ов с
+`wait_event_type = 'Lock'` (семена графа). Это ограничивает observer effect:
+дорогой вызов не делается для backend'ов, заведомо не заблокированных.
+
+Если предварительная проверка не нашла ожиданий, ступень 2 не выполняется;
+секция в сегмент не пишется.
+
+**Ступень 2:** cycle-safe рекурсивный CTE поднимается от заблокированных
+backend'ов к корням через `pg_blocking_pids`, дедуплицирует узлы и
+джойнится с `pg_locks NOT GRANTED`, чтобы получить тип, режим и цель
+ожидаемой блокировки. `LEFT JOIN pg_locks` по `pid` и `NOT granted`
+даёт ожидаемый lock конкретного backend'а.
 
 ```sql
-WITH RECURSIVE blockers AS (
-  SELECT
-    pid,
-    pg_blocking_pids(pid) AS blocked_by,
-    1 AS depth,
-    pid AS root_pid
-  FROM pg_stat_activity
-  WHERE cardinality(pg_blocking_pids(pid)) > 0
-
-  UNION ALL
-  ...
-) SELECT ...
+WITH RECURSIVE
+  waiters AS (SELECT pid, pg_blocking_pids(pid) AS bp
+              FROM pg_stat_activity WHERE wait_event_type = 'Lock'),
+  edges AS (SELECT pid AS waiter, b AS blocker FROM waiters, unnest(bp) AS b),
+  roots AS (SELECT DISTINCT blocker AS pid FROM edges
+            WHERE blocker <> 0 AND blocker NOT IN (SELECT pid FROM waiters)),
+  tree AS (SELECT pid, 0 AS depth, pid AS root_pid FROM roots
+           UNION ALL
+           SELECT e.waiter, t.depth + 1, t.root_pid
+           FROM tree t JOIN edges e ON e.blocker = t.pid)
+           CYCLE pid SET is_cycle USING path,  -- PG14+; PG10-13: WHERE NOT ... = ANY(path)
+  nodes AS (SELECT pid, min(depth) AS depth,
+                   (array_agg(root_pid ORDER BY depth))[1] AS root_pid
+            FROM tree GROUP BY pid)
+SELECT n.pid, n.depth, n.root_pid, /* + backend- и lock-колонки */
+       pg_blocking_pids(n.pid) AS blocked_by
+FROM nodes n JOIN pg_stat_activity USING (pid)
+LEFT JOIN pg_locks l ON l.pid = n.pid AND NOT l.granted
 LIMIT :max_rows;
 ```
 
-CTE должен подниматься к корням блокировок и джойниться с `pg_locks`, чтобы
-получить тип, режим и цель lock.
+Семена рекурсии — корни (блокеры, сами не ждущие), от них спуск к ждущим.
+PID `0` в `blocked_by` — подготовленная (двухфазная) транзакция: её holder
+виден в `pg_locks`, но строки в `pg_stat_activity` нет, поэтому она исключена
+из `roots` и не имеет собственной строки-узла — остаётся только внутри
+массивов `blocked_by`.
+
+Имя таблицы (`lock_relname`) берётся через `pg_class` best-effort: пустое
+значение для блокировок в других базах кластера — ограничение single-DB
+подключения коллектора.
+
+Лимит строк результата — `KRONIKA_PG_MAX_LOCK_ROWS` (по умолчанию 1000).
+Усечённый сбор пока не пишет coverage `1_023_001` (эпик отложен).
 
 ## `1_013_001`..`1_013_004` / `1_014_001`..`1_014_002` tables и indexes
 
