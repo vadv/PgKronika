@@ -958,12 +958,11 @@ async fn every_version_seals_statements(world: &mut BddWorld) -> anyhow::Result<
     Ok(())
 }
 
-/// Install the extension, run a marked probe workload so the view has a row, and
+/// Install the extension, run a probe workload so the view has a row, and
 /// return the layout the installed extension version maps to.
 ///
-/// The layout follows the extension version (`pg_extension.extversion`), which
-/// the cluster pins to whatever ships with its server; it is read here rather
-/// than derived from the server major.
+/// The test reads `pg_extension.extversion` instead of deriving the layout from
+/// the server major.
 async fn install_statements_and_run_workload(
     db: &cluster::Cluster,
 ) -> anyhow::Result<StatementsVersion> {

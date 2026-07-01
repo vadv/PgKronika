@@ -3,10 +3,10 @@
 //! Per-statement execution counters, one row per `(userid, dbid, queryid)` and,
 //! from extension 1.9, also per `toplevel`. The `dbid` distinguishes databases,
 //! so one instance-wide query returns every database's statements. The layout is
-//! selected by the *extension* version, not the server major: the extension can
-//! be pinned independently of the server.
+//! selected by the *extension* version, not the server major, because the
+//! extension can be pinned independently of the server.
 //!
-//! The extension column set grows and is renamed across releases:
+//! The extension column set changes across releases:
 //! - 1.8 (PG13) renamed `total_time`/`min_time`/`max_time`/`mean_time`/
 //!   `stddev_time` to their `*_exec_time` forms and added the planning columns
 //!   (`plans`, `total_plan_time`, ...) and `wal_records`/`wal_fpi`/`wal_bytes`;

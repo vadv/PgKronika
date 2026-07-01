@@ -1,16 +1,15 @@
 //! `pg_stat_statements` collection for types `1_002_001`..`1_002_006`.
 //!
-//! An instance-wide extension view: one row per `(userid, dbid, queryid)` and,
-//! from extension 1.9, also per `toplevel`. The `dbid` distinguishes databases,
-//! so one query against the view (from any database that has the extension
-//! installed) returns every database's statements. The layout is chosen by the
+//! The extension exposes instance-wide rows: one row per `(userid, dbid,
+//! queryid)` and, from extension 1.9, also per `toplevel`. The `dbid`
+//! distinguishes databases, so one query from any database with the extension
+//! installed returns every database's statements. The layout is chosen by the
 //! *extension* version reported by `pg_extension`, not the server major, because
 //! the extension can be pinned independently of the server.
 //!
-//! Candidate selection is purely mechanical: the union of top-N statements by
-//! `total_exec_time` and by `calls`, so a heavy-by-time and a heavy-by-frequency
-//! statement are both kept. The collector records and bounds its output; judging
-//! whether a value is dangerous is the analyzer's job.
+//! Candidate selection unions top-N statements by `total_exec_time` and by
+//! `calls`. This keeps rows that dominate execution time and rows that dominate
+//! call count without assigning severity in SQL.
 //!
 //! `queryid` and `query` are nullable: `queryid` is `NULL` when
 //! `compute_query_id` is off, and `query` is `NULL` for a caller without the
@@ -27,7 +26,7 @@ use kronika_registry::pg_stat_statements::{
 use kronika_registry::{StrId, Ts};
 use tokio_postgres::Client;
 
-/// Prefix a query literal with the kronika marker (SQL-transparency rule).
+/// Prefix a query literal with the collector marker.
 macro_rules! marked {
     ($sql:literal) => {
         concat!(
@@ -65,8 +64,8 @@ pub enum StatementsVersion {
 ///
 /// `extversion` is the `"major.minor"` value from `pg_extension.extversion`.
 /// Anything below 1.8 maps to the legacy layout; anything at or above 1.12 maps
-/// to the newest. A string that does not parse as `major.minor` is treated as
-/// the legacy layout, the conservative choice for an unknown build.
+/// to the newest. A string that does not parse as `major.minor` uses the legacy
+/// layout.
 #[must_use]
 pub fn statements_version(extversion: &str) -> StatementsVersion {
     let (major, minor) = parse_ext_version(extversion).unwrap_or((1, 0));
@@ -97,14 +96,12 @@ fn parse_ext_version(extversion: &str) -> Option<(u32, u32)> {
 
 /// The SQL for one layout.
 ///
-/// `$1` is the per-axis top-N row count. Candidate selection is purely
-/// mechanical — the union of top-N statements by `total_exec_time` (or, on the
-/// legacy layout, `total_time`) and by `calls`. `query` is truncated inline to
-/// [`QUERY_TRUNCATE`] bytes and interned; `datname`/`usename` are resolved with a
-/// `LEFT JOIN`. `ts` is one `statement_timestamp()` for the whole snapshot; the
-/// `*_stats_since` columns come back as unix microseconds. The collector only
-/// records the most extreme rows per axis and bounds its own output; no
-/// threshold and no "danger" verdict appears in the SQL.
+/// `$1` is the per-axis top-N row count. Candidate selection unions top-N
+/// statements by `total_exec_time` (or, on the legacy layout, `total_time`) and
+/// by `calls`. `query` is truncated inline to [`QUERY_TRUNCATE`] bytes and
+/// interned; `datname`/`usename` are resolved with a `LEFT JOIN`. `ts` is one
+/// `statement_timestamp()` for the whole snapshot; the `*_stats_since` columns
+/// come back as unix microseconds. SQL applies no thresholds or severity labels.
 #[allow(
     clippy::too_many_lines,
     reason = "six full per-version SQL literals; splitting the match hurts readability"
