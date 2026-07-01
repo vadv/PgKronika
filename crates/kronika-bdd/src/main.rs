@@ -21,12 +21,13 @@ mod collector;
 use std::path::Path;
 
 use anyhow::Context;
-use cucumber::{World, event, given, then};
+use cucumber::{World, event, given, then, when};
 use kronika_format::{Entry, crc32c};
 use kronika_reader::{Dictionary, Resolved, Segment};
 use kronika_registry::{
     Bytes, MAX_SECTION_BYTES, Section, StrId, VerifiedSection,
     bgwriter_checkpointer::BgwriterCheckpointer,
+    pg_locks::{PgLocksV1, PgLocksV2},
     pg_prepared_xacts::PgPreparedXacts,
     pg_stat_activity::PgStatActivityV3,
     pg_stat_archiver::PgStatArchiver,
@@ -91,12 +92,46 @@ const PG_STAT_IO_V2_TYPE_ID: u32 = 1_009_002;
 
 const PG_PREPARED_XACTS_TYPE_ID: u32 = 1_010_001;
 
+const PG_LOCKS_V1_TYPE_ID: u32 = 1_011_001;
+const PG_LOCKS_V2_TYPE_ID: u32 = 1_011_002;
+
+/// First major on the PG14+ `pg_locks` layout that carries `waitstart`.
+const PG_LOCKS_V2_MIN_MAJOR: u32 = 14;
+
 const PG_STAT_PROGRESS_VACUUM_TYPE_ID: u32 = 1_012_001;
+
+/// A live blocking pair held open across a snapshot: the holder session (whose
+/// uncommitted transaction keeps the row lock) and the waiter's blocked `UPDATE`
+/// task. Both must outlive the snapshot; dropping either releases the wait.
+#[derive(Debug)]
+struct LockWait {
+    /// Holder session; its `BEGIN; UPDATE` transaction is never committed, so the
+    /// row lock stays held until this connection is dropped.
+    #[allow(
+        dead_code,
+        reason = "held open to keep the row lock; dropped to release it, not read"
+    )]
+    holder: cluster::Conn,
+    /// The waiter's blocked `UPDATE`, running on its own connection inside the
+    /// task. Aborting it drops that connection and cancels the query.
+    waiter: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LockWait {
+    fn drop(&mut self) {
+        // Abort the waiter first so its query stops; the holder connection then
+        // drops via its own `Drop`, rolling back the open transaction.
+        self.waiter.abort();
+    }
+}
 
 /// Cucumber state for one scenario: the matrix booted by the `Given` step.
 #[derive(Debug, Default, World)]
 struct BddWorld {
     clusters: Vec<cluster::Cluster>,
+    /// Blocking pairs kept alive while the wait-tree scenario snapshots; one per
+    /// cluster. Cleared (and thus released) after the assertion.
+    lock_waits: Vec<LockWait>,
 }
 
 #[given("the PostgreSQL matrix is booted")]
@@ -1961,6 +1996,221 @@ async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> an
     Ok(())
 }
 
+/// How long to wait for the waiter's `UPDATE` to actually block on a lock.
+const LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One decoded wait-tree row projected to the fields the assertion checks, so the
+/// V1 and V2 layouts share a single check.
+#[derive(Debug)]
+struct LockWaitObservation {
+    pid: i32,
+    /// Deduped `pg_blocking_pids(pid)`; empty for roots.
+    blocked_by: Vec<i32>,
+    /// Whether the row carries an awaited lock (`lock_locktype` set).
+    has_awaited_lock: bool,
+}
+
+#[when("session H holds a row lock and session W blocks on it")]
+async fn open_blocking_pair(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    let mut waits = Vec::with_capacity(world.clusters.len());
+    for db in &world.clusters {
+        waits.push(start_blocking_pair(db).await?);
+    }
+    // Store only after every cluster is blocked, so a mid-loop failure does not
+    // strand half-open transactions on the world.
+    world.lock_waits = waits;
+    Ok(())
+}
+
+/// Open a holder session on a fresh row lock, then a waiter whose conflicting
+/// `UPDATE` blocks behind it. Returns once the waiter is confirmed waiting on a
+/// lock, with both sessions still live.
+async fn start_blocking_pair(db: &cluster::Cluster) -> anyhow::Result<LockWait> {
+    let holder = db.connect().await?;
+    holder
+        .client()
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS kronika_lock_probe (id int primary key, v int); \
+             INSERT INTO kronika_lock_probe VALUES (1, 0) ON CONFLICT (id) DO NOTHING;",
+        )
+        .await
+        .with_context(|| format!("postgres {}: seed lock probe table", db.major()))?;
+    // The transaction stays open (no COMMIT), so the row lock is held until the
+    // holder connection is dropped.
+    holder
+        .client()
+        .batch_execute("BEGIN; UPDATE kronika_lock_probe SET v = v + 1 WHERE id = 1;")
+        .await
+        .with_context(|| format!("postgres {}: hold the row lock", db.major()))?;
+
+    // The waiter runs its conflicting UPDATE on its own connection inside the
+    // task, so it stays blocked while we snapshot. The task owns the connection;
+    // aborting it drops the connection and cancels the query.
+    let waiter_conn = db.connect().await?;
+    let waiter = tokio::spawn(async move {
+        // The query blocks until the holder commits or the task is aborted; the
+        // outcome is irrelevant, only that it holds the lock wait open.
+        let _result = waiter_conn
+            .client()
+            .execute("UPDATE kronika_lock_probe SET v = v + 1 WHERE id = 1", &[])
+            .await;
+    });
+
+    if let Err(err) = wait_until_lock_wait(&holder).await {
+        // Nothing is stored yet, so tear the pair down before propagating.
+        waiter.abort();
+        return Err(err.context(format!("postgres {}: waiter never blocked", db.major())));
+    }
+    Ok(LockWait { holder, waiter })
+}
+
+/// Poll `pg_stat_activity` until at least one backend is waiting on a lock, or
+/// fail after [`LOCK_WAIT_TIMEOUT`]. The view is cluster-wide, so any connection
+/// observes the waiter.
+async fn wait_until_lock_wait(conn: &cluster::Conn) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT_TIMEOUT;
+    loop {
+        let row = conn
+            .client()
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'",
+                &[],
+            )
+            .await
+            .context("count lock waiters")?;
+        let waiting: i64 = row.get(0);
+        if waiting > 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "no backend entered a lock wait within {LOCK_WAIT_TIMEOUT:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[then("each matrix cluster seals a wait tree with W blocked by H")]
+async fn assert_wait_tree(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    anyhow::ensure!(
+        world.lock_waits.len() == world.clusters.len(),
+        "the blocking step did not open a pair for every cluster"
+    );
+    // Snapshot every cluster while its blocking pair is still held, then release
+    // the holders and waiters regardless of the assertion outcome.
+    let mut result = Ok(());
+    for db in &world.clusters {
+        match collect_one(db).await {
+            Ok(segment) => {
+                if let Err(err) = assert_wait_tree_section(db.major(), &segment) {
+                    result = Err(err);
+                    break;
+                }
+            }
+            Err(err) => {
+                result = Err(err);
+                break;
+            }
+        }
+    }
+    world.lock_waits.clear();
+    result
+}
+
+/// Spawn the collector and take one snapshot.
+async fn collect_one(db: &cluster::Cluster) -> anyhow::Result<std::path::PathBuf> {
+    let mut collector = collector::Collector::spawn(db).await?;
+    collector.snapshot().await
+}
+
+/// Decode the wait-tree section for the cluster's layout and check that a waiter
+/// points at a blocker that is itself a root, and that the waiter has an awaited
+/// lock. The matrix runs PG14+, so this normally reads the V2 layout; the V1
+/// branch keeps the split explicit and is covered directly by a codec golden.
+fn assert_wait_tree_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let observations = decode_locks_section(major, path, &segment)?;
+    check_wait_tree(major, &observations)
+}
+
+/// Project the sealed wait-tree rows to [`LockWaitObservation`] for the layout
+/// the major selects.
+fn decode_locks_section(
+    major: u32,
+    path: &Path,
+    segment: &Segment,
+) -> anyhow::Result<Vec<LockWaitObservation>> {
+    if major >= PG_LOCKS_V2_MIN_MAJOR {
+        Ok(
+            decode_section_rows::<PgLocksV2>(path, segment, PG_LOCKS_V2_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_011_002"))?
+                .into_iter()
+                .map(|r| LockWaitObservation {
+                    pid: r.pid,
+                    blocked_by: r.blocked_by,
+                    has_awaited_lock: r.lock_locktype.is_some(),
+                })
+                .collect(),
+        )
+    } else {
+        Ok(
+            decode_section_rows::<PgLocksV1>(path, segment, PG_LOCKS_V1_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_011_001"))?
+                .into_iter()
+                .map(|r| LockWaitObservation {
+                    pid: r.pid,
+                    blocked_by: r.blocked_by,
+                    has_awaited_lock: r.lock_locktype.is_some(),
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Shared invariants over the projected wait-tree rows: a waiter with a non-empty
+/// `blocked_by`, its blocker present as a root, and the waiter awaiting a lock.
+fn check_wait_tree(major: u32, rows: &[LockWaitObservation]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "postgres {major}: wait-tree section decoded to no rows"
+    );
+    let waiter = rows
+        .iter()
+        .find(|r| !r.blocked_by.is_empty())
+        .with_context(|| format!("postgres {major}: no waiter row with a blocked_by edge"))?;
+    let blocker_pid = waiter.blocked_by[0];
+    anyhow::ensure!(
+        rows.iter()
+            .any(|r| r.pid == blocker_pid && r.blocked_by.is_empty()),
+        "postgres {major}: blocker pid {blocker_pid} is not present as a root"
+    );
+    anyhow::ensure!(
+        waiter.has_awaited_lock,
+        "postgres {major}: the waiter row carries no awaited lock",
+    );
+    Ok(())
+}
+
+#[then("no matrix cluster seals a pg_locks wait-tree section")]
+async fn assert_no_wait_tree(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let segment_path = collect_one(db).await?;
+        let segment = Segment::open(&segment_path)
+            .with_context(|| format!("postgres {}: open sealed segment", db.major()))?;
+        anyhow::ensure!(
+            !has_section(&segment, PG_LOCKS_V1_TYPE_ID)
+                && !has_section(&segment, PG_LOCKS_V2_TYPE_ID),
+            "postgres {}: an idle cluster sealed a pg_locks wait-tree section",
+            db.major()
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
@@ -1998,7 +2248,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::single_wal_row;
+    use super::{LockWaitObservation, check_wait_tree, single_wal_row};
 
     #[test]
     fn single_wal_row_accepts_exactly_one() {
@@ -2013,5 +2263,43 @@ mod tests {
     #[test]
     fn single_wal_row_rejects_multiple_rows() {
         assert!(single_wal_row(15, vec![1_i32, 2]).is_err());
+    }
+
+    fn obs(pid: i32, blocked_by: Vec<i32>, has_awaited_lock: bool) -> LockWaitObservation {
+        LockWaitObservation {
+            pid,
+            blocked_by,
+            has_awaited_lock,
+        }
+    }
+
+    #[test]
+    fn check_wait_tree_accepts_waiter_pointing_at_a_root() {
+        let rows = [obs(100, vec![], false), obs(200, vec![100], true)];
+        assert!(check_wait_tree(15, &rows).is_ok());
+    }
+
+    #[test]
+    fn check_wait_tree_rejects_empty_section() {
+        assert!(check_wait_tree(15, &[]).is_err());
+    }
+
+    #[test]
+    fn check_wait_tree_rejects_no_waiter() {
+        let rows = [obs(100, vec![], false), obs(200, vec![], false)];
+        assert!(check_wait_tree(15, &rows).is_err());
+    }
+
+    #[test]
+    fn check_wait_tree_rejects_blocker_missing_as_root() {
+        // The waiter points at pid 100, but no row for 100 exists.
+        let rows = [obs(200, vec![100], true)];
+        assert!(check_wait_tree(15, &rows).is_err());
+    }
+
+    #[test]
+    fn check_wait_tree_rejects_waiter_without_awaited_lock() {
+        let rows = [obs(100, vec![], false), obs(200, vec![100], false)];
+        assert!(check_wait_tree(15, &rows).is_err());
     }
 }

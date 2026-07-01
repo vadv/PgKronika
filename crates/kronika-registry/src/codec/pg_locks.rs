@@ -277,6 +277,43 @@ mod tests {
         }
     }
 
+    /// A root backend on the PG 10-13 layout: no waiter columns populated.
+    fn v1_row(ts: i64, pid: i32, root_pid: i32) -> PgLocksV1 {
+        PgLocksV1 {
+            ts: Ts(ts),
+            pid,
+            blocked_by: vec![],
+            depth: 0,
+            root_pid,
+            datid: 16_384,
+            datname: StrId(1),
+            usename: Some(StrId(2)),
+            application_name: StrId(3),
+            client_addr: StrId(4),
+            backend_type: StrId(5),
+            state: Some(StrId(6)),
+            wait_event_type: None,
+            wait_event: None,
+            query: StrId(7),
+            backend_xid_age: None,
+            backend_xmin_age: None,
+            backend_start: Some(Ts(ts - 60_000_000)),
+            xact_start: Some(Ts(ts - 5_000_000)),
+            query_start: Some(Ts(ts - 1_000_000)),
+            state_change: Some(Ts(ts - 1_000_000)),
+            lock_locktype: None,
+            lock_mode: None,
+            lock_granted: None,
+            lock_relation: None,
+            lock_relname: None,
+            lock_page: None,
+            lock_tuple: None,
+            lock_transactionid: None,
+            lock_fastpath: None,
+            lock_target: None,
+        }
+    }
+
     #[test]
     fn v2_contract_shape() {
         let c = PgLocksV2::CONTRACT;
@@ -423,5 +460,62 @@ mod tests {
         assert_eq!(decoded[1].lock_tuple, None);
         assert_eq!(decoded[0].lock_fastpath, Some(false));
         assert_eq!(decoded[1].lock_fastpath, None);
+    }
+
+    #[test]
+    fn v1_golden_root_waiter_and_zero_blocker() {
+        // Root: not blocked, so every awaited-lock column is None.
+        let root = v1_row(3_000_000, 100, 100);
+        // Waiter blocked by the root, with a fully populated awaited lock.
+        let mut waiter = v1_row(3_000_000, 200, 100);
+        waiter.blocked_by = vec![100];
+        waiter.depth = 1;
+        waiter.wait_event_type = Some(StrId(8));
+        waiter.wait_event = Some(StrId(9));
+        waiter.lock_locktype = Some(StrId(10));
+        waiter.lock_mode = Some(StrId(11));
+        waiter.lock_granted = Some(false);
+        waiter.lock_relation = Some(12_345);
+        waiter.lock_relname = Some(StrId(12));
+        waiter.lock_page = Some(42);
+        waiter.lock_tuple = Some(7);
+        waiter.lock_transactionid = Some(999_999);
+        waiter.lock_fastpath = Some(false);
+        waiter.lock_target = Some(StrId(13));
+        // Blocked behind a prepared-transaction holder: pg_blocking_pids yields 0.
+        let mut orphan = v1_row(3_000_000, 300, 300);
+        orphan.blocked_by = vec![0];
+        orphan.depth = 1;
+
+        // Encode order matches the (root_pid, depth, pid) sort so decode preserves it.
+        let rows = [root, waiter, orphan];
+        let bytes = PgLocksV1::encode(&rows).expect("encode");
+        let decoded = PgLocksV1::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
+
+        assert_eq!(decoded.as_slice(), &rows, "PG10-13 locks roundtrip");
+        assert_eq!(
+            decoded[0].blocked_by,
+            Vec::<i32>::new(),
+            "root has no edges"
+        );
+        assert!(
+            decoded[0].lock_locktype.is_none(),
+            "an unblocked root has no awaited lock"
+        );
+        assert_eq!(
+            decoded[1].blocked_by,
+            vec![100],
+            "waiter points at the root"
+        );
+        assert_eq!(
+            decoded[1].lock_locktype,
+            Some(StrId(10)),
+            "the waiter's awaited lock survives the roundtrip"
+        );
+        assert_eq!(
+            decoded[2].blocked_by,
+            vec![0],
+            "a prepared-xact holder is recorded as pid 0"
+        );
     }
 }
