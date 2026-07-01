@@ -64,44 +64,58 @@ FROM pg_stat_activity;
 `query_id` доступен не на всех версиях PostgreSQL и при
 `compute_query_id = off` может быть нулем.
 
-## `1_002_001` statements: двухфазный сбор текстов
+## `1_002_001`..`1_002_006` statements
 
-Фаза 1: статистика без текстов.
+Сбор класса A: `pg_stat_statements` — инстанс-широкое представление (строка на
+`(userid, dbid, queryid)`, `dbid` различает базы), поэтому одного запроса
+достаточно для всех баз. Расширение может быть установлено не в основной базе:
+коллектор пробует сначала `pool.main()`, затем соединения `per_db()`, и собирает
+с первого, где расширение есть. Если его нет нигде — секция не пишется, в лог
+идёт строка о пропуске.
+
+Раскладка выбирается по версии расширения, а не по мажору сервера. Проба:
 
 ```sql
-/* reftool:pgs */
+/* pg_kronika:... */
+SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements';
+```
+
+`extversion` (`"1.11"` и т. п.) разбирается в `major.minor` и отображается в тип
+(≤ 1.7 → `1_002_001`, 1.8 → `_002`, 1.9 → `_003`, 1.10 → `_004`, 1.11 → `_005`,
+≥ 1.12 → `_006`). Нераспознанная строка трактуется как legacy-раскладка.
+
+Один запрос со встроенным усечением текста (без второй фазы):
+
+```sql
+/* pg_kronika:... */
+WITH candidates AS (
+  (SELECT userid, dbid, queryid FROM pg_stat_statements
+     ORDER BY total_exec_time DESC NULLS LAST LIMIT $1)
+  UNION
+  (SELECT userid, dbid, queryid FROM pg_stat_statements
+     ORDER BY calls DESC NULLS LAST LIMIT $1)
+)
 SELECT
-  s.userid,
-  s.dbid,
-  s.queryid,
-  COALESCE(d.datname, '') AS datname,
-  COALESCE(r.rolname, '') AS usename,
-  s.calls,
-  s.total_exec_time,
+  s.queryid, s.userid, s.dbid,
+  d.datname::text AS datname, r.rolname::text AS usename,
+  LEFT(s.query, 5000) AS query,
   ...
-FROM pg_stat_statements(showtext := false) s
+FROM pg_stat_statements s
+JOIN candidates c ON c.userid = s.userid AND c.dbid = s.dbid
+  AND c.queryid IS NOT DISTINCT FROM s.queryid
 LEFT JOIN pg_database d ON d.oid = s.dbid
-LEFT JOIN pg_roles r ON r.oid = s.userid
-ORDER BY total_exec_time DESC
-LIMIT :max_statements;
+LEFT JOIN pg_roles r ON r.oid = s.userid;
 ```
 
-Для PG < 13 используются старые имена колонок, например `total_time`.
-
-Фаза 2: тексты только для `queryid`, которых ещё нет в интернер-кэше.
-
-```sql
-/* reftool:pgs */
-SELECT
-  queryid,
-  LEFT(query, :max_text_len) AS query
-FROM pg_stat_statements
-WHERE queryid = ANY($1);
-```
-
-Расширение `pg_stat_statements` ищется по всем базам пула: оно может быть
-установлено не в основной базе. Версия расширения перепроверяется примерно раз
-в 5 минут.
+Отбор кандидатов — чисто механический: объединение двух осей top-N (по
+`total_exec_time`, в legacy-раскладке — по `total_time`; и по `calls`), без
+порогов и вердиктов (см. `1_002` в `postgresql.md`). Лимит на ось —
+`KRONIKA_PG_MAX_STATEMENTS`, по умолчанию 500. Текст берётся прямо в `SELECT` как
+`LEFT(query, 5000)` и интернируется. `IS NOT DISTINCT FROM` в join нужен, чтобы
+строка с `NULL` `queryid` (выключенный `compute_query_id`) совпала со своим
+кандидатом. Для legacy-раскладки используются старые имена колонок времени
+(`total_time` и т. п.); переименование `blk_*_time` → `shared_blk_*_time` — с
+ext 1.11.
 
 ## `1_003_001` / `1_004_001` store_plans
 

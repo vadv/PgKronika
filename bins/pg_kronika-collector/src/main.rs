@@ -25,6 +25,10 @@
 //!   default 500. Each mechanical axis (tables: read activity, write volume,
 //!   size, dead tuples, transaction-id age, multixact age; indexes: scans,
 //!   tuples read, size) contributes up to this many rows before the union;
+//! - `KRONIKA_PG_MAX_STATEMENTS`: per-axis top-N row count for the
+//!   `pg_stat_statements` candidate selection, default 500. Each mechanical axis
+//!   (total execution time, calls) contributes up to this many rows before the
+//!   union;
 //! - `KRONIKA_PG_POOL_REFRESH_SECS`: minimum interval between connection-pool
 //!   refreshes (per-database connection reconciliation), default 600;
 //! - `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`: cap for the adaptive `statement_timeout`
@@ -53,6 +57,10 @@ use kronika_source_pg::progress_vacuum::{
 use kronika_source_pg::replication_instance::{
     ReplicationInstanceRow, collect_replication_instance, to_replication_instance,
 };
+use kronika_source_pg::statements::{
+    self, StatementsRow, StatementsVersion, collect_statements, statements_extversion,
+    statements_version,
+};
 use kronika_source_pg::user_indexes::{
     self, UserIndexesRow, UserIndexesVersion, collect_user_indexes,
 };
@@ -77,6 +85,8 @@ struct Config {
     /// Per-axis top-N row count for the relation top-N candidate selection
     /// (`pg_stat_user_tables` and `pg_stat_user_indexes`).
     max_tables: i64,
+    /// Per-axis top-N row count for the `pg_stat_statements` candidate selection.
+    max_statements: i64,
     /// Minimum interval between connection-pool refreshes, seconds.
     pool_refresh_secs: u64,
     /// Cap for the adaptive `statement_timeout` of the heavy per-table query, ms.
@@ -115,6 +125,8 @@ impl Config {
         }
         let max_tables = i64::try_from(env_u64("KRONIKA_PG_MAX_TABLES", 500)?)
             .context("KRONIKA_PG_MAX_TABLES exceeds i64")?;
+        let max_statements = i64::try_from(env_u64("KRONIKA_PG_MAX_STATEMENTS", 500)?)
+            .context("KRONIKA_PG_MAX_STATEMENTS exceeds i64")?;
         let pool_refresh_secs = env_u64("KRONIKA_PG_POOL_REFRESH_SECS", 600)?;
         let heavy_timeout_cap_ms = env_u64("KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS", 60_000)?;
         Ok(Self {
@@ -124,6 +136,7 @@ impl Config {
             session,
             exclude_databases,
             max_tables,
+            max_statements,
             pool_refresh_secs,
             heavy_timeout_cap_ms,
         })
@@ -296,6 +309,51 @@ async fn collect_user_indexes_all(
     user_indexes
 }
 
+/// Collect `pg_stat_statements` once from whichever connection has the extension.
+///
+/// The view is instance-wide: one row per `(userid, dbid, queryid)` covering
+/// every database, so a single query against any database that has the extension
+/// installed returns all of them. The probe tries the main connection first,
+/// then each per-database connection, and collects from the first that reports
+/// the extension. Returns `None` (no section) when no connection has it. All
+/// awaits finish here so the caller can intern without holding the `!Send`
+/// `Interner` across an await.
+async fn collect_statements_once(
+    pool: &ConnectionPool,
+    config: &Config,
+) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
+    let mut candidates: Vec<&tokio_postgres::Client> = Vec::with_capacity(1 + pool.per_db().len());
+    candidates.push(pool.main());
+    candidates.extend(
+        pool.per_db()
+            .iter()
+            .map(kronika_source_pg::pool::DatabaseConn::client),
+    );
+
+    for client in candidates {
+        let extversion = match statements_extversion(client).await {
+            Ok(Some(extversion)) => extversion,
+            Ok(None) => continue, // extension not installed on this connection
+            Err(err) => {
+                eprintln!("pg_kronika-collector: pg_stat_statements probe failed: {err}");
+                continue;
+            }
+        };
+        let version = statements_version(&extversion);
+        match collect_statements(client, version, config.max_statements).await {
+            Ok(rows) => return Some((version, rows)),
+            Err(err) => {
+                eprintln!("pg_kronika-collector: skip pg_stat_statements: {err}");
+                return None;
+            }
+        }
+    }
+    eprintln!(
+        "pg_kronika-collector: pg_stat_statements extension not installed in any reachable database; skipping section 1_002"
+    );
+    None
+}
+
 async fn snapshot_and_seal(
     pool: &ConnectionPool,
     major: u32,
@@ -337,6 +395,7 @@ async fn snapshot_and_seal(
 
     let user_tables = collect_user_tables_all(pool, major, config).await;
     let user_indexes = collect_user_indexes_all(pool, major, config).await;
+    let statements = collect_statements_once(pool, config).await;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -370,6 +429,9 @@ async fn snapshot_and_seal(
     push_replication_instance(&mut buffers, &mut interner, &replication_instance_row)?;
     push_user_tables(&mut buffers, &mut interner, &user_tables)?;
     push_user_indexes(&mut buffers, &mut interner, &user_indexes)?;
+    if let Some((version, rows)) = &statements {
+        push_statements(&mut buffers, &mut interner, *version, rows)?;
+    }
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -500,6 +562,31 @@ fn push_user_indexes(
     Ok(())
 }
 
+/// Intern each statement row's strings and buffer it as the version's section.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_statements(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    version: StatementsVersion,
+    rows: &[StatementsRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        match version {
+            StatementsVersion::V1 => buffer_row(buffers, statements::to_v1(row, &mut intern)?)?,
+            StatementsVersion::V2 => buffer_row(buffers, statements::to_v2(row, &mut intern)?)?,
+            StatementsVersion::V3 => buffer_row(buffers, statements::to_v3(row, &mut intern)?)?,
+            StatementsVersion::V4 => buffer_row(buffers, statements::to_v4(row, &mut intern)?)?,
+            StatementsVersion::V5 => buffer_row(buffers, statements::to_v5(row, &mut intern)?)?,
+            StatementsVersion::V6 => buffer_row(buffers, statements::to_v6(row, &mut intern)?)?,
+        }
+    }
+    Ok(())
+}
+
 /// Intern the two settings strings and buffer the instance replication row.
 ///
 /// # Errors
@@ -609,8 +696,8 @@ fn announce(line: &str) {
 mod tests {
     use super::{
         activity_dict_limits, push_activity, push_archiver, push_database, push_io,
-        push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_user_indexes,
-        push_user_tables,
+        push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
+        push_user_indexes, push_user_tables,
     };
     use kronika_source_pg::archiver::ArchiverRow;
     use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
@@ -618,6 +705,7 @@ mod tests {
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
     use kronika_source_pg::replication_instance::ReplicationInstanceRow;
+    use kronika_source_pg::statements::{StatementsRow, StatementsVersion};
     use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion};
     use kronika_source_pg::user_tables::{UserTablesRow, UserTablesVersion};
     use kronika_source_pg::{ActivityRow, ActivityVersion};
@@ -899,6 +987,97 @@ mod tests {
                 .iter()
                 .any(|entry| entry.type_id == 1_014_002),
             "the part carries the pg_stat_user_indexes section"
+        );
+    }
+
+    fn statements_row(queryid: i64) -> StatementsRow {
+        StatementsRow {
+            ts: 1_000,
+            queryid: Some(queryid),
+            userid: 10,
+            dbid: 5,
+            toplevel: Some(true),
+            datname: Some("appdb".to_owned()),
+            usename: Some("alice".to_owned()),
+            query: Some("select 1".to_owned()),
+            calls: 100,
+            rows: 5_000,
+            plans: Some(90),
+            total_time: 1_234.5,
+            total_plan_time: Some(12.5),
+            min_time: 0.5,
+            max_time: 40.0,
+            mean_time: 12.3,
+            stddev_time: 3.1,
+            min_plan_time: Some(0.1),
+            max_plan_time: Some(1.0),
+            mean_plan_time: Some(0.2),
+            stddev_plan_time: Some(0.05),
+            shared_blks_hit: 90_000,
+            shared_blks_read: 4_000,
+            shared_blks_dirtied: 50,
+            shared_blks_written: 30,
+            local_blks_hit: 0,
+            local_blks_read: 0,
+            local_blks_dirtied: 0,
+            local_blks_written: 0,
+            temp_blks_read: 0,
+            temp_blks_written: 0,
+            blk_read_time: 12.5,
+            blk_write_time: 3.0,
+            local_blk_read_time: Some(1.0),
+            local_blk_write_time: Some(0.5),
+            temp_blk_read_time: Some(2.0),
+            temp_blk_write_time: Some(1.5),
+            wal_records: Some(42),
+            wal_fpi: Some(3),
+            wal_bytes: Some(8_192),
+            wal_buffers_full: Some(1),
+            jit_functions: Some(0),
+            jit_generation_time: Some(0.0),
+            jit_inlining_count: Some(0),
+            jit_inlining_time: Some(0.0),
+            jit_optimization_count: Some(0),
+            jit_optimization_time: Some(0.0),
+            jit_emission_count: Some(0),
+            jit_emission_time: Some(0.0),
+            jit_deform_count: Some(0),
+            jit_deform_time: Some(0.0),
+            parallel_workers_to_launch: Some(4),
+            parallel_workers_launched: Some(3),
+            stats_since: Some(500),
+            minmax_stats_since: Some(800),
+        }
+    }
+
+    #[test]
+    fn push_statements_buffers_rows_and_interns_strings() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_statements(
+            &mut buffers,
+            &mut interner,
+            StatementsVersion::V6,
+            &[statements_row(777), statements_row(888)],
+        )
+        .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "rows were buffered");
+
+        // The buffered rows use dictionary ids, and the part carries the V6
+        // statements section.
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        assert!(!dict_sections.is_empty(), "strings reached the dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_002_006),
+            "the part carries the pg_stat_statements section"
         );
     }
 

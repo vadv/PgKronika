@@ -33,6 +33,10 @@ use kronika_registry::{
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
     pg_stat_progress_vacuum::PgStatProgressVacuum,
+    pg_stat_statements::{
+        PgStatStatementsV1, PgStatStatementsV2, PgStatStatementsV3, PgStatStatementsV4,
+        PgStatStatementsV5, PgStatStatementsV6,
+    },
     pg_stat_user_indexes::{PgStatUserIndexesV1, PgStatUserIndexesV2},
     pg_stat_user_tables::{
         PgStatUserTablesV1, PgStatUserTablesV2, PgStatUserTablesV3, PgStatUserTablesV4,
@@ -42,6 +46,7 @@ use kronika_registry::{
 };
 use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::io::{IoVersion, io_version};
+use kronika_source_pg::statements::{StatementsVersion, statements_extversion, statements_version};
 use kronika_source_pg::user_indexes::{UserIndexesVersion, user_indexes_version};
 use kronika_source_pg::user_tables::{UserTablesVersion, user_tables_version};
 use kronika_source_pg::wal::{WalVersion, wal_version};
@@ -56,6 +61,13 @@ const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
 
 const PG_STAT_DATABASE_V3_TYPE_ID: u32 = 1_005_003;
 const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
+
+const PG_STAT_STATEMENTS_V1_TYPE_ID: u32 = 1_002_001;
+const PG_STAT_STATEMENTS_V2_TYPE_ID: u32 = 1_002_002;
+const PG_STAT_STATEMENTS_V3_TYPE_ID: u32 = 1_002_003;
+const PG_STAT_STATEMENTS_V4_TYPE_ID: u32 = 1_002_004;
+const PG_STAT_STATEMENTS_V5_TYPE_ID: u32 = 1_002_005;
+const PG_STAT_STATEMENTS_V6_TYPE_ID: u32 = 1_002_006;
 
 const PG_STAT_USER_TABLES_V1_TYPE_ID: u32 = 1_013_001;
 const PG_STAT_USER_TABLES_V2_TYPE_ID: u32 = 1_013_002;
@@ -929,6 +941,155 @@ fn check_user_indexes_rows(
             "postgres {major}: no kronika_ut_probe_pkey row for database {datname}"
         );
     }
+    Ok(())
+}
+
+#[then(
+    "each matrix cluster installs pg_stat_statements and seals rows with dictionary-backed query text"
+)]
+async fn every_version_seals_statements(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        let version = install_statements_and_run_workload(db).await?;
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_statements_section(db.major(), version, &segment)?;
+    }
+    Ok(())
+}
+
+/// Install the extension, run a marked probe workload so the view has a row, and
+/// return the layout the installed extension version maps to.
+///
+/// The layout follows the extension version (`pg_extension.extversion`), which
+/// the cluster pins to whatever ships with its server; it is read here rather
+/// than derived from the server major.
+async fn install_statements_and_run_workload(
+    db: &cluster::Cluster,
+) -> anyhow::Result<StatementsVersion> {
+    let conn = db.connect().await?;
+    conn.client()
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        .await
+        .with_context(|| format!("postgres {}: create pg_stat_statements", db.major()))?;
+    // A distinctive statement the assertion can find in the sealed rows. Run it a
+    // few times so it accrues calls and lands in both candidate axes.
+    for _ in 0..3 {
+        conn.client()
+            .query("SELECT 42 AS kronika_pgss_probe", &[])
+            .await
+            .with_context(|| format!("postgres {}: run probe query", db.major()))?;
+    }
+    let extversion = statements_extversion(conn.client())
+        .await
+        .with_context(|| format!("postgres {}: read extension version", db.major()))?
+        .with_context(|| {
+            format!(
+                "postgres {}: extension not installed after CREATE",
+                db.major()
+            )
+        })?;
+    Ok(statements_version(&extversion))
+}
+
+/// Decode the sealed `pg_stat_statements` section for the layout the extension
+/// version selects, then check one snapshot timestamp, dictionary-backed query
+/// text, and that the probe statement is present.
+fn assert_statements_section(
+    major: u32,
+    version: StatementsVersion,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    let min_ts = segment.catalog().min_ts;
+    let max_ts = segment.catalog().max_ts;
+    // Project each layout to `(query, ts)`: query resolution and the probe check
+    // are the same across versions.
+    let observations = match version {
+        StatementsVersion::V6 => {
+            decode_section_rows::<PgStatStatementsV6>(path, &segment, PG_STAT_STATEMENTS_V6_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_002_006"))?
+                .iter()
+                .map(|r| (r.query, r.ts.0))
+                .collect::<Vec<_>>()
+        }
+        StatementsVersion::V5 => {
+            decode_section_rows::<PgStatStatementsV5>(path, &segment, PG_STAT_STATEMENTS_V5_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_002_005"))?
+                .iter()
+                .map(|r| (r.query, r.ts.0))
+                .collect::<Vec<_>>()
+        }
+        StatementsVersion::V4 => {
+            decode_section_rows::<PgStatStatementsV4>(path, &segment, PG_STAT_STATEMENTS_V4_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_002_004"))?
+                .iter()
+                .map(|r| (r.query, r.ts.0))
+                .collect::<Vec<_>>()
+        }
+        StatementsVersion::V3 => {
+            decode_section_rows::<PgStatStatementsV3>(path, &segment, PG_STAT_STATEMENTS_V3_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_002_003"))?
+                .iter()
+                .map(|r| (r.query, r.ts.0))
+                .collect::<Vec<_>>()
+        }
+        StatementsVersion::V2 => {
+            decode_section_rows::<PgStatStatementsV2>(path, &segment, PG_STAT_STATEMENTS_V2_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_002_002"))?
+                .iter()
+                .map(|r| (r.query, r.ts.0))
+                .collect::<Vec<_>>()
+        }
+        StatementsVersion::V1 => {
+            decode_section_rows::<PgStatStatementsV1>(path, &segment, PG_STAT_STATEMENTS_V1_TYPE_ID)
+                .with_context(|| format!("postgres {major}: read back section 1_002_001"))?
+                .iter()
+                .map(|r| (r.query, r.ts.0))
+                .collect::<Vec<_>>()
+        }
+    };
+    check_statements_rows(major, &dict, min_ts, max_ts, &observations)
+}
+
+/// Shared invariants over the decoded `(query, ts)` projection: at least one row,
+/// every ts in the segment range, every present query text resolves, and the
+/// probe statement is among them.
+fn check_statements_rows(
+    major: u32,
+    dict: &Dictionary,
+    min_ts: i64,
+    max_ts: i64,
+    rows: &[(Option<StrId>, i64)],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "postgres {major}: pg_stat_statements section decoded to no rows"
+    );
+
+    let mut saw_probe = false;
+    for (query, ts) in rows {
+        ensure_ts_in_segment_range(major, "section 1_002", *ts, min_ts, max_ts)?;
+        // The collector runs as a superuser, so query text is present, not NULL.
+        let id = query.with_context(|| {
+            format!("postgres {major}: a pg_stat_statements row has a NULL query text")
+        })?;
+        let text = resolve_string(major, dict, "query", id.0)?;
+        if text
+            .windows(b"kronika_pgss_probe".len())
+            .any(|w| w == b"kronika_pgss_probe")
+        {
+            saw_probe = true;
+        }
+    }
+    anyhow::ensure!(
+        saw_probe,
+        "postgres {major}: the probe statement was not found in the sealed rows"
+    );
     Ok(())
 }
 
