@@ -153,13 +153,16 @@ CTE должен подниматься к корням блокировок и 
 
 ## `1_013_001` / `1_014_001` tables и indexes
 
-Для таблиц выполняются два запроса на базу:
-
-- `pg_stat_user_tables` с top-N и размером через `pg_total_relation_size`;
-- `pg_statio_user_tables`.
-
-Результаты объединяются на коллекторе по `relid`. Отдельный дешёвый запрос
-`count(*)` даёт coverage для `1_023_001`.
+Для таблиц выполняется один запрос на базу (через пул соединений, итерация по
+`per_db()`): `pg_stat_user_tables` с `LEFT JOIN pg_statio_user_tables` по `relid`,
+размерами через `pg_relation_size`/`pg_total_relation_size` и `xid_age`/`mxid_age`/
+`reltuples` из `pg_class`. Отбор кандидатов — чисто механический: top-N по сырым
+колонкам (активность чтения ∪ запись `n_tup_ins+upd+del` ∪ `relpages` ∪
+dead tuples `n_dead_tup` ∪ `age(relfrozenxid)` ∪ `mxid_age(relminmxid)`), без
+порогов и вердиктов (см. `1_013` в `postgresql.md`). `heap_blks_read`/
+`heap_blks_hit` из `pg_statio_user_tables` — счётчики shared-буферов PostgreSQL
+(промах/попадание буфера), а не I/O ОС или блочного устройства. Запрос идёт под
+адаптивным `statement_timeout`. coverage в `1_023_001` — будущий эпик.
 
 Для индексов схема аналогична:
 

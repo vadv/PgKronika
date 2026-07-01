@@ -21,7 +21,7 @@ mod collector;
 use std::path::Path;
 
 use anyhow::Context;
-use cucumber::{World, given, then};
+use cucumber::{World, event, given, then};
 use kronika_format::{Entry, crc32c};
 use kronika_reader::{Dictionary, Resolved, Segment};
 use kronika_registry::{
@@ -33,11 +33,15 @@ use kronika_registry::{
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
     pg_stat_progress_vacuum::PgStatProgressVacuum,
+    pg_stat_user_tables::{
+        PgStatUserTablesV1, PgStatUserTablesV2, PgStatUserTablesV3, PgStatUserTablesV4,
+    },
     pg_stat_wal::{PgStatWalV1, PgStatWalV2},
     replication_instance::ReplicationInstance,
 };
 use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::io::{IoVersion, io_version};
+use kronika_source_pg::user_tables::{UserTablesVersion, user_tables_version};
 use kronika_source_pg::wal::{WalVersion, wal_version};
 use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
 
@@ -50,6 +54,14 @@ const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
 
 const PG_STAT_DATABASE_V3_TYPE_ID: u32 = 1_005_003;
 const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
+
+const PG_STAT_USER_TABLES_V1_TYPE_ID: u32 = 1_013_001;
+const PG_STAT_USER_TABLES_V2_TYPE_ID: u32 = 1_013_002;
+const PG_STAT_USER_TABLES_V3_TYPE_ID: u32 = 1_013_003;
+const PG_STAT_USER_TABLES_V4_TYPE_ID: u32 = 1_013_004;
+
+/// Databases seeded by the user-tables scenario; each gets one probe table.
+const SEEDED_DATABASES: [&str; 2] = ["kronika_ut_a", "kronika_ut_b"];
 
 const PG_REPLICATION_INSTANCE_TYPE_ID: u32 = 1_015_001;
 const PG_STAT_WAL_V1_TYPE_ID: u32 = 1_007_001;
@@ -574,6 +586,215 @@ fn check_database_rows(
         );
     }
     Ok(())
+}
+
+#[then(
+    "each matrix cluster seals pg_stat_user_tables rows from two seeded databases with dictionary-backed names"
+)]
+async fn every_version_seals_user_tables(world: &mut BddWorld) -> anyhow::Result<()> {
+    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
+    for db in &world.clusters {
+        for datname in SEEDED_DATABASES {
+            seed_user_table_database(db, datname).await?;
+        }
+        // The collector refreshes the pool on SIGUSR2, so the seeded databases
+        // are enumerated and walked in this snapshot.
+        let mut collector = collector::Collector::spawn(db).await?;
+        let segment = collector.snapshot().await?;
+        assert_user_tables_section(db.major(), &segment)?;
+    }
+    Ok(())
+}
+
+/// Create a database with one probe table carrying rows and fresh statistics, so
+/// the table lands in the size and activity candidate axes. `CREATE DATABASE`
+/// cannot run inside a transaction block, hence the separate statements.
+async fn seed_user_table_database(db: &cluster::Cluster, datname: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        datname.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+        "seed database name {datname:?} is not a safe identifier"
+    );
+    let admin = db.connect().await?;
+    let exists = admin
+        .client()
+        .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&datname])
+        .await
+        .with_context(|| format!("postgres {}: probe database {datname}", db.major()))?;
+    if exists.is_none() {
+        admin
+            .client()
+            .batch_execute(&format!("CREATE DATABASE {datname}"))
+            .await
+            .with_context(|| format!("postgres {}: create database {datname}", db.major()))?;
+    }
+    drop(admin);
+
+    let dsn = db.conn_string_db(datname);
+    let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .with_context(|| format!("postgres {}: connect to {datname}", db.major()))?;
+    let driver = tokio::spawn(connection);
+    let result = async {
+        client
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS kronika_ut_probe (id int primary key, payload text); \
+                 INSERT INTO kronika_ut_probe \
+                   SELECT g, repeat('x', 16) FROM generate_series(1, 200) g \
+                   ON CONFLICT (id) DO NOTHING;",
+            )
+            .await
+            .with_context(|| format!("postgres {}: seed table in {datname}", db.major()))?;
+        // VACUUM cannot run inside a transaction block, and a multi-statement
+        // simple query executes as one implicit transaction — so VACUUM ANALYZE
+        // must be its own statement.
+        client
+            .batch_execute("VACUUM ANALYZE kronika_ut_probe;")
+            .await
+            .with_context(|| format!("postgres {}: vacuum analyze in {datname}", db.major()))
+    }
+    .await;
+    driver.abort();
+    result
+}
+
+/// Database row fields covered by the live BDD matrix for user-tables layouts.
+#[derive(Debug, Clone, Copy)]
+struct UserTableObservation {
+    datname: StrId,
+    schemaname: StrId,
+    relname: StrId,
+    ts: i64,
+}
+
+/// Decode the sealed `pg_stat_user_tables` section for the selected layout, then
+/// check one snapshot timestamp, that the two seeded databases both contributed
+/// the probe table, and that datname/schemaname/relname resolve through the
+/// dictionary.
+fn assert_user_tables_section(major: u32, path: &Path) -> anyhow::Result<()> {
+    let segment =
+        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
+    let dict = segment
+        .dictionary()
+        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
+    let min_ts = segment.catalog().min_ts;
+    let max_ts = segment.catalog().max_ts;
+    let observations = match user_tables_version(major) {
+        UserTablesVersion::V4 => decode_section_rows::<PgStatUserTablesV4>(
+            path,
+            &segment,
+            PG_STAT_USER_TABLES_V4_TYPE_ID,
+        )
+        .with_context(|| format!("postgres {major}: read back section 1_013_004"))?
+        .iter()
+        .map(|r| UserTableObservation {
+            datname: r.datname,
+            schemaname: r.schemaname,
+            relname: r.relname,
+            ts: r.ts.0,
+        })
+        .collect::<Vec<_>>(),
+        UserTablesVersion::V3 => decode_section_rows::<PgStatUserTablesV3>(
+            path,
+            &segment,
+            PG_STAT_USER_TABLES_V3_TYPE_ID,
+        )
+        .with_context(|| format!("postgres {major}: read back section 1_013_003"))?
+        .iter()
+        .map(|r| UserTableObservation {
+            datname: r.datname,
+            schemaname: r.schemaname,
+            relname: r.relname,
+            ts: r.ts.0,
+        })
+        .collect::<Vec<_>>(),
+        UserTablesVersion::V2 => decode_section_rows::<PgStatUserTablesV2>(
+            path,
+            &segment,
+            PG_STAT_USER_TABLES_V2_TYPE_ID,
+        )
+        .with_context(|| format!("postgres {major}: read back section 1_013_002"))?
+        .iter()
+        .map(|r| UserTableObservation {
+            datname: r.datname,
+            schemaname: r.schemaname,
+            relname: r.relname,
+            ts: r.ts.0,
+        })
+        .collect::<Vec<_>>(),
+        UserTablesVersion::V1 => decode_section_rows::<PgStatUserTablesV1>(
+            path,
+            &segment,
+            PG_STAT_USER_TABLES_V1_TYPE_ID,
+        )
+        .with_context(|| format!("postgres {major}: read back section 1_013_001"))?
+        .iter()
+        .map(|r| UserTableObservation {
+            datname: r.datname,
+            schemaname: r.schemaname,
+            relname: r.relname,
+            ts: r.ts.0,
+        })
+        .collect::<Vec<_>>(),
+    };
+    check_user_tables_rows(major, &dict, min_ts, max_ts, &observations)
+}
+
+/// Shared invariants over the decoded user-tables rows.
+fn check_user_tables_rows(
+    major: u32,
+    dict: &Dictionary,
+    min_ts: i64,
+    max_ts: i64,
+    rows: &[UserTableObservation],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "postgres {major}: pg_stat_user_tables section decoded to no rows"
+    );
+
+    // One statement_timestamp() per database, but every snapshot ts must fall in
+    // the segment range; the rows share a single collection window.
+    for row in rows {
+        ensure_ts_in_segment_range(major, "section 1_013", row.ts, min_ts, max_ts)?;
+    }
+
+    // Every label resolves, and the probe table from both seeded databases is
+    // present (datname is the discriminator: the table name is identical).
+    let mut seeded_with_probe: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::new();
+    for row in rows {
+        let datname = resolve_string(major, dict, "datname", row.datname.0)?;
+        let schemaname = resolve_string(major, dict, "schemaname", row.schemaname.0)?;
+        let relname = resolve_string(major, dict, "relname", row.relname.0)?;
+        anyhow::ensure!(
+            !schemaname.is_empty(),
+            "postgres {major}: schemaname resolved to an empty string"
+        );
+        if relname == b"kronika_ut_probe"
+            && SEEDED_DATABASES
+                .iter()
+                .any(|name| name.as_bytes() == datname.as_slice())
+        {
+            seeded_with_probe.insert(datname);
+        }
+    }
+    for datname in SEEDED_DATABASES {
+        anyhow::ensure!(
+            seeded_with_probe.contains(datname.as_bytes()),
+            "postgres {major}: no kronika_ut_probe row for database {datname}"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a dictionary id to its bytes or fail with context.
+fn resolve_string(major: u32, dict: &Dictionary, label: &str, id: u64) -> anyhow::Result<Vec<u8>> {
+    match dict.resolve(id) {
+        Some(Resolved::String(bytes)) => Ok(bytes.to_vec()),
+        other => anyhow::bail!(
+            "postgres {major}: {label} str_id {id} did not resolve to a string: {other:?}"
+        ),
+    }
 }
 
 #[then("each matrix cluster seals its replication instance status")]
@@ -1312,7 +1533,36 @@ async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> an
 #[tokio::main]
 async fn main() {
     let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
-    BddWorld::cucumber().run_and_exit(features).await;
+    // On a failed scenario, dump each booted cluster's PostgreSQL server log so
+    // CI shows the server-side cause (e.g. a rejected statement) instead of only
+    // the opaque step panic. PostgreSQL logs errors regardless of DEBUG.
+    BddWorld::cucumber()
+        .after(|_feature, _rule, _scenario, ev, world| {
+            Box::pin(async move {
+                if !matches!(
+                    ev,
+                    event::ScenarioFinished::StepFailed(..)
+                        | event::ScenarioFinished::BeforeHookFailed(_)
+                ) {
+                    return;
+                }
+                if let event::ScenarioFinished::StepFailed(_, _, err) = ev {
+                    eprintln!("=== BDD step failed: {err} ===");
+                }
+                if let Some(world) = world {
+                    for cluster in &world.clusters {
+                        eprintln!(
+                            "=== postgres {} server.log ===\n{}\n=== end postgres {} server.log ===",
+                            cluster.major(),
+                            cluster.server_log(),
+                            cluster.major(),
+                        );
+                    }
+                }
+            })
+        })
+        .run_and_exit(features)
+        .await;
 }
 
 #[cfg(test)]

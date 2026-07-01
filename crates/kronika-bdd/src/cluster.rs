@@ -111,8 +111,13 @@ impl Cluster {
     }
 
     pub(crate) fn conn_string(&self) -> String {
+        self.conn_string_db("postgres")
+    }
+
+    /// Connection string targeting a specific database on this cluster.
+    pub(crate) fn conn_string_db(&self, dbname: &str) -> String {
         format!(
-            "host=127.0.0.1 port={} user=postgres dbname=postgres",
+            "host=127.0.0.1 port={} user=postgres dbname={dbname}",
             self.port
         )
     }
@@ -163,7 +168,7 @@ impl Cluster {
         Ok(())
     }
 
-    fn server_log(&self) -> String {
+    pub(crate) fn server_log(&self) -> String {
         std::fs::read_to_string(self.data_dir.path().join(SERVER_LOG))
             .unwrap_or_else(|_| "(server log unavailable)".to_owned())
     }
@@ -222,8 +227,8 @@ async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
 fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
     let log = std::fs::File::create(data_dir.join(SERVER_LOG))
         .with_context(|| format!("create server log for postgres {}", bin.major))?;
-    Command::new(bin.bindir.join("postgres"))
-        .arg("-D")
+    let mut cmd = Command::new(bin.bindir.join("postgres"));
+    cmd.arg("-D")
         .arg(data_dir)
         // The unix socket goes in the writable data dir; the packaged default
         // (/run/postgresql) does not exist in the minimal image, and postgres
@@ -240,8 +245,13 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
             "full_page_writes=off",
             "-c",
             "max_prepared_transactions=16",
-        ])
-        .stdout(Stdio::null())
+        ]);
+    // DEBUG=1 turns the server log into a full SQL trace; errors are logged
+    // regardless, so the on-failure dump always shows the offending statement.
+    if std::env::var("DEBUG").is_ok() {
+        cmd.args(["-c", "log_statement=all", "-c", "log_min_messages=info"]);
+    }
+    cmd.stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .kill_on_drop(true)
         .spawn()
