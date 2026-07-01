@@ -33,6 +33,7 @@ pub use activity::{
 pub mod archiver;
 pub mod database;
 pub mod io;
+pub mod locks;
 
 pub mod pool;
 pub mod wal;
