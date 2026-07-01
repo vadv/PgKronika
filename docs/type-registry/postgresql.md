@@ -25,7 +25,10 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_010_001` | `pg_prepared_xacts` по базам | базовый шаг | `snapshot_full` | `(datname, ts)` |
 | `1_011_001` | `pg_locks`, дерево ожиданий | по факту | `conditional_full` | `(ts, root_pid, depth)` |
 | `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `conditional_full` | `(ts, pid)` |
-| `1_013_001` | `pg_stat_user_tables` + `pg_statio_user_tables` | 30 с | `changed` | `(datname, relid, ts)` |
+| `1_013_001` | `pg_stat_user_tables` + statio (PG 10-12) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
+| `1_013_002` | `pg_stat_user_tables` + statio (PG 13-15) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
+| `1_013_003` | `pg_stat_user_tables` + statio (PG 16-17) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
+| `1_013_004` | `pg_stat_user_tables` + statio (PG 18) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
 | `1_014_001` | `pg_stat_user_indexes` + `pg_statio_user_indexes` | 30 с | `changed` | `(datname, indexrelid, ts)` |
 | `1_015_001` | replication: статус инстанса | 30 с | `snapshot_full` | `(ts)` |
 | `1_016_001` | replication: реплики primary | 30 с | `snapshot_full` | `(application_name, client_addr, pid, ts)` |
@@ -538,20 +541,57 @@ PG17 заменил `max_dead_tuples` / `num_dead_tuples` на
 `heap_blks_scanned` / `heap_blks_vacuumed` монотонны внутри одного vacuum, но
 класс `G`: между запусками сбрасываются.
 
-## `1_013_001` `pg_stat_user_tables` + `pg_statio_user_tables`
+## `1_013_001`..`1_013_004` `pg_stat_user_tables` + `pg_statio_user_tables`
 
-Собирается отдельно по каждой базе через пул соединений: одно соединение на
-базу, обновление пула раз в 10 минут. Явный `PGDATABASE` отключает режим
-нескольких баз. Источник собирается top-N, значение по умолчанию — 500 строк.
-Порядок отбора фиксируется в coverage `order_by`; базовый вариант:
-`greatest(seq_scan, idx_scan, n_tup_ins + n_tup_upd + n_tup_del, size_bytes)
-DESC`. `pg_statio_user_tables` сливается с основной статистикой по `relid`.
+Собирается отдельно по каждой базе через пул соединений (один коннект на базу,
+обновление пула раз в 10 минут, env `KRONIKA_PG_POOL_REFRESH_SECS`). Явный
+`PGDATABASE` отключает режим нескольких баз. Тяжёлый запрос идёт под адаптивным
+`statement_timeout` (старт 15 с, ×2 до `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` = 60 с;
+SQLSTATE 57014 — расширить и повторить базу, иначе пропустить).
 
-В `changed`-семантике поля класса `G`, например `n_live_tup`, сами по себе
-изменением не считаются, если не сработал `always_include`.
+Четыре версии по росту каталога: `n_ins_since_vacuum` появился в PG13 (V2),
+`n_tup_newpage_upd` и `last_seq_scan`/`last_idx_scan` — в PG16 (V3), четыре
+кумулятивных тайминга вакуума/анализа (`total_vacuum_time`,
+`total_autovacuum_time`, `total_analyze_time`, `total_autoanalyze_time`,
+`double precision`, миллисекунды) — в PG18 (V4).
+
+Отбор кандидатов — чисто механический: объединение top-N таблиц по сырым
+колонкам (N по умолчанию 500, env `KRONIKA_PG_MAX_TABLES`):
+
+- активность: `seq_scan + idx_scan + n_tup_ins/upd/del` (PG16+ — `GREATEST(last_seq_scan, last_idx_scan)`);
+- запись: `n_tup_ins + n_tup_upd + n_tup_del` DESC — на PG16+ ось активности это давность чтения, и таблица только под запись иначе теряется;
+- размер: `pg_class.relpages`;
+- dead tuples: `n_dead_tup`;
+- xid-возраст: `age(relfrozenxid)` DESC — старые таблицы могут попасть в выборку без активности пользовательских запросов;
+- multixact-возраст: `mxid_age(relminmxid)` DESC.
+
+Коллектор пишет крайние строки по каждой оси и ограничивает свой объём; оценку
+«опасно или нет» делает модуль анализа на чтении — порогов и вердиктов в
+коллекторе нет.
+
+`pg_statio_user_tables` сливается в строку через `LEFT JOIN` по `relid`;
+`xid_age`/`mxid_age`/`reltuples` берутся из `pg_class` тем же запросом. `datid`
+нужен вместе с `datname` как стабильный числовой ключ (базу могут переименовать)
+и для join к `pg_stat_database`. `NULL` означает «нет индексов» (`idx_*`), «нет
+TOAST» (`toast_*`) или «события не было» (`last_*`) — не ноль.
+`heap_blks_read`/`heap_blks_hit` — счётчики shared-буферов PostgreSQL (попадание
+в кэш буферов против промаха), а не I/O блочного устройства или ОС: `read` здесь
+значит «не нашлось в shared buffers», а не «прочитано с диска».
+
+Семантика `snapshot_full`: каждый цикл отдаёт все отобранные строки. Ряд
+разрежённый — отсутствие таблицы в снимке означает, что она не попала в top-N, а
+не ноль; сбросы статистики по всей базе видны через `pg_stat_database.stats_reset`
+(`1_005`) по join на `datid`. `changed`-семантика (слать только изменившиеся
+строки + baseline-маркер, экономия для высококардинальных tables/indexes) —
+отдельный будущий эпик, требует delta-инфраструктуры, которой пока нет.
+
+Раскладка V4 (надмножество; V3 без четырёх `total_*_time`, V2 ещё и без
+`n_tup_newpage_upd`/`last_seq_scan`/`last_idx_scan`, V1 ещё и без
+`n_ins_since_vacuum`):
 
 ```text
 ts                              ts    T
+datid                           u32   L
 datname                         str   L
 relid                           u32   L
 schemaname                      str   L
@@ -559,14 +599,17 @@ relname                         str   L
 tablespace                      str   L
 seq_scan                        i64   C
 seq_tup_read                    i64   C
-idx_scan                        i64   C
-idx_tup_fetch                   i64   C
+idx_scan                        i64?  C
+idx_tup_fetch                   i64?  C
 n_tup_ins                       i64   C
 n_tup_upd                       i64   C
 n_tup_del                       i64   C
 n_tup_hot_upd                   i64   C
+n_tup_newpage_upd               i64   C
 n_live_tup                      i64   G
-n_dead_tup                      i64   G
+n_dead_tup                      i64   G   // dead tuples (мёртвые кортежи)
+n_mod_since_analyze             i64   G
+n_ins_since_vacuum              i64   G
 vacuum_count                    i64   C
 autovacuum_count                i64   C
 analyze_count                   i64   C
@@ -575,22 +618,28 @@ last_vacuum                     ts?   G
 last_autovacuum                 ts?   G
 last_analyze                    ts?   G
 last_autoanalyze                ts?   G
-size_bytes                      i64   G
-toast_bytes                     i64   G
-toast_n_live_tup                i64   G
-toast_n_dead_tup                i64   G
+last_seq_scan                   ts?   G
+last_idx_scan                   ts?   G
+total_vacuum_time               f64   C   // PG18+, мс
+total_autovacuum_time           f64   C   // PG18+, мс
+total_analyze_time              f64   C   // PG18+, мс
+total_autoanalyze_time          f64   C   // PG18+, мс
+main_fork_bytes                 i64   G   // pg_relation_size, только main fork
+toast_bytes                     i64?  G
+toast_n_live_tup                i64?  G
+toast_n_dead_tup                i64?  G
 toast_last_autovacuum           ts?   G
-n_mod_since_analyze             i64   G
-n_ins_since_vacuum              i64   G
-heap_blks_read                  i64   C
-heap_blks_hit                   i64   C
-idx_blks_read                   i64   C
-idx_blks_hit                    i64   C
-toast_blks_read                 i64   C
-toast_blks_hit                  i64   C
-tidx_blks_read                  i64   C
-tidx_blks_hit                   i64   C
-is_baseline                     bool  L
+xid_age                         i64   G
+mxid_age                        i64   G
+reltuples                       i64   G
+heap_blks_read                  i64   C   // shared-буферы: промах, не диск/ОС
+heap_blks_hit                   i64   C   // shared-буферы: попадание
+idx_blks_read                   i64?  C
+idx_blks_hit                    i64?  C
+toast_blks_read                 i64?  C
+toast_blks_hit                  i64?  C
+tidx_blks_read                  i64?  C
+tidx_blks_hit                   i64?  C
 ```
 
 ## `1_014_001` `pg_stat_user_indexes` + `pg_statio_user_indexes`
