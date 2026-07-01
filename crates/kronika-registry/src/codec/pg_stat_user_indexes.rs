@@ -92,10 +92,10 @@ pub struct PgStatUserIndexesV2 {
     /// `pg_get_indexdef` reconstruction of the index definition.
     #[column(l)]
     pub indexdef: StrId,
-    /// Index blocks read from disk.
+    /// Shared-buffer misses for index blocks.
     #[column(c)]
     pub idx_blks_read: i64,
-    /// Index buffer hits.
+    /// Shared-buffer hits for index blocks.
     #[column(c)]
     pub idx_blks_hit: i64,
 }
@@ -175,10 +175,10 @@ pub struct PgStatUserIndexesV1 {
     /// `pg_get_indexdef` reconstruction of the index definition.
     #[column(l)]
     pub indexdef: StrId,
-    /// Index blocks read from disk.
+    /// Shared-buffer misses for index blocks.
     #[column(c)]
     pub idx_blks_read: i64,
-    /// Index buffer hits.
+    /// Shared-buffer hits for index blocks.
     #[column(c)]
     pub idx_blks_hit: i64,
 }
