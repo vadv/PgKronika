@@ -7,9 +7,9 @@
 ## Общие правила
 
 - Каждый SQL-запрос коллектора начинается с комментария-маркера
-  `/* pg_kronika:<version> <source-file> */`. Маркер нужен, чтобы исключать
-  собственные запросы коллектора из `pg_stat_activity`, `pg_stat_statements` и
-  аналитики.
+  `/* pg_kronika:<version> <source-file> */`. Маркер отделяет собственные
+  запросы коллектора в `pg_stat_activity`, `pg_stat_statements`, логах и внешней
+  аналитике.
 - Запросы к системным каталогам выполняются через `query_with_lock_retry`:
   DDL может временно держать lock на каталогах.
 - При ошибке соединения сбрасывается клиент и весь кэш окружения:
@@ -64,44 +64,60 @@ FROM pg_stat_activity;
 `query_id` доступен не на всех версиях PostgreSQL и при
 `compute_query_id = off` может быть нулем.
 
-## `1_002_001` statements: двухфазный сбор текстов
+## `1_002_001`..`1_002_006` statements
 
-Фаза 1: статистика без текстов.
+`pg_stat_statements` — представление уровня кластера: строка содержит
+`(userid, dbid, queryid)`, а `dbid` указывает базу выполнения. Коллектор выполняет
+один запрос из базы, где установлено расширение. Источник выбирается и кэшируется:
+сначала `pool.main()`, затем покрытые соединения `per_db()`. На ошибке запроса,
+закрытом соединении, пропавшем расширении или изменении `extversion` кэш
+сбрасывается и запускается ограниченное повторное обнаружение. Поиск источника
+видит только `pool.main()` и покрытые per-db соединения; базы вне лимита пула
+останутся невидимыми до появления явной настройки исходной БД.
+
+Раскладка выбирается по версии расширения, а не по мажору сервера. Проба:
 
 ```sql
 /* pg_kronika:<version> <source-file> */
+SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements';
+```
+
+`extversion` (`"1.11"` и т. п.) разбирается в `major.minor` и отображается в тип:
+≤ 1.7 → `1_002_001`, 1.8 → `_002`, 1.9 → `_003`, 1.10 → `_004`, 1.11 → `_005`,
+≥ 1.12 → `_006`. Нераспознанная строка выбирает legacy-раскладку.
+
+Один запрос со встроенным усечением текста (без второй фазы):
+
+```sql
+/* pg_kronika:<version> <source-file> */
+WITH candidates AS (
+  (SELECT userid, dbid, queryid FROM pg_stat_statements
+     ORDER BY total_exec_time DESC NULLS LAST LIMIT $1)
+  UNION
+  (SELECT userid, dbid, queryid FROM pg_stat_statements
+     ORDER BY calls DESC NULLS LAST LIMIT $1)
+)
 SELECT
-  s.userid,
-  s.dbid,
-  s.queryid,
-  COALESCE(d.datname, '') AS datname,
-  COALESCE(r.rolname, '') AS usename,
-  s.calls,
-  s.total_exec_time,
+  s.queryid, s.userid, s.dbid,
+  d.datname::text AS datname, r.rolname::text AS usename,
+  LEFT(s.query, 5000) AS query,
   ...
-FROM pg_stat_statements(showtext := false) s
+FROM pg_stat_statements s
+JOIN candidates c ON c.userid = s.userid AND c.dbid = s.dbid
+  AND c.queryid IS NOT DISTINCT FROM s.queryid
 LEFT JOIN pg_database d ON d.oid = s.dbid
-LEFT JOIN pg_roles r ON r.oid = s.userid
-ORDER BY total_exec_time DESC
-LIMIT :max_statements;
+LEFT JOIN pg_roles r ON r.oid = s.userid;
 ```
 
-Для PG < 13 используются старые имена колонок, например `total_time`.
-
-Фаза 2: тексты только для `queryid`, которых ещё нет в интернер-кэше.
-
-```sql
-/* pg_kronika:<version> <source-file> */
-SELECT
-  queryid,
-  LEFT(query, :max_text_len) AS query
-FROM pg_stat_statements
-WHERE queryid = ANY($1);
-```
-
-Расширение `pg_stat_statements` ищется по всем базам пула: оно может быть
-установлено не в основной базе. Версия расширения перепроверяется примерно раз
-в 5 минут.
+Отбор кандидатов объединяет две оси top-N: по `total_exec_time` (в
+legacy-раскладке — по `total_time`) и по `calls`, без порогов и вердиктов в SQL
+(см. `1_002` в `postgresql.md`). Лимит на ось — `KRONIKA_PG_MAX_STATEMENTS`, по
+умолчанию 500. Текст берётся прямо в `SELECT` как `LEFT(query, 5000)` и
+интернируется. `IS NOT DISTINCT FROM` в join нужен, чтобы строка с `NULL`
+`queryid` (выключенный `compute_query_id`) совпала со своим кандидатом. Для
+legacy-раскладки используются старые имена колонок времени (`total_time` и т.
+п.); переименование `blk_*_time` → `shared_blk_*_time` начинается с версии
+расширения 1.11.
 
 ## `1_003_001` / `1_004_001` store_plans
 
@@ -162,7 +178,8 @@ dead tuples `n_dead_tup` ∪ `age(relfrozenxid)` ∪ `mxid_age(relminmxid)`), б
 порогов и вердиктов (см. `1_013` в `postgresql.md`). `heap_blks_read`/
 `heap_blks_hit` из `pg_statio_user_tables` — счётчики shared-буферов PostgreSQL
 (промах/попадание буфера), а не I/O ОС или блочного устройства. Запрос идёт под
-адаптивным `statement_timeout`. coverage в `1_023_001` — будущий эпик.
+адаптивным `statement_timeout`. Усечённый сбор пока не пишет coverage
+`1_023_001`.
 
 Для индексов (`1_014`) схема аналогична и симметрична таблицам: один запрос на
 базу по `per_db()` под тем же адаптивным `statement_timeout`, свой env
