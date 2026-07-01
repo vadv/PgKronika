@@ -26,9 +26,8 @@
 //!   size, dead tuples, transaction-id age, multixact age; indexes: scans,
 //!   tuples read, size) contributes up to this many rows before the union;
 //! - `KRONIKA_PG_MAX_STATEMENTS`: per-axis top-N row count for the
-//!   `pg_stat_statements` candidate selection, default 500. Each mechanical axis
-//!   (total execution time, calls) contributes up to this many rows before the
-//!   union;
+//!   `pg_stat_statements` candidate selection, default 500. Each axis (total
+//!   execution time, calls) contributes up to this many rows before the union;
 //! - `KRONIKA_PG_POOL_REFRESH_SECS`: minimum interval between connection-pool
 //!   refreshes (per-database connection reconciliation), default 600;
 //! - `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`: cap for the adaptive `statement_timeout`
@@ -314,10 +313,10 @@ async fn collect_user_indexes_all(
 /// The view is instance-wide: one row per `(userid, dbid, queryid)` covering
 /// every database, so a single query against any database that has the extension
 /// installed returns all of them. The probe tries the main connection first,
-/// then each per-database connection, and collects from the first that reports
-/// the extension. Returns `None` (no section) when no connection has it. All
-/// awaits finish here so the caller can intern without holding the `!Send`
-/// `Interner` across an await.
+/// then each per-database connection, and collects from the first connection
+/// with the extension installed. Returns `None` (no section) when no connection
+/// has it. All awaits finish here so the caller can intern without holding the
+/// `!Send` `Interner` across an await.
 async fn collect_statements_once(
     pool: &ConnectionPool,
     config: &Config,
