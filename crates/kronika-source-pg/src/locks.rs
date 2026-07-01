@@ -97,7 +97,7 @@ const fn locks_query_v2() -> &'static str {
          SELECT n.pid, n.depth, n.root_pid, \
            COALESCE((SELECT array_agg(DISTINCT b ORDER BY b) \
                      FROM unnest(pg_blocking_pids(n.pid)) b), ARRAY[]::int[]) AS blocked_by, \
-           a.datid, coalesce(a.datname::text, '') AS datname, a.usename::text AS usename, \
+           coalesce(a.datid, 0) AS datid, coalesce(a.datname::text, '') AS datname, a.usename::text AS usename, \
            coalesce(a.application_name, '') AS application_name, \
            coalesce(host(a.client_addr), '') AS client_addr, \
            coalesce(a.backend_type, '') AS backend_type, a.state, \
@@ -109,14 +109,17 @@ const fn locks_query_v2() -> &'static str {
            (extract(epoch FROM a.xact_start) * 1e6)::int8 AS xact_start_us, \
            (extract(epoch FROM a.query_start) * 1e6)::int8 AS query_start_us, \
            (extract(epoch FROM a.state_change) * 1e6)::int8 AS state_change_us, \
-           l.locktype AS lock_locktype, l.mode AS lock_mode, l.relation AS lock_relation, \
-           c.relname::text AS lock_relname, l.transactionid::text::int8 AS lock_transactionid, \
+           l.locktype AS lock_locktype, l.mode AS lock_mode, l.granted AS lock_granted, \
+           l.relation AS lock_relation, c.relname::text AS lock_relname, \
+           l.page AS lock_page, l.tuple AS lock_tuple, \
+           l.transactionid::text::int8 AS lock_transactionid, l.fastpath AS lock_fastpath, \
            (l.locktype || coalesce(':' || c.relname, '')) AS lock_target, \
            (extract(epoch FROM l.waitstart) * 1e6)::int8 AS waitstart_us, \
            (extract(epoch FROM snap.ts) * 1e6)::int8 AS ts_us \
          FROM nodes n CROSS JOIN snap \
          JOIN pg_stat_activity a ON a.pid = n.pid \
-         LEFT JOIN LATERAL (SELECT lk.locktype, lk.mode, lk.relation, lk.transactionid, lk.waitstart \
+         LEFT JOIN LATERAL (SELECT lk.locktype, lk.mode, lk.granted, lk.relation, lk.page, \
+                                   lk.tuple, lk.transactionid, lk.fastpath, lk.waitstart \
                             FROM pg_locks lk WHERE lk.pid = n.pid AND NOT lk.granted LIMIT 1) l ON true \
          LEFT JOIN pg_class c ON c.oid = l.relation \
          ORDER BY n.root_pid, n.depth, n.pid \
@@ -145,7 +148,7 @@ const fn locks_query_v1() -> &'static str {
          SELECT n.pid, n.depth, n.root_pid, \
            COALESCE((SELECT array_agg(DISTINCT b ORDER BY b) \
                      FROM unnest(pg_blocking_pids(n.pid)) b), ARRAY[]::int[]) AS blocked_by, \
-           a.datid, coalesce(a.datname::text, '') AS datname, a.usename::text AS usename, \
+           coalesce(a.datid, 0) AS datid, coalesce(a.datname::text, '') AS datname, a.usename::text AS usename, \
            coalesce(a.application_name, '') AS application_name, \
            coalesce(host(a.client_addr), '') AS client_addr, \
            coalesce(a.backend_type, '') AS backend_type, a.state, \
@@ -157,13 +160,16 @@ const fn locks_query_v1() -> &'static str {
            (extract(epoch FROM a.xact_start) * 1e6)::int8 AS xact_start_us, \
            (extract(epoch FROM a.query_start) * 1e6)::int8 AS query_start_us, \
            (extract(epoch FROM a.state_change) * 1e6)::int8 AS state_change_us, \
-           l.locktype AS lock_locktype, l.mode AS lock_mode, l.relation AS lock_relation, \
-           c.relname::text AS lock_relname, l.transactionid::text::int8 AS lock_transactionid, \
+           l.locktype AS lock_locktype, l.mode AS lock_mode, l.granted AS lock_granted, \
+           l.relation AS lock_relation, c.relname::text AS lock_relname, \
+           l.page AS lock_page, l.tuple AS lock_tuple, \
+           l.transactionid::text::int8 AS lock_transactionid, l.fastpath AS lock_fastpath, \
            (l.locktype || coalesce(':' || c.relname, '')) AS lock_target, \
            (extract(epoch FROM snap.ts) * 1e6)::int8 AS ts_us \
          FROM nodes n CROSS JOIN snap \
          JOIN pg_stat_activity a ON a.pid = n.pid \
-         LEFT JOIN LATERAL (SELECT lk.locktype, lk.mode, lk.relation, lk.transactionid \
+         LEFT JOIN LATERAL (SELECT lk.locktype, lk.mode, lk.granted, lk.relation, lk.page, \
+                                   lk.tuple, lk.transactionid, lk.fastpath \
                             FROM pg_locks lk WHERE lk.pid = n.pid AND NOT lk.granted LIMIT 1) l ON true \
          LEFT JOIN pg_class c ON c.oid = l.relation \
          ORDER BY n.root_pid, n.depth, n.pid \
@@ -221,12 +227,21 @@ pub struct LocksRow {
     pub lock_locktype: Option<String>,
     /// Awaited lock mode.
     pub lock_mode: Option<String>,
+    /// Whether the awaited lock is granted; always false for the awaited row,
+    /// recorded for completeness.
+    pub lock_granted: Option<bool>,
     /// Relation oid of the awaited lock.
     pub lock_relation: Option<u32>,
     /// Relation name, resolved only for the connected database.
     pub lock_relname: Option<String>,
+    /// Page number of a page/tuple lock target.
+    pub lock_page: Option<i32>,
+    /// Tuple offset of a tuple lock target.
+    pub lock_tuple: Option<i16>,
     /// Transaction id being awaited (row-lock pattern), raw xid.
     pub lock_transactionid: Option<i64>,
+    /// Whether the awaited lock was taken via the fast path.
+    pub lock_fastpath: Option<bool>,
     /// Human-readable target, best effort.
     pub lock_target: Option<String>,
     /// Lock-wait start (PG14+); `None` on V1 or while not yet timed.
@@ -279,9 +294,13 @@ pub fn to_v2<E>(
         state_change: row.state_change.map(Ts),
         lock_locktype: opt(&mut intern, row.lock_locktype.as_deref())?,
         lock_mode: opt(&mut intern, row.lock_mode.as_deref())?,
+        lock_granted: row.lock_granted,
         lock_relation: row.lock_relation,
         lock_relname: opt(&mut intern, row.lock_relname.as_deref())?,
+        lock_page: row.lock_page,
+        lock_tuple: row.lock_tuple,
         lock_transactionid: row.lock_transactionid,
+        lock_fastpath: row.lock_fastpath,
         lock_target: opt(&mut intern, row.lock_target.as_deref())?,
         waitstart: row.waitstart.map(Ts),
     })
@@ -319,9 +338,13 @@ pub fn to_v1<E>(
         state_change: row.state_change.map(Ts),
         lock_locktype: opt(&mut intern, row.lock_locktype.as_deref())?,
         lock_mode: opt(&mut intern, row.lock_mode.as_deref())?,
+        lock_granted: row.lock_granted,
         lock_relation: row.lock_relation,
         lock_relname: opt(&mut intern, row.lock_relname.as_deref())?,
+        lock_page: row.lock_page,
+        lock_tuple: row.lock_tuple,
         lock_transactionid: row.lock_transactionid,
+        lock_fastpath: row.lock_fastpath,
         lock_target: opt(&mut intern, row.lock_target.as_deref())?,
     })
 }
@@ -353,9 +376,13 @@ fn row_from_pg(row: &tokio_postgres::Row, version: LocksVersion) -> LocksRow {
         state_change: row.get("state_change_us"),
         lock_locktype: row.get("lock_locktype"),
         lock_mode: row.get("lock_mode"),
+        lock_granted: row.get("lock_granted"),
         lock_relation: row.get("lock_relation"),
         lock_relname: row.get("lock_relname"),
+        lock_page: row.get("lock_page"),
+        lock_tuple: row.get("lock_tuple"),
         lock_transactionid: row.get("lock_transactionid"),
+        lock_fastpath: row.get("lock_fastpath"),
         lock_target: row.get("lock_target"),
         waitstart: match version {
             LocksVersion::V1 => None,
@@ -413,9 +440,13 @@ mod tests {
             state_change: Some(999_000),
             lock_locktype: None,
             lock_mode: None,
+            lock_granted: None,
             lock_relation: None,
             lock_relname: None,
+            lock_page: None,
+            lock_tuple: None,
             lock_transactionid: None,
+            lock_fastpath: None,
             lock_target: None,
             waitstart: None,
         }
@@ -431,9 +462,13 @@ mod tests {
             wait_event: Some("relation".to_owned()),
             lock_locktype: Some("relation".to_owned()),
             lock_mode: Some("AccessExclusiveLock".to_owned()),
+            lock_granted: Some(false),
             lock_relation: Some(12_345),
             lock_relname: Some("orders".to_owned()),
+            lock_page: Some(42),
+            lock_tuple: Some(7),
             lock_transactionid: Some(999_999),
+            lock_fastpath: Some(false),
             lock_target: Some("relation:orders".to_owned()),
             waitstart: Some(998_000),
             backend_xid_age: Some(7),
@@ -501,7 +536,11 @@ mod tests {
         assert_eq!(v.depth, 1);
         assert_eq!(v.wait_event_type, Some(intern(b"Lock").unwrap()));
         assert_eq!(v.lock_relation, Some(12_345));
+        assert_eq!(v.lock_granted, Some(false));
+        assert_eq!(v.lock_page, Some(42));
+        assert_eq!(v.lock_tuple, Some(7));
         assert_eq!(v.lock_transactionid, Some(999_999));
+        assert_eq!(v.lock_fastpath, Some(false));
         assert_eq!(v.waitstart.map(|t| t.0), Some(998_000));
         assert_eq!(v.backend_xid_age, Some(7));
     }
@@ -515,6 +554,10 @@ mod tests {
         assert_eq!(v1.blocked_by, v2.blocked_by);
         assert_eq!(v1.lock_target, v2.lock_target);
         assert_eq!(v1.lock_transactionid, v2.lock_transactionid);
+        assert_eq!(v1.lock_granted, v2.lock_granted);
+        assert_eq!(v1.lock_page, v2.lock_page);
+        assert_eq!(v1.lock_tuple, v2.lock_tuple);
+        assert_eq!(v1.lock_fastpath, v2.lock_fastpath);
         assert_eq!(v1.depth, v2.depth);
     }
 

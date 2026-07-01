@@ -4,8 +4,9 @@
 //! The section is node-centric: every backend in a blocking chain has one row,
 //! and the directed edges are carried in the `blocked_by` list column
 //! (`pg_blocking_pids(pid)` deduplicated). Roots have an empty `blocked_by`.
-//! `depth` is the longest-path distance from a root; `root_pid` identifies
-//! which root anchors this node's blocking component.
+//! `depth` is the distance from a root in the blocking component (`min(depth)`
+//! shortest path); a convenience scalar, `blocked_by` is authoritative.
+//! `root_pid` identifies which root anchors this node's blocking component.
 //!
 //! The section splits into two layout versions because `waitstart` was added to
 //! `pg_locks` in PG 14. `PgLocksV2` (PG 14-18) includes `waitstart`;
@@ -34,7 +35,8 @@ pub struct PgLocksV2 {
     /// Deduped `pg_blocking_pids(pid)`; empty for roots; may contain `0`.
     #[column(l)]
     pub blocked_by: Vec<i32>,
-    /// Longest-path distance from a root in the blocking component.
+    /// Distance from a root in the blocking component (`min(depth)` shortest
+    /// path); a convenience scalar, `blocked_by` is authoritative.
     #[column(g)]
     pub depth: i32,
     /// A root of this node's blocking component.
@@ -94,15 +96,28 @@ pub struct PgLocksV2 {
     /// Awaited lock mode.
     #[column(l)]
     pub lock_mode: Option<StrId>,
+    /// Whether the awaited lock is granted; always false for the awaited row,
+    /// recorded for completeness.
+    #[column(l)]
+    pub lock_granted: Option<bool>,
     /// Relation oid of the awaited lock (relation/page/tuple/extend).
     #[column(l)]
     pub lock_relation: Option<u32>,
     /// Relation name, resolved only for the connected database.
     #[column(l)]
     pub lock_relname: Option<StrId>,
+    /// Page number of a page/tuple lock target.
+    #[column(g)]
+    pub lock_page: Option<i32>,
+    /// Tuple offset of a tuple lock target.
+    #[column(g)]
+    pub lock_tuple: Option<i16>,
     /// Transaction id being awaited (row-lock pattern), raw xid.
     #[column(l)]
     pub lock_transactionid: Option<i64>,
+    /// Whether the awaited lock was taken via the fast path.
+    #[column(l)]
+    pub lock_fastpath: Option<bool>,
     /// Human-readable target (rpglot-style), best effort.
     #[column(l)]
     pub lock_target: Option<StrId>,
@@ -131,7 +146,8 @@ pub struct PgLocksV1 {
     /// Deduped `pg_blocking_pids(pid)`; empty for roots; may contain `0`.
     #[column(l)]
     pub blocked_by: Vec<i32>,
-    /// Longest-path distance from a root in the blocking component.
+    /// Distance from a root in the blocking component (`min(depth)` shortest
+    /// path); a convenience scalar, `blocked_by` is authoritative.
     #[column(g)]
     pub depth: i32,
     /// A root of this node's blocking component.
@@ -191,15 +207,28 @@ pub struct PgLocksV1 {
     /// Awaited lock mode.
     #[column(l)]
     pub lock_mode: Option<StrId>,
+    /// Whether the awaited lock is granted; always false for the awaited row,
+    /// recorded for completeness.
+    #[column(l)]
+    pub lock_granted: Option<bool>,
     /// Relation oid of the awaited lock (relation/page/tuple/extend).
     #[column(l)]
     pub lock_relation: Option<u32>,
     /// Relation name, resolved only for the connected database.
     #[column(l)]
     pub lock_relname: Option<StrId>,
+    /// Page number of a page/tuple lock target.
+    #[column(g)]
+    pub lock_page: Option<i32>,
+    /// Tuple offset of a tuple lock target.
+    #[column(g)]
+    pub lock_tuple: Option<i16>,
     /// Transaction id being awaited (row-lock pattern), raw xid.
     #[column(l)]
     pub lock_transactionid: Option<i64>,
+    /// Whether the awaited lock was taken via the fast path.
+    #[column(l)]
+    pub lock_fastpath: Option<bool>,
     /// Human-readable target (rpglot-style), best effort.
     #[column(l)]
     pub lock_target: Option<StrId>,
@@ -236,9 +265,13 @@ mod tests {
             state_change: Some(Ts(ts - 1_000_000)),
             lock_locktype: None,
             lock_mode: None,
+            lock_granted: None,
             lock_relation: None,
             lock_relname: None,
+            lock_page: None,
+            lock_tuple: None,
             lock_transactionid: None,
+            lock_fastpath: None,
             lock_target: None,
             waitstart: None,
         }
@@ -248,7 +281,7 @@ mod tests {
     fn v2_contract_shape() {
         let c = PgLocksV2::CONTRACT;
         assert_eq!(c.type_id.get(), 1_011_002);
-        assert_eq!(c.columns.len(), 28);
+        assert_eq!(c.columns.len(), 32);
         assert_eq!(c.sort_key, ["root_pid", "depth", "pid"]);
         assert_eq!(c.column("ts").map(|col| col.nullable), Some(false));
         assert_eq!(
@@ -260,6 +293,22 @@ mod tests {
             c.column("wait_event_type").map(|col| col.nullable),
             Some(true)
         );
+        assert_eq!(
+            c.column("lock_granted").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::Bool, true))
+        );
+        assert_eq!(
+            c.column("lock_page").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::I32, true))
+        );
+        assert_eq!(
+            c.column("lock_tuple").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::I16, true))
+        );
+        assert_eq!(
+            c.column("lock_fastpath").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::Bool, true))
+        );
         assert_eq!(lint(&[c]), Ok(()));
     }
 
@@ -267,9 +316,25 @@ mod tests {
     fn v1_drops_waitstart() {
         let c = PgLocksV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_011_001);
-        assert_eq!(c.columns.len(), 27);
+        assert_eq!(c.columns.len(), 31);
         assert!(c.column("waitstart").is_none());
         assert!(c.column("blocked_by").is_some());
+        assert_eq!(
+            c.column("lock_granted").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::Bool, true))
+        );
+        assert_eq!(
+            c.column("lock_page").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::I32, true))
+        );
+        assert_eq!(
+            c.column("lock_tuple").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::I16, true))
+        );
+        assert_eq!(
+            c.column("lock_fastpath").map(|col| (col.ty, col.nullable)),
+            Some((crate::ColumnType::Bool, true))
+        );
         assert_eq!(lint(&[c]), Ok(()));
     }
 
@@ -284,9 +349,13 @@ mod tests {
         waiter.wait_event = Some(StrId(9));
         waiter.lock_locktype = Some(StrId(10));
         waiter.lock_mode = Some(StrId(11));
+        waiter.lock_granted = Some(false);
         waiter.lock_relation = Some(12_345);
         waiter.lock_relname = Some(StrId(12));
+        waiter.lock_page = Some(42);
+        waiter.lock_tuple = Some(7);
         waiter.lock_transactionid = Some(999_999);
+        waiter.lock_fastpath = Some(false);
         waiter.lock_target = Some(StrId(13));
         waiter.waitstart = Some(Ts(999_000));
         crate::assert_roundtrips(&[root, waiter]);
@@ -327,8 +396,12 @@ mod tests {
             r.waitstart = Some(Ts(500_000));
             r.lock_locktype = Some(StrId(20));
             r.lock_mode = Some(StrId(21));
+            r.lock_granted = Some(false);
             r.lock_relation = Some(54_321);
+            r.lock_page = Some(3);
+            r.lock_tuple = Some(11);
             r.lock_transactionid = Some(42);
+            r.lock_fastpath = Some(false);
             r
         };
         let without_lock = v2_row(1_000_000, 100, 100);
@@ -342,5 +415,13 @@ mod tests {
         assert_eq!(decoded[1].waitstart, None);
         assert_eq!(decoded[0].lock_relation, Some(54_321));
         assert_eq!(decoded[1].lock_relation, None);
+        assert_eq!(decoded[0].lock_granted, Some(false));
+        assert_eq!(decoded[1].lock_granted, None);
+        assert_eq!(decoded[0].lock_page, Some(3));
+        assert_eq!(decoded[1].lock_page, None);
+        assert_eq!(decoded[0].lock_tuple, Some(11));
+        assert_eq!(decoded[1].lock_tuple, None);
+        assert_eq!(decoded[0].lock_fastpath, Some(false));
+        assert_eq!(decoded[1].lock_fastpath, None);
     }
 }
