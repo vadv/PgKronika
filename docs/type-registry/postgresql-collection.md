@@ -7,10 +7,9 @@
 ## Общие правила
 
 - Каждый SQL-запрос коллектора начинается с комментария-маркера
-  `/* reftool:xxx */`. Маркер нужен, чтобы исключать собственные запросы
-  коллектора из `pg_stat_activity`, `pg_stat_statements` и аналитики.
-- Текущие маркеры: `act`, `pgs`, `pgp`, `sys`, `cov`, `cfg`, `rep`, `ext`,
-  `lck`.
+  `/* pg_kronika:<version> <source-file> */`. Маркер нужен, чтобы исключать
+  собственные запросы коллектора из `pg_stat_activity`, `pg_stat_statements` и
+  аналитики.
 - Запросы к системным каталогам выполняются через `query_with_lock_retry`:
   DDL может временно держать lock на каталогах.
 - При ошибке соединения сбрасывается клиент и весь кэш окружения:
@@ -41,7 +40,7 @@
 ## `1_001_001` activity
 
 ```sql
-/* reftool:act */
+/* pg_kronika:<version> <source-file> */
 SELECT
   pid,
   datname,
@@ -70,7 +69,7 @@ FROM pg_stat_activity;
 Фаза 1: статистика без текстов.
 
 ```sql
-/* reftool:pgs */
+/* pg_kronika:<version> <source-file> */
 SELECT
   s.userid,
   s.dbid,
@@ -92,7 +91,7 @@ LIMIT :max_statements;
 Фаза 2: тексты только для `queryid`, которых ещё нет в интернер-кэше.
 
 ```sql
-/* reftool:pgs */
+/* pg_kronika:<version> <source-file> */
 SELECT
   queryid,
   LEFT(query, :max_text_len) AS query
@@ -122,7 +121,7 @@ Fork определяется при старте по наличию функц
 Ступень 1: дешевая предварительная проверка с кэшем около 1 секунды.
 
 ```sql
-/* reftool:lck */
+/* pg_kronika:<version> <source-file> */
 SELECT EXISTS (
   SELECT 1
   FROM pg_stat_activity

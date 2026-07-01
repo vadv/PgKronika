@@ -213,9 +213,9 @@ pub struct UserIndexesRow {
     pub amname: String,
     /// `pg_get_indexdef` reconstruction of the index definition.
     pub indexdef: String,
-    /// Index blocks read from disk.
+    /// Shared-buffer misses for index blocks.
     pub idx_blks_read: i64,
-    /// Index buffer hits.
+    /// Shared-buffer hits for index blocks.
     pub idx_blks_hit: i64,
 }
 
