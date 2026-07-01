@@ -245,6 +245,9 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
             "full_page_writes=off",
             "-c",
             "max_prepared_transactions=16",
+            // pg_stat_statements must be preloaded before it can be created.
+            "-c",
+            "shared_preload_libraries=pg_stat_statements",
         ]);
     // DEBUG=1 turns the server log into a full SQL trace; errors are logged
     // regardless, so the on-failure dump always shows the offending statement.

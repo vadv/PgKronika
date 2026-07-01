@@ -9,7 +9,12 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_001_001` | `pg_stat_activity` (PG 10-12) | базовый шаг | `snapshot_full` | `(ts, pid)` |
 | `1_001_002` | `pg_stat_activity` (PG 13) | базовый шаг | `snapshot_full` | `(ts, pid)` |
 | `1_001_003` | `pg_stat_activity` (PG 14-18) | базовый шаг | `snapshot_full` | `(ts, pid)` |
-| `1_002_001` | `pg_stat_statements` | 30 с | `changed` | `(queryid, dbid, userid, ts)` |
+| `1_002_001` | `pg_stat_statements` (ext ≤ 1.7, PG 10-12) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
+| `1_002_002` | `pg_stat_statements` (ext 1.8, PG 13) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
+| `1_002_003` | `pg_stat_statements` (ext 1.9, PG 14) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
+| `1_002_004` | `pg_stat_statements` (ext 1.10, PG 15-16) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
+| `1_002_005` | `pg_stat_statements` (ext 1.11, PG 17) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
+| `1_002_006` | `pg_stat_statements` (ext 1.12, PG 18) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
 | `1_003_001` | `pg_store_plans`, форк ossc | 5 мин | `changed` | `(queryid, planid, ts)` |
 | `1_004_001` | `pg_store_plans`, форк vadv | 5 мин | `changed` | `(queryid, planid, ts)` |
 | `1_005_001` | `pg_stat_database` (PG 10-11) | базовый шаг | `snapshot_full` | `(datid, ts)` |
@@ -109,51 +114,119 @@ state_change       ts?   G   // NULL у фоновых
 коротких ожиданий) — отдельный тип; дерево блокировок (`pg_blocking_pids`) — тип
 `1_011_001`.
 
-## `1_002_001` `pg_stat_statements`
+## `1_002_001`..`1_002_006` `pg_stat_statements`
 
-Собирается top-N по `total_exec_time DESC`. Значение по умолчанию для лимита —
-500, должно быть настройкой коллектора. Для каждого усеченного сбора пишется
-coverage-строка `1_023_001` с `source_type_id = 1_002_001`, `max_n`,
-`order_by = "total_exec_time"` и cutoff-значением последней собранной строки.
+Расширение, а не встроенное представление: `pg_stat_statements` даёт по строке на
+`(userid, dbid, queryid)`, а с версии расширения 1.9 — ещё и на `toplevel`.
+`dbid` различает базы, поэтому одного запроса к представлению (из любой базы, где
+расширение установлено) достаточно, чтобы получить статистику всех баз. Коллектор
+делает его один раз — сбор класса A, без обхода по базам.
 
-Тексты запросов получаются отдельным запросом только для новых `queryid`.
-Основной сбор должен использовать `pg_stat_statements(showtext := false)`, а
-тексты добираться точечно. Это уменьшает передачу повторяющихся SQL и хорошо
-ложится на интернер.
+**Раскладка выбирается по версии расширения, а не по мажору сервера.** Расширение
+можно закрепить независимо от версии PostgreSQL, поэтому коллектор читает
+`extversion` из `pg_extension` (`WHERE extname = 'pg_stat_statements'`) и по нему
+выбирает тип. Если расширение не установлено ни в одной доступной базе — секция не
+пишется, а в лог выводится строка о пропуске.
 
-Версионность PostgreSQL:
+### Версии раскладки
 
-- до PG13 используются старые имена вроде `total_time`;
-- `total_plan_time`, `wal_records`, `wal_bytes` отсутствуют до PG13 и пишутся
-  как `NULL`, а не как ноль.
+| `type_id` | Версия расширения | Сервер | Что добавилось | Столбцов в структуре |
+|-----------|-------------------|--------|----------------|----------------------|
+| `1_002_001` | ≤ 1.7 | PG 10-12 | базовая раскладка; старые имена времени `total_time`/`min_time`/`max_time`/`mean_time`/`stddev_time`; без planning/WAL/JIT/`toplevel` | 26 |
+| `1_002_002` | 1.8 | PG 13 | переименование в `*_exec_time`; `plans`, `total_plan_time` и остальные planning-столбцы; `wal_records`/`wal_fpi`/`wal_bytes` | 35 |
+| `1_002_003` | 1.9 | PG 14 | `toplevel` | 36 |
+| `1_002_004` | 1.10 | PG 15-16 | `temp_blk_read_time`/`temp_blk_write_time` и восемь JIT-столбцов | 46 |
+| `1_002_005` | 1.11 | PG 17 | переименование `blk_*_time` → `shared_blk_*_time`; `local_blk_*_time`; `jit_deform_count`/`jit_deform_time`; `stats_since`/`minmax_stats_since` | 52 |
+| `1_002_006` | 1.12 | PG 18 | `wal_buffers_full`; `parallel_workers_to_launch`/`parallel_workers_launched` | 55 |
+
+Число столбцов в структуре = число столбцов представления этой версии плюс три:
+`ts`, разрешённые через `LEFT JOIN` `datname` (`pg_database`) и `usename`
+(`pg_roles`). Столбцы представления по версиям (23 / 32 / 33 / 43 / 49 / 52)
+сверены с postgresql.org/docs соответствующего мажора.
+
+### Сбор
+
+Top-N чисто механический: объединение двух осей — top-N по `total_exec_time`
+(в раскладке `1_002_001` — по `total_time`) и top-N по `calls`. Лимит на ось —
+`KRONIKA_PG_MAX_STATEMENTS`, по умолчанию 500. Никаких порогов и вердиктов в SQL:
+коллектор фиксирует самые крайние строки по каждой оси и ограничивает свой вывод,
+а решение «опасно или нет» — задача анализатора.
+
+Текст запроса берётся прямо в `SELECT` как `LEFT(query, 5000)` (фиксированное
+усечение, без отдельного дозапроса) и интернируется в словарь сегмента.
+
+### NULL против нуля
+
+- `queryid` — `None`, когда `compute_query_id` выключен; `query` — `None`, когда у
+  вызывающего нет прав читать текст чужой роли. Обе величины подлинно nullable.
+- planning-столбцы равны `0` (не `NULL`) при выключенном `track_planning`;
+  `*_blk_*_time` равны `0` при выключенном `track_io_timing`; JIT-столбцы равны
+  `0` без JIT — так их отдаёт PostgreSQL.
+- `stats_since`/`minmax_stats_since` присутствуют (не `NULL`) начиная с раскладки
+  `1_002_005`.
+
+Времена — `f64`, поэтому структуры выводят `PartialEq`, но не `Eq`. Столбцы
+`min/max/mean/stddev` времени исполнения и планирования — класс `g` (производные,
+сбрасываемые); всё остальное числовое — класс `c`.
+
+Раскладка `1_002_006` (сверхмножество):
 
 ```text
-ts                  ts    T
-queryid             i64   L
-dbid                u32   L
-userid              u32   L
-datname             str   L
-usename             str   L
-query               str   L   // через словарь; усечение коллектора
-calls               i64   C
-total_exec_time     f64   C   // ms
-min_exec_time       f64   G
-max_exec_time       f64   G
-mean_exec_time      f64   G
-stddev_exec_time    f64   G
-total_plan_time     f64?  C   // NULL < PG13
-rows                i64   C
-shared_blks_hit     i64   C
-shared_blks_read    i64   C
-shared_blks_dirtied i64   C
-shared_blks_written i64   C
-local_blks_read     i64   C
-local_blks_written  i64   C
-temp_blks_read      i64   C
-temp_blks_written   i64   C
-wal_records         i64?  C   // NULL < PG13
-wal_bytes           i64?  C   // NULL < PG13
-is_baseline         bool  L
+ts                          ts    T
+queryid                     i64?  L   // NULL при выключенном compute_query_id
+userid                      u32   L
+dbid                        u32   L
+toplevel                    bool  L   // с ext 1.9
+datname                     str?  L   // через словарь; LEFT JOIN pg_database
+usename                     str?  L   // через словарь; LEFT JOIN pg_roles
+query                       str?  L   // через словарь; LEFT(query, 5000)
+calls                       i64   C
+rows                        i64   C
+plans                       i64   C
+total_exec_time             f64   C   // ms
+total_plan_time             f64   C   // ms
+min_exec_time               f64   G
+max_exec_time               f64   G
+mean_exec_time              f64   G
+stddev_exec_time            f64   G
+min_plan_time               f64   G
+max_plan_time               f64   G
+mean_plan_time              f64   G
+stddev_plan_time            f64   G
+shared_blks_hit             i64   C
+shared_blks_read            i64   C
+shared_blks_dirtied         i64   C
+shared_blks_written         i64   C
+local_blks_hit              i64   C
+local_blks_read             i64   C
+local_blks_dirtied          i64   C
+local_blks_written          i64   C
+temp_blks_read              i64   C
+temp_blks_written           i64   C
+shared_blk_read_time        f64   C   // с ext 1.11; ранее blk_read_time
+shared_blk_write_time       f64   C   // с ext 1.11; ранее blk_write_time
+local_blk_read_time         f64   C   // с ext 1.11
+local_blk_write_time        f64   C   // с ext 1.11
+temp_blk_read_time          f64   C   // с ext 1.10
+temp_blk_write_time         f64   C   // с ext 1.10
+wal_records                 i64   C
+wal_fpi                     i64   C
+wal_bytes                   i64   C   // numeric в PG, приводится ::int8
+wal_buffers_full            i64   C   // с ext 1.12
+jit_functions               i64   C   // с ext 1.10
+jit_generation_time         f64   C
+jit_inlining_count          i64   C
+jit_inlining_time           f64   C
+jit_optimization_count      i64   C
+jit_optimization_time       f64   C
+jit_emission_count          i64   C
+jit_emission_time           f64   C
+jit_deform_count            i64   C   // с ext 1.11
+jit_deform_time             f64   C   // с ext 1.11
+parallel_workers_to_launch  i64   C   // с ext 1.12
+parallel_workers_launched   i64   C   // с ext 1.12
+stats_since                 ts?   G   // с ext 1.11; unix-микросекунды
+minmax_stats_since          ts?   G   // с ext 1.11; unix-микросекунды
 ```
 
 ## `1_003_001` и `1_004_001` `pg_store_plans`
