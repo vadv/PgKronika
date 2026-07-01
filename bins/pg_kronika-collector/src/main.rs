@@ -74,6 +74,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio_postgres::Client;
 
 struct Config {
     dsn: String,
@@ -167,6 +168,7 @@ async fn main() -> Result<()> {
     let mut sigusr2 = signal(SignalKind::user_defined2()).context("install the SIGUSR2 handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("install the SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("install the SIGINT handler")?;
+    let mut statements_cache = StatementsSourceCache::default();
 
     announce("ready");
 
@@ -190,7 +192,7 @@ async fn main() -> Result<()> {
                     eprintln!("pg_kronika-collector: database not covered this cycle: {db}");
                 }
                 let major = pool.server_major();
-                match snapshot_and_seal(&pool, major, &mut journal, &config).await {
+                match snapshot_and_seal(&pool, major, &mut journal, &config, &mut statements_cache).await {
                     Ok(dest) => announce(&format!("sealed {}", dest.display())),
                     Err(err) => eprintln!("pg_kronika-collector: snapshot failed: {err:#}"),
                 }
@@ -308,49 +310,294 @@ async fn collect_user_indexes_all(
     user_indexes
 }
 
-/// Collect `pg_stat_statements` once from whichever connection has the extension.
-///
-/// The view is instance-wide: one row per `(userid, dbid, queryid)` covering
-/// every database, so a single query against any database that has the extension
-/// installed returns all of them. The probe tries the main connection first,
-/// then each per-database connection, and collects from the first connection
-/// with the extension installed. Returns `None` (no section) when no connection
-/// has it. All awaits finish here so the caller can intern without holding the
-/// `!Send` `Interner` across an await.
-async fn collect_statements_once(
-    pool: &ConnectionPool,
-    config: &Config,
-) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
-    let mut candidates: Vec<&tokio_postgres::Client> = Vec::with_capacity(1 + pool.per_db().len());
-    candidates.push(pool.main());
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StatementsSource {
+    Main,
+    Database(String),
+}
+
+impl StatementsSource {
+    fn label(&self) -> String {
+        match self {
+            Self::Main => "main".to_owned(),
+            Self::Database(datname) => format!("database {datname}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedStatementsSource {
+    source: StatementsSource,
+    extversion: String,
+    version: StatementsVersion,
+}
+
+impl CachedStatementsSource {
+    fn new(source: StatementsSource, extversion: String) -> Self {
+        let version = statements_version(&extversion);
+        Self {
+            source,
+            extversion,
+            version,
+        }
+    }
+
+    fn matches_extversion(&self, extversion: &str) -> bool {
+        self.extversion == extversion && self.version == statements_version(extversion)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MissingStatementsSource {
+    covered_databases: Vec<String>,
+    next_probe: usize,
+}
+
+impl MissingStatementsSource {
+    const fn new(covered_databases: Vec<String>) -> Self {
+        Self {
+            covered_databases,
+            next_probe: 0,
+        }
+    }
+
+    fn matches_covered(&self, covered_databases: &[String]) -> bool {
+        self.covered_databases == covered_databases
+    }
+
+    const fn next_per_db_probe(&mut self, len: usize) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let index = self.next_probe % len;
+        self.next_probe = (index + 1) % len;
+        Some(index)
+    }
+}
+
+#[derive(Debug, Default)]
+struct StatementsSourceCache {
+    selected: Option<CachedStatementsSource>,
+    missing: Option<MissingStatementsSource>,
+}
+
+impl StatementsSourceCache {
+    fn store(&mut self, source: StatementsSource, extversion: String) -> StatementsVersion {
+        let cached = CachedStatementsSource::new(source, extversion);
+        let version = cached.version;
+        self.selected = Some(cached);
+        self.missing = None;
+        version
+    }
+
+    fn invalidate(&mut self) {
+        self.selected = None;
+        self.missing = None;
+    }
+
+    fn mark_missing(&mut self, covered_databases: Vec<String>) {
+        self.selected = None;
+        self.missing = Some(MissingStatementsSource::new(covered_databases));
+    }
+}
+
+struct StatementsCandidate<'a> {
+    source: StatementsSource,
+    client: &'a Client,
+}
+
+fn covered_statement_databases(pool: &ConnectionPool) -> Vec<String> {
+    pool.per_db()
+        .iter()
+        .filter(|db| !db.client().is_closed())
+        .map(|db| db.datname.clone())
+        .collect()
+}
+
+fn statement_client<'a>(pool: &'a ConnectionPool, source: &StatementsSource) -> Option<&'a Client> {
+    match source {
+        StatementsSource::Main => (!pool.main().is_closed()).then_some(pool.main()),
+        StatementsSource::Database(datname) => pool
+            .per_db()
+            .iter()
+            .find(|db| db.datname == *datname && !db.client().is_closed())
+            .map(kronika_source_pg::pool::DatabaseConn::client),
+    }
+}
+
+fn all_statements_candidates(pool: &ConnectionPool) -> Vec<StatementsCandidate<'_>> {
+    let mut candidates = Vec::with_capacity(1 + pool.per_db().len());
+    if !pool.main().is_closed() {
+        candidates.push(StatementsCandidate {
+            source: StatementsSource::Main,
+            client: pool.main(),
+        });
+    }
     candidates.extend(
         pool.per_db()
             .iter()
-            .map(kronika_source_pg::pool::DatabaseConn::client),
+            .filter(|db| !db.client().is_closed())
+            .map(|db| StatementsCandidate {
+                source: StatementsSource::Database(db.datname.clone()),
+                client: db.client(),
+            }),
     );
+    candidates
+}
 
-    for client in candidates {
-        let extversion = match statements_extversion(client).await {
-            Ok(Some(extversion)) => extversion,
-            Ok(None) => continue, // extension not installed on this connection
-            Err(err) => {
-                eprintln!("pg_kronika-collector: pg_stat_statements probe failed: {err}");
-                continue;
-            }
-        };
-        let version = statements_version(&extversion);
-        match collect_statements(client, version, config.max_statements).await {
-            Ok(rows) => return Some((version, rows)),
-            Err(err) => {
-                eprintln!("pg_kronika-collector: skip pg_stat_statements: {err}");
-                return None;
-            }
+fn incremental_statements_candidates<'a>(
+    pool: &'a ConnectionPool,
+    cache: &mut StatementsSourceCache,
+) -> Vec<StatementsCandidate<'a>> {
+    let live = pool
+        .per_db()
+        .iter()
+        .filter(|db| !db.client().is_closed())
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::with_capacity(2);
+    if !pool.main().is_closed() {
+        candidates.push(StatementsCandidate {
+            source: StatementsSource::Main,
+            client: pool.main(),
+        });
+    }
+    if let Some(index) = cache
+        .missing
+        .as_mut()
+        .and_then(|missing| missing.next_per_db_probe(live.len()))
+    {
+        let db = live[index];
+        candidates.push(StatementsCandidate {
+            source: StatementsSource::Database(db.datname.clone()),
+            client: db.client(),
+        });
+    }
+    candidates
+}
+
+async fn collect_statements_from_candidate(
+    candidate: StatementsCandidate<'_>,
+    config: &Config,
+    cache: &mut StatementsSourceCache,
+) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
+    let label = candidate.source.label();
+    let extversion = match statements_extversion(candidate.client).await {
+        Ok(Some(extversion)) => extversion,
+        Ok(None) => return None,
+        Err(err) => {
+            eprintln!("pg_kronika-collector: pg_stat_statements probe failed on {label}: {err}");
+            return None;
+        }
+    };
+    let version = statements_version(&extversion);
+    match collect_statements(candidate.client, version, config.max_statements).await {
+        Ok(rows) => {
+            let version = cache.store(candidate.source, extversion);
+            Some((version, rows))
+        }
+        Err(err) => {
+            eprintln!("pg_kronika-collector: pg_stat_statements query failed on {label}: {err}");
+            None
         }
     }
+}
+
+async fn discover_statements_source(
+    pool: &ConnectionPool,
+    config: &Config,
+    cache: &mut StatementsSourceCache,
+) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
+    for candidate in all_statements_candidates(pool) {
+        if let Some(rows) = collect_statements_from_candidate(candidate, config, cache).await {
+            return Some(rows);
+        }
+    }
+    cache.mark_missing(covered_statement_databases(pool));
     eprintln!(
-        "pg_kronika-collector: pg_stat_statements extension not installed in any reachable database; skipping section 1_002"
+        "pg_kronika-collector: no usable pg_stat_statements source on main or covered per-db connections; skipping section 1_002"
     );
     None
+}
+
+async fn rediscover_missing_statements_source(
+    pool: &ConnectionPool,
+    config: &Config,
+    cache: &mut StatementsSourceCache,
+) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
+    for candidate in incremental_statements_candidates(pool, cache) {
+        if let Some(rows) = collect_statements_from_candidate(candidate, config, cache).await {
+            return Some(rows);
+        }
+    }
+    None
+}
+
+/// Collect `pg_stat_statements` from one cached source connection.
+///
+/// The view is instance-wide and rows identify the execution database with
+/// `dbid`, so the collector queries one reachable database that has the
+/// extension installed. Source discovery checks `pool.main()` first, then the
+/// covered per-db pool connections; databases outside the pool cap are invisible
+/// to this discovery until an explicit source-db setting exists. All awaits
+/// finish here so the caller can intern without holding the `!Send` `Interner`
+/// across an await.
+async fn collect_statements_cached(
+    pool: &ConnectionPool,
+    config: &Config,
+    cache: &mut StatementsSourceCache,
+) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
+    if let Some(cached) = cache.selected.clone() {
+        let label = cached.source.label();
+        if let Some(client) = statement_client(pool, &cached.source) {
+            match statements_extversion(client).await {
+                Ok(Some(extversion)) if cached.matches_extversion(&extversion) => {
+                    match collect_statements(client, cached.version, config.max_statements).await {
+                        Ok(rows) => return Some((cached.version, rows)),
+                        Err(err) => {
+                            eprintln!(
+                                "pg_kronika-collector: pg_stat_statements query failed on cached {label}: {err}; rediscovering"
+                            );
+                            cache.invalidate();
+                        }
+                    }
+                }
+                Ok(Some(extversion)) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_stat_statements version changed on cached {label} ({} -> {extversion}); rediscovering",
+                        cached.extversion
+                    );
+                    cache.invalidate();
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_stat_statements extension missing on cached {label}; rediscovering"
+                    );
+                    cache.invalidate();
+                }
+                Err(err) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_stat_statements probe failed on cached {label}: {err}; rediscovering"
+                    );
+                    cache.invalidate();
+                }
+            }
+        } else {
+            eprintln!(
+                "pg_kronika-collector: cached pg_stat_statements source {label} is unavailable; rediscovering"
+            );
+            cache.invalidate();
+        }
+    }
+
+    let covered = covered_statement_databases(pool);
+    if cache
+        .missing
+        .as_ref()
+        .is_some_and(|missing| missing.matches_covered(&covered))
+    {
+        return rediscover_missing_statements_source(pool, config, cache).await;
+    }
+    discover_statements_source(pool, config, cache).await
 }
 
 async fn snapshot_and_seal(
@@ -358,6 +605,7 @@ async fn snapshot_and_seal(
     major: u32,
     journal: &mut Journal,
     config: &Config,
+    statements_cache: &mut StatementsSourceCache,
 ) -> Result<PathBuf> {
     let client = pool.main();
     // Run every query first: SectionBuffers and Interner are `!Send`, so they
@@ -394,7 +642,7 @@ async fn snapshot_and_seal(
 
     let user_tables = collect_user_tables_all(pool, major, config).await;
     let user_indexes = collect_user_indexes_all(pool, major, config).await;
-    let statements = collect_statements_once(pool, config).await;
+    let statements = collect_statements_cached(pool, config, statements_cache).await;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -694,6 +942,7 @@ fn announce(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
+        CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
         activity_dict_limits, push_activity, push_archiver, push_database, push_io,
         push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
         push_user_indexes, push_user_tables,
@@ -1078,6 +1327,47 @@ mod tests {
                 .any(|entry| entry.type_id == 1_002_006),
             "the part carries the pg_stat_statements section"
         );
+    }
+
+    #[test]
+    fn cached_statements_source_tracks_extversion_and_layout() {
+        let cached = CachedStatementsSource::new(
+            StatementsSource::Database("metrics".to_owned()),
+            "1.11".to_owned(),
+        );
+        assert_eq!(cached.version, StatementsVersion::V5);
+        assert!(cached.matches_extversion("1.11"));
+        assert!(!cached.matches_extversion("1.12"));
+        assert!(!cached.matches_extversion("1.10"));
+    }
+
+    #[test]
+    fn missing_statements_source_rotates_per_db_probes() {
+        let mut missing =
+            MissingStatementsSource::new(vec!["app".to_owned(), "metrics".to_owned()]);
+        assert!(missing.matches_covered(&["app".to_owned(), "metrics".to_owned()]));
+        assert!(!missing.matches_covered(&["app".to_owned()]));
+        assert_eq!(missing.next_per_db_probe(2), Some(0));
+        assert_eq!(missing.next_per_db_probe(2), Some(1));
+        assert_eq!(missing.next_per_db_probe(2), Some(0));
+        assert_eq!(missing.next_per_db_probe(0), None);
+    }
+
+    #[test]
+    fn statements_source_cache_replaces_missing_with_selected_source() {
+        let mut cache = StatementsSourceCache::default();
+        cache.mark_missing(vec!["app".to_owned()]);
+        assert!(cache.selected.is_none());
+        assert!(cache.missing.is_some());
+
+        let version = cache.store(StatementsSource::Main, "1.12".to_owned());
+        assert_eq!(version, StatementsVersion::V6);
+        assert!(cache.selected.is_some());
+        assert!(cache.missing.is_none());
+
+        cache.invalidate();
+        assert!(cache.selected.is_none());
+        assert!(cache.missing.is_none());
     }
 
     fn io_row(object: &str) -> IoRow {

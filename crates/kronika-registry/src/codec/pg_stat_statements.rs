@@ -2,9 +2,9 @@
 //!
 //! Per-statement execution counters, one row per `(userid, dbid, queryid)` and,
 //! from extension 1.9, also per `toplevel`. The `dbid` distinguishes databases,
-//! so one instance-wide query returns every database's statements. The layout is
-//! selected by the *extension* version, not the server major, because the
-//! extension can be pinned independently of the server.
+//! so one query from a database with the extension installed reads the shared
+//! instance-wide rows. The layout is selected by the *extension* version, not the
+//! server major, because the extension can be pinned independently of the server.
 //!
 //! The extension column set changes across releases:
 //! - 1.8 (PG13) renamed `total_time`/`min_time`/`max_time`/`mean_time`/
