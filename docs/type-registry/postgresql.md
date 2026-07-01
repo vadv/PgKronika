@@ -545,10 +545,12 @@ PG17 заменил `max_dead_tuples` / `num_dead_tuples` на
 ## `1_013_001`..`1_013_004` `pg_stat_user_tables` + `pg_statio_user_tables`
 
 Собирается отдельно по каждой базе через пул соединений (один коннект на базу,
-обновление пула раз в 10 минут, env `KRONIKA_PG_POOL_REFRESH_SECS`). Явный
-`PGDATABASE` отключает режим нескольких баз. Тяжёлый запрос идёт под адаптивным
-`statement_timeout` (старт 15 с, ×2 до `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` = 60 с;
-SQLSTATE 57014 — расширить и повторить базу, иначе пропустить).
+обновление пула раз в 10 минут, env `KRONIKA_PG_POOL_REFRESH_SECS`). Коллектор
+всегда перечисляет базы и ходит по каждой — режима одной базы через `PGDATABASE`
+нет: `dbname` из DSN задаёт лишь стартовый коннект, а per-db соединения всё равно
+открываются по всем базам. Тяжёлый запрос идёт под адаптивным `statement_timeout`
+(старт 15 с, ×2 до `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` = 60 с; SQLSTATE 57014 —
+расширить и повторить базу, иначе пропустить).
 
 Четыре версии по росту каталога: `n_ins_since_vacuum` появился в PG13 (V2),
 `n_tup_newpage_upd` и `last_seq_scan`/`last_idx_scan` — в PG16 (V3), четыре
@@ -647,38 +649,52 @@ tidx_blks_hit                   i64?  C
 
 Класс-B сосед `1_013` (`pg_stat_user_tables`): та же схема сбора по каждой базе
 через пул соединений (один коннект на базу, обновление пула раз в 10 минут, env
-`KRONIKA_PG_POOL_REFRESH_SECS`). Явный `PGDATABASE` отключает режим нескольких
-баз. Запрос идёт под тем же адаптивным `statement_timeout` (старт 15 с, ×2 до
-`KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` = 60 с; SQLSTATE 57014 — расширить и повторить
-базу, иначе пропустить).
+`KRONIKA_PG_POOL_REFRESH_SECS`). Коллектор всегда ходит по всем базам — режима
+одной базы через `PGDATABASE` нет. Запрос идёт под тем же адаптивным
+`statement_timeout` (старт 15 с, ×2 до `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` = 60 с;
+SQLSTATE 57014 — расширить и повторить базу, иначе пропустить).
 
 Две версии по росту каталога: `last_idx_scan` появился в PG16 (V2). PG17 и PG18
 в `pg_stat_all_indexes` не добавили ничего — в отличие от таблиц, у индексов нет
 колонок тайминга.
 
 Отбор кандидатов — чисто механический: объединение top-N индексов по сырым
-колонкам (N по умолчанию 500, тот же env `KRONIKA_PG_MAX_TABLES` — это per-axis
-top-N для relation top-N, отдельного env нет):
+колонкам (N по умолчанию 500, свой env `KRONIKA_PG_MAX_INDEXES` — отдельно от
+`KRONIKA_PG_MAX_TABLES`). Каждая ось добавляет `indexrelid` последним ключом
+`ORDER BY`, чтобы top-N был детерминированным при равных значениях:
 
-- `idx_scan` DESC;
-- `idx_tup_read` DESC;
-- размер: `pg_class.relpages` DESC (JOIN по `indexrelid`) — ловит большие
-  индексы, в том числе неиспользуемые;
-- PG16+: `last_idx_scan` DESC NULLS LAST (давность сканирования).
+- `idx_scan` DESC, `indexrelid`;
+- `idx_tup_read` DESC, `indexrelid`;
+- размер: `pg_class.relpages` DESC, `indexrelid` (JOIN по `indexrelid`) — ловит
+  большие индексы, в том числе неиспользуемые;
+- PG16+: `last_idx_scan` DESC, `indexrelid` c `WHERE last_idx_scan IS NOT NULL` —
+  ось давности не забивается ни разу не сканированными индексами (те всё равно
+  попадают через ось `relpages`/размера).
 
 Категория «большой и ни разу не сканировался» из rpglot (`WHERE idx_scan = 0`)
 не переносится — это вердикт. Коллектор пишет `relpages` (через размер) и
 `idx_scan`, а «неиспользуемый большой индекс» выводит модуль анализа на чтении.
 
+Стартовая валидация: `DEFAULT_MAX_DATABASES * оси * N` для tables и indexes
+должно укладываться в лимит строк одной секции (`MAX_SECTION_ROWS` = 65536), иначе
+коллектор падает на старте с явной ошибкой — иначе переполнение всплыло бы только
+при запечатывании и потеряло бы весь сегмент.
+
 `pg_statio_user_indexes` сливается в строку через `LEFT JOIN` по `indexrelid`;
-`main_fork_bytes` = `pg_relation_size(indexrelid)` (только main fork, без TOAST —
-у индекса его нет); `amname` берётся из `pg_am` через `pg_class.relam`; флаги
-`indisunique`/`indisprimary`/`indisvalid` — из `pg_index`; определение —
-`pg_get_indexdef(indexrelid)`. `datid` нужен вместе с `datname` как стабильный
-числовой ключ (базу могут переименовать) и для join к `pg_stat_database`.
-`last_idx_scan` = `NULL` означает «ни разу не сканировали» — не ноль.
-`idx_blks_read`/`idx_blks_hit` — счётчики shared-буферов PostgreSQL (попадание в
-кэш буферов против промаха), а не I/O блочного устройства или ОС.
+`idx_blks_read`/`idx_blks_hit` берутся под `COALESCE(..., 0)` — гонка между
+каталогом и статистикой не даст `NULL`, который иначе уронил бы декодирование в
+`i64`. `main_fork_bytes` = `pg_relation_size(indexrelid)` (только main fork, без
+TOAST — у индекса его нет); `amname` берётся из `pg_am` через `pg_class.relam`;
+флаги `indisunique`/`indisprimary`/`indisvalid`/`indisexclusion`/`indisready` — из
+`pg_index` (`indisexclusion` даёт отличить индекс exclusion-ограничения от
+обычного неиспользуемого; `indisready` — готовность к вставкам); определение —
+`left(pg_get_indexdef(indexrelid), 5000)`: текст обрезается на уровне SQL до
+материализации (partial-индекс с большим выражением иначе не ограничен). `datid`
+нужен вместе с `datname` как стабильный числовой ключ (базу могут переименовать) и
+для join к `pg_stat_database`. `last_idx_scan` = `NULL` означает «ни разу не
+сканировали» — не ноль. `idx_blks_read`/`idx_blks_hit` — счётчики shared-буферов
+PostgreSQL (попадание в кэш буферов против промаха), а не I/O блочного устройства
+или ОС.
 
 Семантика `snapshot_full` (как у `1_013`): каждый цикл отдаёт все отобранные
 строки. Ряд разрежённый — отсутствие индекса в снимке означает, что он не попал
@@ -708,8 +724,10 @@ last_idx_scan  ts?   G   // PG16+, NULL = ни разу
 indisunique    bool  L
 indisprimary   bool  L
 indisvalid     bool  L
+indisexclusion bool  L   // индекс exclusion-ограничения
+indisready     bool  L   // готов к вставкам
 amname         str   L
-indexdef       str   L
+indexdef       str   L   // left(pg_get_indexdef, 5000)
 idx_blks_read  i64   C   // shared-буферы: промах, не диск/ОС
 idx_blks_hit   i64   C   // shared-буферы: попадание
 ```
