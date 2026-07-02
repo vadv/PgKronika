@@ -654,9 +654,8 @@ async fn seed_user_table_database(db: &cluster::Cluster, datname: &str) -> anyho
             *db_err.code() == tokio_postgres::error::SqlState::DUPLICATE_DATABASE
         });
         if !is_dup {
-            return Err(anyhow::Error::from(e)).with_context(|| {
-                format!("postgres {}: create database {datname}", db.major())
-            });
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("postgres {}: create database {datname}", db.major()));
         }
     }
     drop(admin);
