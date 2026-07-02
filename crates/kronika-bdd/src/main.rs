@@ -2108,7 +2108,7 @@ async fn assert_wait_tree(world: &mut BddWorld) -> anyhow::Result<()> {
     for db in &world.clusters {
         match collect_one(db).await {
             Ok(segment) => {
-                if let Err(err) = assert_wait_tree_section(db.major(), &segment) {
+                if let Err(err) = assert_wait_tree_section(db.major(), &segment.path) {
                     result = Err(err);
                     break;
                 }
@@ -2124,9 +2124,20 @@ async fn assert_wait_tree(world: &mut BddWorld) -> anyhow::Result<()> {
 }
 
 /// Spawn the collector and take one snapshot.
-async fn collect_one(db: &cluster::Cluster) -> anyhow::Result<std::path::PathBuf> {
+async fn collect_one(db: &cluster::Cluster) -> anyhow::Result<CollectedSegment> {
     let mut collector = collector::Collector::spawn(db).await?;
-    collector.snapshot().await
+    let path = collector.snapshot().await?;
+    Ok(CollectedSegment {
+        _collector: collector,
+        path,
+    })
+}
+
+/// Keeps the collector alive so its temporary output directory survives until
+/// the sealed segment is opened.
+struct CollectedSegment {
+    _collector: collector::Collector,
+    path: std::path::PathBuf,
 }
 
 /// Decode the wait-tree section for the cluster's layout and check that a waiter
@@ -2202,8 +2213,8 @@ fn check_wait_tree(major: u32, rows: &[LockWaitObservation]) -> anyhow::Result<(
 async fn assert_no_wait_tree(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
     for db in &world.clusters {
-        let segment_path = collect_one(db).await?;
-        let segment = Segment::open(&segment_path)
+        let collected = collect_one(db).await?;
+        let segment = Segment::open(&collected.path)
             .with_context(|| format!("postgres {}: open sealed segment", db.major()))?;
         anyhow::ensure!(
             !has_section(&segment, PG_LOCKS_V1_TYPE_ID)
