@@ -2,7 +2,7 @@
 //!
 //! A [`Session`] is one backend connection whose `pg_backend_pid()` is recorded
 //! when it opens, so an assertion can find that session's row by pid and resolve
-//! a `[Name]` placeholder. Three flavours match the guide's step vocabulary:
+//! a `[Name]` placeholder. Four flavours match the guide's step vocabulary:
 //!
 //! - [`Session::open`] runs a statement and returns.
 //! - [`Session::open_holding`] runs a statement (typically `BEGIN; …`) and keeps
@@ -10,6 +10,9 @@
 //! - [`Session::open_blocking`] runs a statement that is expected to block on a
 //!   lock, on a spawned task, and waits — with a bounded timeout, no fixed
 //!   sleep — until the backend is observed in a lock wait state.
+//! - [`Session::open_background`] runs a statement on a background task without
+//!   waiting for any specific wait state. Useful for long-running operations such
+//!   as `VACUUM` that do not block on a lock.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +27,12 @@ const BLOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Poll interval while waiting for a backend's lock wait state to appear.
 const BLOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long [`Session::wait_for_vacuum_progress`] polls before giving up.
+pub(crate) const VACUUM_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval while waiting for a `pg_stat_progress_vacuum` row.
+const VACUUM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// One named backend connection held for the length of a scenario.
 #[derive(Debug)]
@@ -67,6 +76,25 @@ impl Session {
         Self::open(dsn, sql).await
     }
 
+    /// Open a session on `dsn` and run `sql` on a background task, returning
+    /// immediately without waiting for any particular wait state.
+    ///
+    /// Used for long-running statements such as `VACUUM` that do not block on a
+    /// lock and whose progress is observed through a system view on a separate
+    /// connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection or pid query fails.
+    pub(crate) async fn open_background(dsn: &str, sql: &str) -> Result<Self> {
+        let mut session = Self::connect(dsn).await?;
+        let client = Arc::clone(&session.client);
+        let sql = sql.to_owned();
+        let blocking = tokio::spawn(async move { client.batch_execute(&sql).await });
+        session.blocking = Some(blocking);
+        Ok(session)
+    }
+
     /// Open a session on `dsn`, run `sql` on a background task, and wait until
     /// this backend is observed in a lock wait state.
     ///
@@ -102,6 +130,31 @@ impl Session {
     /// This session's backend pid.
     pub(crate) const fn backend_pid(&self) -> i32 {
         self.backend_pid
+    }
+
+    /// Poll `pg_stat_progress_vacuum` on `dsn` until a row appears for this
+    /// session's backend pid.
+    ///
+    /// Connects a probe client to `dsn` to observe vacuum progress. Bounded
+    /// by [`VACUUM_WAIT_TIMEOUT`]; fails early if the background statement
+    /// completes before a row is observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the probe connection fails, the background task
+    /// finishes before a row appears, or the timeout elapses.
+    pub(crate) async fn wait_for_vacuum_progress(&mut self, dsn: &str) -> Result<()> {
+        let (probe, probe_conn) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .context("connect the vacuum observer")?;
+        let probe_driver = tokio::spawn(async move {
+            drop(probe_conn.await);
+        });
+        let result = wait_for_progress_vacuum_row(&probe, self.backend_pid, &mut self.blocking)
+            .await
+            .map(|_| ());
+        probe_driver.abort();
+        result
     }
 
     /// The session's client, for an oracle that must run inside this session
@@ -195,4 +248,52 @@ async fn is_lock_waiting(observer: &tokio_postgres::Client, pid: i32) -> Result<
         .await
         .context("poll pg_stat_activity for a lock wait")?;
     Ok(row.is_some())
+}
+
+/// Poll `pg_stat_progress_vacuum` on `observer` until a row appears for `pid`.
+///
+/// Returns the `relid` of that row. Bounded by [`VACUUM_WAIT_TIMEOUT`]; fails
+/// if `pid`'s background task finishes first or the timeout elapses.
+async fn wait_for_progress_vacuum_row(
+    observer: &tokio_postgres::Client,
+    pid: i32,
+    blocking: &mut Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
+) -> Result<u32> {
+    let poll = async {
+        loop {
+            if let Some(relid) = progress_vacuum_relid(observer, pid).await? {
+                return Ok(relid);
+            }
+            if let Some(task) = blocking.as_mut()
+                && task.is_finished()
+            {
+                anyhow::bail!(
+                    "VACUUM for pid {pid} finished before pg_stat_progress_vacuum was observed"
+                );
+            }
+            sleep(VACUUM_POLL_INTERVAL).await;
+        }
+    };
+    match timeout(VACUUM_WAIT_TIMEOUT, poll).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "pg_stat_progress_vacuum row for pid {pid} did not appear within {VACUUM_WAIT_TIMEOUT:?}"
+        ),
+    }
+}
+
+/// Return the `relid` from `pg_stat_progress_vacuum` for `pid`, if a row exists.
+async fn progress_vacuum_relid(observer: &tokio_postgres::Client, pid: i32) -> Result<Option<u32>> {
+    let row = observer
+        .query_opt(
+            "SELECT relid FROM pg_stat_progress_vacuum WHERE pid = $1",
+            &[&pid],
+        )
+        .await
+        .context("poll pg_stat_progress_vacuum")?;
+    row.map(|r| {
+        let relid: i64 = r.get(0);
+        u32::try_from(relid).context("relid out of u32 range")
+    })
+    .transpose()
 }
