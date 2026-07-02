@@ -39,8 +39,12 @@ pub(crate) enum OracleKind {
     Transformed,
     /// Selected rows, a limit, an order, and a coverage marker.
     TopN,
-    /// A timestamp window or a monotonic relation, not exact equality.
+    /// The oracle returns per-column floors; each floor must be met (`>=`) by
+    /// at least one section value.
     Window,
+    /// The oracle returns one upper bound; every non-null section value must
+    /// be `<=` that bound.
+    Ceiling,
     /// Codec/layout contract only; no live comparison.
     Schema,
 }
@@ -58,6 +62,7 @@ impl OracleKind {
             "transformed" => Self::Transformed,
             "top-n" | "top_n" | "topn" => Self::TopN,
             "window" => Self::Window,
+            "ceiling" => Self::Ceiling,
             "schema" => Self::Schema,
             other => bail!("unknown oracle kind {other:?}"),
         };
@@ -110,6 +115,9 @@ pub(crate) async fn assert_oracle(
         }
         OracleKind::Window => {
             compare_window(type_id, column, &expected, &actual, &rows, subprocess_logs)
+        }
+        OracleKind::Ceiling => {
+            compare_ceiling(type_id, column, &expected, &actual, &rows, subprocess_logs)
         }
         OracleKind::TopN => deferred_kind("top-n"),
         OracleKind::Schema => deferred_kind("schema"),
@@ -253,6 +261,67 @@ fn cell_ge(actual: &Cell, floor: &Cell) -> bool {
         (Cell::U64(a), Cell::U64(b)) => a >= b,
         (Cell::F64(a), Cell::F64(b)) => a >= b,
         _ => false,
+    }
+}
+
+/// Ceiling oracle: one upper-bound scalar; every non-null section value must
+/// be `<=` it. A NULL bound or a NULL section value asserts nothing.
+fn compare_ceiling(
+    type_id: u32,
+    column: &str,
+    expected: &[Cell],
+    actual: &[Cell],
+    rows: &[Row],
+    subprocess_logs: &str,
+) -> Result<()> {
+    let bound = match expected.first() {
+        None => bail!("ceiling oracle returned no rows for section {type_id} {column}"),
+        Some(Cell::Null) => return Ok(()),
+        Some(cell) => cell,
+    };
+    let violations: Vec<&Cell> = actual
+        .iter()
+        .filter(|v| *v != &Cell::Null && !cell_le(v, bound))
+        .collect();
+    if violations.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{}",
+        dump::section_dump(
+            &format!("section {type_id} {column}: ceiling oracle upper bound exceeded"),
+            rows,
+            subprocess_logs,
+            &[
+                ("oracle upper bound", dump::render_cell(bound)),
+                (
+                    "violating section values",
+                    violations
+                        .iter()
+                        .map(|c| dump::render_cell(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ],
+        )
+    )
+}
+
+/// `a <= b` for same-kind numeric cells.
+///
+/// # Panics
+///
+/// Panics on mismatched cell kinds: the section and the oracle share the
+/// column type, so differing variants are a harness bug.
+fn cell_le(a: &Cell, b: &Cell) -> bool {
+    match (a, b) {
+        (Cell::I16(x), Cell::I16(y)) => x <= y,
+        (Cell::I32(x), Cell::I32(y)) => x <= y,
+        (Cell::I64(x), Cell::I64(y)) | (Cell::Ts(x), Cell::Ts(y)) => x <= y,
+        (Cell::U32(x), Cell::U32(y)) => x <= y,
+        (Cell::U64(x), Cell::U64(y)) => x <= y,
+        (Cell::F64(x), Cell::F64(y)) => x <= y,
+        _ => unreachable!("cell_le on incompatible cell kinds: {a:?} vs {b:?}"),
     }
 }
 
@@ -443,5 +512,41 @@ mod tests {
             err.to_string().contains("oracle returned no rows"),
             "error names the cause"
         );
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use kronika_registry::Cell;
+
+    use super::{cell_le, compare_ceiling};
+
+    #[test]
+    fn cell_le_orders_same_kind_cells() {
+        assert!(cell_le(&Cell::I64(1), &Cell::I64(1)));
+        assert!(cell_le(&Cell::Ts(5), &Cell::Ts(9)));
+        assert!(!cell_le(&Cell::U64(3), &Cell::U64(2)));
+    }
+
+    #[test]
+    fn ceiling_passes_under_bound_and_ignores_nulls() {
+        compare_ceiling(
+            1,
+            "c",
+            &[Cell::I64(10)],
+            &[Cell::I64(9), Cell::Null],
+            &[],
+            "",
+        )
+        .expect("values under the bound pass");
+        compare_ceiling(1, "c", &[Cell::Null], &[Cell::I64(999)], &[], "")
+            .expect("a NULL bound asserts nothing");
+    }
+
+    #[test]
+    fn ceiling_fails_over_bound_and_on_empty_oracle() {
+        compare_ceiling(1, "c", &[Cell::I64(10)], &[Cell::I64(11)], &[], "")
+            .expect_err("a value over the bound fails");
+        compare_ceiling(1, "c", &[], &[Cell::I64(1)], &[], "").expect_err("no oracle rows fail");
     }
 }
