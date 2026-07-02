@@ -179,6 +179,7 @@ impl Config {
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
+        validate_max_plans(max_plans)?;
         Ok(Self {
             dsn,
             out_dir,
@@ -266,6 +267,22 @@ fn validate_heavy_cap(heavy_timeout_cap_ms: u64) -> Result<()> {
 /// # Errors
 /// Returns an error naming the env and the limit when the value exceeds
 /// [`MAX_SECTION_ROWS`].
+/// Reject a `pg_store_plans` top-N that could overflow a single section.
+///
+/// The enumeration query materializes up to this many rows before the section
+/// buffer can reject them, so the bound is enforced at startup.
+///
+/// # Errors
+/// Returns an error naming the env and the limit when out of range.
+fn validate_max_plans(max_plans: i64) -> Result<()> {
+    let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
+    anyhow::ensure!(
+        max_plans > 0 && max_plans <= cap,
+        "KRONIKA_PG_MAX_PLANS must be in 1..={cap}, got {max_plans}"
+    );
+    Ok(())
+}
+
 fn validate_max_lock_rows(max_lock_rows: i64) -> Result<()> {
     let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
     anyhow::ensure!(
@@ -798,6 +815,7 @@ async fn collect_store_plans_cached(
         return None;
     }
 
+    let had_cached_source = cache.selected.is_some();
     if let Some(cached) = cache.selected.clone() {
         let label = cached.source.label();
         if let Some(client) = statement_client(pool, &cached.source) {
@@ -844,6 +862,12 @@ async fn collect_store_plans_cached(
             );
             cache.selected = None;
         }
+    }
+
+    // A cached source that just failed already cost this snapshot one heavy
+    // attempt; rediscovery waits for the next snapshot instead of doubling it.
+    if had_cached_source && cache.selected.is_none() {
+        return None;
     }
 
     for candidate in all_statements_candidates(pool) {
@@ -893,22 +917,42 @@ async fn collect_store_plans_cached(
     None
 }
 
+/// Wall-clock cap on the per-read plan-text phase; rows past it seal NULL.
+const PLAN_TEXT_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Enumerate top-N plan rows, then fetch texts under the per-read budget.
+///
+/// Every limit degrades to a NULL `plan`, never to a lost row: the byte budget,
+/// the per-text cap, the wall-clock deadline, and a fetch error all stop the
+/// text phase only.
 async fn collect_plans_with_texts(
     client: &Client,
     config: &Config,
 ) -> Result<Vec<StorePlansRow>, tokio_postgres::Error> {
+    let started = Instant::now();
     let mut rows = collect_store_plans(client, config.max_plans).await?;
     let mut budget = config.plan_text_budget;
+    let mut fetched = 0_usize;
     for row in &mut rows {
-        if budget == 0 {
-            // Rows after the byte budget are sealed with NULL plan text.
+        // The server-side left() cuts characters; the fetch cap and the final
+        // truncate_to_boundary make the contract bytes.
+        let cap = u64::try_from(config.max_plan_text).unwrap_or(0).min(budget);
+        if cap == 0 {
             break;
         }
-        match fetch_plan_text(client, row, config.max_plan_text).await {
-            Ok(Some(text)) => {
+        if started.elapsed() >= PLAN_TEXT_DEADLINE {
+            eprintln!(
+                "pg_kronika-collector: plan-text deadline {PLAN_TEXT_DEADLINE:?} reached; \
+                 remaining rows seal NULL plans"
+            );
+            break;
+        }
+        match fetch_plan_text(client, row, i32::try_from(cap).unwrap_or(i32::MAX)).await {
+            Ok(Some(mut text)) => {
+                truncate_to_boundary(&mut text, usize::try_from(cap).unwrap_or(usize::MAX));
                 budget = budget.saturating_sub(u64::try_from(text.len()).unwrap_or(u64::MAX));
                 row.plan = Some(text);
+                fetched += 1;
             }
             // The entry vanished between enumeration and this call.
             Ok(None) => {}
@@ -921,7 +965,27 @@ async fn collect_plans_with_texts(
             }
         }
     }
+    eprintln!(
+        "pg_kronika-collector: pg_store_plans read: {} rows, {} plan texts, \
+         {} budget bytes left, {:?} elapsed",
+        rows.len(),
+        fetched,
+        budget,
+        started.elapsed()
+    );
     Ok(rows)
+}
+
+/// Truncate a string to at most `max_bytes`, on a UTF-8 character boundary.
+fn truncate_to_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
 }
 
 async fn snapshot_and_seal(
@@ -1742,6 +1806,35 @@ mod tests {
             stats_since: Some(500),
             minmax_stats_since: Some(800),
         }
+    }
+
+    #[test]
+    fn truncate_to_boundary_respects_utf8_and_short_inputs() {
+        let mut short = "plan".to_owned();
+        super::truncate_to_boundary(&mut short, 10);
+        assert_eq!(short, "plan", "short inputs stay whole");
+
+        let mut exact = "план".to_owned(); // 8 bytes, 4 chars
+        super::truncate_to_boundary(&mut exact, 5);
+        assert_eq!(exact, "пл", "the cut lands on a character boundary");
+        assert!(exact.len() <= 5);
+
+        let mut zero = "план".to_owned();
+        super::truncate_to_boundary(&mut zero, 0);
+        assert_eq!(zero, "", "a zero cap empties the text");
+    }
+
+    #[test]
+    fn max_plans_guard_accepts_range_and_rejects_extremes() {
+        assert!(super::validate_max_plans(1).is_ok());
+        assert!(super::validate_max_plans(500).is_ok());
+        assert!(super::validate_max_plans(0).is_err(), "zero is rejected");
+        let cap = i64::try_from(MAX_SECTION_ROWS).expect("cap fits i64");
+        assert!(super::validate_max_plans(cap).is_ok());
+        assert!(
+            super::validate_max_plans(cap + 1).is_err(),
+            "a value above MAX_SECTION_ROWS is rejected"
+        );
     }
 
     #[test]
