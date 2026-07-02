@@ -31,6 +31,15 @@
 //! - `KRONIKA_PG_MAX_STATEMENTS`: per-axis top-N row count for the
 //!   `pg_stat_statements` candidate selection, default 500. Each axis (total
 //!   execution time, calls) contributes up to this many rows before the union;
+//! - `KRONIKA_PG_MAX_PLANS`: top-N row count by total time for the
+//!   `pg_store_plans` (vadv fork) read, default 500;
+//! - `KRONIKA_PG_PLANS_INTERVAL_S`: minimum interval between `pg_store_plans`
+//!   reads, default 300; `0` reads on every snapshot. Section `1_004_001` is
+//!   written only into the segment whose snapshot performed a read;
+//! - `KRONIKA_PG_MAX_PLAN_TEXT`: per-plan text truncation in bytes, default
+//!   32768;
+//! - `KRONIKA_PG_PLAN_TEXT_BUDGET`: total plan-text bytes fetched per read,
+//!   default 8388608; rows past the budget are written with a NULL plan;
 //! - `KRONIKA_PG_POOL_REFRESH_SECS`: minimum interval between connection-pool
 //!   refreshes (per-database connection reconciliation), default 600;
 //! - `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`: cap for the adaptive `statement_timeout`
@@ -70,6 +79,10 @@ use kronika_source_pg::statements::{
     self, StatementsRow, StatementsVersion, collect_statements, statements_extversion,
     statements_version,
 };
+use kronika_source_pg::store_plans::{
+    self, StorePlansOsscRow, StorePlansRow, collect_store_plans, collect_store_plans_ossc,
+    fetch_plan_text, store_plans_extversion, store_plans_is_ossc, store_plans_is_vadv,
+};
 use kronika_source_pg::user_indexes::{
     self, INDEX_TOPN_AXES, UserIndexesRow, UserIndexesVersion, collect_user_indexes,
 };
@@ -85,6 +98,7 @@ use kronika_writer::{Interner, Journal, JournalConfig, SectionBuffers, dict, sea
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
 
@@ -100,6 +114,14 @@ struct Config {
     max_indexes: i64,
     /// Per-axis top-N row count for the `pg_stat_statements` candidate selection.
     max_statements: i64,
+    /// Top-N row count by total time for the `pg_store_plans` read.
+    max_plans: i64,
+    /// Minimum interval between `pg_store_plans` reads.
+    plans_interval: Duration,
+    /// Per-plan text truncation, bytes.
+    max_plan_text: i32,
+    /// Total plan-text bytes fetched per read.
+    plan_text_budget: u64,
     /// Minimum interval between connection-pool refreshes, seconds.
     pool_refresh_secs: u64,
     /// Cap for the adaptive `statement_timeout` of the heavy per-table query, ms.
@@ -144,6 +166,12 @@ impl Config {
             .context("KRONIKA_PG_MAX_INDEXES exceeds i64")?;
         let max_statements = i64::try_from(env_u64("KRONIKA_PG_MAX_STATEMENTS", 500)?)
             .context("KRONIKA_PG_MAX_STATEMENTS exceeds i64")?;
+        let max_plans = i64::try_from(env_u64("KRONIKA_PG_MAX_PLANS", 500)?)
+            .context("KRONIKA_PG_MAX_PLANS exceeds i64")?;
+        let plans_interval = Duration::from_secs(env_u64("KRONIKA_PG_PLANS_INTERVAL_S", 300)?);
+        let max_plan_text = i32::try_from(env_u64("KRONIKA_PG_MAX_PLAN_TEXT", 32_768)?)
+            .context("KRONIKA_PG_MAX_PLAN_TEXT exceeds i32")?;
+        let plan_text_budget = env_u64("KRONIKA_PG_PLAN_TEXT_BUDGET", 8 * 1024 * 1024)?;
         let pool_refresh_secs = env_u64("KRONIKA_PG_POOL_REFRESH_SECS", 600)?;
         let heavy_timeout_cap_ms = env_u64("KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS", 60_000)?;
         let max_lock_rows = i64::try_from(env_u64("KRONIKA_PG_MAX_LOCK_ROWS", 1000)?)
@@ -151,6 +179,8 @@ impl Config {
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
+        validate_max_plans(max_plans)?;
+        validate_plan_text_limits(max_plan_text, plan_text_budget)?;
         Ok(Self {
             dsn,
             out_dir,
@@ -160,6 +190,10 @@ impl Config {
             max_tables,
             max_indexes,
             max_statements,
+            max_plans,
+            plans_interval,
+            max_plan_text,
+            plan_text_budget,
             pool_refresh_secs,
             heavy_timeout_cap_ms,
             max_lock_rows,
@@ -229,6 +263,42 @@ fn validate_heavy_cap(heavy_timeout_cap_ms: u64) -> Result<()> {
     Ok(())
 }
 
+/// Reject a `pg_store_plans` top-N that could overflow a single section.
+///
+/// The enumeration query materializes up to this many rows before the section
+/// buffer can reject them, so the bound is enforced at startup.
+///
+/// # Errors
+/// Returns an error naming the env and the limit when out of range.
+/// Reject plan-text limits the segment dictionary cannot absorb.
+///
+/// The dictionary truncates one entry at 64 KiB and caps the whole window at
+/// 16 MiB (see [`activity_dict_limits`]); env values past those bounds would
+/// fail the snapshot during interning instead of at startup.
+///
+/// # Errors
+/// Returns an error naming the env and the bound when out of range.
+fn validate_plan_text_limits(max_plan_text: i32, plan_text_budget: u64) -> Result<()> {
+    anyhow::ensure!(
+        max_plan_text > 0 && max_plan_text <= 64 * 1024,
+        "KRONIKA_PG_MAX_PLAN_TEXT must be in 1..=65536, got {max_plan_text}"
+    );
+    anyhow::ensure!(
+        plan_text_budget <= 16 * 1024 * 1024,
+        "KRONIKA_PG_PLAN_TEXT_BUDGET must not exceed 16777216, got {plan_text_budget}"
+    );
+    Ok(())
+}
+
+fn validate_max_plans(max_plans: i64) -> Result<()> {
+    let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
+    anyhow::ensure!(
+        max_plans > 0 && max_plans <= cap,
+        "KRONIKA_PG_MAX_PLANS must be in 1..={cap}, got {max_plans}"
+    );
+    Ok(())
+}
+
 /// Reject a lock-row cap that would overflow a single section.
 ///
 /// # Errors
@@ -274,6 +344,7 @@ async fn main() -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("install the SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("install the SIGINT handler")?;
     let mut statements_cache = StatementsSourceCache::default();
+    let mut plans_cache = PlansSourceCache::default();
 
     announce("ready");
 
@@ -286,7 +357,7 @@ async fn main() -> Result<()> {
                 }
                 if let Err(err) = pool
                     .refresh(
-                        std::time::Duration::from_secs(config.pool_refresh_secs),
+                        Duration::from_secs(config.pool_refresh_secs),
                         DEFAULT_MAX_DATABASES,
                     )
                     .await
@@ -297,7 +368,7 @@ async fn main() -> Result<()> {
                     eprintln!("pg_kronika-collector: database not covered this cycle: {db}");
                 }
                 let major = pool.server_major();
-                match snapshot_and_seal(&pool, major, &mut journal, &config, &mut statements_cache).await {
+                match snapshot_and_seal(&pool, major, &mut journal, &config, &mut statements_cache, &mut plans_cache).await {
                     Ok(dest) => announce(&format!("sealed {}", dest.display())),
                     Err(err) => eprintln!("pg_kronika-collector: snapshot failed: {err:#}"),
                 }
@@ -719,12 +790,376 @@ async fn collect_statements_cached(
     discover_statements_source(pool, config, cache).await
 }
 
+/// Cached `pg_store_plans` source and read pacing.
+///
+/// Plans change slowly and reading their texts can be expensive, so reads run
+/// on their own interval. Segments sealed between reads do not include the
+/// section.
+#[derive(Debug, Default)]
+struct PlansSourceCache {
+    selected: Option<CachedPlansSource>,
+    next_read: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPlansSource {
+    source: StatementsSource,
+    extversion: String,
+    fork: PlansFork,
+}
+
+/// Which `pg_store_plans` fork the cached source exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlansFork {
+    /// vadv 2.x: `pg_store_plans(showtext)`, per-plan-shape identity.
+    Vadv,
+    /// ossc upstream: zero-argument view function, per-query identity.
+    Ossc,
+}
+
+/// One paced read, typed by the source fork.
+#[derive(Debug)]
+enum PlansRead {
+    Vadv(Vec<StorePlansRow>),
+    Ossc(Vec<StorePlansOsscRow>),
+}
+
+impl PlansRead {
+    const fn is_empty(&self) -> bool {
+        match self {
+            Self::Vadv(rows) => rows.is_empty(),
+            Self::Ossc(rows) => rows.is_empty(),
+        }
+    }
+}
+
+/// Delay until the next `pg_store_plans` read.
+///
+/// An empty result means plans have not accumulated yet; retry sooner than the
+/// full interval so the first plans are not delayed by up to `interval`.
+fn plans_reread_delay(rows_empty: bool, interval: Duration) -> Duration {
+    if rows_empty {
+        interval.min(Duration::from_secs(30))
+    } else {
+        interval
+    }
+}
+
+/// One read attempt through the cached source; any failure invalidates it so
+/// the caller can decide when to rediscover.
+async fn try_cached_plans_read(
+    pool: &ConnectionPool,
+    config: &Config,
+    cache: &mut PlansSourceCache,
+    now: Instant,
+) -> Option<PlansRead> {
+    if let Some(cached) = cache.selected.clone() {
+        let label = cached.source.label();
+        if let Some(client) = statement_client(pool, &cached.source) {
+            match store_plans_extversion(client).await {
+                Ok(Some(extversion)) if extversion == cached.extversion => {
+                    match collect_plans_for_fork(client, config, cached.fork).await {
+                        Ok(read) => {
+                            cache.next_read = Some(
+                                now + plans_reread_delay(read.is_empty(), config.plans_interval),
+                            );
+                            return Some(read);
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "pg_kronika-collector: pg_store_plans query failed on cached {label}: {err}; rediscovering"
+                            );
+                            cache.selected = None;
+                        }
+                    }
+                }
+                Ok(Some(extversion)) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_store_plans version changed on cached {label} ({} -> {extversion}); rediscovering",
+                        cached.extversion
+                    );
+                    cache.selected = None;
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_store_plans extension missing on cached {label}; rediscovering"
+                    );
+                    cache.selected = None;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_store_plans probe failed on cached {label}: {err}; rediscovering"
+                    );
+                    cache.selected = None;
+                }
+            }
+        } else {
+            eprintln!(
+                "pg_kronika-collector: cached pg_store_plans source {label} is unavailable; rediscovering"
+            );
+            cache.selected = None;
+        }
+    }
+
+    None
+}
+
+/// Collect `pg_store_plans` from one cached source connection.
+///
+/// The statistics are instance-wide, read from the one database where the
+/// extension is installed; discovery walks `pool.main()` first, then the
+/// covered per-db connections. Returns `None` between paced reads and when no
+/// vadv 2.x source exists. All awaits finish here so the caller can intern
+/// without holding the `!Send` `Interner` across an await.
+async fn collect_store_plans_cached(
+    pool: &ConnectionPool,
+    config: &Config,
+    cache: &mut PlansSourceCache,
+) -> Option<PlansRead> {
+    let now = Instant::now();
+    if cache.next_read.is_some_and(|due| now < due) {
+        return None;
+    }
+
+    let had_cached_source = cache.selected.is_some();
+    if let Some(read) = try_cached_plans_read(pool, config, cache, now).await {
+        return Some(read);
+    }
+
+    // A cached source that just failed already cost this snapshot one heavy
+    // attempt; rediscovery waits for the next snapshot instead of doubling it.
+    if had_cached_source && cache.selected.is_none() {
+        return None;
+    }
+
+    for candidate in all_statements_candidates(pool) {
+        let label = candidate.source.label();
+        let extversion = match store_plans_extversion(candidate.client).await {
+            Ok(Some(extversion)) => extversion,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!("pg_kronika-collector: pg_store_plans probe failed on {label}: {err}");
+                continue;
+            }
+        };
+        let fork = match store_plans_is_vadv(candidate.client).await {
+            Ok(true) => PlansFork::Vadv,
+            Ok(false) => match store_plans_is_ossc(candidate.client).await {
+                Ok(true) => PlansFork::Ossc,
+                Ok(false) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_store_plans on {label} matches neither the \
+                         vadv nor the ossc signature; skipping"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_store_plans signature probe failed on {label}: {err}"
+                    );
+                    continue;
+                }
+            },
+            Err(err) => {
+                eprintln!(
+                    "pg_kronika-collector: pg_store_plans signature probe failed on {label}: {err}"
+                );
+                continue;
+            }
+        };
+        let supported = match fork {
+            PlansFork::Vadv => extversion.starts_with("2."),
+            PlansFork::Ossc => extversion.starts_with("1."),
+        };
+        if !supported {
+            eprintln!(
+                "pg_kronika-collector: pg_store_plans extversion {extversion} on {label} does \
+                 not match the {fork:?} layout; skipping"
+            );
+            continue;
+        }
+        match collect_plans_for_fork(candidate.client, config, fork).await {
+            Ok(read) => {
+                cache.selected = Some(CachedPlansSource {
+                    source: candidate.source,
+                    extversion,
+                    fork,
+                });
+                cache.next_read =
+                    Some(now + plans_reread_delay(read.is_empty(), config.plans_interval));
+                return Some(read);
+            }
+            Err(err) => {
+                eprintln!("pg_kronika-collector: pg_store_plans query failed on {label}: {err}");
+            }
+        }
+    }
+
+    // No source found: keep the pacing so discovery does not rescan every snapshot.
+    cache.next_read = Some(now + config.plans_interval);
+    None
+}
+
+/// Wall-clock cap on the per-read plan-text phase; rows past it seal NULL.
+const PLAN_TEXT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Run the fork's collection path and wrap the rows for sealing.
+async fn collect_plans_for_fork(
+    client: &Client,
+    config: &Config,
+    fork: PlansFork,
+) -> Result<PlansRead, tokio_postgres::Error> {
+    match fork {
+        PlansFork::Vadv => Ok(PlansRead::Vadv(
+            collect_plans_with_texts(client, config).await?,
+        )),
+        PlansFork::Ossc => Ok(PlansRead::Ossc(
+            collect_ossc_plans_with_budget(client, config).await?,
+        )),
+    }
+}
+
+/// Collect ossc rows and apply the byte budget to their inline plan texts.
+///
+/// A zero budget switches to the numeric-only query, so no plan text crosses
+/// the network at all. With a budget, the server truncates per row by
+/// characters and each text is byte-capped in Rust to
+/// `min(max_plan_text, remaining budget)` before accounting; tail rows past
+/// the budget seal a NULL plan. Rows whose identity the upstream masked for
+/// lack of `pg_read_all_stats` are dropped and reported.
+async fn collect_ossc_plans_with_budget(
+    client: &Client,
+    config: &Config,
+) -> Result<Vec<StorePlansOsscRow>, tokio_postgres::Error> {
+    let started = Instant::now();
+    let text_cap = (config.plan_text_budget > 0).then_some(config.max_plan_text);
+    let (mut rows, masked) = collect_store_plans_ossc(client, config.max_plans, text_cap).await?;
+    if masked > 0 {
+        eprintln!(
+            "pg_kronika-collector: pg_store_plans (ossc): {masked} privilege-masked rows \
+             skipped; grant the collector role pg_read_all_stats to cover other roles"
+        );
+    }
+    let per_text_cap = usize::try_from(config.max_plan_text).unwrap_or(usize::MAX);
+    let mut budget = config.plan_text_budget;
+    let mut kept = 0_usize;
+    for row in &mut rows {
+        let Some(text) = row.plan.as_mut() else {
+            continue;
+        };
+        let cap = usize::try_from(budget)
+            .unwrap_or(usize::MAX)
+            .min(per_text_cap);
+        if cap == 0 {
+            row.plan = None;
+            continue;
+        }
+        truncate_to_boundary(text, cap);
+        budget = budget.saturating_sub(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        kept += 1;
+    }
+    eprintln!(
+        "pg_kronika-collector: pg_store_plans (ossc) read: {} rows, {} plan texts, \
+         {} budget bytes left, {:?} elapsed",
+        rows.len(),
+        kept,
+        budget,
+        started.elapsed()
+    );
+    Ok(rows)
+}
+
+/// Enumerate top-N plan rows, then fetch texts under the per-read budget.
+///
+/// Every limit degrades to a NULL `plan`, never to a lost row: the byte budget,
+/// the per-text cap, the wall-clock deadline, and a fetch error all stop the
+/// text phase only.
+async fn collect_plans_with_texts(
+    client: &Client,
+    config: &Config,
+) -> Result<Vec<StorePlansRow>, tokio_postgres::Error> {
+    let started = Instant::now();
+    let mut rows = collect_store_plans(client, config.max_plans).await?;
+    let mut budget = config.plan_text_budget;
+    let mut fetched = 0_usize;
+    for row in &mut rows {
+        // The server-side left() cuts characters; the fetch cap and the final
+        // truncate_to_boundary make the contract bytes.
+        let cap = u64::try_from(config.max_plan_text).unwrap_or(0).min(budget);
+        if cap == 0 {
+            break;
+        }
+        let remaining = PLAN_TEXT_DEADLINE.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            eprintln!(
+                "pg_kronika-collector: plan-text deadline {PLAN_TEXT_DEADLINE:?} reached; \
+                 remaining rows seal NULL plans"
+            );
+            break;
+        }
+        // A hard wall: one slow fetch must not stretch the snapshot past the
+        // deadline while waiting on statement_timeout.
+        let attempt = tokio::time::timeout(
+            remaining,
+            fetch_plan_text(client, row, i32::try_from(cap).unwrap_or(i32::MAX)),
+        )
+        .await;
+        let Ok(attempt) = attempt else {
+            eprintln!(
+                "pg_kronika-collector: plan-text fetch for planid {} exceeded the \
+                 deadline; remaining rows seal NULL plans",
+                row.planid
+            );
+            break;
+        };
+        match attempt {
+            Ok(Some(mut text)) => {
+                truncate_to_boundary(&mut text, usize::try_from(cap).unwrap_or(usize::MAX));
+                budget = budget.saturating_sub(u64::try_from(text.len()).unwrap_or(u64::MAX));
+                row.plan = Some(text);
+                fetched += 1;
+            }
+            // The entry vanished between enumeration and this call.
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "pg_kronika-collector: plan text fetch failed for planid {}: {err}",
+                    row.planid
+                );
+                break;
+            }
+        }
+    }
+    eprintln!(
+        "pg_kronika-collector: pg_store_plans read: {} rows, {} plan texts, \
+         {} budget bytes left, {:?} elapsed",
+        rows.len(),
+        fetched,
+        budget,
+        started.elapsed()
+    );
+    Ok(rows)
+}
+
+/// Truncate a string to at most `max_bytes`, on a UTF-8 character boundary.
+fn truncate_to_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+}
+
 async fn snapshot_and_seal(
     pool: &ConnectionPool,
     major: u32,
     journal: &mut Journal,
     config: &Config,
     statements_cache: &mut StatementsSourceCache,
+    plans_cache: &mut PlansSourceCache,
 ) -> Result<PathBuf> {
     let client = pool.main();
     // Run every query first: SectionBuffers and Interner are `!Send`, so they
@@ -763,6 +1198,7 @@ async fn snapshot_and_seal(
     let user_tables = collect_user_tables_all(pool, major, config).await;
     let user_indexes = collect_user_indexes_all(pool, major, config).await;
     let statements = collect_statements_cached(pool, config, statements_cache).await;
+    let store_plans_rows = collect_store_plans_cached(pool, config, plans_cache).await;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -798,6 +1234,11 @@ async fn snapshot_and_seal(
     push_user_indexes(&mut buffers, &mut interner, &user_indexes)?;
     if let Some((version, rows)) = &statements {
         push_statements(&mut buffers, &mut interner, *version, rows)?;
+    }
+    match &store_plans_rows {
+        Some(PlansRead::Vadv(rows)) => push_store_plans(&mut buffers, &mut interner, rows)?,
+        Some(PlansRead::Ossc(rows)) => push_store_plans_ossc(&mut buffers, &mut interner, rows)?,
+        None => {}
     }
     if !lock_rows.is_empty() {
         push_locks(
@@ -1121,6 +1562,40 @@ fn announce(line: &str) {
     writeln!(stdout, "{line}")
         .and_then(|()| stdout.flush())
         .ok();
+}
+
+/// Intern each plan row's strings and buffer it as section `1_004_001`.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_store_plans(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[StorePlansRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, store_plans::to_vadv_v1(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
+/// Intern each ossc plan row's strings and buffer it as section `1_003_001`.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_store_plans_ossc(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[StorePlansOsscRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, store_plans::to_ossc_v1(row, &mut intern)?)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1515,6 +1990,70 @@ mod tests {
             stats_since: Some(500),
             minmax_stats_since: Some(800),
         }
+    }
+
+    #[test]
+    fn truncate_to_boundary_respects_utf8_and_short_inputs() {
+        let mut short = "plan".to_owned();
+        super::truncate_to_boundary(&mut short, 10);
+        assert_eq!(short, "plan", "short inputs stay whole");
+
+        let mut exact = "план".to_owned(); // 8 bytes, 4 chars
+        super::truncate_to_boundary(&mut exact, 5);
+        assert_eq!(exact, "пл", "the cut lands on a character boundary");
+        assert!(exact.len() <= 5);
+
+        let mut zero = "план".to_owned();
+        super::truncate_to_boundary(&mut zero, 0);
+        assert_eq!(zero, "", "a zero cap empties the text");
+    }
+
+    #[test]
+    fn plan_text_limits_guard_matches_dictionary_bounds() {
+        assert!(super::validate_plan_text_limits(32_768, 8 * 1024 * 1024).is_ok());
+        assert!(super::validate_plan_text_limits(64 * 1024, 0).is_ok());
+        assert!(
+            super::validate_plan_text_limits(0, 1).is_err(),
+            "a zero per-text cap is rejected"
+        );
+        assert!(
+            super::validate_plan_text_limits(64 * 1024 + 1, 1).is_err(),
+            "a per-text cap past the 64 KiB dictionary truncation is rejected"
+        );
+        assert!(
+            super::validate_plan_text_limits(1, 16 * 1024 * 1024 + 1).is_err(),
+            "a budget past the 16 MiB dictionary cap is rejected"
+        );
+    }
+
+    #[test]
+    fn max_plans_guard_accepts_range_and_rejects_extremes() {
+        assert!(super::validate_max_plans(1).is_ok());
+        assert!(super::validate_max_plans(500).is_ok());
+        assert!(super::validate_max_plans(0).is_err(), "zero is rejected");
+        let cap = i64::try_from(MAX_SECTION_ROWS).expect("cap fits i64");
+        assert!(super::validate_max_plans(cap).is_ok());
+        assert!(
+            super::validate_max_plans(cap + 1).is_err(),
+            "a value above MAX_SECTION_ROWS is rejected"
+        );
+    }
+
+    #[test]
+    fn plans_reread_delay_shortens_only_empty_reads() {
+        use std::time::Duration;
+        let interval = Duration::from_mins(5);
+        assert_eq!(super::plans_reread_delay(false, interval), interval);
+        assert_eq!(
+            super::plans_reread_delay(true, interval),
+            Duration::from_secs(30)
+        );
+        let short = Duration::from_secs(10);
+        assert_eq!(
+            super::plans_reread_delay(true, short),
+            short,
+            "the retry delay never exceeds the interval"
+        );
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub mod progress_vacuum;
 pub mod replication_instance;
 
 pub mod statements;
+pub mod store_plans;
 
 pub mod user_indexes;
 pub mod user_tables;

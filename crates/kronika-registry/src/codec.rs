@@ -36,6 +36,7 @@ pub mod pg_stat_statements;
 pub mod pg_stat_user_indexes;
 pub mod pg_stat_user_tables;
 pub mod pg_stat_wal;
+pub mod pg_store_plans;
 pub mod replication_instance;
 pub mod reset_metadata;
 

@@ -22,7 +22,8 @@ use crate::harness::HarnessState;
 /// into the error so CI sees the collector-side cause.
 pub(crate) async fn take(state: &mut HarnessState) -> Result<PathBuf> {
     let cluster = state.cluster()?;
-    let mut collector = Collector::spawn(cluster).await?;
+    let extra_env = state.collector_env().to_vec();
+    let mut collector = Collector::spawn_with_env(cluster, &extra_env).await?;
     let segment = match collector.snapshot().await {
         Ok(segment) => segment,
         Err(err) => {
