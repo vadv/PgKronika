@@ -58,6 +58,8 @@ pub enum ColumnType {
     /// A `u64` reference into the segment string dictionary (the bytes live in
     /// the dictionary, not the section).
     StrId,
+    /// A list of `i32` (Arrow `List<Int32>`); an empty list is not NULL.
+    ListI32,
 }
 
 /// A unix-microseconds timestamp, as carried in a `Ts` column.

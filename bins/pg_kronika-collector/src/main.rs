@@ -35,7 +35,10 @@
 //!   refreshes (per-database connection reconciliation), default 600;
 //! - `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`: cap for the adaptive `statement_timeout`
 //!   of the heavy per-table size query, default 60000. A `57014` (query canceled)
-//!   widens the timeout and retries the same database until this cap.
+//!   widens the timeout and retries the same database until this cap;
+//! - `KRONIKA_PG_MAX_LOCK_ROWS`: lock-wait graph guard, default 1000. The
+//!   section is skipped when no waits exist or when waiters, edges, or nodes
+//!   exceed this value.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
@@ -47,6 +50,10 @@ use kronika_registry::{MAX_SECTION_ROWS, StrId};
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
 use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
+use kronika_source_pg::locks::{
+    LocksRow, LocksVersion, collect_locks, lock_waits_exist, locks_version, to_v1 as locks_to_v1,
+    to_v2 as locks_to_v2,
+};
 use kronika_source_pg::pool::{
     AdaptiveTimeout, ConnectionPool, DEFAULT_MAX_DATABASES, SessionConfig,
 };
@@ -97,6 +104,8 @@ struct Config {
     pool_refresh_secs: u64,
     /// Cap for the adaptive `statement_timeout` of the heavy per-table query, ms.
     heavy_timeout_cap_ms: u64,
+    /// Maximum lock-wait waiters, edges, and nodes accepted for one section.
+    max_lock_rows: i64,
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -137,8 +146,11 @@ impl Config {
             .context("KRONIKA_PG_MAX_STATEMENTS exceeds i64")?;
         let pool_refresh_secs = env_u64("KRONIKA_PG_POOL_REFRESH_SECS", 600)?;
         let heavy_timeout_cap_ms = env_u64("KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS", 60_000)?;
+        let max_lock_rows = i64::try_from(env_u64("KRONIKA_PG_MAX_LOCK_ROWS", 1000)?)
+            .context("KRONIKA_PG_MAX_LOCK_ROWS exceeds i64")?;
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
+        validate_max_lock_rows(max_lock_rows)?;
         Ok(Self {
             dsn,
             out_dir,
@@ -150,6 +162,7 @@ impl Config {
             max_statements,
             pool_refresh_secs,
             heavy_timeout_cap_ms,
+            max_lock_rows,
         })
     }
 }
@@ -212,6 +225,25 @@ fn validate_heavy_cap(heavy_timeout_cap_ms: u64) -> Result<()> {
         heavy_timeout_cap_ms > 0,
         "KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS must be greater than 0: a cap of 0 sets \
          statement_timeout = 0, which removes the guard on the heavy size query"
+    );
+    Ok(())
+}
+
+/// Reject a lock-row cap that would overflow a single section.
+///
+/// # Errors
+/// Returns an error naming the env and the limit when the value exceeds
+/// [`MAX_SECTION_ROWS`].
+fn validate_max_lock_rows(max_lock_rows: i64) -> Result<()> {
+    let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
+    anyhow::ensure!(
+        max_lock_rows > 0,
+        "KRONIKA_PG_MAX_LOCK_ROWS must be greater than 0"
+    );
+    anyhow::ensure!(
+        max_lock_rows <= cap,
+        "KRONIKA_PG_MAX_LOCK_ROWS ({max_lock_rows}) exceeds the {cap}-row section cap; \
+         lower KRONIKA_PG_MAX_LOCK_ROWS"
     );
     Ok(())
 }
@@ -726,6 +758,7 @@ async fn snapshot_and_seal(
     let replication_instance_row = collect_replication_instance(client, major)
         .await
         .context("collect replication instance status")?;
+    let lock_rows = collect_lock_rows(client, major, config.max_lock_rows).await;
 
     let user_tables = collect_user_tables_all(pool, major, config).await;
     let user_indexes = collect_user_indexes_all(pool, major, config).await;
@@ -766,6 +799,14 @@ async fn snapshot_and_seal(
     if let Some((version, rows)) = &statements {
         push_statements(&mut buffers, &mut interner, *version, rows)?;
     }
+    if !lock_rows.is_empty() {
+        push_locks(
+            &mut buffers,
+            &mut interner,
+            locks_version(major),
+            &lock_rows,
+        )?;
+    }
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -781,6 +822,41 @@ async fn snapshot_and_seal(
     // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
+}
+
+/// Collect lock-wait rows or degrade by skipping only section `1_011`.
+async fn collect_lock_rows(client: &Client, major: u32, max_lock_rows: i64) -> Vec<LocksRow> {
+    match lock_waits_exist(client).await {
+        Ok(true) => match collect_locks(client, major, max_lock_rows).await {
+            Ok(snapshot) => {
+                if let Some(skipped) = snapshot.skipped {
+                    eprintln!(
+                        "pg_kronika-collector: skipping section 1_011 for this snapshot; \
+                         lock-wait graph exceeds KRONIKA_PG_MAX_LOCK_ROWS={} \
+                         (waiters={}, edges={}, nodes={})",
+                        skipped.max_rows, skipped.waiters, skipped.edges, skipped.nodes
+                    );
+                    Vec::new()
+                } else {
+                    snapshot.rows
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "pg_kronika-collector: pg_locks wait-tree collection failed; \
+                     skipping section 1_011 for this snapshot: {err}"
+                );
+                Vec::new()
+            }
+        },
+        Ok(false) => Vec::new(),
+        Err(err) => {
+            eprintln!(
+                "pg_kronika-collector: lock-wait precheck failed; skipping section 1_011: {err}"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Limits for interned activity strings.
@@ -1004,6 +1080,27 @@ fn push_io(
     Ok(())
 }
 
+/// Intern each row's strings and buffer it as the version's lock-wait section.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_locks(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    version: LocksVersion,
+    rows: &[LocksRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        match version {
+            LocksVersion::V1 => buffer_row(buffers, locks_to_v1(row, &mut intern)?)?,
+            LocksVersion::V2 => buffer_row(buffers, locks_to_v2(row, &mut intern)?)?,
+        }
+    }
+    Ok(())
+}
+
 /// Whether a tokio-postgres error carries the given SQLSTATE code.
 fn is_sqlstate(err: &tokio_postgres::Error, code: &str) -> bool {
     err.code().is_some_and(|state| state.code() == code)
@@ -1030,13 +1127,16 @@ fn announce(line: &str) {
 mod tests {
     use super::{
         CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
-        activity_dict_limits, push_activity, push_archiver, push_database, push_io,
+        activity_dict_limits, push_activity, push_archiver, push_database, push_io, push_locks,
         push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
         push_user_indexes, push_user_tables, validate_cardinality, validate_heavy_cap,
+        validate_max_lock_rows,
     };
+    use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
     use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
     use kronika_source_pg::io::{IoRow, IoVersion};
+    use kronika_source_pg::locks::{LocksRow, LocksVersion};
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
     use kronika_source_pg::replication_instance::ReplicationInstanceRow;
@@ -1718,6 +1818,122 @@ mod tests {
                 .iter()
                 .any(|entry| entry.type_id == 1_015_001),
             "the part carries the replication_instance section"
+        );
+    }
+
+    #[test]
+    fn max_lock_rows_within_section_cap() {
+        assert!(1000 <= i64::try_from(MAX_SECTION_ROWS).unwrap());
+    }
+
+    #[test]
+    fn max_lock_rows_validation_rejects_overflow() {
+        let cap = i64::try_from(MAX_SECTION_ROWS).unwrap();
+        let err = validate_max_lock_rows(cap + 1).expect_err("value above cap must be rejected");
+        assert!(err.to_string().contains("KRONIKA_PG_MAX_LOCK_ROWS"));
+    }
+
+    #[test]
+    fn max_lock_rows_validation_rejects_zero() {
+        let err = validate_max_lock_rows(0).expect_err("zero disables the graph guard");
+        assert!(err.to_string().contains("greater than 0"));
+    }
+
+    fn locks_root_row() -> LocksRow {
+        LocksRow {
+            ts: 1_000_000,
+            pid: 10,
+            blocked_by: Vec::new(),
+            depth: 0,
+            root_pid: 10,
+            datid: 16_384,
+            datname: "app".to_owned(),
+            usename: Some("postgres".to_owned()),
+            application_name: "psql".to_owned(),
+            client_addr: String::new(),
+            backend_type: "client backend".to_owned(),
+            state: Some("active".to_owned()),
+            wait_event_type: None,
+            wait_event: None,
+            query: "select 1".to_owned(),
+            backend_xid_age: None,
+            backend_xmin_age: None,
+            backend_start: Some(940_000),
+            xact_start: Some(995_000),
+            query_start: Some(999_000),
+            state_change: Some(999_000),
+            lock_locktype: None,
+            lock_mode: None,
+            lock_granted: None,
+            lock_database: None,
+            lock_relation: None,
+            lock_relname: None,
+            lock_page: None,
+            lock_tuple: None,
+            lock_virtualxid: None,
+            lock_transactionid: None,
+            lock_classid: None,
+            lock_objid: None,
+            lock_objsubid: None,
+            lock_fastpath: None,
+            lock_target: None,
+            waitstart: None,
+        }
+    }
+
+    #[test]
+    fn push_locks_buffers_v2_row_into_1_011_002_section() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_locks(
+            &mut buffers,
+            &mut interner,
+            LocksVersion::V2,
+            &[locks_root_row()],
+        )
+        .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "row was buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_011_002),
+            "the part carries the pg_locks wait-tree V2 section"
+        );
+    }
+
+    #[test]
+    fn push_locks_buffers_v1_row_into_1_011_001_section() {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_locks(
+            &mut buffers,
+            &mut interner,
+            LocksVersion::V1,
+            &[locks_root_row()],
+        )
+        .expect("push interns and buffers");
+        assert!(!buffers.is_empty(), "row was buffered");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        let part = buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part");
+        let catalog = kronika_format::validate_part(&part).expect("a valid container");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.type_id == 1_011_001),
+            "the part carries the pg_locks wait-tree V1 section"
         );
     }
 }

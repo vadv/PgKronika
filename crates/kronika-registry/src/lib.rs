@@ -22,15 +22,16 @@ mod sealed {
     pub trait Sealed {}
 }
 
+pub use codec::pg_locks::{PgLocksV1, PgLocksV2};
 pub use codec::{
-    CodecError, DecodeStats, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
-    VerifiedSection, arrow_schema, nullable_bool, nullable_column, opt_bool, opt_primitive,
-    required_bool, required_column, write_bool, write_bool_nullable, write_nullable,
-    write_required,
+    CodecError, DecodeStats, DecodedSection, ListColumn, MAX_ROW_GROUPS, MAX_SECTION_BYTES,
+    MAX_SECTION_ROWS, VerifiedSection, arrow_schema, nullable_bool, nullable_column, opt_bool,
+    opt_primitive, read_list_i32, required_bool, required_column, write_bool, write_bool_nullable,
+    write_list_i32, write_nullable, write_required,
 };
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{
-    bgwriter_checkpointer, instance_metadata, pg_prepared_xacts, pg_stat_activity,
+    bgwriter_checkpointer, instance_metadata, pg_locks, pg_prepared_xacts, pg_stat_activity,
     pg_stat_archiver, pg_stat_database, pg_stat_io, pg_stat_progress_vacuum, pg_stat_statements,
     pg_stat_user_indexes, pg_stat_user_tables, pg_stat_wal, replication_instance, reset_metadata,
 };
@@ -78,6 +79,8 @@ pub const fn registry() -> &'static [TypeContract] {
         pg_stat_user_tables::PgStatUserTablesV2::CONTRACT,
         pg_stat_user_tables::PgStatUserTablesV3::CONTRACT,
         pg_stat_user_tables::PgStatUserTablesV4::CONTRACT,
+        PgLocksV1::CONTRACT,
+        PgLocksV2::CONTRACT,
         pg_stat_user_indexes::PgStatUserIndexesV1::CONTRACT,
         pg_stat_user_indexes::PgStatUserIndexesV2::CONTRACT,
         pg_stat_database::PgStatDatabaseV1::CONTRACT,
