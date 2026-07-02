@@ -55,7 +55,8 @@
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay",
-        "pg-store-plans-vadv": "pg-store-plans-vadv"
+        "pg-store-plans-vadv": "pg-store-plans-vadv",
+        "pg-store-plans-ossc": "pg-store-plans-ossc"
       }
     },
     "rust-overlay": {
@@ -107,6 +108,23 @@
         "owner": "vadv",
         "repo": "pg_store_plans",
         "rev": "1ac02d9e8f84d012b8a2527a41ecd8f2d3ce4493",
+        "type": "github"
+      }
+    },
+    "pg-store-plans-ossc": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1773794601,
+        "narHash": "sha256-SEklD8IzcmqjOc3Okb55tcj7Hwd8BXr/84R1POO6xBg=",
+        "owner": "ossc-db",
+        "repo": "pg_store_plans",
+        "rev": "e802804d4d2763ad3b32fc8fcf9f218c61cc475f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ossc-db",
+        "repo": "pg_store_plans",
+        "rev": "e802804d4d2763ad3b32fc8fcf9f218c61cc475f",
         "type": "github"
       }
     }
