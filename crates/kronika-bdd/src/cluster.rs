@@ -16,6 +16,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SERVER_LOG: &str = "server.log";
 
+const INITDB_LOG: &str = "initdb.log";
+
 /// A `PostgreSQL` major version and the `bin` directory that provides its
 /// `initdb` and `postgres` (a Nix store path inside the image).
 #[derive(Debug, Clone)]
@@ -44,6 +46,34 @@ pub(crate) fn parse_matrix(spec: &str) -> Result<Vec<PgBinary>> {
             })
         })
         .collect()
+}
+
+/// The matrix booted once for the whole process.
+///
+/// Re-running `initdb` per scenario creates unnecessary concurrent boot work.
+/// The matrix boots on first use and every scenario borrows the same clusters;
+/// per-scenario state is isolated with uniquely named databases/schemas, not
+/// fresh clusters. Teardown is the clusters' `kill_on_drop`, which fires when
+/// the process exits.
+static SHARED_MATRIX: tokio::sync::OnceCell<Vec<Cluster>> = tokio::sync::OnceCell::const_new();
+
+/// Borrow the process-wide matrix, booting it from `KRONIKA_PG_MATRIX` on the
+/// first call.
+///
+/// # Errors
+///
+/// Returns an error if `KRONIKA_PG_MATRIX` is unset or malformed, or if any
+/// cluster fails to boot.
+pub(crate) async fn shared_matrix() -> Result<&'static [Cluster]> {
+    let clusters = SHARED_MATRIX
+        .get_or_try_init(|| async {
+            let spec =
+                std::env::var("KRONIKA_PG_MATRIX").context("KRONIKA_PG_MATRIX is not set")?;
+            let matrix = parse_matrix(&spec)?;
+            boot_matrix(&matrix).await
+        })
+        .await?;
+    Ok(clusters)
 }
 
 /// Boot every entry concurrently on distinct loopback ports.
@@ -127,25 +157,10 @@ impl Cluster {
             tokio_postgres::connect(&self.conn_string(), tokio_postgres::NoTls)
                 .await
                 .context("connect")?;
-        // Read the server version from the handshake before the connection moves
-        // into its driver task.
-        let major = kronika_source_pg::server_major(connection.parameter("server_version"));
         Ok(Conn {
             client,
-            major,
             driver: tokio::spawn(connection),
         })
-    }
-
-    /// `server_version` reported by the running cluster.
-    pub(crate) async fn server_version(&self) -> Result<String> {
-        let conn = self.connect().await?;
-        let row = conn
-            .client()
-            .query_one("SHOW server_version", &[])
-            .await
-            .context("query server_version")?;
-        Ok(row.get(0))
     }
 
     async fn wait_ready(&self) -> Result<()> {
@@ -177,8 +192,6 @@ impl Cluster {
 #[derive(Debug)]
 pub(crate) struct Conn {
     client: tokio_postgres::Client,
-    /// Server major version from the handshake, e.g. `Some(17)`.
-    major: Option<u32>,
     /// Abort on drop; otherwise the protocol driver keeps running.
     driver: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
 }
@@ -186,10 +199,6 @@ pub(crate) struct Conn {
 impl Conn {
     pub(crate) const fn client(&self) -> &tokio_postgres::Client {
         &self.client
-    }
-
-    pub(crate) const fn major(&self) -> Option<u32> {
-        self.major
     }
 }
 
@@ -200,7 +209,10 @@ impl Drop for Conn {
 }
 
 async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
-    let status = Command::new(bin.bindir.join("initdb"))
+    // Capture stdout+stderr so a non-zero exit carries the reason. The
+    // after-hook cannot help here because the cluster's data dir does not
+    // exist yet.
+    let output = Command::new(bin.bindir.join("initdb"))
         .arg("-D")
         .arg(data_dir)
         .args([
@@ -212,17 +224,38 @@ async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
             "--locale-provider=libc",
             "--locale=C",
         ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .await
         .with_context(|| format!("spawn initdb for postgres {}", bin.major))?;
+    let diagnostic = initdb_diagnostic(&output.stdout, &output.stderr);
+    // Persist the output next to the data dir. The failure message below still
+    // carries it inline, so a write error here is only noted, never fatal.
+    if let Err(err) = std::fs::write(data_dir.join(INITDB_LOG), &diagnostic) {
+        eprintln!(
+            "=== BDD: could not write {INITDB_LOG} for postgres {}: {err} ===",
+            bin.major
+        );
+    }
     ensure!(
-        status.success(),
-        "initdb for postgres {} failed: {status}",
-        bin.major
+        output.status.success(),
+        "initdb for postgres {} failed: {}\n{diagnostic}",
+        bin.major,
+        output.status,
     );
     Ok(())
+}
+
+/// Render captured `initdb` output for a failure message and the `initdb.log`.
+fn initdb_diagnostic(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    format!(
+        "--- initdb stdout ---\n{}\n--- initdb stderr ---\n{}",
+        stdout.trim_end(),
+        stderr.trim_end(),
+    )
 }
 
 fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
