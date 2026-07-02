@@ -18,6 +18,12 @@ const SERVER_LOG: &str = "server.log";
 
 const INITDB_LOG: &str = "initdb.log";
 
+/// Majors whose image clusters carry the vadv `pg_store_plans` fork.
+///
+/// Both forks install identically named files, so one cluster carries one
+/// fork; PG15/16 stay bare until the ossc layout lands.
+pub(crate) const STORE_PLANS_MAJORS: [u32; 2] = [17, 18];
+
 /// A `PostgreSQL` major version and the `bin` directory that provides its
 /// `initdb` and `postgres` (a Nix store path inside the image).
 #[derive(Debug, Clone)]
@@ -279,10 +285,33 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
             "full_page_writes=off",
             "-c",
             "max_prepared_transactions=16",
-            // pg_stat_statements must be preloaded before it can be created.
-            "-c",
-            "shared_preload_libraries=pg_stat_statements",
         ]);
+    if STORE_PLANS_MAJORS.contains(&bin.major) {
+        // The image ships the vadv pg_store_plans on these majors. The GUCs pin
+        // deterministic test behavior: record every plan (no threshold, no
+        // sampling) and keep the entry key meaningful (compute_query_id).
+        cmd.args([
+            "-c",
+            "shared_preload_libraries=pg_stat_statements,pg_store_plans",
+            "-c",
+            "compute_query_id=on",
+            "-c",
+            "track_io_timing=on",
+            "-c",
+            "pg_store_plans.min_duration=0",
+            "-c",
+            "pg_store_plans.track=all",
+            "-c",
+            "pg_store_plans.sample_rate=1",
+            "-c",
+            "pg_store_plans.store_last_plan=on",
+            "-c",
+            "pg_store_plans.track_planning=on",
+        ]);
+    } else {
+        // pg_stat_statements must be preloaded before it can be created.
+        cmd.args(["-c", "shared_preload_libraries=pg_stat_statements"]);
+    }
     // DEBUG=1 turns the server log into a full SQL trace; errors are logged
     // regardless, so the on-failure dump always shows the offending statement.
     if std::env::var("DEBUG").is_ok() {

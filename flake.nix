@@ -9,6 +9,13 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
+    # vadv fork of pg_store_plans; pinned by rev because PG18 support landed
+    # after the last release tag. Bump: update the rev, `nix flake update
+    # pg-store-plans-vadv`.
+    pg-store-plans-vadv = {
+      url = "github:vadv/pg_store_plans/1ac02d9e8f84d012b8a2527a41ecd8f2d3ce4493";
+      flake = false;
+    };
   };
 
   outputs =
@@ -17,6 +24,7 @@
       flake-utils,
       rust-overlay,
       crane,
+      pg-store-plans-vadv,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -38,6 +46,37 @@
           postgresql_17 = pkgs.postgresql_17;
           postgresql_18 = pkgs.postgresql_18;
         };
+
+        # PGXS build of the vadv pg_store_plans fork against one major.
+        mkStorePlansVadv =
+          pg:
+          pkgs.stdenv.mkDerivation {
+            pname = "pg_store_plans-vadv";
+            version = "2.1";
+            src = pg-store-plans-vadv;
+            buildInputs = [ pg ];
+            makeFlags = [
+              "USE_PGXS=1"
+              "PG_CONFIG=${pg}/bin/pg_config"
+            ];
+            installPhase = ''
+              runHook preInstall
+              install -D -t $out/lib pg_store_plans.so
+              install -D -t $out/share/postgresql/extension \
+                pg_store_plans.control pg_store_plans--*.sql
+              runHook postInstall
+            '';
+          };
+
+        # The vadv fork ships on PG17/18 in the image; PG15/16 stay bare until
+        # the ossc layout lands (both forks install the same file names, so one
+        # cluster carries one fork).
+        postgresql_17_plans = pkgs.postgresql_17.withPackages (_: [
+          (mkStorePlansVadv pkgs.postgresql_17)
+        ]);
+        postgresql_18_plans = pkgs.postgresql_18.withPackages (_: [
+          (mkStorePlansVadv pkgs.postgresql_18)
+        ]);
 
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
@@ -76,8 +115,8 @@
             bins
             pkgs.postgresql_15
             pkgs.postgresql_16
-            pkgs.postgresql_17
-            pkgs.postgresql_18
+            postgresql_17_plans
+            postgresql_18_plans
             pkgs.dockerTools.fakeNss
             # initdb uses popen, so the scratch image needs /bin/sh.
             pkgs.dockerTools.binSh
@@ -93,7 +132,7 @@
               "LANG=C"
               "KRONIKA_FEATURES=${features}"
               "KRONIKA_COLLECTOR_BIN=${bins}/bin/pg_kronika-collector"
-              "KRONIKA_PG_MATRIX=15=${pkgs.postgresql_15}/bin;16=${pkgs.postgresql_16}/bin;17=${pkgs.postgresql_17}/bin;18=${pkgs.postgresql_18}/bin"
+              "KRONIKA_PG_MATRIX=15=${pkgs.postgresql_15}/bin;16=${pkgs.postgresql_16}/bin;17=${postgresql_17_plans}/bin;18=${postgresql_18_plans}/bin"
             ];
           };
         };
