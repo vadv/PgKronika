@@ -80,8 +80,8 @@ use kronika_source_pg::statements::{
     statements_version,
 };
 use kronika_source_pg::store_plans::{
-    self, StorePlansRow, collect_store_plans, fetch_plan_text, store_plans_extversion,
-    store_plans_is_vadv,
+    self, StorePlansOsscRow, StorePlansRow, collect_store_plans, collect_store_plans_ossc,
+    fetch_plan_text, store_plans_extversion, store_plans_is_ossc, store_plans_is_vadv,
 };
 use kronika_source_pg::user_indexes::{
     self, INDEX_TOPN_AXES, UserIndexesRow, UserIndexesVersion, collect_user_indexes,
@@ -784,6 +784,32 @@ struct PlansSourceCache {
 struct CachedPlansSource {
     source: StatementsSource,
     extversion: String,
+    fork: PlansFork,
+}
+
+/// Which `pg_store_plans` fork the cached source exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlansFork {
+    /// vadv 2.x: `pg_store_plans(showtext)`, per-plan-shape identity.
+    Vadv,
+    /// ossc upstream: zero-argument view function, per-query identity.
+    Ossc,
+}
+
+/// One paced read, typed by the source fork.
+#[derive(Debug)]
+enum PlansRead {
+    Vadv(Vec<StorePlansRow>),
+    Ossc(Vec<StorePlansOsscRow>),
+}
+
+impl PlansRead {
+    const fn is_empty(&self) -> bool {
+        match self {
+            Self::Vadv(rows) => rows.is_empty(),
+            Self::Ossc(rows) => rows.is_empty(),
+        }
+    }
 }
 
 /// Delay until the next `pg_store_plans` read.
@@ -798,35 +824,25 @@ fn plans_reread_delay(rows_empty: bool, interval: Duration) -> Duration {
     }
 }
 
-/// Collect `pg_store_plans` (vadv) from one cached source connection.
-///
-/// The statistics are instance-wide, read from the one database where the
-/// extension is installed; discovery walks `pool.main()` first, then the
-/// covered per-db connections. Returns `None` between paced reads and when no
-/// vadv 2.x source exists. All awaits finish here so the caller can intern
-/// without holding the `!Send` `Interner` across an await.
-async fn collect_store_plans_cached(
+/// One read attempt through the cached source; any failure invalidates it so
+/// the caller can decide when to rediscover.
+async fn try_cached_plans_read(
     pool: &ConnectionPool,
     config: &Config,
     cache: &mut PlansSourceCache,
-) -> Option<Vec<StorePlansRow>> {
-    let now = Instant::now();
-    if cache.next_read.is_some_and(|due| now < due) {
-        return None;
-    }
-
-    let had_cached_source = cache.selected.is_some();
+    now: Instant,
+) -> Option<PlansRead> {
     if let Some(cached) = cache.selected.clone() {
         let label = cached.source.label();
         if let Some(client) = statement_client(pool, &cached.source) {
             match store_plans_extversion(client).await {
                 Ok(Some(extversion)) if extversion == cached.extversion => {
-                    match collect_plans_with_texts(client, config).await {
-                        Ok(rows) => {
+                    match collect_plans_for_fork(client, config, cached.fork).await {
+                        Ok(read) => {
                             cache.next_read = Some(
-                                now + plans_reread_delay(rows.is_empty(), config.plans_interval),
+                                now + plans_reread_delay(read.is_empty(), config.plans_interval),
                             );
-                            return Some(rows);
+                            return Some(read);
                         }
                         Err(err) => {
                             eprintln!(
@@ -864,6 +880,31 @@ async fn collect_store_plans_cached(
         }
     }
 
+    None
+}
+
+/// Collect `pg_store_plans` from one cached source connection.
+///
+/// The statistics are instance-wide, read from the one database where the
+/// extension is installed; discovery walks `pool.main()` first, then the
+/// covered per-db connections. Returns `None` between paced reads and when no
+/// vadv 2.x source exists. All awaits finish here so the caller can intern
+/// without holding the `!Send` `Interner` across an await.
+async fn collect_store_plans_cached(
+    pool: &ConnectionPool,
+    config: &Config,
+    cache: &mut PlansSourceCache,
+) -> Option<PlansRead> {
+    let now = Instant::now();
+    if cache.next_read.is_some_and(|due| now < due) {
+        return None;
+    }
+
+    let had_cached_source = cache.selected.is_some();
+    if let Some(read) = try_cached_plans_read(pool, config, cache, now).await {
+        return Some(read);
+    }
+
     // A cached source that just failed already cost this snapshot one heavy
     // attempt; rediscovery waits for the next snapshot instead of doubling it.
     if had_cached_source && cache.selected.is_none() {
@@ -880,31 +921,41 @@ async fn collect_store_plans_cached(
                 continue;
             }
         };
-        match store_plans_is_vadv(candidate.client).await {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!(
-                    "pg_kronika-collector: pg_store_plans on {label} is not the vadv 2.x \
-                     signature; section 1_003 is not collected"
-                );
-                continue;
-            }
+        let fork = match store_plans_is_vadv(candidate.client).await {
+            Ok(true) => PlansFork::Vadv,
+            Ok(false) => match store_plans_is_ossc(candidate.client).await {
+                Ok(true) => PlansFork::Ossc,
+                Ok(false) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_store_plans on {label} matches neither the \
+                         vadv nor the ossc signature; skipping"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "pg_kronika-collector: pg_store_plans signature probe failed on {label}: {err}"
+                    );
+                    continue;
+                }
+            },
             Err(err) => {
                 eprintln!(
                     "pg_kronika-collector: pg_store_plans signature probe failed on {label}: {err}"
                 );
                 continue;
             }
-        }
-        match collect_plans_with_texts(candidate.client, config).await {
-            Ok(rows) => {
+        };
+        match collect_plans_for_fork(candidate.client, config, fork).await {
+            Ok(read) => {
                 cache.selected = Some(CachedPlansSource {
                     source: candidate.source,
                     extversion,
+                    fork,
                 });
                 cache.next_read =
-                    Some(now + plans_reread_delay(rows.is_empty(), config.plans_interval));
-                return Some(rows);
+                    Some(now + plans_reread_delay(read.is_empty(), config.plans_interval));
+                return Some(read);
             }
             Err(err) => {
                 eprintln!("pg_kronika-collector: pg_store_plans query failed on {label}: {err}");
@@ -919,6 +970,60 @@ async fn collect_store_plans_cached(
 
 /// Wall-clock cap on the per-read plan-text phase; rows past it seal NULL.
 const PLAN_TEXT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Run the fork's collection path and wrap the rows for sealing.
+async fn collect_plans_for_fork(
+    client: &Client,
+    config: &Config,
+    fork: PlansFork,
+) -> Result<PlansRead, tokio_postgres::Error> {
+    match fork {
+        PlansFork::Vadv => Ok(PlansRead::Vadv(
+            collect_plans_with_texts(client, config).await?,
+        )),
+        PlansFork::Ossc => Ok(PlansRead::Ossc(
+            collect_ossc_plans_with_budget(client, config).await?,
+        )),
+    }
+}
+
+/// Collect ossc rows and apply the byte budget to their inline plan texts.
+///
+/// The upstream view carries the text, so the server already spent the work;
+/// the budget only bounds what the segment dictionary absorbs — tail rows
+/// past the budget seal a NULL plan.
+async fn collect_ossc_plans_with_budget(
+    client: &Client,
+    config: &Config,
+) -> Result<Vec<StorePlansOsscRow>, tokio_postgres::Error> {
+    let started = Instant::now();
+    let text_cap = config.max_plan_text;
+    let mut rows = collect_store_plans_ossc(client, config.max_plans, text_cap).await?;
+    let mut budget = config.plan_text_budget;
+    let mut kept = 0_usize;
+    for row in &mut rows {
+        let Some(text) = row.plan.as_mut() else {
+            continue;
+        };
+        let cap = usize::try_from(budget).unwrap_or(usize::MAX);
+        if cap == 0 {
+            row.plan = None;
+            continue;
+        }
+        truncate_to_boundary(text, cap);
+        budget = budget.saturating_sub(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        kept += 1;
+    }
+    eprintln!(
+        "pg_kronika-collector: pg_store_plans (ossc) read: {} rows, {} plan texts, \
+         {} budget bytes left, {:?} elapsed",
+        rows.len(),
+        kept,
+        budget,
+        started.elapsed()
+    );
+    Ok(rows)
+}
 
 /// Enumerate top-N plan rows, then fetch texts under the per-read budget.
 ///
@@ -1070,8 +1175,10 @@ async fn snapshot_and_seal(
     if let Some((version, rows)) = &statements {
         push_statements(&mut buffers, &mut interner, *version, rows)?;
     }
-    if let Some(rows) = &store_plans_rows {
-        push_store_plans(&mut buffers, &mut interner, rows)?;
+    match &store_plans_rows {
+        Some(PlansRead::Vadv(rows)) => push_store_plans(&mut buffers, &mut interner, rows)?,
+        Some(PlansRead::Ossc(rows)) => push_store_plans_ossc(&mut buffers, &mut interner, rows)?,
+        None => {}
     }
     if !lock_rows.is_empty() {
         push_locks(
@@ -1410,6 +1517,23 @@ fn push_store_plans(
     for row in rows {
         let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
         buffer_row(buffers, store_plans::to_vadv_v1(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
+/// Intern each ossc plan row's strings and buffer it as section `1_003_001`.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_store_plans_ossc(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[StorePlansOsscRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, store_plans::to_ossc_v1(row, &mut intern)?)?;
     }
     Ok(())
 }
