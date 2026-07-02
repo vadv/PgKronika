@@ -6,35 +6,25 @@
 //! dictionary proves which database connection produced the row.
 
 use anyhow::{Result, bail};
-use cucumber::{gherkin::Step, given, then};
+use cucumber::then;
 use kronika_reader::{Dictionary, Resolved};
 use kronika_registry::{Cell, Row};
 
 use crate::BddWorld;
 use crate::harness::assert_row::decode_section;
 use crate::harness::dump;
-use crate::harness::session::Session;
-use crate::steps::docstring;
-
-/// Create a second isolated database on the scenario's cluster and seed it
-/// with the docstring SQL, giving the pool more than one target to cover.
-#[given("an extra pool-target database seeded with:")]
-async fn extra_pool_target_database(world: &mut BddWorld, step: &Step) -> Result<()> {
-    let sql = docstring(step)?;
-    let dsn = world.harness.create_extra_database("pool_extra").await?;
-    let session = Session::open(&dsn, sql).await?;
-    session.close().await?;
-    Ok(())
-}
 
 /// Assert the section holds exactly one row whose `relname` and `datname`
 /// resolve through the segment dictionary to the given table and database.
+///
+/// The second database is `extra_databases[0]`, seeded by the shared
+/// `a second database seeded with:` step.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
 #[then(
-    regex = r#"^section ([\d_]+) has one row for table "([^"]+)" attributed to the (scenario|extra pool-target) database$"#
+    regex = r#"^section ([\d_]+) has one row for table "([^"]+)" attributed to the (scenario|second) database$"#
 )]
 fn section_row_attributed_to_database(
     world: &mut BddWorld,
@@ -45,7 +35,7 @@ fn section_row_attributed_to_database(
     let type_id = crate::steps::common::parse_type_id(&type_id)?;
     let datname = match which.as_str() {
         "scenario" => world.harness.database()?.to_owned(),
-        _ => world.harness.extra_database()?.to_owned(),
+        _ => world.harness.extra_database_name(0)?.to_owned(),
     };
     let segment = world.harness.segment()?.clone();
     let subprocess_logs = world.harness.failure_log()?;
