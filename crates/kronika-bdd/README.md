@@ -25,9 +25,9 @@ Scenario: every booted major reports a matching server_version_num
     """
 ```
 
-The metric features (activity, archiver, bgwriter/checkpointer, database, io,
-locks, prepared xacts, progress vacuum, statements, user tables and indexes,
-wal, replication instance, connection pool) share one step vocabulary:
+The metric features (activity, archiver, bgwriter/checkpointer, database, I/O,
+locks, prepared transactions, progress vacuum, statements, user tables and
+indexes, WAL, replication instance, connection pool) share one step vocabulary:
 
 - `Given a fresh database on PostgreSQL NN` — the isolated per-scenario
   database;
@@ -45,9 +45,9 @@ wal, replication instance, connection pool) share one step vocabulary:
   independent SQL read compared per kind: `exact`, `transformed`, `subset`,
   `floor` (lower bound), `ceiling` (upper bound);
 - `Given the window floor for section 1_XXX_YYY <column> is captured as:` with
-  `Then section 1_XXX_YYY <column> matches the window oracle up to:` — bracket
-  a monotonically advancing counter between two oracle reads around the
-  snapshot;
+  `Then section 1_XXX_YYY <column> is between the captured floor and:` — check
+  that a monotonically advancing counter lies between oracle reads taken before
+  and after the snapshot;
 - `Then section 1_XXX_YYY is absent from the segment` — the guard for
   layout-split metrics.
 
@@ -158,7 +158,7 @@ bdd:
   without PostgreSQL binary paths.
 - `postgres ... not ready`: the server failed to start or did not accept TCP
   connections within 30 seconds. The error includes `server.log`.
-- smoke mismatch: the cluster answered, but `server_version_num / 10000` is
+- Smoke mismatch: the cluster answered, but `server_version_num / 10000` is
   not the major the matrix declared.
 - assertion failures print the decoded section table, the oracle values, and
   both `server.log` and the collector's stderr; the message names the section

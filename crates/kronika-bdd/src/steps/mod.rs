@@ -5,9 +5,8 @@
 //! taking the collector snapshot. Metric-specific assertions live in a
 //! submodule per metric (e.g. [`archiver`]).
 //!
-//! The generic assertion and oracle steps that a converted feature reuses are
-//! defined in the feature submodule that first needs them, because cucumber
-//! registers a step phrase once; a shared phrase would be declared here.
+//! Shared assertion and oracle phrases live in [`common`] so cucumber registers
+//! each phrase once.
 
 pub(crate) mod archiver;
 pub(crate) mod common;
