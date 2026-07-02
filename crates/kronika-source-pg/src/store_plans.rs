@@ -258,7 +258,7 @@ fn row_from_pg(row: &tokio_postgres::Row) -> StorePlansRow {
 pub async fn fetch_plan_text(
     client: &Client,
     row: &StorePlansRow,
-    max_len: i64,
+    max_len: i32,
 ) -> Result<Option<String>, tokio_postgres::Error> {
     let out = client
         .query_one(

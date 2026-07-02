@@ -119,7 +119,7 @@ struct Config {
     /// Minimum interval between `pg_store_plans` reads.
     plans_interval: Duration,
     /// Per-plan text truncation, bytes.
-    max_plan_text: i64,
+    max_plan_text: i32,
     /// Total plan-text bytes fetched per read.
     plan_text_budget: u64,
     /// Minimum interval between connection-pool refreshes, seconds.
@@ -169,8 +169,8 @@ impl Config {
         let max_plans = i64::try_from(env_u64("KRONIKA_PG_MAX_PLANS", 500)?)
             .context("KRONIKA_PG_MAX_PLANS exceeds i64")?;
         let plans_interval = Duration::from_secs(env_u64("KRONIKA_PG_PLANS_INTERVAL_S", 300)?);
-        let max_plan_text = i64::try_from(env_u64("KRONIKA_PG_MAX_PLAN_TEXT", 32_768)?)
-            .context("KRONIKA_PG_MAX_PLAN_TEXT exceeds i64")?;
+        let max_plan_text = i32::try_from(env_u64("KRONIKA_PG_MAX_PLAN_TEXT", 32_768)?)
+            .context("KRONIKA_PG_MAX_PLAN_TEXT exceeds i32")?;
         let plan_text_budget = env_u64("KRONIKA_PG_PLAN_TEXT_BUDGET", 8 * 1024 * 1024)?;
         let pool_refresh_secs = env_u64("KRONIKA_PG_POOL_REFRESH_SECS", 600)?;
         let heavy_timeout_cap_ms = env_u64("KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS", 60_000)?;
