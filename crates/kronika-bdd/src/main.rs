@@ -30,7 +30,6 @@ use kronika_reader::{Dictionary, Resolved, Segment};
 use kronika_registry::{
     Bytes, MAX_SECTION_BYTES, Section, StrId, VerifiedSection,
     bgwriter_checkpointer::BgwriterCheckpointer,
-    pg_prepared_xacts::PgPreparedXacts,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
     pg_stat_progress_vacuum::PgStatProgressVacuum,
@@ -85,8 +84,6 @@ const PG_STAT_WAL_V2_TYPE_ID: u32 = 1_007_002;
 
 const PG_STAT_IO_V1_TYPE_ID: u32 = 1_009_001;
 const PG_STAT_IO_V2_TYPE_ID: u32 = 1_009_002;
-
-const PG_PREPARED_XACTS_TYPE_ID: u32 = 1_010_001;
 
 const PG_STAT_PROGRESS_VACUUM_TYPE_ID: u32 = 1_012_001;
 
@@ -1330,31 +1327,6 @@ async fn every_version_seals_wal(world: &mut BddWorld) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[then("each matrix cluster seals prepared pg_prepared_xacts rows")]
-async fn every_version_seals_prepared(world: &mut BddWorld) -> anyhow::Result<()> {
-    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in world.clusters {
-        let mut collector = collector::Collector::spawn(db).await?;
-        let idle_segment = collector.snapshot().await?;
-        assert_no_prepared_section(db.major(), &idle_segment)?;
-
-        let gid = prepared_gid(db.major());
-        prepare_transaction(db, &gid).await?;
-        let assertion = async {
-            let segment = collector.snapshot().await?;
-            assert_prepared_section(db.major(), &segment, "postgres")
-        }
-        .await;
-        let cleanup = rollback_prepared(db, &gid).await;
-        if let Err(err) = cleanup {
-            assertion?;
-            return Err(err);
-        }
-        assertion?;
-    }
-    Ok(())
-}
-
 #[then("every version handles pg_stat_io per its layout, resolving labels through the dictionary")]
 async fn every_version_handles_io(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
@@ -1433,116 +1405,6 @@ fn assert_wal_section(major: u32, path: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// A missing prepared-xacts section means there were no prepared transactions.
-fn assert_no_prepared_section(major: u32, path: &Path) -> anyhow::Result<()> {
-    let segment =
-        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
-    anyhow::ensure!(
-        !has_section(&segment, PG_PREPARED_XACTS_TYPE_ID),
-        "postgres {major}: idle cluster unexpectedly sealed section 1_010_001"
-    );
-    Ok(())
-}
-
-/// Decode `pg_prepared_xacts` and check the test transaction's aggregate row.
-fn assert_prepared_section(major: u32, path: &Path, want_datname: &str) -> anyhow::Result<()> {
-    let segment =
-        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
-    let catalog = segment.catalog();
-    let rows = decode_section_rows::<PgPreparedXacts>(path, &segment, PG_PREPARED_XACTS_TYPE_ID)
-        .with_context(|| format!("postgres {major}: read back section 1_010_001"))?;
-    anyhow::ensure!(
-        !rows.is_empty(),
-        "postgres {major}: pg_prepared_xacts section decoded to no rows"
-    );
-    let ts = rows[0].ts.0;
-    anyhow::ensure!(
-        rows.iter().all(|row| row.ts.0 == ts),
-        "postgres {major}: prepared-xacts rows carry differing ts"
-    );
-    ensure_ts_in_segment_range(
-        major,
-        "section 1_010_001",
-        ts,
-        catalog.min_ts,
-        catalog.max_ts,
-    )?;
-
-    let dict = segment
-        .dictionary()
-        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
-    let mut found = 0;
-    for row in &rows {
-        let datname = match dict.resolve(row.datname.0) {
-            Some(Resolved::String(bytes)) => bytes,
-            other => anyhow::bail!(
-                "postgres {major}: datname str_id {} did not resolve to a string: {other:?}",
-                row.datname.0
-            ),
-        };
-        if datname == want_datname.as_bytes() {
-            found += 1;
-            anyhow::ensure!(
-                row.prepared_count == 1,
-                "postgres {major}: prepared_count {}, expected 1",
-                row.prepared_count
-            );
-            anyhow::ensure!(
-                (0..300_000_000).contains(&row.max_age_us),
-                "postgres {major}: max_age_us {} is not sane for a fresh prepared transaction",
-                row.max_age_us
-            );
-            anyhow::ensure!(
-                row.max_xid_age_tx >= 0,
-                "postgres {major}: negative max_xid_age_tx {}",
-                row.max_xid_age_tx
-            );
-        }
-    }
-    anyhow::ensure!(
-        found == 1,
-        "postgres {major}: expected one prepared-xacts row for {want_datname}, got {found}"
-    );
-    Ok(())
-}
-
-async fn prepare_transaction(db: &cluster::Cluster, gid: &str) -> anyhow::Result<()> {
-    let conn = db.connect().await?;
-    let gid = prepared_gid_literal(gid)?;
-    conn.client()
-        .batch_execute(&format!(
-            "CREATE TABLE IF NOT EXISTS kronika_prepared_xacts_probe (id int); \
-             BEGIN; \
-             INSERT INTO kronika_prepared_xacts_probe VALUES ({}); \
-             PREPARE TRANSACTION {gid};",
-            db.major()
-        ))
-        .await
-        .with_context(|| format!("postgres {}: prepare transaction", db.major()))
-}
-
-async fn rollback_prepared(db: &cluster::Cluster, gid: &str) -> anyhow::Result<()> {
-    let conn = db.connect().await?;
-    let gid = prepared_gid_literal(gid)?;
-    conn.client()
-        .batch_execute(&format!("ROLLBACK PREPARED {gid};"))
-        .await
-        .with_context(|| format!("postgres {}: rollback prepared transaction", db.major()))
-}
-
-fn prepared_gid(major: u32) -> String {
-    format!("kronika_bdd_prepared_{major}_{}", std::process::id())
-}
-
-fn prepared_gid_literal(gid: &str) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        gid.bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
-        "prepared transaction gid contains unsafe characters"
-    );
-    Ok(format!("'{gid}'"))
 }
 
 fn has_section(segment: &Segment, type_id: u32) -> bool {

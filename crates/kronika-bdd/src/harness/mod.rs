@@ -54,6 +54,11 @@ pub(crate) struct HarnessState {
     segment: Option<PathBuf>,
     /// The collector's stderr from the most recent snapshot, for failure dumps.
     collector_log: Option<String>,
+    /// Prepared transactions that must be rolled back before the database is
+    /// dropped. A prepared transaction is not tied to a session, so
+    /// `ROLLBACK PREPARED` must run explicitly; otherwise `DROP DATABASE` fails
+    /// because the prepared xact still holds locks in the database.
+    pending_rollbacks: Vec<String>,
 }
 
 impl HarnessState {
@@ -159,6 +164,16 @@ impl HarnessState {
         Ok(self.session(name)?.backend_pid())
     }
 
+    /// Register a prepared transaction GID for cleanup.
+    ///
+    /// `ROLLBACK PREPARED` runs in [`cleanup`](Self::cleanup) before the
+    /// database is dropped. A prepared transaction is not tied to any session;
+    /// it persists until explicitly committed or rolled back, and it holds locks
+    /// that prevent `DROP DATABASE` from succeeding.
+    pub(crate) fn add_rollback_prepared(&mut self, gid: String) {
+        self.pending_rollbacks.push(gid);
+    }
+
     /// Roll back held transactions, abort blocking tasks, and drop the scenario
     /// database. Runs from the `after` hook, so it must not itself panic; every
     /// failure is logged and the rest of the teardown still runs.
@@ -166,6 +181,15 @@ impl HarnessState {
         for (name, session) in std::mem::take(&mut self.sessions) {
             if let Err(err) = session.close().await {
                 eprintln!("=== BDD cleanup: session {name:?}: {err:#} ===");
+            }
+        }
+        // Roll back prepared transactions before dropping the database; a
+        // prepared xact prevents DROP DATABASE from completing.
+        if let Some(cluster) = self.cluster {
+            for gid in std::mem::take(&mut self.pending_rollbacks) {
+                if let Err(err) = rollback_prepared(cluster, &gid).await {
+                    eprintln!("=== BDD cleanup: ROLLBACK PREPARED {gid:?}: {err:#} ===");
+                }
             }
         }
         if let (Some(cluster), Some(dbname)) = (self.cluster, self.database.take())
@@ -202,6 +226,24 @@ async fn create_database(cluster: &Cluster, dbname: &str) -> Result<()> {
         .batch_execute(&format!("CREATE DATABASE {dbname}"))
         .await
         .with_context(|| format!("create database {dbname}"))?;
+    Ok(())
+}
+
+/// Run `ROLLBACK PREPARED` for `gid` on `cluster`'s admin connection.
+///
+/// Called from cleanup to release a prepared transaction that is not tied to
+/// any session. The GID must contain only ASCII alphanumerics and underscores.
+async fn rollback_prepared(cluster: &Cluster, gid: &str) -> Result<()> {
+    anyhow::ensure!(
+        !gid.is_empty() && gid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+        "prepared transaction gid {gid:?} contains unsafe characters"
+    );
+    let admin = cluster.connect().await?;
+    admin
+        .client()
+        .batch_execute(&format!("ROLLBACK PREPARED '{gid}'"))
+        .await
+        .with_context(|| format!("ROLLBACK PREPARED {gid:?}"))?;
     Ok(())
 }
 
