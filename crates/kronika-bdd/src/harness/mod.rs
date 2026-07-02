@@ -230,8 +230,7 @@ impl HarnessState {
                 eprintln!("=== BDD cleanup: session {name:?}: {err:#} ===");
             }
         }
-<<<<<<< HEAD
-        // Roll back prepared transactions before dropping the database; a
+        // Roll back prepared transactions before dropping the databases; a
         // prepared xact prevents DROP DATABASE from completing.
         if let Some(cluster) = self.cluster {
             for gid in std::mem::take(&mut self.pending_rollbacks) {
@@ -240,11 +239,6 @@ impl HarnessState {
                 }
             }
         }
-        if let (Some(cluster), Some(dbname)) = (self.cluster, self.database.take())
-            && let Err(err) = drop_database(cluster, &dbname).await
-        {
-            eprintln!("=== BDD cleanup: drop database {dbname:?}: {err:#} ===");
-=======
         let scenario_dbs = [self.database.take(), self.extra_database.take()];
         for dbname in scenario_dbs.into_iter().flatten() {
             if let Some(cluster) = self.cluster
@@ -252,7 +246,6 @@ impl HarnessState {
             {
                 eprintln!("=== BDD cleanup: drop database {dbname:?}: {err:#} ===");
             }
->>>>>>> 3ee4369 (bdd: connection_pool — конвертация на стандарт (SQL + оракулы))
         }
         self.segment = None;
         self.collector_log = None;
