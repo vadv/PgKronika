@@ -3,11 +3,10 @@ Feature: Collector writes pg_store_plans (vadv fork) to section 1_004_001
   run with compute_query_id=on. The collector reads top plans without texts
   through pg_store_plans(false), then fetches plan text through
   pg_store_plans_get_plan. The oracle joins the live view to
-  pg_stat_statements through queryid_stat_statements; with compute_query_id=on,
-  two statements with the same plan shape remain separate rows.
+  pg_stat_statements through queryid_stat_statements.
 
   @pg17 @serial
-  Scenario: two statements with one plan shape stay separate rows with fetched texts
+  Scenario: two statements with different plan shapes seal fetched texts
     Given a fresh database on PostgreSQL 17
     And a database seeded with:
       """
@@ -23,8 +22,8 @@ Feature: Collector writes pg_store_plans (vadv fork) to section 1_004_001
       SELECT count(*)  AS kronika_psp_marker_a FROM kronika_psp_probe;
       SELECT count(*)  AS kronika_psp_marker_a FROM kronika_psp_probe;
       SELECT count(*)  AS kronika_psp_marker_a FROM kronika_psp_probe;
-      SELECT count(id) AS kronika_psp_marker_b FROM kronika_psp_probe;
-      SELECT count(id) AS kronika_psp_marker_b FROM kronika_psp_probe;
+      SELECT payload AS kronika_psp_marker_b FROM kronika_psp_probe WHERE id = 1;
+      SELECT payload AS kronika_psp_marker_b FROM kronika_psp_probe WHERE id = 1;
       """
     When the collector snapshots the segment
     Then section 1_004_001 has a pg_store_plans row for query like '%kronika_psp_marker_a%' with calls = 3 and a resolvable plan

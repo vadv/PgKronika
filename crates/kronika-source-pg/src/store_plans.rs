@@ -266,13 +266,7 @@ pub async fn fetch_plan_text(
                 "SELECT left(pg_store_plans_textplan(pg_store_plans_get_plan(\
                      $1::oid, $2::oid, $3, $4)), $5::int4) AS plan"
             ),
-            &[
-                &i64::from(row.userid),
-                &i64::from(row.dbid),
-                &row.queryid,
-                &row.planid,
-                &max_len,
-            ],
+            &[&row.userid, &row.dbid, &row.queryid, &row.planid, &max_len],
         )
         .await?;
     Ok(out.get("plan"))
