@@ -11,7 +11,7 @@ Feature: Collector seals the replication instance status singleton
   @pg17
   Scenario: a standalone primary seals one replication-instance row
     Given a fresh database on PostgreSQL 17
-    And the current WAL LSN is captured as the replication instance window floor:
+    And the window floor for section 1_015_001 current_wal_lsn is captured as:
       """
       SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::int8
       """
@@ -43,7 +43,7 @@ Feature: Collector seals the replication instance status singleton
       """
       SELECT (pg_control_checkpoint()).timeline_id::int4
       """
-    And section 1_015_001 current_wal_lsn matches the replication instance window oracle up to:
+    And section 1_015_001 current_wal_lsn matches the window oracle up to:
       """
       SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::int8
       """
