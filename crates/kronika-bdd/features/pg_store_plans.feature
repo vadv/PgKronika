@@ -1,11 +1,10 @@
-Feature: Collector seals pg_store_plans (vadv fork) into section 1_004_001
-  The image ships the vadv pg_store_plans on PostgreSQL 17 and 18 with
-  compute_query_id=on. The collector enumerates top plans without texts
-  through pg_store_plans(false), then fetches each plan text through
-  pg_store_plans_get_plan. A sealed row is matched here by joining the live
-  view to pg_stat_statements through queryid_stat_statements — the bridge the
-  fork maintains; with compute_query_id=on two different statements keep
-  separate rows even when their plans share a shape.
+Feature: Collector writes pg_store_plans (vadv fork) to section 1_004_001
+  The PostgreSQL 17 and 18 test images include the vadv pg_store_plans fork and
+  run with compute_query_id=on. The collector reads top plans without texts
+  through pg_store_plans(false), then fetches plan text through
+  pg_store_plans_get_plan. The oracle joins the live view to
+  pg_stat_statements through queryid_stat_statements; with compute_query_id=on,
+  two statements with the same plan shape remain separate rows.
 
   @pg17 @serial
   Scenario: two statements with one plan shape stay separate rows with fetched texts
@@ -33,7 +32,7 @@ Feature: Collector seals pg_store_plans (vadv fork) into section 1_004_001
     And section 1_003_001 is absent from the segment
 
   @pg18 @serial
-  Scenario: PG18 seals the same vadv layout
+  Scenario: PG18 writes the same vadv layout
     Given a fresh database on PostgreSQL 18
     And a database seeded with:
       """

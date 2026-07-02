@@ -7,12 +7,12 @@
 //! access paths, so they are separate type families (`1_004` vadv, `1_003`
 //! ossc), not one layout with optional columns.
 //!
-//! Key semantics of the vadv fork: the extension keys an entry by
-//! `(userid, dbid, uint32(core queryId), planid)`, and stores the full 64-bit
-//! `pg_stat_statements` query id separately as `queryid_stat_statements` — the
-//! join bridge to `1_002`. With `compute_query_id` off the key degenerates and
-//! plans of different statements merge by plan shape; the collector documents
-//! `compute_query_id = on` as an operating precondition.
+//! The vadv fork keys an entry by `(userid, dbid, uint32(core queryId),
+//! planid)` and stores the full 64-bit `pg_stat_statements` query id separately
+//! as `queryid_stat_statements`, the join bridge to `1_002`. With
+//! `compute_query_id` off, the key degenerates and plans of different
+//! statements merge by plan shape; deployments should run with
+//! `compute_query_id = on`.
 //!
 //! `queryid` and `planid` identify rows only within one instance, one server
 //! major, and one extension version; they are not portable identifiers.

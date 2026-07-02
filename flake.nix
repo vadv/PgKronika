@@ -9,9 +9,9 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
-    # vadv fork of pg_store_plans; pinned by rev because PG18 support landed
-    # after the last release tag. Bump: update the rev, `nix flake update
-    # pg-store-plans-vadv`.
+    # vadv fork of pg_store_plans. The rev is pinned because PostgreSQL 18
+    # support is newer than the last release tag; update it with
+    # `nix flake update pg-store-plans-vadv`.
     pg-store-plans-vadv = {
       url = "github:vadv/pg_store_plans/1ac02d9e8f84d012b8a2527a41ecd8f2d3ce4493";
       flake = false;
@@ -68,9 +68,8 @@
             '';
           };
 
-        # The vadv fork ships on PG17/18 in the image; PG15/16 stay bare until
-        # the ossc layout lands (both forks install the same file names, so one
-        # cluster carries one fork).
+        # The image includes the vadv fork on PG17/18. PG15/16 omit
+        # pg_store_plans because both forks install the same file names.
         postgresql_17_plans = pkgs.postgresql_17.withPackages (_: [
           (mkStorePlansVadv pkgs.postgresql_17)
         ]);

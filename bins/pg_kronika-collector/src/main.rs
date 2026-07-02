@@ -755,8 +755,8 @@ async fn collect_statements_cached(
 /// Cached `pg_store_plans` source and read pacing.
 ///
 /// Plans change slowly and reading their texts can be expensive, so reads run
-/// on their own interval instead of every snapshot; between reads the section
-/// is simply absent from the sealed segments.
+/// on their own interval. Segments sealed between reads do not include the
+/// section.
 #[derive(Debug, Default)]
 struct PlansSourceCache {
     selected: Option<CachedPlansSource>,
@@ -786,8 +786,8 @@ fn plans_reread_delay(rows_empty: bool, interval: Duration) -> Duration {
 /// The statistics are instance-wide, read from the one database where the
 /// extension is installed; discovery walks `pool.main()` first, then the
 /// covered per-db connections. Returns `None` between paced reads and when no
-/// vadv source exists. All awaits finish here so the caller can intern without
-/// holding the `!Send` `Interner` across an await.
+/// vadv 2.x source exists. All awaits finish here so the caller can intern
+/// without holding the `!Send` `Interner` across an await.
 async fn collect_store_plans_cached(
     pool: &ConnectionPool,
     config: &Config,
@@ -861,7 +861,7 @@ async fn collect_store_plans_cached(
             Ok(false) => {
                 eprintln!(
                     "pg_kronika-collector: pg_store_plans on {label} is not the vadv 2.x \
-                     signature; the ossc layout (section 1_003) is not collected yet"
+                     signature; section 1_003 is not collected"
                 );
                 continue;
             }
@@ -902,7 +902,8 @@ async fn collect_plans_with_texts(
     let mut budget = config.plan_text_budget;
     for row in &mut rows {
         if budget == 0 {
-            break; // the rest of the rows are written with a NULL plan
+            // Rows after the byte budget are sealed with NULL plan text.
+            break;
         }
         match fetch_plan_text(client, row, config.max_plan_text).await {
             Ok(Some(text)) => {

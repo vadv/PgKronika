@@ -5,10 +5,9 @@
 //! exist only in the database where `CREATE EXTENSION` ran, so the caller
 //! discovers that database across the pool and pins the connection.
 //!
-//! Collection is two-step, matching the fork's design for external collectors:
-//! step one enumerates top-N rows by `total_time` with `showtext := false`
-//! (no plan texts); step two fetches the text per selected row through
-//! `pg_store_plans_get_plan`, under the caller's per-cycle byte budget.
+//! Collection uses two SQL calls: enumerate top-N rows by `total_time` with
+//! `showtext := false`, then fetch text for selected rows through
+//! `pg_store_plans_get_plan` under the caller's per-cycle byte budget.
 //!
 //! `datname` and `usename` resolve through `LEFT JOIN`, so they are `None`
 //! for an oid with no catalog row. Collection returns owned rows; the caller
@@ -131,8 +130,8 @@ pub async fn store_plans_extversion(
 /// Whether the installed extension exposes the vadv 2.x function signature.
 ///
 /// The vadv fork declares `pg_store_plans(showtext boolean)`; the ossc
-/// upstream declares a zero-argument function. A `false` result routes the
-/// caller to the (future) ossc path instead of failing mid-collection.
+/// upstream declares a zero-argument function. A `false` result lets the caller
+/// skip this layout instead of failing mid-collection.
 ///
 /// # Errors
 /// Returns the [`tokio_postgres::Error`] if the probe query fails.
@@ -341,7 +340,7 @@ mod tests {
 
     #[allow(
         clippy::unnecessary_wraps,
-        reason = "must match the fallible interner signature to_vadv_v1 expects"
+        reason = "the mapper accepts a fallible interner"
     )]
     fn fake_intern(bytes: &[u8]) -> Result<StrId, Infallible> {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -401,7 +400,7 @@ mod tests {
         assert!(q.contains("s.queryid_stat_statements"), "{q}");
         assert!(
             !q.contains("s.plan,") && !q.contains("s.plan "),
-            "step one must not read plan texts: {q}"
+            "enumeration must not fetch plan texts: {q}"
         );
     }
 

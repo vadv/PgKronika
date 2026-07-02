@@ -1,10 +1,9 @@
-//! Steps for `features/pg_store_plans.feature` (type `1_004_001`, vadv fork).
+//! Step definitions for `features/pg_store_plans.feature`.
 //!
-//! Row selection is by `(queryid_stat_statements, planid)`, obtained from an
-//! independent oracle that joins `pg_store_plans(false)` to
-//! `pg_stat_statements` by a LIKE pattern on the statement text. The sealed
-//! plan text must resolve through the segment dictionary to a non-empty
-//! string — proving the two-step text fetch worked.
+//! The oracle identifies rows by `(queryid_stat_statements, planid)` after
+//! joining `pg_store_plans(false)` to `pg_stat_statements` with a LIKE pattern
+//! on statement text. The sealed `plan` value must resolve through the segment
+//! dictionary to a non-empty string.
 
 use anyhow::{Context, Result, bail};
 use cucumber::then;
@@ -15,7 +14,7 @@ use crate::harness::assert_row::decode_section;
 use crate::harness::dump;
 use crate::steps::common::parse_type_id;
 
-/// Open a dedicated connection to the scenario database for oracle queries.
+/// Use a separate scenario-database connection for live extension oracles.
 async fn oracle_client(world: &BddWorld) -> Result<tokio_postgres::Client> {
     let dsn = world.harness.database_dsn()?;
     let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
@@ -25,11 +24,10 @@ async fn oracle_client(world: &BddWorld) -> Result<tokio_postgres::Client> {
     Ok(client)
 }
 
-/// Look up `(queryid_stat_statements, planid, calls)` by a pgss LIKE pattern.
+/// Look up `(queryid_stat_statements, planid, calls)` by statement-text pattern.
 ///
-/// Scoped to the scenario database; exactly one plan row must match, so an
-/// ambiguous pattern (or a statement with several plans) fails instead of
-/// silently picking a row.
+/// The oracle expects exactly one live plan row in the scenario database.
+/// Ambiguous patterns fail instead of selecting an arbitrary plan.
 async fn plans_row_by_like(
     client: &tokio_postgres::Client,
     pattern: &str,
@@ -59,9 +57,8 @@ async fn plans_row_by_like(
     }
 }
 
-/// Assert the sealed section carries the plan row matched through
-/// `pg_stat_statements`, with the scenario's exact `calls` count and a plan
-/// text that resolves through the dictionary to a non-empty string.
+/// Assert the sealed section contains the oracle-matched row, exact `calls`,
+/// and a non-empty dictionary-backed plan text.
 #[then(
     regex = r"^section ([\d_]+) has a pg_store_plans row for query like '([^']+)' with calls = (\d+) and a resolvable plan$"
 )]

@@ -20,8 +20,8 @@ const INITDB_LOG: &str = "initdb.log";
 
 /// Majors whose image clusters carry the vadv `pg_store_plans` fork.
 ///
-/// Both forks install identically named files, so one cluster carries one
-/// fork; PG15/16 stay bare until the ossc layout lands.
+/// Both forks install identically named files, so PG15/16 do not include
+/// either fork.
 pub(crate) const STORE_PLANS_MAJORS: [u32; 2] = [17, 18];
 
 /// A `PostgreSQL` major version and the `bin` directory that provides its
@@ -287,9 +287,9 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
             "max_prepared_transactions=16",
         ]);
     if STORE_PLANS_MAJORS.contains(&bin.major) {
-        // The image ships the vadv pg_store_plans on these majors. The GUCs pin
-        // deterministic test behavior: record every plan (no threshold, no
-        // sampling) and keep the entry key meaningful (compute_query_id).
+        // These majors include the vadv pg_store_plans fork. The GUCs record
+        // every plan (no threshold, no sampling) and preserve query ids in the
+        // extension key.
         cmd.args([
             "-c",
             "shared_preload_libraries=pg_stat_statements,pg_store_plans",
