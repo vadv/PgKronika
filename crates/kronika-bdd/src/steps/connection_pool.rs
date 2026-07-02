@@ -34,14 +34,15 @@ async fn extra_pool_target_database(world: &mut BddWorld, step: &Step) -> Result
     reason = "cucumber step parameters must be owned String"
 )]
 #[then(
-    regex = r#"^section (\d+) has one row for table "([^"]+)" attributed to the (scenario|extra pool-target) database$"#
+    regex = r#"^section ([\d_]+) has one row for table "([^"]+)" attributed to the (scenario|extra pool-target) database$"#
 )]
 fn section_row_attributed_to_database(
     world: &mut BddWorld,
-    type_id: u32,
+    type_id: String,
     relname: String,
     which: String,
 ) -> Result<()> {
+    let type_id = crate::steps::common::parse_type_id(&type_id)?;
     let datname = match which.as_str() {
         "scenario" => world.harness.database()?.to_owned(),
         _ => world.harness.extra_database()?.to_owned(),
