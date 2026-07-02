@@ -87,6 +87,17 @@ async fn session_blocks(world: &mut BddWorld, name: String, step: &Step) -> Resu
 }
 
 /// Run the collector against the scenario cluster and record the sealed segment.
+/// Set one collector environment variable for this scenario's snapshot,
+/// e.g. a zero plan-text budget.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[given(regex = r#"^the collector runs with env "([^"]+)" = "([^"]*)"$"#)]
+fn collector_env(world: &mut BddWorld, key: String, value: String) {
+    world.harness.add_collector_env(key, value);
+}
+
 #[when("the collector snapshots the segment")]
 async fn snapshot_segment(world: &mut BddWorld) -> Result<()> {
     snapshot::take(&mut world.harness).await?;
@@ -118,5 +129,6 @@ mod progress_vacuum;
 mod replication_instance;
 mod smoke;
 mod statements;
+mod store_plans;
 mod user_tables;
 mod wal;

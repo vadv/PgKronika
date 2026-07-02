@@ -34,7 +34,8 @@ pub use codec::{
 pub use codec::{
     bgwriter_checkpointer, instance_metadata, pg_locks, pg_prepared_xacts, pg_stat_activity,
     pg_stat_archiver, pg_stat_database, pg_stat_io, pg_stat_progress_vacuum, pg_stat_statements,
-    pg_stat_user_indexes, pg_stat_user_tables, pg_stat_wal, replication_instance, reset_metadata,
+    pg_stat_user_indexes, pg_stat_user_tables, pg_stat_wal, pg_store_plans, replication_instance,
+    reset_metadata,
 };
 pub(crate) use codec::{check_row_cap, decode_batches, decode_section, encode_section};
 pub use contract::{
@@ -77,6 +78,8 @@ pub const fn registry() -> &'static [TypeContract] {
         pg_stat_statements::PgStatStatementsV4::CONTRACT,
         pg_stat_statements::PgStatStatementsV5::CONTRACT,
         pg_stat_statements::PgStatStatementsV6::CONTRACT,
+        pg_store_plans::PgStorePlansOsscV1::CONTRACT,
+        pg_store_plans::PgStorePlansVadvV1::CONTRACT,
         pg_stat_user_tables::PgStatUserTablesV1::CONTRACT,
         pg_stat_user_tables::PgStatUserTablesV2::CONTRACT,
         pg_stat_user_tables::PgStatUserTablesV3::CONTRACT,

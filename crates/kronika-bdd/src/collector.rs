@@ -34,13 +34,22 @@ pub(crate) struct Collector {
 }
 
 impl Collector {
-    pub(crate) async fn spawn(cluster: &Cluster) -> Result<Self> {
+    /// Spawn with scenario-specific environment overrides (e.g. a zero
+    /// plan-text budget), on top of the standard DSN/output variables.
+    pub(crate) async fn spawn_with_env(
+        cluster: &Cluster,
+        extra_env: &[(String, String)],
+    ) -> Result<Self> {
         let bin =
             std::env::var("KRONIKA_COLLECTOR_BIN").context("KRONIKA_COLLECTOR_BIN is not set")?;
         let out_dir = tempfile::tempdir().context("create the collector output directory")?;
-        let mut child = Command::new(&bin)
-            .env("KRONIKA_PG_DSN", cluster.conn_string())
-            .env("KRONIKA_OUT_DIR", out_dir.path())
+        let mut cmd = Command::new(&bin);
+        cmd.env("KRONIKA_PG_DSN", cluster.conn_string())
+            .env("KRONIKA_OUT_DIR", out_dir.path());
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
