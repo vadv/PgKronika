@@ -15,10 +15,14 @@
 //!   scaling) so the projected value matches the transformed section value. The
 //!   distinction from `exact` is the contract on the SQL, not the comparison.
 //! - `subset`: every value the query returns must appear in the section's column.
+//! - `window`: the recorded value of a monotonically advancing counter must lie
+//!   between two oracle reads that bracket the snapshot. The floor read happens
+//!   before the snapshot, so this kind is served by a captured-floor step pair
+//!   (see [`window_contains`]), not by the single-query oracle step.
 //!
-//! `top-n`, `window`, and `schema` are declared by the guide but not yet
-//! implemented; they return an error naming the kind so the first feature that
-//! needs one adds it, rather than silently degrading to a weaker check.
+//! `top-n` and `schema` are declared by the guide but not yet implemented; they
+//! return an error naming the kind so the first feature that needs one adds it,
+//! rather than silently degrading to a weaker check.
 
 use anyhow::{Context, Result, bail};
 use kronika_registry::{Cell, ColumnType, Row, TypeContract};
@@ -122,6 +126,14 @@ pub(crate) async fn assert_oracle(
         OracleKind::TopN => deferred_kind("top-n"),
         OracleKind::Schema => deferred_kind("schema"),
     }
+}
+
+/// Whether `value` lies in the closed window `[floor, ceiling]`.
+///
+/// The window-oracle check for a monotonically advancing counter: a sample
+/// recorded between two oracle reads must lie between them.
+pub(crate) const fn window_contains(floor: i64, value: i64, ceiling: i64) -> bool {
+    floor <= value && value <= ceiling
 }
 
 /// A declared-but-unimplemented oracle kind. Returns an error (not a panic) that
@@ -417,8 +429,33 @@ const fn into_cell(ty: ColumnType, n: i64) -> Cell {
 
 #[cfg(test)]
 mod tests {
-    use super::{OracleKind, cell_ge, column_cells, compare_window, deferred_kind, multiset_eq};
+    use super::{
+        OracleKind, cell_ge, column_cells, compare_window, deferred_kind, multiset_eq,
+        window_contains,
+    };
     use kronika_registry::{Cell, Row};
+
+    #[test]
+    fn window_contains_accepts_values_inside_and_at_the_bounds() {
+        assert!(window_contains(10, 15, 20));
+        assert!(window_contains(10, 10, 20), "the floor itself is inside");
+        assert!(window_contains(10, 20, 20), "the ceiling itself is inside");
+        assert!(
+            window_contains(10, 10, 10),
+            "a zero-width window holds its value"
+        );
+    }
+
+    #[test]
+    fn window_contains_rejects_values_outside_the_bounds() {
+        assert!(!window_contains(10, 9, 20), "below the floor");
+        assert!(!window_contains(10, 21, 20), "above the ceiling");
+        assert!(
+            !window_contains(10, 0, 20),
+            "zero is below a positive floor"
+        );
+        assert!(!window_contains(10, -1, 20), "negative offsets never pass");
+    }
 
     #[test]
     fn parses_known_kinds_and_rejects_unknown() {

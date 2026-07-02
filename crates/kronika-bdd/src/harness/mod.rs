@@ -63,6 +63,8 @@ pub(crate) struct HarnessState {
     /// `ROLLBACK PREPARED` must run explicitly; otherwise `DROP DATABASE` fails
     /// because the prepared xact still holds locks in the database.
     pending_rollbacks: Vec<String>,
+    /// Pre-snapshot oracle reads for window assertions, keyed by section column.
+    window_floors: BTreeMap<String, i64>,
 }
 
 impl HarnessState {
@@ -258,6 +260,20 @@ impl HarnessState {
         session.wait_for_vacuum_progress(&dsn).await
     }
 
+    /// Record a pre-snapshot oracle read as the window floor for `column`.
+    pub(crate) fn set_window_floor(&mut self, column: &str, value: i64) {
+        self.window_floors.insert(column.to_owned(), value);
+    }
+
+    /// The window floor captured for `column`, or an error naming the missing
+    /// capture step.
+    pub(crate) fn window_floor(&self, column: &str) -> Result<i64> {
+        self.window_floors
+            .get(column)
+            .copied()
+            .with_context(|| format!("no window floor captured for column {column:?}"))
+    }
+
     /// Roll back held transactions, abort blocking tasks, and drop the scenario
     /// database. Runs from the `after` hook, so it must not itself panic; every
     /// failure is logged and the rest of the teardown still runs.
@@ -289,6 +305,7 @@ impl HarnessState {
                 eprintln!("=== BDD cleanup: drop database {dbname:?}: {err:#} ===");
             }
         }
+        self.window_floors.clear();
         self.segment = None;
         self.collector_log = None;
     }
@@ -368,7 +385,7 @@ fn ensure_safe_ident(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_safe_ident, unique_database_name};
+    use super::{HarnessState, ensure_safe_ident, unique_database_name};
 
     #[test]
     fn unique_names_differ_across_calls() {
@@ -409,5 +426,16 @@ mod tests {
             state.extra_database_name(0).is_err(),
             "no extra databases returns an error"
         );
+    }
+
+    #[test]
+    fn window_floor_roundtrips_and_errors_when_missing() {
+        let mut state = HarnessState::default();
+        assert!(
+            state.window_floor("current_wal_lsn").is_err(),
+            "a floor that was never captured is an error"
+        );
+        state.set_window_floor("current_wal_lsn", 42);
+        assert_eq!(state.window_floor("current_wal_lsn").unwrap(), 42);
     }
 }
