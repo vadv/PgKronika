@@ -20,9 +20,12 @@ const INITDB_LOG: &str = "initdb.log";
 
 /// Majors whose image clusters carry the vadv `pg_store_plans` fork.
 ///
-/// Both forks install identically named files, so PG15/16 do not include
-/// either fork.
+/// Both forks install identically named files, so one cluster carries one
+/// fork; the ossc upstream lives on [`OSSC_STORE_PLANS_MAJORS`].
 pub(crate) const STORE_PLANS_MAJORS: [u32; 2] = [17, 18];
+
+/// Majors whose image clusters carry the ossc upstream `pg_store_plans`.
+pub(crate) const OSSC_STORE_PLANS_MAJORS: [u32; 2] = [15, 16];
 
 /// A `PostgreSQL` major version and the `bin` directory that provides its
 /// `initdb` and `postgres` (a Nix store path inside the image).
@@ -307,6 +310,21 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
             "pg_store_plans.store_last_plan=on",
             "-c",
             "pg_store_plans.track_planning=on",
+        ]);
+    } else if OSSC_STORE_PLANS_MAJORS.contains(&bin.major) {
+        // The upstream fork has no sampling or track_planning GUCs; setting
+        // them would fail startup, so this list stays minimal.
+        cmd.args([
+            "-c",
+            "shared_preload_libraries=pg_stat_statements,pg_store_plans",
+            "-c",
+            "compute_query_id=on",
+            "-c",
+            "track_io_timing=on",
+            "-c",
+            "pg_store_plans.min_duration=0",
+            "-c",
+            "pg_store_plans.track=all",
         ]);
     } else {
         // pg_stat_statements must be preloaded before it can be created.

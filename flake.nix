@@ -16,6 +16,11 @@
       url = "github:vadv/pg_store_plans/1ac02d9e8f84d012b8a2527a41ecd8f2d3ce4493";
       flake = false;
     };
+    # ossc upstream, tag 1.10 (PostgreSQL 18 support).
+    pg-store-plans-ossc = {
+      url = "github:ossc-db/pg_store_plans/e802804d4d2763ad3b32fc8fcf9f218c61cc475f";
+      flake = false;
+    };
   };
 
   outputs =
@@ -25,6 +30,7 @@
       rust-overlay,
       crane,
       pg-store-plans-vadv,
+      pg-store-plans-ossc,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -47,15 +53,16 @@
           postgresql_18 = pkgs.postgresql_18;
         };
 
-        # PGXS build of the vadv pg_store_plans fork against one major.
-        mkStorePlansVadv =
-          pg:
+        # PGXS build of a pg_store_plans fork against one major. Both forks
+        # install identically named files, so one cluster carries one fork.
+        mkStorePlans =
+          pg: forkName: forkVersion: forkSrc:
           pg.pkgs.callPackage (
             { postgresqlBuildExtension }:
             postgresqlBuildExtension {
-              pname = "pg_store_plans-vadv";
-              version = "2.1";
-              src = pg-store-plans-vadv;
+              pname = "pg_store_plans-${forkName}";
+              version = forkVersion;
+              src = forkSrc;
               makeFlags = [
                 "USE_PGXS=1"
                 "PG_CONFIG=${pg.pg_config}/bin/pg_config"
@@ -71,13 +78,19 @@
             }
           ) { };
 
-        # The image includes the vadv fork on PG17/18. PG15/16 omit
-        # pg_store_plans because both forks install the same file names.
+        # vadv on PG17/18, ossc upstream on PG15/16: both collector paths get
+        # live BDD coverage.
+        postgresql_15_plans = pkgs.postgresql_15.withPackages (_: [
+          (mkStorePlans pkgs.postgresql_15 "ossc" "1.10" pg-store-plans-ossc)
+        ]);
+        postgresql_16_plans = pkgs.postgresql_16.withPackages (_: [
+          (mkStorePlans pkgs.postgresql_16 "ossc" "1.10" pg-store-plans-ossc)
+        ]);
         postgresql_17_plans = pkgs.postgresql_17.withPackages (_: [
-          (mkStorePlansVadv pkgs.postgresql_17)
+          (mkStorePlans pkgs.postgresql_17 "vadv" "2.1" pg-store-plans-vadv)
         ]);
         postgresql_18_plans = pkgs.postgresql_18.withPackages (_: [
-          (mkStorePlansVadv pkgs.postgresql_18)
+          (mkStorePlans pkgs.postgresql_18 "vadv" "2.1" pg-store-plans-vadv)
         ]);
 
         commonArgs = {
@@ -115,8 +128,8 @@
           maxLayers = 120;
           contents = [
             bins
-            pkgs.postgresql_15
-            pkgs.postgresql_16
+            postgresql_15_plans
+            postgresql_16_plans
             postgresql_17_plans
             postgresql_18_plans
             pkgs.dockerTools.fakeNss
@@ -134,7 +147,7 @@
               "LANG=C"
               "KRONIKA_FEATURES=${features}"
               "KRONIKA_COLLECTOR_BIN=${bins}/bin/pg_kronika-collector"
-              "KRONIKA_PG_MATRIX=15=${pkgs.postgresql_15}/bin;16=${pkgs.postgresql_16}/bin;17=${postgresql_17_plans}/bin;18=${postgresql_18_plans}/bin"
+              "KRONIKA_PG_MATRIX=15=${postgresql_15_plans}/bin;16=${postgresql_16_plans}/bin;17=${postgresql_17_plans}/bin;18=${postgresql_18_plans}/bin"
             ];
           };
         };
