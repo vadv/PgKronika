@@ -5,7 +5,7 @@
 //! collisions.
 
 use anyhow::{Context, Result, bail};
-use cucumber::{gherkin::Step, given, then};
+use cucumber::{gherkin::Step, then};
 use kronika_reader::Resolved;
 use kronika_registry::Cell;
 
@@ -13,23 +13,10 @@ use crate::BddWorld;
 use crate::harness::assert_row::decode_section;
 use crate::harness::dump;
 use crate::harness::oracle::{OracleKind, assert_oracle};
-use crate::harness::session::Session;
 use crate::steps::docstring;
 
 const USER_TABLES_V3_TYPE_ID: u32 = 1_013_003;
 const USER_INDEXES_V2_TYPE_ID: u32 = 1_014_002;
-
-/// Seed a second isolated database with the step's docstring SQL.
-///
-/// The cluster must be selected by a prior `fresh database` step.
-#[given("a second database seeded with:")]
-async fn second_database_seeded(world: &mut BddWorld, step: &Step) -> Result<()> {
-    let sql = docstring(step)?;
-    let dsn = world.harness.add_database("db2").await?;
-    let session = Session::open(&dsn, sql).await?;
-    session.close().await?;
-    Ok(())
-}
 
 /// Assert a `pg_stat_user_tables` row for `relname` in the primary database.
 ///

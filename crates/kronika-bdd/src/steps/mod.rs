@@ -41,6 +41,20 @@ async fn seed_database(world: &mut BddWorld, step: &Step) -> Result<()> {
     Ok(())
 }
 
+/// Create a second isolated database on the scenario's cluster and seed it with
+/// the step's docstring SQL, on a throwaway session.
+///
+/// Per-database fan-out scenarios use this to give the pool more than one
+/// target. The database is `extra_databases[0]`, dropped in cleanup.
+#[given("a second database seeded with:")]
+async fn seed_second_database(world: &mut BddWorld, step: &Step) -> Result<()> {
+    let sql = docstring(step)?;
+    let dsn = world.harness.add_database("db2").await?;
+    let session = Session::open(&dsn, sql).await?;
+    session.close().await?;
+    Ok(())
+}
+
 /// Open a named session and run its docstring SQL to completion.
 #[given(regex = r#"^session "([^"]+)" runs:$"#)]
 async fn session_runs(world: &mut BddWorld, name: String, step: &Step) -> Result<()> {

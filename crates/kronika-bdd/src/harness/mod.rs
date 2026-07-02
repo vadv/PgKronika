@@ -49,9 +49,7 @@ pub(crate) struct HarnessState {
     cluster: Option<&'static Cluster>,
     /// The isolated database created for this scenario, if any.
     database: Option<String>,
-    /// A second isolated database for per-database fan-out scenarios, if any.
-    extra_database: Option<String>,
-    /// Extra isolated databases for scenarios that need more than one.
+    /// Extra isolated databases for per-database fan-out scenarios.
     extra_databases: Vec<String>,
     /// Named sessions opened by `session "X" runs ...` steps.
     sessions: BTreeMap<String, Session>,
@@ -157,36 +155,6 @@ impl HarnessState {
     pub(crate) fn database_dsn(&self) -> Result<String> {
         let cluster = self.cluster()?;
         Ok(cluster.conn_string_db(self.database()?))
-    }
-
-    /// Create a second uniquely named database on the scenario's cluster and
-    /// return its connection string.
-    ///
-    /// Serves per-database fan-out scenarios that need more than one pool
-    /// target; dropped by [`cleanup`](Self::cleanup) like the primary database.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no cluster is selected, an extra database already
-    /// exists, or creation fails.
-    pub(crate) async fn create_extra_database(&mut self, label: &str) -> Result<String> {
-        anyhow::ensure!(
-            self.extra_database.is_none(),
-            "the scenario already created an extra database"
-        );
-        let cluster = self.cluster()?;
-        let dbname = unique_database_name(label, cluster.major());
-        create_database(cluster, &dbname).await?;
-        let dsn = cluster.conn_string_db(&dbname);
-        self.extra_database = Some(dbname);
-        Ok(dsn)
-    }
-
-    /// The extra database's name, or an error if none was created.
-    pub(crate) fn extra_database(&self) -> Result<&str> {
-        self.extra_database
-            .as_deref()
-            .context("no extra database; run the extra pool-target database step first")
     }
 
     /// Insert an opened session under `name`, replacing any previous one.
@@ -319,13 +287,11 @@ impl HarnessState {
                 }
             }
         }
-        let scenario_dbs = [self.database.take(), self.extra_database.take()];
-        for dbname in scenario_dbs.into_iter().flatten() {
-            if let Some(cluster) = self.cluster
-                && let Err(err) = drop_database(cluster, &dbname).await
-            {
-                eprintln!("=== BDD cleanup: drop database {dbname:?}: {err:#} ===");
-            }
+        if let Some(dbname) = self.database.take()
+            && let Some(cluster) = self.cluster
+            && let Err(err) = drop_database(cluster, &dbname).await
+        {
+            eprintln!("=== BDD cleanup: drop database {dbname:?}: {err:#} ===");
         }
         self.window_floors.clear();
         self.segment = None;
