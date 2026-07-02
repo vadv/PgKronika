@@ -17,7 +17,7 @@ Feature: Collector reads pg_stat_io
       CHECKPOINT;
       """
     When the collector snapshots the segment
-    Then section 1_009_001 has a pg_stat_io row for (client backend, relation, normal):
+    Then section 1_009_001 has a row with backend_type = "client backend" and object = "relation" and context = "normal":
       | op_bytes | 8192 |
     And section 1_009_001 op_bytes matches the subset oracle:
       """
@@ -48,7 +48,7 @@ Feature: Collector reads pg_stat_io
       CHECKPOINT;
       """
     When the collector snapshots the segment
-    Then section 1_009_001 has a pg_stat_io row for (client backend, relation, normal):
+    Then section 1_009_001 has a row with backend_type = "client backend" and object = "relation" and context = "normal":
       | op_bytes | 8192 |
     And section 1_009_001 op_bytes matches the subset oracle:
       """
@@ -79,7 +79,7 @@ Feature: Collector reads pg_stat_io
       CHECKPOINT;
       """
     When the collector snapshots the segment
-    Then section 1_009_002 has a pg_stat_io row for (client backend, relation, normal):
+    Then section 1_009_002 has a row with backend_type = "client backend" and object = "relation" and context = "normal":
       | write_bytes | 0 |
     And section 1_009_002 backend_type matches the subset oracle:
       """

@@ -22,6 +22,9 @@ pub(crate) enum ExpectedValue {
     /// A `StrId` column: resolve the decoded id through the dictionary and
     /// compare the bytes to this string.
     Str(String),
+    /// A floor for a cumulative `i64` counter, written `>= N`. The decoded value
+    /// must be at least `N`; background activity may push it higher.
+    AtLeast(i64),
 }
 
 /// One expected column and its value, parsed from a table row.
@@ -76,6 +79,9 @@ fn parse_value(
     let raw = raw.trim();
     if raw.eq_ignore_ascii_case("null") {
         return Ok(ExpectedValue::Cell(Cell::Null));
+    }
+    if let Some(floor) = raw.strip_prefix(">=") {
+        return Ok(ExpectedValue::AtLeast(parse_int(floor.trim())?));
     }
     let value = match ty {
         ColumnType::ListI32 if raw == "[]" => ExpectedValue::Cell(Cell::ListI32(Vec::new())),
