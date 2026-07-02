@@ -56,6 +56,10 @@ use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_chec
 const PG17_MAJOR: u32 = 17;
 const PG18_MAJOR: u32 = 18;
 
+/// Each BDD scenario boots the full `PostgreSQL` matrix; one scenario at a time
+/// keeps CI from starting dozens of clusters at once.
+const MAX_CONCURRENT_SCENARIOS: usize = 1;
+
 const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
 
 const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
@@ -2218,6 +2222,7 @@ async fn main() {
     // CI shows the server-side cause (e.g. a rejected statement) instead of only
     // the opaque step panic. PostgreSQL logs errors regardless of DEBUG.
     BddWorld::cucumber()
+        .max_concurrent_scenarios(MAX_CONCURRENT_SCENARIOS)
         .after(|_feature, _rule, _scenario, ev, world| {
             Box::pin(async move {
                 if !matches!(
