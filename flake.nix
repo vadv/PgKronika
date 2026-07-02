@@ -54,11 +54,11 @@
             pname = "pg_store_plans-vadv";
             version = "2.1";
             src = pg-store-plans-vadv;
-            nativeBuildInputs = [ pg.dev ];
+            nativeBuildInputs = [ pg.pg_config ];
             buildInputs = [ pg ];
             makeFlags = [
               "USE_PGXS=1"
-              "PG_CONFIG=${pg.dev}/bin/pg_config"
+              "PG_CONFIG=${pg.pg_config}/bin/pg_config"
             ];
             installPhase = ''
               runHook preInstall
