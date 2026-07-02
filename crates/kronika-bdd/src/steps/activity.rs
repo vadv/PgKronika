@@ -1,1 +1,1 @@
-//! Steps for features/pg_stat_activity.feature.
+//! Steps for `features/pg_stat_activity.feature`.

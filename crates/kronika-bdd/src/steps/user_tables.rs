@@ -1,1 +1,1 @@
-//! Steps for features/user_tables.feature.
+//! Steps for `features/user_tables.feature`.

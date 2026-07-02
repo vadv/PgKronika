@@ -1,1 +1,1 @@
-//! Steps for features/smoke.feature.
+//! Steps for `features/smoke.feature`.

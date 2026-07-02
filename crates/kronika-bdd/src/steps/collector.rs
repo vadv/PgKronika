@@ -1,1 +1,1 @@
-//! Steps for features/collector.feature.
+//! Steps for `features/collector.feature`.
