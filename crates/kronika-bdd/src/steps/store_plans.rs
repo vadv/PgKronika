@@ -196,7 +196,7 @@ async fn ossc_row_by_like(
 /// Assert the sealed `1_003_001` section carries the oracle-matched row with
 /// the exact `calls` count and a dictionary-backed plan text.
 #[then(
-    regex = r"^section ([\d_]+) has an ossc pg_store_plans row for query like '([^']+)' with calls = (\d+) and a resolvable plan$"
+    regex = r"^section ([\d_]+) has an ossc pg_store_plans row for query like '([^']+)' with calls = (\d+) and a (resolvable|NULL) plan$"
 )]
 #[allow(
     clippy::needless_pass_by_value,
@@ -207,6 +207,7 @@ async fn ossc_row_with_plan(
     type_id: String,
     pattern: String,
     expected_calls: i64,
+    plan_expectation: String,
 ) -> Result<()> {
     let type_id = parse_type_id(&type_id)?;
     let client = oracle_client(world).await?;
@@ -268,6 +269,17 @@ async fn ossc_row_with_plan(
         ),
     }
 
+    if plan_expectation == "NULL" {
+        let plan_cell = row
+            .get("plan")
+            .with_context(|| format!("section {type_id}: row has no plan column"))?;
+        anyhow::ensure!(
+            plan_cell == &Cell::Null,
+            "section {type_id}: plan is {}, expected NULL under a zero text budget",
+            dump::render_cell(plan_cell)
+        );
+        return Ok(());
+    }
     assert_plan_resolves(type_id, row, &dict, &rows, &failure_log)
 }
 

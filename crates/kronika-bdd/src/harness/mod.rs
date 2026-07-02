@@ -66,6 +66,8 @@ pub(crate) struct HarnessState {
     pending_rollbacks: Vec<PreparedRollback>,
     /// Collector output directories retained until assertion steps finish.
     collector_output_dirs: Vec<TempDir>,
+    /// Scenario-specific environment for the spawned collector.
+    collector_env: Vec<(String, String)>,
     /// Pre-snapshot oracle reads for window assertions, keyed by section column.
     window_floors: BTreeMap<String, i64>,
 }
@@ -214,6 +216,16 @@ impl HarnessState {
     }
 
     /// Record the collector's stderr from the most recent snapshot.
+    /// Add one environment override for the collector this scenario spawns.
+    pub(crate) fn add_collector_env(&mut self, key: String, value: String) {
+        self.collector_env.push((key, value));
+    }
+
+    /// Scenario-specific collector environment overrides.
+    pub(crate) fn collector_env(&self) -> &[(String, String)] {
+        &self.collector_env
+    }
+
     pub(crate) fn set_collector_log(&mut self, log: String) {
         self.collector_log = Some(log);
     }
@@ -331,6 +343,7 @@ impl HarnessState {
         self.segment = None;
         self.collector_log = None;
         self.collector_output_dirs.clear();
+        self.collector_env.clear();
     }
 }
 

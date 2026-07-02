@@ -180,6 +180,7 @@ impl Config {
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
         validate_max_plans(max_plans)?;
+        validate_plan_text_limits(max_plan_text, plan_text_budget)?;
         Ok(Self {
             dsn,
             out_dir,
@@ -262,11 +263,6 @@ fn validate_heavy_cap(heavy_timeout_cap_ms: u64) -> Result<()> {
     Ok(())
 }
 
-/// Reject a lock-row cap that would overflow a single section.
-///
-/// # Errors
-/// Returns an error naming the env and the limit when the value exceeds
-/// [`MAX_SECTION_ROWS`].
 /// Reject a `pg_store_plans` top-N that could overflow a single section.
 ///
 /// The enumeration query materializes up to this many rows before the section
@@ -274,6 +270,26 @@ fn validate_heavy_cap(heavy_timeout_cap_ms: u64) -> Result<()> {
 ///
 /// # Errors
 /// Returns an error naming the env and the limit when out of range.
+/// Reject plan-text limits the segment dictionary cannot absorb.
+///
+/// The dictionary truncates one entry at 64 KiB and caps the whole window at
+/// 16 MiB (see [`activity_dict_limits`]); env values past those bounds would
+/// fail the snapshot during interning instead of at startup.
+///
+/// # Errors
+/// Returns an error naming the env and the bound when out of range.
+fn validate_plan_text_limits(max_plan_text: i32, plan_text_budget: u64) -> Result<()> {
+    anyhow::ensure!(
+        max_plan_text > 0 && max_plan_text <= 64 * 1024,
+        "KRONIKA_PG_MAX_PLAN_TEXT must be in 1..=65536, got {max_plan_text}"
+    );
+    anyhow::ensure!(
+        plan_text_budget <= 16 * 1024 * 1024,
+        "KRONIKA_PG_PLAN_TEXT_BUDGET must not exceed 16777216, got {plan_text_budget}"
+    );
+    Ok(())
+}
+
 fn validate_max_plans(max_plans: i64) -> Result<()> {
     let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
     anyhow::ensure!(
@@ -283,6 +299,11 @@ fn validate_max_plans(max_plans: i64) -> Result<()> {
     Ok(())
 }
 
+/// Reject a lock-row cap that would overflow a single section.
+///
+/// # Errors
+/// Returns an error naming the env and the limit when the value exceeds
+/// [`MAX_SECTION_ROWS`].
 fn validate_max_lock_rows(max_lock_rows: i64) -> Result<()> {
     let cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
     anyhow::ensure!(
@@ -946,6 +967,17 @@ async fn collect_store_plans_cached(
                 continue;
             }
         };
+        let supported = match fork {
+            PlansFork::Vadv => extversion.starts_with("2."),
+            PlansFork::Ossc => extversion.starts_with("1."),
+        };
+        if !supported {
+            eprintln!(
+                "pg_kronika-collector: pg_store_plans extversion {extversion} on {label} does \
+                 not match the {fork:?} layout; skipping"
+            );
+            continue;
+        }
         match collect_plans_for_fork(candidate.client, config, fork).await {
             Ok(read) => {
                 cache.selected = Some(CachedPlansSource {
@@ -1974,6 +2006,24 @@ mod tests {
         let mut zero = "план".to_owned();
         super::truncate_to_boundary(&mut zero, 0);
         assert_eq!(zero, "", "a zero cap empties the text");
+    }
+
+    #[test]
+    fn plan_text_limits_guard_matches_dictionary_bounds() {
+        assert!(super::validate_plan_text_limits(32_768, 8 * 1024 * 1024).is_ok());
+        assert!(super::validate_plan_text_limits(64 * 1024, 0).is_ok());
+        assert!(
+            super::validate_plan_text_limits(0, 1).is_err(),
+            "a zero per-text cap is rejected"
+        );
+        assert!(
+            super::validate_plan_text_limits(64 * 1024 + 1, 1).is_err(),
+            "a per-text cap past the 64 KiB dictionary truncation is rejected"
+        );
+        assert!(
+            super::validate_plan_text_limits(1, 16 * 1024 * 1024 + 1).is_err(),
+            "a budget past the 16 MiB dictionary cap is rejected"
+        );
     }
 
     #[test]

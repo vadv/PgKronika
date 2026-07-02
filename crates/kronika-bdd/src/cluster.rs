@@ -291,8 +291,8 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
         ]);
     if STORE_PLANS_MAJORS.contains(&bin.major) {
         // These majors include the vadv pg_store_plans fork. The GUCs record
-        // every plan (no threshold, no sampling) and preserve query ids in the
-        // extension key.
+        // every plan (no threshold, no sampling); compute_query_id keeps the
+        // pg_stat_statements bridge column populated.
         cmd.args([
             "-c",
             "shared_preload_libraries=pg_stat_statements,pg_store_plans",
