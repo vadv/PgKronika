@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ListArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 
 use crate::codec::{CodecError, decode_batches};
@@ -21,9 +21,8 @@ use crate::{VerifiedSection, registry};
 ///
 /// The variants mirror [`ColumnType`]: every on-disk column type has one cell
 /// kind. `Ts` carries unix microseconds; `StrId` carries the raw dictionary id
-/// (not the resolved bytes). `Null` is a `NULL` cell in a nullable column.
-/// `ListI32` has no column type in the current registry; it is reserved for a
-/// future list column so the harness does not need a breaking change to gain it.
+/// (not the resolved bytes). `ListI32` carries list columns such as
+/// `pg_locks.blocked_by`. `Null` is a `NULL` cell in a nullable column.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
     /// Signed 16-bit integer (also carries `I8`).
@@ -44,7 +43,7 @@ pub enum Cell {
     Ts(i64),
     /// A dictionary id; resolve through the segment dictionary for the string.
     StrId(u64),
-    /// A list of signed 32-bit integers (reserved; no current column uses it).
+    /// A list of signed 32-bit integers.
     ListI32(Vec<i32>),
     /// A `NULL` in a nullable column.
     Null,
@@ -126,8 +125,27 @@ fn cell_at(
         ColumnType::Bool => Cell::Bool(typed::<BooleanArray>(array, name)?.value(i)),
         ColumnType::Ts => Cell::Ts(typed::<Int64Array>(array, name)?.value(i)),
         ColumnType::StrId => Cell::StrId(typed::<UInt64Array>(array, name)?.value(i)),
+        ColumnType::ListI32 => Cell::ListI32(list_i32_at(array, name, i)?),
     };
     Ok(cell)
+}
+
+/// Read one `List<Int32>` row into an owned vector.
+fn list_i32_at(array: &dyn Array, name: &'static str, i: usize) -> Result<Vec<i32>, CodecError> {
+    let lists = typed::<ListArray>(array, name)?;
+    let values = lists.value(i);
+    let ints = values
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or(CodecError::ColumnType { name })?;
+    let mut out = Vec::with_capacity(ints.len());
+    for j in 0..ints.len() {
+        if ints.is_null(j) {
+            return Err(CodecError::NullInRequiredColumn { name });
+        }
+        out.push(ints.value(j));
+    }
+    Ok(out)
 }
 
 /// Downcast `array` to the concrete Arrow array the column type maps to.
@@ -297,6 +315,27 @@ mod tests {
             )
             .unwrap(),
             Cell::I64(9)
+        );
+    }
+
+    #[test]
+    fn cell_at_maps_list_i32_to_a_list_cell() {
+        use super::cell_at;
+        use crate::ColumnType;
+        use arrow_array::ListArray;
+        use arrow_array::types::Int32Type;
+
+        let array = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![]),
+        ]);
+        assert_eq!(
+            cell_at(&array, ColumnType::ListI32, "c", 0).unwrap(),
+            Cell::ListI32(vec![1, 2])
+        );
+        assert_eq!(
+            cell_at(&array, ColumnType::ListI32, "c", 1).unwrap(),
+            Cell::ListI32(Vec::new())
         );
     }
 

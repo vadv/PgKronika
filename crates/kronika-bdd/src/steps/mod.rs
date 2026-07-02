@@ -3,8 +3,7 @@
 //! This module holds the generic transport steps used by converted features:
 //! selecting a cluster and isolated database, opening named sessions, and
 //! taking the collector snapshot. Metric-specific assertions live in a
-//! submodule per metric (e.g. [`archiver`]). Steps not yet converted stay in
-//! `main.rs` until they move here.
+//! submodule per metric (e.g. [`archiver`]).
 //!
 //! The generic assertion and oracle steps that a converted feature reuses are
 //! defined in the feature submodule that first needs them, because cucumber

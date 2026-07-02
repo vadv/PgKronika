@@ -414,6 +414,9 @@ fn cell_from_pg(row: &tokio_postgres::Row, ty: ColumnType) -> Result<Cell> {
             "a StrId column cannot be compared to a raw oracle value; \
              resolve the string in the oracle SQL and compare a text column instead"
         ),
+        ColumnType::ListI32 => row
+            .try_get::<_, Option<Vec<i32>>>(0)
+            .map(|v| v.map_or(Cell::Null, Cell::ListI32))?,
     };
     Ok(cell)
 }

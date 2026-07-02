@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use cucumber::{gherkin::Step, then};
+use kronika_reader::Segment;
 use kronika_registry::{Cell, ColumnType, TypeContract, registry};
 
 use crate::BddWorld;
@@ -159,6 +160,31 @@ async fn section_oracle(
     result
 }
 
+/// Assert that a section id is absent from the sealed segment catalog.
+///
+/// Layout-split metrics use this to prove the collector did not also write a
+/// row under the wrong versioned `type_id`.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\d_]+) is absent from the segment$")]
+fn section_absent(world: &mut BddWorld, type_id: String) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let path = world.harness.segment()?;
+    let segment = Segment::open(path).context("open sealed segment")?;
+    let present = segment
+        .catalog()
+        .entries
+        .iter()
+        .any(|entry| entry.type_id == type_id);
+    anyhow::ensure!(
+        !present,
+        "section {type_id} is present in the segment but must be absent for this layout"
+    );
+    Ok(())
+}
+
 /// Parse a section id as written in features (`1_008_001` or `1008001`).
 pub(crate) fn parse_type_id(raw: &str) -> Result<u32> {
     raw.replace('_', "")
@@ -263,6 +289,9 @@ pub(crate) fn parse_key_cell(contract: &TypeContract, column: &str, raw: &str) -
         ),
         ColumnType::StrId => {
             bail!("key column {column:?} is a StrId; use the string form in the step phrase")
+        }
+        ColumnType::ListI32 => {
+            bail!("key column {column:?} is a ListI32; only [] is supported in key phrases")
         }
     };
     Ok(cell)

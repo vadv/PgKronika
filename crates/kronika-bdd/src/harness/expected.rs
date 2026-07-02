@@ -5,7 +5,8 @@
 //! interpreted against the column's [`ColumnType`]: an integer literal for a
 //! numeric column, `true`/`false` for a boolean, a bare string for a `StrId`
 //! label (compared after dictionary resolution), `null` for a `NULL` cell, and
-//! the `[Name]` placeholder for a session's backend pid.
+//! `[Name]` placeholders for session backend pids. `ListI32` columns accept
+//! `[]` and `[Name]`, which covers lock wait edges.
 //!
 //! Parsing is pure — it takes the raw strings and a placeholder resolver — so it
 //! is unit-tested without a database.
@@ -76,11 +77,17 @@ fn parse_value(
     if raw.eq_ignore_ascii_case("null") {
         return Ok(ExpectedValue::Cell(Cell::Null));
     }
-    if let Some(name) = placeholder(raw) {
-        let pid = resolve_pid(name)?;
-        return Ok(ExpectedValue::Cell(pid_cell(ty, pid)?));
-    }
     let value = match ty {
+        ColumnType::ListI32 if raw == "[]" => ExpectedValue::Cell(Cell::ListI32(Vec::new())),
+        ColumnType::ListI32 => {
+            let Some(name) = placeholder(raw) else {
+                bail!("a ListI32 expectation must be [] or a [Name] pid placeholder");
+            };
+            ExpectedValue::Cell(Cell::ListI32(vec![resolve_pid(name)?]))
+        }
+        _ if let Some(name) = placeholder(raw) => {
+            ExpectedValue::Cell(pid_cell(ty, resolve_pid(name)?)?)
+        }
         ColumnType::I8 | ColumnType::I16 => ExpectedValue::Cell(Cell::I16(parse_int(raw)?)),
         ColumnType::I32 => ExpectedValue::Cell(Cell::I32(parse_int(raw)?)),
         ColumnType::I64 => ExpectedValue::Cell(Cell::I64(parse_int(raw)?)),
@@ -188,6 +195,11 @@ mod tests {
             ExpectedValue::Cell(Cell::Null),
             "null is a NULL cell regardless of column type"
         );
+        assert_eq!(
+            parse_value(ColumnType::ListI32, "[]", &mut resolve).unwrap(),
+            ExpectedValue::Cell(Cell::ListI32(Vec::new())),
+            "an empty list literal compares to an empty ListI32 cell"
+        );
     }
 
     #[test]
@@ -199,6 +211,11 @@ mod tests {
         assert_eq!(
             parse_value(ColumnType::I32, "[W]", &mut resolve).unwrap(),
             ExpectedValue::Cell(Cell::I32(4242))
+        );
+        assert_eq!(
+            parse_value(ColumnType::ListI32, "[W]", &mut resolve).unwrap(),
+            ExpectedValue::Cell(Cell::ListI32(vec![4242])),
+            "a ListI32 placeholder becomes a one-element pid list"
         );
     }
 

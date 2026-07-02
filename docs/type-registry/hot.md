@@ -91,7 +91,7 @@ cgroup memory events.
 | `10_012_001` | disk latency | `0` | `read`, `write` | `ms` | `0` | `derived` | `1_108_001` |
 | `10_013_001` | network | `0` | `rx`, `tx` | `B/s` | `1` | `rate` | `1_109_001` |
 | `10_014_001` | TCP retransmit | `0` | `retrans`, `syn_retrans` | `seg/s` | `1` | `rate` | `1_110_001` + `1_111_001` |
-| `10_015_001` | locks waiting | `0` | `waiting_backends` | `n` | `0` | `gauge` | `1_011_001` |
+| `10_015_001` | locks waiting | `0` | `waiting_backends` | `n` | `0` | `gauge` | `1_011_001`, `1_011_002` |
 | `10_016_001` | autovacuum | `0` | `running` | `n` | `0` | `gauge` | `1_012_001` |
 | `10_017_001` | replication lag | standby: `0`; primary: `application_name/client_addr` | `replay_lag` | `s` | `0` | `gauge` | `1_015_001` + `1_016_001` |
 | `10_018_001` | wraparound headroom | `0` | `max_age` | `xid` | `0` | `gauge` | `1_018_001` |
