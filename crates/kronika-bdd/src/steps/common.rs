@@ -1,8 +1,8 @@
-//! Generic assertion and oracle steps shared by every converted feature.
+//! Generic assertion and oracle steps used by converted features.
 //!
 //! Cucumber registers each step phrase once; these phrases are reused across
-//! all per-feature submodules. Feature-specific glue lives in the matching
-//! submodule (e.g. [`archiver`]).
+//! metric modules. Metric-specific steps live in the matching submodule
+//! (e.g. [`archiver`]).
 
 use anyhow::{Context, Result};
 use cucumber::{gherkin::Step, then};

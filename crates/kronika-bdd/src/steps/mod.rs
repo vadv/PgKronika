@@ -1,10 +1,10 @@
 //! Step definitions in the guide's style, split per feature.
 //!
-//! This module holds the generic transport steps shared by every converted
-//! feature: selecting a cluster and isolated database, opening named sessions,
-//! and taking the collector snapshot. Feature-specific assertions live in a
+//! This module holds the generic transport steps used by converted features:
+//! selecting a cluster and isolated database, opening named sessions, and
+//! taking the collector snapshot. Metric-specific assertions live in a
 //! submodule per metric (e.g. [`archiver`]). Steps not yet converted stay in
-//! `main.rs` until their per-feature PR moves them here.
+//! `main.rs` until they move here.
 //!
 //! The generic assertion and oracle steps that a converted feature reuses are
 //! defined in the feature submodule that first needs them, because cucumber

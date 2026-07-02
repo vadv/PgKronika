@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn extra_database_name_returns_error_when_empty() {
-        let state = super::HarnessState::default();
+        let state = HarnessState::default();
         assert!(
             state.extra_database_name(0).is_err(),
             "no extra databases returns an error"

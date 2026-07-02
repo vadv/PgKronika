@@ -158,8 +158,6 @@ async fn user_indexes_idx_scan_oracle_second(
     run_section_oracle(world, USER_INDEXES_V2_TYPE_ID, "idx_scan", sql, true).await
 }
 
-// ─── helpers ────────────────────────────────────────────────────────────────
-
 /// Find and check a `pg_stat_user_tables` row matching (datname, relname).
 fn assert_user_tables_row(
     world: &mut BddWorld,

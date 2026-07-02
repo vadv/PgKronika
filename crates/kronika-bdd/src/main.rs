@@ -26,7 +26,7 @@ use anyhow::Context;
 use cucumber::{World, event, given, then};
 use harness::HarnessState;
 use kronika_format::{Entry, crc32c};
-use kronika_reader::{Dictionary, Resolved, Segment};
+use kronika_reader::Segment;
 use kronika_registry::{
     Bytes, MAX_SECTION_BYTES, Section, VerifiedSection,
     bgwriter_checkpointer::BgwriterCheckpointer,
@@ -46,9 +46,8 @@ const PG_STAT_WAL_V2_TYPE_ID: u32 = 1_007_002;
 /// Cucumber state for one scenario.
 ///
 /// `clusters` borrows the process-wide matrix (booted once, not per scenario).
-/// `harness` holds the new-style per-scenario state — named sessions, the
-/// selected database, and the last snapshot — and is torn down in the `after`
-/// hook.
+/// `harness` holds per-scenario state: named sessions, the selected database,
+/// and the last snapshot. The `after` hook tears it down.
 #[derive(Debug, Default, World)]
 struct BddWorld {
     clusters: &'static [cluster::Cluster],
@@ -251,9 +250,17 @@ fn decode_section_rows<T: Section>(
 ///
 /// Query text that exceeds the blob threshold is classified as `Resolved::Blob`
 /// rather than `Resolved::String`. Both variants carry the stored bytes.
-fn resolve_string(major: u32, dict: &Dictionary, label: &str, id: u64) -> anyhow::Result<Vec<u8>> {
+#[cfg(test)]
+fn resolve_string(
+    major: u32,
+    dict: &kronika_reader::Dictionary,
+    label: &str,
+    id: u64,
+) -> anyhow::Result<Vec<u8>> {
     match dict.resolve(id) {
-        Some(Resolved::String(bytes) | Resolved::Blob { bytes, .. }) => Ok(bytes.to_vec()),
+        Some(
+            kronika_reader::Resolved::String(bytes) | kronika_reader::Resolved::Blob { bytes, .. },
+        ) => Ok(bytes.to_vec()),
         other => anyhow::bail!(
             "postgres {major}: {label} str_id {id} did not resolve to a string: {other:?}"
         ),

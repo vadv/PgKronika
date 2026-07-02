@@ -1,6 +1,5 @@
-# Infra smoke test; the collector itself is exercised in collector.feature.
 Feature: PostgreSQL matrix smoke
-  Every Nix-provided PostgreSQL version boots and answers a version query.
+  Every configured PostgreSQL version boots and answers a version query.
   The version number reported by the server must match the major the matrix booted.
 
   @matrix

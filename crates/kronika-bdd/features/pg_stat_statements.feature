@@ -1,11 +1,10 @@
 Feature: Collector seals pg_stat_statements rows with dictionary-backed query text
   pg_stat_statements is instance-wide and shared by every scenario on the
-  boot-once matrix, so this scenario resets the view first and then never
-  asserts exact row counts: foreign rows (other databases' DDL, harness
-  activity between the reset and the snapshot) are expected. Every Then
-  selects its row by queryid, obtained from an independent oracle query
-  (pg_stat_statements WHERE query LIKE ...), and compares calls and rows
-  between the sealed section and the oracle - a by-key subset check.
+  boot-once matrix, so this scenario resets the view first and avoids exact row
+  counts: rows from other databases and setup activity between reset and
+  snapshot are expected. Each assertion selects its row by queryid, obtained
+  from an independent oracle query (pg_stat_statements WHERE query LIKE ...),
+  then compares calls and rows as a by-key subset check.
 
   The extension normalizes constants to $n but keeps identifiers, aliases
   and comments, so the seed statements carry distinctive aliases and the
