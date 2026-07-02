@@ -108,8 +108,10 @@ pub(crate) async fn assert_oracle(
         OracleKind::Subset => {
             compare_subset(type_id, column, &expected, &actual, &rows, subprocess_logs)
         }
+        OracleKind::Window => {
+            compare_window(type_id, column, &expected, &actual, &rows, subprocess_logs)
+        }
         OracleKind::TopN => deferred_kind("top-n"),
-        OracleKind::Window => deferred_kind("window"),
         OracleKind::Schema => deferred_kind("schema"),
     }
 }
@@ -193,6 +195,65 @@ fn compare_subset(
             ],
         )
     )
+}
+
+/// Each oracle floor value must be met by at least one section value (`actual >= floor`).
+///
+/// Window/tolerance oracle for cumulative counters: the oracle SQL returns a
+/// known minimum (e.g. the row count inserted during setup). Passing means the
+/// section captured data at or above that level; it does not require an exact
+/// match because background activity can increment counters between setup and
+/// the snapshot.
+fn compare_window(
+    type_id: u32,
+    column: &str,
+    oracle: &[Cell],
+    section: &[Cell],
+    rows: &[Row],
+    subprocess_logs: &str,
+) -> Result<()> {
+    if oracle.is_empty() {
+        bail!("window oracle for section {type_id} {column}: oracle returned no rows");
+    }
+    let mut unsatisfied: Vec<Cell> = Vec::new();
+    for floor in oracle {
+        if !section.iter().any(|v| cell_ge(v, floor)) {
+            unsatisfied.push(floor.clone());
+        }
+    }
+    if unsatisfied.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{}",
+        dump::section_dump(
+            &format!(
+                "section {type_id} {column}: window oracle floor(s) not met by any section value"
+            ),
+            rows,
+            subprocess_logs,
+            &[
+                ("floors not met", render_cells(&unsatisfied)),
+                ("section values", render_cells(section)),
+            ],
+        )
+    )
+}
+
+/// Whether `actual >= floor` for numeric cells of matching kinds.
+///
+/// Returns `false` for mismatched kinds or non-numeric cells; the oracle SQL
+/// must project the same type as the section column.
+fn cell_ge(actual: &Cell, floor: &Cell) -> bool {
+    match (actual, floor) {
+        (Cell::I16(a), Cell::I16(b)) => a >= b,
+        (Cell::I32(a), Cell::I32(b)) => a >= b,
+        (Cell::I64(a), Cell::I64(b)) => a >= b,
+        (Cell::U32(a), Cell::U32(b)) => a >= b,
+        (Cell::U64(a), Cell::U64(b)) => a >= b,
+        (Cell::F64(a), Cell::F64(b)) => a >= b,
+        _ => false,
+    }
 }
 
 /// Multiset equality: same elements with the same multiplicity, any order.
@@ -287,7 +348,7 @@ const fn into_cell(ty: ColumnType, n: i64) -> Cell {
 
 #[cfg(test)]
 mod tests {
-    use super::{OracleKind, column_cells, deferred_kind, multiset_eq};
+    use super::{OracleKind, cell_ge, column_cells, compare_window, deferred_kind, multiset_eq};
     use kronika_registry::{Cell, Row};
 
     #[test]
@@ -329,5 +390,58 @@ mod tests {
             Row::from([("other", Cell::I64(99))]),
         ];
         assert_eq!(column_cells(&rows, "v"), vec![Cell::I64(10), Cell::I64(20)]);
+    }
+
+    #[test]
+    fn cell_ge_returns_true_when_actual_meets_or_exceeds_floor() {
+        assert!(
+            cell_ge(&Cell::I64(10), &Cell::I64(10)),
+            "equal satisfies >="
+        );
+        assert!(
+            cell_ge(&Cell::I64(11), &Cell::I64(10)),
+            "greater satisfies >="
+        );
+        assert!(
+            !cell_ge(&Cell::I64(9), &Cell::I64(10)),
+            "less does not satisfy >="
+        );
+        assert!(cell_ge(&Cell::U32(5), &Cell::U32(3)));
+        assert!(cell_ge(&Cell::F64(1.1), &Cell::F64(1.0)));
+        assert!(
+            !cell_ge(&Cell::I64(10), &Cell::I32(5)),
+            "mismatched kinds never satisfy >="
+        );
+    }
+
+    #[test]
+    fn compare_window_passes_when_any_section_value_meets_each_floor() {
+        // Section has two rows; oracle floor is 10; value 15 satisfies it.
+        let section = vec![Cell::I64(5), Cell::I64(15)];
+        let oracle = vec![Cell::I64(10)];
+        assert!(
+            compare_window(1, "col", &oracle, &section, &[], "").is_ok(),
+            "at least one value >= floor passes"
+        );
+    }
+
+    #[test]
+    fn compare_window_fails_when_no_section_value_meets_a_floor() {
+        let section = vec![Cell::I64(3), Cell::I64(7)];
+        let oracle = vec![Cell::I64(10)];
+        assert!(
+            compare_window(1, "col", &oracle, &section, &[], "").is_err(),
+            "no value >= 10 in [3, 7] must fail"
+        );
+    }
+
+    #[test]
+    fn compare_window_errors_on_empty_oracle() {
+        let err = compare_window(1, "col", &[], &[Cell::I64(5)], &[], "")
+            .expect_err("empty oracle is an error");
+        assert!(
+            err.to_string().contains("oracle returned no rows"),
+            "error names the cause"
+        );
     }
 }
