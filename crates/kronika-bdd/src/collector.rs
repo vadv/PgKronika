@@ -29,8 +29,8 @@ pub(crate) struct Collector {
     stderr: Arc<Mutex<Vec<u8>>>,
     /// The stderr-draining task, aborted on drop.
     stderr_task: JoinHandle<()>,
-    /// Keep the output directory alive until the scenario opens the segment.
-    _out_dir: tempfile::TempDir,
+    /// Keep the output directory alive until the harness retains it for the scenario.
+    out_dir: Option<tempfile::TempDir>,
 }
 
 impl Collector {
@@ -64,7 +64,7 @@ impl Collector {
             lines,
             stderr,
             stderr_task,
-            _out_dir: out_dir,
+            out_dir: Some(out_dir),
         })
     }
 
@@ -91,6 +91,11 @@ impl Collector {
             poisoned.into_inner()
         });
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Hand the output directory to the scenario harness after a successful snapshot.
+    pub(crate) const fn take_output_dir(&mut self) -> Option<tempfile::TempDir> {
+        self.out_dir.take()
     }
 }
 

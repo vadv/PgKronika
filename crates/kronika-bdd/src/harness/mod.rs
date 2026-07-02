@@ -33,6 +33,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use tempfile::TempDir;
 
 use crate::cluster::{Cluster, shared_matrix};
 use session::Session;
@@ -62,9 +63,17 @@ pub(crate) struct HarnessState {
     /// dropped. A prepared transaction is not tied to a session, so
     /// `ROLLBACK PREPARED` must run explicitly; otherwise `DROP DATABASE` fails
     /// because the prepared xact still holds locks in the database.
-    pending_rollbacks: Vec<String>,
+    pending_rollbacks: Vec<PreparedRollback>,
+    /// Collector output directories retained until assertion steps finish.
+    collector_output_dirs: Vec<TempDir>,
     /// Pre-snapshot oracle reads for window assertions, keyed by section column.
     window_floors: BTreeMap<String, i64>,
+}
+
+#[derive(Debug)]
+struct PreparedRollback {
+    database: String,
+    gid: String,
 }
 
 impl HarnessState {
@@ -241,8 +250,16 @@ impl HarnessState {
     /// database is dropped. A prepared transaction is not tied to any session;
     /// it persists until explicitly committed or rolled back, and it holds locks
     /// that prevent `DROP DATABASE` from succeeding.
-    pub(crate) fn add_rollback_prepared(&mut self, gid: String) {
-        self.pending_rollbacks.push(gid);
+    pub(crate) fn add_rollback_prepared(&mut self, gid: String) -> Result<()> {
+        let database = self.database()?.to_owned();
+        self.pending_rollbacks
+            .push(PreparedRollback { database, gid });
+        Ok(())
+    }
+
+    /// Keep a collector output directory alive until scenario cleanup.
+    pub(crate) fn retain_collector_output_dir(&mut self, dir: TempDir) {
+        self.collector_output_dirs.push(dir);
     }
 
     /// Poll `pg_stat_progress_vacuum` until a row for session `name` appears.
@@ -286,9 +303,14 @@ impl HarnessState {
         // Roll back prepared transactions before dropping the databases; a
         // prepared xact prevents DROP DATABASE from completing.
         if let Some(cluster) = self.cluster {
-            for gid in std::mem::take(&mut self.pending_rollbacks) {
-                if let Err(err) = rollback_prepared(cluster, &gid).await {
-                    eprintln!("=== BDD cleanup: ROLLBACK PREPARED {gid:?}: {err:#} ===");
+            for prepared in std::mem::take(&mut self.pending_rollbacks) {
+                if let Err(err) =
+                    rollback_prepared(cluster, &prepared.database, &prepared.gid).await
+                {
+                    eprintln!(
+                        "=== BDD cleanup: ROLLBACK PREPARED {:?} in database {:?}: {err:#} ===",
+                        prepared.gid, prepared.database
+                    );
                 }
             }
             for dbname in std::mem::take(&mut self.extra_databases) {
@@ -308,6 +330,7 @@ impl HarnessState {
         self.window_floors.clear();
         self.segment = None;
         self.collector_log = None;
+        self.collector_output_dirs.clear();
     }
 }
 
@@ -342,18 +365,25 @@ async fn create_database(cluster: &Cluster, dbname: &str) -> Result<()> {
 ///
 /// Called from cleanup to release a prepared transaction that is not tied to
 /// any session. The GID must contain only ASCII alphanumerics and underscores.
-async fn rollback_prepared(cluster: &Cluster, gid: &str) -> Result<()> {
+async fn rollback_prepared(cluster: &Cluster, dbname: &str, gid: &str) -> Result<()> {
+    ensure_safe_ident(dbname)?;
     anyhow::ensure!(
         !gid.is_empty() && gid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
         "prepared transaction gid {gid:?} contains unsafe characters"
     );
-    let admin = cluster.connect().await?;
-    admin
-        .client()
+    let dsn = cluster.conn_string_db(dbname);
+    let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .with_context(|| format!("connect to database {dbname} for ROLLBACK PREPARED"))?;
+    let driver = tokio::spawn(async move {
+        drop(connection.await);
+    });
+    let result = client
         .batch_execute(&format!("ROLLBACK PREPARED '{gid}'"))
         .await
-        .with_context(|| format!("ROLLBACK PREPARED {gid:?}"))?;
-    Ok(())
+        .with_context(|| format!("ROLLBACK PREPARED {gid:?}"));
+    driver.abort();
+    result
 }
 
 /// Drop `dbname` on `cluster`, forcing out any lingering connection.

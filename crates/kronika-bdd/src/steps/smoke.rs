@@ -26,12 +26,15 @@ async fn smoke_version_num(world: &mut BddWorld, step: &Step) -> Result<()> {
                 .query_one(sql, &[])
                 .await
                 .with_context(|| format!("postgres {}: run smoke SQL: {sql}", cluster.major()))?;
-            let returned: i64 = row.try_get(0).with_context(|| {
-                format!(
-                    "postgres {}: smoke SQL result is not an integer",
-                    cluster.major()
-                )
-            })?;
+            let returned = row
+                .try_get::<_, i64>(0)
+                .or_else(|_| row.try_get::<_, i32>(0).map(i64::from))
+                .with_context(|| {
+                    format!(
+                        "postgres {}: smoke SQL result is not an integer",
+                        cluster.major()
+                    )
+                })?;
             let declared = i64::from(cluster.major());
             anyhow::ensure!(
                 returned == declared,

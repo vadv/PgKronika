@@ -88,8 +88,16 @@ impl Session {
     /// Returns an error if the connection or pid query fails.
     pub(crate) async fn open_background(dsn: &str, sql: &str) -> Result<Self> {
         let mut session = Self::connect(dsn).await?;
+        let (setup_sql, background_sql) = split_background_sql(sql);
+        if let Some(setup_sql) = setup_sql {
+            session
+                .client
+                .batch_execute(setup_sql)
+                .await
+                .context("run background session setup SQL")?;
+        }
         let client = Arc::clone(&session.client);
-        let sql = sql.to_owned();
+        let sql = background_sql.to_owned();
         let blocking = tokio::spawn(async move { client.batch_execute(&sql).await });
         session.blocking = Some(blocking);
         Ok(session)
@@ -202,6 +210,23 @@ impl Session {
             blocking: None,
         })
     }
+}
+
+/// Split a background session docstring into setup and the statement that must
+/// keep running. This keeps `SET; VACUUM` out of `PostgreSQL`'s implicit
+/// multi-statement transaction block while preserving the setup on the same
+/// session.
+fn split_background_sql(sql: &str) -> (Option<&str>, &str) {
+    let sql = sql.trim();
+    let without_trailing = sql.trim_end_matches(';').trim_end();
+    if let Some((setup, statement)) = without_trailing.rsplit_once(';') {
+        let setup = setup.trim();
+        let statement = statement.trim();
+        if !setup.is_empty() && !statement.is_empty() {
+            return (Some(setup), statement);
+        }
+    }
+    (None, sql)
 }
 
 /// Poll `pg_stat_activity` until `pid` shows a lock wait, the blocking task
