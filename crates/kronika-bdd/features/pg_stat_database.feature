@@ -1,8 +1,31 @@
-Feature: Collector reads pg_stat_database
-  The collector seals pg_stat_database rows using the layout selected by the
-  PostgreSQL major version. The shared-objects row keeps datid=0 and a null
-  datname; database rows keep dictionary-backed names and catalog fields.
+Feature: Collector seals pg_stat_database rows with catalog fields and counter data
+  pg_stat_database has one row per database plus a datid=0 shared-objects row.
+  The row for the scenario's isolated database carries correct pg_database catalog
+  fields and records at least the rows inserted during setup.
 
-  Scenario: matrix clusters seal pg_stat_database catalog fields
-    Given the PostgreSQL matrix is booted
-    Then each matrix cluster seals pg_stat_database rows with catalog fields and dictionary-backed names
+  @pg17 @serial
+  Scenario: isolated database row carries catalog fields and captures inserted rows
+    Given a fresh database on PostgreSQL 17
+    And a database seeded with:
+      """
+      SELECT pg_stat_reset();
+      CREATE TABLE probe(v int);
+      INSERT INTO probe SELECT generate_series(1, 10);
+      """
+    When the collector snapshots the segment
+    Then section 1_005_003 has a pg_stat_database row for the scenario database:
+      | datallowconn  | true  |
+      | datistemplate | false |
+      | datconnlimit  | -1    |
+    And section 1_005_003 tup_inserted matches the window oracle:
+      """
+      SELECT 10::bigint
+      """
+    And section 1_005_003 datallowconn matches the subset oracle:
+      """
+      SELECT datallowconn FROM pg_database WHERE datname = current_database()
+      """
+    And section 1_005_003 datistemplate matches the subset oracle:
+      """
+      SELECT datistemplate FROM pg_database WHERE datname = current_database()
+      """

@@ -1,12 +1,92 @@
 Feature: Collector reads pg_stat_io
-  The source-pg collector reads pg_stat_io into the version's layout (type
-  1_009_001 on PG 16-17 with op_bytes, type 1_009_002 on PG 18 with per-op byte
-  counters). The view does not exist before PG16, so the section is absent there,
-  and each version seals only its own layout. The scenario reads the rows back,
-  confirms the layout-specific columns and that any stats_reset precedes the
-  snapshot, and resolves their backend_type / object / context labels through the
-  segment dictionary.
+  pg_stat_io (type 1_009_001 on PG16-17, type 1_009_002 on PG18) does not
+  exist before PG16. After a shared stats reset, a CREATE TABLE, INSERT, and
+  CHECKPOINT force visible client-backend I/O. Each scenario checks the
+  version-specific layout, verifies label resolution through the dictionary,
+  checks op_bytes against an independent oracle on V1, and confirms stats_reset
+  does not exceed the snapshot timestamp via a ceiling oracle.
 
-  Scenario: every version handles pg_stat_io per its layout
-    Given the PostgreSQL matrix is booted
-    Then every version handles pg_stat_io per its layout, resolving labels through the dictionary
+  @pg16 @serial
+  Scenario: PG16 seals the V1 layout for pg_stat_io with op_bytes
+    Given a fresh database on PostgreSQL 16
+    And a database seeded with:
+      """
+      SELECT pg_stat_reset_shared('io');
+      CREATE TABLE t(id int);
+      INSERT INTO t VALUES (1);
+      CHECKPOINT;
+      """
+    When the collector snapshots the segment
+    Then section 1_009_001 has a pg_stat_io row for (client backend, relation, normal):
+      | op_bytes | 8192 |
+    And section 1_009_001 op_bytes matches the subset oracle:
+      """
+      SELECT op_bytes
+      FROM pg_stat_io
+      WHERE backend_type = 'client backend'
+        AND object = 'relation'
+        AND context = 'normal'
+      """
+    And section 1_009_001 backend_type matches the subset oracle:
+      """
+      SELECT DISTINCT backend_type FROM pg_stat_io
+      """
+    And section 1_009_001 stats_reset matches the ceiling oracle:
+      """
+      SELECT (EXTRACT(EPOCH FROM NOW()) * 1000000)::bigint
+      """
+    And section 1_009_002 is absent from the segment
+
+  @pg17 @serial
+  Scenario: PG17 seals the V1 layout for pg_stat_io with op_bytes
+    Given a fresh database on PostgreSQL 17
+    And a database seeded with:
+      """
+      SELECT pg_stat_reset_shared('io');
+      CREATE TABLE t(id int);
+      INSERT INTO t VALUES (1);
+      CHECKPOINT;
+      """
+    When the collector snapshots the segment
+    Then section 1_009_001 has a pg_stat_io row for (client backend, relation, normal):
+      | op_bytes | 8192 |
+    And section 1_009_001 op_bytes matches the subset oracle:
+      """
+      SELECT op_bytes
+      FROM pg_stat_io
+      WHERE backend_type = 'client backend'
+        AND object = 'relation'
+        AND context = 'normal'
+      """
+    And section 1_009_001 backend_type matches the subset oracle:
+      """
+      SELECT DISTINCT backend_type FROM pg_stat_io
+      """
+    And section 1_009_001 stats_reset matches the ceiling oracle:
+      """
+      SELECT (EXTRACT(EPOCH FROM NOW()) * 1000000)::bigint
+      """
+    And section 1_009_002 is absent from the segment
+
+  @pg18 @serial
+  Scenario: PG18 seals the V2 layout for pg_stat_io with per-op byte counters
+    Given a fresh database on PostgreSQL 18
+    And a database seeded with:
+      """
+      SELECT pg_stat_reset_shared('io');
+      CREATE TABLE t(id int);
+      INSERT INTO t VALUES (1);
+      CHECKPOINT;
+      """
+    When the collector snapshots the segment
+    Then section 1_009_002 has a pg_stat_io row for (client backend, relation, normal):
+      | write_bytes | 0 |
+    And section 1_009_002 backend_type matches the subset oracle:
+      """
+      SELECT DISTINCT backend_type FROM pg_stat_io
+      """
+    And section 1_009_002 stats_reset matches the ceiling oracle:
+      """
+      SELECT (EXTRACT(EPOCH FROM NOW()) * 1000000)::bigint
+      """
+    And section 1_009_001 is absent from the segment

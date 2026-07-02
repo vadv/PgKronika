@@ -1071,7 +1071,7 @@ dependencies = [
  "kronika-format",
  "kronika-reader",
  "kronika-registry",
- "kronika-source-pg",
+ "kronika-writer",
  "nix",
  "portpicker",
  "tempfile",

@@ -4,12 +4,14 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail, ensure};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use tokio::io::{AsyncBufReadExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, BufReader, Lines};
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
 use crate::cluster::Cluster;
@@ -21,8 +23,14 @@ type ChildLines = Lines<BufReader<ChildStdout>>;
 pub(crate) struct Collector {
     child: Child,
     lines: ChildLines,
-    /// Keep the output directory alive until the scenario opens the segment.
-    _out_dir: tempfile::TempDir,
+    /// Everything the collector has written to stderr, drained by a background
+    /// task so a full pipe never stalls the collector and the bytes survive for
+    /// the failure dump.
+    stderr: Arc<Mutex<Vec<u8>>>,
+    /// The stderr-draining task, aborted on drop.
+    stderr_task: JoinHandle<()>,
+    /// Keep the output directory alive until the harness retains it for the scenario.
+    out_dir: Option<tempfile::TempDir>,
 }
 
 impl Collector {
@@ -35,7 +43,7 @@ impl Collector {
             .env("KRONIKA_OUT_DIR", out_dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawn collector {bin}"))?;
@@ -43,12 +51,20 @@ impl Collector {
             .stdout
             .take()
             .context("collector stdout was not piped")?;
+        let stderr_pipe = child
+            .stderr
+            .take()
+            .context("collector stderr was not piped")?;
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_task = spawn_stderr_drain(stderr_pipe, Arc::clone(&stderr));
         let mut lines = BufReader::new(stdout).lines();
         expect_line(&mut lines, "ready").await?;
         Ok(Self {
             child,
             lines,
-            _out_dir: out_dir,
+            stderr,
+            stderr_task,
+            out_dir: Some(out_dir),
         })
     }
 
@@ -63,6 +79,48 @@ impl Collector {
             .with_context(|| format!("expected 'sealed <path>' from collector, got {line:?}"))?;
         Ok(PathBuf::from(path))
     }
+
+    /// The collector's stderr captured so far, decoded lossily.
+    ///
+    /// The guide requires collector stderr in the failure report; a scenario
+    /// reads this after a snapshot to feed the section dump.
+    pub(crate) fn stderr_captured(&self) -> String {
+        let bytes = self.stderr.lock().unwrap_or_else(|poisoned| {
+            // A panicked drain task poisons the lock; the partial buffer is still
+            // the best diagnostic we have, so recover it rather than panic here.
+            poisoned.into_inner()
+        });
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Hand the output directory to the scenario harness after a successful snapshot.
+    pub(crate) const fn take_output_dir(&mut self) -> Option<tempfile::TempDir> {
+        self.out_dir.take()
+    }
+}
+
+impl Drop for Collector {
+    fn drop(&mut self) {
+        self.stderr_task.abort();
+    }
+}
+
+/// Drain `stderr` into `sink` until the pipe closes, so the collector never
+/// stalls on a full stderr buffer and the bytes are available for a dump.
+fn spawn_stderr_drain(mut stderr: ChildStderr, sink: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut guard) = sink.lock() {
+                        guard.extend_from_slice(&buf[..n]);
+                    }
+                }
+            }
+        }
+    })
 }
 
 async fn expect_line(lines: &mut ChildLines, want: &str) -> Result<()> {
