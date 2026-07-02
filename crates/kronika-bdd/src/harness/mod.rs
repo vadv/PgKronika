@@ -172,6 +172,19 @@ impl HarnessState {
     /// that prevent `DROP DATABASE` from succeeding.
     pub(crate) fn add_rollback_prepared(&mut self, gid: String) {
         self.pending_rollbacks.push(gid);
+    /// Poll `pg_stat_progress_vacuum` until a row for session `name` appears.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no session named `name` exists, the probe connection
+    /// fails, the vacuum completes before being observed, or the timeout elapses.
+    pub(crate) async fn wait_for_vacuum_progress(&mut self, name: &str) -> Result<()> {
+        let dsn = self.database_dsn()?;
+        let session = self
+            .sessions
+            .get_mut(name)
+            .with_context(|| format!("no session named {name:?} was opened"))?;
+        session.wait_for_vacuum_progress(&dsn).await
     }
 
     /// Roll back held transactions, abort blocking tasks, and drop the scenario
