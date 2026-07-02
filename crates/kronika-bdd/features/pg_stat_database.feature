@@ -13,7 +13,7 @@ Feature: Collector seals pg_stat_database rows with catalog fields and counter d
       INSERT INTO probe SELECT generate_series(1, 10);
       """
     When the collector snapshots the segment
-    Then section 1_005_003 has a pg_stat_database row for the scenario database:
+    Then section 1_005_003 has a row with datname = [scenario database]:
       | datallowconn  | true  |
       | datistemplate | false |
       | datconnlimit  | -1    |
