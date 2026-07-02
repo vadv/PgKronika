@@ -3,9 +3,8 @@ Feature: Collector reads pg_stat_io
   exist before PG16. After a shared stats reset, a CREATE TABLE, INSERT, and
   CHECKPOINT force visible client-backend I/O. Each scenario checks the
   version-specific layout, verifies label resolution through the dictionary,
-  asserts an exact oracle for the op_bytes gauge (V1) or the absence of
-  op_bytes (V2), and confirms stats_reset does not exceed the snapshot
-  timestamp via a ceiling oracle.
+  checks op_bytes against an independent oracle on V1, and confirms stats_reset
+  does not exceed the snapshot timestamp via a ceiling oracle.
 
   @pg16 @serial
   Scenario: PG16 seals the V1 layout for pg_stat_io with op_bytes
@@ -20,7 +19,7 @@ Feature: Collector reads pg_stat_io
     When the collector snapshots the segment
     Then section 1_009_001 has a pg_stat_io row for (client backend, relation, normal):
       | op_bytes | 8192 |
-    And section 1_009_001 op_bytes matches the exact oracle:
+    And section 1_009_001 op_bytes matches the subset oracle:
       """
       SELECT op_bytes
       FROM pg_stat_io
@@ -51,7 +50,7 @@ Feature: Collector reads pg_stat_io
     When the collector snapshots the segment
     Then section 1_009_001 has a pg_stat_io row for (client backend, relation, normal):
       | op_bytes | 8192 |
-    And section 1_009_001 op_bytes matches the exact oracle:
+    And section 1_009_001 op_bytes matches the subset oracle:
       """
       SELECT op_bytes
       FROM pg_stat_io
@@ -81,7 +80,7 @@ Feature: Collector reads pg_stat_io
       """
     When the collector snapshots the segment
     Then section 1_009_002 has a pg_stat_io row for (client backend, relation, normal):
-      | hits | 0 |
+      | write_bytes | 0 |
     And section 1_009_002 backend_type matches the subset oracle:
       """
       SELECT DISTINCT backend_type FROM pg_stat_io

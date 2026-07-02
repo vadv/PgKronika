@@ -39,19 +39,21 @@ Feature: Collector reads pg_stat_user_tables and pg_stat_user_indexes across dat
     And a database seeded with:
       """
       CREATE TABLE kronika_ut_probe (id int primary key, payload text);
-      INSERT INTO kronika_ut_probe SELECT g, repeat('x', 16) FROM generate_series(1, 200) g;
+      INSERT INTO kronika_ut_probe SELECT g, md5(g::text) FROM generate_series(1, 200) g;
       CREATE INDEX kronika_ut_probe_idx ON kronika_ut_probe (payload);
       ANALYZE kronika_ut_probe;
-      SELECT payload FROM kronika_ut_probe WHERE payload = repeat('x', 16) LIMIT 1;
+      SET enable_seqscan = off;
+      SELECT payload FROM kronika_ut_probe WHERE payload = md5(42::text);
       SELECT pg_stat_force_next_flush();
       """
     And a second database seeded with:
       """
       CREATE TABLE kronika_ut_probe (id int primary key, payload text);
-      INSERT INTO kronika_ut_probe SELECT g, repeat('x', 16) FROM generate_series(1, 200) g;
+      INSERT INTO kronika_ut_probe SELECT g, md5(g::text) FROM generate_series(1, 200) g;
       CREATE INDEX kronika_ut_probe_idx ON kronika_ut_probe (payload);
       ANALYZE kronika_ut_probe;
-      SELECT payload FROM kronika_ut_probe WHERE payload = repeat('x', 16) LIMIT 1;
+      SET enable_seqscan = off;
+      SELECT payload FROM kronika_ut_probe WHERE payload = md5(42::text);
       SELECT pg_stat_force_next_flush();
       """
     When the collector snapshots the segment

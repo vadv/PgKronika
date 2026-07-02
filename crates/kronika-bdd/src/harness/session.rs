@@ -316,9 +316,5 @@ async fn progress_vacuum_relid(observer: &tokio_postgres::Client, pid: i32) -> R
         )
         .await
         .context("poll pg_stat_progress_vacuum")?;
-    row.map(|r| {
-        let relid: i64 = r.get(0);
-        u32::try_from(relid).context("relid out of u32 range")
-    })
-    .transpose()
+    Ok(row.map(|r| r.get(0)))
 }
