@@ -121,6 +121,9 @@ fn pick_distinct_ports(n: usize) -> Result<Vec<u16>> {
 pub(crate) struct Cluster {
     major: u32,
     port: u16,
+    /// The `bin` directory this cluster was booted from; steps use it to
+    /// spawn client tools of the matching major (e.g. `pg_receivewal`).
+    bindir: PathBuf,
     /// Spawned with `kill_on_drop`; held so `postgres` stops when the cluster
     /// is dropped. Declared before `data_dir` so it dies before the dir goes.
     #[allow(dead_code, reason = "owned for its Drop side effect, not read")]
@@ -134,9 +137,11 @@ impl Cluster {
         let data_dir = TempDir::new().context("create data directory")?;
         run_initdb(bin, data_dir.path()).await?;
         let postgres = spawn_postgres(bin, data_dir.path(), port)?;
+        let bindir = bin.bindir.clone();
         let cluster = Self {
             major: bin.major,
             port,
+            bindir,
             postgres,
             data_dir,
         };
@@ -147,6 +152,11 @@ impl Cluster {
     /// Major version this cluster runs.
     pub(crate) const fn major(&self) -> u32 {
         self.major
+    }
+
+    /// The `bin` directory of this cluster's `PostgreSQL` installation.
+    pub(crate) fn bindir(&self) -> &Path {
+        &self.bindir
     }
 
     pub(crate) fn conn_string(&self) -> String {
@@ -288,6 +298,10 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
             "full_page_writes=off",
             "-c",
             "max_prepared_transactions=16",
+            // Logical slots need it; physical replication scenarios are
+            // unaffected, the extra WAL detail is harmless for the rest.
+            "-c",
+            "wal_level=logical",
         ]);
     if STORE_PLANS_MAJORS.contains(&bin.major) {
         // These majors include the vadv pg_store_plans fork. The GUCs record

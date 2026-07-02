@@ -79,6 +79,10 @@ use kronika_source_pg::prepared_xacts::{
 use kronika_source_pg::progress_vacuum::{
     ProgressVacuumRow, collect_progress_vacuum, to_progress_vacuum,
 };
+use kronika_source_pg::replication_details::{
+    ReplicaRow, SlotRow, collect_replication_replicas, collect_replication_slots, to_replicas_v1,
+    to_slots_v1,
+};
 use kronika_source_pg::replication_instance::{
     ReplicationInstanceRow, collect_replication_instance, to_replication_instance,
 };
@@ -1212,6 +1216,7 @@ async fn snapshot_and_seal(
     let replication_instance_row = collect_replication_instance(client, major)
         .await
         .context("collect replication instance status")?;
+    let (replica_rows, slot_rows) = collect_replication_details(client, major).await?;
     let lock_rows = collect_lock_rows(client, major, config.max_lock_rows).await;
 
     let user_tables = collect_user_tables_all(pool, major, config).await;
@@ -1253,6 +1258,7 @@ async fn snapshot_and_seal(
     }
     push_archiver(&mut buffers, &mut interner, &archiver)?;
     push_replication_instance(&mut buffers, &mut interner, &replication_instance_row)?;
+    push_replication_details(&mut buffers, &mut interner, &replica_rows, &slot_rows)?;
     push_user_tables(&mut buffers, &mut interner, &user_tables)?;
     push_user_indexes(&mut buffers, &mut interner, &user_indexes)?;
     if let Some((version, rows)) = &statements {
@@ -1728,6 +1734,43 @@ fn push_instance_metadata(
         btime: Ts(facts.os.btime),
     };
     buffer_row(buffers, row)
+}
+
+/// Collect the walsender and slot detail rows from the main connection.
+async fn collect_replication_details(
+    client: &Client,
+    major: u32,
+) -> Result<(Vec<ReplicaRow>, Vec<SlotRow>)> {
+    let replicas = collect_replication_replicas(client)
+        .await
+        .context("collect pg_stat_replication")?;
+    let slots = collect_replication_slots(client, major)
+        .await
+        .context("collect pg_replication_slots")?;
+    Ok((replicas, slots))
+}
+
+/// Intern and buffer the `pg_stat_replication` and `pg_replication_slots`
+/// rows.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_replication_details(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    replicas: &[ReplicaRow],
+    slots: &[SlotRow],
+) -> Result<()> {
+    for row in replicas {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_replicas_v1(row, &mut intern)?)?;
+    }
+    for row in slots {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_slots_v1(row, &mut intern)?)?;
+    }
+    Ok(())
 }
 
 /// Intern each row's strings and buffer it as the `pg_settings` section.
