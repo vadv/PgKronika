@@ -96,3 +96,15 @@ pub(crate) fn table(step: &Step) -> Result<&[Vec<String>]> {
         .map(|table| table.rows.as_slice())
         .context("step needs a `| column | value |` table")
 }
+mod activity;
+mod collector;
+mod connection_pool;
+mod database;
+mod io;
+mod prepared_xacts;
+mod progress_vacuum;
+mod replication_instance;
+mod smoke;
+mod statements;
+mod user_tables;
+mod wal;
