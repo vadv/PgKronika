@@ -57,6 +57,7 @@
 
 use anyhow::{Context, Result};
 use kronika_format::DictLimits;
+use kronika_registry::collection_coverage::CollectionCoverageV1;
 use kronika_registry::instance_metadata::InstanceMetadata;
 use kronika_registry::{MAX_SECTION_ROWS, StrId, Ts};
 use kronika_source_os::{OsInstanceFacts, collect_os_instance_facts};
@@ -92,18 +93,20 @@ use kronika_source_pg::reset_metadata::{
 };
 use kronika_source_pg::settings::{SettingsRow, collect_settings, to_settings_v1};
 use kronika_source_pg::statements::{
-    self, StatementsRow, StatementsVersion, collect_statements, statements_extversion,
-    statements_version,
+    self, StatementsRow, StatementsVersion, collect_statements, count_statements,
+    statements_extversion, statements_version,
 };
 use kronika_source_pg::store_plans::{
     self, StorePlansOsscRow, StorePlansRow, collect_store_plans, collect_store_plans_ossc,
-    fetch_plan_text, store_plans_extversion, store_plans_is_ossc, store_plans_is_vadv,
+    count_store_plans_ossc, count_store_plans_vadv, fetch_plan_text, store_plans_extversion,
+    store_plans_is_ossc, store_plans_is_vadv,
 };
 use kronika_source_pg::user_indexes::{
     self, INDEX_TOPN_AXES, UserIndexesRow, UserIndexesVersion, collect_user_indexes,
+    count_user_indexes,
 };
 use kronika_source_pg::user_tables::{
-    self, TABLE_TOPN_AXES, UserTablesRow, UserTablesVersion, collect_user_tables,
+    self, TABLE_TOPN_AXES, UserTablesRow, UserTablesVersion, collect_user_tables, count_user_tables,
 };
 use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
@@ -403,6 +406,75 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Counters accumulated while collecting one top-N source, for `1_023_001`.
+#[derive(Debug, Default, Clone, Copy)]
+struct SourceCoverage {
+    /// Rows the source held, summed over the databases that were counted.
+    total: u64,
+    /// Rows actually collected.
+    collected: u64,
+    /// Databases skipped after the adaptive timeout hit its cap.
+    timeouts: u32,
+    /// Databases skipped for any other error.
+    other_skips: u32,
+}
+
+impl SourceCoverage {
+    /// The `1_023_001` reason code: a timeout outranks other skips, which
+    /// outrank plain top-N selection.
+    const fn reason(&self) -> u8 {
+        if self.timeouts > 0 {
+            1
+        } else if self.other_skips > 0 {
+            3
+        } else {
+            0
+        }
+    }
+
+    /// Whether any source rows are missing from the section.
+    const fn truncated(&self) -> bool {
+        self.total > self.collected || self.timeouts > 0 || self.other_skips > 0
+    }
+}
+
+/// One pending `1_023_001` row.
+#[derive(Debug, Clone, Copy)]
+struct CoverageRecord {
+    source_type_id: u32,
+    coverage: SourceCoverage,
+    max_n: u32,
+    order_by: &'static str,
+    cutoff_value: Option<f64>,
+}
+
+/// The `1_013` layout collected on this server major.
+const fn user_tables_type_id(major: u32) -> u32 {
+    match major {
+        0..=12 => 1_013_001,
+        13..=15 => 1_013_002,
+        16..=17 => 1_013_003,
+        _ => 1_013_004,
+    }
+}
+
+/// The `1_014` layout collected on this server major.
+const fn user_indexes_type_id(major: u32) -> u32 {
+    if major >= 16 { 1_014_002 } else { 1_014_001 }
+}
+
+/// The `1_002` layout for the extension version being collected.
+const fn statements_type_id(version: StatementsVersion) -> u32 {
+    match version {
+        StatementsVersion::V1 => 1_002_001,
+        StatementsVersion::V2 => 1_002_002,
+        StatementsVersion::V3 => 1_002_003,
+        StatementsVersion::V4 => 1_002_004,
+        StatementsVersion::V5 => 1_002_005,
+        StatementsVersion::V6 => 1_002_006,
+    }
+}
+
 /// Collect `pg_stat_user_tables` from every pool database, returning owned rows.
 ///
 /// All awaits finish here so the caller can intern without holding the `!Send`
@@ -414,8 +486,12 @@ async fn collect_user_tables_all(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
-) -> Vec<(String, UserTablesVersion, Vec<UserTablesRow>)> {
+) -> (
+    Vec<(String, UserTablesVersion, Vec<UserTablesRow>)>,
+    SourceCoverage,
+) {
     let mut user_tables = Vec::new();
+    let mut coverage = SourceCoverage::default();
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
     for db in pool.per_db() {
         loop {
@@ -435,6 +511,14 @@ async fn collect_user_tables_all(
             }
             match collect_user_tables(db.client(), major, config.max_tables).await {
                 Ok((version, rows)) => {
+                    coverage.collected += rows.len() as u64;
+                    match count_user_tables(db.client()).await {
+                        Ok(n) => coverage.total += u64::try_from(n).unwrap_or(0),
+                        Err(err) => eprintln!(
+                            "pg_kronika-collector: count pg_stat_user_tables for {}: {err}",
+                            db.datname
+                        ),
+                    }
                     user_tables.push((db.datname.clone(), version, rows));
                     break;
                 }
@@ -444,6 +528,7 @@ async fn collect_user_tables_all(
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
+                    coverage.other_skips += 1;
                     eprintln!(
                         "pg_kronika-collector: skip user_tables for {} (lock_not_available): {err}",
                         db.datname
@@ -451,6 +536,11 @@ async fn collect_user_tables_all(
                     break;
                 }
                 Err(err) => {
+                    if is_sqlstate(&err, "57014") {
+                        coverage.timeouts += 1;
+                    } else {
+                        coverage.other_skips += 1;
+                    }
                     eprintln!(
                         "pg_kronika-collector: skip user_tables for {}: {err}",
                         db.datname
@@ -460,7 +550,7 @@ async fn collect_user_tables_all(
             }
         }
     }
-    user_tables
+    (user_tables, coverage)
 }
 
 /// Collect `pg_stat_user_indexes` from every pool database, returning owned rows.
@@ -474,8 +564,12 @@ async fn collect_user_indexes_all(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
-) -> Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)> {
+) -> (
+    Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)>,
+    SourceCoverage,
+) {
     let mut user_indexes = Vec::new();
+    let mut coverage = SourceCoverage::default();
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
     for db in pool.per_db() {
         loop {
@@ -495,6 +589,14 @@ async fn collect_user_indexes_all(
             }
             match collect_user_indexes(db.client(), major, config.max_indexes).await {
                 Ok((version, rows)) => {
+                    coverage.collected += rows.len() as u64;
+                    match count_user_indexes(db.client()).await {
+                        Ok(n) => coverage.total += u64::try_from(n).unwrap_or(0),
+                        Err(err) => eprintln!(
+                            "pg_kronika-collector: count pg_stat_user_indexes for {}: {err}",
+                            db.datname
+                        ),
+                    }
                     user_indexes.push((db.datname.clone(), version, rows));
                     break;
                 }
@@ -504,6 +606,7 @@ async fn collect_user_indexes_all(
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
+                    coverage.other_skips += 1;
                     eprintln!(
                         "pg_kronika-collector: skip user_indexes for {} (lock_not_available): {err}",
                         db.datname
@@ -511,6 +614,11 @@ async fn collect_user_indexes_all(
                     break;
                 }
                 Err(err) => {
+                    if is_sqlstate(&err, "57014") {
+                        coverage.timeouts += 1;
+                    } else {
+                        coverage.other_skips += 1;
+                    }
                     eprintln!(
                         "pg_kronika-collector: skip user_indexes for {}: {err}",
                         db.datname
@@ -520,7 +628,7 @@ async fn collect_user_indexes_all(
             }
         }
     }
-    user_indexes
+    (user_indexes, coverage)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1219,10 +1327,24 @@ async fn snapshot_and_seal(
     let (replica_rows, slot_rows) = collect_replication_details(client, major).await?;
     let lock_rows = collect_lock_rows(client, major, config.max_lock_rows).await;
 
-    let user_tables = collect_user_tables_all(pool, major, config).await;
-    let user_indexes = collect_user_indexes_all(pool, major, config).await;
+    let (user_tables, tables_cov) = collect_user_tables_all(pool, major, config).await;
+    let (user_indexes, indexes_cov) = collect_user_indexes_all(pool, major, config).await;
     let statements = collect_statements_cached(pool, config, statements_cache).await;
     let store_plans_rows = collect_store_plans_cached(pool, config, plans_cache).await;
+    let coverage = collect_coverage_records(
+        pool,
+        major,
+        config,
+        CoverageInputs {
+            tables: tables_cov,
+            indexes: indexes_cov,
+            statements: &statements,
+            plans: &store_plans_rows,
+            statements_cache,
+            plans_cache,
+        },
+    )
+    .await;
     // The extension caches are warm now: reset metadata reads the info views
     // through the same connections those sections were collected from.
     let service =
@@ -1247,12 +1369,7 @@ async fn snapshot_and_seal(
     )?;
     push_progress_vacuum(&mut buffers, &mut interner, &progress_vacuum_rows)?;
     push_prepared_xacts(&mut buffers, &mut interner, &prepared_rows)?;
-    // pg_stat_wal has one all-numeric row; PG10-13 produce no row.
-    match wal {
-        Some(WalSnapshot::V1(row)) => buffer_row(&mut buffers, row)?,
-        Some(WalSnapshot::V2(row)) => buffer_row(&mut buffers, row)?,
-        None => {}
-    }
+    push_wal(&mut buffers, wal)?;
     if let Some((io_version, io_rows)) = &io {
         push_io(&mut buffers, &mut interner, *io_version, io_rows)?;
     }
@@ -1264,11 +1381,7 @@ async fn snapshot_and_seal(
     if let Some((version, rows)) = &statements {
         push_statements(&mut buffers, &mut interner, *version, rows)?;
     }
-    match &store_plans_rows {
-        Some(PlansRead::Vadv(rows)) => push_store_plans(&mut buffers, &mut interner, rows)?,
-        Some(PlansRead::Ossc(rows)) => push_store_plans_ossc(&mut buffers, &mut interner, rows)?,
-        None => {}
-    }
+    push_plans_read(&mut buffers, &mut interner, store_plans_rows.as_ref())?;
     if !lock_rows.is_empty() {
         push_locks(
             &mut buffers,
@@ -1278,7 +1391,19 @@ async fn snapshot_and_seal(
         )?;
     }
     push_service_sections(&mut buffers, &mut interner, &service)?;
+    push_coverage(&mut buffers, &mut interner, ts.0, &coverage)?;
 
+    seal_segment(journal, buffers, &interner, config, ts.0)
+}
+
+/// Encode the buffered window, append it to the journal, and seal `<ts>.pgm`.
+fn seal_segment(
+    journal: &mut Journal,
+    mut buffers: SectionBuffers,
+    interner: &Interner,
+    config: &Config,
+    ts: i64,
+) -> Result<PathBuf> {
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
         .flush(&dict_sections, config.source_id)
@@ -1288,11 +1413,199 @@ async fn snapshot_and_seal(
         .append(&part)
         .context("append the part to the journal")?;
 
-    let dest = config.out_dir.join(format!("{}.pgm", ts.0));
+    let dest = config.out_dir.join(format!("{ts}.pgm"));
     seal(journal, &dest).context("seal the segment")?;
     // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
+}
+
+/// Buffer the `pg_stat_wal` singleton; PG10-13 produce no row.
+///
+/// # Errors
+/// Returns an error when the section buffer is full.
+fn push_wal(buffers: &mut SectionBuffers, wal: Option<WalSnapshot>) -> Result<()> {
+    match wal {
+        Some(WalSnapshot::V1(row)) => buffer_row(buffers, row),
+        Some(WalSnapshot::V2(row)) => buffer_row(buffers, row),
+        None => Ok(()),
+    }
+}
+
+/// Buffer the paced `pg_store_plans` read under its fork's section.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_plans_read(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    read: Option<&PlansRead>,
+) -> Result<()> {
+    match read {
+        Some(PlansRead::Vadv(rows)) => push_store_plans(buffers, interner, rows),
+        Some(PlansRead::Ossc(rows)) => push_store_plans_ossc(buffers, interner, rows),
+        None => Ok(()),
+    }
+}
+
+/// Everything the coverage assembly needs about this snapshot's top-N reads.
+struct CoverageInputs<'a> {
+    tables: SourceCoverage,
+    indexes: SourceCoverage,
+    statements: &'a Option<(StatementsVersion, Vec<StatementsRow>)>,
+    plans: &'a Option<PlansRead>,
+    statements_cache: &'a StatementsSourceCache,
+    plans_cache: &'a PlansSourceCache,
+}
+
+/// Assemble the `1_023_001` rows for every truncated top-N source.
+async fn collect_coverage_records(
+    pool: &ConnectionPool,
+    major: u32,
+    config: &Config,
+    inputs: CoverageInputs<'_>,
+) -> Vec<CoverageRecord> {
+    let mut records = Vec::new();
+    if inputs.tables.truncated() {
+        records.push(CoverageRecord {
+            source_type_id: user_tables_type_id(major),
+            coverage: inputs.tables,
+            max_n: u32::try_from(config.max_tables).unwrap_or(u32::MAX),
+            order_by: "reads|writes|relpages|n_dead_tup|xid_age|mxid_age",
+            cutoff_value: None,
+        });
+    }
+    if inputs.indexes.truncated() {
+        records.push(CoverageRecord {
+            source_type_id: user_indexes_type_id(major),
+            coverage: inputs.indexes,
+            max_n: u32::try_from(config.max_indexes).unwrap_or(u32::MAX),
+            order_by: "idx_scan|idx_tup_read|relpages|last_idx_scan",
+            cutoff_value: None,
+        });
+    }
+    if let Some(record) = statements_coverage(pool, config, &inputs).await {
+        records.push(record);
+    }
+    if let Some(record) = plans_coverage(pool, config, &inputs).await {
+        records.push(record);
+    }
+    records
+}
+
+/// Coverage for the sealed `pg_stat_statements` read, if it was truncated.
+async fn statements_coverage(
+    pool: &ConnectionPool,
+    config: &Config,
+    inputs: &CoverageInputs<'_>,
+) -> Option<CoverageRecord> {
+    let (version, rows) = inputs.statements.as_ref()?;
+    let cached = inputs.statements_cache.selected.as_ref()?;
+    let client = statement_client(pool, &cached.source)?;
+    let total = match count_statements(client).await {
+        Ok(n) => u64::try_from(n).unwrap_or(0),
+        Err(err) => {
+            eprintln!("pg_kronika-collector: count pg_stat_statements: {err}");
+            return None;
+        }
+    };
+    let coverage = SourceCoverage {
+        total,
+        collected: rows.len() as u64,
+        timeouts: 0,
+        other_skips: 0,
+    };
+    coverage.truncated().then(|| CoverageRecord {
+        source_type_id: statements_type_id(*version),
+        coverage,
+        max_n: u32::try_from(config.max_statements).unwrap_or(u32::MAX),
+        order_by: "total_exec_time|calls",
+        cutoff_value: None,
+    })
+}
+
+/// Coverage for the sealed `pg_store_plans` read, if it was truncated.
+///
+/// The single selection axis makes the boundary meaningful: `cutoff_value`
+/// is the smallest `total_time` that still made it into the section.
+async fn plans_coverage(
+    pool: &ConnectionPool,
+    config: &Config,
+    inputs: &CoverageInputs<'_>,
+) -> Option<CoverageRecord> {
+    let read = inputs.plans.as_ref()?;
+    let cached = inputs.plans_cache.selected.as_ref()?;
+    let client = statement_client(pool, &cached.source)?;
+    let (source_type_id, collected, cutoff_value, count) = match read {
+        PlansRead::Vadv(rows) => (
+            1_004_001,
+            rows.len() as u64,
+            min_total_time(rows.iter().map(|r| r.total_time)),
+            count_store_plans_vadv(client).await,
+        ),
+        PlansRead::Ossc(rows) => (
+            1_003_001,
+            rows.len() as u64,
+            min_total_time(rows.iter().map(|r| r.total_time)),
+            count_store_plans_ossc(client).await,
+        ),
+    };
+    let total = match count {
+        Ok(n) => u64::try_from(n).unwrap_or(0),
+        Err(err) => {
+            eprintln!("pg_kronika-collector: count pg_store_plans: {err}");
+            return None;
+        }
+    };
+    let coverage = SourceCoverage {
+        total,
+        collected,
+        timeouts: 0,
+        other_skips: 0,
+    };
+    coverage.truncated().then(|| CoverageRecord {
+        source_type_id,
+        coverage,
+        max_n: u32::try_from(config.max_plans).unwrap_or(u32::MAX),
+        order_by: "total_time",
+        cutoff_value,
+    })
+}
+
+/// The smallest selection metric among the collected rows; `None` when empty.
+fn min_total_time(values: impl Iterator<Item = f64>) -> Option<f64> {
+    values.fold(None, |acc, v| {
+        Some(acc.map_or(v, |a: f64| if v < a { v } else { a }))
+    })
+}
+
+/// Buffer one `1_023_001` row per truncated source.
+///
+/// # Errors
+/// Returns an error if `order_by` cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_coverage(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    ts: i64,
+    records: &[CoverageRecord],
+) -> Result<()> {
+    for record in records {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        let row = CollectionCoverageV1 {
+            ts: Ts(ts),
+            source_type_id: record.source_type_id,
+            total: u32::try_from(record.coverage.total).unwrap_or(u32::MAX),
+            collected: u32::try_from(record.coverage.collected).unwrap_or(u32::MAX),
+            max_n: record.max_n,
+            order_by: intern(record.order_by.as_bytes())?,
+            cutoff_value: record.cutoff_value,
+            reason: record.coverage.reason(),
+        };
+        buffer_row(buffers, row)?;
+    }
+    Ok(())
 }
 
 /// The per-segment service rows: reset context, instance fingerprint, and
@@ -1848,6 +2161,97 @@ fn push_store_plans_ossc(
 #[cfg(test)]
 mod tests {
     use super::{
+        SourceCoverage, StatementsVersion, min_total_time, statements_type_id,
+        user_indexes_type_id, user_tables_type_id,
+    };
+
+    #[test]
+    fn coverage_reason_ranks_timeouts_over_other_skips() {
+        let top_n = SourceCoverage {
+            total: 100,
+            collected: 50,
+            timeouts: 0,
+            other_skips: 0,
+        };
+        assert_eq!(top_n.reason(), 0);
+        assert_eq!(
+            SourceCoverage {
+                other_skips: 2,
+                ..top_n
+            }
+            .reason(),
+            3
+        );
+        assert_eq!(
+            SourceCoverage {
+                timeouts: 1,
+                other_skips: 2,
+                ..top_n
+            }
+            .reason(),
+            1
+        );
+    }
+
+    #[test]
+    fn coverage_truncated_needs_missing_rows_or_skips() {
+        let complete = SourceCoverage {
+            total: 50,
+            collected: 50,
+            timeouts: 0,
+            other_skips: 0,
+        };
+        assert!(!complete.truncated());
+        assert!(
+            SourceCoverage {
+                total: 51,
+                ..complete
+            }
+            .truncated()
+        );
+        assert!(
+            SourceCoverage {
+                timeouts: 1,
+                ..complete
+            }
+            .truncated()
+        );
+        assert!(
+            SourceCoverage {
+                other_skips: 1,
+                ..complete
+            }
+            .truncated()
+        );
+        // A failed count query undercounts the total; that alone must not
+        // fabricate a truncation row.
+        assert!(
+            !SourceCoverage {
+                total: 40,
+                ..complete
+            }
+            .truncated()
+        );
+    }
+
+    #[test]
+    fn min_total_time_finds_the_boundary() {
+        assert_eq!(min_total_time([3.0, 1.5, 2.0].into_iter()), Some(1.5));
+        assert_eq!(min_total_time(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn type_id_maps_cover_the_supported_majors() {
+        assert_eq!(user_tables_type_id(12), 1_013_001);
+        assert_eq!(user_tables_type_id(13), 1_013_002);
+        assert_eq!(user_tables_type_id(16), 1_013_003);
+        assert_eq!(user_tables_type_id(18), 1_013_004);
+        assert_eq!(user_indexes_type_id(15), 1_014_001);
+        assert_eq!(user_indexes_type_id(16), 1_014_002);
+        assert_eq!(statements_type_id(StatementsVersion::V6), 1_002_006);
+    }
+
+    use super::{
         CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
         activity_dict_limits, push_activity, push_archiver, push_database, push_io, push_locks,
         push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
@@ -1862,7 +2266,7 @@ mod tests {
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
     use kronika_source_pg::replication_instance::ReplicationInstanceRow;
-    use kronika_source_pg::statements::{StatementsRow, StatementsVersion};
+    use kronika_source_pg::statements::StatementsRow;
     use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion};
     use kronika_source_pg::user_tables::{UserTablesRow, UserTablesVersion};
     use kronika_source_pg::{ActivityRow, ActivityVersion};

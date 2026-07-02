@@ -328,6 +328,34 @@ fn opt<E>(
     value.map(|s| intern(s.as_bytes())).transpose()
 }
 
+/// Entries in the vadv `pg_store_plans` view, for coverage.
+///
+/// # Errors
+/// Returns the [`tokio_postgres::Error`] if the query fails.
+pub async fn count_store_plans_vadv(client: &Client) -> Result<i64, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            marked!("SELECT count(*)::int8 AS n FROM pg_store_plans(false)"),
+            &[],
+        )
+        .await?;
+    Ok(row.get("n"))
+}
+
+/// Entries in the ossc `pg_store_plans` view, for coverage.
+///
+/// # Errors
+/// Returns the [`tokio_postgres::Error`] if the query fails.
+pub async fn count_store_plans_ossc(client: &Client) -> Result<i64, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            marked!("SELECT count(*)::int8 AS n FROM pg_store_plans"),
+            &[],
+        )
+        .await?;
+    Ok(row.get("n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{StorePlansRow, store_plans_query, to_vadv_v1};
