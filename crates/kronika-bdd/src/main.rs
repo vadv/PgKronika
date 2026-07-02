@@ -1441,6 +1441,7 @@ async fn main() {
     // instead of only the opaque step panic. PostgreSQL logs errors regardless
     // of DEBUG.
     BddWorld::cucumber()
+        .fail_on_skipped()
         .after(|_feature, _rule, _scenario, ev, world| {
             Box::pin(async move {
                 let failed = matches!(
