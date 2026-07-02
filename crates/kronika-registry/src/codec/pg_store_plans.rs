@@ -1,0 +1,251 @@
+//! Type `1_004_001`: `pg_store_plans`, the vadv fork (extension 2.x).
+//!
+//! Per-plan execution counters, one row per `(userid, dbid, queryid, planid)`
+//! as keyed inside the extension. The statistics are instance-wide, read from
+//! the one database where `CREATE EXTENSION pg_store_plans` ran. The vadv fork
+//! and the ossc upstream expose different column sets and different plan-text
+//! access paths, so they are separate type families (`1_004` vadv, `1_003`
+//! ossc), not one layout with optional columns.
+//!
+//! Key semantics of the vadv fork: the extension keys an entry by
+//! `(userid, dbid, uint32(core queryId), planid)`, and stores the full 64-bit
+//! `pg_stat_statements` query id separately as `queryid_stat_statements` — the
+//! join bridge to `1_002`. With `compute_query_id` off the key degenerates and
+//! plans of different statements merge by plan shape; the collector documents
+//! `compute_query_id = on` as an operating precondition.
+//!
+//! `queryid` and `planid` identify rows only within one instance, one server
+//! major, and one extension version; they are not portable identifiers.
+//! Timing columns are `f64`, so the layout derives `PartialEq` but not `Eq`.
+
+use crate::{Section, StrId, Ts};
+
+/// Type `1_004_001`: `pg_store_plans` (vadv fork, extension 2.x).
+///
+/// One row per plan entry of `pg_store_plans(false)`, top-N by `total_time`.
+/// The `*_blk_*_time` columns are `0` when `track_io_timing` is off — an
+/// unmeasured zero is indistinguishable from a true zero. The `*_plan_time`
+/// columns are `0` without `pg_store_plans.track_planning`.
+#[derive(Debug, Clone, Copy, PartialEq, Section)]
+#[section(
+    id = 1_004_001,
+    name = "pg_store_plans",
+    semantics = snapshot_full,
+    sort_key("dbid", "userid", "queryid_stat_statements", "planid")
+)]
+pub struct PgStorePlansVadvV1 {
+    /// Collection time, unix microseconds; one value for all rows of a read.
+    #[column(t)]
+    pub ts: Ts,
+    /// The extension's internal entry key: the core query id truncated to 32
+    /// bits. Kept to make key-truncation collisions diagnosable from data.
+    #[column(l)]
+    pub queryid: i64,
+    /// Full 64-bit `pg_stat_statements` query id; `0` when the bridge is
+    /// unfilled. Join key to section `1_002`.
+    #[column(l)]
+    pub queryid_stat_statements: i64,
+    /// Plan id derived from the normalized plan representation.
+    #[column(l)]
+    pub planid: i64,
+    /// Role oid the statements ran as.
+    #[column(l)]
+    pub userid: u32,
+    /// Database oid the statements ran in.
+    #[column(l)]
+    pub dbid: u32,
+    /// Database name resolved from `dbid`; `None` when `dbid` has no
+    /// `pg_database` row.
+    #[column(l)]
+    pub datname: Option<StrId>,
+    /// Role name resolved from `userid`; `None` when `userid` has no
+    /// `pg_roles` row.
+    #[column(l)]
+    pub usename: Option<StrId>,
+    /// Plan text fetched via `pg_store_plans_get_plan`; `None` when the
+    /// per-cycle plan-text budget was exhausted before this row.
+    #[column(l)]
+    pub plan: Option<StrId>,
+    /// Executions accumulated for this plan entry.
+    #[column(c)]
+    pub calls: i64,
+    /// Executions recorded through `pg_store_plans.slow_statement_duration`.
+    #[column(c)]
+    pub slow_log_calls: i64,
+    /// Total execution time in milliseconds.
+    #[column(c)]
+    pub total_time: f64,
+    /// Minimum execution time in milliseconds (resettable).
+    #[column(g)]
+    pub min_time: f64,
+    /// Maximum execution time in milliseconds (resettable).
+    #[column(g)]
+    pub max_time: f64,
+    /// Mean execution time in milliseconds (resettable).
+    #[column(g)]
+    pub mean_time: f64,
+    /// Population standard deviation of execution time, milliseconds.
+    #[column(g)]
+    pub stddev_time: f64,
+    /// Rows retrieved or affected.
+    #[column(c)]
+    pub rows: i64,
+    /// Shared-block buffer hits.
+    #[column(c)]
+    pub shared_blks_hit: i64,
+    /// Shared blocks read.
+    #[column(c)]
+    pub shared_blks_read: i64,
+    /// Shared blocks dirtied.
+    #[column(c)]
+    pub shared_blks_dirtied: i64,
+    /// Shared blocks written.
+    #[column(c)]
+    pub shared_blks_written: i64,
+    /// Local-block buffer hits.
+    #[column(c)]
+    pub local_blks_hit: i64,
+    /// Local blocks read.
+    #[column(c)]
+    pub local_blks_read: i64,
+    /// Local blocks dirtied.
+    #[column(c)]
+    pub local_blks_dirtied: i64,
+    /// Local blocks written.
+    #[column(c)]
+    pub local_blks_written: i64,
+    /// Temp blocks read.
+    #[column(c)]
+    pub temp_blks_read: i64,
+    /// Temp blocks written.
+    #[column(c)]
+    pub temp_blks_written: i64,
+    /// Time reading blocks, milliseconds; `0` without `track_io_timing`.
+    #[column(c)]
+    pub blk_read_time: f64,
+    /// Time writing blocks, milliseconds; `0` without `track_io_timing`.
+    #[column(c)]
+    pub blk_write_time: f64,
+    /// When statistics for this entry began accumulating.
+    #[column(g)]
+    pub first_call: Ts,
+    /// When the entry was last executed.
+    #[column(g)]
+    pub last_call: Ts,
+    /// Total planning time in milliseconds; `0` without `track_planning`.
+    #[column(c)]
+    pub total_plan_time: f64,
+    /// Minimum planning time in milliseconds; `0` without `track_planning`.
+    #[column(g)]
+    pub min_plan_time: f64,
+    /// Maximum planning time in milliseconds; `0` without `track_planning`.
+    #[column(g)]
+    pub max_plan_time: f64,
+    /// Mean planning time in milliseconds; `0` without `track_planning`.
+    #[column(g)]
+    pub mean_plan_time: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PgStorePlansVadvV1;
+    use crate::{Section, StrId, Ts, VerifiedSection, lint};
+
+    fn row(ts: i64, dbid: u32, userid: u32, plan: Option<StrId>) -> PgStorePlansVadvV1 {
+        PgStorePlansVadvV1 {
+            ts: Ts(ts),
+            queryid: 41,
+            queryid_stat_statements: 4_242_424_242_424,
+            planid: -7_000_000_001,
+            userid,
+            dbid,
+            datname: Some(StrId(1)),
+            usename: Some(StrId(2)),
+            plan,
+            calls: 12,
+            slow_log_calls: 1,
+            total_time: 1_234.5,
+            min_time: 0.5,
+            max_time: 900.0,
+            mean_time: 102.9,
+            stddev_time: 3.3,
+            rows: 400,
+            shared_blks_hit: 10,
+            shared_blks_read: 11,
+            shared_blks_dirtied: 12,
+            shared_blks_written: 13,
+            local_blks_hit: 14,
+            local_blks_read: 15,
+            local_blks_dirtied: 16,
+            local_blks_written: 17,
+            temp_blks_read: 18,
+            temp_blks_written: 19,
+            blk_read_time: 20.5,
+            blk_write_time: 21.5,
+            first_call: Ts(ts - 5_000_000),
+            last_call: Ts(ts - 1),
+            total_plan_time: 7.5,
+            min_plan_time: 0.1,
+            max_plan_time: 2.0,
+            mean_plan_time: 0.6,
+        }
+    }
+
+    #[test]
+    fn vadv_v1_contract_shape() {
+        let c = PgStorePlansVadvV1::CONTRACT;
+        assert_eq!(c.type_id.get(), 1_004_001);
+        assert_eq!(c.columns.len(), 35);
+        assert_eq!(
+            c.sort_key,
+            ["dbid", "userid", "queryid_stat_statements", "planid"]
+        );
+        assert_eq!(c.column("ts").map(|col| col.nullable), Some(false));
+        assert_eq!(c.column("queryid").map(|col| col.nullable), Some(false));
+        assert_eq!(
+            c.column("queryid_stat_statements").map(|col| col.nullable),
+            Some(false)
+        );
+        assert_eq!(c.column("plan").map(|col| col.nullable), Some(true));
+        assert_eq!(c.column("datname").map(|col| col.nullable), Some(true));
+        assert_eq!(c.column("usename").map(|col| col.nullable), Some(true));
+        assert!(c.column("slow_log_calls").is_some());
+        assert!(c.column("local_blks_hit").is_some());
+        assert!(c.column("local_blks_dirtied").is_some());
+        assert!(c.column("mean_plan_time").is_some());
+        // The vadv fork sums I/O timings; the split ossc columns must not leak in.
+        assert!(c.column("shared_blk_read_time").is_none());
+        assert_eq!(lint(&[c]), Ok(()));
+    }
+
+    #[test]
+    fn vadv_v1_roundtrip_preserves_null_plan() {
+        crate::assert_roundtrips(&[row(1_000, 5, 10, Some(StrId(77))), row(1_000, 5, 11, None)]);
+        let bytes = PgStorePlansVadvV1::encode(&[row(1_000, 5, 11, None)]).expect("encode");
+        let decoded =
+            PgStorePlansVadvV1::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
+        assert_eq!(decoded[0].plan, None);
+        assert_eq!(decoded[0].queryid_stat_statements, 4_242_424_242_424);
+        assert!((decoded[0].total_time - 1_234.5).abs() < f64::EPSILON);
+        assert_eq!(decoded[0].first_call, Ts(1_000 - 5_000_000));
+    }
+
+    #[test]
+    fn vadv_v1_encode_sorts_by_key() {
+        let bytes = PgStorePlansVadvV1::encode(&[
+            row(1_000, 9, 3, None),
+            row(1_000, 1, 8, None),
+            row(1_000, 1, 2, None),
+        ])
+        .expect("encode");
+        let decoded =
+            PgStorePlansVadvV1::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|r| (r.dbid, r.userid))
+                .collect::<Vec<_>>(),
+            [(1, 2), (1, 8), (9, 3)]
+        );
+    }
+}
