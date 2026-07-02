@@ -9,7 +9,7 @@ Feature: Collector reads pg_stat_progress_vacuum
   Scenario: no active VACUUM produces no pg_stat_progress_vacuum section
     Given a fresh database on PostgreSQL 17
     When the collector snapshots the segment
-    Then section 1_012_001 is absent
+    Then section 1_012_001 is absent from the segment
 
   @pg17 @slow @serial
   Scenario: a running manual VACUUM is captured with relid and datid matching the catalog

@@ -5,16 +5,16 @@
 //! transaction manager until explicitly committed or rolled back. The harness
 //! cleanup registers each GID so `ROLLBACK PREPARED` runs before the scenario
 //! database is dropped, even when an assertion fails.
+//!
+//! The row is selected by `datname = [scenario database]` through the shared
+//! multi-key row step in [`super::common`]; this module only prepares the
+//! transaction and arranges its rollback.
 
 use anyhow::{Context, Result};
-use cucumber::{gherkin::Step, given, then};
+use cucumber::{gherkin::Step, given};
 
-use super::common::{contract_for, parse_table_with_empty_list};
 use crate::BddWorld;
-use crate::harness::assert_row::{RowSelector, assert_row};
-use crate::steps::{docstring, table};
-
-const TYPE_ID: u32 = 1_010_001;
+use crate::steps::docstring;
 
 const GID: &str = "kronika_bdd_prepared_xacts_probe";
 
@@ -44,32 +44,4 @@ async fn prepare_transaction(world: &mut BddWorld, step: &Step) -> Result<()> {
     // triggers ROLLBACK PREPARED in the after hook.
     world.harness.add_rollback_prepared(GID.to_owned())?;
     Ok(())
-}
-
-/// Assert that section `1_010_001` has a row whose `datname` matches the
-/// scenario's isolated database.
-///
-/// The key resolves through the segment dictionary: the section stores
-/// `datname` as a `StrId`, not a plain string. The data table checks
-/// additional columns on that row.
-#[then(regex = "^section 1_010_001 has a pg_prepared_xacts row for the scenario database:$")]
-fn section_row_by_datname(world: &mut BddWorld, step: &Step) -> Result<()> {
-    let datname = world.harness.database()?.to_owned();
-    let contract = contract_for(TYPE_ID)?;
-    let rows = table(step)?;
-    let expected =
-        parse_table_with_empty_list(contract, rows, |name| world.harness.placeholder_pid(name))?;
-    let segment = world.harness.segment()?.clone();
-    let failure_log = world.harness.failure_log()?;
-    assert_row(
-        &segment,
-        TYPE_ID,
-        &RowSelector::ByStr {
-            column: "datname".to_owned(),
-            value: datname,
-        },
-        false,
-        &expected,
-        &failure_log,
-    )
 }

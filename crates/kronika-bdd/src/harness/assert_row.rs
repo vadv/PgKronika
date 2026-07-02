@@ -19,14 +19,11 @@ use crate::harness::expected::{ExpectedColumn, ExpectedValue};
 
 /// How the assertion picks the row to check.
 ///
-/// `SingleRow` serves singleton sections; `ByPid`, `ByKey`, and `ByStr` are the
-/// harness API for the per-session, keyed-row, and string-keyed assertions that
-/// per-database metric features use.
+/// `SingleRow` serves singleton sections; `ByPid` matches a session's backend
+/// pid; `ByKey` matches one scalar key column; `ByKeys` matches a conjunction of
+/// scalar and dictionary-string keys, which covers the per-database metrics that
+/// select a row by `datname` plus `relname`/label columns.
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "ByPid/ByKey are harness API for session-keyed and key-column assertions; archiver uses SingleRow, prepared_xacts uses ByStr"
-)]
 pub(crate) enum RowSelector {
     /// The section must hold exactly one row; check that one.
     SingleRow,
@@ -44,22 +41,42 @@ pub(crate) enum RowSelector {
         /// The key value to match.
         cell: Cell,
     },
-    /// Find the row whose `column` (a `StrId` column) resolves to `value`
-    /// through the segment dictionary.
+    /// Find the row that matches every key in the conjunction.
     ///
-    /// Used for string-keyed metrics like `pg_prepared_xacts` where the key
-    /// column is stored as a dictionary id, not a scalar.
-    ByStr {
-        /// The `StrId` column name, e.g. `datname`.
+    /// A scalar key compares the decoded [`Cell`]; a string key resolves the
+    /// `StrId` column through the segment dictionary. Multi-key metrics use this
+    /// to select by e.g. `relname` plus `datname`, or by three `pg_stat_io`
+    /// label columns.
+    ByKeys(Vec<KeyMatch>),
+}
+
+/// One key of a [`RowSelector::ByKeys`] conjunction.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum KeyMatch {
+    /// The row's `column` cell equals `cell`.
+    Cell {
+        /// The key column name.
+        column: String,
+        /// The value to match.
+        cell: Cell,
+    },
+    /// The row's `column` is a `StrId` that resolves to `value`.
+    Str {
+        /// The `StrId` column name, e.g. `datname`, `relname`.
         column: String,
         /// The expected string value.
         value: String,
     },
-    /// Find the row whose `StrId` columns resolve to the expected values.
-    ByStrFields {
-        /// The `(column, expected value)` pairs that must all match.
-        fields: Vec<(String, String)>,
-    },
+}
+
+impl KeyMatch {
+    /// Whether `row` satisfies this key, resolving `StrId` cells through `dict`.
+    fn matches(&self, row: &Row, dict: &Dictionary) -> bool {
+        match self {
+            Self::Cell { column, cell } => row.get(column.as_str()) == Some(cell),
+            Self::Str { column, value } => str_matches(row, column, value, dict),
+        }
+    }
 }
 
 /// Decode a section into generic rows and load the segment dictionary.
@@ -170,7 +187,7 @@ pub(crate) fn assert_row(
 
 /// Pick the row named by `selector`, if present.
 ///
-/// `ByStr` resolves through `dict`; all other selectors ignore it.
+/// String keys resolve through `dict`; scalar selectors ignore it.
 fn select_row<'a>(rows: &'a [Row], selector: &RowSelector, dict: &Dictionary) -> Option<&'a Row> {
     match selector {
         RowSelector::SingleRow => rows.first(),
@@ -180,14 +197,9 @@ fn select_row<'a>(rows: &'a [Row], selector: &RowSelector, dict: &Dictionary) ->
         RowSelector::ByKey { column, cell } => rows
             .iter()
             .find(|row| row.get(column.as_str()) == Some(cell)),
-        RowSelector::ByStr { column, value } => rows
+        RowSelector::ByKeys(keys) => rows
             .iter()
-            .find(|row| str_matches(row, column, value, dict)),
-        RowSelector::ByStrFields { fields } => rows.iter().find(|row| {
-            fields
-                .iter()
-                .all(|(column, value)| str_matches(row, column, value, dict))
-        }),
+            .find(|row| keys.iter().all(|key| key.matches(row, dict))),
     }
 }
 
@@ -227,6 +239,20 @@ fn compare_column(row: &Row, col: &ExpectedColumn, dict: &Dictionary) -> Option<
             )
         }),
         ExpectedValue::Str(want) => compare_str(&col.name, actual, want, dict),
+        ExpectedValue::AtLeast(floor) => compare_at_least(&col.name, actual, *floor),
+    }
+}
+
+/// Compare an `i64` counter cell against a `>= floor` expectation.
+fn compare_at_least(name: &str, actual: &Cell, floor: i64) -> Option<String> {
+    match actual {
+        Cell::I64(value) => {
+            (*value < floor).then(|| format!("{name}: expected >= {floor}, got {value}"))
+        }
+        other => Some(format!(
+            "{name}: expected an i64 >= {floor}, got {}",
+            dump::render_cell(other)
+        )),
     }
 }
 
@@ -259,6 +285,7 @@ fn render_expected(expected: &[ExpectedColumn]) -> String {
         let value = match &col.value {
             ExpectedValue::Cell(cell) => dump::render_cell(cell),
             ExpectedValue::Str(s) => format!("{s:?}"),
+            ExpectedValue::AtLeast(floor) => format!(">= {floor}"),
         };
         let _ = writeln!(out, "  {} = {value}", col.name);
     }
@@ -267,13 +294,50 @@ fn render_expected(expected: &[ExpectedColumn]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{RowSelector, compare_column, pid_matches, select_row};
+    use super::{KeyMatch, RowSelector, compare_column, pid_matches, select_row};
     use crate::harness::expected::{ExpectedColumn, ExpectedValue};
-    use kronika_reader::Dictionary;
+    use kronika_reader::{Dictionary, Segment};
     use kronika_registry::{Cell, Row};
 
     fn row(pairs: &[(&'static str, Cell)]) -> Row {
         pairs.iter().cloned().collect()
+    }
+
+    /// A real segment dictionary resolving `values`, returned with their ids.
+    fn dictionary_of(values: &[&str]) -> (Dictionary, Vec<u64>) {
+        use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
+
+        let limits = DictLimits::new(1 << 10, 1 << 20).expect("limits");
+        let mut interner = kronika_writer::Interner::new(limits);
+        let ids: Vec<u64> = values
+            .iter()
+            .map(|v| interner.intern(v.as_bytes()).expect("intern").get())
+            .collect();
+        let dict_sections = kronika_writer::dict::encode(interner.window()).expect("encode");
+        let section_inputs: Vec<_> = dict_sections
+            .iter()
+            .map(|s| SectionInput {
+                type_id: s.type_id,
+                rows: s.rows,
+                body: &s.body,
+            })
+            .collect();
+        let bytes = build_part(
+            &section_inputs,
+            PartMeta {
+                min_ts: 0,
+                max_ts: 0,
+                source_id: 0,
+            },
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dict.pgm");
+        std::fs::write(&path, &bytes).expect("write segment");
+        let dict = Segment::open(&path)
+            .expect("open segment")
+            .dictionary()
+            .expect("read dictionary");
+        (dict, ids)
     }
 
     #[test]
@@ -311,6 +375,98 @@ mod tests {
         };
         let found = select_row(&rows, &selector, &dict).expect("row with datid=2");
         assert_eq!(found["v"], Cell::I64(20));
+    }
+
+    #[test]
+    fn by_keys_requires_every_scalar_key_to_match() {
+        let dict = Dictionary::default();
+        let rows = vec![
+            row(&[
+                ("datid", Cell::U32(1)),
+                ("relid", Cell::U32(9)),
+                ("v", Cell::I64(10)),
+            ]),
+            row(&[
+                ("datid", Cell::U32(2)),
+                ("relid", Cell::U32(9)),
+                ("v", Cell::I64(20)),
+            ]),
+        ];
+        let selector = RowSelector::ByKeys(vec![
+            KeyMatch::Cell {
+                column: "datid".to_owned(),
+                cell: Cell::U32(2),
+            },
+            KeyMatch::Cell {
+                column: "relid".to_owned(),
+                cell: Cell::U32(9),
+            },
+        ]);
+        let found = select_row(&rows, &selector, &dict).expect("row with datid=2 and relid=9");
+        assert_eq!(found["v"], Cell::I64(20), "the conjunction picks one row");
+
+        let no_match = RowSelector::ByKeys(vec![
+            KeyMatch::Cell {
+                column: "datid".to_owned(),
+                cell: Cell::U32(2),
+            },
+            KeyMatch::Cell {
+                column: "relid".to_owned(),
+                cell: Cell::U32(999),
+            },
+        ]);
+        assert!(
+            select_row(&rows, &no_match, &dict).is_none(),
+            "one unmet key fails the whole conjunction"
+        );
+    }
+
+    #[test]
+    fn by_keys_resolves_string_keys_through_the_dictionary() {
+        let (dict, ids) = dictionary_of(&["probe", "kronika_db", "other_db"]);
+        let rows = vec![
+            row(&[
+                ("relname", Cell::StrId(ids[0])),
+                ("datname", Cell::StrId(ids[1])),
+                ("v", Cell::I64(10)),
+            ]),
+            row(&[
+                ("relname", Cell::StrId(ids[0])),
+                ("datname", Cell::StrId(ids[2])),
+                ("v", Cell::I64(20)),
+            ]),
+        ];
+        let selector = RowSelector::ByKeys(vec![
+            KeyMatch::Str {
+                column: "relname".to_owned(),
+                value: "probe".to_owned(),
+            },
+            KeyMatch::Str {
+                column: "datname".to_owned(),
+                value: "other_db".to_owned(),
+            },
+        ]);
+        let found = select_row(&rows, &selector, &dict).expect("probe in other_db");
+        assert_eq!(
+            found["v"],
+            Cell::I64(20),
+            "the same table name in another database is a distinct row"
+        );
+
+        let mixed = RowSelector::ByKeys(vec![
+            KeyMatch::Str {
+                column: "relname".to_owned(),
+                value: "probe".to_owned(),
+            },
+            KeyMatch::Str {
+                column: "datname".to_owned(),
+                value: "absent_db".to_owned(),
+            },
+        ]);
+        assert!(
+            select_row(&rows, &mixed, &dict).is_none(),
+            "an unmatched string key fails the conjunction"
+        );
     }
 
     #[test]
