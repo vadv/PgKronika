@@ -47,7 +47,9 @@
 //!   widens the timeout and retries the same database until this cap;
 //! - `KRONIKA_PG_MAX_LOCK_ROWS`: lock-wait graph guard, default 1000. The
 //!   section is skipped when no waits exist or when waiters, edges, or nodes
-//!   exceed this value.
+//!   exceed this value;
+//! - `KRONIKA_NODE_SELF_ID`: stable node id sealed into `instance_metadata`
+//!   (`1_021_001`); defaults to the hostname.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
@@ -55,9 +57,14 @@
 
 use anyhow::{Context, Result};
 use kronika_format::DictLimits;
-use kronika_registry::{MAX_SECTION_ROWS, StrId};
+use kronika_registry::instance_metadata::InstanceMetadata;
+use kronika_registry::{MAX_SECTION_ROWS, StrId, Ts};
+use kronika_source_os::{OsInstanceFacts, collect_os_instance_facts};
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
+use kronika_source_pg::instance_metadata::{
+    PgInstanceFacts, collect_pg_instance_facts, pg_system_identifier,
+};
 use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
 use kronika_source_pg::locks::{
     LocksRow, LocksVersion, collect_locks, lock_waits_exist, locks_version, to_v1 as locks_to_v1,
@@ -74,6 +81,10 @@ use kronika_source_pg::progress_vacuum::{
 };
 use kronika_source_pg::replication_instance::{
     ReplicationInstanceRow, collect_replication_instance, to_replication_instance,
+};
+use kronika_source_pg::reset_metadata::{
+    ResetBase, ResetExtensions, collect_reset_base, statements_reset_at, store_plans_reset_at,
+    to_reset_metadata,
 };
 use kronika_source_pg::statements::{
     self, StatementsRow, StatementsVersion, collect_statements, statements_extversion,
@@ -128,6 +139,8 @@ struct Config {
     heavy_timeout_cap_ms: u64,
     /// Maximum lock-wait waiters, edges, and nodes accepted for one section.
     max_lock_rows: i64,
+    /// Node id sealed into `instance_metadata`; `None` falls back to hostname.
+    node_self_id: Option<String>,
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -176,6 +189,10 @@ impl Config {
         let heavy_timeout_cap_ms = env_u64("KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS", 60_000)?;
         let max_lock_rows = i64::try_from(env_u64("KRONIKA_PG_MAX_LOCK_ROWS", 1000)?)
             .context("KRONIKA_PG_MAX_LOCK_ROWS exceeds i64")?;
+        let node_self_id = std::env::var("KRONIKA_NODE_SELF_ID")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
@@ -197,6 +214,7 @@ impl Config {
             pool_refresh_secs,
             heavy_timeout_cap_ms,
             max_lock_rows,
+            node_self_id,
         })
     }
 }
@@ -1199,6 +1217,11 @@ async fn snapshot_and_seal(
     let user_indexes = collect_user_indexes_all(pool, major, config).await;
     let statements = collect_statements_cached(pool, config, statements_cache).await;
     let store_plans_rows = collect_store_plans_cached(pool, config, plans_cache).await;
+    // The extension caches are warm now: reset metadata reads the info views
+    // through the same connections those sections were collected from.
+    let (reset_base, reset_ext) =
+        collect_reset_metadata_all(pool, major, statements_cache, plans_cache).await?;
+    let instance = collect_instance_facts(client, config).await?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -1248,6 +1271,8 @@ async fn snapshot_and_seal(
             &lock_rows,
         )?;
     }
+    push_reset_metadata(&mut buffers, &mut interner, &reset_base, &reset_ext)?;
+    push_instance_metadata(&mut buffers, &mut interner, &instance)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -1263,6 +1288,81 @@ async fn snapshot_and_seal(
     // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
+}
+
+/// Assemble `reset_metadata`: the base from the main connection plus the
+/// extension info views read through the discovered statements and plans
+/// sources. An info-view failure degrades that one timestamp to `NULL`.
+async fn collect_reset_metadata_all(
+    pool: &ConnectionPool,
+    major: u32,
+    statements_cache: &StatementsSourceCache,
+    plans_cache: &PlansSourceCache,
+) -> Result<(ResetBase, ResetExtensions)> {
+    let base = collect_reset_base(pool.main(), major)
+        .await
+        .context("collect reset metadata")?;
+    let mut ext = ResetExtensions::default();
+    if let Some(cached) = &statements_cache.selected {
+        ext.statements_version = Some(cached.extversion.clone());
+        if let Some(client) = statement_client(pool, &cached.source) {
+            match statements_reset_at(client).await {
+                Ok(reset) => ext.statements_reset_at = reset,
+                Err(err) => eprintln!(
+                    "pg_kronika-collector: pg_stat_statements_info read failed on {}: {err}",
+                    cached.source.label()
+                ),
+            }
+        }
+    }
+    if let Some(cached) = &plans_cache.selected {
+        ext.store_plans_version = Some(cached.extversion.clone());
+        if let Some(client) = statement_client(pool, &cached.source) {
+            match store_plans_reset_at(client).await {
+                Ok(reset) => ext.store_plans_reset_at = reset,
+                Err(err) => eprintln!(
+                    "pg_kronika-collector: pg_store_plans_info read failed on {}: {err}",
+                    cached.source.label()
+                ),
+            }
+        }
+    }
+    Ok((base, ext))
+}
+
+/// Everything `instance_metadata` seals, joined from both sources.
+#[derive(Debug)]
+struct InstanceFacts {
+    pg: PgInstanceFacts,
+    /// `None` when `pg_control_system()` is not executable under this role.
+    system_identifier: Option<i64>,
+    os: OsInstanceFacts,
+    node_self_id: String,
+}
+
+/// Collect the instance fingerprint; only the system identifier may degrade.
+async fn collect_instance_facts(client: &Client, config: &Config) -> Result<InstanceFacts> {
+    let pg = collect_pg_instance_facts(client)
+        .await
+        .context("collect instance metadata")?;
+    let system_identifier = match pg_system_identifier(client).await {
+        Ok(id) => Some(id),
+        Err(err) => {
+            eprintln!("pg_kronika-collector: pg_control_system() unavailable: {err}");
+            None
+        }
+    };
+    let os = collect_os_instance_facts().context("collect OS instance facts")?;
+    let node_self_id = config
+        .node_self_id
+        .clone()
+        .unwrap_or_else(|| os.hostname.clone());
+    Ok(InstanceFacts {
+        pg,
+        system_identifier,
+        os,
+        node_self_id,
+    })
 }
 
 /// Collect lock-wait rows or degrade by skipping only section `1_011`.
@@ -1543,6 +1643,48 @@ fn push_locks(
 }
 
 /// Whether a tokio-postgres error carries the given SQLSTATE code.
+/// Intern the label strings and buffer the singleton `reset_metadata` row.
+///
+/// # Errors
+/// Returns an error if a label cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_reset_metadata(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    base: &ResetBase,
+    ext: &ResetExtensions,
+) -> Result<()> {
+    let intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+    buffer_row(buffers, to_reset_metadata(base, ext, intern)?)
+}
+
+/// Intern the identity strings and buffer the singleton `instance_metadata`
+/// row.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_instance_metadata(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    facts: &InstanceFacts,
+) -> Result<()> {
+    let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+    let row = InstanceMetadata {
+        ts: Ts(facts.pg.ts),
+        hostname: intern(facts.os.hostname.as_bytes())?,
+        node_self_id: intern(facts.node_self_id.as_bytes())?,
+        pg_version_num: facts.pg.pg_version_num,
+        kernel_version: intern(facts.os.kernel_version.as_bytes())?,
+        pg_system_identifier: facts.system_identifier,
+        clock_ticks_per_sec: facts.os.clock_ticks_per_sec,
+        page_size_bytes: facts.os.page_size_bytes,
+        boot_id: intern(facts.os.boot_id.as_bytes())?,
+        btime: Ts(facts.os.btime),
+    };
+    buffer_row(buffers, row)
+}
+
 fn is_sqlstate(err: &tokio_postgres::Error, code: &str) -> bool {
     err.code().is_some_and(|state| state.code() == code)
 }

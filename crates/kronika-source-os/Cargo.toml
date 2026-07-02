@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rustix = { version = "1", features = ["param"] }
 
 [lints]
 workspace = true

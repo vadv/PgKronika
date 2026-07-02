@@ -214,7 +214,7 @@ mod tests {
             node_self_id: StrId(2),
             pg_version_num: 170_000,
             kernel_version: StrId(3),
-            pg_system_identifier: 7,
+            pg_system_identifier: Some(7),
             clock_ticks_per_sec: 100,
             page_size_bytes: 4096,
             boot_id: StrId(4),
