@@ -4,44 +4,18 @@
 //! adds the metric-specific steps that the generic row assertion and oracle
 //! steps cannot express:
 //!
-//! - asserting the section is absent (empty-state scenario),
 //! - opening a background VACUUM session without waiting for a lock,
 //! - polling until a `pg_stat_progress_vacuum` row for that session appears.
+//!
+//! The empty-state check reuses the shared `section X is absent from the
+//! segment` step in [`super::common`].
 
 use anyhow::{Context, Result};
-use cucumber::{gherkin::Step, given, then};
-use kronika_reader::Segment;
+use cucumber::{gherkin::Step, given};
 
 use crate::BddWorld;
 use crate::harness::session::Session;
-use crate::steps::common::parse_type_id;
 use crate::steps::docstring;
-
-/// Assert that section `type_id` is absent from the sealed segment.
-///
-/// Passes when the section was not written (no rows were collected). Fails with
-/// a message if the section is present.
-#[then(regex = r"^section ([\d_]+) is absent$")]
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "cucumber step parameters must be owned String"
-)]
-fn section_is_absent(world: &mut BddWorld, type_id: String) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
-    let segment_path = world.harness.segment()?.clone();
-    let segment = Segment::open(&segment_path).context("open sealed segment")?;
-    let present = segment
-        .catalog()
-        .entries
-        .iter()
-        .any(|entry| entry.type_id == type_id);
-    anyhow::ensure!(
-        !present,
-        "section {type_id} is present in the segment but was expected to be absent; \
-         a VACUUM may have started unexpectedly"
-    );
-    Ok(())
-}
 
 /// Open a named session and run its docstring SQL on a background task, returning
 /// immediately without waiting for any particular wait state.

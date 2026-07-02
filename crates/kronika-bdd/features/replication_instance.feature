@@ -1,22 +1,22 @@
 Feature: Collector seals the replication instance status singleton
-  Type 1015001 is one instance-wide row: recovery role, timeline, and WAL
+  Type 1_015_001 is one instance-wide row: recovery role, timeline, and WAL
   positions. The matrix runs standalone primaries without replicas, so the
   recorded row must have the primary shape: not in recovery, zero streaming
   replicas, and every standby/receiver column NULL — replay_lag_s included,
   because 0 is reserved for a standby whose receive and replay LSN are known
-  and equal. current_wal_lsn only advances, so it is checked as a window:
-  an oracle read taken before the snapshot is the floor, a read taken after
-  it is the ceiling, and the recorded byte offset must lie between them.
+  and equal. current_wal_lsn only advances, so the scenario captures a floor
+  before the snapshot, reads a ceiling after it, and checks that the recorded
+  byte offset lies between them.
 
   @pg17
   Scenario: a standalone primary seals one replication-instance row
     Given a fresh database on PostgreSQL 17
-    And the current WAL LSN is captured as the replication instance window floor:
+    And the window floor for section 1_015_001 current_wal_lsn is captured as:
       """
       SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::int8
       """
     When the collector snapshots the segment
-    Then section 1015001 has exactly one row:
+    Then section 1_015_001 has exactly one row:
       | is_in_recovery         | false |
       | streaming_replicas     | 0     |
       | replay_lag_s           | null  |
@@ -30,20 +30,20 @@ Feature: Collector seals the replication instance status singleton
       | latest_end_lsn         | null  |
       | latest_end_time        | null  |
       | received_tli           | null  |
-    And section 1015001 is_in_recovery matches the exact oracle:
+    And section 1_015_001 is_in_recovery matches the exact oracle:
       """
       SELECT pg_is_in_recovery()
       """
-    And section 1015001 streaming_replicas matches the exact oracle:
+    And section 1_015_001 streaming_replicas matches the exact oracle:
       """
       SELECT count(*) FILTER (WHERE state = 'streaming')::int4
       FROM pg_stat_replication
       """
-    And section 1015001 timeline_id matches the exact oracle:
+    And section 1_015_001 timeline_id matches the exact oracle:
       """
       SELECT (pg_control_checkpoint()).timeline_id::int4
       """
-    And section 1015001 current_wal_lsn matches the replication instance window oracle up to:
+    And section 1_015_001 current_wal_lsn is between the captured floor and:
       """
       SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::int8
       """

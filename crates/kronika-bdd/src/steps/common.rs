@@ -4,15 +4,16 @@
 //! metric modules. Metric-specific steps live in the matching submodule
 //! (e.g. [`archiver`]).
 
-use anyhow::{Context, Result};
-use cucumber::{gherkin::Step, then};
+use anyhow::{Context, Result, bail};
+use cucumber::{gherkin::Step, given, then};
 use kronika_reader::Segment;
-use kronika_registry::{Cell, ColumnType, TypeContract, registry};
+use kronika_registry::{Cell, ColumnType, Row, TypeContract, registry};
 
 use crate::BddWorld;
-use crate::harness::assert_row::{RowSelector, assert_row};
+use crate::harness::assert_row::{KeyMatch, RowSelector, assert_row, decode_section};
+use crate::harness::dump;
 use crate::harness::expected::{ExpectedColumn, ExpectedValue, parse_table};
-use crate::harness::oracle::{OracleKind, assert_oracle};
+use crate::harness::oracle::{OracleKind, assert_oracle, window_contains};
 use crate::steps::{docstring, table};
 
 /// Assert that a singleton section has exactly one row matching the table.
@@ -83,26 +84,32 @@ fn section_row_for_session(
     )
 }
 
-/// Assert that a section has a row identified by a named key column and value.
+/// Assert that a section has a row identified by one or more key columns.
 ///
-/// The key column and value appear in the step phrase and select the row; the
-/// data table checks further columns. `[Name]` placeholders in the table are
-/// resolved to pids.
+/// The key spec is a `column = value` conjunction joined by ` and `; the data
+/// table checks further columns. A value may be a quoted string, a bare scalar,
+/// or one of the `[scenario database]` / `[second database]` placeholders that
+/// resolve to the scenario's own or first extra database name. `[Name]`
+/// placeholders in the table are resolved to session pids.
+///
+/// Matches, for example:
+/// - `section 1_010_001 has a row with datname = [scenario database]:`
+/// - `section 1_013_003 has a row with relname = "probe" and datname = [second database]:`
+/// - `section 1_009_001 has a row with backend_type = "client backend" and object = "relation" and context = "normal":`
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) has a row with (\w+) = ([^:]+):$")]
+#[then(regex = r"^section ([\d_]+) has a row with (.+):$")]
 fn section_row_by_key(
     world: &mut BddWorld,
     type_id: String,
-    key_column: String,
-    key_value: String,
+    key_spec: String,
     step: &Step,
 ) -> Result<()> {
     let type_id = parse_type_id(&type_id)?;
     let contract = contract_for(type_id)?;
-    let key_cell = parse_key_cell(contract, &key_column, key_value.trim())?;
+    let keys = parse_key_spec(contract, &key_spec, |slot| resolve_database(world, slot))?;
     let rows = table(step)?;
     let expected =
         parse_table_with_empty_list(contract, rows, |name| world.harness.placeholder_pid(name))?;
@@ -111,26 +118,35 @@ fn section_row_by_key(
     assert_row(
         &segment,
         type_id,
-        &RowSelector::ByKey {
-            column: key_column,
-            cell: key_cell,
-        },
+        &RowSelector::ByKeys(keys),
         false,
         &expected,
         &failure_log,
     )
 }
 
+/// Resolve a `[scenario database]` / `[second database]` slot to a database name.
+fn resolve_database(world: &BddWorld, slot: &str) -> Result<String> {
+    match slot {
+        "scenario database" => Ok(world.harness.database()?.to_owned()),
+        "second database" => Ok(world.harness.extra_database_name(0)?.to_owned()),
+        other => anyhow::bail!("unknown database placeholder [{other}]"),
+    }
+}
+
 /// Verify a section column against an independent `PostgreSQL` oracle query.
 ///
 /// The oracle kind (`exact`, `subset`, `top-n`, …) is named in the step; the
-/// docstring carries the oracle SQL. The query runs on the scenario database.
-#[then(regex = r"^section ([\d_]+) (\w+) matches the ([\w-]+) oracle:$")]
+/// docstring carries the oracle SQL. The query runs on the scenario database,
+/// or on the first extra database when the phrase ends with `in the second
+/// database` — the form per-database fan-out features use to check each side.
+#[then(regex = r"^section ([\d_]+) (\w+) matches the ([\w-]+) oracle( in the second database)?:$")]
 async fn section_oracle(
     world: &mut BddWorld,
     type_id: String,
     column: String,
     kind: String,
+    second_database: String,
     step: &Step,
 ) -> Result<()> {
     let type_id = parse_type_id(&type_id)?;
@@ -139,7 +155,11 @@ async fn section_oracle(
     let sql = docstring(step)?;
     let segment = world.harness.segment()?.clone();
     let failure_log = world.harness.failure_log()?;
-    let dsn = world.harness.database_dsn()?;
+    let dsn = if second_database.is_empty() {
+        world.harness.database_dsn()?
+    } else {
+        world.harness.extra_database_dsn(0)?
+    };
     let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
         .await
         .context("connect for the oracle query")?;
@@ -183,6 +203,128 @@ fn section_absent(world: &mut BddWorld, type_id: String) -> Result<()> {
         "section {type_id} is present in the segment but must be absent for this layout"
     );
     Ok(())
+}
+
+/// Capture the window floor for a section column: run the docstring SQL now,
+/// before the snapshot, and store the value.
+///
+/// Pairs with `section X <column> is between the captured floor and:`; together
+/// they bracket a monotonically advancing counter between two oracle reads.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[given(regex = r"^the window floor for section ([\d_]+) (\w+) is captured as:$")]
+async fn window_floor_captured(
+    world: &mut BddWorld,
+    type_id: String,
+    column: String,
+    step: &Step,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let sql = docstring(step)?;
+    let floor = scalar_i64(&world.harness.database_dsn()?, sql).await?;
+    world
+        .harness
+        .set_window_floor(&window_floor_key(type_id, &column), floor);
+    Ok(())
+}
+
+/// Assert the recorded value lies between the captured floor and a ceiling read
+/// by the docstring SQL after the snapshot.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\d_]+) (\w+) is between the captured floor and:$")]
+async fn section_window_bounds(
+    world: &mut BddWorld,
+    type_id: String,
+    column: String,
+    step: &Step,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let sql = docstring(step)?;
+    let floor = world
+        .harness
+        .window_floor(&window_floor_key(type_id, &column))?;
+    let ceiling = scalar_i64(&world.harness.database_dsn()?, sql).await?;
+    let segment = world.harness.segment()?.clone();
+    let failure_log = world.harness.failure_log()?;
+    let (rows, _dict) = decode_section(&segment, type_id)?;
+    let value = match recorded_i64(&rows, &column) {
+        Ok(value) => value,
+        Err(err) => bail!(
+            "{}",
+            dump::section_dump(
+                &format!("section {type_id} {column}: {err}"),
+                &rows,
+                &failure_log,
+                &[],
+            )
+        ),
+    };
+    if window_contains(floor, value, ceiling) {
+        return Ok(());
+    }
+    bail!(
+        "{}",
+        dump::section_dump(
+            &format!(
+                "section {type_id} {column}: window bounds failed \
+                 (floor <= recorded <= ceiling)"
+            ),
+            &rows,
+            &failure_log,
+            &[
+                ("window floor", floor.to_string()),
+                ("recorded", value.to_string()),
+                ("window ceiling", ceiling.to_string()),
+            ],
+        )
+    )
+}
+
+/// The storage key for a captured window floor.
+fn window_floor_key(type_id: u32, column: &str) -> String {
+    format!("{type_id}.{column}")
+}
+
+/// The single recorded `int8` value of `column` across the decoded rows.
+fn recorded_i64(rows: &[Row], column: &str) -> Result<i64> {
+    let [row] = rows else {
+        bail!("expected exactly one row, got {}", rows.len());
+    };
+    match row.get(column) {
+        Some(Cell::I64(value)) => Ok(*value),
+        Some(other) => bail!(
+            "recorded value is {}, not an int8",
+            dump::render_cell(other)
+        ),
+        None => bail!("column absent from the decoded row"),
+    }
+}
+
+/// Run `sql` on a fresh connection to the scenario database and read the
+/// single row's first column as `int8`.
+async fn scalar_i64(dsn: &str, sql: &str) -> Result<i64> {
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .context("connect for the window bound read")?;
+    let driver = tokio::spawn(async move {
+        drop(connection.await);
+    });
+    let result = async {
+        let row = client
+            .query_one(sql, &[])
+            .await
+            .context("window bound read")?;
+        row.try_get::<_, i64>(0)
+            .context("window bound value as int8")
+    }
+    .await;
+    driver.abort();
+    result
 }
 
 /// Parse a section id as written in features (`1_008_001` or `1008001`).
@@ -297,6 +439,70 @@ pub(crate) fn parse_key_cell(contract: &TypeContract, column: &str, raw: &str) -
     Ok(cell)
 }
 
+/// Parse a `column = value [and column = value ...]` key spec into a match
+/// conjunction against `contract`.
+///
+/// A bracketed value is resolved via `resolve_slot` (the `[scenario database]`
+/// placeholders); a quoted or bare `StrId` value becomes a string key; any other
+/// value is parsed as a scalar cell for the column's type.
+pub(crate) fn parse_key_spec(
+    contract: &TypeContract,
+    spec: &str,
+    mut resolve_slot: impl FnMut(&str) -> Result<String>,
+) -> Result<Vec<KeyMatch>> {
+    let mut keys = Vec::new();
+    for clause in spec.split(" and ") {
+        let (column, raw) = clause
+            .split_once('=')
+            .with_context(|| format!("key clause {clause:?} is not `column = value`"))?;
+        let column = column.trim().to_owned();
+        let raw = raw.trim();
+        let key = if let Some(slot) = bracketed(raw) {
+            KeyMatch::Str {
+                column,
+                value: resolve_slot(slot)?,
+            }
+        } else if let Some(text) = quoted(raw) {
+            KeyMatch::Str {
+                column,
+                value: text.to_owned(),
+            }
+        } else if is_str_column(contract, &column) {
+            KeyMatch::Str {
+                column,
+                value: raw.to_owned(),
+            }
+        } else {
+            let cell = parse_key_cell(contract, &column, raw)?;
+            KeyMatch::Cell { column, cell }
+        };
+        keys.push(key);
+    }
+    anyhow::ensure!(!keys.is_empty(), "key spec {spec:?} has no clauses");
+    Ok(keys)
+}
+
+/// The content of a `[ ... ]` slot, if `raw` is one.
+fn bracketed(raw: &str) -> Option<&str> {
+    raw.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .map(str::trim)
+        .filter(|slot| !slot.is_empty())
+}
+
+/// The content of a `"..."` string, if `raw` is one.
+fn quoted(raw: &str) -> Option<&str> {
+    raw.strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+}
+
+/// Whether `column` is a `StrId` column in `contract`.
+fn is_str_column(contract: &TypeContract, column: &str) -> bool {
+    contract
+        .column(column)
+        .is_some_and(|col| col.ty == ColumnType::StrId)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{contract_for, parse_key_cell, parse_table_with_empty_list};
@@ -385,9 +591,112 @@ mod tests {
     }
 
     #[test]
+    fn recorded_i64_reads_one_cell_and_rejects_bad_shapes() {
+        use kronika_registry::Row;
+        let rows = vec![Row::from([("current_wal_lsn", Cell::I64(16_777_216))])];
+        assert_eq!(
+            super::recorded_i64(&rows, "current_wal_lsn").unwrap(),
+            16_777_216
+        );
+        assert!(super::recorded_i64(&[], "c").is_err(), "no rows fail");
+        let null_rows = vec![Row::from([("c", Cell::Null)])];
+        assert!(super::recorded_i64(&null_rows, "c").is_err(), "null fails");
+        let two = vec![
+            Row::from([("c", Cell::I64(1))]),
+            Row::from([("c", Cell::I64(2))]),
+        ];
+        assert!(super::recorded_i64(&two, "c").is_err(), "two rows fail");
+        assert!(
+            super::recorded_i64(&rows, "missing").is_err(),
+            "a missing column fails"
+        );
+    }
+
+    #[test]
     fn type_id_parses_with_and_without_underscores() {
         assert_eq!(super::parse_type_id("1_008_001").unwrap(), 1_008_001);
         assert_eq!(super::parse_type_id("1008001").unwrap(), 1_008_001);
         assert!(super::parse_type_id("porridge").is_err());
+    }
+
+    #[test]
+    fn parse_key_spec_builds_a_multi_key_conjunction() {
+        use crate::harness::assert_row::KeyMatch;
+        use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
+
+        let keys = super::parse_key_spec(
+            &PgPreparedXacts::CONTRACT,
+            r#"datname = "kronika_db" and prepared_count = 1"#,
+            |slot| anyhow::bail!("unexpected slot {slot:?}"),
+        )
+        .unwrap();
+        assert_eq!(keys.len(), 2, "both clauses become keys");
+        assert_eq!(
+            keys[0],
+            KeyMatch::Str {
+                column: "datname".to_owned(),
+                value: "kronika_db".to_owned(),
+            },
+            "a quoted value is a string key"
+        );
+        assert_eq!(
+            keys[1],
+            KeyMatch::Cell {
+                column: "prepared_count".to_owned(),
+                cell: Cell::I64(1),
+            },
+            "a scalar column parses to a cell"
+        );
+    }
+
+    #[test]
+    fn parse_key_spec_resolves_a_bracket_slot_and_bare_strid() {
+        use crate::harness::assert_row::KeyMatch;
+        use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
+
+        // A bracketed value goes through the slot resolver.
+        let keys = super::parse_key_spec(
+            &PgPreparedXacts::CONTRACT,
+            "datname = [scenario database]",
+            |slot| {
+                assert_eq!(slot, "scenario database");
+                Ok("resolved_db".to_owned())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            keys[0],
+            KeyMatch::Str {
+                column: "datname".to_owned(),
+                value: "resolved_db".to_owned(),
+            }
+        );
+
+        // A bare value against a StrId column becomes a string key, unquoted.
+        let keys =
+            super::parse_key_spec(&PgPreparedXacts::CONTRACT, "datname = plain_name", |slot| {
+                anyhow::bail!("unexpected slot {slot:?}")
+            })
+            .unwrap();
+        assert_eq!(
+            keys[0],
+            KeyMatch::Str {
+                column: "datname".to_owned(),
+                value: "plain_name".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_key_spec_rejects_a_clause_without_equals() {
+        use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
+
+        assert!(
+            super::parse_key_spec(&PgPreparedXacts::CONTRACT, "datname is kronika", |_| {
+                anyhow::bail!("no slots")
+            })
+            .is_err(),
+            "a clause with no `=` is rejected"
+        );
     }
 }

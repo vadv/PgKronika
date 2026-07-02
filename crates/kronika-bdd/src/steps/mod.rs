@@ -5,9 +5,8 @@
 //! taking the collector snapshot. Metric-specific assertions live in a
 //! submodule per metric (e.g. [`archiver`]).
 //!
-//! The generic assertion and oracle steps that a converted feature reuses are
-//! defined in the feature submodule that first needs them, because cucumber
-//! registers a step phrase once; a shared phrase would be declared here.
+//! Shared assertion and oracle phrases live in [`common`] so cucumber registers
+//! each phrase once.
 
 pub(crate) mod archiver;
 pub(crate) mod common;
@@ -37,6 +36,20 @@ async fn seed_database(world: &mut BddWorld, step: &Step) -> Result<()> {
     let dsn = world.harness.database_dsn()?;
     let session = Session::open(&dsn, sql).await?;
     // The seed session has served its purpose; close it so it holds nothing.
+    session.close().await?;
+    Ok(())
+}
+
+/// Create a second isolated database on the scenario's cluster and seed it with
+/// the step's docstring SQL, on a throwaway session.
+///
+/// Per-database fan-out scenarios use this to give the pool more than one
+/// target. The database is `extra_databases[0]`, dropped in cleanup.
+#[given("a second database seeded with:")]
+async fn seed_second_database(world: &mut BddWorld, step: &Step) -> Result<()> {
+    let sql = docstring(step)?;
+    let dsn = world.harness.add_database("db2").await?;
+    let session = Session::open(&dsn, sql).await?;
     session.close().await?;
     Ok(())
 }
