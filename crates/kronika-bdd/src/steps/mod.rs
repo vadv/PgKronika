@@ -11,6 +11,7 @@
 //! registers a step phrase once; a shared phrase would be declared here.
 
 pub(crate) mod archiver;
+pub(crate) mod common;
 
 use anyhow::{Context, Result};
 use cucumber::{gherkin::Step, given, when};
