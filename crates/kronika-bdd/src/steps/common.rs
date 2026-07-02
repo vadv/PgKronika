@@ -208,7 +208,7 @@ fn section_absent(world: &mut BddWorld, type_id: String) -> Result<()> {
 /// Capture the window floor for a section column: run the docstring SQL now,
 /// before the snapshot, and store the value.
 ///
-/// Pairs with `section X <column> matches the window oracle up to:`; together
+/// Pairs with `section X <column> is between the captured floor and:`; together
 /// they bracket a monotonically advancing counter between two oracle reads.
 #[allow(
     clippy::needless_pass_by_value,
@@ -230,14 +230,14 @@ async fn window_floor_captured(
     Ok(())
 }
 
-/// Assert the recorded value lies between the captured floor and a ceiling
-/// read by the docstring SQL now, after the snapshot.
+/// Assert the recorded value lies between the captured floor and a ceiling read
+/// by the docstring SQL after the snapshot.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) (\w+) matches the window oracle up to:$")]
-async fn section_window_oracle(
+#[then(regex = r"^section ([\d_]+) (\w+) is between the captured floor and:$")]
+async fn section_window_bounds(
     world: &mut BddWorld,
     type_id: String,
     column: String,
@@ -271,7 +271,7 @@ async fn section_window_oracle(
         "{}",
         dump::section_dump(
             &format!(
-                "section {type_id} {column}: window oracle failed \
+                "section {type_id} {column}: window bounds failed \
                  (floor <= recorded <= ceiling)"
             ),
             &rows,
@@ -310,7 +310,7 @@ fn recorded_i64(rows: &[Row], column: &str) -> Result<i64> {
 async fn scalar_i64(dsn: &str, sql: &str) -> Result<i64> {
     let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
-        .context("connect for the window oracle read")?;
+        .context("connect for the window bound read")?;
     let driver = tokio::spawn(async move {
         drop(connection.await);
     });
@@ -318,9 +318,9 @@ async fn scalar_i64(dsn: &str, sql: &str) -> Result<i64> {
         let row = client
             .query_one(sql, &[])
             .await
-            .context("window oracle read")?;
+            .context("window bound read")?;
         row.try_get::<_, i64>(0)
-            .context("window oracle value as int8")
+            .context("window bound value as int8")
     }
     .await;
     driver.abort();

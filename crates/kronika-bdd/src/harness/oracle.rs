@@ -21,10 +21,10 @@
 //! - `ceiling`: the oracle returns one upper bound; every non-null section value
 //!   must be `<=` it.
 //!
-//! The bracket-window check — a monotonically advancing counter must lie between
-//! a floor read taken before the snapshot and a ceiling read taken after it — is
-//! not an oracle *kind*. Its floor is captured before the snapshot, so it is
-//! served by the shared captured-floor step pair (see [`window_contains`]).
+//! The window-bounds check is not an oracle *kind*: a monotonically advancing
+//! counter must lie between a floor read taken before the snapshot and a ceiling
+//! read taken after it. The shared captured-floor step pair implements this
+//! check; see [`window_contains`].
 //!
 //! `top-n` and `schema` are declared by the guide but not yet implemented; they
 //! return an error naming the kind so the first feature that needs one adds it,
@@ -154,17 +154,19 @@ pub(crate) async fn assert_oracle(
 
 /// Whether `value` lies in the closed window `[floor, ceiling]`.
 ///
-/// The window-oracle check for a monotonically advancing counter: a sample
-/// recorded between two oracle reads must lie between them.
+/// Window-bounds check for a monotonically advancing counter.
+///
+/// A value recorded between two oracle reads must lie between them.
 pub(crate) const fn window_contains(floor: i64, value: i64, ceiling: i64) -> bool {
     floor <= value && value <= ceiling
 }
 
-/// A declared-but-unimplemented oracle kind. Returns an error (not a panic) that
-/// names the kind, so the first scenario needing it implements it here instead
-/// of the harness silently accepting a weaker check.
+/// A declared-but-unimplemented oracle kind.
+///
+/// Returns an error naming the kind so the first scenario needing it implements
+/// the comparison here.
 fn deferred_kind(kind: &str) -> Result<()> {
-    bail!("oracle kind {kind:?} is not implemented yet — add it when the first scenario needs it")
+    bail!("oracle kind {kind:?} is not implemented yet; add it when a scenario needs it")
 }
 
 /// Every value of `column` across the decoded rows.
@@ -328,7 +330,8 @@ fn compare_subset_text(
     )
 }
 
-/// Each oracle floor value must be met by at least one section value (`actual >= floor`).
+/// Each oracle floor value must be met by at least one section value
+/// (`actual >= floor`).
 ///
 /// Floor oracle for cumulative counters: the oracle SQL returns a known minimum
 /// (e.g. the row count inserted during setup). Passing means the section
