@@ -17,11 +17,14 @@
 
 mod cluster;
 mod collector;
+mod harness;
+mod steps;
 
 use std::path::Path;
 
 use anyhow::Context;
 use cucumber::{World, event, given, then};
+use harness::HarnessState;
 use kronika_format::{Entry, crc32c};
 use kronika_reader::{Dictionary, Resolved, Segment};
 use kronika_registry::{
@@ -29,7 +32,6 @@ use kronika_registry::{
     bgwriter_checkpointer::BgwriterCheckpointer,
     pg_prepared_xacts::PgPreparedXacts,
     pg_stat_activity::PgStatActivityV3,
-    pg_stat_archiver::PgStatArchiver,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
     pg_stat_progress_vacuum::PgStatProgressVacuum,
@@ -84,8 +86,6 @@ const PG_REPLICATION_INSTANCE_TYPE_ID: u32 = 1_015_001;
 const PG_STAT_WAL_V1_TYPE_ID: u32 = 1_007_001;
 const PG_STAT_WAL_V2_TYPE_ID: u32 = 1_007_002;
 
-const PG_STAT_ARCHIVER_TYPE_ID: u32 = 1_008_001;
-
 const PG_STAT_IO_V1_TYPE_ID: u32 = 1_009_001;
 const PG_STAT_IO_V2_TYPE_ID: u32 = 1_009_002;
 
@@ -93,24 +93,28 @@ const PG_PREPARED_XACTS_TYPE_ID: u32 = 1_010_001;
 
 const PG_STAT_PROGRESS_VACUUM_TYPE_ID: u32 = 1_012_001;
 
-/// Cucumber state for one scenario: the matrix booted by the `Given` step.
+/// Cucumber state for one scenario.
+///
+/// `clusters` borrows the process-wide matrix (booted once, not per scenario).
+/// `harness` holds the new-style per-scenario state — named sessions, the
+/// selected database, and the last snapshot — and is torn down in the `after`
+/// hook.
 #[derive(Debug, Default, World)]
 struct BddWorld {
-    clusters: Vec<cluster::Cluster>,
+    clusters: &'static [cluster::Cluster],
+    harness: HarnessState,
 }
 
 #[given("the PostgreSQL matrix is booted")]
 async fn boot_matrix_step(world: &mut BddWorld) -> anyhow::Result<()> {
-    let spec = std::env::var("KRONIKA_PG_MATRIX").context("KRONIKA_PG_MATRIX is not set")?;
-    let matrix = cluster::parse_matrix(&spec)?;
-    world.clusters = cluster::boot_matrix(&matrix).await?;
+    world.clusters = cluster::shared_matrix().await?;
     Ok(())
 }
 
 #[then("every version answers a version query")]
 async fn every_version_answers(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let version = db.server_version().await?;
         let major = db.major().to_string();
         anyhow::ensure!(
@@ -124,7 +128,7 @@ async fn every_version_answers(world: &mut BddWorld) -> anyhow::Result<()> {
 #[then("every version reports valid bgwriter/checkpointer stats")]
 async fn every_version_reports_stats(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let conn = db.connect().await?;
         let major = conn
             .major()
@@ -203,7 +207,7 @@ fn assert_version_columns(major: u32, snap: &BgwriterCheckpointer) -> anyhow::Re
 #[then("every version is collected into a sealed segment with section 1_006_001")]
 async fn every_version_seals_a_segment(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
         assert_sealed_section(db.major(), &segment)?;
@@ -269,7 +273,7 @@ fn decode_sealed_row(path: &Path, entry: &Entry) -> anyhow::Result<BgwriterCheck
 #[then("every version seals a segment whose pg_stat_activity rows resolve through the dictionary")]
 async fn every_version_seals_activity(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
         assert_activity_section(db.major(), &segment)?;
@@ -376,7 +380,7 @@ fn decode_activity_rows(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStat
 )]
 async fn every_version_seals_database(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
         assert_database_section(db.major(), &segment)?;
@@ -610,7 +614,7 @@ fn check_database_rows(
 )]
 async fn every_version_seals_user_tables(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         for datname in SEEDED_DATABASES {
             seed_user_table_database(db, datname).await?;
         }
@@ -840,7 +844,7 @@ fn check_user_tables_rows(
 )]
 async fn every_version_seals_user_indexes(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         for datname in SEEDED_DATABASES {
             seed_user_table_database(db, datname).await?;
         }
@@ -1060,7 +1064,7 @@ fn check_user_indexes_rows(
 )]
 async fn every_version_seals_statements(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let version = install_statements_and_run_workload(db).await?;
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
@@ -1231,7 +1235,7 @@ fn resolve_dictionary_bytes(
 #[then("each matrix cluster seals its replication instance status")]
 async fn every_version_seals_replication_instance(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
         assert_replication_instance_section(db.major(), &segment)?;
@@ -1242,7 +1246,7 @@ async fn every_version_seals_replication_instance(world: &mut BddWorld) -> anyho
 #[then("each matrix cluster accepts optional pg_stat_progress_vacuum sections")]
 async fn every_version_accepts_progress_vacuum(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
         assert_optional_progress_vacuum_section(db.major(), &segment)?;
@@ -1413,7 +1417,7 @@ fn check_progress_vacuum_rows(
 #[then("each matrix cluster seals a single-row pg_stat_wal section")]
 async fn every_version_seals_wal(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
         assert_wal_section(db.major(), &segment)?;
@@ -1424,7 +1428,7 @@ async fn every_version_seals_wal(world: &mut BddWorld) -> anyhow::Result<()> {
 #[then("each matrix cluster seals prepared pg_prepared_xacts rows")]
 async fn every_version_seals_prepared(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let mut collector = collector::Collector::spawn(db).await?;
         let idle_segment = collector.snapshot().await?;
         assert_no_prepared_section(db.major(), &idle_segment)?;
@@ -1449,21 +1453,10 @@ async fn every_version_seals_prepared(world: &mut BddWorld) -> anyhow::Result<()
 #[then("every version handles pg_stat_io per its layout, resolving labels through the dictionary")]
 async fn every_version_handles_io(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
+    for db in world.clusters {
         let mut collector = collector::Collector::spawn(db).await?;
         let segment = collector.snapshot().await?;
         assert_io_section(db.major(), &segment)?;
-    }
-    Ok(())
-}
-
-#[then("every version seals a single-row pg_stat_archiver section")]
-async fn every_version_seals_archiver(world: &mut BddWorld) -> anyhow::Result<()> {
-    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in &world.clusters {
-        let mut collector = collector::Collector::spawn(db).await?;
-        let segment = collector.snapshot().await?;
-        assert_archiver_section(db.major(), &segment)?;
     }
     Ok(())
 }
@@ -1843,84 +1836,6 @@ fn single_wal_row<T>(major: u32, rows: Vec<T>) -> anyhow::Result<T> {
     Ok(row)
 }
 
-/// Check singleton shape, counters, timestamp, and optional WAL-name dictionary ids.
-fn assert_archiver_section(major: u32, path: &Path) -> anyhow::Result<()> {
-    let segment =
-        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
-    let catalog = segment.catalog();
-    let entry = catalog
-        .entries
-        .iter()
-        .find(|entry| entry.type_id == PG_STAT_ARCHIVER_TYPE_ID)
-        .with_context(|| format!("postgres {major}: segment has no section 1_008_001"))?;
-    let rows = decode_archiver(path, entry)
-        .with_context(|| format!("postgres {major}: read back section 1_008_001"))?;
-    anyhow::ensure!(
-        rows.len() == 1,
-        "postgres {major}: pg_stat_archiver is a singleton, got {} rows",
-        rows.len()
-    );
-    let row = rows[0];
-    ensure_ts_in_segment_range(
-        major,
-        "section 1_008_001",
-        row.ts.0,
-        catalog.min_ts,
-        catalog.max_ts,
-    )?;
-    anyhow::ensure!(
-        row.archived_count >= 0 && row.failed_count >= 0,
-        "postgres {major}: archiver counters came back negative"
-    );
-    if let Some(reset) = row.stats_reset {
-        anyhow::ensure!(
-            reset.0 <= row.ts.0,
-            "postgres {major}: archiver stats_reset {} is after snapshot ts {}",
-            reset.0,
-            row.ts.0
-        );
-    }
-    if row.last_archived_wal.is_some() || row.last_failed_wal.is_some() {
-        let dict = segment
-            .dictionary()
-            .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
-        resolve_archiver_wal(major, &dict, "last_archived_wal", row.last_archived_wal)?;
-        resolve_archiver_wal(major, &dict, "last_failed_wal", row.last_failed_wal)?;
-    }
-    Ok(())
-}
-
-fn resolve_archiver_wal(
-    major: u32,
-    dict: &Dictionary,
-    field: &str,
-    wal: Option<StrId>,
-) -> anyhow::Result<()> {
-    if let Some(wal) = wal {
-        anyhow::ensure!(
-            matches!(dict.resolve(wal.0), Some(Resolved::String(_))),
-            "postgres {major}: {field} str_id {} did not resolve through the dictionary",
-            wal.0
-        );
-    }
-    Ok(())
-}
-
-/// Read the catalog-bounded section and decode its typed rows.
-fn decode_archiver(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStatArchiver>> {
-    use std::os::unix::fs::FileExt;
-
-    let len = usize::try_from(entry.len).context("section len overflows usize")?;
-    anyhow::ensure!(
-        len <= MAX_SECTION_BYTES,
-        "section of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
-    );
-    let mut body = vec![0_u8; len];
-    std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
-    let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
-        .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
-    PgStatArchiver::decode(verified).context("typed decode of section 1_008_001")
-}
 #[then("each matrix cluster opens per-database pool connections")]
 async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> anyhow::Result<()> {
     use kronika_source_pg::pool::{
@@ -1934,7 +1849,7 @@ async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> an
         lock_timeout_ms: 1_000,
         idle_in_tx_timeout_ms: 10_000,
     };
-    for db in &world.clusters {
+    for db in world.clusters {
         let dsn = db.conn_string();
         let mut pool =
             ConnectionPool::connect(&dsn, "pg_kronika-bdd", session, HashSet::new()).await?;
@@ -1964,31 +1879,34 @@ async fn every_cluster_opens_per_db_pool_connections(world: &mut BddWorld) -> an
 #[tokio::main]
 async fn main() {
     let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
-    // On a failed scenario, dump each booted cluster's PostgreSQL server log so
-    // CI shows the server-side cause (e.g. a rejected statement) instead of only
-    // the opaque step panic. PostgreSQL logs errors regardless of DEBUG.
+    // Every scenario: tear down its harness state (held transactions, blocking
+    // tasks, temp databases). On failure: dump each booted cluster's PostgreSQL
+    // server log so CI shows the server-side cause (e.g. a rejected statement)
+    // instead of only the opaque step panic. PostgreSQL logs errors regardless
+    // of DEBUG.
     BddWorld::cucumber()
         .after(|_feature, _rule, _scenario, ev, world| {
             Box::pin(async move {
-                if !matches!(
+                let failed = matches!(
                     ev,
                     event::ScenarioFinished::StepFailed(..)
                         | event::ScenarioFinished::BeforeHookFailed(_)
-                ) {
-                    return;
-                }
+                );
                 if let event::ScenarioFinished::StepFailed(_, _, err) = ev {
                     eprintln!("=== BDD step failed: {err} ===");
                 }
                 if let Some(world) = world {
-                    for cluster in &world.clusters {
-                        eprintln!(
-                            "=== postgres {} server.log ===\n{}\n=== end postgres {} server.log ===",
-                            cluster.major(),
-                            cluster.server_log(),
-                            cluster.major(),
-                        );
+                    if failed {
+                        for cluster in world.clusters {
+                            eprintln!(
+                                "=== postgres {} server.log ===\n{}\n=== end postgres {} server.log ===",
+                                cluster.major(),
+                                cluster.server_log(),
+                                cluster.major(),
+                            );
+                        }
                     }
+                    world.harness.cleanup().await;
                 }
             })
         })
