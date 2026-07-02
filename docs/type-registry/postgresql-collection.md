@@ -130,11 +130,11 @@ Fork определяется при старте по наличию функц
 Время IO у vadv-форка нормализуется как сумма shared, local и temp
 `blk_*_time`.
 
-## `1_011_001` дерево ожиданий lock
+## `1_011_001` / `1_011_002` граф ожиданий lock
 
-Сбор двухступенчатый.
+Сбор двухступенчатый. Класс A — соединение из `pool.main()`.
 
-Ступень 1: дешевая предварительная проверка с кэшем около 1 секунды.
+**Ступень 1:** дешёвая предварительная проверка по `pg_stat_activity`.
 
 ```sql
 /* pg_kronika:<version> <source-file> */
@@ -145,27 +145,77 @@ SELECT EXISTS (
 );
 ```
 
-Ступень 2: рекурсивный CTE выполняется только если предварительная проверка
-нашла ожидания.
+`pg_blocking_pids` вызывается только для backend'ов с
+`wait_event_type = 'Lock'` (семена графа). Так коллектор не берёт lock manager
+для backend'ов, которые не ждут lock.
 
-```sql
-WITH RECURSIVE blockers AS (
-  SELECT
-    pid,
-    pg_blocking_pids(pid) AS blocked_by,
-    1 AS depth,
-    pid AS root_pid
-  FROM pg_stat_activity
-  WHERE cardinality(pg_blocking_pids(pid)) > 0
+Если предварительная проверка не нашла ожиданий, ступень 2 не выполняется;
+секция в сегмент не пишется.
 
-  UNION ALL
-  ...
-) SELECT ...
-LIMIT :max_rows;
+**Ступень 2:** один statement-снимок строит список waiters, один раз вызывает
+`pg_blocking_pids(pid)` для каждого waiter, дедуплицирует `blocked_by`, проверяет
+guard объёма и только затем запускает cycle-safe рекурсию. Узлы джойнятся с
+детерминированным `DISTINCT ON (pid)` по `pg_locks NOT GRANTED`, чтобы получить
+тип, режим и цель ожидаемой блокировки.
+
+```text
+WITH RECURSIVE
+  waiters_raw AS (
+    SELECT pid, pg_blocking_pids(pid) AS bp
+    FROM pg_stat_activity
+    WHERE wait_event_type = 'Lock'
+  ),
+  waiters AS (
+    SELECT pid, dedup(bp) AS bp
+    FROM waiters_raw
+  ),
+  edges AS (SELECT pid AS waiter, b AS blocker FROM waiters, unnest(bp) AS b),
+  guard AS (
+    SELECT count(waiters) <= :max_rows
+       AND count(edges) <= :max_rows
+       AND count(nodes) <= :max_rows AS ok
+  ),
+  primary_tree AS (
+    -- real backend roots plus prepared-xact root_pid=0 anchors
+  ) CYCLE pid SET is_cycle USING path, -- PG14+; PG10-13: manual path guard
+  fallback_tree AS (
+    -- rootless/cyclic components not reached from primary_tree
+  ) CYCLE pid SET is_cycle USING fallback_path,
+  nodes AS (SELECT deterministic_anchor(primary_tree, fallback_tree)),
+  waiting_locks AS (
+    SELECT DISTINCT ON (pid) *
+    FROM pg_locks
+    WHERE NOT granted
+    ORDER BY pid, locktype, mode, database NULLS FIRST, relation NULLS FIRST,
+             page NULLS FIRST, tuple NULLS FIRST, virtualxid NULLS FIRST,
+             transactionid NULLS FIRST, classid NULLS FIRST, objid NULLS FIRST,
+             objsubid NULLS FIRST, fastpath
+  )
+SELECT n.pid, n.depth, n.root_pid, /* + backend- и lock-колонки */
+       coalesce(w.bp, ARRAY[]::int[]) AS blocked_by
+FROM nodes n JOIN pg_stat_activity USING (pid)
+LEFT JOIN waiters w ON w.pid = n.pid
+LEFT JOIN waiting_locks l ON l.pid = n.pid;
 ```
 
-CTE должен подниматься к корням блокировок и джойниться с `pg_locks`, чтобы
-получить тип, режим и цель lock.
+Первичные семена рекурсии — backend-корни (блокеры, сами не ждущие) и
+prepared-xact якоря `root_pid = 0`. PID `0` не получает синтетическую
+`pg_stat_activity`-строку, но waiter за prepared-xact сохраняется с
+`blocked_by`, содержащим `0`. Если компонент не достижим из backend-корня или
+PID `0`, fallback-обход выбирает детерминированный backend-якорь, поэтому чистые
+циклы/окна дедлока не пропадают.
+
+Имя таблицы (`lock_relname`) берётся через `pg_class`, когда отношение видно из
+базы подключения коллектора или относится к shared-каталогу
+(`pg_locks.database = current_database_oid OR 0`). Блокировки в других базах
+кластера дают пустое имя при сохранённых raw-полях `lock_database` и
+`lock_relation`.
+
+`KRONIKA_PG_MAX_LOCK_ROWS` (по умолчанию `1000`, минимум `1`) — guard на
+waiters, edges и backend nodes, а не финальный `LIMIT`. Если guard срабатывает,
+`1_011` в этом снимке не пишется, коллектор логирует waiters/edges/nodes и
+продолжает запечатывать остальные секции. Ошибка или timeout lock-query ведут к
+такой же деградации только для `1_011`.
 
 ## `1_013_001`..`1_013_004` / `1_014_001`..`1_014_002` tables и indexes
 

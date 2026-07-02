@@ -174,6 +174,7 @@ impl Cluster {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct Conn {
     client: tokio_postgres::Client,
     /// Server major version from the handshake, e.g. `Some(17)`.
