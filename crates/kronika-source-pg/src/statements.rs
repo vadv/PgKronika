@@ -837,6 +837,20 @@ pub async fn collect_statements(
     Ok(rows.iter().map(|row| row_from_pg(row, version)).collect())
 }
 
+/// Entries in `pg_stat_statements` on this connection, for coverage.
+///
+/// # Errors
+/// Returns the [`tokio_postgres::Error`] if the query fails.
+pub async fn count_statements(client: &Client) -> Result<i64, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            marked!("SELECT count(*)::int8 AS n FROM pg_stat_statements(false)"),
+            &[],
+        )
+        .await?;
+    Ok(row.get("n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
