@@ -50,16 +50,15 @@
         # PGXS build of the vadv pg_store_plans fork against one major.
         mkStorePlansVadv =
           pg:
-          pkgs.stdenv.mkDerivation {
+          pg.pkgs.postgresqlBuildExtension (_: {
             pname = "pg_store_plans-vadv";
             version = "2.1";
             src = pg-store-plans-vadv;
-            nativeBuildInputs = [ pg.pg_config ];
-            buildInputs = [ pg ];
             makeFlags = [
               "USE_PGXS=1"
               "PG_CONFIG=${pg.pg_config}/bin/pg_config"
             ];
+            enableUpdateScript = false;
             installPhase = ''
               runHook preInstall
               install -D -t $out/lib pg_store_plans.so
@@ -67,7 +66,7 @@
                 pg_store_plans.control pg_store_plans--*.sql
               runHook postInstall
             '';
-          };
+          });
 
         # The image includes the vadv fork on PG17/18. PG15/16 omit
         # pg_store_plans because both forks install the same file names.
