@@ -39,12 +39,76 @@ Feature: Collector reads the pg_locks wait tree
       | lock_locktype | null |
       | lock_mode     | null |
       | lock_granted  | null |
-    And section 1_011_002 blocked_by matches the subset oracle:
+    And section 1_011_002 blocked_by matches the exact oracle:
       """
-      SELECT pg_blocking_pids(pid)
-      FROM pg_stat_activity
-      WHERE datname = current_database()
-        AND wait_event_type = 'Lock'
+      WITH waiters AS (
+        SELECT pid, pg_blocking_pids(pid) AS blocked_by
+        FROM pg_stat_activity
+        WHERE datname = current_database()
+          AND wait_event_type = 'Lock'
+      ),
+      nodes AS (
+        SELECT pid FROM waiters
+        UNION
+        SELECT unnest(blocked_by) FROM waiters
+      )
+      SELECT pg_blocking_pids(a.pid)
+      FROM nodes n
+      JOIN pg_stat_activity a ON a.pid = n.pid
+      """
+    And section 1_011_002 root_pid matches the exact oracle:
+      """
+      WITH waiters AS (
+        SELECT pid, pg_blocking_pids(pid) AS blocked_by
+        FROM pg_stat_activity
+        WHERE datname = current_database()
+          AND wait_event_type = 'Lock'
+      ),
+      nodes AS (
+        SELECT pid FROM waiters
+        UNION
+        SELECT unnest(blocked_by) FROM waiters
+      )
+      SELECT COALESCE((pg_blocking_pids(a.pid))[1], a.pid)::int
+      FROM nodes n
+      JOIN pg_stat_activity a ON a.pid = n.pid
+      """
+    And section 1_011_002 depth matches the exact oracle:
+      """
+      WITH waiters AS (
+        SELECT pid, pg_blocking_pids(pid) AS blocked_by
+        FROM pg_stat_activity
+        WHERE datname = current_database()
+          AND wait_event_type = 'Lock'
+      ),
+      nodes AS (
+        SELECT pid FROM waiters
+        UNION
+        SELECT unnest(blocked_by) FROM waiters
+      )
+      SELECT CASE WHEN cardinality(pg_blocking_pids(a.pid)) = 0 THEN 0 ELSE 1 END::int
+      FROM nodes n
+      JOIN pg_stat_activity a ON a.pid = n.pid
+      """
+    And section 1_011_002 lock_transactionid matches the subset oracle:
+      """
+      SELECT l.transactionid::text::bigint
+      FROM pg_locks l
+      JOIN pg_stat_activity a ON a.pid = l.pid
+      WHERE a.datname = current_database()
+        AND a.wait_event_type = 'Lock'
+        AND l.locktype = 'transactionid'
+        AND NOT l.granted
+      """
+    And section 1_011_002 waitstart matches the subset oracle:
+      """
+      SELECT (EXTRACT(EPOCH FROM l.waitstart) * 1000000)::bigint
+      FROM pg_locks l
+      JOIN pg_stat_activity a ON a.pid = l.pid
+      WHERE a.datname = current_database()
+        AND a.wait_event_type = 'Lock'
+        AND l.locktype = 'transactionid'
+        AND NOT l.granted
       """
     And section 1_011_001 is absent from the segment
 
