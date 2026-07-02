@@ -172,6 +172,8 @@ impl HarnessState {
     /// that prevent `DROP DATABASE` from succeeding.
     pub(crate) fn add_rollback_prepared(&mut self, gid: String) {
         self.pending_rollbacks.push(gid);
+    }
+
     /// Poll `pg_stat_progress_vacuum` until a row for session `name` appears.
     ///
     /// # Errors
