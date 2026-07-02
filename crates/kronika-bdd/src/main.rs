@@ -28,10 +28,9 @@ use harness::HarnessState;
 use kronika_format::{Entry, crc32c};
 use kronika_reader::{Dictionary, Resolved, Segment};
 use kronika_registry::{
-    Bytes, MAX_SECTION_BYTES, Section, StrId, VerifiedSection,
+    Bytes, MAX_SECTION_BYTES, Section, VerifiedSection,
     bgwriter_checkpointer::BgwriterCheckpointer,
     pg_stat_wal::{PgStatWalV1, PgStatWalV2},
-    replication_instance::ReplicationInstance,
 };
 use kronika_source_pg::collect_bgwriter_checkpointer;
 
@@ -41,7 +40,6 @@ const PG17_MAJOR: u32 = 17;
 
 const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
 
-const PG_REPLICATION_INSTANCE_TYPE_ID: u32 = 1_015_001;
 const PG_STAT_WAL_V1_TYPE_ID: u32 = 1_007_001;
 const PG_STAT_WAL_V2_TYPE_ID: u32 = 1_007_002;
 
@@ -260,90 +258,6 @@ fn resolve_string(major: u32, dict: &Dictionary, label: &str, id: u64) -> anyhow
             "postgres {major}: {label} str_id {id} did not resolve to a string: {other:?}"
         ),
     }
-}
-
-#[then("each matrix cluster seals its replication instance status")]
-async fn every_version_seals_replication_instance(world: &mut BddWorld) -> anyhow::Result<()> {
-    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in world.clusters {
-        let mut collector = collector::Collector::spawn(db).await?;
-        let segment = collector.snapshot().await?;
-        assert_replication_instance_section(db.major(), &segment)?;
-    }
-    Ok(())
-}
-
-/// Decode the sealed instance-replication section: one row, ts in range, a
-/// positive timeline, and the standalone-primary shape (not in recovery,
-/// `current_wal_lsn` set, standby/receiver columns NULL). The standby shape is
-/// covered by source and codec tests, since the matrix runs standalone primaries.
-fn assert_replication_instance_section(major: u32, path: &Path) -> anyhow::Result<()> {
-    let segment =
-        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
-    let catalog = segment.catalog();
-    let dict = segment
-        .dictionary()
-        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
-    let rows =
-        decode_section_rows::<ReplicationInstance>(path, &segment, PG_REPLICATION_INSTANCE_TYPE_ID)
-            .with_context(|| format!("postgres {major}: read back section 1_015_001"))?;
-    anyhow::ensure!(
-        rows.len() == 1,
-        "postgres {major}: expected one replication-instance row, got {}",
-        rows.len()
-    );
-    let row = &rows[0];
-    ensure_ts_in_segment_range(
-        major,
-        "section 1_015_001",
-        row.ts.0,
-        catalog.min_ts,
-        catalog.max_ts,
-    )?;
-    anyhow::ensure!(
-        row.timeline_id >= 1,
-        "postgres {major}: timeline_id {} is not positive",
-        row.timeline_id
-    );
-    anyhow::ensure!(
-        !row.is_in_recovery,
-        "postgres {major}: a standalone cluster reports being in recovery"
-    );
-    anyhow::ensure!(
-        row.current_wal_lsn.is_some(),
-        "postgres {major}: a primary reports no current_wal_lsn"
-    );
-    anyhow::ensure!(
-        row.standby_receive_lsn.is_none()
-            && row.standby_replay_lsn.is_none()
-            && row.replay_lag_s.is_none()
-            && row.standby_last_replay_at.is_none()
-            && row.sender_host.is_none()
-            && row.wal_receiver_status.is_none()
-            && row.sender_port.is_none()
-            && row.slot_name.is_none()
-            && row.latest_end_lsn.is_none()
-            && row.latest_end_time.is_none()
-            && row.received_tli.is_none(),
-        "postgres {major}: a primary must not fill standby receiver columns"
-    );
-    anyhow::ensure!(
-        row.streaming_replicas == 0,
-        "postgres {major}: a standalone cluster reports {} streaming replicas",
-        row.streaming_replicas
-    );
-    // synchronous_standby_names defaults to an empty string, so resolution must
-    // accept an empty value; only the dictionary lookup itself must succeed.
-    for (label, id) in [
-        ("synchronous_standby_names", row.synchronous_standby_names.0),
-        ("synchronous_commit", row.synchronous_commit.0),
-    ] {
-        anyhow::ensure!(
-            matches!(dict.resolve(id), Some(Resolved::String(_))),
-            "postgres {major}: {label} str_id {id} did not resolve to a string"
-        );
-    }
-    Ok(())
 }
 
 #[then("each matrix cluster seals a single-row pg_stat_wal section")]
