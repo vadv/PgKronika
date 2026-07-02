@@ -19,8 +19,13 @@ use crate::steps::{docstring, table};
 /// Used by any metric whose section carries a single row (archiver, wal,
 /// replication instance). The expected values are written as a `| column |
 /// value |` table in the `.feature`.
-#[then(regex = r"^section (\d+) has exactly one row:$")]
-fn section_single_row(world: &mut BddWorld, type_id: u32, step: &Step) -> Result<()> {
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\d_]+) has exactly one row:$")]
+fn section_single_row(world: &mut BddWorld, type_id: String, step: &Step) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
     let contract = contract_for(type_id)?;
     let rows = table(step)?;
     let expected = parse_table(contract, rows, |name| world.harness.placeholder_pid(name))?;
@@ -44,20 +49,21 @@ fn section_single_row(world: &mut BddWorld, type_id: u32, step: &Step) -> Result
 /// resolved to pids; `[]` is an empty `ListI32`.
 ///
 /// Matches:
-/// - `section 1011 has a row for session "W":`
-/// - `section 1011 has exactly one row for session "W":`
+/// - `section 1_011_001 has a row for session "W":`
+/// - `section 1_011_001 has exactly one row for session "W":`
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = "^section (\\d+) has ((?:exactly one )?a? ?)row for session \"([^\"]+)\":$")]
+#[then(regex = "^section ([\\d_]+) has ((?:exactly one )?a? ?)row for session \"([^\"]+)\":$")]
 fn section_row_for_session(
     world: &mut BddWorld,
-    type_id: u32,
+    type_id: String,
     qualifier: String,
     session_name: String,
     step: &Step,
 ) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
     let exactly_one = qualifier.trim().starts_with("exactly one");
     let pid = world.harness.placeholder_pid(&session_name)?;
     let contract = contract_for(type_id)?;
@@ -85,14 +91,15 @@ fn section_row_for_session(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section (\d+) has a row with (\w+) = ([^:]+):$")]
+#[then(regex = r"^section ([\d_]+) has a row with (\w+) = ([^:]+):$")]
 fn section_row_by_key(
     world: &mut BddWorld,
-    type_id: u32,
+    type_id: String,
     key_column: String,
     key_value: String,
     step: &Step,
 ) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
     let contract = contract_for(type_id)?;
     let key_cell = parse_key_cell(contract, &key_column, key_value.trim())?;
     let rows = table(step)?;
@@ -117,14 +124,15 @@ fn section_row_by_key(
 ///
 /// The oracle kind (`exact`, `subset`, `top-n`, …) is named in the step; the
 /// docstring carries the oracle SQL. The query runs on the scenario database.
-#[then(regex = r"^section (\d+) (\w+) matches the ([\w-]+) oracle:$")]
+#[then(regex = r"^section ([\d_]+) (\w+) matches the ([\w-]+) oracle:$")]
 async fn section_oracle(
     world: &mut BddWorld,
-    type_id: u32,
+    type_id: String,
     column: String,
     kind: String,
     step: &Step,
 ) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
     let contract = contract_for(type_id)?;
     let kind = OracleKind::parse(&kind)?;
     let sql = docstring(step)?;
@@ -149,6 +157,13 @@ async fn section_oracle(
     .await;
     driver.abort();
     result
+}
+
+/// Parse a section id as written in features (`1_008_001` or `1008001`).
+pub(crate) fn parse_type_id(raw: &str) -> Result<u32> {
+    raw.replace('_', "")
+        .parse::<u32>()
+        .with_context(|| format!("invalid section type_id {raw:?}"))
 }
 
 /// The registry contract for `type_id`, or an error if it is not registered.
@@ -338,5 +353,17 @@ mod tests {
             OracleKind::parse("transformed").unwrap(),
             OracleKind::Transformed
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_type_id;
+
+    #[test]
+    fn type_id_parses_with_and_without_underscores() {
+        assert_eq!(parse_type_id("1_008_001").unwrap(), 1_008_001);
+        assert_eq!(parse_type_id("1008001").unwrap(), 1_008_001);
+        assert!(parse_type_id("porridge").is_err());
     }
 }
