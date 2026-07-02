@@ -32,6 +32,7 @@ pub use activity::{
 
 pub mod archiver;
 pub mod database;
+pub mod instance_metadata;
 pub mod io;
 pub mod locks;
 
@@ -43,6 +44,7 @@ pub mod prepared_xacts;
 pub mod progress_vacuum;
 
 pub mod replication_instance;
+pub mod reset_metadata;
 
 pub mod statements;
 pub mod store_plans;
