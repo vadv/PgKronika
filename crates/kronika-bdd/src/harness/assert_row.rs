@@ -19,13 +19,13 @@ use crate::harness::expected::{ExpectedColumn, ExpectedValue};
 
 /// How the assertion picks the row to check.
 ///
-/// `SingleRow` serves singleton sections; `ByPid` and `ByKey` are the harness
-/// API for the per-session and keyed row assertions that later features (locks,
-/// per-database metrics) will use.
+/// `SingleRow` serves singleton sections; `ByPid`, `ByKey`, and `ByStr` are the
+/// harness API for the per-session, keyed-row, and string-keyed assertions that
+/// per-database metric features use.
 #[derive(Debug, Clone)]
 #[allow(
     dead_code,
-    reason = "ByPid/ByKey are harness API for the session-keyed and key-column assertions per-feature agents add next; archiver only needs SingleRow"
+    reason = "ByPid/ByKey are harness API for session-keyed and key-column assertions; archiver uses SingleRow, prepared_xacts uses ByStr"
 )]
 pub(crate) enum RowSelector {
     /// The section must hold exactly one row; check that one.
@@ -43,6 +43,17 @@ pub(crate) enum RowSelector {
         column: String,
         /// The key value to match.
         cell: Cell,
+    },
+    /// Find the row whose `column` (a `StrId` column) resolves to `value`
+    /// through the segment dictionary.
+    ///
+    /// Used for string-keyed metrics like `pg_prepared_xacts` where the key
+    /// column is stored as a dictionary id, not a scalar.
+    ByStr {
+        /// The `StrId` column name, e.g. `datname`.
+        column: String,
+        /// The expected string value.
+        value: String,
     },
 }
 
@@ -117,7 +128,7 @@ pub(crate) fn assert_row(
         );
     }
 
-    let row = select_row(&rows, selector).ok_or_else(|| {
+    let row = select_row(&rows, selector, &dict).ok_or_else(|| {
         anyhow::anyhow!(
             "{}",
             dump::section_dump(
@@ -153,7 +164,9 @@ pub(crate) fn assert_row(
 }
 
 /// Pick the row named by `selector`, if present.
-fn select_row<'a>(rows: &'a [Row], selector: &RowSelector) -> Option<&'a Row> {
+///
+/// `ByStr` resolves through `dict`; all other selectors ignore it.
+fn select_row<'a>(rows: &'a [Row], selector: &RowSelector, dict: &Dictionary) -> Option<&'a Row> {
     match selector {
         RowSelector::SingleRow => rows.first(),
         RowSelector::ByPid { column, pid } => {
@@ -162,6 +175,20 @@ fn select_row<'a>(rows: &'a [Row], selector: &RowSelector) -> Option<&'a Row> {
         RowSelector::ByKey { column, cell } => rows
             .iter()
             .find(|row| row.get(column.as_str()) == Some(cell)),
+        RowSelector::ByStr { column, value } => rows
+            .iter()
+            .find(|row| str_matches(row, column, value, dict)),
+    }
+}
+
+/// Whether `row`'s `StrId` column resolves to `value` through the dictionary.
+fn str_matches(row: &Row, column: &str, value: &str, dict: &Dictionary) -> bool {
+    let Some(Cell::StrId(id)) = row.get(column) else {
+        return false;
+    };
+    match dict.resolve(*id) {
+        Some(Resolved::String(bytes) | Resolved::Blob { bytes, .. }) => bytes == value.as_bytes(),
+        None => false,
     }
 }
 
@@ -241,10 +268,11 @@ mod tests {
 
     #[test]
     fn single_row_selector_takes_the_first() {
+        let dict = Dictionary::default();
         let rows = vec![row(&[("archived_count", Cell::I64(1))])];
-        assert!(select_row(&rows, &RowSelector::SingleRow).is_some());
+        assert!(select_row(&rows, &RowSelector::SingleRow, &dict).is_some());
         assert!(
-            select_row(&[], &RowSelector::SingleRow).is_none(),
+            select_row(&[], &RowSelector::SingleRow, &dict).is_none(),
             "no rows, nothing to select"
         );
     }
@@ -262,6 +290,7 @@ mod tests {
 
     #[test]
     fn by_key_finds_the_matching_row() {
+        let dict = Dictionary::default();
         let rows = vec![
             row(&[("datid", Cell::U32(1)), ("v", Cell::I64(10))]),
             row(&[("datid", Cell::U32(2)), ("v", Cell::I64(20))]),
@@ -270,7 +299,7 @@ mod tests {
             column: "datid".to_owned(),
             cell: Cell::U32(2),
         };
-        let found = select_row(&rows, &selector).expect("row with datid=2");
+        let found = select_row(&rows, &selector, &dict).expect("row with datid=2");
         assert_eq!(found["v"], Cell::I64(20));
     }
 
