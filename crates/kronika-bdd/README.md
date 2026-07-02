@@ -2,66 +2,58 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-bdd` runs PostgreSQL integration scenarios. Nix provides PostgreSQL
-15, 16, and 17; the runner boots them in parallel and connects through
-`tokio-postgres`. The suite checks the cluster setup, calls the `source-pg`
-collector against every version, and runs `pg_kronika-collector` until it writes
-a sealed segment.
+`kronika-bdd` runs PostgreSQL integration scenarios. Nix provides the
+PostgreSQL matrix (15 through 18); the runner boots it once per run, and every
+scenario opens its own uniquely named database on one cluster, drives sessions
+through `tokio-postgres`, snapshots `pg_kronika-collector` into a sealed
+segment, and asserts the recorded rows.
 
 ## What It Runs
 
-`features/smoke.feature` checks the cluster setup:
+Every scenario follows `docs/bdd-testing-guide.md`: the setup SQL is visible in
+the `.feature` as docstrings, the expected values are concrete and tied to that
+setup, and PostgreSQL itself is the oracle.
+
+`features/smoke.feature` is the one matrix-wide scenario:
 
 ```gherkin
-Scenario: every version is reachable
+Scenario: every booted major reports a matching server_version_num
   Given the PostgreSQL matrix is booted
-  Then every version answers a version query
+  Then each cluster's declared major matches the result of:
+    """
+    SELECT current_setting('server_version_num')::int / 10000
+    """
 ```
 
-For each PostgreSQL major version, the runner:
+The metric features (activity, archiver, bgwriter/checkpointer, database, io,
+locks, prepared xacts, progress vacuum, statements, user tables and indexes,
+wal, replication instance, connection pool) share one step vocabulary:
 
-- creates a temporary data directory;
-- runs `initdb` with trust auth, C locale, and no sync;
-- starts `postgres` on a free loopback port;
-- waits until the server accepts TCP connections;
-- runs `SHOW server_version`;
-- checks that the reported version matches the expected major version.
+- `Given a fresh database on PostgreSQL NN` — the isolated per-scenario
+  database;
+- `Given a database seeded with:` and `Given a second database seeded with:` —
+  docstring SQL setup;
+- `Given session "X" runs:` / `… runs and holds its transaction open:` /
+  `… runs and blocks:` — named sessions whose backend pids resolve `[X]`
+  placeholders in expectation tables;
+- `When the collector snapshots the segment` — runs `pg_kronika-collector`
+  (path from `KRONIKA_COLLECTOR_BIN`) until it seals a segment;
+- `Then section 1_XXX_YYY has exactly one row:` / `has a row for session "X":`
+  / `has a row with <col> = <val>:` — expectation tables against the decoded
+  section;
+- `Then section 1_XXX_YYY <column> matches the <kind> oracle:` — an
+  independent SQL read compared per kind: `exact`, `transformed`, `subset`,
+  `floor` (lower bound), `ceiling` (upper bound);
+- `Given the window floor for section 1_XXX_YYY <column> is captured as:` with
+  `Then section 1_XXX_YYY <column> matches the window oracle up to:` — bracket
+  a monotonically advancing counter between two oracle reads around the
+  snapshot;
+- `Then section 1_XXX_YYY is absent from the segment` — the guard for
+  layout-split metrics.
 
-`features/collector.feature` calls the `source-pg` collector against the
-running PostgreSQL versions:
-
-```gherkin
-Scenario: every version yields a valid bgwriter/checkpointer snapshot
-  Given the PostgreSQL matrix is booted
-  Then every version reports valid bgwriter/checkpointer stats
-```
-
-For each version it calls `collect_bgwriter_checkpointer` (registry type
-`1_006_001`) and checks that:
-
-- the row's `ts` is the server's `clock_timestamp()`, near the runner clock;
-- counters are non-negative and `bgwriter_stats_reset` is before that `ts`;
-- the filled and `NULL` columns match the version: PG17+ fills
-  `restartpoints_*` and `checkpointer_stats_reset`, but leaves
-  `buffers_backend` empty; earlier versions do the reverse.
-
-This fails when the SQL no longer matches a catalog layout or the version
-dispatch selects the wrong branch.
-
-The same feature also starts the collector binary:
-
-```gherkin
-Scenario: every version seals a readable segment with section 1_006_001
-  Given the PostgreSQL matrix is booted
-  Then every version is collected into a sealed segment with section 1_006_001
-```
-
-For each version the runner spawns `pg_kronika-collector` (path from
-`KRONIKA_COLLECTOR_BIN`) against the cluster, waits for its `ready` line, sends
-`SIGUSR2`, and reads back the `sealed <path>` it prints. It then opens that
-segment with `kronika-reader`, decodes section `1_006_001` typed, and asserts the
-one row's `ts` equals the segment range and its PG17/pre-17 columns survived the
-round-trip.
+A step phrase that matches no registered step fails the run
+(`fail_on_skipped`), and every failed assertion dumps the decoded section
+table, the oracle values, `server.log`, and the collector's stderr.
 
 ## Quick Local Check
 
@@ -166,8 +158,8 @@ bdd:
   without PostgreSQL binary paths.
 - `postgres ... not ready`: the server failed to start or did not accept TCP
   connections within 30 seconds. The error includes `server.log`.
-- `server_version` mismatch: the process answered, but not with the expected
-  PostgreSQL major version.
-- `collect type 1_006_001 ...` or `postgres NN: ...` from the collector
-  scenario: the query did not match the server's catalog, or the snapshot was
-  rejected by the checks. The message names the column or version branch.
+- smoke mismatch: the cluster answered, but `server_version_num / 10000` is
+  not the major the matrix declared.
+- assertion failures print the decoded section table, the oracle values, and
+  both `server.log` and the collector's stderr; the message names the section
+  and column.

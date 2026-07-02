@@ -3,67 +3,56 @@
 [English version](README.md)
 
 `kronika-bdd` запускает интеграционные BDD-сценарии для PostgreSQL. Nix даёт
-PostgreSQL 15, 16 и 17; программа поднимает их параллельно и подключается через
-`tokio-postgres`. Набор сценариев проверяет запуск серверов, вызывает
-коллектор `source-pg` на каждой версии и запускает `pg_kronika-collector`, пока
-тот не запишет запечатанный сегмент.
+матрицу PostgreSQL (с 15 по 18); программа поднимает её один раз на весь
+прогон, а каждый сценарий открывает собственную базу с уникальным именем на
+одном из кластеров, управляет сессиями через `tokio-postgres`, снимает
+запечатанный сегмент `pg_kronika-collector` и проверяет записанные строки.
 
 ## Что запускается
 
-`features/smoke.feature` проверяет запуск серверов:
+Каждый сценарий следует `docs/bdd-testing-guide.md`: SQL подготовки виден в
+`.feature` как docstring, ожидаемые значения конкретны и привязаны к этой
+подготовке, а оракулом выступает сам PostgreSQL.
+
+`features/smoke.feature` — единственный сценарий на всю матрицу:
 
 ```gherkin
-Scenario: every version is reachable
+Scenario: every booted major reports a matching server_version_num
   Given the PostgreSQL matrix is booted
-  Then every version answers a version query
+  Then each cluster's declared major matches the result of:
+    """
+    SELECT current_setting('server_version_num')::int / 10000
+    """
 ```
 
-Для каждой основной версии PostgreSQL программа:
+Фичи метрик (activity, archiver, bgwriter/checkpointer, database, io, locks,
+prepared xacts, progress vacuum, statements, user tables и indexes, wal,
+replication instance, connection pool) используют общий словарь шагов:
 
-- создаёт временный каталог данных;
-- запускает `initdb` с методом аутентификации `trust`, локалью `C` и
-  `--no-sync`;
-- запускает `postgres` на свободном локальном TCP-порту;
-- ждёт, пока сервер начнёт принимать TCP-подключения;
-- выполняет `SHOW server_version`;
-- проверяет, что версия начинается с ожидаемого основного номера.
+- `Given a fresh database on PostgreSQL NN` — изолированная база сценария;
+- `Given a database seeded with:` и `Given a second database seeded with:` —
+  подготовка docstring-SQL;
+- `Given session "X" runs:` / `… runs and holds its transaction open:` /
+  `… runs and blocks:` — именованные сессии, чьи backend PID разрешают
+  плейсхолдеры `[X]` в таблицах ожиданий;
+- `When the collector snapshots the segment` — запускает
+  `pg_kronika-collector` (путь из `KRONIKA_COLLECTOR_BIN`) до запечатанного
+  сегмента;
+- `Then section 1_XXX_YYY has exactly one row:` / `has a row for session "X":`
+  / `has a row with <col> = <val>:` — таблицы ожиданий против декодированной
+  секции;
+- `Then section 1_XXX_YYY <column> matches the <kind> oracle:` — независимое
+  SQL-чтение, сравнение по виду: `exact`, `transformed`, `subset`, `floor`
+  (нижняя граница), `ceiling` (верхняя);
+- `Given the window floor for section 1_XXX_YYY <column> is captured as:` в
+  паре с `Then section 1_XXX_YYY <column> matches the window oracle up to:` —
+  монотонный счётчик зажимается между двумя чтениями оракула вокруг снапшота;
+- `Then section 1_XXX_YYY is absent from the segment` — защита для метрик с
+  разделёнными layout.
 
-`features/collector.feature` вызывает коллектор `source-pg` на запущенных
-версиях PostgreSQL:
-
-```gherkin
-Scenario: every version yields a valid bgwriter/checkpointer snapshot
-  Given the PostgreSQL matrix is booted
-  Then every version reports valid bgwriter/checkpointer stats
-```
-
-Для каждой версии она вызывает `collect_bgwriter_checkpointer` (тип реестра
-`1_006_001`) и проверяет, что:
-
-- `ts` строки — это `clock_timestamp()` сервера, близкий к времени процесса,
-  который запускает тесты;
-- счётчики неотрицательны, а `bgwriter_stats_reset` — момент не позже этого `ts`;
-- заполненные и `NULL`-колонки соответствуют версии: PG17+ заполняет
-  `restartpoints_*` и `checkpointer_stats_reset`, но оставляет пустым
-  `buffers_backend`; более ранние версии — наоборот.
-
-Так сценарий ловит устаревший SQL-запрос или неверную ветку для версии
-PostgreSQL.
-
-Этот же файл запускает исполняемый файл коллектора:
-
-```gherkin
-Scenario: every version seals a readable segment with section 1_006_001
-  Given the PostgreSQL matrix is booted
-  Then every version is collected into a sealed segment with section 1_006_001
-```
-
-Для каждой версии программа запускает `pg_kronika-collector` (путь из
-`KRONIKA_COLLECTOR_BIN`), ждёт строку `ready`, посылает `SIGUSR2` и читает
-строку `sealed <path>`. Затем она открывает сегмент через `kronika-reader`,
-декодирует секцию `1_006_001` типизированно и проверяет, что `ts` единственной
-строки равен диапазону сегмента, а её колонки для PG17 и более ранних версий
-сохранились после записи и чтения.
+Фраза шага без зарегистрированного определения роняет прогон
+(`fail_on_skipped`), а каждый упавший ассерт печатает декодированную секцию,
+значения оракула, `server.log` и stderr коллектора.
 
 ## Быстрая проверка на локальной машине
 
@@ -170,8 +159,7 @@ bdd:
   передали пути к исполняемым файлам PostgreSQL.
 - `postgres ... not ready`: сервер не стартовал или не начал принимать TCP за
   30 секунд. В ошибку добавляется `server.log`.
-- `server_version` mismatch: процесс ответил, но не той основной версией
-  PostgreSQL.
-- `collect type 1_006_001 ...` или `postgres NN: ...` из сценария коллектора:
-  запрос не совпал с каталогом сервера либо снимок не прошёл проверку.
-  Сообщение называет колонку или ветку для версии PostgreSQL.
+- расхождение в smoke: кластер ответил, но `server_version_num / 10000` — не
+  тот major, который объявила матрица.
+- упавшие ассерты печатают декодированную таблицу секции, значения оракула,
+  `server.log` и stderr коллектора; сообщение называет секцию и колонку.
