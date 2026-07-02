@@ -167,17 +167,6 @@ impl Cluster {
         })
     }
 
-    /// `server_version` reported by the running cluster.
-    pub(crate) async fn server_version(&self) -> Result<String> {
-        let conn = self.connect().await?;
-        let row = conn
-            .client()
-            .query_one("SHOW server_version", &[])
-            .await
-            .context("query server_version")?;
-        Ok(row.get(0))
-    }
-
     async fn wait_ready(&self) -> Result<()> {
         let probe = async {
             while tokio_postgres::connect(&self.conn_string(), tokio_postgres::NoTls)

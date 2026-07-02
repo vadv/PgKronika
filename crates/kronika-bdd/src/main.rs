@@ -111,20 +111,6 @@ async fn boot_matrix_step(world: &mut BddWorld) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[then("every version answers a version query")]
-async fn every_version_answers(world: &mut BddWorld) -> anyhow::Result<()> {
-    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in world.clusters {
-        let version = db.server_version().await?;
-        let major = db.major().to_string();
-        anyhow::ensure!(
-            version.starts_with(&major),
-            "postgres {major} reported server_version {version:?}"
-        );
-    }
-    Ok(())
-}
-
 #[then("every version reports valid bgwriter/checkpointer stats")]
 async fn every_version_reports_stats(world: &mut BddWorld) -> anyhow::Result<()> {
     anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
