@@ -1,28 +1,29 @@
 //! Type `1_004_001`: `pg_store_plans`, the vadv fork (extension 2.x).
 //!
-//! Per-plan execution counters, one row per `(userid, dbid, queryid, planid)`
-//! as keyed inside the extension. The statistics are instance-wide, read from
+//! Per-plan execution counters, one row per `(userid, dbid, planid)` — the
+//! extension's real entry identity: it hashes the normalized plan and passes
+//! a zero query id into the key, so statements sharing a plan shape aggregate
+//! into one entry. The statistics are instance-wide, read from
 //! the one database where `CREATE EXTENSION pg_store_plans` ran. The vadv fork
 //! and the ossc upstream expose different column sets and different plan-text
 //! access paths, so they are separate type families (`1_004` vadv, `1_003`
 //! ossc), not one layout with optional columns.
 //!
-//! The vadv fork keys an entry by `(userid, dbid, uint32(core queryId),
-//! planid)` and stores the full 64-bit `pg_stat_statements` query id separately
-//! as `queryid_stat_statements`, the join bridge to `1_002`. With
-//! `compute_query_id` off, the key degenerates and plans of different
-//! statements merge by plan shape; deployments should run with
-//! `compute_query_id = on`.
+//! `queryid_stat_statements` is best-effort attribution, not identity: the
+//! extension overwrites it on every execution, so the value names the LAST
+//! statement that ran this plan. Joining to `1_002` through it is valid only
+//! under that caveat, and it stays `0` unless `compute_query_id = on`.
 //!
-//! `queryid` and `planid` identify rows only within one instance, one server
-//! major, and one extension version; they are not portable identifiers.
+//! `planid` identifies rows only within one instance, one server major, and
+//! one extension version; it is not a portable identifier.
 //! Timing columns are `f64`, so the layout derives `PartialEq` but not `Eq`.
 
 use crate::{Section, StrId, Ts};
 
 /// Type `1_004_001`: `pg_store_plans` (vadv fork, extension 2.x).
 ///
-/// One row per plan entry of `pg_store_plans(false)`, top-N by `total_time`.
+/// One row per plan entry of `pg_store_plans(false)`, top-N by `total_time`;
+/// the row identity is `(userid, dbid, planid)`.
 /// The `*_blk_*_time` columns are `0` when `track_io_timing` is off — an
 /// unmeasured zero is indistinguishable from a true zero. The `*_plan_time`
 /// columns are `0` without `pg_store_plans.track_planning`.
@@ -31,18 +32,16 @@ use crate::{Section, StrId, Ts};
     id = 1_004_001,
     name = "pg_store_plans",
     semantics = snapshot_full,
-    sort_key("dbid", "userid", "queryid_stat_statements", "planid")
+    sort_key("dbid", "userid", "planid")
 )]
 pub struct PgStorePlansVadvV1 {
     /// Collection time, unix microseconds; one value for all rows of a read.
     #[column(t)]
     pub ts: Ts,
-    /// The extension's internal entry key: the core query id truncated to 32
-    /// bits. Kept to make key-truncation collisions diagnosable from data.
-    #[column(l)]
-    pub queryid: i64,
-    /// Full 64-bit `pg_stat_statements` query id; `0` when the bridge is
-    /// unfilled. Join key to section `1_002`.
+    /// `pg_stat_statements` query id of the LAST statement that ran this
+    /// plan (overwritten by the extension per execution); `0` when
+    /// `compute_query_id` is off. Best-effort bridge to section `1_002`, not
+    /// part of the row identity.
     #[column(l)]
     pub queryid_stat_statements: i64,
     /// Plan id derived from the normalized plan representation.
@@ -154,7 +153,6 @@ mod tests {
     fn row(ts: i64, dbid: u32, userid: u32, plan: Option<StrId>) -> PgStorePlansVadvV1 {
         PgStorePlansVadvV1 {
             ts: Ts(ts),
-            queryid: 41,
             queryid_stat_statements: 4_242_424_242_424,
             planid: -7_000_000_001,
             userid,
@@ -195,13 +193,12 @@ mod tests {
     fn vadv_v1_contract_shape() {
         let c = PgStorePlansVadvV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_004_001);
-        assert_eq!(c.columns.len(), 35);
-        assert_eq!(
-            c.sort_key,
-            ["dbid", "userid", "queryid_stat_statements", "planid"]
-        );
+        assert_eq!(c.columns.len(), 34);
+        assert_eq!(c.sort_key, ["dbid", "userid", "planid"]);
         assert_eq!(c.column("ts").map(|col| col.nullable), Some(false));
-        assert_eq!(c.column("queryid").map(|col| col.nullable), Some(false));
+        // The extension keys entries with a zero query id; the always-zero
+        // column is not sealed.
+        assert!(c.column("queryid").is_none());
         assert_eq!(
             c.column("queryid_stat_statements").map(|col| col.nullable),
             Some(false)

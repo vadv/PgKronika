@@ -38,9 +38,11 @@ macro_rules! marked {
 pub struct StorePlansRow {
     /// Collection time, unix microseconds.
     pub ts: i64,
-    /// The extension's internal entry key (core query id truncated to 32 bits).
+    /// The extension's internal key slot; always `0` on this fork. Kept only
+    /// to pass back into `pg_store_plans_get_plan`; never sealed.
     pub queryid: i64,
-    /// Full 64-bit `pg_stat_statements` query id; `0` when unfilled.
+    /// Query id of the LAST statement that ran this plan; `0` when
+    /// `compute_query_id` is off. Attribution, not identity.
     pub queryid_stat_statements: i64,
     /// Plan id derived from the normalized plan representation.
     pub planid: i64,
@@ -282,7 +284,6 @@ pub fn to_vadv_v1<E>(
 ) -> Result<PgStorePlansVadvV1, E> {
     Ok(PgStorePlansVadvV1 {
         ts: Ts(row.ts),
-        queryid: row.queryid,
         queryid_stat_statements: row.queryid_stat_statements,
         planid: row.planid,
         userid: row.userid,
