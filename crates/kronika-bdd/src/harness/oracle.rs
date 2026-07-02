@@ -25,6 +25,7 @@
 //! rather than silently degrading to a weaker check.
 
 use anyhow::{Context, Result, bail};
+use kronika_reader::{Dictionary, Resolved};
 use kronika_registry::{Cell, ColumnType, Row, TypeContract};
 use tokio_postgres::Client;
 
@@ -102,10 +103,27 @@ pub(crate) async fn assert_oracle(
         .ty;
     let type_id = contract.type_id.get();
 
+    let (rows, dict) = decode_section(segment, type_id)?;
+
+    if ty == ColumnType::StrId {
+        let expected = query_texts(client, sql)
+            .await
+            .with_context(|| format!("run the {kind:?} oracle for section {type_id} {column}"))?;
+        let actual = column_texts(&rows, column, &dict)?;
+        return match kind {
+            OracleKind::Exact | OracleKind::Transformed => {
+                compare_exact_text(type_id, column, &expected, &actual, &rows, subprocess_logs)
+            }
+            OracleKind::Subset => {
+                compare_subset_text(type_id, column, &expected, &actual, &rows, subprocess_logs)
+            }
+            other => bail!("oracle kind {other:?} is not valid for StrId column {column:?}"),
+        };
+    }
+
     let expected = query_cells(client, sql, ty)
         .await
         .with_context(|| format!("run the {kind:?} oracle for section {type_id} {column}"))?;
-    let (rows, _dict) = decode_section(segment, type_id)?;
     let actual = column_cells(&rows, column);
 
     match kind {
@@ -150,6 +168,30 @@ fn column_cells(rows: &[Row], column: &str) -> Vec<Cell> {
         .collect()
 }
 
+/// Resolve every `StrId` value of `column` through the segment dictionary.
+fn column_texts(rows: &[Row], column: &str, dict: &Dictionary) -> Result<Vec<Option<Vec<u8>>>> {
+    rows.iter()
+        .filter_map(|row| row.get(column))
+        .map(|cell| text_from_cell(cell, dict))
+        .collect()
+}
+
+/// Convert a decoded `StrId`/`NULL` cell to comparable bytes.
+fn text_from_cell(cell: &Cell, dict: &Dictionary) -> Result<Option<Vec<u8>>> {
+    let value = match cell {
+        Cell::Null => None,
+        Cell::StrId(id) => match dict.resolve(*id) {
+            Some(Resolved::String(bytes) | Resolved::Blob { bytes, .. }) => Some(bytes.to_vec()),
+            None => bail!("str_id {id} did not resolve through the dictionary"),
+        },
+        other => bail!(
+            "expected a StrId or NULL cell for a text oracle, got {}",
+            dump::render_cell(other)
+        ),
+    };
+    Ok(value)
+}
+
 /// The section column equals the oracle result exactly.
 ///
 /// The order-independent multiset comparison suits a singleton (one value each)
@@ -175,6 +217,32 @@ fn compare_exact(
             &[
                 ("oracle values", render_cells(expected)),
                 ("section values", render_cells(actual)),
+            ],
+        )
+    )
+}
+
+/// The resolved section strings equal the oracle text result exactly.
+fn compare_exact_text(
+    type_id: u32,
+    column: &str,
+    expected: &[Option<Vec<u8>>],
+    actual: &[Option<Vec<u8>>],
+    rows: &[Row],
+    subprocess_logs: &str,
+) -> Result<()> {
+    if text_multiset_eq(expected, actual) {
+        return Ok(());
+    }
+    bail!(
+        "{}",
+        dump::section_dump(
+            &format!("section {type_id} {column}: exact oracle mismatch"),
+            rows,
+            subprocess_logs,
+            &[
+                ("oracle values", render_texts(expected)),
+                ("section values", render_texts(actual)),
             ],
         )
     )
@@ -212,6 +280,43 @@ fn compare_subset(
                         .join(", ")
                 ),
                 ("section values", render_cells(actual)),
+            ],
+        )
+    )
+}
+
+/// Every oracle text value appears among the resolved section strings.
+fn compare_subset_text(
+    type_id: u32,
+    column: &str,
+    expected: &[Option<Vec<u8>>],
+    actual: &[Option<Vec<u8>>],
+    rows: &[Row],
+    subprocess_logs: &str,
+) -> Result<()> {
+    let missing: Vec<&Option<Vec<u8>>> = expected
+        .iter()
+        .filter(|want| !actual.contains(want))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{}",
+        dump::section_dump(
+            &format!("section {type_id} {column}: subset oracle missing values"),
+            rows,
+            subprocess_logs,
+            &[
+                (
+                    "missing",
+                    missing
+                        .iter()
+                        .map(|text| render_text((*text).as_deref()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                ("section values", render_texts(actual)),
             ],
         )
     )
@@ -353,6 +458,22 @@ fn multiset_eq(a: &[Cell], b: &[Cell]) -> bool {
     remaining.is_empty()
 }
 
+/// Multiset equality for resolved text/`NULL` values.
+fn text_multiset_eq(a: &[Option<Vec<u8>>], b: &[Option<Vec<u8>>]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut remaining: Vec<&Option<Vec<u8>>> = b.iter().collect();
+    for want in a {
+        if let Some(pos) = remaining.iter().position(|text| *text == want) {
+            remaining.swap_remove(pos);
+        } else {
+            return false;
+        }
+    }
+    remaining.is_empty()
+}
+
 /// Render a list of cells for a failure block.
 fn render_cells(cells: &[Cell]) -> String {
     if cells.is_empty() {
@@ -363,6 +484,26 @@ fn render_cells(cells: &[Cell]) -> String {
         .map(dump::render_cell)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Render text/`NULL` oracle values for a failure block.
+fn render_texts(values: &[Option<Vec<u8>>]) -> String {
+    if values.is_empty() {
+        return "(none)".to_owned();
+    }
+    values
+        .iter()
+        .map(|value| render_text(value.as_deref()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Render one text oracle value.
+fn render_text(value: Option<&[u8]>) -> String {
+    value.map_or_else(
+        || "NULL".to_owned(),
+        |bytes| format!("{:?}", String::from_utf8_lossy(bytes)),
+    )
 }
 
 /// Run `sql` and read its first column of every row as a [`Cell`] of type `ty`.
@@ -376,6 +517,16 @@ async fn query_cells(client: &Client, sql: &str, ty: ColumnType) -> Result<Vec<C
         cells.push(cell_from_pg(row, ty)?);
     }
     Ok(cells)
+}
+
+/// Run `sql` and read its first column of every row as nullable text bytes.
+async fn query_texts(client: &Client, sql: &str) -> Result<Vec<Option<Vec<u8>>>> {
+    let rows = client.query(sql, &[]).await.context("oracle query")?;
+    let mut values = Vec::with_capacity(rows.len());
+    for row in &rows {
+        values.push(row.try_get::<_, Option<String>>(0)?.map(String::into_bytes));
+    }
+    Ok(values)
 }
 
 /// Read the first column of a `PostgreSQL` row as a [`Cell`] of the section type.
@@ -433,8 +584,8 @@ const fn into_cell(ty: ColumnType, n: i64) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::{
-        OracleKind, cell_ge, column_cells, compare_window, deferred_kind, multiset_eq,
-        window_contains,
+        OracleKind, cell_ge, column_cells, compare_subset_text, compare_window, deferred_kind,
+        multiset_eq, text_multiset_eq, window_contains,
     };
     use kronika_registry::{Cell, Row};
 
@@ -489,6 +640,32 @@ mod tests {
         ));
         assert!(!multiset_eq(&[Cell::I64(1)], &[Cell::I64(1), Cell::I64(1)]));
         assert!(!multiset_eq(&[Cell::I64(1)], &[Cell::I64(2)]));
+    }
+
+    #[test]
+    fn text_multiset_eq_ignores_order_but_respects_multiplicity() {
+        let a = vec![Some(b"client backend".to_vec()), None];
+        let b = vec![None, Some(b"client backend".to_vec())];
+        assert!(text_multiset_eq(&a, &b));
+        assert!(!text_multiset_eq(
+            &[Some(b"client backend".to_vec())],
+            &[
+                Some(b"client backend".to_vec()),
+                Some(b"client backend".to_vec())
+            ]
+        ));
+    }
+
+    #[test]
+    fn text_subset_oracle_accepts_present_label() {
+        let expected = vec![Some(b"client backend".to_vec())];
+        let actual = vec![
+            Some(b"autovacuum worker".to_vec()),
+            Some(b"client backend".to_vec()),
+        ];
+        assert!(
+            compare_subset_text(1_009_001, "backend_type", &expected, &actual, &[], "").is_ok()
+        );
     }
 
     #[test]
