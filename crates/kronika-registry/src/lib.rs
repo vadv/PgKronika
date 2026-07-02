@@ -8,6 +8,7 @@ extern crate self as kronika_registry;
 
 mod codec;
 mod contract;
+mod generic;
 mod pool;
 mod section;
 mod type_id;
@@ -38,6 +39,7 @@ pub(crate) use codec::{check_row_cap, decode_batches, decode_section, encode_sec
 pub use contract::{
     Column, ColumnClass, ColumnType, LintError, Semantics, StrId, Ts, TypeContract, lint,
 };
+pub use generic::{Cell, Row, decode_rows};
 pub use pool::{BytesPool, PoolStats};
 pub use section::Section;
 #[cfg(test)]
