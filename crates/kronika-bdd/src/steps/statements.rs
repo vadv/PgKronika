@@ -13,6 +13,7 @@ use crate::BddWorld;
 use crate::harness::assert_row::{RowSelector, assert_row, decode_section};
 use crate::harness::dump;
 use crate::harness::expected::{ExpectedColumn, ExpectedValue};
+use crate::steps::common::parse_type_id;
 
 /// Open a dedicated connection to the scenario database for oracle queries.
 async fn oracle_client(world: &BddWorld) -> Result<tokio_postgres::Client> {
@@ -68,7 +69,7 @@ async fn pgss_row_by_like(
 /// The oracle first verifies the live view holds those counts, then the section
 /// row (selected by the oracle's `queryid`) is compared column-by-column.
 #[then(
-    regex = r"^section (\d+) has a row for pg_stat_statements query like '([^']+)' with calls = (\d+) and rows = (\d+)$"
+    regex = r"^section ([\d_]+) has a row for pg_stat_statements query like '([^']+)' with calls = (\d+) and rows = (\d+)$"
 )]
 #[allow(
     clippy::needless_pass_by_value,
@@ -76,11 +77,12 @@ async fn pgss_row_by_like(
 )]
 async fn pgss_row_with_counts(
     world: &mut BddWorld,
-    type_id: u32,
+    type_id: String,
     pattern: String,
     expected_calls: i64,
     expected_rows: i64,
 ) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
     let client = oracle_client(world).await?;
     let (queryid, oracle_calls, oracle_rows) = pgss_row_by_like(&client, &pattern).await?;
 
@@ -134,12 +136,15 @@ async fn pgss_row_with_counts(
 ///
 /// Fails when the row is missing, the text resolved as a String entry (too
 /// short), or the id does not resolve at all.
-#[then(regex = r"^section (\d+) has a blob-path row for pg_stat_statements query like '([^']+)'$")]
+#[then(
+    regex = r"^section ([\d_]+) has a blob-path row for pg_stat_statements query like '([^']+)'$"
+)]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-async fn pgss_blob_path_row(world: &mut BddWorld, type_id: u32, pattern: String) -> Result<()> {
+async fn pgss_blob_path_row(world: &mut BddWorld, type_id: String, pattern: String) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
     let client = oracle_client(world).await?;
     let (queryid, _calls, _rows) = pgss_row_by_like(&client, &pattern).await?;
 

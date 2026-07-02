@@ -55,6 +55,11 @@ pub(crate) enum RowSelector {
         /// The expected string value.
         value: String,
     },
+    /// Find the row whose `StrId` columns resolve to the expected values.
+    ByStrFields {
+        /// The `(column, expected value)` pairs that must all match.
+        fields: Vec<(String, String)>,
+    },
 }
 
 /// Decode a section into generic rows and load the segment dictionary.
@@ -178,6 +183,11 @@ fn select_row<'a>(rows: &'a [Row], selector: &RowSelector, dict: &Dictionary) ->
         RowSelector::ByStr { column, value } => rows
             .iter()
             .find(|row| str_matches(row, column, value, dict)),
+        RowSelector::ByStrFields { fields } => rows.iter().find(|row| {
+            fields
+                .iter()
+                .all(|(column, value)| str_matches(row, column, value, dict))
+        }),
     }
 }
 

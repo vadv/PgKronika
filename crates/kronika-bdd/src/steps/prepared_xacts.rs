@@ -42,7 +42,7 @@ async fn prepare_transaction(world: &mut BddWorld, step: &Step) -> Result<()> {
     result?;
     // Register cleanup before returning so a panic or assertion failure still
     // triggers ROLLBACK PREPARED in the after hook.
-    world.harness.add_rollback_prepared(GID.to_owned());
+    world.harness.add_rollback_prepared(GID.to_owned())?;
     Ok(())
 }
 

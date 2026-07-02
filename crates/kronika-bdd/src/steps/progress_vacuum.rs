@@ -14,14 +14,20 @@ use kronika_reader::Segment;
 
 use crate::BddWorld;
 use crate::harness::session::Session;
+use crate::steps::common::parse_type_id;
 use crate::steps::docstring;
 
 /// Assert that section `type_id` is absent from the sealed segment.
 ///
 /// Passes when the section was not written (no rows were collected). Fails with
 /// a message if the section is present.
-#[then(regex = r"^section (\d+) is absent$")]
-fn section_is_absent(world: &mut BddWorld, type_id: u32) -> Result<()> {
+#[then(regex = r"^section ([\d_]+) is absent$")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+fn section_is_absent(world: &mut BddWorld, type_id: String) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
     let segment_path = world.harness.segment()?.clone();
     let segment = Segment::open(&segment_path).context("open sealed segment")?;
     let present = segment

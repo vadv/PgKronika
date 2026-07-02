@@ -32,6 +32,9 @@ pub(crate) async fn take(state: &mut HarnessState) -> Result<PathBuf> {
         }
     };
     state.set_collector_log(collector.stderr_captured());
+    if let Some(out_dir) = collector.take_output_dir() {
+        state.retain_collector_output_dir(out_dir);
+    }
     state.set_segment(segment.clone());
     Ok(segment)
 }
