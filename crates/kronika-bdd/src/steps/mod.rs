@@ -128,6 +128,7 @@ mod prepared_xacts;
 mod progress_vacuum;
 mod replication_instance;
 mod service_metadata;
+mod settings;
 mod smoke;
 mod statements;
 mod store_plans;
