@@ -105,5 +105,6 @@ mod progress_vacuum;
 mod replication_instance;
 mod smoke;
 mod statements;
+mod store_plans;
 mod user_tables;
 mod wal;
