@@ -19,7 +19,7 @@ Feature: Collector seals pg_prepared_xacts rows per database
       PREPARE TRANSACTION 'kronika_bdd_prepared_xacts_probe';
       """
     When the collector snapshots the segment
-    Then section 1_010_001 has a row with datname = the scenario database:
+    Then section 1_010_001 has a pg_prepared_xacts row for the scenario database:
       | prepared_count | 1 |
     And section 1_010_001 prepared_count matches the exact oracle:
       """

@@ -52,7 +52,7 @@ async fn prepare_transaction(world: &mut BddWorld, step: &Step) -> Result<()> {
 /// The key resolves through the segment dictionary: the section stores
 /// `datname` as a `StrId`, not a plain string. The data table checks
 /// additional columns on that row.
-#[then(regex = "^section 1_010_001 has a row with datname = the scenario database:$")]
+#[then(regex = "^section 1_010_001 has a pg_prepared_xacts row for the scenario database:$")]
 fn section_row_by_datname(world: &mut BddWorld, step: &Step) -> Result<()> {
     let datname = world.harness.database()?.to_owned();
     let contract = contract_for(TYPE_ID)?;
