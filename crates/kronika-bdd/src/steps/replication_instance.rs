@@ -1,1 +1,1 @@
-//! Steps for features/replication_instance.feature.
+//! Steps for `features/replication_instance.feature`.

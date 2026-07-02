@@ -1,1 +1,1 @@
-//! Steps for features/connection_pool.feature.
+//! Steps for `features/connection_pool.feature`.

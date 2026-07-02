@@ -1,1 +1,1 @@
-//! Steps for features/pg_prepared_xacts.feature.
+//! Steps for `features/pg_prepared_xacts.feature`.
