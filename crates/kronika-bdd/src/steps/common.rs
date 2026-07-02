@@ -354,16 +354,11 @@ mod tests {
             OracleKind::Transformed
         );
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_type_id;
 
     #[test]
     fn type_id_parses_with_and_without_underscores() {
-        assert_eq!(parse_type_id("1_008_001").unwrap(), 1_008_001);
-        assert_eq!(parse_type_id("1008001").unwrap(), 1_008_001);
-        assert!(parse_type_id("porridge").is_err());
+        assert_eq!(super::parse_type_id("1_008_001").unwrap(), 1_008_001);
+        assert_eq!(super::parse_type_id("1008001").unwrap(), 1_008_001);
+        assert!(super::parse_type_id("porridge").is_err());
     }
 }
