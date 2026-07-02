@@ -9,7 +9,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-kronika-source-pg = { path = "../kronika-source-pg" }
 kronika-registry = { path = "../kronika-registry" }
 kronika-reader = { path = "../kronika-reader" }
 kronika-format = { path = "../kronika-format" }
