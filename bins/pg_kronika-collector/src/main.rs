@@ -86,6 +86,7 @@ use kronika_source_pg::reset_metadata::{
     ResetBase, ResetExtensions, collect_reset_base, statements_reset_at, store_plans_reset_at,
     to_reset_metadata,
 };
+use kronika_source_pg::settings::{SettingsRow, collect_settings, to_settings_v1};
 use kronika_source_pg::statements::{
     self, StatementsRow, StatementsVersion, collect_statements, statements_extversion,
     statements_version,
@@ -1219,9 +1220,8 @@ async fn snapshot_and_seal(
     let store_plans_rows = collect_store_plans_cached(pool, config, plans_cache).await;
     // The extension caches are warm now: reset metadata reads the info views
     // through the same connections those sections were collected from.
-    let (reset_base, reset_ext) =
-        collect_reset_metadata_all(pool, major, statements_cache, plans_cache).await?;
-    let instance = collect_instance_facts(client, config).await?;
+    let service =
+        collect_service_sections(pool, major, config, statements_cache, plans_cache).await?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -1271,8 +1271,7 @@ async fn snapshot_and_seal(
             &lock_rows,
         )?;
     }
-    push_reset_metadata(&mut buffers, &mut interner, &reset_base, &reset_ext)?;
-    push_instance_metadata(&mut buffers, &mut interner, &instance)?;
+    push_service_sections(&mut buffers, &mut interner, &service)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -1288,6 +1287,52 @@ async fn snapshot_and_seal(
     // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
+}
+
+/// The per-segment service rows: reset context, instance fingerprint, and
+/// the full `pg_settings` copy.
+struct ServiceSections {
+    reset_base: ResetBase,
+    reset_ext: ResetExtensions,
+    instance: InstanceFacts,
+    settings: Vec<SettingsRow>,
+}
+
+/// Collect the service sections sealed into every segment.
+async fn collect_service_sections(
+    pool: &ConnectionPool,
+    major: u32,
+    config: &Config,
+    statements_cache: &StatementsSourceCache,
+    plans_cache: &PlansSourceCache,
+) -> Result<ServiceSections> {
+    let (reset_base, reset_ext) =
+        collect_reset_metadata_all(pool, major, statements_cache, plans_cache).await?;
+    let instance = collect_instance_facts(pool.main(), config).await?;
+    let settings = collect_settings(pool.main())
+        .await
+        .context("collect pg_settings")?;
+    Ok(ServiceSections {
+        reset_base,
+        reset_ext,
+        instance,
+        settings,
+    })
+}
+
+/// Buffer the three service sections of one segment.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_service_sections(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    service: &ServiceSections,
+) -> Result<()> {
+    push_reset_metadata(buffers, interner, &service.reset_base, &service.reset_ext)?;
+    push_instance_metadata(buffers, interner, &service.instance)?;
+    push_settings(buffers, interner, &service.settings)
 }
 
 /// Assemble `reset_metadata`: the base from the main connection plus the
@@ -1683,6 +1728,23 @@ fn push_instance_metadata(
         btime: Ts(facts.os.btime),
     };
     buffer_row(buffers, row)
+}
+
+/// Intern each row's strings and buffer it as the `pg_settings` section.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_settings(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[SettingsRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_settings_v1(row, &mut intern)?)?;
+    }
+    Ok(())
 }
 
 fn is_sqlstate(err: &tokio_postgres::Error, code: &str) -> bool {

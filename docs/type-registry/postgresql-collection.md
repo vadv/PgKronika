@@ -487,6 +487,25 @@ SELECT system_identifier FROM pg_control_system();
 
 `node_self_id` берётся из `KRONIKA_NODE_SELF_ID`; без переменной — hostname.
 
+## `1_019_001` `pg_settings`
+
+Полная копия `pg_settings` пишется в каждый сегмент с главного соединения,
+одним запросом с `ORDER BY name`. Сортировка по имени в SQL важна: интернер
+выдаёт id в порядке вставки, поэтому сортовой ключ секции `(name)` совпадает с
+алфавитным порядком имён.
+
+```sql
+SELECT
+  name, setting, unit, source, sourcefile, sourceline,
+  pending_restart, context, vartype, boot_val, reset_val
+FROM pg_settings
+ORDER BY name;
+```
+
+`setting` хранится как отдаёт сервер — числом в единицах `unit`
+(`work_mem = '7539kB'` даёт `setting = 7539`, `unit = kB`). Раскладка стабильна
+на PG10-18: `pending_restart` существует с PostgreSQL 9.5.
+
 ## `1_015_001` - `1_017_001` replication
 
 Роль инстанса определяется через `pg_is_in_recovery()`.

@@ -988,8 +988,8 @@ sourceline      i32?  L
 pending_restart bool  L
 context         str   L
 vartype         str   L
-boot_val        str   L
-reset_val       str   L
+boot_val        str?  L
+reset_val       str?  L
 ```
 
 ## `1_020_001` `reset_metadata`
