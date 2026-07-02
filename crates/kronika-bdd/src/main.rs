@@ -630,6 +630,9 @@ async fn every_version_seals_user_tables(world: &mut BddWorld) -> anyhow::Result
 /// Create a database with one probe table carrying rows and fresh statistics, so
 /// the table lands in the size and activity candidate axes. `CREATE DATABASE`
 /// cannot run inside a transaction block, hence the separate statements.
+// Interim: these fixed-name databases will be replaced with unique-per-scenario
+// names per docs/bdd-testing-guide.md §6 when user_tables/user_indexes are
+// converted to the new oracle style.
 async fn seed_user_table_database(db: &cluster::Cluster, datname: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         datname.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
@@ -641,12 +644,20 @@ async fn seed_user_table_database(db: &cluster::Cluster, datname: &str) -> anyho
         .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&datname])
         .await
         .with_context(|| format!("postgres {}: probe database {datname}", db.major()))?;
-    if exists.is_none() {
-        admin
+    if exists.is_none()
+        && let Err(e) = admin
             .client()
             .batch_execute(&format!("CREATE DATABASE {datname}"))
             .await
-            .with_context(|| format!("postgres {}: create database {datname}", db.major()))?;
+    {
+        let is_dup = e.as_db_error().is_some_and(|db_err| {
+            *db_err.code() == tokio_postgres::error::SqlState::DUPLICATE_DATABASE
+        });
+        if !is_dup {
+            return Err(anyhow::Error::from(e)).with_context(|| {
+                format!("postgres {}: create database {datname}", db.major())
+            });
+        }
     }
     drop(admin);
 
@@ -1208,9 +1219,12 @@ fn check_statements_rows(
 }
 
 /// Resolve a dictionary id to its bytes or fail with context.
+///
+/// Query text that exceeds the blob threshold is classified as `Resolved::Blob`
+/// rather than `Resolved::String`. Both variants carry the stored bytes.
 fn resolve_string(major: u32, dict: &Dictionary, label: &str, id: u64) -> anyhow::Result<Vec<u8>> {
     match dict.resolve(id) {
-        Some(Resolved::String(bytes)) => Ok(bytes.to_vec()),
+        Some(Resolved::String(bytes) | Resolved::Blob { bytes, .. }) => Ok(bytes.to_vec()),
         other => anyhow::bail!(
             "postgres {major}: {label} str_id {id} did not resolve to a string: {other:?}"
         ),
@@ -1931,5 +1945,55 @@ mod tests {
     #[test]
     fn single_wal_row_rejects_multiple_rows() {
         assert!(single_wal_row(15, vec![1_i32, 2]).is_err());
+    }
+
+    #[test]
+    fn resolve_string_accepts_blob_entry() {
+        use super::resolve_string;
+        use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
+        use kronika_reader::{Resolved, Segment};
+
+        // A blob_threshold of 4 forces any value longer than 3 bytes into
+        // dict.blobs. "hello" (5 bytes) lands there.
+        let limits = DictLimits::new(4, 1 << 20).expect("limits");
+        let mut interner = kronika_writer::Interner::new(limits);
+        let id = interner.intern_blob(b"hello").expect("intern blob");
+
+        let dict_sections = kronika_writer::dict::encode(interner.window()).expect("encode");
+        let section_inputs: Vec<_> = dict_sections
+            .iter()
+            .map(|s| SectionInput {
+                type_id: s.type_id,
+                rows: s.rows,
+                body: &s.body,
+            })
+            .collect();
+        let bytes = build_part(
+            &section_inputs,
+            PartMeta {
+                min_ts: 0,
+                max_ts: 0,
+                source_id: 0,
+            },
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.pgm");
+        std::fs::write(&path, &bytes).expect("write segment");
+
+        let segment = Segment::open(&path).expect("open segment");
+        let dict = segment.dictionary().expect("read dictionary");
+
+        assert_eq!(
+            dict.resolve(id.get()),
+            Some(Resolved::Blob {
+                bytes: b"hello",
+                full_len: 5,
+                truncated: false
+            }),
+            "entry is classified as Blob"
+        );
+        let result = resolve_string(15, &dict, "query", id.get());
+        assert_eq!(result.expect("resolve_string accepts Blob"), b"hello");
     }
 }

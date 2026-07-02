@@ -21,5 +21,8 @@ tempfile = "3"
 portpicker = "0.1"
 nix = { version = "0.29", features = ["signal"] }
 
+[dev-dependencies]
+kronika-writer = { path = "../kronika-writer" }
+
 [lints]
 workspace = true
