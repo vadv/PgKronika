@@ -515,6 +515,10 @@ pub struct StorePlansOsscRow {
 }
 
 /// The ossc collection query: top-N rows with server-truncated plan texts.
+///
+/// The upstream SRF still copies its stored plan texts into the server-side
+/// tuplestore regardless of the projection; selecting `left(...)` bounds what
+/// crosses the network and what the collector allocates.
 const fn store_plans_ossc_query() -> &'static str {
     marked!(
         "SELECT \
@@ -559,29 +563,103 @@ const fn store_plans_ossc_query() -> &'static str {
     )
 }
 
-/// Collect top-N ossc `pg_store_plans` rows with server-truncated plan texts.
+/// The numeric-only ossc query: plan texts never cross the network.
 ///
-/// `text_cap` is the per-row character truncation applied by the server; the
-/// caller enforces the byte budget afterwards.
+/// Used when the plan-text budget is zero; the `plan` column is projected as
+/// `NULL` so no text is transferred or allocated by the collector.
+const fn store_plans_ossc_numeric_query() -> &'static str {
+    marked!(
+        "SELECT \
+             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             s.queryid, \
+             s.planid, \
+             s.userid, \
+             s.dbid, \
+             d.datname, \
+             r.rolname AS usename, \
+             NULL::text AS plan, \
+             s.calls, \
+             s.total_time, \
+             s.min_time, \
+             s.max_time, \
+             s.mean_time, \
+             s.stddev_time, \
+             s.rows, \
+             s.shared_blks_hit, \
+             s.shared_blks_read, \
+             s.shared_blks_dirtied, \
+             s.shared_blks_written, \
+             s.local_blks_hit, \
+             s.local_blks_read, \
+             s.local_blks_dirtied, \
+             s.local_blks_written, \
+             s.temp_blks_read, \
+             s.temp_blks_written, \
+             s.shared_blk_read_time, \
+             s.shared_blk_write_time, \
+             s.local_blk_read_time, \
+             s.local_blk_write_time, \
+             s.temp_blk_read_time, \
+             s.temp_blk_write_time, \
+             (extract(epoch from s.first_call) * 1e6)::int8 AS first_call_us, \
+             (extract(epoch from s.last_call) * 1e6)::int8 AS last_call_us \
+         FROM pg_store_plans s \
+         LEFT JOIN pg_database d ON d.oid = s.dbid \
+         LEFT JOIN pg_roles r ON r.oid = s.userid \
+         ORDER BY s.total_time DESC \
+         LIMIT $1"
+    )
+}
+
+/// Collect top-N ossc `pg_store_plans` rows.
+///
+/// With `text_cap = Some(chars)` the server truncates each plan text per row;
+/// with `None` the query projects `NULL` plans and no text crosses the
+/// network. The caller enforces the byte budget afterwards.
+///
+/// Rows whose `queryid`/`planid` came back `NULL` are privilege-masked by the
+/// upstream (the collector lacks `pg_read_all_stats` for other roles' rows);
+/// they carry no identity and are dropped, and their count is returned so the
+/// caller can log the degradation.
 ///
 /// # Errors
 /// Returns the [`tokio_postgres::Error`] if the query fails.
 pub async fn collect_store_plans_ossc(
     client: &Client,
     max_plans: i64,
-    text_cap: i32,
-) -> Result<Vec<StorePlansOsscRow>, tokio_postgres::Error> {
-    let rows = client
-        .query(store_plans_ossc_query(), &[&max_plans, &text_cap])
-        .await?;
-    Ok(rows.iter().map(ossc_row_from_pg).collect())
+    text_cap: Option<i32>,
+) -> Result<(Vec<StorePlansOsscRow>, usize), tokio_postgres::Error> {
+    let rows = match text_cap {
+        Some(cap) => {
+            client
+                .query(store_plans_ossc_query(), &[&max_plans, &cap])
+                .await?
+        }
+        None => {
+            client
+                .query(store_plans_ossc_numeric_query(), &[&max_plans])
+                .await?
+        }
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    let mut masked = 0_usize;
+    for row in &rows {
+        match ossc_row_from_pg(row) {
+            Some(parsed) => out.push(parsed),
+            None => masked += 1,
+        }
+    }
+    Ok((out, masked))
 }
 
-fn ossc_row_from_pg(row: &tokio_postgres::Row) -> StorePlansOsscRow {
-    StorePlansOsscRow {
+fn ossc_row_from_pg(row: &tokio_postgres::Row) -> Option<StorePlansOsscRow> {
+    // NULL identity columns mean the upstream masked another role's entry.
+    let queryid: Option<i64> = row.get("queryid");
+    let planid: Option<i64> = row.get("planid");
+    Some(StorePlansOsscRow {
         ts: row.get("ts_us"),
-        queryid: row.get("queryid"),
-        planid: row.get("planid"),
+        queryid: queryid?,
+        planid: planid?,
         userid: row.get("userid"),
         dbid: row.get("dbid"),
         datname: row.get("datname"),
@@ -612,7 +690,7 @@ fn ossc_row_from_pg(row: &tokio_postgres::Row) -> StorePlansOsscRow {
         temp_blk_write_time: row.get("temp_blk_write_time"),
         first_call: row.get("first_call_us"),
         last_call: row.get("last_call_us"),
-    }
+    })
 }
 
 /// Build a `1_003_001` row, interning the strings.

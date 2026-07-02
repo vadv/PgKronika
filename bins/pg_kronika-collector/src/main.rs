@@ -989,23 +989,35 @@ async fn collect_plans_for_fork(
 
 /// Collect ossc rows and apply the byte budget to their inline plan texts.
 ///
-/// The upstream view carries the text, so the server already spent the work;
-/// the budget only bounds what the segment dictionary absorbs — tail rows
-/// past the budget seal a NULL plan.
+/// A zero budget switches to the numeric-only query, so no plan text crosses
+/// the network at all. With a budget, the server truncates per row by
+/// characters and each text is byte-capped in Rust to
+/// `min(max_plan_text, remaining budget)` before accounting; tail rows past
+/// the budget seal a NULL plan. Rows whose identity the upstream masked for
+/// lack of `pg_read_all_stats` are dropped and reported.
 async fn collect_ossc_plans_with_budget(
     client: &Client,
     config: &Config,
 ) -> Result<Vec<StorePlansOsscRow>, tokio_postgres::Error> {
     let started = Instant::now();
-    let text_cap = config.max_plan_text;
-    let mut rows = collect_store_plans_ossc(client, config.max_plans, text_cap).await?;
+    let text_cap = (config.plan_text_budget > 0).then_some(config.max_plan_text);
+    let (mut rows, masked) = collect_store_plans_ossc(client, config.max_plans, text_cap).await?;
+    if masked > 0 {
+        eprintln!(
+            "pg_kronika-collector: pg_store_plans (ossc): {masked} privilege-masked rows \
+             skipped; grant the collector role pg_read_all_stats to cover other roles"
+        );
+    }
+    let per_text_cap = usize::try_from(config.max_plan_text).unwrap_or(usize::MAX);
     let mut budget = config.plan_text_budget;
     let mut kept = 0_usize;
     for row in &mut rows {
         let Some(text) = row.plan.as_mut() else {
             continue;
         };
-        let cap = usize::try_from(budget).unwrap_or(usize::MAX);
+        let cap = usize::try_from(budget)
+            .unwrap_or(usize::MAX)
+            .min(per_text_cap);
         if cap == 0 {
             row.plan = None;
             continue;
@@ -1045,14 +1057,30 @@ async fn collect_plans_with_texts(
         if cap == 0 {
             break;
         }
-        if started.elapsed() >= PLAN_TEXT_DEADLINE {
+        let remaining = PLAN_TEXT_DEADLINE.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             eprintln!(
                 "pg_kronika-collector: plan-text deadline {PLAN_TEXT_DEADLINE:?} reached; \
                  remaining rows seal NULL plans"
             );
             break;
         }
-        match fetch_plan_text(client, row, i32::try_from(cap).unwrap_or(i32::MAX)).await {
+        // A hard wall: one slow fetch must not stretch the snapshot past the
+        // deadline while waiting on statement_timeout.
+        let attempt = tokio::time::timeout(
+            remaining,
+            fetch_plan_text(client, row, i32::try_from(cap).unwrap_or(i32::MAX)),
+        )
+        .await;
+        let Ok(attempt) = attempt else {
+            eprintln!(
+                "pg_kronika-collector: plan-text fetch for planid {} exceeded the \
+                 deadline; remaining rows seal NULL plans",
+                row.planid
+            );
+            break;
+        };
+        match attempt {
             Ok(Some(mut text)) => {
                 truncate_to_boundary(&mut text, usize::try_from(cap).unwrap_or(usize::MAX));
                 budget = budget.saturating_sub(u64::try_from(text.len()).unwrap_or(u64::MAX));
