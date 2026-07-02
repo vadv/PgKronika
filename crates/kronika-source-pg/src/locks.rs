@@ -139,7 +139,7 @@ const fn locks_query_v2() -> &'static str {
                            FROM pg_locks WHERE NOT granted \
                            ORDER BY pid, locktype, mode, database NULLS FIRST, relation NULLS FIRST, \
                                     page NULLS FIRST, tuple NULLS FIRST, virtualxid NULLS FIRST, \
-                                    transactionid NULLS FIRST, classid NULLS FIRST, objid NULLS FIRST, \
+                                    transactionid::text::int8 NULLS FIRST, classid NULLS FIRST, objid NULLS FIRST, \
                                     objsubid NULLS FIRST, fastpath), \
          out AS (SELECT false AS kronika_skipped, g.waiters AS kronika_waiters, \
            g.edges AS kronika_edges, g.nodes AS kronika_nodes, n.pid, n.depth, n.root_pid, \
@@ -255,7 +255,7 @@ const fn locks_query_v1() -> &'static str {
                            FROM pg_locks WHERE NOT granted \
                            ORDER BY pid, locktype, mode, database NULLS FIRST, relation NULLS FIRST, \
                                     page NULLS FIRST, tuple NULLS FIRST, virtualxid NULLS FIRST, \
-                                    transactionid NULLS FIRST, classid NULLS FIRST, objid NULLS FIRST, \
+                                    transactionid::text::int8 NULLS FIRST, classid NULLS FIRST, objid NULLS FIRST, \
                                     objsubid NULLS FIRST, fastpath), \
          out AS (SELECT false AS kronika_skipped, g.waiters AS kronika_waiters, \
            g.edges AS kronika_edges, g.nodes AS kronika_nodes, n.pid, n.depth, n.root_pid, \
@@ -735,6 +735,12 @@ mod tests {
         );
         assert!(locks_query(LocksVersion::V1).contains("COALESCE(w.bp"));
         assert!(locks_query(LocksVersion::V2).contains("COALESCE(w.bp"));
+    }
+
+    #[test]
+    fn both_queries_order_xid_locks_by_orderable_cast() {
+        assert!(locks_query(LocksVersion::V1).contains("transactionid::text::int8 NULLS FIRST"));
+        assert!(locks_query(LocksVersion::V2).contains("transactionid::text::int8 NULLS FIRST"));
     }
 
     #[test]
