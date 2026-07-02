@@ -15,10 +15,16 @@
 //!   scaling) so the projected value matches the transformed section value. The
 //!   distinction from `exact` is the contract on the SQL, not the comparison.
 //! - `subset`: every value the query returns must appear in the section's column.
-//! - `window`: the recorded value of a monotonically advancing counter must lie
-//!   between two oracle reads that bracket the snapshot. The floor read happens
-//!   before the snapshot, so this kind is served by a captured-floor step pair
-//!   (see [`window_contains`]), not by the single-query oracle step.
+//! - `floor`: the oracle returns a known minimum for a cumulative counter; at
+//!   least one section value must meet it (`>=`). Background activity may push
+//!   the counter higher, so this is a lower bound, not equality.
+//! - `ceiling`: the oracle returns one upper bound; every non-null section value
+//!   must be `<=` it.
+//!
+//! The bracket-window check — a monotonically advancing counter must lie between
+//! a floor read taken before the snapshot and a ceiling read taken after it — is
+//! not an oracle *kind*. Its floor is captured before the snapshot, so it is
+//! served by the shared captured-floor step pair (see [`window_contains`]).
 //!
 //! `top-n` and `schema` are declared by the guide but not yet implemented; they
 //! return an error naming the kind so the first feature that needs one adds it,
@@ -44,9 +50,9 @@ pub(crate) enum OracleKind {
     Transformed,
     /// Selected rows, a limit, an order, and a coverage marker.
     TopN,
-    /// The oracle returns per-column floors; each floor must be met (`>=`) by
-    /// at least one section value.
-    Window,
+    /// The oracle returns a known minimum; at least one section value must meet
+    /// it (`>=`). A lower bound for a cumulative counter, not equality.
+    Floor,
     /// The oracle returns one upper bound; every non-null section value must
     /// be `<=` that bound.
     Ceiling,
@@ -66,7 +72,7 @@ impl OracleKind {
             "subset" => Self::Subset,
             "transformed" => Self::Transformed,
             "top-n" | "top_n" | "topn" => Self::TopN,
-            "window" => Self::Window,
+            "floor" => Self::Floor,
             "ceiling" => Self::Ceiling,
             "schema" => Self::Schema,
             other => bail!("unknown oracle kind {other:?}"),
@@ -135,8 +141,8 @@ pub(crate) async fn assert_oracle(
         OracleKind::Subset => {
             compare_subset(type_id, column, &expected, &actual, &rows, subprocess_logs)
         }
-        OracleKind::Window => {
-            compare_window(type_id, column, &expected, &actual, &rows, subprocess_logs)
+        OracleKind::Floor => {
+            compare_floor(type_id, column, &expected, &actual, &rows, subprocess_logs)
         }
         OracleKind::Ceiling => {
             compare_ceiling(type_id, column, &expected, &actual, &rows, subprocess_logs)
@@ -324,12 +330,12 @@ fn compare_subset_text(
 
 /// Each oracle floor value must be met by at least one section value (`actual >= floor`).
 ///
-/// Window/tolerance oracle for cumulative counters: the oracle SQL returns a
-/// known minimum (e.g. the row count inserted during setup). Passing means the
-/// section captured data at or above that level; it does not require an exact
-/// match because background activity can increment counters between setup and
-/// the snapshot.
-fn compare_window(
+/// Floor oracle for cumulative counters: the oracle SQL returns a known minimum
+/// (e.g. the row count inserted during setup). Passing means the section
+/// captured data at or above that level; it does not require an exact match
+/// because background activity can increment counters between setup and the
+/// snapshot.
+fn compare_floor(
     type_id: u32,
     column: &str,
     oracle: &[Cell],
@@ -338,7 +344,7 @@ fn compare_window(
     subprocess_logs: &str,
 ) -> Result<()> {
     if oracle.is_empty() {
-        bail!("window oracle for section {type_id} {column}: oracle returned no rows");
+        bail!("floor oracle for section {type_id} {column}: oracle returned no rows");
     }
     let mut unsatisfied: Vec<Cell> = Vec::new();
     for floor in oracle {
@@ -353,7 +359,7 @@ fn compare_window(
         "{}",
         dump::section_dump(
             &format!(
-                "section {type_id} {column}: window oracle floor(s) not met by any section value"
+                "section {type_id} {column}: floor oracle floor(s) not met by any section value"
             ),
             rows,
             subprocess_logs,
@@ -584,7 +590,7 @@ const fn into_cell(ty: ColumnType, n: i64) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::{
-        OracleKind, cell_ge, column_cells, compare_subset_text, compare_window, deferred_kind,
+        OracleKind, cell_ge, column_cells, compare_floor, compare_subset_text, deferred_kind,
         multiset_eq, text_multiset_eq, window_contains,
     };
     use kronika_registry::{Cell, Row};
@@ -620,7 +626,13 @@ mod tests {
             OracleKind::Transformed
         );
         assert_eq!(OracleKind::parse("top-n").unwrap(), OracleKind::TopN);
+        assert_eq!(OracleKind::parse("floor").unwrap(), OracleKind::Floor);
+        assert_eq!(OracleKind::parse("Ceiling").unwrap(), OracleKind::Ceiling);
         assert!(OracleKind::parse("nonsense").is_err());
+        assert!(
+            OracleKind::parse("window").is_err(),
+            "the bracket window is a step pair, not an oracle kind"
+        );
     }
 
     #[test]
@@ -701,29 +713,29 @@ mod tests {
     }
 
     #[test]
-    fn compare_window_passes_when_any_section_value_meets_each_floor() {
+    fn compare_floor_passes_when_any_section_value_meets_each_floor() {
         // Section has two rows; oracle floor is 10; value 15 satisfies it.
         let section = vec![Cell::I64(5), Cell::I64(15)];
         let oracle = vec![Cell::I64(10)];
         assert!(
-            compare_window(1, "col", &oracle, &section, &[], "").is_ok(),
+            compare_floor(1, "col", &oracle, &section, &[], "").is_ok(),
             "at least one value >= floor passes"
         );
     }
 
     #[test]
-    fn compare_window_fails_when_no_section_value_meets_a_floor() {
+    fn compare_floor_fails_when_no_section_value_meets_a_floor() {
         let section = vec![Cell::I64(3), Cell::I64(7)];
         let oracle = vec![Cell::I64(10)];
         assert!(
-            compare_window(1, "col", &oracle, &section, &[], "").is_err(),
+            compare_floor(1, "col", &oracle, &section, &[], "").is_err(),
             "no value >= 10 in [3, 7] must fail"
         );
     }
 
     #[test]
-    fn compare_window_errors_on_empty_oracle() {
-        let err = compare_window(1, "col", &[], &[Cell::I64(5)], &[], "")
+    fn compare_floor_errors_on_empty_oracle() {
+        let err = compare_floor(1, "col", &[], &[Cell::I64(5)], &[], "")
             .expect_err("empty oracle is an error");
         assert!(
             err.to_string().contains("oracle returned no rows"),

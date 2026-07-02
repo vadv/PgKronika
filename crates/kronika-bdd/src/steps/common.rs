@@ -4,15 +4,16 @@
 //! metric modules. Metric-specific steps live in the matching submodule
 //! (e.g. [`archiver`]).
 
-use anyhow::{Context, Result};
-use cucumber::{gherkin::Step, then};
+use anyhow::{Context, Result, bail};
+use cucumber::{gherkin::Step, given, then};
 use kronika_reader::Segment;
-use kronika_registry::{Cell, ColumnType, TypeContract, registry};
+use kronika_registry::{Cell, ColumnType, Row, TypeContract, registry};
 
 use crate::BddWorld;
-use crate::harness::assert_row::{KeyMatch, RowSelector, assert_row};
+use crate::harness::assert_row::{KeyMatch, RowSelector, assert_row, decode_section};
+use crate::harness::dump;
 use crate::harness::expected::{ExpectedColumn, ExpectedValue, parse_table};
-use crate::harness::oracle::{OracleKind, assert_oracle};
+use crate::harness::oracle::{OracleKind, assert_oracle, window_contains};
 use crate::steps::{docstring, table};
 
 /// Assert that a singleton section has exactly one row matching the table.
@@ -202,6 +203,128 @@ fn section_absent(world: &mut BddWorld, type_id: String) -> Result<()> {
         "section {type_id} is present in the segment but must be absent for this layout"
     );
     Ok(())
+}
+
+/// Capture the window floor for a section column: run the docstring SQL now,
+/// before the snapshot, and store the value.
+///
+/// Pairs with `section X <column> matches the window oracle up to:`; together
+/// they bracket a monotonically advancing counter between two oracle reads.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[given(regex = r"^the window floor for section ([\d_]+) (\w+) is captured as:$")]
+async fn window_floor_captured(
+    world: &mut BddWorld,
+    type_id: String,
+    column: String,
+    step: &Step,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let sql = docstring(step)?;
+    let floor = scalar_i64(&world.harness.database_dsn()?, sql).await?;
+    world
+        .harness
+        .set_window_floor(&window_floor_key(type_id, &column), floor);
+    Ok(())
+}
+
+/// Assert the recorded value lies between the captured floor and a ceiling
+/// read by the docstring SQL now, after the snapshot.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\d_]+) (\w+) matches the window oracle up to:$")]
+async fn section_window_oracle(
+    world: &mut BddWorld,
+    type_id: String,
+    column: String,
+    step: &Step,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let sql = docstring(step)?;
+    let floor = world
+        .harness
+        .window_floor(&window_floor_key(type_id, &column))?;
+    let ceiling = scalar_i64(&world.harness.database_dsn()?, sql).await?;
+    let segment = world.harness.segment()?.clone();
+    let failure_log = world.harness.failure_log()?;
+    let (rows, _dict) = decode_section(&segment, type_id)?;
+    let value = match recorded_i64(&rows, &column) {
+        Ok(value) => value,
+        Err(err) => bail!(
+            "{}",
+            dump::section_dump(
+                &format!("section {type_id} {column}: {err}"),
+                &rows,
+                &failure_log,
+                &[],
+            )
+        ),
+    };
+    if window_contains(floor, value, ceiling) {
+        return Ok(());
+    }
+    bail!(
+        "{}",
+        dump::section_dump(
+            &format!(
+                "section {type_id} {column}: window oracle failed \
+                 (floor <= recorded <= ceiling)"
+            ),
+            &rows,
+            &failure_log,
+            &[
+                ("window floor", floor.to_string()),
+                ("recorded", value.to_string()),
+                ("window ceiling", ceiling.to_string()),
+            ],
+        )
+    )
+}
+
+/// The storage key for a captured window floor.
+fn window_floor_key(type_id: u32, column: &str) -> String {
+    format!("{type_id}.{column}")
+}
+
+/// The single recorded `int8` value of `column` across the decoded rows.
+fn recorded_i64(rows: &[Row], column: &str) -> Result<i64> {
+    let [row] = rows else {
+        bail!("expected exactly one row, got {}", rows.len());
+    };
+    match row.get(column) {
+        Some(Cell::I64(value)) => Ok(*value),
+        Some(other) => bail!(
+            "recorded value is {}, not an int8",
+            dump::render_cell(other)
+        ),
+        None => bail!("column absent from the decoded row"),
+    }
+}
+
+/// Run `sql` on a fresh connection to the scenario database and read the
+/// single row's first column as `int8`.
+async fn scalar_i64(dsn: &str, sql: &str) -> Result<i64> {
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .context("connect for the window oracle read")?;
+    let driver = tokio::spawn(async move {
+        drop(connection.await);
+    });
+    let result = async {
+        let row = client
+            .query_one(sql, &[])
+            .await
+            .context("window oracle read")?;
+        row.try_get::<_, i64>(0)
+            .context("window oracle value as int8")
+    }
+    .await;
+    driver.abort();
+    result
 }
 
 /// Parse a section id as written in features (`1_008_001` or `1008001`).
@@ -464,6 +587,28 @@ mod tests {
         assert_eq!(
             OracleKind::parse("transformed").unwrap(),
             OracleKind::Transformed
+        );
+    }
+
+    #[test]
+    fn recorded_i64_reads_one_cell_and_rejects_bad_shapes() {
+        use kronika_registry::Row;
+        let rows = vec![Row::from([("current_wal_lsn", Cell::I64(16_777_216))])];
+        assert_eq!(
+            super::recorded_i64(&rows, "current_wal_lsn").unwrap(),
+            16_777_216
+        );
+        assert!(super::recorded_i64(&[], "c").is_err(), "no rows fail");
+        let null_rows = vec![Row::from([("c", Cell::Null)])];
+        assert!(super::recorded_i64(&null_rows, "c").is_err(), "null fails");
+        let two = vec![
+            Row::from([("c", Cell::I64(1))]),
+            Row::from([("c", Cell::I64(2))]),
+        ];
+        assert!(super::recorded_i64(&two, "c").is_err(), "two rows fail");
+        assert!(
+            super::recorded_i64(&rows, "missing").is_err(),
+            "a missing column fails"
         );
     }
 
