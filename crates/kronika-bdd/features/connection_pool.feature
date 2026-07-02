@@ -2,11 +2,10 @@ Feature: Collector opens per-database pool connections
   The pool enumerates non-template databases that grant CONNECT and opens one
   connection per database. pg_stat_user_tables (section 1013003 on PG 16-17)
   is collected only through those per-database connections, and each sealed
-  row carries the datname of the connection that collected it. A row
-  attributed to a database is therefore direct evidence the pool reached it;
-  if the per-database fan-out breaks, that database's rows are absent. The
-  pool code does not depend on the server major, so PG 17 stands in for the
-  matrix.
+  row carries the datname of the connection that collected it. A row attributed
+  to a database proves the pool opened that database connection; if fan-out
+  breaks, that database's rows are absent. PG 17 covers this behavior because
+  the pool contract is independent of the server major.
 
   @pg17 @serial
   Scenario: user tables are sealed from two databases through per-database connections

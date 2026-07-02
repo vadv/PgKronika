@@ -26,7 +26,7 @@ Feature: Collector reads pg_stat_progress_vacuum
       SET vacuum_cost_limit = 1;
       VACUUM kronika_vac_probe;
       """
-    And the harness waits for pg_stat_progress_vacuum to show session "V"
+    And pg_stat_progress_vacuum shows session "V"
     When the collector snapshots the segment
     Then section 1_012_001 has a row for session "V":
       | is_autovacuum | false |

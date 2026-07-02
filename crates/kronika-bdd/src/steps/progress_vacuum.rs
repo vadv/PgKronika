@@ -1,8 +1,8 @@
 //! Steps for `features/pg_stat_progress_vacuum.feature`.
 //!
-//! `pg_stat_progress_vacuum` rows exist only while a VACUUM runs. The shared
-//! steps in `common` handle generic row assertions and oracle checks; this
-//! module adds the three steps specific to this metric:
+//! `pg_stat_progress_vacuum` rows exist only while a VACUUM runs. This module
+//! adds the metric-specific steps that the generic row assertion and oracle
+//! steps cannot express:
 //!
 //! - asserting the section is absent (empty-state scenario),
 //! - opening a background VACUUM session without waiting for a lock,
@@ -60,7 +60,7 @@ async fn session_runs_vacuum_background(
 /// Waits up to `VACUUM_WAIT_TIMEOUT` before failing. The next step (snapshot)
 /// runs only after this poll succeeds, so the collector observes the in-flight
 /// vacuum row.
-#[given(regex = r#"^the harness waits for pg_stat_progress_vacuum to show session "([^"]+)"$"#)]
+#[given(regex = r#"^pg_stat_progress_vacuum shows session "([^"]+)"$"#)]
 async fn wait_for_vacuum_progress(world: &mut BddWorld, name: String) -> Result<()> {
     world
         .harness

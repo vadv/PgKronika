@@ -3,7 +3,7 @@
 //! `pg_stat_user_tables` rows are collected only through the pool's
 //! per-database connections, and each sealed row carries the datname of the
 //! connection that collected it. Resolving that datname through the segment
-//! dictionary makes a row direct evidence the pool reached its database.
+//! dictionary proves which database connection produced the row.
 
 use anyhow::{Result, bail};
 use cucumber::{gherkin::Step, given, then};

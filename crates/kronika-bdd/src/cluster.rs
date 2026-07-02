@@ -50,11 +50,11 @@ pub(crate) fn parse_matrix(spec: &str) -> Result<Vec<PgBinary>> {
 
 /// The matrix booted once for the whole process.
 ///
-/// Re-running `initdb` per scenario swamps the host with concurrent `initdb`
-/// processes and makes CI flaky. The matrix boots on first use and every
-/// scenario borrows the same clusters; per-scenario state is isolated with
-/// uniquely named databases/schemas, not fresh clusters. Teardown is the
-/// clusters' `kill_on_drop`, which fires when the process exits.
+/// Re-running `initdb` per scenario creates unnecessary concurrent boot work.
+/// The matrix boots on first use and every scenario borrows the same clusters;
+/// per-scenario state is isolated with uniquely named databases/schemas, not
+/// fresh clusters. Teardown is the clusters' `kill_on_drop`, which fires when
+/// the process exits.
 static SHARED_MATRIX: tokio::sync::OnceCell<Vec<Cluster>> = tokio::sync::OnceCell::const_new();
 
 /// Borrow the process-wide matrix, booting it from `KRONIKA_PG_MATRIX` on the
@@ -218,9 +218,9 @@ impl Drop for Conn {
 }
 
 async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
-    // Capture stdout+stderr so a non-zero exit carries the reason. Discarding
-    // it (the old `Stdio::null()`) reduced every failure to "exit status: 1",
-    // and the after-hook cannot help: the cluster's data dir does not exist yet.
+    // Capture stdout+stderr so a non-zero exit carries the reason. The
+    // after-hook cannot help here because the cluster's data dir does not
+    // exist yet.
     let output = Command::new(bin.bindir.join("initdb"))
         .arg("-D")
         .arg(data_dir)
@@ -239,9 +239,8 @@ async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
         .await
         .with_context(|| format!("spawn initdb for postgres {}", bin.major))?;
     let diagnostic = initdb_diagnostic(&output.stdout, &output.stderr);
-    // Persist the output next to the data dir so CI keeps it as an artifact even
-    // when the run succeeds; the failure message below still carries it inline,
-    // so a write error here is only noted, never fatal.
+    // Persist the output next to the data dir. The failure message below still
+    // carries it inline, so a write error here is only noted, never fatal.
     if let Err(err) = std::fs::write(data_dir.join(INITDB_LOG), &diagnostic) {
         eprintln!(
             "=== BDD: could not write {INITDB_LOG} for postgres {}: {err} ===",
