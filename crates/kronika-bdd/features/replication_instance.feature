@@ -1,5 +1,5 @@
 Feature: Collector seals the replication instance status singleton
-  Type 1015001 is one instance-wide row: recovery role, timeline, and WAL
+  Type 1_015_001 is one instance-wide row: recovery role, timeline, and WAL
   positions. The matrix runs standalone primaries without replicas, so the
   recorded row must have the primary shape: not in recovery, zero streaming
   replicas, and every standby/receiver column NULL — replay_lag_s included,
@@ -16,7 +16,7 @@ Feature: Collector seals the replication instance status singleton
       SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::int8
       """
     When the collector snapshots the segment
-    Then section 1015001 has exactly one row:
+    Then section 1_015_001 has exactly one row:
       | is_in_recovery         | false |
       | streaming_replicas     | 0     |
       | replay_lag_s           | null  |
@@ -30,20 +30,20 @@ Feature: Collector seals the replication instance status singleton
       | latest_end_lsn         | null  |
       | latest_end_time        | null  |
       | received_tli           | null  |
-    And section 1015001 is_in_recovery matches the exact oracle:
+    And section 1_015_001 is_in_recovery matches the exact oracle:
       """
       SELECT pg_is_in_recovery()
       """
-    And section 1015001 streaming_replicas matches the exact oracle:
+    And section 1_015_001 streaming_replicas matches the exact oracle:
       """
       SELECT count(*) FILTER (WHERE state = 'streaming')::int4
       FROM pg_stat_replication
       """
-    And section 1015001 timeline_id matches the exact oracle:
+    And section 1_015_001 timeline_id matches the exact oracle:
       """
       SELECT (pg_control_checkpoint()).timeline_id::int4
       """
-    And section 1015001 current_wal_lsn matches the replication instance window oracle up to:
+    And section 1_015_001 current_wal_lsn matches the replication instance window oracle up to:
       """
       SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::int8
       """

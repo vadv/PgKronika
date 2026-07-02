@@ -1,4 +1,4 @@
-//! Steps for `features/replication_instance.feature` (type `1015001`).
+//! Steps for `features/replication_instance.feature` (type `1_015_001`).
 //!
 //! The singleton's `current_wal_lsn` only advances, so it is asserted as a
 //! window: a floor read captured before the snapshot, a ceiling read taken by
@@ -31,7 +31,7 @@ async fn capture_wal_window_floor(world: &mut BddWorld, step: &Step) -> Result<(
 
 /// Assert the recorded `current_wal_lsn` lies between the captured floor and a
 /// ceiling read by the docstring SQL now, after the snapshot.
-#[then("section 1015001 current_wal_lsn matches the replication instance window oracle up to:")]
+#[then("section 1_015_001 current_wal_lsn matches the replication instance window oracle up to:")]
 async fn wal_lsn_within_window(world: &mut BddWorld, step: &Step) -> Result<()> {
     let sql = docstring(step)?;
     let floor = world.harness.window_floor(WAL_LSN_COLUMN)?;
