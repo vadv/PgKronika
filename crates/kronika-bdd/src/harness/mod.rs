@@ -50,6 +50,8 @@ pub(crate) struct HarnessState {
     database: Option<String>,
     /// A second isolated database for per-database fan-out scenarios, if any.
     extra_database: Option<String>,
+    /// Extra isolated databases for scenarios that need more than one.
+    extra_databases: Vec<String>,
     /// Named sessions opened by `session "X" runs ...` steps.
     sessions: BTreeMap<String, Session>,
     /// Sealed segment from the most recent `snapshots the segment` step.
@@ -86,6 +88,41 @@ impl HarnessState {
         self.cluster = Some(cluster);
         self.database = Some(dbname);
         Ok(dsn)
+    }
+
+    /// Create a second isolated database on the already-selected cluster.
+    ///
+    /// The cluster must have been selected by [`use_database`](Self::use_database) first.
+    /// The new database is dropped in [`cleanup`](Self::cleanup).
+    pub(crate) async fn add_database(&mut self, label: &str) -> Result<String> {
+        let cluster = self.cluster()?;
+        let dbname = unique_database_name(label, cluster.major());
+        create_database(cluster, &dbname).await?;
+        let dsn = cluster.conn_string_db(&dbname);
+        self.extra_databases.push(dbname);
+        Ok(dsn)
+    }
+
+    /// The nth extra database name (0-indexed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no extra database exists at `idx`.
+    pub(crate) fn extra_database_name(&self, idx: usize) -> Result<&str> {
+        self.extra_databases
+            .get(idx)
+            .map(String::as_str)
+            .with_context(|| format!("no extra database at index {idx}"))
+    }
+
+    /// The connection string for the nth extra database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster is not selected or no extra database at `idx`.
+    pub(crate) fn extra_database_dsn(&self, idx: usize) -> Result<String> {
+        let cluster = self.cluster()?;
+        Ok(cluster.conn_string_db(self.extra_database_name(idx)?))
     }
 
     /// The selected cluster, or an error if no `use_database` step ran.
@@ -238,6 +275,11 @@ impl HarnessState {
                     eprintln!("=== BDD cleanup: ROLLBACK PREPARED {gid:?}: {err:#} ===");
                 }
             }
+            for dbname in std::mem::take(&mut self.extra_databases) {
+                if let Err(err) = drop_database(cluster, &dbname).await {
+                    eprintln!("=== BDD cleanup: drop extra database {dbname:?}: {err:#} ===");
+                }
+            }
         }
         let scenario_dbs = [self.database.take(), self.extra_database.take()];
         for dbname in scenario_dbs.into_iter().flatten() {
@@ -358,5 +400,14 @@ mod tests {
     #[test]
     fn accepts_a_generated_name() {
         assert!(ensure_safe_ident("kronika_archiver_17_1234_0").is_ok());
+    }
+
+    #[test]
+    fn extra_database_name_returns_error_when_empty() {
+        let state = super::HarnessState::default();
+        assert!(
+            state.extra_database_name(0).is_err(),
+            "no extra databases returns an error"
+        );
     }
 }
