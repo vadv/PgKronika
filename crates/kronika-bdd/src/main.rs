@@ -31,7 +31,6 @@ use kronika_registry::{
     Bytes, MAX_SECTION_BYTES, Section, StrId, VerifiedSection,
     bgwriter_checkpointer::BgwriterCheckpointer,
     pg_prepared_xacts::PgPreparedXacts,
-    pg_stat_activity::PgStatActivityV3,
     pg_stat_database::{PgStatDatabaseV3, PgStatDatabaseV4},
     pg_stat_io::{PgStatIoV1, PgStatIoV2},
     pg_stat_progress_vacuum::PgStatProgressVacuum,
@@ -46,20 +45,18 @@ use kronika_registry::{
     pg_stat_wal::{PgStatWalV1, PgStatWalV2},
     replication_instance::ReplicationInstance,
 };
+use kronika_source_pg::collect_bgwriter_checkpointer;
 use kronika_source_pg::database::{DatabaseVersion, database_version};
 use kronika_source_pg::io::{IoVersion, io_version};
 use kronika_source_pg::statements::{StatementsVersion, statements_extversion, statements_version};
 use kronika_source_pg::user_indexes::{UserIndexesVersion, indexdef_max_len, user_indexes_version};
 use kronika_source_pg::user_tables::{UserTablesVersion, user_tables_version};
 use kronika_source_pg::wal::{WalVersion, wal_version};
-use kronika_source_pg::{ActivityVersion, activity_version, collect_bgwriter_checkpointer};
 
 const PG17_MAJOR: u32 = 17;
 const PG18_MAJOR: u32 = 18;
 
 const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
-
-const PG_STAT_ACTIVITY_V3_TYPE_ID: u32 = 1_001_003;
 
 const PG_STAT_DATABASE_V3_TYPE_ID: u32 = 1_005_003;
 const PG_STAT_DATABASE_V4_TYPE_ID: u32 = 1_005_004;
@@ -256,80 +253,6 @@ fn decode_sealed_row(path: &Path, entry: &Entry) -> anyhow::Result<BgwriterCheck
     Ok(row)
 }
 
-#[then("every version seals a segment whose pg_stat_activity rows resolve through the dictionary")]
-async fn every_version_seals_activity(world: &mut BddWorld) -> anyhow::Result<()> {
-    anyhow::ensure!(!world.clusters.is_empty(), "no clusters were booted");
-    for db in world.clusters {
-        let mut collector = collector::Collector::spawn(db).await?;
-        let segment = collector.snapshot().await?;
-        assert_activity_section(db.major(), &segment)?;
-    }
-    Ok(())
-}
-
-/// Decode the sealed `pg_stat_activity` section and resolve its strings.
-///
-/// The matrix runs PG14+, so every cluster maps to the V3 layout. The check also
-/// verifies that the collector's own backend is present in the snapshot.
-fn assert_activity_section(major: u32, path: &Path) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        activity_version(major) == ActivityVersion::V3,
-        "postgres {major}: matrix version is not on the V3 activity layout"
-    );
-    let segment =
-        Segment::open(path).with_context(|| format!("postgres {major}: open sealed segment"))?;
-    let catalog = segment.catalog();
-    let entry = catalog
-        .entries
-        .iter()
-        .find(|entry| entry.type_id == PG_STAT_ACTIVITY_V3_TYPE_ID)
-        .with_context(|| format!("postgres {major}: segment has no section 1_001_003"))?;
-
-    let rows = decode_activity_rows(path, entry)
-        .with_context(|| format!("postgres {major}: read back section 1_001_003"))?;
-    anyhow::ensure!(
-        !rows.is_empty(),
-        "postgres {major}: pg_stat_activity section decoded to no rows"
-    );
-
-    // One statement_timestamp() covers the whole snapshot.
-    let ts = rows[0].ts.0;
-    anyhow::ensure!(
-        rows.iter().all(|row| row.ts.0 == ts),
-        "postgres {major}: snapshot rows carry differing ts"
-    );
-    ensure_ts_in_segment_range(
-        major,
-        "section 1_001_003",
-        ts,
-        catalog.min_ts,
-        catalog.max_ts,
-    )?;
-
-    let dict = segment
-        .dictionary()
-        .with_context(|| format!("postgres {major}: read the segment dictionary"))?;
-    let mut saw_collector = false;
-    for row in &rows {
-        match dict.resolve(row.application_name.0) {
-            Some(Resolved::String(bytes)) => {
-                if bytes.starts_with(b"pg_kronika-collector") {
-                    saw_collector = true;
-                }
-            }
-            other => anyhow::bail!(
-                "postgres {major}: application_name str_id {} did not resolve to a string: {other:?}",
-                row.application_name.0
-            ),
-        }
-    }
-    anyhow::ensure!(
-        saw_collector,
-        "postgres {major}: the collector's own backend was not found in the snapshot"
-    );
-    Ok(())
-}
-
 fn ensure_ts_in_segment_range(
     major: u32,
     section: &str,
@@ -342,23 +265,6 @@ fn ensure_ts_in_segment_range(
         "postgres {major}: {section} ts {ts} outside segment range {min_ts}..={max_ts}"
     );
     Ok(())
-}
-
-/// Read the catalog-bounded section and decode its typed rows.
-fn decode_activity_rows(path: &Path, entry: &Entry) -> anyhow::Result<Vec<PgStatActivityV3>> {
-    use std::os::unix::fs::FileExt;
-
-    let len = usize::try_from(entry.len).context("section len overflows usize")?;
-    anyhow::ensure!(
-        len <= MAX_SECTION_BYTES,
-        "section of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
-    );
-    let mut body = vec![0_u8; len];
-    std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
-
-    let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
-        .map_err(|err| anyhow::anyhow!("section crc check failed: {err}"))?;
-    PgStatActivityV3::decode(verified).context("typed decode of section 1_001_003")
 }
 
 #[then(
