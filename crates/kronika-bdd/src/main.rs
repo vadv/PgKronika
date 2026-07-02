@@ -1078,14 +1078,6 @@ fn assert_wal_section(major: u32, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn has_section(segment: &Segment, type_id: u32) -> bool {
-    segment
-        .catalog()
-        .entries
-        .iter()
-        .any(|entry| entry.type_id == type_id)
-}
-
 /// `stats_reset`, when present, must not be after the snapshot ts.
 fn check_wal_stats_reset(major: u32, reset: Option<i64>, ts: i64) -> anyhow::Result<()> {
     if let Some(reset) = reset {
