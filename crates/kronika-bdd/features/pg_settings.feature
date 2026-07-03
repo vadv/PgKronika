@@ -1,14 +1,14 @@
-Feature: Collector seals pg_settings (1_019_001) into every segment
+Feature: Every segment carries pg_settings (1_019_001)
   The full parameter set of the running server goes into each segment, so a
-  reader interprets the other sections without chasing configuration through
-  older segments. The set of names is pinned against the live view; a value
-  changed through ALTER SYSTEM plus reload proves the section reflects the
-  running server, not compiled-in defaults. pg_settings reports the value and
-  its unit separately: work_mem set to '7539kB' seals as setting 7539 with
-  unit kB.
+  reader interprets the other sections without reading configuration from
+  older segments. The set of names is compared with `pg_settings`; a value
+  changed through ALTER SYSTEM plus reload checks that the section reflects
+  the running server, not compiled-in defaults. `pg_settings` reports the
+  value and its unit separately: `work_mem` set to `7539kB` is stored as
+  setting `7539` with unit `kB`.
 
   @pg15 @serial
-  Scenario: the full parameter set with a live ALTER SYSTEM change
+  Scenario: the full parameter set with an ALTER SYSTEM change
     Given a fresh database on PostgreSQL 15
     And the server is reconfigured with:
       """
@@ -27,7 +27,7 @@ Feature: Collector seals pg_settings (1_019_001) into every segment
     And section 1_019_001 pg_settings entry "work_mem" has pending_restart = "false"
 
   @pg17 @serial
-  Scenario: a postmaster-context change is sealed as pending restart
+  Scenario: a postmaster-context change is recorded as pending restart
     Given a fresh database on PostgreSQL 17
     And the server is reconfigured with:
       """

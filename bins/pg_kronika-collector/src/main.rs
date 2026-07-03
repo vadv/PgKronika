@@ -1298,7 +1298,7 @@ struct ServiceSections {
     settings: Vec<SettingsRow>,
 }
 
-/// Collect the service sections sealed into every segment.
+/// Collect the service sections written to every segment.
 async fn collect_service_sections(
     pool: &ConnectionPool,
     major: u32,
