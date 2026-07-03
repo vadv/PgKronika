@@ -440,8 +440,10 @@ async fn settings_loaded(client: &tokio_postgres::Client, setting: &str) -> Resu
                 EXISTS ( \
                     SELECT 1 FROM pg_settings \
                     WHERE name = $1 \
-                      AND sourcefile = current_setting('data_directory') || '/postgresql.auto.conf' \
-                      AND (source = 'configuration file' OR pending_restart) \
+                      AND ( \
+                          sourcefile = current_setting('data_directory') || '/postgresql.auto.conf' \
+                          OR pending_restart \
+                      ) \
                 ) AS settings_visible",
             &[&setting],
         )

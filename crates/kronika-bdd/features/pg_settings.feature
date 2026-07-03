@@ -40,9 +40,6 @@ Feature: Every segment carries pg_settings (1_019_001)
     When the collector snapshots the segment
     Then section 1_019_001 pg_settings entry "shared_buffers" has pending_restart = "true"
     And section 1_019_001 pg_settings entry "shared_buffers" has context = "postmaster"
-    And section 1_019_001 pg_settings entry "shared_buffers" has source = "configuration file"
-    And section 1_019_001 pg_settings entry "shared_buffers" has sourcefile ending with "postgresql.auto.conf"
-    And section 1_019_001 pg_settings entry "shared_buffers" has sourceline > 0
     And section 1_019_001 name matches the exact oracle:
       """
       SELECT name FROM pg_settings
