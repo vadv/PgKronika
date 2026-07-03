@@ -1,8 +1,9 @@
 //! Collects `PostgreSQL` stats and writes sealed PGM segments.
 //!
 //! The daemon runs on the database host. Each collection tick reads the due
-//! `PostgreSQL` sources, writes one journal part, seals `<ts>.pgm`, and resets
-//! the journal after a successful seal.
+//! `PostgreSQL` sources and appends one journal part when rows exist. The open
+//! segment seals on SIGUSR2, on the raw journal byte cap, or on its max age.
+//! The journal is reset only after a successful seal.
 //!
 //! Environment:
 //! - `KRONIKA_PG_DSN`: libpq connection string (key=value or URI) for the target
@@ -69,11 +70,11 @@
 //!   activity snapshot shows a backend waiting on a heavyweight lock. The
 //!   `pg_store_plans` pace stays on `KRONIKA_PG_PLANS_INTERVAL_S`;
 //! - `KRONIKA_SEGMENT_MAX_BYTES`: seal the segment once the journal holds
-//!   this many raw (pre-seal) bytes, default 67108864 (64 MiB); `0` seals on
-//!   every tick. A SIGUSR2 tick always seals immediately;
-//! - `KRONIKA_SEGMENT_MAX_AGE_S`: seal an open segment older than this many
-//!   seconds even under the size cap, default 900 — the quiet-instance
-//!   safety valve, like `archive_timeout` for WAL.
+//!   this many raw bytes before segment packing, default 67108864 (64 MiB);
+//!   `0` seals on every tick. A SIGUSR2 tick always seals immediately;
+//! - `KRONIKA_SEGMENT_MAX_AGE_S`: seal an open segment at this age even when
+//!   it stays under the byte cap, default 900 seconds, analogous to
+//!   `archive_timeout` for WAL.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
@@ -182,8 +183,7 @@ struct Config {
     /// Seal the segment when the journal holds at least this many raw bytes;
     /// `0` seals on every tick (the pre-rotation behavior).
     segment_max_bytes: u64,
-    /// Seal an open segment older than this many seconds even if the size
-    /// cap was not reached — the quiet-instance safety valve.
+    /// Seal an open segment at this age even if the byte cap was not reached.
     segment_max_age_secs: u64,
 }
 
@@ -536,8 +536,8 @@ async fn main() -> Result<()> {
         // The plans pace lives outside the scheduler; a tick with only the
         // plans read due still runs.
         if due.is_empty() && !plans_cache.is_due(Instant::now()) {
-            // The age safety valve must fire even when nothing collects:
-            // a quiet instance still publishes its open segment on time.
+            // The max-age cap is checked even when no source is due, so a
+            // low-activity instance still closes its open segment on time.
             let age = Duration::from_secs(config.segment_max_age_secs);
             if segment.age_expired(Instant::now(), age) {
                 match seal_open_segment(&mut journal, &config, &mut segment) {
@@ -565,8 +565,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// One collection cycle: reconnect and refresh the pool, snapshot the due
-/// sources, seal the segment. Failures log and leave the daemon running.
+/// One collection cycle: reconnect and refresh the pool, append a collection
+/// window, and seal the segment when rotation is due. Failures log and leave
+/// the daemon running.
 #[allow(
     clippy::too_many_arguments,
     reason = "the collection cycle wires every piece of daemon state together once"
@@ -1806,17 +1807,18 @@ impl SegmentState {
         }
     }
 
-    /// Whether the age safety valve fired for an open segment.
+    /// Whether the open segment has reached `max_age`.
     fn age_expired(&self, now: Instant, max_age: Duration) -> bool {
         self.opened_at
             .is_some_and(|opened| now.duration_since(opened) >= max_age)
     }
 }
 
-/// Whether the open segment must seal now, per the rotation contract:
-/// a forced tick always seals (the SIGUSR2 snapshot contract), a zero size
-/// cap seals every tick, otherwise the raw journal size or the segment age
-/// decides — whichever trips first.
+/// Whether the open segment must seal now under the rotation contract.
+///
+/// Forced ticks seal immediately, `max_bytes = 0` keeps the legacy one-tick
+/// segment mode, and otherwise the raw journal size or segment age closes the
+/// segment.
 const fn should_seal(
     forced: bool,
     journal_bytes: usize,
@@ -2601,7 +2603,7 @@ mod tests {
         assert!(should_seal(false, 1, 0, false), "zero cap seals every tick");
         assert!(should_seal(false, 64, 64, false), "size cap reached");
         assert!(!should_seal(false, 63, 64, false), "under the cap");
-        assert!(should_seal(false, 1, u64::MAX, true), "age valve fired");
+        assert!(should_seal(false, 1, u64::MAX, true), "age cap reached");
     }
 
     #[test]

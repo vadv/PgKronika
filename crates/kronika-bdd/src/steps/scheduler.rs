@@ -1,9 +1,8 @@
 //! Step definitions for `features/scheduler.feature`.
 //!
 //! The timer scenario starts the collector with a 1-second internal tick and
-//! waits for announced sealed segments without sending signals. Assertions then
-//! check that the first timer tick reads every source and later ticks read only
-//! due sources.
+//! waits for announced sealed segments without sending signals. Assertions
+//! cover source pacing and timer-driven segment rotation.
 
 use anyhow::{Context, Result};
 use cucumber::{then, when};
@@ -15,7 +14,7 @@ use crate::steps::common::parse_type_id;
 
 /// Start the collector with the scenario env and wait for `count` sealed
 /// segments driven purely by its internal timer.
-#[when(regex = r"^the collector runs on its own timer until (\d+) segments are sealed$")]
+#[when(regex = r"^the collector runs on its own timer until (\d+) segments? (?:is|are) sealed$")]
 async fn run_on_timer(world: &mut BddWorld, count: usize) -> Result<()> {
     let cluster = world.harness.cluster()?;
     let extra_env = world.harness.collector_env().to_vec();
@@ -59,9 +58,8 @@ fn timer_segment_missing(world: &mut BddWorld, index: usize, type_id: String) ->
     assert_timer_section(world, index, &type_id, false)
 }
 
-/// The section of a timer segment carries at least `min` distinct `ts`
-/// values — the segment accumulated that many collection windows.
-#[then(regex = r"^timer segment (\d+) section ([\d_]+) spans at least (\d+) snapshots$")]
+/// The timer segment contains at least `min` distinct `ts` values.
+#[then(regex = r"^timer segment (\d+) section ([\d_]+) contains at least (\d+) snapshots$")]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"

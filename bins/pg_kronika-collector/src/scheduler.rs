@@ -125,7 +125,7 @@ impl DueSet {
         self.kinds.contains(&kind)
     }
 
-    /// No source is due: the tick seals nothing.
+    /// No source is due for this tick.
     pub(crate) const fn is_empty(&self) -> bool {
         self.kinds.is_empty()
     }
@@ -168,8 +168,8 @@ impl Scheduler {
         }
     }
 
-    /// A segment was just sealed: the per-segment service sources come due
-    /// again, so the next window opens a self-contained file.
+    /// A segment was just sealed, so the next window must re-read the
+    /// per-segment service sources.
     pub(crate) fn mark_segment_opened(&mut self) {
         for (slot, kind) in ALL_SOURCES.iter().enumerate() {
             if SEGMENT_OPEN_SOURCES.contains(kind) {
