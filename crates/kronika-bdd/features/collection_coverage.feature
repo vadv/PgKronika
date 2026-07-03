@@ -1,6 +1,6 @@
 Feature: Coverage rows (1_023_001) describe truncated top-N sources
   A top-N section without coverage reads as complete data. When a source
-  reports more rows than the collector wrote, the segment gets one 1_023_001
+  reports more rows than the collector wrote, the collector writes one 1_023_001
   row naming the source section, how many rows the source reported, how many
   were written, the configured limit, and the reason. A source that fits its
   limits gets no coverage row: an empty section means no truncation was
