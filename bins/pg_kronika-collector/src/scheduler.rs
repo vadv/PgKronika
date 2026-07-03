@@ -114,22 +114,34 @@ impl Intervals {
 
 /// The sources one tick must read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct DueSet(Vec<SourceKind>);
+pub(crate) struct DueSet {
+    kinds: Vec<SourceKind>,
+    forced: bool,
+}
 
 impl DueSet {
     /// Whether `kind` is due this tick.
     pub(crate) fn has(&self, kind: SourceKind) -> bool {
-        self.0.contains(&kind)
+        self.kinds.contains(&kind)
     }
 
     /// No source is due: the tick seals nothing.
     pub(crate) const fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.kinds.is_empty()
+    }
+
+    /// Whether this tick was forced (SIGUSR2): paced reads outside the
+    /// scheduler ignore their own deadline too.
+    pub(crate) const fn forced(&self) -> bool {
+        self.forced
     }
 
     /// A set with every source due (forced tick).
     fn all() -> Self {
-        Self(ALL_SOURCES.to_vec())
+        Self {
+            kinds: ALL_SOURCES.to_vec(),
+            forced: true,
+        }
     }
 }
 
@@ -159,17 +171,20 @@ impl Scheduler {
             self.last_read = [Some(now); ALL_SOURCES.len()];
             return DueSet::all();
         }
-        let mut due = Vec::new();
+        let mut kinds = Vec::new();
         for (slot, kind) in ALL_SOURCES.iter().enumerate() {
             let interval = Duration::from_secs(self.intervals.of(*kind));
             let is_due =
                 self.last_read[slot].is_none_or(|last| now.duration_since(last) >= interval);
             if is_due {
                 self.last_read[slot] = Some(now);
-                due.push(*kind);
+                kinds.push(*kind);
             }
         }
-        DueSet(due)
+        DueSet {
+            kinds,
+            forced: false,
+        }
     }
 }
 
@@ -259,6 +274,18 @@ mod tests {
                 .plan(start + Duration::from_secs(5), false)
                 .has(SourceKind::Activity)
         );
+    }
+
+    #[test]
+    fn zero_interval_is_due_on_every_tick() {
+        let mut intervals = uniform(1000);
+        intervals.activity = 0;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+        scheduler.plan(start, false);
+        let next = scheduler.plan(start + Duration::from_secs(1), false);
+        assert!(next.has(SourceKind::Activity));
+        assert!(!next.has(SourceKind::Database));
     }
 
     #[test]
