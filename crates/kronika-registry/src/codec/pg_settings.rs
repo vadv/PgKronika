@@ -3,15 +3,15 @@
 //! Roughly 350 rows and ~11 KiB per copy. The section is `on_change` with the
 //! `every_segment_last_known` materialization policy: the collector writes a
 //! full copy into every segment, so a segment is self-contained and a reader
-//! never chases settings through older segments. `setting` is the value in
-//! the unit named by `unit` (`work_mem` seals as `4096` + `kB`, not `4MB`).
+//! never reads settings from older segments. `setting` is the value in the
+//! unit named by `unit` (`work_mem` is stored as `4096` + `kB`, not `4MB`).
 
 use crate::{Section, StrId, Ts};
 
 /// One row of type `1_019_001`; one `pg_settings` entry.
 ///
 /// `pending_restart` is `true` when a changed value (e.g. via `ALTER SYSTEM`
-/// plus reload) takes effect only after a server restart — the sealed
+/// plus reload) takes effect only after a server restart — the stored
 /// `setting` still shows the running value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(id = 1_019_001, name = "pg_settings", semantics = on_change, sort_key("name"))]
