@@ -43,6 +43,7 @@ pub mod prepared_xacts;
 
 pub mod progress_vacuum;
 
+pub mod replication_details;
 pub mod replication_instance;
 pub mod reset_metadata;
 pub mod settings;

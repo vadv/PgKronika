@@ -77,6 +77,14 @@ pub(crate) struct HarnessState {
     collector_output_dirs: Vec<TempDir>,
     /// Scenario-specific environment for the spawned collector.
     collector_env: Vec<(String, String)>,
+    /// Client-tool processes spawned by steps (e.g. `pg_receivewal`);
+    /// killed in cleanup before the scenario database is dropped. The
+    /// tempdir holds the tool's working files for the process lifetime.
+    background_tools: Vec<(String, tokio::process::Child, TempDir)>,
+    /// Replication slots created by steps. Dropped in cleanup after the tools
+    /// die and before the databases: a logical slot pins its database, so
+    /// `DROP DATABASE` fails while the slot exists.
+    pending_slot_drops: Vec<String>,
     /// Pre-snapshot oracle reads for window assertions, keyed by section column.
     window_floors: BTreeMap<String, i64>,
     /// Cluster-level GUCs changed with `ALTER SYSTEM SET` and reset in cleanup.
@@ -175,6 +183,21 @@ impl HarnessState {
     /// Insert an opened session under `name`, replacing any previous one.
     pub(crate) fn insert_session(&mut self, name: String, session: Session) {
         self.sessions.insert(name, session);
+    }
+
+    /// Track a spawned client-tool process for cleanup.
+    pub(crate) fn add_background_tool(
+        &mut self,
+        label: String,
+        child: tokio::process::Child,
+        workdir: TempDir,
+    ) {
+        self.background_tools.push((label, child, workdir));
+    }
+
+    /// Track a replication slot for cleanup.
+    pub(crate) fn add_slot_drop(&mut self, slot_name: String) {
+        self.pending_slot_drops.push(slot_name);
     }
 
     /// The session opened under `name`, or an error naming it.
@@ -298,6 +321,18 @@ impl HarnessState {
         for (name, session) in std::mem::take(&mut self.sessions) {
             if let Err(err) = session.close().await {
                 eprintln!("=== BDD cleanup: session {name:?}: {err:#} ===");
+            }
+        }
+        for (label, mut child, _workdir) in std::mem::take(&mut self.background_tools) {
+            if let Err(err) = child.kill().await {
+                eprintln!("=== BDD cleanup: kill background tool {label:?}: {err:#} ===");
+            }
+        }
+        if let Some(cluster) = self.cluster {
+            for slot in std::mem::take(&mut self.pending_slot_drops) {
+                if let Err(err) = drop_replication_slot(cluster, &slot).await {
+                    eprintln!("=== BDD cleanup: drop replication slot {slot:?}: {err:#} ===");
+                }
             }
         }
         // Roll back prepared transactions before dropping the databases; a
@@ -537,6 +572,39 @@ async fn create_database(cluster: &Cluster, dbname: &str) -> Result<()> {
         .await
         .with_context(|| format!("create database {dbname}"))?;
     Ok(())
+}
+
+/// Drop one replication slot, retrying while its walsender is still exiting.
+///
+/// A slot cannot be dropped while a connection streams from it; the killed
+/// `pg_receivewal` needs a moment to disappear from the server side.
+async fn drop_replication_slot(cluster: &Cluster, slot: &str) -> Result<()> {
+    anyhow::ensure!(
+        !slot.is_empty() && slot.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+        "slot name {slot:?} contains unsafe characters"
+    );
+    let conn = cluster.connect().await?;
+    let mut last_err = None;
+    for _ in 0..10 {
+        match conn
+            .client()
+            .execute(
+                "SELECT pg_drop_replication_slot(slot_name)                  FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+    Err(last_err.map_or_else(
+        || anyhow::anyhow!("slot {slot:?} drop retries exhausted"),
+        |err| anyhow::Error::new(err).context(format!("drop replication slot {slot:?}")),
+    ))
 }
 
 /// Run `ROLLBACK PREPARED` for `gid` on `cluster`'s admin connection.

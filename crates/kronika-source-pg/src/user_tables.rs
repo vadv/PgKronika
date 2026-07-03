@@ -130,7 +130,8 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                age(cl.relfrozenxid)::int8 AS xid_age, mxid_age(cl.relminmxid)::int8 AS mxid_age, cl.reltuples::int8 AS reltuples, \
                io.heap_blks_read, io.heap_blks_hit, io.idx_blks_read, io.idx_blks_hit, \
                io.toast_blks_read, io.toast_blks_hit, io.tidx_blks_read, io.tidx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+               (SELECT count(*) FROM pg_stat_user_tables) AS source_total \
              FROM pg_stat_user_tables t \
              JOIN candidates cand ON cand.relid = t.relid \
              LEFT JOIN pg_class cl ON cl.oid = t.relid \
@@ -178,7 +179,8 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                age(cl.relfrozenxid)::int8 AS xid_age, mxid_age(cl.relminmxid)::int8 AS mxid_age, cl.reltuples::int8 AS reltuples, \
                io.heap_blks_read, io.heap_blks_hit, io.idx_blks_read, io.idx_blks_hit, \
                io.toast_blks_read, io.toast_blks_hit, io.tidx_blks_read, io.tidx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+               (SELECT count(*) FROM pg_stat_user_tables) AS source_total \
              FROM pg_stat_user_tables t \
              JOIN candidates cand ON cand.relid = t.relid \
              LEFT JOIN pg_class cl ON cl.oid = t.relid \
@@ -227,7 +229,8 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                age(cl.relfrozenxid)::int8 AS xid_age, mxid_age(cl.relminmxid)::int8 AS mxid_age, cl.reltuples::int8 AS reltuples, \
                io.heap_blks_read, io.heap_blks_hit, io.idx_blks_read, io.idx_blks_hit, \
                io.toast_blks_read, io.toast_blks_hit, io.tidx_blks_read, io.tidx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+               (SELECT count(*) FROM pg_stat_user_tables) AS source_total \
              FROM pg_stat_user_tables t \
              JOIN candidates cand ON cand.relid = t.relid \
              LEFT JOIN pg_class cl ON cl.oid = t.relid \
@@ -277,7 +280,8 @@ pub const fn user_tables_query(version: UserTablesVersion) -> &'static str {
                age(cl.relfrozenxid)::int8 AS xid_age, mxid_age(cl.relminmxid)::int8 AS mxid_age, cl.reltuples::int8 AS reltuples, \
                io.heap_blks_read, io.heap_blks_hit, io.idx_blks_read, io.idx_blks_hit, \
                io.toast_blks_read, io.toast_blks_hit, io.tidx_blks_read, io.tidx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+               (SELECT count(*) FROM pg_stat_user_tables) AS source_total \
              FROM pg_stat_user_tables t \
              JOIN candidates cand ON cand.relid = t.relid \
              LEFT JOIN pg_class cl ON cl.oid = t.relid \
@@ -699,13 +703,16 @@ pub async fn collect_user_tables(
     client: &Client,
     major: u32,
     max_tables: i64,
-) -> Result<(UserTablesVersion, Vec<UserTablesRow>), tokio_postgres::Error> {
+) -> Result<(UserTablesVersion, Vec<UserTablesRow>, u64), tokio_postgres::Error> {
     let version = user_tables_version(major);
     let rows = client
         .query(user_tables_query(version), &[&max_tables])
         .await?;
+    let source_total = rows
+        .first()
+        .map_or(0, |row| row.get::<_, i64>("source_total"));
     let parsed = rows.iter().map(|row| row_from_pg(row, version)).collect();
-    Ok((version, parsed))
+    Ok((version, parsed, u64::try_from(source_total).unwrap_or(0)))
 }
 
 #[cfg(test)]

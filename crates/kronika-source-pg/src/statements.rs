@@ -129,7 +129,10 @@ pub fn statements_query(version: StatementsVersion) -> String {
          LEFT JOIN pg_database d ON d.oid = s.dbid \
          LEFT JOIN pg_roles r ON r.oid = s.userid";
     let text = format!("LEFT(s.query, {QUERY_TRUNCATE}) AS query");
-    let ts = "(extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us";
+    // `source_total` rides in the same statement as the candidate read, so
+    // the coverage total describes exactly the row population it was cut from.
+    let ts = "(extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+              (SELECT count(*) FROM pg_stat_statements) AS source_total";
     let ident = format!(
         "s.queryid, s.userid, s.dbid, d.datname::text AS datname, r.rolname::text AS usename, {text}"
     );
@@ -830,11 +833,17 @@ pub async fn collect_statements(
     client: &Client,
     version: StatementsVersion,
     max_statements: i64,
-) -> Result<Vec<StatementsRow>, tokio_postgres::Error> {
+) -> Result<(Vec<StatementsRow>, u64), tokio_postgres::Error> {
     let rows = client
         .query(&statements_query(version), &[&max_statements])
         .await?;
-    Ok(rows.iter().map(|row| row_from_pg(row, version)).collect())
+    let source_total = rows
+        .first()
+        .map_or(0, |row| row.get::<_, i64>("source_total"));
+    Ok((
+        rows.iter().map(|row| row_from_pg(row, version)).collect(),
+        u64::try_from(source_total).unwrap_or(0),
+    ))
 }
 
 #[cfg(test)]
