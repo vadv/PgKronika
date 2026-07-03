@@ -19,6 +19,7 @@ anyhow = "1"
 tempfile = "3"
 portpicker = "0.1"
 nix = { version = "0.29", features = ["signal"] }
+rustix = { version = "1", features = ["param"] }
 
 [dev-dependencies]
 kronika-writer = { path = "../kronika-writer" }

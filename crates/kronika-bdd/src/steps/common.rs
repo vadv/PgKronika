@@ -180,6 +180,93 @@ async fn section_oracle(
     result
 }
 
+/// Assert that a singleton section's column is `NULL`.
+///
+/// Service sections use this for nullable source-unavailable cases: the vadv
+/// `pg_store_plans` fork ships no info view, `pg_stat_io` predates PG16, and
+/// so on. The section must hold exactly one row.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\d_]+) (\w+) is null$")]
+fn section_column_null(world: &mut BddWorld, type_id: String, column: String) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let (row, _dict) = single_row(world, type_id)?;
+    let cell = row
+        .get(column.as_str())
+        .with_context(|| format!("section {type_id} has no column {column:?}"))?;
+    anyhow::ensure!(
+        cell == &Cell::Null,
+        "section {type_id}: {column} is {cell:?}, expected NULL"
+    );
+    Ok(())
+}
+
+/// Assert that a singleton section's `StrId` column resolves to the given
+/// string through the segment dictionary.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r#"^section ([\d_]+) (\w+) resolves to "([^"]*)"$"#)]
+fn section_column_resolves(
+    world: &mut BddWorld,
+    type_id: String,
+    column: String,
+    expected: String,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let (row, dict) = single_row(world, type_id)?;
+    let actual = resolve_str_column(type_id, &row, &dict, &column)?;
+    anyhow::ensure!(
+        actual == expected,
+        "section {type_id}: {column} is {actual:?}, expected {expected:?}"
+    );
+    Ok(())
+}
+
+/// Decode a singleton section: exactly one row, or an error naming the count.
+pub(crate) fn single_row(
+    world: &BddWorld,
+    type_id: u32,
+) -> Result<(Row, kronika_reader::Dictionary)> {
+    let segment = world.harness.segment()?.clone();
+    let (mut rows, dict) = decode_section(&segment, type_id)?;
+    anyhow::ensure!(
+        rows.len() == 1,
+        "section {type_id} holds {} rows, expected exactly one",
+        rows.len()
+    );
+    let row = rows.remove(0);
+    Ok((row, dict))
+}
+
+/// Resolve a `StrId` column of one row to an owned UTF-8 string.
+pub(crate) fn resolve_str_column(
+    type_id: u32,
+    row: &Row,
+    dict: &kronika_reader::Dictionary,
+    column: &str,
+) -> Result<String> {
+    use kronika_reader::Resolved;
+
+    let cell = row
+        .get(column)
+        .with_context(|| format!("section {type_id} has no column {column:?}"))?;
+    let Cell::StrId(id) = cell else {
+        bail!("section {type_id}: {column} is {cell:?}, expected an interned string");
+    };
+    match dict.resolve(*id) {
+        Some(Resolved::String(bytes) | Resolved::Blob { bytes, .. }) => {
+            Ok(String::from_utf8_lossy(bytes).into_owned())
+        }
+        None => {
+            bail!("section {type_id}: {column} str_id={id} did not resolve through the dictionary")
+        }
+    }
+}
+
 /// Assert that a section id is absent from the sealed segment catalog.
 ///
 /// Layout-split metrics use this to prove the collector did not also write a

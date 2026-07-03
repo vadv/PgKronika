@@ -20,9 +20,10 @@ pub struct ResetMetadata {
     #[column(g)]
     pub postmaster_start_time: Ts,
     /// Max `stats_reset` across `pg_stat_database`; a coarse database-level
-    /// reset marker.
+    /// reset marker. `None` until any database-level reset happened: on
+    /// PG15+ a fresh cluster reports `NULL` for every database.
     #[column(g)]
-    pub pg_stat_database_reset_max_at: Ts,
+    pub pg_stat_database_reset_max_at: Option<Ts>,
     /// `pg_stat_statements` reset; `None` if the extension or its info view is
     /// absent.
     #[column(g)]
@@ -30,6 +31,12 @@ pub struct ResetMetadata {
     /// `pg_store_plans` reset; `None` if unsupported.
     #[column(g)]
     pub pg_store_plans_reset_at: Option<Ts>,
+    /// `pg_stat_bgwriter` reset; `None` if the server returns no reset time.
+    #[column(g)]
+    pub pg_stat_bgwriter_reset_at: Option<Ts>,
+    /// `pg_stat_checkpointer` reset; `None` before PG17.
+    #[column(g)]
+    pub pg_stat_checkpointer_reset_at: Option<Ts>,
     /// `pg_stat_wal` reset; `None` before `pg_stat_wal` existed.
     #[column(g)]
     pub pg_stat_wal_reset_at: Option<Ts>,
@@ -68,9 +75,11 @@ mod tests {
         ResetMetadata {
             ts: Ts(2_000_000),
             postmaster_start_time: Ts(1_700_000_000_000_000),
-            pg_stat_database_reset_max_at: Ts(1_700_000_500_000_000),
+            pg_stat_database_reset_max_at: Some(Ts(1_700_000_500_000_000)),
             pg_stat_statements_reset_at: Some(Ts(1_700_000_400_000_000)),
             pg_store_plans_reset_at: None,
+            pg_stat_bgwriter_reset_at: Some(Ts(1_700_000_300_000_000)),
+            pg_stat_checkpointer_reset_at: Some(Ts(1_700_000_300_000_000)),
             pg_stat_wal_reset_at: Some(Ts(1_700_000_200_000_000)),
             pg_stat_archiver_reset_at: Some(Ts(1_700_000_100_000_000)),
             pg_stat_io_reset_at: Some(Ts(1_700_000_600_000_000)),
@@ -86,7 +95,10 @@ mod tests {
         ResetMetadata {
             // Keep sort order defined.
             ts: Ts(1_000_000),
-            // Pre-PG16 and no extensions.
+            // A fresh cluster: no database-level reset yet, pre-PG16 views,
+            // no extensions, no checkpointer view.
+            pg_stat_database_reset_max_at: None,
+            pg_stat_checkpointer_reset_at: None,
             pg_stat_archiver_reset_at: None,
             pg_stat_io_reset_at: None,
             ext_pg_stat_statements_version: None,

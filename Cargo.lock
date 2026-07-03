@@ -1074,6 +1074,7 @@ dependencies = [
  "kronika-writer",
  "nix",
  "portpicker",
+ "rustix",
  "tempfile",
  "tokio",
  "tokio-postgres",
@@ -1138,6 +1139,9 @@ version = "0.0.0"
 [[package]]
 name = "kronika-source-os"
 version = "0.0.0"
+dependencies = [
+ "rustix",
+]
 
 [[package]]
 name = "kronika-source-pg"
@@ -1588,6 +1592,7 @@ dependencies = [
  "anyhow",
  "kronika-format",
  "kronika-registry",
+ "kronika-source-os",
  "kronika-source-pg",
  "kronika-writer",
  "tempfile",

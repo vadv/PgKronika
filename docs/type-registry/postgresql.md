@@ -977,6 +977,16 @@ age      i64  G   // age(datfrozenxid)
 в каждый сегмент как актуальная копия. Это сохраняет самодостаточность сегмента:
 коду чтения не нужно искать настройки в предыдущих сегментах.
 
+`source` хранит категорию источника, которую вернул PostgreSQL. `sourcefile` —
+путь к файлу конфигурации, когда сервер его раскрывает, `sourceline` — номер
+строки в этом файле, когда сервер его раскрывает. Для нефайловых источников или
+скрытых путей `sourcefile`/`sourceline` равны `NULL`.
+
+Число строк ожидаемо ограничено числом GUC в PostgreSQL и расширениях, но
+коллектор всё равно проверяет снимок на `MAX_SECTION_ROWS` до интернирования
+строк. При превышении лимита секция падает с явной ошибкой; строки не
+усекаются и не отбрасываются.
+
 ```text
 ts              ts    T
 name            str   L
@@ -988,8 +998,8 @@ sourceline      i32?  L
 pending_restart bool  L
 context         str   L
 vartype         str   L
-boot_val        str   L
-reset_val       str   L
+boot_val        str?  L
+reset_val       str?  L
 ```
 
 ## `1_020_001` `reset_metadata`
@@ -1016,7 +1026,7 @@ reset_val       str   L
 ```text
 ts                             ts    T
 postmaster_start_time          ts    G
-pg_stat_database_reset_max_at  ts    G
+pg_stat_database_reset_max_at  ts?   G
 pg_stat_statements_reset_at    ts?   G
 pg_store_plans_reset_at        ts?   G
 pg_stat_bgwriter_reset_at      ts?   G
@@ -1028,6 +1038,7 @@ ext_pg_stat_statements_version str?  L
 ext_pg_store_plans_version     str?  L
 compute_query_id               str?  L
 track_io_timing                bool? L
+track_wal_io_timing            bool? L
 ```
 
 Семантика полей:
@@ -1035,7 +1046,7 @@ track_io_timing                bool? L
 | Поле | Значение |
 |------|----------|
 | `postmaster_start_time` | время старта postmaster; изменение означает рестарт PostgreSQL |
-| `pg_stat_database_reset_max_at` | максимум `stats_reset` из `pg_stat_database`; грубый маркер reset на уровне базы |
+| `pg_stat_database_reset_max_at` | максимум `stats_reset` из `pg_stat_database`; маркер reset на уровне базы. `NULL`, пока ни одна база не сбрасывалась: на PG15+ свежий кластер отдаёт `NULL` по всем базам |
 | `pg_stat_statements_reset_at` | reset `pg_stat_statements`; `NULL`, если расширение или `pg_stat_statements_info` недоступны |
 | `pg_store_plans_reset_at` | reset `pg_store_plans`; `NULL`, если расширение, информационное представление/функция или форк этого не поддерживает |
 | `pg_stat_bgwriter_reset_at` | reset bgwriter-статистики; `NULL`, если представление или поле недоступны |
@@ -1043,10 +1054,11 @@ track_io_timing                bool? L
 | `pg_stat_wal_reset_at` | reset WAL-статистики; `NULL` до появления `pg_stat_wal` |
 | `pg_stat_archiver_reset_at` | reset archiver-статистики; `NULL`, если сервер не вернул время сброса |
 | `pg_stat_io_reset_at` | reset `pg_stat_io`; `NULL` до PG16 |
-| `ext_pg_stat_statements_version` | версия расширения или `NULL`, если расширение не установлено в доступных БД |
-| `ext_pg_store_plans_version` | версия расширения или `NULL` |
+| `ext_pg_stat_statements_version` | версия расширения на выбранном источнике сбора секции `1_002`; `NULL` означает «коллектор не читает это расширение в этом снапшоте» — отсутствует, недоступно или неопознанный форк |
+| `ext_pg_store_plans_version` | то же для источника секций `1_003`/`1_004` |
 | `compute_query_id` | значение GUC; при `off`/`NULL` `query_id` нельзя считать надежным ключом |
 | `track_io_timing` | если `false`, `blk_*_time` остаются нулевыми и не означают «быстрый IO»; `NULL`, если GUC недоступен |
+| `track_wal_io_timing` | если `false`, WAL-timing колонки остаются нулевыми, потому что замер выключен; это не означает отсутствие затрат на запись. `NULL` до PG14 |
 
 Правила для кода чтения:
 
@@ -1086,14 +1098,16 @@ hostname              str   L
 node_self_id          str   L
 pg_version_num        i32   L
 kernel_version        str   L
-pg_system_identifier  i64   L
+pg_system_identifier  i64?  L
 clock_ticks_per_sec   i64   L   // sysconf(_SC_CLK_TCK), нужно для ticks
 page_size_bytes       i64   L
 boot_id               str   L   // /proc/sys/kernel/random/boot_id
 btime                 ts    L   // /proc/stat btime
 ```
 
-`pg_system_identifier` переживает рестарты и меняется при `initdb`.
+`pg_system_identifier` переживает рестарты и меняется при `initdb`; `NULL`,
+если роль коллектора не может выполнить `pg_control_system()`. `node_self_id`
+берётся из `KRONIKA_NODE_SELF_ID`, по умолчанию — hostname.
 `clock_ticks_per_sec`, `page_size_bytes`, `boot_id` и `btime` делают OS-секции
 самодостаточными: код чтения не должен знать эти значения из внешней
 конфигурации.
