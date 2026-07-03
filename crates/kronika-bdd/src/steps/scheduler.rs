@@ -70,13 +70,11 @@ fn timer_segment_spans(
     type_id: String,
     min: usize,
 ) -> Result<()> {
-    use crate::harness::assert_row::decode_section;
     use kronika_registry::Cell;
 
     let type_id = parse_type_id(&type_id)?;
     let path = world.harness.timer_segment(index)?;
-    let segment_path = path.clone();
-    let (rows, _dict) = decode_section(&segment_path, type_id)?;
+    let rows = decode_all_sections_of(path, type_id)?;
     let mut stamps: Vec<i64> = rows
         .iter()
         .filter_map(|row| match row.get("ts") {
@@ -94,6 +92,41 @@ fn timer_segment_spans(
         world.harness.failure_log().unwrap_or_default(),
     );
     Ok(())
+}
+
+/// Decode rows from every catalog entry of `type_id`.
+///
+/// A multi-window segment contains one entry per collection window.
+fn decode_all_sections_of(
+    path: &std::path::Path,
+    type_id: u32,
+) -> Result<Vec<kronika_registry::Row>> {
+    use kronika_format::crc32c;
+    use kronika_registry::{Bytes, VerifiedSection, decode_rows};
+    use std::os::unix::fs::FileExt;
+
+    let segment = Segment::open(path).context("open sealed segment")?;
+    let entries: Vec<_> = segment
+        .catalog()
+        .entries
+        .iter()
+        .filter(|entry| entry.type_id == type_id)
+        .copied()
+        .collect();
+    anyhow::ensure!(!entries.is_empty(), "segment has no section {type_id}");
+    let mut rows = Vec::new();
+    for entry in entries {
+        let len = usize::try_from(entry.len).context("section len overflows usize")?;
+        let mut body = vec![0_u8; len];
+        std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
+        let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
+            .map_err(|err| anyhow::anyhow!("section {type_id} crc check failed: {err}"))?;
+        rows.extend(
+            decode_rows(type_id, verified)
+                .with_context(|| format!("generic decode of section {type_id}"))?,
+        );
+    }
+    Ok(rows)
 }
 
 fn assert_timer_section(
