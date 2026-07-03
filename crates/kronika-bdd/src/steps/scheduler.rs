@@ -38,6 +38,51 @@ async fn run_on_timer(world: &mut BddWorld, count: usize) -> Result<()> {
     Ok(())
 }
 
+/// Grow a journal on disk, SIGKILL the collector, restart it in the same
+/// output directory, and expose the segments the restart recovered.
+///
+/// The kill waits for a second window so at least one fully synced frame is
+/// on disk regardless of where the kill lands.
+#[when("the collector is killed mid-segment and restarted")]
+async fn kill_and_restart(world: &mut BddWorld) -> Result<()> {
+    let cluster = world.harness.cluster()?;
+    let extra_env = world.harness.collector_env().to_vec();
+    let collector = Collector::spawn_with_env(cluster, &extra_env).await?;
+    let first = wait_journal_grows(&collector, 0).await?;
+    wait_journal_grows(&collector, first).await?;
+    let out_dir = collector.kill_abruptly().await?;
+
+    let mut restarted = Collector::spawn_with_env_in(cluster, &extra_env, out_dir).await?;
+    let segments = restarted.recovered_seals().to_vec();
+    world.harness.set_collector_log(restarted.stderr_captured());
+    if let Some(out_dir) = restarted.take_output_dir() {
+        world.harness.retain_collector_output_dir(out_dir);
+    }
+    anyhow::ensure!(
+        !segments.is_empty(),
+        "the restarted collector announced no recovered segment"
+    );
+    world.harness.set_timer_segments(segments);
+    Ok(())
+}
+
+/// Wait until the journal file grows past `min` bytes.
+async fn wait_journal_grows(collector: &Collector, min: u64) -> Result<u64> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let len = collector.journal_len();
+        if len > min {
+            return Ok(len);
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the journal did not grow past {min} bytes in 30s\ncollector stderr:\n{}",
+            collector.stderr_captured(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Assert a section's presence in the `index`-th (1-based) timer segment.
 #[then(regex = r"^timer segment (\d+) has section ([\d_]+)$")]
 #[allow(
@@ -114,11 +159,12 @@ fn decode_all_sections_of(
         .copied()
         .collect();
     anyhow::ensure!(!entries.is_empty(), "segment has no section {type_id}");
+    let file = std::fs::File::open(path)?;
     let mut rows = Vec::new();
     for entry in entries {
         let len = usize::try_from(entry.len).context("section len overflows usize")?;
         let mut body = vec![0_u8; len];
-        std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
+        file.read_exact_at(&mut body, entry.offset)?;
         let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
             .map_err(|err| anyhow::anyhow!("section {type_id} crc check failed: {err}"))?;
         rows.extend(
