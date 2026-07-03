@@ -428,6 +428,9 @@ async fn wait_for_settings_state(
 }
 
 async fn settings_loaded(client: &tokio_postgres::Client, setting: &str) -> Result<bool> {
+    // Postmaster-context GUCs show up in pg_file_settings with
+    // "setting could not be applied" until restart; pg_settings.pending_restart
+    // is the contract we wait for in that case.
     let row = client
         .query_one(
             "SELECT \
@@ -435,8 +438,7 @@ async fn settings_loaded(client: &tokio_postgres::Client, setting: &str) -> Resu
                     SELECT 1 FROM pg_file_settings \
                     WHERE name = $1 \
                       AND sourcefile = current_setting('data_directory') || '/postgresql.auto.conf' \
-                      AND error IS NULL \
-                ) AS file_parsed, \
+                ) AS file_seen, \
                 EXISTS ( \
                     SELECT 1 FROM pg_settings \
                     WHERE name = $1 \
@@ -449,7 +451,7 @@ async fn settings_loaded(client: &tokio_postgres::Client, setting: &str) -> Resu
         )
         .await
         .with_context(|| format!("poll loaded ALTER SYSTEM setting {setting:?}"))?;
-    Ok(row.get::<_, bool>("file_parsed") && row.get::<_, bool>("settings_visible"))
+    Ok(row.get::<_, bool>("file_seen") && row.get::<_, bool>("settings_visible"))
 }
 
 async fn settings_reset(client: &tokio_postgres::Client, setting: &str) -> Result<bool> {
