@@ -17,6 +17,7 @@ use cucumber::{gherkin::Step, given, when};
 use crate::BddWorld;
 use crate::harness::session::Session;
 use crate::harness::snapshot;
+use crate::harness::{altered_system_setting, wait_for_altered_system_settings};
 
 /// Select the matrix cluster of the given major and open an isolated database.
 ///
@@ -55,20 +56,31 @@ async fn reconfigure_server(world: &mut BddWorld, step: &Step) -> Result<()> {
         .context("connect to reconfigure the server")?;
     let driver = tokio::spawn(async move { drop(conn.await) });
     let mut result = Ok(());
+    let mut altered_settings = Vec::new();
     for statement in sql.split(';') {
         let statement = statement.trim();
         if statement.is_empty() {
             continue;
         }
+        let altered_setting = altered_system_setting(statement);
         if let Err(err) = client.batch_execute(statement).await {
             result = Err(err).with_context(|| format!("reconfigure statement {statement:?}"));
             break;
         }
+        if let Some(name) = altered_setting {
+            world.harness.add_altered_system_setting(name.clone());
+            if !altered_settings.contains(&name) {
+                altered_settings.push(name);
+            }
+        }
+    }
+    if result.is_ok()
+        && !altered_settings.is_empty()
+        && let Err(err) = wait_for_altered_system_settings(&client, &altered_settings).await
+    {
+        result = Err(err);
     }
     driver.abort();
-    // pg_reload_conf() only signals the postmaster; give the reload a moment
-    // so the collector's snapshot sees the new values.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     result
 }
 

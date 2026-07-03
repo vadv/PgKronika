@@ -337,6 +337,22 @@ fn validate_max_lock_rows(max_lock_rows: i64) -> Result<()> {
     Ok(())
 }
 
+/// Reject a `pg_settings` snapshot that cannot fit into one section.
+///
+/// `PostgreSQL`'s `GUC` set is expected to be small and bounded by server code
+/// plus loaded extensions, but the collector still checks the hard PGM section
+/// cap before any `pg_settings` strings are interned.
+///
+/// # Errors
+/// Returns an error naming the section and the row cap when out of range.
+fn validate_settings_row_count(rows: usize) -> Result<()> {
+    anyhow::ensure!(
+        rows <= MAX_SECTION_ROWS,
+        "pg_settings returned {rows} rows, exceeding the {MAX_SECTION_ROWS}-row section cap"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
@@ -1312,6 +1328,7 @@ async fn collect_service_sections(
     let settings = collect_settings(pool.main())
         .await
         .context("collect pg_settings")?;
+    validate_settings_row_count(settings.len())?;
     Ok(ServiceSections {
         reset_base,
         reset_ext,
@@ -1687,7 +1704,6 @@ fn push_locks(
     Ok(())
 }
 
-/// Whether a tokio-postgres error carries the given SQLSTATE code.
 /// Intern the label strings and buffer the singleton `reset_metadata` row.
 ///
 /// # Errors
@@ -1740,6 +1756,7 @@ fn push_settings(
     interner: &mut Interner,
     rows: &[SettingsRow],
 ) -> Result<()> {
+    validate_settings_row_count(rows.len())?;
     for row in rows {
         let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
         buffer_row(buffers, to_settings_v1(row, &mut intern)?)?;
@@ -1747,6 +1764,7 @@ fn push_settings(
     Ok(())
 }
 
+/// Whether a tokio-postgres error carries the given SQLSTATE code.
 fn is_sqlstate(err: &tokio_postgres::Error, code: &str) -> bool {
     err.code().is_some_and(|state| state.code() == code)
 }
@@ -1809,7 +1827,7 @@ mod tests {
         activity_dict_limits, push_activity, push_archiver, push_database, push_io, push_locks,
         push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
         push_user_indexes, push_user_tables, validate_cardinality, validate_heavy_cap,
-        validate_max_lock_rows,
+        validate_max_lock_rows, validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
@@ -2241,6 +2259,14 @@ mod tests {
             super::validate_max_plans(cap + 1).is_err(),
             "a value above MAX_SECTION_ROWS is rejected"
         );
+    }
+
+    #[test]
+    fn settings_row_guard_rejects_section_overflow() {
+        assert!(validate_settings_row_count(MAX_SECTION_ROWS).is_ok());
+        let err = validate_settings_row_count(MAX_SECTION_ROWS + 1)
+            .expect_err("pg_settings must not exceed one section");
+        assert!(err.to_string().contains("pg_settings"));
     }
 
     #[test]
