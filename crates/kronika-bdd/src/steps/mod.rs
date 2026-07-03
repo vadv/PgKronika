@@ -172,6 +172,7 @@ mod prepared_xacts;
 mod progress_vacuum;
 mod replication_details;
 mod replication_instance;
+mod scheduler;
 mod service_metadata;
 mod settings;
 mod smoke;

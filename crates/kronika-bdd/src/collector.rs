@@ -45,7 +45,10 @@ impl Collector {
         let out_dir = tempfile::tempdir().context("create the collector output directory")?;
         let mut cmd = Command::new(&bin);
         cmd.env("KRONIKA_PG_DSN", cluster.conn_string())
-            .env("KRONIKA_OUT_DIR", out_dir.path());
+            .env("KRONIKA_OUT_DIR", out_dir.path())
+            // Scenarios drive collection through signals; the internal timer
+            // stays off unless a scenario turns it on explicitly.
+            .env("KRONIKA_INTERVAL_S", "0");
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -81,7 +84,12 @@ impl Collector {
         let raw = self.child.id().context("collector already exited")?;
         let pid = Pid::from_raw(i32::try_from(raw).context("collector pid out of range")?);
         kill(pid, Signal::SIGUSR2).context("send SIGUSR2 to the collector")?;
+        self.wait_sealed().await
+    }
 
+    /// Wait for the collector to announce the next sealed segment on its own,
+    /// without sending a signal — the internal-timer path.
+    pub(crate) async fn wait_sealed(&mut self) -> Result<PathBuf> {
         let line = next_line(&mut self.lines).await?;
         let path = line
             .strip_prefix("sealed ")

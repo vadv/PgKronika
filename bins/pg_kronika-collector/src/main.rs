@@ -1,6 +1,6 @@
 //! Collects `PostgreSQL` stats and writes sealed PGM segments.
 //!
-//! The daemon runs on the database host. A collection signal gathers the enabled
+//! The daemon runs on the database host. Each collection tick reads the due
 //! `PostgreSQL` sources, writes one journal part, seals `<ts>.pgm`, and resets
 //! the journal after a successful seal.
 //!
@@ -49,11 +49,31 @@
 //!   section is skipped when no waits exist or when waiters, edges, or nodes
 //!   exceed this value;
 //! - `KRONIKA_NODE_SELF_ID`: stable node id sealed into `instance_metadata`
-//!   (`1_021_001`); defaults to the hostname.
+//!   (`1_021_001`); defaults to the hostname;
+//! - `KRONIKA_INTERVAL_S`: base tick of the internal timer, default 5; `0`
+//!   disables the timer, leaving collection to SIGUSR2 only. A signal is a
+//!   forced tick: it reads every source regardless of intervals;
+//! - per-source read intervals, seconds (a source is read on the first tick
+//!   whose elapsed time since its last read reaches the interval):
+//!   `KRONIKA_PG_ACTIVITY_INTERVAL_S` (5), `KRONIKA_PG_DATABASE_INTERVAL_S`
+//!   (10), `KRONIKA_PG_BGWRITER_INTERVAL_S` (10), `KRONIKA_PG_WAL_INTERVAL_S`
+//!   (10), `KRONIKA_PG_IO_INTERVAL_S` (10), `KRONIKA_PG_ARCHIVER_INTERVAL_S`
+//!   (30), `KRONIKA_PG_PREPARED_INTERVAL_S` (30),
+//!   `KRONIKA_PG_PROGRESS_VACUUM_INTERVAL_S` (10),
+//!   `KRONIKA_PG_STATEMENTS_INTERVAL_S` (30), `KRONIKA_PG_TABLES_INTERVAL_S`
+//!   (30), `KRONIKA_PG_INDEXES_INTERVAL_S` (60),
+//!   `KRONIKA_PG_REPLICATION_INTERVAL_S` (30),
+//!   `KRONIKA_PG_RESET_METADATA_INTERVAL_S` (30),
+//!   `KRONIKA_INSTANCE_INTERVAL_S` (60), `KRONIKA_PG_SETTINGS_INTERVAL_S`
+//!   (3600). The lock-wait graph has no interval: it runs when the freshest
+//!   activity snapshot shows a backend waiting on a heavyweight lock. The
+//!   `pg_store_plans` pace stays on `KRONIKA_PG_PLANS_INTERVAL_S`.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
 )]
+
+mod scheduler;
 
 use anyhow::{Context, Result};
 use kronika_format::DictLimits;
@@ -68,7 +88,7 @@ use kronika_source_pg::instance_metadata::{
 };
 use kronika_source_pg::io::{self, IoRow, IoVersion, collect_io};
 use kronika_source_pg::locks::{
-    LocksRow, LocksVersion, collect_locks, lock_waits_exist, locks_version, to_v1 as locks_to_v1,
+    LocksRow, LocksVersion, collect_locks, locks_version, to_v1 as locks_to_v1,
     to_v2 as locks_to_v2,
 };
 use kronika_source_pg::pool::{
@@ -112,6 +132,7 @@ use kronika_source_pg::{
     to_v3,
 };
 use kronika_writer::{Interner, Journal, JournalConfig, SectionBuffers, dict, seal};
+use scheduler::{DueSet, Intervals, Scheduler, SourceKind};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
@@ -147,6 +168,11 @@ struct Config {
     max_lock_rows: i64,
     /// Node id sealed into `instance_metadata`; `None` falls back to hostname.
     node_self_id: Option<String>,
+    /// Base tick of the internal timer, seconds; `0` disables the timer and
+    /// leaves collection to signals only.
+    tick_secs: u64,
+    /// Per-source read intervals.
+    intervals: Intervals,
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -199,6 +225,31 @@ impl Config {
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
+        let tick_secs = env_u64("KRONIKA_INTERVAL_S", 5)?;
+        let defaults = Intervals::default();
+        let intervals = Intervals {
+            activity: env_u64("KRONIKA_PG_ACTIVITY_INTERVAL_S", defaults.activity)?,
+            database: env_u64("KRONIKA_PG_DATABASE_INTERVAL_S", defaults.database)?,
+            bgwriter: env_u64("KRONIKA_PG_BGWRITER_INTERVAL_S", defaults.bgwriter)?,
+            wal: env_u64("KRONIKA_PG_WAL_INTERVAL_S", defaults.wal)?,
+            io: env_u64("KRONIKA_PG_IO_INTERVAL_S", defaults.io)?,
+            archiver: env_u64("KRONIKA_PG_ARCHIVER_INTERVAL_S", defaults.archiver)?,
+            prepared_xacts: env_u64("KRONIKA_PG_PREPARED_INTERVAL_S", defaults.prepared_xacts)?,
+            progress_vacuum: env_u64(
+                "KRONIKA_PG_PROGRESS_VACUUM_INTERVAL_S",
+                defaults.progress_vacuum,
+            )?,
+            statements: env_u64("KRONIKA_PG_STATEMENTS_INTERVAL_S", defaults.statements)?,
+            user_tables: env_u64("KRONIKA_PG_TABLES_INTERVAL_S", defaults.user_tables)?,
+            user_indexes: env_u64("KRONIKA_PG_INDEXES_INTERVAL_S", defaults.user_indexes)?,
+            replication: env_u64("KRONIKA_PG_REPLICATION_INTERVAL_S", defaults.replication)?,
+            reset_metadata: env_u64(
+                "KRONIKA_PG_RESET_METADATA_INTERVAL_S",
+                defaults.reset_metadata,
+            )?,
+            instance_metadata: env_u64("KRONIKA_INSTANCE_INTERVAL_S", defaults.instance_metadata)?,
+            settings: env_u64("KRONIKA_PG_SETTINGS_INTERVAL_S", defaults.settings)?,
+        };
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
@@ -221,6 +272,8 @@ impl Config {
             heavy_timeout_cap_ms,
             max_lock_rows,
             node_self_id,
+            tick_secs,
+            intervals,
         })
     }
 }
@@ -437,39 +490,92 @@ async fn main() -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("install the SIGINT handler")?;
     let mut statements_cache = StatementsSourceCache::default();
     let mut plans_cache = PlansSourceCache::default();
+    let mut sched = Scheduler::new(config.intervals);
+    // With the timer disabled the ticker never fires; collection is
+    // signal-driven only (the BDD harness runs in this mode).
+    let mut ticker = (config.tick_secs > 0)
+        .then(|| tokio::time::interval(Duration::from_secs(config.tick_secs)));
+    if let Some(ticker) = ticker.as_mut() {
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    }
 
     announce("ready");
 
     loop {
-        tokio::select! {
-            Some(()) = sigusr2.recv() => {
-                if let Err(err) = pool.ensure_main().await {
-                    eprintln!("pg_kronika-collector: main reconnect failed: {err:#}");
-                    continue;
+        let forced = tokio::select! {
+            Some(()) = sigusr2.recv() => true,
+            () = async {
+                match ticker.as_mut() {
+                    Some(ticker) => {
+                        ticker.tick().await;
+                    }
+                    None => std::future::pending::<()>().await,
                 }
-                if let Err(err) = pool
-                    .refresh(
-                        Duration::from_secs(config.pool_refresh_secs),
-                        DEFAULT_MAX_DATABASES,
-                    )
-                    .await
-                {
-                    eprintln!("pg_kronika-collector: pool refresh failed: {err:#}");
-                }
-                for db in pool.uncovered() {
-                    eprintln!("pg_kronika-collector: database not covered this cycle: {db}");
-                }
-                let major = pool.server_major();
-                match snapshot_and_seal(&pool, major, &mut journal, &config, &mut statements_cache, &mut plans_cache).await {
-                    Ok(dest) => announce(&format!("sealed {}", dest.display())),
-                    Err(err) => eprintln!("pg_kronika-collector: snapshot failed: {err:#}"),
-                }
-            }
+            } => false,
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
+        };
+        let due = sched.plan(Instant::now(), forced);
+        // The plans pace lives outside the scheduler; a tick with only the
+        // plans read due still runs.
+        if due.is_empty() && !plans_cache.is_due(Instant::now()) {
+            continue;
         }
+        run_collection_cycle(
+            &mut pool,
+            &mut journal,
+            &config,
+            &mut statements_cache,
+            &mut plans_cache,
+            &due,
+        )
+        .await;
     }
     Ok(())
+}
+
+/// One collection cycle: reconnect and refresh the pool, snapshot the due
+/// sources, seal the segment. Failures log and leave the daemon running.
+async fn run_collection_cycle(
+    pool: &mut ConnectionPool,
+    journal: &mut Journal,
+    config: &Config,
+    statements_cache: &mut StatementsSourceCache,
+    plans_cache: &mut PlansSourceCache,
+    due: &DueSet,
+) {
+    if let Err(err) = pool.ensure_main().await {
+        eprintln!("pg_kronika-collector: main reconnect failed: {err:#}");
+        return;
+    }
+    if let Err(err) = pool
+        .refresh(
+            Duration::from_secs(config.pool_refresh_secs),
+            DEFAULT_MAX_DATABASES,
+        )
+        .await
+    {
+        eprintln!("pg_kronika-collector: pool refresh failed: {err:#}");
+    }
+    for db in pool.uncovered() {
+        eprintln!("pg_kronika-collector: database not covered this cycle: {db}");
+    }
+    let major = pool.server_major();
+    match snapshot_and_seal(
+        pool,
+        major,
+        journal,
+        config,
+        statements_cache,
+        plans_cache,
+        due,
+    )
+    .await
+    {
+        Ok(Some(dest)) => announce(&format!("sealed {}", dest.display())),
+        Ok(None) => {}
+        Err(err) => eprintln!("pg_kronika-collector: snapshot failed: {err:#}"),
+    }
 }
 
 /// Counters accumulated while collecting one top-N source, for `1_023_001`.
@@ -1020,6 +1126,16 @@ struct PlansSourceCache {
     next_read: Option<Instant>,
 }
 
+impl PlansSourceCache {
+    /// Whether the paced `pg_store_plans` read is due at `now`.
+    ///
+    /// The main loop asks this before skipping a tick whose scheduler due-set
+    /// is empty: the plans pace must not depend on another source being due.
+    fn is_due(&self, now: Instant) -> bool {
+        self.next_read.is_none_or(|due| now >= due)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedPlansSource {
     source: StatementsSource,
@@ -1134,9 +1250,10 @@ async fn collect_store_plans_cached(
     pool: &ConnectionPool,
     config: &Config,
     cache: &mut PlansSourceCache,
+    force: bool,
 ) -> Option<(PlansRead, u64)> {
     let now = Instant::now();
-    if cache.next_read.is_some_and(|due| now < due) {
+    if !force && !cache.is_due(now) {
         return None;
     }
 
@@ -1382,46 +1499,28 @@ async fn snapshot_and_seal(
     config: &Config,
     statements_cache: &mut StatementsSourceCache,
     plans_cache: &mut PlansSourceCache,
-) -> Result<PathBuf> {
-    let client = pool.main();
+    due: &DueSet,
+) -> Result<Option<PathBuf>> {
     // Run every query first: SectionBuffers and Interner are `!Send`, so they
-    // must not be held across an await.
-    let bgwriter = collect_bgwriter_checkpointer(client, major)
-        .await
-        .context("collect type 1_006_001")?;
-    let ts = bgwriter.ts;
-    let (activity_version, activity_rows) = collect_activity(client, major)
-        .await
-        .context("collect pg_stat_activity")?;
-    let (database_version, database_rows) = collect_database(client, major)
-        .await
-        .context("collect pg_stat_database")?;
-    let progress_vacuum_rows = collect_progress_vacuum(client, major)
-        .await
-        .context("collect pg_stat_progress_vacuum")?;
-    let prepared_rows = collect_prepared_xacts(client)
-        .await
-        .context("collect pg_prepared_xacts")?;
-    let wal = collect_wal(client, major)
-        .await
-        .context("collect pg_stat_wal")?;
-    // pg_stat_io exists from PG16; `None` on older majors.
-    let io = collect_io(client, major)
-        .await
-        .context("collect pg_stat_io")?;
-    let archiver = collect_archiver(client)
-        .await
-        .context("collect pg_stat_archiver")?;
-    let replication_instance_row = collect_replication_instance(client, major)
-        .await
-        .context("collect replication instance status")?;
-    let (replica_rows, slot_rows) = collect_replication_details(client, major).await?;
-    let lock_rows = collect_lock_rows(client, major, config.max_lock_rows).await;
-
-    let (user_tables, tables_cov) = collect_user_tables_all(pool, major, config).await;
-    let (user_indexes, indexes_cov) = collect_user_indexes_all(pool, major, config).await;
-    let statements = collect_statements_cached(pool, config, statements_cache).await;
-    let store_plans_rows = collect_store_plans_cached(pool, config, plans_cache).await;
+    // must not be held across an await. Each source reads only when due.
+    let main_src = collect_main_conn_sources(pool.main(), major, config, due).await?;
+    let (user_tables, tables_cov) = if due.has(SourceKind::UserTables) {
+        collect_user_tables_all(pool, major, config).await
+    } else {
+        (Vec::new(), SourceCoverage::default())
+    };
+    let (user_indexes, indexes_cov) = if due.has(SourceKind::UserIndexes) {
+        collect_user_indexes_all(pool, major, config).await
+    } else {
+        (Vec::new(), SourceCoverage::default())
+    };
+    let statements = if due.has(SourceKind::Statements) {
+        collect_statements_cached(pool, config, statements_cache).await
+    } else {
+        None
+    };
+    let store_plans_rows =
+        collect_store_plans_cached(pool, config, plans_cache, due.forced()).await;
     let coverage = collect_coverage_records(
         major,
         config,
@@ -1432,37 +1531,14 @@ async fn snapshot_and_seal(
             plans: &store_plans_rows,
         },
     );
-    // The extension caches are warm now: reset metadata reads the info views
-    // through the same connections those sections were collected from.
+    // The extension caches stay warm across ticks: reset metadata reads the
+    // info views through the same connections those sections use.
     let service =
-        collect_service_sections(pool, major, config, statements_cache, plans_cache).await?;
+        collect_service_sections(pool, major, config, statements_cache, plans_cache, due).await?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
-    buffers
-        .push(bgwriter)
-        .map_err(|_row| anyhow::anyhow!("section buffer full for bgwriter"))?;
-    push_activity(
-        &mut buffers,
-        &mut interner,
-        activity_version,
-        &activity_rows,
-    )?;
-    push_database(
-        &mut buffers,
-        &mut interner,
-        database_version,
-        &database_rows,
-    )?;
-    push_progress_vacuum(&mut buffers, &mut interner, &progress_vacuum_rows)?;
-    push_prepared_xacts(&mut buffers, &mut interner, &prepared_rows)?;
-    push_wal(&mut buffers, wal)?;
-    if let Some((io_version, io_rows)) = &io {
-        push_io(&mut buffers, &mut interner, *io_version, io_rows)?;
-    }
-    push_archiver(&mut buffers, &mut interner, &archiver)?;
-    push_replication_instance(&mut buffers, &mut interner, &replication_instance_row)?;
-    push_replication_details(&mut buffers, &mut interner, &replica_rows, &slot_rows)?;
+    push_main_conn_sections(&mut buffers, &mut interner, major, &main_src)?;
     push_user_tables(&mut buffers, &mut interner, &user_tables)?;
     push_user_indexes(&mut buffers, &mut interner, &user_indexes)?;
     if let Some((version, rows, _total)) = &statements {
@@ -1473,18 +1549,184 @@ async fn snapshot_and_seal(
         &mut interner,
         store_plans_rows.as_ref().map(|(read, _total)| read),
     )?;
-    if !lock_rows.is_empty() {
-        push_locks(
-            &mut buffers,
-            &mut interner,
-            locks_version(major),
-            &lock_rows,
-        )?;
-    }
     push_service_sections(&mut buffers, &mut interner, &service)?;
-    push_coverage(&mut buffers, &mut interner, ts.0, &coverage)?;
+    push_coverage(&mut buffers, &mut interner, main_src.ts.0, &coverage)?;
 
-    seal_segment(journal, buffers, &interner, config, ts.0)
+    if buffers.is_empty() {
+        // Every due source turned out empty (e.g. no vacuum in progress);
+        // an empty tick seals nothing.
+        return Ok(None);
+    }
+    seal_segment(journal, buffers, &interner, config, main_src.ts.0).map(Some)
+}
+
+/// Everything one tick reads from the main connection, gated by `due`.
+struct MainConnSources {
+    ts: Ts,
+    bgwriter: Option<kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer>,
+    activity: Option<(ActivityVersion, Vec<ActivityRow>)>,
+    database: Option<(DatabaseVersion, Vec<DatabaseRow>)>,
+    progress_vacuum_rows: Vec<ProgressVacuumRow>,
+    prepared_rows: Vec<PreparedXactsRow>,
+    wal: Option<WalSnapshot>,
+    io: Option<(IoVersion, Vec<IoRow>)>,
+    archiver: Option<ArchiverRow>,
+    replication: Option<(ReplicationInstanceRow, Vec<ReplicaRow>, Vec<SlotRow>)>,
+    lock_rows: Vec<LocksRow>,
+}
+
+/// Read the due main-connection sources.
+async fn collect_main_conn_sources(
+    client: &Client,
+    major: u32,
+    config: &Config,
+    due: &DueSet,
+) -> Result<MainConnSources> {
+    let ts = kronika_source_pg::snapshot_ts(client)
+        .await
+        .context("read the snapshot timestamp")?;
+    let bgwriter = if due.has(SourceKind::Bgwriter) {
+        Some(
+            collect_bgwriter_checkpointer(client, major)
+                .await
+                .context("collect type 1_006_001")?,
+        )
+    } else {
+        None
+    };
+    let activity = if due.has(SourceKind::Activity) {
+        Some(
+            collect_activity(client, major)
+                .await
+                .context("collect pg_stat_activity")?,
+        )
+    } else {
+        None
+    };
+    let database = if due.has(SourceKind::Database) {
+        Some(
+            collect_database(client, major)
+                .await
+                .context("collect pg_stat_database")?,
+        )
+    } else {
+        None
+    };
+    let progress_vacuum_rows = if due.has(SourceKind::ProgressVacuum) {
+        collect_progress_vacuum(client, major)
+            .await
+            .context("collect pg_stat_progress_vacuum")?
+    } else {
+        Vec::new()
+    };
+    let prepared_rows = if due.has(SourceKind::PreparedXacts) {
+        collect_prepared_xacts(client)
+            .await
+            .context("collect pg_prepared_xacts")?
+    } else {
+        Vec::new()
+    };
+    let wal = if due.has(SourceKind::Wal) {
+        collect_wal(client, major)
+            .await
+            .context("collect pg_stat_wal")?
+    } else {
+        None
+    };
+    let io = if due.has(SourceKind::Io) {
+        collect_io(client, major)
+            .await
+            .context("collect pg_stat_io")?
+    } else {
+        None
+    };
+    let archiver = if due.has(SourceKind::Archiver) {
+        Some(
+            collect_archiver(client)
+                .await
+                .context("collect pg_stat_archiver")?,
+        )
+    } else {
+        None
+    };
+    let replication = if due.has(SourceKind::Replication) {
+        let instance_row = collect_replication_instance(client, major)
+            .await
+            .context("collect replication instance status")?;
+        let (replica_rows, slot_rows) = collect_replication_details(client, major).await?;
+        Some((instance_row, replica_rows, slot_rows))
+    } else {
+        None
+    };
+    // The lock-wait graph has no interval of its own: the freshest activity
+    // snapshot already says whether any backend waits on a heavyweight lock.
+    let lock_rows = match &activity {
+        Some((_, rows)) if activity_has_lock_waiters(rows) => {
+            collect_lock_rows(client, major, config.max_lock_rows).await
+        }
+        _ => Vec::new(),
+    };
+    Ok(MainConnSources {
+        ts,
+        bgwriter,
+        activity,
+        database,
+        progress_vacuum_rows,
+        prepared_rows,
+        wal,
+        io,
+        archiver,
+        replication,
+        lock_rows,
+    })
+}
+
+/// Buffer the main-connection sections that were read this tick.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_main_conn_sections(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    major: u32,
+    src: &MainConnSources,
+) -> Result<()> {
+    if let Some(bgwriter) = src.bgwriter {
+        buffers
+            .push(bgwriter)
+            .map_err(|_row| anyhow::anyhow!("section buffer full for bgwriter"))?;
+    }
+    if let Some((activity_version, activity_rows)) = &src.activity {
+        push_activity(buffers, interner, *activity_version, activity_rows)?;
+    }
+    if let Some((database_version, database_rows)) = &src.database {
+        push_database(buffers, interner, *database_version, database_rows)?;
+    }
+    push_progress_vacuum(buffers, interner, &src.progress_vacuum_rows)?;
+    push_prepared_xacts(buffers, interner, &src.prepared_rows)?;
+    push_wal(buffers, src.wal)?;
+    if let Some((io_version, io_rows)) = &src.io {
+        push_io(buffers, interner, *io_version, io_rows)?;
+    }
+    if let Some(archiver) = &src.archiver {
+        push_archiver(buffers, interner, archiver)?;
+    }
+    if let Some((instance_row, replica_rows, slot_rows)) = &src.replication {
+        push_replication_instance(buffers, interner, instance_row)?;
+        push_replication_details(buffers, interner, replica_rows, slot_rows)?;
+    }
+    if !src.lock_rows.is_empty() {
+        push_locks(buffers, interner, locks_version(major), &src.lock_rows)?;
+    }
+    Ok(())
+}
+
+/// Whether the activity snapshot shows a backend waiting on a heavyweight
+/// lock — the free precheck for the lock-wait graph.
+fn activity_has_lock_waiters(rows: &[ActivityRow]) -> bool {
+    rows.iter()
+        .any(|row| row.wait_event_type.as_deref() == Some("Lock"))
 }
 
 /// Encode the buffered window, append it to the journal, and seal `<ts>.pgm`.
@@ -1677,39 +1919,49 @@ fn push_coverage(
     Ok(())
 }
 
-/// The per-segment service rows: reset context, instance fingerprint, and
-/// the full `pg_settings` copy.
+/// Service rows gated by their scheduler intervals.
 struct ServiceSections {
-    reset_base: ResetBase,
-    reset_ext: ResetExtensions,
-    instance: InstanceFacts,
+    reset: Option<(ResetBase, ResetExtensions)>,
+    instance: Option<InstanceFacts>,
     settings: Vec<SettingsRow>,
 }
 
-/// Collect the service sections written to every segment.
+/// Collect the due service sections.
 async fn collect_service_sections(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
     statements_cache: &StatementsSourceCache,
     plans_cache: &PlansSourceCache,
+    due: &DueSet,
 ) -> Result<ServiceSections> {
-    let (reset_base, reset_ext) =
-        collect_reset_metadata_all(pool, major, statements_cache, plans_cache).await?;
-    let instance = collect_instance_facts(pool.main(), config).await?;
-    let settings = collect_settings(pool.main())
-        .await
-        .context("collect pg_settings")?;
-    validate_settings_row_count(settings.len())?;
+    let reset = if due.has(SourceKind::ResetMetadata) {
+        Some(collect_reset_metadata_all(pool, major, statements_cache, plans_cache).await?)
+    } else {
+        None
+    };
+    let instance = if due.has(SourceKind::InstanceMetadata) {
+        Some(collect_instance_facts(pool.main(), config).await?)
+    } else {
+        None
+    };
+    let settings = if due.has(SourceKind::Settings) {
+        let settings = collect_settings(pool.main())
+            .await
+            .context("collect pg_settings")?;
+        validate_settings_row_count(settings.len())?;
+        settings
+    } else {
+        Vec::new()
+    };
     Ok(ServiceSections {
-        reset_base,
-        reset_ext,
+        reset,
         instance,
         settings,
     })
 }
 
-/// Buffer the three service sections of one segment.
+/// Buffer the service sections collected for this tick.
 ///
 /// # Errors
 /// Returns an error if a string cannot be interned (dictionary full) or a
@@ -1719,8 +1971,12 @@ fn push_service_sections(
     interner: &mut Interner,
     service: &ServiceSections,
 ) -> Result<()> {
-    push_reset_metadata(buffers, interner, &service.reset_base, &service.reset_ext)?;
-    push_instance_metadata(buffers, interner, &service.instance)?;
+    if let Some((reset_base, reset_ext)) = &service.reset {
+        push_reset_metadata(buffers, interner, reset_base, reset_ext)?;
+    }
+    if let Some(instance) = &service.instance {
+        push_instance_metadata(buffers, interner, instance)?;
+    }
     push_settings(buffers, interner, &service.settings)
 }
 
@@ -1801,33 +2057,24 @@ async fn collect_instance_facts(client: &Client, config: &Config) -> Result<Inst
 
 /// Collect lock-wait rows or degrade by skipping only section `1_011`.
 async fn collect_lock_rows(client: &Client, major: u32, max_lock_rows: i64) -> Vec<LocksRow> {
-    match lock_waits_exist(client).await {
-        Ok(true) => match collect_locks(client, major, max_lock_rows).await {
-            Ok(snapshot) => {
-                if let Some(skipped) = snapshot.skipped {
-                    eprintln!(
-                        "pg_kronika-collector: skipping section 1_011 for this snapshot; \
-                         lock-wait graph exceeds KRONIKA_PG_MAX_LOCK_ROWS={} \
-                         (waiters={}, edges={}, nodes={})",
-                        skipped.max_rows, skipped.waiters, skipped.edges, skipped.nodes
-                    );
-                    Vec::new()
-                } else {
-                    snapshot.rows
-                }
-            }
-            Err(err) => {
+    match collect_locks(client, major, max_lock_rows).await {
+        Ok(snapshot) => {
+            if let Some(skipped) = snapshot.skipped {
                 eprintln!(
-                    "pg_kronika-collector: pg_locks wait-tree collection failed; \
-                     skipping section 1_011 for this snapshot: {err}"
+                    "pg_kronika-collector: skipping section 1_011 for this snapshot; \
+                     lock-wait graph exceeds KRONIKA_PG_MAX_LOCK_ROWS={} \
+                     (waiters={}, edges={}, nodes={})",
+                    skipped.max_rows, skipped.waiters, skipped.edges, skipped.nodes
                 );
                 Vec::new()
+            } else {
+                snapshot.rows
             }
-        },
-        Ok(false) => Vec::new(),
+        }
         Err(err) => {
             eprintln!(
-                "pg_kronika-collector: lock-wait precheck failed; skipping section 1_011: {err}"
+                "pg_kronika-collector: pg_locks wait-tree collection failed; \
+                 skipping section 1_011 for this snapshot: {err}"
             );
             Vec::new()
         }
@@ -2236,9 +2483,24 @@ fn push_store_plans_ossc(
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceCoverage, StatementsVersion, min_total_time, statements_type_id,
+        PlansSourceCache, SourceCoverage, StatementsVersion, min_total_time, statements_type_id,
         user_indexes_type_id, user_tables_type_id,
     };
+
+    #[test]
+    fn plans_cache_is_due_without_a_deadline_and_after_it() {
+        use std::time::{Duration, Instant};
+
+        let mut cache = PlansSourceCache::default();
+        let now = Instant::now();
+        assert!(cache.is_due(now), "a fresh cache reads immediately");
+        cache.next_read = Some(now + Duration::from_mins(5));
+        assert!(!cache.is_due(now), "before the deadline nothing is due");
+        assert!(
+            cache.is_due(now + Duration::from_mins(5)),
+            "the deadline itself is due"
+        );
+    }
 
     #[test]
     fn coverage_reason_ranks_timeouts_over_other_skips() {

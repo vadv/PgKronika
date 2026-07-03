@@ -75,6 +75,24 @@ pub fn server_major(server_version: Option<&str>) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// The snapshot timestamp: server time in unix microseconds.
+///
+/// The segment file is named after this value, so it comes from one tiny
+/// query instead of piggybacking on whichever section happens to be due.
+///
+/// # Errors
+/// Returns the underlying [`tokio_postgres::Error`] if the server cannot be
+/// queried.
+pub async fn snapshot_ts(client: &Client) -> Result<Ts, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            marked!("SELECT (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us"),
+            &[],
+        )
+        .await?;
+    Ok(Ts(row.get("ts_us")))
+}
+
 /// Collect type `1_006_001` from a connected server of major version `major`.
 ///
 /// `major` comes from the handshake (see [`server_major`]), so collection makes

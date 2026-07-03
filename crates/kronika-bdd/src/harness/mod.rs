@@ -66,6 +66,8 @@ pub(crate) struct HarnessState {
     sessions: BTreeMap<String, Session>,
     /// Sealed segment from the most recent `snapshots the segment` step.
     segment: Option<PathBuf>,
+    /// Segments sealed by the internal-timer step, in seal order.
+    timer_segments: Vec<PathBuf>,
     /// The collector's stderr from the most recent snapshot, for failure dumps.
     collector_log: Option<String>,
     /// Prepared transactions that must be rolled back before the database is
@@ -183,6 +185,27 @@ impl HarnessState {
     /// Insert an opened session under `name`, replacing any previous one.
     pub(crate) fn insert_session(&mut self, name: String, session: Session) {
         self.sessions.insert(name, session);
+    }
+
+    /// Record the segments a timer-driven collector run sealed.
+    pub(crate) fn set_timer_segments(&mut self, segments: Vec<PathBuf>) {
+        self.timer_segments = segments;
+    }
+
+    /// The `index`-th (1-based) segment of the timer-driven run.
+    pub(crate) fn timer_segment(&self, index: usize) -> Result<&PathBuf> {
+        self.timer_segments
+            .get(
+                index
+                    .checked_sub(1)
+                    .context("timer segment index is 1-based")?,
+            )
+            .with_context(|| {
+                format!(
+                    "the timer run sealed {} segments; segment {index} was asked for",
+                    self.timer_segments.len()
+                )
+            })
     }
 
     /// Track a spawned client-tool process for cleanup.
@@ -370,6 +393,7 @@ impl HarnessState {
         }
         self.window_floors.clear();
         self.segment = None;
+        self.timer_segments.clear();
         self.collector_log = None;
         self.collector_output_dirs.clear();
         self.collector_env.clear();
