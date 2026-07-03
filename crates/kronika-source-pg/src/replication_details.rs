@@ -2,7 +2,7 @@
 //! `pg_replication_slots` (`1_017_001`).
 //!
 //! Both views are cluster-wide and read from the main connection. A standby
-//! usually has no walsenders, so `1_016_001` seals no rows there; slots exist
+//! usually has no walsenders, so `1_016_001` writes no rows there; slots exist
 //! on both roles, but `retained_bytes` needs `pg_current_wal_lsn()` and is
 //! `NULL` in recovery. LSN offsets saturate to `i64::MAX` in SQL, matching
 //! the `1_015_001` collection.
@@ -24,6 +24,38 @@ macro_rules! marked {
             $sql,
         )
     };
+}
+
+/// PostgreSQL-side row bounds for replication detail views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationDetailBounds {
+    /// Upper bound for `pg_stat_replication` rows.
+    pub max_wal_senders: i64,
+    /// Upper bound for `pg_replication_slots` rows.
+    pub max_replication_slots: i64,
+}
+
+/// Collect GUC values that bound replication-detail cardinality.
+///
+/// # Errors
+/// Returns the [`tokio_postgres::Error`] if the query fails.
+pub async fn collect_replication_detail_bounds(
+    client: &Client,
+) -> Result<ReplicationDetailBounds, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            marked!(
+                "SELECT \
+                     current_setting('max_wal_senders')::int8 AS max_wal_senders, \
+                     current_setting('max_replication_slots')::int8 AS max_replication_slots"
+            ),
+            &[],
+        )
+        .await?;
+    Ok(ReplicationDetailBounds {
+        max_wal_senders: row.get("max_wal_senders"),
+        max_replication_slots: row.get("max_replication_slots"),
+    })
 }
 
 /// One `pg_stat_replication` row before interning.
@@ -123,7 +155,7 @@ pub async fn collect_replication_replicas(
         .collect())
 }
 
-/// Intern the row's strings and build the sealed `1_016_001` layout.
+/// Intern the row's strings and build the `1_016_001` registry row.
 ///
 /// # Errors
 /// Propagates the interner error when the dictionary is full.
@@ -253,7 +285,7 @@ pub async fn collect_replication_slots(
         .collect())
 }
 
-/// Intern the row's strings and build the sealed `1_017_001` layout.
+/// Intern the row's strings and build the `1_017_001` registry row.
 ///
 /// # Errors
 /// Propagates the interner error when the dictionary is full.

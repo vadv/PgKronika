@@ -298,8 +298,8 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
             "full_page_writes=off",
             "-c",
             "max_prepared_transactions=16",
-            // Logical slots need it; physical replication scenarios are
-            // unaffected, the extra WAL detail is harmless for the rest.
+            // Logical slots need it; the other replication scenarios do not
+            // assert WAL records produced by this setting.
             "-c",
             "wal_level=logical",
         ]);
