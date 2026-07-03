@@ -37,3 +37,23 @@ Feature: The scheduler paces sources by their own intervals
       """
       SELECT current_setting('server_version_num')::int4
       """
+
+  @pg16 @serial
+  Scenario: a segment accumulates windows until the age valve fires
+    Given a fresh database on PostgreSQL 16
+    And the collector runs with env "KRONIKA_INTERVAL_S" = "1"
+    And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "1"
+    And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "3"
+    When the collector runs on its own timer until 1 segments are sealed
+    Then timer segment 1 section 1_001_003 spans at least 2 snapshots
+    And timer segment 1 has section 1_019_001
+
+  @pg15 @serial
+  Scenario: a one-byte size cap seals every tick into its own file
+    Given a fresh database on PostgreSQL 15
+    And the collector runs with env "KRONIKA_INTERVAL_S" = "1"
+    And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "1"
+    And the collector runs with env "KRONIKA_SEGMENT_MAX_BYTES" = "1"
+    When the collector runs on its own timer until 2 segments are sealed
+    Then timer segment 1 has section 1_001_003
+    And timer segment 2 has section 1_001_003

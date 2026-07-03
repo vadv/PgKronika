@@ -59,6 +59,45 @@ fn timer_segment_missing(world: &mut BddWorld, index: usize, type_id: String) ->
     assert_timer_section(world, index, &type_id, false)
 }
 
+/// The section of a timer segment carries at least `min` distinct `ts`
+/// values — the segment accumulated that many collection windows.
+#[then(regex = r"^timer segment (\d+) section ([\d_]+) spans at least (\d+) snapshots$")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+fn timer_segment_spans(
+    world: &mut BddWorld,
+    index: usize,
+    type_id: String,
+    min: usize,
+) -> Result<()> {
+    use crate::harness::assert_row::decode_section;
+    use kronika_registry::Cell;
+
+    let type_id = parse_type_id(&type_id)?;
+    let path = world.harness.timer_segment(index)?;
+    let segment_path = path.clone();
+    let (rows, _dict) = decode_section(&segment_path, type_id)?;
+    let mut stamps: Vec<i64> = rows
+        .iter()
+        .filter_map(|row| match row.get("ts") {
+            Some(Cell::Ts(ts)) => Some(*ts),
+            _ => None,
+        })
+        .collect();
+    stamps.sort_unstable();
+    stamps.dedup();
+    anyhow::ensure!(
+        stamps.len() >= min,
+        "timer segment {index}: section {type_id} holds {} distinct snapshot \
+         timestamps, expected at least {min}\ncollector stderr:\n{}",
+        stamps.len(),
+        world.harness.failure_log().unwrap_or_default(),
+    );
+    Ok(())
+}
+
 fn assert_timer_section(
     world: &BddWorld,
     index: usize,

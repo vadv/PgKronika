@@ -67,7 +67,13 @@
 //!   `KRONIKA_INSTANCE_INTERVAL_S` (60), `KRONIKA_PG_SETTINGS_INTERVAL_S`
 //!   (3600). The lock-wait graph has no interval: it runs when the freshest
 //!   activity snapshot shows a backend waiting on a heavyweight lock. The
-//!   `pg_store_plans` pace stays on `KRONIKA_PG_PLANS_INTERVAL_S`.
+//!   `pg_store_plans` pace stays on `KRONIKA_PG_PLANS_INTERVAL_S`;
+//! - `KRONIKA_SEGMENT_MAX_BYTES`: seal the segment once the journal holds
+//!   this many raw (pre-seal) bytes, default 67108864 (64 MiB); `0` seals on
+//!   every tick. A SIGUSR2 tick always seals immediately;
+//! - `KRONIKA_SEGMENT_MAX_AGE_S`: seal an open segment older than this many
+//!   seconds even under the size cap, default 900 — the quiet-instance
+//!   safety valve, like `archive_timeout` for WAL.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
@@ -173,6 +179,12 @@ struct Config {
     tick_secs: u64,
     /// Per-source read intervals.
     intervals: Intervals,
+    /// Seal the segment when the journal holds at least this many raw bytes;
+    /// `0` seals on every tick (the pre-rotation behavior).
+    segment_max_bytes: u64,
+    /// Seal an open segment older than this many seconds even if the size
+    /// cap was not reached — the quiet-instance safety valve.
+    segment_max_age_secs: u64,
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -226,6 +238,8 @@ impl Config {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
         let tick_secs = env_u64("KRONIKA_INTERVAL_S", 5)?;
+        let segment_max_bytes = env_u64("KRONIKA_SEGMENT_MAX_BYTES", 64 * 1024 * 1024)?;
+        let segment_max_age_secs = env_u64("KRONIKA_SEGMENT_MAX_AGE_S", 900)?;
         let defaults = Intervals::default();
         let intervals = Intervals {
             activity: env_u64("KRONIKA_PG_ACTIVITY_INTERVAL_S", defaults.activity)?,
@@ -274,6 +288,8 @@ impl Config {
             node_self_id,
             tick_secs,
             intervals,
+            segment_max_bytes,
+            segment_max_age_secs,
         })
     }
 }
@@ -491,6 +507,7 @@ async fn main() -> Result<()> {
     let mut statements_cache = StatementsSourceCache::default();
     let mut plans_cache = PlansSourceCache::default();
     let mut sched = Scheduler::new(config.intervals);
+    let mut segment = SegmentState::default();
     // With the timer disabled the ticker never fires; collection is
     // signal-driven only (the BDD harness runs in this mode).
     let mut ticker = (config.tick_secs > 0)
@@ -519,6 +536,18 @@ async fn main() -> Result<()> {
         // The plans pace lives outside the scheduler; a tick with only the
         // plans read due still runs.
         if due.is_empty() && !plans_cache.is_due(Instant::now()) {
+            // The age safety valve must fire even when nothing collects:
+            // a quiet instance still publishes its open segment on time.
+            let age = Duration::from_secs(config.segment_max_age_secs);
+            if segment.age_expired(Instant::now(), age) {
+                match seal_open_segment(&mut journal, &config, &mut segment) {
+                    Ok(dest) => {
+                        sched.mark_segment_opened();
+                        announce(&format!("sealed {}", dest.display()));
+                    }
+                    Err(err) => eprintln!("pg_kronika-collector: segment seal failed: {err:#}"),
+                }
+            }
             continue;
         }
         run_collection_cycle(
@@ -528,6 +557,8 @@ async fn main() -> Result<()> {
             &mut statements_cache,
             &mut plans_cache,
             &due,
+            &mut segment,
+            &mut sched,
         )
         .await;
     }
@@ -536,6 +567,10 @@ async fn main() -> Result<()> {
 
 /// One collection cycle: reconnect and refresh the pool, snapshot the due
 /// sources, seal the segment. Failures log and leave the daemon running.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the collection cycle wires every piece of daemon state together once"
+)]
 async fn run_collection_cycle(
     pool: &mut ConnectionPool,
     journal: &mut Journal,
@@ -543,6 +578,8 @@ async fn run_collection_cycle(
     statements_cache: &mut StatementsSourceCache,
     plans_cache: &mut PlansSourceCache,
     due: &DueSet,
+    segment: &mut SegmentState,
+    sched: &mut Scheduler,
 ) {
     if let Err(err) = pool.ensure_main().await {
         eprintln!("pg_kronika-collector: main reconnect failed: {err:#}");
@@ -569,10 +606,16 @@ async fn run_collection_cycle(
         statements_cache,
         plans_cache,
         due,
+        segment,
     )
     .await
     {
-        Ok(Some(dest)) => announce(&format!("sealed {}", dest.display())),
+        Ok(Some(dest)) => {
+            // A fresh segment must be self-contained: the service sections
+            // (instance, reset, settings) come due on its first window.
+            sched.mark_segment_opened();
+            announce(&format!("sealed {}", dest.display()));
+        }
         Ok(None) => {}
         Err(err) => eprintln!("pg_kronika-collector: snapshot failed: {err:#}"),
     }
@@ -1492,6 +1535,10 @@ fn truncate_to_boundary(text: &mut String, max_bytes: usize) {
     text.truncate(cut);
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the snapshot wires every piece of daemon state together once"
+)]
 async fn snapshot_and_seal(
     pool: &ConnectionPool,
     major: u32,
@@ -1500,6 +1547,7 @@ async fn snapshot_and_seal(
     statements_cache: &mut StatementsSourceCache,
     plans_cache: &mut PlansSourceCache,
     due: &DueSet,
+    segment: &mut SegmentState,
 ) -> Result<Option<PathBuf>> {
     // Run every query first: SectionBuffers and Interner are `!Send`, so they
     // must not be held across an await. Each source reads only when due.
@@ -1554,10 +1602,22 @@ async fn snapshot_and_seal(
 
     if buffers.is_empty() {
         // Every due source turned out empty (e.g. no vacuum in progress);
-        // an empty tick seals nothing.
+        // an empty tick appends nothing.
         return Ok(None);
     }
-    seal_segment(journal, buffers, &interner, config, main_src.ts.0).map(Some)
+    append_window(journal, buffers, &interner, config)?;
+    let now = Instant::now();
+    segment.on_window_appended(main_src.ts.0, now);
+    let age = Duration::from_secs(config.segment_max_age_secs);
+    if should_seal(
+        due.forced(),
+        journal.bytes(),
+        config.segment_max_bytes,
+        segment.age_expired(now, age),
+    ) {
+        return seal_open_segment(journal, config, segment).map(Some);
+    }
+    Ok(None)
 }
 
 /// Everything one tick reads from the main connection, gated by `due`.
@@ -1729,14 +1789,50 @@ fn activity_has_lock_waiters(rows: &[ActivityRow]) -> bool {
         .any(|row| row.wait_event_type.as_deref() == Some("Lock"))
 }
 
-/// Encode the buffered window, append it to the journal, and seal `<ts>.pgm`.
-fn seal_segment(
+/// The open (not yet sealed) segment: its file name comes from the first
+/// window's timestamp, its age from the moment that window was appended.
+#[derive(Debug, Default, Clone, Copy)]
+struct SegmentState {
+    first_ts: Option<i64>,
+    opened_at: Option<Instant>,
+}
+
+impl SegmentState {
+    /// Register the appended window; the first one opens the segment.
+    const fn on_window_appended(&mut self, ts: i64, now: Instant) {
+        if self.first_ts.is_none() {
+            self.first_ts = Some(ts);
+            self.opened_at = Some(now);
+        }
+    }
+
+    /// Whether the age safety valve fired for an open segment.
+    fn age_expired(&self, now: Instant, max_age: Duration) -> bool {
+        self.opened_at
+            .is_some_and(|opened| now.duration_since(opened) >= max_age)
+    }
+}
+
+/// Whether the open segment must seal now, per the rotation contract:
+/// a forced tick always seals (the SIGUSR2 snapshot contract), a zero size
+/// cap seals every tick, otherwise the raw journal size or the segment age
+/// decides — whichever trips first.
+const fn should_seal(
+    forced: bool,
+    journal_bytes: usize,
+    max_bytes: u64,
+    age_expired: bool,
+) -> bool {
+    forced || max_bytes == 0 || journal_bytes as u64 >= max_bytes || age_expired
+}
+
+/// Encode the buffered window and append it to the journal.
+fn append_window(
     journal: &mut Journal,
     mut buffers: SectionBuffers,
     interner: &Interner,
     config: &Config,
-    ts: i64,
-) -> Result<PathBuf> {
+) -> Result<()> {
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
         .flush(&dict_sections, config.source_id)
@@ -1745,11 +1841,23 @@ fn seal_segment(
     journal
         .append(&part)
         .context("append the part to the journal")?;
+    Ok(())
+}
 
-    let dest = config.out_dir.join(format!("{ts}.pgm"));
+/// Seal the open segment into `<first_ts>.pgm` and reset the journal.
+fn seal_open_segment(
+    journal: &mut Journal,
+    config: &Config,
+    segment: &mut SegmentState,
+) -> Result<PathBuf> {
+    let first_ts = segment
+        .first_ts
+        .context("sealing an open segment requires an appended window")?;
+    let dest = config.out_dir.join(format!("{first_ts}.pgm"));
     seal(journal, &dest).context("seal the segment")?;
     // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
+    *segment = SegmentState::default();
     Ok(dest)
 }
 
@@ -2483,9 +2591,36 @@ fn push_store_plans_ossc(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlansSourceCache, SourceCoverage, StatementsVersion, min_total_time, statements_type_id,
-        user_indexes_type_id, user_tables_type_id,
+        PlansSourceCache, SegmentState, SourceCoverage, StatementsVersion, min_total_time,
+        should_seal, statements_type_id, user_indexes_type_id, user_tables_type_id,
     };
+
+    #[test]
+    fn segment_seals_on_force_zero_cap_size_or_age() {
+        assert!(should_seal(true, 0, u64::MAX, false), "force always seals");
+        assert!(should_seal(false, 1, 0, false), "zero cap seals every tick");
+        assert!(should_seal(false, 64, 64, false), "size cap reached");
+        assert!(!should_seal(false, 63, 64, false), "under the cap");
+        assert!(should_seal(false, 1, u64::MAX, true), "age valve fired");
+    }
+
+    #[test]
+    fn segment_state_opens_on_the_first_window_only() {
+        use std::time::{Duration, Instant};
+
+        let mut segment = SegmentState::default();
+        let now = Instant::now();
+        assert!(!segment.age_expired(now, Duration::from_secs(1)));
+        segment.on_window_appended(100, now);
+        segment.on_window_appended(200, now + Duration::from_secs(5));
+        assert_eq!(
+            segment.first_ts,
+            Some(100),
+            "the first window names the file"
+        );
+        assert!(segment.age_expired(now + Duration::from_secs(5), Duration::from_secs(5)));
+        assert!(!segment.age_expired(now + Duration::from_secs(4), Duration::from_secs(5)));
+    }
 
     #[test]
     fn plans_cache_is_due_without_a_deadline_and_after_it() {

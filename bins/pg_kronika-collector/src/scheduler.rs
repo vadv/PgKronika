@@ -145,6 +145,14 @@ impl DueSet {
     }
 }
 
+/// The sources a fresh segment re-reads on its first tick, so every sealed
+/// file carries its own instance identity, reset context, and configuration.
+const SEGMENT_OPEN_SOURCES: [SourceKind; 3] = [
+    SourceKind::ResetMetadata,
+    SourceKind::InstanceMetadata,
+    SourceKind::Settings,
+];
+
 /// Decides which sources each tick reads, one entry per source.
 #[derive(Debug)]
 pub(crate) struct Scheduler {
@@ -157,6 +165,16 @@ impl Scheduler {
         Self {
             intervals,
             last_read: [None; ALL_SOURCES.len()],
+        }
+    }
+
+    /// A segment was just sealed: the per-segment service sources come due
+    /// again, so the next window opens a self-contained file.
+    pub(crate) fn mark_segment_opened(&mut self) {
+        for (slot, kind) in ALL_SOURCES.iter().enumerate() {
+            if SEGMENT_OPEN_SOURCES.contains(kind) {
+                self.last_read[slot] = None;
+            }
         }
     }
 
@@ -274,6 +292,20 @@ mod tests {
                 .plan(start + Duration::from_secs(5), false)
                 .has(SourceKind::Activity)
         );
+    }
+
+    #[test]
+    fn segment_open_re_arms_only_the_service_sources() {
+        let mut scheduler = Scheduler::new(uniform(1000));
+        let start = Instant::now();
+        scheduler.plan(start, false); // first tick: everything read
+        scheduler.mark_segment_opened();
+        let next = scheduler.plan(start + Duration::from_secs(1), false);
+        assert!(next.has(SourceKind::ResetMetadata));
+        assert!(next.has(SourceKind::InstanceMetadata));
+        assert!(next.has(SourceKind::Settings));
+        assert!(!next.has(SourceKind::Activity));
+        assert!(!next.has(SourceKind::UserTables));
     }
 
     #[test]
