@@ -8,6 +8,10 @@ Feature: The scheduler paces sources by their own intervals
   @pg17 @serial
   Scenario: later ticks skip sources that are not due
     Given a fresh database on PostgreSQL 17
+    And a database seeded with:
+      """
+      CREATE TABLE kronika_sched_probe(id int);
+      """
     And the collector runs with env "KRONIKA_INTERVAL_S" = "1"
     And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "1"
     And the collector runs with env "KRONIKA_PG_SETTINGS_INTERVAL_S" = "3600"
