@@ -38,7 +38,7 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_014_001` | `pg_stat_user_indexes` + statio (PG 10-15) | 30 с | `snapshot_full` | `(datid, indexrelid, ts)` |
 | `1_014_002` | `pg_stat_user_indexes` + statio (PG 16-18) | 30 с | `snapshot_full` | `(datid, indexrelid, ts)` |
 | `1_015_001` | replication: статус инстанса | 30 с | `snapshot_full` | `(ts)` |
-| `1_016_001` | replication: реплики primary | 30 с | `snapshot_full` | `(application_name, client_addr, pid, ts)` |
+| `1_016_001` | replication: реплики primary | 30 с | `snapshot_full` | `(application_name, pid, ts)` |
 | `1_017_001` | replication: слоты | 30 с | `snapshot_full` | `(slot_name, ts)` |
 | `1_018_001` | wraparound | 30 с | `snapshot_full` | `(datname, ts)` |
 | `1_019_001` | `pg_settings` | сегмент + 1 ч | `on_change` | `(name)` |
@@ -931,6 +931,13 @@ received_tli               i32?  G
 
 ### `1_016_001` реплики primary
 
+Сортовой ключ — `(application_name, pid, ts)`: `pid` уникален в пределах
+снимка, а nullable-колонка (`client_addr`) в ключе не участвует. LSN-колонки
+nullable: walsender от `pg_basebackup` показывает `state = backup` с `NULL`
+позициями; lag-колонки `NULL`, когда standby не шлёт ответы. Строковые поля
+`usename`/`application_name`/`state`/`sync_state` коалесируются в пустую
+строку.
+
 ```text
 ts                ts    T
 pid               i32   L
@@ -939,10 +946,11 @@ application_name  str   L
 client_addr       str?  L
 state             str   L
 sync_state        str   L
-sent_lsn          i64   G
-write_lsn         i64   G
-flush_lsn         i64   G
-replay_lsn        i64   G
+sync_priority     i32?  G
+sent_lsn          i64?  G
+write_lsn         i64?  G
+flush_lsn         i64?  G
+replay_lsn        i64?  G
 write_lag_us      i64?  G
 flush_lag_us      i64?  G
 replay_lag_us     i64?  G
@@ -950,16 +958,21 @@ replay_lag_us     i64?  G
 
 ### `1_017_001` replication slots
 
+`restart_lsn` nullable: физический слот, созданный без резервирования WAL, не
+имеет позиции, и все производные от неё колонки остаются `NULL` вместе с ним.
+`retained_bytes = pg_current_wal_lsn() - restart_lsn`; на standby нет текущей
+LSN, значение `NULL`. `wal_status` появился в PG13; ранее — `NULL`.
+
 ```text
 ts                  ts    T
 slot_name           str   L
 plugin              str?  L
 slot_type           str   L
 active              bool  G
-restart_lsn         i64   G
+restart_lsn         i64?  G
 confirmed_flush_lsn i64?  G
 retained_bytes      i64?  G
-wal_status          str   G   // reserved | extended | lost, PG13+
+wal_status          str?  L   // reserved | extended | unreserved | lost, PG13+
 ```
 
 ## `1_018_001` wraparound

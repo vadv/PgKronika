@@ -79,6 +79,10 @@ use kronika_source_pg::prepared_xacts::{
 use kronika_source_pg::progress_vacuum::{
     ProgressVacuumRow, collect_progress_vacuum, to_progress_vacuum,
 };
+use kronika_source_pg::replication_details::{
+    ReplicaRow, ReplicationDetailBounds, SlotRow, collect_replication_detail_bounds,
+    collect_replication_replicas, collect_replication_slots, to_replicas_v1, to_slots_v1,
+};
 use kronika_source_pg::replication_instance::{
     ReplicationInstanceRow, collect_replication_instance, to_replication_instance,
 };
@@ -349,6 +353,58 @@ fn validate_settings_row_count(rows: usize) -> Result<()> {
     anyhow::ensure!(
         rows <= MAX_SECTION_ROWS,
         "pg_settings returned {rows} rows, exceeding the {MAX_SECTION_ROWS}-row section cap"
+    );
+    Ok(())
+}
+
+const REPLICA_DICT_BYTES_PER_ROW: i64 = 224;
+const SLOT_DICT_BYTES_PER_ROW: i64 = 152;
+
+/// Reject replication-detail GUC bounds that can overflow section or dictionary limits.
+///
+/// The strings in both views are bounded by `PostgreSQL` `name`, `inet` text, and
+/// fixed status labels. These constants overestimate the unique bytes per row,
+/// so a high GUC fails before the collector materializes the view output.
+///
+/// # Errors
+/// Returns an error naming the GUC or dictionary cap that would be exceeded.
+fn validate_replication_detail_bounds(bounds: ReplicationDetailBounds) -> Result<()> {
+    let section_cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
+    check_replication_detail_section_bound("max_wal_senders", bounds.max_wal_senders, section_cap)?;
+    check_replication_detail_section_bound(
+        "max_replication_slots",
+        bounds.max_replication_slots,
+        section_cap,
+    )?;
+
+    let dict_cap = i64::try_from(activity_dict_limits().max_total_bytes())
+        .context("dictionary byte cap exceeds i64")?;
+    let replica_bytes = bounds
+        .max_wal_senders
+        .checked_mul(REPLICA_DICT_BYTES_PER_ROW)
+        .context("max_wal_senders dictionary estimate overflows i64")?;
+    let slot_bytes = bounds
+        .max_replication_slots
+        .checked_mul(SLOT_DICT_BYTES_PER_ROW)
+        .context("max_replication_slots dictionary estimate overflows i64")?;
+    let worst_case = replica_bytes
+        .checked_add(slot_bytes)
+        .context("replication detail dictionary estimate overflows i64")?;
+    anyhow::ensure!(
+        worst_case <= dict_cap,
+        "replication detail labels can require {worst_case} dictionary bytes from \
+         max_wal_senders={} and max_replication_slots={}, exceeding the {dict_cap}-byte cap",
+        bounds.max_wal_senders,
+        bounds.max_replication_slots
+    );
+    Ok(())
+}
+
+fn check_replication_detail_section_bound(guc: &str, value: i64, cap: i64) -> Result<()> {
+    anyhow::ensure!(value >= 0, "{guc} must be non-negative, got {value}");
+    anyhow::ensure!(
+        value <= cap,
+        "{guc} ({value}) exceeds the {cap}-row section cap; lower {guc}"
     );
     Ok(())
 }
@@ -1228,6 +1284,7 @@ async fn snapshot_and_seal(
     let replication_instance_row = collect_replication_instance(client, major)
         .await
         .context("collect replication instance status")?;
+    let (replica_rows, slot_rows) = collect_replication_details(client, major).await?;
     let lock_rows = collect_lock_rows(client, major, config.max_lock_rows).await;
 
     let user_tables = collect_user_tables_all(pool, major, config).await;
@@ -1269,6 +1326,7 @@ async fn snapshot_and_seal(
     }
     push_archiver(&mut buffers, &mut interner, &archiver)?;
     push_replication_instance(&mut buffers, &mut interner, &replication_instance_row)?;
+    push_replication_details(&mut buffers, &mut interner, &replica_rows, &slot_rows)?;
     push_user_tables(&mut buffers, &mut interner, &user_tables)?;
     push_user_indexes(&mut buffers, &mut interner, &user_indexes)?;
     if let Some((version, rows)) = &statements {
@@ -1746,6 +1804,47 @@ fn push_instance_metadata(
     buffer_row(buffers, row)
 }
 
+/// Collect the walsender and slot detail rows from the main connection.
+async fn collect_replication_details(
+    client: &Client,
+    major: u32,
+) -> Result<(Vec<ReplicaRow>, Vec<SlotRow>)> {
+    let bounds = collect_replication_detail_bounds(client)
+        .await
+        .context("collect replication detail row bounds")?;
+    validate_replication_detail_bounds(bounds)?;
+    let replicas = collect_replication_replicas(client)
+        .await
+        .context("collect pg_stat_replication")?;
+    let slots = collect_replication_slots(client, major)
+        .await
+        .context("collect pg_replication_slots")?;
+    Ok((replicas, slots))
+}
+
+/// Intern and buffer the `pg_stat_replication` and `pg_replication_slots`
+/// rows.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_replication_details(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    replicas: &[ReplicaRow],
+    slots: &[SlotRow],
+) -> Result<()> {
+    for row in replicas {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_replicas_v1(row, &mut intern)?)?;
+    }
+    for row in slots {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_slots_v1(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
 /// Intern each row's strings and buffer it as the `pg_settings` section.
 ///
 /// # Errors
@@ -1827,7 +1926,7 @@ mod tests {
         activity_dict_limits, push_activity, push_archiver, push_database, push_io, push_locks,
         push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
         push_user_indexes, push_user_tables, validate_cardinality, validate_heavy_cap,
-        validate_max_lock_rows, validate_settings_row_count,
+        validate_max_lock_rows, validate_replication_detail_bounds, validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
@@ -1836,6 +1935,7 @@ mod tests {
     use kronika_source_pg::locks::{LocksRow, LocksVersion};
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
+    use kronika_source_pg::replication_details::ReplicationDetailBounds;
     use kronika_source_pg::replication_instance::ReplicationInstanceRow;
     use kronika_source_pg::statements::{StatementsRow, StatementsVersion};
     use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion};
@@ -2606,6 +2706,49 @@ mod tests {
     fn max_lock_rows_validation_rejects_zero() {
         let err = validate_max_lock_rows(0).expect_err("zero disables the graph guard");
         assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn replication_detail_bounds_accept_defaults() {
+        let bounds = ReplicationDetailBounds {
+            max_wal_senders: 10,
+            max_replication_slots: 10,
+        };
+        assert!(validate_replication_detail_bounds(bounds).is_ok());
+    }
+
+    #[test]
+    fn replication_detail_bounds_reject_section_overflow() {
+        let cap = i64::try_from(MAX_SECTION_ROWS).unwrap();
+        let bounds = ReplicationDetailBounds {
+            max_wal_senders: cap + 1,
+            max_replication_slots: 10,
+        };
+        let err = validate_replication_detail_bounds(bounds)
+            .expect_err("max_wal_senders above the section cap must be rejected");
+        assert!(err.to_string().contains("max_wal_senders"));
+    }
+
+    #[test]
+    fn replication_detail_bounds_reject_negative_guc() {
+        let bounds = ReplicationDetailBounds {
+            max_wal_senders: 10,
+            max_replication_slots: -1,
+        };
+        let err = validate_replication_detail_bounds(bounds)
+            .expect_err("negative max_replication_slots must be rejected");
+        assert!(err.to_string().contains("non-negative"));
+    }
+
+    #[test]
+    fn replication_detail_bounds_reject_dictionary_overflow() {
+        let bounds = ReplicationDetailBounds {
+            max_wal_senders: 60_000,
+            max_replication_slots: 40_000,
+        };
+        let err = validate_replication_detail_bounds(bounds)
+            .expect_err("combined replication labels must fit the dictionary cap");
+        assert!(err.to_string().contains("dictionary bytes"));
     }
 
     fn locks_root_row() -> LocksRow {

@@ -39,6 +39,8 @@ pub mod pg_stat_user_tables;
 pub mod pg_stat_wal;
 pub mod pg_store_plans;
 pub mod replication_instance;
+pub mod replication_replicas;
+pub mod replication_slots;
 pub mod reset_metadata;
 
 /// Maximum rows in one snapshot section.
