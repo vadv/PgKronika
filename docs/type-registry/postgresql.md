@@ -1036,7 +1036,7 @@ track_wal_io_timing            bool? L
 | Поле | Значение |
 |------|----------|
 | `postmaster_start_time` | время старта postmaster; изменение означает рестарт PostgreSQL |
-| `pg_stat_database_reset_max_at` | максимум `stats_reset` из `pg_stat_database`; грубый маркер reset на уровне базы. `NULL`, пока ни одна база не сбрасывалась: на PG15+ свежий кластер отдаёт `NULL` по всем базам |
+| `pg_stat_database_reset_max_at` | максимум `stats_reset` из `pg_stat_database`; маркер reset на уровне базы. `NULL`, пока ни одна база не сбрасывалась: на PG15+ свежий кластер отдаёт `NULL` по всем базам |
 | `pg_stat_statements_reset_at` | reset `pg_stat_statements`; `NULL`, если расширение или `pg_stat_statements_info` недоступны |
 | `pg_store_plans_reset_at` | reset `pg_store_plans`; `NULL`, если расширение, информационное представление/функция или форк этого не поддерживает |
 | `pg_stat_bgwriter_reset_at` | reset bgwriter-статистики; `NULL`, если представление или поле недоступны |
@@ -1044,11 +1044,11 @@ track_wal_io_timing            bool? L
 | `pg_stat_wal_reset_at` | reset WAL-статистики; `NULL` до появления `pg_stat_wal` |
 | `pg_stat_archiver_reset_at` | reset archiver-статистики; `NULL`, если сервер не вернул время сброса |
 | `pg_stat_io_reset_at` | reset `pg_stat_io`; `NULL` до PG16 |
-| `ext_pg_stat_statements_version` | версия расширения на выбранном источнике сбора секции `1_002`; `NULL` означает «коллектор сейчас не читает это расширение» — отсутствует, недоступно или неопознанный форк |
+| `ext_pg_stat_statements_version` | версия расширения на выбранном источнике сбора секции `1_002`; `NULL` означает «коллектор не читает это расширение в этом снапшоте» — отсутствует, недоступно или неопознанный форк |
 | `ext_pg_store_plans_version` | то же для источника секций `1_003`/`1_004` |
 | `compute_query_id` | значение GUC; при `off`/`NULL` `query_id` нельзя считать надежным ключом |
 | `track_io_timing` | если `false`, `blk_*_time` остаются нулевыми и не означают «быстрый IO»; `NULL`, если GUC недоступен |
-| `track_wal_io_timing` | если `false`, WAL-timing колонки остаются нулевыми, потому что замер выключен, а не потому что записи бесплатны; `NULL` до PG14 |
+| `track_wal_io_timing` | если `false`, WAL-timing колонки остаются нулевыми, потому что замер выключен; это не означает отсутствие затрат на запись. `NULL` до PG14 |
 
 Правила для кода чтения:
 

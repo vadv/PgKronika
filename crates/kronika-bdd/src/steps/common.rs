@@ -182,7 +182,7 @@ async fn section_oracle(
 
 /// Assert that a singleton section's column is `NULL`.
 ///
-/// Service sections use this to pin "source unavailable" semantics: the vadv
+/// Service sections use this for nullable source-unavailable cases: the vadv
 /// `pg_store_plans` fork ships no info view, `pg_stat_io` predates PG16, and
 /// so on. The section must hold exactly one row.
 #[allow(

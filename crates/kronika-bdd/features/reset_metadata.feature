@@ -1,14 +1,13 @@
 Feature: Every segment carries the reset context (1_020_001)
-  reset_metadata lets a reader tell a genuine stats reset from a counter
-  anomaly: it seals the postmaster start time, the per-view stats_reset
-  timestamps this server major exposes, the versions of the statistics
-  extensions actually being collected, and the GUCs that change how counter
-  and timing columns must be read. Every oracle below is an independent query
-  against the live server; reset timestamps do not move between the snapshot
-  and the assertion, so exact equality holds.
+  reset_metadata lets a reader distinguish a stats reset from an unexplained
+  counter decrease. It records the postmaster start time, the per-view
+  stats_reset timestamps exposed by this server major, the versions of the
+  statistics extensions collected in the snapshot, and the GUCs that affect
+  counter and timing columns. The scenarios compare those fields with
+  independent PostgreSQL queries.
 
   @pg17 @serial
-  Scenario: extension resets and interpretation GUCs are anchored to the live server
+  Scenario: extension resets and interpretation GUCs come from PostgreSQL
     Given a fresh database on PostgreSQL 17
     And a database seeded with:
       """

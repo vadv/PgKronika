@@ -1330,7 +1330,7 @@ async fn collect_reset_metadata_all(
     Ok((base, ext))
 }
 
-/// Everything `instance_metadata` seals, joined from both sources.
+/// Fields written to `instance_metadata`, joined from `PostgreSQL` and the host.
 #[derive(Debug)]
 struct InstanceFacts {
     pg: PgInstanceFacts,
