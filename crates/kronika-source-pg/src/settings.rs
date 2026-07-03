@@ -95,7 +95,7 @@ pub async fn collect_settings(client: &Client) -> Result<Vec<SettingsRow>, tokio
         .collect())
 }
 
-/// Intern the row's strings and build the sealed layout.
+/// Intern the row's strings and build the registry row.
 ///
 /// # Errors
 /// Propagates the interner error when the dictionary is full.

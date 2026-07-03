@@ -2,9 +2,8 @@
 //!
 //! Slots are created through SQL and dropped by harness cleanup (a logical
 //! slot pins its database, so cleanup drops slots first). The walsender
-//! scenario runs a real `pg_receivewal` from the cluster's own `bin`
-//! directory, so section `1_016_001` is checked against a genuine streaming
-//! connection, not a fixture.
+//! scenario runs `pg_receivewal` from the cluster's own `bin` directory and
+//! checks section `1_016_001` against that streaming connection.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -80,7 +79,7 @@ async fn create_slot(
     Ok(())
 }
 
-/// Start a real `pg_receivewal` and wait until its walsender shows up.
+/// Start `pg_receivewal` and wait until its walsender shows up.
 ///
 /// The tool comes from the scenario cluster's own `bin` directory, streams
 /// into a fresh physical slot, and identifies itself through `PGAPPNAME`.
