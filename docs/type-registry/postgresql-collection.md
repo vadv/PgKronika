@@ -524,10 +524,10 @@ Standby lag считается с поправкой на idle primary:
 - `pg_replication_slots`.
 
 Обе детальные секции (`1_016_001`, `1_017_001`) читаются с главного соединения
-на любой роли: standby просто не даёт walsender-строк, а у слотов на standby
-`retained_bytes` остаётся `NULL` — `pg_current_wal_lsn()` там не определена, и
-запрос оборачивает её в `CASE WHEN NOT pg_is_in_recovery()`. LSN-значения
-насыщаются до `i64::MAX` тем же способом, что в `1_015_001`.
+на любой роли: на standby `pg_stat_replication` не возвращает walsender-строк,
+а у слотов `retained_bytes` остаётся `NULL` — `pg_current_wal_lsn()` там не
+определена, и запрос оборачивает её в `CASE WHEN NOT pg_is_in_recovery()`.
+LSN-значения насыщаются до `i64::MAX` тем же способом, что в `1_015_001`.
 
 `retained_bytes` слота считается как:
 
