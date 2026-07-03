@@ -1,9 +1,8 @@
 Feature: The scheduler paces sources by their own intervals
   The collector ticks on an internal timer (KRONIKA_INTERVAL_S) and each tick
   reads only the sources whose interval elapsed. The first tick after start
-  reads everything, so the first segment is self-contained. A SIGUSR2 stays a
-  forced tick that reads everything regardless of intervals — the contract
-  every other feature file in this suite relies on.
+  reads everything, so the first segment is self-contained. SIGUSR2 is a
+  forced tick: it reads every source regardless of intervals.
 
   @pg17 @serial
   Scenario: later ticks skip sources that are not due

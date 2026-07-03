@@ -1,9 +1,9 @@
 //! Step definitions for `features/scheduler.feature`.
 //!
 //! The timer scenario starts the collector with a 1-second internal tick and
-//! reads the paths it announces on its own; no signal is sent. Segment
-//! composition is then checked per sealed segment: the first tick reads
-//! everything, later ticks only what is due.
+//! waits for announced sealed segments without sending signals. Assertions then
+//! check that the first timer tick reads every source and later ticks read only
+//! due sources.
 
 use anyhow::{Context, Result};
 use cucumber::{then, when};

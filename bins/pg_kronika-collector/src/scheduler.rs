@@ -1,12 +1,10 @@
-//! Per-source pacing: which sources a collection tick reads.
+//! Per-source pacing for collection ticks.
 //!
-//! Every source has its own interval (an env knob); the scheduler answers
-//! "what is due now". A forced tick (SIGUSR2, and the very first tick after
-//! start) reads everything, so the first segment after a restart is
-//! self-contained and the signal contract keeps its meaning for tests and
-//! operators. `pg_store_plans` is not listed here: its paced read predates
-//! the scheduler and stays inside the plans source cache. The lock-wait graph
-//! has no interval either — it runs when the freshest activity snapshot
+//! Each source has its own interval. A forced tick (`SIGUSR2`, and the first
+//! tick after start) reads every source, so the first segment after restart is
+//! self-contained and signal-driven collection keeps its contract. The
+//! `pg_store_plans` cadence remains inside the plans source cache. The
+//! lock-wait graph has no interval; it runs when the current activity snapshot
 //! shows a backend waiting on a heavyweight lock.
 
 use std::time::{Duration, Instant};
@@ -50,7 +48,7 @@ pub(crate) const ALL_SOURCES: [SourceKind; 15] = [
     SourceKind::Settings,
 ];
 
-/// Per-source intervals, seconds. Defaults follow the approved timing plan.
+/// Per-source intervals, in seconds.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Intervals {
     pub activity: u64,
