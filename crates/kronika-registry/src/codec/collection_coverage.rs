@@ -1,10 +1,9 @@
 //! Type `1_023_001`: collection coverage for truncated top-N sources.
 //!
 //! Without it a top-N section reads as complete data. One row per source
-//! section that was actually truncated in this segment: how many rows the
-//! source held, how many were sealed, and why the rest is missing. Coverage
-//! does not make the source complete — it only tells the reader what part of
-//! it the collector saw.
+//! section truncated in this segment records how many rows the source reported,
+//! how many were written, and why the rest is missing. Coverage does not make
+//! the source complete; it tells the reader what part of it the collector saw.
 
 use crate::{Section, StrId, Ts};
 
@@ -29,10 +28,10 @@ pub struct CollectionCoverageV1 {
     /// `type_id` of the truncated section.
     #[column(l)]
     pub source_type_id: u32,
-    /// Rows the source held at collection time.
+    /// Rows the source reported at collection time.
     #[column(g)]
     pub total: u32,
-    /// Rows sealed into the source section.
+    /// Rows written into the source section.
     #[column(g)]
     pub collected: u32,
     /// The collector's configured limit (per axis for multi-axis selections).
