@@ -22,6 +22,7 @@ Feature: Coverage rows (1_023_001) describe truncated top-N sources
     When the collector snapshots the segment
     Then section 1_023_001 has a row with source_type_id = 1013003:
       | total        | 40   |
+      | unknown_total | false |
       | max_n        | 5    |
       | reason       | 0    |
       | cutoff_value | null |
