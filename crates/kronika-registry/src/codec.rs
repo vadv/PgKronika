@@ -24,6 +24,7 @@ use parquet::file::properties::WriterProperties;
 use crate::contract::{ColumnType, TypeContract};
 
 pub mod bgwriter_checkpointer;
+pub mod collection_coverage;
 pub mod instance_metadata;
 pub mod pg_locks;
 pub mod pg_prepared_xacts;
@@ -39,6 +40,8 @@ pub mod pg_stat_user_tables;
 pub mod pg_stat_wal;
 pub mod pg_store_plans;
 pub mod replication_instance;
+pub mod replication_replicas;
+pub mod replication_slots;
 pub mod reset_metadata;
 
 /// Maximum rows in one snapshot section.
