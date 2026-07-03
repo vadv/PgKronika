@@ -933,9 +933,9 @@ received_tli               i32?  G
 
 Сортовой ключ — `(application_name, pid, ts)`: `pid` уникален в пределах
 снимка, а nullable-колонка (`client_addr`) в ключе не участвует. LSN-колонки
-nullable: walsender от `pg_basebackup` показывает `state = backup` с `NULL`
-позициями; lag-колонки `NULL`, когда standby не шлёт ответы. Строковые поля
-`usename`/`application_name`/`state`/`sync_state` коалесируются в пустую
+допускают `NULL`: walsender от `pg_basebackup` показывает `state = backup` с
+`NULL`-позициями; lag-колонки `NULL`, когда standby не шлёт ответы. Строковые
+поля `usename`/`application_name`/`state`/`sync_state` коалесируются в пустую
 строку.
 
 ```text
@@ -958,8 +958,9 @@ replay_lag_us     i64?  G
 
 ### `1_017_001` replication slots
 
-`restart_lsn` nullable: физический слот, созданный без резервирования WAL, не
-имеет позиции, и все производные от неё колонки остаются `NULL` вместе с ним.
+`restart_lsn` допускает `NULL`: физический слот, созданный без резервирования
+WAL, не имеет позиции, и все производные от неё колонки остаются `NULL` вместе
+с ним.
 `retained_bytes = pg_current_wal_lsn() - restart_lsn`; на standby нет текущей
 LSN, значение `NULL`. `wal_status` появился в PG13; ранее — `NULL`.
 
