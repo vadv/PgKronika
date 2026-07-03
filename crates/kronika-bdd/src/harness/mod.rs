@@ -574,10 +574,6 @@ async fn create_database(cluster: &Cluster, dbname: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run `ROLLBACK PREPARED` for `gid` on `cluster`'s admin connection.
-///
-/// Called from cleanup to release a prepared transaction that is not tied to
-/// any session. The GID must contain only ASCII alphanumerics and underscores.
 /// Drop one replication slot, retrying while its walsender is still exiting.
 ///
 /// A slot cannot be dropped while a connection streams from it; the killed
@@ -611,6 +607,10 @@ async fn drop_replication_slot(cluster: &Cluster, slot: &str) -> Result<()> {
     ))
 }
 
+/// Run `ROLLBACK PREPARED` for `gid` on `cluster`'s admin connection.
+///
+/// Called from cleanup to release a prepared transaction that is not tied to
+/// any session. The GID must contain only ASCII alphanumerics and underscores.
 async fn rollback_prepared(cluster: &Cluster, dbname: &str, gid: &str) -> Result<()> {
     ensure_safe_ident(dbname)?;
     anyhow::ensure!(
