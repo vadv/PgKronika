@@ -600,12 +600,9 @@ async fn collect_user_tables_all(
                     coverage.collected += rows.len() as u64;
                     // The total rides in the same statement as the rows, so
                     // it describes exactly the population they were cut from.
-                    // An empty read leaves the per-database total unknown.
-                    if rows.is_empty() {
-                        coverage.unknown_total = true;
-                    } else {
-                        coverage.total += source_total;
-                    }
+                    // Every selection axis is an unfiltered ORDER BY, so an
+                    // empty read means an empty source: a zero total is exact.
+                    coverage.total += source_total;
                     user_tables.push((db.datname.clone(), version, rows));
                     break;
                 }
@@ -680,12 +677,9 @@ async fn collect_user_indexes_all(
             match collect_user_indexes(db.client(), major, config.max_indexes).await {
                 Ok((version, rows, source_total)) => {
                     coverage.collected += rows.len() as u64;
-                    // Same-statement total; an empty read leaves it unknown.
-                    if rows.is_empty() {
-                        coverage.unknown_total = true;
-                    } else {
-                        coverage.total += source_total;
-                    }
+                    // Same-statement total; an empty read means an empty
+                    // source, so the zero total is exact.
+                    coverage.total += source_total;
                     user_indexes.push((db.datname.clone(), version, rows));
                     break;
                 }
@@ -1597,7 +1591,7 @@ fn statements_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<C
     let coverage = SourceCoverage {
         total: *source_total,
         collected: rows.len() as u64,
-        unknown_total: rows.is_empty() && *source_total == 0,
+        unknown_total: false,
         timeouts: 0,
         permission_skips: 0,
         other_skips: 0,
@@ -1633,7 +1627,7 @@ fn plans_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<Covera
     let coverage = SourceCoverage {
         total: *source_total,
         collected,
-        unknown_total: collected == 0 && *source_total == 0,
+        unknown_total: false,
         timeouts: 0,
         permission_skips: 0,
         other_skips: 0,
