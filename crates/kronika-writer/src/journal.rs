@@ -232,11 +232,10 @@ impl Journal {
         Ok((journal, report))
     }
 
-    /// Bytes currently occupying the journal file, damaged regions included.
+    /// Bytes currently occupying the journal file, including damaged regions.
     ///
-    /// The collector's segment rotation compares this against its size cap:
-    /// the journal holds raw (pre-seal) frames, so the cap bounds unpacked
-    /// data exactly as configured.
+    /// The collector compares this raw frame length with its segment byte cap
+    /// before packing the segment.
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.end
