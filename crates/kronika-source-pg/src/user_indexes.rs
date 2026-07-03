@@ -339,6 +339,20 @@ pub async fn collect_user_indexes(
     Ok((version, parsed))
 }
 
+/// Rows in `pg_stat_user_indexes` of the connected database, for coverage.
+///
+/// # Errors
+/// Returns the [`tokio_postgres::Error`] if the query fails.
+pub async fn count_user_indexes(client: &Client) -> Result<i64, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            marked!("SELECT count(*)::int8 AS n FROM pg_stat_user_indexes"),
+            &[],
+        )
+        .await?;
+    Ok(row.get("n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

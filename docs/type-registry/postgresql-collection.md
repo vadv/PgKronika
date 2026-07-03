@@ -304,7 +304,7 @@ dead tuples `n_dead_tup` ∪ `age(relfrozenxid)` ∪ `mxid_age(relminmxid)`), б
 порогов и вердиктов (см. `1_013` в `postgresql.md`). `heap_blks_read`/
 `heap_blks_hit` из `pg_statio_user_tables` — счётчики shared-буферов PostgreSQL
 (промах/попадание буфера), а не I/O ОС или блочного устройства. Запрос идёт под
-адаптивным `statement_timeout`. Усечённый сбор пока не пишет coverage
+адаптивным `statement_timeout`. Усечённый сбор помечается строкой coverage
 `1_023_001`.
 
 Для индексов (`1_014`) схема аналогична и симметрична таблицам: один запрос на
@@ -487,6 +487,22 @@ SELECT system_identifier FROM pg_control_system();
 
 `node_self_id` берётся из `KRONIKA_NODE_SELF_ID`; без переменной — hostname.
 
+## `1_023_001` coverage
+
+Строка пишется на каждый top-N источник, у которого в этом снимке часть строк
+не попала в секцию: `total > collected`, `unknown_total = true`, либо часть
+источника пропущена по таймауту или другой ошибке. Источник, уложившийся в
+лимиты, строки не получает — пустая секция означает «усечений не было».
+
+- `1_013`/`1_014`: `count(*)` выполняется до тяжёлого top-N запроса по каждой
+  базе. Если count успешен, `total` включает эту базу даже при последующем
+  timeout top-N. Если count не удался, `unknown_total = true`, `reason = 3`, а
+  `total` включает только известную нижнюю границу.
+- `1_002`: `total` — `count(*)` на соединении источника расширения; при ошибке
+  count пишется строка с `unknown_total = true` и `reason = 3`.
+- `1_003`/`1_004`: то же; единственная ось отбора даёт `cutoff_value` —
+  минимальный `total_time`, попавший в секцию.
+
 ## `1_019_001` `pg_settings`
 
 Полная копия `pg_settings` пишется в каждый сегмент с главного соединения,
@@ -533,6 +549,12 @@ Standby lag считается с поправкой на idle primary:
 
 - `pg_stat_replication`;
 - `pg_replication_slots`.
+
+Обе детальные секции (`1_016_001`, `1_017_001`) читаются с главного соединения
+на любой роли: на standby `pg_stat_replication` не возвращает walsender-строк,
+а у слотов `retained_bytes` остаётся `NULL` — `pg_current_wal_lsn()` там не
+определена, и запрос оборачивает её в `CASE WHEN NOT pg_is_in_recovery()`.
+LSN-значения насыщаются до `i64::MAX` тем же способом, что в `1_015_001`.
 
 `retained_bytes` слота считается как:
 
