@@ -1,6 +1,6 @@
 //! Collects `PostgreSQL` stats and writes sealed PGM segments.
 //!
-//! The daemon runs on the database host. A collection signal gathers the enabled
+//! The daemon runs on the database host. Each collection tick reads the due
 //! `PostgreSQL` sources, writes one journal part, seals `<ts>.pgm`, and resets
 //! the journal after a successful seal.
 //!
@@ -1905,15 +1905,14 @@ fn push_coverage(
     Ok(())
 }
 
-/// The per-segment service rows: reset context, instance fingerprint, and
-/// the full `pg_settings` copy.
+/// Service rows gated by their scheduler intervals.
 struct ServiceSections {
     reset: Option<(ResetBase, ResetExtensions)>,
     instance: Option<InstanceFacts>,
     settings: Vec<SettingsRow>,
 }
 
-/// Collect the service sections written to every segment.
+/// Collect the due service sections.
 async fn collect_service_sections(
     pool: &ConnectionPool,
     major: u32,
@@ -1948,7 +1947,7 @@ async fn collect_service_sections(
     })
 }
 
-/// Buffer the three service sections of one segment.
+/// Buffer the service sections collected for this tick.
 ///
 /// # Errors
 /// Returns an error if a string cannot be interned (dictionary full) or a
