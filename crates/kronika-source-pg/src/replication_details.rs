@@ -26,6 +26,38 @@ macro_rules! marked {
     };
 }
 
+/// PostgreSQL-side row bounds for replication detail views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationDetailBounds {
+    /// Upper bound for `pg_stat_replication` rows.
+    pub max_wal_senders: i64,
+    /// Upper bound for `pg_replication_slots` rows.
+    pub max_replication_slots: i64,
+}
+
+/// Collect GUC values that bound replication-detail cardinality.
+///
+/// # Errors
+/// Returns the [`tokio_postgres::Error`] if the query fails.
+pub async fn collect_replication_detail_bounds(
+    client: &Client,
+) -> Result<ReplicationDetailBounds, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            marked!(
+                "SELECT \
+                     current_setting('max_wal_senders')::int8 AS max_wal_senders, \
+                     current_setting('max_replication_slots')::int8 AS max_replication_slots"
+            ),
+            &[],
+        )
+        .await?;
+    Ok(ReplicationDetailBounds {
+        max_wal_senders: row.get("max_wal_senders"),
+        max_replication_slots: row.get("max_replication_slots"),
+    })
+}
+
 /// One `pg_stat_replication` row before interning.
 #[derive(Debug, Clone)]
 pub struct ReplicaRow {
