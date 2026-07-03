@@ -29,14 +29,25 @@ pub(crate) mod oracle;
 pub(crate) mod session;
 pub(crate) mod snapshot;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tempfile::TempDir;
+use tokio::time::{sleep, timeout};
 
 use crate::cluster::{Cluster, shared_matrix};
 use session::Session;
+
+const SETTINGS_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
+const SETTINGS_RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy)]
+enum SettingsState {
+    Loaded,
+    Reset,
+}
 
 /// Per-scenario harness state, embedded in the cucumber `World`.
 ///
@@ -76,6 +87,8 @@ pub(crate) struct HarnessState {
     pending_slot_drops: Vec<String>,
     /// Pre-snapshot oracle reads for window assertions, keyed by section column.
     window_floors: BTreeMap<String, i64>,
+    /// Cluster-level GUCs changed with `ALTER SYSTEM SET` and reset in cleanup.
+    altered_system_settings: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -260,6 +273,13 @@ impl HarnessState {
         Ok(())
     }
 
+    /// Register a cluster-level GUC changed through `ALTER SYSTEM SET`.
+    pub(crate) fn add_altered_system_setting(&mut self, name: String) {
+        if !name.is_empty() {
+            self.altered_system_settings.insert(name);
+        }
+    }
+
     /// Keep a collector output directory alive until scenario cleanup.
     pub(crate) fn retain_collector_output_dir(&mut self, dir: TempDir) {
         self.collector_output_dirs.push(dir);
@@ -318,6 +338,14 @@ impl HarnessState {
         // Roll back prepared transactions before dropping the databases; a
         // prepared xact prevents DROP DATABASE from completing.
         if let Some(cluster) = self.cluster {
+            let altered_settings: Vec<_> = std::mem::take(&mut self.altered_system_settings)
+                .into_iter()
+                .collect();
+            if !altered_settings.is_empty()
+                && let Err(err) = reset_system_settings(cluster, &altered_settings).await
+            {
+                eprintln!("=== BDD cleanup: ALTER SYSTEM RESET {altered_settings:?}: {err:#} ===");
+            }
             for prepared in std::mem::take(&mut self.pending_rollbacks) {
                 if let Err(err) =
                     rollback_prepared(cluster, &prepared.database, &prepared.gid).await
@@ -345,7 +373,178 @@ impl HarnessState {
         self.collector_log = None;
         self.collector_output_dirs.clear();
         self.collector_env.clear();
+        self.altered_system_settings.clear();
     }
+}
+
+/// Extract the GUC name from an `ALTER SYSTEM SET <name> ...` statement.
+pub(crate) fn altered_system_setting(statement: &str) -> Option<String> {
+    let rest = strip_prefix_ascii_case(statement.trim_start(), "ALTER")?.trim_start();
+    let rest = strip_prefix_ascii_case(rest, "SYSTEM")?.trim_start();
+    let rest = strip_prefix_ascii_case(rest, "SET")?.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some(rest) = rest.strip_prefix('"') {
+        let (name, _) = parse_quoted_identifier(rest)?;
+        return Some(name);
+    }
+    let end = rest
+        .find(|c: char| c.is_ascii_whitespace() || c == '=')
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest.get(..end).map(str::to_owned)
+}
+
+/// Wait until `ALTER SYSTEM SET` changes are visible after `pg_reload_conf()`.
+pub(crate) async fn wait_for_altered_system_settings(
+    client: &tokio_postgres::Client,
+    settings: &[String],
+) -> Result<()> {
+    wait_for_settings_state(client, settings, SettingsState::Loaded)
+        .await
+        .context("wait for ALTER SYSTEM settings to load")
+}
+
+async fn reset_system_settings(cluster: &Cluster, settings: &[String]) -> Result<()> {
+    let admin = cluster.connect().await?;
+    for setting in settings {
+        admin
+            .client()
+            .batch_execute(&format!(
+                "ALTER SYSTEM RESET {}",
+                quote_config_identifier(setting)
+            ))
+            .await
+            .with_context(|| format!("ALTER SYSTEM RESET {setting:?}"))?;
+    }
+    admin
+        .client()
+        .batch_execute("SELECT pg_reload_conf()")
+        .await
+        .context("reload PostgreSQL configuration after ALTER SYSTEM RESET")?;
+    wait_for_settings_state(admin.client(), settings, SettingsState::Reset)
+        .await
+        .context("wait for ALTER SYSTEM RESET to apply")
+}
+
+async fn wait_for_settings_state(
+    client: &tokio_postgres::Client,
+    settings: &[String],
+    state: SettingsState,
+) -> Result<()> {
+    let poll = async {
+        loop {
+            let mut ready = true;
+            for setting in settings {
+                let reached = match state {
+                    SettingsState::Loaded => settings_loaded(client, setting).await?,
+                    SettingsState::Reset => settings_reset(client, setting).await?,
+                };
+                if !reached {
+                    ready = false;
+                    break;
+                }
+            }
+            if ready {
+                return Ok(());
+            }
+            sleep(SETTINGS_RELOAD_POLL_INTERVAL).await;
+        }
+    };
+    match timeout(SETTINGS_RELOAD_TIMEOUT, poll).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "settings {settings:?} did not reach the expected state within {SETTINGS_RELOAD_TIMEOUT:?}"
+        ),
+    }
+}
+
+async fn settings_loaded(client: &tokio_postgres::Client, setting: &str) -> Result<bool> {
+    // Postmaster-context GUCs show up in pg_file_settings with
+    // "setting could not be applied" until restart; pg_settings.pending_restart
+    // is the contract we wait for in that case.
+    let row = client
+        .query_one(
+            "SELECT \
+                EXISTS ( \
+                    SELECT 1 FROM pg_file_settings \
+                    WHERE name = $1 \
+                      AND sourcefile = current_setting('data_directory') || '/postgresql.auto.conf' \
+                ) AS file_seen, \
+                EXISTS ( \
+                    SELECT 1 FROM pg_settings \
+                    WHERE name = $1 \
+                      AND ( \
+                          sourcefile = current_setting('data_directory') || '/postgresql.auto.conf' \
+                          OR pending_restart \
+                      ) \
+                ) AS settings_visible",
+            &[&setting],
+        )
+        .await
+        .with_context(|| format!("poll loaded ALTER SYSTEM setting {setting:?}"))?;
+    Ok(row.get::<_, bool>("file_seen") && row.get::<_, bool>("settings_visible"))
+}
+
+async fn settings_reset(client: &tokio_postgres::Client, setting: &str) -> Result<bool> {
+    let row = client
+        .query_one(
+            "SELECT \
+                EXISTS ( \
+                    SELECT 1 FROM pg_file_settings \
+                    WHERE name = $1 \
+                      AND sourcefile = current_setting('data_directory') || '/postgresql.auto.conf' \
+                ) AS in_auto_conf, \
+                COALESCE(( \
+                    SELECT pending_restart FROM pg_settings WHERE name = $1 \
+                ), false) AS pending_restart",
+            &[&setting],
+        )
+        .await
+        .with_context(|| format!("poll reset ALTER SYSTEM setting {setting:?}"))?;
+    Ok(!row.get::<_, bool>("in_auto_conf") && !row.get::<_, bool>("pending_restart"))
+}
+
+fn quote_config_identifier(name: &str) -> String {
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for ch in name.chars() {
+        if ch == '"' {
+            quoted.push('"');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn parse_quoted_identifier(rest: &str) -> Option<(String, &str)> {
+    let mut name = String::new();
+    let mut chars = rest.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '"' {
+            if chars.next_if(|(_, next)| *next == '"').is_some() {
+                name.push('"');
+                continue;
+            }
+            let tail = rest.get(idx + ch.len_utf8()..)?;
+            return Some((name, tail));
+        }
+        name.push(ch);
+    }
+    None
+}
+
+fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    if value.len() < prefix.len() {
+        return None;
+    }
+    let head = value.get(..prefix.len())?;
+    let tail = value.get(prefix.len()..)?;
+    head.eq_ignore_ascii_case(prefix).then_some(tail)
 }
 
 /// A database name unique to one scenario run: `kronika_<label>_<major>_<pid>_<seq>`.
@@ -402,7 +601,7 @@ async fn drop_replication_slot(cluster: &Cluster, slot: &str) -> Result<()> {
             Ok(_) => return Ok(()),
             Err(err) => {
                 last_err = Some(err);
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                sleep(Duration::from_millis(300)).await;
             }
         }
     }
@@ -462,7 +661,10 @@ fn ensure_safe_ident(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HarnessState, ensure_safe_ident, unique_database_name};
+    use super::{
+        HarnessState, altered_system_setting, ensure_safe_ident, quote_config_identifier,
+        unique_database_name,
+    };
 
     #[test]
     fn unique_names_differ_across_calls() {
@@ -494,6 +696,29 @@ mod tests {
     #[test]
     fn accepts_a_generated_name() {
         assert!(ensure_safe_ident("kronika_archiver_17_1234_0").is_ok());
+    }
+
+    #[test]
+    fn extracts_altered_system_setting_names() {
+        assert_eq!(
+            altered_system_setting("ALTER SYSTEM SET work_mem = '7539kB'").as_deref(),
+            Some("work_mem")
+        );
+        assert_eq!(
+            altered_system_setting("alter system set shared_buffers TO '190MB'").as_deref(),
+            Some("shared_buffers")
+        );
+        assert_eq!(
+            altered_system_setting("ALTER SYSTEM SET \"custom.guc\" = 'on'").as_deref(),
+            Some("custom.guc")
+        );
+        assert_eq!(altered_system_setting("SELECT pg_reload_conf()"), None);
+    }
+
+    #[test]
+    fn quotes_config_identifiers_for_alter_system_reset() {
+        assert_eq!(quote_config_identifier("work_mem"), "\"work_mem\"");
+        assert_eq!(quote_config_identifier("custom\"guc"), "\"custom\"\"guc\"");
     }
 
     #[test]
