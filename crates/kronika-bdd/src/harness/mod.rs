@@ -435,18 +435,19 @@ async fn settings_loaded(client: &tokio_postgres::Client, setting: &str) -> Resu
                     SELECT 1 FROM pg_file_settings \
                     WHERE name = $1 \
                       AND sourcefile = current_setting('data_directory') || '/postgresql.auto.conf' \
-                      AND applied \
-                ) AS file_loaded, \
+                      AND error IS NULL \
+                ) AS file_parsed, \
                 EXISTS ( \
                     SELECT 1 FROM pg_settings \
                     WHERE name = $1 \
                       AND sourcefile = current_setting('data_directory') || '/postgresql.auto.conf' \
-                ) AS settings_loaded",
+                      AND (source = 'configuration file' OR pending_restart) \
+                ) AS settings_visible",
             &[&setting],
         )
         .await
         .with_context(|| format!("poll loaded ALTER SYSTEM setting {setting:?}"))?;
-    Ok(row.get::<_, bool>("file_loaded") && row.get::<_, bool>("settings_loaded"))
+    Ok(row.get::<_, bool>("file_parsed") && row.get::<_, bool>("settings_visible"))
 }
 
 async fn settings_reset(client: &tokio_postgres::Client, setting: &str) -> Result<bool> {
