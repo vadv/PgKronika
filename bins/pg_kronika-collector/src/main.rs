@@ -409,10 +409,12 @@ async fn main() -> Result<()> {
 /// Counters accumulated while collecting one top-N source, for `1_023_001`.
 #[derive(Debug, Default, Clone, Copy)]
 struct SourceCoverage {
-    /// Rows the source reported, summed over the databases that were counted.
+    /// Known lower bound for source rows.
     total: u64,
     /// Rows collected.
     collected: u64,
+    /// At least one count failed, so `total` is not exact.
+    unknown_total: bool,
     /// Databases skipped after the adaptive timeout hit its cap.
     timeouts: u32,
     /// Databases skipped for any other error.
@@ -425,7 +427,7 @@ impl SourceCoverage {
     const fn reason(&self) -> u8 {
         if self.timeouts > 0 {
             1
-        } else if self.other_skips > 0 {
+        } else if self.other_skips > 0 || self.unknown_total {
             3
         } else {
             0
@@ -434,7 +436,10 @@ impl SourceCoverage {
 
     /// Whether any source rows are missing from the section.
     const fn truncated(&self) -> bool {
-        self.total > self.collected || self.timeouts > 0 || self.other_skips > 0
+        self.total > self.collected
+            || self.unknown_total
+            || self.timeouts > 0
+            || self.other_skips > 0
     }
 }
 
@@ -494,6 +499,35 @@ async fn collect_user_tables_all(
     let mut coverage = SourceCoverage::default();
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
     for db in pool.per_db() {
+        if let Err(err) = db
+            .client()
+            .batch_execute(&format!(
+                "SET statement_timeout = {}",
+                config.session.statement_timeout_ms
+            ))
+            .await
+        {
+            eprintln!(
+                "pg_kronika-collector: SET statement_timeout failed for {}: {err}; \
+                 user_tables count proceeds under the previously-set timeout",
+                db.datname
+            );
+        }
+        let count_failed = match count_user_tables(db.client()).await {
+            Ok(n) => {
+                let total = u64::try_from(n).unwrap_or(0);
+                coverage.total += total;
+                false
+            }
+            Err(err) => {
+                coverage.unknown_total = true;
+                eprintln!(
+                    "pg_kronika-collector: count pg_stat_user_tables for {}: {err}",
+                    db.datname
+                );
+                true
+            }
+        };
         loop {
             // The heavy size functions can be slow, so this query runs under a
             // wider statement_timeout. SET persists on the connection: it stays
@@ -512,12 +546,8 @@ async fn collect_user_tables_all(
             match collect_user_tables(db.client(), major, config.max_tables).await {
                 Ok((version, rows)) => {
                     coverage.collected += rows.len() as u64;
-                    match count_user_tables(db.client()).await {
-                        Ok(n) => coverage.total += u64::try_from(n).unwrap_or(0),
-                        Err(err) => eprintln!(
-                            "pg_kronika-collector: count pg_stat_user_tables for {}: {err}",
-                            db.datname
-                        ),
+                    if count_failed {
+                        coverage.total += rows.len() as u64;
                     }
                     user_tables.push((db.datname.clone(), version, rows));
                     break;
@@ -572,6 +602,35 @@ async fn collect_user_indexes_all(
     let mut coverage = SourceCoverage::default();
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
     for db in pool.per_db() {
+        if let Err(err) = db
+            .client()
+            .batch_execute(&format!(
+                "SET statement_timeout = {}",
+                config.session.statement_timeout_ms
+            ))
+            .await
+        {
+            eprintln!(
+                "pg_kronika-collector: SET statement_timeout failed for {}: {err}; \
+                 user_indexes count proceeds under the previously-set timeout",
+                db.datname
+            );
+        }
+        let count_failed = match count_user_indexes(db.client()).await {
+            Ok(n) => {
+                let total = u64::try_from(n).unwrap_or(0);
+                coverage.total += total;
+                false
+            }
+            Err(err) => {
+                coverage.unknown_total = true;
+                eprintln!(
+                    "pg_kronika-collector: count pg_stat_user_indexes for {}: {err}",
+                    db.datname
+                );
+                true
+            }
+        };
         loop {
             // pg_relation_size over many indexes can be slow, so this query runs
             // under a wider statement_timeout. SET persists on the connection: it
@@ -590,12 +649,8 @@ async fn collect_user_indexes_all(
             match collect_user_indexes(db.client(), major, config.max_indexes).await {
                 Ok((version, rows)) => {
                     coverage.collected += rows.len() as u64;
-                    match count_user_indexes(db.client()).await {
-                        Ok(n) => coverage.total += u64::try_from(n).unwrap_or(0),
-                        Err(err) => eprintln!(
-                            "pg_kronika-collector: count pg_stat_user_indexes for {}: {err}",
-                            db.datname
-                        ),
+                    if count_failed {
+                        coverage.total += rows.len() as u64;
                     }
                     user_indexes.push((db.datname.clone(), version, rows));
                     break;
@@ -1503,16 +1558,17 @@ async fn statements_coverage(
     let (version, rows) = inputs.statements.as_ref()?;
     let cached = inputs.statements_cache.selected.as_ref()?;
     let client = statement_client(pool, &cached.source)?;
-    let total = match count_statements(client).await {
-        Ok(n) => u64::try_from(n).unwrap_or(0),
+    let (total, unknown_total) = match count_statements(client).await {
+        Ok(n) => (u64::try_from(n).unwrap_or(0), false),
         Err(err) => {
             eprintln!("pg_kronika-collector: count pg_stat_statements: {err}");
-            return None;
+            (rows.len() as u64, true)
         }
     };
     let coverage = SourceCoverage {
         total,
         collected: rows.len() as u64,
+        unknown_total,
         timeouts: 0,
         other_skips: 0,
     };
@@ -1551,16 +1607,17 @@ async fn plans_coverage(
             count_store_plans_ossc(client).await,
         ),
     };
-    let total = match count {
-        Ok(n) => u64::try_from(n).unwrap_or(0),
+    let (total, unknown_total) = match count {
+        Ok(n) => (u64::try_from(n).unwrap_or(0), false),
         Err(err) => {
             eprintln!("pg_kronika-collector: count pg_store_plans: {err}");
-            return None;
+            (collected, true)
         }
     };
     let coverage = SourceCoverage {
         total,
         collected,
+        unknown_total,
         timeouts: 0,
         other_skips: 0,
     };
@@ -1597,6 +1654,7 @@ fn push_coverage(
             ts: Ts(ts),
             source_type_id: record.source_type_id,
             total: u32::try_from(record.coverage.total).unwrap_or(u32::MAX),
+            unknown_total: record.coverage.unknown_total,
             collected: u32::try_from(record.coverage.collected).unwrap_or(u32::MAX),
             max_n: record.max_n,
             order_by: intern(record.order_by.as_bytes())?,
@@ -2170,6 +2228,7 @@ mod tests {
         let top_n = SourceCoverage {
             total: 100,
             collected: 50,
+            unknown_total: false,
             timeouts: 0,
             other_skips: 0,
         };
@@ -2177,6 +2236,14 @@ mod tests {
         assert_eq!(
             SourceCoverage {
                 other_skips: 2,
+                ..top_n
+            }
+            .reason(),
+            3
+        );
+        assert_eq!(
+            SourceCoverage {
+                unknown_total: true,
                 ..top_n
             }
             .reason(),
@@ -2198,6 +2265,7 @@ mod tests {
         let complete = SourceCoverage {
             total: 50,
             collected: 50,
+            unknown_total: false,
             timeouts: 0,
             other_skips: 0,
         };
@@ -2218,13 +2286,18 @@ mod tests {
         );
         assert!(
             SourceCoverage {
+                unknown_total: true,
+                ..complete
+            }
+            .truncated()
+        );
+        assert!(
+            SourceCoverage {
                 other_skips: 1,
                 ..complete
             }
             .truncated()
         );
-        // A failed count query undercounts the total; that alone must not
-        // create a truncation row.
         assert!(
             !SourceCoverage {
                 total: 40,

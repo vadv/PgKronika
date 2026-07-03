@@ -1,9 +1,10 @@
 //! Type `1_023_001`: collection coverage for truncated top-N sources.
 //!
 //! Without it a top-N section reads as complete data. One row per source
-//! section truncated in this segment records how many rows the source reported,
-//! how many were written, and why the rest is missing. Coverage does not make
-//! the source complete; it tells the reader what part of it the collector saw.
+//! section truncated in this segment records how many rows the collector could
+//! count, how many were written, and why the rest is missing. Coverage does not
+//! make the source complete; it tells the reader what part of it the collector
+//! saw.
 
 use crate::{Section, StrId, Ts};
 
@@ -28,9 +29,12 @@ pub struct CollectionCoverageV1 {
     /// `type_id` of the truncated section.
     #[column(l)]
     pub source_type_id: u32,
-    /// Rows the source reported at collection time.
+    /// Known lower bound for rows in the source at collection time.
     #[column(g)]
     pub total: u32,
+    /// Whether at least one source count failed, so `total` is not exact.
+    #[column(l)]
+    pub unknown_total: bool,
     /// Rows written into the source section.
     #[column(g)]
     pub collected: u32,
@@ -59,6 +63,7 @@ mod tests {
             ts: Ts(1_000_000),
             source_type_id: source,
             total: 4_000,
+            unknown_total: false,
             collected: 500,
             max_n: 500,
             order_by: StrId(1),
@@ -76,8 +81,12 @@ mod tests {
     fn contract_shape() {
         let c = CollectionCoverageV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_023_001);
-        assert_eq!(c.columns.len(), 8);
+        assert_eq!(c.columns.len(), 9);
         assert_eq!(c.sort_key, ["source_type_id", "ts"]);
+        assert_eq!(
+            c.column("unknown_total").map(|col| col.nullable),
+            Some(false)
+        );
         assert_eq!(c.column("cutoff_value").map(|col| col.nullable), Some(true));
         assert_eq!(c.column("reason").map(|col| col.nullable), Some(false));
     }
