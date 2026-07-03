@@ -45,6 +45,7 @@ pub mod progress_vacuum;
 
 pub mod replication_instance;
 pub mod reset_metadata;
+pub mod settings;
 
 pub mod statements;
 pub mod store_plans;
