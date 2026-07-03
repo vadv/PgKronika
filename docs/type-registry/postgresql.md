@@ -931,6 +931,11 @@ received_tli               i32?  G
 
 ### `1_016_001` реплики primary
 
+`1_016`/`1_017` — минимальный контракт WAL-позиций и удержания, не полное
+операторское представление репликации: `backend_xmin` walsender'а и
+`xmin`/`catalog_xmin`/`safe_wal_size` слота сюда пока не входят и добавятся
+отдельной версией раскладки.
+
 Сортовой ключ — `(application_name, pid, ts)`: `pid` уникален в пределах
 снимка, а nullable-колонка (`client_addr`) в ключе не участвует. LSN-колонки
 допускают `NULL`: walsender от `pg_basebackup` показывает `state = backup` с

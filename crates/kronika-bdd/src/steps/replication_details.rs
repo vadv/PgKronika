@@ -202,14 +202,19 @@ fn assert_named_row(
         }
     };
 
-    let row = rows
-        .iter()
-        .find(|row| {
-            row.get(key_column)
-                .and_then(&resolve)
-                .is_some_and(|v| v == key)
-        })
+    let mut matches = rows.iter().filter(|row| {
+        row.get(key_column)
+            .and_then(&resolve)
+            .is_some_and(|v| v == key)
+    });
+    let row = matches
+        .next()
         .with_context(|| format!("section {type_id} has no row with {key_column} = {key:?}"))?;
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "section {type_id}: more than one row with {key_column} = {key:?}; \
+         the scenario must pin a unique key"
+    );
 
     for expected in table(step)? {
         let [column, want] = expected.as_slice() else {

@@ -153,6 +153,7 @@ const fn store_plans_query() -> &'static str {
     marked!(
         "SELECT \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             (SELECT count(*) FROM pg_store_plans(false)) AS source_total, \
              s.queryid, \
              s.queryid_stat_statements, \
              s.planid, \
@@ -205,9 +206,15 @@ const fn store_plans_query() -> &'static str {
 pub async fn collect_store_plans(
     client: &Client,
     max_plans: i64,
-) -> Result<Vec<StorePlansRow>, tokio_postgres::Error> {
+) -> Result<(Vec<StorePlansRow>, u64), tokio_postgres::Error> {
     let rows = client.query(store_plans_query(), &[&max_plans]).await?;
-    Ok(rows.iter().map(row_from_pg).collect())
+    let source_total = rows
+        .first()
+        .map_or(0, |row| row.get::<_, i64>("source_total"));
+    Ok((
+        rows.iter().map(row_from_pg).collect(),
+        u64::try_from(source_total).unwrap_or(0),
+    ))
 }
 
 fn row_from_pg(row: &tokio_postgres::Row) -> StorePlansRow {
@@ -326,34 +333,6 @@ fn opt<E>(
     value: Option<&str>,
 ) -> Result<Option<StrId>, E> {
     value.map(|s| intern(s.as_bytes())).transpose()
-}
-
-/// Entries in the vadv `pg_store_plans` view, for coverage.
-///
-/// # Errors
-/// Returns the [`tokio_postgres::Error`] if the query fails.
-pub async fn count_store_plans_vadv(client: &Client) -> Result<i64, tokio_postgres::Error> {
-    let row = client
-        .query_one(
-            marked!("SELECT count(*)::int8 AS n FROM pg_store_plans(false)"),
-            &[],
-        )
-        .await?;
-    Ok(row.get("n"))
-}
-
-/// Entries in the ossc `pg_store_plans` view, for coverage.
-///
-/// # Errors
-/// Returns the [`tokio_postgres::Error`] if the query fails.
-pub async fn count_store_plans_ossc(client: &Client) -> Result<i64, tokio_postgres::Error> {
-    let row = client
-        .query_one(
-            marked!("SELECT count(*)::int8 AS n FROM pg_store_plans"),
-            &[],
-        )
-        .await?;
-    Ok(row.get("n"))
 }
 
 #[cfg(test)]
@@ -551,6 +530,7 @@ const fn store_plans_ossc_query() -> &'static str {
     marked!(
         "SELECT \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             (SELECT count(*) FROM pg_store_plans) AS source_total, \
              s.queryid, \
              s.planid, \
              s.userid, \
@@ -599,6 +579,7 @@ const fn store_plans_ossc_numeric_query() -> &'static str {
     marked!(
         "SELECT \
              (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             (SELECT count(*) FROM pg_store_plans) AS source_total, \
              s.queryid, \
              s.planid, \
              s.userid, \
@@ -656,7 +637,7 @@ pub async fn collect_store_plans_ossc(
     client: &Client,
     max_plans: i64,
     text_cap: Option<i32>,
-) -> Result<(Vec<StorePlansOsscRow>, usize), tokio_postgres::Error> {
+) -> Result<(Vec<StorePlansOsscRow>, usize, u64), tokio_postgres::Error> {
     let rows = match text_cap {
         Some(cap) => {
             client
@@ -669,6 +650,9 @@ pub async fn collect_store_plans_ossc(
                 .await?
         }
     };
+    let source_total = rows
+        .first()
+        .map_or(0, |row| row.get::<_, i64>("source_total"));
     let mut out = Vec::with_capacity(rows.len());
     let mut masked = 0_usize;
     for row in &rows {
@@ -677,7 +661,7 @@ pub async fn collect_store_plans_ossc(
             None => masked += 1,
         }
     }
-    Ok((out, masked))
+    Ok((out, masked, u64::try_from(source_total).unwrap_or(0)))
 }
 
 fn ossc_row_from_pg(row: &tokio_postgres::Row) -> Option<StorePlansOsscRow> {
