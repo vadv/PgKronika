@@ -1,10 +1,10 @@
 //! Type `1_017_001`: `pg_replication_slots`, one row per slot.
 //!
-//! Slots are cluster-wide and survive restarts, so a forgotten slot retains
-//! WAL forever — `retained_bytes` is the primary signal. LSN columns are
-//! absolute byte offsets from `0/0`, saturated to `i64::MAX`. A physical slot
-//! created without reserving WAL has no `restart_lsn` yet, and every derived
-//! column stays `None` with it.
+//! Slots are cluster-wide and survive restarts. A slot can retain WAL
+//! indefinitely; `retained_bytes` reports how much WAL the slot holds back.
+//! LSN columns are absolute byte offsets from `0/0`, saturated to `i64::MAX`.
+//! A physical slot created without reserving WAL has no `restart_lsn` yet,
+//! and every derived column stays `None` with it.
 
 use crate::{Section, StrId, Ts};
 

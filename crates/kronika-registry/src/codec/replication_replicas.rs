@@ -1,6 +1,6 @@
 //! Type `1_016_001`: `pg_stat_replication`, one row per connected walsender.
 //!
-//! Read on the primary; a standby seals no rows. LSN columns are absolute
+//! Read on the primary; a standby writes no rows. LSN columns are absolute
 //! byte offsets from `0/0`, saturated to `i64::MAX`, and are `None` for a
 //! walsender that reports no position yet — a `pg_basebackup` connection
 //! shows `state = backup` with NULL positions. Lag columns are `None` when

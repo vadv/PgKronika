@@ -2,7 +2,7 @@
 //! `pg_replication_slots` (`1_017_001`).
 //!
 //! Both views are cluster-wide and read from the main connection. A standby
-//! usually has no walsenders, so `1_016_001` seals no rows there; slots exist
+//! usually has no walsenders, so `1_016_001` writes no rows there; slots exist
 //! on both roles, but `retained_bytes` needs `pg_current_wal_lsn()` and is
 //! `NULL` in recovery. LSN offsets saturate to `i64::MAX` in SQL, matching
 //! the `1_015_001` collection.
@@ -123,7 +123,7 @@ pub async fn collect_replication_replicas(
         .collect())
 }
 
-/// Intern the row's strings and build the sealed `1_016_001` layout.
+/// Intern the row's strings and build the `1_016_001` registry row.
 ///
 /// # Errors
 /// Propagates the interner error when the dictionary is full.
@@ -253,7 +253,7 @@ pub async fn collect_replication_slots(
         .collect())
 }
 
-/// Intern the row's strings and build the sealed `1_017_001` layout.
+/// Intern the row's strings and build the `1_017_001` registry row.
 ///
 /// # Errors
 /// Propagates the interner error when the dictionary is full.
