@@ -2,12 +2,11 @@ Feature: Every segment carries the instance fingerprint (1_021_001)
   instance_metadata anchors a segment to one server and one host boot: the
   PostgreSQL version and control-file identifier explain version-dependent
   sections, and the host facts (boot id, boot time, tick rate, page size) let
-  OS sections be read without external configuration. PostgreSQL vouches for
-  the server facts; the host facts are checked against independent /proc and
-  sysconf reads.
+  OS sections be read without external configuration. PostgreSQL supplies the
+  server facts; the host facts are checked against /proc and sysconf reads.
 
   @pg17 @serial
-  Scenario: the segment carries the fingerprint of the live server and host
+  Scenario: the segment carries the server and host fingerprint
     Given a fresh database on PostgreSQL 17
     When the collector snapshots the segment
     Then section 1_021_001 pg_version_num matches the exact oracle:

@@ -1,11 +1,8 @@
 //! Step definitions for the host-fact columns of `instance_metadata`
 //! (`1_021_001`).
 //!
-//! `PostgreSQL` cannot vouch for `/proc` values, so these oracles read the
-//! host independently: the file steps re-read and re-parse `/proc` with their
-//! own code, and the sysconf steps call `rustix` directly. Both pin that the
-//! collector delivered the live host value through interning, sealing, and
-//! decoding unchanged.
+//! `PostgreSQL` cannot verify `/proc` values, so these steps compare decoded
+//! section values with fresh `/proc` reads and `sysconf` calls.
 
 use anyhow::{Context, Result};
 use cucumber::then;
@@ -68,11 +65,10 @@ fn btime_equals_proc_stat(world: &mut BddWorld, type_id: String) -> Result<()> {
     Ok(())
 }
 
-/// A numeric column equals a live sysconf value read through `rustix`.
+/// A numeric column equals a sysconf value read through `rustix`.
 ///
-/// `getconf` does not exist in the scratch test image, so this is a transport
-/// oracle: the value source is the same syscall, while sealing and decoding
-/// are exercised independently.
+/// The expected value comes from the same syscall as the collector. The check
+/// still exercises dictionary interning, section buffering, and decoding.
 #[then(regex = r"^section ([\d_]+) (\w+) equals the local sysconf (clock ticks|page size)$")]
 #[allow(
     clippy::needless_pass_by_value,

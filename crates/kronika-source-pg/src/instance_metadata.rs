@@ -1,7 +1,7 @@
 //! The `PostgreSQL` half of section `1_021_001` (`instance_metadata`).
 //!
 //! The OS half comes from `kronika-source-os`; the collector binary joins the
-//! two and seals one row per segment.
+//! two and writes one row per segment.
 
 use tokio_postgres::Client;
 

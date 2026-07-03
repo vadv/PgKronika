@@ -208,9 +208,9 @@ fn parse_bool_guc(value: &str) -> Option<bool> {
 
 /// Extension context resolved by the caller from its discovered sources.
 ///
-/// A `None` version means the collector is not reading that extension right
-/// now — absent, unreadable, or an unrecognized fork — not merely "not
-/// installed anywhere".
+/// A `None` version means this snapshot is not reading that extension: absent,
+/// unreadable, or an unrecognized fork. It does not mean "not installed
+/// anywhere".
 #[derive(Debug, Clone, Default)]
 pub struct ResetExtensions {
     /// `pg_stat_statements` extension version on the statements source.
@@ -223,7 +223,7 @@ pub struct ResetExtensions {
     pub store_plans_reset_at: Option<i64>,
 }
 
-/// Assemble the sealed row, interning the label strings.
+/// Assemble the registry row, interning the label strings.
 ///
 /// # Errors
 /// Propagates the interner error when the dictionary is full.
