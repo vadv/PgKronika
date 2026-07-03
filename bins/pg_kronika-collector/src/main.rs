@@ -409,9 +409,9 @@ async fn main() -> Result<()> {
 /// Counters accumulated while collecting one top-N source, for `1_023_001`.
 #[derive(Debug, Default, Clone, Copy)]
 struct SourceCoverage {
-    /// Rows the source held, summed over the databases that were counted.
+    /// Rows the source reported, summed over the databases that were counted.
     total: u64,
-    /// Rows actually collected.
+    /// Rows collected.
     collected: u64,
     /// Databases skipped after the adaptive timeout hit its cap.
     timeouts: u32,
@@ -1449,7 +1449,7 @@ fn push_plans_read(
     }
 }
 
-/// Everything the coverage assembly needs about this snapshot's top-N reads.
+/// Inputs needed to assemble coverage for this snapshot's top-N reads.
 struct CoverageInputs<'a> {
     tables: SourceCoverage,
     indexes: SourceCoverage,
@@ -1494,7 +1494,7 @@ async fn collect_coverage_records(
     records
 }
 
-/// Coverage for the sealed `pg_stat_statements` read, if it was truncated.
+/// Coverage for the collected `pg_stat_statements` read, if it was truncated.
 async fn statements_coverage(
     pool: &ConnectionPool,
     config: &Config,
@@ -1525,7 +1525,7 @@ async fn statements_coverage(
     })
 }
 
-/// Coverage for the sealed `pg_store_plans` read, if it was truncated.
+/// Coverage for the collected `pg_store_plans` read, if it was truncated.
 ///
 /// The single selection axis makes the boundary meaningful: `cutoff_value`
 /// is the smallest `total_time` that still made it into the section.
@@ -2224,7 +2224,7 @@ mod tests {
             .truncated()
         );
         // A failed count query undercounts the total; that alone must not
-        // fabricate a truncation row.
+        // create a truncation row.
         assert!(
             !SourceCoverage {
                 total: 40,
