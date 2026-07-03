@@ -138,11 +138,14 @@ use kronika_source_pg::{
     ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer, to_v1, to_v2,
     to_v3,
 };
-use kronika_writer::{Interner, Journal, JournalConfig, SectionBuffers, dict, seal};
+use kronika_writer::{
+    DEFAULT_MAX_JOURNAL_LEN, Interner, Journal, JournalConfig, JournalError, SectionBuffers, dict,
+    seal,
+};
 use scheduler::{DueSet, Intervals, Scheduler, SourceKind};
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
@@ -185,6 +188,9 @@ struct Config {
     segment_max_bytes: u64,
     /// Seal an open segment at this age even if the byte cap was not reached.
     segment_max_age_secs: u64,
+    /// Hard cap of the on-disk journal file; reaching it seals the open
+    /// segment early instead of failing the append.
+    journal_max_bytes: u64,
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -240,30 +246,16 @@ impl Config {
         let tick_secs = env_u64("KRONIKA_INTERVAL_S", 5)?;
         let segment_max_bytes = env_u64("KRONIKA_SEGMENT_MAX_BYTES", 64 * 1024 * 1024)?;
         let segment_max_age_secs = env_u64("KRONIKA_SEGMENT_MAX_AGE_S", 900)?;
-        let defaults = Intervals::default();
-        let intervals = Intervals {
-            activity: env_u64("KRONIKA_PG_ACTIVITY_INTERVAL_S", defaults.activity)?,
-            database: env_u64("KRONIKA_PG_DATABASE_INTERVAL_S", defaults.database)?,
-            bgwriter: env_u64("KRONIKA_PG_BGWRITER_INTERVAL_S", defaults.bgwriter)?,
-            wal: env_u64("KRONIKA_PG_WAL_INTERVAL_S", defaults.wal)?,
-            io: env_u64("KRONIKA_PG_IO_INTERVAL_S", defaults.io)?,
-            archiver: env_u64("KRONIKA_PG_ARCHIVER_INTERVAL_S", defaults.archiver)?,
-            prepared_xacts: env_u64("KRONIKA_PG_PREPARED_INTERVAL_S", defaults.prepared_xacts)?,
-            progress_vacuum: env_u64(
-                "KRONIKA_PG_PROGRESS_VACUUM_INTERVAL_S",
-                defaults.progress_vacuum,
-            )?,
-            statements: env_u64("KRONIKA_PG_STATEMENTS_INTERVAL_S", defaults.statements)?,
-            user_tables: env_u64("KRONIKA_PG_TABLES_INTERVAL_S", defaults.user_tables)?,
-            user_indexes: env_u64("KRONIKA_PG_INDEXES_INTERVAL_S", defaults.user_indexes)?,
-            replication: env_u64("KRONIKA_PG_REPLICATION_INTERVAL_S", defaults.replication)?,
-            reset_metadata: env_u64(
-                "KRONIKA_PG_RESET_METADATA_INTERVAL_S",
-                defaults.reset_metadata,
-            )?,
-            instance_metadata: env_u64("KRONIKA_INSTANCE_INTERVAL_S", defaults.instance_metadata)?,
-            settings: env_u64("KRONIKA_PG_SETTINGS_INTERVAL_S", defaults.settings)?,
-        };
+        let journal_max_bytes =
+            env_u64("KRONIKA_JOURNAL_MAX_BYTES", DEFAULT_MAX_JOURNAL_LEN as u64)?;
+        if segment_max_bytes > journal_max_bytes {
+            eprintln!(
+                "pg_kronika: KRONIKA_SEGMENT_MAX_BYTES ({segment_max_bytes}) exceeds \
+                 KRONIKA_JOURNAL_MAX_BYTES ({journal_max_bytes}); segments will rotate \
+                 at the journal cap instead"
+            );
+        }
+        let intervals = intervals_from_env()?;
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
@@ -290,8 +282,37 @@ impl Config {
             intervals,
             segment_max_bytes,
             segment_max_age_secs,
+            journal_max_bytes,
         })
     }
+}
+
+/// Read the per-source intervals, falling back to the built-in defaults.
+fn intervals_from_env() -> Result<Intervals> {
+    let defaults = Intervals::default();
+    Ok(Intervals {
+        activity: env_u64("KRONIKA_PG_ACTIVITY_INTERVAL_S", defaults.activity)?,
+        database: env_u64("KRONIKA_PG_DATABASE_INTERVAL_S", defaults.database)?,
+        bgwriter: env_u64("KRONIKA_PG_BGWRITER_INTERVAL_S", defaults.bgwriter)?,
+        wal: env_u64("KRONIKA_PG_WAL_INTERVAL_S", defaults.wal)?,
+        io: env_u64("KRONIKA_PG_IO_INTERVAL_S", defaults.io)?,
+        archiver: env_u64("KRONIKA_PG_ARCHIVER_INTERVAL_S", defaults.archiver)?,
+        prepared_xacts: env_u64("KRONIKA_PG_PREPARED_INTERVAL_S", defaults.prepared_xacts)?,
+        progress_vacuum: env_u64(
+            "KRONIKA_PG_PROGRESS_VACUUM_INTERVAL_S",
+            defaults.progress_vacuum,
+        )?,
+        statements: env_u64("KRONIKA_PG_STATEMENTS_INTERVAL_S", defaults.statements)?,
+        user_tables: env_u64("KRONIKA_PG_TABLES_INTERVAL_S", defaults.user_tables)?,
+        user_indexes: env_u64("KRONIKA_PG_INDEXES_INTERVAL_S", defaults.user_indexes)?,
+        replication: env_u64("KRONIKA_PG_REPLICATION_INTERVAL_S", defaults.replication)?,
+        reset_metadata: env_u64(
+            "KRONIKA_PG_RESET_METADATA_INTERVAL_S",
+            defaults.reset_metadata,
+        )?,
+        instance_metadata: env_u64("KRONIKA_INSTANCE_INTERVAL_S", defaults.instance_metadata)?,
+        settings: env_u64("KRONIKA_PG_SETTINGS_INTERVAL_S", defaults.settings)?,
+    })
 }
 
 /// Reject per-axis top-N counts that could overflow a single section.
@@ -484,6 +505,15 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
 
+    // The journal lives next to the sealed segments so windows survive a
+    // restart; recovered windows are sealed right away, before the server
+    // connection — shipping already-collected data must not wait for it.
+    let (mut journal, recovered) =
+        open_collector_journal(&config.out_dir, config.journal_max_bytes)?;
+    if let Some(dest) = recovered {
+        announce(&format!("sealed {} reason=recovered", dest.display()));
+    }
+
     let mut pool = ConnectionPool::connect(
         &config.dsn,
         &format!("pg_kronika-collector/{}", env!("CARGO_PKG_VERSION")),
@@ -492,14 +522,6 @@ async fn main() -> Result<()> {
     )
     .await
     .context("connect pool")?;
-
-    // Only sealed segments leave this process.
-    let journal_dir = tempfile::tempdir().context("create the journal directory")?;
-    let (mut journal, _report) = Journal::open(
-        &journal_dir.path().join("active.parts"),
-        JournalConfig::default(),
-    )
-    .context("open the journal")?;
 
     let mut sigusr2 = signal(SignalKind::user_defined2()).context("install the SIGUSR2 handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("install the SIGTERM handler")?;
@@ -533,21 +555,21 @@ async fn main() -> Result<()> {
             _ = sigint.recv() => break,
         };
         let due = sched.plan(Instant::now(), forced);
+        // The age valve runs on every tick, before collection: a tick whose
+        // sources fail or return no rows must still close an expired segment.
+        let age = Duration::from_secs(config.segment_max_age_secs);
+        if segment.age_expired(Instant::now(), age) {
+            match seal_open_segment(&mut journal, &config, &mut segment) {
+                Ok(dest) => {
+                    sched.mark_segment_opened();
+                    announce(&format!("sealed {} reason=age", dest.display()));
+                }
+                Err(err) => eprintln!("pg_kronika-collector: segment seal failed: {err:#}"),
+            }
+        }
         // The plans pace lives outside the scheduler; a tick with only the
         // plans read due still runs.
         if due.is_empty() && !plans_cache.is_due(Instant::now()) {
-            // The max-age cap is checked even when no source is due, so a
-            // low-activity instance still closes its open segment on time.
-            let age = Duration::from_secs(config.segment_max_age_secs);
-            if segment.age_expired(Instant::now(), age) {
-                match seal_open_segment(&mut journal, &config, &mut segment) {
-                    Ok(dest) => {
-                        sched.mark_segment_opened();
-                        announce(&format!("sealed {}", dest.display()));
-                    }
-                    Err(err) => eprintln!("pg_kronika-collector: segment seal failed: {err:#}"),
-                }
-            }
             continue;
         }
         run_collection_cycle(
@@ -611,13 +633,14 @@ async fn run_collection_cycle(
     )
     .await
     {
-        Ok(Some(dest)) => {
-            // A fresh segment must be self-contained: the service sections
-            // (instance, reset, settings) come due on its first window.
-            sched.mark_segment_opened();
-            announce(&format!("sealed {}", dest.display()));
+        Ok(sealed) => {
+            for (dest, reason) in sealed {
+                // A fresh segment must be self-contained: the service sections
+                // (instance, reset, settings) come due on its first window.
+                sched.mark_segment_opened();
+                announce(&format!("sealed {} reason={reason}", dest.display()));
+            }
         }
-        Ok(None) => {}
         Err(err) => eprintln!("pg_kronika-collector: snapshot failed: {err:#}"),
     }
 }
@@ -1549,7 +1572,7 @@ async fn snapshot_and_seal(
     plans_cache: &mut PlansSourceCache,
     due: &DueSet,
     segment: &mut SegmentState,
-) -> Result<Option<PathBuf>> {
+) -> Result<Vec<(PathBuf, &'static str)>> {
     // Run every query first: SectionBuffers and Interner are `!Send`, so they
     // must not be held across an await. Each source reads only when due.
     let main_src = collect_main_conn_sources(pool.main(), major, config, due).await?;
@@ -1603,22 +1626,40 @@ async fn snapshot_and_seal(
 
     if buffers.is_empty() {
         // Every due source turned out empty (e.g. no vacuum in progress);
-        // an empty tick appends nothing.
-        return Ok(None);
+        // an empty tick appends nothing. The age valve in the main loop
+        // still closes an expired segment on such ticks.
+        return Ok(Vec::new());
     }
-    append_window(journal, buffers, &interner, config)?;
+    let part = encode_window(buffers, &interner, config)?;
+    let mut sealed = Vec::new();
+    if let Err(err) = journal.append(&part) {
+        match err {
+            // The journal cap fired before the segment byte cap: seal what is
+            // already on disk and retry — the first frame after a reset is
+            // exempt from the cap, so the retry cannot return Full again.
+            JournalError::Full { .. } if segment.first_ts.is_some() => {
+                sealed.push((seal_open_segment(journal, config, segment)?, "journal-full"));
+                journal
+                    .append(&part)
+                    .context("append the window after an early seal")?;
+            }
+            other => {
+                return Err(anyhow::Error::new(other).context("append the part to the journal"));
+            }
+        }
+    }
     let now = Instant::now();
     segment.on_window_appended(main_src.ts.0, now);
     let age = Duration::from_secs(config.segment_max_age_secs);
-    if should_seal(
+    if let Some(reason) = seal_reason(
         due.forced(),
         journal.bytes(),
         config.segment_max_bytes,
         segment.age_expired(now, age),
     ) {
-        return seal_open_segment(journal, config, segment).map(Some);
+        sealed.push((seal_open_segment(journal, config, segment)?, reason));
     }
-    Ok(None)
+    Ok(sealed)
 }
 
 /// Everything one tick reads from the main connection, gated by `due`.
@@ -1814,36 +1855,41 @@ impl SegmentState {
     }
 }
 
-/// Whether the open segment must seal now under the rotation contract.
+/// Why the open segment must seal now, or `None` to keep collecting.
 ///
 /// Forced ticks seal immediately, `max_bytes = 0` keeps the legacy one-tick
 /// segment mode, and otherwise the raw journal size or segment age closes the
 /// segment.
-const fn should_seal(
+const fn seal_reason(
     forced: bool,
     journal_bytes: usize,
     max_bytes: u64,
     age_expired: bool,
-) -> bool {
-    forced || max_bytes == 0 || journal_bytes as u64 >= max_bytes || age_expired
+) -> Option<&'static str> {
+    if forced {
+        Some("forced")
+    } else if max_bytes == 0 {
+        Some("tick")
+    } else if journal_bytes as u64 >= max_bytes {
+        Some("size")
+    } else if age_expired {
+        Some("age")
+    } else {
+        None
+    }
 }
 
-/// Encode the buffered window and append it to the journal.
-fn append_window(
-    journal: &mut Journal,
+/// Encode the buffered window into one journal-ready part.
+fn encode_window(
     mut buffers: SectionBuffers,
     interner: &Interner,
     config: &Config,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
-    let part = buffers
+    buffers
         .flush(&dict_sections, config.source_id)
         .context("encode the collection window")?
-        .context("a buffered row must yield a part")?;
-    journal
-        .append(&part)
-        .context("append the part to the journal")?;
-    Ok(())
+        .context("a buffered row must yield a part")
 }
 
 /// Seal the open segment into `<first_ts>.pgm` and reset the journal.
@@ -1861,6 +1907,73 @@ fn seal_open_segment(
     journal.reset().context("reset the journal after seal")?;
     *segment = SegmentState::default();
     Ok(dest)
+}
+
+/// Open the journal under the output directory and seal windows a previous
+/// process left behind, so a restart loses no collected data.
+fn open_collector_journal(
+    out_dir: &Path,
+    journal_max_bytes: u64,
+) -> Result<(Journal, Option<PathBuf>)> {
+    let journal_config = JournalConfig {
+        max_journal_len: usize::try_from(journal_max_bytes)
+            .context("KRONIKA_JOURNAL_MAX_BYTES exceeds usize")?,
+        ..JournalConfig::default()
+    };
+    let (mut journal, report) =
+        Journal::open(&out_dir.join("active.parts"), journal_config).context("open the journal")?;
+    if report.has_media_damage() {
+        eprintln!(
+            "pg_kronika-collector: journal recovery found damaged regions; \
+             appending after them"
+        );
+    }
+    if journal.parts().is_empty() {
+        return Ok((journal, None));
+    }
+    match seal_recovered_journal(&mut journal, out_dir) {
+        Ok(dest) => Ok((journal, dest)),
+        // A journal this binary cannot re-read (e.g. written by an
+        // incompatible version) must not stop the daemon: drop it and start
+        // collecting fresh.
+        Err(err) => {
+            eprintln!(
+                "pg_kronika-collector: recovery seal failed, dropping the stale journal: {err:#}"
+            );
+            journal
+                .reset()
+                .context("reset the journal after a failed recovery seal")?;
+            Ok((journal, None))
+        }
+    }
+}
+
+/// Seal recovered windows under the earliest data timestamp they carry.
+///
+/// Parts without a data timestamp hold no rows (a dictionary needs a data
+/// section to be referenced from), so a journal made only of those is reset
+/// without producing a segment.
+fn seal_recovered_journal(journal: &mut Journal, out_dir: &Path) -> Result<Option<PathBuf>> {
+    let mut first_ts: Option<i64> = None;
+    for part in journal.parts().to_vec() {
+        let body = journal.read_part(part).context("read a recovered part")?;
+        let catalog = kronika_format::validate_part(&body).context("validate a recovered part")?;
+        if catalog.min_ts != i64::MAX {
+            first_ts = Some(first_ts.map_or(catalog.min_ts, |ts| ts.min(catalog.min_ts)));
+        }
+    }
+    let Some(first_ts) = first_ts else {
+        journal
+            .reset()
+            .context("reset a recovered journal with no data windows")?;
+        return Ok(None);
+    };
+    let dest = out_dir.join(format!("{first_ts}.pgm"));
+    seal(journal, &dest).context("seal the recovered segment")?;
+    journal
+        .reset()
+        .context("reset the journal after the recovery seal")?;
+    Ok(Some(dest))
 }
 
 /// Buffer the `pg_stat_wal` singleton; PG10-13 produce no row.
@@ -2594,16 +2707,37 @@ fn push_store_plans_ossc(
 mod tests {
     use super::{
         PlansSourceCache, SegmentState, SourceCoverage, StatementsVersion, min_total_time,
-        should_seal, statements_type_id, user_indexes_type_id, user_tables_type_id,
+        seal_reason, statements_type_id, user_indexes_type_id, user_tables_type_id,
     };
 
     #[test]
     fn segment_seals_on_force_zero_cap_size_or_age() {
-        assert!(should_seal(true, 0, u64::MAX, false), "force always seals");
-        assert!(should_seal(false, 1, 0, false), "zero cap seals every tick");
-        assert!(should_seal(false, 64, 64, false), "size cap reached");
-        assert!(!should_seal(false, 63, 64, false), "under the cap");
-        assert!(should_seal(false, 1, u64::MAX, true), "age cap reached");
+        assert_eq!(
+            seal_reason(true, 0, u64::MAX, false),
+            Some("forced"),
+            "force always seals"
+        );
+        assert_eq!(
+            seal_reason(false, 1, 0, false),
+            Some("tick"),
+            "zero cap seals every tick"
+        );
+        assert_eq!(
+            seal_reason(false, 64, 64, false),
+            Some("size"),
+            "size cap reached"
+        );
+        assert_eq!(seal_reason(false, 63, 64, false), None, "under the cap");
+        assert_eq!(
+            seal_reason(false, 1, u64::MAX, true),
+            Some("age"),
+            "age cap reached"
+        );
+        assert_eq!(
+            seal_reason(true, 64, 64, true),
+            Some("forced"),
+            "the forced reason outranks size and age"
+        );
     }
 
     #[test]
@@ -2754,10 +2888,11 @@ mod tests {
 
     use super::{
         CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
-        activity_dict_limits, push_activity, push_archiver, push_database, push_io, push_locks,
-        push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
-        push_user_indexes, push_user_tables, validate_cardinality, validate_heavy_cap,
-        validate_max_lock_rows, validate_replication_detail_bounds, validate_settings_row_count,
+        activity_dict_limits, open_collector_journal, push_activity, push_archiver, push_database,
+        push_io, push_locks, push_prepared_xacts, push_progress_vacuum, push_replication_instance,
+        push_statements, push_user_indexes, push_user_tables, validate_cardinality,
+        validate_heavy_cap, validate_max_lock_rows, validate_replication_detail_bounds,
+        validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
@@ -2857,6 +2992,55 @@ mod tests {
                 .any(|entry| entry.type_id == 1_001_003),
             "the part carries the pg_stat_activity section"
         );
+    }
+
+    /// One encoded collection window holding a single activity row.
+    fn activity_window() -> Vec<u8> {
+        let mut buffers = SectionBuffers::new();
+        let mut interner = Interner::new(activity_dict_limits());
+        push_activity(
+            &mut buffers,
+            &mut interner,
+            ActivityVersion::V3,
+            &[client_row(7)],
+        )
+        .expect("push interns and buffers");
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        buffers
+            .flush(&dict_sections, 0)
+            .expect("flush encodes the window")
+            .expect("buffered rows produce a part")
+    }
+
+    #[test]
+    fn startup_seals_windows_a_dead_process_left_in_the_journal() {
+        use kronika_writer::{Journal, JournalConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let (mut journal, _report) =
+                Journal::open(&dir.path().join("active.parts"), JournalConfig::default())
+                    .expect("open the journal");
+            journal.append(&activity_window()).expect("append");
+            // Dropping without seal is the crash: the file stays behind.
+        }
+
+        let (journal, recovered) =
+            open_collector_journal(dir.path(), 1 << 30).expect("reopen the journal");
+        let dest = recovered.expect("leftover windows must become a segment");
+        // client_row stamps ts = 1_000, which names the recovered file.
+        assert_eq!(dest, dir.path().join("1000.pgm"));
+        assert!(dest.exists(), "the recovered segment is on disk");
+        assert!(journal.parts().is_empty(), "the journal restarts empty");
+    }
+
+    #[test]
+    fn startup_with_an_empty_journal_recovers_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (journal, recovered) =
+            open_collector_journal(dir.path(), 1 << 30).expect("open the journal");
+        assert!(recovered.is_none());
+        assert!(journal.parts().is_empty());
     }
 
     fn db_row(datid: u32) -> DatabaseRow {
