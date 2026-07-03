@@ -15,6 +15,7 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "1"
     And the collector runs with env "KRONIKA_PG_SETTINGS_INTERVAL_S" = "3600"
     And the collector runs with env "KRONIKA_PG_TABLES_INTERVAL_S" = "3600"
+    And the collector runs with env "KRONIKA_SEGMENT_MAX_BYTES" = "1"
     When the collector runs on its own timer until 2 segments are sealed
     Then timer segment 1 has section 1_019_001
     And timer segment 1 has section 1_013_003
