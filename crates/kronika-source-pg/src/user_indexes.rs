@@ -111,7 +111,8 @@ pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
             indexdef_max_len!(),
             "), '')::text AS indexdef, \
                COALESCE(io.idx_blks_read, 0) AS idx_blks_read, COALESCE(io.idx_blks_hit, 0) AS idx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+               (SELECT count(*) FROM pg_stat_user_indexes) AS source_total \
              FROM pg_stat_user_indexes i \
              JOIN candidates cand ON cand.indexrelid = i.indexrelid \
              LEFT JOIN pg_class cl ON cl.oid = i.indexrelid \
@@ -151,7 +152,8 @@ pub const fn user_indexes_query(version: UserIndexesVersion) -> &'static str {
             indexdef_max_len!(),
             "), '')::text AS indexdef, \
                COALESCE(io.idx_blks_read, 0) AS idx_blks_read, COALESCE(io.idx_blks_hit, 0) AS idx_blks_hit, \
-               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+               (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+               (SELECT count(*) FROM pg_stat_user_indexes) AS source_total \
              FROM pg_stat_user_indexes i \
              JOIN candidates cand ON cand.indexrelid = i.indexrelid \
              LEFT JOIN pg_class cl ON cl.oid = i.indexrelid \
@@ -330,27 +332,16 @@ pub async fn collect_user_indexes(
     client: &Client,
     major: u32,
     max_indexes: i64,
-) -> Result<(UserIndexesVersion, Vec<UserIndexesRow>), tokio_postgres::Error> {
+) -> Result<(UserIndexesVersion, Vec<UserIndexesRow>, u64), tokio_postgres::Error> {
     let version = user_indexes_version(major);
     let rows = client
         .query(user_indexes_query(version), &[&max_indexes])
         .await?;
+    let source_total = rows
+        .first()
+        .map_or(0, |row| row.get::<_, i64>("source_total"));
     let parsed = rows.iter().map(|row| row_from_pg(row, version)).collect();
-    Ok((version, parsed))
-}
-
-/// Rows in `pg_stat_user_indexes` of the connected database, for coverage.
-///
-/// # Errors
-/// Returns the [`tokio_postgres::Error`] if the query fails.
-pub async fn count_user_indexes(client: &Client) -> Result<i64, tokio_postgres::Error> {
-    let row = client
-        .query_one(
-            marked!("SELECT count(*)::int8 AS n FROM pg_stat_user_indexes"),
-            &[],
-        )
-        .await?;
-    Ok(row.get("n"))
+    Ok((version, parsed, u64::try_from(source_total).unwrap_or(0)))
 }
 
 #[cfg(test)]
