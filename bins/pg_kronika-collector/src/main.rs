@@ -516,7 +516,9 @@ async fn main() -> Result<()> {
             _ = sigint.recv() => break,
         };
         let due = sched.plan(Instant::now(), forced);
-        if due.is_empty() {
+        // The plans pace lives outside the scheduler; a tick with only the
+        // plans read due still runs.
+        if due.is_empty() && !plans_cache.is_due(Instant::now()) {
             continue;
         }
         run_collection_cycle(
@@ -1124,6 +1126,16 @@ struct PlansSourceCache {
     next_read: Option<Instant>,
 }
 
+impl PlansSourceCache {
+    /// Whether the paced `pg_store_plans` read is due at `now`.
+    ///
+    /// The main loop asks this before skipping a tick whose scheduler due-set
+    /// is empty: the plans pace must not depend on another source being due.
+    fn is_due(&self, now: Instant) -> bool {
+        self.next_read.is_none_or(|due| now >= due)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedPlansSource {
     source: StatementsSource,
@@ -1238,9 +1250,10 @@ async fn collect_store_plans_cached(
     pool: &ConnectionPool,
     config: &Config,
     cache: &mut PlansSourceCache,
+    force: bool,
 ) -> Option<(PlansRead, u64)> {
     let now = Instant::now();
-    if cache.next_read.is_some_and(|due| now < due) {
+    if !force && !cache.is_due(now) {
         return None;
     }
 
@@ -1506,7 +1519,8 @@ async fn snapshot_and_seal(
     } else {
         None
     };
-    let store_plans_rows = collect_store_plans_cached(pool, config, plans_cache).await;
+    let store_plans_rows =
+        collect_store_plans_cached(pool, config, plans_cache, due.forced()).await;
     let coverage = collect_coverage_records(
         major,
         config,
@@ -2469,9 +2483,24 @@ fn push_store_plans_ossc(
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceCoverage, StatementsVersion, min_total_time, statements_type_id,
+        PlansSourceCache, SourceCoverage, StatementsVersion, min_total_time, statements_type_id,
         user_indexes_type_id, user_tables_type_id,
     };
+
+    #[test]
+    fn plans_cache_is_due_without_a_deadline_and_after_it() {
+        use std::time::{Duration, Instant};
+
+        let mut cache = PlansSourceCache::default();
+        let now = Instant::now();
+        assert!(cache.is_due(now), "a fresh cache reads immediately");
+        cache.next_read = Some(now + Duration::from_mins(5));
+        assert!(!cache.is_due(now), "before the deadline nothing is due");
+        assert!(
+            cache.is_due(now + Duration::from_mins(5)),
+            "the deadline itself is due"
+        );
+    }
 
     #[test]
     fn coverage_reason_ranks_timeouts_over_other_skips() {
