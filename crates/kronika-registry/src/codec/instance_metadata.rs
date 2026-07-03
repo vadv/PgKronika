@@ -34,8 +34,10 @@ pub struct InstanceMetadata {
     #[column(l)]
     pub kernel_version: StrId,
     /// `pg_control` system identifier; survives restart, changes on `initdb`.
+    /// `None` when `pg_control_system()` is not executable under the
+    /// collector's role.
     #[column(l)]
-    pub pg_system_identifier: i64,
+    pub pg_system_identifier: Option<i64>,
     /// `sysconf(_SC_CLK_TCK)`; needed to convert OS tick counters.
     #[column(l)]
     pub clock_ticks_per_sec: i64,
@@ -62,7 +64,7 @@ mod tests {
             node_self_id: StrId(2),
             pg_version_num: 170_000,
             kernel_version: StrId(3),
-            pg_system_identifier: 7_300_000_000_000_000_000,
+            pg_system_identifier: Some(7_300_000_000_000_000_000),
             clock_ticks_per_sec: 100,
             page_size_bytes: 4096,
             boot_id: StrId(4),
@@ -77,6 +79,11 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_values() {
-        crate::assert_roundtrips(&[row()]);
+        let unresolved = InstanceMetadata {
+            ts: Ts(2_000_000),
+            pg_system_identifier: None,
+            ..row()
+        };
+        crate::assert_roundtrips(&[row(), unresolved]);
     }
 }
