@@ -40,6 +40,38 @@ async fn seed_database(world: &mut BddWorld, step: &Step) -> Result<()> {
     Ok(())
 }
 
+/// Apply server configuration statements, each in its own implicit
+/// transaction.
+///
+/// `ALTER SYSTEM` refuses to run inside a transaction block, and a
+/// multi-statement batch is one implicit transaction — so unlike the seeding
+/// step, every `;`-terminated statement here is sent separately.
+#[given("the server is reconfigured with:")]
+async fn reconfigure_server(world: &mut BddWorld, step: &Step) -> Result<()> {
+    let sql = docstring(step)?;
+    let dsn = world.harness.database_dsn()?;
+    let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .context("connect to reconfigure the server")?;
+    let driver = tokio::spawn(async move { drop(conn.await) });
+    let mut result = Ok(());
+    for statement in sql.split(';') {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        if let Err(err) = client.batch_execute(statement).await {
+            result = Err(err).with_context(|| format!("reconfigure statement {statement:?}"));
+            break;
+        }
+    }
+    driver.abort();
+    // pg_reload_conf() only signals the postmaster; give the reload a moment
+    // so the collector's snapshot sees the new values.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    result
+}
+
 /// Create a second isolated database on the scenario's cluster and seed it with
 /// the step's docstring SQL, on a throwaway session.
 ///

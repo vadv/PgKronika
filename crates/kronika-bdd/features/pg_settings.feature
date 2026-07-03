@@ -10,7 +10,7 @@ Feature: Collector seals pg_settings (1_019_001) into every segment
   @pg15 @serial
   Scenario: the full parameter set with a live ALTER SYSTEM change
     Given a fresh database on PostgreSQL 15
-    And a database seeded with:
+    And the server is reconfigured with:
       """
       ALTER SYSTEM SET work_mem = '7539kB';
       SELECT pg_reload_conf();
@@ -29,7 +29,7 @@ Feature: Collector seals pg_settings (1_019_001) into every segment
   @pg17 @serial
   Scenario: a postmaster-context change is sealed as pending restart
     Given a fresh database on PostgreSQL 17
-    And a database seeded with:
+    And the server is reconfigured with:
       """
       ALTER SYSTEM SET shared_buffers = '190MB';
       SELECT pg_reload_conf();
