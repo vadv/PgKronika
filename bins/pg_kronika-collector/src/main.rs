@@ -86,6 +86,7 @@ use kronika_source_pg::reset_metadata::{
     ResetBase, ResetExtensions, collect_reset_base, statements_reset_at, store_plans_reset_at,
     to_reset_metadata,
 };
+use kronika_source_pg::settings::{SettingsRow, collect_settings, to_settings_v1};
 use kronika_source_pg::statements::{
     self, StatementsRow, StatementsVersion, collect_statements, statements_extversion,
     statements_version,
@@ -332,6 +333,22 @@ fn validate_max_lock_rows(max_lock_rows: i64) -> Result<()> {
         max_lock_rows <= cap,
         "KRONIKA_PG_MAX_LOCK_ROWS ({max_lock_rows}) exceeds the {cap}-row section cap; \
          lower KRONIKA_PG_MAX_LOCK_ROWS"
+    );
+    Ok(())
+}
+
+/// Reject a `pg_settings` snapshot that cannot fit into one section.
+///
+/// `PostgreSQL`'s `GUC` set is expected to be small and bounded by server code
+/// plus loaded extensions, but the collector still checks the hard PGM section
+/// cap before any `pg_settings` strings are interned.
+///
+/// # Errors
+/// Returns an error naming the section and the row cap when out of range.
+fn validate_settings_row_count(rows: usize) -> Result<()> {
+    anyhow::ensure!(
+        rows <= MAX_SECTION_ROWS,
+        "pg_settings returned {rows} rows, exceeding the {MAX_SECTION_ROWS}-row section cap"
     );
     Ok(())
 }
@@ -1219,9 +1236,8 @@ async fn snapshot_and_seal(
     let store_plans_rows = collect_store_plans_cached(pool, config, plans_cache).await;
     // The extension caches are warm now: reset metadata reads the info views
     // through the same connections those sections were collected from.
-    let (reset_base, reset_ext) =
-        collect_reset_metadata_all(pool, major, statements_cache, plans_cache).await?;
-    let instance = collect_instance_facts(client, config).await?;
+    let service =
+        collect_service_sections(pool, major, config, statements_cache, plans_cache).await?;
 
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
@@ -1271,8 +1287,7 @@ async fn snapshot_and_seal(
             &lock_rows,
         )?;
     }
-    push_reset_metadata(&mut buffers, &mut interner, &reset_base, &reset_ext)?;
-    push_instance_metadata(&mut buffers, &mut interner, &instance)?;
+    push_service_sections(&mut buffers, &mut interner, &service)?;
 
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
@@ -1288,6 +1303,53 @@ async fn snapshot_and_seal(
     // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
+}
+
+/// The per-segment service rows: reset context, instance fingerprint, and
+/// the full `pg_settings` copy.
+struct ServiceSections {
+    reset_base: ResetBase,
+    reset_ext: ResetExtensions,
+    instance: InstanceFacts,
+    settings: Vec<SettingsRow>,
+}
+
+/// Collect the service sections written to every segment.
+async fn collect_service_sections(
+    pool: &ConnectionPool,
+    major: u32,
+    config: &Config,
+    statements_cache: &StatementsSourceCache,
+    plans_cache: &PlansSourceCache,
+) -> Result<ServiceSections> {
+    let (reset_base, reset_ext) =
+        collect_reset_metadata_all(pool, major, statements_cache, plans_cache).await?;
+    let instance = collect_instance_facts(pool.main(), config).await?;
+    let settings = collect_settings(pool.main())
+        .await
+        .context("collect pg_settings")?;
+    validate_settings_row_count(settings.len())?;
+    Ok(ServiceSections {
+        reset_base,
+        reset_ext,
+        instance,
+        settings,
+    })
+}
+
+/// Buffer the three service sections of one segment.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_service_sections(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    service: &ServiceSections,
+) -> Result<()> {
+    push_reset_metadata(buffers, interner, &service.reset_base, &service.reset_ext)?;
+    push_instance_metadata(buffers, interner, &service.instance)?;
+    push_settings(buffers, interner, &service.settings)
 }
 
 /// Assemble `reset_metadata`: the base from the main connection plus the
@@ -1642,7 +1704,6 @@ fn push_locks(
     Ok(())
 }
 
-/// Whether a tokio-postgres error carries the given SQLSTATE code.
 /// Intern the label strings and buffer the singleton `reset_metadata` row.
 ///
 /// # Errors
@@ -1685,6 +1746,25 @@ fn push_instance_metadata(
     buffer_row(buffers, row)
 }
 
+/// Intern each row's strings and buffer it as the `pg_settings` section.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_settings(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[SettingsRow],
+) -> Result<()> {
+    validate_settings_row_count(rows.len())?;
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_settings_v1(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
+/// Whether a tokio-postgres error carries the given SQLSTATE code.
 fn is_sqlstate(err: &tokio_postgres::Error, code: &str) -> bool {
     err.code().is_some_and(|state| state.code() == code)
 }
@@ -1747,7 +1827,7 @@ mod tests {
         activity_dict_limits, push_activity, push_archiver, push_database, push_io, push_locks,
         push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
         push_user_indexes, push_user_tables, validate_cardinality, validate_heavy_cap,
-        validate_max_lock_rows,
+        validate_max_lock_rows, validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
@@ -2179,6 +2259,14 @@ mod tests {
             super::validate_max_plans(cap + 1).is_err(),
             "a value above MAX_SECTION_ROWS is rejected"
         );
+    }
+
+    #[test]
+    fn settings_row_guard_rejects_section_overflow() {
+        assert!(validate_settings_row_count(MAX_SECTION_ROWS).is_ok());
+        let err = validate_settings_row_count(MAX_SECTION_ROWS + 1)
+            .expect_err("pg_settings must not exceed one section");
+        assert!(err.to_string().contains("pg_settings"));
     }
 
     #[test]

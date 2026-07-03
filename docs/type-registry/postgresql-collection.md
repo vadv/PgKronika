@@ -30,7 +30,7 @@
 | `pg_stat_activity`, wait events, locks | доступ к `pg_stat_*`; для чужих запросов может требоваться `pg_read_all_stats` или `pg_monitor` | скрытые поля пишутся `NULL`, генерируется permission-событие |
 | `pg_stat_statements` | расширение установлено, права на view/function | тип отсутствует, version поля в `reset_metadata` = `NULL` |
 | `pg_store_plans` | расширение установлено в одной из БД пула, права на view/function | тип отсутствует или plan/reset поля `NULL` |
-| `pg_settings` | доступ к `pg_settings`; часть sourcefile может быть скрыта | скрытые поля `NULL` |
+| `pg_settings` | доступ к `pg_settings`; часть `sourcefile`/`sourceline` может быть скрыта | скрытые поля `NULL` |
 | представления репликации | права на `pg_stat_replication`, `pg_replication_slots`; часто нужна роль мониторинга | типы репликации отсутствуют или частично `NULL` |
 | PostgreSQL logs | файловый доступ к `log_directory` или sidecar shipping | логовые event_stream-типы отсутствуют, генерируется permission-событие |
 
@@ -486,6 +486,36 @@ SELECT system_identifier FROM pg_control_system();
 - `page_size_bytes` — `sysconf(_SC_PAGESIZE)`.
 
 `node_self_id` берётся из `KRONIKA_NODE_SELF_ID`; без переменной — hostname.
+
+## `1_019_001` `pg_settings`
+
+Полная копия `pg_settings` пишется в каждый сегмент с главного соединения,
+одним запросом с `ORDER BY name`. Сортировка по имени в SQL важна: интернер
+выдаёт id в порядке вставки, поэтому сортовой ключ секции `(name)` совпадает с
+алфавитным порядком имён.
+
+```sql
+SELECT
+  name, setting, unit, source, sourcefile, sourceline,
+  pending_restart, context, vartype, boot_val, reset_val
+FROM pg_settings
+ORDER BY name;
+```
+
+`setting` хранится как отдаёт сервер — числом в единицах `unit`
+(`work_mem = '7539kB'` даёт `setting = 7539`, `unit = kB`). Раскладка стабильна
+на PG10-18: `pending_restart` существует с PostgreSQL 9.5.
+
+Происхождение пишется без нормализации: `source` — категория источника из
+PostgreSQL (`default`, `configuration file`, `client` и т. п.), `sourcefile` —
+путь к файлу конфигурации, если сервер его раскрывает, `sourceline` — номер
+строки в этом файле, если сервер его раскрывает. Для нефайловых источников или
+скрытых путей `sourcefile` и `sourceline` остаются `NULL`.
+
+Число GUC ожидается небольшим и ограниченным кодом PostgreSQL плюс загруженными
+расширениями. Коллектор всё равно проверяет `pg_settings` на
+`MAX_SECTION_ROWS` до интернирования строк и падает с ошибкой этой секции, если
+снимок не помещается. Строки не усекаются и не отбрасываются.
 
 ## `1_015_001` - `1_017_001` replication
 
