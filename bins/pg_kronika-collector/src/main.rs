@@ -57,6 +57,7 @@
 
 use anyhow::{Context, Result};
 use kronika_format::DictLimits;
+use kronika_registry::collection_coverage::CollectionCoverageV1;
 use kronika_registry::instance_metadata::InstanceMetadata;
 use kronika_registry::{MAX_SECTION_ROWS, StrId, Ts};
 use kronika_source_os::{OsInstanceFacts, collect_os_instance_facts};
@@ -78,6 +79,10 @@ use kronika_source_pg::prepared_xacts::{
 };
 use kronika_source_pg::progress_vacuum::{
     ProgressVacuumRow, collect_progress_vacuum, to_progress_vacuum,
+};
+use kronika_source_pg::replication_details::{
+    ReplicaRow, ReplicationDetailBounds, SlotRow, collect_replication_detail_bounds,
+    collect_replication_replicas, collect_replication_slots, to_replicas_v1, to_slots_v1,
 };
 use kronika_source_pg::replication_instance::{
     ReplicationInstanceRow, collect_replication_instance, to_replication_instance,
@@ -353,6 +358,58 @@ fn validate_settings_row_count(rows: usize) -> Result<()> {
     Ok(())
 }
 
+const REPLICA_DICT_BYTES_PER_ROW: i64 = 224;
+const SLOT_DICT_BYTES_PER_ROW: i64 = 152;
+
+/// Reject replication-detail GUC bounds that can overflow section or dictionary limits.
+///
+/// The strings in both views are bounded by `PostgreSQL` `name`, `inet` text, and
+/// fixed status labels. These constants overestimate the unique bytes per row,
+/// so a high GUC fails before the collector materializes the view output.
+///
+/// # Errors
+/// Returns an error naming the GUC or dictionary cap that would be exceeded.
+fn validate_replication_detail_bounds(bounds: ReplicationDetailBounds) -> Result<()> {
+    let section_cap = i64::try_from(MAX_SECTION_ROWS).context("MAX_SECTION_ROWS exceeds i64")?;
+    check_replication_detail_section_bound("max_wal_senders", bounds.max_wal_senders, section_cap)?;
+    check_replication_detail_section_bound(
+        "max_replication_slots",
+        bounds.max_replication_slots,
+        section_cap,
+    )?;
+
+    let dict_cap = i64::try_from(activity_dict_limits().max_total_bytes())
+        .context("dictionary byte cap exceeds i64")?;
+    let replica_bytes = bounds
+        .max_wal_senders
+        .checked_mul(REPLICA_DICT_BYTES_PER_ROW)
+        .context("max_wal_senders dictionary estimate overflows i64")?;
+    let slot_bytes = bounds
+        .max_replication_slots
+        .checked_mul(SLOT_DICT_BYTES_PER_ROW)
+        .context("max_replication_slots dictionary estimate overflows i64")?;
+    let worst_case = replica_bytes
+        .checked_add(slot_bytes)
+        .context("replication detail dictionary estimate overflows i64")?;
+    anyhow::ensure!(
+        worst_case <= dict_cap,
+        "replication detail labels can require {worst_case} dictionary bytes from \
+         max_wal_senders={} and max_replication_slots={}, exceeding the {dict_cap}-byte cap",
+        bounds.max_wal_senders,
+        bounds.max_replication_slots
+    );
+    Ok(())
+}
+
+fn check_replication_detail_section_bound(guc: &str, value: i64, cap: i64) -> Result<()> {
+    anyhow::ensure!(value >= 0, "{guc} must be non-negative, got {value}");
+    anyhow::ensure!(
+        value <= cap,
+        "{guc} ({value}) exceeds the {cap}-row section cap; lower {guc}"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
@@ -415,6 +472,95 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Counters accumulated while collecting one top-N source, for `1_023_001`.
+#[derive(Debug, Default, Clone, Copy)]
+struct SourceCoverage {
+    /// Known lower bound for source rows.
+    total: u64,
+    /// Rows collected.
+    collected: u64,
+    /// At least one count failed, so `total` is not exact.
+    unknown_total: bool,
+    /// Databases skipped after the adaptive timeout hit its cap.
+    timeouts: u32,
+    /// Databases skipped on a privilege failure (SQLSTATE 42501).
+    permission_skips: u32,
+    /// Databases skipped for any other error.
+    other_skips: u32,
+}
+
+impl SourceCoverage {
+    /// The `1_023_001` reason code: a timeout outranks a privilege failure,
+    /// which outranks other skips; plain top-N selection is the default.
+    const fn reason(&self) -> u8 {
+        if self.timeouts > 0 {
+            1
+        } else if self.permission_skips > 0 {
+            2
+        } else if self.other_skips > 0 || self.unknown_total {
+            3
+        } else {
+            0
+        }
+    }
+
+    /// Whether any source rows are missing from the section.
+    const fn truncated(&self) -> bool {
+        self.total > self.collected
+            || self.unknown_total
+            || self.timeouts > 0
+            || self.permission_skips > 0
+            || self.other_skips > 0
+    }
+}
+
+/// One pending `1_023_001` row.
+#[derive(Debug, Clone, Copy)]
+struct CoverageRecord {
+    source_type_id: u32,
+    coverage: SourceCoverage,
+    max_n: u32,
+    order_by: &'static str,
+    cutoff_value: Option<f64>,
+}
+
+/// The `1_013` layout collected on this server major.
+const fn user_tables_type_id(major: u32) -> u32 {
+    match major {
+        0..=12 => 1_013_001,
+        13..=15 => 1_013_002,
+        16..=17 => 1_013_003,
+        _ => 1_013_004,
+    }
+}
+
+/// The `1_014` layout collected on this server major.
+const fn user_indexes_type_id(major: u32) -> u32 {
+    if major >= 16 { 1_014_002 } else { 1_014_001 }
+}
+
+/// The `1_014` selection axes on this server major: `last_idx_scan` exists
+/// only from PG16, so older majors must not claim it in coverage.
+const fn user_indexes_order_by(major: u32) -> &'static str {
+    if major >= 16 {
+        "idx_scan|idx_tup_read|relpages|last_idx_scan"
+    } else {
+        "idx_scan|idx_tup_read|relpages"
+    }
+}
+
+/// The `1_002` layout for the extension version being collected.
+const fn statements_type_id(version: StatementsVersion) -> u32 {
+    match version {
+        StatementsVersion::V1 => 1_002_001,
+        StatementsVersion::V2 => 1_002_002,
+        StatementsVersion::V3 => 1_002_003,
+        StatementsVersion::V4 => 1_002_004,
+        StatementsVersion::V5 => 1_002_005,
+        StatementsVersion::V6 => 1_002_006,
+    }
+}
+
 /// Collect `pg_stat_user_tables` from every pool database, returning owned rows.
 ///
 /// All awaits finish here so the caller can intern without holding the `!Send`
@@ -426,8 +572,12 @@ async fn collect_user_tables_all(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
-) -> Vec<(String, UserTablesVersion, Vec<UserTablesRow>)> {
+) -> (
+    Vec<(String, UserTablesVersion, Vec<UserTablesRow>)>,
+    SourceCoverage,
+) {
     let mut user_tables = Vec::new();
+    let mut coverage = SourceCoverage::default();
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
     for db in pool.per_db() {
         loop {
@@ -446,7 +596,13 @@ async fn collect_user_tables_all(
                 );
             }
             match collect_user_tables(db.client(), major, config.max_tables).await {
-                Ok((version, rows)) => {
+                Ok((version, rows, source_total)) => {
+                    coverage.collected += rows.len() as u64;
+                    // The total rides in the same statement as the rows, so
+                    // it describes exactly the population they were cut from.
+                    // Every selection axis is an unfiltered ORDER BY, so an
+                    // empty read means an empty source: a zero total is exact.
+                    coverage.total += source_total;
                     user_tables.push((db.datname.clone(), version, rows));
                     break;
                 }
@@ -456,6 +612,7 @@ async fn collect_user_tables_all(
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
+                    coverage.other_skips += 1;
                     eprintln!(
                         "pg_kronika-collector: skip user_tables for {} (lock_not_available): {err}",
                         db.datname
@@ -463,6 +620,14 @@ async fn collect_user_tables_all(
                     break;
                 }
                 Err(err) => {
+                    if is_sqlstate(&err, "57014") {
+                        coverage.timeouts += 1;
+                    } else if is_sqlstate(&err, "42501") {
+                        coverage.permission_skips += 1;
+                    } else {
+                        coverage.other_skips += 1;
+                    }
+                    coverage.unknown_total = true;
                     eprintln!(
                         "pg_kronika-collector: skip user_tables for {}: {err}",
                         db.datname
@@ -472,7 +637,7 @@ async fn collect_user_tables_all(
             }
         }
     }
-    user_tables
+    (user_tables, coverage)
 }
 
 /// Collect `pg_stat_user_indexes` from every pool database, returning owned rows.
@@ -486,8 +651,12 @@ async fn collect_user_indexes_all(
     pool: &ConnectionPool,
     major: u32,
     config: &Config,
-) -> Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)> {
+) -> (
+    Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)>,
+    SourceCoverage,
+) {
     let mut user_indexes = Vec::new();
+    let mut coverage = SourceCoverage::default();
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
     for db in pool.per_db() {
         loop {
@@ -506,7 +675,11 @@ async fn collect_user_indexes_all(
                 );
             }
             match collect_user_indexes(db.client(), major, config.max_indexes).await {
-                Ok((version, rows)) => {
+                Ok((version, rows, source_total)) => {
+                    coverage.collected += rows.len() as u64;
+                    // Same-statement total; an empty read means an empty
+                    // source, so the zero total is exact.
+                    coverage.total += source_total;
                     user_indexes.push((db.datname.clone(), version, rows));
                     break;
                 }
@@ -516,6 +689,7 @@ async fn collect_user_indexes_all(
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
+                    coverage.other_skips += 1;
                     eprintln!(
                         "pg_kronika-collector: skip user_indexes for {} (lock_not_available): {err}",
                         db.datname
@@ -523,6 +697,14 @@ async fn collect_user_indexes_all(
                     break;
                 }
                 Err(err) => {
+                    if is_sqlstate(&err, "57014") {
+                        coverage.timeouts += 1;
+                    } else if is_sqlstate(&err, "42501") {
+                        coverage.permission_skips += 1;
+                    } else {
+                        coverage.other_skips += 1;
+                    }
+                    coverage.unknown_total = true;
                     eprintln!(
                         "pg_kronika-collector: skip user_indexes for {}: {err}",
                         db.datname
@@ -532,7 +714,7 @@ async fn collect_user_indexes_all(
             }
         }
     }
-    user_indexes
+    (user_indexes, coverage)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -704,7 +886,7 @@ async fn collect_statements_from_candidate(
     candidate: StatementsCandidate<'_>,
     config: &Config,
     cache: &mut StatementsSourceCache,
-) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
+) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
     let label = candidate.source.label();
     let extversion = match statements_extversion(candidate.client).await {
         Ok(Some(extversion)) => extversion,
@@ -716,9 +898,9 @@ async fn collect_statements_from_candidate(
     };
     let version = statements_version(&extversion);
     match collect_statements(candidate.client, version, config.max_statements).await {
-        Ok(rows) => {
+        Ok((rows, source_total)) => {
             let version = cache.store(candidate.source, extversion);
-            Some((version, rows))
+            Some((version, rows, source_total))
         }
         Err(err) => {
             eprintln!("pg_kronika-collector: pg_stat_statements query failed on {label}: {err}");
@@ -731,7 +913,7 @@ async fn discover_statements_source(
     pool: &ConnectionPool,
     config: &Config,
     cache: &mut StatementsSourceCache,
-) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
+) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
     for candidate in all_statements_candidates(pool) {
         if let Some(rows) = collect_statements_from_candidate(candidate, config, cache).await {
             return Some(rows);
@@ -748,7 +930,7 @@ async fn rediscover_missing_statements_source(
     pool: &ConnectionPool,
     config: &Config,
     cache: &mut StatementsSourceCache,
-) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
+) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
     for candidate in incremental_statements_candidates(pool, cache) {
         if let Some(rows) = collect_statements_from_candidate(candidate, config, cache).await {
             return Some(rows);
@@ -770,14 +952,16 @@ async fn collect_statements_cached(
     pool: &ConnectionPool,
     config: &Config,
     cache: &mut StatementsSourceCache,
-) -> Option<(StatementsVersion, Vec<StatementsRow>)> {
+) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
     if let Some(cached) = cache.selected.clone() {
         let label = cached.source.label();
         if let Some(client) = statement_client(pool, &cached.source) {
             match statements_extversion(client).await {
                 Ok(Some(extversion)) if cached.matches_extversion(&extversion) => {
                     match collect_statements(client, cached.version, config.max_statements).await {
-                        Ok(rows) => return Some((cached.version, rows)),
+                        Ok((rows, source_total)) => {
+                            return Some((cached.version, rows, source_total));
+                        }
                         Err(err) => {
                             eprintln!(
                                 "pg_kronika-collector: pg_stat_statements query failed on cached {label}: {err}; rediscovering"
@@ -887,7 +1071,7 @@ async fn try_cached_plans_read(
     config: &Config,
     cache: &mut PlansSourceCache,
     now: Instant,
-) -> Option<PlansRead> {
+) -> Option<(PlansRead, u64)> {
     if let Some(cached) = cache.selected.clone() {
         let label = cached.source.label();
         if let Some(client) = statement_client(pool, &cached.source) {
@@ -896,7 +1080,7 @@ async fn try_cached_plans_read(
                     match collect_plans_for_fork(client, config, cached.fork).await {
                         Ok(read) => {
                             cache.next_read = Some(
-                                now + plans_reread_delay(read.is_empty(), config.plans_interval),
+                                now + plans_reread_delay(read.0.is_empty(), config.plans_interval),
                             );
                             return Some(read);
                         }
@@ -950,7 +1134,7 @@ async fn collect_store_plans_cached(
     pool: &ConnectionPool,
     config: &Config,
     cache: &mut PlansSourceCache,
-) -> Option<PlansRead> {
+) -> Option<(PlansRead, u64)> {
     let now = Instant::now();
     if cache.next_read.is_some_and(|due| now < due) {
         return None;
@@ -1021,7 +1205,7 @@ async fn collect_store_plans_cached(
                     fork,
                 });
                 cache.next_read =
-                    Some(now + plans_reread_delay(read.is_empty(), config.plans_interval));
+                    Some(now + plans_reread_delay(read.0.is_empty(), config.plans_interval));
                 return Some(read);
             }
             Err(err) => {
@@ -1043,14 +1227,16 @@ async fn collect_plans_for_fork(
     client: &Client,
     config: &Config,
     fork: PlansFork,
-) -> Result<PlansRead, tokio_postgres::Error> {
+) -> Result<(PlansRead, u64), tokio_postgres::Error> {
     match fork {
-        PlansFork::Vadv => Ok(PlansRead::Vadv(
-            collect_plans_with_texts(client, config).await?,
-        )),
-        PlansFork::Ossc => Ok(PlansRead::Ossc(
-            collect_ossc_plans_with_budget(client, config).await?,
-        )),
+        PlansFork::Vadv => {
+            let (rows, source_total) = collect_plans_with_texts(client, config).await?;
+            Ok((PlansRead::Vadv(rows), source_total))
+        }
+        PlansFork::Ossc => {
+            let (rows, source_total) = collect_ossc_plans_with_budget(client, config).await?;
+            Ok((PlansRead::Ossc(rows), source_total))
+        }
     }
 }
 
@@ -1065,10 +1251,11 @@ async fn collect_plans_for_fork(
 async fn collect_ossc_plans_with_budget(
     client: &Client,
     config: &Config,
-) -> Result<Vec<StorePlansOsscRow>, tokio_postgres::Error> {
+) -> Result<(Vec<StorePlansOsscRow>, u64), tokio_postgres::Error> {
     let started = Instant::now();
     let text_cap = (config.plan_text_budget > 0).then_some(config.max_plan_text);
-    let (mut rows, masked) = collect_store_plans_ossc(client, config.max_plans, text_cap).await?;
+    let (mut rows, masked, source_total) =
+        collect_store_plans_ossc(client, config.max_plans, text_cap).await?;
     if masked > 0 {
         eprintln!(
             "pg_kronika-collector: pg_store_plans (ossc): {masked} privilege-masked rows \
@@ -1101,7 +1288,7 @@ async fn collect_ossc_plans_with_budget(
         budget,
         started.elapsed()
     );
-    Ok(rows)
+    Ok((rows, source_total))
 }
 
 /// Enumerate top-N plan rows, then fetch texts under the per-read budget.
@@ -1112,9 +1299,9 @@ async fn collect_ossc_plans_with_budget(
 async fn collect_plans_with_texts(
     client: &Client,
     config: &Config,
-) -> Result<Vec<StorePlansRow>, tokio_postgres::Error> {
+) -> Result<(Vec<StorePlansRow>, u64), tokio_postgres::Error> {
     let started = Instant::now();
-    let mut rows = collect_store_plans(client, config.max_plans).await?;
+    let (mut rows, source_total) = collect_store_plans(client, config.max_plans).await?;
     let mut budget = config.plan_text_budget;
     let mut fetched = 0_usize;
     for row in &mut rows {
@@ -1173,7 +1360,7 @@ async fn collect_plans_with_texts(
         budget,
         started.elapsed()
     );
-    Ok(rows)
+    Ok((rows, source_total))
 }
 
 /// Truncate a string to at most `max_bytes`, on a UTF-8 character boundary.
@@ -1228,12 +1415,23 @@ async fn snapshot_and_seal(
     let replication_instance_row = collect_replication_instance(client, major)
         .await
         .context("collect replication instance status")?;
+    let (replica_rows, slot_rows) = collect_replication_details(client, major).await?;
     let lock_rows = collect_lock_rows(client, major, config.max_lock_rows).await;
 
-    let user_tables = collect_user_tables_all(pool, major, config).await;
-    let user_indexes = collect_user_indexes_all(pool, major, config).await;
+    let (user_tables, tables_cov) = collect_user_tables_all(pool, major, config).await;
+    let (user_indexes, indexes_cov) = collect_user_indexes_all(pool, major, config).await;
     let statements = collect_statements_cached(pool, config, statements_cache).await;
     let store_plans_rows = collect_store_plans_cached(pool, config, plans_cache).await;
+    let coverage = collect_coverage_records(
+        major,
+        config,
+        &CoverageInputs {
+            tables: tables_cov,
+            indexes: indexes_cov,
+            statements: &statements,
+            plans: &store_plans_rows,
+        },
+    );
     // The extension caches are warm now: reset metadata reads the info views
     // through the same connections those sections were collected from.
     let service =
@@ -1258,27 +1456,23 @@ async fn snapshot_and_seal(
     )?;
     push_progress_vacuum(&mut buffers, &mut interner, &progress_vacuum_rows)?;
     push_prepared_xacts(&mut buffers, &mut interner, &prepared_rows)?;
-    // pg_stat_wal has one all-numeric row; PG10-13 produce no row.
-    match wal {
-        Some(WalSnapshot::V1(row)) => buffer_row(&mut buffers, row)?,
-        Some(WalSnapshot::V2(row)) => buffer_row(&mut buffers, row)?,
-        None => {}
-    }
+    push_wal(&mut buffers, wal)?;
     if let Some((io_version, io_rows)) = &io {
         push_io(&mut buffers, &mut interner, *io_version, io_rows)?;
     }
     push_archiver(&mut buffers, &mut interner, &archiver)?;
     push_replication_instance(&mut buffers, &mut interner, &replication_instance_row)?;
+    push_replication_details(&mut buffers, &mut interner, &replica_rows, &slot_rows)?;
     push_user_tables(&mut buffers, &mut interner, &user_tables)?;
     push_user_indexes(&mut buffers, &mut interner, &user_indexes)?;
-    if let Some((version, rows)) = &statements {
+    if let Some((version, rows, _total)) = &statements {
         push_statements(&mut buffers, &mut interner, *version, rows)?;
     }
-    match &store_plans_rows {
-        Some(PlansRead::Vadv(rows)) => push_store_plans(&mut buffers, &mut interner, rows)?,
-        Some(PlansRead::Ossc(rows)) => push_store_plans_ossc(&mut buffers, &mut interner, rows)?,
-        None => {}
-    }
+    push_plans_read(
+        &mut buffers,
+        &mut interner,
+        store_plans_rows.as_ref().map(|(read, _total)| read),
+    )?;
     if !lock_rows.is_empty() {
         push_locks(
             &mut buffers,
@@ -1288,7 +1482,19 @@ async fn snapshot_and_seal(
         )?;
     }
     push_service_sections(&mut buffers, &mut interner, &service)?;
+    push_coverage(&mut buffers, &mut interner, ts.0, &coverage)?;
 
+    seal_segment(journal, buffers, &interner, config, ts.0)
+}
+
+/// Encode the buffered window, append it to the journal, and seal `<ts>.pgm`.
+fn seal_segment(
+    journal: &mut Journal,
+    mut buffers: SectionBuffers,
+    interner: &Interner,
+    config: &Config,
+    ts: i64,
+) -> Result<PathBuf> {
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
     let part = buffers
         .flush(&dict_sections, config.source_id)
@@ -1298,11 +1504,177 @@ async fn snapshot_and_seal(
         .append(&part)
         .context("append the part to the journal")?;
 
-    let dest = config.out_dir.join(format!("{}.pgm", ts.0));
+    let dest = config.out_dir.join(format!("{ts}.pgm"));
     seal(journal, &dest).context("seal the segment")?;
     // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
     Ok(dest)
+}
+
+/// Buffer the `pg_stat_wal` singleton; PG10-13 produce no row.
+///
+/// # Errors
+/// Returns an error when the section buffer is full.
+fn push_wal(buffers: &mut SectionBuffers, wal: Option<WalSnapshot>) -> Result<()> {
+    match wal {
+        Some(WalSnapshot::V1(row)) => buffer_row(buffers, row),
+        Some(WalSnapshot::V2(row)) => buffer_row(buffers, row),
+        None => Ok(()),
+    }
+}
+
+/// Buffer the paced `pg_store_plans` read under its fork's section.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_plans_read(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    read: Option<&PlansRead>,
+) -> Result<()> {
+    match read {
+        Some(PlansRead::Vadv(rows)) => push_store_plans(buffers, interner, rows),
+        Some(PlansRead::Ossc(rows)) => push_store_plans_ossc(buffers, interner, rows),
+        None => Ok(()),
+    }
+}
+
+/// Inputs needed to assemble coverage for this snapshot's top-N reads.
+struct CoverageInputs<'a> {
+    tables: SourceCoverage,
+    indexes: SourceCoverage,
+    statements: &'a Option<(StatementsVersion, Vec<StatementsRow>, u64)>,
+    plans: &'a Option<(PlansRead, u64)>,
+}
+
+/// Assemble the `1_023_001` rows for every truncated top-N source.
+fn collect_coverage_records(
+    major: u32,
+    config: &Config,
+    inputs: &CoverageInputs<'_>,
+) -> Vec<CoverageRecord> {
+    let mut records = Vec::new();
+    if inputs.tables.truncated() {
+        records.push(CoverageRecord {
+            source_type_id: user_tables_type_id(major),
+            coverage: inputs.tables,
+            max_n: u32::try_from(config.max_tables).unwrap_or(u32::MAX),
+            order_by: "reads|writes|relpages|n_dead_tup|xid_age|mxid_age",
+            cutoff_value: None,
+        });
+    }
+    if inputs.indexes.truncated() {
+        records.push(CoverageRecord {
+            source_type_id: user_indexes_type_id(major),
+            coverage: inputs.indexes,
+            max_n: u32::try_from(config.max_indexes).unwrap_or(u32::MAX),
+            order_by: user_indexes_order_by(major),
+            cutoff_value: None,
+        });
+    }
+    if let Some(record) = statements_coverage(config, inputs) {
+        records.push(record);
+    }
+    if let Some(record) = plans_coverage(config, inputs) {
+        records.push(record);
+    }
+    records
+}
+
+/// Coverage for the collected `pg_stat_statements` read, if it was truncated.
+///
+/// The total rides in the same statement as the collected rows, so it
+/// describes exactly the population they were cut from.
+fn statements_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<CoverageRecord> {
+    let (version, rows, source_total) = inputs.statements.as_ref()?;
+    let coverage = SourceCoverage {
+        total: *source_total,
+        collected: rows.len() as u64,
+        unknown_total: false,
+        timeouts: 0,
+        permission_skips: 0,
+        other_skips: 0,
+    };
+    coverage.truncated().then(|| CoverageRecord {
+        source_type_id: statements_type_id(*version),
+        coverage,
+        max_n: u32::try_from(config.max_statements).unwrap_or(u32::MAX),
+        order_by: "total_exec_time|calls",
+        cutoff_value: None,
+    })
+}
+
+/// Coverage for the collected `pg_store_plans` read, if it was truncated.
+///
+/// The single selection axis makes the boundary meaningful: `cutoff_value`
+/// is the smallest `total_time` that still made it into the section. The
+/// total rides in the enumeration statement itself.
+fn plans_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<CoverageRecord> {
+    let (read, source_total) = inputs.plans.as_ref()?;
+    let (source_type_id, collected, cutoff_value) = match read {
+        PlansRead::Vadv(rows) => (
+            1_004_001,
+            rows.len() as u64,
+            min_total_time(rows.iter().map(|r| r.total_time)),
+        ),
+        PlansRead::Ossc(rows) => (
+            1_003_001,
+            rows.len() as u64,
+            min_total_time(rows.iter().map(|r| r.total_time)),
+        ),
+    };
+    let coverage = SourceCoverage {
+        total: *source_total,
+        collected,
+        unknown_total: false,
+        timeouts: 0,
+        permission_skips: 0,
+        other_skips: 0,
+    };
+    coverage.truncated().then(|| CoverageRecord {
+        source_type_id,
+        coverage,
+        max_n: u32::try_from(config.max_plans).unwrap_or(u32::MAX),
+        order_by: "total_time",
+        cutoff_value,
+    })
+}
+
+/// The smallest selection metric among the collected rows; `None` when empty.
+fn min_total_time(values: impl Iterator<Item = f64>) -> Option<f64> {
+    values.fold(None, |acc, v| {
+        Some(acc.map_or(v, |a: f64| if v < a { v } else { a }))
+    })
+}
+
+/// Buffer one `1_023_001` row per truncated source.
+///
+/// # Errors
+/// Returns an error if `order_by` cannot be interned (dictionary full) or the
+/// section buffer is full.
+fn push_coverage(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    ts: i64,
+    records: &[CoverageRecord],
+) -> Result<()> {
+    for record in records {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        let row = CollectionCoverageV1 {
+            ts: Ts(ts),
+            source_type_id: record.source_type_id,
+            total: u32::try_from(record.coverage.total).unwrap_or(u32::MAX),
+            unknown_total: record.coverage.unknown_total,
+            collected: u32::try_from(record.coverage.collected).unwrap_or(u32::MAX),
+            max_n: record.max_n,
+            order_by: intern(record.order_by.as_bytes())?,
+            cutoff_value: record.cutoff_value,
+            reason: record.coverage.reason(),
+        };
+        buffer_row(buffers, row)?;
+    }
+    Ok(())
 }
 
 /// The per-segment service rows: reset context, instance fingerprint, and
@@ -1746,6 +2118,47 @@ fn push_instance_metadata(
     buffer_row(buffers, row)
 }
 
+/// Collect the walsender and slot detail rows from the main connection.
+async fn collect_replication_details(
+    client: &Client,
+    major: u32,
+) -> Result<(Vec<ReplicaRow>, Vec<SlotRow>)> {
+    let bounds = collect_replication_detail_bounds(client)
+        .await
+        .context("collect replication detail row bounds")?;
+    validate_replication_detail_bounds(bounds)?;
+    let replicas = collect_replication_replicas(client)
+        .await
+        .context("collect pg_stat_replication")?;
+    let slots = collect_replication_slots(client, major)
+        .await
+        .context("collect pg_replication_slots")?;
+    Ok((replicas, slots))
+}
+
+/// Intern and buffer the `pg_stat_replication` and `pg_replication_slots`
+/// rows.
+///
+/// # Errors
+/// Returns an error if a string cannot be interned (dictionary full) or a
+/// section buffer is full.
+fn push_replication_details(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    replicas: &[ReplicaRow],
+    slots: &[SlotRow],
+) -> Result<()> {
+    for row in replicas {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_replicas_v1(row, &mut intern)?)?;
+    }
+    for row in slots {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_slots_v1(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
 /// Intern each row's strings and buffer it as the `pg_settings` section.
 ///
 /// # Errors
@@ -1823,11 +2236,129 @@ fn push_store_plans_ossc(
 #[cfg(test)]
 mod tests {
     use super::{
+        SourceCoverage, StatementsVersion, min_total_time, statements_type_id,
+        user_indexes_type_id, user_tables_type_id,
+    };
+
+    #[test]
+    fn coverage_reason_ranks_timeouts_over_other_skips() {
+        let top_n = SourceCoverage {
+            total: 100,
+            collected: 50,
+            unknown_total: false,
+            timeouts: 0,
+            permission_skips: 0,
+            other_skips: 0,
+        };
+        assert_eq!(top_n.reason(), 0);
+        assert_eq!(
+            SourceCoverage {
+                other_skips: 2,
+                ..top_n
+            }
+            .reason(),
+            3
+        );
+        assert_eq!(
+            SourceCoverage {
+                unknown_total: true,
+                ..top_n
+            }
+            .reason(),
+            3
+        );
+        assert_eq!(
+            SourceCoverage {
+                permission_skips: 1,
+                other_skips: 2,
+                ..top_n
+            }
+            .reason(),
+            2
+        );
+        assert_eq!(
+            SourceCoverage {
+                timeouts: 1,
+                permission_skips: 1,
+                other_skips: 2,
+                ..top_n
+            }
+            .reason(),
+            1
+        );
+    }
+
+    #[test]
+    fn coverage_truncated_needs_missing_rows_or_skips() {
+        let complete = SourceCoverage {
+            total: 50,
+            collected: 50,
+            unknown_total: false,
+            timeouts: 0,
+            permission_skips: 0,
+            other_skips: 0,
+        };
+        assert!(!complete.truncated());
+        assert!(
+            SourceCoverage {
+                total: 51,
+                ..complete
+            }
+            .truncated()
+        );
+        assert!(
+            SourceCoverage {
+                timeouts: 1,
+                ..complete
+            }
+            .truncated()
+        );
+        assert!(
+            SourceCoverage {
+                unknown_total: true,
+                ..complete
+            }
+            .truncated()
+        );
+        assert!(
+            SourceCoverage {
+                other_skips: 1,
+                ..complete
+            }
+            .truncated()
+        );
+        assert!(
+            !SourceCoverage {
+                total: 40,
+                ..complete
+            }
+            .truncated()
+        );
+    }
+
+    #[test]
+    fn min_total_time_finds_the_boundary() {
+        assert_eq!(min_total_time([3.0, 1.5, 2.0].into_iter()), Some(1.5));
+        assert_eq!(min_total_time(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn type_id_maps_cover_the_supported_majors() {
+        assert_eq!(user_tables_type_id(12), 1_013_001);
+        assert_eq!(user_tables_type_id(13), 1_013_002);
+        assert_eq!(user_tables_type_id(16), 1_013_003);
+        assert_eq!(user_tables_type_id(18), 1_013_004);
+        assert_eq!(user_indexes_type_id(15), 1_014_001);
+        assert_eq!(user_indexes_type_id(16), 1_014_002);
+        assert_eq!(statements_type_id(StatementsVersion::V6), 1_002_006);
+    }
+
+    use super::{
         CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
         activity_dict_limits, push_activity, push_archiver, push_database, push_io, push_locks,
         push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
         push_user_indexes, push_user_tables, validate_cardinality, validate_heavy_cap,
-        validate_max_lock_rows, validate_settings_row_count,
+        validate_max_lock_rows, validate_replication_detail_bounds, validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
@@ -1836,8 +2367,9 @@ mod tests {
     use kronika_source_pg::locks::{LocksRow, LocksVersion};
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
+    use kronika_source_pg::replication_details::ReplicationDetailBounds;
     use kronika_source_pg::replication_instance::ReplicationInstanceRow;
-    use kronika_source_pg::statements::{StatementsRow, StatementsVersion};
+    use kronika_source_pg::statements::StatementsRow;
     use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion};
     use kronika_source_pg::user_tables::{UserTablesRow, UserTablesVersion};
     use kronika_source_pg::{ActivityRow, ActivityVersion};
@@ -2606,6 +3138,49 @@ mod tests {
     fn max_lock_rows_validation_rejects_zero() {
         let err = validate_max_lock_rows(0).expect_err("zero disables the graph guard");
         assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn replication_detail_bounds_accept_defaults() {
+        let bounds = ReplicationDetailBounds {
+            max_wal_senders: 10,
+            max_replication_slots: 10,
+        };
+        assert!(validate_replication_detail_bounds(bounds).is_ok());
+    }
+
+    #[test]
+    fn replication_detail_bounds_reject_section_overflow() {
+        let cap = i64::try_from(MAX_SECTION_ROWS).unwrap();
+        let bounds = ReplicationDetailBounds {
+            max_wal_senders: cap + 1,
+            max_replication_slots: 10,
+        };
+        let err = validate_replication_detail_bounds(bounds)
+            .expect_err("max_wal_senders above the section cap must be rejected");
+        assert!(err.to_string().contains("max_wal_senders"));
+    }
+
+    #[test]
+    fn replication_detail_bounds_reject_negative_guc() {
+        let bounds = ReplicationDetailBounds {
+            max_wal_senders: 10,
+            max_replication_slots: -1,
+        };
+        let err = validate_replication_detail_bounds(bounds)
+            .expect_err("negative max_replication_slots must be rejected");
+        assert!(err.to_string().contains("non-negative"));
+    }
+
+    #[test]
+    fn replication_detail_bounds_reject_dictionary_overflow() {
+        let bounds = ReplicationDetailBounds {
+            max_wal_senders: 60_000,
+            max_replication_slots: 40_000,
+        };
+        let err = validate_replication_detail_bounds(bounds)
+            .expect_err("combined replication labels must fit the dictionary cap");
+        assert!(err.to_string().contains("dictionary bytes"));
     }
 
     fn locks_root_row() -> LocksRow {
