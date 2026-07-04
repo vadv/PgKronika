@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, BufReader, Lines};
@@ -31,6 +31,8 @@ pub(crate) struct Collector {
     stderr_task: JoinHandle<()>,
     /// Keep the output directory alive until the harness retains it for the scenario.
     out_dir: Option<tempfile::TempDir>,
+    /// Segments the collector sealed on startup from a recovered journal.
+    recovered_seals: Vec<PathBuf>,
 }
 
 impl Collector {
@@ -40,9 +42,19 @@ impl Collector {
         cluster: &Cluster,
         extra_env: &[(String, String)],
     ) -> Result<Self> {
+        let out_dir = tempfile::tempdir().context("create the collector output directory")?;
+        Self::spawn_with_env_in(cluster, extra_env, out_dir).await
+    }
+
+    /// Spawn into an existing output directory — the restart path, where the
+    /// new process must find the previous journal.
+    pub(crate) async fn spawn_with_env_in(
+        cluster: &Cluster,
+        extra_env: &[(String, String)],
+        out_dir: tempfile::TempDir,
+    ) -> Result<Self> {
         let bin =
             std::env::var("KRONIKA_COLLECTOR_BIN").context("KRONIKA_COLLECTOR_BIN is not set")?;
-        let out_dir = tempfile::tempdir().context("create the collector output directory")?;
         let mut cmd = Command::new(&bin);
         cmd.env("KRONIKA_PG_DSN", cluster.conn_string())
             .env("KRONIKA_OUT_DIR", out_dir.path())
@@ -70,13 +82,25 @@ impl Collector {
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let stderr_task = spawn_stderr_drain(stderr_pipe, Arc::clone(&stderr));
         let mut lines = BufReader::new(stdout).lines();
-        expect_line(&mut lines, "ready").await?;
+        // Recovery seals are announced before "ready".
+        let mut recovered_seals = Vec::new();
+        loop {
+            let line = next_line(&mut lines).await?;
+            if line == "ready" {
+                break;
+            }
+            recovered_seals.push(
+                parse_sealed(&line)
+                    .with_context(|| format!("expected 'ready' or a seal, got {line:?}"))?,
+            );
+        }
         Ok(Self {
             child,
             lines,
             stderr,
             stderr_task,
             out_dir: Some(out_dir),
+            recovered_seals,
         })
     }
 
@@ -91,10 +115,30 @@ impl Collector {
     /// without sending a signal — the internal-timer path.
     pub(crate) async fn wait_sealed(&mut self) -> Result<PathBuf> {
         let line = next_line(&mut self.lines).await?;
-        let path = line
-            .strip_prefix("sealed ")
-            .with_context(|| format!("expected 'sealed <path>' from collector, got {line:?}"))?;
-        Ok(PathBuf::from(path))
+        parse_sealed(&line)
+    }
+
+    /// Segments the collector sealed on startup from a recovered journal.
+    pub(crate) fn recovered_seals(&self) -> &[PathBuf] {
+        &self.recovered_seals
+    }
+
+    /// Raw size of the open journal file, `0` before the first window.
+    pub(crate) fn journal_len(&self) -> u64 {
+        self.out_dir
+            .as_ref()
+            .and_then(|dir| std::fs::metadata(dir.path().join("active.parts")).ok())
+            .map_or(0, |meta| meta.len())
+    }
+
+    /// Kill the collector without any chance to seal, keeping its output
+    /// directory for the process that restarts in it.
+    pub(crate) async fn kill_abruptly(mut self) -> Result<tempfile::TempDir> {
+        self.child.start_kill().context("SIGKILL the collector")?;
+        self.child.wait().await.context("reap the collector")?;
+        self.out_dir
+            .take()
+            .context("output directory already taken")
     }
 
     /// The collector's stderr captured so far, decoded lossily.
@@ -140,13 +184,15 @@ fn spawn_stderr_drain(mut stderr: ChildStderr, sink: Arc<Mutex<Vec<u8>>>) -> Joi
     })
 }
 
-async fn expect_line(lines: &mut ChildLines, want: &str) -> Result<()> {
-    let line = next_line(lines).await?;
-    ensure!(
-        line == want,
-        "expected {want:?} from collector, got {line:?}"
-    );
-    Ok(())
+/// Extract the segment path from a `sealed <path> reason=<reason>` line.
+fn parse_sealed(line: &str) -> Result<PathBuf> {
+    let rest = line
+        .strip_prefix("sealed ")
+        .with_context(|| format!("expected 'sealed <path> reason=...', got {line:?}"))?;
+    let (path, _reason) = rest
+        .rsplit_once(" reason=")
+        .with_context(|| format!("seal announcement without a reason: {line:?}"))?;
+    Ok(PathBuf::from(path))
 }
 
 async fn next_line(lines: &mut ChildLines) -> Result<String> {

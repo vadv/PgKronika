@@ -232,6 +232,15 @@ impl Journal {
         Ok((journal, report))
     }
 
+    /// Bytes currently occupying the journal file, including damaged regions.
+    ///
+    /// The collector compares this raw frame length with its segment byte cap
+    /// before packing the segment.
+    #[must_use]
+    pub const fn bytes(&self) -> usize {
+        self.end
+    }
+
     /// Append one part as a frame and sync the file.
     ///
     /// # Errors
