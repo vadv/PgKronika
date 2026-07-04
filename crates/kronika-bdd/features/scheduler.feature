@@ -14,6 +14,10 @@ Feature: The scheduler paces sources by their own intervals
   pool sources (statements, tables, indexes) run under a per-cycle
   database-time budget: a source over the budget moves to the next tick,
   where it runs unconditionally — deferral never becomes starvation.
+  Triggers read the rows already collected: lock waiters or active-backend
+  pressure accelerate the activity pace, replication lag or retained WAL
+  accelerate the replication pace, and the pace relaxes when the condition
+  clears.
 
   @pg17 @serial
   Scenario: later ticks skip sources that are not due
@@ -90,6 +94,27 @@ Feature: The scheduler paces sources by their own intervals
     When the collector is killed mid-segment and restarted
     Then timer segment 1 has section 1_001_003
     And timer segment 1 has section 1_019_001
+
+  @pg15 @serial
+  Scenario: a lock wait accelerates the activity pace
+    Given a fresh database on PostgreSQL 15
+    And a database seeded with:
+      """
+      CREATE TABLE kronika_pace_probe(id int);
+      """
+    And session "H" runs and holds its transaction open:
+      """
+      LOCK TABLE kronika_pace_probe IN ACCESS EXCLUSIVE MODE
+      """
+    And session "W" runs and blocks:
+      """
+      SELECT count(*) FROM kronika_pace_probe
+      """
+    And the collector runs with env "KRONIKA_INTERVAL_S" = "1"
+    And the collector runs with env "KRONIKA_PG_ACTIVITY_FAST_INTERVAL_S" = "0"
+    And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "4"
+    When the collector runs on its own timer until 1 segment is sealed
+    Then timer segment 1 section 1_001_003 contains at least 3 snapshots
 
   @pg17 @serial
   Scenario: the cycle budget defers sized sources and repays them next tick
