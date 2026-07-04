@@ -367,6 +367,16 @@ impl HarnessState {
         // vmstat — all fields optional; provide a minimal pair so the file is non-empty.
         self.write_proc_fixture("vmstat", "pgpgin 0\npgpgout 0\n")?;
 
+        // Host identity for instance_metadata (1_021), which also reads through
+        // KRONIKA_PROC_ROOT since Task 1 — its reads are a hard error, so the
+        // fixture must carry these or the whole snapshot fails.
+        self.write_proc_fixture("sys/kernel/hostname", "bdd-fixture-host\n")?;
+        self.write_proc_fixture("sys/kernel/osrelease", "6.1.0-fixture\n")?;
+        self.write_proc_fixture(
+            "sys/kernel/random/boot_id",
+            "00000000-0000-0000-0000-000000000000\n",
+        )?;
+
         Ok(())
     }
 
