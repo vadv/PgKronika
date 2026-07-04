@@ -26,6 +26,7 @@ use crate::contract::{ColumnType, TypeContract};
 pub mod bgwriter_checkpointer;
 pub mod collection_coverage;
 pub mod instance_metadata;
+pub mod os_cpu;
 pub mod pg_locks;
 pub mod pg_prepared_xacts;
 pub mod pg_settings;

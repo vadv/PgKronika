@@ -9,5 +9,8 @@ pub use fs::ProcFs;
 mod instance;
 pub use instance::{OsInstanceFacts, collect_os_instance_facts};
 
+pub mod proc;
+pub use proc::stat::{CpuRow, ParseError, parse_cpu};
+
 mod scope;
 pub use scope::{OsScope, detect_container};
