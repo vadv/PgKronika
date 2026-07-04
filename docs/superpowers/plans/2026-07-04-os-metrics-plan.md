@@ -12,6 +12,87 @@
 реализации и вопросы, которые нужно утвердить до кодового PR. В этом PR не
 нужно включать полноценный сбор OS-метрик.
 
+## 0. Решения брейнсторма 2026-07-04
+
+Раздел добавлен после совместного обсуждения. Он утверждает то, что раньше
+было открытыми вопросами, и уточняет модель диска, ранее описанную
+поверхностно.
+
+### 0.1 Scope — обязательное свойство каждой строки, не режим коллектора
+
+Главная боль предыдущего инструмента: метрики Kubernetes-ноды снимались
+вместе с pod, и в интерфейсе смешивались — host-wide числа (`MemTotal` всей
+ноды, host `loadavg`) показывались там, где ожидались метрики pod, давая
+пугающие и ложные значения.
+
+Решение-инвариант: **scope — свойство каждого источника, а не один флаг на
+весь коллектор**. Один и тот же docker-запуск даёт разным файлам разный
+scope, потому что их изолируют разные namespace:
+
+- `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`, `/proc/vmstat` — протекают
+  host-wide (cgroup-лимиты в них не отражаются) → `scope=host`;
+- `/proc/net/*` — сеть pod через net namespace → `scope=pod_net`;
+- `/proc/PID/*` — процессы pod через pid namespace → `scope=pod`;
+- cgroup (`memory.max`, `cpu.max`, throttling) — и есть pod-правда →
+  `scope=container`.
+
+Механика: **каждая OS-строка несёт колонку `scope` — 1-байтовый `u8`-enum**:
+`0=host`, `1=pod`, `2=pod_net`, `3=container`, `4=unknown`. Reader
+разворачивает в лейбл. Строка самодостаточна: UI не может спутать host-число
+с pod-числом, потому что метка вшита в данные, а не додумывается интерфейсом.
+Если детекция контейнера неуверенная — `scope=unknown`, коллектор не врёт и
+не выдаёт host-число за pod.
+
+### 0.2 Модель диска — mountinfo-фильтр (перенято из rpglot 1:1) + роль через SQL
+
+Проверено по исходникам rpglot
+(`rpglot-core/src/collector/procfs/parser/disk.rs`, `system.rs`,
+`collector.rs`, `util/container.rs`): атрибуция «дисков pod» делается **чисто
+через mountinfo контейнера, без обращения к PostgreSQL**. Это правильный
+подход, и он перенимается целиком:
+
+1. читать `/proc/self/mountinfo` → карта `(major:minor) → mount_paths`;
+   `major=0` псевдо-устройства (overlay/proc/sysfs) пропускать;
+2. реальные `major=0` (btrfs/ZFS с источником `/dev/xxx`) резолвить через
+   `<sys_root>/class/block/{dev}/dev`;
+3. в контейнере оставить `(major,minor)`, у которых **хотя бы один** путь НЕ
+   k8s-infra bind-mount (список: `/etc/hosts`, `/etc/hostname`,
+   `/etc/resolv.conf`, `/dev/termination-log`, `/run/secrets/`,
+   `/var/run/secrets/`); устройства, чьи ВСЕ пути инфраструктурные,
+   выбросить — они с root-диска ноды, и `/proc/diskstats` на них показал бы
+   I/O всей ноды (ложные алерты);
+4. `1_108 diskstats` фильтруется по этому множеству. Метка **`scope=host`**:
+   это устройства, которые pod реально использует, но счётчики на них =
+   нагрузка всех потребителей устройства, не только pod;
+5. `1_203 cgroup io.stat` собирается **отдельной** секцией с меткой
+   **`scope=container`** — точный вклад pod. Две метки рядом: «saturation
+   железа» (diskstats) и «I/O pod» (cgroup) больше не смешиваются.
+
+mountinfo-подход автоматически покрывает то, что чистый SQL-подход пропустил
+бы: **WAL на отдельном volume, логи на отдельном volume, temp** — всё, что
+физически смонтировано в pod, видно в mountinfo сразу, без знания
+PostgreSQL-конфигурации.
+
+**Обогащение роли (утверждено, опциональный слой поверх базы, не механизм
+обнаружения):** для чисто-PG-инструмента диагностически ценно знать, какое
+устройство несёт что. Поверх mountinfo-множества коллектор помечает роль
+устройства через SQL: `SHOW data_directory`, реальный путь `pg_wal` (с
+разыменованием симлинка), `log_directory`, `temp_tablespaces`,
+`pg_tablespace_location(oid)` → каждый путь резолвится в `(major,minor)` через
+ту же mountinfo-карту → устройству ставится роль (`data`/`wal`/`log`/`temp`).
+Это позволяет UI различать «затык WAL-диска» и «затык data-диска». rpglot
+этого не делал (он приложение-агностик); роль — дополнение, коллектор без неё
+всё равно корректно атрибутирует диски. Джойн роли делает коллектор (у него
+на руках оба канала — procfs и SQL); `kronika-source-os` остаётся procfs-only
+и отдаёт сырой mountinfo + diskstats.
+
+### 0.3 Открыто для следующего шага брейнсторма
+
+Ещё не утверждено (обсудим отдельно): расхождение таймингов (этот план —
+10 с база для Wave 1/2; ранее утверждённый тайминг-план — 5 с hot-path
+procfs); порядок первого implementation PR (Option A vs Option B); cmdline
+default; setfsuid; глубина обхода cgroup-дерева.
+
 ## 1. Текущее состояние PgKronika после latest main
 
 ### Что уже закрыто в SQL-поле
@@ -575,11 +656,12 @@ degraded log.
 ### `1_108_001` diskstats from `/proc/diskstats`
 
 Источник: `/proc/diskstats`, дополнительно `/proc/self/mountinfo` и
-configured `sys_root` path like `/sys/class/block/*/dev` для container
-filtering and major=0 resolution.
+configured `sys_root` path `<sys_root>/class/block/*/dev` для container
+filtering and `major=0` resolution.
 
 Поля: modern diskstats layout including reads/writes, sectors, times,
-in-progress, weighted time, optional discard and flush fields.
+in-progress, weighted time, optional discard and flush fields; плюс колонка
+`scope` (`u8`, см. раздел 0.1).
 
 Единицы:
 
@@ -599,14 +681,34 @@ Nullable: discard/flush columns `NULL` on older kernels.
 
 Права: обычное чтение.
 
-Контейнеры/pods:
+Scope: **`host`**. Даже после mountinfo-фильтрации это устройства, которые pod
+реально использует, но счётчики на них — нагрузка всех потребителей
+устройства, не только pod. Точный вклад pod — в `1_203_001` (cgroup io,
+`scope=container`). Две метки идут рядом и не смешиваются.
 
-- в контейнере нельзя blindly писать все host devices;
-- применить rpglot-подход: соотнести devices с mountinfo текущего namespace;
-- отфильтровать Kubernetes infra bind-mounts;
-- для btrfs/ZFS major=0 пробовать resolve через configured `sys_root`;
-- node diskstats из pod разрешать только при явном host proc/sys mount and
-  `scope=node`.
+Атрибуция дисков pod (перенято из rpglot 1:1, проверено по исходникам —
+см. раздел 0.2):
+
+1. `/proc/self/mountinfo` → карта `(major:minor) → mount_paths`; `major=0`
+   псевдо-устройства (overlay/proc/sysfs) пропускать;
+2. реальные `major=0` (btrfs/ZFS, источник `/dev/xxx`) резолвить через
+   `<sys_root>/class/block/{dev}/dev`;
+3. в контейнере (детекция — раздел 4) оставить `(major,minor)`, у которых
+   **хотя бы один** путь НЕ k8s-infra bind-mount (`/etc/hosts`,
+   `/etc/hostname`, `/etc/resolv.conf`, `/dev/termination-log`,
+   `/run/secrets/`, `/var/run/secrets/`); устройства, чьи ВСЕ пути
+   инфраструктурные, выбросить — иначе `/proc/diskstats` покажет I/O всей
+   ноды;
+4. отфильтровать diskstats по этому множеству;
+5. вне контейнера — писать все устройства как есть, `scope=host` (это и есть
+   правда про машину).
+
+Роль устройства (опциональное обогащение, раздел 0.2): коллектор через SQL
+(`SHOW data_directory`, разыменованный `pg_wal`, `log_directory`,
+`temp_tablespaces`, `pg_tablespace_location`) резолвит пути данных в
+`(major,minor)` по той же mountinfo-карте и ставит устройству роль
+(`data`/`wal`/`log`/`temp`). Роль — дополнение поверх атрибуции, не механизм
+обнаружения; без неё диски всё равно собираются корректно.
 
 Деградация: если cap сработал, не выдавать partial full. Лучше пропустить
 секцию и логировать `reason=cardinality_cap`, затем добавить coverage/event в
@@ -927,7 +1029,8 @@ reset by collector-side interpretation.
 - `blkio.throttle.io_service_bytes` or `blkio.io_service_bytes`;
 - `blkio.throttle.io_serviced` or `blkio.io_serviced`.
 
-Поля: `cgroup_path`, `major`, `minor`, `rbytes`, `wbytes`, `rios`, `wios`.
+Поля: `cgroup_path`, `major`, `minor`, `rbytes`, `wbytes`, `rios`, `wios`;
+плюс колонка `scope` (`u8`).
 
 Единицы: bytes and operation counts.
 
@@ -940,6 +1043,12 @@ reset by collector-side interpretation.
 
 Nullable: no fake zeros for absent controller; missing device line means absent
 row.
+
+Scope: **`container`** — это точный вклад pod в I/O по устройствам, ядро
+атрибутирует его cgroup'у. Парная секция к `1_108` (diskstats, `scope=host`):
+diskstats показывает saturation устройства всеми потребителями, cgroup io —
+долю pod. Reader сопоставляет их по `(major,minor)`, но метки хранятся раздельно
+и не смешиваются.
 
 Деградация: cap or timeout means skip section and log coverage gap.
 
@@ -1416,7 +1525,16 @@ Acceptance:
 
 ## 11. Risks and approval questions
 
-Approval needed:
+Утверждено брейнстормом 2026-07-04 (раздел 0), убрано из открытых вопросов:
+
+- **Scope** (бывшие вопросы 6 и 9): scope — обязательная 1-байтовая `u8`-колонка
+  в каждой OS-строке, вычисляется per-source; host-числа никогда не выдаются за
+  pod; неуверенная детекция → `unknown`. См. 0.1.
+- **Модель диска**: mountinfo-фильтр из rpglot (проверено) как база
+  атрибуции + SQL-обогащение роли устройства (`data`/`wal`/`log`/`temp`) как
+  опциональный слой. См. 0.2.
+
+Остаются открытыми:
 
 1. Нумерация: подтвердить, что OS остается в `1_100/1_200`, а не переносится в
    `2_0xx`.
@@ -1428,20 +1546,16 @@ Approval needed:
    отказе, или сразу включать controlled `setfsuid` retry?
 5. Cgroup scope: обходить все дерево под configured root или начать с self
    cgroup plus children?
-6. Pod/node scope: в обычном pod собирать только truthful pod/container scope и
-   считать node metrics unavailable, пока не задан явный host proc/sys mount?
 7. Node deployment contract: нужен ли официально поддержанный DaemonSet/sidecar
    mode с `hostPID`, read-only hostPath `/proc`/`/sys`, and documented security
    context, или node-level OS metrics остаются вне default deployment?
 8. Cgroup target: для pod deployment считать главным collector cgroup,
    PostgreSQL target cgroup, pod-parent cgroup, or explicit configured cgroup?
-9. Container semantics: считать `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`
-   scoped by configured `proc_root` and never call them node metrics without
-   explicit node scope?
 10. Diagnostics: в первом кодовом PR достаточно structured logs или сразу
    вводить event/degradation section?
-11. Intervals: принять стартовые 10s для Wave 1/2, 5s process hot set, 30s
-   process extended and mapping?
+11. Intervals: **расхождение к разрешению** — этот план предлагает 10s база для
+   Wave 1/2, но ранее утверждённый тайминг-план задаёт 5s hot-path procfs
+   (cpu/meminfo/vmstat/PSI/diskstats/net). Свести к одному решению.
 12. Порядок первого implementation PR: Option A, low-cardinality Wave 1 with
    strict scope metadata, или Option B, process+cgroup earlier because pod
    deployments need backend join and cgroup throttling/OOM before host
