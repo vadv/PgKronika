@@ -2,5 +2,6 @@
 
 pub mod loadavg;
 pub mod meminfo;
+pub mod pressure;
 pub mod stat;
 pub mod vmstat;
