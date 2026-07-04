@@ -10,7 +10,10 @@ Feature: The scheduler paces sources by their own intervals
   every-tick sources use interval 0. The open segment lives as a journal
   file in the output directory: a restarted collector seals whatever
   windows it finds there before collecting, and a journal that hits its
-  own byte cap seals the open segment early instead of failing.
+  own byte cap seals the open segment early instead of failing. The sized
+  pool sources (statements, tables, indexes) run under a per-cycle
+  database-time budget: a source over the budget moves to the next tick,
+  where it runs unconditionally — deferral never becomes starvation.
 
   @pg17 @serial
   Scenario: later ticks skip sources that are not due
@@ -87,6 +90,23 @@ Feature: The scheduler paces sources by their own intervals
     When the collector is killed mid-segment and restarted
     Then timer segment 1 has section 1_001_003
     And timer segment 1 has section 1_019_001
+
+  @pg17 @serial
+  Scenario: the cycle budget defers sized sources and repays them next tick
+    Given a fresh database on PostgreSQL 17
+    And a database seeded with:
+      """
+      CREATE TABLE kronika_budget_probe(id int);
+      """
+    And the collector runs with env "KRONIKA_INTERVAL_S" = "1"
+    And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "0"
+    And the collector runs with env "KRONIKA_CYCLE_DB_BUDGET_MS" = "1"
+    And the collector runs with env "KRONIKA_SEGMENT_MAX_BYTES" = "1"
+    When the collector runs on its own timer until 2 segments are sealed
+    Then timer segment 1 has section 1_001_003
+    And timer segment 1 has section 1_019_001
+    And timer segment 1 is missing section 1_013_003
+    And timer segment 2 has section 1_013_003
 
   @pg15 @serial
   Scenario: a one-byte size cap seals each timer tick

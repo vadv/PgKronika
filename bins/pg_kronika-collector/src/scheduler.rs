@@ -178,17 +178,26 @@ impl Scheduler {
         }
     }
 
+    /// Put a planned-but-unread source back: it comes due on the next tick.
+    pub(crate) fn defer(&mut self, kind: SourceKind) {
+        self.last_read[slot_of(kind)] = None;
+    }
+
     /// The due set for a tick at `now`.
     ///
     /// A source is due when it has never been read or its interval elapsed.
     /// `force` marks everything due — the SIGUSR2 contract. Due sources are
     /// immediately marked read: a failed read retries after its interval,
-    /// not on the next tick.
+    /// not on the next tick. The two heaviest sized sources do not share an
+    /// unforced tick: when tables and indexes come due together, indexes
+    /// yields to the next tick — except on its first-ever read, so the first
+    /// window stays self-contained.
     pub(crate) fn plan(&mut self, now: Instant, force: bool) -> DueSet {
         if force {
             self.last_read = [Some(now); ALL_SOURCES.len()];
             return DueSet::all();
         }
+        let indexes_read_before = self.last_read[slot_of(SourceKind::UserIndexes)].is_some();
         let mut kinds = Vec::new();
         for (slot, kind) in ALL_SOURCES.iter().enumerate() {
             let interval = Duration::from_secs(self.intervals.of(*kind));
@@ -199,11 +208,29 @@ impl Scheduler {
                 kinds.push(*kind);
             }
         }
+        // An explicit zero interval is an operator's "every tick" and is
+        // exempt from phase separation.
+        if indexes_read_before
+            && self.intervals.user_indexes > 0
+            && kinds.contains(&SourceKind::UserTables)
+            && kinds.contains(&SourceKind::UserIndexes)
+        {
+            kinds.retain(|kind| *kind != SourceKind::UserIndexes);
+            self.defer(SourceKind::UserIndexes);
+        }
         DueSet {
             kinds,
             forced: false,
         }
     }
+}
+
+/// Index of `kind` in [`ALL_SOURCES`] and every parallel array.
+fn slot_of(kind: SourceKind) -> usize {
+    ALL_SOURCES
+        .iter()
+        .position(|candidate| *candidate == kind)
+        .expect("ALL_SOURCES lists every kind")
 }
 
 #[cfg(test)]
@@ -330,5 +357,61 @@ mod tests {
                 .plan(start + Duration::from_secs(1), false)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_deferred_source_comes_due_on_the_next_tick() {
+        let mut scheduler = Scheduler::new(uniform(1000));
+        let start = Instant::now();
+        scheduler.plan(start, false); // first tick: everything read
+        scheduler.defer(SourceKind::UserTables);
+        let next = scheduler.plan(start + Duration::from_secs(1), false);
+        assert!(next.has(SourceKind::UserTables));
+        assert!(
+            !next.has(SourceKind::UserIndexes),
+            "only the deferred source returns"
+        );
+    }
+
+    #[test]
+    fn indexes_yield_when_tables_share_the_tick() {
+        let mut intervals = uniform(1000);
+        intervals.user_tables = 30;
+        intervals.user_indexes = 60;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+
+        let first = scheduler.plan(start, false);
+        assert!(
+            first.has(SourceKind::UserTables) && first.has(SourceKind::UserIndexes),
+            "the first window carries both sized sources"
+        );
+
+        let at_60 = scheduler.plan(start + Duration::from_mins(1), false);
+        assert!(at_60.has(SourceKind::UserTables));
+        assert!(
+            !at_60.has(SourceKind::UserIndexes),
+            "indexes yield the shared tick"
+        );
+
+        let at_61 = scheduler.plan(start + Duration::from_secs(61), false);
+        assert!(!at_61.has(SourceKind::UserTables));
+        assert!(
+            at_61.has(SourceKind::UserIndexes),
+            "indexes run one tick later"
+        );
+    }
+
+    #[test]
+    fn a_zero_indexes_interval_is_exempt_from_phase_separation() {
+        let mut intervals = uniform(1000);
+        intervals.user_tables = 0;
+        intervals.user_indexes = 0;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+        scheduler.plan(start, false);
+        let next = scheduler.plan(start + Duration::from_secs(1), false);
+        assert!(next.has(SourceKind::UserTables));
+        assert!(next.has(SourceKind::UserIndexes));
     }
 }
