@@ -179,7 +179,7 @@ use logging::{
 };
 use scheduler::{DueSet, Intervals, Scheduler, SourceKind};
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
@@ -2306,6 +2306,27 @@ impl OsSources {
     }
 }
 
+fn read_optional_os_file(fs: &ProcFs, rel: &'static str, type_id: u32) -> Option<String> {
+    match fs.read_raw(rel) {
+        Ok(content) => Some(content),
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(err) => {
+            log_event(
+                LogLevel::Warn,
+                "collection_degraded",
+                &[
+                    field("collection", section_name(type_id)),
+                    field("type_id", type_id),
+                    field("layout_id", layout_id(type_id)),
+                    field("source", rel),
+                    field("reason", &err),
+                ],
+            );
+            None
+        }
+    }
+}
+
 /// Read the six procfs-core OS sections synchronously.
 ///
 /// All reads are gated on `due.has(SourceKind::OsCore)`. On file read or parse
@@ -2524,9 +2545,9 @@ fn collect_os_sources(fs: &ProcFs, scope: u8, ts: i64, due: &DueSet) -> OsSource
     {
         let type_id = 1_107_001_u32;
         let started = Instant::now();
-        let psi_cpu = fs.read_raw("pressure/cpu").ok();
-        let psi_memory = fs.read_raw("pressure/memory").ok();
-        let psi_io = fs.read_raw("pressure/io").ok();
+        let psi_cpu = read_optional_os_file(fs, "pressure/cpu", type_id);
+        let psi_memory = read_optional_os_file(fs, "pressure/memory", type_id);
+        let psi_io = read_optional_os_file(fs, "pressure/io", type_id);
         match parse_pressure(
             psi_cpu.as_deref(),
             psi_memory.as_deref(),
@@ -2535,8 +2556,22 @@ fn collect_os_sources(fs: &ProcFs, scope: u8, ts: i64, due: &DueSet) -> OsSource
         ) {
             Ok(rows) => {
                 let n = rows.len();
-                os.psi = rows.into_iter().map(|r| r.to_section(scope)).collect();
-                log_collection_finish(type_id, "procfs", n, started.elapsed());
+                if n == 0 {
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_degraded",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "pressure/{cpu,memory,io}"),
+                            field("reason", "no pressure files available"),
+                        ],
+                    );
+                } else {
+                    os.psi = rows.into_iter().map(|r| r.to_section(scope)).collect();
+                    log_collection_finish(type_id, "procfs", n, started.elapsed());
+                }
             }
             Err(err) => {
                 log_event(

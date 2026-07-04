@@ -20,25 +20,25 @@ pub struct OsPsi {
     #[column(l)]
     pub resource: u8,
     /// Fraction of time tasks stalled (some) over the last 10 s.
-    #[column(c)]
+    #[column(g)]
     pub some_avg10: f64,
     /// Fraction of time tasks stalled (some) over the last 60 s.
-    #[column(c)]
+    #[column(g)]
     pub some_avg60: f64,
     /// Fraction of time tasks stalled (some) over the last 300 s.
-    #[column(c)]
+    #[column(g)]
     pub some_avg300: f64,
     /// Cumulative stall time (some), microseconds.
     #[column(c)]
     pub some_total: i64,
     /// Fraction of time tasks stalled (full) over the last 10 s. `None` for cpu.
-    #[column(c)]
+    #[column(g)]
     pub full_avg10: Option<f64>,
     /// Fraction of time tasks stalled (full) over the last 60 s. `None` for cpu.
-    #[column(c)]
+    #[column(g)]
     pub full_avg60: Option<f64>,
     /// Fraction of time tasks stalled (full) over the last 300 s. `None` for cpu.
-    #[column(c)]
+    #[column(g)]
     pub full_avg300: Option<f64>,
     /// Cumulative stall time (full), microseconds. `None` for cpu.
     #[column(c)]
@@ -51,7 +51,7 @@ pub struct OsPsi {
 #[cfg(test)]
 mod tests {
     use super::OsPsi;
-    use crate::{Section, Ts, VerifiedSection, lint};
+    use crate::{ColumnClass, Section, Ts, VerifiedSection, lint};
 
     fn cpu_row(ts: i64) -> OsPsi {
         OsPsi {
@@ -98,6 +98,18 @@ mod tests {
         assert_eq!(c.column("full_avg10").map(|col| col.nullable), Some(true));
         assert_eq!(c.column("full_total").map(|col| col.nullable), Some(true));
         assert_eq!(c.column("some_avg10").map(|col| col.nullable), Some(false));
+        assert_eq!(
+            c.column("some_avg10").map(|col| col.class),
+            Some(ColumnClass::Gauge)
+        );
+        assert_eq!(
+            c.column("full_avg10").map(|col| col.class),
+            Some(ColumnClass::Gauge)
+        );
+        assert_eq!(
+            c.column("some_total").map(|col| col.class),
+            Some(ColumnClass::Cumulative)
+        );
         assert_eq!(c.column("scope").map(|col| col.nullable), Some(false));
     }
 

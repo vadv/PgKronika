@@ -201,7 +201,7 @@ impl StatMiscRow {
             processes: self.processes,
             procs_running: self.procs_running,
             procs_blocked: self.procs_blocked,
-            btime: self.btime,
+            btime: Ts(self.btime),
             scope,
         }
     }
@@ -298,7 +298,7 @@ mod tests {
             .to_section(0);
         assert_eq!(section.ts.0, 9_999);
         assert_eq!(section.ctxt, 12_345);
-        assert_eq!(section.btime, 1_700_000_000_000_000);
+        assert_eq!(section.btime.0, 1_700_000_000_000_000);
         assert_eq!(section.processes, 42);
         assert_eq!(section.procs_running, 3);
         assert_eq!(section.procs_blocked, 1);

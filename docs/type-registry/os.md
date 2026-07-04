@@ -143,7 +143,7 @@ nonvoluntary_ctxt_switches  i64   C
 
 ```text
 ts          ts   T
-cpu_id      i32? L   // NULL = агрегатная строка "cpu"
+cpu_id      i32  L   // -1 = агрегатная строка "cpu"
 user        i64  C
 nice        i64  C
 system      i64  C
@@ -154,6 +154,7 @@ softirq     i64  C
 steal       i64  C
 guest       i64  C
 guest_nice  i64  C
+scope       u8   L   // 0=host в Wave 1
 ```
 
 Значения хранятся в единицах планировщика (`ticks`).
@@ -164,58 +165,46 @@ guest_nice  i64  C
 ts             ts   T
 ctxt           i64  C
 processes      i64  C   // forks
-procs_running  i32  G
-procs_blocked  i32  G
-btime          ts   L
+procs_running  i64  G
+procs_blocked  i64  G
+btime          ts   G   // unix microseconds
+scope          u8   L   // 0=host в Wave 1
 ```
 
 `procs_blocked` полезен как быстрый индикатор D-state и возможного IO-затыка.
 
 ## `1_104_001` `/proc/meminfo`
 
-Новая версия пишет широкий набор необязательных ключей. Ключи, отсутствующие в ядре,
-пишутся как `NULL`. Значения в КБ, кроме `HugePages_*`, где исходное значение
-измеряется в штуках.
+Wave 1 пишет поля ниже. `MemTotal` обязателен; остальные ключи, отсутствующие в
+ядре, пишутся как `NULL`. Значения в КБ, кроме `HugePages_*`, где исходное
+значение измеряется в штуках.
 
 ```text
-ts                ts   T
-mem_total         i64  G
-mem_free          i64  G
-mem_available     i64  G
-buffers           i64  G
-cached            i64  G
-swap_cached       i64  G
-active            i64  G
-inactive          i64  G
-active_anon       i64  G
-inactive_anon     i64  G
-active_file       i64  G
-inactive_file     i64  G
-unevictable       i64  G
-mlocked           i64  G
-swap_total        i64  G
-swap_free         i64  G
-dirty             i64  G
-writeback         i64  G
-anon_pages        i64  G
-mapped            i64  G
-shmem             i64  G
-kreclaimable      i64  G
-slab              i64  G
-s_reclaimable     i64  G
-s_unreclaim       i64  G
-kernel_stack      i64  G
-page_tables       i64  G
-commit_limit      i64  G
-committed_as      i64  G
-vmalloc_total     i64  G
-vmalloc_used      i64  G
-hugepages_total   i64  G
-hugepages_free    i64  G
-hugepagesize      i64  G
-direct_map_4k     i64  G
-direct_map_2m     i64  G
-direct_map_1g     i64  G
+ts                 ts   T
+mem_total          i64  G
+mem_free           i64? G
+mem_available      i64? G
+buffers            i64? G
+cached             i64? G
+swap_total         i64? G
+swap_free          i64? G
+active             i64? G
+inactive           i64? G
+dirty              i64? G
+writeback          i64? G
+slab               i64? G
+s_reclaimable      i64? G
+s_unreclaim        i64? G
+anon_pages         i64? G
+mapped             i64? G
+shmem              i64? G
+page_tables        i64? G
+commit_limit       i64? G
+committed_as       i64? G
+huge_pages_total   i64? G
+huge_pages_free    i64? G
+hugepagesize       i64? G
+scope              u8   L   // 0=host в Wave 1
 ```
 
 ## `1_105_001` `/proc/loadavg`
@@ -225,8 +214,9 @@ ts      ts   T
 load1   f64  G
 load5   f64  G
 load15  f64  G
-running u32  G
-total   u32  G
+running i32  G
+total   i32  G
+scope   u8   L   // 0=host в Wave 1
 ```
 
 ## `1_106_001` `/proc/vmstat`
@@ -236,17 +226,18 @@ total   u32  G
 
 ```text
 ts              ts   T
-pgpgin          i64  C
-pgpgout         i64  C
-pswpin          i64  C
-pswpout         i64  C
-pgfault         i64  C
-pgmajfault      i64  C
-pgsteal_kswapd  i64  C
-pgsteal_direct  i64  C
-pgscan_kswapd   i64  C
-pgscan_direct   i64  C
-oom_kill        i64  C
+pgpgin          i64? C
+pgpgout         i64? C
+pswpin          i64? C
+pswpout         i64? C
+pgfault         i64? C
+pgmajfault      i64? C
+pgsteal_kswapd  i64? C
+pgsteal_direct  i64? C
+pgscan_kswapd   i64? C
+pgscan_direct   i64? C
+oom_kill        i64? C
+scope           u8   L   // 0=host в Wave 1
 ```
 
 Остальные ключи добавляются как необязательные колонки текущей версии, если это
@@ -257,14 +248,15 @@ oom_kill        i64  C
 ```text
 ts            ts   T
 resource      u8   L   // 0=cpu 1=memory 2=io
-some_avg10    f32  G
-some_avg60    f32  G
-some_avg300   f32  G
+some_avg10    f64  G
+some_avg60    f64  G
+some_avg300   f64  G
 some_total    i64  C   // usec
-full_avg10    f32? G   // NULL для cpu
-full_avg60    f32? G   // NULL для cpu
-full_avg300   f32? G   // NULL для cpu
+full_avg10    f64? G   // NULL для cpu
+full_avg60    f64? G   // NULL для cpu
+full_avg300   f64? G   // NULL для cpu
 full_total    i64? C   // NULL для cpu
+scope         u8   L   // 0=host в Wave 1
 ```
 
 ## `1_108_001` `/proc/diskstats`

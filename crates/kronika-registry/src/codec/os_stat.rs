@@ -31,7 +31,7 @@ pub struct OsStat {
     pub procs_blocked: i64,
     /// Kernel boot time, unix microseconds.
     #[column(g)]
-    pub btime: i64,
+    pub btime: Ts,
     /// Source scope (`0=host`). See `kronika_source_os::OsScope`.
     #[column(l)]
     pub scope: u8,
@@ -49,7 +49,7 @@ mod tests {
             processes: 42,
             procs_running: 3,
             procs_blocked: 1,
-            btime: 1_700_000_000_000_000,
+            btime: Ts(1_700_000_000_000_000),
             scope: 0,
         }
     }

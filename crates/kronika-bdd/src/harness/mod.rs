@@ -351,30 +351,43 @@ impl HarnessState {
         // Ensure the root exists and KRONIKA_PROC_ROOT is registered.
         self.fixture_proc_root()?;
 
-        // stat — aggregate + one cpu line so parse_cpu succeeds; required misc fields present.
+        // stat: aggregate + one cpu line so parse_cpu succeeds; required misc fields present.
         self.write_proc_fixture(
             "stat",
             "cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\n\
              ctxt 0\nbtime 1700000000\nprocesses 0\nprocs_running 0\nprocs_blocked 0\n",
         )?;
 
-        // meminfo — only MemTotal is required by the parser.
-        self.write_proc_fixture("meminfo", "MemTotal: 1024 kB\n")?;
-
-        // loadavg — one line with running/total token.
-        self.write_proc_fixture("loadavg", "0.00 0.00 0.00 0/1 1\n")?;
-
-        // vmstat — all fields optional; provide a minimal pair so the file is non-empty.
-        self.write_proc_fixture("vmstat", "pgpgin 0\npgpgout 0\n")?;
-
-        // Host identity for instance_metadata (1_021), which also reads through
-        // KRONIKA_PROC_ROOT since Task 1 — its reads are a hard error, so the
-        // fixture must carry these or the whole snapshot fails.
-        self.write_proc_fixture("sys/kernel/hostname", "bdd-fixture-host\n")?;
-        self.write_proc_fixture("sys/kernel/osrelease", "6.1.0-fixture\n")?;
+        self.write_proc_fixture("sys/kernel/hostname", "fixture-host\n")?;
+        self.write_proc_fixture("sys/kernel/osrelease", "6.9.0-fixture\n")?;
         self.write_proc_fixture(
             "sys/kernel/random/boot_id",
-            "00000000-0000-0000-0000-000000000000\n",
+            "00000000-0000-4000-8000-000000000001\n",
+        )?;
+        self.write_proc_fixture("1/cgroup", "0::/init.scope\n")?;
+
+        // meminfo: only MemTotal is required by the parser.
+        self.write_proc_fixture("meminfo", "MemTotal: 1024 kB\n")?;
+
+        // loadavg: one line with running/total token.
+        self.write_proc_fixture("loadavg", "0.00 0.00 0.00 0/1 1\n")?;
+
+        // vmstat: all fields optional; provide a minimal pair so the file is non-empty.
+        self.write_proc_fixture("vmstat", "pgpgin 0\npgpgout 0\n")?;
+
+        self.write_proc_fixture(
+            "pressure/cpu",
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )?;
+        self.write_proc_fixture(
+            "pressure/memory",
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )?;
+        self.write_proc_fixture(
+            "pressure/io",
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
         )?;
 
         Ok(())
