@@ -152,6 +152,7 @@ Log-домен:
 
 Кодовый PR после утверждения должен включать:
 
+- scope detector and source metadata before writing aggregate OS sections;
 - procfs parser API с настраиваемым `proc_root`;
 - registry codecs and contracts для `1_102` - `1_107`;
 - scheduler source kind, например `OsCore`;
@@ -253,10 +254,47 @@ Recommended first implementation behavior:
 
 - Wave 1 may collect `/proc` core metrics in pod scope, but UI/API labels must
   say `scope=pod|container`, not `scope=node`;
+- if pod deployments are the primary target, move process+cgroup foundation
+  before disk/net and consider moving it before host aggregate polish;
 - node scope is opt-in through explicit configuration, not inferred from
   Kubernetes environment variables;
 - if scope cannot be classified, write `scope=unknown` and keep the raw source
   paths in diagnostics.
+
+### Снимать / не снимать / снимать только при scope X
+
+Эта таблица фиксирует решение с точки зрения Linux performance, DevOps/SRE and
+DBA. Collector может сохранять raw facts, но alerting and summaries обязаны
+учитывать scope.
+
+| Сигнал | Решение | Требование scope | Обоснование |
+|---|---|---|---|
+| PostgreSQL backend process rows from `/proc/PID/*` | Снимать обязательно | `process` scope; корректный join требует shared PID namespace или явный host proc root с PID-нумерацией PostgreSQL | Высокая DBA-ценность: query PID -> CPU ticks, RSS, faults, state, run delay, block delay, cmdline/comm. Это главный мост между PostgreSQL and Linux. |
+| Process I/O from `/proc/PID/io` | Снимать обязательно, nullable | Тот же process scope; недоступные поля пишутся как `NULL` | Высокая DBA/Linux-ценность для backend physical I/O, syscall I/O and approximation of OS page-cache behavior. Нельзя писать `0` при permission failure. |
+| Cgroup CPU quota, usage and throttling | Снимать обязательно в pod/container | `target_cgroup=postgres|pod|collector|configured` должен быть явным | Для SRE это полезнее loadavg в Kubernetes: quota, usage and throttling объясняют latency under CPU limits. Collector cgroup не равен PostgreSQL cgroup без доказательства. |
+| Cgroup memory and OOM events | Снимать обязательно в pod/container | То же правило `target_cgroup` | Лучше объясняет pod OOM, memory pressure and limit hits, чем `/proc/meminfo` внутри pod. |
+| PSI CPU/memory/io | Снимать со scope labels | Scope выбранного `proc_root`; cgroup PSI можно добавить позже | Linux performance сигнал stall time. Полезен при известном scope; вводит в заблуждение, если pod view назвать node pressure. |
+| `/proc/stat` CPU ticks | Снимать со scope labels | `scope=node` только с host proc root; иначе `scope=pod|container|unknown` | Полезно для rates and saturation trends. Само по себе не является pod capacity signal. |
+| CPU count/topology | Снимать только как capacity metadata | Нужна связка с cpuset and cgroup quota/period; raw host CPU count нельзя использовать как pod capacity | CPU count искажает ratios. Effective capacity в Kubernetes задается quota/cpuset, а не обязательно online host CPUs. |
+| `/proc/loadavg` | Снимать как secondary/debug; не alert в pod scope | Primary только для реального node scope; в pod scope помечать secondary | Load average смешивает runnable and uninterruptible tasks на видимом kernel scope. В container mode rpglot отключает loadavg alerting при наличии cgroup data, потому что loadavg может отражать host load, not container load. |
+| `/proc/meminfo` | Снимать со scope labels | Node memory только с host proc root; pod limit брать из cgroup memory | Полезно для host cache/reclaim context. В pod deployment нельзя показывать как pod memory limit or PostgreSQL memory envelope. |
+| `/proc/vmstat` | Снимать со scope labels | То же, что выбранный proc root | Полезно для faults, reclaim, swap and OOM counters, но host/pod interpretation зависит от proc scope. |
+| `/proc/diskstats` | Снимать только при атрибуции | Node scope с host roots или pod/container scope после mountinfo filtering | Raw diskstats в pod могут показать node devices и дать ложную I/O attribution. Нужен filter by mount namespace and infra bind-mounts. |
+| `/proc/net/dev`, SNMP, netstat | Снимать с namespace labels, ниже по DBA-приоритету | Current network namespace, если host network/proc roots не заданы явно | Полезно для SRE network errors/retransmits. Менее прямо связано с PostgreSQL без join to workload and namespace scope. |
+| Host/node aggregate metrics from a normal pod | Не снимать как node metrics | Node scope unavailable | Если назвать namespace data "node metrics", получатся ложные выводы о capacity, load and pressure. |
+| Node metrics from pod with host mounts | Снимать только по explicit deployment contract | read-only host `/proc`/`/sys`, configured roots and security context | Это node-agent mode. Он меняет security posture и должен быть явным. |
+
+Решение для первого implementation PR:
+
+- Option A: keep Wave 1 first, but include scope detector, configured roots and
+  scope labels in the same PR. CPU/mem/load/PSI are stored as scoped raw facts;
+  loadavg is not a primary pod alert signal; CPU count is capacity metadata only.
+- Option B: if pod deployments are the main product path, move process+cgroup
+  foundation earlier. This gives the DBA-critical backend join and Kubernetes
+  quota/throttling/OOM signals before broad host aggregates.
+
+Нужно утвердить: Option A для low-cardinality foundation first или Option B для
+PostgreSQL backend/process+cgroup value first в Kubernetes.
 
 ### Node-level metrics from a pod
 
@@ -314,6 +352,10 @@ Observed rpglot behavior:
 - system collectors read all global files from the selected proc path;
 - in containers, diskstats are filtered through current mountinfo and
   Kubernetes infra bind-mounts are excluded from disk attribution;
+- load average alerting is skipped when a cgroup block is present, because
+  `/proc/loadavg` can describe host load rather than container load;
+- effective CPU count uses cgroup quota/period when available, otherwise
+  SystemCpu online CPU count;
 - cgroup v1 lookup uses `/proc/self/cgroup` for relative paths.
 
 PgKronika should adopt:
@@ -1242,6 +1284,18 @@ Acceptance:
 
 ### Implementation PR 1: Wave 1 OS core
 
+Есть два допустимых варианта первого implementation PR:
+
+- Option A, low-cardinality foundation: scope detector plus `1_102_001` -
+  `1_107_001`.
+- Option B, pod-first DBA value: scope detector plus process identity skeleton,
+  backend PID join readiness and cgroup CPU/memory/PIDs before broad host
+  aggregates.
+
+Текущая рекомендация: Option A, если PgKronika сначала нужен небольшой,
+low-risk OS source foundation. Выбрать Option B, если Kubernetes sidecar/pod
+deployments are the primary production target.
+
 Scope:
 
 - OS scope detector and metadata/log labels;
@@ -1267,7 +1321,9 @@ Acceptance:
 - no panic path on malformed fixture;
 - missing PSI yields documented degradation, not zeros;
 - normal pod fixture proves metrics are scoped as pod/container;
-- node scope requires explicit host proc/sys configuration.
+- node scope requires explicit host proc/sys configuration;
+- loadavg stored as scoped secondary data, not primary pod alert signal;
+- CPU count stored only as capacity metadata with cgroup/cpuset context.
 
 ### Implementation PR 2: Wave 2 disk/net/mount
 
@@ -1292,6 +1348,9 @@ Acceptance:
 - pod diskstats fixture does not report unrelated node devices as pod disks.
 
 ### Implementation PR 3: Wave 3 processes
+
+If Option B is approved, this scope moves before disk/net and can become the
+first implementation PR after the scope detector.
 
 Scope:
 
@@ -1383,12 +1442,18 @@ Approval needed:
    вводить event/degradation section?
 11. Intervals: принять стартовые 10s для Wave 1/2, 5s process hot set, 30s
    process extended and mapping?
+12. Порядок первого implementation PR: Option A, low-cardinality Wave 1 with
+   strict scope metadata, или Option B, process+cgroup earlier because pod
+   deployments need backend join and cgroup throttling/OOM before host
+   aggregates?
 
 Основная рекомендация: утвердить `1_100/1_200`, Wave 1 как первый кодовый PR,
 scope detector in Wave 1, pod default as truthful pod/container metrics, node
 metrics only through explicit host proc/sys configuration, cmdline enabled with
-cap, `/proc/PID/io` nullable without `setfsuid` in the first process PR, cgroup
-tree walk only after separate approval.
+cap, `/proc/PID/io` nullable without `setfsuid` in the first process PR,
+loadavg secondary in pod scope, CPU count as capacity metadata only, cgroup tree
+walk only after separate approval. If production deployment is mostly
+Kubernetes pod/sidecar, approve Option B and move process+cgroup earlier.
 
 ## 12. Recommended next action
 
@@ -1398,12 +1463,19 @@ tree walk only after separate approval.
 feat(os): добавить Wave 1 procfs core metrics
 ```
 
-Первый PR должен ограничиться scope detector плюс `1_102_001` - `1_107_001`,
-parser fixtures, registry codecs, scheduler wiring, structured logs and BDD
-fixture oracle. Это дает полезные CPU/memory/load/PSI данные без риска per-PID
-privacy, setfsuid and cgroup cardinality problems.
+Первый PR по Option A должен ограничиться scope detector плюс `1_102_001` -
+`1_107_001`, parser fixtures, registry codecs, scheduler wiring, structured
+logs and BDD fixture oracle. Это дает полезные CPU/memory/PSI данные без риска
+per-PID privacy, setfsuid and cgroup cardinality problems. Loadavg остается
+secondary data in pod scope.
 
-Перед этим нужно утвердить pod/node решение: default pod mode пишет только
-pod/container-scoped OS data, cgroup data and explicit scope labels; node-level
-metrics from a pod включаются только при явном deployment contract with host
-proc/sys roots and required security context.
+Первый PR по Option B должен начать с process identity skeleton, safe
+`/proc/PID/io` nullability model and cgroup CPU/memory/PIDs. Это быстрее даст
+DBA value: backend PID -> process CPU/memory/I/O plus Kubernetes
+quota/throttling/OOM context.
+
+Перед этим нужно утвердить pod/node and implementation-order decision: default
+pod mode пишет только pod/container-scoped OS data, cgroup data and explicit
+scope labels; node-level metrics from a pod включаются только при явном
+deployment contract with host proc/sys roots and required security context;
+первым кодовым PR идет Option A or Option B.
