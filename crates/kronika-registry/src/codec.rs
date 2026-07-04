@@ -27,6 +27,7 @@ pub mod bgwriter_checkpointer;
 pub mod collection_coverage;
 pub mod instance_metadata;
 pub mod os_cpu;
+pub mod os_loadavg;
 pub mod os_meminfo;
 pub mod os_stat;
 pub mod pg_locks;
