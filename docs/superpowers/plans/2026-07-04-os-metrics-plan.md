@@ -86,7 +86,30 @@ PostgreSQL-конфигурации.
 на руках оба канала — procfs и SQL); `kronika-source-os` остаётся procfs-only
 и отдаёт сырой mountinfo + diskstats.
 
-### 0.3 Открыто для следующего шага брейнсторма
+### 0.3 Решение: type_id allocation
+
+Решение пользователя от 2026-07-04: числовая раскладка `type_id` не блокирует
+approval этого design PR.
+
+План использует `1_100/1_200` как консервативный стартовый диапазон внутри
+текущих соглашений реестра PgKronika. Точные numeric IDs являются деталями
+реализации. Первый implementation PR может выбрать любые свободные значения,
+которые не конфликтуют с актуальным `main` и проходят registry linter.
+
+Layout compatibility and stability start only after a concrete section is
+implemented and merged. До этого `type_id` в этом документе служит
+предварительной картой секций, а не approval gate.
+
+Это решение не ослабляет контракт схемы. Строгими остаются:
+
+- смысл каждой секции;
+- field names, field types, units and nullability;
+- sort keys;
+- `snapshot_full`/`on_change`/event semantics;
+- scope labels and source roots;
+- degradation, coverage and BDD oracle contracts.
+
+### 0.4 Открыто для следующего шага брейнсторма
 
 Ещё не утверждено (обсудим отдельно): расхождение таймингов (этот план —
 10 с база для Wave 1/2; ранее утверждённый тайминг-план — 5 с hot-path
@@ -185,14 +208,26 @@ Log-домен:
 - `3_001_001+` закреплено за словарями;
 - `10_001_001+` закреплено за графиками.
 
-Рекомендация: не переносить OS в `2_0xx`. Использовать уже описанные
-`1_100/1_200`, а термин "волна 2" трактовать как этап внедрения, не как
-`type_id`.
+Рекомендация: не переносить OS в `2_0xx` без отдельного изменения реестра.
+Использовать уже описанные `1_100/1_200` как conservative default, а термин
+"волна 2" трактовать как этап внедрения, не как `type_id`.
 
-Если нужен именно новый OS-диапазон `2_0xx`, это отдельное решение с миграцией
-реестра, потому что класс `2` уже занят event-секциями.
+Если первый implementation PR выберет другой свободный OS range внутри текущих
+registry conventions, это допустимо. Exact numeric allocation не блокирует
+approval. Блокером может быть только конфликт с реестром, schema semantics or
+layout contract.
+
+### Decision: type_id allocation
+
+`type_id` values ниже являются предварительными. Первый implementation PR
+выбирает любые currently-free IDs, сохраняет их в repo docs and registry и
+проходит registry checks. Compatibility/stability starts when a section is
+implemented; до реализации numeric IDs можно менять без миграции данных.
 
 ### Стартовый список секций
+
+Таблица показывает предложенную conservative allocation, а не обязательную
+финальную нумерацию.
 
 | Волна | `type_id` | Секция | Семантика | Период |
 |---|---:|---|---|---|
@@ -1389,7 +1424,8 @@ Acceptance:
 
 - `git diff --check` passes;
 - PR opened as draft/design;
-- user approves numbering and first implementation scope.
+- user approves first implementation scope; exact `type_id` allocation is not
+  an approval blocker.
 
 ### Implementation PR 1: Wave 1 OS core
 
@@ -1533,41 +1569,44 @@ Acceptance:
 - **Модель диска**: mountinfo-фильтр из rpglot (проверено) как база
   атрибуции + SQL-обогащение роли устройства (`data`/`wal`/`log`/`temp`) как
   опциональный слой. См. 0.2.
+- **Нумерация `type_id`**: exact numeric allocation is flexible. Использовать
+  любой свободный conservative range внутри текущих registry conventions;
+  финальные IDs выбирает первый implementation PR. См. 0.3.
 
 Остаются открытыми:
 
-1. Нумерация: подтвердить, что OS остается в `1_100/1_200`, а не переносится в
-   `2_0xx`.
-2. Process scope: собирать все visible PIDs или только PostgreSQL-related PIDs
+1. Process scope: собирать все visible PIDs или только PostgreSQL-related PIDs
    plus top-N? rpglot собирает все, но это больше данных and privacy risk.
-3. Cmdline: включать `cmdline` по умолчанию, ограничивать 64 KiB and dictionary
+2. Cmdline: включать `cmdline` по умолчанию, ограничивать 64 KiB and dictionary
    budget, или требовать explicit opt-in?
-4. `/proc/PID/io`: начинать без `setfsuid` fallback, записывая NULL при
+3. `/proc/PID/io`: начинать без `setfsuid` fallback, записывая NULL при
    отказе, или сразу включать controlled `setfsuid` retry?
-5. Cgroup scope: обходить все дерево под configured root или начать с self
+4. Cgroup scope: обходить все дерево под configured root или начать с self
    cgroup plus children?
-7. Node deployment contract: нужен ли официально поддержанный DaemonSet/sidecar
+5. Node deployment contract: нужен ли официально поддержанный DaemonSet/sidecar
    mode с `hostPID`, read-only hostPath `/proc`/`/sys`, and documented security
    context, или node-level OS metrics остаются вне default deployment?
-8. Cgroup target: для pod deployment считать главным collector cgroup,
+6. Cgroup target: для pod deployment считать главным collector cgroup,
    PostgreSQL target cgroup, pod-parent cgroup, or explicit configured cgroup?
-10. Diagnostics: в первом кодовом PR достаточно structured logs или сразу
+7. Diagnostics: в первом кодовом PR достаточно structured logs или сразу
    вводить event/degradation section?
-11. Intervals: **расхождение к разрешению** — этот план предлагает 10s база для
+8. Intervals: **расхождение к разрешению** — этот план предлагает 10s база для
    Wave 1/2, но ранее утверждённый тайминг-план задаёт 5s hot-path procfs
    (cpu/meminfo/vmstat/PSI/diskstats/net). Свести к одному решению.
-12. Порядок первого implementation PR: Option A, low-cardinality Wave 1 with
+9. Порядок первого implementation PR: Option A, low-cardinality Wave 1 with
    strict scope metadata, или Option B, process+cgroup earlier because pod
    deployments need backend join and cgroup throttling/OOM before host
    aggregates?
 
-Основная рекомендация: утвердить `1_100/1_200`, Wave 1 как первый кодовый PR,
-scope detector in Wave 1, pod default as truthful pod/container metrics, node
-metrics only through explicit host proc/sys configuration, cmdline enabled with
-cap, `/proc/PID/io` nullable without `setfsuid` in the first process PR,
-loadavg secondary in pod scope, CPU count as capacity metadata only, cgroup tree
-walk only after separate approval. If production deployment is mostly
-Kubernetes pod/sidecar, approve Option B and move process+cgroup earlier.
+Основная рекомендация: принять `1_100/1_200` как conservative default для
+планирования, не блокируя approval на exact numeric IDs; Wave 1 как первый
+кодовый PR, scope detector in Wave 1, pod default as truthful pod/container
+metrics, node metrics only through explicit host proc/sys configuration,
+cmdline enabled with cap, `/proc/PID/io` nullable without `setfsuid` in the
+first process PR, loadavg secondary in pod scope, CPU count as capacity
+metadata only, cgroup tree walk only after separate approval. If production
+deployment is mostly Kubernetes pod/sidecar, approve Option B and move
+process+cgroup earlier.
 
 ## 12. Recommended next action
 
