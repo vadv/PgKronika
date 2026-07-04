@@ -238,6 +238,10 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
 }
 
 impl Config {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "environment parsing keeps the validated daemon contract in one place"
+    )]
     fn from_env() -> Result<Self> {
         let dsn = std::env::var("KRONIKA_PG_DSN").context("KRONIKA_PG_DSN is not set")?;
         let out_dir = std::env::var("KRONIKA_OUT_DIR")
@@ -2267,6 +2271,7 @@ async fn read_pool_sources(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the snapshot wires every piece of daemon state together once"
 )]
 async fn snapshot_and_seal(
