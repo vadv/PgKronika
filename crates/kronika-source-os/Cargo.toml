@@ -11,5 +11,8 @@ repository.workspace = true
 [dependencies]
 rustix = { version = "1", features = ["param"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
