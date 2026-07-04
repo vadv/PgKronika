@@ -196,6 +196,18 @@ struct Config {
     /// Ceiling for one cycle's database time before the sized pool sources
     /// (statements, tables, indexes) are deferred; `0` disables the budget.
     cycle_db_budget_ms: u64,
+    /// Activity pace while its trigger fires; at or above the base interval
+    /// the trigger is disabled.
+    activity_fast_interval_s: u64,
+    /// Active client backends that trip the activity trigger.
+    ash_active_threshold: usize,
+    /// Replication pace while its trigger fires; at or above the base
+    /// interval the trigger is disabled.
+    replication_fast_interval_s: u64,
+    /// Replay lag that trips the replication trigger, seconds.
+    repl_lag_trigger_s: i64,
+    /// Slot-retained WAL that trips the replication trigger, bytes.
+    slot_retained_trigger_bytes: i64,
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -261,6 +273,17 @@ impl Config {
             );
         }
         let cycle_db_budget_ms = env_u64("KRONIKA_CYCLE_DB_BUDGET_MS", 15_000)?;
+        let activity_fast_interval_s = env_u64("KRONIKA_PG_ACTIVITY_FAST_INTERVAL_S", 1)?;
+        let ash_active_threshold = usize::try_from(env_u64("KRONIKA_PG_ASH_ACTIVE_THRESHOLD", 20)?)
+            .context("KRONIKA_PG_ASH_ACTIVE_THRESHOLD exceeds usize")?;
+        let replication_fast_interval_s = env_u64("KRONIKA_PG_REPLICATION_FAST_INTERVAL_S", 10)?;
+        let repl_lag_trigger_s = i64::try_from(env_u64("KRONIKA_PG_REPL_LAG_TRIGGER_S", 10)?)
+            .context("KRONIKA_PG_REPL_LAG_TRIGGER_S exceeds i64")?;
+        let slot_retained_trigger_bytes = i64::try_from(env_u64(
+            "KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES",
+            1024 * 1024 * 1024,
+        )?)
+        .context("KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES exceeds i64")?;
         let intervals = intervals_from_env()?;
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
@@ -290,6 +313,11 @@ impl Config {
             segment_max_age_secs,
             journal_max_bytes,
             cycle_db_budget_ms,
+            activity_fast_interval_s,
+            ash_active_threshold,
+            replication_fast_interval_s,
+            repl_lag_trigger_s,
+            slot_retained_trigger_bytes,
         })
     }
 }
@@ -645,6 +673,18 @@ async fn run_collection_cycle(
     .await
     {
         Ok(outcome) => {
+            apply_trigger_pace(
+                sched,
+                SourceKind::Activity,
+                outcome.activity_hot,
+                config.activity_fast_interval_s,
+            );
+            apply_trigger_pace(
+                sched,
+                SourceKind::Replication,
+                outcome.replication_hot,
+                config.replication_fast_interval_s,
+            );
             for kind in outcome.deferred {
                 // The budget pushed the source to the next tick, not dropped it.
                 sched.defer(kind);
@@ -661,12 +701,35 @@ async fn run_collection_cycle(
     }
 }
 
-/// What one collection cycle produced: segments sealed on this tick and the
-/// sized sources the budget pushed to the next tick.
+/// Apply one source's trigger verdict to its pace, logging only transitions.
+fn apply_trigger_pace(
+    sched: &mut Scheduler,
+    kind: SourceKind,
+    hot: Option<bool>,
+    fast_interval_s: u64,
+) {
+    match hot {
+        Some(true) => {
+            if sched.accelerate(kind, fast_interval_s) {
+                eprintln!("pg_kronika-collector: pace: {kind:?} accelerated to {fast_interval_s}s");
+            }
+        }
+        Some(false) if sched.relax(kind) => {
+            eprintln!("pg_kronika-collector: pace: {kind:?} back to its base interval");
+        }
+        _ => {}
+    }
+}
+
+/// What one collection cycle produced: segments sealed on this tick, the
+/// sized sources the budget pushed to the next tick, and the trigger verdicts
+/// of the sources that were read (`None` when a source was not read).
 #[derive(Debug, Default)]
 struct CycleOutcome {
     sealed: Vec<(PathBuf, &'static str)>,
     deferred: Vec<SourceKind>,
+    activity_hot: Option<bool>,
+    replication_hot: Option<bool>,
 }
 
 /// Counters accumulated while collecting one top-N source, for `1_023_001`.
@@ -1583,29 +1646,29 @@ fn truncate_to_boundary(text: &mut String, max_bytes: usize) {
     text.truncate(cut);
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the snapshot wires every piece of daemon state together once"
-)]
-async fn snapshot_and_seal(
+/// What the sized pool sources produced this cycle.
+struct PoolReads {
+    statements: Option<(StatementsVersion, Vec<StatementsRow>, u64)>,
+    user_tables: Vec<(String, UserTablesVersion, Vec<UserTablesRow>)>,
+    tables_cov: SourceCoverage,
+    user_indexes: Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)>,
+    indexes_cov: SourceCoverage,
+    deferred: Vec<SourceKind>,
+}
+
+/// Read the due sized sources under the cycle budget, in survival order —
+/// statements first, indexes last — so under pressure the most expensive
+/// source is deferred first.
+async fn read_pool_sources(
     pool: &ConnectionPool,
     major: u32,
-    journal: &mut Journal,
     config: &Config,
     statements_cache: &mut StatementsSourceCache,
-    plans_cache: &mut PlansSourceCache,
     due: &DueSet,
-    segment: &mut SegmentState,
     pool_budget: &mut PoolBudget,
-) -> Result<CycleOutcome> {
-    // Run every query first: SectionBuffers and Interner are `!Send`, so they
-    // must not be held across an await. Each source reads only when due.
-    // The budget clock covers the whole cycle's database time; the sized pool
-    // sources check it in survival order — statements first, indexes last —
-    // so under pressure the most expensive source is deferred first.
-    let cycle_start = Instant::now();
+    cycle_start: Instant,
+) -> PoolReads {
     let mut deferred = Vec::new();
-    let main_src = collect_main_conn_sources(pool.main(), major, config, due).await?;
     let statements = if due.has(SourceKind::Statements) {
         if pool_budget.admit(PoolSource::Statements, cycle_start.elapsed(), due.forced()) {
             collect_statements_cached(pool, config, statements_cache).await
@@ -1636,6 +1699,72 @@ async fn snapshot_and_seal(
     } else {
         (Vec::new(), SourceCoverage::default())
     };
+    PoolReads {
+        statements,
+        user_tables,
+        tables_cov,
+        user_indexes,
+        indexes_cov,
+        deferred,
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the snapshot wires every piece of daemon state together once"
+)]
+async fn snapshot_and_seal(
+    pool: &ConnectionPool,
+    major: u32,
+    journal: &mut Journal,
+    config: &Config,
+    statements_cache: &mut StatementsSourceCache,
+    plans_cache: &mut PlansSourceCache,
+    due: &DueSet,
+    segment: &mut SegmentState,
+    pool_budget: &mut PoolBudget,
+) -> Result<CycleOutcome> {
+    // Run every query first: SectionBuffers and Interner are `!Send`, so they
+    // must not be held across an await. Each source reads only when due.
+    // The budget clock covers the whole cycle's database time; the sized pool
+    // sources check it in survival order — statements first, indexes last —
+    // so under pressure the most expensive source is deferred first.
+    let cycle_start = Instant::now();
+    let main_src = collect_main_conn_sources(pool.main(), major, config, due).await?;
+    // Trigger verdicts come from the rows already collected — no extra queries.
+    let activity_hot = main_src
+        .activity
+        .as_ref()
+        .map(|(_, rows)| activity_needs_acceleration(rows, config.ash_active_threshold));
+    let replication_hot = main_src
+        .replication
+        .as_ref()
+        .map(|(instance, replicas, slots)| {
+            replication_needs_acceleration(
+                instance,
+                replicas,
+                slots,
+                config.repl_lag_trigger_s,
+                config.slot_retained_trigger_bytes,
+            )
+        });
+    let PoolReads {
+        statements,
+        user_tables,
+        tables_cov,
+        user_indexes,
+        indexes_cov,
+        deferred,
+    } = read_pool_sources(
+        pool,
+        major,
+        config,
+        statements_cache,
+        due,
+        pool_budget,
+        cycle_start,
+    )
+    .await;
     let store_plans_rows =
         collect_store_plans_cached(pool, config, plans_cache, due.forced()).await;
     let coverage = collect_coverage_records(
@@ -1676,11 +1805,32 @@ async fn snapshot_and_seal(
         return Ok(CycleOutcome {
             sealed: Vec::new(),
             deferred,
+            activity_hot,
+            replication_hot,
         });
     }
     let part = encode_window(buffers, &interner, config)?;
+    let sealed = append_window_and_rotate(journal, config, segment, due, main_src.ts.0, &part)?;
+    Ok(CycleOutcome {
+        sealed,
+        deferred,
+        activity_hot,
+        replication_hot,
+    })
+}
+
+/// Append one encoded window and seal under the rotation contract, returning
+/// the segments this tick closed.
+fn append_window_and_rotate(
+    journal: &mut Journal,
+    config: &Config,
+    segment: &mut SegmentState,
+    due: &DueSet,
+    window_ts: i64,
+    part: &[u8],
+) -> Result<Vec<(PathBuf, &'static str)>> {
     let mut sealed = Vec::new();
-    if let Err(err) = journal.append(&part) {
+    if let Err(err) = journal.append(part) {
         match err {
             // The journal cap fired before the segment byte cap: seal what is
             // already on disk and retry — the first frame after a reset is
@@ -1688,7 +1838,7 @@ async fn snapshot_and_seal(
             JournalError::Full { .. } if segment.first_ts.is_some() => {
                 sealed.push((seal_open_segment(journal, config, segment)?, "journal-full"));
                 journal
-                    .append(&part)
+                    .append(part)
                     .context("append the window after an early seal")?;
             }
             other => {
@@ -1697,7 +1847,7 @@ async fn snapshot_and_seal(
         }
     }
     let now = Instant::now();
-    segment.on_window_appended(main_src.ts.0, now);
+    segment.on_window_appended(window_ts, now);
     let age = Duration::from_secs(config.segment_max_age_secs);
     if let Some(reason) = seal_reason(
         due.forced(),
@@ -1707,7 +1857,7 @@ async fn snapshot_and_seal(
     ) {
         sealed.push((seal_open_segment(journal, config, segment)?, reason));
     }
-    Ok(CycleOutcome { sealed, deferred })
+    Ok(sealed)
 }
 
 /// Everything one tick reads from the main connection, gated by `due`.
@@ -1877,6 +2027,51 @@ fn push_main_conn_sections(
 fn activity_has_lock_waiters(rows: &[ActivityRow]) -> bool {
     rows.iter()
         .any(|row| row.wait_event_type.as_deref() == Some("Lock"))
+}
+
+/// Whether the activity snapshot justifies the accelerated pace: a backend
+/// waits on a heavyweight lock, or active client backends reach `threshold`.
+fn activity_needs_acceleration(rows: &[ActivityRow], threshold: usize) -> bool {
+    if activity_has_lock_waiters(rows) {
+        return true;
+    }
+    let active_clients = rows
+        .iter()
+        .filter(|row| {
+            row.backend_type == "client backend" && row.state.as_deref() == Some("active")
+        })
+        .count();
+    active_clients >= threshold
+}
+
+/// Whether the replication snapshot justifies the accelerated pace: a replica
+/// or this standby replays behind `lag_trigger_s`, or a slot retains at least
+/// `retained_trigger_bytes` of WAL.
+fn replication_needs_acceleration(
+    instance: &ReplicationInstanceRow,
+    replicas: &[ReplicaRow],
+    slots: &[SlotRow],
+    lag_trigger_s: i64,
+    retained_trigger_bytes: i64,
+) -> bool {
+    if instance
+        .replay_lag_s
+        .is_some_and(|lag| lag >= lag_trigger_s)
+    {
+        return true;
+    }
+    let replica_lag_floor_us = lag_trigger_s.saturating_mul(1_000_000);
+    if replicas.iter().any(|replica| {
+        replica
+            .replay_lag_us
+            .is_some_and(|lag| lag >= replica_lag_floor_us)
+    }) {
+        return true;
+    }
+    slots.iter().any(|slot| {
+        slot.retained_bytes
+            .is_some_and(|bytes| bytes >= retained_trigger_bytes)
+    })
 }
 
 /// The open (not yet sealed) segment: its file name comes from the first
@@ -2936,11 +3131,11 @@ mod tests {
 
     use super::{
         CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
-        activity_dict_limits, open_collector_journal, push_activity, push_archiver, push_database,
-        push_io, push_locks, push_prepared_xacts, push_progress_vacuum, push_replication_instance,
-        push_statements, push_user_indexes, push_user_tables, validate_cardinality,
-        validate_heavy_cap, validate_max_lock_rows, validate_replication_detail_bounds,
-        validate_settings_row_count,
+        activity_dict_limits, activity_needs_acceleration, open_collector_journal, push_activity,
+        push_archiver, push_database, push_io, push_locks, push_prepared_xacts,
+        push_progress_vacuum, push_replication_instance, push_statements, push_user_indexes,
+        push_user_tables, replication_needs_acceleration, validate_cardinality, validate_heavy_cap,
+        validate_max_lock_rows, validate_replication_detail_bounds, validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
@@ -2949,7 +3144,7 @@ mod tests {
     use kronika_source_pg::locks::{LocksRow, LocksVersion};
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
-    use kronika_source_pg::replication_details::ReplicationDetailBounds;
+    use kronika_source_pg::replication_details::{ReplicaRow, ReplicationDetailBounds, SlotRow};
     use kronika_source_pg::replication_instance::ReplicationInstanceRow;
     use kronika_source_pg::statements::StatementsRow;
     use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion};
@@ -3616,6 +3811,109 @@ mod tests {
             latest_end_time: Some(950),
             received_tli: Some(2),
         }
+    }
+
+    fn trigger_replica_row(replay_lag_us: Option<i64>) -> ReplicaRow {
+        ReplicaRow {
+            ts: 1_000,
+            pid: 9,
+            usename: "repl".to_owned(),
+            application_name: "walreceiver".to_owned(),
+            client_addr: None,
+            state: "streaming".to_owned(),
+            sync_state: "async".to_owned(),
+            sync_priority: Some(0),
+            sent_lsn: Some(2_048),
+            write_lsn: Some(2_048),
+            flush_lsn: Some(2_048),
+            replay_lsn: Some(1_024),
+            write_lag_us: None,
+            flush_lag_us: None,
+            replay_lag_us,
+        }
+    }
+
+    fn trigger_slot_row(retained_bytes: Option<i64>) -> SlotRow {
+        SlotRow {
+            ts: 1_000,
+            slot_name: "standby_a".to_owned(),
+            plugin: None,
+            slot_type: "physical".to_owned(),
+            active: true,
+            restart_lsn: Some(1_024),
+            confirmed_flush_lsn: None,
+            retained_bytes,
+            wal_status: Some("reserved".to_owned()),
+        }
+    }
+
+    #[test]
+    fn activity_accelerates_on_lock_waiters_or_active_pressure() {
+        let mut waiter = client_row(1);
+        waiter.wait_event_type = Some("Lock".to_owned());
+        assert!(activity_needs_acceleration(&[waiter], 100));
+
+        let busy: Vec<_> = (0..3).map(client_row).collect();
+        assert!(activity_needs_acceleration(&busy, 3));
+        assert!(
+            !activity_needs_acceleration(&busy, 4),
+            "below the threshold, no lock waiters: base pace"
+        );
+
+        let mut walsender = client_row(5);
+        walsender.backend_type = "walsender".to_owned();
+        assert!(
+            !activity_needs_acceleration(&[walsender], 1),
+            "only client backends count toward the threshold"
+        );
+    }
+
+    #[test]
+    fn replication_accelerates_on_lag_or_retained_wal() {
+        let gib = 1_024 * 1_024 * 1_024;
+        let calm_instance = ReplicationInstanceRow {
+            replay_lag_s: None,
+            ..replication_instance_row()
+        };
+
+        assert!(
+            !replication_needs_acceleration(&calm_instance, &[], &[], 10, gib),
+            "nothing lags, nothing is retained"
+        );
+        assert!(
+            replication_needs_acceleration(&replication_instance_row(), &[], &[], 1, gib),
+            "this standby replays behind the trigger"
+        );
+        assert!(
+            replication_needs_acceleration(
+                &calm_instance,
+                &[trigger_replica_row(Some(11_000_000))],
+                &[],
+                10,
+                gib
+            ),
+            "a replica replays behind the trigger"
+        );
+        assert!(
+            !replication_needs_acceleration(
+                &calm_instance,
+                &[trigger_replica_row(Some(9_000_000))],
+                &[],
+                10,
+                gib
+            ),
+            "a replica under the trigger stays at base pace"
+        );
+        assert!(
+            replication_needs_acceleration(
+                &calm_instance,
+                &[],
+                &[trigger_slot_row(Some(gib))],
+                10,
+                gib
+            ),
+            "a slot retains enough WAL to trip the trigger"
+        );
     }
 
     #[test]
