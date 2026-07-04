@@ -32,8 +32,8 @@ pub use codec::{
 };
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{
-    bgwriter_checkpointer, collection_coverage, instance_metadata, os_cpu, os_stat, pg_locks,
-    pg_prepared_xacts, pg_settings, pg_stat_activity, pg_stat_archiver, pg_stat_database,
+    bgwriter_checkpointer, collection_coverage, instance_metadata, os_cpu, os_meminfo, os_stat,
+    pg_locks, pg_prepared_xacts, pg_settings, pg_stat_activity, pg_stat_archiver, pg_stat_database,
     pg_stat_io, pg_stat_progress_vacuum, pg_stat_statements, pg_stat_user_indexes,
     pg_stat_user_tables, pg_stat_wal, pg_store_plans, replication_instance, replication_replicas,
     replication_slots, reset_metadata,
@@ -123,6 +123,7 @@ pub const fn registry() -> &'static [TypeContract] {
         collection_coverage::CollectionCoverageV1::CONTRACT,
         os_cpu::OsCpu::CONTRACT,
         os_stat::OsStat::CONTRACT,
+        os_meminfo::OsMeminfo::CONTRACT,
     ]
 }
 

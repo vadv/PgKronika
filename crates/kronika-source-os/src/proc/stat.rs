@@ -293,7 +293,9 @@ mod tests {
 
     #[test]
     fn to_section_carries_every_floor_field_and_scope() {
-        let section = parse_stat_misc(STAT_SAMPLE, 9_999).expect("parse").to_section(0);
+        let section = parse_stat_misc(STAT_SAMPLE, 9_999)
+            .expect("parse")
+            .to_section(0);
         assert_eq!(section.ts.0, 9_999);
         assert_eq!(section.ctxt, 12_345);
         assert_eq!(section.btime, 1_700_000_000_000_000);
