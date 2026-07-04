@@ -80,9 +80,11 @@
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
 )]
 
+mod budget;
 mod scheduler;
 
 use anyhow::{Context, Result};
+use budget::{PoolBudget, PoolSource};
 use kronika_format::DictLimits;
 use kronika_registry::collection_coverage::CollectionCoverageV1;
 use kronika_registry::instance_metadata::InstanceMetadata;
@@ -191,6 +193,9 @@ struct Config {
     /// Hard cap of the on-disk journal file; reaching it seals the open
     /// segment early instead of failing the append.
     journal_max_bytes: u64,
+    /// Ceiling for one cycle's database time before the sized pool sources
+    /// (statements, tables, indexes) are deferred; `0` disables the budget.
+    cycle_db_budget_ms: u64,
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -255,6 +260,7 @@ impl Config {
                  at the journal cap instead"
             );
         }
+        let cycle_db_budget_ms = env_u64("KRONIKA_CYCLE_DB_BUDGET_MS", 15_000)?;
         let intervals = intervals_from_env()?;
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
@@ -283,6 +289,7 @@ impl Config {
             segment_max_bytes,
             segment_max_age_secs,
             journal_max_bytes,
+            cycle_db_budget_ms,
         })
     }
 }
@@ -530,6 +537,7 @@ async fn main() -> Result<()> {
     let mut plans_cache = PlansSourceCache::default();
     let mut sched = Scheduler::new(config.intervals);
     let mut segment = SegmentState::default();
+    let mut pool_budget = PoolBudget::new(Duration::from_millis(config.cycle_db_budget_ms));
     // With the timer disabled the ticker never fires; collection is
     // signal-driven only (the BDD harness runs in this mode).
     let mut ticker = (config.tick_secs > 0)
@@ -581,6 +589,7 @@ async fn main() -> Result<()> {
             &due,
             &mut segment,
             &mut sched,
+            &mut pool_budget,
         )
         .await;
     }
@@ -603,6 +612,7 @@ async fn run_collection_cycle(
     due: &DueSet,
     segment: &mut SegmentState,
     sched: &mut Scheduler,
+    pool_budget: &mut PoolBudget,
 ) {
     if let Err(err) = pool.ensure_main().await {
         eprintln!("pg_kronika-collector: main reconnect failed: {err:#}");
@@ -630,11 +640,17 @@ async fn run_collection_cycle(
         plans_cache,
         due,
         segment,
+        pool_budget,
     )
     .await
     {
-        Ok(sealed) => {
-            for (dest, reason) in sealed {
+        Ok(outcome) => {
+            for kind in outcome.deferred {
+                // The budget pushed the source to the next tick, not dropped it.
+                sched.defer(kind);
+                eprintln!("pg_kronika-collector: cycle budget deferred {kind:?}");
+            }
+            for (dest, reason) in outcome.sealed {
                 // A fresh segment must be self-contained: the service sections
                 // (instance, reset, settings) come due on its first window.
                 sched.mark_segment_opened();
@@ -643,6 +659,14 @@ async fn run_collection_cycle(
         }
         Err(err) => eprintln!("pg_kronika-collector: snapshot failed: {err:#}"),
     }
+}
+
+/// What one collection cycle produced: segments sealed on this tick and the
+/// sized sources the budget pushed to the next tick.
+#[derive(Debug, Default)]
+struct CycleOutcome {
+    sealed: Vec<(PathBuf, &'static str)>,
+    deferred: Vec<SourceKind>,
 }
 
 /// Counters accumulated while collecting one top-N source, for `1_023_001`.
@@ -1572,24 +1596,45 @@ async fn snapshot_and_seal(
     plans_cache: &mut PlansSourceCache,
     due: &DueSet,
     segment: &mut SegmentState,
-) -> Result<Vec<(PathBuf, &'static str)>> {
+    pool_budget: &mut PoolBudget,
+) -> Result<CycleOutcome> {
     // Run every query first: SectionBuffers and Interner are `!Send`, so they
     // must not be held across an await. Each source reads only when due.
+    // The budget clock covers the whole cycle's database time; the sized pool
+    // sources check it in survival order — statements first, indexes last —
+    // so under pressure the most expensive source is deferred first.
+    let cycle_start = Instant::now();
+    let mut deferred = Vec::new();
     let main_src = collect_main_conn_sources(pool.main(), major, config, due).await?;
+    let statements = if due.has(SourceKind::Statements) {
+        if pool_budget.admit(PoolSource::Statements, cycle_start.elapsed(), due.forced()) {
+            collect_statements_cached(pool, config, statements_cache).await
+        } else {
+            deferred.push(SourceKind::Statements);
+            None
+        }
+    } else {
+        None
+    };
     let (user_tables, tables_cov) = if due.has(SourceKind::UserTables) {
-        collect_user_tables_all(pool, major, config).await
+        if pool_budget.admit(PoolSource::UserTables, cycle_start.elapsed(), due.forced()) {
+            collect_user_tables_all(pool, major, config).await
+        } else {
+            deferred.push(SourceKind::UserTables);
+            (Vec::new(), SourceCoverage::default())
+        }
     } else {
         (Vec::new(), SourceCoverage::default())
     };
     let (user_indexes, indexes_cov) = if due.has(SourceKind::UserIndexes) {
-        collect_user_indexes_all(pool, major, config).await
+        if pool_budget.admit(PoolSource::UserIndexes, cycle_start.elapsed(), due.forced()) {
+            collect_user_indexes_all(pool, major, config).await
+        } else {
+            deferred.push(SourceKind::UserIndexes);
+            (Vec::new(), SourceCoverage::default())
+        }
     } else {
         (Vec::new(), SourceCoverage::default())
-    };
-    let statements = if due.has(SourceKind::Statements) {
-        collect_statements_cached(pool, config, statements_cache).await
-    } else {
-        None
     };
     let store_plans_rows =
         collect_store_plans_cached(pool, config, plans_cache, due.forced()).await;
@@ -1628,7 +1673,10 @@ async fn snapshot_and_seal(
         // Every due source turned out empty (e.g. no vacuum in progress);
         // an empty tick appends nothing. The age valve in the main loop
         // still closes an expired segment on such ticks.
-        return Ok(Vec::new());
+        return Ok(CycleOutcome {
+            sealed: Vec::new(),
+            deferred,
+        });
     }
     let part = encode_window(buffers, &interner, config)?;
     let mut sealed = Vec::new();
@@ -1659,7 +1707,7 @@ async fn snapshot_and_seal(
     ) {
         sealed.push((seal_open_segment(journal, config, segment)?, reason));
     }
-    Ok(sealed)
+    Ok(CycleOutcome { sealed, deferred })
 }
 
 /// Everything one tick reads from the main connection, gated by `due`.
