@@ -104,7 +104,8 @@ Feature: The scheduler paces sources by their own intervals
       """
     And session "H" runs and holds its transaction open:
       """
-      LOCK TABLE kronika_pace_probe IN ACCESS EXCLUSIVE MODE
+      BEGIN;
+      LOCK TABLE kronika_pace_probe IN ACCESS EXCLUSIVE MODE;
       """
     And session "W" runs and blocks:
       """
