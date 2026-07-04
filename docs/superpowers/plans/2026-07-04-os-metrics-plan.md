@@ -139,7 +139,8 @@ default; setfsuid; глубина обхода cgroup-дерева.
 - `1_015` replication instance;
 - `1_016` replication replicas;
 - `1_017` replication slots;
-- `1_018` wraparound risk;
+- wraparound risk — влит колонками в `1_005` (database) и `1_013` (user
+  tables); отдельного типа нет;
 - `1_019` settings;
 - `1_020` reset_metadata;
 - `1_021` instance_metadata;
@@ -326,8 +327,8 @@ Host/node scope:
   `/host/proc`, `/host/sys`, `/host/sys/fs/cgroup`;
 - process rows относятся к host PID namespace only if deployment explicitly
   provides host PID visibility;
-- все секции должны нести metadata/scope label, чтобы reader не смешивал host
-  and pod views.
+- каждая строка несёт `scope`-колонку (раздел 0.1), поэтому reader не смешивает
+  host and pod views независимо от instance-level metadata.
 
 Container/pod scope:
 
@@ -356,9 +357,10 @@ Process scope:
 Default for pod/container deployment:
 
 - detect container/pod mode;
-- record `os_scope=container` or `os_scope=pod` in instance/source metadata;
-- record `proc_root`, `sys_root`, `cgroup_root`, `pid_namespace`, and detected
-  container signals where feasible;
+- write per-row `scope` (`u8`, раздел 0.1) на каждой OS-строке; source-level
+  контекст (`proc_root`, `sys_root`, `cgroup_root`, `pid_namespace`, detected
+  container signals) идёт в instance/source metadata — он один на коллектор,
+  scope в metadata не дублируется;
 - collect only truthful namespace metrics;
 - do not label namespace `/proc` values as node metrics;
 - mark node metrics unavailable unless host proc/sys roots are explicitly
