@@ -111,8 +111,6 @@ Feature: The scheduler paces sources by their own intervals
       """
       SELECT count(*) FROM kronika_pace_probe
       """
-    And the collector runs with env "KRONIKA_INTERVAL_S" = "1"
-    And the collector runs with env "KRONIKA_PG_ACTIVITY_FAST_INTERVAL_S" = "0"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "4"
     When the collector runs on its own timer until 1 segment is sealed
     Then timer segment 1 section 1_001_003 contains at least 3 snapshots

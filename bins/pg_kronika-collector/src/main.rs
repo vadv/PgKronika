@@ -51,9 +51,10 @@
 //!   exceed this value;
 //! - `KRONIKA_NODE_SELF_ID`: stable node id sealed into `instance_metadata`
 //!   (`1_021_001`); defaults to the hostname;
-//! - `KRONIKA_INTERVAL_S`: base tick of the internal timer, default 5; `0`
-//!   disables the timer, leaving collection to SIGUSR2 only. A signal is a
-//!   forced tick: it reads every source regardless of intervals;
+//! - `KRONIKA_INTERVAL_S`: regular wake cap of the internal timer, default 5;
+//!   positive source or trigger intervals can wake sooner; `0` disables the
+//!   timer, leaving collection to SIGUSR2 only. A signal is a forced tick: it
+//!   reads every source regardless of intervals;
 //! - per-source read intervals, seconds (a source is read on the first tick
 //!   whose elapsed time since its last read reaches the interval):
 //!   `KRONIKA_PG_ACTIVITY_INTERVAL_S` (5), `KRONIKA_PG_DATABASE_INTERVAL_S`
@@ -69,6 +70,14 @@
 //!   (3600). The lock-wait graph has no interval: it runs when the freshest
 //!   activity snapshot shows a backend waiting on a heavyweight lock. The
 //!   `pg_store_plans` pace stays on `KRONIKA_PG_PLANS_INTERVAL_S`;
+//! - trigger fast intervals and thresholds:
+//!   `KRONIKA_PG_ACTIVITY_FAST_INTERVAL_S` (1),
+//!   `KRONIKA_PG_ASH_ACTIVE_THRESHOLD` (20),
+//!   `KRONIKA_PG_REPLICATION_FAST_INTERVAL_S` (10),
+//!   `KRONIKA_PG_REPL_LAG_TRIGGER_S` (10),
+//!   `KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES` (1073741824). A fast interval at
+//!   or above the source's base interval disables that trigger; `0` means every
+//!   timer wake while the trigger stays hot;
 //! - `KRONIKA_SEGMENT_MAX_BYTES`: seal the segment once the journal holds
 //!   this many raw bytes before segment packing, default 67108864 (64 MiB);
 //!   `0` seals on every tick. A SIGUSR2 tick always seals immediately;
@@ -535,6 +544,30 @@ fn check_replication_detail_section_bound(guc: &str, value: i64, cap: i64) -> Re
     Ok(())
 }
 
+fn timer_sleep_delay(
+    now: Instant,
+    tick_secs: u64,
+    segment_max_age_secs: u64,
+    sched: &Scheduler,
+    plans_cache: &PlansSourceCache,
+    segment: &SegmentState,
+) -> Option<Duration> {
+    if tick_secs == 0 {
+        return None;
+    }
+    let mut delay = Duration::from_secs(tick_secs);
+    if let Some(next_due) = sched.next_elapsed_due_in(now) {
+        delay = delay.min(next_due);
+    }
+    if let Some(next_plans) = plans_cache.next_due_in(now) {
+        delay = delay.min(next_plans);
+    }
+    if let Some(next_age) = segment.time_until_age(now, Duration::from_secs(segment_max_age_secs)) {
+        delay = delay.min(next_age);
+    }
+    Some(delay)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
@@ -566,24 +599,30 @@ async fn main() -> Result<()> {
     let mut sched = Scheduler::new(config.intervals);
     let mut segment = SegmentState::default();
     let mut pool_budget = PoolBudget::new(Duration::from_millis(config.cycle_db_budget_ms));
-    // With the timer disabled the ticker never fires; collection is
-    // signal-driven only (the BDD harness runs in this mode).
-    let mut ticker = (config.tick_secs > 0)
-        .then(|| tokio::time::interval(Duration::from_secs(config.tick_secs)));
-    if let Some(ticker) = ticker.as_mut() {
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    }
+    // With the timer disabled collection is signal-driven only.
+    let mut first_timer_tick = config.tick_secs > 0;
 
     announce("ready");
 
     loop {
+        let sleep = if first_timer_tick {
+            first_timer_tick = false;
+            Some(Duration::ZERO)
+        } else {
+            timer_sleep_delay(
+                Instant::now(),
+                config.tick_secs,
+                config.segment_max_age_secs,
+                &sched,
+                &plans_cache,
+                &segment,
+            )
+        };
         let forced = tokio::select! {
             Some(()) = sigusr2.recv() => true,
             () = async {
-                match ticker.as_mut() {
-                    Some(ticker) => {
-                        ticker.tick().await;
-                    }
+                match sleep {
+                    Some(delay) => tokio::time::sleep(delay).await,
                     None => std::future::pending::<()>().await,
                 }
             } => false,
@@ -1287,6 +1326,11 @@ impl PlansSourceCache {
     /// is empty: the plans pace must not depend on another source being due.
     fn is_due(&self, now: Instant) -> bool {
         self.next_read.is_none_or(|due| now >= due)
+    }
+
+    fn next_due_in(&self, now: Instant) -> Option<Duration> {
+        let delay = self.next_read?.saturating_duration_since(now);
+        (!delay.is_zero()).then_some(delay)
     }
 }
 
@@ -2095,6 +2139,10 @@ impl SegmentState {
     fn age_expired(&self, now: Instant, max_age: Duration) -> bool {
         self.opened_at
             .is_some_and(|opened| now.duration_since(opened) >= max_age)
+    }
+
+    fn time_until_age(&self, now: Instant, max_age: Duration) -> Option<Duration> {
+        Some(max_age.saturating_sub(now.saturating_duration_since(self.opened_at?)))
     }
 }
 
@@ -2949,8 +2997,9 @@ fn push_store_plans_ossc(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlansSourceCache, SegmentState, SourceCoverage, StatementsVersion, min_total_time,
-        seal_reason, statements_type_id, user_indexes_type_id, user_tables_type_id,
+        Intervals, PlansSourceCache, Scheduler, SegmentState, SourceCoverage, SourceKind,
+        StatementsVersion, min_total_time, seal_reason, statements_type_id, timer_sleep_delay,
+        user_indexes_type_id, user_tables_type_id,
     };
 
     #[test]
@@ -3013,6 +3062,81 @@ mod tests {
         assert!(
             cache.is_due(now + Duration::from_mins(5)),
             "the deadline itself is due"
+        );
+    }
+
+    #[test]
+    fn timer_sleep_uses_source_deadline_before_regular_tick() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let intervals = Intervals {
+            activity: 1,
+            ..Intervals::default()
+        };
+        let mut sched = Scheduler::new(intervals);
+        sched.plan(start, false);
+
+        assert_eq!(
+            timer_sleep_delay(
+                start,
+                5,
+                900,
+                &sched,
+                &PlansSourceCache::default(),
+                &SegmentState::default()
+            ),
+            Some(Duration::from_secs(1)),
+            "a 1s source interval is not capped by a 5s regular wake"
+        );
+    }
+
+    #[test]
+    fn timer_sleep_uses_accelerated_deadline_before_regular_tick() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut sched = Scheduler::new(Intervals::default());
+        sched.plan(start, false);
+        assert!(sched.accelerate(SourceKind::Activity, 1));
+
+        assert_eq!(
+            timer_sleep_delay(
+                start,
+                5,
+                900,
+                &sched,
+                &PlansSourceCache::default(),
+                &SegmentState::default()
+            ),
+            Some(Duration::from_secs(1)),
+            "default activity fast pace can wake before the 5s regular timer"
+        );
+    }
+
+    #[test]
+    fn timer_sleep_keeps_zero_interval_on_regular_wakes() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let intervals = Intervals {
+            activity: 0,
+            ..Intervals::default()
+        };
+        let mut sched = Scheduler::new(intervals);
+        sched.plan(start, false);
+
+        assert_eq!(
+            timer_sleep_delay(
+                start,
+                5,
+                900,
+                &sched,
+                &PlansSourceCache::default(),
+                &SegmentState::default()
+            ),
+            Some(Duration::from_secs(5)),
+            "zero means every timer wake, not an immediate busy loop"
         );
     }
 

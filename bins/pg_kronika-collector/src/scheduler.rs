@@ -1,11 +1,13 @@
 //! Per-source pacing for collection ticks.
 //!
 //! Each source has its own interval. A forced tick (`SIGUSR2`, and the first
-//! tick after start) reads every source, so the first segment after restart is
-//! self-contained and signal-driven collection keeps its contract. The
-//! `pg_store_plans` cadence remains inside the plans source cache. The
-//! lock-wait graph has no interval; it runs when the current activity snapshot
-//! shows a backend waiting on a heavyweight lock.
+//! timer tick after start) reads every source, so the first segment after
+//! restart is self-contained and signal-driven collection keeps its contract.
+//! Positive intervals can pull the next timer wake forward; explicit zero
+//! intervals run on every timer wake. The `pg_store_plans` cadence remains
+//! inside the plans source cache. The lock-wait graph has no interval; it runs
+//! when the current activity snapshot shows a backend waiting on a heavyweight
+//! lock.
 
 use std::time::{Duration, Instant};
 
@@ -204,6 +206,27 @@ impl Scheduler {
     /// Put a planned-but-unread source back: it comes due on the next tick.
     pub(crate) fn defer(&mut self, kind: SourceKind) {
         self.last_read[slot_of(kind)] = None;
+    }
+
+    /// Time until the next positive source interval elapses.
+    ///
+    /// Sources with no previous read, deferred sources, and explicit zero
+    /// intervals are read on the next timer wake; they do not pull the wake
+    /// forward by themselves.
+    pub(crate) fn next_elapsed_due_in(&self, now: Instant) -> Option<Duration> {
+        ALL_SOURCES
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, kind)| {
+                let last = self.last_read[slot]?;
+                let secs = self.overrides[slot].unwrap_or_else(|| self.intervals.of(*kind));
+                if secs == 0 {
+                    return None;
+                }
+                let interval = Duration::from_secs(secs);
+                Some(interval.saturating_sub(now.saturating_duration_since(last)))
+            })
+            .min()
     }
 
     /// The due set for a tick at `now`.
@@ -477,6 +500,47 @@ mod tests {
         let next = scheduler.plan(start + Duration::from_secs(1), false);
         assert!(next.has(SourceKind::Activity));
         assert!(!next.has(SourceKind::Replication));
+    }
+
+    #[test]
+    fn next_due_uses_positive_accelerated_interval() {
+        let mut intervals = uniform(1000);
+        intervals.activity = 5;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+        scheduler.plan(start, false);
+        scheduler.accelerate(SourceKind::Activity, 1);
+
+        assert_eq!(
+            scheduler.next_elapsed_due_in(start),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            scheduler.next_elapsed_due_in(start + Duration::from_secs(1)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn zero_and_deferred_sources_wait_for_a_timer_wake() {
+        let mut intervals = uniform(1000);
+        intervals.activity = 0;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+        scheduler.plan(start, false);
+
+        assert_eq!(
+            scheduler.next_elapsed_due_in(start),
+            Some(Duration::from_secs(1000)),
+            "zero-interval sources are due on timer wakes, not a tight loop"
+        );
+
+        scheduler.defer(SourceKind::Replication);
+        assert_eq!(
+            scheduler.next_elapsed_due_in(start),
+            Some(Duration::from_secs(1000)),
+            "deferred sources return on the next timer wake"
+        );
     }
 
     #[test]
