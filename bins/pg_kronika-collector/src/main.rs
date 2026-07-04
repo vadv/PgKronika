@@ -54,9 +54,10 @@
 //!   exceed this value;
 //! - `KRONIKA_NODE_SELF_ID`: stable node id sealed into `instance_metadata`
 //!   (`1_021_001`); defaults to the hostname;
-//! - `KRONIKA_INTERVAL_S`: base tick of the internal timer, default 5; `0`
-//!   disables the timer, leaving collection to SIGUSR2 only. A signal is a
-//!   forced tick: it reads every source regardless of intervals;
+//! - `KRONIKA_INTERVAL_S`: regular wake cap of the internal timer, default 5;
+//!   positive source or trigger intervals can wake sooner; `0` disables the
+//!   timer, leaving collection to SIGUSR2 only. A signal is a forced tick: it
+//!   reads every source regardless of intervals;
 //! - per-source read intervals, seconds (a source is read on the first tick
 //!   whose elapsed time since its last read reaches the interval):
 //!   `KRONIKA_PG_ACTIVITY_INTERVAL_S` (5), `KRONIKA_PG_DATABASE_INTERVAL_S`
@@ -72,6 +73,14 @@
 //!   (3600). The lock-wait graph has no interval: it runs when the freshest
 //!   activity snapshot shows a backend waiting on a heavyweight lock. The
 //!   `pg_store_plans` pace stays on `KRONIKA_PG_PLANS_INTERVAL_S`;
+//! - trigger fast intervals and thresholds:
+//!   `KRONIKA_PG_ACTIVITY_FAST_INTERVAL_S` (1),
+//!   `KRONIKA_PG_ASH_ACTIVE_THRESHOLD` (20),
+//!   `KRONIKA_PG_REPLICATION_FAST_INTERVAL_S` (10),
+//!   `KRONIKA_PG_REPL_LAG_TRIGGER_S` (10),
+//!   `KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES` (1073741824). A fast interval at
+//!   or above the source's base interval disables that trigger; `0` means every
+//!   timer wake while the trigger stays hot;
 //! - `KRONIKA_SEGMENT_MAX_BYTES`: seal the segment once the journal holds
 //!   this many raw bytes before segment packing, default 67108864 (64 MiB);
 //!   `0` seals on every tick. A SIGUSR2 tick always seals immediately;
@@ -207,6 +216,18 @@ struct Config {
     /// Ceiling for one cycle's database time before the sized pool sources
     /// (statements, tables, indexes) are deferred; `0` disables the budget.
     cycle_db_budget_ms: u64,
+    /// Activity pace while its trigger fires; at or above the base interval
+    /// the trigger is disabled.
+    activity_fast_interval_s: u64,
+    /// Active client backends that trip the activity trigger.
+    ash_active_threshold: usize,
+    /// Replication pace while its trigger fires; at or above the base
+    /// interval the trigger is disabled.
+    replication_fast_interval_s: u64,
+    /// Replay lag that trips the replication trigger, seconds.
+    repl_lag_trigger_s: i64,
+    /// Slot-retained WAL that trips the replication trigger, bytes.
+    slot_retained_trigger_bytes: i64,
 }
 
 fn env_u64(key: &str, default: u64) -> Result<u64> {
@@ -217,6 +238,10 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
 }
 
 impl Config {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "environment parsing keeps the validated daemon contract in one place"
+    )]
     fn from_env() -> Result<Self> {
         let dsn = std::env::var("KRONIKA_PG_DSN").context("KRONIKA_PG_DSN is not set")?;
         let out_dir = std::env::var("KRONIKA_OUT_DIR")
@@ -280,6 +305,17 @@ impl Config {
             );
         }
         let cycle_db_budget_ms = env_u64("KRONIKA_CYCLE_DB_BUDGET_MS", 15_000)?;
+        let activity_fast_interval_s = env_u64("KRONIKA_PG_ACTIVITY_FAST_INTERVAL_S", 1)?;
+        let ash_active_threshold = usize::try_from(env_u64("KRONIKA_PG_ASH_ACTIVE_THRESHOLD", 20)?)
+            .context("KRONIKA_PG_ASH_ACTIVE_THRESHOLD exceeds usize")?;
+        let replication_fast_interval_s = env_u64("KRONIKA_PG_REPLICATION_FAST_INTERVAL_S", 10)?;
+        let repl_lag_trigger_s = i64::try_from(env_u64("KRONIKA_PG_REPL_LAG_TRIGGER_S", 10)?)
+            .context("KRONIKA_PG_REPL_LAG_TRIGGER_S exceeds i64")?;
+        let slot_retained_trigger_bytes = i64::try_from(env_u64(
+            "KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES",
+            1024 * 1024 * 1024,
+        )?)
+        .context("KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES exceeds i64")?;
         let intervals = intervals_from_env()?;
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
@@ -309,6 +345,11 @@ impl Config {
             segment_max_age_secs,
             journal_max_bytes,
             cycle_db_budget_ms,
+            activity_fast_interval_s,
+            ash_active_threshold,
+            replication_fast_interval_s,
+            repl_lag_trigger_s,
+            slot_retained_trigger_bytes,
         })
     }
 }
@@ -526,6 +567,30 @@ fn check_replication_detail_section_bound(guc: &str, value: i64, cap: i64) -> Re
     Ok(())
 }
 
+fn timer_sleep_delay(
+    now: Instant,
+    tick_secs: u64,
+    segment_max_age_secs: u64,
+    sched: &Scheduler,
+    plans_cache: &PlansSourceCache,
+    segment: &SegmentState,
+) -> Option<Duration> {
+    if tick_secs == 0 {
+        return None;
+    }
+    let mut delay = Duration::from_secs(tick_secs);
+    if let Some(next_due) = sched.next_elapsed_due_in(now) {
+        delay = delay.min(next_due);
+    }
+    if let Some(next_plans) = plans_cache.next_due_in(now) {
+        delay = delay.min(next_plans);
+    }
+    if let Some(next_age) = segment.time_until_age(now, Duration::from_secs(segment_max_age_secs)) {
+        delay = delay.min(next_age);
+    }
+    Some(delay)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
@@ -557,24 +622,30 @@ async fn main() -> Result<()> {
     let mut sched = Scheduler::new(config.intervals);
     let mut segment = SegmentState::default();
     let mut pool_budget = PoolBudget::new(Duration::from_millis(config.cycle_db_budget_ms));
-    // With the timer disabled the ticker never fires; collection is
-    // signal-driven only (the BDD harness runs in this mode).
-    let mut ticker = (config.tick_secs > 0)
-        .then(|| tokio::time::interval(Duration::from_secs(config.tick_secs)));
-    if let Some(ticker) = ticker.as_mut() {
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    }
+    // With the timer disabled collection is signal-driven only.
+    let mut first_timer_tick = config.tick_secs > 0;
 
     announce("ready");
 
     loop {
+        let sleep = if first_timer_tick {
+            first_timer_tick = false;
+            Some(Duration::ZERO)
+        } else {
+            timer_sleep_delay(
+                Instant::now(),
+                config.tick_secs,
+                config.segment_max_age_secs,
+                &sched,
+                &plans_cache,
+                &segment,
+            )
+        };
         let forced = tokio::select! {
             Some(()) = sigusr2.recv() => true,
             () = async {
-                match ticker.as_mut() {
-                    Some(ticker) => {
-                        ticker.tick().await;
-                    }
+                match sleep {
+                    Some(delay) => tokio::time::sleep(delay).await,
                     None => std::future::pending::<()>().await,
                 }
             } => false,
@@ -680,6 +751,18 @@ async fn run_collection_cycle(
     .await
     {
         Ok(outcome) => {
+            apply_trigger_pace(
+                sched,
+                SourceKind::Activity,
+                outcome.activity_hot,
+                config.activity_fast_interval_s,
+            );
+            apply_trigger_pace(
+                sched,
+                SourceKind::Replication,
+                outcome.replication_hot,
+                config.replication_fast_interval_s,
+            );
             for kind in outcome.deferred {
                 // The budget pushed the source to the next tick, not dropped it.
                 sched.defer(kind);
@@ -700,12 +783,35 @@ async fn run_collection_cycle(
     }
 }
 
-/// What one collection cycle produced: segments sealed on this tick and the
-/// sized sources the budget pushed to the next tick.
+/// Apply one source's trigger verdict to its pace, logging only transitions.
+fn apply_trigger_pace(
+    sched: &mut Scheduler,
+    kind: SourceKind,
+    hot: Option<bool>,
+    fast_interval_s: u64,
+) {
+    match hot {
+        Some(true) => {
+            if sched.accelerate(kind, fast_interval_s) {
+                eprintln!("pg_kronika-collector: pace: {kind:?} accelerated to {fast_interval_s}s");
+            }
+        }
+        Some(false) if sched.relax(kind) => {
+            eprintln!("pg_kronika-collector: pace: {kind:?} back to its base interval");
+        }
+        _ => {}
+    }
+}
+
+/// What one collection cycle produced: segments sealed on this tick, the
+/// sized sources the budget pushed to the next tick, and the trigger verdicts
+/// of the sources that were read (`None` when a source was not read).
 #[derive(Debug, Default)]
 struct CycleOutcome {
     sealed: Vec<(PathBuf, &'static str)>,
     deferred: Vec<SourceKind>,
+    activity_hot: Option<bool>,
+    replication_hot: Option<bool>,
 }
 
 /// Counters accumulated while collecting one top-N source, for `1_023_001`.
@@ -1500,6 +1606,11 @@ impl PlansSourceCache {
     fn is_due(&self, now: Instant) -> bool {
         self.next_read.is_none_or(|due| now >= due)
     }
+
+    fn next_due_in(&self, now: Instant) -> Option<Duration> {
+        let delay = self.next_read?.saturating_duration_since(now);
+        (!delay.is_zero()).then_some(delay)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2095,30 +2206,29 @@ fn truncate_to_boundary(text: &mut String, max_bytes: usize) {
     text.truncate(cut);
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the snapshot wires every piece of daemon state together once"
-)]
-async fn snapshot_and_seal(
+/// What the sized pool sources produced this cycle.
+struct PoolReads {
+    statements: Option<(StatementsVersion, Vec<StatementsRow>, u64)>,
+    user_tables: Vec<(String, UserTablesVersion, Vec<UserTablesRow>)>,
+    tables_cov: SourceCoverage,
+    user_indexes: Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)>,
+    indexes_cov: SourceCoverage,
+    deferred: Vec<SourceKind>,
+}
+
+/// Read the due sized sources under the cycle budget, in survival order —
+/// statements first, indexes last — so under pressure the most expensive
+/// source is deferred first.
+async fn read_pool_sources(
     pool: &ConnectionPool,
     major: u32,
-    journal: &mut Journal,
     config: &Config,
     statements_cache: &mut StatementsSourceCache,
-    plans_cache: &mut PlansSourceCache,
     due: &DueSet,
-    segment: &mut SegmentState,
     pool_budget: &mut PoolBudget,
-) -> Result<CycleOutcome> {
-    // Run every query first: SectionBuffers and Interner are `!Send`, so they
-    // must not be held across an await. Each source reads only when due.
-    // The budget clock covers the whole cycle's database time; the sized pool
-    // sources check it in survival order — statements first, indexes last —
-    // so under pressure the most expensive source is deferred first.
-    let cycle_start = Instant::now();
+    cycle_start: Instant,
+) -> PoolReads {
     let mut deferred = Vec::new();
-    let main_src = collect_main_conn_sources(pool.main(), major, config, due).await?;
     let statements = if due.has(SourceKind::Statements) {
         if pool_budget.admit(PoolSource::Statements, cycle_start.elapsed(), due.forced()) {
             collect_statements_cached(pool, config, statements_cache).await
@@ -2149,6 +2259,73 @@ async fn snapshot_and_seal(
     } else {
         (Vec::new(), SourceCoverage::default())
     };
+    PoolReads {
+        statements,
+        user_tables,
+        tables_cov,
+        user_indexes,
+        indexes_cov,
+        deferred,
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the snapshot wires every piece of daemon state together once"
+)]
+async fn snapshot_and_seal(
+    pool: &ConnectionPool,
+    major: u32,
+    journal: &mut Journal,
+    config: &Config,
+    statements_cache: &mut StatementsSourceCache,
+    plans_cache: &mut PlansSourceCache,
+    due: &DueSet,
+    segment: &mut SegmentState,
+    pool_budget: &mut PoolBudget,
+) -> Result<CycleOutcome> {
+    // Run every query first: SectionBuffers and Interner are `!Send`, so they
+    // must not be held across an await. Each source reads only when due.
+    // The budget clock covers the whole cycle's database time; the sized pool
+    // sources check it in survival order — statements first, indexes last —
+    // so under pressure the most expensive source is deferred first.
+    let cycle_start = Instant::now();
+    let main_src = collect_main_conn_sources(pool.main(), major, config, due).await?;
+    // Trigger verdicts come from the rows already collected — no extra queries.
+    let activity_hot = main_src
+        .activity
+        .as_ref()
+        .map(|(_, rows)| activity_needs_acceleration(rows, config.ash_active_threshold));
+    let replication_hot = main_src
+        .replication
+        .as_ref()
+        .map(|(instance, replicas, slots)| {
+            replication_needs_acceleration(
+                instance,
+                replicas,
+                slots,
+                config.repl_lag_trigger_s,
+                config.slot_retained_trigger_bytes,
+            )
+        });
+    let PoolReads {
+        statements,
+        user_tables,
+        tables_cov,
+        user_indexes,
+        indexes_cov,
+        deferred,
+    } = read_pool_sources(
+        pool,
+        major,
+        config,
+        statements_cache,
+        due,
+        pool_budget,
+        cycle_start,
+    )
+    .await;
     let store_plans_rows =
         collect_store_plans_cached(pool, config, plans_cache, due.forced()).await;
     let coverage = collect_coverage_records(
@@ -2189,6 +2366,8 @@ async fn snapshot_and_seal(
         return Ok(CycleOutcome {
             sealed: Vec::new(),
             deferred,
+            activity_hot,
+            replication_hot,
         });
     }
     let flushed = encode_window(buffers, &interner, config)?;
@@ -2269,7 +2448,12 @@ async fn snapshot_and_seal(
     ) {
         sealed.push((seal_open_segment(journal, config, segment, reason)?, reason));
     }
-    Ok(CycleOutcome { sealed, deferred })
+    Ok(CycleOutcome {
+        sealed,
+        deferred,
+        activity_hot,
+        replication_hot,
+    })
 }
 
 /// Everything one tick reads from the main connection, gated by `due`.
@@ -2632,6 +2816,51 @@ fn activity_has_lock_waiters(rows: &[ActivityRow]) -> bool {
         .any(|row| row.wait_event_type.as_deref() == Some("Lock"))
 }
 
+/// Whether the activity snapshot justifies the accelerated pace: a backend
+/// waits on a heavyweight lock, or active client backends reach `threshold`.
+fn activity_needs_acceleration(rows: &[ActivityRow], threshold: usize) -> bool {
+    if activity_has_lock_waiters(rows) {
+        return true;
+    }
+    let active_clients = rows
+        .iter()
+        .filter(|row| {
+            row.backend_type == "client backend" && row.state.as_deref() == Some("active")
+        })
+        .count();
+    active_clients >= threshold
+}
+
+/// Whether the replication snapshot justifies the accelerated pace: a replica
+/// or this standby replays behind `lag_trigger_s`, or a slot retains at least
+/// `retained_trigger_bytes` of WAL.
+fn replication_needs_acceleration(
+    instance: &ReplicationInstanceRow,
+    replicas: &[ReplicaRow],
+    slots: &[SlotRow],
+    lag_trigger_s: i64,
+    retained_trigger_bytes: i64,
+) -> bool {
+    if instance
+        .replay_lag_s
+        .is_some_and(|lag| lag >= lag_trigger_s)
+    {
+        return true;
+    }
+    let replica_lag_floor_us = lag_trigger_s.saturating_mul(1_000_000);
+    if replicas.iter().any(|replica| {
+        replica
+            .replay_lag_us
+            .is_some_and(|lag| lag >= replica_lag_floor_us)
+    }) {
+        return true;
+    }
+    slots.iter().any(|slot| {
+        slot.retained_bytes
+            .is_some_and(|bytes| bytes >= retained_trigger_bytes)
+    })
+}
+
 /// The open (not yet sealed) segment: its file name comes from the first
 /// window's timestamp, its age from the moment that window was appended.
 #[derive(Debug, Default, Clone, Copy)]
@@ -2653,6 +2882,10 @@ impl SegmentState {
     fn age_expired(&self, now: Instant, max_age: Duration) -> bool {
         self.opened_at
             .is_some_and(|opened| now.duration_since(opened) >= max_age)
+    }
+
+    fn time_until_age(&self, now: Instant, max_age: Duration) -> Option<Duration> {
+        Some(max_age.saturating_sub(now.saturating_duration_since(self.opened_at?)))
     }
 }
 
@@ -3689,8 +3922,9 @@ fn push_store_plans_ossc(
 #[cfg(test)]
 mod tests {
     use super::{
-        PlansSourceCache, SegmentState, SourceCoverage, StatementsVersion, min_total_time,
-        seal_reason, statements_type_id, user_indexes_type_id, user_tables_type_id,
+        Intervals, PlansSourceCache, Scheduler, SegmentState, SourceCoverage, SourceKind,
+        StatementsVersion, min_total_time, seal_reason, statements_type_id, timer_sleep_delay,
+        user_indexes_type_id, user_tables_type_id,
     };
 
     #[test]
@@ -3753,6 +3987,81 @@ mod tests {
         assert!(
             cache.is_due(now + Duration::from_mins(5)),
             "the deadline itself is due"
+        );
+    }
+
+    #[test]
+    fn timer_sleep_uses_source_deadline_before_regular_tick() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let intervals = Intervals {
+            activity: 1,
+            ..Intervals::default()
+        };
+        let mut sched = Scheduler::new(intervals);
+        sched.plan(start, false);
+
+        assert_eq!(
+            timer_sleep_delay(
+                start,
+                5,
+                900,
+                &sched,
+                &PlansSourceCache::default(),
+                &SegmentState::default()
+            ),
+            Some(Duration::from_secs(1)),
+            "a 1s source interval is not capped by a 5s regular wake"
+        );
+    }
+
+    #[test]
+    fn timer_sleep_uses_accelerated_deadline_before_regular_tick() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut sched = Scheduler::new(Intervals::default());
+        sched.plan(start, false);
+        assert!(sched.accelerate(SourceKind::Activity, 1));
+
+        assert_eq!(
+            timer_sleep_delay(
+                start,
+                5,
+                900,
+                &sched,
+                &PlansSourceCache::default(),
+                &SegmentState::default()
+            ),
+            Some(Duration::from_secs(1)),
+            "default activity fast pace can wake before the 5s regular timer"
+        );
+    }
+
+    #[test]
+    fn timer_sleep_keeps_zero_interval_on_regular_wakes() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let intervals = Intervals {
+            activity: 0,
+            ..Intervals::default()
+        };
+        let mut sched = Scheduler::new(intervals);
+        sched.plan(start, false);
+
+        assert_eq!(
+            timer_sleep_delay(
+                start,
+                5,
+                900,
+                &sched,
+                &PlansSourceCache::default(),
+                &SegmentState::default()
+            ),
+            Some(Duration::from_secs(5)),
+            "zero means every timer wake, not an immediate busy loop"
         );
     }
 
@@ -3871,11 +4180,11 @@ mod tests {
 
     use super::{
         CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
-        activity_dict_limits, open_collector_journal, push_activity, push_archiver, push_database,
-        push_io, push_locks, push_prepared_xacts, push_progress_vacuum, push_replication_instance,
-        push_statements, push_user_indexes, push_user_tables, validate_cardinality,
-        validate_heavy_cap, validate_max_lock_rows, validate_replication_detail_bounds,
-        validate_settings_row_count,
+        activity_dict_limits, activity_needs_acceleration, open_collector_journal, push_activity,
+        push_archiver, push_database, push_io, push_locks, push_prepared_xacts,
+        push_progress_vacuum, push_replication_instance, push_statements, push_user_indexes,
+        push_user_tables, replication_needs_acceleration, validate_cardinality, validate_heavy_cap,
+        validate_max_lock_rows, validate_replication_detail_bounds, validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
@@ -3884,7 +4193,7 @@ mod tests {
     use kronika_source_pg::locks::{LocksRow, LocksVersion};
     use kronika_source_pg::prepared_xacts::PreparedXactsRow;
     use kronika_source_pg::progress_vacuum::ProgressVacuumRow;
-    use kronika_source_pg::replication_details::ReplicationDetailBounds;
+    use kronika_source_pg::replication_details::{ReplicaRow, ReplicationDetailBounds, SlotRow};
     use kronika_source_pg::replication_instance::ReplicationInstanceRow;
     use kronika_source_pg::statements::StatementsRow;
     use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion};
@@ -4551,6 +4860,109 @@ mod tests {
             latest_end_time: Some(950),
             received_tli: Some(2),
         }
+    }
+
+    fn trigger_replica_row(replay_lag_us: Option<i64>) -> ReplicaRow {
+        ReplicaRow {
+            ts: 1_000,
+            pid: 9,
+            usename: "repl".to_owned(),
+            application_name: "walreceiver".to_owned(),
+            client_addr: None,
+            state: "streaming".to_owned(),
+            sync_state: "async".to_owned(),
+            sync_priority: Some(0),
+            sent_lsn: Some(2_048),
+            write_lsn: Some(2_048),
+            flush_lsn: Some(2_048),
+            replay_lsn: Some(1_024),
+            write_lag_us: None,
+            flush_lag_us: None,
+            replay_lag_us,
+        }
+    }
+
+    fn trigger_slot_row(retained_bytes: Option<i64>) -> SlotRow {
+        SlotRow {
+            ts: 1_000,
+            slot_name: "standby_a".to_owned(),
+            plugin: None,
+            slot_type: "physical".to_owned(),
+            active: true,
+            restart_lsn: Some(1_024),
+            confirmed_flush_lsn: None,
+            retained_bytes,
+            wal_status: Some("reserved".to_owned()),
+        }
+    }
+
+    #[test]
+    fn activity_accelerates_on_lock_waiters_or_active_pressure() {
+        let mut waiter = client_row(1);
+        waiter.wait_event_type = Some("Lock".to_owned());
+        assert!(activity_needs_acceleration(&[waiter], 100));
+
+        let busy: Vec<_> = (0..3).map(client_row).collect();
+        assert!(activity_needs_acceleration(&busy, 3));
+        assert!(
+            !activity_needs_acceleration(&busy, 4),
+            "below the threshold, no lock waiters: base pace"
+        );
+
+        let mut walsender = client_row(5);
+        walsender.backend_type = "walsender".to_owned();
+        assert!(
+            !activity_needs_acceleration(&[walsender], 1),
+            "only client backends count toward the threshold"
+        );
+    }
+
+    #[test]
+    fn replication_accelerates_on_lag_or_retained_wal() {
+        let gib = 1_024 * 1_024 * 1_024;
+        let calm_instance = ReplicationInstanceRow {
+            replay_lag_s: None,
+            ..replication_instance_row()
+        };
+
+        assert!(
+            !replication_needs_acceleration(&calm_instance, &[], &[], 10, gib),
+            "nothing lags, nothing is retained"
+        );
+        assert!(
+            replication_needs_acceleration(&replication_instance_row(), &[], &[], 1, gib),
+            "this standby replays behind the trigger"
+        );
+        assert!(
+            replication_needs_acceleration(
+                &calm_instance,
+                &[trigger_replica_row(Some(11_000_000))],
+                &[],
+                10,
+                gib
+            ),
+            "a replica replays behind the trigger"
+        );
+        assert!(
+            !replication_needs_acceleration(
+                &calm_instance,
+                &[trigger_replica_row(Some(9_000_000))],
+                &[],
+                10,
+                gib
+            ),
+            "a replica under the trigger stays at base pace"
+        );
+        assert!(
+            replication_needs_acceleration(
+                &calm_instance,
+                &[],
+                &[trigger_slot_row(Some(gib))],
+                10,
+                gib
+            ),
+            "a slot retains enough WAL to trip the trigger"
+        );
     }
 
     #[test]
