@@ -1,11 +1,13 @@
 //! Per-source pacing for collection ticks.
 //!
 //! Each source has its own interval. A forced tick (`SIGUSR2`, and the first
-//! tick after start) reads every source, so the first segment after restart is
-//! self-contained and signal-driven collection keeps its contract. The
-//! `pg_store_plans` cadence remains inside the plans source cache. The
-//! lock-wait graph has no interval; it runs when the current activity snapshot
-//! shows a backend waiting on a heavyweight lock.
+//! timer tick after start) reads every source, so the first segment after
+//! restart is self-contained and signal-driven collection keeps its contract.
+//! Positive intervals can pull the next timer wake forward; explicit zero
+//! intervals run on every timer wake. The `pg_store_plans` cadence remains
+//! inside the plans source cache. The lock-wait graph has no interval; it runs
+//! when the current activity snapshot shows a backend waiting on a heavyweight
+//! lock.
 
 use std::time::{Duration, Instant};
 
@@ -157,6 +159,8 @@ const SEGMENT_OPEN_SOURCES: [SourceKind; 3] = [
 #[derive(Debug)]
 pub(crate) struct Scheduler {
     intervals: Intervals,
+    /// Trigger-accelerated intervals, overriding the base while active.
+    overrides: [Option<u64>; ALL_SOURCES.len()],
     last_read: [Option<Instant>; ALL_SOURCES.len()],
 }
 
@@ -164,8 +168,29 @@ impl Scheduler {
     pub(crate) const fn new(intervals: Intervals) -> Self {
         Self {
             intervals,
+            overrides: [None; ALL_SOURCES.len()],
             last_read: [None; ALL_SOURCES.len()],
         }
+    }
+
+    /// Pace `kind` at `secs` until [`Scheduler::relax`], returning whether the
+    /// pace changed. An acceleration at or above the base interval is a no-op:
+    /// operators disable a trigger by setting its fast interval to the base.
+    pub(crate) fn accelerate(&mut self, kind: SourceKind, secs: u64) -> bool {
+        if secs >= self.intervals.of(kind) {
+            return false;
+        }
+        let slot = slot_of(kind);
+        if self.overrides[slot] == Some(secs) {
+            return false;
+        }
+        self.overrides[slot] = Some(secs);
+        true
+    }
+
+    /// Return `kind` to its base interval, returning whether the pace changed.
+    pub(crate) fn relax(&mut self, kind: SourceKind) -> bool {
+        self.overrides[slot_of(kind)].take().is_some()
     }
 
     /// A segment was just sealed, so the next window must re-read the
@@ -181,6 +206,27 @@ impl Scheduler {
     /// Put a planned-but-unread source back: it comes due on the next tick.
     pub(crate) fn defer(&mut self, kind: SourceKind) {
         self.last_read[slot_of(kind)] = None;
+    }
+
+    /// Time until the next positive source interval elapses.
+    ///
+    /// Sources with no previous read, deferred sources, and explicit zero
+    /// intervals are read on the next timer wake; they do not pull the wake
+    /// forward by themselves.
+    pub(crate) fn next_elapsed_due_in(&self, now: Instant) -> Option<Duration> {
+        ALL_SOURCES
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, kind)| {
+                let last = self.last_read[slot]?;
+                let secs = self.overrides[slot].unwrap_or_else(|| self.intervals.of(*kind));
+                if secs == 0 {
+                    return None;
+                }
+                let interval = Duration::from_secs(secs);
+                Some(interval.saturating_sub(now.saturating_duration_since(last)))
+            })
+            .min()
     }
 
     /// The due set for a tick at `now`.
@@ -200,7 +246,8 @@ impl Scheduler {
         let indexes_read_before = self.last_read[slot_of(SourceKind::UserIndexes)].is_some();
         let mut kinds = Vec::new();
         for (slot, kind) in ALL_SOURCES.iter().enumerate() {
-            let interval = Duration::from_secs(self.intervals.of(*kind));
+            let secs = self.overrides[slot].unwrap_or_else(|| self.intervals.of(*kind));
+            let interval = Duration::from_secs(secs);
             let is_due =
                 self.last_read[slot].is_none_or(|last| now.duration_since(last) >= interval);
             if is_due {
@@ -399,6 +446,100 @@ mod tests {
         assert!(
             at_61.has(SourceKind::UserIndexes),
             "indexes run one tick later"
+        );
+    }
+
+    #[test]
+    fn acceleration_paces_a_source_faster_until_relaxed() {
+        let mut intervals = uniform(1000);
+        intervals.activity = 5;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+        scheduler.plan(start, false);
+
+        assert!(scheduler.accelerate(SourceKind::Activity, 1));
+        assert!(
+            !scheduler.accelerate(SourceKind::Activity, 1),
+            "re-arming the same pace is not a change"
+        );
+        assert!(
+            scheduler
+                .plan(start + Duration::from_secs(1), false)
+                .has(SourceKind::Activity),
+            "the accelerated pace makes a 1s tick due"
+        );
+
+        assert!(scheduler.relax(SourceKind::Activity));
+        assert!(!scheduler.relax(SourceKind::Activity), "already at base");
+        assert!(
+            !scheduler
+                .plan(start + Duration::from_secs(3), false)
+                .has(SourceKind::Activity),
+            "back at the 5s base, 2s after the last read is not due"
+        );
+    }
+
+    #[test]
+    fn acceleration_at_or_above_the_base_interval_is_ignored() {
+        let mut intervals = uniform(1000);
+        intervals.activity = 5;
+        let mut scheduler = Scheduler::new(intervals);
+        assert!(
+            !scheduler.accelerate(SourceKind::Activity, 5),
+            "a fast interval equal to the base disables the trigger"
+        );
+        assert!(!scheduler.accelerate(SourceKind::Activity, 30));
+    }
+
+    #[test]
+    fn acceleration_does_not_touch_other_sources() {
+        let mut scheduler = Scheduler::new(uniform(1000));
+        let start = Instant::now();
+        scheduler.plan(start, false);
+        scheduler.accelerate(SourceKind::Activity, 1);
+        let next = scheduler.plan(start + Duration::from_secs(1), false);
+        assert!(next.has(SourceKind::Activity));
+        assert!(!next.has(SourceKind::Replication));
+    }
+
+    #[test]
+    fn next_due_uses_positive_accelerated_interval() {
+        let mut intervals = uniform(1000);
+        intervals.activity = 5;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+        scheduler.plan(start, false);
+        scheduler.accelerate(SourceKind::Activity, 1);
+
+        assert_eq!(
+            scheduler.next_elapsed_due_in(start),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            scheduler.next_elapsed_due_in(start + Duration::from_secs(1)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn zero_and_deferred_sources_wait_for_a_timer_wake() {
+        let mut intervals = uniform(1000);
+        intervals.activity = 0;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+        scheduler.plan(start, false);
+
+        assert_eq!(
+            scheduler.next_elapsed_due_in(start),
+            Some(Duration::from_secs(1000)),
+            "zero-interval sources are due on timer wakes, not a tight loop"
+        );
+
+        scheduler.defer(SourceKind::Replication);
+        assert_eq!(
+            scheduler.next_elapsed_due_in(start),
+            Some(Duration::from_secs(1000)),
+            "deferred sources return on the next timer wake"
         );
     }
 
