@@ -379,6 +379,7 @@ fn intervals_from_env() -> Result<Intervals> {
         )?,
         instance_metadata: env_u64("KRONIKA_INSTANCE_INTERVAL_S", defaults.instance_metadata)?,
         settings: env_u64("KRONIKA_PG_SETTINGS_INTERVAL_S", defaults.settings)?,
+        os_core: env_u64("KRONIKA_OS_CORE_INTERVAL_S", defaults.os_core)?,
     })
 }
 
