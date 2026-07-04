@@ -30,6 +30,7 @@ pub mod os_cpu;
 pub mod os_loadavg;
 pub mod os_meminfo;
 pub mod os_stat;
+pub mod os_vmstat;
 pub mod pg_locks;
 pub mod pg_prepared_xacts;
 pub mod pg_settings;
