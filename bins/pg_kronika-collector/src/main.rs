@@ -9,6 +9,8 @@
 //! - `KRONIKA_PG_DSN`: libpq connection string (key=value or URI) for the target
 //!   server;
 //! - `KRONIKA_OUT_DIR`: directory that receives sealed segments;
+//! - `KRONIKA_LOG_LEVEL`: collector stderr verbosity, one of `error`, `warn`,
+//!   `info`, `debug`, or `trace` (default `info`);
 //! - `KRONIKA_SOURCE_ID`: `u64` stamped into every sealed segment to identify
 //!   the source (default `0`). Sealing refuses to mix two *non-zero* source ids
 //!   in one segment, so distinct collectors sharing a `KRONIKA_OUT_DIR` must use
@@ -141,13 +143,14 @@ use kronika_source_pg::{
     to_v3,
 };
 use kronika_writer::{
-    DEFAULT_MAX_JOURNAL_LEN, Interner, Journal, JournalConfig, JournalError, SectionBuffers, dict,
-    seal,
+    DEFAULT_MAX_JOURNAL_LEN, FlushSummary, FlushedPart, Interner, Journal, JournalConfig,
+    JournalError, SectionBuffers, dict, seal,
 };
 use scheduler::{DueSet, Intervals, Scheduler, SourceKind};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
@@ -205,6 +208,245 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Error => 1,
+            Self::Warn => 2,
+            Self::Info => 3,
+            Self::Debug => 4,
+            Self::Trace => 5,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "error" => Some(Self::Error),
+            "warn" | "warning" => Some(Self::Warn),
+            "info" => Some(Self::Info),
+            "debug" => Some(Self::Debug),
+            "trace" => Some(Self::Trace),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogField {
+    key: &'static str,
+    value: String,
+}
+
+fn current_log_level() -> LogLevel {
+    static LOG_LEVEL: OnceLock<LogLevel> = OnceLock::new();
+    *LOG_LEVEL.get_or_init(|| {
+        std::env::var("KRONIKA_LOG_LEVEL")
+            .ok()
+            .and_then(|value| LogLevel::parse(value.trim()))
+            .unwrap_or(LogLevel::Info)
+    })
+}
+
+fn log_event(level: LogLevel, action: &'static str, fields: &[LogField]) {
+    if level.rank() > current_log_level().rank() {
+        return;
+    }
+    let mut line = String::from("pg_kronika-collector");
+    push_log_field(&mut line, "level", level.as_str());
+    push_log_field(&mut line, "action", action);
+    for field in fields {
+        push_log_field(&mut line, field.key, &field.value);
+    }
+    eprintln!("{line}");
+}
+
+fn push_log_field(line: &mut String, key: &str, value: &str) {
+    line.push(' ');
+    line.push_str(key);
+    line.push('=');
+    push_log_value(line, value);
+}
+
+fn push_log_value(line: &mut String, value: &str) {
+    let plain = !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| !b.is_ascii_whitespace() && b != b'=' && b != b'"' && b != b'\\');
+    if plain {
+        line.push_str(value);
+        return;
+    }
+    line.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => line.push_str("\\\""),
+            '\\' => line.push_str("\\\\"),
+            '\n' => line.push_str("\\n"),
+            '\r' => line.push_str("\\r"),
+            '\t' => line.push_str("\\t"),
+            _ => line.push(ch),
+        }
+    }
+    line.push('"');
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "log call sites pass owned display adapters and scalars; field stores the formatted value immediately"
+)]
+fn field(key: &'static str, value: impl ToString) -> LogField {
+    LogField {
+        key,
+        value: value.to_string(),
+    }
+}
+
+fn duration_ms(duration: Duration) -> String {
+    duration.as_millis().to_string()
+}
+
+const fn layout_id(type_id: u32) -> u32 {
+    type_id % 1_000
+}
+
+fn section_name(type_id: u32) -> &'static str {
+    kronika_registry::section_name(type_id).unwrap_or("unknown")
+}
+
+fn section_fields(type_id: u32) -> [LogField; 3] {
+    [
+        field("collection", section_name(type_id)),
+        field("type_id", type_id),
+        field("layout_id", layout_id(type_id)),
+    ]
+}
+
+const fn source_kind_name(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Activity => "activity",
+        SourceKind::Database => "database",
+        SourceKind::Bgwriter => "bgwriter",
+        SourceKind::Wal => "wal",
+        SourceKind::Io => "io",
+        SourceKind::Archiver => "archiver",
+        SourceKind::PreparedXacts => "prepared_xacts",
+        SourceKind::ProgressVacuum => "progress_vacuum",
+        SourceKind::Statements => "statements",
+        SourceKind::UserTables => "user_tables",
+        SourceKind::UserIndexes => "user_indexes",
+        SourceKind::Replication => "replication",
+        SourceKind::ResetMetadata => "reset_metadata",
+        SourceKind::InstanceMetadata => "instance_metadata",
+        SourceKind::Settings => "settings",
+    }
+}
+
+fn log_source_deferred(kind: SourceKind, major: u32) {
+    let mut fields = vec![
+        field("source_kind", source_kind_name(kind)),
+        field("reason", "cycle_db_budget"),
+        field("degraded", true),
+    ];
+    match kind {
+        SourceKind::UserTables => fields.extend(section_fields(user_tables_type_id(major))),
+        SourceKind::UserIndexes => fields.extend(section_fields(user_indexes_type_id(major))),
+        SourceKind::Statements => fields.push(field("collection", "pg_stat_statements")),
+        SourceKind::Activity
+        | SourceKind::Database
+        | SourceKind::Bgwriter
+        | SourceKind::Wal
+        | SourceKind::Io
+        | SourceKind::Archiver
+        | SourceKind::PreparedXacts
+        | SourceKind::ProgressVacuum
+        | SourceKind::Replication
+        | SourceKind::ResetMetadata
+        | SourceKind::InstanceMetadata
+        | SourceKind::Settings => {}
+    }
+    log_event(LogLevel::Warn, "collection_deferred", &fields);
+}
+
+fn log_collection_start(type_id: u32, source: &str) {
+    let [collection, type_id, layout_id] = section_fields(type_id);
+    log_event(
+        LogLevel::Debug,
+        "collection_start",
+        &[collection, type_id, layout_id, field("source", source)],
+    );
+}
+
+fn log_database_collection_start(type_id: u32, database: &str) {
+    let [collection, type_id, layout_id] = section_fields(type_id);
+    log_event(
+        LogLevel::Debug,
+        "collection_start",
+        &[
+            collection,
+            type_id,
+            layout_id,
+            field("source", "database"),
+            field("database", database),
+        ],
+    );
+}
+
+fn log_collection_finish(type_id: u32, source: &str, rows: usize, elapsed: Duration) {
+    let [collection, type_id, layout_id] = section_fields(type_id);
+    log_event(
+        LogLevel::Debug,
+        "collection_finish",
+        &[
+            collection,
+            type_id,
+            layout_id,
+            field("source", source),
+            field("rows", rows),
+            field("elapsed_ms", duration_ms(elapsed)),
+        ],
+    );
+}
+
+fn log_collection_failure(
+    type_id: u32,
+    source: &str,
+    err: &(dyn std::fmt::Display + '_),
+    elapsed: Duration,
+) {
+    let [collection, type_id, layout_id] = section_fields(type_id);
+    log_event(
+        LogLevel::Error,
+        "collection_failure",
+        &[
+            collection,
+            type_id,
+            layout_id,
+            field("source", source),
+            field("error", err),
+            field("elapsed_ms", duration_ms(elapsed)),
+        ],
+    );
+}
+
 impl Config {
     fn from_env() -> Result<Self> {
         let dsn = std::env::var("KRONIKA_PG_DSN").context("KRONIKA_PG_DSN is not set")?;
@@ -226,7 +468,11 @@ impl Config {
             .map(str::to_owned)
             .collect();
         if !exclude_databases.is_empty() {
-            eprintln!("pg_kronika: excluding databases: {exclude_databases:?}");
+            log_event(
+                LogLevel::Info,
+                "config_exclude_databases",
+                &[field("databases", format!("{exclude_databases:?}"))],
+            );
         }
         let max_tables = i64::try_from(env_u64("KRONIKA_PG_MAX_TABLES", 500)?)
             .context("KRONIKA_PG_MAX_TABLES exceeds i64")?;
@@ -254,10 +500,14 @@ impl Config {
         let journal_max_bytes =
             env_u64("KRONIKA_JOURNAL_MAX_BYTES", DEFAULT_MAX_JOURNAL_LEN as u64)?;
         if segment_max_bytes > journal_max_bytes {
-            eprintln!(
-                "pg_kronika: KRONIKA_SEGMENT_MAX_BYTES ({segment_max_bytes}) exceeds \
-                 KRONIKA_JOURNAL_MAX_BYTES ({journal_max_bytes}); segments will rotate \
-                 at the journal cap instead"
+            log_event(
+                LogLevel::Warn,
+                "config_degraded",
+                &[
+                    field("reason", "segment_cap_exceeds_journal_cap"),
+                    field("segment_max_bytes", segment_max_bytes),
+                    field("journal_max_bytes", journal_max_bytes),
+                ],
             );
         }
         let cycle_db_budget_ms = env_u64("KRONIKA_CYCLE_DB_BUDGET_MS", 15_000)?;
@@ -567,12 +817,16 @@ async fn main() -> Result<()> {
         // sources fail or return no rows must still close an expired segment.
         let age = Duration::from_secs(config.segment_max_age_secs);
         if segment.age_expired(Instant::now(), age) {
-            match seal_open_segment(&mut journal, &config, &mut segment) {
+            match seal_open_segment(&mut journal, &config, &mut segment, "age") {
                 Ok(dest) => {
                     sched.mark_segment_opened();
                     announce(&format!("sealed {} reason=age", dest.display()));
                 }
-                Err(err) => eprintln!("pg_kronika-collector: segment seal failed: {err:#}"),
+                Err(err) => log_event(
+                    LogLevel::Error,
+                    "segment_seal_failure",
+                    &[field("reason", "age"), field("error", format!("{err:#}"))],
+                ),
             }
         }
         // The plans pace lives outside the scheduler; a tick with only the
@@ -615,7 +869,11 @@ async fn run_collection_cycle(
     pool_budget: &mut PoolBudget,
 ) {
     if let Err(err) = pool.ensure_main().await {
-        eprintln!("pg_kronika-collector: main reconnect failed: {err:#}");
+        log_event(
+            LogLevel::Error,
+            "pool_reconnect_failure",
+            &[field("source", "main"), field("error", format!("{err:#}"))],
+        );
         return;
     }
     if let Err(err) = pool
@@ -625,10 +883,18 @@ async fn run_collection_cycle(
         )
         .await
     {
-        eprintln!("pg_kronika-collector: pool refresh failed: {err:#}");
+        log_event(
+            LogLevel::Warn,
+            "pool_refresh_failure",
+            &[field("error", format!("{err:#}"))],
+        );
     }
     for db in pool.uncovered() {
-        eprintln!("pg_kronika-collector: database not covered this cycle: {db}");
+        log_event(
+            LogLevel::Warn,
+            "database_uncovered",
+            &[field("database", db), field("reason", "pool_limit")],
+        );
     }
     let major = pool.server_major();
     match snapshot_and_seal(
@@ -648,7 +914,7 @@ async fn run_collection_cycle(
             for kind in outcome.deferred {
                 // The budget pushed the source to the next tick, not dropped it.
                 sched.defer(kind);
-                eprintln!("pg_kronika-collector: cycle budget deferred {kind:?}");
+                log_source_deferred(kind, major);
             }
             for (dest, reason) in outcome.sealed {
                 // A fresh segment must be self-contained: the service sections
@@ -657,7 +923,11 @@ async fn run_collection_cycle(
                 announce(&format!("sealed {} reason={reason}", dest.display()));
             }
         }
-        Err(err) => eprintln!("pg_kronika-collector: snapshot failed: {err:#}"),
+        Err(err) => log_event(
+            LogLevel::Error,
+            "snapshot_failure",
+            &[field("error", format!("{err:#}"))],
+        ),
     }
 }
 
@@ -731,6 +1001,25 @@ const fn user_tables_type_id(major: u32) -> u32 {
     }
 }
 
+/// The `1_001` layout collected on this server major.
+const fn activity_type_id(version: ActivityVersion) -> u32 {
+    match version {
+        ActivityVersion::V1 => 1_001_001,
+        ActivityVersion::V2 => 1_001_002,
+        ActivityVersion::V3 => 1_001_003,
+    }
+}
+
+/// The `1_005` layout collected on this server major.
+const fn database_type_id(version: DatabaseVersion) -> u32 {
+    match version {
+        DatabaseVersion::V1 => 1_005_001,
+        DatabaseVersion::V2 => 1_005_002,
+        DatabaseVersion::V3 => 1_005_003,
+        DatabaseVersion::V4 => 1_005_004,
+    }
+}
+
 /// The `1_014` layout collected on this server major.
 const fn user_indexes_type_id(major: u32) -> u32 {
     if major >= 16 { 1_014_002 } else { 1_014_001 }
@@ -758,6 +1047,30 @@ const fn statements_type_id(version: StatementsVersion) -> u32 {
     }
 }
 
+/// The `1_007` layout returned by `pg_stat_wal`.
+const fn wal_type_id(wal: &WalSnapshot) -> u32 {
+    match wal {
+        WalSnapshot::V1(_) => 1_007_001,
+        WalSnapshot::V2(_) => 1_007_002,
+    }
+}
+
+/// The `1_009` layout collected on this server major.
+const fn io_type_id(version: IoVersion) -> u32 {
+    match version {
+        IoVersion::V1 => 1_009_001,
+        IoVersion::V2 => 1_009_002,
+    }
+}
+
+/// The `1_011` layout collected on this server major.
+const fn locks_type_id(version: LocksVersion) -> u32 {
+    match version {
+        LocksVersion::V1 => 1_011_001,
+        LocksVersion::V2 => 1_011_002,
+    }
+}
+
 /// Collect `pg_stat_user_tables` from every pool database, returning owned rows.
 ///
 /// All awaits finish here so the caller can intern without holding the `!Send`
@@ -765,6 +1078,10 @@ const fn statements_type_id(version: StatementsVersion) -> u32 {
 /// `statement_timeout`: SQLSTATE `57014` widens it and retries the same database
 /// until the cap; any other error logs and skips that database so one bad
 /// database does not lose the whole segment.
+#[allow(
+    clippy::too_many_lines,
+    reason = "per-database retry, coverage, and diagnostic logging stay together for one source"
+)]
 async fn collect_user_tables_all(
     pool: &ConnectionPool,
     major: u32,
@@ -776,8 +1093,11 @@ async fn collect_user_tables_all(
     let mut user_tables = Vec::new();
     let mut coverage = SourceCoverage::default();
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
+    let type_id = user_tables_type_id(major);
     for db in pool.per_db() {
         loop {
+            let started = Instant::now();
+            log_database_collection_start(type_id, &db.datname);
             // The heavy size functions can be slow, so this query runs under a
             // wider statement_timeout. SET persists on the connection: it stays
             // in effect until the next database's SET overwrites it.
@@ -786,10 +1106,18 @@ async fn collect_user_tables_all(
                 .batch_execute(&format!("SET statement_timeout = {}", heavy.current_ms()))
                 .await
             {
-                eprintln!(
-                    "pg_kronika-collector: SET statement_timeout failed for {}: {err}; \
-                     user_tables query proceeds under the previously-set timeout",
-                    db.datname
+                log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", "database"),
+                        field("database", &db.datname),
+                        field("reason", "set_statement_timeout_failed"),
+                        field("error", &err),
+                    ],
                 );
             }
             match collect_user_tables(db.client(), major, config.max_tables).await {
@@ -800,34 +1128,88 @@ async fn collect_user_tables_all(
                     // Every selection axis is an unfiltered ORDER BY, so an
                     // empty read means an empty source: a zero total is exact.
                     coverage.total += source_total;
+                    log_event(
+                        LogLevel::Debug,
+                        "collection_finish",
+                        &[
+                            field("collection", section_name(user_tables_type_id(major))),
+                            field("type_id", user_tables_type_id(major)),
+                            field("layout_id", layout_id(user_tables_type_id(major))),
+                            field("source", "database"),
+                            field("database", &db.datname),
+                            field("rows", rows.len()),
+                            field("source_total", source_total),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
+                    );
                     user_tables.push((db.datname.clone(), version, rows));
                     break;
                 }
                 Err(err) if is_sqlstate(&err, "57014") && !heavy.at_cap() => {
+                    let old_timeout_ms = heavy.current_ms();
                     heavy.grow(); // statement_timeout hit; retry this database wider
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_retry",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "database"),
+                            field("database", &db.datname),
+                            field("reason", "statement_timeout"),
+                            field("timeout_ms", old_timeout_ms),
+                            field("next_timeout_ms", heavy.current_ms()),
+                            field("error", &err),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
+                    );
                 }
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
                     coverage.other_skips += 1;
-                    eprintln!(
-                        "pg_kronika-collector: skip user_tables for {} (lock_not_available): {err}",
-                        db.datname
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_skip",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "database"),
+                            field("database", &db.datname),
+                            field("reason", "lock_not_available"),
+                            field("error", &err),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
                     );
                     break;
                 }
                 Err(err) => {
-                    if is_sqlstate(&err, "57014") {
+                    let reason = if is_sqlstate(&err, "57014") {
                         coverage.timeouts += 1;
+                        "statement_timeout"
                     } else if is_sqlstate(&err, "42501") {
                         coverage.permission_skips += 1;
+                        "permission_denied"
                     } else {
                         coverage.other_skips += 1;
-                    }
+                        "query_failed"
+                    };
                     coverage.unknown_total = true;
-                    eprintln!(
-                        "pg_kronika-collector: skip user_tables for {}: {err}",
-                        db.datname
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_skip",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "database"),
+                            field("database", &db.datname),
+                            field("reason", reason),
+                            field("error", &err),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
                     );
                     break;
                 }
@@ -844,6 +1226,10 @@ async fn collect_user_tables_all(
 /// runs under an adaptive `statement_timeout`: SQLSTATE `57014` widens it and
 /// retries the same database until the cap; any other error logs and skips that
 /// database so one bad database does not lose the whole segment.
+#[allow(
+    clippy::too_many_lines,
+    reason = "per-database retry, coverage, and diagnostic logging stay together for one source"
+)]
 async fn collect_user_indexes_all(
     pool: &ConnectionPool,
     major: u32,
@@ -855,8 +1241,11 @@ async fn collect_user_indexes_all(
     let mut user_indexes = Vec::new();
     let mut coverage = SourceCoverage::default();
     let mut heavy = AdaptiveTimeout::new(15_000, config.heavy_timeout_cap_ms);
+    let type_id = user_indexes_type_id(major);
     for db in pool.per_db() {
         loop {
+            let started = Instant::now();
+            log_database_collection_start(type_id, &db.datname);
             // pg_relation_size over many indexes can be slow, so this query runs
             // under a wider statement_timeout. SET persists on the connection: it
             // stays in effect until the next database's SET overwrites it.
@@ -865,10 +1254,18 @@ async fn collect_user_indexes_all(
                 .batch_execute(&format!("SET statement_timeout = {}", heavy.current_ms()))
                 .await
             {
-                eprintln!(
-                    "pg_kronika-collector: SET statement_timeout failed for {}: {err}; \
-                     user_indexes query proceeds under the previously-set timeout",
-                    db.datname
+                log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", "database"),
+                        field("database", &db.datname),
+                        field("reason", "set_statement_timeout_failed"),
+                        field("error", &err),
+                    ],
                 );
             }
             match collect_user_indexes(db.client(), major, config.max_indexes).await {
@@ -877,34 +1274,88 @@ async fn collect_user_indexes_all(
                     // Same-statement total; an empty read means an empty
                     // source, so the zero total is exact.
                     coverage.total += source_total;
+                    log_event(
+                        LogLevel::Debug,
+                        "collection_finish",
+                        &[
+                            field("collection", section_name(user_indexes_type_id(major))),
+                            field("type_id", user_indexes_type_id(major)),
+                            field("layout_id", layout_id(user_indexes_type_id(major))),
+                            field("source", "database"),
+                            field("database", &db.datname),
+                            field("rows", rows.len()),
+                            field("source_total", source_total),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
+                    );
                     user_indexes.push((db.datname.clone(), version, rows));
                     break;
                 }
                 Err(err) if is_sqlstate(&err, "57014") && !heavy.at_cap() => {
+                    let old_timeout_ms = heavy.current_ms();
                     heavy.grow(); // statement_timeout hit; retry this database wider
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_retry",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "database"),
+                            field("database", &db.datname),
+                            field("reason", "statement_timeout"),
+                            field("timeout_ms", old_timeout_ms),
+                            field("next_timeout_ms", heavy.current_ms()),
+                            field("error", &err),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
+                    );
                 }
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
                     coverage.other_skips += 1;
-                    eprintln!(
-                        "pg_kronika-collector: skip user_indexes for {} (lock_not_available): {err}",
-                        db.datname
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_skip",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "database"),
+                            field("database", &db.datname),
+                            field("reason", "lock_not_available"),
+                            field("error", &err),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
                     );
                     break;
                 }
                 Err(err) => {
-                    if is_sqlstate(&err, "57014") {
+                    let reason = if is_sqlstate(&err, "57014") {
                         coverage.timeouts += 1;
+                        "statement_timeout"
                     } else if is_sqlstate(&err, "42501") {
                         coverage.permission_skips += 1;
+                        "permission_denied"
                     } else {
                         coverage.other_skips += 1;
-                    }
+                        "query_failed"
+                    };
                     coverage.unknown_total = true;
-                    eprintln!(
-                        "pg_kronika-collector: skip user_indexes for {}: {err}",
-                        db.datname
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_skip",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "database"),
+                            field("database", &db.datname),
+                            field("reason", reason),
+                            field("error", &err),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
                     );
                     break;
                 }
@@ -1085,11 +1536,29 @@ async fn collect_statements_from_candidate(
     cache: &mut StatementsSourceCache,
 ) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
     let label = candidate.source.label();
+    let started = Instant::now();
+    log_event(
+        LogLevel::Debug,
+        "collection_start",
+        &[
+            field("collection", "pg_stat_statements"),
+            field("source", &label),
+        ],
+    );
     let extversion = match statements_extversion(candidate.client).await {
         Ok(Some(extversion)) => extversion,
         Ok(None) => return None,
         Err(err) => {
-            eprintln!("pg_kronika-collector: pg_stat_statements probe failed on {label}: {err}");
+            log_event(
+                LogLevel::Warn,
+                "collection_probe_failure",
+                &[
+                    field("collection", "pg_stat_statements"),
+                    field("source", &label),
+                    field("error", &err),
+                    field("elapsed_ms", duration_ms(started.elapsed())),
+                ],
+            );
             return None;
         }
     };
@@ -1097,10 +1566,37 @@ async fn collect_statements_from_candidate(
     match collect_statements(candidate.client, version, config.max_statements).await {
         Ok((rows, source_total)) => {
             let version = cache.store(candidate.source, extversion);
+            let type_id = statements_type_id(version);
+            log_event(
+                LogLevel::Debug,
+                "collection_finish",
+                &[
+                    field("collection", section_name(type_id)),
+                    field("type_id", type_id),
+                    field("layout_id", layout_id(type_id)),
+                    field("source", &label),
+                    field("rows", rows.len()),
+                    field("source_total", source_total),
+                    field("elapsed_ms", duration_ms(started.elapsed())),
+                ],
+            );
             Some((version, rows, source_total))
         }
         Err(err) => {
-            eprintln!("pg_kronika-collector: pg_stat_statements query failed on {label}: {err}");
+            let type_id = statements_type_id(version);
+            log_event(
+                LogLevel::Warn,
+                "collection_skip",
+                &[
+                    field("collection", section_name(type_id)),
+                    field("type_id", type_id),
+                    field("layout_id", layout_id(type_id)),
+                    field("source", &label),
+                    field("reason", "query_failed"),
+                    field("error", &err),
+                    field("elapsed_ms", duration_ms(started.elapsed())),
+                ],
+            );
             None
         }
     }
@@ -1117,8 +1613,13 @@ async fn discover_statements_source(
         }
     }
     cache.mark_missing(covered_statement_databases(pool));
-    eprintln!(
-        "pg_kronika-collector: no usable pg_stat_statements source on main or covered per-db connections; skipping section 1_002"
+    log_event(
+        LogLevel::Warn,
+        "collection_skip",
+        &[
+            field("collection", "pg_stat_statements"),
+            field("reason", "no_usable_source"),
+        ],
     );
     None
 }
@@ -1145,6 +1646,10 @@ async fn rediscover_missing_statements_source(
 /// to this discovery until an explicit source-db setting exists. All awaits
 /// finish here so the caller can intern without holding the `!Send` `Interner`
 /// across an await.
+#[allow(
+    clippy::too_many_lines,
+    reason = "cached source validation and rediscovery diagnostics are one state transition"
+)]
 async fn collect_statements_cached(
     pool: &ConnectionPool,
     config: &Config,
@@ -1152,44 +1657,103 @@ async fn collect_statements_cached(
 ) -> Option<(StatementsVersion, Vec<StatementsRow>, u64)> {
     if let Some(cached) = cache.selected.clone() {
         let label = cached.source.label();
+        let started = Instant::now();
         if let Some(client) = statement_client(pool, &cached.source) {
             match statements_extversion(client).await {
                 Ok(Some(extversion)) if cached.matches_extversion(&extversion) => {
                     match collect_statements(client, cached.version, config.max_statements).await {
                         Ok((rows, source_total)) => {
+                            let type_id = statements_type_id(cached.version);
+                            log_event(
+                                LogLevel::Debug,
+                                "collection_finish",
+                                &[
+                                    field("collection", section_name(type_id)),
+                                    field("type_id", type_id),
+                                    field("layout_id", layout_id(type_id)),
+                                    field("source", &label),
+                                    field("cached_source", true),
+                                    field("rows", rows.len()),
+                                    field("source_total", source_total),
+                                    field("elapsed_ms", duration_ms(started.elapsed())),
+                                ],
+                            );
                             return Some((cached.version, rows, source_total));
                         }
                         Err(err) => {
-                            eprintln!(
-                                "pg_kronika-collector: pg_stat_statements query failed on cached {label}: {err}; rediscovering"
+                            let type_id = statements_type_id(cached.version);
+                            log_event(
+                                LogLevel::Warn,
+                                "collection_probe_failure",
+                                &[
+                                    field("collection", section_name(type_id)),
+                                    field("type_id", type_id),
+                                    field("layout_id", layout_id(type_id)),
+                                    field("source", &label),
+                                    field("cached_source", true),
+                                    field("reason", "query_failed"),
+                                    field("error", &err),
+                                    field("elapsed_ms", duration_ms(started.elapsed())),
+                                ],
                             );
                             cache.invalidate();
                         }
                     }
                 }
                 Ok(Some(extversion)) => {
-                    eprintln!(
-                        "pg_kronika-collector: pg_stat_statements version changed on cached {label} ({} -> {extversion}); rediscovering",
-                        cached.extversion
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_probe_failure",
+                        &[
+                            field("collection", "pg_stat_statements"),
+                            field("source", &label),
+                            field("cached_source", true),
+                            field("reason", "extension_version_changed"),
+                            field("old_extversion", &cached.extversion),
+                            field("new_extversion", extversion),
+                        ],
                     );
                     cache.invalidate();
                 }
                 Ok(None) => {
-                    eprintln!(
-                        "pg_kronika-collector: pg_stat_statements extension missing on cached {label}; rediscovering"
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_probe_failure",
+                        &[
+                            field("collection", "pg_stat_statements"),
+                            field("source", &label),
+                            field("cached_source", true),
+                            field("reason", "extension_missing"),
+                        ],
                     );
                     cache.invalidate();
                 }
                 Err(err) => {
-                    eprintln!(
-                        "pg_kronika-collector: pg_stat_statements probe failed on cached {label}: {err}; rediscovering"
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_probe_failure",
+                        &[
+                            field("collection", "pg_stat_statements"),
+                            field("source", &label),
+                            field("cached_source", true),
+                            field("reason", "probe_failed"),
+                            field("error", &err),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
                     );
                     cache.invalidate();
                 }
             }
         } else {
-            eprintln!(
-                "pg_kronika-collector: cached pg_stat_statements source {label} is unavailable; rediscovering"
+            log_event(
+                LogLevel::Warn,
+                "collection_probe_failure",
+                &[
+                    field("collection", "pg_stat_statements"),
+                    field("source", &label),
+                    field("cached_source", true),
+                    field("reason", "source_unavailable"),
+                ],
             );
             cache.invalidate();
         }
@@ -1257,6 +1821,36 @@ impl PlansRead {
             Self::Ossc(rows) => rows.is_empty(),
         }
     }
+
+    const fn rows_len(&self) -> usize {
+        match self {
+            Self::Vadv(rows) => rows.len(),
+            Self::Ossc(rows) => rows.len(),
+        }
+    }
+
+    const fn type_id(&self) -> u32 {
+        match self {
+            Self::Vadv(_) => 1_004_001,
+            Self::Ossc(_) => 1_003_001,
+        }
+    }
+}
+
+impl PlansFork {
+    const fn type_id(self) -> u32 {
+        match self {
+            Self::Vadv => 1_004_001,
+            Self::Ossc => 1_003_001,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vadv => "vadv",
+            Self::Ossc => "ossc",
+        }
+    }
 }
 
 /// Delay until the next `pg_store_plans` read.
@@ -1273,6 +1867,10 @@ fn plans_reread_delay(rows_empty: bool, interval: Duration) -> Duration {
 
 /// One read attempt through the cached source; any failure invalidates it so
 /// the caller can decide when to rediscover.
+#[allow(
+    clippy::too_many_lines,
+    reason = "cached source validation and rediscovery diagnostics are one state transition"
+)]
 async fn try_cached_plans_read(
     pool: &ConnectionPool,
     config: &Config,
@@ -1281,6 +1879,8 @@ async fn try_cached_plans_read(
 ) -> Option<(PlansRead, u64)> {
     if let Some(cached) = cache.selected.clone() {
         let label = cached.source.label();
+        let started = Instant::now();
+        let type_id = cached.fork.type_id();
         if let Some(client) = statement_client(pool, &cached.source) {
             match store_plans_extversion(client).await {
                 Ok(Some(extversion)) if extversion == cached.extversion => {
@@ -1289,39 +1889,109 @@ async fn try_cached_plans_read(
                             cache.next_read = Some(
                                 now + plans_reread_delay(read.0.is_empty(), config.plans_interval),
                             );
+                            log_event(
+                                LogLevel::Debug,
+                                "collection_finish",
+                                &[
+                                    field("collection", section_name(type_id)),
+                                    field("type_id", type_id),
+                                    field("layout_id", layout_id(type_id)),
+                                    field("source", &label),
+                                    field("cached_source", true),
+                                    field("fork", cached.fork.as_str()),
+                                    field("rows", read.0.rows_len()),
+                                    field("source_total", read.1),
+                                    field("elapsed_ms", duration_ms(started.elapsed())),
+                                ],
+                            );
                             return Some(read);
                         }
                         Err(err) => {
-                            eprintln!(
-                                "pg_kronika-collector: pg_store_plans query failed on cached {label}: {err}; rediscovering"
+                            log_event(
+                                LogLevel::Warn,
+                                "collection_probe_failure",
+                                &[
+                                    field("collection", section_name(type_id)),
+                                    field("type_id", type_id),
+                                    field("layout_id", layout_id(type_id)),
+                                    field("source", &label),
+                                    field("cached_source", true),
+                                    field("fork", cached.fork.as_str()),
+                                    field("reason", "query_failed"),
+                                    field("error", &err),
+                                    field("elapsed_ms", duration_ms(started.elapsed())),
+                                ],
                             );
                             cache.selected = None;
                         }
                     }
                 }
                 Ok(Some(extversion)) => {
-                    eprintln!(
-                        "pg_kronika-collector: pg_store_plans version changed on cached {label} ({} -> {extversion}); rediscovering",
-                        cached.extversion
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_probe_failure",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", &label),
+                            field("cached_source", true),
+                            field("fork", cached.fork.as_str()),
+                            field("reason", "extension_version_changed"),
+                            field("old_extversion", &cached.extversion),
+                            field("new_extversion", extversion),
+                        ],
                     );
                     cache.selected = None;
                 }
                 Ok(None) => {
-                    eprintln!(
-                        "pg_kronika-collector: pg_store_plans extension missing on cached {label}; rediscovering"
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_probe_failure",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", &label),
+                            field("cached_source", true),
+                            field("fork", cached.fork.as_str()),
+                            field("reason", "extension_missing"),
+                        ],
                     );
                     cache.selected = None;
                 }
                 Err(err) => {
-                    eprintln!(
-                        "pg_kronika-collector: pg_store_plans probe failed on cached {label}: {err}; rediscovering"
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_probe_failure",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", &label),
+                            field("cached_source", true),
+                            field("fork", cached.fork.as_str()),
+                            field("reason", "probe_failed"),
+                            field("error", &err),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
                     );
                     cache.selected = None;
                 }
             }
         } else {
-            eprintln!(
-                "pg_kronika-collector: cached pg_store_plans source {label} is unavailable; rediscovering"
+            log_event(
+                LogLevel::Warn,
+                "collection_probe_failure",
+                &[
+                    field("collection", section_name(type_id)),
+                    field("type_id", type_id),
+                    field("layout_id", layout_id(type_id)),
+                    field("source", &label),
+                    field("cached_source", true),
+                    field("fork", cached.fork.as_str()),
+                    field("reason", "source_unavailable"),
+                ],
             );
             cache.selected = None;
         }
@@ -1337,6 +2007,10 @@ async fn try_cached_plans_read(
 /// covered per-db connections. Returns `None` between paced reads and when no
 /// vadv 2.x source exists. All awaits finish here so the caller can intern
 /// without holding the `!Send` `Interner` across an await.
+#[allow(
+    clippy::too_many_lines,
+    reason = "source discovery, fork detection, and diagnostic skip reasons share one control flow"
+)]
 async fn collect_store_plans_cached(
     pool: &ConnectionPool,
     config: &Config,
@@ -1361,11 +2035,30 @@ async fn collect_store_plans_cached(
 
     for candidate in all_statements_candidates(pool) {
         let label = candidate.source.label();
+        let started = Instant::now();
+        log_event(
+            LogLevel::Debug,
+            "collection_start",
+            &[
+                field("collection", "pg_store_plans"),
+                field("source", &label),
+            ],
+        );
         let extversion = match store_plans_extversion(candidate.client).await {
             Ok(Some(extversion)) => extversion,
             Ok(None) => continue,
             Err(err) => {
-                eprintln!("pg_kronika-collector: pg_store_plans probe failed on {label}: {err}");
+                log_event(
+                    LogLevel::Warn,
+                    "collection_probe_failure",
+                    &[
+                        field("collection", "pg_store_plans"),
+                        field("source", &label),
+                        field("reason", "probe_failed"),
+                        field("error", &err),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
+                );
                 continue;
             }
         };
@@ -1374,34 +2067,67 @@ async fn collect_store_plans_cached(
             Ok(false) => match store_plans_is_ossc(candidate.client).await {
                 Ok(true) => PlansFork::Ossc,
                 Ok(false) => {
-                    eprintln!(
-                        "pg_kronika-collector: pg_store_plans on {label} matches neither the \
-                         vadv nor the ossc signature; skipping"
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_skip",
+                        &[
+                            field("collection", "pg_store_plans"),
+                            field("source", &label),
+                            field("reason", "unsupported_signature"),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
                     );
                     continue;
                 }
                 Err(err) => {
-                    eprintln!(
-                        "pg_kronika-collector: pg_store_plans signature probe failed on {label}: {err}"
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_probe_failure",
+                        &[
+                            field("collection", "pg_store_plans"),
+                            field("source", &label),
+                            field("reason", "signature_probe_failed"),
+                            field("error", &err),
+                            field("elapsed_ms", duration_ms(started.elapsed())),
+                        ],
                     );
                     continue;
                 }
             },
             Err(err) => {
-                eprintln!(
-                    "pg_kronika-collector: pg_store_plans signature probe failed on {label}: {err}"
+                log_event(
+                    LogLevel::Warn,
+                    "collection_probe_failure",
+                    &[
+                        field("collection", "pg_store_plans"),
+                        field("source", &label),
+                        field("reason", "signature_probe_failed"),
+                        field("error", &err),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
                 );
                 continue;
             }
         };
+        let type_id = fork.type_id();
         let supported = match fork {
             PlansFork::Vadv => extversion.starts_with("2."),
             PlansFork::Ossc => extversion.starts_with("1."),
         };
         if !supported {
-            eprintln!(
-                "pg_kronika-collector: pg_store_plans extversion {extversion} on {label} does \
-                 not match the {fork:?} layout; skipping"
+            log_event(
+                LogLevel::Warn,
+                "collection_skip",
+                &[
+                    field("collection", section_name(type_id)),
+                    field("type_id", type_id),
+                    field("layout_id", layout_id(type_id)),
+                    field("source", &label),
+                    field("fork", fork.as_str()),
+                    field("reason", "unsupported_extension_version"),
+                    field("extversion", extversion),
+                    field("elapsed_ms", duration_ms(started.elapsed())),
+                ],
             );
             continue;
         }
@@ -1414,10 +2140,37 @@ async fn collect_store_plans_cached(
                 });
                 cache.next_read =
                     Some(now + plans_reread_delay(read.0.is_empty(), config.plans_interval));
+                log_event(
+                    LogLevel::Debug,
+                    "collection_finish",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", &label),
+                        field("fork", fork.as_str()),
+                        field("rows", read.0.rows_len()),
+                        field("source_total", read.1),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
+                );
                 return Some(read);
             }
             Err(err) => {
-                eprintln!("pg_kronika-collector: pg_store_plans query failed on {label}: {err}");
+                log_event(
+                    LogLevel::Warn,
+                    "collection_skip",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", &label),
+                        field("fork", fork.as_str()),
+                        field("reason", "query_failed"),
+                        field("error", &err),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
+                );
             }
         }
     }
@@ -1465,9 +2218,17 @@ async fn collect_ossc_plans_with_budget(
     let (mut rows, masked, source_total) =
         collect_store_plans_ossc(client, config.max_plans, text_cap).await?;
     if masked > 0 {
-        eprintln!(
-            "pg_kronika-collector: pg_store_plans (ossc): {masked} privilege-masked rows \
-             skipped; grant the collector role pg_read_all_stats to cover other roles"
+        log_event(
+            LogLevel::Warn,
+            "collection_degraded",
+            &[
+                field("collection", section_name(1_003_001)),
+                field("type_id", 1_003_001),
+                field("layout_id", layout_id(1_003_001)),
+                field("fork", "ossc"),
+                field("reason", "privilege_masked_rows"),
+                field("skipped_rows", masked),
+            ],
         );
     }
     let per_text_cap = usize::try_from(config.max_plan_text).unwrap_or(usize::MAX);
@@ -1488,13 +2249,19 @@ async fn collect_ossc_plans_with_budget(
         budget = budget.saturating_sub(u64::try_from(text.len()).unwrap_or(u64::MAX));
         kept += 1;
     }
-    eprintln!(
-        "pg_kronika-collector: pg_store_plans (ossc) read: {} rows, {} plan texts, \
-         {} budget bytes left, {:?} elapsed",
-        rows.len(),
-        kept,
-        budget,
-        started.elapsed()
+    log_event(
+        LogLevel::Debug,
+        "plan_text_read_finish",
+        &[
+            field("collection", section_name(1_003_001)),
+            field("type_id", 1_003_001),
+            field("layout_id", layout_id(1_003_001)),
+            field("fork", "ossc"),
+            field("rows", rows.len()),
+            field("plan_texts", kept),
+            field("budget_bytes_left", budget),
+            field("elapsed_ms", duration_ms(started.elapsed())),
+        ],
     );
     Ok((rows, source_total))
 }
@@ -1521,9 +2288,18 @@ async fn collect_plans_with_texts(
         }
         let remaining = PLAN_TEXT_DEADLINE.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            eprintln!(
-                "pg_kronika-collector: plan-text deadline {PLAN_TEXT_DEADLINE:?} reached; \
-                 remaining rows seal NULL plans"
+            log_event(
+                LogLevel::Warn,
+                "collection_degraded",
+                &[
+                    field("collection", section_name(1_004_001)),
+                    field("type_id", 1_004_001),
+                    field("layout_id", layout_id(1_004_001)),
+                    field("fork", "vadv"),
+                    field("reason", "plan_text_deadline"),
+                    field("deadline_ms", duration_ms(PLAN_TEXT_DEADLINE)),
+                    field("elapsed_ms", duration_ms(started.elapsed())),
+                ],
             );
             break;
         }
@@ -1535,10 +2311,19 @@ async fn collect_plans_with_texts(
         )
         .await;
         let Ok(attempt) = attempt else {
-            eprintln!(
-                "pg_kronika-collector: plan-text fetch for planid {} exceeded the \
-                 deadline; remaining rows seal NULL plans",
-                row.planid
+            log_event(
+                LogLevel::Warn,
+                "collection_degraded",
+                &[
+                    field("collection", section_name(1_004_001)),
+                    field("type_id", 1_004_001),
+                    field("layout_id", layout_id(1_004_001)),
+                    field("fork", "vadv"),
+                    field("reason", "plan_text_fetch_timeout"),
+                    field("planid", row.planid),
+                    field("deadline_ms", duration_ms(PLAN_TEXT_DEADLINE)),
+                    field("elapsed_ms", duration_ms(started.elapsed())),
+                ],
             );
             break;
         };
@@ -1552,21 +2337,37 @@ async fn collect_plans_with_texts(
             // The entry vanished between enumeration and this call.
             Ok(None) => {}
             Err(err) => {
-                eprintln!(
-                    "pg_kronika-collector: plan text fetch failed for planid {}: {err}",
-                    row.planid
+                log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(1_004_001)),
+                        field("type_id", 1_004_001),
+                        field("layout_id", layout_id(1_004_001)),
+                        field("fork", "vadv"),
+                        field("reason", "plan_text_fetch_failed"),
+                        field("planid", row.planid),
+                        field("error", &err),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
                 );
                 break;
             }
         }
     }
-    eprintln!(
-        "pg_kronika-collector: pg_store_plans read: {} rows, {} plan texts, \
-         {} budget bytes left, {:?} elapsed",
-        rows.len(),
-        fetched,
-        budget,
-        started.elapsed()
+    log_event(
+        LogLevel::Debug,
+        "plan_text_read_finish",
+        &[
+            field("collection", section_name(1_004_001)),
+            field("type_id", 1_004_001),
+            field("layout_id", layout_id(1_004_001)),
+            field("fork", "vadv"),
+            field("rows", rows.len()),
+            field("plan_texts", fetched),
+            field("budget_bytes_left", budget),
+            field("elapsed_ms", duration_ms(started.elapsed())),
+        ],
     );
     Ok((rows, source_total))
 }
@@ -1585,6 +2386,7 @@ fn truncate_to_boundary(text: &mut String, max_bytes: usize) {
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the snapshot wires every piece of daemon state together once"
 )]
 async fn snapshot_and_seal(
@@ -1678,23 +2480,72 @@ async fn snapshot_and_seal(
             deferred,
         });
     }
-    let part = encode_window(buffers, &interner, config)?;
+    let flushed = encode_window(buffers, &interner, config)?;
     let mut sealed = Vec::new();
-    if let Err(err) = journal.append(&part) {
+    let append_started = Instant::now();
+    let journal_bytes_before = journal.bytes();
+    if let Err(err) = journal.append(&flushed.body) {
         match err {
             // The journal cap fired before the segment byte cap: seal what is
             // already on disk and retry — the first frame after a reset is
             // exempt from the cap, so the retry cannot return Full again.
-            JournalError::Full { .. } if segment.first_ts.is_some() => {
-                sealed.push((seal_open_segment(journal, config, segment)?, "journal-full"));
-                journal
-                    .append(&part)
+            JournalError::Full { len, max } if segment.first_ts.is_some() => {
+                log_event(
+                    LogLevel::Warn,
+                    "journal_full",
+                    &[
+                        field("journal_bytes", len),
+                        field("journal_max_bytes", max),
+                        field("part_bytes", flushed.summary.part_bytes),
+                        field("sections", flushed.summary.sections.len()),
+                        field("rows", summary_rows(&flushed.summary)),
+                    ],
+                );
+                sealed.push((
+                    seal_open_segment(journal, config, segment, "journal-full")?,
+                    "journal-full",
+                ));
+                let retry_started = Instant::now();
+                let journal_bytes_before = journal.bytes();
+                let part_ref = journal
+                    .append(&flushed.body)
                     .context("append the window after an early seal")?;
+                log_journal_append(
+                    &flushed.summary,
+                    part_ref.offset,
+                    part_ref.len,
+                    journal_bytes_before,
+                    journal.bytes(),
+                    retry_started.elapsed(),
+                    true,
+                );
             }
             other => {
+                log_event(
+                    LogLevel::Error,
+                    "journal_append_failure",
+                    &[
+                        field("part_bytes", flushed.summary.part_bytes),
+                        field("sections", flushed.summary.sections.len()),
+                        field("rows", summary_rows(&flushed.summary)),
+                        field("journal_bytes_before", journal_bytes_before),
+                        field("error", &other),
+                        field("elapsed_ms", duration_ms(append_started.elapsed())),
+                    ],
+                );
                 return Err(anyhow::Error::new(other).context("append the part to the journal"));
             }
         }
+    } else if let Some(part_ref) = journal.parts().last().copied() {
+        log_journal_append(
+            &flushed.summary,
+            part_ref.offset,
+            part_ref.len,
+            journal_bytes_before,
+            journal.bytes(),
+            append_started.elapsed(),
+            false,
+        );
     }
     let now = Instant::now();
     segment.on_window_appended(main_src.ts.0, now);
@@ -1705,7 +2556,7 @@ async fn snapshot_and_seal(
         config.segment_max_bytes,
         segment.age_expired(now, age),
     ) {
-        sealed.push((seal_open_segment(journal, config, segment)?, reason));
+        sealed.push((seal_open_segment(journal, config, segment, reason)?, reason));
     }
     Ok(CycleOutcome { sealed, deferred })
 }
@@ -1726,6 +2577,10 @@ struct MainConnSources {
 }
 
 /// Read the due main-connection sources.
+#[allow(
+    clippy::too_many_lines,
+    reason = "main-connection collection keeps each source's query, row count, and failure context adjacent"
+)]
 async fn collect_main_conn_sources(
     client: &Client,
     major: u32,
@@ -1736,74 +2591,255 @@ async fn collect_main_conn_sources(
         .await
         .context("read the snapshot timestamp")?;
     let bgwriter = if due.has(SourceKind::Bgwriter) {
-        Some(
-            collect_bgwriter_checkpointer(client, major)
-                .await
-                .context("collect type 1_006_001")?,
-        )
+        let type_id = 1_006_001;
+        let started = Instant::now();
+        log_collection_start(type_id, "main");
+        match collect_bgwriter_checkpointer(client, major).await {
+            Ok(row) => {
+                log_collection_finish(type_id, "main", 1, started.elapsed());
+                Some(row)
+            }
+            Err(err) => {
+                log_collection_failure(type_id, "main", &err, started.elapsed());
+                return Err(err).context("collect pg_stat_bgwriter + pg_stat_checkpointer");
+            }
+        }
     } else {
         None
     };
     let activity = if due.has(SourceKind::Activity) {
-        Some(
-            collect_activity(client, major)
-                .await
-                .context("collect pg_stat_activity")?,
-        )
+        let started = Instant::now();
+        let source = "main";
+        log_event(
+            LogLevel::Debug,
+            "collection_start",
+            &[
+                field("collection", "pg_stat_activity"),
+                field("source", source),
+            ],
+        );
+        match collect_activity(client, major).await {
+            Ok((version, rows)) => {
+                let type_id = activity_type_id(version);
+                log_collection_finish(type_id, source, rows.len(), started.elapsed());
+                Some((version, rows))
+            }
+            Err(err) => {
+                log_event(
+                    LogLevel::Error,
+                    "collection_failure",
+                    &[
+                        field("collection", "pg_stat_activity"),
+                        field("source", source),
+                        field("error", &err),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
+                );
+                return Err(err).context("collect pg_stat_activity");
+            }
+        }
     } else {
         None
     };
     let database = if due.has(SourceKind::Database) {
-        Some(
-            collect_database(client, major)
-                .await
-                .context("collect pg_stat_database")?,
-        )
+        let started = Instant::now();
+        log_event(
+            LogLevel::Debug,
+            "collection_start",
+            &[
+                field("collection", "pg_stat_database"),
+                field("source", "main"),
+            ],
+        );
+        match collect_database(client, major).await {
+            Ok((version, rows)) => {
+                let type_id = database_type_id(version);
+                log_collection_finish(type_id, "main", rows.len(), started.elapsed());
+                Some((version, rows))
+            }
+            Err(err) => {
+                log_event(
+                    LogLevel::Error,
+                    "collection_failure",
+                    &[
+                        field("collection", "pg_stat_database"),
+                        field("source", "main"),
+                        field("error", &err),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
+                );
+                return Err(err).context("collect pg_stat_database");
+            }
+        }
     } else {
         None
     };
     let progress_vacuum_rows = if due.has(SourceKind::ProgressVacuum) {
-        collect_progress_vacuum(client, major)
-            .await
-            .context("collect pg_stat_progress_vacuum")?
+        let type_id = 1_012_001;
+        let started = Instant::now();
+        log_collection_start(type_id, "main");
+        match collect_progress_vacuum(client, major).await {
+            Ok(rows) => {
+                log_collection_finish(type_id, "main", rows.len(), started.elapsed());
+                rows
+            }
+            Err(err) => {
+                log_collection_failure(type_id, "main", &err, started.elapsed());
+                return Err(err).context("collect pg_stat_progress_vacuum");
+            }
+        }
     } else {
         Vec::new()
     };
     let prepared_rows = if due.has(SourceKind::PreparedXacts) {
-        collect_prepared_xacts(client)
-            .await
-            .context("collect pg_prepared_xacts")?
+        let type_id = 1_010_001;
+        let started = Instant::now();
+        log_collection_start(type_id, "main");
+        match collect_prepared_xacts(client).await {
+            Ok(rows) => {
+                log_collection_finish(type_id, "main", rows.len(), started.elapsed());
+                rows
+            }
+            Err(err) => {
+                log_collection_failure(type_id, "main", &err, started.elapsed());
+                return Err(err).context("collect pg_prepared_xacts");
+            }
+        }
     } else {
         Vec::new()
     };
     let wal = if due.has(SourceKind::Wal) {
-        collect_wal(client, major)
-            .await
-            .context("collect pg_stat_wal")?
+        let started = Instant::now();
+        log_event(
+            LogLevel::Debug,
+            "collection_start",
+            &[field("collection", "pg_stat_wal"), field("source", "main")],
+        );
+        match collect_wal(client, major).await {
+            Ok(Some(wal)) => {
+                log_collection_finish(wal_type_id(&wal), "main", 1, started.elapsed());
+                Some(wal)
+            }
+            Ok(None) => {
+                log_event(
+                    LogLevel::Debug,
+                    "collection_skip",
+                    &[
+                        field("collection", "pg_stat_wal"),
+                        field("source", "main"),
+                        field("server_major", major),
+                        field("reason", "unsupported_server_major"),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
+                );
+                None
+            }
+            Err(err) => {
+                log_event(
+                    LogLevel::Error,
+                    "collection_failure",
+                    &[
+                        field("collection", "pg_stat_wal"),
+                        field("source", "main"),
+                        field("error", &err),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
+                );
+                return Err(err).context("collect pg_stat_wal");
+            }
+        }
     } else {
         None
     };
     let io = if due.has(SourceKind::Io) {
-        collect_io(client, major)
-            .await
-            .context("collect pg_stat_io")?
+        let started = Instant::now();
+        log_event(
+            LogLevel::Debug,
+            "collection_start",
+            &[field("collection", "pg_stat_io"), field("source", "main")],
+        );
+        match collect_io(client, major).await {
+            Ok(Some((version, rows))) => {
+                log_collection_finish(io_type_id(version), "main", rows.len(), started.elapsed());
+                Some((version, rows))
+            }
+            Ok(None) => {
+                log_event(
+                    LogLevel::Debug,
+                    "collection_skip",
+                    &[
+                        field("collection", "pg_stat_io"),
+                        field("source", "main"),
+                        field("server_major", major),
+                        field("reason", "unsupported_server_major"),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
+                );
+                None
+            }
+            Err(err) => {
+                log_event(
+                    LogLevel::Error,
+                    "collection_failure",
+                    &[
+                        field("collection", "pg_stat_io"),
+                        field("source", "main"),
+                        field("error", &err),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
+                );
+                return Err(err).context("collect pg_stat_io");
+            }
+        }
     } else {
         None
     };
     let archiver = if due.has(SourceKind::Archiver) {
-        Some(
-            collect_archiver(client)
-                .await
-                .context("collect pg_stat_archiver")?,
-        )
+        let type_id = 1_008_001;
+        let started = Instant::now();
+        log_collection_start(type_id, "main");
+        match collect_archiver(client).await {
+            Ok(row) => {
+                log_collection_finish(type_id, "main", 1, started.elapsed());
+                Some(row)
+            }
+            Err(err) => {
+                log_collection_failure(type_id, "main", &err, started.elapsed());
+                return Err(err).context("collect pg_stat_archiver");
+            }
+        }
     } else {
         None
     };
     let replication = if due.has(SourceKind::Replication) {
-        let instance_row = collect_replication_instance(client, major)
-            .await
-            .context("collect replication instance status")?;
+        let started = Instant::now();
+        log_collection_start(1_015_001, "main");
+        let instance_row = match collect_replication_instance(client, major).await {
+            Ok(row) => {
+                log_collection_finish(1_015_001, "main", 1, started.elapsed());
+                row
+            }
+            Err(err) => {
+                log_collection_failure(1_015_001, "main", &err, started.elapsed());
+                return Err(err).context("collect replication instance status");
+            }
+        };
+        log_collection_start(1_016_001, "main");
+        log_collection_start(1_017_001, "main");
+        let details_started = Instant::now();
         let (replica_rows, slot_rows) = collect_replication_details(client, major).await?;
+        log_collection_finish(
+            1_016_001,
+            "main",
+            replica_rows.len(),
+            details_started.elapsed(),
+        );
+        log_collection_finish(
+            1_017_001,
+            "main",
+            slot_rows.len(),
+            details_started.elapsed(),
+        );
         Some((instance_row, replica_rows, slot_rows))
     } else {
         None
@@ -1814,7 +2850,21 @@ async fn collect_main_conn_sources(
         Some((_, rows)) if activity_has_lock_waiters(rows) => {
             collect_lock_rows(client, major, config.max_lock_rows).await
         }
-        _ => Vec::new(),
+        _ => {
+            let type_id = locks_type_id(locks_version(major));
+            log_event(
+                LogLevel::Debug,
+                "collection_skip",
+                &[
+                    field("collection", section_name(type_id)),
+                    field("type_id", type_id),
+                    field("layout_id", layout_id(type_id)),
+                    field("source", "main"),
+                    field("reason", "no_lock_waiters"),
+                ],
+            );
+            Vec::new()
+        }
     };
     Ok(MainConnSources {
         ts,
@@ -1843,9 +2893,7 @@ fn push_main_conn_sections(
     src: &MainConnSources,
 ) -> Result<()> {
     if let Some(bgwriter) = src.bgwriter {
-        buffers
-            .push(bgwriter)
-            .map_err(|_row| anyhow::anyhow!("section buffer full for bgwriter"))?;
+        buffer_row(buffers, bgwriter)?;
     }
     if let Some((activity_version, activity_rows)) = &src.activity {
         push_activity(buffers, interner, *activity_version, activity_rows)?;
@@ -1932,12 +2980,78 @@ fn encode_window(
     mut buffers: SectionBuffers,
     interner: &Interner,
     config: &Config,
-) -> Result<Vec<u8>> {
+) -> Result<FlushedPart> {
+    let started = Instant::now();
     let dict_sections = dict::encode(interner.window()).context("encode the segment dictionary")?;
-    buffers
-        .flush(&dict_sections, config.source_id)
+    let flushed = buffers
+        .flush_with_summary(&dict_sections, config.source_id)
         .context("encode the collection window")?
-        .context("a buffered row must yield a part")
+        .context("a buffered row must yield a part")?;
+    log_flush_summary(&flushed.summary, config.source_id, started.elapsed());
+    Ok(flushed)
+}
+
+fn summary_rows(summary: &FlushSummary) -> u64 {
+    let mut rows = 0_u64;
+    for section in &summary.sections {
+        rows = rows.saturating_add(u64::from(section.rows));
+    }
+    rows
+}
+
+fn log_flush_summary(summary: &FlushSummary, source_id: u64, elapsed: Duration) {
+    log_event(
+        LogLevel::Debug,
+        "window_encoded",
+        &[
+            field("source_id", source_id),
+            field("sections", summary.sections.len()),
+            field("rows", summary_rows(summary)),
+            field("part_bytes", summary.part_bytes),
+            field("elapsed_ms", duration_ms(elapsed)),
+        ],
+    );
+    for section in &summary.sections {
+        let [collection, type_id, layout_id] = section_fields(section.type_id);
+        log_event(
+            LogLevel::Debug,
+            "section_encoded",
+            &[
+                collection,
+                type_id,
+                layout_id,
+                field("rows", section.rows),
+                field("encoded_bytes", section.body_bytes),
+                field("part_bytes", summary.part_bytes),
+            ],
+        );
+    }
+}
+
+fn log_journal_append(
+    summary: &FlushSummary,
+    part_offset: usize,
+    part_len: usize,
+    journal_bytes_before: usize,
+    journal_bytes_after: usize,
+    elapsed: Duration,
+    retry_after_seal: bool,
+) {
+    log_event(
+        LogLevel::Debug,
+        "journal_append_finish",
+        &[
+            field("part_offset", part_offset),
+            field("part_len", part_len),
+            field("part_bytes", summary.part_bytes),
+            field("sections", summary.sections.len()),
+            field("rows", summary_rows(summary)),
+            field("journal_bytes_before", journal_bytes_before),
+            field("journal_bytes_after", journal_bytes_after),
+            field("retry_after_seal", retry_after_seal),
+            field("elapsed_ms", duration_ms(elapsed)),
+        ],
+    );
 }
 
 /// Seal the open segment into `<first_ts>.pgm` and reset the journal.
@@ -1945,12 +3059,32 @@ fn seal_open_segment(
     journal: &mut Journal,
     config: &Config,
     segment: &mut SegmentState,
+    reason: &'static str,
 ) -> Result<PathBuf> {
     let first_ts = segment
         .first_ts
         .context("sealing an open segment requires an appended window")?;
     let dest = config.out_dir.join(format!("{first_ts}.pgm"));
-    seal(journal, &dest).context("seal the segment")?;
+    let journal_bytes = journal.bytes();
+    let journal_parts = journal.parts().len();
+    let started = Instant::now();
+    let summary = seal(journal, &dest).context("seal the segment")?;
+    log_event(
+        LogLevel::Info,
+        "segment_seal_finish",
+        &[
+            field("segment_path", dest.display()),
+            field("segment_id", first_ts),
+            field("reason", reason),
+            field("sections", summary.sections),
+            field("segment_bytes", summary.bytes),
+            field("journal_bytes", journal_bytes),
+            field("journal_parts", journal_parts),
+            field("min_ts", summary.min_ts),
+            field("max_ts", summary.max_ts),
+            field("elapsed_ms", duration_ms(started.elapsed())),
+        ],
+    );
     // Leave active.parts intact if seal() fails.
     journal.reset().context("reset the journal after seal")?;
     *segment = SegmentState::default();
@@ -1971,9 +3105,13 @@ fn open_collector_journal(
     let (mut journal, report) =
         Journal::open(&out_dir.join("active.parts"), journal_config).context("open the journal")?;
     if report.has_media_damage() {
-        eprintln!(
-            "pg_kronika-collector: journal recovery found damaged regions; \
-             appending after them"
+        log_event(
+            LogLevel::Warn,
+            "journal_recovery_damaged",
+            &[
+                field("damaged_regions", report.damages.len()),
+                field("truncated_torn_tail", report.truncated_torn_tail),
+            ],
         );
     }
     if journal.parts().is_empty() {
@@ -1985,8 +3123,14 @@ fn open_collector_journal(
         // incompatible version) must not stop the daemon: drop it and start
         // collecting fresh.
         Err(err) => {
-            eprintln!(
-                "pg_kronika-collector: recovery seal failed, dropping the stale journal: {err:#}"
+            log_event(
+                LogLevel::Error,
+                "journal_recovery_seal_failure",
+                &[
+                    field("journal_bytes", journal.bytes()),
+                    field("journal_parts", journal.parts().len()),
+                    field("error", format!("{err:#}")),
+                ],
             );
             journal
                 .reset()
@@ -2011,13 +3155,41 @@ fn seal_recovered_journal(journal: &mut Journal, out_dir: &Path) -> Result<Optio
         }
     }
     let Some(first_ts) = first_ts else {
+        log_event(
+            LogLevel::Info,
+            "journal_recovery_empty",
+            &[
+                field("journal_bytes", journal.bytes()),
+                field("journal_parts", journal.parts().len()),
+                field("reason", "no_timestamped_sections"),
+            ],
+        );
         journal
             .reset()
             .context("reset a recovered journal with no data windows")?;
         return Ok(None);
     };
     let dest = out_dir.join(format!("{first_ts}.pgm"));
-    seal(journal, &dest).context("seal the recovered segment")?;
+    let journal_bytes = journal.bytes();
+    let journal_parts = journal.parts().len();
+    let started = Instant::now();
+    let summary = seal(journal, &dest).context("seal the recovered segment")?;
+    log_event(
+        LogLevel::Info,
+        "segment_seal_finish",
+        &[
+            field("segment_path", dest.display()),
+            field("segment_id", first_ts),
+            field("reason", "recovered"),
+            field("sections", summary.sections),
+            field("segment_bytes", summary.bytes),
+            field("journal_bytes", journal_bytes),
+            field("journal_parts", journal_parts),
+            field("min_ts", summary.min_ts),
+            field("max_ts", summary.max_ts),
+            field("elapsed_ms", duration_ms(started.elapsed())),
+        ],
+    );
     journal
         .reset()
         .context("reset the journal after the recovery seal")?;
@@ -2125,14 +3297,12 @@ fn statements_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<C
 /// total rides in the enumeration statement itself.
 fn plans_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<CoverageRecord> {
     let (read, source_total) = inputs.plans.as_ref()?;
-    let (source_type_id, collected, cutoff_value) = match read {
+    let (collected, cutoff_value) = match read {
         PlansRead::Vadv(rows) => (
-            1_004_001,
             rows.len() as u64,
             min_total_time(rows.iter().map(|r| r.total_time)),
         ),
         PlansRead::Ossc(rows) => (
-            1_003_001,
             rows.len() as u64,
             min_total_time(rows.iter().map(|r| r.total_time)),
         ),
@@ -2146,7 +3316,7 @@ fn plans_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<Covera
         other_skips: 0,
     };
     coverage.truncated().then(|| CoverageRecord {
-        source_type_id,
+        source_type_id: read.type_id(),
         coverage,
         max_n: u32::try_from(config.max_plans).unwrap_or(u32::MAX),
         order_by: "total_time",
@@ -2217,9 +3387,19 @@ async fn collect_service_sections(
         None
     };
     let settings = if due.has(SourceKind::Settings) {
-        let settings = collect_settings(pool.main())
-            .await
-            .context("collect pg_settings")?;
+        let type_id = 1_019_001;
+        let started = Instant::now();
+        log_collection_start(type_id, "main");
+        let settings = match collect_settings(pool.main()).await {
+            Ok(settings) => {
+                log_collection_finish(type_id, "main", settings.len(), started.elapsed());
+                settings
+            }
+            Err(err) => {
+                log_collection_failure(type_id, "main", &err, started.elapsed());
+                return Err(err).context("collect pg_settings");
+            }
+        };
         validate_settings_row_count(settings.len())?;
         settings
     } else {
@@ -2260,18 +3440,36 @@ async fn collect_reset_metadata_all(
     statements_cache: &StatementsSourceCache,
     plans_cache: &PlansSourceCache,
 ) -> Result<(ResetBase, ResetExtensions)> {
-    let base = collect_reset_base(pool.main(), major)
-        .await
-        .context("collect reset metadata")?;
+    let type_id = 1_020_001;
+    let started = Instant::now();
+    log_collection_start(type_id, "main");
+    let base = match collect_reset_base(pool.main(), major).await {
+        Ok(base) => {
+            log_collection_finish(type_id, "main", 1, started.elapsed());
+            base
+        }
+        Err(err) => {
+            log_collection_failure(type_id, "main", &err, started.elapsed());
+            return Err(err).context("collect reset metadata");
+        }
+    };
     let mut ext = ResetExtensions::default();
     if let Some(cached) = &statements_cache.selected {
         ext.statements_version = Some(cached.extversion.clone());
         if let Some(client) = statement_client(pool, &cached.source) {
             match statements_reset_at(client).await {
                 Ok(reset) => ext.statements_reset_at = reset,
-                Err(err) => eprintln!(
-                    "pg_kronika-collector: pg_stat_statements_info read failed on {}: {err}",
-                    cached.source.label()
+                Err(err) => log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", cached.source.label()),
+                        field("reason", "pg_stat_statements_info_failed"),
+                        field("error", &err),
+                    ],
                 ),
             }
         }
@@ -2281,9 +3479,17 @@ async fn collect_reset_metadata_all(
         if let Some(client) = statement_client(pool, &cached.source) {
             match store_plans_reset_at(client).await {
                 Ok(reset) => ext.store_plans_reset_at = reset,
-                Err(err) => eprintln!(
-                    "pg_kronika-collector: pg_store_plans_info read failed on {}: {err}",
-                    cached.source.label()
+                Err(err) => log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", cached.source.label()),
+                        field("reason", "pg_store_plans_info_failed"),
+                        field("error", &err),
+                    ],
                 ),
             }
         }
@@ -2303,13 +3509,32 @@ struct InstanceFacts {
 
 /// Collect the instance fingerprint; only the system identifier may degrade.
 async fn collect_instance_facts(client: &Client, config: &Config) -> Result<InstanceFacts> {
-    let pg = collect_pg_instance_facts(client)
-        .await
-        .context("collect instance metadata")?;
+    let type_id = 1_021_001;
+    let started = Instant::now();
+    log_collection_start(type_id, "main");
+    let pg = match collect_pg_instance_facts(client).await {
+        Ok(pg) => pg,
+        Err(err) => {
+            log_collection_failure(type_id, "main", &err, started.elapsed());
+            return Err(err).context("collect instance metadata");
+        }
+    };
     let system_identifier = match pg_system_identifier(client).await {
         Ok(id) => Some(id),
         Err(err) => {
-            eprintln!("pg_kronika-collector: pg_control_system() unavailable: {err}");
+            log_event(
+                LogLevel::Warn,
+                "collection_degraded",
+                &[
+                    field("collection", section_name(type_id)),
+                    field("type_id", type_id),
+                    field("layout_id", layout_id(type_id)),
+                    field("source", "main"),
+                    field("reason", "pg_control_system_unavailable"),
+                    field("error", &err),
+                    field("elapsed_ms", duration_ms(started.elapsed())),
+                ],
+            );
             None
         }
     };
@@ -2318,34 +3543,59 @@ async fn collect_instance_facts(client: &Client, config: &Config) -> Result<Inst
         .node_self_id
         .clone()
         .unwrap_or_else(|| os.hostname.clone());
-    Ok(InstanceFacts {
+    let facts = InstanceFacts {
         pg,
         system_identifier,
         os,
         node_self_id,
-    })
+    };
+    log_collection_finish(type_id, "main", 1, started.elapsed());
+    Ok(facts)
 }
 
 /// Collect lock-wait rows or degrade by skipping only section `1_011`.
 async fn collect_lock_rows(client: &Client, major: u32, max_lock_rows: i64) -> Vec<LocksRow> {
+    let type_id = locks_type_id(locks_version(major));
+    let started = Instant::now();
+    log_collection_start(type_id, "main");
     match collect_locks(client, major, max_lock_rows).await {
         Ok(snapshot) => {
             if let Some(skipped) = snapshot.skipped {
-                eprintln!(
-                    "pg_kronika-collector: skipping section 1_011 for this snapshot; \
-                     lock-wait graph exceeds KRONIKA_PG_MAX_LOCK_ROWS={} \
-                     (waiters={}, edges={}, nodes={})",
-                    skipped.max_rows, skipped.waiters, skipped.edges, skipped.nodes
+                log_event(
+                    LogLevel::Warn,
+                    "collection_skip",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", "main"),
+                        field("reason", "lock_graph_too_large"),
+                        field("max_rows", skipped.max_rows),
+                        field("waiters", skipped.waiters),
+                        field("edges", skipped.edges),
+                        field("nodes", skipped.nodes),
+                        field("elapsed_ms", duration_ms(started.elapsed())),
+                    ],
                 );
                 Vec::new()
             } else {
+                log_collection_finish(type_id, "main", snapshot.rows.len(), started.elapsed());
                 snapshot.rows
             }
         }
         Err(err) => {
-            eprintln!(
-                "pg_kronika-collector: pg_locks wait-tree collection failed; \
-                 skipping section 1_011 for this snapshot: {err}"
+            log_event(
+                LogLevel::Warn,
+                "collection_skip",
+                &[
+                    field("collection", section_name(type_id)),
+                    field("type_id", type_id),
+                    field("layout_id", layout_id(type_id)),
+                    field("source", "main"),
+                    field("reason", "query_failed"),
+                    field("error", &err),
+                    field("elapsed_ms", duration_ms(started.elapsed())),
+                ],
             );
             Vec::new()
         }
@@ -2641,16 +3891,52 @@ async fn collect_replication_details(
     client: &Client,
     major: u32,
 ) -> Result<(Vec<ReplicaRow>, Vec<SlotRow>)> {
-    let bounds = collect_replication_detail_bounds(client)
-        .await
-        .context("collect replication detail row bounds")?;
-    validate_replication_detail_bounds(bounds)?;
-    let replicas = collect_replication_replicas(client)
-        .await
-        .context("collect pg_stat_replication")?;
-    let slots = collect_replication_slots(client, major)
-        .await
-        .context("collect pg_replication_slots")?;
+    let started = Instant::now();
+    let bounds = match collect_replication_detail_bounds(client).await {
+        Ok(bounds) => bounds,
+        Err(err) => {
+            log_event(
+                LogLevel::Error,
+                "collection_failure",
+                &[
+                    field("collection", "replication_details"),
+                    field("source", "main"),
+                    field("reason", "bounds_query_failed"),
+                    field("error", &err),
+                    field("elapsed_ms", duration_ms(started.elapsed())),
+                ],
+            );
+            return Err(err).context("collect replication detail row bounds");
+        }
+    };
+    if let Err(err) = validate_replication_detail_bounds(bounds) {
+        log_event(
+            LogLevel::Error,
+            "collection_failure",
+            &[
+                field("collection", "replication_details"),
+                field("source", "main"),
+                field("reason", "bounds_validation_failed"),
+                field("error", format!("{err:#}")),
+                field("elapsed_ms", duration_ms(started.elapsed())),
+            ],
+        );
+        return Err(err);
+    }
+    let replicas = match collect_replication_replicas(client).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            log_collection_failure(1_016_001, "main", &err, started.elapsed());
+            return Err(err).context("collect pg_stat_replication");
+        }
+    };
+    let slots = match collect_replication_slots(client, major).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            log_collection_failure(1_017_001, "main", &err, started.elapsed());
+            return Err(err).context("collect pg_replication_slots");
+        }
+    };
     Ok((replicas, slots))
 }
 
@@ -2705,9 +3991,15 @@ fn buffer_row<S: kronika_registry::Section + 'static>(
     buffers: &mut SectionBuffers,
     row: S,
 ) -> Result<()> {
-    buffers
-        .push(row)
-        .map_err(|_row| anyhow::anyhow!("section buffer is full"))
+    let type_id = S::CONTRACT.type_id.get();
+    buffers.push(row).map_err(|_row| {
+        anyhow::anyhow!(
+            "section buffer is full: collection={} type_id={} layout_id={}",
+            section_name(type_id),
+            type_id,
+            layout_id(type_id)
+        )
+    })
 }
 
 fn announce(line: &str) {
@@ -2935,12 +4227,12 @@ mod tests {
     }
 
     use super::{
-        CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
-        activity_dict_limits, open_collector_journal, push_activity, push_archiver, push_database,
-        push_io, push_locks, push_prepared_xacts, push_progress_vacuum, push_replication_instance,
-        push_statements, push_user_indexes, push_user_tables, validate_cardinality,
-        validate_heavy_cap, validate_max_lock_rows, validate_replication_detail_bounds,
-        validate_settings_row_count,
+        CachedStatementsSource, LogLevel, MissingStatementsSource, StatementsSource,
+        StatementsSourceCache, activity_dict_limits, open_collector_journal, push_activity,
+        push_archiver, push_database, push_io, push_locks, push_log_value, push_prepared_xacts,
+        push_progress_vacuum, push_replication_instance, push_statements, push_user_indexes,
+        push_user_tables, validate_cardinality, validate_heavy_cap, validate_max_lock_rows,
+        validate_replication_detail_bounds, validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
@@ -2960,6 +4252,29 @@ mod tests {
     #[test]
     fn cardinality_validation_passes_at_defaults() {
         assert!(validate_cardinality(500, 500).is_ok());
+    }
+
+    #[test]
+    fn logfmt_value_quotes_spaces_and_escapes_control_characters() {
+        let mut out = String::new();
+        push_log_value(&mut out, "pg_stat_bgwriter + pg_stat_checkpointer");
+        assert_eq!(out, "\"pg_stat_bgwriter + pg_stat_checkpointer\"");
+
+        out.clear();
+        push_log_value(&mut out, "plain_value");
+        assert_eq!(out, "plain_value");
+
+        out.clear();
+        push_log_value(&mut out, "a=\"b\"\n");
+        assert_eq!(out, "\"a=\\\"b\\\"\\n\"");
+    }
+
+    #[test]
+    fn log_level_parse_accepts_configured_levels() {
+        assert_eq!(LogLevel::parse("error"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::parse("warning"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::parse("debug"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse("verbose"), None);
     }
 
     #[test]
