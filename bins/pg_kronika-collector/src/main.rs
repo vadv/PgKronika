@@ -84,6 +84,7 @@
 )]
 
 mod budget;
+mod logging;
 mod scheduler;
 
 use anyhow::{Context, Result};
@@ -144,15 +145,20 @@ use kronika_source_pg::{
     to_v3,
 };
 use kronika_writer::{
-    DEFAULT_MAX_JOURNAL_LEN, FlushSummary, FlushedPart, Interner, Journal, JournalConfig,
-    JournalError, SectionBuffers, dict, seal,
+    DEFAULT_MAX_JOURNAL_LEN, FlushedPart, Interner, Journal, JournalConfig, JournalError,
+    SectionBuffers, dict, seal,
+};
+use logging::{
+    CollectionFamily, LogLevel, duration_ms, field, layout_id, log_collection_failure,
+    log_collection_finish, log_collection_start, log_database_collection_finish,
+    log_database_collection_retry, log_database_collection_skip, log_database_collection_start,
+    log_event, log_flush_summary, log_journal_append, log_source_deferred, section_name,
+    summary_rows,
 };
 use scheduler::{DueSet, Intervals, Scheduler, SourceKind};
 use std::collections::HashSet;
-use std::fmt::{Display, Write as _};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
@@ -208,425 +214,6 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
         |_| Ok(default),
         |v| v.parse().with_context(|| format!("{key} is not a u64")),
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
-}
-
-impl LogLevel {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::Warn => "warn",
-            Self::Info => "info",
-            Self::Debug => "debug",
-            Self::Trace => "trace",
-        }
-    }
-
-    const fn rank(self) -> u8 {
-        match self {
-            Self::Error => 1,
-            Self::Warn => 2,
-            Self::Info => 3,
-            Self::Debug => 4,
-            Self::Trace => 5,
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "error" => Some(Self::Error),
-            "warn" | "warning" => Some(Self::Warn),
-            "info" => Some(Self::Info),
-            "debug" => Some(Self::Debug),
-            "trace" => Some(Self::Trace),
-            _ => None,
-        }
-    }
-}
-
-struct LogField<'a> {
-    key: &'static str,
-    value: LogValue<'a>,
-}
-
-enum LogValue<'a> {
-    Str(&'a str),
-    Display(&'a dyn Display),
-    Owned(String),
-    Bool(bool),
-    I32(i32),
-    I64(i64),
-    U32(u32),
-    U64(u64),
-    U128(u128),
-    Usize(usize),
-}
-
-trait IntoLogValue<'a> {
-    fn into_log_value(self) -> LogValue<'a>;
-}
-
-impl<'a, T: Display> IntoLogValue<'a> for &'a T {
-    fn into_log_value(self) -> LogValue<'a> {
-        LogValue::Display(self)
-    }
-}
-
-impl<'a> IntoLogValue<'a> for &'a str {
-    fn into_log_value(self) -> LogValue<'a> {
-        LogValue::Str(self)
-    }
-}
-
-impl<'a> IntoLogValue<'a> for &'a dyn Display {
-    fn into_log_value(self) -> LogValue<'a> {
-        LogValue::Display(self)
-    }
-}
-
-impl IntoLogValue<'static> for String {
-    fn into_log_value(self) -> LogValue<'static> {
-        LogValue::Owned(self)
-    }
-}
-
-impl IntoLogValue<'static> for std::path::Display<'_> {
-    fn into_log_value(self) -> LogValue<'static> {
-        LogValue::Owned(self.to_string())
-    }
-}
-
-impl IntoLogValue<'static> for bool {
-    fn into_log_value(self) -> LogValue<'static> {
-        LogValue::Bool(self)
-    }
-}
-
-impl IntoLogValue<'static> for i32 {
-    fn into_log_value(self) -> LogValue<'static> {
-        LogValue::I32(self)
-    }
-}
-
-impl IntoLogValue<'static> for i64 {
-    fn into_log_value(self) -> LogValue<'static> {
-        LogValue::I64(self)
-    }
-}
-
-impl IntoLogValue<'static> for u32 {
-    fn into_log_value(self) -> LogValue<'static> {
-        LogValue::U32(self)
-    }
-}
-
-impl IntoLogValue<'static> for u64 {
-    fn into_log_value(self) -> LogValue<'static> {
-        LogValue::U64(self)
-    }
-}
-
-impl IntoLogValue<'static> for u128 {
-    fn into_log_value(self) -> LogValue<'static> {
-        LogValue::U128(self)
-    }
-}
-
-impl IntoLogValue<'static> for usize {
-    fn into_log_value(self) -> LogValue<'static> {
-        LogValue::Usize(self)
-    }
-}
-
-fn current_log_level() -> LogLevel {
-    static LOG_LEVEL: OnceLock<LogLevel> = OnceLock::new();
-    *LOG_LEVEL.get_or_init(|| {
-        let Ok(value) = std::env::var("KRONIKA_LOG_LEVEL") else {
-            return LogLevel::Info;
-        };
-        let value = value.trim();
-        let Some(level) = parse_log_level_value(value) else {
-            emit_log_event(
-                LogLevel::Warn,
-                "invalid_log_level",
-                &[
-                    field("env", "KRONIKA_LOG_LEVEL"),
-                    field("value", value),
-                    field("fallback", LogLevel::Info.as_str()),
-                ],
-            );
-            return LogLevel::Info;
-        };
-        level
-    })
-}
-
-fn parse_log_level_value(value: &str) -> Option<LogLevel> {
-    let value = value.trim();
-    let value = value.to_ascii_lowercase();
-    LogLevel::parse(&value)
-}
-
-fn log_enabled(level: LogLevel) -> bool {
-    level.rank() <= current_log_level().rank()
-}
-
-fn log_event(level: LogLevel, action: &'static str, fields: &[LogField<'_>]) {
-    if log_enabled(level) {
-        emit_log_event(level, action, fields);
-    }
-}
-
-fn emit_log_event(level: LogLevel, action: &'static str, fields: &[LogField<'_>]) {
-    let line = render_log_line(level, action, fields);
-    eprintln!("{line}");
-}
-
-fn render_log_line(level: LogLevel, action: &'static str, fields: &[LogField<'_>]) -> String {
-    let mut line = String::from("pg_kronika-collector");
-    push_log_field(&mut line, "level", level.as_str());
-    push_log_field(&mut line, "action", action);
-    for field in fields {
-        push_log_field_value(&mut line, field.key, &field.value);
-    }
-    line
-}
-
-fn push_log_field(line: &mut String, key: &str, value: &str) {
-    line.push(' ');
-    line.push_str(key);
-    line.push('=');
-    push_log_value(line, value);
-}
-
-fn push_log_field_value(line: &mut String, key: &str, value: &LogValue<'_>) {
-    let mut rendered = String::new();
-    match value {
-        LogValue::Str(value) => {
-            push_log_field(line, key, value);
-            return;
-        }
-        LogValue::Display(value) => {
-            let _ = write!(&mut rendered, "{value}");
-        }
-        LogValue::Owned(value) => rendered.push_str(value),
-        LogValue::Bool(value) => {
-            let _ = write!(&mut rendered, "{value}");
-        }
-        LogValue::I32(value) => {
-            let _ = write!(&mut rendered, "{value}");
-        }
-        LogValue::I64(value) => {
-            let _ = write!(&mut rendered, "{value}");
-        }
-        LogValue::U32(value) => {
-            let _ = write!(&mut rendered, "{value}");
-        }
-        LogValue::U64(value) => {
-            let _ = write!(&mut rendered, "{value}");
-        }
-        LogValue::U128(value) => {
-            let _ = write!(&mut rendered, "{value}");
-        }
-        LogValue::Usize(value) => {
-            let _ = write!(&mut rendered, "{value}");
-        }
-    }
-    push_log_field(line, key, &rendered);
-}
-
-fn push_log_value(line: &mut String, value: &str) {
-    let plain = !value.is_empty()
-        && value.chars().all(|ch| {
-            !ch.is_whitespace() && !ch.is_control() && ch != '=' && ch != '"' && ch != '\\'
-        });
-    if plain {
-        line.push_str(value);
-        return;
-    }
-    line.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => line.push_str("\\\""),
-            '\\' => line.push_str("\\\\"),
-            '\n' => line.push_str("\\n"),
-            '\r' => line.push_str("\\r"),
-            '\t' => line.push_str("\\t"),
-            _ if ch.is_control() => {
-                line.push_str("\\u{");
-                let _ = write!(line, "{:x}", ch as u32);
-                line.push('}');
-            }
-            _ => line.push(ch),
-        }
-    }
-    line.push('"');
-}
-
-fn field<'a>(key: &'static str, value: impl IntoLogValue<'a>) -> LogField<'a> {
-    LogField {
-        key,
-        value: value.into_log_value(),
-    }
-}
-
-const fn duration_ms(duration: Duration) -> u128 {
-    duration.as_millis()
-}
-
-const fn layout_id(type_id: u32) -> u32 {
-    type_id % 1_000
-}
-
-fn section_name(type_id: u32) -> &'static str {
-    kronika_registry::section_name(type_id).unwrap_or("unknown")
-}
-
-fn section_fields(type_id: u32) -> [LogField<'static>; 3] {
-    [
-        field("collection", section_name(type_id)),
-        field("type_id", type_id),
-        field("layout_id", layout_id(type_id)),
-    ]
-}
-
-#[derive(Clone, Copy)]
-enum CollectionFamily {
-    Activity,
-    Database,
-    Statements,
-    StorePlans,
-    Wal,
-    Io,
-    ReplicationDetails,
-}
-
-impl CollectionFamily {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Activity => "pg_stat_activity",
-            Self::Database => "pg_stat_database",
-            Self::Statements => "pg_stat_statements",
-            Self::StorePlans => "pg_store_plans",
-            Self::Wal => "pg_stat_wal",
-            Self::Io => "pg_stat_io",
-            Self::ReplicationDetails => "replication_details",
-        }
-    }
-
-    fn field(self) -> LogField<'static> {
-        field("collection", self.name())
-    }
-}
-
-const fn source_kind_name(kind: SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Activity => "activity",
-        SourceKind::Database => "database",
-        SourceKind::Bgwriter => "bgwriter",
-        SourceKind::Wal => "wal",
-        SourceKind::Io => "io",
-        SourceKind::Archiver => "archiver",
-        SourceKind::PreparedXacts => "prepared_xacts",
-        SourceKind::ProgressVacuum => "progress_vacuum",
-        SourceKind::Statements => "statements",
-        SourceKind::UserTables => "user_tables",
-        SourceKind::UserIndexes => "user_indexes",
-        SourceKind::Replication => "replication",
-        SourceKind::ResetMetadata => "reset_metadata",
-        SourceKind::InstanceMetadata => "instance_metadata",
-        SourceKind::Settings => "settings",
-    }
-}
-
-fn log_source_deferred(kind: SourceKind, major: u32) {
-    let mut fields = vec![
-        field("source_kind", source_kind_name(kind)),
-        field("reason", "cycle_db_budget"),
-        field("deferred", true),
-    ];
-    match kind {
-        SourceKind::UserTables => fields.extend(section_fields(user_tables_type_id(major))),
-        SourceKind::UserIndexes => fields.extend(section_fields(user_indexes_type_id(major))),
-        SourceKind::Statements => fields.push(CollectionFamily::Statements.field()),
-        SourceKind::Activity
-        | SourceKind::Database
-        | SourceKind::Bgwriter
-        | SourceKind::Wal
-        | SourceKind::Io
-        | SourceKind::Archiver
-        | SourceKind::PreparedXacts
-        | SourceKind::ProgressVacuum
-        | SourceKind::Replication
-        | SourceKind::ResetMetadata
-        | SourceKind::InstanceMetadata
-        | SourceKind::Settings => {}
-    }
-    log_event(LogLevel::Debug, "collection_deferred", &fields);
-}
-
-fn log_collection_start(type_id: u32, source: &str) {
-    let [collection, type_id, layout_id] = section_fields(type_id);
-    log_event(
-        LogLevel::Debug,
-        "collection_start",
-        &[collection, type_id, layout_id, field("source", source)],
-    );
-}
-
-fn log_database_collection_start(type_id: u32, database: &str) {
-    let [collection, type_id, layout_id] = section_fields(type_id);
-    log_event(
-        LogLevel::Debug,
-        "collection_start",
-        &[
-            collection,
-            type_id,
-            layout_id,
-            field("source", "database"),
-            field("database", database),
-        ],
-    );
-}
-
-fn log_collection_finish(type_id: u32, source: &str, rows: usize, elapsed: Duration) {
-    let [collection, type_id, layout_id] = section_fields(type_id);
-    log_event(
-        LogLevel::Debug,
-        "collection_finish",
-        &[
-            collection,
-            type_id,
-            layout_id,
-            field("source", source),
-            field("rows", rows),
-            field("elapsed_ms", duration_ms(elapsed)),
-        ],
-    );
-}
-
-fn log_collection_failure(type_id: u32, source: &str, err: &(dyn Display + '_), elapsed: Duration) {
-    let [collection, type_id, layout_id] = section_fields(type_id);
-    log_event(
-        LogLevel::Error,
-        "collection_failure",
-        &[
-            collection,
-            type_id,
-            layout_id,
-            field("source", source),
-            field("error", err),
-            field("elapsed_ms", duration_ms(elapsed)),
-        ],
-    );
 }
 
 impl Config {
@@ -1174,7 +761,7 @@ struct CoverageRecord {
 }
 
 /// The `1_013` layout collected on this server major.
-const fn user_tables_type_id(major: u32) -> u32 {
+pub(crate) const fn user_tables_type_id(major: u32) -> u32 {
     match major {
         0..=12 => 1_013_001,
         13..=15 => 1_013_002,
@@ -1203,7 +790,7 @@ const fn database_type_id(version: DatabaseVersion) -> u32 {
 }
 
 /// The `1_014` layout collected on this server major.
-const fn user_indexes_type_id(major: u32) -> u32 {
+pub(crate) const fn user_indexes_type_id(major: u32) -> u32 {
     if major >= 16 { 1_014_002 } else { 1_014_001 }
 }
 
@@ -1310,19 +897,12 @@ async fn collect_user_tables_all(
                     // Every selection axis is an unfiltered ORDER BY, so an
                     // empty read means an empty source: a zero total is exact.
                     coverage.total += source_total;
-                    log_event(
-                        LogLevel::Debug,
-                        "collection_finish",
-                        &[
-                            field("collection", section_name(user_tables_type_id(major))),
-                            field("type_id", user_tables_type_id(major)),
-                            field("layout_id", layout_id(user_tables_type_id(major))),
-                            field("source", "database"),
-                            field("database", &db.datname),
-                            field("rows", rows.len()),
-                            field("source_total", source_total),
-                            field("elapsed_ms", duration_ms(started.elapsed())),
-                        ],
+                    log_database_collection_finish(
+                        type_id,
+                        &db.datname,
+                        rows.len(),
+                        source_total,
+                        started.elapsed(),
                     );
                     user_tables.push((db.datname.clone(), version, rows));
                     break;
@@ -1330,40 +910,25 @@ async fn collect_user_tables_all(
                 Err(err) if is_sqlstate(&err, "57014") && !heavy.at_cap() => {
                     let old_timeout_ms = heavy.current_ms();
                     heavy.grow(); // statement_timeout hit; retry this database wider
-                    log_event(
-                        LogLevel::Warn,
-                        "collection_retry",
-                        &[
-                            field("collection", section_name(type_id)),
-                            field("type_id", type_id),
-                            field("layout_id", layout_id(type_id)),
-                            field("source", "database"),
-                            field("database", &db.datname),
-                            field("reason", "statement_timeout"),
-                            field("timeout_ms", old_timeout_ms),
-                            field("next_timeout_ms", heavy.current_ms()),
-                            field("error", &err),
-                            field("elapsed_ms", duration_ms(started.elapsed())),
-                        ],
+                    log_database_collection_retry(
+                        type_id,
+                        &db.datname,
+                        old_timeout_ms,
+                        heavy.current_ms(),
+                        &err,
+                        started.elapsed(),
                     );
                 }
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
                     coverage.other_skips += 1;
-                    log_event(
-                        LogLevel::Warn,
-                        "collection_skip",
-                        &[
-                            field("collection", section_name(type_id)),
-                            field("type_id", type_id),
-                            field("layout_id", layout_id(type_id)),
-                            field("source", "database"),
-                            field("database", &db.datname),
-                            field("reason", "lock_not_available"),
-                            field("error", &err),
-                            field("elapsed_ms", duration_ms(started.elapsed())),
-                        ],
+                    log_database_collection_skip(
+                        type_id,
+                        &db.datname,
+                        "lock_not_available",
+                        &err,
+                        started.elapsed(),
                     );
                     break;
                 }
@@ -1379,19 +944,12 @@ async fn collect_user_tables_all(
                         "query_failed"
                     };
                     coverage.unknown_total = true;
-                    log_event(
-                        LogLevel::Warn,
-                        "collection_skip",
-                        &[
-                            field("collection", section_name(type_id)),
-                            field("type_id", type_id),
-                            field("layout_id", layout_id(type_id)),
-                            field("source", "database"),
-                            field("database", &db.datname),
-                            field("reason", reason),
-                            field("error", &err),
-                            field("elapsed_ms", duration_ms(started.elapsed())),
-                        ],
+                    log_database_collection_skip(
+                        type_id,
+                        &db.datname,
+                        reason,
+                        &err,
+                        started.elapsed(),
                     );
                     break;
                 }
@@ -1456,19 +1014,12 @@ async fn collect_user_indexes_all(
                     // Same-statement total; an empty read means an empty
                     // source, so the zero total is exact.
                     coverage.total += source_total;
-                    log_event(
-                        LogLevel::Debug,
-                        "collection_finish",
-                        &[
-                            field("collection", section_name(user_indexes_type_id(major))),
-                            field("type_id", user_indexes_type_id(major)),
-                            field("layout_id", layout_id(user_indexes_type_id(major))),
-                            field("source", "database"),
-                            field("database", &db.datname),
-                            field("rows", rows.len()),
-                            field("source_total", source_total),
-                            field("elapsed_ms", duration_ms(started.elapsed())),
-                        ],
+                    log_database_collection_finish(
+                        type_id,
+                        &db.datname,
+                        rows.len(),
+                        source_total,
+                        started.elapsed(),
                     );
                     user_indexes.push((db.datname.clone(), version, rows));
                     break;
@@ -1476,40 +1027,25 @@ async fn collect_user_indexes_all(
                 Err(err) if is_sqlstate(&err, "57014") && !heavy.at_cap() => {
                     let old_timeout_ms = heavy.current_ms();
                     heavy.grow(); // statement_timeout hit; retry this database wider
-                    log_event(
-                        LogLevel::Warn,
-                        "collection_retry",
-                        &[
-                            field("collection", section_name(type_id)),
-                            field("type_id", type_id),
-                            field("layout_id", layout_id(type_id)),
-                            field("source", "database"),
-                            field("database", &db.datname),
-                            field("reason", "statement_timeout"),
-                            field("timeout_ms", old_timeout_ms),
-                            field("next_timeout_ms", heavy.current_ms()),
-                            field("error", &err),
-                            field("elapsed_ms", duration_ms(started.elapsed())),
-                        ],
+                    log_database_collection_retry(
+                        type_id,
+                        &db.datname,
+                        old_timeout_ms,
+                        heavy.current_ms(),
+                        &err,
+                        started.elapsed(),
                     );
                 }
                 Err(err) if is_sqlstate(&err, "55P03") => {
                     // lock_not_available: another session holds a conflicting lock.
                     // Label it distinctly so contention is not read as a query bug.
                     coverage.other_skips += 1;
-                    log_event(
-                        LogLevel::Warn,
-                        "collection_skip",
-                        &[
-                            field("collection", section_name(type_id)),
-                            field("type_id", type_id),
-                            field("layout_id", layout_id(type_id)),
-                            field("source", "database"),
-                            field("database", &db.datname),
-                            field("reason", "lock_not_available"),
-                            field("error", &err),
-                            field("elapsed_ms", duration_ms(started.elapsed())),
-                        ],
+                    log_database_collection_skip(
+                        type_id,
+                        &db.datname,
+                        "lock_not_available",
+                        &err,
+                        started.elapsed(),
                     );
                     break;
                 }
@@ -1525,19 +1061,12 @@ async fn collect_user_indexes_all(
                         "query_failed"
                     };
                     coverage.unknown_total = true;
-                    log_event(
-                        LogLevel::Warn,
-                        "collection_skip",
-                        &[
-                            field("collection", section_name(type_id)),
-                            field("type_id", type_id),
-                            field("layout_id", layout_id(type_id)),
-                            field("source", "database"),
-                            field("database", &db.datname),
-                            field("reason", reason),
-                            field("error", &err),
-                            field("elapsed_ms", duration_ms(started.elapsed())),
-                        ],
+                    log_database_collection_skip(
+                        type_id,
+                        &db.datname,
+                        reason,
+                        &err,
+                        started.elapsed(),
                     );
                     break;
                 }
@@ -3167,69 +2696,6 @@ fn encode_window(
     Ok(flushed)
 }
 
-fn summary_rows(summary: &FlushSummary) -> u64 {
-    let mut rows = 0_u64;
-    for section in &summary.sections {
-        rows = rows.saturating_add(u64::from(section.rows));
-    }
-    rows
-}
-
-fn log_flush_summary(summary: &FlushSummary, source_id: u64, elapsed: Duration) {
-    log_event(
-        LogLevel::Debug,
-        "window_encoded",
-        &[
-            field("source_id", source_id),
-            field("sections", summary.sections.len()),
-            field("section_rows", summary_rows(summary)),
-            field("part_bytes", summary.part_bytes),
-            field("elapsed_ms", duration_ms(elapsed)),
-        ],
-    );
-    for section in &summary.sections {
-        let [collection, type_id, layout_id] = section_fields(section.type_id);
-        log_event(
-            LogLevel::Debug,
-            "section_encoded",
-            &[
-                collection,
-                type_id,
-                layout_id,
-                field("section_rows", section.rows),
-                field("encoded_bytes", section.body_bytes),
-                field("part_bytes", summary.part_bytes),
-            ],
-        );
-    }
-}
-
-fn log_journal_append(
-    summary: &FlushSummary,
-    part_offset: usize,
-    part_len: usize,
-    journal_bytes_before: usize,
-    journal_bytes_after: usize,
-    elapsed: Duration,
-    retry_after_seal: bool,
-) {
-    log_event(
-        LogLevel::Debug,
-        "journal_append_finish",
-        &[
-            field("part_offset", part_offset),
-            field("part_len", part_len),
-            field("part_bytes", summary.part_bytes),
-            field("sections", summary.sections.len()),
-            field("section_rows", summary_rows(summary)),
-            field("journal_bytes_before", journal_bytes_before),
-            field("journal_bytes_after", journal_bytes_after),
-            field("retry_after_seal", retry_after_seal),
-            field("elapsed_ms", duration_ms(elapsed)),
-        ],
-    );
-}
-
 /// Seal the open segment into `<first_ts>.pgm` and reset the journal.
 fn seal_open_segment(
     journal: &mut Journal,
@@ -4404,13 +3870,12 @@ mod tests {
     }
 
     use super::{
-        CachedStatementsSource, CollectionFamily, LogLevel, MissingStatementsSource,
-        StatementsSource, StatementsSourceCache, activity_dict_limits, field,
-        open_collector_journal, parse_log_level_value, push_activity, push_archiver, push_database,
-        push_io, push_locks, push_log_value, push_prepared_xacts, push_progress_vacuum,
-        push_replication_instance, push_statements, push_user_indexes, push_user_tables,
-        render_log_line, validate_cardinality, validate_heavy_cap, validate_max_lock_rows,
-        validate_replication_detail_bounds, validate_settings_row_count,
+        CachedStatementsSource, MissingStatementsSource, StatementsSource, StatementsSourceCache,
+        activity_dict_limits, open_collector_journal, push_activity, push_archiver, push_database,
+        push_io, push_locks, push_prepared_xacts, push_progress_vacuum, push_replication_instance,
+        push_statements, push_user_indexes, push_user_tables, validate_cardinality,
+        validate_heavy_cap, validate_max_lock_rows, validate_replication_detail_bounds,
+        validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
     use kronika_source_pg::archiver::ArchiverRow;
@@ -4430,54 +3895,6 @@ mod tests {
     #[test]
     fn cardinality_validation_passes_at_defaults() {
         assert!(validate_cardinality(500, 500).is_ok());
-    }
-
-    #[test]
-    fn logfmt_value_quotes_spaces_and_escapes_control_characters() {
-        let mut out = String::new();
-        push_log_value(&mut out, "pg_stat_bgwriter + pg_stat_checkpointer");
-        assert_eq!(out, "\"pg_stat_bgwriter + pg_stat_checkpointer\"");
-
-        out.clear();
-        push_log_value(&mut out, "plain_value");
-        assert_eq!(out, "plain_value");
-
-        out.clear();
-        push_log_value(&mut out, "a=\"b\"\n");
-        assert_eq!(out, "\"a=\\\"b\\\"\\n\"");
-
-        out.clear();
-        push_log_value(&mut out, "\u{1b}\0");
-        assert_eq!(out, "\"\\u{1b}\\u{0}\"");
-    }
-
-    #[test]
-    fn render_log_line_uses_collection_family_and_structured_fields() {
-        let line = render_log_line(
-            LogLevel::Warn,
-            "collection_skip",
-            &[
-                CollectionFamily::Statements.field(),
-                field("source", "database"),
-                field("database", "db one"),
-                field("section_rows", 3_u32),
-                field("error", "bad\u{1b}value"),
-            ],
-        );
-        assert_eq!(
-            line,
-            "pg_kronika-collector level=warn action=collection_skip collection=pg_stat_statements source=database database=\"db one\" section_rows=3 error=\"bad\\u{1b}value\""
-        );
-    }
-
-    #[test]
-    fn log_level_parse_accepts_configured_levels() {
-        assert_eq!(LogLevel::parse("error"), Some(LogLevel::Error));
-        assert_eq!(LogLevel::parse("warning"), Some(LogLevel::Warn));
-        assert_eq!(LogLevel::parse("debug"), Some(LogLevel::Debug));
-        assert_eq!(LogLevel::parse("verbose"), None);
-        assert_eq!(parse_log_level_value(" DEBUG "), Some(LogLevel::Debug));
-        assert_eq!(parse_log_level_value("verbose"), None);
     }
 
     #[test]
