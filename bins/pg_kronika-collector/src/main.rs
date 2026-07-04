@@ -101,8 +101,21 @@ use budget::{PoolBudget, PoolSource};
 use kronika_format::DictLimits;
 use kronika_registry::collection_coverage::CollectionCoverageV1;
 use kronika_registry::instance_metadata::InstanceMetadata;
+use kronika_registry::os_cpu::OsCpu;
+use kronika_registry::os_loadavg::OsLoadavg;
+use kronika_registry::os_meminfo::OsMeminfo;
+use kronika_registry::os_psi::OsPsi;
+use kronika_registry::os_stat::OsStat;
+use kronika_registry::os_vmstat::OsVmstat;
 use kronika_registry::{MAX_SECTION_ROWS, StrId, Ts};
-use kronika_source_os::{OsInstanceFacts, collect_os_instance_facts};
+use kronika_source_os::proc::loadavg::parse_loadavg;
+use kronika_source_os::proc::meminfo::parse_meminfo;
+use kronika_source_os::proc::pressure::parse_pressure;
+use kronika_source_os::proc::stat::{parse_cpu, parse_stat_misc};
+use kronika_source_os::proc::vmstat::parse_vmstat;
+use kronika_source_os::{
+    OsInstanceFacts, OsScope, ProcFs, collect_os_instance_facts, detect_container,
+};
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
 use kronika_source_pg::instance_metadata::{
@@ -2270,6 +2283,306 @@ async fn read_pool_sources(
     }
 }
 
+/// OS procfs sections collected synchronously in the read phase.
+struct OsSources {
+    cpu: Vec<OsCpu>,
+    stat: Option<OsStat>,
+    meminfo: Option<OsMeminfo>,
+    loadavg: Option<OsLoadavg>,
+    vmstat: Option<OsVmstat>,
+    psi: Vec<OsPsi>,
+}
+
+impl OsSources {
+    const fn empty() -> Self {
+        Self {
+            cpu: Vec::new(),
+            stat: None,
+            meminfo: None,
+            loadavg: None,
+            vmstat: None,
+            psi: Vec::new(),
+        }
+    }
+}
+
+/// Read the six procfs-core OS sections synchronously.
+///
+/// All reads are gated on `due.has(SourceKind::OsCore)`. On file read or parse
+/// failure the affected section is skipped and a `collection_degraded` event is
+/// logged; zeros are never fabricated.
+#[allow(
+    clippy::too_many_lines,
+    reason = "six independent procfs reads with per-source degradation logging kept adjacent"
+)]
+fn collect_os_sources(fs: &ProcFs, scope: u8, ts: i64, due: &DueSet) -> OsSources {
+    if !due.has(SourceKind::OsCore) {
+        return OsSources::empty();
+    }
+
+    let mut os = OsSources::empty();
+
+    // stat — read once, feed to both cpu and stat-misc parsers.
+    let stat_started = Instant::now();
+    match fs.read("stat") {
+        Ok(content) => {
+            // CPU rows (1_102_001)
+            let cpu_type_id = 1_102_001_u32;
+            match parse_cpu(&content, ts) {
+                Ok(rows) => {
+                    let n = rows.len();
+                    os.cpu = rows.into_iter().map(|r| r.to_section(scope)).collect();
+                    log_collection_finish(cpu_type_id, "procfs", n, stat_started.elapsed());
+                }
+                Err(err) => {
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_degraded",
+                        &[
+                            field("collection", section_name(cpu_type_id)),
+                            field("type_id", cpu_type_id),
+                            field("layout_id", layout_id(cpu_type_id)),
+                            field("source", "stat"),
+                            field("reason", &err.0),
+                        ],
+                    );
+                }
+            }
+            // Stat-misc row (1_103_001) — same content, separate parser.
+            // Its own clock so the reported latency excludes the CPU parse above.
+            let stat_misc_started = Instant::now();
+            let stat_type_id = 1_103_001_u32;
+            match parse_stat_misc(&content, ts) {
+                Ok(row) => {
+                    os.stat = Some(row.to_section(scope));
+                    log_collection_finish(stat_type_id, "procfs", 1, stat_misc_started.elapsed());
+                }
+                Err(err) => {
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_degraded",
+                        &[
+                            field("collection", section_name(stat_type_id)),
+                            field("type_id", stat_type_id),
+                            field("layout_id", layout_id(stat_type_id)),
+                            field("source", "stat"),
+                            field("reason", &err.0),
+                        ],
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            let cpu_type_id = 1_102_001_u32;
+            let stat_type_id = 1_103_001_u32;
+            log_event(
+                LogLevel::Warn,
+                "collection_degraded",
+                &[
+                    field("collection", section_name(cpu_type_id)),
+                    field("type_id", cpu_type_id),
+                    field("layout_id", layout_id(cpu_type_id)),
+                    field("source", "stat"),
+                    field("reason", &err),
+                ],
+            );
+            log_event(
+                LogLevel::Warn,
+                "collection_degraded",
+                &[
+                    field("collection", section_name(stat_type_id)),
+                    field("type_id", stat_type_id),
+                    field("layout_id", layout_id(stat_type_id)),
+                    field("source", "stat"),
+                    field("reason", &err),
+                ],
+            );
+        }
+    }
+
+    // meminfo (1_104_001)
+    {
+        let type_id = 1_104_001_u32;
+        let started = Instant::now();
+        match fs.read("meminfo") {
+            Ok(content) => match parse_meminfo(&content, ts) {
+                Ok(row) => {
+                    os.meminfo = Some(row.to_section(scope));
+                    log_collection_finish(type_id, "procfs", 1, started.elapsed());
+                }
+                Err(err) => {
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_degraded",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "meminfo"),
+                            field("reason", &err.0),
+                        ],
+                    );
+                }
+            },
+            Err(err) => {
+                log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", "meminfo"),
+                        field("reason", &err),
+                    ],
+                );
+            }
+        }
+    }
+
+    // loadavg (1_105_001)
+    {
+        let type_id = 1_105_001_u32;
+        let started = Instant::now();
+        match fs.read("loadavg") {
+            Ok(content) => match parse_loadavg(&content, ts) {
+                Ok(row) => {
+                    os.loadavg = Some(row.to_section(scope));
+                    log_collection_finish(type_id, "procfs", 1, started.elapsed());
+                }
+                Err(err) => {
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_degraded",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "loadavg"),
+                            field("reason", &err.0),
+                        ],
+                    );
+                }
+            },
+            Err(err) => {
+                log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", "loadavg"),
+                        field("reason", &err),
+                    ],
+                );
+            }
+        }
+    }
+
+    // vmstat (1_106_001)
+    {
+        let type_id = 1_106_001_u32;
+        let started = Instant::now();
+        match fs.read("vmstat") {
+            Ok(content) => match parse_vmstat(&content, ts) {
+                Ok(row) => {
+                    os.vmstat = Some(row.to_section(scope));
+                    log_collection_finish(type_id, "procfs", 1, started.elapsed());
+                }
+                Err(err) => {
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_degraded",
+                        &[
+                            field("collection", section_name(type_id)),
+                            field("type_id", type_id),
+                            field("layout_id", layout_id(type_id)),
+                            field("source", "vmstat"),
+                            field("reason", &err.0),
+                        ],
+                    );
+                }
+            },
+            Err(err) => {
+                log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", "vmstat"),
+                        field("reason", &err),
+                    ],
+                );
+            }
+        }
+    }
+
+    // PSI — cpu/memory/io as Option<String>; missing file → None (1_107_001)
+    {
+        let type_id = 1_107_001_u32;
+        let started = Instant::now();
+        let psi_cpu = fs.read_raw("pressure/cpu").ok();
+        let psi_memory = fs.read_raw("pressure/memory").ok();
+        let psi_io = fs.read_raw("pressure/io").ok();
+        match parse_pressure(
+            psi_cpu.as_deref(),
+            psi_memory.as_deref(),
+            psi_io.as_deref(),
+            ts,
+        ) {
+            Ok(rows) => {
+                let n = rows.len();
+                os.psi = rows.into_iter().map(|r| r.to_section(scope)).collect();
+                log_collection_finish(type_id, "procfs", n, started.elapsed());
+            }
+            Err(err) => {
+                log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(type_id)),
+                        field("type_id", type_id),
+                        field("layout_id", layout_id(type_id)),
+                        field("source", "pressure/{cpu,memory,io}"),
+                        field("reason", &err.0),
+                    ],
+                );
+            }
+        }
+    }
+
+    os
+}
+
+/// Buffer all six OS sections into the snapshot window.
+///
+/// # Errors
+/// Returns an error if a section buffer is full.
+fn push_os_sources(buffers: &mut SectionBuffers, os: &OsSources) -> Result<()> {
+    for row in &os.cpu {
+        buffer_row(buffers, *row)?;
+    }
+    if let Some(row) = os.stat {
+        buffer_row(buffers, row)?;
+    }
+    if let Some(row) = os.meminfo {
+        buffer_row(buffers, row)?;
+    }
+    if let Some(row) = os.loadavg {
+        buffer_row(buffers, row)?;
+    }
+    if let Some(row) = os.vmstat {
+        buffer_row(buffers, row)?;
+    }
+    for row in &os.psi {
+        buffer_row(buffers, *row)?;
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2344,6 +2657,17 @@ async fn snapshot_and_seal(
     let service =
         collect_service_sections(pool, major, config, statements_cache, plans_cache, due).await?;
 
+    // OS procfs read — synchronous, safe before SectionBuffers are built.
+    let fs = ProcFs::from_env();
+    let in_container = detect_container(&fs);
+    log_event(
+        LogLevel::Debug,
+        "os_core_read",
+        &[field("container", in_container)],
+    );
+    let scope = OsScope::Host.as_u8();
+    let os = collect_os_sources(&fs, scope, main_src.ts.0, due);
+
     let mut buffers = SectionBuffers::new();
     let mut interner = Interner::new(activity_dict_limits());
     push_main_conn_sections(&mut buffers, &mut interner, major, &main_src)?;
@@ -2358,6 +2682,7 @@ async fn snapshot_and_seal(
         store_plans_rows.as_ref().map(|(read, _total)| read),
     )?;
     push_service_sections(&mut buffers, &mut interner, &service)?;
+    push_os_sources(&mut buffers, &os)?;
     push_coverage(&mut buffers, &mut interner, main_src.ts.0, &coverage)?;
 
     if buffers.is_empty() {
