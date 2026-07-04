@@ -8,3 +8,6 @@ pub use fs::ProcFs;
 
 mod instance;
 pub use instance::{OsInstanceFacts, collect_os_instance_facts};
+
+mod scope;
+pub use scope::{OsScope, detect_container};
