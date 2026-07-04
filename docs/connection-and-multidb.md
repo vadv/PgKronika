@@ -130,7 +130,7 @@ Per-db refresh удаляет закрытые клиенты по `Client::is_c
 |---|---:|---|
 | `KRONIKA_PG_DSN` | нет | базовая строка подключения, `key=value` или URI |
 | `KRONIKA_OUT_DIR` | нет | каталог для запечатанных сегментов |
-| `KRONIKA_LOG_LEVEL` | `info` | stderr-логи коллектора: `error`, `warn`, `info`, `debug`, `trace` |
+| `KRONIKA_LOG_LEVEL` | `info` | уровень stderr-логов: `error`, `warn`, `info`, `debug`, `trace` |
 | `KRONIKA_SOURCE_ID` | `0` | идентификатор источника в сегменте |
 | `KRONIKA_PG_STATEMENT_TIMEOUT_MS` | `15000` | `statement_timeout` |
 | `KRONIKA_PG_LOCK_TIMEOUT_MS` | `1000` | `lock_timeout` |
