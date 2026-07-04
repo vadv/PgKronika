@@ -66,7 +66,7 @@ pub const DICT_STRINGS_TYPE_ID: u32 = 3_001_001;
 /// `type_id` of a `dict.blobs` section. See [`DICT_STRINGS_TYPE_ID`].
 pub const DICT_BLOBS_TYPE_ID: u32 = 3_002_001;
 
-/// Return the stable human-readable section name for a raw `type_id`.
+/// Return the registry section name for a raw `type_id`.
 #[must_use]
 pub fn section_name(type_id: u32) -> Option<&'static str> {
     match type_id {

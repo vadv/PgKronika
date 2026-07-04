@@ -9,7 +9,7 @@
 //! - `KRONIKA_PG_DSN`: libpq connection string (key=value or URI) for the target
 //!   server;
 //! - `KRONIKA_OUT_DIR`: directory that receives sealed segments;
-//! - `KRONIKA_LOG_LEVEL`: collector stderr verbosity, one of `error`, `warn`,
+//! - `KRONIKA_LOG_LEVEL`: collector stderr log level, one of `error`, `warn`,
 //!   `info`, `debug`, or `trace` (default `info`);
 //! - `KRONIKA_SOURCE_ID`: `u64` stamped into every sealed segment to identify
 //!   the source (default `0`). Sealing refuses to mix two *non-zero* source ids
@@ -311,7 +311,7 @@ fn push_log_value(line: &mut String, value: &str) {
 
 #[allow(
     clippy::needless_pass_by_value,
-    reason = "log call sites pass owned display adapters and scalars; field stores the formatted value immediately"
+    reason = "log fields format display adapters and scalars immediately"
 )]
 fn field(key: &'static str, value: impl ToString) -> LogField {
     LogField {

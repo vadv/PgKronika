@@ -48,7 +48,7 @@ pub struct FlushSummary {
 pub struct FlushedPart {
     /// PGM part body ready for `Journal::append`.
     pub body: Vec<u8>,
-    /// Section and byte counts for logging and metrics.
+    /// Section and byte counts for logs.
     pub summary: FlushSummary,
 }
 
