@@ -23,6 +23,35 @@ struct EncodedRows {
     ts_range: Option<(i64, i64)>,
 }
 
+/// Encoded bytes and row count for one section in a flushed journal part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionFlushSummary {
+    /// Section `type_id`.
+    pub type_id: u32,
+    /// Rows encoded into this section.
+    pub rows: u32,
+    /// Encoded section body bytes.
+    pub body_bytes: usize,
+}
+
+/// Accounting for one flushed collection window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlushSummary {
+    /// One entry per section written into the part.
+    pub sections: Vec<SectionFlushSummary>,
+    /// Total PGM part bytes appended to the journal frame body.
+    pub part_bytes: usize,
+}
+
+/// A flushed journal part plus its section-level accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlushedPart {
+    /// PGM part body ready for `Journal::append`.
+    pub body: Vec<u8>,
+    /// Section and byte counts for logs.
+    pub summary: FlushSummary,
+}
+
 struct RowBuffer<T: Section> {
     rows: Vec<T>,
 }
@@ -123,6 +152,21 @@ impl SectionBuffers {
         dict_sections: &[crate::dict::DictSection],
         source_id: u64,
     ) -> Result<Option<Vec<u8>>, CodecError> {
+        Ok(self
+            .flush_with_summary(dict_sections, source_id)?
+            .map(|flushed| flushed.body))
+    }
+
+    /// Encode buffered rows and dictionary sections into one PGM part.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] when section encoding or part assembly fails.
+    pub fn flush_with_summary(
+        &mut self,
+        dict_sections: &[crate::dict::DictSection],
+        source_id: u64,
+    ) -> Result<Option<FlushedPart>, CodecError> {
         let encoded: Vec<(u32, EncodedRows)> = self
             .by_type
             .values()
@@ -169,11 +213,26 @@ impl SectionBuffers {
                 source_id,
             },
         );
+        let mut summary_sections = Vec::with_capacity(sections.len());
+        for section in &sections {
+            summary_sections.push(SectionFlushSummary {
+                type_id: section.type_id,
+                rows: section.rows,
+                body_bytes: section.body.len(),
+            });
+        }
+        let summary = FlushSummary {
+            sections: summary_sections,
+            part_bytes: part.len(),
+        };
 
         for buffer in self.by_type.values_mut() {
             buffer.clear();
         }
-        Ok(Some(part))
+        Ok(Some(FlushedPart {
+            body: part,
+            summary,
+        }))
     }
 }
 
@@ -265,9 +324,66 @@ mod tests {
     }
 
     #[test]
+    fn flush_with_summary_reports_section_rows_and_bytes() {
+        let mut buffers = SectionBuffers::new();
+        buffers.push(bgwriter(1_000)).expect("buffer not full");
+        buffers.push(bgwriter(2_000)).expect("buffer not full");
+        buffers.push(instance(1_500)).expect("buffer not full");
+
+        let flushed = buffers
+            .flush_with_summary(&[], 7)
+            .expect("flush encodes the buffered rows")
+            .expect("buffered rows produce a part");
+        assert_eq!(flushed.summary.part_bytes, flushed.body.len());
+        assert_eq!(flushed.summary.sections.len(), 2);
+        let bgwriter = flushed
+            .summary
+            .sections
+            .iter()
+            .find(|section| section.type_id == 1_006_001)
+            .expect("bgwriter section summary");
+        assert_eq!(bgwriter.rows, 2);
+        assert!(bgwriter.body_bytes > 0);
+        let instance = flushed
+            .summary
+            .sections
+            .iter()
+            .find(|section| section.type_id == 1_021_001)
+            .expect("instance section summary");
+        assert_eq!(instance.rows, 1);
+        assert!(instance.body_bytes > 0);
+        assert!(buffers.is_empty(), "flush clears the window");
+    }
+
+    #[test]
     fn flushing_an_empty_window_yields_no_part() {
         let mut buffers = SectionBuffers::new();
         assert!(buffers.flush(&[], 0).expect("flush ok").is_none());
+    }
+
+    #[test]
+    fn flush_summary_includes_dictionary_sections() {
+        let mut buffers = SectionBuffers::new();
+        let dict_sections = [crate::dict::DictSection {
+            type_id: kronika_registry::DICT_STRINGS_TYPE_ID,
+            rows: 3,
+            body: vec![1, 2, 3, 4],
+        }];
+
+        let flushed = buffers
+            .flush_with_summary(&dict_sections, 0)
+            .expect("flush ok")
+            .expect("dictionary-only part is still written");
+        assert_eq!(flushed.summary.sections.len(), 1);
+        assert_eq!(
+            flushed.summary.sections[0],
+            super::SectionFlushSummary {
+                type_id: kronika_registry::DICT_STRINGS_TYPE_ID,
+                rows: 3,
+                body_bytes: 4,
+            }
+        );
+        assert_eq!(flushed.summary.part_bytes, flushed.body.len());
     }
 
     #[test]

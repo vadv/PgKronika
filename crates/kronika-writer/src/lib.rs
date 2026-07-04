@@ -9,7 +9,7 @@ mod interner;
 mod journal;
 mod segment;
 
-pub use buffer::SectionBuffers;
+pub use buffer::{FlushSummary, FlushedPart, SectionBuffers, SectionFlushSummary};
 pub use interner::{FlushedEntry, Interner, SealedSegment};
 pub use journal::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalConfig, JournalError, OpenReport};
 pub use segment::{SealError, SealSummary, seal};
