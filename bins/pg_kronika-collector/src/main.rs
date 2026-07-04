@@ -10,7 +10,8 @@
 //!   server;
 //! - `KRONIKA_OUT_DIR`: directory that receives sealed segments;
 //! - `KRONIKA_LOG_LEVEL`: collector stderr log level, one of `error`, `warn`,
-//!   `info`, `debug`, or `trace` (default `info`);
+//!   `info`, `debug`, or `trace` (default `info`; invalid values warn and use
+//!   `info`);
 //! - `KRONIKA_SOURCE_ID`: `u64` stamped into every sealed segment to identify
 //!   the source (default `0`). Sealing refuses to mix two *non-zero* source ids
 //!   in one segment, so distinct collectors sharing a `KRONIKA_OUT_DIR` must use
@@ -148,6 +149,7 @@ use kronika_writer::{
 };
 use scheduler::{DueSet, Intervals, Scheduler, SourceKind};
 use std::collections::HashSet;
+use std::fmt::{Display, Write as _};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -250,33 +252,152 @@ impl LogLevel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LogField {
+struct LogField<'a> {
     key: &'static str,
-    value: String,
+    value: LogValue<'a>,
+}
+
+enum LogValue<'a> {
+    Str(&'a str),
+    Display(&'a dyn Display),
+    Owned(String),
+    Bool(bool),
+    I32(i32),
+    I64(i64),
+    U32(u32),
+    U64(u64),
+    U128(u128),
+    Usize(usize),
+}
+
+trait IntoLogValue<'a> {
+    fn into_log_value(self) -> LogValue<'a>;
+}
+
+impl<'a, T: Display> IntoLogValue<'a> for &'a T {
+    fn into_log_value(self) -> LogValue<'a> {
+        LogValue::Display(self)
+    }
+}
+
+impl<'a> IntoLogValue<'a> for &'a str {
+    fn into_log_value(self) -> LogValue<'a> {
+        LogValue::Str(self)
+    }
+}
+
+impl<'a> IntoLogValue<'a> for &'a dyn Display {
+    fn into_log_value(self) -> LogValue<'a> {
+        LogValue::Display(self)
+    }
+}
+
+impl IntoLogValue<'static> for String {
+    fn into_log_value(self) -> LogValue<'static> {
+        LogValue::Owned(self)
+    }
+}
+
+impl IntoLogValue<'static> for std::path::Display<'_> {
+    fn into_log_value(self) -> LogValue<'static> {
+        LogValue::Owned(self.to_string())
+    }
+}
+
+impl IntoLogValue<'static> for bool {
+    fn into_log_value(self) -> LogValue<'static> {
+        LogValue::Bool(self)
+    }
+}
+
+impl IntoLogValue<'static> for i32 {
+    fn into_log_value(self) -> LogValue<'static> {
+        LogValue::I32(self)
+    }
+}
+
+impl IntoLogValue<'static> for i64 {
+    fn into_log_value(self) -> LogValue<'static> {
+        LogValue::I64(self)
+    }
+}
+
+impl IntoLogValue<'static> for u32 {
+    fn into_log_value(self) -> LogValue<'static> {
+        LogValue::U32(self)
+    }
+}
+
+impl IntoLogValue<'static> for u64 {
+    fn into_log_value(self) -> LogValue<'static> {
+        LogValue::U64(self)
+    }
+}
+
+impl IntoLogValue<'static> for u128 {
+    fn into_log_value(self) -> LogValue<'static> {
+        LogValue::U128(self)
+    }
+}
+
+impl IntoLogValue<'static> for usize {
+    fn into_log_value(self) -> LogValue<'static> {
+        LogValue::Usize(self)
+    }
 }
 
 fn current_log_level() -> LogLevel {
     static LOG_LEVEL: OnceLock<LogLevel> = OnceLock::new();
     *LOG_LEVEL.get_or_init(|| {
-        std::env::var("KRONIKA_LOG_LEVEL")
-            .ok()
-            .and_then(|value| LogLevel::parse(value.trim()))
-            .unwrap_or(LogLevel::Info)
+        let Ok(value) = std::env::var("KRONIKA_LOG_LEVEL") else {
+            return LogLevel::Info;
+        };
+        let value = value.trim();
+        let Some(level) = parse_log_level_value(value) else {
+            emit_log_event(
+                LogLevel::Warn,
+                "invalid_log_level",
+                &[
+                    field("env", "KRONIKA_LOG_LEVEL"),
+                    field("value", value),
+                    field("fallback", LogLevel::Info.as_str()),
+                ],
+            );
+            return LogLevel::Info;
+        };
+        level
     })
 }
 
-fn log_event(level: LogLevel, action: &'static str, fields: &[LogField]) {
-    if level.rank() > current_log_level().rank() {
-        return;
+fn parse_log_level_value(value: &str) -> Option<LogLevel> {
+    let value = value.trim();
+    let value = value.to_ascii_lowercase();
+    LogLevel::parse(&value)
+}
+
+fn log_enabled(level: LogLevel) -> bool {
+    level.rank() <= current_log_level().rank()
+}
+
+fn log_event(level: LogLevel, action: &'static str, fields: &[LogField<'_>]) {
+    if log_enabled(level) {
+        emit_log_event(level, action, fields);
     }
+}
+
+fn emit_log_event(level: LogLevel, action: &'static str, fields: &[LogField<'_>]) {
+    let line = render_log_line(level, action, fields);
+    eprintln!("{line}");
+}
+
+fn render_log_line(level: LogLevel, action: &'static str, fields: &[LogField<'_>]) -> String {
     let mut line = String::from("pg_kronika-collector");
     push_log_field(&mut line, "level", level.as_str());
     push_log_field(&mut line, "action", action);
     for field in fields {
-        push_log_field(&mut line, field.key, &field.value);
+        push_log_field_value(&mut line, field.key, &field.value);
     }
-    eprintln!("{line}");
+    line
 }
 
 fn push_log_field(line: &mut String, key: &str, value: &str) {
@@ -286,11 +407,47 @@ fn push_log_field(line: &mut String, key: &str, value: &str) {
     push_log_value(line, value);
 }
 
+fn push_log_field_value(line: &mut String, key: &str, value: &LogValue<'_>) {
+    let mut rendered = String::new();
+    match value {
+        LogValue::Str(value) => {
+            push_log_field(line, key, value);
+            return;
+        }
+        LogValue::Display(value) => {
+            let _ = write!(&mut rendered, "{value}");
+        }
+        LogValue::Owned(value) => rendered.push_str(value),
+        LogValue::Bool(value) => {
+            let _ = write!(&mut rendered, "{value}");
+        }
+        LogValue::I32(value) => {
+            let _ = write!(&mut rendered, "{value}");
+        }
+        LogValue::I64(value) => {
+            let _ = write!(&mut rendered, "{value}");
+        }
+        LogValue::U32(value) => {
+            let _ = write!(&mut rendered, "{value}");
+        }
+        LogValue::U64(value) => {
+            let _ = write!(&mut rendered, "{value}");
+        }
+        LogValue::U128(value) => {
+            let _ = write!(&mut rendered, "{value}");
+        }
+        LogValue::Usize(value) => {
+            let _ = write!(&mut rendered, "{value}");
+        }
+    }
+    push_log_field(line, key, &rendered);
+}
+
 fn push_log_value(line: &mut String, value: &str) {
     let plain = !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| !b.is_ascii_whitespace() && b != b'=' && b != b'"' && b != b'\\');
+        && value.chars().all(|ch| {
+            !ch.is_whitespace() && !ch.is_control() && ch != '=' && ch != '"' && ch != '\\'
+        });
     if plain {
         line.push_str(value);
         return;
@@ -303,25 +460,26 @@ fn push_log_value(line: &mut String, value: &str) {
             '\n' => line.push_str("\\n"),
             '\r' => line.push_str("\\r"),
             '\t' => line.push_str("\\t"),
+            _ if ch.is_control() => {
+                line.push_str("\\u{");
+                let _ = write!(line, "{:x}", ch as u32);
+                line.push('}');
+            }
             _ => line.push(ch),
         }
     }
     line.push('"');
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "log fields format display adapters and scalars immediately"
-)]
-fn field(key: &'static str, value: impl ToString) -> LogField {
+fn field<'a>(key: &'static str, value: impl IntoLogValue<'a>) -> LogField<'a> {
     LogField {
         key,
-        value: value.to_string(),
+        value: value.into_log_value(),
     }
 }
 
-fn duration_ms(duration: Duration) -> String {
-    duration.as_millis().to_string()
+const fn duration_ms(duration: Duration) -> u128 {
+    duration.as_millis()
 }
 
 const fn layout_id(type_id: u32) -> u32 {
@@ -332,12 +490,41 @@ fn section_name(type_id: u32) -> &'static str {
     kronika_registry::section_name(type_id).unwrap_or("unknown")
 }
 
-fn section_fields(type_id: u32) -> [LogField; 3] {
+fn section_fields(type_id: u32) -> [LogField<'static>; 3] {
     [
         field("collection", section_name(type_id)),
         field("type_id", type_id),
         field("layout_id", layout_id(type_id)),
     ]
+}
+
+#[derive(Clone, Copy)]
+enum CollectionFamily {
+    Activity,
+    Database,
+    Statements,
+    StorePlans,
+    Wal,
+    Io,
+    ReplicationDetails,
+}
+
+impl CollectionFamily {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Activity => "pg_stat_activity",
+            Self::Database => "pg_stat_database",
+            Self::Statements => "pg_stat_statements",
+            Self::StorePlans => "pg_store_plans",
+            Self::Wal => "pg_stat_wal",
+            Self::Io => "pg_stat_io",
+            Self::ReplicationDetails => "replication_details",
+        }
+    }
+
+    fn field(self) -> LogField<'static> {
+        field("collection", self.name())
+    }
 }
 
 const fn source_kind_name(kind: SourceKind) -> &'static str {
@@ -364,12 +551,12 @@ fn log_source_deferred(kind: SourceKind, major: u32) {
     let mut fields = vec![
         field("source_kind", source_kind_name(kind)),
         field("reason", "cycle_db_budget"),
-        field("degraded", true),
+        field("deferred", true),
     ];
     match kind {
         SourceKind::UserTables => fields.extend(section_fields(user_tables_type_id(major))),
         SourceKind::UserIndexes => fields.extend(section_fields(user_indexes_type_id(major))),
-        SourceKind::Statements => fields.push(field("collection", "pg_stat_statements")),
+        SourceKind::Statements => fields.push(CollectionFamily::Statements.field()),
         SourceKind::Activity
         | SourceKind::Database
         | SourceKind::Bgwriter
@@ -383,7 +570,7 @@ fn log_source_deferred(kind: SourceKind, major: u32) {
         | SourceKind::InstanceMetadata
         | SourceKind::Settings => {}
     }
-    log_event(LogLevel::Warn, "collection_deferred", &fields);
+    log_event(LogLevel::Debug, "collection_deferred", &fields);
 }
 
 fn log_collection_start(type_id: u32, source: &str) {
@@ -426,12 +613,7 @@ fn log_collection_finish(type_id: u32, source: &str, rows: usize, elapsed: Durat
     );
 }
 
-fn log_collection_failure(
-    type_id: u32,
-    source: &str,
-    err: &(dyn std::fmt::Display + '_),
-    elapsed: Duration,
-) {
+fn log_collection_failure(type_id: u32, source: &str, err: &(dyn Display + '_), elapsed: Duration) {
     let [collection, type_id, layout_id] = section_fields(type_id);
     log_event(
         LogLevel::Error,
@@ -1541,7 +1723,7 @@ async fn collect_statements_from_candidate(
         LogLevel::Debug,
         "collection_start",
         &[
-            field("collection", "pg_stat_statements"),
+            CollectionFamily::Statements.field(),
             field("source", &label),
         ],
     );
@@ -1553,7 +1735,7 @@ async fn collect_statements_from_candidate(
                 LogLevel::Warn,
                 "collection_probe_failure",
                 &[
-                    field("collection", "pg_stat_statements"),
+                    CollectionFamily::Statements.field(),
                     field("source", &label),
                     field("error", &err),
                     field("elapsed_ms", duration_ms(started.elapsed())),
@@ -1617,7 +1799,7 @@ async fn discover_statements_source(
         LogLevel::Warn,
         "collection_skip",
         &[
-            field("collection", "pg_stat_statements"),
+            CollectionFamily::Statements.field(),
             field("reason", "no_usable_source"),
         ],
     );
@@ -1705,7 +1887,7 @@ async fn collect_statements_cached(
                         LogLevel::Warn,
                         "collection_probe_failure",
                         &[
-                            field("collection", "pg_stat_statements"),
+                            CollectionFamily::Statements.field(),
                             field("source", &label),
                             field("cached_source", true),
                             field("reason", "extension_version_changed"),
@@ -1720,7 +1902,7 @@ async fn collect_statements_cached(
                         LogLevel::Warn,
                         "collection_probe_failure",
                         &[
-                            field("collection", "pg_stat_statements"),
+                            CollectionFamily::Statements.field(),
                             field("source", &label),
                             field("cached_source", true),
                             field("reason", "extension_missing"),
@@ -1733,7 +1915,7 @@ async fn collect_statements_cached(
                         LogLevel::Warn,
                         "collection_probe_failure",
                         &[
-                            field("collection", "pg_stat_statements"),
+                            CollectionFamily::Statements.field(),
                             field("source", &label),
                             field("cached_source", true),
                             field("reason", "probe_failed"),
@@ -1749,7 +1931,7 @@ async fn collect_statements_cached(
                 LogLevel::Warn,
                 "collection_probe_failure",
                 &[
-                    field("collection", "pg_stat_statements"),
+                    CollectionFamily::Statements.field(),
                     field("source", &label),
                     field("cached_source", true),
                     field("reason", "source_unavailable"),
@@ -2040,7 +2222,7 @@ async fn collect_store_plans_cached(
             LogLevel::Debug,
             "collection_start",
             &[
-                field("collection", "pg_store_plans"),
+                CollectionFamily::StorePlans.field(),
                 field("source", &label),
             ],
         );
@@ -2052,7 +2234,7 @@ async fn collect_store_plans_cached(
                     LogLevel::Warn,
                     "collection_probe_failure",
                     &[
-                        field("collection", "pg_store_plans"),
+                        CollectionFamily::StorePlans.field(),
                         field("source", &label),
                         field("reason", "probe_failed"),
                         field("error", &err),
@@ -2071,7 +2253,7 @@ async fn collect_store_plans_cached(
                         LogLevel::Warn,
                         "collection_skip",
                         &[
-                            field("collection", "pg_store_plans"),
+                            CollectionFamily::StorePlans.field(),
                             field("source", &label),
                             field("reason", "unsupported_signature"),
                             field("elapsed_ms", duration_ms(started.elapsed())),
@@ -2084,7 +2266,7 @@ async fn collect_store_plans_cached(
                         LogLevel::Warn,
                         "collection_probe_failure",
                         &[
-                            field("collection", "pg_store_plans"),
+                            CollectionFamily::StorePlans.field(),
                             field("source", &label),
                             field("reason", "signature_probe_failed"),
                             field("error", &err),
@@ -2099,7 +2281,7 @@ async fn collect_store_plans_cached(
                     LogLevel::Warn,
                     "collection_probe_failure",
                     &[
-                        field("collection", "pg_store_plans"),
+                        CollectionFamily::StorePlans.field(),
                         field("source", &label),
                         field("reason", "signature_probe_failed"),
                         field("error", &err),
@@ -2498,7 +2680,7 @@ async fn snapshot_and_seal(
                         field("journal_max_bytes", max),
                         field("part_bytes", flushed.summary.part_bytes),
                         field("sections", flushed.summary.sections.len()),
-                        field("rows", summary_rows(&flushed.summary)),
+                        field("section_rows", summary_rows(&flushed.summary)),
                     ],
                 );
                 sealed.push((
@@ -2527,7 +2709,7 @@ async fn snapshot_and_seal(
                     &[
                         field("part_bytes", flushed.summary.part_bytes),
                         field("sections", flushed.summary.sections.len()),
-                        field("rows", summary_rows(&flushed.summary)),
+                        field("section_rows", summary_rows(&flushed.summary)),
                         field("journal_bytes_before", journal_bytes_before),
                         field("error", &other),
                         field("elapsed_ms", duration_ms(append_started.elapsed())),
@@ -2613,10 +2795,7 @@ async fn collect_main_conn_sources(
         log_event(
             LogLevel::Debug,
             "collection_start",
-            &[
-                field("collection", "pg_stat_activity"),
-                field("source", source),
-            ],
+            &[CollectionFamily::Activity.field(), field("source", source)],
         );
         match collect_activity(client, major).await {
             Ok((version, rows)) => {
@@ -2629,7 +2808,7 @@ async fn collect_main_conn_sources(
                     LogLevel::Error,
                     "collection_failure",
                     &[
-                        field("collection", "pg_stat_activity"),
+                        CollectionFamily::Activity.field(),
                         field("source", source),
                         field("error", &err),
                         field("elapsed_ms", duration_ms(started.elapsed())),
@@ -2646,10 +2825,7 @@ async fn collect_main_conn_sources(
         log_event(
             LogLevel::Debug,
             "collection_start",
-            &[
-                field("collection", "pg_stat_database"),
-                field("source", "main"),
-            ],
+            &[CollectionFamily::Database.field(), field("source", "main")],
         );
         match collect_database(client, major).await {
             Ok((version, rows)) => {
@@ -2662,7 +2838,7 @@ async fn collect_main_conn_sources(
                     LogLevel::Error,
                     "collection_failure",
                     &[
-                        field("collection", "pg_stat_database"),
+                        CollectionFamily::Database.field(),
                         field("source", "main"),
                         field("error", &err),
                         field("elapsed_ms", duration_ms(started.elapsed())),
@@ -2713,7 +2889,7 @@ async fn collect_main_conn_sources(
         log_event(
             LogLevel::Debug,
             "collection_start",
-            &[field("collection", "pg_stat_wal"), field("source", "main")],
+            &[CollectionFamily::Wal.field(), field("source", "main")],
         );
         match collect_wal(client, major).await {
             Ok(Some(wal)) => {
@@ -2725,7 +2901,7 @@ async fn collect_main_conn_sources(
                     LogLevel::Debug,
                     "collection_skip",
                     &[
-                        field("collection", "pg_stat_wal"),
+                        CollectionFamily::Wal.field(),
                         field("source", "main"),
                         field("server_major", major),
                         field("reason", "unsupported_server_major"),
@@ -2739,7 +2915,7 @@ async fn collect_main_conn_sources(
                     LogLevel::Error,
                     "collection_failure",
                     &[
-                        field("collection", "pg_stat_wal"),
+                        CollectionFamily::Wal.field(),
                         field("source", "main"),
                         field("error", &err),
                         field("elapsed_ms", duration_ms(started.elapsed())),
@@ -2756,7 +2932,7 @@ async fn collect_main_conn_sources(
         log_event(
             LogLevel::Debug,
             "collection_start",
-            &[field("collection", "pg_stat_io"), field("source", "main")],
+            &[CollectionFamily::Io.field(), field("source", "main")],
         );
         match collect_io(client, major).await {
             Ok(Some((version, rows))) => {
@@ -2768,7 +2944,7 @@ async fn collect_main_conn_sources(
                     LogLevel::Debug,
                     "collection_skip",
                     &[
-                        field("collection", "pg_stat_io"),
+                        CollectionFamily::Io.field(),
                         field("source", "main"),
                         field("server_major", major),
                         field("reason", "unsupported_server_major"),
@@ -2782,7 +2958,7 @@ async fn collect_main_conn_sources(
                     LogLevel::Error,
                     "collection_failure",
                     &[
-                        field("collection", "pg_stat_io"),
+                        CollectionFamily::Io.field(),
                         field("source", "main"),
                         field("error", &err),
                         field("elapsed_ms", duration_ms(started.elapsed())),
@@ -3006,7 +3182,7 @@ fn log_flush_summary(summary: &FlushSummary, source_id: u64, elapsed: Duration) 
         &[
             field("source_id", source_id),
             field("sections", summary.sections.len()),
-            field("rows", summary_rows(summary)),
+            field("section_rows", summary_rows(summary)),
             field("part_bytes", summary.part_bytes),
             field("elapsed_ms", duration_ms(elapsed)),
         ],
@@ -3020,7 +3196,7 @@ fn log_flush_summary(summary: &FlushSummary, source_id: u64, elapsed: Duration) 
                 collection,
                 type_id,
                 layout_id,
-                field("rows", section.rows),
+                field("section_rows", section.rows),
                 field("encoded_bytes", section.body_bytes),
                 field("part_bytes", summary.part_bytes),
             ],
@@ -3045,7 +3221,7 @@ fn log_journal_append(
             field("part_len", part_len),
             field("part_bytes", summary.part_bytes),
             field("sections", summary.sections.len()),
-            field("rows", summary_rows(summary)),
+            field("section_rows", summary_rows(summary)),
             field("journal_bytes_before", journal_bytes_before),
             field("journal_bytes_after", journal_bytes_after),
             field("retry_after_seal", retry_after_seal),
@@ -3075,6 +3251,7 @@ fn seal_open_segment(
         &[
             field("segment_path", dest.display()),
             field("segment_id", first_ts),
+            field("source_id", config.source_id),
             field("reason", reason),
             field("sections", summary.sections),
             field("segment_bytes", summary.bytes),
@@ -3899,7 +4076,7 @@ async fn collect_replication_details(
                 LogLevel::Error,
                 "collection_failure",
                 &[
-                    field("collection", "replication_details"),
+                    CollectionFamily::ReplicationDetails.field(),
                     field("source", "main"),
                     field("reason", "bounds_query_failed"),
                     field("error", &err),
@@ -3914,7 +4091,7 @@ async fn collect_replication_details(
             LogLevel::Error,
             "collection_failure",
             &[
-                field("collection", "replication_details"),
+                CollectionFamily::ReplicationDetails.field(),
                 field("source", "main"),
                 field("reason", "bounds_validation_failed"),
                 field("error", format!("{err:#}")),
@@ -4227,11 +4404,12 @@ mod tests {
     }
 
     use super::{
-        CachedStatementsSource, LogLevel, MissingStatementsSource, StatementsSource,
-        StatementsSourceCache, activity_dict_limits, open_collector_journal, push_activity,
-        push_archiver, push_database, push_io, push_locks, push_log_value, push_prepared_xacts,
-        push_progress_vacuum, push_replication_instance, push_statements, push_user_indexes,
-        push_user_tables, validate_cardinality, validate_heavy_cap, validate_max_lock_rows,
+        CachedStatementsSource, CollectionFamily, LogLevel, MissingStatementsSource,
+        StatementsSource, StatementsSourceCache, activity_dict_limits, field,
+        open_collector_journal, parse_log_level_value, push_activity, push_archiver, push_database,
+        push_io, push_locks, push_log_value, push_prepared_xacts, push_progress_vacuum,
+        push_replication_instance, push_statements, push_user_indexes, push_user_tables,
+        render_log_line, validate_cardinality, validate_heavy_cap, validate_max_lock_rows,
         validate_replication_detail_bounds, validate_settings_row_count,
     };
     use kronika_registry::MAX_SECTION_ROWS;
@@ -4267,6 +4445,29 @@ mod tests {
         out.clear();
         push_log_value(&mut out, "a=\"b\"\n");
         assert_eq!(out, "\"a=\\\"b\\\"\\n\"");
+
+        out.clear();
+        push_log_value(&mut out, "\u{1b}\0");
+        assert_eq!(out, "\"\\u{1b}\\u{0}\"");
+    }
+
+    #[test]
+    fn render_log_line_uses_collection_family_and_structured_fields() {
+        let line = render_log_line(
+            LogLevel::Warn,
+            "collection_skip",
+            &[
+                CollectionFamily::Statements.field(),
+                field("source", "database"),
+                field("database", "db one"),
+                field("section_rows", 3_u32),
+                field("error", "bad\u{1b}value"),
+            ],
+        );
+        assert_eq!(
+            line,
+            "pg_kronika-collector level=warn action=collection_skip collection=pg_stat_statements source=database database=\"db one\" section_rows=3 error=\"bad\\u{1b}value\""
+        );
     }
 
     #[test]
@@ -4275,6 +4476,8 @@ mod tests {
         assert_eq!(LogLevel::parse("warning"), Some(LogLevel::Warn));
         assert_eq!(LogLevel::parse("debug"), Some(LogLevel::Debug));
         assert_eq!(LogLevel::parse("verbose"), None);
+        assert_eq!(parse_log_level_value(" DEBUG "), Some(LogLevel::Debug));
+        assert_eq!(parse_log_level_value("verbose"), None);
     }
 
     #[test]
