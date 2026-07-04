@@ -66,6 +66,19 @@ pub const DICT_STRINGS_TYPE_ID: u32 = 3_001_001;
 /// `type_id` of a `dict.blobs` section. See [`DICT_STRINGS_TYPE_ID`].
 pub const DICT_BLOBS_TYPE_ID: u32 = 3_002_001;
 
+/// Return the stable human-readable section name for a raw `type_id`.
+#[must_use]
+pub fn section_name(type_id: u32) -> Option<&'static str> {
+    match type_id {
+        DICT_STRINGS_TYPE_ID => Some("dict.strings"),
+        DICT_BLOBS_TYPE_ID => Some("dict.blobs"),
+        _ => registry()
+            .iter()
+            .find(|contract| contract.type_id.get() == type_id)
+            .map(|contract| contract.name),
+    }
+}
+
 /// Every type id known to this build, in registry order.
 #[must_use]
 pub const fn registry() -> &'static [TypeContract] {
@@ -184,8 +197,9 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        BytesPool, CodecError, VerifiedSection, arrow_schema, decode_any, decode_pooled,
-        encode_section, lint_registry, registry,
+        BytesPool, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, VerifiedSection,
+        arrow_schema, decode_any, decode_pooled, encode_section, lint_registry, registry,
+        section_name,
     };
 
     #[test]
@@ -254,5 +268,14 @@ mod tests {
             decode_any(2_999_999, VerifiedSection::for_test(Bytes::new())),
             Err(CodecError::UnknownType { type_id: 2_999_999 })
         ));
+    }
+
+    #[test]
+    fn section_name_uses_registry_contracts_and_dictionary_names() {
+        assert_eq!(section_name(1_004_001), Some("pg_store_plans"));
+        assert_eq!(section_name(1_019_001), Some("pg_settings"));
+        assert_eq!(section_name(DICT_STRINGS_TYPE_ID), Some("dict.strings"));
+        assert_eq!(section_name(DICT_BLOBS_TYPE_ID), Some("dict.blobs"));
+        assert_eq!(section_name(9_999_999), None);
     }
 }
