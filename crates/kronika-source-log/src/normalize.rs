@@ -114,7 +114,8 @@ pub(crate) fn classify_error(pattern: &str, severity: LogSeverity) -> ErrorCateg
             "could not extend",
             "remaining connection slots",
         ],
-    ) {
+    ) || is_signal_kill(&lower)
+    {
         ErrorCategory::Resource
     } else if any_contains(
         &lower,
@@ -188,6 +189,10 @@ fn any_contains(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
+fn is_signal_kill(value: &str) -> bool {
+    value.contains("terminated by signal") && value.contains(": killed")
+}
+
 fn strip_at_character(value: &str) -> &str {
     value
         .find(" at character ")
@@ -254,6 +259,7 @@ fn replace_word_patterns(value: &str) -> String {
         "process ",
         "database ",
         "PID ",
+        "signal ",
         "on page ",
     ] {
         out = replace_word_number(&out, prefix);
@@ -368,6 +374,10 @@ mod tests {
             normalize_error("invalid input syntax for type integer: \"abc\""),
             "invalid input syntax for type integer: ..."
         );
+        assert_eq!(
+            normalize_error("server process (PID 4242) was terminated by signal 9: Killed"),
+            "server process (...) was terminated by signal ...: Killed"
+        );
     }
 
     #[test]
@@ -386,6 +396,20 @@ mod tests {
         assert_eq!(
             classify_error("division by zero", LogSeverity::Error),
             ErrorCategory::Syntax
+        );
+        assert_eq!(
+            classify_error(
+                "server process (...) was terminated by signal ...: Killed",
+                LogSeverity::Log
+            ),
+            ErrorCategory::Resource
+        );
+        assert_eq!(
+            classify_error(
+                "server process (...) was terminated by signal ...: Segmentation fault",
+                LogSeverity::Log
+            ),
+            ErrorCategory::System
         );
     }
 

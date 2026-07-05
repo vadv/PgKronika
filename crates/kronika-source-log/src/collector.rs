@@ -503,6 +503,11 @@ fn parse_errors(
                 message,
             }) => {
                 let pattern = normalize_error(message);
+                let category = classify_error(&pattern, severity);
+                if severity == LogSeverity::Log && !is_relevant_log_event(&pattern, category) {
+                    last_key = None;
+                    continue;
+                }
                 let key = ErrorKey {
                     pattern,
                     severity,
@@ -565,6 +570,23 @@ fn parse_errors(
         ))
     });
     rows
+}
+
+fn is_relevant_log_event(pattern: &str, category: ErrorCategory) -> bool {
+    let lower = pattern.to_ascii_lowercase();
+    match category {
+        ErrorCategory::Resource => {
+            lower.contains("terminated by signal") && lower.contains(": killed")
+        }
+        ErrorCategory::System => {
+            lower.contains("crash")
+                || (lower.contains("server process")
+                    && (lower.contains("terminated by signal")
+                        || lower.contains("exited with exit code")))
+                || lower.contains("all server processes terminated")
+        }
+        _ => false,
+    }
 }
 
 fn append_statement(entry: &mut PendingError, text: &str) {
@@ -745,6 +767,52 @@ mod tests {
             batch.errors[0].statement.as_deref(),
             Some("select * from a")
         );
+    }
+
+    #[tokio::test]
+    async fn collects_oom_kill_and_crash_log_events_without_dumping_ordinary_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:00:00 UTC [1]: LOG:  checkpoint starting: immediate force wait\n\
+             2026-07-05 12:00:01 UTC [2]: LOG:  server process (PID 4242) was terminated by signal 9: Killed\n\
+             2026-07-05 12:00:02 UTC [3]: LOG:  server process (PID 4243) was terminated by signal 11: Segmentation fault\n\
+             2026-07-05 12:00:03 UTC [4]: WARNING:  terminating connection because of crash of another server process\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.errors.len(), 3);
+        let oom = batch
+            .errors
+            .iter()
+            .find(|row| row.pattern == "server process (...) was terminated by signal ...: Killed")
+            .expect("oom kill row");
+        assert_eq!(oom.severity, LogSeverity::Log);
+        assert_eq!(oom.category, ErrorCategory::Resource);
+        let segfault = batch
+            .errors
+            .iter()
+            .find(|row| {
+                row.pattern
+                    == "server process (...) was terminated by signal ...: Segmentation fault"
+            })
+            .expect("segfault row");
+        assert_eq!(segfault.severity, LogSeverity::Log);
+        assert_eq!(segfault.category, ErrorCategory::System);
+        let crash_warning = batch
+            .errors
+            .iter()
+            .find(|row| {
+                row.pattern == "terminating connection because of crash of another server process"
+            })
+            .expect("crash warning row");
+        assert_eq!(crash_warning.severity, LogSeverity::Warning);
+        assert_eq!(crash_warning.category, ErrorCategory::System);
     }
 
     #[tokio::test]

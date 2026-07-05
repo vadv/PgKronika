@@ -66,6 +66,8 @@ pub enum LogSeverity {
     Panic,
     /// `WARNING`.
     Warning,
+    /// Selected lifecycle `LOG` records that carry crash/OOM signal data.
+    Log,
 }
 
 impl LogSeverity {
@@ -77,6 +79,7 @@ impl LogSeverity {
             Self::Fatal => 1,
             Self::Panic => 2,
             Self::Warning => 3,
+            Self::Log => 4,
         }
     }
 }
@@ -86,10 +89,12 @@ const SEVERITIES: &[(&str, LogSeverity)] = &[
     ("FATAL:  ", LogSeverity::Fatal),
     ("ERROR:  ", LogSeverity::Error),
     ("WARNING:  ", LogSeverity::Warning),
+    ("LOG:  ", LogSeverity::Log),
     ("ПАНИКА:  ", LogSeverity::Panic),
     ("ВАЖНО:  ", LogSeverity::Fatal),
     ("ОШИБКА:  ", LogSeverity::Error),
     ("ПРЕДУПРЕЖДЕНИЕ:  ", LogSeverity::Warning),
+    ("СООБЩЕНИЕ:  ", LogSeverity::Log),
 ];
 
 const STATEMENT_PREFIXES: &[&str] = &["STATEMENT:  ", "ОПЕРАТОР:  "];
@@ -247,6 +252,22 @@ mod tests {
             ParsedLine::Error {
                 severity: LogSeverity::Warning,
                 message: "внимание",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_postmaster_log_severity() {
+        let parsed = parse_stderr_line(
+            "2026-07-05 12:30:45 UTC [42]: LOG:  server process (PID 4242) was terminated by signal 9: Killed",
+        )
+        .expect("log parsed");
+        assert!(matches!(
+            parsed,
+            ParsedLine::Error {
+                severity: LogSeverity::Log,
+                message: "server process (PID 4242) was terminated by signal 9: Killed",
                 ..
             }
         ));

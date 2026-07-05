@@ -22,7 +22,8 @@ pub struct PgLogErrorV1 {
     /// Log record time, unix microseconds; collection time when stderr has no parsed timestamp.
     #[column(t)]
     pub ts: Ts,
-    /// Severity: `0` error, `1` fatal, `2` panic, `3` warning.
+    /// Severity: `0` error, `1` fatal, `2` panic, `3` warning,
+    /// `4` selected crash/OOM lifecycle log.
     #[column(l)]
     pub severity: u8,
     /// Error category: `0` lock through `10` other, matching the source taxonomy.
