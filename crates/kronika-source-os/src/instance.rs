@@ -1,5 +1,6 @@
 //! Host identity facts for the `instance_metadata` section (`1_021_001`).
 
+use crate::ProcFs;
 use std::io;
 
 /// Host facts read from `/proc` and `sysconf`.
@@ -29,30 +30,19 @@ pub struct OsInstanceFacts {
 /// Returns an [`io::Error`] naming the `/proc` file that failed to read or
 /// parse; the collector runs on Linux, where all of them exist.
 pub fn collect_os_instance_facts() -> io::Result<OsInstanceFacts> {
-    let stat = read_proc("/proc/stat")?;
+    let fs = ProcFs::from_env();
+    let stat = fs.read("stat")?;
     let btime =
-        parse_btime(&stat).ok_or_else(|| io::Error::other("/proc/stat: no parsable btime line"))?;
+        parse_btime(&stat).ok_or_else(|| io::Error::other("stat: no parsable btime line"))?;
     Ok(OsInstanceFacts {
-        hostname: read_proc("/proc/sys/kernel/hostname")?,
-        kernel_version: read_proc("/proc/sys/kernel/osrelease")?,
-        boot_id: read_proc("/proc/sys/kernel/random/boot_id")?,
+        hostname: fs.read("sys/kernel/hostname")?,
+        kernel_version: fs.read("sys/kernel/osrelease")?,
+        boot_id: fs.read("sys/kernel/random/boot_id")?,
         btime,
         clock_ticks_per_sec: i64::try_from(rustix::param::clock_ticks_per_second())
             .map_err(io::Error::other)?,
         page_size_bytes: i64::try_from(rustix::param::page_size()).map_err(io::Error::other)?,
     })
-}
-
-/// Read a `/proc` file, trimmed; empty content is an error, the path is named
-/// in every failure.
-fn read_proc(path: &str) -> io::Result<String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|err| io::Error::new(err.kind(), format!("{path}: {err}")))?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return Err(io::Error::other(format!("{path}: empty")));
-    }
-    Ok(trimmed.to_owned())
 }
 
 /// Extract the kernel boot time from `/proc/stat` content, unix microseconds.

@@ -29,10 +29,11 @@ pub(crate) enum SourceKind {
     ResetMetadata,
     InstanceMetadata,
     Settings,
+    OsCore,
 }
 
 /// All source kinds, in collection order.
-pub(crate) const ALL_SOURCES: [SourceKind; 15] = [
+pub(crate) const ALL_SOURCES: [SourceKind; 16] = [
     SourceKind::Activity,
     SourceKind::Database,
     SourceKind::Bgwriter,
@@ -48,6 +49,7 @@ pub(crate) const ALL_SOURCES: [SourceKind; 15] = [
     SourceKind::ResetMetadata,
     SourceKind::InstanceMetadata,
     SourceKind::Settings,
+    SourceKind::OsCore,
 ];
 
 /// Per-source intervals, in seconds.
@@ -68,6 +70,7 @@ pub(crate) struct Intervals {
     pub reset_metadata: u64,
     pub instance_metadata: u64,
     pub settings: u64,
+    pub os_core: u64,
 }
 
 impl Default for Intervals {
@@ -88,6 +91,7 @@ impl Default for Intervals {
             reset_metadata: 30,
             instance_metadata: 60,
             settings: 3600,
+            os_core: 10,
         }
     }
 }
@@ -110,6 +114,7 @@ impl Intervals {
             SourceKind::ResetMetadata => self.reset_metadata,
             SourceKind::InstanceMetadata => self.instance_metadata,
             SourceKind::Settings => self.settings,
+            SourceKind::OsCore => self.os_core,
         }
     }
 }
@@ -302,6 +307,7 @@ mod tests {
             reset_metadata: secs,
             instance_metadata: secs,
             settings: secs,
+            os_core: secs,
         }
     }
 
