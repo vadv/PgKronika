@@ -102,9 +102,14 @@ use kronika_format::DictLimits;
 use kronika_registry::collection_coverage::CollectionCoverageV1;
 use kronika_registry::instance_metadata::InstanceMetadata;
 use kronika_registry::os_cpu::OsCpu;
+use kronika_registry::os_diskstats::OsDiskstats;
 use kronika_registry::os_loadavg::OsLoadavg;
 use kronika_registry::os_meminfo::OsMeminfo;
+use kronika_registry::os_mountinfo::OsMountinfo;
+use kronika_registry::os_netdev::OsNetdev;
+use kronika_registry::os_netstat::OsNetstat;
 use kronika_registry::os_psi::OsPsi;
+use kronika_registry::os_snmp::OsSnmp;
 use kronika_registry::os_stat::OsStat;
 use kronika_registry::os_vmstat::OsVmstat;
 use kronika_registry::{MAX_SECTION_ROWS, StrId, Ts};
@@ -113,8 +118,11 @@ use kronika_source_os::proc::meminfo::parse_meminfo;
 use kronika_source_os::proc::pressure::parse_pressure;
 use kronika_source_os::proc::stat::{parse_cpu, parse_stat_misc};
 use kronika_source_os::proc::vmstat::parse_vmstat;
+use kronika_source_os::proc::{diskstats, net_dev, net_netstat, net_snmp};
 use kronika_source_os::{
-    OsInstanceFacts, OsScope, ProcFs, collect_os_instance_facts, detect_container,
+    MountEntry, OsInstanceFacts, OsScope, ProcFs, SysFs, collect_os_instance_facts,
+    container_device_set, detect_container, device_map, display_path, mount_row, net_scope,
+    parse_dev_pair, parse_mountinfo, statvfs,
 };
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
@@ -2291,6 +2299,11 @@ struct OsSources {
     loadavg: Option<OsLoadavg>,
     vmstat: Option<OsVmstat>,
     psi: Vec<OsPsi>,
+    diskstats: Vec<OsDiskstats>,
+    netdev: Vec<OsNetdev>,
+    snmp: Option<OsSnmp>,
+    netstat: Option<OsNetstat>,
+    mountinfo: Vec<OsMountinfo>,
 }
 
 impl OsSources {
@@ -2302,6 +2315,11 @@ impl OsSources {
             loadavg: None,
             vmstat: None,
             psi: Vec::new(),
+            diskstats: Vec::new(),
+            netdev: Vec::new(),
+            snmp: None,
+            netstat: None,
+            mountinfo: Vec::new(),
         }
     }
 }
@@ -2327,16 +2345,27 @@ fn read_optional_os_file(fs: &ProcFs, rel: &'static str, type_id: u32) -> Option
     }
 }
 
-/// Read the six procfs-core OS sections synchronously.
+/// Read every procfs OS section synchronously.
 ///
 /// All reads are gated on `due.has(SourceKind::OsCore)`. On file read or parse
 /// failure the affected section is skipped and a `collection_degraded` event is
-/// logged; zeros are never fabricated.
+/// logged; zeros are never fabricated. `scope` is the host scope for
+/// device-local sections; network sections carry their own `net_scope`.
+///
+/// The `interner` is the segment's interner: device, interface, and mount
+/// strings are interned here so the built rows already hold their `StrId`s.
 #[allow(
     clippy::too_many_lines,
-    reason = "six independent procfs reads with per-source degradation logging kept adjacent"
+    reason = "independent procfs reads with per-source degradation logging kept adjacent"
 )]
-fn collect_os_sources(fs: &ProcFs, scope: u8, ts: i64, due: &DueSet) -> OsSources {
+fn collect_os_sources(
+    fs: &ProcFs,
+    interner: &mut Interner,
+    scope: u8,
+    ts: i64,
+    in_container: bool,
+    due: &DueSet,
+) -> OsSources {
     if !due.has(SourceKind::OsCore) {
         return OsSources::empty();
     }
@@ -2589,10 +2618,286 @@ fn collect_os_sources(fs: &ProcFs, scope: u8, ts: i64, due: &DueSet) -> OsSource
         }
     }
 
+    // Wave 2: one mountinfo read serves both the container device filter and
+    // the disk-attribution rows.
+    let mounts = mountinfo_entries(fs);
+
+    // Counters: disk and network. Network sections carry the pod's
+    // network-namespace scope inside a container, not the host scope.
+    let net_scope_id = net_scope(fs).as_u8();
+    os.diskstats = collect_diskstats(fs, interner, scope, ts, in_container, &mounts);
+    os.netdev = collect_netdev(fs, interner, net_scope_id, ts);
+    collect_net_singletons(fs, net_scope_id, ts, &mut os);
+
+    // Attribution: map surviving devices to their mount points and filesystem
+    // capacity. Mount strings are interned here.
+    os.mountinfo = collect_mountinfo(interner, scope, ts, &mounts, &os.diskstats);
+
     os
 }
 
-/// Buffer all six OS sections into the snapshot window.
+/// Read and parse `/proc/diskstats`, interning device names into rows.
+///
+/// Inside a container the pod's real backing devices are the only ones charged
+/// to it: `/proc/diskstats` reports the whole node, so rows are filtered to the
+/// mountinfo-derived device set. Over `KRONIKA_OS_MAX_DISKS` rows the lowest
+/// `(major, minor)` devices are kept and the overflow is logged, not dropped
+/// silently.
+fn collect_diskstats(
+    fs: &ProcFs,
+    interner: &mut Interner,
+    scope: u8,
+    ts: i64,
+    in_container: bool,
+    mounts: &[MountEntry],
+) -> Vec<OsDiskstats> {
+    let type_id = 1_108_001_u32;
+    let started = Instant::now();
+    let Some(content) = read_optional_os_file(fs, "diskstats", type_id) else {
+        return Vec::new();
+    };
+    let mut rows = match diskstats::parse(&content) {
+        Ok(rows) => rows,
+        Err(err) => {
+            log_degraded(type_id, "diskstats", &err.0);
+            return Vec::new();
+        }
+    };
+
+    if in_container {
+        let devices = container_device_set(mounts);
+        rows.retain(|row| devices.contains(&(row.major, row.minor)));
+    }
+
+    apply_disk_cap(&mut rows, type_id);
+
+    let built: Vec<OsDiskstats> = rows
+        .iter()
+        .filter_map(|row| {
+            let device = intern_str(interner, type_id, "diskstats", &row.device)?;
+            Some(row.to_section(scope, ts, device))
+        })
+        .collect();
+    log_collection_finish(type_id, "procfs", built.len(), started.elapsed());
+    built
+}
+
+/// Keep at most `KRONIKA_OS_MAX_DISKS` devices, ordered by `(major, minor)`.
+///
+/// When the cap trims rows, a `collection_degraded` event with `reason=disk_cap`
+/// records how many devices were dropped so the gap is visible, not silent.
+fn apply_disk_cap(rows: &mut Vec<diskstats::DiskstatsRow>, type_id: u32) {
+    let cap = env_u64("KRONIKA_OS_MAX_DISKS", 256).unwrap_or(256);
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+    let dropped = cap_disks(rows, cap);
+    if dropped == 0 {
+        return;
+    }
+    log_event(
+        LogLevel::Warn,
+        "collection_degraded",
+        &[
+            field("collection", section_name(type_id)),
+            field("type_id", type_id),
+            field("layout_id", layout_id(type_id)),
+            field("source", "diskstats"),
+            field("reason", "disk_cap"),
+            field("dropped", dropped),
+            field("cap", cap),
+        ],
+    );
+}
+
+/// Trim `rows` to the `cap` lowest `(major, minor)` devices in place.
+///
+/// Returns the number of devices dropped (`0` when already within the cap).
+fn cap_disks(rows: &mut Vec<diskstats::DiskstatsRow>, cap: usize) -> usize {
+    if rows.len() <= cap {
+        return 0;
+    }
+    rows.sort_by_key(|row| (row.major, row.minor));
+    let dropped = rows.len() - cap;
+    rows.truncate(cap);
+    dropped
+}
+
+/// Read and parse `/proc/net/dev`, interning interface names into rows.
+fn collect_netdev(fs: &ProcFs, interner: &mut Interner, scope: u8, ts: i64) -> Vec<OsNetdev> {
+    let type_id = 1_109_001_u32;
+    let started = Instant::now();
+    let Some(content) = read_optional_os_file(fs, "net/dev", type_id) else {
+        return Vec::new();
+    };
+    let rows = match net_dev::parse(&content) {
+        Ok(rows) => rows,
+        Err(err) => {
+            log_degraded(type_id, "net/dev", &err.0);
+            return Vec::new();
+        }
+    };
+    let built: Vec<OsNetdev> = rows
+        .iter()
+        .filter_map(|row| {
+            let iface = intern_str(interner, type_id, "net/dev", &row.iface)?;
+            Some(row.to_section(scope, ts, iface))
+        })
+        .collect();
+    log_collection_finish(type_id, "procfs", built.len(), started.elapsed());
+    built
+}
+
+/// Read the two singleton network counter files into `os`.
+fn collect_net_singletons(fs: &ProcFs, scope: u8, ts: i64, os: &mut OsSources) {
+    let snmp_type_id = 1_110_001_u32;
+    let started = Instant::now();
+    if let Some(content) = read_optional_os_file(fs, "net/snmp", snmp_type_id) {
+        match net_snmp::parse(&content) {
+            Ok(row) => {
+                os.snmp = Some(row.to_section(scope, ts));
+                log_collection_finish(snmp_type_id, "procfs", 1, started.elapsed());
+            }
+            Err(err) => log_degraded(snmp_type_id, "net/snmp", &err.0),
+        }
+    }
+
+    let netstat_type_id = 1_111_001_u32;
+    let started = Instant::now();
+    if let Some(content) = read_optional_os_file(fs, "net/netstat", netstat_type_id) {
+        match net_netstat::parse(&content) {
+            Ok(row) => {
+                os.netstat = Some(row.to_section(scope, ts));
+                log_collection_finish(netstat_type_id, "procfs", 1, started.elapsed());
+            }
+            Err(err) => log_degraded(netstat_type_id, "net/netstat", &err.0),
+        }
+    }
+}
+
+/// Read and parse `/proc/self/mountinfo`, resolving `major == 0` subvolume
+/// devices via `/sys`.
+fn mountinfo_entries(fs: &ProcFs) -> Vec<MountEntry> {
+    let type_id = 1_112_001_u32;
+    let Some(content) = read_optional_os_file(fs, "self/mountinfo", type_id) else {
+        return Vec::new();
+    };
+    let mut entries = parse_mountinfo(&content);
+    resolve_major_zero(&SysFs::from_env(), &mut entries);
+    entries
+}
+
+/// Recover the real `(major, minor)` of `major == 0` subvolume mounts (btrfs,
+/// ZFS) whose source is a `/dev/` node, by reading `class/block/<name>/dev`.
+/// Entries that cannot be resolved keep `major == 0` and are dropped by
+/// `device_map`/`container_device_set` downstream.
+fn resolve_major_zero(sys: &SysFs, entries: &mut [MountEntry]) {
+    for entry in entries.iter_mut().filter(|e| e.major == 0) {
+        let Some(name) = entry.source.strip_prefix("/dev/") else {
+            continue;
+        };
+        let rel = format!("class/block/{name}/dev");
+        if let Ok(content) = sys.read(&rel)
+            && let Some((major, minor)) = parse_dev_pair(&content)
+        {
+            entry.major = major;
+            entry.minor = minor;
+        }
+    }
+}
+
+/// Build the mount-attribution rows for the devices that survived filtering.
+///
+/// Each diskstats device that has a mount point becomes one `os_mountinfo` row
+/// with its display path and, when available, filesystem capacity. Mount point,
+/// fstype, and source strings are interned here.
+fn collect_mountinfo(
+    interner: &mut Interner,
+    scope: u8,
+    ts: i64,
+    entries: &[MountEntry],
+    diskstats: &[OsDiskstats],
+) -> Vec<OsMountinfo> {
+    let type_id = 1_112_001_u32;
+    let started = Instant::now();
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let map = device_map(entries);
+
+    let mut rows = Vec::new();
+    for disk in diskstats {
+        let Some(paths) = map.get(&(disk.major, disk.minor)) else {
+            continue;
+        };
+        let Some(path) = display_path(paths) else {
+            continue;
+        };
+        // Match on device and path together: a path string may repeat across
+        // devices, so the entry backing this device is the correct source of
+        // fstype/source/is_k8s_infra.
+        let Some(entry) = entries
+            .iter()
+            .find(|e| e.major == disk.major && e.minor == disk.minor && e.mount_point == path)
+        else {
+            continue;
+        };
+        let (Some(mount_point), Some(fstype), Some(source)) = (
+            intern_str(interner, type_id, "self/mountinfo", &entry.mount_point),
+            intern_str(interner, type_id, "self/mountinfo", &entry.fstype),
+            intern_str(interner, type_id, "self/mountinfo", &entry.source),
+        ) else {
+            continue;
+        };
+        let space = statvfs(path);
+        rows.push(mount_row(
+            entry,
+            space,
+            scope,
+            ts,
+            mount_point,
+            fstype,
+            source,
+        ));
+    }
+    log_collection_finish(type_id, "procfs", rows.len(), started.elapsed());
+    rows
+}
+
+/// Intern one OS string, logging degradation and returning `None` on failure so
+/// the caller skips only the affected row.
+fn intern_str(
+    interner: &mut Interner,
+    type_id: u32,
+    source: &'static str,
+    value: &str,
+) -> Option<StrId> {
+    match interner.intern(value.as_bytes()) {
+        Ok(id) => Some(StrId(id.get())),
+        Err(err) => {
+            log_degraded(type_id, source, &err);
+            None
+        }
+    }
+}
+
+/// Emit a `collection_degraded` event with the section identity and reason.
+fn log_degraded(type_id: u32, source: &'static str, reason: &dyn std::fmt::Display) {
+    log_event(
+        LogLevel::Warn,
+        "collection_degraded",
+        &[
+            field("collection", section_name(type_id)),
+            field("type_id", type_id),
+            field("layout_id", layout_id(type_id)),
+            field("source", source),
+            field("reason", reason),
+        ],
+    );
+}
+
+/// Buffer every collected OS section into the snapshot window.
+///
+/// Rows are pre-built with their string ids already interned, so this only
+/// moves them into the buffers.
 ///
 /// # Errors
 /// Returns an error if a section buffer is full.
@@ -2613,6 +2918,21 @@ fn push_os_sources(buffers: &mut SectionBuffers, os: &OsSources) -> Result<()> {
         buffer_row(buffers, row)?;
     }
     for row in &os.psi {
+        buffer_row(buffers, *row)?;
+    }
+    for row in &os.diskstats {
+        buffer_row(buffers, *row)?;
+    }
+    for row in &os.netdev {
+        buffer_row(buffers, *row)?;
+    }
+    if let Some(row) = os.snmp {
+        buffer_row(buffers, row)?;
+    }
+    if let Some(row) = os.netstat {
+        buffer_row(buffers, row)?;
+    }
+    for row in &os.mountinfo {
         buffer_row(buffers, *row)?;
     }
     Ok(())
@@ -2693,6 +3013,10 @@ async fn snapshot_and_seal(
         collect_service_sections(pool, major, config, statements_cache, plans_cache, due).await?;
 
     // OS procfs read — synchronous, safe before SectionBuffers are built.
+    // The interner is created here, before the OS read, because the Wave 2
+    // sections (diskstats, netdev, mountinfo) intern device/interface/mount
+    // strings while building their rows. The same interner then serves the PG
+    // pushes below — one interner per window.
     let fs = ProcFs::from_env();
     let in_container = detect_container(&fs);
     log_event(
@@ -2701,10 +3025,10 @@ async fn snapshot_and_seal(
         &[field("container", in_container)],
     );
     let scope = OsScope::Host.as_u8();
-    let os = collect_os_sources(&fs, scope, main_src.ts.0, due);
+    let mut interner = Interner::new(activity_dict_limits());
+    let os = collect_os_sources(&fs, &mut interner, scope, main_src.ts.0, in_container, due);
 
     let mut buffers = SectionBuffers::new();
-    let mut interner = Interner::new(activity_dict_limits());
     push_main_conn_sections(&mut buffers, &mut interner, major, &main_src)?;
     push_user_tables(&mut buffers, &mut interner, &user_tables)?;
     push_user_indexes(&mut buffers, &mut interner, &user_indexes)?;
@@ -4283,10 +4607,78 @@ fn push_store_plans_ossc(
 #[cfg(test)]
 mod tests {
     use super::{
-        Intervals, PlansSourceCache, Scheduler, SegmentState, SourceCoverage, SourceKind,
-        StatementsVersion, min_total_time, seal_reason, statements_type_id, timer_sleep_delay,
+        Intervals, MountEntry, PlansSourceCache, Scheduler, SegmentState, SourceCoverage,
+        SourceKind, StatementsVersion, SysFs, cap_disks, diskstats, min_total_time,
+        resolve_major_zero, seal_reason, statements_type_id, timer_sleep_delay,
         user_indexes_type_id, user_tables_type_id,
     };
+
+    fn disk_row(major: i32, minor: i32) -> diskstats::DiskstatsRow {
+        let line = format!("{major} {minor} dev{minor} 1 0 8 2 3 0 24 4 0 6 6\n");
+        diskstats::parse(&line)
+            .expect("valid diskstats line")
+            .remove(0)
+    }
+
+    fn mount_entry(major: i32, minor: i32, source: &str) -> MountEntry {
+        MountEntry {
+            major,
+            minor,
+            mount_point: "/data".to_owned(),
+            fstype: "btrfs".to_owned(),
+            source: source.to_owned(),
+            is_k8s_infra: false,
+        }
+    }
+
+    #[test]
+    fn cap_disks_keeps_lowest_devices_and_reports_drop() {
+        let mut rows = vec![disk_row(8, 5), disk_row(8, 0), disk_row(259, 0)];
+        let dropped = cap_disks(&mut rows, 2);
+        assert_eq!(dropped, 1);
+        // Kept devices are the two lowest (major, minor) pairs.
+        assert_eq!(
+            rows.iter().map(|r| (r.major, r.minor)).collect::<Vec<_>>(),
+            vec![(8, 0), (8, 5)]
+        );
+    }
+
+    #[test]
+    fn cap_disks_is_a_noop_within_the_cap() {
+        let mut rows = vec![disk_row(8, 0), disk_row(8, 1)];
+        assert_eq!(cap_disks(&mut rows, 2), 0);
+        assert_eq!(cap_disks(&mut rows, 5), 0);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn resolve_major_zero_rewrites_dev_backed_subvolumes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("class/block/nvme0n1p2")).expect("mkdir");
+        std::fs::write(dir.path().join("class/block/nvme0n1p2/dev"), "259:2\n").expect("write");
+        let sys = SysFs::new(dir.path().to_path_buf());
+
+        let mut entries = vec![
+            mount_entry(0, 42, "/dev/nvme0n1p2"), // resolvable btrfs subvolume
+            mount_entry(0, 43, "tmpfs"),          // no /dev/ source: unchanged
+            mount_entry(8, 1, "/dev/sda1"),       // already real: unchanged
+        ];
+        resolve_major_zero(&sys, &mut entries);
+
+        assert_eq!((entries[0].major, entries[0].minor), (259, 2));
+        assert_eq!((entries[1].major, entries[1].minor), (0, 43));
+        assert_eq!((entries[2].major, entries[2].minor), (8, 1));
+    }
+
+    #[test]
+    fn resolve_major_zero_leaves_entry_when_sysfs_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sys = SysFs::new(dir.path().to_path_buf());
+        let mut entries = vec![mount_entry(0, 42, "/dev/nvme0n1p2")];
+        resolve_major_zero(&sys, &mut entries);
+        // Unresolvable major==0 stays 0 and is dropped downstream by device_map.
+        assert_eq!((entries[0].major, entries[0].minor), (0, 42));
+    }
 
     #[test]
     fn segment_seals_on_force_zero_cap_size_or_age() {
