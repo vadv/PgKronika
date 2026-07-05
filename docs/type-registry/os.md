@@ -14,8 +14,13 @@ net/snmp, net/netstat, mountinfo, topology). Scope-значения: diskstats
 (`1_108_001`), mountinfo (`1_112_001`) и topology (`1_113_001`) несут
 `scope=host` (данные уровня устройства/узла); сетевые секции (`1_109_001`,
 `1_110_001`, `1_111_001`) несут `scope=pod_net`, когда обнаружен контейнер
-(через cgroup), иначе `scope=host`. Остальные ОС-типы (processes, cgroup) —
-следующие волны.
+(через cgroup), иначе `scope=host`.
+
+**Реализовано (Wave 3):** `1_100_001`, `1_101_001`, `1_200_001`-`1_204_001`
+(processes, process status, PID-to-cgroup mapping, cgroup cpu/memory/io/pids).
+Эти секции несут `scope=container`, когда коллектор сам запущен в контейнере,
+иначе `scope=host`. Корень sysfs переопределяется `KRONIKA_SYS_ROOT`
+(по умолчанию `/sys`).
 
 ## Сводная таблица
 
@@ -41,22 +46,26 @@ net/snmp, net/netstat, mountinfo, topology). Scope-значения: diskstats
 | `1_203_001` | cgroup: io | базовый шаг | `snapshot_full` | `(cgroup_path, major, minor, ts)` |
 | `1_204_001` | cgroup: pids | базовый шаг | `snapshot_full` | `(cgroup_path, ts)` |
 
+Периоды Wave 3 управляются отдельно:
+
+- `KRONIKA_OS_PROCESS_INTERVAL_S`, по умолчанию 5 с;
+- `KRONIKA_OS_PROCESS_STATUS_INTERVAL_S`, по умолчанию 30 с;
+- `KRONIKA_OS_CGROUP_INTERVAL_S`, по умолчанию 10 с;
+- `KRONIKA_OS_CGROUP_MAPPING_INTERVAL_S`, по умолчанию 30 с.
+
 ## Бюджеты и права доступа
 
-ОС-коллектор должен иметь бюджеты на число сущностей и системные вызовы.
-Минимальные настройки:
+ОС-коллектор имеет бюджеты на число сущностей:
 
-- максимальное число PID за один проход сбора;
-- максимальное число cgroup за один проход сбора;
-- максимальное число пар `(cgroup, device)` для `1_203_001`;
-- максимальное время чтения `/proc` и `/sys` за один проход сбора;
-- режим деградации: пропуск низкоприоритетных источников, досрочная запись
-  буфера, событие `collector_gap` или событие о проблеме с правами либо
-  тайм-аутом.
+- `KRONIKA_OS_MAX_PROCS`, по умолчанию 4096: за проход сохраняются младшие PID;
+- `KRONIKA_OS_MAX_CGROUPS`, по умолчанию 1024;
+- `KRONIKA_OS_MAX_CGROUP_IO_ROWS`, по умолчанию 4096;
+- `KRONIKA_OS_CGROUP_MAX_DEPTH`, по умолчанию 8.
 
 Если лимит сработал, коллектор не должен молча выдавать частичный снимок как
-полный. Для частичного сбора нужна диагностическая метрика/событие и, где
-применимо, coverage.
+полный. Для частичного сбора пишется `collection_degraded` с `reason` и
+числом отброшенных строк. Отдельный лимит времени чтения `/proc` и `/sys`
+оставлен для будущей версии.
 
 Права доступа:
 
@@ -64,21 +73,26 @@ net/snmp, net/netstat, mountinfo, topology). Scope-значения: diskstats
 |----------|------|-----------|
 | `/proc/PID/io` | чужой uid, `hidepid`, Yama, SELinux/AppArmor, container PID namespace | недоступные io-колонки пишутся `NULL`, не `0` |
 | `/proc/PID/cmdline` | процесс исчез или доступ закрыт | `cmdline = NULL`, строка процесса может остаться |
-| `/sys/fs/cgroup` | rootless/container mode, отсутствующий контроллер, нестандартный mount layout | отсутствующие поля `NULL`, отсутствующий контроллер не имитируется нулями |
+| `/sys/fs/cgroup` | rootless/container mode, отсутствующий контроллер, нестандартный mount layout | nullable-поля пишутся `NULL`; отсутствующий контроллер пропускается, а не имитируется строкой |
 | обход логов, cgroup и `/proc` | тайм-аут или отказ в доступе | событие/метрика коллектора с указанием источника |
 
 ## `1_100_001` processes, горячий набор
 
 Самый объёмный системный тип: все PID на каждом регулярном сборе. Источники:
 `/proc/PID/stat`, `/proc/PID/io`, `/proc/PID/schedstat`, `/proc/PID/comm`,
-`/proc/PID/cmdline`.
+`/proc/PID/cmdline`, `/proc/PID/status`.
 
 Ключ сущности — `(pid, starttime)`. `starttime` нужен, чтобы отделять повторно
 использованный PID.
 
 Контейнерная особенность: чтение `/proc/PID/io` для процессов другого uid может
-требовать `setfsuid` без `CAP_SYS_PTRACE`. Если io-данные недоступны,
-соответствующие колонки пишутся как `NULL`, а не как нули.
+требовать `setfsuid`/`setfsgid` без `CAP_SYS_PTRACE`. Коллектор сначала читает
+файл обычными правами, затем при `PermissionDenied` пробует файловые uid/gid
+процесса. Если io-данные недоступны, соответствующие колонки пишутся как
+`NULL`, а не как нули.
+
+`cmdline` собирается по умолчанию, но `environ` не читается. Когда `cmdline`
+недоступен или пуст, колонка остаётся `NULL`, а строка процесса сохраняется.
 
 ```text
 ts                      ts    T
@@ -117,11 +131,14 @@ wchar                   i64?  C
 read_bytes              i64?  C
 write_bytes             i64?  C
 cancelled_write_bytes   i64?  C
+exit_signal             i32   L
+scope                   u8    L   // 0=host или 3=container в Wave 3
 ```
 
 `utime` и `stime` хранятся в единицах планировщика (`ticks`). Значение `hz`
 должно храниться в
-`instance_metadata`; код чтения не должен брать его из внешней конфигурации.
+`instance_metadata`; код чтения берёт его из `sysconf(_SC_CLK_TCK)`, а не из
+внешней конфигурации.
 
 ## `1_101_001` `/proc/PID/status`, расширенный набор
 
@@ -142,6 +159,7 @@ threads                     u32   G
 fdsize                      u32   G
 voluntary_ctxt_switches     i64   C
 nonvoluntary_ctxt_switches  i64   C
+scope                       u8    L   // 0=host или 3=container в Wave 3
 ```
 
 Кандидаты для будущих версий: число fd, `wchan`, `oom_score`.
@@ -415,18 +433,21 @@ scope       u8   L
 
 ## cgroup `1_200_001` - `1_204_001`
 
-Сущность почти везде — `cgroup_path`. Первая реализация читала только свой
-cgroup; новая реализация должна уметь обходить дерево `/sys/fs/cgroup`.
-Глубина и фильтр обхода — настройки коллектора.
+Сущность почти везде — `cgroup_path`. Wave 3 обходит дерево
+`/sys/fs/cgroup` через `KRONIKA_SYS_ROOT`, ограничивая глубину и число строк
+настройками `KRONIKA_OS_MAX_CGROUPS`, `KRONIKA_OS_CGROUP_MAX_DEPTH` и
+`KRONIKA_OS_MAX_CGROUP_IO_ROWS`.
 
 Поддержка cgroup v1 обязательна и пишет в те же `type_id`: раскладка единая,
 коллектор нормализует значения на месте.
 
 Нормализация cgroup v1:
 
+- `cpuacct.usage` ns -> usec;
 - `cpuacct.stat` ticks -> usec через `hz`;
 - `throttled_time` ns -> usec;
-- `memory.stat` `rss/cache/total_*` -> `anon/file`;
+- `memory.stat` `rss/cache/slab/kernel_stack/total_*` -> `anon/file/slab/kernel`;
+- `memory.failcnt` -> `max_events`;
 - `blkio.throttle.io_service_bytes` и `io_serviced` -> `rbytes/wbytes/rios/wios`.
 
 Лимиты считаются данными, а не метаданными: квоты могут меняться на лету,
@@ -441,6 +462,7 @@ ts           ts   T
 pid          i32  L
 starttime    ts   L
 cgroup_path  str  L
+scope        u8   L   // 0=host или 3=container в Wave 3
 ```
 
 `cgroup_path` — значение соответствия `pid -> cgroup`, а не часть ключа
@@ -466,6 +488,7 @@ throttled_usec i64  C
 nr_throttled   i64  C
 quota_usec     i64  G   // -1 = max
 period_usec    i64  G
+scope          u8   L   // 0=host или 3=container в Wave 3
 ```
 
 `throttled_usec` и `nr_throttled` важны для диагностики скрытого CPU throttling
@@ -487,9 +510,13 @@ high_events  i64  C
 max_events   i64  C
 oom_events   i64  C
 oom_kill     i64  C
+scope        u8   L   // 0=host или 3=container в Wave 3
 ```
 
-В cgroup v2 значение `max` может быть строкой `max`; в PGM это `NULL`.
+В cgroup v2 значение `max` может быть строкой `max`; в PGM это `NULL`. В
+cgroup v1 событий `low/high/oom/oom_kill` нет, поэтому эти счётчики остаются
+нулевыми; строка создаётся только когда есть обязательный controller-файл
+`memory.usage_in_bytes`.
 
 ### `1_203_001` cgroup io
 
@@ -504,6 +531,7 @@ rbytes       i64  C
 wbytes       i64  C
 rios         i64  C
 wios         i64  C
+scope        u8   L   // 0=host или 3=container в Wave 3
 ```
 
 ### `1_204_001` cgroup pids
@@ -513,6 +541,7 @@ ts           ts   T
 cgroup_path  str  L
 current      i64  G
 max          i64? G   // NULL = без лимита
+scope        u8   L   // 0=host или 3=container в Wave 3
 ```
 
 Диапазон `1_205_001` - `1_299_999` зарезервирован под cpuset, hugetlb и будущие

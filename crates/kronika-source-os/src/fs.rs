@@ -3,6 +3,7 @@
 //!
 //! Also provides [`statvfs`] for filesystem capacity queries.
 
+use std::collections::BinaryHeap;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
@@ -13,6 +14,24 @@ pub struct FsSpace {
     pub total_bytes: i64,
     /// Available bytes for unprivileged writes (`f_bavail * f_frsize`).
     pub free_bytes: i64,
+}
+
+/// Bounded list of numeric `/proc` directories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedPids {
+    /// PID numbers retained by the cap, sorted ascending.
+    pub pids: Vec<i32>,
+    /// Numeric PID directories skipped because the cap was reached.
+    pub dropped: usize,
+}
+
+/// One child directory under a configured filesystem root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntryName {
+    /// File name only, never a path.
+    pub name: String,
+    /// Whether the entry is a directory according to `file_type`.
+    pub is_dir: bool,
 }
 
 /// Convert raw `statvfs` fields to [`FsSpace`].
@@ -134,6 +153,45 @@ impl ProcFs {
         }
         Ok(content)
     }
+
+    /// Return the lowest numeric `/proc` directory names, bounded by `max`.
+    ///
+    /// # Errors
+    /// Returns the underlying `read_dir` error for the proc root.
+    pub fn pid_dirs_capped(&self, max: usize) -> io::Result<CappedPids> {
+        let mut kept = BinaryHeap::new();
+        let mut dropped = 0_usize;
+        for entry in std::fs::read_dir(&self.root)? {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(pid) = name.parse::<i32>() else {
+                continue;
+            };
+            if max == 0 {
+                dropped = dropped.saturating_add(1);
+                continue;
+            }
+            if kept.len() < max {
+                kept.push(pid);
+            } else if kept.peek().is_some_and(|highest| pid < *highest) {
+                kept.pop();
+                kept.push(pid);
+                dropped = dropped.saturating_add(1);
+            } else {
+                dropped = dropped.saturating_add(1);
+            }
+        }
+        let mut pids = kept.into_vec();
+        pids.sort_unstable();
+        Ok(CappedPids { pids, dropped })
+    }
 }
 
 /// A `/sys` root, overridable via `KRONIKA_SYS_ROOT`.
@@ -185,6 +243,35 @@ impl SysFs {
             return Err(io::Error::other(format!("{rel}: empty")));
         }
         Ok(trimmed.to_owned())
+    }
+
+    /// Return the absolute path for a checked relative sysfs path.
+    ///
+    /// # Errors
+    /// Returns an error when `rel` is empty or escapes the configured root.
+    pub fn path(&self, rel: &str) -> io::Result<PathBuf> {
+        Ok(self.root.join(checked_relative_path(rel)?))
+    }
+
+    /// Read immediate children under `<root>/<rel>`.
+    ///
+    /// # Errors
+    /// Returns the underlying `read_dir` error or a path validation error.
+    pub fn read_dir(&self, rel: &str) -> io::Result<Vec<DirEntryName>> {
+        let path = self.path(rel)?;
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            entries.push(DirEntryName {
+                name,
+                is_dir: entry.file_type()?.is_dir(),
+            });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
     }
 }
 

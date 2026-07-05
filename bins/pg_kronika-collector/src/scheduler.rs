@@ -31,10 +31,14 @@ pub(crate) enum SourceKind {
     Settings,
     OsCore,
     OsMountTopo,
+    OsProcesses,
+    OsProcessStatus,
+    OsCgroup,
+    OsCgroupMapping,
 }
 
 /// All source kinds, in collection order.
-pub(crate) const ALL_SOURCES: [SourceKind; 17] = [
+pub(crate) const ALL_SOURCES: [SourceKind; 21] = [
     SourceKind::Activity,
     SourceKind::Database,
     SourceKind::Bgwriter,
@@ -52,6 +56,10 @@ pub(crate) const ALL_SOURCES: [SourceKind; 17] = [
     SourceKind::Settings,
     SourceKind::OsCore,
     SourceKind::OsMountTopo,
+    SourceKind::OsProcesses,
+    SourceKind::OsProcessStatus,
+    SourceKind::OsCgroup,
+    SourceKind::OsCgroupMapping,
 ];
 
 /// Per-source intervals, in seconds.
@@ -74,6 +82,10 @@ pub(crate) struct Intervals {
     pub settings: u64,
     pub os_core: u64,
     pub os_mount_topo: u64,
+    pub os_processes: u64,
+    pub os_process_status: u64,
+    pub os_cgroup: u64,
+    pub os_cgroup_mapping: u64,
 }
 
 impl Default for Intervals {
@@ -96,6 +108,10 @@ impl Default for Intervals {
             settings: 3600,
             os_core: 10,
             os_mount_topo: 60,
+            os_processes: 5,
+            os_process_status: 30,
+            os_cgroup: 10,
+            os_cgroup_mapping: 30,
         }
     }
 }
@@ -120,6 +136,10 @@ impl Intervals {
             SourceKind::Settings => self.settings,
             SourceKind::OsCore => self.os_core,
             SourceKind::OsMountTopo => self.os_mount_topo,
+            SourceKind::OsProcesses => self.os_processes,
+            SourceKind::OsProcessStatus => self.os_process_status,
+            SourceKind::OsCgroup => self.os_cgroup,
+            SourceKind::OsCgroupMapping => self.os_cgroup_mapping,
         }
     }
 }
@@ -325,6 +345,10 @@ mod tests {
             settings: secs,
             os_core: secs,
             os_mount_topo: secs,
+            os_processes: secs,
+            os_process_status: secs,
+            os_cgroup: secs,
+            os_cgroup_mapping: secs,
         }
     }
 

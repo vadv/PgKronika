@@ -3,9 +3,12 @@
 //! This crate reads `/proc`, `/sys`, and cgroup data for the local host.
 //! It provides the host identity facts for `instance_metadata` (`1_021_001`).
 
+pub mod cgroup;
+
 mod fs;
 pub use fs::{
-    FsSpace, MAX_PROC_FILE_BYTES, ProcFs, SysFs, parse_dev_pair, space_from_raw, statvfs,
+    CappedPids, DirEntryName, FsSpace, MAX_PROC_FILE_BYTES, ProcFs, SysFs, parse_dev_pair,
+    space_from_raw, statvfs,
 };
 
 mod instance;
