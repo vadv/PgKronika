@@ -157,7 +157,7 @@ Tcp: 1 5 6 7 8 9 100 110 3 1 2\n";
 
     #[test]
     fn missing_key_within_group_yields_zero() {
-        // No InErrs in the header → defaults to 0.
+        // Missing keys default to 0.
         let c = "\
 Tcp: ActiveOpens PassiveOpens\n\
 Tcp: 42 17\n\

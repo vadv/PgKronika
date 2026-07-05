@@ -392,8 +392,9 @@ scope          u8    L
 
 ## `1_113_001` `cpuinfo` / topology
 
-`on_change`, политика материализации `every_segment_last_known`. Wave 2 пишет
-mountinfo и topology `on_change` с повторной «вооружённостью» на каждый сегмент.
+`on_change`, политика материализации `every_segment_last_known`.
+`SEGMENT_OPEN_SOURCES` заново помечает mountinfo и topology к отправке при
+открытии сегмента.
 
 ```text
 ts          ts   T

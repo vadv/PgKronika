@@ -1,9 +1,8 @@
-Feature: Wave 2 OS sections are sealed from fixture /proc and /sys trees
+Feature: Wave 2 OS sections use fixture /proc and /sys trees
 
   The collector reads diskstats, net/dev, net/snmp, net/netstat,
   self/mountinfo, and topology through KRONIKA_PROC_ROOT / KRONIKA_SYS_ROOT.
-  Pointing them at a fixture directory makes assertions host-independent:
-  the fixture content is the oracle.
+  Fixture roots make assertions independent from the host kernel state.
 
   @pg16 @serial
   Scenario: диски снимаются из фикстурного /proc/diskstats
@@ -23,7 +22,7 @@ Feature: Wave 2 OS sections are sealed from fixture /proc and /sys trees
     And section 1_108_001 major 9 minor 9 has write_sectors = 4000
 
   @pg16 @serial
-  Scenario: legacy diskstats — 14 полей дают discards = NULL
+  Scenario: legacy diskstats с 14 полями пишет discards = NULL
     Given a fresh database on PostgreSQL 16
     And a fixture proc tree
     And the fixture proc file "diskstats" contains:
@@ -90,7 +89,7 @@ Feature: Wave 2 OS sections are sealed from fixture /proc and /sys trees
     And section 1_111_001 scope equals 2
 
   @pg16 @serial
-  Scenario: диск в поде атрибутируется через mountinfo и не тянет чужие устройства
+  Scenario: диск в поде фильтруется через mountinfo
     Given a fresh database on PostgreSQL 16
     And a fixture proc tree
     And the fixture proc tree is a container

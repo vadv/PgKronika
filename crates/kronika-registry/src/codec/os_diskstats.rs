@@ -60,22 +60,22 @@ pub struct OsDiskstats {
     /// Weighted time spent doing I/O, milliseconds.
     #[column(c)]
     pub io_weighted_time_ms: i64,
-    /// Discard operations completed (kernel ≥ 4.18; `None` on older kernels).
+    /// Discard operations completed (kernel >= 4.18; `None` on older kernels).
     #[column(c)]
     pub discards: Option<i64>,
-    /// Discards merged (kernel ≥ 4.18; `None` on older kernels).
+    /// Discards merged (kernel >= 4.18; `None` on older kernels).
     #[column(c)]
     pub d_merged: Option<i64>,
-    /// Sectors discarded (kernel ≥ 4.18; `None` on older kernels).
+    /// Sectors discarded (kernel >= 4.18; `None` on older kernels).
     #[column(c)]
     pub discard_sectors: Option<i64>,
-    /// Time spent discarding, milliseconds (kernel ≥ 4.18; `None` on older kernels).
+    /// Time spent discarding, milliseconds (kernel >= 4.18; `None` on older kernels).
     #[column(c)]
     pub discard_time_ms: Option<i64>,
-    /// Flush requests completed (kernel ≥ 5.5; `None` on older kernels).
+    /// Flush requests completed (kernel >= 5.5; `None` on older kernels).
     #[column(c)]
     pub flushes: Option<i64>,
-    /// Time spent flushing, milliseconds (kernel ≥ 5.5; `None` on older kernels).
+    /// Time spent flushing, milliseconds (kernel >= 5.5; `None` on older kernels).
     #[column(c)]
     pub flush_time_ms: Option<i64>,
     /// Source scope (`0=host`). See `kronika_source_os::OsScope`.

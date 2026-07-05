@@ -33,23 +33,23 @@ pub struct DiskstatsRow {
     pub write_sectors: i64,
     /// Time spent writing, milliseconds.
     pub write_time_ms: i64,
-    /// I/O operations currently in progress (gauge — not a monotonic counter).
+    /// I/O operations currently in progress (gauge, not a monotonic counter).
     pub io_in_progress: i64,
     /// Time spent doing I/O, milliseconds.
     pub io_time_ms: i64,
     /// Weighted time spent doing I/O, milliseconds.
     pub io_weighted_time_ms: i64,
-    /// Discard operations completed (kernel ≥ 4.18; `None` on older kernels).
+    /// Discard operations completed (kernel >= 4.18; `None` on older kernels).
     pub discards: Option<i64>,
-    /// Discards merged (kernel ≥ 4.18; `None` on older kernels).
+    /// Discards merged (kernel >= 4.18; `None` on older kernels).
     pub d_merged: Option<i64>,
-    /// Sectors discarded (kernel ≥ 4.18; `None` on older kernels).
+    /// Sectors discarded (kernel >= 4.18; `None` on older kernels).
     pub discard_sectors: Option<i64>,
-    /// Time spent discarding, milliseconds (kernel ≥ 4.18; `None` on older kernels).
+    /// Time spent discarding, milliseconds (kernel >= 4.18; `None` on older kernels).
     pub discard_time_ms: Option<i64>,
-    /// Flush requests completed (kernel ≥ 5.5; `None` on older kernels).
+    /// Flush requests completed (kernel >= 5.5; `None` on older kernels).
     pub flushes: Option<i64>,
-    /// Time spent flushing, milliseconds (kernel ≥ 5.5; `None` on older kernels).
+    /// Time spent flushing, milliseconds (kernel >= 5.5; `None` on older kernels).
     pub flush_time_ms: Option<i64>,
 }
 
@@ -66,7 +66,7 @@ fn parse_i64(s: &str, pos: usize) -> Result<i64, ParseError> {
 /// Parse every line in `/proc/diskstats` content.
 ///
 /// Lines with fewer than 14 whitespace-separated fields are silently skipped
-/// (partition entries on older kernels). A line with ≥14 fields but a
+/// (partition entries on older kernels). A line with at least 14 fields but a
 /// non-numeric value is a [`ParseError`].
 ///
 /// # Errors

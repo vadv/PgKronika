@@ -50,7 +50,7 @@ pub(crate) fn detect_container_from_cgroup(cgroup: &str) -> bool {
 /// skipped in that case.
 ///
 /// When `KRONIKA_PROC_ROOT` is absent (default `/proc`), all three signals
-/// are checked — matching Wave 1 production behavior.
+/// are checked, matching Wave 1 production behavior.
 #[must_use]
 pub fn detect_container(fs: &ProcFs) -> bool {
     let proc_root_overridden = std::env::var_os("KRONIKA_PROC_ROOT").is_some();
@@ -68,7 +68,7 @@ pub fn detect_container(fs: &ProcFs) -> bool {
 
 /// Maps the container flag to the appropriate network scope.
 ///
-/// Pure function — test this directly to avoid env/filesystem non-determinism.
+/// Pure function; tests can avoid env/filesystem non-determinism.
 #[must_use]
 pub(crate) const fn scope_for_net(in_container: bool) -> OsScope {
     if in_container {
