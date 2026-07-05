@@ -152,7 +152,7 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
       """
     And the statvfs fixture is "/data=10737418240:5368709120;/data/pg wal=21474836480:1073741824"
     When the collector snapshots the segment
-    Then section 1_108_001 has 0 rows
+    Then section 1_108_001 is absent from the segment
     And section 1_112_001 has 2 rows
     And section 1_112_001 has a row with mount_point = "/data":
       | major       | 8           |
