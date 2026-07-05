@@ -1,5 +1,4 @@
-//! Parse `/proc/self/mountinfo` and attribute block-device I/O to a pod's real
-//! backing devices.
+//! Parse `/proc/self/mountinfo` and derive disk-attribution helpers.
 //!
 //! In a Kubernetes pod, `/proc/diskstats` reports the whole node's per-device
 //! counters. Charging all of them to the pod would double-count the node. This
@@ -25,11 +24,13 @@ pub struct MountEntry {
     pub major: i32,
     /// Device minor number.
     pub minor: i32,
-    /// Where the filesystem is mounted (mountinfo field 5).
+    /// Where the filesystem is mounted (mountinfo field 5), with mountinfo
+    /// octal escapes decoded.
     pub mount_point: String,
     /// Filesystem type after the ` - ` separator (e.g. `ext4`, `btrfs`).
     pub fstype: String,
-    /// Mount source after the ` - ` separator (e.g. `/dev/sda1`).
+    /// Mount source after the ` - ` separator (e.g. `/dev/sda1`), with
+    /// mountinfo octal escapes decoded.
     pub source: String,
     /// Whether [`mount_point`](Self::mount_point) is a Kubernetes bind-mounted
     /// infrastructure path that shares the node's device but carries no pod I/O.
@@ -90,17 +91,54 @@ pub fn parse_mountinfo(content: &str) -> Vec<MountEntry> {
             continue;
         };
 
+        let mount_point = unescape_mountinfo_field(mount_point);
+        let fstype = unescape_mountinfo_field(fstype);
+        let source = unescape_mountinfo_field(source);
+
         entries.push(MountEntry {
             major,
             minor,
-            is_k8s_infra: is_k8s_infra_mount(mount_point),
-            mount_point: (*mount_point).to_owned(),
-            fstype: fstype.to_owned(),
-            source: source.to_owned(),
+            is_k8s_infra: is_k8s_infra_mount(&mount_point),
+            mount_point,
+            fstype,
+            source,
         });
     }
 
     entries
+}
+
+fn unescape_mountinfo_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && let (Some(a), Some(b), Some(c)) = (
+                octal_digit(bytes[i + 1]),
+                octal_digit(bytes[i + 2]),
+                octal_digit(bytes[i + 3]),
+            )
+        {
+            let value = u16::from(a) * 64 + u16::from(b) * 8 + u16::from(c);
+            if let Ok(byte) = u8::try_from(value) {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
+        }
+
+        out.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn octal_digit(byte: u8) -> Option<u8> {
+    (b'0'..=b'7').contains(&byte).then(|| byte - b'0')
 }
 
 /// Maps `(major, minor)` to its mount points, dropping `major == 0` entries.
@@ -190,6 +228,16 @@ mod tests {
         assert_eq!(e[0].source, "/dev/sda1");
         assert!(!e[0].is_k8s_infra);
         assert!(e[2].is_k8s_infra); // /etc/hosts
+    }
+
+    #[test]
+    fn decodes_mountinfo_octal_escapes() {
+        let c = "\
+30 25 8:1 / /data\\040pg rw,relatime shared:1 - ext4 /dev/disk\\040one rw\n";
+        let e = parse_mountinfo(c);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].mount_point, "/data pg");
+        assert_eq!(e[0].source, "/dev/disk one");
     }
 
     #[test]

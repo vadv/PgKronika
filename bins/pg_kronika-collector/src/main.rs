@@ -123,8 +123,8 @@ use kronika_source_os::proc::vmstat::parse_vmstat;
 use kronika_source_os::proc::{diskstats, net_dev, net_netstat, net_snmp};
 use kronika_source_os::{
     MountEntry, OsInstanceFacts, OsScope, ProcFs, SysFs, collect_os_instance_facts,
-    container_device_set, detect_container, device_map, display_path, mount_row, net_scope,
-    parse_dev_pair, parse_mountinfo, statvfs,
+    container_device_set, detect_container, mount_row, net_scope, parse_dev_pair, parse_mountinfo,
+    statvfs,
 };
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion, collect_database};
@@ -2355,8 +2355,8 @@ fn read_optional_os_file(fs: &ProcFs, rel: &'static str, type_id: u32) -> Option
 /// Counter sections (cpu, stat, meminfo, loadavg, vmstat, psi, diskstats,
 /// netdev, snmp, netstat) are gated on `due.has(SourceKind::OsCore)` and are
 /// never emitted on an OsMountTopo-only tick. Mountinfo is parsed on every
-/// `OsCore` tick for attribution and emitted, together with topology, only when
-/// `due.has(SourceKind::OsMountTopo)` is true.
+/// `OsCore` tick for diskstats attribution and emitted, together with topology,
+/// only when `due.has(SourceKind::OsMountTopo)` is true.
 /// On file read or parse failure the affected section is skipped and a
 /// `collection_degraded` event is logged; zeros are never fabricated. `scope`
 /// is the host scope for device-local sections; network sections carry their
@@ -2650,22 +2650,8 @@ fn collect_os_sources(
     }
 
     if due.has(SourceKind::OsMountTopo) {
-        // Ensure os.diskstats is populated for the device lookup inside
-        // collect_mountinfo. On co-occurring OsCore ticks the list is already
-        // filled above; on rare OsMountTopo-only ticks collect it here.
-        if !due.has(SourceKind::OsCore) {
-            os.diskstats = collect_diskstats(fs, interner, scope, ts, in_container, &mounts);
-        }
-        // Attribution rows: surviving diskstats devices mapped to their mount
-        // points and filesystem capacity. Mount strings are interned here.
-        os.mountinfo = collect_mountinfo(interner, scope, ts, &mounts, os.diskstats.as_slice());
-        os.topology = collect_topology(fs, interner, scope, ts);
-        // diskstats was collected above only for the device set used by
-        // collect_mountinfo. It is an OsCore section and must not be emitted
-        // on an OsMountTopo-only tick.
-        if !due.has(SourceKind::OsCore) {
-            os.diskstats = Vec::new();
-        }
+        os.mountinfo = collect_mountinfo(interner, scope, ts, &mounts);
+        os.topology = collect_topology(fs, &SysFs::from_env(), interner, scope, ts);
     }
 
     os
@@ -2722,7 +2708,7 @@ fn collect_diskstats(
 /// When the cap trims rows, a `collection_degraded` event with `reason=disk_cap`
 /// records how many devices were dropped so the gap is visible, not silent.
 fn apply_disk_cap(rows: &mut Vec<diskstats::DiskstatsRow>, type_id: u32) {
-    let cap = env_u64("KRONIKA_OS_MAX_DISKS", 256).unwrap_or(256);
+    let cap = os_max_disks(type_id);
     let cap = usize::try_from(cap).unwrap_or(usize::MAX);
     let dropped = cap_disks(rows, cap);
     if dropped == 0 {
@@ -2741,6 +2727,27 @@ fn apply_disk_cap(rows: &mut Vec<diskstats::DiskstatsRow>, type_id: u32) {
             field("cap", cap),
         ],
     );
+}
+
+fn os_max_disks(type_id: u32) -> u64 {
+    match env_u64("KRONIKA_OS_MAX_DISKS", 256) {
+        Ok(cap) => cap,
+        Err(err) => {
+            log_event(
+                LogLevel::Warn,
+                "collection_degraded",
+                &[
+                    field("collection", section_name(type_id)),
+                    field("type_id", type_id),
+                    field("layout_id", layout_id(type_id)),
+                    field("source", "KRONIKA_OS_MAX_DISKS"),
+                    field("reason", &err),
+                    field("cap", 256_u64),
+                ],
+            );
+            256
+        }
+    }
 }
 
 /// Trim `rows` to the `cap` lowest `(major, minor)` devices in place.
@@ -2839,42 +2846,25 @@ fn resolve_major_zero(sys: &SysFs, entries: &mut [MountEntry]) {
     }
 }
 
-/// Build the mount-attribution rows for the devices that survived filtering.
+/// Build one `os_mountinfo` row per parsed mount entry.
 ///
-/// Each diskstats device that has a mount point becomes one `os_mountinfo` row
-/// with its display path and, when available, filesystem capacity. Mount point,
-/// fstype, and source strings are interned here.
+/// Mount point, fstype, and source strings are interned here. Filesystem
+/// capacity is nullable because `statvfs` can fail for pseudo-filesystems or
+/// mounts that vanish during collection.
 fn collect_mountinfo(
     interner: &mut Interner,
     scope: u8,
     ts: i64,
     entries: &[MountEntry],
-    diskstats: &[OsDiskstats],
 ) -> Vec<OsMountinfo> {
     let type_id = 1_112_001_u32;
     let started = Instant::now();
     if entries.is_empty() {
         return Vec::new();
     }
-    let map = device_map(entries);
 
     let mut rows = Vec::new();
-    for disk in diskstats {
-        let Some(paths) = map.get(&(disk.major, disk.minor)) else {
-            continue;
-        };
-        let Some(path) = display_path(paths) else {
-            continue;
-        };
-        // Match on device and path together: a path string may repeat across
-        // devices, so the entry backing this device is the correct source of
-        // fstype/source/is_k8s_infra.
-        let Some(entry) = entries
-            .iter()
-            .find(|e| e.major == disk.major && e.minor == disk.minor && e.mount_point == path)
-        else {
-            continue;
-        };
+    for entry in entries {
         let (Some(mount_point), Some(fstype), Some(source)) = (
             intern_str(interner, type_id, "self/mountinfo", &entry.mount_point),
             intern_str(interner, type_id, "self/mountinfo", &entry.fstype),
@@ -2882,7 +2872,7 @@ fn collect_mountinfo(
         ) else {
             continue;
         };
-        let space = statvfs(path);
+        let space = statvfs(&entry.mount_point);
         rows.push(mount_row(
             entry,
             space,
@@ -2901,19 +2891,28 @@ fn collect_mountinfo(
 ///
 /// On read or parse failure the section is skipped and a `collection_degraded`
 /// event is logged; zeros are never fabricated.
-fn collect_topology(fs: &ProcFs, interner: &mut Interner, scope: u8, ts: i64) -> Vec<OsTopology> {
+fn collect_topology(
+    fs: &ProcFs,
+    sys: &SysFs,
+    interner: &mut Interner,
+    scope: u8,
+    ts: i64,
+) -> Vec<OsTopology> {
     let type_id = 1_113_001_u32;
     let started = Instant::now();
     let Some(content) = read_optional_os_file(fs, "cpuinfo", type_id) else {
         return Vec::new();
     };
-    let rows = match cpuinfo::parse(&content) {
+    let mut rows = match cpuinfo::parse(&content) {
         Ok(rows) => rows,
         Err(err) => {
             log_degraded(type_id, "cpuinfo", &err.0);
             return Vec::new();
         }
     };
+    for row in &mut rows {
+        row.mhz_max = cpu_max_mhz(sys, row.cpu_id);
+    }
     let built: Vec<OsTopology> = rows
         .iter()
         .filter_map(|row| {
@@ -2923,6 +2922,12 @@ fn collect_topology(fs: &ProcFs, interner: &mut Interner, scope: u8, ts: i64) ->
         .collect();
     log_collection_finish(type_id, "procfs", built.len(), started.elapsed());
     built
+}
+
+fn cpu_max_mhz(sys: &SysFs, cpu_id: i32) -> Option<f64> {
+    let rel = format!("devices/system/cpu/cpu{cpu_id}/cpufreq/cpuinfo_max_freq");
+    let khz = sys.read(&rel).ok()?.parse::<f64>().ok()?;
+    (khz.is_finite() && khz >= 0.0).then_some(khz / 1000.0)
 }
 
 /// Intern one OS string, logging degradation and returning `None` on failure so
@@ -4674,9 +4679,9 @@ fn push_store_plans_ossc(
 mod tests {
     use super::{
         DueSet, Intervals, MountEntry, PlansSourceCache, Scheduler, SegmentState, SourceCoverage,
-        SourceKind, StatementsVersion, SysFs, cap_disks, collect_os_sources, diskstats,
-        min_total_time, resolve_major_zero, seal_reason, statements_type_id, timer_sleep_delay,
-        user_indexes_type_id, user_tables_type_id,
+        SourceKind, StatementsVersion, SysFs, cap_disks, collect_mountinfo, collect_os_sources,
+        cpu_max_mhz, diskstats, min_total_time, resolve_major_zero, seal_reason,
+        statements_type_id, timer_sleep_delay, user_indexes_type_id, user_tables_type_id,
     };
     use kronika_source_os::ProcFs;
 
@@ -4745,6 +4750,49 @@ mod tests {
         resolve_major_zero(&sys, &mut entries);
         // Unresolvable major==0 stays 0 and is dropped downstream by device_map.
         assert_eq!((entries[0].major, entries[0].minor), (0, 42));
+    }
+
+    #[test]
+    fn collect_mountinfo_emits_every_mount_entry() {
+        let entries = vec![
+            MountEntry {
+                major: 8,
+                minor: 1,
+                mount_point: "/data".to_owned(),
+                fstype: "ext4".to_owned(),
+                source: "/dev/sda1".to_owned(),
+                is_k8s_infra: false,
+            },
+            MountEntry {
+                major: 8,
+                minor: 1,
+                mount_point: "/data/pg wal".to_owned(),
+                fstype: "ext4".to_owned(),
+                source: "/dev/sda1".to_owned(),
+                is_k8s_infra: false,
+            },
+        ];
+        let mut interner = Interner::new(activity_dict_limits());
+        let rows = collect_mountinfo(&mut interner, 0, 1_000_000, &entries);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|r| (r.major, r.minor)).collect::<Vec<_>>(),
+            vec![(8, 1), (8, 1)]
+        );
+        assert_ne!(rows[0].mount_point, rows[1].mount_point);
+    }
+
+    #[test]
+    fn cpu_max_mhz_reads_sysfs_khz() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rel = "devices/system/cpu/cpu0/cpufreq";
+        std::fs::create_dir_all(dir.path().join(rel)).expect("mkdir");
+        std::fs::write(dir.path().join(rel).join("cpuinfo_max_freq"), "3600000\n").expect("write");
+        let sys = SysFs::new(dir.path().to_path_buf());
+
+        assert_eq!(cpu_max_mhz(&sys, 0), Some(3600.0));
+        assert_eq!(cpu_max_mhz(&sys, 1), None);
     }
 
     #[test]
@@ -6079,9 +6127,7 @@ mod tests {
         );
     }
 
-    // Verify that diskstats rows are NOT emitted on an OsMountTopo-only tick
-    // (the cadence defect fixed in Finding 1: diskstats was collected for the
-    // attribution device lookup but then forwarded to push_os_sources).
+    // Verify that diskstats rows are not emitted on an OsMountTopo-only tick.
     #[test]
     fn collect_os_sources_no_diskstats_on_mount_topo_only_tick() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6108,7 +6154,7 @@ mod tests {
         );
         assert!(
             !os.mountinfo.is_empty(),
-            "mountinfo rows must still be built from the device set"
+            "mountinfo rows must still be built"
         );
     }
 }
