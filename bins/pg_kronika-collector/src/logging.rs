@@ -537,6 +537,27 @@ pub(crate) fn log_collection_failure(
     );
 }
 
+pub(crate) fn log_count_degraded(
+    type_id: u32,
+    source: &'static str,
+    reason: &'static str,
+    count: usize,
+) {
+    let [collection, type_id, layout_id] = section_fields(type_id);
+    log_event(
+        LogLevel::Warn,
+        "collection_degraded",
+        &[
+            collection,
+            type_id,
+            layout_id,
+            field("source", source),
+            field("reason", reason),
+            field("count", count),
+        ],
+    );
+}
+
 pub(crate) fn summary_rows(summary: &FlushSummary) -> u64 {
     let mut rows = 0_u64;
     for section in &summary.sections {
