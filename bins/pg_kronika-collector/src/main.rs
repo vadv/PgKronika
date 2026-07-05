@@ -136,12 +136,16 @@ use kronika_registry::os_snmp::OsSnmp;
 use kronika_registry::os_stat::OsStat;
 use kronika_registry::os_topology::OsTopology;
 use kronika_registry::os_vmstat::OsVmstat;
-use kronika_registry::pg_log::{PgLogErrorV1, PgLogGapV1};
+use kronika_registry::pg_log::{
+    PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1, PgLogSlowQueryV1,
+};
 use kronika_registry::{MAX_SECTION_ROWS, StrId, Ts};
 use kronika_source_log::{
-    DiscoveryStatus as LogDiscoveryStatus, GroupedLogError, LogCollection, LogCollector, LogConfig,
-    LogGap, MAX_PATTERN_BYTES, MAX_TEXT_BYTES, PG_LOG_ERRORS_TYPE_ID, PG_LOG_GAP_TYPE_ID,
-    ParserKind as LogParserKind,
+    CheckpointEvent, DiscoveryStatus as LogDiscoveryStatus, GroupedLogError, LifecycleEvent,
+    LogCollection, LogCollector, LogConfig, LogGap, MAX_PATTERN_BYTES, MAX_TEXT_BYTES,
+    PG_LOG_CHECKPOINTS_TYPE_ID, PG_LOG_ERRORS_TYPE_ID, PG_LOG_GAP_TYPE_ID,
+    PG_LOG_LIFECYCLE_TYPE_ID, PG_LOG_SLOW_QUERIES_TYPE_ID, ParserKind as LogParserKind,
+    SlowQueryEvent,
 };
 use kronika_source_os::proc::cpuinfo;
 use kronika_source_os::proc::loadavg::parse_loadavg;
@@ -3734,6 +3738,30 @@ async fn collect_log_batch(
         collection.errors.len(),
         started.elapsed(),
     );
+    if !collection.checkpoints.is_empty() {
+        log_collection_finish(
+            PG_LOG_CHECKPOINTS_TYPE_ID,
+            "log",
+            collection.checkpoints.len(),
+            started.elapsed(),
+        );
+    }
+    if !collection.slow_queries.is_empty() {
+        log_collection_finish(
+            PG_LOG_SLOW_QUERIES_TYPE_ID,
+            "log",
+            collection.slow_queries.len(),
+            started.elapsed(),
+        );
+    }
+    if !collection.lifecycles.is_empty() {
+        log_collection_finish(
+            PG_LOG_LIFECYCLE_TYPE_ID,
+            "log",
+            collection.lifecycles.len(),
+            started.elapsed(),
+        );
+    }
     if !collection.gaps.is_empty() {
         log_collection_finish(
             PG_LOG_GAP_TYPE_ID,
@@ -3749,6 +3777,9 @@ async fn collect_log_batch(
             &[
                 field("status", discovery_status_name(status)),
                 field("error_rows", collection.errors.len()),
+                field("checkpoint_rows", collection.checkpoints.len()),
+                field("slow_query_rows", collection.slow_queries.len()),
+                field("lifecycle_rows", collection.lifecycles.len()),
                 field("gap_rows", collection.gaps.len()),
                 field("elapsed_ms", duration_ms(started.elapsed())),
             ],
@@ -3788,6 +3819,15 @@ fn push_log_sections(
     let mut dropped = 0_u32;
     for error in &collection.errors {
         dropped = dropped.saturating_add(push_log_error(buffers, interner, error)?);
+    }
+    for checkpoint in &collection.checkpoints {
+        dropped = dropped.saturating_add(push_log_checkpoint(buffers, interner, checkpoint)?);
+    }
+    for slow_query in &collection.slow_queries {
+        dropped = dropped.saturating_add(push_log_slow_query(buffers, interner, slow_query)?);
+    }
+    for lifecycle in &collection.lifecycles {
+        dropped = dropped.saturating_add(push_log_lifecycle(buffers, interner, lifecycle)?);
     }
     dropped = dropped.saturating_add(push_log_gaps(buffers, interner, &collection.gaps)?);
     Ok(dropped)
@@ -3837,6 +3877,100 @@ fn push_log_error(
             statement,
             database: None,
             username: None,
+            dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
+        },
+    )?;
+    Ok(dropped)
+}
+
+fn push_log_checkpoint(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    checkpoint: &CheckpointEvent,
+) -> Result<u32> {
+    let mut dropped = 0_u32;
+    let reason = checkpoint
+        .reason
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    buffer_row(
+        buffers,
+        PgLogCheckpointV1 {
+            ts: Ts(checkpoint.ts),
+            phase: checkpoint.phase.code(),
+            reason,
+            seconds_apart: checkpoint.seconds_apart,
+            buffers_written: checkpoint.buffers_written,
+            write_ms: checkpoint.write_ms,
+            sync_ms: checkpoint.sync_ms,
+            total_ms: checkpoint.total_ms,
+            distance_kb: checkpoint.distance_kb,
+            estimate_kb: checkpoint.estimate_kb,
+            wal_added: checkpoint.wal_added,
+            wal_removed: checkpoint.wal_removed,
+            wal_recycled: checkpoint.wal_recycled,
+            sync_files: checkpoint.sync_files,
+            longest_sync_ms: checkpoint.longest_sync_ms,
+            average_sync_ms: checkpoint.average_sync_ms,
+            dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
+        },
+    )?;
+    Ok(dropped)
+}
+
+fn push_log_slow_query(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    slow_query: &SlowQueryEvent,
+) -> Result<u32> {
+    let mut dropped = 0_u32;
+    let pattern = intern_log_text(
+        interner,
+        &slow_query.pattern,
+        MAX_PATTERN_BYTES,
+        &mut dropped,
+    );
+    let sample = intern_log_text(interner, &slow_query.sample, MAX_TEXT_BYTES, &mut dropped);
+    buffer_row(
+        buffers,
+        PgLogSlowQueryV1 {
+            ts: Ts(slow_query.ts),
+            pattern,
+            sample,
+            count: slow_query.count,
+            max_duration_ms: slow_query.max_duration_ms,
+            total_duration_ms: slow_query.total_duration_ms,
+            dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
+        },
+    )?;
+    Ok(dropped)
+}
+
+fn push_log_lifecycle(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    lifecycle: &LifecycleEvent,
+) -> Result<u32> {
+    let mut dropped = 0_u32;
+    let shutdown_mode = lifecycle
+        .shutdown_mode
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let message = intern_log_text(interner, &lifecycle.message, MAX_TEXT_BYTES, &mut dropped);
+    let query_detail = lifecycle
+        .query_detail
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    buffer_row(
+        buffers,
+        PgLogLifecycleV1 {
+            ts: Ts(lifecycle.ts),
+            kind: lifecycle.kind.code(),
+            pid: lifecycle.pid,
+            signal: lifecycle.signal,
+            shutdown_mode,
+            message,
+            query_detail,
             dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
         },
     )?;

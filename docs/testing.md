@@ -189,7 +189,7 @@ CREATE TABLE bdd_7f3a + 1000 INSERT
   → 1_013_001: строка relname = "bdd_7f3a", дельта n_tup_ins равна 1000
 
 SELECT pg_sleep(2) /* bdd-slow-7f3a */ при log_min_duration_statement = 100
-  → будущий 1_026_001: sql содержит метку, duration_ms ≈ 2000
+  → 1_026_001: sample содержит метку, max_duration_ms ≈ 2000
   → 1_001_001: есть снимок, где этот запрос в state = active
 
 пять ошибок 'bdd-err-7f3a' в одном окне агрегации
@@ -219,7 +219,7 @@ SELECT pg_sleep(2) /* bdd-slow-7f3a */ при log_min_duration_statement = 100
 ```text
 дельта xact_commit (1_005_001) ≈ интеграл графика TPS (10_002_001)
                                ≈ отчёт pgbench
-checkpoint виден в счётчиках 1_006_001, в будущем лог-типе 1_024_001
+checkpoint виден в счётчиках 1_006_001, в лог-типе 1_024_001
                                и в графике 10_001_001
 процесс с известным comm крутит busy-loop 3 секунды
   → дельта utime / hz ≈ 3 в 1_100_001
