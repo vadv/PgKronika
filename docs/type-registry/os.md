@@ -7,8 +7,15 @@ loadavg, vmstat, PSI). Каждая строка несёт колонку `scop
 `0=host, 1=pod, 2=pod_net, 3=container, 4=unknown`); в Wave 1 procfs-core
 файлы протекают host-wide в контейнере, поэтому их `scope` = `host`.
 Корень procfs переопределяется `KRONIKA_PROC_ROOT` (по умолчанию `/proc`),
-период — `KRONIKA_OS_CORE_INTERVAL_S` (по умолчанию 10 с). Остальные ОС-типы
-(processes, диск, сеть, cgroup) — следующие волны.
+период — `KRONIKA_OS_CORE_INTERVAL_S` (по умолчанию 10 с).
+
+**Реализовано (Wave 2):** `1_108_001`-`1_113_001` (diskstats, net/dev,
+net/snmp, net/netstat, mountinfo, topology). Scope-значения: diskstats
+(`1_108_001`), mountinfo (`1_112_001`) и topology (`1_113_001`) несут
+`scope=host` (данные уровня устройства/узла); сетевые секции (`1_109_001`,
+`1_110_001`, `1_111_001`) несут `scope=pod_net`, когда обнаружен контейнер
+(через cgroup), иначе `scope=host`. Остальные ОС-типы (processes, cgroup) —
+следующие волны.
 
 ## Сводная таблица
 
@@ -26,8 +33,8 @@ loadavg, vmstat, PSI). Каждая строка несёт колонку `scop
 | `1_109_001` | `/proc/net/dev` | базовый шаг | `snapshot_full` | `(iface, ts)` |
 | `1_110_001` | `/proc/net/snmp` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_111_001` | `/proc/net/netstat` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_112_001` | `mountinfo` | сегмент + по изменению | `on_change` | `(major, minor, mount_point)` |
-| `1_113_001` | `cpuinfo` / topology | сегмент + по изменению | `on_change` | `(cpu_id)` |
+| `1_112_001` | `mountinfo` | сегмент + по изменению | `on_change` | `(major, minor, mount_point, ts)` |
+| `1_113_001` | `cpuinfo` / topology | сегмент + по изменению | `on_change` | `(cpu_id, ts)` |
 | `1_200_001` | cgroup: process mapping | 30 с | `snapshot_full` | `(pid, starttime, ts)` |
 | `1_201_001` | cgroup: cpu | базовый шаг | `snapshot_full` | `(cgroup_path, ts)` |
 | `1_202_001` | cgroup: memory | базовый шаг | `snapshot_full` | `(cgroup_path, ts)` |
@@ -266,8 +273,8 @@ scope         u8   L   // 0=host в Wave 1
 
 ```text
 ts                   ts    T
-major                u32   L
-minor                u32   L
+major                i32   L
+minor                i32   L
 device               str   L
 reads                i64   C
 r_merged             i64   C
@@ -286,6 +293,7 @@ discard_sectors      i64?  C
 discard_time_ms      i64?  C
 flushes              i64?  C
 flush_time_ms        i64?  C
+scope                u8    L   // 0=host в Wave 2
 ```
 
 ## `1_109_001` `/proc/net/dev`
@@ -311,6 +319,7 @@ tx_fifo        i64  C
 tx_colls       i64  C
 tx_carrier     i64  C
 tx_compressed  i64  C
+scope          u8   L   // 0=host или 2=pod_net в Wave 2
 ```
 
 ## `1_110_001` `/proc/net/snmp`
@@ -333,6 +342,7 @@ udp_in_datagrams   i64  C
 udp_out_datagrams  i64  C
 udp_in_errors      i64  C
 udp_no_ports       i64  C
+scope              u8   L   // 0=host или 2=pod_net в Wave 2
 ```
 
 ## `1_111_001` `/proc/net/netstat`
@@ -348,6 +358,7 @@ tcp_fast_retrans       i64  C
 tcp_slow_start_retrans i64  C
 tcp_ofo_queue          i64  C
 tcp_syn_retrans        i64  C
+scope                  u8   L   // 0=host или 2=pod_net в Wave 2
 ```
 
 Расширение остальными ключами требует проверки совместимости. При несовместимом
