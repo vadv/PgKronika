@@ -355,6 +355,8 @@ impl HarnessState {
     pub(crate) fn seed_default_proc_fixture(&mut self) -> Result<()> {
         // Ensure the root exists and KRONIKA_PROC_ROOT is registered.
         self.fixture_proc_root()?;
+        // Keep OS fixture scenarios independent from the runner's real /sys.
+        self.fixture_sys_root()?;
 
         // stat: aggregate + one cpu line so parse_cpu succeeds; required misc fields present.
         self.write_proc_fixture(

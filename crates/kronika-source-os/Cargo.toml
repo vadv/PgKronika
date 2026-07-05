@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 kronika-registry = { path = "../kronika-registry" }
+nix = { version = "0.29", features = ["fs", "user"] }
 rustix = { version = "1", features = ["param", "fs"] }
 
 [dev-dependencies]
