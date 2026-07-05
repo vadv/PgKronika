@@ -136,6 +136,67 @@ impl ProcFs {
     }
 }
 
+/// A `/sys` root, overridable via `KRONIKA_SYS_ROOT`.
+///
+/// Used to recover the real `(major, minor)` of `major == 0` subvolume mounts
+/// (btrfs, ZFS) from `class/block/<name>/dev`, and to let BDD fixture the
+/// sysfs tree.
+#[derive(Debug, Clone)]
+pub struct SysFs {
+    root: PathBuf,
+}
+
+impl SysFs {
+    /// Root from `KRONIKA_SYS_ROOT`, defaulting to `/sys`.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let root = std::env::var_os("KRONIKA_SYS_ROOT")
+            .map_or_else(|| PathBuf::from("/sys"), PathBuf::from);
+        Self { root }
+    }
+
+    /// A reader rooted at `root`.
+    #[must_use]
+    pub const fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// Read `<root>/<rel>`, trimmed; empty content is an error.
+    ///
+    /// # Errors
+    /// Returns the underlying `io::Error` (with the path), an empty-file error,
+    /// or a path-escape error when `rel` leaves the configured root.
+    pub fn read(&self, rel: &str) -> io::Result<String> {
+        let rel_path = checked_relative_path(rel)?;
+        let path = self.root.join(rel_path);
+        let mut file = std::fs::File::open(&path).map_err(|err| tag_io_error(rel, &err))?;
+        let mut content = String::new();
+        file.by_ref()
+            .take((MAX_PROC_FILE_BYTES + 1) as u64)
+            .read_to_string(&mut content)
+            .map_err(|err| tag_io_error(rel, &err))?;
+        if content.len() > MAX_PROC_FILE_BYTES {
+            return Err(io::Error::other(format!(
+                "{rel}: exceeds {MAX_PROC_FILE_BYTES} byte sysfs read limit"
+            )));
+        }
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err(io::Error::other(format!("{rel}: empty")));
+        }
+        Ok(trimmed.to_owned())
+    }
+}
+
+/// Parse a `MAJ:MIN` device string (the content of `class/block/<name>/dev`).
+///
+/// Returns `None` when the string is not exactly two colon-separated `i32`s.
+#[must_use]
+pub fn parse_dev_pair(content: &str) -> Option<(i32, i32)> {
+    let (major, minor) = content.trim().split_once(':')?;
+    Some((major.trim().parse().ok()?, minor.trim().parse().ok()?))
+}
+
 fn checked_relative_path(rel: &str) -> io::Result<&Path> {
     if rel.trim().is_empty() {
         return Err(io::Error::other("empty proc-relative path"));
@@ -160,7 +221,7 @@ fn tag_io_error(rel: &str, err: &io::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{FsSpace, ProcFs, parse_fixture, space_from_raw};
+    use super::{FsSpace, ProcFs, SysFs, parse_dev_pair, parse_fixture, space_from_raw};
     use std::io::Write;
 
     #[test]
@@ -259,6 +320,36 @@ mod tests {
         let fs = ProcFs::new(dir.path().to_path_buf());
         assert!(fs.read_raw("../stat").is_err());
         assert!(fs.read_raw("/proc/stat").is_err());
+    }
+
+    #[test]
+    fn parse_dev_pair_reads_major_minor() {
+        assert_eq!(parse_dev_pair("259:3\n"), Some((259, 3)));
+        assert_eq!(parse_dev_pair("  8:1  "), Some((8, 1)));
+    }
+
+    #[test]
+    fn parse_dev_pair_rejects_malformed() {
+        assert_eq!(parse_dev_pair("259"), None);
+        assert_eq!(parse_dev_pair("a:b"), None);
+        assert_eq!(parse_dev_pair(""), None);
+    }
+
+    #[test]
+    fn sysfs_reads_block_dev_under_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("class/block/dm-0")).expect("mkdir");
+        std::fs::write(dir.path().join("class/block/dm-0/dev"), "253:0\n").expect("write");
+        let sys = SysFs::new(dir.path().to_path_buf());
+        assert_eq!(sys.read("class/block/dm-0/dev").expect("read"), "253:0");
+    }
+
+    #[test]
+    fn sysfs_rejects_escape_and_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sys = SysFs::new(dir.path().to_path_buf());
+        assert!(sys.read("../etc/passwd").is_err());
+        assert!(sys.read("class/block/nope/dev").is_err());
     }
 
     #[test]
