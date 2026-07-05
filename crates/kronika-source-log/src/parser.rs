@@ -50,9 +50,19 @@ pub(crate) enum ParsedLine<'a> {
         sqlstate: Option<&'a str>,
         message: &'a str,
     },
-    Statement {
+    Continuation {
+        kind: ContinuationKind,
         text: &'a str,
     },
+}
+
+/// Structured stderr continuation payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContinuationKind {
+    Detail,
+    Hint,
+    Context,
+    Statement,
 }
 
 /// Severity stored in grouped log errors.
@@ -97,6 +107,9 @@ const SEVERITIES: &[(&str, LogSeverity)] = &[
     ("СООБЩЕНИЕ:  ", LogSeverity::Log),
 ];
 
+const DETAIL_PREFIXES: &[&str] = &["DETAIL:  ", "ПОДРОБНОСТИ:  "];
+const HINT_PREFIXES: &[&str] = &["HINT:  ", "ПОДСКАЗКА:  "];
+const CONTEXT_PREFIXES: &[&str] = &["CONTEXT:  ", "КОНТЕКСТ:  "];
 const STATEMENT_PREFIXES: &[&str] = &["STATEMENT:  ", "ОПЕРАТОР:  "];
 
 pub(crate) fn parse_stderr_line(line: &str) -> Option<ParsedLine<'_>> {
@@ -117,15 +130,34 @@ pub(crate) fn parse_stderr_line(line: &str) -> Option<ParsedLine<'_>> {
         }
     }
 
-    for prefix in STATEMENT_PREFIXES {
-        if let Some(pos) = line.find(prefix) {
-            let text = line.get(pos + prefix.len()..)?.trim();
-            return Some(ParsedLine::Statement {
-                text: truncate_utf8(text, MAX_TEXT_BYTES),
-            });
+    for (kind, prefixes) in [
+        (ContinuationKind::Detail, DETAIL_PREFIXES),
+        (ContinuationKind::Hint, HINT_PREFIXES),
+        (ContinuationKind::Context, CONTEXT_PREFIXES),
+        (ContinuationKind::Statement, STATEMENT_PREFIXES),
+    ] {
+        for prefix in prefixes {
+            if let Some(parsed) = parse_continuation(line, prefix, kind) {
+                return Some(parsed);
+            }
         }
     }
 
+    None
+}
+
+fn parse_continuation<'a>(
+    line: &'a str,
+    prefix: &str,
+    kind: ContinuationKind,
+) -> Option<ParsedLine<'a>> {
+    if let Some(pos) = line.find(prefix) {
+        let text = line.get(pos + prefix.len()..)?.trim();
+        return Some(ParsedLine::Continuation {
+            kind,
+            text: truncate_utf8(text, MAX_TEXT_BYTES),
+        });
+    }
     None
 }
 
@@ -220,7 +252,7 @@ fn days_from_civil(year: i32, month: i32, day: i32) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogSeverity, ParsedLine, parse_stderr_line, strip_sqlstate};
+    use super::{ContinuationKind, LogSeverity, ParsedLine, parse_stderr_line, strip_sqlstate};
 
     #[test]
     fn parses_stderr_error_and_sqlstate() {
@@ -280,10 +312,39 @@ mod tests {
                 .expect("statement parsed");
         assert!(matches!(
             parsed,
-            ParsedLine::Statement {
+            ParsedLine::Continuation {
+                kind: ContinuationKind::Statement,
                 text: "select pg_sleep(10)"
             }
         ));
+    }
+
+    #[test]
+    fn parses_typed_continuation_lines() {
+        assert_eq!(
+            parse_stderr_line("2026-07-05 12:30:46 UTC [42]: DETAIL:  Process 1 waits")
+                .expect("detail parsed"),
+            ParsedLine::Continuation {
+                kind: ContinuationKind::Detail,
+                text: "Process 1 waits"
+            }
+        );
+        assert_eq!(
+            parse_stderr_line("2026-07-05 12:30:47 UTC [42]: HINT:  See server log")
+                .expect("hint parsed"),
+            ParsedLine::Continuation {
+                kind: ContinuationKind::Hint,
+                text: "See server log"
+            }
+        );
+        assert_eq!(
+            parse_stderr_line("2026-07-05 12:30:48 UTC [42]: CONTEXT:  while updating tuple")
+                .expect("context parsed"),
+            ParsedLine::Continuation {
+                kind: ContinuationKind::Context,
+                text: "while updating tuple"
+            }
+        );
     }
 
     #[test]

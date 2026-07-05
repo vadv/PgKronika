@@ -1,7 +1,7 @@
 //! Persistent tail offset state.
 
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::parser::ParserKind;
@@ -38,7 +38,7 @@ impl TailState {
         Ok(parse_state(&text))
     }
 
-    /// Persist the state atomically enough for collector restart recovery.
+    /// Persist the state after forcing temp-file and directory metadata.
     ///
     /// # Errors
     ///
@@ -49,8 +49,20 @@ impl TailState {
             fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, self.render())?;
-        fs::rename(tmp, path)
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp)?;
+            file.write_all(self.render().as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(())
     }
 
     fn render(&self) -> String {
@@ -64,6 +76,10 @@ impl TailState {
             self.skip_until_newline
         )
     }
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
 }
 
 fn parse_state(text: &str) -> Option<TailState> {
@@ -116,6 +132,29 @@ mod tests {
         };
         state.save(&path).expect("save");
         assert_eq!(TailState::load(&path).expect("load"), Some(state));
+    }
+
+    #[test]
+    fn save_overwrites_existing_state_without_leaving_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.txt");
+        let first = TailState {
+            path: dir.path().join("postgresql.log"),
+            dev: 10,
+            inode: 20,
+            offset: 30,
+            parser_kind: ParserKind::Stderr,
+            skip_until_newline: false,
+        };
+        let second = TailState {
+            offset: 90,
+            skip_until_newline: true,
+            ..first.clone()
+        };
+        first.save(&path).expect("first save");
+        second.save(&path).expect("second save");
+        assert_eq!(TailState::load(&path).expect("load"), Some(second));
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]

@@ -1146,18 +1146,20 @@ btime                 ts    L   // /proc/stat btime
   backlog-skip после 64 МБ с tail 1 МБ;
 - состояние tailer хранит `path`, `dev`, `inode`, `offset`, `parser_kind` и
   `skip_until_newline`; оно сохраняется только после успешной записи окна в
-  journal или после пустого обработанного цикла;
+  journal или после пустого обработанного цикла, через fsync temp-файла,
+  rename и fsync директории;
 - `csvlog` пока не парсится: `KRONIKA_LOG_FORMAT=csvlog` создаёт
   `1_029_001 reason=unsupported_format`, а не частичный контракт.
 
-Текстовые caps: `pattern` — 256 байт; `sample`, `statement` и `source_path` —
-5120 байт. При переполнении словаря строка не роняет snapshot: недоступные
-текстовые поля пишутся как `NULL`, а `1_029_001 reason=dictionary_full`
-фиксирует число отброшенных полей.
+Текстовые caps: `pattern` — 256 байт; `sample`, `detail`, `hint`, `context`,
+`statement` и `source_path` — 5120 байт. При переполнении словаря строка не
+роняет snapshot: недоступные текстовые поля пишутся как `NULL`, а
+`1_029_001 reason=dictionary_full` фиксирует число отброшенных полей.
 
 Типы `1_024_001` - `1_028_001` (checkpoints, autovacuum, slow queries, lock
-waits, lifecycle) и полный byte-level `csvlog` parser отложены до следующих PR.
-Они не зарегистрированы и не пишутся этим collector.
+waits, temp files, lifecycle) и полный byte-level `csvlog` parser отложены до
+следующих PR. Обычные `LOG:` строки для этих событий сейчас не заявляются как
+полный контракт, не зарегистрированы и не пишутся этим collector.
 
 ### `1_022_001` `pg_log_errors`
 
@@ -1168,8 +1170,9 @@ waits, lifecycle) и полный byte-level `csvlog` parser отложены д
 отобранные `LOG:` события падения backend/postmaster и OOM/SIGKILL.
 
 Нормализация `pattern` заменяет кавычки, числа и содержимое скобок на `...`.
-`STATEMENT:` или строка продолжения после ошибки прикрепляется к первой группе,
-для которой она встретилась.
+`DETAIL:`, `HINT:`, `CONTEXT:` и `STATEMENT:` хранятся в отдельных bounded
+полях. Строки продолжения без prefix дописываются в последнее typed-поле этой
+ошибки, поэтому диагностический `DETAIL` deadlock не смешивается с SQL.
 
 ```text
 ts                   ts    T   // время записи из prefix; иначе время collection
@@ -1179,6 +1182,9 @@ sqlstate             str?  L
 pattern              str?  L   // NULL только при dictionary degradation
 count                u32   G
 sample               str?  L   // первый ограниченный пример сообщения
+detail               str?  L
+hint                 str?  L
+context              str?  L
 statement            str?  L
 database             str?  L   // NULL для stderr scope
 username             str?  L   // NULL для stderr scope
@@ -1191,9 +1197,10 @@ dict_dropped_fields  u8    G
 
 ### `1_029_001` `pg_log_gap`
 
-Строка означает, что tailer или parser обработал источник с деградацией либо
-не смог безопасно прочитать источник. Отсутствие секции означает, что в
-реализованном log scope не было обнаруженной потери/деградации.
+Строка означает, что tailer или parser обработал источник с деградацией,
+остановился по backpressure-лимиту либо не смог безопасно прочитать источник.
+Отсутствие секции означает, что в реализованном log scope не было обнаруженной
+потери/деградации и источник не сообщил отдельное состояние вроде disabled.
 
 ```text
 ts                    ts    T
@@ -1216,7 +1223,15 @@ parser_dropped_lines  u32   G
 
 `reason`: `0=backlog`, `1=truncate`, `2=invalid_utf8`, `3=binary`, `4=sparse`,
 `5=rotation`, `6=missing_file`, `7=unsupported_format`,
-`8=source_unavailable`, `9=dictionary_full`, `10=parser_drop`.
+`8=source_unavailable`, `9=dictionary_full`, `10=parser_drop`,
+`11=budget_exhausted`, `12=disabled`, `13=query_failed`,
+`14=permission_denied`, `15=timestamp_fallback`.
+
+`budget_exhausted` означает backpressure: collector остановил текущий read по
+лимиту строк/байт/времени и не коммитит offset за непрочитанные bytes. Это не
+сигнал потери данных. `parser_drop` означает, что parser-level output cap
+отбросил уже прочитанные группы. `timestamp_fallback` означает, что stderr
+prefix не дал parseable timestamp и строка получила время collection.
 
 ## `1_023_001` coverage
 

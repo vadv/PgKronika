@@ -41,6 +41,15 @@ pub struct PgLogErrorV1 {
     /// First concrete message sample in the group.
     #[column(l)]
     pub sample: Option<StrId>,
+    /// `DETAIL:` continuation payload when `PostgreSQL` emitted one.
+    #[column(l)]
+    pub detail: Option<StrId>,
+    /// `HINT:` continuation payload when `PostgreSQL` emitted one.
+    #[column(l)]
+    pub hint: Option<StrId>,
+    /// `CONTEXT:` continuation payload when `PostgreSQL` emitted one.
+    #[column(l)]
+    pub context: Option<StrId>,
     /// SQL from a following `STATEMENT:` line when available.
     #[column(l)]
     pub statement: Option<StrId>,
@@ -79,7 +88,9 @@ pub struct PgLogGapV1 {
     pub parser_kind: u8,
     /// Reason: `0` backlog, `1` truncate, `2` invalid UTF-8, `3` binary,
     /// `4` sparse, `5` rotation, `6` missing file, `7` unsupported format,
-    /// `8` source unavailable, `9` dictionary full, `10` parser drop.
+    /// `8` source unavailable, `9` dictionary full, `10` parser drop,
+    /// `11` budget exhausted, `12` disabled, `13` query failed,
+    /// `14` permission denied, `15` timestamp fallback.
     #[column(l)]
     pub reason: u8,
     /// File device id when known.
@@ -137,7 +148,7 @@ mod tests {
     fn error_contract_shape() {
         let c = PgLogErrorV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_022_001);
-        assert_eq!(c.columns.len(), 11);
+        assert_eq!(c.columns.len(), 14);
         assert_eq!(c.sort_key, ["severity", "category", "pattern", "ts"]);
         assert_eq!(c.column("pattern").map(|col| col.nullable), Some(true));
         assert_eq!(c.column("count").map(|col| col.nullable), Some(false));
@@ -167,6 +178,9 @@ mod tests {
                 pattern: Some(StrId(2)),
                 count: 3,
                 sample: Some(StrId(3)),
+                detail: Some(StrId(4)),
+                hint: Some(StrId(5)),
+                context: Some(StrId(6)),
                 statement: None,
                 database: None,
                 username: None,
@@ -180,6 +194,9 @@ mod tests {
                 pattern: None,
                 count: 1,
                 sample: None,
+                detail: None,
+                hint: None,
+                context: None,
                 statement: None,
                 database: None,
                 username: None,

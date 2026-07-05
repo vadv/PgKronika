@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
 use crate::normalize::{ErrorCategory, classify_error, normalize_error};
-use crate::parser::{LogSeverity, ParsedLine, ParserKind, parse_stderr_line};
+use crate::parser::{ContinuationKind, LogSeverity, ParsedLine, ParserKind, parse_stderr_line};
 use crate::state::TailState;
 use crate::tailer::{TailCaps, TailGaps, TailLine, read_batch};
 use crate::{MAX_TEXT_BYTES, truncate_utf8, u32_saturating};
@@ -83,6 +83,12 @@ pub struct GroupedLogError {
     pub count: u32,
     /// First concrete sample.
     pub sample: String,
+    /// Attached `DETAIL:` payload.
+    pub detail: Option<String>,
+    /// Attached `HINT:` payload.
+    pub hint: Option<String>,
+    /// Attached `CONTEXT:` payload.
+    pub context: Option<String>,
     /// Attached SQL statement.
     pub statement: Option<String>,
 }
@@ -112,6 +118,16 @@ pub enum GapReason {
     DictionaryFull,
     /// Parser-level output cap dropped records.
     ParserDrop,
+    /// Read budget stopped this cycle; offset is not committed past unread bytes.
+    BudgetExhausted,
+    /// Log collection is disabled by configuration.
+    Disabled,
+    /// Discovery query failed; last known source is used when available.
+    QueryFailed,
+    /// The source path exists but cannot be opened with collector permissions.
+    PermissionDenied,
+    /// stderr prefix did not expose a parseable timestamp; collection time was used.
+    TimestampFallback,
 }
 
 impl GapReason {
@@ -130,6 +146,11 @@ impl GapReason {
             Self::SourceUnavailable => 8,
             Self::DictionaryFull => 9,
             Self::ParserDrop => 10,
+            Self::BudgetExhausted => 11,
+            Self::Disabled => 12,
+            Self::QueryFailed => 13,
+            Self::PermissionDenied => 14,
+            Self::TimestampFallback => 15,
         }
     }
 }
@@ -190,6 +211,7 @@ pub struct LogCollector {
     state: Option<TailState>,
     source: Option<LogSource>,
     next_discovery: Option<Instant>,
+    disabled_reported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +225,9 @@ struct PendingError {
     ts: i64,
     count: u32,
     sample: String,
+    detail: Option<String>,
+    hint: Option<String>,
+    context: Option<String>,
     statement: Option<String>,
 }
 
@@ -230,6 +255,7 @@ impl LogCollector {
             state,
             source,
             next_discovery: None,
+            disabled_reported: false,
         })
     }
 
@@ -240,12 +266,23 @@ impl LogCollector {
     }
 
     /// Collect one bounded log batch.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "collection keeps discovery, tail gaps, and commit state in one auditable boundary"
+    )]
     pub async fn collect(&mut self, client: Option<&Client>, ts: i64) -> LogCollection {
         if !self.config.enabled {
-            return LogCollection {
+            let mut collection = LogCollection {
                 discovery_status: Some(DiscoveryStatus::Disabled),
                 ..LogCollection::default()
             };
+            if !self.disabled_reported {
+                collection
+                    .gaps
+                    .push(self.simple_gap(ts, GapReason::Disabled));
+                self.disabled_reported = true;
+            }
+            return collection;
         }
 
         let mut result = LogCollection::default();
@@ -253,15 +290,19 @@ impl LogCollector {
         result.discovery_status = Some(discovery);
         if matches!(
             discovery,
-            DiscoveryStatus::UnsupportedFormat | DiscoveryStatus::SourceUnavailable
+            DiscoveryStatus::UnsupportedFormat
+                | DiscoveryStatus::SourceUnavailable
+                | DiscoveryStatus::QueryFailed
         ) {
-            let reason = if discovery == DiscoveryStatus::UnsupportedFormat {
-                GapReason::UnsupportedFormat
-            } else {
-                GapReason::SourceUnavailable
+            let reason = match discovery {
+                DiscoveryStatus::UnsupportedFormat => GapReason::UnsupportedFormat,
+                DiscoveryStatus::QueryFailed => GapReason::QueryFailed,
+                _ => GapReason::SourceUnavailable,
             };
             result.gaps.push(self.simple_gap(ts, reason));
-            return result;
+            if discovery != DiscoveryStatus::QueryFailed {
+                return result;
+            }
         }
 
         let Some(source) = self.source.clone() else {
@@ -281,21 +322,25 @@ impl LogCollector {
             return result;
         }
 
-        let Ok(batch) = read_batch(
+        let batch = match read_batch(
             &source.path,
             source.parser_kind,
             self.state.as_ref(),
             self.config.start_at_beginning,
             self.config.tail_caps,
-        ) else {
-            result.gaps.push(LogGap {
-                parser_kind: source.parser_kind,
-                reason: GapReason::SourceUnavailable,
-                source_path: Some(source.path),
-                ts,
-                ..empty_gap()
-            });
-            return result;
+        ) {
+            Ok(batch) => batch,
+            Err(err) => {
+                let reason = read_error_reason(err.kind());
+                result.gaps.push(LogGap {
+                    parser_kind: source.parser_kind,
+                    reason,
+                    source_path: Some(source.path),
+                    ts,
+                    ..empty_gap()
+                });
+                return result;
+            }
         };
         let mut parse_gaps = ParseGaps::default();
         result.errors = parse_errors(&batch.lines, ts, &mut parse_gaps);
@@ -320,10 +365,19 @@ impl LogCollector {
         if parse_gaps.dropped_groups != 0 {
             result.gaps.push(LogGap {
                 ts,
-                source_path: Some(source.path),
+                source_path: Some(source.path.clone()),
                 parser_kind: source.parser_kind,
                 reason: GapReason::ParserDrop,
                 parser_dropped_lines: parse_gaps.dropped_groups,
+                ..file_state_fields(batch.next_state.as_ref())
+            });
+        }
+        if parse_gaps.timestamp_fallbacks != 0 {
+            result.gaps.push(LogGap {
+                ts,
+                source_path: Some(source.path),
+                parser_kind: source.parser_kind,
+                reason: GapReason::TimestampFallback,
                 ..file_state_fields(batch.next_state.as_ref())
             });
         }
@@ -413,6 +467,14 @@ impl LogCollector {
     }
 }
 
+fn read_error_reason(kind: io::ErrorKind) -> GapReason {
+    if kind == io::ErrorKind::PermissionDenied {
+        GapReason::PermissionDenied
+    } else {
+        GapReason::SourceUnavailable
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryError {
     Query,
@@ -471,8 +533,13 @@ async fn current_logfile(client: &Client) -> Result<Option<String>, DiscoveryErr
 struct ParseGaps {
     invalid_utf8: u32,
     dropped_groups: u32,
+    timestamp_fallbacks: u32,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "stderr grouping, continuation state, and output cap accounting stay auditable together"
+)]
 fn parse_errors(
     lines: &[TailLine],
     fallback_ts: i64,
@@ -480,18 +547,18 @@ fn parse_errors(
 ) -> Vec<GroupedLogError> {
     let mut pending = HashMap::<ErrorKey, PendingError>::new();
     let mut last_key = None::<ErrorKey>;
+    let mut last_continuation = None::<ContinuationKind>;
     for line in lines {
         let Ok(decoded) = std::str::from_utf8(&line.bytes) else {
             gaps.invalid_utf8 = gaps.invalid_utf8.saturating_add(1);
             last_key = None;
+            last_continuation = None;
             continue;
         };
         let decoded = decoded.strip_suffix('\r').unwrap_or(decoded);
         if decoded.starts_with([' ', '\t']) {
-            if let Some(key) = &last_key
-                && let Some(entry) = pending.get_mut(key)
-            {
-                append_statement(entry, decoded.trim());
+            if let Some(kind) = last_continuation {
+                append_to_last_continuation(&mut pending, last_key.as_ref(), kind, decoded.trim());
             }
             continue;
         }
@@ -506,7 +573,11 @@ fn parse_errors(
                 let category = classify_error(&pattern, severity);
                 if severity == LogSeverity::Log && !is_relevant_log_event(&pattern, category) {
                     last_key = None;
+                    last_continuation = None;
                     continue;
+                }
+                if ts.is_none() {
+                    gaps.timestamp_fallbacks = gaps.timestamp_fallbacks.saturating_add(1);
                 }
                 let key = ErrorKey {
                     pattern,
@@ -517,20 +588,23 @@ fn parse_errors(
                     ts: ts.unwrap_or(fallback_ts),
                     count: 0,
                     sample: truncate_utf8(message, MAX_TEXT_BYTES).to_owned(),
+                    detail: None,
+                    hint: None,
+                    context: None,
                     statement: None,
                 });
                 entry.count = entry.count.saturating_add(1);
                 last_key = Some(key);
+                last_continuation = None;
             }
-            Some(ParsedLine::Statement { text }) => {
-                if let Some(key) = &last_key
-                    && let Some(entry) = pending.get_mut(key)
-                {
-                    append_statement(entry, text);
-                }
+            Some(ParsedLine::Continuation { kind, text }) => {
+                last_continuation =
+                    append_to_last_continuation(&mut pending, last_key.as_ref(), kind, text)
+                        .then_some(kind);
             }
             None => {
                 last_key = None;
+                last_continuation = None;
             }
         }
     }
@@ -544,18 +618,24 @@ fn parse_errors(
             pattern: key.pattern,
             count: entry.count,
             sample: entry.sample,
+            detail: entry.detail,
+            hint: entry.hint,
+            context: entry.context,
             statement: entry.statement,
         })
         .collect();
     rows.sort_by(|a, b| {
-        b.count.cmp(&a.count).then_with(|| {
-            (a.severity, a.category, a.pattern.as_str(), a.ts).cmp(&(
-                b.severity,
-                b.category,
-                b.pattern.as_str(),
-                b.ts,
-            ))
-        })
+        retention_priority(a.severity)
+            .cmp(&retention_priority(b.severity))
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| {
+                (a.severity, a.category, a.pattern.as_str(), a.ts).cmp(&(
+                    b.severity,
+                    b.category,
+                    b.pattern.as_str(),
+                    b.ts,
+                ))
+            })
     });
     if rows.len() > 32 {
         gaps.dropped_groups = u32_saturating((rows.len() - 32) as u64);
@@ -570,6 +650,29 @@ fn parse_errors(
         ))
     });
     rows
+}
+
+fn append_to_last_continuation(
+    pending: &mut HashMap<ErrorKey, PendingError>,
+    last_key: Option<&ErrorKey>,
+    kind: ContinuationKind,
+    text: &str,
+) -> bool {
+    let Some(key) = last_key else {
+        return false;
+    };
+    let Some(entry) = pending.get_mut(key) else {
+        return false;
+    };
+    append_continuation(entry, kind, text);
+    true
+}
+
+const fn retention_priority(severity: LogSeverity) -> u8 {
+    match severity {
+        LogSeverity::Panic | LogSeverity::Fatal => 0,
+        LogSeverity::Error | LogSeverity::Warning | LogSeverity::Log => 1,
+    }
 }
 
 fn is_relevant_log_event(pattern: &str, category: ErrorCategory) -> bool {
@@ -589,11 +692,21 @@ fn is_relevant_log_event(pattern: &str, category: ErrorCategory) -> bool {
     }
 }
 
-fn append_statement(entry: &mut PendingError, text: &str) {
+fn append_continuation(entry: &mut PendingError, kind: ContinuationKind, text: &str) {
+    let target = match kind {
+        ContinuationKind::Detail => &mut entry.detail,
+        ContinuationKind::Hint => &mut entry.hint,
+        ContinuationKind::Context => &mut entry.context,
+        ContinuationKind::Statement => &mut entry.statement,
+    };
+    append_text(target, text);
+}
+
+fn append_text(target: &mut Option<String>, text: &str) {
     if text.is_empty() {
         return;
     }
-    let current = entry.statement.get_or_insert_with(String::new);
+    let current = target.get_or_insert_with(String::new);
     if !current.is_empty() {
         current.push(' ');
     }
@@ -677,7 +790,7 @@ fn gaps_from_tail(
             ts,
             source_path: Some(source_path.to_owned()),
             parser_kind,
-            reason: GapReason::ParserDrop,
+            reason: GapReason::BudgetExhausted,
             budget_exhaustions: gaps.budget_exhaustions,
             ..file_state_fields(state)
         });
@@ -729,8 +842,10 @@ const fn empty_gap() -> LogGap {
 
 #[cfg(test)]
 mod tests {
-    use super::{GapReason, LogCollector, LogConfig};
+    use super::{GapReason, LogCollector, LogConfig, read_error_reason};
     use crate::{ErrorCategory, LogSeverity, ParserKind};
+    use std::fmt::Write as _;
+    use std::io;
 
     fn fixture_config(path: std::path::PathBuf, state_path: std::path::PathBuf) -> LogConfig {
         LogConfig {
@@ -766,6 +881,50 @@ mod tests {
         assert_eq!(
             batch.errors[0].statement.as_deref(),
             Some("select * from a")
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_deadlock_diagnostics_as_typed_continuations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:00:00 UTC [1]: ERROR:  deadlock detected\n\
+             2026-07-05 12:00:00 UTC [1]: DETAIL:  Process 111 waits for ShareLock on transaction 10; blocked by process 222.\n\
+             \tProcess 222 waits for ShareLock on transaction 11; blocked by process 111.\n\
+             2026-07-05 12:00:00 UTC [1]: HINT:  See server log for query details.\n\
+             2026-07-05 12:00:00 UTC [1]: CONTEXT:  while updating tuple (0,1) in relation \"deadlock_probe\"\n\
+             2026-07-05 12:00:00 UTC [1]: STATEMENT:  UPDATE deadlock_probe SET id = id WHERE id = 1\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.errors.len(), 1);
+        let row = &batch.errors[0];
+        assert_eq!(row.pattern, "deadlock detected");
+        assert_eq!(row.category, ErrorCategory::Lock);
+        assert_eq!(
+            row.detail.as_deref(),
+            Some(
+                "Process 111 waits for ShareLock on transaction 10; blocked by process 222. \
+                 Process 222 waits for ShareLock on transaction 11; blocked by process 111."
+            )
+        );
+        assert_eq!(
+            row.hint.as_deref(),
+            Some("See server log for query details.")
+        );
+        assert_eq!(
+            row.context.as_deref(),
+            Some("while updating tuple (0,1) in relation \"deadlock_probe\"")
+        );
+        assert_eq!(
+            row.statement.as_deref(),
+            Some("UPDATE deadlock_probe SET id = id WHERE id = 1")
         );
     }
 
@@ -829,6 +988,125 @@ mod tests {
                 .gaps
                 .iter()
                 .any(|gap| gap.reason == GapReason::InvalidUtf8)
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_is_backpressure_not_parser_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:00:00 UTC [1]: ERROR:  relation \"a\" does not exist\n\
+             2026-07-05 12:00:01 UTC [1]: ERROR:  relation \"b\" does not exist\n",
+        )
+        .expect("write");
+        let mut config = fixture_config(log, dir.path().join("state"));
+        config.tail_caps.max_lines = 1;
+        let mut collector = LogCollector::new(config).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert!(
+            batch.gaps.iter().any(|gap| {
+                gap.reason == GapReason::BudgetExhausted && gap.budget_exhaustions > 0
+            })
+        );
+        assert!(
+            !batch
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == GapReason::ParserDrop)
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_collection_emits_explicit_gap_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = LogConfig::disabled(dir.path());
+        config.state_path = dir.path().join("state");
+        let mut collector = LogCollector::new(config).expect("collector");
+
+        let first = collector.collect(None, 1).await;
+        let second = collector.collect(None, 2).await;
+
+        assert!(
+            first
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == GapReason::Disabled)
+        );
+        assert!(second.gaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timestamp_fallback_emits_explicit_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(&log, "ERROR:  division by zero\n").expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.errors.len(), 1);
+        assert_eq!(batch.errors[0].ts, 1);
+        assert!(
+            batch
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == GapReason::TimestampFallback)
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_rows_are_retained_before_lower_severity_overflow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        let mut text = String::new();
+        for idx in 0..32 {
+            writeln!(
+                &mut text,
+                "2026-07-05 12:00:{idx:02} UTC [1]: ERROR:  probe{idx} failure observed"
+            )
+            .expect("format error row");
+            writeln!(
+                &mut text,
+                "2026-07-05 12:01:{idx:02} UTC [1]: ERROR:  probe{idx} failure observed"
+            )
+            .expect("format error row");
+        }
+        text.push_str("2026-07-05 12:02:00 UTC [1]: FATAL:  terminating connection due to administrator command\n");
+        std::fs::write(&log, text).expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.errors.len(), 32);
+        assert!(
+            batch
+                .errors
+                .iter()
+                .any(|row| row.severity == LogSeverity::Fatal)
+        );
+        assert!(
+            batch
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == GapReason::ParserDrop && gap.parser_dropped_lines == 1)
+        );
+    }
+
+    #[test]
+    fn permission_denied_is_a_distinct_gap_reason() {
+        assert_eq!(
+            read_error_reason(io::ErrorKind::PermissionDenied),
+            GapReason::PermissionDenied
+        );
+        assert_eq!(
+            read_error_reason(io::ErrorKind::NotFound),
+            GapReason::SourceUnavailable
         );
     }
 
