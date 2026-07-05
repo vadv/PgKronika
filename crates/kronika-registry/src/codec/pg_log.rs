@@ -1,8 +1,7 @@
 //! `PostgreSQL` log-domain sections.
 //!
-//! The first log-domain layout stores grouped stderr errors and explicit
-//! degradation signals from the bounded tailer. Other typed log events use
-//! separate future sections.
+//! The log-domain layout stores grouped stderr errors, selected typed stderr
+//! events, and explicit degradation signals from the bounded tailer.
 
 use crate::{Section, StrId, Ts};
 
@@ -59,6 +58,147 @@ pub struct PgLogErrorV1 {
     /// User name from csvlog; `NULL` for the first stderr scope.
     #[column(l)]
     pub username: Option<StrId>,
+    /// Text fields dropped because dictionary interning failed.
+    #[column(g)]
+    pub dict_dropped_fields: u8,
+}
+
+/// Type `1_024_001`: typed checkpoint LOG events.
+///
+/// One row represents one checkpoint LOG record in the collection window.
+/// Nullable numeric fields mean the field is not present in that checkpoint
+/// message shape, not that `PostgreSQL` reported zero.
+#[derive(Debug, Clone, Copy, PartialEq, Section)]
+#[section(
+    id = 1_024_001,
+    name = "pg_log_checkpoints",
+    semantics = event_stream,
+    sort_key("ts", "phase")
+)]
+pub struct PgLogCheckpointV1 {
+    /// Log record time, unix microseconds.
+    #[column(t)]
+    pub ts: Ts,
+    /// Phase: `0` starting, `1` complete, `2` too frequent.
+    #[column(l)]
+    pub phase: u8,
+    /// Starting reason or warning text.
+    #[column(l)]
+    pub reason: Option<StrId>,
+    /// Too-frequent checkpoint interval, seconds.
+    #[column(g)]
+    pub seconds_apart: Option<i64>,
+    /// Buffers written by checkpoint.
+    #[column(g)]
+    pub buffers_written: Option<i64>,
+    /// Write phase time, ms.
+    #[column(g)]
+    pub write_ms: Option<f64>,
+    /// Sync phase time, ms.
+    #[column(g)]
+    pub sync_ms: Option<f64>,
+    /// Total checkpoint time, ms.
+    #[column(g)]
+    pub total_ms: Option<f64>,
+    /// WAL distance, kB.
+    #[column(g)]
+    pub distance_kb: Option<i64>,
+    /// Estimated WAL distance, kB.
+    #[column(g)]
+    pub estimate_kb: Option<i64>,
+    /// WAL files added.
+    #[column(g)]
+    pub wal_added: Option<i64>,
+    /// WAL files removed.
+    #[column(g)]
+    pub wal_removed: Option<i64>,
+    /// WAL files recycled.
+    #[column(g)]
+    pub wal_recycled: Option<i64>,
+    /// Files synced.
+    #[column(g)]
+    pub sync_files: Option<i64>,
+    /// Longest individual file sync, ms.
+    #[column(g)]
+    pub longest_sync_ms: Option<f64>,
+    /// Average file sync, ms.
+    #[column(g)]
+    pub average_sync_ms: Option<f64>,
+    /// Text fields dropped because dictionary interning failed.
+    #[column(g)]
+    pub dict_dropped_fields: u8,
+}
+
+/// Type `1_026_001`: slow-query LOG top-N.
+///
+/// One row represents a normalized SQL pattern from `duration: ... statement:`
+/// stderr LOG records in the collection window. The collector keeps only the
+/// bounded top-N by max duration and reports `parser_drop` when more patterns
+/// were read.
+#[derive(Debug, Clone, Copy, PartialEq, Section)]
+#[section(
+    id = 1_026_001,
+    name = "pg_log_slow_queries",
+    semantics = event_stream,
+    sort_key("pattern", "ts")
+)]
+pub struct PgLogSlowQueryV1 {
+    /// Timestamp of the max-duration sample, unix microseconds.
+    #[column(t)]
+    pub ts: Ts,
+    /// Normalized SQL pattern.
+    #[column(l)]
+    pub pattern: Option<StrId>,
+    /// Bounded SQL sample for the max-duration occurrence.
+    #[column(l)]
+    pub sample: Option<StrId>,
+    /// Occurrences of this pattern in the collection window.
+    #[column(g)]
+    pub count: u32,
+    /// Largest duration for the pattern, ms.
+    #[column(g)]
+    pub max_duration_ms: f64,
+    /// Sum of durations for this pattern, ms.
+    #[column(g)]
+    pub total_duration_ms: f64,
+    /// Text fields dropped because dictionary interning failed.
+    #[column(g)]
+    pub dict_dropped_fields: u8,
+}
+
+/// Type `1_028_001`: server lifecycle LOG events.
+///
+/// Crash/OOM lifecycle messages are also retained in `pg_log_errors` for the
+/// compatibility error timeline; shutdown and ready messages live only here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
+#[section(
+    id = 1_028_001,
+    name = "pg_log_lifecycle",
+    semantics = event_stream,
+    sort_key("ts", "kind")
+)]
+pub struct PgLogLifecycleV1 {
+    /// Log record time, unix microseconds.
+    #[column(t)]
+    pub ts: Ts,
+    /// Kind: `0` crash, `1` shutdown, `2` ready.
+    #[column(l)]
+    pub kind: u8,
+    /// Crashed process id when present.
+    #[column(l)]
+    pub pid: Option<i32>,
+    /// Crash signal number when present.
+    #[column(l)]
+    pub signal: Option<i32>,
+    /// Shutdown mode: `fast`, `smart`, or `immediate`.
+    #[column(l)]
+    pub shutdown_mode: Option<StrId>,
+    /// Bounded lifecycle message.
+    #[column(l)]
+    pub message: Option<StrId>,
+    /// SQL extracted from a following crash `DETAIL:` line.
+    #[column(l)]
+    pub query_detail: Option<StrId>,
     /// Text fields dropped because dictionary interning failed.
     #[column(g)]
     pub dict_dropped_fields: u8,
@@ -133,13 +273,19 @@ pub struct PgLogGapV1 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PgLogErrorV1, PgLogGapV1};
+    use super::{PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1, PgLogSlowQueryV1};
     use crate::{Section, StrId, Ts, lint};
 
     #[test]
     fn contracts_pass_the_linter() {
         assert_eq!(
-            lint(&[PgLogErrorV1::CONTRACT, PgLogGapV1::CONTRACT]),
+            lint(&[
+                PgLogErrorV1::CONTRACT,
+                PgLogCheckpointV1::CONTRACT,
+                PgLogSlowQueryV1::CONTRACT,
+                PgLogLifecycleV1::CONTRACT,
+                PgLogGapV1::CONTRACT,
+            ]),
             Ok(())
         );
     }
@@ -152,6 +298,46 @@ mod tests {
         assert_eq!(c.sort_key, ["severity", "category", "pattern", "ts"]);
         assert_eq!(c.column("pattern").map(|col| col.nullable), Some(true));
         assert_eq!(c.column("count").map(|col| col.nullable), Some(false));
+    }
+
+    #[test]
+    fn checkpoint_contract_shape() {
+        let c = PgLogCheckpointV1::CONTRACT;
+        assert_eq!(c.type_id.get(), 1_024_001);
+        assert_eq!(c.columns.len(), 17);
+        assert_eq!(c.sort_key, ["ts", "phase"]);
+        assert_eq!(c.column("reason").map(|col| col.nullable), Some(true));
+        assert_eq!(
+            c.column("buffers_written").map(|col| col.nullable),
+            Some(true)
+        );
+        assert_eq!(
+            c.column("dict_dropped_fields").map(|col| col.nullable),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn slow_query_contract_shape() {
+        let c = PgLogSlowQueryV1::CONTRACT;
+        assert_eq!(c.type_id.get(), 1_026_001);
+        assert_eq!(c.columns.len(), 7);
+        assert_eq!(c.sort_key, ["pattern", "ts"]);
+        assert_eq!(c.column("pattern").map(|col| col.nullable), Some(true));
+        assert_eq!(
+            c.column("max_duration_ms").map(|col| col.nullable),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn lifecycle_contract_shape() {
+        let c = PgLogLifecycleV1::CONTRACT;
+        assert_eq!(c.type_id.get(), 1_028_001);
+        assert_eq!(c.columns.len(), 8);
+        assert_eq!(c.sort_key, ["ts", "kind"]);
+        assert_eq!(c.column("pid").map(|col| col.nullable), Some(true));
+        assert_eq!(c.column("message").map(|col| col.nullable), Some(true));
     }
 
     #[test]
@@ -201,6 +387,89 @@ mod tests {
                 database: None,
                 username: None,
                 dict_dropped_fields: 2,
+            },
+        ]);
+    }
+
+    #[test]
+    fn checkpoint_roundtrip_preserves_nullable_metrics() {
+        crate::assert_roundtrips(&[
+            PgLogCheckpointV1 {
+                ts: Ts(30),
+                phase: 0,
+                reason: Some(StrId(10)),
+                seconds_apart: None,
+                buffers_written: None,
+                write_ms: None,
+                sync_ms: None,
+                total_ms: None,
+                distance_kb: None,
+                estimate_kb: None,
+                wal_added: None,
+                wal_removed: None,
+                wal_recycled: None,
+                sync_files: None,
+                longest_sync_ms: None,
+                average_sync_ms: None,
+                dict_dropped_fields: 0,
+            },
+            PgLogCheckpointV1 {
+                ts: Ts(31),
+                phase: 1,
+                reason: None,
+                seconds_apart: None,
+                buffers_written: Some(123),
+                write_ms: Some(1200.0),
+                sync_ms: Some(300.0),
+                total_ms: Some(1800.0),
+                distance_kb: Some(4096),
+                estimate_kb: Some(8192),
+                wal_added: Some(0),
+                wal_removed: Some(1),
+                wal_recycled: Some(2),
+                sync_files: Some(5),
+                longest_sync_ms: Some(40.0),
+                average_sync_ms: Some(8.0),
+                dict_dropped_fields: 0,
+            },
+        ]);
+    }
+
+    #[test]
+    fn slow_query_roundtrip_preserves_topn_metrics() {
+        crate::assert_roundtrips(&[PgLogSlowQueryV1 {
+            ts: Ts(40),
+            pattern: Some(StrId(20)),
+            sample: Some(StrId(21)),
+            count: 3,
+            max_duration_ms: 1234.5,
+            total_duration_ms: 2000.0,
+            dict_dropped_fields: 0,
+        }]);
+    }
+
+    #[test]
+    fn lifecycle_roundtrip_preserves_optional_crash_fields() {
+        crate::assert_roundtrips(&[
+            PgLogLifecycleV1 {
+                ts: Ts(50),
+                kind: 0,
+                pid: Some(4242),
+                signal: Some(9),
+                shutdown_mode: None,
+                message: Some(StrId(30)),
+                query_detail: Some(StrId(31)),
+                dict_dropped_fields: 0,
+            },
+            PgLogLifecycleV1 {
+                ts: Ts(51),
+                kind: 1,
+                pid: None,
+                signal: None,
+                shutdown_mode: Some(StrId(32)),
+                message: Some(StrId(33)),
+                query_detail: None,
+                dict_dropped_fields: 0,
             },
         ]);
     }

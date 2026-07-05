@@ -46,6 +46,9 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_021_001` | `instance_metadata` | сегмент | `snapshot_full` | `(ts)` |
 | `1_022_001` | log: ошибки stderr, сгруппированные | поток | `event_stream` | `(severity, category, pattern, ts)` |
 | `1_023_001` | coverage | 30 с | `snapshot_full` | `(source_type_id, ts)` |
+| `1_024_001` | log: checkpoint events из stderr | поток | `event_stream` | `(ts, phase)` |
+| `1_026_001` | log: slow-query top-N из stderr | поток | `event_stream` | `(pattern, ts)` |
+| `1_028_001` | log: lifecycle events из stderr | поток | `event_stream` | `(ts, kind)` |
 | `1_029_001` | log: пропуски и деградации tailer/parser | поток | `event_stream` | `(ts, reason)` |
 
 ## `1_001_001` / `1_001_002` / `1_001_003` `pg_stat_activity`
@@ -1128,12 +1131,12 @@ btime                 ts    L   // /proc/stat btime
 самодостаточными: код чтения не должен знать эти значения из внешней
 конфигурации.
 
-## Логовые типы `1_022_001`, `1_029_001`
+## Логовые типы `1_022_001`, `1_024_001`, `1_026_001`, `1_028_001`, `1_029_001`
 
-Первый инкремент логов — ограниченный байтовый tailer для `stderr`,
-группировка ошибок и явные строки деградации. Коллектор не пишет сырые строки
-лога в PGM: все выходы агрегированы или типизированы, текстовые поля
-ограничены до интернирования.
+Текущая область логов — ограниченный байтовый tailer для `stderr`,
+группировка ошибок, первые типизированные `LOG:` события и явные строки деградации.
+Коллектор не пишет сырые строки лога в PGM: все выходы агрегированы или
+типизированы, текстовые поля ограничены до интернирования.
 
 Конвейер чтения:
 
@@ -1152,20 +1155,23 @@ btime                 ts    L   // /proc/stat btime
   `1_029_001 reason=unsupported_format`, а не частичный контракт.
 
 Лимиты текстовых полей: `pattern` — 256 байт; `sample`, `detail`, `hint`,
-`context`, `statement` и `source_path` — 5120 байт. При переполнении словаря
-строка не срывает snapshot: недоступные текстовые поля пишутся как `NULL`, а
-`1_029_001 reason=dictionary_full` фиксирует число отброшенных полей.
+`context`, `statement`, `reason`, `message`, `query_detail` и `source_path` —
+5120 байт. При переполнении словаря строка не срывает snapshot: недоступные
+текстовые поля пишутся как `NULL`, а `1_029_001 reason=dictionary_full`
+фиксирует число отброшенных полей.
 
-Типы `1_024_001` - `1_028_001` (checkpoints, autovacuum, slow queries, lock
-waits, temp files, lifecycle) и полный байтовый `csvlog` parser отложены до
-следующих PR. Обычные `LOG:` строки для этих событий сейчас не входят в
-контракт, не зарегистрированы и не пишутся этим collector.
+Обычные `LOG:` строки не превращаются в ошибки и не пишутся в PGM. В этом
+инкременте typed pipeline принимает только checkpoint, slow-query и lifecycle
+шаблоны из `stderr`. Autovacuum, lock waits, temp files и полный байтовый
+`csvlog` parser отложены; `csvlog` остаётся поздним опциональным расширением,
+не near-term путём.
 
 ### `1_022_001` `pg_log_errors`
 
 Одна строка представляет группу `(severity, category, pattern)` в текущем окне.
 Для `stderr` SQLSTATE извлекается только из сообщений вида `XXXXX:  ...`;
-`database` и `username` остаются `NULL` до реализации `csvlog`. Обычные
+`database` и `username` в stderr-области остаются `NULL`. Их возможное
+заполнение относится к будущему `csvlog` parser. Обычные
 `LOG:` строки не пишутся в `pg_log_errors`; в этом инкременте допускаются только
 отобранные `LOG:` события падения backend/postmaster и OOM/SIGKILL.
 
@@ -1195,6 +1201,71 @@ dict_dropped_fields  u8    G
 Категории: `0=lock`, `1=constraint`, `2=serialization`, `3=timeout`,
 `4=resource`, `5=data_corruption`, `6=system`, `7=connection`, `8=auth`,
 `9=syntax`, `10=other`.
+
+### `1_024_001` `pg_log_checkpoints`
+
+Одна строка представляет один checkpoint `LOG:` record. `phase`: `0=starting`,
+`1=complete`, `2=too_frequent`. Для `complete` времена PostgreSQL из секунд
+переводятся в миллисекунды. Nullable числовые поля означают, что этот формат
+сообщения их не содержит; ноль хранится только когда PostgreSQL реально
+сообщил `0`.
+
+```text
+ts                   ts    T
+phase                u8    L
+reason               str?  L   // starting reason или текст too_frequent
+seconds_apart        i64?  G
+buffers_written      i64?  G
+write_ms             f64?  G
+sync_ms              f64?  G
+total_ms             f64?  G
+distance_kb          i64?  G
+estimate_kb          i64?  G
+wal_added            i64?  G
+wal_removed          i64?  G
+wal_recycled         i64?  G
+sync_files           i64?  G
+longest_sync_ms      f64?  G
+average_sync_ms      f64?  G
+dict_dropped_fields  u8    G
+```
+
+### `1_026_001` `pg_log_slow_queries`
+
+Строки строятся из `LOG: duration: ... ms  statement: ...` и русского
+эквивалента. Записи `log_duration=on` без `statement:` игнорируются: без SQL
+они не дают устойчивого ключа. В одном окне collector группирует по
+нормализованному SQL pattern и оставляет top-N по `max_duration_ms`
+(`16` рядов). Прочитанные, но не попавшие в top-N pattern'ы дают
+`1_029_001 reason=parser_drop`.
+
+```text
+ts                   ts    T   // время max-duration sample
+pattern              str?  L   // 256 байт
+sample               str?  L   // SQL max-duration sample, 5120 байт
+count                u32   G
+max_duration_ms      f64   G
+total_duration_ms    f64   G
+dict_dropped_fields  u8    G
+```
+
+### `1_028_001` `pg_log_lifecycle`
+
+Lifecycle пишет crash, shutdown request и ready-to-accept-connections из
+`stderr`. Crash/OOM `LOG:` строки дополнительно остаются в `1_022_001`, чтобы
+не ломать error timeline из первого log-domain инкремента. Shutdown и ready
+пишутся только сюда.
+
+```text
+ts                   ts    T
+kind                 u8    L   // 0=crash, 1=shutdown, 2=ready
+pid                  i32?  L
+signal               i32?  L
+shutdown_mode        str?  L   // fast | smart | immediate
+message              str?  L
+query_detail         str?  L   // SQL из crash DETAIL, если PostgreSQL его дал
+dict_dropped_fields  u8    G
+```
 
 ### `1_029_001` `pg_log_gap`
 
@@ -1232,9 +1303,9 @@ parser_dropped_lines  u32   G
 `budget_exhausted` означает ограничение чтения: collector остановил текущий
 read по лимиту строк/байт/времени и не коммитит offset за непрочитанные bytes.
 Это не сигнал потери данных. `parser_drop` означает, что лимит выхода parser
-отбросил уже прочитанные группы. `timestamp_fallback` означает, что stderr
-prefix не содержит timestamp, который collector смог разобрать, и строка
-получила время collection.
+отбросил уже прочитанные группы ошибок или typed-event rows/top-N candidates.
+`timestamp_fallback` означает, что stderr prefix не содержит timestamp, который
+collector смог разобрать, и строка получила время collection.
 
 ## `1_023_001` coverage
 

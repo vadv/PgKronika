@@ -15,7 +15,8 @@ mod state;
 mod tailer;
 
 pub use collector::{
-    DiscoveryStatus, GapReason, GroupedLogError, LogCollection, LogCollector, LogConfig, LogGap,
+    CheckpointEvent, CheckpointPhase, DiscoveryStatus, GapReason, GroupedLogError, LifecycleEvent,
+    LifecycleKind, LogCollection, LogCollector, LogConfig, LogGap, SlowQueryEvent,
 };
 pub use normalize::ErrorCategory;
 pub use parser::{LogSeverity, ParserKind};
@@ -24,6 +25,12 @@ pub use tailer::{TailCaps, TailGaps};
 
 /// Type id for grouped log errors.
 pub const PG_LOG_ERRORS_TYPE_ID: u32 = 1_022_001;
+/// Type id for typed checkpoint log events.
+pub const PG_LOG_CHECKPOINTS_TYPE_ID: u32 = 1_024_001;
+/// Type id for slow-query top-N log events.
+pub const PG_LOG_SLOW_QUERIES_TYPE_ID: u32 = 1_026_001;
+/// Type id for server lifecycle log events.
+pub const PG_LOG_LIFECYCLE_TYPE_ID: u32 = 1_028_001;
 /// Type id for log-tail degradation rows.
 pub const PG_LOG_GAP_TYPE_ID: u32 = 1_029_001;
 

@@ -11,7 +11,7 @@ use crate::normalize::{ErrorCategory, classify_error, normalize_error};
 use crate::parser::{ContinuationKind, LogSeverity, ParsedLine, ParserKind, parse_stderr_line};
 use crate::state::TailState;
 use crate::tailer::{TailCaps, TailGaps, TailLine, read_batch};
-use crate::{MAX_TEXT_BYTES, truncate_utf8, u32_saturating};
+use crate::{MAX_PATTERN_BYTES, MAX_TEXT_BYTES, truncate_utf8, u32_saturating};
 
 /// Runtime configuration for the log collector.
 #[derive(Debug, Clone)]
@@ -91,6 +91,125 @@ pub struct GroupedLogError {
     pub context: Option<String>,
     /// Attached SQL statement.
     pub statement: Option<String>,
+}
+
+/// Phase of a checkpoint log event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointPhase {
+    /// `checkpoint starting: ...`.
+    Starting,
+    /// `checkpoint complete: ...`.
+    Complete,
+    /// `checkpoints are occurring too frequently ...`.
+    TooFrequent,
+}
+
+impl CheckpointPhase {
+    /// Numeric code stored in `pg_log_checkpoints`.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Starting => 0,
+            Self::Complete => 1,
+            Self::TooFrequent => 2,
+        }
+    }
+}
+
+/// One typed checkpoint event before dictionary interning.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointEvent {
+    /// Log record time.
+    pub ts: i64,
+    /// Checkpoint phase.
+    pub phase: CheckpointPhase,
+    /// Starting reason or warning text.
+    pub reason: Option<String>,
+    /// Interval reported by the too-frequent checkpoint warning.
+    pub seconds_apart: Option<i64>,
+    /// Buffers written by the checkpoint.
+    pub buffers_written: Option<i64>,
+    /// Checkpoint write time, ms.
+    pub write_ms: Option<f64>,
+    /// Checkpoint sync time, ms.
+    pub sync_ms: Option<f64>,
+    /// Total checkpoint time, ms.
+    pub total_ms: Option<f64>,
+    /// WAL distance covered by the checkpoint, kB.
+    pub distance_kb: Option<i64>,
+    /// Estimated WAL distance for checkpoint scheduling, kB.
+    pub estimate_kb: Option<i64>,
+    /// WAL files added.
+    pub wal_added: Option<i64>,
+    /// WAL files removed.
+    pub wal_removed: Option<i64>,
+    /// WAL files recycled.
+    pub wal_recycled: Option<i64>,
+    /// Files synced by the checkpoint.
+    pub sync_files: Option<i64>,
+    /// Longest individual file sync duration, ms.
+    pub longest_sync_ms: Option<f64>,
+    /// Average file sync duration, ms.
+    pub average_sync_ms: Option<f64>,
+}
+
+/// Slow-query aggregate for one normalized SQL pattern in a collection window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlowQueryEvent {
+    /// Timestamp of the max-duration sample.
+    pub ts: i64,
+    /// Normalized SQL pattern.
+    pub pattern: String,
+    /// Bounded SQL sample for the max-duration occurrence.
+    pub sample: String,
+    /// Occurrences of this pattern in the collection window.
+    pub count: u32,
+    /// Largest duration for the pattern, ms.
+    pub max_duration_ms: f64,
+    /// Sum of durations for this pattern, ms.
+    pub total_duration_ms: f64,
+}
+
+/// Server lifecycle event kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleKind {
+    /// Backend/postmaster child crash.
+    Crash,
+    /// Postmaster shutdown request.
+    Shutdown,
+    /// Server is ready to accept connections.
+    Ready,
+}
+
+impl LifecycleKind {
+    /// Numeric code stored in `pg_log_lifecycle`.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Crash => 0,
+            Self::Shutdown => 1,
+            Self::Ready => 2,
+        }
+    }
+}
+
+/// One typed server lifecycle event before dictionary interning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleEvent {
+    /// Log record time.
+    pub ts: i64,
+    /// Lifecycle kind.
+    pub kind: LifecycleKind,
+    /// Crashed process id when `PostgreSQL` reports it.
+    pub pid: Option<i32>,
+    /// Crash signal number when `PostgreSQL` reports it.
+    pub signal: Option<i32>,
+    /// Shutdown mode: `fast`, `smart`, or `immediate`.
+    pub shutdown_mode: Option<String>,
+    /// Bounded lifecycle message.
+    pub message: String,
+    /// SQL extracted from a following crash `DETAIL:` line.
+    pub query_detail: Option<String>,
 }
 
 /// Why `pg_log_gap` was emitted.
@@ -197,6 +316,12 @@ pub struct LogGap {
 pub struct LogCollection {
     /// Grouped errors.
     pub errors: Vec<GroupedLogError>,
+    /// Typed checkpoint events.
+    pub checkpoints: Vec<CheckpointEvent>,
+    /// Slow-query top-N rows.
+    pub slow_queries: Vec<SlowQueryEvent>,
+    /// Server lifecycle events.
+    pub lifecycles: Vec<LifecycleEvent>,
     /// Degradation rows.
     pub gaps: Vec<LogGap>,
     /// Discovery status for logs.
@@ -231,12 +356,42 @@ struct PendingError {
     statement: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingSlowQuery {
+    ts: i64,
+    duration_ms: f64,
+    sql: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSlowQueryGroup {
+    ts: i64,
+    pattern: String,
+    sample: String,
+    count: u32,
+    max_duration_ms: f64,
+    total_duration_ms: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ErrorKey {
     pattern: String,
     severity: LogSeverity,
     sqlstate: Option<String>,
 }
+
+#[derive(Debug, Default)]
+struct ParsedLogRecords {
+    errors: Vec<GroupedLogError>,
+    checkpoints: Vec<CheckpointEvent>,
+    slow_queries: Vec<SlowQueryEvent>,
+    lifecycles: Vec<LifecycleEvent>,
+}
+
+const MAX_ERROR_GROUPS: usize = 32;
+const MAX_CHECKPOINT_EVENTS: usize = 64;
+const MAX_SLOW_QUERY_GROUPS: usize = 16;
+const MAX_LIFECYCLE_EVENTS: usize = 32;
 
 impl LogCollector {
     /// Create a collector and load persisted tail state.
@@ -343,7 +498,11 @@ impl LogCollector {
             }
         };
         let mut parse_gaps = ParseGaps::default();
-        result.errors = parse_errors(&batch.lines, ts, &mut parse_gaps);
+        let parsed = parse_stderr_records(&batch.lines, ts, &mut parse_gaps);
+        result.errors = parsed.errors;
+        result.checkpoints = parsed.checkpoints;
+        result.slow_queries = parsed.slow_queries;
+        result.lifecycles = parsed.lifecycles;
         result.gaps.extend(gaps_from_tail(
             ts,
             &source.path,
@@ -362,13 +521,16 @@ impl LogCollector {
                 ..file_state_fields(batch.next_state.as_ref())
             });
         }
-        if parse_gaps.dropped_groups != 0 {
+        let parser_drops = parse_gaps
+            .dropped_groups
+            .saturating_add(parse_gaps.dropped_events);
+        if parser_drops != 0 {
             result.gaps.push(LogGap {
                 ts,
                 source_path: Some(source.path.clone()),
                 parser_kind: source.parser_kind,
                 reason: GapReason::ParserDrop,
-                parser_dropped_lines: parse_gaps.dropped_groups,
+                parser_dropped_lines: parser_drops,
                 ..file_state_fields(batch.next_state.as_ref())
             });
         }
@@ -533,35 +695,53 @@ async fn current_logfile(client: &Client) -> Result<Option<String>, DiscoveryErr
 struct ParseGaps {
     invalid_utf8: u32,
     dropped_groups: u32,
+    dropped_events: u32,
     timestamp_fallbacks: u32,
 }
 
 #[allow(
     clippy::too_many_lines,
-    reason = "stderr grouping, continuation state, and output cap accounting stay auditable together"
+    reason = "stderr event routing, continuation state, and cap accounting stay auditable together"
 )]
-fn parse_errors(
+fn parse_stderr_records(
     lines: &[TailLine],
     fallback_ts: i64,
     gaps: &mut ParseGaps,
-) -> Vec<GroupedLogError> {
+) -> ParsedLogRecords {
+    let mut records = ParsedLogRecords::default();
     let mut pending = HashMap::<ErrorKey, PendingError>::new();
+    let mut slow_groups = HashMap::<String, PendingSlowQueryGroup>::new();
+    let mut pending_slow = None::<PendingSlowQuery>;
     let mut last_key = None::<ErrorKey>;
     let mut last_continuation = None::<ContinuationKind>;
+    let mut last_lifecycle = None::<usize>;
+    let mut lifecycle_detail_active = false;
     for line in lines {
         let Ok(decoded) = std::str::from_utf8(&line.bytes) else {
+            flush_pending_slow_query(&mut pending_slow, &mut slow_groups);
             gaps.invalid_utf8 = gaps.invalid_utf8.saturating_add(1);
             last_key = None;
             last_continuation = None;
+            last_lifecycle = None;
+            lifecycle_detail_active = false;
             continue;
         };
         let decoded = decoded.strip_suffix('\r').unwrap_or(decoded);
         if decoded.starts_with([' ', '\t']) {
+            let text = decoded.trim();
+            if let Some(slow) = pending_slow.as_mut() {
+                append_string_capped(&mut slow.sql, text, MAX_TEXT_BYTES);
+                continue;
+            }
             if let Some(kind) = last_continuation {
-                append_to_last_continuation(&mut pending, last_key.as_ref(), kind, decoded.trim());
+                append_to_last_continuation(&mut pending, last_key.as_ref(), kind, text);
+            }
+            if lifecycle_detail_active {
+                append_lifecycle_detail_continuation(&mut records.lifecycles, last_lifecycle, text);
             }
             continue;
         }
+        flush_pending_slow_query(&mut pending_slow, &mut slow_groups);
         match parse_stderr_line(decoded) {
             Some(ParsedLine::Error {
                 ts,
@@ -569,11 +749,33 @@ fn parse_errors(
                 sqlstate,
                 message,
             }) => {
+                let used_ts = ts.unwrap_or(fallback_ts);
+                let mut routed = false;
+                let mut lifecycle_for_continuation = None;
+                if severity == LogSeverity::Log {
+                    if let Some(event) = parse_checkpoint_event(message, used_ts) {
+                        routed = true;
+                        push_checkpoint_event(&mut records.checkpoints, event, gaps);
+                    } else if let Some(slow) = parse_slow_query_event(message, used_ts) {
+                        routed = true;
+                        pending_slow = Some(slow);
+                    } else if let Some(event) = parse_lifecycle_event(message, used_ts) {
+                        routed = true;
+                        lifecycle_for_continuation =
+                            push_lifecycle_event(&mut records.lifecycles, event, gaps);
+                    }
+                }
+
                 let pattern = normalize_error(message);
                 let category = classify_error(&pattern, severity);
                 if severity == LogSeverity::Log && !is_relevant_log_event(&pattern, category) {
+                    if routed && ts.is_none() {
+                        gaps.timestamp_fallbacks = gaps.timestamp_fallbacks.saturating_add(1);
+                    }
                     last_key = None;
                     last_continuation = None;
+                    last_lifecycle = lifecycle_for_continuation;
+                    lifecycle_detail_active = false;
                     continue;
                 }
                 if ts.is_none() {
@@ -585,7 +787,7 @@ fn parse_errors(
                     sqlstate: sqlstate.map(str::to_owned),
                 };
                 let entry = pending.entry(key.clone()).or_insert_with(|| PendingError {
-                    ts: ts.unwrap_or(fallback_ts),
+                    ts: used_ts,
                     count: 0,
                     sample: truncate_utf8(message, MAX_TEXT_BYTES).to_owned(),
                     detail: None,
@@ -596,18 +798,38 @@ fn parse_errors(
                 entry.count = entry.count.saturating_add(1);
                 last_key = Some(key);
                 last_continuation = None;
+                last_lifecycle = lifecycle_for_continuation;
+                lifecycle_detail_active = false;
             }
             Some(ParsedLine::Continuation { kind, text }) => {
+                if let Some(slow) = pending_slow.as_mut() {
+                    append_string_capped(&mut slow.sql, text, MAX_TEXT_BYTES);
+                    continue;
+                }
                 last_continuation =
                     append_to_last_continuation(&mut pending, last_key.as_ref(), kind, text)
                         .then_some(kind);
+                lifecycle_detail_active = kind == ContinuationKind::Detail
+                    && apply_lifecycle_detail(&mut records.lifecycles, last_lifecycle, text);
             }
             None => {
                 last_key = None;
                 last_continuation = None;
+                last_lifecycle = None;
+                lifecycle_detail_active = false;
             }
         }
     }
+    flush_pending_slow_query(&mut pending_slow, &mut slow_groups);
+    records.errors = error_rows_from_pending(pending, gaps);
+    records.slow_queries = slow_rows_from_groups(slow_groups, gaps);
+    records
+}
+
+fn error_rows_from_pending(
+    pending: HashMap<ErrorKey, PendingError>,
+    gaps: &mut ParseGaps,
+) -> Vec<GroupedLogError> {
     let mut rows: Vec<_> = pending
         .into_iter()
         .map(|(key, entry)| GroupedLogError {
@@ -637,9 +859,9 @@ fn parse_errors(
                 ))
             })
     });
-    if rows.len() > 32 {
-        gaps.dropped_groups = u32_saturating((rows.len() - 32) as u64);
-        rows.truncate(32);
+    if rows.len() > MAX_ERROR_GROUPS {
+        gaps.dropped_groups = u32_saturating((rows.len() - MAX_ERROR_GROUPS) as u64);
+        rows.truncate(MAX_ERROR_GROUPS);
     }
     rows.sort_by(|a, b| {
         (a.severity, a.category, a.pattern.as_str(), a.ts).cmp(&(
@@ -650,6 +872,424 @@ fn parse_errors(
         ))
     });
     rows
+}
+
+fn slow_rows_from_groups(
+    groups: HashMap<String, PendingSlowQueryGroup>,
+    gaps: &mut ParseGaps,
+) -> Vec<SlowQueryEvent> {
+    let mut rows: Vec<_> = groups
+        .into_values()
+        .map(|entry| SlowQueryEvent {
+            ts: entry.ts,
+            pattern: entry.pattern,
+            sample: entry.sample,
+            count: entry.count,
+            max_duration_ms: entry.max_duration_ms,
+            total_duration_ms: entry.total_duration_ms,
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.max_duration_ms
+            .total_cmp(&a.max_duration_ms)
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.pattern.cmp(&b.pattern))
+            .then_with(|| a.ts.cmp(&b.ts))
+    });
+    if rows.len() > MAX_SLOW_QUERY_GROUPS {
+        gaps.dropped_events = gaps
+            .dropped_events
+            .saturating_add(u32_saturating((rows.len() - MAX_SLOW_QUERY_GROUPS) as u64));
+        rows.truncate(MAX_SLOW_QUERY_GROUPS);
+    }
+    rows.sort_by(|a, b| (a.pattern.as_str(), a.ts).cmp(&(b.pattern.as_str(), b.ts)));
+    rows
+}
+
+fn flush_pending_slow_query(
+    pending: &mut Option<PendingSlowQuery>,
+    groups: &mut HashMap<String, PendingSlowQueryGroup>,
+) {
+    let Some(query) = pending.take() else {
+        return;
+    };
+    let pattern = normalize_slow_sql(&query.sql);
+    let entry = groups
+        .entry(pattern.clone())
+        .or_insert_with(|| PendingSlowQueryGroup {
+            ts: query.ts,
+            pattern,
+            sample: query.sql.clone(),
+            count: 0,
+            max_duration_ms: query.duration_ms,
+            total_duration_ms: 0.0,
+        });
+    entry.count = entry.count.saturating_add(1);
+    entry.total_duration_ms += query.duration_ms;
+    if query.duration_ms > entry.max_duration_ms {
+        entry.ts = query.ts;
+        entry.sample = query.sql;
+        entry.max_duration_ms = query.duration_ms;
+    }
+}
+
+fn normalize_slow_sql(sql: &str) -> String {
+    let normalized = normalize_error(sql);
+    let normalized = replace_numeric_literals(&normalized);
+    truncate_utf8(&normalized, MAX_PATTERN_BYTES).to_owned()
+}
+
+fn replace_numeric_literals(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if !bytes[idx].is_ascii_digit() {
+            let Some(ch) = value.get(idx..).and_then(|tail| tail.chars().next()) else {
+                break;
+            };
+            out.push(ch);
+            idx += ch.len_utf8();
+            continue;
+        }
+        let start = idx;
+        while idx < bytes.len() && (bytes[idx].is_ascii_digit() || bytes[idx] == b'.') {
+            idx += 1;
+        }
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = idx >= bytes.len() || !is_ident_byte(bytes[idx]);
+        if before_ok && after_ok {
+            out.push_str("...");
+        } else {
+            out.push_str(value.get(start..idx).unwrap_or_default());
+        }
+    }
+    out
+}
+
+const fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn push_checkpoint_event(
+    rows: &mut Vec<CheckpointEvent>,
+    event: CheckpointEvent,
+    gaps: &mut ParseGaps,
+) {
+    if rows.len() >= MAX_CHECKPOINT_EVENTS {
+        gaps.dropped_events = gaps.dropped_events.saturating_add(1);
+        return;
+    }
+    rows.push(event);
+}
+
+fn push_lifecycle_event(
+    rows: &mut Vec<LifecycleEvent>,
+    event: LifecycleEvent,
+    gaps: &mut ParseGaps,
+) -> Option<usize> {
+    if rows.len() >= MAX_LIFECYCLE_EVENTS {
+        gaps.dropped_events = gaps.dropped_events.saturating_add(1);
+        return None;
+    }
+    rows.push(event);
+    Some(rows.len() - 1)
+}
+
+const CHECKPOINT_STARTING: &[&str] = &["checkpoint starting:", "начата контрольная точка:"];
+const CHECKPOINT_COMPLETE: &[&str] = &["checkpoint complete:", "контрольная точка завершена:"];
+const CHECKPOINT_TOO_FREQUENT: &[&str] = &[
+    "checkpoints are occurring too frequently",
+    "контрольные точки происходят слишком часто",
+];
+const DURATION_PREFIXES: &[(&str, &str)] = &[
+    ("duration: ", " ms  statement: "),
+    ("продолжительность: ", " мс  оператор: "),
+];
+const SERVER_CRASH_PREFIXES: &[&str] = &["server process (PID ", "серверный процесс (PID "];
+const SERVER_SHUTDOWN_PREFIXES: &[(&str, &str)] = &[
+    ("received fast shutdown request", "fast"),
+    ("received smart shutdown request", "smart"),
+    ("received immediate shutdown request", "immediate"),
+    ("получен запрос на быстрое выключение", "fast"),
+    ("получен запрос на умное выключение", "smart"),
+    ("получен запрос на немедленное выключение", "immediate"),
+];
+const SERVER_READY_PREFIXES: &[&str] = &[
+    "database system is ready to accept connections",
+    "система БД готова принимать подключения",
+];
+
+fn parse_checkpoint_event(message: &str, ts: i64) -> Option<CheckpointEvent> {
+    for prefix in CHECKPOINT_STARTING {
+        if let Some(reason) = message.strip_prefix(prefix) {
+            return Some(CheckpointEvent {
+                ts,
+                phase: CheckpointPhase::Starting,
+                reason: non_empty_text(reason.trim()),
+                seconds_apart: None,
+                buffers_written: None,
+                write_ms: None,
+                sync_ms: None,
+                total_ms: None,
+                distance_kb: None,
+                estimate_kb: None,
+                wal_added: None,
+                wal_removed: None,
+                wal_recycled: None,
+                sync_files: None,
+                longest_sync_ms: None,
+                average_sync_ms: None,
+            });
+        }
+    }
+    if CHECKPOINT_COMPLETE
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        let (wal_added, wal_removed, wal_recycled) =
+            parse_wal_file_counts(message).unwrap_or((None, None, None));
+        return Some(CheckpointEvent {
+            ts,
+            phase: CheckpointPhase::Complete,
+            reason: None,
+            seconds_apart: None,
+            buffers_written: extract_i64_after(message, "wrote ")
+                .or_else(|| extract_i64_after(message, "записано буферов: ")),
+            write_ms: extract_seconds_as_ms(message, "write=")
+                .or_else(|| extract_seconds_as_ms(message, "запись=")),
+            sync_ms: extract_seconds_as_ms(message, "sync=")
+                .or_else(|| extract_seconds_as_ms(message, "синхронизация=")),
+            total_ms: extract_seconds_as_ms(message, "total=")
+                .or_else(|| extract_seconds_as_ms(message, "всего=")),
+            distance_kb: extract_i64_after(message, "distance=")
+                .or_else(|| extract_i64_after(message, "расстояние=")),
+            estimate_kb: extract_i64_after(message, "estimate=")
+                .or_else(|| extract_i64_after(message, "ожидалось=")),
+            wal_added,
+            wal_removed,
+            wal_recycled,
+            sync_files: extract_i64_after(message, "sync files=")
+                .or_else(|| extract_i64_after(message, "синхронизировано файлов: ")),
+            longest_sync_ms: extract_seconds_as_ms(message, "longest=")
+                .or_else(|| extract_seconds_as_ms(message, "самый долгий: ")),
+            average_sync_ms: extract_seconds_as_ms(message, "average=")
+                .or_else(|| extract_seconds_as_ms(message, "средний: ")),
+        });
+    }
+    if CHECKPOINT_TOO_FREQUENT
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        return Some(CheckpointEvent {
+            ts,
+            phase: CheckpointPhase::TooFrequent,
+            reason: Some(truncate_utf8(message, MAX_TEXT_BYTES).to_owned()),
+            seconds_apart: extract_parenthesized_i64(message),
+            buffers_written: None,
+            write_ms: None,
+            sync_ms: None,
+            total_ms: None,
+            distance_kb: None,
+            estimate_kb: None,
+            wal_added: None,
+            wal_removed: None,
+            wal_recycled: None,
+            sync_files: None,
+            longest_sync_ms: None,
+            average_sync_ms: None,
+        });
+    }
+    None
+}
+
+fn parse_slow_query_event(message: &str, ts: i64) -> Option<PendingSlowQuery> {
+    for &(duration_prefix, statement_marker) in DURATION_PREFIXES {
+        let Some(rest) = message.strip_prefix(duration_prefix) else {
+            continue;
+        };
+        let Some(statement_pos) = rest.find(statement_marker) else {
+            continue;
+        };
+        let duration_ms = rest.get(..statement_pos)?.parse::<f64>().ok()?;
+        if !duration_ms.is_finite() || duration_ms < 0.0 {
+            return None;
+        }
+        let sql_start = statement_pos + statement_marker.len();
+        return Some(PendingSlowQuery {
+            ts,
+            duration_ms,
+            sql: truncate_utf8(rest.get(sql_start..)?.trim(), MAX_TEXT_BYTES).to_owned(),
+        });
+    }
+    None
+}
+
+fn parse_lifecycle_event(message: &str, ts: i64) -> Option<LifecycleEvent> {
+    if SERVER_CRASH_PREFIXES
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        return Some(LifecycleEvent {
+            ts,
+            kind: LifecycleKind::Crash,
+            pid: parse_crash_pid(message),
+            signal: parse_crash_signal(message),
+            shutdown_mode: None,
+            message: truncate_utf8(message, MAX_TEXT_BYTES).to_owned(),
+            query_detail: None,
+        });
+    }
+    for &(prefix, mode) in SERVER_SHUTDOWN_PREFIXES {
+        if message.starts_with(prefix) {
+            return Some(LifecycleEvent {
+                ts,
+                kind: LifecycleKind::Shutdown,
+                pid: None,
+                signal: None,
+                shutdown_mode: Some(mode.to_owned()),
+                message: truncate_utf8(message, MAX_TEXT_BYTES).to_owned(),
+                query_detail: None,
+            });
+        }
+    }
+    if SERVER_READY_PREFIXES
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        return Some(LifecycleEvent {
+            ts,
+            kind: LifecycleKind::Ready,
+            pid: None,
+            signal: None,
+            shutdown_mode: None,
+            message: truncate_utf8(message, MAX_TEXT_BYTES).to_owned(),
+            query_detail: None,
+        });
+    }
+    None
+}
+
+fn apply_lifecycle_detail(rows: &mut [LifecycleEvent], index: Option<usize>, text: &str) -> bool {
+    let Some(index) = index else {
+        return false;
+    };
+    let Some(sql) = extract_crash_detail_sql(text) else {
+        return false;
+    };
+    let Some(row) = rows.get_mut(index) else {
+        return false;
+    };
+    append_option_text_capped(&mut row.query_detail, &sql, MAX_TEXT_BYTES);
+    true
+}
+
+fn append_lifecycle_detail_continuation(
+    rows: &mut [LifecycleEvent],
+    index: Option<usize>,
+    text: &str,
+) -> bool {
+    let Some(row) = index.and_then(|index| rows.get_mut(index)) else {
+        return false;
+    };
+    append_option_text_capped(&mut row.query_detail, text, MAX_TEXT_BYTES);
+    true
+}
+
+fn extract_crash_detail_sql(text: &str) -> Option<String> {
+    for marker in ["was running: ", "выполнял действие: "] {
+        if let Some(pos) = text.find(marker) {
+            return Some(
+                truncate_utf8(text.get(pos + marker.len()..)?.trim(), MAX_TEXT_BYTES).to_owned(),
+            );
+        }
+    }
+    (text.contains("was running") || text.contains("выполнял действие")).then(String::new)
+}
+
+fn parse_crash_pid(message: &str) -> Option<i32> {
+    let start = message.find("(PID ")? + "(PID ".len();
+    parse_i32_prefix(message.get(start..)?)
+}
+
+fn parse_crash_signal(message: &str) -> Option<i32> {
+    for marker in ["signal ", "сигналом "] {
+        if let Some(pos) = message.find(marker) {
+            return parse_i32_prefix(message.get(pos + marker.len()..)?);
+        }
+    }
+    None
+}
+
+fn parse_i32_prefix(value: &str) -> Option<i32> {
+    let end = value
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(value.len());
+    value.get(..end)?.parse().ok()
+}
+
+fn parse_wal_file_counts(message: &str) -> Option<(Option<i64>, Option<i64>, Option<i64>)> {
+    if let Some(pos) = message.find(" WAL file") {
+        let added = extract_trailing_i64(message.get(..pos)?);
+        let removed = extract_i64_after(message, "added, ");
+        let recycled = extract_i64_after(message, "removed, ");
+        return Some((added, removed, recycled));
+    }
+    if message.contains("добавлено файлов WAL:") {
+        let added = extract_i64_after(message, "добавлено файлов WAL: ");
+        let removed = extract_i64_after(message, "удалено: ");
+        let recycled = extract_i64_after(message, "переработано: ");
+        return Some((added, removed, recycled));
+    }
+    None
+}
+
+fn extract_parenthesized_i64(message: &str) -> Option<i64> {
+    let start = message.find('(')? + 1;
+    let rest = message.get(start..)?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
+}
+
+fn extract_trailing_i64(text: &str) -> Option<i64> {
+    let trimmed = text.trim_end();
+    let end = trimmed.len();
+    let start = trimmed
+        .rfind(|c: char| !c.is_ascii_digit() && c != '-')
+        .map_or(0, |pos| pos + 1);
+    if start >= end {
+        return None;
+    }
+    trimmed.get(start..end)?.parse().ok()
+}
+
+fn extract_i64_after(text: &str, marker: &str) -> Option<i64> {
+    let start = text.find(marker)? + marker.len();
+    let rest = text.get(start..)?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
+}
+
+fn extract_f64_after(text: &str, marker: &str) -> Option<f64> {
+    let start = text.find(marker)? + marker.len();
+    let rest = text.get(start..)?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+        .unwrap_or(rest.len());
+    let value = rest.get(..end)?.parse::<f64>().ok()?;
+    value.is_finite().then_some(value)
+}
+
+fn extract_seconds_as_ms(text: &str, marker: &str) -> Option<f64> {
+    extract_f64_after(text, marker).map(|seconds| seconds * 1000.0)
+}
+
+fn non_empty_text(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| truncate_utf8(value, MAX_TEXT_BYTES).to_owned())
 }
 
 fn append_to_last_continuation(
@@ -703,18 +1343,32 @@ fn append_continuation(entry: &mut PendingError, kind: ContinuationKind, text: &
 }
 
 fn append_text(target: &mut Option<String>, text: &str) {
-    if text.is_empty() {
+    append_option_text_capped(target, text, MAX_TEXT_BYTES);
+}
+
+fn append_option_text_capped(target: &mut Option<String>, text: &str, max_bytes: usize) {
+    if text.is_empty() || max_bytes == 0 {
         return;
     }
     let current = target.get_or_insert_with(String::new);
-    if !current.is_empty() {
-        current.push(' ');
+    append_string_capped(current, text, max_bytes);
+}
+
+fn append_string_capped(target: &mut String, text: &str, max_bytes: usize) {
+    if text.is_empty() || target.len() >= max_bytes {
+        return;
     }
-    current.push_str(text);
-    if current.len() > MAX_TEXT_BYTES {
-        let truncated = truncate_utf8(current, MAX_TEXT_BYTES).to_owned();
-        *current = truncated;
+    if !target.is_empty() {
+        if target.len().saturating_add(1) >= max_bytes {
+            return;
+        }
+        target.push(' ');
     }
+    if target.len() >= max_bytes {
+        return;
+    }
+    let remaining = max_bytes - target.len();
+    target.push_str(truncate_utf8(text, remaining));
 }
 
 fn gaps_from_tail(
@@ -842,7 +1496,9 @@ const fn empty_gap() -> LogGap {
 
 #[cfg(test)]
 mod tests {
-    use super::{GapReason, LogCollector, LogConfig, read_error_reason};
+    use super::{
+        CheckpointPhase, GapReason, LifecycleKind, LogCollector, LogConfig, read_error_reason,
+    };
     use crate::{ErrorCategory, LogSeverity, ParserKind};
     use std::fmt::Write as _;
     use std::io;
@@ -972,6 +1628,164 @@ mod tests {
             .expect("crash warning row");
         assert_eq!(crash_warning.severity, LogSeverity::Warning);
         assert_eq!(crash_warning.category, ErrorCategory::System);
+        assert_eq!(batch.checkpoints.len(), 1);
+        assert_eq!(batch.checkpoints[0].phase, CheckpointPhase::Starting);
+        assert_eq!(
+            batch.checkpoints[0].reason.as_deref(),
+            Some("immediate force wait")
+        );
+        assert_eq!(batch.lifecycles.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn collects_checkpoint_events_with_nullable_metrics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:03:00 UTC [1]: LOG:  checkpoint starting: time\n\
+             2026-07-05 12:03:01 UTC [1]: LOG:  checkpoint complete: wrote 128 buffers (0.2%); 0 WAL file(s) added, 1 removed, 2 recycled; write=1.234 s, sync=0.056 s, total=1.500 s; sync files=7, longest=0.040 s, average=0.008 s; distance=4096 kB, estimate=8192 kB\n\
+             2026-07-05 12:03:02 UTC [1]: LOG:  checkpoints are occurring too frequently (3 seconds apart)\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert!(batch.errors.is_empty());
+        assert_eq!(batch.checkpoints.len(), 3);
+        assert_eq!(batch.checkpoints[0].phase, CheckpointPhase::Starting);
+        assert_eq!(batch.checkpoints[0].reason.as_deref(), Some("time"));
+        let complete = batch
+            .checkpoints
+            .iter()
+            .find(|event| event.phase == CheckpointPhase::Complete)
+            .expect("complete checkpoint");
+        assert_eq!(complete.buffers_written, Some(128));
+        assert_eq!(complete.write_ms, Some(1234.0));
+        assert_eq!(complete.sync_ms, Some(56.0));
+        assert_eq!(complete.total_ms, Some(1500.0));
+        assert_eq!(complete.wal_added, Some(0));
+        assert_eq!(complete.wal_removed, Some(1));
+        assert_eq!(complete.wal_recycled, Some(2));
+        assert_eq!(complete.sync_files, Some(7));
+        let too_frequent = batch
+            .checkpoints
+            .iter()
+            .find(|event| event.phase == CheckpointPhase::TooFrequent)
+            .expect("too frequent checkpoint");
+        assert_eq!(too_frequent.seconds_apart, Some(3));
+    }
+
+    #[tokio::test]
+    async fn collects_slow_query_topn_and_ignores_ordinary_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:04:00 UTC [1]: LOG:  listening on IPv4 address \"127.0.0.1\", port 5432\n\
+             2026-07-05 12:04:01 UTC [1]: LOG:  duration: 1500.250 ms  statement: SELECT *\n\
+             \tFROM slow_table WHERE id = 42\n\
+             2026-07-05 12:04:02 UTC [1]: LOG:  duration: 500.000 ms  statement: SELECT * FROM slow_table WHERE id = 99\n\
+             2026-07-05 12:04:03 UTC [1]: LOG:  duration: 10.000 ms\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert!(batch.errors.is_empty());
+        assert!(batch.checkpoints.is_empty());
+        assert!(batch.lifecycles.is_empty());
+        assert_eq!(batch.slow_queries.len(), 1);
+        let slow = &batch.slow_queries[0];
+        assert_eq!(slow.count, 2);
+        assert_close(slow.max_duration_ms, 1500.250);
+        assert_close(slow.total_duration_ms, 2000.250);
+        assert_eq!(slow.sample, "SELECT * FROM slow_table WHERE id = 42");
+        assert!(slow.sample.len() <= crate::MAX_TEXT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn slow_query_topn_overflow_emits_parser_drop_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        let mut content = String::new();
+        for idx in 0..18 {
+            writeln!(
+                &mut content,
+                "2026-07-05 12:04:{idx:02} UTC [1]: LOG:  duration: {}.000 ms  statement: SELECT * FROM slow_table_{idx}",
+                idx + 1
+            )
+            .expect("format fixture line");
+        }
+        std::fs::write(&log, content).expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.slow_queries.len(), 16);
+        let parser_drop = batch
+            .gaps
+            .iter()
+            .find(|gap| gap.reason == GapReason::ParserDrop)
+            .expect("parser drop gap");
+        assert_eq!(parser_drop.parser_dropped_lines, 2);
+    }
+
+    #[tokio::test]
+    async fn collects_lifecycle_events_with_crash_detail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:05:00 UTC [1]: LOG:  server process (PID 4242) was terminated by signal 9: Killed\n\
+             2026-07-05 12:05:00 UTC [1]: DETAIL:  Failed process was running: SELECT pg_sleep(10)\n\
+             \tFROM lifecycle_probe\n\
+             2026-07-05 12:05:01 UTC [1]: LOG:  received fast shutdown request\n\
+             2026-07-05 12:05:02 UTC [1]: LOG:  database system is ready to accept connections\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.errors.len(), 1);
+        assert_eq!(batch.lifecycles.len(), 3);
+        let crash = batch
+            .lifecycles
+            .iter()
+            .find(|event| event.kind == LifecycleKind::Crash)
+            .expect("crash lifecycle");
+        assert_eq!(crash.pid, Some(4242));
+        assert_eq!(crash.signal, Some(9));
+        assert_eq!(
+            crash.query_detail.as_deref(),
+            Some("SELECT pg_sleep(10) FROM lifecycle_probe")
+        );
+        let shutdown = batch
+            .lifecycles
+            .iter()
+            .find(|event| event.kind == LifecycleKind::Shutdown)
+            .expect("shutdown lifecycle");
+        assert_eq!(shutdown.shutdown_mode.as_deref(), Some("fast"));
+        assert!(
+            batch
+                .lifecycles
+                .iter()
+                .any(|event| event.kind == LifecycleKind::Ready)
+        );
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "expected {actual} to be close to {expected}"
+        );
     }
 
     #[tokio::test]
