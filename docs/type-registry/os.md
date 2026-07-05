@@ -7,8 +7,15 @@ loadavg, vmstat, PSI). Каждая строка несёт колонку `scop
 `0=host, 1=pod, 2=pod_net, 3=container, 4=unknown`); в Wave 1 procfs-core
 файлы протекают host-wide в контейнере, поэтому их `scope` = `host`.
 Корень procfs переопределяется `KRONIKA_PROC_ROOT` (по умолчанию `/proc`),
-период — `KRONIKA_OS_CORE_INTERVAL_S` (по умолчанию 10 с). Остальные ОС-типы
-(processes, диск, сеть, cgroup) — следующие волны.
+период — `KRONIKA_OS_CORE_INTERVAL_S` (по умолчанию 10 с).
+
+**Реализовано (Wave 2):** `1_108_001`-`1_113_001` (diskstats, net/dev,
+net/snmp, net/netstat, mountinfo, topology). Scope-значения: diskstats
+(`1_108_001`), mountinfo (`1_112_001`) и topology (`1_113_001`) несут
+`scope=host` (данные уровня устройства/узла); сетевые секции (`1_109_001`,
+`1_110_001`, `1_111_001`) несут `scope=pod_net`, когда обнаружен контейнер
+(через cgroup), иначе `scope=host`. Остальные ОС-типы (processes, cgroup) —
+следующие волны.
 
 ## Сводная таблица
 
@@ -26,8 +33,8 @@ loadavg, vmstat, PSI). Каждая строка несёт колонку `scop
 | `1_109_001` | `/proc/net/dev` | базовый шаг | `snapshot_full` | `(iface, ts)` |
 | `1_110_001` | `/proc/net/snmp` | базовый шаг | `snapshot_full` | `(ts)` |
 | `1_111_001` | `/proc/net/netstat` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_112_001` | `mountinfo` | сегмент + по изменению | `on_change` | `(major, minor, mount_point)` |
-| `1_113_001` | `cpuinfo` / topology | сегмент + по изменению | `on_change` | `(cpu_id)` |
+| `1_112_001` | `mountinfo` | сегмент + по изменению | `on_change` | `(major, minor, mount_point, ts)` |
+| `1_113_001` | `cpuinfo` / topology | сегмент + по изменению | `on_change` | `(cpu_id, ts)` |
 | `1_200_001` | cgroup: process mapping | 30 с | `snapshot_full` | `(pid, starttime, ts)` |
 | `1_201_001` | cgroup: cpu | базовый шаг | `snapshot_full` | `(cgroup_path, ts)` |
 | `1_202_001` | cgroup: memory | базовый шаг | `snapshot_full` | `(cgroup_path, ts)` |
@@ -266,8 +273,8 @@ scope         u8   L   // 0=host в Wave 1
 
 ```text
 ts                   ts    T
-major                u32   L
-minor                u32   L
+major                i32   L
+minor                i32   L
 device               str   L
 reads                i64   C
 r_merged             i64   C
@@ -286,6 +293,7 @@ discard_sectors      i64?  C
 discard_time_ms      i64?  C
 flushes              i64?  C
 flush_time_ms        i64?  C
+scope                u8    L   // 0=host в Wave 2
 ```
 
 ## `1_109_001` `/proc/net/dev`
@@ -311,6 +319,7 @@ tx_fifo        i64  C
 tx_colls       i64  C
 tx_carrier     i64  C
 tx_compressed  i64  C
+scope          u8   L   // 0=host или 2=pod_net в Wave 2
 ```
 
 ## `1_110_001` `/proc/net/snmp`
@@ -333,6 +342,7 @@ udp_in_datagrams   i64  C
 udp_out_datagrams  i64  C
 udp_in_errors      i64  C
 udp_no_ports       i64  C
+scope              u8   L   // 0=host или 2=pod_net в Wave 2
 ```
 
 ## `1_111_001` `/proc/net/netstat`
@@ -348,6 +358,7 @@ tcp_fast_retrans       i64  C
 tcp_slow_start_retrans i64  C
 tcp_ofo_queue          i64  C
 tcp_syn_retrans        i64  C
+scope                  u8   L   // 0=host или 2=pod_net в Wave 2
 ```
 
 Расширение остальными ключами требует проверки совместимости. При несовместимом
@@ -356,36 +367,50 @@ tcp_syn_retrans        i64  C
 ## `1_112_001` `mountinfo`
 
 `on_change`, политика материализации `every_segment_last_known`. Нужен для
-атрибуции `diskstats` к точкам монтирования, поэтому актуальная копия пишется в
-каждый сегмент даже без изменений.
+атрибуции `diskstats` к точкам монтирования, поэтому актуальная копия полной
+таблицы mountinfo пишется в каждый сегмент даже без изменений. Wave 2 добавляет
+ёмкость ФС (`total_bytes`, `free_bytes`) через `statvfs(2)`: `NULL`, когда
+вызов не удался. Одна строка соответствует одной записи
+`/proc/self/mountinfo`; несколько mount points одного `(major, minor)` не
+схлопываются.
 
 Учитываются:
 
-- btrfs/ZFS, где subvolume может иметь `major=0`, но реальный источник — `/dev`;
+- btrfs/ZFS, где subvolume может иметь `major=0`, но прямой источник
+  `/dev/<block>` позволяет восстановить реальный device через `/sys`;
 - фильтрация инфраструктурных Kubernetes bind-mount вроде `/etc/hosts`, чтобы
   не приписывать I/O всего узла контейнеру.
 
 ```text
 ts             ts    T
-major          u32   L
-minor          u32   L
+major          i32   L
+minor          i32   L
 mount_point    str   L
 fstype         str   L
 source         str   L
 is_k8s_infra   bool  L
+total_bytes    i64?  G   // NULL когда statvfs не удался
+free_bytes     i64?  G   // NULL когда statvfs не удался
+scope          u8    L
 ```
 
 ## `1_113_001` `cpuinfo` / topology
 
 `on_change`, политика материализации `every_segment_last_known`.
+`SEGMENT_OPEN_SOURCES` заново помечает mountinfo и topology к отправке при
+открытии сегмента. `mhz_max` берётся из
+`/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq` и пишется в MHz;
+`NULL`, если sysfs не раскрывает максимум для CPU. Поле не заполняется из
+`/proc/cpuinfo` `cpu MHz`, потому что это текущее значение на части систем.
 
 ```text
 ts          ts   T
 cpu_id      i32  L
 model_name  str  L
-mhz_max     f64  L
+mhz_max     f64? L
 core_id     i32  L
 socket_id   i32  L
+scope       u8   L
 ```
 
 ## cgroup `1_200_001` - `1_204_001`

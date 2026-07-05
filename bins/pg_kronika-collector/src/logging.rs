@@ -354,6 +354,7 @@ const fn source_kind_name(kind: SourceKind) -> &'static str {
         SourceKind::InstanceMetadata => "instance_metadata",
         SourceKind::Settings => "settings",
         SourceKind::OsCore => "os_core",
+        SourceKind::OsMountTopo => "os_mount_topo",
     }
 }
 
@@ -379,7 +380,8 @@ pub(crate) fn log_source_deferred(kind: SourceKind, major: u32) {
         | SourceKind::ResetMetadata
         | SourceKind::InstanceMetadata
         | SourceKind::Settings
-        | SourceKind::OsCore => {}
+        | SourceKind::OsCore
+        | SourceKind::OsMountTopo => {}
     }
     log_event(LogLevel::Debug, "collection_deferred", &fields);
 }

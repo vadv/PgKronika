@@ -42,21 +42,54 @@ pub(crate) fn detect_container_from_cgroup(cgroup: &str) -> bool {
 }
 
 /// Multi-signal container detection.
+///
+/// When `KRONIKA_PROC_ROOT` is set (BDD fixtures or a node-agent pointed at
+/// `/host/proc`), detection uses only the cgroup file read through that root.
+/// The `/.dockerenv` and `KUBERNETES_SERVICE_HOST` signals describe the
+/// collector's own packaging, not the root it is observing, so they are
+/// skipped in that case.
+///
+/// When `KRONIKA_PROC_ROOT` is absent (default `/proc`), all three signals
+/// are checked, matching Wave 1 production behavior.
 #[must_use]
 pub fn detect_container(fs: &ProcFs) -> bool {
-    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        return true;
-    }
-    if std::path::Path::new("/.dockerenv").exists() {
-        return true;
+    let proc_root_overridden = std::env::var_os("KRONIKA_PROC_ROOT").is_some();
+    if !proc_root_overridden {
+        if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+            return true;
+        }
+        if std::path::Path::new("/.dockerenv").exists() {
+            return true;
+        }
     }
     fs.read_raw("1/cgroup")
         .is_ok_and(|c| detect_container_from_cgroup(&c))
 }
 
+/// Maps the container flag to the appropriate network scope.
+///
+/// Pure function; tests can avoid env/filesystem non-determinism.
+#[must_use]
+pub(crate) const fn scope_for_net(in_container: bool) -> OsScope {
+    if in_container {
+        OsScope::PodNet
+    } else {
+        OsScope::Host
+    }
+}
+
+/// Scope for `/proc/net/*` sections.
+///
+/// Returns `PodNet` inside a container (the file describes the pod's network
+/// namespace, not the node's), `Host` otherwise.
+#[must_use]
+pub fn net_scope(fs: &ProcFs) -> OsScope {
+    scope_for_net(detect_container(fs))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OsScope, detect_container_from_cgroup};
+    use super::{OsScope, detect_container_from_cgroup, scope_for_net};
 
     #[test]
     fn scope_encodes_as_stable_u8() {
@@ -73,5 +106,11 @@ mod tests {
         assert!(detect_container_from_cgroup("0::/kubepods/pod123/abc\n"));
         assert!(detect_container_from_cgroup("12:pids:/docker/deadbeef\n"));
         assert!(!detect_container_from_cgroup("0::/init.scope\n"));
+    }
+
+    #[test]
+    fn scope_for_net_maps_container_flag() {
+        assert_eq!(scope_for_net(true), OsScope::PodNet);
+        assert_eq!(scope_for_net(false), OsScope::Host);
     }
 }
