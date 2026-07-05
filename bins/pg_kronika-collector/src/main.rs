@@ -832,7 +832,7 @@ async fn run_collection_cycle(
             "pool_reconnect_failure",
             &[field("source", "main"), field("error", format!("{err:#}"))],
         );
-        if due.has(SourceKind::PgLog) && log_collector.enabled() {
+        if due.has(SourceKind::PgLog) {
             match run_log_only_cycle(log_collector, journal, config, due, segment).await {
                 Ok(sealed) => {
                     for (dest, reason) in sealed {
@@ -3595,7 +3595,7 @@ async fn snapshot_and_seal(
     // info views through the same connections those sections use.
     let service =
         collect_service_sections(pool, major, config, statements_cache, plans_cache, due).await?;
-    let mut log_collection = if due.has(SourceKind::PgLog) && log_collector.enabled() {
+    let mut log_collection = if due.has(SourceKind::PgLog) {
         Some(collect_log_batch(log_collector, Some(pool.main()), main_src.ts.0).await)
     } else {
         None
@@ -3805,6 +3805,18 @@ fn push_log_error(
         .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
     let pattern = intern_log_text(interner, &error.pattern, MAX_PATTERN_BYTES, &mut dropped);
     let sample = intern_log_text(interner, &error.sample, MAX_TEXT_BYTES, &mut dropped);
+    let detail = error
+        .detail
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let hint = error
+        .hint
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let context = error
+        .context
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
     let statement = error
         .statement
         .as_deref()
@@ -3819,6 +3831,9 @@ fn push_log_error(
             pattern,
             count: error.count,
             sample,
+            detail,
+            hint,
+            context,
             statement,
             database: None,
             username: None,

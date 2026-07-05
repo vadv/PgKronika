@@ -41,3 +41,25 @@ Feature: PostgreSQL log-domain stderr fixtures
       | severity | 3 |
       | category | 6 |
       | count    | 1 |
+
+  @pg16 @serial
+  Scenario: deadlock DETAIL HINT CONTEXT stay out of statement text
+    Given a fresh database on PostgreSQL 16
+    And a PostgreSQL stderr log fixture:
+      """
+      2026-07-05 12:02:00 UTC [1]: ERROR:  deadlock detected
+      2026-07-05 12:02:00 UTC [1]: DETAIL:  Process 111 waits for ShareLock on transaction 10; blocked by process 222.
+        Process 222 waits for ShareLock on transaction 11; blocked by process 111.
+      2026-07-05 12:02:00 UTC [1]: HINT:  See server log for query details.
+      2026-07-05 12:02:00 UTC [1]: CONTEXT:  while updating tuple (0,1) in relation "deadlock_probe"
+      2026-07-05 12:02:00 UTC [1]: STATEMENT:  UPDATE deadlock_probe SET id = id WHERE id = 1
+      """
+    When the collector snapshots the segment
+    Then section 1_022_001 has a row with pattern = "deadlock detected":
+      | severity  | 0                                                                                                                                              |
+      | category  | 0                                                                                                                                              |
+      | count     | 1                                                                                                                                              |
+      | detail    | Process 111 waits for ShareLock on transaction 10; blocked by process 222. Process 222 waits for ShareLock on transaction 11; blocked by process 111. |
+      | hint      | See server log for query details.                                                                                                               |
+      | context   | while updating tuple (0,1) in relation "deadlock_probe"                                                                                         |
+      | statement | UPDATE deadlock_probe SET id = id WHERE id = 1                                                                                                  |
