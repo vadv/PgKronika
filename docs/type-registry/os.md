@@ -97,7 +97,7 @@ net/snmp, net/netstat, mountinfo, topology). Scope-значения: diskstats
 ```text
 ts                      ts    T
 pid                     i32   L
-starttime               ts    L   // btime + jiffies
+starttime               ts    L   // btime + start ticks / hz
 ppid                    i32   L
 uid                     u32   L
 euid                    u32   L
@@ -446,9 +446,16 @@ scope       u8   L
 - `cpuacct.usage` ns -> usec;
 - `cpuacct.stat` ticks -> usec через `hz`;
 - `throttled_time` ns -> usec;
-- `memory.stat` `rss/cache/slab/kernel_stack/total_*` -> `anon/file/slab/kernel`;
+- `memory.stat` `rss/cache/slab/kernel_stack/total_*` -> `anon/file/slab/kernel`,
+  где `kernel = slab + kernel_stack`;
 - `memory.failcnt` -> `max_events`;
 - `blkio.throttle.io_service_bytes` и `io_serviced` -> `rbytes/wbytes/rios/wios`.
+
+Для cgroup v1 диагностический `collection_degraded reason=cgroup_cap` считает
+переполнение controller-tree обходов. Когда v1 controller-деревья содержат
+одни и те же cgroup paths, поле `dropped` может быть выше числа уникальных
+неэмитированных `cgroup_path`; лимит на фактически эмитированные строки всё
+равно применяется по уникальным путям.
 
 Лимиты считаются данными, а не метаданными: квоты могут меняться на лету,
 например при Kubernetes VPA.
@@ -514,9 +521,10 @@ scope        u8   L   // 0=host или 3=container в Wave 3
 ```
 
 В cgroup v2 значение `max` может быть строкой `max`; в PGM это `NULL`. В
-cgroup v1 событий `low/high/oom/oom_kill` нет, поэтому эти счётчики остаются
-нулевыми; строка создаётся только когда есть обязательный controller-файл
-`memory.usage_in_bytes`.
+cgroup v1 событий `low/high/oom/oom_kill` нет, поэтому эти non-nullable
+счётчики остаются нулевыми. Поле `kernel` в v1 не имеет прямого аналога и
+вычисляется как `slab + kernel_stack`. Строка создаётся только когда есть
+обязательный controller-файл `memory.usage_in_bytes`.
 
 ### `1_203_001` cgroup io
 
