@@ -1,8 +1,76 @@
 //! Reader for a `/proc` tree whose root is overridable for tests and for
 //! host-mounted deployments.
+//!
+//! Also provides [`statvfs`] for filesystem capacity queries.
 
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+
+/// Filesystem capacity at a mount point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsSpace {
+    /// Total filesystem size in bytes (`f_blocks * f_frsize`).
+    pub total_bytes: i64,
+    /// Available bytes for unprivileged writes (`f_bavail * f_frsize`).
+    pub free_bytes: i64,
+}
+
+/// Convert raw `statvfs` fields to [`FsSpace`].
+///
+/// Saturates to `i64::MAX` when the product exceeds `i64::MAX` so that
+/// very large filesystems never wrap or panic.
+#[must_use]
+pub fn space_from_raw(blocks: u64, bavail: u64, frsize: u64) -> FsSpace {
+    let saturating_mul = |a: u64, b: u64| -> i64 {
+        a.saturating_mul(b)
+            .min(i64::MAX as u64)
+            .try_into()
+            .unwrap_or(i64::MAX)
+    };
+    FsSpace {
+        total_bytes: saturating_mul(blocks, frsize),
+        free_bytes: saturating_mul(bavail, frsize),
+    }
+}
+
+/// Query filesystem capacity for `mount_point`.
+///
+/// **Env fixture override:** if `KRONIKA_STATVFS_FIXTURE` is set, its value
+/// is parsed as `path1=TOTAL:FREE;path2=TOTAL:FREE` (bytes, decimal). The
+/// entry whose path equals `mount_point` is returned; no entry → `None`.
+/// This lets BDD tests inject deterministic capacity without a real filesystem.
+///
+/// Otherwise calls `statvfs(2)` and maps success via [`space_from_raw`].
+/// Returns `None` on any syscall error — a mount can vanish mid-scan.
+#[must_use]
+pub fn statvfs(mount_point: &str) -> Option<FsSpace> {
+    if let Ok(fixture) = std::env::var("KRONIKA_STATVFS_FIXTURE") {
+        return parse_fixture(&fixture, mount_point);
+    }
+    rustix::fs::statvfs(mount_point)
+        .ok()
+        .map(|s| space_from_raw(s.f_blocks, s.f_bavail, s.f_frsize))
+}
+
+pub(crate) fn parse_fixture(fixture: &str, mount_point: &str) -> Option<FsSpace> {
+    for entry in fixture.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (path, rest) = entry.split_once('=')?;
+        let (total_str, free_str) = rest.split_once(':')?;
+        if path == mount_point {
+            let total_bytes = total_str.trim().parse().ok()?;
+            let free_bytes = free_str.trim().parse().ok()?;
+            return Some(FsSpace {
+                total_bytes,
+                free_bytes,
+            });
+        }
+    }
+    None
+}
 
 /// Maximum bytes read from one procfs file.
 ///
@@ -92,8 +160,51 @@ fn tag_io_error(rel: &str, err: &io::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::ProcFs;
+    use super::{FsSpace, ProcFs, parse_fixture, space_from_raw};
     use std::io::Write;
+
+    #[test]
+    fn space_from_raw_normal() {
+        let s = space_from_raw(1000, 400, 4096);
+        assert_eq!(s.total_bytes, 1000 * 4096);
+        assert_eq!(s.free_bytes, 400 * 4096);
+    }
+
+    #[test]
+    fn space_from_raw_overflow_saturates() {
+        let s = space_from_raw(u64::MAX, u64::MAX, 4096);
+        assert_eq!(s.total_bytes, i64::MAX);
+        assert_eq!(s.free_bytes, i64::MAX);
+    }
+
+    #[test]
+    fn statvfs_fixture_hit() {
+        assert_eq!(
+            parse_fixture("/data=1000:400", "/data"),
+            Some(FsSpace {
+                total_bytes: 1000,
+                free_bytes: 400
+            })
+        );
+    }
+
+    #[test]
+    fn statvfs_fixture_miss() {
+        assert_eq!(parse_fixture("/data=1000:400", "/other"), None);
+    }
+
+    #[test]
+    fn statvfs_fixture_multiple_entries() {
+        let fixture = "/data=1000:400;/var=2048:512";
+        assert_eq!(
+            parse_fixture(fixture, "/var"),
+            Some(FsSpace {
+                total_bytes: 2048,
+                free_bytes: 512
+            })
+        );
+        assert_eq!(parse_fixture(fixture, "/missing"), None);
+    }
 
     #[test]
     fn reads_relative_path_under_root() {
