@@ -355,6 +355,10 @@ const fn source_kind_name(kind: SourceKind) -> &'static str {
         SourceKind::Settings => "settings",
         SourceKind::OsCore => "os_core",
         SourceKind::OsMountTopo => "os_mount_topo",
+        SourceKind::OsProcesses => "os_processes",
+        SourceKind::OsProcessStatus => "os_process_status",
+        SourceKind::OsCgroup => "os_cgroup",
+        SourceKind::OsCgroupMapping => "os_cgroup_mapping",
     }
 }
 
@@ -381,7 +385,11 @@ pub(crate) fn log_source_deferred(kind: SourceKind, major: u32) {
         | SourceKind::InstanceMetadata
         | SourceKind::Settings
         | SourceKind::OsCore
-        | SourceKind::OsMountTopo => {}
+        | SourceKind::OsMountTopo
+        | SourceKind::OsProcesses
+        | SourceKind::OsProcessStatus
+        | SourceKind::OsCgroup
+        | SourceKind::OsCgroupMapping => {}
     }
     log_event(LogLevel::Debug, "collection_deferred", &fields);
 }
