@@ -111,8 +111,10 @@ use kronika_registry::os_netstat::OsNetstat;
 use kronika_registry::os_psi::OsPsi;
 use kronika_registry::os_snmp::OsSnmp;
 use kronika_registry::os_stat::OsStat;
+use kronika_registry::os_topology::OsTopology;
 use kronika_registry::os_vmstat::OsVmstat;
 use kronika_registry::{MAX_SECTION_ROWS, StrId, Ts};
+use kronika_source_os::proc::cpuinfo;
 use kronika_source_os::proc::loadavg::parse_loadavg;
 use kronika_source_os::proc::meminfo::parse_meminfo;
 use kronika_source_os::proc::pressure::parse_pressure;
@@ -401,6 +403,7 @@ fn intervals_from_env() -> Result<Intervals> {
         instance_metadata: env_u64("KRONIKA_INSTANCE_INTERVAL_S", defaults.instance_metadata)?,
         settings: env_u64("KRONIKA_PG_SETTINGS_INTERVAL_S", defaults.settings)?,
         os_core: env_u64("KRONIKA_OS_CORE_INTERVAL_S", defaults.os_core)?,
+        os_mount_topo: env_u64("KRONIKA_OS_MOUNTTOPO_INTERVAL_S", defaults.os_mount_topo)?,
     })
 }
 
@@ -2304,6 +2307,7 @@ struct OsSources {
     snmp: Option<OsSnmp>,
     netstat: Option<OsNetstat>,
     mountinfo: Vec<OsMountinfo>,
+    topology: Vec<OsTopology>,
 }
 
 impl OsSources {
@@ -2320,6 +2324,7 @@ impl OsSources {
             snmp: None,
             netstat: None,
             mountinfo: Vec::new(),
+            topology: Vec::new(),
         }
     }
 }
@@ -2347,10 +2352,13 @@ fn read_optional_os_file(fs: &ProcFs, rel: &'static str, type_id: u32) -> Option
 
 /// Read every procfs OS section synchronously.
 ///
-/// All reads are gated on `due.has(SourceKind::OsCore)`. On file read or parse
-/// failure the affected section is skipped and a `collection_degraded` event is
-/// logged; zeros are never fabricated. `scope` is the host scope for
-/// device-local sections; network sections carry their own `net_scope`.
+/// Counter sections (cpu, stat, meminfo, loadavg, vmstat, psi, diskstats,
+/// netdev) are gated on `due.has(SourceKind::OsCore)`. The slow-cadence
+/// sections (mountinfo, topology) are gated on `due.has(SourceKind::OsMountTopo)`.
+/// On file read or parse failure the affected section is skipped and a
+/// `collection_degraded` event is logged; zeros are never fabricated. `scope`
+/// is the host scope for device-local sections; network sections carry their
+/// own `net_scope`.
 ///
 /// The `interner` is the segment's interner: device, interface, and mount
 /// strings are interned here so the built rows already hold their `StrId`s.
@@ -2366,100 +2374,120 @@ fn collect_os_sources(
     in_container: bool,
     due: &DueSet,
 ) -> OsSources {
-    if !due.has(SourceKind::OsCore) {
+    if !due.has(SourceKind::OsCore) && !due.has(SourceKind::OsMountTopo) {
         return OsSources::empty();
     }
 
     let mut os = OsSources::empty();
 
-    // stat — read once, feed to both cpu and stat-misc parsers.
-    let stat_started = Instant::now();
-    match fs.read("stat") {
-        Ok(content) => {
-            // CPU rows (1_102_001)
-            let cpu_type_id = 1_102_001_u32;
-            match parse_cpu(&content, ts) {
-                Ok(rows) => {
-                    let n = rows.len();
-                    os.cpu = rows.into_iter().map(|r| r.to_section(scope)).collect();
-                    log_collection_finish(cpu_type_id, "procfs", n, stat_started.elapsed());
+    if due.has(SourceKind::OsCore) {
+        // stat — read once, feed to both cpu and stat-misc parsers.
+        let stat_started = Instant::now();
+        match fs.read("stat") {
+            Ok(content) => {
+                // CPU rows (1_102_001)
+                let cpu_type_id = 1_102_001_u32;
+                match parse_cpu(&content, ts) {
+                    Ok(rows) => {
+                        let n = rows.len();
+                        os.cpu = rows.into_iter().map(|r| r.to_section(scope)).collect();
+                        log_collection_finish(cpu_type_id, "procfs", n, stat_started.elapsed());
+                    }
+                    Err(err) => {
+                        log_event(
+                            LogLevel::Warn,
+                            "collection_degraded",
+                            &[
+                                field("collection", section_name(cpu_type_id)),
+                                field("type_id", cpu_type_id),
+                                field("layout_id", layout_id(cpu_type_id)),
+                                field("source", "stat"),
+                                field("reason", &err.0),
+                            ],
+                        );
+                    }
                 }
-                Err(err) => {
-                    log_event(
-                        LogLevel::Warn,
-                        "collection_degraded",
-                        &[
-                            field("collection", section_name(cpu_type_id)),
-                            field("type_id", cpu_type_id),
-                            field("layout_id", layout_id(cpu_type_id)),
-                            field("source", "stat"),
-                            field("reason", &err.0),
-                        ],
-                    );
+                // Stat-misc row (1_103_001) — same content, separate parser.
+                // Its own clock so the reported latency excludes the CPU parse above.
+                let stat_misc_started = Instant::now();
+                let stat_type_id = 1_103_001_u32;
+                match parse_stat_misc(&content, ts) {
+                    Ok(row) => {
+                        os.stat = Some(row.to_section(scope));
+                        log_collection_finish(
+                            stat_type_id,
+                            "procfs",
+                            1,
+                            stat_misc_started.elapsed(),
+                        );
+                    }
+                    Err(err) => {
+                        log_event(
+                            LogLevel::Warn,
+                            "collection_degraded",
+                            &[
+                                field("collection", section_name(stat_type_id)),
+                                field("type_id", stat_type_id),
+                                field("layout_id", layout_id(stat_type_id)),
+                                field("source", "stat"),
+                                field("reason", &err.0),
+                            ],
+                        );
+                    }
                 }
             }
-            // Stat-misc row (1_103_001) — same content, separate parser.
-            // Its own clock so the reported latency excludes the CPU parse above.
-            let stat_misc_started = Instant::now();
-            let stat_type_id = 1_103_001_u32;
-            match parse_stat_misc(&content, ts) {
-                Ok(row) => {
-                    os.stat = Some(row.to_section(scope));
-                    log_collection_finish(stat_type_id, "procfs", 1, stat_misc_started.elapsed());
-                }
-                Err(err) => {
-                    log_event(
-                        LogLevel::Warn,
-                        "collection_degraded",
-                        &[
-                            field("collection", section_name(stat_type_id)),
-                            field("type_id", stat_type_id),
-                            field("layout_id", layout_id(stat_type_id)),
-                            field("source", "stat"),
-                            field("reason", &err.0),
-                        ],
-                    );
-                }
+            Err(err) => {
+                let cpu_type_id = 1_102_001_u32;
+                let stat_type_id = 1_103_001_u32;
+                log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(cpu_type_id)),
+                        field("type_id", cpu_type_id),
+                        field("layout_id", layout_id(cpu_type_id)),
+                        field("source", "stat"),
+                        field("reason", &err),
+                    ],
+                );
+                log_event(
+                    LogLevel::Warn,
+                    "collection_degraded",
+                    &[
+                        field("collection", section_name(stat_type_id)),
+                        field("type_id", stat_type_id),
+                        field("layout_id", layout_id(stat_type_id)),
+                        field("source", "stat"),
+                        field("reason", &err),
+                    ],
+                );
             }
         }
-        Err(err) => {
-            let cpu_type_id = 1_102_001_u32;
-            let stat_type_id = 1_103_001_u32;
-            log_event(
-                LogLevel::Warn,
-                "collection_degraded",
-                &[
-                    field("collection", section_name(cpu_type_id)),
-                    field("type_id", cpu_type_id),
-                    field("layout_id", layout_id(cpu_type_id)),
-                    field("source", "stat"),
-                    field("reason", &err),
-                ],
-            );
-            log_event(
-                LogLevel::Warn,
-                "collection_degraded",
-                &[
-                    field("collection", section_name(stat_type_id)),
-                    field("type_id", stat_type_id),
-                    field("layout_id", layout_id(stat_type_id)),
-                    field("source", "stat"),
-                    field("reason", &err),
-                ],
-            );
-        }
-    }
 
-    // meminfo (1_104_001)
-    {
-        let type_id = 1_104_001_u32;
-        let started = Instant::now();
-        match fs.read("meminfo") {
-            Ok(content) => match parse_meminfo(&content, ts) {
-                Ok(row) => {
-                    os.meminfo = Some(row.to_section(scope));
-                    log_collection_finish(type_id, "procfs", 1, started.elapsed());
-                }
+        // meminfo (1_104_001)
+        {
+            let type_id = 1_104_001_u32;
+            let started = Instant::now();
+            match fs.read("meminfo") {
+                Ok(content) => match parse_meminfo(&content, ts) {
+                    Ok(row) => {
+                        os.meminfo = Some(row.to_section(scope));
+                        log_collection_finish(type_id, "procfs", 1, started.elapsed());
+                    }
+                    Err(err) => {
+                        log_event(
+                            LogLevel::Warn,
+                            "collection_degraded",
+                            &[
+                                field("collection", section_name(type_id)),
+                                field("type_id", type_id),
+                                field("layout_id", layout_id(type_id)),
+                                field("source", "meminfo"),
+                                field("reason", &err.0),
+                            ],
+                        );
+                    }
+                },
                 Err(err) => {
                     log_event(
                         LogLevel::Warn,
@@ -2469,37 +2497,37 @@ fn collect_os_sources(
                             field("type_id", type_id),
                             field("layout_id", layout_id(type_id)),
                             field("source", "meminfo"),
-                            field("reason", &err.0),
+                            field("reason", &err),
                         ],
                     );
                 }
-            },
-            Err(err) => {
-                log_event(
-                    LogLevel::Warn,
-                    "collection_degraded",
-                    &[
-                        field("collection", section_name(type_id)),
-                        field("type_id", type_id),
-                        field("layout_id", layout_id(type_id)),
-                        field("source", "meminfo"),
-                        field("reason", &err),
-                    ],
-                );
             }
         }
-    }
 
-    // loadavg (1_105_001)
-    {
-        let type_id = 1_105_001_u32;
-        let started = Instant::now();
-        match fs.read("loadavg") {
-            Ok(content) => match parse_loadavg(&content, ts) {
-                Ok(row) => {
-                    os.loadavg = Some(row.to_section(scope));
-                    log_collection_finish(type_id, "procfs", 1, started.elapsed());
-                }
+        // loadavg (1_105_001)
+        {
+            let type_id = 1_105_001_u32;
+            let started = Instant::now();
+            match fs.read("loadavg") {
+                Ok(content) => match parse_loadavg(&content, ts) {
+                    Ok(row) => {
+                        os.loadavg = Some(row.to_section(scope));
+                        log_collection_finish(type_id, "procfs", 1, started.elapsed());
+                    }
+                    Err(err) => {
+                        log_event(
+                            LogLevel::Warn,
+                            "collection_degraded",
+                            &[
+                                field("collection", section_name(type_id)),
+                                field("type_id", type_id),
+                                field("layout_id", layout_id(type_id)),
+                                field("source", "loadavg"),
+                                field("reason", &err.0),
+                            ],
+                        );
+                    }
+                },
                 Err(err) => {
                     log_event(
                         LogLevel::Warn,
@@ -2509,37 +2537,37 @@ fn collect_os_sources(
                             field("type_id", type_id),
                             field("layout_id", layout_id(type_id)),
                             field("source", "loadavg"),
-                            field("reason", &err.0),
+                            field("reason", &err),
                         ],
                     );
                 }
-            },
-            Err(err) => {
-                log_event(
-                    LogLevel::Warn,
-                    "collection_degraded",
-                    &[
-                        field("collection", section_name(type_id)),
-                        field("type_id", type_id),
-                        field("layout_id", layout_id(type_id)),
-                        field("source", "loadavg"),
-                        field("reason", &err),
-                    ],
-                );
             }
         }
-    }
 
-    // vmstat (1_106_001)
-    {
-        let type_id = 1_106_001_u32;
-        let started = Instant::now();
-        match fs.read("vmstat") {
-            Ok(content) => match parse_vmstat(&content, ts) {
-                Ok(row) => {
-                    os.vmstat = Some(row.to_section(scope));
-                    log_collection_finish(type_id, "procfs", 1, started.elapsed());
-                }
+        // vmstat (1_106_001)
+        {
+            let type_id = 1_106_001_u32;
+            let started = Instant::now();
+            match fs.read("vmstat") {
+                Ok(content) => match parse_vmstat(&content, ts) {
+                    Ok(row) => {
+                        os.vmstat = Some(row.to_section(scope));
+                        log_collection_finish(type_id, "procfs", 1, started.elapsed());
+                    }
+                    Err(err) => {
+                        log_event(
+                            LogLevel::Warn,
+                            "collection_degraded",
+                            &[
+                                field("collection", section_name(type_id)),
+                                field("type_id", type_id),
+                                field("layout_id", layout_id(type_id)),
+                                field("source", "vmstat"),
+                                field("reason", &err.0),
+                            ],
+                        );
+                    }
+                },
                 Err(err) => {
                     log_event(
                         LogLevel::Warn,
@@ -2549,43 +2577,46 @@ fn collect_os_sources(
                             field("type_id", type_id),
                             field("layout_id", layout_id(type_id)),
                             field("source", "vmstat"),
-                            field("reason", &err.0),
+                            field("reason", &err),
                         ],
                     );
                 }
-            },
-            Err(err) => {
-                log_event(
-                    LogLevel::Warn,
-                    "collection_degraded",
-                    &[
-                        field("collection", section_name(type_id)),
-                        field("type_id", type_id),
-                        field("layout_id", layout_id(type_id)),
-                        field("source", "vmstat"),
-                        field("reason", &err),
-                    ],
-                );
             }
         }
-    }
 
-    // PSI — cpu/memory/io as Option<String>; missing file → None (1_107_001)
-    {
-        let type_id = 1_107_001_u32;
-        let started = Instant::now();
-        let psi_cpu = read_optional_os_file(fs, "pressure/cpu", type_id);
-        let psi_memory = read_optional_os_file(fs, "pressure/memory", type_id);
-        let psi_io = read_optional_os_file(fs, "pressure/io", type_id);
-        match parse_pressure(
-            psi_cpu.as_deref(),
-            psi_memory.as_deref(),
-            psi_io.as_deref(),
-            ts,
-        ) {
-            Ok(rows) => {
-                let n = rows.len();
-                if n == 0 {
+        // PSI — cpu/memory/io as Option<String>; missing file → None (1_107_001)
+        {
+            let type_id = 1_107_001_u32;
+            let started = Instant::now();
+            let psi_cpu = read_optional_os_file(fs, "pressure/cpu", type_id);
+            let psi_memory = read_optional_os_file(fs, "pressure/memory", type_id);
+            let psi_io = read_optional_os_file(fs, "pressure/io", type_id);
+            match parse_pressure(
+                psi_cpu.as_deref(),
+                psi_memory.as_deref(),
+                psi_io.as_deref(),
+                ts,
+            ) {
+                Ok(rows) => {
+                    let n = rows.len();
+                    if n == 0 {
+                        log_event(
+                            LogLevel::Warn,
+                            "collection_degraded",
+                            &[
+                                field("collection", section_name(type_id)),
+                                field("type_id", type_id),
+                                field("layout_id", layout_id(type_id)),
+                                field("source", "pressure/{cpu,memory,io}"),
+                                field("reason", "no pressure files available"),
+                            ],
+                        );
+                    } else {
+                        os.psi = rows.into_iter().map(|r| r.to_section(scope)).collect();
+                        log_collection_finish(type_id, "procfs", n, started.elapsed());
+                    }
+                }
+                Err(err) => {
                     log_event(
                         LogLevel::Warn,
                         "collection_degraded",
@@ -2594,44 +2625,40 @@ fn collect_os_sources(
                             field("type_id", type_id),
                             field("layout_id", layout_id(type_id)),
                             field("source", "pressure/{cpu,memory,io}"),
-                            field("reason", "no pressure files available"),
+                            field("reason", &err.0),
                         ],
                     );
-                } else {
-                    os.psi = rows.into_iter().map(|r| r.to_section(scope)).collect();
-                    log_collection_finish(type_id, "procfs", n, started.elapsed());
                 }
             }
-            Err(err) => {
-                log_event(
-                    LogLevel::Warn,
-                    "collection_degraded",
-                    &[
-                        field("collection", section_name(type_id)),
-                        field("type_id", type_id),
-                        field("layout_id", layout_id(type_id)),
-                        field("source", "pressure/{cpu,memory,io}"),
-                        field("reason", &err.0),
-                    ],
-                );
-            }
         }
-    }
+    } // end if due.has(SourceKind::OsCore) — stat, meminfo, loadavg, vmstat, psi
 
-    // Wave 2: one mountinfo read serves both the container device filter and
-    // the disk-attribution rows.
+    // Mountinfo is parsed whenever either OsCore or OsMountTopo is due:
+    // OsCore needs it for the container device filter in diskstats;
+    // OsMountTopo needs it to build the attribution section rows.
     let mounts = mountinfo_entries(fs);
 
-    // Counters: disk and network. Network sections carry the pod's
-    // network-namespace scope inside a container, not the host scope.
-    let net_scope_id = net_scope(fs).as_u8();
-    os.diskstats = collect_diskstats(fs, interner, scope, ts, in_container, &mounts);
-    os.netdev = collect_netdev(fs, interner, net_scope_id, ts);
-    collect_net_singletons(fs, net_scope_id, ts, &mut os);
+    if due.has(SourceKind::OsCore) {
+        // Counters: disk and network. Network sections carry the pod's
+        // network-namespace scope inside a container, not the host scope.
+        let net_scope_id = net_scope(fs).as_u8();
+        os.diskstats = collect_diskstats(fs, interner, scope, ts, in_container, &mounts);
+        os.netdev = collect_netdev(fs, interner, net_scope_id, ts);
+        collect_net_singletons(fs, net_scope_id, ts, &mut os);
+    }
 
-    // Attribution: map surviving devices to their mount points and filesystem
-    // capacity. Mount strings are interned here.
-    os.mountinfo = collect_mountinfo(interner, scope, ts, &mounts, &os.diskstats);
+    if due.has(SourceKind::OsMountTopo) {
+        // Ensure os.diskstats is populated for the device lookup inside
+        // collect_mountinfo. On co-occurring OsCore ticks the list is already
+        // filled above; on rare OsMountTopo-only ticks collect it here.
+        if !due.has(SourceKind::OsCore) {
+            os.diskstats = collect_diskstats(fs, interner, scope, ts, in_container, &mounts);
+        }
+        // Attribution rows: surviving diskstats devices mapped to their mount
+        // points and filesystem capacity. Mount strings are interned here.
+        os.mountinfo = collect_mountinfo(interner, scope, ts, &mounts, os.diskstats.as_slice());
+        os.topology = collect_topology(fs, interner, scope, ts);
+    }
 
     os
 }
@@ -2862,6 +2889,34 @@ fn collect_mountinfo(
     rows
 }
 
+/// Read `/proc/cpuinfo` and build one `os_topology` row per logical CPU.
+///
+/// On read or parse failure the section is skipped and a `collection_degraded`
+/// event is logged; zeros are never fabricated.
+fn collect_topology(fs: &ProcFs, interner: &mut Interner, scope: u8, ts: i64) -> Vec<OsTopology> {
+    let type_id = 1_113_001_u32;
+    let started = Instant::now();
+    let Some(content) = read_optional_os_file(fs, "cpuinfo", type_id) else {
+        return Vec::new();
+    };
+    let rows = match cpuinfo::parse(&content) {
+        Ok(rows) => rows,
+        Err(err) => {
+            log_degraded(type_id, "cpuinfo", &err.0);
+            return Vec::new();
+        }
+    };
+    let built: Vec<OsTopology> = rows
+        .iter()
+        .filter_map(|row| {
+            let model_name_id = intern_str(interner, type_id, "cpuinfo", &row.model_name)?;
+            Some(row.to_section(scope, ts, model_name_id))
+        })
+        .collect();
+    log_collection_finish(type_id, "procfs", built.len(), started.elapsed());
+    built
+}
+
 /// Intern one OS string, logging degradation and returning `None` on failure so
 /// the caller skips only the affected row.
 fn intern_str(
@@ -2933,6 +2988,9 @@ fn push_os_sources(buffers: &mut SectionBuffers, os: &OsSources) -> Result<()> {
         buffer_row(buffers, row)?;
     }
     for row in &os.mountinfo {
+        buffer_row(buffers, *row)?;
+    }
+    for row in &os.topology {
         buffer_row(buffers, *row)?;
     }
     Ok(())
