@@ -1,108 +1,8 @@
-//! Collects `PostgreSQL` stats and writes sealed PGM segments.
+//! PostgreSQL collector daemon.
 //!
-//! The daemon runs on the database host. Each collection tick reads the due
-//! `PostgreSQL` sources and appends one journal part when rows exist. The open
-//! segment seals on SIGUSR2, on the raw journal byte cap, or on its max age.
-//! The journal is reset only after a successful seal.
-//!
-//! Environment:
-//! - `KRONIKA_PG_DSN`: libpq connection string (key=value or URI) for the target
-//!   server;
-//! - `KRONIKA_OUT_DIR`: directory that receives sealed segments;
-//! - `KRONIKA_LOG_LEVEL`: collector stderr log level, one of `error`, `warn`,
-//!   `info`, `debug`, or `trace` (default `info`; invalid values warn and use
-//!   `info`);
-//! - `KRONIKA_SOURCE_ID`: `u64` stamped into every sealed segment to identify
-//!   the source (default `0`). Sealing refuses to mix two *non-zero* source ids
-//!   in one segment, so distinct collectors sharing a `KRONIKA_OUT_DIR` must use
-//!   distinct non-zero ids. The default `0` is exempt from that check: two
-//!   collectors left at `0` writing to the same directory merge their data
-//!   silently. Set a unique non-zero id per source in any multi-collector setup;
-//! - `KRONIKA_PG_STATEMENT_TIMEOUT_MS`: statement timeout in ms, default 15000;
-//! - `KRONIKA_PG_LOCK_TIMEOUT_MS`: lock timeout in ms, default 1000 (must be
-//!   below the statement timeout, else it never fires; validated at startup);
-//! - `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS`: idle-in-transaction timeout in ms,
-//!   default 10000;
-//! - `KRONIKA_PG_EXCLUDE_DATABASES`: semicolon-separated list of databases to skip;
-//! - `KRONIKA_PG_MAX_TABLES`: per-axis top-N row count for the `pg_stat_user_tables`
-//!   candidate selection, default 500. Each of the six mechanical axes (read
-//!   activity, write volume, size, dead tuples, transaction-id age, multixact age)
-//!   contributes up to this many rows before the union;
-//! - `KRONIKA_PG_MAX_INDEXES`: per-axis top-N row count for the
-//!   `pg_stat_user_indexes` candidate selection, default 500. Each mechanical axis
-//!   (scans, tuples read, size; plus scan recency on PG16+) contributes up to this
-//!   many rows before the union;
-//! - `KRONIKA_PG_MAX_STATEMENTS`: per-axis top-N row count for the
-//!   `pg_stat_statements` candidate selection, default 500. Each axis (total
-//!   execution time, calls) contributes up to this many rows before the union;
-//! - `KRONIKA_PG_MAX_PLANS`: top-N row count by total time for the
-//!   `pg_store_plans` (vadv fork) read, default 500;
-//! - `KRONIKA_PG_PLANS_INTERVAL_S`: minimum interval between `pg_store_plans`
-//!   reads, default 300; `0` reads on every snapshot. Section `1_004_001` is
-//!   written only into the segment whose snapshot performed a read;
-//! - `KRONIKA_PG_MAX_PLAN_TEXT`: per-plan text truncation in bytes, default
-//!   32768;
-//! - `KRONIKA_PG_PLAN_TEXT_BUDGET`: total plan-text bytes fetched per read,
-//!   default 8388608; rows past the budget are written with a NULL plan;
-//! - `KRONIKA_PG_POOL_REFRESH_SECS`: minimum interval between connection-pool
-//!   refreshes (per-database connection reconciliation), default 600;
-//! - `KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`: cap for the adaptive `statement_timeout`
-//!   of the heavy per-table size query, default 60000. A `57014` (query canceled)
-//!   widens the timeout and retries the same database until this cap;
-//! - `KRONIKA_PG_MAX_LOCK_ROWS`: lock-wait graph guard, default 1000. The
-//!   section is skipped when no waits exist or when waiters, edges, or nodes
-//!   exceed this value;
-//! - `KRONIKA_NODE_SELF_ID`: stable node id sealed into `instance_metadata`
-//!   (`1_021_001`); defaults to the hostname;
-//! - `KRONIKA_INTERVAL_S`: regular wake cap of the internal timer, default 5;
-//!   positive source or trigger intervals can wake sooner; `0` disables the
-//!   timer, leaving collection to SIGUSR2 only. A signal is a forced tick: it
-//!   reads every source regardless of intervals;
-//! - per-source read intervals, seconds (a source is read on the first tick
-//!   whose elapsed time since its last read reaches the interval):
-//!   `KRONIKA_PG_ACTIVITY_INTERVAL_S` (5), `KRONIKA_PG_DATABASE_INTERVAL_S`
-//!   (10), `KRONIKA_PG_BGWRITER_INTERVAL_S` (10), `KRONIKA_PG_WAL_INTERVAL_S`
-//!   (10), `KRONIKA_PG_IO_INTERVAL_S` (10), `KRONIKA_PG_ARCHIVER_INTERVAL_S`
-//!   (30), `KRONIKA_PG_PREPARED_INTERVAL_S` (30),
-//!   `KRONIKA_PG_PROGRESS_VACUUM_INTERVAL_S` (10),
-//!   `KRONIKA_PG_STATEMENTS_INTERVAL_S` (30), `KRONIKA_PG_TABLES_INTERVAL_S`
-//!   (30), `KRONIKA_PG_INDEXES_INTERVAL_S` (60),
-//!   `KRONIKA_PG_REPLICATION_INTERVAL_S` (30),
-//!   `KRONIKA_PG_RESET_METADATA_INTERVAL_S` (30),
-//!   `KRONIKA_INSTANCE_INTERVAL_S` (60), `KRONIKA_PG_SETTINGS_INTERVAL_S`
-//!   (3600), `KRONIKA_OS_CORE_INTERVAL_S` (10),
-//!   `KRONIKA_OS_MOUNTTOPO_INTERVAL_S` (60),
-//!   `KRONIKA_OS_PROCESS_INTERVAL_S` (5),
-//!   `KRONIKA_OS_PROCESS_STATUS_INTERVAL_S` (30),
-//!   `KRONIKA_OS_CGROUP_INTERVAL_S` (10),
-//!   `KRONIKA_OS_CGROUP_MAPPING_INTERVAL_S` (30),
-//!   `KRONIKA_PG_LOG_INTERVAL_S` (5). The lock-wait graph has no
-//!   interval: it runs when the freshest activity snapshot shows a backend
-//!   waiting on a heavyweight lock. The `pg_store_plans` pace stays on
-//!   `KRONIKA_PG_PLANS_INTERVAL_S`;
-//! - `PostgreSQL` log source: `KRONIKA_PG_LOG_ENABLED` (default `0`, or enabled
-//!   when `KRONIKA_LOG_PATH` is set), `KRONIKA_LOG_PATH` direct stderr fixture
-//!   or sidecar path, `KRONIKA_LOG_ROOT` for relative `pg_current_logfile()`
-//!   paths, `KRONIKA_LOG_FORMAT` (`stderr` only in this scope; `csvlog` emits
-//!   `pg_log_gap`), `KRONIKA_LOG_STATE_PATH`, and
-//!   `KRONIKA_LOG_START_AT_BEGINNING` for deterministic fixtures;
-//! - OS source caps: `KRONIKA_OS_MAX_DISKS` (256),
-//!   `KRONIKA_OS_MAX_PROCS` (4096), `KRONIKA_OS_MAX_CGROUPS` (1024),
-//!   `KRONIKA_OS_MAX_CGROUP_IO_ROWS` (4096), `KRONIKA_OS_CGROUP_MAX_DEPTH` (8);
-//! - trigger fast intervals and thresholds:
-//!   `KRONIKA_PG_ACTIVITY_FAST_INTERVAL_S` (1),
-//!   `KRONIKA_PG_ASH_ACTIVE_THRESHOLD` (20),
-//!   `KRONIKA_PG_REPLICATION_FAST_INTERVAL_S` (10),
-//!   `KRONIKA_PG_REPL_LAG_TRIGGER_S` (10),
-//!   `KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES` (1073741824). A fast interval at
-//!   or above the source's base interval disables that trigger; `0` means every
-//!   timer wake while the trigger stays hot;
-//! - `KRONIKA_SEGMENT_MAX_BYTES`: seal the segment once the journal holds
-//!   this many raw bytes before segment packing, default 67108864 (64 MiB);
-//!   `0` seals on every tick. A SIGUSR2 tick always seals immediately;
-//! - `KRONIKA_SEGMENT_MAX_AGE_S`: seal an open segment at this age even when
-//!   it stays under the byte cap, default 900 seconds, analogous to
-//!   `archive_timeout` for WAL.
+//! The main module owns process lifecycle and cycle orchestration. Source
+//! discovery, paced reads, segment IO, logging, and config parsing live in
+//! focused sibling modules.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
@@ -340,7 +240,7 @@ async fn main() -> Result<()> {
 /// the daemon running.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the collection cycle wires every piece of daemon state together once"
+    reason = "the cycle owns daemon state transitions across pool, journal, scheduler, and logs"
 )]
 async fn run_collection_cycle(
     pool: &mut ConnectionPool,
@@ -793,7 +693,7 @@ async fn read_pool_sources(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "the snapshot wires every piece of daemon state together once"
+    reason = "one snapshot coordinates reads, buffering, coverage, and segment append"
 )]
 async fn snapshot_and_seal(
     pool: &ConnectionPool,
@@ -870,11 +770,8 @@ async fn snapshot_and_seal(
         None
     };
 
-    // OS procfs read — synchronous, safe before SectionBuffers are built.
-    // The interner is created here, before the OS read, because the Wave 2
-    // sections (diskstats, netdev, mountinfo) intern device/interface/mount
-    // strings while building their rows. The same interner then serves the PG
-    // pushes below — one interner per window.
+    // OS rows intern device/interface/mount strings while being built, so the
+    // window interner must exist before the procfs read.
     let fs = ProcFs::from_env();
     let in_container = detect_container(&fs);
     log_event(
@@ -912,9 +809,8 @@ async fn snapshot_and_seal(
     }
 
     if buffers.is_empty() {
-        // Every due source turned out empty (e.g. no vacuum in progress);
-        // an empty tick appends nothing. The age valve in the main loop
-        // still closes an expired segment on such ticks.
+        // Empty due sources append nothing; the main loop still closes an
+        // expired segment before the next collection attempt.
         commit_log_collection(log_collector, log_collection.as_ref());
         return Ok(CycleOutcome {
             sealed: Vec::new(),
