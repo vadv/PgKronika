@@ -32,7 +32,7 @@
 | `pg_store_plans` | расширение установлено в одной из БД пула, права на view/function | тип отсутствует или plan/reset поля `NULL` |
 | `pg_settings` | доступ к `pg_settings`; часть `sourcefile`/`sourceline` может быть скрыта | скрытые поля `NULL` |
 | представления репликации | права на `pg_stat_replication`, `pg_replication_slots`; часто нужна роль мониторинга | типы репликации отсутствуют или частично `NULL` |
-| PostgreSQL logs | файловый доступ к `log_directory` или sidecar shipping | логовые event_stream-типы отсутствуют, генерируется permission-событие |
+| PostgreSQL logs | файловый доступ к stderr-логу или доставка sidecar | `1_029_001` фиксирует `source_unavailable`/`unsupported_format`/`permission_denied`/`disabled`/`query_failed`; типизированные строки логов отсутствуют |
 
 Нули не используются как замена недоступных значений. Недоступность источника
 должна быть видна в metadata, событии или self-metrics коллектора.
