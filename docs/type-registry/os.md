@@ -367,13 +367,17 @@ scope                  u8   L   // 0=host или 2=pod_net в Wave 2
 ## `1_112_001` `mountinfo`
 
 `on_change`, политика материализации `every_segment_last_known`. Нужен для
-атрибуции `diskstats` к точкам монтирования, поэтому актуальная копия пишется в
-каждый сегмент даже без изменений. Wave 2 добавляет ёмкость ФС (`total_bytes`,
-`free_bytes`) через `statvfs(2)`: `NULL`, когда вызов не удался.
+атрибуции `diskstats` к точкам монтирования, поэтому актуальная копия полной
+таблицы mountinfo пишется в каждый сегмент даже без изменений. Wave 2 добавляет
+ёмкость ФС (`total_bytes`, `free_bytes`) через `statvfs(2)`: `NULL`, когда
+вызов не удался. Одна строка соответствует одной записи
+`/proc/self/mountinfo`; несколько mount points одного `(major, minor)` не
+схлопываются.
 
 Учитываются:
 
-- btrfs/ZFS, где subvolume может иметь `major=0`, но реальный источник — `/dev`;
+- btrfs/ZFS, где subvolume может иметь `major=0`, но прямой источник
+  `/dev/<block>` позволяет восстановить реальный device через `/sys`;
 - фильтрация инфраструктурных Kubernetes bind-mount вроде `/etc/hosts`, чтобы
   не приписывать I/O всего узла контейнеру.
 
@@ -394,13 +398,16 @@ scope          u8    L
 
 `on_change`, политика материализации `every_segment_last_known`.
 `SEGMENT_OPEN_SOURCES` заново помечает mountinfo и topology к отправке при
-открытии сегмента.
+открытии сегмента. `mhz_max` берётся из
+`/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq` и пишется в MHz;
+`NULL`, если sysfs не раскрывает максимум для CPU. Поле не заполняется из
+`/proc/cpuinfo` `cpu MHz`, потому что это текущее значение на части систем.
 
 ```text
 ts          ts   T
 cpu_id      i32  L
 model_name  str  L
-mhz_max     f64  L
+mhz_max     f64? L
 core_id     i32  L
 socket_id   i32  L
 scope       u8   L

@@ -12,8 +12,8 @@ pub struct CpuinfoRow {
     pub cpu_id: i32,
     /// CPU model string (`model name` field).
     pub model_name: String,
-    /// Current or max clock frequency in MHz (`cpu MHz`); `0.0` when absent.
-    pub mhz_max: f64,
+    /// Maximum clock frequency in MHz, filled from sysfs by the collector.
+    pub mhz_max: Option<f64>,
     /// Physical core within the socket (`core id`); `-1` when absent.
     pub core_id: i32,
     /// Physical socket (`physical id`); `-1` when absent.
@@ -39,8 +39,10 @@ impl CpuinfoRow {
 /// Parse the content of `/proc/cpuinfo` into one [`CpuinfoRow`] per logical CPU.
 ///
 /// Blocks are separated by blank lines; each line is `key\t: value`.
-/// Missing numeric fields use sentinel defaults: `core_id`/`socket_id` = `-1`,
-/// `mhz_max` = `0.0`. Blocks without a `processor` field are skipped.
+/// Missing numeric topology fields use sentinel defaults:
+/// `core_id`/`socket_id` = `-1`. Blocks without a `processor` field are
+/// skipped. `cpu MHz` is intentionally ignored because it reports the current
+/// clock on many systems, not a topology maximum.
 ///
 /// # Errors
 ///
@@ -51,7 +53,6 @@ pub fn parse(content: &str) -> Result<Vec<CpuinfoRow>, ParseError> {
     for block in content.split("\n\n") {
         let mut cpu_id: Option<i32> = None;
         let mut model_name = String::new();
-        let mut mhz_max: f64 = 0.0;
         let mut core_id: i32 = -1;
         let mut socket_id: i32 = -1;
 
@@ -69,9 +70,6 @@ pub fn parse(content: &str) -> Result<Vec<CpuinfoRow>, ParseError> {
                 "model name" => {
                     value.clone_into(&mut model_name);
                 }
-                "cpu MHz" => {
-                    mhz_max = value.parse::<f64>().unwrap_or(0.0);
-                }
                 "core id" => {
                     core_id = value.parse::<i32>().unwrap_or(-1);
                 }
@@ -86,7 +84,7 @@ pub fn parse(content: &str) -> Result<Vec<CpuinfoRow>, ParseError> {
             rows.push(CpuinfoRow {
                 cpu_id: id,
                 model_name,
-                mhz_max,
+                mhz_max: None,
                 core_id,
                 socket_id,
             });
@@ -144,12 +142,12 @@ cpu MHz\t\t: 2245.000
             rows[0].model_name,
             "Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz"
         );
-        assert!((rows[0].mhz_max - 3600.0).abs() < 0.001);
+        assert_eq!(rows[0].mhz_max, None);
         assert_eq!(rows[0].core_id, 0);
         assert_eq!(rows[0].socket_id, 0);
 
         assert_eq!(rows[1].cpu_id, 1);
-        assert!((rows[1].mhz_max - 3200.5).abs() < 0.001);
+        assert_eq!(rows[1].mhz_max, None);
         assert_eq!(rows[1].core_id, 1);
         assert_eq!(rows[1].socket_id, 0);
     }
@@ -166,10 +164,10 @@ cpu MHz\t\t: 2245.000
     }
 
     #[test]
-    fn missing_mhz_defaults_to_zero() {
+    fn cpu_mhz_is_not_treated_as_max_frequency() {
         let content = "processor\t: 0\nmodel name\t: Test CPU\n\n";
         let rows = parse(content).expect("parse");
-        assert!(rows[0].mhz_max.abs() < f64::EPSILON);
+        assert_eq!(rows[0].mhz_max, None);
     }
 
     #[test]

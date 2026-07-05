@@ -1,11 +1,11 @@
-//! Type `1_113_001`: CPU topology from `/proc/cpuinfo`.
+//! Type `1_113_001`: CPU topology from `/proc/cpuinfo` and sysfs.
 
 use crate::{Section, StrId, Ts};
 
-/// One logical CPU's topology facts from `/proc/cpuinfo`.
+/// One logical CPU's topology facts from `/proc/cpuinfo` and sysfs.
 ///
 /// Emitted `on_change`; one row per logical CPU per collection segment.
-/// `mhz_max` carries `f64`, so this struct derives `PartialEq` but not `Eq`.
+/// `mhz_max` is `None` when sysfs does not expose a max-frequency value.
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_113_001,
@@ -23,9 +23,9 @@ pub struct OsTopology {
     /// CPU model string, as a string dictionary reference.
     #[column(l)]
     pub model_name: StrId,
-    /// Clock frequency in MHz at collection time (`cpu MHz`).
+    /// Maximum clock frequency in MHz from sysfs; `None` when unavailable.
     #[column(l)]
-    pub mhz_max: f64,
+    pub mhz_max: Option<f64>,
     /// Physical core within the socket (`core id`); `-1` when absent.
     #[column(l)]
     pub core_id: i32,
@@ -47,7 +47,7 @@ mod tests {
             ts: Ts(ts),
             cpu_id,
             model_name: StrId(1),
-            mhz_max: 3600.0,
+            mhz_max: Some(3600.0),
             core_id: 0,
             socket_id: 0,
             scope: 0,
@@ -82,5 +82,16 @@ mod tests {
         assert_eq!(decoded[1].ts.0, 1_000);
         assert_eq!(decoded[2].cpu_id, 1);
         assert_eq!(decoded[2].ts.0, 2_000);
+    }
+
+    #[test]
+    fn null_mhz_max_survives_roundtrip() {
+        let value = OsTopology {
+            mhz_max: None,
+            ..row(1_000, 0)
+        };
+        let bytes = OsTopology::encode(&[value]).expect("encode");
+        let decoded = OsTopology::decode(VerifiedSection::for_test(bytes.into())).expect("decode");
+        assert_eq!(decoded[0].mhz_max, None);
     }
 }

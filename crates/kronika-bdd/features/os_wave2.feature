@@ -136,3 +136,55 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
     Then section 1_112_001 major 254 minor 16 mount_point resolves to "/data"
     And section 1_112_001 major 254 minor 16 has total_bytes = 5000000000
     And section 1_112_001 major 254 minor 16 has free_bytes = 2000000000
+
+  @pg16 @serial
+  Scenario: mountinfo пишет все mount points независимо от diskstats
+    Given a fresh database on PostgreSQL 16
+    And a fixture proc tree
+    And the fixture proc file "diskstats" contains:
+      """
+      ignored
+      """
+    And the fixture proc file "self/mountinfo" contains:
+      """
+      30 25 8:1 / /data rw,relatime shared:1 - ext4 /dev/sda1 rw
+      31 25 8:1 / /data/pg\040wal rw,relatime shared:2 - ext4 /dev/sda1 rw
+      """
+    And the statvfs fixture is "/data=10737418240:5368709120;/data/pg wal=21474836480:1073741824"
+    When the collector snapshots the segment
+    Then section 1_108_001 has 0 rows
+    And section 1_112_001 has 2 rows
+    And section 1_112_001 has a row with mount_point = "/data":
+      | major       | 8           |
+      | minor       | 1           |
+      | total_bytes | 10737418240 |
+      | free_bytes  | 5368709120  |
+    And section 1_112_001 has a row with mount_point = "/data/pg wal":
+      | major       | 8           |
+      | minor       | 1           |
+      | total_bytes | 21474836480 |
+      | free_bytes  | 1073741824  |
+
+  @pg16 @serial
+  Scenario: topology берет максимальную частоту из sysfs
+    Given a fresh database on PostgreSQL 16
+    And a fixture proc tree
+    And the fixture proc file "cpuinfo" contains:
+      """
+      processor	: 0
+      model name	: Test CPU
+      cpu MHz		: 800.000
+      physical id	: 0
+      core id		: 0
+      """
+    And the fixture sys file "devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq" contains:
+      """
+      3600000
+      """
+    When the collector snapshots the segment
+    Then section 1_113_001 has 1 rows
+    And section 1_113_001 has a row with cpu_id = 0:
+      | model_name | Test CPU |
+      | mhz_max    | 3600.0   |
+      | core_id    | 0        |
+      | socket_id  | 0        |
