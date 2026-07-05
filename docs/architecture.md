@@ -256,7 +256,7 @@ crates/
 │                       и пересчёта старой истории в web
 ├── kronika-source-pg   сборщики PostgreSQL
 ├── kronika-source-os   /proc, /sys, cgroup
-└── kronika-source-log  читатель логов + парсеры stderr/csvlog
+└── kronika-source-log  ограниченный tailer логов + stderr parser; csvlog отложен
 ```
 
 Зависимости исполняемых файлов задаются жёстко и проверяются в CI:

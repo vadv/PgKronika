@@ -1135,6 +1135,13 @@ dependencies = [
 [[package]]
 name = "kronika-source-log"
 version = "0.0.0"
+dependencies = [
+ "memchr",
+ "nix",
+ "tempfile",
+ "tokio",
+ "tokio-postgres",
+]
 
 [[package]]
 name = "kronika-source-os"
@@ -1595,6 +1602,7 @@ dependencies = [
  "anyhow",
  "kronika-format",
  "kronika-registry",
+ "kronika-source-log",
  "kronika-source-os",
  "kronika-source-pg",
  "kronika-writer",

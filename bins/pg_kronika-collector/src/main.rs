@@ -75,10 +75,17 @@
 //!   `KRONIKA_OS_PROCESS_INTERVAL_S` (5),
 //!   `KRONIKA_OS_PROCESS_STATUS_INTERVAL_S` (30),
 //!   `KRONIKA_OS_CGROUP_INTERVAL_S` (10),
-//!   `KRONIKA_OS_CGROUP_MAPPING_INTERVAL_S` (30). The lock-wait graph has no
+//!   `KRONIKA_OS_CGROUP_MAPPING_INTERVAL_S` (30),
+//!   `KRONIKA_PG_LOG_INTERVAL_S` (5). The lock-wait graph has no
 //!   interval: it runs when the freshest activity snapshot shows a backend
 //!   waiting on a heavyweight lock. The `pg_store_plans` pace stays on
 //!   `KRONIKA_PG_PLANS_INTERVAL_S`;
+//! - `PostgreSQL` log source: `KRONIKA_PG_LOG_ENABLED` (default `0`, or enabled
+//!   when `KRONIKA_LOG_PATH` is set), `KRONIKA_LOG_PATH` direct stderr fixture
+//!   or sidecar path, `KRONIKA_LOG_ROOT` for relative `pg_current_logfile()`
+//!   paths, `KRONIKA_LOG_FORMAT` (`stderr` only in this scope; `csvlog` emits
+//!   `pg_log_gap`), `KRONIKA_LOG_STATE_PATH`, and
+//!   `KRONIKA_LOG_START_AT_BEGINNING` for deterministic fixtures;
 //! - OS source caps: `KRONIKA_OS_MAX_DISKS` (256),
 //!   `KRONIKA_OS_MAX_PROCS` (4096), `KRONIKA_OS_MAX_CGROUPS` (1024),
 //!   `KRONIKA_OS_MAX_CGROUP_IO_ROWS` (4096), `KRONIKA_OS_CGROUP_MAX_DEPTH` (8);
@@ -129,7 +136,13 @@ use kronika_registry::os_snmp::OsSnmp;
 use kronika_registry::os_stat::OsStat;
 use kronika_registry::os_topology::OsTopology;
 use kronika_registry::os_vmstat::OsVmstat;
+use kronika_registry::pg_log::{PgLogErrorV1, PgLogGapV1};
 use kronika_registry::{MAX_SECTION_ROWS, StrId, Ts};
+use kronika_source_log::{
+    DiscoveryStatus as LogDiscoveryStatus, GroupedLogError, LogCollection, LogCollector, LogConfig,
+    LogGap, MAX_PATTERN_BYTES, MAX_TEXT_BYTES, PG_LOG_ERRORS_TYPE_ID, PG_LOG_GAP_TYPE_ID,
+    ParserKind as LogParserKind,
+};
 use kronika_source_os::proc::cpuinfo;
 use kronika_source_os::proc::loadavg::parse_loadavg;
 use kronika_source_os::proc::meminfo::parse_meminfo;
@@ -208,7 +221,7 @@ use scheduler::{DueSet, Intervals, Scheduler, SourceKind};
 use std::collections::HashSet;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
 
@@ -245,6 +258,8 @@ struct Config {
     tick_secs: u64,
     /// Per-source read intervals.
     intervals: Intervals,
+    /// `PostgreSQL` log source configuration.
+    log: LogConfig,
     /// Seal the segment when the journal holds at least this many raw bytes;
     /// `0` seals on every tick (the pre-rotation behavior).
     segment_max_bytes: u64,
@@ -277,6 +292,17 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
     )
 }
 
+fn env_bool(key: &str, default: bool) -> Result<bool> {
+    std::env::var(key).map_or_else(
+        |_| Ok(default),
+        |v| match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => anyhow::bail!("{key} must be one of 1/0, true/false, yes/no, on/off"),
+        },
+    )
+}
+
 impl Config {
     #[allow(
         clippy::too_many_lines,
@@ -284,7 +310,7 @@ impl Config {
     )]
     fn from_env() -> Result<Self> {
         let dsn = std::env::var("KRONIKA_PG_DSN").context("KRONIKA_PG_DSN is not set")?;
-        let out_dir = std::env::var("KRONIKA_OUT_DIR")
+        let out_dir: PathBuf = std::env::var("KRONIKA_OUT_DIR")
             .context("KRONIKA_OUT_DIR is not set")?
             .into();
         let source_id = env_u64("KRONIKA_SOURCE_ID", 0)?;
@@ -357,6 +383,7 @@ impl Config {
         )?)
         .context("KRONIKA_PG_SLOT_RETAINED_TRIGGER_BYTES exceeds i64")?;
         let intervals = intervals_from_env()?;
+        let log = log_config_from_env(&out_dir)?;
         validate_cardinality(max_tables, max_indexes)?;
         validate_heavy_cap(heavy_timeout_cap_ms)?;
         validate_max_lock_rows(max_lock_rows)?;
@@ -381,6 +408,7 @@ impl Config {
             node_self_id,
             tick_secs,
             intervals,
+            log,
             segment_max_bytes,
             segment_max_age_secs,
             journal_max_bytes,
@@ -431,6 +459,40 @@ fn intervals_from_env() -> Result<Intervals> {
             "KRONIKA_OS_CGROUP_MAPPING_INTERVAL_S",
             defaults.os_cgroup_mapping,
         )?,
+        pg_log: env_u64("KRONIKA_PG_LOG_INTERVAL_S", defaults.pg_log)?,
+    })
+}
+
+fn log_config_from_env(out_dir: &Path) -> Result<LogConfig> {
+    let path_override = std::env::var("KRONIKA_LOG_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+    let enabled = env_bool("KRONIKA_PG_LOG_ENABLED", path_override.is_some())?;
+    let root_override = std::env::var("KRONIKA_LOG_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+    let parser_kind = match std::env::var("KRONIKA_LOG_FORMAT")
+        .unwrap_or_else(|_| "stderr".to_owned())
+        .trim()
+    {
+        "stderr" => LogParserKind::Stderr,
+        "csvlog" => LogParserKind::Csvlog,
+        "unknown" => LogParserKind::Unknown,
+        other => anyhow::bail!("KRONIKA_LOG_FORMAT must be stderr or csvlog, got {other:?}"),
+    };
+    let state_path = std::env::var("KRONIKA_LOG_STATE_PATH")
+        .map_or_else(|_| out_dir.join("pg_log_tail.state"), PathBuf::from);
+    Ok(LogConfig {
+        enabled,
+        path_override,
+        root_override,
+        parser_kind,
+        state_path,
+        start_at_beginning: env_bool("KRONIKA_LOG_START_AT_BEGINNING", false)?,
+        discovery_interval: Duration::from_secs(env_u64("KRONIKA_LOG_DISCOVERY_INTERVAL_S", 60)?),
+        tail_caps: kronika_source_log::TailCaps::default(),
     })
 }
 
@@ -671,6 +733,8 @@ async fn main() -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("install the SIGINT handler")?;
     let mut statements_cache = StatementsSourceCache::default();
     let mut plans_cache = PlansSourceCache::default();
+    let mut log_collector =
+        LogCollector::new(config.log.clone()).context("initialize PostgreSQL log collector")?;
     let mut sched = Scheduler::new(config.intervals);
     let mut segment = SegmentState::default();
     let mut pool_budget = PoolBudget::new(Duration::from_millis(config.cycle_db_budget_ms));
@@ -732,6 +796,7 @@ async fn main() -> Result<()> {
             &config,
             &mut statements_cache,
             &mut plans_cache,
+            &mut log_collector,
             &due,
             &mut segment,
             &mut sched,
@@ -755,6 +820,7 @@ async fn run_collection_cycle(
     config: &Config,
     statements_cache: &mut StatementsSourceCache,
     plans_cache: &mut PlansSourceCache,
+    log_collector: &mut LogCollector,
     due: &DueSet,
     segment: &mut SegmentState,
     sched: &mut Scheduler,
@@ -766,6 +832,21 @@ async fn run_collection_cycle(
             "pool_reconnect_failure",
             &[field("source", "main"), field("error", format!("{err:#}"))],
         );
+        if due.has(SourceKind::PgLog) {
+            match run_log_only_cycle(log_collector, journal, config, due, segment).await {
+                Ok(sealed) => {
+                    for (dest, reason) in sealed {
+                        sched.mark_segment_opened();
+                        announce(&format!("sealed {} reason={reason}", dest.display()));
+                    }
+                }
+                Err(err) => log_event(
+                    LogLevel::Error,
+                    "pg_log_only_failure",
+                    &[field("error", format!("{err:#}"))],
+                ),
+            }
+        }
         return;
     }
     if let Err(err) = pool
@@ -796,6 +877,7 @@ async fn run_collection_cycle(
         config,
         statements_cache,
         plans_cache,
+        log_collector,
         due,
         segment,
         pool_budget,
@@ -3451,6 +3533,7 @@ async fn snapshot_and_seal(
     config: &Config,
     statements_cache: &mut StatementsSourceCache,
     plans_cache: &mut PlansSourceCache,
+    log_collector: &mut LogCollector,
     due: &DueSet,
     segment: &mut SegmentState,
     pool_budget: &mut PoolBudget,
@@ -3512,6 +3595,11 @@ async fn snapshot_and_seal(
     // info views through the same connections those sections use.
     let service =
         collect_service_sections(pool, major, config, statements_cache, plans_cache, due).await?;
+    let mut log_collection = if due.has(SourceKind::PgLog) {
+        Some(collect_log_batch(log_collector, Some(pool.main()), main_src.ts.0).await)
+    } else {
+        None
+    };
 
     // OS procfs read — synchronous, safe before SectionBuffers are built.
     // The interner is created here, before the OS read, because the Wave 2
@@ -3544,11 +3632,30 @@ async fn snapshot_and_seal(
     push_service_sections(&mut buffers, &mut interner, &service)?;
     push_os_sources(&mut buffers, &os)?;
     push_coverage(&mut buffers, &mut interner, main_src.ts.0, &coverage)?;
+    if let Some(collection) = log_collection.as_mut() {
+        let dropped = push_log_sections(&mut buffers, &mut interner, collection)?;
+        if dropped != 0 {
+            let first_new_gap = collection.gaps.len();
+            log_collector.record_dictionary_drops(collection, main_src.ts.0, dropped);
+            push_log_gaps(
+                &mut buffers,
+                &mut interner,
+                &collection.gaps[first_new_gap..],
+            )?;
+            log_count_degraded(
+                PG_LOG_GAP_TYPE_ID,
+                "log",
+                "dictionary_full",
+                usize::try_from(dropped).unwrap_or(usize::MAX),
+            );
+        }
+    }
 
     if buffers.is_empty() {
         // Every due source turned out empty (e.g. no vacuum in progress);
         // an empty tick appends nothing. The age valve in the main loop
         // still closes an expired segment on such ticks.
+        commit_log_collection(log_collector, log_collection.as_ref());
         return Ok(CycleOutcome {
             sealed: Vec::new(),
             deferred,
@@ -3557,63 +3664,266 @@ async fn snapshot_and_seal(
         });
     }
     let flushed = encode_window(buffers, &interner, config)?;
+    let sealed = append_window_and_maybe_seal(
+        journal,
+        config,
+        segment,
+        main_src.ts.0,
+        due.forced(),
+        &flushed,
+    )
+    .context("append the collection window")?;
+    commit_log_collection(log_collector, log_collection.as_ref());
+    Ok(CycleOutcome {
+        sealed,
+        deferred,
+        activity_hot,
+        replication_hot,
+    })
+}
+
+async fn run_log_only_cycle(
+    log_collector: &mut LogCollector,
+    journal: &mut Journal,
+    config: &Config,
+    due: &DueSet,
+    segment: &mut SegmentState,
+) -> Result<Vec<(PathBuf, &'static str)>> {
+    let ts = system_ts_us();
+    let mut collection = collect_log_batch(log_collector, None, ts).await;
+    let mut interner = Interner::new(activity_dict_limits());
+    let mut buffers = SectionBuffers::new();
+    let dropped = push_log_sections(&mut buffers, &mut interner, &collection)?;
+    if dropped != 0 {
+        let first_new_gap = collection.gaps.len();
+        log_collector.record_dictionary_drops(&mut collection, ts, dropped);
+        push_log_gaps(
+            &mut buffers,
+            &mut interner,
+            &collection.gaps[first_new_gap..],
+        )?;
+        log_count_degraded(
+            PG_LOG_GAP_TYPE_ID,
+            "log",
+            "dictionary_full",
+            usize::try_from(dropped).unwrap_or(usize::MAX),
+        );
+    }
+    if buffers.is_empty() {
+        commit_log_collection(log_collector, Some(&collection));
+        return Ok(Vec::new());
+    }
+    let flushed = encode_window(buffers, &interner, config)?;
+    let sealed = append_window_and_maybe_seal(journal, config, segment, ts, due.forced(), &flushed)
+        .context("append the log-only collection window")?;
+    commit_log_collection(log_collector, Some(&collection));
+    Ok(sealed)
+}
+
+async fn collect_log_batch(
+    log_collector: &mut LogCollector,
+    client: Option<&Client>,
+    ts: i64,
+) -> LogCollection {
+    log_collection_start(PG_LOG_ERRORS_TYPE_ID, "log");
+    let started = Instant::now();
+    let collection = log_collector.collect(client, ts).await;
+    log_collection_finish(
+        PG_LOG_ERRORS_TYPE_ID,
+        "log",
+        collection.errors.len(),
+        started.elapsed(),
+    );
+    if !collection.gaps.is_empty() {
+        log_collection_finish(
+            PG_LOG_GAP_TYPE_ID,
+            "log",
+            collection.gaps.len(),
+            started.elapsed(),
+        );
+    }
+    if let Some(status) = collection.discovery_status {
+        log_event(
+            LogLevel::Debug,
+            "pg_log_discovery",
+            &[
+                field("status", discovery_status_name(status)),
+                field("error_rows", collection.errors.len()),
+                field("gap_rows", collection.gaps.len()),
+                field("elapsed_ms", duration_ms(started.elapsed())),
+            ],
+        );
+    }
+    collection
+}
+
+const fn discovery_status_name(status: LogDiscoveryStatus) -> &'static str {
+    match status {
+        LogDiscoveryStatus::Available => "available",
+        LogDiscoveryStatus::UnsupportedFormat => "unsupported_format",
+        LogDiscoveryStatus::SourceUnavailable => "source_unavailable",
+        LogDiscoveryStatus::QueryFailed => "query_failed",
+        LogDiscoveryStatus::Disabled => "disabled",
+    }
+}
+
+fn commit_log_collection(log_collector: &mut LogCollector, collection: Option<&LogCollection>) {
+    let Some(collection) = collection else {
+        return;
+    };
+    if let Err(err) = log_collector.commit(collection) {
+        log_event(
+            LogLevel::Error,
+            "pg_log_state_commit_failure",
+            &[field("error", &err)],
+        );
+    }
+}
+
+fn push_log_sections(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    collection: &LogCollection,
+) -> Result<u32> {
+    let mut dropped = 0_u32;
+    for error in &collection.errors {
+        dropped = dropped.saturating_add(push_log_error(buffers, interner, error)?);
+    }
+    dropped = dropped.saturating_add(push_log_gaps(buffers, interner, &collection.gaps)?);
+    Ok(dropped)
+}
+
+fn push_log_error(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    error: &GroupedLogError,
+) -> Result<u32> {
+    let mut dropped = 0_u32;
+    let sqlstate = error
+        .sqlstate
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let pattern = intern_log_text(interner, &error.pattern, MAX_PATTERN_BYTES, &mut dropped);
+    let sample = intern_log_text(interner, &error.sample, MAX_TEXT_BYTES, &mut dropped);
+    let detail = error
+        .detail
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let hint = error
+        .hint
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let context = error
+        .context
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let statement = error
+        .statement
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    buffer_row(
+        buffers,
+        PgLogErrorV1 {
+            ts: Ts(error.ts),
+            severity: error.severity.code(),
+            category: error.category.code(),
+            sqlstate,
+            pattern,
+            count: error.count,
+            sample,
+            detail,
+            hint,
+            context,
+            statement,
+            database: None,
+            username: None,
+            dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
+        },
+    )?;
+    Ok(dropped)
+}
+
+fn push_log_gaps(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    gaps: &[LogGap],
+) -> Result<u32> {
+    let mut total_dropped = 0_u32;
+    for gap in gaps {
+        let mut dropped = 0_u32;
+        let source_path = gap.source_path.as_ref().and_then(|path| {
+            let value = path.to_string_lossy();
+            intern_log_text(interner, &value, MAX_TEXT_BYTES, &mut dropped)
+        });
+        buffer_row(
+            buffers,
+            PgLogGapV1 {
+                ts: Ts(gap.ts),
+                source_path,
+                parser_kind: gap.parser_kind.code(),
+                reason: gap.reason.code(),
+                dev: gap.dev,
+                inode: gap.inode,
+                offset: gap.offset,
+                bytes_skipped: gap.bytes_skipped,
+                truncated_lines: gap.truncated_lines,
+                invalid_utf8: gap.invalid_utf8,
+                binary_dropped: gap.binary_dropped,
+                rotations: gap.rotations,
+                missing_files: gap.missing_files,
+                budget_exhaustions: gap.budget_exhaustions,
+                dict_dropped_fields: gap.dict_dropped_fields.saturating_add(dropped),
+                parser_dropped_lines: gap.parser_dropped_lines,
+            },
+        )?;
+        total_dropped = total_dropped.saturating_add(dropped);
+    }
+    Ok(total_dropped)
+}
+
+fn intern_log_text(
+    interner: &mut Interner,
+    value: &str,
+    max_bytes: usize,
+    dropped: &mut u32,
+) -> Option<StrId> {
+    let value = truncate_log_text(value, max_bytes);
+    interner.intern(value.as_bytes()).map_or_else(
+        |_err| {
+            *dropped = dropped.saturating_add(1);
+            None
+        },
+        |id| Some(StrId(id.get())),
+    )
+}
+
+fn truncate_log_text(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    if max_bytes == 0 {
+        return "";
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.get(..end).unwrap_or_default()
+}
+
+fn append_window_and_maybe_seal(
+    journal: &mut Journal,
+    config: &Config,
+    segment: &mut SegmentState,
+    ts: i64,
+    forced: bool,
+    flushed: &FlushedPart,
+) -> Result<Vec<(PathBuf, &'static str)>> {
     let mut sealed = Vec::new();
     let append_started = Instant::now();
     let journal_bytes_before = journal.bytes();
-    if let Err(err) = journal.append(&flushed.body) {
-        match err {
-            // The journal cap fired before the segment byte cap: seal what is
-            // already on disk and retry — the first frame after a reset is
-            // exempt from the cap, so the retry cannot return Full again.
-            JournalError::Full { len, max } if segment.first_ts.is_some() => {
-                log_event(
-                    LogLevel::Warn,
-                    "journal_full",
-                    &[
-                        field("journal_bytes", len),
-                        field("journal_max_bytes", max),
-                        field("part_bytes", flushed.summary.part_bytes),
-                        field("sections", flushed.summary.sections.len()),
-                        field("section_rows", summary_rows(&flushed.summary)),
-                    ],
-                );
-                sealed.push((
-                    seal_open_segment(journal, config, segment, "journal-full")?,
-                    "journal-full",
-                ));
-                let retry_started = Instant::now();
-                let journal_bytes_before = journal.bytes();
-                let part_ref = journal
-                    .append(&flushed.body)
-                    .context("append the window after an early seal")?;
-                log_journal_append(
-                    &flushed.summary,
-                    part_ref.offset,
-                    part_ref.len,
-                    journal_bytes_before,
-                    journal.bytes(),
-                    retry_started.elapsed(),
-                    true,
-                );
-            }
-            other => {
-                log_event(
-                    LogLevel::Error,
-                    "journal_append_failure",
-                    &[
-                        field("part_bytes", flushed.summary.part_bytes),
-                        field("sections", flushed.summary.sections.len()),
-                        field("section_rows", summary_rows(&flushed.summary)),
-                        field("journal_bytes_before", journal_bytes_before),
-                        field("error", &other),
-                        field("elapsed_ms", duration_ms(append_started.elapsed())),
-                    ],
-                );
-                return Err(anyhow::Error::new(other).context("append the part to the journal"));
-            }
-        }
-    } else if let Some(part_ref) = journal.parts().last().copied() {
-        log_journal_append(
+    match journal.append(&flushed.body) {
+        Ok(part_ref) => log_journal_append(
             &flushed.summary,
             part_ref.offset,
             part_ref.len,
@@ -3621,25 +3931,77 @@ async fn snapshot_and_seal(
             journal.bytes(),
             append_started.elapsed(),
             false,
-        );
+        ),
+        Err(JournalError::Full { len, max }) if segment.first_ts.is_some() => {
+            log_event(
+                LogLevel::Warn,
+                "journal_full",
+                &[
+                    field("journal_bytes", len),
+                    field("journal_max_bytes", max),
+                    field("part_bytes", flushed.summary.part_bytes),
+                    field("sections", flushed.summary.sections.len()),
+                    field("section_rows", summary_rows(&flushed.summary)),
+                ],
+            );
+            sealed.push((
+                seal_open_segment(journal, config, segment, "journal-full")?,
+                "journal-full",
+            ));
+            let retry_started = Instant::now();
+            let journal_bytes_before = journal.bytes();
+            let part_ref = journal
+                .append(&flushed.body)
+                .context("append the window after an early seal")?;
+            log_journal_append(
+                &flushed.summary,
+                part_ref.offset,
+                part_ref.len,
+                journal_bytes_before,
+                journal.bytes(),
+                retry_started.elapsed(),
+                true,
+            );
+        }
+        Err(other) => {
+            log_event(
+                LogLevel::Error,
+                "journal_append_failure",
+                &[
+                    field("part_bytes", flushed.summary.part_bytes),
+                    field("sections", flushed.summary.sections.len()),
+                    field("section_rows", summary_rows(&flushed.summary)),
+                    field("journal_bytes_before", journal_bytes_before),
+                    field("error", &other),
+                    field("elapsed_ms", duration_ms(append_started.elapsed())),
+                ],
+            );
+            return Err(anyhow::Error::new(other).context("append the part to the journal"));
+        }
     }
     let now = Instant::now();
-    segment.on_window_appended(main_src.ts.0, now);
+    segment.on_window_appended(ts, now);
     let age = Duration::from_secs(config.segment_max_age_secs);
     if let Some(reason) = seal_reason(
-        due.forced(),
+        forced,
         journal.bytes(),
         config.segment_max_bytes,
         segment.age_expired(now, age),
     ) {
         sealed.push((seal_open_segment(journal, config, segment, reason)?, reason));
     }
-    Ok(CycleOutcome {
-        sealed,
-        deferred,
-        activity_hot,
-        replication_hot,
-    })
+    Ok(sealed)
+}
+
+fn system_ts_us() -> i64 {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    let micros = duration
+        .as_secs()
+        .saturating_mul(1_000_000)
+        .saturating_add(u64::from(duration.subsec_micros()));
+    i64::try_from(micros).unwrap_or(i64::MAX)
 }
 
 /// Everything one tick reads from the main connection, gated by `due`.
