@@ -203,6 +203,14 @@ test_branch_slug_is_tag_safe() {
   assert_eq "$slug" "feature-add-cache-ci"
 }
 
+test_run_passes_args_and_debug_to_container() {
+  local log
+  log=$(run_case run-args env \
+    DEBUG=1 \
+    "$SCRIPT" run pgkronika-bdd:local --tags @pg_log)
+  assert_contains "$log" "run --rm -e DEBUG=1 pgkronika-bdd:local --tags @pg_log"
+}
+
 for test in \
   test_exact_hit_pulls_and_does_not_build \
   test_branch_cache_digest_used_for_miss \
@@ -212,7 +220,8 @@ for test in \
   test_exact_hit_updates_branch_cache_when_enabled \
   test_branch_cache_updates_only_when_enabled \
   test_exact_tag_is_not_overwritten_if_it_appears_before_push \
-  test_branch_slug_is_tag_safe
+  test_branch_slug_is_tag_safe \
+  test_run_passes_args_and_debug_to_container
 do
   "$test"
 done

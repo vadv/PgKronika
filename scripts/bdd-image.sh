@@ -17,7 +17,8 @@ Commands:
                  Print a branch name as a Docker tag fragment.
   build-builder  Build or pull the BDD builder image.
   build-runtime  Build image.tar with the builder image and load it into Docker.
-  run [image]    Run the BDD image.
+  run [image] [args...]
+                 Run the BDD image. Extra args are passed to kronika-bdd.
 
 Environment:
   BDD_IMAGE_PREFIX   Registry prefix, default ghcr.io/vadv/pgkronika.
@@ -40,6 +41,7 @@ Environment:
                      Set to 1 to retag a pulled or pushed builder as the branch cache.
   BDD_RUNTIME_PUSH   Set to 1 to push BDD_RUNTIME_IMAGE after building.
   BDD_OUTPUT_TAR     Tarball path for build-runtime, default image.tar.
+  DEBUG              Passed through to the BDD container when set.
 EOF
 }
 
@@ -348,8 +350,20 @@ build_runtime() {
 }
 
 run_runtime() {
-  local image=${1:-$(runtime_image)}
-  docker_cmd run --rm "$image"
+  local image
+  if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+    image=$1
+    shift
+  else
+    image=$(runtime_image)
+  fi
+
+  local args=(--rm)
+  if [ -n "${DEBUG:-}" ]; then
+    args+=(-e "DEBUG=$DEBUG")
+  fi
+
+  docker_cmd run "${args[@]}" "$image" "$@"
 }
 
 cmd=${1:-}
