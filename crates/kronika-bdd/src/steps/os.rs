@@ -1,7 +1,8 @@
-//! Step definitions for `features/os_core.feature`.
+//! Step definitions for `features/os_core.feature` and `features/os_wave2.feature`.
 //!
-//! All assertions read the fixture `/proc` tree (via `KRONIKA_PROC_ROOT`) as
-//! the oracle, so no host-specific values appear in assertions.
+//! All assertions read the fixture `/proc` and `/sys` trees (via
+//! `KRONIKA_PROC_ROOT` and `KRONIKA_SYS_ROOT`) as the oracle, so no
+//! host-specific values appear in assertions.
 
 use anyhow::{Context, Result};
 use cucumber::{gherkin::Step, given, then};
@@ -304,6 +305,266 @@ fn section_resource_row_column_null(
             &failure_log,
             &[],
         )
+    );
+    Ok(())
+}
+
+/// Write the step's docstring to `<sys-fixture-root>/<rel>`.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[given(regex = r#"^the fixture sys file "([^"]+)" contains:$"#)]
+fn fixture_sys_file(world: &mut BddWorld, rel: String, step: &Step) -> Result<()> {
+    let content = crate::steps::docstring(step)?;
+    world.harness.fixture_sys_root()?;
+    world.harness.write_sys_fixture(&rel, content)
+}
+
+/// Seed the statvfs fixture env: `path1=TOTAL:FREE;path2=TOTAL:FREE`.
+///
+/// The collector's `statvfs()` reads `KRONIKA_STATVFS_FIXTURE` when set;
+/// this step injects deterministic capacity values for mountinfo assertions.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[given(regex = r#"^the statvfs fixture is "([^"]*)"$"#)]
+fn statvfs_fixture(world: &mut BddWorld, spec: String) {
+    world
+        .harness
+        .add_collector_env("KRONIKA_STATVFS_FIXTURE".to_owned(), spec);
+}
+
+/// Seed the container cgroup fixture so `detect_container` returns true.
+///
+/// Writing a line containing `kubepods` to `1/cgroup` makes the collector
+/// treat this host as a Kubernetes pod: diskstats filters to mounted devices
+/// and net sections carry `scope=pod_net` (2).
+#[given("the fixture proc tree is a container")]
+fn fixture_proc_tree_container(world: &mut BddWorld) -> Result<()> {
+    world.harness.fixture_proc_root()?;
+    world
+        .harness
+        .write_proc_fixture("1/cgroup", "0::/kubepods/pod-test/container-abc\n")
+}
+
+/// Assert an integer column in the row whose `major` and `minor` match.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\d_]+) major (\d+) minor (\d+) has (\w+) = (-?\d+)$")]
+fn section_device_row_column(
+    world: &mut BddWorld,
+    type_id: String,
+    major: i32,
+    minor: i32,
+    column: String,
+    expected: i64,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let segment = world.harness.segment()?.clone();
+    let failure_log = world.harness.failure_log()?;
+    let (rows, _dict) = decode_section(&segment, type_id)?;
+    let row = rows
+        .iter()
+        .find(|r| {
+            r.get("major") == Some(&Cell::I32(major)) && r.get("minor") == Some(&Cell::I32(minor))
+        })
+        .with_context(|| {
+            dump::section_dump(
+                &format!("section {type_id}: no row with major={major} minor={minor}"),
+                &rows,
+                &failure_log,
+                &[],
+            )
+        })?;
+    let actual = row
+        .get(column.as_str())
+        .with_context(|| format!("section {type_id}: column {column:?} absent"))?;
+    anyhow::ensure!(
+        int_cell_equals(actual, expected),
+        "{}",
+        dump::section_dump(
+            &format!(
+                "section {type_id}: major={major} minor={minor} {column}: expected {expected}, got {}",
+                dump::render_cell(actual)
+            ),
+            &rows,
+            &failure_log,
+            &[],
+        )
+    );
+    Ok(())
+}
+
+/// Assert that no row with the given major/minor exists in a section.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\d_]+) has no row with major (\d+) minor (\d+)$")]
+fn section_no_device_row(
+    world: &mut BddWorld,
+    type_id: String,
+    major: i32,
+    minor: i32,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let segment = world.harness.segment()?.clone();
+    let failure_log = world.harness.failure_log()?;
+    let (rows, _dict) = decode_section(&segment, type_id)?;
+    let found = rows.iter().any(|r| {
+        r.get("major") == Some(&Cell::I32(major)) && r.get("minor") == Some(&Cell::I32(minor))
+    });
+    anyhow::ensure!(
+        !found,
+        "{}",
+        dump::section_dump(
+            &format!("section {type_id}: row with major={major} minor={minor} must be absent"),
+            &rows,
+            &failure_log,
+            &[],
+        )
+    );
+    Ok(())
+}
+
+/// Assert that a section row identified by major/minor has a NULL column.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\d_]+) major (\d+) minor (\d+) has (\w+) = null$")]
+fn section_device_row_column_null(
+    world: &mut BddWorld,
+    type_id: String,
+    major: i32,
+    minor: i32,
+    column: String,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let segment = world.harness.segment()?.clone();
+    let failure_log = world.harness.failure_log()?;
+    let (rows, _dict) = decode_section(&segment, type_id)?;
+    let row = rows
+        .iter()
+        .find(|r| {
+            r.get("major") == Some(&Cell::I32(major)) && r.get("minor") == Some(&Cell::I32(minor))
+        })
+        .with_context(|| {
+            dump::section_dump(
+                &format!("section {type_id}: no row with major={major} minor={minor}"),
+                &rows,
+                &failure_log,
+                &[],
+            )
+        })?;
+    let actual = row
+        .get(column.as_str())
+        .with_context(|| format!("section {type_id}: column {column:?} absent"))?;
+    anyhow::ensure!(
+        actual == &Cell::Null,
+        "{}",
+        dump::section_dump(
+            &format!(
+                "section {type_id}: major={major} minor={minor} {column}: expected null, got {}",
+                dump::render_cell(actual)
+            ),
+            &rows,
+            &failure_log,
+            &[],
+        )
+    );
+    Ok(())
+}
+
+/// Assert a bool column in the row whose `major` and `minor` match.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\d_]+) major (\d+) minor (\d+) has (\w+) = (true|false)$")]
+fn section_device_row_column_bool(
+    world: &mut BddWorld,
+    type_id: String,
+    major: i32,
+    minor: i32,
+    column: String,
+    expected: bool,
+) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let segment = world.harness.segment()?.clone();
+    let failure_log = world.harness.failure_log()?;
+    let (rows, _dict) = decode_section(&segment, type_id)?;
+    let row = rows
+        .iter()
+        .find(|r| {
+            r.get("major") == Some(&Cell::I32(major)) && r.get("minor") == Some(&Cell::I32(minor))
+        })
+        .with_context(|| {
+            dump::section_dump(
+                &format!("section {type_id}: no row with major={major} minor={minor}"),
+                &rows,
+                &failure_log,
+                &[],
+            )
+        })?;
+    let actual = row
+        .get(column.as_str())
+        .with_context(|| format!("section {type_id}: column {column:?} absent"))?;
+    anyhow::ensure!(
+        actual == &Cell::Bool(expected),
+        "{}",
+        dump::section_dump(
+            &format!(
+                "section {type_id}: major={major} minor={minor} {column}: expected {expected}, got {}",
+                dump::render_cell(actual)
+            ),
+            &rows,
+            &failure_log,
+            &[],
+        )
+    );
+    Ok(())
+}
+
+/// Assert that the `mount_point` string column for a major/minor row resolves to a given value.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r#"^section ([\d_]+) major (\d+) minor (\d+) mount_point resolves to "([^"]*)"$"#)]
+fn section_device_row_mount_point(
+    world: &mut BddWorld,
+    type_id: String,
+    major: i32,
+    minor: i32,
+    expected: String,
+) -> Result<()> {
+    use crate::steps::common::resolve_str_column;
+    let type_id = parse_type_id(&type_id)?;
+    let segment = world.harness.segment()?.clone();
+    let failure_log = world.harness.failure_log()?;
+    let (rows, dict) = decode_section(&segment, type_id)?;
+    let row = rows
+        .iter()
+        .find(|r| {
+            r.get("major") == Some(&Cell::I32(major)) && r.get("minor") == Some(&Cell::I32(minor))
+        })
+        .with_context(|| {
+            dump::section_dump(
+                &format!("section {type_id}: no row with major={major} minor={minor}"),
+                &rows,
+                &failure_log,
+                &[],
+            )
+        })?;
+    let actual = resolve_str_column(type_id, row, &dict, "mount_point")?;
+    anyhow::ensure!(
+        actual == expected,
+        "section {type_id}: major={major} minor={minor} mount_point: expected {expected:?}, got {actual:?}"
     );
     Ok(())
 }
