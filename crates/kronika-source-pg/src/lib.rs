@@ -24,6 +24,9 @@ macro_rules! marked {
     };
 }
 
+mod pg_row;
+pub use pg_row::{PgCollectError, PgRowError};
+
 mod activity;
 pub use activity::{
     ActivityRow, ActivityVersion, activity_query, activity_version, collect_activity, to_v1, to_v2,
