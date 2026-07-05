@@ -4,7 +4,14 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$ROOT/scripts/bdd-image.sh"
 TEST_TMP=$(mktemp -d)
-trap 'rm -rf "$TEST_TMP"' EXIT
+
+cleanup() {
+  rm -rf "$TEST_TMP"
+  rm -f \
+    "$ROOT/scripts/.cache-key-host-only-probe" \
+    "$ROOT/crates/kronika-bdd/features/cache_key_probe.feature"
+}
+trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*" >&2
@@ -49,6 +56,13 @@ if [ "$1" = "info" ]; then
   exit 0
 fi
 
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  case "$3" in
+    *local-hit*) exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+
 if [ "$1" = "manifest" ] && [ "$2" = "inspect" ]; then
   case "$3" in
     *exact-hit*) exit 0 ;;
@@ -69,6 +83,11 @@ if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then
     exit 0
   fi
   exit 1
+fi
+
+if [ "$1" = "run" ]; then
+  cat >/dev/null || true
+  exit 0
 fi
 
 case "$1" in
@@ -107,6 +126,17 @@ test_exact_hit_pulls_and_does_not_build() {
     "$SCRIPT" build-builder)
   assert_contains "$log" "manifest inspect ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-exact-hit"
   assert_contains "$log" "pull ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-exact-hit"
+  assert_not_contains "$log" "buildx build"
+}
+
+test_local_exact_builder_skips_pull_and_build() {
+  local log
+  log=$(run_case local-hit env \
+    BDD_BUILDER_IMAGE="ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-local-hit" \
+    BDD_BUILDER_PULL=1 \
+    "$SCRIPT" build-builder)
+  assert_contains "$log" "image inspect ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-local-hit"
+  assert_not_contains "$log" "manifest inspect"
   assert_not_contains "$log" "buildx build"
 }
 
@@ -211,7 +241,88 @@ test_run_passes_args_and_debug_to_container() {
   assert_contains "$log" "run --rm -e DEBUG=1 pgkronika-bdd:local --tags @pg_log"
 }
 
+test_runtime_reuse_local_skips_build() {
+  local log
+  log=$(run_case runtime-local-hit env \
+    BDD_RUNTIME_IMAGE="pgkronika-bdd:local-hit" \
+    BDD_RUNTIME_REUSE_LOCAL=1 \
+    "$SCRIPT" build-runtime)
+  assert_contains "$log" "image inspect pgkronika-bdd:local-hit"
+  assert_not_contains "$log" "run --rm -i"
+  assert_not_contains "$log" "load -i"
+}
+
+test_runtime_build_uses_filtered_stdin_tar() {
+  local log output
+  output="$TEST_TMP/runtime-build.tar"
+  log=$(run_case runtime-build env \
+    BDD_BUILDER_IMAGE="pgkronika-bdd-builder:test" \
+    BDD_RUNTIME_IMAGE="pgkronika-bdd:runtime-build" \
+    BDD_OUTPUT_TAR="$output" \
+    "$SCRIPT" build-runtime)
+  assert_contains "$log" "run --rm -i pgkronika-bdd-builder:test sh -ceu"
+  assert_not_contains "$log" "-v $ROOT:/src:ro"
+  assert_contains "$log" "load -i $output"
+  assert_contains "$log" "tag pgkronika-bdd:latest pgkronika-bdd:runtime-build"
+}
+
+test_runtime_paths_exclude_host_only_helpers() {
+  local paths
+  paths=$("$SCRIPT" image-paths)
+  if printf '%s\n' "$paths" | grep -Fx -- "scripts/bdd-image.sh" >/dev/null; then
+    fail "runtime paths must not include scripts/bdd-image.sh"
+  fi
+  if printf '%s\n' "$paths" | grep -Fx -- "scripts/test-bdd-local.sh" >/dev/null; then
+    fail "runtime paths must not include scripts/test-bdd-local.sh"
+  fi
+  if printf '%s\n' "$paths" | grep -Fx -- "Makefile" >/dev/null; then
+    fail "runtime paths must not include Makefile"
+  fi
+  printf '%s\n' "$paths" | grep -Fx -- "crates/kronika-bdd/features/pg_log.feature" >/dev/null \
+    || fail "runtime paths must include pg_log.feature"
+  printf '%s\n' "$paths" | grep -Fx -- "crates/kronika-bdd/src/main.rs" >/dev/null \
+    || fail "runtime paths must include kronika-bdd source"
+}
+
+test_builder_paths_exclude_host_only_but_include_targets() {
+  local paths
+  paths=$("$SCRIPT" builder-paths)
+  if printf '%s\n' "$paths" | grep -Fx -- "scripts/bdd-image.sh" >/dev/null; then
+    fail "builder paths must not include scripts/bdd-image.sh"
+  fi
+  if printf '%s\n' "$paths" | grep -Fx -- "Makefile" >/dev/null; then
+    fail "builder paths must not include Makefile"
+  fi
+  printf '%s\n' "$paths" | grep -Fx -- "crates/kronika-format/src/lib.rs" >/dev/null \
+    || fail "builder paths must include crate source targets for Cargo metadata"
+  printf '%s\n' "$paths" | grep -Fx -- "xtask/src/main.rs" >/dev/null \
+    || fail "builder paths must include xtask source target for Cargo metadata"
+}
+
+test_runtime_key_ignores_host_only_files() {
+  local before after probe
+  probe="$ROOT/scripts/.cache-key-host-only-probe"
+  before=$("$SCRIPT" image-key)
+  printf 'host helper only\n' > "$probe"
+  after=$("$SCRIPT" image-key)
+  rm -f "$probe"
+  assert_eq "$after" "$before"
+}
+
+test_runtime_key_changes_for_feature_inputs() {
+  local before after probe
+  probe="$ROOT/crates/kronika-bdd/features/cache_key_probe.feature"
+  before=$("$SCRIPT" image-key)
+  printf 'Feature: cache key probe\n' > "$probe"
+  after=$("$SCRIPT" image-key)
+  rm -f "$probe"
+  if [ "$after" = "$before" ]; then
+    fail "runtime image key must change when a BDD feature changes"
+  fi
+}
+
 for test in \
+  test_local_exact_builder_skips_pull_and_build \
   test_exact_hit_pulls_and_does_not_build \
   test_branch_cache_digest_used_for_miss \
   test_main_cache_is_fallback_after_branch_cache_miss \
@@ -221,7 +332,13 @@ for test in \
   test_branch_cache_updates_only_when_enabled \
   test_exact_tag_is_not_overwritten_if_it_appears_before_push \
   test_branch_slug_is_tag_safe \
-  test_run_passes_args_and_debug_to_container
+  test_run_passes_args_and_debug_to_container \
+  test_runtime_reuse_local_skips_build \
+  test_runtime_build_uses_filtered_stdin_tar \
+  test_runtime_paths_exclude_host_only_helpers \
+  test_builder_paths_exclude_host_only_but_include_targets \
+  test_runtime_key_ignores_host_only_files \
+  test_runtime_key_changes_for_feature_inputs
 do
   "$test"
 done

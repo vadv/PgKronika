@@ -98,8 +98,10 @@ DEBUG=1 make test-bdd TAGS=@pg_log
 
 `TAGS` is required and is passed to Cucumber as `--tags`. The target uses the
 same Docker/Buildx image path as the full run and uses a transient runtime
-tarball under `/tmp` unless `BDD_OUTPUT_TAR` is set. The unfiltered full run
-remains `./scripts/bdd-image.sh run`.
+tarball under `/tmp` unless `BDD_OUTPUT_TAR` is set. When `BDD_RUNTIME_IMAGE` is
+not set, the target tags the local image by platform and BDD runtime input hash,
+so changes to Makefile, helper scripts, or README files do not rebuild the BDD
+image. The unfiltered full run remains `./scripts/bdd-image.sh run`.
 
 To publish the builder image from a machine that is allowed to push:
 
