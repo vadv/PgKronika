@@ -531,7 +531,7 @@ impl HarnessState {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create fixture log dir for {filename:?}"))?;
         }
-        std::fs::write(&target, content)
+        std::fs::write(&target, completed_log_fixture(content))
             .with_context(|| format!("write fixture PostgreSQL log file {filename:?}"))?;
         self.add_collector_env(
             "KRONIKA_LOG_PATH".to_owned(),
@@ -635,6 +635,14 @@ impl HarnessState {
         self.sys_fixture = None;
         self.log_fixture = None;
     }
+}
+
+fn completed_log_fixture(content: &str) -> Vec<u8> {
+    let mut bytes = content.as_bytes().to_vec();
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    bytes
 }
 
 /// Extract the GUC name from an `ALTER SYSTEM SET <name> ...` statement.
@@ -922,8 +930,8 @@ fn ensure_safe_ident(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HarnessState, altered_system_setting, ensure_safe_ident, quote_config_identifier,
-        unique_database_name,
+        HarnessState, altered_system_setting, completed_log_fixture, ensure_safe_ident,
+        quote_config_identifier, unique_database_name,
     };
 
     #[test]
@@ -979,6 +987,12 @@ mod tests {
     fn quotes_config_identifiers_for_alter_system_reset() {
         assert_eq!(quote_config_identifier("work_mem"), "\"work_mem\"");
         assert_eq!(quote_config_identifier("custom\"guc"), "\"custom\"\"guc\"");
+    }
+
+    #[test]
+    fn log_fixture_content_is_completed_with_newline() {
+        assert_eq!(completed_log_fixture("one\ntwo"), b"one\ntwo\n");
+        assert_eq!(completed_log_fixture("one\n"), b"one\n");
     }
 
     #[test]
