@@ -32,6 +32,7 @@ pub mod os_loadavg;
 pub mod os_meminfo;
 pub mod os_netdev;
 pub mod os_psi;
+pub mod os_snmp;
 pub mod os_stat;
 pub mod os_vmstat;
 pub mod pg_locks;
