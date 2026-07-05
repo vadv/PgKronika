@@ -113,6 +113,7 @@ mod config;
 mod coverage;
 mod logging;
 mod os_sources;
+mod pg_log_source;
 mod plans_source;
 mod scheduler;
 mod segments;
@@ -131,12 +132,8 @@ use coverage::min_total_time;
 use coverage::{CoverageInputs, SourceCoverage, collect_coverage_records, push_coverage};
 use kronika_format::DictLimits;
 use kronika_registry::instance_metadata::InstanceMetadata;
-use kronika_registry::pg_log::{PgLogErrorV1, PgLogGapV1};
 use kronika_registry::{StrId, Ts};
-use kronika_source_log::{
-    DiscoveryStatus as LogDiscoveryStatus, GroupedLogError, LogCollection, LogCollector, LogGap,
-    MAX_PATTERN_BYTES, MAX_TEXT_BYTES, PG_LOG_ERRORS_TYPE_ID, PG_LOG_GAP_TYPE_ID,
-};
+use kronika_source_log::LogCollector;
 #[cfg(test)]
 use kronika_source_os::proc::diskstats;
 #[cfg(test)]
@@ -187,13 +184,16 @@ use kronika_source_pg::{
 use kronika_writer::{Interner, Journal, SectionBuffers};
 use logging::{
     CollectionFamily, LogLevel, duration_ms, field, layout_id, log_collection_failure,
-    log_collection_finish, log_collection_start, log_count_degraded,
-    log_database_collection_finish, log_database_collection_retry, log_database_collection_skip,
-    log_database_collection_start, log_event, log_source_deferred, section_name,
+    log_collection_finish, log_collection_start, log_database_collection_finish,
+    log_database_collection_retry, log_database_collection_skip, log_database_collection_start,
+    log_event, log_source_deferred, section_name,
 };
 #[cfg(test)]
 use os_sources::{cap_disks, collect_mountinfo, cpu_max_mhz, resolve_major_zero};
 use os_sources::{collect_os_sources, push_os_sources};
+use pg_log_source::{
+    collect_log_batch, commit_log_collection, push_log_collection, run_log_only_cycle,
+};
 use plans_source::{PlansRead, PlansSourceCache, collect_store_plans_cached};
 #[cfg(test)]
 use plans_source::{plans_reread_delay, truncate_to_boundary};
@@ -213,7 +213,7 @@ use statements_source::{StatementsSource, statements_type_id};
 use statements_source::{StatementsSourceCache, collect_statements_cached, statement_client};
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_postgres::Client;
 
@@ -953,22 +953,13 @@ async fn snapshot_and_seal(
     push_os_sources(&mut buffers, &os)?;
     push_coverage(&mut buffers, &mut interner, main_src.ts.0, &coverage)?;
     if let Some(collection) = log_collection.as_mut() {
-        let dropped = push_log_sections(&mut buffers, &mut interner, collection)?;
-        if dropped != 0 {
-            let first_new_gap = collection.gaps.len();
-            log_collector.record_dictionary_drops(collection, main_src.ts.0, dropped);
-            push_log_gaps(
-                &mut buffers,
-                &mut interner,
-                &collection.gaps[first_new_gap..],
-            )?;
-            log_count_degraded(
-                PG_LOG_GAP_TYPE_ID,
-                "log",
-                "dictionary_full",
-                usize::try_from(dropped).unwrap_or(usize::MAX),
-            );
-        }
+        push_log_collection(
+            &mut buffers,
+            &mut interner,
+            log_collector,
+            collection,
+            main_src.ts.0,
+        )?;
     }
 
     if buffers.is_empty() {
@@ -1000,246 +991,6 @@ async fn snapshot_and_seal(
         activity_hot,
         replication_hot,
     })
-}
-
-async fn run_log_only_cycle(
-    log_collector: &mut LogCollector,
-    journal: &mut Journal,
-    config: &Config,
-    due: &DueSet,
-    segment: &mut SegmentState,
-) -> Result<Vec<(PathBuf, &'static str)>> {
-    let ts = system_ts_us();
-    let mut collection = collect_log_batch(log_collector, None, ts).await;
-    let mut interner = Interner::new(activity_dict_limits());
-    let mut buffers = SectionBuffers::new();
-    let dropped = push_log_sections(&mut buffers, &mut interner, &collection)?;
-    if dropped != 0 {
-        let first_new_gap = collection.gaps.len();
-        log_collector.record_dictionary_drops(&mut collection, ts, dropped);
-        push_log_gaps(
-            &mut buffers,
-            &mut interner,
-            &collection.gaps[first_new_gap..],
-        )?;
-        log_count_degraded(
-            PG_LOG_GAP_TYPE_ID,
-            "log",
-            "dictionary_full",
-            usize::try_from(dropped).unwrap_or(usize::MAX),
-        );
-    }
-    if buffers.is_empty() {
-        commit_log_collection(log_collector, Some(&collection));
-        return Ok(Vec::new());
-    }
-    let flushed = encode_window(buffers, &interner, config)?;
-    let sealed = append_window_and_maybe_seal(journal, config, segment, ts, due.forced(), &flushed)
-        .context("append the log-only collection window")?;
-    commit_log_collection(log_collector, Some(&collection));
-    Ok(sealed)
-}
-
-async fn collect_log_batch(
-    log_collector: &mut LogCollector,
-    client: Option<&Client>,
-    ts: i64,
-) -> LogCollection {
-    log_collection_start(PG_LOG_ERRORS_TYPE_ID, "log");
-    let started = Instant::now();
-    let collection = log_collector.collect(client, ts).await;
-    log_collection_finish(
-        PG_LOG_ERRORS_TYPE_ID,
-        "log",
-        collection.errors.len(),
-        started.elapsed(),
-    );
-    if !collection.gaps.is_empty() {
-        log_collection_finish(
-            PG_LOG_GAP_TYPE_ID,
-            "log",
-            collection.gaps.len(),
-            started.elapsed(),
-        );
-    }
-    if let Some(status) = collection.discovery_status {
-        log_event(
-            LogLevel::Debug,
-            "pg_log_discovery",
-            &[
-                field("status", discovery_status_name(status)),
-                field("error_rows", collection.errors.len()),
-                field("gap_rows", collection.gaps.len()),
-                field("elapsed_ms", duration_ms(started.elapsed())),
-            ],
-        );
-    }
-    collection
-}
-
-const fn discovery_status_name(status: LogDiscoveryStatus) -> &'static str {
-    match status {
-        LogDiscoveryStatus::Available => "available",
-        LogDiscoveryStatus::UnsupportedFormat => "unsupported_format",
-        LogDiscoveryStatus::SourceUnavailable => "source_unavailable",
-        LogDiscoveryStatus::QueryFailed => "query_failed",
-        LogDiscoveryStatus::Disabled => "disabled",
-    }
-}
-
-fn commit_log_collection(log_collector: &mut LogCollector, collection: Option<&LogCollection>) {
-    let Some(collection) = collection else {
-        return;
-    };
-    if let Err(err) = log_collector.commit(collection) {
-        log_event(
-            LogLevel::Error,
-            "pg_log_state_commit_failure",
-            &[field("error", &err)],
-        );
-    }
-}
-
-fn push_log_sections(
-    buffers: &mut SectionBuffers,
-    interner: &mut Interner,
-    collection: &LogCollection,
-) -> Result<u32> {
-    let mut dropped = 0_u32;
-    for error in &collection.errors {
-        dropped = dropped.saturating_add(push_log_error(buffers, interner, error)?);
-    }
-    dropped = dropped.saturating_add(push_log_gaps(buffers, interner, &collection.gaps)?);
-    Ok(dropped)
-}
-
-fn push_log_error(
-    buffers: &mut SectionBuffers,
-    interner: &mut Interner,
-    error: &GroupedLogError,
-) -> Result<u32> {
-    let mut dropped = 0_u32;
-    let sqlstate = error
-        .sqlstate
-        .as_deref()
-        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
-    let pattern = intern_log_text(interner, &error.pattern, MAX_PATTERN_BYTES, &mut dropped);
-    let sample = intern_log_text(interner, &error.sample, MAX_TEXT_BYTES, &mut dropped);
-    let detail = error
-        .detail
-        .as_deref()
-        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
-    let hint = error
-        .hint
-        .as_deref()
-        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
-    let context = error
-        .context
-        .as_deref()
-        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
-    let statement = error
-        .statement
-        .as_deref()
-        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
-    buffer_row(
-        buffers,
-        PgLogErrorV1 {
-            ts: Ts(error.ts),
-            severity: error.severity.code(),
-            category: error.category.code(),
-            sqlstate,
-            pattern,
-            count: error.count,
-            sample,
-            detail,
-            hint,
-            context,
-            statement,
-            database: None,
-            username: None,
-            dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
-        },
-    )?;
-    Ok(dropped)
-}
-
-fn push_log_gaps(
-    buffers: &mut SectionBuffers,
-    interner: &mut Interner,
-    gaps: &[LogGap],
-) -> Result<u32> {
-    let mut total_dropped = 0_u32;
-    for gap in gaps {
-        let mut dropped = 0_u32;
-        let source_path = gap.source_path.as_ref().and_then(|path| {
-            let value = path.to_string_lossy();
-            intern_log_text(interner, &value, MAX_TEXT_BYTES, &mut dropped)
-        });
-        buffer_row(
-            buffers,
-            PgLogGapV1 {
-                ts: Ts(gap.ts),
-                source_path,
-                parser_kind: gap.parser_kind.code(),
-                reason: gap.reason.code(),
-                dev: gap.dev,
-                inode: gap.inode,
-                offset: gap.offset,
-                bytes_skipped: gap.bytes_skipped,
-                truncated_lines: gap.truncated_lines,
-                invalid_utf8: gap.invalid_utf8,
-                binary_dropped: gap.binary_dropped,
-                rotations: gap.rotations,
-                missing_files: gap.missing_files,
-                budget_exhaustions: gap.budget_exhaustions,
-                dict_dropped_fields: gap.dict_dropped_fields.saturating_add(dropped),
-                parser_dropped_lines: gap.parser_dropped_lines,
-            },
-        )?;
-        total_dropped = total_dropped.saturating_add(dropped);
-    }
-    Ok(total_dropped)
-}
-
-fn intern_log_text(
-    interner: &mut Interner,
-    value: &str,
-    max_bytes: usize,
-    dropped: &mut u32,
-) -> Option<StrId> {
-    let value = truncate_log_text(value, max_bytes);
-    interner.intern(value.as_bytes()).map_or_else(
-        |_err| {
-            *dropped = dropped.saturating_add(1);
-            None
-        },
-        |id| Some(StrId(id.get())),
-    )
-}
-
-fn truncate_log_text(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    if max_bytes == 0 {
-        return "";
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value.get(..end).unwrap_or_default()
-}
-
-fn system_ts_us() -> i64 {
-    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return 0;
-    };
-    let micros = duration
-        .as_secs()
-        .saturating_mul(1_000_000)
-        .saturating_add(u64::from(duration.subsec_micros()));
-    i64::try_from(micros).unwrap_or(i64::MAX)
 }
 
 /// Everything one tick reads from the main connection, gated by `due`.
@@ -1922,7 +1673,7 @@ async fn collect_lock_rows(client: &Client, major: u32, max_lock_rows: i64) -> V
 ///
 /// Query text can dominate the dictionary. Long values spill to `dict.blobs`,
 /// truncate after 64 KiB, and the dictionary is capped at 16 MiB.
-fn activity_dict_limits() -> DictLimits {
+pub(crate) fn activity_dict_limits() -> DictLimits {
     DictLimits::new(4096, 64 * 1024)
         .and_then(|limits| limits.with_max_total_bytes(16 * 1024 * 1024))
         .expect("static activity dictionary limits satisfy 0 < blob <= truncate <= total")
@@ -2303,7 +2054,7 @@ fn is_sqlstate(err: &tokio_postgres::Error, code: &str) -> bool {
 }
 
 /// Buffer one typed snapshot row, mapping a full buffer to an error.
-fn buffer_row<S: kronika_registry::Section + 'static>(
+pub(crate) fn buffer_row<S: kronika_registry::Section + 'static>(
     buffers: &mut SectionBuffers,
     row: S,
 ) -> Result<()> {
