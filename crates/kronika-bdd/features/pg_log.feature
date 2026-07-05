@@ -1,3 +1,4 @@
+@pg_log
 Feature: PostgreSQL log-domain stderr fixtures
   The collector reads deterministic stderr fixtures through KRONIKA_LOG_PATH.
   The sealed rows contain grouped bounded facts, never raw line dumps.

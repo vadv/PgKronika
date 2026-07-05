@@ -90,6 +90,17 @@ leaves the tarball in the working tree.
 The first builder build after a dependency change is still expensive. Later
 source-only changes reuse the same builder image.
 
+For a tagged local BDD run, use the repository Makefile target:
+
+```sh
+DEBUG=1 make test-bdd TAGS=@pg_log
+```
+
+`TAGS` is required and is passed to Cucumber as `--tags`. The target uses the
+same Docker/Buildx image path as the full run and uses a transient runtime
+tarball under `/tmp` unless `BDD_OUTPUT_TAR` is set. The unfiltered full run
+remains `./scripts/bdd-image.sh run`.
+
 To publish the builder image from a machine that is allowed to push:
 
 ```sh
