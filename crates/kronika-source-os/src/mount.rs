@@ -12,6 +12,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use kronika_registry::StrId;
+use kronika_registry::Ts;
+use kronika_registry::os_mountinfo::OsMountinfo;
+
+use crate::FsSpace;
+
 /// One `/proc/self/mountinfo` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountEntry {
@@ -133,6 +139,35 @@ pub fn display_path(paths: &[String]) -> Option<&str> {
         .min_by_key(|p| p.len())
         .or_else(|| paths.iter().min_by_key(|p| p.len()))
         .map(String::as_str)
+}
+
+/// Build a registry row for `1_112_001` from a parsed mount entry and optional
+/// capacity snapshot.
+///
+/// The caller interns `entry.mount_point`, `entry.fstype`, and `entry.source`
+/// and passes the resulting [`StrId`]s. `space` is `None` when `statvfs` failed.
+#[must_use]
+pub fn mount_row(
+    entry: &MountEntry,
+    space: Option<FsSpace>,
+    scope: u8,
+    ts: i64,
+    mount_point_id: StrId,
+    fstype_id: StrId,
+    source_id: StrId,
+) -> OsMountinfo {
+    OsMountinfo {
+        ts: Ts(ts),
+        major: entry.major,
+        minor: entry.minor,
+        mount_point: mount_point_id,
+        fstype: fstype_id,
+        source: source_id,
+        is_k8s_infra: entry.is_k8s_infra,
+        total_bytes: space.map(|s| s.total_bytes),
+        free_bytes: space.map(|s| s.free_bytes),
+        scope,
+    }
 }
 
 #[cfg(test)]
