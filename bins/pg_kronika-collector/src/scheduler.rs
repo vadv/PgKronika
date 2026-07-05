@@ -155,6 +155,16 @@ impl DueSet {
             forced: true,
         }
     }
+
+    /// A set with exactly the given sources due. For use in unit tests only.
+    #[cfg(test)]
+    #[allow(clippy::missing_const_for_fn, reason = "Vec disallows const context")]
+    pub(crate) fn for_test(kinds: Vec<SourceKind>) -> Self {
+        Self {
+            kinds,
+            forced: false,
+        }
+    }
 }
 
 /// The sources a fresh segment re-reads on its first tick, so every sealed
