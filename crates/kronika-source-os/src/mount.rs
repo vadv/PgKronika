@@ -242,4 +242,44 @@ mod tests {
         ];
         assert_eq!(display_path(&paths), Some("/etc/hosts"));
     }
+
+    #[test]
+    fn mount_row_maps_space_fields() {
+        let entry = MountEntry {
+            major: 8,
+            minor: 1,
+            mount_point: "/data".to_owned(),
+            fstype: "ext4".to_owned(),
+            source: "/dev/sda1".to_owned(),
+            is_k8s_infra: false,
+        };
+
+        let row = mount_row(&entry, None, 2, 1_000_000, StrId(10), StrId(20), StrId(30));
+        assert_eq!(row.total_bytes, None);
+        assert_eq!(row.free_bytes, None);
+        assert_eq!(row.major, 8);
+        assert_eq!(row.minor, 1);
+        assert!(!row.is_k8s_infra);
+        assert_eq!(row.scope, 2);
+        assert_eq!(row.ts, Ts(1_000_000));
+        assert_eq!(row.mount_point, StrId(10));
+        assert_eq!(row.fstype, StrId(20));
+        assert_eq!(row.source, StrId(30));
+
+        let space = FsSpace {
+            total_bytes: 500_000_000,
+            free_bytes: 200_000_000,
+        };
+        let row2 = mount_row(
+            &entry,
+            Some(space),
+            2,
+            1_000_000,
+            StrId(10),
+            StrId(20),
+            StrId(30),
+        );
+        assert_eq!(row2.total_bytes, Some(500_000_000));
+        assert_eq!(row2.free_bytes, Some(200_000_000));
+    }
 }
