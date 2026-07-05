@@ -30,10 +30,11 @@ pub(crate) enum SourceKind {
     InstanceMetadata,
     Settings,
     OsCore,
+    OsMountTopo,
 }
 
 /// All source kinds, in collection order.
-pub(crate) const ALL_SOURCES: [SourceKind; 16] = [
+pub(crate) const ALL_SOURCES: [SourceKind; 17] = [
     SourceKind::Activity,
     SourceKind::Database,
     SourceKind::Bgwriter,
@@ -50,6 +51,7 @@ pub(crate) const ALL_SOURCES: [SourceKind; 16] = [
     SourceKind::InstanceMetadata,
     SourceKind::Settings,
     SourceKind::OsCore,
+    SourceKind::OsMountTopo,
 ];
 
 /// Per-source intervals, in seconds.
@@ -71,6 +73,7 @@ pub(crate) struct Intervals {
     pub instance_metadata: u64,
     pub settings: u64,
     pub os_core: u64,
+    pub os_mount_topo: u64,
 }
 
 impl Default for Intervals {
@@ -92,6 +95,7 @@ impl Default for Intervals {
             instance_metadata: 60,
             settings: 3600,
             os_core: 10,
+            os_mount_topo: 60,
         }
     }
 }
@@ -115,6 +119,7 @@ impl Intervals {
             SourceKind::InstanceMetadata => self.instance_metadata,
             SourceKind::Settings => self.settings,
             SourceKind::OsCore => self.os_core,
+            SourceKind::OsMountTopo => self.os_mount_topo,
         }
     }
 }
@@ -150,14 +155,25 @@ impl DueSet {
             forced: true,
         }
     }
+
+    /// A set with exactly the given sources due. For use in unit tests only.
+    #[cfg(test)]
+    #[allow(clippy::missing_const_for_fn, reason = "Vec disallows const context")]
+    pub(crate) fn for_test(kinds: Vec<SourceKind>) -> Self {
+        Self {
+            kinds,
+            forced: false,
+        }
+    }
 }
 
 /// The sources a fresh segment re-reads on its first tick, so every sealed
 /// file carries its own instance identity, reset context, and configuration.
-const SEGMENT_OPEN_SOURCES: [SourceKind; 3] = [
+const SEGMENT_OPEN_SOURCES: [SourceKind; 4] = [
     SourceKind::ResetMetadata,
     SourceKind::InstanceMetadata,
     SourceKind::Settings,
+    SourceKind::OsMountTopo,
 ];
 
 /// Decides which sources each tick reads, one entry per source.
@@ -308,6 +324,7 @@ mod tests {
             instance_metadata: secs,
             settings: secs,
             os_core: secs,
+            os_mount_topo: secs,
         }
     }
 
@@ -384,6 +401,7 @@ mod tests {
         assert!(next.has(SourceKind::ResetMetadata));
         assert!(next.has(SourceKind::InstanceMetadata));
         assert!(next.has(SourceKind::Settings));
+        assert!(next.has(SourceKind::OsMountTopo));
         assert!(!next.has(SourceKind::Activity));
         assert!(!next.has(SourceKind::UserTables));
     }
@@ -560,5 +578,38 @@ mod tests {
         let next = scheduler.plan(start + Duration::from_secs(1), false);
         assert!(next.has(SourceKind::UserTables));
         assert!(next.has(SourceKind::UserIndexes));
+    }
+
+    #[test]
+    fn os_mount_topo_default_interval_is_60s() {
+        assert_eq!(Intervals::default().os_mount_topo, 60);
+    }
+
+    #[test]
+    fn os_mount_topo_comes_due_after_its_interval() {
+        let mut intervals = uniform(1000);
+        intervals.os_mount_topo = 60;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+        scheduler.plan(start, false); // first tick: everything due
+
+        let at_59s = scheduler.plan(start + Duration::from_secs(59), false);
+        assert!(!at_59s.has(SourceKind::OsMountTopo));
+
+        let at_60s = scheduler.plan(start + Duration::from_mins(1), false);
+        assert!(at_60s.has(SourceKind::OsMountTopo));
+    }
+
+    #[test]
+    fn segment_open_re_arms_os_mount_topo() {
+        let mut intervals = uniform(1000);
+        intervals.os_mount_topo = 60;
+        let mut scheduler = Scheduler::new(intervals);
+        let start = Instant::now();
+        scheduler.plan(start, false); // first tick: everything read
+        scheduler.mark_segment_opened();
+        // One second later OsMountTopo fires again because segment was opened.
+        let next = scheduler.plan(start + Duration::from_secs(1), false);
+        assert!(next.has(SourceKind::OsMountTopo));
     }
 }
