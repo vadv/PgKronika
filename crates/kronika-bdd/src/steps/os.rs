@@ -1,4 +1,4 @@
-//! Step definitions for `features/os_core.feature` and `features/os_wave2.feature`.
+//! Step definitions for OS fixture features.
 //!
 //! All assertions read the fixture `/proc` and `/sys` trees (via
 //! `KRONIKA_PROC_ROOT` and `KRONIKA_SYS_ROOT`) as the oracle, so no
