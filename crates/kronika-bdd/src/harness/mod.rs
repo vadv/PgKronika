@@ -30,7 +30,7 @@ pub(crate) mod session;
 pub(crate) mod snapshot;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -79,6 +79,11 @@ pub(crate) struct HarnessState {
     collector_output_dirs: Vec<TempDir>,
     /// Scenario-specific environment for the spawned collector.
     collector_env: Vec<(String, String)>,
+    /// A fixture `/proc` tree created lazily by `fixture_proc_root`.
+    ///
+    /// Kept alive for the duration of the scenario; path is passed to the
+    /// collector through `KRONIKA_PROC_ROOT` in `collector_env`.
+    proc_fixture: Option<TempDir>,
     /// Client-tool processes spawned by steps (e.g. `pg_receivewal`);
     /// killed in cleanup before the scenario database is dropped. The
     /// tempdir holds the tool's working files for the process lifetime.
@@ -308,6 +313,108 @@ impl HarnessState {
         self.collector_output_dirs.push(dir);
     }
 
+    /// Return the root of the fixture `/proc` tree, creating it on first call.
+    ///
+    /// Pushes `KRONIKA_PROC_ROOT` into the collector env the first time so the
+    /// spawned collector reads the fixture tree instead of the host `/proc`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `TempDir` cannot be created.
+    pub(crate) fn fixture_proc_root(&mut self) -> Result<&Path> {
+        if self.proc_fixture.is_none() {
+            let dir = TempDir::new().context("create fixture proc root")?;
+            let root = dir.path().to_owned();
+            self.proc_fixture = Some(dir);
+            self.add_collector_env(
+                "KRONIKA_PROC_ROOT".to_owned(),
+                root.to_string_lossy().into_owned(),
+            );
+        }
+        Ok(self
+            .proc_fixture
+            .as_ref()
+            .expect("proc_fixture set just above")
+            .path())
+    }
+
+    /// Create the fixture tree and seed it with minimal valid content for all
+    /// procfs sources so unrelated sections can still parse.
+    ///
+    /// The caller may overwrite individual files afterwards with
+    /// `write_proc_fixture`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fixture root or any seed file cannot be created.
+    pub(crate) fn seed_default_proc_fixture(&mut self) -> Result<()> {
+        // Ensure the root exists and KRONIKA_PROC_ROOT is registered.
+        self.fixture_proc_root()?;
+
+        // stat: aggregate + one cpu line so parse_cpu succeeds; required misc fields present.
+        self.write_proc_fixture(
+            "stat",
+            "cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\n\
+             ctxt 0\nbtime 1700000000\nprocesses 0\nprocs_running 0\nprocs_blocked 0\n",
+        )?;
+
+        self.write_proc_fixture("sys/kernel/hostname", "fixture-host\n")?;
+        self.write_proc_fixture("sys/kernel/osrelease", "6.9.0-fixture\n")?;
+        self.write_proc_fixture(
+            "sys/kernel/random/boot_id",
+            "00000000-0000-4000-8000-000000000001\n",
+        )?;
+        self.write_proc_fixture("1/cgroup", "0::/init.scope\n")?;
+
+        // meminfo: only MemTotal is required by the parser.
+        self.write_proc_fixture("meminfo", "MemTotal: 1024 kB\n")?;
+
+        // loadavg: one line with running/total token.
+        self.write_proc_fixture("loadavg", "0.00 0.00 0.00 0/1 1\n")?;
+
+        // vmstat: all fields optional; provide a minimal pair so the file is non-empty.
+        self.write_proc_fixture("vmstat", "pgpgin 0\npgpgout 0\n")?;
+
+        self.write_proc_fixture(
+            "pressure/cpu",
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )?;
+        self.write_proc_fixture(
+            "pressure/memory",
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )?;
+        self.write_proc_fixture(
+            "pressure/io",
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )?;
+
+        Ok(())
+    }
+
+    /// Write `content` to `<fixture-root>/<rel>`, creating parent dirs as needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fixture root is not yet initialised, a parent
+    /// directory cannot be created, or the file cannot be written.
+    pub(crate) fn write_proc_fixture(&self, rel: &str, content: &str) -> Result<()> {
+        let root = self
+            .proc_fixture
+            .as_ref()
+            .context("fixture proc root not yet initialised; call fixture_proc_root() first")?
+            .path();
+        let target = root.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create fixture dir for {rel:?}"))?;
+        }
+        std::fs::write(&target, content)
+            .with_context(|| format!("write fixture proc file {rel:?}"))?;
+        Ok(())
+    }
+
     /// Poll `pg_stat_progress_vacuum` until a row for session `name` appears.
     ///
     /// # Errors
@@ -398,6 +505,8 @@ impl HarnessState {
         self.collector_output_dirs.clear();
         self.collector_env.clear();
         self.altered_system_settings.clear();
+        // Drop the fixture proc tree last; the collector already exited.
+        self.proc_fixture = None;
     }
 }
 

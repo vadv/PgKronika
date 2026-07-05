@@ -353,6 +353,7 @@ const fn source_kind_name(kind: SourceKind) -> &'static str {
         SourceKind::ResetMetadata => "reset_metadata",
         SourceKind::InstanceMetadata => "instance_metadata",
         SourceKind::Settings => "settings",
+        SourceKind::OsCore => "os_core",
     }
 }
 
@@ -377,7 +378,8 @@ pub(crate) fn log_source_deferred(kind: SourceKind, major: u32) {
         | SourceKind::Replication
         | SourceKind::ResetMetadata
         | SourceKind::InstanceMetadata
-        | SourceKind::Settings => {}
+        | SourceKind::Settings
+        | SourceKind::OsCore => {}
     }
     log_event(LogLevel::Debug, "collection_deferred", &fields);
 }

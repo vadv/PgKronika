@@ -9,7 +9,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-registry = { path = "../kronika-registry" }
 rustix = { version = "1", features = ["param"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

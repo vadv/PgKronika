@@ -1140,7 +1140,9 @@ version = "0.0.0"
 name = "kronika-source-os"
 version = "0.0.0"
 dependencies = [
+ "kronika-registry",
  "rustix",
+ "tempfile",
 ]
 
 [[package]]
