@@ -247,34 +247,29 @@ pub fn to_v1<E>(
     })
 }
 
-/// Read a raw row from a result row using the version's column set.
-fn row_from_pg(row: &tokio_postgres::Row, version: ActivityVersion) -> ActivityRow {
-    ActivityRow {
-        ts: row.get("ts_us"),
-        pid: row.get("pid"),
-        leader_pid: match version {
-            ActivityVersion::V1 => None,
-            ActivityVersion::V2 | ActivityVersion::V3 => row.get("leader_pid"),
-        },
-        datname: row.get("datname"),
-        usename: row.get("usename"),
-        application_name: row.get("application_name"),
-        client_addr: row.get("client_addr"),
-        backend_type: row.get("backend_type"),
-        state: row.get("state"),
-        wait_event_type: row.get("wait_event_type"),
-        wait_event: row.get("wait_event"),
-        query: row.get("query"),
-        query_id: match version {
-            ActivityVersion::V1 | ActivityVersion::V2 => None,
-            ActivityVersion::V3 => row.get("query_id"),
-        },
-        backend_xid_age: row.get("backend_xid_age"),
-        backend_xmin_age: row.get("backend_xmin_age"),
-        backend_start: row.get("backend_start_us"),
-        xact_start: row.get("xact_start_us"),
-        query_start: row.get("query_start_us"),
-        state_change: row.get("state_change_us"),
+pg_row_mapper! {
+    ActivityCols(version: ActivityVersion) => ActivityRow {
+        ts: i64 = "ts_us",
+        pid: i32 = "pid",
+        leader_pid: Option<i32> = "leader_pid"
+            if matches!(version, ActivityVersion::V2 | ActivityVersion::V3),
+        datname: Option<String> = "datname",
+        usename: Option<String> = "usename",
+        application_name: String = "application_name",
+        client_addr: String = "client_addr",
+        backend_type: String = "backend_type",
+        state: Option<String> = "state",
+        wait_event_type: Option<String> = "wait_event_type",
+        wait_event: Option<String> = "wait_event",
+        query: Option<String> = "query",
+        query_id: Option<i64> = "query_id"
+            if matches!(version, ActivityVersion::V3),
+        backend_xid_age: Option<i64> = "backend_xid_age",
+        backend_xmin_age: Option<i64> = "backend_xmin_age",
+        backend_start: i64 = "backend_start_us",
+        xact_start: Option<i64> = "xact_start_us",
+        query_start: Option<i64> = "query_start_us",
+        state_change: Option<i64> = "state_change_us",
     }
 }
 
@@ -286,17 +281,23 @@ fn row_from_pg(row: &tokio_postgres::Row, version: ActivityVersion) -> ActivityR
 pub async fn collect_activity(
     client: &Client,
     major: u32,
-) -> Result<(ActivityVersion, Vec<ActivityRow>), tokio_postgres::Error> {
+) -> Result<(ActivityVersion, Vec<ActivityRow>), crate::PgCollectError> {
     let version = activity_version(major);
-    let rows = client.query(activity_query(version), &[]).await?;
-    let parsed = rows.iter().map(|row| row_from_pg(row, version)).collect();
+    let stmt = client.prepare(activity_query(version)).await?;
+    let cols = ActivityCols::new(version, stmt.columns())?;
+    let rows = client.query(&stmt, &[]).await?;
+    let parsed = rows
+        .iter()
+        .map(|row| cols.read(row))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((version, parsed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityRow, ActivityVersion, activity_query, activity_version, to_v1, to_v2, to_v3,
+        ActivityCols, ActivityRow, ActivityVersion, activity_query, activity_version, to_v1, to_v2,
+        to_v3,
     };
     use kronika_registry::StrId;
     use std::convert::Infallible;
@@ -364,6 +365,50 @@ mod tests {
             assert!(activity_query(v).contains("pg_stat_activity"));
             assert!(activity_query(v).contains("pg_kronika"));
         }
+    }
+
+    fn v1_column_names() -> [&'static str; 17] {
+        [
+            "ts_us",
+            "pid",
+            "datname",
+            "usename",
+            "application_name",
+            "client_addr",
+            "backend_type",
+            "state",
+            "wait_event_type",
+            "wait_event",
+            "query",
+            "backend_xid_age",
+            "backend_xmin_age",
+            "backend_start_us",
+            "xact_start_us",
+            "query_start_us",
+            "state_change_us",
+        ]
+    }
+
+    #[test]
+    fn row_mapper_skips_columns_absent_from_v1() {
+        let cols = ActivityCols::new_from_names(ActivityVersion::V1, v1_column_names())
+            .expect("V1 column set should resolve");
+
+        assert!(cols.leader_pid.is_none());
+        assert!(cols.query_id.is_none());
+    }
+
+    #[test]
+    fn row_mapper_requires_query_id_for_v3() {
+        let mut columns = Vec::from(v1_column_names());
+        columns.push("leader_pid");
+        let err = ActivityCols::new_from_names(ActivityVersion::V3, columns)
+            .expect_err("V3 should require query_id");
+
+        assert_eq!(
+            err.to_string(),
+            "ActivityRow.query_id: missing PostgreSQL column `query_id`"
+        );
     }
 
     #[test]

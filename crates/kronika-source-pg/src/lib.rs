@@ -24,6 +24,10 @@ macro_rules! marked {
     };
 }
 
+#[allow(
+    unused_macro_rules,
+    reason = "alias branch is used by wider collectors such as pg_stat_statements"
+)]
 macro_rules! pg_row_mapper {
     (
         $cols:ident($version:ident : $version_ty:ty) => $row_ty:ident {
