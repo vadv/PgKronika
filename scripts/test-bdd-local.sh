@@ -38,6 +38,15 @@ fi
 
 export BDD_BUILDER_PULL=${BDD_BUILDER_PULL:-1}
 
+runtime_image=${BDD_RUNTIME_IMAGE:-}
+if [ -z "$runtime_image" ]; then
+  platform_slug=$("$ROOT/scripts/bdd-image.sh" platform-slug)
+  image_hash=$("$ROOT/scripts/bdd-image.sh" image-key)
+  runtime_image="pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}"
+fi
+export BDD_RUNTIME_IMAGE=$runtime_image
+export BDD_RUNTIME_REUSE_LOCAL=1
+
 cleanup_output=
 if [ -z "${BDD_OUTPUT_TAR:-}" ]; then
   BDD_OUTPUT_TAR=$(mktemp "${TMPDIR:-/tmp}/pgkronika-bdd.XXXXXX.tar")
@@ -52,10 +61,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$ROOT/scripts/bdd-image.sh" build-builder
-"$ROOT/scripts/bdd-image.sh" build-runtime
+if "$DOCKER" image inspect "$runtime_image" >/dev/null 2>&1; then
+  echo "Reusing BDD runtime image $runtime_image"
+else
+  "$ROOT/scripts/bdd-image.sh" build-builder
+  "$ROOT/scripts/bdd-image.sh" build-runtime
+fi
 
-runtime_image=${BDD_RUNTIME_IMAGE:-pgkronika-bdd:latest}
 cucumber_args=(--tags "$TAGS")
 if [ -n "${DEBUG:-}" ] && [ "$DEBUG" != "0" ]; then
   cucumber_args=(-vvv "${cucumber_args[@]}")
