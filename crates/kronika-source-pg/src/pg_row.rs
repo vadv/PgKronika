@@ -7,8 +7,12 @@ use std::marker::PhantomData;
 use tokio_postgres::Row;
 use tokio_postgres::types::FromSqlOwned;
 
-/// Error while building a PostgreSQL row mapper or decoding one row.
+/// Error while building a `PostgreSQL` row mapper or decoding one row.
 #[derive(Debug)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "variants name the column-related failure without relying on enum context"
+)]
 pub enum PgRowError {
     /// The query result does not contain the column required for a field.
     MissingColumn {
@@ -16,7 +20,7 @@ pub enum PgRowError {
         row: &'static str,
         /// Rust field being filled.
         field: &'static str,
-        /// PostgreSQL column alias expected by the field.
+        /// `PostgreSQL` column alias expected by the field.
         column: &'static str,
     },
     /// The query result contains the same selected column name more than once.
@@ -25,7 +29,7 @@ pub enum PgRowError {
         row: &'static str,
         /// Rust field being filled.
         field: &'static str,
-        /// PostgreSQL column alias expected by the field.
+        /// `PostgreSQL` column alias expected by the field.
         column: &'static str,
     },
     /// `tokio-postgres` could not decode the selected column into the field type.
@@ -34,7 +38,7 @@ pub enum PgRowError {
         row: &'static str,
         /// Rust field being filled.
         field: &'static str,
-        /// PostgreSQL column alias read by the field.
+        /// `PostgreSQL` column alias read by the field.
         column: &'static str,
         /// Decode failure returned by `tokio-postgres`.
         source: tokio_postgres::Error,
@@ -72,7 +76,7 @@ impl Error for PgRowError {
     }
 }
 
-/// Error returned by converted PostgreSQL collectors.
+/// Error returned by converted `PostgreSQL` collectors.
 #[derive(Debug)]
 pub enum PgCollectError {
     /// Query preparation or execution failed.
@@ -84,7 +88,7 @@ pub enum PgCollectError {
 impl PgCollectError {
     /// Return the underlying query error when this is a database failure.
     #[must_use]
-    pub fn as_query_error(&self) -> Option<&tokio_postgres::Error> {
+    pub const fn as_query_error(&self) -> Option<&tokio_postgres::Error> {
         match self {
             Self::Query(err) => Some(err),
             Self::Row(_) => None,
@@ -181,13 +185,46 @@ where
         reason = "used by pg_row_mapper-generated collector mappings"
     )]
     pub(crate) fn get(&self, row: &Row) -> Result<T, PgRowError> {
-        row.try_get(self.index).map_err(|source| PgRowError::DecodeColumn {
-            row: self.row,
-            field: self.field,
-            column: self.column,
-            source,
-        })
+        row.try_get(self.index)
+            .map_err(|source| PgRowError::DecodeColumn {
+                row: self.row,
+                field: self.field,
+                column: self.column,
+                source,
+            })
     }
+}
+
+pub(crate) trait PgGatedDecode<T>: Sized {
+    fn decode_gated(column: Option<&PgCol<T>>, row: &Row) -> Result<Self, PgRowError>;
+}
+
+// A gated non-null column (`plans: i64 if ...`) becomes `Option<i64>`, while a
+// gated nullable column (`query_id: Option<i64> if ...`) stays `Option<i64>`.
+impl<T> PgGatedDecode<T> for Option<T>
+where
+    T: FromSqlOwned,
+{
+    fn decode_gated(column: Option<&PgCol<T>>, row: &Row) -> Result<Self, PgRowError> {
+        column.map_or_else(|| Ok(None), |column| column.get(row).map(Some))
+    }
+}
+
+impl<T> PgGatedDecode<Self> for Option<T>
+where
+    Self: FromSqlOwned,
+{
+    fn decode_gated(column: Option<&PgCol<Self>>, row: &Row) -> Result<Self, PgRowError> {
+        column.map_or_else(|| Ok(None), |column| column.get(row))
+    }
+}
+
+pub(crate) fn read_gated<T, O>(column: Option<&PgCol<T>>, row: &Row) -> Result<O, PgRowError>
+where
+    T: FromSqlOwned,
+    O: PgGatedDecode<T>,
+{
+    O::decode_gated(column, row)
 }
 
 #[cfg(test)]

@@ -697,105 +697,163 @@ pub fn to_v1<E>(
     })
 }
 
-/// Read a raw row from a result row using the version's column set.
-fn row_from_pg(row: &tokio_postgres::Row, version: StatementsVersion) -> StatementsRow {
-    let has_split = !matches!(version, StatementsVersion::V1);
-    let has_toplevel = matches!(
-        version,
-        StatementsVersion::V3
-            | StatementsVersion::V4
-            | StatementsVersion::V5
-            | StatementsVersion::V6
-    );
-    let has_temp_time = matches!(
-        version,
-        StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
-    );
-    let has_jit = has_temp_time;
-    let has_pg17 = matches!(version, StatementsVersion::V5 | StatementsVersion::V6);
-    let has_pg18 = matches!(version, StatementsVersion::V6);
-    StatementsRow {
-        ts: row.get("ts_us"),
-        queryid: row.get("queryid"),
-        userid: row.get("userid"),
-        dbid: row.get("dbid"),
-        toplevel: has_toplevel.then(|| row.get("toplevel")),
-        datname: row.get("datname"),
-        usename: row.get("usename"),
-        query: row.get("query"),
-        calls: row.get("calls"),
-        rows: row.get("rows"),
-        plans: has_split.then(|| row.get("plans")),
-        // The legacy column is `total_time`; V2+ renamed it to `total_exec_time`.
-        total_time: match version {
-            StatementsVersion::V1 => row.get("total_time"),
-            _ => row.get("total_exec_time"),
+pg_row_mapper! {
+    StatementsCols(version: StatementsVersion) => StatementsRow {
+        ts: i64 = "ts_us",
+        queryid: Option<i64> = "queryid",
+        userid: u32 = "userid",
+        dbid: u32 = "dbid",
+        toplevel: bool = "toplevel"
+            if matches!(
+                version,
+                StatementsVersion::V3
+                    | StatementsVersion::V4
+                    | StatementsVersion::V5
+                    | StatementsVersion::V6
+            ),
+        datname: Option<String> = "datname",
+        usename: Option<String> = "usename",
+        query: Option<String> = "query",
+        calls: i64 = "calls",
+        rows: i64 = "rows",
+        plans: i64 = "plans"
+            if !matches!(version, StatementsVersion::V1),
+        total_time: f64 = {
+            match version {
+                StatementsVersion::V1 => "total_time",
+                _ => "total_exec_time",
+            }
         },
-        total_plan_time: has_split.then(|| row.get("total_plan_time")),
-        min_time: match version {
-            StatementsVersion::V1 => row.get("min_time"),
-            _ => row.get("min_exec_time"),
+        total_plan_time: f64 = "total_plan_time"
+            if !matches!(version, StatementsVersion::V1),
+        min_time: f64 = {
+            match version {
+                StatementsVersion::V1 => "min_time",
+                _ => "min_exec_time",
+            }
         },
-        max_time: match version {
-            StatementsVersion::V1 => row.get("max_time"),
-            _ => row.get("max_exec_time"),
+        max_time: f64 = {
+            match version {
+                StatementsVersion::V1 => "max_time",
+                _ => "max_exec_time",
+            }
         },
-        mean_time: match version {
-            StatementsVersion::V1 => row.get("mean_time"),
-            _ => row.get("mean_exec_time"),
+        mean_time: f64 = {
+            match version {
+                StatementsVersion::V1 => "mean_time",
+                _ => "mean_exec_time",
+            }
         },
-        stddev_time: match version {
-            StatementsVersion::V1 => row.get("stddev_time"),
-            _ => row.get("stddev_exec_time"),
+        stddev_time: f64 = {
+            match version {
+                StatementsVersion::V1 => "stddev_time",
+                _ => "stddev_exec_time",
+            }
         },
-        min_plan_time: has_split.then(|| row.get("min_plan_time")),
-        max_plan_time: has_split.then(|| row.get("max_plan_time")),
-        mean_plan_time: has_split.then(|| row.get("mean_plan_time")),
-        stddev_plan_time: has_split.then(|| row.get("stddev_plan_time")),
-        shared_blks_hit: row.get("shared_blks_hit"),
-        shared_blks_read: row.get("shared_blks_read"),
-        shared_blks_dirtied: row.get("shared_blks_dirtied"),
-        shared_blks_written: row.get("shared_blks_written"),
-        local_blks_hit: row.get("local_blks_hit"),
-        local_blks_read: row.get("local_blks_read"),
-        local_blks_dirtied: row.get("local_blks_dirtied"),
-        local_blks_written: row.get("local_blks_written"),
-        temp_blks_read: row.get("temp_blks_read"),
-        temp_blks_written: row.get("temp_blks_written"),
-        // Pre-1.11 the pair is `blk_read_time`; 1.11+ renamed it to
-        // `shared_blk_read_time`.
-        blk_read_time: if has_pg17 {
-            row.get("shared_blk_read_time")
-        } else {
-            row.get("blk_read_time")
+        min_plan_time: f64 = "min_plan_time"
+            if !matches!(version, StatementsVersion::V1),
+        max_plan_time: f64 = "max_plan_time"
+            if !matches!(version, StatementsVersion::V1),
+        mean_plan_time: f64 = "mean_plan_time"
+            if !matches!(version, StatementsVersion::V1),
+        stddev_plan_time: f64 = "stddev_plan_time"
+            if !matches!(version, StatementsVersion::V1),
+        shared_blks_hit: i64 = "shared_blks_hit",
+        shared_blks_read: i64 = "shared_blks_read",
+        shared_blks_dirtied: i64 = "shared_blks_dirtied",
+        shared_blks_written: i64 = "shared_blks_written",
+        local_blks_hit: i64 = "local_blks_hit",
+        local_blks_read: i64 = "local_blks_read",
+        local_blks_dirtied: i64 = "local_blks_dirtied",
+        local_blks_written: i64 = "local_blks_written",
+        temp_blks_read: i64 = "temp_blks_read",
+        temp_blks_written: i64 = "temp_blks_written",
+        blk_read_time: f64 = {
+            match version {
+                StatementsVersion::V5 | StatementsVersion::V6 => "shared_blk_read_time",
+                _ => "blk_read_time",
+            }
         },
-        blk_write_time: if has_pg17 {
-            row.get("shared_blk_write_time")
-        } else {
-            row.get("blk_write_time")
+        blk_write_time: f64 = {
+            match version {
+                StatementsVersion::V5 | StatementsVersion::V6 => "shared_blk_write_time",
+                _ => "blk_write_time",
+            }
         },
-        local_blk_read_time: has_pg17.then(|| row.get("local_blk_read_time")),
-        local_blk_write_time: has_pg17.then(|| row.get("local_blk_write_time")),
-        temp_blk_read_time: has_temp_time.then(|| row.get("temp_blk_read_time")),
-        temp_blk_write_time: has_temp_time.then(|| row.get("temp_blk_write_time")),
-        wal_records: has_split.then(|| row.get("wal_records")),
-        wal_fpi: has_split.then(|| row.get("wal_fpi")),
-        wal_bytes: has_split.then(|| row.get("wal_bytes")),
-        wal_buffers_full: has_pg18.then(|| row.get("wal_buffers_full")),
-        jit_functions: has_jit.then(|| row.get("jit_functions")),
-        jit_generation_time: has_jit.then(|| row.get("jit_generation_time")),
-        jit_inlining_count: has_jit.then(|| row.get("jit_inlining_count")),
-        jit_inlining_time: has_jit.then(|| row.get("jit_inlining_time")),
-        jit_optimization_count: has_jit.then(|| row.get("jit_optimization_count")),
-        jit_optimization_time: has_jit.then(|| row.get("jit_optimization_time")),
-        jit_emission_count: has_jit.then(|| row.get("jit_emission_count")),
-        jit_emission_time: has_jit.then(|| row.get("jit_emission_time")),
-        jit_deform_count: has_pg17.then(|| row.get("jit_deform_count")),
-        jit_deform_time: has_pg17.then(|| row.get("jit_deform_time")),
-        parallel_workers_to_launch: has_pg18.then(|| row.get("parallel_workers_to_launch")),
-        parallel_workers_launched: has_pg18.then(|| row.get("parallel_workers_launched")),
-        stats_since: has_pg17.then(|| row.get("stats_since_us")).flatten(),
-        minmax_stats_since: has_pg17.then(|| row.get("minmax_stats_since_us")).flatten(),
+        local_blk_read_time: f64 = "local_blk_read_time"
+            if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
+        local_blk_write_time: f64 = "local_blk_write_time"
+            if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
+        temp_blk_read_time: f64 = "temp_blk_read_time"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        temp_blk_write_time: f64 = "temp_blk_write_time"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        wal_records: i64 = "wal_records"
+            if !matches!(version, StatementsVersion::V1),
+        wal_fpi: i64 = "wal_fpi"
+            if !matches!(version, StatementsVersion::V1),
+        wal_bytes: i64 = "wal_bytes"
+            if !matches!(version, StatementsVersion::V1),
+        wal_buffers_full: i64 = "wal_buffers_full"
+            if matches!(version, StatementsVersion::V6),
+        jit_functions: i64 = "jit_functions"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        jit_generation_time: f64 = "jit_generation_time"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        jit_inlining_count: i64 = "jit_inlining_count"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        jit_inlining_time: f64 = "jit_inlining_time"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        jit_optimization_count: i64 = "jit_optimization_count"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        jit_optimization_time: f64 = "jit_optimization_time"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        jit_emission_count: i64 = "jit_emission_count"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        jit_emission_time: f64 = "jit_emission_time"
+            if matches!(
+                version,
+                StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
+            ),
+        jit_deform_count: i64 = "jit_deform_count"
+            if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
+        jit_deform_time: f64 = "jit_deform_time"
+            if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
+        parallel_workers_to_launch: i64 = "parallel_workers_to_launch"
+            if matches!(version, StatementsVersion::V6),
+        parallel_workers_launched: i64 = "parallel_workers_launched"
+            if matches!(version, StatementsVersion::V6),
+        stats_since: Option<i64> = "stats_since_us"
+            if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
+        minmax_stats_since: Option<i64> = "minmax_stats_since_us"
+            if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
     }
 }
 
@@ -828,20 +886,24 @@ pub async fn statements_extversion(
 /// `max_statements` is the per-axis top-N row count.
 ///
 /// # Errors
-/// Returns the [`tokio_postgres::Error`] if the query fails.
+/// Returns a [`crate::PgCollectError`] if the query fails or if the returned
+/// columns do not match the selected layout.
 pub async fn collect_statements(
     client: &Client,
     version: StatementsVersion,
     max_statements: i64,
-) -> Result<(Vec<StatementsRow>, u64), tokio_postgres::Error> {
-    let rows = client
-        .query(&statements_query(version), &[&max_statements])
-        .await?;
+) -> Result<(Vec<StatementsRow>, u64), crate::PgCollectError> {
+    let sql = statements_query(version);
+    let stmt = client.prepare(&sql).await?;
+    let cols = StatementsCols::new(version, stmt.columns())?;
+    let rows = client.query(&stmt, &[&max_statements]).await?;
     let source_total = rows
         .first()
         .map_or(0, |row| row.get::<_, i64>("source_total"));
     Ok((
-        rows.iter().map(|row| row_from_pg(row, version)).collect(),
+        rows.iter()
+            .map(|row| cols.read(row))
+            .collect::<Result<Vec<_>, _>>()?,
         u64::try_from(source_total).unwrap_or(0),
     ))
 }
@@ -849,7 +911,8 @@ pub async fn collect_statements(
 #[cfg(test)]
 mod tests {
     use super::{
-        StatementsRow, StatementsVersion, statements_query, statements_version, to_v1, to_v2, to_v6,
+        StatementsCols, StatementsRow, StatementsVersion, statements_query, statements_version,
+        to_v1, to_v2, to_v6,
     };
     use kronika_registry::StrId;
     use std::convert::Infallible;
@@ -925,6 +988,76 @@ mod tests {
             stats_since: Some(1_500),
             minmax_stats_since: Some(1_800),
         }
+    }
+
+    fn v1_column_names() -> [&'static str; 26] {
+        [
+            "ts_us",
+            "queryid",
+            "userid",
+            "dbid",
+            "datname",
+            "usename",
+            "query",
+            "calls",
+            "rows",
+            "total_time",
+            "min_time",
+            "max_time",
+            "mean_time",
+            "stddev_time",
+            "shared_blks_hit",
+            "shared_blks_read",
+            "shared_blks_dirtied",
+            "shared_blks_written",
+            "local_blks_hit",
+            "local_blks_read",
+            "local_blks_dirtied",
+            "local_blks_written",
+            "temp_blks_read",
+            "temp_blks_written",
+            "blk_read_time",
+            "blk_write_time",
+        ]
+    }
+
+    fn v2_columns_with_legacy_exec_names() -> Vec<&'static str> {
+        let mut names = v1_column_names().to_vec();
+        names.extend([
+            "plans",
+            "total_plan_time",
+            "min_plan_time",
+            "max_plan_time",
+            "mean_plan_time",
+            "stddev_plan_time",
+            "wal_records",
+            "wal_fpi",
+            "wal_bytes",
+        ]);
+        names
+    }
+
+    #[test]
+    fn statements_row_mapper_accepts_v1_legacy_timing_names() {
+        let cols = StatementsCols::new_from_names(StatementsVersion::V1, v1_column_names())
+            .expect("V1 columns should resolve with legacy timing names");
+
+        assert!(cols.plans.is_none());
+        assert!(cols.toplevel.is_none());
+    }
+
+    #[test]
+    fn statements_row_mapper_requires_exec_timing_names_for_v2() {
+        let err = StatementsCols::new_from_names(
+            StatementsVersion::V2,
+            v2_columns_with_legacy_exec_names(),
+        )
+        .expect_err("V2 should require total_exec_time instead of legacy total_time");
+
+        assert_eq!(
+            err.to_string(),
+            "StatementsRow.total_time: missing PostgreSQL column `total_exec_time`"
+        );
     }
 
     #[test]

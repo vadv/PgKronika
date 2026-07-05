@@ -540,7 +540,7 @@ macro_rules! pg_row_mapper {
             fn read(&self, row: &tokio_postgres::Row) -> Result<$row_ty, crate::PgRowError> {
                 Ok($row_ty {
                     $(
-                        $field: pg_row_mapper!(@read self, row, $field $(, $condition)?),
+                        $field: pg_row_mapper!(@read self, row, $field, $ty $(, $condition)?),
                     )+
                 })
             }
@@ -581,14 +581,11 @@ macro_rules! pg_row_mapper {
             Ok(None)
         }
     }};
-    (@read $self:ident, $row:ident, $field:ident) => {
+    (@read $self:ident, $row:ident, $field:ident, $ty:ty) => {
         $self.$field.get($row)?
     };
-    (@read $self:ident, $row:ident, $field:ident, $condition:expr) => {
-        match &$self.$field {
-            Some(col) => col.get($row)?,
-            None => None,
-        }
+    (@read $self:ident, $row:ident, $field:ident, $ty:ty, $condition:expr) => {
+        crate::pg_row::read_gated($self.$field.as_ref(), $row)?
     };
 }
 ```
@@ -729,7 +726,7 @@ pg_row_mapper! {
         queryid: Option<i64> = "queryid",
         userid: u32 = "userid",
         dbid: u32 = "dbid",
-        toplevel: Option<bool> = "toplevel"
+        toplevel: bool = "toplevel"
             if matches!(
                 version,
                 StatementsVersion::V3
@@ -742,7 +739,7 @@ pg_row_mapper! {
         query: Option<String> = "query",
         calls: i64 = "calls",
         rows: i64 = "rows",
-        plans: Option<i64> = "plans"
+        plans: i64 = "plans"
             if !matches!(version, StatementsVersion::V1),
         total_time: f64 = {
             match version {
@@ -750,7 +747,7 @@ pg_row_mapper! {
                 _ => "total_exec_time",
             }
         },
-        total_plan_time: Option<f64> = "total_plan_time"
+        total_plan_time: f64 = "total_plan_time"
             if !matches!(version, StatementsVersion::V1),
         min_time: f64 = {
             match version {
@@ -776,13 +773,13 @@ pg_row_mapper! {
                 _ => "stddev_exec_time",
             }
         },
-        min_plan_time: Option<f64> = "min_plan_time"
+        min_plan_time: f64 = "min_plan_time"
             if !matches!(version, StatementsVersion::V1),
-        max_plan_time: Option<f64> = "max_plan_time"
+        max_plan_time: f64 = "max_plan_time"
             if !matches!(version, StatementsVersion::V1),
-        mean_plan_time: Option<f64> = "mean_plan_time"
+        mean_plan_time: f64 = "mean_plan_time"
             if !matches!(version, StatementsVersion::V1),
-        stddev_plan_time: Option<f64> = "stddev_plan_time"
+        stddev_plan_time: f64 = "stddev_plan_time"
             if !matches!(version, StatementsVersion::V1),
         shared_blks_hit: i64 = "shared_blks_hit",
         shared_blks_read: i64 = "shared_blks_read",
@@ -806,75 +803,75 @@ pg_row_mapper! {
                 _ => "blk_write_time",
             }
         },
-        local_blk_read_time: Option<f64> = "local_blk_read_time"
+        local_blk_read_time: f64 = "local_blk_read_time"
             if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
-        local_blk_write_time: Option<f64> = "local_blk_write_time"
+        local_blk_write_time: f64 = "local_blk_write_time"
             if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
-        temp_blk_read_time: Option<f64> = "temp_blk_read_time"
+        temp_blk_read_time: f64 = "temp_blk_read_time"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        temp_blk_write_time: Option<f64> = "temp_blk_write_time"
+        temp_blk_write_time: f64 = "temp_blk_write_time"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        wal_records: Option<i64> = "wal_records"
+        wal_records: i64 = "wal_records"
             if !matches!(version, StatementsVersion::V1),
-        wal_fpi: Option<i64> = "wal_fpi"
+        wal_fpi: i64 = "wal_fpi"
             if !matches!(version, StatementsVersion::V1),
-        wal_bytes: Option<i64> = "wal_bytes"
+        wal_bytes: i64 = "wal_bytes"
             if !matches!(version, StatementsVersion::V1),
-        wal_buffers_full: Option<i64> = "wal_buffers_full"
+        wal_buffers_full: i64 = "wal_buffers_full"
             if matches!(version, StatementsVersion::V6),
-        jit_functions: Option<i64> = "jit_functions"
+        jit_functions: i64 = "jit_functions"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        jit_generation_time: Option<f64> = "jit_generation_time"
+        jit_generation_time: f64 = "jit_generation_time"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        jit_inlining_count: Option<i64> = "jit_inlining_count"
+        jit_inlining_count: i64 = "jit_inlining_count"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        jit_inlining_time: Option<f64> = "jit_inlining_time"
+        jit_inlining_time: f64 = "jit_inlining_time"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        jit_optimization_count: Option<i64> = "jit_optimization_count"
+        jit_optimization_count: i64 = "jit_optimization_count"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        jit_optimization_time: Option<f64> = "jit_optimization_time"
+        jit_optimization_time: f64 = "jit_optimization_time"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        jit_emission_count: Option<i64> = "jit_emission_count"
+        jit_emission_count: i64 = "jit_emission_count"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        jit_emission_time: Option<f64> = "jit_emission_time"
+        jit_emission_time: f64 = "jit_emission_time"
             if matches!(
                 version,
                 StatementsVersion::V4 | StatementsVersion::V5 | StatementsVersion::V6
             ),
-        jit_deform_count: Option<i64> = "jit_deform_count"
+        jit_deform_count: i64 = "jit_deform_count"
             if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
-        jit_deform_time: Option<f64> = "jit_deform_time"
+        jit_deform_time: f64 = "jit_deform_time"
             if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),
-        parallel_workers_to_launch: Option<i64> = "parallel_workers_to_launch"
+        parallel_workers_to_launch: i64 = "parallel_workers_to_launch"
             if matches!(version, StatementsVersion::V6),
-        parallel_workers_launched: Option<i64> = "parallel_workers_launched"
+        parallel_workers_launched: i64 = "parallel_workers_launched"
             if matches!(version, StatementsVersion::V6),
         stats_since: Option<i64> = "stats_since_us"
             if matches!(version, StatementsVersion::V5 | StatementsVersion::V6),

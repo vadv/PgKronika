@@ -91,7 +91,7 @@ macro_rules! pg_row_mapper {
             fn read(&self, row: &tokio_postgres::Row) -> Result<$row_ty, crate::PgRowError> {
                 Ok($row_ty {
                     $(
-                        $field: pg_row_mapper!(@read self, row, $field $(, $condition)?),
+                        $field: pg_row_mapper!(@read self, row, $field, $ty $(, $condition)?),
                     )+
                 })
             }
@@ -132,14 +132,11 @@ macro_rules! pg_row_mapper {
             Ok(None)
         }
     }};
-    (@read $self:ident, $row:ident, $field:ident) => {
+    (@read $self:ident, $row:ident, $field:ident, $ty:ty) => {
         $self.$field.get($row)?
     };
-    (@read $self:ident, $row:ident, $field:ident, $condition:expr) => {
-        match &$self.$field {
-            Some(col) => col.get($row)?,
-            None => None,
-        }
+    (@read $self:ident, $row:ident, $field:ident, $ty:ty, $condition:expr) => {
+        crate::pg_row::read_gated($self.$field.as_ref(), $row)?
     };
 }
 
