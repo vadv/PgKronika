@@ -1163,7 +1163,9 @@ waits, lifecycle) и полный byte-level `csvlog` parser отложены д
 
 Одна строка представляет группу `(severity, category, pattern)` в текущем окне.
 Для `stderr` SQLSTATE извлекается только из сообщений вида `XXXXX:  ...`;
-`database` и `username` остаются `NULL` до реализации `csvlog`.
+`database` и `username` остаются `NULL` до реализации `csvlog`. Обычные
+`LOG:` строки не пишутся в `pg_log_errors`; в этом scope допускаются только
+отобранные `LOG:` события падения backend/postmaster и OOM/SIGKILL.
 
 Нормализация `pattern` заменяет кавычки, числа и содержимое скобок на `...`.
 `STATEMENT:` или строка продолжения после ошибки прикрепляется к первой группе,
@@ -1171,7 +1173,7 @@ waits, lifecycle) и полный byte-level `csvlog` parser отложены д
 
 ```text
 ts                   ts    T   // время записи из prefix; иначе время collection
-severity             u8    L   // 0=ERROR, 1=FATAL, 2=PANIC, 3=WARNING
+severity             u8    L   // 0=ERROR, 1=FATAL, 2=PANIC, 3=WARNING, 4=LOG crash/OOM
 category             u8    L   // 0=lock ... 10=other
 sqlstate             str?  L
 pattern              str?  L   // NULL только при dictionary degradation
