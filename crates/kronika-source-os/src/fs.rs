@@ -21,12 +21,8 @@ pub struct FsSpace {
 /// very large filesystems never wrap or panic.
 #[must_use]
 pub fn space_from_raw(blocks: u64, bavail: u64, frsize: u64) -> FsSpace {
-    let saturating_mul = |a: u64, b: u64| -> i64 {
-        a.saturating_mul(b)
-            .min(i64::MAX as u64)
-            .try_into()
-            .unwrap_or(i64::MAX)
-    };
+    let saturating_mul =
+        |a: u64, b: u64| -> i64 { a.saturating_mul(b).min(i64::MAX as u64).cast_signed() };
     FsSpace {
         total_bytes: saturating_mul(blocks, frsize),
         free_bytes: saturating_mul(bavail, frsize),
@@ -58,8 +54,12 @@ pub(crate) fn parse_fixture(fixture: &str, mount_point: &str) -> Option<FsSpace>
         if entry.is_empty() {
             continue;
         }
-        let (path, rest) = entry.split_once('=')?;
-        let (total_str, free_str) = rest.split_once(':')?;
+        let Some((path, rest)) = entry.split_once('=') else {
+            continue;
+        };
+        let Some((total_str, free_str)) = rest.split_once(':') else {
+            continue;
+        };
         if path == mount_point {
             let total_bytes = total_str.trim().parse().ok()?;
             let free_bytes = free_str.trim().parse().ok()?;
@@ -204,6 +204,20 @@ mod tests {
             })
         );
         assert_eq!(parse_fixture(fixture, "/missing"), None);
+    }
+
+    #[test]
+    fn statvfs_fixture_malformed_entry_skipped() {
+        // A malformed entry before the target must be skipped, not abort the scan.
+        assert_eq!(
+            parse_fixture("garbage;/data=1000:400", "/data"),
+            Some(FsSpace {
+                total_bytes: 1000,
+                free_bytes: 400
+            })
+        );
+        // A miss still returns None even when malformed entries are present.
+        assert_eq!(parse_fixture("garbage;/data=1000:400", "/other"), None);
     }
 
     #[test]
