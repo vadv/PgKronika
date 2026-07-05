@@ -2353,8 +2353,10 @@ fn read_optional_os_file(fs: &ProcFs, rel: &'static str, type_id: u32) -> Option
 /// Read every procfs OS section synchronously.
 ///
 /// Counter sections (cpu, stat, meminfo, loadavg, vmstat, psi, diskstats,
-/// netdev) are gated on `due.has(SourceKind::OsCore)`. The slow-cadence
-/// sections (mountinfo, topology) are gated on `due.has(SourceKind::OsMountTopo)`.
+/// netdev, snmp, netstat) are gated on `due.has(SourceKind::OsCore)` and are
+/// never emitted on an OsMountTopo-only tick. Mountinfo is parsed on every
+/// `OsCore` tick for attribution and emitted, together with topology, only when
+/// `due.has(SourceKind::OsMountTopo)` is true.
 /// On file read or parse failure the affected section is skipped and a
 /// `collection_degraded` event is logged; zeros are never fabricated. `scope`
 /// is the host scope for device-local sections; network sections carry their
@@ -2658,6 +2660,12 @@ fn collect_os_sources(
         // points and filesystem capacity. Mount strings are interned here.
         os.mountinfo = collect_mountinfo(interner, scope, ts, &mounts, os.diskstats.as_slice());
         os.topology = collect_topology(fs, interner, scope, ts);
+        // diskstats was collected above only for the device set used by
+        // collect_mountinfo. It is an OsCore section and must not be emitted
+        // on an OsMountTopo-only tick.
+        if !due.has(SourceKind::OsCore) {
+            os.diskstats = Vec::new();
+        }
     }
 
     os
@@ -4665,11 +4673,12 @@ fn push_store_plans_ossc(
 #[cfg(test)]
 mod tests {
     use super::{
-        Intervals, MountEntry, PlansSourceCache, Scheduler, SegmentState, SourceCoverage,
-        SourceKind, StatementsVersion, SysFs, cap_disks, diskstats, min_total_time,
-        resolve_major_zero, seal_reason, statements_type_id, timer_sleep_delay,
+        DueSet, Intervals, MountEntry, PlansSourceCache, Scheduler, SegmentState, SourceCoverage,
+        SourceKind, StatementsVersion, SysFs, cap_disks, collect_os_sources, diskstats,
+        min_total_time, resolve_major_zero, seal_reason, statements_type_id, timer_sleep_delay,
         user_indexes_type_id, user_tables_type_id,
     };
+    use kronika_source_os::ProcFs;
 
     fn disk_row(major: i32, minor: i32) -> diskstats::DiskstatsRow {
         let line = format!("{major} {minor} dev{minor} 1 0 8 2 3 0 24 4 0 6 6\n");
@@ -6067,6 +6076,39 @@ mod tests {
                 .iter()
                 .any(|entry| entry.type_id == 1_011_001),
             "the part carries the pg_locks wait-tree V1 section"
+        );
+    }
+
+    // Verify that diskstats rows are NOT emitted on an OsMountTopo-only tick
+    // (the cadence defect fixed in Finding 1: diskstats was collected for the
+    // attribution device lookup but then forwarded to push_os_sources).
+    #[test]
+    fn collect_os_sources_no_diskstats_on_mount_topo_only_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proc_root = dir.path();
+
+        // diskstats: one device (8:1)
+        let diskstats_line = "8 1 sda1 1 0 8 2 3 0 24 4 0 6 6\n";
+        std::fs::write(proc_root.join("diskstats"), diskstats_line).expect("write diskstats");
+
+        // self/mountinfo: sda1 mounted at /data
+        std::fs::create_dir_all(proc_root.join("self")).expect("mkdir self");
+        let mountinfo_line = "30 25 8:1 / /data rw - ext4 /dev/sda1 rw\n";
+        std::fs::write(proc_root.join("self/mountinfo"), mountinfo_line).expect("write mountinfo");
+
+        let fs = ProcFs::new(proc_root.to_path_buf());
+        let mut interner = Interner::new(activity_dict_limits());
+        let due = DueSet::for_test(vec![SourceKind::OsMountTopo]);
+
+        let os = collect_os_sources(&fs, &mut interner, 0, 0, false, &due);
+
+        assert!(
+            os.diskstats.is_empty(),
+            "diskstats must not be emitted on an OsMountTopo-only tick"
+        );
+        assert!(
+            !os.mountinfo.is_empty(),
+            "mountinfo rows must still be built from the device set"
         );
     }
 }
