@@ -43,16 +43,24 @@ pub(crate) fn detect_container_from_cgroup(cgroup: &str) -> bool {
 
 /// Multi-signal container detection.
 ///
-/// Note: the `/.dockerenv` signal uses a literal host path and does NOT honor
-/// `KRONIKA_PROC_ROOT`. Only the cgroup signal reads through `fs` (proc root).
-/// A full multi-root fix is deferred beyond Wave 2.
+/// When `KRONIKA_PROC_ROOT` is set (BDD fixtures or a node-agent pointed at
+/// `/host/proc`), detection uses only the cgroup file read through that root.
+/// The `/.dockerenv` and `KUBERNETES_SERVICE_HOST` signals describe the
+/// collector's own packaging, not the root it is observing, so they are
+/// skipped in that case.
+///
+/// When `KRONIKA_PROC_ROOT` is absent (default `/proc`), all three signals
+/// are checked — matching Wave 1 production behavior.
 #[must_use]
 pub fn detect_container(fs: &ProcFs) -> bool {
-    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        return true;
-    }
-    if std::path::Path::new("/.dockerenv").exists() {
-        return true;
+    let proc_root_overridden = std::env::var_os("KRONIKA_PROC_ROOT").is_some();
+    if !proc_root_overridden {
+        if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+            return true;
+        }
+        if std::path::Path::new("/.dockerenv").exists() {
+            return true;
+        }
     }
     fs.read_raw("1/cgroup")
         .is_ok_and(|c| detect_container_from_cgroup(&c))
