@@ -357,7 +357,8 @@ tcp_syn_retrans        i64  C
 
 `on_change`, политика материализации `every_segment_last_known`. Нужен для
 атрибуции `diskstats` к точкам монтирования, поэтому актуальная копия пишется в
-каждый сегмент даже без изменений.
+каждый сегмент даже без изменений. Wave 2 добавляет ёмкость ФС (`total_bytes`,
+`free_bytes`) через `statvfs(2)`: `NULL`, когда вызов не удался.
 
 Учитываются:
 
@@ -367,17 +368,21 @@ tcp_syn_retrans        i64  C
 
 ```text
 ts             ts    T
-major          u32   L
-minor          u32   L
+major          i32   L
+minor          i32   L
 mount_point    str   L
 fstype         str   L
 source         str   L
 is_k8s_infra   bool  L
+total_bytes    i64?  G   // NULL когда statvfs не удался
+free_bytes     i64?  G   // NULL когда statvfs не удался
+scope          u8    L
 ```
 
 ## `1_113_001` `cpuinfo` / topology
 
-`on_change`, политика материализации `every_segment_last_known`.
+`on_change`, политика материализации `every_segment_last_known`. Wave 2 пишет
+mountinfo и topology `on_change` с повторной «вооружённостью» на каждый сегмент.
 
 ```text
 ts          ts   T
@@ -386,6 +391,7 @@ model_name  str  L
 mhz_max     f64  L
 core_id     i32  L
 socket_id   i32  L
+scope       u8   L
 ```
 
 ## cgroup `1_200_001` - `1_204_001`

@@ -1,5 +1,6 @@
 //! Parsers for `/proc` virtual filesystem files.
 
+pub mod cpuinfo;
 pub mod diskstats;
 pub mod loadavg;
 pub mod meminfo;
