@@ -43,7 +43,7 @@ Feature: PostgreSQL log-domain stderr fixtures
       | count    | 1 |
 
   @pg16 @serial
-  Scenario: deadlock DETAIL HINT CONTEXT stay out of statement text
+  Scenario: deadlock diagnostics are separate from statement text
     Given a fresh database on PostgreSQL 16
     And a PostgreSQL stderr log fixture:
       """
