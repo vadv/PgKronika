@@ -42,6 +42,10 @@ pub(crate) fn detect_container_from_cgroup(cgroup: &str) -> bool {
 }
 
 /// Multi-signal container detection.
+///
+/// Note: the `/.dockerenv` signal uses a literal host path and does NOT honor
+/// `KRONIKA_PROC_ROOT`. Only the cgroup signal reads through `fs` (proc root).
+/// A full multi-root fix is deferred beyond Wave 2.
 #[must_use]
 pub fn detect_container(fs: &ProcFs) -> bool {
     if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
@@ -54,9 +58,30 @@ pub fn detect_container(fs: &ProcFs) -> bool {
         .is_ok_and(|c| detect_container_from_cgroup(&c))
 }
 
+/// Maps the container flag to the appropriate network scope.
+///
+/// Pure function — test this directly to avoid env/filesystem non-determinism.
+#[must_use]
+pub(crate) const fn scope_for_net(in_container: bool) -> OsScope {
+    if in_container {
+        OsScope::PodNet
+    } else {
+        OsScope::Host
+    }
+}
+
+/// Scope for `/proc/net/*` sections.
+///
+/// Returns `PodNet` inside a container (the file describes the pod's network
+/// namespace, not the node's), `Host` otherwise.
+#[must_use]
+pub fn net_scope(fs: &ProcFs) -> OsScope {
+    scope_for_net(detect_container(fs))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OsScope, detect_container_from_cgroup};
+    use super::{OsScope, detect_container_from_cgroup, scope_for_net};
 
     #[test]
     fn scope_encodes_as_stable_u8() {
@@ -73,5 +98,11 @@ mod tests {
         assert!(detect_container_from_cgroup("0::/kubepods/pod123/abc\n"));
         assert!(detect_container_from_cgroup("12:pids:/docker/deadbeef\n"));
         assert!(!detect_container_from_cgroup("0::/init.scope\n"));
+    }
+
+    #[test]
+    fn scope_for_net_maps_container_flag() {
+        assert_eq!(scope_for_net(true), OsScope::PodNet);
+        assert_eq!(scope_for_net(false), OsScope::Host);
     }
 }

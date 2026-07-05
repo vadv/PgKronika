@@ -19,4 +19,4 @@ pub mod proc;
 pub use proc::stat::{CpuRow, ParseError, parse_cpu};
 
 mod scope;
-pub use scope::{OsScope, detect_container};
+pub use scope::{OsScope, detect_container, net_scope};
