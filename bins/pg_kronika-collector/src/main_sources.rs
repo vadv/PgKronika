@@ -88,7 +88,7 @@ pub(crate) struct MainConnSources {
 /// Read the due main-connection sources.
 #[allow(
     clippy::too_many_lines,
-    reason = "main-connection collection keeps each source's query, row count, and failure context adjacent"
+    reason = "main-connection reads share one snapshot timestamp and failure policy"
 )]
 pub(crate) async fn collect_main_conn_sources(
     client: &Client,
@@ -384,8 +384,7 @@ pub(crate) async fn collect_main_conn_sources(
     })
 }
 
-/// Whether the activity snapshot shows a backend waiting on a heavyweight
-/// lock — the free precheck for the lock-wait graph.
+/// Whether the activity snapshot shows a heavyweight lock waiter.
 fn activity_has_lock_waiters(rows: &[ActivityRow]) -> bool {
     rows.iter()
         .any(|row| row.wait_event_type.as_deref() == Some("Lock"))
