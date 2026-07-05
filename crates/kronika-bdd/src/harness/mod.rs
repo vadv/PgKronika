@@ -84,6 +84,11 @@ pub(crate) struct HarnessState {
     /// Kept alive for the duration of the scenario; path is passed to the
     /// collector through `KRONIKA_PROC_ROOT` in `collector_env`.
     proc_fixture: Option<TempDir>,
+    /// A fixture `/sys` tree created lazily by `fixture_sys_root`.
+    ///
+    /// Kept alive for the duration of the scenario; path is passed to the
+    /// collector through `KRONIKA_SYS_ROOT` in `collector_env`.
+    sys_fixture: Option<TempDir>,
     /// Client-tool processes spawned by steps (e.g. `pg_receivewal`);
     /// killed in cleanup before the scenario database is dropped. The
     /// tempdir holds the tool's working files for the process lifetime.
@@ -390,6 +395,33 @@ impl HarnessState {
              full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
         )?;
 
+        // Wave 2: minimal valid content so parsers don't fail when files exist.
+        // diskstats: one legacy 14-field partition entry so the file is non-empty.
+        self.write_proc_fixture("diskstats", "   8       0 sda 0 0 0 0 0 0 0 0 0 0 0\n")?;
+        // net/dev: header lines + loopback only.
+        self.write_proc_fixture(
+            "net/dev",
+            "Inter-|   Receive                                                |  Transmit\n\
+             face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop  fifo colls carrier compressed\n\
+                lo:       0       0    0    0    0     0          0         0        0       0    0    0     0     0       0          0\n",
+        )?;
+        // net/snmp: minimal Tcp/Udp groups.
+        self.write_proc_fixture(
+            "net/snmp",
+            "Tcp: ActiveOpens PassiveOpens AttemptFails EstabResets InSegs OutSegs RetransSegs InErrs OutRsts CurrEstab\n\
+             Tcp: 0 0 0 0 0 0 0 0 0 0\n\
+             Udp: InDatagrams NoPorts InErrors OutDatagrams\n\
+             Udp: 0 0 0 0\n",
+        )?;
+        // net/netstat: minimal TcpExt group.
+        self.write_proc_fixture(
+            "net/netstat",
+            "TcpExt: ListenOverflows ListenDrops TCPTimeouts TCPFastRetrans TCPSlowStartRetrans TCPOFOQueue TCPSynRetrans\n\
+             TcpExt: 0 0 0 0 0 0 0\n",
+        )?;
+        // self/mountinfo: empty (no mounts to attribute).
+        self.write_proc_fixture("self/mountinfo", "")?;
+
         Ok(())
     }
 
@@ -412,6 +444,53 @@ impl HarnessState {
         }
         std::fs::write(&target, content)
             .with_context(|| format!("write fixture proc file {rel:?}"))?;
+        Ok(())
+    }
+
+    /// Return the root of the fixture `/sys` tree, creating it on first call.
+    ///
+    /// Pushes `KRONIKA_SYS_ROOT` into the collector env the first time so the
+    /// spawned collector reads the fixture tree instead of the host `/sys`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `TempDir` cannot be created.
+    pub(crate) fn fixture_sys_root(&mut self) -> Result<&Path> {
+        if self.sys_fixture.is_none() {
+            let dir = TempDir::new().context("create fixture sys root")?;
+            let root = dir.path().to_owned();
+            self.sys_fixture = Some(dir);
+            self.add_collector_env(
+                "KRONIKA_SYS_ROOT".to_owned(),
+                root.to_string_lossy().into_owned(),
+            );
+        }
+        Ok(self
+            .sys_fixture
+            .as_ref()
+            .expect("sys_fixture set just above")
+            .path())
+    }
+
+    /// Write `content` to `<sys-fixture-root>/<rel>`, creating parent dirs as needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sys fixture root is not yet initialised, a parent
+    /// directory cannot be created, or the file cannot be written.
+    pub(crate) fn write_sys_fixture(&self, rel: &str, content: &str) -> Result<()> {
+        let root = self
+            .sys_fixture
+            .as_ref()
+            .context("fixture sys root not yet initialised; call fixture_sys_root() first")?
+            .path();
+        let target = root.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create sys fixture dir for {rel:?}"))?;
+        }
+        std::fs::write(&target, content)
+            .with_context(|| format!("write sys fixture file {rel:?}"))?;
         Ok(())
     }
 
@@ -505,8 +584,9 @@ impl HarnessState {
         self.collector_output_dirs.clear();
         self.collector_env.clear();
         self.altered_system_settings.clear();
-        // Drop the fixture proc tree last; the collector already exited.
+        // Drop the fixture trees last; the collector already exited.
         self.proc_fixture = None;
+        self.sys_fixture = None;
     }
 }
 
