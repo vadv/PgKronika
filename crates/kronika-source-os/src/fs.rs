@@ -33,11 +33,11 @@ pub fn space_from_raw(blocks: u64, bavail: u64, frsize: u64) -> FsSpace {
 ///
 /// **Env fixture override:** if `KRONIKA_STATVFS_FIXTURE` is set, its value
 /// is parsed as `path1=TOTAL:FREE;path2=TOTAL:FREE` (bytes, decimal). The
-/// entry whose path equals `mount_point` is returned; no entry → `None`.
+/// entry whose path equals `mount_point` is returned; no entry returns `None`.
 /// This lets BDD tests inject deterministic capacity without a real filesystem.
 ///
 /// Otherwise calls `statvfs(2)` and maps success via [`space_from_raw`].
-/// Returns `None` on any syscall error — a mount can vanish mid-scan.
+/// Returns `None` on any syscall error because a mount can vanish mid-scan.
 #[must_use]
 pub fn statvfs(mount_point: &str) -> Option<FsSpace> {
     if let Ok(fixture) = std::env::var("KRONIKA_STATVFS_FIXTURE") {

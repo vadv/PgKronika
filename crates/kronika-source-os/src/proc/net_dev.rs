@@ -72,7 +72,7 @@ pub fn parse(content: &str) -> Result<Vec<NetDevRow>, ParseError> {
         }
 
         // Split interface name from the rest; the `:` may be glued to the
-        // first counter (e.g. `eth0:1000 …`).
+        // first counter (for example, `eth0:1000 ...`).
         let Some((iface_raw, rest)) = line.split_once(':') else {
             continue;
         };
