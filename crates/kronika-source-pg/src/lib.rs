@@ -24,6 +24,121 @@ macro_rules! marked {
     };
 }
 
+macro_rules! pg_row_mapper {
+    (
+        $cols:ident($version:ident : $version_ty:ty) => $row_ty:ident {
+            $(
+                $field:ident : $ty:ty = $column:tt $(if $condition:expr)?
+            ),+ $(,)?
+        }
+    ) => {
+        #[derive(Debug)]
+        #[allow(
+            dead_code,
+            reason = "some generated fields are read only by generated row decoding"
+        )]
+        struct $cols {
+            $(
+                $field: pg_row_mapper!(@col_ty $ty $(, $condition)?),
+            )+
+        }
+
+        impl $cols {
+            #[allow(
+                dead_code,
+                reason = "tests exercise new_from_names; collectors call new"
+            )]
+            fn new(
+                $version: $version_ty,
+                columns: &[tokio_postgres::Column],
+            ) -> Result<Self, crate::PgRowError> {
+                Self::new_from_names($version, columns.iter().map(tokio_postgres::Column::name))
+            }
+
+            fn new_from_names<I, S>(
+                $version: $version_ty,
+                column_names: I,
+            ) -> Result<Self, crate::PgRowError>
+            where
+                I: IntoIterator<Item = S>,
+                S: AsRef<str>,
+            {
+                let column_names: Vec<S> = column_names.into_iter().collect();
+                Ok(Self {
+                    $(
+                        $field: pg_row_mapper!(
+                            @init
+                            $version,
+                            &column_names,
+                            stringify!($row_ty),
+                            stringify!($field),
+                            $column,
+                            $ty
+                            $(, $condition)?
+                        )?,
+                    )+
+                })
+            }
+
+            #[allow(
+                dead_code,
+                reason = "used after collector row mappings are converted"
+            )]
+            fn read(&self, row: &tokio_postgres::Row) -> Result<$row_ty, crate::PgRowError> {
+                Ok($row_ty {
+                    $(
+                        $field: pg_row_mapper!(@read self, row, $field $(, $condition)?),
+                    )+
+                })
+            }
+        }
+    };
+    (@col_ty $ty:ty) => {
+        crate::pg_row::PgCol<$ty>
+    };
+    (@col_ty $ty:ty, $condition:expr) => {
+        Option<crate::pg_row::PgCol<$ty>>
+    };
+    (@column $version:ident, $column:literal) => {
+        $column
+    };
+    (@column $version:ident, { $column:expr }) => {
+        $column
+    };
+    (@init $version:ident, $columns:expr, $row:expr, $field:expr, $column:tt, $ty:ty) => {{
+        let column = pg_row_mapper!(@column $version, $column);
+        crate::pg_row::PgCol::<$ty>::required(
+            $row,
+            $field,
+            column,
+            ($columns).iter().map(AsRef::as_ref),
+        )
+    }};
+    (@init $version:ident, $columns:expr, $row:expr, $field:expr, $column:tt, $ty:ty, $condition:expr) => {{
+        if $condition {
+            let column = pg_row_mapper!(@column $version, $column);
+            crate::pg_row::PgCol::<$ty>::required(
+                $row,
+                $field,
+                column,
+                ($columns).iter().map(AsRef::as_ref),
+            )
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    }};
+    (@read $self:ident, $row:ident, $field:ident) => {
+        $self.$field.get($row)?
+    };
+    (@read $self:ident, $row:ident, $field:ident, $condition:expr) => {
+        match &$self.$field {
+            Some(col) => col.get($row)?,
+            None => None,
+        }
+    };
+}
+
 mod pg_row;
 pub use pg_row::{PgCollectError, PgRowError};
 

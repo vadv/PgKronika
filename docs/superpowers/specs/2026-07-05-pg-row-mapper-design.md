@@ -41,7 +41,7 @@
 
 ```rust
 pg_row_mapper! {
-    ActivityCols(ActivityVersion) => ActivityRow {
+    ActivityCols(version: ActivityVersion) => ActivityRow {
         ts: i64 = "ts_us",
         pid: i32 = "pid",
         datname: Option<String> = "datname",

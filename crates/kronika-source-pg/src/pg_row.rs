@@ -240,3 +240,71 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod macro_tests {
+    #[allow(dead_code, reason = "macro tests inspect the generated column map")]
+    #[derive(Debug, PartialEq)]
+    struct DemoRow {
+        ts: i64,
+        optional: Option<i64>,
+        gated: Option<i64>,
+        renamed: i64,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum DemoVersion {
+        V1,
+        V2,
+    }
+
+    pg_row_mapper! {
+        DemoCols(version: DemoVersion) => DemoRow {
+            ts: i64 = "ts_us",
+            optional: Option<i64> = "optional_value",
+            gated: Option<i64> = "gated_value"
+                if matches!(version, DemoVersion::V2),
+            renamed: i64 = {
+                match version {
+                    DemoVersion::V1 => "old_name",
+                    DemoVersion::V2 => "new_name",
+                }
+            },
+        }
+    }
+
+    #[test]
+    fn macro_builds_versioned_column_map() {
+        let cols =
+            DemoCols::new_from_names(DemoVersion::V1, ["ts_us", "optional_value", "old_name"])
+                .expect("V1 columns should resolve");
+
+        assert!(cols.gated.is_none());
+    }
+
+    #[test]
+    fn macro_requires_gated_column_when_version_enables_it() {
+        let err =
+            DemoCols::new_from_names(DemoVersion::V2, ["ts_us", "optional_value", "new_name"])
+                .expect_err("V2 should require gated_value");
+
+        assert_eq!(
+            err.to_string(),
+            "DemoRow.gated: missing PostgreSQL column `gated_value`"
+        );
+    }
+
+    #[test]
+    fn macro_uses_versioned_column_alias() {
+        let err = DemoCols::new_from_names(
+            DemoVersion::V2,
+            ["ts_us", "optional_value", "gated_value", "old_name"],
+        )
+        .expect_err("V2 should require the new alias");
+
+        assert_eq!(
+            err.to_string(),
+            "DemoRow.renamed: missing PostgreSQL column `new_name`"
+        );
+    }
+}

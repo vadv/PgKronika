@@ -420,7 +420,7 @@ mod macro_tests {
     }
 
     pg_row_mapper! {
-        DemoCols(DemoVersion) => DemoRow {
+        DemoCols(version: DemoVersion) => DemoRow {
             ts: i64 = "ts_us",
             optional: Option<i64> = "optional_value",
             gated: Option<i64> = "gated_value"
@@ -492,7 +492,7 @@ Add this macro to `crates/kronika-source-pg/src/lib.rs` after `marked!`:
 ```rust
 macro_rules! pg_row_mapper {
     (
-        $cols:ident($version_ty:ty) => $row_ty:ident {
+        $cols:ident($version:ident : $version_ty:ty) => $row_ty:ident {
             $(
                 $field:ident : $ty:ty = $column:tt $(if $condition:expr)?
             ),+ $(,)?
@@ -506,22 +506,26 @@ macro_rules! pg_row_mapper {
 
         impl $cols {
             fn new(
-                version: $version_ty,
+                $version: $version_ty,
                 columns: &[tokio_postgres::Column],
             ) -> Result<Self, crate::PgRowError> {
-                Self::new_from_names(version, columns.iter().map(tokio_postgres::Column::name))
+                Self::new_from_names($version, columns.iter().map(tokio_postgres::Column::name))
             }
 
-            fn new_from_names<'a>(
-                version: $version_ty,
-                column_names: impl IntoIterator<Item = &'a str>,
-            ) -> Result<Self, crate::PgRowError> {
-                let column_names: Vec<&str> = column_names.into_iter().collect();
+            fn new_from_names<I, S>(
+                $version: $version_ty,
+                column_names: I,
+            ) -> Result<Self, crate::PgRowError>
+            where
+                I: IntoIterator<Item = S>,
+                S: AsRef<str>,
+            {
+                let column_names: Vec<S> = column_names.into_iter().collect();
                 Ok(Self {
                     $(
                         $field: pg_row_mapper!(
                             @init
-                            version,
+                            $version,
                             &column_names,
                             stringify!($row_ty),
                             stringify!($field),
@@ -556,12 +560,22 @@ macro_rules! pg_row_mapper {
     };
     (@init $version:ident, $columns:expr, $row:expr, $field:expr, $column:tt, $ty:ty) => {{
         let column = pg_row_mapper!(@column $version, $column);
-        crate::pg_row::PgCol::<$ty>::required($row, $field, column, ($columns).iter().copied())
+        crate::pg_row::PgCol::<$ty>::required(
+            $row,
+            $field,
+            column,
+            ($columns).iter().map(AsRef::as_ref),
+        )
     }};
     (@init $version:ident, $columns:expr, $row:expr, $field:expr, $column:tt, $ty:ty, $condition:expr) => {{
         if $condition {
             let column = pg_row_mapper!(@column $version, $column);
-            crate::pg_row::PgCol::<$ty>::required($row, $field, column, ($columns).iter().copied())
+            crate::pg_row::PgCol::<$ty>::required(
+                $row,
+                $field,
+                column,
+                ($columns).iter().map(AsRef::as_ref),
+            )
                 .map(Some)
         } else {
             Ok(None)
@@ -620,7 +634,7 @@ In `crates/kronika-source-pg/src/activity.rs`, add this mapping near `row_from_p
 
 ```rust
 pg_row_mapper! {
-    ActivityCols(ActivityVersion) => ActivityRow {
+    ActivityCols(version: ActivityVersion) => ActivityRow {
         ts: i64 = "ts_us",
         pid: i32 = "pid",
         leader_pid: Option<i32> = "leader_pid"
@@ -710,7 +724,7 @@ In `crates/kronika-source-pg/src/statements.rs`, add this mapping near `row_from
 
 ```rust
 pg_row_mapper! {
-    StatementsCols(StatementsVersion) => StatementsRow {
+    StatementsCols(version: StatementsVersion) => StatementsRow {
         ts: i64 = "ts_us",
         queryid: Option<i64> = "queryid",
         userid: u32 = "userid",
