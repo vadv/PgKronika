@@ -35,10 +35,11 @@ pub(crate) enum SourceKind {
     OsProcessStatus,
     OsCgroup,
     OsCgroupMapping,
+    PgLog,
 }
 
 /// All source kinds, in collection order.
-pub(crate) const ALL_SOURCES: [SourceKind; 21] = [
+pub(crate) const ALL_SOURCES: [SourceKind; 22] = [
     SourceKind::Activity,
     SourceKind::Database,
     SourceKind::Bgwriter,
@@ -60,6 +61,7 @@ pub(crate) const ALL_SOURCES: [SourceKind; 21] = [
     SourceKind::OsProcessStatus,
     SourceKind::OsCgroup,
     SourceKind::OsCgroupMapping,
+    SourceKind::PgLog,
 ];
 
 /// Per-source intervals, in seconds.
@@ -86,6 +88,7 @@ pub(crate) struct Intervals {
     pub os_process_status: u64,
     pub os_cgroup: u64,
     pub os_cgroup_mapping: u64,
+    pub pg_log: u64,
 }
 
 impl Default for Intervals {
@@ -112,6 +115,7 @@ impl Default for Intervals {
             os_process_status: 30,
             os_cgroup: 10,
             os_cgroup_mapping: 30,
+            pg_log: 5,
         }
     }
 }
@@ -140,6 +144,7 @@ impl Intervals {
             SourceKind::OsProcessStatus => self.os_process_status,
             SourceKind::OsCgroup => self.os_cgroup,
             SourceKind::OsCgroupMapping => self.os_cgroup_mapping,
+            SourceKind::PgLog => self.pg_log,
         }
     }
 }
@@ -349,6 +354,7 @@ mod tests {
             os_process_status: secs,
             os_cgroup: secs,
             os_cgroup_mapping: secs,
+            pg_log: secs,
         }
     }
 

@@ -168,6 +168,7 @@ mod collector;
 mod connection_pool;
 mod database;
 mod io;
+mod log;
 mod os;
 mod prepared_xacts;
 mod progress_vacuum;

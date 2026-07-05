@@ -359,6 +359,7 @@ const fn source_kind_name(kind: SourceKind) -> &'static str {
         SourceKind::OsProcessStatus => "os_process_status",
         SourceKind::OsCgroup => "os_cgroup",
         SourceKind::OsCgroupMapping => "os_cgroup_mapping",
+        SourceKind::PgLog => "pg_log",
     }
 }
 
@@ -389,7 +390,8 @@ pub(crate) fn log_source_deferred(kind: SourceKind, major: u32) {
         | SourceKind::OsProcesses
         | SourceKind::OsProcessStatus
         | SourceKind::OsCgroup
-        | SourceKind::OsCgroupMapping => {}
+        | SourceKind::OsCgroupMapping
+        | SourceKind::PgLog => {}
     }
     log_event(LogLevel::Debug, "collection_deferred", &fields);
 }
