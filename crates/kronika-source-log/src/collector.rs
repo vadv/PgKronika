@@ -1277,7 +1277,7 @@ const CHECKPOINT_TOO_FREQUENT: &[&str] = &[
 ];
 const DURATION_PREFIXES: &[(&str, &str)] = &[
     ("duration: ", " ms  statement: "),
-    ("продолжительность: ", " мс  оператор: "),
+    ("продолжительность: ", " мс, оператор: "),
 ];
 const AUTOVACUUM_PREFIXES: &[(&str, AutovacuumKind)] = &[
     ("automatic vacuum of table", AutovacuumKind::Vacuum),
@@ -1286,13 +1286,13 @@ const AUTOVACUUM_PREFIXES: &[(&str, AutovacuumKind)] = &[
     ("автоматический анализ таблицы", AutovacuumKind::Analyze),
 ];
 const TEMP_FILE_PREFIXES: &[&str] = &["temporary file:", "временный файл:"];
-const SERVER_CRASH_PREFIXES: &[&str] = &["server process (PID ", "серверный процесс (PID "];
+const SERVER_CRASH_PREFIXES: &[&str] = &["server process (PID ", "процесс сервера (PID "];
 const SERVER_SHUTDOWN_PREFIXES: &[(&str, &str)] = &[
     ("received fast shutdown request", "fast"),
     ("received smart shutdown request", "smart"),
     ("received immediate shutdown request", "immediate"),
     ("получен запрос на быстрое выключение", "fast"),
-    ("получен запрос на умное выключение", "smart"),
+    ("получен запрос на \"вежливое\" выключение", "smart"),
     ("получен запрос на немедленное выключение", "immediate"),
 ];
 const SERVER_READY_PREFIXES: &[&str] = &[
@@ -1339,7 +1339,7 @@ fn parse_checkpoint_event(message: &str, ts: i64) -> Option<CheckpointEvent> {
             write_ms: extract_seconds_as_ms(message, "write=")
                 .or_else(|| extract_seconds_as_ms(message, "запись=")),
             sync_ms: extract_seconds_as_ms(message, "sync=")
-                .or_else(|| extract_seconds_as_ms(message, "синхронизация=")),
+                .or_else(|| extract_seconds_as_ms(message, "синхр.=")),
             total_ms: extract_seconds_as_ms(message, "total=")
                 .or_else(|| extract_seconds_as_ms(message, "всего=")),
             distance_kb: extract_i64_after(message, "distance=")
@@ -1350,11 +1350,11 @@ fn parse_checkpoint_event(message: &str, ts: i64) -> Option<CheckpointEvent> {
             wal_removed,
             wal_recycled,
             sync_files: extract_i64_after(message, "sync files=")
-                .or_else(|| extract_i64_after(message, "синхронизировано файлов: ")),
+                .or_else(|| extract_i64_after(message, "синхронизировано_файлов=")),
             longest_sync_ms: extract_seconds_as_ms(message, "longest=")
-                .or_else(|| extract_seconds_as_ms(message, "самый долгий: ")),
+                .or_else(|| extract_seconds_as_ms(message, "самая_долгая_синхр.=")),
             average_sync_ms: extract_seconds_as_ms(message, "average=")
-                .or_else(|| extract_seconds_as_ms(message, "средний: ")),
+                .or_else(|| extract_seconds_as_ms(message, "средняя=")),
         });
     }
     if CHECKPOINT_TOO_FREQUENT
@@ -1398,46 +1398,78 @@ fn parse_autovacuum_event(message: &str, ts: i64) -> AutovacuumEvent {
         .iter()
         .find_map(|(prefix, kind)| message.starts_with(prefix).then_some(*kind))
         .unwrap_or(AutovacuumKind::Vacuum);
-    let pages = tail_after_any(message, &["pages: ", "страниц: "]);
-    let tuples = tail_after_any(message, &["tuples: ", "кортежей: "]);
-    let wal = message.contains("WAL usage:");
+    let pages_en = tail_after_any(message, &["pages: "]);
+    let pages_ru = tail_after_any(message, &["страниц удалено: "]);
+    let tuples_en = tail_after_any(message, &["tuples: "]);
+    let tuples_ru = tail_after_any(message, &["версий строк: удалено: "]);
+    let wal = message.contains("WAL usage:") || message.contains("использование WAL:");
     AutovacuumEvent {
         ts,
         kind,
         relation: extract_quoted_string(message),
         index_scans: extract_i64_after(message, "index scans: ")
             .or_else(|| extract_i64_after(message, "сканирований индекса: ")),
-        pages_removed: pages.and_then(extract_i64_prefix),
-        pages_remaining: pages.and_then(|tail| extract_i64_after(tail, " removed, ")),
+        pages_removed: pages_en
+            .and_then(extract_i64_prefix)
+            .or_else(|| pages_ru.and_then(extract_i64_prefix)),
+        pages_remaining: pages_en
+            .and_then(|tail| extract_i64_after(tail, " removed, "))
+            .or_else(|| pages_ru.and_then(|tail| extract_i64_after(tail, ", осталось: "))),
         tuples_removed: (kind == AutovacuumKind::Vacuum)
-            .then(|| tuples.and_then(extract_i64_prefix))
+            .then(|| {
+                tuples_en
+                    .and_then(extract_i64_prefix)
+                    .or_else(|| tuples_ru.and_then(extract_i64_prefix))
+            })
             .flatten(),
         tuples_remaining: (kind == AutovacuumKind::Vacuum)
-            .then(|| tuples.and_then(|tail| extract_i64_after(tail, " removed, ")))
+            .then(|| {
+                tuples_en
+                    .and_then(|tail| extract_i64_after(tail, " removed, "))
+                    .or_else(|| tuples_ru.and_then(|tail| extract_i64_after(tail, ", осталось: ")))
+            })
             .flatten(),
-        tuples_dead_not_removable: tuples.and_then(|tail| extract_i64_after(tail, " remain, ")),
+        tuples_dead_not_removable: tuples_en
+            .and_then(|tail| extract_i64_after(tail, " remain, "))
+            .or_else(|| {
+                tuples_ru.and_then(|tail| {
+                    extract_i64_after(tail, ", «мёртвых», но ещё не подлежащих удалению: ")
+                })
+            }),
         elapsed_ms: extract_seconds_as_ms(message, "elapsed: ")
             .or_else(|| extract_seconds_as_ms(message, "прошло: ")),
         buffer_hits: extract_i64_after(message, "buffer usage: ")
-            .or_else(|| extract_i64_after(message, "буферов: ")),
+            .or_else(|| extract_i64_after(message, "использование буфера: попаданий: ")),
         buffer_misses: extract_i64_after(message, " hits, ")
-            .or_else(|| extract_i64_after(message, " попаданий, ")),
+            .or_else(|| extract_i64_after(message, ", промахов: ")),
         buffer_dirtied: extract_i64_after(message, " misses, ")
-            .or_else(|| extract_i64_after(message, " промахов, ")),
+            .or_else(|| extract_i64_after(message, " reads, "))
+            .or_else(|| extract_i64_after(message, ", «грязных» записей: ")),
         avg_read_rate_mbs: extract_f64_after(message, "avg read rate: ")
             .or_else(|| extract_f64_after(message, "средняя скорость чтения: ")),
         avg_write_rate_mbs: extract_f64_after(message, "avg write rate: ")
             .or_else(|| extract_f64_after(message, "средняя скорость записи: ")),
-        cpu_user_ms: extract_cpu_seconds_as_ms(message, "user: "),
-        cpu_system_ms: extract_cpu_seconds_as_ms(message, "system: "),
+        cpu_user_ms: extract_cpu_seconds_as_ms(message, "user: ")
+            .or_else(|| extract_cpu_seconds_as_ms(message, "пользов.: ")),
+        cpu_system_ms: extract_cpu_seconds_as_ms(message, "system: ")
+            .or_else(|| extract_cpu_seconds_as_ms(message, "система: ")),
         wal_records: wal
-            .then(|| extract_i64_after(message, "WAL usage: "))
+            .then(|| {
+                extract_i64_after(message, "WAL usage: ")
+                    .or_else(|| extract_i64_after(message, "использование WAL: записей: "))
+            })
             .flatten(),
         wal_fpi: wal
-            .then(|| extract_i64_after(message, " records, "))
+            .then(|| {
+                extract_i64_after(message, " records, ")
+                    .or_else(|| extract_i64_after(message, ", полных образов страниц: "))
+            })
             .flatten(),
         wal_bytes: wal
-            .then(|| extract_i64_after(message, " images, "))
+            .then(|| {
+                extract_i64_after(message, " images, ")
+                    .or_else(|| extract_i64_after(message, ", байт: "))
+            })
             .flatten(),
     }
 }
@@ -1477,7 +1509,7 @@ fn parse_lock_wait_event(message: &str, ts: i64) -> Option<LockWaitEvent> {
         let after_pid = rest
             .find(|c: char| !c.is_ascii_digit())
             .and_then(|pos| rest.get(pos..))?;
-        return parse_lock_wait_tail(ts, pid, after_pid, " продолжает ожидать ", " получил ");
+        return parse_lock_wait_tail_ru(ts, pid, after_pid);
     }
     None
 }
@@ -1540,9 +1572,43 @@ fn parse_lock_mode_target(rest: &str) -> (Option<String>, Option<String>) {
 }
 
 fn find_lock_target_marker(value: &str) -> Option<(usize, usize)> {
-    [" on ", " на "]
-        .iter()
-        .find_map(|marker| value.find(marker).map(|pos| (pos, marker.len())))
+    value.find(" on ").map(|pos| (pos, " on ".len()))
+}
+
+fn parse_lock_wait_tail_ru(ts: i64, pid: Option<i32>, tail: &str) -> Option<LockWaitEvent> {
+    let (kind, rest, duration_marker) = if let Some(rest) =
+        tail.strip_prefix(" продолжает ожидать в режиме ")
+    {
+        (LockWaitKind::Waiting, rest, " в течение ")
+    } else if let Some(rest) = tail.strip_prefix(" получил в режиме ") {
+        (LockWaitKind::Acquired, rest, " через ")
+    } else {
+        return None;
+    };
+    let mode_end = rest.find(" блокировку \"")?;
+    let lock_mode = rest
+        .get(..mode_end)
+        .and_then(|value| non_empty_text(value.trim()));
+    let target_start = mode_end + " блокировку \"".len();
+    let target_end = rest.get(target_start..)?.find('"')?;
+    let lock_target = rest
+        .get(target_start..target_start + target_end)
+        .and_then(non_empty_text);
+    let duration_ms = extract_duration_after(rest, duration_marker);
+    lock_mode.as_ref()?;
+    lock_target.as_ref()?;
+    duration_ms?;
+    Some(LockWaitEvent {
+        ts,
+        kind,
+        pid,
+        lock_mode,
+        lock_target,
+        duration_ms,
+        detail: None,
+        context: None,
+        statement: None,
+    })
 }
 
 fn parse_temp_file_event(message: &str, ts: i64) -> Option<TempFileEvent> {
@@ -1714,7 +1780,7 @@ fn parse_crash_pid(message: &str) -> Option<i32> {
 }
 
 fn parse_crash_signal(message: &str) -> Option<i32> {
-    for marker in ["signal ", "сигналом "] {
+    for marker in ["signal ", "по сигналу "] {
         if let Some(pos) = message.find(marker) {
             return parse_i32_prefix(message.get(pos + marker.len()..)?);
         }
@@ -1736,8 +1802,8 @@ fn parse_wal_file_counts(message: &str) -> Option<(Option<i64>, Option<i64>, Opt
         let recycled = extract_i64_after(message, "removed, ");
         return Some((added, removed, recycled));
     }
-    if message.contains("добавлено файлов WAL:") {
-        let added = extract_i64_after(message, "добавлено файлов WAL: ");
+    if message.contains("добавлено файлов WAL ") {
+        let added = extract_i64_after(message, "добавлено файлов WAL ");
         let removed = extract_i64_after(message, "удалено: ");
         let recycled = extract_i64_after(message, "переработано: ");
         return Some((added, removed, recycled));
@@ -2528,7 +2594,7 @@ mod tests {
         let log = dir.path().join("postgresql.log");
         std::fs::write(
             &log,
-            "2026-07-05 12:05:00 UTC [1]: LOG:  серверный процесс (PID 4242) был прерван сигналом 9: Убито\n",
+            "2026-07-05 12:05:00 UTC [1]: СООБЩЕНИЕ:  процесс сервера (PID 4242) был завершён по сигналу 9: Killed\n",
         )
         .expect("write");
         let mut collector =
@@ -2542,6 +2608,7 @@ mod tests {
         assert_eq!(batch.lifecycles[0].signal, Some(9));
         assert_eq!(batch.errors.len(), 1);
         assert_eq!(batch.errors[0].severity, LogSeverity::Log);
+        assert_eq!(batch.errors[0].category, ErrorCategory::Resource);
     }
 
     fn assert_close(actual: f64, expected: f64) {
