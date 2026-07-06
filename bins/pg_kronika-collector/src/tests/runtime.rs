@@ -1,7 +1,8 @@
-use crate::buffering::{activity_dict_limits, push_activity};
+use crate::buffering::push_activity;
 use crate::plans_source::PlansSourceCache;
 use crate::scheduler::{Intervals, Scheduler, SourceKind};
 use crate::segments::{SegmentState, open_collector_journal, seal_reason};
+use crate::source_contracts::activity_dict_limits;
 use crate::timer_sleep_delay;
 use kronika_source_pg::{ActivityRow, ActivityVersion};
 use kronika_writer::{Interner, SectionBuffers, dict};

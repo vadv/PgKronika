@@ -1,7 +1,7 @@
 use crate::buffering::buffer_row;
 use crate::config::Config;
 use crate::plans_source::PlansRead;
-use crate::pool_sources::{user_indexes_type_id, user_tables_type_id};
+use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
 use crate::statements_source::statements_type_id;
 use anyhow::Result;
 use kronika_registry::collection_coverage::CollectionCoverageV1;

@@ -1,8 +1,9 @@
 use crate::buffering::{
-    activity_dict_limits, push_activity, push_archiver, push_database, push_io, push_locks,
-    push_prepared_xacts, push_progress_vacuum, push_replication_instance, push_statements,
-    push_user_indexes, push_user_tables,
+    push_activity, push_archiver, push_database, push_io, push_locks, push_prepared_xacts,
+    push_progress_vacuum, push_replication_instance, push_statements, push_user_indexes,
+    push_user_tables,
 };
+use crate::source_contracts::activity_dict_limits;
 use kronika_source_pg::archiver::ArchiverRow;
 use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
 use kronika_source_pg::io::{IoRow, IoVersion};

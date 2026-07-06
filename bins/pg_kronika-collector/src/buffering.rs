@@ -4,7 +4,6 @@ use crate::main_sources::MainConnSources;
 use crate::plans_source::PlansRead;
 use crate::service_sections::{InstanceFacts, ServiceSections};
 use anyhow::Result;
-use kronika_format::DictLimits;
 use kronika_registry::instance_metadata::InstanceMetadata;
 use kronika_registry::{StrId, Ts};
 use kronika_source_pg::archiver::{ArchiverRow, to_archiver};
@@ -112,16 +111,6 @@ pub(crate) fn push_service_sections(
     }
     push_settings(buffers, interner, &service.settings)
 }
-/// Limits for interned activity strings.
-///
-/// Query text can dominate the dictionary. Long values spill to `dict.blobs`,
-/// truncate after 64 KiB, and the dictionary is capped at 16 MiB.
-pub(crate) fn activity_dict_limits() -> DictLimits {
-    DictLimits::new(4096, 64 * 1024)
-        .and_then(|limits| limits.with_max_total_bytes(16 * 1024 * 1024))
-        .expect("static activity dictionary limits satisfy 0 < blob <= truncate <= total")
-}
-
 /// Intern each row's strings and buffer it as the version's section type.
 ///
 /// # Errors
