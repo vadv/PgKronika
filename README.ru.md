@@ -72,10 +72,9 @@ cargo run -p xtask -- check-deps
 коллектора, а код PostgreSQL-источника не должен попадать в зависимости
 веб-процесса.
 
-BDD-проверку для PostgreSQL 15, 16 и 17 можно запускать локально, в GitHub
-Actions и в GitLab CI. Команды для быстрой проверки, запуска через
-Docker/Buildx, запуска через Nix и примеры CI описаны в
-[crates/kronika-bdd/README.ru.md](crates/kronika-bdd/README.ru.md).
+Команды запуска тестов описаны в [docs/testing.md](docs/testing.md): локальный
+Rust gate, BDD по тегу через Docker/Buildx, кэш BDD image и пути для GitHub
+Actions/GitLab CI.
 
 Реализация движется по крейтам: низкоуровневый формат, состояние записи, реестр
 типов, источники данных, затем серверные исполняемые файлы.
