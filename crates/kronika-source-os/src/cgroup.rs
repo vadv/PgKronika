@@ -1,4 +1,4 @@
-//! Parse and collect cgroup v2 plus focused cgroup v1 metrics.
+//! Parse and collect cgroup v2 and selected cgroup v1 metrics.
 
 use std::collections::{BTreeSet, VecDeque};
 

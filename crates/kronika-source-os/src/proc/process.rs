@@ -45,7 +45,7 @@ pub fn process_facts(fs: &ProcFs) -> io::Result<ProcessFacts> {
 /// # Errors
 /// Returns [`ProcessError`] when a required file disappears, cannot be read, or
 /// cannot be parsed. Optional `io`, `schedstat`, `cmdline`, `comm`, and cgroup
-/// reads degrade inside the returned row instead.
+/// read failures are recorded in the returned row instead.
 pub fn read_process(
     fs: &ProcFs,
     pid: i32,

@@ -260,9 +260,9 @@ pub(crate) struct PoolReads {
     pub(crate) deferred: Vec<SourceKind>,
 }
 
-/// Read the due sized sources under the cycle budget, in survival order —
-/// statements first, indexes last — so under pressure the most expensive
-/// source is deferred first.
+/// Read the due sized sources under the cycle budget, in priority order:
+/// statements first, indexes last. Under pressure, the most expensive source is
+/// deferred first.
 pub(crate) async fn read_pool_sources(
     pool: &ConnectionPool,
     major: u32,
