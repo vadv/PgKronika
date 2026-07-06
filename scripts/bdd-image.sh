@@ -4,20 +4,55 @@ set -euo pipefail
 NIX_BASE_IMAGE=${BDD_NIX_BASE_IMAGE:-docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894}
 DOCKER=${BDD_DOCKER:-docker}
 
+BDD_DEPS_PATHS=(
+  Dockerfile.bdd-builder
+  flake.nix
+  flake.lock
+  rust-toolchain.toml
+  Cargo.toml
+  Cargo.lock
+  'crates/*/Cargo.toml'
+  'bins/*/Cargo.toml'
+  xtask/Cargo.toml
+)
+
+BDD_BUILDER_CONTEXT_PATHS=(
+  "${BDD_DEPS_PATHS[@]}"
+)
+
+BDD_RUNTIME_KEY_PATHS=(
+  "${BDD_DEPS_PATHS[@]}"
+  'crates/*/src/**'
+  'bins/*/src/**'
+  'crates/kronika-bdd/features/**'
+)
+
+BDD_RUNTIME_SOURCE_PATHS=(
+  "${BDD_RUNTIME_KEY_PATHS[@]}"
+  'xtask/src/**'
+)
+
 usage() {
   cat <<'EOF'
 Usage: scripts/bdd-image.sh <command>
 
 Commands:
   deps-key       Print the dependency key for the BDD builder image.
+  deps-paths     Print files included in the BDD builder dependency key.
+  builder-paths  Print repository files used to seed the BDD builder context.
+  builder-context-tar
+                 Print the filtered BDD builder Docker context tar.
+  runtime-image  Print the default BDD runtime image tag.
   image-key      Print the key for the final BDD image.
+  image-paths    Print files included in the BDD runtime image key.
   platform       Print the Docker platform used for the builder image.
   platform-slug  Print the platform as a Docker tag fragment.
   branch-slug [name]
                  Print a branch name as a Docker tag fragment.
   build-builder  Build or pull the BDD builder image.
   build-runtime  Build image.tar with the builder image and load it into Docker.
-  run [image]    Run the BDD image.
+  run [image] [args...]
+                 Run the BDD image. Extra args are passed to kronika-bdd.
 
 Environment:
   BDD_IMAGE_PREFIX   Registry prefix, default ghcr.io/vadv/pgkronika.
@@ -29,7 +64,7 @@ Environment:
   BDD_BUILDER_MAIN_IMAGE
                      Mutable builder cache for main.
   BDD_NIX_BASE_IMAGE Pinned Nix image used when no branch cache is available.
-  BDD_RUNTIME_IMAGE  Runtime image tag. Defaults to pgkronika-bdd:latest.
+  BDD_RUNTIME_IMAGE  Runtime image tag. Defaults to pgkronika-bdd:<platform>-sha-<image-key>.
   BDD_CACHE_FROM     Optional buildx cache source, for example type=registry,ref=...
   BDD_CACHE_TO       Optional buildx cache target, for example type=registry,ref=...,mode=max.
   BDD_BUILDER_PULL   Set to 1 to pull an existing builder image before building.
@@ -39,7 +74,10 @@ Environment:
   BDD_BUILDER_UPDATE_BRANCH_CACHE
                      Set to 1 to retag a pulled or pushed builder as the branch cache.
   BDD_RUNTIME_PUSH   Set to 1 to push BDD_RUNTIME_IMAGE after building.
+  BDD_RUNTIME_REUSE_LOCAL
+                     Set to 0 to force rebuilding an existing local BDD_RUNTIME_IMAGE.
   BDD_OUTPUT_TAR     Tarball path for build-runtime, default image.tar.
+  DEBUG              Passed through to the BDD container when set.
 EOF
 }
 
@@ -75,34 +113,72 @@ hash_git_paths() {
   ) | sha256_stream
 }
 
+print_git_paths() {
+  local root
+  root=$(repo_root)
+  (
+    cd "$root"
+    git ls-files -co --exclude-standard -- "$@" | LC_ALL=C sort
+  )
+}
+
+source_tar() {
+  local root
+  root=$(repo_root)
+  (
+    cd "$root"
+    git ls-files -co --exclude-standard -z -- "$@" \
+      | LC_ALL=C sort -z \
+      | tar --null -T - -cf -
+  )
+}
+
+write_dummy_builder_sources() {
+  local context=$1 dir
+
+  for dir in "$context"/crates/*; do
+    [ -f "$dir/Cargo.toml" ] || continue
+    mkdir -p "$dir/src"
+    case "${dir##*/}" in
+      kronika-bdd)
+        printf 'fn main() {}\n' > "$dir/src/main.rs"
+        ;;
+      *)
+        printf '#![allow(missing_docs)]\n' > "$dir/src/lib.rs"
+        ;;
+    esac
+  done
+
+  for dir in "$context"/bins/* "$context"/xtask; do
+    [ -f "$dir/Cargo.toml" ] || continue
+    mkdir -p "$dir/src"
+    printf 'fn main() {}\n' > "$dir/src/main.rs"
+  done
+}
+
+write_builder_context() {
+  local context=$1
+  source_tar "${BDD_BUILDER_CONTEXT_PATHS[@]}" | tar -C "$context" -xf -
+  write_dummy_builder_sources "$context"
+}
+
+builder_context_tar() {
+  local context
+  context=$(mktemp -d)
+  if ! write_builder_context "$context"; then
+    rm -rf "$context"
+    return 1
+  fi
+  tar -C "$context" -cf - .
+  rm -rf "$context"
+}
+
 deps_key() {
-  hash_git_paths \
-    Dockerfile.bdd-builder \
-    flake.nix \
-    flake.lock \
-    rust-toolchain.toml \
-    Cargo.toml \
-    Cargo.lock \
-    crates/*/Cargo.toml \
-    bins/*/Cargo.toml \
-    xtask/Cargo.toml
+  hash_git_paths "${BDD_DEPS_PATHS[@]}"
 }
 
 image_key() {
-  hash_git_paths \
-    Dockerfile.bdd-builder \
-    scripts/bdd-image.sh \
-    flake.nix \
-    flake.lock \
-    rust-toolchain.toml \
-    Cargo.toml \
-    Cargo.lock \
-    crates/*/Cargo.toml \
-    bins/*/Cargo.toml \
-    xtask/Cargo.toml \
-    crates/*/src/** \
-    bins/*/src/** \
-    crates/kronika-bdd/features/**
+  hash_git_paths "${BDD_RUNTIME_KEY_PATHS[@]}"
 }
 
 short_key() {
@@ -194,7 +270,11 @@ builder_main_image() {
 }
 
 runtime_image() {
-  printf '%s' "${BDD_RUNTIME_IMAGE:-pgkronika-bdd:latest}"
+  if [ -n "${BDD_RUNTIME_IMAGE:-}" ]; then
+    printf '%s' "$BDD_RUNTIME_IMAGE"
+    return
+  fi
+  printf 'pgkronika-bdd:%s-sha-%s' "$(platform_slug)" "$(short_key "$(image_key)")"
 }
 
 image_repository() {
@@ -263,7 +343,7 @@ builder_base_image() {
 }
 
 build_builder() {
-  local root image branch_cache main_cache base
+  local root context image branch_cache main_cache base
   root=$(repo_root)
   image=$(builder_image)
   branch_cache=$(builder_branch_image)
@@ -274,6 +354,12 @@ build_builder() {
   append_summary "- exact: \`$image\`"
   append_summary "- branch cache: \`$branch_cache\`"
   append_summary "- main cache: \`$main_cache\`"
+
+  if docker_cmd image inspect "$image" >/dev/null 2>&1; then
+    append_summary "- local exact hit: yes"
+    update_builder_branch_cache "$image" "$branch_cache"
+    return
+  fi
 
   if [ "${BDD_BUILDER_PULL:-0}" = "1" ] && docker_cmd manifest inspect "$image" >/dev/null 2>&1; then
     append_summary "- exact hit: yes"
@@ -302,7 +388,16 @@ build_builder() {
     args+=(--cache-to "$BDD_CACHE_TO")
   fi
 
-  docker_cmd buildx build "${args[@]}" "$root"
+  context=$(mktemp -d)
+  if ! write_builder_context "$context"; then
+    rm -rf "$context"
+    return 1
+  fi
+  if ! docker_cmd buildx build "${args[@]}" "$context"; then
+    rm -rf "$context"
+    return 1
+  fi
+  rm -rf "$context"
 
   if [ "${BDD_BUILDER_PUSH:-0}" = "1" ]; then
     if docker_cmd manifest inspect "$image" >/dev/null 2>&1; then
@@ -318,22 +413,25 @@ build_builder() {
 }
 
 build_runtime() {
-  local root builder runtime output
-  root=$(repo_root)
+  local builder runtime output
   builder=$(builder_image)
   runtime=$(runtime_image)
   output=${BDD_OUTPUT_TAR:-image.tar}
 
-  docker_cmd run --rm -v "$root":/src:ro "$builder" sh -ceu '
+  if [ "${BDD_RUNTIME_REUSE_LOCAL:-1}" = "1" ] && docker_cmd image inspect "$runtime" >/dev/null 2>&1; then
+    append_summary "## BDD runtime"
+    append_summary ""
+    append_summary "- local exact hit: yes"
+    append_summary "- image: \`$runtime\`"
+    if [ "${BDD_RUNTIME_PUSH:-0}" = "1" ]; then
+      docker_cmd push "$runtime"
+    fi
+    return
+  fi
+
+  source_tar "${BDD_RUNTIME_SOURCE_PATHS[@]}" | docker_cmd run --rm -i "$builder" sh -ceu '
     mkdir -p /tmp/src
-    tar \
-      --exclude=.git \
-      --exclude=.direnv \
-      --exclude=target \
-      --exclude=result \
-      --exclude=result-* \
-      --exclude=image.tar \
-      -C /src -cf - . | tar -C /tmp/src -xf -
+    tar -C /tmp/src -xf -
     cd /tmp/src
     nix build .#image --out-link /tmp/img
     /tmp/img
@@ -348,8 +446,20 @@ build_runtime() {
 }
 
 run_runtime() {
-  local image=${1:-$(runtime_image)}
-  docker_cmd run --rm "$image"
+  local image
+  if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+    image=$1
+    shift
+  else
+    image=$(runtime_image)
+  fi
+
+  local args=(--rm)
+  if [ -n "${DEBUG:-}" ]; then
+    args+=(-e "DEBUG=$DEBUG")
+  fi
+
+  docker_cmd run "${args[@]}" "$image" "$@"
 }
 
 cmd=${1:-}
@@ -357,8 +467,24 @@ case "$cmd" in
   deps-key)
     deps_key
     ;;
+  deps-paths)
+    print_git_paths "${BDD_DEPS_PATHS[@]}"
+    ;;
+  builder-paths)
+    print_git_paths "${BDD_BUILDER_CONTEXT_PATHS[@]}"
+    ;;
+  builder-context-tar)
+    builder_context_tar
+    ;;
+  runtime-image)
+    runtime_image
+    printf '\n'
+    ;;
   image-key)
     image_key
+    ;;
+  image-paths)
+    print_git_paths "${BDD_RUNTIME_KEY_PATHS[@]}"
     ;;
   platform)
     platform
