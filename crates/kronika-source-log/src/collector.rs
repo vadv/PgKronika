@@ -1497,14 +1497,18 @@ fn parse_lock_wait_tail(
         return None;
     };
     let (lock_mode, lock_target) = parse_lock_mode_target(rest);
+    let duration_ms =
+        extract_duration_after(rest, " after ").or_else(|| extract_duration_after(rest, " после "));
+    lock_mode.as_ref()?;
+    lock_target.as_ref()?;
+    duration_ms?;
     Some(LockWaitEvent {
         ts,
         kind,
         pid,
         lock_mode,
         lock_target,
-        duration_ms: extract_duration_after(rest, " after ")
-            .or_else(|| extract_duration_after(rest, " после ")),
+        duration_ms,
         detail: None,
         context: None,
         statement: None,
@@ -2321,7 +2325,10 @@ mod tests {
             "2026-07-05 12:07:00 UTC [70]: LOG:  process 70 still waiting for ShareLock on transaction 12345678 after 30009.004 ms\n\
              2026-07-05 12:07:00 UTC [70]: DETAIL:  Process holding the lock: 80. Wait queue: 70.\n\
              \tWait queue continues on the next line.\n\
+             2026-07-05 12:07:00 UTC [70]: CONTEXT:  while updating tuple (0,1) in relation \"accounts\"\n\
+             \tduring lock wait probe\n\
              2026-07-05 12:07:00 UTC [70]: STATEMENT:  UPDATE accounts SET balance = balance + 1 WHERE id = 1\n\
+             \tRETURNING balance\n\
              2026-07-05 12:07:01 UTC [70]: LOG:  process 70 acquired ShareLock on transaction 12345678 after 30010.004 ms\n",
         )
         .expect("write");
@@ -2348,8 +2355,12 @@ mod tests {
             )
         );
         assert_eq!(
+            waiting.context.as_deref(),
+            Some("while updating tuple (0,1) in relation \"accounts\" during lock wait probe")
+        );
+        assert_eq!(
             waiting.statement.as_deref(),
-            Some("UPDATE accounts SET balance = balance + 1 WHERE id = 1")
+            Some("UPDATE accounts SET balance = balance + 1 WHERE id = 1 RETURNING balance")
         );
         let acquired = batch
             .lock_waits
@@ -2358,6 +2369,25 @@ mod tests {
             .expect("acquired row");
         assert_eq!(acquired.pid, Some(70));
         assert_close(acquired.duration_ms.expect("duration"), 30010.004);
+    }
+
+    #[tokio::test]
+    async fn ignores_incomplete_lock_wait_like_log_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:07:00 UTC [70]: LOG:  process 70 still waiting for ShareLock\n\
+             2026-07-05 12:07:01 UTC [70]: LOG:  process 70 acquired ShareLock on transaction 12345678\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert!(batch.errors.is_empty());
+        assert!(batch.lock_waits.is_empty());
     }
 
     #[tokio::test]

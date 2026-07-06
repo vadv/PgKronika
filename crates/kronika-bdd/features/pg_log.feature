@@ -124,13 +124,16 @@ Feature: PostgreSQL log-domain stderr fixtures
         avg read rate: 1.500 MB/s, avg write rate: 2.500 MB/s
         WAL usage: 15 records, 2 full page images, 4096 bytes
         system usage: CPU: user: 0.12 s, system: 0.34 s, elapsed: 5.67 s
+      2026-07-05 12:06:00 UTC [1]: LOG:  automatic vacuum launcher started
       2026-07-05 12:06:01 UTC [1]: LOG:  automatic analyze of table "tpl-service.bucket_90.posting_sender"
         buffer usage: 1843 hits, 3 misses, 0 dirtied
         avg read rate: 0.500 MB/s, avg write rate: 0.000 MB/s
         system usage: CPU: user: 0.02 s, system: 0.01 s, elapsed: 3.60 s
+      2026-07-05 12:06:02 UTC [1]: LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
       """
     When the collector snapshots the segment
     Then section 1_022_001 is absent from the segment
+    And section 1_025_001 has 2 rows
     And section 1_025_001 has a row with relation = mydb.public.orders:
       | kind                       | 0      |
       | index_scans                | 1      |
@@ -150,11 +153,21 @@ Feature: PostgreSQL log-domain stderr fixtures
       | wal_records                | 15     |
       | wal_fpi                    | 2      |
       | wal_bytes                  | 4096   |
+      | dict_dropped_fields        | 0      |
     And section 1_025_001 has a row with relation = tpl-service.bucket_90.posting_sender:
-      | kind             | 1      |
-      | tuples_removed   | null   |
-      | buffer_hits      | 1843   |
-      | elapsed_ms       | 3600.0 |
+      | kind                      | 1      |
+      | pages_removed             | null   |
+      | tuples_removed            | null   |
+      | buffer_hits               | 1843   |
+      | buffer_misses             | 3      |
+      | buffer_dirtied            | 0      |
+      | avg_read_rate_mbs         | 0.5    |
+      | avg_write_rate_mbs        | 0.0    |
+      | cpu_user_ms               | 20.0   |
+      | cpu_system_ms             | 10.0   |
+      | elapsed_ms                | 3600.0 |
+      | wal_records               | null   |
+      | dict_dropped_fields       | 0      |
 
   @pg16 @serial
   Scenario: lock-wait LOG records are typed without becoming errors
@@ -164,23 +177,34 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:07:00 UTC [70]: LOG:  process 70 still waiting for ShareLock on transaction 12345678 after 30009.004 ms
       2026-07-05 12:07:00 UTC [70]: DETAIL:  Process holding the lock: 80. Wait queue: 70.
         Wait queue continues on the next line.
+      2026-07-05 12:07:00 UTC [70]: CONTEXT:  while updating tuple (0,1) in relation "accounts"
+        during lock wait probe
       2026-07-05 12:07:00 UTC [70]: STATEMENT:  UPDATE accounts SET balance = balance + 1 WHERE id = 1
+        RETURNING balance
+      2026-07-05 12:07:00 UTC [70]: LOG:  process 70 still waiting for ShareLock
       2026-07-05 12:07:01 UTC [70]: LOG:  process 70 acquired ShareLock on transaction 12345678 after 30010.004 ms
       """
     When the collector snapshots the segment
     Then section 1_022_001 is absent from the segment
+    And section 1_027_001 has 2 rows
     And section 1_027_001 has a row with kind = 0:
       | pid          | 70                                                                                                      |
       | lock_mode    | ShareLock                                                                                               |
       | lock_target  | transaction 12345678                                                                                    |
       | duration_ms  | 30009.004                                                                                               |
       | detail       | Process holding the lock: 80. Wait queue: 70. Wait queue continues on the next line.                    |
-      | statement    | UPDATE accounts SET balance = balance + 1 WHERE id = 1                                                  |
+      | context      | while updating tuple (0,1) in relation "accounts" during lock wait probe                                |
+      | statement    | UPDATE accounts SET balance = balance + 1 WHERE id = 1 RETURNING balance                                |
+      | dict_dropped_fields | 0                                                                                                 |
     And section 1_027_001 has a row with kind = 1:
-      | pid          | 70                   |
-      | lock_mode    | ShareLock            |
-      | lock_target  | transaction 12345678 |
-      | duration_ms  | 30010.004            |
+      | pid                 | 70                   |
+      | lock_mode           | ShareLock            |
+      | lock_target         | transaction 12345678 |
+      | duration_ms         | 30010.004            |
+      | detail              | null                 |
+      | context             | null                 |
+      | statement           | null                 |
+      | dict_dropped_fields | 0                    |
 
   @pg16 @serial
   Scenario: temporary-file LOG records are typed without becoming errors
@@ -190,12 +214,21 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:08:00 UTC [1]: LOG:  temporary file: path "base/pgsql_tmp/pgsql_tmp15967.0", size 200204288
       2026-07-05 12:08:00 UTC [1]: STATEMENT:  SELECT * FROM big_sort ORDER BY payload
         LIMIT 100
+      2026-07-05 12:08:01 UTC [1]: LOG:  temporary file cleanup complete
+      2026-07-05 12:08:02 UTC [1]: LOG:  temporary file: path "base/pgsql_tmp/pgsql_tmp15967.no_size"
+      2026-07-05 12:08:03 UTC [1]: LOG:  temporary file: path "base/pgsql_tmp/pgsql_tmp15967.1", size 0
       """
     When the collector snapshots the segment
     Then section 1_022_001 is absent from the segment
+    And section 1_030_001 has 2 rows
     And section 1_030_001 has a row with path = base/pgsql_tmp/pgsql_tmp15967.0:
-      | size_bytes | 200204288                                         |
-      | statement  | SELECT * FROM big_sort ORDER BY payload LIMIT 100 |
+      | size_bytes          | 200204288                                         |
+      | statement           | SELECT * FROM big_sort ORDER BY payload LIMIT 100 |
+      | dict_dropped_fields | 0                                                 |
+    And section 1_030_001 has a row with path = base/pgsql_tmp/pgsql_tmp15967.1:
+      | size_bytes          | 0    |
+      | statement           | null |
+      | dict_dropped_fields | 0    |
 
   @pg16 @serial
   Scenario: lifecycle LOG records carry crash detail and shutdown state
