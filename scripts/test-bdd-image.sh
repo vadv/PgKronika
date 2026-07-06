@@ -6,9 +6,14 @@ SCRIPT="$ROOT/scripts/bdd-image.sh"
 TEST_TMP=$(mktemp -d)
 
 cleanup() {
+  if [ -f "$TEST_TMP/kronika-source-log.Cargo.toml.bak" ]; then
+    cp "$TEST_TMP/kronika-source-log.Cargo.toml.bak" \
+      "$ROOT/crates/kronika-source-log/Cargo.toml"
+  fi
   rm -rf "$TEST_TMP"
   rm -f \
     "$ROOT/scripts/.cache-key-host-only-probe" \
+    "$ROOT/crates/kronika-source-log/src/cache_key_probe.rs" \
     "$ROOT/crates/kronika-bdd/features/cache_key_probe.feature"
 }
 trap cleanup EXIT
@@ -38,6 +43,30 @@ assert_eq() {
   if [ "$actual" != "$expected" ]; then
     fail "expected '$expected', got '$actual'"
   fi
+}
+
+hash_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+builder_context_content_key() {
+  local context
+  context=$(mktemp -d "$TEST_TMP/builder-context-key.XXXXXX")
+  "$SCRIPT" builder-context-tar | tar -C "$context" -xf -
+  (
+    cd "$context"
+    find . -type f -print0 \
+      | LC_ALL=C sort -z \
+      | while IFS= read -r -d '' path; do
+          printf '%s\0' "${path#./}"
+          cat "$path"
+          printf '\0'
+        done
+  ) | hash_stdin
 }
 
 make_mock_docker() {
@@ -284,7 +313,7 @@ test_runtime_paths_exclude_host_only_helpers() {
     || fail "runtime paths must include kronika-bdd source"
 }
 
-test_builder_paths_exclude_host_only_but_include_targets() {
+test_builder_paths_are_deps_only() {
   local paths
   paths=$("$SCRIPT" builder-paths)
   if printf '%s\n' "$paths" | grep -Fx -- "scripts/bdd-image.sh" >/dev/null; then
@@ -293,10 +322,23 @@ test_builder_paths_exclude_host_only_but_include_targets() {
   if printf '%s\n' "$paths" | grep -Fx -- "Makefile" >/dev/null; then
     fail "builder paths must not include Makefile"
   fi
-  printf '%s\n' "$paths" | grep -Fx -- "crates/kronika-format/src/lib.rs" >/dev/null \
-    || fail "builder paths must include crate source targets for Cargo metadata"
-  printf '%s\n' "$paths" | grep -Fx -- "xtask/src/main.rs" >/dev/null \
-    || fail "builder paths must include xtask source target for Cargo metadata"
+  if printf '%s\n' "$paths" | grep -E '/src/.*\.rs$' >/dev/null; then
+    fail "builder paths must not include Rust source files"
+  fi
+  printf '%s\n' "$paths" | grep -Fx -- "crates/kronika-source-log/Cargo.toml" >/dev/null \
+    || fail "builder paths must include crate manifests"
+}
+
+test_builder_context_tar_has_stable_dummy_targets() {
+  local context
+  context=$(mktemp -d "$TEST_TMP/builder-context.XXXXXX")
+  "$SCRIPT" builder-context-tar | tar -C "$context" -xf -
+  grep -Fx -- '#![allow(missing_docs)]' "$context/crates/kronika-format/src/lib.rs" >/dev/null \
+    || fail "builder context must contain dummy crate lib target"
+  grep -Fx -- 'fn main() {}' "$context/crates/kronika-bdd/src/main.rs" >/dev/null \
+    || fail "builder context must contain dummy BDD bin target"
+  grep -Fx -- 'fn main() {}' "$context/xtask/src/main.rs" >/dev/null \
+    || fail "builder context must contain dummy xtask target"
 }
 
 test_runtime_key_ignores_host_only_files() {
@@ -307,6 +349,43 @@ test_runtime_key_ignores_host_only_files() {
   after=$("$SCRIPT" image-key)
   rm -f "$probe"
   assert_eq "$after" "$before"
+}
+
+test_rust_source_changes_runtime_but_not_deps_or_builder() {
+  local before_deps before_image before_builder_paths before_builder_context
+  local after_deps after_image after_builder_paths after_builder_context probe
+  probe="$ROOT/crates/kronika-source-log/src/cache_key_probe.rs"
+  before_deps=$("$SCRIPT" deps-key)
+  before_image=$("$SCRIPT" image-key)
+  before_builder_paths=$("$SCRIPT" builder-paths | hash_stdin)
+  before_builder_context=$(builder_context_content_key)
+  printf 'pub(crate) fn cache_key_probe() {}\n' > "$probe"
+  after_deps=$("$SCRIPT" deps-key)
+  after_image=$("$SCRIPT" image-key)
+  after_builder_paths=$("$SCRIPT" builder-paths | hash_stdin)
+  after_builder_context=$(builder_context_content_key)
+  rm -f "$probe"
+  assert_eq "$after_deps" "$before_deps"
+  assert_eq "$after_builder_paths" "$before_builder_paths"
+  assert_eq "$after_builder_context" "$before_builder_context"
+  if [ "$after_image" = "$before_image" ]; then
+    fail "runtime image key must change when Rust source changes"
+  fi
+}
+
+test_dependency_manifest_changes_deps_key() {
+  local before after manifest backup
+  manifest="$ROOT/crates/kronika-source-log/Cargo.toml"
+  backup="$TEST_TMP/kronika-source-log.Cargo.toml.bak"
+  cp "$manifest" "$backup"
+  before=$("$SCRIPT" deps-key)
+  printf '\n# cache key dependency-input probe\n' >> "$manifest"
+  after=$("$SCRIPT" deps-key)
+  cp "$backup" "$manifest"
+  rm -f "$backup"
+  if [ "$after" = "$before" ]; then
+    fail "deps key must change when a Cargo.toml input changes"
+  fi
 }
 
 test_runtime_key_changes_for_feature_inputs() {
@@ -336,8 +415,11 @@ for test in \
   test_runtime_reuse_local_skips_build \
   test_runtime_build_uses_filtered_stdin_tar \
   test_runtime_paths_exclude_host_only_helpers \
-  test_builder_paths_exclude_host_only_but_include_targets \
+  test_builder_paths_are_deps_only \
+  test_builder_context_tar_has_stable_dummy_targets \
   test_runtime_key_ignores_host_only_files \
+  test_rust_source_changes_runtime_but_not_deps_or_builder \
+  test_dependency_manifest_changes_deps_key \
   test_runtime_key_changes_for_feature_inputs
 do
   "$test"

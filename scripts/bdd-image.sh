@@ -16,15 +16,8 @@ BDD_DEPS_PATHS=(
   xtask/Cargo.toml
 )
 
-BDD_RUST_TARGET_PATHS=(
-  'crates/*/src/**'
-  'bins/*/src/**'
-  'xtask/src/**'
-)
-
 BDD_BUILDER_CONTEXT_PATHS=(
   "${BDD_DEPS_PATHS[@]}"
-  "${BDD_RUST_TARGET_PATHS[@]}"
 )
 
 BDD_RUNTIME_KEY_PATHS=(
@@ -46,7 +39,9 @@ Usage: scripts/bdd-image.sh <command>
 Commands:
   deps-key       Print the dependency key for the BDD builder image.
   deps-paths     Print files included in the BDD builder dependency key.
-  builder-paths  Print files sent to the BDD builder Docker context.
+  builder-paths  Print repository files used to seed the BDD builder context.
+  builder-context-tar
+                 Print the filtered BDD builder Docker context tar.
   image-key      Print the key for the final BDD image.
   image-paths    Print files included in the BDD runtime image key.
   platform       Print the Docker platform used for the builder image.
@@ -135,6 +130,46 @@ source_tar() {
       | LC_ALL=C sort -z \
       | tar --null -T - -cf -
   )
+}
+
+write_dummy_builder_sources() {
+  local context=$1 dir
+
+  for dir in "$context"/crates/*; do
+    [ -f "$dir/Cargo.toml" ] || continue
+    mkdir -p "$dir/src"
+    case "${dir##*/}" in
+      kronika-bdd)
+        printf 'fn main() {}\n' > "$dir/src/main.rs"
+        ;;
+      *)
+        printf '#![allow(missing_docs)]\n' > "$dir/src/lib.rs"
+        ;;
+    esac
+  done
+
+  for dir in "$context"/bins/* "$context"/xtask; do
+    [ -f "$dir/Cargo.toml" ] || continue
+    mkdir -p "$dir/src"
+    printf 'fn main() {}\n' > "$dir/src/main.rs"
+  done
+}
+
+write_builder_context() {
+  local context=$1
+  source_tar "${BDD_BUILDER_CONTEXT_PATHS[@]}" | tar -C "$context" -xf -
+  write_dummy_builder_sources "$context"
+}
+
+builder_context_tar() {
+  local context
+  context=$(mktemp -d)
+  if ! write_builder_context "$context"; then
+    rm -rf "$context"
+    return 1
+  fi
+  tar -C "$context" -cf - .
+  rm -rf "$context"
 }
 
 deps_key() {
@@ -349,7 +384,7 @@ build_builder() {
   fi
 
   context=$(mktemp -d)
-  if ! source_tar "${BDD_BUILDER_CONTEXT_PATHS[@]}" | tar -C "$context" -xf -; then
+  if ! write_builder_context "$context"; then
     rm -rf "$context"
     return 1
   fi
@@ -429,6 +464,9 @@ case "$cmd" in
     ;;
   builder-paths)
     print_git_paths "${BDD_BUILDER_CONTEXT_PATHS[@]}"
+    ;;
+  builder-context-tar)
+    builder_context_tar
     ;;
   image-key)
     image_key
