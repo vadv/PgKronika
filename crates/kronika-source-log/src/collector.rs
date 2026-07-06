@@ -153,6 +153,71 @@ pub struct CheckpointEvent {
     pub average_sync_ms: Option<f64>,
 }
 
+/// Autovacuum event kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutovacuumKind {
+    /// `automatic vacuum of table ...`.
+    Vacuum,
+    /// `automatic analyze of table ...`.
+    Analyze,
+}
+
+impl AutovacuumKind {
+    /// Numeric code stored in `pg_log_autovacuum`.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Vacuum => 0,
+            Self::Analyze => 1,
+        }
+    }
+}
+
+/// One typed autovacuum/autoanalyze event before dictionary interning.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutovacuumEvent {
+    /// Log record time.
+    pub ts: i64,
+    /// Operation kind.
+    pub kind: AutovacuumKind,
+    /// Qualified relation name when `PostgreSQL` reports it.
+    pub relation: Option<String>,
+    /// Number of index scans in a vacuum report.
+    pub index_scans: Option<i64>,
+    /// Heap pages removed by vacuum.
+    pub pages_removed: Option<i64>,
+    /// Heap pages remaining after vacuum.
+    pub pages_remaining: Option<i64>,
+    /// Tuples removed by vacuum.
+    pub tuples_removed: Option<i64>,
+    /// Tuples remaining after vacuum.
+    pub tuples_remaining: Option<i64>,
+    /// Dead tuples not yet removable.
+    pub tuples_dead_not_removable: Option<i64>,
+    /// Elapsed runtime, ms.
+    pub elapsed_ms: Option<f64>,
+    /// Buffer cache hits.
+    pub buffer_hits: Option<i64>,
+    /// Buffer cache misses.
+    pub buffer_misses: Option<i64>,
+    /// Buffers dirtied.
+    pub buffer_dirtied: Option<i64>,
+    /// Average read rate, MB/s.
+    pub avg_read_rate_mbs: Option<f64>,
+    /// Average write rate, MB/s.
+    pub avg_write_rate_mbs: Option<f64>,
+    /// User CPU time, ms.
+    pub cpu_user_ms: Option<f64>,
+    /// System CPU time, ms.
+    pub cpu_system_ms: Option<f64>,
+    /// WAL records generated.
+    pub wal_records: Option<i64>,
+    /// WAL full-page images generated.
+    pub wal_fpi: Option<i64>,
+    /// WAL bytes generated.
+    pub wal_bytes: Option<i64>,
+}
+
 /// Slow-query aggregate for one normalized SQL pattern in a collection window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlowQueryEvent {
@@ -168,6 +233,62 @@ pub struct SlowQueryEvent {
     pub max_duration_ms: f64,
     /// Sum of durations for this pattern, ms.
     pub total_duration_ms: f64,
+}
+
+/// Lock-wait log event kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockWaitKind {
+    /// Backend is still waiting after `deadlock_timeout`.
+    Waiting,
+    /// Backend acquired the lock after waiting.
+    Acquired,
+}
+
+impl LockWaitKind {
+    /// Numeric code stored in `pg_log_lock_waits`.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Waiting => 0,
+            Self::Acquired => 1,
+        }
+    }
+}
+
+/// One typed lock-wait event before dictionary interning.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockWaitEvent {
+    /// Log record time.
+    pub ts: i64,
+    /// Lock-wait event kind.
+    pub kind: LockWaitKind,
+    /// Waiting backend pid.
+    pub pid: Option<i32>,
+    /// Lock mode, e.g. `ShareLock`.
+    pub lock_mode: Option<String>,
+    /// Lock target, e.g. `transaction 12345`.
+    pub lock_target: Option<String>,
+    /// Wait duration reported by `PostgreSQL`, ms.
+    pub duration_ms: Option<f64>,
+    /// `DETAIL:` payload when present.
+    pub detail: Option<String>,
+    /// `CONTEXT:` payload when present.
+    pub context: Option<String>,
+    /// Attached SQL statement.
+    pub statement: Option<String>,
+}
+
+/// One typed temp-file event before dictionary interning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TempFileEvent {
+    /// Log record time.
+    pub ts: i64,
+    /// Temporary file path.
+    pub path: Option<String>,
+    /// Temporary file size, bytes.
+    pub size_bytes: i64,
+    /// Attached SQL statement when `PostgreSQL` logs one.
+    pub statement: Option<String>,
 }
 
 /// Server lifecycle event kind.
@@ -318,10 +439,16 @@ pub struct LogCollection {
     pub errors: Vec<GroupedLogError>,
     /// Typed checkpoint events.
     pub checkpoints: Vec<CheckpointEvent>,
+    /// Autovacuum/autoanalyze typed events.
+    pub autovacuums: Vec<AutovacuumEvent>,
     /// Slow-query top-N rows.
     pub slow_queries: Vec<SlowQueryEvent>,
+    /// Lock-wait typed events.
+    pub lock_waits: Vec<LockWaitEvent>,
     /// Server lifecycle events.
     pub lifecycles: Vec<LifecycleEvent>,
+    /// Temporary-file typed events.
+    pub temp_files: Vec<TempFileEvent>,
     /// Degradation rows.
     pub gaps: Vec<LogGap>,
     /// Discovery status for logs.
@@ -364,6 +491,12 @@ struct PendingSlowQuery {
 }
 
 #[derive(Debug, Clone)]
+struct PendingAutovacuum {
+    ts: i64,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
 struct PendingSlowQueryGroup {
     ts: i64,
     pattern: String,
@@ -384,14 +517,20 @@ struct ErrorKey {
 struct ParsedLogRecords {
     errors: Vec<GroupedLogError>,
     checkpoints: Vec<CheckpointEvent>,
+    autovacuums: Vec<AutovacuumEvent>,
     slow_queries: Vec<SlowQueryEvent>,
+    lock_waits: Vec<LockWaitEvent>,
     lifecycles: Vec<LifecycleEvent>,
+    temp_files: Vec<TempFileEvent>,
 }
 
 const MAX_ERROR_GROUPS: usize = 32;
 const MAX_CHECKPOINT_EVENTS: usize = 64;
+const MAX_AUTOVACUUM_EVENTS: usize = 64;
 const MAX_SLOW_QUERY_GROUPS: usize = 16;
+const MAX_LOCK_WAIT_EVENTS: usize = 64;
 const MAX_LIFECYCLE_EVENTS: usize = 32;
+const MAX_TEMP_FILE_EVENTS: usize = 64;
 
 impl LogCollector {
     /// Create a collector and load persisted tail state.
@@ -501,8 +640,11 @@ impl LogCollector {
         let parsed = parse_stderr_records(&batch.lines, ts, &mut parse_gaps);
         result.errors = parsed.errors;
         result.checkpoints = parsed.checkpoints;
+        result.autovacuums = parsed.autovacuums;
         result.slow_queries = parsed.slow_queries;
+        result.lock_waits = parsed.lock_waits;
         result.lifecycles = parsed.lifecycles;
+        result.temp_files = parsed.temp_files;
         result.gaps.extend(gaps_from_tail(
             ts,
             &source.path,
@@ -712,18 +854,32 @@ fn parse_stderr_records(
     let mut pending = HashMap::<ErrorKey, PendingError>::new();
     let mut slow_groups = HashMap::<String, PendingSlowQueryGroup>::new();
     let mut pending_slow = None::<PendingSlowQuery>;
+    let mut pending_autovacuum = None::<PendingAutovacuum>;
     let mut last_key = None::<ErrorKey>;
     let mut last_continuation = None::<ContinuationKind>;
+    let mut last_lock_wait = None::<usize>;
+    let mut lock_detail_active = false;
+    let mut lock_context_active = false;
+    let mut lock_statement_active = false;
     let mut last_lifecycle = None::<usize>;
     let mut lifecycle_detail_active = false;
+    let mut last_temp_file = None::<usize>;
+    let mut temp_statement_active = false;
     for line in lines {
         let Ok(decoded) = std::str::from_utf8(&line.bytes) else {
             flush_pending_slow_query(&mut pending_slow, &mut slow_groups);
+            flush_pending_autovacuum(&mut pending_autovacuum, &mut records.autovacuums, gaps);
             gaps.invalid_utf8 = gaps.invalid_utf8.saturating_add(1);
             last_key = None;
             last_continuation = None;
+            last_lock_wait = None;
+            lock_detail_active = false;
+            lock_context_active = false;
+            lock_statement_active = false;
             last_lifecycle = None;
             lifecycle_detail_active = false;
+            last_temp_file = None;
+            temp_statement_active = false;
             continue;
         };
         let decoded = decoded.strip_suffix('\r').unwrap_or(decoded);
@@ -733,15 +889,32 @@ fn parse_stderr_records(
                 append_string_capped(&mut slow.sql, text, MAX_TEXT_BYTES);
                 continue;
             }
+            if let Some(autovacuum) = pending_autovacuum.as_mut() {
+                append_string_capped(&mut autovacuum.message, text, MAX_TEXT_BYTES);
+                continue;
+            }
             if let Some(kind) = last_continuation {
                 append_to_last_continuation(&mut pending, last_key.as_ref(), kind, text);
+            }
+            if lock_detail_active {
+                append_lock_detail_continuation(&mut records.lock_waits, last_lock_wait, text);
+            }
+            if lock_context_active {
+                append_lock_context_continuation(&mut records.lock_waits, last_lock_wait, text);
+            }
+            if lock_statement_active {
+                append_lock_statement_continuation(&mut records.lock_waits, last_lock_wait, text);
             }
             if lifecycle_detail_active {
                 append_lifecycle_detail_continuation(&mut records.lifecycles, last_lifecycle, text);
             }
+            if temp_statement_active {
+                append_temp_statement_continuation(&mut records.temp_files, last_temp_file, text);
+            }
             continue;
         }
         flush_pending_slow_query(&mut pending_slow, &mut slow_groups);
+        flush_pending_autovacuum(&mut pending_autovacuum, &mut records.autovacuums, gaps);
         match parse_stderr_line(decoded) {
             Some(ParsedLine::Error {
                 ts,
@@ -751,31 +924,55 @@ fn parse_stderr_records(
             }) => {
                 let used_ts = ts.unwrap_or(fallback_ts);
                 let mut routed = false;
+                let mut routed_crash = false;
+                let mut lock_for_continuation = None;
                 let mut lifecycle_for_continuation = None;
+                let mut temp_for_continuation = None;
                 if severity == LogSeverity::Log {
                     if let Some(event) = parse_checkpoint_event(message, used_ts) {
                         routed = true;
                         push_checkpoint_event(&mut records.checkpoints, event, gaps);
+                    } else if let Some(autovacuum) = parse_autovacuum_start(message, used_ts) {
+                        routed = true;
+                        pending_autovacuum = Some(autovacuum);
                     } else if let Some(slow) = parse_slow_query_event(message, used_ts) {
                         routed = true;
                         pending_slow = Some(slow);
+                    } else if let Some(event) = parse_lock_wait_event(message, used_ts) {
+                        routed = true;
+                        lock_for_continuation =
+                            push_lock_wait_event(&mut records.lock_waits, event, gaps);
                     } else if let Some(event) = parse_lifecycle_event(message, used_ts) {
                         routed = true;
+                        routed_crash = event.kind == LifecycleKind::Crash;
                         lifecycle_for_continuation =
                             push_lifecycle_event(&mut records.lifecycles, event, gaps);
+                    } else if let Some(event) = parse_temp_file_event(message, used_ts) {
+                        routed = true;
+                        temp_for_continuation =
+                            push_temp_file_event(&mut records.temp_files, event, gaps);
                     }
                 }
 
                 let pattern = normalize_error(message);
                 let category = classify_error(&pattern, severity);
-                if severity == LogSeverity::Log && !is_relevant_log_event(&pattern, category) {
+                if severity == LogSeverity::Log
+                    && !routed_crash
+                    && !is_relevant_log_event(&pattern, category)
+                {
                     if routed && ts.is_none() {
                         gaps.timestamp_fallbacks = gaps.timestamp_fallbacks.saturating_add(1);
                     }
                     last_key = None;
                     last_continuation = None;
+                    last_lock_wait = lock_for_continuation;
+                    lock_detail_active = false;
+                    lock_context_active = false;
+                    lock_statement_active = false;
                     last_lifecycle = lifecycle_for_continuation;
                     lifecycle_detail_active = false;
+                    last_temp_file = temp_for_continuation;
+                    temp_statement_active = false;
                     continue;
                 }
                 if ts.is_none() {
@@ -798,29 +995,54 @@ fn parse_stderr_records(
                 entry.count = entry.count.saturating_add(1);
                 last_key = Some(key);
                 last_continuation = None;
+                last_lock_wait = lock_for_continuation;
+                lock_detail_active = false;
+                lock_context_active = false;
+                lock_statement_active = false;
                 last_lifecycle = lifecycle_for_continuation;
                 lifecycle_detail_active = false;
+                last_temp_file = temp_for_continuation;
+                temp_statement_active = false;
             }
             Some(ParsedLine::Continuation { kind, text }) => {
                 if let Some(slow) = pending_slow.as_mut() {
                     append_string_capped(&mut slow.sql, text, MAX_TEXT_BYTES);
                     continue;
                 }
+                if let Some(autovacuum) = pending_autovacuum.as_mut() {
+                    append_string_capped(&mut autovacuum.message, text, MAX_TEXT_BYTES);
+                    continue;
+                }
                 last_continuation =
                     append_to_last_continuation(&mut pending, last_key.as_ref(), kind, text)
                         .then_some(kind);
+                lock_detail_active = kind == ContinuationKind::Detail
+                    && apply_lock_detail(&mut records.lock_waits, last_lock_wait, text);
+                lock_context_active = kind == ContinuationKind::Context
+                    && apply_lock_context(&mut records.lock_waits, last_lock_wait, text);
+                lock_statement_active = kind == ContinuationKind::Statement
+                    && apply_lock_statement(&mut records.lock_waits, last_lock_wait, text);
                 lifecycle_detail_active = kind == ContinuationKind::Detail
                     && apply_lifecycle_detail(&mut records.lifecycles, last_lifecycle, text);
+                temp_statement_active = kind == ContinuationKind::Statement
+                    && apply_temp_statement(&mut records.temp_files, last_temp_file, text);
             }
             None => {
                 last_key = None;
                 last_continuation = None;
+                last_lock_wait = None;
+                lock_detail_active = false;
+                lock_context_active = false;
+                lock_statement_active = false;
                 last_lifecycle = None;
                 lifecycle_detail_active = false;
+                last_temp_file = None;
+                temp_statement_active = false;
             }
         }
     }
     flush_pending_slow_query(&mut pending_slow, &mut slow_groups);
+    flush_pending_autovacuum(&mut pending_autovacuum, &mut records.autovacuums, gaps);
     records.errors = error_rows_from_pending(pending, gaps);
     records.slow_queries = slow_rows_from_groups(slow_groups, gaps);
     records
@@ -933,6 +1155,18 @@ fn flush_pending_slow_query(
     }
 }
 
+fn flush_pending_autovacuum(
+    pending: &mut Option<PendingAutovacuum>,
+    rows: &mut Vec<AutovacuumEvent>,
+    gaps: &mut ParseGaps,
+) {
+    let Some(pending) = pending.take() else {
+        return;
+    };
+    let event = parse_autovacuum_event(&pending.message, pending.ts);
+    push_autovacuum_event(rows, event, gaps);
+}
+
 fn normalize_slow_sql(sql: &str) -> String {
     let normalized = normalize_error(sql);
     let normalized = replace_numeric_literals(&normalized);
@@ -983,12 +1217,51 @@ fn push_checkpoint_event(
     rows.push(event);
 }
 
+fn push_autovacuum_event(
+    rows: &mut Vec<AutovacuumEvent>,
+    event: AutovacuumEvent,
+    gaps: &mut ParseGaps,
+) -> Option<usize> {
+    if rows.len() >= MAX_AUTOVACUUM_EVENTS {
+        gaps.dropped_events = gaps.dropped_events.saturating_add(1);
+        return None;
+    }
+    rows.push(event);
+    Some(rows.len() - 1)
+}
+
+fn push_lock_wait_event(
+    rows: &mut Vec<LockWaitEvent>,
+    event: LockWaitEvent,
+    gaps: &mut ParseGaps,
+) -> Option<usize> {
+    if rows.len() >= MAX_LOCK_WAIT_EVENTS {
+        gaps.dropped_events = gaps.dropped_events.saturating_add(1);
+        return None;
+    }
+    rows.push(event);
+    Some(rows.len() - 1)
+}
+
 fn push_lifecycle_event(
     rows: &mut Vec<LifecycleEvent>,
     event: LifecycleEvent,
     gaps: &mut ParseGaps,
 ) -> Option<usize> {
     if rows.len() >= MAX_LIFECYCLE_EVENTS {
+        gaps.dropped_events = gaps.dropped_events.saturating_add(1);
+        return None;
+    }
+    rows.push(event);
+    Some(rows.len() - 1)
+}
+
+fn push_temp_file_event(
+    rows: &mut Vec<TempFileEvent>,
+    event: TempFileEvent,
+    gaps: &mut ParseGaps,
+) -> Option<usize> {
+    if rows.len() >= MAX_TEMP_FILE_EVENTS {
         gaps.dropped_events = gaps.dropped_events.saturating_add(1);
         return None;
     }
@@ -1006,6 +1279,13 @@ const DURATION_PREFIXES: &[(&str, &str)] = &[
     ("duration: ", " ms  statement: "),
     ("продолжительность: ", " мс  оператор: "),
 ];
+const AUTOVACUUM_PREFIXES: &[(&str, AutovacuumKind)] = &[
+    ("automatic vacuum of table", AutovacuumKind::Vacuum),
+    ("automatic analyze of table", AutovacuumKind::Analyze),
+    ("автоматическая очистка таблицы", AutovacuumKind::Vacuum),
+    ("автоматический анализ таблицы", AutovacuumKind::Analyze),
+];
+const TEMP_FILE_PREFIXES: &[&str] = &["temporary file:", "временный файл:"];
 const SERVER_CRASH_PREFIXES: &[&str] = &["server process (PID ", "серверный процесс (PID "];
 const SERVER_SHUTDOWN_PREFIXES: &[(&str, &str)] = &[
     ("received fast shutdown request", "fast"),
@@ -1103,6 +1383,65 @@ fn parse_checkpoint_event(message: &str, ts: i64) -> Option<CheckpointEvent> {
     None
 }
 
+fn parse_autovacuum_start(message: &str, ts: i64) -> Option<PendingAutovacuum> {
+    AUTOVACUUM_PREFIXES
+        .iter()
+        .any(|(prefix, _kind)| message.starts_with(prefix))
+        .then(|| PendingAutovacuum {
+            ts,
+            message: truncate_utf8(message, MAX_TEXT_BYTES).to_owned(),
+        })
+}
+
+fn parse_autovacuum_event(message: &str, ts: i64) -> AutovacuumEvent {
+    let kind = AUTOVACUUM_PREFIXES
+        .iter()
+        .find_map(|(prefix, kind)| message.starts_with(prefix).then_some(*kind))
+        .unwrap_or(AutovacuumKind::Vacuum);
+    let pages = tail_after_any(message, &["pages: ", "страниц: "]);
+    let tuples = tail_after_any(message, &["tuples: ", "кортежей: "]);
+    let wal = message.contains("WAL usage:");
+    AutovacuumEvent {
+        ts,
+        kind,
+        relation: extract_quoted_string(message),
+        index_scans: extract_i64_after(message, "index scans: ")
+            .or_else(|| extract_i64_after(message, "сканирований индекса: ")),
+        pages_removed: pages.and_then(extract_i64_prefix),
+        pages_remaining: pages.and_then(|tail| extract_i64_after(tail, " removed, ")),
+        tuples_removed: (kind == AutovacuumKind::Vacuum)
+            .then(|| tuples.and_then(extract_i64_prefix))
+            .flatten(),
+        tuples_remaining: (kind == AutovacuumKind::Vacuum)
+            .then(|| tuples.and_then(|tail| extract_i64_after(tail, " removed, ")))
+            .flatten(),
+        tuples_dead_not_removable: tuples.and_then(|tail| extract_i64_after(tail, " remain, ")),
+        elapsed_ms: extract_seconds_as_ms(message, "elapsed: ")
+            .or_else(|| extract_seconds_as_ms(message, "прошло: ")),
+        buffer_hits: extract_i64_after(message, "buffer usage: ")
+            .or_else(|| extract_i64_after(message, "буферов: ")),
+        buffer_misses: extract_i64_after(message, " hits, ")
+            .or_else(|| extract_i64_after(message, " попаданий, ")),
+        buffer_dirtied: extract_i64_after(message, " misses, ")
+            .or_else(|| extract_i64_after(message, " промахов, ")),
+        avg_read_rate_mbs: extract_f64_after(message, "avg read rate: ")
+            .or_else(|| extract_f64_after(message, "средняя скорость чтения: ")),
+        avg_write_rate_mbs: extract_f64_after(message, "avg write rate: ")
+            .or_else(|| extract_f64_after(message, "средняя скорость записи: ")),
+        cpu_user_ms: extract_cpu_seconds_as_ms(message, "user: "),
+        cpu_system_ms: extract_cpu_seconds_as_ms(message, "system: "),
+        wal_records: wal
+            .then(|| extract_i64_after(message, "WAL usage: "))
+            .flatten(),
+        wal_fpi: wal
+            .then(|| extract_i64_after(message, " records, "))
+            .flatten(),
+        wal_bytes: wal
+            .then(|| extract_i64_after(message, " images, "))
+            .flatten(),
+    }
+}
+
 fn parse_slow_query_event(message: &str, ts: i64) -> Option<PendingSlowQuery> {
     for &(duration_prefix, statement_marker) in DURATION_PREFIXES {
         let Some(rest) = message.strip_prefix(duration_prefix) else {
@@ -1123,6 +1462,100 @@ fn parse_slow_query_event(message: &str, ts: i64) -> Option<PendingSlowQuery> {
         });
     }
     None
+}
+
+fn parse_lock_wait_event(message: &str, ts: i64) -> Option<LockWaitEvent> {
+    if let Some(rest) = message.strip_prefix("process ") {
+        let pid = parse_i32_prefix(rest);
+        let after_pid = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .and_then(|pos| rest.get(pos..))?;
+        return parse_lock_wait_tail(ts, pid, after_pid, " still waiting for ", " acquired ");
+    }
+    if let Some(rest) = message.strip_prefix("процесс ") {
+        let pid = parse_i32_prefix(rest);
+        let after_pid = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .and_then(|pos| rest.get(pos..))?;
+        return parse_lock_wait_tail(ts, pid, after_pid, " продолжает ожидать ", " получил ");
+    }
+    None
+}
+
+fn parse_lock_wait_tail(
+    ts: i64,
+    pid: Option<i32>,
+    tail: &str,
+    waiting_marker: &str,
+    acquired_marker: &str,
+) -> Option<LockWaitEvent> {
+    let (kind, rest) = if let Some(rest) = tail.strip_prefix(waiting_marker) {
+        (LockWaitKind::Waiting, rest)
+    } else if let Some(rest) = tail.strip_prefix(acquired_marker) {
+        (LockWaitKind::Acquired, rest)
+    } else {
+        return None;
+    };
+    let (lock_mode, lock_target) = parse_lock_mode_target(rest);
+    Some(LockWaitEvent {
+        ts,
+        kind,
+        pid,
+        lock_mode,
+        lock_target,
+        duration_ms: extract_duration_after(rest, " after ")
+            .or_else(|| extract_duration_after(rest, " после ")),
+        detail: None,
+        context: None,
+        statement: None,
+    })
+}
+
+fn parse_lock_mode_target(rest: &str) -> (Option<String>, Option<String>) {
+    let Some((on_pos, marker_len)) = find_lock_target_marker(rest) else {
+        return (non_empty_text(rest.trim()), None);
+    };
+    let mode = rest
+        .get(..on_pos)
+        .and_then(|value| non_empty_text(value.trim()));
+    let target_start = on_pos + marker_len;
+    let Some(after_pos) = rest
+        .get(target_start..)
+        .and_then(|tail| tail.rfind(" after ").or_else(|| tail.rfind(" после ")))
+    else {
+        return (
+            mode,
+            rest.get(target_start..)
+                .and_then(|value| non_empty_text(value.trim())),
+        );
+    };
+    let target = rest
+        .get(target_start..target_start + after_pos)
+        .and_then(|value| non_empty_text(value.trim()));
+    (mode, target)
+}
+
+fn find_lock_target_marker(value: &str) -> Option<(usize, usize)> {
+    [" on ", " на "]
+        .iter()
+        .find_map(|marker| value.find(marker).map(|pos| (pos, marker.len())))
+}
+
+fn parse_temp_file_event(message: &str, ts: i64) -> Option<TempFileEvent> {
+    if !TEMP_FILE_PREFIXES
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        return None;
+    }
+    Some(TempFileEvent {
+        ts,
+        path: extract_quoted_string(message),
+        size_bytes: extract_i64_after(message, "size ")
+            .or_else(|| extract_i64_after(message, "размер "))
+            .filter(|value| *value >= 0)?,
+        statement: None,
+    })
 }
 
 fn parse_lifecycle_event(message: &str, ts: i64) -> Option<LifecycleEvent> {
@@ -1194,6 +1627,70 @@ fn append_lifecycle_detail_continuation(
     };
     append_option_text_capped(&mut row.query_detail, text, MAX_TEXT_BYTES);
     true
+}
+
+fn apply_lock_detail(rows: &mut [LockWaitEvent], index: Option<usize>, text: &str) -> bool {
+    let Some(row) = index.and_then(|index| rows.get_mut(index)) else {
+        return false;
+    };
+    append_option_text_capped(&mut row.detail, text, MAX_TEXT_BYTES);
+    true
+}
+
+fn append_lock_detail_continuation(
+    rows: &mut [LockWaitEvent],
+    index: Option<usize>,
+    text: &str,
+) -> bool {
+    apply_lock_detail(rows, index, text)
+}
+
+fn apply_lock_context(rows: &mut [LockWaitEvent], index: Option<usize>, text: &str) -> bool {
+    let Some(row) = index.and_then(|index| rows.get_mut(index)) else {
+        return false;
+    };
+    append_option_text_capped(&mut row.context, text, MAX_TEXT_BYTES);
+    true
+}
+
+fn append_lock_context_continuation(
+    rows: &mut [LockWaitEvent],
+    index: Option<usize>,
+    text: &str,
+) -> bool {
+    apply_lock_context(rows, index, text)
+}
+
+fn apply_lock_statement(rows: &mut [LockWaitEvent], index: Option<usize>, text: &str) -> bool {
+    let Some(row) = index.and_then(|index| rows.get_mut(index)) else {
+        return false;
+    };
+    append_option_text_capped(&mut row.statement, text, MAX_TEXT_BYTES);
+    true
+}
+
+fn append_lock_statement_continuation(
+    rows: &mut [LockWaitEvent],
+    index: Option<usize>,
+    text: &str,
+) -> bool {
+    apply_lock_statement(rows, index, text)
+}
+
+fn apply_temp_statement(rows: &mut [TempFileEvent], index: Option<usize>, text: &str) -> bool {
+    let Some(row) = index.and_then(|index| rows.get_mut(index)) else {
+        return false;
+    };
+    append_option_text_capped(&mut row.statement, text, MAX_TEXT_BYTES);
+    true
+}
+
+fn append_temp_statement_continuation(
+    rows: &mut [TempFileEvent],
+    index: Option<usize>,
+    text: &str,
+) -> bool {
+    apply_temp_statement(rows, index, text)
 }
 
 fn extract_crash_detail_sql(text: &str) -> Option<String> {
@@ -1274,6 +1771,13 @@ fn extract_i64_after(text: &str, marker: &str) -> Option<i64> {
     rest.get(..end)?.parse().ok()
 }
 
+fn extract_i64_prefix(text: &str) -> Option<i64> {
+    let end = text
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(text.len());
+    text.get(..end)?.parse().ok()
+}
+
 fn extract_f64_after(text: &str, marker: &str) -> Option<f64> {
     let start = text.find(marker)? + marker.len();
     let rest = text.get(start..)?;
@@ -1286,6 +1790,38 @@ fn extract_f64_after(text: &str, marker: &str) -> Option<f64> {
 
 fn extract_seconds_as_ms(text: &str, marker: &str) -> Option<f64> {
     extract_f64_after(text, marker).map(|seconds| seconds * 1000.0)
+}
+
+fn extract_duration_after(text: &str, marker: &str) -> Option<f64> {
+    let start = text.rfind(marker)? + marker.len();
+    let rest = text.get(start..)?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(rest.len());
+    let value = rest.get(..end)?.parse::<f64>().ok()?;
+    (value.is_finite() && value >= 0.0).then_some(value)
+}
+
+fn extract_cpu_seconds_as_ms(text: &str, marker: &str) -> Option<f64> {
+    text.find("CPU:")
+        .and_then(|pos| text.get(pos..))
+        .and_then(|tail| extract_seconds_as_ms(tail, marker))
+}
+
+fn extract_quoted_string(text: &str) -> Option<String> {
+    let start = text.find('"')? + 1;
+    let rest = text.get(start..)?;
+    let end = rest.find('"')?;
+    rest.get(..end)
+        .and_then(non_empty_text)
+        .map(|value| truncate_utf8(&value, MAX_TEXT_BYTES).to_owned())
+}
+
+fn tail_after_any<'a>(text: &'a str, markers: &[&str]) -> Option<&'a str> {
+    markers.iter().find_map(|marker| {
+        text.find(marker)
+            .and_then(|pos| text.get(pos + marker.len()..))
+    })
 }
 
 fn non_empty_text(value: &str) -> Option<String> {
@@ -1497,7 +2033,8 @@ const fn empty_gap() -> LogGap {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckpointPhase, GapReason, LifecycleKind, LogCollector, LogConfig, read_error_reason,
+        AutovacuumKind, CheckpointPhase, GapReason, LifecycleKind, LockWaitKind, LogCollector,
+        LogConfig, read_error_reason,
     };
     use crate::{ErrorCategory, LogSeverity, ParserKind};
     use std::fmt::Write as _;
@@ -1670,6 +2207,10 @@ mod tests {
         assert_eq!(complete.wal_removed, Some(1));
         assert_eq!(complete.wal_recycled, Some(2));
         assert_eq!(complete.sync_files, Some(7));
+        assert_eq!(complete.distance_kb, Some(4096));
+        assert_eq!(complete.estimate_kb, Some(8192));
+        assert_eq!(complete.longest_sync_ms, Some(40.0));
+        assert_eq!(complete.average_sync_ms, Some(8.0));
         let too_frequent = batch
             .checkpoints
             .iter()
@@ -1706,6 +2247,176 @@ mod tests {
         assert_close(slow.total_duration_ms, 2000.250);
         assert_eq!(slow.sample, "SELECT * FROM slow_table WHERE id = 42");
         assert!(slow.sample.len() <= crate::MAX_TEXT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn collects_autovacuum_events_from_multiline_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:06:00 UTC [1]: LOG:  automatic vacuum of table \"mydb.public.orders\": index scans: 1\n\
+             \tpages: 10 removed, 20 remain, 0 skipped due to pins, 0 skipped frozen\n\
+             \ttuples: 30 removed, 40 remain, 5 are dead but not yet removable, oldest xmin: 123\n\
+             \tbuffer usage: 100 hits, 2 misses, 3 dirtied\n\
+             \tavg read rate: 1.500 MB/s, avg write rate: 2.500 MB/s\n\
+             \tWAL usage: 15 records, 2 full page images, 4096 bytes\n\
+             \tsystem usage: CPU: user: 0.12 s, system: 0.34 s, elapsed: 5.67 s\n\
+             2026-07-05 12:06:01 UTC [1]: LOG:  automatic analyze of table \"tpl-service.bucket_90.posting_sender\"\n\
+             \tbuffer usage: 1843 hits, 3 misses, 0 dirtied\n\
+             \tavg read rate: 0.500 MB/s, avg write rate: 0.000 MB/s\n\
+             \tsystem usage: CPU: user: 0.02 s, system: 0.01 s, elapsed: 3.60 s\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert!(batch.errors.is_empty());
+        assert_eq!(batch.autovacuums.len(), 2);
+        let vacuum = batch
+            .autovacuums
+            .iter()
+            .find(|event| event.kind == AutovacuumKind::Vacuum)
+            .expect("vacuum row");
+        assert_eq!(vacuum.relation.as_deref(), Some("mydb.public.orders"));
+        assert_eq!(vacuum.index_scans, Some(1));
+        assert_eq!(vacuum.pages_removed, Some(10));
+        assert_eq!(vacuum.pages_remaining, Some(20));
+        assert_eq!(vacuum.tuples_removed, Some(30));
+        assert_eq!(vacuum.tuples_remaining, Some(40));
+        assert_eq!(vacuum.tuples_dead_not_removable, Some(5));
+        assert_close(vacuum.elapsed_ms.expect("elapsed"), 5670.0);
+        assert_eq!(vacuum.buffer_hits, Some(100));
+        assert_eq!(vacuum.buffer_misses, Some(2));
+        assert_eq!(vacuum.buffer_dirtied, Some(3));
+        assert_eq!(vacuum.avg_read_rate_mbs, Some(1.5));
+        assert_eq!(vacuum.avg_write_rate_mbs, Some(2.5));
+        assert_close(vacuum.cpu_user_ms.expect("user cpu"), 120.0);
+        assert_close(vacuum.cpu_system_ms.expect("system cpu"), 340.0);
+        assert_eq!(vacuum.wal_records, Some(15));
+        assert_eq!(vacuum.wal_fpi, Some(2));
+        assert_eq!(vacuum.wal_bytes, Some(4096));
+        let analyze = batch
+            .autovacuums
+            .iter()
+            .find(|event| event.kind == AutovacuumKind::Analyze)
+            .expect("analyze row");
+        assert_eq!(
+            analyze.relation.as_deref(),
+            Some("tpl-service.bucket_90.posting_sender")
+        );
+        assert_eq!(analyze.tuples_removed, None);
+        assert_eq!(analyze.buffer_hits, Some(1843));
+        assert_close(analyze.elapsed_ms.expect("elapsed"), 3600.0);
+    }
+
+    #[tokio::test]
+    async fn collects_lock_wait_events_with_continuations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:07:00 UTC [70]: LOG:  process 70 still waiting for ShareLock on transaction 12345678 after 30009.004 ms\n\
+             2026-07-05 12:07:00 UTC [70]: DETAIL:  Process holding the lock: 80. Wait queue: 70.\n\
+             \tWait queue continues on the next line.\n\
+             2026-07-05 12:07:00 UTC [70]: STATEMENT:  UPDATE accounts SET balance = balance + 1 WHERE id = 1\n\
+             2026-07-05 12:07:01 UTC [70]: LOG:  process 70 acquired ShareLock on transaction 12345678 after 30010.004 ms\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert!(batch.errors.is_empty());
+        assert_eq!(batch.lock_waits.len(), 2);
+        let waiting = batch
+            .lock_waits
+            .iter()
+            .find(|event| event.kind == LockWaitKind::Waiting)
+            .expect("waiting row");
+        assert_eq!(waiting.pid, Some(70));
+        assert_eq!(waiting.lock_mode.as_deref(), Some("ShareLock"));
+        assert_eq!(waiting.lock_target.as_deref(), Some("transaction 12345678"));
+        assert_close(waiting.duration_ms.expect("duration"), 30009.004);
+        assert_eq!(
+            waiting.detail.as_deref(),
+            Some(
+                "Process holding the lock: 80. Wait queue: 70. Wait queue continues on the next line."
+            )
+        );
+        assert_eq!(
+            waiting.statement.as_deref(),
+            Some("UPDATE accounts SET balance = balance + 1 WHERE id = 1")
+        );
+        let acquired = batch
+            .lock_waits
+            .iter()
+            .find(|event| event.kind == LockWaitKind::Acquired)
+            .expect("acquired row");
+        assert_eq!(acquired.pid, Some(70));
+        assert_close(acquired.duration_ms.expect("duration"), 30010.004);
+    }
+
+    #[tokio::test]
+    async fn collects_temp_file_events_with_statement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:08:00 UTC [1]: LOG:  temporary file: path \"base/pgsql_tmp/pgsql_tmp15967.0\", size 200204288\n\
+             2026-07-05 12:08:00 UTC [1]: STATEMENT:  SELECT * FROM big_sort ORDER BY payload\n\
+             \tLIMIT 100\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert!(batch.errors.is_empty());
+        assert_eq!(batch.temp_files.len(), 1);
+        let temp_file = &batch.temp_files[0];
+        assert_eq!(
+            temp_file.path.as_deref(),
+            Some("base/pgsql_tmp/pgsql_tmp15967.0")
+        );
+        assert_eq!(temp_file.size_bytes, 200_204_288);
+        assert_eq!(
+            temp_file.statement.as_deref(),
+            Some("SELECT * FROM big_sort ORDER BY payload LIMIT 100")
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_event_overflow_emits_parser_drop_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        let mut content = String::new();
+        for idx in 0..66 {
+            writeln!(
+                &mut content,
+                "2026-07-05 12:08:{:02} UTC [1]: LOG:  temporary file: path \"base/pgsql_tmp/pgsql_tmp15967.{idx}\", size {}",
+                idx % 60,
+                idx + 1
+            )
+            .expect("format fixture line");
+        }
+        std::fs::write(&log, content).expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.temp_files.len(), 64);
+        let parser_drop = batch
+            .gaps
+            .iter()
+            .find(|gap| gap.reason == GapReason::ParserDrop)
+            .expect("parser drop gap");
+        assert_eq!(parser_drop.parser_dropped_lines, 2);
     }
 
     #[tokio::test]
@@ -1779,6 +2490,28 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == LifecycleKind::Ready)
         );
+    }
+
+    #[tokio::test]
+    async fn localized_crash_log_is_retained_as_lifecycle_and_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:05:00 UTC [1]: LOG:  серверный процесс (PID 4242) был прерван сигналом 9: Убито\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.lifecycles.len(), 1);
+        assert_eq!(batch.lifecycles[0].kind, LifecycleKind::Crash);
+        assert_eq!(batch.lifecycles[0].pid, Some(4242));
+        assert_eq!(batch.lifecycles[0].signal, Some(9));
+        assert_eq!(batch.errors.len(), 1);
+        assert_eq!(batch.errors[0].severity, LogSeverity::Log);
     }
 
     fn assert_close(actual: f64, expected: f64) {

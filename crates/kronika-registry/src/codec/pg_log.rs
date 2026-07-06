@@ -129,6 +129,84 @@ pub struct PgLogCheckpointV1 {
     pub dict_dropped_fields: u8,
 }
 
+/// Type `1_025_001`: autovacuum and autoanalyze LOG events.
+///
+/// One row represents one bounded stderr autovacuum/autoanalyze report. Numeric
+/// fields stay nullable because `PostgreSQL` emits different shapes for vacuum
+/// and analyze records, and older releases may omit selected metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Section)]
+#[section(
+    id = 1_025_001,
+    name = "pg_log_autovacuum",
+    semantics = event_stream,
+    sort_key("ts", "kind", "relation")
+)]
+pub struct PgLogAutovacuumV1 {
+    /// Log record time, unix microseconds.
+    #[column(t)]
+    pub ts: Ts,
+    /// Kind: `0` vacuum, `1` analyze.
+    #[column(l)]
+    pub kind: u8,
+    /// Qualified relation name reported by `PostgreSQL`.
+    #[column(l)]
+    pub relation: Option<StrId>,
+    /// Index scans from a vacuum report.
+    #[column(g)]
+    pub index_scans: Option<i64>,
+    /// Heap pages removed by vacuum.
+    #[column(g)]
+    pub pages_removed: Option<i64>,
+    /// Heap pages remaining after vacuum.
+    #[column(g)]
+    pub pages_remaining: Option<i64>,
+    /// Tuples removed by vacuum.
+    #[column(g)]
+    pub tuples_removed: Option<i64>,
+    /// Tuples remaining after vacuum.
+    #[column(g)]
+    pub tuples_remaining: Option<i64>,
+    /// Dead tuples not yet removable.
+    #[column(g)]
+    pub tuples_dead_not_removable: Option<i64>,
+    /// Elapsed runtime, ms.
+    #[column(g)]
+    pub elapsed_ms: Option<f64>,
+    /// Buffer cache hits.
+    #[column(g)]
+    pub buffer_hits: Option<i64>,
+    /// Buffer cache misses.
+    #[column(g)]
+    pub buffer_misses: Option<i64>,
+    /// Buffers dirtied.
+    #[column(g)]
+    pub buffer_dirtied: Option<i64>,
+    /// Average read rate, MB/s.
+    #[column(g)]
+    pub avg_read_rate_mbs: Option<f64>,
+    /// Average write rate, MB/s.
+    #[column(g)]
+    pub avg_write_rate_mbs: Option<f64>,
+    /// User CPU time, ms.
+    #[column(g)]
+    pub cpu_user_ms: Option<f64>,
+    /// System CPU time, ms.
+    #[column(g)]
+    pub cpu_system_ms: Option<f64>,
+    /// WAL records generated.
+    #[column(g)]
+    pub wal_records: Option<i64>,
+    /// WAL full-page images generated.
+    #[column(g)]
+    pub wal_fpi: Option<i64>,
+    /// WAL bytes generated.
+    #[column(g)]
+    pub wal_bytes: Option<i64>,
+    /// Text fields dropped because dictionary interning failed.
+    #[column(g)]
+    pub dict_dropped_fields: u8,
+}
+
 /// Type `1_026_001`: slow-query LOG top-N.
 ///
 /// One row represents a normalized SQL pattern from `duration: ... statement:`
@@ -161,6 +239,51 @@ pub struct PgLogSlowQueryV1 {
     /// Sum of durations for this pattern, ms.
     #[column(g)]
     pub total_duration_ms: f64,
+    /// Text fields dropped because dictionary interning failed.
+    #[column(g)]
+    pub dict_dropped_fields: u8,
+}
+
+/// Type `1_027_001`: lock-wait LOG events.
+///
+/// One row represents a `log_lock_waits` message. `waiting` and `acquired`
+/// records are separate rows because `PostgreSQL` emits them as separate LOG
+/// lines and may attach different continuation fields.
+#[derive(Debug, Clone, Copy, PartialEq, Section)]
+#[section(
+    id = 1_027_001,
+    name = "pg_log_lock_waits",
+    semantics = event_stream,
+    sort_key("ts", "kind", "pid")
+)]
+pub struct PgLogLockWaitV1 {
+    /// Log record time, unix microseconds.
+    #[column(t)]
+    pub ts: Ts,
+    /// Kind: `0` still waiting, `1` acquired.
+    #[column(l)]
+    pub kind: u8,
+    /// Waiting backend process id.
+    #[column(l)]
+    pub pid: Option<i32>,
+    /// Lock mode, e.g. `ShareLock`.
+    #[column(l)]
+    pub lock_mode: Option<StrId>,
+    /// Lock target, e.g. `transaction 12345`.
+    #[column(l)]
+    pub lock_target: Option<StrId>,
+    /// Wait duration reported by `PostgreSQL`, ms.
+    #[column(g)]
+    pub duration_ms: Option<f64>,
+    /// `DETAIL:` continuation payload.
+    #[column(l)]
+    pub detail: Option<StrId>,
+    /// `CONTEXT:` continuation payload.
+    #[column(l)]
+    pub context: Option<StrId>,
+    /// SQL from a following `STATEMENT:` line.
+    #[column(l)]
+    pub statement: Option<StrId>,
     /// Text fields dropped because dictionary interning failed.
     #[column(g)]
     pub dict_dropped_fields: u8,
@@ -199,6 +322,36 @@ pub struct PgLogLifecycleV1 {
     /// SQL extracted from a following crash `DETAIL:` line.
     #[column(l)]
     pub query_detail: Option<StrId>,
+    /// Text fields dropped because dictionary interning failed.
+    #[column(g)]
+    pub dict_dropped_fields: u8,
+}
+
+/// Type `1_030_001`: temporary-file LOG events.
+///
+/// One row represents a `log_temp_files` record. The file path and attached
+/// statement are bounded dictionary strings; `size_bytes` is required because
+/// `PostgreSQL` reports it in the LOG line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
+#[section(
+    id = 1_030_001,
+    name = "pg_log_temp_files",
+    semantics = event_stream,
+    sort_key("ts", "size_bytes")
+)]
+pub struct PgLogTempFileV1 {
+    /// Log record time, unix microseconds.
+    #[column(t)]
+    pub ts: Ts,
+    /// Temporary file path.
+    #[column(l)]
+    pub path: Option<StrId>,
+    /// Temporary file size, bytes.
+    #[column(g)]
+    pub size_bytes: i64,
+    /// SQL from a following `STATEMENT:` line.
+    #[column(l)]
+    pub statement: Option<StrId>,
     /// Text fields dropped because dictionary interning failed.
     #[column(g)]
     pub dict_dropped_fields: u8,
@@ -273,7 +426,10 @@ pub struct PgLogGapV1 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1, PgLogSlowQueryV1};
+    use super::{
+        PgLogAutovacuumV1, PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1,
+        PgLogLockWaitV1, PgLogSlowQueryV1, PgLogTempFileV1,
+    };
     use crate::{Section, StrId, Ts, lint};
 
     #[test]
@@ -282,9 +438,12 @@ mod tests {
             lint(&[
                 PgLogErrorV1::CONTRACT,
                 PgLogCheckpointV1::CONTRACT,
+                PgLogAutovacuumV1::CONTRACT,
                 PgLogSlowQueryV1::CONTRACT,
+                PgLogLockWaitV1::CONTRACT,
                 PgLogLifecycleV1::CONTRACT,
                 PgLogGapV1::CONTRACT,
+                PgLogTempFileV1::CONTRACT,
             ]),
             Ok(())
         );
@@ -318,6 +477,17 @@ mod tests {
     }
 
     #[test]
+    fn autovacuum_contract_shape() {
+        let c = PgLogAutovacuumV1::CONTRACT;
+        assert_eq!(c.type_id.get(), 1_025_001);
+        assert_eq!(c.columns.len(), 21);
+        assert_eq!(c.sort_key, ["ts", "kind", "relation"]);
+        assert_eq!(c.column("relation").map(|col| col.nullable), Some(true));
+        assert_eq!(c.column("kind").map(|col| col.nullable), Some(false));
+        assert_eq!(c.column("elapsed_ms").map(|col| col.nullable), Some(true));
+    }
+
+    #[test]
     fn slow_query_contract_shape() {
         let c = PgLogSlowQueryV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_026_001);
@@ -331,6 +501,16 @@ mod tests {
     }
 
     #[test]
+    fn lock_wait_contract_shape() {
+        let c = PgLogLockWaitV1::CONTRACT;
+        assert_eq!(c.type_id.get(), 1_027_001);
+        assert_eq!(c.columns.len(), 10);
+        assert_eq!(c.sort_key, ["ts", "kind", "pid"]);
+        assert_eq!(c.column("lock_mode").map(|col| col.nullable), Some(true));
+        assert_eq!(c.column("duration_ms").map(|col| col.nullable), Some(true));
+    }
+
+    #[test]
     fn lifecycle_contract_shape() {
         let c = PgLogLifecycleV1::CONTRACT;
         assert_eq!(c.type_id.get(), 1_028_001);
@@ -338,6 +518,16 @@ mod tests {
         assert_eq!(c.sort_key, ["ts", "kind"]);
         assert_eq!(c.column("pid").map(|col| col.nullable), Some(true));
         assert_eq!(c.column("message").map(|col| col.nullable), Some(true));
+    }
+
+    #[test]
+    fn temp_file_contract_shape() {
+        let c = PgLogTempFileV1::CONTRACT;
+        assert_eq!(c.type_id.get(), 1_030_001);
+        assert_eq!(c.columns.len(), 5);
+        assert_eq!(c.sort_key, ["ts", "size_bytes"]);
+        assert_eq!(c.column("path").map(|col| col.nullable), Some(true));
+        assert_eq!(c.column("size_bytes").map(|col| col.nullable), Some(false));
     }
 
     #[test]
@@ -436,6 +626,58 @@ mod tests {
     }
 
     #[test]
+    fn autovacuum_roundtrip_preserves_nullable_metrics() {
+        crate::assert_roundtrips(&[
+            PgLogAutovacuumV1 {
+                ts: Ts(35),
+                kind: 0,
+                relation: Some(StrId(12)),
+                index_scans: Some(1),
+                pages_removed: Some(10),
+                pages_remaining: Some(20),
+                tuples_removed: Some(30),
+                tuples_remaining: Some(40),
+                tuples_dead_not_removable: Some(5),
+                elapsed_ms: Some(5670.0),
+                buffer_hits: Some(100),
+                buffer_misses: Some(2),
+                buffer_dirtied: Some(3),
+                avg_read_rate_mbs: Some(1.5),
+                avg_write_rate_mbs: Some(2.5),
+                cpu_user_ms: Some(120.0),
+                cpu_system_ms: Some(340.0),
+                wal_records: Some(15),
+                wal_fpi: Some(2),
+                wal_bytes: Some(4096),
+                dict_dropped_fields: 0,
+            },
+            PgLogAutovacuumV1 {
+                ts: Ts(36),
+                kind: 1,
+                relation: None,
+                index_scans: None,
+                pages_removed: None,
+                pages_remaining: None,
+                tuples_removed: None,
+                tuples_remaining: None,
+                tuples_dead_not_removable: None,
+                elapsed_ms: Some(10.0),
+                buffer_hits: None,
+                buffer_misses: None,
+                buffer_dirtied: None,
+                avg_read_rate_mbs: None,
+                avg_write_rate_mbs: None,
+                cpu_user_ms: None,
+                cpu_system_ms: None,
+                wal_records: None,
+                wal_fpi: None,
+                wal_bytes: None,
+                dict_dropped_fields: 1,
+            },
+        ]);
+    }
+
+    #[test]
     fn slow_query_roundtrip_preserves_topn_metrics() {
         crate::assert_roundtrips(&[PgLogSlowQueryV1 {
             ts: Ts(40),
@@ -444,6 +686,22 @@ mod tests {
             count: 3,
             max_duration_ms: 1234.5,
             total_duration_ms: 2000.0,
+            dict_dropped_fields: 0,
+        }]);
+    }
+
+    #[test]
+    fn lock_wait_roundtrip_preserves_continuations() {
+        crate::assert_roundtrips(&[PgLogLockWaitV1 {
+            ts: Ts(45),
+            kind: 0,
+            pid: Some(70),
+            lock_mode: Some(StrId(22)),
+            lock_target: Some(StrId(23)),
+            duration_ms: Some(30009.004),
+            detail: Some(StrId(24)),
+            context: None,
+            statement: Some(StrId(25)),
             dict_dropped_fields: 0,
         }]);
     }
@@ -472,6 +730,17 @@ mod tests {
                 dict_dropped_fields: 0,
             },
         ]);
+    }
+
+    #[test]
+    fn temp_file_roundtrip_preserves_statement() {
+        crate::assert_roundtrips(&[PgLogTempFileV1 {
+            ts: Ts(60),
+            path: Some(StrId(40)),
+            size_bytes: 200_204_288,
+            statement: Some(StrId(41)),
+            dict_dropped_fields: 0,
+        }]);
     }
 
     #[test]

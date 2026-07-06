@@ -137,15 +137,17 @@ use kronika_registry::os_stat::OsStat;
 use kronika_registry::os_topology::OsTopology;
 use kronika_registry::os_vmstat::OsVmstat;
 use kronika_registry::pg_log::{
-    PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1, PgLogSlowQueryV1,
+    PgLogAutovacuumV1, PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1,
+    PgLogLockWaitV1, PgLogSlowQueryV1, PgLogTempFileV1,
 };
 use kronika_registry::{MAX_SECTION_ROWS, StrId, Ts};
 use kronika_source_log::{
-    CheckpointEvent, DiscoveryStatus as LogDiscoveryStatus, GroupedLogError, LifecycleEvent,
-    LogCollection, LogCollector, LogConfig, LogGap, MAX_PATTERN_BYTES, MAX_TEXT_BYTES,
-    PG_LOG_CHECKPOINTS_TYPE_ID, PG_LOG_ERRORS_TYPE_ID, PG_LOG_GAP_TYPE_ID,
-    PG_LOG_LIFECYCLE_TYPE_ID, PG_LOG_SLOW_QUERIES_TYPE_ID, ParserKind as LogParserKind,
-    SlowQueryEvent,
+    AutovacuumEvent, CheckpointEvent, DiscoveryStatus as LogDiscoveryStatus, GroupedLogError,
+    LifecycleEvent, LockWaitEvent, LogCollection, LogCollector, LogConfig, LogGap,
+    MAX_PATTERN_BYTES, MAX_TEXT_BYTES, PG_LOG_AUTOVACUUM_TYPE_ID, PG_LOG_CHECKPOINTS_TYPE_ID,
+    PG_LOG_ERRORS_TYPE_ID, PG_LOG_GAP_TYPE_ID, PG_LOG_LIFECYCLE_TYPE_ID, PG_LOG_LOCK_WAITS_TYPE_ID,
+    PG_LOG_SLOW_QUERIES_TYPE_ID, PG_LOG_TEMP_FILES_TYPE_ID, ParserKind as LogParserKind,
+    SlowQueryEvent, TempFileEvent,
 };
 use kronika_source_os::proc::cpuinfo;
 use kronika_source_os::proc::loadavg::parse_loadavg;
@@ -3746,6 +3748,14 @@ async fn collect_log_batch(
             started.elapsed(),
         );
     }
+    if !collection.autovacuums.is_empty() {
+        log_collection_finish(
+            PG_LOG_AUTOVACUUM_TYPE_ID,
+            "log",
+            collection.autovacuums.len(),
+            started.elapsed(),
+        );
+    }
     if !collection.slow_queries.is_empty() {
         log_collection_finish(
             PG_LOG_SLOW_QUERIES_TYPE_ID,
@@ -3754,11 +3764,27 @@ async fn collect_log_batch(
             started.elapsed(),
         );
     }
+    if !collection.lock_waits.is_empty() {
+        log_collection_finish(
+            PG_LOG_LOCK_WAITS_TYPE_ID,
+            "log",
+            collection.lock_waits.len(),
+            started.elapsed(),
+        );
+    }
     if !collection.lifecycles.is_empty() {
         log_collection_finish(
             PG_LOG_LIFECYCLE_TYPE_ID,
             "log",
             collection.lifecycles.len(),
+            started.elapsed(),
+        );
+    }
+    if !collection.temp_files.is_empty() {
+        log_collection_finish(
+            PG_LOG_TEMP_FILES_TYPE_ID,
+            "log",
+            collection.temp_files.len(),
             started.elapsed(),
         );
     }
@@ -3778,8 +3804,11 @@ async fn collect_log_batch(
                 field("status", discovery_status_name(status)),
                 field("error_rows", collection.errors.len()),
                 field("checkpoint_rows", collection.checkpoints.len()),
+                field("autovacuum_rows", collection.autovacuums.len()),
                 field("slow_query_rows", collection.slow_queries.len()),
+                field("lock_wait_rows", collection.lock_waits.len()),
                 field("lifecycle_rows", collection.lifecycles.len()),
+                field("temp_file_rows", collection.temp_files.len()),
                 field("gap_rows", collection.gaps.len()),
                 field("elapsed_ms", duration_ms(started.elapsed())),
             ],
@@ -3823,11 +3852,20 @@ fn push_log_sections(
     for checkpoint in &collection.checkpoints {
         dropped = dropped.saturating_add(push_log_checkpoint(buffers, interner, checkpoint)?);
     }
+    for autovacuum in &collection.autovacuums {
+        dropped = dropped.saturating_add(push_log_autovacuum(buffers, interner, autovacuum)?);
+    }
     for slow_query in &collection.slow_queries {
         dropped = dropped.saturating_add(push_log_slow_query(buffers, interner, slow_query)?);
     }
+    for lock_wait in &collection.lock_waits {
+        dropped = dropped.saturating_add(push_log_lock_wait(buffers, interner, lock_wait)?);
+    }
     for lifecycle in &collection.lifecycles {
         dropped = dropped.saturating_add(push_log_lifecycle(buffers, interner, lifecycle)?);
+    }
+    for temp_file in &collection.temp_files {
+        dropped = dropped.saturating_add(push_log_temp_file(buffers, interner, temp_file)?);
     }
     dropped = dropped.saturating_add(push_log_gaps(buffers, interner, &collection.gaps)?);
     Ok(dropped)
@@ -3918,6 +3956,45 @@ fn push_log_checkpoint(
     Ok(dropped)
 }
 
+fn push_log_autovacuum(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    autovacuum: &AutovacuumEvent,
+) -> Result<u32> {
+    let mut dropped = 0_u32;
+    let relation = autovacuum
+        .relation
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    buffer_row(
+        buffers,
+        PgLogAutovacuumV1 {
+            ts: Ts(autovacuum.ts),
+            kind: autovacuum.kind.code(),
+            relation,
+            index_scans: autovacuum.index_scans,
+            pages_removed: autovacuum.pages_removed,
+            pages_remaining: autovacuum.pages_remaining,
+            tuples_removed: autovacuum.tuples_removed,
+            tuples_remaining: autovacuum.tuples_remaining,
+            tuples_dead_not_removable: autovacuum.tuples_dead_not_removable,
+            elapsed_ms: autovacuum.elapsed_ms,
+            buffer_hits: autovacuum.buffer_hits,
+            buffer_misses: autovacuum.buffer_misses,
+            buffer_dirtied: autovacuum.buffer_dirtied,
+            avg_read_rate_mbs: autovacuum.avg_read_rate_mbs,
+            avg_write_rate_mbs: autovacuum.avg_write_rate_mbs,
+            cpu_user_ms: autovacuum.cpu_user_ms,
+            cpu_system_ms: autovacuum.cpu_system_ms,
+            wal_records: autovacuum.wal_records,
+            wal_fpi: autovacuum.wal_fpi,
+            wal_bytes: autovacuum.wal_bytes,
+            dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
+        },
+    )?;
+    Ok(dropped)
+}
+
 fn push_log_slow_query(
     buffers: &mut SectionBuffers,
     interner: &mut Interner,
@@ -3940,6 +4017,50 @@ fn push_log_slow_query(
             count: slow_query.count,
             max_duration_ms: slow_query.max_duration_ms,
             total_duration_ms: slow_query.total_duration_ms,
+            dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
+        },
+    )?;
+    Ok(dropped)
+}
+
+fn push_log_lock_wait(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    lock_wait: &LockWaitEvent,
+) -> Result<u32> {
+    let mut dropped = 0_u32;
+    let lock_mode = lock_wait
+        .lock_mode
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let lock_target = lock_wait
+        .lock_target
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let detail = lock_wait
+        .detail
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let context = lock_wait
+        .context
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let statement = lock_wait
+        .statement
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    buffer_row(
+        buffers,
+        PgLogLockWaitV1 {
+            ts: Ts(lock_wait.ts),
+            kind: lock_wait.kind.code(),
+            pid: lock_wait.pid,
+            lock_mode,
+            lock_target,
+            duration_ms: lock_wait.duration_ms,
+            detail,
+            context,
+            statement,
             dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
         },
     )?;
@@ -3971,6 +4092,33 @@ fn push_log_lifecycle(
             shutdown_mode,
             message,
             query_detail,
+            dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
+        },
+    )?;
+    Ok(dropped)
+}
+
+fn push_log_temp_file(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    temp_file: &TempFileEvent,
+) -> Result<u32> {
+    let mut dropped = 0_u32;
+    let path = temp_file
+        .path
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    let statement = temp_file
+        .statement
+        .as_deref()
+        .and_then(|value| intern_log_text(interner, value, MAX_TEXT_BYTES, &mut dropped));
+    buffer_row(
+        buffers,
+        PgLogTempFileV1 {
+            ts: Ts(temp_file.ts),
+            path,
+            size_bytes: temp_file.size_bytes,
+            statement,
             dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
         },
     )?;

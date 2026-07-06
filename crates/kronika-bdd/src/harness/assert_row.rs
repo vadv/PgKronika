@@ -230,7 +230,7 @@ fn compare_column(row: &Row, col: &ExpectedColumn, dict: &Dictionary) -> Option<
         return Some(format!("{}: column absent from decoded row", col.name));
     };
     match &col.value {
-        ExpectedValue::Cell(want) => (actual != want).then(|| {
+        ExpectedValue::Cell(want) => (!cells_match(actual, want)).then(|| {
             format!(
                 "{}: expected {}, got {}",
                 col.name,
@@ -241,6 +241,21 @@ fn compare_column(row: &Row, col: &ExpectedColumn, dict: &Dictionary) -> Option<
         ExpectedValue::Str(want) => compare_str(&col.name, actual, want, dict),
         ExpectedValue::AtLeast(floor) => compare_at_least(&col.name, actual, *floor),
     }
+}
+
+fn cells_match(actual: &Cell, want: &Cell) -> bool {
+    match (actual, want) {
+        (Cell::F64(actual), Cell::F64(want)) => floats_match(*actual, *want),
+        _ => actual == want,
+    }
+}
+
+fn floats_match(actual: f64, want: f64) -> bool {
+    if !actual.is_finite() || !want.is_finite() {
+        return actual.to_bits() == want.to_bits();
+    }
+    let tolerance = 0.000_001_f64.max(want.abs() * 0.000_000_001);
+    (actual - want).abs() <= tolerance
 }
 
 /// Compare an `i64` counter cell against a `>= floor` expectation.
@@ -489,6 +504,29 @@ mod tests {
         let diff = compare_column(&r, &want_bad, &dict).expect("a diff");
         assert!(diff.contains("expected 8"), "diff names the expected value");
         assert!(diff.contains("got 7"), "diff names the actual value");
+    }
+
+    #[test]
+    fn compare_column_tolerates_small_float_rounding() {
+        let dict = Dictionary::default();
+        let r = row(&[("duration_ms", Cell::F64(1_500.250_000_000_1))]);
+        let want_ok = ExpectedColumn {
+            name: "duration_ms".to_owned(),
+            value: ExpectedValue::Cell(Cell::F64(1500.25)),
+        };
+        assert!(
+            compare_column(&r, &want_ok, &dict).is_none(),
+            "small parquet/arrow float roundoff is accepted"
+        );
+
+        let want_bad = ExpectedColumn {
+            name: "duration_ms".to_owned(),
+            value: ExpectedValue::Cell(Cell::F64(1500.0)),
+        };
+        assert!(
+            compare_column(&r, &want_bad, &dict).is_some(),
+            "material float differences still fail"
+        );
     }
 
     #[test]
