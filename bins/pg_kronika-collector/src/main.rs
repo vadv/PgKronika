@@ -2,7 +2,7 @@
 //!
 //! The main module owns process lifecycle and cycle orchestration. Source
 //! discovery, paced reads, segment IO, logging, and config parsing live in
-//! focused sibling modules.
+//! separate modules.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"
@@ -90,9 +90,8 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
 
-    // The journal lives next to the sealed segments so windows survive a
-    // restart; recovered windows are sealed right away, before the server
-    // connection — shipping already-collected data must not wait for it.
+    // The journal lives next to sealed segments so windows survive restarts.
+    // Recovered windows are sealed before connecting to PostgreSQL.
     let (mut journal, recovered) =
         open_collector_journal(&config.out_dir, config.journal_max_bytes)?;
     if let Some(dest) = recovered {
@@ -345,14 +344,14 @@ async fn snapshot_and_seal(
     segment: &mut SegmentState,
     pool_budget: &mut PoolBudget,
 ) -> Result<CycleOutcome> {
-    // Run every query first: SectionBuffers and Interner are `!Send`, so they
-    // must not be held across an await. Each source reads only when due.
-    // The budget clock covers the whole cycle's database time; the sized pool
-    // sources check it in survival order — statements first, indexes last —
-    // so under pressure the most expensive source is deferred first.
+    // Run every query first: SectionBuffers and Interner are `!Send` and must
+    // not cross await points. Each source reads only when due.
+    // The budget clock covers the whole cycle's database time. Sized pool
+    // sources check it in priority order: statements first, indexes last. Under
+    // pressure, the most expensive source is deferred first.
     let cycle_start = Instant::now();
     let main_src = collect_main_conn_sources(pool.main(), major, config, due).await?;
-    // Trigger verdicts come from the rows already collected — no extra queries.
+    // Trigger decisions come from the rows already collected; no extra queries.
     let activity_hot = main_src
         .activity
         .as_ref()

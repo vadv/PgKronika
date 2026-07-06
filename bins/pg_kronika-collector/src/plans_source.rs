@@ -255,7 +255,7 @@ async fn try_cached_plans_read(
 /// without holding the `!Send` `Interner` across an await.
 #[allow(
     clippy::too_many_lines,
-    reason = "source discovery, fork detection, and diagnostic skip reasons share one control flow"
+    reason = "source discovery, fork detection, and diagnostic skip reasons use one control flow"
 )]
 pub(crate) async fn collect_store_plans_cached(
     pool: &ConnectionPool,
@@ -549,7 +549,7 @@ async fn collect_plans_with_texts(
             );
             break;
         }
-        // A hard wall: one slow fetch must not stretch the snapshot past the
+        // Hard timeout: one slow fetch must not stretch the snapshot past the
         // deadline while waiting on statement_timeout.
         let attempt = tokio::time::timeout(
             remaining,
