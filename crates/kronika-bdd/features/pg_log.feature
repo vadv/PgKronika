@@ -126,7 +126,7 @@ Feature: PostgreSQL log-domain stderr fixtures
         system usage: CPU: user: 0.12 s, system: 0.34 s, elapsed: 5.67 s
       2026-07-05 12:06:00 UTC [1]: LOG:  automatic vacuum launcher started
       2026-07-05 12:06:01 UTC [1]: LOG:  automatic analyze of table "tpl-service.bucket_90.posting_sender"
-        buffer usage: 1843 hits, 3 misses, 0 dirtied
+        buffer usage: 1843 hits, 3 reads, 4 dirtied
         avg read rate: 0.500 MB/s, avg write rate: 0.000 MB/s
         system usage: CPU: user: 0.02 s, system: 0.01 s, elapsed: 3.60 s
       2026-07-05 12:06:02 UTC [1]: LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
@@ -160,7 +160,7 @@ Feature: PostgreSQL log-domain stderr fixtures
       | tuples_removed            | null   |
       | buffer_hits               | 1843   |
       | buffer_misses             | 3      |
-      | buffer_dirtied            | 0      |
+      | buffer_dirtied            | 4      |
       | avg_read_rate_mbs         | 0.5    |
       | avg_write_rate_mbs        | 0.0    |
       | cpu_user_ms               | 20.0   |

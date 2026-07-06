@@ -897,19 +897,19 @@ fn parse_stderr_records(
                 append_to_last_continuation(&mut pending, last_key.as_ref(), kind, text);
             }
             if lock_detail_active {
-                append_lock_detail_continuation(&mut records.lock_waits, last_lock_wait, text);
+                apply_lock_detail(&mut records.lock_waits, last_lock_wait, text);
             }
             if lock_context_active {
-                append_lock_context_continuation(&mut records.lock_waits, last_lock_wait, text);
+                apply_lock_context(&mut records.lock_waits, last_lock_wait, text);
             }
             if lock_statement_active {
-                append_lock_statement_continuation(&mut records.lock_waits, last_lock_wait, text);
+                apply_lock_statement(&mut records.lock_waits, last_lock_wait, text);
             }
             if lifecycle_detail_active {
                 append_lifecycle_detail_continuation(&mut records.lifecycles, last_lifecycle, text);
             }
             if temp_statement_active {
-                append_temp_statement_continuation(&mut records.temp_files, last_temp_file, text);
+                apply_temp_statement(&mut records.temp_files, last_temp_file, text);
             }
             continue;
         }
@@ -1707,28 +1707,12 @@ fn apply_lock_detail(rows: &mut [LockWaitEvent], index: Option<usize>, text: &st
     true
 }
 
-fn append_lock_detail_continuation(
-    rows: &mut [LockWaitEvent],
-    index: Option<usize>,
-    text: &str,
-) -> bool {
-    apply_lock_detail(rows, index, text)
-}
-
 fn apply_lock_context(rows: &mut [LockWaitEvent], index: Option<usize>, text: &str) -> bool {
     let Some(row) = index.and_then(|index| rows.get_mut(index)) else {
         return false;
     };
     append_option_text_capped(&mut row.context, text, MAX_TEXT_BYTES);
     true
-}
-
-fn append_lock_context_continuation(
-    rows: &mut [LockWaitEvent],
-    index: Option<usize>,
-    text: &str,
-) -> bool {
-    apply_lock_context(rows, index, text)
 }
 
 fn apply_lock_statement(rows: &mut [LockWaitEvent], index: Option<usize>, text: &str) -> bool {
@@ -1739,28 +1723,12 @@ fn apply_lock_statement(rows: &mut [LockWaitEvent], index: Option<usize>, text: 
     true
 }
 
-fn append_lock_statement_continuation(
-    rows: &mut [LockWaitEvent],
-    index: Option<usize>,
-    text: &str,
-) -> bool {
-    apply_lock_statement(rows, index, text)
-}
-
 fn apply_temp_statement(rows: &mut [TempFileEvent], index: Option<usize>, text: &str) -> bool {
     let Some(row) = index.and_then(|index| rows.get_mut(index)) else {
         return false;
     };
     append_option_text_capped(&mut row.statement, text, MAX_TEXT_BYTES);
     true
-}
-
-fn append_temp_statement_continuation(
-    rows: &mut [TempFileEvent],
-    index: Option<usize>,
-    text: &str,
-) -> bool {
-    apply_temp_statement(rows, index, text)
 }
 
 fn extract_crash_detail_sql(text: &str) -> Option<String> {
@@ -2333,7 +2301,7 @@ mod tests {
              \tWAL usage: 15 records, 2 full page images, 4096 bytes\n\
              \tsystem usage: CPU: user: 0.12 s, system: 0.34 s, elapsed: 5.67 s\n\
              2026-07-05 12:06:01 UTC [1]: LOG:  automatic analyze of table \"tpl-service.bucket_90.posting_sender\"\n\
-             \tbuffer usage: 1843 hits, 3 misses, 0 dirtied\n\
+             \tbuffer usage: 1843 hits, 3 reads, 4 dirtied\n\
              \tavg read rate: 0.500 MB/s, avg write rate: 0.000 MB/s\n\
              \tsystem usage: CPU: user: 0.02 s, system: 0.01 s, elapsed: 3.60 s\n",
         )
@@ -2379,6 +2347,8 @@ mod tests {
         );
         assert_eq!(analyze.tuples_removed, None);
         assert_eq!(analyze.buffer_hits, Some(1843));
+        assert_eq!(analyze.buffer_misses, Some(3));
+        assert_eq!(analyze.buffer_dirtied, Some(4));
         assert_close(analyze.elapsed_ms.expect("elapsed"), 3600.0);
     }
 
