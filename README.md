@@ -71,8 +71,8 @@ from the collector, and PostgreSQL source code must not become reachable from
 the web process.
 
 Test commands are documented in [docs/testing.md](docs/testing.md). It covers
-the local Rust gate, tagged BDD runs through Docker/Buildx, the BDD image cache,
-and the GitHub Actions/GitLab CI paths.
+the local Rust gate, full and tagged BDD runs through Docker/Buildx, the BDD
+image cache, and the GitHub Actions/GitLab CI paths.
 
 The implementation is moving crate by crate: format primitives, writer state,
 type registry, collectors, and then serving binaries.

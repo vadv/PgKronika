@@ -1,4 +1,4 @@
 .PHONY: test-bdd
 
-test-bdd: ## Run tagged BDD scenarios through the Docker/Nix image path. Example: DEBUG=1 make test-bdd TAGS=@pg_log
+test-bdd: ## Run BDD through Docker/Nix. Optional: DEBUG=1 make test-bdd TAGS=@pg_log
 	@TAGS="$(TAGS)" DEBUG="$(DEBUG)" scripts/test-bdd-local.sh

@@ -73,8 +73,8 @@ cargo run -p xtask -- check-deps
 веб-процесса.
 
 Команды запуска тестов описаны в [docs/testing.md](docs/testing.md): локальный
-Rust gate, BDD по тегу через Docker/Buildx, кэш BDD image и пути для GitHub
-Actions/GitLab CI.
+Rust gate, полный и тегированный BDD через Docker/Buildx, кэш BDD image и пути
+для GitHub Actions/GitLab CI.
 
 Реализация движется по крейтам: низкоуровневый формат, состояние записи, реестр
 типов, источники данных, затем серверные исполняемые файлы.

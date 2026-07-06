@@ -66,14 +66,21 @@ Runner-only unit tests do not start PostgreSQL:
 cargo test -p kronika-bdd
 ```
 
-The usual tagged Docker/Nix run from the repository root is:
+The full Docker/Nix run from the repository root is:
+
+```sh
+DEBUG=1 make test-bdd
+```
+
+To filter by Cucumber tags:
 
 ```sh
 DEBUG=1 make test-bdd TAGS=@pg_log
 ```
 
-`TAGS` is required and is passed to Cucumber as `--tags`. `DEBUG=1` enables
-verbose Cucumber output and passes `DEBUG` into the container.
+`TAGS` is optional. When it is unset, the runner executes the full BDD suite.
+When it is set, it is passed to Cucumber as `--tags`. `DEBUG=1` enables verbose
+Cucumber output and passes `DEBUG` into the container.
 
 ## Useful Failures
 

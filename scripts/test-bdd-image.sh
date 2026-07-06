@@ -315,7 +315,28 @@ test_runtime_build_uses_filtered_stdin_tar() {
   assert_contains "$log" "tag pgkronika-bdd:latest pgkronika-bdd:runtime-build"
 }
 
-test_local_bdd_runner_uses_default_fast_runtime() {
+test_local_bdd_runner_runs_full_suite_without_tags() {
+  local tmp log stdout
+  tmp=$(mktemp -d "$TEST_TMP/local-bdd-full-runner.XXXXXX")
+  make_mock_docker "$tmp"
+  log="$tmp/docker.log"
+  stdout="$tmp/stdout.log"
+  : > "$log"
+  (
+    export MOCK_DOCKER_LOG="$log"
+    export BDD_DOCKER="$tmp/docker"
+    export BDD_PLATFORM=linux/amd64
+    DEBUG=1 "$ROOT/scripts/test-bdd-local.sh"
+  ) > "$stdout" 2>&1
+  assert_contains "$stdout" "Reusing BDD runtime image pgkronika-bdd:linux-amd64-sha-"
+  assert_contains "$log" "image inspect pgkronika-bdd:linux-amd64-sha-"
+  assert_contains "$log" "run --rm -e DEBUG=1 pgkronika-bdd:linux-amd64-sha-"
+  assert_not_contains "$log" "--tags"
+  assert_not_contains "$log" "buildx build"
+  assert_not_contains "$log" "load -i"
+}
+
+test_local_bdd_runner_uses_default_fast_runtime_with_tags() {
   local tmp log stdout
   tmp=$(mktemp -d "$TEST_TMP/local-bdd-runner.XXXXXX")
   make_mock_docker "$tmp"
@@ -468,7 +489,8 @@ for test in \
   test_runtime_reuse_local_is_default_for_content_keyed_image \
   test_runtime_reuse_local_skips_build \
   test_runtime_build_uses_filtered_stdin_tar \
-  test_local_bdd_runner_uses_default_fast_runtime \
+  test_local_bdd_runner_runs_full_suite_without_tags \
+  test_local_bdd_runner_uses_default_fast_runtime_with_tags \
   test_runtime_paths_exclude_host_only_helpers \
   test_builder_paths_are_deps_only \
   test_builder_context_tar_has_stable_dummy_targets \

@@ -11,7 +11,8 @@
 | Быстрая проверка одного крейта | `cargo test -p <crate>` |
 | Полный локальный Rust gate | см. [Полный локальный gate](#полный-локальный-gate) |
 | Проверка BDD image helper без PostgreSQL | `scripts/test-bdd-image.sh` |
-| Tagged BDD через Docker/Nix | `DEBUG=1 make test-bdd TAGS=@pg_log` |
+| Полный BDD через Docker/Nix | `DEBUG=1 make test-bdd` |
+| BDD по тегу через Docker/Nix | `DEBUG=1 make test-bdd TAGS=@pg_log` |
 | Полный BDD image run | `./scripts/bdd-image.sh build-builder && ./scripts/bdd-image.sh build-runtime && ./scripts/bdd-image.sh run` |
 | Архитектурные зависимости | `cargo run -p xtask -- check-deps` |
 
@@ -37,23 +38,31 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p xtask -- check-deps
+DEBUG=1 make test-bdd
 ```
 
 `check-deps` проверяет границы workspace: collector не должен зависеть от
 storage-backend кода, web не должен тянуть PostgreSQL sources, а служебные
 крейты не должны создавать циклы ответственности.
 
-## Локальный BDD по тегу
+## Локальный BDD
 
-Запуск одного набора сценариев:
+Полный запуск BDD:
+
+```sh
+DEBUG=1 make test-bdd
+```
+
+Запуск одного набора сценариев по тегу:
 
 ```sh
 DEBUG=1 make test-bdd TAGS=@pg_log
 ```
 
-`TAGS` обязателен. Значение передаётся в Cucumber как `--tags`, поэтому можно
-использовать обычные tag expressions. `DEBUG=1` включает verbose Cucumber output
-(`-vvv`) и передаётся в контейнер как переменная окружения.
+`TAGS` необязателен. Если он не задан, runner не передаёт `--tags` и запускает
+весь BDD suite. Если `TAGS` задан, значение валидируется как Cucumber tag
+expression и передаётся в Cucumber как `--tags`. `DEBUG=1` включает verbose
+Cucumber output (`-vvv`) и передаётся в контейнер как переменная окружения.
 
 Этот путь использует Docker/Buildx и тот же Nix image, что и CI. Runner сам
 вычисляет content-keyed тег runtime image:
@@ -189,8 +198,8 @@ bdd:
 
 ## Частые ошибки
 
-- `TAGS is required`: pass a Cucumber tag expression, for example
-  `TAGS=@pg_log`.
+- `TAGS must contain at least one Cucumber tag`: проверьте tag expression,
+  например `TAGS=@pg_log`. Не задавайте `TAGS`, если нужен полный BDD run.
 - `Docker daemon is not reachable`: start Docker or set `BDD_DOCKER`.
 - `Docker Buildx is required`: install/enable Buildx for the Docker daemon.
 - `KRONIKA_PG_MATRIX is not set`: the BDD binary was run outside the Nix image.
