@@ -254,3 +254,90 @@ Feature: PostgreSQL log-domain stderr fixtures
       | shutdown_mode | fast |
     And section 1_028_001 has a row with kind = 2:
       | message | database system is ready to accept connections |
+
+  @pg16 @serial
+  Scenario: Russian stderr LOG records use PostgreSQL NLS strings
+    Given a fresh database on PostgreSQL 16
+    And a PostgreSQL stderr log fixture:
+      """
+      2026-07-05 12:09:00 UTC [1]: СООБЩЕНИЕ:  начата контрольная точка: time
+      2026-07-05 12:09:01 UTC [1]: СООБЩЕНИЕ:  контрольная точка завершена: записано буферов: 128 (0.2%); добавлено файлов WAL 0, удалено: 1, переработано: 2; запись=1.234 сек., синхр.=0.056 сек., всего=1.500 сек.; синхронизировано_файлов=7, самая_долгая_синхр.=0.040 сек., средняя=0.008 сек.; расстояние=4096 КБ, ожидалось=8192 КБ
+      2026-07-05 12:09:02 UTC [1]: СООБЩЕНИЕ:  продолжительность: 1500.250 мс, оператор: SELECT * FROM slow_table WHERE id = 42
+      2026-07-05 12:09:03 UTC [1]: СООБЩЕНИЕ:  автоматическая очистка таблицы "mydb.public.orders": сканирований индекса: 1
+        страниц удалено: 10, осталось: 20, просканировано: 30 (50.00% от общего числа)
+        версий строк: удалено: 30, осталось: 40, «мёртвых», но ещё не подлежащих удалению: 5
+        использование буфера: попаданий: 100, промахов: 2, «грязных» записей: 3
+        средняя скорость чтения: 1.500 МБ/с, средняя скорость записи: 2.500 МБ/с
+        использование WAL: записей: 15, полных образов страниц: 2, байт: 4096
+        CPU: пользов.: 0.12 с, система: 0.34 с, прошло: 5.67 с
+      2026-07-05 12:09:04 UTC [70]: СООБЩЕНИЕ:  процесс 70 продолжает ожидать в режиме ShareLock блокировку "transaction 12345678" в течение 30009.004 мс
+      2026-07-05 12:09:04 UTC [70]: ОПЕРАТОР:  UPDATE accounts SET balance = balance + 1 WHERE id = 1
+      2026-07-05 12:09:05 UTC [1]: СООБЩЕНИЕ:  временный файл: путь "base/pgsql_tmp/pgsql_tmp15967.2", размер 200204288
+      2026-07-05 12:09:05 UTC [1]: ОПЕРАТОР:  SELECT * FROM big_sort ORDER BY payload
+      2026-07-05 12:09:06 UTC [1]: СООБЩЕНИЕ:  процесс сервера (PID 4242) был завершён по сигналу 9: Killed
+      2026-07-05 12:09:06 UTC [1]: ПОДРОБНОСТИ:  Завершившийся процесс выполнял действие: SELECT pg_sleep(10)
+      2026-07-05 12:09:07 UTC [1]: СООБЩЕНИЕ:  получен запрос на "вежливое" выключение
+      2026-07-05 12:09:08 UTC [1]: СООБЩЕНИЕ:  система БД готова принимать подключения
+      """
+    When the collector snapshots the segment
+    Then section 1_024_001 has 2 rows
+    And section 1_024_001 has a row with phase = 0:
+      | reason | time |
+    And section 1_024_001 has a row with phase = 1:
+      | buffers_written | 128    |
+      | write_ms        | 1234.0 |
+      | sync_ms         | 56.0   |
+      | total_ms        | 1500.0 |
+      | wal_added       | 0      |
+      | wal_removed     | 1      |
+      | wal_recycled    | 2      |
+      | sync_files      | 7      |
+      | distance_kb     | 4096   |
+      | estimate_kb     | 8192   |
+      | longest_sync_ms | 40.0   |
+      | average_sync_ms | 8.0    |
+    And section 1_026_001 has a row with pattern = SELECT * FROM slow_table WHERE id = ...:
+      | count             | 1                                      |
+      | max_duration_ms   | 1500.25                                |
+      | total_duration_ms | 1500.25                                |
+      | sample            | SELECT * FROM slow_table WHERE id = 42 |
+    And section 1_025_001 has a row with relation = mydb.public.orders:
+      | kind                      | 0      |
+      | index_scans               | 1      |
+      | pages_removed             | 10     |
+      | pages_remaining           | 20     |
+      | tuples_removed            | 30     |
+      | tuples_remaining          | 40     |
+      | tuples_dead_not_removable | 5      |
+      | elapsed_ms                | 5670.0 |
+      | buffer_hits               | 100    |
+      | buffer_misses             | 2      |
+      | buffer_dirtied            | 3      |
+      | avg_read_rate_mbs         | 1.5    |
+      | avg_write_rate_mbs        | 2.5    |
+      | cpu_user_ms               | 120.0  |
+      | cpu_system_ms             | 340.0  |
+      | wal_records               | 15     |
+      | wal_fpi                   | 2      |
+      | wal_bytes                 | 4096   |
+    And section 1_027_001 has a row with kind = 0:
+      | pid         | 70                   |
+      | lock_mode   | ShareLock            |
+      | lock_target | transaction 12345678 |
+      | duration_ms | 30009.004            |
+      | statement   | UPDATE accounts SET balance = balance + 1 WHERE id = 1 |
+    And section 1_030_001 has a row with path = base/pgsql_tmp/pgsql_tmp15967.2:
+      | size_bytes | 200204288                                  |
+      | statement  | SELECT * FROM big_sort ORDER BY payload    |
+    And section 1_022_001 has a row with pattern = "процесс сервера (...) был завершён по сигналу ...: Killed":
+      | severity | 4 |
+      | category | 4 |
+      | count    | 1 |
+    And section 1_028_001 has a row with kind = 0:
+      | pid          | 4242                                      |
+      | signal       | 9                                         |
+      | query_detail | SELECT pg_sleep(10)                      |
+    And section 1_028_001 has a row with kind = 1:
+      | shutdown_mode | smart |
+    And section 1_028_001 has a row with kind = 2:
+      | message | система БД готова принимать подключения |

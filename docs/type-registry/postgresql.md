@@ -1171,6 +1171,14 @@ autoanalyze, slow query, lock wait, lifecycle и temporary file. Полный
 байтовый `csvlog` parser остаётся поздним опциональным расширением, не
 near-term путём.
 
+Языковая область stderr parser ограничена английскими PostgreSQL `msgid` и
+русскими NLS `msgstr`, сверенными по upstream веткам `REL_15_STABLE` ...
+`REL_18_STABLE`. Поддержка других локалей не заявляется: неизвестные
+локализованные `LOG:` строки игнорируются как ordinary LOG, а не разбираются
+нечёткими шаблонами. Severity и continuation labels распознаются в английском
+и русском вариантах PostgreSQL (`LOG`/`СООБЩЕНИЕ`, `ERROR`/`ОШИБКА`,
+`DETAIL`/`ПОДРОБНОСТИ`, `STATEMENT`/`ОПЕРАТОР` и т.д.).
+
 ### `1_022_001` `pg_log_errors`
 
 Одна строка представляет группу `(severity, category, pattern)` в текущем окне.
@@ -1269,7 +1277,8 @@ dict_dropped_fields        u8    G
 ### `1_026_001` `pg_log_slow_queries`
 
 Строки строятся из `LOG: duration: ... ms  statement: ...` и русского
-эквивалента. Записи `log_duration=on` без `statement:` игнорируются: без SQL
+NLS-эквивалента PostgreSQL `СООБЩЕНИЕ: продолжительность: ... мс, оператор:
+...`. Записи `log_duration=on` без `statement:` игнорируются: без SQL
 они не дают устойчивого ключа. В одном окне collector группирует по
 нормализованному SQL pattern и оставляет top-N по `max_duration_ms`
 (`16` рядов). Прочитанные, но не попавшие в top-N pattern'ы дают

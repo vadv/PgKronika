@@ -137,7 +137,10 @@ pub(crate) fn classify_error(pattern: &str, severity: LogSeverity) -> ErrorCateg
             "i/o error",
             "crash shutdown",
             "server process",
+            "процесс сервера",
             "shutting down",
+            "был завершён по сигналу",
+            "завершился с кодом выхода",
         ],
     ) {
         ErrorCategory::System
@@ -190,7 +193,8 @@ fn any_contains(value: &str, needles: &[&str]) -> bool {
 }
 
 fn is_signal_kill(value: &str) -> bool {
-    value.contains("terminated by signal") && value.contains(": killed")
+    (value.contains("terminated by signal") || value.contains("был завершён по сигналу"))
+        && value.contains(": killed")
 }
 
 fn strip_at_character(value: &str) -> &str {
@@ -260,6 +264,7 @@ fn replace_word_patterns(value: &str) -> String {
         "database ",
         "PID ",
         "signal ",
+        "по сигналу ",
         "on page ",
     ] {
         out = replace_word_number(&out, prefix);
@@ -323,8 +328,11 @@ fn replace_wal_address(value: &str) -> String {
     let mut idx = 0;
     while idx < bytes.len() {
         if !bytes[idx].is_ascii_hexdigit() {
-            out.push(char::from(bytes[idx]));
-            idx += 1;
+            let Some(ch) = value.get(idx..).and_then(|tail| tail.chars().next()) else {
+                break;
+            };
+            out.push(ch);
+            idx += ch.len_utf8();
             continue;
         }
         let start = idx;
@@ -378,6 +386,10 @@ mod tests {
             normalize_error("server process (PID 4242) was terminated by signal 9: Killed"),
             "server process (...) was terminated by signal ...: Killed"
         );
+        assert_eq!(
+            normalize_error("процесс сервера (PID 4242) был завершён по сигналу 9: Killed"),
+            "процесс сервера (...) был завершён по сигналу ...: Killed"
+        );
     }
 
     #[test]
@@ -410,6 +422,13 @@ mod tests {
                 LogSeverity::Log
             ),
             ErrorCategory::System
+        );
+        assert_eq!(
+            classify_error(
+                "процесс сервера (...) был завершён по сигналу ...: Killed",
+                LogSeverity::Log
+            ),
+            ErrorCategory::Resource
         );
     }
 
