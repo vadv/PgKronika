@@ -86,6 +86,11 @@ Feature: PostgreSQL log-domain stderr fixtures
       | wal_added       | 0      |
       | wal_removed     | 1      |
       | wal_recycled    | 2      |
+      | sync_files      | 7      |
+      | distance_kb     | 4096   |
+      | estimate_kb     | 8192   |
+      | longest_sync_ms | 40.0   |
+      | average_sync_ms | 8.0    |
     And section 1_024_001 has a row with phase = 2:
       | seconds_apart | 3 |
 
@@ -106,6 +111,91 @@ Feature: PostgreSQL log-domain stderr fixtures
       | max_duration_ms   | 1500.25    |
       | total_duration_ms | 2000.25    |
       | sample            | SELECT * FROM slow_table WHERE id = 42 |
+
+  @pg16 @serial
+  Scenario: autovacuum LOG records are typed without becoming errors
+    Given a fresh database on PostgreSQL 16
+    And a PostgreSQL stderr log fixture:
+      """
+      2026-07-05 12:06:00 UTC [1]: LOG:  automatic vacuum of table "mydb.public.orders": index scans: 1
+        pages: 10 removed, 20 remain, 0 skipped due to pins, 0 skipped frozen
+        tuples: 30 removed, 40 remain, 5 are dead but not yet removable, oldest xmin: 123
+        buffer usage: 100 hits, 2 misses, 3 dirtied
+        avg read rate: 1.500 MB/s, avg write rate: 2.500 MB/s
+        WAL usage: 15 records, 2 full page images, 4096 bytes
+        system usage: CPU: user: 0.12 s, system: 0.34 s, elapsed: 5.67 s
+      2026-07-05 12:06:01 UTC [1]: LOG:  automatic analyze of table "tpl-service.bucket_90.posting_sender"
+        buffer usage: 1843 hits, 3 misses, 0 dirtied
+        avg read rate: 0.500 MB/s, avg write rate: 0.000 MB/s
+        system usage: CPU: user: 0.02 s, system: 0.01 s, elapsed: 3.60 s
+      """
+    When the collector snapshots the segment
+    Then section 1_022_001 is absent from the segment
+    And section 1_025_001 has a row with relation = mydb.public.orders:
+      | kind                       | 0      |
+      | index_scans                | 1      |
+      | pages_removed              | 10     |
+      | pages_remaining            | 20     |
+      | tuples_removed             | 30     |
+      | tuples_remaining           | 40     |
+      | tuples_dead_not_removable  | 5      |
+      | elapsed_ms                 | 5670.0 |
+      | buffer_hits                | 100    |
+      | buffer_misses              | 2      |
+      | buffer_dirtied             | 3      |
+      | avg_read_rate_mbs          | 1.5    |
+      | avg_write_rate_mbs         | 2.5    |
+      | cpu_user_ms                | 120.0  |
+      | cpu_system_ms              | 340.0  |
+      | wal_records                | 15     |
+      | wal_fpi                    | 2      |
+      | wal_bytes                  | 4096   |
+    And section 1_025_001 has a row with relation = tpl-service.bucket_90.posting_sender:
+      | kind             | 1      |
+      | tuples_removed   | null   |
+      | buffer_hits      | 1843   |
+      | elapsed_ms       | 3600.0 |
+
+  @pg16 @serial
+  Scenario: lock-wait LOG records are typed without becoming errors
+    Given a fresh database on PostgreSQL 16
+    And a PostgreSQL stderr log fixture:
+      """
+      2026-07-05 12:07:00 UTC [70]: LOG:  process 70 still waiting for ShareLock on transaction 12345678 after 30009.004 ms
+      2026-07-05 12:07:00 UTC [70]: DETAIL:  Process holding the lock: 80. Wait queue: 70.
+        Wait queue continues on the next line.
+      2026-07-05 12:07:00 UTC [70]: STATEMENT:  UPDATE accounts SET balance = balance + 1 WHERE id = 1
+      2026-07-05 12:07:01 UTC [70]: LOG:  process 70 acquired ShareLock on transaction 12345678 after 30010.004 ms
+      """
+    When the collector snapshots the segment
+    Then section 1_022_001 is absent from the segment
+    And section 1_027_001 has a row with kind = 0:
+      | pid          | 70                                                                                                      |
+      | lock_mode    | ShareLock                                                                                               |
+      | lock_target  | transaction 12345678                                                                                    |
+      | duration_ms  | 30009.004                                                                                               |
+      | detail       | Process holding the lock: 80. Wait queue: 70. Wait queue continues on the next line.                    |
+      | statement    | UPDATE accounts SET balance = balance + 1 WHERE id = 1                                                  |
+    And section 1_027_001 has a row with kind = 1:
+      | pid          | 70                   |
+      | lock_mode    | ShareLock            |
+      | lock_target  | transaction 12345678 |
+      | duration_ms  | 30010.004            |
+
+  @pg16 @serial
+  Scenario: temporary-file LOG records are typed without becoming errors
+    Given a fresh database on PostgreSQL 16
+    And a PostgreSQL stderr log fixture:
+      """
+      2026-07-05 12:08:00 UTC [1]: LOG:  temporary file: path "base/pgsql_tmp/pgsql_tmp15967.0", size 200204288
+      2026-07-05 12:08:00 UTC [1]: STATEMENT:  SELECT * FROM big_sort ORDER BY payload
+        LIMIT 100
+      """
+    When the collector snapshots the segment
+    Then section 1_022_001 is absent from the segment
+    And section 1_030_001 has a row with path = base/pgsql_tmp/pgsql_tmp15967.0:
+      | size_bytes | 200204288                                         |
+      | statement  | SELECT * FROM big_sort ORDER BY payload LIMIT 100 |
 
   @pg16 @serial
   Scenario: lifecycle LOG records carry crash detail and shutdown state

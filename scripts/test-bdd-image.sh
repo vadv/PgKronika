@@ -6,15 +6,7 @@ SCRIPT="$ROOT/scripts/bdd-image.sh"
 TEST_TMP=$(mktemp -d)
 
 cleanup() {
-  if [ -f "$TEST_TMP/kronika-source-log.Cargo.toml.bak" ]; then
-    cp "$TEST_TMP/kronika-source-log.Cargo.toml.bak" \
-      "$ROOT/crates/kronika-source-log/Cargo.toml"
-  fi
   rm -rf "$TEST_TMP"
-  rm -f \
-    "$ROOT/scripts/.cache-key-host-only-probe" \
-    "$ROOT/crates/kronika-source-log/src/cache_key_probe.rs" \
-    "$ROOT/crates/kronika-bdd/features/cache_key_probe.feature"
 }
 trap cleanup EXIT
 
@@ -53,10 +45,35 @@ hash_stdin() {
   fi
 }
 
+make_repo_copy() {
+  local copy
+  copy=$(mktemp -d "$TEST_TMP/repo-copy.XXXXXX")
+  (
+    cd "$ROOT"
+    git ls-files -z | tar --null -T - -cf -
+  ) | tar -C "$copy" -xf -
+  (
+    cd "$copy"
+    git init -q
+    git add -A
+  )
+  printf '%s\n' "$copy"
+}
+
+run_bdd_image_script() {
+  local script=$1
+  shift
+  (
+    cd "$(dirname "$script")/.."
+    "$script" "$@"
+  )
+}
+
 builder_context_content_key() {
+  local script=${1:-$SCRIPT}
   local context
   context=$(mktemp -d "$TEST_TMP/builder-context-key.XXXXXX")
-  "$SCRIPT" builder-context-tar | tar -C "$context" -xf -
+  run_bdd_image_script "$script" builder-context-tar | tar -C "$context" -xf -
   (
     cd "$context"
     find . -type f -print0 \
@@ -404,29 +421,31 @@ test_builder_context_tar_has_stable_dummy_targets() {
 }
 
 test_runtime_key_ignores_host_only_files() {
-  local before after probe
-  probe="$ROOT/scripts/.cache-key-host-only-probe"
-  before=$("$SCRIPT" image-key)
+  local before after probe repo script
+  repo=$(make_repo_copy)
+  script="$repo/scripts/bdd-image.sh"
+  probe="$repo/scripts/.cache-key-host-only-probe"
+  before=$(run_bdd_image_script "$script" image-key)
   printf 'host helper only\n' > "$probe"
-  after=$("$SCRIPT" image-key)
-  rm -f "$probe"
+  after=$(run_bdd_image_script "$script" image-key)
   assert_eq "$after" "$before"
 }
 
 test_rust_source_changes_runtime_but_not_deps_or_builder() {
   local before_deps before_image before_builder_paths before_builder_context
-  local after_deps after_image after_builder_paths after_builder_context probe
-  probe="$ROOT/crates/kronika-source-log/src/cache_key_probe.rs"
-  before_deps=$("$SCRIPT" deps-key)
-  before_image=$("$SCRIPT" image-key)
-  before_builder_paths=$("$SCRIPT" builder-paths | hash_stdin)
-  before_builder_context=$(builder_context_content_key)
+  local after_deps after_image after_builder_paths after_builder_context probe repo script
+  repo=$(make_repo_copy)
+  script="$repo/scripts/bdd-image.sh"
+  probe="$repo/crates/kronika-source-log/src/cache_key_probe.rs"
+  before_deps=$(run_bdd_image_script "$script" deps-key)
+  before_image=$(run_bdd_image_script "$script" image-key)
+  before_builder_paths=$(run_bdd_image_script "$script" builder-paths | hash_stdin)
+  before_builder_context=$(builder_context_content_key "$script")
   printf 'pub(crate) fn cache_key_probe() {}\n' > "$probe"
-  after_deps=$("$SCRIPT" deps-key)
-  after_image=$("$SCRIPT" image-key)
-  after_builder_paths=$("$SCRIPT" builder-paths | hash_stdin)
-  after_builder_context=$(builder_context_content_key)
-  rm -f "$probe"
+  after_deps=$(run_bdd_image_script "$script" deps-key)
+  after_image=$(run_bdd_image_script "$script" image-key)
+  after_builder_paths=$(run_bdd_image_script "$script" builder-paths | hash_stdin)
+  after_builder_context=$(builder_context_content_key "$script")
   assert_eq "$after_deps" "$before_deps"
   assert_eq "$after_builder_paths" "$before_builder_paths"
   assert_eq "$after_builder_context" "$before_builder_context"
@@ -436,27 +455,26 @@ test_rust_source_changes_runtime_but_not_deps_or_builder() {
 }
 
 test_dependency_manifest_changes_deps_key() {
-  local before after manifest backup
-  manifest="$ROOT/crates/kronika-source-log/Cargo.toml"
-  backup="$TEST_TMP/kronika-source-log.Cargo.toml.bak"
-  cp "$manifest" "$backup"
-  before=$("$SCRIPT" deps-key)
+  local before after manifest repo script
+  repo=$(make_repo_copy)
+  script="$repo/scripts/bdd-image.sh"
+  manifest="$repo/crates/kronika-source-log/Cargo.toml"
+  before=$(run_bdd_image_script "$script" deps-key)
   printf '\n# cache key dependency-input probe\n' >> "$manifest"
-  after=$("$SCRIPT" deps-key)
-  cp "$backup" "$manifest"
-  rm -f "$backup"
+  after=$(run_bdd_image_script "$script" deps-key)
   if [ "$after" = "$before" ]; then
     fail "deps key must change when a Cargo.toml input changes"
   fi
 }
 
 test_runtime_key_changes_for_feature_inputs() {
-  local before after probe
-  probe="$ROOT/crates/kronika-bdd/features/cache_key_probe.feature"
-  before=$("$SCRIPT" image-key)
+  local before after probe repo script
+  repo=$(make_repo_copy)
+  script="$repo/scripts/bdd-image.sh"
+  probe="$repo/crates/kronika-bdd/features/cache_key_probe.feature"
+  before=$(run_bdd_image_script "$script" image-key)
   printf 'Feature: cache key probe\n' > "$probe"
-  after=$("$SCRIPT" image-key)
-  rm -f "$probe"
+  after=$(run_bdd_image_script "$script" image-key)
   if [ "$after" = "$before" ]; then
     fail "runtime image key must change when a BDD feature changes"
   fi
