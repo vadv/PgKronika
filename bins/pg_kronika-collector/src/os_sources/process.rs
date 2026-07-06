@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    DueSet, Instant, Interner, OsCgroupMapping, OsSources, ProcFs, ProcessError, SourceKind, Ts,
+    intern_str, log_cap_degraded, log_collection_finish, log_count_degraded, log_degraded,
+    os_max_procs, process_facts, read_process,
+};
 
 #[allow(
     clippy::too_many_lines,

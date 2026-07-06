@@ -1,5 +1,4 @@
-use crate::activity_dict_limits;
-use crate::buffer_row;
+use crate::buffering::{activity_dict_limits, buffer_row};
 use crate::config::Config;
 use crate::logging::{
     LogLevel, duration_ms, field, log_collection_finish, log_collection_start, log_count_degraded,
@@ -174,7 +173,7 @@ pub(crate) fn commit_log_collection(
 pub(crate) fn push_log_collection(
     buffers: &mut SectionBuffers,
     interner: &mut Interner,
-    log_collector: &mut LogCollector,
+    log_collector: &LogCollector,
     collection: &mut LogCollection,
     ts: i64,
 ) -> Result<()> {

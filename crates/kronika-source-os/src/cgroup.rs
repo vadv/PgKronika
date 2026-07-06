@@ -407,3 +407,6 @@ fn push_io_rows(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
