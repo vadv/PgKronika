@@ -84,8 +84,10 @@ export BDD_BUILDER_PULL=1
 
 `build-builder` pulls `pgkronika-bdd-builder` when the dependency key exists in
 the registry. Otherwise it builds the image locally. `build-runtime` uses that
-builder to create `image.tar`, loads `pgkronika-bdd:latest` into Docker, and
-leaves the tarball in the working tree.
+builder to create `image.tar`, loads the image into Docker, and tags it as
+`pgkronika-bdd:<platform>-sha-<runtime-key>` unless `BDD_RUNTIME_IMAGE` is set.
+If that exact local image already exists, `build-runtime` reuses it by default;
+set `BDD_RUNTIME_REUSE_LOCAL=0` to force a rebuild.
 
 The first builder build after a dependency change is still expensive. Later
 source-only changes reuse the same builder image.
@@ -101,7 +103,8 @@ same Docker/Buildx image path as the full run and uses a transient runtime
 tarball under `/tmp` unless `BDD_OUTPUT_TAR` is set. When `BDD_RUNTIME_IMAGE` is
 not set, the target tags the local image by platform and BDD runtime input hash,
 so changes to Makefile, helper scripts, or README files do not rebuild the BDD
-image. The unfiltered full run remains `./scripts/bdd-image.sh run`.
+image. The unfiltered full run remains `./scripts/bdd-image.sh run`; it uses the
+same content-keyed default image tag.
 
 To publish the builder image from a machine that is allowed to push:
 
@@ -130,19 +133,22 @@ Remove `result-bdd-image` when done.
 
 The GitHub Actions workflow has two BDD jobs:
 
-- `bdd image` builds or pulls the BDD builder, then builds the runtime image;
-- `bdd matrix` runs the already built image.
+- `bdd metadata` computes the dependency key, runtime key, and image refs;
+- `bdd matrix` pulls or builds the content-keyed runtime image, then runs it.
 
 For same-repository runs, the builder image is stored in GHCR. The builder tag is
 based on the dependency key and platform, so edits in `src/` do not rebuild the
 Rust/PostgreSQL dependency layer. The final runtime image is still tagged by
 content; if that exact image already exists, the job skips the build before
-cleaning disk space.
+cleaning disk space. If the build step runs, it uses `build-runtime` with the
+same local exact-image reuse default as the Makefile path.
 
-Fork pull requests do not push to GHCR. They build the builder locally and pass
-the runtime image to `bdd matrix` as a short-lived artifact.
+Fork pull requests do not push to GHCR. They use the same separated
+dependency/runtime inputs, but cannot publish package-cache updates back to the
+repository registry.
 
-The same script works in GitLab CI. A minimal job looks like this:
+This repository has no checked-in GitLab CI configuration. The same script can
+be used in GitLab CI; a minimal job looks like this:
 
 ```yaml
 bdd:

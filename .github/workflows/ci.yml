@@ -157,6 +157,7 @@ jobs:
         run: |
           export BDD_BUILDER_IMAGE="${{ needs.bdd-meta.outputs.builder }}"
           export BDD_RUNTIME_IMAGE="${{ needs.bdd-meta.outputs.image }}"
+          export BDD_RUNTIME_REUSE_LOCAL=1
           export BDD_OUTPUT_TAR=image.tar
           ./scripts/bdd-image.sh build-runtime
           rm -f image.tar
