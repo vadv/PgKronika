@@ -1,5 +1,5 @@
 use crate::coverage::{SourceCoverage, min_total_time};
-use crate::pool_sources::{user_indexes_type_id, user_tables_type_id};
+use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
 use crate::statements_source::statements_type_id;
 use kronika_source_pg::statements::StatementsVersion;
 

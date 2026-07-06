@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::logging::{LogLevel, field, log_event};
 use crate::scheduler::Intervals;
+use crate::source_contracts::activity_dict_limits;
 
 pub(crate) struct Config {
     pub(crate) dsn: String,
@@ -434,7 +435,8 @@ pub(crate) fn validate_replication_detail_bounds(bounds: ReplicationDetailBounds
         section_cap,
     )?;
 
-    let dict_cap = 16 * 1024 * 1024;
+    let dict_cap = i64::try_from(activity_dict_limits().max_total_bytes())
+        .context("activity dictionary byte cap exceeds i64")?;
     let replica_bytes = bounds
         .max_wal_senders
         .checked_mul(REPLICA_DICT_BYTES_PER_ROW)

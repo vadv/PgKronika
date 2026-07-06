@@ -1,4 +1,4 @@
-use crate::buffering::{activity_dict_limits, buffer_row};
+use crate::buffering::buffer_row;
 use crate::config::Config;
 use crate::logging::{
     LogLevel, duration_ms, field, log_collection_finish, log_collection_start, log_count_degraded,
@@ -6,6 +6,7 @@ use crate::logging::{
 };
 use crate::scheduler::DueSet;
 use crate::segments::{SegmentState, append_window_and_maybe_seal, encode_window};
+use crate::source_contracts::activity_dict_limits;
 use anyhow::{Context, Result};
 use kronika_registry::pg_log::{
     PgLogAutovacuumV1, PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1,

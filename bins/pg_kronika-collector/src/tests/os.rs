@@ -1,8 +1,8 @@
-use crate::buffering::activity_dict_limits;
 use crate::os_sources::{
     cap_disks, collect_mountinfo, collect_os_sources, cpu_max_mhz, resolve_major_zero,
 };
 use crate::scheduler::{DueSet, SourceKind};
+use crate::source_contracts::activity_dict_limits;
 use kronika_source_os::proc::diskstats;
 use kronika_source_os::{MountEntry, ProcFs, SysFs};
 use kronika_writer::Interner;

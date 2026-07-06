@@ -21,6 +21,7 @@ mod pool_sources;
 mod scheduler;
 mod segments;
 mod service_sections;
+mod source_contracts;
 mod statements_source;
 #[cfg(test)]
 mod tests;
@@ -28,8 +29,8 @@ mod tests;
 use anyhow::{Context, Result};
 use budget::PoolBudget;
 use buffering::{
-    activity_dict_limits, push_main_conn_sections, push_plans_read, push_service_sections,
-    push_statements, push_user_indexes, push_user_tables,
+    push_main_conn_sections, push_plans_read, push_service_sections, push_statements,
+    push_user_indexes, push_user_tables,
 };
 use config::Config;
 use coverage::{CoverageInputs, collect_coverage_records, push_coverage};
@@ -53,6 +54,7 @@ use segments::{
     seal_open_segment,
 };
 use service_sections::collect_service_sections;
+use source_contracts::activity_dict_limits;
 use statements_source::StatementsSourceCache;
 use std::io::Write;
 use std::path::PathBuf;

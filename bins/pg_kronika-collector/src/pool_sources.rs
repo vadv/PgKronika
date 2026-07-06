@@ -6,27 +6,13 @@ use crate::logging::{
     log_database_collection_skip, log_database_collection_start, log_event, section_name,
 };
 use crate::scheduler::{DueSet, SourceKind};
+use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
 use crate::statements_source::{StatementsSourceCache, collect_statements_cached};
 use kronika_source_pg::pool::{AdaptiveTimeout, ConnectionPool};
 use kronika_source_pg::statements::{StatementsRow, StatementsVersion};
 use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion, collect_user_indexes};
 use kronika_source_pg::user_tables::{UserTablesRow, UserTablesVersion, collect_user_tables};
 use std::time::Instant;
-
-/// The `1_013` layout collected on this server major.
-pub(crate) const fn user_tables_type_id(major: u32) -> u32 {
-    match major {
-        0..=12 => 1_013_001,
-        13..=15 => 1_013_002,
-        16..=17 => 1_013_003,
-        _ => 1_013_004,
-    }
-}
-
-/// The `1_014` layout collected on this server major.
-pub(crate) const fn user_indexes_type_id(major: u32) -> u32 {
-    if major >= 16 { 1_014_002 } else { 1_014_001 }
-}
 
 /// Collect `pg_stat_user_tables` from every pool database, returning owned rows.
 ///
