@@ -55,102 +55,32 @@ A step phrase that matches no registered step fails the run
 (`fail_on_skipped`), and every failed assertion dumps the decoded section
 table, the oracle values, `server.log`, and the collector's stderr.
 
-## Quick Local Check
+## Running Tests
 
-This runs only unit tests. It does not start PostgreSQL:
+Use [../../docs/testing.md](../../docs/testing.md) for local and CI commands,
+Docker/Buildx prerequisites, and the BDD image cache model.
+
+Runner-only unit tests do not start PostgreSQL:
 
 ```sh
 cargo test -p kronika-bdd
 ```
 
-Use this for `KRONIKA_PG_MATRIX` parsing and runner code. It is not the full
-PostgreSQL run.
-
-## Full Local Run With Docker
-
-This path needs Docker with Buildx. Nix runs inside Docker. The builder image
-stores the Rust and PostgreSQL dependency build.
-
-From the repository root:
+The full Docker/Nix run from the repository root is:
 
 ```sh
-export BDD_IMAGE_PREFIX=ghcr.io/vadv/pgkronika
-export BDD_BUILDER_PULL=1
-
-./scripts/bdd-image.sh build-builder
-./scripts/bdd-image.sh build-runtime
-./scripts/bdd-image.sh run
+DEBUG=1 make test-bdd
 ```
 
-`build-builder` pulls `pgkronika-bdd-builder` when the dependency key exists in
-the registry. Otherwise it builds the image locally. `build-runtime` uses that
-builder to create `image.tar`, loads `pgkronika-bdd:latest` into Docker, and
-leaves the tarball in the working tree.
-
-The first builder build after a dependency change is still expensive. Later
-source-only changes reuse the same builder image.
-
-To publish the builder image from a machine that is allowed to push:
+To filter by Cucumber tags:
 
 ```sh
-export BDD_BUILDER_PUSH=1
-./scripts/bdd-image.sh build-builder
+DEBUG=1 make test-bdd TAGS=@pg_log
 ```
 
-`BDD_CACHE_FROM` and `BDD_CACHE_TO` can still point to a separate BuildKit
-registry cache. The default path relies on the builder image itself and avoids a
-second upload of the same Nix store.
-
-## Full Local Run With Local Nix
-
-If Nix is already installed on the host:
-
-```sh
-nix build .#image --out-link result-bdd-image
-./result-bdd-image | docker load
-docker run --rm pgkronika-bdd:latest
-```
-
-Remove `result-bdd-image` when done.
-
-## CI Path
-
-The GitHub Actions workflow has two BDD jobs:
-
-- `bdd image` builds or pulls the BDD builder, then builds the runtime image;
-- `bdd matrix` runs the already built image.
-
-For same-repository runs, the builder image is stored in GHCR. The builder tag is
-based on the dependency key and platform, so edits in `src/` do not rebuild the
-Rust/PostgreSQL dependency layer. The final runtime image is still tagged by
-content; if that exact image already exists, the job skips the build before
-cleaning disk space.
-
-Fork pull requests do not push to GHCR. They build the builder locally and pass
-the runtime image to `bdd matrix` as a short-lived artifact.
-
-The same script works in GitLab CI. A minimal job looks like this:
-
-```yaml
-bdd:
-  image: docker:29
-  services:
-    - docker:29-dind
-  variables:
-    DOCKER_TLS_CERTDIR: ""
-    BDD_IMAGE_PREFIX: "$CI_REGISTRY_IMAGE"
-    BDD_PLATFORM: linux/amd64
-  before_script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-    - docker buildx create --use
-  script:
-    - platform_slug=$(./scripts/bdd-image.sh platform-slug)
-    - export BDD_BUILDER_PULL=1 BDD_BUILDER_PUSH=1
-    - export BDD_RUNTIME_IMAGE="${BDD_IMAGE_PREFIX}/pgkronika-bdd:${platform_slug}-sha-$(./scripts/bdd-image.sh image-key | cut -c1-16)"
-    - ./scripts/bdd-image.sh build-builder
-    - BDD_RUNTIME_PUSH=1 ./scripts/bdd-image.sh build-runtime
-    - ./scripts/bdd-image.sh run "$BDD_RUNTIME_IMAGE"
-```
+`TAGS` is optional. When it is unset, the runner executes the full BDD suite.
+When it is set, it is passed to Cucumber as `--tags`. `DEBUG=1` enables verbose
+Cucumber output and passes `DEBUG` into the container.
 
 ## Useful Failures
 
