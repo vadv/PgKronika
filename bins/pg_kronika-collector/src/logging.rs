@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use kronika_writer::FlushSummary;
 
+use crate::pool_sources::{user_indexes_type_id, user_tables_type_id};
 use crate::scheduler::SourceKind;
-use crate::{user_indexes_type_id, user_tables_type_id};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogLevel {

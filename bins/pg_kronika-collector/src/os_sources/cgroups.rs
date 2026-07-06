@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    DueSet, Instant, Interner, OsSources, ProcFs, SourceKind, SysFs, cgroup, intern_str,
+    log_cap_degraded, log_collection_finish, log_degraded, os_cgroup_max_depth,
+    os_max_cgroup_io_rows, os_max_cgroups, process_facts,
+};
 
 pub(super) fn collect_cgroup_sections(
     sys: &SysFs,

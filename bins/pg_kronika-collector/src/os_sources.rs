@@ -1,4 +1,4 @@
-use crate::buffer_row;
+use crate::buffering::buffer_row;
 use crate::config::env_u64;
 use crate::logging::{
     LogLevel, field, layout_id, log_collection_finish, log_count_degraded, log_event, section_name,
@@ -100,12 +100,12 @@ impl OsSources {
     }
 
     #[cfg(test)]
-    pub(crate) fn diskstats_empty(&self) -> bool {
+    pub(crate) const fn diskstats_empty(&self) -> bool {
         self.diskstats.is_empty()
     }
 
     #[cfg(test)]
-    pub(crate) fn mountinfo_empty(&self) -> bool {
+    pub(crate) const fn mountinfo_empty(&self) -> bool {
         self.mountinfo.is_empty()
     }
 }

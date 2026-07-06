@@ -1,4 +1,4 @@
-use super::*;
+use super::{OsSources, Result, SectionBuffers, buffer_row};
 
 /// Buffer every collected OS section into the snapshot window.
 ///
