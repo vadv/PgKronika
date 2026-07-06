@@ -10,18 +10,16 @@ fail() {
   exit 2
 }
 
-if [ -z "$TAGS" ]; then
-  fail "TAGS is required. Example: DEBUG=1 make test-bdd TAGS=@pg_log"
-fi
+if [ -n "$TAGS" ]; then
+  case "$TAGS" in
+    *$'\n'*|*$'\r'*)
+      fail "TAGS must be a single-line Cucumber tag expression."
+      ;;
+  esac
 
-case "$TAGS" in
-  *$'\n'*|*$'\r'*)
-    fail "TAGS must be a single-line Cucumber tag expression."
-    ;;
-esac
-
-if ! printf '%s\n' "$TAGS" | grep -Eq '(^|[[:space:]()])@[A-Za-z0-9_-]+'; then
-  fail "TAGS must contain at least one Cucumber tag, for example @pg_log."
+  if ! printf '%s\n' "$TAGS" | grep -Eq '(^|[[:space:]()])@[A-Za-z0-9_-]+'; then
+    fail "TAGS must contain at least one Cucumber tag, for example @pg_log."
+  fi
 fi
 
 if ! command -v "$DOCKER" >/dev/null 2>&1; then
@@ -66,7 +64,10 @@ else
   "$ROOT/scripts/bdd-image.sh" build-runtime
 fi
 
-cucumber_args=(--tags "$TAGS")
+cucumber_args=()
+if [ -n "$TAGS" ]; then
+  cucumber_args=(--tags "$TAGS")
+fi
 if [ -n "${DEBUG:-}" ] && [ "$DEBUG" != "0" ]; then
   cucumber_args=(-vvv "${cucumber_args[@]}")
 fi

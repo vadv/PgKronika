@@ -66,14 +66,21 @@ CI описаны в [../../docs/testing.md](../../docs/testing.md).
 cargo test -p kronika-bdd
 ```
 
-Обычный tagged запуск через Docker/Nix из корня репозитория:
+Полный запуск через Docker/Nix из корня репозитория:
+
+```sh
+DEBUG=1 make test-bdd
+```
+
+Фильтрация по Cucumber tags:
 
 ```sh
 DEBUG=1 make test-bdd TAGS=@pg_log
 ```
 
-`TAGS` обязателен и передаётся в Cucumber как `--tags`. `DEBUG=1` включает
-подробный вывод Cucumber и передаёт `DEBUG` в контейнер.
+`TAGS` необязателен. Если он не задан, runner выполняет весь BDD suite. Если он
+задан, значение передаётся в Cucumber как `--tags`. `DEBUG=1` включает подробный
+вывод Cucumber и передаёт `DEBUG` в контейнер.
 
 ## Полезные ошибки
 
