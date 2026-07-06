@@ -42,6 +42,7 @@ Commands:
   builder-paths  Print repository files used to seed the BDD builder context.
   builder-context-tar
                  Print the filtered BDD builder Docker context tar.
+  runtime-image  Print the default BDD runtime image tag.
   image-key      Print the key for the final BDD image.
   image-paths    Print files included in the BDD runtime image key.
   platform       Print the Docker platform used for the builder image.
@@ -63,7 +64,7 @@ Environment:
   BDD_BUILDER_MAIN_IMAGE
                      Mutable builder cache for main.
   BDD_NIX_BASE_IMAGE Pinned Nix image used when no branch cache is available.
-  BDD_RUNTIME_IMAGE  Runtime image tag. Defaults to pgkronika-bdd:latest.
+  BDD_RUNTIME_IMAGE  Runtime image tag. Defaults to pgkronika-bdd:<platform>-sha-<image-key>.
   BDD_CACHE_FROM     Optional buildx cache source, for example type=registry,ref=...
   BDD_CACHE_TO       Optional buildx cache target, for example type=registry,ref=...,mode=max.
   BDD_BUILDER_PULL   Set to 1 to pull an existing builder image before building.
@@ -74,7 +75,7 @@ Environment:
                      Set to 1 to retag a pulled or pushed builder as the branch cache.
   BDD_RUNTIME_PUSH   Set to 1 to push BDD_RUNTIME_IMAGE after building.
   BDD_RUNTIME_REUSE_LOCAL
-                     Set to 1 to reuse an existing local BDD_RUNTIME_IMAGE.
+                     Set to 0 to force rebuilding an existing local BDD_RUNTIME_IMAGE.
   BDD_OUTPUT_TAR     Tarball path for build-runtime, default image.tar.
   DEBUG              Passed through to the BDD container when set.
 EOF
@@ -269,7 +270,11 @@ builder_main_image() {
 }
 
 runtime_image() {
-  printf '%s' "${BDD_RUNTIME_IMAGE:-pgkronika-bdd:latest}"
+  if [ -n "${BDD_RUNTIME_IMAGE:-}" ]; then
+    printf '%s' "$BDD_RUNTIME_IMAGE"
+    return
+  fi
+  printf 'pgkronika-bdd:%s-sha-%s' "$(platform_slug)" "$(short_key "$(image_key)")"
 }
 
 image_repository() {
@@ -413,11 +418,14 @@ build_runtime() {
   runtime=$(runtime_image)
   output=${BDD_OUTPUT_TAR:-image.tar}
 
-  if [ "${BDD_RUNTIME_REUSE_LOCAL:-0}" = "1" ] && docker_cmd image inspect "$runtime" >/dev/null 2>&1; then
+  if [ "${BDD_RUNTIME_REUSE_LOCAL:-1}" = "1" ] && docker_cmd image inspect "$runtime" >/dev/null 2>&1; then
     append_summary "## BDD runtime"
     append_summary ""
     append_summary "- local exact hit: yes"
     append_summary "- image: \`$runtime\`"
+    if [ "${BDD_RUNTIME_PUSH:-0}" = "1" ]; then
+      docker_cmd push "$runtime"
+    fi
     return
   fi
 
@@ -467,6 +475,10 @@ case "$cmd" in
     ;;
   builder-context-tar)
     builder_context_tar
+    ;;
+  runtime-image)
+    runtime_image
+    printf '\n'
     ;;
   image-key)
     image_key

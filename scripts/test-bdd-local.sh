@@ -40,12 +40,10 @@ export BDD_BUILDER_PULL=${BDD_BUILDER_PULL:-1}
 
 runtime_image=${BDD_RUNTIME_IMAGE:-}
 if [ -z "$runtime_image" ]; then
-  platform_slug=$("$ROOT/scripts/bdd-image.sh" platform-slug)
-  image_hash=$("$ROOT/scripts/bdd-image.sh" image-key)
-  runtime_image="pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}"
+  runtime_image=$("$ROOT/scripts/bdd-image.sh" runtime-image)
 fi
 export BDD_RUNTIME_IMAGE=$runtime_image
-export BDD_RUNTIME_REUSE_LOCAL=1
+export BDD_RUNTIME_REUSE_LOCAL=${BDD_RUNTIME_REUSE_LOCAL:-1}
 
 cleanup_output=
 if [ -z "${BDD_OUTPUT_TAR:-}" ]; then

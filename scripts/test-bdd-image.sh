@@ -78,7 +78,11 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
 
 if [ "$1" = "info" ]; then
-  case "$3" in
+  if [ "$#" -eq 1 ]; then
+    echo info
+    exit 0
+  fi
+  case "${3:-}" in
     '{{.OSType}}') echo linux ;;
     '{{.Architecture}}') echo x86_64 ;;
   esac
@@ -87,6 +91,7 @@ fi
 
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   case "$3" in
+    pgkronika-bdd:linux-amd64-sha-*) exit 0 ;;
     *local-hit*) exit 0 ;;
     *) exit 1 ;;
   esac
@@ -270,6 +275,21 @@ test_run_passes_args_and_debug_to_container() {
   assert_contains "$log" "run --rm -e DEBUG=1 pgkronika-bdd:local --tags @pg_log"
 }
 
+test_runtime_image_default_is_content_keyed() {
+  local image
+  image=$(BDD_PLATFORM=linux/amd64 "$SCRIPT" runtime-image)
+  printf '%s\n' "$image" | grep -E '^pgkronika-bdd:linux-amd64-sha-[0-9a-f]{16}$' >/dev/null \
+    || fail "default runtime image must be content-keyed, got: $image"
+}
+
+test_runtime_reuse_local_is_default_for_content_keyed_image() {
+  local log
+  log=$(run_case runtime-default-local-hit "$SCRIPT" build-runtime)
+  assert_contains "$log" "image inspect pgkronika-bdd:linux-amd64-sha-"
+  assert_not_contains "$log" "run --rm -i"
+  assert_not_contains "$log" "load -i"
+}
+
 test_runtime_reuse_local_skips_build() {
   local log
   log=$(run_case runtime-local-hit env \
@@ -293,6 +313,27 @@ test_runtime_build_uses_filtered_stdin_tar() {
   assert_not_contains "$log" "-v $ROOT:/src:ro"
   assert_contains "$log" "load -i $output"
   assert_contains "$log" "tag pgkronika-bdd:latest pgkronika-bdd:runtime-build"
+}
+
+test_local_bdd_runner_uses_default_fast_runtime() {
+  local tmp log stdout
+  tmp=$(mktemp -d "$TEST_TMP/local-bdd-runner.XXXXXX")
+  make_mock_docker "$tmp"
+  log="$tmp/docker.log"
+  stdout="$tmp/stdout.log"
+  : > "$log"
+  (
+    export MOCK_DOCKER_LOG="$log"
+    export BDD_DOCKER="$tmp/docker"
+    export BDD_PLATFORM=linux/amd64
+    DEBUG=1 TAGS=@pg_log "$ROOT/scripts/test-bdd-local.sh"
+  ) > "$stdout" 2>&1
+  assert_contains "$stdout" "Reusing BDD runtime image pgkronika-bdd:linux-amd64-sha-"
+  assert_contains "$log" "image inspect pgkronika-bdd:linux-amd64-sha-"
+  assert_contains "$log" "run --rm -e DEBUG=1 pgkronika-bdd:linux-amd64-sha-"
+  assert_contains "$log" "--tags @pg_log"
+  assert_not_contains "$log" "buildx build"
+  assert_not_contains "$log" "load -i"
 }
 
 test_runtime_paths_exclude_host_only_helpers() {
@@ -400,6 +441,17 @@ test_runtime_key_changes_for_feature_inputs() {
   fi
 }
 
+test_github_actions_bdd_uses_fast_runtime_default() {
+  local workflow
+  workflow="$ROOT/.github/workflows/ci.yml"
+  grep -F -- 'image_hash=$(./scripts/bdd-image.sh image-key)' "$workflow" >/dev/null \
+    || fail "GitHub Actions must key the BDD runtime image by image-key"
+  grep -F -- 'export BDD_RUNTIME_REUSE_LOCAL=1' "$workflow" >/dev/null \
+    || fail "GitHub Actions build-runtime step must use local exact-image reuse"
+  grep -F -- './scripts/bdd-image.sh build-runtime' "$workflow" >/dev/null \
+    || fail "GitHub Actions must use the BDD image helper for runtime builds"
+}
+
 for test in \
   test_local_exact_builder_skips_pull_and_build \
   test_exact_hit_pulls_and_does_not_build \
@@ -412,15 +464,19 @@ for test in \
   test_exact_tag_is_not_overwritten_if_it_appears_before_push \
   test_branch_slug_is_tag_safe \
   test_run_passes_args_and_debug_to_container \
+  test_runtime_image_default_is_content_keyed \
+  test_runtime_reuse_local_is_default_for_content_keyed_image \
   test_runtime_reuse_local_skips_build \
   test_runtime_build_uses_filtered_stdin_tar \
+  test_local_bdd_runner_uses_default_fast_runtime \
   test_runtime_paths_exclude_host_only_helpers \
   test_builder_paths_are_deps_only \
   test_builder_context_tar_has_stable_dummy_targets \
   test_runtime_key_ignores_host_only_files \
   test_rust_source_changes_runtime_but_not_deps_or_builder \
   test_dependency_manifest_changes_deps_key \
-  test_runtime_key_changes_for_feature_inputs
+  test_runtime_key_changes_for_feature_inputs \
+  test_github_actions_bdd_uses_fast_runtime_default
 do
   "$test"
 done
