@@ -1,6 +1,6 @@
 Feature: Collector opens per-database pool connections
   The pool enumerates non-template databases that grant CONNECT and opens one
-  connection per database. pg_stat_user_tables (section 1_013_003 on PG 16-17)
+  connection per database. pg_stat_user_tables (section pg_stat_user_tables.pg16_17 on PG 16-17)
   is collected only through those per-database connections, and each sealed
   row carries the datname of the connection that collected it. A row attributed
   to a database proves the pool opened that database connection; if fan-out
@@ -21,9 +21,9 @@ Feature: Collector opens per-database pool connections
       INSERT INTO pool_probe_extra VALUES (1);
       """
     When the collector snapshots the segment
-    Then section 1_013_003 has one row for table "pool_probe_scenario" attributed to the scenario database
-    And section 1_013_003 has one row for table "pool_probe_extra" attributed to the second database
-    And section 1_013_003 relid matches the subset oracle:
+    Then section pg_stat_user_tables.pg16_17 has one row for table "pool_probe_scenario" attributed to the scenario database
+    And section pg_stat_user_tables.pg16_17 has one row for table "pool_probe_extra" attributed to the second database
+    And section pg_stat_user_tables.pg16_17 relid matches the subset oracle:
       """
       SELECT c.oid::bigint FROM pg_class c WHERE c.relname = 'pool_probe_scenario'
       """

@@ -10,10 +10,10 @@ use cucumber::then;
 use kronika_registry::Cell;
 
 use crate::BddWorld;
-use crate::harness::assert_row::{RowSelector, assert_row, decode_section};
+use crate::harness::assert_row::{RowSelector, assert_row, decode_section_labeled};
 use crate::harness::dump;
 use crate::harness::expected::{ExpectedColumn, ExpectedValue};
-use crate::steps::common::parse_type_id;
+use crate::steps::common::parse_section_ref;
 
 /// Open a dedicated connection to the scenario database for oracle queries.
 async fn oracle_client(world: &BddWorld) -> Result<tokio_postgres::Client> {
@@ -69,7 +69,7 @@ async fn pgss_row_by_like(
 /// The oracle first verifies the live view holds those counts, then the section
 /// row (selected by the oracle's `queryid`) is compared column-by-column.
 #[then(
-    regex = r"^section ([\d_]+) has a row for pg_stat_statements query like '([^']+)' with calls = (\d+) and rows = (\d+)$"
+    regex = r"^section ([\w.+-]+) has a row for pg_stat_statements query like '([^']+)' with calls = (\d+) and rows = (\d+)$"
 )]
 #[allow(
     clippy::needless_pass_by_value,
@@ -77,12 +77,12 @@ async fn pgss_row_by_like(
 )]
 async fn pgss_row_with_counts(
     world: &mut BddWorld,
-    type_id: String,
+    section: String,
     pattern: String,
     expected_calls: i64,
     expected_rows: i64,
 ) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
+    let section = parse_section_ref(&section)?;
     let client = oracle_client(world).await?;
     let (queryid, oracle_calls, oracle_rows) = pgss_row_by_like(&client, &pattern).await?;
 
@@ -90,7 +90,7 @@ async fn pgss_row_with_counts(
     let failure_log = world.harness.failure_log()?;
 
     if oracle_calls != expected_calls || oracle_rows != expected_rows {
-        let (rows, _dict) = decode_section(&segment, type_id)?;
+        let (rows, _dict) = decode_section_labeled(&segment, section.type_id, &section.label)?;
         bail!(
             "{}",
             dump::section_dump(
@@ -120,7 +120,8 @@ async fn pgss_row_with_counts(
     ];
     assert_row(
         &segment,
-        type_id,
+        section.type_id,
+        &section.label,
         &RowSelector::ByKey {
             column: "queryid".to_owned(),
             cell: Cell::I64(queryid),
@@ -137,20 +138,20 @@ async fn pgss_row_with_counts(
 /// Fails when the row is missing, the text resolved as a String entry (too
 /// short), or the id does not resolve at all.
 #[then(
-    regex = r"^section ([\d_]+) has a blob-path row for pg_stat_statements query like '([^']+)'$"
+    regex = r"^section ([\w.+-]+) has a blob-path row for pg_stat_statements query like '([^']+)'$"
 )]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-async fn pgss_blob_path_row(world: &mut BddWorld, type_id: String, pattern: String) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
+async fn pgss_blob_path_row(world: &mut BddWorld, section: String, pattern: String) -> Result<()> {
+    let section = parse_section_ref(&section)?;
     let client = oracle_client(world).await?;
     let (queryid, _calls, _rows) = pgss_row_by_like(&client, &pattern).await?;
 
     let segment = world.harness.segment()?.clone();
     let failure_log = world.harness.failure_log()?;
-    let (rows, dict) = decode_section(&segment, type_id)?;
+    let (rows, dict) = decode_section_labeled(&segment, section.type_id, &section.label)?;
 
     let row = rows
         .iter()
@@ -160,7 +161,8 @@ async fn pgss_blob_path_row(world: &mut BddWorld, type_id: String, pattern: Stri
                 "{}",
                 dump::section_dump(
                     &format!(
-                        "section {type_id}: no row with queryid={queryid} (pattern {pattern:?})"
+                        "section {}: no row with queryid={queryid} (pattern {pattern:?})",
+                        section.label
                     ),
                     &rows,
                     &failure_log,
@@ -169,16 +171,20 @@ async fn pgss_blob_path_row(world: &mut BddWorld, type_id: String, pattern: Stri
             )
         })?;
 
-    let query_cell = row
-        .get("query")
-        .with_context(|| format!("section {type_id}: row queryid={queryid} has no query column"))?;
+    let query_cell = row.get("query").with_context(|| {
+        format!(
+            "section {}: row queryid={queryid} has no query column",
+            section.label
+        )
+    })?;
 
     let Cell::StrId(str_id) = query_cell else {
         bail!(
             "{}",
             dump::section_dump(
                 &format!(
-                    "section {type_id}: query cell for queryid={queryid} is not a StrId: {}",
+                    "section {}: query cell for queryid={queryid} is not a StrId: {}",
+                    section.label,
                     dump::render_cell(query_cell)
                 ),
                 &rows,
@@ -194,8 +200,9 @@ async fn pgss_blob_path_row(world: &mut BddWorld, type_id: String, pattern: Stri
             "{}",
             dump::section_dump(
                 &format!(
-                    "section {type_id}: queryid={queryid} query text ({} bytes) resolved as \
+                    "section {}: queryid={queryid} query text ({} bytes) resolved as \
                      String, expected Blob (text must be 4096 bytes or more)",
+                    section.label,
                     bytes.len()
                 ),
                 &rows,
@@ -210,8 +217,9 @@ async fn pgss_blob_path_row(world: &mut BddWorld, type_id: String, pattern: Stri
             "{}",
             dump::section_dump(
                 &format!(
-                    "section {type_id}: queryid={queryid} str_id={str_id} did not resolve \
-                     through the dictionary"
+                    "section {}: queryid={queryid} str_id={str_id} did not resolve \
+                     through the dictionary",
+                    section.label
                 ),
                 &rows,
                 &failure_log,

@@ -84,7 +84,7 @@ async fn wait_journal_grows(collector: &Collector, min: u64) -> Result<u64> {
 }
 
 /// Assert a section's presence in the `index`-th (1-based) timer segment.
-#[then(regex = r"^timer segment (\d+) has section ([\d_]+)$")]
+#[then(regex = r"^timer segment (\d+) has section ([\w.+-]+)$")]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
@@ -94,7 +94,7 @@ fn timer_segment_has(world: &mut BddWorld, index: usize, type_id: String) -> Res
 }
 
 /// Assert a section's absence from the `index`-th (1-based) timer segment.
-#[then(regex = r"^timer segment (\d+) is missing section ([\d_]+)$")]
+#[then(regex = r"^timer segment (\d+) is missing section ([\w.+-]+)$")]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
@@ -104,7 +104,7 @@ fn timer_segment_missing(world: &mut BddWorld, index: usize, type_id: String) ->
 }
 
 /// The timer segment contains at least `min` distinct `ts` values.
-#[then(regex = r"^timer segment (\d+) section ([\d_]+) contains at least (\d+) snapshots$")]
+#[then(regex = r"^timer segment (\d+) section ([\w.+-]+) contains at least (\d+) snapshots$")]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"

@@ -1,4 +1,4 @@
-Feature: Collector writes upstream pg_store_plans to section 1_003_001
+Feature: Collector writes upstream pg_store_plans to section pg_store_plans.ossc
   The PostgreSQL 15 and 16 test images include the ossc upstream fork. Unlike
   the vadv fork, the upstream keys an entry by (userid, dbid, queryid, planid)
   with the real core query id, so plans stay per-statement and queryid joins
@@ -24,8 +24,8 @@ Feature: Collector writes upstream pg_store_plans to section 1_003_001
       SELECT count(*) AS kronika_ossc_marker FROM kronika_ossc_probe;
       """
     When the collector snapshots the segment
-    Then section 1_003_001 has an ossc pg_store_plans row for query like '%kronika_ossc_marker%' with calls = 3 and a resolvable plan
-    And section 1_004_001 is absent from the segment
+    Then section pg_store_plans.ossc has an ossc pg_store_plans row for query like '%kronika_ossc_marker%' with calls = 3 and a resolvable plan
+    And section pg_store_plans.vadv is absent from the segment
 
   @pg15 @serial
   Scenario: a zero text budget seals counters with NULL plans
@@ -46,7 +46,7 @@ Feature: Collector writes upstream pg_store_plans to section 1_003_001
       SELECT count(*) AS kronika_ossc_nobudget_marker FROM kronika_ossc_nobudget;
       """
     When the collector snapshots the segment
-    Then section 1_003_001 has an ossc pg_store_plans row for query like '%kronika_ossc_nobudget_marker%' with calls = 2 and a NULL plan
+    Then section pg_store_plans.ossc has an ossc pg_store_plans row for query like '%kronika_ossc_nobudget_marker%' with calls = 2 and a NULL plan
 
   @pg16 @serial
   Scenario: statements sharing a plan shape keep separate per-query rows
@@ -67,6 +67,6 @@ Feature: Collector writes upstream pg_store_plans to section 1_003_001
       SELECT id FROM kronika_ossc_split WHERE id = 3 AND true;
       """
     When the collector snapshots the segment
-    Then section 1_003_001 has an ossc pg_store_plans row for query like '%kronika_ossc_split WHERE id = $1' with calls = 2 and a resolvable plan
-    And section 1_003_001 has an ossc pg_store_plans row for query like '%kronika_ossc_split WHERE id = $1 AND%' with calls = 1 and a resolvable plan
-    And section 1_004_001 is absent from the segment
+    Then section pg_store_plans.ossc has an ossc pg_store_plans row for query like '%kronika_ossc_split WHERE id = $1' with calls = 2 and a resolvable plan
+    And section pg_store_plans.ossc has an ossc pg_store_plans row for query like '%kronika_ossc_split WHERE id = $1 AND%' with calls = 1 and a resolvable plan
+    And section pg_store_plans.vadv is absent from the segment

@@ -19,13 +19,13 @@ Feature: The collector seals OS procfs sections from a fixture /proc tree
       procs_blocked 0
       """
     When the collector snapshots the segment
-    Then section 1_102_001 has 2 rows
-    And section 1_102_001 cpu_id row -1 has user = 100
-    And section 1_102_001 cpu_id row -1 has idle = 400
-    And section 1_102_001 cpu_id row -1 has scope = 0
-    And section 1_103_001 ctxt equals 12345
-    And section 1_103_001 processes equals 42
-    And section 1_103_001 scope equals 0
+    Then section os_cpu has 2 rows
+    And section os_cpu cpu_id row -1 has user = 100
+    And section os_cpu cpu_id row -1 has idle = 400
+    And section os_cpu cpu_id row -1 has scope = 0
+    And section os_stat ctxt equals 12345
+    And section os_stat processes equals 42
+    And section os_stat scope equals 0
 
   @pg16 @serial
   Scenario: Memory, load, vmstat, and PSI are sealed from fixture proc files
@@ -79,18 +79,18 @@ Feature: The collector seals OS procfs sections from a fixture /proc tree
       full avg10=0.05 avg60=0.02 avg300=0.01 total=5000
       """
     When the collector snapshots the segment
-    Then section 1_104_001 mem_total equals 2048
-    And section 1_104_001 s_reclaimable equals 128
-    And section 1_104_001 s_unreclaim equals 128
-    And section 1_104_001 scope equals 0
-    And section 1_105_001 load1 equals 1.25
-    And section 1_105_001 running equals 4
-    And section 1_105_001 scope equals 0
-    And section 1_106_001 pgpgin equals 111
-    And section 1_106_001 oom_kill equals 2
-    And section 1_106_001 scope equals 0
-    And section 1_107_001 has 3 rows
-    And section 1_107_001 resource row 0 has some_total = 1000
-    And section 1_107_001 resource row 0 has full_total = null
-    And section 1_107_001 resource row 1 has full_total = 3000
-    And section 1_107_001 resource row 2 has full_total = 5000
+    Then section os_meminfo mem_total equals 2048
+    And section os_meminfo s_reclaimable equals 128
+    And section os_meminfo s_unreclaim equals 128
+    And section os_meminfo scope equals 0
+    And section os_loadavg load1 equals 1.25
+    And section os_loadavg running equals 4
+    And section os_loadavg scope equals 0
+    And section os_vmstat pgpgin equals 111
+    And section os_vmstat oom_kill equals 2
+    And section os_vmstat scope equals 0
+    And section os_psi has 3 rows
+    And section os_psi resource row 0 has some_total = 1000
+    And section os_psi resource row 0 has full_total = null
+    And section os_psi resource row 1 has full_total = 3000
+    And section os_psi resource row 2 has full_total = 5000

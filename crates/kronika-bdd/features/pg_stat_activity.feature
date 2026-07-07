@@ -1,5 +1,5 @@
-Feature: Collector reads pg_stat_activity into section 1_001_003
-  The source-pg collector snapshots pg_stat_activity into section 1_001_003
+Feature: Collector reads pg_stat_activity into section pg_stat_activity.pg14_18
+  The source-pg collector snapshots pg_stat_activity into section pg_stat_activity.pg14_18
   (layout PG 14-18). The scenario opens a session with a distinctive query
   text, snapshots the segment, and checks the recorded row against concrete
   values resolved through the dictionary.
@@ -17,10 +17,10 @@ Feature: Collector reads pg_stat_activity into section 1_001_003
       SELECT 'kronika_bdd_activity_marker' FROM kronika_probe WHERE id = 0;
       """
     When the collector snapshots the segment
-    Then section 1_001_003 has a row for session "S":
+    Then section pg_stat_activity.pg14_18 has a row for session "S":
       | pid   | [S]                 |
       | state | idle in transaction |
-    And section 1_001_003 pid is present in pg_stat_activity:
+    And section pg_stat_activity.pg14_18.pid is present in pg_stat_activity:
       """
       SELECT pid FROM pg_stat_activity
       WHERE state = 'idle in transaction'

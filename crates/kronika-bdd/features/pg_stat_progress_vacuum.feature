@@ -9,7 +9,7 @@ Feature: Collector reads pg_stat_progress_vacuum
   Scenario: no active VACUUM produces no pg_stat_progress_vacuum section
     Given a fresh database on PostgreSQL 17
     When the collector snapshots the segment
-    Then section 1_012_001 is absent from the segment
+    Then section pg_stat_progress_vacuum is absent from the segment
 
   @pg17 @slow @serial
   Scenario: a running manual VACUUM is captured with relid and datid matching the catalog
@@ -28,13 +28,13 @@ Feature: Collector reads pg_stat_progress_vacuum
       """
     And pg_stat_progress_vacuum shows session "V"
     When the collector snapshots the segment
-    Then section 1_012_001 has a row for session "V":
+    Then section pg_stat_progress_vacuum has a row for session "V":
       | is_autovacuum | false |
-    And section 1_012_001 datid matches the exact oracle:
+    And section pg_stat_progress_vacuum datid matches the exact oracle:
       """
       SELECT oid::bigint FROM pg_database WHERE datname = current_database()
       """
-    And section 1_012_001 relid matches the exact oracle:
+    And section pg_stat_progress_vacuum relid matches the exact oracle:
       """
       SELECT 'kronika_vac_probe'::regclass::oid::bigint
       """

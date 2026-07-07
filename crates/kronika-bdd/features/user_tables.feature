@@ -20,15 +20,15 @@ Feature: Collector reads pg_stat_user_tables and pg_stat_user_indexes across dat
       ANALYZE kronika_ut_probe;
       """
     When the collector snapshots the segment
-    Then section 1_013_003 has a row with relname = "kronika_ut_probe" and datname = [scenario database]:
+    Then section pg_stat_user_tables.pg16_17 has a row with relname = "kronika_ut_probe" and datname = [scenario database]:
       | n_tup_ins | >= 200 |
-    Then section 1_013_003 has a row with relname = "kronika_ut_probe" and datname = [second database]:
+    Then section pg_stat_user_tables.pg16_17 has a row with relname = "kronika_ut_probe" and datname = [second database]:
       | n_tup_ins | >= 200 |
-    Then section 1_013_003 n_tup_ins matches the subset oracle:
+    Then section pg_stat_user_tables.pg16_17 n_tup_ins matches the subset oracle:
       """
       SELECT n_tup_ins FROM pg_stat_user_tables WHERE relname = 'kronika_ut_probe'
       """
-    Then section 1_013_003 n_tup_ins matches the subset oracle in the second database:
+    Then section pg_stat_user_tables.pg16_17 n_tup_ins matches the subset oracle in the second database:
       """
       SELECT n_tup_ins FROM pg_stat_user_tables WHERE relname = 'kronika_ut_probe'
       """
@@ -57,17 +57,17 @@ Feature: Collector reads pg_stat_user_tables and pg_stat_user_indexes across dat
       SELECT pg_stat_force_next_flush();
       """
     When the collector snapshots the segment
-    Then section 1_014_002 has a row with indexrelname = "kronika_ut_probe_idx" and datname = [scenario database]:
+    Then section pg_stat_user_indexes.pg16_18 has a row with indexrelname = "kronika_ut_probe_idx" and datname = [scenario database]:
       | idx_scan     | >= 1  |
       | indisprimary | false |
-    Then section 1_014_002 has a row with indexrelname = "kronika_ut_probe_idx" and datname = [second database]:
+    Then section pg_stat_user_indexes.pg16_18 has a row with indexrelname = "kronika_ut_probe_idx" and datname = [second database]:
       | idx_scan     | >= 1  |
       | indisprimary | false |
-    Then section 1_014_002 idx_scan matches the subset oracle:
+    Then section pg_stat_user_indexes.pg16_18 idx_scan matches the subset oracle:
       """
       SELECT idx_scan FROM pg_stat_user_indexes WHERE indexrelname = 'kronika_ut_probe_idx'
       """
-    Then section 1_014_002 idx_scan matches the subset oracle in the second database:
+    Then section pg_stat_user_indexes.pg16_18 idx_scan matches the subset oracle in the second database:
       """
       SELECT idx_scan FROM pg_stat_user_indexes WHERE indexrelname = 'kronika_ut_probe_idx'
       """
