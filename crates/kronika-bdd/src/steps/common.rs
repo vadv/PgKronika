@@ -7,13 +7,13 @@
 use anyhow::{Context, Result, bail};
 use cucumber::{gherkin::Step, given, then};
 use kronika_reader::Segment;
-use kronika_registry::{Cell, ColumnType, Row, TypeContract, registry};
+use kronika_registry::{Cell, ColumnType, Row, TypeContract, registry, section_name};
 
 use crate::BddWorld;
-use crate::harness::assert_row::{KeyMatch, RowSelector, assert_row, decode_section};
+use crate::harness::assert_row::{KeyMatch, RowSelector, assert_row, decode_section_labeled};
 use crate::harness::dump;
 use crate::harness::expected::{ExpectedColumn, ExpectedValue, parse_table};
-use crate::harness::oracle::{OracleKind, assert_oracle, window_contains};
+use crate::harness::oracle::{OracleKind, OracleTarget, assert_oracle, window_contains};
 use crate::steps::{docstring, table};
 
 /// Assert that a singleton section has exactly one row matching the table.
@@ -25,17 +25,18 @@ use crate::steps::{docstring, table};
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) has exactly one row:$")]
-fn section_single_row(world: &mut BddWorld, type_id: String, step: &Step) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
-    let contract = contract_for(type_id)?;
+#[then(regex = r"^section ([\w.+-]+) has exactly one row:$")]
+fn section_single_row(world: &mut BddWorld, section: String, step: &Step) -> Result<()> {
+    let section = parse_section_ref(&section)?;
+    let contract = contract_for(section.type_id)?;
     let rows = table(step)?;
     let expected = parse_table(contract, rows, |name| world.harness.placeholder_pid(name))?;
     let segment = world.harness.segment()?.clone();
     let failure_log = world.harness.failure_log()?;
     assert_row(
         &segment,
-        type_id,
+        section.type_id,
+        &section.label,
         &RowSelector::SingleRow,
         true,
         &expected,
@@ -51,24 +52,24 @@ fn section_single_row(world: &mut BddWorld, type_id: String, step: &Step) -> Res
 /// resolved to pids; `[]` is an empty `ListI32`.
 ///
 /// Matches:
-/// - `section 1_011_001 has a row for session "W":`
-/// - `section 1_011_001 has exactly one row for session "W":`
+/// - `section pg_locks.pg14_18 has a row for session "W":`
+/// - `section pg_locks.pg14_18 has exactly one row for session "W":`
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = "^section ([\\d_]+) has ((?:exactly one )?a? ?)row for session \"([^\"]+)\":$")]
+#[then(regex = "^section ([\\w.+-]+) has ((?:exactly one )?a? ?)row for session \"([^\"]+)\":$")]
 fn section_row_for_session(
     world: &mut BddWorld,
-    type_id: String,
+    section: String,
     qualifier: String,
     session_name: String,
     step: &Step,
 ) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
+    let section = parse_section_ref(&section)?;
     let exactly_one = qualifier.trim().starts_with("exactly one");
     let pid = world.harness.placeholder_pid(&session_name)?;
-    let contract = contract_for(type_id)?;
+    let contract = contract_for(section.type_id)?;
     let rows = table(step)?;
     let expected =
         parse_table_with_empty_list(contract, rows, |name| world.harness.placeholder_pid(name))?;
@@ -76,7 +77,8 @@ fn section_row_for_session(
     let failure_log = world.harness.failure_log()?;
     assert_row(
         &segment,
-        type_id,
+        section.type_id,
+        &section.label,
         &RowSelector::ByPid { column: "pid", pid },
         exactly_one,
         &expected,
@@ -93,22 +95,22 @@ fn section_row_for_session(
 /// placeholders in the table are resolved to session pids.
 ///
 /// Matches, for example:
-/// - `section 1_010_001 has a row with datname = [scenario database]:`
-/// - `section 1_013_003 has a row with relname = "probe" and datname = [second database]:`
-/// - `section 1_009_001 has a row with backend_type = "client backend" and object = "relation" and context = "normal":`
+/// - `section pg_prepared_xacts has a row with datname = [scenario database]:`
+/// - `section pg_stat_user_tables.pg16_17 has a row with relname = "probe" and datname = [second database]:`
+/// - `section pg_stat_io.pg16_17 has a row with backend_type = "client backend" and object = "relation" and context = "normal":`
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) has a row with (.+):$")]
+#[then(regex = r"^section ([\w.+-]+) has a row with (.+):$")]
 fn section_row_by_key(
     world: &mut BddWorld,
-    type_id: String,
+    section: String,
     key_spec: String,
     step: &Step,
 ) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
-    let contract = contract_for(type_id)?;
+    let section = parse_section_ref(&section)?;
+    let contract = contract_for(section.type_id)?;
     let keys = parse_key_spec(contract, &key_spec, |slot| resolve_database(world, slot))?;
     let rows = table(step)?;
     let expected =
@@ -117,7 +119,8 @@ fn section_row_by_key(
     let failure_log = world.harness.failure_log()?;
     assert_row(
         &segment,
-        type_id,
+        section.type_id,
+        &section.label,
         &RowSelector::ByKeys(keys),
         false,
         &expected,
@@ -140,17 +143,19 @@ fn resolve_database(world: &BddWorld, slot: &str) -> Result<String> {
 /// docstring carries the oracle SQL. The query runs on the scenario database,
 /// or on the first extra database when the phrase ends with `in the second
 /// database` — the form per-database fan-out features use to check each side.
-#[then(regex = r"^section ([\d_]+) (\w+) matches the ([\w-]+) oracle( in the second database)?:$")]
+#[then(
+    regex = r"^section ([\w.+-]+)(?: (\w+))? matches the ([\w-]+) oracle( in the second database)?:$"
+)]
 async fn section_oracle(
     world: &mut BddWorld,
-    type_id: String,
+    subject: String,
     column: String,
     kind: String,
     second_database: String,
     step: &Step,
 ) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
-    let contract = contract_for(type_id)?;
+    let subject = parse_section_column(&subject, &column)?;
+    let contract = contract_for(subject.section.type_id)?;
     let kind = OracleKind::parse(&kind)?;
     let sql = docstring(step)?;
     let segment = world.harness.segment()?.clone();
@@ -168,9 +173,13 @@ async fn section_oracle(
     });
     let result = assert_oracle(
         &client,
-        contract,
+        OracleTarget {
+            contract,
+            section_label: &subject.section.label,
+            subject_label: &subject.label,
+            column: &subject.column,
+        },
         &segment,
-        &column,
         kind,
         sql,
         &failure_log,
@@ -189,16 +198,17 @@ async fn section_oracle(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) (\w+) is null$")]
-fn section_column_null(world: &mut BddWorld, type_id: String, column: String) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
-    let (row, _dict) = single_row(world, type_id)?;
+#[then(regex = r"^section ([\w.+-]+)(?: (\w+))? is null$")]
+fn section_column_null(world: &mut BddWorld, subject: String, column: String) -> Result<()> {
+    let subject = parse_section_column(&subject, &column)?;
+    let (row, _dict) = single_row_labeled(world, &subject.section)?;
     let cell = row
-        .get(column.as_str())
-        .with_context(|| format!("section {type_id} has no column {column:?}"))?;
+        .get(subject.column.as_str())
+        .with_context(|| format!("{} has no column {:?}", subject.label, subject.column))?;
     anyhow::ensure!(
         cell == &Cell::Null,
-        "section {type_id}: {column} is {cell:?}, expected NULL"
+        "{} is {cell:?}, expected NULL",
+        subject.label
     );
     Ok(())
 }
@@ -209,19 +219,20 @@ fn section_column_null(world: &mut BddWorld, type_id: String, column: String) ->
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r#"^section ([\d_]+) (\w+) resolves to "([^"]*)"$"#)]
+#[then(regex = r#"^section ([\w.+-]+)(?: (\w+))? resolves to "([^"]*)"$"#)]
 fn section_column_resolves(
     world: &mut BddWorld,
-    type_id: String,
+    subject: String,
     column: String,
     expected: String,
 ) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
-    let (row, dict) = single_row(world, type_id)?;
-    let actual = resolve_str_column(type_id, &row, &dict, &column)?;
+    let subject = parse_section_column(&subject, &column)?;
+    let (row, dict) = single_row_labeled(world, &subject.section)?;
+    let actual = resolve_str_column(subject.section.type_id, &row, &dict, &subject.column)?;
     anyhow::ensure!(
         actual == expected,
-        "section {type_id}: {column} is {actual:?}, expected {expected:?}"
+        "{} is {actual:?}, expected {expected:?}",
+        subject.label
     );
     Ok(())
 }
@@ -231,11 +242,23 @@ pub(crate) fn single_row(
     world: &BddWorld,
     type_id: u32,
 ) -> Result<(Row, kronika_reader::Dictionary)> {
+    let section = SectionRef {
+        type_id,
+        label: canonical_section_label(type_id),
+    };
+    single_row_labeled(world, &section)
+}
+
+fn single_row_labeled(
+    world: &BddWorld,
+    section: &SectionRef,
+) -> Result<(Row, kronika_reader::Dictionary)> {
     let segment = world.harness.segment()?.clone();
-    let (mut rows, dict) = decode_section(&segment, type_id)?;
+    let (mut rows, dict) = decode_section_labeled(&segment, section.type_id, &section.label)?;
     anyhow::ensure!(
         rows.len() == 1,
-        "section {type_id} holds {} rows, expected exactly one",
+        "section {} holds {} rows, expected exactly one",
+        section.label,
         rows.len()
     );
     let row = rows.remove(0);
@@ -275,19 +298,20 @@ pub(crate) fn resolve_str_column(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) is absent from the segment$")]
-fn section_absent(world: &mut BddWorld, type_id: String) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
+#[then(regex = r"^section ([\w.+-]+) is absent from the segment$")]
+fn section_absent(world: &mut BddWorld, section: String) -> Result<()> {
+    let section = parse_section_ref(&section)?;
     let path = world.harness.segment()?;
     let segment = Segment::open(path).context("open sealed segment")?;
     let present = segment
         .catalog()
         .entries
         .iter()
-        .any(|entry| entry.type_id == type_id);
+        .any(|entry| entry.type_id == section.type_id);
     anyhow::ensure!(
         !present,
-        "section {type_id} is present in the segment but must be absent for this layout"
+        "section {} is present in the segment but must be absent for this layout",
+        section.label
     );
     Ok(())
 }
@@ -295,25 +319,26 @@ fn section_absent(world: &mut BddWorld, type_id: String) -> Result<()> {
 /// Capture the window floor for a section column: run the docstring SQL now,
 /// before the snapshot, and store the value.
 ///
-/// Pairs with `section X <column> is between the captured floor and:`; together
+/// Pairs with `section X.<column> is between the captured floor and:`; together
 /// they bracket a monotonically advancing counter between two oracle reads.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[given(regex = r"^the window floor for section ([\d_]+) (\w+) is captured as:$")]
+#[given(regex = r"^the window floor for section ([\w.+-]+)(?: (\w+))? is captured as:$")]
 async fn window_floor_captured(
     world: &mut BddWorld,
-    type_id: String,
+    subject: String,
     column: String,
     step: &Step,
 ) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
+    let subject = parse_section_column(&subject, &column)?;
     let sql = docstring(step)?;
     let floor = scalar_i64(&world.harness.database_dsn()?, sql).await?;
-    world
-        .harness
-        .set_window_floor(&window_floor_key(type_id, &column), floor);
+    world.harness.set_window_floor(
+        &window_floor_key(subject.section.type_id, &subject.column),
+        floor,
+    );
     Ok(())
 }
 
@@ -323,28 +348,29 @@ async fn window_floor_captured(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) (\w+) is between the captured floor and:$")]
+#[then(regex = r"^section ([\w.+-]+)(?: (\w+))? is between the captured floor and:$")]
 async fn section_window_bounds(
     world: &mut BddWorld,
-    type_id: String,
+    subject: String,
     column: String,
     step: &Step,
 ) -> Result<()> {
-    let type_id = parse_type_id(&type_id)?;
+    let subject = parse_section_column(&subject, &column)?;
     let sql = docstring(step)?;
     let floor = world
         .harness
-        .window_floor(&window_floor_key(type_id, &column))?;
+        .window_floor(&window_floor_key(subject.section.type_id, &subject.column))?;
     let ceiling = scalar_i64(&world.harness.database_dsn()?, sql).await?;
     let segment = world.harness.segment()?.clone();
     let failure_log = world.harness.failure_log()?;
-    let (rows, _dict) = decode_section(&segment, type_id)?;
-    let value = match recorded_i64(&rows, &column) {
+    let (rows, _dict) =
+        decode_section_labeled(&segment, subject.section.type_id, &subject.section.label)?;
+    let value = match recorded_i64(&rows, &subject.column) {
         Ok(value) => value,
         Err(err) => bail!(
             "{}",
             dump::section_dump(
-                &format!("section {type_id} {column}: {err}"),
+                &format!("{}: {err}", subject.label),
                 &rows,
                 &failure_log,
                 &[],
@@ -358,8 +384,8 @@ async fn section_window_bounds(
         "{}",
         dump::section_dump(
             &format!(
-                "section {type_id} {column}: window bounds failed \
-                 (floor <= recorded <= ceiling)"
+                "{}: window bounds failed (floor <= recorded <= ceiling)",
+                subject.label
             ),
             &rows,
             &failure_log,
@@ -414,11 +440,194 @@ async fn scalar_i64(dsn: &str, sql: &str) -> Result<i64> {
     result
 }
 
-/// Parse a section id as written in features (`1_008_001` or `1008001`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SectionRef {
+    pub(crate) type_id: u32,
+    pub(crate) label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SectionColumnRef {
+    pub(crate) section: SectionRef,
+    pub(crate) column: String,
+    pub(crate) label: String,
+}
+
+struct FieldAlias {
+    name: &'static str,
+    type_id: u32,
+    column: &'static str,
+}
+
+const SECTION_ALIASES: &[(&str, u32)] = &[
+    ("pg_stat_activity.pg10_12", 1_001_001),
+    ("pg_stat_activity.pg13", 1_001_002),
+    ("pg_stat_activity.pg14_18", 1_001_003),
+    ("pg_stat_statements.pg10_12", 1_002_001),
+    ("pg_stat_statements.pg13", 1_002_002),
+    ("pg_stat_statements.pg14", 1_002_003),
+    ("pg_stat_statements.pg15_16", 1_002_004),
+    ("pg_stat_statements.pg17", 1_002_005),
+    ("pg_stat_statements.pg18", 1_002_006),
+    ("pg_store_plans.ossc", 1_003_001),
+    ("pg_store_plans.vadv", 1_004_001),
+    ("pg_stat_database.pg10_11", 1_005_001),
+    ("pg_stat_database.pg12_13", 1_005_002),
+    ("pg_stat_database.pg14_17", 1_005_003),
+    ("pg_stat_database.pg18", 1_005_004),
+    ("pg_stat_bgwriter+pg_stat_checkpointer", 1_006_001),
+    ("bgwriter_checkpointer", 1_006_001),
+    ("pg_stat_wal.pg15_17", 1_007_001),
+    ("pg_stat_wal.pg18", 1_007_002),
+    ("pg_stat_io.pg16_17", 1_009_001),
+    ("pg_stat_io.pg18", 1_009_002),
+    ("pg_locks.pg10_13", 1_011_001),
+    ("pg_locks.pg14_18", 1_011_002),
+    ("pg_stat_user_tables.pg10_12", 1_013_001),
+    ("pg_stat_user_tables.pg13_15", 1_013_002),
+    ("pg_stat_user_tables.pg16_17", 1_013_003),
+    ("pg_stat_user_tables.pg18", 1_013_004),
+    ("pg_stat_user_indexes.pg10_15", 1_014_001),
+    ("pg_stat_user_indexes.pg16_18", 1_014_002),
+];
+
+const FIELD_ALIASES: &[FieldAlias] = &[
+    FieldAlias {
+        name: "pg_is_in_recovery.is_in_recovery",
+        type_id: 1_015_001,
+        column: "is_in_recovery",
+    },
+    FieldAlias {
+        name: "pg_stat_replication.streaming_replicas",
+        type_id: 1_015_001,
+        column: "streaming_replicas",
+    },
+    FieldAlias {
+        name: "pg_control_checkpoint.timeline_id",
+        type_id: 1_015_001,
+        column: "timeline_id",
+    },
+    FieldAlias {
+        name: "pg_current_wal_lsn.current_wal_lsn",
+        type_id: 1_015_001,
+        column: "current_wal_lsn",
+    },
+    FieldAlias {
+        name: "pg_stat_wal.current_wal_lsn",
+        type_id: 1_015_001,
+        column: "current_wal_lsn",
+    },
+];
+
+/// Parse a section id or BDD alias as written in features.
 pub(crate) fn parse_type_id(raw: &str) -> Result<u32> {
+    Ok(parse_section_ref(raw)?.type_id)
+}
+
+pub(crate) fn parse_section_ref(raw: &str) -> Result<SectionRef> {
+    let raw = raw.trim();
+    if let Some(type_id) = parse_numeric_type_id(raw)? {
+        return section_ref_for_type_id(type_id);
+    }
+
+    let normalized = raw.to_ascii_lowercase();
+    if let Some((alias, type_id)) = SECTION_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == normalized)
+    {
+        contract_for(*type_id)?;
+        return Ok(SectionRef {
+            type_id: *type_id,
+            label: (*alias).to_owned(),
+        });
+    }
+
+    let matches: Vec<&TypeContract> = registry()
+        .iter()
+        .filter(|contract| contract.name == raw)
+        .collect();
+    match matches.as_slice() {
+        [contract] => Ok(SectionRef {
+            type_id: contract.type_id.get(),
+            label: raw.to_owned(),
+        }),
+        [] => bail!("unknown BDD section {raw:?}; use a registry section name or BDD alias"),
+        many => {
+            let choices = many
+                .iter()
+                .map(|contract| canonical_section_label(contract.type_id.get()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("section name {raw:?} is versioned; use one of: {choices}")
+        }
+    }
+}
+
+pub(crate) fn parse_section_column(subject: &str, column: &str) -> Result<SectionColumnRef> {
+    let subject = subject.trim();
+    let column = column.trim();
+    if !column.is_empty() {
+        let section = parse_section_ref(subject)?;
+        return section_column_ref(section, column, None);
+    }
+
+    let normalized = subject.to_ascii_lowercase();
+    if let Some(alias) = FIELD_ALIASES.iter().find(|alias| alias.name == normalized) {
+        let section = section_ref_for_type_id(alias.type_id)?;
+        return section_column_ref(section, alias.column, Some(alias.name));
+    }
+
+    let (section, column) = subject
+        .rsplit_once('.')
+        .with_context(|| format!("{subject:?} must be written as section.column"))?;
+    let section = parse_section_ref(section)?;
+    section_column_ref(section, column, None)
+}
+
+fn section_column_ref(
+    section: SectionRef,
+    column: &str,
+    label: Option<&str>,
+) -> Result<SectionColumnRef> {
+    let contract = contract_for(section.type_id)?;
+    anyhow::ensure!(
+        contract.column(column).is_some(),
+        "section {} has no column {column:?}",
+        section.label
+    );
+    let label = label.map_or_else(|| format!("{}.{}", section.label, column), str::to_owned);
+    Ok(SectionColumnRef {
+        section,
+        column: column.to_owned(),
+        label,
+    })
+}
+
+fn parse_numeric_type_id(raw: &str) -> Result<Option<u32>> {
+    if !raw.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        return Ok(None);
+    }
     raw.replace('_', "")
         .parse::<u32>()
+        .map(Some)
         .with_context(|| format!("invalid section type_id {raw:?}"))
+}
+
+fn section_ref_for_type_id(type_id: u32) -> Result<SectionRef> {
+    contract_for(type_id)?;
+    Ok(SectionRef {
+        type_id,
+        label: canonical_section_label(type_id),
+    })
+}
+
+fn canonical_section_label(type_id: u32) -> String {
+    SECTION_ALIASES
+        .iter()
+        .find(|(_, alias_type_id)| *alias_type_id == type_id)
+        .map(|(alias, _)| (*alias).to_owned())
+        .or_else(|| section_name(type_id).map(str::to_owned))
+        .unwrap_or_else(|| type_id.to_string())
 }
 
 /// The registry contract for `type_id`, or an error if it is not registered.
@@ -592,7 +801,10 @@ fn is_str_column(contract: &TypeContract, column: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{contract_for, parse_key_cell, parse_table_with_empty_list};
+    use super::{
+        contract_for, parse_key_cell, parse_section_column, parse_section_ref,
+        parse_table_with_empty_list,
+    };
     use crate::harness::expected::ExpectedValue;
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use kronika_registry::{Cell, Section};
@@ -703,7 +915,36 @@ mod tests {
     fn type_id_parses_with_and_without_underscores() {
         assert_eq!(super::parse_type_id("1_008_001").unwrap(), 1_008_001);
         assert_eq!(super::parse_type_id("1008001").unwrap(), 1_008_001);
+        assert_eq!(
+            super::parse_type_id("pg_stat_wal.pg15_17").unwrap(),
+            1_007_001
+        );
         assert!(super::parse_type_id("porridge").is_err());
+    }
+
+    #[test]
+    fn section_ref_resolves_aliases_and_rejects_ambiguous_names() {
+        let section = parse_section_ref("pg_stat_database.pg14_17").unwrap();
+        assert_eq!(section.type_id, 1_005_003);
+        assert_eq!(section.label, "pg_stat_database.pg14_17");
+
+        assert!(
+            parse_section_ref("pg_stat_database").is_err(),
+            "versioned registry names need an explicit BDD alias"
+        );
+    }
+
+    #[test]
+    fn section_column_resolves_section_dot_column_and_raw_probe_aliases() {
+        let subject = parse_section_column("pg_stat_wal.pg15_17.stats_reset", "").unwrap();
+        assert_eq!(subject.section.type_id, 1_007_001);
+        assert_eq!(subject.column, "stats_reset");
+        assert_eq!(subject.label, "pg_stat_wal.pg15_17.stats_reset");
+
+        let subject = parse_section_column("pg_control_checkpoint.timeline_id", "").unwrap();
+        assert_eq!(subject.section.type_id, 1_015_001);
+        assert_eq!(subject.column, "timeline_id");
+        assert_eq!(subject.label, "pg_control_checkpoint.timeline_id");
     }
 
     #[test]

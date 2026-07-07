@@ -1,4 +1,4 @@
-//! Steps for `features/pg_stat_activity.feature` (section `1_001_003`).
+//! Steps for `features/pg_stat_activity.feature` (`pg_stat_activity.pg14_18`).
 //!
 //! Generic transport and row-assertion steps come from [`super::mod`] and
 //! [`super::common`]. The one step here is specific to `pg_stat_activity` so
@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use cucumber::{gherkin::Step, then};
 
 use crate::BddWorld;
-use crate::harness::oracle::{OracleKind, assert_oracle};
+use crate::harness::oracle::{OracleKind, OracleTarget, assert_oracle};
 use crate::steps::{common::contract_for, docstring};
 
 const ACTIVITY_TYPE_ID: u32 = 1_001_003;
@@ -18,7 +18,7 @@ const ACTIVITY_TYPE_ID: u32 = 1_001_003;
 ///
 /// The docstring is the oracle SQL. The phrase names `pg_stat_activity` so it
 /// cannot collide with the generic oracle step in `common`.
-#[then(regex = "^section 1_001_003 pid is present in pg_stat_activity:$")]
+#[then(regex = "^section pg_stat_activity\\.pg14_18\\.pid is present in pg_stat_activity:$")]
 async fn activity_pid_subset_oracle(world: &mut BddWorld, step: &Step) -> Result<()> {
     let contract = contract_for(ACTIVITY_TYPE_ID)?;
     let sql = docstring(step)?;
@@ -33,9 +33,13 @@ async fn activity_pid_subset_oracle(world: &mut BddWorld, step: &Step) -> Result
     });
     let result = assert_oracle(
         &client,
-        contract,
+        OracleTarget {
+            contract,
+            section_label: "pg_stat_activity.pg14_18",
+            subject_label: "pg_stat_activity.pg14_18.pid",
+            column: "pid",
+        },
         &segment,
-        "pid",
         OracleKind::Subset,
         sql,
         &failure_log,

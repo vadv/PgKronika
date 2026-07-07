@@ -12,7 +12,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use kronika_format::crc32c;
 use kronika_reader::{Dictionary, Resolved, Segment};
-use kronika_registry::{Bytes, Cell, MAX_SECTION_BYTES, Row, VerifiedSection, decode_rows};
+use kronika_registry::{
+    Bytes, Cell, MAX_SECTION_BYTES, Row, VerifiedSection, decode_rows, section_name,
+};
 
 use crate::harness::dump;
 use crate::harness::expected::{ExpectedColumn, ExpectedValue};
@@ -88,6 +90,15 @@ impl KeyMatch {
 /// Returns an error if the segment has no such section, the section is too
 /// large, the CRC fails, or decoding fails.
 pub(crate) fn decode_section(path: &Path, type_id: u32) -> Result<(Vec<Row>, Dictionary)> {
+    decode_section_labeled(path, type_id, &fallback_section_label(type_id))
+}
+
+/// Decode a section, using `section_label` in diagnostics.
+pub(crate) fn decode_section_labeled(
+    path: &Path,
+    type_id: u32,
+    section_label: &str,
+) -> Result<(Vec<Row>, Dictionary)> {
     use std::os::unix::fs::FileExt;
 
     let segment = Segment::open(path).context("open sealed segment")?;
@@ -96,25 +107,30 @@ pub(crate) fn decode_section(path: &Path, type_id: u32) -> Result<(Vec<Row>, Dic
         .entries
         .iter()
         .find(|entry| entry.type_id == type_id)
-        .with_context(|| format!("segment has no section {type_id}"))?;
-    let len = usize::try_from(entry.len).context("section len overflows usize")?;
+        .with_context(|| format!("segment has no section {section_label}"))?;
+    let len = usize::try_from(entry.len)
+        .with_context(|| format!("section {section_label} len overflows usize"))?;
     anyhow::ensure!(
         len <= MAX_SECTION_BYTES,
-        "section {type_id} of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
+        "section {section_label} of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
     );
     let mut body = vec![0_u8; len];
     std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
     let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
-        .map_err(|err| anyhow::anyhow!("section {type_id} crc check failed: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("section {section_label} crc check failed: {err}"))?;
     let rows = decode_rows(type_id, verified)
-        .with_context(|| format!("generic decode of section {type_id}"))?;
+        .with_context(|| format!("generic decode of section {section_label}"))?;
     let dict = segment
         .dictionary()
         .context("read the segment dictionary")?;
     Ok((rows, dict))
 }
 
-/// Assert that the selected row of section `type_id` matches `expected`.
+fn fallback_section_label(type_id: u32) -> String {
+    section_name(type_id).map_or_else(|| type_id.to_string(), str::to_owned)
+}
+
+/// Assert that the selected row of section `section_label` matches `expected`.
 ///
 /// `subprocess_logs` (the cluster and collector output) is included in the
 /// failure dump. When `single_row_expected` is set (the `exactly one row`
@@ -128,19 +144,20 @@ pub(crate) fn decode_section(path: &Path, type_id: u32) -> Result<(Vec<Row>, Dic
 pub(crate) fn assert_row(
     path: &Path,
     type_id: u32,
+    section_label: &str,
     selector: &RowSelector,
     single_row_expected: bool,
     expected: &[ExpectedColumn],
     subprocess_logs: &str,
 ) -> Result<()> {
-    let (rows, dict) = decode_section(path, type_id)?;
+    let (rows, dict) = decode_section_labeled(path, type_id, section_label)?;
 
     if single_row_expected && rows.len() != 1 {
         bail!(
             "{}",
             dump::section_dump(
                 &format!(
-                    "section {type_id}: expected exactly one row, got {}",
+                    "section {section_label}: expected exactly one row, got {}",
                     rows.len()
                 ),
                 &rows,
@@ -154,7 +171,7 @@ pub(crate) fn assert_row(
         anyhow::anyhow!(
             "{}",
             dump::section_dump(
-                &format!("section {type_id}: no row matched {selector:?}"),
+                &format!("section {section_label}: no row matched {selector:?}"),
                 &rows,
                 subprocess_logs,
                 &[("expected", render_expected(expected))],
@@ -174,7 +191,10 @@ pub(crate) fn assert_row(
     bail!(
         "{}",
         dump::section_dump(
-            &format!("section {type_id}: {} column(s) did not match", diffs.len()),
+            &format!(
+                "section {section_label}: {} column(s) did not match",
+                diffs.len()
+            ),
             &rows,
             subprocess_logs,
             &[

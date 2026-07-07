@@ -1,4 +1,4 @@
-//! Steps for `features/collector.feature` (section `1_006_001`).
+//! Steps for `features/collector.feature` (`pg_stat_bgwriter+pg_stat_checkpointer`).
 //!
 //! The feature pins the two `pg_stat_bgwriter` / `pg_stat_checkpointer` layouts:
 //! pre-PG17 stores backend buffer counters and no checkpointer reset, while
@@ -14,8 +14,12 @@ use crate::harness::dump;
 
 const BGWRITER_CHECKPOINTER_TYPE_ID: u32 = 1_006_001;
 
-/// Assert the pre-PG17 nullable-column shape of section `1_006_001`.
-#[then("section 1_006_001 uses the pre-PG17 bgwriter/checkpointer layout")]
+const BGWRITER_CHECKPOINTER_LABEL: &str = "pg_stat_bgwriter+pg_stat_checkpointer";
+
+/// Assert the pre-PG17 nullable-column shape.
+#[then(
+    "section pg_stat_bgwriter+pg_stat_checkpointer uses the pre-PG17 bgwriter/checkpointer layout"
+)]
 fn pre_pg17_layout(world: &mut BddWorld) -> Result<()> {
     let (rows, logs) = bgwriter_rows(world)?;
     let row = single_row(&rows, &logs)?;
@@ -29,8 +33,8 @@ fn pre_pg17_layout(world: &mut BddWorld) -> Result<()> {
     Ok(())
 }
 
-/// Assert the PG17+ nullable-column shape of section `1_006_001`.
-#[then("section 1_006_001 uses the PG17+ bgwriter/checkpointer layout")]
+/// Assert the PG17+ nullable-column shape.
+#[then("section pg_stat_bgwriter+pg_stat_checkpointer uses the PG17+ bgwriter/checkpointer layout")]
 fn pg17_layout(world: &mut BddWorld) -> Result<()> {
     let (rows, logs) = bgwriter_rows(world)?;
     let row = single_row(&rows, &logs)?;
@@ -57,7 +61,7 @@ fn single_row<'a>(rows: &'a [Row], logs: &str) -> Result<&'a Row> {
             "{}",
             dump::section_dump(
                 &format!(
-                    "section {BGWRITER_CHECKPOINTER_TYPE_ID}: expected one row, got {}",
+                    "section {BGWRITER_CHECKPOINTER_LABEL}: expected one row, got {}",
                     rows.len()
                 ),
                 rows,

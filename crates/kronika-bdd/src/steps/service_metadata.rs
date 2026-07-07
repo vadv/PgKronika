@@ -12,7 +12,7 @@ use crate::BddWorld;
 use crate::steps::common::{parse_type_id, resolve_str_column, single_row};
 
 /// The section's string column equals the trimmed content of a host file.
-#[then(regex = r#"^section ([\d_]+) (\w+) equals the trimmed content of "([^"]+)"$"#)]
+#[then(regex = r#"^section ([\w.+-]+) (\w+) equals the trimmed content of "([^"]+)"$"#)]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
@@ -38,7 +38,7 @@ fn column_equals_file(
 }
 
 /// `btime` equals an independent parse of the `/proc/stat` btime line.
-#[then(regex = r"^section ([\d_]+) btime equals the /proc/stat btime in microseconds$")]
+#[then(regex = r"^section ([\w.+-]+) btime equals the /proc/stat btime in microseconds$")]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
@@ -69,7 +69,7 @@ fn btime_equals_proc_stat(world: &mut BddWorld, type_id: String) -> Result<()> {
 ///
 /// The expected value comes from the same syscall as the collector. The check
 /// still exercises dictionary interning, section buffering, and decoding.
-#[then(regex = r"^section ([\d_]+) (\w+) equals the local sysconf (clock ticks|page size)$")]
+#[then(regex = r"^section ([\w.+-]+) (\w+) equals the local sysconf (clock ticks|page size)$")]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"

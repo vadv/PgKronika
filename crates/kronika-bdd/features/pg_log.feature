@@ -13,7 +13,7 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:00:02 UTC [1]: ERROR:  relation "b" does not exist
       """
     When the collector snapshots the segment
-    Then section 1_022_001 has a row with pattern = relation "..." does not exist:
+    Then section pg_log_errors has a row with pattern = relation "..." does not exist:
       | severity  | 0               |
       | category  | 9               |
       | count     | 2               |
@@ -30,15 +30,15 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:01:03 UTC [4]: WARNING:  terminating connection because of crash of another server process
       """
     When the collector snapshots the segment
-    Then section 1_022_001 has a row with pattern = "server process (...) was terminated by signal ...: Killed":
+    Then section pg_log_errors has a row with pattern = "server process (...) was terminated by signal ...: Killed":
       | severity | 4 |
       | category | 4 |
       | count    | 1 |
-    And section 1_022_001 has a row with pattern = "server process (...) was terminated by signal ...: Segmentation fault":
+    And section pg_log_errors has a row with pattern = "server process (...) was terminated by signal ...: Segmentation fault":
       | severity | 4 |
       | category | 6 |
       | count    | 1 |
-    And section 1_022_001 has a row with pattern = "terminating connection because of crash of another server process":
+    And section pg_log_errors has a row with pattern = "terminating connection because of crash of another server process":
       | severity | 3 |
       | category | 6 |
       | count    | 1 |
@@ -56,7 +56,7 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:02:00 UTC [1]: STATEMENT:  UPDATE deadlock_probe SET id = id WHERE id = 1
       """
     When the collector snapshots the segment
-    Then section 1_022_001 has a row with pattern = "deadlock detected":
+    Then section pg_log_errors has a row with pattern = "deadlock detected":
       | severity  | 0                                                                                                                                              |
       | category  | 0                                                                                                                                              |
       | count     | 1                                                                                                                                              |
@@ -75,10 +75,10 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:03:02 UTC [1]: LOG:  checkpoints are occurring too frequently (3 seconds apart)
       """
     When the collector snapshots the segment
-    Then section 1_022_001 is absent from the segment
-    And section 1_024_001 has a row with phase = 0:
+    Then section pg_log_errors is absent from the segment
+    And section pg_log_checkpoints has a row with phase = 0:
       | reason | time |
-    And section 1_024_001 has a row with phase = 1:
+    And section pg_log_checkpoints has a row with phase = 1:
       | buffers_written | 128    |
       | write_ms        | 1234.0 |
       | sync_ms         | 56.0   |
@@ -91,7 +91,7 @@ Feature: PostgreSQL log-domain stderr fixtures
       | estimate_kb     | 8192   |
       | longest_sync_ms | 40.0   |
       | average_sync_ms | 8.0    |
-    And section 1_024_001 has a row with phase = 2:
+    And section pg_log_checkpoints has a row with phase = 2:
       | seconds_apart | 3 |
 
   @pg16 @serial
@@ -105,8 +105,8 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:04:03 UTC [1]: LOG:  duration: 10.000 ms
       """
     When the collector snapshots the segment
-    Then section 1_022_001 is absent from the segment
-    And section 1_026_001 has a row with pattern = SELECT * FROM slow_table WHERE id = ...:
+    Then section pg_log_errors is absent from the segment
+    And section pg_log_slow_queries has a row with pattern = SELECT * FROM slow_table WHERE id = ...:
       | count             | 2          |
       | max_duration_ms   | 1500.25    |
       | total_duration_ms | 2000.25    |
@@ -132,9 +132,9 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:06:02 UTC [1]: LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
       """
     When the collector snapshots the segment
-    Then section 1_022_001 is absent from the segment
-    And section 1_025_001 has 2 rows
-    And section 1_025_001 has a row with relation = mydb.public.orders:
+    Then section pg_log_errors is absent from the segment
+    And section pg_log_autovacuum has 2 rows
+    And section pg_log_autovacuum has a row with relation = mydb.public.orders:
       | kind                       | 0      |
       | index_scans                | 1      |
       | pages_removed              | 10     |
@@ -154,7 +154,7 @@ Feature: PostgreSQL log-domain stderr fixtures
       | wal_fpi                    | 2      |
       | wal_bytes                  | 4096   |
       | dict_dropped_fields        | 0      |
-    And section 1_025_001 has a row with relation = tpl-service.bucket_90.posting_sender:
+    And section pg_log_autovacuum has a row with relation = tpl-service.bucket_90.posting_sender:
       | kind                      | 1      |
       | pages_removed             | null   |
       | tuples_removed            | null   |
@@ -185,9 +185,9 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:07:01 UTC [70]: LOG:  process 70 acquired ShareLock on transaction 12345678 after 30010.004 ms
       """
     When the collector snapshots the segment
-    Then section 1_022_001 is absent from the segment
-    And section 1_027_001 has 2 rows
-    And section 1_027_001 has a row with kind = 0:
+    Then section pg_log_errors is absent from the segment
+    And section pg_log_lock_waits has 2 rows
+    And section pg_log_lock_waits has a row with kind = 0:
       | pid          | 70                                                                                                      |
       | lock_mode    | ShareLock                                                                                               |
       | lock_target  | transaction 12345678                                                                                    |
@@ -196,7 +196,7 @@ Feature: PostgreSQL log-domain stderr fixtures
       | context      | while updating tuple (0,1) in relation "accounts" during lock wait probe                                |
       | statement    | UPDATE accounts SET balance = balance + 1 WHERE id = 1 RETURNING balance                                |
       | dict_dropped_fields | 0                                                                                                 |
-    And section 1_027_001 has a row with kind = 1:
+    And section pg_log_lock_waits has a row with kind = 1:
       | pid                 | 70                   |
       | lock_mode           | ShareLock            |
       | lock_target         | transaction 12345678 |
@@ -219,13 +219,13 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:08:03 UTC [1]: LOG:  temporary file: path "base/pgsql_tmp/pgsql_tmp15967.1", size 0
       """
     When the collector snapshots the segment
-    Then section 1_022_001 is absent from the segment
-    And section 1_030_001 has 2 rows
-    And section 1_030_001 has a row with path = base/pgsql_tmp/pgsql_tmp15967.0:
+    Then section pg_log_errors is absent from the segment
+    And section pg_log_temp_files has 2 rows
+    And section pg_log_temp_files has a row with path = base/pgsql_tmp/pgsql_tmp15967.0:
       | size_bytes          | 200204288                                         |
       | statement           | SELECT * FROM big_sort ORDER BY payload LIMIT 100 |
       | dict_dropped_fields | 0                                                 |
-    And section 1_030_001 has a row with path = base/pgsql_tmp/pgsql_tmp15967.1:
+    And section pg_log_temp_files has a row with path = base/pgsql_tmp/pgsql_tmp15967.1:
       | size_bytes          | 0    |
       | statement           | null |
       | dict_dropped_fields | 0    |
@@ -242,17 +242,17 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:05:02 UTC [1]: LOG:  database system is ready to accept connections
       """
     When the collector snapshots the segment
-    Then section 1_022_001 has a row with pattern = "server process (...) was terminated by signal ...: Killed":
+    Then section pg_log_errors has a row with pattern = "server process (...) was terminated by signal ...: Killed":
       | severity | 4 |
       | category | 4 |
       | count    | 1 |
-    And section 1_028_001 has a row with kind = 0:
+    And section pg_log_lifecycle has a row with kind = 0:
       | pid          | 4242                                         |
       | signal       | 9                                            |
       | query_detail | SELECT pg_sleep(10) FROM lifecycle_probe    |
-    And section 1_028_001 has a row with kind = 1:
+    And section pg_log_lifecycle has a row with kind = 1:
       | shutdown_mode | fast |
-    And section 1_028_001 has a row with kind = 2:
+    And section pg_log_lifecycle has a row with kind = 2:
       | message | database system is ready to accept connections |
 
   @pg16 @serial
@@ -280,10 +280,10 @@ Feature: PostgreSQL log-domain stderr fixtures
       2026-07-05 12:09:08 UTC [1]: СООБЩЕНИЕ:  система БД готова принимать подключения
       """
     When the collector snapshots the segment
-    Then section 1_024_001 has 2 rows
-    And section 1_024_001 has a row with phase = 0:
+    Then section pg_log_checkpoints has 2 rows
+    And section pg_log_checkpoints has a row with phase = 0:
       | reason | time |
-    And section 1_024_001 has a row with phase = 1:
+    And section pg_log_checkpoints has a row with phase = 1:
       | buffers_written | 128    |
       | write_ms        | 1234.0 |
       | sync_ms         | 56.0   |
@@ -296,12 +296,12 @@ Feature: PostgreSQL log-domain stderr fixtures
       | estimate_kb     | 8192   |
       | longest_sync_ms | 40.0   |
       | average_sync_ms | 8.0    |
-    And section 1_026_001 has a row with pattern = SELECT * FROM slow_table WHERE id = ...:
+    And section pg_log_slow_queries has a row with pattern = SELECT * FROM slow_table WHERE id = ...:
       | count             | 1                                      |
       | max_duration_ms   | 1500.25                                |
       | total_duration_ms | 1500.25                                |
       | sample            | SELECT * FROM slow_table WHERE id = 42 |
-    And section 1_025_001 has a row with relation = mydb.public.orders:
+    And section pg_log_autovacuum has a row with relation = mydb.public.orders:
       | kind                      | 0      |
       | index_scans               | 1      |
       | pages_removed             | 10     |
@@ -320,24 +320,24 @@ Feature: PostgreSQL log-domain stderr fixtures
       | wal_records               | 15     |
       | wal_fpi                   | 2      |
       | wal_bytes                 | 4096   |
-    And section 1_027_001 has a row with kind = 0:
+    And section pg_log_lock_waits has a row with kind = 0:
       | pid         | 70                   |
       | lock_mode   | ShareLock            |
       | lock_target | transaction 12345678 |
       | duration_ms | 30009.004            |
       | statement   | UPDATE accounts SET balance = balance + 1 WHERE id = 1 |
-    And section 1_030_001 has a row with path = base/pgsql_tmp/pgsql_tmp15967.2:
+    And section pg_log_temp_files has a row with path = base/pgsql_tmp/pgsql_tmp15967.2:
       | size_bytes | 200204288                                  |
       | statement  | SELECT * FROM big_sort ORDER BY payload    |
-    And section 1_022_001 has a row with pattern = "процесс сервера (...) был завершён по сигналу ...: Killed":
+    And section pg_log_errors has a row with pattern = "процесс сервера (...) был завершён по сигналу ...: Killed":
       | severity | 4 |
       | category | 4 |
       | count    | 1 |
-    And section 1_028_001 has a row with kind = 0:
+    And section pg_log_lifecycle has a row with kind = 0:
       | pid          | 4242                                      |
       | signal       | 9                                         |
       | query_detail | SELECT pg_sleep(10)                      |
-    And section 1_028_001 has a row with kind = 1:
+    And section pg_log_lifecycle has a row with kind = 1:
       | shutdown_mode | smart |
-    And section 1_028_001 has a row with kind = 2:
+    And section pg_log_lifecycle has a row with kind = 2:
       | message | система БД готова принимать подключения |
