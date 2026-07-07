@@ -13,7 +13,7 @@ use std::time::Duration;
 use kronika_writer::FlushSummary;
 
 use crate::scheduler::SourceKind;
-use crate::{user_indexes_type_id, user_tables_type_id};
+use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogLevel {
@@ -533,6 +533,27 @@ pub(crate) fn log_collection_failure(
             field("source", source),
             field("error", err),
             field("elapsed_ms", duration_ms(elapsed)),
+        ],
+    );
+}
+
+pub(crate) fn log_count_degraded(
+    type_id: u32,
+    source: &'static str,
+    reason: &'static str,
+    count: usize,
+) {
+    let [collection, type_id, layout_id] = section_fields(type_id);
+    log_event(
+        LogLevel::Warn,
+        "collection_degraded",
+        &[
+            collection,
+            type_id,
+            layout_id,
+            field("source", source),
+            field("reason", reason),
+            field("count", count),
         ],
     );
 }
