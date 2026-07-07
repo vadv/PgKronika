@@ -1104,6 +1104,7 @@ dependencies = [
  "crc",
  "proptest",
  "sha2 0.10.9",
+ "tempfile",
  "xxhash-rust",
 ]
 

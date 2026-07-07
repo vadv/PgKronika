@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 // Dev-dependency of other test targets; anchored for the
 // `unused_crate_dependencies` lint, which checks each target separately.
 use crc as _;
+use tempfile as _;
 use xxhash_rust as _;
 
 const BLOB_THRESHOLD: usize = 8;
