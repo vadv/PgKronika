@@ -14,6 +14,7 @@ use proptest::prelude::*;
 // `unused_crate_dependencies` lint, which checks each target separately.
 use crc as _;
 use sha2 as _;
+use tempfile as _;
 use xxhash_rust as _;
 
 const fn limits() -> JournalLimits {

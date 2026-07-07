@@ -18,12 +18,15 @@ mod catalog;
 mod crc;
 mod dictionary;
 mod parts;
+mod read_at;
 mod str_id;
 
-// proptest is used by tests/property.rs only; anchored for the
+// proptest and tempfile are used by external test files only; anchored for the
 // `unused_crate_dependencies` lint, which checks each target separately.
 #[cfg(test)]
 use proptest as _;
+#[cfg(test)]
+use tempfile as _;
 
 pub use catalog::{Catalog, DecodeError, ENTRY_LEN, Entry, META_LEN, TAIL_INDEX_LEN, TailIndex};
 pub use crc::crc32c;
@@ -37,6 +40,7 @@ pub use parts::{
     FrameHeader, JournalLimits, PartError, PartMeta, PartRef, ScanReport, SectionInput, build_part,
     scan_journal, validate_part, validate_part_catalog,
 };
+pub use read_at::ReadAt;
 pub use str_id::StrId;
 
 /// Segment magic bytes.
