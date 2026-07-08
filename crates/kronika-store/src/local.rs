@@ -621,12 +621,12 @@ mod tests {
         );
     }
 
-    // scan_journal_reader returns partial active + warning when the streaming
-    // scan succeeds (found one part) but the per-part body re-read hits
-    // UnexpectedEof (file shrank between the streaming scan and the read_exact_at
-    // in our loop — TOCTOU race with a concurrent seal/reset).
+    // scan_journal_reader stays non-fatal when the streaming scan hits
+    // UnexpectedEof on a LATER frame's body (a second frame whose body extends
+    // past the shrunken journal): the streaming-scan error is caught, a warning
+    // is emitted, and the caller still continues to the sealed-file pass.
     #[test]
-    fn scan_concurrent_truncation_after_streaming_scan() {
+    fn scan_survives_journal_truncated_at_second_frame() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("active.parts");
 
@@ -673,6 +673,71 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.path == journal_path),
             "scan must warn about the truncated journal"
+        );
+    }
+
+    // A mock ReadAt that serves each offset once, then returns UnexpectedEof on
+    // any re-read of the same offset — simulating the journal shrinking AFTER
+    // the streaming scan validated a part but BEFORE scan_journal_reader's own
+    // per-part re-read (the second stale-catch point, inside the loop).
+    struct ShrinksAfterScan {
+        data: Vec<u8>,
+        seen: std::cell::RefCell<std::collections::HashSet<u64>>,
+    }
+
+    impl ReadAt for ShrinksAfterScan {
+        fn byte_len(&self) -> io::Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            if !self.seen.borrow_mut().insert(offset) {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            let end = start.saturating_add(buf.len());
+            if end > self.data.len() {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            buf.copy_from_slice(&self.data[start..end]);
+            Ok(())
+        }
+    }
+
+    // Exercises the per-part-loop stale-catch: the streaming scan validates one
+    // part (first read of each offset), then the loop's own read_exact_at of the
+    // part body hits UnexpectedEof (second read of that offset). The part is
+    // dropped with a warning and the scan does not fail.
+    #[test]
+    fn scan_survives_journal_shrink_after_streaming_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        let p = part(2000, 7);
+        let mut data = Vec::new();
+        data.extend_from_slice(
+            &FrameHeader {
+                part_len: p.len() as u64,
+            }
+            .encode(),
+        );
+        data.extend_from_slice(&p);
+        let mock = ShrinksAfterScan {
+            data,
+            seen: std::cell::RefCell::new(std::collections::HashSet::new()),
+        };
+
+        let local = LocalDir::open(dir.path()).unwrap();
+        let mut warnings = Vec::new();
+        let (active, _damages) = local
+            .scan_journal_reader(&mock, &journal_path, &mut warnings)
+            .expect("scan must not fail fatally when the per-part re-read hits EOF");
+
+        assert!(
+            active.is_empty(),
+            "the part must be dropped when its per-part re-read fails"
+        );
+        assert!(
+            warnings.iter().any(|w| w.path == journal_path),
+            "a warning must reference the journal path"
         );
     }
 }
