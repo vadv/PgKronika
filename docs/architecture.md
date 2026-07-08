@@ -119,11 +119,11 @@ SIGTERM/INT  мягкое завершение: сброс буферов → з
 │              слой аутентификации               │
 │                    ▼                            │
 │                ядро чтения                      │
-│   каталог сегментов, чтение хвостов,            │
-│   LRU словарей и str_id, детализация, сравнение │
+│   PgmUnit + LocalDirSnapshot: sealed-сегменты   │
+│   + live active.parts, dedup, Dictionary        │
 │                    ▼                            │
-│   SegmentStore: LocalDir | FileSet |            │
-│                 DaemonHttp | S3                 │
+│   LocalDir: storage-access (сейчас реализован)  │
+│   DaemonHttp / S3: не реализованы (отложены)   │
 │                                                 │
 │  :8688  + API диапазонного чтения сегментов     │
 │         из локального хранилища                 │
@@ -247,10 +247,17 @@ crates/
 │                       семантики; декодеры всех версий
 ├── kronika-writer      интернер, буферы, журнал частей,
 │                       слияние и запечатывание
-├── kronika-store       trait SegmentStore + LocalDir + FileSet
-├── kronika-store-http  DaemonHttp-клиент диапазонного чтения
-├── kronika-store-s3    object_store + rustls
-├── kronika-reader      каталог сегментов, чтение хвостов, LRU, детализация
+├── kronika-store       storage-access над локальным каталогом: список sealed *.pgm
+│                       (дешёвый хвостовой read каталога без декода секций) +
+│                       потоковый скан active.parts (one-part-at-a-time, bounded).
+│                       Зависит только от kronika-format. Декодирование секций —
+│                       в kronika-reader. Backends DaemonHttp / S3 не реализованы
+│                       (отложены).
+├── kronika-reader      ядро чтения: PgmUnit — единый декод PGM-контейнера через
+│                       ReadAt (sealed File или in-memory part &[u8]);
+│                       LocalDirSnapshot — sealed-сегменты + live-части
+│                       active.parts с dedup частей, покрытых sealed-сегментом.
+│                       Зависит от kronika-store + kronika-registry + kronika-format.
 ├── kronika-diff        скорости, восстановление baseline, reset-правила
 ├── kronika-charts      формулы класса 10: один код для запечатывания, /metrics
 │                       и пересчёта старой истории в web
@@ -262,15 +269,20 @@ crates/
 Зависимости исполняемых файлов задаются жёстко и проверяются в CI:
 
 ```text
-collector → writer, source-*, charts, registry      [запрещён store-s3]
-web       → reader, diff, charts, store-*, mcp      [запрещены source-*]
-archiver  → store-s3, format                        [запрещён registry]
+collector → writer, source-*, charts, registry      [запрещены reader, store]
+web       → reader, diff, charts, store, mcp        [запрещены source-*]
+archiver  → store, format                           [запрещён registry]
 dump      → format, registry, reader, diff, store
 ```
 
 Смысл правил: S3-код и ключи доступа не попадают в привилегированный процесс;
-PostgreSQL-клиент не попадает в веб-процесс; архиватор не требует пересборки при
-добавлении типов.
+PostgreSQL-клиент не попадает в веб-процесс; архиватор использует
+kronika-store только для storage-access и не требует пересборки при добавлении
+типов (декодирование секций ему не нужно). Коллектор не тянет ни
+kronika-reader, ни kronika-store.
+
+Когда появятся backends DaemonHttp и S3, правила для web/archiver
+расширятся на kronika-store-http и kronika-store-s3 соответственно.
 
 ## 8. Версионирование
 
