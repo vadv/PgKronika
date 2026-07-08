@@ -459,17 +459,33 @@ pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
 /// Scan a journal source frame by frame, keeping peak memory to one part body.
 ///
 /// Produces a [`ScanReport`] identical to `scan_journal` over the same bytes.
-/// `resync_chunk` is the read-window size used when searching past damage;
-/// the caller controls it so tests can exercise small windows.
+///
+/// `resync_chunk` is the caller-owned read-window size used when searching past
+/// damage. The window allocation is proportional to `resync_chunk`; a value of
+/// `1 << 20` (1 MiB) is a reasonable default. Must be greater than zero.
 ///
 /// # Errors
 ///
+/// Returns [`io::ErrorKind::InvalidInput`] when `resync_chunk` is zero.
 /// Returns an I/O error if `reader` fails on any read or on `byte_len`.
 pub fn scan_journal_streaming<R: ReadAt>(
     reader: &R,
     limits: JournalLimits,
     resync_chunk: usize,
 ) -> io::Result<ScanReport> {
+    if resync_chunk == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resync_chunk must be greater than zero",
+        ));
+    }
+    let overlap = FRAME_MAGIC.len() - 1;
+    resync_chunk.checked_add(overlap).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resync_chunk + overlap overflows usize",
+        )
+    })?;
     let total_len = usize::try_from(reader.byte_len()?).map_err(|_overflow| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -754,6 +770,15 @@ mod streaming_tests {
         let got =
             scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn resync_chunk_zero_returns_invalid_input() {
+        let p = sample_part();
+        let buf = framed(&[&p]);
+        let err = scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 0)
+            .expect_err("resync_chunk=0 must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
 

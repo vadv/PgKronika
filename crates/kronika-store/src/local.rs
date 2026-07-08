@@ -61,48 +61,49 @@ impl LocalDir {
         // journal copy before reset; after seal, the later sealed-file scan
         // finds the .pgm copy and the snapshot layer deduplicates.
         let journal_path = self.root.join("active.parts");
-        let (active, damages) = if journal_path.exists() {
-            let file = File::open(&journal_path)?;
-            let report = scan_journal_streaming(&file, JournalLimits::default(), 1 << 20)?;
+        let (active, damages) = match File::open(&journal_path) {
+            Ok(file) => {
+                let report = scan_journal_streaming(&file, JournalLimits::default(), 1 << 20)?;
 
-            let mut active_parts = Vec::new();
-            for part_ref in report.parts {
-                // Keep allocation bounded even if scanner limits change.
-                if part_ref.len as u64 > DEFAULT_MAX_PART_LEN {
-                    warnings.push(StoreWarning {
-                        path: journal_path.clone(),
-                        reason: format!(
-                            "part at offset {} claims len {} which exceeds DEFAULT_MAX_PART_LEN",
-                            part_ref.offset, part_ref.len
-                        ),
-                    });
-                    continue;
+                let mut active_parts = Vec::new();
+                for part_ref in report.parts {
+                    // Keep allocation bounded even if scanner limits change.
+                    if part_ref.len as u64 > DEFAULT_MAX_PART_LEN {
+                        warnings.push(StoreWarning {
+                            path: journal_path.clone(),
+                            reason: format!(
+                                "part at offset {} claims len {} which exceeds DEFAULT_MAX_PART_LEN",
+                                part_ref.offset, part_ref.len
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // Read one bounded part to attach its catalog to the scan result.
+                    let mut buf = vec![0_u8; part_ref.len];
+                    file.read_exact_at(&mut buf, part_ref.offset as u64)?;
+
+                    // The streaming scanner already checked section CRCs. Re-checking
+                    // the catalog keeps the scan result self-contained; a mismatch is
+                    // reported instead of silently dropping the part.
+                    match validate_part_catalog(&buf) {
+                        Ok(catalog) => active_parts.push(ActivePart {
+                            part: part_ref,
+                            catalog,
+                        }),
+                        Err(err) => warnings.push(StoreWarning {
+                            path: journal_path.clone(),
+                            reason: format!(
+                                "part at offset {} passed scanner but failed catalog decode: {err}",
+                                part_ref.offset
+                            ),
+                        }),
+                    }
                 }
-
-                // Read one bounded part to attach its catalog to the scan result.
-                let mut buf = vec![0_u8; part_ref.len];
-                file.read_exact_at(&mut buf, part_ref.offset as u64)?;
-
-                // The streaming scanner already checked section CRCs. Re-checking
-                // the catalog keeps the scan result self-contained; a mismatch is
-                // reported instead of silently dropping the part.
-                match validate_part_catalog(&buf) {
-                    Ok(catalog) => active_parts.push(ActivePart {
-                        part: part_ref,
-                        catalog,
-                    }),
-                    Err(err) => warnings.push(StoreWarning {
-                        path: journal_path.clone(),
-                        reason: format!(
-                            "part at offset {} passed scanner but failed catalog decode: {err}",
-                            part_ref.offset
-                        ),
-                    }),
-                }
+                (active_parts, report.damages)
             }
-            (active_parts, report.damages)
-        } else {
-            (Vec::new(), Vec::new())
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
+            Err(err) => return Err(err),
         };
 
         // A part sealed after the journal scan appears in the sealed-file pass.
