@@ -1115,6 +1115,7 @@ dependencies = [
  "arrow-array",
  "kronika-format",
  "kronika-registry",
+ "kronika-store",
  "kronika-writer",
  "parquet",
  "tempfile",

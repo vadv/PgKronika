@@ -2,7 +2,10 @@
 //!
 //! Open the end catalog, then read section bodies by catalog range.
 
+mod snapshot;
 mod unit;
+
+pub use snapshot::{LocalDirSnapshot, UnitMeta};
 
 use std::collections::HashMap;
 use std::error::Error;
