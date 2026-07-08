@@ -1,5 +1,15 @@
 //! Segment storage abstractions.
 //!
-//! This crate will define the common segment-store API and local
-//! implementations such as directory-backed storage and explicit file sets.
-//! Public API docs will be added here as the crate is implemented.
+//! This crate provides read-only access to a local directory of PGM segments.
+//! It lists sealed `.pgm` files, decodes their end catalogs cheaply (tail read
+//! only, no section bodies), and streams valid parts from the `active.parts`
+//! journal without loading the whole file.
+//!
+//! The crate intentionally depends only on `kronika-format`. Section decoding
+//! lives in `kronika-reader`.
+
+mod local;
+mod source;
+
+pub use local::{LocalDir, read_catalog};
+pub use source::{ActivePart, LocalScan, SealedUnit, StoreError, StoreWarning};
