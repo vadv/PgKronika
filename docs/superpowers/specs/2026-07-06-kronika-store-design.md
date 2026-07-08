@@ -106,16 +106,18 @@ scan continues with other files.
 
 - sealed units first;
 - live parts after sealed units;
-- live parts dropped when a sealed unit with the same `source_id` fully covers
-  `[min_ts, max_ts]`.
+- live parts dropped only when their catalog exactly matches a sealed unit
+  catalog.
 
-`LocalDirSnapshot` exposes unit metadata and per-unit decode. It does not merge
-rows across units or provide cursor paging.
+`LocalDirSnapshot` exposes unit metadata, scan warnings, journal damages, and
+per-unit decode. It does not merge rows across units or provide cursor paging.
 
 ## Memory Bounds
 
 - Journal scan reads one part body at a time.
 - `JournalLimits::max_part_len` caps part allocation.
+- `LocalDir::read_active_part` rejects cached active part references above
+  `DEFAULT_MAX_PART_LEN` before allocation.
 - `read_catalog` caps the catalog block before allocation.
 - `PgmUnit::decode` caps section bodies with `MAX_SECTION_BYTES`.
 - Store does not load sealed section bodies during discovery.

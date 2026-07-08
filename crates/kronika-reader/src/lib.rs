@@ -5,11 +5,13 @@
 //! `&[u8]`.
 //!
 //! [`LocalDirSnapshot`] combines sealed segments with live `active.parts`
-//! entries and drops live parts already covered by a sealed segment.
+//! entries, suppresses exact sealed/live duplicates, and exposes scan
+//! diagnostics.
 
 mod snapshot;
 mod unit;
 
+pub use kronika_format::DamageRegion;
 pub use snapshot::{LocalDirSnapshot, UnitMeta};
 
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ use kronika_format::{Catalog, DecodeError, Entry};
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_ROWS,
 };
+use kronika_store::StoreError;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 pub use unit::PgmUnit;
@@ -82,6 +85,8 @@ pub enum ReadError {
     /// A section failed CRC verification or decoding; a malformed dictionary
     /// section (bad Parquet, missing columns) arrives here too.
     Codec(CodecError),
+    /// The store rejected a local snapshot item before segment decode.
+    Store(StoreError),
     /// The active part's catalog changed between snapshot time and decode time.
     ///
     /// Callers must call `refresh()` and retry.
@@ -115,6 +120,7 @@ impl fmt::Display for ReadError {
             Self::Catalog(err) => write!(f, "segment catalog: {err}"),
             Self::SectionTooLarge { len } => write!(f, "section of {len} bytes is above the cap"),
             Self::Codec(err) => write!(f, "section decode: {err}"),
+            Self::Store(err) => write!(f, "store read: {err}"),
             Self::StaleSnapshot { unit_idx } => {
                 write!(
                     f,
@@ -131,6 +137,7 @@ impl Error for ReadError {
             Self::Io(err) => Some(err),
             Self::Tail(err) | Self::Catalog(err) => Some(err),
             Self::Codec(err) => Some(err),
+            Self::Store(err) => Some(err),
             Self::TooSmall { .. }
             | Self::BadMagic { .. }
             | Self::UnsupportedFormat { .. }

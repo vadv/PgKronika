@@ -49,11 +49,18 @@ pub struct StoreWarning {
     pub reason: String,
 }
 
-/// Why `read_catalog` failed.
+/// Why a storage read failed.
 #[derive(Debug)]
 pub enum StoreError {
     /// An I/O error occurred while reading the file.
     Io(std::io::Error),
+    /// A journal part declares a body larger than the reader accepts.
+    ActivePartTooLarge {
+        /// Claimed active part body size, bytes.
+        len: usize,
+        /// Maximum accepted active part body size, bytes.
+        max: u64,
+    },
     /// The source is too short to contain a tail index.
     TooSmall,
     /// The first four bytes are not the PGM magic.
@@ -75,6 +82,12 @@ impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(err) => write!(f, "I/O error: {err}"),
+            Self::ActivePartTooLarge { len, max } => {
+                write!(
+                    f,
+                    "active part of {len} bytes exceeds the part limit of {max}"
+                )
+            }
             Self::TooSmall => write!(f, "source is too small for a PGM segment"),
             Self::BadMagic => write!(f, "source does not start with PGM1 magic"),
             Self::UnsupportedFormat { version } => {
@@ -92,7 +105,8 @@ impl std::error::Error for StoreError {
         match self {
             Self::Io(err) => Some(err),
             Self::Catalog(err) => Some(err),
-            Self::TooSmall
+            Self::ActivePartTooLarge { .. }
+            | Self::TooSmall
             | Self::BadMagic
             | Self::UnsupportedFormat { .. }
             | Self::BadCatalogLen

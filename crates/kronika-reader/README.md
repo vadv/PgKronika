@@ -5,7 +5,8 @@
 `kronika-reader` is the read core for PGM segments. `PgmUnit` decodes a PGM
 container over any `ReadAt` source — a sealed file or an in-memory journal part —
 through a single path. `LocalDirSnapshot` combines sealed segments with live
-`active.parts` entries and drops live parts already covered by a sealed segment.
+`active.parts` entries, suppresses exact sealed/live duplicates, and exposes
+scan diagnostics.
 
 ## Opening a Segment
 
@@ -34,6 +35,16 @@ are CRC-checked and use the same row and row-group limits as data sections.
 with `full_len` and `truncated`. That keeps a stored prefix distinct from the
 original full value. If the same id appears as both a string and a blob across
 parts, the blob wins.
+
+## Local Directory Snapshots
+
+`LocalDirSnapshot::units()` returns sealed units first and then live journal
+parts. A live part is hidden only when its catalog exactly matches a sealed unit
+catalog. Time-range overlap does not prove that the live part was finalized.
+
+`warnings()` returns skipped-file and skipped-part warnings. `damages()` returns
+typed `DamageRegion` values for corrupt `active.parts` byte ranges; valid parts
+around a damaged region remain visible.
 
 ## Scope Boundaries
 

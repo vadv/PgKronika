@@ -121,9 +121,17 @@ impl LocalDir {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the journal file cannot be opened or the part
-    /// bytes cannot be read.
-    pub fn read_active_part(&self, p: &ActivePart) -> io::Result<Vec<u8>> {
+    /// Returns [`StoreError::ActivePartTooLarge`] if the cached part reference
+    /// exceeds the active part cap, or [`StoreError::Io`] if the journal file
+    /// cannot be opened or the part bytes cannot be read.
+    pub fn read_active_part(&self, p: &ActivePart) -> Result<Vec<u8>, StoreError> {
+        let part_len = u64::try_from(p.part.len).unwrap_or(u64::MAX);
+        if part_len > DEFAULT_MAX_PART_LEN {
+            return Err(StoreError::ActivePartTooLarge {
+                len: p.part.len,
+                max: DEFAULT_MAX_PART_LEN,
+            });
+        }
         let journal_path = self.root.join("active.parts");
         let file = File::open(journal_path)?;
         let mut buf = vec![0_u8; p.part.len];
@@ -523,6 +531,35 @@ mod tests {
         assert_eq!(catalog.source_id, 42);
     }
 
+    #[test]
+    fn read_active_part_rejects_oversized_ref_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("active.parts"), b"").unwrap();
+        let catalog = read_catalog(&part(1000, 42).as_slice()).expect("catalog");
+        let oversized_len = usize::try_from(DEFAULT_MAX_PART_LEN).expect("part cap fits usize") + 1;
+        let active = ActivePart {
+            part: kronika_format::PartRef {
+                offset: FRAME_HEADER_LEN,
+                len: oversized_len,
+            },
+            catalog,
+        };
+
+        let err = LocalDir::open(dir.path())
+            .unwrap()
+            .read_active_part(&active)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::ActivePartTooLarge { len, max }
+                    if len == oversized_len && max == DEFAULT_MAX_PART_LEN
+            ),
+            "oversized active part must be rejected before allocation"
+        );
+    }
+
     // --- scan() behavioral tests ---
 
     #[test]
@@ -559,6 +596,33 @@ mod tests {
         let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
         assert_eq!(scan.sealed.len(), 1, "good segment still served");
         assert_eq!(scan.warnings.len(), 1, "bad segment produces one warning");
+    }
+
+    #[test]
+    fn scan_keeps_sealed_when_active_journal_has_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("1000.pgm"), part(1000, 7)).unwrap();
+        let unfinished_part = part(2000, 7);
+        fs::write(
+            dir.path().join("active.parts"),
+            FrameHeader {
+                part_len: u64::try_from(unfinished_part.len()).expect("part length fits u64"),
+            }
+            .encode(),
+        )
+        .unwrap();
+
+        let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
+        assert_eq!(scan.sealed.len(), 1, "sealed discovery must still run");
+        assert!(
+            scan.active.is_empty(),
+            "unfinished live frame must not become active"
+        );
+        assert_eq!(scan.damages.len(), 1, "torn live frame must be reported");
+        assert!(
+            scan.warnings.is_empty(),
+            "torn tail is typed damage, not a file warning"
+        );
     }
 
     // A mock ReadAt that claims a large byte_len but returns UnexpectedEof on

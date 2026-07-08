@@ -1,15 +1,15 @@
 //! Read view over sealed files and active journal parts.
 //!
 //! Combines `LocalDir`'s sealed `.pgm` segments and `active.parts` journal into
-//! one list, drops active parts that a sealed unit already covers, and decodes
-//! both through `PgmUnit`.
+//! one list, suppresses exact sealed/live duplicates, and decodes both through
+//! `PgmUnit`.
 
 use std::io;
 use std::path::Path;
 
-use kronika_format::Catalog;
+use kronika_format::{Catalog, DamageRegion};
 use kronika_registry::DecodedSection;
-use kronika_store::{LocalDir, LocalScan, StoreWarning};
+use kronika_store::{LocalDir, LocalScan, StoreError, StoreWarning};
 
 use crate::{PgmUnit, ReadError};
 
@@ -37,8 +37,8 @@ enum Handle {
 ///
 /// `open` calls `LocalDir::scan` with journal-first ordering. A part in the seal
 /// window is visible either from `active.parts` before reset or from a sealed
-/// `.pgm` after seal. `units()` drops an active part whose `[min_ts, max_ts]`
-/// range is fully covered by a sealed unit with the same `source_id`.
+/// `.pgm` after seal. `units()` drops an active part only when its catalog
+/// exactly matches a sealed unit catalog.
 #[derive(Debug)]
 pub struct LocalDirSnapshot {
     dir: LocalDir,
@@ -73,11 +73,21 @@ impl LocalDirSnapshot {
         &self.scan.warnings
     }
 
+    /// Damaged byte ranges found while scanning `active.parts`.
+    ///
+    /// These ranges describe journal bytes the frame scanner could not validate.
+    /// Valid parts before or after a damaged region remain visible through
+    /// [`units`](Self::units).
+    #[must_use]
+    pub fn damages(&self) -> &[DamageRegion] {
+        &self.scan.damages
+    }
+
     /// Deduplicated list of units visible in this snapshot.
     ///
     /// Sealed units appear first, then surviving live parts. An active part is
-    /// omitted when a sealed unit of the same `source_id` covers its entire
-    /// `[min_ts, max_ts]` range.
+    /// omitted only when a sealed unit has the same catalog. Time-range overlap
+    /// is not enough to prove that a live part was sealed.
     #[must_use]
     pub fn units(&self) -> Vec<UnitMeta> {
         self.handles()
@@ -160,13 +170,14 @@ impl LocalDirSnapshot {
                 })?;
                 let bytes = match self.dir.read_active_part(ap) {
                     Ok(b) => b,
-                    Err(err)
+                    Err(StoreError::Io(err))
                         if err.kind() == io::ErrorKind::NotFound
                             || err.kind() == io::ErrorKind::UnexpectedEof =>
                     {
                         return Err(ReadError::StaleSnapshot { unit_idx: idx });
                     }
-                    Err(err) => return Err(ReadError::Io(err)),
+                    Err(StoreError::Io(err)) => return Err(ReadError::Io(err)),
+                    Err(err) => return Err(ReadError::Store(err)),
                 };
                 let unit = PgmUnit::open(bytes.as_slice())?;
                 if unit.catalog() != &ap.catalog {
@@ -186,13 +197,7 @@ impl LocalDirSnapshot {
             .active
             .iter()
             .enumerate()
-            .filter(|(_, ap)| {
-                let ac = &ap.catalog;
-                !self.scan.sealed.iter().any(|su| {
-                    let sc = &su.catalog;
-                    sc.source_id == ac.source_id && sc.min_ts <= ac.min_ts && ac.max_ts <= sc.max_ts
-                })
-            })
+            .filter(|(_, ap)| !self.scan.sealed.iter().any(|su| su.catalog == ap.catalog))
             .map(|(i, _)| Handle::Active(i));
 
         sealed_iter.chain(active_iter)
@@ -256,20 +261,49 @@ mod tests {
     }
 
     #[test]
-    fn sealed_covering_part_is_deduped_no_double() {
+    fn exact_sealed_active_catalog_is_deduped_no_double() {
         let dir = tempfile::tempdir().unwrap();
         let part = make_part(1000, 2000, 42);
         // Write the same data as a sealed .pgm.
         fs::write(dir.path().join("1000.pgm"), &part).unwrap();
-        // And as an active part covering the same range.
+        // And as the exact same active part.
         let journal = framed(&part);
         fs::write(dir.path().join("active.parts"), &journal).unwrap();
 
         let snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let units = snap.units();
-        assert_eq!(units.len(), 1, "covered active part must be deduped");
+        assert_eq!(units.len(), 1, "exact active duplicate must be deduped");
         assert!(!units[0].live, "surviving unit must be the sealed one");
         assert_eq!(units[0].source_id, 42);
+    }
+
+    #[test]
+    fn overlapping_active_part_is_not_deduped_by_range_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = make_part(1000, 5000, 42);
+        let active = make_part(2000, 3000, 42);
+        fs::write(dir.path().join("1000.pgm"), &sealed).unwrap();
+        fs::write(dir.path().join("active.parts"), framed(&active)).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let units = snap.units();
+        assert_eq!(
+            units.len(),
+            2,
+            "range overlap must not hide a distinct live part"
+        );
+        assert!(
+            units
+                .iter()
+                .any(|u| !u.live && u.min_ts == 1000 && u.max_ts == 5000),
+            "sealed unit must remain visible"
+        );
+        assert!(
+            units
+                .iter()
+                .any(|u| u.live && u.min_ts == 2000 && u.max_ts == 3000),
+            "overlapping live unit must remain visible"
+        );
     }
 
     #[test]
@@ -294,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn middle_corruption_reported_rest_served() {
+    fn middle_corruption_reported_through_snapshot_api_rest_served() {
         let dir = tempfile::tempdir().unwrap();
         let part1 = make_part(1000, 2000, 1);
         let part2 = make_part(3000, 4000, 1);
@@ -307,7 +341,7 @@ mod tests {
         let units = snap.units();
         assert_eq!(units.len(), 2, "both valid parts must be visible");
         assert!(
-            !snap.scan.damages.is_empty(),
+            !snap.damages().is_empty(),
             "corrupt region must be recorded as a damage"
         );
     }
@@ -409,7 +443,7 @@ mod tests {
         assert_eq!(units.len(), 1);
         assert!(!units[0].live);
         assert!(snap.scan.active.is_empty());
-        assert!(snap.scan.damages.is_empty());
+        assert!(snap.damages().is_empty());
     }
 
     // When active.parts disappears (removed or truncated to zero) between
@@ -433,6 +467,26 @@ mod tests {
         assert!(
             matches!(err, ReadError::StaleSnapshot { unit_idx: 0 }),
             "removed journal must return StaleSnapshot, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_unit_active_zero_truncated_after_snapshot_returns_stale_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = make_part(1000, 2000, 7);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part)).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert_eq!(snap.units().len(), 1);
+        assert!(snap.units()[0].live);
+
+        fs::write(&journal_path, b"").unwrap();
+
+        let err = snap.decode_unit(0, 0).unwrap_err();
+        assert!(
+            matches!(err, ReadError::StaleSnapshot { unit_idx: 0 }),
+            "truncated journal must return StaleSnapshot, got: {err}"
         );
     }
 }
