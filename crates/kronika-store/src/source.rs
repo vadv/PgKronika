@@ -36,11 +36,11 @@ pub struct LocalScan {
     pub active: Vec<ActivePart>,
     /// Damaged journal regions from the `active.parts` scan.
     pub damages: Vec<DamageRegion>,
-    /// Sealed files that were skipped due to catalog errors.
+    /// Warnings emitted while scanning sealed files or active journal parts.
     pub warnings: Vec<StoreWarning>,
 }
 
-/// A storage unit that could not be read and was skipped.
+/// A storage item or live journal state that could not be read and was skipped.
 #[derive(Debug)]
 pub struct StoreWarning {
     /// Path of the file that triggered the warning.

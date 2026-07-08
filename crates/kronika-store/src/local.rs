@@ -136,10 +136,10 @@ impl LocalDir {
     ///
     /// A concurrent seal followed by `Journal::reset` can truncate the journal
     /// while the streaming scan or a per-part re-read is running; the resulting
-    /// `UnexpectedEof`/`NotFound` means the live journal shrank under us, not a
-    /// real failure. Such an error yields the parts read so far plus a warning,
-    /// so the caller still returns the sealed-file view. Other I/O errors
-    /// propagate.
+    /// `UnexpectedEof`/`NotFound` means the live journal shrank under us. During
+    /// the streaming scan this yields an empty live set; during per-part re-read
+    /// it yields the parts already attached. In both cases the sealed-file scan
+    /// still runs and a warning records the race. Other I/O errors propagate.
     #[expect(
         clippy::unused_self,
         reason = "method on LocalDir for API symmetry and unit-testing with a mock ReadAt"
