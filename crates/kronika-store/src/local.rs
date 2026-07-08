@@ -57,36 +57,10 @@ impl LocalDir {
         let mut sealed = Vec::new();
         let mut warnings = Vec::new();
 
-        // Collect and sort *.pgm file names deterministically.
-        // Per-entry I/O errors are recorded as warnings and skipped.
-        let mut pgm_paths: Vec<PathBuf> = Vec::new();
-        for entry_result in fs::read_dir(&self.root)? {
-            match entry_result {
-                Ok(entry) => {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("pgm") {
-                        pgm_paths.push(path);
-                    }
-                }
-                Err(err) => warnings.push(StoreWarning {
-                    path: self.root.clone(),
-                    reason: format!("read_dir entry error: {err}"),
-                }),
-            }
-        }
-        pgm_paths.sort();
-
-        for path in pgm_paths {
-            match read_catalog_from_path(&path) {
-                Ok(catalog) => sealed.push(SealedUnit { path, catalog }),
-                Err(err) => warnings.push(StoreWarning {
-                    path,
-                    reason: err.to_string(),
-                }),
-            }
-        }
-
-        // Scan active.parts if it exists.
+        // Scan active.parts FIRST so that a part mid-seal (journal reset but
+        // .pgm not yet written) is captured in `active` rather than lost.
+        // If a part has already been sealed by the time we list .pgm files,
+        // it appears in `sealed` and the snapshot layer deduplicates.
         let journal_path = self.root.join("active.parts");
         let (active, damages) = if journal_path.exists() {
             let file = File::open(&journal_path)?;
@@ -136,6 +110,35 @@ impl LocalDir {
         } else {
             (Vec::new(), Vec::new())
         };
+
+        // List sealed .pgm files AFTER the journal scan; a part sealed between
+        // the two reads appears in `sealed` (never in neither).
+        let mut pgm_paths: Vec<PathBuf> = Vec::new();
+        for entry_result in fs::read_dir(&self.root)? {
+            match entry_result {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("pgm") {
+                        pgm_paths.push(path);
+                    }
+                }
+                Err(err) => warnings.push(StoreWarning {
+                    path: self.root.clone(),
+                    reason: format!("read_dir entry error: {err}"),
+                }),
+            }
+        }
+        pgm_paths.sort();
+
+        for path in pgm_paths {
+            match read_catalog_from_path(&path) {
+                Ok(catalog) => sealed.push(SealedUnit { path, catalog }),
+                Err(err) => warnings.push(StoreWarning {
+                    path,
+                    reason: err.to_string(),
+                }),
+            }
+        }
 
         Ok(LocalScan {
             sealed,
