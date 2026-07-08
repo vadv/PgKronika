@@ -256,7 +256,7 @@ crates/
 ├── kronika-reader      ядро чтения: PgmUnit — единый декод PGM-контейнера через
 │                       ReadAt (sealed File или in-memory part &[u8]);
 │                       LocalDirSnapshot — sealed-сегменты + live-части
-│                       active.parts с dedup частей, покрытых sealed-сегментом.
+│                       active.parts с dedup точных sealed/live-дубликатов.
 │                       Зависит от kronika-store + kronika-registry + kronika-format.
 ├── kronika-diff        скорости, восстановление baseline, reset-правила
 ├── kronika-charts      формулы класса 10: один код для запечатывания, /metrics

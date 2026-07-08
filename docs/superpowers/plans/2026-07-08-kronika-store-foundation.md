@@ -127,10 +127,11 @@ pub struct UnitMeta {
 ```
 
 `LocalDirSnapshot` owns a `LocalDir` and the latest `LocalScan`. `units()` returns
-sealed units first, then live parts whose `[min_ts, max_ts]` range is not fully
-covered by a sealed unit with the same `source_id`. `refresh()` rescans the
-directory and journal. `decode_unit` opens the selected sealed file or active part
-and delegates to `PgmUnit`.
+sealed units first, then live parts whose catalog does not exactly match a sealed
+unit catalog. `refresh()` rescans the directory and journal. `warnings()` exposes
+skipped-file and skipped-part warnings; `damages()` exposes journal damage
+regions. `decode_unit` opens the selected sealed file or active part and
+delegates to `PgmUnit`.
 
 ## Tests
 
@@ -144,9 +145,10 @@ Required coverage:
 - `read_catalog` covers short source, bad tail, bad magic, bad format version,
   bad catalog length, corrupt catalog, out-of-bounds section, and happy path.
 - `PgmUnit` decodes the same bytes from `File` and `&[u8]`.
-- `LocalDirSnapshot` exposes live parts before seal, deduplicates sealed-covered
-  live parts, sees appended parts after `refresh`, and keeps valid parts around
-  a damaged journal region.
+- `LocalDirSnapshot` exposes live parts before seal, deduplicates exact
+  sealed/live catalog matches, keeps overlapping distinct live parts visible,
+  exposes journal damages, sees appended parts after `refresh`, and keeps valid
+  parts around a damaged journal region.
 
 ## Verification
 
