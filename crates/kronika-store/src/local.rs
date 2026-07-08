@@ -5,8 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use kronika_format::{
-    Catalog, FORMAT_VERSION, JournalLimits, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex,
-    scan_journal_streaming, validate_part_catalog,
+    Catalog, DEFAULT_MAX_PART_LEN, FORMAT_VERSION, JournalLimits, MAGIC, ReadAt, TAIL_INDEX_LEN,
+    TailIndex, scan_journal_streaming, validate_part_catalog,
 };
 
 use crate::source::{ActivePart, LocalScan, SealedUnit, StoreError, StoreWarning};
@@ -58,13 +58,22 @@ impl LocalDir {
         let mut warnings = Vec::new();
 
         // Collect and sort *.pgm file names deterministically.
-        let mut pgm_paths: Vec<PathBuf> = fs::read_dir(&self.root)?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                (path.extension().and_then(|e| e.to_str()) == Some("pgm")).then_some(path)
-            })
-            .collect();
+        // Per-entry I/O errors are recorded as warnings and skipped.
+        let mut pgm_paths: Vec<PathBuf> = Vec::new();
+        for entry_result in fs::read_dir(&self.root)? {
+            match entry_result {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("pgm") {
+                        pgm_paths.push(path);
+                    }
+                }
+                Err(err) => warnings.push(StoreWarning {
+                    path: self.root.clone(),
+                    reason: format!("read_dir entry error: {err}"),
+                }),
+            }
+        }
         pgm_paths.sort();
 
         for path in pgm_paths {
@@ -85,14 +94,42 @@ impl LocalDir {
 
             let mut active_parts = Vec::new();
             for part_ref in report.parts {
+                // Guard against an oversized part before allocating.
+                // The journal scanner already bounds part length via JournalLimits,
+                // so this path is unreachable in practice; the explicit check
+                // mirrors the MAX_CATALOG_BYTES guard in read_catalog.
+                if part_ref.len as u64 > DEFAULT_MAX_PART_LEN {
+                    warnings.push(StoreWarning {
+                        path: journal_path.clone(),
+                        reason: format!(
+                            "part at offset {} claims len {} which exceeds DEFAULT_MAX_PART_LEN",
+                            part_ref.offset, part_ref.len
+                        ),
+                    });
+                    continue;
+                }
+
                 // Read just this part's bytes to validate its catalog.
                 let mut buf = vec![0_u8; part_ref.len];
                 file.read_exact_at(&mut buf, part_ref.offset as u64)?;
-                if let Ok(catalog) = validate_part_catalog(&buf) {
-                    active_parts.push(ActivePart {
+
+                // validate_part (called inside the streaming scanner) is strictly
+                // stronger than validate_part_catalog — it also checks section CRCs.
+                // A part that reached this loop already passed the full check, so
+                // this catalog-only re-check should never fail. If it somehow does,
+                // record a warning rather than silently dropping the part.
+                match validate_part_catalog(&buf) {
+                    Ok(catalog) => active_parts.push(ActivePart {
                         part: part_ref,
                         catalog,
-                    });
+                    }),
+                    Err(err) => warnings.push(StoreWarning {
+                        path: journal_path.clone(),
+                        reason: format!(
+                            "part at offset {} passed scanner but failed catalog decode: {err}",
+                            part_ref.offset
+                        ),
+                    }),
                 }
             }
             (active_parts, report.damages)
@@ -208,7 +245,9 @@ pub fn read_catalog<R: ReadAt>(reader: &R) -> Result<Catalog, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
+    use kronika_format::{
+        ENTRY_LEN, FrameHeader, META_LEN, PartMeta, SectionInput, build_part, crc32c,
+    };
 
     fn part(ts: i64, src: u64) -> Vec<u8> {
         build_part(
@@ -224,6 +263,224 @@ mod tests {
             },
         )
     }
+
+    /// Build a minimal valid part with no sections and a specific `format_version`.
+    ///
+    /// Layout: `MAGIC(4)` | catalog block (`META_LEN` bytes) | tail index (`TAIL_INDEX_LEN` bytes)
+    fn minimal_part_with_version(format_version: u32) -> Vec<u8> {
+        let catalog = Catalog {
+            entries: vec![],
+            min_ts: 0,
+            max_ts: 0,
+            source_id: 0,
+            format_version,
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&catalog.encode());
+        out
+    }
+
+    /// Locate the tail index within a part buffer.
+    ///
+    /// Returns the byte offset of the 8-byte tail index at the end of the buffer.
+    fn tail_offset(buf: &[u8]) -> usize {
+        buf.len() - TAIL_INDEX_LEN
+    }
+
+    /// Locate the catalog block start within a part buffer.
+    ///
+    /// The `catalog_len` stored in the tail index tells us where the catalog starts.
+    fn catalog_offset(buf: &[u8]) -> usize {
+        let tail_at = tail_offset(buf);
+        let catalog_len =
+            u32::from_le_bytes(buf[tail_at..tail_at + 4].try_into().unwrap()) as usize;
+        tail_at - catalog_len
+    }
+
+    /// Offset of `format_version` within the meta block (28 bytes into meta).
+    fn format_version_offset(buf: &[u8]) -> usize {
+        // meta block is the last META_LEN bytes of the catalog block (before the tail)
+        let cat_start = catalog_offset(buf);
+        let cat_end = tail_offset(buf);
+        let cat_len = cat_end - cat_start;
+        let entry_count = (cat_len - META_LEN) / ENTRY_LEN;
+        cat_start + entry_count * ENTRY_LEN + 28 // 28 = offset of format_version within meta
+    }
+
+    /// Offset of crc32c within the meta block (32 bytes into meta).
+    fn meta_crc_offset(buf: &[u8]) -> usize {
+        let cat_start = catalog_offset(buf);
+        let cat_end = tail_offset(buf);
+        let cat_len = cat_end - cat_start;
+        let entry_count = (cat_len - META_LEN) / ENTRY_LEN;
+        cat_start + entry_count * ENTRY_LEN + 32 // 32 = META_CRC_OFFSET
+    }
+
+    /// Recompute catalog CRC and patch it into `buf` at the crc field position.
+    fn repatch_catalog_crc(buf: &mut [u8]) {
+        let crc_at = meta_crc_offset(buf);
+        let tail_at = tail_offset(buf);
+        // Zero the crc field before computing.
+        buf[crc_at..crc_at + 4].copy_from_slice(&0_u32.to_le_bytes());
+        let crc = crc32c(&buf[catalog_offset(buf)..tail_at]);
+        buf[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    // --- read_catalog branch tests ---
+
+    #[test]
+    fn read_catalog_too_small_buffer_shorter_than_tail() {
+        // A buffer shorter than TAIL_INDEX_LEN cannot hold a tail index.
+        let buf: &[u8] = &[0_u8; TAIL_INDEX_LEN - 1];
+        assert!(
+            matches!(read_catalog(&buf), Err(StoreError::TooSmall)),
+            "buffer shorter than tail index must return TooSmall"
+        );
+    }
+
+    #[test]
+    fn read_catalog_too_small_bad_tail_magic() {
+        // Exactly TAIL_INDEX_LEN bytes with wrong magic: TailIndex::decode fails
+        // → mapped to TooSmall.
+        let buf = [0_u8; TAIL_INDEX_LEN];
+        assert!(
+            matches!(read_catalog(&buf.as_slice()), Err(StoreError::TooSmall)),
+            "tail with wrong magic must return TooSmall"
+        );
+    }
+
+    #[test]
+    fn read_catalog_bad_catalog_len_exceeds_max() {
+        // Tail index with catalog_len > MAX_CATALOG_BYTES (64 MiB).
+        // Build tail manually: catalog_len as u32 LE + MAGIC.
+        // MAX_CATALOG_BYTES = 64 MiB = 0x0400_0000; adding 1 gives 0x0400_0001, which fits u32.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "MAX_CATALOG_BYTES + 1 = 64 MiB + 1 < u32::MAX; truncation is impossible"
+        )]
+        let huge_len: u32 = (MAX_CATALOG_BYTES + 1) as u32;
+        let mut buf = vec![0_u8; TAIL_INDEX_LEN + 100];
+        let tail_at = buf.len() - TAIL_INDEX_LEN;
+        buf[tail_at..tail_at + 4].copy_from_slice(&huge_len.to_le_bytes());
+        buf[tail_at + 4..tail_at + 8].copy_from_slice(&MAGIC);
+        assert!(
+            matches!(
+                read_catalog(&buf.as_slice()),
+                Err(StoreError::BadCatalogLen)
+            ),
+            "catalog_len > MAX_CATALOG_BYTES must return BadCatalogLen"
+        );
+    }
+
+    #[test]
+    fn read_catalog_bad_catalog_len_catalog_overlaps_magic() {
+        // catalog_len so large that catalog_at would land before the magic.
+        // The file is: MAGIC(4) + tail_index(8) = 12 bytes.
+        // Set catalog_len = 9 so catalog_at = 12 - 8 - 9 = -5 (underflow → BadCatalogLen).
+        let catalog_len: u32 = 9;
+        let mut buf = vec![0_u8; 12];
+        buf[0..4].copy_from_slice(&MAGIC);
+        let tail_at = 4;
+        buf[tail_at..tail_at + 4].copy_from_slice(&catalog_len.to_le_bytes());
+        buf[tail_at + 4..tail_at + 8].copy_from_slice(&MAGIC);
+        assert!(
+            matches!(
+                read_catalog(&buf.as_slice()),
+                Err(StoreError::BadCatalogLen)
+            ),
+            "catalog extending past magic must return BadCatalogLen"
+        );
+    }
+
+    #[test]
+    fn read_catalog_catalog_decode_error() {
+        // Valid tail + catalog bytes that fail Catalog::decode (all-zeroes meta has bad CRC).
+        // File: MAGIC(4) | catalog_block(META_LEN=40, all zeroes) | tail(8)
+        let catalog_len = u32::try_from(META_LEN).expect("META_LEN fits u32");
+        let total = MAGIC.len() + META_LEN + TAIL_INDEX_LEN;
+        let mut buf = vec![0_u8; total];
+        buf[0..4].copy_from_slice(&MAGIC);
+        let tail_at = MAGIC.len() + META_LEN;
+        buf[tail_at..tail_at + 4].copy_from_slice(&catalog_len.to_le_bytes());
+        buf[tail_at + 4..tail_at + 8].copy_from_slice(&MAGIC);
+        // catalog_at = MAGIC.len() = 4, catalog block is all zeroes — CRC mismatch.
+        assert!(
+            matches!(read_catalog(&buf.as_slice()), Err(StoreError::Catalog(_))),
+            "corrupt catalog block must return Catalog(DecodeError)"
+        );
+    }
+
+    #[test]
+    fn read_catalog_bad_magic() {
+        // Valid tail + valid catalog, but byte 0 is not MAGIC.
+        let mut buf = minimal_part_with_version(FORMAT_VERSION);
+        buf[0] ^= 0xFF; // corrupt first byte
+        assert!(
+            matches!(read_catalog(&buf.as_slice()), Err(StoreError::BadMagic)),
+            "wrong magic at offset 0 must return BadMagic"
+        );
+    }
+
+    #[test]
+    fn read_catalog_unsupported_format_version() {
+        // Valid part except format_version != FORMAT_VERSION.
+        // Patch format_version to 99, then recompute catalog CRC.
+        let mut buf = minimal_part_with_version(FORMAT_VERSION);
+        let fv_at = format_version_offset(&buf);
+        buf[fv_at..fv_at + 4].copy_from_slice(&99_u32.to_le_bytes());
+        repatch_catalog_crc(&mut buf);
+        assert!(
+            matches!(
+                read_catalog(&buf.as_slice()),
+                Err(StoreError::UnsupportedFormat { version: 99 })
+            ),
+            "unknown format_version must return UnsupportedFormat"
+        );
+    }
+
+    #[test]
+    fn read_catalog_out_of_bounds_entry() {
+        // Build a part with one section, then patch that entry's offset to point
+        // into the catalog block (past catalog_at), triggering OutOfBounds.
+        let section_body = b"data";
+        let mut buf = build_part(
+            &[SectionInput {
+                type_id: 1_006_001,
+                rows: 1,
+                body: section_body,
+            }],
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 0,
+            },
+        );
+        // Entry layout in catalog block: type_id(4) flags(4) offset(8) len(8) rows(4) crc32c(4)
+        // offset field starts at byte 8 within the first entry.
+        let cat_start = catalog_offset(&buf);
+        let entry_offset_field = cat_start + 8;
+        // Set offset to a value past catalog_start (i.e., into the catalog block itself).
+        let bad_offset = cat_start as u64 + 1;
+        buf[entry_offset_field..entry_offset_field + 8].copy_from_slice(&bad_offset.to_le_bytes());
+        // Recompute catalog CRC so Catalog::decode succeeds.
+        repatch_catalog_crc(&mut buf);
+        assert!(
+            matches!(read_catalog(&buf.as_slice()), Err(StoreError::OutOfBounds)),
+            "entry pointing into catalog block must return OutOfBounds"
+        );
+    }
+
+    #[test]
+    fn read_catalog_happy_path() {
+        // Confirm a correctly built part round-trips through read_catalog.
+        let buf = part(1000, 42);
+        let catalog = read_catalog(&buf.as_slice()).expect("valid part must decode");
+        assert_eq!(catalog.min_ts, 1000);
+        assert_eq!(catalog.source_id, 42);
+    }
+
+    // --- scan() behavioral tests ---
 
     #[test]
     fn scan_lists_sealed_and_active_with_cheap_catalog() {
