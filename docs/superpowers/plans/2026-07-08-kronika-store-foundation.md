@@ -1,8 +1,8 @@
-# kronika-store Foundation Plan
+# План чтения локальных PGM-данных
 
 ## Цель
 
-Заложить read-фундамент для локальных PGM-данных:
+Подготовить read-path для локальных PGM-данных:
 
 - `kronika-format`: общий `ReadAt` и потоковый scan `active.parts`.
 - `kronika-store`: storage-access над локальной директорией без декода секций.
@@ -159,4 +159,4 @@ cargo test --workspace
 cargo run -p xtask -- check-deps
 ```
 
-`kronika-bdd` is not changed by this foundation PR.
+`kronika-bdd` не меняется.
