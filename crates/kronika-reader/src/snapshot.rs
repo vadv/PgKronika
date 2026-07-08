@@ -8,10 +8,10 @@ use std::io;
 use std::path::Path;
 
 use kronika_format::{Catalog, DamageRegion};
-use kronika_registry::DecodedSection;
+use kronika_registry::{DecodedSection, Row};
 use kronika_store::{LocalDir, LocalScan, StoreError, StoreWarning};
 
-use crate::{PgmUnit, ReadError};
+use crate::{Dictionary, PgmUnit, ReadError};
 
 /// Metadata describing one unit (sealed or live) in the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +184,106 @@ impl LocalDirSnapshot {
                     return Err(ReadError::StaleSnapshot { unit_idx: idx });
                 }
                 unit.decode(cached_entry)
+            }
+        }
+    }
+
+    /// Decode one section as named-cell rows from the unit at position `idx`.
+    ///
+    /// Mirrors [`decode_unit`](Self::decode_unit) exactly — same bounds checks,
+    /// staleness handling, and active-part re-read — but calls
+    /// `PgmUnit::decode_rows` instead of `PgmUnit::decode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for the same reasons as [`decode_unit`](Self::decode_unit).
+    pub fn decode_unit_rows(&self, idx: usize, entry_idx: usize) -> Result<Vec<Row>, ReadError> {
+        let handle = self.handles().nth(idx).ok_or_else(|| {
+            ReadError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unit index {idx} is out of range"),
+            ))
+        })?;
+        match handle {
+            Handle::Sealed(i) => {
+                let su = &self.scan.sealed[i];
+                let entry = su.catalog.entries.get(entry_idx).ok_or_else(|| {
+                    ReadError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("entry index {entry_idx} is out of range for sealed unit {idx}"),
+                    ))
+                })?;
+                let file = self.dir.open_sealed(su)?;
+                PgmUnit::open(file)?.decode_rows(entry)
+            }
+            Handle::Active(i) => {
+                let ap = &self.scan.active[i];
+                let cached_entry = ap.catalog.entries.get(entry_idx).ok_or_else(|| {
+                    ReadError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("entry index {entry_idx} is out of range for active unit {idx}"),
+                    ))
+                })?;
+                let bytes = match self.dir.read_active_part(ap) {
+                    Ok(b) => b,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::NotFound
+                            || err.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Err(ReadError::StaleSnapshot { unit_idx: idx });
+                    }
+                    Err(err) => return Err(ReadError::Io(err)),
+                };
+                let unit = PgmUnit::open(bytes.as_slice())?;
+                if unit.catalog() != &ap.catalog {
+                    return Err(ReadError::StaleSnapshot { unit_idx: idx });
+                }
+                unit.decode_rows(cached_entry)
+            }
+        }
+    }
+
+    /// Read the dictionary of the unit at position `idx` in `units()`.
+    ///
+    /// Opens the unit the same way [`decode_unit`](Self::decode_unit) does —
+    /// sealed via a `File`, active by re-reading the journal bytes — and applies
+    /// the same staleness check for live units.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the unit index is out of range, the unit
+    /// cannot be opened, a dictionary section fails CRC or decode, or the
+    /// active part's catalog changed since the snapshot was taken.
+    pub fn unit_dictionary(&self, idx: usize) -> Result<Dictionary, ReadError> {
+        let handle = self.handles().nth(idx).ok_or_else(|| {
+            ReadError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unit index {idx} is out of range"),
+            ))
+        })?;
+        match handle {
+            Handle::Sealed(i) => {
+                let su = &self.scan.sealed[i];
+                let file = self.dir.open_sealed(su)?;
+                PgmUnit::open(file)?.dictionary()
+            }
+            Handle::Active(i) => {
+                let ap = &self.scan.active[i];
+                let bytes = match self.dir.read_active_part(ap) {
+                    Ok(b) => b,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::NotFound
+                            || err.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Err(ReadError::StaleSnapshot { unit_idx: idx });
+                    }
+                    Err(err) => return Err(ReadError::Io(err)),
+                };
+                let unit = PgmUnit::open(bytes.as_slice())?;
+                if unit.catalog() != &ap.catalog {
+                    return Err(ReadError::StaleSnapshot { unit_idx: idx });
+                }
+                unit.dictionary()
             }
         }
     }
@@ -444,6 +544,205 @@ mod tests {
         assert!(!units[0].live);
         assert!(snap.scan.active.is_empty());
         assert!(snap.damages().is_empty());
+    }
+
+    // ---- decode_unit_rows / unit_dictionary tests ----
+
+    use kronika_format::DictLimits;
+    use kronika_registry::Cell;
+    use kronika_registry::pg_stat_archiver::PgStatArchiver;
+    use kronika_registry::{StrId, Ts};
+    use kronika_writer::Interner;
+    use kronika_writer::dict;
+
+    /// Build a part with one `pg_stat_archiver` row (carrying a `StrId`) and
+    /// the corresponding `dict.strings` section. Returns the part bytes and the
+    /// interned `str_id` for the WAL file name.
+    fn make_archiver_part_with_dict(min_ts: i64, max_ts: i64, source_id: u64) -> (Vec<u8>, u64) {
+        let mut interner = Interner::new(DictLimits::new(256, 1 << 20).expect("limits"));
+        let wal_id = interner
+            .intern(b"000000010000000000000001")
+            .expect("intern");
+
+        let archiver_body = PgStatArchiver::encode(&[PgStatArchiver {
+            ts: Ts(min_ts),
+            archived_count: 5,
+            last_archived_wal: Some(StrId(wal_id.get())),
+            last_archived_time: Some(Ts(min_ts - 1000)),
+            failed_count: 0,
+            last_failed_wal: None,
+            last_failed_time: None,
+            stats_reset: None,
+        }])
+        .expect("encode archiver");
+
+        let dict_sections = dict::encode(interner.window()).expect("encode dict");
+        // Collect owned bodies so all SectionInput borrows can point to them.
+        let dict_owned: Vec<(u32, u32, Vec<u8>)> = dict_sections
+            .into_iter()
+            .map(|s| (s.type_id, s.rows, s.body))
+            .collect();
+
+        let mut all: Vec<SectionInput<'_>> = vec![SectionInput {
+            type_id: 1_008_001,
+            rows: 1,
+            body: &archiver_body,
+        }];
+        for (type_id, rows, body) in &dict_owned {
+            all.push(SectionInput {
+                type_id: *type_id,
+                rows: *rows,
+                body,
+            });
+        }
+
+        let bytes = build_part(
+            &all,
+            PartMeta {
+                min_ts,
+                max_ts,
+                source_id,
+            },
+        );
+        (bytes, wal_id.get())
+    }
+
+    #[test]
+    fn decode_unit_rows_sealed_and_active_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let (part_bytes, _wal_id) = make_archiver_part_with_dict(1000, 2000, 9);
+
+        // Write as sealed.
+        fs::write(dir.path().join("1000.pgm"), &part_bytes).unwrap();
+        let sealed_snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert!(!sealed_snap.units()[0].live);
+        // pg_stat_archiver is entry 0 (first non-dict section, but dict sections
+        // come after data sections in our fixture, so entry 0 is archiver).
+        let catalog = sealed_snap.unit_catalog(0).expect("catalog");
+        let archiver_entry_idx = catalog
+            .entries
+            .iter()
+            .position(|e| e.type_id == 1_008_001)
+            .expect("archiver entry");
+        let sealed_rows = sealed_snap
+            .decode_unit_rows(0, archiver_entry_idx)
+            .expect("decode sealed rows");
+
+        // Write same bytes as active part.
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part_bytes)).unwrap();
+        let active_snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        // The active part is deduped by the sealed unit, so only 1 unit total.
+        // The sealed unit is at index 0. Write only active (remove sealed).
+        fs::remove_file(dir.path().join("1000.pgm")).unwrap();
+        let active_snap2 = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert!(active_snap2.units()[0].live);
+        let catalog2 = active_snap2.unit_catalog(0).expect("catalog");
+        let archiver_entry_idx2 = catalog2
+            .entries
+            .iter()
+            .position(|e| e.type_id == 1_008_001)
+            .expect("archiver entry");
+        let active_rows = active_snap2
+            .decode_unit_rows(0, archiver_entry_idx2)
+            .expect("decode active rows");
+
+        assert_eq!(
+            sealed_rows, active_rows,
+            "sealed and active paths yield identical named-cell rows"
+        );
+        assert_eq!(sealed_rows.len(), 1, "one row decoded");
+        assert_eq!(
+            sealed_rows[0]["archived_count"],
+            Cell::I64(5),
+            "archived_count cell"
+        );
+        // last_archived_wal carries a StrId.
+        assert!(
+            matches!(sealed_rows[0]["last_archived_wal"], Cell::StrId(_)),
+            "last_archived_wal is a StrId cell"
+        );
+        // Suppress the active_snap binding unused warning.
+        drop(active_snap);
+    }
+
+    #[test]
+    fn unit_dictionary_resolves_interned_str_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (part_bytes, wal_id) = make_archiver_part_with_dict(1000, 2000, 9);
+        fs::write(dir.path().join("1000.pgm"), &part_bytes).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let dict = snap.unit_dictionary(0).expect("unit dictionary");
+        assert!(!dict.is_empty(), "at least one entry in the dictionary");
+        let resolved = dict.resolve(wal_id).expect("wal_id is in the dictionary");
+        assert_eq!(
+            resolved,
+            crate::Resolved::String(b"000000010000000000000001"),
+            "str_id resolves to the interned WAL name"
+        );
+    }
+
+    #[test]
+    fn unit_dictionary_active_resolves_str_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (part_bytes, wal_id) = make_archiver_part_with_dict(1000, 2000, 9);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part_bytes)).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert!(snap.units()[0].live);
+        let dict = snap.unit_dictionary(0).expect("unit dictionary for active");
+        let resolved = dict.resolve(wal_id).expect("wal_id resolved");
+        assert_eq!(
+            resolved,
+            crate::Resolved::String(b"000000010000000000000001"),
+        );
+    }
+
+    #[test]
+    fn decode_unit_rows_stale_after_journal_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (part_bytes, _) = make_archiver_part_with_dict(1000, 2000, 9);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part_bytes)).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert!(snap.units()[0].live);
+        let archiver_entry_idx = snap
+            .unit_catalog(0)
+            .expect("catalog")
+            .entries
+            .iter()
+            .position(|e| e.type_id == 1_008_001)
+            .expect("archiver entry");
+
+        fs::remove_file(&journal_path).unwrap();
+
+        let err = snap.decode_unit_rows(0, archiver_entry_idx).unwrap_err();
+        assert!(
+            matches!(err, ReadError::StaleSnapshot { unit_idx: 0 }),
+            "removed journal must return StaleSnapshot for decode_unit_rows, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unit_dictionary_stale_after_journal_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (part_bytes, _) = make_archiver_part_with_dict(1000, 2000, 9);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part_bytes)).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert!(snap.units()[0].live);
+
+        fs::remove_file(&journal_path).unwrap();
+
+        let err = snap.unit_dictionary(0).unwrap_err();
+        assert!(
+            matches!(err, ReadError::StaleSnapshot { unit_idx: 0 }),
+            "removed journal must return StaleSnapshot for unit_dictionary, got: {err}"
+        );
     }
 
     // When active.parts disappears (removed or truncated to zero) between

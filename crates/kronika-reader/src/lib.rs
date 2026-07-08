@@ -26,6 +26,8 @@ use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_ROWS,
 };
 use kronika_store::StoreError;
+
+pub use kronika_registry::{Cell, Row};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 pub use unit::PgmUnit;
