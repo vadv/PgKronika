@@ -1167,6 +1167,10 @@ dependencies = [
 [[package]]
 name = "kronika-store"
 version = "0.0.0"
+dependencies = [
+ "kronika-format",
+ "tempfile",
+]
 
 [[package]]
 name = "kronika-store-http"
