@@ -2,34 +2,27 @@
 //!
 //! Open the end catalog, then read section bodies by catalog range.
 
+mod unit;
+
 use std::collections::HashMap;
-use std::collections::hash_map::Entry as MapEntry;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use arrow_array::{Array, BinaryArray, BooleanArray, RecordBatch, UInt64Array};
-use kronika_format::{
-    Catalog, DecodeError, Entry, FORMAT_VERSION, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c,
-};
+use kronika_format::{Catalog, DecodeError, Entry};
 use kronika_registry::{
-    Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS,
-    MAX_SECTION_BYTES, MAX_SECTION_ROWS, VerifiedSection, decode_any,
+    Bytes, CodecError, DICT_BLOBS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_ROWS,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-/// Upper bound on the end-catalog block, checked before allocation.
-///
-/// A larger `catalog_len` is treated as a corrupt tail index.
-const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
+pub use unit::PgmUnit;
 
 /// A sealed segment opened for reading.
 #[derive(Debug)]
 pub struct Segment {
-    file: File,
-    catalog: Catalog,
+    inner: PgmUnit<File>,
 }
 
 /// Why a segment could not be opened or a section decoded.
@@ -142,15 +135,15 @@ impl Segment {
     /// Returns [`ReadError`] on I/O errors or invalid segment framing.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = File::open(path)?;
-        let len = file.metadata()?.len();
-        let catalog = read_catalog(&file, len)?;
-        Ok(Self { file, catalog })
+        Ok(Self {
+            inner: PgmUnit::open(file)?,
+        })
     }
 
     /// The segment's end catalog.
     #[must_use]
     pub const fn catalog(&self) -> &Catalog {
-        &self.catalog
+        self.inner.catalog()
     }
 
     /// Read and decode one section by its catalog `entry`.
@@ -162,12 +155,7 @@ impl Segment {
     /// Returns [`ReadError`] when the section is a dictionary, out of bounds,
     /// fails CRC, or fails typed decode.
     pub fn decode(&self, entry: &Entry) -> Result<DecodedSection, ReadError> {
-        if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
-            return Err(ReadError::DictionarySection {
-                type_id: entry.type_id,
-            });
-        }
-        decode_any(entry.type_id, self.verified_body(entry)?).map_err(ReadError::Codec)
+        self.inner.decode(entry)
     }
 
     /// Read the segment's dictionary sections into a `str_id` -> bytes map.
@@ -179,48 +167,7 @@ impl Segment {
     /// Returns [`ReadError`] when a dictionary section cannot be read or
     /// decoded.
     pub fn dictionary(&self) -> Result<Dictionary, ReadError> {
-        let mut by_id: HashMap<u64, Stored> = HashMap::new();
-        for entry in &self.catalog.entries {
-            if !matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
-                continue;
-            }
-            let body = self.verified_body(entry)?.into_bytes();
-            for (str_id, value) in
-                decode_dictionary(body, entry.type_id).map_err(ReadError::Codec)?
-            {
-                match by_id.entry(str_id) {
-                    MapEntry::Vacant(slot) => {
-                        slot.insert(value);
-                    }
-                    // A later part may move the same id from `dict.strings` to
-                    // `dict.blobs`; the blob carries truncation metadata, so it
-                    // wins.
-                    MapEntry::Occupied(mut slot) => {
-                        if matches!(value, Stored::Blob { .. }) {
-                            slot.insert(value);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Dictionary { by_id })
-    }
-
-    /// Read and CRC-check a section body.
-    fn verified_body(&self, entry: &Entry) -> Result<VerifiedSection, ReadError> {
-        let len = usize::try_from(entry.len)
-            .ok()
-            .filter(|&len| len <= MAX_SECTION_BYTES)
-            .ok_or(ReadError::SectionTooLarge { len: entry.len })?;
-        let mut body = vec![0_u8; len];
-        self.file.read_exact_at(&mut body, entry.offset)?;
-        VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c).map_err(|source| {
-            ReadError::Codec(CodecError::Section {
-                type_id: entry.type_id,
-                bytes_in: len,
-                source: Box::new(source),
-            })
-        })
+        self.inner.dictionary()
     }
 }
 
@@ -242,7 +189,7 @@ pub enum Resolved<'a> {
 
 /// One stored dictionary value, with a blob's truncation metadata.
 #[derive(Debug, Clone)]
-enum Stored {
+pub(crate) enum Stored {
     String(Vec<u8>),
     Blob {
         bytes: Vec<u8>,
@@ -271,7 +218,7 @@ impl Stored {
 /// A segment's `str_id` -> value map, built from its dictionary sections.
 #[derive(Debug, Clone, Default)]
 pub struct Dictionary {
-    by_id: HashMap<u64, Stored>,
+    pub(crate) by_id: HashMap<u64, Stored>,
 }
 
 impl Dictionary {
@@ -297,7 +244,10 @@ impl Dictionary {
 /// Decode a dictionary section body into `(str_id, value)` pairs.
 ///
 /// Applies row-group and row-count caps before reading dictionary columns.
-fn decode_dictionary(body: Bytes, type_id: u32) -> Result<Vec<(u64, Stored)>, CodecError> {
+pub(crate) fn decode_dictionary(
+    body: Bytes,
+    type_id: u32,
+) -> Result<Vec<(u64, Stored)>, CodecError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(body)?;
     let groups = builder.metadata().num_row_groups();
     if groups > MAX_ROW_GROUPS {
@@ -387,58 +337,6 @@ fn reject_nulls(array: &dyn Array, name: &'static str) -> Result<(), CodecError>
     } else {
         Err(CodecError::NullInRequiredColumn { name })
     }
-}
-
-/// Read and decode the end catalog from the file's tail.
-fn read_catalog(file: &File, len: u64) -> Result<Catalog, ReadError> {
-    let tail_at = len
-        .checked_sub(TAIL_INDEX_LEN as u64)
-        .ok_or(ReadError::TooSmall { len })?;
-    let mut tail_bytes = [0_u8; TAIL_INDEX_LEN];
-    file.read_exact_at(&mut tail_bytes, tail_at)?;
-    let tail = TailIndex::decode(tail_bytes).map_err(ReadError::Tail)?;
-
-    let catalog_len = u64::from(tail.catalog_len);
-    let bad_len = || ReadError::BadCatalogLen {
-        catalog_len: tail.catalog_len,
-    };
-    if catalog_len > MAX_CATALOG_BYTES {
-        return Err(bad_len());
-    }
-    let catalog_at = tail_at.checked_sub(catalog_len).ok_or_else(bad_len)?;
-    if catalog_at < MAGIC.len() as u64 {
-        return Err(bad_len());
-    }
-
-    let mut buf = vec![0_u8; tail.catalog_len as usize];
-    file.read_exact_at(&mut buf, catalog_at)?;
-    let catalog = Catalog::decode(&buf).map_err(ReadError::Catalog)?;
-
-    // Check container-level invariants at open, before callers start decoding
-    // individual sections.
-    let mut magic = [0_u8; MAGIC.len()];
-    file.read_exact_at(&mut magic, 0)?;
-    if magic != MAGIC {
-        return Err(ReadError::BadMagic { actual: magic });
-    }
-    if catalog.format_version != FORMAT_VERSION {
-        return Err(ReadError::UnsupportedFormat {
-            version: catalog.format_version,
-        });
-    }
-    for entry in &catalog.entries {
-        let in_bounds = entry.offset >= MAGIC.len() as u64
-            && entry
-                .offset
-                .checked_add(entry.len)
-                .is_some_and(|end| end <= catalog_at);
-        if !in_bounds {
-            return Err(ReadError::SectionOutOfBounds {
-                type_id: entry.type_id,
-            });
-        }
-    }
-    Ok(catalog)
 }
 
 #[cfg(test)]
