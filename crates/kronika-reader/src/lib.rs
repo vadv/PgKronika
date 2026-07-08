@@ -82,6 +82,13 @@ pub enum ReadError {
     /// A section failed CRC verification or decoding; a malformed dictionary
     /// section (bad Parquet, missing columns) arrives here too.
     Codec(CodecError),
+    /// The active part's catalog changed between snapshot time and decode time.
+    ///
+    /// Callers must call `refresh()` and retry.
+    StaleSnapshot {
+        /// Index of the unit that triggered the staleness check.
+        unit_idx: usize,
+    },
 }
 
 impl fmt::Display for ReadError {
@@ -108,6 +115,12 @@ impl fmt::Display for ReadError {
             Self::Catalog(err) => write!(f, "segment catalog: {err}"),
             Self::SectionTooLarge { len } => write!(f, "section of {len} bytes is above the cap"),
             Self::Codec(err) => write!(f, "section decode: {err}"),
+            Self::StaleSnapshot { unit_idx } => {
+                write!(
+                    f,
+                    "unit {unit_idx}: active part changed since snapshot; call refresh()"
+                )
+            }
         }
     }
 }
@@ -124,7 +137,8 @@ impl Error for ReadError {
             | Self::SectionOutOfBounds { .. }
             | Self::DictionarySection { .. }
             | Self::BadCatalogLen { .. }
-            | Self::SectionTooLarge { .. } => None,
+            | Self::SectionTooLarge { .. }
+            | Self::StaleSnapshot { .. } => None,
         }
     }
 }
