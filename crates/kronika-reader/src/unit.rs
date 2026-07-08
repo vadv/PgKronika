@@ -9,7 +9,7 @@ use std::collections::hash_map::Entry as MapEntry;
 use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
-    VerifiedSection, decode_any,
+    Row, VerifiedSection, decode_any, decode_rows,
 };
 
 use crate::{Dictionary, ReadError, Stored, decode_dictionary};
@@ -59,6 +59,23 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             });
         }
         decode_any(entry.type_id, self.verified_body(entry)?).map_err(ReadError::Codec)
+    }
+
+    /// Read and decode one section as named-cell rows.
+    ///
+    /// Rejects dictionary sections; call [`dictionary`](Self::dictionary) for those.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the section is a dictionary, out of bounds,
+    /// fails CRC, or fails typed decode.
+    pub fn decode_rows(&self, entry: &Entry) -> Result<Vec<Row>, ReadError> {
+        if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
+            return Err(ReadError::DictionarySection {
+                type_id: entry.type_id,
+            });
+        }
+        decode_rows(entry.type_id, self.verified_body(entry)?).map_err(ReadError::Codec)
     }
 
     /// Read the container's dictionary sections into a `str_id` -> bytes map.
