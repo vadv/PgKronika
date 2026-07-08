@@ -1,4 +1,4 @@
-# kronika-store Foundation Design
+# Дизайн чтения локальных PGM-данных
 
 Дата: 2026-07-06. Обновлено: 2026-07-08.
 
@@ -109,8 +109,8 @@ scan continues with other files.
 - live parts dropped when a sealed unit with the same `source_id` fully covers
   `[min_ts, max_ts]`.
 
-`LocalDirSnapshot` is a foundation read view. It exposes unit metadata and
-per-unit decode. It does not merge rows across units or provide cursor paging.
+`LocalDirSnapshot` exposes unit metadata and per-unit decode. It does not merge
+rows across units or provide cursor paging.
 
 ## Memory Bounds
 
@@ -129,8 +129,8 @@ per-unit decode. It does not merge rows across units or provide cursor paging.
 - Corrupt final region with no later valid frame: `DamageKind::QuarantinedTail`.
 - Bad sealed file: `StoreWarning`.
 
-Store surfaces these signals. Query-level gaps are outside this foundation
-layer; they require row/window semantics above `LocalDirSnapshot`.
+Store surfaces these signals. Query-level gaps require row/window semantics
+above `LocalDirSnapshot`.
 
 ## Storage Layout Context
 
@@ -141,8 +141,8 @@ layer; they require row/window semantics above `LocalDirSnapshot`.
 {root}/{cluster_id}/{yyyy}/{mm}/{dd}/{hh}/manifest.idx
 ```
 
-This foundation PR reads the local directory and sealed file tails. `manifest.idx`
-and remote backends are separate storage-discovery work.
+This PR reads the local directory and sealed file tails. `manifest.idx` and
+remote backends are separate storage-discovery work.
 
 ## Verification
 
