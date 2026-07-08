@@ -20,6 +20,9 @@ pub const FRAME_HEADER_LEN: usize = 16;
 /// This is a starting value, not a fixed format constant.
 pub const DEFAULT_MAX_PART_LEN: u64 = 64 * 1024 * 1024;
 
+/// Default resync window size for streaming journal recovery, bytes.
+pub const DEFAULT_RESYNC_CHUNK: usize = 1 << 20;
+
 /// Header of one journal frame.
 ///
 /// The header stores the length of the part body that follows it.
@@ -778,6 +781,15 @@ mod streaming_tests {
         let buf = framed(&[&p]);
         let err = scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 0)
             .expect_err("resync_chunk=0 must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn resync_chunk_overflow_returns_invalid_input() {
+        let p = sample_part();
+        let buf = framed(&[&p]);
+        let err = scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), usize::MAX)
+            .expect_err("resync_chunk=usize::MAX must be rejected due to overflow");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

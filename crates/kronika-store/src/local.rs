@@ -5,8 +5,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use kronika_format::{
-    Catalog, DEFAULT_MAX_PART_LEN, FORMAT_VERSION, JournalLimits, MAGIC, ReadAt, TAIL_INDEX_LEN,
-    TailIndex, scan_journal_streaming, validate_part_catalog,
+    Catalog, DEFAULT_MAX_PART_LEN, DEFAULT_RESYNC_CHUNK, DamageRegion, FORMAT_VERSION,
+    JournalLimits, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex, scan_journal_streaming,
+    validate_part_catalog,
 };
 
 use crate::source::{ActivePart, LocalScan, SealedUnit, StoreError, StoreWarning};
@@ -52,9 +53,8 @@ impl LocalDir {
     /// # Errors
     ///
     /// Returns an I/O error if the directory itself cannot be read, or if
-    /// `active.parts` cannot be opened.
+    /// `active.parts` cannot be opened with an error other than `NotFound`.
     pub fn scan(&self) -> io::Result<LocalScan> {
-        let mut sealed = Vec::new();
         let mut warnings = Vec::new();
 
         // Scan active.parts before sealed files. During seal, this captures the
@@ -62,51 +62,13 @@ impl LocalDir {
         // finds the .pgm copy and the snapshot layer deduplicates.
         let journal_path = self.root.join("active.parts");
         let (active, damages) = match File::open(&journal_path) {
-            Ok(file) => {
-                let report = scan_journal_streaming(&file, JournalLimits::default(), 1 << 20)?;
-
-                let mut active_parts = Vec::new();
-                for part_ref in report.parts {
-                    // Keep allocation bounded even if scanner limits change.
-                    if part_ref.len as u64 > DEFAULT_MAX_PART_LEN {
-                        warnings.push(StoreWarning {
-                            path: journal_path.clone(),
-                            reason: format!(
-                                "part at offset {} claims len {} which exceeds DEFAULT_MAX_PART_LEN",
-                                part_ref.offset, part_ref.len
-                            ),
-                        });
-                        continue;
-                    }
-
-                    // Read one bounded part to attach its catalog to the scan result.
-                    let mut buf = vec![0_u8; part_ref.len];
-                    file.read_exact_at(&mut buf, part_ref.offset as u64)?;
-
-                    // The streaming scanner already checked section CRCs. Re-checking
-                    // the catalog keeps the scan result self-contained; a mismatch is
-                    // reported instead of silently dropping the part.
-                    match validate_part_catalog(&buf) {
-                        Ok(catalog) => active_parts.push(ActivePart {
-                            part: part_ref,
-                            catalog,
-                        }),
-                        Err(err) => warnings.push(StoreWarning {
-                            path: journal_path.clone(),
-                            reason: format!(
-                                "part at offset {} passed scanner but failed catalog decode: {err}",
-                                part_ref.offset
-                            ),
-                        }),
-                    }
-                }
-                (active_parts, report.damages)
-            }
+            Ok(file) => self.scan_journal_reader(&file, &journal_path, &mut warnings)?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
             Err(err) => return Err(err),
         };
 
         // A part sealed after the journal scan appears in the sealed-file pass.
+        let mut sealed = Vec::new();
         let mut pgm_paths: Vec<PathBuf> = Vec::new();
         for entry_result in fs::read_dir(&self.root)? {
             match entry_result {
@@ -168,6 +130,89 @@ impl LocalDir {
         file.read_exact_at(&mut buf, p.part.offset as u64)?;
         Ok(buf)
     }
+
+    /// Scan an already-open `active.parts` journal into active parts and damage
+    /// regions.
+    ///
+    /// A concurrent seal followed by `Journal::reset` can truncate the journal
+    /// while the streaming scan or a per-part re-read is running; the resulting
+    /// `UnexpectedEof`/`NotFound` means the live journal shrank under us, not a
+    /// real failure. Such an error yields the parts read so far plus a warning,
+    /// so the caller still returns the sealed-file view. Other I/O errors
+    /// propagate.
+    #[expect(
+        clippy::unused_self,
+        reason = "method on LocalDir for API symmetry and unit-testing with a mock ReadAt"
+    )]
+    fn scan_journal_reader<R: ReadAt>(
+        &self,
+        reader: &R,
+        journal_path: &Path,
+        warnings: &mut Vec<StoreWarning>,
+    ) -> io::Result<(Vec<ActivePart>, Vec<DamageRegion>)> {
+        let report =
+            match scan_journal_streaming(reader, JournalLimits::default(), DEFAULT_RESYNC_CHUNK) {
+                Ok(report) => report,
+                Err(err) if is_stale_journal(&err) => {
+                    warnings.push(StoreWarning {
+                        path: journal_path.to_owned(),
+                        reason: format!("live journal changed during scan: {err}"),
+                    });
+                    return Ok((Vec::new(), Vec::new()));
+                }
+                Err(err) => return Err(err),
+            };
+
+        let mut active = Vec::with_capacity(report.parts.len());
+        for part_ref in report.parts {
+            if part_ref.len as u64 > DEFAULT_MAX_PART_LEN {
+                warnings.push(StoreWarning {
+                    path: journal_path.to_owned(),
+                    reason: format!(
+                        "active part at offset {} exceeds the max part length",
+                        part_ref.offset
+                    ),
+                });
+                continue;
+            }
+            let mut buf = vec![0_u8; part_ref.len];
+            match reader.read_exact_at(&mut buf, part_ref.offset as u64) {
+                Ok(()) => {}
+                Err(err) if is_stale_journal(&err) => {
+                    warnings.push(StoreWarning {
+                        path: journal_path.to_owned(),
+                        reason: format!("live journal changed during scan: {err}"),
+                    });
+                    break;
+                }
+                Err(err) => return Err(err),
+            }
+            match validate_part_catalog(&buf) {
+                Ok(catalog) => active.push(ActivePart {
+                    part: part_ref,
+                    catalog,
+                }),
+                Err(err) => warnings.push(StoreWarning {
+                    path: journal_path.to_owned(),
+                    reason: format!(
+                        "active part at offset {} passed the frame scan but failed catalog decode: {err}",
+                        part_ref.offset
+                    ),
+                }),
+            }
+        }
+
+        Ok((active, report.damages))
+    }
+}
+
+/// Whether an I/O error means the live journal shrank or vanished under us
+/// (a concurrent seal + `Journal::reset`), rather than a real I/O failure.
+fn is_stale_journal(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::NotFound
+    )
 }
 
 /// Read and decode the end catalog from a `.pgm` file path.
@@ -243,7 +288,8 @@ pub fn read_catalog<R: ReadAt>(reader: &R) -> Result<Catalog, StoreError> {
 mod tests {
     use super::*;
     use kronika_format::{
-        ENTRY_LEN, FrameHeader, META_LEN, PartMeta, SectionInput, build_part, crc32c,
+        ENTRY_LEN, FRAME_HEADER_LEN, FrameHeader, META_LEN, PartMeta, SectionInput, build_part,
+        crc32c,
     };
 
     fn part(ts: i64, src: u64) -> Vec<u8> {
@@ -513,5 +559,120 @@ mod tests {
         let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
         assert_eq!(scan.sealed.len(), 1, "good segment still served");
         assert_eq!(scan.warnings.len(), 1, "bad segment produces one warning");
+    }
+
+    // A mock ReadAt that claims a large byte_len but returns UnexpectedEof on
+    // body reads — simulating a file that was truncated between byte_len() and
+    // the first read_exact_at call (TOCTOU race with a concurrent seal/reset).
+    struct TruncatedAfterHeader {
+        data: Vec<u8>,
+        /// Reported size is larger than `data.len()`, causing body reads to fail.
+        reported_len: u64,
+    }
+
+    impl ReadAt for TruncatedAfterHeader {
+        fn byte_len(&self) -> io::Result<u64> {
+            Ok(self.reported_len)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            let end = start.saturating_add(buf.len());
+            if end > self.data.len() {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            buf.copy_from_slice(&self.data[start..end]);
+            Ok(())
+        }
+    }
+
+    // scan_journal_reader returns empty active + warning when scan_journal_streaming
+    // itself hits UnexpectedEof (e.g., the file shrank between byte_len and body
+    // read inside the streaming scan — TOCTOU race with a concurrent seal/reset).
+    #[test]
+    fn scan_survives_journal_truncated_mid_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        // The actual content is just a valid frame header; byte_len lies and
+        // says there is a full body too — read_exact_at on body bytes fails.
+        let p = part(2000, 7);
+        let header = FrameHeader {
+            part_len: p.len() as u64,
+        }
+        .encode();
+        let reported_len = (FRAME_HEADER_LEN + p.len()) as u64;
+        let mock = TruncatedAfterHeader {
+            data: header.to_vec(),
+            reported_len,
+        };
+
+        let local = LocalDir::open(dir.path()).unwrap();
+        let mut warnings = Vec::new();
+        let (active, _damages) = local
+            .scan_journal_reader(&mock, &journal_path, &mut warnings)
+            .expect("scan must not fail fatally on UnexpectedEof from streaming scan");
+
+        assert!(
+            active.is_empty(),
+            "no active parts expected from truncated journal"
+        );
+        assert!(
+            warnings.iter().any(|w| w.path == journal_path),
+            "a warning must reference the journal path"
+        );
+    }
+
+    // scan_journal_reader returns partial active + warning when the streaming
+    // scan succeeds (found one part) but the per-part body re-read hits
+    // UnexpectedEof (file shrank between the streaming scan and the read_exact_at
+    // in our loop — TOCTOU race with a concurrent seal/reset).
+    #[test]
+    fn scan_concurrent_truncation_after_streaming_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+
+        // Build a journal with one valid frame followed by a second frame
+        // header with no body. The mock's data contains both headers and the
+        // first body, but reported_len includes the second body too — so
+        // scan_journal_streaming reads the first frame completely (valid), then
+        // reads the second frame header but finds the body extends past the
+        // actual data → UnexpectedEof inside streaming_frame_at's body read,
+        // propagated as Err from scan_journal_streaming.
+        let p1 = part(2000, 7);
+        let header1 = FrameHeader {
+            part_len: p1.len() as u64,
+        }
+        .encode();
+        let p2_fake_len = 512_u64; // claimed body size, not present in data
+        let header2 = FrameHeader {
+            part_len: p2_fake_len,
+        }
+        .encode();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&header1);
+        data.extend_from_slice(&p1);
+        data.extend_from_slice(&header2);
+        // p2 body is NOT in data; reported_len pretends it is.
+        let reported_len = (data.len() as u64) + p2_fake_len;
+
+        let mock = TruncatedAfterHeader { data, reported_len };
+
+        let local = LocalDir::open(dir.path()).unwrap();
+        let mut warnings = Vec::new();
+        let (active, _damages) = local
+            .scan_journal_reader(&mock, &journal_path, &mut warnings)
+            .expect("scan must not fail fatally");
+
+        // scan_journal_streaming sees the second frame's body is "present" per
+        // reported_len but read_exact_at fails → Err(UnexpectedEof) →
+        // scan_journal_reader catches it, emits warning, returns empty active.
+        assert!(
+            active.is_empty(),
+            "truncated journal must yield no active parts"
+        );
+        assert!(
+            warnings.iter().any(|w| w.path == journal_path),
+            "scan must warn about the truncated journal"
+        );
     }
 }
