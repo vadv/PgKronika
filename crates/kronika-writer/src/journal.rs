@@ -25,8 +25,8 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use kronika_format::{
-    DamageKind, DamageRegion, FRAME_HEADER_LEN, FRAME_MAGIC, FrameHeader, JournalLimits, PartError,
-    PartRef, ScanReport, validate_part,
+    DamageKind, DamageRegion, FRAME_HEADER_LEN, FrameHeader, JournalLimits, PartError, PartRef,
+    ScanReport, scan_journal_streaming, validate_part,
 };
 
 /// Default cap for the whole journal file, bytes.
@@ -355,170 +355,15 @@ impl Journal {
     }
 }
 
-/// Outcome of checking one frame position in the file. Mirrors the
-/// classification of `kronika_format::scan_journal`; the equivalence of the
-/// two scanners is pinned by a test.
-enum FileFrame {
-    /// A valid frame with a validated part of this length.
-    Valid { body_len: usize },
-    /// The frame is cut off by the end of the file: a torn write.
-    Torn,
-    /// The frame is damaged. When the header itself was sane,
-    /// `implied_end` is where the frame claims to end.
-    Damaged { implied_end: Option<usize> },
-}
-
-/// Stream the recovery scan over the file: frame by frame, one part buffer,
-/// never the whole journal in memory.
+/// Stream the recovery scan over the file by delegating to
+/// `kronika_format::scan_journal_streaming`.
 fn scan_file(
     file: &File,
-    file_len: usize,
+    _file_len: usize,
     limits: JournalLimits,
     resync_chunk: usize,
 ) -> Result<ScanReport, std::io::Error> {
-    let mut report = ScanReport::default();
-    let mut part_buf = Vec::new();
-    let mut pos = 0_usize;
-
-    while pos < file_len {
-        match frame_at_file(file, file_len, pos, limits, &mut part_buf)? {
-            FileFrame::Valid { body_len } => {
-                report.parts.push(PartRef {
-                    offset: pos + FRAME_HEADER_LEN,
-                    len: body_len,
-                });
-                pos += FRAME_HEADER_LEN + body_len;
-                report.valid_len = pos;
-            }
-            FileFrame::Torn => {
-                report.damages.push(DamageRegion {
-                    from: pos,
-                    kind: DamageKind::TornTail,
-                });
-                return Ok(report);
-            }
-            FileFrame::Damaged { implied_end } => {
-                if let Some(next) = resync_file(
-                    file,
-                    file_len,
-                    pos,
-                    implied_end,
-                    limits,
-                    &mut part_buf,
-                    resync_chunk,
-                )? {
-                    report.damages.push(DamageRegion {
-                        from: pos,
-                        kind: DamageKind::Middle { resumed_at: next },
-                    });
-                    pos = next;
-                    continue;
-                }
-                let kind = if implied_end == Some(file_len) {
-                    DamageKind::TornTail
-                } else {
-                    DamageKind::QuarantinedTail
-                };
-                report.damages.push(DamageRegion { from: pos, kind });
-                return Ok(report);
-            }
-        }
-    }
-
-    Ok(report)
-}
-
-/// Check one frame position, reading at most the header and one part body.
-fn frame_at_file(
-    file: &File,
-    file_len: usize,
-    pos: usize,
-    limits: JournalLimits,
-    part_buf: &mut Vec<u8>,
-) -> Result<FileFrame, std::io::Error> {
-    let rem = file_len - pos;
-    if rem < FRAME_HEADER_LEN {
-        return Ok(FileFrame::Torn);
-    }
-    let mut header_bytes = [0_u8; FRAME_HEADER_LEN];
-    file.read_exact_at(&mut header_bytes, pos as u64)?;
-    let Ok(header) = FrameHeader::decode(header_bytes) else {
-        return Ok(FileFrame::Damaged { implied_end: None });
-    };
-    if header.part_len > limits.max_part_len {
-        return Ok(FileFrame::Damaged { implied_end: None });
-    }
-    let Ok(body_len) = usize::try_from(header.part_len) else {
-        return Ok(FileFrame::Damaged { implied_end: None });
-    };
-    if rem - FRAME_HEADER_LEN < body_len {
-        return Ok(FileFrame::Torn);
-    }
-    part_buf.resize(body_len, 0);
-    file.read_exact_at(&mut part_buf[..body_len], (pos + FRAME_HEADER_LEN) as u64)?;
-    if validate_part(&part_buf[..body_len]).is_err() {
-        return Ok(FileFrame::Damaged {
-            implied_end: Some(pos + FRAME_HEADER_LEN + body_len),
-        });
-    }
-    Ok(FileFrame::Valid { body_len })
-}
-
-/// Streaming twin of the in-memory resynchronization: the header-implied
-/// boundary first, then a sliding-window byte search to the end of the
-/// file. The window carries a `FRAME_MAGIC`-sized overlap so a magic
-/// spanning a chunk boundary is not missed.
-fn resync_file(
-    file: &File,
-    file_len: usize,
-    damaged_at: usize,
-    implied_end: Option<usize>,
-    limits: JournalLimits,
-    part_buf: &mut Vec<u8>,
-    chunk_len: usize,
-) -> Result<Option<usize>, std::io::Error> {
-    if let Some(boundary) = implied_end
-        && boundary < file_len
-        && matches!(
-            frame_at_file(file, file_len, boundary, limits, part_buf)?,
-            FileFrame::Valid { .. }
-        )
-    {
-        return Ok(Some(boundary));
-    }
-
-    let overlap = FRAME_MAGIC.len() - 1;
-    let mut window = vec![0_u8; chunk_len + overlap];
-    let mut base = damaged_at + 1;
-    while base + FRAME_HEADER_LEN <= file_len {
-        let take = (file_len - base).min(window.len());
-        file.read_exact_at(&mut window[..take], base as u64)?;
-
-        let mut from = 0;
-        while let Some(found) = find_magic(&window[from..take]) {
-            let at = base + from + found;
-            if matches!(
-                frame_at_file(file, file_len, at, limits, part_buf)?,
-                FileFrame::Valid { .. }
-            ) {
-                return Ok(Some(at));
-            }
-            from = from + found + 1;
-        }
-
-        if base + take >= file_len {
-            break;
-        }
-        base += chunk_len;
-    }
-    Ok(None)
-}
-
-/// Position of the first `FRAME_MAGIC` occurrence in `haystack`.
-fn find_magic(haystack: &[u8]) -> Option<usize> {
-    haystack
-        .windows(FRAME_MAGIC.len())
-        .position(|window| window == FRAME_MAGIC)
+    scan_journal_streaming(file, limits, resync_chunk)
 }
 
 /// Sync the directory entry after creating the journal file.
@@ -533,7 +378,9 @@ fn sync_parent_dir(path: &Path) -> Result<(), JournalError> {
 
 #[cfg(test)]
 mod tests {
-    use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, crc32c, scan_journal};
+    use kronika_format::{
+        Catalog, Entry, FORMAT_VERSION, FRAME_MAGIC, MAGIC, crc32c, scan_journal,
+    };
 
     use super::*;
 
