@@ -2,9 +2,11 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-reader` opens a sealed PGM segment and decodes its sections. It starts
-from the end catalog, then reads section bodies by the ranges stored there. The
-API uses positional reads and applies size limits before allocation.
+`kronika-reader` is the read and query core for PGM segments. `PgmUnit` decodes
+a PGM container over any `ReadAt` source — a sealed file or an in-memory journal
+part — through a single decode path. `LocalDirSnapshot` combines sealed segments
+with live `active.parts` entries, deduplicating parts already covered by a sealed
+segment.
 
 ## Opening a Segment
 
