@@ -1,7 +1,7 @@
-//! `PgmUnit<R>`: a unified decoder that reads a PGM container over any `ReadAt`.
+//! Decoder for one PGM container over any `ReadAt` source.
 //!
-//! Serves both sealed segment files (`File`) and in-memory journal parts
-//! (`&[u8]`) through a single decode path.
+//! The same code handles sealed segment files (`File`) and in-memory journal
+//! parts (`&[u8]`).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
@@ -19,8 +19,7 @@ const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A PGM container opened for reading over any [`ReadAt`] source.
 ///
-/// Works identically for sealed segment files (`File`) and in-memory journal
-/// parts (`&[u8]`), giving callers one decode path for both.
+/// Works for sealed segment files (`File`) and in-memory journal parts (`&[u8]`).
 #[derive(Debug)]
 pub struct PgmUnit<R: kronika_format::ReadAt> {
     reader: R,

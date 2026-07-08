@@ -1,11 +1,11 @@
-//! Segment read and query core.
+//! Segment read core.
 //!
 //! [`PgmUnit`] decodes a PGM container over any [`kronika_format::ReadAt`]
-//! implementation — a sealed [`std::fs::File`] or an in-memory journal part
-//! `&[u8]` — providing a single decode path for both sources.
+//! implementation: a sealed [`std::fs::File`] or an in-memory journal part
+//! `&[u8]`.
 //!
 //! [`LocalDirSnapshot`] combines sealed segments with live `active.parts`
-//! entries, deduplicating parts already covered by a sealed segment.
+//! entries and drops live parts already covered by a sealed segment.
 
 mod snapshot;
 mod unit;

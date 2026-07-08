@@ -122,8 +122,8 @@ SIGTERM/INT  мягкое завершение: сброс буферов → з
 │   PgmUnit + LocalDirSnapshot: sealed-сегменты   │
 │   + live active.parts, dedup, Dictionary        │
 │                    ▼                            │
-│   LocalDir: storage-access (сейчас реализован)  │
-│   DaemonHttp / S3: не реализованы (отложены)   │
+│   LocalDir: storage-access над локальным диском │
+│   удалённые backends вне этого слоя             │
 │                                                 │
 │  :8688  + API диапазонного чтения сегментов     │
 │         из локального хранилища                 │
@@ -251,8 +251,8 @@ crates/
 │                       (дешёвый хвостовой read каталога без декода секций) +
 │                       потоковый скан active.parts (one-part-at-a-time, bounded).
 │                       Зависит только от kronika-format. Декодирование секций —
-│                       в kronika-reader. Backends DaemonHttp / S3 не реализованы
-│                       (отложены).
+│                       в kronika-reader. Удалённые backends не входят в этот
+│                       storage-access слой.
 ├── kronika-reader      ядро чтения: PgmUnit — единый декод PGM-контейнера через
 │                       ReadAt (sealed File или in-memory part &[u8]);
 │                       LocalDirSnapshot — sealed-сегменты + live-части
@@ -281,8 +281,8 @@ kronika-store только для storage-access и не требует пере
 типов (декодирование секций ему не нужно). Коллектор не тянет ни
 kronika-reader, ни kronika-store.
 
-Когда появятся backends DaemonHttp и S3, правила для web/archiver
-расширятся на kronika-store-http и kronika-store-s3 соответственно.
+Для удалённых backends правила web/archiver расширяются отдельными крейтами
+`kronika-store-http` и `kronika-store-s3`.
 
 ## 8. Версионирование
 

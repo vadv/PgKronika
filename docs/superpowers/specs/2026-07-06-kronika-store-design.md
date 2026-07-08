@@ -1,381 +1,156 @@
-# kronika-store — дизайн
+# kronika-store Foundation Design
 
-Дата: 2026-07-06 (ред. 2026-07-07, вариант A — полный, с живым журналом).
-Статус: дизайн к реализации.
+Дата: 2026-07-06. Обновлено: 2026-07-08.
 
-Крейт **`kronika-store`** — read-слой над **каталогом `.pgm`-сегментов И живым
-журналом `active.parts`**. Сырой фундамент «читающей» половины: на нём сидит
-HTTP-API (`pg_kronika-web`), позже — слой аномалий/анализа. Сейчас крейт —
-doc-only заглушка (`crates/kronika-store/src/lib.rs`).
+## Назначение
 
-**Что уже есть и переиспользуется (не переписываем):** декод ОДНОГО запечатанного
-сегмента реализован в `kronika-reader` (`Segment::open/catalog/decode/dictionary`,
-`Resolved`, `ReadError`). Store НЕ читает сегмент заново. Его новая работа —
-**directory-level мультисегментный индекс + чтение живого журнала + единый
-запрос** поверх готового примитива.
+`kronika-store` даёт read-only storage-access к локальной директории PGM-данных:
 
-Заземление: `kronika-reader` (примитив одного сегмента), `kronika-format` (дешёвый
-каталог, `Entry`, мультиоконность, **`scan_journal`/`validate_part` — part-модель
-журнала**), `kronika-registry` (`type_id ↔ имя` + контракты колонок). Потребитель —
-`output_to_user/pgkronika-api-over-files-spec.md`.
+- sealed `.pgm` files;
+- live `active.parts` journal;
+- decoded catalogs for both sources;
+- raw byte reads for a selected sealed file or active part.
 
-## 1. Назначение и границы
+The crate does not decode registry sections and does not expose row, JSON,
+HTTP, S3, cursor, rate, or anomaly APIs. Section decoding belongs to
+`kronika-reader`.
 
-**Делает:** открывает `KRONIKA_OUT_DIR`, строит единый индекс по ДВУМ источникам —
-запечатанные `*.pgm` (иммутабельные) и **живой журнал `active.parts`**
-(мутабельный, незапечатанные parts) — и отвечает на запросы: источники, сегменты в
-окне, строки секции в окне (резолв `str_id` + курсор). Мультисегментность,
-мультиоконность и near-real-time из журнала спрятаны внутри.
+## Workspace Contract
 
-**Near-real-time — часть контракта, не опция.** Свежее открытое окно живёт только в
-`active.parts` до seal (до `KRONIKA_SEGMENT_MAX_AGE_S=900с`). Store обязан отдавать
-эти данные, иначе ответ отстаёт до ~15 минут. Формат специально поддерживает чтение
-незапечатанных parts тем же кодом.
+- `kronika-store` depends only on `kronika-format`.
+- `kronika-reader` depends on `kronika-store`, `kronika-format`, and
+  `kronika-registry`.
+- `pg_kronika-collector` writes local data and does not depend on store/reader.
+- `pg_kronika-archiver` can use store as storage-access without registry or
+  reader.
 
-**НЕ делает** (YAGNI + регистратор):
-- нет HTTP — `pg_kronika-web` поверх (следующий срез);
-- нет rate/delta/аномалий/порогов/вердиктов — только сырые строки (регистратор);
-- нет записи;
-- нет S3/remote — `kronika-store-http`/`-s3` остаются заглушками (шов оставлен);
-- нет кэша сверх ин-мемори индекса (str_id-LRU между сегментами — позже).
+This split keeps storage discovery independent from section schemas.
 
-## 2. Место в workspace и источники
+## Data Sources
 
-Новый крейт `crates/kronika-store`. Зависит от `kronika-reader`, `kronika-format`,
-`kronika-registry`. **Без `axum`**. Потребитель — `bins/pg_kronika-web`.
+### Sealed `.pgm`
 
-Доступ к данным — за швом `SegmentSource` с **двумя конкретными реализациями с
-первого дня**:
-- **`SealedDir`** — запечатанные `*.pgm` в директории. Иммутабельны: индекс строится
-  один раз, растёт только при появлении новых файлов.
-- **`LiveJournal`** — `active.parts` в той же директории. Мутабелен: parts
-  дописываются каждое окно, журнал обнуляется на seal.
+For each sealed file, store reads only:
 
-Оба отдают единый список «сегмент-подобных единиц» с каталогом
-(`source_id/min_ts/max_ts/entries`) и способом декодировать секцию. http/s3-шов —
-позже, `Store` API не меняет.
+1. tail index;
+2. catalog block before the tail index;
+3. magic and format-version fields needed to validate the container;
+4. catalog entry bounds.
 
-## 3. Живой журнал (parts) — как читаем
+Section bodies are not loaded while listing files.
 
-- Каждый part в `active.parts` — самостоятельный мини-PGM со своим каталогом;
-  перечисляется дёшево через `kronika_format::scan_journal` (offset + catalog
-  каждого кадра `PGMP`), декодируется как контейнер (те же Entry/словарь, что у
-  сегмента) — **не отдельный формат**.
-- **Единый декод.** Чтобы декод жил в одном месте, `kronika-reader` расширяется
-  примитивом «сегмент-вью над байтовым диапазоном / in-memory part» (тот же
-  catalog/entry/dictionary/registry-путь, что `Segment` над файлом). Store
-  применяет его и к `.pgm`, и к part'ам журнала. Это единственная новая
-  reader-возможность; всё остальное — переиспользование.
-- **Мутабельность.** `refresh()` перечитывает хвост журнала (кадры с последнего
-  known-offset) и подхватывает новые `.pgm`. Sealed-сегменты не перечитываются.
-  Store читает журнал, который коллектор пишет параллельно, но сам его не чинит
-  (recovery — дело коллектора при его старте).
-- **Seal-переход (дедуп).** seal пишет `.pgm`, ПОТОМ обнуляет журнал → короткое
-  окно, где part есть и в новом `.pgm`, и в ещё-живом журнале. Правило: **part,
-  чей `[min_ts,max_ts]` уже покрыт запечатанным сегментом того же `source_id`,
-  пропускается** (идемпотентность формата: parts с `max_ts ≤ max_ts` сегмента уже
-  влиты). Near-real-time не двоит данные на переходе.
+### `active.parts`
 
-### 3a. Повреждённый журнал и разрывы покрытия
+`active.parts` is an append-only journal of framed PGM parts. Each part is a
+self-contained PGM container with its own catalog and dictionary sections.
 
-Формат запрещает молчаливое усечение середины. Store обязан различать «ещё не
-дописано» и «порча», и **отдавать разрыв наружу**, а не проглатывать его. Три
-случая при чтении `active.parts`:
+Store scans the journal with `scan_journal_streaming`, which reads one frame at a
+time through `ReadAt`. Valid parts become `ActivePart { part, catalog }`.
+Damaged regions are returned as `DamageRegion`.
 
-1. **Недописанный последний кадр** (коллектор пишет прямо сейчас / упал на середине
-   кадра): объявленный `part_len` больше остатка файла, либо `validate_part`
-   последнего кадра не сходится. Это НЕ порча — «ещё не дописано». Игнорируем до
-   последней валидной границы; кадр появится на следующем `refresh`. Ни разрыв, ни
-   warning.
-2. **Порча в середине** (битый кадр между валидными): ресинк к следующему `PGMP`
-   ограниченным сканом (`header_crc` + `validate_part`), читаем валидные parts
-   после него — **но помечаем разрыв**. Точные `ts` битого кадра неизвестны (он
-   нечитаем) → границы разрыва выводим по соседям: `(max_ts последнего хорошего до,
-   min_ts первого хорошего после)`.
-3. **Журнал нечитаем целиком**: обслуживаем только sealed-сегменты + `warning` +
-   открытый разрыв в живом хвосте `(max_ts последнего sealed данного источника,
-   now)`.
-
-**Разрыв реален только там, где нет sealed-покрытия.** Если время повреждённого
-куска журнала уже запечатано в `.pgm` того же источника — разрыва НЕТ (дедуп §3
-предпочтёт sealed). Формально на запрос:
-`real_gaps = окно − (читаемое покрытие sealed ∪ читаемые parts)`. Битый кадр журнала
-даёт разрыв только там, где он — единственный источник данных.
-
-## 4. Публичная модель
+## Public Model
 
 ```rust
-pub struct Store { /* индекс sealed + журнал + предупреждения + SegmentSource */ }
-
-pub struct TimeWindow { pub from: i64, pub to: i64 } // unix микросекунды
-
-pub struct SourceSummary {
-    pub source_id: u64,          // str_id "{cluster_id}/{pg_system_identifier}"
-    pub label: Option<String>,   // резолв source_id через словарь, если строка есть
-    pub min_ts: i64,
-    pub max_ts: i64,
-    pub segments: u32,           // sealed + живые единицы журнала
+pub struct SealedUnit {
+    pub path: PathBuf,
+    pub catalog: Catalog,
 }
 
-pub struct SegmentMeta {
-    pub segment_id: SegmentId,   // Sealed(first_ts) | Live(part_seq)
-    pub source_id: u64,
-    pub min_ts: i64,
-    pub max_ts: i64,
-    pub live: bool,              // из журнала (ещё не запечатан)
-    pub sections: Vec<SectionPresence>, // (имя секции, суммарно rows)
+pub struct ActivePart {
+    pub part: PartRef,
+    pub catalog: Catalog,
 }
 
-pub struct SectionQuery<'a> {
-    pub name: &'a str,           // имя секции ("os-cpu"), не число
-    pub source: u64,
-    pub window: TimeWindow,
-    pub limit: usize,            // дефолт 1000, жёсткий потолок 10_000
-    pub cursor: Option<Cursor>,
+pub struct LocalScan {
+    pub sealed: Vec<SealedUnit>,
+    pub active: Vec<ActivePart>,
+    pub damages: Vec<DamageRegion>,
+    pub warnings: Vec<StoreWarning>,
 }
 
-pub struct SectionPage {
-    pub section: String,
-    pub source_id: u64,
-    pub rows: Vec<Row>,
-    pub gaps: Vec<Gap>,          // непокрытые/нечитаемые интервалы в окне (§3a)
-    pub next_cursor: Option<Cursor>,
-}
-
-pub struct Gap { pub from: i64, pub to: i64, pub reason: GapReason }
-pub enum GapReason {
-    CorruptJournalFrame,        // битый кадр active.parts, границы по соседям
-    CorruptSegment,             // битый sealed .pgm, нет альтернативного покрытия
-    NoCoverage,                 // в окне нет ни sealed, ни parts
-}
-
-pub type Row = Vec<(String, Value)>; // порядок колонок = порядок контракта
-
-pub enum Value {
-    Null,
-    I64(i64), U64(u64), F64(f64), Bool(bool),
-    Ts(i64),                                       // unix микросекунды
-    Str(String),                                   // str_id → строка
-    Blob { text: String, full_len: u64, truncated: bool },
-}
-
-pub struct Cursor(/* непрозрачный: (segment_id, entry_idx, row_offset) */);
-```
-
-Ключевое решение: **строка пересекает границу крейта с уже резолвнутым `str_id`**
-(`Value::Str`/`Blob`) + именами колонок из реестра — ровно то, что нужно JSON-API.
-Имена/типы колонок — из контракта секции (`kronika-registry`); `StrId`-колонки
-резолвятся словарём того сегмента/part'а, откуда строка (`Dictionary::resolve`);
-`NULL` → `Value::Null`.
-
-## 5. Операции
-
-```rust
-impl Store {
-    pub fn open(dir: &Path) -> Result<Store, StoreError>;   // sealed + журнал
-    pub fn refresh(&mut self) -> Result<(), StoreError>;    // хвост журнала + новые .pgm
-    pub fn sources(&self) -> Vec<SourceSummary>;
-    pub fn segments(&self, source: u64, window: TimeWindow) -> Vec<SegmentMeta>;
-    pub fn section(&self, q: SectionQuery) -> Result<SectionPage, StoreError>;
-    pub fn sections_catalog(&self) -> Vec<SectionContract>; // из реестра, для /v1/sections
-    pub fn warnings(&self) -> &[StoreWarning];              // пропущенные битые сегменты
+pub struct StoreWarning {
+    pub path: PathBuf,
+    pub reason: String,
 }
 ```
 
-- **`open`** — просканировать `*.pgm` (дешёвое хвостовое чтение каталогов) И
-  `active.parts` (`scan_journal` → каталог каждого part'а); применить seal-дедуп;
-  собрать единый индекс `SegmentMeta` (`live` помечает журнальные).
-- **`refresh`** — перечитать хвост журнала с последнего offset + подхватить новые
-  `.pgm`; пересобрать дедуп на границе seal.
-- **`sources`** — свернуть индекс по `source_id` (sealed + live); `label` — попытка
-  резолва `source_id` словарём (нет строки → `None`, не врём).
-- **`segments`** — из индекса: единицы источника, чьи `[min_ts,max_ts]` пересекают
-  окно (sealed + live).
-- **`section`** — `name → type_id` (реестр; нет → `UnknownSection`); выбрать
-  пересекающие sealed-сегменты И живые parts; в каждом декодировать все Entry этого
-  `type_id` (мультиоконность → по порядку каталога); отфильтровать по
-  `ts ∈ [from,to]`; резолвнуть `str_id`; слить по sort-key секции через границы;
-  применить seal-дедуп, `limit`; вычислить `gaps` (§3a: непокрытые/нечитаемые
-  интервалы окна); выдать `next_cursor`.
-- **`sections_catalog`** — тонкая проекция контрактов реестра (имя/семантика/
-  колонки/класс/sort-key) для `/v1/sections`.
+`StoreWarning` means one file or part was skipped. `DamageRegion` describes
+journal bytes that the frame scanner could not validate.
 
-## 6. Слияние, отсечка, дедуп
+## LocalDir Scan
 
-- Отсечка ДО декода: имя файла + индекс `min/max_ts` отбрасывают непересекающие
-  единицы; живые parts всегда проверяются (их `max_ts` — самый свежий).
-- Внутри пересекающих: декодируем целиком и фильтруем по `ts` (v1 просто;
-  оптимизация по группам строк — позже).
-- Слияние sealed + live — по sort-key секции из реестра; порядок Entry внутри
-  единицы (мультиоконность) сохраняется.
-- **Seal-дедуп** (см. §3): живой part, чей диапазон покрыт sealed-сегментом того же
-  источника, исключается до слияния.
-- Битый сегмент/part → **пропуск + `warnings`**, не падение запроса.
+`LocalDir::scan` uses journal-first ordering:
 
-## 7. Масштаб и индексация (1000+ файлов, локально и S3)
+1. Scan `active.parts`, if present.
+2. Attach catalogs to valid active parts.
+3. List sealed `.pgm` files.
+4. Read sealed catalogs.
+5. Return `LocalScan`.
 
-Требование: до ~1000 сегментов в директории; sealed могут лежать на S3; читать
-максимально быстро.
+The order covers seal races under the writer contract: before journal reset, the
+part is visible in `active.parts`; after seal, the sealed file is visible in the
+`.pgm` listing. The reader layer handles duplicate live parts.
 
-**Ключевой принцип — разделять DISCOVERY и DATA.** DISCOVERY (какие сегменты есть +
-их `source_id/min_ts/max_ts/секции`) масштабируется с ЧИСЛОМ файлов; DATA (тела
-секций) — только для сегментов, ПЕРЕСЕКАЮЩИХ окно, масштабируется с РАЗМЕРОМ окна.
-Узкий запрос по 1000-файловой директории обязан трогать тела лишь нескольких
-пересекающих сегментов — при условии, что discovery дёшев.
+Bad sealed files do not fail the whole scan. They produce `StoreWarning` and the
+scan continues with other files.
 
-**Локально — не проблема (замерено).** 1000 файлов × хвостовой read каталога:
-**~4мс** серийно, один поток (10k ≈ 40мс). Индекс локально нужен лишь чтобы не
-пересканировать на каждый запрос: ин-мемори индекс `{segment_id, source_id,
-min_ts, max_ts, sections}`, `refresh()` инкрементально по новым файлам/mtime.
+## Reader Integration
 
-**S3 — здесь вся сложность.** Каждый cheap-read = HTTP range-GET (p50 ~20-30мс,
-p99 ~80-150мс). Discovery 1000 сегментов:
+`kronika-reader::PgmUnit<R>` decodes one PGM container over any `ReadAt` source:
 
-| Стратегия | S3 Standard | S3 Express |
-|---|---|---|
-| Наивно серийно (1 GET/файл) | ~30с ❌ | ~7с ❌ |
-| Параллельно C=100 | ~0.3с (p99 ~1с) | ~0.1с |
-| **Манифест (1 GET)** | **~25мс** ✅ | ~7мс ✅ |
+- `File` for sealed segments;
+- `&[u8]` for active journal parts already read into a bounded buffer.
 
-Стоимость ничтожна (2000 GET = $0.0008); узкое место — латентность×число.
+`Segment` delegates to `PgmUnit<File>`. `LocalDirSnapshot` combines
+`LocalDir::scan` output into one visible list:
 
-**Раскладка хранения (РЕШЕНО): почасовое партиционирование в директории.** Сегменты
-кладутся в иерархию по времени вплоть до ЧАСА:
-`{root}/[{cluster}/]{yyyy}/{mm}/{dd}/{hh}/<first_ts>.pgm` — все сегменты одного часа
-в одной директории (напр. `.../2026/07/07/07/`). Осознанный отход от плоского
-`<micros>.pgm`, делается СРАЗУ (ретрофит дороже). Что даёт:
-- **Ограничивает число файлов в директории** размером «сколько сеалов за час» —
-  директория не растёт бесконечно, скан и манифест остаются малыми.
-- **Дискавери = выбор часовых директорий, пересекающих окно** (по пути, без чтения
-  файлов): запрос за час → 1-2 директории, за сутки → 24. На S3 час-путь = префикс,
-  `ListObjectsV2` по нему даёт список сегментов часа за 1 звонок.
-- **Граничный сегмент:** запечатанный в 07:05, но начатый в 06:58 лежит в `06/` по
-  `first_ts`, а данными заходит в час 07 → при запросе часа 07 заглянуть и в
-  предыдущую часовую директорию; точное пересечение — по `min_ts/max_ts` из
-  манифеста, час-директория лишь грубый бакет.
+- sealed units first;
+- live parts after sealed units;
+- live parts dropped when a sealed unit with the same `source_id` fully covers
+  `[min_ts, max_ts]`.
 
-**Индексная стратегия (по важности):**
+`LocalDirSnapshot` is a foundation read view. It exposes unit metadata and
+per-unit decode. It does not merge rows across units or provide cursor paging.
 
-1. **★ Манифест-сайдкар НА ЧАС** — решающая оптимизация для S3. В каждой часовой
-   директории один объект (`manifest.idx`) = конкатенация КАТАЛОГ-МЕТ сегментов
-   этого часа (`segment_id/source_id/min_ts/max_ts/section-presence`, НЕ тела; один
-   час × до ~1000 сегментов × ~64B ≈ ≤64KB) → **1 GET ≈ 25мс на час** вместо
-   1000-2000. **Пишется/аппендится коллектором на seal** в текущую часовую
-   директорию (+1 мелкий PUT). Дискавери окна = прочитать манифесты пересекающих
-   часов (1 GET/час, параллельно). Это «meta-файл = конкатенация хвостов»
-   (`segment-format.md §14`), привязанный к часу. Манифест — ОПТИМИЗАЦИЯ, не
-   источник истины: нет/битый → фолбэк на `ListObjectsV2` часа + параллельный
-   фан-аут каталогов (деградация, не падение); запись про удалённый сегмент →
-   пропуск.
-2. **Выбор часовых директорий по окну** (см. раскладку) прунит кандидатов ДО чтения
-   манифестов/каталогов: `[from,to]` → множество часов (+граничный предыдущий) →
-   их директории/префиксы.
-3. **Один range-GET на сегмент, не два.** Discovery-read = GET последних ~64KB
-   одним range (покрывает tail+catalog типичного сегмента) → 1 запрос/сегмент.
-4. **Параллельный фан-аут** (фолбэк без манифеста): пул переиспользуемых соединений,
-   C=50-200, ретрай медленнейшего 1% (гасит p99-хвост). Один префикс держит
-   5500 GET/с — burst 2000 в норме.
-5. **S3 Express One Zone — опциональный горячий тир** для свежих сегментов, где
-   критичен p99 (single-digit мс, нет лимита префикса, дешевле GET) ценой single-AZ.
-   Сначала манифест-на-Standard; Express — если p99 узкое место.
+## Memory Bounds
 
-**Что это даёт плану:** discovery 1000 файлов на S3 сжимается с ~30с (наивно) до
-~25мс (манифест). Работа делится: **(store)** читатель манифеста + LIST-прунинг +
-параллельный фан-аут + ин-мемори индекс за швом `SegmentSource`; **(коллектор)**
-пишет сегмент в почасовую директорию `.../yyyy/mm/dd/hh/` + аппендит ЛОКАЛЬНЫЙ
-per-hour `manifest.idx` на seal; **(archiver)** выгружает часовую директорию
-(сегменты + manifest) в S3 — S3-путь его зона (`docs/architecture.md`);
-**(формат)** почасовая раскладка закреплена в `docs/segment-format.md §14`. Тела
-секций фетчатся только для сегментов, пересекающих окно. Журнал `active.parts` —
-мутабельный вход, `refresh()` перечитывает его хвост инкрементально.
+- Journal scan reads one part body at a time.
+- `JournalLimits::max_part_len` caps part allocation.
+- `read_catalog` caps the catalog block before allocation.
+- `PgmUnit::decode` caps section bodies with `MAX_SECTION_BYTES`.
+- Store does not load sealed section bodies during discovery.
+- The in-memory index grows with the number of sealed files and valid active
+  parts, not with total segment body bytes.
 
-## 8. Ошибки
+## Corruption Semantics
 
-```rust
-pub enum StoreError {
-    OpenDir(io::Error),
-    UnknownSection(String),
-    // прочие фатальные, не связанные с одним битым файлом/кадром
-}
-pub struct StoreWarning { pub unit: SegmentId, pub reason: ReadError } // пропущено
-```
+- Incomplete final journal frame: `DamageKind::TornTail`.
+- Corrupt frame followed by a valid frame: `DamageKind::Middle`.
+- Corrupt final region with no later valid frame: `DamageKind::QuarantinedTail`.
+- Bad sealed file: `StoreWarning`.
 
-Два разных сигнала. `warnings` — про ПРОПУЩЕННЫЕ единицы (какой файл/кадр не
-прочитался и почему). `gaps` в `SectionPage` — про ВРЕМЕННОЕ покрытие (какие
-интервалы окна нечитаемы или непокрыты, §3a). Ошибка одного сегмента/part'а не
-роняет запрос — пропуск + `warnings` + при необходимости `gap`. Фатально только
-то, что делает ответ невозможным (нет директории, неизвестная секция).
+Store surfaces these signals. Query-level gaps are outside this foundation
+layer; they require row/window semantics above `LocalDirSnapshot`.
 
-**Контракт устойчивости (жёстко):** ни `open()`, ни `refresh()`, ни `section()` НЕ
-падают из-за ОДНОЙ битой единицы. Один порченый `.pgm` или один нечитаемый кадр
-журнала пропускается (→ `warnings` + при необходимости `gap`), store всё равно
-открывается и отдаёт весь читаемый остаток. Это осознанный урок из reftool: там
-первая загрузка истории (`build_index`) `?`-роняет весь провайдер на первом же
-битом чанке — история не отдаётся вообще, хотя `refresh` того же чанка
-толерантен. **`open` обязан быть так же толерантен, как `refresh`** — никакого `?`
-поперёк per-unit ошибки на пути открытия.
+## Storage Layout Context
 
-## 9. Раскладка крейта
+`docs/segment-format.md` defines hourly placement:
 
 ```text
-crates/kronika-store/src/
-  lib.rs      — Store, публичные типы, реэкспорт
-  index.rs    — обход директории: sealed каталоги + журнал (scan_journal) → индекс
-  journal.rs  — LiveJournal source: перечисление parts, refresh хвоста, seal-дедуп
-  query.rs    — section(): выбор единиц, декод, фильтр, слияние, пагинация
-  row.rs      — Value/Row + резолв str_id (DecodedSection → Row)
-  error.rs    — StoreError, StoreWarning
+{root}/{cluster_id}/{yyyy}/{mm}/{dd}/{hh}/{first_ts}.pgm
+{root}/{cluster_id}/{yyyy}/{mm}/{dd}/{hh}/manifest.idx
 ```
 
-Плюс небольшое расширение `kronika-reader`: сегмент-вью над байтовым диапазоном /
-in-memory part (единый декод для `.pgm` и журнальных parts).
+This foundation PR reads the local directory and sealed file tails. `manifest.idx`
+and remote backends are separate storage-discovery work.
 
-## 10. Тестирование (test-first, golden, host-independent)
+## Verification
 
-Фикстуры: `kronika_format::build_part` → `.pgm` в temp-директорию; журнал — кадры
-`PGMP` из тех же parts. `Store::open` → сверка точного результата. Тесты — ДО кода.
+Relevant checks:
 
-Обязательные кейсы:
-- пустая директория → пустые `sources`/`segments`;
-- один sealed-сегмент, одно окно → строки секции точно;
-- мультиоконность: несколько Entry одного `type_id` → агрегированы по порядку;
-- мультисегментность: окно поверх 2+ sealed → слияние по sort-key;
-- **живой журнал:** незапечатанные parts видны через `section()` (near-real-time);
-- **seal-переход:** sealed-сегмент + журнал с перекрывающимися parts → **без
-  задвоения** (дедуп по ts-range);
-- **`refresh`:** дописанный в журнал part появляется после `refresh`;
-- резолв `str_id`: строка (`Value::Str`) и усечённый blob (`Value::Blob`);
-- `NULL`-колонка → `Value::Null`;
-- окно вне всех единиц → пустые `rows`;
-- неизвестная секция → `UnknownSection`;
-- битый sealed/part → пропуск + `warnings`, остальные обслужены;
-- **`open` с битым `.pgm` среди валидных → open УСПЕШЕН**, остальные сегменты
-  отдаются (не BAIL на первом битом — прямой урок reftool `build_index`);
-- **порча в середине журнала** (битый кадр между валидными) → parts после него
-  читаются, разрыв отдан в `gaps` с границами по соседям;
-- **недописанный последний кадр** журнала → отложен (ни `gap`, ни `warning`),
-  появляется после `refresh`, когда коллектор дописал;
-- **разрыв, покрытый sealed:** битый кусок журнала, чьё время уже в `.pgm` →
-  `gaps` пуст (данные взяты из sealed), задвоения нет;
-- **журнал нечитаем целиком** → sealed обслужены, открытый `gap` в живом хвосте;
-- пагинация: курсор через границу единицы, устойчивость к повтору;
-- фильтр по `source`.
-
-## 11. Связь с API и будущим
-
-`kronika-store` — сырой read-слой (sealed + live). Декод одного сегмента —
-переиспользуется из `kronika-reader`; новое здесь — directory-индекс, живой журнал,
-единый запрос. Следующий срез — `pg_kronika-web`: тонкие axum-ручки
-`/v1/{version,sources,sections,segments,section/{name}}` поверх этих операций (по
-спеке `pgkronika-api-over-files-spec.md`), тоже golden-тестами. Слой аномалий/rate
-позже читает через этот же store; `gaps` существуют в том числе для него — **rate НЕ
-считается поперёк `gap`** (сброс базы / потолок dt), иначе всплеск или лживое
-затухание (ловушка reftool: OS-рейты без dt-cap затухают через часовой разрыв).
-Backend-шов `SegmentSource` — точка для http/s3.
-
-## 12. Проверки
-
-Гейт: `cargo fmt --check`, `clippy --workspace --all-targets -D warnings`,
-`cargo test --workspace`, `xtask check-deps` (`kronika-store` в графе разрешён;
-`axum` в крейт НЕ тянуть). Регистратор: ни порогов, ни производных — только сырые
-строки, окна, имена, резолвнутые строки.
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p xtask -- check-deps
+```

@@ -5,8 +5,8 @@
 //! only, no section bodies), and streams valid parts from the `active.parts`
 //! journal without loading the whole file.
 //!
-//! The crate intentionally depends only on `kronika-format`. Section decoding
-//! lives in `kronika-reader`.
+//! The crate depends only on `kronika-format`. Section decoding lives in
+//! `kronika-reader`.
 
 mod local;
 mod source;
