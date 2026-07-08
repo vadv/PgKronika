@@ -1,8 +1,7 @@
-//! Positional byte-source abstraction shared by the journal scanner and the
-//! segment/part decoders: read exactly `buf.len()` bytes at an absolute offset.
+//! Positional byte source shared by journal scanning and PGM decoding.
 use std::io;
 
-/// Positional byte-source: read exactly `buf.len()` bytes at an absolute byte offset.
+/// A byte source that supports exact positional reads.
 pub trait ReadAt {
     /// Reads exactly `buf.len()` bytes starting at `offset`.
     ///

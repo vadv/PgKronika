@@ -57,10 +57,9 @@ impl LocalDir {
         let mut sealed = Vec::new();
         let mut warnings = Vec::new();
 
-        // Scan active.parts FIRST so that a part mid-seal (journal reset but
-        // .pgm not yet written) is captured in `active` rather than lost.
-        // If a part has already been sealed by the time we list .pgm files,
-        // it appears in `sealed` and the snapshot layer deduplicates.
+        // Scan active.parts before sealed files. During seal, this captures the
+        // journal copy before reset; after seal, the later sealed-file scan
+        // finds the .pgm copy and the snapshot layer deduplicates.
         let journal_path = self.root.join("active.parts");
         let (active, damages) = if journal_path.exists() {
             let file = File::open(&journal_path)?;
@@ -68,10 +67,7 @@ impl LocalDir {
 
             let mut active_parts = Vec::new();
             for part_ref in report.parts {
-                // Guard against an oversized part before allocating.
-                // The journal scanner already bounds part length via JournalLimits,
-                // so this path is unreachable in practice; the explicit check
-                // mirrors the MAX_CATALOG_BYTES guard in read_catalog.
+                // Keep allocation bounded even if scanner limits change.
                 if part_ref.len as u64 > DEFAULT_MAX_PART_LEN {
                     warnings.push(StoreWarning {
                         path: journal_path.clone(),
@@ -83,15 +79,13 @@ impl LocalDir {
                     continue;
                 }
 
-                // Read just this part's bytes to validate its catalog.
+                // Read one bounded part to attach its catalog to the scan result.
                 let mut buf = vec![0_u8; part_ref.len];
                 file.read_exact_at(&mut buf, part_ref.offset as u64)?;
 
-                // validate_part (called inside the streaming scanner) is strictly
-                // stronger than validate_part_catalog — it also checks section CRCs.
-                // A part that reached this loop already passed the full check, so
-                // this catalog-only re-check should never fail. If it somehow does,
-                // record a warning rather than silently dropping the part.
+                // The streaming scanner already checked section CRCs. Re-checking
+                // the catalog keeps the scan result self-contained; a mismatch is
+                // reported instead of silently dropping the part.
                 match validate_part_catalog(&buf) {
                     Ok(catalog) => active_parts.push(ActivePart {
                         part: part_ref,
@@ -111,8 +105,7 @@ impl LocalDir {
             (Vec::new(), Vec::new())
         };
 
-        // List sealed .pgm files AFTER the journal scan; a part sealed between
-        // the two reads appears in `sealed` (never in neither).
+        // A part sealed after the journal scan appears in the sealed-file pass.
         let mut pgm_paths: Vec<PathBuf> = Vec::new();
         for entry_result in fs::read_dir(&self.root)? {
             match entry_result {

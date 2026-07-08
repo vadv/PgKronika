@@ -1,8 +1,8 @@
-//! `LocalDirSnapshot`: a unified read view over sealed and active units.
+//! Read view over sealed files and active journal parts.
 //!
-//! Combines `LocalDir`'s sealed `.pgm` segments and `active.parts` journal
-//! into one list, deduplicating active parts that a sealed unit already covers,
-//! and decoding both via `PgmUnit`.
+//! Combines `LocalDir`'s sealed `.pgm` segments and `active.parts` journal into
+//! one list, drops active parts that a sealed unit already covers, and decodes
+//! both through `PgmUnit`.
 
 use std::io;
 use std::path::Path;
@@ -35,11 +35,10 @@ enum Handle {
 
 /// A point-in-time view of a `LocalDir` combining sealed and active units.
 ///
-/// `open` calls `LocalDir::scan` with the journal-first ordering, so a part
-/// mid-seal is captured in `active` (before the `.pgm` is written) or in
-/// `sealed` (after), never lost.  `units()` then deduplicates: an active part
-/// whose `[min_ts, max_ts]` is fully covered by a sealed unit of the same
-/// `source_id` is dropped — the sealed file is the authoritative record.
+/// `open` calls `LocalDir::scan` with journal-first ordering. A part in the seal
+/// window is visible either from `active.parts` before reset or from a sealed
+/// `.pgm` after seal. `units()` drops an active part whose `[min_ts, max_ts]`
+/// range is fully covered by a sealed unit with the same `source_id`.
 #[derive(Debug)]
 pub struct LocalDirSnapshot {
     dir: LocalDir,
@@ -76,7 +75,7 @@ impl LocalDirSnapshot {
 
     /// Deduplicated list of units visible in this snapshot.
     ///
-    /// Sealed units appear first, then surviving live parts.  An active part is
+    /// Sealed units appear first, then surviving live parts. An active part is
     /// omitted when a sealed unit of the same `source_id` covers its entire
     /// `[min_ts, max_ts]` range.
     #[must_use]

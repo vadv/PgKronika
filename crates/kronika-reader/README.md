@@ -2,11 +2,10 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-reader` is the read and query core for PGM segments. `PgmUnit` decodes
-a PGM container over any `ReadAt` source — a sealed file or an in-memory journal
-part — through a single decode path. `LocalDirSnapshot` combines sealed segments
-with live `active.parts` entries, deduplicating parts already covered by a sealed
-segment.
+`kronika-reader` is the read core for PGM segments. `PgmUnit` decodes a PGM
+container over any `ReadAt` source — a sealed file or an in-memory journal part —
+through a single path. `LocalDirSnapshot` combines sealed segments with live
+`active.parts` entries and drops live parts already covered by a sealed segment.
 
 ## Opening a Segment
 
@@ -36,7 +35,8 @@ with `full_len` and `truncated`. That keeps a stored prefix distinct from the
 original full value. If the same id appears as both a string and a blob across
 parts, the blob wins.
 
-## Not Implemented Yet
+## Scope Boundaries
 
-Time-range queries, drill-down queries, the cross-segment `str_id` cache, and
-on-demand `dict.blobs` reads are left for later steps.
+This crate does not provide time-range queries, drill-down queries, a
+cross-segment `str_id` cache, or on-demand `dict.blobs` reads. Those APIs belong
+above `Segment`, `PgmUnit`, and `LocalDirSnapshot`.
