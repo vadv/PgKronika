@@ -25,8 +25,8 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use kronika_format::{
-    DamageKind, DamageRegion, FRAME_HEADER_LEN, FrameHeader, JournalLimits, PartError, PartRef,
-    ScanReport, scan_journal_streaming, validate_part,
+    DEFAULT_RESYNC_CHUNK, DamageKind, DamageRegion, FRAME_HEADER_LEN, FrameHeader, JournalLimits,
+    PartError, PartRef, ScanReport, scan_journal_streaming, validate_part,
 };
 
 /// Default cap for the whole journal file, bytes.
@@ -35,9 +35,6 @@ use kronika_format::{
 /// this cap is reached. The first frame after open/reset is exempt, so a tiny
 /// cap cannot wedge an empty journal.
 pub const DEFAULT_MAX_JOURNAL_LEN: usize = 1024 * 1024 * 1024;
-
-/// Search-window size for streaming recovery.
-const RESYNC_CHUNK: usize = 1 << 20;
 
 /// Configuration of one journal file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +199,7 @@ impl Journal {
                 "journal does not fit the address space",
             ))
         })?;
-        let mut scan = scan_file(&file, file_len, config.limits, RESYNC_CHUNK)?;
+        let mut scan = scan_file(&file, file_len, config.limits, DEFAULT_RESYNC_CHUNK)?;
         // The directory is the only per-frame state kept after recovery;
         // dropping the push-growth slack keeps it at exactly 16 B per part.
         scan.parts.shrink_to_fit();

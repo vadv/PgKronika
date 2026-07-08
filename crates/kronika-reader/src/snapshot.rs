@@ -158,7 +158,16 @@ impl LocalDirSnapshot {
                         format!("entry index {entry_idx} is out of range for active unit {idx}"),
                     ))
                 })?;
-                let bytes = self.dir.read_active_part(ap)?;
+                let bytes = match self.dir.read_active_part(ap) {
+                    Ok(b) => b,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::NotFound
+                            || err.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Err(ReadError::StaleSnapshot { unit_idx: idx });
+                    }
+                    Err(err) => return Err(ReadError::Io(err)),
+                };
                 let unit = PgmUnit::open(bytes.as_slice())?;
                 if unit.catalog() != &ap.catalog {
                     return Err(ReadError::StaleSnapshot { unit_idx: idx });
@@ -401,5 +410,29 @@ mod tests {
         assert!(!units[0].live);
         assert!(snap.scan.active.is_empty());
         assert!(snap.scan.damages.is_empty());
+    }
+
+    // When active.parts disappears (removed or truncated to zero) between
+    // snapshot time and decode_unit time, read_active_part returns NotFound or
+    // UnexpectedEof. decode_unit must map that to StaleSnapshot, not ReadError::Io.
+    #[test]
+    fn decode_unit_active_truncated_after_snapshot_returns_stale_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = make_part(1000, 2000, 7);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part)).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert_eq!(snap.units().len(), 1);
+        assert!(snap.units()[0].live);
+
+        // Remove the journal file to simulate post-seal reset.
+        fs::remove_file(&journal_path).unwrap();
+
+        let err = snap.decode_unit(0, 0).unwrap_err();
+        assert!(
+            matches!(err, ReadError::StaleSnapshot { unit_idx: 0 }),
+            "removed journal must return StaleSnapshot, got: {err}"
+        );
     }
 }
