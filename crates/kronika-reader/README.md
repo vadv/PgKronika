@@ -2,9 +2,11 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-reader` opens a sealed PGM segment and decodes its sections. It starts
-from the end catalog, then reads section bodies by the ranges stored there. The
-API uses positional reads and applies size limits before allocation.
+`kronika-reader` is the read core for PGM segments. `PgmUnit` decodes a PGM
+container over any `ReadAt` source — a sealed file or an in-memory journal part —
+through a single path. `LocalDirSnapshot` combines sealed segments with live
+`active.parts` entries, suppresses exact sealed/live duplicates, and exposes
+scan diagnostics.
 
 ## Opening a Segment
 
@@ -34,7 +36,18 @@ with `full_len` and `truncated`. That keeps a stored prefix distinct from the
 original full value. If the same id appears as both a string and a blob across
 parts, the blob wins.
 
-## Not Implemented Yet
+## Local Directory Snapshots
 
-Time-range queries, drill-down queries, the cross-segment `str_id` cache, and
-on-demand `dict.blobs` reads are left for later steps.
+`LocalDirSnapshot::units()` returns sealed units first and then live journal
+parts. A live part is hidden only when its catalog exactly matches a sealed unit
+catalog. Time-range overlap does not prove that the live part was finalized.
+
+`warnings()` returns skipped-file and skipped-part warnings. `damages()` returns
+typed `DamageRegion` values for corrupt `active.parts` byte ranges; valid parts
+around a damaged region remain visible.
+
+## Scope Boundaries
+
+This crate does not provide time-range queries, drill-down queries, a
+cross-segment `str_id` cache, or on-demand `dict.blobs` reads. Those APIs belong
+above `Segment`, `PgmUnit`, and `LocalDirSnapshot`.
