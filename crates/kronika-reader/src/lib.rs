@@ -8,10 +8,12 @@
 //! entries, suppresses exact sealed/live duplicates, and exposes scan
 //! diagnostics.
 
+mod query;
 mod snapshot;
 mod unit;
 
 pub use kronika_format::DamageRegion;
+pub use query::{LogicalColumn, LogicalSection, logical_section};
 pub use snapshot::{LocalDirSnapshot, UnitMeta};
 
 use std::collections::HashMap;
