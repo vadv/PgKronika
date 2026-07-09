@@ -1,0 +1,191 @@
+//! Union view of a logical section across its layout versions.
+
+use kronika_registry::{ColumnType, registry};
+
+/// One column in a logical section's union schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogicalColumn {
+    /// Column name.
+    pub name: &'static str,
+    /// On-disk value type (from the first version that introduces the column).
+    pub ty: ColumnType,
+}
+
+/// A logical section: the union of all layout versions sharing the same name.
+#[derive(Debug, Clone)]
+pub struct LogicalSection {
+    /// Source name, e.g. `"pg_stat_activity"`.
+    pub name: &'static str,
+    /// Raw type ids of all versions, ascending.
+    pub type_ids: Vec<u32>,
+    /// Union of columns across all versions, in first-appearance order
+    /// (scanning versions by ascending `type_id`).
+    pub columns: Vec<LogicalColumn>,
+    /// Sort key, identical across all versions.
+    pub sort_key: &'static [&'static str],
+}
+
+/// Build the union view of a logical section by name.
+///
+/// Returns `None` when no registered contract carries that name.
+///
+/// # Panics
+///
+/// Panics with a diagnostic when the registry contains contracts for this
+/// name that disagree on a column's type or on the sort key — a registry
+/// invariant violation that must be fixed in the registry, not coded around.
+#[must_use]
+pub fn logical_section(name: &str) -> Option<LogicalSection> {
+    // Collect all contracts for this name, sorted ascending by type_id.
+    let mut contracts: Vec<_> = registry().iter().filter(|c| c.name == name).collect();
+
+    if contracts.is_empty() {
+        return None;
+    }
+
+    contracts.sort_by_key(|c| c.type_id.get());
+
+    // Validate sort_key consistency across versions.
+    let sort_key = contracts[0].sort_key;
+    for contract in &contracts[1..] {
+        assert!(
+            contract.sort_key == sort_key,
+            "registry violation: logical section {:?} has inconsistent sort_key \
+             across versions — type_id {} has {:?}, type_id {} has {:?}",
+            name,
+            contracts[0].type_id.get(),
+            sort_key,
+            contract.type_id.get(),
+            contract.sort_key,
+        );
+    }
+
+    // Build union of columns by first appearance; reject type conflicts.
+    let mut columns: Vec<LogicalColumn> = Vec::new();
+    for contract in &contracts {
+        for col in contract.columns {
+            if let Some(existing) = columns.iter().find(|lc| lc.name == col.name) {
+                assert!(
+                    existing.ty == col.ty,
+                    "registry violation: logical section {:?} column {:?} has \
+                     conflicting types — first seen as {:?}, but type_id {} declares {:?}",
+                    name,
+                    col.name,
+                    existing.ty,
+                    contract.type_id.get(),
+                    col.ty,
+                );
+            } else {
+                columns.push(LogicalColumn {
+                    name: col.name,
+                    ty: col.ty,
+                });
+            }
+        }
+    }
+
+    let type_ids = contracts.iter().map(|c| c.type_id.get()).collect();
+
+    Some(LogicalSection {
+        name: contracts[0].name,
+        type_ids,
+        columns,
+        sort_key,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use kronika_registry::registry;
+
+    use super::logical_section;
+
+    #[test]
+    fn returns_none_for_unknown_name() {
+        assert!(logical_section("no_such_name").is_none());
+    }
+
+    #[test]
+    fn registry_wide_invariant_all_multi_version_names_succeed() {
+        // Collect all distinct names that appear in ≥2 contracts.
+        let mut names: Vec<&'static str> = registry().iter().map(|c| c.name).collect();
+        names.sort_unstable();
+        names.dedup();
+
+        for name in names {
+            let count = registry().iter().filter(|c| c.name == name).count();
+            if count >= 2 {
+                // Must not panic — a panic here means a registry violation.
+                let section = logical_section(name)
+                    .unwrap_or_else(|| panic!("logical_section({name:?}) returned None"));
+                assert!(
+                    section.type_ids.len() >= 2,
+                    "expected ≥2 type_ids for {name:?}"
+                );
+                // type_ids must be ascending.
+                for window in section.type_ids.windows(2) {
+                    assert!(
+                        window[0] < window[1],
+                        "type_ids not ascending for {name:?}: {window:?}"
+                    );
+                }
+                assert!(
+                    !section.columns.is_empty(),
+                    "union columns must not be empty for {name:?}"
+                );
+                assert!(
+                    !section.sort_key.is_empty(),
+                    "sort_key must not be empty for {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pg_stat_activity_union_is_correct() {
+        let section =
+            logical_section("pg_stat_activity").expect("pg_stat_activity must be in the registry");
+
+        // Three layout versions: 1_001_001, 1_001_002, 1_001_003.
+        assert_eq!(section.type_ids, vec![1_001_001, 1_001_002, 1_001_003]);
+
+        // type_ids are ascending.
+        for window in section.type_ids.windows(2) {
+            assert!(window[0] < window[1], "type_ids not ascending: {window:?}");
+        }
+
+        // Sort key is consistent across all versions.
+        assert_eq!(section.sort_key, ["ts", "pid"]);
+
+        // Columns shared by all versions appear (from V1).
+        let col_names: Vec<_> = section.columns.iter().map(|c| c.name).collect();
+        assert!(col_names.contains(&"ts"), "ts column must be present");
+        assert!(col_names.contains(&"pid"), "pid column must be present");
+        assert!(
+            col_names.contains(&"datname"),
+            "datname column must be present"
+        );
+
+        // V2-specific column (leader_pid added in PG13) must appear.
+        assert!(
+            col_names.contains(&"leader_pid"),
+            "leader_pid (V2+) must be in the union"
+        );
+
+        // V3-specific column (query_id added in PG14) must appear.
+        assert!(
+            col_names.contains(&"query_id"),
+            "query_id (V3 only) must be in the union"
+        );
+
+        // V1 columns precede version-specific additions (first-appearance order).
+        let ts_pos = col_names.iter().position(|&n| n == "ts").unwrap();
+        let leader_pos = col_names.iter().position(|&n| n == "leader_pid").unwrap();
+        let query_id_pos = col_names.iter().position(|&n| n == "query_id").unwrap();
+        assert!(ts_pos < leader_pos, "ts (V1) must precede leader_pid (V2)");
+        assert!(
+            leader_pos < query_id_pos,
+            "leader_pid (V2) must precede query_id (V3)"
+        );
+    }
+}
