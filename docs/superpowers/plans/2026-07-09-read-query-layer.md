@@ -114,27 +114,46 @@ pub fn cell_to_value(cell: &Cell, dict: &Dictionary) -> Value;  // + флаг «
 
 ---
 
-## Task 4: `section()` — merge + ts-фильтр (без курсора)
+## Task 4: батч-ядро `sections()` за один проход + `open_unit` (без курсора)
 
-**Files:** create `crates/kronika-reader/src/query/section.rs`.
+Веб тянет снапшот из нескольких метрик окна — ядро должно открывать сегменты один
+раз на батч, а не раз-на-метрику (§1.3a).
+
+**Files:** modify `crates/kronika-reader/src/snapshot.rs` (`open_unit`); create `crates/kronika-reader/src/query/section.rs`.
 **Produces:**
 ```rust
-pub struct SectionQuery<'a> { pub name:&'a str, pub source:u64, pub from:i64, pub to:i64, pub limit:usize }
+// snapshot.rs — открыть единицу ОДИН раз, переиспользовать для многих секций
+pub enum OpenUnit { Sealed(PgmUnit<File>), Active(PgmUnit<Vec<u8>>) }
+impl OpenUnit {
+    pub fn catalog(&self) -> &Catalog;
+    pub fn decode_rows(&self, entry:&Entry) -> Result<Vec<Row>, ReadError>;
+    pub fn dictionary(&self) -> Result<Dictionary, ReadError>;
+}
+impl LocalDirSnapshot { pub fn open_unit(&self, idx:usize) -> Result<OpenUnit, ReadError>; }
+// active: read_active_part байты один раз (стейл-проверка при open), дальше все секции из них.
+
+// query/section.rs
 pub struct SectionPage { pub section:String, pub source_id:u64, pub rows:Vec<OutRow>, pub gaps:Vec<Gap>, pub next_cursor:Option<Cursor> }
 pub enum QueryError { UnknownSection(String), Read(ReadError) }
-pub fn section(snap:&LocalDirSnapshot, q:SectionQuery) -> Result<SectionPage, QueryError>;
+pub fn sections(snap:&mut LocalDirSnapshot, source:u64, from:i64, to:i64, names:&[&str], limit:usize)
+    -> Result<BTreeMap<String, SectionPage>, QueryError>;   // &mut уже здесь: T6 навесит refresh-retry без ресигнатуры
+pub fn section(snap:&mut LocalDirSnapshot, name:&str, source:u64, from:i64, to:i64, limit:usize)
+    -> Result<SectionPage, QueryError>;   // = sections(&[name])[name]
 ```
-(В этой задаче `cursor` не вводить; `next_cursor: None`, `gaps: vec![]` — заполнит T5/T6.)
-Алгоритм §1.3: `logical_section(name)` → единицы `snap.units()` с `source_id==source` и
-пересечением окна → на единицу `unit_dictionary` + на каждый `entry` матчащего `type_id`
-(в т.ч. повтор = мультиокно) `decode_unit_rows` → `cell_to_value` по union-колонкам
-(отсутствующие Null) → фильтр `row["ts"] (Cell::Ts) ∈ [from,to]` → k-merge (min-heap) по
-`sort_key`-значениям → `limit`. Пик памяти: одна секция на единицу (≤`MAX_SECTION_ROWS`)
-× число единиц.
+(Курсор не вводить; `next_cursor: None`, `gaps: vec![]` — T5/T6.)
 
-**TDD:** одна единица → строки в порядке sort_key; мультиокно (повтор `type_id`);
-merge 2 sealed по sort_key; union v1+v3 (отсутствующие колонки Null); ts-фильтр отсекает
-вне окна; `limit` усекает; неизвестное имя → `UnknownSection`.
+Алгоритм §1.3a (ОДИН проход): `logical_section` каждого имени (нет → `UnknownSection`);
+отобрать единицы `snap.units()` `source_id==source` ∩ окно; **на единицу `open_unit` ОДИН
+раз** (словарь из неё один раз) → для каждого имени: каждый `entry` матчащего `type_id`
+(повтор = мультиокно) `OpenUnit::decode_rows` → `cell_to_value` по union-колонкам
+(отсутствующие Null) → фильтр `row["ts"](Cell::Ts) ∈ [from,to]` → per-name аккумулятор;
+после обхода — per-name k-merge (min-heap по `sort_key`) + `limit`. `section(name)` =
+`sections(&[name])`. Пик памяти: `names × units × MAX_SECTION_ROWS`.
+
+**TDD:** одна единица (порядок sort_key); мультиокно; merge 2 sealed; union v1+v3 (Null);
+ts-фильтр; `limit`; неизвестное имя → `UnknownSection`; **батч 2 имён открывает каждую
+единицу ОДИН раз** — счётчик вызовов `open_unit` (тест-хук/обёртка) == число единиц окна,
+не имён×единиц.
 
 ---
 
@@ -168,8 +187,7 @@ impl Cursor { pub fn encode(&self)->String; pub fn decode(s:&str)->Result<Self,Q
 (`CorruptJournalFrame`), непокрытые интервалы окна (`[from,to]` минус объединение
 `[min_ts,max_ts]` читаемых единиц источника → `NoCoverage`).
 
-`snap` в `section()` — `&mut LocalDirSnapshot` (нужен `refresh`); пересмотреть сигнатуру
-T4 под `&mut` заранее.
+`snap` в `section()` уже `&mut LocalDirSnapshot` (сигнатура задана в T4) — `refresh` доступен.
 
 **TDD:** стейл (заменить/удалить active между units и decode) → refresh+retry → консистентно;
 битый sealed → `CorruptSegment`-gap, остальное отдано; окно вне единиц → `NoCoverage`-gap
