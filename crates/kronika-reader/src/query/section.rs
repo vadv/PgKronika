@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::query::cursor::Cursor;
 use crate::query::logical::{LogicalSection, logical_section};
 use crate::query::value::{Gap, OutRow, Value, cell_to_value};
 use crate::{Cell, LocalDirSnapshot, ReadError};
@@ -23,7 +24,8 @@ pub struct SectionPage {
     pub rows: Vec<OutRow>,
     /// Coverage holes in the window. Always empty until a later stage fills it.
     pub gaps: Vec<Gap>,
-    /// Cursor to resume after the last row. Always `None` until a later stage.
+    /// Cursor to resume after the last returned row, or `None` when this page
+    /// exhausts the stream.
     pub next_cursor: Option<Cursor>,
 }
 
@@ -32,6 +34,8 @@ pub struct SectionPage {
 pub enum QueryError {
     /// No registered contract carries this section name.
     UnknownSection(String),
+    /// A resume cursor was malformed or belonged to another source.
+    BadCursor(String),
     /// Reading a unit or decoding a section failed.
     Read(ReadError),
 }
@@ -42,20 +46,17 @@ impl From<ReadError> for QueryError {
     }
 }
 
-/// Placeholder for the pagination cursor a later stage introduces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cursor;
-
 /// Read one logical section for a source and window.
 ///
 /// Equivalent to [`sections`] with a single name, returning that name's page.
 /// A registered name always yields a page (possibly with no rows); an
 /// unregistered one fails before any page is built, so [`sections`] returns
-/// exactly one entry here.
+/// exactly one entry here. `cursor`, when set, resumes after the row it pins.
 ///
 /// # Errors
 ///
-/// Returns [`QueryError::UnknownSection`] when `name` is not registered, or
+/// Returns [`QueryError::UnknownSection`] when `name` is not registered,
+/// [`QueryError::BadCursor`] when `cursor` targets another source, or
 /// [`QueryError::Read`] when a unit cannot be opened or decoded.
 pub fn section(
     snap: &mut LocalDirSnapshot,
@@ -64,8 +65,11 @@ pub fn section(
     from: i64,
     to: i64,
     limit: usize,
+    cursor: Option<Cursor>,
 ) -> Result<SectionPage, QueryError> {
-    let pages = sections(snap, source, from, to, &[name], limit)?;
+    let cursors: BTreeMap<String, Cursor> =
+        cursor.map(|c| (name.to_owned(), c)).into_iter().collect();
+    let pages = sections(snap, source, from, to, &[name], limit, &cursors)?;
     pages
         .into_values()
         .next()
@@ -74,9 +78,15 @@ pub fn section(
 
 /// Read several logical sections for a source and window in one pass.
 ///
+/// A section named in `cursors` resumes after the row its cursor pins: rows are
+/// ordered by [`compare_full`], every row at or before the cursor is dropped,
+/// and the remaining tail is paged. When the tail exceeds `limit`, the page's
+/// `next_cursor` pins its last row so a further call continues the stream.
+///
 /// # Errors
 ///
-/// Returns [`QueryError::UnknownSection`] for the first unregistered name, or
+/// Returns [`QueryError::UnknownSection`] for the first unregistered name,
+/// [`QueryError::BadCursor`] when a cursor targets another source, or
 /// [`QueryError::Read`] when a unit cannot be opened or decoded.
 // `&mut` is reserved for a later refresh-on-stale retry; today only `&self`
 // methods run through it.
@@ -88,6 +98,7 @@ pub fn sections(
     to: i64,
     names: &[&str],
     limit: usize,
+    cursors: &BTreeMap<String, Cursor>,
 ) -> Result<BTreeMap<String, SectionPage>, QueryError> {
     // Resolve every requested name up front; an unknown name fails the whole call.
     let mut requested: Vec<(String, LogicalSection)> = Vec::with_capacity(names.len());
@@ -144,23 +155,52 @@ pub fn sections(
         }
     }
 
-    // Order each buffer by its section's sort key, then truncate to `limit`.
-    let pages = requested
-        .into_iter()
-        .zip(buffers)
-        .map(|((name, logical), mut rows)| {
-            rows.sort_by(|a, b| compare_by_sort_key(a, b, logical.sort_key));
-            rows.truncate(limit);
-            let page = SectionPage {
-                section: name.clone(),
-                source_id: source,
-                rows,
-                gaps: Vec::new(),
-                next_cursor: None,
-            };
-            (name, page)
-        })
-        .collect();
+    // Order each buffer by the section's total order, drop everything at or
+    // before the resume cursor, then page the tail.
+    let mut pages = BTreeMap::new();
+    for ((name, logical), mut rows) in requested.into_iter().zip(buffers) {
+        let columns: Vec<&str> = logical.columns.iter().map(|col| col.name).collect();
+        rows.sort_by(|a, b| compare_full(a, b, &columns, logical.sort_key));
+
+        if let Some(cursor) = cursors.get(&name) {
+            if cursor.source_id != source {
+                return Err(QueryError::BadCursor(format!(
+                    "cursor source {} does not match query source {source}",
+                    cursor.source_id
+                )));
+            }
+            // Pair the cursor's values back with their column names so the same
+            // total order compares the cursor against every candidate row.
+            let cursor_row: OutRow = columns
+                .iter()
+                .map(|&name| name.to_owned())
+                .zip(cursor.values.iter().cloned())
+                .collect();
+            let start = rows.partition_point(|row| {
+                compare_full(row, &cursor_row, &columns, logical.sort_key)
+                    != std::cmp::Ordering::Greater
+            });
+            rows.drain(..start);
+        }
+
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        // A cursor pins the last returned row, so an empty page (e.g. `limit`
+        // of zero) never emits one, even when rows remain.
+        let next_cursor = rows.last().filter(|_| has_more).map(|row| Cursor {
+            source_id: source,
+            values: row.iter().map(|(_, v)| v.clone()).collect(),
+        });
+
+        let page = SectionPage {
+            section: name.clone(),
+            source_id: source,
+            rows,
+            gaps: Vec::new(),
+            next_cursor,
+        };
+        pages.insert(name, page);
+    }
     Ok(pages)
 }
 
@@ -173,6 +213,28 @@ fn compare_by_sort_key(a: &OutRow, b: &OutRow, sort_key: &[&str]) -> std::cmp::O
         let va = row_value(a, key);
         let vb = row_value(b, key);
         let ordering = compare_values(va, vb);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// A total order over rows: sort key first, then the remaining union columns.
+///
+/// Ties on the sort key break on the other `columns` (those not in `sort_key`,
+/// in `columns` order), so equal-sort-key rows still order deterministically —
+/// the property keyset pagination needs to tile a stream without gap or repeat.
+fn compare_full(a: &OutRow, b: &OutRow, columns: &[&str], sort_key: &[&str]) -> std::cmp::Ordering {
+    let by_key = compare_by_sort_key(a, b, sort_key);
+    if by_key != std::cmp::Ordering::Equal {
+        return by_key;
+    }
+    for &col in columns {
+        if sort_key.contains(&col) {
+            continue;
+        }
+        let ordering = compare_values(row_value(a, col), row_value(b, col));
         if ordering != std::cmp::Ordering::Equal {
             return ordering;
         }
@@ -245,6 +307,7 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
@@ -253,9 +316,14 @@ mod tests {
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use kronika_registry::{StrId, Ts};
 
-    use super::{QueryError, Value, section, sections};
+    use super::{Cursor, QueryError, Value, section, sections};
     use crate::LocalDirSnapshot;
     use crate::snapshot::OPEN_UNIT_CALLS;
+
+    /// No cursors; the common resume-nothing case for the batch entry point.
+    fn no_cursors() -> BTreeMap<String, Cursor> {
+        BTreeMap::new()
+    }
 
     /// One archiver row with the given timestamp and archived count.
     fn archiver_row(ts: i64, archived: i64) -> PgStatArchiver {
@@ -377,7 +445,8 @@ mod tests {
         fs::write(dir.path().join("1000.pgm"), &part).unwrap();
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100).expect("section");
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(
             ts,
@@ -404,7 +473,8 @@ mod tests {
         fs::write(dir.path().join("1000.pgm"), &part).unwrap();
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100).expect("section");
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(ts, vec![&Value::Ts(1000), &Value::Ts(2000)]);
     }
@@ -424,7 +494,8 @@ mod tests {
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         assert_eq!(snap.units().len(), 2);
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100).expect("section");
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(
             ts,
@@ -451,7 +522,8 @@ mod tests {
         fs::write(dir.path().join("2000.pgm"), &part_v1).unwrap();
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page = section(&mut snap, "pg_stat_activity", 7, 0, 10_000, 100).expect("section");
+        let page =
+            section(&mut snap, "pg_stat_activity", 7, 0, 10_000, 100, None).expect("section");
         assert_eq!(page.rows.len(), 2);
 
         // The union carries leader_pid; ordering is by (ts, pid).
@@ -491,7 +563,8 @@ mod tests {
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // Window [2000, 3000]: boundaries included, 1000 and 4000 excluded.
-        let page = section(&mut snap, "pg_stat_archiver", 7, 2000, 3000, 100).expect("section");
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 2000, 3000, 100, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(ts, vec![&Value::Ts(2000), &Value::Ts(3000)]);
     }
@@ -509,7 +582,7 @@ mod tests {
         fs::write(dir.path().join("1000.pgm"), &part).unwrap();
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 2).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 2, None).expect("section");
         let ts: Vec<&Value> = page.rows.iter().map(|r| cell(r, "ts")).collect();
         assert_eq!(
             ts,
@@ -522,10 +595,21 @@ mod tests {
     fn unknown_section_name_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let err = sections(&mut snap, 7, 0, 10_000, &["no_such_section"], 100).unwrap_err();
+        let err = sections(
+            &mut snap,
+            7,
+            0,
+            10_000,
+            &["no_such_section"],
+            100,
+            &no_cursors(),
+        )
+        .unwrap_err();
         match err {
             QueryError::UnknownSection(name) => assert_eq!(name, "no_such_section"),
-            other @ QueryError::Read(_) => panic!("expected UnknownSection, got {other:?}"),
+            other @ (QueryError::Read(_) | QueryError::BadCursor(_)) => {
+                panic!("expected UnknownSection, got {other:?}")
+            }
         }
     }
 
@@ -564,6 +648,7 @@ mod tests {
             10_000,
             &["pg_stat_archiver", "pg_stat_activity"],
             100,
+            &no_cursors(),
         )
         .expect("sections");
         assert_eq!(
@@ -594,8 +679,17 @@ mod tests {
         fs::write(dir.path().join("1000.pgm"), &part).unwrap();
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let one = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100).expect("section");
-        let many = sections(&mut snap, 7, 0, 10_000, &["pg_stat_archiver"], 100).expect("sections");
+        let one = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
+        let many = sections(
+            &mut snap,
+            7,
+            0,
+            10_000,
+            &["pg_stat_archiver"],
+            100,
+            &no_cursors(),
+        )
+        .expect("sections");
         assert_eq!(one, many["pg_stat_archiver"]);
     }
 
@@ -608,7 +702,8 @@ mod tests {
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         // Query source 7 — the only unit belongs to source 42.
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100).expect("section");
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
         assert!(page.rows.is_empty(), "no rows for a different source");
         assert_eq!(page.source_id, 7);
     }
@@ -626,7 +721,7 @@ mod tests {
 
         fs::remove_file(&journal_path).unwrap();
 
-        let err = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100).unwrap_err();
+        let err = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -797,9 +892,205 @@ mod tests {
         fs::write(dir.path().join("1000.pgm"), &part).unwrap();
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
-        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 0).expect("section");
+        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 0, None).expect("section");
         assert!(page.rows.is_empty(), "limit 0 yields no rows");
         assert!(page.gaps.is_empty());
         assert!(page.next_cursor.is_none());
+    }
+
+    // ---- keyset pagination ----
+
+    /// Read one archiver section, paging by `limit` and following `next_cursor`
+    /// until it runs out. Returns each page's `archived_count` sequence.
+    fn page_archived_counts(
+        snap: &mut LocalDirSnapshot,
+        source: u64,
+        limit: usize,
+    ) -> Vec<Vec<i64>> {
+        let mut pages = Vec::new();
+        let mut cursor: Option<Cursor> = None;
+        loop {
+            let page = section(
+                snap,
+                "pg_stat_archiver",
+                source,
+                0,
+                10_000,
+                limit,
+                cursor.clone(),
+            )
+            .expect("section");
+            let counts: Vec<i64> = page
+                .rows
+                .iter()
+                .map(|r| match cell(r, "archived_count") {
+                    Value::I64(v) => *v,
+                    other => panic!("archived_count is I64, got {other:?}"),
+                })
+                .collect();
+            pages.push(counts);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        pages
+    }
+
+    #[test]
+    fn pagination_covers_every_row_once_across_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[
+            archiver_row(1000, 1),
+            archiver_row(2000, 2),
+            archiver_row(3000, 3),
+            archiver_row(4000, 4),
+            archiver_row(5000, 5),
+        ])
+        .expect("encode");
+        let part = part_from(&[(1_008_001, 5, body)], 1000, 5000, 7);
+        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let pages = page_archived_counts(&mut snap, 7, 2);
+        // limit 2 over 5 rows: [1,2], [3,4], [5], then the stream is exhausted.
+        assert_eq!(pages, vec![vec![1, 2], vec![3, 4], vec![5]]);
+    }
+
+    #[test]
+    fn pagination_across_unit_boundary_loses_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two sealed units whose rows interleave by ts, so a page that crosses
+        // the boundary must merge both units, not restart per unit.
+        let body_a = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(3000, 3)])
+            .expect("encode");
+        let part_a = part_from(&[(1_008_001, 2, body_a)], 1000, 3000, 7);
+        fs::write(dir.path().join("1000.pgm"), &part_a).unwrap();
+
+        let body_b = PgStatArchiver::encode(&[archiver_row(2000, 2), archiver_row(4000, 4)])
+            .expect("encode");
+        let part_b = part_from(&[(1_008_001, 2, body_b)], 2000, 4000, 7);
+        fs::write(dir.path().join("2000.pgm"), &part_b).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert_eq!(snap.units().len(), 2);
+        let pages = page_archived_counts(&mut snap, 7, 3);
+        // Merged ts order 1000..4000: page1=[1,2,3] spans both units, page2=[4].
+        assert_eq!(pages, vec![vec![1, 2, 3], vec![4]]);
+    }
+
+    #[test]
+    fn pagination_breaks_ties_on_non_sort_key_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two rows share the sort key (ts), differing only in archived_count.
+        // The total order must still split them so a cursor lands between.
+        let body = PgStatArchiver::encode(&[archiver_row(5000, 1), archiver_row(5000, 2)])
+            .expect("encode");
+        let part = part_from(&[(1_008_001, 2, body)], 5000, 5000, 7);
+        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        // limit 1 cuts between the two equal-ts rows.
+        let page1 =
+            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 1, None).expect("section page1");
+        assert_eq!(
+            page1.rows.iter().map(|r| cell(r, "ts")).collect::<Vec<_>>(),
+            vec![&Value::Ts(5000)]
+        );
+        assert_eq!(cell(&page1.rows[0], "archived_count"), &Value::I64(1));
+        let cursor = page1.next_cursor.expect("more rows remain after the tie");
+
+        let page2 = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 1, Some(cursor))
+            .expect("section page2");
+        assert_eq!(
+            cell(&page2.rows[0], "archived_count"),
+            &Value::I64(2),
+            "page2 continues with the second equal-ts row, no repeat or skip"
+        );
+        assert!(page2.next_cursor.is_none(), "two rows, both now returned");
+    }
+
+    #[test]
+    fn last_page_has_no_next_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
+            .expect("encode");
+        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
+        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        // limit equals the row count: the first page already drains the stream.
+        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 2, None).expect("section");
+        assert_eq!(page.rows.len(), 2);
+        assert!(
+            page.next_cursor.is_none(),
+            "a page that returns the last row emits no cursor"
+        );
+    }
+
+    #[test]
+    fn broken_cursor_text_is_rejected() {
+        let err = Cursor::decode("this is not a cursor").unwrap_err();
+        assert!(matches!(err, QueryError::BadCursor(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn cursor_from_another_source_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
+        let part = part_from(&[(1_008_001, 1, body)], 1000, 1000, 7);
+        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        // A cursor minted for source 42, replayed against source 7.
+        let foreign = Cursor {
+            source_id: 42,
+            values: vec![Value::Ts(1000)],
+        };
+        let err = section(
+            &mut snap,
+            "pg_stat_archiver",
+            7,
+            0,
+            10_000,
+            100,
+            Some(foreign),
+        )
+        .unwrap_err();
+        assert!(matches!(err, QueryError::BadCursor(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn compare_full_breaks_sort_key_ties_on_remaining_columns() {
+        use std::cmp::Ordering;
+        let columns = ["ts", "archived_count"];
+        let sort_key = ["ts"];
+        let low: super::OutRow = vec![
+            ("ts".to_owned(), Value::Ts(5)),
+            ("archived_count".to_owned(), Value::I64(1)),
+        ];
+        let high: super::OutRow = vec![
+            ("ts".to_owned(), Value::Ts(5)),
+            ("archived_count".to_owned(), Value::I64(2)),
+        ];
+        // Equal sort key; the non-key column decides.
+        assert_eq!(
+            super::compare_full(&low, &high, &columns, &sort_key),
+            Ordering::Less
+        );
+        // Sort key alone would tie these.
+        assert_eq!(
+            super::compare_by_sort_key(&low, &high, &sort_key),
+            Ordering::Equal
+        );
+        // A leading sort-key difference decides before the tie-break runs.
+        let later: super::OutRow = vec![
+            ("ts".to_owned(), Value::Ts(6)),
+            ("archived_count".to_owned(), Value::I64(0)),
+        ];
+        assert_eq!(
+            super::compare_full(&high, &later, &columns, &sort_key),
+            Ordering::Less
+        );
     }
 }
