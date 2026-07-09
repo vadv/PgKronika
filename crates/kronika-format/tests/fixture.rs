@@ -21,6 +21,7 @@ use kronika_format::{Catalog, Entry, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
 use crc as _;
 use proptest as _;
 use sha2 as _;
+use tempfile as _;
 use xxhash_rust as _;
 
 const SEGMENT: &[u8] = include_bytes!("fixtures/minimal.pgm");

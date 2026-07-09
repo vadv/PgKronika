@@ -1104,6 +1104,7 @@ dependencies = [
  "crc",
  "proptest",
  "sha2 0.10.9",
+ "tempfile",
  "xxhash-rust",
 ]
 
@@ -1114,6 +1115,7 @@ dependencies = [
  "arrow-array",
  "kronika-format",
  "kronika-registry",
+ "kronika-store",
  "kronika-writer",
  "parquet",
  "tempfile",
@@ -1166,6 +1168,10 @@ dependencies = [
 [[package]]
 name = "kronika-store"
 version = "0.0.0"
+dependencies = [
+ "kronika-format",
+ "tempfile",
+]
 
 [[package]]
 name = "kronika-store-http"

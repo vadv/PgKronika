@@ -5,8 +5,9 @@
 
 use std::error::Error;
 use std::fmt;
+use std::io;
 
-use crate::{Catalog, DecodeError, Entry, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
+use crate::{Catalog, DecodeError, Entry, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex, crc32c};
 
 /// Magic bytes opening every journal frame.
 pub const FRAME_MAGIC: [u8; 4] = *b"PGMP";
@@ -18,6 +19,9 @@ pub const FRAME_HEADER_LEN: usize = 16;
 ///
 /// This is a starting value, not a fixed format constant.
 pub const DEFAULT_MAX_PART_LEN: u64 = 64 * 1024 * 1024;
+
+/// Default resync window size for streaming journal recovery, bytes.
+pub const DEFAULT_RESYNC_CHUNK: usize = 1 << 20;
 
 /// Header of one journal frame.
 ///
@@ -455,6 +459,183 @@ pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
     report
 }
 
+/// Scan a journal source frame by frame, keeping peak memory to one part body.
+///
+/// Produces a [`ScanReport`] identical to `scan_journal` over the same bytes.
+///
+/// `resync_chunk` is the caller-owned read-window size used when searching past
+/// damage. The window allocation is proportional to `resync_chunk`; a value of
+/// `1 << 20` (1 MiB) is a reasonable default. Must be greater than zero.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when `resync_chunk` is zero.
+/// Returns an I/O error if `reader` fails on any read or on `byte_len`.
+pub fn scan_journal_streaming<R: ReadAt>(
+    reader: &R,
+    limits: JournalLimits,
+    resync_chunk: usize,
+) -> io::Result<ScanReport> {
+    if resync_chunk == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resync_chunk must be greater than zero",
+        ));
+    }
+    let overlap = FRAME_MAGIC.len() - 1;
+    resync_chunk.checked_add(overlap).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resync_chunk + overlap overflows usize",
+        )
+    })?;
+    let total_len = usize::try_from(reader.byte_len()?).map_err(|_overflow| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "source does not fit the address space",
+        )
+    })?;
+
+    let mut report = ScanReport::default();
+    let mut part_buf = Vec::new();
+    let mut pos = 0_usize;
+
+    while pos < total_len {
+        match streaming_frame_at(reader, total_len, pos, limits, &mut part_buf)? {
+            StreamingFrame::Valid { body_len } => {
+                report.parts.push(PartRef {
+                    offset: pos + FRAME_HEADER_LEN,
+                    len: body_len,
+                });
+                pos += FRAME_HEADER_LEN + body_len;
+                report.valid_len = pos;
+            }
+            StreamingFrame::Torn => {
+                report.damages.push(DamageRegion {
+                    from: pos,
+                    kind: DamageKind::TornTail,
+                });
+                return Ok(report);
+            }
+            StreamingFrame::Damaged { implied_end } => {
+                if let Some(next) = streaming_resync(
+                    reader,
+                    total_len,
+                    pos,
+                    implied_end,
+                    limits,
+                    &mut part_buf,
+                    resync_chunk,
+                )? {
+                    report.damages.push(DamageRegion {
+                        from: pos,
+                        kind: DamageKind::Middle { resumed_at: next },
+                    });
+                    pos = next;
+                    continue;
+                }
+                let kind = if implied_end == Some(total_len) {
+                    DamageKind::TornTail
+                } else {
+                    DamageKind::QuarantinedTail
+                };
+                report.damages.push(DamageRegion { from: pos, kind });
+                return Ok(report);
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Outcome of checking one frame position in the streaming scanner.
+enum StreamingFrame {
+    Valid { body_len: usize },
+    Torn,
+    Damaged { implied_end: Option<usize> },
+}
+
+fn streaming_frame_at<R: ReadAt>(
+    reader: &R,
+    total_len: usize,
+    pos: usize,
+    limits: JournalLimits,
+    part_buf: &mut Vec<u8>,
+) -> io::Result<StreamingFrame> {
+    let rem = total_len - pos;
+    if rem < FRAME_HEADER_LEN {
+        return Ok(StreamingFrame::Torn);
+    }
+    let mut header_bytes = [0_u8; FRAME_HEADER_LEN];
+    reader.read_exact_at(&mut header_bytes, pos as u64)?;
+    let Ok(header) = FrameHeader::decode(header_bytes) else {
+        return Ok(StreamingFrame::Damaged { implied_end: None });
+    };
+    if header.part_len > limits.max_part_len {
+        return Ok(StreamingFrame::Damaged { implied_end: None });
+    }
+    let Ok(body_len) = usize::try_from(header.part_len) else {
+        return Ok(StreamingFrame::Damaged { implied_end: None });
+    };
+    if rem - FRAME_HEADER_LEN < body_len {
+        return Ok(StreamingFrame::Torn);
+    }
+    part_buf.resize(body_len, 0);
+    reader.read_exact_at(&mut part_buf[..body_len], (pos + FRAME_HEADER_LEN) as u64)?;
+    if validate_part(&part_buf[..body_len]).is_err() {
+        return Ok(StreamingFrame::Damaged {
+            implied_end: Some(pos + FRAME_HEADER_LEN + body_len),
+        });
+    }
+    Ok(StreamingFrame::Valid { body_len })
+}
+
+fn streaming_resync<R: ReadAt>(
+    reader: &R,
+    total_len: usize,
+    damaged_at: usize,
+    implied_end: Option<usize>,
+    limits: JournalLimits,
+    part_buf: &mut Vec<u8>,
+    chunk_len: usize,
+) -> io::Result<Option<usize>> {
+    if let Some(boundary) = implied_end
+        && boundary < total_len
+        && matches!(
+            streaming_frame_at(reader, total_len, boundary, limits, part_buf)?,
+            StreamingFrame::Valid { .. }
+        )
+    {
+        return Ok(Some(boundary));
+    }
+
+    let overlap = FRAME_MAGIC.len() - 1;
+    let mut window = vec![0_u8; chunk_len + overlap];
+    let mut base = damaged_at + 1;
+    while base + FRAME_HEADER_LEN <= total_len {
+        let take = (total_len - base).min(window.len());
+        reader.read_exact_at(&mut window[..take], base as u64)?;
+
+        let mut from = 0;
+        while let Some(found) = find_magic(&window[from..take]) {
+            let at = base + from + found;
+            if matches!(
+                streaming_frame_at(reader, total_len, at, limits, part_buf)?,
+                StreamingFrame::Valid { .. }
+            ) {
+                return Ok(Some(at));
+            }
+            from = from + found + 1;
+        }
+
+        if base + take >= total_len {
+            break;
+        }
+        base += chunk_len;
+    }
+    Ok(None)
+}
+
 /// Outcome of checking one frame position.
 enum FrameCheck {
     /// A valid frame with a validated part of this length.
@@ -531,6 +712,86 @@ fn find_magic(haystack: &[u8]) -> Option<usize> {
     haystack
         .windows(FRAME_MAGIC.len())
         .position(|window| window == FRAME_MAGIC)
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    fn framed(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for p in parts {
+            out.extend_from_slice(
+                &FrameHeader {
+                    part_len: p.len() as u64,
+                }
+                .encode(),
+            );
+            out.extend_from_slice(p);
+        }
+        out
+    }
+    fn sample_part() -> Vec<u8> {
+        build_part(
+            &[SectionInput {
+                type_id: 1_006_001,
+                rows: 0,
+                body: b"",
+            }],
+            PartMeta {
+                min_ts: 1,
+                max_ts: 2,
+                source_id: 7,
+            },
+        )
+    }
+    #[test]
+    fn streaming_matches_buffer_on_clean_journal() {
+        let p = sample_part();
+        let buf = framed(&[&p, &p]);
+        let want = scan_journal(&buf, JournalLimits::default());
+        let got =
+            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
+        assert_eq!(got, want);
+    }
+    #[test]
+    fn streaming_matches_buffer_on_torn_tail() {
+        let p = sample_part();
+        let mut buf = framed(&[&p]);
+        buf.extend_from_slice(&FrameHeader { part_len: 999 }.encode()); // header for absent body
+        let want = scan_journal(&buf, JournalLimits::default());
+        let got =
+            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
+        assert_eq!(got, want);
+    }
+    #[test]
+    fn streaming_matches_buffer_on_middle_corruption() {
+        let p = sample_part();
+        let mut buf = framed(&[&p]);
+        buf.extend_from_slice(&[0xFF; 8]); // garbage between valid frames
+        buf.extend_from_slice(&framed(&[&p]));
+        let want = scan_journal(&buf, JournalLimits::default());
+        let got =
+            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn resync_chunk_zero_returns_invalid_input() {
+        let p = sample_part();
+        let buf = framed(&[&p]);
+        let err = scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 0)
+            .expect_err("resync_chunk=0 must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn resync_chunk_overflow_returns_invalid_input() {
+        let p = sample_part();
+        let buf = framed(&[&p]);
+        let err = scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), usize::MAX)
+            .expect_err("resync_chunk=usize::MAX must be rejected due to overflow");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
 }
 
 #[cfg(test)]
