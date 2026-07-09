@@ -13,8 +13,11 @@ mod snapshot;
 mod unit;
 
 pub use kronika_format::DamageRegion;
-pub use query::{Gap, GapReason, LogicalColumn, LogicalSection, OutRow, Value, logical_section};
-pub use snapshot::{LocalDirSnapshot, UnitMeta};
+pub use query::{
+    Cursor, Gap, GapReason, LogicalColumn, LogicalSection, OutRow, QueryError, SectionPage, Value,
+    logical_section, section, sections,
+};
+pub use snapshot::{LocalDirSnapshot, OpenUnit, UnitMeta};
 
 use std::collections::HashMap;
 use std::error::Error;

@@ -46,6 +46,15 @@ impl ReadAt for &[u8] {
     }
 }
 
+impl ReadAt for Vec<u8> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.as_slice().read_exact_at(buf, offset)
+    }
+    fn byte_len(&self) -> io::Result<u64> {
+        Ok(self.len() as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ReadAt;
@@ -74,5 +83,20 @@ mod tests {
         let mut buf = [0_u8; 5];
         file.read_exact_at(&mut buf, 6).unwrap();
         assert_eq!(&buf, b"world");
+    }
+    #[test]
+    fn vec_reads_at_offset_and_reports_len() {
+        let data: Vec<u8> = b"0123456789".to_vec();
+        assert_eq!(data.byte_len().unwrap(), 10);
+        let mut buf = [0_u8; 3];
+        data.read_exact_at(&mut buf, 4).unwrap();
+        assert_eq!(&buf, b"456");
+    }
+    #[test]
+    fn vec_read_past_end_errors() {
+        let data: Vec<u8> = b"abc".to_vec();
+        let mut buf = [0_u8; 4];
+        assert!(data.read_exact_at(&mut buf, 0).is_err());
+        assert!(data.read_exact_at(&mut buf, 3).is_err());
     }
 }
