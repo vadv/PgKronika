@@ -7,11 +7,72 @@
 use std::io;
 use std::path::Path;
 
-use kronika_format::{Catalog, DamageRegion};
+use kronika_format::{Catalog, DamageRegion, Entry};
 use kronika_registry::{DecodedSection, Row};
 use kronika_store::{LocalDir, LocalScan, StoreError, StoreWarning};
 
 use crate::{Dictionary, PgmUnit, ReadError};
+
+// Counts `open_unit` calls so batch tests can assert a unit is opened once.
+// Thread-local, so parallel tests do not perturb each other; a test resets it
+// to 0 before the call it measures.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OPEN_UNIT_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// A unit opened once for decoding many sections.
+///
+/// Holds the underlying [`PgmUnit`] so the catalog, dictionary, and every
+/// section come from one read of the unit's bytes. A sealed variant reads from
+/// an immutable `.pgm` file; an active variant owns the journal bytes captured
+/// at open time, after the staleness check has passed.
+#[derive(Debug)]
+pub enum OpenUnit {
+    /// A sealed segment, backed by its immutable `.pgm` file.
+    Sealed(PgmUnit<std::fs::File>),
+    /// An active journal part, backed by the bytes read when the unit opened.
+    Active(PgmUnit<Vec<u8>>),
+}
+
+impl OpenUnit {
+    /// The unit's end catalog.
+    #[must_use]
+    pub const fn catalog(&self) -> &Catalog {
+        match self {
+            Self::Sealed(unit) => unit.catalog(),
+            Self::Active(unit) => unit.catalog(),
+        }
+    }
+
+    /// Decode one section as named-cell rows.
+    ///
+    /// `entry` must come from this unit's [`catalog`](Self::catalog).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the section is a dictionary, out of bounds,
+    /// fails CRC, or fails typed decode.
+    pub fn decode_rows(&self, entry: &Entry) -> Result<Vec<Row>, ReadError> {
+        match self {
+            Self::Sealed(unit) => unit.decode_rows(entry),
+            Self::Active(unit) => unit.decode_rows(entry),
+        }
+    }
+
+    /// Read the unit's dictionary sections into a `str_id` -> value map.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when a dictionary section cannot be read or decoded.
+    pub fn dictionary(&self) -> Result<Dictionary, ReadError> {
+        match self {
+            Self::Sealed(unit) => unit.dictionary(),
+            Self::Active(unit) => unit.dictionary(),
+        }
+    }
+}
 
 /// Metadata describing one unit (sealed or live) in the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +345,56 @@ impl LocalDirSnapshot {
                     return Err(ReadError::StaleSnapshot { unit_idx: idx });
                 }
                 unit.dictionary()
+            }
+        }
+    }
+
+    /// Open the unit at position `idx` in `units()` for multi-section decoding.
+    ///
+    /// A sealed unit opens its immutable `.pgm` file. An active unit re-reads the
+    /// journal bytes and compares the freshly parsed catalog against the cached
+    /// one; a `NotFound`/`UnexpectedEof` read or a catalog mismatch means the
+    /// journal moved on and yields [`ReadError::StaleSnapshot`]. The staleness
+    /// check runs once, here; the returned [`OpenUnit`] then serves every section
+    /// from the bytes captured at open time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when `idx` is out of range, the unit cannot be
+    /// opened, or the active part changed since the snapshot was taken.
+    pub fn open_unit(&self, idx: usize) -> Result<OpenUnit, ReadError> {
+        #[cfg(test)]
+        OPEN_UNIT_CALLS.with(|c| c.set(c.get() + 1));
+
+        let handle = self.handles().nth(idx).ok_or_else(|| {
+            ReadError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unit index {idx} is out of range"),
+            ))
+        })?;
+        match handle {
+            Handle::Sealed(i) => {
+                let su = &self.scan.sealed[i];
+                let file = self.dir.open_sealed(su)?;
+                Ok(OpenUnit::Sealed(PgmUnit::open(file)?))
+            }
+            Handle::Active(i) => {
+                let ap = &self.scan.active[i];
+                let bytes = match self.dir.read_active_part(ap) {
+                    Ok(b) => b,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::NotFound
+                            || err.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Err(ReadError::StaleSnapshot { unit_idx: idx });
+                    }
+                    Err(err) => return Err(ReadError::Io(err)),
+                };
+                let unit = PgmUnit::open(bytes)?;
+                if unit.catalog() != &ap.catalog {
+                    return Err(ReadError::StaleSnapshot { unit_idx: idx });
+                }
+                Ok(OpenUnit::Active(unit))
             }
         }
     }
@@ -787,5 +898,127 @@ mod tests {
             matches!(err, ReadError::StaleSnapshot { unit_idx: 0 }),
             "truncated journal must return StaleSnapshot, got: {err}"
         );
+    }
+
+    // ---- open_unit / OpenUnit tests ----
+
+    #[test]
+    fn open_unit_sealed_decodes_rows_and_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let (part_bytes, wal_id) = make_archiver_part_with_dict(1000, 2000, 9);
+        fs::write(dir.path().join("1000.pgm"), &part_bytes).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let unit = snap.open_unit(0).expect("open sealed unit");
+        assert!(matches!(unit, OpenUnit::Sealed(_)));
+        assert_eq!(unit.catalog().source_id, 9);
+
+        let archiver = unit
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.type_id == 1_008_001)
+            .expect("archiver entry");
+        let rows = unit.decode_rows(archiver).expect("decode rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["archived_count"], Cell::I64(5));
+
+        let dict = unit.dictionary().expect("dictionary");
+        assert_eq!(
+            dict.resolve(wal_id).expect("resolve"),
+            crate::Resolved::String(b"000000010000000000000001")
+        );
+    }
+
+    #[test]
+    fn open_unit_active_decodes_rows_and_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let (part_bytes, wal_id) = make_archiver_part_with_dict(1000, 2000, 9);
+        fs::write(dir.path().join("active.parts"), framed(&part_bytes)).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert!(snap.units()[0].live);
+        let unit = snap.open_unit(0).expect("open active unit");
+        assert!(matches!(unit, OpenUnit::Active(_)));
+        assert_eq!(unit.catalog().source_id, 9);
+
+        let archiver = unit
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.type_id == 1_008_001)
+            .expect("archiver entry");
+        let rows = unit.decode_rows(archiver).expect("decode rows");
+        assert_eq!(rows.len(), 1);
+
+        let dict = unit.dictionary().expect("dictionary");
+        assert_eq!(
+            dict.resolve(wal_id).expect("resolve"),
+            crate::Resolved::String(b"000000010000000000000001")
+        );
+    }
+
+    #[test]
+    fn open_unit_out_of_range_is_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let err = snap.open_unit(99).unwrap_err();
+        assert!(
+            matches!(err, ReadError::Io(ref e) if e.kind() == io::ErrorKind::InvalidInput),
+            "out-of-range unit index must return InvalidInput"
+        );
+    }
+
+    #[test]
+    fn open_unit_active_stale_after_journal_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = make_part(1000, 2000, 7);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part)).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert!(snap.units()[0].live);
+
+        fs::remove_file(&journal_path).unwrap();
+
+        let err = snap.open_unit(0).unwrap_err();
+        assert!(
+            matches!(err, ReadError::StaleSnapshot { unit_idx: 0 }),
+            "removed journal must return StaleSnapshot, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_unit_active_stale_when_journal_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_a = make_part(1000, 2000, 1);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part_a)).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert_eq!(snap.units().len(), 1);
+
+        // Replace with a different part so the cached catalog no longer matches.
+        let part_b = make_part(5000, 6000, 2);
+        fs::write(&journal_path, framed(&part_b)).unwrap();
+
+        let err = snap.open_unit(0).unwrap_err();
+        assert!(
+            matches!(err, ReadError::StaleSnapshot { unit_idx: 0 }),
+            "replaced journal must trigger StaleSnapshot, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_unit_increments_the_test_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = make_part(1000, 2000, 7);
+        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+
+        let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        OPEN_UNIT_CALLS.with(|c| c.set(0));
+        drop(snap.open_unit(0).expect("open"));
+        drop(snap.open_unit(0).expect("open"));
+        assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 2);
     }
 }

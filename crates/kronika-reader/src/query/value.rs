@@ -70,13 +70,6 @@ pub enum GapReason {
 /// was `StrId(id)` with `id != 0` and `dict.resolve(id)` returned `None`
 /// (dictionary gap for that segment). `None` in every other case, including the
 /// `StrId(0)` sentinel and `Cell::Null`, which are legitimate nulls.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the row-materialization caller lands in a later change; only unit tests exercise it now"
-    )
-)]
 pub(crate) fn cell_to_value(cell: &Cell, dict: &Dictionary) -> (Value, Option<u64>) {
     match cell {
         Cell::I16(v) => (Value::I64(i64::from(*v)), None),
