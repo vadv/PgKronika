@@ -287,13 +287,14 @@ impl LocalDirSnapshot {
                 })?;
                 let bytes = match self.dir.read_active_part(ap) {
                     Ok(b) => b,
-                    Err(err)
+                    Err(StoreError::Io(err))
                         if err.kind() == io::ErrorKind::NotFound
                             || err.kind() == io::ErrorKind::UnexpectedEof =>
                     {
                         return Err(ReadError::StaleSnapshot { unit_idx: idx });
                     }
-                    Err(err) => return Err(ReadError::Io(err)),
+                    Err(StoreError::Io(err)) => return Err(ReadError::Io(err)),
+                    Err(err) => return Err(ReadError::Store(err)),
                 };
                 let unit = PgmUnit::open(bytes.as_slice())?;
                 if unit.catalog() != &ap.catalog {
@@ -332,13 +333,14 @@ impl LocalDirSnapshot {
                 let ap = &self.scan.active[i];
                 let bytes = match self.dir.read_active_part(ap) {
                     Ok(b) => b,
-                    Err(err)
+                    Err(StoreError::Io(err))
                         if err.kind() == io::ErrorKind::NotFound
                             || err.kind() == io::ErrorKind::UnexpectedEof =>
                     {
                         return Err(ReadError::StaleSnapshot { unit_idx: idx });
                     }
-                    Err(err) => return Err(ReadError::Io(err)),
+                    Err(StoreError::Io(err)) => return Err(ReadError::Io(err)),
+                    Err(err) => return Err(ReadError::Store(err)),
                 };
                 let unit = PgmUnit::open(bytes.as_slice())?;
                 if unit.catalog() != &ap.catalog {
@@ -382,13 +384,14 @@ impl LocalDirSnapshot {
                 let ap = &self.scan.active[i];
                 let bytes = match self.dir.read_active_part(ap) {
                     Ok(b) => b,
-                    Err(err)
+                    Err(StoreError::Io(err))
                         if err.kind() == io::ErrorKind::NotFound
                             || err.kind() == io::ErrorKind::UnexpectedEof =>
                     {
                         return Err(ReadError::StaleSnapshot { unit_idx: idx });
                     }
-                    Err(err) => return Err(ReadError::Io(err)),
+                    Err(StoreError::Io(err)) => return Err(ReadError::Io(err)),
+                    Err(err) => return Err(ReadError::Store(err)),
                 };
                 let unit = PgmUnit::open(bytes)?;
                 if unit.catalog() != &ap.catalog {
