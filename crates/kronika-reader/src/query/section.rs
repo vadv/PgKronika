@@ -13,6 +13,10 @@ use crate::query::logical::{LogicalSection, logical_section};
 use crate::query::value::{Gap, OutRow, Value, cell_to_value};
 use crate::{Cell, LocalDirSnapshot, ReadError};
 
+/// How many times `sections` refreshes a stale snapshot before giving up on the
+/// stale unit and letting its time fall into a gap.
+const MAX_REFRESH: u32 = 2;
+
 /// One logical section's answer for a source and time window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SectionPage {
@@ -108,52 +112,27 @@ pub fn sections(
         requested.push((name.to_owned(), logical));
     }
 
-    // Units of this source whose time range overlaps the window, in units() order.
-    let in_window: Vec<usize> = snap
-        .units()
-        .iter()
-        .enumerate()
-        .filter(|(_, meta)| meta.source_id == source && meta.max_ts >= from && meta.min_ts <= to)
-        .map(|(idx, _)| idx)
-        .collect();
-
-    // One buffer per requested section, positionally aligned with `requested`.
-    let mut buffers: Vec<Vec<OutRow>> = vec![Vec::new(); requested.len()];
-
-    // One open per unit: read its dictionary once, then decode every section.
-    for &idx in &in_window {
-        let unit = snap.open_unit(idx)?;
-        let dict = unit.dictionary()?;
-        let catalog = unit.catalog();
-        for (buffer, (_, logical)) in buffers.iter_mut().zip(&requested) {
-            for entry in &catalog.entries {
-                if !logical.type_ids.contains(&entry.type_id) {
-                    continue;
-                }
-                for row in unit.decode_rows(entry)? {
-                    // Registry contracts all carry a `ts` column; `get` (not
-                    // indexing) keeps a future ts-less section from panicking.
-                    let Some(&Cell::Ts(t)) = row.get("ts") else {
-                        continue;
-                    };
-                    if t < from || t > to {
-                        continue;
-                    }
-                    let out: OutRow = logical
-                        .columns
-                        .iter()
-                        .map(|col| {
-                            let value = row
-                                .get(col.name)
-                                .map_or(Value::Null, |cell| cell_to_value(cell, &dict).0);
-                            (col.name.to_owned(), value)
-                        })
-                        .collect();
-                    buffer.push(out);
-                }
+    // Gather rows and the time ranges actually read. A unit that goes stale mid
+    // read (concurrent seal/reset) triggers a snapshot refresh and a full retry,
+    // up to MAX_REFRESH times; after that the still-stale unit is skipped and its
+    // time drops out of coverage, surfacing as a gap.
+    let mut refreshed: u32 = 0;
+    let (buffers, covered) = loop {
+        let skip_stale = refreshed >= MAX_REFRESH;
+        match gather(snap, source, from, to, &requested, skip_stale) {
+            Ok(gathered) => break gathered,
+            Err(GatherError::Stale) => {
+                snap.refresh()
+                    .map_err(|err| QueryError::Read(ReadError::Io(err)))?;
+                refreshed += 1;
             }
+            Err(GatherError::Read(err)) => return Err(QueryError::Read(err)),
         }
-    }
+    };
+
+    // Coverage holes are a property of the source over the window, so they are
+    // identical for every requested section.
+    let gaps = coverage_gaps(from, to, &covered);
 
     // Order each buffer by the section's total order, drop everything at or
     // before the resume cursor, then page the tail.
@@ -196,12 +175,126 @@ pub fn sections(
             section: name.clone(),
             source_id: source,
             rows,
-            gaps: Vec::new(),
+            gaps: gaps.clone(),
             next_cursor,
         };
         pages.insert(name, page);
     }
     Ok(pages)
+}
+
+/// Failure while gathering a window's rows.
+enum GatherError {
+    /// A unit went stale (concurrent seal/reset); the caller should refresh and retry.
+    Stale,
+    /// A read failed for a reason a refresh will not fix.
+    Read(ReadError),
+}
+
+/// Per-section row buffers plus the `[min, max]` ranges actually read.
+type Gathered = (Vec<Vec<OutRow>>, Vec<(i64, i64)>);
+
+/// Decode every requested section from the source's in-window units in one pass.
+///
+/// Opens each unit once, reads its dictionary once, and returns per-section row
+/// buffers alongside the units' `[min, max]` ranges. With `skip_stale` a unit
+/// that opens stale is skipped; otherwise the first stale unit returns
+/// [`GatherError::Stale`] so the caller can refresh and retry.
+fn gather(
+    snap: &LocalDirSnapshot,
+    source: u64,
+    from: i64,
+    to: i64,
+    requested: &[(String, LogicalSection)],
+    skip_stale: bool,
+) -> Result<Gathered, GatherError> {
+    let metas = snap.units();
+    let in_window: Vec<usize> = metas
+        .iter()
+        .enumerate()
+        .filter(|(_, meta)| meta.source_id == source && meta.max_ts >= from && meta.min_ts <= to)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    let mut buffers: Vec<Vec<OutRow>> = vec![Vec::new(); requested.len()];
+    let mut covered: Vec<(i64, i64)> = Vec::new();
+
+    for &idx in &in_window {
+        let unit = match snap.open_unit(idx) {
+            Ok(unit) => unit,
+            Err(ReadError::StaleSnapshot { .. }) if skip_stale => continue,
+            Err(ReadError::StaleSnapshot { .. }) => return Err(GatherError::Stale),
+            Err(err) => return Err(GatherError::Read(err)),
+        };
+        let dict = unit.dictionary().map_err(GatherError::Read)?;
+        let catalog = unit.catalog();
+        covered.push((metas[idx].min_ts, metas[idx].max_ts));
+        for (buffer, (_, logical)) in buffers.iter_mut().zip(requested) {
+            for entry in &catalog.entries {
+                if !logical.type_ids.contains(&entry.type_id) {
+                    continue;
+                }
+                for row in unit.decode_rows(entry).map_err(GatherError::Read)? {
+                    // Registry contracts all carry a `ts` column; `get` (not
+                    // indexing) keeps a future ts-less section from panicking.
+                    let Some(&Cell::Ts(t)) = row.get("ts") else {
+                        continue;
+                    };
+                    if t < from || t > to {
+                        continue;
+                    }
+                    let out: OutRow = logical
+                        .columns
+                        .iter()
+                        .map(|col| {
+                            let value = row
+                                .get(col.name)
+                                .map_or(Value::Null, |cell| cell_to_value(cell, &dict).0);
+                            (col.name.to_owned(), value)
+                        })
+                        .collect();
+                    buffer.push(out);
+                }
+            }
+        }
+    }
+    Ok((buffers, covered))
+}
+
+/// Stretches of `[from, to]` that no readable unit covers, given each unit's
+/// `[min, max]` range. Ranges are clamped to the window, merged where they
+/// overlap or touch, and the complement within the window is returned.
+fn coverage_gaps(from: i64, to: i64, covered: &[(i64, i64)]) -> Vec<Gap> {
+    let mut ranges: Vec<(i64, i64)> = covered
+        .iter()
+        .map(|&(min, max)| (min.max(from), max.min(to)))
+        .filter(|&(start, end)| start <= end)
+        .collect();
+    ranges.sort_by_key(|&(start, _)| start);
+
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+
+    let mut gaps = Vec::new();
+    let mut cursor = from;
+    for (start, end) in merged {
+        if start > cursor {
+            gaps.push(Gap {
+                from: cursor,
+                to: start,
+            });
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < to {
+        gaps.push(Gap { from: cursor, to });
+    }
+    gaps
 }
 
 /// Order two rows by the sort-key column values, ascending.
@@ -454,7 +547,17 @@ mod tests {
         );
         assert_eq!(page.section, "pg_stat_archiver");
         assert_eq!(page.source_id, 7);
-        assert!(page.gaps.is_empty());
+        // Window [0, 10_000] over coverage [1000, 3000] leaves edge gaps.
+        assert_eq!(
+            page.gaps,
+            vec![
+                super::Gap { from: 0, to: 1000 },
+                super::Gap {
+                    from: 3000,
+                    to: 10_000
+                },
+            ]
+        );
         assert!(page.next_cursor.is_none());
     }
 
@@ -709,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn active_unit_removed_before_read_surfaces_stale() {
+    fn active_unit_removed_mid_read_degrades_to_a_gap() {
         let dir = tempfile::tempdir().unwrap();
         let body = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
         let part = part_from(&[(1_008_001, 1, body)], 1000, 1000, 7);
@@ -721,13 +824,17 @@ mod tests {
 
         fs::remove_file(&journal_path).unwrap();
 
-        let err = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                QueryError::Read(crate::ReadError::StaleSnapshot { unit_idx: 0 })
-            ),
-            "removed journal must surface StaleSnapshot, got: {err:?}"
+        // The unit is gone; the retry refreshes, finds nothing, and the window
+        // degrades to one uncovered gap instead of an error.
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
+        assert!(page.rows.is_empty());
+        assert_eq!(
+            page.gaps,
+            vec![super::Gap {
+                from: 0,
+                to: 10_000
+            }]
         );
     }
 
@@ -894,7 +1001,17 @@ mod tests {
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let page = section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 0, None).expect("section");
         assert!(page.rows.is_empty(), "limit 0 yields no rows");
-        assert!(page.gaps.is_empty());
+        // Coverage [1000, 2000] is read even at limit 0, so the window edges are gaps.
+        assert_eq!(
+            page.gaps,
+            vec![
+                super::Gap { from: 0, to: 1000 },
+                super::Gap {
+                    from: 2000,
+                    to: 10_000
+                },
+            ]
+        );
         assert!(page.next_cursor.is_none());
     }
 
@@ -1092,5 +1209,158 @@ mod tests {
             super::compare_full(&high, &later, &columns, &sort_key),
             Ordering::Less
         );
+    }
+
+    // ---- T6: stale-retry + coverage gaps ----
+
+    #[test]
+    fn coverage_gaps_covers_window_edges_and_holes() {
+        use super::{Gap, coverage_gaps};
+        // No coverage at all: the whole window is one gap.
+        assert_eq!(coverage_gaps(0, 100, &[]), vec![Gap { from: 0, to: 100 }]);
+        // Full coverage: no gaps.
+        assert!(coverage_gaps(0, 100, &[(0, 100)]).is_empty());
+        // Leading and trailing gaps around one interior block.
+        assert_eq!(
+            coverage_gaps(0, 100, &[(40, 60)]),
+            vec![Gap { from: 0, to: 40 }, Gap { from: 60, to: 100 }]
+        );
+        // Overlapping and touching ranges merge, leaving no gap.
+        assert!(coverage_gaps(0, 100, &[(0, 50), (40, 100)]).is_empty());
+        assert!(coverage_gaps(0, 100, &[(0, 50), (50, 100)]).is_empty());
+        // Unsorted input with one interior hole.
+        assert_eq!(
+            coverage_gaps(0, 100, &[(60, 100), (0, 40)]),
+            vec![Gap { from: 40, to: 60 }]
+        );
+        // Ranges are clamped to the window before subtraction.
+        assert_eq!(
+            coverage_gaps(10, 90, &[(0, 50), (80, 200)]),
+            vec![Gap { from: 50, to: 80 }]
+        );
+    }
+
+    #[test]
+    fn window_before_any_unit_is_one_gap_with_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(5000, 1)]).expect("encode");
+        let part = part_from(&[(1_008_001, 1, body)], 5000, 5000, 7);
+        fs::write(dir.path().join("5000.pgm"), &part).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let page = section(&mut snap, "pg_stat_archiver", 7, 0, 1000, 100, None).expect("section");
+        assert!(page.rows.is_empty(), "unit lies outside the window");
+        assert_eq!(page.gaps, vec![super::Gap { from: 0, to: 1000 }]);
+    }
+
+    #[test]
+    fn partial_coverage_leaves_leading_and_trailing_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(2000, 1), archiver_row(3000, 2)])
+            .expect("encode");
+        let part = part_from(&[(1_008_001, 2, body)], 2000, 3000, 7);
+        fs::write(dir.path().join("2000.pgm"), &part).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 1000, 4000, 100, None).expect("section");
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(
+            page.gaps,
+            vec![
+                super::Gap {
+                    from: 1000,
+                    to: 2000
+                },
+                super::Gap {
+                    from: 3000,
+                    to: 4000
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn hole_between_two_units_becomes_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
+        fs::write(
+            dir.path().join("1000.pgm"),
+            part_from(&[(1_008_001, 1, a)], 1000, 1000, 7),
+        )
+        .unwrap();
+        let b = PgStatArchiver::encode(&[archiver_row(5000, 2)]).expect("encode");
+        fs::write(
+            dir.path().join("5000.pgm"),
+            part_from(&[(1_008_001, 1, b)], 5000, 5000, 7),
+        )
+        .unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 1000, 5000, 100, None).expect("section");
+        assert_eq!(page.rows.len(), 2, "both samples fall in the window");
+        assert_eq!(
+            page.gaps,
+            vec![super::Gap {
+                from: 1000,
+                to: 5000
+            }]
+        );
+    }
+
+    #[test]
+    fn full_coverage_reports_no_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(4000, 2)])
+            .expect("encode");
+        let part = part_from(&[(1_008_001, 2, body)], 1000, 4000, 7);
+        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 1000, 4000, 100, None).expect("section");
+        assert!(page.gaps.is_empty(), "window equals coverage");
+    }
+
+    #[test]
+    fn stale_active_unit_refreshes_and_reads_the_new_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("active.parts");
+        let a = part_from(
+            &[(
+                1_008_001,
+                1,
+                PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode"),
+            )],
+            1000,
+            1000,
+            7,
+        );
+        fs::write(&journal, framed(&a)).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert!(snap.units()[0].live);
+
+        // The journal is replaced with a different part after the snapshot was
+        // taken. The first open sees a mismatched catalog (stale), refresh picks
+        // up the new part, and the retry reads it consistently.
+        let b = part_from(
+            &[(
+                1_008_001,
+                1,
+                PgStatArchiver::encode(&[archiver_row(2000, 9)]).expect("encode"),
+            )],
+            2000,
+            2000,
+            7,
+        );
+        fs::write(&journal, framed(&b)).unwrap();
+
+        let page =
+            section(&mut snap, "pg_stat_archiver", 7, 0, 10_000, 100, None).expect("section");
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(cell(&page.rows[0], "ts"), &Value::Ts(2000));
+        assert_eq!(cell(&page.rows[0], "archived_count"), &Value::I64(9));
     }
 }

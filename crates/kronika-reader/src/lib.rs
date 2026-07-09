@@ -14,7 +14,7 @@ mod unit;
 
 pub use kronika_format::DamageRegion;
 pub use query::{
-    Cursor, Gap, GapReason, LogicalColumn, LogicalSection, OutRow, QueryError, SectionPage, Value,
+    Cursor, Gap, LogicalColumn, LogicalSection, OutRow, QueryError, SectionPage, Value,
     logical_section, section, sections,
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, UnitMeta};
