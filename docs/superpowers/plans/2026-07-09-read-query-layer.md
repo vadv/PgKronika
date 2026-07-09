@@ -178,20 +178,30 @@ impl Cursor { pub fn encode(&self)->String; pub fn decode(s:&str)->Result<Self,Q
 
 ---
 
-## Task 6: stale-retry + gaps
+## Task 6: stale-retry + gaps (по факту, без угадываний)
 
-**Files:** extend `section.rs`; `query/gaps.rs`.
-**Produces:** `section()` — стейл-retry (§1.5): при `ReadError::StaleSnapshot` до 2 раз
-`snap.refresh()` + пересбор; после лимита — исключить единицу + `Gap`. `gaps` (§1.6):
-из `snap.warnings()` (пропущенный sealed → `CorruptSegment`), damages журнала
-(`CorruptJournalFrame`), непокрытые интервалы окна (`[from,to]` минус объединение
-`[min_ts,max_ts]` читаемых единиц источника → `NoCoverage`).
+Ридер отдаёт только то, что реально прочитал. Дырка = интервал окна без читаемых
+данных, БЕЗ причины: причину порчи не атрибутируем (у битого сегмента не читается ни
+время, ни источник — угадывать нечем; причину даст будущий manifest). Интервал дырки —
+в той же закрытой семантике `[from, to]`, что и окно запроса.
 
-`snap` в `section()` уже `&mut LocalDirSnapshot` (сигнатура задана в T4) — `refresh` доступен.
+**Files:** modify `crates/kronika-reader/src/query/value.rs` (`Gap { from, to }`, убрать
+`GapReason` и её реэкспорты в `query/mod.rs`+`lib.rs`); extend `crates/kronika-reader/src/query/section.rs`.
+**Produces:**
+- stale-retry: в `sections()` при `ReadError::StaleSnapshot` до 2 раз `snap.refresh()` +
+  пересбор всего прохода; если после лимита единица всё ещё стейл (или не открылась) —
+  исключить её из прохода (её время просто не войдёт в покрытие → станет дыркой).
+- gaps (одинаковы для всех секций одного источника — считать РАЗ на запрос): взять
+  `[min_ts,max_ts]` единиц источника, которые РЕАЛЬНО открылись, ∩ окно; смёржить
+  пересекающиеся; вычесть из `[from,to]`; каждый непокрытый интервал = `Gap{from,to}`.
+  Окно целиком вне единиц → одна дырка `[from,to]`.
 
-**TDD:** стейл (заменить/удалить active между units и decode) → refresh+retry → консистентно;
-битый sealed → `CorruptSegment`-gap, остальное отдано; окно вне единиц → `NoCoverage`-gap
-+ пустые rows; частичное покрытие → gap на непокрытом хвосте.
+`snap` в `sections()` уже `&mut LocalDirSnapshot` (сигнатура T4) — `refresh` доступен.
+
+**TDD:** стейл (заменить/удалить active между snapshot и section) → refresh+retry → строки
+консистентны, дырки нет если покрытие цело; окно целиком вне единиц → одна дырка `[from,to]`
++ пустые rows; частичное покрытие → дырка на непокрытом хвосте; разрыв во времени между
+двумя единицами → дырка в середине; единица, упавшая на open после ретраев → её интервал в дырке.
 
 ---
 
