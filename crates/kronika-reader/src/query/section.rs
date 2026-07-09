@@ -26,7 +26,7 @@ pub struct SectionPage {
     pub source_id: u64,
     /// Rows on the section's union columns, ordered by its sort key.
     pub rows: Vec<OutRow>,
-    /// Coverage holes in the window. Always empty until a later stage fills it.
+    /// Stretches of the window that no readable unit covers.
     pub gaps: Vec<Gap>,
     /// Cursor to resume after the last returned row, or `None` when this page
     /// exhausts the stream.
@@ -92,9 +92,6 @@ pub fn section(
 /// Returns [`QueryError::UnknownSection`] for the first unregistered name,
 /// [`QueryError::BadCursor`] when a cursor targets another source, or
 /// [`QueryError::Read`] when a unit cannot be opened or decoded.
-// `&mut` is reserved for a later refresh-on-stale retry; today only `&self`
-// methods run through it.
-#[allow(clippy::needless_pass_by_ref_mut, reason = "later change adds refresh")]
 pub fn sections(
     snap: &mut LocalDirSnapshot,
     source: u64,
@@ -1211,7 +1208,7 @@ mod tests {
         );
     }
 
-    // ---- T6: stale-retry + coverage gaps ----
+    // ---- stale-retry + coverage gaps ----
 
     #[test]
     fn coverage_gaps_covers_window_edges_and_holes() {
