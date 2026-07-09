@@ -30,7 +30,7 @@ use crate::{Section, StrId, Ts};
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_004_001,
-    name = "pg_store_plans",
+    name = "pg_store_plans_vadv",
     semantics = snapshot_full,
     sort_key("dbid", "userid", "planid")
 )]
@@ -258,7 +258,7 @@ mod tests {
 #[derive(Debug, Clone, Copy, PartialEq, Section)]
 #[section(
     id = 1_003_001,
-    name = "pg_store_plans",
+    name = "pg_store_plans_ossc",
     semantics = snapshot_full,
     sort_key("dbid", "userid", "queryid", "planid")
 )]

@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn section_name_uses_registry_contracts_and_dictionary_names() {
-        assert_eq!(section_name(1_004_001), Some("pg_store_plans"));
+        assert_eq!(section_name(1_004_001), Some("pg_store_plans_vadv"));
         assert_eq!(section_name(1_019_001), Some("pg_settings"));
         assert_eq!(section_name(DICT_STRINGS_TYPE_ID), Some("dict.strings"));
         assert_eq!(section_name(DICT_BLOBS_TYPE_ID), Some("dict.blobs"));

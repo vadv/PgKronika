@@ -8,11 +8,16 @@
 //! entries, suppresses exact sealed/live duplicates, and exposes scan
 //! diagnostics.
 
+mod query;
 mod snapshot;
 mod unit;
 
 pub use kronika_format::DamageRegion;
-pub use snapshot::{LocalDirSnapshot, UnitMeta};
+pub use query::{
+    Cursor, Gap, LogicalColumn, LogicalSection, OutRow, QueryError, SectionPage, Value,
+    logical_section, section, sections,
+};
+pub use snapshot::{LocalDirSnapshot, OpenUnit, UnitMeta};
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -26,6 +31,8 @@ use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_ROWS,
 };
 use kronika_store::StoreError;
+
+pub use kronika_registry::{Cell, Row};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 pub use unit::PgmUnit;
