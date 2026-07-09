@@ -43,26 +43,17 @@ pub enum Value {
 /// order. Columns absent from a row's layout version are [`Value::Null`].
 pub type OutRow = Vec<(String, Value)>;
 
-/// A coverage hole in a result, over the half-open time range `[from, to)`.
+/// A stretch of the query window `[from, to]` that no readable unit covers.
+///
+/// Records only that data is missing, not why: a corrupt segment can't be told
+/// from an absent one without reading it, and telling a normal collection-cadence
+/// boundary from real loss needs the interval, which the consumer knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gap {
-    /// Start of the gap, unix microseconds, inclusive.
+    /// Start of the gap, unix microseconds.
     pub from: i64,
-    /// End of the gap, unix microseconds, exclusive.
+    /// End of the gap, unix microseconds.
     pub to: i64,
-    /// Why the range is missing.
-    pub reason: GapReason,
-}
-
-/// Why a [`Gap`] range carries no rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GapReason {
-    /// A journal frame in the range failed to decode.
-    CorruptJournalFrame,
-    /// A sealed segment in the range failed to decode.
-    CorruptSegment,
-    /// No segment or journal part covers the range.
-    NoCoverage,
 }
 
 /// Map one decoded cell to an output value, resolving string ids through `dict`.

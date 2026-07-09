@@ -8,4 +8,4 @@ mod value;
 pub use cursor::Cursor;
 pub use logical::{LogicalColumn, LogicalSection, logical_section};
 pub use section::{QueryError, SectionPage, section, sections};
-pub use value::{Gap, GapReason, OutRow, Value};
+pub use value::{Gap, OutRow, Value};
