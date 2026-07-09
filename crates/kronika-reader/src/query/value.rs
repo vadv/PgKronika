@@ -3,8 +3,8 @@
 //! [`Value`] is the width-neutral output type the JSON layer consumes: integer
 //! widths collapse to `I64`/`U64`, and dictionary ids resolve to their bytes.
 //! [`OutRow`] carries one row's cells keyed by union-column name; absent columns
-//! are [`Value::Null`]. [`Gap`] describes a coverage hole in a result and is
-//! populated by later query stages.
+//! are [`Value::Null`]. [`Gap`] marks a stretch of a query window that no
+//! readable unit covers.
 
 use crate::{Cell, Dictionary, Resolved};
 
