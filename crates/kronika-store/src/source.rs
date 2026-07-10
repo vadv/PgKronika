@@ -7,7 +7,7 @@ use kronika_format::{Catalog, DamageRegion, PartRef};
 /// A sealed `.pgm` segment file with its catalog already decoded.
 ///
 /// The catalog was read from the file tail; section bodies are not loaded.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SealedUnit {
     /// Absolute path to the `.pgm` file.
     pub path: PathBuf,
@@ -19,7 +19,7 @@ pub struct SealedUnit {
 ///
 /// The catalog was decoded from the part bytes but the section bodies remain
 /// unread.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ActivePart {
     /// Location of the part body inside the journal file.
     pub part: PartRef,
@@ -28,7 +28,7 @@ pub struct ActivePart {
 }
 
 /// Result of scanning a [`super::LocalDir`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LocalScan {
     /// Sealed segments, sorted by file name.
     pub sealed: Vec<SealedUnit>,
@@ -46,7 +46,7 @@ pub struct LocalScan {
 }
 
 /// A storage item or live journal state that could not be read and was skipped.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StoreWarning {
     /// Path of the file that triggered the warning.
     pub path: PathBuf,

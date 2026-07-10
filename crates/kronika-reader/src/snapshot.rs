@@ -100,7 +100,10 @@ enum Handle {
 /// window is visible either from `active.parts` before reset or from a sealed
 /// `.pgm` after seal. `units()` drops an active part only when its catalog
 /// exactly matches a sealed unit catalog.
-#[derive(Debug)]
+///
+/// `Clone` copies the catalog metadata cache, not any section bodies; a web
+/// handler clones a shared snapshot per request to call `&mut` query functions.
+#[derive(Debug, Clone)]
 pub struct LocalDirSnapshot {
     dir: LocalDir,
     scan: LocalScan,

@@ -17,7 +17,7 @@ const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A storage directory containing sealed `.pgm` segments and an `active.parts`
 /// journal.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LocalDir {
     root: PathBuf,
 }
