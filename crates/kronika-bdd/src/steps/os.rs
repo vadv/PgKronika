@@ -43,7 +43,7 @@ fn fixture_proc_file(world: &mut BddWorld, rel: String, step: &Step) -> Result<(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) has (\d+) rows?$")]
+#[then(regex = r"^section ([\w.+-]+) has (\d+) rows?$")]
 fn section_row_count(world: &mut BddWorld, type_id: String, count: usize) -> Result<()> {
     let type_id = parse_type_id(&type_id)?;
     let segment = world.harness.segment()?.clone();
@@ -72,7 +72,7 @@ fn section_row_count(world: &mut BddWorld, type_id: String, count: usize) -> Res
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) cpu_id row (-?\d+) has (\w+) = (-?\d+)$")]
+#[then(regex = r"^section ([\w.+-]+) cpu_id row (-?\d+) has (\w+) = (-?\d+)$")]
 fn section_cpu_row_column(
     world: &mut BddWorld,
     type_id: String,
@@ -119,7 +119,7 @@ fn section_cpu_row_column(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) (\w+) equals (-?\d+)$")]
+#[then(regex = r"^section ([\w.+-]+) (\w+) equals (-?\d+)$")]
 fn section_column_equals(
     world: &mut BddWorld,
     type_id: String,
@@ -167,7 +167,7 @@ fn section_column_equals(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) (\w+) equals (-?\d+\.\d+)$")]
+#[then(regex = r"^section ([\w.+-]+) (\w+) equals (-?\d+\.\d+)$")]
 fn section_float_column_equals(
     world: &mut BddWorld,
     type_id: String,
@@ -215,7 +215,7 @@ fn section_float_column_equals(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) resource row (-?\d+) has (\w+) = (-?\d+)$")]
+#[then(regex = r"^section ([\w.+-]+) resource row (-?\d+) has (\w+) = (-?\d+)$")]
 fn section_resource_row_column(
     world: &mut BddWorld,
     type_id: String,
@@ -265,7 +265,7 @@ fn section_resource_row_column(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) resource row (-?\d+) has (\w+) = null$")]
+#[then(regex = r"^section ([\w.+-]+) resource row (-?\d+) has (\w+) = null$")]
 fn section_resource_row_column_null(
     world: &mut BddWorld,
     type_id: String,
@@ -354,7 +354,7 @@ fn fixture_proc_tree_container(world: &mut BddWorld) -> Result<()> {
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) major (\d+) minor (\d+) has (\w+) = (-?\d+)$")]
+#[then(regex = r"^section ([\w.+-]+) major (\d+) minor (\d+) has (\w+) = (-?\d+)$")]
 fn section_device_row_column(
     world: &mut BddWorld,
     type_id: String,
@@ -404,7 +404,7 @@ fn section_device_row_column(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) has no row with major (\d+) minor (\d+)$")]
+#[then(regex = r"^section ([\w.+-]+) has no row with major (\d+) minor (\d+)$")]
 fn section_no_device_row(
     world: &mut BddWorld,
     type_id: String,
@@ -436,7 +436,7 @@ fn section_no_device_row(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) major (\d+) minor (\d+) has (\w+) = null$")]
+#[then(regex = r"^section ([\w.+-]+) major (\d+) minor (\d+) has (\w+) = null$")]
 fn section_device_row_column_null(
     world: &mut BddWorld,
     type_id: String,
@@ -485,7 +485,7 @@ fn section_device_row_column_null(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r"^section ([\d_]+) major (\d+) minor (\d+) has (\w+) = (true|false)$")]
+#[then(regex = r"^section ([\w.+-]+) major (\d+) minor (\d+) has (\w+) = (true|false)$")]
 fn section_device_row_column_bool(
     world: &mut BddWorld,
     type_id: String,
@@ -535,7 +535,7 @@ fn section_device_row_column_bool(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
 )]
-#[then(regex = r#"^section ([\d_]+) major (\d+) minor (\d+) mount_point resolves to "([^"]*)"$"#)]
+#[then(regex = r#"^section ([\w.+-]+) major (\d+) minor (\d+) mount_point resolves to "([^"]*)"$"#)]
 fn section_device_row_mount_point(
     world: &mut BddWorld,
     type_id: String,

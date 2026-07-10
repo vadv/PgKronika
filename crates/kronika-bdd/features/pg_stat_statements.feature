@@ -109,7 +109,7 @@ Feature: Collector seals pg_stat_statements rows with dictionary-backed query te
       */ 1 AS kronika_blob_probe;
       """
     When the collector snapshots the segment
-    Then section 1_002_005 has a row for pg_stat_statements query like '%kronika_calls_probe%' with calls = 3 and rows = 3
-    And section 1_002_005 has a row for pg_stat_statements query like '%UPDATE kronika_pgss_t%' with calls = 1 and rows = 5
-    And section 1_002_005 has a row for pg_stat_statements query like '%kronika_blob_probe%' with calls = 1 and rows = 1
-    And section 1_002_005 has a blob-path row for pg_stat_statements query like '%kronika_blob_probe%'
+    Then section pg_stat_statements.pg17 has a row for pg_stat_statements query like '%kronika_calls_probe%' with calls = 3 and rows = 3
+    And section pg_stat_statements.pg17 has a row for pg_stat_statements query like '%UPDATE kronika_pgss_t%' with calls = 1 and rows = 5
+    And section pg_stat_statements.pg17 has a row for pg_stat_statements query like '%kronika_blob_probe%' with calls = 1 and rows = 1
+    And section pg_stat_statements.pg17 has a blob-path row for pg_stat_statements query like '%kronika_blob_probe%'

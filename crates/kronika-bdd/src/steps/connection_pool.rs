@@ -24,7 +24,7 @@ use crate::harness::dump;
     reason = "cucumber step parameters must be owned String"
 )]
 #[then(
-    regex = r#"^section ([\d_]+) has one row for table "([^"]+)" attributed to the (scenario|second) database$"#
+    regex = r#"^section ([\w.+-]+) has one row for table "([^"]+)" attributed to the (scenario|second) database$"#
 )]
 fn section_row_attributed_to_database(
     world: &mut BddWorld,

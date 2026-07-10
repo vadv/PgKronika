@@ -149,7 +149,7 @@ async fn start_wal_receiver(
 }
 
 /// Assert columns of the slot row named in the step.
-#[then(regex = r#"^section ([\d_]+) has a replication slot "([^"]+)" with:$"#)]
+#[then(regex = r#"^section ([\w.+-]+) has a replication slot "([^"]+)" with:$"#)]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
@@ -164,7 +164,7 @@ fn slot_row_matches(
 }
 
 /// Assert columns of the walsender row named by its application.
-#[then(regex = r#"^section ([\d_]+) has a replica row for application "([^"]+)" with:$"#)]
+#[then(regex = r#"^section ([\w.+-]+) has a replica row for application "([^"]+)" with:$"#)]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"

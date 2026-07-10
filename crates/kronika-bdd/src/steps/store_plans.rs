@@ -60,7 +60,7 @@ async fn plans_row_by_like(
 /// Assert the sealed section contains the oracle-matched row, exact `calls`,
 /// and a non-empty dictionary-backed plan text.
 #[then(
-    regex = r"^section ([\d_]+) has a pg_store_plans row for query like '([^']+)' with calls = (\d+) and a resolvable plan$"
+    regex = r"^section ([\w.+-]+) has a pg_store_plans row for query like '([^']+)' with calls = (\d+) and a resolvable plan$"
 )]
 #[allow(
     clippy::needless_pass_by_value,
@@ -196,7 +196,7 @@ async fn ossc_row_by_like(
 /// Assert the sealed `1_003_001` section carries the oracle-matched row with
 /// the exact `calls` count and a dictionary-backed plan text.
 #[then(
-    regex = r"^section ([\d_]+) has an ossc pg_store_plans row for query like '([^']+)' with calls = (\d+) and a (resolvable|NULL) plan$"
+    regex = r"^section ([\w.+-]+) has an ossc pg_store_plans row for query like '([^']+)' with calls = (\d+) and a (resolvable|NULL) plan$"
 )]
 #[allow(
     clippy::needless_pass_by_value,

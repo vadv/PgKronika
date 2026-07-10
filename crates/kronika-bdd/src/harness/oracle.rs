@@ -35,7 +35,7 @@ use kronika_reader::{Dictionary, Resolved};
 use kronika_registry::{Cell, ColumnType, Row, TypeContract};
 use tokio_postgres::Client;
 
-use crate::harness::assert_row::decode_section;
+use crate::harness::assert_row::decode_section_labeled;
 use crate::harness::dump;
 
 /// The oracle kind named in the step, parsed from the scenario text.
@@ -81,6 +81,13 @@ impl OracleKind {
     }
 }
 
+pub(crate) struct OracleTarget<'a> {
+    pub(crate) contract: &'a TypeContract,
+    pub(crate) section_label: &'a str,
+    pub(crate) subject_label: &'a str,
+    pub(crate) column: &'a str,
+}
+
 /// Run the oracle `sql` on `client` and compare its result to `column` of the
 /// decoded section per `kind`.
 ///
@@ -91,62 +98,89 @@ impl OracleKind {
 /// failures carry the section dump.
 pub(crate) async fn assert_oracle(
     client: &Client,
-    contract: &TypeContract,
+    target: OracleTarget<'_>,
     segment: &std::path::Path,
-    column: &str,
     kind: OracleKind,
     sql: &str,
     subprocess_logs: &str,
 ) -> Result<()> {
-    let ty = contract
-        .column(column)
+    let ty = target
+        .contract
+        .column(target.column)
         .with_context(|| {
             format!(
-                "section {} has no column {column:?}",
-                contract.type_id.get()
+                "section {} has no column {:?}",
+                target.subject_label, target.column
             )
         })?
         .ty;
-    let type_id = contract.type_id.get();
+    let type_id = target.contract.type_id.get();
 
-    let (rows, dict) = decode_section(segment, type_id)?;
+    let (rows, dict) = decode_section_labeled(segment, type_id, target.section_label)?;
 
     if ty == ColumnType::StrId {
         let expected = query_texts(client, sql)
             .await
-            .with_context(|| format!("run the {kind:?} oracle for section {type_id} {column}"))?;
-        let actual = column_texts(&rows, column, &dict)?;
+            .with_context(|| format!("run the {kind:?} oracle for {}", target.subject_label))?;
+        let actual = column_texts(&rows, target.column, &dict)?;
         return match kind {
-            OracleKind::Exact | OracleKind::Transformed => {
-                compare_exact_text(type_id, column, &expected, &actual, &rows, subprocess_logs)
-            }
-            OracleKind::Subset => {
-                compare_subset_text(type_id, column, &expected, &actual, &rows, subprocess_logs)
-            }
-            other => bail!("oracle kind {other:?} is not valid for StrId column {column:?}"),
+            OracleKind::Exact | OracleKind::Transformed => compare_exact_text(
+                target.subject_label,
+                &expected,
+                &actual,
+                &rows,
+                subprocess_logs,
+            ),
+            OracleKind::Subset => compare_subset_text(
+                target.subject_label,
+                &expected,
+                &actual,
+                &rows,
+                subprocess_logs,
+            ),
+            other => bail!(
+                "oracle kind {other:?} is not valid for StrId column {:?}",
+                target.column
+            ),
         };
     }
 
     let expected = query_cells(client, sql, ty)
         .await
-        .with_context(|| format!("run the {kind:?} oracle for section {type_id} {column}"))?;
-    let actual = column_cells(&rows, column);
+        .with_context(|| format!("run the {kind:?} oracle for {}", target.subject_label))?;
+    let actual = column_cells(&rows, target.column);
 
     match kind {
         // Exact and Transformed share the equality check; they differ only in
         // whether the oracle SQL is allowed to carry the transformation.
-        OracleKind::Exact | OracleKind::Transformed => {
-            compare_exact(type_id, column, &expected, &actual, &rows, subprocess_logs)
-        }
-        OracleKind::Subset => {
-            compare_subset(type_id, column, &expected, &actual, &rows, subprocess_logs)
-        }
-        OracleKind::Floor => {
-            compare_floor(type_id, column, &expected, &actual, &rows, subprocess_logs)
-        }
-        OracleKind::Ceiling => {
-            compare_ceiling(type_id, column, &expected, &actual, &rows, subprocess_logs)
-        }
+        OracleKind::Exact | OracleKind::Transformed => compare_exact(
+            target.subject_label,
+            &expected,
+            &actual,
+            &rows,
+            subprocess_logs,
+        ),
+        OracleKind::Subset => compare_subset(
+            target.subject_label,
+            &expected,
+            &actual,
+            &rows,
+            subprocess_logs,
+        ),
+        OracleKind::Floor => compare_floor(
+            target.subject_label,
+            &expected,
+            &actual,
+            &rows,
+            subprocess_logs,
+        ),
+        OracleKind::Ceiling => compare_ceiling(
+            target.subject_label,
+            &expected,
+            &actual,
+            &rows,
+            subprocess_logs,
+        ),
         OracleKind::TopN => deferred_kind("top-n"),
         OracleKind::Schema => deferred_kind("schema"),
     }
@@ -206,8 +240,7 @@ fn text_from_cell(cell: &Cell, dict: &Dictionary) -> Result<Option<Vec<u8>>> {
 /// and unordered stat rows alike; a section that also sorts by this column will
 /// still match.
 fn compare_exact(
-    type_id: u32,
-    column: &str,
+    subject_label: &str,
     expected: &[Cell],
     actual: &[Cell],
     rows: &[Row],
@@ -219,7 +252,7 @@ fn compare_exact(
     bail!(
         "{}",
         dump::section_dump(
-            &format!("section {type_id} {column}: exact oracle mismatch"),
+            &format!("{subject_label}: exact oracle mismatch"),
             rows,
             subprocess_logs,
             &[
@@ -232,8 +265,7 @@ fn compare_exact(
 
 /// The resolved section strings equal the oracle text result exactly.
 fn compare_exact_text(
-    type_id: u32,
-    column: &str,
+    subject_label: &str,
     expected: &[Option<Vec<u8>>],
     actual: &[Option<Vec<u8>>],
     rows: &[Row],
@@ -245,7 +277,7 @@ fn compare_exact_text(
     bail!(
         "{}",
         dump::section_dump(
-            &format!("section {type_id} {column}: exact oracle mismatch"),
+            &format!("{subject_label}: exact oracle mismatch"),
             rows,
             subprocess_logs,
             &[
@@ -258,8 +290,7 @@ fn compare_exact_text(
 
 /// Every oracle value appears among the section column's values.
 fn compare_subset(
-    type_id: u32,
-    column: &str,
+    subject_label: &str,
     expected: &[Cell],
     actual: &[Cell],
     rows: &[Row],
@@ -275,7 +306,7 @@ fn compare_subset(
     bail!(
         "{}",
         dump::section_dump(
-            &format!("section {type_id} {column}: subset oracle missing values"),
+            &format!("{subject_label}: subset oracle missing values"),
             rows,
             subprocess_logs,
             &[
@@ -295,8 +326,7 @@ fn compare_subset(
 
 /// Every oracle text value appears among the resolved section strings.
 fn compare_subset_text(
-    type_id: u32,
-    column: &str,
+    subject_label: &str,
     expected: &[Option<Vec<u8>>],
     actual: &[Option<Vec<u8>>],
     rows: &[Row],
@@ -312,7 +342,7 @@ fn compare_subset_text(
     bail!(
         "{}",
         dump::section_dump(
-            &format!("section {type_id} {column}: subset oracle missing values"),
+            &format!("{subject_label}: subset oracle missing values"),
             rows,
             subprocess_logs,
             &[
@@ -339,15 +369,14 @@ fn compare_subset_text(
 /// because background activity can increment counters between setup and the
 /// snapshot.
 fn compare_floor(
-    type_id: u32,
-    column: &str,
+    subject_label: &str,
     oracle: &[Cell],
     section: &[Cell],
     rows: &[Row],
     subprocess_logs: &str,
 ) -> Result<()> {
     if oracle.is_empty() {
-        bail!("floor oracle for section {type_id} {column}: oracle returned no rows");
+        bail!("floor oracle for {subject_label}: oracle returned no rows");
     }
     let mut unsatisfied: Vec<Cell> = Vec::new();
     for floor in oracle {
@@ -361,9 +390,7 @@ fn compare_floor(
     bail!(
         "{}",
         dump::section_dump(
-            &format!(
-                "section {type_id} {column}: floor oracle floor(s) not met by any section value"
-            ),
+            &format!("{subject_label}: floor oracle floor(s) not met by any section value"),
             rows,
             subprocess_logs,
             &[
@@ -393,15 +420,14 @@ fn cell_ge(actual: &Cell, floor: &Cell) -> bool {
 /// Ceiling oracle: one upper-bound scalar; every non-null section value must
 /// be `<=` it. A NULL bound or a NULL section value asserts nothing.
 fn compare_ceiling(
-    type_id: u32,
-    column: &str,
+    subject_label: &str,
     expected: &[Cell],
     actual: &[Cell],
     rows: &[Row],
     subprocess_logs: &str,
 ) -> Result<()> {
     let bound = match expected.first() {
-        None => bail!("ceiling oracle returned no rows for section {type_id} {column}"),
+        None => bail!("ceiling oracle returned no rows for {subject_label}"),
         Some(Cell::Null) => return Ok(()),
         Some(cell) => cell,
     };
@@ -415,7 +441,7 @@ fn compare_ceiling(
     bail!(
         "{}",
         dump::section_dump(
-            &format!("section {type_id} {column}: ceiling oracle upper bound exceeded"),
+            &format!("{subject_label}: ceiling oracle upper bound exceeded"),
             rows,
             subprocess_logs,
             &[
@@ -679,7 +705,14 @@ mod tests {
             Some(b"client backend".to_vec()),
         ];
         assert!(
-            compare_subset_text(1_009_001, "backend_type", &expected, &actual, &[], "").is_ok()
+            compare_subset_text(
+                "pg_stat_io.pg16_17.backend_type",
+                &expected,
+                &actual,
+                &[],
+                ""
+            )
+            .is_ok()
         );
     }
 
@@ -721,7 +754,7 @@ mod tests {
         let section = vec![Cell::I64(5), Cell::I64(15)];
         let oracle = vec![Cell::I64(10)];
         assert!(
-            compare_floor(1, "col", &oracle, &section, &[], "").is_ok(),
+            compare_floor("section.col", &oracle, &section, &[], "").is_ok(),
             "at least one value >= floor passes"
         );
     }
@@ -731,14 +764,14 @@ mod tests {
         let section = vec![Cell::I64(3), Cell::I64(7)];
         let oracle = vec![Cell::I64(10)];
         assert!(
-            compare_floor(1, "col", &oracle, &section, &[], "").is_err(),
+            compare_floor("section.col", &oracle, &section, &[], "").is_err(),
             "no value >= 10 in [3, 7] must fail"
         );
     }
 
     #[test]
     fn compare_floor_errors_on_empty_oracle() {
-        let err = compare_floor(1, "col", &[], &[Cell::I64(5)], &[], "")
+        let err = compare_floor("section.col", &[], &[Cell::I64(5)], &[], "")
             .expect_err("empty oracle is an error");
         assert!(
             err.to_string().contains("oracle returned no rows"),
@@ -763,22 +796,22 @@ mod ceiling_tests {
     #[test]
     fn ceiling_passes_under_bound_and_ignores_nulls() {
         compare_ceiling(
-            1,
-            "c",
+            "section.c",
             &[Cell::I64(10)],
             &[Cell::I64(9), Cell::Null],
             &[],
             "",
         )
         .expect("values under the bound pass");
-        compare_ceiling(1, "c", &[Cell::Null], &[Cell::I64(999)], &[], "")
+        compare_ceiling("section.c", &[Cell::Null], &[Cell::I64(999)], &[], "")
             .expect("a NULL bound asserts nothing");
     }
 
     #[test]
     fn ceiling_fails_over_bound_and_on_empty_oracle() {
-        compare_ceiling(1, "c", &[Cell::I64(10)], &[Cell::I64(11)], &[], "")
+        compare_ceiling("section.c", &[Cell::I64(10)], &[Cell::I64(11)], &[], "")
             .expect_err("a value over the bound fails");
-        compare_ceiling(1, "c", &[], &[Cell::I64(1)], &[], "").expect_err("no oracle rows fail");
+        compare_ceiling("section.c", &[], &[Cell::I64(1)], &[], "")
+            .expect_err("no oracle rows fail");
     }
 }
