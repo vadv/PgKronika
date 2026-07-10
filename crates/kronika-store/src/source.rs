@@ -38,6 +38,11 @@ pub struct LocalScan {
     pub damages: Vec<DamageRegion>,
     /// Warnings emitted while scanning sealed files or active journal parts.
     pub warnings: Vec<StoreWarning>,
+    /// Byte offset of the end of the last valid journal frame.
+    ///
+    /// This is the resumable offset for the next incremental scan. It may be
+    /// less than the journal file size when the tail holds an unfinished frame.
+    pub valid_len: u64,
 }
 
 /// A storage item or live journal state that could not be read and was skipped.
