@@ -28,6 +28,7 @@ pub(crate) mod expected;
 pub(crate) mod oracle;
 pub(crate) mod session;
 pub(crate) mod snapshot;
+pub(crate) mod web;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
