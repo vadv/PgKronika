@@ -13,11 +13,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use kronika_reader::LocalDirSnapshot;
+use kronika_reader::{
+    LocalDirSnapshot, OutRow, QueryError, SectionPage, Value as CellValue, section,
+};
 use kronika_registry::{
     ColumnClass, ColumnType, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, Semantics, TypeContract,
     registry, section_name,
@@ -39,6 +41,12 @@ const ADDR_ENV: &str = "KRONIKA_WEB_ADDR";
 /// Default listen address: loopback only. The v1 API has no auth, so it stays
 /// off-network unless [`ADDR_ENV`] opts in.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
+
+/// Rows returned when a request omits `limit`.
+const DEFAULT_LIMIT: usize = 1_000;
+
+/// Hard ceiling on `limit`, applied even when a request asks for more.
+const MAX_LIMIT: usize = 10_000;
 
 /// Shared router state.
 ///
@@ -70,6 +78,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/sources", get(sources))
         .route("/v1/sections", get(sections))
         .route("/v1/segments", get(segments))
+        .route("/v1/section/{name}", get(section_data))
         .with_state(state)
 }
 
@@ -184,6 +193,31 @@ async fn segments(
     Ok(Json(json!({ "segments": out })))
 }
 
+/// `GET /v1/section/{name}?source&from&to&limit` — one section's rows over the
+/// window, decoded and serialized to JSON.
+///
+/// Delegates the query (ts filter, sort, union columns, gap accounting) to the
+/// reader; this handler only parses parameters and shapes the result. A stale
+/// snapshot degrades to gaps inside the reader, so it stays a `200` here.
+async fn section_data(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let source = parse_u64(&params, "source")?;
+    let from = parse_i64(&params, "from")?;
+    let to = parse_i64(&params, "to")?;
+    let limit = parse_limit(&params)?;
+
+    // section() takes `&mut`; clone the shared snapshot (catalog metadata, not
+    // section bodies) and query the private copy.
+    let mut snap = state.snapshot.load().as_ref().clone();
+    match section(&mut snap, &name, source, from, to, limit, None) {
+        Ok(page) => Ok(Json(page_to_json(&page))),
+        Err(err) => Err(query_error_response(&err)),
+    }
+}
+
 /// Parse a required unsigned query parameter, or a `400` with a JSON body.
 fn parse_u64(
     params: &std::collections::HashMap<String, String>,
@@ -214,6 +248,85 @@ fn bad_request(detail: &str) -> (StatusCode, Json<Value>) {
         StatusCode::BAD_REQUEST,
         Json(json!({ "error": "bad_request", "detail": detail })),
     )
+}
+
+/// Parse the optional `limit`: absent → [`DEFAULT_LIMIT`], present → clamped to
+/// [`MAX_LIMIT`], unparseable → `400`.
+fn parse_limit(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<usize, (StatusCode, Json<Value>)> {
+    params.get("limit").map_or(Ok(DEFAULT_LIMIT), |raw| {
+        raw.parse::<usize>()
+            .map(|limit| limit.min(MAX_LIMIT))
+            .map_err(|_err| bad_request("`limit` must be a non-negative integer"))
+    })
+}
+
+/// Map one reader [`CellValue`] to its JSON form (see the API contract).
+fn value_to_json(value: &CellValue) -> Value {
+    match value {
+        CellValue::Null => Value::Null,
+        CellValue::I64(n) => (*n).into(),
+        CellValue::U64(n) => (*n).into(),
+        CellValue::F64(n) => (*n).into(),
+        CellValue::Bool(b) => (*b).into(),
+        CellValue::Ts(t) => (*t).into(),
+        CellValue::Str(s) => Value::String(s.clone()),
+        CellValue::Blob {
+            text,
+            full_len,
+            truncated,
+        } => json!({ "text": text.as_str(), "full_len": *full_len, "truncated": *truncated }),
+        CellValue::ListI32(items) => Value::from(items.clone()),
+    }
+}
+
+/// Shape one output row as a JSON object keyed by column name.
+fn row_to_json(row: &OutRow) -> Value {
+    let object = row
+        .iter()
+        .map(|(name, value)| (name.clone(), value_to_json(value)))
+        .collect();
+    Value::Object(object)
+}
+
+/// Shape a [`SectionPage`] as the `/v1/section` response body.
+fn page_to_json(page: &SectionPage) -> Value {
+    let rows: Vec<Value> = page.rows.iter().map(row_to_json).collect();
+    let gaps: Vec<Value> = page
+        .gaps
+        .iter()
+        .map(|gap| json!({ "from": gap.from, "to": gap.to }))
+        .collect();
+    let next_cursor = page
+        .next_cursor
+        .as_ref()
+        .map_or(Value::Null, |cursor| Value::String(cursor.encode()));
+    json!({
+        "section": page.section,
+        "source_id": page.source_id,
+        "rows": rows,
+        "gaps": gaps,
+        "next_cursor": next_cursor,
+    })
+}
+
+/// Map a reader [`QueryError`] to an HTTP status and a `{ error, detail }` body.
+fn query_error_response(err: &QueryError) -> (StatusCode, Json<Value>) {
+    let (status, code, detail) = match err {
+        QueryError::UnknownSection(name) => (
+            StatusCode::NOT_FOUND,
+            "unknown_section",
+            format!("no section named `{name}`"),
+        ),
+        QueryError::BadCursor(message) => (StatusCode::BAD_REQUEST, "bad_cursor", message.clone()),
+        QueryError::Read(read) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "read_error",
+            read.to_string(),
+        ),
+    };
+    (status, Json(json!({ "error": code, "detail": detail })))
 }
 
 /// Stable wire name for a column's on-disk type.
@@ -298,13 +411,14 @@ mod tests {
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
     use kronika_format::{PartMeta, SectionInput, build_part};
+    use kronika_reader::Value as CellValue;
     use kronika_registry::Section;
     use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use tower::ServiceExt;
 
-    use super::{AppState, app};
+    use super::{AppState, app, parse_limit, value_to_json};
 
     /// Build an [`AppState`] over a temp directory holding one `build_part`
     /// segment, then answer one request against `app(state)` in-process.
@@ -642,6 +756,235 @@ mod tests {
                 .as_str()
                 .is_some_and(|detail| detail.contains("unsigned integer")),
             "the detail explains the parse failure, distinct from a missing parameter"
+        );
+    }
+
+    /// Write a `pg_stat_archiver` segment holding `rows`.
+    fn write_archiver_segment(
+        dir: &std::path::Path,
+        file: &str,
+        source: u64,
+        min_ts: i64,
+        max_ts: i64,
+        rows: &[PgStatArchiver],
+    ) {
+        let body = PgStatArchiver::encode(rows).expect("encode archiver");
+        let bytes = build_part(
+            &[SectionInput {
+                type_id: 1_008_001,
+                rows: u32::try_from(rows.len()).expect("row count fits u32"),
+                body: &body,
+            }],
+            PartMeta {
+                min_ts,
+                max_ts,
+                source_id: source,
+            },
+        );
+        std::fs::write(dir.join(file), &bytes).expect("write segment");
+    }
+
+    #[test]
+    fn value_to_json_maps_every_variant() {
+        assert_eq!(
+            value_to_json(&CellValue::Null),
+            serde_json::json!(null),
+            "null"
+        );
+        assert_eq!(
+            value_to_json(&CellValue::I64(-5)),
+            serde_json::json!(-5),
+            "i64"
+        );
+        assert_eq!(
+            value_to_json(&CellValue::U64(5)),
+            serde_json::json!(5),
+            "u64"
+        );
+        assert_eq!(
+            value_to_json(&CellValue::F64(1.5)),
+            serde_json::json!(1.5),
+            "f64"
+        );
+        assert_eq!(
+            value_to_json(&CellValue::Bool(true)),
+            serde_json::json!(true),
+            "bool"
+        );
+        assert_eq!(
+            value_to_json(&CellValue::Ts(1_234)),
+            serde_json::json!(1_234),
+            "ts serializes as a number"
+        );
+        assert_eq!(
+            value_to_json(&CellValue::Str("x".to_owned())),
+            serde_json::json!("x"),
+            "str"
+        );
+        assert_eq!(
+            value_to_json(&CellValue::Blob {
+                text: "ab".to_owned(),
+                full_len: 10,
+                truncated: true,
+            }),
+            serde_json::json!({ "text": "ab", "full_len": 10, "truncated": true }),
+            "blob carries text, full_len and truncated"
+        );
+        assert_eq!(
+            value_to_json(&CellValue::ListI32(vec![1, 2, 3])),
+            serde_json::json!([1, 2, 3]),
+            "list of i32"
+        );
+    }
+
+    #[test]
+    fn parse_limit_defaults_caps_and_rejects() {
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            parse_limit(&empty).ok(),
+            Some(1_000),
+            "an absent limit uses the default"
+        );
+
+        let explicit = std::collections::HashMap::from([("limit".to_owned(), "50".to_owned())]);
+        assert_eq!(
+            parse_limit(&explicit).ok(),
+            Some(50),
+            "an explicit limit is honored"
+        );
+
+        let huge = std::collections::HashMap::from([("limit".to_owned(), "99999".to_owned())]);
+        assert_eq!(
+            parse_limit(&huge).ok(),
+            Some(10_000),
+            "a limit above the ceiling is clamped"
+        );
+
+        let bad = std::collections::HashMap::from([("limit".to_owned(), "-1".to_owned())]);
+        assert!(
+            parse_limit(&bad).is_err(),
+            "a non-numeric limit is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn section_serializes_rows_over_a_covered_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_archiver_segment(
+            dir.path(),
+            "1000.pgm",
+            7,
+            1_000,
+            2_000,
+            &[archiver_row(1_000, 5), archiver_row(1_100, 6)],
+        );
+
+        let (status, body) = serve(
+            dir.path(),
+            "/v1/section/pg_stat_archiver?source=7&from=1000&to=2000&limit=10",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "section responds 200");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "section": "pg_stat_archiver",
+                "source_id": 7,
+                "rows": [
+                    { "ts": 1_000, "archived_count": 5, "last_archived_wal": null, "last_archived_time": null, "failed_count": 0, "last_failed_wal": null, "last_failed_time": null, "stats_reset": null },
+                    { "ts": 1_100, "archived_count": 6, "last_archived_wal": null, "last_archived_time": null, "failed_count": 0, "last_failed_wal": null, "last_failed_time": null, "stats_reset": null }
+                ],
+                "gaps": [],
+                "next_cursor": null
+            }),
+            "rows serialize on union columns; a fully covered window has no gaps"
+        );
+    }
+
+    #[tokio::test]
+    async fn section_reports_a_gap_for_an_uncovered_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_archiver_segment(
+            dir.path(),
+            "1000.pgm",
+            7,
+            1_000,
+            2_000,
+            &[archiver_row(1_000, 5)],
+        );
+
+        let (status, body) = serve(
+            dir.path(),
+            "/v1/section/pg_stat_archiver?source=7&from=5000&to=6000&limit=10",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "section responds 200");
+        assert_eq!(
+            body["rows"],
+            serde_json::json!([]),
+            "an uncovered window has no rows"
+        );
+        assert_eq!(
+            body["gaps"],
+            serde_json::json!([{ "from": 5_000, "to": 6_000 }]),
+            "the whole uncovered window is one gap"
+        );
+        assert_eq!(
+            body["next_cursor"],
+            serde_json::json!(null),
+            "an exhausted stream carries no cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn section_unknown_name_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_archiver_segment(
+            dir.path(),
+            "1000.pgm",
+            7,
+            1_000,
+            2_000,
+            &[archiver_row(1_000, 5)],
+        );
+
+        let (status, body) = serve(
+            dir.path(),
+            "/v1/section/does_not_exist?source=7&from=0&to=3000",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is 404");
+        assert_eq!(
+            body["error"], "unknown_section",
+            "the error body names the fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn section_bad_parameter_is_a_bad_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_archiver_segment(
+            dir.path(),
+            "1000.pgm",
+            7,
+            1_000,
+            2_000,
+            &[archiver_row(1_000, 5)],
+        );
+
+        let (status, body) = serve(
+            dir.path(),
+            "/v1/section/pg_stat_archiver?source=abc&from=0&to=3000",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-numeric source is 400"
+        );
+        assert_eq!(
+            body["error"], "bad_request",
+            "the error body names the fault"
         );
     }
 }
