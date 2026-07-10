@@ -8,14 +8,21 @@
 //! background task refreshes the shared snapshot once a second; tests build the
 //! state directly and never start that task, so the router stays deterministic.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use kronika_reader::LocalDirSnapshot;
-use serde_json::json;
+use kronika_registry::{
+    ColumnClass, ColumnType, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, Semantics, TypeContract,
+    registry, section_name,
+};
+use serde_json::{Value, json};
 
 /// Container format version this build serves, mirrored into `/v1/version`.
 const FORMAT_VERSION: u32 = 1;
@@ -53,6 +60,9 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/v1/version", get(version))
+        .route("/v1/sources", get(sources))
+        .route("/v1/sections", get(sections))
+        .route("/v1/segments", get(segments))
         .with_state(state)
 }
 
@@ -60,8 +70,184 @@ pub fn app(state: AppState) -> Router {
 ///
 /// The body is static: `{"api":"v1","format_version":1}` with an
 /// `application/json` content type.
-async fn version() -> Json<serde_json::Value> {
+async fn version() -> Json<Value> {
     Json(json!({ "api": "v1", "format_version": FORMAT_VERSION }))
+}
+
+/// `GET /v1/sources` — every source in the store and its overall time span.
+async fn sources(State(state): State<AppState>) -> Json<Value> {
+    let snapshot = state.snapshot.load_full();
+    let mut spans: BTreeMap<u64, (i64, i64, usize)> = BTreeMap::new();
+    for unit in snapshot.units() {
+        let span = spans
+            .entry(unit.source_id)
+            .or_insert((unit.min_ts, unit.max_ts, 0));
+        span.0 = span.0.min(unit.min_ts);
+        span.1 = span.1.max(unit.max_ts);
+        span.2 += 1;
+    }
+    let sources: Vec<Value> = spans
+        .into_iter()
+        .map(|(source_id, (min_ts, max_ts, segments))| {
+            json!({ "source_id": source_id, "min_ts": min_ts, "max_ts": max_ts, "segments": segments })
+        })
+        .collect();
+    Json(json!({ "sources": sources }))
+}
+
+/// `GET /v1/sections` — static catalog of section types from the registry.
+///
+/// One entry per logical name: its semantics, sort key, and the union of its
+/// versions' columns (first appearance across ascending `type_id`).
+async fn sections() -> Json<Value> {
+    let mut by_name: BTreeMap<&'static str, Vec<&'static TypeContract>> = BTreeMap::new();
+    for contract in registry() {
+        by_name.entry(contract.name).or_default().push(contract);
+    }
+    let sections: Vec<Value> = by_name
+        .into_iter()
+        .map(|(name, mut contracts)| {
+            contracts.sort_by_key(|contract| contract.type_id.get());
+            let mut seen = std::collections::HashSet::new();
+            let mut columns = Vec::new();
+            for contract in &contracts {
+                for column in contract.columns {
+                    if seen.insert(column.name) {
+                        columns.push(json!({
+                            "name": column.name,
+                            "type": column_type_name(column.ty),
+                            "class": column_class_name(column.class),
+                        }));
+                    }
+                }
+            }
+            json!({
+                "name": name,
+                "semantics": semantics_name(contracts[0].semantics),
+                "sort_key": contracts[0].sort_key,
+                "columns": columns,
+            })
+        })
+        .collect();
+    Json(json!({ "sections": sections }))
+}
+
+/// `GET /v1/segments?source&from&to` — segments of `source` overlapping the
+/// window, catalog metadata only (no section bodies decoded).
+async fn segments(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let source = parse_u64(&params, "source")?;
+    let from = parse_i64(&params, "from")?;
+    let to = parse_i64(&params, "to")?;
+
+    let snapshot = state.snapshot.load_full();
+    let units = snapshot.units();
+    let mut out = Vec::new();
+    for (idx, unit) in units.iter().enumerate() {
+        if unit.source_id != source || unit.max_ts < from || unit.min_ts > to {
+            continue;
+        }
+        let Some(catalog) = snapshot.unit_catalog(idx) else {
+            continue;
+        };
+        let mut rows_by_name: BTreeMap<&'static str, u64> = BTreeMap::new();
+        for entry in &catalog.entries {
+            if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
+                continue;
+            }
+            let Some(name) = section_name(entry.type_id) else {
+                continue;
+            };
+            *rows_by_name.entry(name).or_insert(0) += u64::from(entry.rows);
+        }
+        let sections: Vec<Value> = rows_by_name
+            .into_iter()
+            .map(|(name, rows)| json!({ "name": name, "rows": rows }))
+            .collect();
+        out.push(json!({
+            "segment_id": unit.min_ts.to_string(),
+            "source_id": unit.source_id,
+            "min_ts": unit.min_ts,
+            "max_ts": unit.max_ts,
+            "sections": sections,
+        }));
+    }
+    Ok(Json(json!({ "segments": out })))
+}
+
+/// Parse a required unsigned query parameter, or a `400` with a JSON body.
+fn parse_u64(
+    params: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Result<u64, (StatusCode, Json<Value>)> {
+    params
+        .get(key)
+        .ok_or_else(|| bad_request(&format!("missing query parameter `{key}`")))?
+        .parse()
+        .map_err(|_err| bad_request(&format!("`{key}` must be an unsigned integer")))
+}
+
+/// Parse a required signed query parameter, or a `400` with a JSON body.
+fn parse_i64(
+    params: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Result<i64, (StatusCode, Json<Value>)> {
+    params
+        .get(key)
+        .ok_or_else(|| bad_request(&format!("missing query parameter `{key}`")))?
+        .parse()
+        .map_err(|_err| bad_request(&format!("`{key}` must be an integer")))
+}
+
+/// A `400 Bad Request` with a `{ "error", "detail" }` JSON body.
+fn bad_request(detail: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "bad_request", "detail": detail })),
+    )
+}
+
+/// Stable wire name for a column's on-disk type.
+const fn column_type_name(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::I8 => "i8",
+        ColumnType::I16 => "i16",
+        ColumnType::I32 => "i32",
+        ColumnType::I64 => "i64",
+        ColumnType::U8 => "u8",
+        ColumnType::U16 => "u16",
+        ColumnType::U32 => "u32",
+        ColumnType::U64 => "u64",
+        ColumnType::F32 => "f32",
+        ColumnType::F64 => "f64",
+        ColumnType::Bool => "bool",
+        ColumnType::Ts => "ts",
+        ColumnType::StrId => "str",
+        ColumnType::ListI32 => "list_i32",
+    }
+}
+
+/// Stable wire name for a column's role: cumulative / gauge / label / timestamp.
+const fn column_class_name(class: ColumnClass) -> &'static str {
+    match class {
+        ColumnClass::Cumulative => "c",
+        ColumnClass::Gauge => "g",
+        ColumnClass::Label => "l",
+        ColumnClass::Timestamp => "t",
+    }
+}
+
+/// Stable wire name for a section's collection semantics.
+const fn semantics_name(semantics: Semantics) -> &'static str {
+    match semantics {
+        Semantics::SnapshotFull => "snapshot_full",
+        Semantics::ConditionalFull => "conditional_full",
+        Semantics::EventStream => "event_stream",
+        Semantics::Changed => "changed",
+        Semantics::OnChange => "on_change",
+    }
 }
 
 #[tokio::main]
@@ -105,7 +291,9 @@ mod tests {
     use http_body_util::BodyExt;
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_registry::Section;
+    use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use tower::ServiceExt;
 
     use super::{AppState, app};
@@ -223,6 +411,229 @@ mod tests {
             page.is_ok(),
             "a cloned snapshot must answer a section query: {:?}",
             page.err()
+        );
+    }
+
+    /// Open a snapshot over a caller-built `dir` and answer one request.
+    ///
+    /// Unlike [`fixture_response`], the test writes its own segments into `dir`
+    /// first; this returns the response status and its JSON body.
+    async fn serve(dir: &std::path::Path, uri: &str) -> (StatusCode, serde_json::Value) {
+        let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
+        let state = AppState::new(snapshot);
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read body")
+            .to_bytes();
+        let value = serde_json::from_slice(&bytes).expect("body is valid JSON");
+        (status, value)
+    }
+
+    /// Write an empty `pg_stat_bgwriter + pg_stat_checkpointer` segment.
+    fn write_bgwriter_segment(
+        dir: &std::path::Path,
+        file: &str,
+        source: u64,
+        min_ts: i64,
+        max_ts: i64,
+    ) {
+        let body = BgwriterCheckpointer::encode(&[]).expect("encode section");
+        let bytes = build_part(
+            &[SectionInput {
+                type_id: 1_006_001,
+                rows: 0,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts,
+                max_ts,
+                source_id: source,
+            },
+        );
+        std::fs::write(dir.join(file), &bytes).expect("write segment");
+    }
+
+    /// One `pg_stat_archiver` row with every optional column left NULL.
+    fn archiver_row(ts: i64, archived: i64) -> PgStatArchiver {
+        PgStatArchiver {
+            ts: Ts(ts),
+            archived_count: archived,
+            last_archived_wal: None,
+            last_archived_time: None,
+            failed_count: 0,
+            last_failed_wal: None,
+            last_failed_time: None,
+            stats_reset: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sources_fold_each_source_into_one_span() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+        write_bgwriter_segment(dir.path(), "3000.pgm", 7, 3_000, 4_000);
+        write_bgwriter_segment(dir.path(), "1500.pgm", 42, 1_500, 2_500);
+
+        let (status, body) = serve(dir.path(), "/v1/sources").await;
+        assert_eq!(status, StatusCode::OK, "sources responds 200");
+        assert_eq!(
+            body,
+            serde_json::json!({ "sources": [
+                { "source_id": 7, "min_ts": 1_000, "max_ts": 4_000, "segments": 2 },
+                { "source_id": 42, "min_ts": 1_500, "max_ts": 2_500, "segments": 1 }
+            ] }),
+            "each source folds its units into one span, ordered by source_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn sections_catalog_describes_archiver_from_the_registry() {
+        // The catalog is static: it comes from the registry, not the fixture.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+
+        let (status, body) = serve(dir.path(), "/v1/sections").await;
+        assert_eq!(status, StatusCode::OK, "sections responds 200");
+        let archiver = body["sections"]
+            .as_array()
+            .expect("sections is an array")
+            .iter()
+            .find(|section| section["name"] == "pg_stat_archiver")
+            .expect("pg_stat_archiver is in the catalog");
+        assert_eq!(
+            archiver["semantics"], "snapshot_full",
+            "archiver is a full snapshot"
+        );
+        assert_eq!(
+            archiver["sort_key"],
+            serde_json::json!(["ts"]),
+            "archiver sorts by ts"
+        );
+        let columns = archiver["columns"].as_array().expect("columns array");
+        assert!(
+            columns.contains(&serde_json::json!({ "name": "ts", "type": "ts", "class": "t" })),
+            "ts is a timestamp-class ts column"
+        );
+        assert!(
+            columns.contains(
+                &serde_json::json!({ "name": "archived_count", "type": "i64", "class": "c" })
+            ),
+            "archived_count is a cumulative i64 counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn segments_sum_rows_per_name_and_skip_dictionaries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archiver_a = PgStatArchiver::encode(&[archiver_row(1_000, 1), archiver_row(1_100, 2)])
+            .expect("encode archiver");
+        let archiver_b =
+            PgStatArchiver::encode(&[archiver_row(1_200, 3)]).expect("encode archiver");
+        let bgwriter = BgwriterCheckpointer::encode(&[]).expect("encode bgwriter");
+        let bytes = build_part(
+            &[
+                SectionInput {
+                    type_id: 1_008_001,
+                    rows: 2,
+                    body: &archiver_a,
+                },
+                SectionInput {
+                    type_id: 1_008_001,
+                    rows: 1,
+                    body: &archiver_b,
+                },
+                SectionInput {
+                    type_id: 1_006_001,
+                    rows: 0,
+                    body: &bgwriter,
+                },
+            ],
+            PartMeta {
+                min_ts: 1_000,
+                max_ts: 2_000,
+                source_id: 7,
+            },
+        );
+        std::fs::write(dir.path().join("1000.pgm"), &bytes).expect("write segment");
+
+        let (status, body) = serve(dir.path(), "/v1/segments?source=7&from=0&to=3000").await;
+        assert_eq!(status, StatusCode::OK, "segments responds 200");
+        assert_eq!(
+            body,
+            serde_json::json!({ "segments": [
+                { "segment_id": "1000", "source_id": 7, "min_ts": 1_000, "max_ts": 2_000,
+                  "sections": [
+                    { "name": "pg_stat_archiver", "rows": 3 },
+                    { "name": "pg_stat_bgwriter + pg_stat_checkpointer", "rows": 0 }
+                  ] }
+            ] }),
+            "repeated type_ids of one name sum their rows; sections order by name"
+        );
+    }
+
+    #[tokio::test]
+    async fn segments_outside_the_window_are_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bgwriter_segment(dir.path(), "5000.pgm", 7, 5_000, 6_000);
+
+        let (status, body) = serve(dir.path(), "/v1/segments?source=7&from=0&to=1000").await;
+        assert_eq!(status, StatusCode::OK, "segments responds 200");
+        assert_eq!(
+            body,
+            serde_json::json!({ "segments": [] }),
+            "a window before every unit yields no segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn segments_missing_a_required_parameter_is_a_bad_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+
+        let (status, body) = serve(dir.path(), "/v1/segments?from=0&to=1000").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a missing source is a client error"
+        );
+        assert_eq!(
+            body["error"], "bad_request",
+            "the error body names the fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn segments_non_numeric_parameter_is_a_bad_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+
+        let (status, body) = serve(dir.path(), "/v1/segments?source=abc&from=0&to=1000").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-numeric source is a client error"
+        );
+        assert_eq!(
+            body["error"], "bad_request",
+            "the error body names the fault"
+        );
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("unsigned integer")),
+            "the detail explains the parse failure, distinct from a missing parameter"
         );
     }
 }
