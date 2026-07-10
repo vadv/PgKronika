@@ -33,6 +33,13 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// Environment variable naming the store directory served by `main`.
 const DIR_ENV: &str = "KRONIKA_WEB_DIR";
 
+/// Environment variable overriding the listen address (see [`DEFAULT_ADDR`]).
+const ADDR_ENV: &str = "KRONIKA_WEB_ADDR";
+
+/// Default listen address: loopback only. The v1 API has no auth, so it stays
+/// off-network unless [`ADDR_ENV`] opts in.
+const DEFAULT_ADDR: &str = "127.0.0.1:8080";
+
 /// Shared router state.
 ///
 /// The snapshot is swapped atomically by the background refresh task; handlers
@@ -279,7 +286,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 8080)).await?;
+    let addr = std::env::var(ADDR_ENV).unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
+    let listener = tokio::net::TcpListener::bind(addr.as_str()).await?;
     axum::serve(listener, app(state)).await?;
     Ok(())
 }
