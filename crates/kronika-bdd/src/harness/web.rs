@@ -18,6 +18,7 @@ use pg_kronika_web::{AppState, app};
 use serde_json::Value;
 use tower::ServiceExt as _;
 
+use crate::harness::assert_row::KeyMatch;
 use crate::harness::expected::{ExpectedColumn, ExpectedValue};
 
 /// One in-process request against a fresh router over `dir`; returns the HTTP
@@ -83,6 +84,25 @@ pub(crate) fn assert_one_row(page: &Value, expected: &[ExpectedColumn]) -> Resul
     let [row] = rows.as_slice() else {
         bail!("expected exactly one row, got {}; page: {page}", rows.len());
     };
+    assert_columns(row, expected)
+}
+
+/// Assert the page holds a row matching every key, whose columns match `expected`.
+pub(crate) fn assert_row_where(
+    page: &Value,
+    keys: &[KeyMatch],
+    expected: &[ExpectedColumn],
+) -> Result<()> {
+    let rows = page["rows"].as_array().context("`rows` is not an array")?;
+    let row = rows
+        .iter()
+        .find(|row| keys.iter().all(|key| json_matches_key(row, key)))
+        .with_context(|| format!("no web row matched {keys:?}; page: {page}"))?;
+    assert_columns(row, expected)
+}
+
+/// Report every column of `row` that differs from `expected`.
+fn assert_columns(row: &Value, expected: &[ExpectedColumn]) -> Result<()> {
     let diffs: Vec<String> = expected
         .iter()
         .filter_map(|col| column_diff(col, &row[col.name.as_str()]))
@@ -91,6 +111,14 @@ pub(crate) fn assert_one_row(page: &Value, expected: &[ExpectedColumn]) -> Resul
         return Ok(());
     }
     bail!("web row did not match:\n{}\nrow: {row}", diffs.join("\n"))
+}
+
+/// Whether a JSON row satisfies one key, resolving strings the way the API does.
+fn json_matches_key(row: &Value, key: &KeyMatch) -> bool {
+    match key {
+        KeyMatch::Cell { column, cell } => json_matches_cell(&row[column.as_str()], cell),
+        KeyMatch::Str { column, value } => row[column.as_str()].as_str() == Some(value.as_str()),
+    }
 }
 
 /// A mismatch line if the JSON `actual` differs from the expected value.
@@ -132,7 +160,8 @@ fn json_matches_cell(actual: &Value, cell: &Cell) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{column_diff, json_matches_cell};
+    use super::{column_diff, json_matches_cell, json_matches_key};
+    use crate::harness::assert_row::KeyMatch;
     use crate::harness::expected::{ExpectedColumn, ExpectedValue};
     use kronika_registry::Cell;
     use serde_json::json;
@@ -197,6 +226,41 @@ mod tests {
         assert!(
             column_diff(&floor_col, &json!(9)).is_some(),
             "below the floor is a diff"
+        );
+    }
+
+    #[test]
+    fn json_matches_key_matches_scalar_and_resolved_string_keys() {
+        let row = json!({ "datname": "kronika_db", "datid": 5 });
+        assert!(
+            json_matches_key(
+                &row,
+                &KeyMatch::Str {
+                    column: "datname".to_owned(),
+                    value: "kronika_db".to_owned(),
+                }
+            ),
+            "a string key matches the resolved column"
+        );
+        assert!(
+            json_matches_key(
+                &row,
+                &KeyMatch::Cell {
+                    column: "datid".to_owned(),
+                    cell: Cell::U32(5),
+                }
+            ),
+            "a scalar key matches the number"
+        );
+        assert!(
+            !json_matches_key(
+                &row,
+                &KeyMatch::Str {
+                    column: "datname".to_owned(),
+                    value: "other_db".to_owned(),
+                }
+            ),
+            "a different string does not match"
         );
     }
 }

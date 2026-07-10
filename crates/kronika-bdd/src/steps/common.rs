@@ -129,7 +129,7 @@ fn section_row_by_key(
 }
 
 /// Resolve a `[scenario database]` / `[second database]` slot to a database name.
-fn resolve_database(world: &BddWorld, slot: &str) -> Result<String> {
+pub(crate) fn resolve_database(world: &BddWorld, slot: &str) -> Result<String> {
     match slot {
         "scenario database" => Ok(world.harness.database()?.to_owned()),
         "second database" => Ok(world.harness.extra_database_name(0)?.to_owned()),
