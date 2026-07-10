@@ -462,6 +462,7 @@ pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
 /// Scan a journal source frame by frame, keeping peak memory to one part body.
 ///
 /// Produces a [`ScanReport`] identical to `scan_journal` over the same bytes.
+/// Equivalent to [`scan_journal_streaming_from`] with a start offset of `0`.
 ///
 /// `resync_chunk` is the caller-owned read-window size used when searching past
 /// damage. The window allocation is proportional to `resync_chunk`; a value of
@@ -473,6 +474,34 @@ pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
 /// Returns an I/O error if `reader` fails on any read or on `byte_len`.
 pub fn scan_journal_streaming<R: ReadAt>(
     reader: &R,
+    limits: JournalLimits,
+    resync_chunk: usize,
+) -> io::Result<ScanReport> {
+    scan_journal_streaming_from(reader, 0, limits, resync_chunk)
+}
+
+/// Scan a journal source starting at byte offset `start_at`.
+///
+/// Like [`scan_journal_streaming`] but resumes at `start_at` instead of `0`,
+/// so an incremental follower re-validates only `[start_at, byte_len)`. All
+/// offsets in the returned [`ScanReport`] (`parts`, `damages`, `valid_len`) are
+/// absolute from the start of the source.
+///
+/// `start_at` must be a frame boundary. The `valid_len` of a previous scan
+/// satisfies this by construction: it always ends at the last valid frame.
+/// When the source has no bytes past `start_at`, the report is empty and its
+/// `valid_len` equals `start_at`.
+///
+/// `resync_chunk` is the caller-owned read-window size used when searching past
+/// damage; see [`scan_journal_streaming`].
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when `resync_chunk` is zero.
+/// Returns an I/O error if `reader` fails on any read or on `byte_len`.
+pub fn scan_journal_streaming_from<R: ReadAt>(
+    reader: &R,
+    start_at: u64,
     limits: JournalLimits,
     resync_chunk: usize,
 ) -> io::Result<ScanReport> {
@@ -495,10 +524,18 @@ pub fn scan_journal_streaming<R: ReadAt>(
             "source does not fit the address space",
         )
     })?;
+    let mut pos = usize::try_from(start_at).map_err(|_overflow| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "start_at does not fit the address space",
+        )
+    })?;
 
-    let mut report = ScanReport::default();
+    let mut report = ScanReport {
+        valid_len: pos,
+        ..ScanReport::default()
+    };
     let mut part_buf = Vec::new();
-    let mut pos = 0_usize;
 
     while pos < total_len {
         match streaming_frame_at(reader, total_len, pos, limits, &mut part_buf)? {
@@ -782,6 +819,98 @@ mod streaming_tests {
         let err = scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 0)
             .expect_err("resync_chunk=0 must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn streaming_from_zero_matches_full_scan_on_clean_journal() {
+        let p = sample_part();
+        let buf = framed(&[&p, &p]);
+        let want =
+            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
+        let got =
+            scan_journal_streaming_from(&buf.as_slice(), 0, JournalLimits::default(), 1 << 20)
+                .unwrap();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn streaming_from_zero_matches_full_scan_on_torn_tail() {
+        let p = sample_part();
+        let mut buf = framed(&[&p]);
+        buf.extend_from_slice(&FrameHeader { part_len: 999 }.encode()); // header for absent body
+        let want =
+            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
+        let got =
+            scan_journal_streaming_from(&buf.as_slice(), 0, JournalLimits::default(), 1 << 20)
+                .unwrap();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn streaming_from_zero_matches_full_scan_on_middle_corruption() {
+        let p = sample_part();
+        let mut buf = framed(&[&p]);
+        buf.extend_from_slice(&[0xFF; 8]); // garbage between valid frames
+        buf.extend_from_slice(&framed(&[&p]));
+        let want =
+            scan_journal_streaming(&buf.as_slice(), JournalLimits::default(), 1 << 20).unwrap();
+        let got =
+            scan_journal_streaming_from(&buf.as_slice(), 0, JournalLimits::default(), 1 << 20)
+                .unwrap();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn streaming_from_valid_len_scans_only_the_tail() {
+        // A two-part journal. The first frame ends at `first_len`; scanning from
+        // there must find only the second part, with an absolute offset, and not
+        // re-report the first.
+        let p = sample_part();
+        let buf = framed(&[&p, &p]);
+        let first_len = FRAME_HEADER_LEN + p.len();
+
+        let report = scan_journal_streaming_from(
+            &buf.as_slice(),
+            first_len as u64,
+            JournalLimits::default(),
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(report.parts.len(), 1, "only the tail part is scanned");
+        assert_eq!(
+            report.parts[0].offset,
+            first_len + FRAME_HEADER_LEN,
+            "the tail part offset is absolute from the file start"
+        );
+        assert_eq!(report.parts[0].len, p.len());
+        assert_eq!(
+            report.valid_len,
+            buf.len(),
+            "valid_len spans the whole file"
+        );
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn streaming_from_end_of_journal_is_empty() {
+        // Starting exactly at the journal length yields no parts and a valid_len
+        // pinned to the start offset (nothing new to read).
+        let p = sample_part();
+        let buf = framed(&[&p, &p]);
+        let report = scan_journal_streaming_from(
+            &buf.as_slice(),
+            buf.len() as u64,
+            JournalLimits::default(),
+            1 << 20,
+        )
+        .unwrap();
+        assert!(report.parts.is_empty(), "no parts past the end");
+        assert!(report.damages.is_empty(), "no damage past the end");
+        assert_eq!(
+            report.valid_len,
+            buf.len(),
+            "valid_len stays at the start offset when nothing follows"
+        );
     }
 
     #[test]
