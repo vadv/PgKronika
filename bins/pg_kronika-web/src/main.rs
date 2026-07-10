@@ -18,7 +18,8 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use kronika_reader::{
-    LocalDirSnapshot, OutRow, QueryError, SectionPage, Value as CellValue, section,
+    Cursor, LocalDirSnapshot, OutRow, QueryError, SectionPage, Value as CellValue, section,
+    sections as query_sections,
 };
 use kronika_registry::{
     ColumnClass, ColumnType, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, Semantics, TypeContract,
@@ -79,6 +80,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/sections", get(sections))
         .route("/v1/segments", get(segments))
         .route("/v1/section/{name}", get(section_data))
+        .route("/v1/sections/batch", get(sections_batch))
         .with_state(state)
 }
 
@@ -208,12 +210,49 @@ async fn section_data(
     let from = parse_i64(&params, "from")?;
     let to = parse_i64(&params, "to")?;
     let limit = parse_limit(&params)?;
+    let cursor = parse_cursor(&params)?;
 
     // section() takes `&mut`; clone the shared snapshot (catalog metadata, not
     // section bodies) and query the private copy.
     let mut snap = state.snapshot.load().as_ref().clone();
-    match section(&mut snap, &name, source, from, to, limit, None) {
+    match section(&mut snap, &name, source, from, to, limit, cursor) {
         Ok(page) => Ok(Json(page_to_json(&page))),
+        Err(err) => Err(query_error_response(&err)),
+    }
+}
+
+/// `GET /v1/sections/batch?source&from&to&names=a,b,c&limit` — several sections
+/// for one source over one window, each as its own page keyed by name.
+///
+/// One decode of each overlapping segment serves every requested section, so a
+/// multi-metric view costs one pass, not one per section. An unknown name fails
+/// the whole request.
+async fn sections_batch(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let source = parse_u64(&params, "source")?;
+    let from = parse_i64(&params, "from")?;
+    let to = parse_i64(&params, "to")?;
+    let limit = parse_limit(&params)?;
+    let raw = params
+        .get("names")
+        .ok_or_else(|| bad_request("missing query parameter `names`"))?;
+    let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
+    if names.is_empty() {
+        return Err(bad_request("`names` must list at least one section"));
+    }
+
+    let mut snap = state.snapshot.load().as_ref().clone();
+    let cursors = BTreeMap::new();
+    match query_sections(&mut snap, source, from, to, &names, limit, &cursors) {
+        Ok(pages) => {
+            let object = pages
+                .iter()
+                .map(|(name, page)| (name.clone(), page_to_json(page)))
+                .collect();
+            Ok(Json(Value::Object(object)))
+        }
         Err(err) => Err(query_error_response(&err)),
     }
 }
@@ -259,6 +298,18 @@ fn parse_limit(
         raw.parse::<usize>()
             .map(|limit| limit.min(MAX_LIMIT))
             .map_err(|_err| bad_request("`limit` must be a non-negative integer"))
+    })
+}
+
+/// Parse the optional resume `cursor`: absent → `None`, present → decoded, or a
+/// `400` when it is malformed or belongs to another source.
+fn parse_cursor(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<Option<Cursor>, (StatusCode, Json<Value>)> {
+    params.get("cursor").map_or(Ok(None), |raw| {
+        Cursor::decode(raw)
+            .map(Some)
+            .map_err(|err| query_error_response(&err))
     })
 }
 
@@ -415,6 +466,7 @@ mod tests {
     use kronika_registry::Section;
     use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use tower::ServiceExt;
 
@@ -981,6 +1033,191 @@ mod tests {
             status,
             StatusCode::BAD_REQUEST,
             "a non-numeric source is 400"
+        );
+        assert_eq!(
+            body["error"], "bad_request",
+            "the error body names the fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn section_cursor_pages_across_segment_boundaries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_archiver_segment(
+            dir.path(),
+            "1000.pgm",
+            7,
+            1_000,
+            2_000,
+            &[archiver_row(1_000, 1)],
+        );
+        write_archiver_segment(
+            dir.path(),
+            "3000.pgm",
+            7,
+            3_000,
+            4_000,
+            &[archiver_row(3_000, 2)],
+        );
+
+        let (status, page1) = serve(
+            dir.path(),
+            "/v1/section/pg_stat_archiver?source=7&from=0&to=5000&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "page one responds 200");
+        assert_eq!(
+            page1["rows"].as_array().map(Vec::len),
+            Some(1),
+            "the limit caps page one at one row"
+        );
+        assert_eq!(
+            page1["rows"][0]["ts"],
+            serde_json::json!(1_000),
+            "page one is the earliest row"
+        );
+        let cursor = page1["next_cursor"]
+            .as_str()
+            .expect("a full page carries a resume cursor");
+
+        let (status, page2) = serve(
+            dir.path(),
+            &format!(
+                "/v1/section/pg_stat_archiver?source=7&from=0&to=5000&limit=1&cursor={cursor}"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "page two responds 200");
+        assert_eq!(
+            page2["rows"][0]["ts"],
+            serde_json::json!(3_000),
+            "page two resumes at the next segment's row, no duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn section_malformed_cursor_is_a_bad_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_archiver_segment(
+            dir.path(),
+            "1000.pgm",
+            7,
+            1_000,
+            2_000,
+            &[archiver_row(1_000, 1)],
+        );
+
+        let (status, body) = serve(
+            dir.path(),
+            "/v1/section/pg_stat_archiver?source=7&from=0&to=5000&cursor=notavalidcursor",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a malformed cursor is a client error"
+        );
+        assert_eq!(
+            body["error"], "bad_cursor",
+            "the error body names the fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn sections_batch_returns_a_page_per_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archiver = PgStatArchiver::encode(&[archiver_row(1_000, 1), archiver_row(1_100, 2)])
+            .expect("encode archiver");
+        let prepared = PgPreparedXacts::encode(&[]).expect("encode prepared_xacts");
+        let bytes = build_part(
+            &[
+                SectionInput {
+                    type_id: 1_008_001,
+                    rows: 2,
+                    body: &archiver,
+                },
+                SectionInput {
+                    type_id: 1_010_001,
+                    rows: 0,
+                    body: &prepared,
+                },
+            ],
+            PartMeta {
+                min_ts: 1_000,
+                max_ts: 2_000,
+                source_id: 7,
+            },
+        );
+        std::fs::write(dir.path().join("1000.pgm"), &bytes).expect("write segment");
+
+        let (status, body) = serve(
+            dir.path(),
+            "/v1/sections/batch?source=7&from=1000&to=2000&names=pg_stat_archiver,pg_prepared_xacts&limit=10",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "batch responds 200");
+        assert_eq!(
+            body["pg_stat_archiver"]["rows"].as_array().map(Vec::len),
+            Some(2),
+            "the archiver page carries its rows"
+        );
+        assert_eq!(
+            body["pg_stat_archiver"]["section"], "pg_stat_archiver",
+            "each page names its section"
+        );
+        assert_eq!(
+            body["pg_prepared_xacts"]["rows"],
+            serde_json::json!([]),
+            "a section with no rows is still present in the batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn sections_batch_without_names_is_a_bad_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_archiver_segment(
+            dir.path(),
+            "1000.pgm",
+            7,
+            1_000,
+            2_000,
+            &[archiver_row(1_000, 1)],
+        );
+
+        let (status, body) =
+            serve(dir.path(), "/v1/sections/batch?source=7&from=1000&to=2000").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "batch without names is a client error"
+        );
+        assert_eq!(
+            body["error"], "bad_request",
+            "the error body names the fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn sections_batch_with_only_separators_is_a_bad_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_archiver_segment(
+            dir.path(),
+            "1000.pgm",
+            7,
+            1_000,
+            2_000,
+            &[archiver_row(1_000, 1)],
+        );
+
+        let (status, body) = serve(
+            dir.path(),
+            "/v1/sections/batch?source=7&from=1000&to=2000&names=,,",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a names list of only separators names no section"
         );
         assert_eq!(
             body["error"], "bad_request",
