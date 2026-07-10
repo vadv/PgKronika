@@ -1,4 +1,4 @@
-//! Steps for `features/pg_stat_wal.feature` (sections `1_007_001` / `1_007_002`).
+//! Steps for `features/pg_stat_wal.feature` (`pg_stat_wal.pg15_17` / `pg_stat_wal.pg18`).
 //!
 //! PG15-17 use the V1 layout with write/sync counters. PG18 uses V2 after those
 //! fields moved out of `pg_stat_wal`.
@@ -13,12 +13,14 @@ use crate::harness::dump;
 
 const PG_STAT_WAL_V1_TYPE_ID: u32 = 1_007_001;
 const PG_STAT_WAL_V2_TYPE_ID: u32 = 1_007_002;
+const PG_STAT_WAL_V1_LABEL: &str = "pg_stat_wal.pg15_17";
+const PG_STAT_WAL_V2_LABEL: &str = "pg_stat_wal.pg18";
 
 /// Assert the PG15-17 `pg_stat_wal` layout.
-#[then("section 1_007_001 uses the PG15-17 pg_stat_wal layout")]
+#[then("section pg_stat_wal.pg15_17 uses the PG15-17 pg_stat_wal layout")]
 fn wal_v1_layout(world: &mut BddWorld) -> Result<()> {
     let (rows, logs) = wal_rows(world, PG_STAT_WAL_V1_TYPE_ID)?;
-    let row = single_row(PG_STAT_WAL_V1_TYPE_ID, &rows, &logs)?;
+    let row = single_row(PG_STAT_WAL_V1_LABEL, &rows, &logs)?;
     check_generation_counters(row)?;
     expect_i64(row, "wal_write")?;
     expect_i64(row, "wal_sync")?;
@@ -29,10 +31,10 @@ fn wal_v1_layout(world: &mut BddWorld) -> Result<()> {
 }
 
 /// Assert the PG18 `pg_stat_wal` layout.
-#[then("section 1_007_002 uses the PG18 pg_stat_wal layout")]
+#[then("section pg_stat_wal.pg18 uses the PG18 pg_stat_wal layout")]
 fn wal_v2_layout(world: &mut BddWorld) -> Result<()> {
     let (rows, logs) = wal_rows(world, PG_STAT_WAL_V2_TYPE_ID)?;
-    let row = single_row(PG_STAT_WAL_V2_TYPE_ID, &rows, &logs)?;
+    let row = single_row(PG_STAT_WAL_V2_LABEL, &rows, &logs)?;
     check_generation_counters(row)?;
     expect_absent(row, "wal_write")?;
     expect_absent(row, "wal_sync")?;
@@ -49,12 +51,15 @@ fn wal_rows(world: &BddWorld, type_id: u32) -> Result<(Vec<Row>, String)> {
     Ok((rows, logs))
 }
 
-fn single_row<'a>(type_id: u32, rows: &'a [Row], logs: &str) -> Result<&'a Row> {
+fn single_row<'a>(section_label: &str, rows: &'a [Row], logs: &str) -> Result<&'a Row> {
     let [row] = rows else {
         bail!(
             "{}",
             dump::section_dump(
-                &format!("section {type_id}: expected one row, got {}", rows.len()),
+                &format!(
+                    "section {section_label}: expected one row, got {}",
+                    rows.len()
+                ),
                 rows,
                 logs,
                 &[],

@@ -72,7 +72,7 @@ Feature: Wave 3 OS process and cgroup sections use fixture procfs and sysfs tree
       4:pids:/docker/noio
       """
     When the collector snapshots the segment
-    Then section 1_100_001 has a row with pid = 123:
+    Then section os_process has a row with pid = 123:
       | ppid                  | 1                |
       | uid                   | 1000             |
       | euid                  | 1001             |
@@ -107,12 +107,12 @@ Feature: Wave 3 OS process and cgroup sections use fixture procfs and sysfs tree
       | cancelled_write_bytes | 7                |
       | exit_signal           | 15               |
       | scope                 | 0                |
-    And section 1_100_001 has a row with pid = 124:
+    And section os_process has a row with pid = 124:
       | comm       | noio |
       | syscr      | null |
       | read_bytes | null |
       | cmdline    | null |
-    And section 1_101_001 has a row with pid = 123:
+    And section os_process_status has a row with pid = 123:
       | vm_data                     | 10 |
       | vm_stk                      | 11 |
       | vm_lib                      | 12 |
@@ -125,10 +125,10 @@ Feature: Wave 3 OS process and cgroup sections use fixture procfs and sysfs tree
       | voluntary_ctxt_switches     | 20 |
       | nonvoluntary_ctxt_switches  | 21 |
       | scope                       | 0  |
-    And section 1_200_001 has a row with pid = 123:
+    And section os_cgroup_mapping has a row with pid = 123:
       | cgroup_path | /kubepods/pod-a/container-123 |
       | scope       | 0                             |
-    And section 1_200_001 has a row with pid = 124:
+    And section os_cgroup_mapping has a row with pid = 124:
       | cgroup_path | /docker/noio |
 
   @pg16 @serial
@@ -187,7 +187,7 @@ Feature: Wave 3 OS process and cgroup sections use fixture procfs and sysfs tree
       100
       """
     When the collector snapshots the segment
-    Then section 1_201_001 has a row with cgroup_path = "/kubepods/pod-a":
+    Then section os_cgroup_cpu has a row with cgroup_path = "/kubepods/pod-a":
       | usage_usec     | 1000   |
       | user_usec      | 700    |
       | system_usec    | 300    |
@@ -196,7 +196,7 @@ Feature: Wave 3 OS process and cgroup sections use fixture procfs and sysfs tree
       | quota_usec     | -1     |
       | period_usec    | 100000 |
       | scope          | 0      |
-    And section 1_202_001 has a row with cgroup_path = "/kubepods/pod-a":
+    And section os_cgroup_memory has a row with cgroup_path = "/kubepods/pod-a":
       | current     | 4096 |
       | max         | null |
       | anon        | 1000 |
@@ -209,13 +209,13 @@ Feature: Wave 3 OS process and cgroup sections use fixture procfs and sysfs tree
       | oom_events  | 4    |
       | oom_kill    | 5    |
       | scope       | 0    |
-    And section 1_203_001 has a row with cgroup_path = "/kubepods/pod-a" and major = 8 and minor = 0:
+    And section os_cgroup_io has a row with cgroup_path = "/kubepods/pod-a" and major = 8 and minor = 0:
       | rbytes | 10 |
       | wbytes | 20 |
       | rios   | 3  |
       | wios   | 4  |
       | scope  | 0  |
-    And section 1_204_001 has a row with cgroup_path = "/kubepods/pod-a":
+    And section os_cgroup_pids has a row with cgroup_path = "/kubepods/pod-a":
       | current | 7   |
       | max     | 100 |
       | scope   | 0   |
@@ -281,14 +281,14 @@ Feature: Wave 3 OS process and cgroup sections use fixture procfs and sysfs tree
       8:0 Total 12
       """
     When the collector snapshots the segment
-    Then section 1_201_001 has a row with cgroup_path = "/docker/abc":
+    Then section os_cgroup_cpu has a row with cgroup_path = "/docker/abc":
       | usage_usec     | 123456 |
       | throttled_usec | 7      |
       | nr_throttled   | 2      |
       | quota_usec     | 50000  |
       | period_usec    | 100000 |
       | scope          | 0      |
-    And section 1_202_001 has a row with cgroup_path = "/docker/abc":
+    And section os_cgroup_memory has a row with cgroup_path = "/docker/abc":
       | current    | 4096 |
       | max        | 8192 |
       | anon       | 1000 |
@@ -297,13 +297,13 @@ Feature: Wave 3 OS process and cgroup sections use fixture procfs and sysfs tree
       | slab       | 120  |
       | max_events | 6    |
       | scope      | 0    |
-    And section 1_203_001 has a row with cgroup_path = "/docker/abc" and major = 8 and minor = 0:
+    And section os_cgroup_io has a row with cgroup_path = "/docker/abc" and major = 8 and minor = 0:
       | rbytes | 4096 |
       | wbytes | 8192 |
       | rios   | 4    |
       | wios   | 8    |
       | scope  | 0    |
-    And section 1_204_001 has a row with cgroup_path = "/docker/abc":
+    And section os_cgroup_pids has a row with cgroup_path = "/docker/abc":
       | current | 9    |
       | max     | null |
       | scope   | 0    |

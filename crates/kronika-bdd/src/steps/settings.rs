@@ -14,7 +14,7 @@ use crate::steps::common::parse_type_id;
 /// dictionary. The expected value is written as text: strings compare
 /// resolved, booleans as `true`/`false`, integers as decimal, and `null`
 /// matches a `NULL` cell.
-#[then(regex = r#"^section ([\d_]+) pg_settings entry "([^"]+)" has (\w+) = "([^"]*)"$"#)]
+#[then(regex = r#"^section ([\w.+-]+) pg_settings entry "([^"]+)" has (\w+) = "([^"]*)"$"#)]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
@@ -35,7 +35,9 @@ fn settings_entry_column(
     Ok(())
 }
 
-#[then(regex = r#"^section ([\d_]+) pg_settings entry "([^"]+)" has (\w+) ending with "([^"]*)"$"#)]
+#[then(
+    regex = r#"^section ([\w.+-]+) pg_settings entry "([^"]+)" has (\w+) ending with "([^"]*)"$"#
+)]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
@@ -56,7 +58,7 @@ fn settings_entry_column_suffix(
     Ok(())
 }
 
-#[then(regex = r#"^section ([\d_]+) pg_settings entry "([^"]+)" has (\w+) > (-?\d+)$"#)]
+#[then(regex = r#"^section ([\w.+-]+) pg_settings entry "([^"]+)" has (\w+) > (-?\d+)$"#)]
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"

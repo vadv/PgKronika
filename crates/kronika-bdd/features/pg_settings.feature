@@ -1,4 +1,4 @@
-Feature: Every segment carries pg_settings (1_019_001)
+Feature: Every segment carries pg_settings (pg_settings)
   The full parameter set of the running server goes into each segment, so a
   reader interprets the other sections without reading configuration from
   older segments. The set of names is compared with `pg_settings`; a value
@@ -16,18 +16,18 @@ Feature: Every segment carries pg_settings (1_019_001)
       SELECT pg_reload_conf();
       """
     When the collector snapshots the segment
-    Then section 1_019_001 name matches the exact oracle:
+    Then section pg_settings name matches the exact oracle:
       """
       SELECT name FROM pg_settings
       """
-    And section 1_019_001 pg_settings entry "work_mem" has setting = "7539"
-    And section 1_019_001 pg_settings entry "work_mem" has unit = "kB"
-    And section 1_019_001 pg_settings entry "work_mem" has context = "user"
-    And section 1_019_001 pg_settings entry "work_mem" has vartype = "integer"
-    And section 1_019_001 pg_settings entry "work_mem" has source = "configuration file"
-    And section 1_019_001 pg_settings entry "work_mem" has sourcefile ending with "postgresql.auto.conf"
-    And section 1_019_001 pg_settings entry "work_mem" has sourceline > 0
-    And section 1_019_001 pg_settings entry "work_mem" has pending_restart = "false"
+    And section pg_settings pg_settings entry "work_mem" has setting = "7539"
+    And section pg_settings pg_settings entry "work_mem" has unit = "kB"
+    And section pg_settings pg_settings entry "work_mem" has context = "user"
+    And section pg_settings pg_settings entry "work_mem" has vartype = "integer"
+    And section pg_settings pg_settings entry "work_mem" has source = "configuration file"
+    And section pg_settings pg_settings entry "work_mem" has sourcefile ending with "postgresql.auto.conf"
+    And section pg_settings pg_settings entry "work_mem" has sourceline > 0
+    And section pg_settings pg_settings entry "work_mem" has pending_restart = "false"
 
   @pg17 @serial
   Scenario: a postmaster-context change is recorded as pending restart
@@ -38,9 +38,9 @@ Feature: Every segment carries pg_settings (1_019_001)
       SELECT pg_reload_conf();
       """
     When the collector snapshots the segment
-    Then section 1_019_001 pg_settings entry "shared_buffers" has pending_restart = "true"
-    And section 1_019_001 pg_settings entry "shared_buffers" has context = "postmaster"
-    And section 1_019_001 name matches the exact oracle:
+    Then section pg_settings pg_settings entry "shared_buffers" has pending_restart = "true"
+    And section pg_settings pg_settings entry "shared_buffers" has context = "postmaster"
+    And section pg_settings name matches the exact oracle:
       """
       SELECT name FROM pg_settings
       """

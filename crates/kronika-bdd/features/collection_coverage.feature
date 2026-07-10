@@ -1,6 +1,6 @@
-Feature: Coverage rows (1_023_001) describe truncated top-N sources
+Feature: Coverage rows (collection_coverage) describe truncated top-N sources
   A top-N section without coverage reads as complete data. When a source
-  reports more rows than the collector wrote, the collector writes one 1_023_001
+  reports more rows than the collector wrote, the collector writes one collection_coverage
   row naming the source section, how many rows the source reported, how many
   were written, the configured limit, and the reason. A source that fits its
   limits gets no coverage row: an empty section means no truncation was
@@ -20,13 +20,13 @@ Feature: Coverage rows (1_023_001) describe truncated top-N sources
       END $$;
       """
     When the collector snapshots the segment
-    Then section 1_023_001 has a row with source_type_id = 1013003:
+    Then section collection_coverage has a row with source_type_id = 1013003:
       | total        | 40   |
       | unknown_total | false |
       | max_n        | 5    |
       | reason       | 0    |
       | cutoff_value | null |
-    And section 1_023_001 total matches the exact oracle:
+    And section collection_coverage total matches the exact oracle:
       """
       SELECT count(*)::int8 FROM pg_stat_user_tables
       """
@@ -39,4 +39,4 @@ Feature: Coverage rows (1_023_001) describe truncated top-N sources
       CREATE TABLE kronika_cov_single(id int);
       """
     When the collector snapshots the segment
-    Then section 1_023_001 is absent from the segment
+    Then section collection_coverage is absent from the segment

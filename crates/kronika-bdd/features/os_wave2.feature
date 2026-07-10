@@ -14,12 +14,12 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
          9       9 md0 100 0 8000 40 50 0 4000 20 0 200 300
       """
     When the collector snapshots the segment
-    Then section 1_108_001 has 2 rows
-    And section 1_108_001 major 8 minor 1 has reads = 500
-    And section 1_108_001 major 8 minor 1 has write_sectors = 12000
-    And section 1_108_001 major 8 minor 1 has io_in_progress = 2
-    And section 1_108_001 major 9 minor 9 has reads = 100
-    And section 1_108_001 major 9 minor 9 has write_sectors = 4000
+    Then section os_diskstats has 2 rows
+    And section os_diskstats major 8 minor 1 has reads = 500
+    And section os_diskstats major 8 minor 1 has write_sectors = 12000
+    And section os_diskstats major 8 minor 1 has io_in_progress = 2
+    And section os_diskstats major 9 minor 9 has reads = 100
+    And section os_diskstats major 9 minor 9 has write_sectors = 4000
 
   @pg16 @serial
   Scenario: legacy diskstats с 14 полями пишет discards = NULL
@@ -30,8 +30,8 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
        259       0 nvme0n1 1 0 8 2 3 0 24 4 0 6 6
       """
     When the collector snapshots the segment
-    Then section 1_108_001 has 1 rows
-    And section 1_108_001 major 259 minor 0 has discards = null
+    Then section os_diskstats has 1 rows
+    And section os_diskstats major 259 minor 0 has discards = null
 
   @pg16 @serial
   Scenario: сеть снимается из фикстурных /proc/net/*
@@ -57,21 +57,21 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
       TcpExt: 10 20 30 40 50 60 70
       """
     When the collector snapshots the segment
-    Then section 1_109_001 has 2 rows
-    And section 1_110_001 tcp_active_opens equals 100
-    And section 1_110_001 tcp_passive_opens equals 200
-    And section 1_110_001 tcp_curr_estab equals 15
-    And section 1_110_001 udp_in_datagrams equals 4000
-    And section 1_110_001 udp_no_ports equals 8
-    And section 1_110_001 scope equals 0
-    And section 1_111_001 listen_overflows equals 10
-    And section 1_111_001 listen_drops equals 20
-    And section 1_111_001 tcp_timeouts equals 30
-    And section 1_111_001 tcp_fast_retrans equals 40
-    And section 1_111_001 tcp_slow_start_retrans equals 50
-    And section 1_111_001 tcp_ofo_queue equals 60
-    And section 1_111_001 tcp_syn_retrans equals 70
-    And section 1_111_001 scope equals 0
+    Then section os_netdev has 2 rows
+    And section os_snmp tcp_active_opens equals 100
+    And section os_snmp tcp_passive_opens equals 200
+    And section os_snmp tcp_curr_estab equals 15
+    And section os_snmp udp_in_datagrams equals 4000
+    And section os_snmp udp_no_ports equals 8
+    And section os_snmp scope equals 0
+    And section os_netstat listen_overflows equals 10
+    And section os_netstat listen_drops equals 20
+    And section os_netstat tcp_timeouts equals 30
+    And section os_netstat tcp_fast_retrans equals 40
+    And section os_netstat tcp_slow_start_retrans equals 50
+    And section os_netstat tcp_ofo_queue equals 60
+    And section os_netstat tcp_syn_retrans equals 70
+    And section os_netstat scope equals 0
 
   @pg16 @serial
   Scenario: сеть в контейнере имеет scope=pod_net
@@ -85,8 +85,8 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
           lo:       0       0    0    0    0     0          0         0        0       0    0    0     0     0       0          0
       """
     When the collector snapshots the segment
-    Then section 1_110_001 scope equals 2
-    And section 1_111_001 scope equals 2
+    Then section os_snmp scope equals 2
+    And section os_netstat scope equals 2
 
   @pg16 @serial
   Scenario: диск в поде фильтруется через mountinfo
@@ -106,14 +106,14 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
       """
     And the statvfs fixture is "/data=10737418240:5368709120"
     When the collector snapshots the segment
-    Then section 1_108_001 has 1 rows
-    And section 1_108_001 major 8 minor 1 has reads = 500
-    And section 1_108_001 has no row with major 253 minor 0
-    And section 1_108_001 has no row with major 9 minor 9
-    And section 1_112_001 major 8 minor 1 mount_point resolves to "/data"
-    And section 1_112_001 major 8 minor 1 has is_k8s_infra = false
-    And section 1_112_001 major 8 minor 1 has total_bytes = 10737418240
-    And section 1_112_001 major 8 minor 1 has free_bytes = 5368709120
+    Then section os_diskstats has 1 rows
+    And section os_diskstats major 8 minor 1 has reads = 500
+    And section os_diskstats has no row with major 253 minor 0
+    And section os_diskstats has no row with major 9 minor 9
+    And section os_mountinfo major 8 minor 1 mount_point resolves to "/data"
+    And section os_mountinfo major 8 minor 1 has is_k8s_infra = false
+    And section os_mountinfo major 8 minor 1 has total_bytes = 10737418240
+    And section os_mountinfo major 8 minor 1 has free_bytes = 5368709120
 
   @pg16 @serial
   Scenario: btrfs major=0 резолвится через /sys/class/block
@@ -133,9 +133,9 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
       """
     And the statvfs fixture is "/data=5000000000:2000000000"
     When the collector snapshots the segment
-    Then section 1_112_001 major 254 minor 16 mount_point resolves to "/data"
-    And section 1_112_001 major 254 minor 16 has total_bytes = 5000000000
-    And section 1_112_001 major 254 minor 16 has free_bytes = 2000000000
+    Then section os_mountinfo major 254 minor 16 mount_point resolves to "/data"
+    And section os_mountinfo major 254 minor 16 has total_bytes = 5000000000
+    And section os_mountinfo major 254 minor 16 has free_bytes = 2000000000
 
   @pg16 @serial
   Scenario: mountinfo пишет все mount points независимо от diskstats
@@ -152,14 +152,14 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
       """
     And the statvfs fixture is "/data=10737418240:5368709120;/data/pg wal=21474836480:1073741824"
     When the collector snapshots the segment
-    Then section 1_108_001 is absent from the segment
-    And section 1_112_001 has 2 rows
-    And section 1_112_001 has a row with mount_point = "/data":
+    Then section os_diskstats is absent from the segment
+    And section os_mountinfo has 2 rows
+    And section os_mountinfo has a row with mount_point = "/data":
       | major       | 8           |
       | minor       | 1           |
       | total_bytes | 10737418240 |
       | free_bytes  | 5368709120  |
-    And section 1_112_001 has a row with mount_point = "/data/pg wal":
+    And section os_mountinfo has a row with mount_point = "/data/pg wal":
       | major       | 8           |
       | minor       | 1           |
       | total_bytes | 21474836480 |
@@ -182,8 +182,8 @@ Feature: Wave 2 OS sections use fixture /proc and /sys trees
       3600000
       """
     When the collector snapshots the segment
-    Then section 1_113_001 has 1 rows
-    And section 1_113_001 has a row with cpu_id = 0:
+    Then section os_topology has 1 rows
+    And section os_topology has a row with cpu_id = 0:
       | model_name | Test CPU |
       | mhz_max    | 3600.0   |
       | core_id    | 0        |

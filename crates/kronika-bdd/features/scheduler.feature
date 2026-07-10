@@ -32,12 +32,12 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_PG_TABLES_INTERVAL_S" = "3600"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_BYTES" = "1"
     When the collector runs on its own timer until 2 segments are sealed
-    Then timer segment 1 has section 1_019_001
-    And timer segment 1 has section 1_013_003
-    And timer segment 1 has section 1_001_003
-    And timer segment 2 has section 1_001_003
-    And timer segment 2 has section 1_019_001
-    And timer segment 2 is missing section 1_013_003
+    Then timer segment 1 has section pg_settings
+    And timer segment 1 has section pg_stat_user_tables.pg16_17
+    And timer segment 1 has section pg_stat_activity.pg14_18
+    And timer segment 2 has section pg_stat_activity.pg14_18
+    And timer segment 2 has section pg_settings
+    And timer segment 2 is missing section pg_stat_user_tables.pg16_17
 
   @pg16 @serial
   Scenario: a signal reads every source and seals immediately
@@ -45,11 +45,11 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_PG_SETTINGS_INTERVAL_S" = "3600"
     And the collector runs with env "KRONIKA_PG_TABLES_INTERVAL_S" = "3600"
     When the collector snapshots the segment
-    Then section 1_019_001 name matches the exact oracle:
+    Then section pg_settings name matches the exact oracle:
       """
       SELECT name FROM pg_settings
       """
-    And section 1_021_001 pg_version_num matches the exact oracle:
+    And section instance_metadata pg_version_num matches the exact oracle:
       """
       SELECT current_setting('server_version_num')::int4
       """
@@ -61,8 +61,8 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "0"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "3"
     When the collector runs on its own timer until 1 segment is sealed
-    Then timer segment 1 section 1_001_003 contains at least 2 snapshots
-    And timer segment 1 has section 1_019_001
+    Then timer segment 1 section pg_stat_activity.pg14_18 contains at least 2 snapshots
+    And timer segment 1 has section pg_settings
 
   @pg15 @serial
   Scenario: max age seals even when every due source stays empty
@@ -72,7 +72,7 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_PG_PROGRESS_VACUUM_INTERVAL_S" = "0"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "3"
     When the collector runs on its own timer until 1 segment is sealed
-    Then timer segment 1 has section 1_001_003
+    Then timer segment 1 has section pg_stat_activity.pg14_18
 
   @pg16 @serial
   Scenario: a full journal seals the open segment instead of wedging
@@ -82,8 +82,8 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_JOURNAL_MAX_BYTES" = "1"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "3600"
     When the collector runs on its own timer until 2 segments are sealed
-    Then timer segment 1 has section 1_001_003
-    And timer segment 2 has section 1_001_003
+    Then timer segment 1 has section pg_stat_activity.pg14_18
+    And timer segment 2 has section pg_stat_activity.pg14_18
 
   @pg17 @serial
   Scenario: windows on disk survive a collector restart
@@ -92,8 +92,8 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "0"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "3600"
     When the collector is killed mid-segment and restarted
-    Then timer segment 1 has section 1_001_003
-    And timer segment 1 has section 1_019_001
+    Then timer segment 1 has section pg_stat_activity.pg14_18
+    And timer segment 1 has section pg_settings
 
   @pg15 @serial
   Scenario: a lock wait accelerates the activity pace
@@ -114,7 +114,7 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_INTERVAL_S" = "5"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_AGE_S" = "4"
     When the collector runs on its own timer until 1 segment is sealed
-    Then timer segment 1 section 1_001_003 contains at least 3 snapshots
+    Then timer segment 1 section pg_stat_activity.pg14_18 contains at least 3 snapshots
 
   @pg17 @serial
   Scenario: the cycle budget defers sized sources and repays them next tick
@@ -128,10 +128,10 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_CYCLE_DB_BUDGET_MS" = "1"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_BYTES" = "1"
     When the collector runs on its own timer until 2 segments are sealed
-    Then timer segment 1 has section 1_001_003
-    And timer segment 1 has section 1_019_001
-    And timer segment 1 is missing section 1_013_003
-    And timer segment 2 has section 1_013_003
+    Then timer segment 1 has section pg_stat_activity.pg14_18
+    And timer segment 1 has section pg_settings
+    And timer segment 1 is missing section pg_stat_user_tables.pg16_17
+    And timer segment 2 has section pg_stat_user_tables.pg16_17
 
   @pg15 @serial
   Scenario: a one-byte size cap seals each timer tick
@@ -140,5 +140,5 @@ Feature: The scheduler paces sources by their own intervals
     And the collector runs with env "KRONIKA_PG_ACTIVITY_INTERVAL_S" = "0"
     And the collector runs with env "KRONIKA_SEGMENT_MAX_BYTES" = "1"
     When the collector runs on its own timer until 2 segments are sealed
-    Then timer segment 1 has section 1_001_003
-    And timer segment 2 has section 1_001_003
+    Then timer segment 1 has section pg_stat_activity.pg14_18
+    And timer segment 2 has section pg_stat_activity.pg14_18

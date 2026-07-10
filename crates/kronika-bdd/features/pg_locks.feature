@@ -1,7 +1,7 @@
 Feature: Collector reads the pg_locks wait tree
   A row-lock wait is sealed as a node-centric wait tree. The waiter row points
   at the holder through blocked_by, and the holder row is the root. The live BDD
-  pins the PG14+ layout (1_011_002); codec tests cover the PG10-13 layout.
+  pins the PG14+ layout (pg_locks.pg14_18); codec tests cover the PG10-13 layout.
 
   @pg17 @lock @serial
   Scenario: row-lock wait is captured as W blocked by H
@@ -21,7 +21,7 @@ Feature: Collector reads the pg_locks wait tree
       UPDATE kronika_lock_probe SET v = v + 1 WHERE id = 1;
       """
     When the collector snapshots the segment
-    Then section 1_011_002 has a row for session "W":
+    Then section pg_locks.pg14_18 has a row for session "W":
       | pid             | [W]           |
       | blocked_by      | [H]           |
       | depth           | 1             |
@@ -31,7 +31,7 @@ Feature: Collector reads the pg_locks wait tree
       | lock_locktype   | transactionid |
       | lock_mode       | ShareLock     |
       | lock_granted    | false         |
-    And section 1_011_002 has a row for session "H":
+    And section pg_locks.pg14_18 has a row for session "H":
       | pid           | [H]  |
       | blocked_by    | []   |
       | depth         | 0    |
@@ -39,7 +39,7 @@ Feature: Collector reads the pg_locks wait tree
       | lock_locktype | null |
       | lock_mode     | null |
       | lock_granted  | null |
-    And section 1_011_002 blocked_by matches the exact oracle:
+    And section pg_locks.pg14_18 blocked_by matches the exact oracle:
       """
       WITH waiters AS (
         SELECT pid, pg_blocking_pids(pid) AS blocked_by
@@ -56,7 +56,7 @@ Feature: Collector reads the pg_locks wait tree
       FROM nodes n
       JOIN pg_stat_activity a ON a.pid = n.pid
       """
-    And section 1_011_002 root_pid matches the exact oracle:
+    And section pg_locks.pg14_18 root_pid matches the exact oracle:
       """
       WITH waiters AS (
         SELECT pid, pg_blocking_pids(pid) AS blocked_by
@@ -73,7 +73,7 @@ Feature: Collector reads the pg_locks wait tree
       FROM nodes n
       JOIN pg_stat_activity a ON a.pid = n.pid
       """
-    And section 1_011_002 depth matches the exact oracle:
+    And section pg_locks.pg14_18 depth matches the exact oracle:
       """
       WITH waiters AS (
         SELECT pid, pg_blocking_pids(pid) AS blocked_by
@@ -90,7 +90,7 @@ Feature: Collector reads the pg_locks wait tree
       FROM nodes n
       JOIN pg_stat_activity a ON a.pid = n.pid
       """
-    And section 1_011_002 lock_transactionid matches the subset oracle:
+    And section pg_locks.pg14_18 lock_transactionid matches the subset oracle:
       """
       SELECT l.transactionid::text::bigint
       FROM pg_locks l
@@ -100,7 +100,7 @@ Feature: Collector reads the pg_locks wait tree
         AND l.locktype = 'transactionid'
         AND NOT l.granted
       """
-    And section 1_011_002 waitstart matches the subset oracle:
+    And section pg_locks.pg14_18 waitstart matches the subset oracle:
       """
       SELECT (EXTRACT(EPOCH FROM l.waitstart) * 1000000)::bigint
       FROM pg_locks l
@@ -110,11 +110,11 @@ Feature: Collector reads the pg_locks wait tree
         AND l.locktype = 'transactionid'
         AND NOT l.granted
       """
-    And section 1_011_001 is absent from the segment
+    And section pg_locks.pg10_13 is absent from the segment
 
   @pg17 @lock @serial
   Scenario: no lock waits seals no wait-tree section
     Given a fresh database on PostgreSQL 17
     When the collector snapshots the segment
-    Then section 1_011_002 is absent from the segment
-    And section 1_011_001 is absent from the segment
+    Then section pg_locks.pg14_18 is absent from the segment
+    And section pg_locks.pg10_13 is absent from the segment
