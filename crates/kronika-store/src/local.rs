@@ -113,7 +113,10 @@ impl LocalDir {
             Ok(meta) => {
                 let size = meta.len();
                 if size == last_valid_len {
-                    // Unchanged journal: keep known parts, skip the body read.
+                    // Unchanged journal size: keep known parts, skip the body
+                    // read. An equal-length rewrite is indistinguishable by size
+                    // alone; decoding re-validates each unit's catalog, so a
+                    // stale hit is caught there, not here.
                     (prev_active, Vec::new(), last_valid_len)
                 } else {
                     let file = File::open(&journal_path)?;

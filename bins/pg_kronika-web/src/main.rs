@@ -42,14 +42,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(snapshot);
 
     // The refresh task owns its own mutable snapshot and publishes a fresh
-    // clone after each incremental scan.
+    // clone after each incremental scan. It logs any change in the warning and
+    // damaged-region counts, so serving partial data over corruption leaves an
+    // operator-visible trace instead of being silently dropped.
     let shared = Arc::clone(&state.snapshot);
     tokio::spawn(async move {
         let mut snap = shared.load().as_ref().clone();
+        let mut health = (snap.warnings().len(), snap.damages().len());
+        if health != (0, 0) {
+            eprintln!(
+                "store opened with {} warning(s), {} damaged region(s)",
+                health.0, health.1
+            );
+        }
         loop {
             tokio::time::sleep(REFRESH_INTERVAL).await;
             match snap.refresh_incremental() {
-                Ok(()) => shared.store(Arc::new(snap.clone())),
+                Ok(()) => {
+                    let current = (snap.warnings().len(), snap.damages().len());
+                    if current != health {
+                        eprintln!(
+                            "store health changed: {} warning(s), {} damaged region(s)",
+                            current.0, current.1
+                        );
+                        health = current;
+                    }
+                    shared.store(Arc::new(snap.clone()));
+                }
                 Err(err) => eprintln!("refresh failed: {err}"),
             }
         }
@@ -57,6 +76,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = std::env::var(ADDR_ENV).unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
     let listener = tokio::net::TcpListener::bind(addr.as_str()).await?;
-    axum::serve(listener, app(state)).await?;
+
+    // Drain in-flight requests on SIGTERM/SIGINT rather than dropping them, so a
+    // rolling restart does not cut off readers mid-response.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    axum::serve(listener, app(state))
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+        })
+        .await?;
     Ok(())
 }
