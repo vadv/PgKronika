@@ -15,9 +15,7 @@ use crate::steps::table;
 
 /// Assert the web API serves exactly one row of a section, matching the table.
 ///
-/// The row travels the whole read path — the sealed segment, the reader query
-/// layer, and the HTTP serialization — so a passing row proves they agree, not
-/// only that the on-disk segment is correct.
+/// A passing row proves the sealed segment, the reader, and the HTTP layer agree.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"
@@ -41,9 +39,9 @@ async fn web_section_single_row(world: &mut BddWorld, section: String, step: &St
 
 /// Assert the web API serves a row of a section identified by key columns.
 ///
-/// The HTTP mirror of the direct-decode `has a row with <keys>:` step: the same
-/// `column = value` conjunction selects the row (string keys compared against the
-/// resolved column), then its columns are checked against the JSON.
+/// HTTP mirror of the direct-decode `has a row with <keys>:` step: the same
+/// `column = value` conjunction selects the row (string keys against the
+/// resolved column).
 #[allow(
     clippy::needless_pass_by_value,
     reason = "cucumber step parameters must be owned String"

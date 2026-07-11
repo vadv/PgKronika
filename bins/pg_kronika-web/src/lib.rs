@@ -1,12 +1,9 @@
-//! Serves data to humans and agents: web UI, MCP server, JSON API.
+//! JSON API over a local store directory, served by an axum router.
 //!
-//! This binary hosts an axum router over a near-real-time view of a local
-//! store directory. The router is built by [`app`] from an [`AppState`], which
-//! holds the shared snapshot behind an [`ArcSwap`]. Request handlers clone the
-//! current snapshot (catalog metadata only, not section bodies) and call the
-//! reader's `&mut` query functions on their private copy. In production a
-//! background task refreshes the shared snapshot once a second; tests build the
-//! state directly and never start that task, so the router stays deterministic.
+//! Handlers clone the shared snapshot (catalog metadata, not section bodies)
+//! and run the reader's `&mut` queries on the private copy. A background task
+//! refreshes the shared snapshot once a second; tests skip it, so the router
+//! stays deterministic.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,10 +35,7 @@ const DEFAULT_LIMIT: usize = 1_000;
 /// Hard ceiling on `limit`, applied even when a request asks for more.
 const MAX_LIMIT: usize = 10_000;
 
-/// Shared router state.
-///
-/// The snapshot is swapped atomically by the background refresh task; handlers
-/// load the current pointer and clone it for their own `&mut` queries.
+/// Shared router state: the store snapshot behind an atomic swap.
 #[derive(Debug, Clone)]
 pub struct AppState {
     /// The current store snapshot, replaced wholesale on each refresh.
@@ -75,8 +69,7 @@ pub fn app(state: AppState) -> Router {
 
 /// `GET /v1/version` — the API and container format versions this build serves.
 ///
-/// The body is static: `{"api":"v1","format_version":1}` with an
-/// `application/json` content type.
+/// Static body, `application/json`.
 async fn version() -> Json<Value> {
     Json(json!({ "api": "v1", "format_version": FORMAT_VERSION }))
 }
@@ -187,9 +180,9 @@ async fn segments(
 /// `GET /v1/section/{name}?source&from&to&limit` — one section's rows over the
 /// window, decoded and serialized to JSON.
 ///
-/// Delegates the query (ts filter, sort, union columns, gap accounting) to the
-/// reader; this handler only parses parameters and shapes the result. A stale
-/// snapshot degrades to gaps inside the reader, so it stays a `200` here.
+/// The reader does the query (ts filter, sort, union columns, gaps); this
+/// handler parses params and shapes the result. A stale snapshot degrades to
+/// gaps inside the reader, so it stays a `200`.
 async fn section_data(
     State(state): State<AppState>,
     Path(name): Path<String>,
