@@ -12,6 +12,11 @@ repository.workspace = true
 kronika-registry = { path = "../kronika-registry" }
 kronika-reader = { path = "../kronika-reader" }
 kronika-format = { path = "../kronika-format" }
+pg_kronika-web = { path = "../../bins/pg_kronika-web" }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+serde_json = "1"
 cucumber = "0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util", "sync"] }
 tokio-postgres = "0.7"

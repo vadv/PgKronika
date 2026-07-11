@@ -182,3 +182,4 @@ mod statements;
 mod store_plans;
 mod user_tables;
 mod wal;
+mod web;

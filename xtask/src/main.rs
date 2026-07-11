@@ -104,6 +104,10 @@ fn workspace_graph() -> BTreeMap<String, BTreeSet<String>> {
                 .as_array()
                 .expect("dependencies array")
                 .iter()
+                // `kind: "dev"` deps are test-only and never link into a binary,
+                // so they do not carry another crate into a binary's runtime.
+                // `null` (normal) and `"build"` deps do; keep those.
+                .filter(|d| d["kind"].as_str() != Some("dev"))
                 .map(|d| d["name"].as_str().expect("dependency name").to_owned())
                 .filter(|d| names.contains(d))
                 .collect();

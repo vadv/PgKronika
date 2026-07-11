@@ -100,10 +100,15 @@ enum Handle {
 /// window is visible either from `active.parts` before reset or from a sealed
 /// `.pgm` after seal. `units()` drops an active part only when its catalog
 /// exactly matches a sealed unit catalog.
-#[derive(Debug)]
+///
+/// `Clone` copies the catalog metadata cache, not any section bodies; a web
+/// handler clones a shared snapshot per request to call `&mut` query functions.
+#[derive(Debug, Clone)]
 pub struct LocalDirSnapshot {
     dir: LocalDir,
     scan: LocalScan,
+    /// End of the last valid journal frame, carried across incremental refreshes.
+    last_valid_len: u64,
 }
 
 impl LocalDirSnapshot {
@@ -115,16 +120,45 @@ impl LocalDirSnapshot {
     pub fn open(root: &Path) -> io::Result<Self> {
         let dir = LocalDir::open(root)?;
         let scan = dir.scan()?;
-        Ok(Self { dir, scan })
+        let last_valid_len = scan.valid_len;
+        Ok(Self {
+            dir,
+            scan,
+            last_valid_len,
+        })
     }
 
     /// Re-scan the directory, picking up new sealed files and journal appends.
+    ///
+    /// This is a full re-scan of the journal from offset `0`. For steady-state
+    /// polling prefer [`refresh_incremental`](Self::refresh_incremental).
     ///
     /// # Errors
     ///
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh(&mut self) -> io::Result<()> {
         self.scan = self.dir.scan()?;
+        self.last_valid_len = self.scan.valid_len;
+        Ok(())
+    }
+
+    /// Re-scan the store incrementally, reading only the journal tail.
+    ///
+    /// Uses the last known journal offset to skip already-validated frames: an
+    /// unchanged journal is not re-read, an appended tail adds only its new
+    /// parts, and a truncate-in-place reset rescans from the start. Sealed
+    /// `.pgm` files are always re-listed, so a newly sealed segment is picked up.
+    ///
+    /// The decode-time staleness check in [`decode_unit`](Self::decode_unit) and
+    /// friends remains the backstop against a part changing under a reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the directory cannot be re-scanned.
+    pub fn refresh_incremental(&mut self) -> io::Result<()> {
+        let prev_active = std::mem::take(&mut self.scan.active);
+        self.scan = self.dir.scan_from(self.last_valid_len, prev_active)?;
+        self.last_valid_len = self.scan.valid_len;
         Ok(())
     }
 
@@ -539,6 +573,157 @@ mod tests {
 
         snap.refresh().unwrap();
         assert_eq!(snap.units().len(), 2, "refresh must surface the new part");
+    }
+
+    #[test]
+    fn refresh_incremental_surfaces_appended_part_and_keeps_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let part1 = make_part(1000, 2000, 1);
+        let journal_path = dir.path().join("active.parts");
+        let journal = framed(&part1);
+        fs::write(&journal_path, &journal).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert_eq!(snap.units().len(), 1);
+        let first_offset = snap.scan.active[0].part.offset;
+        let valid_before = snap.last_valid_len;
+        assert_eq!(valid_before, journal.len() as u64);
+
+        // Append a second part.
+        let part2 = make_part(3000, 4000, 1);
+        let mut buf = fs::read(&journal_path).unwrap();
+        let appended = framed(&part2);
+        buf.extend_from_slice(&appended);
+        fs::write(&journal_path, &buf).unwrap();
+
+        snap.refresh_incremental().unwrap();
+        assert_eq!(
+            snap.units().len(),
+            2,
+            "incremental refresh surfaces the new part"
+        );
+        assert_eq!(
+            snap.scan.active[0].part.offset, first_offset,
+            "the first part is carried over, not re-scanned"
+        );
+        assert_eq!(
+            snap.last_valid_len,
+            valid_before + appended.len() as u64,
+            "valid_len advances by exactly the appended frame"
+        );
+    }
+
+    #[test]
+    fn refresh_incremental_noop_when_journal_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let part1 = make_part(1000, 2000, 1);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part1)).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let first_offset = snap.scan.active[0].part.offset;
+        let valid_before = snap.last_valid_len;
+
+        snap.refresh_incremental().unwrap();
+
+        assert_eq!(
+            snap.units().len(),
+            1,
+            "unchanged journal keeps its one unit"
+        );
+        assert_eq!(
+            snap.scan.active[0].part.offset, first_offset,
+            "the part is carried unchanged, the journal body is not re-read"
+        );
+        assert_eq!(
+            snap.last_valid_len, valid_before,
+            "valid_len is unchanged on a noop refresh"
+        );
+    }
+
+    #[test]
+    fn refresh_incremental_reset_when_journal_truncated_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let part1 = make_part(1000, 2000, 1);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part1)).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert_eq!(snap.units().len(), 1);
+
+        // Truncate-in-place to zero (a reset).
+        fs::write(&journal_path, b"").unwrap();
+
+        snap.refresh_incremental().unwrap();
+        assert!(snap.units().is_empty(), "reset clears the live parts");
+        assert_eq!(snap.last_valid_len, 0, "valid_len resets to zero");
+    }
+
+    #[test]
+    fn refresh_incremental_torn_tail_holds_then_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let part1 = make_part(1000, 2000, 1);
+        let journal_path = dir.path().join("active.parts");
+        let journal = framed(&part1);
+        fs::write(&journal_path, &journal).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let valid_before = snap.last_valid_len;
+
+        // Append a truncated (incomplete) second frame.
+        let part2 = make_part(3000, 4000, 1);
+        let full = framed(&part2);
+        let mut buf = journal.clone();
+        buf.extend_from_slice(&full[..full.len() - 3]);
+        fs::write(&journal_path, &buf).unwrap();
+
+        snap.refresh_incremental().unwrap();
+        assert_eq!(snap.units().len(), 1, "torn tail must not surface a part");
+        assert_eq!(
+            snap.last_valid_len, valid_before,
+            "valid_len does not move past the last complete frame"
+        );
+
+        // Complete the frame; the next incremental refresh sees it.
+        let mut done = journal;
+        done.extend_from_slice(&full);
+        fs::write(&journal_path, &done).unwrap();
+
+        snap.refresh_incremental().unwrap();
+        assert_eq!(
+            snap.units().len(),
+            2,
+            "completed frame is surfaced next tick"
+        );
+        assert_eq!(snap.last_valid_len, done.len() as u64);
+    }
+
+    #[test]
+    fn refresh_incremental_discovers_new_sealed_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let part1 = make_part(2000, 3000, 1);
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part1)).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        assert_eq!(snap.units().len(), 1);
+        assert!(snap.units()[0].live);
+
+        // A new sealed segment appears in the directory.
+        let sealed = make_part(500, 1000, 1);
+        fs::write(dir.path().join("0500.pgm"), &sealed).unwrap();
+
+        snap.refresh_incremental().unwrap();
+        let units = snap.units();
+        assert_eq!(units.len(), 2, "new sealed segment is discovered");
+        assert!(
+            units.iter().any(|u| !u.live && u.min_ts == 500),
+            "the sealed unit is visible"
+        );
+        assert!(
+            units.iter().any(|u| u.live && u.min_ts == 2000),
+            "the live part remains visible"
+        );
     }
 
     #[test]
