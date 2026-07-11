@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use kronika_format::{
     Catalog, DEFAULT_MAX_PART_LEN, DEFAULT_RESYNC_CHUNK, DamageRegion, FORMAT_VERSION,
-    JournalLimits, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex, scan_journal_streaming,
-    validate_part_catalog,
+    FRAME_HEADER_LEN, JournalLimits, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex,
+    scan_journal_streaming_from, validate_part_catalog,
 };
 
 use crate::source::{ActivePart, LocalScan, SealedUnit, StoreError, StoreWarning};
@@ -17,7 +17,7 @@ const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A storage directory containing sealed `.pgm` segments and an `active.parts`
 /// journal.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LocalDir {
     root: PathBuf,
 }
@@ -61,13 +61,106 @@ impl LocalDir {
         // journal copy before reset; after seal, the later sealed-file scan
         // finds the .pgm copy and the snapshot layer deduplicates.
         let journal_path = self.root.join("active.parts");
-        let (active, damages) = match File::open(&journal_path) {
-            Ok(file) => self.scan_journal_reader(&file, &journal_path, &mut warnings)?,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
+        let (active, damages, valid_len) = match File::open(&journal_path) {
+            Ok(file) => {
+                self.scan_journal_reader_from(&file, 0, Vec::new(), &journal_path, &mut warnings)?
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (Vec::new(), Vec::new(), 0),
             Err(err) => return Err(err),
         };
 
-        // A part sealed after the journal scan appears in the sealed-file pass.
+        let sealed = self.list_sealed(&mut warnings)?;
+
+        Ok(LocalScan {
+            sealed,
+            active,
+            damages,
+            warnings,
+            valid_len,
+        })
+    }
+
+    /// Incrementally re-scan the store from a known journal offset.
+    ///
+    /// `last_valid_len` is the end of the last valid frame seen by the previous
+    /// scan; `prev_active` are the active parts that scan already validated.
+    /// The journal is stat-gated:
+    ///
+    /// - size `== last_valid_len`: unchanged; `prev_active` is kept as is and the
+    ///   journal body is not re-read.
+    /// - size `> last_valid_len`: only `[last_valid_len, size)` is scanned and the
+    ///   new parts are appended to `prev_active`.
+    /// - size `< last_valid_len` or the file is gone: a reset (truncate-in-place);
+    ///   `prev_active` is dropped and the journal is scanned from `0`.
+    ///
+    /// Sealed `.pgm` files are always re-listed. Journal reads that hit
+    /// `UnexpectedEof`/`NotFound` (a concurrent seal + reset) are downgraded to a
+    /// warning, matching [`scan`](Self::scan).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the directory cannot be read, or if the journal
+    /// cannot be stated or opened with an error other than `NotFound`.
+    pub fn scan_from(
+        &self,
+        last_valid_len: u64,
+        prev_active: Vec<ActivePart>,
+    ) -> io::Result<LocalScan> {
+        let mut warnings = Vec::new();
+        let journal_path = self.root.join("active.parts");
+
+        let (active, damages, valid_len) = match fs::metadata(&journal_path) {
+            Ok(meta) => {
+                let size = meta.len();
+                if size == last_valid_len {
+                    // Unchanged journal size: keep known parts, skip the body
+                    // read. An equal-length rewrite is indistinguishable by size
+                    // alone; decoding re-validates each unit's catalog, so a
+                    // stale hit is caught there, not here.
+                    (prev_active, Vec::new(), last_valid_len)
+                } else {
+                    let file = File::open(&journal_path)?;
+                    if size > last_valid_len {
+                        self.scan_journal_reader_from(
+                            &file,
+                            last_valid_len,
+                            prev_active,
+                            &journal_path,
+                            &mut warnings,
+                        )?
+                    } else {
+                        // size < last_valid_len: reset (truncate-in-place),
+                        // drop known parts and rescan from the start.
+                        self.scan_journal_reader_from(
+                            &file,
+                            0,
+                            Vec::new(),
+                            &journal_path,
+                            &mut warnings,
+                        )?
+                    }
+                }
+            }
+            // The journal vanished: treat as a reset to an empty journal.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (Vec::new(), Vec::new(), 0),
+            Err(err) => return Err(err),
+        };
+
+        let sealed = self.list_sealed(&mut warnings)?;
+
+        Ok(LocalScan {
+            sealed,
+            active,
+            damages,
+            warnings,
+            valid_len,
+        })
+    }
+
+    /// List sealed `.pgm` segments, decoding each catalog from its tail.
+    ///
+    /// Unreadable `.pgm` files are skipped and recorded as [`StoreWarning`]s.
+    fn list_sealed(&self, warnings: &mut Vec<StoreWarning>) -> io::Result<Vec<SealedUnit>> {
         let mut sealed = Vec::new();
         let mut pgm_paths: Vec<PathBuf> = Vec::new();
         for entry_result in fs::read_dir(&self.root)? {
@@ -95,13 +188,7 @@ impl LocalDir {
                 }),
             }
         }
-
-        Ok(LocalScan {
-            sealed,
-            active,
-            damages,
-            warnings,
-        })
+        Ok(sealed)
     }
 
     /// Open a sealed segment file for raw byte access.
@@ -139,8 +226,13 @@ impl LocalDir {
         Ok(buf)
     }
 
-    /// Scan an already-open `active.parts` journal into active parts and damage
-    /// regions.
+    /// Scan an already-open `active.parts` journal from `start_at` into active
+    /// parts, damage regions, and the resumable `valid_len`.
+    ///
+    /// Newly validated parts are appended to `prev_active`; pass an empty vector
+    /// for a full scan. Frame offsets from the scan are absolute, so a caller
+    /// resuming at `start_at > 0` gets parts that reference their true journal
+    /// position.
     ///
     /// A concurrent seal followed by `Journal::reset` can truncate the journal
     /// while the streaming scan or a per-part re-read is running; the resulting
@@ -152,26 +244,37 @@ impl LocalDir {
         clippy::unused_self,
         reason = "method on LocalDir for API symmetry and unit-testing with a mock ReadAt"
     )]
-    fn scan_journal_reader<R: ReadAt>(
+    fn scan_journal_reader_from<R: ReadAt>(
         &self,
         reader: &R,
+        start_at: u64,
+        prev_active: Vec<ActivePart>,
         journal_path: &Path,
         warnings: &mut Vec<StoreWarning>,
-    ) -> io::Result<(Vec<ActivePart>, Vec<DamageRegion>)> {
-        let report =
-            match scan_journal_streaming(reader, JournalLimits::default(), DEFAULT_RESYNC_CHUNK) {
-                Ok(report) => report,
-                Err(err) if is_stale_journal(&err) => {
-                    warnings.push(StoreWarning {
-                        path: journal_path.to_owned(),
-                        reason: format!("live journal changed during scan: {err}"),
-                    });
-                    return Ok((Vec::new(), Vec::new()));
-                }
-                Err(err) => return Err(err),
-            };
+    ) -> io::Result<(Vec<ActivePart>, Vec<DamageRegion>, u64)> {
+        let report = match scan_journal_streaming_from(
+            reader,
+            start_at,
+            JournalLimits::default(),
+            DEFAULT_RESYNC_CHUNK,
+        ) {
+            Ok(report) => report,
+            Err(err) if is_stale_journal(&err) => {
+                warnings.push(StoreWarning {
+                    path: journal_path.to_owned(),
+                    reason: format!("live journal changed during scan: {err}"),
+                });
+                return Ok((Vec::new(), Vec::new(), start_at));
+            }
+            Err(err) => return Err(err),
+        };
 
-        let mut active = Vec::with_capacity(report.parts.len());
+        let mut active = prev_active;
+        active.reserve(report.parts.len());
+        // The scan's valid_len assumes every part re-reads cleanly. If a per-part
+        // re-read hits a concurrent shrink, roll the resumable offset back to the
+        // failed frame's start so the next scan does not skip past it.
+        let mut valid_len = report.valid_len as u64;
         for part_ref in report.parts {
             if part_ref.len as u64 > DEFAULT_MAX_PART_LEN {
                 warnings.push(StoreWarning {
@@ -191,6 +294,7 @@ impl LocalDir {
                         path: journal_path.to_owned(),
                         reason: format!("live journal changed during scan: {err}"),
                     });
+                    valid_len = (part_ref.offset - FRAME_HEADER_LEN) as u64;
                     break;
                 }
                 Err(err) => return Err(err),
@@ -210,7 +314,7 @@ impl LocalDir {
             }
         }
 
-        Ok((active, report.damages))
+        Ok((active, report.damages, valid_len))
     }
 }
 
@@ -296,8 +400,7 @@ pub fn read_catalog<R: ReadAt>(reader: &R) -> Result<Catalog, StoreError> {
 mod tests {
     use super::*;
     use kronika_format::{
-        ENTRY_LEN, FRAME_HEADER_LEN, FrameHeader, META_LEN, PartMeta, SectionInput, build_part,
-        crc32c,
+        ENTRY_LEN, FrameHeader, META_LEN, PartMeta, SectionInput, build_part, crc32c,
     };
 
     fn part(ts: i64, src: u64) -> Vec<u8> {
@@ -625,6 +728,167 @@ mod tests {
         );
     }
 
+    // --- scan_from() incremental tests ---
+
+    /// Wrap a part body in one journal frame.
+    fn framed(part_bytes: &[u8]) -> Vec<u8> {
+        let mut out = FrameHeader {
+            part_len: part_bytes.len() as u64,
+        }
+        .encode()
+        .to_vec();
+        out.extend_from_slice(part_bytes);
+        out
+    }
+
+    #[test]
+    fn scan_from_unchanged_size_keeps_prev_and_reports_same_valid_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = framed(&part(1000, 7));
+        fs::write(dir.path().join("active.parts"), &journal).unwrap();
+        let local = LocalDir::open(dir.path()).unwrap();
+
+        let first = local.scan().unwrap();
+        assert_eq!(first.active.len(), 1);
+        assert_eq!(first.valid_len, journal.len() as u64);
+
+        let prev_active = first.active;
+        let again = local.scan_from(first.valid_len, prev_active).unwrap();
+        assert_eq!(again.active.len(), 1, "unchanged journal keeps the part");
+        assert_eq!(again.active[0].catalog.min_ts, 1000);
+        assert_eq!(again.valid_len, journal.len() as u64);
+    }
+
+    #[test]
+    fn scan_from_appends_only_the_new_tail_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        let journal = framed(&part(1000, 7));
+        fs::write(&journal_path, &journal).unwrap();
+        let local = LocalDir::open(dir.path()).unwrap();
+
+        let first = local.scan().unwrap();
+        let first_valid = first.valid_len;
+        let first_offset = first.active[0].part.offset;
+
+        // Append a second frame.
+        let mut buf = fs::read(&journal_path).unwrap();
+        buf.extend_from_slice(&framed(&part(3000, 7)));
+        fs::write(&journal_path, &buf).unwrap();
+
+        let scan = local.scan_from(first_valid, first.active).unwrap();
+        assert_eq!(scan.active.len(), 2, "prev part kept, new tail appended");
+        assert_eq!(
+            scan.active[0].part.offset, first_offset,
+            "the first part keeps its original offset"
+        );
+        assert_eq!(scan.active[0].catalog.min_ts, 1000);
+        assert_eq!(scan.active[1].catalog.min_ts, 3000);
+        assert_eq!(scan.valid_len, buf.len() as u64);
+    }
+
+    #[test]
+    fn scan_from_size_shrink_resets_and_rescans_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        // Two frames make the initial journal larger than one replacement frame.
+        let mut two = framed(&part(1000, 7));
+        two.extend_from_slice(&framed(&part(2000, 7)));
+        fs::write(&journal_path, &two).unwrap();
+        let local = LocalDir::open(dir.path()).unwrap();
+
+        let first = local.scan().unwrap();
+        assert_eq!(first.active.len(), 2);
+        let stale_valid = first.valid_len;
+
+        // Truncate-in-place then write a smaller, different journal.
+        let replacement = framed(&part(5000, 9));
+        assert!(
+            (replacement.len() as u64) < stale_valid,
+            "replacement is smaller"
+        );
+        fs::write(&journal_path, &replacement).unwrap();
+
+        let scan = local.scan_from(stale_valid, first.active).unwrap();
+        assert_eq!(scan.active.len(), 1, "reset yields exactly the new journal");
+        assert_eq!(
+            scan.active[0].catalog.min_ts, 5000,
+            "stale parts are dropped, only the new part surfaces"
+        );
+        assert_eq!(scan.valid_len, replacement.len() as u64);
+    }
+
+    #[test]
+    fn scan_from_missing_journal_resets_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part(1000, 7))).unwrap();
+        let local = LocalDir::open(dir.path()).unwrap();
+        let first = local.scan().unwrap();
+
+        fs::remove_file(&journal_path).unwrap();
+
+        let scan = local.scan_from(first.valid_len, first.active).unwrap();
+        assert!(
+            scan.active.is_empty(),
+            "removed journal empties the live set"
+        );
+        assert_eq!(scan.valid_len, 0, "valid_len resets to zero");
+        assert!(scan.damages.is_empty());
+    }
+
+    #[test]
+    fn scan_from_torn_tail_does_not_advance_valid_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        let journal = framed(&part(1000, 7));
+        fs::write(&journal_path, &journal).unwrap();
+        let local = LocalDir::open(dir.path()).unwrap();
+        let first = local.scan().unwrap();
+        let first_valid = first.valid_len;
+
+        // Append a header for a body that is not fully written yet.
+        let next = part(3000, 7);
+        let mut buf = fs::read(&journal_path).unwrap();
+        let full = framed(&next);
+        buf.extend_from_slice(&full[..full.len() - 3]); // truncated tail frame
+        fs::write(&journal_path, &buf).unwrap();
+
+        let scan = local.scan_from(first_valid, first.active).unwrap();
+        assert_eq!(scan.active.len(), 1, "torn tail frame is not surfaced");
+        assert_eq!(
+            scan.valid_len, first_valid,
+            "valid_len stays at the last complete frame"
+        );
+
+        // Finish the frame: the next incremental scan surfaces it.
+        let mut done = journal;
+        done.extend_from_slice(&full);
+        fs::write(&journal_path, &done).unwrap();
+
+        let after = local.scan_from(scan.valid_len, scan.active).unwrap();
+        assert_eq!(after.active.len(), 2, "completed frame now surfaces");
+        assert_eq!(after.active[1].catalog.min_ts, 3000);
+        assert_eq!(after.valid_len, done.len() as u64);
+    }
+
+    #[test]
+    fn scan_from_discovers_new_sealed_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        fs::write(&journal_path, framed(&part(1000, 7))).unwrap();
+        let local = LocalDir::open(dir.path()).unwrap();
+        let first = local.scan().unwrap();
+        assert_eq!(first.sealed.len(), 0);
+
+        fs::write(dir.path().join("0500.pgm"), part(500, 7)).unwrap();
+
+        let scan = local.scan_from(first.valid_len, first.active).unwrap();
+        assert_eq!(scan.sealed.len(), 1, "new sealed .pgm is discovered");
+        assert_eq!(scan.sealed[0].catalog.min_ts, 500);
+        assert_eq!(scan.active.len(), 1, "active part is preserved");
+    }
+
     // A mock ReadAt that claims a large byte_len but returns UnexpectedEof on
     // body reads — simulating a file that was truncated between byte_len() and
     // the first read_exact_at call (TOCTOU race with a concurrent seal/reset).
@@ -671,8 +935,8 @@ mod tests {
 
         let local = LocalDir::open(dir.path()).unwrap();
         let mut warnings = Vec::new();
-        let (active, _damages) = local
-            .scan_journal_reader(&mock, &journal_path, &mut warnings)
+        let (active, _damages, _valid_len) = local
+            .scan_journal_reader_from(&mock, 0, Vec::new(), &journal_path, &mut warnings)
             .expect("scan must not fail fatally on UnexpectedEof from streaming scan");
 
         assert!(
@@ -723,8 +987,8 @@ mod tests {
 
         let local = LocalDir::open(dir.path()).unwrap();
         let mut warnings = Vec::new();
-        let (active, _damages) = local
-            .scan_journal_reader(&mock, &journal_path, &mut warnings)
+        let (active, _damages, _valid_len) = local
+            .scan_journal_reader_from(&mock, 0, Vec::new(), &journal_path, &mut warnings)
             .expect("scan must not fail fatally");
 
         // scan_journal_streaming sees the second frame's body is "present" per
@@ -791,8 +1055,8 @@ mod tests {
 
         let local = LocalDir::open(dir.path()).unwrap();
         let mut warnings = Vec::new();
-        let (active, _damages) = local
-            .scan_journal_reader(&mock, &journal_path, &mut warnings)
+        let (active, _damages, _valid_len) = local
+            .scan_journal_reader_from(&mock, 0, Vec::new(), &journal_path, &mut warnings)
             .expect("scan must not fail fatally when the per-part re-read hits EOF");
 
         assert!(
