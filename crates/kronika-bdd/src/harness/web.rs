@@ -2,9 +2,9 @@
 //! directory, query it without a socket, and compare a response row to the
 //! values written in a `.feature`.
 //!
-//! This drives the whole read path — collector output, the reader query layer,
-//! and the HTTP serialization — against the same live-PostgreSQL oracle the
-//! direct-decode steps use.
+//! This exercises the whole read path (collector output, reader, HTTP
+//! serialization) against the same live-PostgreSQL oracle the direct-decode
+//! steps use.
 
 use std::path::Path;
 

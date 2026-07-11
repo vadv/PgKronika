@@ -1,8 +1,7 @@
 //! The `pg_kronika-web` binary: serve the JSON API over a local store directory.
 //!
-//! The router, state, and handlers live in the [`pg_kronika_web`] library; this
-//! binary wires them to a socket and runs the background refresh loop. The
-//! refresh-timer policy lives here, in the binary, not in the reader library.
+//! The router, state, and handlers live in [`pg_kronika_web`]; this binary
+//! wires them to a socket and runs the refresh loop and its timer policy.
 #![allow(
     unused_crate_dependencies,
     reason = "this thin binary consumes the pg_kronika_web library and a runtime; the package's other dependencies belong to the library and its tests"
