@@ -12,6 +12,13 @@ mod query;
 mod snapshot;
 mod unit;
 
+// criterion and mimalloc are used only by the `serving` bench; anchored for the
+// `unused_crate_dependencies` lint, which checks each target separately.
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use mimalloc as _;
+
 pub use kronika_format::DamageRegion;
 pub use query::{
     Cursor, Gap, LogicalColumn, LogicalSection, OutRow, QueryError, SectionPage, Value,
