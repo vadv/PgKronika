@@ -24,7 +24,9 @@ use kronika_reader::LocalDirSnapshot;
 use metrics_exporter_prometheus::PrometheusHandle;
 // The binary target and the `#[tokio::test]` harness need the async runtime; the
 // library's handlers are runtime-agnostic and never name it. The binary also
-// pulls tracing, its subscriber, and tower-http; the library proper names none.
+// pulls its allocator, tracing, the subscriber, and tower-http; the library
+// proper names none.
+use mimalloc as _;
 use tokio as _;
 use tower_http as _;
 use tracing as _;
