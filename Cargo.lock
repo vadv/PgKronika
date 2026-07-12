@@ -1223,17 +1223,22 @@ name = "kronika-bdd"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "axum",
  "cucumber",
+ "http-body-util",
  "kronika-format",
  "kronika-reader",
  "kronika-registry",
  "kronika-writer",
  "nix",
+ "pg_kronika-web",
  "portpicker",
  "rustix",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tower",
 ]
 
 [[package]]
