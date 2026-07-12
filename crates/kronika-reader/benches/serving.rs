@@ -398,5 +398,69 @@ fn bench_refresh_incremental(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_section_query, bench_refresh_incremental);
+/// Build `m` single-row sealed segments (`1000.pgm`, `1001.pgm`, …).
+///
+/// Opening the dir yields `m` sealed units, so `LocalDirSnapshot::clone` copies
+/// `m` catalogs — the per-request cost the data handlers pay on the happy path
+/// today.
+fn build_many_segments(dir: &Path, m: usize) {
+    for i in 0..m {
+        let mut interner = Interner::new(DictLimits::new(1 << 16, 1 << 24).expect("dict limits"));
+        let idx = i64::try_from(i).expect("segment index fits i64");
+        let str_id = interner
+            .intern(&query_text(idx))
+            .expect("intern query text");
+        let row = statements_v6_row(1000 + idx, 1, 1, idx, StrId(str_id.get()));
+        let body = PgStatStatementsV6::encode(&[row]).expect("encode v6");
+        let dict_sections = dict::encode(interner.window()).expect("encode dictionary");
+        let mut inputs: Vec<SectionInput<'_>> = dict_sections
+            .iter()
+            .map(|s| SectionInput {
+                type_id: s.type_id,
+                rows: s.rows,
+                body: &s.body,
+            })
+            .collect();
+        inputs.push(SectionInput {
+            type_id: 1_002_006,
+            rows: 1,
+            body: &body,
+        });
+        let part = build_part(
+            &inputs,
+            PartMeta {
+                min_ts: 1000 + idx,
+                max_ts: 1000 + idx,
+                source_id: SOURCE,
+            },
+        );
+        std::fs::write(dir.join(format!("{}.pgm", 1000 + i)), &part).expect("write part");
+    }
+}
+
+/// Per-request snapshot clone as the sealed-segment count grows. Data handlers
+/// clone the whole catalog set on every request today; P2 removes it from the
+/// happy path, so this sizes what P2 saves.
+fn bench_snapshot_clone(c: &mut Criterion) {
+    let mut group = c.benchmark_group("snapshot_clone");
+    for &m in &[100_usize, 1000, 5000] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        build_many_segments(tmp.path(), m);
+        let snap = LocalDirSnapshot::open(tmp.path()).expect("open snapshot");
+        let id = BenchmarkId::from_parameter(format!("{m}_segments"));
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                black_box(snap.clone());
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_section_query,
+    bench_refresh_incremental,
+    bench_snapshot_clone
+);
 criterion_main!(benches);
