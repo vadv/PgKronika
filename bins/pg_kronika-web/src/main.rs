@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rolling restart does not cut off readers mid-response.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    axum::serve(listener, app(state, metrics_handle))
+    axum::serve(listener, app(state, None, metrics_handle))
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = sigterm.recv() => {}
