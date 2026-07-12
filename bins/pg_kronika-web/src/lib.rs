@@ -85,6 +85,8 @@ impl AppState {
 /// with `tower::ServiceExt::oneshot`.
 pub fn app(state: AppState) -> Router {
     Router::new()
+        .route("/healthz", get(handlers::probes::healthz))
+        .route("/readyz", get(handlers::probes::readyz))
         .route("/v1/version", get(handlers::v1::version))
         .route("/v1/sources", get(handlers::v1::sources))
         .route("/v1/sections", get(handlers::v1::sections))
@@ -777,5 +779,79 @@ mod tests {
             body["error"], "bad_request",
             "the error body names the fault"
         );
+    }
+
+    // --- probe helpers ---
+
+    /// Build an empty snapshot in a temp dir; return `(dir, snapshot)`.
+    fn empty_snapshot() -> (tempfile::TempDir, kronika_reader::LocalDirSnapshot) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+        (dir, snapshot)
+    }
+
+    /// Drive one probe request and return `(status, body)`.
+    async fn probe(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read body")
+            .to_bytes();
+        let value = serde_json::from_slice(&bytes).expect("body is valid JSON");
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_200_ok() {
+        let (_dir, snapshot) = empty_snapshot();
+        let state = AppState::new(snapshot);
+        let (status, body) = probe(state, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"status": "ok"}));
+    }
+
+    #[tokio::test]
+    async fn readyz_fresh_snapshot_returns_200_ready() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let (_dir, snapshot) = empty_snapshot();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // last_refresh = now; stale_after = 10s => age == 0, not stale
+        let state = AppState::with_readiness(snapshot, now, std::time::Duration::from_secs(10));
+        let (status, body) = probe(state, "/readyz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ready"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn readyz_stale_snapshot_returns_503_not_ready() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let (_dir, snapshot) = empty_snapshot();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // last_refresh = now - 3600; stale_after = 10s => age = 3600, stale
+        let state = AppState::with_readiness(
+            snapshot,
+            now.saturating_sub(3600),
+            std::time::Duration::from_secs(10),
+        );
+        let (status, body) = probe(state, "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], serde_json::json!(false));
     }
 }
