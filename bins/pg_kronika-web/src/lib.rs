@@ -6,6 +6,8 @@
 //! stays deterministic.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use axum::Router;
@@ -18,23 +20,61 @@ use tokio as _;
 pub(crate) mod handlers;
 mod params;
 mod serialize;
+pub(crate) mod startup;
 
 /// Container format version this build serves, mirrored into `/v1/version`.
 pub(crate) const FORMAT_VERSION: u32 = 1;
 
-/// Shared router state: the store snapshot behind an atomic swap.
+/// Shared router state: the store snapshot and readiness counters.
+///
+/// All fields use `Arc` so `Clone` is cheap; the router clones this per request.
 #[derive(Debug, Clone)]
 pub struct AppState {
     /// The current store snapshot, replaced wholesale on each refresh.
     pub snapshot: Arc<ArcSwap<LocalDirSnapshot>>,
+    /// Unix timestamp (seconds) of the last successful snapshot refresh.
+    pub last_refresh: Arc<AtomicU64>,
+    /// Number of completed refresh loop iterations (successful or not).
+    pub refresh_loop_iterations: Arc<AtomicU64>,
+    /// Age threshold after which the store is considered stale.
+    pub stale_after: Duration,
 }
 
 impl AppState {
-    /// Wrap an already-open snapshot in swappable shared state.
+    /// Wrap a snapshot in shared state with default readiness values.
+    ///
+    /// `last_refresh` is initialised to the current wall-clock second so that
+    /// `/readyz` reports ready immediately after startup. `stale_after` defaults
+    /// to 10 s, matching the refresh loop cadence.
     #[must_use]
     pub fn new(snapshot: LocalDirSnapshot) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         Self {
             snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            last_refresh: Arc::new(AtomicU64::new(now)),
+            refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
+            stale_after: Duration::from_secs(10),
+        }
+    }
+
+    /// Construct state with explicit readiness values — intended for tests.
+    ///
+    /// Use this when a test needs to control `last_refresh` or `stale_after`
+    /// (e.g. to assert `/readyz` 503 behaviour).
+    #[must_use]
+    pub fn with_readiness(
+        snapshot: LocalDirSnapshot,
+        last_refresh_secs: u64,
+        stale_after: Duration,
+    ) -> Self {
+        Self {
+            snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            last_refresh: Arc::new(AtomicU64::new(last_refresh_secs)),
+            refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
+            stale_after,
         }
     }
 }
