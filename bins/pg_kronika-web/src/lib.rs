@@ -4,15 +4,24 @@
 //! and run the reader's `&mut` queries on the private copy. A background task
 //! refreshes the shared snapshot once a second; tests skip it, so the router
 //! stays deterministic.
+#![allow(
+    clippy::multiple_crate_versions,
+    reason = "metrics-exporter-prometheus and axum pull duplicate transitive versions outside our control"
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use axum::Router;
+use axum::extract::MatchedPath;
+use axum::http::Request;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::get;
 use kronika_reader::LocalDirSnapshot;
+use metrics_exporter_prometheus::PrometheusHandle;
 // The binary target and the `#[tokio::test]` harness need the async runtime; the
 // library's handlers are runtime-agnostic and never name it.
 use tokio as _;
@@ -24,6 +33,11 @@ pub(crate) mod startup;
 
 /// Container format version this build serves, mirrored into `/v1/version`.
 pub(crate) const FORMAT_VERSION: u32 = 1;
+
+/// Histogram buckets, in seconds, for `kronika_web_request_duration_seconds`.
+pub const REQUEST_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
 
 /// Shared router state: the store snapshot and readiness counters.
 ///
@@ -79,12 +93,55 @@ impl AppState {
     }
 }
 
-/// Build the request router over `state`.
+/// Per-request metrics middleware.
+///
+/// Increments `kronika_web_requests_total` and records
+/// `kronika_web_request_duration_seconds` after the inner handler responds.
+/// Tracks in-flight requests via `kronika_web_inflight_requests` gauge.
+/// Path labels come from `MatchedPath` to avoid high-cardinality URIs.
+async fn track_metrics(req: Request<axum::body::Body>, next: Next) -> Response {
+    let matched = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|mp| mp.as_str().to_owned());
+    let method = req.method().as_str().to_owned();
+    let (method_label, path_label) = startup::metric_labels(&method, matched.as_deref());
+
+    metrics::gauge!("kronika_web_inflight_requests").increment(1.0);
+    let start = Instant::now();
+
+    let response = next.run(req).await;
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+
+    metrics::gauge!("kronika_web_inflight_requests").decrement(1.0);
+    metrics::counter!(
+        "kronika_web_requests_total",
+        "method" => method_label.clone(),
+        "path" => path_label,
+        "status" => status
+    )
+    .increment(1);
+    metrics::histogram!(
+        "kronika_web_request_duration_seconds",
+        "method" => method_label,
+        "path" => path_label
+    )
+    .record(elapsed);
+
+    response
+}
+
+/// Build the request router over `state` with Prometheus metrics support.
 ///
 /// Pure: no sockets, no background tasks. Tests call this directly and drive it
 /// with `tower::ServiceExt::oneshot`.
-pub fn app(state: AppState) -> Router {
+pub fn app(state: AppState, metrics_handle: PrometheusHandle) -> Router {
+    use axum::Extension;
+
     Router::new()
+        .route("/metrics", get(handlers::metrics::metrics_handler))
         .route("/healthz", get(handlers::probes::healthz))
         .route("/readyz", get(handlers::probes::readyz))
         .route("/v1/version", get(handlers::v1::version))
@@ -93,11 +150,15 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/segments", get(handlers::v1::segments))
         .route("/v1/section/{name}", get(handlers::v1::section_data))
         .route("/v1/sections/batch", get(handlers::v1::sections_batch))
+        .layer(Extension(metrics_handle))
+        .layer(middleware::from_fn(track_metrics))
         .with_state(state)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
@@ -107,9 +168,32 @@ mod tests {
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
     use tower::ServiceExt;
 
     use super::{AppState, app};
+
+    /// Process-global Prometheus recorder installed once for all tests.
+    ///
+    /// `install_recorder` panics on the second call, so `OnceLock` ensures
+    /// it only runs once per test binary. All `app()` calls in tests share
+    /// this handle.
+    static TEST_RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
+
+    fn test_metrics_handle() -> PrometheusHandle {
+        TEST_RECORDER
+            .get_or_init(|| {
+                PrometheusBuilder::new()
+                    .set_buckets_for_metric(
+                        Matcher::Full("kronika_web_request_duration_seconds".to_owned()),
+                        super::REQUEST_DURATION_BUCKETS,
+                    )
+                    .expect("histogram buckets are valid")
+                    .install_recorder()
+                    .expect("install global Prometheus recorder")
+            })
+            .clone()
+    }
 
     /// Build an [`AppState`] over a temp directory holding one `build_part`
     /// segment, then answer one request against `app(state)` in-process.
@@ -136,7 +220,7 @@ mod tests {
         let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let state = AppState::new(snapshot);
 
-        let response = app(state)
+        let response = app(state, test_metrics_handle())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -234,7 +318,7 @@ mod tests {
     async fn serve(dir: &std::path::Path, uri: &str) -> (StatusCode, serde_json::Value) {
         let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
         let state = AppState::new(snapshot);
-        let response = app(state)
+        let response = app(state, test_metrics_handle())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -792,7 +876,7 @@ mod tests {
 
     /// Drive one probe request and return `(status, body)`.
     async fn probe(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
-        let response = app(state)
+        let response = app(state, test_metrics_handle())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -853,5 +937,68 @@ mod tests {
         let (status, body) = probe(state, "/readyz").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["ready"], serde_json::json!(false));
+    }
+
+    // --- /metrics ---
+
+    #[tokio::test]
+    async fn metrics_endpoint_lists_metric_names_after_traffic() {
+        let handle = test_metrics_handle();
+
+        // track_metrics registers the request counter lazily — on the first
+        // increment, which runs after a handler returns. Warm it with one
+        // request so the scrape sees it without leaning on sibling tests.
+        let (_warm_dir, warm_snapshot) = empty_snapshot();
+        app(AppState::new(warm_snapshot), handle.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route warmup request");
+
+        let (_dir, snapshot) = empty_snapshot();
+        let response = app(AppState::new(snapshot), handle)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "/metrics must return 200"
+        );
+
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+
+        assert!(
+            body.contains("kronika_web_requests_total"),
+            "/metrics body must contain kronika_web_requests_total"
+        );
+        assert!(
+            body.contains("kronika_web_data_age_seconds"),
+            "/metrics body must contain kronika_web_data_age_seconds"
+        );
+        assert!(
+            body.contains("kronika_web_reader_age_seconds"),
+            "/metrics body must contain kronika_web_reader_age_seconds"
+        );
+        assert!(
+            body.contains("kronika_web_units_total"),
+            "/metrics body must contain kronika_web_units_total"
+        );
     }
 }

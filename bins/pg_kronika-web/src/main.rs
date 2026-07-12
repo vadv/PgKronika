@@ -6,11 +6,16 @@
     unused_crate_dependencies,
     reason = "this thin binary consumes the pg_kronika_web library and a runtime; the package's other dependencies belong to the library and its tests"
 )]
+#![allow(
+    clippy::multiple_crate_versions,
+    reason = "metrics-exporter-prometheus and axum pull duplicate transitive versions outside our control"
+)]
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use kronika_reader::LocalDirSnapshot;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use pg_kronika_web::{AppState, app};
 
 /// How often the refresh task re-scans the store directory.
@@ -36,6 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("usage: pg_kronika-web <dir>   (or set {DIR_ENV})");
         std::process::exit(2);
     };
+
+    let metrics_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| format!("failed to install metrics recorder: {e}"))?;
 
     let snapshot = LocalDirSnapshot::open(&dir)?;
     let state = AppState::new(snapshot);
@@ -80,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rolling restart does not cut off readers mid-response.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    axum::serve(listener, app(state))
+    axum::serve(listener, app(state, metrics_handle))
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = sigterm.recv() => {}
