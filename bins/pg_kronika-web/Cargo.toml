@@ -20,6 +20,9 @@ subtle = "2"
 rust-embed = { version = "8", features = ["mime-guess"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tower-http = { version = "0.6", features = ["trace"] }
 
 [dev-dependencies]
 kronika-format = { path = "../../crates/kronika-format" }

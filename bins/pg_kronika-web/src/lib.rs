@@ -23,8 +23,12 @@ use axum::routing::get;
 use kronika_reader::LocalDirSnapshot;
 use metrics_exporter_prometheus::PrometheusHandle;
 // The binary target and the `#[tokio::test]` harness need the async runtime; the
-// library's handlers are runtime-agnostic and never name it.
+// library's handlers are runtime-agnostic and never name it. The binary also
+// pulls tracing, its subscriber, and tower-http; the library proper names none.
 use tokio as _;
+use tower_http as _;
+use tracing as _;
+use tracing_subscriber as _;
 
 mod auth;
 pub(crate) mod handlers;
@@ -34,9 +38,10 @@ pub(crate) mod startup;
 
 pub use auth::AuthConfig;
 use auth::require_basic_auth;
+pub use startup::WebConfig;
 
 /// Container format version this build serves, mirrored into `/v1/version`.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 1;
 
 /// Histogram buckets, in seconds, for `kronika_web_request_duration_seconds`.
 pub const REQUEST_DURATION_BUCKETS: &[f64] = &[
@@ -78,10 +83,10 @@ impl AppState {
         }
     }
 
-    /// Construct state with explicit readiness values — intended for tests.
+    /// Construct state with an explicit `last_refresh` and `stale_after`.
     ///
-    /// Use this when a test needs to control `last_refresh` or `stale_after`
-    /// (e.g. to assert `/readyz` 503 behaviour).
+    /// The server passes the configured staleness threshold and the current
+    /// time; tests use it to drive `/readyz` from an injected `last_refresh`.
     #[must_use]
     pub fn with_readiness(
         snapshot: LocalDirSnapshot,

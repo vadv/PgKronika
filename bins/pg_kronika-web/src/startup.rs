@@ -2,9 +2,6 @@
 //!
 //! All functions here are side-effect-free: no I/O, no environment reads.
 //! `WebConfig::from_env` is the only entry point that touches `std::env`.
-// Items in this module are consumed by later tasks (T5, T7); allow
-// dead_code so the gate stays green before those tasks are implemented.
-#![allow(dead_code, reason = "consumed by T5 auth and T7 main")]
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -58,12 +55,33 @@ pub(crate) fn parse_basic_auth(raw: &str) -> Result<(String, String), String> {
 }
 
 /// Validated server configuration parsed from env-var strings.
-pub(crate) struct WebConfig {
+pub struct WebConfig {
+    /// Store directory to serve.
     pub dir: PathBuf,
+    /// Listen address (`host:port`).
     pub addr: String,
+    /// Basic Auth credential; `None` leaves the API open.
     pub basic_auth: Option<(String, String)>,
+    /// Age after which `/readyz` reports the store stale.
     pub stale_after: Duration,
+    /// Log filter directive (e.g. `info`).
     pub log: String,
+}
+
+impl std::fmt::Debug for WebConfig {
+    /// Redacts the Basic Auth credential so it never reaches a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebConfig")
+            .field("dir", &self.dir)
+            .field("addr", &self.addr)
+            .field(
+                "basic_auth",
+                &self.basic_auth.as_ref().map(|_| "<redacted>"),
+            )
+            .field("stale_after", &self.stale_after)
+            .field("log", &self.log)
+            .finish()
+    }
 }
 
 impl WebConfig {
@@ -105,7 +123,10 @@ impl WebConfig {
     /// Required: `KRONIKA_WEB_DIR`, `KRONIKA_WEB_ADDR`.
     /// Optional: `KRONIKA_WEB_BASIC_AUTH`, `KRONIKA_WEB_STALE_AFTER_S`,
     /// `KRONIKA_WEB_LOG`.
-    pub(crate) fn from_env() -> Result<Self, String> {
+    ///
+    /// # Errors
+    /// Returns a message when a required variable is unset or a value is invalid.
+    pub fn from_env() -> Result<Self, String> {
         let dir = std::env::var("KRONIKA_WEB_DIR")
             .map_err(|_e| "KRONIKA_WEB_DIR is not set".to_owned())?;
         let addr = std::env::var("KRONIKA_WEB_ADDR")
