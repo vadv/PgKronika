@@ -2,12 +2,33 @@
 //!
 //! All functions here are side-effect-free: no I/O, no environment reads.
 //! `WebConfig::from_env` is the only entry point that touches `std::env`.
-// Items in this module are consumed by later tasks (T3, T5, T7); allow
+// Items in this module are consumed by later tasks (T5, T7); allow
 // dead_code so the gate stays green before those tasks are implemented.
-#![allow(dead_code, reason = "consumed by T3 probes, T5 auth, and T7 main")]
+#![allow(dead_code, reason = "consumed by T5 auth and T7 main")]
 
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Normalises a request's method and matched path into metric label values.
+///
+/// `matched_path` must come from axum's `MatchedPath` extension, not
+/// `uri().path()`, to avoid high-cardinality labels.
+/// When no route matched, path is reported as `"other"`.
+pub(crate) fn metric_labels(method: &str, matched_path: Option<&str>) -> (String, &'static str) {
+    let path: &'static str = match matched_path {
+        Some("/healthz") => "/healthz",
+        Some("/readyz") => "/readyz",
+        Some("/metrics") => "/metrics",
+        Some("/v1/version") => "/v1/version",
+        Some("/v1/sources") => "/v1/sources",
+        Some("/v1/sections") => "/v1/sections",
+        Some("/v1/segments") => "/v1/segments",
+        Some("/v1/section/{name}") => "/v1/section/{name}",
+        Some("/v1/sections/batch") => "/v1/sections/batch",
+        _ => "other",
+    };
+    (method.to_owned(), path)
+}
 
 /// Returns `true` if the store data is stale.
 ///
@@ -106,6 +127,25 @@ impl WebConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- metric_labels ---
+
+    #[test]
+    fn metric_labels_known_path_is_preserved() {
+        let (method, path) = metric_labels("GET", Some("/v1/section/{name}"));
+        assert_eq!(method, "GET", "method is forwarded unchanged");
+        assert_eq!(
+            path, "/v1/section/{name}",
+            "known matched path is preserved"
+        );
+    }
+
+    #[test]
+    fn metric_labels_none_path_becomes_other() {
+        let (method, path) = metric_labels("GET", None);
+        assert_eq!(method, "GET", "method is forwarded unchanged");
+        assert_eq!(path, "other", "unmatched path becomes 'other'");
+    }
 
     // --- staleness ---
 
