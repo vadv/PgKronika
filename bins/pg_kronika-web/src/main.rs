@@ -29,6 +29,11 @@ use pg_kronika_web::{
 };
 use tower_http::trace::TraceLayer;
 
+/// Process-wide allocator: mimalloc, chosen for the allocation-heavy
+/// snapshot-clone-per-request path.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// How often the refresh task re-scans the store directory.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
