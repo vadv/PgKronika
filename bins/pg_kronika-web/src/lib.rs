@@ -5,35 +5,22 @@
 //! refreshes the shared snapshot once a second; tests skip it, so the router
 //! stays deterministic.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::Router;
 use axum::routing::get;
-use axum::{Json, Router};
-use kronika_reader::{
-    Cursor, LocalDirSnapshot, OutRow, QueryError, SectionPage, Value as CellValue, section,
-    sections as query_sections,
-};
-use kronika_registry::{
-    ColumnClass, ColumnType, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, Semantics, TypeContract,
-    registry, section_name,
-};
-use serde_json::{Value, json};
+use kronika_reader::LocalDirSnapshot;
 // The binary target and the `#[tokio::test]` harness need the async runtime; the
 // library's handlers are runtime-agnostic and never name it.
 use tokio as _;
 
+pub(crate) mod handlers;
+mod params;
+mod serialize;
+
 /// Container format version this build serves, mirrored into `/v1/version`.
-const FORMAT_VERSION: u32 = 1;
-
-/// Rows returned when a request omits `limit`.
-const DEFAULT_LIMIT: usize = 1_000;
-
-/// Hard ceiling on `limit`, applied even when a request asks for more.
-const MAX_LIMIT: usize = 10_000;
+pub(crate) const FORMAT_VERSION: u32 = 1;
 
 /// Shared router state: the store snapshot behind an atomic swap.
 #[derive(Debug, Clone)]
@@ -58,349 +45,13 @@ impl AppState {
 /// with `tower::ServiceExt::oneshot`.
 pub fn app(state: AppState) -> Router {
     Router::new()
-        .route("/v1/version", get(version))
-        .route("/v1/sources", get(sources))
-        .route("/v1/sections", get(sections))
-        .route("/v1/segments", get(segments))
-        .route("/v1/section/{name}", get(section_data))
-        .route("/v1/sections/batch", get(sections_batch))
+        .route("/v1/version", get(handlers::v1::version))
+        .route("/v1/sources", get(handlers::v1::sources))
+        .route("/v1/sections", get(handlers::v1::sections))
+        .route("/v1/segments", get(handlers::v1::segments))
+        .route("/v1/section/{name}", get(handlers::v1::section_data))
+        .route("/v1/sections/batch", get(handlers::v1::sections_batch))
         .with_state(state)
-}
-
-/// `GET /v1/version` — the API and container format versions this build serves.
-///
-/// Static body, `application/json`.
-async fn version() -> Json<Value> {
-    Json(json!({ "api": "v1", "format_version": FORMAT_VERSION }))
-}
-
-/// `GET /v1/sources` — every source in the store and its overall time span.
-async fn sources(State(state): State<AppState>) -> Json<Value> {
-    let snapshot = state.snapshot.load_full();
-    let mut spans: BTreeMap<u64, (i64, i64, usize)> = BTreeMap::new();
-    for unit in snapshot.units() {
-        let span = spans
-            .entry(unit.source_id)
-            .or_insert((unit.min_ts, unit.max_ts, 0));
-        span.0 = span.0.min(unit.min_ts);
-        span.1 = span.1.max(unit.max_ts);
-        span.2 += 1;
-    }
-    let sources: Vec<Value> = spans
-        .into_iter()
-        .map(|(source_id, (min_ts, max_ts, segments))| {
-            json!({ "source_id": source_id, "min_ts": min_ts, "max_ts": max_ts, "segments": segments })
-        })
-        .collect();
-    Json(json!({ "sources": sources }))
-}
-
-/// `GET /v1/sections` — static catalog of section types from the registry.
-///
-/// One entry per logical name: its semantics, sort key, and the union of its
-/// versions' columns (first appearance across ascending `type_id`).
-async fn sections() -> Json<Value> {
-    let mut by_name: BTreeMap<&'static str, Vec<&'static TypeContract>> = BTreeMap::new();
-    for contract in registry() {
-        by_name.entry(contract.name).or_default().push(contract);
-    }
-    let sections: Vec<Value> = by_name
-        .into_iter()
-        .map(|(name, mut contracts)| {
-            contracts.sort_by_key(|contract| contract.type_id.get());
-            let mut seen = std::collections::HashSet::new();
-            let mut columns = Vec::new();
-            for contract in &contracts {
-                for column in contract.columns {
-                    if seen.insert(column.name) {
-                        columns.push(json!({
-                            "name": column.name,
-                            "type": column_type_name(column.ty),
-                            "class": column_class_name(column.class),
-                        }));
-                    }
-                }
-            }
-            json!({
-                "name": name,
-                "semantics": semantics_name(contracts[0].semantics),
-                "sort_key": contracts[0].sort_key,
-                "columns": columns,
-            })
-        })
-        .collect();
-    Json(json!({ "sections": sections }))
-}
-
-/// `GET /v1/segments?source&from&to` — segments of `source` overlapping the
-/// window, catalog metadata only (no section bodies decoded).
-async fn segments(
-    State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
-
-    let snapshot = state.snapshot.load_full();
-    let units = snapshot.units();
-    let mut out = Vec::new();
-    for (idx, unit) in units.iter().enumerate() {
-        if unit.source_id != source || unit.max_ts < from || unit.min_ts > to {
-            continue;
-        }
-        let Some(catalog) = snapshot.unit_catalog(idx) else {
-            continue;
-        };
-        let mut rows_by_name: BTreeMap<&'static str, u64> = BTreeMap::new();
-        for entry in &catalog.entries {
-            if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
-                continue;
-            }
-            let Some(name) = section_name(entry.type_id) else {
-                continue;
-            };
-            *rows_by_name.entry(name).or_insert(0) += u64::from(entry.rows);
-        }
-        let sections: Vec<Value> = rows_by_name
-            .into_iter()
-            .map(|(name, rows)| json!({ "name": name, "rows": rows }))
-            .collect();
-        out.push(json!({
-            "segment_id": unit.min_ts.to_string(),
-            "source_id": unit.source_id,
-            "min_ts": unit.min_ts,
-            "max_ts": unit.max_ts,
-            "sections": sections,
-        }));
-    }
-    Ok(Json(json!({ "segments": out })))
-}
-
-/// `GET /v1/section/{name}?source&from&to&limit` — one section's rows over the
-/// window, decoded and serialized to JSON.
-///
-/// The reader does the query (ts filter, sort, union columns, gaps); this
-/// handler parses params and shapes the result. A stale snapshot degrades to
-/// gaps inside the reader, so it stays a `200`.
-async fn section_data(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
-    let limit = parse_limit(&params)?;
-    let cursor = parse_cursor(&params)?;
-
-    // section() takes `&mut`; clone the shared snapshot (catalog metadata, not
-    // section bodies) and query the private copy.
-    let mut snap = state.snapshot.load().as_ref().clone();
-    match section(&mut snap, &name, source, from, to, limit, cursor) {
-        Ok(page) => Ok(Json(page_to_json(&page))),
-        Err(err) => Err(query_error_response(&err)),
-    }
-}
-
-/// `GET /v1/sections/batch?source&from&to&names=a,b,c&limit` — several sections
-/// for one source over one window, each as its own page keyed by name.
-///
-/// One decode of each overlapping segment serves every requested section, so a
-/// multi-metric view costs one pass, not one per section. An unknown name fails
-/// the whole request.
-async fn sections_batch(
-    State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
-    let limit = parse_limit(&params)?;
-    let raw = params
-        .get("names")
-        .ok_or_else(|| bad_request("missing query parameter `names`"))?;
-    let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
-    if names.is_empty() {
-        return Err(bad_request("`names` must list at least one section"));
-    }
-
-    let mut snap = state.snapshot.load().as_ref().clone();
-    let cursors = BTreeMap::new();
-    match query_sections(&mut snap, source, from, to, &names, limit, &cursors) {
-        Ok(pages) => {
-            let object = pages
-                .iter()
-                .map(|(name, page)| (name.clone(), page_to_json(page)))
-                .collect();
-            Ok(Json(Value::Object(object)))
-        }
-        Err(err) => Err(query_error_response(&err)),
-    }
-}
-
-/// Parse a required unsigned query parameter, or a `400` with a JSON body.
-fn parse_u64(
-    params: &std::collections::HashMap<String, String>,
-    key: &str,
-) -> Result<u64, (StatusCode, Json<Value>)> {
-    params
-        .get(key)
-        .ok_or_else(|| bad_request(&format!("missing query parameter `{key}`")))?
-        .parse()
-        .map_err(|_err| bad_request(&format!("`{key}` must be an unsigned integer")))
-}
-
-/// Parse a required signed query parameter, or a `400` with a JSON body.
-fn parse_i64(
-    params: &std::collections::HashMap<String, String>,
-    key: &str,
-) -> Result<i64, (StatusCode, Json<Value>)> {
-    params
-        .get(key)
-        .ok_or_else(|| bad_request(&format!("missing query parameter `{key}`")))?
-        .parse()
-        .map_err(|_err| bad_request(&format!("`{key}` must be an integer")))
-}
-
-/// A `400 Bad Request` with a `{ "error", "detail" }` JSON body.
-fn bad_request(detail: &str) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "error": "bad_request", "detail": detail })),
-    )
-}
-
-/// Parse the optional `limit`: absent → [`DEFAULT_LIMIT`], present → clamped to
-/// [`MAX_LIMIT`], unparseable → `400`.
-fn parse_limit(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<usize, (StatusCode, Json<Value>)> {
-    params.get("limit").map_or(Ok(DEFAULT_LIMIT), |raw| {
-        raw.parse::<usize>()
-            .map(|limit| limit.min(MAX_LIMIT))
-            .map_err(|_err| bad_request("`limit` must be a non-negative integer"))
-    })
-}
-
-/// Parse the optional resume `cursor`: absent → `None`, present → decoded, or a
-/// `400` when it is malformed or belongs to another source.
-fn parse_cursor(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<Option<Cursor>, (StatusCode, Json<Value>)> {
-    params.get("cursor").map_or(Ok(None), |raw| {
-        Cursor::decode(raw)
-            .map(Some)
-            .map_err(|err| query_error_response(&err))
-    })
-}
-
-/// Map one reader [`CellValue`] to its JSON form (see the API contract).
-fn value_to_json(value: &CellValue) -> Value {
-    match value {
-        CellValue::Null => Value::Null,
-        CellValue::I64(n) => (*n).into(),
-        CellValue::U64(n) => (*n).into(),
-        CellValue::F64(n) => (*n).into(),
-        CellValue::Bool(b) => (*b).into(),
-        CellValue::Ts(t) => (*t).into(),
-        CellValue::Str(s) => Value::String(s.clone()),
-        CellValue::Blob {
-            text,
-            full_len,
-            truncated,
-        } => json!({ "text": text.as_str(), "full_len": *full_len, "truncated": *truncated }),
-        CellValue::ListI32(items) => Value::from(items.clone()),
-    }
-}
-
-/// Shape one output row as a JSON object keyed by column name.
-fn row_to_json(row: &OutRow) -> Value {
-    let object = row
-        .iter()
-        .map(|(name, value)| (name.clone(), value_to_json(value)))
-        .collect();
-    Value::Object(object)
-}
-
-/// Shape a [`SectionPage`] as the `/v1/section` response body.
-fn page_to_json(page: &SectionPage) -> Value {
-    let rows: Vec<Value> = page.rows.iter().map(row_to_json).collect();
-    let gaps: Vec<Value> = page
-        .gaps
-        .iter()
-        .map(|gap| json!({ "from": gap.from, "to": gap.to }))
-        .collect();
-    let next_cursor = page
-        .next_cursor
-        .as_ref()
-        .map_or(Value::Null, |cursor| Value::String(cursor.encode()));
-    json!({
-        "section": page.section,
-        "source_id": page.source_id,
-        "rows": rows,
-        "gaps": gaps,
-        "next_cursor": next_cursor,
-    })
-}
-
-/// Map a reader [`QueryError`] to an HTTP status and a `{ error, detail }` body.
-fn query_error_response(err: &QueryError) -> (StatusCode, Json<Value>) {
-    let (status, code, detail) = match err {
-        QueryError::UnknownSection(name) => (
-            StatusCode::NOT_FOUND,
-            "unknown_section",
-            format!("no section named `{name}`"),
-        ),
-        QueryError::BadCursor(message) => (StatusCode::BAD_REQUEST, "bad_cursor", message.clone()),
-        QueryError::Read(read) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "read_error",
-            read.to_string(),
-        ),
-    };
-    (status, Json(json!({ "error": code, "detail": detail })))
-}
-
-/// Stable wire name for a column's on-disk type.
-const fn column_type_name(ty: ColumnType) -> &'static str {
-    match ty {
-        ColumnType::I8 => "i8",
-        ColumnType::I16 => "i16",
-        ColumnType::I32 => "i32",
-        ColumnType::I64 => "i64",
-        ColumnType::U8 => "u8",
-        ColumnType::U16 => "u16",
-        ColumnType::U32 => "u32",
-        ColumnType::U64 => "u64",
-        ColumnType::F32 => "f32",
-        ColumnType::F64 => "f64",
-        ColumnType::Bool => "bool",
-        ColumnType::Ts => "ts",
-        ColumnType::StrId => "str",
-        ColumnType::ListI32 => "list_i32",
-    }
-}
-
-/// Stable wire name for a column's role: cumulative / gauge / label / timestamp.
-const fn column_class_name(class: ColumnClass) -> &'static str {
-    match class {
-        ColumnClass::Cumulative => "c",
-        ColumnClass::Gauge => "g",
-        ColumnClass::Label => "l",
-        ColumnClass::Timestamp => "t",
-    }
-}
-
-/// Stable wire name for a section's collection semantics.
-const fn semantics_name(semantics: Semantics) -> &'static str {
-    match semantics {
-        Semantics::SnapshotFull => "snapshot_full",
-        Semantics::ConditionalFull => "conditional_full",
-        Semantics::EventStream => "event_stream",
-        Semantics::Changed => "changed",
-        Semantics::OnChange => "on_change",
-    }
 }
 
 #[cfg(test)]
@@ -409,7 +60,6 @@ mod tests {
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
     use kronika_format::{PartMeta, SectionInput, build_part};
-    use kronika_reader::Value as CellValue;
     use kronika_registry::Section;
     use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
@@ -417,7 +67,7 @@ mod tests {
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use tower::ServiceExt;
 
-    use super::{AppState, app, parse_limit, value_to_json};
+    use super::{AppState, app};
 
     /// Build an [`AppState`] over a temp directory holding one `build_part`
     /// segment, then answer one request against `app(state)` in-process.
@@ -781,89 +431,6 @@ mod tests {
             },
         );
         std::fs::write(dir.join(file), &bytes).expect("write segment");
-    }
-
-    #[test]
-    fn value_to_json_maps_every_variant() {
-        assert_eq!(
-            value_to_json(&CellValue::Null),
-            serde_json::json!(null),
-            "null"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::I64(-5)),
-            serde_json::json!(-5),
-            "i64"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::U64(5)),
-            serde_json::json!(5),
-            "u64"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::F64(1.5)),
-            serde_json::json!(1.5),
-            "f64"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::Bool(true)),
-            serde_json::json!(true),
-            "bool"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::Ts(1_234)),
-            serde_json::json!(1_234),
-            "ts serializes as a number"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::Str("x".to_owned())),
-            serde_json::json!("x"),
-            "str"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::Blob {
-                text: "ab".to_owned(),
-                full_len: 10,
-                truncated: true,
-            }),
-            serde_json::json!({ "text": "ab", "full_len": 10, "truncated": true }),
-            "blob carries text, full_len and truncated"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::ListI32(vec![1, 2, 3])),
-            serde_json::json!([1, 2, 3]),
-            "list of i32"
-        );
-    }
-
-    #[test]
-    fn parse_limit_defaults_caps_and_rejects() {
-        let empty = std::collections::HashMap::new();
-        assert_eq!(
-            parse_limit(&empty).ok(),
-            Some(1_000),
-            "an absent limit uses the default"
-        );
-
-        let explicit = std::collections::HashMap::from([("limit".to_owned(), "50".to_owned())]);
-        assert_eq!(
-            parse_limit(&explicit).ok(),
-            Some(50),
-            "an explicit limit is honored"
-        );
-
-        let huge = std::collections::HashMap::from([("limit".to_owned(), "99999".to_owned())]);
-        assert_eq!(
-            parse_limit(&huge).ok(),
-            Some(10_000),
-            "a limit above the ceiling is clamped"
-        );
-
-        let bad = std::collections::HashMap::from([("limit".to_owned(), "-1".to_owned())]);
-        assert!(
-            parse_limit(&bad).is_err(),
-            "a non-numeric limit is rejected"
-        );
     }
 
     #[tokio::test]
