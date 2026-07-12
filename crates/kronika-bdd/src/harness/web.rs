@@ -40,7 +40,7 @@ fn bdd_metrics_handle() -> PrometheusHandle {
 /// status and the parsed JSON body.
 async fn request(dir: &Path, uri: &str) -> Result<(u16, Value)> {
     let snapshot = LocalDirSnapshot::open(dir).context("open the store snapshot")?;
-    let router = app(AppState::new(snapshot), bdd_metrics_handle());
+    let router = app(AppState::new(snapshot), None, bdd_metrics_handle());
     let response = router
         .oneshot(
             Request::builder()

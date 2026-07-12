@@ -26,10 +26,14 @@ use metrics_exporter_prometheus::PrometheusHandle;
 // library's handlers are runtime-agnostic and never name it.
 use tokio as _;
 
+mod auth;
 pub(crate) mod handlers;
 mod params;
 mod serialize;
 pub(crate) mod startup;
+
+pub use auth::AuthConfig;
+use auth::require_basic_auth;
 
 /// Container format version this build serves, mirrored into `/v1/version`.
 pub(crate) const FORMAT_VERSION: u32 = 1;
@@ -133,23 +137,32 @@ async fn track_metrics(req: Request<axum::body::Body>, next: Next) -> Response {
     response
 }
 
-/// Build the request router over `state` with Prometheus metrics support.
+/// Build the request router over `state`.
 ///
-/// Pure: no sockets, no background tasks. Tests call this directly and drive it
-/// with `tower::ServiceExt::oneshot`.
-pub fn app(state: AppState, metrics_handle: PrometheusHandle) -> Router {
+/// `auth` gates everything except the public probes and `/metrics`: `Some`
+/// requires the Basic credential, `None` leaves the API open. Pure: no sockets,
+/// no background tasks. Tests drive it with `tower::ServiceExt::oneshot`.
+pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: PrometheusHandle) -> Router {
     use axum::Extension;
 
-    Router::new()
-        .route("/metrics", get(handlers::metrics::metrics_handler))
+    let public = Router::new()
         .route("/healthz", get(handlers::probes::healthz))
         .route("/readyz", get(handlers::probes::readyz))
+        .route("/metrics", get(handlers::metrics::metrics_handler));
+
+    let mut protected = Router::new()
         .route("/v1/version", get(handlers::v1::version))
         .route("/v1/sources", get(handlers::v1::sources))
         .route("/v1/sections", get(handlers::v1::sections))
         .route("/v1/segments", get(handlers::v1::segments))
         .route("/v1/section/{name}", get(handlers::v1::section_data))
-        .route("/v1/sections/batch", get(handlers::v1::sections_batch))
+        .route("/v1/sections/batch", get(handlers::v1::sections_batch));
+    if let Some(cfg) = auth {
+        protected = protected.route_layer(middleware::from_fn_with_state(cfg, require_basic_auth));
+    }
+
+    public
+        .merge(protected)
         .layer(Extension(metrics_handle))
         .layer(middleware::from_fn(track_metrics))
         .with_state(state)
@@ -171,7 +184,7 @@ mod tests {
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
     use tower::ServiceExt;
 
-    use super::{AppState, app};
+    use super::{AppState, AuthConfig, app};
 
     /// Process-global Prometheus recorder installed once for all tests.
     ///
@@ -220,7 +233,7 @@ mod tests {
         let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let state = AppState::new(snapshot);
 
-        let response = app(state, test_metrics_handle())
+        let response = app(state, None, test_metrics_handle())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -318,7 +331,7 @@ mod tests {
     async fn serve(dir: &std::path::Path, uri: &str) -> (StatusCode, serde_json::Value) {
         let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
         let state = AppState::new(snapshot);
-        let response = app(state, test_metrics_handle())
+        let response = app(state, None, test_metrics_handle())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -876,7 +889,7 @@ mod tests {
 
     /// Drive one probe request and return `(status, body)`.
     async fn probe(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
-        let response = app(state, test_metrics_handle())
+        let response = app(state, None, test_metrics_handle())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -949,7 +962,7 @@ mod tests {
         // increment, which runs after a handler returns. Warm it with one
         // request so the scrape sees it without leaning on sibling tests.
         let (_warm_dir, warm_snapshot) = empty_snapshot();
-        app(AppState::new(warm_snapshot), handle.clone())
+        app(AppState::new(warm_snapshot), None, handle.clone())
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
@@ -960,7 +973,7 @@ mod tests {
             .expect("route warmup request");
 
         let (_dir, snapshot) = empty_snapshot();
-        let response = app(AppState::new(snapshot), handle)
+        let response = app(AppState::new(snapshot), None, handle)
             .oneshot(
                 Request::builder()
                     .uri("/metrics")
@@ -1000,5 +1013,88 @@ mod tests {
             body.contains("kronika_web_units_total"),
             "/metrics body must contain kronika_web_units_total"
         );
+    }
+
+    // --- auth ---
+
+    /// A valid `Authorization: Basic` header for `user:pass`.
+    fn basic_header(user: &str, pass: &str) -> String {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        format!("Basic {encoded}")
+    }
+
+    /// Drive one request over an empty snapshot with the given auth setting and
+    /// optional `Authorization` header; return the response status.
+    async fn auth_status(auth: Option<AuthConfig>, uri: &str, header: Option<&str>) -> StatusCode {
+        let (_dir, snapshot) = empty_snapshot();
+        let mut builder = Request::builder().uri(uri);
+        if let Some(value) = header {
+            builder = builder.header(header::AUTHORIZATION, value);
+        }
+        app(AppState::new(snapshot), auth, test_metrics_handle())
+            .oneshot(builder.body(Body::empty()).expect("build request"))
+            .await
+            .expect("route request")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_leaves_v1_open() {
+        assert_eq!(
+            auth_status(None, "/v1/version", None).await,
+            StatusCode::OK,
+            "with auth off, /v1 needs no credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_v1_without_credentials() {
+        assert_eq!(
+            auth_status(Some(AuthConfig::new("u", "p")), "/v1/version", None).await,
+            StatusCode::UNAUTHORIZED,
+            "with auth on, /v1 without a header is 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_accepts_correct_credentials() {
+        let header = basic_header("u", "p");
+        assert_eq!(
+            auth_status(
+                Some(AuthConfig::new("u", "p")),
+                "/v1/version",
+                Some(header.as_str())
+            )
+            .await,
+            StatusCode::OK,
+            "the right credential opens /v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_wrong_password() {
+        let header = basic_header("u", "wrong");
+        assert_eq!(
+            auth_status(
+                Some(AuthConfig::new("u", "p")),
+                "/v1/version",
+                Some(header.as_str())
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "a wrong password is 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_keeps_probes_and_metrics_public() {
+        for uri in ["/healthz", "/readyz", "/metrics"] {
+            assert_eq!(
+                auth_status(Some(AuthConfig::new("u", "p")), uri, None).await,
+                StatusCode::OK,
+                "{uri} stays public under auth"
+            );
+        }
     }
 }
