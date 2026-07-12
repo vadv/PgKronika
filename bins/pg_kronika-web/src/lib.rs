@@ -139,9 +139,10 @@ async fn track_metrics(req: Request<axum::body::Body>, next: Next) -> Response {
 
 /// Build the request router over `state`.
 ///
-/// `auth` gates everything except the public probes and `/metrics`: `Some`
-/// requires the Basic credential, `None` leaves the API open. Pure: no sockets,
-/// no background tasks. Tests drive it with `tower::ServiceExt::oneshot`.
+/// `auth` gates everything except the public probes and `/metrics` — the `/v1`
+/// API and the embedded UI alike: `Some` requires the Basic credential, `None`
+/// leaves them open. Pure: no sockets, no background tasks. Tests drive it with
+/// `tower::ServiceExt::oneshot`.
 pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: PrometheusHandle) -> Router {
     use axum::Extension;
 
@@ -156,9 +157,12 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .route("/v1/sections", get(handlers::v1::sections))
         .route("/v1/segments", get(handlers::v1::segments))
         .route("/v1/section/{name}", get(handlers::v1::section_data))
-        .route("/v1/sections/batch", get(handlers::v1::sections_batch));
+        .route("/v1/sections/batch", get(handlers::v1::sections_batch))
+        .fallback(handlers::static_::static_handler);
     if let Some(cfg) = auth {
-        protected = protected.route_layer(middleware::from_fn_with_state(cfg, require_basic_auth));
+        // `layer`, not `route_layer`: auth must also cover the static fallback,
+        // which `route_layer` (matched routes only) leaves open.
+        protected = protected.layer(middleware::from_fn_with_state(cfg, require_basic_auth));
     }
 
     public
@@ -1096,5 +1100,111 @@ mod tests {
                 "{uri} stays public under auth"
             );
         }
+    }
+
+    // --- static + SPA fallback ---
+
+    /// Drive one request over an empty snapshot; return status, content type and
+    /// the raw body (static responses are HTML, not JSON).
+    async fn raw_request(
+        auth: Option<AuthConfig>,
+        uri: &str,
+        header: Option<&str>,
+    ) -> (StatusCode, String, Vec<u8>) {
+        let (_dir, snapshot) = empty_snapshot();
+        let mut builder = Request::builder().uri(uri);
+        if let Some(value) = header {
+            builder = builder.header(header::AUTHORIZATION, value);
+        }
+        let response = app(AppState::new(snapshot), auth, test_metrics_handle())
+            .oneshot(builder.body(Body::empty()).expect("build request"))
+            .await
+            .expect("route request");
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read body")
+            .to_bytes()
+            .to_vec();
+        (status, content_type, body)
+    }
+
+    #[tokio::test]
+    async fn static_serves_index_html() {
+        let (status, content_type, body) = raw_request(None, "/index.html", None).await;
+        assert_eq!(status, StatusCode::OK, "/index.html is served");
+        assert!(
+            content_type.starts_with("text/html"),
+            "index.html is HTML, got {content_type}"
+        );
+        assert!(!body.is_empty(), "the shell has a body");
+    }
+
+    #[tokio::test]
+    async fn static_root_serves_spa_shell() {
+        let (status, content_type, _body) = raw_request(None, "/", None).await;
+        assert_eq!(status, StatusCode::OK, "/ falls back to the SPA shell");
+        assert!(content_type.starts_with("text/html"), "the shell is HTML");
+    }
+
+    #[tokio::test]
+    async fn static_unknown_ui_path_serves_spa_shell() {
+        let (status, content_type, _body) = raw_request(None, "/dashboard/live", None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unknown UI path falls back to the shell"
+        );
+        assert!(content_type.starts_with("text/html"), "the shell is HTML");
+    }
+
+    #[tokio::test]
+    async fn static_unknown_v1_path_is_json_404() {
+        let (status, content_type, body) = raw_request(None, "/v1/does-not-exist", None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unknown /v1 path is a 404"
+        );
+        assert!(
+            content_type.starts_with("application/json"),
+            "the 404 is JSON, not the HTML shell"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(value["error"], "not_found", "the error names the fault");
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_protects_static() {
+        // Security-critical: with auth on, the UI is behind it too, not just
+        // /v1. This fails if the auth layer misses the static fallback.
+        let (status, _ct, _body) =
+            raw_request(Some(AuthConfig::new("u", "p")), "/index.html", None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the static UI is behind auth when it is enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_allows_static_with_credentials() {
+        let header = basic_header("u", "p");
+        let (status, content_type, _body) = raw_request(
+            Some(AuthConfig::new("u", "p")),
+            "/index.html",
+            Some(header.as_str()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the right credential opens the UI");
+        assert!(content_type.starts_with("text/html"), "the shell is HTML");
     }
 }

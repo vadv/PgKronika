@@ -17,6 +17,7 @@ serde_json = "1"
 arc-swap = "1"
 base64 = "0.22"
 subtle = "2"
+rust-embed = { version = "8", features = ["mime-guess"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
