@@ -125,7 +125,7 @@ fn expect_optional_ts(row: &Row, column: &str) -> Result<()> {
 
 fn expect_absent(row: &Row, column: &str) -> Result<()> {
     anyhow::ensure!(
-        !row.contains_key(column),
+        row.get(column).is_none(),
         "{column}: column is present but PG18 layout must not carry it"
     );
     Ok(())
@@ -136,12 +136,12 @@ mod tests {
     use super::{check_generation_counters, expect_absent, expect_optional_ts};
     use kronika_registry::{Cell, Row};
 
-    fn v2_row() -> Row {
-        Row::from([
+    fn v2_row_with_bytes(wal_bytes: i64) -> Row {
+        crate::harness::test_row(&[
             ("ts", Cell::Ts(10)),
             ("wal_records", Cell::I64(1)),
             ("wal_fpi", Cell::I64(0)),
-            ("wal_bytes", Cell::I64(1024)),
+            ("wal_bytes", Cell::I64(wal_bytes)),
             ("wal_buffers_full", Cell::I64(0)),
             ("stats_reset", Cell::Null),
         ])
@@ -149,27 +149,26 @@ mod tests {
 
     #[test]
     fn generation_counter_check_accepts_valid_row() {
-        check_generation_counters(&v2_row()).expect("generation counters pass");
+        check_generation_counters(&v2_row_with_bytes(1024)).expect("generation counters pass");
     }
 
     #[test]
     fn generation_counter_check_rejects_negative_wal_bytes() {
-        let mut row = v2_row();
-        row.insert("wal_bytes", Cell::I64(-1));
+        let row = v2_row_with_bytes(-1);
         assert!(check_generation_counters(&row).is_err());
     }
 
     #[test]
     fn optional_ts_accepts_null_or_positive_timestamp() {
-        let row = v2_row();
+        let row = v2_row_with_bytes(1024);
         assert!(expect_optional_ts(&row, "stats_reset").is_ok());
-        let row = Row::from([("stats_reset", Cell::Ts(1))]);
+        let row = crate::harness::test_row(&[("stats_reset", Cell::Ts(1))]);
         assert!(expect_optional_ts(&row, "stats_reset").is_ok());
     }
 
     #[test]
     fn absent_column_check_rejects_present_column() {
-        let row = Row::from([("wal_write", Cell::I64(0))]);
+        let row = crate::harness::test_row(&[("wal_write", Cell::I64(0))]);
         assert!(expect_absent(&row, "wal_write").is_err());
     }
 }

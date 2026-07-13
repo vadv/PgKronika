@@ -133,8 +133,8 @@ mod tests {
     use super::{check_common_counters, expect_i64, expect_null, expect_ts};
     use kronika_registry::{Cell, Row};
 
-    fn common_row() -> Row {
-        Row::from([
+    fn common_row_with_alloc(buffers_alloc: i64) -> Row {
+        crate::harness::test_row(&[
             ("ts", Cell::Ts(10)),
             ("checkpoints_timed", Cell::I64(0)),
             ("checkpoints_req", Cell::I64(0)),
@@ -143,26 +143,25 @@ mod tests {
             ("buffers_checkpoint", Cell::I64(0)),
             ("buffers_clean", Cell::I64(0)),
             ("maxwritten_clean", Cell::I64(0)),
-            ("buffers_alloc", Cell::I64(1)),
+            ("buffers_alloc", Cell::I64(buffers_alloc)),
             ("bgwriter_stats_reset", Cell::Ts(1)),
         ])
     }
 
     #[test]
     fn common_counter_check_accepts_nonnegative_values() {
-        check_common_counters(&common_row()).expect("common counters pass");
+        check_common_counters(&common_row_with_alloc(1)).expect("common counters pass");
     }
 
     #[test]
     fn common_counter_check_rejects_negative_counter() {
-        let mut row = common_row();
-        row.insert("buffers_alloc", Cell::I64(-1));
+        let row = common_row_with_alloc(-1);
         assert!(check_common_counters(&row).is_err());
     }
 
     #[test]
     fn helpers_distinguish_present_values_from_nulls() {
-        let row = Row::from([
+        let row = crate::harness::test_row(&[
             ("some_counter", Cell::I64(0)),
             ("some_ts", Cell::Ts(1)),
             ("gone", Cell::Null),

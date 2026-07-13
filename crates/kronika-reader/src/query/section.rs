@@ -231,10 +231,24 @@ fn gather(
                 if !logical.type_ids.contains(&entry.type_id) {
                     continue;
                 }
-                for row in unit.decode_rows(entry).map_err(GatherError::Read)? {
-                    // Registry contracts all carry a `ts` column; `get` (not
-                    // indexing) keeps a future ts-less section from panicking.
-                    let Some(&Cell::Ts(t)) = row.get("ts") else {
+                let rows = unit.decode_rows(entry).map_err(GatherError::Read)?;
+                let Some(first) = rows.first() else {
+                    continue;
+                };
+                // Cell positions are fixed per contract, so resolve each union
+                // column (and `ts`) to its index once per entry, not per row.
+                // A missing `ts` skips the rows rather than panicking, keeping
+                // a future ts-less section harmless.
+                let columns = first.contract().columns;
+                let ts_at = columns.iter().position(|column| column.name == "ts");
+                let cell_at: Vec<Option<usize>> = logical
+                    .columns
+                    .iter()
+                    .map(|col| columns.iter().position(|column| column.name == col.name))
+                    .collect();
+                for row in rows {
+                    let cells = row.cells();
+                    let Some(&Cell::Ts(t)) = ts_at.and_then(|at| cells.get(at)) else {
                         continue;
                     };
                     if t < from || t > to {
@@ -243,9 +257,10 @@ fn gather(
                     let out: OutRow = logical
                         .columns
                         .iter()
-                        .map(|col| {
-                            let value = row
-                                .get(col.name)
+                        .zip(&cell_at)
+                        .map(|(col, at)| {
+                            let value = at
+                                .and_then(|at| cells.get(at))
                                 .map_or(Value::Null, |cell| cell_to_value(cell, &dict).0);
                             (col.name.to_owned(), value)
                         })
@@ -646,6 +661,41 @@ mod tests {
         );
         // query_id (V3-only) is Null on the V1 row too.
         assert_eq!(cell(v1_row, "query_id"), &Value::Null);
+    }
+
+    #[test]
+    fn out_rows_carry_the_full_union_in_logical_column_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Rows decoded from different layout versions must still present the
+        // same column list: the full union, in logical-section order.
+        let body_v3 = PgStatActivityV3::encode(&[activity_v3(1000, 10, Some(9))]).expect("encode");
+        fs::write(
+            dir.path().join("1000.pgm"),
+            part_from(&[(1_001_003, 1, body_v3)], 1000, 1000, 7),
+        )
+        .unwrap();
+        let body_v1 = PgStatActivityV1::encode(&[activity_v1(2000, 20)]).expect("encode");
+        fs::write(
+            dir.path().join("2000.pgm"),
+            part_from(&[(1_001_001, 1, body_v1)], 2000, 2000, 7),
+        )
+        .unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let page =
+            section(&mut snap, "pg_stat_activity", 7, 0, 10_000, 100, None).expect("section");
+        assert_eq!(page.rows.len(), 2, "one row per layout version");
+
+        let union: Vec<&str> = crate::query::logical::logical_section("pg_stat_activity")
+            .expect("registered section")
+            .columns
+            .iter()
+            .map(|col| col.name)
+            .collect();
+        for row in &page.rows {
+            let names: Vec<&str> = row.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(names, union, "row lists the full union in logical order");
+        }
     }
 
     #[test]

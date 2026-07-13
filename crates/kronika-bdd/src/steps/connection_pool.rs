@@ -127,7 +127,7 @@ mod tests {
     }
 
     fn table_row(relname_id: u64, datname_id: u64) -> Row {
-        Row::from([
+        crate::harness::test_row(&[
             ("relname", Cell::StrId(relname_id)),
             ("datname", Cell::StrId(datname_id)),
         ])
@@ -160,7 +160,7 @@ mod tests {
             !str_cell_is(&row, "datname", "anything", &dict),
             "an id the dictionary does not carry never matches"
         );
-        let non_str = Row::from([("relname", Cell::I64(5))]);
+        let non_str = crate::harness::test_row(&[("relname", Cell::I64(5))]);
         assert!(
             !str_cell_is(&non_str, "relname", "5", &dict),
             "a non-StrId cell never matches"

@@ -25,7 +25,7 @@ pub(crate) fn rows_table(rows: &[Row]) -> String {
     let mut out = String::new();
     for (i, row) in rows.iter().enumerate() {
         let _ = writeln!(out, "row {i}:");
-        for (name, cell) in row {
+        for (name, cell) in row.iter() {
             let _ = writeln!(out, "  {name} = {}", render_cell(cell));
         }
     }
@@ -103,10 +103,10 @@ mod tests {
     use kronika_registry::{Cell, Row};
 
     fn sample_rows() -> Vec<Row> {
-        let mut a = Row::new();
-        a.insert("archived_count", Cell::I64(7));
-        a.insert("last_archived_wal", Cell::Null);
-        vec![a]
+        vec![crate::harness::test_row(&[
+            ("archived_count", Cell::I64(7)),
+            ("last_archived_wal", Cell::Null),
+        ])]
     }
 
     #[test]
