@@ -622,7 +622,7 @@ mod tests {
         OracleKind, cell_ge, column_cells, compare_floor, compare_subset_text, deferred_kind,
         multiset_eq, text_multiset_eq, window_contains,
     };
-    use kronika_registry::{Cell, Row};
+    use kronika_registry::Cell;
 
     #[test]
     fn window_contains_accepts_values_inside_and_at_the_bounds() {
@@ -719,9 +719,9 @@ mod tests {
     #[test]
     fn column_cells_collects_the_named_column_from_every_row() {
         let rows = vec![
-            Row::from([("v", Cell::I64(10))]),
-            Row::from([("v", Cell::I64(20))]),
-            Row::from([("other", Cell::I64(99))]),
+            crate::harness::test_row(&[("v", Cell::I64(10))]),
+            crate::harness::test_row(&[("v", Cell::I64(20))]),
+            crate::harness::test_row(&[("other", Cell::I64(99))]),
         ];
         assert_eq!(column_cells(&rows, "v"), vec![Cell::I64(10), Cell::I64(20)]);
     }

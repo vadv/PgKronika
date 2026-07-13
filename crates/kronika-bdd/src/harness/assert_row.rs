@@ -335,7 +335,7 @@ mod tests {
     use kronika_registry::{Cell, Row};
 
     fn row(pairs: &[(&'static str, Cell)]) -> Row {
-        pairs.iter().cloned().collect()
+        crate::harness::test_row(pairs)
     }
 
     /// A real segment dictionary resolving `values`, returned with their ids.
@@ -409,7 +409,7 @@ mod tests {
             cell: Cell::U32(2),
         };
         let found = select_row(&rows, &selector, &dict).expect("row with datid=2");
-        assert_eq!(found["v"], Cell::I64(20));
+        assert_eq!(found.get("v"), Some(&Cell::I64(20)));
     }
 
     #[test]
@@ -438,7 +438,11 @@ mod tests {
             },
         ]);
         let found = select_row(&rows, &selector, &dict).expect("row with datid=2 and relid=9");
-        assert_eq!(found["v"], Cell::I64(20), "the conjunction picks one row");
+        assert_eq!(
+            found.get("v"),
+            Some(&Cell::I64(20)),
+            "the conjunction picks one row"
+        );
 
         let no_match = RowSelector::ByKeys(vec![
             KeyMatch::Cell {
@@ -483,8 +487,8 @@ mod tests {
         ]);
         let found = select_row(&rows, &selector, &dict).expect("probe in other_db");
         assert_eq!(
-            found["v"],
-            Cell::I64(20),
+            found.get("v"),
+            Some(&Cell::I64(20)),
             "the same table name in another database is a distinct row"
         );
 

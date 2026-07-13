@@ -23,7 +23,9 @@ BDD_BUILDER_CONTEXT_PATHS=(
 BDD_RUNTIME_KEY_PATHS=(
   "${BDD_DEPS_PATHS[@]}"
   'crates/*/src/**'
+  'crates/*/benches/**'
   'bins/*/src/**'
+  'bins/*/static/**'
   'crates/kronika-bdd/features/**'
 )
 
@@ -153,6 +155,20 @@ write_dummy_builder_sources() {
     [ -f "$dir/Cargo.toml" ] || continue
     mkdir -p "$dir/src"
     printf 'fn main() {}\n' > "$dir/src/main.rs"
+  done
+
+  # Every declared [[bench]] target needs a file on disk, or cargo refuses to
+  # parse the crate manifest.
+  for dir in "$context"/crates/* "$context"/bins/*; do
+    [ -f "$dir/Cargo.toml" ] || continue
+    awk '/^\[\[bench\]\]/ { in_bench = 1; next }
+         /^\[/ { in_bench = 0 }
+         in_bench && /^name *= *"/ { gsub(/^name *= *"|".*$/, ""); print }' \
+      "$dir/Cargo.toml" \
+      | while IFS= read -r bench; do
+          mkdir -p "$dir/benches"
+          printf 'fn main() {}\n' > "$dir/benches/$bench.rs"
+        done
   done
 }
 
