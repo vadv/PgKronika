@@ -30,7 +30,8 @@ use pg_kronika_web::{
 use tower_http::trace::TraceLayer;
 
 /// Process-wide allocator: mimalloc, chosen for the allocation-heavy
-/// snapshot-clone-per-request path.
+/// snapshot-clone-per-request path. The `override` feature also routes C-side
+/// malloc (zstd in the parquet decode path) through mimalloc.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

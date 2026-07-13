@@ -23,7 +23,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower-http = { version = "0.6", features = ["trace"] }
-mimalloc = "0.1"
+mimalloc = { version = "0.1", features = ["override"] }
 
 [dev-dependencies]
 kronika-format = { path = "../../crates/kronika-format" }
