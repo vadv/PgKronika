@@ -15,6 +15,15 @@ axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
 serde_json = "1"
 arc-swap = "1"
+base64 = "0.22"
+subtle = "2"
+rust-embed = { version = "8", features = ["mime-guess"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tower-http = { version = "0.6", features = ["trace"] }
+mimalloc = { version = "0.1", features = ["override"] }
 
 [dev-dependencies]
 kronika-format = { path = "../../crates/kronika-format" }

@@ -4,420 +4,220 @@
 //! and run the reader's `&mut` queries on the private copy. A background task
 //! refreshes the shared snapshot once a second; tests skip it, so the router
 //! stays deterministic.
+#![allow(
+    clippy::multiple_crate_versions,
+    reason = "metrics-exporter-prometheus and axum pull duplicate transitive versions outside our control"
+)]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::Router;
+use axum::extract::MatchedPath;
+use axum::http::Request;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::get;
-use axum::{Json, Router};
-use kronika_reader::{
-    Cursor, LocalDirSnapshot, OutRow, QueryError, SectionPage, Value as CellValue, section,
-    sections as query_sections,
-};
-use kronika_registry::{
-    ColumnClass, ColumnType, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, Semantics, TypeContract,
-    registry, section_name,
-};
-use serde_json::{Value, json};
+use kronika_reader::LocalDirSnapshot;
+use metrics_exporter_prometheus::PrometheusHandle;
 // The binary target and the `#[tokio::test]` harness need the async runtime; the
-// library's handlers are runtime-agnostic and never name it.
+// library's handlers are runtime-agnostic and never name it. The binary also
+// pulls its allocator, tracing, the subscriber, and tower-http; the library
+// proper names none.
+use mimalloc as _;
 use tokio as _;
+use tower_http as _;
+use tracing as _;
+use tracing_subscriber as _;
+
+mod auth;
+pub(crate) mod handlers;
+mod params;
+mod serialize;
+pub(crate) mod startup;
+
+pub use auth::AuthConfig;
+use auth::require_basic_auth;
+pub use startup::WebConfig;
 
 /// Container format version this build serves, mirrored into `/v1/version`.
-const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 1;
 
-/// Rows returned when a request omits `limit`.
-const DEFAULT_LIMIT: usize = 1_000;
+/// Histogram buckets, in seconds, for `kronika_web_request_duration_seconds`.
+pub const REQUEST_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
 
-/// Hard ceiling on `limit`, applied even when a request asks for more.
-const MAX_LIMIT: usize = 10_000;
-
-/// Shared router state: the store snapshot behind an atomic swap.
+/// Shared router state: the store snapshot and readiness counters.
+///
+/// All fields use `Arc` so `Clone` is cheap; the router clones this per request.
 #[derive(Debug, Clone)]
 pub struct AppState {
     /// The current store snapshot, replaced wholesale on each refresh.
     pub snapshot: Arc<ArcSwap<LocalDirSnapshot>>,
+    /// Unix timestamp (seconds) of the last successful snapshot refresh.
+    pub last_refresh: Arc<AtomicU64>,
+    /// Number of completed refresh loop iterations (successful or not).
+    pub refresh_loop_iterations: Arc<AtomicU64>,
+    /// Age threshold after which the store is considered stale.
+    pub stale_after: Duration,
 }
 
 impl AppState {
-    /// Wrap an already-open snapshot in swappable shared state.
+    /// Wrap a snapshot in shared state with default readiness values.
+    ///
+    /// `last_refresh` is initialised to the current wall-clock second so that
+    /// `/readyz` reports ready immediately after startup. `stale_after` defaults
+    /// to 10 s, matching the refresh loop cadence.
     #[must_use]
     pub fn new(snapshot: LocalDirSnapshot) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         Self {
             snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            last_refresh: Arc::new(AtomicU64::new(now)),
+            refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
+            stale_after: Duration::from_secs(10),
         }
     }
+
+    /// Construct state with an explicit `last_refresh` and `stale_after`.
+    ///
+    /// The server passes the configured staleness threshold and the current
+    /// time; tests use it to drive `/readyz` from an injected `last_refresh`.
+    #[must_use]
+    pub fn with_readiness(
+        snapshot: LocalDirSnapshot,
+        last_refresh_secs: u64,
+        stale_after: Duration,
+    ) -> Self {
+        Self {
+            snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            last_refresh: Arc::new(AtomicU64::new(last_refresh_secs)),
+            refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
+            stale_after,
+        }
+    }
+}
+
+/// Per-request metrics middleware.
+///
+/// Increments `kronika_web_requests_total` and records
+/// `kronika_web_request_duration_seconds` after the inner handler responds.
+/// Tracks in-flight requests via `kronika_web_inflight_requests` gauge.
+/// Path labels come from `MatchedPath` to avoid high-cardinality URIs.
+async fn track_metrics(req: Request<axum::body::Body>, next: Next) -> Response {
+    let matched = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|mp| mp.as_str().to_owned());
+    let method = req.method().as_str().to_owned();
+    let (method_label, path_label) = startup::metric_labels(&method, matched.as_deref());
+
+    metrics::gauge!("kronika_web_inflight_requests").increment(1.0);
+    let start = Instant::now();
+
+    let response = next.run(req).await;
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+
+    metrics::gauge!("kronika_web_inflight_requests").decrement(1.0);
+    metrics::counter!(
+        "kronika_web_requests_total",
+        "method" => method_label.clone(),
+        "path" => path_label,
+        "status" => status
+    )
+    .increment(1);
+    metrics::histogram!(
+        "kronika_web_request_duration_seconds",
+        "method" => method_label,
+        "path" => path_label
+    )
+    .record(elapsed);
+
+    response
 }
 
 /// Build the request router over `state`.
 ///
-/// Pure: no sockets, no background tasks. Tests call this directly and drive it
-/// with `tower::ServiceExt::oneshot`.
-pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/v1/version", get(version))
-        .route("/v1/sources", get(sources))
-        .route("/v1/sections", get(sections))
-        .route("/v1/segments", get(segments))
-        .route("/v1/section/{name}", get(section_data))
-        .route("/v1/sections/batch", get(sections_batch))
+/// `auth` gates everything except the public probes and `/metrics` — the `/v1`
+/// API and the embedded UI alike: `Some` requires the Basic credential, `None`
+/// leaves them open. Pure: no sockets, no background tasks. Tests drive it with
+/// `tower::ServiceExt::oneshot`.
+pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: PrometheusHandle) -> Router {
+    use axum::Extension;
+
+    let public = Router::new()
+        .route("/healthz", get(handlers::probes::healthz))
+        .route("/readyz", get(handlers::probes::readyz))
+        .route("/metrics", get(handlers::metrics::metrics_handler));
+
+    let mut protected = Router::new()
+        .route("/v1/version", get(handlers::v1::version))
+        .route("/v1/sources", get(handlers::v1::sources))
+        .route("/v1/sections", get(handlers::v1::sections))
+        .route("/v1/segments", get(handlers::v1::segments))
+        .route("/v1/section/{name}", get(handlers::v1::section_data))
+        .route("/v1/sections/batch", get(handlers::v1::sections_batch))
+        .fallback(handlers::static_::static_handler);
+    if let Some(cfg) = auth {
+        // `layer`, not `route_layer`: auth must also cover the static fallback,
+        // which `route_layer` (matched routes only) leaves open.
+        protected = protected.layer(middleware::from_fn_with_state(cfg, require_basic_auth));
+    }
+
+    public
+        .merge(protected)
+        .layer(Extension(metrics_handle))
+        .layer(middleware::from_fn(track_metrics))
         .with_state(state)
-}
-
-/// `GET /v1/version` — the API and container format versions this build serves.
-///
-/// Static body, `application/json`.
-async fn version() -> Json<Value> {
-    Json(json!({ "api": "v1", "format_version": FORMAT_VERSION }))
-}
-
-/// `GET /v1/sources` — every source in the store and its overall time span.
-async fn sources(State(state): State<AppState>) -> Json<Value> {
-    let snapshot = state.snapshot.load_full();
-    let mut spans: BTreeMap<u64, (i64, i64, usize)> = BTreeMap::new();
-    for unit in snapshot.units() {
-        let span = spans
-            .entry(unit.source_id)
-            .or_insert((unit.min_ts, unit.max_ts, 0));
-        span.0 = span.0.min(unit.min_ts);
-        span.1 = span.1.max(unit.max_ts);
-        span.2 += 1;
-    }
-    let sources: Vec<Value> = spans
-        .into_iter()
-        .map(|(source_id, (min_ts, max_ts, segments))| {
-            json!({ "source_id": source_id, "min_ts": min_ts, "max_ts": max_ts, "segments": segments })
-        })
-        .collect();
-    Json(json!({ "sources": sources }))
-}
-
-/// `GET /v1/sections` — static catalog of section types from the registry.
-///
-/// One entry per logical name: its semantics, sort key, and the union of its
-/// versions' columns (first appearance across ascending `type_id`).
-async fn sections() -> Json<Value> {
-    let mut by_name: BTreeMap<&'static str, Vec<&'static TypeContract>> = BTreeMap::new();
-    for contract in registry() {
-        by_name.entry(contract.name).or_default().push(contract);
-    }
-    let sections: Vec<Value> = by_name
-        .into_iter()
-        .map(|(name, mut contracts)| {
-            contracts.sort_by_key(|contract| contract.type_id.get());
-            let mut seen = std::collections::HashSet::new();
-            let mut columns = Vec::new();
-            for contract in &contracts {
-                for column in contract.columns {
-                    if seen.insert(column.name) {
-                        columns.push(json!({
-                            "name": column.name,
-                            "type": column_type_name(column.ty),
-                            "class": column_class_name(column.class),
-                        }));
-                    }
-                }
-            }
-            json!({
-                "name": name,
-                "semantics": semantics_name(contracts[0].semantics),
-                "sort_key": contracts[0].sort_key,
-                "columns": columns,
-            })
-        })
-        .collect();
-    Json(json!({ "sections": sections }))
-}
-
-/// `GET /v1/segments?source&from&to` — segments of `source` overlapping the
-/// window, catalog metadata only (no section bodies decoded).
-async fn segments(
-    State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
-
-    let snapshot = state.snapshot.load_full();
-    let units = snapshot.units();
-    let mut out = Vec::new();
-    for (idx, unit) in units.iter().enumerate() {
-        if unit.source_id != source || unit.max_ts < from || unit.min_ts > to {
-            continue;
-        }
-        let Some(catalog) = snapshot.unit_catalog(idx) else {
-            continue;
-        };
-        let mut rows_by_name: BTreeMap<&'static str, u64> = BTreeMap::new();
-        for entry in &catalog.entries {
-            if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
-                continue;
-            }
-            let Some(name) = section_name(entry.type_id) else {
-                continue;
-            };
-            *rows_by_name.entry(name).or_insert(0) += u64::from(entry.rows);
-        }
-        let sections: Vec<Value> = rows_by_name
-            .into_iter()
-            .map(|(name, rows)| json!({ "name": name, "rows": rows }))
-            .collect();
-        out.push(json!({
-            "segment_id": unit.min_ts.to_string(),
-            "source_id": unit.source_id,
-            "min_ts": unit.min_ts,
-            "max_ts": unit.max_ts,
-            "sections": sections,
-        }));
-    }
-    Ok(Json(json!({ "segments": out })))
-}
-
-/// `GET /v1/section/{name}?source&from&to&limit` — one section's rows over the
-/// window, decoded and serialized to JSON.
-///
-/// The reader does the query (ts filter, sort, union columns, gaps); this
-/// handler parses params and shapes the result. A stale snapshot degrades to
-/// gaps inside the reader, so it stays a `200`.
-async fn section_data(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
-    let limit = parse_limit(&params)?;
-    let cursor = parse_cursor(&params)?;
-
-    // section() takes `&mut`; clone the shared snapshot (catalog metadata, not
-    // section bodies) and query the private copy.
-    let mut snap = state.snapshot.load().as_ref().clone();
-    match section(&mut snap, &name, source, from, to, limit, cursor) {
-        Ok(page) => Ok(Json(page_to_json(&page))),
-        Err(err) => Err(query_error_response(&err)),
-    }
-}
-
-/// `GET /v1/sections/batch?source&from&to&names=a,b,c&limit` — several sections
-/// for one source over one window, each as its own page keyed by name.
-///
-/// One decode of each overlapping segment serves every requested section, so a
-/// multi-metric view costs one pass, not one per section. An unknown name fails
-/// the whole request.
-async fn sections_batch(
-    State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
-    let limit = parse_limit(&params)?;
-    let raw = params
-        .get("names")
-        .ok_or_else(|| bad_request("missing query parameter `names`"))?;
-    let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
-    if names.is_empty() {
-        return Err(bad_request("`names` must list at least one section"));
-    }
-
-    let mut snap = state.snapshot.load().as_ref().clone();
-    let cursors = BTreeMap::new();
-    match query_sections(&mut snap, source, from, to, &names, limit, &cursors) {
-        Ok(pages) => {
-            let object = pages
-                .iter()
-                .map(|(name, page)| (name.clone(), page_to_json(page)))
-                .collect();
-            Ok(Json(Value::Object(object)))
-        }
-        Err(err) => Err(query_error_response(&err)),
-    }
-}
-
-/// Parse a required unsigned query parameter, or a `400` with a JSON body.
-fn parse_u64(
-    params: &std::collections::HashMap<String, String>,
-    key: &str,
-) -> Result<u64, (StatusCode, Json<Value>)> {
-    params
-        .get(key)
-        .ok_or_else(|| bad_request(&format!("missing query parameter `{key}`")))?
-        .parse()
-        .map_err(|_err| bad_request(&format!("`{key}` must be an unsigned integer")))
-}
-
-/// Parse a required signed query parameter, or a `400` with a JSON body.
-fn parse_i64(
-    params: &std::collections::HashMap<String, String>,
-    key: &str,
-) -> Result<i64, (StatusCode, Json<Value>)> {
-    params
-        .get(key)
-        .ok_or_else(|| bad_request(&format!("missing query parameter `{key}`")))?
-        .parse()
-        .map_err(|_err| bad_request(&format!("`{key}` must be an integer")))
-}
-
-/// A `400 Bad Request` with a `{ "error", "detail" }` JSON body.
-fn bad_request(detail: &str) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "error": "bad_request", "detail": detail })),
-    )
-}
-
-/// Parse the optional `limit`: absent → [`DEFAULT_LIMIT`], present → clamped to
-/// [`MAX_LIMIT`], unparseable → `400`.
-fn parse_limit(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<usize, (StatusCode, Json<Value>)> {
-    params.get("limit").map_or(Ok(DEFAULT_LIMIT), |raw| {
-        raw.parse::<usize>()
-            .map(|limit| limit.min(MAX_LIMIT))
-            .map_err(|_err| bad_request("`limit` must be a non-negative integer"))
-    })
-}
-
-/// Parse the optional resume `cursor`: absent → `None`, present → decoded, or a
-/// `400` when it is malformed or belongs to another source.
-fn parse_cursor(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<Option<Cursor>, (StatusCode, Json<Value>)> {
-    params.get("cursor").map_or(Ok(None), |raw| {
-        Cursor::decode(raw)
-            .map(Some)
-            .map_err(|err| query_error_response(&err))
-    })
-}
-
-/// Map one reader [`CellValue`] to its JSON form (see the API contract).
-fn value_to_json(value: &CellValue) -> Value {
-    match value {
-        CellValue::Null => Value::Null,
-        CellValue::I64(n) => (*n).into(),
-        CellValue::U64(n) => (*n).into(),
-        CellValue::F64(n) => (*n).into(),
-        CellValue::Bool(b) => (*b).into(),
-        CellValue::Ts(t) => (*t).into(),
-        CellValue::Str(s) => Value::String(s.clone()),
-        CellValue::Blob {
-            text,
-            full_len,
-            truncated,
-        } => json!({ "text": text.as_str(), "full_len": *full_len, "truncated": *truncated }),
-        CellValue::ListI32(items) => Value::from(items.clone()),
-    }
-}
-
-/// Shape one output row as a JSON object keyed by column name.
-fn row_to_json(row: &OutRow) -> Value {
-    let object = row
-        .iter()
-        .map(|(name, value)| (name.clone(), value_to_json(value)))
-        .collect();
-    Value::Object(object)
-}
-
-/// Shape a [`SectionPage`] as the `/v1/section` response body.
-fn page_to_json(page: &SectionPage) -> Value {
-    let rows: Vec<Value> = page.rows.iter().map(row_to_json).collect();
-    let gaps: Vec<Value> = page
-        .gaps
-        .iter()
-        .map(|gap| json!({ "from": gap.from, "to": gap.to }))
-        .collect();
-    let next_cursor = page
-        .next_cursor
-        .as_ref()
-        .map_or(Value::Null, |cursor| Value::String(cursor.encode()));
-    json!({
-        "section": page.section,
-        "source_id": page.source_id,
-        "rows": rows,
-        "gaps": gaps,
-        "next_cursor": next_cursor,
-    })
-}
-
-/// Map a reader [`QueryError`] to an HTTP status and a `{ error, detail }` body.
-fn query_error_response(err: &QueryError) -> (StatusCode, Json<Value>) {
-    let (status, code, detail) = match err {
-        QueryError::UnknownSection(name) => (
-            StatusCode::NOT_FOUND,
-            "unknown_section",
-            format!("no section named `{name}`"),
-        ),
-        QueryError::BadCursor(message) => (StatusCode::BAD_REQUEST, "bad_cursor", message.clone()),
-        QueryError::Read(read) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "read_error",
-            read.to_string(),
-        ),
-    };
-    (status, Json(json!({ "error": code, "detail": detail })))
-}
-
-/// Stable wire name for a column's on-disk type.
-const fn column_type_name(ty: ColumnType) -> &'static str {
-    match ty {
-        ColumnType::I8 => "i8",
-        ColumnType::I16 => "i16",
-        ColumnType::I32 => "i32",
-        ColumnType::I64 => "i64",
-        ColumnType::U8 => "u8",
-        ColumnType::U16 => "u16",
-        ColumnType::U32 => "u32",
-        ColumnType::U64 => "u64",
-        ColumnType::F32 => "f32",
-        ColumnType::F64 => "f64",
-        ColumnType::Bool => "bool",
-        ColumnType::Ts => "ts",
-        ColumnType::StrId => "str",
-        ColumnType::ListI32 => "list_i32",
-    }
-}
-
-/// Stable wire name for a column's role: cumulative / gauge / label / timestamp.
-const fn column_class_name(class: ColumnClass) -> &'static str {
-    match class {
-        ColumnClass::Cumulative => "c",
-        ColumnClass::Gauge => "g",
-        ColumnClass::Label => "l",
-        ColumnClass::Timestamp => "t",
-    }
-}
-
-/// Stable wire name for a section's collection semantics.
-const fn semantics_name(semantics: Semantics) -> &'static str {
-    match semantics {
-        Semantics::SnapshotFull => "snapshot_full",
-        Semantics::ConditionalFull => "conditional_full",
-        Semantics::EventStream => "event_stream",
-        Semantics::Changed => "changed",
-        Semantics::OnChange => "on_change",
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
     use kronika_format::{PartMeta, SectionInput, build_part};
-    use kronika_reader::Value as CellValue;
     use kronika_registry::Section;
     use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
     use tower::ServiceExt;
 
-    use super::{AppState, app, parse_limit, value_to_json};
+    use super::{AppState, AuthConfig, app};
+
+    /// Process-global Prometheus recorder installed once for all tests.
+    ///
+    /// `install_recorder` panics on the second call, so `OnceLock` ensures
+    /// it only runs once per test binary. All `app()` calls in tests share
+    /// this handle.
+    static TEST_RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
+
+    fn test_metrics_handle() -> PrometheusHandle {
+        TEST_RECORDER
+            .get_or_init(|| {
+                PrometheusBuilder::new()
+                    .set_buckets_for_metric(
+                        Matcher::Full("kronika_web_request_duration_seconds".to_owned()),
+                        super::REQUEST_DURATION_BUCKETS,
+                    )
+                    .expect("histogram buckets are valid")
+                    .install_recorder()
+                    .expect("install global Prometheus recorder")
+            })
+            .clone()
+    }
 
     /// Build an [`AppState`] over a temp directory holding one `build_part`
     /// segment, then answer one request against `app(state)` in-process.
@@ -444,7 +244,7 @@ mod tests {
         let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let state = AppState::new(snapshot);
 
-        let response = app(state)
+        let response = app(state, None, test_metrics_handle())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -542,7 +342,7 @@ mod tests {
     async fn serve(dir: &std::path::Path, uri: &str) -> (StatusCode, serde_json::Value) {
         let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
         let state = AppState::new(snapshot);
-        let response = app(state)
+        let response = app(state, None, test_metrics_handle())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -781,89 +581,6 @@ mod tests {
             },
         );
         std::fs::write(dir.join(file), &bytes).expect("write segment");
-    }
-
-    #[test]
-    fn value_to_json_maps_every_variant() {
-        assert_eq!(
-            value_to_json(&CellValue::Null),
-            serde_json::json!(null),
-            "null"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::I64(-5)),
-            serde_json::json!(-5),
-            "i64"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::U64(5)),
-            serde_json::json!(5),
-            "u64"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::F64(1.5)),
-            serde_json::json!(1.5),
-            "f64"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::Bool(true)),
-            serde_json::json!(true),
-            "bool"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::Ts(1_234)),
-            serde_json::json!(1_234),
-            "ts serializes as a number"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::Str("x".to_owned())),
-            serde_json::json!("x"),
-            "str"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::Blob {
-                text: "ab".to_owned(),
-                full_len: 10,
-                truncated: true,
-            }),
-            serde_json::json!({ "text": "ab", "full_len": 10, "truncated": true }),
-            "blob carries text, full_len and truncated"
-        );
-        assert_eq!(
-            value_to_json(&CellValue::ListI32(vec![1, 2, 3])),
-            serde_json::json!([1, 2, 3]),
-            "list of i32"
-        );
-    }
-
-    #[test]
-    fn parse_limit_defaults_caps_and_rejects() {
-        let empty = std::collections::HashMap::new();
-        assert_eq!(
-            parse_limit(&empty).ok(),
-            Some(1_000),
-            "an absent limit uses the default"
-        );
-
-        let explicit = std::collections::HashMap::from([("limit".to_owned(), "50".to_owned())]);
-        assert_eq!(
-            parse_limit(&explicit).ok(),
-            Some(50),
-            "an explicit limit is honored"
-        );
-
-        let huge = std::collections::HashMap::from([("limit".to_owned(), "99999".to_owned())]);
-        assert_eq!(
-            parse_limit(&huge).ok(),
-            Some(10_000),
-            "a limit above the ceiling is clamped"
-        );
-
-        let bad = std::collections::HashMap::from([("limit".to_owned(), "-1".to_owned())]);
-        assert!(
-            parse_limit(&bad).is_err(),
-            "a non-numeric limit is rejected"
-        );
     }
 
     #[tokio::test]
@@ -1170,5 +887,331 @@ mod tests {
             body["error"], "bad_request",
             "the error body names the fault"
         );
+    }
+
+    // --- probe helpers ---
+
+    /// Build an empty snapshot in a temp dir; return `(dir, snapshot)`.
+    fn empty_snapshot() -> (tempfile::TempDir, kronika_reader::LocalDirSnapshot) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+        (dir, snapshot)
+    }
+
+    /// Drive one probe request and return `(status, body)`.
+    async fn probe(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = app(state, None, test_metrics_handle())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read body")
+            .to_bytes();
+        let value = serde_json::from_slice(&bytes).expect("body is valid JSON");
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_200_ok() {
+        let (_dir, snapshot) = empty_snapshot();
+        let state = AppState::new(snapshot);
+        let (status, body) = probe(state, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"status": "ok"}));
+    }
+
+    #[tokio::test]
+    async fn readyz_fresh_snapshot_returns_200_ready() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let (_dir, snapshot) = empty_snapshot();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // last_refresh = now; stale_after = 10s => age == 0, not stale
+        let state = AppState::with_readiness(snapshot, now, std::time::Duration::from_secs(10));
+        let (status, body) = probe(state, "/readyz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ready"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn readyz_stale_snapshot_returns_503_not_ready() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let (_dir, snapshot) = empty_snapshot();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // last_refresh = now - 3600; stale_after = 10s => age = 3600, stale
+        let state = AppState::with_readiness(
+            snapshot,
+            now.saturating_sub(3600),
+            std::time::Duration::from_secs(10),
+        );
+        let (status, body) = probe(state, "/readyz").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], serde_json::json!(false));
+    }
+
+    // --- /metrics ---
+
+    #[tokio::test]
+    async fn metrics_endpoint_lists_metric_names_after_traffic() {
+        let handle = test_metrics_handle();
+
+        // track_metrics registers the request counter lazily — on the first
+        // increment, which runs after a handler returns. Warm it with one
+        // request so the scrape sees it without leaning on sibling tests.
+        let (_warm_dir, warm_snapshot) = empty_snapshot();
+        app(AppState::new(warm_snapshot), None, handle.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route warmup request");
+
+        let (_dir, snapshot) = empty_snapshot();
+        let response = app(AppState::new(snapshot), None, handle)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "/metrics must return 200"
+        );
+
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+
+        assert!(
+            body.contains("kronika_web_requests_total"),
+            "/metrics body must contain kronika_web_requests_total"
+        );
+        assert!(
+            body.contains("kronika_web_data_age_seconds"),
+            "/metrics body must contain kronika_web_data_age_seconds"
+        );
+        assert!(
+            body.contains("kronika_web_reader_age_seconds"),
+            "/metrics body must contain kronika_web_reader_age_seconds"
+        );
+        assert!(
+            body.contains("kronika_web_units_total"),
+            "/metrics body must contain kronika_web_units_total"
+        );
+    }
+
+    // --- auth ---
+
+    /// A valid `Authorization: Basic` header for `user:pass`.
+    fn basic_header(user: &str, pass: &str) -> String {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        format!("Basic {encoded}")
+    }
+
+    /// Drive one request over an empty snapshot with the given auth setting and
+    /// optional `Authorization` header; return the response status.
+    async fn auth_status(auth: Option<AuthConfig>, uri: &str, header: Option<&str>) -> StatusCode {
+        let (_dir, snapshot) = empty_snapshot();
+        let mut builder = Request::builder().uri(uri);
+        if let Some(value) = header {
+            builder = builder.header(header::AUTHORIZATION, value);
+        }
+        app(AppState::new(snapshot), auth, test_metrics_handle())
+            .oneshot(builder.body(Body::empty()).expect("build request"))
+            .await
+            .expect("route request")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_leaves_v1_open() {
+        assert_eq!(
+            auth_status(None, "/v1/version", None).await,
+            StatusCode::OK,
+            "with auth off, /v1 needs no credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_v1_without_credentials() {
+        assert_eq!(
+            auth_status(Some(AuthConfig::new("u", "p")), "/v1/version", None).await,
+            StatusCode::UNAUTHORIZED,
+            "with auth on, /v1 without a header is 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_accepts_correct_credentials() {
+        let header = basic_header("u", "p");
+        assert_eq!(
+            auth_status(
+                Some(AuthConfig::new("u", "p")),
+                "/v1/version",
+                Some(header.as_str())
+            )
+            .await,
+            StatusCode::OK,
+            "the right credential opens /v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_rejects_wrong_password() {
+        let header = basic_header("u", "wrong");
+        assert_eq!(
+            auth_status(
+                Some(AuthConfig::new("u", "p")),
+                "/v1/version",
+                Some(header.as_str())
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "a wrong password is 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_keeps_probes_and_metrics_public() {
+        for uri in ["/healthz", "/readyz", "/metrics"] {
+            assert_eq!(
+                auth_status(Some(AuthConfig::new("u", "p")), uri, None).await,
+                StatusCode::OK,
+                "{uri} stays public under auth"
+            );
+        }
+    }
+
+    // --- static + SPA fallback ---
+
+    /// Drive one request over an empty snapshot; return status, content type and
+    /// the raw body (static responses are HTML, not JSON).
+    async fn raw_request(
+        auth: Option<AuthConfig>,
+        uri: &str,
+        header: Option<&str>,
+    ) -> (StatusCode, String, Vec<u8>) {
+        let (_dir, snapshot) = empty_snapshot();
+        let mut builder = Request::builder().uri(uri);
+        if let Some(value) = header {
+            builder = builder.header(header::AUTHORIZATION, value);
+        }
+        let response = app(AppState::new(snapshot), auth, test_metrics_handle())
+            .oneshot(builder.body(Body::empty()).expect("build request"))
+            .await
+            .expect("route request");
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read body")
+            .to_bytes()
+            .to_vec();
+        (status, content_type, body)
+    }
+
+    #[tokio::test]
+    async fn static_serves_index_html() {
+        let (status, content_type, body) = raw_request(None, "/index.html", None).await;
+        assert_eq!(status, StatusCode::OK, "/index.html is served");
+        assert!(
+            content_type.starts_with("text/html"),
+            "index.html is HTML, got {content_type}"
+        );
+        assert!(!body.is_empty(), "the shell has a body");
+    }
+
+    #[tokio::test]
+    async fn static_root_serves_spa_shell() {
+        let (status, content_type, _body) = raw_request(None, "/", None).await;
+        assert_eq!(status, StatusCode::OK, "/ falls back to the SPA shell");
+        assert!(content_type.starts_with("text/html"), "the shell is HTML");
+    }
+
+    #[tokio::test]
+    async fn static_unknown_ui_path_serves_spa_shell() {
+        let (status, content_type, _body) = raw_request(None, "/dashboard/live", None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unknown UI path falls back to the shell"
+        );
+        assert!(content_type.starts_with("text/html"), "the shell is HTML");
+    }
+
+    #[tokio::test]
+    async fn static_unknown_v1_path_is_json_404() {
+        let (status, content_type, body) = raw_request(None, "/v1/does-not-exist", None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unknown /v1 path is a 404"
+        );
+        assert!(
+            content_type.starts_with("application/json"),
+            "the 404 is JSON, not the HTML shell"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(value["error"], "not_found", "the error names the fault");
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_protects_static() {
+        // Security-critical: with auth on, the UI is behind it too, not just
+        // /v1. This fails if the auth layer misses the static fallback.
+        let (status, _ct, _body) =
+            raw_request(Some(AuthConfig::new("u", "p")), "/index.html", None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the static UI is behind auth when it is enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_enabled_allows_static_with_credentials() {
+        let header = basic_header("u", "p");
+        let (status, content_type, _body) = raw_request(
+            Some(AuthConfig::new("u", "p")),
+            "/index.html",
+            Some(header.as_str()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the right credential opens the UI");
+        assert!(content_type.starts_with("text/html"), "the shell is HTML");
     }
 }

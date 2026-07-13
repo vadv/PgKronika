@@ -891,18 +891,20 @@ mod tests {
 
     #[test]
     fn recorded_i64_reads_one_cell_and_rejects_bad_shapes() {
-        use kronika_registry::Row;
-        let rows = vec![Row::from([("current_wal_lsn", Cell::I64(16_777_216))])];
+        let rows = vec![crate::harness::test_row(&[(
+            "current_wal_lsn",
+            Cell::I64(16_777_216),
+        )])];
         assert_eq!(
             super::recorded_i64(&rows, "current_wal_lsn").unwrap(),
             16_777_216
         );
         assert!(super::recorded_i64(&[], "c").is_err(), "no rows fail");
-        let null_rows = vec![Row::from([("c", Cell::Null)])];
+        let null_rows = vec![crate::harness::test_row(&[("c", Cell::Null)])];
         assert!(super::recorded_i64(&null_rows, "c").is_err(), "null fails");
         let two = vec![
-            Row::from([("c", Cell::I64(1))]),
-            Row::from([("c", Cell::I64(2))]),
+            crate::harness::test_row(&[("c", Cell::I64(1))]),
+            crate::harness::test_row(&[("c", Cell::I64(2))]),
         ];
         assert!(super::recorded_i64(&two, "c").is_err(), "two rows fail");
         assert!(
