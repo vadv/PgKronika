@@ -7,6 +7,7 @@
 //! steps use.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use axum::body::Body;
@@ -14,6 +15,7 @@ use axum::http::Request;
 use http_body_util::BodyExt as _;
 use kronika_reader::LocalDirSnapshot;
 use kronika_registry::Cell;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pg_kronika_web::{AppState, app};
 use serde_json::Value;
 use tower::ServiceExt as _;
@@ -21,11 +23,24 @@ use tower::ServiceExt as _;
 use crate::harness::assert_row::KeyMatch;
 use crate::harness::expected::{ExpectedColumn, ExpectedValue};
 
+/// Process-global Prometheus handle for BDD harness requests.
+static BDD_RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
+
+fn bdd_metrics_handle() -> PrometheusHandle {
+    BDD_RECORDER
+        .get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("install global Prometheus recorder for BDD harness")
+        })
+        .clone()
+}
+
 /// One in-process request against a fresh router over `dir`; returns the HTTP
 /// status and the parsed JSON body.
 async fn request(dir: &Path, uri: &str) -> Result<(u16, Value)> {
     let snapshot = LocalDirSnapshot::open(dir).context("open the store snapshot")?;
-    let router = app(AppState::new(snapshot));
+    let router = app(AppState::new(snapshot), None, bdd_metrics_handle());
     let response = router
         .oneshot(
             Request::builder()

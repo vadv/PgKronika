@@ -44,6 +44,58 @@ use session::Session;
 const SETTINGS_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const SETTINGS_RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Build a [`kronika_registry::Row`] over a synthetic leaked contract, one
+/// column per pair. Row construction requires a `'static` contract; leaking a
+/// throwaway one keeps unit tests free to use arbitrary column names.
+///
+/// Each call leaks its own contract, and `Row` equality compares contracts by
+/// address — two `test_row` results never compare equal. Assert on `get`
+/// results instead. A `Null` cell gets an arbitrary column type (`I64`); the
+/// contract only names cells, nothing decodes through it.
+#[cfg(test)]
+pub(crate) fn test_row(pairs: &[(&'static str, kronika_registry::Cell)]) -> kronika_registry::Row {
+    use kronika_registry::{
+        Cell, Column, ColumnClass, ColumnType, Row, Semantics, TypeContract, registry,
+    };
+
+    const fn ty_for(cell: &Cell) -> ColumnType {
+        match cell {
+            Cell::I16(_) => ColumnType::I16,
+            Cell::I32(_) => ColumnType::I32,
+            Cell::Null | Cell::I64(_) => ColumnType::I64,
+            Cell::U32(_) => ColumnType::U32,
+            Cell::U64(_) => ColumnType::U64,
+            Cell::F64(_) => ColumnType::F64,
+            Cell::Bool(_) => ColumnType::Bool,
+            Cell::Ts(_) => ColumnType::Ts,
+            Cell::StrId(_) => ColumnType::StrId,
+            Cell::ListI32(_) => ColumnType::ListI32,
+        }
+    }
+
+    let columns: Vec<Column> = pairs
+        .iter()
+        .map(|(name, cell)| Column {
+            name,
+            ty: ty_for(cell),
+            class: ColumnClass::Gauge,
+            nullable: true,
+        })
+        .collect();
+    let contract = TypeContract {
+        type_id: registry()[0].type_id,
+        name: "test",
+        semantics: Semantics::SnapshotFull,
+        columns: Box::leak(columns.into_boxed_slice()),
+        sort_key: &[],
+        deprecated: false,
+    };
+    Row::new(
+        Box::leak(Box::new(contract)),
+        pairs.iter().map(|(_, cell)| cell.clone()).collect(),
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SettingsState {
     Loaded,

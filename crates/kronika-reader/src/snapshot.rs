@@ -952,13 +952,16 @@ mod tests {
         );
         assert_eq!(sealed_rows.len(), 1, "one row decoded");
         assert_eq!(
-            sealed_rows[0]["archived_count"],
-            Cell::I64(5),
+            sealed_rows[0].get("archived_count"),
+            Some(&Cell::I64(5)),
             "archived_count cell"
         );
         // last_archived_wal carries a StrId.
         assert!(
-            matches!(sealed_rows[0]["last_archived_wal"], Cell::StrId(_)),
+            matches!(
+                sealed_rows[0].get("last_archived_wal"),
+                Some(&Cell::StrId(_))
+            ),
             "last_archived_wal is a StrId cell"
         );
         // Suppress the active_snap binding unused warning.
@@ -1109,7 +1112,7 @@ mod tests {
             .expect("archiver entry");
         let rows = unit.decode_rows(archiver).expect("decode rows");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["archived_count"], Cell::I64(5));
+        assert_eq!(rows[0].get("archived_count"), Some(&Cell::I64(5)));
 
         let dict = unit.dictionary().expect("dictionary");
         assert_eq!(

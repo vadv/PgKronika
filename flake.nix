@@ -94,7 +94,20 @@
         ]);
 
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          # Cargo-source filtering keeps only .rs files and manifests, which
+          # drops the web UI assets rust-embed compiles into the binary; the
+          # bench directory is pinned too so a filter change cannot break the
+          # manifest's declared [[bench]] target.
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            # maybeMissing: the BDD builder context carries only manifests and
+            # dummy sources, so these directories may be absent there.
+            fileset = pkgs.lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              (pkgs.lib.fileset.maybeMissing ./crates/kronika-reader/benches)
+              (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/static)
+            ];
+          };
           strictDeps = true;
           # Limit the image build to the BDD runner and the collector.
           # `-p` replaces crane's default flags, so keep `--locked` here.

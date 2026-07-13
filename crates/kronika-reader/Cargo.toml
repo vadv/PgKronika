@@ -18,6 +18,12 @@ parquet = { version = "55", default-features = false, features = ["arrow", "zstd
 [dev-dependencies]
 kronika-writer = { path = "../kronika-writer" }
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+mimalloc = { version = "0.1", features = ["override"] }
+
+[[bench]]
+name = "serving"
+harness = false
 
 [lints]
 workspace = true

@@ -1,12 +1,10 @@
 //! Generic, column-name-addressable section decode.
 //!
 //! [`decode_rows`] turns any registered section into `Vec<Row>`, where a [`Row`]
-//! maps each contract column name to a [`Cell`]. This is the primitive the BDD
-//! harness uses to assert an arbitrary section's rows by column name, without a
-//! per-metric typed struct. `StrId` cells stay as the raw `u64` id; the caller
-//! resolves them through the segment dictionary.
-
-use std::collections::BTreeMap;
+//! carries one [`Cell`] per contract column, addressable by column name. This is
+//! the primitive the BDD harness uses to assert an arbitrary section's rows by
+//! column name, without a per-metric typed struct. `StrId` cells stay as the raw
+//! `u64` id; the caller resolves them through the segment dictionary.
 
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -49,13 +47,74 @@ pub enum Cell {
     Null,
 }
 
-/// A decoded section row: column name to [`Cell`], in contract column order.
-pub type Row = BTreeMap<&'static str, Cell>;
+/// A decoded section row: cells in contract column order, addressable by name.
+///
+/// Cells sit in a vector positionally aligned with the contract's columns, so
+/// decode is a straight per-column push with no per-cell map insert. Name
+/// lookups walk the contract's column list.
+#[derive(Debug, Clone)]
+pub struct Row {
+    /// The contract the row was decoded against; names cells positionally.
+    contract: &'static TypeContract,
+    /// One cell per contract column, in contract column order.
+    cells: Vec<Cell>,
+}
+
+impl PartialEq for Row {
+    /// Rows are equal when decoded against the same registry contract (compared
+    /// by address — contracts are registry statics) with equal cells.
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.contract, other.contract) && self.cells == other.cells
+    }
+}
+
+impl Row {
+    /// Assemble a row of `cells` in `contract` column order.
+    ///
+    /// The decode path always supplies one cell per column; a shorter vector
+    /// leaves the tail columns absent (`get` returns `None`).
+    #[must_use]
+    pub const fn new(contract: &'static TypeContract, cells: Vec<Cell>) -> Self {
+        Self { contract, cells }
+    }
+
+    /// The cell under `name`, or `None` when the contract lacks that column.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&Cell> {
+        let at = self
+            .contract
+            .columns
+            .iter()
+            .position(|column| column.name == name)?;
+        self.cells.get(at)
+    }
+
+    /// The contract this row was decoded against.
+    #[must_use]
+    pub const fn contract(&self) -> &'static TypeContract {
+        self.contract
+    }
+
+    /// Cells in contract column order.
+    #[must_use]
+    pub fn cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
+    /// `(column name, cell)` pairs in contract column order.
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &Cell)> {
+        self.contract
+            .columns
+            .iter()
+            .map(|column| column.name)
+            .zip(&self.cells)
+    }
+}
 
 /// Decode a verified section into generic, column-addressable rows.
 ///
-/// The contract is selected by `type_id`. Each row maps every contract column
-/// name to a [`Cell`]; `StrId` columns keep the raw dictionary id.
+/// The contract is selected by `type_id`. Each row carries one [`Cell`] per
+/// contract column; `StrId` columns keep the raw dictionary id.
 ///
 /// # Errors
 ///
@@ -78,24 +137,28 @@ pub fn decode_rows(type_id: u32, section: VerifiedSection) -> Result<Vec<Row>, C
 
 /// Decode against an explicit contract, without the [`CodecError::Section`] wrap.
 fn decode_rows_with(
-    contract: &TypeContract,
+    contract: &'static TypeContract,
     section: VerifiedSection,
 ) -> Result<Vec<Row>, CodecError> {
     let decoded = decode_batches(contract, section)?;
     let mut rows: Vec<Row> = Vec::with_capacity(decoded.stats.rows);
     for batch in &decoded.batches {
-        for i in 0..batch.num_rows() {
-            let mut row = Row::new();
-            for column in contract.columns {
-                let array = batch
+        let arrays: Vec<&dyn Array> = contract
+            .columns
+            .iter()
+            .map(|column| {
+                batch
                     .column_by_name(column.name)
-                    .ok_or(CodecError::MissingColumn { name: column.name })?;
-                row.insert(
-                    column.name,
-                    cell_at(array.as_ref(), column.ty, column.name, i)?,
-                );
+                    .map(AsRef::as_ref)
+                    .ok_or(CodecError::MissingColumn { name: column.name })
+            })
+            .collect::<Result<_, _>>()?;
+        for i in 0..batch.num_rows() {
+            let mut cells = Vec::with_capacity(contract.columns.len());
+            for (column, array) in contract.columns.iter().zip(&arrays) {
+                cells.push(cell_at(*array, column.ty, column.name, i)?);
             }
-            rows.push(row);
+            rows.push(Row { contract, cells });
         }
     }
     Ok(rows)
@@ -161,9 +224,126 @@ fn typed<'a, A: Array + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cell, decode_rows};
+    use super::{Cell, Row, decode_rows};
+    use crate::contract::TypeContract;
     use crate::pg_stat_archiver::PgStatArchiver;
-    use crate::{Section, StrId, Ts, VerifiedSection};
+    use crate::{Section, StrId, Ts, VerifiedSection, registry};
+
+    /// The archiver contract straight from the registry.
+    fn archiver_contract() -> &'static TypeContract {
+        registry()
+            .iter()
+            .find(|contract| contract.type_id.get() == 1_008_001)
+            .expect("archiver contract registered")
+    }
+
+    /// A full cell vector for the archiver contract: `Null` everywhere except
+    /// the first column (`ts`).
+    fn archiver_cells(ts: i64) -> Vec<Cell> {
+        let contract = archiver_contract();
+        let mut cells = vec![Cell::Null; contract.columns.len()];
+        cells[0] = Cell::Ts(ts);
+        cells
+    }
+
+    // ---- positional Row API ----
+
+    #[test]
+    fn row_get_resolves_each_contract_column_positionally() {
+        let contract = archiver_contract();
+        let cells: Vec<Cell> = (0..contract.columns.len())
+            .map(|i| Cell::I64(i64::try_from(i).expect("small index")))
+            .collect();
+        let row = Row::new(contract, cells);
+        for (i, column) in contract.columns.iter().enumerate() {
+            assert_eq!(
+                row.get(column.name),
+                Some(&Cell::I64(i64::try_from(i).expect("small index"))),
+                "column {} resolves to its position",
+                column.name
+            );
+        }
+    }
+
+    #[test]
+    fn row_get_is_none_for_a_column_outside_the_contract() {
+        let row = Row::new(archiver_contract(), archiver_cells(1));
+        assert_eq!(row.get("no_such_column"), None);
+    }
+
+    #[test]
+    fn row_shorter_cells_leave_tail_columns_absent() {
+        let contract = archiver_contract();
+        let row = Row::new(contract, vec![Cell::Ts(5)]);
+        assert_eq!(row.get(contract.columns[0].name), Some(&Cell::Ts(5)));
+        let last = contract.columns.last().expect("archiver has columns");
+        assert_eq!(row.get(last.name), None, "missing tail cell reads absent");
+    }
+
+    #[test]
+    fn row_iter_follows_contract_column_order() {
+        let contract = archiver_contract();
+        let row = Row::new(contract, archiver_cells(1));
+        let names: Vec<&str> = row.iter().map(|(name, _)| name).collect();
+        let want: Vec<&str> = contract.columns.iter().map(|column| column.name).collect();
+        assert_eq!(names, want);
+    }
+
+    #[test]
+    fn row_iter_stops_at_the_shorter_of_columns_and_cells() {
+        let contract = archiver_contract();
+        let row = Row::new(contract, vec![Cell::Ts(5), Cell::I64(2)]);
+        assert_eq!(row.iter().count(), 2, "iter pairs only the present cells");
+    }
+
+    #[test]
+    fn rows_compare_equal_only_on_same_contract_and_cells() {
+        let archiver = archiver_contract();
+        let row = Row::new(archiver, archiver_cells(1));
+        assert_eq!(row, Row::new(archiver, archiver_cells(1)));
+        assert_ne!(row, Row::new(archiver, archiver_cells(2)), "cells differ");
+
+        let other = registry()
+            .iter()
+            .find(|contract| contract.type_id.get() != 1_008_001)
+            .expect("registry has more than one contract");
+        let foreign = Row::new(other, archiver_cells(1));
+        assert_ne!(row, foreign, "same cells under another contract differ");
+    }
+
+    #[test]
+    fn decoded_row_cells_align_with_contract_columns() {
+        let want = vec![PgStatArchiver {
+            ts: Ts(77),
+            archived_count: 5,
+            last_archived_wal: None,
+            last_archived_time: None,
+            failed_count: 1,
+            last_failed_wal: None,
+            last_failed_time: None,
+            stats_reset: None,
+        }];
+        let bytes = PgStatArchiver::encode(&want).expect("encode");
+        let rows =
+            decode_rows(1_008_001, VerifiedSection::for_test(bytes.into())).expect("decode_rows");
+        let row = &rows[0];
+        let contract = row.contract();
+        assert_eq!(contract.type_id.get(), 1_008_001, "contract travels along");
+        assert_eq!(
+            row.cells().len(),
+            contract.columns.len(),
+            "decode fills every contract column"
+        );
+        // The positional view and the by-name view agree cell for cell.
+        for (at, column) in contract.columns.iter().enumerate() {
+            assert_eq!(
+                row.cells().get(at),
+                row.get(column.name),
+                "cell {} equal by index and by name",
+                column.name
+            );
+        }
+    }
 
     #[test]
     fn roundtrips_every_cell_kind_through_the_archiver_section() {
@@ -199,30 +379,45 @@ mod tests {
         // Rows are sorted by the `ts` sort key, so the first encoded row (lower
         // ts) is first.
         let first = &rows[0];
-        assert_eq!(first["ts"], Cell::Ts(1_700_000_000_000_000), "Ts cell");
-        assert_eq!(first["archived_count"], Cell::I64(42), "I64 counter cell");
         assert_eq!(
-            first["last_archived_wal"],
-            Cell::StrId(7),
+            first.get("ts"),
+            Some(&Cell::Ts(1_700_000_000_000_000)),
+            "Ts cell"
+        );
+        assert_eq!(
+            first.get("archived_count"),
+            Some(&Cell::I64(42)),
+            "I64 counter cell"
+        );
+        assert_eq!(
+            first.get("last_archived_wal"),
+            Some(&Cell::StrId(7)),
             "StrId keeps the raw id, unresolved"
         );
         assert_eq!(
-            first["last_archived_time"],
-            Cell::Ts(1_699_999_999_000_000),
+            first.get("last_archived_time"),
+            Some(&Cell::Ts(1_699_999_999_000_000)),
             "present nullable Ts"
         );
         assert_eq!(
-            first["last_failed_wal"],
-            Cell::Null,
+            first.get("last_failed_wal"),
+            Some(&Cell::Null),
             "absent nullable StrId decodes to Null, distinct from a zero id"
         );
-        assert_eq!(first["stats_reset"], Cell::Ts(1_600_000_000_000_000));
+        assert_eq!(
+            first.get("stats_reset"),
+            Some(&Cell::Ts(1_600_000_000_000_000))
+        );
 
         let second = &rows[1];
-        assert_eq!(second["archived_count"], Cell::I64(0));
-        assert_eq!(second["last_archived_wal"], Cell::Null);
-        assert_eq!(second["last_failed_wal"], Cell::StrId(9));
-        assert_eq!(second["stats_reset"], Cell::Null, "absent nullable Ts");
+        assert_eq!(second.get("archived_count"), Some(&Cell::I64(0)));
+        assert_eq!(second.get("last_archived_wal"), Some(&Cell::Null));
+        assert_eq!(second.get("last_failed_wal"), Some(&Cell::StrId(9)));
+        assert_eq!(
+            second.get("stats_reset"),
+            Some(&Cell::Null),
+            "absent nullable Ts"
+        );
     }
 
     #[test]
