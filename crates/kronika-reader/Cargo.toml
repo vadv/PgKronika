@@ -19,7 +19,7 @@ parquet = { version = "55", default-features = false, features = ["arrow", "zstd
 kronika-writer = { path = "../kronika-writer" }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
-mimalloc = "0.1"
+mimalloc = { version = "0.1", features = ["override"] }
 
 [[bench]]
 name = "serving"

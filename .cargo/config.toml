@@ -1,10 +1,9 @@
-# Static musl is the default build target: the release binary links libc
-# statically and runs on any Linux with no runtime dependency. The C deps
-# (zstd-sys, mimalloc) build through musl-gcc; the workspace pulls no TLS/openssl
-# native code, so nothing else needs a cross toolchain.
-[build]
-target = "x86_64-unknown-linux-musl"
-
+# The default target stays glibc: musl's byte-loop memset/memmove/memcmp and
+# its allocator run the serving path 2-6x slower than glibc's SIMD variants
+# (see criterion serving benches). A portable static binary is still one flag
+# away — `--target x86_64-unknown-linux-musl` builds through musl-gcc; the
+# workspace pulls no TLS/openssl native code, so nothing else needs a cross
+# toolchain.
 [target.x86_64-unknown-linux-musl]
 linker = "musl-gcc"
 
