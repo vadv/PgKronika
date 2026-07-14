@@ -31,6 +31,30 @@ pub struct LogicalSection {
     pub identity: Vec<&'static str>,
 }
 
+impl LogicalSection {
+    /// Columns that key a diff series.
+    ///
+    /// The declared `identity`, or the sort key without `ts` when no identity is
+    /// declared. The sort-key fallback names the entity for sections whose sort
+    /// key is `(entity…, ts)` — the common case, one row per entity per snapshot
+    /// — while `identity` overrides it where the sort key alone is insufficient
+    /// (`pg_stat_statements` sorts by dbid/userid, but the entity also needs
+    /// queryid/toplevel). A singleton (sort key `ts` only) yields an empty key:
+    /// one series for the whole section, which is correct for it.
+    #[must_use]
+    pub fn diff_key(&self) -> Vec<&'static str> {
+        if self.identity.is_empty() {
+            self.sort_key
+                .iter()
+                .copied()
+                .filter(|column| *column != "ts")
+                .collect()
+        } else {
+            self.identity.clone()
+        }
+    }
+}
+
 /// Build the union view of a logical section by name.
 ///
 /// Returns `None` when no registered contract carries that name.
@@ -192,6 +216,27 @@ mod tests {
         };
         assert_eq!(class("calls"), Some(ColumnClass::Cumulative));
         assert_eq!(class("queryid"), Some(ColumnClass::Label));
+    }
+
+    #[test]
+    fn diff_key_uses_identity_or_falls_back_to_sort_key_without_ts() {
+        // A declared identity is used verbatim.
+        let stmt =
+            logical_section("pg_stat_statements").expect("pg_stat_statements in the registry");
+        assert_eq!(
+            stmt.diff_key(),
+            vec!["queryid", "userid", "dbid", "toplevel"]
+        );
+
+        // os_cpu declares no identity; the entity is the sort key minus `ts`, so
+        // each core stays its own series instead of collapsing into one.
+        let os_cpu = logical_section("os_cpu").expect("os_cpu in the registry");
+        assert!(os_cpu.identity.is_empty());
+        assert_eq!(os_cpu.diff_key(), vec!["cpu_id"]);
+
+        // A singleton (sort key `ts` only) has an empty key: one series.
+        let wal = logical_section("pg_stat_wal").expect("pg_stat_wal in the registry");
+        assert!(wal.diff_key().is_empty());
     }
 
     #[test]
