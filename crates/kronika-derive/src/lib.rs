@@ -26,6 +26,7 @@ struct Header {
     name: LitStr,
     semantics: Ident,
     sort_key: Vec<LitStr>,
+    identity: Vec<LitStr>,
 }
 
 /// One resolved column: its field, on-disk shape, and class.
@@ -121,6 +122,7 @@ fn parse_header(input: &DeriveInput) -> syn::Result<Header> {
     let mut name = None;
     let mut semantics = None;
     let mut sort_key = Vec::new();
+    let mut identity = Vec::new();
 
     attr.parse_nested_meta(|meta| {
         if meta.path.is_ident("id") {
@@ -134,6 +136,11 @@ fn parse_header(input: &DeriveInput) -> syn::Result<Header> {
             syn::parenthesized!(content in meta.input);
             let keys = content.parse_terminated(<LitStr as syn::parse::Parse>::parse, Token![,])?;
             sort_key = keys.into_iter().collect();
+        } else if meta.path.is_ident("identity") {
+            let content;
+            syn::parenthesized!(content in meta.input);
+            let keys = content.parse_terminated(<LitStr as syn::parse::Parse>::parse, Token![,])?;
+            identity = keys.into_iter().collect();
         } else {
             return Err(meta.error("unknown #[section(..)] key"));
         }
@@ -146,6 +153,7 @@ fn parse_header(input: &DeriveInput) -> syn::Result<Header> {
         semantics: semantics
             .ok_or_else(|| syn::Error::new(attr.span(), "#[section(..)] needs `semantics`"))?,
         sort_key,
+        identity,
     })
 }
 
@@ -307,6 +315,7 @@ fn build_contract(header: &Header, columns: &[ColumnDef]) -> TokenStream2 {
     let name = &header.name;
     let semantics_variant = semantics_variant(&header.semantics);
     let sort_key = &header.sort_key;
+    let identity = &header.identity;
 
     let column_entries = columns.iter().map(|c| {
         let name = &c.name;
@@ -336,6 +345,7 @@ fn build_contract(header: &Header, columns: &[ColumnDef]) -> TokenStream2 {
             semantics: ::kronika_registry::Semantics::#semantics_variant,
             columns: &[ #( #column_entries ),* ],
             sort_key: &[ #( #sort_key ),* ],
+            identity: &[ #( #identity ),* ],
             deprecated: false,
         };
     }

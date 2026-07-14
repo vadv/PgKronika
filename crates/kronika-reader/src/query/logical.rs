@@ -1,6 +1,6 @@
 //! Union view of a logical section across its layout versions.
 
-use kronika_registry::{ColumnType, registry};
+use kronika_registry::{ColumnClass, ColumnType, registry};
 
 /// One column in a logical section's union schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +9,8 @@ pub struct LogicalColumn {
     pub name: &'static str,
     /// On-disk value type (from the first version that introduces the column).
     pub ty: ColumnType,
+    /// The column's role; `Cumulative` marks a counter the diff layer rates.
+    pub class: ColumnClass,
 }
 
 /// A logical section: the union of all layout versions sharing the same name.
@@ -23,6 +25,34 @@ pub struct LogicalSection {
     pub columns: Vec<LogicalColumn>,
     /// Sort key, identical across all versions.
     pub sort_key: &'static [&'static str],
+    /// Union of every version's identity columns (the diff series key). A
+    /// version that lacks a later identity column, e.g. `toplevel`, fills it
+    /// with NULL, so pre- and post-upgrade rows land in distinct series.
+    pub identity: Vec<&'static str>,
+}
+
+impl LogicalSection {
+    /// Columns that key a diff series.
+    ///
+    /// The declared `identity`, or the sort key without `ts` when no identity is
+    /// declared. The sort-key fallback names the entity for sections whose sort
+    /// key is `(entity…, ts)` — the common case, one row per entity per snapshot
+    /// — while `identity` overrides it where the sort key alone is insufficient
+    /// (`pg_stat_statements` sorts by dbid/userid, but the entity also needs
+    /// queryid/toplevel). A singleton (sort key `ts` only) yields an empty key:
+    /// one series for the whole section, which is correct for it.
+    #[must_use]
+    pub fn diff_key(&self) -> Vec<&'static str> {
+        if self.identity.is_empty() {
+            self.sort_key
+                .iter()
+                .copied()
+                .filter(|column| *column != "ts")
+                .collect()
+        } else {
+            self.identity.clone()
+        }
+    }
 }
 
 /// Build the union view of a logical section by name.
@@ -75,11 +105,33 @@ pub fn logical_section(name: &str) -> Option<LogicalSection> {
                     contract.type_id.get(),
                     col.ty,
                 );
+                assert!(
+                    existing.class == col.class,
+                    "registry violation: logical section {:?} column {:?} has \
+                     conflicting classes — first seen as {:?}, but type_id {} declares {:?}",
+                    name,
+                    col.name,
+                    existing.class,
+                    contract.type_id.get(),
+                    col.class,
+                );
             } else {
                 columns.push(LogicalColumn {
                     name: col.name,
                     ty: col.ty,
+                    class: col.class,
                 });
+            }
+        }
+    }
+
+    // Identity is the union of the versions' identity columns: a later version
+    // that adds an identity column widens the key, and older rows fill it NULL.
+    let mut identity: Vec<&'static str> = Vec::new();
+    for contract in &contracts {
+        for &id_name in contract.identity {
+            if !identity.contains(&id_name) {
+                identity.push(id_name);
             }
         }
     }
@@ -91,6 +143,7 @@ pub fn logical_section(name: &str) -> Option<LogicalSection> {
         type_ids,
         columns,
         sort_key,
+        identity,
     })
 }
 
@@ -139,6 +192,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pg_stat_statements_identity_unions_and_classes_resolve() {
+        use kronika_registry::ColumnClass;
+
+        let section = logical_section("pg_stat_statements")
+            .expect("pg_stat_statements must be in the registry");
+
+        // V1/V2 identity is (queryid, userid, dbid); V3+ widen it with toplevel.
+        assert_eq!(
+            section.identity,
+            vec!["queryid", "userid", "dbid", "toplevel"]
+        );
+
+        let class = |name: &str| {
+            section
+                .columns
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.class)
+        };
+        assert_eq!(class("calls"), Some(ColumnClass::Cumulative));
+        assert_eq!(class("queryid"), Some(ColumnClass::Label));
+    }
+
+    #[test]
+    fn diff_key_uses_identity_or_falls_back_to_sort_key_without_ts() {
+        // A declared identity is used verbatim.
+        let stmt =
+            logical_section("pg_stat_statements").expect("pg_stat_statements in the registry");
+        assert_eq!(
+            stmt.diff_key(),
+            vec!["queryid", "userid", "dbid", "toplevel"]
+        );
+
+        // os_cpu declares no identity; the entity is the sort key minus `ts`, so
+        // each core stays its own series instead of collapsing into one.
+        let os_cpu = logical_section("os_cpu").expect("os_cpu in the registry");
+        assert!(os_cpu.identity.is_empty());
+        assert_eq!(os_cpu.diff_key(), vec!["cpu_id"]);
+
+        // A singleton (sort key `ts` only) has an empty key: one series.
+        let wal = logical_section("pg_stat_wal").expect("pg_stat_wal in the registry");
+        assert!(wal.diff_key().is_empty());
     }
 
     #[test]
