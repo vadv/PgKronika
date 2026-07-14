@@ -3,15 +3,25 @@ use std::collections::BTreeMap;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use kronika_reader::{section, sections as query_sections};
-use kronika_registry::{DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name};
+use kronika_reader::{
+    QueryError, diff_section, logical_section, section, sections as query_sections,
+};
+use kronika_registry::{
+    ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
+};
 use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::params::{
     bad_request, parse_cursor, parse_i64, parse_limit, parse_u64, query_error_response,
 };
-use crate::serialize::{column_class_name, column_type_name, page_to_json, semantics_name};
+use crate::serialize::{
+    column_class_name, column_type_name, page_to_json, semantics_name, series_diff_to_json,
+};
+
+/// Cap on rows read for one diff response; a wider window is rejected so a
+/// single request cannot pull an unbounded section into memory.
+const DIFF_MAX_ROWS: usize = 262_144;
 
 /// `GET /v1/version` — the API and container format versions this build serves.
 ///
@@ -184,4 +194,47 @@ pub(crate) async fn sections_batch(
         }
         Err(err) => Err(query_error_response(&err)),
     }
+}
+
+/// `GET /v1/section/{name}/diff?source&from&to` — per-entity deltas and rates
+/// over a window.
+///
+/// Resolves the section's identity and cumulative columns from the registry,
+/// reads the window in one page, and folds each series through the diff core.
+/// A window whose rows exceed one page is rejected so the response stays bounded.
+pub(crate) async fn section_diff(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let source = parse_u64(&params, "source")?;
+    let from = parse_i64(&params, "from")?;
+    let to = parse_i64(&params, "to")?;
+
+    let logical = logical_section(&name)
+        .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.clone())))?;
+    let identity = logical.identity.clone();
+    let cumulative: Vec<&str> = logical
+        .columns
+        .iter()
+        .filter(|column| column.class == ColumnClass::Cumulative)
+        .map(|column| column.name)
+        .collect();
+
+    let mut snap = state.snapshot.load().as_ref().clone();
+    let page = section(&mut snap, &name, source, from, to, DIFF_MAX_ROWS, None)
+        .map_err(|err| query_error_response(&err))?;
+    if page.next_cursor.is_some() {
+        return Err(bad_request(
+            "window has too many rows to diff in one response; narrow the window",
+        ));
+    }
+
+    let series = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+    Ok(Json(json!({
+        "section": name,
+        "source_id": source,
+        "identity": identity,
+        "series": series_diff_to_json(&identity, &series),
+    })))
 }

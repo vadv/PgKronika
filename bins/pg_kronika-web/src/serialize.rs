@@ -1,4 +1,6 @@
-use kronika_reader::{OutRow, SectionPage, Value as CellValue};
+use kronika_reader::{
+    DiffAt, DiffPoint, OutRow, Reason, Scalar, SectionPage, SeriesDiff, Value as CellValue,
+};
 use kronika_registry::{ColumnClass, ColumnType, Semantics};
 use serde_json::{Value, json};
 
@@ -49,6 +51,78 @@ pub(crate) fn page_to_json(page: &SectionPage) -> Value {
         "gaps": gaps,
         "next_cursor": next_cursor,
     })
+}
+
+/// Shape a section's diff over a window: an array of per-entity series, each
+/// with its identity key and a point list per cumulative column.
+pub(crate) fn series_diff_to_json(identity: &[&str], series: &[SeriesDiff]) -> Value {
+    let out = series
+        .iter()
+        .map(|s| {
+            let key: serde_json::Map<String, Value> = identity
+                .iter()
+                .zip(&s.key)
+                .map(|(name, value)| ((*name).to_owned(), value_to_json(value)))
+                .collect();
+            let columns: serde_json::Map<String, Value> = s
+                .columns
+                .iter()
+                .map(|c| {
+                    let points = c.points.iter().map(point_to_json).collect();
+                    (c.name.clone(), Value::Array(points))
+                })
+                .collect();
+            json!({ "key": key, "columns": columns })
+        })
+        .collect();
+    Value::Array(out)
+}
+
+fn point_to_json(at: &DiffAt) -> Value {
+    match at.point {
+        DiffPoint::Value {
+            delta,
+            rate,
+            dt_micros,
+        } => json!({
+            "ts": at.ts,
+            "delta": scalar_to_json(delta),
+            "rate": finite(rate),
+            "dt_micros": dt_micros,
+        }),
+        DiffPoint::NoData { reason } => json!({
+            "ts": at.ts,
+            "nodata": reason_name(reason),
+        }),
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a delta above i64::MAX is astronomically rare for a real counter; \
+              the lossy f64 fallback keeps the response numeric"
+)]
+fn scalar_to_json(scalar: Scalar) -> Value {
+    match scalar {
+        Scalar::Int(v) => i64::try_from(v).map_or_else(|_| finite(v as f64), Value::from),
+        Scalar::Float(v) => finite(v),
+    }
+}
+
+/// A finite `f64` as a JSON number, or `null` for NaN/infinity, which JSON
+/// cannot represent.
+fn finite(v: f64) -> Value {
+    if v.is_finite() { v.into() } else { Value::Null }
+}
+
+const fn reason_name(reason: Reason) -> &'static str {
+    match reason {
+        Reason::Reset => "reset",
+        Reason::Gap => "gap",
+        Reason::FirstPoint => "first_point",
+        Reason::Anomaly => "anomaly",
+        Reason::NotCollected => "not_collected",
+    }
 }
 
 /// Stable wire name for a column's on-disk type.
@@ -148,6 +222,49 @@ mod tests {
             value_to_json(&CellValue::ListI32(vec![1, 2, 3])),
             serde_json::json!([1, 2, 3]),
             "list of i32"
+        );
+    }
+
+    #[test]
+    fn series_diff_to_json_shapes_keys_columns_and_reasons() {
+        use kronika_reader::{ColumnDiff, DiffAt, DiffPoint, Reason, Scalar, SeriesDiff};
+
+        use super::series_diff_to_json;
+
+        let series = vec![SeriesDiff {
+            key: vec![CellValue::I64(42)],
+            columns: vec![ColumnDiff {
+                name: "calls".to_owned(),
+                points: vec![
+                    DiffAt {
+                        ts: 1_000,
+                        point: DiffPoint::NoData {
+                            reason: Reason::FirstPoint,
+                        },
+                    },
+                    DiffAt {
+                        ts: 3_000,
+                        point: DiffPoint::Value {
+                            delta: Scalar::Int(10),
+                            rate: 5.0,
+                            dt_micros: 2_000,
+                        },
+                    },
+                ],
+            }],
+        }];
+
+        assert_eq!(
+            series_diff_to_json(&["queryid"], &series),
+            serde_json::json!([{
+                "key": { "queryid": 42 },
+                "columns": {
+                    "calls": [
+                        { "ts": 1_000, "nodata": "first_point" },
+                        { "ts": 3_000, "delta": 10, "rate": 5.0, "dt_micros": 2_000 },
+                    ]
+                }
+            }])
         );
     }
 }
