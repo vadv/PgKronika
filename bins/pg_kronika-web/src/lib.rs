@@ -164,6 +164,7 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .route("/v1/sections", get(handlers::v1::sections))
         .route("/v1/segments", get(handlers::v1::segments))
         .route("/v1/section/{name}", get(handlers::v1::section_data))
+        .route("/v1/section/{name}/diff", get(handlers::v1::section_diff))
         .route("/v1/sections/batch", get(handlers::v1::sections_batch))
         .fallback(handlers::static_::static_handler);
     if let Some(cfg) = auth {
@@ -292,6 +293,23 @@ mod tests {
             "the fixture directory outlives the request"
         );
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn section_diff_resolves_identity_and_columns_for_a_known_section() {
+        // The fixture holds no pg_stat_statements data, so the diff is empty —
+        // but the route, the registry column resolution, and the response shape
+        // are all exercised.
+        let (_dir, status, body) =
+            fixture_response("/v1/section/pg_stat_statements/diff?source=7&from=0&to=9000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["section"], "pg_stat_statements");
+        assert_eq!(
+            body["identity"],
+            serde_json::json!(["queryid", "userid", "dbid", "toplevel"]),
+            "identity resolves as the union of the section's versions"
+        );
+        assert_eq!(body["series"], serde_json::json!([]));
     }
 
     #[test]
