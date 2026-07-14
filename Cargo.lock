@@ -1377,6 +1377,7 @@ version = "0.0.0"
 dependencies = [
  "arrow-array",
  "criterion",
+ "kronika-diff",
  "kronika-format",
  "kronika-registry",
  "kronika-store",
