@@ -58,11 +58,16 @@ userid, ts`, без `queryid`). Добавляем одно поле:
   `datid`; user_tables → `datid, relid`; user_indexes → `datid, indexrelid`.
   Линтер: каждое имя — колонка класса `Label`.
 
-Пустой `identity` (секция не размечена) значит: `Cumulative`-колонки секции не
-дифференцируются. Gauge-только секции (activity, locks) в дифф не входят
-намеренно — у них нет кумулятивов. Nullable-колонка в `identity` (`queryid` при
-`compute_query_id = off`) схлопывает все NULL-строки в одну серию по остатку
-ключа; свёртка серий (шаг 3) обязана это учесть — связано с `NotCollected` ниже.
+Пустой `identity` (секция не размечена) значит: ключ серии берётся из `sort_key`
+без `ts`. Для секций с `sort_key = (сущность…, ts)` это и есть сущность (os_cpu →
+cpu_id, pg_stat_io → backend_type/object/context), поэтому многострочные секции
+не схлопываются в одну серию. Для синглтона (`sort_key = ts`) ключ пуст — одна
+серия на секцию, что для него верно. `identity` объявляется явно только там, где
+`sort_key` недостаточен: pg_stat_statements сортируется по dbid/userid, но сущность
+добавляет queryid/toplevel. Gauge-только секции (activity, locks) в дифф не входят —
+у них нет кумулятивов. Nullable-колонка в ключе (`queryid` при `compute_query_id =
+off`) схлопывает NULL-строки в одну серию по остатку ключа; свёртка (шаг 3) обязана
+это учесть — связано с `NotCollected` ниже.
 
 Остальное (`ColumnClass`, `semantics`, `columns`) уже в контракте.
 

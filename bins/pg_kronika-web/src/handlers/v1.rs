@@ -213,7 +213,9 @@ pub(crate) async fn section_diff(
 
     let logical = logical_section(&name)
         .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.clone())))?;
-    let identity = logical.identity.clone();
+    // The series key: declared identity, or the sort key minus `ts` when a
+    // section is unmarked, so multi-row sections do not collapse into one series.
+    let identity = logical.diff_key();
     let cumulative: Vec<&str> = logical
         .columns
         .iter()
