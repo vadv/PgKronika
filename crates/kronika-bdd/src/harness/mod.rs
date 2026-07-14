@@ -88,6 +88,7 @@ pub(crate) fn test_row(pairs: &[(&'static str, kronika_registry::Cell)]) -> kron
         semantics: Semantics::SnapshotFull,
         columns: Box::leak(columns.into_boxed_slice()),
         sort_key: &[],
+        identity: &[],
         deprecated: false,
     };
     Row::new(

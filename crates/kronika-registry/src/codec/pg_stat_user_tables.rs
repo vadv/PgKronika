@@ -26,7 +26,8 @@ use crate::{Section, StrId, Ts};
     id = 1_013_004,
     name = "pg_stat_user_tables",
     semantics = snapshot_full,
-    sort_key("datid", "relid", "ts")
+    sort_key("datid", "relid", "ts"),
+    identity("datid", "relid")
 )]
 pub struct PgStatUserTablesV4 {
     /// Snapshot time, unix microseconds (per-database `statement_timestamp()`).
@@ -192,7 +193,8 @@ pub struct PgStatUserTablesV4 {
     id = 1_013_003,
     name = "pg_stat_user_tables",
     semantics = snapshot_full,
-    sort_key("datid", "relid", "ts")
+    sort_key("datid", "relid", "ts"),
+    identity("datid", "relid")
 )]
 pub struct PgStatUserTablesV3 {
     /// Snapshot time, unix microseconds (per-database `statement_timestamp()`).
@@ -343,7 +345,8 @@ pub struct PgStatUserTablesV3 {
     id = 1_013_002,
     name = "pg_stat_user_tables",
     semantics = snapshot_full,
-    sort_key("datid", "relid", "ts")
+    sort_key("datid", "relid", "ts"),
+    identity("datid", "relid")
 )]
 pub struct PgStatUserTablesV2 {
     /// Snapshot time, unix microseconds (per-database `statement_timestamp()`).
@@ -485,7 +488,8 @@ pub struct PgStatUserTablesV2 {
     id = 1_013_001,
     name = "pg_stat_user_tables",
     semantics = snapshot_full,
-    sort_key("datid", "relid", "ts")
+    sort_key("datid", "relid", "ts"),
+    identity("datid", "relid")
 )]
 pub struct PgStatUserTablesV1 {
     /// Snapshot time, unix microseconds (per-database `statement_timestamp()`).

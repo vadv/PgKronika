@@ -36,7 +36,8 @@ use crate::{Section, StrId, Ts};
     id = 1_002_006,
     name = "pg_stat_statements",
     semantics = snapshot_full,
-    sort_key("dbid", "userid", "ts")
+    sort_key("dbid", "userid", "ts"),
+    identity("queryid", "userid", "dbid", "toplevel")
 )]
 pub struct PgStatStatementsV6 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
@@ -215,7 +216,8 @@ pub struct PgStatStatementsV6 {
     id = 1_002_005,
     name = "pg_stat_statements",
     semantics = snapshot_full,
-    sort_key("dbid", "userid", "ts")
+    sort_key("dbid", "userid", "ts"),
+    identity("queryid", "userid", "dbid", "toplevel")
 )]
 pub struct PgStatStatementsV5 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
@@ -387,7 +389,8 @@ pub struct PgStatStatementsV5 {
     id = 1_002_004,
     name = "pg_stat_statements",
     semantics = snapshot_full,
-    sort_key("dbid", "userid", "ts")
+    sort_key("dbid", "userid", "ts"),
+    identity("queryid", "userid", "dbid", "toplevel")
 )]
 pub struct PgStatStatementsV4 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
@@ -539,7 +542,8 @@ pub struct PgStatStatementsV4 {
     id = 1_002_003,
     name = "pg_stat_statements",
     semantics = snapshot_full,
-    sort_key("dbid", "userid", "ts")
+    sort_key("dbid", "userid", "ts"),
+    identity("queryid", "userid", "dbid", "toplevel")
 )]
 pub struct PgStatStatementsV3 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
@@ -661,7 +665,8 @@ pub struct PgStatStatementsV3 {
     id = 1_002_002,
     name = "pg_stat_statements",
     semantics = snapshot_full,
-    sort_key("dbid", "userid", "ts")
+    sort_key("dbid", "userid", "ts"),
+    identity("queryid", "userid", "dbid")
 )]
 pub struct PgStatStatementsV2 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
@@ -782,7 +787,8 @@ pub struct PgStatStatementsV2 {
     id = 1_002_001,
     name = "pg_stat_statements",
     semantics = snapshot_full,
-    sort_key("dbid", "userid", "ts")
+    sort_key("dbid", "userid", "ts"),
+    identity("queryid", "userid", "dbid")
 )]
 pub struct PgStatStatementsV1 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
