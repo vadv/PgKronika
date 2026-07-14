@@ -26,7 +26,8 @@ use crate::{Section, StrId, Ts};
     id = 1_014_002,
     name = "pg_stat_user_indexes",
     semantics = snapshot_full,
-    sort_key("datid", "indexrelid", "ts")
+    sort_key("datid", "indexrelid", "ts"),
+    identity("datid", "indexrelid")
 )]
 pub struct PgStatUserIndexesV2 {
     /// Snapshot time, unix microseconds (per-database `statement_timestamp()`).
@@ -112,7 +113,8 @@ pub struct PgStatUserIndexesV2 {
     id = 1_014_001,
     name = "pg_stat_user_indexes",
     semantics = snapshot_full,
-    sort_key("datid", "indexrelid", "ts")
+    sort_key("datid", "indexrelid", "ts"),
+    identity("datid", "indexrelid")
 )]
 pub struct PgStatUserIndexesV1 {
     /// Snapshot time, unix microseconds (per-database `statement_timestamp()`).

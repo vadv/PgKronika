@@ -132,6 +132,10 @@ pub struct TypeContract {
     pub columns: &'static [Column],
     /// Sort-key column names, in order. Every name must be a column.
     pub sort_key: &'static [&'static str],
+    /// Identity columns for the diff layer: the tuple that identifies one series
+    /// across snapshots. Every name must be a `Label` column. Empty until the
+    /// section is wired for diffing.
+    pub identity: &'static [&'static str],
     /// Whether the type is retired (kept in the registry, no longer written).
     pub deprecated: bool,
 }
@@ -172,6 +176,20 @@ pub enum LintError {
         /// The column that failed validation.
         column: &'static str,
     },
+    /// An identity name is not a column of the type.
+    IdentityColumnMissing {
+        /// The raw id whose identity failed validation.
+        type_id: u32,
+        /// The identity name with no matching column.
+        column: &'static str,
+    },
+    /// An identity name is a column but not of class [`ColumnClass::Label`].
+    IdentityColumnNotLabel {
+        /// The raw id whose identity failed validation.
+        type_id: u32,
+        /// The identity name whose column is not a `Label`.
+        column: &'static str,
+    },
 }
 
 impl fmt::Display for LintError {
@@ -198,6 +216,18 @@ impl fmt::Display for LintError {
                     "type_id {type_id} column {column:?} is class Timestamp but not a non-nullable ts"
                 )
             }
+            Self::IdentityColumnMissing { type_id, column } => {
+                write!(
+                    f,
+                    "type_id {type_id} identity uses {column:?}, which is not a column"
+                )
+            }
+            Self::IdentityColumnNotLabel { type_id, column } => {
+                write!(
+                    f,
+                    "type_id {type_id} identity uses {column:?}, which is not a Label column"
+                )
+            }
         }
     }
 }
@@ -214,6 +244,22 @@ fn lint_contract(contract: &TypeContract, out: &mut Vec<LintError>) {
                 type_id: raw,
                 column: name,
             });
+        }
+    }
+
+    for &name in contract.identity {
+        match contract.column(name) {
+            None => out.push(LintError::IdentityColumnMissing {
+                type_id: raw,
+                column: name,
+            }),
+            Some(column) if !matches!(column.class, ColumnClass::Label) => {
+                out.push(LintError::IdentityColumnNotLabel {
+                    type_id: raw,
+                    column: name,
+                });
+            }
+            Some(_) => {}
         }
     }
 
@@ -290,6 +336,7 @@ mod tests {
             semantics: Semantics::SnapshotFull,
             columns,
             sort_key,
+            identity: &[],
             deprecated: false,
         }
     }
@@ -320,6 +367,52 @@ mod tests {
                 column: "pid"
             }])
         );
+    }
+
+    #[test]
+    fn rejects_identity_that_is_not_a_column() {
+        let c = TypeContract {
+            identity: &["pid"],
+            ..contract(1_006_001, &[TS, VALUE], &["ts"])
+        };
+        assert_eq!(
+            lint(&[c]),
+            Err(vec![LintError::IdentityColumnMissing {
+                type_id: 1_006_001,
+                column: "pid"
+            }])
+        );
+    }
+
+    #[test]
+    fn rejects_identity_column_that_is_not_a_label() {
+        // `value` is a Cumulative column, not a Label.
+        let c = TypeContract {
+            identity: &["value"],
+            ..contract(1_006_001, &[TS, VALUE], &["ts"])
+        };
+        assert_eq!(
+            lint(&[c]),
+            Err(vec![LintError::IdentityColumnNotLabel {
+                type_id: 1_006_001,
+                column: "value"
+            }])
+        );
+    }
+
+    #[test]
+    fn accepts_identity_of_label_columns() {
+        const QUERYID: Column = Column {
+            name: "queryid",
+            ty: ColumnType::I64,
+            class: ColumnClass::Label,
+            nullable: true,
+        };
+        let c = TypeContract {
+            identity: &["queryid"],
+            ..contract(1_002_001, &[TS, QUERYID, VALUE], &["ts"])
+        };
+        assert_eq!(lint(&[c]), Ok(()));
     }
 
     #[test]

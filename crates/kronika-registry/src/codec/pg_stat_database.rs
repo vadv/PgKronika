@@ -26,7 +26,8 @@ use crate::{Section, StrId, Ts};
     id = 1_005_004,
     name = "pg_stat_database",
     semantics = snapshot_full,
-    sort_key("datid", "ts")
+    sort_key("datid", "ts"),
+    identity("datid")
 )]
 pub struct PgStatDatabaseV4 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
@@ -147,7 +148,8 @@ pub struct PgStatDatabaseV4 {
     id = 1_005_003,
     name = "pg_stat_database",
     semantics = snapshot_full,
-    sort_key("datid", "ts")
+    sort_key("datid", "ts"),
+    identity("datid")
 )]
 pub struct PgStatDatabaseV3 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
@@ -262,7 +264,8 @@ pub struct PgStatDatabaseV3 {
     id = 1_005_002,
     name = "pg_stat_database",
     semantics = snapshot_full,
-    sort_key("datid", "ts")
+    sort_key("datid", "ts"),
+    identity("datid")
 )]
 pub struct PgStatDatabaseV2 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.
@@ -356,7 +359,8 @@ pub struct PgStatDatabaseV2 {
     id = 1_005_001,
     name = "pg_stat_database",
     semantics = snapshot_full,
-    sort_key("datid", "ts")
+    sort_key("datid", "ts"),
+    identity("datid")
 )]
 pub struct PgStatDatabaseV1 {
     /// Snapshot time, unix microseconds; one value for all rows of a snapshot.

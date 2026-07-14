@@ -1,5 +1,10 @@
 //! Counter deltas and reset handling.
 //!
-//! This crate will turn cumulative counters into rates, reconstruct baselines,
-//! and apply reset rules. Public API docs will be added here as the crate is
-//! implemented.
+//! Turns cumulative counters into per-interval deltas and rates. The core is
+//! [`diff_pair`]: a pure function over two consecutive samples of one series,
+//! with no knowledge of `PostgreSQL`. Series grouping and reader integration are
+//! added on top in the query layer.
+
+mod pair;
+
+pub use pair::{DiffPoint, Reason, Scalar, diff_pair};
