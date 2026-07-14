@@ -32,6 +32,7 @@ use kronika_writer::{Interner, dict};
 // Dependencies the reader library pulls in but this bench does not touch; naming
 // them keeps `unused_crate_dependencies` quiet without editing the library.
 use arrow_array as _;
+use kronika_diff as _;
 use kronika_store as _;
 use parquet as _;
 
