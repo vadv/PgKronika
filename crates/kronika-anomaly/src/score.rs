@@ -145,6 +145,10 @@ pub fn score_window(cur: &[f64], ref_: &[f64], params: &ScoreParams) -> Scored {
 }
 
 /// Median of a non-empty slice; the even case averages the two middles.
+///
+/// A full sort: `select_nth_unstable` benched ~30% slower on real scan
+/// profiles, where constant series (quiet counters) hit pdqsort's O(n)
+/// fast path.
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
