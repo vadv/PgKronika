@@ -4,7 +4,8 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use kronika_reader::{
-    QueryError, diff_section, logical_section, section, sections as query_sections,
+    LogicalSection, QueryError, SectionPage, diff_section, logical_section, section,
+    sections as query_sections,
 };
 use kronika_registry::{
     ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
@@ -196,25 +197,26 @@ pub(crate) async fn sections_batch(
     }
 }
 
-/// `GET /v1/section/{name}/diff?source&from&to` — per-entity deltas and rates
-/// over a window.
-///
-/// Resolves the section's identity and cumulative columns from the registry,
-/// reads the window in one page, and folds each series through the diff core.
-/// A window whose rows exceed one page is rejected so the response stays bounded.
-pub(crate) async fn section_diff(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
+/// The error half of a handler result: an HTTP status and a JSON body.
+type ErrorResponse = (StatusCode, Json<Value>);
 
-    let logical = logical_section(&name)
-        .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.clone())))?;
-    // The series key: declared identity, or the sort key minus `ts` when a
-    // section is unmarked, so multi-row sections do not collapse into one series.
+/// One section's diff as a JSON object (`section`, `identity`, `series`).
+type DiffObject = serde_json::Map<String, Value>;
+
+/// Fold one section's page into its diff JSON.
+///
+/// The series key is the declared identity, or the sort key minus `ts` when a
+/// section is unmarked, so multi-row sections do not collapse into one series. A
+/// window whose rows exceed one page is rejected so the response stays bounded.
+fn section_diff_object(
+    logical: &LogicalSection,
+    page: &SectionPage,
+) -> Result<DiffObject, ErrorResponse> {
+    if page.next_cursor.is_some() {
+        return Err(bad_request(
+            "window has too many rows to diff in one response; narrow the window",
+        ));
+    }
     let identity = logical.diff_key();
     let cumulative: Vec<&str> = logical
         .columns
@@ -222,21 +224,81 @@ pub(crate) async fn section_diff(
         .filter(|column| column.class == ColumnClass::Cumulative)
         .map(|column| column.name)
         .collect();
+    let series = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+    let mut object = serde_json::Map::new();
+    object.insert("section".to_owned(), json!(logical.name));
+    object.insert("identity".to_owned(), json!(identity));
+    object.insert("series".to_owned(), series_diff_to_json(&identity, &series));
+    Ok(object)
+}
 
+/// `GET /v1/section/{name}/diff?source&from&to` — per-entity deltas and rates
+/// over a window.
+///
+/// Resolves the section's identity and cumulative columns from the registry,
+/// reads the window in one page, and folds each series through the diff core.
+pub(crate) async fn section_diff(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ErrorResponse> {
+    let source = parse_u64(&params, "source")?;
+    let from = parse_i64(&params, "from")?;
+    let to = parse_i64(&params, "to")?;
+
+    let logical = logical_section(&name)
+        .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.clone())))?;
     let mut snap = state.snapshot.load().as_ref().clone();
     let page = section(&mut snap, &name, source, from, to, DIFF_MAX_ROWS, None)
         .map_err(|err| query_error_response(&err))?;
-    if page.next_cursor.is_some() {
-        return Err(bad_request(
-            "window has too many rows to diff in one response; narrow the window",
-        ));
-    }
 
-    let series = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
-    Ok(Json(json!({
-        "section": name,
-        "source_id": source,
-        "identity": identity,
-        "series": series_diff_to_json(&identity, &series),
-    })))
+    let mut object = section_diff_object(&logical, &page)?;
+    object.insert("source_id".to_owned(), json!(source));
+    Ok(Json(Value::Object(object)))
+}
+
+/// `GET /v1/sections/batch/diff?source&from&to&names=a,b,c` — diffs for several
+/// sections over one window, each keyed by name.
+///
+/// One decode of each overlapping segment serves every requested section, so a
+/// multi-metric diff costs one segment pass, not one per section. An unknown name
+/// fails the whole request.
+pub(crate) async fn sections_batch_diff(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ErrorResponse> {
+    let source = parse_u64(&params, "source")?;
+    let from = parse_i64(&params, "from")?;
+    let to = parse_i64(&params, "to")?;
+    let raw = params
+        .get("names")
+        .ok_or_else(|| bad_request("missing query parameter `names`"))?;
+    let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
+    if names.is_empty() {
+        return Err(bad_request("`names` must list at least one section"));
+    }
+    let logicals: Vec<LogicalSection> = names
+        .iter()
+        .map(|&name| {
+            logical_section(name)
+                .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.to_owned())))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut snap = state.snapshot.load().as_ref().clone();
+    let cursors = BTreeMap::new();
+    let pages = query_sections(&mut snap, source, from, to, &names, DIFF_MAX_ROWS, &cursors)
+        .map_err(|err| query_error_response(&err))?;
+
+    let mut out = serde_json::Map::new();
+    for (logical, &name) in logicals.iter().zip(&names) {
+        let page = pages
+            .get(name)
+            .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.to_owned())))?;
+        out.insert(
+            name.to_owned(),
+            Value::Object(section_diff_object(logical, page)?),
+        );
+    }
+    Ok(Json(Value::Object(out)))
 }
