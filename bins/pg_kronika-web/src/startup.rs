@@ -21,7 +21,9 @@ pub(crate) fn metric_labels(method: &str, matched_path: Option<&str>) -> (String
         Some("/v1/sections") => "/v1/sections",
         Some("/v1/segments") => "/v1/segments",
         Some("/v1/section/{name}") => "/v1/section/{name}",
+        Some("/v1/section/{name}/diff") => "/v1/section/{name}/diff",
         Some("/v1/sections/batch") => "/v1/sections/batch",
+        Some("/v1/sections/batch/diff") => "/v1/sections/batch/diff",
         _ => "other",
     };
     (method.to_owned(), path)
