@@ -22,7 +22,7 @@ use crate::serialize::{
 
 /// Cap on rows read for one diff response; a wider window is rejected so a
 /// single request cannot pull an unbounded section into memory.
-const DIFF_MAX_ROWS: usize = 262_144;
+pub(crate) const DIFF_MAX_ROWS: usize = 262_144;
 
 /// `GET /v1/version` — the API and container format versions this build serves.
 ///

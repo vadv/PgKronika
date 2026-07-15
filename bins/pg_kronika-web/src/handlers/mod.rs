@@ -1,3 +1,4 @@
+pub(crate) mod anomalies;
 pub(crate) mod metrics;
 pub(crate) mod probes;
 pub(crate) mod static_;

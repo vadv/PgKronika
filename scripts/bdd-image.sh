@@ -25,6 +25,7 @@ BDD_RUNTIME_KEY_PATHS=(
   'crates/*/src/**'
   'crates/*/benches/**'
   'bins/*/src/**'
+  'bins/*/benches/**'
   'bins/*/static/**'
   'crates/kronika-bdd/features/**'
 )

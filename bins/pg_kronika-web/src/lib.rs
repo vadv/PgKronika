@@ -32,6 +32,12 @@ use tower_http as _;
 use tracing as _;
 use tracing_subscriber as _;
 
+// criterion is used only by the `anomalies` bench; anchored for the
+// `unused_crate_dependencies` lint, which checks each target separately.
+#[cfg(test)]
+use criterion as _;
+
+mod anomaly;
 mod auth;
 pub(crate) mod handlers;
 mod params;
@@ -160,6 +166,7 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
 
     let mut protected = Router::new()
         .route("/v1/version", get(handlers::v1::version))
+        .route("/v1/anomalies", get(handlers::anomalies::anomalies))
         .route("/v1/sources", get(handlers::v1::sources))
         .route("/v1/sections", get(handlers::v1::sections))
         .route("/v1/segments", get(handlers::v1::segments))
@@ -546,6 +553,110 @@ mod tests {
             ] }),
             "repeated type_ids of one name sum their rows; sections order by name"
         );
+    }
+
+    /// Forty archiver snapshots a minute apart: the counter climbs by one per
+    /// minute except minutes 20..25, where it climbs by fifty — a rate spike
+    /// against a calm reference. Returns the last snapshot time.
+    fn write_archiver_spike_segment(dir: &std::path::Path) -> i64 {
+        const MINUTE: i64 = 60 * 1_000_000;
+        let mut rows = Vec::new();
+        let mut count = 0;
+        for minute in 0..40 {
+            count += if (20..25).contains(&minute) { 50 } else { 1 };
+            rows.push(archiver_row(minute * MINUTE, count));
+        }
+        let to = 39 * MINUTE;
+        let body = PgStatArchiver::encode(&rows).expect("encode archiver");
+        let bytes = build_part(
+            &[SectionInput {
+                type_id: 1_008_001,
+                rows: 40,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: 0,
+                max_ts: to,
+                source_id: 7,
+            },
+        );
+        std::fs::write(dir.join("0.pgm"), &bytes).expect("write segment");
+        to
+    }
+
+    #[tokio::test]
+    async fn anomalies_rank_the_archiver_spike_first_and_count_honestly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let to = write_archiver_spike_segment(dir.path());
+
+        let uri = format!("/v1/anomalies?source=7&from=0&to={to}&window=6m&step=2m");
+        let (status, body) = serve(dir.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "anomalies responds 200");
+
+        let episodes = body["episodes"].as_array().expect("episodes is an array");
+        assert!(!episodes.is_empty(), "the spike must surface as an episode");
+        let top = &episodes[0];
+        assert_eq!(top["section"], "pg_stat_archiver");
+        assert_eq!(top["column"], "archived_count");
+        assert_eq!(top["direction"], "up");
+        assert_eq!(top["series"], serde_json::json!({}), "singleton series");
+        assert!(
+            top["peak"]["m"].as_f64().expect("m is a number") > 3.5,
+            "the peak clears the default threshold"
+        );
+
+        let counters = &body["sections"]["pg_stat_archiver"];
+        assert_eq!(counters["series_total"], 1);
+        assert!(counters["evaluated"].as_u64().expect("evaluated") > 0);
+        // Two cumulative columns contribute one honest FirstPoint each; the
+        // three all-NULL gauge columns skip every one of the 40 rows.
+        assert_eq!(counters["nodata_points"], 2 + 3 * 40);
+        assert_eq!(body["skipped"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn anomalies_scan_every_scannable_section_without_a_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let to = write_archiver_spike_segment(dir.path());
+
+        let uri = format!("/v1/anomalies?source=7&from=0&to={to}&window=6m");
+        let (_status, body) = serve(dir.path(), &uri).await;
+        let sections = body["sections"].as_object().expect("sections object");
+        assert!(
+            sections.len() > 1,
+            "an unfiltered scan reports counters for every scannable section"
+        );
+        assert!(sections.contains_key("pg_stat_archiver"));
+    }
+
+    #[tokio::test]
+    async fn anomalies_reject_degenerate_parameters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+
+        for uri in [
+            // window wider than the period
+            "/v1/anomalies?source=7&from=0&to=1000&window=1h",
+            // from at/after to
+            "/v1/anomalies?source=7&from=5&to=5",
+            // malformed knobs
+            "/v1/anomalies?source=7&from=0&to=9000000000&window=0s",
+            "/v1/anomalies?source=7&from=0&to=9000000000&threshold=-1",
+            "/v1/anomalies?source=7&from=0&to=9000000000&eps_rel=NaN",
+            // a huge period over a tiny step: the position cap must reject it
+            // before anything allocates
+            "/v1/anomalies?source=7&from=0&to=900000000000000000&window=1h&step=1s",
+        ] {
+            let (status, _body) = serve(dir.path(), uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be rejected");
+        }
+
+        let (status, _body) = serve(
+            dir.path(),
+            "/v1/anomalies?source=7&from=0&to=9000000000&section=nope",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is a 404");
     }
 
     #[tokio::test]
