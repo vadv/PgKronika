@@ -60,8 +60,8 @@ pub(crate) struct ScanCounts {
     pub all_no_data: u64,
     /// Positions rejected on a NaN or infinite input value.
     pub non_finite: u64,
-    /// Diff points carrying no value (reset/gap/first point) plus gauge rows
-    /// whose value was NULL or non-numeric.
+    /// Diff points carrying no value (reset/gap/first point) or a non-finite
+    /// rate, plus gauge rows whose value was NULL, non-numeric, or non-finite.
     pub nodata_points: u64,
 }
 
@@ -168,11 +168,13 @@ pub(crate) fn scan_section(
             value_buf.clear();
             for at in &column.points {
                 match at.point {
-                    DiffPoint::Value { rate, .. } => {
+                    DiffPoint::Value { rate, .. } if rate.is_finite() => {
                         ts_buf.push(at.ts);
                         value_buf.push(rate);
                     }
-                    DiffPoint::NoData { .. } => counts.nodata_points += 1,
+                    // NoData, and a non-finite rate: filtered at the point so
+                    // one bad value cannot poison the whole series' reference.
+                    _ => counts.nodata_points += 1,
                 }
             }
             scan_timeline(
@@ -405,6 +407,45 @@ mod tests {
             ranked[0].1.key,
             vec![Value::I64(2)],
             "the stronger spike ranks first"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_rate_is_one_nodata_point_not_a_blinded_series() {
+        use kronika_reader::{ColumnDiff, DiffAt, DiffPoint, Scalar, SeriesDiff};
+        // A cumulative series whose rates are finite except one NaN. The bad
+        // point must cost one nodata point, not turn every position NonFinite
+        // (which would silently hide a real spike elsewhere in the column).
+        let points: Vec<DiffAt> = (0..40_i64)
+            .map(|i| {
+                let rate = if i == 5 { f64::NAN } else { 10.0 };
+                DiffAt {
+                    ts: i * 60 * SEC,
+                    point: DiffPoint::Value {
+                        delta: Scalar::Float(rate),
+                        rate,
+                        dt_micros: 60 * SEC,
+                    },
+                }
+            })
+            .collect();
+        let diffs = vec![SeriesDiff {
+            key: vec![Value::I64(1)],
+            columns: vec![ColumnDiff {
+                name: "c".to_owned(),
+                points,
+            }],
+        }];
+        let to = 39 * 60 * SEC;
+        let (_, counts) = scan_section(&diffs, &[], &params(0, to, 10 * 60 * SEC, 5 * 60 * SEC));
+        assert_eq!(
+            counts.nodata_points, 1,
+            "the non-finite rate is one nodata point"
+        );
+        assert!(counts.evaluated > 0, "the rest of the series still scores");
+        assert_eq!(
+            counts.non_finite, 0,
+            "no position is blinded by the bad point"
         );
     }
 

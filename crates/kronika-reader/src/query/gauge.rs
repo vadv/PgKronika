@@ -14,7 +14,7 @@ pub struct ColumnValues {
     pub name: String,
     /// `(ts, value)` in snapshot-time order.
     pub points: Vec<(i64, f64)>,
-    /// Rows whose value was NULL or non-numeric and left no point.
+    /// Rows whose value was NULL, non-numeric, or non-finite and left no point.
     pub skipped: usize,
 }
 
@@ -31,8 +31,8 @@ pub struct SeriesValues {
 ///
 /// `rows` may arrive in any order; each must carry a `ts` column plus the
 /// named identity columns. Series are returned in identity order. Integers,
-/// floats, booleans (as 0/1), and timestamps (as microseconds) become points;
-/// NULL and non-numeric values are counted in `skipped`.
+/// finite floats, booleans (as 0/1), and timestamps (as microseconds) become
+/// points; NULL, non-numeric, and non-finite values are counted in `skipped`.
 #[must_use]
 pub fn gauge_section(identity: &[&str], gauges: &[&str], rows: &[OutRow]) -> Vec<SeriesValues> {
     group_series(identity, rows)
@@ -56,7 +56,15 @@ const fn numeric(value: &Value) -> Option<f64> {
     match value {
         Value::I64(v) | Value::Ts(v) => Some(*v as f64),
         Value::U64(v) => Some(*v as f64),
-        Value::F64(v) => Some(*v),
+        // A non-finite reading is dropped like a NULL: scoring it would poison
+        // the whole series' reference, so it is counted as skipped, not a point.
+        Value::F64(v) => {
+            if v.is_finite() {
+                Some(*v)
+            } else {
+                None
+            }
+        }
         Value::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
         Value::Null | Value::Str(_) | Value::Blob { .. } | Value::ListI32(_) => None,
     }
@@ -116,6 +124,20 @@ mod tests {
         let out = gauge_section(&["id"], &["g"], &rows);
         assert_eq!(out[0].columns[0].points, vec![(20, 2.5)]);
         assert_eq!(out[0].columns[0].skipped, 2);
+    }
+
+    #[test]
+    fn non_finite_float_values_are_skipped_not_scored() {
+        // A NaN or infinite gauge reading must leave no point: scoring it would
+        // poison the whole series' reference for every window position.
+        let rows = vec![
+            row(0, 1, Value::F64(f64::NAN)),
+            row(10, 1, Value::F64(f64::INFINITY)),
+            row(20, 1, Value::F64(2.5)),
+        ];
+        let out = gauge_section(&["id"], &["g"], &rows);
+        assert_eq!(out[0].columns[0].points, vec![(20, 2.5)]);
+        assert_eq!(out[0].columns[0].skipped, 2, "NaN and inf leave no point");
     }
 
     #[test]
