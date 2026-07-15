@@ -105,6 +105,7 @@
             fileset = pkgs.lib.fileset.unions [
               (craneLib.fileset.commonCargoSources ./.)
               (pkgs.lib.fileset.maybeMissing ./crates/kronika-reader/benches)
+              (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/benches)
               (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/static)
             ];
           };

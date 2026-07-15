@@ -46,7 +46,68 @@ pub(crate) fn parse_i64(
 pub(crate) fn parse_limit(
     params: &std::collections::HashMap<String, String>,
 ) -> Result<usize, (StatusCode, Json<Value>)> {
-    params.get("limit").map_or(Ok(DEFAULT_LIMIT), |raw| {
+    parse_limit_default(params, DEFAULT_LIMIT)
+}
+
+/// Parse an optional duration parameter into microseconds: `250ms`, `90s`,
+/// `15m`, `2h`, or a bare number of seconds. Absent → `default_us`; zero,
+/// negative, or overflowing → `400`.
+pub(crate) fn parse_duration_us(
+    params: &std::collections::HashMap<String, String>,
+    key: &str,
+    default_us: i64,
+) -> Result<i64, (StatusCode, Json<Value>)> {
+    params.get(key).map_or(Ok(default_us), |raw| {
+        duration_us(raw).ok_or_else(|| {
+            bad_request(&format!(
+                "`{key}` must be a positive duration like `250ms`, `90s`, `15m`, or `2h`"
+            ))
+        })
+    })
+}
+
+/// A duration literal as microseconds, `None` when malformed or non-positive.
+fn duration_us(raw: &str) -> Option<i64> {
+    let suffixed =
+        |suffix: &str, scale: i64| raw.strip_suffix(suffix).map(|digits| (digits, scale));
+    // `ms` before `s`: a millisecond literal also ends in `s`.
+    let (digits, scale) = suffixed("ms", 1_000)
+        .or_else(|| suffixed("s", 1_000_000))
+        .or_else(|| suffixed("m", 60 * 1_000_000))
+        .or_else(|| suffixed("h", 3_600 * 1_000_000))
+        .unwrap_or((raw, 1_000_000));
+    let seconds: i64 = digits.parse().ok()?;
+    if seconds <= 0 {
+        return None;
+    }
+    seconds.checked_mul(scale)
+}
+
+/// Parse an optional float parameter; absent → `default`. Non-finite and
+/// negative values are rejected: every caller's knob (a sigma threshold, a
+/// relative floor) is meaningless below zero.
+pub(crate) fn parse_f64_non_negative(
+    params: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: f64,
+) -> Result<f64, (StatusCode, Json<Value>)> {
+    params
+        .get(key)
+        .map_or(Ok(default), |raw| match raw.parse::<f64>() {
+            Ok(value) if value.is_finite() && value >= 0.0 => Ok(value),
+            _ => Err(bad_request(&format!(
+                "`{key}` must be a non-negative finite number"
+            ))),
+        })
+}
+
+/// Parse the optional `limit` with a caller-chosen default, clamped to
+/// [`MAX_LIMIT`]; unparseable → `400`.
+pub(crate) fn parse_limit_default(
+    params: &std::collections::HashMap<String, String>,
+    default: usize,
+) -> Result<usize, (StatusCode, Json<Value>)> {
+    params.get("limit").map_or(Ok(default), |raw| {
         raw.parse::<usize>()
             .map(|limit| limit.min(MAX_LIMIT))
             .map_err(|_err| bad_request("`limit` must be a non-negative integer"))
@@ -85,7 +146,53 @@ pub(crate) fn query_error_response(err: &QueryError) -> (StatusCode, Json<Value>
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_LIMIT, MAX_LIMIT, parse_limit};
+    use super::{DEFAULT_LIMIT, MAX_LIMIT, duration_us, parse_f64_non_negative, parse_limit};
+
+    #[test]
+    fn durations_parse_with_suffixes_and_reject_degenerate_values() {
+        assert_eq!(duration_us("250ms"), Some(250 * 1_000));
+        assert_eq!(duration_us("90s"), Some(90 * 1_000_000));
+        assert_eq!(duration_us("15m"), Some(15 * 60 * 1_000_000));
+        assert_eq!(duration_us("2h"), Some(2 * 3_600 * 1_000_000));
+        assert_eq!(duration_us("45"), Some(45 * 1_000_000), "bare seconds");
+        for bad in [
+            "0s",
+            "0ms",
+            "-5m",
+            "",
+            "m",
+            "ms",
+            "1.5h",
+            "1d",
+            "999999999999999999h",
+        ] {
+            assert_eq!(duration_us(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn floats_default_when_absent_and_reject_non_finite_or_negative() {
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            parse_f64_non_negative(&empty, "threshold", 3.5).ok(),
+            Some(3.5)
+        );
+
+        let ok = std::collections::HashMap::from([("threshold".to_owned(), "2.0".to_owned())]);
+        assert_eq!(
+            parse_f64_non_negative(&ok, "threshold", 3.5).ok(),
+            Some(2.0)
+        );
+
+        for bad in ["-1", "NaN", "inf", "abc"] {
+            let params =
+                std::collections::HashMap::from([("threshold".to_owned(), bad.to_owned())]);
+            assert!(
+                parse_f64_non_negative(&params, "threshold", 3.5).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn parse_limit_defaults_caps_and_rejects() {
