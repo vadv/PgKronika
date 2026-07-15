@@ -1320,6 +1320,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kronika-anomaly"
+version = "0.0.0"
+
+[[package]]
 name = "kronika-bdd"
 version = "0.0.0"
 dependencies = [

@@ -10,6 +10,7 @@ members = [
     "crates/kronika-store-s3",
     "crates/kronika-reader",
     "crates/kronika-diff",
+    "crates/kronika-anomaly",
     "crates/kronika-charts",
     "crates/kronika-source-pg",
     "crates/kronika-source-os",

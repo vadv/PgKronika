@@ -1,0 +1,14 @@
+[package]
+name = "kronika-anomaly"
+description = "Spike scoring over derivative series: robust window score and episode folding"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
