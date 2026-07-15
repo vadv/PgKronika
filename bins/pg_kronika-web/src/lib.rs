@@ -166,6 +166,10 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
         .route("/v1/section/{name}", get(handlers::v1::section_data))
         .route("/v1/section/{name}/diff", get(handlers::v1::section_diff))
         .route("/v1/sections/batch", get(handlers::v1::sections_batch))
+        .route(
+            "/v1/sections/batch/diff",
+            get(handlers::v1::sections_batch_diff),
+        )
         .fallback(handlers::static_::static_handler);
     if let Some(cfg) = auth {
         // `layer`, not `route_layer`: auth must also cover the static fallback,
@@ -310,6 +314,28 @@ mod tests {
             "identity resolves as the union of the section's versions"
         );
         assert_eq!(body["series"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn batch_diff_serves_each_requested_section_keyed_by_name() {
+        // The fixture holds no rows for either section, so the series are empty —
+        // but the batch route, name resolution, and per-name shape are exercised.
+        let (_dir, status, body) = fixture_response(
+            "/v1/sections/batch/diff?source=7&from=0&to=9000&names=pg_stat_wal,pg_stat_io",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["pg_stat_wal"]["section"], "pg_stat_wal");
+        assert_eq!(body["pg_stat_wal"]["series"], serde_json::json!([]));
+        assert_eq!(body["pg_stat_io"]["section"], "pg_stat_io");
+        assert_eq!(body["pg_stat_io"]["series"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn batch_diff_rejects_a_missing_names_parameter() {
+        let (_dir, status, _body) =
+            fixture_response("/v1/sections/batch/diff?source=7&from=0&to=9000").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
