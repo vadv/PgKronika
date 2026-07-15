@@ -78,6 +78,9 @@ pub enum NotEvaluatedReason {
     CurTooSmall,
     /// Both the window and the reference are empty.
     AllNoData,
+    /// A window or reference value is `NaN` or infinity. Scoring it would
+    /// silently misclassify corrupt data as a verdict, so it is not scored.
+    NonFinite,
 }
 
 /// Outcome of scoring one window.
@@ -95,8 +98,10 @@ const MAD_TO_SIGMA: f64 = 1.4826;
 
 /// Score `cur` against `ref_` with the modified z-score.
 ///
-/// Inputs must be finite; derivative and gauge values from the read path
-/// satisfy this by construction. Deterministic: same inputs, same output.
+/// A window or reference carrying a non-finite value is reported as
+/// [`NotEvaluatedReason::NonFinite`] rather than scored: a `NaN` would otherwise
+/// pass through the median as a `Flat` verdict and drop out of episodes
+/// silently. Deterministic: same inputs, same output.
 #[must_use]
 pub fn score_window(cur: &[f64], ref_: &[f64], params: &ScoreParams) -> Scored {
     if cur.is_empty() && ref_.is_empty() {
@@ -107,6 +112,9 @@ pub fn score_window(cur: &[f64], ref_: &[f64], params: &ScoreParams) -> Scored {
     }
     if cur.len() < params.min_cur {
         return Scored::NotEvaluated(NotEvaluatedReason::CurTooSmall);
+    }
+    if !cur.iter().all(|v| v.is_finite()) || !ref_.iter().all(|v| v.is_finite()) {
+        return Scored::NotEvaluated(NotEvaluatedReason::NonFinite);
     }
 
     let ref_median = median(ref_);
@@ -260,6 +268,32 @@ mod tests {
         let cur = vec![2.0, 2.0, 2.0];
         let e = evaluated(score_window(&cur, &refs, &params));
         assert!((e.sigma_used - 1.0).abs() < 1e-12, "absolute floor 1.0");
+    }
+
+    #[test]
+    fn non_finite_input_is_reported_not_silently_scored() {
+        let refs = calm_ref(10.0, 40);
+        // A NaN in the window would median-through to a NaN score, then read as
+        // Flat and vanish from episodes; instead it must surface as NonFinite.
+        let cur_nan = vec![50.0, f64::NAN, 51.0];
+        assert_eq!(
+            score_window(&cur_nan, &refs, &ScoreParams::default()),
+            Scored::NotEvaluated(NotEvaluatedReason::NonFinite)
+        );
+        // The sign bit of NaN must not change the outcome (total_cmp orders
+        // +NaN and -NaN differently, so both are checked).
+        let cur_neg_nan = vec![-f64::NAN, 1.0, 2.0];
+        assert_eq!(
+            score_window(&cur_neg_nan, &refs, &ScoreParams::default()),
+            Scored::NotEvaluated(NotEvaluatedReason::NonFinite)
+        );
+        // Infinity in the reference.
+        let mut ref_inf = calm_ref(10.0, 40);
+        ref_inf[0] = f64::INFINITY;
+        assert_eq!(
+            score_window(&[10.0, 10.0, 10.0], &ref_inf, &ScoreParams::default()),
+            Scored::NotEvaluated(NotEvaluatedReason::NonFinite)
+        );
     }
 
     #[test]
