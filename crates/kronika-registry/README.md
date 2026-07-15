@@ -45,6 +45,10 @@ construction, and external crates cannot create one.
 - `Label` — identity or an attribute of the entity;
 - `Timestamp` — `i64` unix microseconds.
 
+The scorable classes (`Cumulative`, `Gauge`) also declare `eps_abs` — the
+absolute floor of the anomaly-score scale (`ColumnClass::eps_abs`); `Label`
+and `Timestamp` columns are never scored and declare none.
+
 `ColumnType` is the on-disk value type: the integer and float base types
 (`I8`…`I64`, `U8`…`U64`, `F32`/`F64`), `Bool`, `Ts` (an `i64` timestamp), and
 `StrId` (a `u64` reference into the segment string dictionary — the bytes live
@@ -63,7 +67,9 @@ span a contract or the whole registry:
 - two contracts that share a `type_id` (ids are never reused);
 - a sort-key name that is not a column;
 - a `Changed` type with no `is_baseline` column;
-- a `Timestamp`-class column that is not the required non-nullable `ts`.
+- a `Timestamp`-class column that is not the required non-nullable `ts`;
+- an identity name that is not a column, or names a non-`Label` column;
+- a column-class `eps_abs` declaration that is not positive and finite.
 
 ## Snapshot Sections
 

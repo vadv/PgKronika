@@ -23,6 +23,23 @@ pub enum ColumnClass {
     Timestamp,
 }
 
+impl ColumnClass {
+    /// Every column class, for exhaustive registry lints.
+    pub const ALL: [Self; 4] = [Self::Cumulative, Self::Gauge, Self::Label, Self::Timestamp];
+
+    /// Absolute floor for the anomaly-score scale: `Some` only for scorable
+    /// classes (Cumulative in rate units/s, Gauge in raw units). Calibrated,
+    /// not literature: below any real one-event-per-day rate (~1.2e-5/s),
+    /// above f64 noise of integer-derived series.
+    #[must_use]
+    pub const fn eps_abs(self) -> Option<f64> {
+        match self {
+            Self::Cumulative | Self::Gauge => Some(1e-6),
+            Self::Label | Self::Timestamp => None,
+        }
+    }
+}
+
 /// The on-disk type of a column value.
 ///
 /// The set is the base types of the registry: a column uses the narrowest
@@ -190,6 +207,12 @@ pub enum LintError {
         /// The identity name whose column is not a `Label`.
         column: &'static str,
     },
+    /// A column class declares an `eps_abs` that is not positive and finite.
+    /// Zero or negative collapses the score scale; `NaN` poisons every score.
+    BadEpsAbs {
+        /// The class whose declaration failed validation.
+        class: ColumnClass,
+    },
 }
 
 impl fmt::Display for LintError {
@@ -226,6 +249,12 @@ impl fmt::Display for LintError {
                 write!(
                     f,
                     "type_id {type_id} identity uses {column:?}, which is not a Label column"
+                )
+            }
+            Self::BadEpsAbs { class } => {
+                write!(
+                    f,
+                    "column class {class:?} declares an eps_abs that is not positive and finite"
                 )
             }
         }
@@ -282,7 +311,17 @@ fn lint_contract(contract: &TypeContract, out: &mut Vec<LintError>) {
     }
 }
 
-/// Check every contract and the cross-type uniqueness of ids.
+/// Check one class's `eps_abs` declaration, appending findings to `out`.
+fn lint_eps_abs(class: ColumnClass, eps_abs: Option<f64>, out: &mut Vec<LintError>) {
+    if let Some(value) = eps_abs
+        && !(value.is_finite() && value > 0.0)
+    {
+        out.push(LintError::BadEpsAbs { class });
+    }
+}
+
+/// Check every contract, the cross-type uniqueness of ids, and the per-class
+/// `eps_abs` declarations.
 ///
 /// # Errors
 ///
@@ -290,6 +329,10 @@ fn lint_contract(contract: &TypeContract, out: &mut Vec<LintError>) {
 /// and a fully valid one both return `Ok`.
 pub fn lint(contracts: &[TypeContract]) -> Result<(), Vec<LintError>> {
     let mut out = Vec::new();
+
+    for class in ColumnClass::ALL {
+        lint_eps_abs(class, class.eps_abs(), &mut out);
+    }
 
     for (i, contract) in contracts.iter().enumerate() {
         lint_contract(contract, &mut out);
@@ -309,7 +352,9 @@ pub fn lint(contracts: &[TypeContract]) -> Result<(), Vec<LintError>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Column, ColumnClass, ColumnType, LintError, Semantics, TypeContract, lint};
+    use super::{
+        Column, ColumnClass, ColumnType, LintError, Semantics, TypeContract, lint, lint_eps_abs,
+    };
     use crate::TypeId;
 
     const TS: Column = Column {
@@ -345,6 +390,59 @@ mod tests {
     fn accepts_a_valid_contract() {
         let c = contract(1_006_001, &[TS, VALUE], &["ts"]);
         assert_eq!(lint(&[c]), Ok(()));
+    }
+
+    #[test]
+    fn all_enumerates_every_column_class() {
+        // Compile-time tripwire: a new `ColumnClass` variant fails this match,
+        // pointing whoever adds it at `ALL`, which must list the variant for
+        // `lint` to check its `eps_abs` declaration.
+        for class in ColumnClass::ALL {
+            match class {
+                ColumnClass::Cumulative
+                | ColumnClass::Gauge
+                | ColumnClass::Label
+                | ColumnClass::Timestamp => {}
+            }
+        }
+    }
+
+    #[test]
+    fn scorable_classes_declare_a_positive_finite_eps_abs() {
+        for class in [ColumnClass::Cumulative, ColumnClass::Gauge] {
+            let eps = class.eps_abs().expect("scorable class declares eps_abs");
+            assert!(eps.is_finite() && eps > 0.0, "{class:?}: {eps}");
+        }
+        assert_eq!(ColumnClass::Label.eps_abs(), None);
+        assert_eq!(ColumnClass::Timestamp.eps_abs(), None);
+    }
+
+    #[test]
+    fn lint_rejects_a_degenerate_eps_abs() {
+        // The registry constants are valid by construction, so the lint arm
+        // is exercised through the helper with injected values.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1e-6] {
+            let mut out = Vec::new();
+            lint_eps_abs(ColumnClass::Gauge, Some(bad), &mut out);
+            assert_eq!(
+                out,
+                vec![LintError::BadEpsAbs {
+                    class: ColumnClass::Gauge
+                }],
+                "eps_abs {bad} must be rejected"
+            );
+        }
+        let mut out = Vec::new();
+        lint_eps_abs(ColumnClass::Cumulative, Some(1e-6), &mut out);
+        lint_eps_abs(ColumnClass::Label, None, &mut out);
+        assert!(out.is_empty(), "valid and absent eps_abs pass");
+    }
+
+    #[test]
+    fn an_empty_registry_lints_clean() {
+        // Also pins the built-in per-class eps_abs declarations, which are
+        // linted regardless of the contract list.
+        assert_eq!(lint(&[]), Ok(()));
     }
 
     #[test]
