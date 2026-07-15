@@ -1,8 +1,11 @@
+use kronika_anomaly::Direction;
 use kronika_reader::{
     DiffAt, DiffPoint, OutRow, Reason, Scalar, SectionPage, SeriesDiff, Value as CellValue,
 };
 use kronika_registry::{ColumnClass, ColumnType, Semantics};
 use serde_json::{Value, json};
+
+use crate::anomaly::EpisodeHit;
 
 /// Map one reader [`CellValue`] to its JSON form (see the API contract).
 pub(crate) fn value_to_json(value: &CellValue) -> Value {
@@ -122,6 +125,44 @@ const fn reason_name(reason: Reason) -> &'static str {
         Reason::FirstPoint => "first_point",
         Reason::Anomaly => "anomaly",
         Reason::NotCollected => "not_collected",
+    }
+}
+
+/// Shape one ranked anomaly episode: the series it belongs to, the scored
+/// column, the episode interval, and every number behind the peak verdict.
+pub(crate) fn episode_to_json(section: &str, identity: &[&'static str], hit: &EpisodeHit) -> Value {
+    let series: serde_json::Map<String, Value> = identity
+        .iter()
+        .zip(&hit.key)
+        .map(|(name, value)| ((*name).to_owned(), value_to_json(value)))
+        .collect();
+    let peak = hit.episode.peak;
+    json!({
+        "section": section,
+        "series": series,
+        "column": hit.column,
+        "start": hit.episode.start,
+        "end": hit.episode.end,
+        "peak_ts": hit.episode.peak_ts,
+        "direction": direction_name(peak.dir),
+        "peak": {
+            "m": finite(peak.m),
+            "med_cur": finite(peak.med_cur),
+            "med_ref": finite(peak.med_ref),
+            "mad_ref": finite(peak.mad_ref),
+            "sigma_used": finite(peak.sigma_used),
+            "n_cur": peak.n_cur,
+            "n_ref": peak.n_ref,
+        },
+    })
+}
+
+/// Stable wire name for a deviation direction.
+const fn direction_name(dir: Direction) -> &'static str {
+    match dir {
+        Direction::Up => "up",
+        Direction::Down => "down",
+        Direction::Flat => "flat",
     }
 }
 

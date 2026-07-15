@@ -78,6 +78,50 @@ pub(crate) async fn only_source(dir: &Path) -> Result<u64> {
     }
 }
 
+/// The single source's id and time span, read through `/v1/sources`.
+pub(crate) async fn source_span(dir: &Path) -> Result<(u64, i64, i64)> {
+    let (status, body) = request(dir, "/v1/sources").await?;
+    anyhow::ensure!(status == 200, "/v1/sources returned status {status}");
+    let sources = body["sources"]
+        .as_array()
+        .context("`sources` is not an array")?;
+    let [source] = sources.as_slice() else {
+        bail!("expected exactly one source, got {}", sources.len());
+    };
+    Ok((
+        source["source_id"]
+            .as_u64()
+            .context("`source_id` is not a number")?,
+        source["min_ts"].as_i64().context("`min_ts` is not i64")?,
+        source["max_ts"].as_i64().context("`max_ts` is not i64")?,
+    ))
+}
+
+/// One section's diff over the whole period, for failure diagnostics.
+pub(crate) async fn section_diff(dir: &Path, name: &str, source: u64) -> Result<Value> {
+    let uri = format!(
+        "/v1/section/{name}/diff?source={source}&from={}&to={}",
+        i64::MIN,
+        i64::MAX,
+    );
+    let (status, body) = request(dir, &uri).await?;
+    anyhow::ensure!(
+        status == 200,
+        "/v1/section/{name}/diff returned status {status}: {body}"
+    );
+    Ok(body)
+}
+
+/// The `/v1/anomalies` response over the store in `dir`.
+pub(crate) async fn anomalies(dir: &Path, query: &str) -> Result<Value> {
+    let (status, body) = request(dir, &format!("/v1/anomalies?{query}")).await?;
+    anyhow::ensure!(
+        status == 200,
+        "/v1/anomalies returned status {status}: {body}"
+    );
+    Ok(body)
+}
+
 /// Fetch one section's page for `source` over the widest possible window.
 pub(crate) async fn section_page(dir: &Path, name: &str, source: u64) -> Result<Value> {
     let uri = format!(

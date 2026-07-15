@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kronika-anomaly = { path = "../../crates/kronika-anomaly" }
 kronika-reader = { path = "../../crates/kronika-reader" }
 kronika-registry = { path = "../../crates/kronika-registry" }
 axum = "0.8"
@@ -30,6 +31,11 @@ kronika-format = { path = "../../crates/kronika-format" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "anomalies"
+harness = false
 
 [lints]
 workspace = true

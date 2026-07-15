@@ -70,7 +70,7 @@ fn key_part(value: &Value) -> KeyPart {
     }
 }
 
-fn column<'a>(row: &'a OutRow, name: &str) -> Option<&'a Value> {
+pub(crate) fn column<'a>(row: &'a OutRow, name: &str) -> Option<&'a Value> {
     row.iter().find(|(n, _)| n.as_str() == name).map(|(_, v)| v)
 }
 
@@ -100,17 +100,14 @@ fn spans_gap(prev_ts: i64, cur_ts: i64, gaps: &[Gap]) -> bool {
     gaps.iter().any(|g| g.from < cur_ts && prev_ts < g.to)
 }
 
-/// Fold a page's rows into per-series, per-column diffs.
+/// One grouped series: its identity values and time-ordered `(ts, row)` pairs.
+pub(crate) type GroupedSeries<'a> = (Vec<Value>, Vec<(i64, &'a OutRow)>);
+
+/// Group a page's rows by identity and sort each group by snapshot time.
 ///
-/// `rows` may arrive in any order; each must carry a `ts` column plus the named
-/// identity and cumulative columns. Series are returned in identity order.
-#[must_use]
-pub fn diff_section(
-    identity: &[&str],
-    cumulative: &[&str],
-    rows: &[OutRow],
-    gaps: &[Gap],
-) -> Vec<SeriesDiff> {
+/// Returns `(identity values, time-ordered rows)` per series, in identity
+/// order. A row without a readable `ts` sorts first.
+pub(crate) fn group_series<'a>(identity: &[&str], rows: &'a [OutRow]) -> Vec<GroupedSeries<'a>> {
     let mut groups: BTreeMap<Vec<KeyPart>, Vec<usize>> = BTreeMap::new();
     for (i, row) in rows.iter().enumerate() {
         let key: Vec<KeyPart> = identity
@@ -133,17 +130,35 @@ pub fn diff_section(
             .map(|name| column(series[0].1, name).cloned().unwrap_or(Value::Null))
             .collect();
 
-        let columns = cumulative
-            .iter()
-            .map(|&name| ColumnDiff {
-                name: name.to_owned(),
-                points: fold_column(&series, name, gaps),
-            })
-            .collect();
-
-        out.push(SeriesDiff { key, columns });
+        out.push((key, series));
     }
     out
+}
+
+/// Fold a page's rows into per-series, per-column diffs.
+///
+/// `rows` may arrive in any order; each must carry a `ts` column plus the named
+/// identity and cumulative columns. Series are returned in identity order.
+#[must_use]
+pub fn diff_section(
+    identity: &[&str],
+    cumulative: &[&str],
+    rows: &[OutRow],
+    gaps: &[Gap],
+) -> Vec<SeriesDiff> {
+    group_series(identity, rows)
+        .into_iter()
+        .map(|(key, series)| {
+            let columns = cumulative
+                .iter()
+                .map(|&name| ColumnDiff {
+                    name: name.to_owned(),
+                    points: fold_column(&series, name, gaps),
+                })
+                .collect();
+            SeriesDiff { key, columns }
+        })
+        .collect()
 }
 
 fn fold_column(series: &[(i64, &OutRow)], name: &str, gaps: &[Gap]) -> Vec<DiffAt> {

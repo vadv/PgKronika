@@ -164,6 +164,7 @@ pub(crate) fn table(step: &Step) -> Result<&[Vec<String>]> {
         .context("step needs a `| column | value |` table")
 }
 mod activity;
+mod anomalies;
 mod collector;
 mod connection_pool;
 mod database;
