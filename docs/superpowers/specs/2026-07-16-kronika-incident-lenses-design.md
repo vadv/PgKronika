@@ -1,10 +1,13 @@
-# Контракт линз `kronika-incident`
+# Контракт линз incident-движка
 
 Дата: 2026-07-16.
 
+Workspace topology, ownership, resource model и migration contract заданы в
+[`2026-07-17-kronika-incident-implementation.md`](2026-07-17-kronika-incident-implementation.md).
+
 ## 1. Потолок атрибуции и форма результата
 
-`kronika-incident` объясняет совместно наблюдавшиеся аномалии за уже завершённый
+Incident-движок объясняет совместно наблюдавшиеся аномалии за уже завершённый
 период. Он не измеряет root cause. PgKronika не семплирует активные сессии и
 wait events с частотой ASH, поэтому не располагает аддитивным бюджетом DB time и
 не может приписать долю задержки конкретному запросу, ожиданию или ресурсу.
@@ -56,17 +59,19 @@ Finding {
   `io_in_progress`, `MemAvailable`. Gauge не дифференцируется.
 - **Cumulative counter** — накопительный счётчик: `calls`, `wal_bytes`, CPU
   ticks, `read_time_ms`. В линзу поступает только типизированный результат
-  `kronika-diff`, а не вычитание внутри правила.
+  `kronika-analytics::diff`, а не вычитание внутри правила.
 - **Derived value** — отношение или скорость, вычисленные только после
   получения честных дельт. Сначала считаются `delta(A)` и `delta(B)` на одном
   наборе интервалов, затем `sum(delta(A)) / sum(delta(B))`.
 - **Anomaly episode** — последовательность окон с аномальным score из
-  `kronika-anomaly`. Это кандидат для кластеризации, а не метрика и не причина.
+  `kronika-analytics::anomaly`. Это кандидат для кластеризации, а не метрика и
+  не причина.
 
 PostgreSQL-специфичные identity, версии, reset sources и GUC gates принадлежат
-`kronika-registry`. `kronika-diff` и `kronika-anomaly` остаются чистыми
-интерпретаторами контрактов. Каталог ниже должен жить в отдельном будущем слое
-`kronika-incident`; добавлять правила инцидентов в registry нельзя.
+`kronika-registry`. Модули `kronika-analytics::{diff, anomaly}` остаются чистыми
+интерпретаторами контрактов. В первом срезе каталог живёт в приватном domain-
+модуле `pg_kronika-web`; добавлять правила инцидентов в analytics или registry
+нельзя.
 
 ### 2.2. Data-quality contract
 
@@ -91,10 +96,13 @@ PostgreSQL-специфичные identity, версии, reset sources и GUC g
    дельта остаётся свидетельством фактически накопленного времени, но полнота
    измерения неизвестна.
 
-Timing-линзам нужен стабильный cross-section contract: registry объявляет
-row- и operation-aware `gated_by`, а diff возвращает `NotCollected`, если gate
-был выключен на интервале. Пока этот контракт не реализован, нулевые timing-
-колонки не участвуют в отрицательных выводах.
+Timing-линзы используют стабильный cross-section contract: registry объявляет
+row- и operation-aware `gated_by`, а reader возвращает `NotCollected`, если
+gate был выключен или неизвестен на интервале. Контракт реализован для
+`track_io_timing`/`track_wal_io_timing`, включая PG18 WAL row override.
+`track_planning` пока не имеет queryable gate и остаётся отдельным
+предусловием planning-веток. Нулевые timing-колонки не участвуют в отрицательных
+выводах, если полнота producer sessions не доказана.
 
 Ограничение gate глубже состояния collector session. `track_io_timing`,
 `track_wal_io_timing` и `pg_stat_statements.track_planning` могут меняться в
@@ -139,8 +147,9 @@ timestamps и durations в этом контракте — знаковые Unix
 арифметика checked. PostgreSQL snapshots используют server
 `statement_timestamp()`, OS/cgroup snapshots — wall clock коллектора, log event
 — разобранный server timestamp либо collection time. Общая epoch не доказывает
-синхронизацию часов. `kronika-anomaly` строит episodes с некаузальным reference
-из того же периода; такой результат нельзя использовать для push alerting.
+синхронизацию часов. `kronika-analytics::anomaly` строит episodes с некаузальным
+reference из того же периода; такой результат нельзя использовать для push
+alerting.
 
 Evaluation получает типизированный `IncidentConfig`:
 
@@ -176,8 +185,8 @@ evaluation этой линзы возвращает `skipped`, а не clamp. P/
 Численные product defaults, кроме `epsilon_us = step_us`, задаёт endpoint
 config; движок их не подменяет.
 
-Episodes сортируются по `(start_us, end_us, type_id, column, identity)`. Sweep-
-line объединяет следующий episode, если
+Episodes сортируются по `(start_us, end_us, logical_section, column, identity)`.
+Sweep-line объединяет следующий episode, если
 `next.start_us <= current_end_us + epsilon_us` и получившийся span не превышает
 `max_cluster_span_us`; иначе компонент закрывается. Разбиение по span
 возвращается в `data_quality`.
@@ -220,9 +229,10 @@ Findings сортируются по `(confidence desc, role_rank, lens_id, scop
 
 Идентичность incident задаёт полный `IncidentKeyV1`:
 `(node_self_id, incident_start_us, incident_end_us, sorted EpisodeRefV1[])`.
-`EpisodeRefV1` содержит `(type_id, column, registry identity key, start_us,
-end_us)`; identity values кодируются в порядке registry key с типом и длиной.
-Это стабильная API tuple, а не process-local hash. Если transport позже введёт
+`EpisodeRefV1` содержит `(logical_section, column, registry identity key,
+start_us, end_us)`; identity values кодируются в порядке registry key с типом и
+длиной. `type_id` отсутствует: union reader не сохраняет provenance layout. Это
+стабильная API tuple, а не process-local hash. Если transport позже введёт
 короткий opaque id, версия canonical encoding и hash algorithm становятся
 частью API; скрытый `DefaultHasher` недопустим.
 
@@ -263,25 +273,25 @@ series запрещены. Top-K findings поддерживается bounded h
    синглтоны дают пустой ключ = одну серию. Массовая разметка `identity()` не
    требуется; явный `identity()` остаётся override там, где sort_key шире
    сущности (statements).
-2. **NotCollected.** DQ timing-линз требует статус `NotCollected` при gate=off.
-   Свёртка diff сейчас выдаёт только `FirstPoint/Gap/Reset/Anomaly`; контракт
-   `gated_by`->`NotCollected` не реализован, а `pg_stat_statements.track_planning`
-   не собирается как поле. До этого контракта timing-ветки не строятся и их
-   нулевой timing не участвует в выводах: `PG-IO-011`, PG18-путь `PG-WAL-009`,
-   тайминги `PG-TEMP-003`, planning-ветки `PG-QRY-001` и `PG-PLAN-002`.
-3. **type_id записки.** `kronika-anomaly` отдаёт эпизод как `(start, end, peak)`
-   без identity/column/type_id — их добавляет слой чтения. `EpisodeRefV1` и
-   сортировка кластеризации требуют `type_id`, поэтому ref строится из
-   обогащённого хита, а не из голого эпизода. Для логической секции поверх union
-   версий раскладки правило выбора `type_id` фиксируется реализацией
-   (рекомендуется раскладка последней точки серии), стабильно на всё окно.
+2. **NotCollected.** Registry/reader уже реализуют
+   `gated_by -> NotCollected` для `track_io_timing` и
+   `track_wal_io_timing`, включая PG18 row override и propagation в diff/anomaly
+   endpoints. Остаток — новый `reset_metadata` layout/`type_id` с queryable
+   `track_planning` и gates planning-колонок. Состояние collector session не
+   доказывает coverage всех producer sessions, поэтому измеренный ноль не даёт
+   отрицательного вывода даже при `gate=on`.
+3. **Без `type_id` в записке.** `kronika-analytics::anomaly` отдаёт эпизод как
+   `(start, end, peak)` без identity/column; их добавляет слой чтения. Union
+   сохраняет logical section, но теряет provenance конкретного layout, поэтому
+   `type_id` не восстанавливается best-effort и не входит в key/evidence/API.
 
 Детерминизм ключа и слияния:
 
 4. **Резолвинг StrId.** `node_self_id` и Label-колонки identity идут в ключ
-   резолвнутой UTF-8 строкой. Записка с нерезолвнутым `StrId` (dictionary gap ->
-   `Value::Null`) исключается из инцидента, а не кодируется как `Null`: иначе
-   одна сущность даёт разные ключи между процессами с разным охватом сегментов.
+   резолвнутой UTF-8 строкой. Текущий `SectionPage` объединяет настоящий NULL,
+   отсутствующую layout-колонку и нерезолвнутый `StrId` в `Value::Null`.
+   Поэтому первый срез консервативно исключает любую записку с NULL в identity
+   как `identity_null_or_unresolved`, а не заявляет точный `dropped_unresolved`.
 5. **Слияние sweep-line.** При объединении
    `current_end_us := max(current_end_us, next.end_us)` — эпизоды не вложены;
    span считается до этого максимума.
@@ -298,9 +308,9 @@ series запрещены. Top-K findings поддерживается bounded h
    `lead`/`downstream` включаются только при известных периоде и clock domain;
    это осознанное сужение, не ошибка.
 
-Первый срез — линзы на работающем `diff_key` без зависимости от `gated_by` и
-period. Timing-зависимые (п. 2) и directional-зависимые (п. 8) — второй срез,
-после соответствующих предусловий.
+Первый срез использует работающие `diff_key` и I/O `gated_by`, но не зависит от
+period/clock. Planning-зависимые ветки (п. 2) и temporal directional-роли
+(п. 8) остаются dormant до соответствующих предусловий.
 
 ## 4. Каталог PostgreSQL
 
@@ -583,6 +593,9 @@ period. Timing-зависимые (п. 2) и directional-зависимые (п.
   означает empty только при успешном conditional collection. PostgreSQL
   подтверждает, что prepared transaction продолжает держать locks и мешает
   VACUUM: [PREPARE TRANSACTION](https://www.postgresql.org/docs/18/sql-prepare-transaction.html).
+  В первом срезе horizon и relation dead tuples остаются
+  `coincident`/`amplifier`: directional edge разрешается только после
+  relation-level entity join и P/I/D clock contract.
 
 ### `PG-CONN-014` — connection и transaction pressure
 
@@ -637,7 +650,7 @@ period. Timing-зависимые (п. 2) и directional-зависимые (п.
   `max_slot_wal_keep_size`.
 - **Расчёт и время:** repeated retained-bytes gauge и его slope по реальным
   timestamps; inactive/`extended|unreserved|lost` усиливают finding. Не
-  вычитать gauge через `kronika-diff`.
+  вычитать gauge через `kronika-analytics::diff`.
 - **Cap и альтернативы:** ожидаемый consumer outage, logical decoding backlog,
   intentional unlimited retention. `active=false` сам по себе не дефект.
 - **Показать:** slot/type/plugin, active, both LSN, retained bytes/trend,
