@@ -82,10 +82,10 @@ pub struct PgStatDatabaseV4 {
     #[column(c)]
     pub deadlocks: i64,
     /// Time spent reading blocks, ms; zero without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_read_time: f64,
     /// Time spent writing blocks, ms; zero without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_write_time: f64,
     /// Time of the last statistics reset for this database; `None` if never.
     #[column(g)]
@@ -204,10 +204,10 @@ pub struct PgStatDatabaseV3 {
     #[column(c)]
     pub deadlocks: i64,
     /// Time spent reading blocks, ms; zero without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_read_time: f64,
     /// Time spent writing blocks, ms; zero without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_write_time: f64,
     /// Time of the last statistics reset for this database; `None` if never.
     #[column(g)]
@@ -320,10 +320,10 @@ pub struct PgStatDatabaseV2 {
     #[column(c)]
     pub deadlocks: i64,
     /// Time spent reading blocks, ms; zero without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_read_time: f64,
     /// Time spent writing blocks, ms; zero without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_write_time: f64,
     /// Time of the last statistics reset for this database; `None` if never.
     #[column(g)]
@@ -415,10 +415,10 @@ pub struct PgStatDatabaseV1 {
     #[column(c)]
     pub deadlocks: i64,
     /// Time spent reading blocks, ms; zero without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_read_time: f64,
     /// Time spent writing blocks, ms; zero without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_write_time: f64,
     /// Time of the last statistics reset for this database; `None` if never.
     #[column(g)]

@@ -4,8 +4,8 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use kronika_reader::{
-    LogicalSection, QueryError, SectionPage, diff_section, logical_section, section,
-    sections as query_sections,
+    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, apply_gating, diff_section,
+    gate_readings, logical_section, section, sections as query_sections,
 };
 use kronika_registry::{
     ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
@@ -203,6 +203,69 @@ type ErrorResponse = (StatusCode, Json<Value>);
 /// One section's diff as a JSON object (`section`, `identity`, `series`).
 type DiffObject = serde_json::Map<String, Value>;
 
+/// Gate timelines for the request's gated columns, keyed by the gate's
+/// section and column names.
+///
+/// A gate section whose page is missing or truncated contributes no
+/// readings: an unknown gate state never rewrites a value (absence of
+/// knowledge is not evidence the GUC was off).
+pub(crate) struct Gates {
+    readings: BTreeMap<(&'static str, &'static str), Vec<GateReading>>,
+}
+
+impl Gates {
+    /// Names of the sections the logical sections' gates live in.
+    pub(crate) fn sections(logicals: &[LogicalSection]) -> Vec<&'static str> {
+        let mut names = std::collections::BTreeSet::new();
+        for logical in logicals {
+            for column in &logical.columns {
+                if let Some(gate) = column.gated_by {
+                    names.insert(gate.section);
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// Build the timelines the logical sections need from fetched pages.
+    pub(crate) fn from_pages(
+        logicals: &[LogicalSection],
+        pages: &BTreeMap<String, SectionPage>,
+    ) -> Self {
+        let mut readings = BTreeMap::new();
+        for logical in logicals {
+            for column in &logical.columns {
+                let Some(gate) = column.gated_by else {
+                    continue;
+                };
+                readings
+                    .entry((gate.section, gate.column))
+                    .or_insert_with(|| {
+                        pages
+                            .get(gate.section)
+                            .filter(|page| page.next_cursor.is_none())
+                            .map(|page| gate_readings(&page.rows, gate.column))
+                            .unwrap_or_default()
+                    });
+            }
+        }
+        Self { readings }
+    }
+
+    /// Rewrite the gated columns of one section's folded series.
+    pub(crate) fn apply(&self, logical: &LogicalSection, series: &mut [SeriesDiff]) {
+        for column in &logical.columns {
+            let Some(gate) = column.gated_by else {
+                continue;
+            };
+            let Some(readings) = self.readings.get(&(gate.section, gate.column)) else {
+                continue;
+            };
+            apply_gating(series, column.name, readings);
+        }
+    }
+}
+
 /// Fold one section's page into its diff JSON.
 ///
 /// The series key is the declared identity, or the sort key minus `ts` when a
@@ -211,6 +274,7 @@ type DiffObject = serde_json::Map<String, Value>;
 fn section_diff_object(
     logical: &LogicalSection,
     page: &SectionPage,
+    gates: &Gates,
 ) -> Result<DiffObject, ErrorResponse> {
     if page.next_cursor.is_some() {
         return Err(bad_request(
@@ -224,7 +288,8 @@ fn section_diff_object(
         .filter(|column| column.class == ColumnClass::Cumulative)
         .map(|column| column.name)
         .collect();
-    let series = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+    let mut series = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+    gates.apply(logical, &mut series);
     let mut object = serde_json::Map::new();
     object.insert("section".to_owned(), json!(logical.name));
     object.insert("identity".to_owned(), json!(identity));
@@ -251,8 +316,23 @@ pub(crate) async fn section_diff(
     let mut snap = state.snapshot.load().as_ref().clone();
     let page = section(&mut snap, &name, source, from, to, DIFF_MAX_ROWS, None)
         .map_err(|err| query_error_response(&err))?;
+    let mut gate_pages = BTreeMap::new();
+    for gate_section in Gates::sections(std::slice::from_ref(&logical)) {
+        let gate_page = section(
+            &mut snap,
+            gate_section,
+            source,
+            from,
+            to,
+            DIFF_MAX_ROWS,
+            None,
+        )
+        .map_err(|err| query_error_response(&err))?;
+        gate_pages.insert(gate_section.to_owned(), gate_page);
+    }
+    let gates = Gates::from_pages(std::slice::from_ref(&logical), &gate_pages);
 
-    let mut object = section_diff_object(&logical, &page)?;
+    let mut object = section_diff_object(&logical, &page, &gates)?;
     object.insert("source_id".to_owned(), json!(source));
     Ok(Json(Value::Object(object)))
 }
@@ -287,8 +367,25 @@ pub(crate) async fn sections_batch_diff(
 
     let mut snap = state.snapshot.load().as_ref().clone();
     let cursors = BTreeMap::new();
-    let pages = query_sections(&mut snap, source, from, to, &names, DIFF_MAX_ROWS, &cursors)
-        .map_err(|err| query_error_response(&err))?;
+    // Gate sections ride the same gather; requested names stay first so the
+    // response loop below only walks them.
+    let mut fetch_names = names.clone();
+    for gate_section in Gates::sections(&logicals) {
+        if !fetch_names.contains(&gate_section) {
+            fetch_names.push(gate_section);
+        }
+    }
+    let pages = query_sections(
+        &mut snap,
+        source,
+        from,
+        to,
+        &fetch_names,
+        DIFF_MAX_ROWS,
+        &cursors,
+    )
+    .map_err(|err| query_error_response(&err))?;
+    let gates = Gates::from_pages(&logicals, &pages);
 
     let mut out = serde_json::Map::new();
     for (logical, &name) in logicals.iter().zip(&names) {
@@ -297,7 +394,7 @@ pub(crate) async fn sections_batch_diff(
             .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.to_owned())))?;
         out.insert(
             name.to_owned(),
-            Value::Object(section_diff_object(logical, page)?),
+            Value::Object(section_diff_object(logical, page, &gates)?),
         );
     }
     Ok(Json(Value::Object(out)))

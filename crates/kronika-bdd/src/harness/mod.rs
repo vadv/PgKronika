@@ -76,6 +76,7 @@ pub(crate) fn test_row(pairs: &[(&'static str, kronika_registry::Cell)]) -> kron
     let columns: Vec<Column> = pairs
         .iter()
         .map(|(name, cell)| Column {
+            gated_by: None,
             name,
             ty: ty_for(cell),
             class: ColumnClass::Gauge,

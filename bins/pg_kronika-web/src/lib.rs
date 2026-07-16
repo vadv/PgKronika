@@ -204,6 +204,8 @@ mod tests {
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
+    use kronika_registry::pg_stat_database::PgStatDatabaseV1;
+    use kronika_registry::reset_metadata::ResetMetadata;
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
     use tower::ServiceExt;
 
@@ -627,6 +629,143 @@ mod tests {
             "an unfiltered scan reports counters for every scannable section"
         );
         assert!(sections.contains_key("pg_stat_archiver"));
+    }
+
+    /// One `pg_stat_database` row with climbing IO counters and timings.
+    fn db_row(ts: i64, tick: i32) -> PgStatDatabaseV1 {
+        PgStatDatabaseV1 {
+            ts: Ts(ts),
+            datid: 5,
+            datname: None,
+            numbackends: None,
+            xact_commit: i64::from(tick) * 10,
+            xact_rollback: 0,
+            blks_read: i64::from(tick) * 100,
+            blks_hit: i64::from(tick) * 1_000,
+            tup_returned: 0,
+            tup_fetched: 0,
+            tup_inserted: 0,
+            tup_updated: 0,
+            tup_deleted: 0,
+            conflicts: 0,
+            temp_files: 0,
+            temp_bytes: 0,
+            deadlocks: 0,
+            blk_read_time: 2.5 * f64::from(tick),
+            blk_write_time: 0.5 * f64::from(tick),
+            stats_reset: None,
+            frozen_xid_age: None,
+            min_mxid_age: None,
+            datconnlimit: None,
+            datallowconn: None,
+            datistemplate: None,
+        }
+    }
+
+    /// One `reset_metadata` row carrying the `track_io_timing` gate state.
+    fn reset_row(ts: i64, track_io_timing: Option<bool>) -> ResetMetadata {
+        ResetMetadata {
+            ts: Ts(ts),
+            postmaster_start_time: Ts(1),
+            pg_stat_database_reset_max_at: None,
+            pg_stat_statements_reset_at: None,
+            pg_store_plans_reset_at: None,
+            pg_stat_bgwriter_reset_at: None,
+            pg_stat_checkpointer_reset_at: None,
+            pg_stat_wal_reset_at: None,
+            pg_stat_archiver_reset_at: None,
+            pg_stat_io_reset_at: None,
+            ext_pg_stat_statements_version: None,
+            ext_pg_store_plans_version: None,
+            compute_query_id: None,
+            track_io_timing,
+            track_wal_io_timing: None,
+        }
+    }
+
+    /// Four snapshots of `pg_stat_database` with climbing timings, alongside
+    /// `reset_metadata` reading `track_io_timing = false` throughout.
+    fn write_gated_db_segment(dir: &std::path::Path) -> i64 {
+        const MINUTE: i64 = 60 * 1_000_000;
+        let rows: Vec<PgStatDatabaseV1> =
+            (0..4).map(|i| db_row(i64::from(i) * MINUTE, i)).collect();
+        let meta: Vec<ResetMetadata> = (0..4).map(|i| reset_row(i * MINUTE, Some(false))).collect();
+        let to = 3 * MINUTE;
+        let db_body = PgStatDatabaseV1::encode(&rows).expect("encode pg_stat_database");
+        let meta_body = ResetMetadata::encode(&meta).expect("encode reset_metadata");
+        let bytes = build_part(
+            &[
+                SectionInput {
+                    type_id: 1_005_001,
+                    rows: 4,
+                    body: &db_body,
+                },
+                SectionInput {
+                    type_id: 1_020_001,
+                    rows: 4,
+                    body: &meta_body,
+                },
+            ],
+            PartMeta {
+                min_ts: 0,
+                max_ts: to,
+                source_id: 7,
+            },
+        );
+        std::fs::write(dir.join("0.pgm"), &bytes).expect("write segment");
+        to
+    }
+
+    #[tokio::test]
+    async fn diff_reports_not_collected_while_track_io_timing_is_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let to = write_gated_db_segment(dir.path());
+
+        let uri = format!("/v1/section/pg_stat_database/diff?source=7&from=0&to={to}");
+        let (status, body) = serve(dir.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "diff responds 200");
+
+        let series = body["series"].as_array().expect("series array");
+        let db = series
+            .iter()
+            .find(|s| s["key"]["datid"] == 5)
+            .expect("datid 5 series present");
+
+        let timing = db["columns"]["blk_read_time"]
+            .as_array()
+            .expect("blk_read_time points");
+        assert!(
+            timing[1..]
+                .iter()
+                .all(|point| point["nodata"] == "not_collected"),
+            "timings measured under a disabled GUC must read not_collected: {timing:?}"
+        );
+
+        let blocks = db["columns"]["blks_read"]
+            .as_array()
+            .expect("blks_read points");
+        assert!(
+            blocks[1..].iter().all(|point| point["rate"].is_number()),
+            "an ungated counter keeps its rates: {blocks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anomalies_count_gated_timings_as_nodata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let to = write_gated_db_segment(dir.path());
+
+        let uri =
+            format!("/v1/anomalies?source=7&from=0&to={to}&window=1m&section=pg_stat_database");
+        let (status, body) = serve(dir.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "anomalies responds 200");
+        let counters = &body["sections"]["pg_stat_database"];
+        // Two gated columns contribute three rewritten pairs each on top of
+        // the per-column FirstPoint the ungated ones also carry.
+        assert!(
+            counters["nodata_points"].as_u64().expect("nodata_points") >= 6,
+            "gated pairs must land in nodata_points: {counters}"
+        );
     }
 
     #[tokio::test]

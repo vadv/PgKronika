@@ -20,7 +20,7 @@ use crate::params::{
 };
 use crate::serialize::episode_to_json;
 
-use super::v1::DIFF_MAX_ROWS;
+use super::v1::{DIFF_MAX_ROWS, Gates};
 
 /// Default window length: one hour.
 const WINDOW_DEFAULT_US: i64 = 3_600 * 1_000_000;
@@ -91,21 +91,20 @@ fn counts_to_json(counts: &ScanCounts) -> Value {
 /// raw readings; MAD units make peak `|m|` comparable across sections, so
 /// one ranked list serves the whole source. A section whose period exceeds
 /// the row cap lands in `skipped` and the rest of the scan proceeds.
-pub(crate) async fn anomalies(
-    State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ErrorResponse> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
+/// Parse and validate every scan knob of the request.
+fn parse_scan_params(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<(ScanParams, usize), ErrorResponse> {
+    let from = parse_i64(params, "from")?;
+    let to = parse_i64(params, "to")?;
     if from >= to {
         return Err(bad_request("`from` must be before `to`"));
     }
-    let window = parse_duration_us(&params, "window", WINDOW_DEFAULT_US)?;
-    let step = parse_duration_us(&params, "step", (window / 4).max(1))?;
-    let threshold = parse_f64_non_negative(&params, "threshold", THRESHOLD_DEFAULT)?;
-    let eps_rel = parse_f64_non_negative(&params, "eps_rel", EPS_REL_DEFAULT)?;
-    let limit = parse_limit_default(&params, LIMIT_DEFAULT)?;
+    let window = parse_duration_us(params, "window", WINDOW_DEFAULT_US)?;
+    let step = parse_duration_us(params, "step", (window / 4).max(1))?;
+    let threshold = parse_f64_non_negative(params, "threshold", THRESHOLD_DEFAULT)?;
+    let eps_rel = parse_f64_non_negative(params, "eps_rel", EPS_REL_DEFAULT)?;
+    let limit = parse_limit_default(params, LIMIT_DEFAULT)?;
     if from.checked_add(window).is_none_or(|first| first > to) {
         return Err(bad_request("`window` must fit inside [from, to]"));
     }
@@ -119,6 +118,27 @@ pub(crate) async fn anomalies(
              widen `step` or narrow [from, to]",
         ));
     }
+    Ok((
+        ScanParams {
+            from,
+            to,
+            window,
+            step,
+            threshold,
+            eps_rel,
+        },
+        limit,
+    ))
+}
+
+pub(crate) async fn anomalies(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ErrorResponse> {
+    let source = parse_u64(&params, "source")?;
+    let (scan, limit) = parse_scan_params(&params)?;
+    let (from, to) = (scan.from, scan.to);
+    let (window, step) = (scan.window, scan.step);
 
     let names: Vec<&'static str> = match params.get("section") {
         Some(name) => {
@@ -129,19 +149,29 @@ pub(crate) async fn anomalies(
         None => scannable_sections(),
     };
 
-    let scan = ScanParams {
-        from,
-        to,
-        window,
-        step,
-        threshold,
-        eps_rel,
-    };
+    // Gate sections ride the same gather even when a `section=` filter
+    // narrows the scan; only `names` feed the response loop below.
+    let logicals: Vec<LogicalSection> = names.iter().filter_map(|&n| logical_section(n)).collect();
+    let mut fetch_names = names.clone();
+    for gate_section in Gates::sections(&logicals) {
+        if !fetch_names.contains(&gate_section) {
+            fetch_names.push(gate_section);
+        }
+    }
 
     let mut snap = state.snapshot.load().as_ref().clone();
     let cursors = BTreeMap::new();
-    let pages = query_sections(&mut snap, source, from, to, &names, DIFF_MAX_ROWS, &cursors)
-        .map_err(|err| query_error_response(&err))?;
+    let pages = query_sections(
+        &mut snap,
+        source,
+        from,
+        to,
+        &fetch_names,
+        DIFF_MAX_ROWS,
+        &cursors,
+    )
+    .map_err(|err| query_error_response(&err))?;
+    let gates = Gates::from_pages(&logicals, &pages);
 
     let mut hits: Vec<(&'static str, EpisodeHit)> = Vec::new();
     let mut identities: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
@@ -165,7 +195,8 @@ pub(crate) async fn anomalies(
         let identity = logical.diff_key();
         let (cumulative, gauges) = scorable_columns(&logical);
 
-        let diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+        let mut diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+        gates.apply(&logical, &mut diffs);
         let gauge_series = gauge_section(&identity, &gauges, &page.rows);
         let (section_hits, counts) = scan_section(&diffs, &gauge_series, &scan);
 
@@ -192,8 +223,8 @@ pub(crate) async fn anomalies(
         "to": to,
         "window_us": window,
         "step_us": step,
-        "threshold": threshold,
-        "eps_rel": eps_rel,
+        "threshold": scan.threshold,
+        "eps_rel": scan.eps_rel,
         "limit": limit,
         "episodes": episodes,
         "sections": Value::Object(sections_out),
