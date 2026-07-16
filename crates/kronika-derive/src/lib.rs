@@ -45,6 +45,18 @@ struct ColumnDef {
     /// decoded value back into it.
     wrapper: Option<Ident>,
     nullable: bool,
+    gate: Option<GateDef>,
+}
+
+struct GateDef {
+    default: (String, String),
+    overrides: Vec<GateOverrideDef>,
+}
+
+struct GateOverrideDef {
+    column: String,
+    value: String,
+    gate: (String, String),
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
@@ -168,8 +180,9 @@ fn parse_column(field: &syn::Field) -> syn::Result<ColumnDef> {
         .iter()
         .find(|a| a.path().is_ident("column"))
         .ok_or_else(|| syn::Error::new(field.span(), "field needs a #[column(class)] attribute"))?;
-    let class_ident: Ident = class_attr.parse_args()?;
-    let column_class = column_class(&class_ident)?;
+    let args: ColumnArgs = class_attr.parse_args()?;
+    let column_class = column_class(&args.class)?;
+    let gate = args.gate;
 
     let (inner, nullable) = unwrap_option(&field.ty);
 
@@ -185,6 +198,7 @@ fn parse_column(field: &syn::Field) -> syn::Result<ColumnDef> {
             arrow_type: None,
             wrapper: None,
             nullable: false,
+            gate,
         });
     }
 
@@ -199,6 +213,96 @@ fn parse_column(field: &syn::Field) -> syn::Result<ColumnDef> {
         arrow_type,
         wrapper,
         nullable,
+        gate,
+    })
+}
+
+/// Arguments of `#[column(...)]`.
+struct ColumnArgs {
+    class: Ident,
+    gate: Option<GateDef>,
+}
+
+impl syn::parse::Parse for ColumnArgs {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let class: Ident = input.parse()?;
+        let mut default = None;
+        let mut overrides = Vec::new();
+        while input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            let key: Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            let value: LitStr = input.parse()?;
+            if key == "gated_by" {
+                if default.is_some() {
+                    return Err(syn::Error::new(key.span(), "duplicate `gated_by`"));
+                }
+                default = Some(parse_section_ref(&value, "gated_by")?);
+            } else if key == "gate_override" {
+                overrides.push(parse_gate_override(&value)?);
+            } else {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "expected `gated_by` or `gate_override`",
+                ));
+            }
+        }
+        let gate = match default {
+            Some(default) => Some(GateDef { default, overrides }),
+            None if overrides.is_empty() => None,
+            None => {
+                return Err(syn::Error::new(
+                    class.span(),
+                    "`gate_override` requires `gated_by`",
+                ));
+            }
+        };
+        Ok(Self { class, gate })
+    }
+}
+
+fn parse_section_ref(value: &LitStr, key: &str) -> syn::Result<(String, String)> {
+    let raw = value.value();
+    let Some((section, column)) = raw.split_once('.') else {
+        return Err(syn::Error::new(
+            value.span(),
+            format!("{key} must be \"section.column\""),
+        ));
+    };
+    if section.is_empty() || column.is_empty() || column.contains('.') {
+        return Err(syn::Error::new(
+            value.span(),
+            format!("{key} must be \"section.column\""),
+        ));
+    }
+    Ok((section.to_owned(), column.to_owned()))
+}
+
+fn parse_gate_override(value: &LitStr) -> syn::Result<GateOverrideDef> {
+    let raw = value.value();
+    let Some((selector, gate)) = raw.split_once("=>") else {
+        return Err(syn::Error::new(
+            value.span(),
+            "gate_override must be \"column=value=>section.column\"",
+        ));
+    };
+    let Some((column, expected)) = selector.split_once('=') else {
+        return Err(syn::Error::new(
+            value.span(),
+            "gate_override must be \"column=value=>section.column\"",
+        ));
+    };
+    if column.is_empty() || expected.is_empty() || column.contains('.') {
+        return Err(syn::Error::new(
+            value.span(),
+            "gate_override must be \"column=value=>section.column\"",
+        ));
+    }
+    let gate_lit = LitStr::new(gate, value.span());
+    Ok(GateOverrideDef {
+        column: column.to_owned(),
+        value: expected.to_owned(),
+        gate: parse_section_ref(&gate_lit, "gate_override")?,
     })
 }
 
@@ -322,12 +426,43 @@ fn build_contract(header: &Header, columns: &[ColumnDef]) -> TokenStream2 {
         let ty = &c.column_type;
         let class = &c.column_class;
         let nullable = c.nullable;
+        let gated_by = c.gate.as_ref().map_or_else(
+            || quote! { ::core::option::Option::None },
+            |gate| {
+                let (section, column) = &gate.default;
+                let overrides = gate.overrides.iter().map(|rule| {
+                    let selector = &rule.column;
+                    let value = &rule.value;
+                    let (gate_section, gate_column) = &rule.gate;
+                    quote! {
+                        ::kronika_registry::RowGateOverride {
+                            column: #selector,
+                            value: #value,
+                            gate: ::kronika_registry::SectionColumnRef {
+                                section: #gate_section,
+                                column: #gate_column,
+                            },
+                        }
+                    }
+                });
+                quote! {
+                    ::core::option::Option::Some(::kronika_registry::CollectionGate {
+                        default: ::kronika_registry::SectionColumnRef {
+                            section: #section,
+                            column: #column,
+                        },
+                        overrides: &[ #( #overrides ),* ],
+                    })
+                }
+            },
+        );
         quote! {
             ::kronika_registry::Column {
                 name: #name,
                 ty: ::kronika_registry::ColumnType::#ty,
                 class: ::kronika_registry::ColumnClass::#class,
                 nullable: #nullable,
+                gated_by: #gated_by,
             }
         }
     });

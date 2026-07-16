@@ -22,9 +22,10 @@ use mimalloc as _;
 pub use kronika_diff::{DiffPoint, Reason, Scalar};
 pub use kronika_format::DamageRegion;
 pub use query::{
-    ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, LogicalColumn, LogicalSection, OutRow,
-    QueryError, SectionPage, SeriesDiff, SeriesValues, Value, diff_section, gauge_section,
-    logical_section, section, sections,
+    ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
+    OutRow, QueryError, SectionPage, SeriesDiff, SeriesValues, Value, apply_collection_gating,
+    apply_gating, diff_section, gate_readings, gauge_section, logical_section, section, sections,
+    select_gate,
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, UnitMeta};
 

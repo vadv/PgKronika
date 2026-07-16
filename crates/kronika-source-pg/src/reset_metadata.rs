@@ -46,9 +46,9 @@ pub struct ResetBase {
     pub pg_stat_io_reset_at: Option<i64>,
     /// `compute_query_id` GUC as the server shows it; `None` before PG14.
     pub compute_query_id: Option<String>,
-    /// `track_io_timing` GUC.
+    /// `track_io_timing` in this collector session.
     pub track_io_timing: Option<bool>,
-    /// `track_wal_io_timing` GUC; `None` before PG14.
+    /// `track_wal_io_timing` in this collector session; `None` before PG14.
     pub track_wal_io_timing: Option<bool>,
 }
 
