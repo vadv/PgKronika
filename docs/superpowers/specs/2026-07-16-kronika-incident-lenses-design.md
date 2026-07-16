@@ -247,6 +247,61 @@ series запрещены. Top-K findings поддерживается bounded h
 Деплой приложения сейчас не собирается. Его нельзя выводить из смены query mix;
 для точного deploy context нужен отдельный event source.
 
+### 3.5. Предусловия реализации и детерминизм ключа
+
+Каталог опирается на контракты, часть которых ещё не реализована. До кода
+фиксируются предусловия и правила кодирования: без них ключ инцидента
+невоспроизводим между процессами либо направленность недоопределена.
+
+Предусловия pipeline:
+
+1. **Ключ сущности.** `EpisodeRefV1` кодирует серию через
+   `LogicalSection::diff_key()` (объявленный `identity()`, иначе sort_key без
+   ts-колонки), а не через сырой `contract.identity`. Этот fallback уже
+   различает многострочные секции (`os_cpu`->`cpu_id`,
+   `pg_stat_io`->`backend_type/object/context`), у которых `identity()` пуст, а
+   синглтоны дают пустой ключ = одну серию. Массовая разметка `identity()` не
+   требуется; явный `identity()` остаётся override там, где sort_key шире
+   сущности (statements).
+2. **NotCollected.** DQ timing-линз требует статус `NotCollected` при gate=off.
+   Свёртка diff сейчас выдаёт только `FirstPoint/Gap/Reset/Anomaly`; контракт
+   `gated_by`->`NotCollected` не реализован, а `pg_stat_statements.track_planning`
+   не собирается как поле. До этого контракта timing-ветки не строятся и их
+   нулевой timing не участвует в выводах: `PG-IO-011`, PG18-путь `PG-WAL-009`,
+   тайминги `PG-TEMP-003`, planning-ветки `PG-QRY-001` и `PG-PLAN-002`.
+3. **type_id записки.** `kronika-anomaly` отдаёт эпизод как `(start, end, peak)`
+   без identity/column/type_id — их добавляет слой чтения. `EpisodeRefV1` и
+   сортировка кластеризации требуют `type_id`, поэтому ref строится из
+   обогащённого хита, а не из голого эпизода. Для логической секции поверх union
+   версий раскладки правило выбора `type_id` фиксируется реализацией
+   (рекомендуется раскладка последней точки серии), стабильно на всё окно.
+
+Детерминизм ключа и слияния:
+
+4. **Резолвинг StrId.** `node_self_id` и Label-колонки identity идут в ключ
+   резолвнутой UTF-8 строкой. Записка с нерезолвнутым `StrId` (dictionary gap ->
+   `Value::Null`) исключается из инцидента, а не кодируется как `Null`: иначе
+   одна сущность даёт разные ключи между процессами с разным охватом сегментов.
+5. **Слияние sweep-line.** При объединении
+   `current_end_us := max(current_end_us, next.end_us)` — эпизоды не вложены;
+   span считается до этого максимума.
+6. **Полный порядок.** `scope_key` кодируется тем же типизированным способом, что
+   identity в `EpisodeRefV1`, и задаёт полный порядок: co-leads одной линзы
+   одного confidence иначе неупорядочены.
+7. **Горизонт.** `2 * period(L)` в `h(L)` считается checked; `period(L)`, дающий
+   переполнение или выше temporal cap, обрабатывается как window и skew — линза
+   возвращает `skipped`.
+8. **Источник period/clock.** `source_period(s)` — интервал сбора секции из
+   runtime-конфигурации коллектора; reader и `Semantics` его сейчас не несут.
+   Пока он не проброшен, period неизвестен и `clock_relation=Unknown` по
+   умолчанию -> directional role запрещён, каталог отдаёт `coincident`.
+   `lead`/`downstream` включаются только при известных периоде и clock domain;
+   это осознанное сужение, не ошибка.
+
+Первый срез — линзы на работающем `diff_key` без зависимости от `gated_by` и
+period. Timing-зависимые (п. 2) и directional-зависимые (п. 8) — второй срез,
+после соответствующих предусловий.
+
 ## 4. Каталог PostgreSQL
 
 Во всех формулах `d(x)` — честная typed delta, `r(x)` — `d(x)/dt`, а
@@ -801,10 +856,13 @@ OS finding связывается с PostgreSQL только при совпад
   relation rows не содержат filesystem path и не участвуют в mount attribution.
 - **Расчёт и время:** gauge `free_bytes/total_bytes` and absolute free bytes;
   минимум две materialized segment copies либо один exact ENOSPC-like PG log.
+  `free_bytes` — доступное непривилегированному writer (`statvfs.f_bavail`),
+  reserved blocks уже вычтены, поэтому near-zero здесь означает реальный ENOSPC
+  для backend, а не raw-остаток; это и оправдывает cap `high` на observed zero.
   Threshold является продуктовой policy и показывается в evidence.
-- **Cap и альтернативы:** reserved blocks, quotas, thin provisioning, overlay,
-  WAL symlink или tablespace вне mapped data-directory mount. Низкий free space
-  может быть coincident без error/growth evidence.
+- **Cap и альтернативы:** quotas, thin provisioning, overlay, WAL symlink или
+  tablespace вне mapped data-directory mount. Низкий free space может быть
+  coincident без error/growth evidence.
 - **Показать:** mount/source/fstype/scope, total/free/ratio/threshold, resolved PG
   path, slot/archive/WAL rates and errors.
 - **DQ:** `NULL` statvfs -> not evaluated; zero is real zero. Inode exhaustion
@@ -844,7 +902,8 @@ OS finding связывается с PostgreSQL только при совпад
 | Archive backlog and `pg_wal` growth | Archiver counters не показывают `.ready` queue или directory bytes | Bounded `pg_wal/archive_status` counts/oldest age, directory bytes and path-to-mount mapping |
 | Base-backup progress | Нет `pg_stat_progress_basebackup` | Versioned progress rows plus walsender/PID bridge |
 | Per-socket replication network | Host counters нельзя связать с replication socket | Bounded TCP_INFO per selected walsender socket, endpoint labels and sampling coverage |
-| Cgroup PSI and throttle fraction | Сохраняется host PSI; в cgroup CPU нет `nr_periods` | cgroup cpu/memory/io pressure totals plus `nr_periods`, controller/version metadata |
+| Cgroup throttle fraction | `os_cgroup_cpu` codec не разбирает `nr_periods`, хотя ядро отдаёт его в `cpu.stat` | Добавить колонку `nr_periods` в существующую секцию `os_cgroup_cpu` (тривиальное расширение codec) |
+| Cgroup PSI | Собирается только host PSI; cgroup pressure-файлы не читаются | cgroup cpu/memory/io pressure totals, controller/version metadata |
 | THP/compaction stalls | Текущий vmstat codec не содержит THP/compaction counters | `compact_stall/fail`, THP alloc/fallback counters and sysfs mode/defrag policy |
 | NUMA/zone reclaim | Нет NUMA counters/config | node numastat, `numa_miss/foreign`, zone reclaim counters and `zone_reclaim_mode` |
 | Filesystem inode headroom | mountinfo хранит только bytes | `f_files/f_favail` from statvfs with mount identity |
