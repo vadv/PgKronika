@@ -263,6 +263,14 @@ async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
         bin.major,
         output.status,
     );
+    // `ALTER SYSTEM` cannot override a command-line GUC.
+    let conf = data_dir.join("postgresql.conf");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&conf)
+        .with_context(|| format!("open {} to append GUCs", conf.display()))?;
+    std::io::Write::write_all(&mut file, b"track_io_timing = on\n")
+        .context("append track_io_timing to postgresql.conf")?;
     Ok(())
 }
 
@@ -313,8 +321,6 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
             "-c",
             "compute_query_id=on",
             "-c",
-            "track_io_timing=on",
-            "-c",
             "pg_store_plans.min_duration=0",
             "-c",
             "pg_store_plans.track=all",
@@ -333,8 +339,6 @@ fn spawn_postgres(bin: &PgBinary, data_dir: &Path, port: u16) -> Result<Child> {
             "shared_preload_libraries=pg_stat_statements,pg_store_plans",
             "-c",
             "compute_query_id=on",
-            "-c",
-            "track_io_timing=on",
             "-c",
             "pg_store_plans.min_duration=0",
             "-c",
