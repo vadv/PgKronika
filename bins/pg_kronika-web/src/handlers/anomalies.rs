@@ -6,14 +6,15 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use kronika_reader::{
-    LogicalSection, QueryError, diff_section, gauge_section, logical_section,
-    sections as query_sections,
+    LocalDirSnapshot, LogicalSection, QueryError, diff_section, gauge_section, logical_section,
+    section as query_section,
 };
 use kronika_registry::{ColumnClass, SectionClass, registry};
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 
 use crate::AppState;
-use crate::anomaly::{EpisodeHit, ScanCounts, ScanParams, rank, scan_section};
+use crate::anomaly::{EpisodeHit, MAX_SCORE_WORK, ScanCounts, ScanParams, rank, scan_section};
 use crate::params::{
     bad_request, parse_duration_us, parse_f64_non_negative, parse_i64, parse_limit_default,
     parse_u64, query_error_response,
@@ -35,8 +36,17 @@ const LIMIT_DEFAULT: usize = 50;
 /// cannot allocate unbounded score profiles.
 const MAX_POSITIONS: i64 = 10_000;
 
+static ANOMALY_REQUESTS: Semaphore = Semaphore::const_new(1);
+
 /// The error half of a handler result: an HTTP status and a JSON body.
 type ErrorResponse = (StatusCode, Json<Value>);
+
+struct SectionScan {
+    identity: Vec<&'static str>,
+    hits: Vec<EpisodeHit>,
+    counts: ScanCounts,
+    work: usize,
+}
 
 /// Names of every section the detector scans: snapshot and event sections
 /// with at least one scorable (Cumulative or Gauge) column. Dictionaries are
@@ -95,6 +105,15 @@ pub(crate) async fn anomalies(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, ErrorResponse> {
+    let _permit = ANOMALY_REQUESTS.acquire().await.map_err(|_closed| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "anomaly_scanner_unavailable",
+                "detail": "the anomaly scanner is unavailable",
+            })),
+        )
+    })?;
     let source = parse_u64(&params, "source")?;
     let from = parse_i64(&params, "from")?;
     let to = parse_i64(&params, "to")?;
@@ -139,41 +158,28 @@ pub(crate) async fn anomalies(
     };
 
     let mut snap = state.snapshot.load().as_ref().clone();
-    let cursors = BTreeMap::new();
-    let pages = query_sections(&mut snap, source, from, to, &names, DIFF_MAX_ROWS, &cursors)
-        .map_err(|err| query_error_response(&err))?;
-
     let mut hits: Vec<(&'static str, EpisodeHit)> = Vec::new();
     let mut identities: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
     let mut sections_out = serde_json::Map::new();
     let mut skipped = Vec::new();
+    let mut remaining_work = MAX_SCORE_WORK;
 
     for &name in &names {
-        let Some(page) = pages.get(name) else {
-            continue;
-        };
-        if page.next_cursor.is_some() {
-            skipped.push(json!({
-                "section": name,
-                "reason": "the period has too many rows to scan in one pass; narrow it",
-            }));
-            continue;
+        match scan_one_section(&mut snap, name, source, &scan, remaining_work, limit)? {
+            Ok(section) => {
+                remaining_work -= section.work;
+                hits.extend(section.hits.into_iter().map(|hit| (name, hit)));
+                rank(&mut hits, limit);
+                identities.insert(name, section.identity);
+                sections_out.insert(name.to_owned(), counts_to_json(&section.counts));
+            }
+            Err(reason) => {
+                skipped.push(json!({
+                    "section": name,
+                    "reason": reason,
+                }));
+            }
         }
-        let Some(logical) = logical_section(name) else {
-            continue;
-        };
-        let identity = logical.diff_key();
-        let (cumulative, gauges) = scorable_columns(&logical);
-
-        let diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
-        let gauge_series = gauge_section(&identity, &gauges, &page.rows);
-        let (section_hits, counts) = scan_section(&diffs, &gauge_series, &scan);
-
-        for hit in section_hits {
-            hits.push((name, hit));
-        }
-        identities.insert(name, identity);
-        sections_out.insert(name.to_owned(), counts_to_json(&counts));
     }
 
     rank(&mut hits, limit);
@@ -199,6 +205,52 @@ pub(crate) async fn anomalies(
         "sections": Value::Object(sections_out),
         "skipped": skipped,
     })))
+}
+
+fn scan_one_section(
+    snap: &mut LocalDirSnapshot,
+    name: &'static str,
+    source: u64,
+    scan: &ScanParams,
+    remaining_work: usize,
+    hit_limit: usize,
+) -> Result<Result<SectionScan, String>, ErrorResponse> {
+    let page = match query_section(snap, name, source, scan.from, scan.to, DIFF_MAX_ROWS, None) {
+        Ok(page) => page,
+        Err(QueryError::ResultTooLarge { max_cells }) => {
+            return Ok(Err(format!(
+                "the period exceeds the {max_cells}-cell materialization limit; narrow it"
+            )));
+        }
+        Err(err) => return Err(query_error_response(&err)),
+    };
+    if page.next_cursor.is_some() {
+        return Ok(Err(
+            "the period has too many rows to scan in one pass; narrow it".to_owned(),
+        ));
+    }
+    let logical = logical_section(name)
+        .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.to_owned())))?;
+    let identity = logical.diff_key();
+    let (cumulative, gauges) = scorable_columns(&logical);
+    let diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+    let gauge_series = gauge_section(&identity, &gauges, &page.rows);
+    let (hits, counts, work) =
+        match scan_section(&diffs, &gauge_series, scan, remaining_work, hit_limit) {
+            Ok(scanned) => scanned,
+            Err(limit) => {
+                return Ok(Err(format!(
+                    "scoring requires {} point-position pairs; {} remain in the request budget",
+                    limit.required, limit.available
+                )));
+            }
+        };
+    Ok(Ok(SectionScan {
+        identity,
+        hits,
+        counts,
+        work,
+    }))
 }
 
 /// Split a logical section's columns into cumulative and gauge name lists.

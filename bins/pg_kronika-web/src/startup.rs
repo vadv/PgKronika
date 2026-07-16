@@ -49,9 +49,9 @@ pub(crate) const fn staleness(
 pub(crate) fn parse_basic_auth(raw: &str) -> Result<(String, String), String> {
     let (user, pass) = raw
         .split_once(':')
-        .ok_or_else(|| format!("basic auth value has no ':': {raw:?}"))?;
+        .ok_or_else(|| "KRONIKA_WEB_BASIC_AUTH must contain ':'".to_owned())?;
     if user.is_empty() {
-        return Err(format!("basic auth user is empty in {raw:?}"));
+        return Err("KRONIKA_WEB_BASIC_AUTH user must not be empty".to_owned());
     }
     Ok((user.to_owned(), pass.to_owned()))
 }
@@ -151,8 +151,6 @@ impl WebConfig {
 mod tests {
     use super::*;
 
-    // --- metric_labels ---
-
     #[test]
     fn metric_labels_known_path_is_preserved() {
         let (method, path) = metric_labels("GET", Some("/v1/section/{name}"));
@@ -169,8 +167,6 @@ mod tests {
         assert_eq!(method, "GET", "method is forwarded unchanged");
         assert_eq!(path, "other", "unmatched path becomes 'other'");
     }
-
-    // --- staleness ---
 
     #[test]
     fn staleness_fresh_data_within_threshold() {
@@ -205,8 +201,6 @@ mod tests {
         );
     }
 
-    // --- parse_basic_auth ---
-
     #[test]
     fn parse_basic_auth_simple_user_password() {
         assert_eq!(
@@ -227,21 +221,17 @@ mod tests {
 
     #[test]
     fn parse_basic_auth_no_colon_is_error() {
-        assert!(
-            parse_basic_auth("nocodon").is_err(),
-            "input without ':' must return Err"
-        );
+        let secret = "secret-without-delimiter";
+        let err = parse_basic_auth(secret).expect_err("input without ':' must fail");
+        assert!(!err.contains(secret));
     }
 
     #[test]
     fn parse_basic_auth_empty_user_is_error() {
-        assert!(
-            parse_basic_auth(":pass").is_err(),
-            "empty user before ':' must return Err"
-        );
+        let secret = ":secret-password";
+        let err = parse_basic_auth(secret).expect_err("empty user must fail");
+        assert!(!err.contains(secret));
     }
-
-    // --- WebConfig::parse ---
 
     #[test]
     fn web_config_parse_minimal_valid() {
