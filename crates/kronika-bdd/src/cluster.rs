@@ -263,8 +263,7 @@ async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
         bin.major,
         output.status,
     );
-    // In postgresql.conf, not a `-c` flag: a command-line GUC outranks
-    // postgresql.auto.conf, so `ALTER SYSTEM` scenarios could never flip it.
+    // `ALTER SYSTEM` cannot override a command-line GUC.
     let conf = data_dir.join("postgresql.conf");
     let mut file = std::fs::OpenOptions::new()
         .append(true)
