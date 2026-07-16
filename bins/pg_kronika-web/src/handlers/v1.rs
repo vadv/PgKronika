@@ -4,8 +4,8 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use kronika_reader::{
-    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, apply_gating, diff_section,
-    gate_readings, logical_section, section, sections as query_sections,
+    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, apply_collection_gating,
+    diff_section, gate_readings, logical_section, section, sections as query_sections,
 };
 use kronika_registry::{
     ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
@@ -206,9 +206,7 @@ type DiffObject = serde_json::Map<String, Value>;
 /// Gate timelines for the request's gated columns, keyed by the gate's
 /// section and column names.
 ///
-/// A gate section whose page is missing or truncated contributes no
-/// readings: an unknown gate state never rewrites a value (absence of
-/// knowledge is not evidence the GUC was off).
+/// Missing or truncated gate pages yield an unknown timeline.
 pub(crate) struct Gates {
     readings: BTreeMap<(&'static str, &'static str), Vec<GateReading>>,
 }
@@ -220,7 +218,9 @@ impl Gates {
         for logical in logicals {
             for column in &logical.columns {
                 if let Some(gate) = column.gated_by {
-                    names.insert(gate.section);
+                    for reference in gate.references() {
+                        names.insert(reference.section);
+                    }
                 }
             }
         }
@@ -238,15 +238,22 @@ impl Gates {
                 let Some(gate) = column.gated_by else {
                     continue;
                 };
-                readings
-                    .entry((gate.section, gate.column))
-                    .or_insert_with(|| {
-                        pages
-                            .get(gate.section)
-                            .filter(|page| page.next_cursor.is_none())
-                            .map(|page| gate_readings(&page.rows, gate.column))
-                            .unwrap_or_default()
-                    });
+                for reference in gate.references() {
+                    readings
+                        .entry((reference.section, reference.column))
+                        .or_insert_with(|| {
+                            pages
+                                .get(reference.section)
+                                .filter(|page| page.next_cursor.is_none())
+                                .map(|page| {
+                                    let mut values = gate_readings(&page.rows, reference.column);
+                                    values.extend(page.gaps.iter().map(|gap| (gap.from, None)));
+                                    values.sort_by_key(|reading| reading.0);
+                                    values
+                                })
+                                .unwrap_or_default()
+                        });
+                }
             }
         }
         Self { readings }
@@ -254,14 +261,16 @@ impl Gates {
 
     /// Rewrite the gated columns of one section's folded series.
     pub(crate) fn apply(&self, logical: &LogicalSection, series: &mut [SeriesDiff]) {
+        let identity = logical.diff_key();
         for column in &logical.columns {
             let Some(gate) = column.gated_by else {
                 continue;
             };
-            let Some(readings) = self.readings.get(&(gate.section, gate.column)) else {
-                continue;
-            };
-            apply_gating(series, column.name, readings);
+            apply_collection_gating(series, column.name, &identity, gate, |selected| {
+                self.readings
+                    .get(&(selected.section, selected.column))
+                    .map_or(&[][..], Vec::as_slice)
+            });
         }
     }
 }
@@ -398,4 +407,89 @@ pub(crate) async fn sections_batch_diff(
         );
     }
     Ok(Json(Value::Object(out)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use kronika_reader::{ColumnDiff, DiffAt, DiffPoint, Reason, Scalar, SeriesDiff, Value};
+
+    use super::Gates;
+
+    const SEC: i64 = 1_000_000;
+
+    fn series(object: &str, column: &str) -> SeriesDiff {
+        SeriesDiff {
+            key: vec![
+                Value::Str("client backend".to_owned()),
+                Value::Str(object.to_owned()),
+                Value::Str("normal".to_owned()),
+            ],
+            columns: vec![ColumnDiff {
+                name: column.to_owned(),
+                points: vec![DiffAt {
+                    ts: SEC,
+                    point: DiffPoint::Value {
+                        delta: Scalar::Float(1.0),
+                        rate: 1.0,
+                        dt_micros: SEC,
+                    },
+                }],
+            }],
+        }
+    }
+
+    fn not_collected(series: &SeriesDiff) -> bool {
+        matches!(
+            series.columns[0].points[0].point,
+            DiffPoint::NoData {
+                reason: Reason::NotCollected
+            }
+        )
+    }
+
+    fn gates(io: bool, wal: bool) -> Gates {
+        Gates {
+            readings: BTreeMap::from([
+                (("reset_metadata", "track_io_timing"), vec![(0, Some(io))]),
+                (
+                    ("reset_metadata", "track_wal_io_timing"),
+                    vec![(0, Some(wal))],
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn pg18_wal_and_relation_rows_use_different_timing_gates() {
+        let logical = kronika_reader::logical_section("pg_stat_io").expect("registered section");
+
+        let mut io_on = vec![series("relation", "read_time"), series("wal", "read_time")];
+        gates(true, false).apply(&logical, &mut io_on);
+        assert!(!not_collected(&io_on[0]));
+        assert!(not_collected(&io_on[1]));
+
+        let mut wal_on = vec![series("relation", "read_time"), series("wal", "read_time")];
+        gates(false, true).apply(&logical, &mut wal_on);
+        assert!(not_collected(&wal_on[0]));
+        assert!(!not_collected(&wal_on[1]));
+    }
+
+    #[test]
+    fn pg18_wal_writeback_time_still_uses_track_io_timing() {
+        let logical = kronika_reader::logical_section("pg_stat_io").expect("registered section");
+        let mut wal = vec![series("wal", "writeback_time")];
+        gates(false, true).apply(&logical, &mut wal);
+        assert!(not_collected(&wal[0]));
+    }
+
+    #[test]
+    fn unresolved_row_selector_is_not_collected() {
+        let logical = kronika_reader::logical_section("pg_stat_io").expect("registered section");
+        let mut unknown = vec![series("wal", "read_time")];
+        unknown[0].key[1] = Value::Null;
+        gates(true, true).apply(&logical, &mut unknown);
+        assert!(not_collected(&unknown[0]));
+    }
 }

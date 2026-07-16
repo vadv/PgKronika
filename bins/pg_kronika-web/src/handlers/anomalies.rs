@@ -89,19 +89,6 @@ fn counts_to_json(counts: &ScanCounts) -> Value {
     })
 }
 
-/// `GET /v1/anomalies?source&from&to` — every anomaly episode of the period,
-/// across all sections of the source, ranked by peak score.
-///
-/// Optional knobs and their defaults: `window=1h` (sliding window length),
-/// `step` (position stride, `window/4`), `threshold=3.5` (episode cutoff in
-/// robust sigmas), `eps_rel=0.05` (relative scale floor), `limit=50` (episode
-/// cap after ranking), `section=<name>` (restrict the scan to one section).
-///
-/// Cumulative columns are scored over derivative rates, gauge columns over
-/// raw readings; MAD units make peak `|m|` comparable across sections, so
-/// one ranked list serves the whole source. A section whose period exceeds
-/// the row cap lands in `skipped` and the rest of the scan proceeds.
-/// Parse and validate every scan knob of the request.
 fn parse_scan_params(
     params: &std::collections::HashMap<String, String>,
 ) -> Result<(ScanParams, usize), ErrorResponse> {
@@ -141,6 +128,10 @@ fn parse_scan_params(
     ))
 }
 
+/// `GET /v1/anomalies?source&from&to` returns ranked anomaly episodes.
+///
+/// Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `limit`,
+/// and `section`. Oversized sections are reported in `skipped`.
 pub(crate) async fn anomalies(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -169,7 +160,10 @@ pub(crate) async fn anomalies(
     };
 
     let mut snap = state.snapshot.load().as_ref().clone();
-    let logicals: Vec<LogicalSection> = names.iter().filter_map(|&name| logical_section(name)).collect();
+    let logicals: Vec<LogicalSection> = names
+        .iter()
+        .filter_map(|&name| logical_section(name))
+        .collect();
     let gates = load_gates(&mut snap, &logicals, source, from, to)?;
     let mut hits: Vec<(&'static str, EpisodeHit)> = Vec::new();
     let mut identities: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();

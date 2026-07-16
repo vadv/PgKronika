@@ -631,7 +631,6 @@ mod tests {
         assert!(sections.contains_key("pg_stat_archiver"));
     }
 
-    /// One `pg_stat_database` row with climbing IO counters and timings.
     fn db_row(ts: i64, tick: i32) -> PgStatDatabaseV1 {
         PgStatDatabaseV1 {
             ts: Ts(ts),
@@ -662,7 +661,6 @@ mod tests {
         }
     }
 
-    /// One `reset_metadata` row carrying the `track_io_timing` gate state.
     fn reset_row(ts: i64, track_io_timing: Option<bool>) -> ResetMetadata {
         ResetMetadata {
             ts: Ts(ts),
@@ -683,8 +681,6 @@ mod tests {
         }
     }
 
-    /// Four snapshots of `pg_stat_database` with climbing timings, alongside
-    /// `reset_metadata` reading `track_io_timing = false` throughout.
     fn write_gated_db_segment(dir: &std::path::Path) -> i64 {
         const MINUTE: i64 = 60 * 1_000_000;
         let rows: Vec<PgStatDatabaseV1> =
@@ -751,6 +747,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_diff_applies_collection_gates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let to = write_gated_db_segment(dir.path());
+        let uri = format!("/v1/sections/batch/diff?source=7&from=0&to={to}&names=pg_stat_database");
+        let (status, body) = serve(dir.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let points = body["pg_stat_database"]["series"][0]["columns"]["blk_read_time"]
+            .as_array()
+            .expect("blk_read_time points");
+        assert!(
+            points[1..]
+                .iter()
+                .all(|point| point["nodata"] == "not_collected")
+        );
+    }
+
+    #[tokio::test]
     async fn anomalies_count_gated_timings_as_nodata() {
         let dir = tempfile::tempdir().expect("tempdir");
         let to = write_gated_db_segment(dir.path());
@@ -760,8 +773,6 @@ mod tests {
         let (status, body) = serve(dir.path(), &uri).await;
         assert_eq!(status, StatusCode::OK, "anomalies responds 200");
         let counters = &body["sections"]["pg_stat_database"];
-        // Two gated columns contribute three rewritten pairs each on top of
-        // the per-column FirstPoint the ungated ones also carry.
         assert!(
             counters["nodata_points"].as_u64().expect("nodata_points") >= 6,
             "gated pairs must land in nodata_points: {counters}"

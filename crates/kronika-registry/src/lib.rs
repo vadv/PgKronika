@@ -46,8 +46,8 @@ pub use codec::{
 };
 pub(crate) use codec::{check_row_cap, decode_batches, decode_section, encode_section};
 pub use contract::{
-    Column, ColumnClass, ColumnType, LintError, SectionColumnRef, Semantics, StrId, Ts,
-    TypeContract, lint, lint_references,
+    CollectionGate, Column, ColumnClass, ColumnType, LintError, RowGateOverride, SectionColumnRef,
+    Semantics, StrId, Ts, TypeContract, lint, lint_references,
 };
 pub use generic::{Cell, Row, decode_rows};
 pub use pool::{BytesPool, PoolStats};

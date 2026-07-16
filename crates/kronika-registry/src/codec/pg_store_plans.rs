@@ -120,10 +120,10 @@ pub struct PgStorePlansVadvV1 {
     #[column(c)]
     pub temp_blks_written: i64,
     /// Time reading blocks, milliseconds; `0` without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_read_time: f64,
     /// Time writing blocks, milliseconds; `0` without `track_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub blk_write_time: f64,
     /// When statistics for this entry began accumulating.
     #[column(g)]
@@ -342,22 +342,22 @@ pub struct PgStorePlansOsscV1 {
     #[column(c)]
     pub temp_blks_written: i64,
     /// Time reading shared blocks, milliseconds.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub shared_blk_read_time: f64,
     /// Time writing shared blocks, milliseconds.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub shared_blk_write_time: f64,
     /// Time reading local blocks, milliseconds.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub local_blk_read_time: f64,
     /// Time writing local blocks, milliseconds.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub local_blk_write_time: f64,
     /// Time reading temp blocks, milliseconds.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub temp_blk_read_time: f64,
     /// Time writing temp blocks, milliseconds.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub temp_blk_write_time: f64,
     /// When statistics for this entry began accumulating.
     #[column(g)]

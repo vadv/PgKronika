@@ -50,13 +50,13 @@ pub struct PgStatIoV1 {
     #[column(c)]
     pub writebacks: Option<i64>,
     /// Time spent in writeback, ms.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub writeback_time: Option<f64>,
     /// Relation extend operations.
     #[column(c)]
     pub extends: Option<i64>,
     /// Time spent extending, ms.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub extend_time: Option<f64>,
     /// Bytes per I/O unit (block size), e.g. 8192. A fixed unit size, not a
     /// counter: total bytes = (`reads` + `writes` + `extends`) * `op_bytes`.
@@ -76,7 +76,7 @@ pub struct PgStatIoV1 {
     #[column(c)]
     pub fsyncs: Option<i64>,
     /// Time spent in fsync, ms.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub fsync_time: Option<f64>,
     /// Time of the last `pg_stat_io` reset; `None` if never.
     #[column(g)]
@@ -115,9 +115,12 @@ pub struct PgStatIoV2 {
     /// Bytes read (`numeric` in the view, stored as `i64`).
     #[column(c)]
     pub read_bytes: Option<i64>,
-    /// Time spent reading, ms. `None` only where the backend performs no reads;
-    /// `0.0` (not `None`) when `track_io_timing` is off.
-    #[column(c, gated_by = "reset_metadata.track_io_timing")]
+    /// Time spent reading, ms.
+    #[column(
+        c,
+        gated_by = "reset_metadata.track_io_timing",
+        gate_override = "object=wal=>reset_metadata.track_wal_io_timing"
+    )]
     pub read_time: Option<f64>,
     /// Write operations.
     #[column(c)]
@@ -126,13 +129,17 @@ pub struct PgStatIoV2 {
     #[column(c)]
     pub write_bytes: Option<i64>,
     /// Time spent writing, ms.
-    #[column(c, gated_by = "reset_metadata.track_io_timing")]
+    #[column(
+        c,
+        gated_by = "reset_metadata.track_io_timing",
+        gate_override = "object=wal=>reset_metadata.track_wal_io_timing"
+    )]
     pub write_time: Option<f64>,
     /// Writeback operations.
     #[column(c)]
     pub writebacks: Option<i64>,
-    /// Time spent in writeback, ms.
-    #[column(c)]
+    /// Time spent in writeback, ms; controlled by `track_io_timing` for all rows.
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub writeback_time: Option<f64>,
     /// Relation extend operations.
     #[column(c)]
@@ -141,7 +148,11 @@ pub struct PgStatIoV2 {
     #[column(c)]
     pub extend_bytes: Option<i64>,
     /// Time spent extending, ms.
-    #[column(c)]
+    #[column(
+        c,
+        gated_by = "reset_metadata.track_io_timing",
+        gate_override = "object=wal=>reset_metadata.track_wal_io_timing"
+    )]
     pub extend_time: Option<f64>,
     /// Buffer hits.
     #[column(c)]
@@ -156,7 +167,11 @@ pub struct PgStatIoV2 {
     #[column(c)]
     pub fsyncs: Option<i64>,
     /// Time spent in fsync, ms.
-    #[column(c)]
+    #[column(
+        c,
+        gated_by = "reset_metadata.track_io_timing",
+        gate_override = "object=wal=>reset_metadata.track_wal_io_timing"
+    )]
     pub fsync_time: Option<f64>,
     /// Time of the last `pg_stat_io` reset; `None` if never.
     #[column(g)]
@@ -166,7 +181,7 @@ pub struct PgStatIoV2 {
 #[cfg(test)]
 mod tests {
     use super::{PgStatIoV1, PgStatIoV2};
-    use crate::{ColumnClass, Section, StrId, Ts, VerifiedSection, lint};
+    use crate::{ColumnClass, Section, SectionColumnRef, StrId, Ts, VerifiedSection, lint};
 
     fn v1_row(ts: i64, object: u64) -> PgStatIoV1 {
         PgStatIoV1 {
@@ -219,6 +234,28 @@ mod tests {
     }
 
     #[test]
+    fn every_v1_timing_uses_track_io_timing() {
+        let expected = SectionColumnRef {
+            section: "reset_metadata",
+            column: "track_io_timing",
+        };
+        for name in [
+            "read_time",
+            "write_time",
+            "writeback_time",
+            "extend_time",
+            "fsync_time",
+        ] {
+            let gate = PgStatIoV1::CONTRACT
+                .column(name)
+                .and_then(|column| column.gated_by)
+                .unwrap_or_else(|| panic!("{name} must be gated"));
+            assert_eq!(gate.default, expected);
+            assert!(gate.overrides.is_empty());
+        }
+    }
+
+    #[test]
     fn v1_roundtrip_preserves_values_and_nulls() {
         crate::assert_roundtrips(&[v1_row(1_000, 10), v1_row(1_000, 20)]);
     }
@@ -266,6 +303,35 @@ mod tests {
         assert!(c.column("op_bytes").is_none());
         assert_eq!(c.column("read_bytes").map(|col| col.nullable), Some(true));
         assert_eq!(lint(&[c]), Ok(()));
+    }
+
+    #[test]
+    fn v2_wal_timings_select_track_wal_io_timing() {
+        let io = SectionColumnRef {
+            section: "reset_metadata",
+            column: "track_io_timing",
+        };
+        let wal = SectionColumnRef {
+            section: "reset_metadata",
+            column: "track_wal_io_timing",
+        };
+        for name in ["read_time", "write_time", "extend_time", "fsync_time"] {
+            let gate = PgStatIoV2::CONTRACT
+                .column(name)
+                .and_then(|column| column.gated_by)
+                .unwrap_or_else(|| panic!("{name} must be gated"));
+            assert_eq!(gate.default, io);
+            assert_eq!(gate.overrides.len(), 1);
+            assert_eq!(gate.overrides[0].column, "object");
+            assert_eq!(gate.overrides[0].value, "wal");
+            assert_eq!(gate.overrides[0].gate, wal);
+        }
+        let writeback = PgStatIoV2::CONTRACT
+            .column("writeback_time")
+            .and_then(|column| column.gated_by)
+            .expect("writeback_time must be gated");
+        assert_eq!(writeback.default, io);
+        assert!(writeback.overrides.is_empty());
     }
 
     #[test]

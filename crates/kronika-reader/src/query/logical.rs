@@ -1,6 +1,6 @@
 //! Union view of a logical section across its layout versions.
 
-use kronika_registry::{ColumnClass, ColumnType, SectionColumnRef, registry};
+use kronika_registry::{CollectionGate, ColumnClass, ColumnType, registry};
 
 /// One column in a logical section's union schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,8 +11,8 @@ pub struct LogicalColumn {
     pub ty: ColumnType,
     /// The column's role; `Cumulative` marks a counter the diff layer rates.
     pub class: ColumnClass,
-    /// The boolean gate the column's values depend on, if declared.
-    pub gated_by: Option<SectionColumnRef>,
+    /// Collection gate for this cumulative column.
+    pub gated_by: Option<CollectionGate>,
 }
 
 /// A logical section: the union of all layout versions sharing the same name.
@@ -96,7 +96,7 @@ pub fn logical_section(name: &str) -> Option<LogicalSection> {
     let mut columns: Vec<LogicalColumn> = Vec::new();
     for contract in &contracts {
         for col in contract.columns {
-            if let Some(existing) = columns.iter().find(|lc| lc.name == col.name) {
+            if let Some(existing) = columns.iter_mut().find(|lc| lc.name == col.name) {
                 assert!(
                     existing.ty == col.ty,
                     "registry violation: logical section {:?} column {:?} has \
@@ -107,6 +107,37 @@ pub fn logical_section(name: &str) -> Option<LogicalSection> {
                     contract.type_id.get(),
                     col.ty,
                 );
+                if let (Some(existing_gate), Some(candidate)) = (existing.gated_by, col.gated_by) {
+                    assert_eq!(
+                        existing_gate.default, candidate.default,
+                        "registry violation: logical section {name:?} column {:?} has conflicting default gates",
+                        col.name,
+                    );
+                    for rule in candidate.overrides {
+                        if let Some(current) = existing_gate.overrides.iter().find(|current| {
+                            current.column == rule.column && current.value == rule.value
+                        }) {
+                            assert_eq!(current.gate, rule.gate);
+                        }
+                    }
+                    assert!(
+                        candidate.overrides.iter().all(|rule| {
+                            existing_gate
+                                .overrides
+                                .iter()
+                                .any(|current| current == rule)
+                        }) || existing_gate.overrides.iter().all(|rule| {
+                            candidate.overrides.iter().any(|current| current == rule)
+                        }),
+                        "registry violation: logical section {name:?} column {:?} has incompatible row gate overrides",
+                        col.name,
+                    );
+                    if candidate.overrides.len() > existing_gate.overrides.len() {
+                        existing.gated_by = Some(candidate);
+                    }
+                } else if existing.gated_by.is_none() {
+                    existing.gated_by = col.gated_by;
+                }
                 assert!(
                     existing.class == col.class,
                     "registry violation: logical section {:?} column {:?} has \
