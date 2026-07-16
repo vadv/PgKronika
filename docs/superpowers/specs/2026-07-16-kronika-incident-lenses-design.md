@@ -27,7 +27,7 @@ heavyweight lock в момент снимка. Даже такое ребро д
 
 ```text
 Incident {
-  interval, cluster_id,
+  interval, incident_key: IncidentKeyV1,
   members: [AnomalyEpisodeRef],
   findings: [Finding],
   unclassified_members: [AnomalyEpisodeRef],
@@ -91,10 +91,10 @@ PostgreSQL-специфичные identity, версии, reset sources и GUC g
    дельта остаётся свидетельством фактически накопленного времени, но полнота
    измерения неизвестна.
 
-PR #68 или эквивалентный контракт `gated_by -> NotCollected` является
-предпосылкой для timing-линз. Этот документ от него не зависит на уровне кода:
-ветка PR #68 не включается. До появления gate-aware series timing-колонки с
-нулём не участвуют в отрицательных выводах.
+Timing-линзам нужен стабильный cross-section contract: registry объявляет
+row- и operation-aware `gated_by`, а diff возвращает `NotCollected`, если gate
+был выключен на интервале. Пока этот контракт не реализован, нулевые timing-
+колонки не участвуют в отрицательных выводах.
 
 Ограничение gate глубже состояния collector session. `track_io_timing`,
 `track_wal_io_timing` и `pg_stat_statements.track_planning` могут меняться в
@@ -104,12 +104,14 @@ PR #68 или эквивалентный контракт `gated_by -> NotCollec
 [контракта cumulative statistics](https://www.postgresql.org/docs/18/monitoring-stats.html)
 и [runtime GUC](https://www.postgresql.org/docs/18/runtime-config-statistics.html).
 
-Для PG18 gate `pg_stat_io.*_time` выбирается по строке: `object='wal'` зависит
-от `track_wal_io_timing`, остальные объекты — от `track_io_timing`. `fsyncs` и
-`fsync_time` имеют смысл только в поддерживаемых строках; для relation I/O
-fsync учитывается в `context='normal'`. `NULL` в неподдерживаемой комбинации
-остаётся `NULL`. Версии PG16-17 используют `op_bytes` как gauge, PG18 —
-кумулятивные `read_bytes`, `write_bytes`, `extend_bytes`.
+Для PG16-17 все строки `pg_stat_io` относятся к relation/temp relation, а
+timing gates зависят от `track_io_timing`. В PG18 `read_time`, `write_time`,
+`extend_time` и `fsync_time` зависят от `track_wal_io_timing` при
+`object='wal'` и от `track_io_timing` для остальных объектов;
+`writeback_time` зависит от `track_io_timing`. `fsyncs/fsync_time` учитываются
+только в `context='normal'`. Неподдерживаемая операция в конкретной строке
+остаётся `NULL` и не проходит gate evaluation. PG16-17 используют `op_bytes`
+как gauge, PG18 — cumulative `read_bytes`, `write_bytes`, `extend_bytes`.
 
 ### 2.3. Реально доступные семейства
 
@@ -125,31 +127,69 @@ fsync учитывается в `context='normal'`. `NULL` в неподдерж
   diskstats, netdev/SNMP/netstat, mount capacity/topology, PID-to-cgroup mapping
   и cgroup CPU/memory/I/O/PID.
 
-Отсутствуют, в частности, `pg_stat_slru`, `pg_stat_database_conflicts`,
-subscription statistics, per-socket TCP, cgroup PSI, inode capacity, THP/NUMA
-vmstat, jbd2, `pg_wal/archive_status` и размер `pg_wal`. Они не используются в
-основном каталоге.
+Input, которого нет в этих registry sections, может использоваться только в
+roadmap после появления отдельного collector contract.
 
 ## 3. Кластеризация и вычисление
 
 ### 3.1. Интервал и контекст
 
-Пользователь выбирает завершённый `[from, to]`. `kronika-anomaly` строит
-episodes с некаузальным reference из того же периода; такой результат нельзя
-использовать для push alerting.
+Пользователь выбирает завершённый полуинтервал `[from_us, to_us)`. Все
+timestamps и durations в этом контракте — знаковые Unix microseconds UTC;
+арифметика checked. PostgreSQL snapshots используют server
+`statement_timestamp()`, OS/cgroup snapshots — wall clock коллектора, log event
+— разобранный server timestamp либо collection time. Общая epoch не доказывает
+синхронизацию часов. `kronika-anomaly` строит episodes с некаузальным reference
+из того же периода; такой результат нельзя использовать для push alerting.
 
-Episodes сортируются по `(start, end, section, column, identity)`. Sweep-line
-объединяет их, если следующий `start <= current_end + epsilon`, где по умолчанию
-`epsilon` равен anomaly `step`. Чтобы цепочка коротких пересечений не склеила
-весь период, компонент закрывается при достижении `max_cluster_span`. При
-достижении лимита причина разбиения возвращается в `data_quality`.
+Evaluation получает типизированный `IncidentConfig`:
+
+- `step_us > 0` — шаг сетки anomaly endpoint;
+- `window_us > 0` — минимальный горизонт для lead/downstream evidence;
+- `epsilon_us >= 0` — допустимый промежуток между episodes; при отсутствии
+  равен `step_us`;
+- `max_cluster_span_us >= step_us` — жёсткий предел от первого `start_us` до
+  максимального `end_us` одного incident;
+- `clock_relation = SameDomain | MaxSkewUs(u64) | Unknown`; `Unknown` запрещает
+  направление между разными clock domains;
+- `max_temporal_horizon_us > 0` и `max_query_span_us > 0` — hard bounds для
+  expanded read interval;
+- положительные hard caps на decoded points, episodes, clusters, findings и
+  evidence rows.
+
+`source_period(s)` — ожидаемый период конкретной periodic section при её
+фактической runtime-конфигурации, а не медиана наблюдаемых timestamps. Gap не
+меняет period. Event stream и `on_change` section периода не имеют. Для линзы
+`L` используется `period(L) = max(source_period(s))` по её реально выбранным
+periodic inputs; если таких inputs нет, period равен нулю. Неизвестный period
+обязательного periodic input запрещает directional role выше `coincident`.
+`clock_skew_us` равен нулю для `SameDomain` и объявленной границе для
+`MaxSkewUs`; при `Unknown` cross-domain `h(L)` не вычисляется.
+
+Конфигурация отклоняется до чтения данных, если `from_us >= to_us`, значение не
+помещается в `i64`, `epsilon_us > max_cluster_span_us`,
+`max_cluster_span_us > max_query_span_us`, `window_us` или объявленный clock
+skew выше temporal cap либо отсутствует любой обязательный cap. Если
+`max(window_us, 2 * period(L), clock_skew_us)` выше temporal cap, directional
+evaluation этой линзы возвращает `skipped`, а не clamp. P/D читают данные за
+пределами выбранного периода; граница retention считается coverage gap.
+Численные product defaults, кроме `epsilon_us = step_us`, задаёт endpoint
+config; движок их не подменяет.
+
+Episodes сортируются по `(start_us, end_us, type_id, column, identity)`. Sweep-
+line объединяет следующий episode, если
+`next.start_us <= current_end_us + epsilon_us` и получившийся span не превышает
+`max_cluster_span_us`; иначе компонент закрывается. Разбиение по span
+возвращается в `data_quality`.
 
 Для направления используются три области:
 
-- `P = [incident.start - max(window, 2 * source_period), incident.start)` —
+- `h(L) = max(window_us, 2 * period(L), clock_skew_us)` — горизонт конкретной
+  линзы; для одного clock domain skew равен нулю;
+- `P = [incident.start_us - h(L), incident.start_us)` —
   допустимое предшествование;
-- `I = [incident.start, incident.end]` — совпадение;
-- `D = (incident.end, incident.end + window]` — допустимое следствие.
+- `I = [incident.start_us, incident.end_us)` — совпадение;
+- `D = [incident.end_us, incident.end_us + h(L))` — допустимое следствие.
 
 Механизм без различающего наблюдения даёт не выше `coincident`. Например,
 WAL generation в `P`, requested checkpoints в `I` и checkpointer I/O в `I/D`
@@ -173,9 +213,18 @@ WAL generation в `P`, requested checkpoints в `I` и checkpointer I/O в `I/D`
 ### 3.3. Детерминизм и пределы
 
 Findings сортируются по `(confidence desc, role_rank, lens_id, scope_key)`, где
-`role_rank = lead, amplifier, downstream, coincident`. Равенство не разрешается
-временным lead-lag на каденсе 5-30 секунд. `cluster_id` строится из нормализованного
-интервала и отсортированных member refs.
+`role_rank = lead, amplifier, downstream, coincident`. Разница timestamps не
+задаёт порядок, если она не превышает максимум periods и clock skew
+сравниваемых sources. При `clock_relation=Unknown` PostgreSQL/OS ordering не
+даёт directional role.
+
+Идентичность incident задаёт полный `IncidentKeyV1`:
+`(node_self_id, incident_start_us, incident_end_us, sorted EpisodeRefV1[])`.
+`EpisodeRefV1` содержит `(type_id, column, registry identity key, start_us,
+end_us)`; identity values кодируются в порядке registry key с типом и длиной.
+Это стабильная API tuple, а не process-local hash. Если transport позже введёт
+короткий opaque id, версия canonical encoding и hash algorithm становятся
+частью API; скрытый `DefaultHasher` недопустим.
 
 Web/reader обязаны ограничить число sections, series, decoded points, episodes,
 clusters, findings на cluster и evidence rows на finding. Превышение любого
@@ -232,9 +281,10 @@ series запрещены. Top-K findings поддерживается bounded h
 - **Вход:** `pg_store_plans` `1_003_001` или `1_004_001`: `planid`, calls,
   execution metrics и plan text; мост к statements по contract конкретного
   форка. Секция опциональна и читается раз в 5 минут.
-- **Расчёт и время:** сравнить набор и доли calls по planid до и во время
-  incident; требовать новый/вернувшийся planid и изменение work/call или
-  exec/call. `mean_*` — gauge, он не дифференцируется.
+- **Расчёт и время:** сравнить набор planid и доли `d(calls)` на одинаковых
+  валидных интервалах до и во время incident; требовать новый/вернувшийся
+  planid и изменение work/call или exec/call. Raw lifetime `calls` share не
+  используется; `mean_*` — gauge и не дифференцируется.
 - **Cap и альтернативы:** `medium` для ossc с core queryid, `low` для best-effort
   bridge vadv. Альтернативы: тот же plan на другом объёме данных, eviction
   extension entries, reset, редкий план между 5-минутными снимками.
@@ -256,9 +306,10 @@ series запрещены. Top-K findings поддерживается bounded h
 - **Вход:** statements `temp_blks_read/written` и ext 1.10+ temp timings;
   database `temp_files/temp_bytes`; PG16+ `pg_stat_io` с
   `object='temp relation'`; `pg_log_temp_files` при включённом логировании.
-- **Расчёт и время:** в `P/I` считать temp blocks/call, temp bytes/file и
-  temp-time/op только после дельт, со знаменателем >0. Log event является
-  точным фактом создания файла, но не полным счётчиком без подходящей настройки.
+- **Расчёт и время:** в `P/I` считать paired temp blocks/call,
+  `paired(temp_bytes,temp_files)` и paired temp-time/block только при
+  положительном знаменателе. Log event является точным фактом создания файла,
+  но не полным счётчиком без подходящей настройки.
 - **Cap и альтернативы:** `medium`. Альтернативы: hash/sort, materialize,
   maintenance, explicit temp tables; work_mem exhaustion без plan evidence не
   утверждается.
@@ -297,7 +348,8 @@ series запрещены. Top-K findings поддерживается bounded h
   counters, PG18 total vacuum times; vacuum progress; autovacuum log events;
   PG16+ `pg_stat_io context='vacuum'`.
 - **Расчёт и время:** gauges `n_dead_tup` и
-  `n_dead_tup/max(n_live_tup+n_dead_tup,1)` в `P/I`; counter rates vacuum;
+  `n_dead_tup/max(n_live_tup+n_dead_tup,1)` в `P/I`; отдельно
+  `r(vacuum_count)`, `r(autovacuum_count)` и PG18 deltas total vacuum time;
   progress fields остаются gauges одного запуска. Требуется различающий сигнал:
   debt растёт до scan/read/write anomaly либо активный vacuum совпадает с I/O.
 - **Cap и альтернативы:** `medium`. `n_dead_tup` — оценка, не физический bloat;
@@ -336,16 +388,16 @@ series запрещены. Top-K findings поддерживается bounded h
 - **Вход:** user tables `n_tup_upd`, `n_tup_hot_upd`; PG16+
   `n_tup_newpage_upd`; user indexes `idx_blks_read/hit`, size and scan counters;
   statements/WAL counters.
-- **Расчёт и время:** на paired intervals с `d(n_tup_upd)>0` показать
-  `d(hot)/d(upd)`, `d(newpage)/d(upd)` при наличии, index block miss rate и WAL
-  per update. Низкая HOT share должна предшествовать или совпасть с index/WAL
-  amplification.
+- **Расчёт и время:** на одном наборе paired intervals с `d(n_tup_upd)>0`
+  показать `sum(d(hot))/sum(d(upd))`, `sum(d(newpage))/sum(d(upd))` при
+  наличии, `sum(d(idx_read))/sum(d(idx_read)+d(idx_hit))` и WAL bytes/update.
+  Низкая HOT share должна предшествовать или совпасть с index/WAL amplification.
 - **Cap и альтернативы:** indexed-column updates, недостаток свободного места на
   heap page, fillfactor, новые/удалённые индексы и workload mix. Низкая HOT share
   сама по себе не измеряет index bloat.
 - **Показать:** все дельты и ratios по relation, связанные index identities/
   sizes, WAL bytes/FPI per update, PG version.
-- **DQ:** standard; в PG15 ветка `n_tup_newpage_upd` unavailable, но HOT ratio
+- **DQ:** standard; в PG15 колонка `n_tup_newpage_upd` unavailable, но HOT ratio
   остаётся доступен. Механика HOT —
   [официальная глава PostgreSQL](https://www.postgresql.org/docs/18/storage-hot.html).
 
@@ -405,23 +457,32 @@ series запрещены. Top-K findings поддерживается bounded h
   относится только к PostgreSQL buffer cache и не включает OS cache:
   [PG16 statistics](https://www.postgresql.org/docs/16/monitoring-stats.html).
 
-### `PG-IO-011` — PostgreSQL I/O time per operation
+### `PG-IO-011` — PostgreSQL I/O time per counted unit
 
-- **Вопрос и роль:** выросло ли наблюдаемое время на одну I/O operation внутри
-  PostgreSQL? Обычно `downstream` OS/device pressure или `amplifier`; cap
+- **Вопрос и роль:** выросло ли наблюдаемое время на одну учтённую operation или
+  block внутри PostgreSQL? Обычно `downstream` OS/device pressure или
+  `amplifier`; cap
   `medium`.
 - **Вход:** PG15 database/statements block time; PG16+ `pg_stat_io` by exact
-  `(backend_type,object,context)`; operation counters and row-dependent gates.
-- **Расчёт и время:** `sum(d(time_ms))/sum(d(ops))` на одних валидных парах и
-  `d(ops)>0`; никогда `rate(time)/raw ops`. Сопоставить с device latency/PSI в
-  `P/I` и query latency в `I/D`.
+  `(backend_type,object,context)`; counters and row/operation-aware gates.
+- **Расчёт и время:** для PG16+ считать paired `read_time/reads`,
+  `write_time/writes`, `extend_time/extends`, `fsync_time/fsyncs`; для
+  `writeback_time/writebacks` единица знаменателя — запрошенный BLCKSZ block,
+  не syscall. Для PG15 database доступен read time/block
+  `paired(blk_read_time,blks_read)`, но у database write timing нет точного
+  block denominator. Statements используют суммы соответствующих
+  shared/local/temp block counters. Никакой ratio не смешивает rate timing с
+  raw counter. Сопоставить с device latency/PSI в `P/I` и query latency в
+  `I/D`.
 - **Cap и альтернативы:** OS page cache, filesystem, cgroup I/O, backend mix,
   timer overhead and partial per-session GUC coverage. `pg_stat_io` не покрывает
   relation I/O, обходящий shared buffers.
 - **Показать:** selector row, time/op, обе суммы, gate state/history, NULL rows,
   OS device/mount evidence.
-- **DQ:** standard; gate unknown ограничивает вывод положительным накопленным
-  временем, gate off -> `NotCollected`. Ноль не означает быстрый I/O.
+- **DQ:** standard; для каждой operation сначала проверяются non-NULL cell и её
+  gate из раздела 2.2. Gate unknown ограничивает вывод положительным
+  накопленным временем, gate off -> `NotCollected`. Ноль не означает быстрый
+  I/O.
 
 ### `PG-LOCK-012` — heavyweight lock wait graph
 
@@ -452,9 +513,12 @@ series запрещены. Top-K findings поддерживается bounded h
 - **Вход:** activity `state`, `xact_start`, `backend_xid_age`,
   `backend_xmin_age`; database `idle_in_transaction_time`; prepared-xacts
   count/max age/XID age; lock graph.
-- **Расчёт и время:** repeated gauge maxima/counts в `P/I`; prepared rows или
-  idle-in-transaction должны предшествовать росту dead tuples/freeze headroom
-  и, для lock claim, иметь edge. Wall-clock и XID age показываются отдельно.
+- **Расчёт и время:** activity ages/start times и prepared count/max ages —
+  gauges; для них считаются repeated maxima/counts в `P/I` без typed delta.
+  Database `idle_in_transaction_time` — cumulative counter, поэтому
+  используется только `d(idle_in_transaction_time)/dt`. Prepared/idle evidence
+  должно предшествовать росту dead tuples/freeze pressure; lock claim требует
+  edge. Wall-clock и XID age показываются отдельно.
 - **Cap и альтернативы:** legitimate long report/maintenance, replication
   worker, transaction without relevant relation. Большой xmin age не доказывает
   блокировку конкретного vacuum без relation-level horizon evidence.
@@ -470,11 +534,16 @@ series запрещены. Top-K findings поддерживается bounded h
 - **Вопрос и роль:** приблизилось ли число backends к лимиту и вырос ли churn
   соединений при снижении throughput? Роль — `lead`/`amplifier`; cap `medium`.
 - **Вход:** database `numbackends`, `sessions`, `sessions_*`, xact counters;
-  activity counts by state/backend type; settings `max_connections`, per-DB
-  `datconnlimit`; cgroup pids/process memory как отдельное evidence.
-- **Расчёт и время:** gauges `sum(numbackends)/max_connections` и per-DB finite
-  limit; rates sessions and xacts; state composition. Не использовать
-  `work_mem * connections` как измерение памяти.
+  activity counts by state/backend type; settings `max_connections` и reserved
+  slots, per-DB `datconnlimit`; cgroup pids/process memory как отдельное
+  evidence.
+- **Расчёт и время:** gauge count activity rows с
+  `backend_type='client backend'` делится на `max_connections`; per-DB client
+  count — на положительный `datconnlimit`. `numbackends` показывается как
+  database-level cross-check, но не смешивается с лимитом client slots. Rates
+  sessions/xacts и state composition считаются отдельно. Reserved slots
+  показываются в evidence; `work_mem * connections` не является измерением
+  памяти.
 - **Cap и альтернативы:** pool resize, idle but harmless sessions, maintenance,
   parallel workers, low TPS by design. CPU/memory/lock effect должен иметь свои
   метрики.
@@ -550,14 +619,17 @@ series запрещены. Top-K findings поддерживается bounded h
 - **Вход:** activity snapshots, settings `synchronous_commit` и
   `synchronous_standby_names`, replica state/sync_state/LSN gaps, network and
   standby resource evidence при наличии.
-- **Расчёт и время:** per-snapshot count and duration proxy from query/state
-  start; минимум три снимка, если нет typed lock/event. SyncRep concentration в
-  `I` должна совпасть со снижением commit rate/ростом active time.
+- **Расчёт и время:** per-snapshot count и persistence по последовательным
+  снимкам; минимум три снимка. `query_start` и `state_change` не являются
+  началом SyncRep wait и не используются как его duration. Концентрация в `I`
+  должна совпасть со снижением commit rate/ростом active time.
 - **Cap и альтернативы:** standby disk/apply, network, walsender scheduling,
-  configured remote_apply semantics. Без per-socket/standby OS нельзя назвать
-  сеть причиной.
-- **Показать:** waiting PIDs/query identities, sample count, settings,
-  sync_state, LSN gaps, xact rate and external evidence.
+  configured remote_apply semantics. `pg_settings.synchronous_commit` не
+  доказывает значение в конкретной producer session. Без per-socket/standby OS
+  нельзя назвать сеть причиной.
+- **Показать:** waiting PIDs/query identities, timestamps и число samples,
+  query/state start только как context, settings, sync_state, LSN gaps, xact
+  rate and external evidence.
 - **DQ:** standard; `wait_event=NULL` under insufficient privileges/coverage is
   unknown. Snapshot sampling пропускает короткие waits.
 
@@ -592,14 +664,16 @@ OS finding связывается с PostgreSQL только при совпад
 - **Вход:** aggregate `os_cpu cpu_id=-1`, host PSI CPU `some`, loadavg,
   procs_running and topology. Linux, при наличии procfs/PSI.
 - **Расчёт и время:**
-  `work=d(user-guest)+d(nice-guest_nice)+d(system+irq+softirq)`,
-  `total=work+d(idle+iowait+steal)`; показывать `work/total`, `iowait/total`,
-  `steal/total`, runnable/core и `d(PSI some_total)/dt`. Guest ticks уже входят
-  в user/nice и второй раз не прибавляются. Pressure в `P/I`, PG latency в
-  `I/D`.
+  `busy=d(user+nice+system+irq+softirq)`,
+  `total=busy+d(idle+iowait+steal)`; показывать `busy/total`, `iowait/total`,
+  `steal/total`, runnable/core и `d(PSI some_total)/dt`. `guest` и `guest_nice`
+  уже включены в `user` и `nice`: их не вычитают и не прибавляют повторно.
+  Pressure в `P/I`, PG latency в `I/D`.
 - **Cap и альтернативы:** other host workloads, CPU hotplug, VM clock/accounting,
   intentional batch. Busy без PSI означает demand, но не доказанную starvation;
-  steal не идентифицирует noisy neighbor.
+  steal не идентифицирует noisy neighbor. Kernel допускает уменьшение iowait,
+  поэтому отрицательная delta этой колонки считается data anomaly, а сама доля
+  не используется как точный учёт I/O stalls.
 - **Показать:** все tick deltas/shares, HZ, cores, load/runnable, PSI total/avg,
   top process CPU and PG symptoms.
 - **DQ:** standard; counter reset при boot/CPU reattach разрывает ряд.
@@ -614,8 +688,8 @@ OS finding связывается с PostgreSQL только при совпад
   activity/process, cgroup CPU usage/throttled/nr_throttled/quota/period, host
   CPU/PSI.
 - **Расчёт и время:** positive deltas throttled_usec and nr_throttled in `P/I`,
-  quota finite, host not saturated; `d(throttled_usec)/dt` is shown as a rate,
-  not a percent of wall time.
+  quota finite, host not saturated; `d(throttled_usec)/elapsed_s` показывается
+  в µs/s, не как процент wall time.
 - **Cap и альтернативы:** intentional quota, ancestor throttling, migration
   between cgroups, other processes in same cgroup. Collector lacks `nr_periods`,
   so fraction of throttled periods is unavailable.
@@ -669,7 +743,8 @@ OS finding связывается с PostgreSQL только при совпад
 - **Расчёт и время:** `d(read_time_ms)/d(reads)`,
   `d(write_time_ms)/d(writes)`, optional flush time/op; average in-flight proxy
   `d(io_weighted_time_ms)/dt_ms`; `io_in_progress` gauge; bytes from sectors*512.
-  Требуются positive operation denominators.
+  Каждое отношение использует одинаковые валидные пары и positive denominator;
+  weighted ratio — оценка среднего числа in-flight requests, не utilization.
 - **Cap и альтернативы:** device mapper layering, partitions vs whole disk,
   page cache, remote/network filesystem, discard/flush mix. `io_time_ms/dt` не
   используется как доказательство saturation: при parallel I/O он не измеряет
@@ -709,8 +784,9 @@ OS finding связывается с PostgreSQL только при совпад
   pressure in `P/I`. PID-only bytes без device остаются association.
 - **Cap и альтернативы:** process exit/PID reuse, permissions, buffered writes,
   shared cgroup, device mapper. `rchar/wchar` не используются как block bytes.
-- **Показать:** process identity/starttime/command, actual read/write/cancelled
-  deltas, mapping, cgroup device bytes/ops, disk evidence and PG symptom.
+- **Показать:** process identity/starttime/command, deltas
+  `read_bytes/write_bytes/cancelled_write_bytes`, mapping, cgroup device
+  bytes/ops, disk evidence and PG symptom.
 - **DQ:** standard; process/cgroup caps and permission NULL lower confidence;
   no negative inference from missing PID. `/proc/PID/io` semantics —
   [procfs documentation](https://docs.kernel.org/filesystems/proc.html).
@@ -721,14 +797,14 @@ OS finding связывается с PostgreSQL только при совпад
   `lead`/`amplifier`; cap `high` для наблюдаемого zero/near-zero headroom,
   `medium` для привязки к PostgreSQL.
 - **Вход:** mountinfo total/free bytes, mount/source/fstype/major/minor;
-  `pg_settings.data_directory` and tablespaces when mapping is resolvable;
-  archive/slot/WAL evidence.
+  `pg_settings.data_directory`; archive/slot/WAL evidence. Имена tablespace в
+  relation rows не содержат filesystem path и не участвуют в mount attribution.
 - **Расчёт и время:** gauge `free_bytes/total_bytes` and absolute free bytes;
   минимум две materialized segment copies либо один exact ENOSPC-like PG log.
   Threshold является продуктовой policy и показывается в evidence.
 - **Cap и альтернативы:** reserved blocks, quotas, thin provisioning, overlay,
-  WAL/tablespace symlink outside mapped mount. Низкий free space может быть
-  coincident без error/growth evidence.
+  WAL symlink или tablespace вне mapped data-directory mount. Низкий free space
+  может быть coincident без error/growth evidence.
 - **Показать:** mount/source/fstype/scope, total/free/ratio/threshold, resolved PG
   path, slot/archive/WAL rates and errors.
 - **DQ:** `NULL` statvfs -> not evaluated; zero is real zero. Inode exhaustion
