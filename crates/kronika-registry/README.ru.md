@@ -55,8 +55,9 @@
 таймлайн для совпавших identity строк. Интервал диффа становится
 `not_collected`, если выбранный гейт не был достоверно включён во всех
 наблюдавшихся состояниях интервала.
-Planning-time поля пока не гейтятся: текущий layout `reset_metadata` не хранит
-`track_planning`, а его расширение требует нового `type_id`.
+Planning counters/timings (`pg_stat_statements.plans` и `*_plan_time`, а также
+`pg_store_plans.*_plan_time`) пока не гейтятся: текущий layout `reset_metadata`
+не хранит `track_planning`, а его расширение требует нового `type_id`.
 
 `ColumnType` — тип значения на диске: целочисленные и плавающие базовые типы
 (`I8`…`I64`, `U8`…`U64`, `F32`/`F64`), `Bool`, `Ts` (`i64`, временная метка) и `StrId`
