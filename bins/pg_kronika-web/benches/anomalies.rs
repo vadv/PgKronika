@@ -1,10 +1,7 @@
-//! Full-scan budget benchmark: `GET /v1/anomalies` end to end.
+//! End-to-end `GET /v1/anomalies` benchmark.
 //!
-//! The design note fixes the budget at 1-2 s for a typical period. The fixture
-//! is a two-hour, 10-second-cadence source: `pg_stat_statements` with 200
-//! series over 44 columns (the dominant cost), plus the archiver and
-//! bgwriter singletons. The request runs the whole path: batch gather,
-//! per-series diff fold, sliding-window scoring, ranking, JSON.
+//! The fixture covers two hours at 10-second cadence with 200 statement
+//! series, plus archiver and bgwriter singletons.
 
 #![allow(
     missing_docs,

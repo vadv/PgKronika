@@ -161,8 +161,6 @@ mod tests {
 
     #[test]
     fn a_non_finite_or_negative_threshold_yields_no_episodes() {
-        // A NaN cutoff would make `|m| > threshold` always false (silent
-        // shutdown); a negative one would flag everything. Both must be inert.
         let profile = vec![(0, eval(5.0)), (10, eval(6.0))];
         assert!(
             episodes(&profile, f64::NAN).is_empty(),
@@ -176,8 +174,6 @@ mod tests {
 
     #[test]
     fn a_sign_flip_within_a_run_stays_one_episode_with_the_peak_direction() {
-        // Spike then plunge with no below-threshold gap: one contiguous episode,
-        // its direction is the peak's (the larger |m|). Pins the merge semantics.
         let profile = vec![(0, eval(4.0)), (10, eval(-6.0)), (20, eval(-5.0))];
         let found = episodes(&profile, 3.5);
         assert_eq!(
@@ -195,8 +191,6 @@ mod tests {
 
     #[test]
     fn a_tie_in_absolute_score_keeps_the_earlier_peak() {
-        // Both positions are |m| = 6 above threshold; the strict `>` keeps the
-        // earlier one as the peak, matching the documented contract.
         let profile = vec![(0, eval(6.0)), (10, eval(-6.0))];
         let found = episodes(&profile, 3.5);
         assert_eq!(found.len(), 1);
