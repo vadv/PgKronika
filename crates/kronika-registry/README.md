@@ -53,8 +53,10 @@ A cumulative column may declare `gated_by`, a reference to a singleton `Bool`
 timeline. `gate_override = "label=value=>section.column"` selects a different
 timeline for matching row identities. A diff interval is `not_collected` unless
 the selected gate is known on at every sampled state in that interval.
-Planning-time fields are not gated: the current `reset_metadata` layout does
-not record `track_planning`, and changing that layout requires a new `type_id`.
+Planning counters and timings (`pg_stat_statements.plans` and `*_plan_time`,
+plus `pg_store_plans.*_plan_time`) are not gated: the current `reset_metadata`
+layout does not record `track_planning`, and changing it requires a new
+`type_id`.
 
 `ColumnType` is the on-disk value type: the integer and float base types
 (`I8`…`I64`, `U8`…`U64`, `F32`/`F64`), `Bool`, `Ts` (an `i64` timestamp), and
