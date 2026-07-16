@@ -1,5 +1,6 @@
-//! Anomaly-endpoint step glue: seal one calm-then-loaded collector run, then
-//! check `/v1/anomalies` reports the load as an episode.
+//! Detector step glue: timer-driven collector runs sealed as one segment,
+//! checked through `/v1/anomalies` (load plateau) and `/v1/section/{name}/diff`
+//! (GUC-gated timings).
 
 use anyhow::{Context, Result, ensure};
 use cucumber::{then, when};
@@ -7,6 +8,87 @@ use cucumber::{then, when};
 use crate::BddWorld;
 use crate::collector::Collector;
 use crate::harness::web;
+
+/// Run the collector on its one-second internal timer with no extra load,
+/// then seal one continuous segment.
+#[when(regex = r"^the collector ticks for (\d+) seconds and seals the segment$")]
+async fn collector_ticks_calm(world: &mut BddWorld, seconds: u64) -> Result<()> {
+    let cluster = world.harness.cluster()?;
+    let mut extra_env = world.harness.collector_env().to_vec();
+    extra_env.push(("KRONIKA_INTERVAL_S".to_owned(), "1".to_owned()));
+    extra_env.push(("KRONIKA_PG_DATABASE_INTERVAL_S".to_owned(), "1".to_owned()));
+    let mut collector = Collector::spawn_with_env(cluster, &extra_env).await?;
+    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+    let segment = collector.snapshot().await?;
+    world.harness.set_collector_log(collector.stderr_captured());
+    if let Some(dir) = collector.take_output_dir() {
+        world.harness.retain_collector_output_dir(dir);
+    }
+    world.harness.set_segment(segment);
+    Ok(())
+}
+
+/// Points of one diff column of one series, from `/v1/section/{name}/diff`.
+async fn diff_column_points(
+    world: &mut BddWorld,
+    section: &str,
+    column: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let segment = world.harness.segment()?.clone();
+    let dir = segment
+        .parent()
+        .context("the sealed segment has no parent directory")?;
+    let source = web::only_source(dir).await?;
+    let diff = web::section_diff(dir, section, source).await?;
+    let series = diff["series"]
+        .as_array()
+        .context("`series` is not an array")?;
+    let with_points = series
+        .iter()
+        .filter_map(|s| s["columns"][column].as_array())
+        .find(|points| points.len() > 1)
+        .with_context(|| format!("no series with {column} points; diff: {diff}"))?;
+    Ok(with_points.clone())
+}
+
+/// Assert every pair of the column (after the honest `FirstPoint`) reads
+/// `not_collected`.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(
+    regex = r"^the web API diffs column (\w+) of section ([\w.+-]+) as not collected throughout$"
+)]
+async fn web_diffs_column_not_collected(
+    world: &mut BddWorld,
+    column: String,
+    section: String,
+) -> Result<()> {
+    let points = diff_column_points(world, &section, &column).await?;
+    ensure!(
+        points[1..]
+            .iter()
+            .all(|point| point["nodata"] == "not_collected"),
+        "every pair of {section}.{column} must read not_collected: {points:?}"
+    );
+    Ok(())
+}
+
+/// Assert the column still carries numeric rates (its gate did not fire).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^the web API keeps rates for column (\w+) of section ([\w.+-]+)$")]
+async fn web_keeps_rates(world: &mut BddWorld, column: String, section: String) -> Result<()> {
+    let points = diff_column_points(world, &section, &column).await?;
+    ensure!(
+        points[1..].iter().all(|point| point["rate"].is_number()),
+        "{section}.{column} must keep numeric rates: {points:?}"
+    );
+    Ok(())
+}
 
 /// Run the collector on its one-second internal timer so every snapshot
 /// lands in one continuous segment (signal-sealed single-snapshot segments

@@ -1,6 +1,6 @@
 //! Union view of a logical section across its layout versions.
 
-use kronika_registry::{ColumnClass, ColumnType, registry};
+use kronika_registry::{ColumnClass, ColumnType, SectionColumnRef, registry};
 
 /// One column in a logical section's union schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +11,8 @@ pub struct LogicalColumn {
     pub ty: ColumnType,
     /// The column's role; `Cumulative` marks a counter the diff layer rates.
     pub class: ColumnClass,
+    /// The boolean gate the column's values depend on, if declared.
+    pub gated_by: Option<SectionColumnRef>,
 }
 
 /// A logical section: the union of all layout versions sharing the same name.
@@ -120,6 +122,7 @@ pub fn logical_section(name: &str) -> Option<LogicalSection> {
                     name: col.name,
                     ty: col.ty,
                     class: col.class,
+                    gated_by: col.gated_by,
                 });
             }
         }

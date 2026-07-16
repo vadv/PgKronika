@@ -38,13 +38,13 @@ pub struct PgStatIoV1 {
     pub reads: Option<i64>,
     /// Time spent reading, ms. `None` only where the backend performs no reads;
     /// `0.0` (not `None`) when `track_io_timing` is off.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub read_time: Option<f64>,
     /// Write operations.
     #[column(c)]
     pub writes: Option<i64>,
     /// Time spent writing, ms.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub write_time: Option<f64>,
     /// Writeback operations.
     #[column(c)]
@@ -117,7 +117,7 @@ pub struct PgStatIoV2 {
     pub read_bytes: Option<i64>,
     /// Time spent reading, ms. `None` only where the backend performs no reads;
     /// `0.0` (not `None`) when `track_io_timing` is off.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub read_time: Option<f64>,
     /// Write operations.
     #[column(c)]
@@ -126,7 +126,7 @@ pub struct PgStatIoV2 {
     #[column(c)]
     pub write_bytes: Option<i64>,
     /// Time spent writing, ms.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_io_timing")]
     pub write_time: Option<f64>,
     /// Writeback operations.
     #[column(c)]

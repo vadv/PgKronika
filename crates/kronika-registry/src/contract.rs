@@ -100,6 +100,18 @@ pub struct Ts(pub i64);
 #[repr(transparent)]
 pub struct StrId(pub u64);
 
+/// A column of another section, referenced by logical names.
+///
+/// Contracts are consts, so the type system cannot resolve the reference;
+/// [`lint`] checks that the section and column exist and fit the declared use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionColumnRef {
+    /// Logical section name, e.g. `"reset_metadata"`.
+    pub section: &'static str,
+    /// Column name inside that section.
+    pub column: &'static str,
+}
+
 /// One column of a typed section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Column {
@@ -111,6 +123,10 @@ pub struct Column {
     pub class: ColumnClass,
     /// Whether the column may be `NULL`.
     pub nullable: bool,
+    /// The boolean gate this column's values depend on: while the referenced
+    /// GUC column reads `false`, the source does not measure this value, so a
+    /// zero means "not collected", never "measured zero".
+    pub gated_by: Option<SectionColumnRef>,
 }
 
 /// How a source is collected (README.md, "Collection Semantics").
@@ -213,6 +229,14 @@ pub enum LintError {
         /// The class whose declaration failed validation.
         class: ColumnClass,
     },
+    /// A `gated_by` reference does not resolve to a `Bool` column of a known
+    /// section.
+    BadGatedBy {
+        /// The raw id whose column declares the reference.
+        type_id: u32,
+        /// The column carrying the `gated_by` declaration.
+        column: &'static str,
+    },
 }
 
 impl fmt::Display for LintError {
@@ -255,6 +279,13 @@ impl fmt::Display for LintError {
                 write!(
                     f,
                     "column class {class:?} declares an eps_abs that is not positive and finite"
+                )
+            }
+            Self::BadGatedBy { type_id, column } => {
+                write!(
+                    f,
+                    "type_id {type_id} column {column:?} declares a gated_by that does not \
+                     resolve to a Bool column of a known section"
                 )
             }
         }
@@ -320,6 +351,46 @@ fn lint_eps_abs(class: ColumnClass, eps_abs: Option<f64>, out: &mut Vec<LintErro
     }
 }
 
+/// Check cross-section references of every contract: a `gated_by` must name
+/// a `Bool` column of a section present in `contracts`.
+///
+/// Separate from [`lint`], which holds for any subset (codec tests lint one
+/// contract): references only resolve against the whole registry table.
+///
+/// # Errors
+///
+/// Returns every unresolved reference found across `contracts`.
+pub fn lint_references(contracts: &[TypeContract]) -> Result<(), Vec<LintError>> {
+    let mut out = Vec::new();
+    for contract in contracts {
+        for column in contract.columns {
+            let Some(gate) = column.gated_by else {
+                continue;
+            };
+            if !resolves_to_bool(contracts, gate) {
+                out.push(LintError::BadGatedBy {
+                    type_id: contract.type_id.get(),
+                    column: column.name,
+                });
+            }
+        }
+    }
+    if out.is_empty() { Ok(()) } else { Err(out) }
+}
+
+/// Whether `gate` names a `Bool` column of any contract version sharing the
+/// referenced section name.
+fn resolves_to_bool(contracts: &[TypeContract], gate: SectionColumnRef) -> bool {
+    contracts
+        .iter()
+        .filter(|contract| contract.name == gate.section)
+        .any(|contract| {
+            contract
+                .column(gate.column)
+                .is_some_and(|column| matches!(column.ty, ColumnType::Bool))
+        })
+}
+
 /// Check every contract, the cross-type uniqueness of ids, and the per-class
 /// `eps_abs` declarations.
 ///
@@ -354,6 +425,7 @@ pub fn lint(contracts: &[TypeContract]) -> Result<(), Vec<LintError>> {
 mod tests {
     use super::{
         Column, ColumnClass, ColumnType, LintError, Semantics, TypeContract, lint, lint_eps_abs,
+        lint_references,
     };
     use crate::TypeId;
 
@@ -362,12 +434,14 @@ mod tests {
         ty: ColumnType::Ts,
         class: ColumnClass::Timestamp,
         nullable: false,
+        gated_by: None,
     };
     const VALUE: Column = Column {
         name: "value",
         ty: ColumnType::I64,
         class: ColumnClass::Cumulative,
         nullable: false,
+        gated_by: None,
     };
 
     fn contract(
@@ -439,6 +513,71 @@ mod tests {
     }
 
     #[test]
+    fn gated_by_resolves_against_a_bool_column_of_a_named_section() {
+        const BOOL_GATE: Column = Column {
+            name: "track_io_timing",
+            ty: ColumnType::Bool,
+            class: ColumnClass::Label,
+            nullable: true,
+            gated_by: None,
+        };
+        const TEXT_GATE: Column = Column {
+            name: "track_io_timing",
+            ty: ColumnType::StrId,
+            class: ColumnClass::Label,
+            nullable: true,
+            gated_by: None,
+        };
+        const TIMED: Column = Column {
+            name: "blk_read_time",
+            ty: ColumnType::F64,
+            class: ColumnClass::Cumulative,
+            nullable: false,
+            gated_by: Some(super::SectionColumnRef {
+                section: "meta",
+                column: "track_io_timing",
+            }),
+        };
+        let timed_section = TypeContract {
+            name: "timed",
+            ..contract(1_006_001, &[TS, TIMED], &["ts"])
+        };
+        let meta_section = TypeContract {
+            name: "meta",
+            ..contract(1_006_002, &[TS, BOOL_GATE], &["ts"])
+        };
+        assert_eq!(
+            lint_references(&[timed_section, meta_section]),
+            Ok(()),
+            "resolvable gate lints clean"
+        );
+
+        // The reference points at a section no contract carries.
+        assert_eq!(
+            lint_references(&[timed_section]),
+            Err(vec![LintError::BadGatedBy {
+                type_id: 1_006_001,
+                column: "blk_read_time"
+            }]),
+            "an unknown gate section is rejected"
+        );
+
+        // The section exists but the gate column is not Bool there.
+        let text_meta_section = TypeContract {
+            name: "meta",
+            ..contract(1_006_002, &[TS, TEXT_GATE], &["ts"])
+        };
+        assert_eq!(
+            lint_references(&[timed_section, text_meta_section]),
+            Err(vec![LintError::BadGatedBy {
+                type_id: 1_006_001,
+                column: "blk_read_time"
+            }]),
+            "a non-Bool gate column is rejected"
+        );
+    }
+
+    #[test]
     fn an_empty_registry_lints_clean() {
         // Also pins the built-in per-class eps_abs declarations, which are
         // linted regardless of the contract list.
@@ -505,6 +644,7 @@ mod tests {
             ty: ColumnType::I64,
             class: ColumnClass::Label,
             nullable: true,
+            gated_by: None,
         };
         let c = TypeContract {
             identity: &["queryid"],
@@ -530,6 +670,7 @@ mod tests {
             ty: ColumnType::Ts,
             class: ColumnClass::Timestamp,
             nullable: true,
+            gated_by: None,
         };
         let c = contract(1_006_001, &[BAD_TS], &["ts"]);
         assert_eq!(
@@ -550,6 +691,7 @@ mod tests {
             ty: ColumnType::Ts,
             class: ColumnClass::Timestamp,
             nullable: false,
+            gated_by: None,
         };
         let c = contract(1_006_001, &[COLLECTED_AT], &["collected_at"]);
         assert_eq!(

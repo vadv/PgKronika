@@ -49,6 +49,11 @@ The scorable classes (`Cumulative`, `Gauge`) also declare `eps_abs` — the
 absolute floor of the anomaly-score scale (`ColumnClass::eps_abs`); `Label`
 and `Timestamp` columns are never scored and declare none.
 
+A column whose values exist only while a GUC is on declares `gated_by`, a
+reference to the `Bool` column carrying that GUC (today all gates live in
+`reset_metadata`). The diff layer rewrites deltas measured under an off gate
+to `not_collected`, so a zero never reads as "measured zero".
+
 `ColumnType` is the on-disk value type: the integer and float base types
 (`I8`…`I64`, `U8`…`U64`, `F32`/`F64`), `Bool`, `Ts` (an `i64` timestamp), and
 `StrId` (a `u64` reference into the segment string dictionary — the bytes live
@@ -70,6 +75,10 @@ span a contract or the whole registry:
 - a `Timestamp`-class column that is not the required non-nullable `ts`;
 - an identity name that is not a column, or names a non-`Label` column;
 - a column-class `eps_abs` declaration that is not positive and finite.
+
+`lint_references` checks what only the whole table can: a `gated_by` that
+does not resolve to a `Bool` column of a known section. Codec tests lint one
+contract; `lint_registry` runs both passes.
 
 ## Snapshot Sections
 

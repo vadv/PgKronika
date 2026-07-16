@@ -45,6 +45,8 @@ struct ColumnDef {
     /// decoded value back into it.
     wrapper: Option<Ident>,
     nullable: bool,
+    /// `gated_by = "section.column"` from the attribute, split at the dot.
+    gated_by: Option<(String, String)>,
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
@@ -168,8 +170,9 @@ fn parse_column(field: &syn::Field) -> syn::Result<ColumnDef> {
         .iter()
         .find(|a| a.path().is_ident("column"))
         .ok_or_else(|| syn::Error::new(field.span(), "field needs a #[column(class)] attribute"))?;
-    let class_ident: Ident = class_attr.parse_args()?;
-    let column_class = column_class(&class_ident)?;
+    let args: ColumnArgs = class_attr.parse_args()?;
+    let column_class = column_class(&args.class)?;
+    let gated_by = args.gated_by;
 
     let (inner, nullable) = unwrap_option(&field.ty);
 
@@ -185,6 +188,7 @@ fn parse_column(field: &syn::Field) -> syn::Result<ColumnDef> {
             arrow_type: None,
             wrapper: None,
             nullable: false,
+            gated_by,
         });
     }
 
@@ -199,7 +203,47 @@ fn parse_column(field: &syn::Field) -> syn::Result<ColumnDef> {
         arrow_type,
         wrapper,
         nullable,
+        gated_by,
     })
+}
+
+/// Arguments of `#[column(...)]`: the class ident, then an optional
+/// `gated_by = "section.column"` pair.
+struct ColumnArgs {
+    class: Ident,
+    gated_by: Option<(String, String)>,
+}
+
+impl syn::parse::Parse for ColumnArgs {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let class: Ident = input.parse()?;
+        let gated_by = if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            let key: Ident = input.parse()?;
+            if key != "gated_by" {
+                return Err(syn::Error::new(key.span(), "expected `gated_by`"));
+            }
+            input.parse::<syn::Token![=]>()?;
+            let value: LitStr = input.parse()?;
+            let raw = value.value();
+            let Some((section, column)) = raw.split_once('.') else {
+                return Err(syn::Error::new(
+                    value.span(),
+                    "gated_by must be \"section.column\"",
+                ));
+            };
+            if section.is_empty() || column.is_empty() || column.contains('.') {
+                return Err(syn::Error::new(
+                    value.span(),
+                    "gated_by must be \"section.column\"",
+                ));
+            }
+            Some((section.to_owned(), column.to_owned()))
+        } else {
+            None
+        };
+        Ok(Self { class, gated_by })
+    }
 }
 
 fn column_class(ident: &Ident) -> syn::Result<Ident> {
@@ -322,12 +366,23 @@ fn build_contract(header: &Header, columns: &[ColumnDef]) -> TokenStream2 {
         let ty = &c.column_type;
         let class = &c.column_class;
         let nullable = c.nullable;
+        let gated_by = if let Some((section, column)) = &c.gated_by {
+            quote! {
+                ::core::option::Option::Some(::kronika_registry::SectionColumnRef {
+                    section: #section,
+                    column: #column,
+                })
+            }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
         quote! {
             ::kronika_registry::Column {
                 name: #name,
                 ty: ::kronika_registry::ColumnType::#ty,
                 class: ::kronika_registry::ColumnClass::#class,
                 nullable: #nullable,
+                gated_by: #gated_by,
             }
         }
     });
