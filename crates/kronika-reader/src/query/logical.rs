@@ -1,6 +1,6 @@
 //! Union view of a logical section across its layout versions.
 
-use kronika_registry::{ColumnClass, ColumnType, registry};
+use kronika_registry::{CollectionGate, ColumnClass, ColumnType, registry};
 
 /// One column in a logical section's union schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +11,8 @@ pub struct LogicalColumn {
     pub ty: ColumnType,
     /// The column's role; `Cumulative` marks a counter the diff layer rates.
     pub class: ColumnClass,
+    /// Collection gate for this cumulative column.
+    pub gated_by: Option<CollectionGate>,
 }
 
 /// A logical section: the union of all layout versions sharing the same name.
@@ -55,6 +57,39 @@ impl LogicalSection {
     }
 }
 
+fn merge_gate(
+    current: &mut Option<CollectionGate>,
+    candidate: Option<CollectionGate>,
+    section: &str,
+    column: &str,
+) {
+    let (Some(existing), Some(candidate)) = (*current, candidate) else {
+        if current.is_none() {
+            *current = candidate;
+        }
+        return;
+    };
+    assert_eq!(
+        existing.default, candidate.default,
+        "registry violation: {section}.{column} has conflicting default gates"
+    );
+    let candidate_contains = existing
+        .overrides
+        .iter()
+        .all(|rule| candidate.overrides.contains(rule));
+    let existing_contains = candidate
+        .overrides
+        .iter()
+        .all(|rule| existing.overrides.contains(rule));
+    assert!(
+        candidate_contains || existing_contains,
+        "registry violation: {section}.{column} has incompatible row gate overrides"
+    );
+    if candidate.overrides.len() > existing.overrides.len() {
+        *current = Some(candidate);
+    }
+}
+
 /// Build the union view of a logical section by name.
 ///
 /// Returns `None` when no registered contract carries that name.
@@ -94,7 +129,7 @@ pub fn logical_section(name: &str) -> Option<LogicalSection> {
     let mut columns: Vec<LogicalColumn> = Vec::new();
     for contract in &contracts {
         for col in contract.columns {
-            if let Some(existing) = columns.iter().find(|lc| lc.name == col.name) {
+            if let Some(existing) = columns.iter_mut().find(|lc| lc.name == col.name) {
                 assert!(
                     existing.ty == col.ty,
                     "registry violation: logical section {:?} column {:?} has \
@@ -105,6 +140,7 @@ pub fn logical_section(name: &str) -> Option<LogicalSection> {
                     contract.type_id.get(),
                     col.ty,
                 );
+                merge_gate(&mut existing.gated_by, col.gated_by, name, col.name);
                 assert!(
                     existing.class == col.class,
                     "registry violation: logical section {:?} column {:?} has \
@@ -120,6 +156,7 @@ pub fn logical_section(name: &str) -> Option<LogicalSection> {
                     name: col.name,
                     ty: col.ty,
                     class: col.class,
+                    gated_by: col.gated_by,
                 });
             }
         }

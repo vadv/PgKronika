@@ -100,6 +100,45 @@ pub struct Ts(pub i64);
 #[repr(transparent)]
 pub struct StrId(pub u64);
 
+/// A column of another section, referenced by logical names.
+///
+/// Contracts are consts, so the type system cannot resolve the reference;
+/// [`lint`] checks that the section and column exist and fit the declared use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionColumnRef {
+    /// Logical section name, e.g. `"reset_metadata"`.
+    pub section: &'static str,
+    /// Column name inside that section.
+    pub column: &'static str,
+}
+
+/// A gate selected for rows whose string label equals `value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowGateOverride {
+    /// Label column used to select the gate.
+    pub column: &'static str,
+    /// Dictionary value that activates this override.
+    pub value: &'static str,
+    /// Gate used for matching rows.
+    pub gate: SectionColumnRef,
+}
+
+/// Collection state required for a cumulative column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionGate {
+    /// Gate used when no row override matches.
+    pub default: SectionColumnRef,
+    /// Row-specific gate overrides.
+    pub overrides: &'static [RowGateOverride],
+}
+
+impl CollectionGate {
+    /// Every referenced gate, including the default.
+    pub fn references(self) -> impl Iterator<Item = SectionColumnRef> {
+        std::iter::once(self.default).chain(self.overrides.iter().map(|rule| rule.gate))
+    }
+}
+
 /// One column of a typed section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Column {
@@ -111,6 +150,8 @@ pub struct Column {
     pub class: ColumnClass,
     /// Whether the column may be `NULL`.
     pub nullable: bool,
+    /// Collection state required for this cumulative value.
+    pub gated_by: Option<CollectionGate>,
 }
 
 /// How a source is collected (README.md, "Collection Semantics").
@@ -213,6 +254,37 @@ pub enum LintError {
         /// The class whose declaration failed validation.
         class: ColumnClass,
     },
+    /// A `gated_by` reference does not resolve to a `Bool` column of a known
+    /// section.
+    BadGatedBy {
+        /// The raw id whose column declares the reference.
+        type_id: u32,
+        /// The column carrying the `gated_by` declaration.
+        column: &'static str,
+    },
+    /// Gating is declared for a class the diff interpreter does not gate.
+    UnsupportedGatedClass {
+        /// The raw id whose column declares the gate.
+        type_id: u32,
+        /// The gated column.
+        column: &'static str,
+    },
+    /// A row gate selector is not a stable, non-null string identity label.
+    BadGateSelector {
+        /// The raw id whose column declares the selector.
+        type_id: u32,
+        /// The gated column.
+        column: &'static str,
+        /// The selector column.
+        selector: &'static str,
+    },
+    /// Versions of one logical column declare incompatible gates.
+    InconsistentGate {
+        /// The raw id where the conflict was found.
+        type_id: u32,
+        /// The gated column.
+        column: &'static str,
+    },
 }
 
 impl fmt::Display for LintError {
@@ -257,6 +329,29 @@ impl fmt::Display for LintError {
                     "column class {class:?} declares an eps_abs that is not positive and finite"
                 )
             }
+            Self::BadGatedBy { type_id, column } => {
+                write!(
+                    f,
+                    "type_id {type_id} column {column:?} declares a gated_by that does not \
+                     resolve to a Bool column of a known section"
+                )
+            }
+            Self::UnsupportedGatedClass { type_id, column } => write!(
+                f,
+                "type_id {type_id} column {column:?} declares a gate but is not Cumulative"
+            ),
+            Self::BadGateSelector {
+                type_id,
+                column,
+                selector,
+            } => write!(
+                f,
+                "type_id {type_id} column {column:?} has invalid gate selector {selector:?}"
+            ),
+            Self::InconsistentGate { type_id, column } => write!(
+                f,
+                "type_id {type_id} column {column:?} conflicts with another layout version's gate"
+            ),
         }
     }
 }
@@ -308,6 +403,12 @@ fn lint_contract(contract: &TypeContract, out: &mut Vec<LintError>) {
                 column: column.name,
             });
         }
+        if column.gated_by.is_some() && column.class != ColumnClass::Cumulative {
+            out.push(LintError::UnsupportedGatedClass {
+                type_id: raw,
+                column: column.name,
+            });
+        }
     }
 }
 
@@ -317,6 +418,164 @@ fn lint_eps_abs(class: ColumnClass, eps_abs: Option<f64>, out: &mut Vec<LintErro
         && !(value.is_finite() && value > 0.0)
     {
         out.push(LintError::BadEpsAbs { class });
+    }
+}
+
+/// Check cross-section references of every contract: a `gated_by` must name
+/// a `Bool` column of a section present in `contracts`.
+///
+/// Separate from [`lint`], which holds for any subset (codec tests lint one
+/// contract): references only resolve against the whole registry table.
+///
+/// # Errors
+///
+/// Returns every unresolved reference found across `contracts`.
+pub fn lint_references(contracts: &[TypeContract]) -> Result<(), Vec<LintError>> {
+    let mut out = Vec::new();
+    for contract in contracts {
+        for column in contract.columns {
+            let Some(gate) = column.gated_by else {
+                continue;
+            };
+            if gate
+                .references()
+                .any(|reference| !resolves_to_bool(contracts, reference))
+            {
+                out.push(LintError::BadGatedBy {
+                    type_id: contract.type_id.get(),
+                    column: column.name,
+                });
+            }
+            for rule in gate.overrides {
+                if !valid_selector(contracts, contract, column.name, rule.column) {
+                    out.push(LintError::BadGateSelector {
+                        type_id: contract.type_id.get(),
+                        column: column.name,
+                        selector: rule.column,
+                    });
+                }
+            }
+        }
+    }
+    lint_gate_consistency(contracts, &mut out);
+    if out.is_empty() { Ok(()) } else { Err(out) }
+}
+
+/// Whether every layout of the referenced section exposes the same Bool gate.
+fn resolves_to_bool(contracts: &[TypeContract], gate: SectionColumnRef) -> bool {
+    let matching: Vec<_> = contracts
+        .iter()
+        .filter(|contract| contract.name == gate.section)
+        .collect();
+    !matching.is_empty()
+        && matching.iter().all(|contract| {
+            contract
+                .column(gate.column)
+                .is_some_and(|column| matches!(column.ty, ColumnType::Bool))
+                && contract.identity.is_empty()
+                && contract.sort_key == ["ts"]
+        })
+}
+
+fn diff_key(contract: &TypeContract) -> Vec<&'static str> {
+    if contract.identity.is_empty() {
+        contract
+            .sort_key
+            .iter()
+            .copied()
+            .filter(|name| *name != "ts")
+            .collect()
+    } else {
+        contract.identity.to_vec()
+    }
+}
+
+fn valid_selector(
+    contracts: &[TypeContract],
+    source: &TypeContract,
+    gated_column: &str,
+    selector: &str,
+) -> bool {
+    contracts
+        .iter()
+        .filter(|contract| contract.name == source.name && contract.column(gated_column).is_some())
+        .all(|contract| {
+            contract.column(selector).is_some_and(|column| {
+                column.ty == ColumnType::StrId
+                    && column.class == ColumnClass::Label
+                    && !column.nullable
+                    && diff_key(contract).contains(&selector)
+            })
+        })
+}
+
+fn lint_gate_consistency(contracts: &[TypeContract], out: &mut Vec<LintError>) {
+    for (index, contract) in contracts.iter().enumerate() {
+        for column in contract.columns {
+            let Some(gate) = column.gated_by else {
+                continue;
+            };
+            if gate.overrides.iter().enumerate().any(|(index, rule)| {
+                gate.overrides[..index]
+                    .iter()
+                    .any(|earlier| earlier.column == rule.column && earlier.value == rule.value)
+            }) {
+                out.push(LintError::InconsistentGate {
+                    type_id: contract.type_id.get(),
+                    column: column.name,
+                });
+            }
+            for other in &contracts[..index] {
+                if other.name != contract.name {
+                    continue;
+                }
+                let Some(other_column) = other.column(column.name) else {
+                    continue;
+                };
+                let Some(other_gate) = other_column.gated_by else {
+                    out.push(LintError::InconsistentGate {
+                        type_id: contract.type_id.get(),
+                        column: column.name,
+                    });
+                    continue;
+                };
+                let contains_other = other_gate
+                    .overrides
+                    .iter()
+                    .all(|rule| gate.overrides.iter().any(|candidate| candidate == rule));
+                let other_contains = gate.overrides.iter().all(|rule| {
+                    other_gate
+                        .overrides
+                        .iter()
+                        .any(|candidate| candidate == rule)
+                });
+                let compatible =
+                    gate.default == other_gate.default && (contains_other || other_contains);
+                if !compatible {
+                    out.push(LintError::InconsistentGate {
+                        type_id: contract.type_id.get(),
+                        column: column.name,
+                    });
+                }
+            }
+        }
+        for column in contract
+            .columns
+            .iter()
+            .filter(|column| column.gated_by.is_none())
+        {
+            if contracts[..index].iter().any(|other| {
+                other.name == contract.name
+                    && other
+                        .column(column.name)
+                        .is_some_and(|other| other.gated_by.is_some())
+            }) {
+                out.push(LintError::InconsistentGate {
+                    type_id: contract.type_id.get(),
+                    column: column.name,
+                });
+            }
+        }
     }
 }
 
@@ -354,6 +613,7 @@ pub fn lint(contracts: &[TypeContract]) -> Result<(), Vec<LintError>> {
 mod tests {
     use super::{
         Column, ColumnClass, ColumnType, LintError, Semantics, TypeContract, lint, lint_eps_abs,
+        lint_references,
     };
     use crate::TypeId;
 
@@ -362,12 +622,14 @@ mod tests {
         ty: ColumnType::Ts,
         class: ColumnClass::Timestamp,
         nullable: false,
+        gated_by: None,
     };
     const VALUE: Column = Column {
         name: "value",
         ty: ColumnType::I64,
         class: ColumnClass::Cumulative,
         nullable: false,
+        gated_by: None,
     };
 
     fn contract(
@@ -439,6 +701,161 @@ mod tests {
     }
 
     #[test]
+    fn gated_by_resolves_against_a_bool_column_of_a_named_section() {
+        const BOOL_GATE: Column = Column {
+            name: "track_io_timing",
+            ty: ColumnType::Bool,
+            class: ColumnClass::Label,
+            nullable: true,
+            gated_by: None,
+        };
+        const TEXT_GATE: Column = Column {
+            name: "track_io_timing",
+            ty: ColumnType::StrId,
+            class: ColumnClass::Label,
+            nullable: true,
+            gated_by: None,
+        };
+        const TIMED: Column = Column {
+            name: "blk_read_time",
+            ty: ColumnType::F64,
+            class: ColumnClass::Cumulative,
+            nullable: false,
+            gated_by: Some(super::CollectionGate {
+                default: super::SectionColumnRef {
+                    section: "meta",
+                    column: "track_io_timing",
+                },
+                overrides: &[],
+            }),
+        };
+        let timed_section = TypeContract {
+            name: "timed",
+            ..contract(1_006_001, &[TS, TIMED], &["ts"])
+        };
+        let meta_section = TypeContract {
+            name: "meta",
+            ..contract(1_006_002, &[TS, BOOL_GATE], &["ts"])
+        };
+        assert_eq!(
+            lint_references(&[timed_section, meta_section]),
+            Ok(()),
+            "resolvable gate lints clean"
+        );
+
+        // The reference points at a section no contract carries.
+        assert_eq!(
+            lint_references(&[timed_section]),
+            Err(vec![LintError::BadGatedBy {
+                type_id: 1_006_001,
+                column: "blk_read_time"
+            }]),
+            "an unknown gate section is rejected"
+        );
+
+        // The section exists but the gate column is not Bool there.
+        let text_meta_section = TypeContract {
+            name: "meta",
+            ..contract(1_006_002, &[TS, TEXT_GATE], &["ts"])
+        };
+        assert_eq!(
+            lint_references(&[timed_section, text_meta_section]),
+            Err(vec![LintError::BadGatedBy {
+                type_id: 1_006_001,
+                column: "blk_read_time"
+            }]),
+            "a non-Bool gate column is rejected"
+        );
+        assert_eq!(
+            lint_references(&[timed_section, meta_section, text_meta_section]),
+            Err(vec![LintError::BadGatedBy {
+                type_id: 1_006_001,
+                column: "blk_read_time"
+            }]),
+            "every gate layout must expose the Bool column"
+        );
+    }
+
+    #[test]
+    fn lint_rejects_gates_on_uninterpreted_column_classes() {
+        const GATED_GAUGE: Column = Column {
+            name: "value",
+            ty: ColumnType::F64,
+            class: ColumnClass::Gauge,
+            nullable: false,
+            gated_by: Some(super::CollectionGate {
+                default: super::SectionColumnRef {
+                    section: "meta",
+                    column: "enabled",
+                },
+                overrides: &[],
+            }),
+        };
+        let gated = contract(1_006_001, &[TS, GATED_GAUGE], &["ts"]);
+        assert_eq!(
+            lint(&[gated]),
+            Err(vec![LintError::UnsupportedGatedClass {
+                type_id: 1_006_001,
+                column: "value",
+            }])
+        );
+    }
+
+    #[test]
+    fn lint_rejects_a_row_selector_outside_the_series_identity() {
+        const OBJECT: Column = Column {
+            name: "object",
+            ty: ColumnType::StrId,
+            class: ColumnClass::Label,
+            nullable: false,
+            gated_by: None,
+        };
+        const ENABLED: Column = Column {
+            name: "enabled",
+            ty: ColumnType::Bool,
+            class: ColumnClass::Label,
+            nullable: false,
+            gated_by: None,
+        };
+        const TIMED: Column = Column {
+            name: "timed",
+            ty: ColumnType::F64,
+            class: ColumnClass::Cumulative,
+            nullable: false,
+            gated_by: Some(super::CollectionGate {
+                default: super::SectionColumnRef {
+                    section: "meta",
+                    column: "enabled",
+                },
+                overrides: &[super::RowGateOverride {
+                    column: "object",
+                    value: "wal",
+                    gate: super::SectionColumnRef {
+                        section: "meta",
+                        column: "enabled",
+                    },
+                }],
+            }),
+        };
+        let source = TypeContract {
+            name: "source",
+            ..contract(1_006_001, &[TS, OBJECT, TIMED], &["ts"])
+        };
+        let meta = TypeContract {
+            name: "meta",
+            ..contract(1_006_002, &[TS, ENABLED], &["ts"])
+        };
+        assert_eq!(
+            lint_references(&[source, meta]),
+            Err(vec![LintError::BadGateSelector {
+                type_id: 1_006_001,
+                column: "timed",
+                selector: "object",
+            }])
+        );
+    }
+
+    #[test]
     fn an_empty_registry_lints_clean() {
         // Also pins the built-in per-class eps_abs declarations, which are
         // linted regardless of the contract list.
@@ -505,6 +922,7 @@ mod tests {
             ty: ColumnType::I64,
             class: ColumnClass::Label,
             nullable: true,
+            gated_by: None,
         };
         let c = TypeContract {
             identity: &["queryid"],
@@ -530,6 +948,7 @@ mod tests {
             ty: ColumnType::Ts,
             class: ColumnClass::Timestamp,
             nullable: true,
+            gated_by: None,
         };
         let c = contract(1_006_001, &[BAD_TS], &["ts"]);
         assert_eq!(
@@ -550,6 +969,7 @@ mod tests {
             ty: ColumnType::Ts,
             class: ColumnClass::Timestamp,
             nullable: false,
+            gated_by: None,
         };
         let c = contract(1_006_001, &[COLLECTED_AT], &["collected_at"]);
         assert_eq!(
