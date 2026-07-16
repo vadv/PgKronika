@@ -1,22 +1,20 @@
 //! Sliding-window anomaly scan over one period's folded series.
 //!
-//! The derivative (or raw gauge) series of the period is built once; the
-//! window then slides over it by index, scoring each position against the
-//! rest of the period. The design note picks this non-causal reference for
-//! retrospective scans: data after the window anchors the median as well as
-//! data before it.
+//! Each position is scored against the rest of the period, including later
+//! samples. This is a retrospective, non-causal scan.
 
 use kronika_anomaly::{Episode, NotEvaluatedReason, ScoreParams, Scored, episodes, score_window};
 use kronika_reader::{DiffPoint, SeriesDiff, SeriesValues, Value};
 use kronika_registry::ColumnClass;
 
-/// Sufficiency gates from the design note: a position is evaluated only over
-/// at least 20 reference and 3 window points.
+/// A score requires at least 20 reference and 3 window points.
 const MIN_REF: usize = 20;
 const MIN_CUR: usize = 3;
 
-/// Per-class absolute floors, pinned at compile time: a scorable class that
-/// stops declaring one fails the build here, not at request time.
+/// Maximum point-position pairs scored by one HTTP request.
+pub(crate) const MAX_SCORE_WORK: usize = 50_000_000;
+
+/// Per-class absolute scale floors.
 const EPS_ABS_CUMULATIVE: f64 = match ColumnClass::Cumulative.eps_abs() {
     Some(eps) => eps,
     None => panic!("Cumulative must declare eps_abs"),
@@ -74,6 +72,12 @@ pub(crate) struct EpisodeHit {
     pub column: String,
     /// The episode with its peak score.
     pub episode: Episode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanLimit {
+    pub required: usize,
+    pub available: usize,
 }
 
 /// Window positions of the scan: `from + window`, stepping by `step`, with
@@ -148,8 +152,20 @@ pub(crate) fn scan_section(
     diffs: &[SeriesDiff],
     gauges: &[SeriesValues],
     params: &ScanParams,
-) -> (Vec<EpisodeHit>, ScanCounts) {
+    max_work: usize,
+    hit_limit: usize,
+) -> Result<(Vec<EpisodeHit>, ScanCounts, usize), ScanLimit> {
     let scan_positions = positions(params);
+    let work = score_work(diffs, gauges, scan_positions.len()).ok_or(ScanLimit {
+        required: usize::MAX,
+        available: max_work,
+    })?;
+    if work > max_work {
+        return Err(ScanLimit {
+            required: work,
+            available: max_work,
+        });
+    }
     let cumulative_score = ScoreParams::new(MIN_REF, MIN_CUR, EPS_ABS_CUMULATIVE, params.eps_rel);
     let gauge_score = ScoreParams::new(MIN_REF, MIN_CUR, EPS_ABS_GAUGE, params.eps_rel);
 
@@ -172,8 +188,6 @@ pub(crate) fn scan_section(
                         ts_buf.push(at.ts);
                         value_buf.push(rate);
                     }
-                    // NoData, and a non-finite rate: filtered at the point so
-                    // one bad value cannot poison the whole series' reference.
                     _ => counts.nodata_points += 1,
                 }
             }
@@ -188,6 +202,7 @@ pub(crate) fn scan_section(
                 &mut ref_buf,
                 &mut counts,
                 &mut hits,
+                hit_limit,
             );
         }
     }
@@ -212,11 +227,27 @@ pub(crate) fn scan_section(
                 &mut ref_buf,
                 &mut counts,
                 &mut hits,
+                hit_limit,
             );
         }
     }
 
-    (hits, counts)
+    rank_section(&mut hits, hit_limit);
+    Ok((hits, counts, work))
+}
+
+fn score_work(diffs: &[SeriesDiff], gauges: &[SeriesValues], positions: usize) -> Option<usize> {
+    let diff_points = diffs
+        .iter()
+        .flat_map(|series| &series.columns)
+        .try_fold(0_usize, |sum, column| sum.checked_add(column.points.len()))?;
+    let gauge_points = gauges
+        .iter()
+        .flat_map(|series| &series.columns)
+        .try_fold(0_usize, |sum, column| sum.checked_add(column.points.len()))?;
+    diff_points
+        .checked_add(gauge_points)?
+        .checked_mul(positions)
 }
 
 /// Score one timeline, tally the profile, and collect its episodes.
@@ -236,6 +267,7 @@ fn scan_timeline(
     ref_buf: &mut Vec<f64>,
     counts: &mut ScanCounts,
     hits: &mut Vec<EpisodeHit>,
+    hit_limit: usize,
 ) {
     let profile = score_series(ts, values, scan_positions, params.window, score, ref_buf);
     tally(&profile, counts);
@@ -246,6 +278,15 @@ fn scan_timeline(
             episode,
         });
     }
+    rank_section(hits, hit_limit);
+}
+
+fn rank_section(hits: &mut Vec<EpisodeHit>, limit: usize) {
+    if hits.len() <= limit {
+        return;
+    }
+    hits.sort_by(|a, b| b.episode.peak.m.abs().total_cmp(&a.episode.peak.m.abs()));
+    hits.truncate(limit);
 }
 
 /// Rank episodes across sections by peak `|m|`, descending, and truncate to
@@ -282,7 +323,16 @@ mod tests {
         }
     }
 
-    /// One gauge series named `g` for identity `id`, from raw points.
+    fn scan_all(
+        diffs: &[kronika_reader::SeriesDiff],
+        gauges: &[SeriesValues],
+        params: &ScanParams,
+    ) -> (Vec<EpisodeHit>, ScanCounts) {
+        let (hits, counts, _) =
+            scan_section(diffs, gauges, params, usize::MAX, usize::MAX).expect("within budget");
+        (hits, counts)
+    }
+
     fn gauge_series(id: i64, points: Vec<(i64, f64)>, skipped: usize) -> SeriesValues {
         SeriesValues {
             key: vec![Value::I64(id)],
@@ -294,8 +344,6 @@ mod tests {
         }
     }
 
-    /// A calm minute-grid gauge timeline with a plateau of `spike` values
-    /// spanning positions `[spike_at, spike_at + spike_len)`.
     fn spiky_points(n: i64, spike_at: i64, spike_len: i64, spike: f64) -> Vec<(i64, f64)> {
         (0..n)
             .map(|i| {
@@ -320,28 +368,21 @@ mod tests {
     #[test]
     fn a_window_wider_than_the_period_yields_no_positions() {
         assert!(positions(&params(0, 10 * SEC, 20 * SEC, 5 * SEC)).is_empty());
-        // Overflow near i64::MAX must not wrap into fake positions.
         assert!(positions(&params(i64::MAX - 5, i64::MAX, 10, 1)).is_empty());
     }
 
     #[test]
     fn a_spike_in_one_series_becomes_one_episode_with_up_direction() {
-        // 60 minute-spaced points, values ~10, a 50.0 plateau at minutes
-        // 30..35. The plateau must dominate a window's median (the core scores
-        // median(cur), so a blip shorter than half the window stays quiet):
-        // a 6-minute window over 5 spike points flips its median to 50.
         let points = spiky_points(60, 30, 5, 50.0);
         let to = points.last().expect("points not empty").0;
         let series = vec![gauge_series(1, points, 0)];
         let scan = params(0, to, 6 * 60 * SEC, 2 * 60 * SEC);
-        let (hits, counts) = scan_section(&[], &series, &scan);
+        let (hits, counts) = scan_all(&[], &series, &scan);
 
         assert_eq!(hits.len(), 1, "one contiguous spike, one episode");
         let episode = &hits[0].episode;
         assert_eq!(episode.peak.dir, Direction::Up);
         assert!(episode.peak.m > 3.5);
-        // Positions are window right edges: the episode's windows must cover
-        // the spike interval (minutes 30..35).
         assert!(episode.start - scan.window <= 34 * 60 * SEC);
         assert!(30 * 60 * SEC <= episode.end);
         assert!(counts.evaluated > 0);
@@ -353,7 +394,7 @@ mod tests {
         let points = spiky_points(60, 0, 0, 10.0);
         let to = points.last().expect("points not empty").0;
         let series = vec![gauge_series(1, points, 0)];
-        let (hits, counts) = scan_section(&[], &series, &params(0, to, 6 * 60 * SEC, 2 * 60 * SEC));
+        let (hits, counts) = scan_all(&[], &series, &params(0, to, 6 * 60 * SEC, 2 * 60 * SEC));
         assert!(hits.is_empty());
         assert!(counts.evaluated > 0);
     }
@@ -363,14 +404,14 @@ mod tests {
         let points = spiky_points(30, 0, 0, 10.0);
         let to = points.last().expect("points not empty").0;
         let series = vec![gauge_series(1, points, 4)];
-        let (_, counts) = scan_section(&[], &series, &params(0, to, 10 * 60 * SEC, 2 * 60 * SEC));
+        let (_, counts) = scan_all(&[], &series, &params(0, to, 10 * 60 * SEC, 2 * 60 * SEC));
         assert_eq!(counts.nodata_points, 4);
     }
 
     #[test]
     fn an_empty_timeline_reports_all_no_data_positions() {
         let series = vec![gauge_series(1, Vec::new(), 0)];
-        let (hits, counts) = scan_section(&[], &series, &params(0, 100 * SEC, 20 * SEC, 20 * SEC));
+        let (hits, counts) = scan_all(&[], &series, &params(0, 100 * SEC, 20 * SEC, 20 * SEC));
         assert!(hits.is_empty());
         assert_eq!(counts.evaluated, 0);
         assert!(
@@ -381,9 +422,8 @@ mod tests {
 
     #[test]
     fn sparse_series_positions_fail_the_sufficiency_gates() {
-        // Two points cannot satisfy ref >= 20 at any position.
         let series = vec![gauge_series(1, vec![(0, 10.0), (60 * SEC, 11.0)], 0)];
-        let (hits, counts) = scan_section(&[], &series, &params(0, 60 * SEC, 20 * SEC, 20 * SEC));
+        let (hits, counts) = scan_all(&[], &series, &params(0, 60 * SEC, 20 * SEC, 20 * SEC));
         assert!(hits.is_empty());
         assert_eq!(counts.evaluated, 0);
         assert!(counts.ref_too_small + counts.cur_too_small > 0);
@@ -396,7 +436,7 @@ mod tests {
         let to = strong.last().expect("points not empty").0;
         let series = vec![gauge_series(1, weak, 0), gauge_series(2, strong, 0)];
         let scan = params(0, to, 6 * 60 * SEC, 2 * 60 * SEC);
-        let (hits, _) = scan_section(&[], &series, &scan);
+        let (hits, _) = scan_all(&[], &series, &scan);
         assert!(hits.len() >= 2, "both spikes must surface");
 
         let mut ranked: Vec<(&'static str, EpisodeHit)> =
@@ -413,9 +453,6 @@ mod tests {
     #[test]
     fn a_non_finite_rate_is_one_nodata_point_not_a_blinded_series() {
         use kronika_reader::{ColumnDiff, DiffAt, DiffPoint, Scalar, SeriesDiff};
-        // A cumulative series whose rates are finite except one NaN. The bad
-        // point must cost one nodata point, not turn every position NonFinite
-        // (which would silently hide a real spike elsewhere in the column).
         let points: Vec<DiffAt> = (0..40_i64)
             .map(|i| {
                 let rate = if i == 5 { f64::NAN } else { 10.0 };
@@ -437,7 +474,7 @@ mod tests {
             }],
         }];
         let to = 39 * 60 * SEC;
-        let (_, counts) = scan_section(&diffs, &[], &params(0, to, 10 * 60 * SEC, 5 * 60 * SEC));
+        let (_, counts) = scan_all(&diffs, &[], &params(0, to, 10 * 60 * SEC, 5 * 60 * SEC));
         assert_eq!(
             counts.nodata_points, 1,
             "the non-finite rate is one nodata point"
@@ -452,5 +489,27 @@ mod tests {
     #[test]
     fn counts_default_to_zero() {
         assert_eq!(ScanCounts::default().evaluated, 0);
+    }
+
+    #[test]
+    fn scan_rejects_work_above_the_request_budget() {
+        let points = spiky_points(30, 0, 0, 10.0);
+        let to = points.last().expect("points not empty").0;
+        let series = vec![gauge_series(1, points, 0)];
+        let scan = params(0, to, 10 * 60 * SEC, 2 * 60 * SEC);
+        let err = scan_section(&[], &series, &scan, 1, 10).expect_err("budget must apply");
+        assert!(err.required > err.available);
+    }
+
+    #[test]
+    fn scan_retains_only_the_requested_number_of_episodes() {
+        let to = 59 * 60 * SEC;
+        let series = vec![
+            gauge_series(1, spiky_points(60, 30, 5, 100.0), 0),
+            gauge_series(2, spiky_points(60, 30, 5, 50.0), 0),
+        ];
+        let scan = params(0, to, 6 * 60 * SEC, 2 * 60 * SEC);
+        let (hits, _, _) = scan_section(&[], &series, &scan, usize::MAX, 1).expect("within budget");
+        assert_eq!(hits.len(), 1);
     }
 }

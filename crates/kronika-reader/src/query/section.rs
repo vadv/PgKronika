@@ -17,6 +17,9 @@ use crate::{Cell, LocalDirSnapshot, ReadError};
 /// stale unit and letting its time fall into a gap.
 const MAX_REFRESH: u32 = 2;
 
+/// Maximum number of output cells retained by one query.
+const MAX_MATERIALIZED_CELLS: usize = 10_000_000;
+
 /// One logical section's answer for a source and time window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SectionPage {
@@ -42,6 +45,11 @@ pub enum QueryError {
     BadCursor(String),
     /// Reading a unit or decoding a section failed.
     Read(ReadError),
+    /// The matching rows exceed the query materialization budget.
+    ResultTooLarge {
+        /// Maximum cells a query may retain.
+        max_cells: usize,
+    },
 }
 
 impl From<ReadError> for QueryError {
@@ -61,7 +69,8 @@ impl From<ReadError> for QueryError {
 ///
 /// Returns [`QueryError::UnknownSection`] when `name` is not registered,
 /// [`QueryError::BadCursor`] when `cursor` targets another source, or
-/// [`QueryError::Read`] when a unit cannot be opened or decoded.
+/// [`QueryError::Read`] when a unit cannot be opened or decoded. Returns
+/// [`QueryError::ResultTooLarge`] before retaining more than the query budget.
 pub fn section(
     snap: &mut LocalDirSnapshot,
     name: &str,
@@ -91,7 +100,8 @@ pub fn section(
 ///
 /// Returns [`QueryError::UnknownSection`] for the first unregistered name,
 /// [`QueryError::BadCursor`] when a cursor targets another source, or
-/// [`QueryError::Read`] when a unit cannot be opened or decoded.
+/// [`QueryError::Read`] when a unit cannot be opened or decoded. Returns
+/// [`QueryError::ResultTooLarge`] before retaining more than the query budget.
 pub fn sections(
     snap: &mut LocalDirSnapshot,
     source: u64,
@@ -124,6 +134,11 @@ pub fn sections(
                 refreshed += 1;
             }
             Err(GatherError::Read(err)) => return Err(QueryError::Read(err)),
+            Err(GatherError::ResultTooLarge) => {
+                return Err(QueryError::ResultTooLarge {
+                    max_cells: MAX_MATERIALIZED_CELLS,
+                });
+            }
         }
     };
 
@@ -181,11 +196,14 @@ pub fn sections(
 }
 
 /// Failure while gathering a window's rows.
+#[derive(Debug)]
 enum GatherError {
     /// A unit went stale (concurrent seal/reset); the caller should refresh and retry.
     Stale,
     /// A read failed for a reason a refresh will not fix.
     Read(ReadError),
+    /// Retaining another row would exceed the materialization budget.
+    ResultTooLarge,
 }
 
 /// Per-section row buffers plus the `[min, max]` ranges actually read.
@@ -215,6 +233,7 @@ fn gather(
 
     let mut buffers: Vec<Vec<OutRow>> = vec![Vec::new(); requested.len()];
     let mut covered: Vec<(i64, i64)> = Vec::new();
+    let mut materialized_cells = 0_usize;
 
     for &idx in &in_window {
         let unit = match snap.open_unit(idx) {
@@ -254,6 +273,11 @@ fn gather(
                     if t < from || t > to {
                         continue;
                     }
+                    charge_materialization(
+                        &mut materialized_cells,
+                        logical.columns.len(),
+                        MAX_MATERIALIZED_CELLS,
+                    )?;
                     let out: OutRow = logical
                         .columns
                         .iter()
@@ -271,6 +295,18 @@ fn gather(
         }
     }
     Ok((buffers, covered))
+}
+
+fn charge_materialization(
+    materialized_cells: &mut usize,
+    row_width: usize,
+    max_cells: usize,
+) -> Result<(), GatherError> {
+    *materialized_cells = materialized_cells
+        .checked_add(row_width)
+        .filter(|&cells| cells <= max_cells)
+        .ok_or(GatherError::ResultTooLarge)?;
+    Ok(())
 }
 
 /// Stretches of `[from, to]` that no readable unit covers, given each unit's
@@ -421,7 +457,7 @@ mod tests {
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use kronika_registry::{StrId, Ts};
 
-    use super::{Cursor, QueryError, Value, section, sections};
+    use super::{Cursor, QueryError, Value, charge_materialization, section, sections};
     use crate::LocalDirSnapshot;
     use crate::snapshot::OPEN_UNIT_CALLS;
 
@@ -757,10 +793,27 @@ mod tests {
         .unwrap_err();
         match err {
             QueryError::UnknownSection(name) => assert_eq!(name, "no_such_section"),
-            other @ (QueryError::Read(_) | QueryError::BadCursor(_)) => {
+            other @ (QueryError::Read(_)
+            | QueryError::BadCursor(_)
+            | QueryError::ResultTooLarge { .. }) => {
                 panic!("expected UnknownSection, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn materialization_budget_rejects_the_first_excess_row() {
+        let mut cells = 8;
+        charge_materialization(&mut cells, 2, 10).expect("the exact limit is allowed");
+        assert_eq!(cells, 10);
+        assert!(charge_materialization(&mut cells, 1, 10).is_err());
+        assert_eq!(cells, 10);
+    }
+
+    #[test]
+    fn materialization_budget_rejects_integer_overflow() {
+        let mut cells = usize::MAX;
+        assert!(charge_materialization(&mut cells, 1, usize::MAX).is_err());
     }
 
     #[test]
@@ -884,8 +937,6 @@ mod tests {
             }]
         );
     }
-
-    // ---- pure ordering helpers ----
 
     #[test]
     fn compare_values_orders_by_variant_rank() {
@@ -1061,8 +1112,6 @@ mod tests {
         );
         assert!(page.next_cursor.is_none());
     }
-
-    // ---- keyset pagination ----
 
     /// Read one archiver section, paging by `limit` and following `next_cursor`
     /// until it runs out. Returns each page's `archived_count` sequence.
@@ -1257,8 +1306,6 @@ mod tests {
             Ordering::Less
         );
     }
-
-    // ---- stale-retry + coverage gaps ----
 
     #[test]
     fn coverage_gaps_covers_window_edges_and_holes() {

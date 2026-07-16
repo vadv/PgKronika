@@ -1183,8 +1183,6 @@ mod tests {
         );
     }
 
-    // --- probe helpers ---
-
     /// Build an empty snapshot in a temp dir; return `(dir, snapshot)`.
     fn empty_snapshot() -> (tempfile::TempDir, kronika_reader::LocalDirSnapshot) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1257,8 +1255,6 @@ mod tests {
         assert_eq!(body["ready"], serde_json::json!(false));
     }
 
-    // --- /metrics ---
-
     #[tokio::test]
     async fn metrics_endpoint_lists_metric_names_after_traffic() {
         let handle = test_metrics_handle();
@@ -1307,8 +1303,9 @@ mod tests {
             "/metrics body must contain kronika_web_requests_total"
         );
         assert!(
-            body.contains("kronika_web_data_age_seconds"),
-            "/metrics body must contain kronika_web_data_age_seconds"
+            body.lines()
+                .any(|line| line == "kronika_web_data_age_seconds NaN"),
+            "an empty store must expose data age as unavailable"
         );
         assert!(
             body.contains("kronika_web_reader_age_seconds"),
@@ -1319,8 +1316,6 @@ mod tests {
             "/metrics body must contain kronika_web_units_total"
         );
     }
-
-    // --- auth ---
 
     /// A valid `Authorization: Basic` header for `user:pass`.
     fn basic_header(user: &str, pass: &str) -> String {
@@ -1402,8 +1397,6 @@ mod tests {
             );
         }
     }
-
-    // --- static + SPA fallback ---
 
     /// Drive one request over an empty snapshot; return status, content type and
     /// the raw body (static responses are HTML, not JSON).

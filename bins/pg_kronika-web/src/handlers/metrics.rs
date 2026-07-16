@@ -39,23 +39,8 @@ pub(crate) async fn metrics_handler(
     let unit_count_f = unit_count as f64;
     metrics::gauge!("kronika_web_units_total").set(unit_count_f);
 
-    let max_ts_micros = units.iter().map(|u| u.max_ts).max().unwrap_or(0);
-    if max_ts_micros > 0 {
-        #[allow(
-            clippy::cast_sign_loss,
-            reason = "max_ts is checked to be positive before this cast"
-        )]
-        let data_secs = (max_ts_micros / 1_000_000) as u64;
-        let age = now_secs.saturating_sub(data_secs);
-        // Age in seconds fits well within f64 precision.
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "age in seconds fits well within f64 mantissa for any real data age"
-        )]
-        metrics::gauge!("kronika_web_data_age_seconds").set(age as f64);
-    } else {
-        metrics::gauge!("kronika_web_data_age_seconds").set(0.0);
-    }
+    let max_ts_micros = units.iter().map(|u| u.max_ts).max();
+    metrics::gauge!("kronika_web_data_age_seconds").set(data_age_seconds(now_secs, max_ts_micros));
 
     // Reader-age gauge: seconds since the last successful snapshot refresh.
     let last = state.last_refresh.load(Relaxed);
@@ -101,15 +86,37 @@ fn set_process_metrics() {
     }
 }
 
-/// Returns resident memory in bytes from `/proc/self/statm`.
-///
-/// Field index 1 (0-based) is the resident set size in pages; page size
-/// is 4096 bytes on all Linux targets this binary supports (x86-64, aarch64).
+/// Returns resident memory in bytes from `/proc/self/status`.
 fn read_rss_bytes() -> Option<u64> {
-    let contents = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let rss_pages: u64 = contents.split_whitespace().nth(1)?.parse().ok()?;
-    // Page size is 4096 on all supported Linux targets (x86-64 and aarch64).
-    Some(rss_pages * 4096)
+    let contents = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_rss_bytes(&contents)
+}
+
+fn data_age_seconds(now_secs: u64, max_ts_micros: Option<i64>) -> f64 {
+    let Some(max_ts_micros) = max_ts_micros.filter(|&ts| ts > 0) else {
+        return f64::NAN;
+    };
+    #[allow(clippy::cast_sign_loss, reason = "the timestamp is positive")]
+    let data_secs = (max_ts_micros / 1_000_000) as u64;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "real data ages fit in the f64 integer mantissa"
+    )]
+    let age = now_secs.saturating_sub(data_secs) as f64;
+    age
+}
+
+fn parse_rss_bytes(contents: &str) -> Option<u64> {
+    let line = contents.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "VmRSS:" {
+        return None;
+    }
+    let kib: u64 = fields.next()?.parse().ok()?;
+    if fields.next()? != "kB" || fields.next().is_some() {
+        return None;
+    }
+    kib.checked_mul(1024)
 }
 
 /// Counts entries in `/proc/self/fd` (each is an open file descriptor).
@@ -118,4 +125,33 @@ fn count_open_fds() -> Option<u64> {
     let count = entries.filter_map(Result::ok).count();
     // Subtract the dirfd opened by read_dir itself.
     Some(count.saturating_sub(1) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{data_age_seconds, parse_rss_bytes};
+
+    #[test]
+    fn missing_data_age_is_not_reported_as_zero() {
+        assert!(data_age_seconds(100, None).is_nan());
+        assert!(data_age_seconds(100, Some(0)).is_nan());
+    }
+
+    #[test]
+    fn data_age_uses_the_latest_unit_timestamp() {
+        assert!((data_age_seconds(100, Some(95_000_000)) - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rss_uses_the_kernel_reported_kibibytes() {
+        let status = "Name:\tpg_kronika-web\nVmRSS:\t123 kB\nThreads:\t1\n";
+        assert_eq!(parse_rss_bytes(status), Some(123 * 1024));
+    }
+
+    #[test]
+    fn malformed_or_overflowing_rss_is_unavailable() {
+        assert_eq!(parse_rss_bytes("VmRSS: unknown kB\n"), None);
+        assert_eq!(parse_rss_bytes("VmRSS: 1 MB\n"), None);
+        assert_eq!(parse_rss_bytes("VmRSS: 18446744073709551615 kB\n"), None);
+    }
 }
