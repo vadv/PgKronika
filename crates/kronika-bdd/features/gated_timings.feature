@@ -1,10 +1,5 @@
 @web @anomalies
 Feature: Timings measured under a disabled GUC read as not collected
-  With track_io_timing off, PostgreSQL keeps blk_*_time at zero; folding
-  those zeros into deltas would claim "measured zero, IO is free". The diff
-  must report such pairs as not_collected while ungated counters keep their
-  rates.
-
   @pg17 @serial
   Scenario: blk_read_time pairs under track_io_timing=off are not collected
     Given a fresh database on PostgreSQL 17
