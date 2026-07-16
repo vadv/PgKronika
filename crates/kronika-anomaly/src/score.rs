@@ -15,10 +15,7 @@ pub struct ScoreParams {
 }
 
 impl ScoreParams {
-    /// Build params, sanitizing every field: count gates clamp to at least
-    /// one (an empty window or reference is never scored), `eps_abs` to a
-    /// positive minimum and negative fractions to zero so the scale can
-    /// never collapse to zero.
+    /// Clamp count gates and scale floors to valid ranges.
     #[must_use]
     pub const fn new(min_ref: usize, min_cur: usize, eps_abs: f64, eps_rel: f64) -> Self {
         Self {
@@ -31,7 +28,7 @@ impl ScoreParams {
 }
 
 impl Default for ScoreParams {
-    /// Defaults from the design note: ref >= 20, cur >= 3, relative floor 5%.
+    /// Defaults: at least 20 reference points, 3 current points, and a 5% relative floor.
     fn default() -> Self {
         Self::new(20, 3, 1e-9, 0.05)
     }
@@ -145,10 +142,6 @@ pub fn score_window(cur: &[f64], ref_: &[f64], params: &ScoreParams) -> Scored {
 }
 
 /// Median of a non-empty slice; the even case averages the two middles.
-///
-/// A full sort: `select_nth_unstable` benched ~30% slower on real scan
-/// profiles, where constant series (quiet counters) hit pdqsort's O(n)
-/// fast path.
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -205,8 +198,6 @@ mod tests {
 
     #[test]
     fn contaminated_reference_still_flags_the_spike() {
-        // 20% of the reference carries the incident itself; the median and
-        // MAD must hold the baseline.
         let mut refs = calm_ref(10.0, 40);
         for v in refs.iter_mut().take(8) {
             *v = 55.0;
@@ -260,14 +251,12 @@ mod tests {
 
     #[test]
     fn floor_takes_the_larger_of_absolute_and_relative() {
-        // med_ref = 100, eps_rel 0.05 -> relative floor 5.0 wins over abs 1.0.
         let refs = vec![100.0; 40];
         let cur = vec![110.0, 110.0, 110.0];
         let params = ScoreParams::new(20, 3, 1.0, 0.05);
         let e = evaluated(score_window(&cur, &refs, &params));
         assert!((e.sigma_used - 5.0).abs() < 1e-12, "relative floor 5.0");
 
-        // med_ref = 1, abs floor 1.0 wins over relative 0.05.
         let refs = vec![1.0; 40];
         let cur = vec![2.0, 2.0, 2.0];
         let e = evaluated(score_window(&cur, &refs, &params));
@@ -277,21 +266,16 @@ mod tests {
     #[test]
     fn non_finite_input_is_reported_not_silently_scored() {
         let refs = calm_ref(10.0, 40);
-        // A NaN in the window would median-through to a NaN score, then read as
-        // Flat and vanish from episodes; instead it must surface as NonFinite.
         let cur_nan = vec![50.0, f64::NAN, 51.0];
         assert_eq!(
             score_window(&cur_nan, &refs, &ScoreParams::default()),
             Scored::NotEvaluated(NotEvaluatedReason::NonFinite)
         );
-        // The sign bit of NaN must not change the outcome (total_cmp orders
-        // +NaN and -NaN differently, so both are checked).
         let cur_neg_nan = vec![-f64::NAN, 1.0, 2.0];
         assert_eq!(
             score_window(&cur_neg_nan, &refs, &ScoreParams::default()),
             Scored::NotEvaluated(NotEvaluatedReason::NonFinite)
         );
-        // Infinity in the reference.
         let mut ref_inf = calm_ref(10.0, 40);
         ref_inf[0] = f64::INFINITY;
         assert_eq!(
@@ -324,8 +308,6 @@ mod tests {
         let params = ScoreParams::new(0, 0, 1e-9, 0.05);
         assert_eq!(params.min_ref, 1, "zero ref gate clamps to one");
         assert_eq!(params.min_cur, 1, "zero cur gate clamps to one");
-        // The clamped gates keep empty inputs out of the math: an empty
-        // reference is rejected, not scored.
         assert_eq!(
             score_window(&[1.0], &[], &params),
             Scored::NotEvaluated(NotEvaluatedReason::RefTooSmall)
