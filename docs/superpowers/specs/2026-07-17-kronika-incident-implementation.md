@@ -34,7 +34,9 @@
 
 ### 2.1. Целевая топология workspace
 
-Целевая топология содержит 13 активных packages:
+Текущие 20 packages сокращаются до 16 активных: три пустых
+placeholder packages исключаются, а `kronika-diff` и `kronika-anomaly`
+заменяются одним `kronika-analytics`:
 
 ```text
 kronika-format
@@ -44,8 +46,11 @@ kronika-writer
 kronika-store
 kronika-analytics        [diff, anomaly]
 kronika-reader
+kronika-source-pg
+kronika-source-os
+kronika-source-log
 kronika-bdd
-pg_kronika-collector     [sources::pg, sources::os, sources::log]
+pg_kronika-collector
 pg_kronika-web
 pg_kronika-archiver
 pg_kronika-dump
@@ -82,8 +87,13 @@ kronika-store     -> kronika-format
 kronika-analytics -> std
 kronika-reader    -> kronika-format + kronika-store
                      + kronika-registry + kronika-analytics
+kronika-source-pg  -> kronika-registry
+kronika-source-os  -> kronika-registry
+kronika-source-log -> внутренних workspace-зависимостей нет
 
 pg_kronika-collector -> kronika-format + kronika-registry + kronika-writer
+                        + kronika-source-pg + kronika-source-os
+                        + kronika-source-log
 pg_kronika-web       -> kronika-reader + kronika-registry + kronika-analytics
 pg_kronika-archiver  -> kronika-format + kronika-store
 pg_kronika-dump      -> kronika-format + kronika-store
@@ -105,6 +115,9 @@ Incident-каталог не входит ни в analytics, ни в registry.
 - `kronika-writer`, `kronika-store` и `kronika-reader` не объединяются: у них
   разные durability, dependency и resource contracts.
 - Четыре deployable binaries остаются отдельными packages.
+- `kronika-source-pg`, `kronika-source-os` и `kronika-source-log` остаются
+  отдельными packages; их консолидация с collector не входит в этот
+  контракт.
 - `kronika-bdd` и `xtask` не входят в production graph.
 
 ## 3. Ответственность и файлы
@@ -598,13 +611,6 @@ Mechanical moves и behavior changes идут разными PR.
 9. **I5 — prerequisites второго среза.** Отдельно добавить period/clock,
    entity joins и новый `track_planning` layout; только затем включать
    directional/planning branches.
-
-Перенос `source-pg`, `source-os`, `source-log` в private collector modules —
-общая roadmap консолидации, но не prerequisite и не часть incident stack. Каждый
-source переносится отдельным PR. До и после него измеряются clean и warm
-`cargo build --timings` для collector и edit/rebuild соответствующего source на
-нормальной машине. При существенном ухудшении iteration time/cache move
-останавливается или откатывается; runtime benefit не предполагается.
 
 ## 11. Отклонённые варианты и компромиссы
 
