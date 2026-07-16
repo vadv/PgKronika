@@ -57,6 +57,39 @@ impl LogicalSection {
     }
 }
 
+fn merge_gate(
+    current: &mut Option<CollectionGate>,
+    candidate: Option<CollectionGate>,
+    section: &str,
+    column: &str,
+) {
+    let (Some(existing), Some(candidate)) = (*current, candidate) else {
+        if current.is_none() {
+            *current = candidate;
+        }
+        return;
+    };
+    assert_eq!(
+        existing.default, candidate.default,
+        "registry violation: {section}.{column} has conflicting default gates"
+    );
+    let candidate_contains = existing
+        .overrides
+        .iter()
+        .all(|rule| candidate.overrides.contains(rule));
+    let existing_contains = candidate
+        .overrides
+        .iter()
+        .all(|rule| existing.overrides.contains(rule));
+    assert!(
+        candidate_contains || existing_contains,
+        "registry violation: {section}.{column} has incompatible row gate overrides"
+    );
+    if candidate.overrides.len() > existing.overrides.len() {
+        *current = Some(candidate);
+    }
+}
+
 /// Build the union view of a logical section by name.
 ///
 /// Returns `None` when no registered contract carries that name.
@@ -107,37 +140,7 @@ pub fn logical_section(name: &str) -> Option<LogicalSection> {
                     contract.type_id.get(),
                     col.ty,
                 );
-                if let (Some(existing_gate), Some(candidate)) = (existing.gated_by, col.gated_by) {
-                    assert_eq!(
-                        existing_gate.default, candidate.default,
-                        "registry violation: logical section {name:?} column {:?} has conflicting default gates",
-                        col.name,
-                    );
-                    for rule in candidate.overrides {
-                        if let Some(current) = existing_gate.overrides.iter().find(|current| {
-                            current.column == rule.column && current.value == rule.value
-                        }) {
-                            assert_eq!(current.gate, rule.gate);
-                        }
-                    }
-                    assert!(
-                        candidate.overrides.iter().all(|rule| {
-                            existing_gate
-                                .overrides
-                                .iter()
-                                .any(|current| current == rule)
-                        }) || existing_gate.overrides.iter().all(|rule| {
-                            candidate.overrides.iter().any(|current| current == rule)
-                        }),
-                        "registry violation: logical section {name:?} column {:?} has incompatible row gate overrides",
-                        col.name,
-                    );
-                    if candidate.overrides.len() > existing_gate.overrides.len() {
-                        existing.gated_by = Some(candidate);
-                    }
-                } else if existing.gated_by.is_none() {
-                    existing.gated_by = col.gated_by;
-                }
+                merge_gate(&mut existing.gated_by, col.gated_by, name, col.name);
                 assert!(
                     existing.class == col.class,
                     "registry violation: logical section {:?} column {:?} has \

@@ -426,35 +426,36 @@ fn build_contract(header: &Header, columns: &[ColumnDef]) -> TokenStream2 {
         let ty = &c.column_type;
         let class = &c.column_class;
         let nullable = c.nullable;
-        let gated_by = if let Some(gate) = &c.gate {
-            let (section, column) = &gate.default;
-            let overrides = gate.overrides.iter().map(|rule| {
-                let selector = &rule.column;
-                let value = &rule.value;
-                let (gate_section, gate_column) = &rule.gate;
-                quote! {
-                    ::kronika_registry::RowGateOverride {
-                        column: #selector,
-                        value: #value,
-                        gate: ::kronika_registry::SectionColumnRef {
-                            section: #gate_section,
-                            column: #gate_column,
-                        },
+        let gated_by = c.gate.as_ref().map_or_else(
+            || quote! { ::core::option::Option::None },
+            |gate| {
+                let (section, column) = &gate.default;
+                let overrides = gate.overrides.iter().map(|rule| {
+                    let selector = &rule.column;
+                    let value = &rule.value;
+                    let (gate_section, gate_column) = &rule.gate;
+                    quote! {
+                        ::kronika_registry::RowGateOverride {
+                            column: #selector,
+                            value: #value,
+                            gate: ::kronika_registry::SectionColumnRef {
+                                section: #gate_section,
+                                column: #gate_column,
+                            },
+                        }
                     }
+                });
+                quote! {
+                    ::core::option::Option::Some(::kronika_registry::CollectionGate {
+                        default: ::kronika_registry::SectionColumnRef {
+                            section: #section,
+                            column: #column,
+                        },
+                        overrides: &[ #( #overrides ),* ],
+                    })
                 }
-            });
-            quote! {
-                ::core::option::Option::Some(::kronika_registry::CollectionGate {
-                    default: ::kronika_registry::SectionColumnRef {
-                        section: #section,
-                        column: #column,
-                    },
-                    overrides: &[ #( #overrides ),* ],
-                })
-            }
-        } else {
-            quote! { ::core::option::Option::None }
-        };
+            },
+        );
         quote! {
             ::kronika_registry::Column {
                 name: #name,
