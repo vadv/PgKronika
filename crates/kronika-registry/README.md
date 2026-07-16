@@ -49,10 +49,12 @@ The scorable classes (`Cumulative`, `Gauge`) also declare `eps_abs` — the
 absolute floor of the anomaly-score scale (`ColumnClass::eps_abs`); `Label`
 and `Timestamp` columns are never scored and declare none.
 
-A column whose values exist only while a GUC is on declares `gated_by`, a
-reference to the `Bool` column carrying that GUC (today all gates live in
-`reset_metadata`). The diff layer rewrites deltas measured under an off gate
-to `not_collected`, so a zero never reads as "measured zero".
+A cumulative column may declare `gated_by`, a reference to a singleton `Bool`
+timeline. `gate_override = "label=value=>section.column"` selects a different
+timeline for matching row identities. A diff interval is `not_collected` unless
+the selected gate is known on at every sampled state in that interval.
+Planning-time fields are not gated: the current `reset_metadata` layout does
+not record `track_planning`, and changing that layout requires a new `type_id`.
 
 `ColumnType` is the on-disk value type: the integer and float base types
 (`I8`…`I64`, `U8`…`U64`, `F32`/`F64`), `Bool`, `Ts` (an `i64` timestamp), and
@@ -76,9 +78,10 @@ span a contract or the whole registry:
 - an identity name that is not a column, or names a non-`Label` column;
 - a column-class `eps_abs` declaration that is not positive and finite.
 
-`lint_references` checks what only the whole table can: a `gated_by` that
-does not resolve to a `Bool` column of a known section. Codec tests lint one
-contract; `lint_registry` runs both passes.
+`lint_references` resolves every gate across all layout versions. It also
+requires row selectors to be non-null string labels in the diff identity and
+rejects incompatible versioned declarations. Gating is limited to cumulative
+columns; other classes fail `lint` instead of becoming a runtime no-op.
 
 ## Snapshot Sections
 

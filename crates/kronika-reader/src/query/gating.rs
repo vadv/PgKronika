@@ -1,11 +1,7 @@
-//! GUC gating of diff series: rewrite pairs measured while a gate was off.
-//!
-//! A gated column (registry `gated_by`) reads zero whenever its GUC is off;
-//! folding that zero into a delta claims "measured zero". This pass rewrites
-//! a `Value` point to `NoData { NotCollected }` when the gate was off at
-//! either end of the pair's interval, so the timeline says "not measured".
+//! Collection-state gating of diff intervals.
 
 use kronika_diff::{DiffPoint, Reason};
+use kronika_registry::{CollectionGate, SectionColumnRef};
 
 use crate::query::diff::{SeriesDiff, column};
 use crate::query::value::{OutRow, Value};
@@ -14,30 +10,80 @@ use crate::query::value::{OutRow, Value};
 /// collector could not read the GUC.
 pub type GateReading = (i64, Option<bool>);
 
-/// Rewrite `column`'s `Value` points to `NotCollected` where `gate` was off.
+/// Resolve a row-conditional gate from the diff identity.
+#[must_use]
+pub fn select_gate(
+    gate: CollectionGate,
+    identity: &[&str],
+    key: &[Value],
+) -> Option<SectionColumnRef> {
+    for rule in gate.overrides {
+        let index = identity.iter().position(|name| *name == rule.column)?;
+        match key.get(index)? {
+            Value::Str(value) if value == rule.value => return Some(rule.gate),
+            Value::Str(_) => {}
+            _ => return None,
+        }
+    }
+    Some(gate.default)
+}
+
+/// Apply a registry gate, including row overrides, to one diff column.
+pub fn apply_collection_gating<'a>(
+    series: &mut [SeriesDiff],
+    column: &str,
+    identity: &[&str],
+    gate: CollectionGate,
+    readings: impl Fn(SectionColumnRef) -> &'a [GateReading],
+) {
+    let mut references = Vec::new();
+    for reference in gate.references() {
+        if !references.contains(&reference) {
+            references.push(reference);
+        }
+    }
+    for reference in references {
+        apply_gating_where(series, column, readings(reference), |one| {
+            select_gate(gate, identity, &one.key) == Some(reference)
+        });
+    }
+    apply_gating_where(series, column, &[], |one| {
+        select_gate(gate, identity, &one.key).is_none()
+    });
+}
+
+/// Rewrite values unless the gate is known on throughout their sampled interval.
 ///
 /// `gate` must be in ascending `ts` order; the state at a timestamp is the
-/// most recent reading at or before it. A pair is gated when either end of
-/// its interval reads `false` — a gate that flipped mid-interval measured
-/// only part of it. An unknown state (`None`, or a timestamp before the
-/// first reading) gates nothing: absence of knowledge is not evidence the
-/// GUC was off.
+/// latest reading at or before it. A false or unknown reading inside the
+/// interval makes the value `NotCollected`. Changes between samples cannot be
+/// observed.
 pub fn apply_gating(series: &mut [SeriesDiff], column: &str, gate: &[GateReading]) {
+    apply_gating_where(series, column, gate, |_| true);
+}
+
+fn apply_gating_where(
+    series: &mut [SeriesDiff],
+    column: &str,
+    gate: &[GateReading],
+    include: impl Fn(&SeriesDiff) -> bool,
+) {
     debug_assert!(
         gate.windows(2).all(|pair| pair[0].0 <= pair[1].0),
-        "apply_gating expects gate readings in ascending ts order"
+        "gate readings must be sorted by ts"
     );
-    for one in series.iter_mut() {
+    let timeline = GateTimeline::new(gate);
+    for one in series.iter_mut().filter(|one| include(one)) {
         for gated in one.columns.iter_mut().filter(|c| c.name == column) {
             let mut prev_ts: Option<i64> = None;
             for at in &mut gated.points {
-                let off_at = |ts: i64| state_at(gate, ts) == Some(false);
-                if matches!(at.point, DiffPoint::Value { .. })
-                    && (off_at(at.ts) || prev_ts.is_some_and(off_at))
-                {
-                    at.point = DiffPoint::NoData {
-                        reason: Reason::NotCollected,
-                    };
+                if let DiffPoint::Value { dt_micros, .. } = at.point {
+                    let start = prev_ts.unwrap_or_else(|| at.ts.saturating_sub(dt_micros));
+                    if !timeline.collected_throughout(start, at.ts) {
+                        at.point = DiffPoint::NoData {
+                            reason: Reason::NotCollected,
+                        };
+                    }
                 }
                 prev_ts = Some(at.ts);
             }
@@ -71,6 +117,35 @@ pub fn gate_readings(rows: &[OutRow], gate_column: &str) -> Vec<GateReading> {
 fn state_at(gate: &[GateReading], ts: i64) -> Option<bool> {
     let idx = gate.partition_point(|&(reading_ts, _)| reading_ts <= ts);
     if idx == 0 { None } else { gate[idx - 1].1 }
+}
+
+struct GateTimeline<'a> {
+    readings: &'a [GateReading],
+    invalid_prefix: Vec<usize>,
+}
+
+impl<'a> GateTimeline<'a> {
+    fn new(readings: &'a [GateReading]) -> Self {
+        let mut invalid_prefix = Vec::with_capacity(readings.len() + 1);
+        invalid_prefix.push(0);
+        for &(_, state) in readings {
+            let invalid = usize::from(state != Some(true));
+            invalid_prefix.push(invalid_prefix.last().copied().unwrap_or(0) + invalid);
+        }
+        Self {
+            readings,
+            invalid_prefix,
+        }
+    }
+
+    fn collected_throughout(&self, from: i64, to: i64) -> bool {
+        if state_at(self.readings, from) != Some(true) {
+            return false;
+        }
+        let first = self.readings.partition_point(|&(ts, _)| ts <= from);
+        let last = self.readings.partition_point(|&(ts, _)| ts <= to);
+        self.invalid_prefix[last] == self.invalid_prefix[first]
+    }
 }
 
 #[cfg(test)]
@@ -137,8 +212,6 @@ mod tests {
     #[test]
     fn pairs_inside_an_off_interval_become_not_collected() {
         let mut s = series(vec![value_at(SEC), value_at(2 * SEC), value_at(3 * SEC)]);
-        // Off from t=0, back on at t=2s: the pairs ending at 1s and 2s touch
-        // the off state (at their start or end), the 2s..3s pair is clean.
         let gate = vec![(0, Some(false)), (2 * SEC, Some(true))];
         apply_gating(&mut s, "blk_read_time", &gate);
         assert_eq!(
@@ -156,17 +229,47 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_gate_state_rewrites_nothing() {
+    fn unknown_and_before_first_are_not_collected() {
         let mut s = series(vec![value_at(SEC), value_at(2 * SEC)]);
         apply_gating(&mut s, "blk_read_time", &[(0, None)]);
-        assert_eq!(reasons(&s), vec![None, None], "None state gates nothing");
-        let mut s = series(vec![value_at(SEC)]);
-        apply_gating(&mut s, "blk_read_time", &[(5 * SEC, Some(false))]);
         assert_eq!(
             reasons(&s),
-            vec![None],
-            "a timestamp before the first reading gates nothing"
+            vec![Some(Reason::NotCollected), Some(Reason::NotCollected)]
         );
+        let mut s = series(vec![value_at(SEC)]);
+        apply_gating(&mut s, "blk_read_time", &[(5 * SEC, Some(false))]);
+        assert_eq!(reasons(&s), vec![Some(Reason::NotCollected)]);
+    }
+
+    #[test]
+    fn interior_false_reading_invalidates_the_interval() {
+        let mut s = series(vec![value_at(SEC), value_at(2 * SEC)]);
+        let gate = vec![
+            (0, Some(true)),
+            (SEC + SEC / 4, Some(false)),
+            (SEC + SEC / 2, Some(true)),
+        ];
+        apply_gating(&mut s, "blk_read_time", &gate);
+        assert_eq!(reasons(&s), vec![None, Some(Reason::NotCollected)]);
+    }
+
+    #[test]
+    fn endpoint_transitions_are_conservative() {
+        let mut off_to_on = series(vec![value_at(SEC)]);
+        apply_gating(
+            &mut off_to_on,
+            "blk_read_time",
+            &[(0, Some(false)), (SEC, Some(true))],
+        );
+        assert_eq!(reasons(&off_to_on), vec![Some(Reason::NotCollected)]);
+
+        let mut on_to_off = series(vec![value_at(SEC)]);
+        apply_gating(
+            &mut on_to_off,
+            "blk_read_time",
+            &[(0, Some(true)), (SEC, Some(false))],
+        );
+        assert_eq!(reasons(&on_to_off), vec![Some(Reason::NotCollected)]);
     }
 
     #[test]
