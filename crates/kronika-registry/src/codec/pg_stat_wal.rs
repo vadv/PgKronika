@@ -35,10 +35,10 @@ pub struct PgStatWalV1 {
     #[column(c)]
     pub wal_sync: i64,
     /// Time spent writing WAL to disk, ms; `0.0` without `track_wal_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_wal_io_timing")]
     pub wal_write_time: f64,
     /// Time spent syncing WAL to disk, ms; `0.0` without `track_wal_io_timing`.
-    #[column(c)]
+    #[column(c, gated_by = "reset_metadata.track_wal_io_timing")]
     pub wal_sync_time: f64,
     /// Time of the last `pg_stat_wal` reset; `None` if never.
     #[column(g)]

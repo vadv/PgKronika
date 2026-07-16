@@ -21,7 +21,7 @@ use crate::params::{
 };
 use crate::serialize::episode_to_json;
 
-use super::v1::DIFF_MAX_ROWS;
+use super::v1::{DIFF_MAX_ROWS, Gates};
 
 /// Default window length: one hour.
 const WINDOW_DEFAULT_US: i64 = 3_600 * 1_000_000;
@@ -89,18 +89,49 @@ fn counts_to_json(counts: &ScanCounts) -> Value {
     })
 }
 
-/// `GET /v1/anomalies?source&from&to` — every anomaly episode of the period,
-/// across all sections of the source, ranked by peak score.
+fn parse_scan_params(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<(ScanParams, usize), ErrorResponse> {
+    let from = parse_i64(params, "from")?;
+    let to = parse_i64(params, "to")?;
+    if from >= to {
+        return Err(bad_request("`from` must be before `to`"));
+    }
+    let window = parse_duration_us(params, "window", WINDOW_DEFAULT_US)?;
+    let step = parse_duration_us(params, "step", (window / 4).max(1))?;
+    let threshold = parse_f64_non_negative(params, "threshold", THRESHOLD_DEFAULT)?;
+    let eps_rel = parse_f64_non_negative(params, "eps_rel", EPS_REL_DEFAULT)?;
+    let limit = parse_limit_default(params, LIMIT_DEFAULT)?;
+    if from.checked_add(window).is_none_or(|first| first > to) {
+        return Err(bad_request("`window` must fit inside [from, to]"));
+    }
+    let positions = to
+        .checked_sub(from)
+        .and_then(|span| span.checked_sub(window))
+        .map(|scannable| scannable / step + 2);
+    if positions.is_none_or(|count| count > MAX_POSITIONS) {
+        return Err(bad_request(
+            "the period and `step` produce too many window positions; \
+             widen `step` or narrow [from, to]",
+        ));
+    }
+    Ok((
+        ScanParams {
+            from,
+            to,
+            window,
+            step,
+            threshold,
+            eps_rel,
+        },
+        limit,
+    ))
+}
+
+/// `GET /v1/anomalies?source&from&to` returns ranked anomaly episodes.
 ///
-/// Optional knobs and their defaults: `window=1h` (sliding window length),
-/// `step` (position stride, `window/4`), `threshold=3.5` (episode cutoff in
-/// robust sigmas), `eps_rel=0.05` (relative scale floor), `limit=50` (episode
-/// cap after ranking), `section=<name>` (restrict the scan to one section).
-///
-/// Cumulative columns are scored over derivative rates, gauge columns over
-/// raw readings; MAD units make peak `|m|` comparable across sections, so
-/// one ranked list serves the whole source. A section whose period exceeds
-/// the row cap lands in `skipped` and the rest of the scan proceeds.
+/// Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `limit`,
+/// and `section`. Oversized sections are reported in `skipped`.
 pub(crate) async fn anomalies(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -115,29 +146,9 @@ pub(crate) async fn anomalies(
         )
     })?;
     let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
-    if from >= to {
-        return Err(bad_request("`from` must be before `to`"));
-    }
-    let window = parse_duration_us(&params, "window", WINDOW_DEFAULT_US)?;
-    let step = parse_duration_us(&params, "step", (window / 4).max(1))?;
-    let threshold = parse_f64_non_negative(&params, "threshold", THRESHOLD_DEFAULT)?;
-    let eps_rel = parse_f64_non_negative(&params, "eps_rel", EPS_REL_DEFAULT)?;
-    let limit = parse_limit_default(&params, LIMIT_DEFAULT)?;
-    if from.checked_add(window).is_none_or(|first| first > to) {
-        return Err(bad_request("`window` must fit inside [from, to]"));
-    }
-    let positions = to
-        .checked_sub(from)
-        .and_then(|span| span.checked_sub(window))
-        .map(|scannable| scannable / step + 2);
-    if positions.is_none_or(|count| count > MAX_POSITIONS) {
-        return Err(bad_request(
-            "the period and `step` produce too many window positions; \
-             widen `step` or narrow [from, to]",
-        ));
-    }
+    let (scan, limit) = parse_scan_params(&params)?;
+    let (from, to) = (scan.from, scan.to);
+    let (window, step) = (scan.window, scan.step);
 
     let names: Vec<&'static str> = match params.get("section") {
         Some(name) => {
@@ -148,16 +159,12 @@ pub(crate) async fn anomalies(
         None => scannable_sections(),
     };
 
-    let scan = ScanParams {
-        from,
-        to,
-        window,
-        step,
-        threshold,
-        eps_rel,
-    };
-
     let mut snap = state.snapshot.load().as_ref().clone();
+    let logicals: Vec<LogicalSection> = names
+        .iter()
+        .filter_map(|&name| logical_section(name))
+        .collect();
+    let gates = load_gates(&mut snap, &logicals, source, from, to)?;
     let mut hits: Vec<(&'static str, EpisodeHit)> = Vec::new();
     let mut identities: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
     let mut sections_out = serde_json::Map::new();
@@ -165,7 +172,15 @@ pub(crate) async fn anomalies(
     let mut remaining_work = MAX_SCORE_WORK;
 
     for &name in &names {
-        match scan_one_section(&mut snap, name, source, &scan, remaining_work, limit)? {
+        match scan_one_section(
+            &mut snap,
+            name,
+            source,
+            &scan,
+            remaining_work,
+            limit,
+            &gates,
+        )? {
             Ok(section) => {
                 remaining_work -= section.work;
                 hits.extend(section.hits.into_iter().map(|hit| (name, hit)));
@@ -198,13 +213,29 @@ pub(crate) async fn anomalies(
         "to": to,
         "window_us": window,
         "step_us": step,
-        "threshold": threshold,
-        "eps_rel": eps_rel,
+        "threshold": scan.threshold,
+        "eps_rel": scan.eps_rel,
         "limit": limit,
         "episodes": episodes,
         "sections": Value::Object(sections_out),
         "skipped": skipped,
     })))
+}
+
+fn load_gates(
+    snap: &mut LocalDirSnapshot,
+    logicals: &[LogicalSection],
+    source: u64,
+    from: i64,
+    to: i64,
+) -> Result<Gates, ErrorResponse> {
+    let mut pages = BTreeMap::new();
+    for name in Gates::sections(logicals) {
+        let page = query_section(snap, name, source, from, to, DIFF_MAX_ROWS, None)
+            .map_err(|err| query_error_response(&err))?;
+        pages.insert(name.to_owned(), page);
+    }
+    Ok(Gates::from_pages(logicals, &pages))
 }
 
 fn scan_one_section(
@@ -214,6 +245,7 @@ fn scan_one_section(
     scan: &ScanParams,
     remaining_work: usize,
     hit_limit: usize,
+    gates: &Gates,
 ) -> Result<Result<SectionScan, String>, ErrorResponse> {
     let page = match query_section(snap, name, source, scan.from, scan.to, DIFF_MAX_ROWS, None) {
         Ok(page) => page,
@@ -233,7 +265,8 @@ fn scan_one_section(
         .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.to_owned())))?;
     let identity = logical.diff_key();
     let (cumulative, gauges) = scorable_columns(&logical);
-    let diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+    let mut diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+    gates.apply(&logical, &mut diffs);
     let gauge_series = gauge_section(&identity, &gauges, &page.rows);
     let (hits, counts, work) =
         match scan_section(&diffs, &gauge_series, scan, remaining_work, hit_limit) {

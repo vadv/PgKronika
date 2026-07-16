@@ -55,13 +55,12 @@ pub struct ResetMetadata {
     /// `compute_query_id` GUC value; if `off`, `query_id` is not a reliable key.
     #[column(l)]
     pub compute_query_id: Option<StrId>,
-    /// `track_io_timing` GUC; if `false`, `blk_*_time` stay zero and do not mean
-    /// fast IO; `None` if the GUC is unavailable.
+    /// `track_io_timing` in the collector session. Interpreting aggregate
+    /// timings assumes contributing sessions use the same setting.
     #[column(l)]
     pub track_io_timing: Option<bool>,
-    /// `track_wal_io_timing` GUC. If `false`, WAL timing columns stay zero
-    /// because timing is disabled, not because writes are free. `None` if the GUC
-    /// is unavailable.
+    /// `track_wal_io_timing` in the collector session, under the same uniform
+    /// session-setting assumption as `track_io_timing`.
     #[column(l)]
     pub track_wal_io_timing: Option<bool>,
 }

@@ -46,7 +46,8 @@ pub use codec::{
 };
 pub(crate) use codec::{check_row_cap, decode_batches, decode_section, encode_section};
 pub use contract::{
-    Column, ColumnClass, ColumnType, LintError, Semantics, StrId, Ts, TypeContract, lint,
+    CollectionGate, Column, ColumnClass, ColumnType, LintError, RowGateOverride, SectionColumnRef,
+    Semantics, StrId, Ts, TypeContract, lint, lint_references,
 };
 pub use generic::{Cell, Row, decode_rows};
 pub use pool::{BytesPool, PoolStats};
@@ -220,7 +221,8 @@ pub fn decode_pooled(
 ///
 /// Returns all linter errors found in registered contracts.
 pub fn lint_registry() -> Result<(), Vec<LintError>> {
-    lint(registry())
+    lint(registry())?;
+    lint_references(registry())
 }
 
 #[cfg(test)]
