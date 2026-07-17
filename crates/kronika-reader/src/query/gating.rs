@@ -1,6 +1,6 @@
 //! Collection-state gating of diff intervals.
 
-use kronika_diff::{DiffPoint, Reason};
+use kronika_analytics::{DiffPoint, Reason};
 use kronika_registry::{CollectionGate, SectionColumnRef};
 
 use crate::query::diff::{SeriesDiff, column};
@@ -150,7 +150,7 @@ impl<'a> GateTimeline<'a> {
 
 #[cfg(test)]
 mod tests {
-    use kronika_diff::{DiffPoint, Reason, Scalar};
+    use kronika_analytics::{DiffPoint, Reason, Scalar};
 
     use super::apply_gating;
     use crate::query::diff::{ColumnDiff, DiffAt, SeriesDiff};

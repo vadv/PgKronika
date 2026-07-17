@@ -3,7 +3,7 @@
 //! Each position is scored against the rest of the period, including later
 //! samples. This is a retrospective, non-causal scan.
 
-use kronika_anomaly::{Episode, NotEvaluatedReason, ScoreParams, Scored, episodes, score_window};
+use kronika_analytics::{Episode, NotEvaluatedReason, ScoreParams, Scored, episodes, score_window};
 use kronika_reader::{DiffPoint, Reason, SeriesDiff, SeriesValues, Value};
 use kronika_registry::ColumnClass;
 
@@ -358,7 +358,7 @@ pub(crate) fn rank(hits: &mut Vec<(&'static str, EpisodeHit)>, limit: usize) {
 
 #[cfg(test)]
 mod tests {
-    use kronika_anomaly::{Direction, NotEvaluatedReason, ScoreParams, Scored};
+    use kronika_analytics::{Direction, NotEvaluatedReason, ScoreParams, Scored};
     use kronika_reader::{ColumnValues, SeriesValues, Value};
 
     use super::{EpisodeHit, ScanCounts, ScanParams, positions, rank, scan_section, score_series};

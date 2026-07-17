@@ -1,4 +1,4 @@
-use kronika_anomaly::Direction;
+use kronika_analytics::Direction;
 use kronika_reader::{
     DiffAt, DiffPoint, OutRow, Reason, Scalar, SectionPage, SeriesDiff, Value as CellValue,
 };

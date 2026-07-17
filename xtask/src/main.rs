@@ -33,12 +33,11 @@ const RULES: &[(&str, &[&str])] = &[
         // No source-*: the PostgreSQL client and /proc readers must not
         // enter the web process.
         &[
-            "kronika-anomaly",
             "kronika-format",
             "kronika-derive",
             "kronika-registry",
             "kronika-reader",
-            "kronika-diff",
+            "kronika-analytics",
             "kronika-store",
         ],
     ),
@@ -55,7 +54,7 @@ const RULES: &[(&str, &[&str])] = &[
             "kronika-derive",
             "kronika-registry",
             "kronika-reader",
-            "kronika-diff",
+            "kronika-analytics",
             "kronika-store",
         ],
     ),
