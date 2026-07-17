@@ -40,6 +40,11 @@ use criterion as _;
 mod anomaly;
 mod auth;
 pub(crate) mod handlers;
+#[allow(
+    dead_code,
+    reason = "domain core is compiled and unit-tested but not yet reachable from a route"
+)]
+mod incident;
 mod params;
 mod serialize;
 pub(crate) mod startup;
