@@ -40,6 +40,11 @@ use criterion as _;
 mod anomaly;
 mod auth;
 pub(crate) mod handlers;
+#[allow(
+    dead_code,
+    reason = "incident limits and the reader adapter are not wired yet"
+)]
+mod incident;
 mod params;
 mod serialize;
 pub(crate) mod startup;
