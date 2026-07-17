@@ -1,19 +1,14 @@
-//! Pure domain model for incident analysis: series identity, the canonical
-//! episode key, and its deterministic byte encoding. No I/O, no HTTP, no JSON.
+//! Incident identity and canonical key encoding.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
 
 use kronika_anomaly::Episode;
-use kronika_reader::Value;
 
-/// Encoding version of [`IncidentKeyV1`]. Any change to the byte layout below
-/// must bump this so a stored key never silently decodes under new rules.
+/// Bump when the canonical byte layout changes.
 const KEY_VERSION: u8 = 1;
 
-/// A scalar allowed in a series identity: the order-stable subset of reader
-/// [`Value`] that `diff_key` columns actually carry. Floats, timestamps, blobs,
-/// lists and `NULL` are not identities and are rejected on conversion.
+/// A scalar accepted in a canonical series identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum IdentityValue {
     I64(i64),
@@ -22,31 +17,15 @@ pub(crate) enum IdentityValue {
     Text(String),
 }
 
-/// Why a reader [`Value`] cannot stand in an incident identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IdentityReject {
-    /// `NULL`, an unresolved id, or the `StrId(0)` sentinel: the entity cannot be
-    /// named, so the episode is dropped rather than keyed under a stand-in.
-    NullOrUnresolved,
-    /// A float, timestamp, blob or list — not an order-stable identity scalar.
-    NonScalar,
-}
-
 impl IdentityValue {
-    /// Convert one reader value, rejecting anything that is not a canonical
-    /// identity scalar.
-    pub(crate) fn from_value(value: &Value) -> Result<Self, IdentityReject> {
-        match value {
-            Value::Null => Err(IdentityReject::NullOrUnresolved),
-            Value::I64(v) => Ok(Self::I64(*v)),
-            Value::U64(v) => Ok(Self::U64(*v)),
-            Value::Bool(v) => Ok(Self::Bool(*v)),
-            Value::Str(s) => Ok(Self::Text(s.clone())),
-            _ => Err(IdentityReject::NonScalar),
+    const fn encoded_len(&self) -> Option<usize> {
+        match self {
+            Self::I64(_) | Self::U64(_) => Some(9),
+            Self::Bool(_) => Some(2),
+            Self::Text(text) => 9_usize.checked_add(text.len()),
         }
     }
 
-    /// Append the tagged, length-delimited encoding of this scalar.
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Self::I64(v) => {
@@ -69,8 +48,6 @@ impl IdentityValue {
     }
 }
 
-/// Append a `u64` big-endian length followed by the bytes. The length prefix is
-/// what keeps `("ab","c")` and `("a","bc")` from encoding to the same key.
 fn encode_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
     out.extend_from_slice(bytes);
@@ -82,9 +59,8 @@ pub(crate) struct EnrichedEpisode {
     pub reference: EpisodeRefV1,
 }
 
-/// Stable, cross-process reference to one series' anomaly episode. `type_id` is
-/// deliberately absent: union rows drop layout provenance, so a stable key uses
-/// the logical section name instead.
+/// Stable reference to one series' anomaly episode. Union rows do not preserve
+/// `type_id`, so the key uses the logical section name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EpisodeRefV1 {
     pub logical_section: &'static str,
@@ -95,7 +71,19 @@ pub(crate) struct EpisodeRefV1 {
 }
 
 impl EpisodeRefV1 {
-    /// Append the canonical encoding of this reference.
+    fn encoded_len(&self) -> Option<usize> {
+        let mut len = 8_usize
+            .checked_add(self.logical_section.len())?
+            .checked_add(8)?
+            .checked_add(self.column.len())?
+            .checked_add(8)?
+            .checked_add(16)?;
+        for value in self.identity.iter() {
+            len = len.checked_add(value.encoded_len()?)?;
+        }
+        Some(len)
+    }
+
     fn encode(&self, out: &mut Vec<u8>) {
         encode_bytes(out, self.logical_section.as_bytes());
         encode_bytes(out, self.column.as_bytes());
@@ -107,8 +95,6 @@ impl EpisodeRefV1 {
         out.extend_from_slice(&self.end_us.to_be_bytes());
     }
 
-    /// Total order: interval first, then section, column, and identity. Used
-    /// both to cluster episodes and to canonicalise a key's member list.
     const fn order_key(&self) -> (i64, i64, &'static str, &'static str) {
         (
             self.start_us,
@@ -133,46 +119,57 @@ impl PartialOrd for EpisodeRefV1 {
     }
 }
 
-/// Identity of one incident: a resolved node id, the interval, and the sorted
-/// set of member episodes. Two incidents with the same members in any input
-/// order canonicalise to the same bytes.
 pub(crate) struct IncidentKeyV1 {
-    node_self_id: String,
-    start_us: i64,
-    end_us: i64,
-    members: Vec<EpisodeRefV1>,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyTooLarge {
+    pub observed: usize,
+    pub limit: usize,
 }
 
 impl IncidentKeyV1 {
-    /// Build a key, sorting members into canonical order. `node_self_id` must be
-    /// the resolved UTF-8 node id; an unresolved id has no place here and the
-    /// caller drops the incident instead of substituting one.
     pub(crate) fn new(
-        node_self_id: String,
+        node_self_id: &str,
         start_us: i64,
         end_us: i64,
-        mut members: Vec<EpisodeRefV1>,
-    ) -> Self {
-        members.sort();
-        Self {
-            node_self_id,
-            start_us,
-            end_us,
-            members,
+        members: &[EpisodeRefV1],
+        max_bytes: usize,
+    ) -> Result<Self, KeyTooLarge> {
+        let mut ordered: Vec<&EpisodeRefV1> = members.iter().collect();
+        ordered.sort_unstable();
+
+        let mut encoded_len = 1_usize
+            .checked_add(8)
+            .and_then(|len| len.checked_add(node_self_id.len()))
+            .and_then(|len| len.checked_add(16))
+            .and_then(|len| len.checked_add(8))
+            .unwrap_or(usize::MAX);
+        for member in &ordered {
+            encoded_len = encoded_len.saturating_add(member.encoded_len().unwrap_or(usize::MAX));
         }
+        if encoded_len > max_bytes {
+            return Err(KeyTooLarge {
+                observed: encoded_len,
+                limit: max_bytes,
+            });
+        }
+
+        let mut bytes = Vec::with_capacity(encoded_len);
+        bytes.push(KEY_VERSION);
+        encode_bytes(&mut bytes, node_self_id.as_bytes());
+        bytes.extend_from_slice(&start_us.to_be_bytes());
+        bytes.extend_from_slice(&end_us.to_be_bytes());
+        bytes.extend_from_slice(&(ordered.len() as u64).to_be_bytes());
+        for member in ordered {
+            member.encode(&mut bytes);
+        }
+        Ok(Self { bytes })
     }
 
-    /// The version-tagged, length-delimited byte encoding of this key.
-    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = vec![KEY_VERSION];
-        encode_bytes(&mut out, self.node_self_id.as_bytes());
-        out.extend_from_slice(&self.start_us.to_be_bytes());
-        out.extend_from_slice(&self.end_us.to_be_bytes());
-        out.extend_from_slice(&(self.members.len() as u64).to_be_bytes());
-        for member in &self.members {
-            member.encode(&mut out);
-        }
-        out
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -191,46 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn scalar_values_convert_to_identity() {
-        assert_eq!(
-            IdentityValue::from_value(&Value::I64(-7)),
-            Ok(IdentityValue::I64(-7))
-        );
-        assert_eq!(
-            IdentityValue::from_value(&Value::U64(7)),
-            Ok(IdentityValue::U64(7))
-        );
-        assert_eq!(
-            IdentityValue::from_value(&Value::Bool(true)),
-            Ok(IdentityValue::Bool(true))
-        );
-        assert_eq!(
-            IdentityValue::from_value(&Value::Str("db".to_owned())),
-            Ok(IdentityValue::Text("db".to_owned()))
-        );
-    }
-
-    #[test]
-    fn null_is_rejected_as_unresolved() {
-        assert_eq!(
-            IdentityValue::from_value(&Value::Null),
-            Err(IdentityReject::NullOrUnresolved)
-        );
-    }
-
-    #[test]
-    fn float_and_timestamp_are_rejected_as_non_scalar() {
-        assert_eq!(
-            IdentityValue::from_value(&Value::F64(1.0)),
-            Err(IdentityReject::NonScalar)
-        );
-        assert_eq!(
-            IdentityValue::from_value(&Value::Ts(1)),
-            Err(IdentityReject::NonScalar)
-        );
-    }
-
-    #[test]
     fn identity_scalars_order_by_variant_then_value() {
         assert!(IdentityValue::I64(9) < IdentityValue::U64(0));
         assert!(IdentityValue::U64(9) < IdentityValue::Bool(false));
@@ -243,8 +200,8 @@ mod tests {
     fn encoding_is_deterministic() {
         let a = iref("s", &[IdentityValue::I64(1)], 10, 20);
         let b = iref("s", &[IdentityValue::I64(1)], 10, 20);
-        let key_a = IncidentKeyV1::new("n".to_owned(), 0, 100, vec![a]);
-        let key_b = IncidentKeyV1::new("n".to_owned(), 0, 100, vec![b]);
+        let key_a = IncidentKeyV1::new("n", 0, 100, &[a], 1024).expect("within limit");
+        let key_b = IncidentKeyV1::new("n", 0, 100, &[b], 1024).expect("within limit");
         assert_eq!(key_a.canonical_bytes(), key_b.canonical_bytes());
     }
 
@@ -252,16 +209,20 @@ mod tests {
     fn length_prefix_prevents_text_boundary_collision() {
         let ab_c = iref("s", &[text("ab"), text("c")], 0, 1);
         let a_bc = iref("s", &[text("a"), text("bc")], 0, 1);
-        let ka = IncidentKeyV1::new("n".to_owned(), 0, 1, vec![ab_c]);
-        let kb = IncidentKeyV1::new("n".to_owned(), 0, 1, vec![a_bc]);
+        let ka = IncidentKeyV1::new("n", 0, 1, &[ab_c], 1024).expect("within limit");
+        let kb = IncidentKeyV1::new("n", 0, 1, &[a_bc], 1024).expect("within limit");
         assert_ne!(ka.canonical_bytes(), kb.canonical_bytes());
     }
 
     #[test]
     fn distinct_fields_produce_distinct_keys() {
         let base = || iref("s", &[IdentityValue::U64(1)], 10, 20);
-        let bytes =
-            |r: EpisodeRefV1| IncidentKeyV1::new("n".to_owned(), 0, 99, vec![r]).canonical_bytes();
+        let bytes = |r: EpisodeRefV1| {
+            IncidentKeyV1::new("n", 0, 99, &[r], 1024)
+                .expect("within limit")
+                .canonical_bytes()
+                .to_vec()
+        };
         let baseline = bytes(base());
         let mut other_section = base();
         other_section.logical_section = "t";
@@ -275,24 +236,43 @@ mod tests {
     fn member_order_does_not_change_the_key() {
         let x = iref("a", &[IdentityValue::I64(1)], 0, 5);
         let y = iref("b", &[IdentityValue::I64(2)], 3, 8);
-        let forward = IncidentKeyV1::new("n".to_owned(), 0, 10, vec![x.clone(), y.clone()]);
-        let reversed = IncidentKeyV1::new("n".to_owned(), 0, 10, vec![y, x]);
+        let forward =
+            IncidentKeyV1::new("n", 0, 10, &[x.clone(), y.clone()], 1024).expect("within limit");
+        let reversed = IncidentKeyV1::new("n", 0, 10, &[y, x], 1024).expect("within limit");
         assert_eq!(forward.canonical_bytes(), reversed.canonical_bytes());
     }
 
     #[test]
     fn node_id_participates_in_the_key() {
         let r = iref("s", &[IdentityValue::I64(1)], 0, 1);
-        let one = IncidentKeyV1::new("node-a".to_owned(), 0, 1, vec![r.clone()]).canonical_bytes();
-        let two = IncidentKeyV1::new("node-b".to_owned(), 0, 1, vec![r]).canonical_bytes();
+        let one = IncidentKeyV1::new("node-a", 0, 1, std::slice::from_ref(&r), 1024)
+            .expect("within limit")
+            .canonical_bytes()
+            .to_vec();
+        let two = IncidentKeyV1::new("node-b", 0, 1, &[r], 1024)
+            .expect("within limit")
+            .canonical_bytes()
+            .to_vec();
         assert_ne!(one, two);
     }
 
     #[test]
     fn key_carries_the_version_byte() {
         let r = iref("s", &[IdentityValue::I64(1)], 0, 1);
-        let bytes = IncidentKeyV1::new("n".to_owned(), 0, 1, vec![r]).canonical_bytes();
-        assert_eq!(bytes.first(), Some(&KEY_VERSION));
+        let key = IncidentKeyV1::new("n", 0, 1, &[r], 1024).expect("within limit");
+        assert_eq!(key.canonical_bytes().first(), Some(&KEY_VERSION));
+    }
+
+    #[test]
+    fn key_size_is_checked_before_allocation() {
+        let reference = iref("section", &[text("identity")], 0, 1);
+        assert_eq!(
+            IncidentKeyV1::new("node", 0, 1, &[reference], 1).err(),
+            Some(KeyTooLarge {
+                observed: 102,
+                limit: 1,
+            })
+        );
     }
 
     #[test]

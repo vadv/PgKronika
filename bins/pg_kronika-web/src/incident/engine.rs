@@ -1,116 +1,349 @@
-//! Bounded, deterministic evaluation: episodes become clustered incidents, each
-//! run through only its candidate lenses under a shared work budget.
+//! Bounded, deterministic incident evaluation.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 
-use super::cluster::cluster_episodes;
-use super::dispatch::{SectionColumn, WorkBudget, candidate_lenses, section_index};
+use super::cluster::{ClusterError, ClusterOutcome, cluster_episodes};
+use super::dispatch::{
+    LimitAxis, LimitHit, SectionColumn, WorkBudget, candidate_lenses, section_index,
+};
 use super::evidence::Finding;
-use super::lens::{ClockRelation, EvalContext, Lens};
-use super::model::{EnrichedEpisode, EpisodeRefV1, IncidentKeyV1};
+use super::evidence::sink::{FindingSink, OutputCounts, OutputLimits};
+use super::lens::Lens;
+use super::model::{EnrichedEpisode, EpisodeRefV1, IncidentKeyV1, KeyTooLarge};
 use super::series::SeriesSet;
 
-/// Validated inputs for one analysis run.
-pub(crate) struct IncidentConfig {
-    pub node_self_id: String,
-    pub epsilon_us: i64,
-    pub max_cluster_span_us: i64,
-    pub clock_relation: ClockRelation,
-    pub work_limit: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClockRelation {
+    SameDomain,
+    Unknown,
 }
 
-/// One incident: a cluster of episodes, its canonical key, and the findings of
-/// the lenses that applied.
+pub(crate) struct EvalContext {
+    pub incident_start_us: i64,
+    pub incident_end_us: i64,
+    clock_relation: ClockRelation,
+}
+
+pub(crate) struct TemporalDirectionPermit<'a> {
+    _context: PhantomData<&'a EvalContext>,
+}
+
+impl EvalContext {
+    pub(crate) fn temporal_direction(&self) -> Option<TemporalDirectionPermit<'_>> {
+        matches!(self.clock_relation, ClockRelation::SameDomain).then_some(
+            TemporalDirectionPermit {
+                _context: PhantomData,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(clock_relation: ClockRelation) -> Self {
+        Self {
+            incident_start_us: 0,
+            incident_end_us: 10,
+            clock_relation,
+        }
+    }
+}
+
+/// No production constructor exists until the incident ceilings are approved.
+pub(crate) struct IncidentConfig {
+    node_self_id: String,
+    epsilon_us: i64,
+    max_cluster_span_us: i64,
+    clock_relation: ClockRelation,
+    work_limit: u64,
+    max_episodes: usize,
+    max_clusters: usize,
+    max_key_bytes: usize,
+    max_lens_evaluations: u64,
+    max_findings: u64,
+    max_evidence_rows: u64,
+}
+
 pub(crate) struct Incident {
     pub key: IncidentKeyV1,
     pub start_us: i64,
     pub end_us: i64,
     pub members: Vec<EpisodeRefV1>,
     pub findings: Vec<Finding>,
+    pub evaluation_complete: bool,
 }
 
-/// Result of one run, including the honesty accounting the caller reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EngineSkip {
+    pub lens_id: Option<&'static str>,
+    pub limit: LimitHit,
+}
+
 pub(crate) struct EngineOutcome {
     pub incidents: Vec<Incident>,
     pub span_splits: u64,
-    pub work_exhausted: bool,
+    pub complete: bool,
+    pub skipped: Vec<EngineSkip>,
 }
 
-/// Presentation order: strongest confidence first, then role (lead first), then
-/// lens id. Stable sort keeps a lens' own deterministic order for equal keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnalyzeError {
+    MissingNodeIdentity,
+    EpisodeLimit { observed: usize, limit: usize },
+    ClusterLimit { observed: usize, limit: usize },
+    DuplicateLensId(&'static str),
+    Key(KeyTooLarge),
+    Cluster(ClusterError),
+}
+
 fn finding_order(a: &Finding, b: &Finding) -> Ordering {
     b.confidence()
         .cmp(&a.confidence())
         .then_with(|| a.role().cmp(&b.role()))
         .then_with(|| a.lens_id().cmp(b.lens_id()))
+        .then_with(|| a.scope().cmp(b.scope()))
+        .then_with(|| a.evidence().cmp(b.evidence()))
 }
 
-/// Cluster `episodes` and evaluate each incident's candidate lenses under one
-/// shared budget. Once the budget is exhausted, remaining lenses and clusters
-/// simply add nothing; the exhaustion is reported, never hidden.
+fn prepare_clusters(
+    episodes: Vec<EnrichedEpisode>,
+    config: &IncidentConfig,
+) -> Result<ClusterOutcome, AnalyzeError> {
+    if config.node_self_id.is_empty() {
+        return Err(AnalyzeError::MissingNodeIdentity);
+    }
+    if episodes.len() > config.max_episodes {
+        return Err(AnalyzeError::EpisodeLimit {
+            observed: episodes.len(),
+            limit: config.max_episodes,
+        });
+    }
+
+    let references = episodes
+        .into_iter()
+        .map(|episode| episode.reference)
+        .collect();
+    let clustered = cluster_episodes(references, config.epsilon_us, config.max_cluster_span_us)
+        .map_err(AnalyzeError::Cluster)?;
+    if clustered.clusters.len() > config.max_clusters {
+        return Err(AnalyzeError::ClusterLimit {
+            observed: clustered.clusters.len(),
+            limit: config.max_clusters,
+        });
+    }
+    Ok(clustered)
+}
+
+const fn admit_lens_evaluation(
+    lens_id: &'static str,
+    evaluations: &mut u64,
+    evaluation_limit: u64,
+    budget: &mut WorkBudget,
+) -> Result<(), EngineSkip> {
+    let observed = evaluations.saturating_add(1);
+    if observed > evaluation_limit {
+        return Err(EngineSkip {
+            lens_id: Some(lens_id),
+            limit: LimitHit {
+                axis: LimitAxis::LensEvaluations,
+                observed,
+                limit: evaluation_limit,
+            },
+        });
+    }
+    if !budget.charge(1) {
+        return Err(EngineSkip {
+            lens_id: Some(lens_id),
+            limit: LimitHit {
+                axis: LimitAxis::Work,
+                observed: budget.spent().saturating_add(1),
+                limit: budget.limit(),
+            },
+        });
+    }
+    *evaluations = observed;
+    Ok(())
+}
+
 pub(crate) fn analyze(
     episodes: Vec<EnrichedEpisode>,
     series: &SeriesSet,
     lenses: &[&dyn Lens],
     config: &IncidentConfig,
-) -> EngineOutcome {
-    let references = episodes.into_iter().map(|e| e.reference).collect();
-    let clustered = cluster_episodes(references, config.epsilon_us, config.max_cluster_span_us);
+) -> Result<EngineOutcome, AnalyzeError> {
+    let clustered = prepare_clusters(episodes, config)?;
 
+    let mut lens_ids = BTreeSet::new();
+    for lens in lenses {
+        if !lens_ids.insert(lens.id()) {
+            return Err(AnalyzeError::DuplicateLensId(lens.id()));
+        }
+    }
     let inputs: Vec<&'static [SectionColumn]> = lenses.iter().map(|lens| lens.inputs()).collect();
     let index = section_index(&inputs);
 
     let mut budget = WorkBudget::new(config.work_limit);
+    let mut output_counts = OutputCounts::new();
+    let output_limits = OutputLimits::new(config.max_findings, config.max_evidence_rows);
+    let mut lens_evaluations = 0_u64;
     let mut incidents = Vec::with_capacity(clustered.clusters.len());
+    let mut skipped = Vec::new();
+    let mut complete = true;
 
-    for cluster in clustered.clusters {
+    'clusters: for cluster in clustered.clusters {
         let context = EvalContext {
             incident_start_us: cluster.start_us,
             incident_end_us: cluster.end_us,
             clock_relation: config.clock_relation,
         };
-        let present: BTreeSet<&'static str> =
-            cluster.members.iter().map(|m| m.logical_section).collect();
-
+        let present: BTreeSet<&'static str> = cluster
+            .members
+            .iter()
+            .map(|member| member.logical_section)
+            .collect();
         let mut findings = Vec::new();
+        let mut incident_complete = true;
+
         for lens_index in candidate_lenses(&index, &present) {
-            if !budget.charge(1) {
+            let lens = lenses[lens_index];
+            if let Err(skip) = admit_lens_evaluation(
+                lens.id(),
+                &mut lens_evaluations,
+                config.max_lens_evaluations,
+                &mut budget,
+            ) {
+                skipped.push(skip);
+                incident_complete = false;
+                complete = false;
                 break;
             }
-            findings.extend(lenses[lens_index].evaluate(&cluster, series, &context, &mut budget));
+
+            let mut sink = FindingSink::new(
+                &mut findings,
+                &mut budget,
+                &mut output_counts,
+                output_limits,
+                lens.id(),
+                lens.confidence_cap(),
+            );
+            let evaluation = lens.evaluate(&cluster, series, &context, &mut sink);
+            let limit = evaluation.err().or_else(|| sink.limit_hit());
+            if let Some(limit) = limit {
+                skipped.push(EngineSkip {
+                    lens_id: Some(lens.id()),
+                    limit,
+                });
+                incident_complete = false;
+                complete = false;
+                break;
+            }
         }
         findings.sort_by(finding_order);
 
+        let key = IncidentKeyV1::new(
+            &config.node_self_id,
+            cluster.start_us,
+            cluster.end_us,
+            &cluster.members,
+            config.max_key_bytes,
+        )
+        .map_err(AnalyzeError::Key)?;
         incidents.push(Incident {
-            key: IncidentKeyV1::new(
-                config.node_self_id.clone(),
-                cluster.start_us,
-                cluster.end_us,
-                cluster.members.clone(),
-            ),
+            key,
             start_us: cluster.start_us,
             end_us: cluster.end_us,
             members: cluster.members,
             findings,
+            evaluation_complete: incident_complete,
         });
+
+        if !incident_complete {
+            break 'clusters;
+        }
     }
 
-    EngineOutcome {
+    Ok(EngineOutcome {
         incidents,
         span_splits: clustered.span_splits,
-        work_exhausted: budget.is_exhausted(),
-    }
+        complete,
+        skipped,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::incident::cluster::Cluster;
-    use crate::incident::evidence::{Confidence, Evidence, Role};
+    use crate::incident::evidence::{
+        Confidence, ConfidenceCap, Evidence, FindingDraft, FindingScope, Role,
+    };
     use crate::incident::model::IdentityValue;
     use kronika_anomaly::{Direction, Episode, Evaluated};
     use std::sync::Arc;
+
+    #[derive(Clone, Copy)]
+    enum TestEvidence {
+        Ratio,
+        Gauge,
+        Counter,
+    }
+
+    impl TestEvidence {
+        const fn build(self) -> Evidence {
+            match self {
+                Self::Ratio => Evidence::Ratio,
+                Self::Gauge => Evidence::Gauge,
+                Self::Counter => Evidence::Counter,
+            }
+        }
+    }
+
+    struct FixedLens {
+        id: &'static str,
+        inputs: &'static [SectionColumn],
+        cap: ConfidenceCap,
+        role: Role,
+        evidence: TestEvidence,
+    }
+
+    impl Lens for FixedLens {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn inputs(&self) -> &'static [SectionColumn] {
+            self.inputs
+        }
+
+        fn confidence_cap(&self) -> ConfidenceCap {
+            self.cap
+        }
+
+        fn evaluate(
+            &self,
+            cluster: &Cluster,
+            _series: &SeriesSet,
+            context: &EvalContext,
+            sink: &mut FindingSink<'_>,
+        ) -> Result<(), LimitHit> {
+            let scope = FindingScope::from_episode(&cluster.members[0]);
+            sink.emit(FindingDraft::new(
+                self.role,
+                scope,
+                vec![self.evidence.build()],
+                context.temporal_direction().as_ref(),
+            ))
+        }
+    }
+
+    const LOCKS: &[SectionColumn] = &[SectionColumn {
+        section: "pg_locks",
+        column: "blocked_by",
+    }];
+    const CACHE: &[SectionColumn] = &[SectionColumn {
+        section: "pg_stat_database",
+        column: "blks_read",
+    }];
 
     fn placeholder_episode() -> Episode {
         Episode {
@@ -129,50 +362,6 @@ mod tests {
             },
         }
     }
-
-    /// A lens bound to one section that always emits a single finding.
-    struct FixedLens {
-        id: &'static str,
-        inputs: &'static [SectionColumn],
-        cap: Confidence,
-        role: Role,
-        evidence: Evidence,
-    }
-
-    impl Lens for FixedLens {
-        fn id(&self) -> &'static str {
-            self.id
-        }
-        fn inputs(&self) -> &'static [SectionColumn] {
-            self.inputs
-        }
-        fn confidence_cap(&self) -> Confidence {
-            self.cap
-        }
-        fn evaluate(
-            &self,
-            _cluster: &Cluster,
-            _series: &SeriesSet,
-            _context: &EvalContext,
-            _budget: &mut WorkBudget,
-        ) -> Vec<Finding> {
-            vec![Finding::new(
-                self.id,
-                self.role,
-                self.cap,
-                vec![self.evidence],
-            )]
-        }
-    }
-
-    const LOCKS: &[SectionColumn] = &[SectionColumn {
-        section: "pg_locks",
-        column: "blocked_by",
-    }];
-    const CACHE: &[SectionColumn] = &[SectionColumn {
-        section: "pg_stat_database",
-        column: "blks_read",
-    }];
 
     fn episode(section: &'static str, id: i64, start: i64, end: i64) -> EnrichedEpisode {
         EnrichedEpisode {
@@ -194,151 +383,292 @@ mod tests {
             max_cluster_span_us: 1_000,
             clock_relation: ClockRelation::Unknown,
             work_limit,
+            max_episodes: 100,
+            max_clusters: 100,
+            max_key_bytes: 4_096,
+            max_lens_evaluations: 100,
+            max_findings: 100,
+            max_evidence_rows: 100,
         }
     }
 
-    fn lock_lens() -> FixedLens {
+    fn cache_lens(id: &'static str, evidence: TestEvidence) -> FixedLens {
         FixedLens {
-            id: "PG-LOCK-012",
-            inputs: LOCKS,
-            cap: Confidence::High,
-            role: Role::Lead,
-            evidence: Evidence::LockEdge,
-        }
-    }
-
-    fn cache_lens() -> FixedLens {
-        FixedLens {
-            id: "PG-CACHE-010",
+            id,
             inputs: CACHE,
-            cap: Confidence::Medium,
+            cap: ConfidenceCap::Medium,
             role: Role::Amplifier,
-            evidence: Evidence::Ratio,
+            evidence,
         }
     }
 
     #[test]
     fn no_episodes_yield_no_incidents() {
-        let outcome = analyze(vec![], &SeriesSet::new(), &[], &config(100));
+        let outcome = analyze(vec![], &SeriesSet::for_test(0), &[], &config(100)).expect("valid");
         assert!(outcome.incidents.is_empty());
-        assert!(!outcome.work_exhausted);
+        assert!(outcome.complete);
+        assert!(outcome.skipped.is_empty());
     }
 
     #[test]
     fn a_cluster_without_a_matching_lens_has_no_findings() {
-        let lens = cache_lens();
-        let lenses: &[&dyn Lens] = &[&lens];
+        let lens = cache_lens("CACHE", TestEvidence::Ratio);
         let outcome = analyze(
             vec![episode("pg_locks", 1, 0, 10)],
-            &SeriesSet::new(),
-            lenses,
+            &SeriesSet::for_test(0),
+            &[&lens],
             &config(100),
-        );
-        assert_eq!(outcome.incidents.len(), 1);
-        assert!(
-            outcome.incidents[0].findings.is_empty(),
-            "cache lens does not read pg_locks"
-        );
+        )
+        .expect("valid");
+        assert!(outcome.incidents[0].findings.is_empty());
     }
 
     #[test]
     fn a_matching_lens_produces_a_finding() {
-        let lens = lock_lens();
-        let lenses: &[&dyn Lens] = &[&lens];
+        let lens = cache_lens("CACHE", TestEvidence::Ratio);
         let outcome = analyze(
-            vec![episode("pg_locks", 1, 0, 10)],
-            &SeriesSet::new(),
-            lenses,
+            vec![episode("pg_stat_database", 1, 0, 10)],
+            &SeriesSet::for_test(0),
+            &[&lens],
             &config(100),
-        );
+        )
+        .expect("valid");
         assert_eq!(outcome.incidents[0].findings.len(), 1);
         assert_eq!(
             outcome.incidents[0].findings[0].confidence(),
-            Confidence::High
+            Confidence::MEDIUM
         );
     }
 
     #[test]
     fn separate_clusters_become_separate_incidents() {
-        let lens = lock_lens();
-        let lenses: &[&dyn Lens] = &[&lens];
+        let lens = FixedLens {
+            id: "LOCK",
+            inputs: LOCKS,
+            cap: ConfidenceCap::Low,
+            role: Role::Coincident,
+            evidence: TestEvidence::Counter,
+        };
         let outcome = analyze(
             vec![
                 episode("pg_locks", 1, 0, 10),
                 episode("pg_locks", 2, 500, 510),
             ],
-            &SeriesSet::new(),
-            lenses,
+            &SeriesSet::for_test(0),
+            &[&lens],
             &config(100),
-        );
+        )
+        .expect("valid");
         assert_eq!(outcome.incidents.len(), 2);
     }
 
     #[test]
-    fn findings_sort_by_confidence_then_role_then_lens() {
-        let lock = lock_lens();
-        let cache = cache_lens();
-        let lenses: &[&dyn Lens] = &[&cache, &lock];
-        let outcome = analyze(
-            vec![
-                episode("pg_locks", 1, 0, 10),
-                episode("pg_stat_database", 1, 2, 8),
-            ],
-            &SeriesSet::new(),
-            lenses,
-            &config(100),
-        );
-        let ids: Vec<&str> = outcome.incidents[0]
-            .findings
-            .iter()
-            .map(Finding::lens_id)
-            .collect();
-        assert_eq!(
-            ids,
-            vec!["PG-LOCK-012", "PG-CACHE-010"],
-            "High lead before Medium amplifier"
-        );
-    }
-
-    #[test]
-    fn the_key_is_deterministic_across_runs() {
-        let lens = lock_lens();
-        let lenses: &[&dyn Lens] = &[&lens];
-        let run = || {
-            analyze(
-                vec![episode("pg_locks", 1, 0, 10)],
-                &SeriesSet::new(),
-                lenses,
-                &config(100),
-            )
-            .incidents
-            .remove(0)
-            .key
-            .canonical_bytes()
+    fn finding_order_is_independent_of_lens_registration_order() {
+        let ratio = cache_lens("SAME", TestEvidence::Ratio);
+        let gauge = cache_lens("SAME", TestEvidence::Gauge);
+        let run = |reverse: bool| {
+            let reference = episode("pg_stat_database", 1, 0, 10).reference;
+            let scope = FindingScope::from_episode(&reference);
+            let mut findings = Vec::new();
+            let mut budget = WorkBudget::new(10);
+            let mut counts = OutputCounts::new();
+            for evidence in [ratio.evidence.build(), gauge.evidence.build()] {
+                FindingSink::new(
+                    &mut findings,
+                    &mut budget,
+                    &mut counts,
+                    OutputLimits::new(2, 2),
+                    "SAME",
+                    ConfidenceCap::Medium,
+                )
+                .emit(FindingDraft::new(
+                    Role::Amplifier,
+                    scope.clone(),
+                    vec![evidence],
+                    None,
+                ))
+                .expect("within limits");
+            }
+            if reverse {
+                findings.reverse();
+            }
+            findings.sort_by(finding_order);
+            findings
+                .into_iter()
+                .map(|finding| format!("{:?}", finding.evidence()[0]))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(run(), run());
+
+        assert_eq!(run(false), run(true));
     }
 
     #[test]
-    fn an_exhausted_budget_is_reported_and_stops_further_lenses() {
-        let lock = lock_lens();
-        let cache = cache_lens();
-        let lenses: &[&dyn Lens] = &[&lock, &cache];
-        // One lens evaluation fits; the second charge fails and latches.
+    fn unknown_clock_rejects_an_unproven_lead() {
+        let lens = FixedLens {
+            id: "TEMPORAL",
+            inputs: CACHE,
+            cap: ConfidenceCap::Medium,
+            role: Role::Lead,
+            evidence: TestEvidence::Ratio,
+        };
         let outcome = analyze(
-            vec![
-                episode("pg_locks", 1, 0, 10),
-                episode("pg_stat_database", 1, 2, 8),
-            ],
-            &SeriesSet::new(),
-            lenses,
-            &config(1),
-        );
-        assert!(outcome.work_exhausted);
+            vec![episode("pg_stat_database", 1, 0, 10)],
+            &SeriesSet::for_test(0),
+            &[&lens],
+            &config(100),
+        )
+        .expect("valid");
+        assert_eq!(outcome.incidents[0].findings[0].role(), Role::Coincident);
+    }
+
+    #[test]
+    fn key_is_independent_of_episode_order() {
+        let run = |episodes| {
+            analyze(episodes, &SeriesSet::for_test(0), &[], &config(100))
+                .expect("valid")
+                .incidents
+                .remove(0)
+                .key
+                .canonical_bytes()
+                .to_vec()
+        };
+        let first = episode("pg_locks", 1, 0, 10);
+        let second = episode("pg_stat_database", 2, 2, 8);
+        let forward = run(vec![first, second]);
+        let reversed = run(vec![
+            episode("pg_stat_database", 2, 2, 8),
+            episode("pg_locks", 1, 0, 10),
+        ]);
+        assert_eq!(forward, reversed);
+    }
+
+    #[test]
+    fn duplicate_lens_ids_are_rejected() {
+        let one = cache_lens("DUP", TestEvidence::Ratio);
+        let two = cache_lens("DUP", TestEvidence::Gauge);
+        assert!(matches!(
+            analyze(
+                vec![episode("pg_stat_database", 1, 0, 10)],
+                &SeriesSet::for_test(0),
+                &[&one, &two],
+                &config(100),
+            ),
+            Err(AnalyzeError::DuplicateLensId("DUP"))
+        ));
+    }
+
+    #[test]
+    fn missing_node_and_input_limits_are_typed_errors() {
+        let mut missing_node = config(100);
+        missing_node.node_self_id.clear();
+        assert!(matches!(
+            analyze(vec![], &SeriesSet::for_test(0), &[], &missing_node),
+            Err(AnalyzeError::MissingNodeIdentity)
+        ));
+
+        let mut episode_limited = config(100);
+        episode_limited.max_episodes = 0;
+        assert!(matches!(
+            analyze(
+                vec![episode("s", 1, 0, 1)],
+                &SeriesSet::for_test(0),
+                &[],
+                &episode_limited,
+            ),
+            Err(AnalyzeError::EpisodeLimit {
+                observed: 1,
+                limit: 0
+            })
+        ));
+
+        let mut cluster_limited = config(100);
+        cluster_limited.max_clusters = 0;
+        assert!(matches!(
+            analyze(
+                vec![episode("s", 1, 0, 1)],
+                &SeriesSet::for_test(0),
+                &[],
+                &cluster_limited,
+            ),
+            Err(AnalyzeError::ClusterLimit {
+                observed: 1,
+                limit: 0
+            })
+        ));
+
+        let mut key_limited = config(100);
+        key_limited.max_key_bytes = 1;
+        assert!(matches!(
+            analyze(
+                vec![episode("s", 1, 0, 1)],
+                &SeriesSet::for_test(0),
+                &[],
+                &key_limited,
+            ),
+            Err(AnalyzeError::Key(KeyTooLarge {
+                observed: 88,
+                limit: 1
+            }))
+        ));
+    }
+
+    #[test]
+    fn exhausted_work_marks_the_partial_incident_and_response() {
+        let first = cache_lens("A", TestEvidence::Ratio);
+        let second = cache_lens("B", TestEvidence::Gauge);
+        let outcome = analyze(
+            vec![episode("pg_stat_database", 1, 0, 10)],
+            &SeriesSet::for_test(0),
+            &[&first, &second],
+            &config(2),
+        )
+        .expect("bounded partial result");
+        assert!(!outcome.complete);
+        assert!(!outcome.incidents[0].evaluation_complete);
+        assert_eq!(outcome.incidents[0].findings.len(), 1);
+        assert_eq!(outcome.skipped[0].limit.axis, LimitAxis::Work);
+    }
+
+    #[test]
+    fn finding_limit_is_reported_without_retaining_excess_output() {
+        let first = cache_lens("A", TestEvidence::Ratio);
+        let second = cache_lens("B", TestEvidence::Gauge);
+        let mut cfg = config(100);
+        cfg.max_findings = 1;
+        let outcome = analyze(
+            vec![episode("pg_stat_database", 1, 0, 10)],
+            &SeriesSet::for_test(0),
+            &[&first, &second],
+            &cfg,
+        )
+        .expect("bounded partial result");
+        assert!(!outcome.complete);
+        assert_eq!(outcome.incidents[0].findings.len(), 1);
+        assert_eq!(outcome.skipped[0].limit.axis, LimitAxis::Findings);
+    }
+
+    #[test]
+    fn lens_evaluation_limit_is_reported_before_calling_the_excess_lens() {
+        let first = cache_lens("A", TestEvidence::Ratio);
+        let second = cache_lens("B", TestEvidence::Gauge);
+        let mut cfg = config(100);
+        cfg.max_lens_evaluations = 1;
+        let outcome = analyze(
+            vec![episode("pg_stat_database", 1, 0, 10)],
+            &SeriesSet::for_test(0),
+            &[&first, &second],
+            &cfg,
+        )
+        .expect("bounded partial result");
+        assert!(!outcome.complete);
+        assert_eq!(outcome.incidents[0].findings.len(), 1);
         assert_eq!(
-            outcome.incidents[0].findings.len(),
-            1,
-            "only the first lens ran before the budget latched"
+            outcome.skipped[0].limit,
+            LimitHit {
+                axis: LimitAxis::LensEvaluations,
+                observed: 2,
+                limit: 1,
+            }
         );
     }
 }
