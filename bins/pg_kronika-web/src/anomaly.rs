@@ -63,6 +63,8 @@ pub(crate) struct ScanCounts {
     /// Diff points carrying no value (reset/gap/first point) or a non-finite
     /// rate, plus gauge rows whose value was NULL, non-numeric, or non-finite.
     pub nodata_points: u64,
+    /// Above-threshold episodes omitted by the caller's retained-hit ceiling.
+    pub episodes_truncated: u64,
 }
 
 /// One above-threshold episode of one series' column.
@@ -268,7 +270,9 @@ pub(crate) fn scan_section(
         }
     }
 
-    rank_section(&mut hits, hit_limit);
+    counts.episodes_truncated = counts
+        .episodes_truncated
+        .saturating_add(rank_section(&mut hits, hit_limit) as u64);
     Ok((hits, counts, work))
 }
 
@@ -323,15 +327,19 @@ fn scan_timeline(
             episode,
         });
     }
-    rank_section(hits, hit_limit);
+    counts.episodes_truncated = counts
+        .episodes_truncated
+        .saturating_add(rank_section(hits, hit_limit) as u64);
 }
 
-fn rank_section(hits: &mut Vec<EpisodeHit>, limit: usize) {
+fn rank_section(hits: &mut Vec<EpisodeHit>, limit: usize) -> usize {
     if hits.len() <= limit {
-        return;
+        return 0;
     }
+    let removed = hits.len() - limit;
     hits.sort_by(|a, b| b.episode.peak.m.abs().total_cmp(&a.episode.peak.m.abs()));
     hits.truncate(limit);
+    removed
 }
 
 /// Rank episodes across sections by peak `|m|`, descending, and truncate to

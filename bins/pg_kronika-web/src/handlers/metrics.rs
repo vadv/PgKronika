@@ -104,7 +104,7 @@ pub(crate) fn data_age_seconds(now_secs: u64, max_ts_micros: Option<i64>) -> Opt
     let max_ts_micros = max_ts_micros.filter(|&ts| ts > 0)?;
     #[allow(clippy::cast_sign_loss, reason = "the timestamp is positive")]
     let data_secs = (max_ts_micros / 1_000_000) as u64;
-    Some(now_secs.saturating_sub(data_secs))
+    now_secs.checked_sub(data_secs)
 }
 
 fn parse_rss_bytes(contents: &str) -> Option<u64> {
@@ -141,6 +141,11 @@ mod tests {
     #[test]
     fn data_age_uses_the_latest_unit_timestamp() {
         assert_eq!(data_age_seconds(100, Some(95_000_000)), Some(5));
+    }
+
+    #[test]
+    fn future_data_age_is_unavailable_instead_of_zero() {
+        assert_eq!(data_age_seconds(100, Some(101_000_000)), None);
     }
 
     #[test]
