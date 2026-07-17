@@ -14,6 +14,8 @@ pub struct ColumnValues {
     pub name: String,
     /// `(ts, value)` in snapshot-time order.
     pub points: Vec<(i64, f64)>,
+    /// Timestamps whose invalid value splits timeline continuity.
+    pub breaks: Vec<i64>,
     /// Rows whose value was NULL, non-numeric, or non-finite and left no point.
     pub skipped: usize,
 }
@@ -72,16 +74,18 @@ const fn numeric(value: &Value) -> Option<f64> {
 
 fn collect_column(series: &[(i64, &OutRow)], name: &str) -> ColumnValues {
     let mut points = Vec::with_capacity(series.len());
-    let mut skipped = 0_usize;
+    let mut breaks = Vec::new();
     for &(ts, row) in series {
         match column(row, name).and_then(numeric) {
             Some(value) => points.push((ts, value)),
-            None => skipped += 1,
+            None => breaks.push(ts),
         }
     }
+    let skipped = breaks.len();
     ColumnValues {
         name: name.to_owned(),
         points,
+        breaks,
         skipped,
     }
 }
@@ -123,6 +127,7 @@ mod tests {
         ];
         let out = gauge_section(&["id"], &["g"], &rows);
         assert_eq!(out[0].columns[0].points, vec![(20, 2.5)]);
+        assert_eq!(out[0].columns[0].breaks, vec![0, 10]);
         assert_eq!(out[0].columns[0].skipped, 2);
     }
 
@@ -137,6 +142,7 @@ mod tests {
         ];
         let out = gauge_section(&["id"], &["g"], &rows);
         assert_eq!(out[0].columns[0].points, vec![(20, 2.5)]);
+        assert_eq!(out[0].columns[0].breaks, vec![0, 10]);
         assert_eq!(out[0].columns[0].skipped, 2, "NaN and inf leave no point");
     }
 
@@ -153,6 +159,7 @@ mod tests {
             vec![(0, 0.0), (10, 1.0), (20, 1_000_000.0)]
         );
         assert_eq!(out[0].columns[0].skipped, 0);
+        assert!(out[0].columns[0].breaks.is_empty());
     }
 
     #[test]
