@@ -1348,10 +1348,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kronika-charts"
-version = "0.0.0"
-
-[[package]]
 name = "kronika-derive"
 version = "0.0.0"
 dependencies = [
@@ -1442,14 +1438,6 @@ dependencies = [
  "kronika-format",
  "tempfile",
 ]
-
-[[package]]
-name = "kronika-store-http"
-version = "0.0.0"
-
-[[package]]
-name = "kronika-store-s3"
-version = "0.0.0"
 
 [[package]]
 name = "kronika-writer"
