@@ -15,13 +15,10 @@ mod series;
 pub(crate) use model::{EnrichedEpisode, EpisodeRefV1, IdentityValue};
 pub(crate) use series::{Series, SeriesError, SeriesInsertError, SeriesSet};
 
-// The engine entry point and its result types have no non-test consumer until
-// the HTTP endpoint lands; the input adapter's tests already drive them.
-#[allow(
-    unused_imports,
-    reason = "engine surface awaits the incident endpoint; exercised by adapter tests"
-)]
-pub(crate) use engine::{ClockRelation, EngineOutcome, Incident, IncidentConfig, analyze};
+pub(crate) use dispatch::LimitAxis;
+pub(crate) use engine::{
+    AnalyzeError, ClockRelation, EngineOutcome, EngineSkip, Incident, IncidentConfig, analyze,
+};
 #[allow(
     unused_imports,
     reason = "the lens catalog and its endpoint land in a later step"

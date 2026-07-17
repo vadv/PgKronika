@@ -42,13 +42,10 @@ mod auth;
 pub(crate) mod handlers;
 #[allow(
     dead_code,
-    reason = "incident limits and the reader adapter are not wired yet"
+    reason = "the finding, evidence, lens, and sink surface is exercised by engine tests and \
+              awaits the lens catalog (P4/P5); clustering and the engine entry point are wired"
 )]
 mod incident;
-#[allow(
-    dead_code,
-    reason = "the incident input adapter has no HTTP route yet; the endpoint lands in a later step"
-)]
 mod incident_input;
 mod params;
 mod serialize;
@@ -177,6 +174,7 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
     let mut protected = Router::new()
         .route("/v1/version", get(handlers::v1::version))
         .route("/v1/anomalies", get(handlers::anomalies::anomalies))
+        .route("/v1/incidents", get(handlers::incidents::incidents))
         .route("/v1/sources", get(handlers::v1::sources))
         .route("/v1/sections", get(handlers::v1::sections))
         .route("/v1/segments", get(handlers::v1::segments))
@@ -817,6 +815,170 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is a 404");
+    }
+
+    /// Write one segment carrying instance metadata (so an incident key has a
+    /// resolved node id), its string dictionary, and the given archiver rows.
+    fn write_archiver_with_identity(
+        dir: &std::path::Path,
+        rows: &[PgStatArchiver],
+        min_ts: i64,
+        max_ts: i64,
+    ) {
+        use kronika_format::DictLimits;
+        use kronika_registry::StrId;
+        use kronika_registry::instance_metadata::InstanceMetadata;
+
+        let mut interner = kronika_writer::Interner::new(
+            DictLimits::new(4096, 1 << 20).expect("dictionary limits"),
+        );
+        let mut intern = |value: &str| {
+            interner
+                .intern(value.as_bytes())
+                .map(|id| StrId(id.get()))
+                .expect("intern fixture identity")
+        };
+        let metadata = InstanceMetadata {
+            ts: Ts(min_ts),
+            hostname: intern("db-host-7"),
+            node_self_id: intern("node-7"),
+            pg_version_num: 170_000,
+            kernel_version: intern("test-kernel"),
+            pg_system_identifier: Some(7),
+            clock_ticks_per_sec: 100,
+            page_size_bytes: 4096,
+            boot_id: intern("test-boot"),
+            btime: Ts(0),
+        };
+        let dictionary =
+            kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
+        let archiver = PgStatArchiver::encode(rows).expect("encode archiver");
+        let metadata = InstanceMetadata::encode(&[metadata]).expect("encode metadata");
+        let mut sections: Vec<SectionInput<'_>> = dictionary
+            .iter()
+            .map(|section| SectionInput {
+                type_id: section.type_id,
+                rows: section.rows,
+                body: &section.body,
+            })
+            .collect();
+        sections.push(SectionInput {
+            type_id: 1_008_001,
+            rows: u32::try_from(rows.len()).expect("fixture row count"),
+            body: &archiver,
+        });
+        sections.push(SectionInput {
+            type_id: 1_021_001,
+            rows: 1,
+            body: &metadata,
+        });
+        let bytes = build_part(
+            &sections,
+            PartMeta {
+                min_ts,
+                max_ts,
+                source_id: 7,
+            },
+        );
+        std::fs::write(dir.join("0.pgm"), bytes).expect("write segment");
+    }
+
+    /// Forty per-minute archiver rows; the count climbs by one each minute
+    /// except minutes 20..25, where it climbs by fifty (the spike).
+    fn archiver_rows(spiking: bool) -> Vec<PgStatArchiver> {
+        const MINUTE: i64 = 60 * 1_000_000;
+        let mut rows = Vec::new();
+        let mut count = 0;
+        for minute in 0..40 {
+            count += if spiking && (20..25).contains(&minute) {
+                50
+            } else {
+                1
+            };
+            rows.push(archiver_row(minute * MINUTE, count));
+        }
+        rows
+    }
+
+    // The analyzer holds one process-wide permit, so the spike and calm cases
+    // share one serial test rather than racing for it across parallel tests.
+    #[tokio::test]
+    async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
+        let to = 39 * 60 * 1_000_000;
+        let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m");
+
+        let spiking = tempfile::tempdir().expect("tempdir");
+        write_archiver_with_identity(spiking.path(), &archiver_rows(true), 0, to);
+        let (status, body) = serve(spiking.path(), &uri).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "incidents 200; got {status}: {body}"
+        );
+
+        for field in [
+            "complete",
+            "incidents",
+            "coverage_by_section",
+            "data_age_seconds",
+            "catalog",
+            "data_quality",
+            "skipped",
+        ] {
+            assert!(body.get(field).is_some(), "response carries {field}");
+        }
+        let incidents = body["incidents"].as_array().expect("incidents is an array");
+        assert!(
+            !incidents.is_empty(),
+            "the spike must cluster into an incident"
+        );
+        assert_eq!(
+            incidents[0]["findings"],
+            serde_json::json!([]),
+            "findings stay empty until a lens catalog lands"
+        );
+        let members = incidents[0]["members"]
+            .as_array()
+            .expect("members is an array");
+        assert!(
+            members.iter().any(|member| {
+                member["logical_section"] == "pg_stat_archiver"
+                    && member["column"] == "archived_count"
+            }),
+            "an incident member is the real archiver spike series"
+        );
+
+        let calm = tempfile::tempdir().expect("tempdir");
+        write_archiver_with_identity(calm.path(), &archiver_rows(false), 0, to);
+        let (status, body) = serve(calm.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "calm 200; got {status}: {body}");
+        assert_eq!(
+            body["incidents"],
+            serde_json::json!([]),
+            "no anomaly means no incident"
+        );
+        for field in ["catalog", "data_quality", "skipped", "coverage_by_section"] {
+            assert!(
+                body.get(field).is_some(),
+                "an empty response still carries {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incidents_reject_degenerate_parameters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bgwriter_segment(dir.path(), "1000.pgm", 7, 1_000, 2_000);
+
+        for uri in [
+            "/v1/incidents?source=7&from=5&to=5",
+            "/v1/incidents?source=7&from=0&to=1000&window=1h",
+            "/v1/incidents?source=7&from=0&to=9000000000&window=0s",
+            "/v1/incidents?source=7&from=0&to=9000000000&threshold=-1",
+        ] {
+            let (status, _body) = serve(dir.path(), uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be rejected");
+        }
     }
 
     #[tokio::test]
