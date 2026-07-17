@@ -36,6 +36,21 @@ pub struct SectionPage {
     pub next_cursor: Option<Cursor>,
 }
 
+/// Row and materialized-cell ceilings for a section query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimits {
+    rows: usize,
+    cells: usize,
+}
+
+impl QueryLimits {
+    /// Set the row and cell ceilings.
+    #[must_use]
+    pub const fn new(rows: usize, cells: usize) -> Self {
+        Self { rows, cells }
+    }
+}
+
 /// Why a batch section read failed.
 #[derive(Debug)]
 pub enum QueryError {
@@ -80,9 +95,37 @@ pub fn section(
     limit: usize,
     cursor: Option<Cursor>,
 ) -> Result<SectionPage, QueryError> {
+    section_with_limits(
+        snap,
+        name,
+        source,
+        from,
+        to,
+        cursor,
+        QueryLimits::new(limit, MAX_MATERIALIZED_CELLS),
+    )
+}
+
+/// Read one logical section under a caller-supplied materialized-cell cap.
+///
+/// The reader's hard cap still applies when `max_cells` is larger. This entry
+/// point lets a multi-query adapter spend one request budget across calls.
+///
+/// # Errors
+///
+/// Returns the same errors as [`section`].
+pub fn section_with_limits(
+    snap: &mut LocalDirSnapshot,
+    name: &str,
+    source: u64,
+    from: i64,
+    to: i64,
+    cursor: Option<Cursor>,
+    limits: QueryLimits,
+) -> Result<SectionPage, QueryError> {
     let cursors: BTreeMap<String, Cursor> =
         cursor.map(|c| (name.to_owned(), c)).into_iter().collect();
-    let pages = sections(snap, source, from, to, &[name], limit, &cursors)?;
+    let pages = sections_with_limits(snap, source, from, to, &[name], &cursors, limits)?;
     pages
         .into_values()
         .next()
@@ -111,6 +154,32 @@ pub fn sections(
     limit: usize,
     cursors: &BTreeMap<String, Cursor>,
 ) -> Result<BTreeMap<String, SectionPage>, QueryError> {
+    sections_with_limits(
+        snap,
+        source,
+        from,
+        to,
+        names,
+        cursors,
+        QueryLimits::new(limit, MAX_MATERIALIZED_CELLS),
+    )
+}
+
+/// Read several logical sections under a caller-supplied materialized-cell cap.
+///
+/// # Errors
+///
+/// Returns the same errors as [`sections`].
+pub fn sections_with_limits(
+    snap: &mut LocalDirSnapshot,
+    source: u64,
+    from: i64,
+    to: i64,
+    names: &[&str],
+    cursors: &BTreeMap<String, Cursor>,
+    limits: QueryLimits,
+) -> Result<BTreeMap<String, SectionPage>, QueryError> {
+    let max_cells = limits.cells.min(MAX_MATERIALIZED_CELLS);
     // Resolve every requested name up front; an unknown name fails the whole call.
     let mut requested: Vec<(String, LogicalSection)> = Vec::with_capacity(names.len());
     for &name in names {
@@ -126,7 +195,7 @@ pub fn sections(
     let mut refreshed: u32 = 0;
     let (buffers, covered) = loop {
         let skip_stale = refreshed >= MAX_REFRESH;
-        match gather(snap, source, from, to, &requested, skip_stale) {
+        match gather(snap, source, from, to, &requested, skip_stale, max_cells) {
             Ok(gathered) => break gathered,
             Err(GatherError::Stale) => {
                 snap.refresh()
@@ -135,9 +204,7 @@ pub fn sections(
             }
             Err(GatherError::Read(err)) => return Err(QueryError::Read(err)),
             Err(GatherError::ResultTooLarge) => {
-                return Err(QueryError::ResultTooLarge {
-                    max_cells: MAX_MATERIALIZED_CELLS,
-                });
+                return Err(QueryError::ResultTooLarge { max_cells });
             }
         }
     };
@@ -174,8 +241,8 @@ pub fn sections(
             rows.drain(..start);
         }
 
-        let has_more = rows.len() > limit;
-        rows.truncate(limit);
+        let has_more = rows.len() > limits.rows;
+        rows.truncate(limits.rows);
         // A cursor pins the last returned row, so an empty page (e.g. `limit`
         // of zero) never emits one, even when rows remain.
         let next_cursor = rows.last().filter(|_| has_more).map(|row| Cursor {
@@ -222,6 +289,7 @@ fn gather(
     to: i64,
     requested: &[(String, LogicalSection)],
     skip_stale: bool,
+    max_cells: usize,
 ) -> Result<Gathered, GatherError> {
     let metas = snap.units();
     let in_window: Vec<usize> = metas
@@ -256,8 +324,7 @@ fn gather(
                 };
                 // Cell positions are fixed per contract, so resolve each union
                 // column (and `ts`) to its index once per entry, not per row.
-                // A missing `ts` skips the rows rather than panicking, keeping
-                // a future ts-less section harmless.
+                // A section without `ts` has no rows in a time-window query.
                 let columns = first.contract().columns;
                 let ts_at = columns.iter().position(|column| column.name == "ts");
                 let cell_at: Vec<Option<usize>> = logical
@@ -276,7 +343,7 @@ fn gather(
                     charge_materialization(
                         &mut materialized_cells,
                         logical.columns.len(),
-                        MAX_MATERIALIZED_CELLS,
+                        max_cells,
                     )?;
                     let out: OutRow = logical
                         .columns

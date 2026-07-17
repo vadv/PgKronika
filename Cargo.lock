@@ -2014,6 +2014,7 @@ dependencies = [
  "kronika-format",
  "kronika-reader",
  "kronika-registry",
+ "kronika-writer",
  "metrics",
  "metrics-exporter-prometheus",
  "mimalloc",
