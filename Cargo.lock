@@ -2019,6 +2019,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mimalloc",
  "rust-embed",
+ "serde",
  "serde_json",
  "subtle",
  "tempfile",
