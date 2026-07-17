@@ -51,7 +51,7 @@ struct SectionScan {
 /// Names of every section the detector scans: snapshot and event sections
 /// with at least one scorable (Cumulative or Gauge) column. Dictionaries are
 /// not timelines and charts are derived views of the same raw data.
-fn scannable_sections() -> Vec<&'static str> {
+pub(crate) fn scannable_sections() -> Vec<&'static str> {
     let mut names = std::collections::BTreeSet::new();
     for contract in registry() {
         if contract.deprecated {

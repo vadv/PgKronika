@@ -50,6 +50,23 @@ pub(crate) struct InputLimits {
     episodes: usize,
 }
 
+impl InputLimits {
+    /// Provisional ceilings sized to keep one request's adapter-owned state
+    /// near 100 MB of resident memory. The numbers are an estimate pending a
+    /// measured budget (§9), not a proven bound.
+    pub(crate) const fn default_100mb() -> Self {
+        Self {
+            sections: 64,
+            materialized_cells: 2_000_000,
+            series_points: 500_000,
+            identity_bytes: 1 << 20,
+            positions: 10_000,
+            score_work: crate::anomaly::MAX_SCORE_WORK,
+            episodes: 20_000,
+        }
+    }
+}
+
 #[cfg(test)]
 impl InputLimits {
     fn for_test() -> Self {

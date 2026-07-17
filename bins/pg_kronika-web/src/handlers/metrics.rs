@@ -40,7 +40,13 @@ pub(crate) async fn metrics_handler(
     metrics::gauge!("kronika_web_units_total").set(unit_count_f);
 
     let max_ts_micros = units.iter().map(|u| u.max_ts).max();
-    metrics::gauge!("kronika_web_data_age_seconds").set(data_age_seconds(now_secs, max_ts_micros));
+    let data_age = data_age_seconds(now_secs, max_ts_micros);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "real data ages fit in the f64 integer mantissa"
+    )]
+    metrics::gauge!("kronika_web_data_age_seconds")
+        .set(data_age.map_or(f64::NAN, |seconds| seconds as f64));
 
     // Reader-age gauge: seconds since the last successful snapshot refresh.
     let last = state.last_refresh.load(Relaxed);
@@ -92,18 +98,13 @@ fn read_rss_bytes() -> Option<u64> {
     parse_rss_bytes(&contents)
 }
 
-fn data_age_seconds(now_secs: u64, max_ts_micros: Option<i64>) -> f64 {
-    let Some(max_ts_micros) = max_ts_micros.filter(|&ts| ts > 0) else {
-        return f64::NAN;
-    };
+/// Seconds between `now_secs` and the newest unit timestamp, or `None` when no
+/// unit carries a positive timestamp (an empty or unpopulated store).
+pub(crate) fn data_age_seconds(now_secs: u64, max_ts_micros: Option<i64>) -> Option<u64> {
+    let max_ts_micros = max_ts_micros.filter(|&ts| ts > 0)?;
     #[allow(clippy::cast_sign_loss, reason = "the timestamp is positive")]
     let data_secs = (max_ts_micros / 1_000_000) as u64;
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "real data ages fit in the f64 integer mantissa"
-    )]
-    let age = now_secs.saturating_sub(data_secs) as f64;
-    age
+    Some(now_secs.saturating_sub(data_secs))
 }
 
 fn parse_rss_bytes(contents: &str) -> Option<u64> {
@@ -133,13 +134,13 @@ mod tests {
 
     #[test]
     fn missing_data_age_is_not_reported_as_zero() {
-        assert!(data_age_seconds(100, None).is_nan());
-        assert!(data_age_seconds(100, Some(0)).is_nan());
+        assert_eq!(data_age_seconds(100, None), None);
+        assert_eq!(data_age_seconds(100, Some(0)), None);
     }
 
     #[test]
     fn data_age_uses_the_latest_unit_timestamp() {
-        assert!((data_age_seconds(100, Some(95_000_000)) - 5.0).abs() < f64::EPSILON);
+        assert_eq!(data_age_seconds(100, Some(95_000_000)), Some(5));
     }
 
     #[test]

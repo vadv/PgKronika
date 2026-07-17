@@ -49,7 +49,6 @@ impl EvalContext {
     }
 }
 
-/// No production constructor exists until the incident ceilings are approved.
 pub(crate) struct IncidentConfig {
     node_self_id: String,
     epsilon_us: i64,
@@ -62,6 +61,33 @@ pub(crate) struct IncidentConfig {
     max_lens_evaluations: u64,
     max_findings: u64,
     max_evidence_rows: u64,
+}
+
+impl IncidentConfig {
+    /// Provisional ceilings sized to hold one request's evaluation near 100 MB
+    /// of resident memory. The numbers are an estimate pending a measured
+    /// budget (§9), not a proven bound. The node id and clustering knobs come
+    /// from the request; the rest are fixed admission limits.
+    pub(crate) fn default_100mb(
+        node_self_id: &str,
+        epsilon_us: i64,
+        max_cluster_span_us: i64,
+        clock_relation: ClockRelation,
+    ) -> Self {
+        Self {
+            node_self_id: node_self_id.to_owned(),
+            epsilon_us,
+            max_cluster_span_us,
+            clock_relation,
+            work_limit: 50_000_000,
+            max_episodes: 20_000,
+            max_clusters: 5_000,
+            max_key_bytes: 262_144,
+            max_lens_evaluations: 1_000_000,
+            max_findings: 50_000,
+            max_evidence_rows: 200_000,
+        }
+    }
 }
 
 #[cfg(test)]
