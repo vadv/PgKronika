@@ -23,7 +23,6 @@ const RULES: &[(&str, &[&str])] = &[
             "kronika-derive",
             "kronika-registry",
             "kronika-writer",
-            "kronika-charts",
             "kronika-source-pg",
             "kronika-source-os",
             "kronika-source-log",
@@ -40,17 +39,14 @@ const RULES: &[(&str, &[&str])] = &[
             "kronika-registry",
             "kronika-reader",
             "kronika-diff",
-            "kronika-charts",
             "kronika-store",
-            "kronika-store-http",
-            "kronika-store-s3",
         ],
     ),
     (
         "pg_kronika-archiver",
         // No registry: the archiver checks only the container and must not
         // need a rebuild when data types are added.
-        &["kronika-format", "kronika-store", "kronika-store-s3"],
+        &["kronika-format", "kronika-store"],
     ),
     (
         "pg_kronika-dump",
@@ -60,10 +56,7 @@ const RULES: &[(&str, &[&str])] = &[
             "kronika-registry",
             "kronika-reader",
             "kronika-diff",
-            "kronika-charts",
             "kronika-store",
-            "kronika-store-http",
-            "kronika-store-s3",
         ],
     ),
 ];
