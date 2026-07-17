@@ -23,10 +23,8 @@ use axum::routing::get;
 use kronika_reader::LocalDirSnapshot;
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
-// The binary target and the `#[tokio::test]` harness need the async runtime; the
-// library's handlers are runtime-agnostic and never name it. The binary also
-// pulls its allocator, tracing, the subscriber, and tower-http; the library
-// proper names none.
+// These crates are used by the binary target. Keep the imports here so the
+// library target satisfies `unused_crate_dependencies`.
 use mimalloc as _;
 use tokio as _;
 use tower_http as _;
@@ -43,8 +41,8 @@ mod auth;
 pub(crate) mod handlers;
 #[allow(
     dead_code,
-    reason = "the finding, evidence, lens, and sink surface is exercised by engine tests and \
-              awaits the lens catalog (P4/P5); clustering and the engine entry point are wired"
+    reason = "finding, evidence, and lens types are exercised by engine tests but the HTTP \
+              endpoint currently exposes clustering only"
 )]
 mod incident;
 mod incident_input;

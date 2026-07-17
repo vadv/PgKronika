@@ -93,8 +93,7 @@ impl IncidentConfig {
 
 #[cfg(test)]
 impl IncidentConfig {
-    /// Generous ceilings for tests exercising real data before production
-    /// limits are approved; the node id and clustering knobs are the caller's.
+    /// Relaxed collection and work ceilings for focused engine tests.
     pub(crate) fn for_test(
         node_self_id: &str,
         epsilon_us: i64,

@@ -21,6 +21,6 @@ pub(crate) use engine::{
 };
 #[allow(
     unused_imports,
-    reason = "the lens catalog and its endpoint land in a later step"
+    reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"
 )]
 pub(crate) use lens::Lens;
