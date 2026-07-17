@@ -23,9 +23,9 @@ pub use kronika_diff::{DiffPoint, Reason, Scalar};
 pub use kronika_format::DamageRegion;
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
-    OutRow, QueryError, SectionPage, SeriesDiff, SeriesValues, Value, apply_collection_gating,
-    apply_gating, diff_section, gate_readings, gauge_section, logical_section, section, sections,
-    select_gate,
+    OutRow, QueryError, QueryLimits, SectionPage, SeriesDiff, SeriesValues, Value,
+    apply_collection_gating, apply_gating, diff_section, gate_readings, gauge_section,
+    logical_section, section, section_with_limits, sections, sections_with_limits, select_gate,
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, UnitMeta};
 

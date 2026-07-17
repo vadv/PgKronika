@@ -13,7 +13,7 @@ mod series;
 // Input preparation and consumers live outside this module (`incident_input`),
 // so the reader-facing input surface and the engine entry point are exported.
 pub(crate) use model::{EnrichedEpisode, EpisodeRefV1, IdentityValue};
-pub(crate) use series::{Series, SeriesInsertError, SeriesSet};
+pub(crate) use series::{Series, SeriesError, SeriesInsertError, SeriesSet};
 
 // The engine entry point and its result types have no non-test consumer until
 // the HTTP endpoint lands; the input adapter's tests already drive them.

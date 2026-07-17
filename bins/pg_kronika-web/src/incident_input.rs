@@ -1,41 +1,68 @@
-//! Adapter from the store reader to the incident engine's owned input.
-//!
-//! It reads each requested logical section the way `/v1/anomalies` does
-//! (`section` -> `diff_section`/`gauge_section` -> collection gating -> numeric
-//! scan), then converts scan episodes into engine input: `EnrichedEpisode`s
-//! keyed by canonical identity and a `SeriesSet` of the scanned timelines. The
-//! engine sees only owned buffers; no snapshot handle escapes.
+//! Store-reader adapter for owned incident-engine input.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use kronika_reader::{
-    ColumnValues, DiffPoint, Gap, LocalDirSnapshot, LogicalSection, QueryError, SeriesDiff,
-    SeriesValues, Value, diff_section, gauge_section, logical_section, section as query_section,
+    DiffPoint, Gap, LocalDirSnapshot, LogicalSection, OutRow, QueryError, QueryLimits, Reason,
+    SectionPage, SeriesDiff, SeriesValues, Value, diff_section, gauge_section, logical_section,
+    section_with_limits, sections_with_limits,
 };
 use kronika_registry::ColumnClass;
 
 use crate::anomaly::{EpisodeHit, ScanParams, scan_section};
 use crate::handlers::v1::{DIFF_MAX_ROWS, Gates};
 use crate::incident::{
-    EnrichedEpisode, EpisodeRefV1, IdentityValue, Series, SeriesInsertError, SeriesSet,
+    EnrichedEpisode, EpisodeRefV1, IdentityValue, Series, SeriesError, SeriesInsertError, SeriesSet,
 };
 
-/// One counted honesty signal from building the engine input.
-///
-/// Every dropped episode and filtered point lands in exactly one of these, so
-/// the response can report degradation instead of silently smoothing it.
+/// Data exclusions recorded while building engine input.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InputQuality {
-    /// Episodes dropped because an identity value was not a canonical scalar
+    /// Rows or episodes dropped because identity was not a canonical scalar
     /// (`Null`, float, timestamp, blob, or list).
     pub non_canonical_identity: u64,
     /// Series points dropped because their diff rate was non-finite.
     pub non_finite_points: u64,
-    /// Points collapsed because two samples of one series shared a timestamp.
+    /// First cumulative samples, which have no preceding pair.
+    pub first_points: u64,
+    /// Counter reset pairs excluded from numeric timelines.
+    pub resets: u64,
+    /// Pairs excluded because their interval crosses a coverage gap.
+    pub gaps: u64,
+    /// Pairs excluded by collection gating.
+    pub not_collected: u64,
+    /// Invalid timestamp or scalar pairs excluded by the reader.
+    pub anomalous_points: u64,
+    /// Invalid gauge readings excluded from numeric timelines.
+    pub invalid_gauge_points: u64,
+    /// Equal duplicate samples removed before folding.
     pub duplicate_timestamps: u64,
-    /// Series skipped because the same identity was already inserted for the
-    /// section and column.
-    pub duplicate_series: u64,
+}
+
+/// Request ceilings for adapter-owned work and data.
+pub(crate) struct InputLimits {
+    sections: usize,
+    materialized_cells: usize,
+    series_points: usize,
+    identity_bytes: usize,
+    positions: usize,
+    score_work: usize,
+    episodes: usize,
+}
+
+#[cfg(test)]
+impl InputLimits {
+    fn for_test() -> Self {
+        Self {
+            sections: 64,
+            materialized_cells: 1_000_000,
+            series_points: 1_000_000,
+            identity_bytes: 1 << 20,
+            positions: 10_000,
+            score_work: crate::anomaly::MAX_SCORE_WORK,
+            episodes: 50,
+        }
+    }
 }
 
 /// Why building the engine input failed before analysis could start.
@@ -43,6 +70,12 @@ pub(crate) struct InputQuality {
 pub(crate) enum InputError {
     /// A requested name is not a registered logical section.
     UnknownSection(String),
+    /// The period, window, or step cannot define a finite scan.
+    InvalidScan,
+    /// No source unit overlaps the requested period.
+    NoData,
+    /// The scan would materialize too many window positions.
+    PositionLimit { observed: usize, limit: usize },
     /// Reading or decoding a section failed, or the registry contract was
     /// inconsistent — never masked as an absence of anomalies.
     Read(QueryError),
@@ -50,6 +83,27 @@ pub(crate) enum InputError {
     UnknownColumn {
         section: &'static str,
         column: String,
+    },
+    /// More unique sections were requested than the request ceiling allows.
+    SectionLimit { observed: usize, limit: usize },
+    /// The requested pages exceeded the request-wide materialization ceiling.
+    MaterializationLimit { limit: usize },
+    /// No resolved node id covers the requested source and interval.
+    MissingNodeIdentity,
+    /// The interval spans more than one node id for the same source.
+    ConflictingNodeIdentity,
+    /// Node identity bytes exceeded the adapter ceiling.
+    IdentityByteLimit { observed: usize, limit: usize },
+    /// Two adapter paths attempted to register the same series.
+    DuplicateSeries {
+        section: &'static str,
+        column: &'static str,
+    },
+    /// A folded timeline violated the core series invariant.
+    InvalidSeries {
+        section: &'static str,
+        column: &'static str,
+        error: SeriesError,
     },
     /// The scanned series exceeded the engine's owned-point limit.
     SeriesLimit { observed: usize, limit: usize },
@@ -65,17 +119,24 @@ pub(crate) struct SectionSkip {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkipReason {
-    /// The period exceeded the reader materialization budget.
-    ResultTooLarge,
+    /// The section did not fit the remaining materialized-cell budget.
+    MaterializationLimit { limit: usize },
     /// The period had more rows than one page could hold.
     IncompletePage,
     /// Scoring the section would exceed the request's numeric-scan budget.
-    ScanBudget,
+    ScanBudget { required: usize, available: usize },
+    /// Conflicting values shared one identity and timestamp.
+    ConflictingTimestamp { timestamp: i64 },
+    /// Canonical row identities exceeded the request byte budget.
+    IdentityByteLimit { observed: usize, limit: usize },
+    /// Retaining the section's incident series would exceed the point cap.
+    SeriesPointLimit { observed: usize, limit: usize },
 }
 
-/// Owned engine input plus the coverage and honesty counters gathered building
-/// it. No field borrows the snapshot.
+/// Owned engine input, coverage, and exclusion counters.
 pub(crate) struct PreparedInput {
+    pub source_id: u64,
+    pub node_self_id: String,
     pub episodes: Vec<EnrichedEpisode>,
     pub series: SeriesSet,
     pub coverage_by_section: BTreeMap<&'static str, Vec<Gap>>,
@@ -83,123 +144,553 @@ pub(crate) struct PreparedInput {
     pub skipped: Vec<SectionSkip>,
 }
 
-/// Read `sections` for one source over `[from, to)`, scan each for anomaly
-/// episodes, and assemble the engine's owned input.
+/// Read and scan `sections` for one source over `[from, to)`.
 ///
-/// `series_point_limit` caps the total points held in the returned `SeriesSet`;
-/// `scan_budget` and `hit_limit` bound the numeric scan exactly as the anomaly
-/// endpoint does. Oversized or incomplete sections are skipped, not fatal; a
-/// read, decode, or registry-contract failure aborts with a typed error.
+/// Limits cover the whole call. An incomplete or locally oversized section is
+/// skipped; input, decode, and request-wide admission failures are typed errors.
 pub(crate) fn prepare_input(
     snap: &mut LocalDirSnapshot,
     source: u64,
     scan: &ScanParams,
     sections: &[&'static str],
-    series_point_limit: usize,
-    scan_budget: usize,
-    hit_limit: usize,
+    limits: &InputLimits,
 ) -> Result<PreparedInput, InputError> {
-    let logicals: Vec<LogicalSection> = sections
-        .iter()
-        .map(|&name| {
+    let position_count = scan_position_count(scan).ok_or(InputError::InvalidScan)?;
+    if position_count > limits.positions {
+        return Err(InputError::PositionLimit {
+            observed: position_count,
+            limit: limits.positions,
+        });
+    }
+    let input = read_input_pages(snap, source, scan, sections, limits)?;
+    let mut remaining_identity_bytes = limits.identity_bytes;
+    let node_self_id = load_node_identity(
+        &input.metadata,
+        &mut remaining_identity_bytes,
+        limits.identity_bytes,
+    )?;
+    let gates = Gates::from_pages(&input.logicals, &input.pages);
+    let mut state = BuildState::new(limits, remaining_identity_bytes, input.skipped);
+    for logical in &input.logicals {
+        let Some(page) = input.pages.get(logical.name).cloned() else {
+            if state
+                .skipped
+                .iter()
+                .any(|skip| skip.section == logical.name)
+            {
+                continue;
+            }
+            return Err(InputError::Read(QueryError::UnknownSection(
+                logical.name.to_owned(),
+            )));
+        };
+        state.process(logical, page, &gates, scan, limits)?;
+    }
+
+    Ok(PreparedInput {
+        source_id: source,
+        node_self_id,
+        episodes: state.episodes,
+        series: state.series,
+        coverage_by_section: state.coverage_by_section,
+        quality: state.quality,
+        skipped: state.skipped,
+    })
+}
+
+struct InputPages {
+    logicals: Vec<LogicalSection>,
+    metadata: SectionPage,
+    pages: BTreeMap<String, SectionPage>,
+    skipped: Vec<SectionSkip>,
+}
+
+fn read_input_pages(
+    snap: &mut LocalDirSnapshot,
+    source: u64,
+    scan: &ScanParams,
+    sections: &[&'static str],
+    limits: &InputLimits,
+) -> Result<InputPages, InputError> {
+    let names: BTreeSet<&'static str> = sections.iter().copied().collect();
+    if names.len() > limits.sections {
+        return Err(InputError::SectionLimit {
+            observed: names.len(),
+            limit: limits.sections,
+        });
+    }
+    let logicals: Vec<LogicalSection> = names
+        .into_iter()
+        .map(|name| {
             logical_section(name).ok_or_else(|| InputError::UnknownSection(name.to_owned()))
         })
         .collect::<Result<_, _>>()?;
 
-    let gates = load_gates(snap, &logicals, source, scan.from, scan.to)?;
-
-    let mut episodes = Vec::new();
-    let mut series = SeriesSet::new(series_point_limit);
-    let mut coverage_by_section = BTreeMap::new();
-    let mut quality = InputQuality::default();
-    let mut skipped = Vec::new();
-    let mut remaining_scan = scan_budget;
-
-    for logical in &logicals {
-        let page = match query_section(
-            snap,
-            logical.name,
-            source,
-            scan.from,
-            scan.to,
-            DIFF_MAX_ROWS,
-            None,
-        ) {
-            Ok(page) => page,
-            Err(QueryError::ResultTooLarge { .. }) => {
-                skipped.push(SectionSkip {
-                    section: logical.name,
-                    reason: SkipReason::ResultTooLarge,
-                });
-                continue;
-            }
-            Err(err) => return Err(InputError::Read(err)),
-        };
-        if page.next_cursor.is_some() {
-            skipped.push(SectionSkip {
-                section: logical.name,
-                reason: SkipReason::IncompletePage,
-            });
-            continue;
-        }
-        coverage_by_section.insert(logical.name, page.gaps.clone());
-
-        let identity = logical.diff_key();
-        let (cumulative, gauges) = scorable_columns(logical);
-        let mut diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
-        gates.apply(logical, &mut diffs);
-        let gauge_series = gauge_section(&identity, &gauges, &page.rows);
-
-        let scanned = match scan_section(&diffs, &gauge_series, scan, remaining_scan, hit_limit) {
-            Ok((hits, _counts, work)) => {
-                remaining_scan -= work;
-                hits
-            }
-            Err(_limit) => {
-                skipped.push(SectionSkip {
-                    section: logical.name,
-                    reason: SkipReason::ScanBudget,
-                });
-                continue;
-            }
-        };
-
-        ingest_section(
-            logical,
-            &diffs,
-            &gauge_series,
-            scanned,
-            &mut series,
-            &mut episodes,
-            &mut quality,
-        )?;
+    let mut read_names = BTreeSet::new();
+    read_names.extend(logicals.iter().map(|logical| logical.name));
+    read_names.extend(Gates::sections(&logicals));
+    let observed_sections = read_names.len().saturating_add(1);
+    if observed_sections > limits.sections {
+        return Err(InputError::SectionLimit {
+            observed: observed_sections,
+            limit: limits.sections,
+        });
     }
 
-    Ok(PreparedInput {
-        episodes,
-        series,
-        coverage_by_section,
-        quality,
+    let metadata_from = snap
+        .units()
+        .iter()
+        .filter(|unit| {
+            unit.source_id == source && unit.max_ts >= scan.from && unit.min_ts <= scan.to
+        })
+        .map(|unit| unit.min_ts)
+        .min()
+        .ok_or(InputError::NoData)?;
+    let mut remaining_cells = limits.materialized_cells;
+    let metadata_page = section_with_limits(
+        snap,
+        "instance_metadata",
+        source,
+        metadata_from,
+        scan.to,
+        None,
+        QueryLimits::new(DIFF_MAX_ROWS, remaining_cells),
+    )
+    .map_err(|err| map_query_error(err, limits.materialized_cells))?;
+    charge_materialized_cells(
+        &metadata_page,
+        &mut remaining_cells,
+        limits.materialized_cells,
+    )?;
+
+    let read_names: Vec<&str> = read_names.into_iter().collect();
+    let batch = sections_with_limits(
+        snap,
+        source,
+        scan.from,
+        scan.to,
+        &read_names,
+        &BTreeMap::new(),
+        QueryLimits::new(DIFF_MAX_ROWS, remaining_cells),
+    );
+    let (pages, skipped) = match batch {
+        Ok(pages) => (pages, Vec::new()),
+        Err(QueryError::ResultTooLarge { .. }) => read_partial_pages(
+            snap,
+            source,
+            scan,
+            &read_names,
+            remaining_cells,
+            limits.materialized_cells,
+        )?,
+        Err(error) => return Err(InputError::Read(error)),
+    };
+
+    Ok(InputPages {
+        logicals,
+        metadata: metadata_page,
+        pages,
         skipped,
     })
 }
 
-/// Fetch the gate sections the logical sections declare and fold them into the
-/// gating timelines, reusing the anomaly endpoint's contract.
-fn load_gates(
+fn read_partial_pages(
     snap: &mut LocalDirSnapshot,
-    logicals: &[LogicalSection],
     source: u64,
-    from: i64,
-    to: i64,
-) -> Result<Gates, InputError> {
+    scan: &ScanParams,
+    names: &[&str],
+    mut remaining_cells: usize,
+    materialization_limit: usize,
+) -> Result<(BTreeMap<String, SectionPage>, Vec<SectionSkip>), InputError> {
     let mut pages = BTreeMap::new();
-    for name in Gates::sections(logicals) {
-        let page = query_section(snap, name, source, from, to, DIFF_MAX_ROWS, None)
-            .map_err(InputError::Read)?;
-        pages.insert(name.to_owned(), page);
+    let mut skipped = Vec::new();
+    for &name in names {
+        if remaining_cells == 0 {
+            skipped.push(materialization_skip(name, materialization_limit)?);
+            continue;
+        }
+        match section_with_limits(
+            snap,
+            name,
+            source,
+            scan.from,
+            scan.to,
+            None,
+            QueryLimits::new(DIFF_MAX_ROWS, remaining_cells),
+        ) {
+            Ok(page) => {
+                charge_materialized_cells(&page, &mut remaining_cells, materialization_limit)?;
+                pages.insert(name.to_owned(), page);
+            }
+            Err(QueryError::ResultTooLarge { .. }) => {
+                skipped.push(materialization_skip(name, materialization_limit)?);
+                remaining_cells = 0;
+            }
+            Err(error) => return Err(InputError::Read(error)),
+        }
     }
-    Ok(Gates::from_pages(logicals, &pages))
+    Ok((pages, skipped))
+}
+
+fn materialization_skip(name: &str, limit: usize) -> Result<SectionSkip, InputError> {
+    let logical =
+        logical_section(name).ok_or_else(|| InputError::UnknownSection(name.to_owned()))?;
+    Ok(SectionSkip {
+        section: logical.name,
+        reason: SkipReason::MaterializationLimit { limit },
+    })
+}
+
+struct BuildState {
+    episodes: Vec<EnrichedEpisode>,
+    series: SeriesSet,
+    coverage_by_section: BTreeMap<&'static str, Vec<Gap>>,
+    quality: InputQuality,
+    skipped: Vec<SectionSkip>,
+    remaining_identity_bytes: usize,
+    remaining_scan: usize,
+}
+
+impl BuildState {
+    fn new(
+        limits: &InputLimits,
+        remaining_identity_bytes: usize,
+        skipped: Vec<SectionSkip>,
+    ) -> Self {
+        Self {
+            episodes: Vec::new(),
+            series: SeriesSet::new(limits.series_points),
+            coverage_by_section: BTreeMap::new(),
+            quality: InputQuality::default(),
+            skipped,
+            remaining_identity_bytes,
+            remaining_scan: limits.score_work,
+        }
+    }
+
+    fn process(
+        &mut self,
+        logical: &LogicalSection,
+        mut page: SectionPage,
+        gates: &Gates,
+        scan: &ScanParams,
+        limits: &InputLimits,
+    ) -> Result<(), InputError> {
+        if page.next_cursor.is_some() {
+            self.skipped.push(SectionSkip {
+                section: logical.name,
+                reason: SkipReason::IncompletePage,
+            });
+            return Ok(());
+        }
+        self.coverage_by_section
+            .insert(logical.name, page.gaps.clone());
+
+        let identity = logical.diff_key();
+        let (cumulative, gauges) = scorable_columns(logical);
+        match normalize_duplicate_rows(
+            &mut page.rows,
+            &identity,
+            &cumulative,
+            &gauges,
+            &mut self.quality,
+            &mut self.remaining_identity_bytes,
+            limits.identity_bytes,
+        ) {
+            Ok(()) => {}
+            Err(NormalizeError::Conflict(timestamp)) => {
+                self.skipped.push(SectionSkip {
+                    section: logical.name,
+                    reason: SkipReason::ConflictingTimestamp { timestamp },
+                });
+                return Ok(());
+            }
+            Err(NormalizeError::IdentityByteLimit { observed, limit }) => {
+                self.skipped.push(SectionSkip {
+                    section: logical.name,
+                    reason: SkipReason::IdentityByteLimit { observed, limit },
+                });
+                return Ok(());
+            }
+        }
+        let mut diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
+        gates.apply(logical, &mut diffs);
+        let gauge_series = gauge_section(&identity, &gauges, &page.rows);
+        tally_quality(&diffs, &gauge_series, &mut self.quality);
+
+        let scanned = match scan_section(
+            &diffs,
+            &gauge_series,
+            scan,
+            self.remaining_scan,
+            limits.episodes,
+        ) {
+            Ok((hits, _counts, work)) => {
+                self.remaining_scan -= work;
+                hits
+            }
+            Err(limit) => {
+                self.skipped.push(SectionSkip {
+                    section: logical.name,
+                    reason: SkipReason::ScanBudget {
+                        required: limit.required,
+                        available: limit.available,
+                    },
+                });
+                return Ok(());
+            }
+        };
+
+        match ingest_section(
+            logical,
+            &diffs,
+            &gauge_series,
+            scanned,
+            &mut self.series,
+            &mut self.quality,
+        ) {
+            Ok(section_episodes) => {
+                self.episodes.extend(section_episodes);
+                rank_episodes(&mut self.episodes, limits.episodes);
+            }
+            Err(InputError::SeriesLimit { observed, limit }) => {
+                self.skipped.push(SectionSkip {
+                    section: logical.name,
+                    reason: SkipReason::SeriesPointLimit { observed, limit },
+                });
+            }
+            Err(err) => return Err(err),
+        }
+        Ok(())
+    }
+}
+
+fn scan_position_count(scan: &ScanParams) -> Option<usize> {
+    if scan.from >= scan.to
+        || scan.window <= 0
+        || scan.step <= 0
+        || !scan.threshold.is_finite()
+        || scan.threshold < 0.0
+        || !scan.eps_rel.is_finite()
+        || scan.eps_rel < 0.0
+    {
+        return None;
+    }
+    let first = scan.from.checked_add(scan.window)?;
+    if first > scan.to {
+        return None;
+    }
+    if first == scan.to {
+        return Some(1);
+    }
+    let interior = scan
+        .to
+        .checked_sub(first)?
+        .checked_sub(1)?
+        .checked_div(scan.step)?
+        .checked_add(1)?;
+    usize::try_from(interior.checked_add(1)?).ok()
+}
+
+fn map_query_error(error: QueryError, materialization_limit: usize) -> InputError {
+    match error {
+        QueryError::ResultTooLarge { .. } => InputError::MaterializationLimit {
+            limit: materialization_limit,
+        },
+        other => InputError::Read(other),
+    }
+}
+
+fn charge_materialized_cells(
+    page: &SectionPage,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<(), InputError> {
+    let cells = page.rows.iter().try_fold(0_usize, |total, row| {
+        total
+            .checked_add(row.len())
+            .ok_or(InputError::MaterializationLimit { limit })
+    })?;
+    *remaining = remaining
+        .checked_sub(cells)
+        .ok_or(InputError::MaterializationLimit { limit })?;
+    Ok(())
+}
+
+fn load_node_identity(
+    page: &SectionPage,
+    remaining_bytes: &mut usize,
+    byte_limit: usize,
+) -> Result<String, InputError> {
+    if page.next_cursor.is_some() {
+        return Err(InputError::MissingNodeIdentity);
+    }
+    let mut identities = BTreeSet::new();
+    for row in &page.rows {
+        let Some(Value::Str(value)) = row_value(row, "node_self_id") else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        charge_identity_bytes(value.len(), remaining_bytes, byte_limit)
+            .map_err(|(observed, limit)| InputError::IdentityByteLimit { observed, limit })?;
+        identities.insert(value.clone());
+    }
+    match identities.len() {
+        0 => Err(InputError::MissingNodeIdentity),
+        1 => identities
+            .into_iter()
+            .next()
+            .ok_or(InputError::MissingNodeIdentity),
+        _ => Err(InputError::ConflictingNodeIdentity),
+    }
+}
+
+fn row_value<'a>(row: &'a OutRow, name: &str) -> Option<&'a Value> {
+    row.iter()
+        .find_map(|(column, value)| (column == name).then_some(value))
+}
+
+fn canonical_identity_values(row: &OutRow, names: &[&str]) -> Option<Vec<IdentityValue>> {
+    names
+        .iter()
+        .map(|name| match row_value(row, name)? {
+            Value::I64(value) => Some(IdentityValue::I64(*value)),
+            Value::U64(value) => Some(IdentityValue::U64(*value)),
+            Value::Bool(value) => Some(IdentityValue::Bool(*value)),
+            Value::Str(value) => Some(IdentityValue::Text(value.clone())),
+            Value::Null | Value::F64(_) | Value::Ts(_) | Value::Blob { .. } | Value::ListI32(_) => {
+                None
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalizeError {
+    Conflict(i64),
+    IdentityByteLimit { observed: usize, limit: usize },
+}
+
+fn identity_bytes(identity: &[IdentityValue]) -> Option<usize> {
+    identity.iter().try_fold(0_usize, |sum, value| {
+        let bytes = match value {
+            IdentityValue::I64(_) | IdentityValue::U64(_) => 9,
+            IdentityValue::Bool(_) => 2,
+            IdentityValue::Text(text) => 9_usize.checked_add(text.len())?,
+        };
+        sum.checked_add(bytes)
+    })
+}
+
+fn charge_identity_bytes(
+    bytes: usize,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<(), (usize, usize)> {
+    let Some(left) = remaining.checked_sub(bytes) else {
+        let observed = limit
+            .checked_sub(*remaining)
+            .and_then(|spent| spent.checked_add(bytes))
+            .unwrap_or(usize::MAX);
+        return Err((observed, limit));
+    };
+    *remaining = left;
+    Ok(())
+}
+
+fn normalize_duplicate_rows(
+    rows: &mut Vec<OutRow>,
+    identity: &[&str],
+    cumulative: &[&str],
+    gauges: &[&str],
+    quality: &mut InputQuality,
+    remaining_identity_bytes: &mut usize,
+    identity_byte_limit: usize,
+) -> Result<(), NormalizeError> {
+    let compared: Vec<&str> = cumulative.iter().chain(gauges).copied().collect();
+    let mut seen: BTreeMap<(Vec<IdentityValue>, i64), usize> = BTreeMap::new();
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in std::mem::take(rows) {
+        let Some(key) = canonical_identity_values(&row, identity) else {
+            quality.non_canonical_identity = quality.non_canonical_identity.saturating_add(1);
+            continue;
+        };
+        let bytes = identity_bytes(&key).ok_or(NormalizeError::IdentityByteLimit {
+            observed: usize::MAX,
+            limit: identity_byte_limit,
+        })?;
+        charge_identity_bytes(bytes, remaining_identity_bytes, identity_byte_limit)
+            .map_err(|(observed, limit)| NormalizeError::IdentityByteLimit { observed, limit })?;
+        let Some(Value::Ts(timestamp)) = row_value(&row, "ts") else {
+            kept.push(row);
+            continue;
+        };
+        let row_key = (key, *timestamp);
+        if let Some(&previous) = seen.get(&row_key) {
+            let equal = compared
+                .iter()
+                .all(|name| row_value(&kept[previous], name) == row_value(&row, name));
+            if !equal {
+                return Err(NormalizeError::Conflict(*timestamp));
+            }
+            quality.duplicate_timestamps = quality.duplicate_timestamps.saturating_add(1);
+        } else {
+            seen.insert(row_key, kept.len());
+            kept.push(row);
+        }
+    }
+    *rows = kept;
+    Ok(())
+}
+
+fn tally_quality(diffs: &[SeriesDiff], gauges: &[SeriesValues], quality: &mut InputQuality) {
+    for point in diffs
+        .iter()
+        .flat_map(|series| &series.columns)
+        .flat_map(|column| &column.points)
+    {
+        match point.point {
+            DiffPoint::Value { rate, .. } if rate.is_finite() => {}
+            DiffPoint::Value { .. } => {
+                quality.non_finite_points = quality.non_finite_points.saturating_add(1);
+            }
+            DiffPoint::NoData {
+                reason: Reason::FirstPoint,
+            } => quality.first_points = quality.first_points.saturating_add(1),
+            DiffPoint::NoData {
+                reason: Reason::Reset,
+            } => quality.resets = quality.resets.saturating_add(1),
+            DiffPoint::NoData {
+                reason: Reason::Gap,
+            } => quality.gaps = quality.gaps.saturating_add(1),
+            DiffPoint::NoData {
+                reason: Reason::NotCollected,
+            } => quality.not_collected = quality.not_collected.saturating_add(1),
+            DiffPoint::NoData {
+                reason: Reason::Anomaly,
+            } => quality.anomalous_points = quality.anomalous_points.saturating_add(1),
+        }
+    }
+    for column in gauges.iter().flat_map(|series| &series.columns) {
+        quality.invalid_gauge_points = quality
+            .invalid_gauge_points
+            .saturating_add(column.skipped as u64);
+    }
+}
+
+fn rank_episodes(episodes: &mut Vec<EnrichedEpisode>, limit: usize) {
+    episodes.sort_by(|left, right| {
+        right
+            .episode
+            .peak
+            .m
+            .abs()
+            .total_cmp(&left.episode.peak.m.abs())
+            .then_with(|| left.reference.cmp(&right.reference))
+    });
+    episodes.truncate(limit);
 }
 
 /// Turn one section's scan hits and scanned series into engine input.
@@ -212,10 +703,12 @@ fn ingest_section(
     gauges: &[SeriesValues],
     hits: Vec<EpisodeHit>,
     series: &mut SeriesSet,
-    episodes: &mut Vec<EnrichedEpisode>,
     quality: &mut InputQuality,
-) -> Result<(), InputError> {
+) -> Result<Vec<EnrichedEpisode>, InputError> {
     let mut inserted: BTreeSet<(&'static str, Vec<IdentityValue>)> = BTreeSet::new();
+    let mut episodes = Vec::with_capacity(hits.len());
+    let mut built_series = Vec::new();
+    let mut remaining_points = series.remaining_points();
     for hit in hits {
         let Some(identity) = canonical_identity(&hit.key, quality) else {
             continue;
@@ -230,9 +723,19 @@ fn ingest_section(
         };
 
         let key = (column, identity.clone());
-        if inserted.insert(key) {
-            let points = column_points(diffs, gauges, &hit.key, column, quality);
-            insert_series(series, logical.name, column, identity, points, quality)?;
+        if inserted.insert(key)
+            && let Some(built) = column_series(
+                diffs,
+                gauges,
+                &hit.key,
+                logical.name,
+                column,
+                remaining_points,
+                series.point_limit(),
+            )?
+        {
+            remaining_points -= built.len();
+            built_series.push((column, identity, built));
         }
 
         episodes.push(EnrichedEpisode {
@@ -240,7 +743,19 @@ fn ingest_section(
             reference,
         });
     }
-    Ok(())
+
+    for (column, identity, _) in &built_series {
+        if series.contains(logical.name, column, identity) {
+            return Err(InputError::DuplicateSeries {
+                section: logical.name,
+                column,
+            });
+        }
+    }
+    for (column, identity, built) in built_series {
+        insert_series(series, logical.name, column, identity, built)?;
+    }
+    Ok(episodes)
 }
 
 /// Convert an identity row to canonical scalars, or count the drop.
@@ -257,7 +772,7 @@ fn canonical_identity(key: &[Value], quality: &mut InputQuality) -> Option<Vec<I
             Value::Bool(v) => IdentityValue::Bool(*v),
             Value::Str(text) => IdentityValue::Text(text.clone()),
             Value::Null | Value::F64(_) | Value::Ts(_) | Value::Blob { .. } | Value::ListI32(_) => {
-                quality.non_canonical_identity += 1;
+                quality.non_canonical_identity = quality.non_canonical_identity.saturating_add(1);
                 return None;
             }
         };
@@ -282,93 +797,114 @@ fn resolve_column(logical: &LogicalSection, column: &str) -> Result<&'static str
         })
 }
 
-/// Collect the `(ts, value)` timeline the scan scored for one series column:
-/// finite diff rates for cumulative columns, raw readings for gauges.
-fn column_points(
+fn column_series(
     diffs: &[SeriesDiff],
     gauges: &[SeriesValues],
     key: &[Value],
+    section: &'static str,
     column: &'static str,
-    quality: &mut InputQuality,
-) -> Vec<(i64, f64)> {
+    remaining_points: usize,
+    point_limit: usize,
+) -> Result<Option<Series>, InputError> {
     if let Some(series) = diffs.iter().find(|series| series.key == key)
         && let Some(diff) = series.columns.iter().find(|diff| diff.name == column)
     {
-        let mut points = Vec::with_capacity(diff.points.len());
+        let mut runs = Vec::new();
+        let mut ts = Vec::new();
+        let mut values = Vec::new();
+        let mut retained = 0_usize;
         for at in &diff.points {
             match at.point {
-                DiffPoint::Value { rate, .. } if rate.is_finite() => points.push((at.ts, rate)),
-                _ => quality.non_finite_points += 1,
+                DiffPoint::Value { rate, .. } if rate.is_finite() => {
+                    charge_series_point(&mut retained, remaining_points, point_limit)?;
+                    ts.push(at.ts);
+                    values.push(rate);
+                }
+                DiffPoint::NoData {
+                    reason: Reason::FirstPoint,
+                } => {}
+                DiffPoint::Value { .. } | DiffPoint::NoData { .. } => {
+                    finish_run(&mut runs, &mut ts, &mut values);
+                }
             }
         }
-        return points;
+        finish_run(&mut runs, &mut ts, &mut values);
+        return build_series(runs, section, column);
     }
     if let Some(series) = gauges.iter().find(|series| series.key == key)
         && let Some(values) = series.columns.iter().find(|values| values.name == column)
     {
-        return gauge_points(values);
+        let mut runs = Vec::new();
+        let mut ts = Vec::new();
+        let mut readings = Vec::new();
+        let mut retained = 0_usize;
+        let mut breaks = values.breaks.iter().peekable();
+        for &(at, value) in &values.points {
+            if breaks.next_if(|&&gap| gap <= at).is_some() {
+                while breaks.next_if(|&&gap| gap <= at).is_some() {}
+                finish_run(&mut runs, &mut ts, &mut readings);
+            }
+            charge_series_point(&mut retained, remaining_points, point_limit)?;
+            ts.push(at);
+            readings.push(value);
+        }
+        finish_run(&mut runs, &mut ts, &mut readings);
+        return build_series(runs, section, column);
     }
-    Vec::new()
+    Ok(None)
 }
 
-/// A gauge column's raw points; every value is already finite (`gauge_section`
-/// counts non-finite readings as skipped).
-fn gauge_points(values: &ColumnValues) -> Vec<(i64, f64)> {
-    values.points.clone()
+fn charge_series_point(
+    retained: &mut usize,
+    remaining: usize,
+    limit: usize,
+) -> Result<(), InputError> {
+    *retained = retained.checked_add(1).ok_or(InputError::SeriesLimit {
+        observed: usize::MAX,
+        limit,
+    })?;
+    if *retained > remaining {
+        return Err(InputError::SeriesLimit {
+            observed: limit.saturating_add(1),
+            limit,
+        });
+    }
+    Ok(())
 }
 
-/// Insert one series into the set, collapsing duplicate timestamps so the
-/// strictly-increasing contract of `Series::new` holds. On equal timestamps the
-/// last value wins, matching a monotone snapshot stream's freshest read.
+fn finish_run(runs: &mut Vec<(Vec<i64>, Vec<f64>)>, ts: &mut Vec<i64>, values: &mut Vec<f64>) {
+    if !ts.is_empty() {
+        runs.push((std::mem::take(ts), std::mem::take(values)));
+    }
+}
+
+fn build_series(
+    runs: Vec<(Vec<i64>, Vec<f64>)>,
+    section: &'static str,
+    column: &'static str,
+) -> Result<Option<Series>, InputError> {
+    let built = Series::from_runs(runs).map_err(|error| InputError::InvalidSeries {
+        section,
+        column,
+        error,
+    })?;
+    Ok((!built.is_empty()).then_some(built))
+}
+
 fn insert_series(
     series: &mut SeriesSet,
     section: &'static str,
     column: &'static str,
     identity: Vec<IdentityValue>,
-    points: Vec<(i64, f64)>,
-    quality: &mut InputQuality,
+    built: Series,
 ) -> Result<(), InputError> {
-    let (ts, values) = dedup_timestamps(points, quality);
-    // A non-finite value is filtered upstream and duplicate timestamps are
-    // collapsed here, so `Series::new` cannot reject a prepared timeline; an
-    // empty timeline is valid and simply carries no series.
-    let Ok(built) = Series::new(ts, values) else {
-        return Ok(());
-    };
-    if built.is_empty() {
-        return Ok(());
-    }
     match series.insert(section, column, identity.into(), built) {
         Ok(()) => Ok(()),
-        Err(SeriesInsertError::Duplicate) => {
-            quality.duplicate_series += 1;
-            Ok(())
-        }
+        Err(SeriesInsertError::Duplicate) => Err(InputError::DuplicateSeries { section, column }),
         Err(SeriesInsertError::PointLimit { observed, limit }) => {
             Err(InputError::SeriesLimit { observed, limit })
         }
     }
-}
-
-/// Collapse points that share a timestamp, keeping the last value, and count
-/// each collapse. Input is in snapshot-time order, so a stable pass over
-/// consecutive equal timestamps suffices.
-fn dedup_timestamps(points: Vec<(i64, f64)>, quality: &mut InputQuality) -> (Vec<i64>, Vec<f64>) {
-    let mut ts = Vec::with_capacity(points.len());
-    let mut values = Vec::with_capacity(points.len());
-    for (at, value) in points {
-        match values.last_mut() {
-            Some(last) if ts.last() == Some(&at) => {
-                quality.duplicate_timestamps += 1;
-                *last = value;
-            }
-            _ => {
-                ts.push(at);
-                values.push(value);
-            }
-        }
-    }
-    (ts, values)
 }
 
 /// Split a section's columns into cumulative and gauge name lists, matching the
@@ -388,7 +924,7 @@ fn scorable_columns(logical: &LogicalSection) -> (Vec<&'static str>, Vec<&'stati
 
 #[cfg(test)]
 mod tests {
-    use kronika_reader::{ColumnDiff, DiffAt, Reason, Scalar};
+    use kronika_reader::{ColumnDiff, ColumnValues, DiffAt, Scalar};
 
     use super::*;
     use crate::incident::{ClockRelation, IncidentConfig, analyze};
@@ -451,6 +987,18 @@ mod tests {
     }
 
     #[test]
+    fn scan_position_count_rejects_degenerate_arithmetic() {
+        let mut scan = spike_scan(10 * MINUTE);
+        assert_eq!(scan_position_count(&scan), Some(3));
+        scan.step = 0;
+        assert_eq!(scan_position_count(&scan), None);
+        scan.step = MINUTE;
+        scan.from = i64::MAX - 1;
+        scan.to = i64::MAX;
+        assert_eq!(scan_position_count(&scan), None);
+    }
+
+    #[test]
     fn resolve_column_returns_the_static_name_or_a_typed_error() {
         let logical = logical_section("pg_stat_archiver").expect("archiver in the registry");
         let resolved = resolve_column(&logical, "archived_count").expect("column exists");
@@ -462,29 +1010,149 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn equal_timestamps_collapse_to_the_last_value_and_are_counted() {
-        let mut q = quality();
-        let (ts, values) = dedup_timestamps(
-            vec![(1, 10.0), (1, 11.0), (2, 20.0), (2, 21.0), (2, 22.0)],
-            &mut q,
-        );
-        assert_eq!(ts, vec![1, 2]);
-        assert_eq!(values, vec![11.0, 22.0], "the freshest read wins on a tie");
-        assert_eq!(q.duplicate_timestamps, 3);
+    fn sample_row(timestamp: i64, value: f64) -> OutRow {
+        vec![
+            ("ts".to_owned(), Value::Ts(timestamp)),
+            ("c".to_owned(), Value::F64(value)),
+        ]
     }
 
     #[test]
-    fn distinct_timestamps_pass_through_unchanged() {
+    fn equal_duplicate_rows_are_deduplicated() {
         let mut q = quality();
-        let (ts, values) = dedup_timestamps(vec![(1, 1.0), (2, 2.0), (3, 3.0)], &mut q);
-        assert_eq!(ts, vec![1, 2, 3]);
-        assert_eq!(values, vec![1.0, 2.0, 3.0]);
+        let mut rows = vec![sample_row(1, 10.0), sample_row(1, 10.0)];
+        let mut identity_bytes = 100;
+        assert_eq!(
+            normalize_duplicate_rows(
+                &mut rows,
+                &[],
+                &["c"],
+                &[],
+                &mut q,
+                &mut identity_bytes,
+                100,
+            ),
+            Ok(())
+        );
+        assert_eq!(rows, vec![sample_row(1, 10.0)]);
+        assert_eq!(q.duplicate_timestamps, 1);
+    }
+
+    #[test]
+    fn conflicting_duplicate_rows_are_rejected_in_either_order() {
+        let mut forward_quality = quality();
+        let mut forward = vec![sample_row(1, 10.0), sample_row(1, 11.0)];
+        let mut reverse_quality = quality();
+        let mut reverse = vec![sample_row(1, 11.0), sample_row(1, 10.0)];
+        let mut forward_bytes = 100;
+        let mut reverse_bytes = 100;
+
+        assert_eq!(
+            normalize_duplicate_rows(
+                &mut forward,
+                &[],
+                &["c"],
+                &[],
+                &mut forward_quality,
+                &mut forward_bytes,
+                100,
+            ),
+            Err(NormalizeError::Conflict(1))
+        );
+        assert_eq!(
+            normalize_duplicate_rows(
+                &mut reverse,
+                &[],
+                &["c"],
+                &[],
+                &mut reverse_quality,
+                &mut reverse_bytes,
+                100,
+            ),
+            Err(NormalizeError::Conflict(1))
+        );
+    }
+
+    #[test]
+    fn distinct_timestamps_are_unchanged() {
+        let mut q = quality();
+        let expected = vec![sample_row(1, 1.0), sample_row(2, 2.0)];
+        let mut rows = expected.clone();
+        let mut identity_bytes = 100;
+        assert_eq!(
+            normalize_duplicate_rows(
+                &mut rows,
+                &[],
+                &["c"],
+                &[],
+                &mut q,
+                &mut identity_bytes,
+                100,
+            ),
+            Ok(())
+        );
+        assert_eq!(rows, expected);
         assert_eq!(q.duplicate_timestamps, 0);
     }
 
     #[test]
-    fn column_points_keeps_finite_rates_and_counts_the_rest() {
+    fn unresolved_identity_row_is_counted_and_removed() {
+        let mut rows = vec![vec![
+            ("ts".to_owned(), Value::Ts(1)),
+            ("id".to_owned(), Value::Null),
+            ("c".to_owned(), Value::F64(1.0)),
+        ]];
+        let mut q = quality();
+        let mut identity_bytes = 100;
+
+        assert_eq!(
+            normalize_duplicate_rows(
+                &mut rows,
+                &["id"],
+                &["c"],
+                &[],
+                &mut q,
+                &mut identity_bytes,
+                100,
+            ),
+            Ok(())
+        );
+        assert!(rows.is_empty());
+        assert_eq!(q.non_canonical_identity, 1);
+    }
+
+    #[test]
+    fn identity_bytes_are_charged_across_rows() {
+        let row = |timestamp, identity: &str| {
+            vec![
+                ("ts".to_owned(), Value::Ts(timestamp)),
+                ("id".to_owned(), Value::Str(identity.to_owned())),
+                ("c".to_owned(), Value::F64(1.0)),
+            ]
+        };
+        let mut rows = vec![row(1, "abc"), row(2, "def")];
+        let mut q = quality();
+        let mut identity_bytes = 20;
+
+        assert_eq!(
+            normalize_duplicate_rows(
+                &mut rows,
+                &["id"],
+                &["c"],
+                &[],
+                &mut q,
+                &mut identity_bytes,
+                20,
+            ),
+            Err(NormalizeError::IdentityByteLimit {
+                observed: 24,
+                limit: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_diff_points_split_retained_series() {
         let key = vec![Value::I64(1)];
         let diffs = vec![SeriesDiff {
             key: key.clone(),
@@ -519,43 +1187,214 @@ mod tests {
                             reason: Reason::Reset,
                         },
                     },
+                    DiffAt {
+                        ts: 240,
+                        point: DiffPoint::Value {
+                            delta: Scalar::Int(7),
+                            rate: 7.0,
+                            dt_micros: 60,
+                        },
+                    },
                 ],
             }],
         }];
-        let mut q = quality();
-        let points = column_points(&diffs, &[], &key, "c", &mut q);
-        assert_eq!(points, vec![(60, 5.0)], "only the one finite rate survives");
-        assert_eq!(
-            q.non_finite_points, 3,
-            "FirstPoint, NaN, and Reset each leave no point"
-        );
+        let series = column_series(&diffs, &[], &key, "s", "c", 10, 10)
+            .expect("valid series")
+            .expect("nonempty series");
+        assert_eq!(series.runs().len(), 2);
+        assert_eq!(series.runs()[0].ts(), &[60]);
+        assert_eq!(series.runs()[1].ts(), &[240]);
     }
 
     #[test]
-    fn column_points_reads_gauge_readings_when_the_column_is_a_gauge() {
+    fn point_limit_is_checked_while_building_a_series() {
+        let key = vec![Value::I64(1)];
+        let diffs = vec![SeriesDiff {
+            key: key.clone(),
+            columns: vec![ColumnDiff {
+                name: "c".to_owned(),
+                points: vec![
+                    DiffAt {
+                        ts: 1,
+                        point: DiffPoint::Value {
+                            delta: Scalar::Int(1),
+                            rate: 1.0,
+                            dt_micros: 1,
+                        },
+                    },
+                    DiffAt {
+                        ts: 2,
+                        point: DiffPoint::Value {
+                            delta: Scalar::Int(1),
+                            rate: 1.0,
+                            dt_micros: 1,
+                        },
+                    },
+                ],
+            }],
+        }];
+
+        assert!(matches!(
+            column_series(&diffs, &[], &key, "s", "c", 1, 1),
+            Err(InputError::SeriesLimit {
+                observed: 2,
+                limit: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_series_is_a_typed_adapter_error() {
+        let mut series = SeriesSet::for_test(10);
+        insert_series(
+            &mut series,
+            "s",
+            "c",
+            vec![IdentityValue::I64(1)],
+            Series::new(vec![1], vec![1.0]).expect("valid series"),
+        )
+        .expect("first insert");
+
+        assert!(matches!(
+            insert_series(
+                &mut series,
+                "s",
+                "c",
+                vec![IdentityValue::I64(1)],
+                Series::new(vec![2], vec![2.0]).expect("valid series"),
+            ),
+            Err(InputError::DuplicateSeries {
+                section: "s",
+                column: "c",
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_gauge_point_splits_retained_series() {
         let key = vec![Value::I64(1)];
         let gauges = vec![SeriesValues {
             key: key.clone(),
             columns: vec![ColumnValues {
                 name: "g".to_owned(),
-                points: vec![(0, 1.0), (60, 2.0)],
-                skipped: 0,
+                points: vec![(0, 1.0), (120, 2.0)],
+                breaks: vec![60],
+                skipped: 1,
+            }],
+        }];
+        let series = column_series(&[], &gauges, &key, "s", "g", 10, 10)
+            .expect("valid series")
+            .expect("nonempty series");
+        assert_eq!(series.runs().len(), 2);
+        assert_eq!(series.runs()[0].values(), &[1.0]);
+        assert_eq!(series.runs()[1].values(), &[2.0]);
+    }
+
+    #[test]
+    fn diff_exclusions_have_distinct_quality_counts() {
+        let reasons = [
+            Reason::FirstPoint,
+            Reason::Reset,
+            Reason::Gap,
+            Reason::NotCollected,
+            Reason::Anomaly,
+        ];
+        let diffs = vec![SeriesDiff {
+            key: Vec::new(),
+            columns: vec![ColumnDiff {
+                name: "c".to_owned(),
+                points: reasons
+                    .into_iter()
+                    .enumerate()
+                    .map(|(timestamp, reason)| DiffAt {
+                        ts: i64::try_from(timestamp).expect("small timestamp"),
+                        point: DiffPoint::NoData { reason },
+                    })
+                    .collect(),
             }],
         }];
         let mut q = quality();
-        assert_eq!(
-            column_points(&[], &gauges, &key, "g", &mut q),
-            vec![(0, 1.0), (60, 2.0)]
+
+        tally_quality(&diffs, &[], &mut q);
+
+        assert_eq!(q.first_points, 1);
+        assert_eq!(q.resets, 1);
+        assert_eq!(q.gaps, 1);
+        assert_eq!(q.not_collected, 1);
+        assert_eq!(q.anomalous_points, 1);
+    }
+
+    fn write_archiver_segment(
+        path: &std::path::Path,
+        rows: &[kronika_registry::pg_stat_archiver::PgStatArchiver],
+        min_ts: i64,
+        max_ts: i64,
+    ) {
+        use kronika_format::{DictLimits, PartMeta, SectionInput};
+        use kronika_registry::instance_metadata::InstanceMetadata;
+        use kronika_registry::{Section, StrId, Ts};
+
+        let mut interner = kronika_writer::Interner::new(
+            DictLimits::new(4096, 1 << 20).expect("dictionary limits"),
         );
-        assert_eq!(q.non_finite_points, 0);
+        let mut intern = |value: &str| {
+            interner
+                .intern(value.as_bytes())
+                .map(|id| StrId(id.get()))
+                .expect("intern fixture identity")
+        };
+        let metadata = InstanceMetadata {
+            ts: Ts(min_ts),
+            hostname: intern("db-host-7"),
+            node_self_id: intern("node-7"),
+            pg_version_num: 170_000,
+            kernel_version: intern("test-kernel"),
+            pg_system_identifier: Some(7),
+            clock_ticks_per_sec: 100,
+            page_size_bytes: 4096,
+            boot_id: intern("test-boot"),
+            btime: Ts(0),
+        };
+        let dictionary =
+            kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
+        let archiver = kronika_registry::pg_stat_archiver::PgStatArchiver::encode(rows)
+            .expect("encode archiver");
+        let metadata = InstanceMetadata::encode(&[metadata]).expect("encode metadata");
+        let mut sections: Vec<SectionInput<'_>> = dictionary
+            .iter()
+            .map(|section| SectionInput {
+                type_id: section.type_id,
+                rows: section.rows,
+                body: &section.body,
+            })
+            .collect();
+        sections.push(SectionInput {
+            type_id: 1_008_001,
+            rows: u32::try_from(rows.len()).expect("fixture row count"),
+            body: &archiver,
+        });
+        sections.push(SectionInput {
+            type_id: 1_021_001,
+            rows: 1,
+            body: &metadata,
+        });
+        let bytes = kronika_format::build_part(
+            &sections,
+            PartMeta {
+                min_ts,
+                max_ts,
+                source_id: 7,
+            },
+        );
+        std::fs::write(path, bytes).expect("write segment");
     }
 
     /// Split forty per-minute archiver snapshots across two segments; the
     /// counter climbs by one per minute except minutes 20..25, where it climbs
     /// by fifty. Returns the last snapshot time.
     fn write_two_segment_spike(dir: &std::path::Path) -> i64 {
+        use kronika_registry::Ts;
         use kronika_registry::pg_stat_archiver::PgStatArchiver;
-        use kronika_registry::{Section, Ts};
 
         let row = |ts: i64, archived: i64| PgStatArchiver {
             ts: Ts(ts),
@@ -575,25 +1414,8 @@ mod tests {
             rows.push(row(minute * MINUTE, count));
         }
 
-        let write_segment = |file: &str, rows: &[PgStatArchiver], min_ts: i64, max_ts: i64| {
-            let body = PgStatArchiver::encode(rows).expect("encode archiver");
-            let bytes = kronika_format::build_part(
-                &[kronika_format::SectionInput {
-                    type_id: 1_008_001,
-                    rows: u32::try_from(rows.len()).expect("row count fits u32"),
-                    body: &body,
-                }],
-                kronika_format::PartMeta {
-                    min_ts,
-                    max_ts,
-                    source_id: 7,
-                },
-            );
-            std::fs::write(dir.join(file), &bytes).expect("write segment");
-        };
-
-        write_segment("0.pgm", &rows[..20], 0, 19 * MINUTE);
-        write_segment("2000.pgm", &rows[20..], 20 * MINUTE, 39 * MINUTE);
+        write_archiver_segment(&dir.join("0.pgm"), &rows[..21], 0, 20 * MINUTE);
+        write_archiver_segment(&dir.join("2000.pgm"), &rows[20..], 20 * MINUTE, 39 * MINUTE);
         39 * MINUTE
     }
 
@@ -620,9 +1442,7 @@ mod tests {
             7,
             &scan,
             &["pg_stat_archiver"],
-            1_000_000,
-            crate::anomaly::MAX_SCORE_WORK,
-            50,
+            &InputLimits::for_test(),
         )
         .expect("prepare input from real segments");
 
@@ -631,6 +1451,9 @@ mod tests {
             "the two segments read and scan cleanly: {:?}",
             prepared.skipped
         );
+        assert_eq!(prepared.source_id, 7);
+        assert_eq!(prepared.node_self_id, "node-7");
+        assert_eq!(prepared.quality.duplicate_timestamps, 1);
         let episode = prepared
             .episodes
             .iter()
@@ -650,8 +1473,12 @@ mod tests {
         );
         let (start_us, end_us) = (episode.reference.start_us, episode.reference.end_us);
 
-        let config =
-            IncidentConfig::for_test("node-7", MINUTE, 3_600 * MINUTE, ClockRelation::Unknown);
+        let config = IncidentConfig::for_test(
+            &prepared.node_self_id,
+            MINUTE,
+            3_600 * MINUTE,
+            ClockRelation::Unknown,
+        );
         let outcome = analyze(prepared.episodes, &prepared.series, &[], &config)
             .expect("engine analyzes prepared input");
 
@@ -685,8 +1512,8 @@ mod tests {
 
     #[test]
     fn a_calm_two_segment_series_yields_no_incident() {
+        use kronika_registry::Ts;
         use kronika_registry::pg_stat_archiver::PgStatArchiver;
-        use kronika_registry::{Section, Ts};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let row = |ts: i64, archived: i64| PgStatArchiver {
@@ -700,24 +1527,13 @@ mod tests {
             stats_reset: None,
         };
         let rows: Vec<PgStatArchiver> = (0..40_i64).map(|m| row(m * MINUTE, m + 1)).collect();
-        let write = |file: &str, rows: &[PgStatArchiver], min_ts: i64, max_ts: i64| {
-            let body = PgStatArchiver::encode(rows).expect("encode archiver");
-            let bytes = kronika_format::build_part(
-                &[kronika_format::SectionInput {
-                    type_id: 1_008_001,
-                    rows: u32::try_from(rows.len()).expect("row count fits u32"),
-                    body: &body,
-                }],
-                kronika_format::PartMeta {
-                    min_ts,
-                    max_ts,
-                    source_id: 7,
-                },
-            );
-            std::fs::write(dir.path().join(file), &bytes).expect("write segment");
-        };
-        write("0.pgm", &rows[..20], 0, 19 * MINUTE);
-        write("2000.pgm", &rows[20..], 20 * MINUTE, 39 * MINUTE);
+        write_archiver_segment(&dir.path().join("0.pgm"), &rows[..21], 0, 20 * MINUTE);
+        write_archiver_segment(
+            &dir.path().join("2000.pgm"),
+            &rows[20..],
+            20 * MINUTE,
+            39 * MINUTE,
+        );
 
         let mut snap = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let scan = spike_scan(39 * MINUTE);
@@ -726,18 +1542,79 @@ mod tests {
             7,
             &scan,
             &["pg_stat_archiver"],
-            1_000_000,
-            crate::anomaly::MAX_SCORE_WORK,
-            50,
+            &InputLimits::for_test(),
         )
         .expect("prepare input");
 
-        let config =
-            IncidentConfig::for_test("node-7", MINUTE, 3_600 * MINUTE, ClockRelation::Unknown);
+        assert_eq!(prepared.node_self_id, "node-7");
+        let config = IncidentConfig::for_test(
+            &prepared.node_self_id,
+            MINUTE,
+            3_600 * MINUTE,
+            ClockRelation::Unknown,
+        );
         let outcome = analyze(prepared.episodes, &prepared.series, &[], &config).expect("analyze");
         assert!(
             outcome.incidents.is_empty(),
             "a steady counter produces no anomaly and no incident"
         );
+    }
+
+    #[test]
+    fn materialization_limit_applies_to_the_whole_batch() {
+        use kronika_registry::Ts;
+        use kronika_registry::pg_stat_archiver::PgStatArchiver;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rows = [
+            PgStatArchiver {
+                ts: Ts(0),
+                archived_count: 1,
+                last_archived_wal: None,
+                last_archived_time: None,
+                failed_count: 0,
+                last_failed_wal: None,
+                last_failed_time: None,
+                stats_reset: None,
+            },
+            PgStatArchiver {
+                ts: Ts(MINUTE),
+                archived_count: 2,
+                last_archived_wal: None,
+                last_archived_time: None,
+                failed_count: 0,
+                last_failed_wal: None,
+                last_failed_time: None,
+                stats_reset: None,
+            },
+        ];
+        write_archiver_segment(&dir.path().join("0.pgm"), &rows, 0, MINUTE);
+        let mut snap = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+        let mut limits = InputLimits::for_test();
+        limits.materialized_cells = logical_section("instance_metadata")
+            .expect("metadata contract")
+            .columns
+            .len();
+        let scan = ScanParams {
+            from: 0,
+            to: MINUTE,
+            window: MINUTE,
+            step: MINUTE,
+            threshold: 3.5,
+            eps_rel: 0.05,
+        };
+
+        let prepared = prepare_input(&mut snap, 7, &scan, &["pg_stat_archiver"], &limits)
+            .expect("metadata fits and oversized data is skipped");
+        assert_eq!(
+            prepared.skipped,
+            vec![SectionSkip {
+                section: "pg_stat_archiver",
+                reason: SkipReason::MaterializationLimit {
+                    limit: limits.materialized_cells,
+                },
+            }]
+        );
+        assert!(prepared.episodes.is_empty());
     }
 }

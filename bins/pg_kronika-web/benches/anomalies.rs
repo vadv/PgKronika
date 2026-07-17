@@ -8,6 +8,7 @@
     reason = "criterion_group!/criterion_main! expand to undocumented public items; a bench binary has no public API"
 )]
 
+use kronika_writer as _;
 use std::path::Path;
 use std::sync::OnceLock;
 
