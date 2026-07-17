@@ -49,7 +49,6 @@ impl EvalContext {
     }
 }
 
-/// No production constructor exists until the incident ceilings are approved.
 pub(crate) struct IncidentConfig {
     node_self_id: String,
     epsilon_us: i64,
@@ -59,15 +58,42 @@ pub(crate) struct IncidentConfig {
     max_episodes: usize,
     max_clusters: usize,
     max_key_bytes: usize,
+    max_total_key_bytes: usize,
     max_lens_evaluations: u64,
     max_findings: u64,
     max_evidence_rows: u64,
 }
 
+impl IncidentConfig {
+    /// Fixed ceilings for collection sizes and work units.
+    ///
+    /// These values do not claim a resident-memory budget.
+    pub(crate) fn production(
+        node_self_id: &str,
+        epsilon_us: i64,
+        max_cluster_span_us: i64,
+        clock_relation: ClockRelation,
+    ) -> Self {
+        Self {
+            node_self_id: node_self_id.to_owned(),
+            epsilon_us,
+            max_cluster_span_us,
+            clock_relation,
+            work_limit: 50_000_000,
+            max_episodes: 20_000,
+            max_clusters: 5_000,
+            max_key_bytes: 262_144,
+            max_total_key_bytes: 4 << 20,
+            max_lens_evaluations: 1_000_000,
+            max_findings: 50_000,
+            max_evidence_rows: 200_000,
+        }
+    }
+}
+
 #[cfg(test)]
 impl IncidentConfig {
-    /// Generous ceilings for tests exercising real data before production
-    /// limits are approved; the node id and clustering knobs are the caller's.
+    /// Relaxed collection and work ceilings for focused engine tests.
     pub(crate) fn for_test(
         node_self_id: &str,
         epsilon_us: i64,
@@ -83,6 +109,7 @@ impl IncidentConfig {
             max_episodes: usize::MAX,
             max_clusters: usize::MAX,
             max_key_bytes: 1 << 20,
+            max_total_key_bytes: usize::MAX,
             max_lens_evaluations: u64::MAX,
             max_findings: u64::MAX,
             max_evidence_rows: u64::MAX,
@@ -119,6 +146,7 @@ pub(crate) enum AnalyzeError {
     ClusterLimit { observed: usize, limit: usize },
     DuplicateLensId(&'static str),
     Key(KeyTooLarge),
+    KeyBudget { observed: usize, limit: usize },
     Cluster(ClusterError),
 }
 
@@ -191,6 +219,24 @@ const fn admit_lens_evaluation(
     Ok(())
 }
 
+fn charge_key_bytes(
+    spent: usize,
+    key: &IncidentKeyV1,
+    limit: usize,
+) -> Result<usize, AnalyzeError> {
+    let observed =
+        spent
+            .checked_add(key.canonical_bytes().len())
+            .ok_or(AnalyzeError::KeyBudget {
+                observed: usize::MAX,
+                limit,
+            })?;
+    if observed > limit {
+        return Err(AnalyzeError::KeyBudget { observed, limit });
+    }
+    Ok(observed)
+}
+
 pub(crate) fn analyze(
     episodes: Vec<EnrichedEpisode>,
     series: &SeriesSet,
@@ -215,6 +261,7 @@ pub(crate) fn analyze(
     let mut incidents = Vec::with_capacity(clustered.clusters.len());
     let mut skipped = Vec::new();
     let mut complete = true;
+    let mut key_bytes = 0_usize;
 
     'clusters: for cluster in clustered.clusters {
         let context = EvalContext {
@@ -274,6 +321,7 @@ pub(crate) fn analyze(
             config.max_key_bytes,
         )
         .map_err(AnalyzeError::Key)?;
+        key_bytes = charge_key_bytes(key_bytes, &key, config.max_total_key_bytes)?;
         incidents.push(Incident {
             key,
             start_us: cluster.start_us,
@@ -412,6 +460,7 @@ mod tests {
             max_episodes: 100,
             max_clusters: 100,
             max_key_bytes: 4_096,
+            max_total_key_bytes: 64 * 1_024,
             max_lens_evaluations: 100,
             max_findings: 100,
             max_evidence_rows: 100,
@@ -434,6 +483,21 @@ mod tests {
         assert!(outcome.incidents.is_empty());
         assert!(outcome.complete);
         assert!(outcome.skipped.is_empty());
+    }
+
+    #[test]
+    fn total_key_bytes_are_bounded_across_incidents() {
+        let mut limits = config(100);
+        limits.max_total_key_bytes = 1;
+        let error = analyze(
+            vec![episode("pg_stat_database", 1, 0, 10)],
+            &SeriesSet::for_test(0),
+            &[],
+            &limits,
+        )
+        .err()
+        .expect("the request-wide key budget is smaller than one key");
+        assert!(matches!(error, AnalyzeError::KeyBudget { limit: 1, .. }));
     }
 
     #[test]

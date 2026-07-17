@@ -17,6 +17,8 @@ pub(crate) fn metric_labels(method: &str, matched_path: Option<&str>) -> (String
         Some("/readyz") => "/readyz",
         Some("/metrics") => "/metrics",
         Some("/v1/version") => "/v1/version",
+        Some("/v1/anomalies") => "/v1/anomalies",
+        Some("/v1/incidents") => "/v1/incidents",
         Some("/v1/sources") => "/v1/sources",
         Some("/v1/sections") => "/v1/sections",
         Some("/v1/segments") => "/v1/segments",
@@ -159,6 +161,13 @@ mod tests {
             path, "/v1/section/{name}",
             "known matched path is preserved"
         );
+    }
+
+    #[test]
+    fn analytic_metric_paths_use_fixed_labels() {
+        for path in ["/v1/anomalies", "/v1/incidents"] {
+            assert_eq!(metric_labels("GET", Some(path)).1, path);
+        }
     }
 
     #[test]

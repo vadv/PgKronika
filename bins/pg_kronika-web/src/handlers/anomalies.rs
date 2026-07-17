@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use kronika_reader::{
     LocalDirSnapshot, LogicalSection, QueryError, diff_section, gauge_section, logical_section,
     section as query_section,
 };
 use kronika_registry::{ColumnClass, SectionClass, registry};
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
 
 use crate::AppState;
 use crate::anomaly::{EpisodeHit, MAX_SCORE_WORK, ScanCounts, ScanParams, rank, scan_section};
@@ -36,7 +36,7 @@ const LIMIT_DEFAULT: usize = 50;
 /// cannot allocate unbounded score profiles.
 const MAX_POSITIONS: i64 = 10_000;
 
-static ANOMALY_REQUESTS: Semaphore = Semaphore::const_new(1);
+const RETRY_AFTER_SECONDS: &str = "1";
 
 /// The error half of a handler result: an HTTP status and a JSON body.
 type ErrorResponse = (StatusCode, Json<Value>);
@@ -51,7 +51,7 @@ struct SectionScan {
 /// Names of every section the detector scans: snapshot and event sections
 /// with at least one scorable (Cumulative or Gauge) column. Dictionaries are
 /// not timelines and charts are derived views of the same raw data.
-fn scannable_sections() -> Vec<&'static str> {
+pub(crate) fn scannable_sections() -> Vec<&'static str> {
     let mut names = std::collections::BTreeSet::new();
     for contract in registry() {
         if contract.deprecated {
@@ -87,6 +87,7 @@ fn counts_to_json(counts: &ScanCounts) -> Value {
             "discontinuity": counts.discontinuity,
         },
         "nodata_points": counts.nodata_points,
+        "episodes_truncated": counts.episodes_truncated,
     })
 }
 
@@ -136,22 +137,55 @@ fn parse_scan_params(
 pub(crate) async fn anomalies(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ErrorResponse> {
-    let _permit = ANOMALY_REQUESTS.acquire().await.map_err(|_closed| {
-        (
+) -> Response {
+    let request = match validate_request(&params) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let Ok(permit) = state.try_acquire_analytic() else {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, RETRY_AFTER_SECONDS)],
             Json(json!({
-                "error": "anomaly_scanner_unavailable",
-                "detail": "the anomaly scanner is unavailable",
+                "error": "analytic_capacity_unavailable",
+                "detail": "the analytic worker is busy; retry shortly",
             })),
         )
-    })?;
-    let source = parse_u64(&params, "source")?;
-    let (scan, limit) = parse_scan_params(&params)?;
-    let (from, to) = (scan.from, scan.to);
-    let (window, step) = (scan.window, scan.step);
+            .into_response();
+    };
 
-    let names: Vec<&'static str> = match params.get("section") {
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        run(&state, request)
+    })
+    .await
+    {
+        Ok(Ok(body)) => body.into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "analytic_worker_failed",
+                "detail": "the analytic worker failed",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+struct AnomalyRequest {
+    source: u64,
+    scan: ScanParams,
+    limit: usize,
+    names: Vec<&'static str>,
+}
+
+fn validate_request(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<AnomalyRequest, ErrorResponse> {
+    let source = parse_u64(params, "source")?;
+    let (scan, limit) = parse_scan_params(params)?;
+    let names = match params.get("section") {
         Some(name) => {
             let logical = logical_section(name)
                 .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.clone())))?;
@@ -159,6 +193,23 @@ pub(crate) async fn anomalies(
         }
         None => scannable_sections(),
     };
+    Ok(AnomalyRequest {
+        source,
+        scan,
+        limit,
+        names,
+    })
+}
+
+fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorResponse> {
+    let AnomalyRequest {
+        source,
+        scan,
+        limit,
+        names,
+    } = request;
+    let (from, to) = (scan.from, scan.to);
+    let (window, step) = (scan.window, scan.step);
 
     let mut snap = state.snapshot.load().as_ref().clone();
     let logicals: Vec<LogicalSection> = names
