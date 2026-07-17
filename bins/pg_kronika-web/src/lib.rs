@@ -42,7 +42,7 @@ mod auth;
 pub(crate) mod handlers;
 #[allow(
     dead_code,
-    reason = "domain core is compiled and unit-tested but not yet reachable from a route"
+    reason = "incident limits and the reader adapter are not wired yet"
 )]
 mod incident;
 mod params;
