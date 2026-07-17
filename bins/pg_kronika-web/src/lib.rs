@@ -45,6 +45,11 @@ pub(crate) mod handlers;
     reason = "incident limits and the reader adapter are not wired yet"
 )]
 mod incident;
+#[allow(
+    dead_code,
+    reason = "the incident input adapter has no HTTP route yet; the endpoint lands in a later step"
+)]
+mod incident_input;
 mod params;
 mod serialize;
 pub(crate) mod startup;

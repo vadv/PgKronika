@@ -8,6 +8,11 @@ use super::evidence::sink::FindingSink;
 use super::model::{EpisodeRefV1, IdentityValue};
 
 pub(crate) struct Series {
+    runs: Vec<SeriesRun>,
+    points: usize,
+}
+
+pub(crate) struct SeriesRun {
     ts: Vec<i64>,
     values: Vec<f64>,
 }
@@ -17,36 +22,68 @@ pub(crate) enum SeriesError {
     LengthMismatch,
     TimestampsNotStrictlyIncreasing,
     NonFiniteValue,
+    PointCountOverflow,
 }
 
 impl Series {
     pub(crate) fn new(ts: Vec<i64>, values: Vec<f64>) -> Result<Self, SeriesError> {
-        if ts.len() != values.len() {
-            return Err(SeriesError::LengthMismatch);
-        }
-        if !ts.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Err(SeriesError::TimestampsNotStrictlyIncreasing);
-        }
-        if !values.iter().all(|value| value.is_finite()) {
-            return Err(SeriesError::NonFiniteValue);
-        }
-        Ok(Self { ts, values })
+        Self::from_runs(vec![(ts, values)])
     }
 
+    pub(crate) fn from_runs(runs: Vec<(Vec<i64>, Vec<f64>)>) -> Result<Self, SeriesError> {
+        let mut built = Vec::with_capacity(runs.len());
+        let mut points = 0_usize;
+        let mut previous_last = None;
+        for (ts, values) in runs {
+            if ts.len() != values.len() {
+                return Err(SeriesError::LengthMismatch);
+            }
+            if !ts.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Err(SeriesError::TimestampsNotStrictlyIncreasing);
+            }
+            if previous_last
+                .zip(ts.first().copied())
+                .is_some_and(|(previous, first)| previous >= first)
+            {
+                return Err(SeriesError::TimestampsNotStrictlyIncreasing);
+            }
+            if !values.iter().all(|value| value.is_finite()) {
+                return Err(SeriesError::NonFiniteValue);
+            }
+            points = points
+                .checked_add(ts.len())
+                .ok_or(SeriesError::PointCountOverflow)?;
+            if !ts.is_empty() {
+                previous_last = ts.last().copied();
+                built.push(SeriesRun { ts, values });
+            }
+        }
+        Ok(Self {
+            runs: built,
+            points,
+        })
+    }
+
+    pub(crate) fn runs(&self) -> &[SeriesRun] {
+        &self.runs
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.points
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.points == 0
+    }
+}
+
+impl SeriesRun {
     pub(crate) fn ts(&self) -> &[i64] {
         &self.ts
     }
 
     pub(crate) fn values(&self) -> &[f64] {
         &self.values
-    }
-
-    pub(crate) const fn len(&self) -> usize {
-        self.ts.len()
-    }
-
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.ts.is_empty()
     }
 }
 
@@ -70,13 +107,38 @@ pub(crate) enum SeriesInsertError {
 }
 
 impl SeriesSet {
-    #[cfg(test)]
-    pub(crate) const fn for_test(point_limit: usize) -> Self {
+    pub(crate) const fn new(point_limit: usize) -> Self {
         Self {
             series: BTreeMap::new(),
             points: 0,
             point_limit,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(point_limit: usize) -> Self {
+        Self::new(point_limit)
+    }
+
+    pub(crate) const fn remaining_points(&self) -> usize {
+        self.point_limit - self.points
+    }
+
+    pub(crate) const fn point_limit(&self) -> usize {
+        self.point_limit
+    }
+
+    pub(crate) fn contains(
+        &self,
+        section: &'static str,
+        column: &'static str,
+        identity: &[IdentityValue],
+    ) -> bool {
+        self.series.contains_key(&SeriesId {
+            section,
+            column,
+            identity: Arc::from(identity),
+        })
     }
 
     pub(crate) fn insert(
@@ -153,8 +215,9 @@ mod tests {
     fn parallel_finite_ascending_arrays_build_a_series() {
         let series = Series::new(vec![1, 2, 3], vec![10.0, 20.0, 30.0]).expect("valid series");
         assert_eq!(series.len(), 3);
-        assert_eq!(series.ts(), &[1, 2, 3]);
-        assert_eq!(series.values(), &[10.0, 20.0, 30.0]);
+        assert_eq!(series.runs().len(), 1);
+        assert_eq!(series.runs()[0].ts(), &[1, 2, 3]);
+        assert_eq!(series.runs()[0].values(), &[10.0, 20.0, 30.0]);
     }
 
     #[test]
@@ -183,6 +246,14 @@ mod tests {
     fn duplicate_timestamps_are_rejected() {
         assert_eq!(
             Series::new(vec![1, 1], vec![1.0, 2.0]).err(),
+            Some(SeriesError::TimestampsNotStrictlyIncreasing)
+        );
+    }
+
+    #[test]
+    fn runs_must_remain_in_timestamp_order() {
+        assert_eq!(
+            Series::from_runs(vec![(vec![3], vec![1.0]), (vec![2], vec![2.0])]).err(),
             Some(SeriesError::TimestampsNotStrictlyIncreasing)
         );
     }
@@ -264,7 +335,8 @@ mod tests {
             Err(SeriesInsertError::Duplicate)
         );
         assert_eq!(
-            set.lookup(&reference("s", "c", 1)).map(Series::values),
+            set.lookup(&reference("s", "c", 1))
+                .map(|series| series.runs()[0].values()),
             Some(&[1.0][..])
         );
     }

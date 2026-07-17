@@ -84,6 +84,7 @@ fn counts_to_json(counts: &ScanCounts) -> Value {
             "cur_too_small": counts.cur_too_small,
             "all_no_data": counts.all_no_data,
             "non_finite": counts.non_finite,
+            "discontinuity": counts.discontinuity,
         },
         "nodata_points": counts.nodata_points,
     })

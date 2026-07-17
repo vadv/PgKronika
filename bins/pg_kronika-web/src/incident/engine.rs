@@ -64,6 +64,32 @@ pub(crate) struct IncidentConfig {
     max_evidence_rows: u64,
 }
 
+#[cfg(test)]
+impl IncidentConfig {
+    /// Generous ceilings for tests exercising real data before production
+    /// limits are approved; the node id and clustering knobs are the caller's.
+    pub(crate) fn for_test(
+        node_self_id: &str,
+        epsilon_us: i64,
+        max_cluster_span_us: i64,
+        clock_relation: ClockRelation,
+    ) -> Self {
+        Self {
+            node_self_id: node_self_id.to_owned(),
+            epsilon_us,
+            max_cluster_span_us,
+            clock_relation,
+            work_limit: u64::MAX,
+            max_episodes: usize::MAX,
+            max_clusters: usize::MAX,
+            max_key_bytes: 1 << 20,
+            max_lens_evaluations: u64::MAX,
+            max_findings: u64::MAX,
+            max_evidence_rows: u64::MAX,
+        }
+    }
+}
+
 pub(crate) struct Incident {
     pub key: IncidentKeyV1,
     pub start_us: i64,

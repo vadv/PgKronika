@@ -28,6 +28,7 @@ mimalloc = { version = "0.1", features = ["override"] }
 
 [dev-dependencies]
 kronika-format = { path = "../../crates/kronika-format" }
+kronika-writer = { path = "../../crates/kronika-writer" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

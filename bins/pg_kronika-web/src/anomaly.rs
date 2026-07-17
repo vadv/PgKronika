@@ -4,7 +4,7 @@
 //! samples. This is a retrospective, non-causal scan.
 
 use kronika_anomaly::{Episode, NotEvaluatedReason, ScoreParams, Scored, episodes, score_window};
-use kronika_reader::{DiffPoint, SeriesDiff, SeriesValues, Value};
+use kronika_reader::{DiffPoint, Reason, SeriesDiff, SeriesValues, Value};
 use kronika_registry::ColumnClass;
 
 /// A score requires at least 20 reference and 3 window points.
@@ -58,6 +58,8 @@ pub(crate) struct ScanCounts {
     pub all_no_data: u64,
     /// Positions rejected on a NaN or infinite input value.
     pub non_finite: u64,
+    /// Positions that cross an explicit timeline break.
+    pub discontinuity: u64,
     /// Diff points carrying no value (reset/gap/first point) or a non-finite
     /// rate, plus gauge rows whose value was NULL, non-numeric, or non-finite.
     pub nodata_points: u64,
@@ -111,6 +113,7 @@ pub(crate) fn positions(params: &ScanParams) -> Vec<i64> {
 fn score_series(
     ts: &[i64],
     values: &[f64],
+    breaks: &[i64],
     scan_positions: &[i64],
     window: i64,
     score: &ScoreParams,
@@ -118,12 +121,32 @@ fn score_series(
 ) -> Vec<(i64, Scored)> {
     scan_positions
         .iter()
-        .map(|&position| {
-            let lo = ts.partition_point(|&t| t < position - window);
+        .enumerate()
+        .map(|(index, &position)| {
+            let window_start = position.checked_sub(window).unwrap_or(i64::MIN);
+            let break_end = breaks.partition_point(|&at| at <= position);
+            let previous_position = index
+                .checked_sub(1)
+                .map_or(window_start, |previous| scan_positions[previous]);
+            let break_start = breaks.partition_point(|&at| at <= previous_position);
+            if break_start < break_end {
+                return (
+                    position,
+                    Scored::NotEvaluated(NotEvaluatedReason::Discontinuity),
+                );
+            }
+
+            let segment_lo = break_end
+                .checked_sub(1)
+                .map_or(0, |last| ts.partition_point(|&t| t <= breaks[last]));
+            let segment_hi = breaks
+                .get(break_end)
+                .map_or(ts.len(), |&next| ts.partition_point(|&t| t < next));
+            let lo = ts.partition_point(|&t| t < window_start).max(segment_lo);
             let hi = ts.partition_point(|&t| t <= position);
             ref_buf.clear();
-            ref_buf.extend_from_slice(&values[..lo]);
-            ref_buf.extend_from_slice(&values[hi..]);
+            ref_buf.extend_from_slice(&values[segment_lo..lo]);
+            ref_buf.extend_from_slice(&values[hi..segment_hi]);
             (position, score_window(&values[lo..hi], ref_buf, score))
         })
         .collect()
@@ -138,6 +161,9 @@ fn tally(profile: &[(i64, Scored)], counts: &mut ScanCounts) {
             Scored::NotEvaluated(NotEvaluatedReason::CurTooSmall) => counts.cur_too_small += 1,
             Scored::NotEvaluated(NotEvaluatedReason::AllNoData) => counts.all_no_data += 1,
             Scored::NotEvaluated(NotEvaluatedReason::NonFinite) => counts.non_finite += 1,
+            Scored::NotEvaluated(NotEvaluatedReason::Discontinuity) => {
+                counts.discontinuity += 1;
+            }
         }
     }
 }
@@ -177,23 +203,32 @@ pub(crate) fn scan_section(
     let mut ts_buf = Vec::new();
     let mut value_buf = Vec::new();
     let mut ref_buf = Vec::new();
+    let mut breaks = Vec::new();
 
     for series in diffs {
         for column in &series.columns {
             ts_buf.clear();
             value_buf.clear();
+            breaks.clear();
             for at in &column.points {
                 match at.point {
                     DiffPoint::Value { rate, .. } if rate.is_finite() => {
                         ts_buf.push(at.ts);
                         value_buf.push(rate);
                     }
-                    _ => counts.nodata_points += 1,
+                    DiffPoint::NoData {
+                        reason: Reason::FirstPoint,
+                    } => counts.nodata_points += 1,
+                    _ => {
+                        counts.nodata_points += 1;
+                        breaks.push(at.ts);
+                    }
                 }
             }
             scan_timeline(
                 &ts_buf,
                 &value_buf,
+                &breaks,
                 &scan_positions,
                 params,
                 &cumulative_score,
@@ -219,6 +254,7 @@ pub(crate) fn scan_section(
             scan_timeline(
                 &ts_buf,
                 &value_buf,
+                &column.breaks,
                 &scan_positions,
                 params,
                 &gauge_score,
@@ -259,6 +295,7 @@ fn score_work(diffs: &[SeriesDiff], gauges: &[SeriesValues], positions: usize) -
 fn scan_timeline(
     ts: &[i64],
     values: &[f64],
+    breaks: &[i64],
     scan_positions: &[i64],
     params: &ScanParams,
     score: &ScoreParams,
@@ -269,7 +306,15 @@ fn scan_timeline(
     hits: &mut Vec<EpisodeHit>,
     hit_limit: usize,
 ) {
-    let profile = score_series(ts, values, scan_positions, params.window, score, ref_buf);
+    let profile = score_series(
+        ts,
+        values,
+        breaks,
+        scan_positions,
+        params.window,
+        score,
+        ref_buf,
+    );
     tally(&profile, counts);
     for episode in episodes(&profile, params.threshold) {
         hits.push(EpisodeHit {
@@ -305,10 +350,10 @@ pub(crate) fn rank(hits: &mut Vec<(&'static str, EpisodeHit)>, limit: usize) {
 
 #[cfg(test)]
 mod tests {
-    use kronika_anomaly::Direction;
+    use kronika_anomaly::{Direction, NotEvaluatedReason, ScoreParams, Scored};
     use kronika_reader::{ColumnValues, SeriesValues, Value};
 
-    use super::{EpisodeHit, ScanCounts, ScanParams, positions, rank, scan_section};
+    use super::{EpisodeHit, ScanCounts, ScanParams, positions, rank, scan_section, score_series};
 
     const SEC: i64 = 1_000_000;
 
@@ -339,6 +384,7 @@ mod tests {
             columns: vec![ColumnValues {
                 name: "g".to_owned(),
                 points,
+                breaks: Vec::new(),
                 skipped,
             }],
         }
@@ -427,6 +473,31 @@ mod tests {
         assert!(hits.is_empty());
         assert_eq!(counts.evaluated, 0);
         assert!(counts.ref_too_small + counts.cur_too_small > 0);
+    }
+
+    #[test]
+    fn a_break_excludes_the_other_runs_from_the_reference() {
+        let ts: Vec<i64> = (0..30).collect();
+        let values: Vec<f64> = (0..30).map(f64::from).collect();
+        let mut reference = Vec::new();
+        let profile = score_series(
+            &ts,
+            &values,
+            &[24],
+            &[25, 28],
+            3,
+            &ScoreParams::new(20, 3, 0.1, 0.05),
+            &mut reference,
+        );
+
+        assert_eq!(
+            profile[0].1,
+            Scored::NotEvaluated(NotEvaluatedReason::Discontinuity)
+        );
+        assert_eq!(
+            profile[1].1,
+            Scored::NotEvaluated(NotEvaluatedReason::RefTooSmall)
+        );
     }
 
     #[test]

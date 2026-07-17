@@ -78,6 +78,8 @@ pub enum NotEvaluatedReason {
     /// A window or reference value is `NaN` or infinity. Scoring it would
     /// silently misclassify corrupt data as a verdict, so it is not scored.
     NonFinite,
+    /// A reset, gap, gate exclusion, or invalid point split the timeline.
+    Discontinuity,
 }
 
 /// Outcome of scoring one window.
