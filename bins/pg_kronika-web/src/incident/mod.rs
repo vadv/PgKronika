@@ -5,5 +5,6 @@
 //! deterministic and unit-tested here without fixtures.
 
 mod cluster;
+mod dispatch;
 mod evidence;
 mod model;
