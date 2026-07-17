@@ -7,4 +7,6 @@
 mod cluster;
 mod dispatch;
 mod evidence;
+mod lens;
 mod model;
+mod series;
