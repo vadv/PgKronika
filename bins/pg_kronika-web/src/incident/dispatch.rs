@@ -1,5 +1,4 @@
-//! Bounded dispatch: which lenses a cluster triggers, and the work budget that
-//! keeps one request from running the catalog unboundedly.
+//! Catalog dispatch and request work limits.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,10 +11,6 @@ pub(crate) struct SectionColumn {
     pub column: &'static str,
 }
 
-/// A shrinking allowance of evaluation work. One request charges points
-/// inspected, lens evaluations and evidence rows against it; once it cannot
-/// cover a charge it latches exhausted and the caller records a skip instead of
-/// silently doing less.
 pub(crate) struct WorkBudget {
     limit: u64,
     remaining: u64,
@@ -31,8 +26,6 @@ impl WorkBudget {
         }
     }
 
-    /// Charge `units`. Returns `false` and latches exhaustion when the budget
-    /// cannot cover the whole charge; nothing partial is spent.
     pub(crate) const fn charge(&mut self, units: u64) -> bool {
         if self.exhausted {
             return false;
@@ -50,11 +43,28 @@ impl WorkBudget {
         self.exhausted
     }
 
-    /// Work actually charged. Stays honest after exhaustion: the charge that
-    /// overflowed consumed nothing, so this never overstates.
     pub(crate) const fn spent(&self) -> u64 {
         self.limit - self.remaining
     }
+
+    pub(crate) const fn limit(&self) -> u64 {
+        self.limit
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitAxis {
+    Work,
+    LensEvaluations,
+    Findings,
+    EvidenceRows,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LimitHit {
+    pub axis: LimitAxis,
+    pub observed: u64,
+    pub limit: u64,
 }
 
 /// Map each logical section to the lenses that read it. Built once from the
@@ -93,9 +103,29 @@ pub(crate) fn candidate_lenses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::incident::evidence::sink::{FindingSink, OutputCounts, OutputLimits};
+    use crate::incident::evidence::{ConfidenceCap, Evidence, FindingDraft, FindingScope, Role};
+    use crate::incident::model::{EpisodeRefV1, IdentityValue};
+    use std::sync::Arc;
 
     fn sc(section: &'static str, column: &'static str) -> SectionColumn {
         SectionColumn { section, column }
+    }
+
+    fn finding(evidence: Vec<Evidence>) -> FindingDraft {
+        let reference = EpisodeRefV1 {
+            logical_section: "s",
+            column: "c",
+            identity: Arc::from(vec![IdentityValue::I64(1)]),
+            start_us: 0,
+            end_us: 1,
+        };
+        FindingDraft::new(
+            Role::Coincident,
+            FindingScope::from_episode(&reference),
+            evidence,
+            None,
+        )
     }
 
     #[test]
@@ -207,5 +237,56 @@ mod tests {
         let index = section_index(&[lens0]);
         let present = BTreeSet::from(["z"]);
         assert!(candidate_lenses(&index, &present).is_empty());
+    }
+
+    #[test]
+    fn sink_applies_finding_and_evidence_limits_before_retaining_output() {
+        let mut findings = Vec::new();
+        let mut budget = WorkBudget::new(10);
+        let mut counts = OutputCounts::new();
+        let mut sink = FindingSink::new(
+            &mut findings,
+            &mut budget,
+            &mut counts,
+            OutputLimits::new(1, 1),
+            "L",
+            ConfidenceCap::Medium,
+        );
+        sink.emit(finding(vec![Evidence::Ratio]))
+            .expect("first finding fits");
+        assert_eq!(
+            sink.emit(finding(vec![])),
+            Err(LimitHit {
+                axis: LimitAxis::Findings,
+                observed: 2,
+                limit: 1,
+            })
+        );
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn failed_evidence_charge_is_all_or_nothing() {
+        let mut findings = Vec::new();
+        let mut budget = WorkBudget::new(10);
+        let mut counts = OutputCounts::new();
+        let mut sink = FindingSink::new(
+            &mut findings,
+            &mut budget,
+            &mut counts,
+            OutputLimits::new(2, 1),
+            "L",
+            ConfidenceCap::Medium,
+        );
+        assert_eq!(
+            sink.emit(finding(vec![Evidence::Ratio, Evidence::Gauge])),
+            Err(LimitHit {
+                axis: LimitAxis::EvidenceRows,
+                observed: 2,
+                limit: 1,
+            })
+        );
+        assert!(findings.is_empty());
+        assert_eq!(budget.spent(), 0);
     }
 }
