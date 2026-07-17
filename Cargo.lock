@@ -1320,7 +1320,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kronika-anomaly"
+name = "kronika-analytics"
 version = "0.0.0"
 
 [[package]]
@@ -1348,10 +1348,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kronika-charts"
-version = "0.0.0"
-
-[[package]]
 name = "kronika-derive"
 version = "0.0.0"
 dependencies = [
@@ -1359,10 +1355,6 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[package]]
-name = "kronika-diff"
-version = "0.0.0"
 
 [[package]]
 name = "kronika-format"
@@ -1381,7 +1373,7 @@ version = "0.0.0"
 dependencies = [
  "arrow-array",
  "criterion",
- "kronika-diff",
+ "kronika-analytics",
  "kronika-format",
  "kronika-registry",
  "kronika-store",
@@ -1442,14 +1434,6 @@ dependencies = [
  "kronika-format",
  "tempfile",
 ]
-
-[[package]]
-name = "kronika-store-http"
-version = "0.0.0"
-
-[[package]]
-name = "kronika-store-s3"
-version = "0.0.0"
 
 [[package]]
 name = "kronika-writer"
@@ -2010,7 +1994,7 @@ dependencies = [
  "base64",
  "criterion",
  "http-body-util",
- "kronika-anomaly",
+ "kronika-analytics",
  "kronika-format",
  "kronika-reader",
  "kronika-registry",

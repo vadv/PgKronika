@@ -352,7 +352,7 @@ mod tests {
         Confidence, ConfidenceCap, Evidence, FindingDraft, FindingScope, Role,
     };
     use crate::incident::model::IdentityValue;
-    use kronika_anomaly::{Direction, Episode, Evaluated};
+    use kronika_analytics::{Direction, Episode, Evaluated};
     use std::sync::Arc;
 
     #[derive(Clone, Copy)]

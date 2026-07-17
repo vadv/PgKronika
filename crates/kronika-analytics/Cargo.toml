@@ -1,6 +1,6 @@
 [package]
-name = "kronika-charts"
-description = "pgKronika internal crate"
+name = "kronika-analytics"
+description = "Source-independent analytics: counter diffs and spike scoring"
 publish = false
 version.workspace = true
 edition.workspace = true
