@@ -1539,7 +1539,7 @@ mod tests {
         );
         assert_eq!(
             episode.episode.peak.dir,
-            kronika_anomaly::Direction::Up,
+            kronika_analytics::Direction::Up,
             "the counter jump is an upward rate anomaly"
         );
         let (start_us, end_us) = (episode.reference.start_us, episode.reference.end_us);

@@ -1,13 +1,13 @@
 //! Series folding: turn a section's snapshot rows into per-series diffs.
 //!
 //! [`diff_section`] groups a page's rows by identity, sorts each series by time,
-//! and folds adjacent pairs through [`kronika_diff::diff_pair`]. It reads no
+//! and folds adjacent pairs through [`kronika_analytics::diff_pair`]. It reads no
 //! registry: the caller passes the identity and cumulative column names it
 //! resolved from the contract.
 
 use std::collections::BTreeMap;
 
-use kronika_diff::{DiffPoint, Reason, Scalar, diff_pair};
+use kronika_analytics::{DiffPoint, Reason, Scalar, diff_pair};
 
 use crate::query::value::{Gap, OutRow, Value};
 
@@ -205,7 +205,7 @@ fn fold_pair(
 mod tests {
     use super::{DiffAt, SeriesDiff, diff_section};
     use crate::query::value::{Gap, OutRow, Value};
-    use kronika_diff::{DiffPoint, Reason, Scalar};
+    use kronika_analytics::{DiffPoint, Reason, Scalar};
 
     const SEC: i64 = 1_000_000;
 
