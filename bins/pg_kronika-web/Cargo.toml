@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-kronika-anomaly = { path = "../../crates/kronika-anomaly" }
+kronika-analytics = { path = "../../crates/kronika-analytics" }
 kronika-reader = { path = "../../crates/kronika-reader" }
 kronika-registry = { path = "../../crates/kronika-registry" }
 axum = "0.8"

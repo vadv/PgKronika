@@ -1,6 +1,6 @@
 //! Fold a timeline of window scores into contiguous anomaly episodes.
 
-use crate::score::{Evaluated, Scored};
+use super::score::{Evaluated, Scored};
 
 /// A contiguous run of above-threshold positions with its peak.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,8 +76,8 @@ pub fn episodes(profile: &[(i64, Scored)], threshold: f64) -> Vec<Episode> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::score::{Direction, Evaluated, NotEvaluatedReason, Scored};
     use super::episodes;
-    use crate::score::{Direction, Evaluated, NotEvaluatedReason, Scored};
 
     /// An `Evaluated` carrying score `m`; the explanation fields are filled
     /// with placeholder numbers consistent with the score's sign.

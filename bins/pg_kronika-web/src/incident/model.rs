@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use kronika_anomaly::Episode;
+use kronika_analytics::Episode;
 
 /// Bump when the canonical byte layout changes.
 const KEY_VERSION: u8 = 1;

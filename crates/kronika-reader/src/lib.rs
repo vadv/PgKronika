@@ -19,7 +19,7 @@ use criterion as _;
 #[cfg(test)]
 use mimalloc as _;
 
-pub use kronika_diff::{DiffPoint, Reason, Scalar};
+pub use kronika_analytics::{DiffPoint, Reason, Scalar};
 pub use kronika_format::DamageRegion;
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
