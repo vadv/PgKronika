@@ -22,6 +22,7 @@ use axum::response::Response;
 use axum::routing::get;
 use kronika_reader::LocalDirSnapshot;
 use metrics_exporter_prometheus::PrometheusHandle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 // The binary target and the `#[tokio::test]` harness need the async runtime; the
 // library's handlers are runtime-agnostic and never name it. The binary also
 // pulls its allocator, tracing, the subscriber, and tower-http; the library
@@ -47,6 +48,7 @@ pub(crate) mod handlers;
 )]
 mod incident;
 mod incident_input;
+mod incident_response;
 mod params;
 mod serialize;
 pub(crate) mod startup;
@@ -76,6 +78,7 @@ pub struct AppState {
     pub refresh_loop_iterations: Arc<AtomicU64>,
     /// Age threshold after which the store is considered stale.
     pub stale_after: Duration,
+    analytic_requests: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -95,6 +98,7 @@ impl AppState {
             last_refresh: Arc::new(AtomicU64::new(now)),
             refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
             stale_after: Duration::from_secs(10),
+            analytic_requests: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -113,7 +117,13 @@ impl AppState {
             last_refresh: Arc::new(AtomicU64::new(last_refresh_secs)),
             refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
             stale_after,
+            analytic_requests: Arc::new(Semaphore::new(1)),
         }
+    }
+
+    /// Reserve the server's single heavy-analysis slot without queuing.
+    pub(crate) fn try_acquire_analytic(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        Arc::clone(&self.analytic_requests).try_acquire_owned()
     }
 }
 
@@ -817,10 +827,10 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is a 404");
     }
 
-    /// Write one segment carrying instance metadata (so an incident key has a
-    /// resolved node id), its string dictionary, and the given archiver rows.
-    fn write_archiver_with_identity(
+    fn write_archiver_with_node(
         dir: &std::path::Path,
+        file: &str,
+        node_self_id: &str,
         rows: &[PgStatArchiver],
         min_ts: i64,
         max_ts: i64,
@@ -841,7 +851,7 @@ mod tests {
         let metadata = InstanceMetadata {
             ts: Ts(min_ts),
             hostname: intern("db-host-7"),
-            node_self_id: intern("node-7"),
+            node_self_id: intern(node_self_id),
             pg_version_num: 170_000,
             kernel_version: intern("test-kernel"),
             pg_system_identifier: Some(7),
@@ -880,11 +890,18 @@ mod tests {
                 source_id: 7,
             },
         );
-        std::fs::write(dir.join("0.pgm"), bytes).expect("write segment");
+        std::fs::write(dir.join(file), bytes).expect("write segment");
     }
 
-    /// Forty per-minute archiver rows; the count climbs by one each minute
-    /// except minutes 20..25, where it climbs by fifty (the spike).
+    fn write_archiver_with_identity(
+        dir: &std::path::Path,
+        rows: &[PgStatArchiver],
+        min_ts: i64,
+        max_ts: i64,
+    ) {
+        write_archiver_with_node(dir, "0.pgm", "node-7", rows, min_ts, max_ts);
+    }
+
     fn archiver_rows(spiking: bool) -> Vec<PgStatArchiver> {
         const MINUTE: i64 = 60 * 1_000_000;
         let mut rows = Vec::new();
@@ -900,15 +917,29 @@ mod tests {
         rows
     }
 
-    // The analyzer holds one process-wide permit, so the spike and calm cases
-    // share one serial test rather than racing for it across parallel tests.
     #[tokio::test]
     async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
         let to = 39 * 60 * 1_000_000;
         let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m");
 
         let spiking = tempfile::tempdir().expect("tempdir");
-        write_archiver_with_identity(spiking.path(), &archiver_rows(true), 0, to);
+        let spike_rows = archiver_rows(true);
+        write_archiver_with_node(
+            spiking.path(),
+            "0.pgm",
+            "node-7",
+            &spike_rows[..21],
+            0,
+            20 * 60 * 1_000_000,
+        );
+        write_archiver_with_node(
+            spiking.path(),
+            "1.pgm",
+            "node-7",
+            &spike_rows[20..],
+            20 * 60 * 1_000_000,
+            to,
+        );
         let (status, body) = serve(spiking.path(), &uri).await;
         assert_eq!(
             status,
@@ -918,6 +949,8 @@ mod tests {
 
         for field in [
             "complete",
+            "clustering_complete",
+            "analysis_status",
             "incidents",
             "coverage_by_section",
             "data_age_seconds",
@@ -927,6 +960,11 @@ mod tests {
         ] {
             assert!(body.get(field).is_some(), "response carries {field}");
         }
+        assert_eq!(body["complete"], false, "the lens catalog is not available");
+        assert_eq!(body["clustering_complete"], true);
+        assert_eq!(body["analysis_status"], "incidents_detected");
+        assert_eq!(body["catalog"]["status"], "not_implemented");
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
         let incidents = body["incidents"].as_array().expect("incidents is an array");
         assert!(
             !incidents.is_empty(),
@@ -957,6 +995,9 @@ mod tests {
             serde_json::json!([]),
             "no anomaly means no incident"
         );
+        assert_eq!(body["analysis_status"], "calm");
+        assert_eq!(body["clustering_complete"], true);
+        assert_eq!(body["complete"], false);
         for field in ["catalog", "data_quality", "skipped", "coverage_by_section"] {
             assert!(
                 body.get(field).is_some(),
@@ -975,10 +1016,142 @@ mod tests {
             "/v1/incidents?source=7&from=0&to=1000&window=1h",
             "/v1/incidents?source=7&from=0&to=9000000000&window=0s",
             "/v1/incidents?source=7&from=0&to=9000000000&threshold=-1",
+            "/v1/incidents?source=7&from=0&to=9000000000&eps_rel=NaN",
+            "/v1/incidents?source=7&from=-9223372036854775808&to=9223372036854775807",
+            "/v1/incidents?source=7&from=0&to=3600000000&max_cluster_span=2h",
+            "/v1/incidents?source=7&from=0&to=9000000000&unknown=1",
+            "/v1/incidents?source=7&source=8&from=0&to=9000000000",
         ] {
             let (status, _body) = serve(dir.path(), uri).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be rejected");
         }
+
+        for uri in [
+            "/v1/incidents?source=7&from=0&to=86400000000&window=1s&step=1s",
+            "/v1/incidents?source=7&from=0&to=90000000000",
+        ] {
+            let (status, _body) = serve(dir.path(), uri).await;
+            assert_eq!(
+                status,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{uri} must hit a hard cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incidents_distinguish_no_data_and_identity_quality() {
+        const MINUTE: i64 = 60 * 1_000_000;
+        let no_data = tempfile::tempdir().expect("tempdir");
+        write_bgwriter_segment(no_data.path(), "0.pgm", 7, 0, MINUTE);
+        let (status, body) = serve(
+            no_data.path(),
+            "/v1/incidents?source=8&from=600000000&to=1200000000",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["analysis_status"], "no_data");
+        assert_eq!(body["complete"], false);
+        assert_eq!(body["data_age_seconds"], serde_json::Value::Null);
+
+        let missing = tempfile::tempdir().expect("tempdir");
+        let to = write_archiver_spike_segment(missing.path());
+        let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m");
+        let (status, body) = serve(missing.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["analysis_status"], "missing_node_identity");
+        assert_eq!(body["complete"], false);
+        assert_eq!(body["incidents"], serde_json::json!([]));
+
+        let conflicting = tempfile::tempdir().expect("tempdir");
+        let rows = archiver_rows(true);
+        write_archiver_with_node(
+            conflicting.path(),
+            "0.pgm",
+            "node-a",
+            &rows[..21],
+            0,
+            20 * MINUTE,
+        );
+        write_archiver_with_node(
+            conflicting.path(),
+            "1.pgm",
+            "node-b",
+            &rows[20..],
+            20 * MINUTE,
+            39 * MINUTE,
+        );
+        let (status, body) = serve(conflicting.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["analysis_status"], "conflicting_node_identity");
+        assert_eq!(body["complete"], false);
+    }
+
+    #[tokio::test]
+    async fn analytic_endpoints_share_fail_fast_admission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_bgwriter_segment(dir.path(), "0.pgm", 7, 0, 10 * 60 * 1_000_000);
+        let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+        let state = AppState::new(snapshot);
+        let _permit = state
+            .try_acquire_analytic()
+            .expect("reserve the shared analytic slot");
+
+        for uri in [
+            "/v1/incidents?source=7&from=0&to=600000000&window=1m&step=1m",
+            "/v1/anomalies?source=7&from=0&to=600000000&window=1m&step=1m",
+        ] {
+            let response = app(state.clone(), None, test_metrics_handle())
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("route request");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("1"),
+                "{uri} advertises a valid retry delay",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incident_read_failure_is_sanitized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let to = 39 * 60 * 1_000_000;
+        write_archiver_with_identity(dir.path(), &archiver_rows(true), 0, to);
+        let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+        let state = AppState::new(snapshot);
+        std::fs::remove_file(dir.path().join("0.pgm")).expect("remove fixture after snapshot");
+        let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m");
+        let response = app(state, None, test_metrics_handle())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route request");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON error");
+        assert_eq!(body["error"], "store_read_failed");
+        let rendered = String::from_utf8_lossy(&bytes);
+        assert!(!rendered.contains("0.pgm"));
+        assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
@@ -1533,11 +1706,16 @@ mod tests {
 
     #[tokio::test]
     async fn auth_enabled_rejects_v1_without_credentials() {
-        assert_eq!(
-            auth_status(Some(AuthConfig::new("u", "p")), "/v1/version", None).await,
-            StatusCode::UNAUTHORIZED,
-            "with auth on, /v1 without a header is 401"
-        );
+        for uri in [
+            "/v1/version",
+            "/v1/incidents?source=7&from=0&to=600000000&window=1m",
+        ] {
+            assert_eq!(
+                auth_status(Some(AuthConfig::new("u", "p")), uri, None).await,
+                StatusCode::UNAUTHORIZED,
+                "with auth on, {uri} without a header is 401",
+            );
+        }
     }
 
     #[tokio::test]

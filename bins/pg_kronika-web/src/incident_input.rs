@@ -9,7 +9,7 @@ use kronika_reader::{
 };
 use kronika_registry::ColumnClass;
 
-use crate::anomaly::{EpisodeHit, ScanParams, scan_section};
+use crate::anomaly::{EpisodeHit, ScanCounts, ScanParams, scan_section};
 use crate::handlers::v1::{DIFF_MAX_ROWS, Gates};
 use crate::incident::{
     EnrichedEpisode, EpisodeRefV1, IdentityValue, Series, SeriesError, SeriesInsertError, SeriesSet,
@@ -37,10 +37,18 @@ pub(crate) struct InputQuality {
     pub invalid_gauge_points: u64,
     /// Equal duplicate samples removed before folding.
     pub duplicate_timestamps: u64,
+    /// Window positions scored by the anomaly kernel.
+    pub evaluated_positions: u64,
+    /// Window positions rejected because the available data was insufficient
+    /// or discontinuous.
+    pub unevaluated_positions: u64,
+    /// Above-threshold episodes omitted by the retained-episode ceiling.
+    pub episodes_truncated: u64,
 }
 
 /// Request ceilings for adapter-owned work and data.
 pub(crate) struct InputLimits {
+    units: usize,
     sections: usize,
     materialized_cells: usize,
     series_points: usize,
@@ -51,11 +59,12 @@ pub(crate) struct InputLimits {
 }
 
 impl InputLimits {
-    /// Provisional ceilings sized to keep one request's adapter-owned state
-    /// near 100 MB of resident memory. The numbers are an estimate pending a
-    /// measured budget (§9), not a proven bound.
-    pub(crate) const fn default_100mb() -> Self {
+    /// Fixed ceilings for collection sizes and work units.
+    ///
+    /// These values do not claim a resident-memory budget.
+    pub(crate) const fn production() -> Self {
         Self {
+            units: 4_096,
             sections: 64,
             materialized_cells: 2_000_000,
             series_points: 500_000,
@@ -65,12 +74,17 @@ impl InputLimits {
             episodes: 20_000,
         }
     }
+
+    pub(crate) const fn position_limit(&self) -> usize {
+        self.positions
+    }
 }
 
 #[cfg(test)]
 impl InputLimits {
     fn for_test() -> Self {
         Self {
+            units: 4_096,
             sections: 64,
             materialized_cells: 1_000_000,
             series_points: 1_000_000,
@@ -91,6 +105,8 @@ pub(crate) enum InputError {
     InvalidScan,
     /// No source unit overlaps the requested period.
     NoData,
+    /// Too many source units overlap the request for bounded coverage output.
+    UnitLimit { observed: usize, limit: usize },
     /// The scan would materialize too many window positions.
     PositionLimit { observed: usize, limit: usize },
     /// Reading or decoding a section failed, or the registry contract was
@@ -177,6 +193,19 @@ pub(crate) fn prepare_input(
         return Err(InputError::PositionLimit {
             observed: position_count,
             limit: limits.positions,
+        });
+    }
+    let overlapping_units = snap
+        .units()
+        .iter()
+        .filter(|unit| {
+            unit.source_id == source && unit.max_ts >= scan.from && unit.min_ts <= scan.to
+        })
+        .count();
+    if overlapping_units > limits.units {
+        return Err(InputError::UnitLimit {
+            observed: overlapping_units,
+            limit: limits.units,
         });
     }
     let input = read_input_pages(snap, source, scan, sections, limits)?;
@@ -385,6 +414,25 @@ impl BuildState {
         }
     }
 
+    const fn tally_scan(&mut self, counts: &ScanCounts) {
+        self.quality.evaluated_positions = self
+            .quality
+            .evaluated_positions
+            .saturating_add(counts.evaluated);
+        self.quality.unevaluated_positions = self
+            .quality
+            .unevaluated_positions
+            .saturating_add(counts.ref_too_small)
+            .saturating_add(counts.cur_too_small)
+            .saturating_add(counts.all_no_data)
+            .saturating_add(counts.non_finite)
+            .saturating_add(counts.discontinuity);
+        self.quality.episodes_truncated = self
+            .quality
+            .episodes_truncated
+            .saturating_add(counts.episodes_truncated);
+    }
+
     fn process(
         &mut self,
         logical: &LogicalSection,
@@ -442,8 +490,9 @@ impl BuildState {
             self.remaining_scan,
             limits.episodes,
         ) {
-            Ok((hits, _counts, work)) => {
+            Ok((hits, counts, work)) => {
                 self.remaining_scan -= work;
+                self.tally_scan(&counts);
                 hits
             }
             Err(limit) => {
@@ -468,7 +517,10 @@ impl BuildState {
         ) {
             Ok(section_episodes) => {
                 self.episodes.extend(section_episodes);
-                rank_episodes(&mut self.episodes, limits.episodes);
+                self.quality.episodes_truncated = self
+                    .quality
+                    .episodes_truncated
+                    .saturating_add(rank_episodes(&mut self.episodes, limits.episodes));
             }
             Err(InputError::SeriesLimit { observed, limit }) => {
                 self.skipped.push(SectionSkip {
@@ -482,7 +534,7 @@ impl BuildState {
     }
 }
 
-fn scan_position_count(scan: &ScanParams) -> Option<usize> {
+pub(crate) fn scan_position_count(scan: &ScanParams) -> Option<usize> {
     if scan.from >= scan.to
         || scan.window <= 0
         || scan.step <= 0
@@ -697,7 +749,8 @@ fn tally_quality(diffs: &[SeriesDiff], gauges: &[SeriesValues], quality: &mut In
     }
 }
 
-fn rank_episodes(episodes: &mut Vec<EnrichedEpisode>, limit: usize) {
+fn rank_episodes(episodes: &mut Vec<EnrichedEpisode>, limit: usize) -> u64 {
+    let removed = episodes.len().saturating_sub(limit) as u64;
     episodes.sort_by(|left, right| {
         right
             .episode
@@ -708,6 +761,7 @@ fn rank_episodes(episodes: &mut Vec<EnrichedEpisode>, limit: usize) {
             .then_with(|| left.reference.cmp(&right.reference))
     });
     episodes.truncate(limit);
+    removed
 }
 
 /// Turn one section's scan hits and scanned series into engine input.
@@ -1633,5 +1687,46 @@ mod tests {
             }]
         );
         assert!(prepared.episodes.is_empty());
+    }
+
+    #[test]
+    fn overlapping_units_are_admitted_before_section_reads() {
+        use kronika_registry::Ts;
+        use kronika_registry::pg_stat_archiver::PgStatArchiver;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rows = [PgStatArchiver {
+            ts: Ts(0),
+            archived_count: 1,
+            last_archived_wal: None,
+            last_archived_time: None,
+            failed_count: 0,
+            last_failed_wal: None,
+            last_failed_time: None,
+            stats_reset: None,
+        }];
+        write_archiver_segment(&dir.path().join("0.pgm"), &rows, 0, MINUTE);
+        let mut snap = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+        let mut limits = InputLimits::for_test();
+        limits.units = 0;
+
+        let scan = ScanParams {
+            from: 0,
+            to: MINUTE,
+            window: MINUTE,
+            step: MINUTE,
+            threshold: 3.5,
+            eps_rel: 0.05,
+        };
+        let error = prepare_input(&mut snap, 7, &scan, &["pg_stat_archiver"], &limits)
+            .err()
+            .expect("unit admission rejects before metadata is required");
+        assert!(matches!(
+            error,
+            InputError::UnitLimit {
+                observed: 1,
+                limit: 0,
+            }
+        ));
     }
 }

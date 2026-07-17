@@ -33,6 +33,7 @@ use kronika_anomaly as _;
 use kronika_reader as _;
 use metrics as _;
 use rust_embed as _;
+use serde as _;
 use serde_json as _;
 use subtle as _;
 use tower_http as _;
