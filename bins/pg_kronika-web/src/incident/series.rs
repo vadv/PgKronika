@@ -70,13 +70,17 @@ pub(crate) enum SeriesInsertError {
 }
 
 impl SeriesSet {
-    #[cfg(test)]
-    pub(crate) const fn for_test(point_limit: usize) -> Self {
+    pub(crate) const fn new(point_limit: usize) -> Self {
         Self {
             series: BTreeMap::new(),
             points: 0,
             point_limit,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(point_limit: usize) -> Self {
+        Self::new(point_limit)
     }
 
     pub(crate) fn insert(
