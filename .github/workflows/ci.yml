@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # CI cargo jobs build for host gnu; .cargo/config pins musl for release
+  # binaries, but runners have no musl std, so tests/lint can't find core.
+  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
 
 jobs:
   lint:
