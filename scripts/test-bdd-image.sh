@@ -491,6 +491,25 @@ test_github_actions_bdd_uses_fast_runtime_default() {
     || fail "GitHub Actions must use the BDD image helper for runtime builds"
 }
 
+test_keys_json_carries_schema_and_full_hashes() {
+  local json deps image
+  json=$(BDD_PLATFORM=linux/amd64 "$SCRIPT" keys-json)
+  deps=$("$SCRIPT" deps-key)
+  image=$("$SCRIPT" image-key)
+  printf '%s' "$json" | grep -F "\"key_schema\":1" >/dev/null \
+    || fail "keys-json must carry the key schema version"
+  printf '%s' "$json" | grep -F "\"deps_key\":\"$deps\"" >/dev/null \
+    || fail "keys-json must carry the full deps hash, not the short tag"
+  printf '%s' "$json" | grep -F "\"image_key\":\"$image\"" >/dev/null \
+    || fail "keys-json must carry the full image hash, not the short tag"
+}
+
+test_explain_key_rejects_unknown_target() {
+  if "$SCRIPT" explain-key bogus 2>/dev/null; then
+    fail "explain-key must reject an unknown target"
+  fi
+}
+
 for test in \
   test_local_exact_builder_skips_pull_and_build \
   test_exact_hit_pulls_and_does_not_build \
@@ -516,7 +535,9 @@ for test in \
   test_rust_source_changes_runtime_but_not_deps_or_builder \
   test_dependency_manifest_changes_deps_key \
   test_runtime_key_changes_for_feature_inputs \
-  test_github_actions_bdd_uses_fast_runtime_default
+  test_github_actions_bdd_uses_fast_runtime_default \
+  test_keys_json_carries_schema_and_full_hashes \
+  test_explain_key_rejects_unknown_target
 do
   "$test"
 done

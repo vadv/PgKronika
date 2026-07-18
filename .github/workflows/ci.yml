@@ -91,6 +91,16 @@ jobs:
             echo "image=ghcr.io/${repo}/pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}"
             echo "can_push=${BDD_IMAGE_CAN_PUSH}"
           } >> "$GITHUB_OUTPUT"
+      - name: Report cache keys
+        run: |
+          {
+            echo '## BDD cache keys'
+            echo 'The image tag carries only the first 16 hex; the full hashes and'
+            echo 'key schema below are the authoritative cache identity.'
+            echo '```json'
+            ./scripts/bdd-image.sh keys-json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   bdd-matrix:
     name: bdd matrix

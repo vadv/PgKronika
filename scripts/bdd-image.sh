@@ -4,6 +4,11 @@ set -euo pipefail
 NIX_BASE_IMAGE=${BDD_NIX_BASE_IMAGE:-docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894}
 DOCKER=${BDD_DOCKER:-docker}
 
+# Cache key schema version. The image tag carries only the first 16 hex of a
+# key, so the schema version and full hashes must travel in metadata; bump this
+# when the set of key inputs changes so a stale short tag is never reused.
+KEY_SCHEMA=1
+
 BDD_DEPS_PATHS=(
   Dockerfile.bdd-builder
   flake.nix
@@ -41,6 +46,11 @@ Usage: scripts/bdd-image.sh <command>
 
 Commands:
   deps-key       Print the dependency key for the BDD builder image.
+  keys-json      Print schema, platform, full deps/image hashes, and inputs as JSON.
+  explain-key <deps|image>
+                 Print the full hash and the input files behind a key.
+  assert-source-only-plan
+                 Fail if a dry-run of .#image plans PostgreSQL/extension builds.
   deps-paths     Print files included in the BDD builder dependency key.
   builder-paths  Print repository files used to seed the BDD builder context.
   builder-context-tar
@@ -479,10 +489,81 @@ run_runtime() {
   docker_cmd run "${args[@]}" "$image" "$@"
 }
 
+# Render stdin, one item per line, as a JSON string array.
+json_lines_array() {
+  local first=1 line
+  printf '['
+  while IFS= read -r line; do
+    line=${line//\\/\\\\}
+    line=${line//\"/\\\"}
+    if [ "$first" -eq 1 ]; then first=0; else printf ','; fi
+    printf '"%s"' "$line"
+  done
+  printf ']'
+}
+
+# Full, machine-readable key metadata: schema, platform, full hashes, and the
+# exact input file lists. The short tag is only a locator; this is the key.
+keys_json() {
+  printf '{"key_schema":%s,"platform":"%s","deps_key":"%s","image_key":"%s","deps_paths":' \
+    "$KEY_SCHEMA" "$(platform_slug)" "$(deps_key)" "$(image_key)"
+  print_git_paths "${BDD_DEPS_PATHS[@]}" | json_lines_array
+  printf ',"runtime_paths":'
+  print_git_paths "${BDD_RUNTIME_KEY_PATHS[@]}" | json_lines_array
+  printf '}\n'
+}
+
+# Print the inputs and full hash behind one key, for diagnosing a cache miss.
+explain_key() {
+  case "${1:-}" in
+    deps)
+      printf 'schema=%s key=%s\n' "$KEY_SCHEMA" "$(deps_key)"
+      print_git_paths "${BDD_DEPS_PATHS[@]}"
+      ;;
+    image)
+      printf 'schema=%s key=%s\n' "$KEY_SCHEMA" "$(image_key)"
+      print_git_paths "${BDD_RUNTIME_KEY_PATHS[@]}"
+      ;;
+    *)
+      echo "explain-key: expected 'deps' or 'image', got '${1:-}'" >&2
+      return 2
+      ;;
+  esac
+}
+
+# Fail if a dry-run of the final image plans any PostgreSQL or extension build.
+# Run inside the warmed builder store: with the correct base only the app and
+# layer assembly remain, so a PostgreSQL derivation in the plan is a cache bug.
+assert_source_only_plan() {
+  local plan
+  if ! plan=$(nix build --dry-run .#image 2>&1); then
+    printf '%s\n' "$plan" >&2
+    echo "assert-source-only-plan: nix dry-run failed" >&2
+    return 1
+  fi
+  if printf '%s\n' "$plan" \
+    | grep -qiE 'postgresql-and-plugins|pg_store_plans|postgresql_1[5-8]'; then
+    printf '%s\n' "$plan" >&2
+    echo "assert-source-only-plan: FAIL — source-only build plans PostgreSQL/extension derivations" >&2
+    return 1
+  fi
+  echo "assert-source-only-plan: OK — no PostgreSQL/extension derivation planned"
+}
+
 cmd=${1:-}
 case "$cmd" in
   deps-key)
     deps_key
+    ;;
+  keys-json)
+    keys_json
+    ;;
+  explain-key)
+    shift
+    explain_key "${1:-}"
+    ;;
+  assert-source-only-plan)
+    assert_source_only_plan
     ;;
   deps-paths)
     print_git_paths "${BDD_DEPS_PATHS[@]}"
