@@ -429,8 +429,10 @@ verify_dependency_image() {
 verify_pg_base() {
   local ref=$1 expected=$2
   docker_cmd run --rm --entrypoint /bin/sh "$ref" -ceu '
-    test "$(cat /opt/pgkronika/pg/schema)" = "$1"
-    test "$(cat /opt/pgkronika/pg/dependency-key)" = "$2"
+    IFS= read -r schema < /opt/pgkronika/pg/schema
+    IFS= read -r dependency_key < /opt/pgkronika/pg/dependency-key
+    test "$schema" = "$1"
+    test "$dependency_key" = "$2"
     test -s /opt/pgkronika/pg/closure.json
     for major in 15 16 17 18; do test -x "/opt/pgkronika/pg/$major/postgres"; done
   ' sh "$KEY_SCHEMA" "$expected"

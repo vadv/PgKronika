@@ -178,6 +178,14 @@ test_nix_build_declares_musl_compiler() {
   assert_contains "$file" 'CC_x86_64_unknown_linux_musl ='
 }
 
+test_pg_base_verification_needs_no_coreutils() {
+  local body="$TEST_TMP/verify-pg-base"
+  sed -n '/^verify_pg_base() {/,/^}/p' "$SCRIPT" > "$body"
+  assert_contains "$body" 'IFS= read -r schema < /opt/pgkronika/pg/schema'
+  assert_contains "$body" 'IFS= read -r dependency_key < /opt/pgkronika/pg/dependency-key'
+  assert_not_contains "$body" 'cat /opt/pgkronika/pg/'
+}
+
 test_source_only_plan_gate() {
   local clean="$TEST_TMP/clean-plan" bad="$TEST_TMP/bad-plan" token
   printf 'these derivations will be built: bdd-app-layer pgkronika-bins\n' > "$clean"
@@ -333,6 +341,7 @@ for test in \
   test_dependency_context_uses_exact_dummy_topology \
   test_pg_matrix_uses_exact_with_packages_closures \
   test_nix_build_declares_musl_compiler \
+  test_pg_base_verification_needs_no_coreutils \
   test_source_only_plan_gate \
   test_exact_dependency_hit_never_builds_or_mutates_branch_tags \
   test_public_consumer_fails_closed_without_dependency \
