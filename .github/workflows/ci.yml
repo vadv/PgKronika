@@ -175,13 +175,11 @@ jobs:
             echo "pg_published=$pg_published"
           } >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
-        if: steps.publish.outputs.dependency_published == 'true'
         with:
           subject-name: ${{ steps.publish.outputs.dependency_subject }}
           subject-digest: ${{ steps.publish.outputs.dependency_digest }}
           push-to-registry: true
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
-        if: steps.publish.outputs.pg_published == 'true'
         with:
           subject-name: ${{ steps.publish.outputs.pg_subject }}
           subject-digest: ${{ steps.publish.outputs.pg_digest }}
@@ -252,10 +250,15 @@ jobs:
           BDD_RUNTIME_IMAGE: ${{ steps.refs.outputs.runtime_image }}
         run: |
           if digest_ref=$(./scripts/bdd-image.sh resolve-ref "$BDD_RUNTIME_IMAGE"); then
-            gh attestation verify "oci://$digest_ref" --repo "$GITHUB_REPOSITORY"
-            echo "hit=true" >> "$GITHUB_OUTPUT"
-            echo "digest_ref=$digest_ref" >> "$GITHUB_OUTPUT"
-            echo '- exact runtime hit: `true`' >> "$GITHUB_STEP_SUMMARY"
+            if gh attestation verify "oci://$digest_ref" --repo "$GITHUB_REPOSITORY"; then
+              echo "hit=true" >> "$GITHUB_OUTPUT"
+              echo "digest_ref=$digest_ref" >> "$GITHUB_OUTPUT"
+              echo '- exact runtime hit: `true`' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning title=BDD_RUNTIME_UNATTESTED::Exact runtime exists without valid repository provenance; rebuilding without consuming it."
+              echo "hit=false" >> "$GITHUB_OUTPUT"
+              echo '- exact runtime hit: `false` (attestation missing or invalid)' >> "$GITHUB_STEP_SUMMARY"
+            fi
           else
             echo "hit=false" >> "$GITHUB_OUTPUT"
             echo '- exact runtime hit: `false`' >> "$GITHUB_STEP_SUMMARY"
@@ -308,7 +311,7 @@ jobs:
   bdd-final-publish:
     name: bdd trusted runtime publish
     needs: [bdd-meta, bdd-matrix]
-    if: (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.bdd-matrix.outputs.final_hit != 'true'
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && needs.bdd-matrix.outputs.final_hit != 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: bdd-final-${{ needs.bdd-matrix.outputs.app_key }}
@@ -352,7 +355,6 @@ jobs:
             echo "published=$published"
           } >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
-        if: steps.publish.outputs.published == 'true'
         with:
           subject-name: ${{ steps.publish.outputs.subject }}
           subject-digest: ${{ steps.publish.outputs.digest }}

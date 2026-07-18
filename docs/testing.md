@@ -26,7 +26,8 @@ cargo run -p xtask -- check-deps
 Toolchain берётся из [`rust-toolchain.toml`](../rust-toolchain.toml). Release и
 CI Rust builds используют `x86_64-unknown-linux-musl`; нужен `musl-gcc`. Для
 BDD нужны Docker daemon и Buildx. Nix работает внутри immutable dependency
-image и на хосте не требуется.
+image и на хосте не требуется; Nix derivations получают musl compiler из
+pinned `nixpkgs`, а не из пакетов GitHub runner.
 
 ## Локальный BDD
 
@@ -108,7 +109,8 @@ build. Hit сразу переходит к pull и PG15–18 matrix.
 - Dependency и PG base публикуются single-flight только trusted push или
   maintainer `workflow_dispatch`. В PR #77 push исходной ветки является
   bootstrap path; PR job остаётся read-only и при гонке сообщает typed miss.
-- Final runtime публикуется только после успешной matrix в trusted event.
+- Final runtime публикуется только после успешной matrix в trusted push или
+  maintainer dispatch; PR job никогда не получает write credentials.
 - Images имеют full keys, resolved digests, OCI source/revision labels и build
   provenance attestations. После publish workflow проверяет anonymous manifest
   access.

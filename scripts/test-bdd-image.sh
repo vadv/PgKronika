@@ -156,6 +156,13 @@ test_pg_matrix_uses_exact_with_packages_closures() {
   assert_not_contains "$ROOT/Dockerfile.bdd-builder" '.#postgresql_15 '
 }
 
+test_nix_build_declares_musl_compiler() {
+  local file="$ROOT/flake.nix"
+  assert_contains "$file" 'nativeBuildInputs = [ pkgs.pkgsMusl.stdenv.cc ];'
+  assert_contains "$file" 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER ='
+  assert_contains "$file" 'CC_x86_64_unknown_linux_musl ='
+}
+
 test_source_only_plan_gate() {
   local clean="$TEST_TMP/clean-plan" bad="$TEST_TMP/bad-plan" token
   printf 'these derivations will be built: bdd-app-layer pgkronika-bins\n' > "$clean"
@@ -296,6 +303,8 @@ test_workflow_enforces_trust_and_short_circuit() {
   assert_contains "$ROOT/rust-toolchain.toml" 'targets = ["x86_64-unknown-linux-musl"]'
   assert_contains "$workflow" 'branches: [main, feat/incident-first-slice]'
   assert_contains "$workflow" 'BDD_DEPENDENCY_MISSING'
+  assert_contains "$workflow" 'BDD_RUNTIME_UNATTESTED'
+  assert_contains "$workflow" "if: (github.event_name == 'workflow_dispatch' || github.event_name == 'push')"
   assert_not_contains "$workflow" 'builder_branch_cache'
   assert_not_contains "$workflow" 'branch-main'
 }
@@ -307,6 +316,7 @@ for test in \
   test_target_topology_changes_dependency_key_without_hashing_body \
   test_dependency_context_uses_exact_dummy_topology \
   test_pg_matrix_uses_exact_with_packages_closures \
+  test_nix_build_declares_musl_compiler \
   test_source_only_plan_gate \
   test_exact_dependency_hit_never_builds_or_mutates_branch_tags \
   test_public_consumer_fails_closed_without_dependency \

@@ -110,6 +110,10 @@
             ];
           };
           strictDeps = true;
+          nativeBuildInputs = [ pkgs.pkgsMusl.stdenv.cc ];
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER =
+            "${pkgs.pkgsMusl.stdenv.cc}/bin/cc";
+          CC_x86_64_unknown_linux_musl = "${pkgs.pkgsMusl.stdenv.cc}/bin/cc";
           # Limit the image build to the BDD runner and the collector.
           # `-p` replaces crane's default flags, so keep `--locked` here.
           cargoExtraArgs = "--locked -p kronika-bdd -p pg_kronika-collector";
