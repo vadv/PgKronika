@@ -12,10 +12,14 @@ RUN find /work -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 # changes get a new builder tag; source-only changes can reuse the old one.
 COPY . .
 
+# Prebuild everything `.#image` consumes except the source binary: the cargo
+# dependency artifacts and every PostgreSQL-with-pg_store_plans build. The image
+# build then only compiles the workspace crates and assembles layers.
 RUN nix build \
     .#cargoArtifacts \
-    .#postgresql_15 \
-    .#postgresql_16 \
-    .#postgresql_17 \
+    .#postgresql_15_plans \
+    .#postgresql_16_plans \
+    .#postgresql_17_plans \
+    .#postgresql_18_plans \
     --out-link /tmp/bdd-deps \
   && rm -f /tmp/bdd-deps

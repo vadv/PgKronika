@@ -185,6 +185,15 @@
         packages = {
           default = bins;
           inherit bins cargoArtifacts image;
+          # Exposed so the BDD builder image can prebuild the exact PostgreSQL
+          # builds (with pg_store_plans) that `.#image` consumes, instead of the
+          # bare majors — otherwise the image build recompiles them every run.
+          inherit
+            postgresql_15_plans
+            postgresql_16_plans
+            postgresql_17_plans
+            postgresql_18_plans
+            ;
         } // pgMatrix;
 
         devShells.default = craneLib.devShell {
