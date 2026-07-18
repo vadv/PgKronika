@@ -12,7 +12,8 @@ use kronika_registry::ColumnClass;
 use crate::anomaly::{EpisodeHit, ScanCounts, ScanParams, scan_section};
 use crate::handlers::v1::{DIFF_MAX_ROWS, Gates};
 use crate::incident::{
-    EnrichedEpisode, EpisodeRefV1, IdentityValue, Series, SeriesError, SeriesInsertError, SeriesSet,
+    EnrichedEpisode, EpisodeRefV1, IdentityValue, Series, SeriesError, SeriesInsertError,
+    SeriesSet, TypedInputs,
 };
 
 /// Data exclusions recorded while building engine input.
@@ -172,6 +173,7 @@ pub(crate) struct PreparedInput {
     pub node_self_id: String,
     pub episodes: Vec<EnrichedEpisode>,
     pub series: SeriesSet,
+    pub typed: TypedInputs,
     pub coverage_by_section: BTreeMap<&'static str, Vec<Gap>>,
     pub quality: InputQuality,
     pub skipped: Vec<SectionSkip>,
@@ -238,6 +240,7 @@ pub(crate) fn prepare_input(
         node_self_id,
         episodes: state.episodes,
         series: state.series,
+        typed: state.typed,
         coverage_by_section: state.coverage_by_section,
         quality: state.quality,
         skipped: state.skipped,
@@ -390,6 +393,7 @@ fn materialization_skip(name: &str, limit: usize) -> Result<SectionSkip, InputEr
 struct BuildState {
     episodes: Vec<EnrichedEpisode>,
     series: SeriesSet,
+    typed: TypedInputs,
     coverage_by_section: BTreeMap<&'static str, Vec<Gap>>,
     quality: InputQuality,
     skipped: Vec<SectionSkip>,
@@ -406,6 +410,7 @@ impl BuildState {
         Self {
             episodes: Vec::new(),
             series: SeriesSet::new(limits.series_points),
+            typed: TypedInputs::new(),
             coverage_by_section: BTreeMap::new(),
             quality: InputQuality::default(),
             skipped,
@@ -482,6 +487,7 @@ impl BuildState {
         gates.apply(logical, &mut diffs);
         let gauge_series = gauge_section(&identity, &gauges, &page.rows);
         tally_quality(&diffs, &gauge_series, &mut self.quality);
+        self.retain_typed(logical.name, &cumulative, &gauges, &diffs, &gauge_series);
 
         let scanned = match scan_section(
             &diffs,
@@ -531,6 +537,46 @@ impl BuildState {
             Err(err) => return Err(err),
         }
         Ok(())
+    }
+
+    /// Retain the typed diffs and gauges the section already folded, keyed for
+    /// lens lookup. Non-canonical identities are skipped; their series carry no
+    /// episode either, so a lens has nothing to join.
+    fn retain_typed(
+        &mut self,
+        section: &'static str,
+        cumulative: &[&'static str],
+        gauges: &[&'static str],
+        diffs: &[SeriesDiff],
+        gauge_series: &[SeriesValues],
+    ) {
+        for series in diffs {
+            let Some(identity) = accept_identity(&series.key) else {
+                continue;
+            };
+            for (&name, column) in cumulative.iter().zip(&series.columns) {
+                let points = column
+                    .points
+                    .iter()
+                    .map(|point| (point.ts, point.point))
+                    .collect();
+                self.typed
+                    .insert_counter(section, name, std::sync::Arc::clone(&identity), points);
+            }
+        }
+        for series in gauge_series {
+            let Some(identity) = accept_identity(&series.key) else {
+                continue;
+            };
+            for (&name, column) in gauges.iter().zip(&series.columns) {
+                self.typed.insert_gauge(
+                    section,
+                    name,
+                    std::sync::Arc::clone(&identity),
+                    column.points.clone(),
+                );
+            }
+        }
     }
 }
 
@@ -827,6 +873,23 @@ fn ingest_section(
         insert_series(series, logical.name, column, identity, built)?;
     }
     Ok(episodes)
+}
+
+/// Convert a series key to a canonical identity without counting, for typed
+/// retention. Mirrors [`canonical_identity`]'s accepted kinds; a rejected kind
+/// drops the series, which is already excluded from episodes.
+fn accept_identity(key: &[Value]) -> Option<std::sync::Arc<[IdentityValue]>> {
+    let mut out = Vec::with_capacity(key.len());
+    for value in key {
+        out.push(match value {
+            Value::I64(v) => IdentityValue::I64(*v),
+            Value::U64(v) => IdentityValue::U64(*v),
+            Value::Bool(v) => IdentityValue::Bool(*v),
+            Value::Str(v) => IdentityValue::Text(v.clone()),
+            _ => return None,
+        });
+    }
+    Some(std::sync::Arc::from(out))
 }
 
 /// Convert an identity row to canonical scalars, or count the drop.
@@ -1550,8 +1613,14 @@ mod tests {
             3_600 * MINUTE,
             ClockRelation::Unknown,
         );
-        let outcome = analyze(prepared.episodes, &prepared.series, &[], &config)
-            .expect("engine analyzes prepared input");
+        let outcome = analyze(
+            prepared.episodes,
+            &prepared.series,
+            &prepared.typed,
+            &[],
+            &config,
+        )
+        .expect("engine analyzes prepared input");
 
         assert_eq!(
             outcome.incidents.len(),
@@ -1624,7 +1693,14 @@ mod tests {
             3_600 * MINUTE,
             ClockRelation::Unknown,
         );
-        let outcome = analyze(prepared.episodes, &prepared.series, &[], &config).expect("analyze");
+        let outcome = analyze(
+            prepared.episodes,
+            &prepared.series,
+            &prepared.typed,
+            &[],
+            &config,
+        )
+        .expect("analyze");
         assert!(
             outcome.incidents.is_empty(),
             "a steady counter produces no anomaly and no incident"

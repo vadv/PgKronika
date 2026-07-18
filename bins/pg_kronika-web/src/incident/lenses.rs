@@ -154,16 +154,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-CACHE-010",
-        missing: &[
-            Missing::CounterDeltas,
-            Missing::PairedIntervals,
-            Missing::EntityJoin,
-            Missing::SourcePeriod,
-            Missing::InputCoverage,
-        ],
-    },
-    DormantLens {
         lens_id: "PG-IO-011",
         missing: &[
             Missing::CounterDeltas,
@@ -411,7 +401,7 @@ const _: () = assert!(
 mod tests {
     use super::*;
 
-    const EXPECTED_LENSES: [&str; 28] = [
+    const EXPECTED_LENSES: [&str; 27] = [
         "PG-QRY-001",
         "PG-PLAN-002",
         "PG-TEMP-003",
@@ -421,7 +411,6 @@ mod tests {
         "PG-HOT-007",
         "PG-CHKPT-008",
         "PG-WAL-009",
-        "PG-CACHE-010",
         "PG-IO-011",
         "PG-LOCK-012",
         "PG-HORIZON-013",

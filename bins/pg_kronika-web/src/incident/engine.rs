@@ -13,6 +13,7 @@ use super::evidence::sink::{FindingSink, OutputCounts, OutputLimits};
 use super::lens::Lens;
 use super::model::{EnrichedEpisode, EpisodeRefV1, IncidentKeyV1, KeyTooLarge};
 use super::series::SeriesSet;
+use super::typed::TypedInputs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClockRelation {
@@ -240,6 +241,7 @@ fn charge_key_bytes(
 pub(crate) fn analyze(
     episodes: Vec<EnrichedEpisode>,
     series: &SeriesSet,
+    typed: &TypedInputs,
     lenses: &[&dyn Lens],
     config: &IncidentConfig,
 ) -> Result<EngineOutcome, AnalyzeError> {
@@ -299,7 +301,7 @@ pub(crate) fn analyze(
                 lens.id(),
                 lens.confidence_cap(),
             );
-            let evaluation = lens.evaluate(&cluster, series, &context, &mut sink);
+            let evaluation = lens.evaluate(&cluster, series, typed, &context, &mut sink);
             let limit = evaluation.err().or_else(|| sink.limit_hit());
             if let Some(limit) = limit {
                 skipped.push(EngineSkip {
@@ -397,6 +399,7 @@ mod tests {
             &self,
             cluster: &Cluster,
             _series: &SeriesSet,
+            _typed: &TypedInputs,
             context: &EvalContext,
             sink: &mut FindingSink<'_>,
         ) -> Result<(), LimitHit> {
@@ -479,7 +482,14 @@ mod tests {
 
     #[test]
     fn no_episodes_yield_no_incidents() {
-        let outcome = analyze(vec![], &SeriesSet::for_test(0), &[], &config(100)).expect("valid");
+        let outcome = analyze(
+            vec![],
+            &SeriesSet::for_test(0),
+            &TypedInputs::new(),
+            &[],
+            &config(100),
+        )
+        .expect("valid");
         assert!(outcome.incidents.is_empty());
         assert!(outcome.complete);
         assert!(outcome.skipped.is_empty());
@@ -492,6 +502,7 @@ mod tests {
         let error = analyze(
             vec![episode("pg_stat_database", 1, 0, 10)],
             &SeriesSet::for_test(0),
+            &TypedInputs::new(),
             &[],
             &limits,
         )
@@ -506,6 +517,7 @@ mod tests {
         let outcome = analyze(
             vec![episode("pg_locks", 1, 0, 10)],
             &SeriesSet::for_test(0),
+            &TypedInputs::new(),
             &[&lens],
             &config(100),
         )
@@ -519,6 +531,7 @@ mod tests {
         let outcome = analyze(
             vec![episode("pg_stat_database", 1, 0, 10)],
             &SeriesSet::for_test(0),
+            &TypedInputs::new(),
             &[&lens],
             &config(100),
         )
@@ -545,6 +558,7 @@ mod tests {
                 episode("pg_locks", 2, 500, 510),
             ],
             &SeriesSet::for_test(0),
+            &TypedInputs::new(),
             &[&lens],
             &config(100),
         )
@@ -604,6 +618,7 @@ mod tests {
         let outcome = analyze(
             vec![episode("pg_stat_database", 1, 0, 10)],
             &SeriesSet::for_test(0),
+            &TypedInputs::new(),
             &[&lens],
             &config(100),
         )
@@ -614,13 +629,19 @@ mod tests {
     #[test]
     fn key_is_independent_of_episode_order() {
         let run = |episodes| {
-            analyze(episodes, &SeriesSet::for_test(0), &[], &config(100))
-                .expect("valid")
-                .incidents
-                .remove(0)
-                .key
-                .canonical_bytes()
-                .to_vec()
+            analyze(
+                episodes,
+                &SeriesSet::for_test(0),
+                &TypedInputs::new(),
+                &[],
+                &config(100),
+            )
+            .expect("valid")
+            .incidents
+            .remove(0)
+            .key
+            .canonical_bytes()
+            .to_vec()
         };
         let first = episode("pg_locks", 1, 0, 10);
         let second = episode("pg_stat_database", 2, 2, 8);
@@ -640,6 +661,7 @@ mod tests {
             analyze(
                 vec![episode("pg_stat_database", 1, 0, 10)],
                 &SeriesSet::for_test(0),
+                &TypedInputs::new(),
                 &[&one, &two],
                 &config(100),
             ),
@@ -652,7 +674,13 @@ mod tests {
         let mut missing_node = config(100);
         missing_node.node_self_id.clear();
         assert!(matches!(
-            analyze(vec![], &SeriesSet::for_test(0), &[], &missing_node),
+            analyze(
+                vec![],
+                &SeriesSet::for_test(0),
+                &TypedInputs::new(),
+                &[],
+                &missing_node
+            ),
             Err(AnalyzeError::MissingNodeIdentity)
         ));
 
@@ -662,6 +690,7 @@ mod tests {
             analyze(
                 vec![episode("s", 1, 0, 1)],
                 &SeriesSet::for_test(0),
+                &TypedInputs::new(),
                 &[],
                 &episode_limited,
             ),
@@ -677,6 +706,7 @@ mod tests {
             analyze(
                 vec![episode("s", 1, 0, 1)],
                 &SeriesSet::for_test(0),
+                &TypedInputs::new(),
                 &[],
                 &cluster_limited,
             ),
@@ -692,6 +722,7 @@ mod tests {
             analyze(
                 vec![episode("s", 1, 0, 1)],
                 &SeriesSet::for_test(0),
+                &TypedInputs::new(),
                 &[],
                 &key_limited,
             ),
@@ -709,6 +740,7 @@ mod tests {
         let outcome = analyze(
             vec![episode("pg_stat_database", 1, 0, 10)],
             &SeriesSet::for_test(0),
+            &TypedInputs::new(),
             &[&first, &second],
             &config(2),
         )
@@ -728,6 +760,7 @@ mod tests {
         let outcome = analyze(
             vec![episode("pg_stat_database", 1, 0, 10)],
             &SeriesSet::for_test(0),
+            &TypedInputs::new(),
             &[&first, &second],
             &cfg,
         )
@@ -746,6 +779,7 @@ mod tests {
         let outcome = analyze(
             vec![episode("pg_stat_database", 1, 0, 10)],
             &SeriesSet::for_test(0),
+            &TypedInputs::new(),
             &[&first, &second],
             &cfg,
         )
