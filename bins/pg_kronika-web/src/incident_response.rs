@@ -131,14 +131,21 @@ fn catalog_to_json() -> Value {
     let dormant: Vec<Value> = crate::incident::dormant_catalog()
         .iter()
         .map(|lens| {
+            let awaiting: Vec<_> = lens
+                .missing()
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect();
             json!({
                 "lens_id": lens.lens_id(),
-                "awaiting": lens.awaiting(),
+                "awaiting": awaiting,
+                "requirements_status": "incomplete",
             })
         })
         .collect();
     json!({
         "status": "dormant",
+        "requirements_status": "incomplete",
         "diagnosis_available": false,
         "scope": "anomaly_clustering_only",
         "applied": Value::Array(Vec::new()),
@@ -204,20 +211,6 @@ fn skipped_to_json(
             "reason": { "kind": reason },
         }));
     }
-    let mut awaiting: Vec<&str> = crate::incident::dormant_catalog()
-        .iter()
-        .flat_map(|lens| lens.awaiting().iter().copied())
-        .collect();
-    awaiting.sort_unstable();
-    awaiting.dedup();
-    analysis.push(json!({
-        "scope": "catalog",
-        "reason": {
-            "kind": "dormant",
-            "lenses": crate::incident::dormant_catalog().len(),
-            "awaiting": awaiting,
-        },
-    }));
     json!({
         "sections": sections,
         "evaluations": evaluations,
@@ -280,6 +273,8 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const MAX_CATALOG_JSON_BYTES: usize = 12 * 1024;
+
     fn scan() -> ScanParams {
         ScanParams {
             from: 0,
@@ -317,7 +312,15 @@ mod tests {
     }
 
     #[test]
-    fn no_data_has_the_full_partial_envelope() {
+    fn catalog_json_stays_within_its_static_budget() {
+        let catalog = catalog_to_json();
+        assert_eq!(catalog, catalog_to_json());
+        let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
+        assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
+    }
+
+    #[test]
+    fn no_data_has_partial_envelope() {
         let body = no_data_response(7, &scan(), None);
         for field in [
             "source_id",
@@ -342,6 +345,23 @@ mod tests {
         assert_eq!(body["catalog"]["status"], "dormant");
         assert_eq!(body["catalog"]["diagnosis_available"], false);
         assert_eq!(body["catalog"]["applied"], Value::Array(Vec::new()));
+        assert!(
+            body["catalog"]["dormant"]
+                .as_array()
+                .is_some_and(|entries| entries
+                    .iter()
+                    .all(|entry| entry["requirements_status"] == "incomplete"))
+        );
+    }
+
+    #[test]
+    fn global_catalog_readiness_is_not_a_request_skip() {
+        let body = no_data_response(7, &scan(), None);
+        assert!(
+            body["skipped"]["analysis"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(|entry| entry["scope"] != "catalog"))
+        );
     }
 
     #[test]
@@ -376,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_episode_does_not_activate_a_catalog_without_edge_evidence() {
+    fn lock_episode_does_not_activate_catalog_without_edge_evidence() {
         use crate::incident::{
             ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, SeriesSet,
             analyze,
@@ -431,7 +451,7 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 28, "the full catalog is declared");
+        assert_eq!(dormant.len(), 28);
         let lock = dormant
             .iter()
             .find(|entry| entry["lens_id"] == "PG-LOCK-012")
@@ -440,33 +460,17 @@ mod tests {
             lock["awaiting"],
             json!(["sampled_blocked_by_edges", "lock_snapshot_coverage"])
         );
-        let catalog_skip = &body["skipped"]["analysis"]
-            .as_array()
-            .expect("analysis is a list")
-            .iter()
-            .find(|entry| entry["reason"]["kind"] == "dormant")
-            .expect("catalog dormant summary present")["reason"];
-        assert_eq!(catalog_skip["lenses"], 28);
-        let awaiting = catalog_skip["awaiting"]
-            .as_array()
-            .expect("the catalog summary aggregates awaited capabilities");
         assert!(
-            awaiting
+            body["catalog"]["dormant"]
+                .as_array()
+                .expect("catalog is a list")
                 .iter()
-                .any(|item| item == "sampled_blocked_by_edges"),
-            "the lock edge prerequisite survives aggregation"
+                .all(|entry| entry["requirements_status"] == "incomplete")
         );
         assert!(
-            awaiting
-                .iter()
-                .any(|item| item == "period_clock_provenance"),
-            "the shared clock prerequisite is listed once"
-        );
-        assert!(
-            awaiting
-                .windows(2)
-                .all(|pair| pair[0].as_str() <= pair[1].as_str()),
-            "aggregated prerequisites are sorted and deduplicated"
+            body["skipped"]["analysis"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(|entry| entry["scope"] != "catalog"))
         );
     }
 }

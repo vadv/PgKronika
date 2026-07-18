@@ -967,12 +967,12 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 28, "the full lens catalog is declared");
+        assert_eq!(dormant.len(), 28);
         assert!(
             dormant
                 .iter()
                 .any(|entry| entry["lens_id"] == "PG-LOCK-012"),
-            "the lock lens is catalogued as dormant"
+            "missing dormant lock lens"
         );
         let incidents = body["incidents"].as_array().expect("incidents is an array");
         assert!(
