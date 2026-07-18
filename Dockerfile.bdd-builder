@@ -49,13 +49,15 @@ RUN mkdir -p /opt/bdd-cache \
 
 FROM bdd-pg-build AS pg-export
 
+# PostgreSQL derives lib/share from the invoked bin path. Keep each complete
+# withPackages root behind the stable per-major alias.
 RUN mkdir -p /export/nix/store /export/opt/pgkronika/pg /export/tmp \
  && nix path-info -r /opt/bdd-cache/pg-matrix \
       | while IFS= read -r path; do cp -a "$path" /export/nix/store/; done \
  && cp -a "$(readlink -f /opt/bdd-cache/pg-matrix/fake-nss)/etc" /export/etc \
  && cp -a "$(readlink -f /opt/bdd-cache/pg-matrix/bin-sh)/bin" /export/bin \
  && for major in 15 16 17 18; do \
-      ln -s "$(readlink -f "/opt/bdd-cache/pg-matrix/postgresql-$major")/bin" \
+      ln -s "$(readlink -f "/opt/bdd-cache/pg-matrix/postgresql-$major")" \
         "/export/opt/pgkronika/pg/$major"; \
     done \
  && cp /opt/bdd-cache/pg-closure.json /export/opt/pgkronika/pg/closure.json \
@@ -81,5 +83,5 @@ ENV HOME=/tmp \
     LANG=C \
     KRONIKA_FEATURES=/opt/pgkronika/features \
     KRONIKA_COLLECTOR_BIN=/opt/pgkronika/bin/pg_kronika-collector \
-    KRONIKA_PG_MATRIX="15=/opt/pgkronika/pg/15;16=/opt/pgkronika/pg/16;17=/opt/pgkronika/pg/17;18=/opt/pgkronika/pg/18"
+    KRONIKA_PG_MATRIX="15=/opt/pgkronika/pg/15/bin;16=/opt/pgkronika/pg/16/bin;17=/opt/pgkronika/pg/17/bin;18=/opt/pgkronika/pg/18/bin"
 ENTRYPOINT ["/opt/pgkronika/bin/kronika-bdd"]

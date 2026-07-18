@@ -169,6 +169,9 @@ test_pg_matrix_uses_exact_with_packages_closures() {
   grep -F -- 'pg-store-plans-ossc' "$file" >/dev/null || fail "ossc revision input missing"
   assert_contains "$ROOT/Dockerfile.bdd-builder" 'nix build .#bddPgMatrix'
   assert_not_contains "$ROOT/Dockerfile.bdd-builder" '.#postgresql_15 '
+  assert_contains "$ROOT/Dockerfile.bdd-builder" '"/export/opt/pgkronika/pg/$major"'
+  assert_not_contains "$ROOT/Dockerfile.bdd-builder" 'postgresql-$major")/bin"'
+  assert_contains "$ROOT/Dockerfile.bdd-builder" '15=/opt/pgkronika/pg/15/bin'
 }
 
 test_nix_build_declares_musl_compiler() {
@@ -184,6 +187,20 @@ test_pg_base_verification_needs_no_coreutils() {
   assert_contains "$body" 'IFS= read -r schema < /opt/pgkronika/pg/schema'
   assert_contains "$body" 'IFS= read -r dependency_key < /opt/pgkronika/pg/dependency-key'
   assert_not_contains "$body" 'cat /opt/pgkronika/pg/'
+  assert_contains "$body" 'pkglibdir="$root/lib"'
+  assert_contains "$body" 'if [ -d "$pkglibdir/postgresql" ]; then'
+  assert_contains "$body" 'sharedir="$root/share/postgresql"'
+  assert_contains "$body" 'test -f "$pkglibdir/pg_store_plans.so"'
+  assert_contains "$body" 'test -f "$sharedir/extension/pg_store_plans.control"'
+  assert_contains "$body" 'pg_store_plans--*.sql'
+}
+
+test_workflow_checks_pg_structure_before_bdd() {
+  local workflow="$ROOT/.github/workflows/ci.yml" contract_line matrix_line
+  contract_line=$(grep -n 'name: Verify PostgreSQL runtime contract' "$workflow" | cut -d: -f1)
+  matrix_line=$(grep -n 'name: Run the PostgreSQL matrix' "$workflow" | cut -d: -f1)
+  [ "$contract_line" -lt "$matrix_line" ] || fail "PG runtime contract must run before BDD"
+  assert_contains "$workflow" './scripts/bdd-image.sh verify-pg-runtime "$image"'
 }
 
 test_source_only_plan_gate() {
@@ -342,6 +359,7 @@ for test in \
   test_pg_matrix_uses_exact_with_packages_closures \
   test_nix_build_declares_musl_compiler \
   test_pg_base_verification_needs_no_coreutils \
+  test_workflow_checks_pg_structure_before_bdd \
   test_source_only_plan_gate \
   test_exact_dependency_hit_never_builds_or_mutates_branch_tags \
   test_public_consumer_fails_closed_without_dependency \

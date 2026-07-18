@@ -83,6 +83,7 @@ Build commands:
   dependency-context-tar    Canonical dummy-source dependency context.
   build-dependencies        Build exact Cargo and PG15-18 dependency images.
   resolve-dependencies      Resolve and report both immutable dependency refs.
+  verify-pg-runtime IMAGE   Check PG15-18 binaries and extension files.
   assert-source-only-plan FILE
                             Fail if a Nix plan contains PG/extension work.
   build-app-layer           Build the source-only application tar layer.
@@ -434,8 +435,25 @@ verify_pg_base() {
     test "$schema" = "$1"
     test "$dependency_key" = "$2"
     test -s /opt/pgkronika/pg/closure.json
-    for major in 15 16 17 18; do test -x "/opt/pgkronika/pg/$major/postgres"; done
+    for major in 15 16 17 18; do
+      root="/opt/pgkronika/pg/$major"
+      test -x "$root/bin/postgres"
+      pkglibdir="$root/lib"
+      if [ -d "$pkglibdir/postgresql" ]; then
+        pkglibdir="$pkglibdir/postgresql"
+      fi
+      sharedir="$root/share/postgresql"
+      test -f "$pkglibdir/pg_store_plans.so"
+      test -f "$sharedir/extension/pg_store_plans.control"
+      set -- "$sharedir"/extension/pg_store_plans--*.sql
+      test -f "$1"
+    done
   ' sh "$KEY_SCHEMA" "$expected"
+}
+
+verify_pg_runtime() {
+  [ "$#" -eq 1 ] || fail "verify-pg-runtime requires one image"
+  verify_pg_base "$1" "$(deps_key)"
 }
 
 run_app_nix() {
@@ -605,6 +623,7 @@ case "$cmd" in
   dependency-context-tar|builder-context-tar) dependency_context_tar ;;
   build-dependencies|build-builder) build_dependencies ;;
   resolve-dependencies) resolve_dependencies ;;
+  verify-pg-runtime) shift; verify_pg_runtime "$@" ;;
   assert-source-only-plan) shift; [ "$#" -eq 1 ] || fail "assert-source-only-plan requires a file"; assert_source_only_plan "$1" ;;
   build-app-layer) build_app_layer ;;
   assemble-runtime) assemble_runtime ;;

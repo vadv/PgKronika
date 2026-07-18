@@ -301,6 +301,14 @@ jobs:
           BDD_RUNTIME_IMAGE: ${{ steps.refs.outputs.runtime_image }}
           BDD_APP_LAYER: app-layer.tar
         run: ./scripts/bdd-image.sh assemble-runtime
+      - name: Verify PostgreSQL runtime contract
+        run: |
+          if [ "${{ steps.final.outputs.hit }}" = true ]; then
+            image="${{ steps.final.outputs.digest_ref }}"
+          else
+            image="${{ steps.refs.outputs.runtime_image }}"
+          fi
+          ./scripts/bdd-image.sh verify-pg-runtime "$image"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: needs.bdd-meta.outputs.can_publish == 'true' && steps.final.outputs.hit != 'true'
         with:
