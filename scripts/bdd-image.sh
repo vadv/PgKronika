@@ -137,7 +137,8 @@ source_tar() {
 }
 
 write_dummy_builder_sources() {
-  local context=$1 dir
+  local context=$1 dir root
+  root=$(repo_root)
 
   for dir in "$context"/crates/*; do
     [ -f "$dir/Cargo.toml" ] || continue
@@ -156,6 +157,12 @@ write_dummy_builder_sources() {
     [ -f "$dir/Cargo.toml" ] || continue
     mkdir -p "$dir/src"
     printf 'fn main() {}\n' > "$dir/src/main.rs"
+    # A binary crate that also ships a library target needs both dummy files,
+    # or crane derives a different cargoArtifacts than the real workspace and
+    # the runtime rebuilds every dependency.
+    if [ -f "$root/${dir#"$context"/}/src/lib.rs" ]; then
+      printf '#![allow(missing_docs)]\n' > "$dir/src/lib.rs"
+    fi
   done
 
   # Every declared [[bench]] target needs a file on disk, or cargo refuses to

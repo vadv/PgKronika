@@ -418,6 +418,10 @@ test_builder_context_tar_has_stable_dummy_targets() {
     || fail "builder context must contain dummy BDD bin target"
   grep -Fx -- 'fn main() {}' "$context/xtask/src/main.rs" >/dev/null \
     || fail "builder context must contain dummy xtask target"
+  grep -Fx -- 'fn main() {}' "$context/bins/pg_kronika-web/src/main.rs" >/dev/null \
+    || fail "builder context must contain dummy web bin target"
+  grep -Fx -- '#![allow(missing_docs)]' "$context/bins/pg_kronika-web/src/lib.rs" >/dev/null \
+    || fail "builder context must contain dummy web lib target"
 }
 
 test_runtime_key_ignores_host_only_files() {

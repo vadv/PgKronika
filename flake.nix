@@ -169,7 +169,15 @@
       {
         packages = {
           default = bins;
-          inherit bins cargoArtifacts image;
+          inherit
+            bins
+            cargoArtifacts
+            image
+            postgresql_15_plans
+            postgresql_16_plans
+            postgresql_17_plans
+            postgresql_18_plans
+            ;
         } // pgMatrix;
 
         devShells.default = craneLib.devShell {

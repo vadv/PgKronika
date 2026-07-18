@@ -14,8 +14,9 @@ COPY . .
 
 RUN nix build \
     .#cargoArtifacts \
-    .#postgresql_15 \
-    .#postgresql_16 \
-    .#postgresql_17 \
+    .#postgresql_15_plans \
+    .#postgresql_16_plans \
+    .#postgresql_17_plans \
+    .#postgresql_18_plans \
     --out-link /tmp/bdd-deps \
   && rm -f /tmp/bdd-deps
