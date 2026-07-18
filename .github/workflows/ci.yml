@@ -91,6 +91,8 @@ jobs:
       BDD_PLATFORM: linux/amd64
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Compute immutable refs
         id: meta
         run: |
@@ -204,9 +206,13 @@ jobs:
     if: always() && needs.bdd-meta.result == 'success' && (needs.bdd-dependencies.result == 'success' || needs.bdd-dependencies.result == 'skipped')
     runs-on: ubuntu-latest
     concurrency:
-      group: bdd-app-${{ needs.bdd-meta.outputs.platform_slug }}-${{ needs.bdd-meta.outputs.source_key }}
+      # A same-repository PR delegates to the exact-head push run. Keep that
+      # waiter out of the source consumer's group or it could block the push
+      # job it is waiting for.
+      group: bdd-app-${{ needs.bdd-meta.outputs.platform_slug }}-${{ needs.bdd-meta.outputs.source_key }}-${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && 'delegate' || 'consume' }}
       cancel-in-progress: false
     permissions:
+      actions: read
       contents: read
       packages: read
       attestations: read
@@ -224,8 +230,70 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Select trusted BDD route
+        id: route
+        env:
+          BDD_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$BDD_HEAD_REPOSITORY" = "$GITHUB_REPOSITORY" ]; then
+            echo 'mode=delegate' >> "$GITHUB_OUTPUT"
+          else
+            echo 'mode=consume' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Reuse exact-head trusted push result
+        if: steps.route.outputs.mode == 'delegate'
+        env:
+          BDD_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$BDD_HEAD_SHA" in
+            *[!0-9a-f]*|'')
+              echo 'invalid pull request head SHA' >&2
+              exit 2
+              ;;
+          esac
+          deadline=$((SECONDS + 7200))
+          run_id=
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            run_id=$(gh api --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+              -f event=push -f per_page=100 \
+              --jq ".workflow_runs[] | select(.head_sha == \"$BDD_HEAD_SHA\") | .id" \
+              | head -n 1)
+            if [ -n "$run_id" ]; then
+              job=$(gh api --method GET \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs" \
+                -f per_page=100 \
+                --jq '.jobs[] | select(.name == "bdd matrix") | [.status, (.conclusion // ""), .html_url] | @tsv' \
+                | head -n 1)
+              if [ -n "$job" ]; then
+                IFS=$'\t' read -r status conclusion job_url <<< "$job"
+                if [ "$status" = completed ]; then
+                  if [ "$conclusion" != success ]; then
+                    echo "::error title=BDD_TRUSTED_PUSH_FAILED::Exact-head push BDD concluded $conclusion: $job_url"
+                    exit 2
+                  fi
+                  {
+                    echo '## BDD trusted push delegation'
+                    echo
+                    echo "- exact head: \`$BDD_HEAD_SHA\`"
+                    echo "- push run: \`$run_id\`"
+                    echo "- trusted BDD job: $job_url"
+                    echo '- duplicate PR source build: `skipped`'
+                  } >> "$GITHUB_STEP_SUMMARY"
+                  exit 0
+                fi
+              fi
+            fi
+            sleep 10
+          done
+          echo "::error title=BDD_TRUSTED_PUSH_TIMEOUT::No successful exact-head push BDD completed within 120 minutes for $BDD_HEAD_SHA"
+          exit 2
       - name: Resolve immutable dependencies
         id: refs
+        if: steps.route.outputs.mode == 'consume'
         run: |
           if ! dependency_digest_ref=$(./scripts/bdd-image.sh resolve-ref "$BDD_DEPENDENCY_IMAGE"); then
             echo "::error title=BDD_DEPENDENCY_MISSING::Immutable Cargo artifact for dependency key ${{ needs.bdd-meta.outputs.dependency_key }} is absent. Wait for or rerun the trusted push publisher; pull_request jobs cannot publish it."
@@ -254,6 +322,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Check exact runtime image
         id: final
+        if: steps.route.outputs.mode == 'consume'
         env:
           BDD_RUNTIME_IMAGE: ${{ steps.refs.outputs.runtime_image }}
         run: |
@@ -272,10 +341,10 @@ jobs:
             echo '- exact runtime hit: `false`' >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Pull exact runtime image
-        if: steps.final.outputs.hit == 'true'
+        if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit == 'true'
         run: docker pull "${{ steps.final.outputs.digest_ref }}"
       - name: Free disk space for the source build
-        if: steps.final.outputs.hit != 'true'
+        if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit != 'true'
         run: |
           df -h
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/share/boost /opt/ghc
@@ -285,16 +354,16 @@ jobs:
           docker system prune -af || true
           df -h
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        if: steps.final.outputs.hit != 'true'
+        if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit != 'true'
       - name: Build source-only app layer
-        if: steps.final.outputs.hit != 'true'
+        if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit != 'true'
         env:
           BDD_DEPENDENCY_DIGEST_REF: ${{ steps.refs.outputs.dependency_digest_ref }}
           BDD_PG_BASE_DIGEST_REF: ${{ steps.refs.outputs.pg_digest_ref }}
           BDD_APP_LAYER: app-layer.tar
         run: ./scripts/bdd-image.sh build-app-layer
       - name: Assemble local runtime
-        if: steps.final.outputs.hit != 'true'
+        if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit != 'true'
         env:
           BDD_DEPENDENCY_DIGEST_REF: ${{ steps.refs.outputs.dependency_digest_ref }}
           BDD_PG_BASE_DIGEST_REF: ${{ steps.refs.outputs.pg_digest_ref }}
@@ -302,6 +371,7 @@ jobs:
           BDD_APP_LAYER: app-layer.tar
         run: ./scripts/bdd-image.sh assemble-runtime
       - name: Verify PostgreSQL runtime contract
+        if: steps.route.outputs.mode == 'consume'
         run: |
           if [ "${{ steps.final.outputs.hit }}" = true ]; then
             image="${{ steps.final.outputs.digest_ref }}"
@@ -310,12 +380,13 @@ jobs:
           fi
           ./scripts/bdd-image.sh verify-pg-runtime "$image"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: needs.bdd-meta.outputs.can_publish == 'true' && steps.final.outputs.hit != 'true'
+        if: steps.route.outputs.mode == 'consume' && needs.bdd-meta.outputs.can_publish == 'true' && steps.final.outputs.hit != 'true'
         with:
           name: bdd-app-layer-${{ steps.refs.outputs.app_key }}
           path: app-layer.tar
           retention-days: 1
       - name: Run the PostgreSQL matrix
+        if: steps.route.outputs.mode == 'consume'
         run: |
           if [ "${{ steps.final.outputs.hit }}" = true ]; then
             image="${{ steps.final.outputs.digest_ref }}"

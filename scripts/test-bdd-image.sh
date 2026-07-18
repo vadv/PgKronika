@@ -336,8 +336,8 @@ test_workflow_enforces_trust_and_short_circuit() {
   assert_contains "$workflow" "if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'"
   assert_contains "$workflow" 'packages: read'
   assert_contains "$workflow" 'packages: write'
-  assert_contains "$workflow" "if: steps.final.outputs.hit != 'true'"
-  assert_contains "$workflow" "if: steps.final.outputs.hit == 'true'"
+  assert_contains "$workflow" "steps.final.outputs.hit != 'true'"
+  assert_contains "$workflow" "steps.final.outputs.hit == 'true'"
   assert_contains "$workflow" 'BDD_TRUSTED_PUBLISH: "1"'
   assert_not_contains "$workflow" 'rustup target add x86_64-unknown-linux-musl'
   assert_contains "$ROOT/rust-toolchain.toml" 'targets = ["x86_64-unknown-linux-musl"]'
@@ -347,6 +347,29 @@ test_workflow_enforces_trust_and_short_circuit() {
   assert_contains "$workflow" "if: (github.event_name == 'workflow_dispatch' || github.event_name == 'push')"
   assert_not_contains "$workflow" 'builder_branch_cache'
   assert_not_contains "$workflow" 'branch-main'
+}
+
+test_same_repo_pr_delegates_to_trusted_push_without_deadlock() {
+  local workflow="$ROOT/.github/workflows/ci.yml"
+  assert_contains "$workflow" "github.event.pull_request.head.repo.full_name == github.repository && 'delegate' || 'consume'"
+  assert_contains "$workflow" "echo 'mode=delegate'"
+  assert_contains "$workflow" "-f event=push -f per_page=100"
+  assert_contains "$workflow" 'select(.head_sha =='
+  assert_contains "$workflow" 'select(.name == "bdd matrix")'
+  assert_contains "$workflow" "if: steps.route.outputs.mode == 'consume'"
+  assert_contains "$workflow" 'duplicate PR source build: `skipped`'
+  assert_contains "$workflow" 'actions: read'
+  assert_contains "$workflow" 'packages: read'
+  assert_contains "$workflow" 'BDD_HEAD_REPOSITORY'
+  assert_not_contains "$workflow" 'pull_request_target:'
+}
+
+test_fork_pr_has_no_publisher_route_or_credentials() {
+  local workflow="$ROOT/.github/workflows/ci.yml"
+  assert_contains "$workflow" "if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'"
+  assert_contains "$workflow" "if: (github.event_name == 'workflow_dispatch' || github.event_name == 'push')"
+  assert_contains "$workflow" 'password: ${{ secrets.GITHUB_TOKEN }}'
+  assert_not_contains "$workflow" 'github.event.pull_request.head.repo.full_name != github.repository &&'
 }
 
 for test in \
@@ -366,7 +389,9 @@ for test in \
   test_publish_requires_explicit_trust \
   test_app_build_uses_digest_and_reports_zero_pg_work \
   test_runtime_assembly_is_one_layer_over_pg_digest \
-  test_workflow_enforces_trust_and_short_circuit
+  test_workflow_enforces_trust_and_short_circuit \
+  test_same_repo_pr_delegates_to_trusted_push_without_deadlock \
+  test_fork_pr_has_no_publisher_route_or_credentials
 do
   "$test"
 done
