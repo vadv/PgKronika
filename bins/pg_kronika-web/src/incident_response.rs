@@ -128,12 +128,21 @@ fn identity_to_json(value: &IdentityValue) -> Value {
 }
 
 fn catalog_to_json() -> Value {
+    let dormant: Vec<Value> = crate::incident::dormant_catalog()
+        .iter()
+        .map(|lens| {
+            json!({
+                "lens_id": lens.lens_id(),
+                "awaiting": lens.awaiting(),
+            })
+        })
+        .collect();
     json!({
-        "status": "not_implemented",
+        "status": "dormant",
         "diagnosis_available": false,
         "scope": "anomaly_clustering_only",
         "applied": Value::Array(Vec::new()),
-        "dormant": Value::Array(Vec::new()),
+        "dormant": dormant,
     })
 }
 
@@ -179,13 +188,7 @@ fn skipped_to_json(
     let mut sections: Vec<Value> = input_skipped.iter().map(section_skip_to_json).collect();
     sections.sort_by(|left, right| left["section"].as_str().cmp(&right["section"].as_str()));
     let evaluations: Vec<Value> = engine_skipped.iter().map(engine_skip_to_json).collect();
-    let mut analysis = vec![json!({
-        "scope": "catalog",
-        "reason": {
-            "kind": "not_implemented",
-            "prerequisite": "diagnostic_lens_catalog",
-        },
-    })];
+    let mut analysis = Vec::new();
     if quality.episodes_truncated > 0 {
         analysis.push(json!({
             "scope": "episodes",
@@ -201,6 +204,13 @@ fn skipped_to_json(
             "reason": { "kind": reason },
         }));
     }
+    analysis.push(json!({
+        "scope": "catalog",
+        "reason": {
+            "kind": "dormant",
+            "awaiting": ["sampled_blocked_by_edges", "lock_snapshot_coverage"],
+        },
+    }));
     json!({
         "sections": sections,
         "evaluations": evaluations,
@@ -322,7 +332,9 @@ mod tests {
         assert_eq!(body["analysis_status"], "no_data");
         assert_eq!(body["data_age_seconds"], Value::Null);
         assert!(body["skipped"].get("sections").is_some());
-        assert_eq!(body["catalog"]["status"], "not_implemented");
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
+        assert_eq!(body["catalog"]["applied"], Value::Array(Vec::new()));
     }
 
     #[test]
@@ -348,9 +360,72 @@ mod tests {
         assert_eq!(body["clustering_complete"], false);
         assert_eq!(body["complete"], false);
         assert_eq!(body["analysis_status"], "partial");
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["applied"], json!([]));
         assert_eq!(
             body["skipped"]["sections"][0]["reason"]["kind"],
             "incomplete_page",
         );
+    }
+
+    #[test]
+    fn a_lock_episode_does_not_activate_a_catalog_without_edge_evidence() {
+        use crate::incident::{
+            ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, SeriesSet,
+            analyze,
+        };
+        use kronika_analytics::{Direction, Episode, Evaluated};
+        use std::sync::Arc;
+
+        let peak = Evaluated {
+            m: 0.0,
+            dir: Direction::Flat,
+            med_cur: 0.0,
+            med_ref: 0.0,
+            mad_ref: 1.0,
+            sigma_used: 1.4826,
+            n_cur: 0,
+            n_ref: 0,
+        };
+        let episode = EnrichedEpisode {
+            episode: Episode {
+                start: 0,
+                end: 0,
+                peak_ts: 0,
+                peak,
+            },
+            reference: EpisodeRefV1 {
+                logical_section: "pg_locks",
+                column: "depth",
+                identity: Arc::from(vec![IdentityValue::I64(42)]),
+                start_us: 0,
+                end_us: 10,
+            },
+        };
+        let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+        let outcome =
+            analyze(vec![episode], &SeriesSet::for_test(0), &[], &config).expect("valid analysis");
+
+        let body = build_response(
+            7,
+            &scan(),
+            None,
+            &outcome,
+            &BTreeMap::new(),
+            &InputQuality::default(),
+            &[],
+        );
+
+        assert_eq!(body["incidents"][0]["findings"], json!([]));
+        assert_eq!(body["incidents"][0]["evaluation_complete"], false);
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
+        assert_eq!(body["catalog"]["applied"], json!([]));
+        assert_eq!(body["catalog"]["dormant"][0]["lens_id"], "PG-LOCK-012");
+        assert_eq!(
+            body["catalog"]["dormant"][0]["awaiting"],
+            json!(["sampled_blocked_by_edges", "lock_snapshot_coverage"])
+        );
+        assert_eq!(body["skipped"]["analysis"][0]["reason"]["kind"], "dormant");
     }
 }

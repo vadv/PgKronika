@@ -1,6 +1,7 @@
 //! `GET /v1/incidents` clusters anomaly episodes across sections.
 //!
-//! The response marks diagnosis unavailable because no lens catalog runs.
+//! Diagnostic lenses remain dormant until their typed evidence reaches the
+//! incident engine.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

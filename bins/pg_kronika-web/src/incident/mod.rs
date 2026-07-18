@@ -7,6 +7,7 @@ mod dispatch;
 mod engine;
 mod evidence;
 mod lens;
+mod lenses;
 mod model;
 mod series;
 
@@ -24,3 +25,4 @@ pub(crate) use engine::{
     reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"
 )]
 pub(crate) use lens::Lens;
+pub(crate) use lenses::dormant_catalog;
