@@ -34,11 +34,18 @@ if ! "$DOCKER" buildx version >/dev/null 2>&1; then
   fail "Docker Buildx is required for the BDD image path."
 fi
 
-export BDD_BUILDER_PULL=${BDD_BUILDER_PULL:-1}
+resolved=$("$ROOT/scripts/bdd-image.sh" resolve-dependencies)
+BDD_DEPENDENCY_DIGEST_REF=$(printf '%s\n' "$resolved" | sed -n 's/^dependency_digest_ref=//p')
+BDD_PG_BASE_DIGEST_REF=$(printf '%s\n' "$resolved" | sed -n 's/^pg_digest_ref=//p')
+if [ -z "$BDD_DEPENDENCY_DIGEST_REF" ] || [ -z "$BDD_PG_BASE_DIGEST_REF" ]; then
+  fail "Immutable BDD dependency refs could not be resolved."
+fi
+export BDD_DEPENDENCY_DIGEST_REF BDD_PG_BASE_DIGEST_REF
 
 runtime_image=${BDD_RUNTIME_IMAGE:-}
 if [ -z "$runtime_image" ]; then
-  runtime_image=$("$ROOT/scripts/bdd-image.sh" runtime-image)
+  runtime_image=$("$ROOT/scripts/bdd-image.sh" runtime-image \
+    "$BDD_DEPENDENCY_DIGEST_REF" "$BDD_PG_BASE_DIGEST_REF")
 fi
 export BDD_RUNTIME_IMAGE=$runtime_image
 export BDD_RUNTIME_REUSE_LOCAL=${BDD_RUNTIME_REUSE_LOCAL:-1}
@@ -60,7 +67,6 @@ trap cleanup EXIT
 if "$DOCKER" image inspect "$runtime_image" >/dev/null 2>&1; then
   echo "Reusing BDD runtime image $runtime_image"
 else
-  "$ROOT/scripts/bdd-image.sh" build-builder
   "$ROOT/scripts/bdd-image.sh" build-runtime
 fi
 

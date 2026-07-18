@@ -135,6 +135,80 @@
         # Feature files are read through KRONIKA_FEATURES.
         features = ./crates/kronika-bdd/features;
 
+        bddPgMatrix = pkgs.linkFarm "pgkronika-bdd-pg-matrix" [
+          {
+            name = "postgresql-15";
+            path = postgresql_15_plans;
+          }
+          {
+            name = "postgresql-16";
+            path = postgresql_16_plans;
+          }
+          {
+            name = "postgresql-17";
+            path = postgresql_17_plans;
+          }
+          {
+            name = "postgresql-18";
+            path = postgresql_18_plans;
+          }
+          {
+            name = "fake-nss";
+            path = pkgs.dockerTools.fakeNss;
+          }
+          {
+            name = "bin-sh";
+            path = pkgs.dockerTools.binSh;
+          }
+        ];
+
+        bddPgClosureManifest = pkgs.writeText "pgkronika-bdd-pg-closure.json" (
+          builtins.toJSON {
+            schema = 2;
+            postgresql = {
+              "15" = "${postgresql_15_plans}";
+              "16" = "${postgresql_16_plans}";
+              "17" = "${postgresql_17_plans}";
+              "18" = "${postgresql_18_plans}";
+            };
+            helpers = {
+              fakeNss = "${pkgs.dockerTools.fakeNss}";
+              binSh = "${pkgs.dockerTools.binSh}";
+            };
+          }
+        );
+
+        bddCargoClosureManifest = pkgs.writeText "pgkronika-bdd-cargo-closure.json" (
+          builtins.toJSON {
+            schema = 2;
+            target = "x86_64-unknown-linux-musl";
+            features = "default";
+            cargoArtifacts = "${cargoArtifacts}";
+          }
+        );
+
+        bddAppRoot = pkgs.runCommand "pgkronika-bdd-app-root" { } ''
+          mkdir -p $out/opt/pgkronika/bin $out/opt/pgkronika/features
+          install -m 0755 ${bins}/bin/kronika-bdd $out/opt/pgkronika/bin/kronika-bdd
+          install -m 0755 ${bins}/bin/pg_kronika-collector \
+            $out/opt/pgkronika/bin/pg_kronika-collector
+          cp -R ${features}/. $out/opt/pgkronika/features/
+        '';
+
+        bddAppLayer = pkgs.runCommand "pgkronika-bdd-app-layer.tar" {
+          nativeBuildInputs = [ pkgs.gnutar ];
+        } ''
+          tar \
+            --sort=name \
+            --mtime=@1 \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C ${bddAppRoot} \
+            -cf $out \
+            .
+        '';
+
         # Scratch image for the BDD suite.
         image = pkgs.dockerTools.streamLayeredImage {
           name = "pgkronika-bdd";
@@ -169,7 +243,16 @@
       {
         packages = {
           default = bins;
-          inherit bins cargoArtifacts image;
+          inherit
+            bins
+            cargoArtifacts
+            image
+            bddPgMatrix
+            bddPgClosureManifest
+            bddCargoClosureManifest
+            bddAppLayer
+            ;
+          bddCargoArtifacts = cargoArtifacts;
         } // pgMatrix;
 
         devShells.default = craneLib.devShell {

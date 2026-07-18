@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BDD_PG_BASE
+FROM ${BDD_PG_BASE}
+
+ARG BDD_APP_KEY
+ARG BDD_DEPENDENCY_KEY
+ARG BDD_SOURCE_COMMIT
+ADD app-layer.tar /
+
+LABEL org.opencontainers.image.source="https://github.com/vadv/PgKronika" \
+      org.opencontainers.image.revision="${BDD_SOURCE_COMMIT}" \
+      io.pgkronika.bdd.cache.kind="runtime" \
+      io.pgkronika.bdd.cache.key="${BDD_APP_KEY}" \
+      io.pgkronika.bdd.cache.dependency-key="${BDD_DEPENDENCY_KEY}"

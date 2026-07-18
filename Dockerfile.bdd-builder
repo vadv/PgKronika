@@ -1,21 +1,85 @@
 # syntax=docker/dockerfile:1.7
 
-ARG BDD_BUILDER_BASE=docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894
-FROM ${BDD_BUILDER_BASE} AS bdd-builder
+ARG BDD_NIX_BASE=docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894
+FROM ${BDD_NIX_BASE} AS bdd-cargo
 
+ARG BDD_DEPENDENCY_KEY
+ARG BDD_KEY_SCHEMA
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 WORKDIR /work
-RUN find /work -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-
-# Use the real workspace so crane computes the same `cargoArtifacts` derivation
-# that `nix build .#image` reuses. Manifest, lockfile, flake, or Dockerfile
-# changes get a new builder tag; source-only changes can reuse the old one.
 COPY . .
 
-RUN nix build \
-    .#cargoArtifacts \
-    .#postgresql_15 \
-    .#postgresql_16 \
-    .#postgresql_17 \
-    --out-link /tmp/bdd-deps \
-  && rm -f /tmp/bdd-deps
+RUN mkdir -p /opt/bdd-cache \
+ && test "$(cat .bdd-cache-schema)" = "$BDD_KEY_SCHEMA" \
+ && test "$(cat .bdd-dependency-key)" = "$BDD_DEPENDENCY_KEY" \
+ && nix build .#bddCargoArtifacts --out-link /opt/bdd-cache/cargo-artifacts \
+ && nix build .#bddCargoClosureManifest --out-link /tmp/cargo-closure \
+ && cp -L /tmp/cargo-closure /opt/bdd-cache/cargo-closure.json \
+ && cp .bdd-cache-schema /opt/bdd-cache/schema \
+ && cp .bdd-dependency-key /opt/bdd-cache/dependency-key \
+ && rm -f /tmp/cargo-closure
+
+LABEL org.opencontainers.image.source="https://github.com/vadv/PgKronika" \
+      io.pgkronika.bdd.cache.kind="cargo-dependencies" \
+      io.pgkronika.bdd.cache.schema="${BDD_KEY_SCHEMA}" \
+      io.pgkronika.bdd.cache.key="${BDD_DEPENDENCY_KEY}"
+
+ENTRYPOINT []
+CMD ["sh"]
+
+FROM bdd-cargo AS bdd-deps
+
+FROM ${BDD_NIX_BASE} AS bdd-pg-build
+
+ARG BDD_DEPENDENCY_KEY
+ARG BDD_KEY_SCHEMA
+ENV NIX_CONFIG="experimental-features = nix-command flakes"
+WORKDIR /work
+COPY . .
+
+RUN mkdir -p /opt/bdd-cache \
+ && test "$(cat .bdd-cache-schema)" = "$BDD_KEY_SCHEMA" \
+ && test "$(cat .bdd-dependency-key)" = "$BDD_DEPENDENCY_KEY" \
+ && nix build .#bddPgMatrix --out-link /opt/bdd-cache/pg-matrix \
+ && nix build .#bddPgClosureManifest --out-link /tmp/pg-closure \
+ && cp -L /tmp/pg-closure /opt/bdd-cache/pg-closure.json \
+ && cp .bdd-cache-schema /opt/bdd-cache/schema \
+ && cp .bdd-dependency-key /opt/bdd-cache/dependency-key \
+ && rm -f /tmp/pg-closure
+
+FROM bdd-pg-build AS pg-export
+
+RUN mkdir -p /export/nix/store /export/opt/pgkronika/pg /export/tmp \
+ && nix path-info -r /opt/bdd-cache/pg-matrix \
+      | while IFS= read -r path; do cp -a "$path" /export/nix/store/; done \
+ && cp -a "$(readlink -f /opt/bdd-cache/pg-matrix/fake-nss)/etc" /export/etc \
+ && cp -a "$(readlink -f /opt/bdd-cache/pg-matrix/bin-sh)/bin" /export/bin \
+ && for major in 15 16 17 18; do \
+      ln -s "$(readlink -f "/opt/bdd-cache/pg-matrix/postgresql-$major")/bin" \
+        "/export/opt/pgkronika/pg/$major"; \
+    done \
+ && cp /opt/bdd-cache/pg-closure.json /export/opt/pgkronika/pg/closure.json \
+ && cp /opt/bdd-cache/schema /export/opt/pgkronika/pg/schema \
+ && cp /opt/bdd-cache/dependency-key /export/opt/pgkronika/pg/dependency-key \
+ && chmod 1777 /export/tmp
+
+FROM scratch AS bdd-pg-base
+
+ARG BDD_DEPENDENCY_KEY
+ARG BDD_KEY_SCHEMA
+COPY --from=pg-export /export/ /
+
+LABEL org.opencontainers.image.source="https://github.com/vadv/PgKronika" \
+      io.pgkronika.bdd.cache.kind="postgresql-runtime" \
+      io.pgkronika.bdd.cache.schema="${BDD_KEY_SCHEMA}" \
+      io.pgkronika.bdd.cache.key="${BDD_DEPENDENCY_KEY}"
+
+USER 65534:65534
+ENV HOME=/tmp \
+    TMPDIR=/tmp \
+    LC_ALL=C \
+    LANG=C \
+    KRONIKA_FEATURES=/opt/pgkronika/features \
+    KRONIKA_COLLECTOR_BIN=/opt/pgkronika/bin/pg_kronika-collector \
+    KRONIKA_PG_MATRIX="15=/opt/pgkronika/pg/15;16=/opt/pgkronika/pg/16;17=/opt/pgkronika/pg/17;18=/opt/pgkronika/pg/18"
+ENTRYPOINT ["/opt/pgkronika/bin/kronika-bdd"]
