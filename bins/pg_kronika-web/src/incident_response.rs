@@ -131,14 +131,21 @@ fn catalog_to_json() -> Value {
     let dormant: Vec<Value> = crate::incident::dormant_catalog()
         .iter()
         .map(|lens| {
+            let awaiting: Vec<_> = lens
+                .missing()
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect();
             json!({
                 "lens_id": lens.lens_id(),
-                "awaiting": lens.awaiting(),
+                "awaiting": awaiting,
+                "requirements_status": "incomplete",
             })
         })
         .collect();
     json!({
         "status": "dormant",
+        "requirements_status": "incomplete",
         "diagnosis_available": false,
         "scope": "anomaly_clustering_only",
         "applied": Value::Array(Vec::new()),
@@ -204,13 +211,6 @@ fn skipped_to_json(
             "reason": { "kind": reason },
         }));
     }
-    analysis.push(json!({
-        "scope": "catalog",
-        "reason": {
-            "kind": "dormant",
-            "awaiting": ["sampled_blocked_by_edges", "lock_snapshot_coverage"],
-        },
-    }));
     json!({
         "sections": sections,
         "evaluations": evaluations,
@@ -273,6 +273,8 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const MAX_CATALOG_JSON_BYTES: usize = 12 * 1024;
+
     fn scan() -> ScanParams {
         ScanParams {
             from: 0,
@@ -310,7 +312,15 @@ mod tests {
     }
 
     #[test]
-    fn no_data_has_the_full_partial_envelope() {
+    fn catalog_json_stays_within_its_static_budget() {
+        let catalog = catalog_to_json();
+        assert_eq!(catalog, catalog_to_json());
+        let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
+        assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
+    }
+
+    #[test]
+    fn no_data_has_partial_envelope() {
         let body = no_data_response(7, &scan(), None);
         for field in [
             "source_id",
@@ -335,6 +345,23 @@ mod tests {
         assert_eq!(body["catalog"]["status"], "dormant");
         assert_eq!(body["catalog"]["diagnosis_available"], false);
         assert_eq!(body["catalog"]["applied"], Value::Array(Vec::new()));
+        assert!(
+            body["catalog"]["dormant"]
+                .as_array()
+                .is_some_and(|entries| entries
+                    .iter()
+                    .all(|entry| entry["requirements_status"] == "incomplete"))
+        );
+    }
+
+    #[test]
+    fn global_catalog_readiness_is_not_a_request_skip() {
+        let body = no_data_response(7, &scan(), None);
+        assert!(
+            body["skipped"]["analysis"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(|entry| entry["scope"] != "catalog"))
+        );
     }
 
     #[test]
@@ -369,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_episode_does_not_activate_a_catalog_without_edge_evidence() {
+    fn lock_episode_does_not_activate_catalog_without_edge_evidence() {
         use crate::incident::{
             ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, SeriesSet,
             analyze,
@@ -421,11 +448,29 @@ mod tests {
         assert_eq!(body["catalog"]["status"], "dormant");
         assert_eq!(body["catalog"]["diagnosis_available"], false);
         assert_eq!(body["catalog"]["applied"], json!([]));
-        assert_eq!(body["catalog"]["dormant"][0]["lens_id"], "PG-LOCK-012");
+        let dormant = body["catalog"]["dormant"]
+            .as_array()
+            .expect("catalog lists dormant lenses");
+        assert_eq!(dormant.len(), 28);
+        let lock = dormant
+            .iter()
+            .find(|entry| entry["lens_id"] == "PG-LOCK-012")
+            .expect("lock lens is dormant");
         assert_eq!(
-            body["catalog"]["dormant"][0]["awaiting"],
+            lock["awaiting"],
             json!(["sampled_blocked_by_edges", "lock_snapshot_coverage"])
         );
-        assert_eq!(body["skipped"]["analysis"][0]["reason"]["kind"], "dormant");
+        assert!(
+            body["catalog"]["dormant"]
+                .as_array()
+                .expect("catalog is a list")
+                .iter()
+                .all(|entry| entry["requirements_status"] == "incomplete")
+        );
+        assert!(
+            body["skipped"]["analysis"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(|entry| entry["scope"] != "catalog"))
+        );
     }
 }
