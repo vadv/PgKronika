@@ -402,7 +402,10 @@ const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
     true
 }
 
-const _: () = assert!(catalog_is_valid(DORMANT_CATALOG));
+const _: () = assert!(
+    catalog_is_valid(DORMANT_CATALOG),
+    "dormant catalog violates static bounds"
+);
 
 #[cfg(test)]
 mod tests {
