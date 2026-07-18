@@ -93,6 +93,20 @@
           (mkStorePlans pkgs.postgresql_18 "vadv" "2.1" pg-store-plans-vadv)
         ]);
 
+        # Deps-only source: cargo manifests and sources, without the web UI
+        # `static` assets. Keeping `static` out of the dependency build makes
+        # `cargoArtifacts` a function of the manifests alone, so the BDD builder's
+        # prebuilt dependency derivation matches the runtime image build and is
+        # reused across source-only changes instead of recompiling every run.
+        depsSrc = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            (craneLib.fileset.commonCargoSources ./.)
+            (pkgs.lib.fileset.maybeMissing ./crates/kronika-reader/benches)
+            (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/benches)
+          ];
+        };
+
         commonArgs = {
           # Cargo-source filtering keeps only .rs files and manifests, which
           # drops the web UI assets rust-embed compiles into the binary; the
@@ -119,6 +133,7 @@
         cargoArtifacts = craneLib.buildDepsOnly (
           commonArgs
           // {
+            src = depsSrc;
             pname = "pgkronika-bdd-deps";
           }
         );
