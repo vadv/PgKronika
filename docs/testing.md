@@ -76,6 +76,10 @@ contract trusted publisher отдельно строит exact `bddPgMatrix`:
 `pg_store_plans`, `fakeNss` и `/bin/sh`. Поэтому source builder не скачивает
 PG closure второй раз. Mutable branch/main tags и fallback отсутствуют.
 
+`bddCargoArtifacts` исключает повторную сборку внешних Cargo dependencies, но
+не является compiler cache для first-party crates. Текущий workflow не заявляет
+only-affected compilation и явно выводит `first-party rustc cache: not configured`.
+
 ### PostgreSQL base
 
 PG base содержит только runtime closure PG15–18 и helpers. Stable paths:
