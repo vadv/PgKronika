@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::anomaly::ScanParams;
 use crate::incident::{
-    EngineOutcome, EngineSkip, EpisodeRefV1, Finding, IdentityValue, Incident, LimitAxis,
+    EngineOutcome, EngineSkip, EpisodeRefV1, IdentityValue, Incident, LimitAxis,
 };
 use crate::incident_input::{InputQuality, SectionSkip, SkipReason};
 
@@ -23,7 +23,7 @@ pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<
         "incidents": Value::Array(Vec::new()),
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(false),
+        "catalog": catalog_to_json(),
         "data_quality": quality_to_json(&quality, "unknown"),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some("no_data")),
     })
@@ -46,7 +46,7 @@ pub(crate) fn identity_response(
         "incidents": Value::Array(Vec::new()),
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(false),
+        "catalog": catalog_to_json(),
         "data_quality": quality_to_json(&quality, reason),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some(reason)),
     })
@@ -83,7 +83,7 @@ pub(crate) fn build_response(
         "incidents": incidents,
         "coverage_by_section": coverage_to_json(coverage),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(true),
+        "catalog": catalog_to_json(),
         "data_quality": quality_to_json(quality, "available"),
         "skipped": skipped_to_json(
             input_skipped,
@@ -97,39 +97,13 @@ pub(crate) fn build_response(
 
 fn incident_to_json(incident: &Incident) -> Value {
     let members: Vec<Value> = incident.members.iter().map(member_to_json).collect();
-    let findings: Vec<Value> = incident.findings.iter().map(finding_to_json).collect();
     json!({
         "interval": { "from": incident.start_us, "to": incident.end_us },
         "incident_key": hex(incident.key.canonical_bytes()),
         "members": members,
-        "findings": findings,
-        "evaluation_complete": incident.evaluation_complete,
-        "finding_evaluation_status": if incident.evaluation_complete {
-            "complete"
-        } else {
-            "partial"
-        },
-    })
-}
-
-fn finding_to_json(finding: &Finding) -> Value {
-    let scope = finding.scope();
-    let identity: Vec<Value> = scope.identity().iter().map(identity_to_json).collect();
-    let evidence: Vec<Value> = finding
-        .evidence()
-        .iter()
-        .map(|item| Value::from(item.label()))
-        .collect();
-    json!({
-        "lens_id": finding.lens_id(),
-        "role": finding.role().label(),
-        "confidence": finding.confidence().label(),
-        "scope": {
-            "logical_section": scope.logical_section(),
-            "column": scope.column(),
-            "identity": identity,
-        },
-        "evidence": evidence,
+        "findings": Value::Array(Vec::new()),
+        "evaluation_complete": false,
+        "finding_evaluation_status": "not_available",
     })
 }
 
@@ -153,22 +127,22 @@ fn identity_to_json(value: &IdentityValue) -> Value {
     }
 }
 
-fn catalog_to_json(applied: bool) -> Value {
-    let available: Vec<Value> = crate::incident::catalog_ids()
-        .into_iter()
-        .map(Value::from)
+fn catalog_to_json() -> Value {
+    let dormant: Vec<Value> = crate::incident::dormant_catalog()
+        .iter()
+        .map(|lens| {
+            json!({
+                "lens_id": lens.lens_id(),
+                "awaiting": lens.awaiting(),
+            })
+        })
         .collect();
-    let applied_ids = if applied {
-        available.clone()
-    } else {
-        Vec::new()
-    };
     json!({
-        "status": "active",
-        "diagnosis_available": applied && !available.is_empty(),
-        "available": available,
-        "applied": applied_ids,
-        "dormant": Value::Array(Vec::new()),
+        "status": "dormant",
+        "diagnosis_available": false,
+        "scope": "anomaly_clustering_only",
+        "applied": Value::Array(Vec::new()),
+        "dormant": dormant,
     })
 }
 
@@ -230,6 +204,13 @@ fn skipped_to_json(
             "reason": { "kind": reason },
         }));
     }
+    analysis.push(json!({
+        "scope": "catalog",
+        "reason": {
+            "kind": "dormant",
+            "awaiting": ["sampled_blocked_by_edges", "lock_snapshot_coverage"],
+        },
+    }));
     json!({
         "sections": sections,
         "evaluations": evaluations,
@@ -351,7 +332,8 @@ mod tests {
         assert_eq!(body["analysis_status"], "no_data");
         assert_eq!(body["data_age_seconds"], Value::Null);
         assert!(body["skipped"].get("sections").is_some());
-        assert_eq!(body["catalog"]["status"], "active");
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
         assert_eq!(body["catalog"]["applied"], Value::Array(Vec::new()));
     }
 
@@ -378,6 +360,8 @@ mod tests {
         assert_eq!(body["clustering_complete"], false);
         assert_eq!(body["complete"], false);
         assert_eq!(body["analysis_status"], "partial");
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["applied"], json!([]));
         assert_eq!(
             body["skipped"]["sections"][0]["reason"]["kind"],
             "incomplete_page",
@@ -385,10 +369,10 @@ mod tests {
     }
 
     #[test]
-    fn lock_findings_render_in_the_incident_json() {
+    fn a_lock_episode_does_not_activate_a_catalog_without_edge_evidence() {
         use crate::incident::{
-            ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, Lens,
-            SeriesSet, analyze, catalog,
+            ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, SeriesSet,
+            analyze,
         };
         use kronika_analytics::{Direction, Episode, Evaluated};
         use std::sync::Arc;
@@ -419,10 +403,8 @@ mod tests {
             },
         };
         let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
-        let catalog = catalog();
-        let lenses: Vec<&dyn Lens> = catalog.iter().map(AsRef::as_ref).collect();
-        let outcome = analyze(vec![episode], &SeriesSet::for_test(0), &lenses, &config)
-            .expect("valid analysis");
+        let outcome =
+            analyze(vec![episode], &SeriesSet::for_test(0), &[], &config).expect("valid analysis");
 
         let body = build_response(
             7,
@@ -434,13 +416,16 @@ mod tests {
             &[],
         );
 
-        let finding = &body["incidents"][0]["findings"][0];
-        assert_eq!(finding["lens_id"], "PG-LOCK-001");
-        assert_eq!(finding["role"], "coincident");
-        assert_eq!(finding["confidence"], "medium");
-        assert_eq!(finding["scope"]["logical_section"], "pg_locks");
-        assert_eq!(body["incidents"][0]["evaluation_complete"], true);
-        assert_eq!(body["catalog"]["status"], "active");
-        assert_eq!(body["catalog"]["applied"][0], "PG-LOCK-001");
+        assert_eq!(body["incidents"][0]["findings"], json!([]));
+        assert_eq!(body["incidents"][0]["evaluation_complete"], false);
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
+        assert_eq!(body["catalog"]["applied"], json!([]));
+        assert_eq!(body["catalog"]["dormant"][0]["lens_id"], "PG-LOCK-012");
+        assert_eq!(
+            body["catalog"]["dormant"][0]["awaiting"],
+            json!(["sampled_blocked_by_edges", "lock_snapshot_coverage"])
+        );
+        assert_eq!(body["skipped"]["analysis"][0]["reason"]["kind"], "dormant");
     }
 }

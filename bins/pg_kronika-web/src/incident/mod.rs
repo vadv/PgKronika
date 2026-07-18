@@ -20,6 +20,9 @@ pub(crate) use dispatch::LimitAxis;
 pub(crate) use engine::{
     AnalyzeError, ClockRelation, EngineOutcome, EngineSkip, Incident, IncidentConfig, analyze,
 };
-pub(crate) use evidence::Finding;
+#[allow(
+    unused_imports,
+    reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"
+)]
 pub(crate) use lens::Lens;
-pub(crate) use lenses::{catalog, catalog_ids};
+pub(crate) use lenses::dormant_catalog;

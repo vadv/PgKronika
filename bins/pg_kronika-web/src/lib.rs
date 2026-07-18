@@ -958,24 +958,21 @@ mod tests {
         ] {
             assert!(body.get(field).is_some(), "response carries {field}");
         }
-        assert_eq!(
-            body["complete"], false,
-            "the diagnostic catalog is still partial"
-        );
+        assert_eq!(body["complete"], false);
         assert_eq!(body["clustering_complete"], true);
         assert_eq!(body["analysis_status"], "incidents_detected");
-        assert_eq!(body["catalog"]["status"], "active");
-        assert_eq!(body["catalog"]["diagnosis_available"], true);
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
+        assert_eq!(body["catalog"]["applied"], serde_json::json!([]));
+        assert_eq!(body["catalog"]["dormant"][0]["lens_id"], "PG-LOCK-012");
         let incidents = body["incidents"].as_array().expect("incidents is an array");
         assert!(
             !incidents.is_empty(),
             "the spike must cluster into an incident"
         );
-        assert_eq!(
-            incidents[0]["findings"],
-            serde_json::json!([]),
-            "the archiver spike carries no lock contention, so no lock finding"
-        );
+        assert_eq!(incidents[0]["findings"], serde_json::json!([]));
+        assert_eq!(incidents[0]["evaluation_complete"], false);
+        assert_eq!(incidents[0]["finding_evaluation_status"], "not_available");
         let members = incidents[0]["members"]
             .as_array()
             .expect("members is an array");
