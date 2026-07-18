@@ -2,6 +2,7 @@
 set -euo pipefail
 
 KEY_SCHEMA=2
+COMPILER_CACHE_SCHEMA=1
 CARGO_TARGET=x86_64-unknown-linux-musl
 CARGO_FEATURES=default
 PG_MAJORS=15,16,17,18
@@ -67,6 +68,7 @@ Usage: scripts/bdd-image.sh <command>
 Key and metadata commands:
   deps-key                  Full immutable dependency key.
   source-key                Full source/app content key.
+  compiler-cache-key        First-party compiler cache namespace.
   app-key DEPS_REF PG_REF   Full runtime key, bound to immutable digests.
   keys-json                 Machine-readable key contract.
   deps-paths                Dependency content and target-topology inputs.
@@ -106,6 +108,8 @@ Important overrides:
   BDD_PG_BASE_DIGEST_REF    Resolved PG base repo@sha256 ref.
   BDD_RUNTIME_IMAGE         Exact runtime image tag.
   BDD_APP_LAYER             App tar path, default app-layer.tar.
+  BDD_SCCACHE_DIR           Restored compiler cache directory.
+  BDD_SCCACHE_MODE          READ_ONLY for PRs, READ_WRITE for trusted runs.
   BDD_SOURCE_COMMIT         OCI revision label.
   DEBUG                     Passed to the BDD container.
 EOF
@@ -194,6 +198,12 @@ source_key() {
     printf 'schema\0%s\0platform\0%s\0' "$KEY_SCHEMA" "$(platform)"
     print_git_paths "${APP_KEY_PATHS[@]}" | hash_files
   } | sha256_stream
+}
+
+compiler_cache_key() {
+  printf 'schema\0%s\0platform\0%s\0target\0%s\0features\0%s\0dependency\0%s\0' \
+    "$COMPILER_CACHE_SCHEMA" "$(platform)" "$CARGO_TARGET" "$CARGO_FEATURES" "$(deps_key)" \
+    | sha256_stream
 }
 
 source_revision() {
@@ -303,8 +313,8 @@ dependency_context_tar() {
 }
 
 keys_json() {
-  printf '{"schema":%s,"platform":"%s","cargo_target":"%s","cargo_features":"%s","postgresql_majors":[15,16,17,18],"nix_base":"%s","dependency_key":"%s","source_key":"%s"}\n' \
-    "$KEY_SCHEMA" "$(platform)" "$CARGO_TARGET" "$CARGO_FEATURES" "$NIX_BASE_IMAGE" "$(deps_key)" "$(source_key)"
+  printf '{"schema":%s,"platform":"%s","cargo_target":"%s","cargo_features":"%s","postgresql_majors":[15,16,17,18],"nix_base":"%s","dependency_key":"%s","source_key":"%s","compiler_cache_key":"%s"}\n' \
+    "$KEY_SCHEMA" "$(platform)" "$CARGO_TARGET" "$CARGO_FEATURES" "$NIX_BASE_IMAGE" "$(deps_key)" "$(source_key)" "$(compiler_cache_key)"
 }
 
 print_dependency_paths() {
@@ -424,6 +434,7 @@ verify_dependency_image() {
     test "$(cat /opt/bdd-cache/schema)" = "$1"
     test "$(cat /opt/bdd-cache/dependency-key)" = "$2"
     test -s /opt/bdd-cache/cargo-closure.json
+    test -x /opt/bdd-cache/compiler-tools/bin/sccache
   ' sh "$KEY_SCHEMA" "$expected"
 }
 
@@ -457,19 +468,76 @@ verify_pg_runtime() {
 }
 
 run_app_nix() {
-  local ref=$1 mode=$2
-  source_tar "${APP_SOURCE_PATHS[@]}" | docker_cmd run --rm -i "$ref" sh -ceu '
+  local ref=$1 mode=$2 cache_dir cache_mode mount_mode
+  cache_dir=${BDD_SCCACHE_DIR:-}
+  cache_mode=${BDD_SCCACHE_MODE:-READ_ONLY}
+  [ -n "$cache_dir" ] || fail "BDD_SCCACHE_DIR is required for source builds"
+  [ -d "$cache_dir" ] || fail "BDD_SCCACHE_DIR does not exist: $cache_dir"
+  case "$cache_mode" in
+    READ_ONLY) mount_mode=ro ;;
+    READ_WRITE) mount_mode=rw ;;
+    *) fail "BDD_SCCACHE_MODE must be READ_ONLY or READ_WRITE" ;;
+  esac
+  source_tar "${APP_SOURCE_PATHS[@]}" | docker_cmd run --rm -i \
+    -v "$cache_dir:/var/cache/pgkronika-sccache:$mount_mode" \
+    "$ref" sh -ceu '
     mode=$1
+    cache_mode=$2
     mkdir -p /tmp/src
     tar -C /tmp/src -xf -
     cd /tmp/src
     if [ "$mode" = plan ]; then
       nix build .#bddAppLayer --dry-run --no-link
     else
-      nix build .#bddAppLayer --out-link /tmp/bdd-app-layer 1>&2
+      export PATH="/opt/bdd-cache/compiler-tools/bin:$PATH"
+      export SCCACHE_DIR=/var/cache/pgkronika-sccache
+      export SCCACHE_LOCAL_RW_MODE="$cache_mode"
+      export SCCACHE_CACHE_SIZE=2G
+      # Nix changes source store paths when src changes. The outer cache
+      # namespace already binds the exact dependency/toolchain contract, so
+      # normalise only paths inside this isolated build container.
+      export SCCACHE_BASEDIRS=/tmp:/build:/nix/store
+      export SCCACHE_IDLE_TIMEOUT=0
+      sccache --start-server 1>&2
+      sccache --zero-stats 1>&2
+      trap "sccache --stop-server >/dev/null 2>&1 || true" EXIT
+      nix build --option sandbox false .#bddAppLayer --out-link /tmp/bdd-app-layer 1>&2
+      printf "BDD_SCCACHE_STATS=" 1>&2
+      sccache --show-stats --stats-format=json 1>&2
+      printf "\n" 1>&2
       cat "$(readlink -f /tmp/bdd-app-layer)"
     fi
-  ' sh "$mode"
+  ' sh "$mode" "$cache_mode"
+}
+
+report_sccache_stats() {
+  local build_log=$1 stats_json metrics
+  stats_json=$(sed -n 's/^BDD_SCCACHE_STATS=//p' "$build_log" | tail -n 1)
+  [ -n "$stats_json" ] || fail "sccache did not report compiler statistics"
+  metrics=$(python3 - "$stats_json" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])["stats"]
+
+def total(name):
+    value = data[name]
+    return sum(value.get("counts", {}).values())
+
+print(data["compile_requests"], total("cache_hits"), total("cache_misses"),
+      data["compilations"], data["cache_write_errors"], sep="\t")
+PY
+  )
+  IFS=$'\t' read -r SCCACHE_REQUESTS SCCACHE_HITS SCCACHE_MISSES SCCACHE_COMPILATIONS SCCACHE_WRITE_ERRORS <<< "$metrics"
+  [ "$SCCACHE_REQUESTS" -gt 0 ] || fail "source build issued no rustc requests through sccache"
+  [ "$SCCACHE_WRITE_ERRORS" -eq 0 ] || fail "sccache reported write errors"
+  append_summary "- sccache compile requests: $SCCACHE_REQUESTS"
+  append_summary "- sccache hits: $SCCACHE_HITS"
+  append_summary "- sccache misses: $SCCACHE_MISSES"
+  append_summary "- sccache compilations: $SCCACHE_COMPILATIONS"
+  append_summary "- sccache write errors: $SCCACHE_WRITE_ERRORS"
+  printf 'sccache requests=%s hits=%s misses=%s compilations=%s write_errors=%s\n' \
+    "$SCCACHE_REQUESTS" "$SCCACHE_HITS" "$SCCACHE_MISSES" "$SCCACHE_COMPILATIONS" "$SCCACHE_WRITE_ERRORS" >&2
 }
 
 build_app_layer() {
@@ -507,8 +575,11 @@ build_app_layer() {
   append_summary "- dependency digest: \`$deps_ref\`"
   append_summary "- PostgreSQL base digest: \`$pg_ref\`"
   append_summary "- source key: \`$(source_key)\`"
+  append_summary "- compiler cache key: \`$(compiler_cache_key)\`"
+  append_summary "- compiler cache mode: \`${BDD_SCCACHE_MODE:-READ_ONLY}\`"
   append_summary "- Cargo dependency derivations planned/fetched/built: 0"
   append_summary "- PostgreSQL derivations planned/fetched/built: 0"
+  report_sccache_stats "$build_log"
   append_summary "- app-layer bytes: $(wc -c < "$output")"
   append_summary "- app build seconds: $elapsed"
   rm -f "$plan" "$build_log"
@@ -610,6 +681,7 @@ cmd=${1:-}
 case "$cmd" in
   deps-key) deps_key ;;
   source-key|image-key) source_key ;;
+  compiler-cache-key) compiler_cache_key ;;
   app-key) shift; app_key "$@" ;;
   keys-json) keys_json ;;
   deps-paths|builder-paths) print_dependency_paths ;;

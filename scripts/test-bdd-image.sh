@@ -68,13 +68,15 @@ mutate_and_key() {
 }
 
 test_keys_are_full_and_machine_readable() {
-  local deps source json
+  local deps source compiler json
   deps=$(run_script "$SCRIPT" deps-key)
   source=$(run_script "$SCRIPT" source-key)
+  compiler=$(run_script "$SCRIPT" compiler-cache-key)
   [[ "$deps" =~ ^[0-9a-f]{64}$ ]] || fail "dependency key is not full SHA-256"
   [[ "$source" =~ ^[0-9a-f]{64}$ ]] || fail "source key is not full SHA-256"
+  [[ "$compiler" =~ ^[0-9a-f]{64}$ ]] || fail "compiler cache key is not full SHA-256"
   json=$(run_script "$SCRIPT" keys-json)
-  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema"] == 2; assert d["postgresql_majors"] == [15,16,17,18]' <<< "$json"
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema"] == 2; assert d["postgresql_majors"] == [15,16,17,18]; assert len(d["compiler_cache_key"]) == 64' <<< "$json"
 }
 
 test_default_images_use_flat_ghcr_packages() {
@@ -112,17 +114,20 @@ test_complete_dependency_inputs_change_key() {
 }
 
 test_source_body_changes_only_source_key() {
-  local repo script before_deps after_deps before_source after_source file
+  local repo script before_deps after_deps before_source after_source before_compiler after_compiler file
   repo=$(make_repo_copy)
   script="$repo/scripts/bdd-image.sh"
   file="$repo/bins/pg_kronika-web/src/lib.rs"
   before_deps=$(run_script "$script" deps-key)
   before_source=$(run_script "$script" source-key)
+  before_compiler=$(run_script "$script" compiler-cache-key)
   printf '\n#[cfg(test)] mod cache_contract_probe {}\n' >> "$file"
   after_deps=$(run_script "$script" deps-key)
   after_source=$(run_script "$script" source-key)
+  after_compiler=$(run_script "$script" compiler-cache-key)
   assert_eq "$after_deps" "$before_deps"
   [ "$after_source" != "$before_source" ] || fail "Rust source must change source key"
+  assert_eq "$after_compiler" "$before_compiler"
 }
 
 test_target_topology_changes_dependency_key_without_hashing_body() {
@@ -179,6 +184,19 @@ test_nix_build_declares_musl_compiler() {
   assert_contains "$file" 'nativeBuildInputs = [ pkgs.pkgsMusl.stdenv.cc ];'
   assert_contains "$file" 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER ='
   assert_contains "$file" 'CC_x86_64_unknown_linux_musl ='
+}
+
+test_nix_source_build_uses_first_party_sccache() {
+  local flake="$ROOT/flake.nix" dockerfile="$ROOT/Dockerfile.bdd-builder"
+  assert_contains "$flake" 'paths = [ pkgs.sccache ];'
+  assert_contains "$flake" 'RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";'
+  assert_contains "$flake" 'bddCompilerTools = compilerTools;'
+  assert_contains "$dockerfile" 'nix build .#bddCompilerTools --out-link /opt/bdd-cache/compiler-tools'
+  assert_contains "$SCRIPT" 'SCCACHE_LOCAL_RW_MODE="$cache_mode"'
+  assert_contains "$SCRIPT" 'sccache --show-stats --stats-format=json'
+  assert_contains "$SCRIPT" 'nix build --option sandbox false .#bddAppLayer'
+  assert_not_contains "$SCRIPT" 'ACTIONS_RUNTIME_TOKEN'
+  assert_not_contains "$dockerfile" 'ACTIONS_RUNTIME_TOKEN'
 }
 
 test_pg_base_verification_needs_no_coreutils() {
@@ -249,9 +267,12 @@ fi
 
 if [ "$1" = run ]; then
   cat >/dev/null || true
-  case "${*: -1}" in
+  case "${*: -2:1}" in
     plan) echo 'these derivations will be built: bdd-app-layer pgkronika-bins' ;;
-    build) printf 'thin-app-layer' ;;
+    build)
+      echo 'BDD_SCCACHE_STATS={"stats":{"compile_requests":12,"cache_hits":{"counts":{"Rust":8},"adv_counts":{}},"cache_misses":{"counts":{"Rust":4},"adv_counts":{}},"compilations":4,"cache_write_errors":0}}' >&2
+      printf 'thin-app-layer'
+      ;;
   esac
   exit 0
 fi
@@ -306,15 +327,19 @@ test_publish_requires_explicit_trust() {
 }
 
 test_app_build_uses_digest_and_reports_zero_pg_work() {
-  local layer="$TEST_TMP/app-layer.tar"
+  local layer="$TEST_TMP/app-layer.tar" cache="$TEST_TMP/app-cache"
+  mkdir -p "$cache"
   run_mock app-build env \
     BDD_DEPENDENCY_DIGEST_REF=ghcr.io/acme/deps@sha256:111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000 \
     BDD_PG_BASE_DIGEST_REF=ghcr.io/acme/pg@sha256:111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000 \
     BDD_APP_LAYER="$layer" \
+    BDD_SCCACHE_DIR="$cache" \
+    BDD_SCCACHE_MODE=READ_ONLY \
     "$SCRIPT" build-app-layer
   assert_contains "$MOCK_DOCKER_LOG" 'ghcr.io/acme/deps@sha256:'
   assert_not_contains "$MOCK_DOCKER_LOG" 'build-dependencies'
   assert_eq "$(cat "$layer")" 'thin-app-layer'
+  assert_contains "$MOCK_DOCKER_LOG" '/var/cache/pgkronika-sccache:ro'
 }
 
 test_runtime_assembly_is_one_layer_over_pg_digest() {
@@ -349,6 +374,18 @@ test_workflow_enforces_trust_and_short_circuit() {
   assert_not_contains "$workflow" 'branch-main'
 }
 
+test_compiler_cache_is_source_independent_and_trust_split() {
+  local workflow="$ROOT/.github/workflows/ci.yml" cache_lines="$TEST_TMP/cache-lines"
+  grep -F 'bdd-sccache-${{ needs.bdd-meta.outputs.compiler_cache_key }}-' "$workflow" > "$cache_lines"
+  assert_not_contains "$cache_lines" 'source_key'
+  assert_contains "$workflow" 'uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830'
+  assert_contains "$workflow" 'uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830'
+  assert_contains "$workflow" "needs.bdd-meta.outputs.can_publish == 'true'"
+  assert_contains "$workflow" "needs.bdd-meta.outputs.can_publish == 'true' && 'READ_WRITE' || 'READ_ONLY'"
+  assert_contains "$workflow" 'BDD_SCCACHE_MODE:'
+  assert_not_contains "$workflow" 'ACTIONS_RUNTIME_TOKEN'
+}
+
 test_same_repo_pr_delegates_to_trusted_push_without_deadlock() {
   local workflow="$ROOT/.github/workflows/ci.yml"
   assert_contains "$workflow" "github.event.pull_request.head.repo.full_name == github.repository && 'delegate' || 'consume'"
@@ -381,6 +418,7 @@ for test in \
   test_dependency_context_uses_exact_dummy_topology \
   test_pg_matrix_uses_exact_with_packages_closures \
   test_nix_build_declares_musl_compiler \
+  test_nix_source_build_uses_first_party_sccache \
   test_pg_base_verification_needs_no_coreutils \
   test_workflow_checks_pg_structure_before_bdd \
   test_source_only_plan_gate \
@@ -390,6 +428,7 @@ for test in \
   test_app_build_uses_digest_and_reports_zero_pg_work \
   test_runtime_assembly_is_one_layer_over_pg_digest \
   test_workflow_enforces_trust_and_short_circuit \
+  test_compiler_cache_is_source_independent_and_trust_split \
   test_same_repo_pr_delegates_to_trusted_push_without_deadlock \
   test_fork_pr_has_no_publisher_route_or_credentials
 do

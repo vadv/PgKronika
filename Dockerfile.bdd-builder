@@ -13,6 +13,7 @@ RUN mkdir -p /opt/bdd-cache \
  && test "$(cat .bdd-cache-schema)" = "$BDD_KEY_SCHEMA" \
  && test "$(cat .bdd-dependency-key)" = "$BDD_DEPENDENCY_KEY" \
  && nix build .#bddCargoArtifacts --out-link /opt/bdd-cache/cargo-artifacts \
+ && nix build .#bddCompilerTools --out-link /opt/bdd-cache/compiler-tools \
  && nix build .#bddCargoClosureManifest --out-link /tmp/cargo-closure \
  && cp -L /tmp/cargo-closure /opt/bdd-cache/cargo-closure.json \
  && cp .bdd-cache-schema /opt/bdd-cache/schema \

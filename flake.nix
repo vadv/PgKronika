@@ -127,12 +127,19 @@
           }
         );
 
+        compilerTools = pkgs.symlinkJoin {
+          name = "pgkronika-bdd-compiler-tools";
+          paths = [ pkgs.sccache ];
+        };
+
         # One store path lets the runner spawn the collector.
         bins = craneLib.buildPackage (
           commonArgs
           // {
             inherit cargoArtifacts;
             pname = "pgkronika-bins";
+            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.sccache ];
+            RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
           }
         );
 
@@ -188,6 +195,7 @@
             target = "x86_64-unknown-linux-musl";
             features = "default";
             cargoArtifacts = "${cargoArtifacts}";
+            compilerTools = "${compilerTools}";
           }
         );
 
@@ -255,8 +263,10 @@
             bddPgClosureManifest
             bddCargoClosureManifest
             bddAppLayer
+            compilerTools
             ;
           bddCargoArtifacts = cargoArtifacts;
+          bddCompilerTools = compilerTools;
         } // pgMatrix;
 
         devShells.default = craneLib.devShell {

@@ -83,6 +83,7 @@ jobs:
     outputs:
       dependency_key: ${{ steps.meta.outputs.dependency_key }}
       source_key: ${{ steps.meta.outputs.source_key }}
+      compiler_cache_key: ${{ steps.meta.outputs.compiler_cache_key }}
       platform_slug: ${{ steps.meta.outputs.platform_slug }}
       dependency_image: ${{ steps.meta.outputs.dependency_image }}
       pg_base_image: ${{ steps.meta.outputs.pg_base_image }}
@@ -101,6 +102,7 @@ jobs:
           export BDD_IMAGE_PREFIX="ghcr.io/$owner"
           dependency_key=$(./scripts/bdd-image.sh deps-key)
           source_key=$(./scripts/bdd-image.sh source-key)
+          compiler_cache_key=$(./scripts/bdd-image.sh compiler-cache-key)
           platform_slug=$(./scripts/bdd-image.sh platform-slug)
           dependency_image=$(./scripts/bdd-image.sh dependency-image)
           pg_base_image=$(./scripts/bdd-image.sh pg-base-image)
@@ -112,6 +114,7 @@ jobs:
           {
             echo "dependency_key=$dependency_key"
             echo "source_key=$source_key"
+            echo "compiler_cache_key=$compiler_cache_key"
             echo "platform_slug=$platform_slug"
             echo "dependency_image=$dependency_image"
             echo "pg_base_image=$pg_base_image"
@@ -125,7 +128,7 @@ jobs:
             echo "- source key: \`$source_key\`"
             echo '- Cargo target/features: `x86_64-unknown-linux-musl` / `default`'
             echo '- PostgreSQL matrix: `15,16,17,18` with `pg_store_plans`'
-            echo '- first-party rustc cache: `not configured` (no only-affected compilation claim)'
+            echo "- first-party compiler cache: \`$compiler_cache_key\` (sccache/GHA, source excluded)"
             echo "- trusted publication: \`$can_publish\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -343,6 +346,30 @@ jobs:
       - name: Pull exact runtime image
         if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit == 'true'
         run: docker pull "${{ steps.final.outputs.digest_ref }}"
+      - name: Restore first-party compiler cache
+        id: sccache-restore
+        if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit != 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/bdd-sccache
+          key: bdd-sccache-${{ needs.bdd-meta.outputs.compiler_cache_key }}-${{ github.run_id }}
+          restore-keys: |
+            bdd-sccache-${{ needs.bdd-meta.outputs.compiler_cache_key }}-
+      - name: Prepare first-party compiler cache
+        if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit != 'true'
+        env:
+          BDD_SCCACHE_DIR: ${{ runner.temp }}/bdd-sccache
+          BDD_SCCACHE_MATCHED_KEY: ${{ steps.sccache-restore.outputs.cache-matched-key }}
+        run: |
+          mkdir -p "$BDD_SCCACHE_DIR"
+          chmod 0777 "$BDD_SCCACHE_DIR"
+          {
+            echo '## BDD first-party compiler cache'
+            echo
+            echo "- namespace: \`${{ needs.bdd-meta.outputs.compiler_cache_key }}\`"
+            echo "- restored generation: \`${BDD_SCCACHE_MATCHED_KEY:-none}\`"
+            echo "- mode: \`${{ needs.bdd-meta.outputs.can_publish == 'true' && 'READ_WRITE' || 'READ_ONLY' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Free disk space for the source build
         if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit != 'true'
         run: |
@@ -361,6 +388,8 @@ jobs:
           BDD_DEPENDENCY_DIGEST_REF: ${{ steps.refs.outputs.dependency_digest_ref }}
           BDD_PG_BASE_DIGEST_REF: ${{ steps.refs.outputs.pg_digest_ref }}
           BDD_APP_LAYER: app-layer.tar
+          BDD_SCCACHE_DIR: ${{ runner.temp }}/bdd-sccache
+          BDD_SCCACHE_MODE: ${{ needs.bdd-meta.outputs.can_publish == 'true' && 'READ_WRITE' || 'READ_ONLY' }}
         run: ./scripts/bdd-image.sh build-app-layer
       - name: Assemble local runtime
         if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit != 'true'
@@ -394,6 +423,12 @@ jobs:
             image="${{ steps.refs.outputs.runtime_image }}"
           fi
           docker run --rm "$image"
+      - name: Save trusted first-party compiler cache
+        if: steps.route.outputs.mode == 'consume' && needs.bdd-meta.outputs.can_publish == 'true' && steps.final.outputs.hit != 'true' && success()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/bdd-sccache
+          key: bdd-sccache-${{ needs.bdd-meta.outputs.compiler_cache_key }}-${{ github.run_id }}
 
   bdd-final-publish:
     name: bdd trusted runtime publish

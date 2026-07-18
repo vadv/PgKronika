@@ -42,6 +42,12 @@ if [ -z "$BDD_DEPENDENCY_DIGEST_REF" ] || [ -z "$BDD_PG_BASE_DIGEST_REF" ]; then
 fi
 export BDD_DEPENDENCY_DIGEST_REF BDD_PG_BASE_DIGEST_REF
 
+BDD_SCCACHE_DIR=${BDD_SCCACHE_DIR:-${TMPDIR:-/tmp}/pgkronika-bdd-sccache}
+mkdir -p "$BDD_SCCACHE_DIR"
+chmod 0777 "$BDD_SCCACHE_DIR"
+export BDD_SCCACHE_DIR
+export BDD_SCCACHE_MODE=${BDD_SCCACHE_MODE:-READ_WRITE}
+
 runtime_image=${BDD_RUNTIME_IMAGE:-}
 if [ -z "$runtime_image" ]; then
   runtime_image=$("$ROOT/scripts/bdd-image.sh" runtime-image \
