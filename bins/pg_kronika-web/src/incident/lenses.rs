@@ -13,6 +13,7 @@ pub(crate) enum MissingCapability {
     SourcePeriod,
     InputCoverage,
     EntityJoin,
+    StructuredEvidence,
     TrackPlanningGate,
     StorePlansBridge,
     BlockedByEdges,
@@ -31,6 +32,7 @@ impl MissingCapability {
             Self::SourcePeriod => "source_period_provenance",
             Self::InputCoverage => "request_input_coverage",
             Self::EntityJoin => "cross_section_entity_join",
+            Self::StructuredEvidence => "structured_numeric_evidence",
             Self::TrackPlanningGate => "track_planning_gate",
             Self::StorePlansBridge => "store_plans_bridge",
             Self::BlockedByEdges => "sampled_blocked_by_edges",
@@ -149,6 +151,17 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::EntityJoin,
+            Missing::SourcePeriod,
+            Missing::InputCoverage,
+        ],
+    },
+    DormantLens {
+        lens_id: "PG-CACHE-010",
+        missing: &[
+            Missing::CounterDeltas,
+            Missing::PairedIntervals,
+            Missing::EntityJoin,
+            Missing::StructuredEvidence,
             Missing::SourcePeriod,
             Missing::InputCoverage,
         ],
@@ -401,7 +414,7 @@ const _: () = assert!(
 mod tests {
     use super::*;
 
-    const EXPECTED_LENSES: [&str; 27] = [
+    const EXPECTED_LENSES: [&str; 28] = [
         "PG-QRY-001",
         "PG-PLAN-002",
         "PG-TEMP-003",
@@ -411,6 +424,7 @@ mod tests {
         "PG-HOT-007",
         "PG-CHKPT-008",
         "PG-WAL-009",
+        "PG-CACHE-010",
         "PG-IO-011",
         "PG-LOCK-012",
         "PG-HORIZON-013",

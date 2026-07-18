@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::anomaly::ScanParams;
 use crate::incident::{
-    EngineOutcome, EngineSkip, EpisodeRefV1, Finding, IdentityValue, Incident, LimitAxis,
+    EngineOutcome, EngineSkip, EpisodeRefV1, IdentityValue, Incident, LimitAxis,
 };
 use crate::incident_input::{InputQuality, SectionSkip, SkipReason};
 
@@ -97,39 +97,13 @@ pub(crate) fn build_response(
 
 fn incident_to_json(incident: &Incident) -> Value {
     let members: Vec<Value> = incident.members.iter().map(member_to_json).collect();
-    let findings: Vec<Value> = incident.findings.iter().map(finding_to_json).collect();
     json!({
         "interval": { "from": incident.start_us, "to": incident.end_us },
         "incident_key": hex(incident.key.canonical_bytes()),
         "members": members,
-        "findings": findings,
-        "evaluation_complete": incident.evaluation_complete,
-        "finding_evaluation_status": if incident.evaluation_complete {
-            "complete"
-        } else {
-            "partial"
-        },
-    })
-}
-
-fn finding_to_json(finding: &Finding) -> Value {
-    let scope = finding.scope();
-    let identity: Vec<Value> = scope.identity().iter().map(identity_to_json).collect();
-    let evidence: Vec<Value> = finding
-        .evidence()
-        .iter()
-        .map(|item| Value::from(item.label()))
-        .collect();
-    json!({
-        "lens_id": finding.lens_id(),
-        "role": finding.role().label(),
-        "confidence": finding.confidence().label(),
-        "scope": {
-            "logical_section": scope.logical_section(),
-            "column": scope.column(),
-            "identity": identity,
-        },
-        "evidence": evidence,
+        "findings": Value::Array(Vec::new()),
+        "evaluation_complete": false,
+        "finding_evaluation_status": "not_available",
     })
 }
 
@@ -169,16 +143,12 @@ fn catalog_to_json() -> Value {
             })
         })
         .collect();
-    let applied: Vec<Value> = crate::incident::active_catalog_ids()
-        .into_iter()
-        .map(Value::from)
-        .collect();
     json!({
-        "status": "partial",
+        "status": "dormant",
         "requirements_status": "incomplete",
-        "diagnosis_available": !applied.is_empty(),
-        "scope": "diagnostic_lenses",
-        "applied": applied,
+        "diagnosis_available": false,
+        "scope": "anomaly_clustering_only",
+        "applied": Value::Array(Vec::new()),
         "dormant": dormant,
     })
 }
@@ -372,9 +342,9 @@ mod tests {
         assert_eq!(body["analysis_status"], "no_data");
         assert_eq!(body["data_age_seconds"], Value::Null);
         assert!(body["skipped"].get("sections").is_some());
-        assert_eq!(body["catalog"]["status"], "partial");
-        assert_eq!(body["catalog"]["diagnosis_available"], true);
-        assert_eq!(body["catalog"]["applied"], json!(["PG-CACHE-010"]));
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
+        assert_eq!(body["catalog"]["applied"], Value::Array(Vec::new()));
         assert!(
             body["catalog"]["dormant"]
                 .as_array()
@@ -391,6 +361,29 @@ mod tests {
             body["skipped"]["analysis"]
                 .as_array()
                 .is_some_and(|entries| entries.iter().all(|entry| entry["scope"] != "catalog"))
+        );
+    }
+
+    #[test]
+    fn catalog_does_not_activate_lens_without_structured_evidence() {
+        let body = no_data_response(7, &scan(), None);
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
+        assert_eq!(body["catalog"]["applied"], json!([]));
+        assert!(
+            body["catalog"]["dormant"]
+                .as_array()
+                .and_then(|entries| entries
+                    .iter()
+                    .find(|entry| entry["lens_id"] == "PG-CACHE-010"))
+                .is_some_and(|entry| {
+                    entry["requirements_status"] == "incomplete"
+                        && entry["awaiting"].as_array().is_some_and(|requirements| {
+                            requirements
+                                .iter()
+                                .any(|item| item == "structured_numeric_evidence")
+                        })
+                })
         );
     }
 
@@ -417,8 +410,8 @@ mod tests {
         assert_eq!(body["clustering_complete"], false);
         assert_eq!(body["complete"], false);
         assert_eq!(body["analysis_status"], "partial");
-        assert_eq!(body["catalog"]["status"], "partial");
-        assert_eq!(body["catalog"]["applied"], json!(["PG-CACHE-010"]));
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["applied"], json!([]));
         assert_eq!(
             body["skipped"]["sections"][0]["reason"]["kind"],
             "incomplete_page",
@@ -429,7 +422,7 @@ mod tests {
     fn lock_episode_does_not_activate_catalog_without_edge_evidence() {
         use crate::incident::{
             ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, SeriesSet,
-            TypedInputs, analyze,
+            analyze,
         };
         use kronika_analytics::{Direction, Episode, Evaluated};
         use std::sync::Arc;
@@ -460,14 +453,8 @@ mod tests {
             },
         };
         let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
-        let outcome = analyze(
-            vec![episode],
-            &SeriesSet::for_test(0),
-            &TypedInputs::new(),
-            &[],
-            &config,
-        )
-        .expect("valid analysis");
+        let outcome =
+            analyze(vec![episode], &SeriesSet::for_test(0), &[], &config).expect("valid analysis");
 
         let body = build_response(
             7,
@@ -480,14 +467,14 @@ mod tests {
         );
 
         assert_eq!(body["incidents"][0]["findings"], json!([]));
-        assert_eq!(body["incidents"][0]["evaluation_complete"], true);
-        assert_eq!(body["catalog"]["status"], "partial");
-        assert_eq!(body["catalog"]["diagnosis_available"], true);
-        assert_eq!(body["catalog"]["applied"], json!(["PG-CACHE-010"]));
+        assert_eq!(body["incidents"][0]["evaluation_complete"], false);
+        assert_eq!(body["catalog"]["status"], "dormant");
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
+        assert_eq!(body["catalog"]["applied"], json!([]));
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 27);
+        assert_eq!(dormant.len(), 28);
         let lock = dormant
             .iter()
             .find(|entry| entry["lens_id"] == "PG-LOCK-012")
@@ -508,98 +495,5 @@ mod tests {
                 .as_array()
                 .is_some_and(|entries| entries.iter().all(|entry| entry["scope"] != "catalog"))
         );
-    }
-
-    #[test]
-    fn a_cache_miss_finding_renders_role_evidence_and_scope() {
-        use crate::incident::{
-            ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, Lens,
-            SeriesSet, TypedInputs, active_catalog, analyze,
-        };
-        use kronika_analytics::{DiffPoint, Direction, Episode, Evaluated, Scalar};
-        use std::sync::Arc;
-
-        let identity: Arc<[IdentityValue]> = Arc::from(vec![IdentityValue::U64(5)]);
-        // One-second intervals, so the recovered delta equals the rate.
-        let point = |delta: f64| DiffPoint::Value {
-            delta: Scalar::Int(0),
-            rate: delta,
-            dt_micros: 1_000_000,
-        };
-        let counter = |deltas: [f64; 3]| -> Vec<(i64, DiffPoint)> {
-            deltas
-                .iter()
-                .zip(0_i64..)
-                .map(|(&d, ts)| (ts, point(d)))
-                .collect()
-        };
-        let mut typed = TypedInputs::new();
-        // Cold cache: reads dominate hits over three valid intervals.
-        typed.insert_counter(
-            "pg_stat_database",
-            "blks_read",
-            Arc::clone(&identity),
-            counter([30.0, 30.0, 20.0]),
-        );
-        typed.insert_counter(
-            "pg_stat_database",
-            "blks_hit",
-            Arc::clone(&identity),
-            counter([5.0, 5.0, 10.0]),
-        );
-
-        let episode = EnrichedEpisode {
-            episode: Episode {
-                start: 0,
-                end: 0,
-                peak_ts: 0,
-                peak: Evaluated {
-                    m: 0.0,
-                    dir: Direction::Up,
-                    med_cur: 0.0,
-                    med_ref: 0.0,
-                    mad_ref: 1.0,
-                    sigma_used: 1.4826,
-                    n_cur: 0,
-                    n_ref: 0,
-                },
-            },
-            reference: EpisodeRefV1 {
-                logical_section: "pg_stat_database",
-                column: "blks_read",
-                identity: Arc::clone(&identity),
-                start_us: 0,
-                end_us: 10,
-            },
-        };
-        let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
-        let catalog = active_catalog();
-        let lenses: Vec<&dyn Lens> = catalog.iter().map(AsRef::as_ref).collect();
-        let outcome = analyze(
-            vec![episode],
-            &SeriesSet::for_test(0),
-            &typed,
-            &lenses,
-            &config,
-        )
-        .expect("valid analysis");
-
-        let body = build_response(
-            7,
-            &scan(),
-            None,
-            &outcome,
-            &BTreeMap::new(),
-            &InputQuality::default(),
-            &[],
-        );
-        let finding = &body["incidents"][0]["findings"][0];
-        assert_eq!(finding["lens_id"], "PG-CACHE-010");
-        assert_eq!(finding["role"], "amplifier");
-        assert_eq!(finding["confidence"], "medium");
-        assert_eq!(finding["evidence"], json!(["ratio"]));
-        assert_eq!(finding["scope"]["logical_section"], "pg_stat_database");
-        assert_eq!(finding["scope"]["column"], "blks_read");
-        assert_eq!(finding["scope"]["identity"], json!([5]));
     }
 }
