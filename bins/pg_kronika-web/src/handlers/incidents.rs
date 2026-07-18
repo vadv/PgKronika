@@ -1,6 +1,5 @@
-//! `GET /v1/incidents` clusters anomaly episodes across sections.
-//!
-//! The response marks diagnosis unavailable because no lens catalog runs.
+//! `GET /v1/incidents` clusters anomaly episodes across sections and runs the
+//! diagnostic lens catalog over each cluster, attaching any findings.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,7 +16,7 @@ use crate::AppState;
 use crate::anomaly::ScanParams;
 use crate::handlers::anomalies::scannable_sections;
 use crate::handlers::metrics::data_age_seconds;
-use crate::incident::{AnalyzeError, ClockRelation, IncidentConfig, analyze};
+use crate::incident::{AnalyzeError, ClockRelation, IncidentConfig, Lens, analyze, catalog};
 use crate::incident_input::{InputError, InputLimits, prepare_input, scan_position_count};
 use crate::incident_response::{build_response, identity_response, no_data_response};
 use crate::params::{bad_request, parse_duration_us, parse_f64_non_negative, parse_i64, parse_u64};
@@ -237,7 +236,9 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
         request.max_cluster_span_us,
         ClockRelation::Unknown,
     );
-    let outcome = analyze(prepared.episodes, &prepared.series, &[], &config)
+    let catalog = catalog();
+    let lenses: Vec<&dyn Lens> = catalog.iter().map(AsRef::as_ref).collect();
+    let outcome = analyze(prepared.episodes, &prepared.series, &lenses, &config)
         .map_err(analyze_error_response)?;
 
     Ok(Json(build_response(
