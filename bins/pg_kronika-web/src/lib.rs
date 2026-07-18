@@ -958,11 +958,14 @@ mod tests {
         ] {
             assert!(body.get(field).is_some(), "response carries {field}");
         }
-        assert_eq!(body["complete"], false, "the lens catalog is not available");
+        assert_eq!(
+            body["complete"], false,
+            "the diagnostic catalog is still partial"
+        );
         assert_eq!(body["clustering_complete"], true);
         assert_eq!(body["analysis_status"], "incidents_detected");
-        assert_eq!(body["catalog"]["status"], "not_implemented");
-        assert_eq!(body["catalog"]["diagnosis_available"], false);
+        assert_eq!(body["catalog"]["status"], "active");
+        assert_eq!(body["catalog"]["diagnosis_available"], true);
         let incidents = body["incidents"].as_array().expect("incidents is an array");
         assert!(
             !incidents.is_empty(),
@@ -971,7 +974,7 @@ mod tests {
         assert_eq!(
             incidents[0]["findings"],
             serde_json::json!([]),
-            "findings stay empty until a lens catalog lands"
+            "the archiver spike carries no lock contention, so no lock finding"
         );
         let members = incidents[0]["members"]
             .as_array()
