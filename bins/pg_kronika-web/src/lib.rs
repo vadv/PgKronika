@@ -964,7 +964,16 @@ mod tests {
         assert_eq!(body["catalog"]["status"], "dormant");
         assert_eq!(body["catalog"]["diagnosis_available"], false);
         assert_eq!(body["catalog"]["applied"], serde_json::json!([]));
-        assert_eq!(body["catalog"]["dormant"][0]["lens_id"], "PG-LOCK-012");
+        let dormant = body["catalog"]["dormant"]
+            .as_array()
+            .expect("catalog lists dormant lenses");
+        assert_eq!(dormant.len(), 28, "the full lens catalog is declared");
+        assert!(
+            dormant
+                .iter()
+                .any(|entry| entry["lens_id"] == "PG-LOCK-012"),
+            "the lock lens is catalogued as dormant"
+        );
         let incidents = body["incidents"].as_array().expect("incidents is an array");
         assert!(
             !incidents.is_empty(),

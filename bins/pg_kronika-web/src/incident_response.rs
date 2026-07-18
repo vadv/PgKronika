@@ -204,11 +204,18 @@ fn skipped_to_json(
             "reason": { "kind": reason },
         }));
     }
+    let mut awaiting: Vec<&str> = crate::incident::dormant_catalog()
+        .iter()
+        .flat_map(|lens| lens.awaiting().iter().copied())
+        .collect();
+    awaiting.sort_unstable();
+    awaiting.dedup();
     analysis.push(json!({
         "scope": "catalog",
         "reason": {
             "kind": "dormant",
-            "awaiting": ["sampled_blocked_by_edges", "lock_snapshot_coverage"],
+            "lenses": crate::incident::dormant_catalog().len(),
+            "awaiting": awaiting,
         },
     }));
     json!({
@@ -421,11 +428,45 @@ mod tests {
         assert_eq!(body["catalog"]["status"], "dormant");
         assert_eq!(body["catalog"]["diagnosis_available"], false);
         assert_eq!(body["catalog"]["applied"], json!([]));
-        assert_eq!(body["catalog"]["dormant"][0]["lens_id"], "PG-LOCK-012");
+        let dormant = body["catalog"]["dormant"]
+            .as_array()
+            .expect("catalog lists dormant lenses");
+        assert_eq!(dormant.len(), 28, "the full catalog is declared");
+        let lock = dormant
+            .iter()
+            .find(|entry| entry["lens_id"] == "PG-LOCK-012")
+            .expect("lock lens is dormant");
         assert_eq!(
-            body["catalog"]["dormant"][0]["awaiting"],
+            lock["awaiting"],
             json!(["sampled_blocked_by_edges", "lock_snapshot_coverage"])
         );
-        assert_eq!(body["skipped"]["analysis"][0]["reason"]["kind"], "dormant");
+        let catalog_skip = &body["skipped"]["analysis"]
+            .as_array()
+            .expect("analysis is a list")
+            .iter()
+            .find(|entry| entry["reason"]["kind"] == "dormant")
+            .expect("catalog dormant summary present")["reason"];
+        assert_eq!(catalog_skip["lenses"], 28);
+        let awaiting = catalog_skip["awaiting"]
+            .as_array()
+            .expect("the catalog summary aggregates awaited capabilities");
+        assert!(
+            awaiting
+                .iter()
+                .any(|item| item == "sampled_blocked_by_edges"),
+            "the lock edge prerequisite survives aggregation"
+        );
+        assert!(
+            awaiting
+                .iter()
+                .any(|item| item == "period_clock_provenance"),
+            "the shared clock prerequisite is listed once"
+        );
+        assert!(
+            awaiting
+                .windows(2)
+                .all(|pair| pair[0].as_str() <= pair[1].as_str()),
+            "aggregated prerequisites are sorted and deduplicated"
+        );
     }
 }
