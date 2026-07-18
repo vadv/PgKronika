@@ -97,7 +97,7 @@ Required publication gate:
                             BDD_RUNTIME_PUSH=1. Pulls never require auth.
 
 Important overrides:
-  BDD_IMAGE_PREFIX          Default ghcr.io/vadv/pgkronika.
+  BDD_IMAGE_PREFIX          Owner prefix; default ghcr.io/vadv.
   BDD_PLATFORM              Default local Docker platform.
   BDD_DEPENDENCY_IMAGE      Exact dependency image tag.
   BDD_PG_BASE_IMAGE         Exact PG runtime base tag.
@@ -210,7 +210,7 @@ app_key() {
 }
 
 image_prefix() {
-  printf '%s' "${BDD_IMAGE_PREFIX:-ghcr.io/vadv/pgkronika}"
+  printf '%s' "${BDD_IMAGE_PREFIX:-ghcr.io/vadv}"
 }
 
 dependency_image() {

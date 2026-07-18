@@ -55,6 +55,10 @@ export BDD_PG_BASE_DIGEST_REF=$(printf '%s\n' "$resolved" | sed -n 's/^pg_digest
 
 Pipeline разделён на три immutable объекта.
 
+GHCR использует плоские public packages в owner namespace:
+`ghcr.io/vadv/pgkronika-bdd-builder` для dependency image и
+`ghcr.io/vadv/pgkronika-bdd` для PG base и runtime images.
+
 ### Dependency image
 
 Dependency key включает:

@@ -94,8 +94,9 @@ jobs:
       - name: Compute immutable refs
         id: meta
         run: |
-          repo=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          export BDD_IMAGE_PREFIX="ghcr.io/$repo"
+          owner=${GITHUB_REPOSITORY%%/*}
+          owner=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
+          export BDD_IMAGE_PREFIX="ghcr.io/$owner"
           dependency_key=$(./scripts/bdd-image.sh deps-key)
           source_key=$(./scripts/bdd-image.sh source-key)
           platform_slug=$(./scripts/bdd-image.sh platform-slug)

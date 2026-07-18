@@ -77,6 +77,21 @@ test_keys_are_full_and_machine_readable() {
   python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema"] == 2; assert d["postgresql_majors"] == [15,16,17,18]' <<< "$json"
 }
 
+test_default_images_use_flat_ghcr_packages() {
+  local dependency pg runtime
+  dependency=$(run_script "$SCRIPT" dependency-image)
+  pg=$(run_script "$SCRIPT" pg-base-image)
+  runtime=$(run_script "$SCRIPT" runtime-image)
+  [[ "$dependency" == ghcr.io/vadv/pgkronika-bdd-builder:* ]] \
+    || fail "dependency image must use the flat pgkronika-bdd-builder package"
+  [[ "$pg" == ghcr.io/vadv/pgkronika-bdd:* ]] \
+    || fail "PG image must use the flat pgkronika-bdd package"
+  [[ "$runtime" == ghcr.io/vadv/pgkronika-bdd:* ]] \
+    || fail "runtime image must use the flat pgkronika-bdd package"
+  [[ "$dependency$pg$runtime" != *ghcr.io/vadv/pgkronika/* ]] \
+    || fail "nested pgkronika GHCR packages are forbidden"
+}
+
 test_complete_dependency_inputs_change_key() {
   local file
   for file in \
@@ -311,6 +326,7 @@ test_workflow_enforces_trust_and_short_circuit() {
 
 for test in \
   test_keys_are_full_and_machine_readable \
+  test_default_images_use_flat_ghcr_packages \
   test_complete_dependency_inputs_change_key \
   test_source_body_changes_only_source_key \
   test_target_topology_changes_dependency_key_without_hashing_body \
