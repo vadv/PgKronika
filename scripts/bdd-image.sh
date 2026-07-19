@@ -490,16 +490,13 @@ run_app_nix() {
     tar -C /tmp/src -xf -
     cd /tmp/src
     if [ "$mode" = plan ]; then
-      nix build .#bddAppLayer --dry-run --no-link
+      nix build .#bddAppLayer .#bddCompilerStats --dry-run --no-link
     else
-      export PATH="/opt/bdd-cache/compiler-tools/bin:$PATH"
-      export SCCACHE_DIR=/var/cache/pgkronika-sccache
-      # The compiler wrapper starts sccache as the Nix build user. Starting it
-      # here as root makes cached dep-info files unreadable by that user.
-      trap "sccache --stop-server >/dev/null 2>&1 || true" EXIT
       nix build --option sandbox false .#bddAppLayer --out-link /tmp/bdd-app-layer 1>&2
+      nix build --option sandbox false .#bddCompilerStats \
+        --out-link /tmp/bdd-compiler-stats 1>&2
       printf "BDD_SCCACHE_STATS=" 1>&2
-      sccache --show-stats --stats-format=json 1>&2
+      cat "$(readlink -f /tmp/bdd-compiler-stats)" 1>&2
       printf "\n" 1>&2
       cat "$(readlink -f /tmp/bdd-app-layer)"
     fi

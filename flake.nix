@@ -154,8 +154,22 @@
             pname = "pgkronika-bins";
             nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.sccache compilerWrapper ];
             RUSTC_WRAPPER = "${compilerWrapper}/bin/pgkronika-sccache";
+            postBuild = ''
+              ${pkgs.sccache}/bin/sccache --show-stats --stats-format=json \
+                > "$NIX_BUILD_TOP/pgkronika-sccache-stats.json"
+              ${pkgs.sccache}/bin/sccache --stop-server >/dev/null 2>&1 || true
+            '';
+            postInstall = ''
+              mkdir -p "$out/nix-support"
+              install -m 0444 "$NIX_BUILD_TOP/pgkronika-sccache-stats.json" \
+                "$out/nix-support/pgkronika-sccache-stats.json"
+            '';
           }
         );
+
+        bddCompilerStats = pkgs.runCommand "pgkronika-bdd-compiler-stats.json" { } ''
+          cp ${bins}/nix-support/pgkronika-sccache-stats.json $out
+        '';
 
         # Feature files are read through KRONIKA_FEATURES.
         features = ./crates/kronika-bdd/features;
@@ -277,6 +291,7 @@
             bddPgClosureManifest
             bddCargoClosureManifest
             bddAppLayer
+            bddCompilerStats
             compilerTools
             ;
           bddCargoArtifacts = cargoArtifacts;
