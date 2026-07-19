@@ -86,6 +86,15 @@ pub(crate) struct GaugeQuality {
     gaps: Arc<[GaugeGap]>,
 }
 
+pub(crate) struct GaugeTrackInput {
+    pub section: &'static str,
+    pub column: &'static str,
+    pub identity: Arc<[IdentityValue]>,
+    pub raw_points: Vec<(i64, f64)>,
+    pub breaks: Vec<i64>,
+    pub shared_breaks: Arc<[i64]>,
+}
+
 impl GaugeQuality {
     pub(crate) fn new(gaps: &[(i64, i64)]) -> Self {
         Self {
@@ -533,30 +542,31 @@ impl TypedInputs {
         gaps: &[(i64, i64)],
     ) {
         self.insert_gauge_with_shared_quality(
-            section,
-            column,
-            identity,
-            raw_points,
-            breaks,
-            Arc::from([]),
+            GaugeTrackInput {
+                section,
+                column,
+                identity,
+                raw_points,
+                breaks,
+                shared_breaks: Arc::from([]),
+            },
             &GaugeQuality::new(gaps),
         );
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "reader retention passes one bounded track and its shared quality provenance"
-    )]
     pub(crate) fn insert_gauge_with_shared_quality(
         &mut self,
-        section: &'static str,
-        column: &'static str,
-        identity: Arc<[IdentityValue]>,
-        mut raw_points: Vec<(i64, f64)>,
-        mut breaks: Vec<i64>,
-        mut shared_breaks: Arc<[i64]>,
+        input: GaugeTrackInput,
         quality: &GaugeQuality,
     ) {
+        let GaugeTrackInput {
+            section,
+            column,
+            identity,
+            mut raw_points,
+            mut breaks,
+            mut shared_breaks,
+        } = input;
         raw_points.sort_by_key(|point| point.0);
         let mut points = Vec::with_capacity(raw_points.len());
         for (ts, value) in raw_points {

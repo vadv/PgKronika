@@ -3,11 +3,6 @@
     missing_docs,
     reason = "owned source rows mirror documented registry columns"
 )]
-#![allow(
-    clippy::missing_errors_doc,
-    reason = "collectors return database errors and converters return interner errors unchanged"
-)]
-
 use kronika_registry::incident_gauges::{
     PgFreezeHorizonV1, PgReplicationPhysicalV1, PgReplicationSlotRetentionV1,
     PgReplicationSlotRetentionV2, PgReplicationSlotRetentionV3, PgVacuumObservationV1,
@@ -29,6 +24,9 @@ pub struct LocalJoinFacts {
 }
 
 /// Collect the bounded facts needed for co-located OS joins.
+///
+/// # Errors
+/// Returns the `PostgreSQL` query error unchanged.
 pub async fn collect_local_join_facts(
     client: &Client,
     max_tablespaces: i64,
@@ -157,6 +155,9 @@ pub const fn freeze_horizon_query() -> &'static str {
 }
 
 /// Collect freeze candidates and the source population size.
+///
+/// # Errors
+/// Returns the `PostgreSQL` query error unchanged.
 pub async fn collect_freeze_horizons(
     client: &Client,
     max_relations: i64,
@@ -188,6 +189,10 @@ pub async fn collect_freeze_horizons(
     ))
 }
 
+/// Convert a freeze row using the caller's bounded interner.
+///
+/// # Errors
+/// Returns the interner error unchanged.
 pub fn to_freeze_horizon<E>(
     row: &FreezeHorizonRow,
     mut intern: impl FnMut(&[u8]) -> Result<StrId, E>,
@@ -214,6 +219,7 @@ pub struct VacuumObservationRow {
     pub ts: i64,
     pub pid: i32,
     pub session_start_key: i64,
+    pub query_start_key: i64,
     pub datid: u32,
     pub datname: String,
     pub relid: u32,
@@ -233,6 +239,7 @@ pub const fn vacuum_observation_query() -> &'static str {
         "WITH clock AS (SELECT statement_timestamp() AS observed_at) \
          SELECT (extract(epoch from c.observed_at) * 1e6)::int8 AS ts_us, \
                 v.pid, COALESCE((extract(epoch from a.backend_start) * 1e6)::int8, 0) AS session_start_key, \
+                COALESCE((extract(epoch from a.query_start) * 1e6)::int8, 0) AS query_start_key, \
                 v.datid, v.datname::text AS datname, v.relid, v.phase::text AS phase, \
                 a.backend_type::text AS backend_type, a.pid IS NOT NULL AS activity_present, \
                 CASE WHEN a.pid IS NULL THEN NULL ELSE a.backend_type = 'autovacuum worker' END AS is_autovacuum, \
@@ -246,6 +253,10 @@ pub const fn vacuum_observation_query() -> &'static str {
     )
 }
 
+/// Collect currently running vacuums with same-statement clock context.
+///
+/// # Errors
+/// Returns the `PostgreSQL` query error unchanged.
 pub async fn collect_vacuum_observations(
     client: &Client,
 ) -> Result<Vec<VacuumObservationRow>, tokio_postgres::Error> {
@@ -256,6 +267,7 @@ pub async fn collect_vacuum_observations(
             ts: row.get("ts_us"),
             pid: row.get("pid"),
             session_start_key: row.get("session_start_key"),
+            query_start_key: row.get("query_start_key"),
             datid: row.get("datid"),
             datname: row.get("datname"),
             relid: row.get("relid"),
@@ -271,6 +283,10 @@ pub async fn collect_vacuum_observations(
         .collect())
 }
 
+/// Convert a vacuum row using the caller's bounded interner.
+///
+/// # Errors
+/// Returns the interner error unchanged.
 pub fn to_vacuum_observation<E>(
     row: &VacuumObservationRow,
     mut intern: impl FnMut(&[u8]) -> Result<StrId, E>,
@@ -279,6 +295,7 @@ pub fn to_vacuum_observation<E>(
         ts: Ts(row.ts),
         pid: row.pid,
         session_start_key: row.session_start_key,
+        query_start_key: row.query_start_key,
         datid: row.datid,
         datname: intern(row.datname.as_bytes())?,
         relid: row.relid,
@@ -298,6 +315,7 @@ pub fn to_vacuum_observation<E>(
 pub struct ReplicationPhysicalRow {
     pub ts: i64,
     pub pid: i32,
+    pub backend_start_key: i64,
     pub application_name: String,
     pub slot_name: Option<String>,
     pub slot_type: Option<String>,
@@ -320,6 +338,7 @@ pub const fn replication_physical_query() -> &'static str {
         "WITH clock AS (SELECT statement_timestamp() AS observed_at, \
                                 CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END AS current_lsn) \
          SELECT (extract(epoch from c.observed_at) * 1e6)::int8 AS ts_us, r.pid, \
+                (extract(epoch from r.backend_start) * 1e6)::int8 AS backend_start_key, \
                 COALESCE(r.application_name, '')::text AS application_name, s.slot_name::text, s.slot_type, \
                 COALESCE(r.state, '')::text AS state, COALESCE(r.sync_state, '')::text AS sync_state, \
                 CASE s.slot_type WHEN 'physical' THEN 1 WHEN 'logical' THEN 2 ELSE 0 END::int2 AS scope_code, \
@@ -342,6 +361,10 @@ pub const fn replication_physical_query() -> &'static str {
     )
 }
 
+/// Collect typed replication state and same-snapshot stage gaps.
+///
+/// # Errors
+/// Returns the `PostgreSQL` query error unchanged.
 pub async fn collect_replication_physical(
     client: &Client,
 ) -> Result<Vec<ReplicationPhysicalRow>, tokio_postgres::Error> {
@@ -353,6 +376,7 @@ pub async fn collect_replication_physical(
         .map(|row| ReplicationPhysicalRow {
             ts: row.get("ts_us"),
             pid: row.get("pid"),
+            backend_start_key: row.get("backend_start_key"),
             application_name: row.get("application_name"),
             slot_name: row.get("slot_name"),
             slot_type: row.get("slot_type"),
@@ -371,6 +395,10 @@ pub async fn collect_replication_physical(
         .collect())
 }
 
+/// Convert a replication row using the caller's bounded interner.
+///
+/// # Errors
+/// Returns the interner error unchanged.
 pub fn to_replication_physical<E>(
     row: &ReplicationPhysicalRow,
     mut intern: impl FnMut(&[u8]) -> Result<StrId, E>,
@@ -378,6 +406,7 @@ pub fn to_replication_physical<E>(
     Ok(PgReplicationPhysicalV1 {
         ts: Ts(row.ts),
         pid: row.pid,
+        backend_start_key: row.backend_start_key,
         application_name: intern(row.application_name.as_bytes())?,
         slot_name: intern(row.slot_name.as_deref().unwrap_or("").as_bytes())?,
         slot_type: intern(row.slot_type.as_deref().unwrap_or("").as_bytes())?,
@@ -474,6 +503,10 @@ pub struct SlotRetentionRow {
     pub invalidation_reason: Option<String>,
 }
 
+/// Collect the slot layout supported by `major`.
+///
+/// # Errors
+/// Returns the `PostgreSQL` query error unchanged.
 pub async fn collect_slot_retention(
     client: &Client,
     major: u32,
@@ -523,6 +556,10 @@ fn invalidation_code(reason: Option<&str>) -> u8 {
     }
 }
 
+/// Convert a PG15 slot row using the caller's bounded interner.
+///
+/// # Errors
+/// Returns the interner error unchanged.
 pub fn to_slot_retention_v1<E>(
     row: &SlotRetentionRow,
     mut intern: impl FnMut(&[u8]) -> Result<StrId, E>,
@@ -543,6 +580,10 @@ pub fn to_slot_retention_v1<E>(
     })
 }
 
+/// Convert a PG16 slot row using the caller's bounded interner.
+///
+/// # Errors
+/// Returns the interner error unchanged.
 pub fn to_slot_retention_v2<E>(
     row: &SlotRetentionRow,
     mut intern: impl FnMut(&[u8]) -> Result<StrId, E>,
@@ -564,6 +605,10 @@ pub fn to_slot_retention_v2<E>(
     })
 }
 
+/// Convert a PG17+ slot row using the caller's bounded interner.
+///
+/// # Errors
+/// Returns the interner error unchanged.
 pub fn to_slot_retention_v3<E>(
     row: &SlotRetentionRow,
     mut intern: impl FnMut(&[u8]) -> Result<StrId, E>,
@@ -606,6 +651,7 @@ mod tests {
     fn vacuum_query_keeps_missing_activity_and_clock_errors_nullable() {
         let sql = vacuum_observation_query();
         assert!(sql.contains("LEFT JOIN pg_stat_activity"));
+        assert!(sql.contains("query_start_key"));
         assert!(sql.contains("c.observed_at < a.query_start THEN NULL"));
         assert!(!sql.contains("COALESCE(a.backend_type"));
     }
@@ -614,6 +660,7 @@ mod tests {
     fn replication_query_uses_order_checked_same_snapshot_gaps() {
         let sql = replication_physical_query();
         assert!(sql.contains("active_pid = r.pid"));
+        assert!(sql.contains("backend_start_key"));
         assert!(sql.contains("slot_type"));
         assert!(sql.contains("r.flush_lsn >= r.replay_lsn"));
         assert!(!sql.contains("GREATEST(0"));

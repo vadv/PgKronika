@@ -484,7 +484,7 @@ pub(crate) fn collect_pg_os_joins(fs: &ProcFs, facts: Option<&LocalJoinFacts>, o
     let sys = SysFs::from_env();
     let process =
         collect_process_cgroup_memory(fs, &sys, facts.backend_pid, facts.backend_start, facts.ts);
-    let local_identity_verified = process.is_ok();
+    let mount_namespace = process.as_ref().ok().map(|row| row.mount_namespace);
     let process_hash = process
         .as_ref()
         .map_or_else(|_| empty_hash(), |row| row.process_hash);
@@ -515,16 +515,16 @@ pub(crate) fn collect_pg_os_joins(fs: &ProcFs, facts: Option<&LocalJoinFacts>, o
         },
     });
 
-    let storage = if local_identity_verified && facts.tablespaces_complete {
-        map_postgresql_storage(
+    let storage = match (mount_namespace, facts.tablespaces_complete) {
+        (Some(namespace), true) => map_postgresql_storage(
             fs,
+            namespace,
             Path::new(&facts.data_directory),
             &facts.tablespaces,
             &os.mount_entries,
             258,
-        )
-    } else {
-        Err(JoinFailure::ProcUnavailable)
+        ),
+        _ => Err(JoinFailure::ProcUnavailable),
     };
     match storage {
         Ok(rows) => {

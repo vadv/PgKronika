@@ -53,6 +53,14 @@ PostgreSQL-источники занимают диапазон `1_001_001` - `1
 | `1_028_001` | log: lifecycle events из stderr | поток | `event_stream` | `(ts, kind)` |
 | `1_029_001` | log: пропуски и деградации tailer/parser | поток | `event_stream` | `(ts, reason)` |
 | `1_030_001` | log: temporary-file events из stderr | поток | `event_stream` | `(ts, size_bytes)` |
+| `1_031_001` | эффективные пределы заморозки XID/MXID | 30 с | `snapshot_full` | `(datid, relid, ts)` |
+| `1_032_001` | текущий vacuum с серверными часами | базовый шаг | `conditional_full` | `(pid, session_start_key, query_start_key, ts)` |
+| `1_033_001` | физическая репликация: состояние и разрывы | 30 с | `snapshot_full` | `(pid, backend_start_key, ts)` |
+| `1_034_001` | удержание WAL слотами (PG 15) | 30 с | `snapshot_full` | `(slot_name, ts)` |
+| `1_034_002` | удержание WAL слотами (PG 16) | 30 с | `snapshot_full` | `(slot_name, ts)` |
+| `1_034_003` | удержание WAL слотами (PG 17-18) | 30 с | `snapshot_full` | `(slot_name, ts)` |
+| `1_036_001` | хранилище PostgreSQL → mount, без путей | базовый шаг | `snapshot_full` | `(role, path_hash_hi, path_hash_lo, ts)` |
+| `1_037_001` | процесс PostgreSQL → memory cgroup, без путей | базовый шаг | `snapshot_full` | `(process_hash_hi, process_hash_lo, ts)` |
 
 ## `1_001_001` / `1_001_002` / `1_001_003` `pg_stat_activity`
 
@@ -1409,3 +1417,34 @@ reason          u8    L   // 0=top_n, 1=timeout, 2=permission, 3=other
 Coverage не делает top-N источник полным. Он сообщает коду чтения, какую часть
 источника видел коллектор и почему остальное отсутствует. Если
 `unknown_total = true`, `total` нельзя трактовать как точное число строк.
+
+## Gauge-контракты `1_031`-`1_037`
+
+`1_031_001` хранит отдельные возраста и эффективные пределы XID и MXID для
+строки базы и ограниченного набора самых старых таблиц. Локальные параметры
+таблицы и её TOAST учитываются только на своей шкале. Ключ `(datid, relid)`
+отделяет базу (`relid = 0`) от отношений.
+
+`1_032_001` описывает только выполняющийся vacuum. `elapsed_us` считается от
+`query_start` до `statement_timestamp()` в том же SQL-операторе. При
+исчезнувшей строке `pg_stat_activity`, неизвестном начале запроса или обратном
+ходе часов значение остаётся `NULL`. Ключ включает начало backend и запроса,
+поэтому повторное использование PID и два vacuum в одной сессии не склеиваются.
+
+`1_033_001` хранит четыре неотрицательных разрыва LSN и три nullable lag-поля
+из одного снимка `pg_stat_replication`. `scope_code = 1` ставится только при
+доказанном физическом слоте, связанном через `active_pid`; неизвестная область
+не считается физической. Ключ `(pid, backend_start_key)` защищает от повторного
+использования PID.
+
+`1_034_001`-`1_034_003` разделены по версиям PostgreSQL: PG 16 добавляет
+`conflicting`, PG 17 — `invalidation_reason`. `retained_bytes`,
+`safe_wal_size`, конечный `max_slot_wal_keep_size_bytes` и `wal_status_code`
+остаются разными наблюдениями; `NULL` не превращается в ноль.
+
+`1_036_001` и `1_037_001` создаются только co-located collector. Сырые пути
+PostgreSQL, mount и cgroup в формат не попадают. Storage join проверяет
+PID/start backend, неизменность его mount namespace и совпадение с namespace
+collector; ёмкость берётся по `f_bavail`. Cgroup join повторно читает start и
+membership вокруг чтения контроллера. `mapping_state = 1` означает доказанное
+соответствие, остальные коды — типизированную причину отсутствия данных.

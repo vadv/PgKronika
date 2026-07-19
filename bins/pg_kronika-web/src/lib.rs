@@ -1267,6 +1267,7 @@ mod tests {
                 ts: Ts(i64::from(minute) * MINUTE),
                 pid: 42,
                 session_start_key: 1,
+                query_start_key: 1,
                 datid: 7,
                 datname: fixture_str_id("fixture-1"),
                 relid: 42,
@@ -1299,6 +1300,7 @@ mod tests {
             .map(|minute| PgReplicationPhysicalV1 {
                 ts: Ts(i64::from(minute) * MINUTE),
                 pid: 42,
+                backend_start_key: 1,
                 application_name: fixture_str_id("fixture-1"),
                 slot_name: fixture_str_id("fixture-2"),
                 slot_type: fixture_str_id("fixture-3"),

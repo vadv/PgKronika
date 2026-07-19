@@ -53,20 +53,26 @@ pub(crate) fn identity_response(
     })
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "transport adapter receives bounded domain, coverage, and capability results"
-)]
+pub(crate) struct ResponseInput<'a> {
+    pub coverage: &'a BTreeMap<&'static str, Vec<Gap>>,
+    pub quality: &'a InputQuality,
+    pub skipped: &'a [SectionSkip],
+    pub capability_by_section: &'a BTreeMap<&'static str, CapabilityInputState>,
+}
+
 pub(crate) fn build_response(
     source: u64,
     scan: &ScanParams,
     data_age: Option<u64>,
     outcome: &EngineOutcome,
-    coverage: &BTreeMap<&'static str, Vec<Gap>>,
-    quality: &InputQuality,
-    input_skipped: &[SectionSkip],
-    capability_by_section: &BTreeMap<&'static str, CapabilityInputState>,
+    input: &ResponseInput<'_>,
 ) -> Value {
+    let ResponseInput {
+        coverage,
+        quality,
+        skipped: input_skipped,
+        capability_by_section,
+    } = input;
     let incidents: Vec<Value> = outcome.incidents.iter().map(incident_to_json).collect();
     let clustering_complete = input_skipped.is_empty() && quality.episodes_truncated == 0;
     let analysis_complete = clustering_complete && outcome.complete;
@@ -554,6 +560,41 @@ mod tests {
     }
 
     #[test]
+    fn active_contracts_report_typed_request_capability_absence() {
+        let mut states = BTreeMap::new();
+        states.insert("pg_freeze_horizon", CapabilityInputState::NotCollected);
+        states.insert("pg_storage_mount", CapabilityInputState::Partial);
+        let catalog = catalog_to_json(Some(&BTreeMap::new()), &[], &states);
+        let capabilities = catalog["capabilities"].as_array().expect("capability list");
+        let capability_entry = |lens_id| {
+            capabilities
+                .iter()
+                .find(|entry| entry["lens_id"] == lens_id)
+                .expect("contract capability")
+        };
+        assert_eq!(capability_entry("PG-FREEZE-006")["status"], "not_collected");
+        assert_eq!(
+            capability_entry("PG-FREEZE-006")["reason"],
+            "producer_unavailable"
+        );
+        assert_eq!(capability_entry("OS-FS-027")["status"], "partial");
+        assert_eq!(
+            capability_entry("OS-FS-027")["reason"],
+            "provenance_or_input_missing"
+        );
+        assert!(
+            catalog["applied"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry == "PG-FREEZE-006"))
+        );
+        assert!(catalog["dormant"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .all(|entry| entry["lens_id"] != "PG-FREEZE-006")
+        }));
+    }
+
+    #[test]
     fn no_data_has_partial_envelope() {
         let body = no_data_response(7, &scan(), None);
         for field in [
@@ -611,13 +652,15 @@ mod tests {
             &scan(),
             None,
             &outcome,
-            &BTreeMap::new(),
-            &InputQuality::default(),
-            &[SectionSkip {
-                section: "pg_stat_archiver",
-                reason: SkipReason::IncompletePage,
-            }],
-            &BTreeMap::new(),
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &InputQuality::default(),
+                skipped: &[SectionSkip {
+                    section: "pg_stat_archiver",
+                    reason: SkipReason::IncompletePage,
+                }],
+                capability_by_section: &BTreeMap::new(),
+            },
         );
         assert_eq!(body["clustering_complete"], false);
         assert_eq!(body["complete"], false);
@@ -648,10 +691,12 @@ mod tests {
             &scan(),
             None,
             &outcome,
-            &BTreeMap::new(),
-            &quality,
-            &[],
-            &BTreeMap::new(),
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &quality,
+                skipped: &[],
+                capability_by_section: &BTreeMap::new(),
+            },
         );
 
         assert_eq!(body["clustering_complete"], true);
@@ -707,10 +752,12 @@ mod tests {
             &scan(),
             None,
             &outcome,
-            &BTreeMap::new(),
-            &InputQuality::default(),
-            &[],
-            &BTreeMap::new(),
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &InputQuality::default(),
+                skipped: &[],
+                capability_by_section: &BTreeMap::new(),
+            },
         );
 
         assert_eq!(body["incidents"][0]["findings"], json!([]));
@@ -832,10 +879,12 @@ mod tests {
             &scan(),
             None,
             &outcome,
-            &BTreeMap::new(),
-            &InputQuality::default(),
-            &[],
-            &BTreeMap::new(),
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &InputQuality::default(),
+                skipped: &[],
+                capability_by_section: &BTreeMap::new(),
+            },
         );
         let finding = &body["incidents"][0]["findings"][0];
         assert_eq!(finding["lens_id"], "PG-CACHE-010");

@@ -12,8 +12,8 @@ use kronika_registry::ColumnClass;
 use crate::anomaly::{EpisodeHit, ScanCounts, ScanParams, scan_section};
 use crate::handlers::v1::{DIFF_MAX_ROWS, Gates};
 use crate::incident::{
-    EnrichedEpisode, EpisodeRefV1, GaugeQuality, IdentityValue, Series, SeriesError,
-    SeriesInsertError, SeriesSet, TypedInputs,
+    EnrichedEpisode, EpisodeRefV1, GaugeQuality, GaugeTrackInput, IdentityValue, Series,
+    SeriesError, SeriesInsertError, SeriesSet, TypedInputs,
 };
 
 /// Data exclusions recorded while building engine input.
@@ -456,10 +456,6 @@ impl BuildState {
             .saturating_add(counts.episodes_truncated);
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one section is normalized, admitted, scanned, and retained atomically"
-    )]
     fn process(
         &mut self,
         logical: &LogicalSection,
@@ -472,11 +468,7 @@ impl BuildState {
             self.skip_incomplete(logical.name);
             return Ok(());
         }
-        if let Some(state) = capability_state(logical.name, &page.rows) {
-            self.capability_by_section.insert(logical.name, state);
-        }
-        self.coverage_by_section
-            .insert(logical.name, page.gaps.clone());
+        self.record_page_state(logical.name, &page);
 
         let identity = logical.diff_key();
         let (cumulative, gauges) = scorable_columns(logical);
@@ -574,6 +566,13 @@ impl BuildState {
         Ok(())
     }
 
+    fn record_page_state(&mut self, section: &'static str, page: &SectionPage) {
+        if let Some(state) = capability_state(section, &page.rows) {
+            self.capability_by_section.insert(section, state);
+        }
+        self.coverage_by_section.insert(section, page.gaps.clone());
+    }
+
     fn skip_incomplete(&mut self, section: &'static str) {
         self.skipped.push(SectionSkip {
             section,
@@ -661,12 +660,14 @@ impl BuildState {
                 .collect();
             for (&name, column) in gauges.iter().zip(series.columns) {
                 self.typed.insert_gauge_with_shared_quality(
-                    section,
-                    name,
-                    std::sync::Arc::clone(&identity),
-                    column.points,
-                    column.breaks,
-                    std::sync::Arc::clone(&shared_breaks),
+                    GaugeTrackInput {
+                        section,
+                        column: name,
+                        identity: std::sync::Arc::clone(&identity),
+                        raw_points: column.points,
+                        breaks: column.breaks,
+                        shared_breaks: std::sync::Arc::clone(&shared_breaks),
+                    },
                     &quality,
                 );
             }

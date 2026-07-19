@@ -12,7 +12,7 @@ use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
     ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, Role, ThresholdKind,
+    GaugeTrendInput, GaugeUnit, Role, ThresholdKind,
 };
 use super::lens::Lens;
 use super::series::SeriesSet;
@@ -431,17 +431,17 @@ impl Lens for SlotRetentionLens {
             let mut evidence = vec![Evidence::GaugeObservation(amount_evidence)];
             if let Some(trend) = trend
                 && trend.last > trend.first
-                && let Some(trend_evidence) = GaugeEvidence::trend(
-                    trend.first,
-                    trend.last,
-                    GaugeUnit::Bytes,
-                    0.0,
-                    ThresholdKind::AtLeast,
-                    trend.first_at_us,
-                    trend.last_at_us,
-                    trend.samples,
-                    entity(SLOT, &member.identity),
-                )
+                && let Some(trend_evidence) = GaugeEvidence::trend(GaugeTrendInput {
+                    first: trend.first,
+                    last: trend.last,
+                    operand_unit: GaugeUnit::Bytes,
+                    threshold_per_second: 0.0,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    first_at_us: trend.first_at_us,
+                    last_at_us: trend.last_at_us,
+                    samples: trend.samples,
+                    entity: entity(SLOT, &member.identity),
+                })
             {
                 evidence.push(Evidence::GaugeObservation(trend_evidence));
             }

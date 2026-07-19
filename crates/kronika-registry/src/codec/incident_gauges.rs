@@ -47,7 +47,8 @@ pub struct PgFreezeHorizonV1 {
     id = 1_032_001,
     name = "pg_vacuum_observation",
     semantics = conditional_full,
-    sort_key("pid", "session_start_key", "ts")
+    sort_key("pid", "session_start_key", "query_start_key", "ts"),
+    identity("pid", "session_start_key", "query_start_key", "datid", "relid")
 )]
 pub struct PgVacuumObservationV1 {
     #[column(t)]
@@ -56,6 +57,8 @@ pub struct PgVacuumObservationV1 {
     pub pid: i32,
     #[column(l)]
     pub session_start_key: i64,
+    #[column(l)]
+    pub query_start_key: i64,
     #[column(l)]
     pub datid: u32,
     #[column(l)]
@@ -86,13 +89,16 @@ pub struct PgVacuumObservationV1 {
     id = 1_033_001,
     name = "pg_replication_physical",
     semantics = snapshot_full,
-    sort_key("pid", "ts")
+    sort_key("pid", "backend_start_key", "ts"),
+    identity("pid", "backend_start_key")
 )]
 pub struct PgReplicationPhysicalV1 {
     #[column(t)]
     pub ts: Ts,
     #[column(l)]
     pub pid: i32,
+    #[column(l)]
+    pub backend_start_key: i64,
     #[column(l)]
     pub application_name: StrId,
     #[column(l)]
@@ -246,7 +252,15 @@ pub struct PgReplicationSlotRetentionV3 {
     id = 1_036_001,
     name = "pg_storage_mount",
     semantics = snapshot_full,
-    sort_key("role", "path_hash_hi", "path_hash_lo", "ts")
+    sort_key("role", "path_hash_hi", "path_hash_lo", "ts"),
+    identity(
+        "role",
+        "path_hash_hi",
+        "path_hash_lo",
+        "mount_hash_hi",
+        "mount_hash_lo",
+        "mount_namespace"
+    )
 )]
 pub struct PgStorageMountV1 {
     #[column(t)]
@@ -279,7 +293,14 @@ pub struct PgStorageMountV1 {
     id = 1_037_001,
     name = "pg_process_cgroup_memory",
     semantics = snapshot_full,
-    sort_key("process_hash_hi", "process_hash_lo", "ts")
+    sort_key("process_hash_hi", "process_hash_lo", "ts"),
+    identity(
+        "process_hash_hi",
+        "process_hash_lo",
+        "cgroup_hash_hi",
+        "cgroup_hash_lo",
+        "hierarchy"
+    )
 )]
 pub struct PgProcessCgroupMemoryV1 {
     #[column(t)]
@@ -327,6 +348,30 @@ mod tests {
         assert_eq!(contracts[0].type_id.get(), 1_031_001);
         assert_eq!(contracts[3].columns.len() + 1, contracts[4].columns.len());
         assert_eq!(contracts[4].columns.len() + 2, contracts[5].columns.len());
+        assert_eq!(
+            PgVacuumObservationV1::CONTRACT.identity,
+            &[
+                "pid",
+                "session_start_key",
+                "query_start_key",
+                "datid",
+                "relid"
+            ]
+        );
+        assert_eq!(
+            PgReplicationPhysicalV1::CONTRACT.identity,
+            &["pid", "backend_start_key"]
+        );
+        assert!(
+            PgStorageMountV1::CONTRACT
+                .identity
+                .contains(&"mount_namespace")
+        );
+        assert!(
+            PgProcessCgroupMemoryV1::CONTRACT
+                .identity
+                .contains(&"cgroup_hash_hi")
+        );
     }
 
     #[test]

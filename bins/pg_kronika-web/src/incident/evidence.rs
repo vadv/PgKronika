@@ -203,6 +203,18 @@ pub(crate) struct GaugeRatio {
     operand_unit: GaugeUnit,
 }
 
+pub(crate) struct GaugeTrendInput {
+    pub first: f64,
+    pub last: f64,
+    pub operand_unit: GaugeUnit,
+    pub threshold_per_second: f64,
+    pub threshold_kind: ThresholdKind,
+    pub first_at_us: i64,
+    pub last_at_us: i64,
+    pub samples: usize,
+    pub entity: GaugeEntity,
+}
+
 impl GaugeRatio {
     pub(crate) const fn new(numerator: f64, denominator: f64, operand_unit: GaugeUnit) -> Self {
         Self {
@@ -294,21 +306,18 @@ impl GaugeEvidence {
         })
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "constructor validates the complete public trend-evidence contract"
-    )]
-    pub(crate) fn trend(
-        first: f64,
-        last: f64,
-        operand_unit: GaugeUnit,
-        threshold_per_second: f64,
-        threshold_kind: ThresholdKind,
-        first_at_us: i64,
-        last_at_us: i64,
-        samples: usize,
-        entity: GaugeEntity,
-    ) -> Option<Self> {
+    pub(crate) fn trend(input: GaugeTrendInput) -> Option<Self> {
+        let GaugeTrendInput {
+            first,
+            last,
+            operand_unit,
+            threshold_per_second,
+            threshold_kind,
+            first_at_us,
+            last_at_us,
+            samples,
+            entity,
+        } = input;
         let elapsed_us = u64::try_from(last_at_us.checked_sub(first_at_us)?).ok()?;
         (elapsed_us > 0).then_some(())?;
         let elapsed_seconds = std::time::Duration::from_micros(elapsed_us).as_secs_f64();

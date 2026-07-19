@@ -18,7 +18,9 @@ use crate::handlers::anomalies::scannable_sections;
 use crate::handlers::metrics::data_age_seconds;
 use crate::incident::{AnalyzeError, ClockRelation, IncidentConfig, Lens, active_catalog, analyze};
 use crate::incident_input::{InputError, InputLimits, prepare_input, scan_position_count};
-use crate::incident_response::{build_response, identity_response, no_data_response};
+use crate::incident_response::{
+    ResponseInput, build_response, identity_response, no_data_response,
+};
 use crate::params::{bad_request, parse_duration_us, parse_f64_non_negative, parse_i64, parse_u64};
 
 const WINDOW_DEFAULT_US: i64 = 300 * 1_000_000;
@@ -252,10 +254,12 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
         &request.scan,
         data_age,
         &outcome,
-        &prepared.coverage_by_section,
-        &prepared.quality,
-        &prepared.skipped,
-        &prepared.capability_by_section,
+        &ResponseInput {
+            coverage: &prepared.coverage_by_section,
+            quality: &prepared.quality,
+            skipped: &prepared.skipped,
+            capability_by_section: &prepared.capability_by_section,
+        },
     )))
 }
 

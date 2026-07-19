@@ -3,12 +3,6 @@
     missing_docs,
     reason = "stable numeric failure codes are documented by the durable registry contract"
 )]
-#![allow(
-    clippy::map_err_ignore,
-    clippy::missing_errors_doc,
-    reason = "the public contract exposes bounded failure codes without filesystem details"
-)]
-
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
@@ -67,6 +61,8 @@ pub struct ProcessCgroupMemory {
     pub cgroup_hash: Hash128,
     /// `1=v1`, `2=v2`.
     pub hierarchy: u8,
+    /// Mount namespace inode shared with the collector for storage joins.
+    pub mount_namespace: u64,
     /// Direct memory-controller reading.
     pub memory: CgroupMemoryRow,
     /// Whether the controller reports no finite maximum.
@@ -155,29 +151,41 @@ fn process_snapshot(
     procfs: &ProcFs,
     pid: i32,
     facts: ProcessFacts,
-) -> Result<(i64, Membership), JoinFailure> {
+) -> Result<(i64, Membership, u64), JoinFailure> {
     let stat_content = procfs
         .read_raw(&format!("{pid}/stat"))
-        .map_err(|_| JoinFailure::ProcUnavailable)?;
-    let parsed = parse_stat(&stat_content).map_err(|_| JoinFailure::ProcUnavailable)?;
+        .map_err(|_error| JoinFailure::ProcUnavailable)?;
+    let parsed = parse_stat(&stat_content).map_err(|_error| JoinFailure::ProcUnavailable)?;
     if parsed.pid != pid {
         return Err(JoinFailure::PidMismatch);
     }
     let start_us = starttime_us(facts, parsed.starttime_ticks).ok_or(JoinFailure::StartMismatch)?;
     let cgroup = procfs
         .read_raw(&format!("{pid}/cgroup"))
-        .map_err(|_| JoinFailure::MembershipUnavailable)?;
+        .map_err(|_error| JoinFailure::MembershipUnavailable)?;
     let membership = memory_membership(&cgroup).ok_or(JoinFailure::MembershipUnavailable)?;
-    Ok((start_us, membership))
+    let mount_namespace = std::fs::metadata(
+        procfs
+            .path(&format!("{pid}/ns/mnt"))
+            .map_err(|_error| JoinFailure::NamespaceUnavailable)?,
+    )
+    .map_err(|_error| JoinFailure::NamespaceUnavailable)?
+    .ino();
+    Ok((start_us, membership, mount_namespace))
 }
 
 fn validate_stable_process(
     before_start: i64,
     before_membership: &Membership,
+    before_mount_namespace: u64,
     after_start: i64,
     after_membership: &Membership,
+    after_mount_namespace: u64,
 ) -> Result<(), JoinFailure> {
-    if before_start != after_start || before_membership != after_membership {
+    if before_start != after_start
+        || before_membership != after_membership
+        || before_mount_namespace != after_mount_namespace
+    {
         Err(JoinFailure::ProcessMigrated)
     } else {
         Ok(())
@@ -185,6 +193,10 @@ fn validate_stable_process(
 }
 
 /// Read one validated `PostgreSQL` PID and its memory cgroup without `/proc` scans.
+///
+/// # Errors
+/// Returns a stable [`JoinFailure`] when process identity, membership, namespace,
+/// or the bounded memory-controller reading cannot be proven.
 pub fn collect_process_cgroup_memory(
     procfs: &ProcFs,
     sysfs: &SysFs,
@@ -192,9 +204,10 @@ pub fn collect_process_cgroup_memory(
     expected_start_us: i64,
     ts: i64,
 ) -> Result<ProcessCgroupMemory, JoinFailure> {
-    let facts =
-        crate::proc::process::process_facts(procfs).map_err(|_| JoinFailure::ProcUnavailable)?;
-    let (start_before, membership_before) = process_snapshot(procfs, pid, facts)?;
+    let facts = crate::proc::process::process_facts(procfs)
+        .map_err(|_error| JoinFailure::ProcUnavailable)?;
+    let (start_before, membership_before, mount_namespace_before) =
+        process_snapshot(procfs, pid, facts)?;
     let tick_us = 1_000_000_i64
         .checked_add(facts.clock_ticks_per_sec - 1)
         .and_then(|value| value.checked_div(facts.clock_ticks_per_sec))
@@ -209,12 +222,15 @@ pub fn collect_process_cgroup_memory(
         membership_before.unified_v2,
     )
     .ok_or(JoinFailure::CgroupUnavailable)?;
-    let (start_after, membership_after) = process_snapshot(procfs, pid, facts)?;
+    let (start_after, membership_after, mount_namespace_after) =
+        process_snapshot(procfs, pid, facts)?;
     validate_stable_process(
         start_before,
         &membership_before,
+        mount_namespace_before,
         start_after,
         &membership_after,
+        mount_namespace_after,
     )?;
     let pid_bytes = pid.to_be_bytes();
     let start_bytes = start_before.to_be_bytes();
@@ -225,6 +241,7 @@ pub fn collect_process_cgroup_memory(
             membership_before.path.as_bytes(),
         ]),
         hierarchy: if membership_before.unified_v2 { 2 } else { 1 },
+        mount_namespace: mount_namespace_before,
         memory,
         max_unlimited,
     })
@@ -315,8 +332,13 @@ fn storage_mount(
 }
 
 /// Resolve data, WAL, and bounded tablespace paths to local mounts.
+///
+/// # Errors
+/// Returns a stable [`JoinFailure`] when namespace provenance is unavailable,
+/// the namespace differs from the validated process, or `max_paths` is exceeded.
 pub fn map_postgresql_storage(
     procfs: &ProcFs,
+    expected_mount_namespace: u64,
     data_directory: &Path,
     tablespaces: &[(u32, String)],
     mounts: &[MountEntry],
@@ -325,10 +347,13 @@ pub fn map_postgresql_storage(
     let metadata = std::fs::metadata(
         procfs
             .path("self/ns/mnt")
-            .map_err(|_| JoinFailure::NamespaceUnavailable)?,
+            .map_err(|_error| JoinFailure::NamespaceUnavailable)?,
     )
-    .map_err(|_| JoinFailure::NamespaceUnavailable)?;
+    .map_err(|_error| JoinFailure::NamespaceUnavailable)?;
     let namespace = mount_namespace(&metadata);
+    if namespace != expected_mount_namespace {
+        return Err(JoinFailure::NamespaceUnavailable);
+    }
     let required = tablespaces
         .len()
         .checked_add(2)
@@ -428,7 +453,19 @@ mod tests {
         let root = tempdir().expect("fixture root");
         let proc_root = root.path().join("proc");
         let sys_root = root.path().join("sys");
-        fs::create_dir_all(proc_root.join("42")).expect("proc pid");
+        fs::create_dir_all(proc_root.join("42/ns")).expect("proc pid");
+        fs::create_dir_all(proc_root.join("self/ns")).expect("collector proc");
+        fs::write(proc_root.join("mount-namespace"), "fixture").expect("mount namespace");
+        fs::hard_link(
+            proc_root.join("mount-namespace"),
+            proc_root.join("42/ns/mnt"),
+        )
+        .expect("process mount namespace");
+        fs::hard_link(
+            proc_root.join("mount-namespace"),
+            proc_root.join("self/ns/mnt"),
+        )
+        .expect("collector mount namespace");
         fs::create_dir_all(sys_root.join("fs/cgroup/db")).expect("cgroup path");
         fs::write(proc_root.join("stat"), "cpu 1 2 3\nbtime 1000\n").expect("proc stat");
         fs::write(proc_root.join("42/stat"), stat_line(42, 190)).expect("pid stat");
@@ -456,6 +493,7 @@ mod tests {
         let row = collect_process_cgroup_memory(&procfs, &sysfs, 42, start, 2_000)
             .expect("verified cgroup");
         assert_eq!(row.hierarchy, 2);
+        assert_ne!(row.mount_namespace, 0);
         assert_eq!(row.memory.current, 90);
         assert_eq!(row.memory.max, None);
         assert!(row.max_unlimited);
@@ -501,11 +539,15 @@ mod tests {
             unified_v2: true,
         };
         assert_eq!(
-            validate_stable_process(10, &first, 11, &first),
+            validate_stable_process(10, &first, 7, 11, &first, 7),
             Err(JoinFailure::ProcessMigrated)
         );
         assert_eq!(
-            validate_stable_process(10, &first, 10, &moved),
+            validate_stable_process(10, &first, 7, 10, &moved, 7),
+            Err(JoinFailure::ProcessMigrated)
+        );
+        assert_eq!(
+            validate_stable_process(10, &first, 7, 10, &first, 8),
             Err(JoinFailure::ProcessMigrated)
         );
     }
@@ -518,6 +560,9 @@ mod tests {
         let wal = root.path().join("wal");
         fs::create_dir_all(proc_root.join("self/ns")).expect("namespace path");
         fs::write(proc_root.join("self/ns/mnt"), "namespace fixture").expect("namespace");
+        let namespace = fs::metadata(proc_root.join("self/ns/mnt"))
+            .expect("namespace metadata")
+            .ino();
         fs::create_dir_all(&data).expect("data");
         fs::create_dir_all(&wal).expect("wal");
         symlink("../wal", data.join("pg_wal")).expect("relative wal symlink");
@@ -525,11 +570,33 @@ mod tests {
             mount(1, root.path().to_str().expect("utf8 root")),
             mount(2, wal.to_str().expect("utf8 wal")),
         ];
-        let rows = map_postgresql_storage(&ProcFs::new(proc_root), &data, &[], &mounts, 2)
-            .expect("bounded map");
+        let rows =
+            map_postgresql_storage(&ProcFs::new(proc_root), namespace, &data, &[], &mounts, 2)
+                .expect("bounded map");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.mapping_state == 1));
         assert_ne!(rows[0].mount_hash, rows[1].mount_hash);
         assert!(rows.iter().all(|row| row.total_bytes.is_some()));
+    }
+
+    #[test]
+    fn storage_join_rejects_a_different_process_mount_namespace() {
+        let root = tempdir().expect("fixture root");
+        let proc_root = root.path().join("proc");
+        let data = root.path().join("data");
+        fs::create_dir_all(proc_root.join("self/ns")).expect("namespace path");
+        fs::create_dir_all(&data).expect("data");
+        fs::write(proc_root.join("self/ns/mnt"), "collector namespace").expect("namespace");
+        assert_eq!(
+            map_postgresql_storage(
+                &ProcFs::new(proc_root),
+                u64::MAX,
+                &data,
+                &[],
+                &[mount(1, root.path().to_str().expect("utf8 root"))],
+                2,
+            ),
+            Err(JoinFailure::NamespaceUnavailable)
+        );
     }
 }
