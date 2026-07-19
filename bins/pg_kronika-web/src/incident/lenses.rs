@@ -25,7 +25,8 @@ pub(crate) enum MissingCapability {
     PidCgroupMapping,
     IncidentLogEventInput,
     LogDetailContinuation,
-    LogCaptureCoverage,
+    LogSourceCoverage,
+    EffectiveLogConfigCoverage,
     SensitiveLogRedaction,
 }
 
@@ -46,7 +47,8 @@ impl MissingCapability {
             Self::PidCgroupMapping => "pid_cgroup_mapping",
             Self::IncidentLogEventInput => "incident_log_event_input",
             Self::LogDetailContinuation => "log_detail_continuation",
-            Self::LogCaptureCoverage => "log_capture_coverage",
+            Self::LogSourceCoverage => "log_source_coverage",
+            Self::EffectiveLogConfigCoverage => "effective_log_config_coverage",
             Self::SensitiveLogRedaction => "sensitive_log_redaction",
         }
     }
@@ -613,7 +615,8 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
-            Missing::LogCaptureCoverage,
+            Missing::LogSourceCoverage,
+            Missing::EffectiveLogConfigCoverage,
             Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
@@ -654,7 +657,8 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
-            Missing::LogCaptureCoverage,
+            Missing::LogSourceCoverage,
+            Missing::EffectiveLogConfigCoverage,
             Missing::SourcePeriod,
         ],
     },
@@ -667,7 +671,8 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
-            Missing::LogCaptureCoverage,
+            Missing::LogSourceCoverage,
+            Missing::EffectiveLogConfigCoverage,
             Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
@@ -733,7 +738,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::IncidentLogEventInput,
-            Missing::LogCaptureCoverage,
+            Missing::LogSourceCoverage,
             Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
@@ -770,7 +775,8 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::IncidentLogEventInput,
-            Missing::LogCaptureCoverage,
+            Missing::LogSourceCoverage,
+            Missing::EffectiveLogConfigCoverage,
             Missing::EntityJoin,
             Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
@@ -1023,7 +1029,11 @@ mod tests {
             Missing::SensitiveLogRedaction.as_str(),
             "sensitive_log_redaction"
         );
-        assert_eq!(Missing::LogCaptureCoverage.as_str(), "log_capture_coverage");
+        assert_eq!(Missing::LogSourceCoverage.as_str(), "log_source_coverage");
+        assert_eq!(
+            Missing::EffectiveLogConfigCoverage.as_str(),
+            "effective_log_config_coverage"
+        );
     }
 
     #[test]
