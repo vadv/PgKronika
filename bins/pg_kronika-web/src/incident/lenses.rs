@@ -30,6 +30,7 @@ pub(crate) enum MissingCapability {
     SensitiveLogRedaction,
     SourceClockProvenance,
     KernelOomVictimEvidence,
+    StructuredLogIdentity,
 }
 
 impl MissingCapability {
@@ -54,6 +55,7 @@ impl MissingCapability {
             Self::SensitiveLogRedaction => "sensitive_log_redaction",
             Self::SourceClockProvenance => "source_clock_provenance",
             Self::KernelOomVictimEvidence => "kernel_oom_victim_evidence",
+            Self::StructuredLogIdentity => "structured_log_identity",
         }
     }
 }
@@ -845,6 +847,32 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::SourceClockProvenance,
         ],
     },
+    DormantLens {
+        lens_id: "lock_table_exhaustion",
+        domain: Domain::Pg,
+        title: "Исчерпание таблицы блокировок",
+        detects: "Отказала ли операция из-за нехватки shared memory под таблицу блокировок (\"out of shared memory\")?",
+        confidence: ConfidenceCap::High,
+        missing: &[
+            Missing::IncidentLogEventInput,
+            Missing::StructuredLogIdentity,
+            Missing::LogSourceCoverage,
+            Missing::SourceClockProvenance,
+        ],
+    },
+    DormantLens {
+        lens_id: "shared_memory_alloc_failure",
+        domain: Domain::Pg,
+        title: "Сбой аллокации разделяемой памяти",
+        detects: "Не удалось выделить или изменить сегмент разделяемой памяти (DSM)?",
+        confidence: ConfidenceCap::High,
+        missing: &[
+            Missing::IncidentLogEventInput,
+            Missing::StructuredLogIdentity,
+            Missing::LogSourceCoverage,
+            Missing::SourceClockProvenance,
+        ],
+    },
 ];
 
 /// Log lenses whose single record is a self-contained finding — activate first.
@@ -978,7 +1006,7 @@ mod tests {
         "network_errors",
     ];
 
-    const LOG_EXPECTED_LENSES: [&str; 27] = [
+    const LOG_EXPECTED_LENSES: [&str; 29] = [
         // Batch 1 (core)
         "oom_kill",
         "backend_crash",
@@ -1010,6 +1038,8 @@ mod tests {
         "wal_integrity_log",
         // Batch 4 (audit splits)
         "kernel_oom_victim",
+        "lock_table_exhaustion",
+        "shared_memory_alloc_failure",
     ];
 
     fn fixture(lens_id: &'static str, missing: &'static [MissingCapability]) -> DormantLens {
@@ -1061,6 +1091,10 @@ mod tests {
         assert_eq!(
             Missing::KernelOomVictimEvidence.as_str(),
             "kernel_oom_victim_evidence"
+        );
+        assert_eq!(
+            Missing::StructuredLogIdentity.as_str(),
+            "structured_log_identity"
         );
     }
 
