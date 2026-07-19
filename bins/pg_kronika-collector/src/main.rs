@@ -1,7 +1,7 @@
-//! PostgreSQL and Linux collector daemon.
+//! `PostgreSQL` and Linux collector daemon.
 //!
 //! Configuration is environment-only; required variables are
-//! `KRONIKA_PG_DSN` and `KRONIKA_OUT_DIR`. The process opens one PostgreSQL
+//! `KRONIKA_PG_DSN` and `KRONIKA_OUT_DIR`. The process opens one `PostgreSQL`
 //! instance, schedules each source independently, appends synchronized windows
 //! to `<out>/active.parts`, and rotates immutable `<timestamp>.pgm` segments by
 //! size, age, journal pressure, or `SIGUSR2`.

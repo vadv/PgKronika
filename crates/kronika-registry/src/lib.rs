@@ -16,7 +16,7 @@
 //! ordinary resource use and accidental corruption; they do not authenticate
 //! a deliberately rebuilt segment.
 //!
-//! PostgreSQL- and Linux-specific meaning belongs here in declarative
+//! `PostgreSQL`- and Linux-specific meaning belongs here in declarative
 //! contracts. Collection, storage, cross-segment queries, and HTTP responses
 //! belong to their respective crates.
 #![allow(

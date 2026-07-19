@@ -1,6 +1,6 @@
 //! `PostgreSQL` log collectors.
 //!
-//! [`LogCollector`] discovers a PostgreSQL stderr log file, resumes from a
+//! [`LogCollector`] discovers a `PostgreSQL` stderr log file, resumes from a
 //! durable [`TailState`], and converts bounded records into typed source rows.
 //! It never exposes raw log lines as an output contract.
 //!

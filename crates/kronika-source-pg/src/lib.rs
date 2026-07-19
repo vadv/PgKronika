@@ -1,6 +1,6 @@
-//! PostgreSQL queries and mapping into registry rows.
+//! `PostgreSQL` queries and mapping into registry rows.
 //!
-//! The collectors cover the PostgreSQL 15–18 matrix: activity, database,
+//! The collectors cover the `PostgreSQL` 15–18 matrix: activity, database,
 //! bgwriter/checkpointer, WAL, I/O, locks, prepared transactions, vacuum
 //! progress, replication, settings, tables, indexes, reset/instance metadata,
 //! and optional statement and plan extensions. Layout selection follows the
