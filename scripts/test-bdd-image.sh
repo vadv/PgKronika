@@ -297,6 +297,36 @@ test_run_passes_args_and_debug_to_container() {
   assert_contains "$log" "run --rm -e DEBUG=1 pgkronika-bdd:local --tags @pg_log"
 }
 
+test_check_runtime_is_wired_to_container_shell() {
+  local log
+  log=$(run_case check-runtime "$SCRIPT" check-runtime pgkronika-bdd:contract)
+  assert_contains "$log" "run --rm -i --entrypoint /bin/sh pgkronika-bdd:contract -seu"
+}
+
+test_runtime_contract_checks_all_four_majors() {
+  local contract major matrix root output
+  contract="$ROOT/scripts/check-bdd-runtime.sh"
+  root=$(mktemp -d "$TEST_TMP/runtime-contract.XXXXXX")
+  matrix=''
+  for major in 15 16 17 18; do
+    mkdir -p "$root/pg$major/bin" "$root/pg$major/lib" "$root/pg$major/share/postgresql/extension"
+    : > "$root/pg$major/bin/postgres"
+    chmod +x "$root/pg$major/bin/postgres"
+    : > "$root/pg$major/lib/pg_store_plans.so"
+    : > "$root/pg$major/share/postgresql/extension/pg_store_plans.control"
+    : > "$root/pg$major/share/postgresql/extension/pg_store_plans--1.0.sql"
+    matrix="${matrix}${matrix:+;}${major}=$root/pg$major/bin"
+  done
+
+  KRONIKA_PG_MATRIX="$matrix" sh "$contract" >/dev/null
+  rm -f "$root/pg17/share/postgresql/extension/pg_store_plans.control"
+  if output=$(KRONIKA_PG_MATRIX="$matrix" sh "$contract" 2>&1); then
+    fail "runtime contract must reject a missing PG17 control file"
+  fi
+  printf '%s\n' "$output" | grep -Fx -- 'BDD runtime contract failed: PG17 control file is missing' >/dev/null \
+    || fail "runtime contract must report the first structural failure"
+}
+
 test_runtime_image_default_is_content_keyed() {
   local image
   image=$(BDD_PLATFORM=linux/amd64 "$SCRIPT" runtime-image)
@@ -560,6 +590,8 @@ test_github_actions_bdd_uses_fast_runtime_default() {
     || fail "GitHub Actions build-runtime step must use local exact-image reuse"
   grep -F -- './scripts/bdd-image.sh build-runtime' "$workflow" >/dev/null \
     || fail "GitHub Actions must use the BDD image helper for runtime builds"
+  grep -F -- './scripts/bdd-image.sh check-runtime' "$workflow" >/dev/null \
+    || fail "GitHub Actions must check the runtime before BDD"
   grep -F -- 'ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-${deps_hash}' "$workflow" >/dev/null \
     || fail "GitHub Actions must use the flat PR80 builder tag family"
 }
@@ -576,6 +608,8 @@ for test in \
   test_exact_tag_is_not_overwritten_if_it_appears_before_push \
   test_branch_slug_is_tag_safe \
   test_run_passes_args_and_debug_to_container \
+  test_check_runtime_is_wired_to_container_shell \
+  test_runtime_contract_checks_all_four_majors \
   test_runtime_image_default_is_content_keyed \
   test_runtime_reuse_local_is_default_for_content_keyed_image \
   test_runtime_reuse_local_skips_build \

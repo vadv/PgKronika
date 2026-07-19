@@ -163,6 +163,10 @@ jobs:
           export BDD_OUTPUT_TAR=image.tar
           ./scripts/bdd-image.sh build-runtime
           rm -f image.tar
+      - name: Verify PostgreSQL runtime
+        run: |
+          image="${{ steps.final_image.outputs.ref }}"
+          ./scripts/bdd-image.sh check-runtime "${image:-${{ needs.bdd-meta.outputs.image }}}"
       - name: Run the PostgreSQL matrix
         run: |
           image="${{ steps.final_image.outputs.ref }}"

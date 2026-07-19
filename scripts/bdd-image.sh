@@ -88,6 +88,8 @@ Commands:
                  Print a branch name as a Docker tag fragment.
   build-builder  Build or pull the BDD builder image.
   build-runtime  Build image.tar with the builder image and load it into Docker.
+  check-runtime [image]
+                 Verify PostgreSQL 15-18 and pg_store_plans in the runtime image.
   run [image] [args...]
                  Run the BDD image. Extra args are passed to kronika-bdd.
 
@@ -504,6 +506,14 @@ build_runtime() {
   fi
 }
 
+check_runtime() {
+  local root runtime
+  root=$(repo_root)
+  runtime=${1:-$(runtime_image)}
+  docker_cmd run --rm -i --entrypoint /bin/sh "$runtime" -seu \
+    < "$root/scripts/check-bdd-runtime.sh"
+}
+
 run_runtime() {
   local image
   if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
@@ -563,6 +573,10 @@ case "$cmd" in
     ;;
   build-runtime)
     build_runtime
+    ;;
+  check-runtime)
+    shift
+    check_runtime "${1:-}"
     ;;
   run)
     shift
