@@ -363,7 +363,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "OS-CPU-020",
+        lens_id: "cpu_saturation",
         domain: Domain::Os,
         title: "Насыщение CPU хоста",
         detects: "Runnable pressure, iowait, steal.",
@@ -377,7 +377,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "OS-CGRP-021",
+        lens_id: "cgroup_cpu_throttling",
         domain: Domain::Os,
         title: "Троттлинг CPU в cgroup",
         detects: "Реальный throttling cgroup при доступном CPU хоста.",
@@ -391,7 +391,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "OS-MEM-022",
+        lens_id: "memory_reclaim",
         domain: Domain::Os,
         title: "Нехватка памяти хоста",
         detects: "Memory pressure, direct reclaim, swap, OOM.",
@@ -405,7 +405,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "OS-CGMEM-023",
+        lens_id: "cgroup_memory_limit",
         domain: Domain::Os,
         title: "Лимит памяти cgroup",
         detects: "Достижение `memory.high`/`max`/OOM в cgroup.",
@@ -420,7 +420,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "OS-BLOCK-024",
+        lens_id: "block_device_latency",
         domain: Domain::Os,
         title: "Задержка блочного устройства",
         detects: "Растут время завершения и очередь устройства.",
@@ -434,7 +434,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "OS-WB-025",
+        lens_id: "writeback_pressure",
         domain: Domain::Os,
         title: "Давление dirty/writeback",
         detects: "Повышенные Dirty/Writeback совпали с write/sync-задержкой PostgreSQL.",
@@ -448,7 +448,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "OS-IOWHO-026",
+        lens_id: "io_contender",
         domain: Domain::Os,
         title: "Внешний потребитель I/O",
         detects: "Какой процесс или cgroup нарастил block I/O рядом с давлением.",
@@ -462,7 +462,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "OS-FS-027",
+        lens_id: "filesystem_space",
         domain: Domain::Os,
         title: "Исчерпание места ФС",
         detects: "Точка монтирования близка к исчерпанию байтов.",
@@ -476,7 +476,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "OS-NET-028",
+        lens_id: "network_errors",
         domain: Domain::Os,
         title: "Сетевые ошибки и ретрансмиты",
         detects: "Растут счётчики ошибок интерфейса и TCP-ретрансмиссий.",
@@ -586,15 +586,15 @@ mod tests {
         "wal_archiving_failure",
         "sync_replication_wait",
         "internal_wait_concentration",
-        "OS-CPU-020",
-        "OS-CGRP-021",
-        "OS-MEM-022",
-        "OS-CGMEM-023",
-        "OS-BLOCK-024",
-        "OS-WB-025",
-        "OS-IOWHO-026",
-        "OS-FS-027",
-        "OS-NET-028",
+        "cpu_saturation",
+        "cgroup_cpu_throttling",
+        "memory_reclaim",
+        "cgroup_memory_limit",
+        "block_device_latency",
+        "writeback_pressure",
+        "io_contender",
+        "filesystem_space",
+        "network_errors",
     ];
 
     fn fixture(lens_id: &'static str, missing: &'static [MissingCapability]) -> DormantLens {

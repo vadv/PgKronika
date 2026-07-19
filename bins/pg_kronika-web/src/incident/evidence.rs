@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn resource_event_does_not_prove_direction() {
         let finding = Finding::from_draft(
-            "OS-MEM-022",
+            "memory_reclaim",
             ConfidenceCap::High,
             FindingDraft::new(
                 Role::Lead,
