@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::anomaly::ScanParams;
 use crate::incident::{
-    EngineOutcome, EngineSkip, EpisodeRefV1, IdentityValue, Incident, LimitAxis,
+    DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, IdentityValue, Incident, LimitAxis,
 };
 use crate::incident_input::{InputQuality, SectionSkip, SkipReason};
 
@@ -128,7 +128,18 @@ fn identity_to_json(value: &IdentityValue) -> Value {
 }
 
 fn catalog_to_json() -> Value {
-    let dormant: Vec<Value> = crate::incident::dormant_catalog()
+    json!({
+        "status": "dormant",
+        "requirements_status": "incomplete",
+        "diagnosis_available": false,
+        "scope": "anomaly_clustering_only",
+        "applied": Value::Array(Vec::new()),
+        "dormant": dormant_entries(crate::incident::dormant_catalog()),
+    })
+}
+
+fn dormant_entries(catalog: &'static [DormantLens]) -> Vec<Value> {
+    catalog
         .iter()
         .map(|lens| {
             let awaiting: Vec<_> = lens
@@ -138,19 +149,17 @@ fn catalog_to_json() -> Value {
                 .collect();
             json!({
                 "lens_id": lens.lens_id(),
+                "slug": lens.slug(),
+                "domain": lens.domain().as_str(),
+                "title": lens.title(),
+                "question": lens.detects(),
+                "text_locale": "ru",
+                "confidence_cap": lens.confidence().as_str(),
                 "awaiting": awaiting,
                 "requirements_status": "incomplete",
             })
         })
-        .collect();
-    json!({
-        "status": "dormant",
-        "requirements_status": "incomplete",
-        "diagnosis_available": false,
-        "scope": "anomaly_clustering_only",
-        "applied": Value::Array(Vec::new()),
-        "dormant": dormant,
-    })
+        .collect()
 }
 
 fn quality_to_json(quality: &InputQuality, node_identity: &str) -> Value {
@@ -273,7 +282,12 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    const MAX_CATALOG_JSON_BYTES: usize = 12 * 1024;
+    const MAX_ENTRY_JSON_BYTES: usize = 256
+        + 2 * crate::incident::MAX_CATALOG_TOKEN_BYTES
+        + 2 * crate::incident::MAX_CATALOG_TEXT_BYTES
+        + crate::incident::MAX_MISSING_PER_LENS * (crate::incident::MAX_CATALOG_TOKEN_BYTES + 3);
+    const MAX_CATALOG_JSON_BYTES: usize =
+        256 + crate::incident::MAX_DORMANT_LENSES * MAX_ENTRY_JSON_BYTES;
 
     fn scan() -> ScanParams {
         ScanParams {
@@ -316,7 +330,32 @@ mod tests {
         let catalog = catalog_to_json();
         assert_eq!(catalog, catalog_to_json());
         let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
+        assert_eq!(bytes.len(), 12_581);
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
+        assert!(catalog.get("log_dormant").is_none());
+        let lock = &catalog["dormant"][11];
+        let keys: std::collections::BTreeSet<_> = lock
+            .as_object()
+            .expect("catalog entry")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "awaiting",
+                "confidence_cap",
+                "domain",
+                "lens_id",
+                "question",
+                "requirements_status",
+                "slug",
+                "text_locale",
+                "title",
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]
@@ -459,6 +498,15 @@ mod tests {
         assert_eq!(
             lock["awaiting"],
             json!(["sampled_blocked_by_edges", "lock_snapshot_coverage"])
+        );
+        assert_eq!(lock["domain"], "pg");
+        assert_eq!(lock["slug"], "lock_wait_graph");
+        assert_eq!(lock["confidence_cap"], "high");
+        assert_eq!(lock["text_locale"], "ru");
+        assert_eq!(lock["title"], "Граф ожидания блокировок");
+        assert_eq!(
+            lock["question"],
+            "Кто блокировал ожидающего в момент снимка (`blocked_by` из `pg_locks`)."
         );
         assert!(
             body["catalog"]["dormant"]
