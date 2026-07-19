@@ -54,7 +54,7 @@ use logging::{LogLevel, field, log_event, log_source_deferred};
 use main_sources::{
     activity_needs_acceleration, collect_main_conn_sources, replication_needs_acceleration,
 };
-use os_sources::{collect_os_sources, push_os_sources};
+use os_sources::{collect_os_sources, collect_pg_os_joins, push_os_sources};
 use pg_log_source::{
     collect_log_batch, commit_log_collection, push_log_collection, run_log_only_cycle,
 };
@@ -368,21 +368,23 @@ async fn snapshot_and_seal(
         .activity
         .as_ref()
         .map(|(_, rows)| activity_needs_acceleration(rows, config.ash_active_threshold));
-    let replication_hot = main_src
-        .replication
-        .as_ref()
-        .map(|(instance, replicas, slots)| {
-            replication_needs_acceleration(
-                instance,
-                replicas,
-                slots,
-                config.repl_lag_trigger_s,
-                config.slot_retained_trigger_bytes,
-            )
-        });
+    let replication_hot =
+        main_src
+            .replication
+            .as_ref()
+            .map(|(instance, replicas, slots, _, _, _)| {
+                replication_needs_acceleration(
+                    instance,
+                    replicas,
+                    slots,
+                    config.repl_lag_trigger_s,
+                    config.slot_retained_trigger_bytes,
+                )
+            });
     let PoolReads {
         statements,
         user_tables,
+        freeze_horizons,
         tables_cov,
         user_indexes,
         indexes_cov,
@@ -430,11 +432,13 @@ async fn snapshot_and_seal(
     );
     let scope = OsScope::Host.as_u8();
     let mut interner = Interner::new(activity_dict_limits());
-    let os = collect_os_sources(&fs, &mut interner, scope, main_src.ts.0, in_container, due);
+    let mut os = collect_os_sources(&fs, &mut interner, scope, main_src.ts.0, in_container, due);
+    collect_pg_os_joins(&fs, main_src.local_join.as_ref(), &mut os);
 
     let mut buffers = SectionBuffers::new();
     push_main_conn_sections(&mut buffers, &mut interner, major, &main_src)?;
     push_user_tables(&mut buffers, &mut interner, &user_tables)?;
+    buffering::push_freeze_horizons(&mut buffers, &mut interner, &freeze_horizons)?;
     push_user_indexes(&mut buffers, &mut interner, &user_indexes)?;
     if let Some((version, rows, _total)) = &statements {
         push_statements(&mut buffers, &mut interner, *version, rows)?;

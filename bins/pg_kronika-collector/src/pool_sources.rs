@@ -8,6 +8,7 @@ use crate::logging::{
 use crate::scheduler::{DueSet, SourceKind};
 use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
 use crate::statements_source::{StatementsSourceCache, collect_statements_cached};
+use kronika_source_pg::incident_gauges::{FreezeHorizonRow, collect_freeze_horizons};
 use kronika_source_pg::pool::{AdaptiveTimeout, ConnectionPool};
 use kronika_source_pg::statements::{StatementsRow, StatementsVersion};
 use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion, collect_user_indexes};
@@ -133,6 +134,53 @@ async fn collect_user_tables_all(
     (user_tables, coverage)
 }
 
+/// Collect the two-axis freeze candidates from every database.
+async fn collect_freeze_horizons_all(
+    pool: &ConnectionPool,
+    config: &Config,
+) -> Vec<FreezeHorizonRow> {
+    const MAX_FREEZE_CANDIDATES_PER_AXIS: i64 = 128;
+    let mut collected = Vec::new();
+    for db in pool.per_db() {
+        let started = Instant::now();
+        log_database_collection_start(1_031_001, &db.datname);
+        match collect_freeze_horizons(
+            db.client(),
+            config.max_tables.min(MAX_FREEZE_CANDIDATES_PER_AXIS),
+        )
+        .await
+        {
+            Ok((mut rows, source_total)) => {
+                log_database_collection_finish(
+                    1_031_001,
+                    &db.datname,
+                    rows.len(),
+                    source_total,
+                    started.elapsed(),
+                );
+                collected.append(&mut rows);
+            }
+            Err(err) => {
+                let reason = if is_sqlstate(&err, "57014") {
+                    "statement_timeout"
+                } else if is_sqlstate(&err, "42501") {
+                    "permission_denied"
+                } else {
+                    "query_failed"
+                };
+                log_database_collection_skip(
+                    1_031_001,
+                    &db.datname,
+                    reason,
+                    &err,
+                    started.elapsed(),
+                );
+            }
+        }
+    }
+    collected
+}
+
 /// Collect `pg_stat_user_indexes` from every pool database, returning owned rows.
 ///
 /// Mirrors [`collect_user_tables_all`]: all awaits finish here so the caller can
@@ -254,6 +302,7 @@ async fn collect_user_indexes_all(
 pub(crate) struct PoolReads {
     pub(crate) statements: Option<(StatementsVersion, Vec<StatementsRow>, u64)>,
     pub(crate) user_tables: Vec<(String, UserTablesVersion, Vec<UserTablesRow>)>,
+    pub(crate) freeze_horizons: Vec<FreezeHorizonRow>,
     pub(crate) tables_cov: SourceCoverage,
     pub(crate) user_indexes: Vec<(String, UserIndexesVersion, Vec<UserIndexesRow>)>,
     pub(crate) indexes_cov: SourceCoverage,
@@ -283,15 +332,17 @@ pub(crate) async fn read_pool_sources(
     } else {
         None
     };
-    let (user_tables, tables_cov) = if due.has(SourceKind::UserTables) {
+    let (user_tables, freeze_horizons, tables_cov) = if due.has(SourceKind::UserTables) {
         if pool_budget.admit(PoolSource::UserTables, cycle_start.elapsed(), due.forced()) {
-            collect_user_tables_all(pool, major, config).await
+            let (tables, coverage) = collect_user_tables_all(pool, major, config).await;
+            let freeze = collect_freeze_horizons_all(pool, config).await;
+            (tables, freeze, coverage)
         } else {
             deferred.push(SourceKind::UserTables);
-            (Vec::new(), SourceCoverage::default())
+            (Vec::new(), Vec::new(), SourceCoverage::default())
         }
     } else {
-        (Vec::new(), SourceCoverage::default())
+        (Vec::new(), Vec::new(), SourceCoverage::default())
     };
     let (user_indexes, indexes_cov) = if due.has(SourceKind::UserIndexes) {
         if pool_budget.admit(PoolSource::UserIndexes, cycle_start.elapsed(), due.forced()) {
@@ -306,6 +357,7 @@ pub(crate) async fn read_pool_sources(
     PoolReads {
         statements,
         user_tables,
+        freeze_horizons,
         tables_cov,
         user_indexes,
         indexes_cov,

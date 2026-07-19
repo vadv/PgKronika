@@ -180,7 +180,7 @@ fn read_cpu_v1(sys: &SysFs, ts: i64, path: &str, clock_ticks_per_sec: i64) -> Op
 }
 
 fn read_memory_v2(sys: &SysFs, ts: i64, path: &str) -> Option<CgroupMemoryRow> {
-    let current = parse_i64(&sys.read(&rel(path, "memory.current")).ok()?).unwrap_or(0);
+    let current = parse_i64(&sys.read(&rel(path, "memory.current")).ok()?)?;
     let mut row = CgroupMemoryRow {
         ts,
         cgroup_path: path.to_owned(),
@@ -214,8 +214,7 @@ fn read_memory_v1(sys: &SysFs, ts: i64, path: &str) -> Option<CgroupMemoryRow> {
         MEMORY_V1_DIRS,
         path,
         "memory.usage_in_bytes",
-    )?)
-    .unwrap_or(0);
+    )?)?;
     let mut row = CgroupMemoryRow {
         ts,
         cgroup_path: path.to_owned(),
@@ -239,6 +238,28 @@ fn read_memory_v1(sys: &SysFs, ts: i64, path: &str) -> Option<CgroupMemoryRow> {
         row.max_events = parse_i64(&content).unwrap_or(0);
     }
     Some(row)
+}
+
+/// Read one already validated cgroup memory path without scanning cgroupfs.
+#[must_use]
+pub fn read_memory_path(
+    sys: &SysFs,
+    ts: i64,
+    path: &str,
+    unified_v2: bool,
+) -> Option<(CgroupMemoryRow, bool)> {
+    if unified_v2 {
+        let limit = sys.read(&rel(path, "memory.max")).ok()?;
+        if limit != "max" && parse_i64(&limit).is_none() {
+            return None;
+        }
+        Some((read_memory_v2(sys, ts, path)?, limit == "max"))
+    } else {
+        let limit = read_first_v1(sys, MEMORY_V1_DIRS, path, "memory.limit_in_bytes")?;
+        parse_i64(&limit)?;
+        let unlimited = parse_v1_memory_limit(&limit).is_none();
+        Some((read_memory_v1(sys, ts, path)?, unlimited))
+    }
 }
 
 fn read_pids_v2(sys: &SysFs, ts: i64, path: &str) -> Option<CgroupPidsRow> {

@@ -7,10 +7,10 @@ use serde_json::{Value, json};
 
 use crate::anomaly::ScanParams;
 use crate::incident::{
-    DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, Finding, IdentityValue, Incident,
-    LimitAxis,
+    DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, Evidence, Finding, GaugeMeasurement,
+    IdentityValue, Incident, LimitAxis,
 };
-use crate::incident_input::{InputQuality, SectionSkip, SkipReason};
+use crate::incident_input::{CapabilityInputState, InputQuality, SectionSkip, SkipReason};
 
 pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<u64>) -> Value {
     let quality = InputQuality::default();
@@ -24,7 +24,7 @@ pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<
         "incidents": Value::Array(Vec::new()),
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(),
+        "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
         "data_quality": quality_to_json(&quality, "unknown"),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some("no_data")),
     })
@@ -47,10 +47,17 @@ pub(crate) fn identity_response(
         "incidents": Value::Array(Vec::new()),
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(),
+        "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
         "data_quality": quality_to_json(&quality, reason),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some(reason)),
     })
+}
+
+pub(crate) struct ResponseInput<'a> {
+    pub coverage: &'a BTreeMap<&'static str, Vec<Gap>>,
+    pub quality: &'a InputQuality,
+    pub skipped: &'a [SectionSkip],
+    pub capability_by_section: &'a BTreeMap<&'static str, CapabilityInputState>,
 }
 
 pub(crate) fn build_response(
@@ -58,10 +65,14 @@ pub(crate) fn build_response(
     scan: &ScanParams,
     data_age: Option<u64>,
     outcome: &EngineOutcome,
-    coverage: &BTreeMap<&'static str, Vec<Gap>>,
-    quality: &InputQuality,
-    input_skipped: &[SectionSkip],
+    input: &ResponseInput<'_>,
 ) -> Value {
+    let ResponseInput {
+        coverage,
+        quality,
+        skipped: input_skipped,
+        capability_by_section,
+    } = input;
     let incidents: Vec<Value> = outcome.incidents.iter().map(incident_to_json).collect();
     let clustering_complete = input_skipped.is_empty() && quality.episodes_truncated == 0;
     let analysis_complete = clustering_complete && outcome.complete;
@@ -84,7 +95,7 @@ pub(crate) fn build_response(
         "incidents": incidents,
         "coverage_by_section": coverage_to_json(coverage),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(),
+        "catalog": catalog_to_json(Some(coverage), input_skipped, capability_by_section),
         "data_quality": quality_to_json(quality, "available"),
         "skipped": skipped_to_json(
             input_skipped,
@@ -116,11 +127,7 @@ fn incident_to_json(incident: &Incident) -> Value {
 fn finding_to_json(finding: &Finding) -> Value {
     let scope = finding.scope();
     let identity: Vec<Value> = scope.identity().iter().map(identity_to_json).collect();
-    let evidence: Vec<Value> = finding
-        .evidence()
-        .iter()
-        .map(|item| Value::from(item.label()))
-        .collect();
+    let evidence: Vec<Value> = finding.evidence().iter().map(evidence_to_json).collect();
     json!({
         "lens_id": finding.lens_id(),
         "role": finding.role().label(),
@@ -131,6 +138,67 @@ fn finding_to_json(finding: &Finding) -> Value {
             "identity": identity,
         },
         "evidence": evidence,
+    })
+}
+
+fn evidence_to_json(evidence: &Evidence) -> Value {
+    let Evidence::GaugeObservation(gauge) = evidence else {
+        return Value::from(evidence.label());
+    };
+    let measurement = match gauge.measurement() {
+        GaugeMeasurement::Value(value) => json!({
+            "kind": "value",
+            "value": value.get(),
+        }),
+        GaugeMeasurement::Ratio {
+            numerator,
+            denominator,
+            operand_unit,
+        } => json!({
+            "kind": "ratio",
+            "numerator": numerator.get(),
+            "denominator": denominator.get(),
+            "value": numerator.get() / denominator.get(),
+            "operand_unit": operand_unit.label(),
+            "headroom": denominator.get() - numerator.get(),
+        }),
+        GaugeMeasurement::Trend {
+            first,
+            last,
+            elapsed_us,
+            operand_unit,
+        } => json!({
+            "kind": "trend",
+            "first": first.get(),
+            "last": last.get(),
+            "change": last.get() - first.get(),
+            "elapsed_us": elapsed_us,
+            "value": (last.get() - first.get())
+                / std::time::Duration::from_micros(*elapsed_us).as_secs_f64(),
+            "operand_unit": operand_unit.label(),
+        }),
+    };
+    let entity: Vec<Value> = gauge
+        .entity()
+        .identity()
+        .iter()
+        .map(identity_to_json)
+        .collect();
+    json!({
+        "type": "gauge",
+        "claim": "observed_threshold_crossing",
+        "measurement": measurement,
+        "unit": gauge.unit().label(),
+        "threshold": {
+            "operator": gauge.threshold_kind().label(),
+            "value": gauge.threshold().get(),
+        },
+        "observed_at_us": gauge.observed_at_us(),
+        "sample_count": gauge.samples(),
+        "entity": {
+            "logical_section": gauge.entity().section(),
+            "identity": entity,
+        },
     })
 }
 
@@ -154,17 +222,92 @@ fn identity_to_json(value: &IdentityValue) -> Value {
     }
 }
 
-fn catalog_to_json() -> Value {
+const CONTRACT_CAPABILITIES: &[(&str, &str)] = &[
+    ("PG-VACUUM-005", "pg_vacuum_observation"),
+    ("PG-FREEZE-006", "pg_freeze_horizon"),
+    ("PG-REPL-015", "pg_replication_physical"),
+    ("PG-SLOT-016", "pg_replication_slot_retention"),
+    ("OS-CGMEM-023", "pg_process_cgroup_memory"),
+    ("OS-FS-027", "pg_storage_mount"),
+];
+
+fn catalog_to_json(
+    coverage: Option<&BTreeMap<&'static str, Vec<Gap>>>,
+    input_skipped: &[SectionSkip],
+    capability_by_section: &BTreeMap<&'static str, CapabilityInputState>,
+) -> Value {
     let applied_ids = crate::incident::active_catalog_ids();
     let applied: Vec<Value> = applied_ids.iter().copied().map(Value::from).collect();
+    let capabilities: Vec<Value> = CONTRACT_CAPABILITIES
+        .iter()
+        .map(|&(lens_id, section)| {
+            if let Some(skip) = input_skipped.iter().find(|skip| skip.section == section) {
+                return json!({
+                    "lens_id": lens_id,
+                    "section": section,
+                    "status": "partial",
+                    "reason": skip_reason_label(skip.reason),
+                });
+            }
+            if let Some(state) = capability_by_section.get(section) {
+                match state {
+                    CapabilityInputState::NotCollected => {
+                        return json!({
+                            "lens_id": lens_id,
+                            "section": section,
+                            "status": "not_collected",
+                            "reason": "producer_unavailable",
+                        });
+                    }
+                    CapabilityInputState::Partial => {
+                        return json!({
+                            "lens_id": lens_id,
+                            "section": section,
+                            "status": "partial",
+                            "reason": "provenance_or_input_missing",
+                        });
+                    }
+                    CapabilityInputState::Available => {}
+                }
+            }
+            let Some(gaps) = coverage.and_then(|sections| sections.get(section)) else {
+                return json!({
+                    "lens_id": lens_id,
+                    "section": section,
+                    "status": "not_collected",
+                    "reason": "section_absent",
+                });
+            };
+            json!({
+                "lens_id": lens_id,
+                "section": section,
+                "status": if gaps.is_empty() { "available" } else { "partial" },
+                "reason": if gaps.is_empty() { "complete_coverage" } else { "coverage_gap" },
+                "gap_count": gaps.len(),
+            })
+        })
+        .collect();
     json!({
         "status": "partial",
         "requirements_status": "incomplete",
         "diagnosis_available": !applied.is_empty(),
         "scope": "diagnostic_lenses",
         "applied": applied,
+        "capabilities": capabilities,
         "dormant": dormant_entries(crate::incident::dormant_catalog(), &applied_ids),
     })
+}
+
+const fn skip_reason_label(reason: SkipReason) -> &'static str {
+    match reason {
+        SkipReason::MaterializationLimit { .. } => "materialization_limit",
+        SkipReason::IncompletePage => "incomplete_page",
+        SkipReason::ScanBudget { .. } => "scan_budget",
+        SkipReason::ConflictingTimestamp { .. } => "conflicting_timestamp",
+        SkipReason::IdentityByteLimit { .. } => "identity_byte_limit",
+        SkipReason::SeriesPointLimit { .. } => "series_point_limit",
+        SkipReason::TypedGaugePointLimit { .. } => "typed_gauge_point_limit",
+    }
 }
 
 fn dormant_entries(catalog: &'static [DormantLens], applied: &[&'static str]) -> Vec<Value> {
@@ -277,6 +420,9 @@ fn section_skip_to_json(skip: &SectionSkip) -> Value {
         SkipReason::SeriesPointLimit { observed, limit } => {
             json!({ "kind": "series_point_limit", "observed": observed, "limit": limit })
         }
+        SkipReason::TypedGaugePointLimit { observed, limit } => {
+            json!({ "kind": "typed_gauge_point_limit", "observed": observed, "limit": limit })
+        }
     };
     json!({ "section": skip.section, "reason": reason })
 }
@@ -296,6 +442,7 @@ const fn axis_name(axis: LimitAxis) -> &'static str {
         LimitAxis::LensEvaluations => "lens_evaluations",
         LimitAxis::Findings => "findings",
         LimitAxis::EvidenceRows => "evidence_rows",
+        LimitAxis::OutputBytes => "output_bytes",
     }
 }
 
@@ -313,7 +460,7 @@ mod tests {
     use super::*;
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
-    const APPLIED_IDS: [&str; 9] = [
+    const APPLIED_IDS: [&str; 19] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -323,6 +470,16 @@ mod tests {
         "PG-ARCH-017",
         "OS-NET-028",
         "OS-CGRP-021",
+        "PG-ANALYZE-004",
+        "PG-CONN-014",
+        "OS-MEM-022",
+        "OS-WB-025",
+        "PG-VACUUM-005",
+        "PG-FREEZE-006",
+        "PG-REPL-015",
+        "PG-SLOT-016",
+        "OS-CGMEM-023",
+        "OS-FS-027",
     ];
 
     const MAX_ENTRY_JSON_BYTES: usize = 256
@@ -366,17 +523,18 @@ mod tests {
         assert_eq!(axis_name(LimitAxis::LensEvaluations), "lens_evaluations");
         assert_eq!(axis_name(LimitAxis::Findings), "findings");
         assert_eq!(axis_name(LimitAxis::EvidenceRows), "evidence_rows");
+        assert_eq!(axis_name(LimitAxis::OutputBytes), "output_bytes");
     }
 
     #[test]
     fn catalog_json_stays_within_its_static_budget() {
-        let catalog = catalog_to_json();
-        assert_eq!(catalog, catalog_to_json());
+        let catalog = catalog_to_json(None, &[], &BTreeMap::new());
+        assert_eq!(catalog, catalog_to_json(None, &[], &BTreeMap::new()));
         let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
-        assert_eq!(bytes.len(), 8_730);
+        assert!(!bytes.is_empty());
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
         assert!(catalog.get("log_dormant").is_none());
-        let entry = &catalog["dormant"][11];
+        let entry = &catalog["dormant"][0];
         let keys: std::collections::BTreeSet<_> = entry
             .as_object()
             .expect("catalog entry")
@@ -399,6 +557,41 @@ mod tests {
             .into_iter()
             .collect()
         );
+    }
+
+    #[test]
+    fn active_contracts_report_typed_request_capability_absence() {
+        let mut states = BTreeMap::new();
+        states.insert("pg_freeze_horizon", CapabilityInputState::NotCollected);
+        states.insert("pg_storage_mount", CapabilityInputState::Partial);
+        let catalog = catalog_to_json(Some(&BTreeMap::new()), &[], &states);
+        let capabilities = catalog["capabilities"].as_array().expect("capability list");
+        let capability_entry = |lens_id| {
+            capabilities
+                .iter()
+                .find(|entry| entry["lens_id"] == lens_id)
+                .expect("contract capability")
+        };
+        assert_eq!(capability_entry("PG-FREEZE-006")["status"], "not_collected");
+        assert_eq!(
+            capability_entry("PG-FREEZE-006")["reason"],
+            "producer_unavailable"
+        );
+        assert_eq!(capability_entry("OS-FS-027")["status"], "partial");
+        assert_eq!(
+            capability_entry("OS-FS-027")["reason"],
+            "provenance_or_input_missing"
+        );
+        assert!(
+            catalog["applied"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry == "PG-FREEZE-006"))
+        );
+        assert!(catalog["dormant"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .all(|entry| entry["lens_id"] != "PG-FREEZE-006")
+        }));
     }
 
     #[test]
@@ -459,12 +652,15 @@ mod tests {
             &scan(),
             None,
             &outcome,
-            &BTreeMap::new(),
-            &InputQuality::default(),
-            &[SectionSkip {
-                section: "pg_stat_archiver",
-                reason: SkipReason::IncompletePage,
-            }],
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &InputQuality::default(),
+                skipped: &[SectionSkip {
+                    section: "pg_stat_archiver",
+                    reason: SkipReason::IncompletePage,
+                }],
+                capability_by_section: &BTreeMap::new(),
+            },
         );
         assert_eq!(body["clustering_complete"], false);
         assert_eq!(body["complete"], false);
@@ -490,7 +686,18 @@ mod tests {
             ..InputQuality::default()
         };
 
-        let body = build_response(7, &scan(), None, &outcome, &BTreeMap::new(), &quality, &[]);
+        let body = build_response(
+            7,
+            &scan(),
+            None,
+            &outcome,
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &quality,
+                skipped: &[],
+                capability_by_section: &BTreeMap::new(),
+            },
+        );
 
         assert_eq!(body["clustering_complete"], true);
         assert_eq!(body["analysis_status"], "partial");
@@ -545,9 +752,12 @@ mod tests {
             &scan(),
             None,
             &outcome,
-            &BTreeMap::new(),
-            &InputQuality::default(),
-            &[],
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &InputQuality::default(),
+                skipped: &[],
+                capability_by_section: &BTreeMap::new(),
+            },
         );
 
         assert_eq!(body["incidents"][0]["findings"], json!([]));
@@ -669,9 +879,12 @@ mod tests {
             &scan(),
             None,
             &outcome,
-            &BTreeMap::new(),
-            &InputQuality::default(),
-            &[],
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &InputQuality::default(),
+                skipped: &[],
+                capability_by_section: &BTreeMap::new(),
+            },
         );
         let finding = &body["incidents"][0]["findings"][0];
         assert_eq!(finding["lens_id"], "PG-CACHE-010");

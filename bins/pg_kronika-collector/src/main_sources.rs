@@ -9,6 +9,11 @@ use kronika_registry::Ts;
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver};
 use kronika_source_pg::database::{DatabaseRow, DatabaseVersion, collect_database};
+use kronika_source_pg::incident_gauges::{
+    LocalJoinFacts, ReplicationPhysicalRow, SlotRetentionRow, SlotRetentionVersion,
+    VacuumObservationRow, collect_local_join_facts, collect_replication_physical,
+    collect_slot_retention, collect_vacuum_observations,
+};
 use kronika_source_pg::io::{IoRow, IoVersion, collect_io};
 use kronika_source_pg::locks::{LocksRow, LocksVersion, collect_locks, locks_version};
 use kronika_source_pg::prepared_xacts::{PreparedXactsRow, collect_prepared_xacts};
@@ -71,17 +76,28 @@ const fn locks_type_id(version: LocksVersion) -> u32 {
 }
 
 /// Everything one tick reads from the main connection, gated by `due`.
+type ReplicationSources = (
+    ReplicationInstanceRow,
+    Vec<ReplicaRow>,
+    Vec<SlotRow>,
+    Vec<ReplicationPhysicalRow>,
+    SlotRetentionVersion,
+    Vec<SlotRetentionRow>,
+);
+
 pub(crate) struct MainConnSources {
     pub(crate) ts: Ts,
+    pub(crate) local_join: Option<LocalJoinFacts>,
     pub(crate) bgwriter: Option<BgwriterCheckpointer>,
     pub(crate) activity: Option<(ActivityVersion, Vec<ActivityRow>)>,
     pub(crate) database: Option<(DatabaseVersion, Vec<DatabaseRow>)>,
     pub(crate) progress_vacuum_rows: Vec<ProgressVacuumRow>,
+    pub(crate) vacuum_observation_rows: Vec<VacuumObservationRow>,
     pub(crate) prepared_rows: Vec<PreparedXactsRow>,
     pub(crate) wal: Option<WalSnapshot>,
     pub(crate) io: Option<(IoVersion, Vec<IoRow>)>,
     pub(crate) archiver: Option<ArchiverRow>,
-    pub(crate) replication: Option<(ReplicationInstanceRow, Vec<ReplicaRow>, Vec<SlotRow>)>,
+    pub(crate) replication: Option<ReplicationSources>,
     pub(crate) lock_rows: Vec<LocksRow>,
 }
 
@@ -99,6 +115,26 @@ pub(crate) async fn collect_main_conn_sources(
     let ts = kronika_source_pg::snapshot_ts(client)
         .await
         .context("read the snapshot timestamp")?;
+    let local_join = if due.has(SourceKind::OsMountTopo) || due.has(SourceKind::OsCgroup) {
+        match collect_local_join_facts(client, 256).await {
+            Ok(facts) => facts,
+            Err(err) => {
+                log_event(
+                    LogLevel::Warn,
+                    "collection_skip",
+                    &[
+                        field("collection", "cross_source_join"),
+                        field("source", "main"),
+                        field("reason", "local_join_facts_unavailable"),
+                        field("error", &err),
+                    ],
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let bgwriter = if due.has(SourceKind::Bgwriter) {
         let type_id = 1_006_001;
         let started = Instant::now();
@@ -189,6 +225,23 @@ pub(crate) async fn collect_main_conn_sources(
             Err(err) => {
                 log_collection_failure(type_id, "main", &err, started.elapsed());
                 return Err(err).context("collect pg_stat_progress_vacuum");
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let vacuum_observation_rows = if due.has(SourceKind::ProgressVacuum) {
+        let type_id = 1_032_001;
+        let started = Instant::now();
+        log_collection_start(type_id, "main");
+        match collect_vacuum_observations(client).await {
+            Ok(rows) => {
+                log_collection_finish(type_id, "main", rows.len(), started.elapsed());
+                rows
+            }
+            Err(err) => {
+                log_collection_failure(type_id, "main", &err, started.elapsed());
+                return Err(err).context("collect running vacuum observations");
             }
         }
     } else {
@@ -331,6 +384,12 @@ pub(crate) async fn collect_main_conn_sources(
         log_collection_start(1_017_001, "main");
         let details_started = Instant::now();
         let (replica_rows, slot_rows) = collect_replication_details(client, major).await?;
+        let physical_rows = collect_replication_physical(client)
+            .await
+            .context("collect typed physical replication gaps")?;
+        let (slot_retention_version, slot_retention_rows) = collect_slot_retention(client, major)
+            .await
+            .context("collect typed replication slot retention")?;
         log_collection_finish(
             1_016_001,
             "main",
@@ -343,7 +402,31 @@ pub(crate) async fn collect_main_conn_sources(
             slot_rows.len(),
             details_started.elapsed(),
         );
-        Some((instance_row, replica_rows, slot_rows))
+        log_collection_finish(
+            1_033_001,
+            "main",
+            physical_rows.len(),
+            details_started.elapsed(),
+        );
+        let retention_type_id = match slot_retention_version {
+            SlotRetentionVersion::Pg15 => 1_034_001,
+            SlotRetentionVersion::Pg16 => 1_034_002,
+            SlotRetentionVersion::Pg17Plus => 1_034_003,
+        };
+        log_collection_finish(
+            retention_type_id,
+            "main",
+            slot_retention_rows.len(),
+            details_started.elapsed(),
+        );
+        Some((
+            instance_row,
+            replica_rows,
+            slot_rows,
+            physical_rows,
+            slot_retention_version,
+            slot_retention_rows,
+        ))
     } else {
         None
     };
@@ -371,10 +454,12 @@ pub(crate) async fn collect_main_conn_sources(
     };
     Ok(MainConnSources {
         ts,
+        local_join,
         bgwriter,
         activity,
         database,
         progress_vacuum_rows,
+        vacuum_observation_rows,
         prepared_rows,
         wal,
         io,

@@ -20,10 +20,16 @@ use crate::FsSpace;
 /// One `/proc/self/mountinfo` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountEntry {
+    /// Mount id in the collector's mount namespace.
+    pub mount_id: i32,
+    /// Parent mount id in the collector's mount namespace.
+    pub parent_id: i32,
     /// Device major number (`0` for pseudo/subvolume filesystems).
     pub major: i32,
     /// Device minor number.
     pub minor: i32,
+    /// Filesystem root exposed by this mount (mountinfo field 4).
+    pub root: String,
     /// Where the filesystem is mounted (mountinfo field 5), with mountinfo
     /// octal escapes decoded.
     pub mount_point: String,
@@ -32,6 +38,8 @@ pub struct MountEntry {
     /// Mount source after the ` - ` separator (e.g. `/dev/sda1`), with
     /// mountinfo octal escapes decoded.
     pub source: String,
+    /// Whether the visible mount point has the kernel's deleted suffix.
+    pub deleted: bool,
     /// Whether [`mount_point`](Self::mount_point) is a Kubernetes bind-mounted
     /// infrastructure path that shares the node's device but carries no pod I/O.
     pub is_k8s_infra: bool,
@@ -75,7 +83,16 @@ pub fn parse_mountinfo(content: &str) -> Vec<MountEntry> {
 
         let head_fields: Vec<&str> = head.split_whitespace().collect();
         // Head layout: mount_id parent_id major:minor root mount_point ...
-        let (Some(dev), Some(mount_point)) = (head_fields.get(2), head_fields.get(4)) else {
+        let (Some(mount_id), Some(parent_id), Some(dev), Some(root), Some(mount_point)) = (
+            head_fields.first(),
+            head_fields.get(1),
+            head_fields.get(2),
+            head_fields.get(3),
+            head_fields.get(4),
+        ) else {
+            continue;
+        };
+        let (Ok(mount_id), Ok(parent_id)) = (mount_id.parse(), parent_id.parse()) else {
             continue;
         };
 
@@ -91,17 +108,23 @@ pub fn parse_mountinfo(content: &str) -> Vec<MountEntry> {
             continue;
         };
 
+        let root = unescape_mountinfo_field(root);
         let mount_point = unescape_mountinfo_field(mount_point);
+        let deleted = mount_point.ends_with(" (deleted)");
         let fstype = unescape_mountinfo_field(fstype);
         let source = unescape_mountinfo_field(source);
 
         entries.push(MountEntry {
+            mount_id,
+            parent_id,
             major,
             minor,
+            root,
             is_k8s_infra: is_k8s_infra_mount(&mount_point),
             mount_point,
             fstype,
             source,
+            deleted,
         });
     }
 
@@ -294,11 +317,15 @@ mod tests {
     #[test]
     fn mount_row_maps_space_fields() {
         let entry = MountEntry {
+            mount_id: 30,
+            parent_id: 20,
             major: 8,
             minor: 1,
+            root: "/".to_owned(),
             mount_point: "/data".to_owned(),
             fstype: "ext4".to_owned(),
             source: "/dev/sda1".to_owned(),
+            deleted: false,
             is_k8s_infra: false,
         };
 
