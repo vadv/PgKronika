@@ -25,7 +25,8 @@ pub(crate) use engine::{
     reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"
 )]
 pub(crate) use lens::Lens;
+pub(crate) use lenses::{DormantLens, dormant_catalog};
+#[cfg(test)]
 pub(crate) use lenses::{
-    DormantLens, MAX_CATALOG_TEXT_BYTES, MAX_CATALOG_TOKEN_BYTES, MAX_DORMANT_LENSES,
-    MAX_MISSING_PER_LENS, dormant_catalog,
+    MAX_CATALOG_TEXT_BYTES, MAX_CATALOG_TOKEN_BYTES, MAX_DORMANT_LENSES, MAX_MISSING_PER_LENS,
 };
