@@ -83,15 +83,15 @@ jobs:
           image_hash=$(./scripts/bdd-image.sh image-key)
           platform_slug=$(echo "${BDD_PLATFORM}" | tr '/_' '-')
           branch_slug=$(./scripts/bdd-image.sh branch-slug "${BDD_BRANCH_NAME}")
-          repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           {
             echo "image_hash=${image_hash:0:16}"
             echo "platform_slug=${platform_slug}"
             echo "branch_name=${BDD_BRANCH_NAME}"
-            echo "builder=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-${deps_hash:0:16}"
-            echo "builder_branch_cache=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-branch-${branch_slug}"
-            echo "builder_main_cache=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-branch-main"
-            echo "image=ghcr.io/${repo}/pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}"
+            echo "builder=ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-${deps_hash:0:16}"
+            echo "builder_branch_cache=ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-branch-${branch_slug}"
+            echo "builder_main_cache=ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-branch-main"
+            echo "image=ghcr.io/${owner}/pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}"
             echo "can_push=${BDD_IMAGE_CAN_PUSH}"
           } >> "$GITHUB_OUTPUT"
 
@@ -164,6 +164,8 @@ jobs:
           export BDD_OUTPUT_TAR=image.tar
           ./scripts/bdd-image.sh build-runtime
           rm -f image.tar
+      - name: Verify PostgreSQL runtime
+        run: ./scripts/bdd-image.sh check-runtime "${{ needs.bdd-meta.outputs.image }}"
       - name: Run the PostgreSQL matrix
         run: docker run --rm "${{ needs.bdd-meta.outputs.image }}"
       - name: Push BDD image

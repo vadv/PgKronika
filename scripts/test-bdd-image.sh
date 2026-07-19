@@ -471,6 +471,27 @@ test_dependency_manifest_changes_deps_key() {
   fi
 }
 
+test_effective_builder_and_runtime_keys() {
+  local base cargo topology edited image repo script
+  repo=$(make_repo_copy)
+  script="$repo/scripts/bdd-image.sh"
+  base=$(run_bdd_image_script "$script" deps-key)
+  printf '\n[net]\noffline = true\n' >> "$repo/.cargo/config.toml"
+  cargo=$(run_bdd_image_script "$script" deps-key)
+  [ "$cargo" != "$base" ] || fail ".cargo config must change deps key"
+  mkdir -p "$repo/crates/kronika-source-log/src/bin"
+  printf 'fn main() {}\n' > "$repo/crates/kronika-source-log/src/bin/key_probe.rs"
+  topology=$(run_bdd_image_script "$script" deps-key)
+  [ "$topology" != "$cargo" ] || fail "target path must change deps key"
+  printf 'fn main() { println!("body"); }\n' > "$repo/crates/kronika-source-log/src/bin/key_probe.rs"
+  edited=$(run_bdd_image_script "$script" deps-key)
+  assert_eq "$edited" "$topology"
+  image=$(run_bdd_image_script "$script" image-key)
+  printf '\nfn key_probe() {}\n' >> "$repo/xtask/src/main.rs"
+  assert_eq "$(run_bdd_image_script "$script" deps-key)" "$edited"
+  [ "$(run_bdd_image_script "$script" image-key)" != "$image" ] || fail "xtask source must change image key"
+}
+
 test_runtime_key_changes_for_feature_inputs() {
   local before after probe repo script
   repo=$(make_repo_copy)
@@ -493,6 +514,8 @@ test_github_actions_bdd_uses_fast_runtime_default() {
     || fail "GitHub Actions build-runtime step must use local exact-image reuse"
   grep -F -- './scripts/bdd-image.sh build-runtime' "$workflow" >/dev/null \
     || fail "GitHub Actions must use the BDD image helper for runtime builds"
+  grep -F -- './scripts/bdd-image.sh check-runtime' "$workflow" >/dev/null \
+    || fail "GitHub Actions must check the runtime before BDD"
 }
 
 for test in \
@@ -519,6 +542,7 @@ for test in \
   test_runtime_key_ignores_host_only_files \
   test_rust_source_changes_runtime_but_not_deps_or_builder \
   test_dependency_manifest_changes_deps_key \
+  test_effective_builder_and_runtime_keys \
   test_runtime_key_changes_for_feature_inputs \
   test_github_actions_bdd_uses_fast_runtime_default
 do

@@ -11,6 +11,7 @@ BDD_DEPS_PATHS=(
   rust-toolchain.toml
   Cargo.toml
   Cargo.lock
+  '.cargo/**'
   'crates/*/Cargo.toml'
   'bins/*/Cargo.toml'
   xtask/Cargo.toml
@@ -28,11 +29,11 @@ BDD_RUNTIME_KEY_PATHS=(
   'bins/*/benches/**'
   'bins/*/static/**'
   'crates/kronika-bdd/features/**'
+  'xtask/src/**'
 )
 
 BDD_RUNTIME_SOURCE_PATHS=(
   "${BDD_RUNTIME_KEY_PATHS[@]}"
-  'xtask/src/**'
 )
 
 usage() {
@@ -54,14 +55,16 @@ Commands:
                  Print a branch name as a Docker tag fragment.
   build-builder  Build or pull the BDD builder image.
   build-runtime  Build image.tar with the builder image and load it into Docker.
+  check-runtime [image]
+                 Verify PostgreSQL 15-18 and pg_store_plans files.
   run [image] [args...]
                  Run the BDD image. Extra args are passed to kronika-bdd.
 
 Environment:
-  BDD_IMAGE_PREFIX   Registry prefix, default ghcr.io/vadv/pgkronika.
+  BDD_IMAGE_PREFIX   Registry prefix, default ghcr.io/vadv.
   BDD_PLATFORM       Docker platform. Defaults to the local Docker server platform.
   BDD_BRANCH_NAME    Branch name used for the mutable branch cache.
-  BDD_BUILDER_IMAGE  Builder image tag. Defaults to <prefix>/pgkronika-bdd-builder:deps-<platform>-<deps-key>.
+  BDD_BUILDER_IMAGE  Builder image tag. Defaults to <prefix>/pgkronika-bdd-builder:builder-<platform>-<deps-key>.
   BDD_BUILDER_BRANCH_IMAGE
                      Mutable builder cache for BDD_BRANCH_NAME.
   BDD_BUILDER_MAIN_IMAGE
@@ -125,6 +128,22 @@ print_git_paths() {
   )
 }
 
+cargo_target_paths() {
+  local root manifest dir path
+  root=$(repo_root)
+  (
+    cd "$root"
+    for manifest in crates/*/Cargo.toml bins/*/Cargo.toml xtask/Cargo.toml; do
+      [ -f "$manifest" ] || continue
+      dir=${manifest%/Cargo.toml}
+      for path in "$dir"/build.rs "$dir"/src/{lib,main}.rs "$dir"/src/bin/*.rs "$dir"/src/bin/*/main.rs "$dir"/{tests,examples,benches}/*.rs "$dir"/{tests,examples,benches}/*/main.rs; do
+        [ -f "$path" ] && printf '%s\n' "$path"
+      done
+      :
+    done | LC_ALL=C sort
+  )
+}
+
 source_tar() {
   local root
   root=$(repo_root)
@@ -137,46 +156,19 @@ source_tar() {
 }
 
 write_dummy_builder_sources() {
-  local context=$1 dir root
-  root=$(repo_root)
-
-  for dir in "$context"/crates/*; do
-    [ -f "$dir/Cargo.toml" ] || continue
-    mkdir -p "$dir/src"
-    case "${dir##*/}" in
-      kronika-bdd)
-        printf 'fn main() {}\n' > "$dir/src/main.rs"
+  local context=$1 path target
+  cargo_target_paths | while IFS= read -r path; do
+    target="$context/$path"
+    mkdir -p "${target%/*}"
+    case "$path" in
+      */src/lib.rs)
+        printf '#![allow(missing_docs)]\n' > "$target"
         ;;
-      *)
-        printf '#![allow(missing_docs)]\n' > "$dir/src/lib.rs"
+      */tests/*.rs|*/tests/*/main.rs)
+        : > "$target"
         ;;
+      *) printf 'fn main() {}\n' > "$target" ;;
     esac
-  done
-
-  for dir in "$context"/bins/* "$context"/xtask; do
-    [ -f "$dir/Cargo.toml" ] || continue
-    mkdir -p "$dir/src"
-    printf 'fn main() {}\n' > "$dir/src/main.rs"
-    # A binary crate that also ships a library target needs both dummy files,
-    # or crane derives a different cargoArtifacts than the real workspace and
-    # the runtime rebuilds every dependency.
-    if [ -f "$root/${dir#"$context"/}/src/lib.rs" ]; then
-      printf '#![allow(missing_docs)]\n' > "$dir/src/lib.rs"
-    fi
-  done
-
-  # Every declared [[bench]] target needs a file on disk, or cargo refuses to
-  # parse the crate manifest.
-  for dir in "$context"/crates/* "$context"/bins/*; do
-    [ -f "$dir/Cargo.toml" ] || continue
-    awk '/^\[\[bench\]\]/ { in_bench = 1; next }
-         /^\[/ { in_bench = 0 }
-         in_bench && /^name *= *"/ { gsub(/^name *= *"|".*$/, ""); print }' \
-      "$dir/Cargo.toml" \
-      | while IFS= read -r bench; do
-          mkdir -p "$dir/benches"
-          printf 'fn main() {}\n' > "$dir/benches/$bench.rs"
-        done
   done
 }
 
@@ -198,7 +190,10 @@ builder_context_tar() {
 }
 
 deps_key() {
-  hash_git_paths "${BDD_DEPS_PATHS[@]}"
+  {
+    printf 'builder-context-v2\0%s\0%s\0' "$NIX_BASE_IMAGE" "$(hash_git_paths "${BDD_DEPS_PATHS[@]}")"
+    cargo_target_paths
+  } | sha256_stream
 }
 
 image_key() {
@@ -266,7 +261,7 @@ branch_slug() {
 }
 
 image_prefix() {
-  printf '%s' "${BDD_IMAGE_PREFIX:-ghcr.io/vadv/pgkronika}"
+  printf '%s' "${BDD_IMAGE_PREFIX:-ghcr.io/vadv}"
 }
 
 builder_image() {
@@ -274,7 +269,7 @@ builder_image() {
     printf '%s' "$BDD_BUILDER_IMAGE"
     return
   fi
-  printf '%s/pgkronika-bdd-builder:deps-%s-%s' "$(image_prefix)" "$(platform_slug)" "$(short_key "$(deps_key)")"
+  printf '%s/pgkronika-bdd-builder:builder-%s-%s' "$(image_prefix)" "$(platform_slug)" "$(short_key "$(deps_key)")"
 }
 
 builder_branch_image() {
@@ -282,7 +277,7 @@ builder_branch_image() {
     printf '%s' "$BDD_BUILDER_BRANCH_IMAGE"
     return
   fi
-  printf '%s/pgkronika-bdd-builder:deps-%s-branch-%s' "$(image_prefix)" "$(platform_slug)" "$(branch_slug)"
+  printf '%s/pgkronika-bdd-builder:builder-%s-branch-%s' "$(image_prefix)" "$(platform_slug)" "$(branch_slug)"
 }
 
 builder_main_image() {
@@ -290,7 +285,7 @@ builder_main_image() {
     printf '%s' "$BDD_BUILDER_MAIN_IMAGE"
     return
   fi
-  printf '%s/pgkronika-bdd-builder:deps-%s-branch-main' "$(image_prefix)" "$(platform_slug)"
+  printf '%s/pgkronika-bdd-builder:builder-%s-branch-main' "$(image_prefix)" "$(platform_slug)"
 }
 
 runtime_image() {
@@ -469,6 +464,29 @@ build_runtime() {
   fi
 }
 
+check_runtime() {
+  local runtime=${1:-$(runtime_image)}
+  docker_cmd run --rm --entrypoint /bin/sh "$runtime" -ceu '
+    old_ifs=$IFS; IFS=";"; set -- $KRONIKA_PG_MATRIX; IFS=$old_ifs; seen=
+    for entry do
+      major=${entry%%=*}; bin=${entry#*=}; root=${bin%/bin}
+      case "$major" in 15|16|17|18) ;; *) echo "unexpected PG$major" >&2; exit 1;; esac
+      [ -x "$bin/postgres" ] && [ -f "$root/lib/pg_store_plans.so" ] &&
+        [ -f "$root/share/postgresql/extension/pg_store_plans.control" ] ||
+        { echo "incomplete PG$major runtime" >&2; exit 1; }
+      sql=false
+      for path in "$root"/share/postgresql/extension/pg_store_plans--*.sql; do
+        [ -f "$path" ] && sql=true && break
+      done
+      $sql || { echo "missing PG$major extension SQL" >&2; exit 1; }
+      seen="$seen $major"
+    done
+    for major in 15 16 17 18; do
+      case " $seen " in *" $major "*) ;; *) echo "missing PG$major" >&2; exit 1;; esac
+    done
+  '
+}
+
 run_runtime() {
   local image
   if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
@@ -528,6 +546,10 @@ case "$cmd" in
     ;;
   build-runtime)
     build_runtime
+    ;;
+  check-runtime)
+    shift
+    check_runtime "${1:-}"
     ;;
   run)
     shift
