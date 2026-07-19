@@ -63,9 +63,9 @@ pub(crate) fn build_response(
     input_skipped: &[SectionSkip],
 ) -> Value {
     let incidents: Vec<Value> = outcome.incidents.iter().map(incident_to_json).collect();
-    let clustering_complete =
-        outcome.complete && input_skipped.is_empty() && quality.episodes_truncated == 0;
-    let analysis_status = if !clustering_complete {
+    let clustering_complete = input_skipped.is_empty() && quality.episodes_truncated == 0;
+    let analysis_complete = clustering_complete && outcome.complete;
+    let analysis_status = if !analysis_complete {
         "partial"
     } else if quality.evaluated_positions == 0 {
         "insufficient_data"
@@ -475,6 +475,25 @@ mod tests {
             body["skipped"]["sections"][0]["reason"]["kind"],
             "incomplete_page",
         );
+    }
+
+    #[test]
+    fn incomplete_lens_evaluation_keeps_clustering_complete() {
+        let outcome = EngineOutcome {
+            incidents: Vec::new(),
+            span_splits: 0,
+            complete: false,
+            skipped: Vec::new(),
+        };
+        let quality = InputQuality {
+            evaluated_positions: 1,
+            ..InputQuality::default()
+        };
+
+        let body = build_response(7, &scan(), None, &outcome, &BTreeMap::new(), &quality, &[]);
+
+        assert_eq!(body["clustering_complete"], true);
+        assert_eq!(body["analysis_status"], "partial");
     }
 
     #[test]

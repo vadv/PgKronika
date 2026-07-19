@@ -1,8 +1,9 @@
 # Incident-анализ
 
-`GET /v1/incidents` группирует аномальные эпизоды по времени и узлу. Диагностические
-линзы пока не выполняются: `findings` пуст, `complete=false`, а `catalog.status`
-равен `dormant`. Ответ нельзя трактовать как готовую диагностику причины.
+`GET /v1/incidents` группирует аномальные эпизоды по времени и узлу, затем
+выполняет активные диагностические линзы над типизированными counter-дельтами.
+Это диагностические гипотезы, а не измеренная первопричина: направленная роль
+требует структурного evidence или доказанного порядка часов.
 
 ## Как читать ответ
 
@@ -15,38 +16,54 @@
     {
       "incident_key": "...",
       "members": ["..."],
-      "findings": [],
-      "evaluation_complete": false,
-      "finding_evaluation_status": "not_available"
+      "findings": [
+        {
+          "lens_id": "PG-CACHE-010",
+          "role": "amplifier",
+          "confidence": "medium",
+          "scope": {
+            "logical_section": "pg_stat_database",
+            "column": "blks_read",
+            "identity": [5]
+          },
+          "evidence": ["ratio"]
+        }
+      ],
+      "evaluation_complete": true,
+      "finding_evaluation_status": "complete"
     }
   ],
   "catalog": {
-    "status": "dormant",
-    "diagnosis_available": false,
-    "scope": "anomaly_clustering_only",
-    "applied": [],
+    "status": "partial",
+    "diagnosis_available": true,
+    "scope": "diagnostic_lenses",
+    "applied": ["PG-CACHE-010", "..."],
     "dormant": ["..."]
   }
 }
 ```
 
-- `complete` относится ко всему incident-анализу. Пока линзы не подключены, поле
-  остаётся `false` даже при полном результате кластеризации.
+- `complete` относится ко всему incident-анализу. Пока каталог покрыт частично,
+  поле остаётся `false` даже при полном результате кластеризации и lens evaluation.
 - `clustering_complete` сообщает только о полноте чтения, scoring и группировки
   эпизодов. Оно не подтверждает полноту логов или диагностических evidence.
 - `analysis_status` описывает результат текущего запроса: `no_data`,
   `insufficient_data`, `calm`, `incidents_detected` или `partial`.
 - `incident_key` — детерминированный ключ из node identity, интервала и членов
   кластера. Он не содержит `lens_id`.
-- `findings=[]` и `finding_evaluation_status=not_available` означают, что ни одна
-  линза не выполнялась. Это не отсутствие проблем.
+- `findings=[]` при `finding_evaluation_status=complete` означает, что активные
+  линзы не нашли своих условий в этом incident-окне. Это не доказывает отсутствие
+  проблем вне активного каталога.
+- `finding_evaluation_status=partial` означает, что лимит работы или output
+  остановил оценку части линз; подробность находится в `skipped.evaluations`.
 - `skipped` и `data_quality` нужно проверять до интерпретации результата.
 
-`catalog.dormant` содержит только 28 принятых диагностических вопросов. Поле
-`lens_id` сохраняет опубликованный стабильный идентификатор (`PG-QRY-001`, …,
-`OS-NET-028`), а `slug` даёт читаемое snake_case-имя. Русские `title` и `question`
-явно помечены `text_locale="ru"`. `confidence_cap` — верхняя граница уверенности,
-а не уверенность несуществующего finding.
+`catalog.applied` содержит активные `lens_id`. `catalog.dormant` содержит
+оставшиеся диагностические вопросы, для которых не хватает входов. Поле `lens_id`
+сохраняет опубликованный стабильный идентификатор (`PG-QRY-001`, …,
+`OS-NET-028`), а `slug` даёт читаемое snake_case-имя. Русские `title` и
+`question` явно помечены `text_locale="ru"`. `confidence_cap` — верхняя граница
+уверенности, а не уверенность несуществующего finding.
 
 Пример записи:
 
@@ -101,10 +118,12 @@ SQL, параметры, IP, user/database, пути, conninfo и archive comman
 Код подсистемы находится в `bins/pg_kronika-web/src/incident/`:
 
 - `lenses.rs` — стабильные ID, slug, metadata и недостающие capabilities;
+- `active.rs` — активные counter-линзы и их формулы;
 - `lens.rs` — контракт `Lens`;
 - `dispatch.rs` и `engine.rs` — допуск работы, вызов линз и output limits;
 - `evidence.rs` — предел уверенности и правила роли;
-- `model.rs`, `series.rs`, `cluster.rs` — identity, входные ряды и кластеры;
+- `model.rs`, `series.rs`, `typed.rs`, `cluster.rs` — identity, входные ряды,
+  typed counter evidence и кластеры;
 - `incident_input.rs` — bounded adapter reader → anomaly episodes;
 - `incident_response.rs` — JSON transport.
 

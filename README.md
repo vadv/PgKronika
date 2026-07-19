@@ -122,7 +122,7 @@ crates.io.
 | [`kronika-source-os`](crates/kronika-source-os/) | Bounded Linux `/proc`, `/sys`, filesystem, process, and cgroup readers. |
 | [`kronika-source-log`](crates/kronika-source-log/) | Bounded stderr tailing, normalization, typed events, and gap reporting. |
 | [`pg_kronika-collector`](bins/pg_kronika-collector/) | Collection lifecycle, pacing, budgets, coverage, journaling, and rotation. |
-| [`pg_kronika-web`](bins/pg_kronika-web/) | Local UI, JSON API, auth, readiness, bounded queries, anomalies, and incident clustering. |
+| [`pg_kronika-web`](bins/pg_kronika-web/) | Local UI, JSON API, auth, readiness, bounded queries, anomalies, incident clustering, and diagnostic findings. |
 | [`kronika-bdd`](crates/kronika-bdd/) | Docker/Nix integration runner for the PostgreSQL 15–18 matrix. |
 | [`xtask`](xtask/) | Dependency-boundary check used by CI. |
 | `pg_kronika-archiver`, `pg_kronika-dump` | Placeholders that print an error and exit with status 2. |

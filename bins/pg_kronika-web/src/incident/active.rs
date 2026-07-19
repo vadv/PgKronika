@@ -60,7 +60,7 @@ impl Lens for SharedBufferMissesLens {
         cluster: &Cluster,
         _series: &SeriesSet,
         typed: &TypedInputs,
-        _context: &EvalContext,
+        context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
@@ -73,6 +73,8 @@ impl Lens for SharedBufferMissesLens {
                 &member.identity,
                 "blks_read",
                 "blks_hit",
+                context.incident_start_us,
+                context.incident_end_us,
             ) else {
                 continue;
             };
@@ -135,7 +137,7 @@ impl Lens for WalAmplificationLens {
         cluster: &Cluster,
         _series: &SeriesSet,
         typed: &TypedInputs,
-        _context: &EvalContext,
+        context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
@@ -143,9 +145,14 @@ impl Lens for WalAmplificationLens {
             if member.logical_section != PG_STAT_WAL || member.column != "wal_fpi" {
                 continue;
             }
-            let Some(sums) =
-                typed.paired_delta_sums(PG_STAT_WAL, &member.identity, "wal_fpi", "wal_records")
-            else {
+            let Some(sums) = typed.paired_delta_sums(
+                PG_STAT_WAL,
+                &member.identity,
+                "wal_fpi",
+                "wal_records",
+                context.incident_start_us,
+                context.incident_end_us,
+            ) else {
                 continue;
             };
             if sums.intervals < Self::MIN_INTERVALS {
@@ -203,7 +210,7 @@ impl Lens for TempSpillLens {
         cluster: &Cluster,
         _series: &SeriesSet,
         typed: &TypedInputs,
-        _context: &EvalContext,
+        context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
@@ -216,6 +223,8 @@ impl Lens for TempSpillLens {
                 &member.identity,
                 "temp_bytes",
                 "temp_files",
+                context.incident_start_us,
+                context.incident_end_us,
             ) else {
                 continue;
             };
@@ -277,7 +286,7 @@ impl Lens for RequestedCheckpointsLens {
         cluster: &Cluster,
         _series: &SeriesSet,
         typed: &TypedInputs,
-        _context: &EvalContext,
+        context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
@@ -290,6 +299,8 @@ impl Lens for RequestedCheckpointsLens {
                 &member.identity,
                 "checkpoints_req",
                 "checkpoints_timed",
+                context.incident_start_us,
+                context.incident_end_us,
             ) else {
                 continue;
             };
@@ -351,7 +362,7 @@ impl Lens for BackendIoLatencyLens {
         cluster: &Cluster,
         _series: &SeriesSet,
         typed: &TypedInputs,
-        _context: &EvalContext,
+        context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
@@ -359,9 +370,14 @@ impl Lens for BackendIoLatencyLens {
             if member.logical_section != PG_STAT_IO || member.column != "read_time" {
                 continue;
             }
-            let Some(sums) =
-                typed.paired_delta_sums(PG_STAT_IO, &member.identity, "read_time", "reads")
-            else {
+            let Some(sums) = typed.paired_delta_sums(
+                PG_STAT_IO,
+                &member.identity,
+                "read_time",
+                "reads",
+                context.incident_start_us,
+                context.incident_end_us,
+            ) else {
                 continue;
             };
             if sums.intervals < Self::MIN_INTERVALS {
@@ -422,7 +438,7 @@ impl Lens for HotUpdateFailureLens {
         cluster: &Cluster,
         _series: &SeriesSet,
         typed: &TypedInputs,
-        _context: &EvalContext,
+        context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
@@ -435,6 +451,8 @@ impl Lens for HotUpdateFailureLens {
                 &member.identity,
                 "n_tup_hot_upd",
                 "n_tup_upd",
+                context.incident_start_us,
+                context.incident_end_us,
             ) else {
                 continue;
             };
@@ -499,7 +517,7 @@ impl Lens for WalArchivingFailureLens {
         cluster: &Cluster,
         _series: &SeriesSet,
         typed: &TypedInputs,
-        _context: &EvalContext,
+        context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
@@ -512,6 +530,8 @@ impl Lens for WalArchivingFailureLens {
                 &member.identity,
                 "failed_count",
                 "archived_count",
+                context.incident_start_us,
+                context.incident_end_us,
             ) else {
                 continue;
             };
@@ -570,7 +590,7 @@ impl Lens for NetworkErrorsLens {
         cluster: &Cluster,
         _series: &SeriesSet,
         typed: &TypedInputs,
-        _context: &EvalContext,
+        context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
@@ -578,9 +598,14 @@ impl Lens for NetworkErrorsLens {
             if member.logical_section != OS_NETDEV || member.column != "rx_errs" {
                 continue;
             }
-            let Some(sums) =
-                typed.paired_delta_sums(OS_NETDEV, &member.identity, "rx_errs", "rx_packets")
-            else {
+            let Some(sums) = typed.paired_delta_sums(
+                OS_NETDEV,
+                &member.identity,
+                "rx_errs",
+                "rx_packets",
+                context.incident_start_us,
+                context.incident_end_us,
+            ) else {
                 continue;
             };
             if sums.intervals < Self::MIN_INTERVALS {
@@ -642,7 +667,7 @@ impl Lens for CgroupCpuThrottlingLens {
         cluster: &Cluster,
         _series: &SeriesSet,
         typed: &TypedInputs,
-        _context: &EvalContext,
+        context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
@@ -655,6 +680,8 @@ impl Lens for CgroupCpuThrottlingLens {
                 &member.identity,
                 "throttled_usec",
                 "usage_usec",
+                context.incident_start_us,
+                context.incident_end_us,
             ) else {
                 continue;
             };
@@ -709,7 +736,7 @@ mod tests {
         Arc::from(vec![IdentityValue::U64(5)])
     }
 
-    fn episode() -> EnrichedEpisode {
+    fn episode_window(start_us: i64, end_us: i64) -> EnrichedEpisode {
         EnrichedEpisode {
             episode: Episode {
                 start: 0,
@@ -730,8 +757,8 @@ mod tests {
                 logical_section: PG_STAT_DATABASE,
                 column: "blks_read",
                 identity: id(),
-                start_us: 0,
-                end_us: 10,
+                start_us,
+                end_us,
             },
         }
     }
@@ -755,11 +782,15 @@ mod tests {
     }
 
     fn run(typed: &TypedInputs) -> Vec<(Role, Confidence)> {
+        run_window(typed, 0, 10)
+    }
+
+    fn run_window(typed: &TypedInputs, start_us: i64, end_us: i64) -> Vec<(Role, Confidence)> {
         let lens = SharedBufferMissesLens;
         let lenses: [&dyn Lens; 1] = [&lens];
         let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
         let outcome = analyze(
-            vec![episode()],
+            vec![episode_window(start_us, end_us)],
             &SeriesSet::for_test(0),
             typed,
             &lenses,
@@ -778,6 +809,18 @@ mod tests {
         // miss ratio 80/(80+20) = 0.8, three valid intervals.
         let findings = run(&typed(&[30.0, 30.0, 20.0], &[5.0, 5.0, 10.0]));
         assert_eq!(findings, vec![(Role::Amplifier, Confidence::MEDIUM)]);
+    }
+
+    #[test]
+    fn counter_evidence_outside_the_incident_window_does_not_report() {
+        let typed = typed(
+            &[80.0, 80.0, 80.0, 1.0, 1.0, 1.0],
+            &[1.0, 1.0, 1.0, 99.0, 99.0, 99.0],
+        );
+        assert!(
+            run_window(&typed, 3, 5).is_empty(),
+            "the cold-cache intervals end before the incident window"
+        );
     }
 
     #[test]

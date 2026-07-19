@@ -123,7 +123,7 @@ Basic Auth.
 | [`kronika-source-os`](crates/kronika-source-os/) | Ограниченное чтение Linux `/proc`, `/sys`, файловых систем, процессов и cgroup. |
 | [`kronika-source-log`](crates/kronika-source-log/) | Ограниченный tail stderr, нормализация, типизированные события и gap-учёт. |
 | [`pg_kronika-collector`](bins/pg_kronika-collector/) | Жизненный цикл сбора, интервалы, бюджеты, coverage, журнал и ротация. |
-| [`pg_kronika-web`](bins/pg_kronika-web/) | Локальный UI, JSON API, auth, readiness, bounded queries, аномалии и кластеризация инцидентов. |
+| [`pg_kronika-web`](bins/pg_kronika-web/) | Локальный UI, JSON API, auth, readiness, bounded queries, аномалии, кластеризация инцидентов и диагностические выводы (`findings`). |
 | [`kronika-bdd`](crates/kronika-bdd/) | Docker/Nix runner интеграционных сценариев для PostgreSQL 15–18. |
 | [`xtask`](xtask/) | Проверка границ зависимостей в CI. |
 | `pg_kronika-archiver`, `pg_kronika-dump` | Заглушки: печатают ошибку и завершаются с кодом 2. |

@@ -105,16 +105,21 @@ impl TypedInputs {
         })
     }
 
-    /// Sum `column_a` and `column_b` deltas of one series over the intervals
-    /// where both carry a usable value, matched by snapshot time. Returns `None`
-    /// when either column is absent for the series; `intervals == 0` means the
-    /// columns share no usable interval.
+    /// Sum `column_a` and `column_b` deltas of one series inside
+    /// `[from_us, to_us]`, over intervals where both columns carry a usable
+    /// value and share a snapshot time.
+    ///
+    /// Returns `None` when either column is absent for the series;
+    /// `intervals == 0` means the columns share no usable interval in the
+    /// requested window.
     pub(crate) fn paired_delta_sums(
         &self,
         section: &'static str,
         identity: &[IdentityValue],
         column_a: &'static str,
         column_b: &'static str,
+        from_us: i64,
+        to_us: i64,
     ) -> Option<PairedSums> {
         let track_a = self.counter(section, column_a, identity)?;
         let track_b = self.counter(section, column_b, identity)?;
@@ -132,7 +137,9 @@ impl TypedInputs {
                 std::cmp::Ordering::Less => i += 1,
                 std::cmp::Ordering::Greater => j += 1,
                 std::cmp::Ordering::Equal => {
-                    if let (Some(delta_a), Some(delta_b)) = (a.delta(), b.delta()) {
+                    if (from_us..=to_us).contains(&a.end_us)
+                        && let (Some(delta_a), Some(delta_b)) = (a.delta(), b.delta())
+                    {
                         sums.sum_a += delta_a;
                         sums.sum_b += delta_b;
                         sums.intervals += 1;
@@ -183,7 +190,7 @@ mod tests {
             vec![(10, value(30.0)), (20, value(70.0))],
         );
         let sums = typed
-            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit")
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
             .expect("both columns present");
         assert_eq!(sums.intervals, 2);
         assert!((sums.sum_a - 10.0).abs() < 1e-9);
@@ -197,7 +204,7 @@ mod tests {
             vec![(10, value(30.0)), (20, value(70.0))],
         );
         let sums = typed
-            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit")
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
             .expect("both columns present");
         assert_eq!(
             sums.intervals, 1,
@@ -214,7 +221,7 @@ mod tests {
             vec![(20, value(70.0)), (30, value(90.0))],
         );
         let sums = typed
-            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit")
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
             .expect("both columns present");
         assert_eq!(sums.intervals, 1, "only ts=20 is shared");
         assert!((sums.sum_a - 7.0).abs() < 1e-9);
@@ -227,7 +234,7 @@ mod tests {
         typed.insert_counter("db", "blks_read", id(1), vec![(10, value(3.0))]);
         assert!(
             typed
-                .paired_delta_sums("db", &id(1), "blks_read", "blks_hit")
+                .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
                 .is_none()
         );
     }
@@ -236,7 +243,7 @@ mod tests {
     fn a_reset_only_pair_reports_zero_usable_intervals() {
         let typed = inputs(vec![(10, absent(Reason::Reset))], vec![(10, value(30.0))]);
         let sums = typed
-            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit")
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
             .expect("both columns present");
         assert_eq!(sums.intervals, 0);
         assert!(sums.sum_a.abs() < 1e-9);
@@ -255,10 +262,36 @@ mod tests {
             vec![(10, value(30.0)), (20, value(70.0))],
         );
         let sums = typed
-            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit")
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
             .expect("both columns present");
         assert_eq!(sums.intervals, 1, "the non-finite interval is excluded");
         assert!((sums.sum_a - 7.0).abs() < 1e-9);
         assert!((sums.sum_b - 70.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paired_sums_only_count_intervals_ending_inside_the_window() {
+        let typed = inputs(
+            vec![
+                (0, value(100.0)),
+                (10, value(3.0)),
+                (20, value(7.0)),
+                (30, value(200.0)),
+            ],
+            vec![
+                (0, value(10.0)),
+                (10, value(30.0)),
+                (20, value(70.0)),
+                (30, value(20.0)),
+            ],
+        );
+
+        let sums = typed
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", 10, 20)
+            .expect("both columns present");
+
+        assert_eq!(sums.intervals, 2);
+        assert!((sums.sum_a - 10.0).abs() < 1e-9);
+        assert!((sums.sum_b - 100.0).abs() < 1e-9);
     }
 }
