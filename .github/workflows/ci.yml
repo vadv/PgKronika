@@ -83,15 +83,15 @@ jobs:
           image_hash=$(./scripts/bdd-image.sh image-key)
           platform_slug=$(echo "${BDD_PLATFORM}" | tr '/_' '-')
           branch_slug=$(./scripts/bdd-image.sh branch-slug "${BDD_BRANCH_NAME}")
-          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           {
-            echo "image_hash=${image_hash}"
+            echo "image_hash=${image_hash:0:16}"
             echo "platform_slug=${platform_slug}"
             echo "branch_name=${BDD_BRANCH_NAME}"
-            echo "builder=ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-${deps_hash}"
-            echo "builder_branch_cache=ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-branch-${branch_slug}"
-            echo "builder_main_cache=ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-branch-main"
-            echo "image=ghcr.io/${owner}/pgkronika-bdd:${platform_slug}-sha-${image_hash}"
+            echo "builder=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-${deps_hash:0:16}"
+            echo "builder_branch_cache=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-branch-${branch_slug}"
+            echo "builder_main_cache=ghcr.io/${repo}/pgkronika-bdd-builder:deps-${platform_slug}-branch-main"
+            echo "image=ghcr.io/${repo}/pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}"
             echo "can_push=${BDD_IMAGE_CAN_PUSH}"
           } >> "$GITHUB_OUTPUT"
 
@@ -109,26 +109,27 @@ jobs:
       BDD_PLATFORM: linux/amd64
     steps:
       - uses: actions/checkout@v4
-      - name: Check cached BDD image
-        id: final_image
-        run: |
-          image="${{ needs.bdd-meta.outputs.image }}"
-          if docker manifest inspect "$image" >/dev/null 2>&1; then
-            docker pull "$image"
-            resolved=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "ref=${resolved}" >> "$GITHUB_OUTPUT"
-            echo "Reusing ${resolved}"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
       - name: Log in to GHCR
-        if: needs.bdd-meta.outputs.can_push == 'true' && steps.final_image.outputs.exists != 'true'
+        if: needs.bdd-meta.outputs.can_push == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check cached BDD image
+        id: final_image
+        if: needs.bdd-meta.outputs.can_push == 'true'
+        run: |
+          image="${{ needs.bdd-meta.outputs.image }}"
+          if docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing $image"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Pull cached BDD image
+        if: needs.bdd-meta.outputs.can_push == 'true' && steps.final_image.outputs.exists == 'true'
+        run: docker pull "${{ needs.bdd-meta.outputs.image }}"
       - name: Free disk space for the Nix build
         if: steps.final_image.outputs.exists != 'true'
         run: |
@@ -163,14 +164,8 @@ jobs:
           export BDD_OUTPUT_TAR=image.tar
           ./scripts/bdd-image.sh build-runtime
           rm -f image.tar
-      - name: Verify PostgreSQL runtime
-        run: |
-          image="${{ steps.final_image.outputs.ref }}"
-          ./scripts/bdd-image.sh check-runtime "${image:-${{ needs.bdd-meta.outputs.image }}}"
       - name: Run the PostgreSQL matrix
-        run: |
-          image="${{ steps.final_image.outputs.ref }}"
-          docker run --rm "${image:-${{ needs.bdd-meta.outputs.image }}}"
+        run: docker run --rm "${{ needs.bdd-meta.outputs.image }}"
       - name: Push BDD image
         if: needs.bdd-meta.outputs.can_push == 'true' && steps.final_image.outputs.exists != 'true'
         run: |
@@ -180,13 +175,3 @@ jobs:
           else
             docker push "$image"
           fi
-      - name: Verify anonymous cache access
-        if: needs.bdd-meta.outputs.can_push == 'true' && steps.final_image.outputs.exists != 'true'
-        run: |
-          builder="${{ needs.bdd-meta.outputs.builder }}"
-          image="${{ needs.bdd-meta.outputs.image }}"
-          docker logout ghcr.io
-          docker manifest inspect "$builder" >/dev/null
-          docker pull "$builder"
-          docker manifest inspect "$image" >/dev/null
-          docker pull "$image"

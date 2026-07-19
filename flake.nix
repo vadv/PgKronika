@@ -44,13 +44,6 @@
         # Use the workspace Rust toolchain.
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-        cargoTargets = {
-          "x86_64-linux" = "x86_64-unknown-linux-gnu";
-          "aarch64-linux" = "aarch64-unknown-linux-gnu";
-          "x86_64-darwin" = "x86_64-apple-darwin";
-          "aarch64-darwin" = "aarch64-apple-darwin";
-        };
-        cargoTarget = cargoTargets.${system};
 
         # PostgreSQL majors covered by the collector BDD suite.
         pgMatrix = {
@@ -117,7 +110,6 @@
             ];
           };
           strictDeps = true;
-          CARGO_BUILD_TARGET = cargoTarget;
           # Limit the image build to the BDD runner and the collector.
           # `-p` replaces crane's default flags, so keep `--locked` here.
           cargoExtraArgs = "--locked -p kronika-bdd -p pg_kronika-collector";
