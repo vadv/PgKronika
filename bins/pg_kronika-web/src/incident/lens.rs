@@ -6,6 +6,7 @@ use super::engine::EvalContext;
 use super::evidence::ConfidenceCap;
 use super::evidence::sink::FindingSink;
 use super::series::SeriesSet;
+use super::typed::TypedInputs;
 
 /// A pure lens over preloaded series. Output and inspected points must pass
 /// through `sink`.
@@ -17,6 +18,7 @@ pub(crate) trait Lens {
         &self,
         cluster: &Cluster,
         series: &SeriesSet,
+        typed: &TypedInputs,
         context: &EvalContext,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit>;
@@ -42,6 +44,7 @@ mod tests {
             &self,
             _cluster: &Cluster,
             _series: &SeriesSet,
+            _typed: &TypedInputs,
             _context: &EvalContext,
             _sink: &mut FindingSink<'_>,
         ) -> Result<(), LimitHit> {
@@ -93,6 +96,7 @@ mod tests {
         lens.evaluate(
             &cluster,
             &SeriesSet::for_test(0),
+            &TypedInputs::new(),
             &EvalContext::for_test(super::super::engine::ClockRelation::Unknown),
             &mut sink,
         )

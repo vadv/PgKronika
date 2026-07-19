@@ -13,8 +13,9 @@
 //! Reader and adapter ceilings bound rows, materialized cells, scan positions,
 //! scoring work, identity bytes, and output. One semaphore slot admits heavy
 //! anomaly or incident work; another request receives `503` instead of
-//! queueing. Incident diagnosis is not implemented: the endpoint clusters
-//! episodes, reports `complete=false`, and returns a dormant lens catalog.
+//! queueing. Incident diagnosis is a first slice: the endpoint clusters
+//! episodes, runs the active diagnostic lenses, still reports `complete=false`,
+//! and returns their findings with a partly dormant lens catalog.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "metrics-exporter-prometheus and axum pull duplicate transitive versions outside our control"
@@ -926,6 +927,19 @@ mod tests {
         rows
     }
 
+    /// The active lens ids the incidents endpoint advertises, in catalog order.
+    const ACTIVE_LENS_IDS: [&str; 9] = [
+        "PG-CACHE-010",
+        "PG-WAL-009",
+        "PG-TEMP-003",
+        "PG-CHKPT-008",
+        "PG-IO-011",
+        "PG-HOT-007",
+        "PG-ARCH-017",
+        "OS-NET-028",
+        "OS-CGRP-021",
+    ];
+
     #[tokio::test]
     async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
         let to = 39 * 60 * 1_000_000;
@@ -972,13 +986,16 @@ mod tests {
         assert_eq!(body["complete"], false);
         assert_eq!(body["clustering_complete"], true);
         assert_eq!(body["analysis_status"], "incidents_detected");
-        assert_eq!(body["catalog"]["status"], "dormant");
-        assert_eq!(body["catalog"]["diagnosis_available"], false);
-        assert_eq!(body["catalog"]["applied"], serde_json::json!([]));
+        assert_eq!(body["catalog"]["status"], "partial");
+        assert_eq!(body["catalog"]["diagnosis_available"], true);
+        assert_eq!(
+            body["catalog"]["applied"],
+            serde_json::json!(ACTIVE_LENS_IDS)
+        );
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 28);
+        assert_eq!(dormant.len(), 19, "28 catalog lenses minus 9 active");
         assert!(
             dormant
                 .iter()
@@ -991,8 +1008,8 @@ mod tests {
             "the spike must cluster into an incident"
         );
         assert_eq!(incidents[0]["findings"], serde_json::json!([]));
-        assert_eq!(incidents[0]["evaluation_complete"], false);
-        assert_eq!(incidents[0]["finding_evaluation_status"], "not_available");
+        assert_eq!(incidents[0]["evaluation_complete"], true);
+        assert_eq!(incidents[0]["finding_evaluation_status"], "complete");
         let members = incidents[0]["members"]
             .as_array()
             .expect("members is an array");
