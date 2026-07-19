@@ -1,7 +1,5 @@
-//! `GET /v1/incidents` clusters anomaly episodes across sections.
-//!
-//! Diagnostic lenses remain dormant until their typed evidence reaches the
-//! incident engine.
+//! `GET /v1/incidents` clusters anomaly episodes across sections and runs the
+//! active diagnostic lenses over the typed counter evidence the reader folded.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +16,7 @@ use crate::AppState;
 use crate::anomaly::ScanParams;
 use crate::handlers::anomalies::scannable_sections;
 use crate::handlers::metrics::data_age_seconds;
-use crate::incident::{AnalyzeError, ClockRelation, IncidentConfig, analyze};
+use crate::incident::{AnalyzeError, ClockRelation, IncidentConfig, Lens, active_catalog, analyze};
 use crate::incident_input::{InputError, InputLimits, prepare_input, scan_position_count};
 use crate::incident_response::{build_response, identity_response, no_data_response};
 use crate::params::{bad_request, parse_duration_us, parse_f64_non_negative, parse_i64, parse_u64};
@@ -238,8 +236,16 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
         request.max_cluster_span_us,
         ClockRelation::Unknown,
     );
-    let outcome = analyze(prepared.episodes, &prepared.series, &[], &config)
-        .map_err(analyze_error_response)?;
+    let catalog = active_catalog();
+    let lenses: Vec<&dyn Lens> = catalog.iter().map(AsRef::as_ref).collect();
+    let outcome = analyze(
+        prepared.episodes,
+        &prepared.series,
+        &prepared.typed,
+        &lenses,
+        &config,
+    )
+    .map_err(analyze_error_response)?;
 
     Ok(Json(build_response(
         prepared.source_id,
