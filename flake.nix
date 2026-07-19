@@ -110,6 +110,7 @@
             ];
           };
           strictDeps = true;
+          CARGO_BUILD_TARGET = pkgs.stdenv.hostPlatform.config;
           # Limit the image build to the BDD runner and the collector.
           # `-p` replaces crane's default flags, so keep `--locked` here.
           cargoExtraArgs = "--locked -p kronika-bdd -p pg_kronika-collector";
@@ -169,7 +170,15 @@
       {
         packages = {
           default = bins;
-          inherit bins cargoArtifacts image;
+          inherit
+            bins
+            cargoArtifacts
+            image
+            postgresql_15_plans
+            postgresql_16_plans
+            postgresql_17_plans
+            postgresql_18_plans
+            ;
         } // pgMatrix;
 
         devShells.default = craneLib.devShell {
