@@ -685,6 +685,124 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::SourcePeriod,
         ],
     },
+    // Батч 3 (обслуживание, безопасность, репликация): medium/low.
+    DormantLens {
+        lens_id: "checkpoint_too_frequent",
+        domain: Domain::Pg,
+        title: "Слишком частые контрольные точки",
+        detects: "Форсирует ли WAL-давление внеплановые чекпоинты?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+    },
+    DormantLens {
+        lens_id: "aggressive_autovacuum_wraparound",
+        domain: Domain::Pg,
+        title: "Агрессивный autovacuum против wraparound",
+        detects: "Запускался ли аварийный anti-wraparound freeze?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "autovacuum_cancel",
+        domain: Domain::Pg,
+        title: "Отмена autovacuum под блокировкой",
+        detects: "Отменяется ли autovacuum конфликтующими локами (DDL)?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "auth_password_failures",
+        domain: Domain::Pg,
+        title: "Всплеск неверных паролей",
+        detects: "Всплеск ли отказов аутентификации по паролю?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::LogCaptureCoverage,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "pg_hba_rejections",
+        domain: Domain::Pg,
+        title: "Отказы по pg_hba",
+        detects: "Стучится ли неизвестный хост/БД/пользователь мимо pg_hba?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+    },
+    DormantLens {
+        lens_id: "permission_denied_burst",
+        domain: Domain::Pg,
+        title: "Всплеск отказов доступа (RBAC)",
+        detects: "Всплеск ли `permission denied` (обычно кривой деплой грантов)?",
+        confidence: ConfidenceCap::Low,
+        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+    },
+    DormantLens {
+        lens_id: "connection_storm_log",
+        domain: Domain::Pg,
+        title: "Шторм подключений",
+        detects: "Резкий churn коннектов без упора в лимит?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::LogCaptureCoverage,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "archive_command_failure",
+        domain: Domain::Pg,
+        title: "Сбой archive_command (по логу)",
+        detects: "Почему падает архивация WAL (exit-код, stderr)?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "replication_disconnect",
+        domain: Domain::Pg,
+        title: "Обрыв соединения репликации",
+        detects: "Рвётся ли поток репликации и почему?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "recovery_conflict",
+        domain: Domain::Pg,
+        title: "Конфликт восстановления на реплике",
+        detects: "Отменяются ли запросы на реплике конфликтом с replay?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::LogDetailContinuation,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "wal_integrity_log",
+        domain: Domain::Pg,
+        title: "Проблемы целостности WAL",
+        detects: "Битый WAL при replay/recovery?",
+        confidence: ConfidenceCap::High,
+        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+    },
 ];
 
 /// Log lenses whose single record is a self-contained finding — activate first.
@@ -818,6 +936,38 @@ mod tests {
         "network_errors",
     ];
 
+    const LOG_EXPECTED_LENSES: [&str; 26] = [
+        // Батч 1 (core)
+        "oom_kill",
+        "backend_crash",
+        "panic_shutdown",
+        "disk_full_log",
+        "out_of_memory_log",
+        "connection_slots_exhausted",
+        "deadlock",
+        "data_corruption_log",
+        // Батч 2
+        "lock_wait_logged",
+        "lock_timeout_log",
+        "statement_timeout_log",
+        "temp_file_spill_log",
+        "slow_query_logged",
+        "serialization_failure",
+        "idle_in_transaction_abort",
+        // Батч 3
+        "checkpoint_too_frequent",
+        "aggressive_autovacuum_wraparound",
+        "autovacuum_cancel",
+        "auth_password_failures",
+        "pg_hba_rejections",
+        "permission_denied_burst",
+        "connection_storm_log",
+        "archive_command_failure",
+        "replication_disconnect",
+        "recovery_conflict",
+        "wal_integrity_log",
+    ];
+
     fn fixture(lens_id: &'static str, missing: &'static [MissingCapability]) -> DormantLens {
         DormantLens {
             lens_id,
@@ -918,5 +1068,14 @@ mod tests {
                 "core log lens `{id}` is missing from the catalog"
             );
         }
+    }
+
+    #[test]
+    fn log_catalog_ids_match_the_contract_order() {
+        let ids: Vec<_> = log_dormant_catalog()
+            .iter()
+            .map(DormantLens::lens_id)
+            .collect();
+        assert_eq!(ids, LOG_EXPECTED_LENSES);
     }
 }
