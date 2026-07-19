@@ -7,8 +7,8 @@ use super::dispatch::{LimitHit, SectionColumn};
 use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
-    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, Role,
-    ThresholdKind,
+    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
+    GaugeUnit, Role, ThresholdKind,
 };
 use super::lens::Lens;
 use super::series::SeriesSet;
@@ -778,8 +778,7 @@ impl Lens for StaleStatisticsLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                pair.a,
-                denominator,
+                GaugeRatio::new(pair.a, denominator, GaugeUnit::Count),
                 Self::MODIFIED_FRACTION_FLOOR,
                 ThresholdKind::AtLeast,
                 pair.observed_at_us,
@@ -864,8 +863,7 @@ impl Lens for ConnectionSaturationLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                pair.a,
-                pair.b,
+                GaugeRatio::new(pair.a, pair.b, GaugeUnit::Count),
                 Self::SATURATION_FLOOR,
                 ThresholdKind::AtLeast,
                 pair.observed_at_us,
@@ -950,8 +948,7 @@ impl Lens for MemoryReclaimLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                pair.a,
-                pair.b,
+                GaugeRatio::new(pair.a, pair.b, GaugeUnit::Kibibytes),
                 Self::AVAILABLE_FRACTION_FLOOR,
                 ThresholdKind::Below,
                 pair.observed_at_us,
@@ -1043,8 +1040,7 @@ impl Lens for WritebackPressureLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                numerator,
-                reading.denominator,
+                GaugeRatio::new(numerator, reading.denominator, GaugeUnit::Kibibytes),
                 Self::DIRTY_FRACTION_FLOOR,
                 ThresholdKind::AtLeast,
                 reading.observed_at_us,
@@ -1857,6 +1853,26 @@ mod tests {
     }
 
     #[test]
+    fn stale_statistics_uses_absolute_estimate_and_includes_equality() {
+        let typed = gauges(
+            PG_STAT_USER_TABLES,
+            &[
+                ("n_mod_since_analyze", &[200.0]),
+                ("reltuples", &[-1_000.0]),
+            ],
+        );
+        assert_eq!(
+            run_lens(
+                &StaleStatisticsLens,
+                PG_STAT_USER_TABLES,
+                "n_mod_since_analyze",
+                &typed,
+            ),
+            vec![(Role::Coincident, Confidence::LOW)]
+        );
+    }
+
+    #[test]
     fn per_database_connection_limit_includes_the_threshold_boundary() {
         let typed = gauges(
             PG_STAT_DATABASE,
@@ -1874,20 +1890,22 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_database_connection_limit_is_not_a_denominator() {
-        let typed = gauges(
-            PG_STAT_DATABASE,
-            &[("numbackends", &[80.0]), ("datconnlimit", &[-1.0])],
-        );
-        assert!(
-            run_lens(
-                &ConnectionSaturationLens,
+    fn nonpositive_database_connection_limits_are_not_denominators() {
+        for limit in [-2.0, -1.0, 0.0] {
+            let typed = gauges(
                 PG_STAT_DATABASE,
-                "numbackends",
-                &typed,
-            )
-            .is_empty()
-        );
+                &[("numbackends", &[80.0]), ("datconnlimit", &[limit])],
+            );
+            assert!(
+                run_lens(
+                    &ConnectionSaturationLens,
+                    PG_STAT_DATABASE,
+                    "numbackends",
+                    &typed,
+                )
+                .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -1907,6 +1925,15 @@ mod tests {
         let typed = gauges(
             OS_MEMINFO,
             &[("mem_available", &[5.0]), ("mem_total", &[100.0])],
+        );
+        assert!(run_lens(&MemoryReclaimLens, OS_MEMINFO, "mem_available", &typed,).is_empty());
+    }
+
+    #[test]
+    fn zero_host_memory_total_is_not_a_denominator() {
+        let typed = gauges(
+            OS_MEMINFO,
+            &[("mem_available", &[0.0]), ("mem_total", &[0.0])],
         );
         assert!(run_lens(&MemoryReclaimLens, OS_MEMINFO, "mem_available", &typed,).is_empty());
     }

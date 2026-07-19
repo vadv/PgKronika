@@ -142,11 +142,13 @@ fn evidence_to_json(evidence: &Evidence) -> Value {
         GaugeMeasurement::Ratio {
             numerator,
             denominator,
+            operand_unit,
         } => json!({
             "kind": "ratio",
             "numerator": numerator.get(),
             "denominator": denominator.get(),
             "value": numerator.get() / denominator.get(),
+            "operand_unit": operand_unit.label(),
         }),
     };
     let entity: Vec<Value> = gauge

@@ -184,7 +184,25 @@ pub(crate) enum GaugeMeasurement {
     Ratio {
         numerator: FiniteValue,
         denominator: FiniteValue,
+        operand_unit: GaugeUnit,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GaugeRatio {
+    numerator: f64,
+    denominator: f64,
+    operand_unit: GaugeUnit,
+}
+
+impl GaugeRatio {
+    pub(crate) const fn new(numerator: f64, denominator: f64, operand_unit: GaugeUnit) -> Self {
+        Self {
+            numerator,
+            denominator,
+            operand_unit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -242,22 +260,22 @@ impl GaugeEvidence {
     }
 
     pub(crate) fn ratio(
-        numerator: f64,
-        denominator: f64,
+        ratio: GaugeRatio,
         threshold: f64,
         threshold_kind: ThresholdKind,
         observed_at_us: i64,
         samples: usize,
         entity: GaugeEntity,
     ) -> Option<Self> {
-        (denominator > 0.0).then_some(())?;
-        FiniteValue::new(numerator / denominator)?;
+        (ratio.denominator > 0.0).then_some(())?;
+        FiniteValue::new(ratio.numerator / ratio.denominator)?;
         let samples = u64::try_from(samples).ok()?;
         (samples > 0 && !entity.section().is_empty()).then_some(())?;
         Some(Self {
             measurement: GaugeMeasurement::Ratio {
-                numerator: FiniteValue::new(numerator)?,
-                denominator: FiniteValue::new(denominator)?,
+                numerator: FiniteValue::new(ratio.numerator)?,
+                denominator: FiniteValue::new(ratio.denominator)?,
+                operand_unit: ratio.operand_unit,
             },
             unit: GaugeUnit::Ratio,
             threshold: FiniteValue::new(threshold)?,
@@ -768,8 +786,7 @@ mod tests {
         );
         assert!(
             GaugeEvidence::ratio(
-                1.0,
-                0.0,
+                GaugeRatio::new(1.0, 0.0, GaugeUnit::Count),
                 0.5,
                 ThresholdKind::AtLeast,
                 10,
@@ -780,8 +797,7 @@ mod tests {
         );
         assert!(
             GaugeEvidence::ratio(
-                f64::MAX,
-                f64::MIN_POSITIVE,
+                GaugeRatio::new(f64::MAX, f64::MIN_POSITIVE, GaugeUnit::Bytes),
                 0.5,
                 ThresholdKind::AtLeast,
                 10,

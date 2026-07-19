@@ -1143,6 +1143,7 @@ mod tests {
         assert_eq!(evidence["measurement"]["numerator"], 10_000.0);
         assert_eq!(evidence["measurement"]["denominator"], 1_000_000.0);
         assert_eq!(evidence["measurement"]["value"], 0.01);
+        assert_eq!(evidence["measurement"]["operand_unit"], "KiB");
         assert_eq!(evidence["unit"], "ratio");
         assert_eq!(evidence["threshold"]["operator"], "below");
         assert_eq!(evidence["threshold"]["value"], 0.05);
