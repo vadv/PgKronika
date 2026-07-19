@@ -582,7 +582,8 @@ test_runtime_key_changes_for_feature_inputs() {
 }
 
 test_github_actions_bdd_uses_fast_runtime_default() {
-  local workflow
+  local flake workflow
+  flake="$ROOT/flake.nix"
   workflow="$ROOT/.github/workflows/ci.yml"
   grep -F -- 'image_hash=$(./scripts/bdd-image.sh image-key)' "$workflow" >/dev/null \
     || fail "GitHub Actions must key the BDD runtime image by image-key"
@@ -596,6 +597,8 @@ test_github_actions_bdd_uses_fast_runtime_default() {
     || fail "GitHub Actions must use the flat PR80 builder tag family"
   grep -F -- 'docker pull "$builder"' "$workflow" >/dev/null \
     || fail "GitHub Actions must verify anonymous builder pulls"
+  grep -F -- 'CARGO_BUILD_TARGET = cargoTarget;' "$flake" >/dev/null \
+    || fail "BDD builds must override the repository musl default with the flake host target"
 }
 
 for test in \
