@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn sampled_lock_edge_can_reach_high_and_prove_direction() {
         let finding = Finding::from_draft(
-            "lock_wait_graph",
+            "PG-LOCK-012",
             ConfidenceCap::High,
             FindingDraft::new(
                 Role::Lead,
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn resource_event_does_not_prove_direction() {
         let finding = Finding::from_draft(
-            "memory_reclaim",
+            "OS-MEM-022",
             ConfidenceCap::High,
             FindingDraft::new(
                 Role::Lead,
