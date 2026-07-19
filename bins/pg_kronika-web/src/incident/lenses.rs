@@ -600,6 +600,91 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::SourcePeriod,
         ],
     },
+    // Батч 2 (блокировки и производительность): correlation/rate, medium.
+    DormantLens {
+        lens_id: "lock_wait_logged",
+        domain: Domain::Pg,
+        title: "Длительное ожидание блокировки",
+        detects: "Кто и как долго ждал блокировку до её выдачи?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::LogCaptureCoverage,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "lock_timeout_log",
+        domain: Domain::Pg,
+        title: "Отмена по lock_timeout",
+        detects: "Сдавались ли запросы по `lock_timeout`?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "statement_timeout_log",
+        domain: Domain::Pg,
+        title: "Отмена по statement_timeout",
+        detects: "Упирались ли запросы в `statement_timeout`?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::LogDetailContinuation,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "temp_file_spill_log",
+        domain: Domain::Pg,
+        title: "Пролив во временные файлы",
+        detects: "Сливались ли сортировки/хеши в temp-файлы, какого размера?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::LogCaptureCoverage,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "slow_query_logged",
+        domain: Domain::Pg,
+        title: "Медленный запрос (по логу)",
+        detects: "Был ли конкретный долгий запрос с реальным SQL?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::LogCaptureCoverage,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "serialization_failure",
+        domain: Domain::Pg,
+        title: "Сбой сериализации транзакций",
+        detects: "Всплеск ли откатов по конфликту сериализации?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+    },
+    DormantLens {
+        lens_id: "idle_in_transaction_abort",
+        domain: Domain::Pg,
+        title: "Обрыв по idle-in-transaction",
+        detects: "Убивались ли зависшие в транзакции сессии?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
 ];
 
 /// Log lenses whose single record is a self-contained finding — activate first.
