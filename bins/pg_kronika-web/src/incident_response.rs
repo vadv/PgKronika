@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::anomaly::ScanParams;
 use crate::incident::{
-    DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, Evidence, Finding, GaugeMeasurement,
-    IdentityValue, Incident, LimitAxis,
+    DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence, Finding,
+    GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
 };
 use crate::incident_input::{CapabilityInputState, InputQuality, SectionSkip, SkipReason};
 
@@ -25,6 +25,7 @@ pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
         "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
+        "log": empty_log_json(),
         "data_quality": quality_to_json(&quality, "unknown"),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some("no_data")),
     })
@@ -48,6 +49,7 @@ pub(crate) fn identity_response(
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
         "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
+        "log": empty_log_json(),
         "data_quality": quality_to_json(&quality, reason),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some(reason)),
     })
@@ -65,6 +67,7 @@ pub(crate) fn build_response(
     scan: &ScanParams,
     data_age: Option<u64>,
     outcome: &EngineOutcome,
+    log: &EventOutcome,
     input: &ResponseInput<'_>,
 ) -> Value {
     let ResponseInput {
@@ -96,6 +99,7 @@ pub(crate) fn build_response(
         "coverage_by_section": coverage_to_json(coverage),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
         "catalog": catalog_to_json(Some(coverage), input_skipped, capability_by_section),
+        "log": log_to_json(log),
         "data_quality": quality_to_json(quality, "available"),
         "skipped": skipped_to_json(
             input_skipped,
@@ -199,6 +203,46 @@ fn evidence_to_json(evidence: &Evidence) -> Value {
             "logical_section": gauge.entity().section(),
             "identity": entity,
         },
+    })
+}
+
+/// The log-event branch: self-contained facts, per-section coverage, and any
+/// bound the pass hit. `complete` is false when the event set was truncated or a
+/// lens was cut off, so a consumer never reads the facts as exhaustive.
+fn log_to_json(log: &EventOutcome) -> Value {
+    let findings: Vec<Value> = log.findings.iter().map(finding_to_json).collect();
+    let skipped: Vec<Value> = log.skipped.iter().map(engine_skip_to_json).collect();
+    json!({
+        "complete": log.complete,
+        "applied": applied_event_ids(),
+        "findings": findings,
+        "coverage": log_coverage_to_json(&log.coverage),
+        "skipped": skipped,
+    })
+}
+
+fn applied_event_ids() -> Vec<Value> {
+    crate::incident::event_catalog_ids()
+        .into_iter()
+        .map(Value::from)
+        .collect()
+}
+
+fn log_coverage_to_json(coverage: &BTreeMap<&'static str, LogCoverage>) -> Value {
+    let object: serde_json::Map<String, Value> = coverage
+        .iter()
+        .map(|(&section, state)| (section.to_owned(), Value::from(state.label())))
+        .collect();
+    Value::Object(object)
+}
+
+fn empty_log_json() -> Value {
+    json!({
+        "complete": false,
+        "applied": applied_event_ids(),
+        "findings": Value::Array(Vec::new()),
+        "coverage": json!({}),
+        "skipped": Value::Array(Vec::new()),
     })
 }
 
@@ -505,6 +549,73 @@ mod tests {
         }
     }
 
+    fn empty_log() -> EventOutcome {
+        EventOutcome {
+            findings: Vec::new(),
+            coverage: BTreeMap::new(),
+            complete: true,
+            skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_log_branch_renders_facts_coverage_and_applied() {
+        use crate::incident::{
+            EventConfig, EventInputLimits, EventLens, LogCoverage, LogErrorGroup, LogEventInputs,
+            evaluate_events, event_catalog,
+        };
+
+        let mut events = LogEventInputs::new(EventInputLimits::production());
+        assert!(events.push_error(LogErrorGroup::new(0, Some("40P01".to_owned()), 3)));
+        events.set_coverage("pg_log_errors", LogCoverage::Unknown);
+        events.set_coverage("pg_log_lifecycle", LogCoverage::NotCollected);
+        let catalog = event_catalog();
+        let lenses: Vec<&dyn EventLens> = catalog.iter().map(AsRef::as_ref).collect();
+        let log = evaluate_events(&events, &lenses, &EventConfig::production()).expect("valid");
+
+        let outcome = EngineOutcome {
+            incidents: Vec::new(),
+            span_splits: 0,
+            complete: true,
+            skipped: Vec::new(),
+        };
+        let body = build_response(
+            7,
+            &scan(),
+            None,
+            &outcome,
+            &log,
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &InputQuality::default(),
+                skipped: &[],
+                capability_by_section: &BTreeMap::new(),
+            },
+        );
+
+        let log_json = &body["log"];
+        assert_eq!(log_json["complete"], true);
+        assert_eq!(
+            log_json["applied"].as_array().map(Vec::len),
+            Some(8),
+            "the eight event lenses are advertised as applied"
+        );
+        let finding = &log_json["findings"][0];
+        assert_eq!(finding["lens_id"], "PG-EVT-007");
+        assert_eq!(finding["confidence"], "high");
+        assert_eq!(finding["role"], "coincident");
+        assert_eq!(finding["evidence"], json!(["direct"]));
+        assert_eq!(finding["scope"]["logical_section"], "pg_log_errors");
+        assert_eq!(finding["scope"]["column"], "sqlstate");
+        assert_eq!(
+            finding["scope"]["identity"],
+            json!(["40P01", 3]),
+            "only the code and count reach the response; no SQL, user, or address"
+        );
+        assert_eq!(log_json["coverage"]["pg_log_errors"], "unknown");
+        assert_eq!(log_json["coverage"]["pg_log_lifecycle"], "not_collected");
+    }
+
     #[test]
     fn hex_is_lowercase_and_fixed_width() {
         assert_eq!(hex(&[]), "");
@@ -657,6 +768,7 @@ mod tests {
             &scan(),
             None,
             &outcome,
+            &empty_log(),
             &ResponseInput {
                 coverage: &BTreeMap::new(),
                 quality: &InputQuality::default(),
@@ -696,6 +808,7 @@ mod tests {
             &scan(),
             None,
             &outcome,
+            &empty_log(),
             &ResponseInput {
                 coverage: &BTreeMap::new(),
                 quality: &quality,
@@ -761,6 +874,7 @@ mod tests {
             &scan(),
             None,
             &outcome,
+            &empty_log(),
             &ResponseInput {
                 coverage: &BTreeMap::new(),
                 quality: &InputQuality::default(),
@@ -881,6 +995,7 @@ mod tests {
             &scan(),
             None,
             &outcome,
+            &empty_log(),
             &ResponseInput {
                 coverage: &BTreeMap::new(),
                 quality: &InputQuality::default(),

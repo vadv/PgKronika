@@ -12,9 +12,10 @@ use kronika_registry::ColumnClass;
 use crate::anomaly::{EpisodeHit, ScanCounts, ScanParams, scan_section};
 use crate::handlers::v1::{DIFF_MAX_ROWS, Gates};
 use crate::incident::{
-    ActivityBackend, ActivitySnapshot, EnrichedEpisode, EpisodeRefV1, GaugeQuality,
-    GaugeTrackInput, IdentityValue, LockEdge, LockSnapshot, Series, SeriesError, SeriesInsertError,
-    SeriesSet, TypedInputs,
+    ActivityBackend, ActivitySnapshot, EnrichedEpisode, EpisodeRefV1, EventInputLimits,
+    GaugeQuality, GaugeTrackInput, IdentityValue, LifecycleEvent, LifecycleKind, LockEdge,
+    LockSnapshot, LogCoverage, LogErrorGroup, LogEventInputs, Series, SeriesError,
+    SeriesInsertError, SeriesSet, TypedInputs,
 };
 
 /// Sections whose raw snapshots the sampled activity and lock lenses read.
@@ -191,6 +192,7 @@ pub(crate) struct PreparedInput {
     pub episodes: Vec<EnrichedEpisode>,
     pub series: SeriesSet,
     pub typed: TypedInputs,
+    pub log_events: LogEventInputs,
     pub coverage_by_section: BTreeMap<&'static str, Vec<Gap>>,
     pub quality: InputQuality,
     pub skipped: Vec<SectionSkip>,
@@ -260,17 +262,139 @@ pub(crate) fn prepare_input(
         state.process(logical, page, &gates, scan, limits)?;
     }
 
+    let log_events = build_log_events(&input.pages, &state.skipped, EventInputLimits::production());
+
     Ok(PreparedInput {
         source_id: source,
         node_self_id,
         episodes: state.episodes,
         series: state.series,
         typed: state.typed,
+        log_events,
         coverage_by_section: state.coverage_by_section,
         quality: state.quality,
         skipped: state.skipped,
         capability_by_section: state.capability_by_section,
     })
+}
+
+const PG_LOG_ERRORS: &str = "pg_log_errors";
+const PG_LOG_LIFECYCLE: &str = "pg_log_lifecycle";
+
+/// Extract bounded, typed log events from the already-materialized log-section
+/// pages, alongside — never through — the numeric series path.
+///
+/// A section that was skipped or not read is `NotCollected`, so a lens never
+/// reads its silence as health. Grouped errors are summed per `(severity,
+/// sqlstate)`; lifecycle records stay per-event, since each is one occurrence.
+fn build_log_events(
+    pages: &BTreeMap<String, SectionPage>,
+    skipped: &[SectionSkip],
+    limits: EventInputLimits,
+) -> LogEventInputs {
+    let mut events = LogEventInputs::new(limits);
+    ingest_log_errors(pages.get(PG_LOG_ERRORS), skipped, &mut events);
+    ingest_log_lifecycle(pages.get(PG_LOG_LIFECYCLE), skipped, &mut events);
+    events
+}
+
+/// `Gap` when the page is partial or has coverage gaps; otherwise `Unknown`,
+/// since effective log configuration is never proven from the rows alone.
+const fn log_coverage(page: &SectionPage) -> LogCoverage {
+    if page.next_cursor.is_some() || !page.gaps.is_empty() {
+        LogCoverage::Gap
+    } else {
+        LogCoverage::Unknown
+    }
+}
+
+fn ingest_log_errors(
+    page: Option<&SectionPage>,
+    skipped: &[SectionSkip],
+    events: &mut LogEventInputs,
+) {
+    let Some(page) = page.filter(|_| !skipped.iter().any(|skip| skip.section == PG_LOG_ERRORS))
+    else {
+        events.set_coverage(PG_LOG_ERRORS, LogCoverage::NotCollected);
+        return;
+    };
+    let mut totals: BTreeMap<(u8, Option<String>), u64> = BTreeMap::new();
+    for row in &page.rows {
+        let (Some(severity), Some(count)) = (read_u8(row, "severity"), read_u64(row, "count"))
+        else {
+            continue;
+        };
+        let key = (severity, read_str(row, "sqlstate"));
+        let entry = totals.entry(key).or_insert(0);
+        *entry = entry.saturating_add(count);
+    }
+    for ((severity, sqlstate), count) in totals {
+        if !events.push_error(LogErrorGroup::new(severity, sqlstate, count)) {
+            break;
+        }
+    }
+    events.set_coverage(PG_LOG_ERRORS, log_coverage(page));
+}
+
+fn ingest_log_lifecycle(
+    page: Option<&SectionPage>,
+    skipped: &[SectionSkip],
+    events: &mut LogEventInputs,
+) {
+    let Some(page) = page.filter(|_| !skipped.iter().any(|skip| skip.section == PG_LOG_LIFECYCLE))
+    else {
+        events.set_coverage(PG_LOG_LIFECYCLE, LogCoverage::NotCollected);
+        return;
+    };
+    for row in &page.rows {
+        let Some(kind) = read_u8(row, "kind").and_then(lifecycle_kind) else {
+            continue;
+        };
+        if !events.push_lifecycle(LifecycleEvent::new(kind, read_i32(row, "signal"))) {
+            break;
+        }
+    }
+    events.set_coverage(PG_LOG_LIFECYCLE, log_coverage(page));
+}
+
+const fn lifecycle_kind(code: u8) -> Option<LifecycleKind> {
+    match code {
+        0 => Some(LifecycleKind::Crash),
+        1 => Some(LifecycleKind::Shutdown),
+        2 => Some(LifecycleKind::Ready),
+        _ => None,
+    }
+}
+
+fn read_u8(row: &OutRow, name: &str) -> Option<u8> {
+    match row_value(row, name)? {
+        Value::U64(value) => u8::try_from(*value).ok(),
+        Value::I64(value) => u8::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn read_u64(row: &OutRow, name: &str) -> Option<u64> {
+    match row_value(row, name)? {
+        Value::U64(value) => Some(*value),
+        Value::I64(value) => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn read_i32(row: &OutRow, name: &str) -> Option<i32> {
+    match row_value(row, name)? {
+        Value::I64(value) => i32::try_from(*value).ok(),
+        Value::U64(value) => i32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn read_str(row: &OutRow, name: &str) -> Option<String> {
+    match row_value(row, name)? {
+        Value::Str(value) => Some(value.clone()),
+        _ => None,
+    }
 }
 
 struct InputPages {
@@ -2313,5 +2437,189 @@ mod tests {
         state.retain_snapshots("pg_locks", &[lock_row(100, 20, vec![10, 30])]);
         assert_eq!(state.quality.snapshot_rows_withheld, 2);
         assert_eq!(state.typed.lock_window(i64::MIN, i64::MAX).count(), 0);
+    }
+
+    fn error_row(severity: u64, sqlstate: Option<&str>, count: u64) -> OutRow {
+        vec![
+            ("ts".to_owned(), Value::Ts(0)),
+            ("severity".to_owned(), Value::U64(severity)),
+            (
+                "sqlstate".to_owned(),
+                sqlstate.map_or(Value::Null, |code| Value::Str(code.to_owned())),
+            ),
+            ("count".to_owned(), Value::U64(count)),
+        ]
+    }
+
+    fn lifecycle_row(kind: u64, signal: Option<i32>) -> OutRow {
+        vec![
+            ("ts".to_owned(), Value::Ts(0)),
+            ("kind".to_owned(), Value::U64(kind)),
+            (
+                "signal".to_owned(),
+                signal.map_or(Value::Null, |value| Value::I64(i64::from(value))),
+            ),
+        ]
+    }
+
+    fn log_page(section: &str, rows: Vec<OutRow>) -> SectionPage {
+        SectionPage {
+            section: section.to_owned(),
+            source_id: 7,
+            rows,
+            gaps: Vec::new(),
+            next_cursor: None,
+        }
+    }
+
+    fn event_findings(events: &LogEventInputs) -> Vec<(String, Vec<IdentityValue>)> {
+        use crate::incident::{EventConfig, EventLens, evaluate_events, event_catalog};
+        let catalog = event_catalog();
+        let lenses: Vec<&dyn EventLens> = catalog.iter().map(AsRef::as_ref).collect();
+        let outcome = evaluate_events(events, &lenses, &EventConfig::production()).expect("valid");
+        outcome
+            .findings
+            .iter()
+            .map(|finding| {
+                (
+                    finding.lens_id().to_owned(),
+                    finding.scope().identity().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn value_readers_accept_both_integer_widths_and_reject_the_rest() {
+        let row = vec![
+            ("u".to_owned(), Value::U64(5)),
+            ("i".to_owned(), Value::I64(7)),
+            ("neg".to_owned(), Value::I64(-1)),
+            ("big".to_owned(), Value::U64(300)),
+            ("s".to_owned(), Value::Str("40P01".to_owned())),
+            ("null".to_owned(), Value::Null),
+        ];
+        assert_eq!(read_u8(&row, "u"), Some(5));
+        assert_eq!(read_u8(&row, "i"), Some(7));
+        assert_eq!(read_u8(&row, "neg"), None, "a negative does not fit u8");
+        assert_eq!(read_u8(&row, "big"), None, "300 does not fit u8");
+        assert_eq!(read_u64(&row, "i"), Some(7));
+        assert_eq!(read_u64(&row, "neg"), None);
+        assert_eq!(read_i32(&row, "u"), Some(5));
+        assert_eq!(read_str(&row, "s"), Some("40P01".to_owned()));
+        assert_eq!(read_str(&row, "null"), None);
+        assert_eq!(read_u8(&row, "missing"), None);
+        assert_eq!(read_u8(&row, "s"), None, "a string is not an integer");
+    }
+
+    #[test]
+    fn lifecycle_kind_maps_only_known_codes() {
+        assert_eq!(lifecycle_kind(0), Some(LifecycleKind::Crash));
+        assert_eq!(lifecycle_kind(1), Some(LifecycleKind::Shutdown));
+        assert_eq!(lifecycle_kind(2), Some(LifecycleKind::Ready));
+        assert_eq!(lifecycle_kind(3), None);
+    }
+
+    #[test]
+    fn errors_aggregate_by_severity_and_sqlstate_with_unknown_coverage() {
+        let page = log_page(
+            "pg_log_errors",
+            vec![
+                error_row(0, Some("40P01"), 2),
+                error_row(0, Some("40P01"), 3),
+                error_row(2, None, 1),
+            ],
+        );
+        let mut events = LogEventInputs::new(EventInputLimits::production());
+        ingest_log_errors(Some(&page), &[], &mut events);
+
+        assert_eq!(
+            events.coverage().get("pg_log_errors"),
+            Some(&LogCoverage::Unknown),
+            "a clean read is unknown, never proven-complete",
+        );
+        let facts = event_findings(&events);
+        assert!(
+            facts.contains(&(
+                "PG-EVT-007".to_owned(),
+                vec![
+                    IdentityValue::Text("40P01".to_owned()),
+                    IdentityValue::U64(5),
+                ],
+            )),
+            "the two deadlock rows aggregate into one count-5 fact: {facts:?}",
+        );
+        assert!(
+            facts.iter().any(|(id, _)| id == "PG-EVT-003"),
+            "the panic severity is its own fact",
+        );
+    }
+
+    #[test]
+    fn a_skipped_error_section_is_not_collected_and_yields_no_fact() {
+        let page = log_page("pg_log_errors", vec![error_row(0, Some("40P01"), 1)]);
+        let mut events = LogEventInputs::new(EventInputLimits::production());
+        ingest_log_errors(
+            Some(&page),
+            &[SectionSkip {
+                section: "pg_log_errors",
+                reason: SkipReason::IncompletePage,
+            }],
+            &mut events,
+        );
+        assert_eq!(
+            events.coverage().get("pg_log_errors"),
+            Some(&LogCoverage::NotCollected),
+        );
+        assert!(
+            event_findings(&events).is_empty(),
+            "a partial section is not mined for facts",
+        );
+    }
+
+    #[test]
+    fn a_missing_page_is_not_collected() {
+        let events = build_log_events(&BTreeMap::new(), &[], EventInputLimits::production());
+        assert_eq!(
+            events.coverage().get("pg_log_errors"),
+            Some(&LogCoverage::NotCollected),
+        );
+        assert_eq!(
+            events.coverage().get("pg_log_lifecycle"),
+            Some(&LogCoverage::NotCollected),
+        );
+        assert!(event_findings(&events).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_signals_become_sigkill_and_crash_facts() {
+        let page = log_page(
+            "pg_log_lifecycle",
+            vec![
+                lifecycle_row(0, Some(9)),
+                lifecycle_row(0, Some(11)),
+                lifecycle_row(2, None),
+            ],
+        );
+        let mut events = LogEventInputs::new(EventInputLimits::production());
+        ingest_log_lifecycle(Some(&page), &[], &mut events);
+        let ids: Vec<_> = event_findings(&events)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(ids.contains(&"PG-EVT-001".to_owned()), "sigkill: {ids:?}");
+        assert!(ids.contains(&"PG-EVT-002".to_owned()), "crash: {ids:?}");
+    }
+
+    #[test]
+    fn a_coverage_gap_downgrades_the_section() {
+        let mut page = log_page("pg_log_errors", vec![error_row(0, Some("40P01"), 1)]);
+        page.gaps = vec![Gap { from: 0, to: 5 }];
+        let mut events = LogEventInputs::new(EventInputLimits::production());
+        ingest_log_errors(Some(&page), &[], &mut events);
+        assert_eq!(
+            events.coverage().get("pg_log_errors"),
+            Some(&LogCoverage::Gap),
+        );
     }
 }

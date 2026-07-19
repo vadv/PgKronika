@@ -6,6 +6,7 @@ mod active;
 mod cluster;
 mod dispatch;
 mod engine;
+mod events;
 mod evidence;
 mod gauge_contracts;
 mod lens;
@@ -27,6 +28,11 @@ pub(crate) use active::{active_catalog, active_catalog_ids};
 pub(crate) use dispatch::LimitAxis;
 pub(crate) use engine::{
     AnalyzeError, ClockRelation, EngineOutcome, EngineSkip, Incident, IncidentConfig, analyze,
+};
+pub(crate) use events::{
+    EventConfig, EventError, EventInputLimits, EventLens, EventOutcome, LifecycleEvent,
+    LifecycleKind, LogCoverage, LogErrorGroup, LogEventInputs, evaluate_events, event_catalog,
+    event_catalog_ids,
 };
 pub(crate) use evidence::{Evidence, Finding, GaugeMeasurement};
 #[allow(

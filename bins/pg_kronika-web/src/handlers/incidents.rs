@@ -16,7 +16,10 @@ use crate::AppState;
 use crate::anomaly::ScanParams;
 use crate::handlers::anomalies::scannable_sections;
 use crate::handlers::metrics::data_age_seconds;
-use crate::incident::{AnalyzeError, ClockRelation, IncidentConfig, Lens, active_catalog, analyze};
+use crate::incident::{
+    AnalyzeError, ClockRelation, EventConfig, EventError, EventLens, IncidentConfig, Lens,
+    active_catalog, analyze, evaluate_events, event_catalog,
+};
 use crate::incident_input::{InputError, InputLimits, prepare_input, scan_position_count};
 use crate::incident_response::{
     ResponseInput, build_response, identity_response, no_data_response,
@@ -249,11 +252,21 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
     )
     .map_err(analyze_error_response)?;
 
+    let event_lens_catalog = event_catalog();
+    let event_lenses: Vec<&dyn EventLens> = event_lens_catalog.iter().map(AsRef::as_ref).collect();
+    let log = evaluate_events(
+        &prepared.log_events,
+        &event_lenses,
+        &EventConfig::production(),
+    )
+    .map_err(event_error_response)?;
+
     Ok(Json(build_response(
         prepared.source_id,
         &request.scan,
         data_age,
         &outcome,
+        &log,
         &ResponseInput {
             coverage: &prepared.coverage_by_section,
             quality: &prepared.quality,
@@ -505,6 +518,18 @@ fn analyze_error_response(error: AnalyzeError) -> IncidentError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "cluster_error",
             "clustering the episodes failed",
+        ),
+    }
+}
+
+/// Map an event-pass failure to an HTTP response. A duplicate id is a static
+/// catalog inconsistency, so it is a `500`.
+fn event_error_response(error: EventError) -> IncidentError {
+    match error {
+        EventError::DuplicateLensId(_id) => IncidentError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "duplicate_lens_id",
+            "the event lens catalog contains a duplicate id",
         ),
     }
 }
