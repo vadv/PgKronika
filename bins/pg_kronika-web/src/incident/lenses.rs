@@ -873,6 +873,19 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::SourceClockProvenance,
         ],
     },
+    DormantLens {
+        lens_id: "block_io_integrity_suspicion",
+        domain: Domain::Pg,
+        title: "Подозрение на ошибку block I/O",
+        detects: "Generic ошибка чтения блока (short/torn read, zero page), не подтверждённая проверкой checksum?",
+        confidence: ConfidenceCap::Low,
+        missing: &[
+            Missing::IncidentLogEventInput,
+            Missing::StructuredLogIdentity,
+            Missing::EntityJoin,
+            Missing::SourceClockProvenance,
+        ],
+    },
 ];
 
 /// Log lenses whose single record is a self-contained finding — activate first.
@@ -1006,7 +1019,7 @@ mod tests {
         "network_errors",
     ];
 
-    const LOG_EXPECTED_LENSES: [&str; 29] = [
+    const LOG_EXPECTED_LENSES: [&str; 30] = [
         // Batch 1 (core)
         "oom_kill",
         "backend_crash",
@@ -1040,6 +1053,7 @@ mod tests {
         "kernel_oom_victim",
         "lock_table_exhaustion",
         "shared_memory_alloc_failure",
+        "block_io_integrity_suspicion",
     ];
 
     fn fixture(lens_id: &'static str, missing: &'static [MissingCapability]) -> DormantLens {

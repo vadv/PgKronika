@@ -335,7 +335,7 @@ mod tests {
         let log_dormant = catalog["log_dormant"]
             .as_array()
             .expect("catalog lists dormant log lenses");
-        assert_eq!(log_dormant.len(), 29);
+        assert_eq!(log_dormant.len(), 30);
         assert!(log_dormant.iter().all(|entry| {
             let expected_domain = if entry["lens_id"] == "kernel_oom_victim" {
                 "os"
