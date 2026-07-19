@@ -23,6 +23,8 @@ pub(crate) enum MissingCapability {
     ActivityRows,
     PidCgroupMapping,
     LogEvents,
+    LogDetailContinuation,
+    LogCaptureCoverage,
 }
 
 impl MissingCapability {
@@ -41,6 +43,8 @@ impl MissingCapability {
             Self::ActivityRows => "sampled_activity_rows",
             Self::PidCgroupMapping => "pid_cgroup_mapping",
             Self::LogEvents => "typed_log_events",
+            Self::LogDetailContinuation => "log_detail_continuation",
+            Self::LogCaptureCoverage => "log_capture_coverage",
         }
     }
 }
@@ -618,6 +622,15 @@ mod tests {
     fn domain_strings_are_stable() {
         assert_eq!(Domain::Pg.as_str(), "pg");
         assert_eq!(Domain::Os.as_str(), "os");
+    }
+
+    #[test]
+    fn log_capability_tokens_are_stable() {
+        assert_eq!(
+            Missing::LogDetailContinuation.as_str(),
+            "log_detail_continuation"
+        );
+        assert_eq!(Missing::LogCaptureCoverage.as_str(), "log_capture_coverage");
     }
 
     #[test]
