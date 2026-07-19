@@ -504,7 +504,7 @@ pub(crate) const fn dormant_catalog() -> &'static [DormantLens] {
 /// Dormant lenses reading events visible only in the `PostgreSQL` log, kept in
 /// a sub-catalog separate from the metric one so each keeps its own size bound.
 const LOG_DORMANT_CATALOG: &[DormantLens] = &[
-    // Батч 1 (core): доступность, ресурсы, целостность — self-contained, high.
+    // Batch 1 (core): availability, resources, integrity. Self-contained, high.
     DormantLens {
         lens_id: "oom_kill",
         domain: Domain::Pg,
@@ -600,7 +600,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::SourcePeriod,
         ],
     },
-    // Батч 2 (блокировки и производительность): correlation/rate, medium.
+    // Batch 2 (locks and query performance): correlation/rate, medium.
     DormantLens {
         lens_id: "lock_wait_logged",
         domain: Domain::Pg,
@@ -685,7 +685,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::SourcePeriod,
         ],
     },
-    // Батч 3 (обслуживание, безопасность, репликация): medium/low.
+    // Batch 3 (maintenance, security, replication): medium/low.
     DormantLens {
         lens_id: "checkpoint_too_frequent",
         domain: Domain::Pg,
@@ -937,7 +937,7 @@ mod tests {
     ];
 
     const LOG_EXPECTED_LENSES: [&str; 26] = [
-        // Батч 1 (core)
+        // Batch 1 (core)
         "oom_kill",
         "backend_crash",
         "panic_shutdown",
@@ -946,7 +946,7 @@ mod tests {
         "connection_slots_exhausted",
         "deadlock",
         "data_corruption_log",
-        // Батч 2
+        // Batch 2
         "lock_wait_logged",
         "lock_timeout_log",
         "statement_timeout_log",
@@ -954,7 +954,7 @@ mod tests {
         "slow_query_logged",
         "serialization_failure",
         "idle_in_transaction_abort",
-        // Батч 3
+        // Batch 3
         "checkpoint_too_frequent",
         "aggressive_autovacuum_wraparound",
         "autovacuum_cancel",
