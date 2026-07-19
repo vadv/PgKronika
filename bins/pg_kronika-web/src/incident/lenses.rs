@@ -802,16 +802,29 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "replication_disconnect",
+        lens_id: "walsender_disconnect",
         domain: Domain::Pg,
-        title: "Обрыв соединения репликации",
-        detects: "Оборвался ли поток репликации? Событие для стороны: walsender на primary, walreceiver на standby.",
+        title: "Обрыв walsender (primary)",
+        detects: "Оборвал ли primary поток репликации по timeout walsender?",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SensitiveLogRedaction,
-            Missing::SourcePeriod,
+            Missing::SourceClockProvenance,
+        ],
+    },
+    DormantLens {
+        lens_id: "walreceiver_disconnect",
+        domain: Domain::Pg,
+        title: "Обрыв walreceiver (standby)",
+        detects: "Оборвался ли приём на standby (walreceiver timeout / could not receive data)?",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::IncidentLogEventInput,
+            Missing::EntityJoin,
+            Missing::SensitiveLogRedaction,
+            Missing::SourceClockProvenance,
         ],
     },
     DormantLens {
@@ -1019,7 +1032,7 @@ mod tests {
         "network_errors",
     ];
 
-    const LOG_EXPECTED_LENSES: [&str; 30] = [
+    const LOG_EXPECTED_LENSES: [&str; 31] = [
         // Batch 1 (core)
         "oom_kill",
         "backend_crash",
@@ -1046,7 +1059,8 @@ mod tests {
         "permission_denied_burst",
         "connection_storm_log",
         "archive_command_failure",
-        "replication_disconnect",
+        "walsender_disconnect",
+        "walreceiver_disconnect",
         "recovery_conflict",
         "wal_integrity_log",
         // Batch 4 (audit splits)
