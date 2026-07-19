@@ -3,6 +3,7 @@ set -euo pipefail
 
 NIX_BASE_IMAGE=${BDD_NIX_BASE_IMAGE:-docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894}
 DOCKER=${BDD_DOCKER:-docker}
+BDD_BUILDER_CONTEXT_SCHEMA=2
 
 BDD_DEPS_PATHS=(
   Dockerfile.bdd-builder
@@ -11,13 +12,46 @@ BDD_DEPS_PATHS=(
   rust-toolchain.toml
   Cargo.toml
   Cargo.lock
+  '.cargo/**'
   'crates/*/Cargo.toml'
   'bins/*/Cargo.toml'
   xtask/Cargo.toml
 )
 
-BDD_BUILDER_CONTEXT_PATHS=(
-  "${BDD_DEPS_PATHS[@]}"
+BDD_TARGET_TOPOLOGY_PATHS=(
+  'crates/*/build.rs'
+  'crates/*/src/lib.rs'
+  'crates/*/src/main.rs'
+  'crates/*/src/bin/*.rs'
+  'crates/*/src/bin/*/main.rs'
+  'crates/*/tests/*.rs'
+  'crates/*/tests/*/main.rs'
+  'crates/*/examples/*.rs'
+  'crates/*/examples/*/main.rs'
+  'crates/*/benches/*.rs'
+  'crates/*/benches/*/main.rs'
+  'bins/*/build.rs'
+  'bins/*/src/lib.rs'
+  'bins/*/src/main.rs'
+  'bins/*/src/bin/*.rs'
+  'bins/*/src/bin/*/main.rs'
+  'bins/*/tests/*.rs'
+  'bins/*/tests/*/main.rs'
+  'bins/*/examples/*.rs'
+  'bins/*/examples/*/main.rs'
+  'bins/*/benches/*.rs'
+  'bins/*/benches/*/main.rs'
+  xtask/build.rs
+  xtask/src/lib.rs
+  xtask/src/main.rs
+  'xtask/src/bin/*.rs'
+  'xtask/src/bin/*/main.rs'
+  'xtask/tests/*.rs'
+  'xtask/tests/*/main.rs'
+  'xtask/examples/*.rs'
+  'xtask/examples/*/main.rs'
+  'xtask/benches/*.rs'
+  'xtask/benches/*/main.rs'
 )
 
 BDD_RUNTIME_KEY_PATHS=(
@@ -28,11 +62,11 @@ BDD_RUNTIME_KEY_PATHS=(
   'bins/*/benches/**'
   'bins/*/static/**'
   'crates/kronika-bdd/features/**'
+  'xtask/src/**'
 )
 
 BDD_RUNTIME_SOURCE_PATHS=(
   "${BDD_RUNTIME_KEY_PATHS[@]}"
-  'xtask/src/**'
 )
 
 usage() {
@@ -58,10 +92,10 @@ Commands:
                  Run the BDD image. Extra args are passed to kronika-bdd.
 
 Environment:
-  BDD_IMAGE_PREFIX   Registry prefix, default ghcr.io/vadv/pgkronika.
+  BDD_IMAGE_PREFIX   Registry prefix, default ghcr.io/vadv.
   BDD_PLATFORM       Docker platform. Defaults to the local Docker server platform.
   BDD_BRANCH_NAME    Branch name used for the mutable branch cache.
-  BDD_BUILDER_IMAGE  Builder image tag. Defaults to <prefix>/pgkronika-bdd-builder:deps-<platform>-<deps-key>.
+  BDD_BUILDER_IMAGE  Builder image tag. Defaults to <prefix>/pgkronika-bdd-builder:builder-<platform>-<deps-key>.
   BDD_BUILDER_BRANCH_IMAGE
                      Mutable builder cache for BDD_BRANCH_NAME.
   BDD_BUILDER_MAIN_IMAGE
@@ -125,6 +159,17 @@ print_git_paths() {
   )
 }
 
+target_topology_paths() {
+  print_git_paths "${BDD_TARGET_TOPOLOGY_PATHS[@]}"
+}
+
+dependency_input_paths() {
+  {
+    print_git_paths "${BDD_DEPS_PATHS[@]}"
+    target_topology_paths
+  } | LC_ALL=C sort -u
+}
+
 source_tar() {
   local root
   root=$(repo_root)
@@ -137,52 +182,28 @@ source_tar() {
 }
 
 write_dummy_builder_sources() {
-  local context=$1 dir root
-  root=$(repo_root)
+  local context=$1 path target
 
-  for dir in "$context"/crates/*; do
-    [ -f "$dir/Cargo.toml" ] || continue
-    mkdir -p "$dir/src"
-    case "${dir##*/}" in
-      kronika-bdd)
-        printf 'fn main() {}\n' > "$dir/src/main.rs"
+  target_topology_paths | while IFS= read -r path; do
+    target="$context/$path"
+    mkdir -p "${target%/*}"
+    case "$path" in
+      */src/lib.rs)
+        printf '#![allow(missing_docs)]\n' > "$target"
+        ;;
+      */tests/*.rs|*/tests/*/main.rs)
+        : > "$target"
         ;;
       *)
-        printf '#![allow(missing_docs)]\n' > "$dir/src/lib.rs"
+        printf 'fn main() {}\n' > "$target"
         ;;
     esac
-  done
-
-  for dir in "$context"/bins/* "$context"/xtask; do
-    [ -f "$dir/Cargo.toml" ] || continue
-    mkdir -p "$dir/src"
-    printf 'fn main() {}\n' > "$dir/src/main.rs"
-    # A binary crate that also ships a library target needs both dummy files,
-    # or crane derives a different cargoArtifacts than the real workspace and
-    # the runtime rebuilds every dependency.
-    if [ -f "$root/${dir#"$context"/}/src/lib.rs" ]; then
-      printf '#![allow(missing_docs)]\n' > "$dir/src/lib.rs"
-    fi
-  done
-
-  # Every declared [[bench]] target needs a file on disk, or cargo refuses to
-  # parse the crate manifest.
-  for dir in "$context"/crates/* "$context"/bins/*; do
-    [ -f "$dir/Cargo.toml" ] || continue
-    awk '/^\[\[bench\]\]/ { in_bench = 1; next }
-         /^\[/ { in_bench = 0 }
-         in_bench && /^name *= *"/ { gsub(/^name *= *"|".*$/, ""); print }' \
-      "$dir/Cargo.toml" \
-      | while IFS= read -r bench; do
-          mkdir -p "$dir/benches"
-          printf 'fn main() {}\n' > "$dir/benches/$bench.rs"
-        done
   done
 }
 
 write_builder_context() {
   local context=$1
-  source_tar "${BDD_BUILDER_CONTEXT_PATHS[@]}" | tar -C "$context" -xf -
+  source_tar "${BDD_DEPS_PATHS[@]}" | tar -C "$context" -xf -
   write_dummy_builder_sources "$context"
 }
 
@@ -198,16 +219,28 @@ builder_context_tar() {
 }
 
 deps_key() {
-  hash_git_paths "${BDD_DEPS_PATHS[@]}"
+  local context
+  context=$(mktemp -d)
+  if ! write_builder_context "$context"; then
+    rm -rf "$context"
+    return 1
+  fi
+  (
+    printf 'schema=%s\0base=%s\0' "$BDD_BUILDER_CONTEXT_SCHEMA" "$NIX_BASE_IMAGE"
+    cd "$context"
+    find . -type f -print0 \
+      | LC_ALL=C sort -z \
+      | while IFS= read -r -d '' path; do
+          printf '%s\0' "${path#./}"
+          cat "$path"
+          printf '\0'
+        done
+  ) | sha256_stream
+  rm -rf "$context"
 }
 
 image_key() {
   hash_git_paths "${BDD_RUNTIME_KEY_PATHS[@]}"
-}
-
-short_key() {
-  local key=$1
-  printf '%.16s' "$key"
 }
 
 platform() {
@@ -266,7 +299,7 @@ branch_slug() {
 }
 
 image_prefix() {
-  printf '%s' "${BDD_IMAGE_PREFIX:-ghcr.io/vadv/pgkronika}"
+  printf '%s' "${BDD_IMAGE_PREFIX:-ghcr.io/vadv}"
 }
 
 builder_image() {
@@ -274,7 +307,7 @@ builder_image() {
     printf '%s' "$BDD_BUILDER_IMAGE"
     return
   fi
-  printf '%s/pgkronika-bdd-builder:deps-%s-%s' "$(image_prefix)" "$(platform_slug)" "$(short_key "$(deps_key)")"
+  printf '%s/pgkronika-bdd-builder:builder-%s-%s' "$(image_prefix)" "$(platform_slug)" "$(deps_key)"
 }
 
 builder_branch_image() {
@@ -282,7 +315,7 @@ builder_branch_image() {
     printf '%s' "$BDD_BUILDER_BRANCH_IMAGE"
     return
   fi
-  printf '%s/pgkronika-bdd-builder:deps-%s-branch-%s' "$(image_prefix)" "$(platform_slug)" "$(branch_slug)"
+  printf '%s/pgkronika-bdd-builder:builder-%s-branch-%s' "$(image_prefix)" "$(platform_slug)" "$(branch_slug)"
 }
 
 builder_main_image() {
@@ -290,7 +323,7 @@ builder_main_image() {
     printf '%s' "$BDD_BUILDER_MAIN_IMAGE"
     return
   fi
-  printf '%s/pgkronika-bdd-builder:deps-%s-branch-main' "$(image_prefix)" "$(platform_slug)"
+  printf '%s/pgkronika-bdd-builder:builder-%s-branch-main' "$(image_prefix)" "$(platform_slug)"
 }
 
 runtime_image() {
@@ -298,7 +331,7 @@ runtime_image() {
     printf '%s' "$BDD_RUNTIME_IMAGE"
     return
   fi
-  printf 'pgkronika-bdd:%s-sha-%s' "$(platform_slug)" "$(short_key "$(image_key)")"
+  printf 'pgkronika-bdd:%s-sha-%s' "$(platform_slug)" "$(image_key)"
 }
 
 image_repository() {
@@ -367,7 +400,7 @@ builder_base_image() {
 }
 
 build_builder() {
-  local root context image branch_cache main_cache base
+  local root context image branch_cache main_cache base exact
   root=$(repo_root)
   image=$(builder_image)
   branch_cache=$(builder_branch_image)
@@ -387,7 +420,9 @@ build_builder() {
 
   if [ "${BDD_BUILDER_PULL:-0}" = "1" ] && docker_cmd manifest inspect "$image" >/dev/null 2>&1; then
     append_summary "- exact hit: yes"
-    docker_cmd pull "$image"
+    exact=$(resolve_image_digest_ref "$image")
+    docker_cmd pull "$exact"
+    docker_cmd tag "$exact" "$image"
     update_builder_branch_cache "$image" "$branch_cache"
     return
   fi
@@ -492,10 +527,10 @@ case "$cmd" in
     deps_key
     ;;
   deps-paths)
-    print_git_paths "${BDD_DEPS_PATHS[@]}"
+    dependency_input_paths
     ;;
   builder-paths)
-    print_git_paths "${BDD_BUILDER_CONTEXT_PATHS[@]}"
+    dependency_input_paths
     ;;
   builder-context-tar)
     builder_context_tar

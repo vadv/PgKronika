@@ -125,6 +125,10 @@ if [ "$1" = "manifest" ] && [ "$2" = "inspect" ]; then
 fi
 
 if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ] && [ "$3" = "inspect" ]; then
+  if [[ "$4" == *exact-hit* ]]; then
+    echo "sha256:9999000011112222333344445555666677778888aaaabbbbccccddddeeeeffff"
+    exit 0
+  fi
   if [[ "$4" == *branch-feature-one ]] && [ "${MOCK_BRANCH_CACHE_EXISTS:-0}" = "1" ]; then
     echo "sha256:111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000"
     exit 0
@@ -176,7 +180,8 @@ test_exact_hit_pulls_and_does_not_build() {
     BDD_BUILDER_PULL=1 \
     "$SCRIPT" build-builder)
   assert_contains "$log" "manifest inspect ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-exact-hit"
-  assert_contains "$log" "pull ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-exact-hit"
+  assert_contains "$log" "pull ghcr.io/acme/pgkronika/pgkronika-bdd-builder@sha256:9999000011112222333344445555666677778888aaaabbbbccccddddeeeeffff"
+  assert_contains "$log" "tag ghcr.io/acme/pgkronika/pgkronika-bdd-builder@sha256:9999000011112222333344445555666677778888aaaabbbbccccddddeeeeffff ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-exact-hit"
   assert_not_contains "$log" "buildx build"
 }
 
@@ -250,7 +255,7 @@ test_exact_hit_updates_branch_cache_when_enabled() {
     BDD_BUILDER_PULL=1 \
     BDD_BUILDER_UPDATE_BRANCH_CACHE=1 \
     "$SCRIPT" build-builder)
-  assert_contains "$log" "pull ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-exact-hit"
+  assert_contains "$log" "pull ghcr.io/acme/pgkronika/pgkronika-bdd-builder@sha256:9999000011112222333344445555666677778888aaaabbbbccccddddeeeeffff"
   assert_contains "$log" "tag ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-exact-hit ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-branch-feature-one"
   assert_contains "$log" "push ghcr.io/acme/pgkronika/pgkronika-bdd-builder:deps-linux-amd64-branch-feature-one"
   assert_not_contains "$log" "buildx build"
@@ -295,7 +300,7 @@ test_run_passes_args_and_debug_to_container() {
 test_runtime_image_default_is_content_keyed() {
   local image
   image=$(BDD_PLATFORM=linux/amd64 "$SCRIPT" runtime-image)
-  printf '%s\n' "$image" | grep -E '^pgkronika-bdd:linux-amd64-sha-[0-9a-f]{16}$' >/dev/null \
+  printf '%s\n' "$image" | grep -E '^pgkronika-bdd:linux-amd64-sha-[0-9a-f]{64}$' >/dev/null \
     || fail "default runtime image must be content-keyed, got: $image"
 }
 
@@ -392,7 +397,7 @@ test_runtime_paths_exclude_host_only_helpers() {
     || fail "runtime paths must include kronika-bdd source"
 }
 
-test_builder_paths_are_deps_only() {
+test_builder_paths_are_manifests_and_target_topology() {
   local paths
   paths=$("$SCRIPT" builder-paths)
   if printf '%s\n' "$paths" | grep -Fx -- "scripts/bdd-image.sh" >/dev/null; then
@@ -401,11 +406,15 @@ test_builder_paths_are_deps_only() {
   if printf '%s\n' "$paths" | grep -Fx -- "Makefile" >/dev/null; then
     fail "builder paths must not include Makefile"
   fi
-  if printf '%s\n' "$paths" | grep -E '/src/.*\.rs$' >/dev/null; then
-    fail "builder paths must not include Rust source files"
-  fi
   printf '%s\n' "$paths" | grep -Fx -- "crates/kronika-source-log/Cargo.toml" >/dev/null \
     || fail "builder paths must include crate manifests"
+  printf '%s\n' "$paths" | grep -Fx -- ".cargo/config.toml" >/dev/null \
+    || fail "builder paths must include Cargo configuration"
+  printf '%s\n' "$paths" | grep -Fx -- "bins/pg_kronika-web/src/lib.rs" >/dev/null \
+    || fail "builder paths must include target topology"
+  if printf '%s\n' "$paths" | grep -Fx -- "bins/pg_kronika-web/src/auth.rs" >/dev/null; then
+    fail "builder paths must exclude non-target Rust sources"
+  fi
 }
 
 test_builder_context_tar_has_stable_dummy_targets() {
@@ -471,6 +480,64 @@ test_dependency_manifest_changes_deps_key() {
   fi
 }
 
+test_cargo_config_changes_deps_key() {
+  local before after config repo script
+  repo=$(make_repo_copy)
+  script="$repo/scripts/bdd-image.sh"
+  config="$repo/.cargo/config.toml"
+  before=$(run_bdd_image_script "$script" deps-key)
+  printf '\n[net]\noffline = true\n' >> "$config"
+  after=$(run_bdd_image_script "$script" deps-key)
+  if [ "$after" = "$before" ]; then
+    fail "deps key must change when Cargo configuration changes"
+  fi
+}
+
+test_implicit_target_topology_changes_deps_key_not_source_contents() {
+  local baseline added edited restored path repo script
+  repo=$(make_repo_copy)
+  script="$repo/scripts/bdd-image.sh"
+  baseline=$(run_bdd_image_script "$script" deps-key)
+
+  for path in \
+    bins/pg_kronika-archiver/src/lib.rs \
+    crates/kronika-source-log/src/main.rs \
+    crates/kronika-source-log/src/bin/cache_key_probe.rs \
+    crates/kronika-source-log/tests/cache_key_probe.rs \
+    crates/kronika-source-log/examples/cache_key_probe.rs \
+    crates/kronika-source-log/benches/cache_key_probe.rs
+  do
+    mkdir -p "$repo/${path%/*}"
+    printf 'fn main() {}\n' > "$repo/$path"
+    added=$(run_bdd_image_script "$script" deps-key)
+    if [ "$added" = "$baseline" ]; then
+      fail "deps key must change when target topology adds $path"
+    fi
+    printf 'fn main() { println!("content-only change"); }\n' > "$repo/$path"
+    edited=$(run_bdd_image_script "$script" deps-key)
+    assert_eq "$edited" "$added"
+    rm -f "$repo/$path"
+    restored=$(run_bdd_image_script "$script" deps-key)
+    assert_eq "$restored" "$baseline"
+  done
+}
+
+test_xtask_source_changes_runtime_not_deps() {
+  local before_deps before_image after_deps after_image repo script source
+  repo=$(make_repo_copy)
+  script="$repo/scripts/bdd-image.sh"
+  source="$repo/xtask/src/main.rs"
+  before_deps=$(run_bdd_image_script "$script" deps-key)
+  before_image=$(run_bdd_image_script "$script" image-key)
+  printf '\nfn runtime_key_probe() {}\n' >> "$source"
+  after_deps=$(run_bdd_image_script "$script" deps-key)
+  after_image=$(run_bdd_image_script "$script" image-key)
+  assert_eq "$after_deps" "$before_deps"
+  if [ "$after_image" = "$before_image" ]; then
+    fail "runtime image key must change when xtask source changes"
+  fi
+}
+
 test_runtime_key_changes_for_feature_inputs() {
   local before after probe repo script
   repo=$(make_repo_copy)
@@ -493,6 +560,8 @@ test_github_actions_bdd_uses_fast_runtime_default() {
     || fail "GitHub Actions build-runtime step must use local exact-image reuse"
   grep -F -- './scripts/bdd-image.sh build-runtime' "$workflow" >/dev/null \
     || fail "GitHub Actions must use the BDD image helper for runtime builds"
+  grep -F -- 'ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-${deps_hash}' "$workflow" >/dev/null \
+    || fail "GitHub Actions must use the flat PR80 builder tag family"
 }
 
 for test in \
@@ -514,11 +583,14 @@ for test in \
   test_local_bdd_runner_runs_full_suite_without_tags \
   test_local_bdd_runner_uses_default_fast_runtime_with_tags \
   test_runtime_paths_exclude_host_only_helpers \
-  test_builder_paths_are_deps_only \
+  test_builder_paths_are_manifests_and_target_topology \
   test_builder_context_tar_has_stable_dummy_targets \
   test_runtime_key_ignores_host_only_files \
   test_rust_source_changes_runtime_but_not_deps_or_builder \
   test_dependency_manifest_changes_deps_key \
+  test_cargo_config_changes_deps_key \
+  test_implicit_target_topology_changes_deps_key_not_source_contents \
+  test_xtask_source_changes_runtime_not_deps \
   test_runtime_key_changes_for_feature_inputs \
   test_github_actions_bdd_uses_fast_runtime_default
 do
