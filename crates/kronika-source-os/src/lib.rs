@@ -26,6 +26,12 @@ pub use fs::{
 mod instance;
 pub use instance::{OsInstanceFacts, collect_os_instance_facts};
 
+mod joins;
+pub use joins::{
+    Hash128, JoinFailure, ProcessCgroupMemory, StorageMount, collect_process_cgroup_memory,
+    map_postgresql_storage,
+};
+
 pub mod mount;
 pub use mount::{
     MountEntry, container_device_set, device_map, display_path, is_k8s_infra_mount, mount_row,

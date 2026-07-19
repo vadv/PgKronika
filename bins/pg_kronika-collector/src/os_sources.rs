@@ -5,6 +5,7 @@ use crate::logging::{
 };
 use crate::scheduler::{DueSet, SourceKind};
 use anyhow::Result;
+use kronika_registry::incident_gauges::{PgProcessCgroupMemoryV1, PgStorageMountV1};
 use kronika_registry::os_cgroup_cpu::OsCgroupCpu;
 use kronika_registry::os_cgroup_io::OsCgroupIo;
 use kronika_registry::os_cgroup_mapping::OsCgroupMapping;
@@ -34,11 +35,16 @@ use kronika_source_os::proc::stat::{parse_cpu, parse_stat_misc};
 use kronika_source_os::proc::vmstat::parse_vmstat;
 use kronika_source_os::proc::{diskstats, net_dev, net_netstat, net_snmp};
 use kronika_source_os::{
+    Hash128, JoinFailure, collect_process_cgroup_memory, map_postgresql_storage,
+};
+use kronika_source_os::{
     MountEntry, OsScope, ProcFs, SysFs, cgroup, container_device_set, mount_row, net_scope,
     parse_dev_pair, parse_mountinfo, statvfs,
 };
+use kronika_source_pg::incident_gauges::LocalJoinFacts;
 use kronika_writer::{Interner, SectionBuffers};
 use std::io::ErrorKind;
+use std::path::Path;
 use std::time::Instant;
 
 mod buffering;
@@ -72,6 +78,9 @@ pub(crate) struct OsSources {
     cgroup_memory: Vec<OsCgroupMemory>,
     cgroup_io: Vec<OsCgroupIo>,
     cgroup_pids: Vec<OsCgroupPids>,
+    mount_entries: Vec<MountEntry>,
+    pg_storage_mounts: Vec<PgStorageMountV1>,
+    pg_process_cgroup_memory: Option<PgProcessCgroupMemoryV1>,
 }
 
 impl OsSources {
@@ -96,6 +105,9 @@ impl OsSources {
             cgroup_memory: Vec::new(),
             cgroup_io: Vec::new(),
             cgroup_pids: Vec::new(),
+            mount_entries: Vec::new(),
+            pg_storage_mounts: Vec::new(),
+            pg_process_cgroup_memory: None,
         }
     }
 
@@ -426,6 +438,7 @@ pub(crate) fn collect_os_sources(
     // OsCore needs it for the container device filter in diskstats;
     // OsMountTopo needs it to build the attribution section rows.
     let mounts = procfs_sections::mountinfo_entries(fs);
+    os.mount_entries.clone_from(&mounts);
 
     if due.has(SourceKind::OsCore) {
         // Counters: disk and network. Network sections carry the pod's
@@ -456,6 +469,94 @@ pub(crate) fn collect_os_sources(
     );
 
     os
+}
+
+const fn empty_hash() -> Hash128 {
+    Hash128 { hi: 0, lo: 0 }
+}
+
+/// Build bounded cross-source rows only from the PostgreSQL PID supplied by
+/// the same collection tick. Raw paths never leave this orchestration step.
+pub(crate) fn collect_pg_os_joins(fs: &ProcFs, facts: Option<&LocalJoinFacts>, os: &mut OsSources) {
+    let Some(facts) = facts else {
+        return;
+    };
+    let sys = SysFs::from_env();
+    let process =
+        collect_process_cgroup_memory(fs, &sys, facts.backend_pid, facts.backend_start, facts.ts);
+    let local_identity_verified = process.is_ok();
+    let process_hash = process
+        .as_ref()
+        .map_or_else(|_| empty_hash(), |row| row.process_hash);
+    os.pg_process_cgroup_memory = Some(match process {
+        Ok(row) => PgProcessCgroupMemoryV1 {
+            ts: Ts(facts.ts),
+            process_hash_hi: row.process_hash.hi,
+            process_hash_lo: row.process_hash.lo,
+            cgroup_hash_hi: row.cgroup_hash.hi,
+            cgroup_hash_lo: row.cgroup_hash.lo,
+            hierarchy: row.hierarchy,
+            mapping_state: 1,
+            current_bytes: Some(row.memory.current),
+            max_bytes: row.memory.max,
+            max_unlimited: row.max_unlimited,
+        },
+        Err(reason) => PgProcessCgroupMemoryV1 {
+            ts: Ts(facts.ts),
+            process_hash_hi: process_hash.hi,
+            process_hash_lo: process_hash.lo,
+            cgroup_hash_hi: 0,
+            cgroup_hash_lo: 0,
+            hierarchy: 0,
+            mapping_state: reason.code(),
+            current_bytes: None,
+            max_bytes: None,
+            max_unlimited: false,
+        },
+    });
+
+    let storage = if local_identity_verified && facts.tablespaces_complete {
+        map_postgresql_storage(
+            fs,
+            Path::new(&facts.data_directory),
+            &facts.tablespaces,
+            &os.mount_entries,
+            258,
+        )
+    } else {
+        Err(JoinFailure::ProcUnavailable)
+    };
+    match storage {
+        Ok(rows) => {
+            os.pg_storage_mounts = rows
+                .into_iter()
+                .map(|row| PgStorageMountV1 {
+                    ts: Ts(facts.ts),
+                    role: row.role,
+                    path_hash_hi: row.path_hash.hi,
+                    path_hash_lo: row.path_hash.lo,
+                    mount_hash_hi: row.mount_hash.hi,
+                    mount_hash_lo: row.mount_hash.lo,
+                    mount_namespace: row.mount_namespace,
+                    mapping_state: row.mapping_state,
+                    total_bytes: row.total_bytes,
+                    available_bytes: row.available_bytes,
+                })
+                .collect();
+        }
+        Err(reason) => os.pg_storage_mounts.push(PgStorageMountV1 {
+            ts: Ts(facts.ts),
+            role: 0,
+            path_hash_hi: 0,
+            path_hash_lo: 0,
+            mount_hash_hi: 0,
+            mount_hash_lo: 0,
+            mount_namespace: 0,
+            mapping_state: reason.code(),
+            total_bytes: None,
+            available_bytes: None,
+        }),
+    }
 }
 
 const fn os_entity_scope(in_container: bool) -> u8 {

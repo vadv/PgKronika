@@ -16,11 +16,15 @@ fn disk_row(major: i32, minor: i32) -> diskstats::DiskstatsRow {
 
 fn mount_entry(major: i32, minor: i32, source: &str) -> MountEntry {
     MountEntry {
+        mount_id: minor,
+        parent_id: 1,
         major,
         minor,
+        root: "/".to_owned(),
         mount_point: "/data".to_owned(),
         fstype: "btrfs".to_owned(),
         source: source.to_owned(),
+        deleted: false,
         is_k8s_infra: false,
     }
 }
@@ -78,19 +82,27 @@ fn resolve_major_zero_leaves_entry_when_sysfs_missing() {
 fn collect_mountinfo_emits_every_mount_entry() {
     let entries = vec![
         MountEntry {
+            mount_id: 10,
+            parent_id: 1,
             major: 8,
             minor: 1,
+            root: "/".to_owned(),
             mount_point: "/data".to_owned(),
             fstype: "ext4".to_owned(),
             source: "/dev/sda1".to_owned(),
+            deleted: false,
             is_k8s_infra: false,
         },
         MountEntry {
+            mount_id: 11,
+            parent_id: 10,
             major: 8,
             minor: 1,
+            root: "/".to_owned(),
             mount_point: "/data/pg wal".to_owned(),
             fstype: "ext4".to_owned(),
             source: "/dev/sda1".to_owned(),
+            deleted: false,
             is_k8s_infra: false,
         },
     ];

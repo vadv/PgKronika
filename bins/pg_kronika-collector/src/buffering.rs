@@ -8,6 +8,11 @@ use kronika_registry::instance_metadata::InstanceMetadata;
 use kronika_registry::{StrId, Ts};
 use kronika_source_pg::archiver::{ArchiverRow, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion};
+use kronika_source_pg::incident_gauges::{
+    FreezeHorizonRow, ReplicationPhysicalRow, SlotRetentionRow, SlotRetentionVersion,
+    VacuumObservationRow, to_freeze_horizon, to_replication_physical, to_slot_retention_v1,
+    to_slot_retention_v2, to_slot_retention_v3, to_vacuum_observation,
+};
 use kronika_source_pg::io::{self, IoRow, IoVersion};
 use kronika_source_pg::locks::{
     LocksRow, LocksVersion, locks_version, to_v1 as locks_to_v1, to_v2 as locks_to_v2,
@@ -47,6 +52,7 @@ pub(crate) fn push_main_conn_sections(
         push_database(buffers, interner, *database_version, database_rows)?;
     }
     push_progress_vacuum(buffers, interner, &src.progress_vacuum_rows)?;
+    push_vacuum_observations(buffers, interner, &src.vacuum_observation_rows)?;
     push_prepared_xacts(buffers, interner, &src.prepared_rows)?;
     push_wal(buffers, src.wal)?;
     if let Some((io_version, io_rows)) = &src.io {
@@ -55,9 +61,12 @@ pub(crate) fn push_main_conn_sections(
     if let Some(archiver) = &src.archiver {
         push_archiver(buffers, interner, archiver)?;
     }
-    if let Some((instance_row, replica_rows, slot_rows)) = &src.replication {
+    if let Some((instance_row, replica_rows, slot_rows, physical, version, retention)) =
+        &src.replication
+    {
         push_replication_instance(buffers, interner, instance_row)?;
         push_replication_details(buffers, interner, replica_rows, slot_rows)?;
+        push_replication_incident_inputs(buffers, interner, physical, *version, retention)?;
     }
     if !src.lock_rows.is_empty() {
         push_locks(buffers, interner, locks_version(major), &src.lock_rows)?;
@@ -270,6 +279,32 @@ pub(crate) fn push_progress_vacuum(
     Ok(())
 }
 
+/// Buffer same-snapshot running-vacuum observations.
+pub(crate) fn push_vacuum_observations(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[VacuumObservationRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_vacuum_observation(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
+/// Buffer bounded per-relation freeze horizons.
+pub(crate) fn push_freeze_horizons(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    rows: &[FreezeHorizonRow],
+) -> Result<()> {
+    for row in rows {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_freeze_horizon(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
 /// Intern each row's `datname` and buffer it as the prepared-xacts section.
 ///
 /// # Errors
@@ -404,6 +439,35 @@ pub(crate) fn push_replication_details(
     for row in slots {
         let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
         buffer_row(buffers, to_slots_v1(row, &mut intern)?)?;
+    }
+    Ok(())
+}
+
+/// Buffer typed replication scope, stage gaps, and slot-retention layouts.
+pub(crate) fn push_replication_incident_inputs(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    physical: &[ReplicationPhysicalRow],
+    version: SlotRetentionVersion,
+    retention: &[SlotRetentionRow],
+) -> Result<()> {
+    for row in physical {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        buffer_row(buffers, to_replication_physical(row, &mut intern)?)?;
+    }
+    for row in retention {
+        let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
+        match version {
+            SlotRetentionVersion::Pg15 => {
+                buffer_row(buffers, to_slot_retention_v1(row, &mut intern)?)?;
+            }
+            SlotRetentionVersion::Pg16 => {
+                buffer_row(buffers, to_slot_retention_v2(row, &mut intern)?)?;
+            }
+            SlotRetentionVersion::Pg17Plus => {
+                buffer_row(buffers, to_slot_retention_v3(row, &mut intern)?)?;
+            }
+        }
     }
     Ok(())
 }
