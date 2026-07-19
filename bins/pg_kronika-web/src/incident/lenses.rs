@@ -26,6 +26,7 @@ pub(crate) enum MissingCapability {
     IncidentLogEventInput,
     LogDetailContinuation,
     LogCaptureCoverage,
+    SensitiveLogRedaction,
 }
 
 impl MissingCapability {
@@ -46,6 +47,7 @@ impl MissingCapability {
             Self::IncidentLogEventInput => "incident_log_event_input",
             Self::LogDetailContinuation => "log_detail_continuation",
             Self::LogCaptureCoverage => "log_capture_coverage",
+            Self::SensitiveLogRedaction => "sensitive_log_redaction",
         }
     }
 }
@@ -584,6 +586,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::IncidentLogEventInput,
             Missing::LogDetailContinuation,
             Missing::EntityJoin,
+            Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
     },
@@ -611,6 +614,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::LogCaptureCoverage,
+            Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
     },
@@ -623,6 +627,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
+            Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
     },
@@ -636,6 +641,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::LogDetailContinuation,
+            Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
     },
@@ -662,6 +668,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::LogCaptureCoverage,
+            Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
     },
@@ -727,6 +734,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::IncidentLogEventInput,
             Missing::LogCaptureCoverage,
+            Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
     },
@@ -736,7 +744,11 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         title: "Отказы по pg_hba",
         detects: "Стучится ли неизвестный хост/БД/пользователь мимо pg_hba?",
         confidence: ConfidenceCap::Medium,
-        missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
+        missing: &[
+            Missing::IncidentLogEventInput,
+            Missing::SensitiveLogRedaction,
+            Missing::SourcePeriod,
+        ],
     },
     DormantLens {
         lens_id: "permission_denied_burst",
@@ -744,7 +756,11 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         title: "Всплеск отказов доступа (RBAC)",
         detects: "Всплеск ли `permission denied` (обычно кривой деплой грантов)?",
         confidence: ConfidenceCap::Low,
-        missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
+        missing: &[
+            Missing::IncidentLogEventInput,
+            Missing::SensitiveLogRedaction,
+            Missing::SourcePeriod,
+        ],
     },
     DormantLens {
         lens_id: "connection_storm_log",
@@ -756,6 +772,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
             Missing::IncidentLogEventInput,
             Missing::LogCaptureCoverage,
             Missing::EntityJoin,
+            Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
     },
@@ -768,6 +785,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
+            Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
     },
@@ -1000,6 +1018,10 @@ mod tests {
         assert_eq!(
             Missing::LogDetailContinuation.as_str(),
             "log_detail_continuation"
+        );
+        assert_eq!(
+            Missing::SensitiveLogRedaction.as_str(),
+            "sensitive_log_redaction"
         );
         assert_eq!(Missing::LogCaptureCoverage.as_str(), "log_capture_coverage");
     }
