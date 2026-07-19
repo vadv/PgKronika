@@ -804,6 +804,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::IncidentLogEventInput,
             Missing::EntityJoin,
+            Missing::SensitiveLogRedaction,
             Missing::SourcePeriod,
         ],
     },
