@@ -1,6 +1,6 @@
 [package]
 name = "kronika-store"
-description = "pgKronika internal crate"
+description = "Read-only local PGM directory and live-journal scanning"
 publish = false
 version.workspace = true
 edition.workspace = true

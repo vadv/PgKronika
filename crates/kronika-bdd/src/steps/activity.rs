@@ -1,6 +1,6 @@
 //! Steps for `features/pg_stat_activity.feature` (`pg_stat_activity.pg14_18`).
 //!
-//! Generic transport and row-assertion steps come from [`super::mod`] and
+//! Generic transport and row-assertion steps come from [`crate::steps`] and
 //! [`super::common`]. The one step here is specific to `pg_stat_activity` so
 //! its phrase mentions the view name and cannot clash with other features.
 

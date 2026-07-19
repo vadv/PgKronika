@@ -1,6 +1,24 @@
-//! Section type ids, contracts, and codecs.
+//! Authoritative section type ids, contracts, and codecs.
 //!
-//! Registry contracts and codecs for typed section bodies.
+//! Each registered Rust row type defines one stable `type_id`, logical name,
+//! on-disk columns, sort and identity keys, collection semantics, and optional
+//! collection gates. Layout versions can share a logical name; readers use the
+//! contracts to union their columns without guessing from Parquet metadata.
+//!
+//! The sealed [`Section`] trait couples a contract to its encoder, decoder, and
+//! timestamp range. The internal `kronika-derive` macro generates those pieces
+//! from one annotated struct. [`lint`] and [`lint_references`] reject invalid
+//! ids, keys, column classes, and cross-section gate references.
+//!
+//! Encoded and decoded sections are limited to [`MAX_SECTION_BYTES`],
+//! [`MAX_SECTION_ROWS`], and [`MAX_ROW_GROUPS`]. [`VerifiedSection`] requires a
+//! caller-supplied CRC check before Parquet sees the bytes. These checks bound
+//! ordinary resource use and accidental corruption; they do not authenticate
+//! a deliberately rebuilt segment.
+//!
+//! `PostgreSQL`- and Linux-specific meaning belongs here in declarative
+//! contracts. Collection, storage, cross-segment queries, and HTTP responses
+//! belong to their respective crates.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "the registry's arrow/parquet stack pulls duplicate transitive versions outside this crate"

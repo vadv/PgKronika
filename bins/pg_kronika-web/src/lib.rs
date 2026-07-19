@@ -1,9 +1,20 @@
-//! JSON API over a local store directory, served by an axum router.
+//! Bounded JSON API and embedded UI over a local PGM directory.
 //!
 //! Handlers clone the shared snapshot (catalog metadata, not section bodies)
 //! and run the reader's `&mut` queries on the private copy. A background task
 //! refreshes the shared snapshot once a second; tests skip it, so the router
 //! stays deterministic.
+//!
+//! [`app`] exposes public liveness, readiness, and Prometheus endpoints plus a
+//! UI and `/v1` routes for catalogs, rows, diffs, anomalies, and incident
+//! clusters. Optional [`AuthConfig`] protects the UI and `/v1`; probes and
+//! metrics remain public. TLS and proxy authentication are deployment concerns.
+//!
+//! Reader and adapter ceilings bound rows, materialized cells, scan positions,
+//! scoring work, identity bytes, and output. One semaphore slot admits heavy
+//! anomaly or incident work; another request receives `503` instead of
+//! queueing. Incident diagnosis is not implemented: the endpoint clusters
+//! episodes, reports `complete=false`, and returns a dormant lens catalog.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "metrics-exporter-prometheus and axum pull duplicate transitive versions outside our control"

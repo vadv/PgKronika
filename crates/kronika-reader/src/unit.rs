@@ -17,7 +17,7 @@ use crate::{Dictionary, ReadError, Stored, decode_dictionary};
 /// Upper bound on the catalog block, checked before allocation.
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 
-/// A PGM container opened for reading over any [`ReadAt`] source.
+/// A PGM container opened for reading over any [`kronika_format::ReadAt`] source.
 ///
 /// Works for sealed segment files (`File`) and in-memory journal parts (`&[u8]`).
 #[derive(Debug)]

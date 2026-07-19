@@ -1,4 +1,4 @@
-//! Segment read core.
+//! Verified local PGM reads and bounded logical queries.
 //!
 //! [`PgmUnit`] decodes a PGM container over any [`kronika_format::ReadAt`]
 //! implementation: a sealed [`std::fs::File`] or an in-memory journal part
@@ -7,6 +7,18 @@
 //! [`LocalDirSnapshot`] combines sealed segments with live `active.parts`
 //! entries, suppresses exact sealed/live duplicates, and exposes scan
 //! diagnostics.
+//!
+//! Section queries join registered layout versions under one logical name,
+//! filter by source and time, order rows by the registry contract, and return
+//! coverage gaps plus an opaque cursor. [`QueryLimits`] bounds returned rows
+//! and materialized cells; format, catalog, section, row-group, and row-count
+//! ceilings are checked before or during decode.
+//!
+//! Counter folds preserve reset, gap, first-point, invalid-interval, and
+//! collection-disabled states as distinct [`Reason`] values. A zero rate is
+//! emitted only for a measured unchanged counter. Callers should treat
+//! [`ReadError::StaleSnapshot`] as a refresh-and-retry signal; bounded query
+//! helpers perform a limited refresh retry and then expose the remaining gap.
 
 mod query;
 mod snapshot;
@@ -94,7 +106,8 @@ pub enum ReadError {
     },
     /// The catalog block did not decode (length, count, or CRC).
     Catalog(DecodeError),
-    /// A catalog entry's length is above [`MAX_SECTION_BYTES`].
+    /// A catalog entry's length is above
+    /// [`kronika_registry::MAX_SECTION_BYTES`].
     SectionTooLarge {
         /// The section length claimed by the catalog.
         len: u64,

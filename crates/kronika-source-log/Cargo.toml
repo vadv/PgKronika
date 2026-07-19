@@ -1,6 +1,6 @@
 [package]
 name = "kronika-source-log"
-description = "pgKronika internal crate"
+description = "Bounded PostgreSQL stderr tailing and typed log events"
 publish = false
 version.workspace = true
 edition.workspace = true
