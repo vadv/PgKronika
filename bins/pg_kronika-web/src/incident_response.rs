@@ -350,6 +350,7 @@ fn quality_to_json(quality: &InputQuality, node_identity: &str) -> Value {
         "evaluated_positions": quality.evaluated_positions,
         "unevaluated_positions": quality.unevaluated_positions,
         "episodes_truncated": quality.episodes_truncated,
+        "snapshot_rows_withheld": quality.snapshot_rows_withheld,
     })
 }
 
@@ -460,7 +461,7 @@ mod tests {
     use super::*;
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
-    const APPLIED_IDS: [&str; 19] = [
+    const APPLIED_IDS: [&str; 23] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -480,6 +481,10 @@ mod tests {
         "PG-SLOT-016",
         "OS-CGMEM-023",
         "OS-FS-027",
+        "PG-HORIZON-013",
+        "PG-SYNC-018",
+        "PG-WAIT-019",
+        "PG-LOCK-012",
     ];
 
     const MAX_ENTRY_JSON_BYTES: usize = 256
@@ -704,10 +709,10 @@ mod tests {
     }
 
     #[test]
-    fn lock_episode_does_not_activate_catalog_without_edge_evidence() {
+    fn lock_lens_is_active_but_silent_without_sampled_edges() {
         use crate::incident::{
-            ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, SeriesSet,
-            TypedInputs, analyze,
+            ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, Lens,
+            SeriesSet, TypedInputs, active_catalog, analyze,
         };
         use kronika_analytics::{Direction, Episode, Evaluated};
         use std::sync::Arc;
@@ -738,11 +743,15 @@ mod tests {
             },
         };
         let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+        let catalog = active_catalog();
+        let lenses: Vec<&dyn Lens> = catalog.iter().map(AsRef::as_ref).collect();
+        // A pg_locks episode with no sampled lock edges: the lock lens is active
+        // and runs, but has no direct evidence, so it emits nothing.
         let outcome = analyze(
             vec![episode],
             &SeriesSet::for_test(0),
             &TypedInputs::new(),
-            &[],
+            &lenses,
             &config,
         )
         .expect("valid analysis");
@@ -769,22 +778,15 @@ mod tests {
             .as_array()
             .expect("catalog lists dormant lenses");
         assert_eq!(dormant.len(), 28 - APPLIED_IDS.len());
-        let lock = dormant
-            .iter()
-            .find(|entry| entry["lens_id"] == "PG-LOCK-012")
-            .expect("lock lens is dormant");
-        assert_eq!(
-            lock["awaiting"],
-            json!(["sampled_blocked_by_edges", "lock_snapshot_coverage"])
+        assert!(
+            APPLIED_IDS.contains(&"PG-LOCK-012"),
+            "the lock lens is now applied, not dormant"
         );
-        assert_eq!(lock["domain"], "pg");
-        assert_eq!(lock["slug"], "lock_wait_graph");
-        assert_eq!(lock["confidence_cap"], "high");
-        assert_eq!(lock["text_locale"], "ru");
-        assert_eq!(lock["title"], "Граф ожидания блокировок");
-        assert_eq!(
-            lock["question"],
-            "Кто блокировал ожидающего в момент снимка (`blocked_by` из `pg_locks`)."
+        assert!(
+            dormant
+                .iter()
+                .all(|entry| entry["lens_id"] != "PG-LOCK-012"),
+            "the lock lens no longer appears among dormant lenses"
         );
         assert!(
             body["catalog"]["dormant"]

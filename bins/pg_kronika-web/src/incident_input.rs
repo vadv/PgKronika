@@ -12,9 +12,14 @@ use kronika_registry::ColumnClass;
 use crate::anomaly::{EpisodeHit, ScanCounts, ScanParams, scan_section};
 use crate::handlers::v1::{DIFF_MAX_ROWS, Gates};
 use crate::incident::{
-    EnrichedEpisode, EpisodeRefV1, GaugeQuality, GaugeTrackInput, IdentityValue, Series,
-    SeriesError, SeriesInsertError, SeriesSet, TypedInputs,
+    ActivityBackend, ActivitySnapshot, EnrichedEpisode, EpisodeRefV1, GaugeQuality,
+    GaugeTrackInput, IdentityValue, LockEdge, LockSnapshot, Series, SeriesError, SeriesInsertError,
+    SeriesSet, TypedInputs,
 };
+
+/// Sections whose raw snapshots the sampled activity and lock lenses read.
+const PG_STAT_ACTIVITY: &str = "pg_stat_activity";
+const PG_LOCKS: &str = "pg_locks";
 
 /// Data exclusions recorded while building engine input.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +50,10 @@ pub(crate) struct InputQuality {
     pub unevaluated_positions: u64,
     /// Above-threshold episodes omitted by the retained-episode ceiling.
     pub episodes_truncated: u64,
+    /// Snapshot rows (activity backends or lock edges) withheld because the
+    /// request snapshot-row ceiling was reached. The section's snapshots are
+    /// dropped whole, so a sampled lens sees none rather than a biased subset.
+    pub snapshot_rows_withheld: u64,
 }
 
 /// Request ceilings for adapter-owned work and data.
@@ -58,6 +67,7 @@ pub(crate) struct InputLimits {
     positions: usize,
     score_work: usize,
     episodes: usize,
+    snapshot_rows: usize,
 }
 
 impl InputLimits {
@@ -75,6 +85,7 @@ impl InputLimits {
             positions: 10_000,
             score_work: crate::anomaly::MAX_SCORE_WORK,
             episodes: 20_000,
+            snapshot_rows: 200_000,
         }
     }
 
@@ -96,6 +107,7 @@ impl InputLimits {
             positions: 10_000,
             score_work: crate::anomaly::MAX_SCORE_WORK,
             episodes: 50,
+            snapshot_rows: 200_000,
         }
     }
 }
@@ -413,6 +425,7 @@ struct BuildState {
     skipped: Vec<SectionSkip>,
     remaining_identity_bytes: usize,
     remaining_scan: usize,
+    remaining_snapshot_rows: usize,
     remaining_typed_gauge_points: usize,
     capability_by_section: BTreeMap<&'static str, CapabilityInputState>,
 }
@@ -432,6 +445,7 @@ impl BuildState {
             skipped,
             remaining_identity_bytes,
             remaining_scan: limits.score_work,
+            remaining_snapshot_rows: limits.snapshot_rows,
             remaining_typed_gauge_points: limits.typed_gauge_points,
             capability_by_section: BTreeMap::new(),
         }
@@ -502,6 +516,7 @@ impl BuildState {
         let gauge_series = gauge_section(&identity, &gauges, &page.rows);
         tally_quality(&diffs, &gauge_series, &mut self.quality);
         self.retain_typed(logical.name, &cumulative, &diffs);
+        self.retain_snapshots(logical.name, &page.rows);
         let gauge_points = self.admit_typed_gauge_points(logical.name, &gauge_series, limits);
 
         let scanned = match scan_section(
@@ -673,6 +688,131 @@ impl BuildState {
             }
         }
     }
+
+    /// Retain the raw activity or lock snapshots the sampled lenses read,
+    /// grouped by collection time. A section whose rows would exceed the
+    /// request snapshot-row ceiling is withheld whole and counted, never
+    /// sampled, so a lens sees the full section or none. Sections without a
+    /// snapshot lens are ignored.
+    fn retain_snapshots(&mut self, section: &'static str, rows: &[OutRow]) {
+        match section {
+            PG_STAT_ACTIVITY => {
+                let snapshots = build_activity_snapshots(rows);
+                let observed = snapshots.iter().map(|snap| snap.backends.len()).sum();
+                if self.withhold_snapshots(observed) {
+                    return;
+                }
+                for snapshot in snapshots {
+                    self.typed.insert_activity_snapshot(snapshot);
+                }
+            }
+            PG_LOCKS => {
+                let snapshots = build_lock_snapshots(rows);
+                let observed = snapshots.iter().map(|snap| snap.edges.len()).sum();
+                if self.withhold_snapshots(observed) {
+                    return;
+                }
+                for snapshot in snapshots {
+                    self.typed.insert_lock_snapshot(snapshot);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Charge `observed` snapshot rows against the request ceiling. Returns
+    /// `true` when the section does not fit and must be withheld whole; the
+    /// withheld rows are counted so the response reports the incompleteness.
+    fn withhold_snapshots(&mut self, observed: usize) -> bool {
+        if observed > self.remaining_snapshot_rows {
+            self.quality.snapshot_rows_withheld = self
+                .quality
+                .snapshot_rows_withheld
+                .saturating_add(u64::try_from(observed).unwrap_or(u64::MAX));
+            return true;
+        }
+        self.remaining_snapshot_rows -= observed;
+        false
+    }
+}
+
+/// Group `pg_stat_activity` rows into per-collection-time snapshots. A row with
+/// no timestamp carries no snapshot to join and is dropped.
+fn build_activity_snapshots(rows: &[OutRow]) -> Vec<ActivitySnapshot> {
+    let mut by_ts: BTreeMap<i64, Vec<ActivityBackend>> = BTreeMap::new();
+    for row in rows {
+        let Some(Value::Ts(ts)) = row_value(row, "ts") else {
+            continue;
+        };
+        by_ts
+            .entry(*ts)
+            .or_default()
+            .push(activity_backend(row, *ts));
+    }
+    by_ts
+        .into_iter()
+        .map(|(ts, backends)| ActivitySnapshot { ts, backends })
+        .collect()
+}
+
+/// Reduce one activity row to the fields the sampled lenses read. `xact_age_us`
+/// is the open-transaction age against the snapshot time; a start after the
+/// snapshot (clock disagreement) yields `None` rather than a negative age.
+fn activity_backend(row: &OutRow, ts: i64) -> ActivityBackend {
+    ActivityBackend {
+        xmin_age: match row_value(row, "backend_xmin_age") {
+            Some(Value::I64(age)) => Some(*age),
+            _ => None,
+        },
+        state: str_value(row, "state"),
+        wait_event_type: str_value(row, "wait_event_type"),
+        wait_event: str_value(row, "wait_event"),
+        xact_age_us: match row_value(row, "xact_start") {
+            Some(Value::Ts(start)) => ts.checked_sub(*start).filter(|age| *age >= 0),
+            _ => None,
+        },
+    }
+}
+
+/// A resolved string label, or `None` for `NULL` or any non-string cell.
+fn str_value(row: &OutRow, name: &str) -> Option<Box<str>> {
+    match row_value(row, name) {
+        Some(Value::Str(text)) => Some(text.as_str().into()),
+        _ => None,
+    }
+}
+
+/// Group `pg_locks` rows into per-collection-time edge sets. Each waiter row
+/// expands its `blocked_by` list into one edge per blocker; a root row (empty
+/// `blocked_by`) contributes no edge, so a snapshot with no contention is
+/// simply absent.
+fn build_lock_snapshots(rows: &[OutRow]) -> Vec<LockSnapshot> {
+    let mut by_ts: BTreeMap<i64, Vec<LockEdge>> = BTreeMap::new();
+    for row in rows {
+        let Some(Value::Ts(ts)) = row_value(row, "ts") else {
+            continue;
+        };
+        let Some(Value::I64(waiter)) = row_value(row, "pid") else {
+            continue;
+        };
+        let Some(Value::ListI32(blockers)) = row_value(row, "blocked_by") else {
+            continue;
+        };
+        if blockers.is_empty() {
+            continue;
+        }
+        let edges = by_ts.entry(*ts).or_default();
+        for &blocker in blockers {
+            edges.push(LockEdge {
+                waiter_pid: *waiter,
+                blocker_pid: i64::from(blocker),
+            });
+        }
+    }
+    by_ts
+        .into_iter()
+        .map(|(ts, edges)| LockSnapshot { ts, edges })
+        .collect()
 }
 
 fn capability_state(section: &'static str, rows: &[OutRow]) -> Option<CapabilityInputState> {
@@ -2014,5 +2154,164 @@ mod tests {
                 limit: 0,
             }
         ));
+    }
+
+    fn cell(name: &str, value: Value) -> (String, Value) {
+        (name.to_owned(), value)
+    }
+
+    fn activity_row(ts: i64, pid: i64, state: &str, xmin_age: i64, xact_start: i64) -> OutRow {
+        vec![
+            cell("ts", Value::Ts(ts)),
+            cell("pid", Value::I64(pid)),
+            cell("state", Value::Str(state.to_owned())),
+            cell("backend_xmin_age", Value::I64(xmin_age)),
+            cell("xact_start", Value::Ts(xact_start)),
+        ]
+    }
+
+    #[test]
+    fn activity_snapshots_group_rows_by_collection_time() {
+        let rows = vec![
+            activity_row(100, 1, "active", 5, 40),
+            activity_row(100, 2, "idle in transaction", 9, 30),
+            activity_row(200, 1, "active", 7, 150),
+        ];
+        let snapshots = build_activity_snapshots(&rows);
+        assert_eq!(snapshots.len(), 2, "two distinct timestamps, two snapshots");
+        assert_eq!(snapshots[0].ts, 100);
+        assert_eq!(snapshots[0].backends.len(), 2);
+        assert_eq!(snapshots[1].ts, 200);
+        assert_eq!(snapshots[1].backends.len(), 1);
+    }
+
+    #[test]
+    fn activity_backend_reads_labels_and_transaction_age() {
+        let mut row = activity_row(1_000, 7, "idle in transaction", 42, 400);
+        row.push(cell("wait_event_type", Value::Str("Client".to_owned())));
+        row.push(cell("wait_event", Value::Str("ClientRead".to_owned())));
+        let backend = activity_backend(&row, 1_000);
+        assert_eq!(backend.xmin_age, Some(42));
+        assert_eq!(backend.state.as_deref(), Some("idle in transaction"));
+        assert_eq!(backend.wait_event_type.as_deref(), Some("Client"));
+        assert_eq!(backend.wait_event.as_deref(), Some("ClientRead"));
+        assert_eq!(backend.xact_age_us, Some(600), "1000 - 400");
+    }
+
+    #[test]
+    fn activity_backend_drops_a_transaction_start_after_the_snapshot() {
+        // A start after the snapshot time is a clock disagreement, not a
+        // negative-duration transaction.
+        let backend = activity_backend(&activity_row(500, 1, "active", 3, 900), 500);
+        assert_eq!(backend.xact_age_us, None);
+    }
+
+    #[test]
+    fn activity_backend_maps_missing_fields_to_none() {
+        let row = vec![cell("ts", Value::Ts(1)), cell("pid", Value::I64(9))];
+        let backend = activity_backend(&row, 1);
+        assert_eq!(backend.xmin_age, None);
+        assert_eq!(backend.state, None);
+        assert_eq!(backend.wait_event, None);
+        assert_eq!(backend.xact_age_us, None);
+    }
+
+    #[test]
+    fn activity_rows_without_a_timestamp_are_dropped() {
+        let rows = vec![vec![
+            cell("pid", Value::I64(1)),
+            cell("state", Value::Str("active".to_owned())),
+        ]];
+        assert!(build_activity_snapshots(&rows).is_empty());
+    }
+
+    fn lock_row(ts: i64, pid: i64, blocked_by: Vec<i32>) -> OutRow {
+        vec![
+            cell("ts", Value::Ts(ts)),
+            cell("pid", Value::I64(pid)),
+            cell("blocked_by", Value::ListI32(blocked_by)),
+        ]
+    }
+
+    #[test]
+    fn lock_snapshots_expand_blocked_by_into_edges() {
+        let rows = vec![
+            lock_row(100, 10, vec![]),      // root: no edge
+            lock_row(100, 20, vec![10, 0]), // waiter blocked by pid 10 and a prepared xact
+        ];
+        let snapshots = build_lock_snapshots(&rows);
+        assert_eq!(snapshots.len(), 1, "root alone carries no edge snapshot");
+        assert_eq!(
+            snapshots[0].edges,
+            vec![
+                LockEdge {
+                    waiter_pid: 20,
+                    blocker_pid: 10,
+                },
+                LockEdge {
+                    waiter_pid: 20,
+                    blocker_pid: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn lock_snapshots_are_absent_without_contention() {
+        let rows = vec![lock_row(100, 10, vec![]), lock_row(100, 11, vec![])];
+        assert!(
+            build_lock_snapshots(&rows).is_empty(),
+            "only roots means no contention and no snapshot"
+        );
+    }
+
+    fn build_state(snapshot_rows: usize) -> BuildState {
+        let mut limits = InputLimits::for_test();
+        limits.snapshot_rows = snapshot_rows;
+        BuildState::new(&limits, limits.identity_bytes, Vec::new())
+    }
+
+    #[test]
+    fn a_section_within_the_row_ceiling_is_retained_whole() {
+        let mut state = build_state(10);
+        let rows = vec![
+            activity_row(100, 1, "active", 5, 40),
+            activity_row(100, 2, "active", 6, 40),
+        ];
+        state.retain_snapshots("pg_stat_activity", &rows);
+        assert_eq!(state.quality.snapshot_rows_withheld, 0);
+        assert_eq!(
+            state.typed.activity_window(i64::MIN, i64::MAX).count(),
+            1,
+            "one snapshot retained"
+        );
+    }
+
+    #[test]
+    fn a_section_over_the_row_ceiling_is_withheld_whole_and_counted() {
+        let mut state = build_state(1);
+        let rows = vec![
+            activity_row(100, 1, "active", 5, 40),
+            activity_row(100, 2, "active", 6, 40),
+        ];
+        state.retain_snapshots("pg_stat_activity", &rows);
+        assert_eq!(
+            state.quality.snapshot_rows_withheld, 2,
+            "two backends exceed the ceiling of one, so both are withheld"
+        );
+        assert_eq!(
+            state.typed.activity_window(i64::MIN, i64::MAX).count(),
+            0,
+            "nothing is sampled when the section does not fit"
+        );
+    }
+
+    #[test]
+    fn lock_edges_are_charged_against_the_row_ceiling() {
+        let mut state = build_state(1);
+        // One waiter blocked by two holders is two edges, over the ceiling of one.
+        state.retain_snapshots("pg_locks", &[lock_row(100, 20, vec![10, 30])]);
+        assert_eq!(state.quality.snapshot_rows_withheld, 2);
+        assert_eq!(state.typed.lock_window(i64::MIN, i64::MAX).count(), 0);
     }
 }

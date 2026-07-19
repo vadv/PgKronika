@@ -7,8 +7,8 @@ use super::dispatch::{LimitHit, SectionColumn};
 use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
-    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, Role, ThresholdKind,
+    ConfidenceCap, DirectEvidence, Evidence, FindingDraft, FindingScope, GaugeEntity,
+    GaugeEvidence, GaugeRatio, GaugeUnit, Role, ThresholdKind,
 };
 use super::gauge_contracts::{
     CgroupMemoryLens, FreezeHorizonLens, PhysicalReplicationLens, RunningVacuumLens,
@@ -16,7 +16,7 @@ use super::gauge_contracts::{
 };
 use super::lens::Lens;
 use super::series::SeriesSet;
-use super::typed::{GaugeObjective, TypedInputs};
+use super::typed::{ActivityBackend, ActivitySnapshot, GaugeObjective, TypedInputs};
 
 const PG_STAT_DATABASE: &str = "pg_stat_database";
 const PG_STAT_WAL: &str = "pg_stat_wal";
@@ -24,6 +24,8 @@ const CHECKPOINTER: &str = "pg_stat_bgwriter + pg_stat_checkpointer";
 const PG_STAT_IO: &str = "pg_stat_io";
 const PG_STAT_USER_TABLES: &str = "pg_stat_user_tables";
 const PG_STAT_ARCHIVER: &str = "pg_stat_archiver";
+const PG_STAT_ACTIVITY: &str = "pg_stat_activity";
+const PG_LOCKS: &str = "pg_locks";
 const OS_NETDEV: &str = "os_netdev";
 const OS_CGROUP_CPU: &str = "os_cgroup_cpu";
 const OS_MEMINFO: &str = "os_meminfo";
@@ -1064,6 +1066,333 @@ impl Lens for WritebackPressureLens {
     }
 }
 
+/// `PG-HORIZON-013` (`xmin_horizon_hold`): a backend pinning the vacuum horizon.
+/// Reports an amplifier when a sampled `pg_stat_activity` snapshot in the
+/// incident window holds an old `backend_xmin` while idle in transaction or in a
+/// long-running transaction. Snapshots between samples are unseen, so this is a
+/// sampled observation, not a proof; its confidence caps at medium and, without
+/// a structural direction, it never leads.
+pub(crate) struct XminHorizonHoldLens;
+
+impl XminHorizonHoldLens {
+    const ID: &'static str = "PG-HORIZON-013";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: PG_STAT_ACTIVITY,
+            column: "backend_xmin_age",
+        },
+        SectionColumn {
+            section: PG_STAT_ACTIVITY,
+            column: "xact_start",
+        },
+    ];
+    /// Below this xmin age the hold is ordinary transaction churn, not a horizon
+    /// a vacuum is waiting on.
+    const MIN_XMIN_AGE: i64 = 1_000_000;
+    /// A running (non-idle) transaction must be at least this old, in
+    /// microseconds, to count as a horizon-holding long transaction (5 minutes).
+    const MIN_LONG_XACT_US: i64 = 300_000_000;
+
+    fn holds_horizon(backend: &ActivityBackend) -> bool {
+        backend
+            .xmin_age
+            .is_some_and(|age| age >= Self::MIN_XMIN_AGE)
+            && (idle_in_transaction(backend.state.as_deref())
+                || backend
+                    .xact_age_us
+                    .is_some_and(|age| age >= Self::MIN_LONG_XACT_US))
+    }
+}
+
+impl Lens for XminHorizonHoldLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Medium
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        let Some(member) = activity_member(cluster) else {
+            return Ok(());
+        };
+        let (start, end) = (context.incident_start_us, context.incident_end_us);
+        sink.charge_points(activity_backends_examined(typed, start, end))?;
+        let holds = typed
+            .activity_window(start, end)
+            .any(|snapshot| snapshot.backends.iter().any(Self::holds_horizon));
+        if holds {
+            sink.emit(FindingDraft::new(
+                Role::Amplifier,
+                FindingScope::from_episode(member),
+                vec![Evidence::Gauge],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `PG-SYNC-018` (`sync_replication_wait`): backends parked on synchronous
+/// replication. Reports a coincident finding when a sampled `pg_stat_activity`
+/// snapshot in the incident window holds a backend on `wait_event='SyncRep'` —
+/// the wait itself means synchronous replication is configured and not
+/// acknowledging. Sampled, so its confidence caps at medium.
+pub(crate) struct SyncReplicationWaitLens;
+
+impl SyncReplicationWaitLens {
+    const ID: &'static str = "PG-SYNC-018";
+    const INPUTS: &'static [SectionColumn] = &[SectionColumn {
+        section: PG_STAT_ACTIVITY,
+        column: "wait_event",
+    }];
+    /// One backend held on `SyncRep` already means a synchronous standby is not
+    /// acknowledging commits.
+    const MIN_SYNCREP_BACKENDS: usize = 1;
+}
+
+impl Lens for SyncReplicationWaitLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Medium
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        let Some(member) = activity_member(cluster) else {
+            return Ok(());
+        };
+        let (start, end) = (context.incident_start_us, context.incident_end_us);
+        sink.charge_points(activity_backends_examined(typed, start, end))?;
+        let waiting = typed.activity_window(start, end).any(|snapshot| {
+            snapshot
+                .backends
+                .iter()
+                .filter(|backend| is_syncrep(backend.wait_event.as_deref()))
+                .count()
+                >= Self::MIN_SYNCREP_BACKENDS
+        });
+        if waiting {
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_episode(member),
+                vec![Evidence::Gauge],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `PG-WAIT-019` (`internal_wait_concentration`): active backends piling onto
+/// internal waits. Reports a coincident finding when a sampled
+/// `pg_stat_activity` snapshot in the incident window has at least half of its
+/// active backends on an `LWLock`, `BufferPin`, or `IO` wait. The design
+/// confidence is low, so its findings stay capped there.
+pub(crate) struct InternalWaitConcentrationLens;
+
+impl InternalWaitConcentrationLens {
+    const ID: &'static str = "PG-WAIT-019";
+    const INPUTS: &'static [SectionColumn] = &[SectionColumn {
+        section: PG_STAT_ACTIVITY,
+        column: "wait_event_type",
+    }];
+    /// A fraction over too few active backends is noise; require a floor so the
+    /// concentration is meaningful.
+    const MIN_ACTIVE: usize = 3;
+
+    /// Whether at least half of the snapshot's active backends wait on an
+    /// internal event. The `2 * internal >= active` form is the `>= 1/2`
+    /// threshold without floating point.
+    fn concentrated(snapshot: &ActivitySnapshot) -> bool {
+        let active = snapshot
+            .backends
+            .iter()
+            .filter(|backend| backend.state.as_deref() == Some("active"))
+            .count();
+        if active < Self::MIN_ACTIVE {
+            return false;
+        }
+        let internal = snapshot
+            .backends
+            .iter()
+            .filter(|backend| backend.state.as_deref() == Some("active"))
+            .filter(|backend| is_internal_wait(backend.wait_event_type.as_deref()))
+            .count();
+        internal.saturating_mul(2) >= active
+    }
+}
+
+impl Lens for InternalWaitConcentrationLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Low
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        let Some(member) = activity_member(cluster) else {
+            return Ok(());
+        };
+        let (start, end) = (context.incident_start_us, context.incident_end_us);
+        sink.charge_points(activity_backends_examined(typed, start, end))?;
+        let concentrated = typed.activity_window(start, end).any(Self::concentrated);
+        if concentrated {
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_episode(member),
+                vec![Evidence::Gauge],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `PG-LOCK-012` (`lock_wait_graph`): a sampled lock wait-for graph. Reports a
+/// lead when a `pg_locks` snapshot in the incident window carries a `blocked_by`
+/// edge — direct evidence of who held the lock a waiter awaited. The lock edge
+/// proves a structural direction, so this is the one lens that may lead and
+/// reach high confidence.
+pub(crate) struct LockWaitGraphLens;
+
+impl LockWaitGraphLens {
+    const ID: &'static str = "PG-LOCK-012";
+    const INPUTS: &'static [SectionColumn] = &[SectionColumn {
+        section: PG_LOCKS,
+        column: "blocked_by",
+    }];
+}
+
+impl Lens for LockWaitGraphLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::High
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        let Some(member) = cluster
+            .members
+            .iter()
+            .find(|member| member.logical_section == PG_LOCKS)
+        else {
+            return Ok(());
+        };
+        let (start, end) = (context.incident_start_us, context.incident_end_us);
+        let examined: usize = typed
+            .lock_window(start, end)
+            .map(|snapshot| snapshot.edges.len())
+            .sum();
+        sink.charge_points(examined)?;
+        let has_edge = typed
+            .lock_window(start, end)
+            .any(|snapshot| !snapshot.edges.is_empty());
+        if has_edge {
+            sink.emit(FindingDraft::new(
+                Role::Lead,
+                FindingScope::from_episode(member),
+                vec![Evidence::Direct(DirectEvidence::sampled_lock_edge())],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// The first `pg_stat_activity` episode of a cluster, or `None` when the section
+/// is not represented. The activity lenses report once per incident, scoped to
+/// this episode, rather than once per matching member.
+fn activity_member(cluster: &Cluster) -> Option<&super::model::EpisodeRefV1> {
+    cluster
+        .members
+        .iter()
+        .find(|member| member.logical_section == PG_STAT_ACTIVITY)
+}
+
+/// Total backends the activity lenses scan over the incident window, charged as
+/// work before analysis.
+fn activity_backends_examined(typed: &TypedInputs, start: i64, end: i64) -> usize {
+    typed
+        .activity_window(start, end)
+        .map(|snapshot| snapshot.backends.len())
+        .sum()
+}
+
+/// Whether a session state is an open but idle transaction, which pins the
+/// vacuum horizon without doing work.
+fn idle_in_transaction(state: Option<&str>) -> bool {
+    matches!(
+        state,
+        Some("idle in transaction" | "idle in transaction (aborted)")
+    )
+}
+
+/// Whether a wait event is the synchronous-replication commit wait.
+fn is_syncrep(wait_event: Option<&str>) -> bool {
+    wait_event == Some("SyncRep")
+}
+
+/// Whether a wait-event class is an internal (non-client) contention point.
+fn is_internal_wait(wait_event_type: Option<&str>) -> bool {
+    matches!(wait_event_type, Some("LWLock" | "BufferPin" | "IO"))
+}
+
 /// The lenses whose typed inputs are wired, applied to every request.
 pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
     vec![
@@ -1086,6 +1415,10 @@ pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
         Box::new(SlotRetentionLens),
         Box::new(CgroupMemoryLens),
         Box::new(StorageCapacityLens),
+        Box::new(XminHorizonHoldLens),
+        Box::new(SyncReplicationWaitLens),
+        Box::new(InternalWaitConcentrationLens),
+        Box::new(LockWaitGraphLens),
     ]
 }
 
@@ -1099,7 +1432,7 @@ mod tests {
     use super::super::evidence::Confidence;
     use super::*;
     use crate::incident::model::{EnrichedEpisode, EpisodeRefV1, IdentityValue};
-    use crate::incident::{ClockRelation, IncidentConfig, analyze};
+    use crate::incident::{ClockRelation, IncidentConfig, LockEdge, LockSnapshot, analyze};
     use kronika_analytics::{DiffPoint, Direction, Episode, Evaluated, Scalar};
 
     fn id() -> Arc<[IdentityValue]> {
@@ -1241,6 +1574,10 @@ mod tests {
                 "PG-SLOT-016",
                 "OS-CGMEM-023",
                 "OS-FS-027",
+                "PG-HORIZON-013",
+                "PG-SYNC-018",
+                "PG-WAIT-019",
+                "PG-LOCK-012",
             ]
         );
         let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
@@ -1971,10 +2308,11 @@ mod tests {
     }
 
     #[test]
-    fn ten_active_gauges_and_nine_counters_are_accounted_once() {
+    fn active_and_dormant_lenses_are_accounted_once() {
         let active = active_catalog_ids();
-        assert_eq!(active.len(), 19);
-        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 9);
+        // Nine counter, ten gauge, and four activity/lock lenses are wired.
+        assert_eq!(active.len(), 23);
+        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 5);
         let unique: std::collections::BTreeSet<_> = active.iter().copied().collect();
         assert_eq!(unique.len(), active.len());
     }
@@ -2008,5 +2346,270 @@ mod tests {
         assert_eq!(outcome.skipped[0].limit.axis, super::super::LimitAxis::Work);
         assert_eq!(outcome.skipped[0].limit.observed, 8);
         assert_eq!(outcome.skipped[0].limit.limit, 5);
+    }
+
+    fn base_backend() -> ActivityBackend {
+        ActivityBackend {
+            xmin_age: None,
+            state: None,
+            wait_event_type: None,
+            wait_event: None,
+            xact_age_us: None,
+        }
+    }
+
+    // A snapshot at ts=5 sits inside the run_lens episode window [0, 10].
+    fn activity_typed(backends: Vec<ActivityBackend>) -> TypedInputs {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(ActivitySnapshot { ts: 5, backends });
+        typed
+    }
+
+    fn run_activity(lens: &dyn Lens, typed: &TypedInputs) -> Vec<(Role, Confidence)> {
+        run_lens(lens, PG_STAT_ACTIVITY, "backend_xmin_age", typed)
+    }
+
+    #[test]
+    fn xmin_hold_reports_a_medium_amplifier_for_an_old_idle_transaction() {
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(2_000_000),
+            state: Some("idle in transaction".into()),
+            ..base_backend()
+        }]);
+        assert_eq!(
+            run_activity(&XminHorizonHoldLens, &typed),
+            vec![(Role::Amplifier, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn xmin_hold_reports_for_an_old_long_running_transaction() {
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(2_000_000),
+            state: Some("active".into()),
+            xact_age_us: Some(400_000_000),
+            ..base_backend()
+        }]);
+        assert_eq!(
+            run_activity(&XminHorizonHoldLens, &typed),
+            vec![(Role::Amplifier, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn xmin_hold_ignores_a_fresh_horizon() {
+        // Idle in transaction but a young xmin: ordinary churn, not a hold.
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(100),
+            state: Some("idle in transaction".into()),
+            ..base_backend()
+        }]);
+        assert!(run_activity(&XminHorizonHoldLens, &typed).is_empty());
+    }
+
+    #[test]
+    fn xmin_hold_ignores_an_active_short_transaction() {
+        // Old xmin, but a running query that just started holds no horizon yet.
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(2_000_000),
+            state: Some("active".into()),
+            xact_age_us: Some(1_000),
+            ..base_backend()
+        }]);
+        assert!(run_activity(&XminHorizonHoldLens, &typed).is_empty());
+    }
+
+    #[test]
+    fn xmin_hold_ignores_a_backend_without_an_assigned_xmin() {
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: None,
+            state: Some("idle in transaction".into()),
+            ..base_backend()
+        }]);
+        assert!(run_activity(&XminHorizonHoldLens, &typed).is_empty());
+    }
+
+    #[test]
+    fn xmin_hold_on_empty_input_reports_nothing() {
+        assert!(run_activity(&XminHorizonHoldLens, &TypedInputs::new()).is_empty());
+    }
+
+    #[test]
+    fn sync_replication_reports_a_medium_coincident_on_a_syncrep_wait() {
+        let typed = activity_typed(vec![ActivityBackend {
+            wait_event: Some("SyncRep".into()),
+            ..base_backend()
+        }]);
+        assert_eq!(
+            run_lens(
+                &SyncReplicationWaitLens,
+                PG_STAT_ACTIVITY,
+                "wait_event",
+                &typed
+            ),
+            vec![(Role::Coincident, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn sync_replication_ignores_other_waits() {
+        let typed = activity_typed(vec![ActivityBackend {
+            wait_event: Some("ClientRead".into()),
+            ..base_backend()
+        }]);
+        assert!(
+            run_lens(
+                &SyncReplicationWaitLens,
+                PG_STAT_ACTIVITY,
+                "wait_event",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn internal_wait_reports_a_low_coincident_when_active_backends_concentrate() {
+        // Three active backends, two on LWLock: 2*2 >= 3.
+        let lwlock = || ActivityBackend {
+            state: Some("active".into()),
+            wait_event_type: Some("LWLock".into()),
+            ..base_backend()
+        };
+        let running = ActivityBackend {
+            state: Some("active".into()),
+            ..base_backend()
+        };
+        let typed = activity_typed(vec![lwlock(), lwlock(), running]);
+        assert_eq!(
+            run_lens(
+                &InternalWaitConcentrationLens,
+                PG_STAT_ACTIVITY,
+                "wait_event_type",
+                &typed
+            ),
+            vec![(Role::Coincident, Confidence::LOW)]
+        );
+    }
+
+    #[test]
+    fn internal_wait_needs_a_floor_of_active_backends() {
+        // Two active backends both on LWLock is concentrated but below the floor.
+        let lwlock = || ActivityBackend {
+            state: Some("active".into()),
+            wait_event_type: Some("LWLock".into()),
+            ..base_backend()
+        };
+        let typed = activity_typed(vec![lwlock(), lwlock()]);
+        assert!(
+            run_lens(
+                &InternalWaitConcentrationLens,
+                PG_STAT_ACTIVITY,
+                "wait_event_type",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn internal_wait_ignores_a_low_fraction() {
+        // Four active backends, one on LWLock: 2*1 < 4.
+        let lwlock = ActivityBackend {
+            state: Some("active".into()),
+            wait_event_type: Some("LWLock".into()),
+            ..base_backend()
+        };
+        let running = || ActivityBackend {
+            state: Some("active".into()),
+            ..base_backend()
+        };
+        let typed = activity_typed(vec![lwlock, running(), running(), running()]);
+        assert!(
+            run_lens(
+                &InternalWaitConcentrationLens,
+                PG_STAT_ACTIVITY,
+                "wait_event_type",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    fn lock_typed(edges: Vec<LockEdge>) -> TypedInputs {
+        let mut typed = TypedInputs::new();
+        typed.insert_lock_snapshot(LockSnapshot { ts: 5, edges });
+        typed
+    }
+
+    #[test]
+    fn lock_wait_graph_leads_at_high_confidence_on_a_sampled_edge() {
+        let typed = lock_typed(vec![LockEdge {
+            waiter_pid: 20,
+            blocker_pid: 10,
+        }]);
+        let findings = run_lens(&LockWaitGraphLens, PG_LOCKS, "blocked_by", &typed);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].0, Role::Lead, "the lock edge proves direction");
+        assert_eq!(
+            findings[0].1.label(),
+            "high",
+            "direct edge evidence reaches high confidence"
+        );
+    }
+
+    #[test]
+    fn lock_wait_graph_without_edges_reports_nothing() {
+        // A pg_locks episode with no sampled edge is the honest boundary: the
+        // lens is active but has no direct evidence to stand on.
+        assert!(
+            run_lens(
+                &LockWaitGraphLens,
+                PG_LOCKS,
+                "blocked_by",
+                &lock_typed(vec![])
+            )
+            .is_empty()
+        );
+        assert!(
+            run_lens(
+                &LockWaitGraphLens,
+                PG_LOCKS,
+                "blocked_by",
+                &TypedInputs::new()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_lens_ignores_a_cluster_without_its_section() {
+        // An activity snapshot is present, but the incident is on another
+        // section, so the activity lens never fires.
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(2_000_000),
+            state: Some("idle in transaction".into()),
+            ..base_backend()
+        }]);
+        assert!(run_lens(&XminHorizonHoldLens, PG_STAT_DATABASE, "blks_read", &typed).is_empty());
+    }
+
+    #[test]
+    fn wait_classifiers_cover_their_event_sets() {
+        assert!(is_syncrep(Some("SyncRep")));
+        assert!(!is_syncrep(Some("ClientRead")));
+        assert!(!is_syncrep(None));
+
+        for internal in ["LWLock", "BufferPin", "IO"] {
+            assert!(is_internal_wait(Some(internal)), "{internal} is internal");
+        }
+        assert!(!is_internal_wait(Some("Client")), "client wait is external");
+        assert!(!is_internal_wait(None));
+
+        for idle in ["idle in transaction", "idle in transaction (aborted)"] {
+            assert!(idle_in_transaction(Some(idle)), "{idle} pins the horizon");
+        }
+        assert!(!idle_in_transaction(Some("active")));
+        assert!(!idle_in_transaction(None));
     }
 }

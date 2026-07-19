@@ -18,7 +18,10 @@ mod typed;
 // so the reader-facing input surface and the engine entry point are exported.
 pub(crate) use model::{EnrichedEpisode, EpisodeRefV1, IdentityValue};
 pub(crate) use series::{Series, SeriesError, SeriesInsertError, SeriesSet};
-pub(crate) use typed::{GaugeQuality, GaugeTrackInput, TypedInputs};
+pub(crate) use typed::{
+    ActivityBackend, ActivitySnapshot, GaugeQuality, GaugeTrackInput, LockEdge, LockSnapshot,
+    TypedInputs,
+};
 
 pub(crate) use active::{active_catalog, active_catalog_ids};
 pub(crate) use dispatch::LimitAxis;

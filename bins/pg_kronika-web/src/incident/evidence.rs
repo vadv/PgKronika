@@ -82,8 +82,10 @@ enum DirectEvidenceKind {
 }
 
 impl DirectEvidence {
-    #[cfg(test)]
-    const fn sampled_lock_edge() -> Self {
+    /// A sampled `pg_locks` blocking edge: `blocked_by` names who held the lock
+    /// the waiter awaited. The one direct evidence that proves a structural
+    /// direction, so a lock lens may lead or trail and reach high confidence.
+    pub(crate) const fn sampled_lock_edge() -> Self {
         Self {
             kind: DirectEvidenceKind::SampledLockEdge,
         }

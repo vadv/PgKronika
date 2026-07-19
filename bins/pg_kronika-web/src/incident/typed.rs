@@ -1,4 +1,4 @@
-//! Typed counter and gauge evidence forwarded to lenses.
+//! Typed counter, gauge, and snapshot evidence forwarded to lenses.
 //!
 //! Anomaly episodes only locate an incident; a finding needs the underlying
 //! values. This holds the per-column counter diffs the reader already
@@ -7,6 +7,11 @@
 //! anomaly, or a disabled source).
 //!
 //! Gauges are instantaneous levels, so they are indexed without differencing.
+//! Beside the counter and gauge timelines it carries the raw multi-row snapshots the
+//! activity and lock lenses read: `pg_stat_activity` backends and `pg_locks`
+//! blocking edges captured at each collection time. A snapshot is a moment, not
+//! a rated timeline, so a lens over it reports a sampled observation, never a
+//! direction inferred from a trend.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -426,11 +431,59 @@ impl TripleGaugeWindow<'_> {
     }
 }
 
-/// Typed counter and gauge series for one analysis request, keyed by
-/// `(section, column, identity)`.
+/// One `pg_stat_activity` backend, reduced to the fields the sampled activity
+/// lenses read. Text labels are resolved dictionary strings; `None` mirrors the
+/// view's own `NULL` — a background backend, a backend that is not waiting, or
+/// one with no assigned xmin.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActivityBackend {
+    /// `age(backend_xmin)` in transactions; `Some` only while the backend pins
+    /// the vacuum horizon.
+    pub xmin_age: Option<i64>,
+    /// Session state (`active`, `idle in transaction`, …).
+    pub state: Option<Box<str>>,
+    /// Wait-event class (`LWLock`, `IO`, `BufferPin`, …); `None` when the
+    /// backend is not waiting.
+    pub wait_event_type: Option<Box<str>>,
+    /// Wait-event name (`SyncRep`, …); `None` when the backend is not waiting.
+    pub wait_event: Option<Box<str>>,
+    /// Open-transaction age at snapshot time, microseconds; `None` outside a
+    /// transaction or when the clock disagrees (`xact_start` after the snapshot).
+    pub xact_age_us: Option<i64>,
+}
+
+/// A `pg_stat_activity` snapshot: the backends captured at one collection time.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActivitySnapshot {
+    pub ts: i64,
+    pub backends: Vec<ActivityBackend>,
+}
+
+/// One directed blocking edge from a `pg_locks` snapshot: `waiter_pid` waits on
+/// `blocker_pid`. A `blocker_pid` of `0` is a prepared-transaction holder with
+/// no live backend (`pg_blocking_pids` reports it as `0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LockEdge {
+    pub waiter_pid: i64,
+    pub blocker_pid: i64,
+}
+
+/// A `pg_locks` snapshot: the blocking edges captured at one collection time.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LockSnapshot {
+    pub ts: i64,
+    pub edges: Vec<LockEdge>,
+}
+
+/// Typed evidence for one analysis request: counter series and instantaneous
+/// gauge series keyed by `(section, column, identity)`, plus the activity and
+/// lock snapshots the sampled lenses read, each list in ascending collection
+/// time.
 pub(crate) struct TypedInputs {
     counters: BTreeMap<TrackKey, CounterTrack>,
     gauges: GaugeTracks,
+    activity: Vec<ActivitySnapshot>,
+    locks: Vec<LockSnapshot>,
 }
 
 impl TypedInputs {
@@ -438,6 +491,8 @@ impl TypedInputs {
         Self {
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
+            activity: Vec::new(),
+            locks: Vec::new(),
         }
     }
 
@@ -722,6 +777,40 @@ impl TypedInputs {
             );
         }
         Some(GaugeSnapshotWindow { tracks })
+    }
+
+    /// Append one `pg_stat_activity` snapshot. The adapter feeds snapshots in
+    /// ascending collection time; `activity_window` filters by that time and
+    /// does not depend on the order.
+    pub(crate) fn insert_activity_snapshot(&mut self, snapshot: ActivitySnapshot) {
+        self.activity.push(snapshot);
+    }
+
+    /// Append one `pg_locks` snapshot, in ascending collection time.
+    pub(crate) fn insert_lock_snapshot(&mut self, snapshot: LockSnapshot) {
+        self.locks.push(snapshot);
+    }
+
+    /// Activity snapshots whose collection time lies inside `[from_us, to_us]`.
+    pub(crate) fn activity_window(
+        &self,
+        from_us: i64,
+        to_us: i64,
+    ) -> impl Iterator<Item = &ActivitySnapshot> {
+        self.activity
+            .iter()
+            .filter(move |snapshot| (from_us..=to_us).contains(&snapshot.ts))
+    }
+
+    /// Lock snapshots whose collection time lies inside `[from_us, to_us]`.
+    pub(crate) fn lock_window(
+        &self,
+        from_us: i64,
+        to_us: i64,
+    ) -> impl Iterator<Item = &LockSnapshot> {
+        self.locks
+            .iter()
+            .filter(move |snapshot| (from_us..=to_us).contains(&snapshot.ts))
     }
 }
 
@@ -1193,5 +1282,68 @@ mod tests {
                 .gauge_window("slot", "retained", &id(1), 0, 30)
                 .is_none()
         );
+    }
+
+    fn backend(state: &str) -> ActivityBackend {
+        ActivityBackend {
+            xmin_age: None,
+            state: Some(state.into()),
+            wait_event_type: None,
+            wait_event: None,
+            xact_age_us: None,
+        }
+    }
+
+    fn activity_at(ts: i64, state: &str) -> ActivitySnapshot {
+        ActivitySnapshot {
+            ts,
+            backends: vec![backend(state)],
+        }
+    }
+
+    #[test]
+    fn activity_window_keeps_only_snapshots_inside_the_inclusive_bounds() {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(activity_at(5, "before"));
+        typed.insert_activity_snapshot(activity_at(10, "start"));
+        typed.insert_activity_snapshot(activity_at(15, "inside"));
+        typed.insert_activity_snapshot(activity_at(20, "end"));
+        typed.insert_activity_snapshot(activity_at(25, "after"));
+
+        let states: Vec<_> = typed
+            .activity_window(10, 20)
+            .map(|snapshot| snapshot.backends[0].state.as_deref().expect("state"))
+            .collect();
+        assert_eq!(states, ["start", "inside", "end"], "bounds are inclusive");
+    }
+
+    #[test]
+    fn lock_window_selects_snapshots_by_collection_time() {
+        let edge = LockEdge {
+            waiter_pid: 20,
+            blocker_pid: 10,
+        };
+        let mut typed = TypedInputs::new();
+        typed.insert_lock_snapshot(LockSnapshot {
+            ts: 5,
+            edges: vec![edge],
+        });
+        typed.insert_lock_snapshot(LockSnapshot {
+            ts: 12,
+            edges: vec![edge],
+        });
+
+        let times: Vec<_> = typed
+            .lock_window(10, 20)
+            .map(|snapshot| snapshot.ts)
+            .collect();
+        assert_eq!(times, [12]);
+    }
+
+    #[test]
+    fn empty_inputs_expose_no_snapshots() {
+        let typed = TypedInputs::new();
+        assert_eq!(typed.activity_window(i64::MIN, i64::MAX).count(), 0);
+        assert_eq!(typed.lock_window(i64::MIN, i64::MAX).count(), 0);
     }
 }
