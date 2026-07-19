@@ -15,6 +15,14 @@ impl Confidence {
     const fn high() -> Self {
         Self(2)
     }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self.0 {
+            0 => "low",
+            1 => "medium",
+            _ => "high",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +56,17 @@ pub(crate) enum Role {
     Amplifier,
     Downstream,
     Coincident,
+}
+
+impl Role {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Lead => "lead",
+            Self::Amplifier => "amplifier",
+            Self::Downstream => "downstream",
+            Self::Coincident => "coincident",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -98,6 +117,16 @@ impl Evidence {
     const fn proves_structural_direction(&self) -> bool {
         matches!(self, Self::Direct(direct) if direct.proves_structural_direction())
     }
+
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Direct(_) => "direct",
+            Self::Ratio => "ratio",
+            Self::Gauge => "gauge",
+            Self::Counter => "counter",
+            Self::Event => "event",
+        }
+    }
 }
 
 fn evidence_ceiling(evidence: &[Evidence]) -> Confidence {
@@ -124,6 +153,18 @@ impl FindingScope {
             column: reference.column,
             identity: Arc::clone(&reference.identity),
         }
+    }
+
+    pub(crate) const fn logical_section(&self) -> &'static str {
+        self.logical_section
+    }
+
+    pub(crate) const fn column(&self) -> &'static str {
+        self.column
+    }
+
+    pub(crate) fn identity(&self) -> &[IdentityValue] {
+        &self.identity
     }
 }
 
