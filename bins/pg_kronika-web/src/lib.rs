@@ -927,6 +927,19 @@ mod tests {
         rows
     }
 
+    /// The active lens ids the incidents endpoint advertises, in catalog order.
+    const ACTIVE_LENS_IDS: [&str; 9] = [
+        "PG-CACHE-010",
+        "PG-WAL-009",
+        "PG-TEMP-003",
+        "PG-CHKPT-008",
+        "PG-IO-011",
+        "PG-HOT-007",
+        "PG-ARCH-017",
+        "OS-NET-028",
+        "OS-CGRP-021",
+    ];
+
     #[tokio::test]
     async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
         let to = 39 * 60 * 1_000_000;
@@ -977,12 +990,12 @@ mod tests {
         assert_eq!(body["catalog"]["diagnosis_available"], true);
         assert_eq!(
             body["catalog"]["applied"],
-            serde_json::json!(["PG-CACHE-010"])
+            serde_json::json!(ACTIVE_LENS_IDS)
         );
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 27);
+        assert_eq!(dormant.len(), 19, "28 catalog lenses minus 9 active");
         assert!(
             dormant
                 .iter()

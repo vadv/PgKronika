@@ -312,6 +312,19 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// The active lens ids in catalog order, mirrored from [`active_catalog`].
+    const APPLIED_IDS: [&str; 9] = [
+        "PG-CACHE-010",
+        "PG-WAL-009",
+        "PG-TEMP-003",
+        "PG-CHKPT-008",
+        "PG-IO-011",
+        "PG-HOT-007",
+        "PG-ARCH-017",
+        "OS-NET-028",
+        "OS-CGRP-021",
+    ];
+
     const MAX_ENTRY_JSON_BYTES: usize = 256
         + 2 * crate::incident::MAX_CATALOG_TOKEN_BYTES
         + 2 * crate::incident::MAX_CATALOG_TEXT_BYTES
@@ -360,7 +373,7 @@ mod tests {
         let catalog = catalog_to_json();
         assert_eq!(catalog, catalog_to_json());
         let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
-        assert_eq!(bytes.len(), 12_136);
+        assert_eq!(bytes.len(), 8_730);
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
         assert!(catalog.get("log_dormant").is_none());
         let entry = &catalog["dormant"][11];
@@ -413,7 +426,7 @@ mod tests {
         assert!(body["skipped"].get("sections").is_some());
         assert_eq!(body["catalog"]["status"], "partial");
         assert_eq!(body["catalog"]["diagnosis_available"], true);
-        assert_eq!(body["catalog"]["applied"], json!(["PG-CACHE-010"]));
+        assert_eq!(body["catalog"]["applied"], json!(APPLIED_IDS));
         assert!(
             body["catalog"]["dormant"]
                 .as_array()
@@ -457,7 +470,7 @@ mod tests {
         assert_eq!(body["complete"], false);
         assert_eq!(body["analysis_status"], "partial");
         assert_eq!(body["catalog"]["status"], "partial");
-        assert_eq!(body["catalog"]["applied"], json!(["PG-CACHE-010"]));
+        assert_eq!(body["catalog"]["applied"], json!(APPLIED_IDS));
         assert_eq!(
             body["skipped"]["sections"][0]["reason"]["kind"],
             "incomplete_page",
@@ -522,11 +535,11 @@ mod tests {
         assert_eq!(body["incidents"][0]["evaluation_complete"], true);
         assert_eq!(body["catalog"]["status"], "partial");
         assert_eq!(body["catalog"]["diagnosis_available"], true);
-        assert_eq!(body["catalog"]["applied"], json!(["PG-CACHE-010"]));
+        assert_eq!(body["catalog"]["applied"], json!(APPLIED_IDS));
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 27);
+        assert_eq!(dormant.len(), 28 - APPLIED_IDS.len());
         let lock = dormant
             .iter()
             .find(|entry| entry["lens_id"] == "PG-LOCK-012")
