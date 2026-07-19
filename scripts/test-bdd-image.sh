@@ -594,6 +594,8 @@ test_github_actions_bdd_uses_fast_runtime_default() {
     || fail "GitHub Actions must check the runtime before BDD"
   grep -F -- 'ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-${deps_hash}' "$workflow" >/dev/null \
     || fail "GitHub Actions must use the flat PR80 builder tag family"
+  grep -F -- 'docker pull "$builder"' "$workflow" >/dev/null \
+    || fail "GitHub Actions must verify anonymous builder pulls"
 }
 
 for test in \

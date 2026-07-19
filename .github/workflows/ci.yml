@@ -183,7 +183,10 @@ jobs:
       - name: Verify anonymous cache access
         if: needs.bdd-meta.outputs.can_push == 'true' && steps.final_image.outputs.exists != 'true'
         run: |
+          builder="${{ needs.bdd-meta.outputs.builder }}"
           image="${{ needs.bdd-meta.outputs.image }}"
           docker logout ghcr.io
+          docker manifest inspect "$builder" >/dev/null
+          docker pull "$builder"
           docker manifest inspect "$image" >/dev/null
           docker pull "$image"
