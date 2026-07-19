@@ -23,7 +23,7 @@ pub(crate) enum MissingCapability {
     LockSnapshotCoverage,
     ActivityRows,
     PidCgroupMapping,
-    LogEvents,
+    IncidentLogEventInput,
     LogDetailContinuation,
     LogCaptureCoverage,
 }
@@ -43,7 +43,7 @@ impl MissingCapability {
             Self::LockSnapshotCoverage => "lock_snapshot_coverage",
             Self::ActivityRows => "sampled_activity_rows",
             Self::PidCgroupMapping => "pid_cgroup_mapping",
-            Self::LogEvents => "typed_log_events",
+            Self::IncidentLogEventInput => "incident_log_event_input",
             Self::LogDetailContinuation => "log_detail_continuation",
             Self::LogCaptureCoverage => "log_capture_coverage",
         }
@@ -142,7 +142,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -171,7 +171,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -185,7 +185,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -214,7 +214,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::SourcePeriod,
             Missing::InputCoverage,
         ],
@@ -475,7 +475,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::EntityJoin,
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::SourcePeriod,
             Missing::InputCoverage,
         ],
@@ -512,7 +512,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Был ли backend завершён сигналом 9? Жертва kernel-OOM — отдельный сигнал, signal 9 её не доказывает.",
         confidence: ConfidenceCap::High,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::LogDetailContinuation,
             Missing::EntityJoin,
             Missing::SourcePeriod,
@@ -525,7 +525,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Упал ли backend по сигналу (SIGSEGV/SIGABRT) с каскадом восстановления?",
         confidence: ConfidenceCap::High,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::LogDetailContinuation,
             Missing::SourcePeriod,
         ],
@@ -536,7 +536,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         title: "PANIC / аварийная остановка",
         detects: "Была ли запись severity PANIC и отдельный crash/restart? Не помечает повреждение данных автоматически.",
         confidence: ConfidenceCap::High,
-        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+        missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
     },
     DormantLens {
         lens_id: "disk_full_log",
@@ -545,7 +545,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Отказала ли запись из-за ENOSPC?",
         confidence: ConfidenceCap::High,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
         ],
@@ -557,7 +557,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Отказала ли аллокация PostgreSQL (SQLSTATE 53200)? Это ошибка аллокатора, не исчерпание физической RAM.",
         confidence: ConfidenceCap::High,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
         ],
@@ -569,7 +569,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Отклонялись ли подключения по лимиту?",
         confidence: ConfidenceCap::High,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
         ],
@@ -581,7 +581,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Обнаружил ли PostgreSQL цикл блокировок с жертвой? Факт события, не доказанная причина инцидента.",
         confidence: ConfidenceCap::High,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::LogDetailContinuation,
             Missing::EntityJoin,
             Missing::SourcePeriod,
@@ -594,7 +594,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Дала ли сбой завершённая проверка checksum/страницы? Не generic ошибка чтения или I/O.",
         confidence: ConfidenceCap::High,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::LogDetailContinuation,
             Missing::EntityJoin,
             Missing::SourcePeriod,
@@ -608,7 +608,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Кто и как долго ждал блокировку до её выдачи?",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::LogCaptureCoverage,
             Missing::SourcePeriod,
@@ -621,7 +621,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Отменялись ли запросы по `lock_timeout`? Факт отмены, не доказанная причина инцидента.",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
         ],
@@ -633,7 +633,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Упирались ли запросы в `statement_timeout`? Факт отмены; таймаут не доказывает медленный сервер.",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::LogDetailContinuation,
             Missing::SourcePeriod,
@@ -646,7 +646,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Сливались ли сортировки/хеши в temp-файлы, какого размера?",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::LogCaptureCoverage,
             Missing::SourcePeriod,
@@ -659,7 +659,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Превышен ли настроенный порог длительности конкретным запросом? Сам по себе не аномалия.",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::LogCaptureCoverage,
             Missing::SourcePeriod,
@@ -671,7 +671,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         title: "Сбой сериализации транзакций",
         detects: "Всплеск ли откатов по конфликту сериализации?",
         confidence: ConfidenceCap::Medium,
-        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+        missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
     },
     DormantLens {
         lens_id: "idle_in_transaction_abort",
@@ -680,7 +680,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Убивались ли зависшие в транзакции сессии?",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
         ],
@@ -692,7 +692,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         title: "Слишком частые контрольные точки",
         detects: "Форсирует ли WAL-давление внеплановые чекпоинты?",
         confidence: ConfidenceCap::Medium,
-        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+        missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
     },
     DormantLens {
         lens_id: "aggressive_autovacuum_wraparound",
@@ -701,7 +701,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Запускался ли аварийный anti-wraparound freeze?",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
         ],
@@ -713,7 +713,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Отменяется ли autovacuum конфликтующими локами (DDL)?",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
         ],
@@ -725,7 +725,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Всплеск ли отказов аутентификации по паролю?",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::LogCaptureCoverage,
             Missing::SourcePeriod,
         ],
@@ -736,7 +736,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         title: "Отказы по pg_hba",
         detects: "Стучится ли неизвестный хост/БД/пользователь мимо pg_hba?",
         confidence: ConfidenceCap::Medium,
-        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+        missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
     },
     DormantLens {
         lens_id: "permission_denied_burst",
@@ -744,7 +744,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         title: "Всплеск отказов доступа (RBAC)",
         detects: "Всплеск ли `permission denied` (обычно кривой деплой грантов)?",
         confidence: ConfidenceCap::Low,
-        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+        missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
     },
     DormantLens {
         lens_id: "connection_storm_log",
@@ -753,7 +753,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Резкий churn коннектов без упора в лимит?",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::LogCaptureCoverage,
             Missing::EntityJoin,
             Missing::SourcePeriod,
@@ -766,7 +766,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Почему падает архивация WAL (exit-код, stderr)?",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
         ],
@@ -778,7 +778,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Оборвался ли поток репликации? Событие для стороны: walsender на primary, walreceiver на standby.",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::EntityJoin,
             Missing::SourcePeriod,
         ],
@@ -790,7 +790,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         detects: "Отменяются ли запросы на реплике конфликтом с replay?",
         confidence: ConfidenceCap::Medium,
         missing: &[
-            Missing::LogEvents,
+            Missing::IncidentLogEventInput,
             Missing::LogDetailContinuation,
             Missing::SourcePeriod,
         ],
@@ -801,7 +801,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         title: "Проблемы целостности WAL",
         detects: "Сбой валидации WAL из archive/stream? Локальный конец WAL (invalid record length в pg_wal) легитимен, не finding.",
         confidence: ConfidenceCap::High,
-        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+        missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
     },
 ];
 
@@ -993,6 +993,10 @@ mod tests {
 
     #[test]
     fn log_capability_tokens_are_stable() {
+        assert_eq!(
+            Missing::IncidentLogEventInput.as_str(),
+            "incident_log_event_input"
+        );
         assert_eq!(
             Missing::LogDetailContinuation.as_str(),
             "log_detail_continuation"

@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(
             oom["awaiting"],
             json!([
-                "typed_log_events",
+                "incident_log_event_input",
                 "log_detail_continuation",
                 "cross_section_entity_join",
                 "source_period_provenance"
