@@ -7,6 +7,7 @@ mod cluster;
 mod dispatch;
 mod engine;
 mod evidence;
+mod gauge_contracts;
 mod lens;
 mod lenses;
 mod model;

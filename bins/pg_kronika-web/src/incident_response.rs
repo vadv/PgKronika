@@ -10,7 +10,7 @@ use crate::incident::{
     DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, Evidence, Finding, GaugeMeasurement,
     IdentityValue, Incident, LimitAxis,
 };
-use crate::incident_input::{InputQuality, SectionSkip, SkipReason};
+use crate::incident_input::{CapabilityInputState, InputQuality, SectionSkip, SkipReason};
 
 pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<u64>) -> Value {
     let quality = InputQuality::default();
@@ -24,7 +24,7 @@ pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<
         "incidents": Value::Array(Vec::new()),
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(),
+        "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
         "data_quality": quality_to_json(&quality, "unknown"),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some("no_data")),
     })
@@ -47,12 +47,16 @@ pub(crate) fn identity_response(
         "incidents": Value::Array(Vec::new()),
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(),
+        "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
         "data_quality": quality_to_json(&quality, reason),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some(reason)),
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "transport adapter receives bounded domain, coverage, and capability results"
+)]
 pub(crate) fn build_response(
     source: u64,
     scan: &ScanParams,
@@ -61,6 +65,7 @@ pub(crate) fn build_response(
     coverage: &BTreeMap<&'static str, Vec<Gap>>,
     quality: &InputQuality,
     input_skipped: &[SectionSkip],
+    capability_by_section: &BTreeMap<&'static str, CapabilityInputState>,
 ) -> Value {
     let incidents: Vec<Value> = outcome.incidents.iter().map(incident_to_json).collect();
     let clustering_complete = input_skipped.is_empty() && quality.episodes_truncated == 0;
@@ -84,7 +89,7 @@ pub(crate) fn build_response(
         "incidents": incidents,
         "coverage_by_section": coverage_to_json(coverage),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(),
+        "catalog": catalog_to_json(Some(coverage), input_skipped, capability_by_section),
         "data_quality": quality_to_json(quality, "available"),
         "skipped": skipped_to_json(
             input_skipped,
@@ -149,6 +154,22 @@ fn evidence_to_json(evidence: &Evidence) -> Value {
             "denominator": denominator.get(),
             "value": numerator.get() / denominator.get(),
             "operand_unit": operand_unit.label(),
+            "headroom": denominator.get() - numerator.get(),
+        }),
+        GaugeMeasurement::Trend {
+            first,
+            last,
+            elapsed_us,
+            operand_unit,
+        } => json!({
+            "kind": "trend",
+            "first": first.get(),
+            "last": last.get(),
+            "change": last.get() - first.get(),
+            "elapsed_us": elapsed_us,
+            "value": (last.get() - first.get())
+                / std::time::Duration::from_micros(*elapsed_us).as_secs_f64(),
+            "operand_unit": operand_unit.label(),
         }),
     };
     let entity: Vec<Value> = gauge
@@ -195,17 +216,92 @@ fn identity_to_json(value: &IdentityValue) -> Value {
     }
 }
 
-fn catalog_to_json() -> Value {
+const CONTRACT_CAPABILITIES: &[(&str, &str)] = &[
+    ("PG-VACUUM-005", "pg_vacuum_observation"),
+    ("PG-FREEZE-006", "pg_freeze_horizon"),
+    ("PG-REPL-015", "pg_replication_physical"),
+    ("PG-SLOT-016", "pg_replication_slot_retention"),
+    ("OS-CGMEM-023", "pg_process_cgroup_memory"),
+    ("OS-FS-027", "pg_storage_mount"),
+];
+
+fn catalog_to_json(
+    coverage: Option<&BTreeMap<&'static str, Vec<Gap>>>,
+    input_skipped: &[SectionSkip],
+    capability_by_section: &BTreeMap<&'static str, CapabilityInputState>,
+) -> Value {
     let applied_ids = crate::incident::active_catalog_ids();
     let applied: Vec<Value> = applied_ids.iter().copied().map(Value::from).collect();
+    let capabilities: Vec<Value> = CONTRACT_CAPABILITIES
+        .iter()
+        .map(|&(lens_id, section)| {
+            if let Some(skip) = input_skipped.iter().find(|skip| skip.section == section) {
+                return json!({
+                    "lens_id": lens_id,
+                    "section": section,
+                    "status": "partial",
+                    "reason": skip_reason_label(skip.reason),
+                });
+            }
+            if let Some(state) = capability_by_section.get(section) {
+                match state {
+                    CapabilityInputState::NotCollected => {
+                        return json!({
+                            "lens_id": lens_id,
+                            "section": section,
+                            "status": "not_collected",
+                            "reason": "producer_unavailable",
+                        });
+                    }
+                    CapabilityInputState::Partial => {
+                        return json!({
+                            "lens_id": lens_id,
+                            "section": section,
+                            "status": "partial",
+                            "reason": "provenance_or_input_missing",
+                        });
+                    }
+                    CapabilityInputState::Available => {}
+                }
+            }
+            let Some(gaps) = coverage.and_then(|sections| sections.get(section)) else {
+                return json!({
+                    "lens_id": lens_id,
+                    "section": section,
+                    "status": "not_collected",
+                    "reason": "section_absent",
+                });
+            };
+            json!({
+                "lens_id": lens_id,
+                "section": section,
+                "status": if gaps.is_empty() { "available" } else { "partial" },
+                "reason": if gaps.is_empty() { "complete_coverage" } else { "coverage_gap" },
+                "gap_count": gaps.len(),
+            })
+        })
+        .collect();
     json!({
         "status": "partial",
         "requirements_status": "incomplete",
         "diagnosis_available": !applied.is_empty(),
         "scope": "diagnostic_lenses",
         "applied": applied,
+        "capabilities": capabilities,
         "dormant": dormant_entries(crate::incident::dormant_catalog(), &applied_ids),
     })
+}
+
+const fn skip_reason_label(reason: SkipReason) -> &'static str {
+    match reason {
+        SkipReason::MaterializationLimit { .. } => "materialization_limit",
+        SkipReason::IncompletePage => "incomplete_page",
+        SkipReason::ScanBudget { .. } => "scan_budget",
+        SkipReason::ConflictingTimestamp { .. } => "conflicting_timestamp",
+        SkipReason::IdentityByteLimit { .. } => "identity_byte_limit",
+        SkipReason::SeriesPointLimit { .. } => "series_point_limit",
+        SkipReason::TypedGaugePointLimit { .. } => "typed_gauge_point_limit",
+    }
 }
 
 fn dormant_entries(catalog: &'static [DormantLens], applied: &[&'static str]) -> Vec<Value> {
@@ -358,7 +454,7 @@ mod tests {
     use super::*;
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
-    const APPLIED_IDS: [&str; 13] = [
+    const APPLIED_IDS: [&str; 19] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -372,6 +468,12 @@ mod tests {
         "PG-CONN-014",
         "OS-MEM-022",
         "OS-WB-025",
+        "PG-VACUUM-005",
+        "PG-FREEZE-006",
+        "PG-REPL-015",
+        "PG-SLOT-016",
+        "OS-CGMEM-023",
+        "OS-FS-027",
     ];
 
     const MAX_ENTRY_JSON_BYTES: usize = 256
@@ -420,8 +522,8 @@ mod tests {
 
     #[test]
     fn catalog_json_stays_within_its_static_budget() {
-        let catalog = catalog_to_json();
-        assert_eq!(catalog, catalog_to_json());
+        let catalog = catalog_to_json(None, &[], &BTreeMap::new());
+        assert_eq!(catalog, catalog_to_json(None, &[], &BTreeMap::new()));
         let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
         assert!(!bytes.is_empty());
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
@@ -515,6 +617,7 @@ mod tests {
                 section: "pg_stat_archiver",
                 reason: SkipReason::IncompletePage,
             }],
+            &BTreeMap::new(),
         );
         assert_eq!(body["clustering_complete"], false);
         assert_eq!(body["complete"], false);
@@ -540,7 +643,16 @@ mod tests {
             ..InputQuality::default()
         };
 
-        let body = build_response(7, &scan(), None, &outcome, &BTreeMap::new(), &quality, &[]);
+        let body = build_response(
+            7,
+            &scan(),
+            None,
+            &outcome,
+            &BTreeMap::new(),
+            &quality,
+            &[],
+            &BTreeMap::new(),
+        );
 
         assert_eq!(body["clustering_complete"], true);
         assert_eq!(body["analysis_status"], "partial");
@@ -598,6 +710,7 @@ mod tests {
             &BTreeMap::new(),
             &InputQuality::default(),
             &[],
+            &BTreeMap::new(),
         );
 
         assert_eq!(body["incidents"][0]["findings"], json!([]));
@@ -722,6 +835,7 @@ mod tests {
             &BTreeMap::new(),
             &InputQuality::default(),
             &[],
+            &BTreeMap::new(),
         );
         let finding = &body["incidents"][0]["findings"][0];
         assert_eq!(finding["lens_id"], "PG-CACHE-010");

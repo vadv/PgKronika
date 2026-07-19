@@ -240,7 +240,7 @@ pub struct PgReplicationSlotRetentionV3 {
     pub invalidation_code: u8,
 }
 
-/// Redacted mapping from a PostgreSQL storage role to a proven local mount.
+/// Redacted mapping from a `PostgreSQL` storage role to a proven local mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(
     id = 1_036_001,
@@ -273,7 +273,7 @@ pub struct PgStorageMountV1 {
     pub available_bytes: Option<i64>,
 }
 
-/// Redacted, race-checked PostgreSQL process to cgroup-memory observation.
+/// Redacted, race-checked `PostgreSQL` process to cgroup-memory observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(
     id = 1_037_001,

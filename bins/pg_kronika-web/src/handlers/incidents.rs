@@ -255,6 +255,7 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
         &prepared.coverage_by_section,
         &prepared.quality,
         &prepared.skipped,
+        &prepared.capability_by_section,
     )))
 }
 

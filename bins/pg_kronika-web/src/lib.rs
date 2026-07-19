@@ -227,14 +227,17 @@ mod tests {
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
     use kronika_format::{PartMeta, SectionInput, build_part};
-    use kronika_registry::Section;
-    use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::incident_gauges::{
+        PgFreezeHorizonV1, PgProcessCgroupMemoryV1, PgReplicationPhysicalV1,
+        PgReplicationSlotRetentionV3, PgStorageMountV1, PgVacuumObservationV1,
+    };
     use kronika_registry::os_meminfo::OsMeminfo;
     use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use kronika_registry::pg_stat_database::PgStatDatabaseV1;
     use kronika_registry::reset_metadata::ResetMetadata;
+    use kronika_registry::{Section, StrId, Ts};
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
     use tower::ServiceExt;
 
@@ -874,7 +877,6 @@ mod tests {
         max_ts: i64,
     ) {
         use kronika_format::DictLimits;
-        use kronika_registry::StrId;
         use kronika_registry::instance_metadata::InstanceMetadata;
 
         let mut interner = kronika_writer::Interner::new(
@@ -898,6 +900,15 @@ mod tests {
             boot_id: intern("test-boot"),
             btime: Ts(0),
         };
+        for value in [
+            "fixture-1",
+            "fixture-2",
+            "fixture-3",
+            "fixture-4",
+            "fixture-5",
+        ] {
+            let _ = intern(value);
+        }
         let dictionary =
             kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
         let metadata = InstanceMetadata::encode(&[metadata]).expect("encode metadata");
@@ -930,6 +941,16 @@ mod tests {
         std::fs::write(dir.join(file), bytes).expect("write segment");
     }
 
+    fn fixture_str_id(value: &str) -> StrId {
+        use kronika_format::DictLimits;
+        let mut interner =
+            kronika_writer::Interner::new(DictLimits::new(32, 4096).expect("dictionary limits"));
+        interner
+            .intern(value.as_bytes())
+            .map(|id| StrId(id.get()))
+            .expect("fixture string id")
+    }
+
     fn write_archiver_with_identity(
         dir: &std::path::Path,
         rows: &[PgStatArchiver],
@@ -955,7 +976,7 @@ mod tests {
     }
 
     /// The active lens ids the incidents endpoint advertises, in catalog order.
-    const ACTIVE_LENS_IDS: [&str; 13] = [
+    const ACTIVE_LENS_IDS: [&str; 19] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -969,6 +990,12 @@ mod tests {
         "PG-CONN-014",
         "OS-MEM-022",
         "OS-WB-025",
+        "PG-VACUUM-005",
+        "PG-FREEZE-006",
+        "PG-REPL-015",
+        "PG-SLOT-016",
+        "OS-CGMEM-023",
+        "OS-FS-027",
     ];
 
     #[tokio::test]
@@ -1026,7 +1053,7 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 15, "28 catalog lenses minus 13 active");
+        assert_eq!(dormant.len(), 9, "28 catalog lenses minus 19 active");
         assert!(
             dormant
                 .iter()
@@ -1155,6 +1182,246 @@ mod tests {
         );
         assert_eq!(evidence["entity"]["logical_section"], "os_meminfo");
         assert_eq!(evidence["entity"]["identity"], serde_json::json!([]));
+    }
+
+    async fn assert_contract_lens(
+        type_id: u32,
+        section: &str,
+        lens_id: &str,
+        rows: usize,
+        body: &[u8],
+        to: i64,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_section_with_node(
+            dir.path(),
+            "0.pgm",
+            "node-7",
+            type_id,
+            u32::try_from(rows).expect("row count"),
+            body,
+            0,
+            to,
+        );
+        let uri =
+            format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m&section={section}");
+        let (status, response) = serve(dir.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{section}: {response}");
+        assert!(
+            response["incidents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|incident| incident["findings"].as_array().into_iter().flatten())
+                .any(|finding| finding["lens_id"] == lens_id),
+            "{section} must reach {lens_id}: {response}"
+        );
+        let capability = response["catalog"]["capabilities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["lens_id"] == lens_id)
+            .expect("capability entry");
+        assert_eq!(capability["status"], "available");
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one integration test exercises six compact versioned row fixtures through HTTP"
+    )]
+    async fn six_versioned_gauge_contracts_reach_http_findings() {
+        const MINUTE: i64 = 60 * 1_000_000;
+        let to = 39 * MINUTE;
+        let spike = |minute: i32| (20..25).contains(&minute);
+
+        let freeze: Vec<_> = (0..40)
+            .map(|minute| PgFreezeHorizonV1 {
+                ts: Ts(i64::from(minute) * MINUTE),
+                datid: 7,
+                datname: fixture_str_id("fixture-1"),
+                relid: 42,
+                schemaname: fixture_str_id("fixture-2"),
+                relname: fixture_str_id("fixture-3"),
+                xid_age: if spike(minute) { 95 } else { 10 },
+                xid_limit: 100,
+                xid_is_toast: false,
+                mxid_age: 10,
+                mxid_limit: 100,
+                mxid_is_toast: false,
+            })
+            .collect();
+        let body = PgFreezeHorizonV1::encode(&freeze).expect("freeze encode");
+        assert_contract_lens(
+            1_031_001,
+            "pg_freeze_horizon",
+            "PG-FREEZE-006",
+            freeze.len(),
+            &body,
+            to,
+        )
+        .await;
+
+        let vacuum: Vec<_> = (0..40)
+            .map(|minute| PgVacuumObservationV1 {
+                ts: Ts(i64::from(minute) * MINUTE),
+                pid: 42,
+                session_start_key: 1,
+                datid: 7,
+                datname: fixture_str_id("fixture-1"),
+                relid: 42,
+                phase: fixture_str_id("fixture-2"),
+                backend_type: fixture_str_id("fixture-3"),
+                activity_present: true,
+                is_autovacuum: Some(true),
+                backend_start: Some(Ts(1)),
+                query_start: Some(Ts(1)),
+                elapsed_us: Some(if spike(minute) {
+                    360_000_000
+                } else {
+                    60_000_000
+                }),
+                clock_valid: Some(true),
+            })
+            .collect();
+        let body = PgVacuumObservationV1::encode(&vacuum).expect("vacuum encode");
+        assert_contract_lens(
+            1_032_001,
+            "pg_vacuum_observation",
+            "PG-VACUUM-005",
+            vacuum.len(),
+            &body,
+            to,
+        )
+        .await;
+
+        let replication: Vec<_> = (0..40)
+            .map(|minute| PgReplicationPhysicalV1 {
+                ts: Ts(i64::from(minute) * MINUTE),
+                pid: 42,
+                application_name: fixture_str_id("fixture-1"),
+                slot_name: fixture_str_id("fixture-2"),
+                slot_type: fixture_str_id("fixture-3"),
+                state: fixture_str_id("fixture-4"),
+                sync_state: fixture_str_id("fixture-5"),
+                scope_code: 1,
+                state_code: 3,
+                current_to_sent_bytes: Some(0),
+                sent_to_write_bytes: Some(0),
+                write_to_flush_bytes: Some(0),
+                flush_to_replay_bytes: Some(if spike(minute) { 100_000_000 } else { 1_000 }),
+                write_lag_us: None,
+                flush_lag_us: None,
+                replay_lag_us: None,
+            })
+            .collect();
+        let body = PgReplicationPhysicalV1::encode(&replication).expect("replication encode");
+        assert_contract_lens(
+            1_033_001,
+            "pg_replication_physical",
+            "PG-REPL-015",
+            replication.len(),
+            &body,
+            to,
+        )
+        .await;
+
+        let slots: Vec<_> = (0..40)
+            .map(|minute| {
+                let retained = if spike(minute) {
+                    90_000_000
+                } else {
+                    10_000_000
+                };
+                PgReplicationSlotRetentionV3 {
+                    ts: Ts(i64::from(minute) * MINUTE),
+                    slot_name: fixture_str_id("fixture-1"),
+                    slot_type: fixture_str_id("fixture-2"),
+                    wal_status: fixture_str_id("fixture-3"),
+                    invalidation_reason: fixture_str_id("fixture-4"),
+                    active: false,
+                    active_pid: None,
+                    restart_lsn: Some(1),
+                    retained_bytes: Some(retained),
+                    safe_wal_size: Some(100_000_000 - retained),
+                    max_slot_wal_keep_size_bytes: Some(100_000_000),
+                    wal_status_code: 1,
+                    is_in_recovery: false,
+                    conflicting: Some(false),
+                    invalidation_code: 0,
+                }
+            })
+            .collect();
+        assert_eq!(
+            kronika_reader::logical_section("pg_replication_slot_retention")
+                .expect("slot logical section")
+                .diff_key(),
+            vec!["slot_name"]
+        );
+        let body = PgReplicationSlotRetentionV3::encode(&slots).expect("slot encode");
+        assert_contract_lens(
+            1_034_003,
+            "pg_replication_slot_retention",
+            "PG-SLOT-016",
+            slots.len(),
+            &body,
+            to,
+        )
+        .await;
+
+        let storage: Vec<_> = (0..40)
+            .map(|minute| PgStorageMountV1 {
+                ts: Ts(i64::from(minute) * MINUTE),
+                role: 1,
+                path_hash_hi: 1,
+                path_hash_lo: 2,
+                mount_hash_hi: 3,
+                mount_hash_lo: 4,
+                mount_namespace: 5,
+                mapping_state: 1,
+                total_bytes: Some(100_000_000),
+                available_bytes: Some(if spike(minute) { 5_000_000 } else { 50_000_000 }),
+            })
+            .collect();
+        let body = PgStorageMountV1::encode(&storage).expect("storage encode");
+        assert_contract_lens(
+            1_036_001,
+            "pg_storage_mount",
+            "OS-FS-027",
+            storage.len(),
+            &body,
+            to,
+        )
+        .await;
+
+        let cgroup: Vec<_> = (0..40)
+            .map(|minute| PgProcessCgroupMemoryV1 {
+                ts: Ts(i64::from(minute) * MINUTE),
+                process_hash_hi: 1,
+                process_hash_lo: 2,
+                cgroup_hash_hi: 3,
+                cgroup_hash_lo: 4,
+                hierarchy: 2,
+                mapping_state: 1,
+                current_bytes: Some(if spike(minute) {
+                    95_000_000
+                } else {
+                    50_000_000
+                }),
+                max_bytes: Some(100_000_000),
+                max_unlimited: false,
+            })
+            .collect();
+        let body = PgProcessCgroupMemoryV1::encode(&cgroup).expect("cgroup encode");
+        assert_contract_lens(
+            1_037_001,
+            "pg_process_cgroup_memory",
+            "OS-CGMEM-023",
+            cgroup.len(),
+            &body,
+            to,
+        )
+        .await;
     }
 
     #[tokio::test]

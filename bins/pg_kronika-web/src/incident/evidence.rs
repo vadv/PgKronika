@@ -149,6 +149,7 @@ pub(crate) enum GaugeUnit {
     Kibibytes,
     Microseconds,
     Ratio,
+    BytesPerSecond,
 }
 
 impl GaugeUnit {
@@ -159,6 +160,7 @@ impl GaugeUnit {
             Self::Kibibytes => "KiB",
             Self::Microseconds => "microseconds",
             Self::Ratio => "ratio",
+            Self::BytesPerSecond => "bytes_per_second",
         }
     }
 }
@@ -184,6 +186,12 @@ pub(crate) enum GaugeMeasurement {
     Ratio {
         numerator: FiniteValue,
         denominator: FiniteValue,
+        operand_unit: GaugeUnit,
+    },
+    Trend {
+        first: FiniteValue,
+        last: FiniteValue,
+        elapsed_us: u64,
         operand_unit: GaugeUnit,
     },
 }
@@ -281,6 +289,43 @@ impl GaugeEvidence {
             threshold: FiniteValue::new(threshold)?,
             threshold_kind,
             observed_at_us,
+            samples,
+            entity,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "constructor validates the complete public trend-evidence contract"
+    )]
+    pub(crate) fn trend(
+        first: f64,
+        last: f64,
+        operand_unit: GaugeUnit,
+        threshold_per_second: f64,
+        threshold_kind: ThresholdKind,
+        first_at_us: i64,
+        last_at_us: i64,
+        samples: usize,
+        entity: GaugeEntity,
+    ) -> Option<Self> {
+        let elapsed_us = u64::try_from(last_at_us.checked_sub(first_at_us)?).ok()?;
+        (elapsed_us > 0).then_some(())?;
+        let elapsed_seconds = std::time::Duration::from_micros(elapsed_us).as_secs_f64();
+        FiniteValue::new((last - first) / elapsed_seconds)?;
+        let samples = u64::try_from(samples).ok()?;
+        (samples >= 2 && !entity.section().is_empty()).then_some(())?;
+        Some(Self {
+            measurement: GaugeMeasurement::Trend {
+                first: FiniteValue::new(first)?,
+                last: FiniteValue::new(last)?,
+                elapsed_us,
+                operand_unit,
+            },
+            unit: GaugeUnit::BytesPerSecond,
+            threshold: FiniteValue::new(threshold_per_second)?,
+            threshold_kind,
+            observed_at_us: last_at_us,
             samples,
             entity,
         })

@@ -251,6 +251,116 @@ pub(crate) struct TripleGaugeWindow<'a> {
     denominator: &'a [GaugePoint],
 }
 
+/// Exact-timestamp readings for a small fixed lens contract.
+pub(crate) struct GaugeSnapshotWindow<'a> {
+    tracks: Vec<&'a [GaugePoint]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GaugeSnapshot {
+    pub values: [f64; 8],
+    pub len: usize,
+    pub observed_at_us: i64,
+    pub samples: usize,
+}
+
+impl GaugeSnapshotWindow<'_> {
+    pub(crate) fn inspected_points(&self) -> usize {
+        self.tracks
+            .iter()
+            .fold(0_usize, |total, points| total.saturating_add(points.len()))
+    }
+
+    pub(crate) fn extreme(&self, score_index: usize, maximize: bool) -> Option<GaugeSnapshot> {
+        if self.tracks.is_empty() || self.tracks.len() > 8 || score_index >= self.tracks.len() {
+            return None;
+        }
+        let mut indexes = vec![0_usize; self.tracks.len()];
+        let mut best: Option<GaugeSnapshot> = None;
+        let mut samples = 0_usize;
+        loop {
+            let mut min_ts = i64::MAX;
+            let mut max_ts = i64::MIN;
+            for (track, &index) in self.tracks.iter().zip(&indexes) {
+                let Some(point) = track.get(index) else {
+                    return best.map(|mut reading| {
+                        reading.samples = samples;
+                        reading
+                    });
+                };
+                min_ts = min_ts.min(point.ts);
+                max_ts = max_ts.max(point.ts);
+            }
+            if min_ts != max_ts {
+                for (track, index) in self.tracks.iter().zip(&mut indexes) {
+                    if track[*index].ts == min_ts {
+                        *index += 1;
+                    }
+                }
+                continue;
+            }
+            let mut values = [0.0_f64; 8];
+            for (slot, (track, index)) in values.iter_mut().zip(self.tracks.iter().zip(&indexes)) {
+                *slot = track[*index].value;
+            }
+            samples = samples.saturating_add(1);
+            let candidate = GaugeSnapshot {
+                values,
+                len: self.tracks.len(),
+                observed_at_us: min_ts,
+                samples,
+            };
+            let score = candidate.values[score_index];
+            if best.is_none_or(|current| {
+                if maximize {
+                    score > current.values[score_index]
+                } else {
+                    score < current.values[score_index]
+                }
+            }) {
+                best = Some(candidate);
+            }
+            for index in &mut indexes {
+                *index += 1;
+            }
+        }
+    }
+
+    pub(crate) fn value_range(&self, index: usize) -> Option<(f64, f64, usize)> {
+        let minimum = self.extreme(index, false)?;
+        let maximum = self.extreme(index, true)?;
+        (minimum.samples == maximum.samples).then_some((
+            minimum.values[index],
+            maximum.values[index],
+            minimum.samples,
+        ))
+    }
+}
+
+/// Gap-free change between the first and last valid sample in a window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GaugeTrend {
+    pub first: f64,
+    pub last: f64,
+    pub first_at_us: i64,
+    pub last_at_us: i64,
+    pub samples: usize,
+}
+
+impl GaugeWindow<'_> {
+    pub(crate) fn trend(&self) -> Option<GaugeTrend> {
+        let first = *self.points.first()?;
+        let last = *self.points.last()?;
+        (self.points.len() >= 2 && first.ts < last.ts).then_some(GaugeTrend {
+            first: first.value,
+            last: last.value,
+            first_at_us: first.ts,
+            last_at_us: last.ts,
+            samples: self.points.len(),
+        })
+    }
+}
+
 impl TripleGaugeWindow<'_> {
     pub(crate) const fn inspected_points(&self) -> usize {
         self.a
@@ -410,7 +520,7 @@ impl TypedInputs {
         identity: Arc<[IdentityValue]>,
         points: Vec<(i64, f64)>,
     ) {
-        self.insert_gauge_with_quality(section, column, identity, points, Vec::new(), Vec::new());
+        self.insert_gauge_with_quality(section, column, identity, points, Vec::new(), &[]);
     }
 
     pub(crate) fn insert_gauge_with_quality(
@@ -420,7 +530,7 @@ impl TypedInputs {
         identity: Arc<[IdentityValue]>,
         raw_points: Vec<(i64, f64)>,
         breaks: Vec<i64>,
-        gaps: Vec<(i64, i64)>,
+        gaps: &[(i64, i64)],
     ) {
         self.insert_gauge_with_shared_quality(
             section,
@@ -429,10 +539,14 @@ impl TypedInputs {
             raw_points,
             breaks,
             Arc::from([]),
-            &GaugeQuality::new(&gaps),
+            &GaugeQuality::new(gaps),
         );
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "reader retention passes one bounded track and its shared quality provenance"
+    )]
     pub(crate) fn insert_gauge_with_shared_quality(
         &mut self,
         section: &'static str,
@@ -577,6 +691,27 @@ impl TypedInputs {
             b: b.points,
             denominator: denominator.points,
         })
+    }
+
+    pub(crate) fn gauge_snapshot_window(
+        &self,
+        section: &'static str,
+        identity: &[IdentityValue],
+        columns: &[&'static str],
+        from_us: i64,
+        to_us: i64,
+    ) -> Option<GaugeSnapshotWindow<'_>> {
+        if columns.is_empty() || columns.len() > 8 {
+            return None;
+        }
+        let mut tracks = Vec::with_capacity(columns.len());
+        for &column in columns {
+            tracks.push(
+                self.gauge_window(section, column, identity, from_us, to_us)?
+                    .points,
+            );
+        }
+        Some(GaugeSnapshotWindow { tracks })
     }
 }
 
@@ -962,7 +1097,7 @@ mod tests {
             id(1),
             vec![(10, 7.0), (30, 8.0)],
             vec![20],
-            Vec::new(),
+            &[],
         );
         assert!(typed.gauge_window("db", "age", &id(1), 10, 30).is_none());
 
@@ -973,7 +1108,7 @@ mod tests {
             id(1),
             vec![(10, 7.0)],
             Vec::new(),
-            vec![(15, 25)],
+            &[(15, 25)],
         );
         assert!(typed.gauge_window("db", "age", &id(1), 10, 30).is_none());
     }
@@ -1004,5 +1139,49 @@ mod tests {
             .triple_gauge_window("mem", &id(1), ("dirty", "writeback", "total"), 0, 30)
             .expect("all tracks exist");
         assert!(window.sum_ratio_max().is_none());
+    }
+
+    #[test]
+    fn snapshot_reduction_requires_all_columns_at_one_timestamp() {
+        let typed = gauges(
+            "join",
+            &[
+                ("value", &[(10, 1.0), (20, 9.0)]),
+                ("state", &[(10, 1.0), (30, 1.0)]),
+            ],
+        );
+        let window = typed
+            .gauge_snapshot_window("join", &id(1), &["value", "state"], 0, 40)
+            .expect("both tracks exist");
+        let reading = window.extreme(0, true).expect("ts=10 is shared");
+        assert_eq!(reading.samples, 1);
+        assert_eq!(reading.observed_at_us, 10);
+        assert_eq!(reading.values[..reading.len], [1.0, 1.0]);
+    }
+
+    #[test]
+    fn trend_needs_two_ordered_samples_and_gap_free_coverage() {
+        let typed = gauges("slot", &[("retained", &[(10, 7.0), (20, 9.0)])]);
+        let trend = typed
+            .gauge_window("slot", "retained", &id(1), 0, 30)
+            .and_then(|window| window.trend())
+            .expect("two ordered samples");
+        assert_eq!(trend.samples, 2);
+        assert_eq!((trend.first, trend.last), (7.0, 9.0));
+
+        let mut gapped = TypedInputs::new();
+        gapped.insert_gauge_with_quality(
+            "slot",
+            "retained",
+            id(1),
+            vec![(10, 7.0), (20, 9.0)],
+            Vec::new(),
+            &[(15, 16)],
+        );
+        assert!(
+            gapped
+                .gauge_window("slot", "retained", &id(1), 0, 30)
+                .is_none()
+        );
     }
 }

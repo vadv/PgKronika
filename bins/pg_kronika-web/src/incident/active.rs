@@ -10,6 +10,10 @@ use super::evidence::{
     ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
     GaugeUnit, Role, ThresholdKind,
 };
+use super::gauge_contracts::{
+    CgroupMemoryLens, FreezeHorizonLens, PhysicalReplicationLens, RunningVacuumLens,
+    SlotRetentionLens, StorageCapacityLens,
+};
 use super::lens::Lens;
 use super::series::SeriesSet;
 use super::typed::{GaugeObjective, TypedInputs};
@@ -1076,6 +1080,12 @@ pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
         Box::new(ConnectionSaturationLens),
         Box::new(MemoryReclaimLens),
         Box::new(WritebackPressureLens),
+        Box::new(RunningVacuumLens),
+        Box::new(FreezeHorizonLens),
+        Box::new(PhysicalReplicationLens),
+        Box::new(SlotRetentionLens),
+        Box::new(CgroupMemoryLens),
+        Box::new(StorageCapacityLens),
     ]
 }
 
@@ -1225,6 +1235,12 @@ mod tests {
                 "PG-CONN-014",
                 "OS-MEM-022",
                 "OS-WB-025",
+                "PG-VACUUM-005",
+                "PG-FREEZE-006",
+                "PG-REPL-015",
+                "PG-SLOT-016",
+                "OS-CGMEM-023",
+                "OS-FS-027",
             ]
         );
         let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
@@ -1955,10 +1971,10 @@ mod tests {
     }
 
     #[test]
-    fn four_active_gauges_and_nine_counters_are_accounted_once() {
+    fn ten_active_gauges_and_nine_counters_are_accounted_once() {
         let active = active_catalog_ids();
-        assert_eq!(active.len(), 13);
-        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 15);
+        assert_eq!(active.len(), 19);
+        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 9);
         let unique: std::collections::BTreeSet<_> = active.iter().copied().collect();
         assert_eq!(unique.len(), active.len());
     }

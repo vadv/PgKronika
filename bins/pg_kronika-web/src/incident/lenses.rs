@@ -170,8 +170,8 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-VACUUM-005",
         slug: "vacuum_backlog",
         domain: Domain::Pg,
-        title: "Отставание vacuum",
-        detects: "Растёт долг мёртвых кортежей, cleanup не успевает.",
+        title: "Длительный текущий vacuum",
+        detects: "Текущий vacuum наблюдается дольше порога по серверным часам.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -186,8 +186,8 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-FREEZE-006",
         slug: "xid_wraparound_risk",
         domain: Domain::Pg,
-        title: "Приближение wraparound XID/MXID",
-        detects: "Headroom по возрасту XID/MXID тает, близко к форсированному aggressive vacuum.",
+        title: "Приближение к пределу заморозки XID/MXID",
+        detects: "Возраст XID или MXID занял большую долю своего эффективного предела.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -318,7 +318,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         slug: "replication_lag",
         domain: Domain::Pg,
         title: "Отставание физической репликации",
-        detects: "На каком LSN-этапе растёт байтовый разрыв (sent/write/flush/replay).",
+        detects: "На каком этапе LSN наблюдается байтовый или временной разрыв.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -333,7 +333,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         slug: "slot_wal_retention",
         domain: Domain::Pg,
         title: "Удержание WAL слотом репликации",
-        detects: "Слот держит растущий WAL, `retained_bytes` со склоном вверх.",
+        detects: "Слот удерживает WAL близко к пределу; изменение подтверждено двумя наблюдениями.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -436,7 +436,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         slug: "cgroup_memory_limit",
         domain: Domain::Os,
         title: "Лимит памяти cgroup",
-        detects: "Достижение `memory.high`/`max`/OOM в cgroup.",
+        detects: "Текущее потребление памяти PostgreSQL близко к конечному пределу cgroup.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::PidCgroupMapping,
@@ -496,8 +496,8 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-FS-027",
         slug: "filesystem_space",
         domain: Domain::Os,
-        title: "Исчерпание места ФС",
-        detects: "Точка монтирования близка к исчерпанию байтов.",
+        title: "Исчерпание места хранения PostgreSQL",
+        detects: "Доказанно связанная точка монтирования близка к исчерпанию доступных байтов.",
         confidence: ConfidenceCap::High,
         missing: &[
             Missing::GaugeSamples,

@@ -182,6 +182,14 @@ pub(crate) struct PreparedInput {
     pub coverage_by_section: BTreeMap<&'static str, Vec<Gap>>,
     pub quality: InputQuality,
     pub skipped: Vec<SectionSkip>,
+    pub capability_by_section: BTreeMap<&'static str, CapabilityInputState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapabilityInputState {
+    Available,
+    Partial,
+    NotCollected,
 }
 
 /// Read and scan `sections` for one source over `[from, to)`.
@@ -249,6 +257,7 @@ pub(crate) fn prepare_input(
         coverage_by_section: state.coverage_by_section,
         quality: state.quality,
         skipped: state.skipped,
+        capability_by_section: state.capability_by_section,
     })
 }
 
@@ -405,6 +414,7 @@ struct BuildState {
     remaining_identity_bytes: usize,
     remaining_scan: usize,
     remaining_typed_gauge_points: usize,
+    capability_by_section: BTreeMap<&'static str, CapabilityInputState>,
 }
 
 impl BuildState {
@@ -423,6 +433,7 @@ impl BuildState {
             remaining_identity_bytes,
             remaining_scan: limits.score_work,
             remaining_typed_gauge_points: limits.typed_gauge_points,
+            capability_by_section: BTreeMap::new(),
         }
     }
 
@@ -445,6 +456,10 @@ impl BuildState {
             .saturating_add(counts.episodes_truncated);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one section is normalized, admitted, scanned, and retained atomically"
+    )]
     fn process(
         &mut self,
         logical: &LogicalSection,
@@ -456,6 +471,9 @@ impl BuildState {
         if page.next_cursor.is_some() {
             self.skip_incomplete(logical.name);
             return Ok(());
+        }
+        if let Some(state) = capability_state(logical.name, &page.rows) {
+            self.capability_by_section.insert(logical.name, state);
         }
         self.coverage_by_section
             .insert(logical.name, page.gaps.clone());
@@ -654,6 +672,35 @@ impl BuildState {
             }
         }
     }
+}
+
+fn capability_state(section: &'static str, rows: &[OutRow]) -> Option<CapabilityInputState> {
+    let empty_state = match section {
+        "pg_vacuum_observation" | "pg_replication_physical" | "pg_replication_slot_retention" => {
+            CapabilityInputState::Available
+        }
+        "pg_freeze_horizon" | "pg_storage_mount" | "pg_process_cgroup_memory" => {
+            CapabilityInputState::NotCollected
+        }
+        _ => return None,
+    };
+    if rows.is_empty() {
+        return Some(empty_state);
+    }
+    if matches!(section, "pg_storage_mount" | "pg_process_cgroup_memory") {
+        let all_verified = rows.iter().all(|row| {
+            matches!(
+                row_value(row, "mapping_state"),
+                Some(Value::I64(1) | Value::U64(1))
+            )
+        });
+        return Some(if all_verified {
+            CapabilityInputState::Available
+        } else {
+            CapabilityInputState::Partial
+        });
+    }
+    Some(CapabilityInputState::Available)
 }
 
 pub(crate) fn scan_position_count(scan: &ScanParams) -> Option<usize> {

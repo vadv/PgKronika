@@ -76,6 +76,15 @@ const fn locks_type_id(version: LocksVersion) -> u32 {
 }
 
 /// Everything one tick reads from the main connection, gated by `due`.
+type ReplicationSources = (
+    ReplicationInstanceRow,
+    Vec<ReplicaRow>,
+    Vec<SlotRow>,
+    Vec<ReplicationPhysicalRow>,
+    SlotRetentionVersion,
+    Vec<SlotRetentionRow>,
+);
+
 pub(crate) struct MainConnSources {
     pub(crate) ts: Ts,
     pub(crate) local_join: Option<LocalJoinFacts>,
@@ -88,14 +97,7 @@ pub(crate) struct MainConnSources {
     pub(crate) wal: Option<WalSnapshot>,
     pub(crate) io: Option<(IoVersion, Vec<IoRow>)>,
     pub(crate) archiver: Option<ArchiverRow>,
-    pub(crate) replication: Option<(
-        ReplicationInstanceRow,
-        Vec<ReplicaRow>,
-        Vec<SlotRow>,
-        Vec<ReplicationPhysicalRow>,
-        SlotRetentionVersion,
-        Vec<SlotRetentionRow>,
-    )>,
+    pub(crate) replication: Option<ReplicationSources>,
     pub(crate) lock_rows: Vec<LocksRow>,
 }
 

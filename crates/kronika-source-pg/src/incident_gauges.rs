@@ -1,7 +1,11 @@
-//! Bounded PostgreSQL inputs used by incident gauge lenses.
+//! Bounded `PostgreSQL` inputs used by incident gauge lenses.
 #![allow(
     missing_docs,
     reason = "owned source rows mirror documented registry columns"
+)]
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "collectors return database errors and converters return interner errors unchanged"
 )]
 
 use kronika_registry::incident_gauges::{
@@ -13,7 +17,7 @@ use tokio_postgres::Client;
 
 use crate::replication_instance::LSN_BYTE_OFFSET_CEILING;
 
-/// Local-process proof and PostgreSQL storage paths collected in one statement.
+/// Local-process proof and `PostgreSQL` storage paths collected in one statement.
 #[derive(Debug, Clone)]
 pub struct LocalJoinFacts {
     pub ts: i64,

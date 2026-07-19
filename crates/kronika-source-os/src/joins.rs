@@ -3,6 +3,11 @@
     missing_docs,
     reason = "stable numeric failure codes are documented by the durable registry contract"
 )]
+#![allow(
+    clippy::map_err_ignore,
+    clippy::missing_errors_doc,
+    reason = "the public contract exposes bounded failure codes without filesystem details"
+)]
 
 use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
@@ -68,7 +73,7 @@ pub struct ProcessCgroupMemory {
     pub max_unlimited: bool,
 }
 
-/// A redacted PostgreSQL storage path mapped to one local mount.
+/// A redacted `PostgreSQL` storage path mapped to one local mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageMount {
     /// `1=data`, `2=wal`, `3=tablespace`.
@@ -151,19 +156,19 @@ fn process_snapshot(
     pid: i32,
     facts: ProcessFacts,
 ) -> Result<(i64, Membership), JoinFailure> {
-    let stat = procfs
+    let stat_content = procfs
         .read_raw(&format!("{pid}/stat"))
         .map_err(|_| JoinFailure::ProcUnavailable)?;
-    let parsed = parse_stat(&stat).map_err(|_| JoinFailure::ProcUnavailable)?;
+    let parsed = parse_stat(&stat_content).map_err(|_| JoinFailure::ProcUnavailable)?;
     if parsed.pid != pid {
         return Err(JoinFailure::PidMismatch);
     }
-    let start = starttime_us(facts, parsed.starttime_ticks).ok_or(JoinFailure::StartMismatch)?;
+    let start_us = starttime_us(facts, parsed.starttime_ticks).ok_or(JoinFailure::StartMismatch)?;
     let cgroup = procfs
         .read_raw(&format!("{pid}/cgroup"))
         .map_err(|_| JoinFailure::MembershipUnavailable)?;
     let membership = memory_membership(&cgroup).ok_or(JoinFailure::MembershipUnavailable)?;
-    Ok((start, membership))
+    Ok((start_us, membership))
 }
 
 fn validate_stable_process(
@@ -179,7 +184,7 @@ fn validate_stable_process(
     }
 }
 
-/// Read one validated PostgreSQL PID and its memory cgroup without `/proc` scans.
+/// Read one validated `PostgreSQL` PID and its memory cgroup without `/proc` scans.
 pub fn collect_process_cgroup_memory(
     procfs: &ProcFs,
     sysfs: &SysFs,

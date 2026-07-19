@@ -475,7 +475,7 @@ const fn empty_hash() -> Hash128 {
     Hash128 { hi: 0, lo: 0 }
 }
 
-/// Build bounded cross-source rows only from the PostgreSQL PID supplied by
+/// Build bounded cross-source rows only from the `PostgreSQL` PID supplied by
 /// the same collection tick. Raw paths never leave this orchestration step.
 pub(crate) fn collect_pg_os_joins(fs: &ProcFs, facts: Option<&LocalJoinFacts>, os: &mut OsSources) {
     let Some(facts) = facts else {
