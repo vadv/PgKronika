@@ -982,7 +982,7 @@ mod tests {
         assert!(
             dormant
                 .iter()
-                .any(|entry| entry["lens_id"] == "PG-LOCK-012"),
+                .any(|entry| entry["lens_id"] == "lock_wait_graph"),
             "missing dormant lock lens"
         );
         let incidents = body["incidents"].as_array().expect("incidents is an array");

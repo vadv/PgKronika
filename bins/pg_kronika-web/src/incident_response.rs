@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(dormant.len(), 28);
         let lock = dormant
             .iter()
-            .find(|entry| entry["lens_id"] == "PG-LOCK-012")
+            .find(|entry| entry["lens_id"] == "lock_wait_graph")
             .expect("lock lens is dormant");
         assert_eq!(
             lock["awaiting"],

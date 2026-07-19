@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn sampled_lock_edge_can_reach_high_and_prove_direction() {
         let finding = Finding::from_draft(
-            "PG-LOCK-012",
+            "lock_wait_graph",
             ConfidenceCap::High,
             FindingDraft::new(
                 Role::Lead,

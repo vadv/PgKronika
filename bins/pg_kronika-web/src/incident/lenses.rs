@@ -101,7 +101,7 @@ use MissingCapability as Missing;
 
 const DORMANT_CATALOG: &[DormantLens] = &[
     DormantLens {
-        lens_id: "PG-QRY-001",
+        lens_id: "query_workload_shift",
         domain: Domain::Pg,
         title: "Сдвиг профиля запроса",
         detects: "У нормализованного запроса изменились частота, работа на вызов или время исполнения.",
@@ -114,7 +114,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-PLAN-002",
+        lens_id: "plan_change",
         domain: Domain::Pg,
         title: "Смена плана запроса",
         detects: "Деградация запроса совпала с появлением или сменой `planid`.",
@@ -129,7 +129,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-TEMP-003",
+        lens_id: "temp_spill",
         domain: Domain::Pg,
         title: "Спил во временные файлы",
         detects: "Рост работы через временные блоки и файлы.",
@@ -144,7 +144,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-ANALYZE-004",
+        lens_id: "stale_statistics",
         domain: Domain::Pg,
         title: "Устаревшая статистика планировщика",
         detects: "`n_mod_since_analyze` высок, свежего analyze нет, план/работа поехали.",
@@ -158,7 +158,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-VACUUM-005",
+        lens_id: "vacuum_backlog",
         domain: Domain::Pg,
         title: "Отставание vacuum",
         detects: "Растёт долг мёртвых кортежей, cleanup не успевает.",
@@ -173,7 +173,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-FREEZE-006",
+        lens_id: "xid_wraparound_risk",
         domain: Domain::Pg,
         title: "Приближение wraparound XID/MXID",
         detects: "Headroom по возрасту XID/MXID тает, близко к форсированному aggressive vacuum.",
@@ -187,7 +187,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-HOT-007",
+        lens_id: "hot_update_failure",
         domain: Domain::Pg,
         title: "Срыв HOT-обновлений",
         detects: "Доля non-HOT updates растёт вместе с работой по индексам и WAL.",
@@ -201,7 +201,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-CHKPT-008",
+        lens_id: "requested_checkpoints",
         domain: Domain::Pg,
         title: "Внеплановые контрольные точки",
         detects: "Растёт доля requested checkpoints и их write/sync-работа.",
@@ -215,7 +215,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-WAL-009",
+        lens_id: "wal_amplification",
         domain: Domain::Pg,
         title: "Раздувание WAL и FPI",
         detects: "Растут WAL bytes на запись, доля FPI, `wal_buffers_full`.",
@@ -229,7 +229,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-CACHE-010",
+        lens_id: "shared_buffer_misses",
         domain: Domain::Pg,
         title: "Промахи shared buffers",
         detects: "Растёт доля промахов shared buffers по базе/отношению/контексту.",
@@ -243,7 +243,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-IO-011",
+        lens_id: "backend_io_latency",
         domain: Domain::Pg,
         title: "Задержка I/O внутри PostgreSQL",
         detects: "Растёт время на операцию или блок (`pg_stat_io`, PG16+).",
@@ -257,7 +257,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-LOCK-012",
+        lens_id: "lock_wait_graph",
         domain: Domain::Pg,
         title: "Граф ожидания блокировок",
         detects: "Кто блокировал ожидающего в момент снимка (`blocked_by` из `pg_locks`).",
@@ -265,7 +265,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[Missing::BlockedByEdges, Missing::LockSnapshotCoverage],
     },
     DormantLens {
-        lens_id: "PG-HORIZON-013",
+        lens_id: "xmin_horizon_hold",
         domain: Domain::Pg,
         title: "Удержание горизонта xmin",
         detects: "Долгая или idle-in-transaction транзакция держит vacuum-горизонт.",
@@ -280,7 +280,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-CONN-014",
+        lens_id: "connection_saturation",
         domain: Domain::Pg,
         title: "Насыщение по соединениям",
         detects: "Backends подходят к `max_connections`, churn растёт при падении throughput.",
@@ -295,7 +295,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-REPL-015",
+        lens_id: "replication_lag",
         domain: Domain::Pg,
         title: "Отставание физической репликации",
         detects: "На каком LSN-этапе растёт байтовый разрыв (sent/write/flush/replay).",
@@ -309,7 +309,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-SLOT-016",
+        lens_id: "slot_wal_retention",
         domain: Domain::Pg,
         title: "Удержание WAL слотом репликации",
         detects: "Слот держит растущий WAL, `retained_bytes` со склоном вверх.",
@@ -322,7 +322,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-ARCH-017",
+        lens_id: "wal_archiving_failure",
         domain: Domain::Pg,
         title: "Ошибки архивации WAL",
         detects: "Подтверждённые ошибки archive command/library (`failed_count`).",
@@ -336,7 +336,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-SYNC-018",
+        lens_id: "sync_replication_wait",
         domain: Domain::Pg,
         title: "Ожидание синхронной репликации",
         detects: "Backends висят на `wait_event='SyncRep'` при настроенной синхронной репликации.",
@@ -350,7 +350,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         ],
     },
     DormantLens {
-        lens_id: "PG-WAIT-019",
+        lens_id: "internal_wait_concentration",
         domain: Domain::Pg,
         title: "Концентрация внутренних ожиданий",
         detects: "Растёт доля active backends на `LWLock`/`BufferPin`/`IO` wait.",
@@ -567,25 +567,25 @@ mod tests {
     use super::*;
 
     const EXPECTED_LENSES: [&str; 28] = [
-        "PG-QRY-001",
-        "PG-PLAN-002",
-        "PG-TEMP-003",
-        "PG-ANALYZE-004",
-        "PG-VACUUM-005",
-        "PG-FREEZE-006",
-        "PG-HOT-007",
-        "PG-CHKPT-008",
-        "PG-WAL-009",
-        "PG-CACHE-010",
-        "PG-IO-011",
-        "PG-LOCK-012",
-        "PG-HORIZON-013",
-        "PG-CONN-014",
-        "PG-REPL-015",
-        "PG-SLOT-016",
-        "PG-ARCH-017",
-        "PG-SYNC-018",
-        "PG-WAIT-019",
+        "query_workload_shift",
+        "plan_change",
+        "temp_spill",
+        "stale_statistics",
+        "vacuum_backlog",
+        "xid_wraparound_risk",
+        "hot_update_failure",
+        "requested_checkpoints",
+        "wal_amplification",
+        "shared_buffer_misses",
+        "backend_io_latency",
+        "lock_wait_graph",
+        "xmin_horizon_hold",
+        "connection_saturation",
+        "replication_lag",
+        "slot_wal_retention",
+        "wal_archiving_failure",
+        "sync_replication_wait",
+        "internal_wait_concentration",
         "OS-CPU-020",
         "OS-CGRP-021",
         "OS-MEM-022",
@@ -623,8 +623,8 @@ mod tests {
     #[test]
     fn duplicate_ids_are_invalid() {
         let duplicate = [
-            fixture("PG-LOCK-012", &[Missing::BlockedByEdges]),
-            fixture("PG-LOCK-012", &[Missing::LockSnapshotCoverage]),
+            fixture("lock_wait_graph", &[Missing::BlockedByEdges]),
+            fixture("lock_wait_graph", &[Missing::LockSnapshotCoverage]),
         ];
         assert!(!catalog_is_valid(&duplicate));
     }
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn duplicate_capabilities_are_invalid() {
         let duplicate = [fixture(
-            "PG-LOCK-012",
+            "lock_wait_graph",
             &[Missing::BlockedByEdges, Missing::BlockedByEdges],
         )];
         assert!(!catalog_is_valid(&duplicate));
@@ -650,7 +650,7 @@ mod tests {
     fn lock_requirements_preserve_pr75() {
         let lock = dormant_catalog()
             .iter()
-            .find(|lens| lens.lens_id() == "PG-LOCK-012")
+            .find(|lens| lens.lens_id() == "lock_wait_graph")
             .expect("lock catalog entry");
         let requirements: Vec<_> = lock
             .missing()
