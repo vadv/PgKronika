@@ -349,7 +349,7 @@ jobs:
       - name: Restore first-party compiler cache
         id: sccache-restore
         if: steps.route.outputs.mode == 'consume' && steps.final.outputs.hit != 'true'
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/bdd-sccache
           key: bdd-sccache-${{ needs.bdd-meta.outputs.compiler_cache_key }}-${{ github.run_id }}
@@ -425,7 +425,7 @@ jobs:
           docker run --rm "$image"
       - name: Save trusted first-party compiler cache
         if: steps.route.outputs.mode == 'consume' && needs.bdd-meta.outputs.can_publish == 'true' && steps.final.outputs.hit != 'true' && success()
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/bdd-sccache
           key: bdd-sccache-${{ needs.bdd-meta.outputs.compiler_cache_key }}-${{ github.run_id }}

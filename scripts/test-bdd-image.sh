@@ -380,8 +380,8 @@ test_compiler_cache_is_source_independent_and_trust_split() {
   local workflow="$ROOT/.github/workflows/ci.yml" cache_lines="$TEST_TMP/cache-lines"
   grep -F 'bdd-sccache-${{ needs.bdd-meta.outputs.compiler_cache_key }}-' "$workflow" > "$cache_lines"
   assert_not_contains "$cache_lines" 'source_key'
-  assert_contains "$workflow" 'uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830'
-  assert_contains "$workflow" 'uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830'
+  assert_contains "$workflow" 'uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
+  assert_contains "$workflow" 'uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
   assert_contains "$workflow" "needs.bdd-meta.outputs.can_publish == 'true'"
   assert_contains "$workflow" "needs.bdd-meta.outputs.can_publish == 'true' && 'READ_WRITE' || 'READ_ONLY'"
   assert_contains "$workflow" 'BDD_SCCACHE_MODE:'
