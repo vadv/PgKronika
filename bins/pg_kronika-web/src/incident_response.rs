@@ -313,7 +313,7 @@ mod tests {
     use super::*;
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
-    const APPLIED_IDS: [&str; 9] = [
+    const APPLIED_IDS: [&str; 15] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -323,6 +323,12 @@ mod tests {
         "PG-ARCH-017",
         "OS-NET-028",
         "OS-CGRP-021",
+        "PG-FREEZE-006",
+        "PG-VACUUM-005",
+        "PG-ANALYZE-004",
+        "PG-CONN-014",
+        "PG-REPL-015",
+        "PG-SLOT-016",
     ];
 
     const MAX_ENTRY_JSON_BYTES: usize = 256
@@ -373,10 +379,10 @@ mod tests {
         let catalog = catalog_to_json();
         assert_eq!(catalog, catalog_to_json());
         let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
-        assert_eq!(bytes.len(), 8_730);
+        assert_eq!(bytes.len(), 6_030);
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
         assert!(catalog.get("log_dormant").is_none());
-        let entry = &catalog["dormant"][11];
+        let entry = &catalog["dormant"][0];
         let keys: std::collections::BTreeSet<_> = entry
             .as_object()
             .expect("catalog entry")

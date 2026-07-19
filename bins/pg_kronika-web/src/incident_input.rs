@@ -488,6 +488,7 @@ impl BuildState {
         let gauge_series = gauge_section(&identity, &gauges, &page.rows);
         tally_quality(&diffs, &gauge_series, &mut self.quality);
         self.retain_typed(logical.name, &cumulative, &diffs);
+        self.retain_typed_gauges(logical.name, &gauges, &gauge_series);
 
         let scanned = match scan_section(
             &diffs,
@@ -561,6 +562,32 @@ impl BuildState {
                     .collect();
                 self.typed
                     .insert_counter(section, name, std::sync::Arc::clone(&identity), points);
+            }
+        }
+    }
+
+    /// Retain each series' raw gauge readings, keyed for lens lookup. Gauges are
+    /// instantaneous levels, so nothing is differenced: the reader already
+    /// dropped NULL, non-numeric, and non-finite readings, leaving one `(ts,
+    /// value)` per valid sample. Columns line up positionally with `gauges`, the
+    /// order `gauge_section` collected them in.
+    fn retain_typed_gauges(
+        &mut self,
+        section: &'static str,
+        gauges: &[&'static str],
+        gauge_series: &[SeriesValues],
+    ) {
+        for series in gauge_series {
+            let Some(identity) = accept_identity(&series.key) else {
+                continue;
+            };
+            for (&name, column) in gauges.iter().zip(&series.columns) {
+                self.typed.insert_gauge(
+                    section,
+                    name,
+                    std::sync::Arc::clone(&identity),
+                    column.points.clone(),
+                );
             }
         }
     }
