@@ -1,7 +1,7 @@
-//! Optionally moves sealed segments to S3. The only process holding cloud credentials.
+//! Reserved entry point for remote archival.
 //!
-//! Not implemented yet: the workspace is in the skeleton stage,
-//! see `docs/plan.md`.
+//! No archival backend, configuration, upload, retry, or deletion behavior is
+//! implemented. The placeholder prints an error and exits with status 2.
 
 fn main() {
     eprintln!("pg_kronika-archiver: not implemented yet, see docs/plan.md");

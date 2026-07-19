@@ -98,10 +98,11 @@ fn parse_ext_version(extversion: &str) -> Option<(u32, u32)> {
 ///
 /// `$1` is the per-axis top-N row count. Candidate selection unions top-N
 /// statements by `total_exec_time` (or, on the legacy layout, `total_time`) and
-/// by `calls`. `query` is truncated inline to [`QUERY_TRUNCATE`] bytes and
-/// interned; `datname`/`usename` are resolved with a `LEFT JOIN`. `ts` is one
-/// `statement_timestamp()` for the whole snapshot; the `*_stats_since` columns
-/// come back as unix microseconds. SQL applies no thresholds or severity labels.
+/// by `calls`. `query` is truncated inline to the crate's fixed query-text
+/// limit and interned; `datname`/`usename` are resolved with a `LEFT JOIN`.
+/// `ts` is one `statement_timestamp()` for the whole snapshot; the
+/// `*_stats_since` columns come back as unix microseconds. SQL applies no
+/// thresholds or severity labels.
 #[allow(
     clippy::too_many_lines,
     reason = "six full per-version SQL literals; splitting the match hurts readability"

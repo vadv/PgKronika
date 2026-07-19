@@ -1,6 +1,6 @@
 //! Byte-level pieces of a PGM segment.
 //!
-//! This crate defines the file structures that writers and readers must share
+//! The public types define the file structures that writers and readers share
 //! exactly: the end catalog, tail index, CRC32C checksums, `str_id`,
 //! per-segment dictionaries, and the `active.parts` journal frame format.
 //!
@@ -13,6 +13,10 @@
 //! 2. Read the catalog bytes immediately before the tail index.
 //! 3. Decode them with [`Catalog::decode`].
 //! 4. Read section bodies using `offset` and `len` from [`Entry`].
+//!
+//! CRC32C detects accidental corruption before higher-level decoding. It is
+//! not a signature and does not make a segment trustworthy against deliberate
+//! modification.
 
 mod catalog;
 mod crc;

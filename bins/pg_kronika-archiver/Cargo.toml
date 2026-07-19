@@ -1,6 +1,6 @@
 [package]
 name = "pg_kronika-archiver"
-description = "pgKronika binary"
+description = "Placeholder for future remote archival"
 publish = false
 version.workspace = true
 edition.workspace = true

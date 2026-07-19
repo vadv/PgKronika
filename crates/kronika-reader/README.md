@@ -2,52 +2,69 @@
 
 [Русская версия](README.ru.md)
 
-`kronika-reader` is the read core for PGM segments. `PgmUnit` decodes a PGM
-container over any `ReadAt` source — a sealed file or an in-memory journal part —
-through a single path. `LocalDirSnapshot` combines sealed segments with live
-`active.parts` entries, suppresses exact sealed/live duplicates, and exposes
-scan diagnostics.
+`kronika-reader` verifies and decodes local PGM units, builds a snapshot over
+sealed files and live journal parts, and exposes bounded logical queries used by
+`pg_kronika-web`.
 
-## Opening a Segment
+## Units and snapshots
 
-`Segment::open(path)` reads the last 8 bytes to find the catalog length, reads
-the catalog block before them, and verifies its CRC. A `catalog_len` above the
-cap or outside the file is rejected before allocation. `Segment::catalog()`
-returns the decoded entries; section bodies are read on demand.
+`PgmUnit<R: ReadAt>` is the common decode path for a sealed `File` and an
+in-memory active part. It opens the end catalog first, validates format version
+and bounds, reads section bytes on demand, checks CRC, then invokes the registry
+codec. `Segment` is the sealed-file convenience wrapper.
 
-## Decoding a Section
+`LocalDirSnapshot` combines units returned by `kronika-store`. Sealed units
+come first, followed by live parts. A live part is suppressed only when its
+catalog exactly matches a sealed unit; overlapping time ranges do not prove
+identity. Store warnings and journal damage remain available to callers.
 
-`Segment::decode(entry)` reads the body at `entry.offset` (bounded by
-`MAX_SECTION_BYTES`), verifies it against `entry.crc32c`, and decodes it through
-`kronika_registry::decode_any`.
+A writer may seal or reset `active.parts` after a snapshot captured a part
+reference. This yields `ReadError::StaleSnapshot`. Query helpers refresh a
+bounded number of times and surface a gap if the unit remains unstable.
 
-CRC is checked before bytes reach the Parquet parser. The reader supplies
-`kronika_format::crc32c` to `VerifiedSection::verify`; the registry crate stays
-independent of `kronika-format`.
+## Logical queries
 
-## Resolving Strings
+`logical_section(name)` combines registered layout versions with that name.
+Section queries:
 
-Snapshot columns store `str_id`, not string bytes. `Segment::dictionary()` reads
-`dict.strings` and `dict.blobs` into a `str_id -> value` map. Dictionary sections
-are CRC-checked and use the same row and row-group limits as data sections.
+1. select one `source_id` and overlapping time range;
+2. decode only matching entries and dictionary sections;
+3. union version columns and resolve strings;
+4. order rows by the registry sort key;
+5. return coverage gaps and an opaque next cursor.
 
-`Dictionary::resolve(str_id)` returns either a full string value or a blob value
-with `full_len` and `truncated`. That keeps a stored prefix distinct from the
-original full value. If the same id appears as both a string and a blob across
-parts, the blob wins.
+`section` and `sections` use a row limit plus the hard 10,000,000-cell
+materialization ceiling. `section_with_limits` and `sections_with_limits` let
+an adapter spend a smaller request-wide cell budget. Exceeding it returns
+`QueryError::ResultTooLarge` before retaining another row.
 
-## Local Directory Snapshots
+The cursor pins the last returned key and source contract. A malformed or
+cross-source cursor is rejected rather than treated as an offset.
 
-`LocalDirSnapshot::units()` returns sealed units first and then live journal
-parts. A live part is hidden only when its catalog exactly matches a sealed unit
-catalog. Time-range overlap does not prove that the live part was finalized.
+## Gauge and counter semantics
 
-`warnings()` returns skipped-file and skipped-part warnings. `damages()` returns
-typed `DamageRegion` values for corrupt `active.parts` byte ranges; valid parts
-around a damaged region remain visible.
+`gauge_section` groups gauge samples by the declared identity. `diff_section`
+folds cumulative columns through `kronika-analytics` using exact integer
+deltas and real sample intervals.
 
-## Scope Boundaries
+No-data states stay typed:
 
-This crate does not provide time-range queries, drill-down queries, a
-cross-segment `str_id` cache, or on-demand `dict.blobs` reads. Those APIs belong
-above `Segment`, `PgmUnit`, and `LocalDirSnapshot`.
+- `FirstPoint` for a series start or first sample after a break;
+- `Reset` when a cumulative value decreases or reset metadata advances;
+- `Gap` when coverage does not span the pair;
+- `NotCollected` when a declared collection gate was off or unknown;
+- `Anomaly` for invalid time order or incompatible scalar input.
+
+An unchanged measured counter yields a real zero delta and rate. Diff does not
+bridge these no-data states and does not extrapolate across unsampled time.
+
+## Bounds and failures
+
+Catalogs are capped at 64 MiB. Registry limits cap each section at 8 MiB,
+65,536 rows, and 16 Parquet row groups before decoded output is accepted.
+Dictionary decode follows the same row and row-group guards. Errors distinguish
+I/O, framing, unsupported format, bounds, CRC/codec, storage, and staleness.
+
+The crate owns no HTTP status mapping, cache policy, remote storage, anomaly
+request budget, or PostgreSQL behavior. See [`src/lib.rs`](src/lib.rs) for the
+canonical public surface.

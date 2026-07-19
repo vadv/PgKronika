@@ -1,8 +1,20 @@
-//! `PostgreSQL` collector daemon.
+//! PostgreSQL and Linux collector daemon.
 //!
-//! The main module owns process lifecycle and cycle orchestration. Source
-//! discovery, paced reads, segment IO, logging, and config parsing live in
-//! separate modules.
+//! Configuration is environment-only; required variables are
+//! `KRONIKA_PG_DSN` and `KRONIKA_OUT_DIR`. The process opens one PostgreSQL
+//! instance, schedules each source independently, appends synchronized windows
+//! to `<out>/active.parts`, and rotates immutable `<timestamp>.pgm` segments by
+//! size, age, journal pressure, or `SIGUSR2`.
+//!
+//! `SIGTERM` and `SIGINT` stop the loop without discarding the journal. Startup
+//! recovery seals valid frames left by the preceding process before opening a
+//! database connection. Individual cycle failures are logged and retried; bad
+//! startup configuration, the initial connection, and journal-open failures
+//! terminate the process.
+//!
+//! Source discovery, paced reads, resource budgets, segment I/O, logfmt
+//! diagnostics, and config parsing live in separate modules. See the package
+//! README for the complete operator contract.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"

@@ -2,7 +2,7 @@
 //!
 //! Cucumber registers each step phrase once; these phrases are reused across
 //! metric modules. Metric-specific steps live in the matching submodule
-//! (e.g. [`archiver`]).
+//! (e.g. [`crate::steps::archiver`]).
 
 use anyhow::{Context, Result, bail};
 use cucumber::{gherkin::Step, given, then};
@@ -643,8 +643,8 @@ pub(crate) fn contract_for(type_id: u32) -> Result<&'static TypeContract> {
 ///
 /// Delegates to [`parse_table`] for all other value forms. `[]` is a literal
 /// token in the feature, not a placeholder (a `[Name]` placeholder has content
-/// between the brackets); the [`crate::harness::expected::placeholder`] helper
-/// already rejects empty brackets, so `[]` falls through to this layer.
+/// between the brackets); the expected-value placeholder parser already
+/// rejects empty brackets, so `[]` falls through to this layer.
 pub(crate) fn parse_table_with_empty_list(
     contract: &TypeContract,
     rows: &[Vec<String>],

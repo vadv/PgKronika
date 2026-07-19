@@ -1,7 +1,22 @@
-//! `PostgreSQL` collectors.
+//! PostgreSQL queries and mapping into registry rows.
 //!
-//! Type `1_006_001` stores `pg_stat_bgwriter` data plus the checkpoint counters
-//! that moved to `pg_stat_checkpointer` in `PostgreSQL` 17.
+//! The collectors cover the PostgreSQL 15–18 matrix: activity, database,
+//! bgwriter/checkpointer, WAL, I/O, locks, prepared transactions, vacuum
+//! progress, replication, settings, tables, indexes, reset/instance metadata,
+//! and optional statement and plan extensions. Layout selection follows the
+//! server major or extension version that owns the source schema.
+//!
+//! Scheduling, string interning, and segment writes belong to the collector.
+//! Async functions return owned source rows so `pg_kronika-collector` can end
+//! every await before it creates non-`Send` writer state. Mapping functions
+//! take an injected fallible interner and produce registered row types.
+//!
+//! The main connection serves instance-wide views. The [`pool`] module owns
+//! up to a caller-supplied number of per-database connections for local views;
+//! failures preserve `tokio_postgres::Error` where callers need SQLSTATE.
+//! Top-N, graph, extension-text, and connection bounds are explicit arguments
+//! or validated configuration. Missing optional extensions return absence,
+//! not fabricated rows.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "tokio-postgres and the registry's arrow/parquet stack pull duplicate transitive versions outside our control"

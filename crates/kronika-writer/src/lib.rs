@@ -1,7 +1,21 @@
-//! Writer-side state for building PGM segments.
+//! Bounded writer state, journal recovery, and PGM sealing.
 //!
-//! Rows and strings accumulate in memory, then become `PGMP` journal frames.
-//! [`seal`] copies those frames into the final `segment.pgm`.
+//! [`SectionBuffers`] accepts registered rows until the registry row cap,
+//! encodes one collection window, and places data sections before dictionary
+//! sections. [`Interner`] owns the current segment's dictionary: unflushed
+//! values retain their bytes, while flushed values retain only identity and
+//! placement metadata for deduplication.
+//!
+//! [`Journal`] appends self-contained PGM parts as synchronized `PGMP` frames
+//! in `active.parts`. Opening a journal truncates only a torn final frame;
+//! middle or terminal media damage remains in [`OpenReport`].
+//! [`JournalConfig::max_journal_len`] is the hard growth bound, reported as
+//! [`JournalError::Full`] so the collector can seal early.
+//!
+//! [`seal`] streams one journal part at a time into a sibling temporary file,
+//! writes and synchronizes the end catalog, and publishes the result without
+//! overwriting an existing destination. It never resets the journal; the
+//! caller does so only after a successful seal.
 
 mod buffer;
 pub mod dict;
