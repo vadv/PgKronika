@@ -281,9 +281,9 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    // Metric (28) plus log (up to 32) dormant entries; measured at 20_085 bytes
-    // for the current 28 + 26 with headroom for the log catalog to fill.
-    const MAX_CATALOG_JSON_BYTES: usize = 24 * 1024;
+    // Metric (28) plus log (up to 40) dormant entries; measured at 23_639 bytes
+    // for the current 28 + 31 with headroom for the log catalog to fill.
+    const MAX_CATALOG_JSON_BYTES: usize = 30 * 1024;
 
     fn scan() -> ScanParams {
         ScanParams {

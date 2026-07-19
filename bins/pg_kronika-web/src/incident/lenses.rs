@@ -3,7 +3,7 @@
 use super::evidence::ConfidenceCap;
 
 const MAX_DORMANT_LENSES: usize = 28;
-const MAX_LOG_DORMANT_LENSES: usize = 32;
+const MAX_LOG_DORMANT_LENSES: usize = 40;
 const MAX_MISSING_PER_LENS: usize = 6;
 const MAX_CATALOG_TOKEN_BYTES: usize = 40;
 const MAX_CATALOG_TEXT_BYTES: usize = 200;
@@ -511,8 +511,9 @@ pub(crate) const fn dormant_catalog() -> &'static [DormantLens] {
     DORMANT_CATALOG
 }
 
-/// Dormant lenses reading events visible only in the `PostgreSQL` log, kept in
-/// a sub-catalog separate from the metric one so each keeps its own size bound.
+/// Dormant lenses driven by discrete event evidence — mostly the `PostgreSQL`
+/// log, plus the kernel OOM-victim record — kept in a sub-catalog separate from
+/// the metric one so each keeps its own size bound.
 const LOG_DORMANT_CATALOG: &[DormantLens] = &[
     // Batch 1 (core): availability, resources, integrity. Self-contained, high.
     DormantLens {
@@ -847,7 +848,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::High,
         missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
     },
-    // Batch 4: finer-grained siblings that separate causes the core lenses merge.
+    // Batch 4: finer-grained siblings; each isolates one cause a core lens conflates.
     DormantLens {
         lens_id: "kernel_oom_victim",
         domain: Domain::Os,
