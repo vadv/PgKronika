@@ -335,9 +335,14 @@ mod tests {
         let log_dormant = catalog["log_dormant"]
             .as_array()
             .expect("catalog lists dormant log lenses");
-        assert_eq!(log_dormant.len(), 26);
+        assert_eq!(log_dormant.len(), 27);
         assert!(log_dormant.iter().all(|entry| {
-            entry["domain"] == "pg" && entry["requirements_status"] == "incomplete"
+            let expected_domain = if entry["lens_id"] == "kernel_oom_victim" {
+                "os"
+            } else {
+                "pg"
+            };
+            entry["domain"] == expected_domain && entry["requirements_status"] == "incomplete"
         }));
     }
 

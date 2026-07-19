@@ -28,6 +28,8 @@ pub(crate) enum MissingCapability {
     LogSourceCoverage,
     EffectiveLogConfigCoverage,
     SensitiveLogRedaction,
+    SourceClockProvenance,
+    KernelOomVictimEvidence,
 }
 
 impl MissingCapability {
@@ -50,6 +52,8 @@ impl MissingCapability {
             Self::LogSourceCoverage => "log_source_coverage",
             Self::EffectiveLogConfigCoverage => "effective_log_config_coverage",
             Self::SensitiveLogRedaction => "sensitive_log_redaction",
+            Self::SourceClockProvenance => "source_clock_provenance",
+            Self::KernelOomVictimEvidence => "kernel_oom_victim_evidence",
         }
     }
 }
@@ -828,6 +832,19 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::High,
         missing: &[Missing::IncidentLogEventInput, Missing::SourcePeriod],
     },
+    // Batch 4: finer-grained siblings that separate causes the core lenses merge.
+    DormantLens {
+        lens_id: "kernel_oom_victim",
+        domain: Domain::Os,
+        title: "Жертва OOM-killer ядра",
+        detects: "Убил ли OOM-killer ядра конкретный процесс (victim PID)? Signal 9 у backend этого не доказывает.",
+        confidence: ConfidenceCap::Medium,
+        missing: &[
+            Missing::KernelOomVictimEvidence,
+            Missing::EntityJoin,
+            Missing::SourceClockProvenance,
+        ],
+    },
 ];
 
 /// Log lenses whose single record is a self-contained finding — activate first.
@@ -961,7 +978,7 @@ mod tests {
         "network_errors",
     ];
 
-    const LOG_EXPECTED_LENSES: [&str; 26] = [
+    const LOG_EXPECTED_LENSES: [&str; 27] = [
         // Batch 1 (core)
         "oom_kill",
         "backend_crash",
@@ -991,6 +1008,8 @@ mod tests {
         "replication_disconnect",
         "recovery_conflict",
         "wal_integrity_log",
+        // Batch 4 (audit splits)
+        "kernel_oom_victim",
     ];
 
     fn fixture(lens_id: &'static str, missing: &'static [MissingCapability]) -> DormantLens {
@@ -1034,6 +1053,14 @@ mod tests {
         assert_eq!(
             Missing::EffectiveLogConfigCoverage.as_str(),
             "effective_log_config_coverage"
+        );
+        assert_eq!(
+            Missing::SourceClockProvenance.as_str(),
+            "source_clock_provenance"
+        );
+        assert_eq!(
+            Missing::KernelOomVictimEvidence.as_str(),
+            "kernel_oom_victim_evidence"
         );
     }
 
@@ -1087,12 +1114,20 @@ mod tests {
     }
 
     #[test]
-    fn log_lenses_stay_in_the_postgres_domain() {
-        assert!(
-            log_dormant_catalog()
-                .iter()
-                .all(|lens| lens.domain().as_str() == "pg")
-        );
+    fn log_lenses_are_pg_except_the_kernel_oom_victim() {
+        for lens in log_dormant_catalog() {
+            let expected = if lens.lens_id() == "kernel_oom_victim" {
+                "os"
+            } else {
+                "pg"
+            };
+            assert_eq!(
+                lens.domain().as_str(),
+                expected,
+                "unexpected domain for `{}`",
+                lens.lens_id()
+            );
+        }
     }
 
     #[test]
