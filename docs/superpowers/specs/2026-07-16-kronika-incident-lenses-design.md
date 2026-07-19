@@ -48,6 +48,10 @@ Finding {
 }
 ```
 
+`lens_id` — опубликованный стабильный идентификатор (`PG-QRY-001`, …,
+`OS-NET-028`). Читаемое snake_case-имя хранится отдельно как `slug` и не
+заменяет `lens_id` в API, findings или сортировке.
+
 `evidence` всегда несёт исходные значения и значения формулы. Один только
 коэффициент, score или текстовый вердикт не является достаточным выводом.
 
@@ -317,7 +321,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
 Во всех формулах `d(x)` — честная typed delta, `r(x)` — `d(x)/dt`, а
 `paired(a,b)` — отношение сумм дельт на одном наборе валидных пар.
 
-### `query_workload_shift` — изменение query workload
+### `PG-QRY-001` (`query_workload_shift`) — изменение query workload
 
 - **Вопрос и роль:** что изменилось у конкретного normalized query: частота,
   работа на вызов или время исполнения? `calls` может быть `lead`, execution
@@ -338,7 +342,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
 - **DQ:** standard; неизвестный timing gate запрещает отрицательный вывод из
   нуля. Отсутствующая top-N строка — unknown, не исчезновение query.
 
-### `plan_change` — смена сохранённого плана
+### `PG-PLAN-002` (`plan_change`) — смена сохранённого плана
 
 - **Вопрос и роль:** совпала ли деградация query с появлением или сменой
   `planid`? При порядке `planid` в `P` -> execution work в `I` роль `lead`, иначе
@@ -364,7 +368,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
 [официальной документации ossc](https://ossc-db.github.io/pg_store_plans/) и
 [исходном форке vadv](https://github.com/vadv/pg_store_plans).
 
-### `temp_spill` — временные файлы и spill
+### `PG-TEMP-003` (`temp_spill`) — временные файлы и spill
 
 - **Вопрос и роль:** выросла ли работа через temporary blocks/files? Для query с
   ростом temp blocks/call это `lead` или `amplifier`; общая latency — downstream.
@@ -383,7 +387,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
 - **DQ:** standard; timing `NotCollected` не отменяет положительные block/file
   counters. Нулевой log stream ничего не доказывает при gap/disabled source.
 
-### `stale_statistics` — риск устаревшей planner statistics
+### `PG-ANALYZE-004` (`stale_statistics`) — риск устаревшей planner statistics
 
 - **Вопрос и роль:** накопились ли изменения relation после последнего ANALYZE
   рядом с изменением query work/plan? Роль — `lead` с cap `medium`.
@@ -405,7 +409,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   не собираются. Формулы autovacuum описаны в
   [routine vacuuming](https://www.postgresql.org/docs/18/routine-vacuuming.html).
 
-### `vacuum_backlog` — накопление dead tuples и работа vacuum
+### `PG-VACUUM-005` (`vacuum_backlog`) — накопление dead tuples и работа vacuum
 
 - **Вопрос и роль:** растёт ли vacuum debt relation и есть ли признаки, что
   cleanup не успевает? Debt — `lead`/`amplifier`, vacuum I/O — `downstream`.
@@ -425,7 +429,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
 - **DQ:** standard; top-N absence unknown. Снижение `n_dead_tup` является
   изменением gauge, не `Reset`.
 
-### `xid_wraparound_risk` — XID/MXID headroom
+### `PG-FREEZE-006` (`xid_wraparound_risk`) — XID/MXID headroom
 
 - **Вопрос и роль:** приблизилась ли database/relation к forced aggressive
   vacuum или защите от wraparound? Роль — `lead`; cap `medium` по age/headroom
@@ -446,7 +450,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   нормативный источник —
   [PG18 routine vacuuming](https://www.postgresql.org/docs/18/routine-vacuuming.html).
 
-### `hot_update_failure` — HOT failure и index amplification
+### `PG-HOT-007` (`hot_update_failure`) — HOT failure и index amplification
 
 - **Вопрос и роль:** какая доля updates не стала HOT и совпала ли она с ростом
   index/WAL work? Роль — `lead` или `amplifier`; cap `medium`.
@@ -466,7 +470,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   остаётся доступен. Механика HOT —
   [официальная глава PostgreSQL](https://www.postgresql.org/docs/18/storage-hot.html).
 
-### `requested_checkpoints` — requested-checkpoint pressure
+### `PG-CHKPT-008` (`requested_checkpoints`) — requested-checkpoint pressure
 
 - **Вопрос и роль:** выросли ли requested checkpoints и их write/sync work?
   Requested anomaly — возможный `lead`; I/O — `downstream`.
@@ -484,7 +488,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
 - **DQ:** standard; PG version/layout показывается. Reset любой исходной семьи
   разрывает общий расчёт.
 
-### `wal_amplification` — WAL/FPI amplification
+### `PG-WAL-009` (`wal_amplification`) — WAL/FPI amplification
 
 - **Вопрос и роль:** выросли ли WAL bytes/record, FPI share или случаи full WAL
   buffers? Роль — `lead`/`amplifier`; cap `medium` только с различающим
@@ -504,7 +508,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   — из `pg_stat_wal`. WAL configuration и связь с checkpoint описаны в
   [официальной документации](https://www.postgresql.org/docs/18/wal-configuration.html).
 
-### `shared_buffer_misses` — shared-buffer miss pressure
+### `PG-CACHE-010` (`shared_buffer_misses`) — shared-buffer miss pressure
 
 - **Вопрос и роль:** выросли ли обращения, не найденные в PostgreSQL shared
   buffers? Роль — `lead`/`amplifier`; cap `medium`.
@@ -522,7 +526,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   относится только к PostgreSQL buffer cache и не включает OS cache:
   [PG16 statistics](https://www.postgresql.org/docs/16/monitoring-stats.html).
 
-### `backend_io_latency` — PostgreSQL I/O time per counted unit
+### `PG-IO-011` (`backend_io_latency`) — PostgreSQL I/O time per counted unit
 
 - **Вопрос и роль:** выросло ли наблюдаемое время на одну учтённую operation или
   block внутри PostgreSQL? Обычно `downstream` OS/device pressure или
@@ -549,7 +553,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   накопленным временем, gate off -> `NotCollected`. Ноль не означает быстрый
   I/O.
 
-### `lock_wait_graph` — heavyweight lock wait graph
+### `PG-LOCK-012` (`lock_wait_graph`) — heavyweight lock wait graph
 
 - **Вопрос и роль:** какой backend непосредственно блокировал waiter в момент
   снимка? Blocker — `lead`, waiter latency — `downstream`.
@@ -571,7 +575,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   `pg_blocking_pids()` —
   [официальные system functions](https://www.postgresql.org/docs/18/functions-info.html).
 
-### `xmin_horizon_hold` — удержание xmin и открытые транзакции
+### `PG-HORIZON-013` (`xmin_horizon_hold`) — удержание xmin и открытые транзакции
 
 - **Вопрос и роль:** есть ли long/idle/prepared transaction, способная удерживать
   vacuum horizon или locks? Роль — `lead` к vacuum debt; cap `medium`.
@@ -597,7 +601,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   `coincident`/`amplifier`: directional edge разрешается только после
   relation-level entity join и P/I/D clock contract.
 
-### `connection_saturation` — connection и transaction pressure
+### `PG-CONN-014` (`connection_saturation`) — connection и transaction pressure
 
 - **Вопрос и роль:** приблизилось ли число backends к лимиту и вырос ли churn
   соединений при снижении throughput? Роль — `lead`/`amplifier`; cap `medium`.
@@ -620,7 +624,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
 - **DQ:** standard; shared database row and unlimited/invalid datconnlimit
   исключаются; permission-limited activity lowers confidence.
 
-### `replication_lag` — physical replication progress
+### `PG-REPL-015` (`replication_lag`) — physical replication progress
 
 - **Вопрос и роль:** на каком наблюдаемом LSN stage растёт byte gap? Это
   `downstream`/`coincident` до появления независимого resource evidence; cap
@@ -641,7 +645,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   Нормативная семантика lag —
   [PG16 monitoring](https://www.postgresql.org/docs/16/monitoring-stats.html).
 
-### `slot_wal_retention` — WAL retention replication slot
+### `PG-SLOT-016` (`slot_wal_retention`) — WAL retention replication slot
 
 - **Вопрос и роль:** удерживает ли slot растущий объём WAL? Роль — `lead` к
   filesystem pressure; cap `medium`.
@@ -661,7 +665,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   заявляются. Поля описаны в
   [`pg_replication_slots`](https://www.postgresql.org/docs/18/view-pg-replication-slots.html).
 
-### `wal_archiving_failure` — ошибки WAL archiving
+### `PG-ARCH-017` (`wal_archiving_failure`) — ошибки WAL archiving
 
 - **Вопрос и роль:** были ли подтверждённые ошибки archive command/library?
   Свежая failure — `lead`/`amplifier`; cap `medium`.
@@ -679,7 +683,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
   Ограничение порядка зафиксировано в
   [cumulative statistics](https://www.postgresql.org/docs/18/monitoring-stats.html).
 
-### `sync_replication_wait` — sampled synchronous-replication wait
+### `PG-SYNC-018` (`sync_replication_wait`) — sampled synchronous-replication wait
 
 - **Вопрос и роль:** наблюдались ли backends на `wait_event='SyncRep'` при
   настроенной synchronous replication? Роль — `lead` к commit latency либо
@@ -701,7 +705,7 @@ period/clock. Planning-зависимые ветки (п. 2) и temporal directi
 - **DQ:** standard; `wait_event=NULL` under insufficient privileges/coverage is
   unknown. Snapshot sampling пропускает короткие waits.
 
-### `internal_wait_concentration` — sampled internal wait concentration
+### `PG-WAIT-019` (`internal_wait_concentration`) — sampled internal wait concentration
 
 - **Вопрос и роль:** выросла ли доля active backends, увиденных на
   `LWLock`, `BufferPin` или `IO` wait? Роль — `coincident`/`amplifier`; cap
@@ -725,7 +729,7 @@ OS finding связывается с PostgreSQL только при совпад
 интервала и совместимого scope. Host-wide signal нельзя приписывать container
 без PID-to-cgroup или cgroup evidence.
 
-### `cpu_saturation` — host CPU pressure и steal
+### `OS-CPU-020` (`cpu_saturation`) — host CPU pressure и steal
 
 - **Вопрос и роль:** испытывал ли host runnable pressure или hypervisor steal?
   Роль — `lead`/`amplifier`; cap `medium`.
@@ -748,7 +752,7 @@ OS finding связывается с PostgreSQL только при совпад
   System-level CPU `full` не определён и не собирается; kernel contract —
   [PSI](https://docs.kernel.org/accounting/psi.html).
 
-### `cgroup_cpu_throttling` — cgroup CPU throttling
+### `OS-CGRP-021` (`cgroup_cpu_throttling`) — cgroup CPU throttling
 
 - **Вопрос и роль:** была ли cgroup PostgreSQL реально throttled при доступном
   host CPU? Роль — `lead`/`amplifier`; cap `medium`.
@@ -768,7 +772,7 @@ OS finding связывается с PostgreSQL только при совпад
   fields are defined in
   [cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html).
 
-### `memory_reclaim` — host reclaim, swap и OOM
+### `OS-MEM-022` (`memory_reclaim`) — host reclaim, swap и OOM
 
 - **Вопрос и роль:** совпала ли деградация с host memory pressure, direct
   reclaim, swap or OOM? Роль — `lead`/`amplifier`; cap `medium`.
@@ -784,7 +788,7 @@ OS finding связывается с PostgreSQL только при совпад
   PSI, top process RSS/swap/major faults, lifecycle evidence.
 - **DQ:** standard; optional vmstat NULL is unknown. Gauge fall is not Reset.
 
-### `cgroup_memory_limit` — cgroup memory limit events
+### `OS-CGMEM-023` (`cgroup_memory_limit`) — cgroup memory limit events
 
 - **Вопрос и роль:** достигала ли PostgreSQL cgroup `memory.high/max` или OOM?
   Роль — `lead`/`amplifier`; cap `medium`, `high` только для kill event плюс
@@ -802,7 +806,7 @@ OS finding связывается с PostgreSQL только при совпад
   collector как нули; ноль не подавляет finding и не доказывает отсутствие
   события. Positive values remain evidence.
 
-### `block_device_latency` — block-device latency и queue pressure
+### `OS-BLOCK-024` (`block_device_latency`) — block-device latency и queue pressure
 
 - **Вопрос и роль:** выросли ли completion time и очередь конкретного device?
   Роль — `lead`/`amplifier`; cap `medium`.
@@ -822,7 +826,7 @@ OS finding связывается с PostgreSQL только при совпад
 - **DQ:** standard; reset при reattach/overflow. Kernel semantics —
   [I/O statistics fields](https://docs.kernel.org/admin-guide/iostats.html).
 
-### `writeback_pressure` — dirty/writeback pressure
+### `OS-WB-025` (`writeback_pressure`) — dirty/writeback pressure
 
 - **Вопрос и роль:** совпали ли elevated Dirty/Writeback и device write/flush
   work с PG sync/write latency? Роль — `amplifier`/`coincident`; cap `low`,
@@ -841,7 +845,7 @@ OS finding связывается с PostgreSQL только при совпад
   `P/I/D`, но не превращается в точную attribution. Kernel threshold semantics —
   [VM sysctl](https://docs.kernel.org/admin-guide/sysctl/vm.html).
 
-### `io_contender` — внешний I/O contender
+### `OS-IOWHO-026` (`io_contender`) — внешний I/O contender
 
 - **Вопрос и роль:** какая process/cgroup увеличила block I/O рядом с pressure?
   Роль — `lead`/`amplifier`; cap `medium` при cgroup-device mapping, иначе `low`.
@@ -859,7 +863,7 @@ OS finding связывается с PostgreSQL только при совпад
   no negative inference from missing PID. `/proc/PID/io` semantics —
   [procfs documentation](https://docs.kernel.org/filesystems/proc.html).
 
-### `filesystem_space` — filesystem byte headroom
+### `OS-FS-027` (`filesystem_space`) — filesystem byte headroom
 
 - **Вопрос и роль:** был ли mount близок к исчерпанию доступных bytes? Роль —
   `lead`/`amplifier`; cap `high` для наблюдаемого zero/near-zero headroom,
@@ -881,7 +885,7 @@ OS finding связывается с PostgreSQL только при совпад
 - **DQ:** `NULL` statvfs -> not evaluated; zero is real zero. Inode exhaustion
   не покрывается и не упоминается как результат этой линзы.
 
-### `network_errors` — network errors и retransmission
+### `OS-NET-028` (`network_errors`) — network errors и retransmission
 
 - **Вопрос и роль:** наблюдался ли рост interface/TCP error counters? Роль —
   `coincident`/`amplifier`; cap `low` для связи с PostgreSQL.
