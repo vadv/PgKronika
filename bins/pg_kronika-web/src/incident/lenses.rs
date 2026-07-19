@@ -1,8 +1,11 @@
 //! Dormant diagnostic catalog metadata.
 
+use super::evidence::ConfidenceCap;
+
 const MAX_DORMANT_LENSES: usize = 28;
 const MAX_MISSING_PER_LENS: usize = 6;
 const MAX_CATALOG_TOKEN_BYTES: usize = 40;
+const MAX_CATALOG_TEXT_BYTES: usize = 200;
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -42,15 +45,51 @@ impl MissingCapability {
     }
 }
 
-/// A design-catalog entry with known missing capabilities.
+/// Diagnostic domain a lens belongs to.
+#[derive(Clone, Copy)]
+pub(crate) enum Domain {
+    Pg,
+    Os,
+}
+
+impl Domain {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pg => "pg",
+            Self::Os => "os",
+        }
+    }
+}
+
+/// A design-catalog entry with a human name and known missing capabilities.
 pub(crate) struct DormantLens {
     lens_id: &'static str,
+    domain: Domain,
+    title: &'static str,
+    detects: &'static str,
+    confidence: ConfidenceCap,
     missing: &'static [MissingCapability],
 }
 
 impl DormantLens {
     pub(crate) const fn lens_id(&self) -> &'static str {
         self.lens_id
+    }
+
+    pub(crate) const fn domain(&self) -> Domain {
+        self.domain
+    }
+
+    pub(crate) const fn title(&self) -> &'static str {
+        self.title
+    }
+
+    pub(crate) const fn detects(&self) -> &'static str {
+        self.detects
+    }
+
+    pub(crate) const fn confidence(&self) -> ConfidenceCap {
+        self.confidence
     }
 
     pub(crate) const fn missing(&self) -> &'static [MissingCapability] {
@@ -63,6 +102,10 @@ use MissingCapability as Missing;
 const DORMANT_CATALOG: &[DormantLens] = &[
     DormantLens {
         lens_id: "PG-QRY-001",
+        domain: Domain::Pg,
+        title: "Сдвиг профиля запроса",
+        detects: "У нормализованного запроса изменились частота, работа на вызов или время исполнения.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -72,6 +115,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-PLAN-002",
+        domain: Domain::Pg,
+        title: "Смена плана запроса",
+        detects: "Деградация запроса совпала с появлением или сменой `planid`.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::GaugeSamples,
@@ -83,6 +130,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-TEMP-003",
+        domain: Domain::Pg,
+        title: "Спил во временные файлы",
+        detects: "Рост работы через временные блоки и файлы.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -94,6 +145,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-ANALYZE-004",
+        domain: Domain::Pg,
+        title: "Устаревшая статистика планировщика",
+        detects: "`n_mod_since_analyze` высок, свежего analyze нет, план/работа поехали.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
@@ -104,6 +159,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-VACUUM-005",
+        domain: Domain::Pg,
+        title: "Отставание vacuum",
+        detects: "Растёт долг мёртвых кортежей, cleanup не успевает.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
@@ -115,6 +174,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-FREEZE-006",
+        domain: Domain::Pg,
+        title: "Приближение wraparound XID/MXID",
+        detects: "Headroom по возрасту XID/MXID тает, близко к форсированному aggressive vacuum.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
             Missing::LogEvents,
@@ -125,6 +188,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-HOT-007",
+        domain: Domain::Pg,
+        title: "Срыв HOT-обновлений",
+        detects: "Доля non-HOT updates растёт вместе с работой по индексам и WAL.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -135,6 +202,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-CHKPT-008",
+        domain: Domain::Pg,
+        title: "Внеплановые контрольные точки",
+        detects: "Растёт доля requested checkpoints и их write/sync-работа.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -145,6 +216,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-WAL-009",
+        domain: Domain::Pg,
+        title: "Раздувание WAL и FPI",
+        detects: "Растут WAL bytes на запись, доля FPI, `wal_buffers_full`.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -155,6 +230,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-CACHE-010",
+        domain: Domain::Pg,
+        title: "Промахи shared buffers",
+        detects: "Растёт доля промахов shared buffers по базе/отношению/контексту.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -165,6 +244,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-IO-011",
+        domain: Domain::Pg,
+        title: "Задержка I/O внутри PostgreSQL",
+        detects: "Растёт время на операцию или блок (`pg_stat_io`, PG16+).",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -175,10 +258,18 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-LOCK-012",
+        domain: Domain::Pg,
+        title: "Граф ожидания блокировок",
+        detects: "Кто блокировал ожидающего в момент снимка (`blocked_by` из `pg_locks`).",
+        confidence: ConfidenceCap::High,
         missing: &[Missing::BlockedByEdges, Missing::LockSnapshotCoverage],
     },
     DormantLens {
         lens_id: "PG-HORIZON-013",
+        domain: Domain::Pg,
+        title: "Удержание горизонта xmin",
+        detects: "Долгая или idle-in-transaction транзакция держит vacuum-горизонт.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
@@ -190,6 +281,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-CONN-014",
+        domain: Domain::Pg,
+        title: "Насыщение по соединениям",
+        detects: "Backends подходят к `max_connections`, churn растёт при падении throughput.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
@@ -201,6 +296,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-REPL-015",
+        domain: Domain::Pg,
+        title: "Отставание физической репликации",
+        detects: "На каком LSN-этапе растёт байтовый разрыв (sent/write/flush/replay).",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
@@ -211,6 +310,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-SLOT-016",
+        domain: Domain::Pg,
+        title: "Удержание WAL слотом репликации",
+        detects: "Слот держит растущий WAL, `retained_bytes` со склоном вверх.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
             Missing::EntityJoin,
@@ -220,6 +323,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-ARCH-017",
+        domain: Domain::Pg,
+        title: "Ошибки архивации WAL",
+        detects: "Подтверждённые ошибки archive command/library (`failed_count`).",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::GaugeSamples,
@@ -230,6 +337,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-SYNC-018",
+        domain: Domain::Pg,
+        title: "Ожидание синхронной репликации",
+        detects: "Backends висят на `wait_event='SyncRep'` при настроенной синхронной репликации.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::ActivityRows,
             Missing::CounterDeltas,
@@ -240,6 +351,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "PG-WAIT-019",
+        domain: Domain::Pg,
+        title: "Концентрация внутренних ожиданий",
+        detects: "Растёт доля active backends на `LWLock`/`BufferPin`/`IO` wait.",
+        confidence: ConfidenceCap::Low,
         missing: &[
             Missing::ActivityRows,
             Missing::EntityJoin,
@@ -249,6 +364,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "OS-CPU-020",
+        domain: Domain::Os,
+        title: "Насыщение CPU хоста",
+        detects: "Runnable pressure, iowait, steal.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -259,6 +378,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "OS-CGRP-021",
+        domain: Domain::Os,
+        title: "Троттлинг CPU в cgroup",
+        detects: "Реальный throttling cgroup при доступном CPU хоста.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::PidCgroupMapping,
             Missing::CounterDeltas,
@@ -269,6 +392,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "OS-MEM-022",
+        domain: Domain::Os,
+        title: "Нехватка памяти хоста",
+        detects: "Memory pressure, direct reclaim, swap, OOM.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
@@ -279,6 +406,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "OS-CGMEM-023",
+        domain: Domain::Os,
+        title: "Лимит памяти cgroup",
+        detects: "Достижение `memory.high`/`max`/OOM в cgroup.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::PidCgroupMapping,
             Missing::GaugeSamples,
@@ -290,6 +421,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "OS-BLOCK-024",
+        domain: Domain::Os,
+        title: "Задержка блочного устройства",
+        detects: "Растут время завершения и очередь устройства.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -300,6 +435,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "OS-WB-025",
+        domain: Domain::Os,
+        title: "Давление dirty/writeback",
+        detects: "Повышенные Dirty/Writeback совпали с write/sync-задержкой PostgreSQL.",
+        confidence: ConfidenceCap::Low,
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
@@ -310,6 +449,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "OS-IOWHO-026",
+        domain: Domain::Os,
+        title: "Внешний потребитель I/O",
+        detects: "Какой процесс или cgroup нарастил block I/O рядом с давлением.",
+        confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
             Missing::PidCgroupMapping,
@@ -320,6 +463,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "OS-FS-027",
+        domain: Domain::Os,
+        title: "Исчерпание места ФС",
+        detects: "Точка монтирования близка к исчерпанию байтов.",
+        confidence: ConfidenceCap::High,
         missing: &[
             Missing::GaugeSamples,
             Missing::EntityJoin,
@@ -330,6 +477,10 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
     DormantLens {
         lens_id: "OS-NET-028",
+        domain: Domain::Os,
+        title: "Сетевые ошибки и ретрансмиты",
+        detects: "Растут счётчики ошибок интерфейса и TCP-ретрансмиссий.",
+        confidence: ConfidenceCap::Low,
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
@@ -370,6 +521,10 @@ const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
         let lens = &catalog[lens_at];
         if lens.lens_id.is_empty()
             || lens.lens_id.len() > MAX_CATALOG_TOKEN_BYTES
+            || lens.title.is_empty()
+            || lens.title.len() > MAX_CATALOG_TEXT_BYTES
+            || lens.detects.is_empty()
+            || lens.detects.len() > MAX_CATALOG_TEXT_BYTES
             || lens.missing.is_empty()
             || lens.missing.len() > MAX_MISSING_PER_LENS
         {
@@ -442,6 +597,17 @@ mod tests {
         "OS-NET-028",
     ];
 
+    fn fixture(lens_id: &'static str, missing: &'static [MissingCapability]) -> DormantLens {
+        DormantLens {
+            lens_id,
+            domain: Domain::Pg,
+            title: "title",
+            detects: "detects",
+            confidence: ConfidenceCap::Medium,
+            missing,
+        }
+    }
+
     #[test]
     fn catalog_ids_match_the_contract_order() {
         let ids: Vec<_> = dormant_catalog().iter().map(DormantLens::lens_id).collect();
@@ -449,34 +615,33 @@ mod tests {
     }
 
     #[test]
+    fn domain_strings_are_stable() {
+        assert_eq!(Domain::Pg.as_str(), "pg");
+        assert_eq!(Domain::Os.as_str(), "os");
+    }
+
+    #[test]
     fn duplicate_ids_are_invalid() {
         let duplicate = [
-            DormantLens {
-                lens_id: "PG-LOCK-012",
-                missing: &[Missing::BlockedByEdges],
-            },
-            DormantLens {
-                lens_id: "PG-LOCK-012",
-                missing: &[Missing::LockSnapshotCoverage],
-            },
+            fixture("PG-LOCK-012", &[Missing::BlockedByEdges]),
+            fixture("PG-LOCK-012", &[Missing::LockSnapshotCoverage]),
         ];
         assert!(!catalog_is_valid(&duplicate));
     }
 
     #[test]
     fn duplicate_capabilities_are_invalid() {
-        let duplicate = [DormantLens {
-            lens_id: "PG-LOCK-012",
-            missing: &[Missing::BlockedByEdges, Missing::BlockedByEdges],
-        }];
+        let duplicate = [fixture(
+            "PG-LOCK-012",
+            &[Missing::BlockedByEdges, Missing::BlockedByEdges],
+        )];
         assert!(!catalog_is_valid(&duplicate));
     }
 
     #[test]
     fn catalog_growth_requires_a_new_bound() {
-        let oversized = std::array::from_fn::<_, { MAX_DORMANT_LENSES + 1 }, _>(|_| DormantLens {
-            lens_id: "x",
-            missing: &[Missing::InputCoverage],
+        let oversized = std::array::from_fn::<_, { MAX_DORMANT_LENSES + 1 }, _>(|_| {
+            fixture("x", &[Missing::InputCoverage])
         });
         assert!(!catalog_is_valid(&oversized));
     }

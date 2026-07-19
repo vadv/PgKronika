@@ -32,6 +32,14 @@ impl ConfidenceCap {
             Self::High => Confidence::high(),
         }
     }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -343,6 +351,13 @@ mod tests {
     fn confidence_orders_low_medium_high() {
         assert!(Confidence::LOW < Confidence::MEDIUM);
         assert!(Confidence::MEDIUM < Confidence::high());
+    }
+
+    #[test]
+    fn confidence_cap_strings_are_stable() {
+        assert_eq!(ConfidenceCap::Low.as_str(), "low");
+        assert_eq!(ConfidenceCap::Medium.as_str(), "medium");
+        assert_eq!(ConfidenceCap::High.as_str(), "high");
     }
 
     #[test]
