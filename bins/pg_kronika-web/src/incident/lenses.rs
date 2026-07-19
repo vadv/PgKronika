@@ -3,6 +3,7 @@
 use super::evidence::ConfidenceCap;
 
 const MAX_DORMANT_LENSES: usize = 28;
+const MAX_LOG_DORMANT_LENSES: usize = 32;
 const MAX_MISSING_PER_LENS: usize = 6;
 const MAX_CATALOG_TOKEN_BYTES: usize = 40;
 const MAX_CATALOG_TEXT_BYTES: usize = 200;
@@ -500,6 +501,124 @@ pub(crate) const fn dormant_catalog() -> &'static [DormantLens] {
     DORMANT_CATALOG
 }
 
+/// Dormant lenses reading events visible only in the `PostgreSQL` log, kept in
+/// a sub-catalog separate from the metric one so each keeps its own size bound.
+const LOG_DORMANT_CATALOG: &[DormantLens] = &[
+    // Батч 1 (core): доступность, ресурсы, целостность — self-contained, high.
+    DormantLens {
+        lens_id: "oom_kill",
+        domain: Domain::Pg,
+        title: "OOM-kill бэкенда",
+        detects: "Убил ли OOM-killer backend PostgreSQL?",
+        confidence: ConfidenceCap::High,
+        missing: &[
+            Missing::LogEvents,
+            Missing::LogDetailContinuation,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "backend_crash",
+        domain: Domain::Pg,
+        title: "Аварийное завершение backend",
+        detects: "Упал ли backend по сигналу (SIGSEGV/SIGABRT) с каскадом восстановления?",
+        confidence: ConfidenceCap::High,
+        missing: &[
+            Missing::LogEvents,
+            Missing::LogDetailContinuation,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "panic_shutdown",
+        domain: Domain::Pg,
+        title: "PANIC / аварийная остановка",
+        detects: "Была ли PANIC-запись, обрушившая кластер?",
+        confidence: ConfidenceCap::High,
+        missing: &[Missing::LogEvents, Missing::SourcePeriod],
+    },
+    DormantLens {
+        lens_id: "disk_full_log",
+        domain: Domain::Pg,
+        title: "Нет места на диске (по логу)",
+        detects: "Отказала ли запись из-за ENOSPC?",
+        confidence: ConfidenceCap::High,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "out_of_memory_log",
+        domain: Domain::Pg,
+        title: "Ошибка нехватки памяти (по логу)",
+        detects: "Отказал ли аллокатор PostgreSQL по памяти?",
+        confidence: ConfidenceCap::High,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "connection_slots_exhausted",
+        domain: Domain::Pg,
+        title: "Исчерпание слотов соединений",
+        detects: "Отклонялись ли подключения по лимиту?",
+        confidence: ConfidenceCap::High,
+        missing: &[
+            Missing::LogEvents,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "deadlock",
+        domain: Domain::Pg,
+        title: "Взаимоблокировка",
+        detects: "Обнаружил ли PostgreSQL цикл блокировок с жертвой?",
+        confidence: ConfidenceCap::High,
+        missing: &[
+            Missing::LogEvents,
+            Missing::LogDetailContinuation,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+    DormantLens {
+        lens_id: "data_corruption_log",
+        domain: Domain::Pg,
+        title: "Повреждение данных (по логу)",
+        detects: "Зафиксировано ли повреждение страниц/индексов/checksum?",
+        confidence: ConfidenceCap::High,
+        missing: &[
+            Missing::LogEvents,
+            Missing::LogDetailContinuation,
+            Missing::EntityJoin,
+            Missing::SourcePeriod,
+        ],
+    },
+];
+
+/// Log lenses whose single record is a self-contained finding — activate first.
+const CORE_LOG_LENS_IDS: &[&str] = &[
+    "oom_kill",
+    "backend_crash",
+    "panic_shutdown",
+    "disk_full_log",
+    "out_of_memory_log",
+    "connection_slots_exhausted",
+    "deadlock",
+    "data_corruption_log",
+];
+
+/// Returns dormant log-lens design entries, separate from the metric catalog.
+pub(crate) const fn log_dormant_catalog() -> &'static [DormantLens] {
+    LOG_DORMANT_CATALOG
+}
+
 const fn text_eq(left: &str, right: &str) -> bool {
     let left = left.as_bytes();
     let right = right.as_bytes();
@@ -517,7 +636,15 @@ const fn text_eq(left: &str, right: &str) -> bool {
 }
 
 const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
-    if catalog.is_empty() || catalog.len() > MAX_DORMANT_LENSES {
+    catalog_within_bounds(catalog, MAX_DORMANT_LENSES)
+}
+
+const fn log_catalog_is_valid(catalog: &[DormantLens]) -> bool {
+    catalog_within_bounds(catalog, MAX_LOG_DORMANT_LENSES)
+}
+
+const fn catalog_within_bounds(catalog: &[DormantLens], max_lenses: usize) -> bool {
+    if catalog.is_empty() || catalog.len() > max_lenses {
         return false;
     }
     let mut lens_at = 0;
@@ -564,6 +691,11 @@ const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
 const _: () = assert!(
     catalog_is_valid(DORMANT_CATALOG),
     "dormant catalog violates static bounds"
+);
+
+const _: () = assert!(
+    log_catalog_is_valid(LOG_DORMANT_CATALOG),
+    "log dormant catalog violates static bounds"
 );
 
 #[cfg(test)]
@@ -674,5 +806,32 @@ mod tests {
             requirements,
             ["sampled_blocked_by_edges", "lock_snapshot_coverage"]
         );
+    }
+
+    #[test]
+    fn log_catalog_satisfies_its_static_bounds() {
+        assert!(log_catalog_is_valid(log_dormant_catalog()));
+        assert!(!log_dormant_catalog().is_empty());
+    }
+
+    #[test]
+    fn log_lenses_stay_in_the_postgres_domain() {
+        assert!(
+            log_dormant_catalog()
+                .iter()
+                .all(|lens| lens.domain().as_str() == "pg")
+        );
+    }
+
+    #[test]
+    fn core_log_lens_ids_are_catalogued() {
+        for id in CORE_LOG_LENS_IDS {
+            assert!(
+                log_dormant_catalog()
+                    .iter()
+                    .any(|lens| lens.lens_id() == *id),
+                "core log lens `{id}` is missing from the catalog"
+            );
+        }
     }
 }
