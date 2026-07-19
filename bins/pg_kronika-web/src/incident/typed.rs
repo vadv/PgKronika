@@ -64,7 +64,8 @@ pub(crate) struct PairedSums {
 struct GaugeTrack {
     points: Vec<GaugePoint>,
     breaks: Vec<i64>,
-    gaps: Vec<GaugeGap>,
+    shared_breaks: Arc<[i64]>,
+    gaps: Arc<[GaugeGap]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +78,20 @@ pub(crate) struct GaugePoint {
 struct GaugeGap {
     from: i64,
     to: i64,
+}
+
+/// Section-level coverage gaps shared by tracks built from one reader page.
+#[derive(Clone)]
+pub(crate) struct GaugeQuality {
+    gaps: Arc<[GaugeGap]>,
+}
+
+impl GaugeQuality {
+    pub(crate) fn new(gaps: &[(i64, i64)]) -> Self {
+        Self {
+            gaps: Arc::from(normalize_gaps(gaps)),
+        }
+    }
 }
 
 type GaugeEntityTracks = BTreeMap<Arc<[IdentityValue]>, GaugeTrack>;
@@ -403,9 +418,30 @@ impl TypedInputs {
         section: &'static str,
         column: &'static str,
         identity: Arc<[IdentityValue]>,
+        raw_points: Vec<(i64, f64)>,
+        breaks: Vec<i64>,
+        gaps: Vec<(i64, i64)>,
+    ) {
+        self.insert_gauge_with_shared_quality(
+            section,
+            column,
+            identity,
+            raw_points,
+            breaks,
+            Arc::from([]),
+            &GaugeQuality::new(&gaps),
+        );
+    }
+
+    pub(crate) fn insert_gauge_with_shared_quality(
+        &mut self,
+        section: &'static str,
+        column: &'static str,
+        identity: Arc<[IdentityValue]>,
         mut raw_points: Vec<(i64, f64)>,
         mut breaks: Vec<i64>,
-        gaps: Vec<(i64, i64)>,
+        mut shared_breaks: Arc<[i64]>,
+        quality: &GaugeQuality,
     ) {
         raw_points.sort_by_key(|point| point.0);
         let mut points = Vec::with_capacity(raw_points.len());
@@ -422,17 +458,19 @@ impl TypedInputs {
         }
         breaks.sort_unstable();
         breaks.dedup();
-        let mut gaps: Vec<GaugeGap> = gaps
-            .into_iter()
-            .filter_map(|(from, to)| (from < to).then_some(GaugeGap { from, to }))
-            .collect();
-        gaps.sort_by_key(|gap| (gap.from, gap.to));
+        if !shared_breaks.windows(2).all(|pair| pair[0] < pair[1]) {
+            let mut normalized = shared_breaks.to_vec();
+            normalized.sort_unstable();
+            normalized.dedup();
+            shared_breaks = normalized.into();
+        }
         self.gauges.entry((section, column)).or_default().insert(
             identity,
             GaugeTrack {
                 points,
                 breaks,
-                gaps,
+                shared_breaks,
+                gaps: Arc::clone(&quality.gaps),
             },
         );
     }
@@ -458,14 +496,9 @@ impl TypedInputs {
             return None;
         }
         let track = self.gauge(section, column, identity)?;
-        if track
-            .breaks
-            .iter()
-            .any(|&timestamp| (from_us..to_us).contains(&timestamp))
-            || track
-                .gaps
-                .iter()
-                .any(|gap| gap.from < to_us && gap.to > from_us)
+        if sorted_timestamp_in_window(&track.breaks, from_us, to_us)
+            || sorted_timestamp_in_window(&track.shared_breaks, from_us, to_us)
+            || sorted_gap_overlaps(&track.gaps, from_us, to_us)
         {
             return None;
         }
@@ -545,6 +578,37 @@ impl TypedInputs {
             denominator: denominator.points,
         })
     }
+}
+
+fn normalize_gaps(gaps: &[(i64, i64)]) -> Vec<GaugeGap> {
+    let mut gaps: Vec<GaugeGap> = gaps
+        .iter()
+        .filter_map(|&(from, to)| (from < to).then_some(GaugeGap { from, to }))
+        .collect();
+    gaps.sort_by_key(|gap| (gap.from, gap.to));
+    let mut merged: Vec<GaugeGap> = Vec::with_capacity(gaps.len());
+    for gap in gaps {
+        if let Some(previous) = merged.last_mut()
+            && gap.from <= previous.to
+        {
+            previous.to = previous.to.max(gap.to);
+        } else {
+            merged.push(gap);
+        }
+    }
+    merged
+}
+
+fn sorted_timestamp_in_window(timestamps: &[i64], from_us: i64, to_us: i64) -> bool {
+    let index = timestamps.partition_point(|&timestamp| timestamp < from_us);
+    timestamps
+        .get(index)
+        .is_some_and(|&timestamp| timestamp < to_us)
+}
+
+fn sorted_gap_overlaps(gaps: &[GaugeGap], from_us: i64, to_us: i64) -> bool {
+    let index = gaps.partition_point(|gap| gap.to <= from_us);
+    gaps.get(index).is_some_and(|gap| gap.from < to_us)
 }
 
 #[cfg(test)]

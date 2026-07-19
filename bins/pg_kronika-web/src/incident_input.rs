@@ -12,8 +12,8 @@ use kronika_registry::ColumnClass;
 use crate::anomaly::{EpisodeHit, ScanCounts, ScanParams, scan_section};
 use crate::handlers::v1::{DIFF_MAX_ROWS, Gates};
 use crate::incident::{
-    EnrichedEpisode, EpisodeRefV1, IdentityValue, Series, SeriesError, SeriesInsertError,
-    SeriesSet, TypedInputs,
+    EnrichedEpisode, EpisodeRefV1, GaugeQuality, IdentityValue, Series, SeriesError,
+    SeriesInsertError, SeriesSet, TypedInputs,
 };
 
 /// Data exclusions recorded while building engine input.
@@ -631,23 +631,25 @@ impl BuildState {
         gaps: &[(i64, i64)],
         duplicate_breaks: &[DuplicateGaugeBreak],
     ) {
+        let quality = GaugeQuality::new(gaps);
         for series in gauge_series {
             let Some(identity) = accept_identity(&series.key) else {
                 continue;
             };
-            let duplicates = duplicate_breaks
+            let shared_breaks: std::sync::Arc<[i64]> = duplicate_breaks
                 .iter()
                 .filter(|duplicate| duplicate.identity.as_slice() == identity.as_ref())
-                .map(|duplicate| duplicate.timestamp);
-            for (&name, mut column) in gauges.iter().zip(series.columns) {
-                column.breaks.extend(duplicates.clone());
-                self.typed.insert_gauge_with_quality(
+                .map(|duplicate| duplicate.timestamp)
+                .collect();
+            for (&name, column) in gauges.iter().zip(series.columns) {
+                self.typed.insert_gauge_with_shared_quality(
                     section,
                     name,
                     std::sync::Arc::clone(&identity),
                     column.points,
                     column.breaks,
-                    gaps.to_vec(),
+                    std::sync::Arc::clone(&shared_breaks),
+                    &quality,
                 );
             }
         }
