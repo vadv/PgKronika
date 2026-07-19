@@ -25,4 +25,4 @@ pub(crate) use engine::{
     reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"
 )]
 pub(crate) use lens::Lens;
-pub(crate) use lenses::dormant_catalog;
+pub(crate) use lenses::{DormantLens, dormant_catalog, log_dormant_catalog};

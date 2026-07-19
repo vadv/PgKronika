@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::anomaly::ScanParams;
 use crate::incident::{
-    EngineOutcome, EngineSkip, EpisodeRefV1, IdentityValue, Incident, LimitAxis,
+    DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, IdentityValue, Incident, LimitAxis,
 };
 use crate::incident_input::{InputQuality, SectionSkip, SkipReason};
 
@@ -128,7 +128,19 @@ fn identity_to_json(value: &IdentityValue) -> Value {
 }
 
 fn catalog_to_json() -> Value {
-    let dormant: Vec<Value> = crate::incident::dormant_catalog()
+    json!({
+        "status": "dormant",
+        "requirements_status": "incomplete",
+        "diagnosis_available": false,
+        "scope": "anomaly_clustering_only",
+        "applied": Value::Array(Vec::new()),
+        "dormant": dormant_entries(crate::incident::dormant_catalog()),
+        "log_dormant": dormant_entries(crate::incident::log_dormant_catalog()),
+    })
+}
+
+fn dormant_entries(catalog: &'static [DormantLens]) -> Vec<Value> {
+    catalog
         .iter()
         .map(|lens| {
             let awaiting: Vec<_> = lens
@@ -146,15 +158,7 @@ fn catalog_to_json() -> Value {
                 "requirements_status": "incomplete",
             })
         })
-        .collect();
-    json!({
-        "status": "dormant",
-        "requirements_status": "incomplete",
-        "diagnosis_available": false,
-        "scope": "anomaly_clustering_only",
-        "applied": Value::Array(Vec::new()),
-        "dormant": dormant,
-    })
+        .collect()
 }
 
 fn quality_to_json(quality: &InputQuality, node_identity: &str) -> Value {
@@ -277,7 +281,9 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    const MAX_CATALOG_JSON_BYTES: usize = 16 * 1024;
+    // Metric (28) plus log (up to 32) dormant entries; measured at 20_085 bytes
+    // for the current 28 + 26 with headroom for the log catalog to fill.
+    const MAX_CATALOG_JSON_BYTES: usize = 24 * 1024;
 
     fn scan() -> ScanParams {
         ScanParams {
@@ -321,6 +327,42 @@ mod tests {
         assert_eq!(catalog, catalog_to_json());
         let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
+    }
+
+    #[test]
+    fn log_dormant_section_lists_every_log_lens() {
+        let catalog = catalog_to_json();
+        let log_dormant = catalog["log_dormant"]
+            .as_array()
+            .expect("catalog lists dormant log lenses");
+        assert_eq!(log_dormant.len(), 26);
+        assert!(log_dormant.iter().all(|entry| {
+            entry["domain"] == "pg" && entry["requirements_status"] == "incomplete"
+        }));
+    }
+
+    #[test]
+    fn log_dormant_renders_the_oom_kill_core_lens() {
+        let catalog = catalog_to_json();
+        let oom = catalog["log_dormant"]
+            .as_array()
+            .expect("log lenses are an array")
+            .iter()
+            .find(|entry| entry["lens_id"] == "oom_kill")
+            .expect("oom_kill lens is dormant");
+        assert_eq!(oom["domain"], "pg");
+        assert_eq!(oom["confidence"], "high");
+        assert_eq!(oom["title"], "OOM-kill бэкенда");
+        assert_eq!(oom["detects"], "Убил ли OOM-killer backend PostgreSQL?");
+        assert_eq!(
+            oom["awaiting"],
+            json!([
+                "typed_log_events",
+                "log_detail_continuation",
+                "cross_section_entity_join",
+                "source_period_provenance"
+            ])
+        );
     }
 
     #[test]
