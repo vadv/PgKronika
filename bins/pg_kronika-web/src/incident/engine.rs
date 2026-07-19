@@ -63,6 +63,7 @@ pub(crate) struct IncidentConfig {
     max_lens_evaluations: u64,
     max_findings: u64,
     max_evidence_rows: u64,
+    max_output_bytes: u64,
 }
 
 impl IncidentConfig {
@@ -88,6 +89,7 @@ impl IncidentConfig {
             max_lens_evaluations: 1_000_000,
             max_findings: 50_000,
             max_evidence_rows: 200_000,
+            max_output_bytes: 32 << 20,
         }
     }
 }
@@ -114,7 +116,25 @@ impl IncidentConfig {
             max_lens_evaluations: u64::MAX,
             max_findings: u64::MAX,
             max_evidence_rows: u64::MAX,
+            max_output_bytes: u64::MAX,
         }
+    }
+
+    pub(crate) fn for_test_with_work_limit(
+        node_self_id: &str,
+        epsilon_us: i64,
+        max_cluster_span_us: i64,
+        clock_relation: ClockRelation,
+        work_limit: u64,
+    ) -> Self {
+        let mut config = Self::for_test(
+            node_self_id,
+            epsilon_us,
+            max_cluster_span_us,
+            clock_relation,
+        );
+        config.work_limit = work_limit;
+        config
     }
 }
 
@@ -258,7 +278,11 @@ pub(crate) fn analyze(
 
     let mut budget = WorkBudget::new(config.work_limit);
     let mut output_counts = OutputCounts::new();
-    let output_limits = OutputLimits::new(config.max_findings, config.max_evidence_rows);
+    let output_limits = OutputLimits::bounded(
+        config.max_findings,
+        config.max_evidence_rows,
+        config.max_output_bytes,
+    );
     let mut lens_evaluations = 0_u64;
     let mut incidents = Vec::with_capacity(clustered.clusters.len());
     let mut skipped = Vec::new();
@@ -467,6 +491,7 @@ mod tests {
             max_lens_evaluations: 100,
             max_findings: 100,
             max_evidence_rows: 100,
+            max_output_bytes: 1 << 20,
         }
     }
 

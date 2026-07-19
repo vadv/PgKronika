@@ -1,13 +1,22 @@
-//! Active diagnostic lenses over typed counter evidence.
+//! Active diagnostic lenses over typed counter and gauge evidence.
+
+use std::sync::Arc;
 
 use super::cluster::Cluster;
 use super::dispatch::{LimitHit, SectionColumn};
 use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
-use super::evidence::{ConfidenceCap, Evidence, FindingDraft, FindingScope, Role};
+use super::evidence::{
+    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
+    GaugeUnit, Role, ThresholdKind,
+};
+use super::gauge_contracts::{
+    CgroupMemoryLens, FreezeHorizonLens, PhysicalReplicationLens, RunningVacuumLens,
+    SlotRetentionLens, StorageCapacityLens,
+};
 use super::lens::Lens;
 use super::series::SeriesSet;
-use super::typed::TypedInputs;
+use super::typed::{GaugeObjective, TypedInputs};
 
 const PG_STAT_DATABASE: &str = "pg_stat_database";
 const PG_STAT_WAL: &str = "pg_stat_wal";
@@ -17,6 +26,7 @@ const PG_STAT_USER_TABLES: &str = "pg_stat_user_tables";
 const PG_STAT_ARCHIVER: &str = "pg_stat_archiver";
 const OS_NETDEV: &str = "os_netdev";
 const OS_CGROUP_CPU: &str = "os_cgroup_cpu";
+const OS_MEMINFO: &str = "os_meminfo";
 
 /// `PG-CACHE-010` (`shared_buffer_misses`): shared-buffer miss pressure. Reports
 /// an elevated `sum(d(blks_read)) / sum(d(blks_read) + d(blks_hit))` over the
@@ -703,6 +713,357 @@ impl Lens for CgroupCpuThrottlingLens {
     }
 }
 
+/// `PG-ANALYZE-004`: observed modifications relative to the planner row
+/// estimate. This does not assert that a plan changed.
+pub(crate) struct StaleStatisticsLens;
+
+impl StaleStatisticsLens {
+    const ID: &'static str = "PG-ANALYZE-004";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: PG_STAT_USER_TABLES,
+            column: "n_mod_since_analyze",
+        },
+        SectionColumn {
+            section: PG_STAT_USER_TABLES,
+            column: "reltuples",
+        },
+    ];
+    const MIN_SAMPLES: usize = 1;
+    const MODIFIED_FRACTION_FLOOR: f64 = 0.2;
+}
+
+impl Lens for StaleStatisticsLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Low
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        for member in &cluster.members {
+            if member.logical_section != PG_STAT_USER_TABLES
+                || member.column != "n_mod_since_analyze"
+            {
+                continue;
+            }
+            let Some(window) = typed.paired_gauge_window(
+                PG_STAT_USER_TABLES,
+                &member.identity,
+                ("n_mod_since_analyze", "reltuples"),
+                context.incident_start_us,
+                context.incident_end_us,
+            ) else {
+                continue;
+            };
+            sink.charge_points(window.inspected_points())?;
+            let Some(pair) = window.reduce(GaugeObjective::RatioAbsOneMax) else {
+                continue;
+            };
+            if pair.samples < Self::MIN_SAMPLES {
+                continue;
+            }
+            let denominator = pair.b.abs().max(1.0);
+            if pair.a < 0.0 || pair.a / denominator < Self::MODIFIED_FRACTION_FLOOR {
+                continue;
+            }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(pair.a, denominator, GaugeUnit::Count),
+                Self::MODIFIED_FRACTION_FLOOR,
+                ThresholdKind::AtLeast,
+                pair.observed_at_us,
+                pair.samples,
+                GaugeEntity::new(PG_STAT_USER_TABLES, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_episode(member),
+                vec![Evidence::GaugeObservation(evidence)],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `PG-CONN-014`: observed occupancy of one database's `datconnlimit`.
+pub(crate) struct ConnectionSaturationLens;
+
+impl ConnectionSaturationLens {
+    const ID: &'static str = "PG-CONN-014";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: PG_STAT_DATABASE,
+            column: "numbackends",
+        },
+        SectionColumn {
+            section: PG_STAT_DATABASE,
+            column: "datconnlimit",
+        },
+    ];
+    const MIN_SAMPLES: usize = 1;
+    const SATURATION_FLOOR: f64 = 0.8;
+}
+
+impl Lens for ConnectionSaturationLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Medium
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        for member in &cluster.members {
+            if member.logical_section != PG_STAT_DATABASE || member.column != "numbackends" {
+                continue;
+            }
+            let Some(window) = typed.paired_gauge_window(
+                PG_STAT_DATABASE,
+                &member.identity,
+                ("numbackends", "datconnlimit"),
+                context.incident_start_us,
+                context.incident_end_us,
+            ) else {
+                continue;
+            };
+            sink.charge_points(window.inspected_points())?;
+            let Some(pair) = window.reduce(GaugeObjective::RatioMax) else {
+                continue;
+            };
+            if pair.samples < Self::MIN_SAMPLES {
+                continue;
+            }
+            if pair.a < 0.0 || pair.b <= 0.0 || pair.a / pair.b < Self::SATURATION_FLOOR {
+                continue;
+            }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(pair.a, pair.b, GaugeUnit::Count),
+                Self::SATURATION_FLOOR,
+                ThresholdKind::AtLeast,
+                pair.observed_at_us,
+                pair.samples,
+                GaugeEntity::new(PG_STAT_DATABASE, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_episode(member),
+                vec![Evidence::GaugeObservation(evidence)],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `OS-MEM-022`: an observed low `MemAvailable / MemTotal` sample.
+pub(crate) struct MemoryReclaimLens;
+
+impl MemoryReclaimLens {
+    const ID: &'static str = "OS-MEM-022";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: OS_MEMINFO,
+            column: "mem_available",
+        },
+        SectionColumn {
+            section: OS_MEMINFO,
+            column: "mem_total",
+        },
+    ];
+    const MIN_SAMPLES: usize = 1;
+    const AVAILABLE_FRACTION_FLOOR: f64 = 0.05;
+}
+
+impl Lens for MemoryReclaimLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Low
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        for member in &cluster.members {
+            if member.logical_section != OS_MEMINFO || member.column != "mem_available" {
+                continue;
+            }
+            let Some(window) = typed.paired_gauge_window(
+                OS_MEMINFO,
+                &member.identity,
+                ("mem_available", "mem_total"),
+                context.incident_start_us,
+                context.incident_end_us,
+            ) else {
+                continue;
+            };
+            sink.charge_points(window.inspected_points())?;
+            let Some(pair) = window.reduce(GaugeObjective::RatioMin) else {
+                continue;
+            };
+            if pair.samples < Self::MIN_SAMPLES {
+                continue;
+            }
+            if pair.b <= 0.0 || pair.a / pair.b >= Self::AVAILABLE_FRACTION_FLOOR {
+                continue;
+            }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(pair.a, pair.b, GaugeUnit::Kibibytes),
+                Self::AVAILABLE_FRACTION_FLOOR,
+                ThresholdKind::Below,
+                pair.observed_at_us,
+                pair.samples,
+                GaugeEntity::new(OS_MEMINFO, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_episode(member),
+                vec![Evidence::GaugeObservation(evidence)],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `OS-WB-025`: an observed `(Dirty + Writeback) / MemTotal` crossing.
+pub(crate) struct WritebackPressureLens;
+
+impl WritebackPressureLens {
+    const ID: &'static str = "OS-WB-025";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: OS_MEMINFO,
+            column: "dirty",
+        },
+        SectionColumn {
+            section: OS_MEMINFO,
+            column: "writeback",
+        },
+        SectionColumn {
+            section: OS_MEMINFO,
+            column: "mem_total",
+        },
+    ];
+    const MIN_SAMPLES: usize = 1;
+    const DIRTY_FRACTION_FLOOR: f64 = 0.1;
+}
+
+impl Lens for WritebackPressureLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Low
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        for member in &cluster.members {
+            if member.logical_section != OS_MEMINFO || member.column != "dirty" {
+                continue;
+            }
+            let Some(window) = typed.triple_gauge_window(
+                OS_MEMINFO,
+                &member.identity,
+                ("dirty", "writeback", "mem_total"),
+                context.incident_start_us,
+                context.incident_end_us,
+            ) else {
+                continue;
+            };
+            sink.charge_points(window.inspected_points())?;
+            let Some(reading) = window.sum_ratio_max() else {
+                continue;
+            };
+            if reading.samples < Self::MIN_SAMPLES {
+                continue;
+            }
+            let numerator = reading.a + reading.b;
+            if reading.denominator <= 0.0
+                || numerator / reading.denominator < Self::DIRTY_FRACTION_FLOOR
+            {
+                continue;
+            }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(numerator, reading.denominator, GaugeUnit::Kibibytes),
+                Self::DIRTY_FRACTION_FLOOR,
+                ThresholdKind::AtLeast,
+                reading.observed_at_us,
+                reading.samples,
+                GaugeEntity::new(OS_MEMINFO, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_episode(member),
+                vec![Evidence::GaugeObservation(evidence)],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
 /// The lenses whose typed inputs are wired, applied to every request.
 pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
     vec![
@@ -715,6 +1076,16 @@ pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
         Box::new(WalArchivingFailureLens),
         Box::new(NetworkErrorsLens),
         Box::new(CgroupCpuThrottlingLens),
+        Box::new(StaleStatisticsLens),
+        Box::new(ConnectionSaturationLens),
+        Box::new(MemoryReclaimLens),
+        Box::new(WritebackPressureLens),
+        Box::new(RunningVacuumLens),
+        Box::new(FreezeHorizonLens),
+        Box::new(PhysicalReplicationLens),
+        Box::new(SlotRetentionLens),
+        Box::new(CgroupMemoryLens),
+        Box::new(StorageCapacityLens),
     ]
 }
 
@@ -730,7 +1101,6 @@ mod tests {
     use crate::incident::model::{EnrichedEpisode, EpisodeRefV1, IdentityValue};
     use crate::incident::{ClockRelation, IncidentConfig, analyze};
     use kronika_analytics::{DiffPoint, Direction, Episode, Evaluated, Scalar};
-    use std::sync::Arc;
 
     fn id() -> Arc<[IdentityValue]> {
         Arc::from(vec![IdentityValue::U64(5)])
@@ -861,6 +1231,16 @@ mod tests {
                 "PG-ARCH-017",
                 "OS-NET-028",
                 "OS-CGRP-021",
+                "PG-ANALYZE-004",
+                "PG-CONN-014",
+                "OS-MEM-022",
+                "OS-WB-025",
+                "PG-VACUUM-005",
+                "PG-FREEZE-006",
+                "PG-REPL-015",
+                "PG-SLOT-016",
+                "OS-CGMEM-023",
+                "OS-FS-027",
             ]
         );
         let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
@@ -1438,5 +1818,195 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    // Gauge readings at ts 0.. within the run_lens incident window `[0, 10]`.
+    fn gauges(section: &'static str, columns: &[(&'static str, &[f64])]) -> TypedInputs {
+        let mut typed = TypedInputs::new();
+        for &(name, values) in columns {
+            let points = values
+                .iter()
+                .zip(0_i64..)
+                .map(|(&value, ts)| (ts, value))
+                .collect();
+            typed.insert_gauge(section, name, id(), points);
+        }
+        typed
+    }
+
+    #[test]
+    fn stale_statistics_uses_reltuples_and_reports_only_the_observation() {
+        let typed = gauges(
+            PG_STAT_USER_TABLES,
+            &[("n_mod_since_analyze", &[250.0]), ("reltuples", &[1_000.0])],
+        );
+        assert_eq!(
+            run_lens(
+                &StaleStatisticsLens,
+                PG_STAT_USER_TABLES,
+                "n_mod_since_analyze",
+                &typed,
+            ),
+            vec![(Role::Coincident, Confidence::LOW)]
+        );
+    }
+
+    #[test]
+    fn stale_statistics_below_the_ratio_reports_nothing() {
+        let typed = gauges(
+            PG_STAT_USER_TABLES,
+            &[("n_mod_since_analyze", &[199.0]), ("reltuples", &[1_000.0])],
+        );
+        assert!(
+            run_lens(
+                &StaleStatisticsLens,
+                PG_STAT_USER_TABLES,
+                "n_mod_since_analyze",
+                &typed,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_statistics_uses_absolute_estimate_and_includes_equality() {
+        let typed = gauges(
+            PG_STAT_USER_TABLES,
+            &[
+                ("n_mod_since_analyze", &[200.0]),
+                ("reltuples", &[-1_000.0]),
+            ],
+        );
+        assert_eq!(
+            run_lens(
+                &StaleStatisticsLens,
+                PG_STAT_USER_TABLES,
+                "n_mod_since_analyze",
+                &typed,
+            ),
+            vec![(Role::Coincident, Confidence::LOW)]
+        );
+    }
+
+    #[test]
+    fn per_database_connection_limit_includes_the_threshold_boundary() {
+        let typed = gauges(
+            PG_STAT_DATABASE,
+            &[("numbackends", &[80.0]), ("datconnlimit", &[100.0])],
+        );
+        assert_eq!(
+            run_lens(
+                &ConnectionSaturationLens,
+                PG_STAT_DATABASE,
+                "numbackends",
+                &typed,
+            ),
+            vec![(Role::Coincident, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn nonpositive_database_connection_limits_are_not_denominators() {
+        for limit in [-2.0, -1.0, 0.0] {
+            let typed = gauges(
+                PG_STAT_DATABASE,
+                &[("numbackends", &[80.0]), ("datconnlimit", &[limit])],
+            );
+            assert!(
+                run_lens(
+                    &ConnectionSaturationLens,
+                    PG_STAT_DATABASE,
+                    "numbackends",
+                    &typed,
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn low_host_available_memory_is_a_low_confidence_observation() {
+        let typed = gauges(
+            OS_MEMINFO,
+            &[("mem_available", &[4.0]), ("mem_total", &[100.0])],
+        );
+        assert_eq!(
+            run_lens(&MemoryReclaimLens, OS_MEMINFO, "mem_available", &typed,),
+            vec![(Role::Coincident, Confidence::LOW)]
+        );
+    }
+
+    #[test]
+    fn available_memory_equal_to_the_floor_does_not_cross_below_it() {
+        let typed = gauges(
+            OS_MEMINFO,
+            &[("mem_available", &[5.0]), ("mem_total", &[100.0])],
+        );
+        assert!(run_lens(&MemoryReclaimLens, OS_MEMINFO, "mem_available", &typed,).is_empty());
+    }
+
+    #[test]
+    fn zero_host_memory_total_is_not_a_denominator() {
+        let typed = gauges(
+            OS_MEMINFO,
+            &[("mem_available", &[0.0]), ("mem_total", &[0.0])],
+        );
+        assert!(run_lens(&MemoryReclaimLens, OS_MEMINFO, "mem_available", &typed,).is_empty());
+    }
+
+    #[test]
+    fn writeback_ratio_uses_dirty_plus_writeback_at_one_timestamp() {
+        let typed = gauges(
+            OS_MEMINFO,
+            &[
+                ("dirty", &[6.0]),
+                ("writeback", &[4.0]),
+                ("mem_total", &[100.0]),
+            ],
+        );
+        assert_eq!(
+            run_lens(&WritebackPressureLens, OS_MEMINFO, "dirty", &typed,),
+            vec![(Role::Coincident, Confidence::LOW)]
+        );
+    }
+
+    #[test]
+    fn ten_active_gauges_and_nine_counters_are_accounted_once() {
+        let active = active_catalog_ids();
+        assert_eq!(active.len(), 19);
+        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 9);
+        let unique: std::collections::BTreeSet<_> = active.iter().copied().collect();
+        assert_eq!(unique.len(), active.len());
+    }
+
+    #[test]
+    fn gauge_window_work_is_admitted_before_reduction() {
+        let typed = gauges(
+            OS_MEMINFO,
+            &[
+                ("mem_available", &[4.0, 4.0, 4.0]),
+                ("mem_total", &[100.0, 100.0, 100.0]),
+            ],
+        );
+        let mut episode = episode_window(0, 10);
+        episode.reference.logical_section = OS_MEMINFO;
+        episode.reference.column = "mem_available";
+        let lens = MemoryReclaimLens;
+        let lenses: [&dyn Lens; 1] = [&lens];
+        let config =
+            IncidentConfig::for_test_with_work_limit("node", 5, 1_000, ClockRelation::Unknown, 5);
+        let outcome = analyze(
+            vec![episode],
+            &SeriesSet::for_test(0),
+            &typed,
+            &lenses,
+            &config,
+        )
+        .expect("valid analysis");
+        assert!(!outcome.complete);
+        assert!(outcome.incidents[0].findings.is_empty());
+        assert_eq!(outcome.skipped[0].limit.axis, super::super::LimitAxis::Work);
+        assert_eq!(outcome.skipped[0].limit.observed, 8);
+        assert_eq!(outcome.skipped[0].limit.limit, 5);
     }
 }

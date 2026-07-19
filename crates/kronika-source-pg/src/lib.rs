@@ -47,6 +47,7 @@ pub use activity::{
 
 pub mod archiver;
 pub mod database;
+pub mod incident_gauges;
 pub mod instance_metadata;
 pub mod io;
 pub mod locks;

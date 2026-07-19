@@ -1,6 +1,7 @@
 //! Evidence-gated confidence and direction.
 
 use std::sync::Arc;
+use std::{cmp::Ordering, hash::Hash};
 
 use super::engine::TemporalDirectionPermit;
 use super::model::{EpisodeRefV1, IdentityValue};
@@ -100,10 +101,279 @@ impl DirectEvidence {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FiniteValue(f64);
+
+impl FiniteValue {
+    pub(crate) fn new(value: f64) -> Option<Self> {
+        value
+            .is_finite()
+            .then_some(Self(if value == 0.0 { 0.0 } else { value }))
+    }
+
+    pub(crate) const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl PartialEq for FiniteValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for FiniteValue {}
+
+impl PartialOrd for FiniteValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FiniteValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl Hash for FiniteValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GaugeUnit {
+    Count,
+    Bytes,
+    Kibibytes,
+    Microseconds,
+    Ratio,
+    BytesPerSecond,
+}
+
+impl GaugeUnit {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Bytes => "bytes",
+            Self::Kibibytes => "KiB",
+            Self::Microseconds => "microseconds",
+            Self::Ratio => "ratio",
+            Self::BytesPerSecond => "bytes_per_second",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ThresholdKind {
+    AtLeast,
+    Below,
+}
+
+impl ThresholdKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::AtLeast => "at_least",
+            Self::Below => "below",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GaugeMeasurement {
+    Value(FiniteValue),
+    Ratio {
+        numerator: FiniteValue,
+        denominator: FiniteValue,
+        operand_unit: GaugeUnit,
+    },
+    Trend {
+        first: FiniteValue,
+        last: FiniteValue,
+        elapsed_us: u64,
+        operand_unit: GaugeUnit,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GaugeRatio {
+    numerator: f64,
+    denominator: f64,
+    operand_unit: GaugeUnit,
+}
+
+pub(crate) struct GaugeTrendInput {
+    pub first: f64,
+    pub last: f64,
+    pub operand_unit: GaugeUnit,
+    pub threshold_per_second: f64,
+    pub threshold_kind: ThresholdKind,
+    pub first_at_us: i64,
+    pub last_at_us: i64,
+    pub samples: usize,
+    pub entity: GaugeEntity,
+}
+
+impl GaugeRatio {
+    pub(crate) const fn new(numerator: f64, denominator: f64, operand_unit: GaugeUnit) -> Self {
+        Self {
+            numerator,
+            denominator,
+            operand_unit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GaugeEntity {
+    section: &'static str,
+    identity: Arc<[IdentityValue]>,
+}
+
+impl GaugeEntity {
+    pub(crate) const fn new(section: &'static str, identity: Arc<[IdentityValue]>) -> Self {
+        Self { section, identity }
+    }
+
+    pub(crate) const fn section(&self) -> &'static str {
+        self.section
+    }
+
+    pub(crate) fn identity(&self) -> &[IdentityValue] {
+        &self.identity
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GaugeEvidence {
+    measurement: GaugeMeasurement,
+    unit: GaugeUnit,
+    threshold: FiniteValue,
+    threshold_kind: ThresholdKind,
+    observed_at_us: i64,
+    samples: u64,
+    entity: GaugeEntity,
+}
+
+impl GaugeEvidence {
+    pub(crate) fn value(
+        value: f64,
+        unit: GaugeUnit,
+        threshold: f64,
+        threshold_kind: ThresholdKind,
+        observed_at_us: i64,
+        samples: usize,
+        entity: GaugeEntity,
+    ) -> Option<Self> {
+        let samples = u64::try_from(samples).ok()?;
+        (samples > 0 && !entity.section().is_empty()).then_some(())?;
+        Some(Self {
+            measurement: GaugeMeasurement::Value(FiniteValue::new(value)?),
+            unit,
+            threshold: FiniteValue::new(threshold)?,
+            threshold_kind,
+            observed_at_us,
+            samples,
+            entity,
+        })
+    }
+
+    pub(crate) fn ratio(
+        ratio: GaugeRatio,
+        threshold: f64,
+        threshold_kind: ThresholdKind,
+        observed_at_us: i64,
+        samples: usize,
+        entity: GaugeEntity,
+    ) -> Option<Self> {
+        (ratio.denominator > 0.0).then_some(())?;
+        FiniteValue::new(ratio.numerator / ratio.denominator)?;
+        let samples = u64::try_from(samples).ok()?;
+        (samples > 0 && !entity.section().is_empty()).then_some(())?;
+        Some(Self {
+            measurement: GaugeMeasurement::Ratio {
+                numerator: FiniteValue::new(ratio.numerator)?,
+                denominator: FiniteValue::new(ratio.denominator)?,
+                operand_unit: ratio.operand_unit,
+            },
+            unit: GaugeUnit::Ratio,
+            threshold: FiniteValue::new(threshold)?,
+            threshold_kind,
+            observed_at_us,
+            samples,
+            entity,
+        })
+    }
+
+    pub(crate) fn trend(input: GaugeTrendInput) -> Option<Self> {
+        let GaugeTrendInput {
+            first,
+            last,
+            operand_unit,
+            threshold_per_second,
+            threshold_kind,
+            first_at_us,
+            last_at_us,
+            samples,
+            entity,
+        } = input;
+        let elapsed_us = u64::try_from(last_at_us.checked_sub(first_at_us)?).ok()?;
+        (elapsed_us > 0).then_some(())?;
+        let elapsed_seconds = std::time::Duration::from_micros(elapsed_us).as_secs_f64();
+        FiniteValue::new((last - first) / elapsed_seconds)?;
+        let samples = u64::try_from(samples).ok()?;
+        (samples >= 2 && !entity.section().is_empty()).then_some(())?;
+        Some(Self {
+            measurement: GaugeMeasurement::Trend {
+                first: FiniteValue::new(first)?,
+                last: FiniteValue::new(last)?,
+                elapsed_us,
+                operand_unit,
+            },
+            unit: GaugeUnit::BytesPerSecond,
+            threshold: FiniteValue::new(threshold_per_second)?,
+            threshold_kind,
+            observed_at_us: last_at_us,
+            samples,
+            entity,
+        })
+    }
+
+    pub(crate) const fn measurement(&self) -> &GaugeMeasurement {
+        &self.measurement
+    }
+
+    pub(crate) const fn unit(&self) -> GaugeUnit {
+        self.unit
+    }
+
+    pub(crate) const fn threshold(&self) -> FiniteValue {
+        self.threshold
+    }
+
+    pub(crate) const fn threshold_kind(&self) -> ThresholdKind {
+        self.threshold_kind
+    }
+
+    pub(crate) const fn observed_at_us(&self) -> i64 {
+        self.observed_at_us
+    }
+
+    pub(crate) const fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    pub(crate) const fn entity(&self) -> &GaugeEntity {
+        &self.entity
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Evidence {
     Direct(DirectEvidence),
     Ratio,
+    GaugeObservation(GaugeEvidence),
     Gauge,
     Counter,
     Event,
@@ -122,7 +392,7 @@ impl Evidence {
         match self {
             Self::Direct(_) => "direct",
             Self::Ratio => "ratio",
-            Self::Gauge => "gauge",
+            Self::GaugeObservation(_) | Self::Gauge => "gauge",
             Self::Counter => "counter",
             Self::Event => "event",
         }
@@ -201,6 +471,42 @@ impl FindingDraft {
     pub(crate) const fn evidence_len(&self) -> usize {
         self.evidence.len()
     }
+
+    fn output_bytes_upper_bound(&self, lens_id: &str) -> u64 {
+        let evidence = self.evidence.iter().fold(0_u64, |total, item| {
+            let bytes = match item {
+                Evidence::GaugeObservation(gauge) => 512_u64
+                    .saturating_add(
+                        u64::try_from(gauge.entity().section().len()).unwrap_or(u64::MAX),
+                    )
+                    .saturating_add(identity_json_upper_bound(gauge.entity().identity())),
+                Evidence::Direct(_)
+                | Evidence::Ratio
+                | Evidence::Gauge
+                | Evidence::Counter
+                | Evidence::Event => 32,
+            };
+            total.saturating_add(bytes)
+        });
+        512_u64
+            .saturating_add(u64::try_from(lens_id.len()).unwrap_or(u64::MAX))
+            .saturating_add(identity_json_upper_bound(self.scope.identity()))
+            .saturating_add(evidence)
+    }
+}
+
+fn identity_json_upper_bound(identity: &[IdentityValue]) -> u64 {
+    identity.iter().fold(2_u64, |total, value| {
+        let bytes = match value {
+            IdentityValue::I64(_) | IdentityValue::U64(_) => 21,
+            IdentityValue::Bool(_) => 5,
+            IdentityValue::Text(text) => u64::try_from(text.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(6)
+                .saturating_add(2),
+        };
+        total.saturating_add(bytes).saturating_add(1)
+    })
 }
 
 impl Finding {
@@ -256,6 +562,7 @@ pub(super) mod sink {
     pub(crate) struct OutputCounts {
         findings: u64,
         evidence_rows: u64,
+        output_bytes: u64,
     }
 
     impl OutputCounts {
@@ -263,6 +570,7 @@ pub(super) mod sink {
             Self {
                 findings: 0,
                 evidence_rows: 0,
+                output_bytes: 0,
             }
         }
     }
@@ -271,6 +579,7 @@ pub(super) mod sink {
     pub(crate) struct OutputLimits {
         findings: u64,
         evidence_rows: u64,
+        output_bytes: u64,
     }
 
     impl OutputLimits {
@@ -278,6 +587,15 @@ pub(super) mod sink {
             Self {
                 findings,
                 evidence_rows,
+                output_bytes: u64::MAX,
+            }
+        }
+
+        pub(crate) const fn bounded(findings: u64, evidence_rows: u64, output_bytes: u64) -> Self {
+            Self {
+                findings,
+                evidence_rows,
+                output_bytes,
             }
         }
     }
@@ -340,9 +658,20 @@ pub(super) mod sink {
                 });
             }
 
+            let finding_bytes = draft.output_bytes_upper_bound(self.lens_id);
+            let output_observed = self.counts.output_bytes.saturating_add(finding_bytes);
+            if output_observed > self.limits.output_bytes {
+                return self.fail(LimitHit {
+                    axis: LimitAxis::OutputBytes,
+                    observed: output_observed,
+                    limit: self.limits.output_bytes,
+                });
+            }
+
             self.charge_work(evidence_rows)?;
             self.counts.findings = findings_observed;
             self.counts.evidence_rows = evidence_observed;
+            self.counts.output_bytes = output_observed;
             self.findings.push(Finding::from_draft(
                 self.lens_id,
                 self.confidence_cap,
@@ -492,5 +821,56 @@ mod tests {
     #[test]
     fn scope_order_is_total() {
         assert!(scope(1) < scope(2));
+    }
+
+    #[test]
+    fn gauge_evidence_rejects_non_finite_values_and_zero_denominators() {
+        let entity = Arc::from(vec![IdentityValue::I64(1)]);
+        assert!(
+            GaugeEvidence::value(
+                f64::NAN,
+                GaugeUnit::Bytes,
+                1.0,
+                ThresholdKind::AtLeast,
+                10,
+                1,
+                GaugeEntity::new("section", Arc::clone(&entity)),
+            )
+            .is_none()
+        );
+        assert!(
+            GaugeEvidence::ratio(
+                GaugeRatio::new(1.0, 0.0, GaugeUnit::Count),
+                0.5,
+                ThresholdKind::AtLeast,
+                10,
+                1,
+                GaugeEntity::new("section", entity),
+            )
+            .is_none()
+        );
+        assert!(
+            GaugeEvidence::ratio(
+                GaugeRatio::new(f64::MAX, f64::MIN_POSITIVE, GaugeUnit::Bytes),
+                0.5,
+                ThresholdKind::AtLeast,
+                10,
+                1,
+                GaugeEntity::new("section", Arc::from([])),
+            )
+            .is_none()
+        );
+        assert!(
+            GaugeEvidence::value(
+                1.0,
+                GaugeUnit::Count,
+                1.0,
+                ThresholdKind::AtLeast,
+                10,
+                0,
+                GaugeEntity::new("section", Arc::from([])),
+            )
+            .is_none()
+        );
     }
 }

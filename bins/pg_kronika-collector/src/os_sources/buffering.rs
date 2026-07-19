@@ -65,5 +65,11 @@ pub(crate) fn push_os_sources(buffers: &mut SectionBuffers, os: &OsSources) -> R
     for row in &os.cgroup_pids {
         buffer_row(buffers, *row)?;
     }
+    for row in &os.pg_storage_mounts {
+        buffer_row(buffers, *row)?;
+    }
+    if let Some(row) = os.pg_process_cgroup_memory {
+        buffer_row(buffers, row)?;
+    }
     Ok(())
 }

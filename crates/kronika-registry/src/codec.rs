@@ -25,6 +25,7 @@ use crate::contract::{ColumnType, TypeContract};
 
 pub mod bgwriter_checkpointer;
 pub mod collection_coverage;
+pub mod incident_gauges;
 pub mod instance_metadata;
 pub mod os_cgroup_cpu;
 pub mod os_cgroup_io;

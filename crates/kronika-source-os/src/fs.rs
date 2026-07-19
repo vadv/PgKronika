@@ -119,6 +119,14 @@ impl ProcFs {
         Self { root }
     }
 
+    /// Return the absolute path for a checked procfs-relative path.
+    ///
+    /// # Errors
+    /// Returns an error when `rel` is empty or escapes the configured root.
+    pub fn path(&self, rel: &str) -> io::Result<PathBuf> {
+        Ok(self.root.join(checked_relative_path(rel)?))
+    }
+
     /// Read `<root>/<rel>`, trimmed; empty content is an error.
     ///
     /// # Errors

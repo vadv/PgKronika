@@ -54,13 +54,14 @@ pub use codec::{
 };
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{
-    bgwriter_checkpointer, collection_coverage, instance_metadata, os_cgroup_cpu, os_cgroup_io,
-    os_cgroup_mapping, os_cgroup_memory, os_cgroup_pids, os_cpu, os_diskstats, os_loadavg,
-    os_meminfo, os_mountinfo, os_netdev, os_netstat, os_process, os_process_status, os_psi,
-    os_snmp, os_stat, os_topology, os_vmstat, pg_locks, pg_log, pg_prepared_xacts, pg_settings,
-    pg_stat_activity, pg_stat_archiver, pg_stat_database, pg_stat_io, pg_stat_progress_vacuum,
-    pg_stat_statements, pg_stat_user_indexes, pg_stat_user_tables, pg_stat_wal, pg_store_plans,
-    replication_instance, replication_replicas, replication_slots, reset_metadata,
+    bgwriter_checkpointer, collection_coverage, incident_gauges, instance_metadata, os_cgroup_cpu,
+    os_cgroup_io, os_cgroup_mapping, os_cgroup_memory, os_cgroup_pids, os_cpu, os_diskstats,
+    os_loadavg, os_meminfo, os_mountinfo, os_netdev, os_netstat, os_process, os_process_status,
+    os_psi, os_snmp, os_stat, os_topology, os_vmstat, pg_locks, pg_log, pg_prepared_xacts,
+    pg_settings, pg_stat_activity, pg_stat_archiver, pg_stat_database, pg_stat_io,
+    pg_stat_progress_vacuum, pg_stat_statements, pg_stat_user_indexes, pg_stat_user_tables,
+    pg_stat_wal, pg_store_plans, replication_instance, replication_replicas, replication_slots,
+    reset_metadata,
 };
 pub(crate) use codec::{check_row_cap, decode_batches, decode_section, encode_section};
 pub use contract::{
@@ -154,6 +155,14 @@ pub const fn registry() -> &'static [TypeContract] {
         collection_coverage::CollectionCoverageV1::CONTRACT,
         pg_log::PgLogGapV1::CONTRACT,
         pg_log::PgLogTempFileV1::CONTRACT,
+        incident_gauges::PgFreezeHorizonV1::CONTRACT,
+        incident_gauges::PgVacuumObservationV1::CONTRACT,
+        incident_gauges::PgReplicationPhysicalV1::CONTRACT,
+        incident_gauges::PgReplicationSlotRetentionV1::CONTRACT,
+        incident_gauges::PgReplicationSlotRetentionV2::CONTRACT,
+        incident_gauges::PgReplicationSlotRetentionV3::CONTRACT,
+        incident_gauges::PgStorageMountV1::CONTRACT,
+        incident_gauges::PgProcessCgroupMemoryV1::CONTRACT,
         os_process::OsProcess::CONTRACT,
         os_process_status::OsProcessStatus::CONTRACT,
         os_cpu::OsCpu::CONTRACT,
