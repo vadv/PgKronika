@@ -138,6 +138,10 @@ fn catalog_to_json() -> Value {
                 .collect();
             json!({
                 "lens_id": lens.lens_id(),
+                "domain": lens.domain().as_str(),
+                "title": lens.title(),
+                "detects": lens.detects(),
+                "confidence": lens.confidence().as_str(),
                 "awaiting": awaiting,
                 "requirements_status": "incomplete",
             })
@@ -273,7 +277,7 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    const MAX_CATALOG_JSON_BYTES: usize = 12 * 1024;
+    const MAX_CATALOG_JSON_BYTES: usize = 16 * 1024;
 
     fn scan() -> ScanParams {
         ScanParams {
@@ -459,6 +463,13 @@ mod tests {
         assert_eq!(
             lock["awaiting"],
             json!(["sampled_blocked_by_edges", "lock_snapshot_coverage"])
+        );
+        assert_eq!(lock["domain"], "pg");
+        assert_eq!(lock["confidence"], "high");
+        assert_eq!(lock["title"], "Граф ожидания блокировок");
+        assert_eq!(
+            lock["detects"],
+            "Кто блокировал ожидающего в момент снимка (`blocked_by` из `pg_locks`)."
         );
         assert!(
             body["catalog"]["dormant"]
