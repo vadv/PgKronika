@@ -928,7 +928,7 @@ mod tests {
     }
 
     /// The active lens ids the incidents endpoint advertises, in catalog order.
-    const ACTIVE_LENS_IDS: [&str; 15] = [
+    const ACTIVE_LENS_IDS: [&str; 19] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -944,6 +944,10 @@ mod tests {
         "PG-CONN-014",
         "PG-REPL-015",
         "PG-SLOT-016",
+        "OS-FS-027",
+        "OS-CGMEM-023",
+        "OS-MEM-022",
+        "OS-WB-025",
     ];
 
     #[tokio::test]
@@ -1001,7 +1005,7 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 13, "28 catalog lenses minus 15 active");
+        assert_eq!(dormant.len(), 9, "28 catalog lenses minus 19 active");
         assert!(
             dormant
                 .iter()

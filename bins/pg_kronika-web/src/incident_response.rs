@@ -313,7 +313,7 @@ mod tests {
     use super::*;
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
-    const APPLIED_IDS: [&str; 15] = [
+    const APPLIED_IDS: [&str; 19] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -329,6 +329,10 @@ mod tests {
         "PG-CONN-014",
         "PG-REPL-015",
         "PG-SLOT-016",
+        "OS-FS-027",
+        "OS-CGMEM-023",
+        "OS-MEM-022",
+        "OS-WB-025",
     ];
 
     const MAX_ENTRY_JSON_BYTES: usize = 256
@@ -379,7 +383,7 @@ mod tests {
         let catalog = catalog_to_json();
         assert_eq!(catalog, catalog_to_json());
         let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
-        assert_eq!(bytes.len(), 6_030);
+        assert_eq!(bytes.len(), 4_409);
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
         assert!(catalog.get("log_dormant").is_none());
         let entry = &catalog["dormant"][0];

@@ -21,6 +21,9 @@ const OS_CGROUP_CPU: &str = "os_cgroup_cpu";
 // logical name, not the codec module name).
 const PG_REPLICATION_SLOTS: &str = "pg_replication_slots";
 const PG_STAT_REPLICATION: &str = "pg_stat_replication";
+const OS_MOUNTINFO: &str = "os_mountinfo";
+const OS_CGROUP_MEMORY: &str = "os_cgroup_memory";
+const OS_MEMINFO: &str = "os_meminfo";
 
 /// `PG-CACHE-010` (`shared_buffer_misses`): shared-buffer miss pressure. Reports
 /// an elevated `sum(d(blks_read)) / sum(d(blks_read) + d(blks_hit))` over the
@@ -1171,6 +1174,313 @@ impl Lens for SlotWalRetentionLens {
     }
 }
 
+/// `OS-FS-027` (`filesystem_space`): a mount point running out of bytes. Reports a
+/// coincident finding when the worst in-window `free_bytes / total_bytes` for a
+/// mount drops below the floor. The design confidence anticipates a direct
+/// disk-full log event; on gauge evidence alone the finding stays capped at
+/// medium.
+pub(crate) struct FilesystemSpaceLens;
+
+impl FilesystemSpaceLens {
+    const ID: &'static str = "OS-FS-027";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: OS_MOUNTINFO,
+            column: "free_bytes",
+        },
+        SectionColumn {
+            section: OS_MOUNTINFO,
+            column: "total_bytes",
+        },
+    ];
+    const MIN_SAMPLES: usize = 1;
+    /// Under a tenth of the filesystem free is close to exhaustion.
+    const FREE_FRACTION_FLOOR: f64 = 0.1;
+}
+
+impl Lens for FilesystemSpaceLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::High
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        for member in &cluster.members {
+            if member.logical_section != OS_MOUNTINFO || member.column != "free_bytes" {
+                continue;
+            }
+            let Some(pair) = typed.paired_gauge(
+                OS_MOUNTINFO,
+                &member.identity,
+                ("free_bytes", "total_bytes"),
+                context.incident_start_us,
+                context.incident_end_us,
+                GaugeObjective::RatioMin,
+            ) else {
+                continue;
+            };
+            if pair.samples < Self::MIN_SAMPLES {
+                continue;
+            }
+            if pair.b <= 0.0 || pair.a / pair.b >= Self::FREE_FRACTION_FLOOR {
+                continue;
+            }
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_episode(member),
+                vec![Evidence::Gauge],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `OS-CGMEM-023` (`cgroup_memory_limit`): a cgroup nearing its memory ceiling.
+/// Reports an amplifier when the worst in-window `current / max` is elevated. A
+/// cgroup with no ceiling (`max` absent) is skipped; mapping the ceiling to a
+/// specific process is a cross-section join. Gauge evidence caps at medium.
+pub(crate) struct CgroupMemoryLimitLens;
+
+impl CgroupMemoryLimitLens {
+    const ID: &'static str = "OS-CGMEM-023";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: OS_CGROUP_MEMORY,
+            column: "current",
+        },
+        SectionColumn {
+            section: OS_CGROUP_MEMORY,
+            column: "max",
+        },
+    ];
+    const MIN_SAMPLES: usize = 1;
+    /// Ninety percent of the cgroup ceiling risks `memory.high` throttling.
+    const LIMIT_FLOOR: f64 = 0.9;
+}
+
+impl Lens for CgroupMemoryLimitLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Medium
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        for member in &cluster.members {
+            if member.logical_section != OS_CGROUP_MEMORY || member.column != "current" {
+                continue;
+            }
+            let Some(pair) = typed.paired_gauge(
+                OS_CGROUP_MEMORY,
+                &member.identity,
+                ("current", "max"),
+                context.incident_start_us,
+                context.incident_end_us,
+                GaugeObjective::RatioMax,
+            ) else {
+                continue;
+            };
+            if pair.samples < Self::MIN_SAMPLES {
+                continue;
+            }
+            if pair.b <= 0.0 || pair.a / pair.b < Self::LIMIT_FLOOR {
+                continue;
+            }
+            sink.emit(FindingDraft::new(
+                Role::Amplifier,
+                FindingScope::from_episode(member),
+                vec![Evidence::Gauge],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `OS-MEM-022` (`memory_reclaim`): host memory headroom collapsing. Reports an
+/// amplifier when the worst in-window `mem_available / mem_total` drops below the
+/// floor. It measures headroom, the gauge proxy for reclaim pressure; the direct
+/// signals (direct reclaim, swap, OOM) are counters and events left untouched
+/// here. Gauge evidence caps at medium.
+pub(crate) struct MemoryReclaimLens;
+
+impl MemoryReclaimLens {
+    const ID: &'static str = "OS-MEM-022";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: OS_MEMINFO,
+            column: "mem_available",
+        },
+        SectionColumn {
+            section: OS_MEMINFO,
+            column: "mem_total",
+        },
+    ];
+    const MIN_SAMPLES: usize = 1;
+    /// Under a twentieth of RAM available is heavy memory pressure.
+    const AVAILABLE_FRACTION_FLOOR: f64 = 0.05;
+}
+
+impl Lens for MemoryReclaimLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Medium
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        for member in &cluster.members {
+            if member.logical_section != OS_MEMINFO || member.column != "mem_available" {
+                continue;
+            }
+            let Some(pair) = typed.paired_gauge(
+                OS_MEMINFO,
+                &member.identity,
+                ("mem_available", "mem_total"),
+                context.incident_start_us,
+                context.incident_end_us,
+                GaugeObjective::RatioMin,
+            ) else {
+                continue;
+            };
+            if pair.samples < Self::MIN_SAMPLES {
+                continue;
+            }
+            if pair.b <= 0.0 || pair.a / pair.b >= Self::AVAILABLE_FRACTION_FLOOR {
+                continue;
+            }
+            sink.emit(FindingDraft::new(
+                Role::Amplifier,
+                FindingScope::from_episode(member),
+                vec![Evidence::Gauge],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `OS-WB-025` (`writeback_pressure`): dirty pages piling up against RAM. Reports
+/// an amplifier when the worst in-window `dirty / mem_total` is elevated, the
+/// gauge proxy for write-back pressure. Folding in `writeback` and correlating
+/// with `PostgreSQL` write/sync latency is a cross-section step; the design
+/// confidence is low, so its findings stay capped there.
+pub(crate) struct WritebackPressureLens;
+
+impl WritebackPressureLens {
+    const ID: &'static str = "OS-WB-025";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: OS_MEMINFO,
+            column: "dirty",
+        },
+        SectionColumn {
+            section: OS_MEMINFO,
+            column: "mem_total",
+        },
+    ];
+    const MIN_SAMPLES: usize = 1;
+    /// A tenth of RAM held dirty strains the write-back path.
+    const DIRTY_FRACTION_FLOOR: f64 = 0.1;
+}
+
+impl Lens for WritebackPressureLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Low
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        for member in &cluster.members {
+            if member.logical_section != OS_MEMINFO || member.column != "dirty" {
+                continue;
+            }
+            let Some(pair) = typed.paired_gauge(
+                OS_MEMINFO,
+                &member.identity,
+                ("dirty", "mem_total"),
+                context.incident_start_us,
+                context.incident_end_us,
+                GaugeObjective::RatioMax,
+            ) else {
+                continue;
+            };
+            if pair.samples < Self::MIN_SAMPLES {
+                continue;
+            }
+            if pair.b <= 0.0 || pair.a / pair.b < Self::DIRTY_FRACTION_FLOOR {
+                continue;
+            }
+            sink.emit(FindingDraft::new(
+                Role::Amplifier,
+                FindingScope::from_episode(member),
+                vec![Evidence::Gauge],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
 /// The lenses whose typed inputs are wired, applied to every request.
 pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
     vec![
@@ -1189,6 +1499,10 @@ pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
         Box::new(ConnectionSaturationLens),
         Box::new(ReplicationLagLens),
         Box::new(SlotWalRetentionLens),
+        Box::new(FilesystemSpaceLens),
+        Box::new(CgroupMemoryLimitLens),
+        Box::new(MemoryReclaimLens),
+        Box::new(WritebackPressureLens),
     ]
 }
 
@@ -1341,6 +1655,10 @@ mod tests {
                 "PG-CONN-014",
                 "PG-REPL-015",
                 "PG-SLOT-016",
+                "OS-FS-027",
+                "OS-CGMEM-023",
+                "OS-MEM-022",
+                "OS-WB-025",
             ]
         );
         let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
@@ -2253,6 +2571,147 @@ mod tests {
                 &SlotWalRetentionLens,
                 PG_REPLICATION_SLOTS,
                 "retained_bytes",
+                &TypedInputs::new()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn filesystem_space_below_the_free_floor_reports_a_medium_coincident() {
+        // 5 of 100 bytes free = 0.05, under the 0.1 floor. The High cap is held
+        // to medium by gauge evidence.
+        let typed = gauges(
+            OS_MOUNTINFO,
+            &[("free_bytes", &[5.0; 2]), ("total_bytes", &[100.0; 2])],
+        );
+        assert_eq!(
+            run_lens(&FilesystemSpaceLens, OS_MOUNTINFO, "free_bytes", &typed),
+            vec![(Role::Coincident, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn filesystem_space_with_room_to_spare_reports_nothing() {
+        let typed = gauges(
+            OS_MOUNTINFO,
+            &[("free_bytes", &[50.0; 2]), ("total_bytes", &[100.0; 2])],
+        );
+        assert!(run_lens(&FilesystemSpaceLens, OS_MOUNTINFO, "free_bytes", &typed).is_empty());
+    }
+
+    #[test]
+    fn filesystem_space_on_empty_input_reports_nothing() {
+        assert!(
+            run_lens(
+                &FilesystemSpaceLens,
+                OS_MOUNTINFO,
+                "free_bytes",
+                &TypedInputs::new()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn cgroup_memory_near_the_limit_reports_a_medium_amplifier() {
+        // 95 of a 100-byte ceiling = 0.95, above the 0.9 floor.
+        let typed = gauges(
+            OS_CGROUP_MEMORY,
+            &[("current", &[95.0; 2]), ("max", &[100.0; 2])],
+        );
+        assert_eq!(
+            run_lens(&CgroupMemoryLimitLens, OS_CGROUP_MEMORY, "current", &typed),
+            vec![(Role::Amplifier, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn cgroup_memory_with_headroom_reports_nothing() {
+        let typed = gauges(
+            OS_CGROUP_MEMORY,
+            &[("current", &[50.0; 2]), ("max", &[100.0; 2])],
+        );
+        assert!(run_lens(&CgroupMemoryLimitLens, OS_CGROUP_MEMORY, "current", &typed).is_empty());
+    }
+
+    #[test]
+    fn cgroup_memory_on_empty_input_reports_nothing() {
+        assert!(
+            run_lens(
+                &CgroupMemoryLimitLens,
+                OS_CGROUP_MEMORY,
+                "current",
+                &TypedInputs::new()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn memory_reclaim_below_the_headroom_floor_reports_a_medium_amplifier() {
+        // 3 of 100 bytes available = 0.03, under the 0.05 floor.
+        let typed = gauges(
+            OS_MEMINFO,
+            &[("mem_available", &[3.0; 2]), ("mem_total", &[100.0; 2])],
+        );
+        assert_eq!(
+            run_lens(&MemoryReclaimLens, OS_MEMINFO, "mem_available", &typed),
+            vec![(Role::Amplifier, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn memory_reclaim_with_ample_memory_reports_nothing() {
+        let typed = gauges(
+            OS_MEMINFO,
+            &[("mem_available", &[50.0; 2]), ("mem_total", &[100.0; 2])],
+        );
+        assert!(run_lens(&MemoryReclaimLens, OS_MEMINFO, "mem_available", &typed).is_empty());
+    }
+
+    #[test]
+    fn memory_reclaim_on_empty_input_reports_nothing() {
+        assert!(
+            run_lens(
+                &MemoryReclaimLens,
+                OS_MEMINFO,
+                "mem_available",
+                &TypedInputs::new()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn writeback_pressure_above_the_dirty_floor_reports_a_low_amplifier() {
+        // 15 of 100 bytes dirty = 0.15, above the 0.1 floor; capped at low.
+        let typed = gauges(
+            OS_MEMINFO,
+            &[("dirty", &[15.0; 2]), ("mem_total", &[100.0; 2])],
+        );
+        assert_eq!(
+            run_lens(&WritebackPressureLens, OS_MEMINFO, "dirty", &typed),
+            vec![(Role::Amplifier, Confidence::LOW)]
+        );
+    }
+
+    #[test]
+    fn writeback_pressure_with_few_dirty_pages_reports_nothing() {
+        let typed = gauges(
+            OS_MEMINFO,
+            &[("dirty", &[2.0; 2]), ("mem_total", &[100.0; 2])],
+        );
+        assert!(run_lens(&WritebackPressureLens, OS_MEMINFO, "dirty", &typed).is_empty());
+    }
+
+    #[test]
+    fn writeback_pressure_on_empty_input_reports_nothing() {
+        assert!(
+            run_lens(
+                &WritebackPressureLens,
+                OS_MEMINFO,
+                "dirty",
                 &TypedInputs::new()
             )
             .is_empty()
