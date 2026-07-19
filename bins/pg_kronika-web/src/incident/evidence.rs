@@ -228,13 +228,15 @@ impl GaugeEvidence {
         samples: usize,
         entity: GaugeEntity,
     ) -> Option<Self> {
+        let samples = u64::try_from(samples).ok()?;
+        (samples > 0 && !entity.section().is_empty()).then_some(())?;
         Some(Self {
             measurement: GaugeMeasurement::Value(FiniteValue::new(value)?),
             unit,
             threshold: FiniteValue::new(threshold)?,
             threshold_kind,
             observed_at_us,
-            samples: u64::try_from(samples).ok()?,
+            samples,
             entity,
         })
     }
@@ -249,6 +251,9 @@ impl GaugeEvidence {
         entity: GaugeEntity,
     ) -> Option<Self> {
         (denominator > 0.0).then_some(())?;
+        FiniteValue::new(numerator / denominator)?;
+        let samples = u64::try_from(samples).ok()?;
+        (samples > 0 && !entity.section().is_empty()).then_some(())?;
         Some(Self {
             measurement: GaugeMeasurement::Ratio {
                 numerator: FiniteValue::new(numerator)?,
@@ -258,7 +263,7 @@ impl GaugeEvidence {
             threshold: FiniteValue::new(threshold)?,
             threshold_kind,
             observed_at_us,
-            samples: u64::try_from(samples).ok()?,
+            samples,
             entity,
         })
     }
@@ -770,6 +775,30 @@ mod tests {
                 10,
                 1,
                 GaugeEntity::new("section", entity),
+            )
+            .is_none()
+        );
+        assert!(
+            GaugeEvidence::ratio(
+                f64::MAX,
+                f64::MIN_POSITIVE,
+                0.5,
+                ThresholdKind::AtLeast,
+                10,
+                1,
+                GaugeEntity::new("section", Arc::from([])),
+            )
+            .is_none()
+        );
+        assert!(
+            GaugeEvidence::value(
+                1.0,
+                GaugeUnit::Count,
+                1.0,
+                ThresholdKind::AtLeast,
+                10,
+                0,
+                GaugeEntity::new("section", Arc::from([])),
             )
             .is_none()
         );
