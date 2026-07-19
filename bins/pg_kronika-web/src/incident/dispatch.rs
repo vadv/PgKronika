@@ -58,6 +58,7 @@ pub(crate) enum LimitAxis {
     LensEvaluations,
     Findings,
     EvidenceRows,
+    OutputBytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +287,27 @@ mod tests {
                 limit: 1,
             })
         );
+        assert!(findings.is_empty());
+        assert_eq!(budget.spent(), 0);
+    }
+
+    #[test]
+    fn output_byte_limit_is_checked_before_retaining_a_finding() {
+        let mut findings = Vec::new();
+        let mut budget = WorkBudget::new(10);
+        let mut counts = OutputCounts::new();
+        let mut sink = FindingSink::new(
+            &mut findings,
+            &mut budget,
+            &mut counts,
+            OutputLimits::bounded(10, 10, 1),
+            "L",
+            ConfidenceCap::Medium,
+        );
+        let hit = sink
+            .emit(finding(vec![Evidence::Ratio]))
+            .expect_err("one byte cannot hold a finding");
+        assert_eq!(hit.axis, LimitAxis::OutputBytes);
         assert!(findings.is_empty());
         assert_eq!(budget.spent(), 0);
     }

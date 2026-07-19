@@ -230,6 +230,7 @@ mod tests {
     use kronika_registry::Section;
     use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::os_meminfo::OsMeminfo;
     use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use kronika_registry::pg_stat_database::PgStatDatabaseV1;
@@ -845,6 +846,33 @@ mod tests {
         min_ts: i64,
         max_ts: i64,
     ) {
+        let archiver = PgStatArchiver::encode(rows).expect("encode archiver");
+        write_section_with_node(
+            dir,
+            file,
+            node_self_id,
+            1_008_001,
+            u32::try_from(rows.len()).expect("fixture row count"),
+            &archiver,
+            min_ts,
+            max_ts,
+        );
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fixture helper mirrors SectionInput and PartMeta fields"
+    )]
+    fn write_section_with_node(
+        dir: &std::path::Path,
+        file: &str,
+        node_self_id: &str,
+        type_id: u32,
+        rows: u32,
+        body: &[u8],
+        min_ts: i64,
+        max_ts: i64,
+    ) {
         use kronika_format::DictLimits;
         use kronika_registry::StrId;
         use kronika_registry::instance_metadata::InstanceMetadata;
@@ -872,7 +900,6 @@ mod tests {
         };
         let dictionary =
             kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
-        let archiver = PgStatArchiver::encode(rows).expect("encode archiver");
         let metadata = InstanceMetadata::encode(&[metadata]).expect("encode metadata");
         let mut sections: Vec<SectionInput<'_>> = dictionary
             .iter()
@@ -883,9 +910,9 @@ mod tests {
             })
             .collect();
         sections.push(SectionInput {
-            type_id: 1_008_001,
-            rows: u32::try_from(rows.len()).expect("fixture row count"),
-            body: &archiver,
+            type_id,
+            rows,
+            body,
         });
         sections.push(SectionInput {
             type_id: 1_021_001,
@@ -928,7 +955,7 @@ mod tests {
     }
 
     /// The active lens ids the incidents endpoint advertises, in catalog order.
-    const ACTIVE_LENS_IDS: [&str; 9] = [
+    const ACTIVE_LENS_IDS: [&str; 13] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -938,6 +965,10 @@ mod tests {
         "PG-ARCH-017",
         "OS-NET-028",
         "OS-CGRP-021",
+        "PG-ANALYZE-004",
+        "PG-CONN-014",
+        "OS-MEM-022",
+        "OS-WB-025",
     ];
 
     #[tokio::test]
@@ -995,7 +1026,7 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 19, "28 catalog lenses minus 9 active");
+        assert_eq!(dormant.len(), 15, "28 catalog lenses minus 13 active");
         assert!(
             dormant
                 .iter()
@@ -1039,6 +1070,90 @@ mod tests {
                 "an empty response still carries {field}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn incidents_publish_numeric_gauge_evidence_from_reader_input() {
+        const MINUTE: i64 = 60 * 1_000_000;
+        let rows: Vec<OsMeminfo> = (0..40)
+            .map(|minute| OsMeminfo {
+                ts: Ts(i64::from(minute) * MINUTE),
+                mem_total: 1_000_000,
+                mem_free: None,
+                mem_available: Some(if (20..25).contains(&minute) {
+                    10_000
+                } else {
+                    500_000
+                }),
+                buffers: None,
+                cached: None,
+                swap_total: None,
+                swap_free: None,
+                active: None,
+                inactive: None,
+                dirty: Some(1_000),
+                writeback: Some(500),
+                slab: None,
+                s_reclaimable: None,
+                s_unreclaim: None,
+                anon_pages: None,
+                mapped: None,
+                shmem: None,
+                page_tables: None,
+                commit_limit: None,
+                committed_as: None,
+                huge_pages_total: None,
+                huge_pages_free: None,
+                hugepagesize: None,
+                scope: 0,
+            })
+            .collect();
+        let body = OsMeminfo::encode(&rows).expect("encode os_meminfo");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let to = 39 * MINUTE;
+        write_section_with_node(
+            dir.path(),
+            "0.pgm",
+            "node-7",
+            1_104_001,
+            u32::try_from(rows.len()).expect("row count"),
+            &body,
+            0,
+            to,
+        );
+
+        let uri =
+            format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m&section=os_meminfo");
+        let (status, response) = serve(dir.path(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let finding = response["incidents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|incident| incident["findings"].as_array().into_iter().flatten())
+            .find(|finding| finding["lens_id"] == "OS-MEM-022")
+            .expect("low MemAvailable finding");
+        assert_eq!(finding["role"], "coincident");
+        assert_eq!(finding["confidence"], "low");
+        assert_eq!(finding["scope"]["identity"], serde_json::json!([]));
+        let evidence = &finding["evidence"][0];
+        assert_eq!(evidence["type"], "gauge");
+        assert_eq!(evidence["claim"], "observed_threshold_crossing");
+        assert_eq!(evidence["measurement"]["kind"], "ratio");
+        assert_eq!(evidence["measurement"]["numerator"], 10_000.0);
+        assert_eq!(evidence["measurement"]["denominator"], 1_000_000.0);
+        assert_eq!(evidence["measurement"]["value"], 0.01);
+        assert_eq!(evidence["unit"], "ratio");
+        assert_eq!(evidence["threshold"]["operator"], "below");
+        assert_eq!(evidence["threshold"]["value"], 0.05);
+        assert!(evidence["observed_at_us"].is_i64());
+        assert!(
+            evidence["sample_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
+        );
+        assert_eq!(evidence["entity"]["logical_section"], "os_meminfo");
+        assert_eq!(evidence["entity"]["identity"], serde_json::json!([]));
     }
 
     #[tokio::test]

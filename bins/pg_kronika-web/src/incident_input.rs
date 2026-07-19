@@ -53,6 +53,7 @@ pub(crate) struct InputLimits {
     sections: usize,
     materialized_cells: usize,
     series_points: usize,
+    typed_gauge_points: usize,
     identity_bytes: usize,
     positions: usize,
     score_work: usize,
@@ -69,6 +70,7 @@ impl InputLimits {
             sections: 64,
             materialized_cells: 2_000_000,
             series_points: 500_000,
+            typed_gauge_points: 500_000,
             identity_bytes: 1 << 20,
             positions: 10_000,
             score_work: crate::anomaly::MAX_SCORE_WORK,
@@ -89,6 +91,7 @@ impl InputLimits {
             sections: 64,
             materialized_cells: 1_000_000,
             series_points: 1_000_000,
+            typed_gauge_points: 1_000_000,
             identity_bytes: 1 << 20,
             positions: 10_000,
             score_work: crate::anomaly::MAX_SCORE_WORK,
@@ -165,6 +168,8 @@ pub(crate) enum SkipReason {
     IdentityByteLimit { observed: usize, limit: usize },
     /// Retaining the section's incident series would exceed the point cap.
     SeriesPointLimit { observed: usize, limit: usize },
+    /// Retaining gauge evidence would exceed its independent point cap.
+    TypedGaugePointLimit { observed: usize, limit: usize },
 }
 
 /// Owned engine input, coverage, and exclusion counters.
@@ -399,6 +404,7 @@ struct BuildState {
     skipped: Vec<SectionSkip>,
     remaining_identity_bytes: usize,
     remaining_scan: usize,
+    remaining_typed_gauge_points: usize,
 }
 
 impl BuildState {
@@ -416,6 +422,7 @@ impl BuildState {
             skipped,
             remaining_identity_bytes,
             remaining_scan: limits.score_work,
+            remaining_typed_gauge_points: limits.typed_gauge_points,
         }
     }
 
@@ -447,10 +454,7 @@ impl BuildState {
         limits: &InputLimits,
     ) -> Result<(), InputError> {
         if page.next_cursor.is_some() {
-            self.skipped.push(SectionSkip {
-                section: logical.name,
-                reason: SkipReason::IncompletePage,
-            });
+            self.skip_incomplete(logical.name);
             return Ok(());
         }
         self.coverage_by_section
@@ -458,7 +462,7 @@ impl BuildState {
 
         let identity = logical.diff_key();
         let (cumulative, gauges) = scorable_columns(logical);
-        match normalize_duplicate_rows(
+        let duplicate_gauge_breaks = match normalize_duplicate_rows(
             &mut page.rows,
             &identity,
             &cumulative,
@@ -467,7 +471,7 @@ impl BuildState {
             &mut self.remaining_identity_bytes,
             limits.identity_bytes,
         ) {
-            Ok(()) => {}
+            Ok(breaks) => breaks,
             Err(NormalizeError::Conflict(timestamp)) => {
                 self.skipped.push(SectionSkip {
                     section: logical.name,
@@ -482,12 +486,13 @@ impl BuildState {
                 });
                 return Ok(());
             }
-        }
+        };
         let mut diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
         gates.apply(logical, &mut diffs);
         let gauge_series = gauge_section(&identity, &gauges, &page.rows);
         tally_quality(&diffs, &gauge_series, &mut self.quality);
         self.retain_typed(logical.name, &cumulative, &diffs);
+        let gauge_points = self.admit_typed_gauge_points(logical.name, &gauge_series, limits);
 
         let scanned = match scan_section(
             &diffs,
@@ -522,6 +527,18 @@ impl BuildState {
             &mut self.quality,
         ) {
             Ok(section_episodes) => {
+                if let Some(gauge_points) = gauge_points {
+                    self.remaining_typed_gauge_points -= gauge_points;
+                    let gaps: Vec<(i64, i64)> =
+                        page.gaps.iter().map(|gap| (gap.from, gap.to)).collect();
+                    self.retain_typed_gauges(
+                        logical.name,
+                        &gauges,
+                        gauge_series,
+                        &gaps,
+                        &duplicate_gauge_breaks,
+                    );
+                }
                 self.episodes.extend(section_episodes);
                 self.quality.episodes_truncated = self
                     .quality
@@ -537,6 +554,42 @@ impl BuildState {
             Err(err) => return Err(err),
         }
         Ok(())
+    }
+
+    fn skip_incomplete(&mut self, section: &'static str) {
+        self.skipped.push(SectionSkip {
+            section,
+            reason: SkipReason::IncompletePage,
+        });
+    }
+
+    fn admit_typed_gauge_points(
+        &mut self,
+        section: &'static str,
+        gauge_series: &[SeriesValues],
+        limits: &InputLimits,
+    ) -> Option<usize> {
+        let points = gauge_series
+            .iter()
+            .flat_map(|series| &series.columns)
+            .try_fold(0_usize, |total, column| {
+                total.checked_add(column.points.len())
+            })
+            .unwrap_or(usize::MAX);
+        if points <= self.remaining_typed_gauge_points {
+            return Some(points);
+        }
+        self.skipped.push(SectionSkip {
+            section,
+            reason: SkipReason::TypedGaugePointLimit {
+                observed: limits
+                    .typed_gauge_points
+                    .saturating_sub(self.remaining_typed_gauge_points)
+                    .saturating_add(points),
+                limit: limits.typed_gauge_points,
+            },
+        });
+        None
     }
 
     /// Retain the typed counter diffs the section already folded, keyed for lens
@@ -561,6 +614,41 @@ impl BuildState {
                     .collect();
                 self.typed
                     .insert_counter(section, name, std::sync::Arc::clone(&identity), points);
+            }
+        }
+    }
+
+    /// Retain each series' raw gauge readings, keyed for lens lookup. Gauges are
+    /// instantaneous levels, so nothing is differenced: the reader already
+    /// dropped NULL, non-numeric, and non-finite readings, leaving one `(ts,
+    /// value)` per valid sample. Columns line up positionally with `gauges`, the
+    /// order `gauge_section` collected them in.
+    fn retain_typed_gauges(
+        &mut self,
+        section: &'static str,
+        gauges: &[&'static str],
+        gauge_series: Vec<SeriesValues>,
+        gaps: &[(i64, i64)],
+        duplicate_breaks: &[DuplicateGaugeBreak],
+    ) {
+        for series in gauge_series {
+            let Some(identity) = accept_identity(&series.key) else {
+                continue;
+            };
+            let duplicates = duplicate_breaks
+                .iter()
+                .filter(|duplicate| duplicate.identity.as_slice() == identity.as_ref())
+                .map(|duplicate| duplicate.timestamp);
+            for (&name, mut column) in gauges.iter().zip(series.columns) {
+                column.breaks.extend(duplicates.clone());
+                self.typed.insert_gauge_with_quality(
+                    section,
+                    name,
+                    std::sync::Arc::clone(&identity),
+                    column.points,
+                    column.breaks,
+                    gaps.to_vec(),
+                );
             }
         }
     }
@@ -674,6 +762,12 @@ enum NormalizeError {
     IdentityByteLimit { observed: usize, limit: usize },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DuplicateGaugeBreak {
+    identity: Vec<IdentityValue>,
+    timestamp: i64,
+}
+
 fn identity_bytes(identity: &[IdentityValue]) -> Option<usize> {
     identity.iter().try_fold(0_usize, |sum, value| {
         let bytes = match value {
@@ -709,10 +803,11 @@ fn normalize_duplicate_rows(
     quality: &mut InputQuality,
     remaining_identity_bytes: &mut usize,
     identity_byte_limit: usize,
-) -> Result<(), NormalizeError> {
+) -> Result<Vec<DuplicateGaugeBreak>, NormalizeError> {
     let compared: Vec<&str> = cumulative.iter().chain(gauges).copied().collect();
     let mut seen: BTreeMap<(Vec<IdentityValue>, i64), usize> = BTreeMap::new();
     let mut kept = Vec::with_capacity(rows.len());
+    let mut duplicate_breaks = Vec::new();
     for row in std::mem::take(rows) {
         let Some(key) = canonical_identity_values(&row, identity) else {
             quality.non_canonical_identity = quality.non_canonical_identity.saturating_add(1);
@@ -737,13 +832,17 @@ fn normalize_duplicate_rows(
                 return Err(NormalizeError::Conflict(*timestamp));
             }
             quality.duplicate_timestamps = quality.duplicate_timestamps.saturating_add(1);
+            duplicate_breaks.push(DuplicateGaugeBreak {
+                identity: row_key.0,
+                timestamp: *timestamp,
+            });
         } else {
             seen.insert(row_key, kept.len());
             kept.push(row);
         }
     }
     *rows = kept;
-    Ok(())
+    Ok(duplicate_breaks)
 }
 
 fn tally_quality(diffs: &[SeriesDiff], gauges: &[SeriesValues], quality: &mut InputQuality) {
@@ -1192,7 +1291,10 @@ mod tests {
                 &mut identity_bytes,
                 100,
             ),
-            Ok(())
+            Ok(vec![DuplicateGaugeBreak {
+                identity: Vec::new(),
+                timestamp: 1,
+            }])
         );
         assert_eq!(rows, vec![sample_row(1, 10.0)]);
         assert_eq!(q.duplicate_timestamps, 1);
@@ -1249,7 +1351,7 @@ mod tests {
                 &mut identity_bytes,
                 100,
             ),
-            Ok(())
+            Ok(Vec::new())
         );
         assert_eq!(rows, expected);
         assert_eq!(q.duplicate_timestamps, 0);
@@ -1275,7 +1377,7 @@ mod tests {
                 &mut identity_bytes,
                 100,
             ),
-            Ok(())
+            Ok(Vec::new())
         );
         assert!(rows.is_empty());
         assert_eq!(q.non_canonical_identity, 1);
@@ -1401,6 +1503,38 @@ mod tests {
                 limit: 1,
             })
         ));
+    }
+
+    #[test]
+    fn typed_gauge_point_admission_rejects_retention_all_or_nothing() {
+        let mut limits = InputLimits::for_test();
+        limits.typed_gauge_points = 2;
+        let mut state = BuildState::new(&limits, limits.identity_bytes, Vec::new());
+        let series = vec![SeriesValues {
+            key: Vec::new(),
+            columns: vec![ColumnValues {
+                name: "mem_available".to_owned(),
+                points: vec![(1, 1.0), (2, 2.0), (3, 3.0)],
+                breaks: Vec::new(),
+                skipped: 0,
+            }],
+        }];
+
+        assert_eq!(
+            state.admit_typed_gauge_points("os_meminfo", &series, &limits),
+            None
+        );
+        assert_eq!(
+            state.skipped,
+            vec![SectionSkip {
+                section: "os_meminfo",
+                reason: SkipReason::TypedGaugePointLimit {
+                    observed: 3,
+                    limit: 2,
+                },
+            }]
+        );
+        assert_eq!(state.remaining_typed_gauge_points, 2);
     }
 
     #[test]

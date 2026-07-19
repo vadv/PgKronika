@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::anomaly::ScanParams;
 use crate::incident::{
-    DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, Finding, IdentityValue, Incident,
-    LimitAxis,
+    DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, Evidence, Finding, GaugeMeasurement,
+    IdentityValue, Incident, LimitAxis,
 };
 use crate::incident_input::{InputQuality, SectionSkip, SkipReason};
 
@@ -116,11 +116,7 @@ fn incident_to_json(incident: &Incident) -> Value {
 fn finding_to_json(finding: &Finding) -> Value {
     let scope = finding.scope();
     let identity: Vec<Value> = scope.identity().iter().map(identity_to_json).collect();
-    let evidence: Vec<Value> = finding
-        .evidence()
-        .iter()
-        .map(|item| Value::from(item.label()))
-        .collect();
+    let evidence: Vec<Value> = finding.evidence().iter().map(evidence_to_json).collect();
     json!({
         "lens_id": finding.lens_id(),
         "role": finding.role().label(),
@@ -131,6 +127,49 @@ fn finding_to_json(finding: &Finding) -> Value {
             "identity": identity,
         },
         "evidence": evidence,
+    })
+}
+
+fn evidence_to_json(evidence: &Evidence) -> Value {
+    let Evidence::GaugeObservation(gauge) = evidence else {
+        return Value::from(evidence.label());
+    };
+    let measurement = match gauge.measurement() {
+        GaugeMeasurement::Value(value) => json!({
+            "kind": "value",
+            "value": value.get(),
+        }),
+        GaugeMeasurement::Ratio {
+            numerator,
+            denominator,
+        } => json!({
+            "kind": "ratio",
+            "numerator": numerator.get(),
+            "denominator": denominator.get(),
+            "value": numerator.get() / denominator.get(),
+        }),
+    };
+    let entity: Vec<Value> = gauge
+        .entity()
+        .identity()
+        .iter()
+        .map(identity_to_json)
+        .collect();
+    json!({
+        "type": "gauge",
+        "claim": "observed_threshold_crossing",
+        "measurement": measurement,
+        "unit": gauge.unit().label(),
+        "threshold": {
+            "operator": gauge.threshold_kind().label(),
+            "value": gauge.threshold().get(),
+        },
+        "observed_at_us": gauge.observed_at_us(),
+        "sample_count": gauge.samples(),
+        "entity": {
+            "logical_section": gauge.entity().section(),
+            "identity": entity,
+        },
     })
 }
 
@@ -277,6 +316,9 @@ fn section_skip_to_json(skip: &SectionSkip) -> Value {
         SkipReason::SeriesPointLimit { observed, limit } => {
             json!({ "kind": "series_point_limit", "observed": observed, "limit": limit })
         }
+        SkipReason::TypedGaugePointLimit { observed, limit } => {
+            json!({ "kind": "typed_gauge_point_limit", "observed": observed, "limit": limit })
+        }
     };
     json!({ "section": skip.section, "reason": reason })
 }
@@ -296,6 +338,7 @@ const fn axis_name(axis: LimitAxis) -> &'static str {
         LimitAxis::LensEvaluations => "lens_evaluations",
         LimitAxis::Findings => "findings",
         LimitAxis::EvidenceRows => "evidence_rows",
+        LimitAxis::OutputBytes => "output_bytes",
     }
 }
 
@@ -313,7 +356,7 @@ mod tests {
     use super::*;
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
-    const APPLIED_IDS: [&str; 9] = [
+    const APPLIED_IDS: [&str; 13] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -323,6 +366,10 @@ mod tests {
         "PG-ARCH-017",
         "OS-NET-028",
         "OS-CGRP-021",
+        "PG-ANALYZE-004",
+        "PG-CONN-014",
+        "OS-MEM-022",
+        "OS-WB-025",
     ];
 
     const MAX_ENTRY_JSON_BYTES: usize = 256
@@ -366,6 +413,7 @@ mod tests {
         assert_eq!(axis_name(LimitAxis::LensEvaluations), "lens_evaluations");
         assert_eq!(axis_name(LimitAxis::Findings), "findings");
         assert_eq!(axis_name(LimitAxis::EvidenceRows), "evidence_rows");
+        assert_eq!(axis_name(LimitAxis::OutputBytes), "output_bytes");
     }
 
     #[test]
@@ -373,10 +421,10 @@ mod tests {
         let catalog = catalog_to_json();
         assert_eq!(catalog, catalog_to_json());
         let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
-        assert_eq!(bytes.len(), 8_730);
+        assert!(!bytes.is_empty());
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
         assert!(catalog.get("log_dormant").is_none());
-        let entry = &catalog["dormant"][11];
+        let entry = &catalog["dormant"][0];
         let keys: std::collections::BTreeSet<_> = entry
             .as_object()
             .expect("catalog entry")

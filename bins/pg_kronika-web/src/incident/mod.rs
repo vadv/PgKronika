@@ -24,7 +24,7 @@ pub(crate) use dispatch::LimitAxis;
 pub(crate) use engine::{
     AnalyzeError, ClockRelation, EngineOutcome, EngineSkip, Incident, IncidentConfig, analyze,
 };
-pub(crate) use evidence::Finding;
+pub(crate) use evidence::{Evidence, Finding, GaugeMeasurement};
 #[allow(
     unused_imports,
     reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"
