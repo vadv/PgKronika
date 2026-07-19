@@ -1,7 +1,24 @@
-//! `#[derive(Section)]`: generate a registry contract and Parquet codec.
+//! Internal derive for a registry section contract and Parquet codec.
 //!
-//! Column types are matched by written name (`i64`, `bool`, `Ts`, `StrId`,
-//! `Option<...>`), because proc macros see tokens, not resolved types.
+//! `#[derive(Section)]` accepts a named-field struct with one
+//! `#[section(id = ..., name = ..., semantics = ..., sort_key(...),
+//! identity(...))]` attribute. Every field needs `#[column(class)]`; a column
+//! may also declare a collection gate and row-specific gate overrides.
+//!
+//! The generated sealed `kronika_registry::Section` implementation exposes
+//! one `TypeContract`, encodes at most `MAX_SECTION_ROWS`, decodes only a
+//! CRC-verified section, and derives its timestamp range from a field named
+//! `ts`. Registry linting validates references and semantic invariants across
+//! the complete contract set.
+//!
+//! Supported field spellings are the registry primitive integer and float
+//! widths, `bool`, `Ts`, `StrId`, `Vec<i32>`, and `Option<T>` for nullable
+//! scalars. Types are matched by their written identifiers because a proc
+//! macro receives tokens, not resolved Rust types. Unsupported shapes and
+//! attributes fail at compile time with a span-local error.
+//!
+//! This proc macro is an implementation detail of `kronika-registry`; it is
+//! not the extension point for downstream section types.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};

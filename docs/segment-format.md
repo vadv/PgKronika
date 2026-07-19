@@ -2,6 +2,12 @@
 
 Версия документа: draft-4, 2026-06-12.
 
+> Это исторический design note. В нём есть ещё не реализованные HOT sections,
+> charts, remote range reads и совместимость будущих версий. Текущий контракт
+> format version 1, limits и recovery описаны в
+> [`kronika-format`](../crates/kronika-format/README.ru.md), а фактический путь
+> чтения — в [`kronika-reader`](../crates/kronika-reader/README.ru.md).
+
 ## 1. Назначение
 
 PGM — формат одного иммутабельного сегмента с данными коллектора за короткий

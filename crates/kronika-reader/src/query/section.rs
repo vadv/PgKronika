@@ -135,9 +135,10 @@ pub fn section_with_limits(
 /// Read several logical sections for a source and window in one pass.
 ///
 /// A section named in `cursors` resumes after the row its cursor pins: rows are
-/// ordered by [`compare_full`], every row at or before the cursor is dropped,
-/// and the remaining tail is paged. When the tail exceeds `limit`, the page's
-/// `next_cursor` pins its last row so a further call continues the stream.
+/// ordered by the crate's full-row comparator, every row at or before the
+/// cursor is dropped, and the remaining tail is paged. When the tail exceeds
+/// `limit`, the page's `next_cursor` pins its last row so a further call
+/// continues the stream.
 ///
 /// # Errors
 ///

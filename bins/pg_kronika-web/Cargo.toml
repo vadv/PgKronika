@@ -1,6 +1,6 @@
 [package]
 name = "pg_kronika-web"
-description = "pgKronika binary"
+description = "Local PGM UI and JSON API with bounded diff, anomaly, and incident queries"
 publish = false
 version.workspace = true
 edition.workspace = true

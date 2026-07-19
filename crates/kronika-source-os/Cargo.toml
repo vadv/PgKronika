@@ -1,6 +1,6 @@
 [package]
 name = "kronika-source-os"
-description = "pgKronika internal crate"
+description = "Bounded Linux procfs, sysfs, filesystem, process, and cgroup collectors"
 publish = false
 version.workspace = true
 edition.workspace = true

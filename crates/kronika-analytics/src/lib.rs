@@ -1,8 +1,20 @@
-//! Source-independent analytics: counter diffs and spike scoring.
+//! Source-independent counter differences and anomaly scoring.
 //!
-//! Holds no knowledge of `PostgreSQL`, Linux, the registry, the reader, or any
-//! transport. Counter deltas (`diff`) and window scoring (`anomaly`) are pure
-//! functions over numeric samples.
+//! [`diff`] interprets two numeric counter samples without extrapolation:
+//! integer deltas stay exact, decreases are resets, and non-positive time
+//! intervals are invalid. The caller adds series-wide coverage, first-point,
+//! and collection-gate reasons because one pair cannot infer them.
+//!
+//! [`anomaly`] compares a current window with a reference window using a
+//! modified z-score, then groups consecutive above-threshold positions into
+//! episodes. Empty, discontinuous, undersized, or non-finite inputs produce an
+//! explicit not-evaluated reason rather than a score.
+//!
+//! The functions allocate in proportion to their input slices or returned
+//! episodes. These functions do not impose request ceilings; adapters such as
+//! `pg_kronika-web` must bound samples, window positions, work, and output
+//! before calling it. The crate has no `PostgreSQL`, Linux, registry, reader,
+//! or transport knowledge.
 
 pub mod anomaly;
 pub mod diff;

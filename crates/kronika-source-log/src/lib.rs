@@ -1,8 +1,19 @@
 //! `PostgreSQL` log collectors.
 //!
-//! This crate discovers a `PostgreSQL` stderr log file, tails it with byte
-//! caps, and converts bounded stderr records into typed source rows. It never
-//! exposes raw log lines as an output contract.
+//! [`LogCollector`] discovers a `PostgreSQL` stderr log file, resumes from a
+//! durable [`TailState`], and converts bounded records into typed source rows.
+//! It never exposes raw log lines as an output contract.
+//!
+//! [`TailCaps`] bounds lines, bytes, elapsed read time, line length, and
+//! backlog. Rotation, copy-truncate, sparse ranges, binary input, truncation,
+//! budget exhaustion, and missing files are counted in [`TailGaps`] and later
+//! sealed as gap rows. A batch advances durable state only after the caller
+//! commits the corresponding segment window.
+//!
+//! The stderr parser groups normalized errors and emits typed checkpoint,
+//! autovacuum, slow-query, lock-wait, lifecycle, and temporary-file events
+//! under fixed per-cycle output caps. `csvlog` is recognized as unsupported;
+//! it is not silently parsed with stderr rules.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "the workspace's PostgreSQL, nix, and arrow/parquet stacks pull duplicate transitive versions outside this crate"

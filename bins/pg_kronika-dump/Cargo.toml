@@ -1,6 +1,6 @@
 [package]
 name = "pg_kronika-dump"
-description = "pgKronika binary"
+description = "Placeholder for future command-line PGM diagnostics"
 publish = false
 version.workspace = true
 edition.workspace = true
