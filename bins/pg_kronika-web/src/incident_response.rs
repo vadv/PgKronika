@@ -352,8 +352,11 @@ mod tests {
             .expect("oom_kill lens is dormant");
         assert_eq!(oom["domain"], "pg");
         assert_eq!(oom["confidence"], "high");
-        assert_eq!(oom["title"], "OOM-kill бэкенда");
-        assert_eq!(oom["detects"], "Убил ли OOM-killer backend PostgreSQL?");
+        assert_eq!(oom["title"], "SIGKILL бэкенда");
+        assert_eq!(
+            oom["detects"],
+            "Был ли backend завершён сигналом 9? Жертва kernel-OOM — отдельный сигнал, signal 9 её не доказывает."
+        );
         assert_eq!(
             oom["awaiting"],
             json!([

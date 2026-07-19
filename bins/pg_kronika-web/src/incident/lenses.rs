@@ -508,8 +508,8 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
     DormantLens {
         lens_id: "oom_kill",
         domain: Domain::Pg,
-        title: "OOM-kill бэкенда",
-        detects: "Убил ли OOM-killer backend PostgreSQL?",
+        title: "SIGKILL бэкенда",
+        detects: "Был ли backend завершён сигналом 9? Жертва kernel-OOM — отдельный сигнал, signal 9 её не доказывает.",
         confidence: ConfidenceCap::High,
         missing: &[
             Missing::LogEvents,
@@ -534,7 +534,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "panic_shutdown",
         domain: Domain::Pg,
         title: "PANIC / аварийная остановка",
-        detects: "Была ли PANIC-запись, обрушившая кластер?",
+        detects: "Была ли запись severity PANIC и отдельный crash/restart? Не помечает повреждение данных автоматически.",
         confidence: ConfidenceCap::High,
         missing: &[Missing::LogEvents, Missing::SourcePeriod],
     },
@@ -553,8 +553,8 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
     DormantLens {
         lens_id: "out_of_memory_log",
         domain: Domain::Pg,
-        title: "Ошибка нехватки памяти (по логу)",
-        detects: "Отказал ли аллокатор PostgreSQL по памяти?",
+        title: "Ошибка аллокации PostgreSQL (по логу)",
+        detects: "Отказала ли аллокация PostgreSQL (SQLSTATE 53200)? Это ошибка аллокатора, не исчерпание физической RAM.",
         confidence: ConfidenceCap::High,
         missing: &[
             Missing::LogEvents,
@@ -578,7 +578,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "deadlock",
         domain: Domain::Pg,
         title: "Взаимоблокировка",
-        detects: "Обнаружил ли PostgreSQL цикл блокировок с жертвой?",
+        detects: "Обнаружил ли PostgreSQL цикл блокировок с жертвой? Факт события, не доказанная причина инцидента.",
         confidence: ConfidenceCap::High,
         missing: &[
             Missing::LogEvents,
@@ -591,7 +591,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "data_corruption_log",
         domain: Domain::Pg,
         title: "Повреждение данных (по логу)",
-        detects: "Зафиксировано ли повреждение страниц/индексов/checksum?",
+        detects: "Дала ли сбой завершённая проверка checksum/страницы? Не generic ошибка чтения или I/O.",
         confidence: ConfidenceCap::High,
         missing: &[
             Missing::LogEvents,
@@ -618,7 +618,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "lock_timeout_log",
         domain: Domain::Pg,
         title: "Отмена по lock_timeout",
-        detects: "Сдавались ли запросы по `lock_timeout`?",
+        detects: "Отменялись ли запросы по `lock_timeout`? Факт отмены, не доказанная причина инцидента.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::LogEvents,
@@ -630,7 +630,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "statement_timeout_log",
         domain: Domain::Pg,
         title: "Отмена по statement_timeout",
-        detects: "Упирались ли запросы в `statement_timeout`?",
+        detects: "Упирались ли запросы в `statement_timeout`? Факт отмены; таймаут не доказывает медленный сервер.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::LogEvents,
@@ -656,7 +656,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "slow_query_logged",
         domain: Domain::Pg,
         title: "Медленный запрос (по логу)",
-        detects: "Был ли конкретный долгий запрос с реальным SQL?",
+        detects: "Превышен ли настроенный порог длительности конкретным запросом? Сам по себе не аномалия.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::LogEvents,
@@ -775,7 +775,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "replication_disconnect",
         domain: Domain::Pg,
         title: "Обрыв соединения репликации",
-        detects: "Рвётся ли поток репликации и почему?",
+        detects: "Оборвался ли поток репликации? Событие для стороны: walsender на primary, walreceiver на standby.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::LogEvents,
@@ -799,7 +799,7 @@ const LOG_DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "wal_integrity_log",
         domain: Domain::Pg,
         title: "Проблемы целостности WAL",
-        detects: "Битый WAL при replay/recovery?",
+        detects: "Сбой валидации WAL из archive/stream? Локальный конец WAL (invalid record length в pg_wal) легитимен, не finding.",
         confidence: ConfidenceCap::High,
         missing: &[Missing::LogEvents, Missing::SourcePeriod],
     },
