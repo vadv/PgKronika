@@ -508,21 +508,21 @@ Readiness задаётся по ветке линзы, а не только по
 
 ### Первый срез
 
-- `PG-LOCK-012`: sampled `blocked_by` — единственный structural `lead`; без
+- `lock_wait_graph`: sampled `blocked_by` — единственный structural `lead`; без
   полного snapshot линза dormant для этого интервала.
-- `PG-VACUUM-005`, `PG-FREEZE-006`, `PG-HORIZON-013`, `PG-CONN-014`,
-  `PG-CACHE-010`, `PG-HOT-007`, `PG-CHKPT-008`, `PG-SLOT-016`, `PG-ARCH-017`:
+- `vacuum_backlog`, `xid_wraparound_risk`, `xmin_horizon_hold`, `connection_saturation`,
+  `shared_buffer_misses`, `hot_update_failure`, `requested_checkpoints`, `slot_wal_retention`, `wal_archiving_failure`:
   только `coincident`/`amplifier`.
-- `OS-CPU-020`, `OS-CGRP-021`, `OS-MEM-022`, `OS-CGMEM-023`, `OS-BLOCK-024`,
-  `OS-WB-025`, `OS-IOWHO-026`, `OS-FS-027`, `OS-NET-028`: только
+- `cpu_saturation`, `cgroup_cpu_throttling`, `memory_reclaim`, `cgroup_memory_limit`, `block_device_latency`,
+  `writeback_pressure`, `io_contender`, `filesystem_space`, `network_errors`: только
   `coincident`/`amplifier`; cross-clock direction запрещён.
-- Counter/event branches `PG-QRY-001`, `PG-TEMP-003`, `PG-ANALYZE-004`,
-  `PG-WAL-009`, `PG-REPL-015`, `PG-SYNC-018`, `PG-WAIT-019` допускаются только
+- Counter/event branches `query_workload_shift`, `temp_spill`, `stale_statistics`,
+  `wal_amplification`, `replication_lag`, `sync_replication_wait`, `internal_wait_concentration` допускаются только
   если их exact inputs из каталога имеют fixtures и не требуют P/I/D.
-- `PG-IO-011` и timing branches могут использовать положительные значения и
+- `backend_io_latency` и timing branches могут использовать положительные значения и
   `NotCollected`. При `gate=on` полнота producer sessions остаётся unknown;
   measured zero не даёт отрицательного finding.
-- Planning branches `PG-QRY-001`/`PG-PLAN-002` dormant до нового
+- Planning branches `query_workload_shift`/`plan_change` dormant до нового
   `track_planning` registry/source contract.
 
 ### Второй срез
