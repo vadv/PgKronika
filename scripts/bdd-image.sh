@@ -435,6 +435,7 @@ verify_dependency_image() {
     test "$(cat /opt/bdd-cache/dependency-key)" = "$2"
     test -s /opt/bdd-cache/cargo-closure.json
     test -x /opt/bdd-cache/compiler-tools/bin/sccache
+    test -x /opt/bdd-cache/compiler-tools/bin/pgkronika-sccache
   ' sh "$KEY_SCHEMA" "$expected"
 }
 
@@ -478,6 +479,8 @@ run_app_nix() {
     READ_WRITE) mount_mode=rw ;;
     *) fail "BDD_SCCACHE_MODE must be READ_ONLY or READ_WRITE" ;;
   esac
+  printf '%s\n' "$cache_mode" > "$cache_dir/.mode"
+  chmod 0644 "$cache_dir/.mode"
   source_tar "${APP_SOURCE_PATHS[@]}" | docker_cmd run --rm -i \
     -v "$cache_dir:/var/cache/pgkronika-sccache:$mount_mode" \
     "$ref" sh -ceu '
@@ -491,15 +494,8 @@ run_app_nix() {
     else
       export PATH="/opt/bdd-cache/compiler-tools/bin:$PATH"
       export SCCACHE_DIR=/var/cache/pgkronika-sccache
-      export SCCACHE_LOCAL_RW_MODE="$cache_mode"
-      export SCCACHE_CACHE_SIZE=2G
-      # Nix changes source store paths when src changes. The outer cache
-      # namespace already binds the exact dependency/toolchain contract, so
-      # normalise only paths inside this isolated build container.
-      export SCCACHE_BASEDIRS=/tmp:/build:/nix/store
-      export SCCACHE_IDLE_TIMEOUT=0
-      sccache --start-server 1>&2
-      sccache --zero-stats 1>&2
+      # The compiler wrapper starts sccache as the Nix build user. Starting it
+      # here as root makes cached dep-info files unreadable by that user.
       trap "sccache --stop-server >/dev/null 2>&1 || true" EXIT
       nix build --option sandbox false .#bddAppLayer --out-link /tmp/bdd-app-layer 1>&2
       printf "BDD_SCCACHE_STATS=" 1>&2

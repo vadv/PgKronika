@@ -188,13 +188,15 @@ test_nix_build_declares_musl_compiler() {
 
 test_nix_source_build_uses_first_party_sccache() {
   local flake="$ROOT/flake.nix" dockerfile="$ROOT/Dockerfile.bdd-builder"
-  assert_contains "$flake" 'paths = [ pkgs.sccache ];'
-  assert_contains "$flake" 'RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";'
+  assert_contains "$flake" 'paths = [ pkgs.sccache compilerWrapper ];'
+  assert_contains "$flake" 'RUSTC_WRAPPER = "${compilerWrapper}/bin/pgkronika-sccache";'
+  assert_contains "$flake" 'SCCACHE_LOCAL_RW_MODE < /var/cache/pgkronika-sccache/.mode'
   assert_contains "$flake" 'bddCompilerTools = compilerTools;'
   assert_contains "$dockerfile" 'nix build .#bddCompilerTools --out-link /opt/bdd-cache/compiler-tools'
-  assert_contains "$SCRIPT" 'SCCACHE_LOCAL_RW_MODE="$cache_mode"'
+  assert_contains "$SCRIPT" 'printf '\''%s\n'\'' "$cache_mode" > "$cache_dir/.mode"'
   assert_contains "$SCRIPT" 'sccache --show-stats --stats-format=json'
   assert_contains "$SCRIPT" 'nix build --option sandbox false .#bddAppLayer'
+  assert_not_contains "$SCRIPT" 'sccache --start-server'
   assert_not_contains "$SCRIPT" 'ACTIONS_RUNTIME_TOKEN'
   assert_not_contains "$dockerfile" 'ACTIONS_RUNTIME_TOKEN'
 }

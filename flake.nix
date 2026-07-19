@@ -127,9 +127,23 @@
           }
         );
 
+        compilerWrapper = pkgs.writeShellScriptBin "pgkronika-sccache" ''
+          IFS= read -r SCCACHE_LOCAL_RW_MODE < /var/cache/pgkronika-sccache/.mode
+          case "$SCCACHE_LOCAL_RW_MODE" in
+            READ_ONLY|READ_WRITE) ;;
+            *) exit 2 ;;
+          esac
+          export SCCACHE_LOCAL_RW_MODE
+          export SCCACHE_DIR=/var/cache/pgkronika-sccache
+          export SCCACHE_CACHE_SIZE=2G
+          export SCCACHE_BASEDIRS=/tmp:/build:/nix/store:/nix/var/nix/builds
+          export SCCACHE_IDLE_TIMEOUT=0
+          exec ${pkgs.sccache}/bin/sccache "$@"
+        '';
+
         compilerTools = pkgs.symlinkJoin {
           name = "pgkronika-bdd-compiler-tools";
-          paths = [ pkgs.sccache ];
+          paths = [ pkgs.sccache compilerWrapper ];
         };
 
         # One store path lets the runner spawn the collector.
@@ -138,8 +152,8 @@
           // {
             inherit cargoArtifacts;
             pname = "pgkronika-bins";
-            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.sccache ];
-            RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.sccache compilerWrapper ];
+            RUSTC_WRAPPER = "${compilerWrapper}/bin/pgkronika-sccache";
           }
         );
 
