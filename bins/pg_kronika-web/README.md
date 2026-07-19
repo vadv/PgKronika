@@ -31,27 +31,32 @@ output, but Basic Auth does not encrypt the connection.
 
 ## Endpoints
 
-| Endpoint | Parameters | Result |
-| --- | --- | --- |
-| `GET /healthz` | none | Process liveness. |
-| `GET /readyz` | none | Snapshot refresh readiness and age. |
-| `GET /metrics` | none | Prometheus text format, including reader, data-age, request, RSS, and fd metrics. |
-| `GET /v1/version` | none | API and PGM format versions. |
-| `GET /v1/sources` | none | Source ids, time spans, and unit counts. |
-| `GET /v1/sections` | none | Logical registry sections and union schemas. |
-| `GET /v1/segments` | `source`, `from`, `to` | Overlapping segment catalogs without body decode. |
-| `GET /v1/section/{name}` | `source`, `from`, `to`; optional `limit`, `cursor` | Ordered rows, gaps, and pagination cursor. |
-| `GET /v1/sections/batch` | `source`, `from`, `to`, comma-separated `names`; optional `limit` | Several logical sections from one segment pass. |
-| `GET /v1/section/{name}/diff` | `source`, `from`, `to` | Per-identity counter deltas/rates and no-data reasons. |
-| `GET /v1/sections/batch/diff` | `source`, `from`, `to`, comma-separated `names` | Several diff results from one pass. |
-| `GET /v1/anomalies` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `limit`, `section` | Ranked robust-score episodes with data-quality counts. |
-| `GET /v1/incidents` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `epsilon`, `max_cluster_span`, `section` | Clusters related anomaly episodes. Diagnostic findings are not available. |
-| `GET /` | none | Embedded UI. |
+For an unfamiliar store, start with `/v1/sources`, `/v1/sections`, and
+`/v1/segments`. They show what data exists before you request rows or run an
+analysis.
 
-`source` is an unsigned catalog source id. `from` and `to` are signed Unix
-microseconds. Duration parameters accept `250ms`, `90s`, `15m`, `2h`, or bare
-seconds. Row endpoints default to 1,000 rows and clamp `limit` to 10,000. A
-cursor is opaque and must be returned unchanged on the next request.
+| Endpoint | Parameters | What the operator gets |
+| --- | --- | --- |
+| `GET /healthz` | none | Confirms that the HTTP process is running. |
+| `GET /readyz` | none | Tells a health checker whether the directory snapshot was refreshed recently and reports its age. |
+| `GET /metrics` | none | Exposes Prometheus metrics for reader errors, data age, HTTP requests, RSS, and open file descriptors. |
+| `GET /v1/version` | none | Identifies the JSON API version and the PGM format version served by this build. |
+| `GET /v1/sources` | none | Lists the collector sources present in the store, with the earliest and latest timestamp and the segment count for each source. |
+| `GET /v1/sections` | none | Shows which logical datasets can be queried and gives each dataset's semantics, sort key, and union of registered columns. |
+| `GET /v1/segments` | `source`, `from`, `to` | Shows which segments overlap the requested period and how many rows each section contains. It reads catalog metadata, not section bodies. |
+| `GET /v1/section/{name}` | `source`, `from`, `to`; optional `limit`, `cursor` | Returns the selected dataset as time-ordered rows. The response also names unreadable or missing intervals in `gaps` and supplies `next_cursor` when more rows remain. |
+| `GET /v1/sections/batch` | `source`, `from`, `to`, comma-separated `names`; optional `limit` | Returns the same row pages for several datasets, keyed by section name, after one pass over the overlapping segments. |
+| `GET /v1/section/{name}/diff` | `source`, `from`, `to` | Turns cumulative counters into per-identity changes and per-second rates. Each point contains `delta`, `rate`, and `dt_micros`, or a `nodata` reason when no honest rate can be computed. |
+| `GET /v1/sections/batch/diff` | `source`, `from`, `to`, comma-separated `names` | Returns the same counter-change view for several datasets, keyed by section name, after one segment pass. |
+| `GET /v1/anomalies` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `limit`, `section` | Finds intervals where counter rates or gauge values changed unusually during the selected period. It returns the affected series, metric, interval, direction, and peak statistics; ranks episodes by `abs(peak.m)`; and reports per-section evaluation counts plus any skipped sections. |
+| `GET /v1/incidents` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `epsilon`, `max_cluster_span`, `section` | Groups anomaly episodes that are close in time into incident candidates. It returns each candidate's interval and member metrics, plus coverage, data-quality, and skipped-work details; root-cause findings are not available. |
+| `GET /` | none | Opens the embedded browser UI over the same local snapshot. |
+
+`source` is the unsigned id returned by `/v1/sources`. `from` and `to` are
+signed Unix timestamps in microseconds. Duration parameters accept `250ms`,
+`90s`, `15m`, `2h`, or bare seconds. Row endpoints return 1,000 rows by default
+and clamp `limit` to 10,000. Treat a cursor as opaque and pass it back unchanged
+on the next request.
 
 Example:
 
@@ -60,27 +65,39 @@ curl -u operator:change-me \
   'http://127.0.0.1:8688/v1/segments?source=1&from=0&to=9223372036854775807'
 ```
 
-Errors use `{ "error": "code", "detail": "message" }` where a detail is
-useful. Unknown sections return `404`; malformed parameters return `400`; a
-request exceeding the materialization ceiling returns `413`.
+Errors use `{ "error": "code", "detail": "message" }` when a detail is
+useful. Unknown sections return `404`, malformed parameters return `400`, and
+requests that exceed an enforced input or materialization ceiling return
+`413`.
 
 ## Query and analysis contracts
 
-- Section reads scan only overlapping units, verify PGM and section CRC before
-  decode, union registered layout versions by logical name, and sort by the
-  registry key. Exact sealed/live duplicates are suppressed.
-- Diff returns a measured zero only when a counter did not change. Reset, gap,
-  first point, invalid timestamp/scalar, and collection-disabled intervals are
-  distinct no-data reasons.
-- Anomaly scoring uses source-independent robust window statistics. Missing or
-  discontinuous data is counted as not evaluated; it is not replaced by zero.
-- Incident requests are limited to a 24-hour span and fixed ceilings for
+- Row queries read only overlapping segments, verify the PGM and section CRCs
+  before decoding, combine registered layout versions under one logical section
+  name, and sort by the registry key. Exact duplicates between sealed segments
+  and `active.parts` appear only once.
+- Diff responses distinguish a measured zero from a missing result. A point
+  without a valid rate carries one of the response codes `reset`, `gap`,
+  `first_point`, `anomaly`, or `not_collected`; `anomaly` here means that the
+  timestamps did not advance or the scalar kinds were inconsistent.
+- Anomaly search compares each current window with the other usable points in
+  the selected period. The strongest absolute peak score appears first.
+  `sections` reports evaluated and unevaluated window positions;
+  `nodata_points` is an aggregate count, so the anomaly response does not split
+  it into reset, gap, and collection-disabled totals. A window position that
+  crosses a timeline break is counted under `not_evaluated.discontinuity`.
+  Missing data is never replaced by zero.
+- Incident clustering preserves more detail about incomplete input:
+  `data_quality` has separate `resets`, `gaps`, and `not_collected` counts,
+  `coverage_by_section` lists gap intervals, and `skipped` explains work omitted
+  by a limit. Requests are limited to 24 hours and have fixed ceilings for
   units, sections, materialized cells, series points, identity bytes, scoring
   work, and episodes.
-- Only one anomaly or incident request runs at a time. A concurrent heavy
-  request gets `503` with `Retry-After: 1`; it is not queued.
-- `/v1/incidents` currently clusters episodes. Response `complete` remains
-  `false`, findings are empty, and the diagnostic lens catalog is dormant.
+- Only one anomaly or incident request runs at a time. A concurrent analysis
+  request receives `503` with `Retry-After: 1`; it is not queued.
+- `/v1/incidents` currently stops after clustering. The response keeps
+  `complete` set to `false`, returns empty `findings`, and exposes the diagnostic
+  lens catalog as dormant.
 
 Store scan warnings and damaged journal regions remain available to the reader
 and affect gaps/completeness. They are never converted to successful rows.
