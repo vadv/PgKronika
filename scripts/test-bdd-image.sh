@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$ROOT/scripts/bdd-image.sh"
 TEST_TMP=$(mktemp -d)
+unset GITHUB_RUN_ID GITHUB_RUN_ATTEMPT
 
 cleanup() {
   rm -rf "$TEST_TMP"
