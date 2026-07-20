@@ -70,7 +70,8 @@ pub const fn activity_query(version: ActivityVersion) -> &'static str {
              (extract(epoch from xact_start) * 1e6)::int8 AS xact_start_us, \
              (extract(epoch from query_start) * 1e6)::int8 AS query_start_us, \
              (extract(epoch from state_change) * 1e6)::int8 AS state_change_us, \
-             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             pg_has_role('pg_read_all_stats', 'member') AS full_visibility \
              FROM pg_stat_activity"
         ),
         ActivityVersion::V2 => marked!(
@@ -84,7 +85,8 @@ pub const fn activity_query(version: ActivityVersion) -> &'static str {
              (extract(epoch from xact_start) * 1e6)::int8 AS xact_start_us, \
              (extract(epoch from query_start) * 1e6)::int8 AS query_start_us, \
              (extract(epoch from state_change) * 1e6)::int8 AS state_change_us, \
-             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             pg_has_role('pg_read_all_stats', 'member') AS full_visibility \
              FROM pg_stat_activity"
         ),
         ActivityVersion::V3 => marked!(
@@ -98,7 +100,8 @@ pub const fn activity_query(version: ActivityVersion) -> &'static str {
              (extract(epoch from xact_start) * 1e6)::int8 AS xact_start_us, \
              (extract(epoch from query_start) * 1e6)::int8 AS query_start_us, \
              (extract(epoch from state_change) * 1e6)::int8 AS state_change_us, \
-             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             pg_has_role('pg_read_all_stats', 'member') AS full_visibility \
              FROM pg_stat_activity"
         ),
     }
@@ -152,6 +155,22 @@ pub struct ActivityRow {
     pub query_start: Option<i64>,
     /// Last state change, unix microseconds.
     pub state_change: Option<i64>,
+}
+
+/// One bounded activity read and the provenance needed by snapshot-wide
+/// consumers. Rows are empty when `truncated` is true.
+#[derive(Debug, Clone)]
+pub struct ActivityRead {
+    /// Durable activity layout selected for the server major version.
+    pub version: ActivityVersion,
+    /// Parsed rows, empty when the source-side bound was exceeded.
+    pub rows: Vec<ActivityRow>,
+    /// Rows returned by the bounded read, including its possible guard row.
+    pub source_rows: usize,
+    /// Whether the guard row proved that the snapshot exceeded the bound.
+    pub truncated: bool,
+    /// Whether activity fields for all sessions were visible to the collector.
+    pub full_visibility: bool,
 }
 
 /// Intern an optional string, preserving `None`.
@@ -297,15 +316,31 @@ fn row_from_pg(row: &tokio_postgres::Row, version: ActivityVersion) -> ActivityR
 pub async fn collect_activity(
     client: &Client,
     major: u32,
-) -> Result<(ActivityVersion, Vec<ActivityRow>, bool), tokio_postgres::Error> {
+) -> Result<ActivityRead, tokio_postgres::Error> {
     let version = activity_version(major);
     let query = bounded_activity_query(version);
     let rows = client.query(&query, &[&ACTIVITY_FETCH_ROWS]).await?;
+    let source_rows = rows.len();
+    let full_visibility = rows
+        .first()
+        .is_some_and(|row| row.get::<_, bool>("full_visibility"));
     if rows.len() > MAX_ACTIVITY_ROWS {
-        return Ok((version, Vec::new(), true));
+        return Ok(ActivityRead {
+            version,
+            rows: Vec::new(),
+            source_rows,
+            truncated: true,
+            full_visibility,
+        });
     }
     let parsed = rows.iter().map(|row| row_from_pg(row, version)).collect();
-    Ok((version, parsed, false))
+    Ok(ActivityRead {
+        version,
+        rows: parsed,
+        source_rows,
+        truncated: false,
+        full_visibility,
+    })
 }
 
 #[cfg(test)]
@@ -390,6 +425,18 @@ mod tests {
             ACTIVITY_FETCH_ROWS,
             i64::try_from(MAX_ACTIVITY_ROWS).unwrap() + 1
         );
+    }
+
+    #[test]
+    fn query_records_visibility_without_exposing_activity_text() {
+        for version in [
+            ActivityVersion::V1,
+            ActivityVersion::V2,
+            ActivityVersion::V3,
+        ] {
+            let query = activity_query(version);
+            assert!(query.contains("pg_has_role('pg_read_all_stats', 'member')"));
+        }
     }
 
     #[test]

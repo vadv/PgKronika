@@ -48,6 +48,9 @@ pub(crate) fn push_main_conn_sections(
     if let Some((activity_version, activity_rows)) = &src.activity {
         push_activity(buffers, interner, *activity_version, activity_rows)?;
     }
+    if let Some(coverage) = src.activity_coverage {
+        buffer_row(buffers, coverage)?;
+    }
     if let Some((database_version, database_rows)) = &src.database {
         push_database(buffers, interner, *database_version, database_rows)?;
     }

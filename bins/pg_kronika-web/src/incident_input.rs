@@ -15,12 +15,13 @@ use crate::incident::{
     ActivityBackend, ActivitySnapshot, EnrichedEpisode, EpisodeRefV1, EventInputLimits,
     GaugeQuality, GaugeTrackInput, IdentityValue, LifecycleEvent, LifecycleKind, LockEdge,
     LockSnapshot, LogCoverage, LogErrorGroup, LogEventInputs, Series, SeriesError,
-    SeriesInsertError, SeriesSet, TypedInputs,
+    SeriesInsertError, SeriesSet, SnapshotCompleteness, TypedInputs,
 };
 
 /// Sections whose raw snapshots the sampled activity and lock lenses read.
 const PG_STAT_ACTIVITY: &str = "pg_stat_activity";
 const PG_LOCKS: &str = "pg_locks";
+const SNAPSHOT_COVERAGE: &str = "snapshot_coverage";
 
 /// Data exclusions recorded while building engine input.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -259,7 +260,13 @@ pub(crate) fn prepare_input(
         limits.identity_bytes,
     )?;
     let gates = Gates::from_pages(&input.logicals, &input.pages);
-    let mut state = BuildState::new(limits, remaining_identity_bytes, input.skipped);
+    let snapshot_provenance = SnapshotProvenance::from_page(input.pages.get(SNAPSHOT_COVERAGE));
+    let mut state = BuildState::new(
+        limits,
+        remaining_identity_bytes,
+        input.skipped,
+        snapshot_provenance,
+    );
     for logical in &input.logicals {
         let Some(page) = input.pages.remove(logical.name) else {
             if state
@@ -498,6 +505,7 @@ fn read_input_pages(
     let mut read_names = BTreeSet::new();
     read_names.extend(logicals.iter().map(|logical| logical.name));
     read_names.extend(Gates::sections(&logicals));
+    read_names.insert(SNAPSHOT_COVERAGE);
     let observed_sections = read_names.len().saturating_add(1);
     if observed_sections > limits.sections {
         return Err(InputError::SectionLimit {
@@ -620,6 +628,97 @@ fn materialization_skip(name: &str, limit: usize) -> Result<SectionSkip, InputEr
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotMarkerState {
+    Complete,
+    Restricted,
+    Unavailable,
+    Unknown,
+}
+
+struct SnapshotProvenance {
+    activity: BTreeMap<i64, SnapshotMarkerState>,
+    page_partial: bool,
+}
+
+impl SnapshotProvenance {
+    fn from_page(page: Option<&SectionPage>) -> Self {
+        let mut activity = BTreeMap::new();
+        let page_partial =
+            page.is_none_or(|page| page.next_cursor.is_some() || !page.gaps.is_empty());
+        if let Some(page) = page {
+            for row in &page.rows {
+                let (Some(ts), Some(source_type_id), Some(read_state), Some(visibility)) = (
+                    read_ts(row, "ts"),
+                    read_u64(row, "source_type_id").and_then(|value| u32::try_from(value).ok()),
+                    read_u8(row, "read_state"),
+                    read_u8(row, "visibility"),
+                ) else {
+                    continue;
+                };
+                if !matches!(source_type_id, 1_001_001..=1_001_003) {
+                    continue;
+                }
+                let counts_match = matches!(
+                    (read_u64(row, "source_total"), read_u64(row, "collected")),
+                    (Some(total), Some(collected)) if total == collected
+                );
+                let session_valid = read_u64(row, "collector_pid").is_some_and(|pid| pid > 0)
+                    && read_ts(row, "collector_started_at").is_some_and(|start| start > 0);
+                let marker = match (read_state, visibility, counts_match, session_valid) {
+                    (0, 0, true, true) => SnapshotMarkerState::Complete,
+                    (0, 1, true, true) => SnapshotMarkerState::Restricted,
+                    (1..=4, _, _, true) => SnapshotMarkerState::Unavailable,
+                    _ => SnapshotMarkerState::Unknown,
+                };
+                activity
+                    .entry(ts)
+                    .and_modify(|current| {
+                        if *current != marker {
+                            *current = SnapshotMarkerState::Unknown;
+                        }
+                    })
+                    .or_insert(marker);
+            }
+        }
+        Self {
+            activity,
+            page_partial,
+        }
+    }
+
+    fn activity_snapshot(&self, ts: i64) -> SnapshotCompleteness {
+        match self.activity.get(&ts) {
+            Some(SnapshotMarkerState::Complete) => SnapshotCompleteness::Complete,
+            Some(SnapshotMarkerState::Restricted) => SnapshotCompleteness::Restricted,
+            Some(SnapshotMarkerState::Unavailable | SnapshotMarkerState::Unknown) | None => {
+                SnapshotCompleteness::Unknown
+            }
+        }
+    }
+
+    fn activity_capability(&self) -> CapabilityInputState {
+        if self.page_partial || self.activity.is_empty() {
+            return CapabilityInputState::Partial;
+        }
+        if self
+            .activity
+            .values()
+            .all(|state| matches!(state, SnapshotMarkerState::Complete))
+        {
+            CapabilityInputState::Available
+        } else if self
+            .activity
+            .values()
+            .all(|state| matches!(state, SnapshotMarkerState::Unavailable))
+        {
+            CapabilityInputState::NotCollected
+        } else {
+            CapabilityInputState::Partial
+        }
+    }
+}
+
 struct BuildState {
     episodes: Vec<EnrichedEpisode>,
     series: SeriesSet,
@@ -633,6 +732,7 @@ struct BuildState {
     snapshot_row_limit: usize,
     remaining_typed_gauge_points: usize,
     capability_by_section: BTreeMap<&'static str, CapabilityInputState>,
+    snapshot_provenance: SnapshotProvenance,
 }
 
 impl BuildState {
@@ -640,7 +740,11 @@ impl BuildState {
         limits: &InputLimits,
         remaining_identity_bytes: usize,
         skipped: Vec<SectionSkip>,
+        snapshot_provenance: SnapshotProvenance,
     ) -> Self {
+        let activity_capability = snapshot_provenance.activity_capability();
+        let mut capability_by_section = BTreeMap::new();
+        capability_by_section.insert(PG_STAT_ACTIVITY, activity_capability);
         Self {
             episodes: Vec::new(),
             series: SeriesSet::new(limits.series_points),
@@ -653,7 +757,8 @@ impl BuildState {
             remaining_snapshot_rows: limits.snapshot_rows,
             snapshot_row_limit: limits.snapshot_rows,
             remaining_typed_gauge_points: limits.typed_gauge_points,
-            capability_by_section: BTreeMap::new(),
+            capability_by_section,
+            snapshot_provenance,
         }
     }
 
@@ -689,6 +794,10 @@ impl BuildState {
             return Ok(());
         }
         self.record_page_state(logical.name, &page);
+
+        if logical.name == SNAPSHOT_COVERAGE {
+            return Ok(());
+        }
 
         // Log rows contain deliberately retained diagnostic text. They feed only
         // the typed event adapter below; admitting them to generic anomaly
@@ -943,7 +1052,7 @@ impl BuildState {
                 if self.withhold_snapshots(section, observed) {
                     return;
                 }
-                for snapshot in build_activity_snapshots(rows) {
+                for snapshot in build_activity_snapshots(rows, &self.snapshot_provenance) {
                     self.typed.insert_activity_snapshot(snapshot);
                 }
             }
@@ -1007,7 +1116,10 @@ impl BuildState {
 
 /// Group `pg_stat_activity` rows into per-collection-time snapshots. A row with
 /// no timestamp carries no snapshot to join and is dropped.
-fn build_activity_snapshots(rows: &[OutRow]) -> Vec<ActivitySnapshot> {
+fn build_activity_snapshots(
+    rows: &[OutRow],
+    provenance: &SnapshotProvenance,
+) -> Vec<ActivitySnapshot> {
     let mut by_ts: BTreeMap<i64, Vec<ActivityBackend>> = BTreeMap::new();
     for row in rows {
         let Some(Value::Ts(ts)) = row_value(row, "ts") else {
@@ -1020,7 +1132,11 @@ fn build_activity_snapshots(rows: &[OutRow]) -> Vec<ActivitySnapshot> {
     }
     by_ts
         .into_iter()
-        .map(|(ts, backends)| ActivitySnapshot { ts, backends })
+        .map(|(ts, backends)| ActivitySnapshot {
+            ts,
+            backends,
+            completeness: provenance.activity_snapshot(ts),
+        })
         .collect()
 }
 
@@ -1029,6 +1145,9 @@ fn build_activity_snapshots(rows: &[OutRow]) -> Vec<ActivitySnapshot> {
 /// snapshot (clock disagreement) yields `None` rather than a negative age.
 fn activity_backend(row: &OutRow, ts: i64) -> ActivityBackend {
     ActivityBackend {
+        pid: read_i64(row, "pid").unwrap_or(0),
+        backend_start: read_ts(row, "backend_start").unwrap_or(0),
+        xid_age: read_i64(row, "backend_xid_age"),
         xmin_age: match row_value(row, "backend_xmin_age") {
             Some(Value::I64(age)) => Some(*age),
             _ => None,
@@ -2085,7 +2204,12 @@ mod tests {
     fn typed_gauge_point_admission_rejects_retention_all_or_nothing() {
         let mut limits = InputLimits::for_test();
         limits.typed_gauge_points = 2;
-        let mut state = BuildState::new(&limits, limits.identity_bytes, Vec::new());
+        let mut state = BuildState::new(
+            &limits,
+            limits.identity_bytes,
+            Vec::new(),
+            SnapshotProvenance::from_page(None),
+        );
         let series = vec![SeriesValues {
             key: Vec::new(),
             columns: vec![ColumnValues {
@@ -2491,12 +2615,20 @@ mod tests {
             .expect("metadata fits and oversized data is skipped");
         assert_eq!(
             prepared.skipped,
-            vec![SectionSkip {
-                section: "pg_stat_archiver",
-                reason: SkipReason::MaterializationLimit {
-                    limit: limits.materialized_cells,
+            vec![
+                SectionSkip {
+                    section: "pg_stat_archiver",
+                    reason: SkipReason::MaterializationLimit {
+                        limit: limits.materialized_cells,
+                    },
                 },
-            }]
+                SectionSkip {
+                    section: SNAPSHOT_COVERAGE,
+                    reason: SkipReason::MaterializationLimit {
+                        limit: limits.materialized_cells,
+                    },
+                },
+            ]
         );
         assert!(prepared.episodes.is_empty());
     }
@@ -2550,6 +2682,8 @@ mod tests {
         vec![
             cell("ts", Value::Ts(ts)),
             cell("pid", Value::I64(pid)),
+            cell("backend_start", Value::Ts(10)),
+            cell("backend_xid_age", Value::I64(11)),
             cell("state", Value::Str(state.to_owned())),
             cell("backend_xmin_age", Value::I64(xmin_age)),
             cell("xact_start", Value::Ts(xact_start)),
@@ -2563,7 +2697,8 @@ mod tests {
             activity_row(100, 2, "idle in transaction", 9, 30),
             activity_row(200, 1, "active", 7, 150),
         ];
-        let snapshots = build_activity_snapshots(&rows);
+        let provenance = SnapshotProvenance::from_page(None);
+        let snapshots = build_activity_snapshots(&rows, &provenance);
         assert_eq!(snapshots.len(), 2, "two distinct timestamps, two snapshots");
         assert_eq!(snapshots[0].ts, 100);
         assert_eq!(snapshots[0].backends.len(), 2);
@@ -2578,6 +2713,8 @@ mod tests {
         row.push(cell("wait_event", Value::Str("ClientRead".to_owned())));
         let backend = activity_backend(&row, 1_000);
         assert_eq!(backend.xmin_age, Some(42));
+        assert_eq!((backend.pid, backend.backend_start), (7, 10));
+        assert_eq!(backend.xid_age, Some(11));
         assert_eq!(backend.state.as_deref(), Some("idle in transaction"));
         assert_eq!(backend.wait_event_type.as_deref(), Some("Client"));
         assert_eq!(backend.wait_event.as_deref(), Some("ClientRead"));
@@ -2590,6 +2727,101 @@ mod tests {
         // negative-duration transaction.
         let backend = activity_backend(&activity_row(500, 1, "active", 3, 900), 500);
         assert_eq!(backend.xact_age_us, None);
+    }
+
+    fn snapshot_marker_row(
+        ts: i64,
+        read_state: u64,
+        visibility: u64,
+        source_total: u64,
+        collected: u64,
+    ) -> OutRow {
+        vec![
+            cell("ts", Value::Ts(ts)),
+            cell("source_type_id", Value::U64(1_001_003)),
+            cell("collector_pid", Value::U64(42)),
+            cell("collector_started_at", Value::Ts(1)),
+            cell("read_state", Value::U64(read_state)),
+            cell("visibility", Value::U64(visibility)),
+            cell("source_total", Value::U64(source_total)),
+            cell("collected", Value::U64(collected)),
+        ]
+    }
+
+    fn snapshot_marker_page(rows: Vec<OutRow>) -> SectionPage {
+        SectionPage {
+            section: SNAPSHOT_COVERAGE.to_owned(),
+            source_id: 7,
+            rows,
+            gaps: Vec::new(),
+            next_cursor: None,
+        }
+    }
+
+    #[test]
+    fn complete_marker_is_required_for_an_activity_denominator() {
+        let page = snapshot_marker_page(vec![snapshot_marker_row(100, 0, 0, 2, 2)]);
+        let provenance = SnapshotProvenance::from_page(Some(&page));
+        assert_eq!(
+            provenance.activity_snapshot(100),
+            SnapshotCompleteness::Complete
+        );
+        assert_eq!(
+            provenance.activity_capability(),
+            CapabilityInputState::Available
+        );
+    }
+
+    #[test]
+    fn restricted_visibility_keeps_positive_rows_but_withholds_denominators() {
+        let page = snapshot_marker_page(vec![snapshot_marker_row(100, 0, 1, 2, 2)]);
+        let provenance = SnapshotProvenance::from_page(Some(&page));
+        assert_eq!(
+            provenance.activity_snapshot(100),
+            SnapshotCompleteness::Restricted
+        );
+        assert_eq!(
+            provenance.activity_capability(),
+            CapabilityInputState::Partial
+        );
+    }
+
+    #[test]
+    fn source_limit_or_read_failure_is_typed_as_not_collected() {
+        for read_state in [1, 2, 3, 4] {
+            let page =
+                snapshot_marker_page(vec![snapshot_marker_row(100, read_state, 2, 4_097, 0)]);
+            let provenance = SnapshotProvenance::from_page(Some(&page));
+            assert_eq!(
+                provenance.activity_snapshot(100),
+                SnapshotCompleteness::Unknown
+            );
+            assert_eq!(
+                provenance.activity_capability(),
+                CapabilityInputState::NotCollected
+            );
+        }
+    }
+
+    #[test]
+    fn old_segments_and_conflicting_markers_are_coverage_unknown() {
+        let old = SnapshotProvenance::from_page(None);
+        assert_eq!(old.activity_snapshot(100), SnapshotCompleteness::Unknown);
+        assert_eq!(old.activity_capability(), CapabilityInputState::Partial);
+
+        let page = snapshot_marker_page(vec![
+            snapshot_marker_row(100, 0, 0, 2, 2),
+            snapshot_marker_row(100, 0, 1, 2, 2),
+        ]);
+        let conflicting = SnapshotProvenance::from_page(Some(&page));
+        assert_eq!(
+            conflicting.activity_snapshot(100),
+            SnapshotCompleteness::Unknown
+        );
+        assert_eq!(
+            conflicting.activity_capability(),
+            CapabilityInputState::Partial
+        );
     }
 
     #[test]
@@ -2608,7 +2840,8 @@ mod tests {
             cell("pid", Value::I64(1)),
             cell("state", Value::Str("active".to_owned())),
         ]];
-        assert!(build_activity_snapshots(&rows).is_empty());
+        let provenance = SnapshotProvenance::from_page(None);
+        assert!(build_activity_snapshots(&rows, &provenance).is_empty());
     }
 
     fn lock_row(ts: i64, pid: i64, blocked_by: Vec<i32>) -> OutRow {
@@ -2666,7 +2899,12 @@ mod tests {
     fn build_state(snapshot_rows: usize) -> BuildState {
         let mut limits = InputLimits::for_test();
         limits.snapshot_rows = snapshot_rows;
-        BuildState::new(&limits, limits.identity_bytes, Vec::new())
+        BuildState::new(
+            &limits,
+            limits.identity_bytes,
+            Vec::new(),
+            SnapshotProvenance::from_page(None),
+        )
     }
 
     #[test]
@@ -2959,7 +3197,12 @@ mod tests {
         let page = log_page(PG_LOG_ERRORS, vec![row]);
         let logical = logical_section(PG_LOG_ERRORS).expect("registered log section");
         let limits = InputLimits::for_test();
-        let mut state = BuildState::new(&limits, limits.identity_bytes, Vec::new());
+        let mut state = BuildState::new(
+            &limits,
+            limits.identity_bytes,
+            Vec::new(),
+            SnapshotProvenance::from_page(None),
+        );
         let gates = Gates::from_pages(std::slice::from_ref(&logical), &BTreeMap::new());
         let scan = ScanParams {
             from: 0,

@@ -61,7 +61,7 @@ pub use codec::{
     pg_settings, pg_stat_activity, pg_stat_archiver, pg_stat_database, pg_stat_io,
     pg_stat_progress_vacuum, pg_stat_statements, pg_stat_user_indexes, pg_stat_user_tables,
     pg_stat_wal, pg_store_plans, replication_instance, replication_replicas, replication_slots,
-    reset_metadata,
+    reset_metadata, snapshot_coverage,
 };
 pub(crate) use codec::{check_row_cap, decode_batches, decode_section, encode_section};
 pub use contract::{
@@ -163,6 +163,7 @@ pub const fn registry() -> &'static [TypeContract] {
         incident_gauges::PgReplicationSlotRetentionV3::CONTRACT,
         incident_gauges::PgStorageMountV1::CONTRACT,
         incident_gauges::PgProcessCgroupMemoryV1::CONTRACT,
+        snapshot_coverage::SnapshotCoverageV1::CONTRACT,
         os_process::OsProcess::CONTRACT,
         os_process_status::OsProcessStatus::CONTRACT,
         os_cpu::OsCpu::CONTRACT,

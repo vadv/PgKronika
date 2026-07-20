@@ -64,6 +64,7 @@ pub mod replication_instance;
 pub mod replication_replicas;
 pub mod replication_slots;
 pub mod reset_metadata;
+pub mod snapshot_coverage;
 
 /// Maximum rows in one snapshot section.
 ///

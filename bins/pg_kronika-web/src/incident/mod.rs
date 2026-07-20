@@ -21,7 +21,7 @@ pub(crate) use model::{EnrichedEpisode, EpisodeRefV1, IdentityValue};
 pub(crate) use series::{Series, SeriesError, SeriesInsertError, SeriesSet};
 pub(crate) use typed::{
     ActivityBackend, ActivitySnapshot, GaugeQuality, GaugeTrackInput, LockEdge, LockSnapshot,
-    TypedInputs,
+    SnapshotCompleteness, TypedInputs,
 };
 
 pub(crate) use active::{active_catalog, active_catalog_ids};

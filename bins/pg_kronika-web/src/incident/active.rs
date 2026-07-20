@@ -1,5 +1,6 @@
 //! Active diagnostic lenses over typed counter and gauge evidence.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::cluster::Cluster;
@@ -17,7 +18,9 @@ use super::gauge_contracts::{
 use super::lens::Lens;
 use super::model::IdentityValue;
 use super::series::SeriesSet;
-use super::typed::{ActivityBackend, ActivitySnapshot, GaugeObjective, TypedInputs};
+use super::typed::{ActivityBackend, GaugeObjective, TypedInputs};
+#[cfg(test)]
+use super::typed::{ActivitySnapshot, SnapshotCompleteness};
 
 const PG_STAT_DATABASE: &str = "pg_stat_database";
 const PG_STAT_WAL: &str = "pg_stat_wal";
@@ -1067,12 +1070,10 @@ impl Lens for WritebackPressureLens {
     }
 }
 
-/// `PG-HORIZON-013` (`xmin_horizon_hold`): a backend pinning the vacuum horizon.
-/// Reports an amplifier when a sampled `pg_stat_activity` snapshot in the
-/// incident window holds an old `backend_xmin` while idle in transaction or in a
-/// long-running transaction. Snapshots between samples are unseen, so this is a
-/// sampled observation, not a proof; its confidence caps at medium and, without
-/// a structural direction, it never leads.
+/// `PG-HORIZON-013` (`xmin_horizon_hold`): an observed old transaction with an
+/// assigned xmin capable of holding the vacuum horizon. Prepared transactions,
+/// slots, and standby feedback are independent alternatives outside this row
+/// observation. Unseen snapshots prevent a global-cause or persistence claim.
 pub(crate) struct XminHorizonHoldLens;
 
 impl XminHorizonHoldLens {
@@ -1090,9 +1091,11 @@ impl XminHorizonHoldLens {
     /// Below this xmin age the hold is ordinary transaction churn, not a horizon
     /// a vacuum is waiting on.
     const MIN_XMIN_AGE: i64 = 1_000_000;
+    const MIN_XMIN_AGE_F64: f64 = 1_000_000.0;
     /// A running (non-idle) transaction must be at least this old, in
     /// microseconds, to count as a horizon-holding long transaction (5 minutes).
     const MIN_LONG_XACT_US: i64 = 300_000_000;
+    const MIN_LONG_XACT_US_F64: f64 = 300_000_000.0;
 
     fn holds_horizon(backend: &ActivityBackend) -> bool {
         backend
@@ -1132,14 +1135,52 @@ impl Lens for XminHorizonHoldLens {
         };
         let (start, end) = (context.incident_start_us, context.incident_end_us);
         sink.charge_points(activity_backends_examined(typed, start, end))?;
-        let holds = typed
+        let candidate = typed
             .activity_window(start, end)
-            .any(|snapshot| snapshot.backends.iter().any(Self::holds_horizon));
-        if holds {
+            .flat_map(|snapshot| {
+                snapshot.backends.iter().filter_map(move |backend| {
+                    (backend.pid > 0 && backend.backend_start > 0 && Self::holds_horizon(backend))
+                        .then_some((snapshot.ts, backend))
+                })
+            })
+            .max_by_key(|(_, backend)| backend.xmin_age.unwrap_or_default());
+        if let Some((observed_at_us, backend)) = candidate {
+            let identity: Arc<[IdentityValue]> = Arc::from(vec![
+                IdentityValue::I64(backend.pid),
+                IdentityValue::I64(backend.backend_start),
+            ]);
+            let Some(xmin_age) = backend.xmin_age.and_then(exact_i64_as_f64) else {
+                return Ok(());
+            };
+            let Some(xmin_evidence) = GaugeEvidence::value(
+                xmin_age,
+                GaugeUnit::Count,
+                Self::MIN_XMIN_AGE_F64,
+                ThresholdKind::AtLeast,
+                observed_at_us,
+                1,
+                GaugeEntity::new(PG_STAT_ACTIVITY, Arc::clone(&identity)),
+            ) else {
+                return Ok(());
+            };
+            let mut evidence = vec![Evidence::GaugeObservation(xmin_evidence)];
+            if let Some(xact_age_us) = backend.xact_age_us.and_then(exact_i64_as_f64)
+                && let Some(xact_evidence) = GaugeEvidence::value(
+                    xact_age_us,
+                    GaugeUnit::Microseconds,
+                    Self::MIN_LONG_XACT_US_F64,
+                    ThresholdKind::AtLeast,
+                    observed_at_us,
+                    1,
+                    GaugeEntity::new(PG_STAT_ACTIVITY, identity),
+                )
+            {
+                evidence.push(Evidence::GaugeObservation(xact_evidence));
+            }
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::Gauge],
+                evidence,
                 None,
             ))?;
         }
@@ -1147,11 +1188,9 @@ impl Lens for XminHorizonHoldLens {
     }
 }
 
-/// `PG-SYNC-018` (`sync_replication_wait`): backends parked on synchronous
-/// replication. Reports a coincident finding when a sampled `pg_stat_activity`
-/// snapshot in the incident window holds a backend on `wait_event='SyncRep'` —
-/// the wait itself means synchronous replication is configured and not
-/// acknowledging. Sampled, so its confidence caps at medium.
+/// `PG-SYNC-018` (`sync_replication_wait`): the same backend session sampled on
+/// `wait_event='SyncRep'` in three consecutive snapshots. This is a positive
+/// sampled observation, not elapsed wait duration or a standby root cause.
 pub(crate) struct SyncReplicationWaitLens;
 
 impl SyncReplicationWaitLens {
@@ -1160,9 +1199,9 @@ impl SyncReplicationWaitLens {
         section: PG_STAT_ACTIVITY,
         column: "wait_event",
     }];
-    /// One backend held on `SyncRep` already means a synchronous standby is not
-    /// acknowledging commits.
-    const MIN_SYNCREP_BACKENDS: usize = 1;
+    /// Require the same session in three consecutive stored snapshots. This is
+    /// sampled persistence, not elapsed wait duration.
+    const MIN_CONSECUTIVE_SAMPLES: usize = 3;
 }
 
 impl Lens for SyncReplicationWaitLens {
@@ -1192,19 +1231,54 @@ impl Lens for SyncReplicationWaitLens {
         };
         let (start, end) = (context.incident_start_us, context.incident_end_us);
         sink.charge_points(activity_backends_examined(typed, start, end))?;
-        let waiting = typed.activity_window(start, end).any(|snapshot| {
-            snapshot
-                .backends
-                .iter()
-                .filter(|backend| is_syncrep(backend.wait_event.as_deref()))
-                .count()
-                >= Self::MIN_SYNCREP_BACKENDS
-        });
-        if waiting {
+        let mut runs: BTreeMap<(i64, i64), (usize, usize, i64)> = BTreeMap::new();
+        for (snapshot_index, snapshot) in typed.activity_window(start, end).enumerate() {
+            for backend in snapshot.backends.iter().filter(|backend| {
+                backend.pid > 0
+                    && backend.backend_start > 0
+                    && is_syncrep(backend.wait_event.as_deref())
+            }) {
+                let entry = runs.entry((backend.pid, backend.backend_start)).or_insert((
+                    snapshot_index,
+                    0,
+                    snapshot.ts,
+                ));
+                entry.1 = if entry.1 > 0 && entry.0.checked_add(1) == Some(snapshot_index) {
+                    entry.1.saturating_add(1)
+                } else {
+                    1
+                };
+                entry.0 = snapshot_index;
+                entry.2 = snapshot.ts;
+            }
+        }
+        let persistent = runs
+            .into_iter()
+            .filter(|(_, (_, samples, _))| *samples >= Self::MIN_CONSECUTIVE_SAMPLES)
+            .max_by_key(|(_, (_, samples, _))| *samples);
+        if let Some(((pid, backend_start), (_, samples, observed_at_us))) = persistent {
+            let Some(samples_value) = u32::try_from(samples).ok().map(f64::from) else {
+                return Ok(());
+            };
+            let identity: Arc<[IdentityValue]> = Arc::from(vec![
+                IdentityValue::I64(pid),
+                IdentityValue::I64(backend_start),
+            ]);
+            let Some(evidence) = GaugeEvidence::value(
+                samples_value,
+                GaugeUnit::Count,
+                3.0,
+                ThresholdKind::AtLeast,
+                observed_at_us,
+                samples,
+                GaugeEntity::new(PG_STAT_ACTIVITY, identity),
+            ) else {
+                return Ok(());
+            };
             sink.emit(FindingDraft::new(
                 Role::Coincident,
                 FindingScope::from_episode(member),
-                vec![Evidence::Gauge],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -1213,10 +1287,9 @@ impl Lens for SyncReplicationWaitLens {
 }
 
 /// `PG-WAIT-019` (`internal_wait_concentration`): active backends piling onto
-/// internal waits. Reports a coincident finding when a sampled
-/// `pg_stat_activity` snapshot in the incident window has at least half of its
-/// active backends on an `LWLock`, `BufferPin`, or `IO` wait. The design
-/// confidence is low, so its findings stay capped there.
+/// internal waits. Reports each bounded wait class separately only when at
+/// least three snapshots carry explicit complete-visibility provenance and the
+/// class accounts for at least half of the visible active-backend denominator.
 pub(crate) struct InternalWaitConcentrationLens;
 
 impl InternalWaitConcentrationLens {
@@ -1229,26 +1302,8 @@ impl InternalWaitConcentrationLens {
     /// concentration is meaningful.
     const MIN_ACTIVE: usize = 3;
 
-    /// Whether at least half of the snapshot's active backends wait on an
-    /// internal event. The `2 * internal >= active` form is the `>= 1/2`
-    /// threshold without floating point.
-    fn concentrated(snapshot: &ActivitySnapshot) -> bool {
-        let active = snapshot
-            .backends
-            .iter()
-            .filter(|backend| backend.state.as_deref() == Some("active"))
-            .count();
-        if active < Self::MIN_ACTIVE {
-            return false;
-        }
-        let internal = snapshot
-            .backends
-            .iter()
-            .filter(|backend| backend.state.as_deref() == Some("active"))
-            .filter(|backend| is_internal_wait(backend.wait_event_type.as_deref()))
-            .count();
-        internal.saturating_mul(2) >= active
-    }
+    const MIN_SNAPSHOTS: usize = 3;
+    const WAIT_FRACTION: f64 = 0.5;
 }
 
 impl Lens for InternalWaitConcentrationLens {
@@ -1278,12 +1333,76 @@ impl Lens for InternalWaitConcentrationLens {
         };
         let (start, end) = (context.incident_start_us, context.incident_end_us);
         sink.charge_points(activity_backends_examined(typed, start, end))?;
-        let concentrated = typed.activity_window(start, end).any(Self::concentrated);
-        if concentrated {
+        let mut snapshots = 0_usize;
+        let mut active_total = 0_usize;
+        let mut class_totals = [0_usize; 3];
+        let mut observed_at_us = start;
+        for snapshot in typed
+            .activity_window(start, end)
+            .filter(|snapshot| snapshot.completeness.denominator_usable())
+        {
+            let active = snapshot
+                .backends
+                .iter()
+                .filter(|backend| backend.state.as_deref() == Some("active"))
+                .count();
+            if active < Self::MIN_ACTIVE {
+                continue;
+            }
+            snapshots = snapshots.saturating_add(1);
+            active_total = active_total.saturating_add(active);
+            observed_at_us = snapshot.ts;
+            for backend in snapshot
+                .backends
+                .iter()
+                .filter(|backend| backend.state.as_deref() == Some("active"))
+            {
+                match backend.wait_event_type.as_deref() {
+                    Some("LWLock") => class_totals[0] = class_totals[0].saturating_add(1),
+                    Some("BufferPin") => class_totals[1] = class_totals[1].saturating_add(1),
+                    Some("IO") => class_totals[2] = class_totals[2].saturating_add(1),
+                    _ => {}
+                }
+            }
+        }
+        let concentrated = class_totals
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, count)| {
+                snapshots >= Self::MIN_SNAPSHOTS
+                    && active_total > 0
+                    && count.saturating_mul(2) >= active_total
+            })
+            .max_by_key(|(_, count)| *count);
+        if let Some((class, waiting)) = concentrated {
+            let class = match class {
+                0 => "LWLock",
+                1 => "BufferPin",
+                _ => "IO",
+            };
+            let identity: Arc<[IdentityValue]> =
+                Arc::from(vec![IdentityValue::Text(class.to_owned())]);
+            let (Some(waiting), Some(active_total)) = (
+                u32::try_from(waiting).ok().map(f64::from),
+                u32::try_from(active_total).ok().map(f64::from),
+            ) else {
+                return Ok(());
+            };
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(waiting, active_total, GaugeUnit::Count),
+                Self::WAIT_FRACTION,
+                ThresholdKind::AtLeast,
+                observed_at_us,
+                snapshots,
+                GaugeEntity::new(PG_STAT_ACTIVITY, identity),
+            ) else {
+                return Ok(());
+            };
             sink.emit(FindingDraft::new(
                 Role::Coincident,
                 FindingScope::from_episode(member),
-                vec![Evidence::Gauge],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -1391,6 +1510,18 @@ fn is_syncrep(wait_event: Option<&str>) -> bool {
     wait_event == Some("SyncRep")
 }
 
+fn exact_i64_as_f64(value: i64) -> Option<f64> {
+    const MAX_EXACT_INTEGER: i64 = 1_i64 << 53;
+    if !(-MAX_EXACT_INTEGER..=MAX_EXACT_INTEGER).contains(&value) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the preceding bound proves exact IEEE-754 integer representation"
+    )]
+    Some(value as f64)
+}
+
 /// Whether a wait-event class is an internal (non-client) contention point.
 fn is_internal_wait(wait_event_type: Option<&str>) -> bool {
     matches!(wait_event_type, Some("LWLock" | "BufferPin" | "IO"))
@@ -1418,6 +1549,9 @@ pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
         Box::new(SlotRetentionLens),
         Box::new(CgroupMemoryLens),
         Box::new(StorageCapacityLens),
+        Box::new(XminHorizonHoldLens),
+        Box::new(SyncReplicationWaitLens),
+        Box::new(InternalWaitConcentrationLens),
         Box::new(LockWaitGraphLens),
     ]
 }
@@ -1574,6 +1708,9 @@ mod tests {
                 "PG-SLOT-016",
                 "OS-CGMEM-023",
                 "OS-FS-027",
+                "PG-HORIZON-013",
+                "PG-SYNC-018",
+                "PG-WAIT-019",
                 "PG-LOCK-012",
             ]
         );
@@ -2307,9 +2444,8 @@ mod tests {
     #[test]
     fn active_and_dormant_lenses_are_accounted_once() {
         let active = active_catalog_ids();
-        // Nine counter, ten gauge, and one complete lock-snapshot lens are wired.
-        assert_eq!(active.len(), 20);
-        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 8);
+        assert_eq!(active.len(), 23);
+        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 5);
         let unique: std::collections::BTreeSet<_> = active.iter().copied().collect();
         assert_eq!(unique.len(), active.len());
     }
@@ -2347,6 +2483,9 @@ mod tests {
 
     fn base_backend() -> ActivityBackend {
         ActivityBackend {
+            pid: 1,
+            backend_start: 1,
+            xid_age: None,
             xmin_age: None,
             state: None,
             wait_event_type: None,
@@ -2358,7 +2497,23 @@ mod tests {
     // A snapshot at ts=5 sits inside the run_lens episode window [0, 10].
     fn activity_typed(backends: Vec<ActivityBackend>) -> TypedInputs {
         let mut typed = TypedInputs::new();
-        typed.insert_activity_snapshot(ActivitySnapshot { ts: 5, backends });
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 5,
+            backends,
+            completeness: SnapshotCompleteness::Complete,
+        });
+        typed
+    }
+
+    fn repeated_activity_typed(backends: &[ActivityBackend]) -> TypedInputs {
+        let mut typed = TypedInputs::new();
+        for ts in [3, 5, 7] {
+            typed.insert_activity_snapshot(ActivitySnapshot {
+                ts,
+                backends: backends.to_owned(),
+                completeness: SnapshotCompleteness::Complete,
+            });
+        }
         typed
     }
 
@@ -2433,7 +2588,7 @@ mod tests {
 
     #[test]
     fn sync_replication_reports_a_medium_coincident_on_a_syncrep_wait() {
-        let typed = activity_typed(vec![ActivityBackend {
+        let typed = repeated_activity_typed(&[ActivityBackend {
             wait_event: Some("SyncRep".into()),
             ..base_backend()
         }]);
@@ -2466,6 +2621,32 @@ mod tests {
     }
 
     #[test]
+    fn sync_replication_requires_the_same_session_in_three_consecutive_samples() {
+        let mut typed = TypedInputs::new();
+        for (ts, backend_start) in [(3, 1), (5, 2), (7, 1)] {
+            typed.insert_activity_snapshot(ActivitySnapshot {
+                ts,
+                backends: vec![ActivityBackend {
+                    pid: 1,
+                    backend_start,
+                    wait_event: Some("SyncRep".into()),
+                    ..base_backend()
+                }],
+                completeness: SnapshotCompleteness::Restricted,
+            });
+        }
+        assert!(
+            run_lens(
+                &SyncReplicationWaitLens,
+                PG_STAT_ACTIVITY,
+                "wait_event",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn internal_wait_reports_a_low_coincident_when_active_backends_concentrate() {
         // Three active backends, two on LWLock: 2*2 >= 3.
         let lwlock = || ActivityBackend {
@@ -2477,7 +2658,7 @@ mod tests {
             state: Some("active".into()),
             ..base_backend()
         };
-        let typed = activity_typed(vec![lwlock(), lwlock(), running]);
+        let typed = repeated_activity_typed(&[lwlock(), lwlock(), running]);
         assert_eq!(
             run_lens(
                 &InternalWaitConcentrationLens,
@@ -2522,6 +2703,43 @@ mod tests {
             ..base_backend()
         };
         let typed = activity_typed(vec![lwlock, running(), running(), running()]);
+        assert!(
+            run_lens(
+                &InternalWaitConcentrationLens,
+                PG_STAT_ACTIVITY,
+                "wait_event_type",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn internal_wait_withholds_ratio_without_complete_snapshot_markers() {
+        let backends = vec![
+            ActivityBackend {
+                state: Some("active".into()),
+                wait_event_type: Some("LWLock".into()),
+                ..base_backend()
+            },
+            ActivityBackend {
+                state: Some("active".into()),
+                wait_event_type: Some("LWLock".into()),
+                ..base_backend()
+            },
+            ActivityBackend {
+                state: Some("active".into()),
+                ..base_backend()
+            },
+        ];
+        let mut typed = TypedInputs::new();
+        for ts in [3, 5, 7] {
+            typed.insert_activity_snapshot(ActivitySnapshot {
+                ts,
+                backends: backends.clone(),
+                completeness: SnapshotCompleteness::Unknown,
+            });
+        }
         assert!(
             run_lens(
                 &InternalWaitConcentrationLens,

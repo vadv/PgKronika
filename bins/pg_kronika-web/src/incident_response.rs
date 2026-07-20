@@ -541,7 +541,7 @@ mod tests {
     use super::*;
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
-    const APPLIED_IDS: [&str; 26] = [
+    const APPLIED_IDS: [&str; 29] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -561,6 +561,9 @@ mod tests {
         "PG-SLOT-016",
         "OS-CGMEM-023",
         "OS-FS-027",
+        "PG-HORIZON-013",
+        "PG-SYNC-018",
+        "PG-WAIT-019",
         "PG-LOCK-012",
         "PG-EVT-001",
         "PG-EVT-002",
@@ -930,8 +933,8 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 8);
-        assert_eq!(body["catalog"]["active_count"], 26);
+        assert_eq!(dormant.len(), 5);
+        assert_eq!(body["catalog"]["active_count"], 29);
         assert_eq!(body["catalog"]["catalog_count"], 34);
         assert!(
             APPLIED_IDS.contains(&"PG-LOCK-012"),

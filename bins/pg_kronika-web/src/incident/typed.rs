@@ -437,6 +437,12 @@ impl TripleGaugeWindow<'_> {
 /// one with no assigned xmin.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ActivityBackend {
+    /// Stable session identity together with `backend_start`.
+    pub pid: i64,
+    /// `PostgreSQL` backend start, Unix microseconds.
+    pub backend_start: i64,
+    /// `age(backend_xid)` in transactions when assigned.
+    pub xid_age: Option<i64>,
     /// `age(backend_xmin)` in transactions; `Some` only while the backend pins
     /// the vacuum horizon.
     pub xmin_age: Option<i64>,
@@ -452,11 +458,29 @@ pub(crate) struct ActivityBackend {
     pub xact_age_us: Option<i64>,
 }
 
+/// Provenance of one stored multi-row snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotCompleteness {
+    /// The source read completed and the collector could see all activity fields.
+    Complete,
+    /// The read completed, but activity fields for other sessions may be NULL.
+    Restricted,
+    /// No valid marker exists (including old layouts and conflicting markers).
+    Unknown,
+}
+
+impl SnapshotCompleteness {
+    pub(crate) const fn denominator_usable(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
 /// A `pg_stat_activity` snapshot: the backends captured at one collection time.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ActivitySnapshot {
     pub ts: i64,
     pub backends: Vec<ActivityBackend>,
+    pub completeness: SnapshotCompleteness,
 }
 
 /// One directed blocking edge from a `pg_locks` snapshot: `waiter_pid` waits on
@@ -1286,6 +1310,9 @@ mod tests {
 
     fn backend(state: &str) -> ActivityBackend {
         ActivityBackend {
+            pid: 1,
+            backend_start: 1,
+            xid_age: None,
             xmin_age: None,
             state: Some(state.into()),
             wait_event_type: None,
@@ -1298,6 +1325,7 @@ mod tests {
         ActivitySnapshot {
             ts,
             backends: vec![backend(state)],
+            completeness: SnapshotCompleteness::Complete,
         }
     }
 
