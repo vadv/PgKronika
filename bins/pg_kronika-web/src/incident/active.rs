@@ -994,8 +994,8 @@ impl Lens for NetworkErrorsLens {
 
 /// `OS-CGRP-021` (`cgroup_cpu_throttling`): a cgroup denied the CPU it asked for.
 /// Reports elevated throttled microseconds per covered second. `usage_usec` is
-/// retained as aligned context, not used as a wall-time denominator. The role
-/// stays coincident until PG-to-cgroup scope and host spare CPU are correlated.
+/// retained as aligned context, not used as a wall-time denominator. The lens
+/// emits coincident; the engine may later apply its observation-time fallback.
 pub(crate) struct CgroupCpuThrottlingLens;
 
 impl CgroupCpuThrottlingLens {
