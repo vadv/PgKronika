@@ -203,7 +203,6 @@ impl Lens for HostCpuLens {
                 .into_iter()
                 .map(Evidence::GaugeObservation)
                 .collect(),
-            None,
         ))?;
         Ok(())
     }
@@ -445,7 +444,6 @@ impl Lens for BlockDeviceLens {
             Role::Coincident,
             FindingScope::from_episode(member),
             evidence,
-            None,
         ))?;
         Ok(())
     }
@@ -684,7 +682,6 @@ impl Lens for ProcessIoWhoLens {
             Role::Coincident,
             FindingScope::from_episode(member),
             evidence,
-            None,
         ))?;
         Ok(())
     }

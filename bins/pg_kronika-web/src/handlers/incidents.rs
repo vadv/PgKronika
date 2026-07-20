@@ -239,9 +239,9 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
         &prepared.node_self_id,
         request.epsilon_us,
         request.max_cluster_span_us,
-        // Product convention: the collector's snapshot timestamp is the
-        // observed event time used to order signals inside an incident.
-        ClockRelation::SameDomain,
+        // Product convention: timestamps are true observation times, but all
+        // metric signals in one incident observation are simultaneous.
+        ClockRelation::Simultaneous,
     );
     let catalog = active_catalog();
     let lenses: Vec<&dyn Lens> = catalog.iter().map(AsRef::as_ref).collect();

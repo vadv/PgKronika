@@ -219,7 +219,6 @@ impl Lens for QueryWorkLens {
                 Role::Amplifier,
                 FindingScope::from_episode(member),
                 evidence,
-                None,
             ))?;
         }
         Ok(())
@@ -446,7 +445,6 @@ impl Lens for PlanChurnLens {
                 .into_iter()
                 .map(Evidence::GaugeObservation)
                 .collect(),
-            None,
         ))?;
         Ok(())
     }

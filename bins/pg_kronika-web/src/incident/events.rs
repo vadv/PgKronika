@@ -348,7 +348,6 @@ fn emit_error_sqlstate(
             Role::Coincident,
             FindingScope::from_parts(PG_LOG_ERRORS, "sqlstate", identity),
             stderr_observation(),
-            None,
         ))?;
     }
     Ok(())
@@ -386,7 +385,6 @@ fn emit_crash_signal(
             Role::Coincident,
             FindingScope::from_parts(PG_LOG_LIFECYCLE, "signal", identity),
             typed_occurrence(),
-            None,
         ))?;
     }
     Ok(())
@@ -487,7 +485,6 @@ impl EventLens for PanicShutdownLens {
                 Role::Coincident,
                 FindingScope::from_parts(PG_LOG_ERRORS, "severity_panic", identity),
                 stderr_observation(),
-                None,
             ))?;
         }
         Ok(())

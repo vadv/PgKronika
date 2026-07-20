@@ -2,14 +2,13 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::marker::PhantomData;
 
 use super::cluster::{ClusterError, ClusterOutcome, cluster_episodes};
 use super::dispatch::{
     LimitAxis, LimitHit, SectionColumn, WorkBudget, candidate_lenses, section_index,
 };
+use super::evidence::Finding;
 use super::evidence::sink::{FindingSink, OutputCounts, OutputLimits};
-use super::evidence::{Finding, Role};
 use super::lens::Lens;
 use super::model::{EnrichedEpisode, EpisodeRefV1, IncidentKeyV1, KeyTooLarge};
 use super::series::SeriesSet;
@@ -17,7 +16,7 @@ use super::typed::TypedInputs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClockRelation {
-    SameDomain,
+    Simultaneous,
     Unknown,
 }
 
@@ -27,17 +26,11 @@ pub(crate) struct EvalContext {
     clock_relation: ClockRelation,
 }
 
-pub(crate) struct TemporalDirectionPermit<'a> {
-    _context: PhantomData<&'a EvalContext>,
-}
-
 impl EvalContext {
-    pub(crate) fn temporal_direction(&self) -> Option<TemporalDirectionPermit<'_>> {
-        matches!(self.clock_relation, ClockRelation::SameDomain).then_some(
-            TemporalDirectionPermit {
-                _context: PhantomData,
-            },
-        )
+    /// Observation timestamps describe when metrics were sampled. This value
+    /// is descriptive only and never authorizes a causal role.
+    pub(crate) const fn clock_relation(&self) -> ClockRelation {
+        self.clock_relation
     }
 
     #[cfg(test)]
@@ -258,44 +251,6 @@ fn charge_key_bytes(
     Ok(observed)
 }
 
-/// Apply the product's observation-time convention to otherwise coincident
-/// findings. Episode start time is the observed event time: every earliest
-/// signal leads, every latest signal trails, and middle signals stay
-/// coincident. Equal extrema leave the whole incident coincident. Existing
-/// amplifier and structural lock roles take precedence.
-fn assign_temporal_direction(
-    findings: &mut [Finding],
-    members: &[EpisodeRefV1],
-    clock: ClockRelation,
-) {
-    if !matches!(clock, ClockRelation::SameDomain) {
-        return;
-    }
-    let (Some(earliest), Some(latest)) = (
-        members.iter().map(|member| member.start_us).min(),
-        members.iter().map(|member| member.start_us).max(),
-    ) else {
-        return;
-    };
-    if earliest == latest {
-        return;
-    }
-    for finding in findings {
-        let Some(member) = members.iter().find(|member| {
-            member.logical_section == finding.scope().logical_section()
-                && member.column == finding.scope().column()
-                && member.identity.as_ref() == finding.scope().identity()
-        }) else {
-            continue;
-        };
-        if member.start_us == earliest {
-            finding.apply_temporal_role(Role::Lead);
-        } else if member.start_us == latest {
-            finding.apply_temporal_role(Role::Downstream);
-        }
-    }
-}
-
 pub(crate) fn analyze(
     episodes: Vec<EnrichedEpisode>,
     series: &SeriesSet,
@@ -375,7 +330,6 @@ pub(crate) fn analyze(
                 break;
             }
         }
-        assign_temporal_direction(&mut findings, &cluster.members, config.clock_relation);
         findings.sort_by(finding_order);
 
         let key = IncidentKeyV1::new(
@@ -415,7 +369,7 @@ mod tests {
     use crate::incident::cluster::Cluster;
     use crate::incident::evidence::{
         Confidence, ConfidenceCap, DirectEvidence, Evidence, FindingDraft, FindingScope,
-        LockParticipant,
+        LockParticipant, Role,
     };
     use crate::incident::model::IdentityValue;
     use kronika_analytics::{Direction, Episode, Evaluated};
@@ -464,7 +418,7 @@ mod tests {
             cluster: &Cluster,
             _series: &SeriesSet,
             _typed: &TypedInputs,
-            context: &EvalContext,
+            _context: &EvalContext,
             sink: &mut FindingSink<'_>,
         ) -> Result<(), LimitHit> {
             let scope = FindingScope::from_episode(&cluster.members[0]);
@@ -472,7 +426,6 @@ mod tests {
                 self.role,
                 scope,
                 vec![self.evidence.build()],
-                context.temporal_direction().as_ref(),
             ))
         }
     }
@@ -505,7 +458,6 @@ mod tests {
                     Role::Coincident,
                     FindingScope::from_episode(member),
                     vec![Evidence::Counter],
-                    None,
                 ))?;
             }
             Ok(())
@@ -553,7 +505,6 @@ mod tests {
                         20,
                         participant,
                     ))],
-                    None,
                 ))?;
             }
             Ok(())
@@ -618,9 +569,9 @@ mod tests {
         }
     }
 
-    fn same_domain_config(work_limit: u64) -> IncidentConfig {
+    fn simultaneous_config(work_limit: u64) -> IncidentConfig {
         let mut config = config(work_limit);
-        config.clock_relation = ClockRelation::SameDomain;
+        config.clock_relation = ClockRelation::Simultaneous;
         config
     }
 
@@ -757,7 +708,6 @@ mod tests {
                     Role::Amplifier,
                     scope.clone(),
                     vec![evidence],
-                    None,
                 ))
                 .expect("within limits");
             }
@@ -775,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_clock_rejects_an_unproven_lead() {
+    fn ordinary_metric_evidence_cannot_request_a_lead_role() {
         let lens = FixedLens {
             id: "TEMPORAL",
             inputs: CACHE,
@@ -788,14 +738,14 @@ mod tests {
             &SeriesSet::for_test(0),
             &TypedInputs::new(),
             &[&lens],
-            &config(100),
+            &simultaneous_config(100),
         )
         .expect("valid");
         assert_eq!(outcome.incidents[0].findings[0].role(), Role::Coincident);
     }
 
     #[test]
-    fn snapshot_time_classifies_extremes_and_keeps_the_middle_coincident() {
+    fn snapshot_metric_timestamps_do_not_assign_directional_roles() {
         let outcome = analyze(
             vec![
                 episode("pg_stat_database", 1, 0, 10),
@@ -805,35 +755,17 @@ mod tests {
             &SeriesSet::for_test(0),
             &TypedInputs::new(),
             &[&CoincidentMembersLens],
-            &same_domain_config(100),
-        )
-        .expect("valid");
-
-        assert_eq!(role_for_identity(&outcome, 1), Role::Lead);
-        assert_eq!(role_for_identity(&outcome, 2), Role::Coincident);
-        assert_eq!(role_for_identity(&outcome, 3), Role::Downstream);
-    }
-
-    #[test]
-    fn equal_snapshot_times_stay_coincident() {
-        let outcome = analyze(
-            vec![
-                episode("pg_stat_database", 1, 4, 10),
-                episode("pg_stat_database", 2, 4, 12),
-            ],
-            &SeriesSet::for_test(0),
-            &TypedInputs::new(),
-            &[&CoincidentMembersLens],
-            &same_domain_config(100),
+            &simultaneous_config(100),
         )
         .expect("valid");
 
         assert_eq!(role_for_identity(&outcome, 1), Role::Coincident);
         assert_eq!(role_for_identity(&outcome, 2), Role::Coincident);
+        assert_eq!(role_for_identity(&outcome, 3), Role::Coincident);
     }
 
     #[test]
-    fn tied_extrema_share_the_extreme_role() {
+    fn tied_snapshot_metric_timestamps_stay_coincident() {
         let outcome = analyze(
             vec![
                 episode("pg_stat_database", 1, 0, 10),
@@ -844,18 +776,17 @@ mod tests {
             &SeriesSet::for_test(0),
             &TypedInputs::new(),
             &[&CoincidentMembersLens],
-            &same_domain_config(100),
+            &simultaneous_config(100),
         )
         .expect("valid");
 
-        assert_eq!(role_for_identity(&outcome, 1), Role::Lead);
-        assert_eq!(role_for_identity(&outcome, 2), Role::Lead);
-        assert_eq!(role_for_identity(&outcome, 3), Role::Downstream);
-        assert_eq!(role_for_identity(&outcome, 4), Role::Downstream);
+        for id in 1..=4 {
+            assert_eq!(role_for_identity(&outcome, id), Role::Coincident);
+        }
     }
 
     #[test]
-    fn structural_lock_roles_override_observation_time() {
+    fn structural_lock_roles_survive_the_simultaneous_metric_convention() {
         let outcome = analyze(
             vec![
                 episode("pg_stat_database", 1, 0, 10),
@@ -864,7 +795,7 @@ mod tests {
             &SeriesSet::for_test(0),
             &TypedInputs::new(),
             &[&StructuralMembersLens],
-            &same_domain_config(100),
+            &simultaneous_config(100),
         )
         .expect("valid");
 

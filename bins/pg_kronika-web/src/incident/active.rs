@@ -230,7 +230,6 @@ impl Lens for SharedBufferMissesLens {
                 Role::Amplifier,
                 FindingScope::from_episode(member),
                 vec![Evidence::CounterAggregate(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -338,7 +337,6 @@ impl Lens for WalAmplificationLens {
                 Role::Amplifier,
                 FindingScope::from_episode(member),
                 vec![Evidence::CounterAggregate(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -444,7 +442,6 @@ impl Lens for TempSpillLens {
                 Role::Amplifier,
                 FindingScope::from_episode(member),
                 vec![Evidence::CounterAggregate(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -553,7 +550,6 @@ impl Lens for RequestedCheckpointsLens {
                 Role::Amplifier,
                 FindingScope::from_episode(member),
                 vec![Evidence::CounterAggregate(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -660,7 +656,6 @@ impl Lens for BackendIoLatencyLens {
                 Role::Amplifier,
                 FindingScope::from_episode(member),
                 vec![Evidence::CounterAggregate(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -771,7 +766,6 @@ impl Lens for HotUpdateFailureLens {
                 Role::Amplifier,
                 FindingScope::from_episode(member),
                 vec![Evidence::CounterAggregate(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -877,7 +871,6 @@ impl Lens for WalArchivingFailureLens {
                 Role::Coincident,
                 FindingScope::from_episode(member),
                 vec![Evidence::CounterAggregate(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -985,7 +978,6 @@ impl Lens for NetworkErrorsLens {
                 Role::Coincident,
                 FindingScope::from_episode(member),
                 vec![Evidence::CounterAggregate(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -994,8 +986,8 @@ impl Lens for NetworkErrorsLens {
 
 /// `OS-CGRP-021` (`cgroup_cpu_throttling`): a cgroup denied the CPU it asked for.
 /// Reports elevated throttled microseconds per covered second. `usage_usec` is
-/// retained as aligned context, not used as a wall-time denominator. The lens
-/// emits coincident; the engine may later apply its observation-time fallback.
+/// retained as aligned context, not used as a wall-time denominator. As an
+/// ordinary metric finding, its role stays coincident.
 pub(crate) struct CgroupCpuThrottlingLens;
 
 impl CgroupCpuThrottlingLens {
@@ -1104,7 +1096,6 @@ impl Lens for CgroupCpuThrottlingLens {
                 Role::Coincident,
                 FindingScope::from_episode(member),
                 vec![Evidence::CounterAggregate(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -1199,7 +1190,6 @@ impl Lens for StaleStatisticsLens {
                 Role::Coincident,
                 FindingScope::from_episode(member),
                 vec![Evidence::GaugeObservation(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -1290,7 +1280,6 @@ impl Lens for ConnectionSaturationLens {
                 Role::Coincident,
                 FindingScope::from_episode(member),
                 vec![Evidence::GaugeObservation(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -1381,7 +1370,6 @@ impl Lens for MemoryReclaimLens {
                 Role::Coincident,
                 FindingScope::from_episode(member),
                 vec![Evidence::GaugeObservation(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -1479,7 +1467,6 @@ impl Lens for WritebackPressureLens {
                 Role::Coincident,
                 FindingScope::from_episode(member),
                 vec![Evidence::GaugeObservation(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -1599,7 +1586,6 @@ impl Lens for XminHorizonHoldLens {
                 Role::Amplifier,
                 FindingScope::from_episode(member),
                 evidence,
-                None,
             ))?;
         }
         Ok(())
@@ -1698,7 +1684,6 @@ impl Lens for SyncReplicationWaitLens {
                 Role::Coincident,
                 FindingScope::from_episode(member),
                 vec![Evidence::GaugeObservation(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -1828,7 +1813,6 @@ impl Lens for InternalWaitConcentrationLens {
                 Role::Coincident,
                 FindingScope::from_episode(member),
                 vec![Evidence::GaugeObservation(evidence)],
-                None,
             ))?;
         }
         Ok(())
@@ -1900,7 +1884,6 @@ impl Lens for LockWaitGraphLens {
                         edge.blocker_pid,
                         LockParticipant::Blocker,
                     ))],
-                    None,
                 ))?;
                 let waiter: Arc<[IdentityValue]> = Arc::from(vec![
                     IdentityValue::I64(snapshot.ts),
@@ -1916,7 +1899,6 @@ impl Lens for LockWaitGraphLens {
                         edge.blocker_pid,
                         LockParticipant::Waiter,
                     ))],
-                    None,
                 ))?;
             }
         }

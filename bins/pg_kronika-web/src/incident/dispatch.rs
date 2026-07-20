@@ -125,7 +125,6 @@ mod tests {
             Role::Coincident,
             FindingScope::from_episode(&reference),
             evidence,
-            None,
         )
     }
 

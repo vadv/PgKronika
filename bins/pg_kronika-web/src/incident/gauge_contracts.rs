@@ -38,7 +38,6 @@ fn emit(
         Role::Coincident,
         FindingScope::from_episode(member),
         evidence,
-        None,
     ))
 }
 

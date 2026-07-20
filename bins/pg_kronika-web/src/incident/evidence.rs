@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::{cmp::Ordering, hash::Hash};
 
-use super::engine::TemporalDirectionPermit;
 use super::model::{EpisodeRefV1, IdentityValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -862,10 +861,6 @@ impl Evidence {
         matches!(self, Self::Direct(direct) if direct.proves_structural_direction(requested_role))
     }
 
-    const fn is_sampled_lock_edge(&self) -> bool {
-        matches!(self, Self::Direct(direct) if direct.lock_edge().is_some())
-    }
-
     pub(crate) const fn label(&self) -> &'static str {
         match self {
             Self::Direct(_) => "direct",
@@ -943,7 +938,6 @@ pub(crate) struct FindingDraft {
     requested_role: Role,
     scope: FindingScope,
     evidence: Vec<Evidence>,
-    temporal_direction: bool,
 }
 
 impl FindingDraft {
@@ -951,13 +945,11 @@ impl FindingDraft {
         requested_role: Role,
         scope: FindingScope,
         evidence: Vec<Evidence>,
-        temporal_direction: Option<&TemporalDirectionPermit<'_>>,
     ) -> Self {
         Self {
             requested_role,
             scope,
             evidence,
-            temporal_direction: temporal_direction.is_some(),
         }
     }
 
@@ -1016,15 +1008,14 @@ impl Finding {
             requested_role,
             scope,
             evidence,
-            temporal_direction,
         } = draft;
         let structural_direction = evidence
             .iter()
             .any(|item| item.proves_structural_direction(requested_role));
+        // Observation timestamps never authorize causal direction. A lead or
+        // downstream role must match explicit structural evidence.
         let role = match requested_role {
-            Role::Lead | Role::Downstream if !structural_direction && !temporal_direction => {
-                Role::Coincident
-            }
+            Role::Lead | Role::Downstream if !structural_direction => Role::Coincident,
             role => role,
         };
         let confidence = cap.confidence().min(evidence_ceiling(&evidence));
@@ -1043,18 +1034,6 @@ impl Finding {
 
     pub(crate) const fn role(&self) -> Role {
         self.role
-    }
-
-    /// Apply observation-time ordering only as a fallback. A sampled lock edge
-    /// owns its structural direction, including when a malformed draft was
-    /// downgraded to coincident.
-    pub(crate) fn apply_temporal_role(&mut self, role: Role) {
-        if self.role == Role::Coincident
-            && matches!(role, Role::Lead | Role::Downstream)
-            && !self.evidence.iter().any(Evidence::is_sampled_lock_edge)
-        {
-            self.role = role;
-        }
     }
 
     pub(crate) const fn confidence(&self) -> Confidence {
@@ -1256,7 +1235,7 @@ mod tests {
             let finding = Finding::from_draft(
                 "L",
                 ConfidenceCap::High,
-                FindingDraft::new(Role::Amplifier, scope(1), vec![evidence], None),
+                FindingDraft::new(Role::Amplifier, scope(1), vec![evidence]),
             );
             assert_eq!(finding.confidence(), Confidence::MEDIUM);
         }
@@ -1276,7 +1255,6 @@ mod tests {
                     30,
                     LockParticipant::Blocker,
                 ))],
-                None,
             ),
         );
         assert_eq!(finding.confidence(), Confidence::HIGH);
@@ -1285,7 +1263,7 @@ mod tests {
 
     #[test]
     fn sampled_lock_edge_only_proves_the_role_of_its_participant() {
-        let mut finding = Finding::from_draft(
+        let finding = Finding::from_draft(
             "PG-LOCK-012",
             ConfidenceCap::High,
             FindingDraft::new(
@@ -1297,16 +1275,9 @@ mod tests {
                     30,
                     LockParticipant::Blocker,
                 ))],
-                None,
             ),
         );
         assert_eq!(finding.role(), Role::Coincident);
-        finding.apply_temporal_role(Role::Lead);
-        assert_eq!(
-            finding.role(),
-            Role::Coincident,
-            "observation time cannot reinterpret a conflicting lock edge"
-        );
 
         let finding = Finding::from_draft(
             "PG-LOCK-012",
@@ -1320,7 +1291,6 @@ mod tests {
                     30,
                     LockParticipant::Waiter,
                 ))],
-                None,
             ),
         );
         assert_eq!(finding.role(), Role::Downstream);
@@ -1335,7 +1305,6 @@ mod tests {
                 Role::Lead,
                 scope(1),
                 vec![Evidence::Direct(DirectEvidence::resource_limit_event())],
-                None,
             ),
         );
         assert_eq!(finding.confidence(), Confidence::HIGH);
@@ -1343,32 +1312,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_clock_downgrades_unproven_direction() {
+    fn unproven_direction_is_always_coincident() {
         let finding = Finding::from_draft(
             "TEMPORAL",
             ConfidenceCap::Medium,
-            FindingDraft::new(Role::Downstream, scope(1), vec![Evidence::Counter], None),
+            FindingDraft::new(Role::Downstream, scope(1), vec![Evidence::Counter]),
         );
         assert_eq!(finding.role(), Role::Coincident);
-    }
-
-    #[test]
-    fn same_clock_keeps_temporal_direction() {
-        let context = super::super::engine::EvalContext::for_test(
-            super::super::engine::ClockRelation::SameDomain,
-        );
-        let permit = context.temporal_direction();
-        let finding = Finding::from_draft(
-            "TEMPORAL",
-            ConfidenceCap::Medium,
-            FindingDraft::new(
-                Role::Downstream,
-                scope(1),
-                vec![Evidence::Counter],
-                permit.as_ref(),
-            ),
-        );
-        assert_eq!(finding.role(), Role::Downstream);
     }
 
     #[test]
@@ -1376,7 +1326,7 @@ mod tests {
         let finding = Finding::from_draft(
             "L",
             ConfidenceCap::High,
-            FindingDraft::new(Role::Coincident, scope(1), vec![], None),
+            FindingDraft::new(Role::Coincident, scope(1), vec![]),
         );
         assert_eq!(finding.confidence(), Confidence::LOW);
     }
