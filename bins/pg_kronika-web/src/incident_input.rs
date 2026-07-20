@@ -700,52 +700,15 @@ impl BuildState {
 
         let identity = logical.diff_key();
         let (cumulative, gauges) = scorable_columns(logical);
-        let snapshot_fields: &[&str] = match logical.name {
-            PG_STAT_ACTIVITY => &[
-                "backend_start",
-                "leader_pid",
-                "backend_type",
-                "state",
-                "wait_event_type",
-                "wait_event",
-                "backend_xmin_age",
-                "xact_start",
-                "query_start",
-            ],
-            PG_LOCKS => &[
-                "backend_start",
-                "blocked_by",
-                "waitstart",
-                "mode",
-                "locktype",
-            ],
-            _ => &[],
-        };
-        let duplicate_gauge_breaks = match normalize_duplicate_rows(
+        let Some(duplicate_gauge_breaks) = self.normalize_page(
+            logical,
             &mut page.rows,
             &identity,
             &cumulative,
             &gauges,
-            snapshot_fields,
-            &mut self.quality,
-            &mut self.remaining_identity_bytes,
-            limits.identity_bytes,
-        ) {
-            Ok(breaks) => breaks,
-            Err(NormalizeError::Conflict(timestamp)) => {
-                self.skipped.push(SectionSkip {
-                    section: logical.name,
-                    reason: SkipReason::ConflictingTimestamp { timestamp },
-                });
-                return Ok(());
-            }
-            Err(NormalizeError::IdentityByteLimit { observed, limit }) => {
-                self.skipped.push(SectionSkip {
-                    section: logical.name,
-                    reason: SkipReason::IdentityByteLimit { observed, limit },
-                });
-                return Ok(());
-            }
+            limits,
+        ) else {
+            return Ok(());
         };
         let mut diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
         gates.apply(logical, &mut diffs);
@@ -815,6 +778,46 @@ impl BuildState {
             Err(err) => return Err(err),
         }
         Ok(())
+    }
+
+    fn normalize_page(
+        &mut self,
+        logical: &LogicalSection,
+        rows: &mut Vec<OutRow>,
+        identity: &[&str],
+        cumulative: &[&str],
+        gauges: &[&str],
+        limits: &InputLimits,
+    ) -> Option<Vec<DuplicateGaugeBreak>> {
+        let result = normalize_duplicate_rows(
+            rows,
+            identity,
+            cumulative,
+            gauges,
+            snapshot_fields(logical.name),
+            &mut self.quality,
+            &mut IdentityBudget {
+                remaining: &mut self.remaining_identity_bytes,
+                limit: limits.identity_bytes,
+            },
+        );
+        match result {
+            Ok(breaks) => Some(breaks),
+            Err(NormalizeError::Conflict(timestamp)) => {
+                self.skipped.push(SectionSkip {
+                    section: logical.name,
+                    reason: SkipReason::ConflictingTimestamp { timestamp },
+                });
+                None
+            }
+            Err(NormalizeError::IdentityByteLimit { observed, limit }) => {
+                self.skipped.push(SectionSkip {
+                    section: logical.name,
+                    reason: SkipReason::IdentityByteLimit { observed, limit },
+                });
+                None
+            }
+        }
     }
 
     fn record_page_state(&mut self, section: &'static str, page: &SectionPage) {
@@ -1261,6 +1264,35 @@ struct DuplicateGaugeBreak {
     timestamp: i64,
 }
 
+struct IdentityBudget<'a> {
+    remaining: &'a mut usize,
+    limit: usize,
+}
+
+fn snapshot_fields(section: &str) -> &'static [&'static str] {
+    match section {
+        PG_STAT_ACTIVITY => &[
+            "backend_start",
+            "leader_pid",
+            "backend_type",
+            "state",
+            "wait_event_type",
+            "wait_event",
+            "backend_xmin_age",
+            "xact_start",
+            "query_start",
+        ],
+        PG_LOCKS => &[
+            "backend_start",
+            "blocked_by",
+            "waitstart",
+            "mode",
+            "locktype",
+        ],
+        _ => &[],
+    }
+}
+
 fn identity_bytes(identity: &[IdentityValue]) -> Option<usize> {
     identity.iter().try_fold(0_usize, |sum, value| {
         let bytes = match value {
@@ -1295,8 +1327,7 @@ fn normalize_duplicate_rows(
     gauges: &[&str],
     snapshot_fields: &[&str],
     quality: &mut InputQuality,
-    remaining_identity_bytes: &mut usize,
-    identity_byte_limit: usize,
+    identity_budget: &mut IdentityBudget<'_>,
 ) -> Result<Vec<DuplicateGaugeBreak>, NormalizeError> {
     let compared: Vec<&str> = cumulative
         .iter()
@@ -1314,9 +1345,9 @@ fn normalize_duplicate_rows(
         };
         let bytes = identity_bytes(&key).ok_or(NormalizeError::IdentityByteLimit {
             observed: usize::MAX,
-            limit: identity_byte_limit,
+            limit: identity_budget.limit,
         })?;
-        charge_identity_bytes(bytes, remaining_identity_bytes, identity_byte_limit)
+        charge_identity_bytes(bytes, identity_budget.remaining, identity_budget.limit)
             .map_err(|(observed, limit)| NormalizeError::IdentityByteLimit { observed, limit })?;
         let Some(Value::Ts(timestamp)) = row_value(&row, "ts") else {
             kept.push(row);
@@ -1788,8 +1819,10 @@ mod tests {
                 &[],
                 &[],
                 &mut q,
-                &mut identity_bytes,
-                100,
+                &mut IdentityBudget {
+                    remaining: &mut identity_bytes,
+                    limit: 100,
+                },
             ),
             Ok(vec![DuplicateGaugeBreak {
                 identity: Vec::new(),
@@ -1817,8 +1850,10 @@ mod tests {
                 &[],
                 &[],
                 &mut forward_quality,
-                &mut forward_bytes,
-                100,
+                &mut IdentityBudget {
+                    remaining: &mut forward_bytes,
+                    limit: 100,
+                },
             ),
             Err(NormalizeError::Conflict(1))
         );
@@ -1830,8 +1865,10 @@ mod tests {
                 &[],
                 &[],
                 &mut reverse_quality,
-                &mut reverse_bytes,
-                100,
+                &mut IdentityBudget {
+                    remaining: &mut reverse_bytes,
+                    limit: 100,
+                },
             ),
             Err(NormalizeError::Conflict(1))
         );
@@ -1856,8 +1893,10 @@ mod tests {
                 &[],
                 &["wait_event_type", "wait_event"],
                 &mut q,
-                &mut identity_bytes,
-                1_000,
+                &mut IdentityBudget {
+                    remaining: &mut identity_bytes,
+                    limit: 1_000,
+                },
             ),
             Err(NormalizeError::Conflict(100))
         );
@@ -1877,8 +1916,10 @@ mod tests {
                 &[],
                 &[],
                 &mut q,
-                &mut identity_bytes,
-                100,
+                &mut IdentityBudget {
+                    remaining: &mut identity_bytes,
+                    limit: 100,
+                },
             ),
             Ok(Vec::new())
         );
@@ -1904,8 +1945,10 @@ mod tests {
                 &[],
                 &[],
                 &mut q,
-                &mut identity_bytes,
-                100,
+                &mut IdentityBudget {
+                    remaining: &mut identity_bytes,
+                    limit: 100,
+                },
             ),
             Ok(Vec::new())
         );
@@ -1934,8 +1977,10 @@ mod tests {
                 &[],
                 &[],
                 &mut q,
-                &mut identity_bytes,
-                20,
+                &mut IdentityBudget {
+                    remaining: &mut identity_bytes,
+                    limit: 20,
+                },
             ),
             Err(NormalizeError::IdentityByteLimit {
                 observed: 24,

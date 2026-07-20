@@ -433,33 +433,7 @@ fn input_error_response(error: InputError) -> IncidentError {
                 "identity quality was not mapped to a partial response",
             )
         }
-        InputError::Read(QueryError::UnknownSection(name)) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "registry_invariant",
-            &format!("resolved section `{name}` is absent from the registry"),
-        ),
-        InputError::Read(QueryError::ResultTooLarge { max_cells }) => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "result_too_large",
-            &format!("the request exceeds the {max_cells}-cell reader ceiling"),
-        ),
-        InputError::Read(QueryError::MaterializedBytesTooLarge { max_bytes }) => {
-            IncidentError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "result_too_large",
-                &format!("the request exceeds the {max_bytes}-byte reader ceiling"),
-            )
-        }
-        InputError::Read(QueryError::BadCursor(_)) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "reader_invariant",
-            "the incident reader produced an invalid internal cursor",
-        ),
-        InputError::Read(QueryError::Read(_)) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store_read_failed",
-            "the store could not be read",
-        ),
+        InputError::Read(error) => read_error_response(error),
         InputError::UnknownColumn { section, column } => IncidentError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "registry_invariant",
@@ -480,6 +454,36 @@ fn input_error_response(error: InputError) -> IncidentError {
             &format!(
                 "section `{section}` column `{column}` folded into an invalid series: {error:?}"
             ),
+        ),
+    }
+}
+
+fn read_error_response(error: QueryError) -> IncidentError {
+    match error {
+        QueryError::UnknownSection(name) => IncidentError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "registry_invariant",
+            &format!("resolved section `{name}` is absent from the registry"),
+        ),
+        QueryError::ResultTooLarge { max_cells } => IncidentError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "result_too_large",
+            &format!("the request exceeds the {max_cells}-cell reader ceiling"),
+        ),
+        QueryError::MaterializedBytesTooLarge { max_bytes } => IncidentError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "result_too_large",
+            &format!("the request exceeds the {max_bytes}-byte reader ceiling"),
+        ),
+        QueryError::BadCursor(_) => IncidentError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reader_invariant",
+            "the incident reader produced an invalid internal cursor",
+        ),
+        QueryError::Read(_) => IncidentError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store_read_failed",
+            "the store could not be read",
         ),
     }
 }

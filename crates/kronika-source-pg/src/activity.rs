@@ -286,9 +286,11 @@ fn row_from_pg(row: &tokio_postgres::Row, version: ActivityVersion) -> ActivityR
     }
 }
 
-/// Collect a bounded `pg_stat_activity` snapshot. The source fetches at most
-/// one row beyond the ceiling. If that row exists, it returns no rows and sets
-/// the truncation flag; consumers must treat the snapshot as unavailable.
+/// Collect a bounded `pg_stat_activity` snapshot.
+///
+/// The source fetches at most one row beyond the ceiling. If that row exists,
+/// it returns no rows and sets the truncation flag; consumers must treat the
+/// snapshot as unavailable.
 ///
 /// # Errors
 /// Returns the [`tokio_postgres::Error`] if the query fails.

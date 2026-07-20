@@ -315,7 +315,7 @@ fn typed_occurrence() -> Vec<Evidence> {
 }
 
 /// stderr severity and SQLSTATE-like tokens are parser observations, not a
-/// structured PostgreSQL code. They therefore cannot justify high confidence.
+/// structured error code. They therefore cannot justify high confidence.
 fn stderr_observation() -> Vec<Evidence> {
     vec![Evidence::Event]
 }
@@ -864,9 +864,17 @@ mod tests {
         assert_eq!(group.count(), 3, "the group still carries its count");
     }
 
+    type EventCase = (
+        Box<dyn EventLens>,
+        LogEventInputs,
+        &'static str,
+        &'static str,
+        Confidence,
+    );
+
     #[test]
     fn each_event_lens_emits_a_bounded_coincident_occurrence_fact() {
-        let cases: Vec<(Box<dyn EventLens>, LogEventInputs, &str, &str, Confidence)> = vec![
+        let cases: Vec<EventCase> = vec![
             (
                 Box::new(BackendSigkillLens),
                 inputs_with(Vec::new(), vec![crash(Some(9))]),

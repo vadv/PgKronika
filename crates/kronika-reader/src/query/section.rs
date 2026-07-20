@@ -200,6 +200,7 @@ pub fn sections_with_limits(
 ) -> Result<BTreeMap<String, SectionPage>, QueryError> {
     let max_cells = limits.cells.min(MAX_MATERIALIZED_CELLS);
     let max_bytes = limits.bytes.min(MAX_MATERIALIZED_BYTES);
+    let effective_limits = QueryLimits::with_bytes(limits.rows, max_cells, max_bytes);
     // Resolve every requested name up front; an unknown name fails the whole call.
     let mut requested: Vec<(String, LogicalSection)> = Vec::with_capacity(names.len());
     for &name in names {
@@ -216,7 +217,13 @@ pub fn sections_with_limits(
     let (buffers, covered) = loop {
         let skip_stale = refreshed >= MAX_REFRESH;
         match gather(
-            snap, source, from, to, &requested, skip_stale, max_cells, max_bytes,
+            snap,
+            source,
+            from,
+            to,
+            &requested,
+            skip_stale,
+            effective_limits,
         ) {
             Ok(gathered) => break gathered,
             Err(GatherError::Stale) => {
@@ -316,8 +323,7 @@ fn gather(
     to: i64,
     requested: &[(String, LogicalSection)],
     skip_stale: bool,
-    max_cells: usize,
-    max_bytes: usize,
+    limits: QueryLimits,
 ) -> Result<Gathered, GatherError> {
     let metas = snap.units();
     let in_window: Vec<usize> = metas
@@ -372,7 +378,7 @@ fn gather(
                     charge_materialization(
                         &mut materialized_cells,
                         logical.columns.len(),
-                        max_cells,
+                        limits.cells,
                     )?;
                     let row_bytes = logical.columns.iter().zip(&cell_at).try_fold(
                         0_usize,
@@ -390,7 +396,7 @@ fn gather(
                     };
                     materialized_bytes = materialized_bytes
                         .checked_add(row_bytes)
-                        .filter(|total| *total <= max_bytes)
+                        .filter(|total| *total <= limits.bytes)
                         .ok_or(GatherError::MaterializedBytesTooLarge)?;
                     let out: OutRow = logical
                         .columns

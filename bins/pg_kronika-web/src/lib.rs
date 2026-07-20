@@ -1005,6 +1005,27 @@ mod tests {
         "PG-EVT-008",
     ];
 
+    async fn assert_calm_incidents(uri: &str, to: i64) {
+        let calm = tempfile::tempdir().expect("tempdir");
+        write_archiver_with_identity(calm.path(), &archiver_rows(false), 0, to);
+        let (status, body) = serve(calm.path(), uri).await;
+        assert_eq!(status, StatusCode::OK, "calm 200; got {status}: {body}");
+        assert_eq!(
+            body["incidents"],
+            serde_json::json!([]),
+            "no anomaly means no incident"
+        );
+        assert_eq!(body["analysis_status"], "calm");
+        assert_eq!(body["clustering_complete"], true);
+        assert_eq!(body["complete"], false);
+        for field in ["catalog", "data_quality", "skipped", "coverage_by_section"] {
+            assert!(
+                body.get(field).is_some(),
+                "an empty response still carries {field}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
         let to = 39 * 60 * 1_000_000;
@@ -1094,24 +1115,7 @@ mod tests {
             "an incident member is the real archiver spike series"
         );
 
-        let calm = tempfile::tempdir().expect("tempdir");
-        write_archiver_with_identity(calm.path(), &archiver_rows(false), 0, to);
-        let (status, body) = serve(calm.path(), &uri).await;
-        assert_eq!(status, StatusCode::OK, "calm 200; got {status}: {body}");
-        assert_eq!(
-            body["incidents"],
-            serde_json::json!([]),
-            "no anomaly means no incident"
-        );
-        assert_eq!(body["analysis_status"], "calm");
-        assert_eq!(body["clustering_complete"], true);
-        assert_eq!(body["complete"], false);
-        for field in ["catalog", "data_quality", "skipped", "coverage_by_section"] {
-            assert!(
-                body.get(field).is_some(),
-                "an empty response still carries {field}"
-            );
-        }
+        assert_calm_incidents(&uri, to).await;
     }
 
     #[tokio::test]
