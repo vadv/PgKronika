@@ -147,6 +147,13 @@ pub(crate) fn query_error_response(err: &QueryError) -> (StatusCode, Json<Value>
                 "query exceeds the {max_cells}-cell materialization limit; narrow the time range"
             ),
         ),
+        QueryError::MaterializedBytesTooLarge { max_bytes } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "result_too_large",
+            format!(
+                "query exceeds the {max_bytes}-byte materialization limit; narrow the time range"
+            ),
+        ),
     };
     (status, Json(json!({ "error": code, "detail": detail })))
 }

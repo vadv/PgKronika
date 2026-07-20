@@ -41,11 +41,11 @@ mod tests;
 use anyhow::{Context, Result};
 use budget::PoolBudget;
 use buffering::{
-    push_main_conn_sections, push_plans_read, push_service_sections, push_statements,
-    push_user_indexes, push_user_tables,
+    push_main_conn_sections, push_plans_read, push_service_sections, push_snapshot_coverages,
+    push_statements, push_user_indexes, push_user_tables,
 };
 use config::Config;
-use coverage::{CoverageInputs, collect_coverage_records, push_coverage};
+use coverage::{CoverageInputs, collect_coverage_records, push_coverage, snapshot_coverage};
 use kronika_source_log::LogCollector;
 use kronika_source_os::{OsScope, ProcFs, detect_container};
 use kronika_source_pg::pool::{ConnectionPool, DEFAULT_MAX_DATABASES};
@@ -451,6 +451,28 @@ async fn snapshot_and_seal(
     push_service_sections(&mut buffers, &mut interner, &service)?;
     push_os_sources(&mut buffers, &os)?;
     push_coverage(&mut buffers, &mut interner, main_src.ts.0, &coverage)?;
+    let mut completeness = Vec::new();
+    if let Some((version, rows, source_total)) = &statements {
+        completeness.push(snapshot_coverage(
+            rows.first().map_or(main_src.ts.0, |row| row.ts),
+            statements_source::statements_type_id(*version),
+            u8::from(*source_total != u64::try_from(rows.len()).unwrap_or(u64::MAX)),
+            0,
+            *source_total,
+            rows.len(),
+        ));
+    }
+    if let Some((read, source_total)) = &store_plans_rows {
+        completeness.push(snapshot_coverage(
+            read.snapshot_ts().unwrap_or(main_src.ts.0),
+            read.type_id(),
+            u8::from(*source_total != u64::try_from(read.rows_len()).unwrap_or(u64::MAX)),
+            0,
+            *source_total,
+            read.rows_len(),
+        ));
+    }
+    push_snapshot_coverages(&mut buffers, &completeness)?;
     if let Some(collection) = log_collection.as_mut() {
         push_log_collection(
             &mut buffers,

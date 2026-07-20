@@ -1,4 +1,4 @@
-//! Typed counter and gauge evidence forwarded to lenses.
+//! Typed counter, gauge, and snapshot evidence forwarded to lenses.
 //!
 //! Anomaly episodes only locate an incident; a finding needs the underlying
 //! values. This holds the per-column counter diffs the reader already
@@ -7,8 +7,13 @@
 //! anomaly, or a disabled source).
 //!
 //! Gauges are instantaneous levels, so they are indexed without differencing.
+//! It also carries the multi-row snapshots used by activity and lock lenses:
+//! `pg_stat_activity` backends and `pg_locks`
+//! blocking edges captured at each collection time. A snapshot is a moment, not
+//! a rated timeline, so a lens over it reports a sampled observation, never a
+//! direction inferred from a trend.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use kronika_analytics::DiffPoint;
@@ -49,6 +54,13 @@ impl CounterPoint {
             DiffPoint::Value { .. } | DiffPoint::NoData { .. } => None,
         }
     }
+
+    fn interval_us(self) -> Option<u64> {
+        match self.point {
+            DiffPoint::Value { dt_micros, .. } => u64::try_from(dt_micros).ok(),
+            DiffPoint::NoData { .. } => None,
+        }
+    }
 }
 
 /// Sum of two columns' deltas over the intervals where both are usable.
@@ -58,6 +70,45 @@ pub(crate) struct PairedSums {
     pub sum_b: f64,
     /// Number of intervals both columns contributed to.
     pub intervals: usize,
+}
+
+/// Sums for a fixed set of cumulative columns over exactly the same usable
+/// intervals. Lenses use `len` entries of `sums`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AlignedSums {
+    pub sums: [f64; 16],
+    pub len: usize,
+    pub intervals: usize,
+    pub last_end_us: i64,
+    pub elapsed_us: u64,
+}
+
+/// One privacy-reduced `pg_store_plans` row. Plan text and names never enter
+/// incident input.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PlanSample {
+    pub ts: i64,
+    pub fork: PlanFork,
+    pub queryid: i64,
+    pub planid: i64,
+    pub userid: u64,
+    pub dbid: u64,
+    pub calls: f64,
+    pub total_time_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PlanFork {
+    Ossc,
+    Vadv,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessCgroupSample {
+    pub ts: i64,
+    pub pid: i64,
+    pub starttime: i64,
+    pub cgroup_path: Box<str>,
 }
 
 /// One gauge column's raw readings for one series, in snapshot-time order.
@@ -426,11 +477,87 @@ impl TripleGaugeWindow<'_> {
     }
 }
 
-/// Typed counter and gauge series for one analysis request, keyed by
-/// `(section, column, identity)`.
+/// One `pg_stat_activity` backend, reduced to the fields the sampled activity
+/// lenses read. Text labels are resolved dictionary strings; `None` mirrors the
+/// view's own `NULL` — a background backend, a backend that is not waiting, or
+/// one with no assigned xmin.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActivityBackend {
+    /// Stable session identity together with `backend_start`.
+    pub pid: i64,
+    /// `PostgreSQL` backend start, Unix microseconds.
+    pub backend_start: i64,
+    /// `age(backend_xid)` in transactions when assigned.
+    pub xid_age: Option<i64>,
+    /// `age(backend_xmin)` in transactions; `Some` only while the backend pins
+    /// the vacuum horizon.
+    pub xmin_age: Option<i64>,
+    /// Session state (`active`, `idle in transaction`, …).
+    pub state: Option<Box<str>>,
+    /// Wait-event class (`LWLock`, `IO`, `BufferPin`, …); `None` when the
+    /// backend is not waiting.
+    pub wait_event_type: Option<Box<str>>,
+    /// Wait-event name (`SyncRep`, …); `None` when the backend is not waiting.
+    pub wait_event: Option<Box<str>>,
+    /// Open-transaction age at snapshot time, microseconds; `None` outside a
+    /// transaction or when the clock disagrees (`xact_start` after the snapshot).
+    pub xact_age_us: Option<i64>,
+}
+
+/// Provenance of one stored multi-row snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotCompleteness {
+    /// The source read completed and the collector could see all activity fields.
+    Complete,
+    /// The read completed, but activity fields for other sessions may be NULL.
+    Restricted,
+    /// No valid marker exists (including old layouts and conflicting markers).
+    Unknown,
+}
+
+impl SnapshotCompleteness {
+    pub(crate) const fn denominator_usable(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+/// A `pg_stat_activity` snapshot: the backends captured at one collection time.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActivitySnapshot {
+    pub ts: i64,
+    pub backends: Vec<ActivityBackend>,
+    pub completeness: SnapshotCompleteness,
+}
+
+/// One directed blocking edge from a `pg_locks` snapshot: `waiter_pid` waits on
+/// `blocker_pid`. A `blocker_pid` of `0` is a prepared-transaction holder with
+/// no live backend (`pg_blocking_pids` reports it as `0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LockEdge {
+    pub waiter_pid: i64,
+    pub blocker_pid: i64,
+}
+
+/// A `pg_locks` snapshot: the blocking edges captured at one collection time.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LockSnapshot {
+    pub ts: i64,
+    pub edges: Vec<LockEdge>,
+}
+
+/// Typed evidence for one analysis request: counter series and instantaneous
+/// gauge series keyed by `(section, column, identity)`, plus the activity and
+/// lock snapshots the sampled lenses read, each list in ascending collection
+/// time.
 pub(crate) struct TypedInputs {
     counters: BTreeMap<TrackKey, CounterTrack>,
     gauges: GaugeTracks,
+    activity: Vec<ActivitySnapshot>,
+    locks: Vec<LockSnapshot>,
+    plans: Vec<PlanSample>,
+    process_cgroups: BTreeMap<(i64, i64, i64), Box<str>>,
+    cgroup_devices: BTreeMap<Box<str>, Vec<Arc<[IdentityValue]>>>,
+    postgres_storage_devices: BTreeSet<(i64, i64)>,
 }
 
 impl TypedInputs {
@@ -438,6 +565,12 @@ impl TypedInputs {
         Self {
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
+            activity: Vec::new(),
+            locks: Vec::new(),
+            plans: Vec::new(),
+            process_cgroups: BTreeMap::new(),
+            cgroup_devices: BTreeMap::new(),
+            postgres_storage_devices: BTreeSet::new(),
         }
     }
 
@@ -452,6 +585,15 @@ impl TypedInputs {
             .into_iter()
             .map(|(end_us, point)| CounterPoint { end_us, point })
             .collect();
+        if section == "os_cgroup_io"
+            && column == "rbytes"
+            && let [IdentityValue::Text(path), ..] = identity.as_ref()
+        {
+            let entities = self.cgroup_devices.entry(path.clone().into()).or_default();
+            if !entities.contains(&identity) {
+                entities.push(Arc::clone(&identity));
+            }
+        }
         self.counters.insert(
             TrackKey {
                 section,
@@ -473,6 +615,38 @@ impl TypedInputs {
             column,
             identity: Arc::from(identity),
         })
+    }
+
+    pub(crate) fn counter_identity_count(
+        &self,
+        section: &'static str,
+        column: &'static str,
+    ) -> usize {
+        self.counters
+            .keys()
+            .filter(|key| key.section == section && key.column == column)
+            .count()
+    }
+
+    pub(crate) fn has_counter(
+        &self,
+        section: &'static str,
+        column: &'static str,
+        identity: &[IdentityValue],
+    ) -> bool {
+        self.counter(section, column, identity).is_some()
+    }
+
+    pub(crate) fn counter_identities(
+        &self,
+        section: &'static str,
+        column: &'static str,
+    ) -> Vec<Arc<[IdentityValue]>> {
+        self.counters
+            .keys()
+            .filter(|key| key.section == section && key.column == column)
+            .map(|key| Arc::clone(&key.identity))
+            .collect()
     }
 
     /// Sum `column_a` and `column_b` deltas of one series inside
@@ -520,6 +694,166 @@ impl TypedInputs {
             }
         }
         Some(sums)
+    }
+
+    pub(crate) fn aligned_counter_points(
+        &self,
+        section: &'static str,
+        identity: &[IdentityValue],
+        columns: &[&'static str],
+    ) -> usize {
+        columns.iter().fold(0_usize, |total, column| {
+            total.saturating_add(
+                self.counter(section, column, identity)
+                    .map_or(0, |track| track.points.len()),
+            )
+        })
+    }
+
+    /// Sum at most 16 columns over the intersection of their usable interval
+    /// endpoints. A reset, gate, gap, or missing point removes the whole
+    /// interval from every operand.
+    pub(crate) fn aligned_delta_sums(
+        &self,
+        section: &'static str,
+        identity: &[IdentityValue],
+        columns: &[&'static str],
+        from_us: i64,
+        to_us: i64,
+    ) -> Option<AlignedSums> {
+        if columns.is_empty() || columns.len() > 16 || from_us > to_us {
+            return None;
+        }
+        let tracks: Vec<&CounterTrack> = columns
+            .iter()
+            .map(|column| self.counter(section, column, identity))
+            .collect::<Option<_>>()?;
+        let mut indexes = vec![0_usize; tracks.len()];
+        let mut result = AlignedSums {
+            sums: [0.0; 16],
+            len: tracks.len(),
+            intervals: 0,
+            last_end_us: from_us,
+            elapsed_us: 0,
+        };
+        loop {
+            let mut minimum = i64::MAX;
+            let mut maximum = i64::MIN;
+            for (track, &index) in tracks.iter().zip(&indexes) {
+                let Some(point) = track.points.get(index) else {
+                    return Some(result);
+                };
+                minimum = minimum.min(point.end_us);
+                maximum = maximum.max(point.end_us);
+            }
+            if minimum != maximum {
+                for (track, index) in tracks.iter().zip(&mut indexes) {
+                    if track.points[*index].end_us == minimum {
+                        *index += 1;
+                    }
+                }
+                continue;
+            }
+            if (from_us..=to_us).contains(&minimum) {
+                let mut deltas = [0.0_f64; 16];
+                let mut usable = true;
+                let mut interval_us = None;
+                for (slot, (track, &index)) in deltas.iter_mut().zip(tracks.iter().zip(&indexes)) {
+                    let point = track.points[index];
+                    let (Some(delta), Some(point_interval_us)) =
+                        (point.delta(), point.interval_us())
+                    else {
+                        usable = false;
+                        break;
+                    };
+                    if interval_us.is_some_and(|expected| expected != point_interval_us) {
+                        usable = false;
+                        break;
+                    }
+                    interval_us = Some(point_interval_us);
+                    *slot = delta;
+                }
+                if usable {
+                    for (sum, delta) in result.sums.iter_mut().zip(deltas) {
+                        *sum += delta;
+                    }
+                    result.intervals = result.intervals.saturating_add(1);
+                    result.last_end_us = minimum;
+                    result.elapsed_us = result
+                        .elapsed_us
+                        .saturating_add(interval_us.unwrap_or_default());
+                }
+            }
+            for index in &mut indexes {
+                *index += 1;
+            }
+        }
+    }
+
+    pub(crate) fn insert_plan_samples(&mut self, mut samples: Vec<PlanSample>) {
+        self.plans.append(&mut samples);
+        self.plans.sort_by_key(|sample| {
+            (
+                sample.ts,
+                sample.fork,
+                sample.dbid,
+                sample.userid,
+                sample.queryid,
+                sample.planid,
+            )
+        });
+    }
+
+    pub(crate) fn plan_window(&self, from_us: i64, to_us: i64) -> &[PlanSample] {
+        let start = self.plans.partition_point(|sample| sample.ts < from_us);
+        let end = self.plans.partition_point(|sample| sample.ts <= to_us);
+        &self.plans[start..end]
+    }
+
+    pub(crate) fn process_is_postgres_backend(
+        &self,
+        pid: i64,
+        starttime: i64,
+        from_us: i64,
+        to_us: i64,
+    ) -> bool {
+        self.activity_window(from_us, to_us).any(|snapshot| {
+            snapshot
+                .backends
+                .iter()
+                .any(|backend| backend.pid == pid && backend.backend_start == starttime)
+        })
+    }
+
+    pub(crate) fn insert_process_cgroups(&mut self, samples: Vec<ProcessCgroupSample>) {
+        for sample in samples {
+            self.process_cgroups.insert(
+                (sample.pid, sample.starttime, sample.ts),
+                sample.cgroup_path,
+            );
+        }
+    }
+
+    pub(crate) fn process_cgroup_at(&self, pid: i64, starttime: i64, ts: i64) -> Option<&str> {
+        self.process_cgroups
+            .get(&(pid, starttime, ts))
+            .map(AsRef::as_ref)
+    }
+
+    pub(crate) fn cgroup_devices(&self, cgroup_path: &str) -> &[Arc<[IdentityValue]>] {
+        self.cgroup_devices
+            .get(cgroup_path)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn insert_postgres_storage_device(&mut self, major: i64, minor: i64) {
+        if major > 0 && minor >= 0 {
+            self.postgres_storage_devices.insert((major, minor));
+        }
+    }
+
+    pub(crate) fn is_postgres_storage_device(&self, major: i64, minor: i64) -> bool {
+        self.postgres_storage_devices.contains(&(major, minor))
     }
 
     pub(crate) fn insert_gauge(
@@ -722,6 +1056,40 @@ impl TypedInputs {
             );
         }
         Some(GaugeSnapshotWindow { tracks })
+    }
+
+    /// Append one `pg_stat_activity` snapshot. The adapter feeds snapshots in
+    /// ascending collection time; `activity_window` filters by that time and
+    /// does not depend on the order.
+    pub(crate) fn insert_activity_snapshot(&mut self, snapshot: ActivitySnapshot) {
+        self.activity.push(snapshot);
+    }
+
+    /// Append one `pg_locks` snapshot, in ascending collection time.
+    pub(crate) fn insert_lock_snapshot(&mut self, snapshot: LockSnapshot) {
+        self.locks.push(snapshot);
+    }
+
+    /// Activity snapshots whose collection time lies inside `[from_us, to_us)`.
+    pub(crate) fn activity_window(
+        &self,
+        from_us: i64,
+        to_us: i64,
+    ) -> impl Iterator<Item = &ActivitySnapshot> {
+        self.activity
+            .iter()
+            .filter(move |snapshot| (from_us..to_us).contains(&snapshot.ts))
+    }
+
+    /// Lock snapshots whose collection time lies inside `[from_us, to_us)`.
+    pub(crate) fn lock_window(
+        &self,
+        from_us: i64,
+        to_us: i64,
+    ) -> impl Iterator<Item = &LockSnapshot> {
+        self.locks
+            .iter()
+            .filter(move |snapshot| (from_us..to_us).contains(&snapshot.ts))
     }
 }
 
@@ -1193,5 +1561,72 @@ mod tests {
                 .gauge_window("slot", "retained", &id(1), 0, 30)
                 .is_none()
         );
+    }
+
+    fn backend(state: &str) -> ActivityBackend {
+        ActivityBackend {
+            pid: 1,
+            backend_start: 1,
+            xid_age: None,
+            xmin_age: None,
+            state: Some(state.into()),
+            wait_event_type: None,
+            wait_event: None,
+            xact_age_us: None,
+        }
+    }
+
+    fn activity_at(ts: i64, state: &str) -> ActivitySnapshot {
+        ActivitySnapshot {
+            ts,
+            backends: vec![backend(state)],
+            completeness: SnapshotCompleteness::Complete,
+        }
+    }
+
+    #[test]
+    fn activity_window_uses_half_open_request_bounds() {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(activity_at(5, "before"));
+        typed.insert_activity_snapshot(activity_at(10, "start"));
+        typed.insert_activity_snapshot(activity_at(15, "inside"));
+        typed.insert_activity_snapshot(activity_at(20, "end"));
+        typed.insert_activity_snapshot(activity_at(25, "after"));
+
+        let states: Vec<_> = typed
+            .activity_window(10, 20)
+            .map(|snapshot| snapshot.backends[0].state.as_deref().expect("state"))
+            .collect();
+        assert_eq!(states, ["start", "inside"], "the end bound is excluded");
+    }
+
+    #[test]
+    fn lock_window_selects_snapshots_by_collection_time() {
+        let edge = LockEdge {
+            waiter_pid: 20,
+            blocker_pid: 10,
+        };
+        let mut typed = TypedInputs::new();
+        typed.insert_lock_snapshot(LockSnapshot {
+            ts: 5,
+            edges: vec![edge],
+        });
+        typed.insert_lock_snapshot(LockSnapshot {
+            ts: 12,
+            edges: vec![edge],
+        });
+
+        let times: Vec<_> = typed
+            .lock_window(10, 20)
+            .map(|snapshot| snapshot.ts)
+            .collect();
+        assert_eq!(times, [12]);
+    }
+
+    #[test]
+    fn empty_inputs_expose_no_snapshots() {
+        let typed = TypedInputs::new();
+        assert_eq!(typed.activity_window(i64::MIN, i64::MAX).count(), 0);
+        assert_eq!(typed.lock_window(i64::MIN, i64::MAX).count(), 0);
     }
 }

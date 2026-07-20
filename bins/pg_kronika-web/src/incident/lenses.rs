@@ -524,9 +524,14 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
 ];
 
-/// Returns design entries with non-exhaustive readiness requirements.
-pub(crate) const fn dormant_catalog() -> &'static [DormantLens] {
+/// Returns all stable core-lens design entries.
+pub(crate) const fn core_catalog() -> &'static [DormantLens] {
     DORMANT_CATALOG
+}
+
+/// No core lens is statically inactive. Runtime capability is request-specific.
+pub(crate) const fn dormant_catalog() -> &'static [DormantLens] {
+    &[]
 }
 
 #[cfg(test)]
@@ -814,7 +819,7 @@ mod tests {
 
     #[test]
     fn stable_ids_keep_their_readable_aliases() {
-        let actual: Vec<_> = dormant_catalog()
+        let actual: Vec<_> = core_catalog()
             .iter()
             .map(|lens| (lens.lens_id(), lens.slug()))
             .collect();
@@ -873,7 +878,7 @@ mod tests {
 
     #[test]
     fn lock_requirements_preserve_the_structural_contract() {
-        let lock = dormant_catalog()
+        let lock = core_catalog()
             .iter()
             .find(|lens| lens.lens_id() == "PG-LOCK-012")
             .expect("lock catalog entry");
@@ -928,7 +933,7 @@ mod tests {
 
     #[test]
     fn event_evidence_targets_existing_metric_lenses() {
-        let metric_ids: BTreeSet<_> = dormant_catalog().iter().map(DormantLens::lens_id).collect();
+        let metric_ids: BTreeSet<_> = core_catalog().iter().map(DormantLens::lens_id).collect();
         let mut split_facts = BTreeSet::new();
         for candidate in EVENT_CANDIDATES {
             match candidate.disposition {
@@ -956,7 +961,7 @@ mod tests {
             "archive_command=",
             "192.168.",
         ];
-        for lens in dormant_catalog() {
+        for lens in core_catalog() {
             let text = format!("{} {}", lens.title(), lens.detects()).to_lowercase();
             for marker in FORBIDDEN {
                 assert!(!text.contains(marker), "sensitive marker `{marker}`");

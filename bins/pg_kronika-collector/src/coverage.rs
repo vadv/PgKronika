@@ -5,9 +5,44 @@ use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
 use crate::statements_source::statements_type_id;
 use anyhow::Result;
 use kronika_registry::collection_coverage::CollectionCoverageV1;
+use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
 use kronika_registry::{StrId, Ts};
 use kronika_source_pg::statements::{StatementsRow, StatementsVersion};
 use kronika_writer::{Interner, SectionBuffers};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn collector_started_at_us() -> i64 {
+    static STARTED_AT: OnceLock<i64> = OnceLock::new();
+    *STARTED_AT.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_micros()).ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Build immutable provenance for one attempted multi-row snapshot.
+pub(crate) fn snapshot_coverage(
+    ts: i64,
+    source_type_id: u32,
+    read_state: u8,
+    visibility: u8,
+    source_total: u64,
+    collected: usize,
+) -> SnapshotCoverageV1 {
+    SnapshotCoverageV1 {
+        ts: Ts(ts),
+        source_type_id,
+        collector_pid: std::process::id(),
+        collector_started_at: Ts(collector_started_at_us()),
+        read_state,
+        visibility,
+        source_total: u32::try_from(source_total).unwrap_or(u32::MAX),
+        collected: u32::try_from(collected).unwrap_or(u32::MAX),
+    }
+}
 
 /// Counters accumulated while collecting one top-N source, for `1_023_001`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -202,4 +237,20 @@ pub(crate) fn push_coverage(
         buffer_row(buffers, row)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::snapshot_coverage;
+
+    #[test]
+    fn marker_keeps_complete_and_failure_states_distinct() {
+        let complete = snapshot_coverage(10, 1_001_003, 0, 0, 12, 12);
+        let failed = snapshot_coverage(20, 1_001_003, 3, 2, 0, 0);
+        assert_eq!((complete.read_state, complete.visibility), (0, 0));
+        assert_eq!((complete.source_total, complete.collected), (12, 12));
+        assert_eq!((failed.read_state, failed.visibility), (3, 2));
+        assert_eq!(complete.collector_pid, failed.collector_pid);
+        assert_eq!(complete.collector_started_at, failed.collector_started_at);
+    }
 }

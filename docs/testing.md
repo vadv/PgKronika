@@ -22,11 +22,13 @@
 ## Требования
 
 - Rust toolchain берётся из [`rust-toolchain.toml`](../rust-toolchain.toml).
-- Для BDD через `make test-bdd` нужен Docker daemon и Docker Buildx.
+- Для BDD через `make test-bdd` нужен Docker daemon. Docker Buildx нужен только
+  при отсутствии exact dependency builder.
 - Nix на хосте не нужен для Docker-пути: Nix запускается внутри builder image.
 - Nix на хосте нужен только для ручного варианта `nix build .#image`.
-- Для публикации BDD cache в registry нужны права на push; локальный запуск
-  работает без них.
+- Публичный exact dependency builder читается анонимно. Права на push нужны
+  только для первой публикации отсутствующего exact builder; runtime image не
+  публикуется.
 
 ## Полный локальный gate
 
@@ -64,19 +66,22 @@ DEBUG=1 make test-bdd TAGS=@pg_log
 expression и передаётся в Cucumber как `--tags`. `DEBUG=1` включает verbose
 Cucumber output (`-vvv`) и передаётся в контейнер как переменная окружения.
 
-Этот путь использует Docker/Buildx и тот же Nix image, что и CI. Runner сам
-вычисляет content-keyed тег runtime image:
+Этот путь использует тот же dependency builder и тот же Nix build, что и CI.
+Runtime получает только локальный тег:
 
 ```text
-pgkronika-bdd:<platform>-sha-<runtime-key>
+pgkronika-bdd:local
 ```
 
-Если такой local image уже есть, он переиспользуется. Повторный запуск после
-правки host-only файлов обычно не собирает образ.
+Каждый запуск заново передаёт текущие source/features в builder, компилирует
+first-party код и собирает runtime. Exact source rerun на чистом runner не
+переиспользует compiler output. Dependency Cargo artifacts, PostgreSQL 15–18 и
+`pg_store_plans` не пересобираются, если exact builder найден.
 
 ## Модель кэша BDD
 
-BDD image path разделяет dependency builder и runtime image.
+Единственный публикуемый cache image — exact dependency builder. Его тег
+содержит platform и dependency key; mutable branch aliases отсутствуют.
 
 Dependency key меняется при изменении:
 
@@ -86,32 +91,33 @@ Dependency key меняется при изменении:
 - `rust-toolchain.toml`;
 - `Dockerfile.bdd-builder`.
 
-Runtime key меняется при изменении dependency inputs, а также:
+Source и BDD features не входят ни в один registry cache key. Они только
+передаются в локальную runtime assembly:
 
 - Rust source files в `crates/*/src/**` и `bins/*/src/**`;
 - BDD feature files в `crates/kronika-bdd/features/**`.
 
-Host-only файлы не меняют dependency key и runtime key:
+Host-only файлы также не меняют dependency key:
 
 - `Makefile`;
 - `scripts/test-bdd-local.sh`;
-- runner/helper shell changes, если они не входят в runtime source;
+- runner/helper shell changes, если они не меняют builder context;
 - README и docs.
 
 Практический эффект:
 
-- изменения зависимостей пересобирают builder image и runtime image;
-- обычные изменения Rust source пересобирают runtime image, но не dependency
-  builder;
-- изменения документации и runner-only файлов переиспользуют существующий
-  runtime image.
+- изменения dependency contract создают новый exact builder tag;
+- обычные изменения Rust source и features сохраняют builder tag, но всегда
+  пересобирают ephemeral local runtime;
+- документация и runner-only файлы не меняют builder tag, но BDD job всё равно
+  выполняет source build: final runtime cache намеренно отсутствует.
 
 Полезные параметры:
 
 ```sh
 BDD_BUILDER_PULL=1          # попытаться взять exact builder из registry
-BDD_RUNTIME_REUSE_LOCAL=0   # принудительно пересобрать runtime image
-BDD_RUNTIME_IMAGE=...       # задать runtime image tag вручную
+BDD_BUILDER_PUSH=1          # опубликовать только отсутствующий exact builder
+BDD_RUNTIME_IMAGE=...       # задать ephemeral local runtime tag вручную
 BDD_OUTPUT_TAR=...          # сохранить runtime tarball в выбранный путь
 BDD_IMAGE_PREFIX=...        # registry prefix для builder images
 ```
@@ -128,9 +134,11 @@ export BDD_BUILDER_PULL=1
 ./scripts/bdd-image.sh run
 ```
 
-`build-builder` строит или берёт dependency builder. `build-runtime` собирает
-runtime image и тегирует его content-keyed именем, если `BDD_RUNTIME_IMAGE` не
-задан. `run` запускает этот image без фильтрации сценариев.
+`build-builder` строит или берёт exact dependency builder. `build-runtime`
+всегда компилирует переданные source внутри него, собирает runtime и тегирует
+его локально. По умолчанию локальный тег — `pgkronika-bdd:local`; в GitHub
+Actions используется `pgkronika-bdd:run-<run-id>-<attempt>`. `run` запускает
+этот image без фильтрации сценариев.
 
 Если Nix установлен на хосте, можно собрать image напрямую:
 
@@ -155,16 +163,18 @@ Docker-путь остаётся основным локальным путём,
   `bash scripts/test-bdd-image.sh`;
 - `test`: `cargo test --workspace`;
 - `coverage`: `cargo llvm-cov --workspace`;
-- `bdd metadata`: вычисляет dependency/runtime keys и image refs;
-- `bdd matrix`: берёт готовый runtime image из GHCR или собирает его через
-  `scripts/bdd-image.sh`, затем запускает PostgreSQL matrix.
+- `bdd matrix`: вычисляет dependency key, анонимно проверяет exact builder,
+  собирает его только при miss, затем всегда собирает ephemeral local runtime
+  и запускает PostgreSQL matrix.
 
-PR из этого же репозитория могут читать и обновлять GHCR cache. PR из форков
-используют те же keys и build path, но не публикуют cache обратно в registry.
+Exact builder публично читается без login. Trusted run из этого же репозитория
+при miss логинится и публикует единственный exact tag. PR из форка не получает
+GHCR credentials и при miss строит builder только локально, без push.
 
-`bdd matrix` не пересобирает dependency builder от обычных Rust source changes.
-Такие изменения меняют runtime key и приводят только к runtime build. Если exact
-runtime image уже есть в GHCR, job пропускает build.
+Обычный Rust source change не меняет builder tag и не строит dependency Cargo
+artifacts/PG closure. Source build при этом запускается всегда. Между чистыми
+hosted runners нет compiler cache, поэтому нельзя обещать компиляцию только
+затронутых first-party crates.
 
 ## GitLab CI
 
@@ -188,11 +198,10 @@ bdd:
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
     - docker buildx create --use
   script:
-    - platform_slug=$(./scripts/bdd-image.sh platform-slug)
     - export BDD_BUILDER_PULL=1 BDD_BUILDER_PUSH=1
-    - export BDD_RUNTIME_IMAGE="${BDD_IMAGE_PREFIX}/pgkronika-bdd:${platform_slug}-sha-$(./scripts/bdd-image.sh image-key | cut -c1-16)"
+    - export BDD_RUNTIME_IMAGE="pgkronika-bdd:run-${CI_PIPELINE_ID}-${CI_JOB_ID}"
     - ./scripts/bdd-image.sh build-builder
-    - BDD_RUNTIME_PUSH=1 ./scripts/bdd-image.sh build-runtime
+    - ./scripts/bdd-image.sh build-runtime
     - ./scripts/bdd-image.sh run "$BDD_RUNTIME_IMAGE"
 ```
 
@@ -201,7 +210,8 @@ bdd:
 - `TAGS must contain at least one Cucumber tag`: проверьте tag expression,
   например `TAGS=@pg_log`. Не задавайте `TAGS`, если нужен полный BDD run.
 - `Docker daemon is not reachable`: start Docker or set `BDD_DOCKER`.
-- `Docker Buildx is required`: install/enable Buildx for the Docker daemon.
+- `docker: 'buildx' is not a docker command`: exact builder отсутствует;
+  install/enable Buildx для его локальной сборки.
 - `KRONIKA_PG_MATRIX is not set`: the BDD binary was run outside the Nix image.
   Use `make test-bdd`, `scripts/bdd-image.sh run`, or provide the matrix
   manually.

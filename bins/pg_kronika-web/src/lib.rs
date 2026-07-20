@@ -976,7 +976,7 @@ mod tests {
     }
 
     /// The active lens ids the incidents endpoint advertises, in catalog order.
-    const ACTIVE_LENS_IDS: [&str; 19] = [
+    const ACTIVE_LENS_IDS: &[&str] = &[
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -996,7 +996,43 @@ mod tests {
         "PG-SLOT-016",
         "OS-CGMEM-023",
         "OS-FS-027",
+        "PG-QRY-001",
+        "PG-PLAN-002",
+        "OS-CPU-020",
+        "OS-BLOCK-024",
+        "OS-IOWHO-026",
+        "PG-HORIZON-013",
+        "PG-SYNC-018",
+        "PG-WAIT-019",
+        "PG-LOCK-012",
+        "PG-EVT-001",
+        "PG-EVT-002",
+        "PG-EVT-003",
+        "PG-EVT-005",
+        "PG-EVT-007",
+        "PG-EVT-008",
     ];
+
+    async fn assert_calm_incidents(uri: &str, to: i64) {
+        let calm = tempfile::tempdir().expect("tempdir");
+        write_archiver_with_identity(calm.path(), &archiver_rows(false), 0, to);
+        let (status, body) = serve(calm.path(), uri).await;
+        assert_eq!(status, StatusCode::OK, "calm 200; got {status}: {body}");
+        assert_eq!(
+            body["incidents"],
+            serde_json::json!([]),
+            "no anomaly means no incident"
+        );
+        assert_eq!(body["analysis_status"], "calm");
+        assert_eq!(body["clustering_complete"], true);
+        assert_eq!(body["complete"], false);
+        for field in ["catalog", "data_quality", "skipped", "coverage_by_section"] {
+            assert!(
+                body.get(field).is_some(),
+                "an empty response still carries {field}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
@@ -1053,13 +1089,14 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 9, "28 catalog lenses minus 19 active");
+        assert_eq!(dormant.len(), 0, "all 28 core lenses are active");
         assert!(
             dormant
                 .iter()
-                .any(|entry| entry["lens_id"] == "PG-LOCK-012"),
-            "missing dormant lock lens"
+                .all(|entry| entry["lens_id"] != "PG-LOCK-012"),
+            "the lock lens is now active, not dormant"
         );
+        assert!(dormant.is_empty());
         let incidents = body["incidents"].as_array().expect("incidents is an array");
         assert!(
             !incidents.is_empty(),
@@ -1079,24 +1116,7 @@ mod tests {
             "an incident member is the real archiver spike series"
         );
 
-        let calm = tempfile::tempdir().expect("tempdir");
-        write_archiver_with_identity(calm.path(), &archiver_rows(false), 0, to);
-        let (status, body) = serve(calm.path(), &uri).await;
-        assert_eq!(status, StatusCode::OK, "calm 200; got {status}: {body}");
-        assert_eq!(
-            body["incidents"],
-            serde_json::json!([]),
-            "no anomaly means no incident"
-        );
-        assert_eq!(body["analysis_status"], "calm");
-        assert_eq!(body["clustering_complete"], true);
-        assert_eq!(body["complete"], false);
-        for field in ["catalog", "data_quality", "skipped", "coverage_by_section"] {
-            assert!(
-                body.get(field).is_some(),
-                "an empty response still carries {field}"
-            );
-        }
+        assert_calm_incidents(&uri, to).await;
     }
 
     #[tokio::test]

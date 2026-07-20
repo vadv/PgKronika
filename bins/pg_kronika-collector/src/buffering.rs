@@ -5,6 +5,7 @@ use crate::plans_source::PlansRead;
 use crate::service_sections::{InstanceFacts, ServiceSections};
 use anyhow::Result;
 use kronika_registry::instance_metadata::InstanceMetadata;
+use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
 use kronika_registry::{StrId, Ts};
 use kronika_source_pg::archiver::{ArchiverRow, to_archiver};
 use kronika_source_pg::database::{self, DatabaseRow, DatabaseVersion};
@@ -31,6 +32,16 @@ use kronika_source_pg::wal::WalSnapshot;
 use kronika_source_pg::{ActivityRow, ActivityVersion, to_v1, to_v2, to_v3};
 use kronika_writer::{Interner, SectionBuffers};
 
+pub(crate) fn push_snapshot_coverages(
+    buffers: &mut SectionBuffers,
+    rows: &[SnapshotCoverageV1],
+) -> Result<()> {
+    for &row in rows {
+        buffer_row(buffers, row)?;
+    }
+    Ok(())
+}
+
 /// Buffer the main-connection sections that were read this tick.
 ///
 /// # Errors
@@ -47,6 +58,9 @@ pub(crate) fn push_main_conn_sections(
     }
     if let Some((activity_version, activity_rows)) = &src.activity {
         push_activity(buffers, interner, *activity_version, activity_rows)?;
+    }
+    if let Some(coverage) = src.activity_coverage {
+        buffer_row(buffers, coverage)?;
     }
     if let Some((database_version, database_rows)) = &src.database {
         push_database(buffers, interner, *database_version, database_rows)?;

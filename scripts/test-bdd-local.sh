@@ -30,10 +30,6 @@ if ! "$DOCKER" info >/dev/null 2>&1; then
   fail "Docker daemon is not reachable. Start Docker and retry."
 fi
 
-if ! "$DOCKER" buildx version >/dev/null 2>&1; then
-  fail "Docker Buildx is required for the BDD image path."
-fi
-
 export BDD_BUILDER_PULL=${BDD_BUILDER_PULL:-1}
 
 runtime_image=${BDD_RUNTIME_IMAGE:-}
@@ -41,7 +37,6 @@ if [ -z "$runtime_image" ]; then
   runtime_image=$("$ROOT/scripts/bdd-image.sh" runtime-image)
 fi
 export BDD_RUNTIME_IMAGE=$runtime_image
-export BDD_RUNTIME_REUSE_LOCAL=${BDD_RUNTIME_REUSE_LOCAL:-1}
 
 cleanup_output=
 if [ -z "${BDD_OUTPUT_TAR:-}" ]; then
@@ -57,12 +52,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if "$DOCKER" image inspect "$runtime_image" >/dev/null 2>&1; then
-  echo "Reusing BDD runtime image $runtime_image"
-else
-  "$ROOT/scripts/bdd-image.sh" build-builder
-  "$ROOT/scripts/bdd-image.sh" build-runtime
-fi
+echo "Building ephemeral BDD runtime image $runtime_image"
+"$ROOT/scripts/bdd-image.sh" build-builder
+"$ROOT/scripts/bdd-image.sh" build-runtime
 
 cucumber_args=()
 if [ -n "$TAGS" ]; then

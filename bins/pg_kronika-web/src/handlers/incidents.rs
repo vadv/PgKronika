@@ -16,7 +16,10 @@ use crate::AppState;
 use crate::anomaly::ScanParams;
 use crate::handlers::anomalies::scannable_sections;
 use crate::handlers::metrics::data_age_seconds;
-use crate::incident::{AnalyzeError, ClockRelation, IncidentConfig, Lens, active_catalog, analyze};
+use crate::incident::{
+    AnalyzeError, ClockRelation, EventConfig, EventError, EventLens, IncidentConfig, Lens,
+    active_catalog, analyze, evaluate_events, event_catalog,
+};
 use crate::incident_input::{InputError, InputLimits, prepare_input, scan_position_count};
 use crate::incident_response::{
     ResponseInput, build_response, identity_response, no_data_response,
@@ -249,11 +252,21 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
     )
     .map_err(analyze_error_response)?;
 
+    let event_lens_catalog = event_catalog();
+    let event_lenses: Vec<&dyn EventLens> = event_lens_catalog.iter().map(AsRef::as_ref).collect();
+    let log = evaluate_events(
+        &prepared.log_events,
+        &event_lenses,
+        &EventConfig::production(),
+    )
+    .map_err(event_error_response)?;
+
     Ok(Json(build_response(
         prepared.source_id,
         &request.scan,
         data_age,
         &outcome,
+        &log,
         &ResponseInput {
             coverage: &prepared.coverage_by_section,
             quality: &prepared.quality,
@@ -420,26 +433,7 @@ fn input_error_response(error: InputError) -> IncidentError {
                 "identity quality was not mapped to a partial response",
             )
         }
-        InputError::Read(QueryError::UnknownSection(name)) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "registry_invariant",
-            &format!("resolved section `{name}` is absent from the registry"),
-        ),
-        InputError::Read(QueryError::ResultTooLarge { max_cells }) => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "result_too_large",
-            &format!("the request exceeds the {max_cells}-cell reader ceiling"),
-        ),
-        InputError::Read(QueryError::BadCursor(_)) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "reader_invariant",
-            "the incident reader produced an invalid internal cursor",
-        ),
-        InputError::Read(QueryError::Read(_)) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store_read_failed",
-            "the store could not be read",
-        ),
+        InputError::Read(error) => read_error_response(error),
         InputError::UnknownColumn { section, column } => IncidentError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "registry_invariant",
@@ -460,6 +454,36 @@ fn input_error_response(error: InputError) -> IncidentError {
             &format!(
                 "section `{section}` column `{column}` folded into an invalid series: {error:?}"
             ),
+        ),
+    }
+}
+
+fn read_error_response(error: QueryError) -> IncidentError {
+    match error {
+        QueryError::UnknownSection(name) => IncidentError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "registry_invariant",
+            &format!("resolved section `{name}` is absent from the registry"),
+        ),
+        QueryError::ResultTooLarge { max_cells } => IncidentError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "result_too_large",
+            &format!("the request exceeds the {max_cells}-cell reader ceiling"),
+        ),
+        QueryError::MaterializedBytesTooLarge { max_bytes } => IncidentError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "result_too_large",
+            &format!("the request exceeds the {max_bytes}-byte reader ceiling"),
+        ),
+        QueryError::BadCursor(_) => IncidentError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reader_invariant",
+            "the incident reader produced an invalid internal cursor",
+        ),
+        QueryError::Read(_) => IncidentError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store_read_failed",
+            "the store could not be read",
         ),
     }
 }
@@ -505,6 +529,18 @@ fn analyze_error_response(error: AnalyzeError) -> IncidentError {
             StatusCode::INTERNAL_SERVER_ERROR,
             "cluster_error",
             "clustering the episodes failed",
+        ),
+    }
+}
+
+/// Map an event-pass failure to an HTTP response. A duplicate id is a static
+/// catalog inconsistency, so it is a `500`.
+fn event_error_response(error: EventError) -> IncidentError {
+    match error {
+        EventError::DuplicateLensId(_id) => IncidentError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "duplicate_lens_id",
+            "the event lens catalog contains a duplicate id",
         ),
     }
 }

@@ -41,8 +41,8 @@ macro_rules! marked {
 
 mod activity;
 pub use activity::{
-    ActivityRow, ActivityVersion, activity_query, activity_version, collect_activity, to_v1, to_v2,
-    to_v3,
+    ActivityRead, ActivityRow, ActivityVersion, MAX_ACTIVITY_ROWS, activity_query,
+    activity_version, collect_activity, to_v1, to_v2, to_v3,
 };
 
 pub mod archiver;

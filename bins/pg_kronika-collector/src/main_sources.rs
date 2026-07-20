@@ -1,4 +1,5 @@
 use crate::config::{Config, validate_replication_detail_bounds};
+use crate::coverage::snapshot_coverage;
 use crate::logging::{
     CollectionFamily, LogLevel, duration_ms, field, layout_id, log_collection_failure,
     log_collection_finish, log_collection_start, log_event, section_name,
@@ -7,6 +8,7 @@ use crate::scheduler::{DueSet, SourceKind};
 use anyhow::{Context, Result};
 use kronika_registry::Ts;
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
 use kronika_source_pg::archiver::{ArchiverRow, collect_archiver};
 use kronika_source_pg::database::{DatabaseRow, DatabaseVersion, collect_database};
 use kronika_source_pg::incident_gauges::{
@@ -27,7 +29,7 @@ use kronika_source_pg::replication_instance::{
 };
 use kronika_source_pg::wal::{WalSnapshot, collect_wal};
 use kronika_source_pg::{
-    ActivityRow, ActivityVersion, collect_activity, collect_bgwriter_checkpointer,
+    ActivityRow, ActivityVersion, activity_version, collect_activity, collect_bgwriter_checkpointer,
 };
 use std::time::Instant;
 use tokio_postgres::Client;
@@ -90,6 +92,7 @@ pub(crate) struct MainConnSources {
     pub(crate) local_join: Option<LocalJoinFacts>,
     pub(crate) bgwriter: Option<BgwriterCheckpointer>,
     pub(crate) activity: Option<(ActivityVersion, Vec<ActivityRow>)>,
+    pub(crate) activity_coverage: Option<SnapshotCoverageV1>,
     pub(crate) database: Option<(DatabaseVersion, Vec<DatabaseRow>)>,
     pub(crate) progress_vacuum_rows: Vec<ProgressVacuumRow>,
     pub(crate) vacuum_observation_rows: Vec<VacuumObservationRow>,
@@ -152,7 +155,7 @@ pub(crate) async fn collect_main_conn_sources(
     } else {
         None
     };
-    let activity = if due.has(SourceKind::Activity) {
+    let (activity, activity_coverage) = if due.has(SourceKind::Activity) {
         let started = Instant::now();
         let source = "main";
         log_event(
@@ -161,10 +164,46 @@ pub(crate) async fn collect_main_conn_sources(
             &[CollectionFamily::Activity.field(), field("source", source)],
         );
         match collect_activity(client, major).await {
-            Ok((version, rows)) => {
-                let type_id = activity_type_id(version);
-                log_collection_finish(type_id, source, rows.len(), started.elapsed());
-                Some((version, rows))
+            Ok(read) => {
+                let type_id = activity_type_id(read.version);
+                let marker_ts = read.rows.first().map_or(ts.0, |row| row.ts);
+                if read.truncated {
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_skip",
+                        &[
+                            CollectionFamily::Activity.field(),
+                            field("source", source),
+                            field("reason", "source_row_limit"),
+                            field("limit", kronika_source_pg::MAX_ACTIVITY_ROWS),
+                        ],
+                    );
+                    (
+                        None,
+                        Some(snapshot_coverage(
+                            marker_ts,
+                            type_id,
+                            1,
+                            u8::from(!read.full_visibility),
+                            u64::try_from(read.source_rows).unwrap_or(u64::MAX),
+                            0,
+                        )),
+                    )
+                } else {
+                    log_collection_finish(type_id, source, read.rows.len(), started.elapsed());
+                    let collected = read.rows.len();
+                    (
+                        Some((read.version, read.rows)),
+                        Some(snapshot_coverage(
+                            marker_ts,
+                            type_id,
+                            0,
+                            u8::from(!read.full_visibility),
+                            u64::try_from(read.source_rows).unwrap_or(u64::MAX),
+                            collected,
+                        )),
+                    )
+                }
             }
             Err(err) => {
                 log_event(
@@ -177,11 +216,26 @@ pub(crate) async fn collect_main_conn_sources(
                         field("elapsed_ms", duration_ms(started.elapsed())),
                     ],
                 );
-                return Err(err).context("collect pg_stat_activity");
+                let read_state = if err.code().is_some_and(|code| code.code() == "42501") {
+                    2
+                } else {
+                    3
+                };
+                (
+                    None,
+                    Some(snapshot_coverage(
+                        ts.0,
+                        activity_type_id(activity_version(major)),
+                        read_state,
+                        2,
+                        0,
+                        0,
+                    )),
+                )
             }
         }
     } else {
-        None
+        (None, None)
     };
     let database = if due.has(SourceKind::Database) {
         let started = Instant::now();
@@ -457,6 +511,7 @@ pub(crate) async fn collect_main_conn_sources(
         local_join,
         bgwriter,
         activity,
+        activity_coverage,
         database,
         progress_vacuum_rows,
         vacuum_observation_rows,
