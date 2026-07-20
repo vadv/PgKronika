@@ -2816,7 +2816,7 @@ mod tests {
     }
 
     #[test]
-    fn error_groups_keep_batch_boundaries_and_unknown_coverage() {
+    fn error_groups_keep_batch_boundaries_but_duplicate_facts_are_suppressed() {
         let page = log_page(
             "pg_log_errors",
             vec![
@@ -2836,8 +2836,8 @@ mod tests {
         let facts = event_findings(&events);
         assert_eq!(
             facts.iter().filter(|(id, _)| id == "PG-EVT-007").count(),
-            2,
-            "stored groups are not merged into a request-wide historical count: {facts:?}",
+            1,
+            "identical public facts are deduplicated without merging stored counts: {facts:?}",
         );
         assert!(
             facts

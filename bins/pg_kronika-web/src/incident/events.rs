@@ -330,11 +330,15 @@ fn emit_error_sqlstate(
     codes: &[&'static str],
 ) -> Result<(), LimitHit> {
     sink.charge_points(events.errors().len())?;
+    let mut emitted = BTreeSet::new();
     for group in events.errors() {
         let Some(sqlstate) = group.sqlstate() else {
             continue;
         };
         if group.count() == 0 || !codes.contains(&sqlstate) {
+            continue;
+        }
+        if !emitted.insert((sqlstate, group.observed_at_us())) {
             continue;
         }
         let identity: Arc<[IdentityValue]> = Arc::from(vec![
@@ -358,6 +362,7 @@ fn emit_crash_signal(
     matches: impl Fn(i32) -> bool,
 ) -> Result<(), LimitHit> {
     sink.charge_points(events.lifecycle().len())?;
+    let mut emitted = BTreeSet::new();
     for event in events.lifecycle() {
         if event.kind() != LifecycleKind::Crash {
             continue;
@@ -366,6 +371,9 @@ fn emit_crash_signal(
             continue;
         };
         if !matches(signal) {
+            continue;
+        }
+        if !emitted.insert((event.observed_at_us(), event.pid(), signal)) {
             continue;
         }
         let identity: Arc<[IdentityValue]> = Arc::from(vec![
@@ -466,8 +474,12 @@ impl EventLens for PanicShutdownLens {
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(events.errors().len())?;
+        let mut emitted = BTreeSet::new();
         for group in events.errors() {
             if group.severity() != SEVERITY_PANIC || group.count() == 0 {
+                continue;
+            }
+            if !emitted.insert(group.observed_at_us()) {
                 continue;
             }
             let identity: Arc<[IdentityValue]> =
@@ -806,7 +818,16 @@ mod tests {
     use super::*;
 
     fn error(severity: u8, sqlstate: Option<&str>, count: u64) -> LogErrorGroup {
-        LogErrorGroup::new(100, severity, sqlstate.map(str::to_owned), count)
+        error_at(100, severity, sqlstate, count)
+    }
+
+    fn error_at(
+        observed_at_us: i64,
+        severity: u8,
+        sqlstate: Option<&str>,
+        count: u64,
+    ) -> LogErrorGroup {
+        LogErrorGroup::new(observed_at_us, severity, sqlstate.map(str::to_owned), count)
     }
 
     fn crash(signal: Option<i32>) -> LifecycleEvent {
@@ -1025,6 +1046,27 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_stored_records_emit_one_public_fact() {
+        let errors = inputs_with(
+            vec![error(0, Some("40P01"), 1), error(0, Some("40P01"), 2)],
+            Vec::new(),
+        );
+        assert_eq!(findings(&errors, &DeadlockLens).len(), 1);
+
+        let lifecycle = inputs_with(Vec::new(), vec![crash(Some(SIGKILL)), crash(Some(SIGKILL))]);
+        assert_eq!(findings(&lifecycle, &BackendSigkillLens).len(), 1);
+
+        let panics = inputs_with(
+            vec![
+                error(SEVERITY_PANIC, None, 1),
+                error(SEVERITY_PANIC, Some("XX000"), 1),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(findings(&panics, &PanicShutdownLens).len(), 1);
+    }
+
+    #[test]
     fn absent_events_yield_no_findings_and_never_an_all_clear() {
         let mut events = LogEventInputs::new(EventInputLimits::production());
         events.set_coverage(PG_LOG_ERRORS, LogCoverage::NotCollected);
@@ -1074,7 +1116,10 @@ mod tests {
     #[test]
     fn the_finding_limit_is_reported_without_retaining_excess() {
         let events = inputs_with(
-            vec![error(0, Some("40P01"), 1), error(0, Some("40P01"), 2)],
+            vec![
+                error_at(100, 0, Some("40P01"), 1),
+                error_at(101, 0, Some("40P01"), 2),
+            ],
             Vec::new(),
         );
         let config = EventConfig::with(1_000, 1_000, 1, 1_000, 1_000_000);
