@@ -8,8 +8,8 @@ use super::cluster::{ClusterError, ClusterOutcome, cluster_episodes};
 use super::dispatch::{
     LimitAxis, LimitHit, SectionColumn, WorkBudget, candidate_lenses, section_index,
 };
+use super::evidence::Finding;
 use super::evidence::sink::{FindingSink, OutputCounts, OutputLimits};
-use super::evidence::{Finding, Role};
 use super::lens::Lens;
 use super::model::{EnrichedEpisode, EpisodeRefV1, IncidentKeyV1, KeyTooLarge};
 use super::series::SeriesSet;
@@ -258,48 +258,6 @@ fn charge_key_bytes(
     Ok(observed)
 }
 
-/// Assign lead/downstream to coincident findings from the capture time of their
-/// source signal: within one clock domain the earliest-starting signal in the
-/// incident leads and the latest trails, and equal starts stay coincident.
-/// Findings the lens already shaped (amplifiers, structural lead/downstream)
-/// are left alone. The engine owns this because only it sees every signal at
-/// once; a lens sees only its own.
-fn assign_temporal_direction(
-    findings: &mut [Finding],
-    members: &[EpisodeRefV1],
-    clock: ClockRelation,
-) {
-    if !matches!(clock, ClockRelation::SameDomain) {
-        return;
-    }
-    let (Some(earliest), Some(latest)) = (
-        members.iter().map(|member| member.start_us).min(),
-        members.iter().map(|member| member.start_us).max(),
-    ) else {
-        return;
-    };
-    if earliest == latest {
-        return;
-    }
-    for finding in findings {
-        if finding.role() != Role::Coincident {
-            continue;
-        }
-        let Some(member) = members.iter().find(|member| {
-            member.logical_section == finding.scope().logical_section()
-                && member.column == finding.scope().column()
-                && member.identity.as_ref() == finding.scope().identity()
-        }) else {
-            continue;
-        };
-        if member.start_us == earliest {
-            finding.set_role(Role::Lead);
-        } else if member.start_us == latest {
-            finding.set_role(Role::Downstream);
-        }
-    }
-}
-
 pub(crate) fn analyze(
     episodes: Vec<EnrichedEpisode>,
     series: &SeriesSet,
@@ -379,7 +337,6 @@ pub(crate) fn analyze(
                 break;
             }
         }
-        assign_temporal_direction(&mut findings, &cluster.members, config.clock_relation);
         findings.sort_by(finding_order);
 
         let key = IncidentKeyV1::new(
@@ -418,7 +375,7 @@ mod tests {
     use super::*;
     use crate::incident::cluster::Cluster;
     use crate::incident::evidence::{
-        Confidence, ConfidenceCap, Evidence, FindingDraft, FindingScope,
+        Confidence, ConfidenceCap, Evidence, FindingDraft, FindingScope, Role,
     };
     use crate::incident::model::IdentityValue;
     use kronika_analytics::{Direction, Episode, Evaluated};
@@ -477,6 +434,41 @@ mod tests {
                 vec![self.evidence.build()],
                 context.temporal_direction().as_ref(),
             ))
+        }
+    }
+
+    struct CoincidentMembersLens;
+
+    impl Lens for CoincidentMembersLens {
+        fn id(&self) -> &'static str {
+            "COINCIDENT_MEMBERS"
+        }
+
+        fn inputs(&self) -> &'static [SectionColumn] {
+            CACHE
+        }
+
+        fn confidence_cap(&self) -> ConfidenceCap {
+            ConfidenceCap::Medium
+        }
+
+        fn evaluate(
+            &self,
+            cluster: &Cluster,
+            _series: &SeriesSet,
+            _typed: &TypedInputs,
+            _context: &EvalContext,
+            sink: &mut FindingSink<'_>,
+        ) -> Result<(), LimitHit> {
+            for member in &cluster.members {
+                sink.emit(FindingDraft::new(
+                    Role::Coincident,
+                    FindingScope::from_episode(member),
+                    vec![Evidence::Counter],
+                    None,
+                ))?;
+            }
+            Ok(())
         }
     }
 
@@ -695,6 +687,28 @@ mod tests {
     }
 
     #[test]
+    fn anomaly_episode_order_does_not_create_causal_roles() {
+        let outcome = analyze(
+            vec![
+                episode("pg_stat_database", 1, 0, 10),
+                episode("pg_stat_database", 2, 2, 12),
+            ],
+            &SeriesSet::for_test(0),
+            &TypedInputs::new(),
+            &[&CoincidentMembersLens],
+            &config(100),
+        )
+        .expect("valid");
+
+        let roles: Vec<_> = outcome.incidents[0]
+            .findings
+            .iter()
+            .map(Finding::role)
+            .collect();
+        assert_eq!(roles, vec![Role::Coincident, Role::Coincident]);
+    }
+
+    #[test]
     fn key_is_independent_of_episode_order() {
         let run = |episodes| {
             analyze(
@@ -861,110 +875,6 @@ mod tests {
                 observed: 2,
                 limit: 1,
             }
-        );
-    }
-
-    fn coincident_findings(references: &[EpisodeRefV1]) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        let mut budget = WorkBudget::new(100);
-        let mut counts = OutputCounts::new();
-        for reference in references {
-            FindingSink::new(
-                &mut findings,
-                &mut budget,
-                &mut counts,
-                OutputLimits::new(8, 8),
-                "L",
-                ConfidenceCap::Low,
-            )
-            .emit(FindingDraft::new(
-                Role::Coincident,
-                FindingScope::from_episode(reference),
-                vec![Evidence::Gauge],
-                None,
-            ))
-            .expect("within limits");
-        }
-        findings
-    }
-
-    #[test]
-    fn same_domain_orders_coincident_findings_by_capture_time() {
-        let members = vec![
-            episode("pg_stat_database", 1, 0, 10).reference,
-            episode("pg_locks", 2, 5, 15).reference,
-        ];
-        let mut findings = coincident_findings(&members);
-        assign_temporal_direction(&mut findings, &members, ClockRelation::SameDomain);
-        let role_of = |section| {
-            findings
-                .iter()
-                .find(|finding| finding.scope().logical_section() == section)
-                .map(Finding::role)
-        };
-        assert_eq!(
-            role_of("pg_stat_database"),
-            Some(Role::Lead),
-            "start 0 leads"
-        );
-        assert_eq!(
-            role_of("pg_locks"),
-            Some(Role::Downstream),
-            "start 5 trails"
-        );
-    }
-
-    #[test]
-    fn a_middle_signal_stays_coincident() {
-        let members = vec![
-            episode("pg_stat_database", 1, 0, 10).reference,
-            episode("pg_stat_activity", 2, 3, 12).reference,
-            episode("pg_locks", 3, 5, 15).reference,
-        ];
-        let mut findings = coincident_findings(&members);
-        assign_temporal_direction(&mut findings, &members, ClockRelation::SameDomain);
-        let role_of = |section| {
-            findings
-                .iter()
-                .find(|finding| finding.scope().logical_section() == section)
-                .map(Finding::role)
-        };
-        assert_eq!(role_of("pg_stat_database"), Some(Role::Lead));
-        assert_eq!(
-            role_of("pg_stat_activity"),
-            Some(Role::Coincident),
-            "a signal between earliest and latest keeps coincident"
-        );
-        assert_eq!(role_of("pg_locks"), Some(Role::Downstream));
-    }
-
-    #[test]
-    fn unknown_clock_leaves_coincident_findings_untouched() {
-        let members = vec![
-            episode("pg_stat_database", 1, 0, 10).reference,
-            episode("pg_locks", 2, 5, 15).reference,
-        ];
-        let mut findings = coincident_findings(&members);
-        assign_temporal_direction(&mut findings, &members, ClockRelation::Unknown);
-        assert!(
-            findings
-                .iter()
-                .all(|finding| finding.role() == Role::Coincident)
-        );
-    }
-
-    #[test]
-    fn equal_starts_stay_coincident_under_one_clock() {
-        let members = vec![
-            episode("pg_stat_database", 1, 4, 10).reference,
-            episode("pg_locks", 2, 4, 15).reference,
-        ];
-        let mut findings = coincident_findings(&members);
-        assign_temporal_direction(&mut findings, &members, ClockRelation::SameDomain);
-        assert!(
-            findings
-                .iter()
-                .all(|finding| finding.role() == Role::Coincident)
         );
     }
 }
