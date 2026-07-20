@@ -103,10 +103,20 @@ impl Lens for SharedBufferMissesLens {
             if total <= 0.0 || sums.sum_a / total < Self::MISS_THRESHOLD {
                 continue;
             }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(sums.sum_a, total, GaugeUnit::Count),
+                Self::MISS_THRESHOLD,
+                ThresholdKind::AtLeast,
+                context.incident_end_us,
+                sums.intervals,
+                GaugeEntity::new(PG_STAT_DATABASE, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::Ratio],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -179,10 +189,20 @@ impl Lens for WalAmplificationLens {
             if sums.sum_b <= 0.0 || sums.sum_a / sums.sum_b < Self::FPI_THRESHOLD {
                 continue;
             }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(sums.sum_a, sums.sum_b, GaugeUnit::Count),
+                Self::FPI_THRESHOLD,
+                ThresholdKind::AtLeast,
+                context.incident_end_us,
+                sums.intervals,
+                GaugeEntity::new(PG_STAT_WAL, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::Ratio],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -192,7 +212,8 @@ impl Lens for WalAmplificationLens {
 
 /// `PG-TEMP-003` (`temp_spill`): spill into temporary files. Reports an amplifier
 /// when both `temp_bytes` and `temp_files` advanced over the incident, the honest
-/// signature of query work spilling to disk. Counter evidence caps at medium.
+/// signature of query work spilling to disk. It publishes the spilled
+/// `temp_bytes` volume; confidence is capped at medium.
 pub(crate) struct TempSpillLens;
 
 impl TempSpillLens {
@@ -252,10 +273,21 @@ impl Lens for TempSpillLens {
             if sums.sum_a <= 0.0 || sums.sum_b <= 0.0 {
                 continue;
             }
+            let Some(evidence) = GaugeEvidence::value(
+                sums.sum_a,
+                GaugeUnit::Bytes,
+                0.0,
+                ThresholdKind::AtLeast,
+                context.incident_end_us,
+                sums.intervals,
+                GaugeEntity::new(PG_STAT_DATABASE, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::Counter],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -266,7 +298,7 @@ impl Lens for TempSpillLens {
 /// `PG-CHKPT-008` (`requested_checkpoints`): checkpoints forced by demand rather
 /// than by the timer. Reports an elevated
 /// `sum(d(checkpoints_req)) / sum(d(checkpoints_req + checkpoints_timed))` as an
-/// amplifier. Ratio evidence caps at medium.
+/// amplifier. Confidence is capped at medium.
 pub(crate) struct RequestedCheckpointsLens;
 
 impl RequestedCheckpointsLens {
@@ -329,10 +361,20 @@ impl Lens for RequestedCheckpointsLens {
             if total <= 0.0 || sums.sum_a / total < Self::REQUESTED_THRESHOLD {
                 continue;
             }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(sums.sum_a, total, GaugeUnit::Count),
+                Self::REQUESTED_THRESHOLD,
+                ThresholdKind::AtLeast,
+                context.incident_end_us,
+                sums.intervals,
+                GaugeEntity::new(CHECKPOINTER, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::Ratio],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -342,7 +384,7 @@ impl Lens for RequestedCheckpointsLens {
 
 /// `PG-IO-011` (`backend_io_latency`): slow reads inside `PostgreSQL`. Reports an
 /// elevated `sum(d(read_time)) / sum(d(reads))` (milliseconds per read) as an
-/// amplifier. `read_time` needs `track_io_timing`; ratio evidence caps at medium.
+/// amplifier. `read_time` needs `track_io_timing`; confidence is capped at medium.
 pub(crate) struct BackendIoLatencyLens;
 
 impl BackendIoLatencyLens {
@@ -404,10 +446,21 @@ impl Lens for BackendIoLatencyLens {
             if sums.sum_b <= 0.0 || sums.sum_a / sums.sum_b < Self::LATENCY_MS_THRESHOLD {
                 continue;
             }
+            let Some(evidence) = GaugeEvidence::value(
+                sums.sum_a / sums.sum_b,
+                GaugeUnit::Milliseconds,
+                Self::LATENCY_MS_THRESHOLD,
+                ThresholdKind::AtLeast,
+                context.incident_end_us,
+                sums.intervals,
+                GaugeEntity::new(PG_STAT_IO, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::Ratio],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -418,7 +471,7 @@ impl Lens for BackendIoLatencyLens {
 /// `PG-HOT-007` (`hot_update_failure`): updates that miss the HOT path. Reports an
 /// elevated non-HOT fraction
 /// `sum(d(n_tup_upd - n_tup_hot_upd)) / sum(d(n_tup_upd))` as an amplifier of
-/// index and WAL work. Ratio evidence caps at medium.
+/// index and WAL work. Confidence is capped at medium.
 pub(crate) struct HotUpdateFailureLens;
 
 impl HotUpdateFailureLens {
@@ -483,10 +536,20 @@ impl Lens for HotUpdateFailureLens {
             {
                 continue;
             }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(sums.sum_b - sums.sum_a, sums.sum_b, GaugeUnit::Count),
+                Self::NON_HOT_THRESHOLD,
+                ThresholdKind::AtLeast,
+                context.incident_end_us,
+                sums.intervals,
+                GaugeEntity::new(PG_STAT_USER_TABLES, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::Ratio],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -497,7 +560,7 @@ impl Lens for HotUpdateFailureLens {
 /// `PG-ARCH-017` (`wal_archiving_failure`): the archiver rejecting WAL segments.
 /// Reports a coincident finding when `failed_count` advanced during the incident,
 /// summed over the intervals it shares with the `archived_count` beside it.
-/// Counter evidence caps at medium.
+/// It publishes the `failed_count` total; confidence is capped at medium.
 pub(crate) struct WalArchivingFailureLens;
 
 impl WalArchivingFailureLens {
@@ -556,10 +619,21 @@ impl Lens for WalArchivingFailureLens {
             if sums.intervals < Self::MIN_INTERVALS || sums.sum_a < Self::MIN_FAILURES {
                 continue;
             }
+            let Some(evidence) = GaugeEvidence::value(
+                sums.sum_a,
+                GaugeUnit::Count,
+                Self::MIN_FAILURES,
+                ThresholdKind::AtLeast,
+                context.incident_end_us,
+                sums.intervals,
+                GaugeEntity::new(PG_STAT_ARCHIVER, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
             sink.emit(FindingDraft::new(
                 Role::Coincident,
                 FindingScope::from_episode(member),
-                vec![Evidence::Counter],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -632,10 +706,20 @@ impl Lens for NetworkErrorsLens {
             if sums.sum_b <= 0.0 || sums.sum_a / sums.sum_b < Self::ERROR_THRESHOLD {
                 continue;
             }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(sums.sum_a, sums.sum_b, GaugeUnit::Count),
+                Self::ERROR_THRESHOLD,
+                ThresholdKind::AtLeast,
+                context.incident_end_us,
+                sums.intervals,
+                GaugeEntity::new(OS_NETDEV, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
             sink.emit(FindingDraft::new(
                 Role::Coincident,
                 FindingScope::from_episode(member),
-                vec![Evidence::Ratio],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -647,7 +731,7 @@ impl Lens for NetworkErrorsLens {
 /// Reports an amplifier when the throttle fraction
 /// `sum(d(throttled_usec)) / sum(d(throttled_usec + usage_usec))` is elevated. It
 /// measures throttling itself, not whether host CPU was spare (a cross-section
-/// question); ratio evidence caps at medium.
+/// question); confidence is capped at medium.
 pub(crate) struct CgroupCpuThrottlingLens;
 
 impl CgroupCpuThrottlingLens {
@@ -710,10 +794,20 @@ impl Lens for CgroupCpuThrottlingLens {
             if total <= 0.0 || sums.sum_a / total < Self::THROTTLE_THRESHOLD {
                 continue;
             }
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(sums.sum_a, total, GaugeUnit::Microseconds),
+                Self::THROTTLE_THRESHOLD,
+                ThresholdKind::AtLeast,
+                context.incident_end_us,
+                sums.intervals,
+                GaugeEntity::new(OS_CGROUP_CPU, Arc::clone(&member.identity)),
+            ) else {
+                continue;
+            };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::Ratio],
+                vec![Evidence::GaugeObservation(evidence)],
                 None,
             ))?;
         }
@@ -1570,7 +1664,7 @@ pub(crate) fn active_catalog_ids() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::evidence::Confidence;
+    use super::super::evidence::{Confidence, GaugeMeasurement};
     use super::*;
     use crate::incident::model::{EnrichedEpisode, EpisodeRefV1};
     use crate::incident::{ClockRelation, IncidentConfig, LockEdge, LockSnapshot, analyze};
@@ -1752,13 +1846,8 @@ mod tests {
         typed
     }
 
-    fn run_lens(
-        lens: &dyn Lens,
-        section: &'static str,
-        column: &'static str,
-        typed: &TypedInputs,
-    ) -> Vec<(Role, Confidence)> {
-        let episode = EnrichedEpisode {
+    fn window_episode(section: &'static str, column: &'static str) -> EnrichedEpisode {
+        EnrichedEpisode {
             episode: Episode {
                 start: 0,
                 end: 0,
@@ -1781,7 +1870,67 @@ mod tests {
                 start_us: 0,
                 end_us: 10,
             },
+        }
+    }
+
+    /// The numeric reading a lens published as its first gauge observation.
+    struct GaugeReading {
+        unit: GaugeUnit,
+        value: f64,
+        operands: Option<(f64, f64)>,
+    }
+
+    fn first_reading(
+        lens: &dyn Lens,
+        section: &'static str,
+        column: &'static str,
+        typed: &TypedInputs,
+    ) -> Option<GaugeReading> {
+        let lenses: [&dyn Lens; 1] = [lens];
+        let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+        let outcome = analyze(
+            vec![window_episode(section, column)],
+            &SeriesSet::for_test(0),
+            typed,
+            &lenses,
+            &config,
+        )
+        .expect("valid analysis");
+        let finding = outcome.incidents[0].findings.first()?;
+        let Evidence::GaugeObservation(gauge) = finding.evidence().first()? else {
+            return None;
         };
+        let reading = match gauge.measurement() {
+            GaugeMeasurement::Value(v) => GaugeReading {
+                unit: gauge.unit(),
+                value: v.get(),
+                operands: None,
+            },
+            GaugeMeasurement::Ratio {
+                numerator,
+                denominator,
+                ..
+            } => GaugeReading {
+                unit: gauge.unit(),
+                value: numerator.get() / denominator.get(),
+                operands: Some((numerator.get(), denominator.get())),
+            },
+            GaugeMeasurement::Trend { first, last, .. } => GaugeReading {
+                unit: gauge.unit(),
+                value: last.get() - first.get(),
+                operands: None,
+            },
+        };
+        Some(reading)
+    }
+
+    fn run_lens(
+        lens: &dyn Lens,
+        section: &'static str,
+        column: &'static str,
+        typed: &TypedInputs,
+    ) -> Vec<(Role, Confidence)> {
+        let episode = window_episode(section, column);
         let lenses: [&dyn Lens; 1] = [lens];
         let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
         let outcome = analyze(
@@ -1797,6 +1946,55 @@ mod tests {
             .iter()
             .map(|finding| (finding.role(), finding.confidence()))
             .collect()
+    }
+
+    #[test]
+    fn cold_cache_publishes_the_miss_ratio_operands() {
+        // 80 misses over 100 accesses: numerator 80, denominator 100.
+        let reading = first_reading(
+            &SharedBufferMissesLens,
+            PG_STAT_DATABASE,
+            "blks_read",
+            &typed(&[30.0, 30.0, 20.0], &[5.0, 5.0, 10.0]),
+        )
+        .expect("a cold cache reports a gauge observation");
+        assert_eq!(reading.unit, GaugeUnit::Ratio);
+        let (numerator, denominator) = reading.operands.expect("a ratio carries operands");
+        assert!((numerator - 80.0).abs() < 1e-9);
+        assert!((denominator - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn temp_spill_publishes_the_spilled_byte_volume() {
+        let typed = pair(
+            PG_STAT_DATABASE,
+            "temp_bytes",
+            &[8_192.0, 8_192.0, 8_192.0],
+            "temp_files",
+            &[1.0, 1.0, 1.0],
+        );
+        let reading = first_reading(&TempSpillLens, PG_STAT_DATABASE, "temp_bytes", &typed)
+            .expect("a spill reports a gauge observation");
+        assert_eq!(reading.unit, GaugeUnit::Bytes);
+        assert!((reading.value - 24_576.0).abs() < 1e-9);
+        assert_eq!(reading.operands, None);
+    }
+
+    #[test]
+    fn backend_io_latency_publishes_milliseconds_per_read() {
+        // 30 ms over 10 reads = 3 ms/read.
+        let typed = pair(
+            PG_STAT_IO,
+            "read_time",
+            &[10.0, 10.0, 10.0],
+            "reads",
+            &[4.0, 3.0, 3.0],
+        );
+        let reading = first_reading(&BackendIoLatencyLens, PG_STAT_IO, "read_time", &typed)
+            .expect("slow reads report a gauge observation");
+        assert_eq!(reading.unit, GaugeUnit::Milliseconds);
+        assert!((reading.value - 3.0).abs() < 1e-9);
+        assert_eq!(reading.operands, None);
     }
 
     #[test]
