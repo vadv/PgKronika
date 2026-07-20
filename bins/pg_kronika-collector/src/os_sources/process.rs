@@ -1,7 +1,7 @@
 use super::{
     DueSet, Instant, Interner, OsCgroupMapping, OsSources, ProcFs, ProcessError, SourceKind, Ts,
     intern_str, log_cap_degraded, log_collection_finish, log_count_degraded, log_degraded,
-    os_max_procs, process_facts, read_process,
+    os_max_procs, process_facts, read_process, snapshot_coverage,
 };
 
 #[allow(
@@ -38,6 +38,10 @@ pub(super) fn collect_process_sections(
                     log_degraded(type_id, "process", &err);
                 }
             }
+            if hot_due {
+                os.snapshot_coverage
+                    .push(snapshot_coverage(ts, hot_type_id, 3, 2, 0, 0));
+            }
             return;
         }
     };
@@ -53,16 +57,21 @@ pub(super) fn collect_process_sections(
                     log_degraded(type_id, "process", &err);
                 }
             }
+            if hot_due {
+                os.snapshot_coverage
+                    .push(snapshot_coverage(ts, hot_type_id, 3, 2, 0, 0));
+            }
             return;
         }
     };
-    if capped.dropped > 0 {
+    let dropped = capped.dropped;
+    if dropped > 0 {
         for type_id in [hot_type_id, status_type_id, mapping_type_id] {
             if (type_id == hot_type_id && hot_due)
                 || (type_id == status_type_id && status_due)
                 || (type_id == mapping_type_id && mapping_due)
             {
-                log_cap_degraded(type_id, "process", "process_cap", capped.dropped, max_procs);
+                log_cap_degraded(type_id, "process", "process_cap", dropped, max_procs);
             }
         }
     }
@@ -84,6 +93,7 @@ pub(super) fn collect_process_sections(
                 io_nulls = io_nulls.saturating_add(1);
             }
             let Some(comm) = intern_str(interner, hot_type_id, "process", &read.hot.comm) else {
+                skipped = skipped.saturating_add(1);
                 continue;
             };
             let cmdline = read
@@ -153,6 +163,26 @@ pub(super) fn collect_process_sections(
     }
     if hot_due {
         log_collection_finish(hot_type_id, "procfs", os.processes.len(), started.elapsed());
+        let source_total = os
+            .processes
+            .len()
+            .saturating_add(skipped)
+            .saturating_add(dropped);
+        let read_state = if dropped > 0 {
+            1
+        } else if skipped > 0 {
+            4
+        } else {
+            0
+        };
+        os.snapshot_coverage.push(snapshot_coverage(
+            ts,
+            hot_type_id,
+            read_state,
+            u8::from(io_nulls > 0),
+            u64::try_from(source_total).unwrap_or(u64::MAX),
+            os.processes.len(),
+        ));
     }
     if status_due {
         log_collection_finish(

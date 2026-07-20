@@ -1,5 +1,6 @@
 //! Active diagnostic lenses over typed counter and gauge evidence.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::cluster::Cluster;
@@ -7,16 +8,21 @@ use super::dispatch::{LimitHit, SectionColumn};
 use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
-    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, Role, ThresholdKind,
+    ConfidenceCap, DirectEvidence, Evidence, FindingDraft, FindingScope, GaugeEntity,
+    GaugeEvidence, GaugeRatio, GaugeUnit, Role, ThresholdKind,
 };
 use super::gauge_contracts::{
     CgroupMemoryLens, FreezeHorizonLens, PhysicalReplicationLens, RunningVacuumLens,
     SlotRetentionLens, StorageCapacityLens,
 };
 use super::lens::Lens;
+use super::model::IdentityValue;
+use super::os_lenses::{BlockDeviceLens, HostCpuLens, ProcessIoWhoLens};
+use super::query_plan::{PlanChurnLens, QueryWorkLens};
 use super::series::SeriesSet;
-use super::typed::{GaugeObjective, TypedInputs};
+use super::typed::{ActivityBackend, GaugeObjective, TypedInputs};
+#[cfg(test)]
+use super::typed::{ActivitySnapshot, SnapshotCompleteness};
 
 const PG_STAT_DATABASE: &str = "pg_stat_database";
 const PG_STAT_WAL: &str = "pg_stat_wal";
@@ -24,6 +30,8 @@ const CHECKPOINTER: &str = "pg_stat_bgwriter + pg_stat_checkpointer";
 const PG_STAT_IO: &str = "pg_stat_io";
 const PG_STAT_USER_TABLES: &str = "pg_stat_user_tables";
 const PG_STAT_ARCHIVER: &str = "pg_stat_archiver";
+const PG_STAT_ACTIVITY: &str = "pg_stat_activity";
+const PG_LOCKS: &str = "pg_locks";
 const OS_NETDEV: &str = "os_netdev";
 const OS_CGROUP_CPU: &str = "os_cgroup_cpu";
 const OS_MEMINFO: &str = "os_meminfo";
@@ -1064,6 +1072,463 @@ impl Lens for WritebackPressureLens {
     }
 }
 
+/// `PG-HORIZON-013` (`xmin_horizon_hold`): an observed old transaction with an
+/// assigned xmin capable of holding the vacuum horizon. Prepared transactions,
+/// slots, and standby feedback are independent alternatives outside this row
+/// observation. Unseen snapshots prevent a global-cause or persistence claim.
+pub(crate) struct XminHorizonHoldLens;
+
+impl XminHorizonHoldLens {
+    const ID: &'static str = "PG-HORIZON-013";
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: PG_STAT_ACTIVITY,
+            column: "backend_xmin_age",
+        },
+        SectionColumn {
+            section: PG_STAT_ACTIVITY,
+            column: "xact_start",
+        },
+    ];
+    /// Below this xmin age the hold is ordinary transaction churn, not a horizon
+    /// a vacuum is waiting on.
+    const MIN_XMIN_AGE: i64 = 1_000_000;
+    const MIN_XMIN_AGE_F64: f64 = 1_000_000.0;
+    /// A running (non-idle) transaction must be at least this old, in
+    /// microseconds, to count as a horizon-holding long transaction (5 minutes).
+    const MIN_LONG_XACT_US: i64 = 300_000_000;
+    const MIN_LONG_XACT_US_F64: f64 = 300_000_000.0;
+
+    fn holds_horizon(backend: &ActivityBackend) -> bool {
+        backend
+            .xmin_age
+            .is_some_and(|age| age >= Self::MIN_XMIN_AGE)
+            && (idle_in_transaction(backend.state.as_deref())
+                || backend
+                    .xact_age_us
+                    .is_some_and(|age| age >= Self::MIN_LONG_XACT_US))
+    }
+}
+
+impl Lens for XminHorizonHoldLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Medium
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        let Some(member) = activity_member(cluster) else {
+            return Ok(());
+        };
+        let (start, end) = (context.incident_start_us, context.incident_end_us);
+        sink.charge_points(activity_backends_examined(typed, start, end))?;
+        let candidate = typed
+            .activity_window(start, end)
+            .flat_map(|snapshot| {
+                snapshot.backends.iter().filter_map(move |backend| {
+                    (backend.pid > 0 && backend.backend_start > 0 && Self::holds_horizon(backend))
+                        .then_some((snapshot.ts, backend))
+                })
+            })
+            .max_by_key(|(_, backend)| backend.xmin_age.unwrap_or_default());
+        if let Some((observed_at_us, backend)) = candidate {
+            let identity: Arc<[IdentityValue]> = Arc::from(vec![
+                IdentityValue::I64(backend.pid),
+                IdentityValue::I64(backend.backend_start),
+            ]);
+            let Some(xmin_age) = backend.xmin_age.and_then(exact_i64_as_f64) else {
+                return Ok(());
+            };
+            let Some(xmin_evidence) = GaugeEvidence::value(
+                xmin_age,
+                GaugeUnit::Count,
+                Self::MIN_XMIN_AGE_F64,
+                ThresholdKind::AtLeast,
+                observed_at_us,
+                1,
+                GaugeEntity::new(PG_STAT_ACTIVITY, Arc::clone(&identity)),
+            ) else {
+                return Ok(());
+            };
+            let mut evidence = vec![Evidence::GaugeObservation(xmin_evidence)];
+            if let Some(xact_age_us) = backend.xact_age_us.and_then(exact_i64_as_f64)
+                && let Some(xact_evidence) = GaugeEvidence::value(
+                    xact_age_us,
+                    GaugeUnit::Microseconds,
+                    Self::MIN_LONG_XACT_US_F64,
+                    ThresholdKind::AtLeast,
+                    observed_at_us,
+                    1,
+                    GaugeEntity::new(PG_STAT_ACTIVITY, identity),
+                )
+            {
+                evidence.push(Evidence::GaugeObservation(xact_evidence));
+            }
+            sink.emit(FindingDraft::new(
+                Role::Amplifier,
+                FindingScope::from_episode(member),
+                evidence,
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `PG-SYNC-018` (`sync_replication_wait`): the same backend session sampled on
+/// `wait_event='SyncRep'` in three consecutive snapshots. This is a positive
+/// sampled observation, not elapsed wait duration or a standby root cause.
+pub(crate) struct SyncReplicationWaitLens;
+
+impl SyncReplicationWaitLens {
+    const ID: &'static str = "PG-SYNC-018";
+    const INPUTS: &'static [SectionColumn] = &[SectionColumn {
+        section: PG_STAT_ACTIVITY,
+        column: "wait_event",
+    }];
+    /// Require the same session in three consecutive stored snapshots. This is
+    /// sampled persistence, not elapsed wait duration.
+    const MIN_CONSECUTIVE_SAMPLES: usize = 3;
+}
+
+impl Lens for SyncReplicationWaitLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Medium
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        let Some(member) = activity_member(cluster) else {
+            return Ok(());
+        };
+        let (start, end) = (context.incident_start_us, context.incident_end_us);
+        sink.charge_points(activity_backends_examined(typed, start, end))?;
+        let mut runs: BTreeMap<(i64, i64), (usize, usize, i64)> = BTreeMap::new();
+        for (snapshot_index, snapshot) in typed.activity_window(start, end).enumerate() {
+            for backend in snapshot.backends.iter().filter(|backend| {
+                backend.pid > 0
+                    && backend.backend_start > 0
+                    && is_syncrep(backend.wait_event.as_deref())
+            }) {
+                let entry = runs.entry((backend.pid, backend.backend_start)).or_insert((
+                    snapshot_index,
+                    0,
+                    snapshot.ts,
+                ));
+                entry.1 = if entry.1 > 0 && entry.0.checked_add(1) == Some(snapshot_index) {
+                    entry.1.saturating_add(1)
+                } else {
+                    1
+                };
+                entry.0 = snapshot_index;
+                entry.2 = snapshot.ts;
+            }
+        }
+        let persistent = runs
+            .into_iter()
+            .filter(|(_, (_, samples, _))| *samples >= Self::MIN_CONSECUTIVE_SAMPLES)
+            .max_by_key(|(_, (_, samples, _))| *samples);
+        if let Some(((pid, backend_start), (_, samples, observed_at_us))) = persistent {
+            let Some(samples_value) = u32::try_from(samples).ok().map(f64::from) else {
+                return Ok(());
+            };
+            let identity: Arc<[IdentityValue]> = Arc::from(vec![
+                IdentityValue::I64(pid),
+                IdentityValue::I64(backend_start),
+            ]);
+            let Some(evidence) = GaugeEvidence::value(
+                samples_value,
+                GaugeUnit::Count,
+                3.0,
+                ThresholdKind::AtLeast,
+                observed_at_us,
+                samples,
+                GaugeEntity::new(PG_STAT_ACTIVITY, identity),
+            ) else {
+                return Ok(());
+            };
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_episode(member),
+                vec![Evidence::GaugeObservation(evidence)],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `PG-WAIT-019` (`internal_wait_concentration`): active backends piling onto
+/// internal waits. Reports each bounded wait class separately only when at
+/// least three snapshots carry explicit complete-visibility provenance and the
+/// class accounts for at least half of the visible active-backend denominator.
+pub(crate) struct InternalWaitConcentrationLens;
+
+impl InternalWaitConcentrationLens {
+    const ID: &'static str = "PG-WAIT-019";
+    const INPUTS: &'static [SectionColumn] = &[SectionColumn {
+        section: PG_STAT_ACTIVITY,
+        column: "wait_event_type",
+    }];
+    /// A fraction over too few active backends is noise; require a floor so the
+    /// concentration is meaningful.
+    const MIN_ACTIVE: usize = 3;
+
+    const MIN_SNAPSHOTS: usize = 3;
+    const WAIT_FRACTION: f64 = 0.5;
+}
+
+impl Lens for InternalWaitConcentrationLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::Low
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        let Some(member) = activity_member(cluster) else {
+            return Ok(());
+        };
+        let (start, end) = (context.incident_start_us, context.incident_end_us);
+        sink.charge_points(activity_backends_examined(typed, start, end))?;
+        let mut snapshots = 0_usize;
+        let mut active_total = 0_usize;
+        let mut class_totals = [0_usize; 3];
+        let mut observed_at_us = start;
+        for snapshot in typed
+            .activity_window(start, end)
+            .filter(|snapshot| snapshot.completeness.denominator_usable())
+        {
+            let active = snapshot
+                .backends
+                .iter()
+                .filter(|backend| backend.state.as_deref() == Some("active"))
+                .count();
+            if active < Self::MIN_ACTIVE {
+                continue;
+            }
+            snapshots = snapshots.saturating_add(1);
+            active_total = active_total.saturating_add(active);
+            observed_at_us = snapshot.ts;
+            for backend in snapshot
+                .backends
+                .iter()
+                .filter(|backend| backend.state.as_deref() == Some("active"))
+            {
+                match backend.wait_event_type.as_deref() {
+                    Some("LWLock") => class_totals[0] = class_totals[0].saturating_add(1),
+                    Some("BufferPin") => class_totals[1] = class_totals[1].saturating_add(1),
+                    Some("IO") => class_totals[2] = class_totals[2].saturating_add(1),
+                    _ => {}
+                }
+            }
+        }
+        let concentrated = class_totals
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, count)| {
+                snapshots >= Self::MIN_SNAPSHOTS
+                    && active_total > 0
+                    && count.saturating_mul(2) >= active_total
+            })
+            .max_by_key(|(_, count)| *count);
+        if let Some((class, waiting)) = concentrated {
+            let class = match class {
+                0 => "LWLock",
+                1 => "BufferPin",
+                _ => "IO",
+            };
+            let identity: Arc<[IdentityValue]> =
+                Arc::from(vec![IdentityValue::Text(class.to_owned())]);
+            let (Some(waiting), Some(active_total)) = (
+                u32::try_from(waiting).ok().map(f64::from),
+                u32::try_from(active_total).ok().map(f64::from),
+            ) else {
+                return Ok(());
+            };
+            let Some(evidence) = GaugeEvidence::ratio(
+                GaugeRatio::new(waiting, active_total, GaugeUnit::Count),
+                Self::WAIT_FRACTION,
+                ThresholdKind::AtLeast,
+                observed_at_us,
+                snapshots,
+                GaugeEntity::new(PG_STAT_ACTIVITY, identity),
+            ) else {
+                return Ok(());
+            };
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_episode(member),
+                vec![Evidence::GaugeObservation(evidence)],
+                None,
+            ))?;
+        }
+        Ok(())
+    }
+}
+
+/// `PG-LOCK-012` (`lock_wait_graph`): a sampled lock wait-for graph. Reports a
+/// lead when a `pg_locks` snapshot in the incident window carries a `blocked_by`
+/// edge — direct evidence of a process that prevented a waiter from acquiring
+/// the requested lock. It may name a queue predecessor instead of a lock holder.
+/// This is the only snapshot lens with structural direction and high confidence.
+pub(crate) struct LockWaitGraphLens;
+
+impl LockWaitGraphLens {
+    const ID: &'static str = "PG-LOCK-012";
+    const INPUTS: &'static [SectionColumn] = &[SectionColumn {
+        section: PG_LOCKS,
+        column: "blocked_by",
+    }];
+}
+
+impl Lens for LockWaitGraphLens {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn inputs(&self) -> &'static [SectionColumn] {
+        Self::INPUTS
+    }
+
+    fn confidence_cap(&self) -> ConfidenceCap {
+        ConfidenceCap::High
+    }
+
+    fn evaluate(
+        &self,
+        cluster: &Cluster,
+        _series: &SeriesSet,
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        sink.charge_points(cluster.members.len())?;
+        let Some(_member) = cluster
+            .members
+            .iter()
+            .find(|member| member.logical_section == PG_LOCKS)
+        else {
+            return Ok(());
+        };
+        let (start, end) = (context.incident_start_us, context.incident_end_us);
+        let snapshots: Vec<_> = typed.lock_window(start, end).collect();
+        let examined: usize = snapshots.iter().map(|snapshot| snapshot.edges.len()).sum();
+        sink.charge_points(examined)?;
+        for snapshot in snapshots {
+            for edge in &snapshot.edges {
+                let identity: Arc<[IdentityValue]> = Arc::from(vec![
+                    IdentityValue::I64(snapshot.ts),
+                    IdentityValue::I64(edge.waiter_pid),
+                    IdentityValue::I64(edge.blocker_pid),
+                ]);
+                sink.emit(FindingDraft::new(
+                    Role::Lead,
+                    FindingScope::from_parts(PG_LOCKS, "blocked_by", identity),
+                    vec![Evidence::Direct(DirectEvidence::sampled_lock_edge())],
+                    None,
+                ))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The first `pg_stat_activity` episode of a cluster, or `None` when the section
+/// is not represented. The activity lenses report once per incident, scoped to
+/// this episode, rather than once per matching member.
+fn activity_member(cluster: &Cluster) -> Option<&super::model::EpisodeRefV1> {
+    cluster
+        .members
+        .iter()
+        .find(|member| member.logical_section == PG_STAT_ACTIVITY)
+}
+
+/// Total backends the activity lenses scan over the incident window, charged as
+/// work before analysis.
+fn activity_backends_examined(typed: &TypedInputs, start: i64, end: i64) -> usize {
+    typed
+        .activity_window(start, end)
+        .map(|snapshot| snapshot.backends.len())
+        .sum()
+}
+
+/// Whether a session state is an open but idle transaction, which pins the
+/// vacuum horizon without doing work.
+fn idle_in_transaction(state: Option<&str>) -> bool {
+    matches!(
+        state,
+        Some("idle in transaction" | "idle in transaction (aborted)")
+    )
+}
+
+/// Whether a wait event is the synchronous-replication commit wait.
+fn is_syncrep(wait_event: Option<&str>) -> bool {
+    wait_event == Some("SyncRep")
+}
+
+fn exact_i64_as_f64(value: i64) -> Option<f64> {
+    const MAX_EXACT_INTEGER: i64 = 1_i64 << 53;
+    if !(-MAX_EXACT_INTEGER..=MAX_EXACT_INTEGER).contains(&value) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the preceding bound proves exact IEEE-754 integer representation"
+    )]
+    Some(value as f64)
+}
+
+/// Whether a wait-event class is an internal (non-client) contention point.
+fn is_internal_wait(wait_event_type: Option<&str>) -> bool {
+    matches!(wait_event_type, Some("LWLock" | "BufferPin" | "IO"))
+}
+
 /// The lenses whose typed inputs are wired, applied to every request.
 pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
     vec![
@@ -1086,6 +1551,15 @@ pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
         Box::new(SlotRetentionLens),
         Box::new(CgroupMemoryLens),
         Box::new(StorageCapacityLens),
+        Box::new(QueryWorkLens),
+        Box::new(PlanChurnLens),
+        Box::new(HostCpuLens),
+        Box::new(BlockDeviceLens),
+        Box::new(ProcessIoWhoLens),
+        Box::new(XminHorizonHoldLens),
+        Box::new(SyncReplicationWaitLens),
+        Box::new(InternalWaitConcentrationLens),
+        Box::new(LockWaitGraphLens),
     ]
 }
 
@@ -1098,8 +1572,8 @@ pub(crate) fn active_catalog_ids() -> Vec<&'static str> {
 mod tests {
     use super::super::evidence::Confidence;
     use super::*;
-    use crate::incident::model::{EnrichedEpisode, EpisodeRefV1, IdentityValue};
-    use crate::incident::{ClockRelation, IncidentConfig, analyze};
+    use crate::incident::model::{EnrichedEpisode, EpisodeRefV1};
+    use crate::incident::{ClockRelation, IncidentConfig, LockEdge, LockSnapshot, analyze};
     use kronika_analytics::{DiffPoint, Direction, Episode, Evaluated, Scalar};
 
     fn id() -> Arc<[IdentityValue]> {
@@ -1241,6 +1715,15 @@ mod tests {
                 "PG-SLOT-016",
                 "OS-CGMEM-023",
                 "OS-FS-027",
+                "PG-QRY-001",
+                "PG-PLAN-002",
+                "OS-CPU-020",
+                "OS-BLOCK-024",
+                "OS-IOWHO-026",
+                "PG-HORIZON-013",
+                "PG-SYNC-018",
+                "PG-WAIT-019",
+                "PG-LOCK-012",
             ]
         );
         let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
@@ -1971,10 +2454,11 @@ mod tests {
     }
 
     #[test]
-    fn ten_active_gauges_and_nine_counters_are_accounted_once() {
+    fn active_and_dormant_lenses_are_accounted_once() {
         let active = active_catalog_ids();
-        assert_eq!(active.len(), 19);
-        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 9);
+        assert_eq!(active.len(), 28);
+        assert_eq!(crate::incident::core_catalog().len(), active.len());
+        assert!(crate::incident::dormant_catalog().is_empty());
         let unique: std::collections::BTreeSet<_> = active.iter().copied().collect();
         assert_eq!(unique.len(), active.len());
     }
@@ -2008,5 +2492,350 @@ mod tests {
         assert_eq!(outcome.skipped[0].limit.axis, super::super::LimitAxis::Work);
         assert_eq!(outcome.skipped[0].limit.observed, 8);
         assert_eq!(outcome.skipped[0].limit.limit, 5);
+    }
+
+    fn base_backend() -> ActivityBackend {
+        ActivityBackend {
+            pid: 1,
+            backend_start: 1,
+            xid_age: None,
+            xmin_age: None,
+            state: None,
+            wait_event_type: None,
+            wait_event: None,
+            xact_age_us: None,
+        }
+    }
+
+    // A snapshot at ts=5 sits inside the run_lens episode window [0, 10].
+    fn activity_typed(backends: Vec<ActivityBackend>) -> TypedInputs {
+        let mut typed = TypedInputs::new();
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 5,
+            backends,
+            completeness: SnapshotCompleteness::Complete,
+        });
+        typed
+    }
+
+    fn repeated_activity_typed(backends: &[ActivityBackend]) -> TypedInputs {
+        let mut typed = TypedInputs::new();
+        for ts in [3, 5, 7] {
+            typed.insert_activity_snapshot(ActivitySnapshot {
+                ts,
+                backends: backends.to_owned(),
+                completeness: SnapshotCompleteness::Complete,
+            });
+        }
+        typed
+    }
+
+    fn run_activity(lens: &dyn Lens, typed: &TypedInputs) -> Vec<(Role, Confidence)> {
+        run_lens(lens, PG_STAT_ACTIVITY, "backend_xmin_age", typed)
+    }
+
+    #[test]
+    fn xmin_hold_reports_a_medium_amplifier_for_an_old_idle_transaction() {
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(2_000_000),
+            state: Some("idle in transaction".into()),
+            ..base_backend()
+        }]);
+        assert_eq!(
+            run_activity(&XminHorizonHoldLens, &typed),
+            vec![(Role::Amplifier, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn xmin_hold_reports_for_an_old_long_running_transaction() {
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(2_000_000),
+            state: Some("active".into()),
+            xact_age_us: Some(400_000_000),
+            ..base_backend()
+        }]);
+        assert_eq!(
+            run_activity(&XminHorizonHoldLens, &typed),
+            vec![(Role::Amplifier, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn xmin_hold_ignores_a_fresh_horizon() {
+        // Idle in transaction but a young xmin: ordinary churn, not a hold.
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(100),
+            state: Some("idle in transaction".into()),
+            ..base_backend()
+        }]);
+        assert!(run_activity(&XminHorizonHoldLens, &typed).is_empty());
+    }
+
+    #[test]
+    fn xmin_hold_ignores_an_active_short_transaction() {
+        // Old xmin, but a running query that just started holds no horizon yet.
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(2_000_000),
+            state: Some("active".into()),
+            xact_age_us: Some(1_000),
+            ..base_backend()
+        }]);
+        assert!(run_activity(&XminHorizonHoldLens, &typed).is_empty());
+    }
+
+    #[test]
+    fn xmin_hold_ignores_a_backend_without_an_assigned_xmin() {
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: None,
+            state: Some("idle in transaction".into()),
+            ..base_backend()
+        }]);
+        assert!(run_activity(&XminHorizonHoldLens, &typed).is_empty());
+    }
+
+    #[test]
+    fn xmin_hold_on_empty_input_reports_nothing() {
+        assert!(run_activity(&XminHorizonHoldLens, &TypedInputs::new()).is_empty());
+    }
+
+    #[test]
+    fn sync_replication_reports_a_medium_coincident_on_a_syncrep_wait() {
+        let typed = repeated_activity_typed(&[ActivityBackend {
+            wait_event: Some("SyncRep".into()),
+            ..base_backend()
+        }]);
+        assert_eq!(
+            run_lens(
+                &SyncReplicationWaitLens,
+                PG_STAT_ACTIVITY,
+                "wait_event",
+                &typed
+            ),
+            vec![(Role::Coincident, Confidence::MEDIUM)]
+        );
+    }
+
+    #[test]
+    fn sync_replication_ignores_other_waits() {
+        let typed = activity_typed(vec![ActivityBackend {
+            wait_event: Some("ClientRead".into()),
+            ..base_backend()
+        }]);
+        assert!(
+            run_lens(
+                &SyncReplicationWaitLens,
+                PG_STAT_ACTIVITY,
+                "wait_event",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn sync_replication_requires_the_same_session_in_three_consecutive_samples() {
+        let mut typed = TypedInputs::new();
+        for (ts, backend_start) in [(3, 1), (5, 2), (7, 1)] {
+            typed.insert_activity_snapshot(ActivitySnapshot {
+                ts,
+                backends: vec![ActivityBackend {
+                    pid: 1,
+                    backend_start,
+                    wait_event: Some("SyncRep".into()),
+                    ..base_backend()
+                }],
+                completeness: SnapshotCompleteness::Restricted,
+            });
+        }
+        assert!(
+            run_lens(
+                &SyncReplicationWaitLens,
+                PG_STAT_ACTIVITY,
+                "wait_event",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn internal_wait_reports_a_low_coincident_when_active_backends_concentrate() {
+        // Three active backends, two on LWLock: 2*2 >= 3.
+        let lwlock = || ActivityBackend {
+            state: Some("active".into()),
+            wait_event_type: Some("LWLock".into()),
+            ..base_backend()
+        };
+        let running = ActivityBackend {
+            state: Some("active".into()),
+            ..base_backend()
+        };
+        let typed = repeated_activity_typed(&[lwlock(), lwlock(), running]);
+        assert_eq!(
+            run_lens(
+                &InternalWaitConcentrationLens,
+                PG_STAT_ACTIVITY,
+                "wait_event_type",
+                &typed
+            ),
+            vec![(Role::Coincident, Confidence::LOW)]
+        );
+    }
+
+    #[test]
+    fn internal_wait_needs_a_floor_of_active_backends() {
+        // Two active backends both on LWLock is concentrated but below the floor.
+        let lwlock = || ActivityBackend {
+            state: Some("active".into()),
+            wait_event_type: Some("LWLock".into()),
+            ..base_backend()
+        };
+        let typed = activity_typed(vec![lwlock(), lwlock()]);
+        assert!(
+            run_lens(
+                &InternalWaitConcentrationLens,
+                PG_STAT_ACTIVITY,
+                "wait_event_type",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn internal_wait_ignores_a_low_fraction() {
+        // Four active backends, one on LWLock: 2*1 < 4.
+        let lwlock = ActivityBackend {
+            state: Some("active".into()),
+            wait_event_type: Some("LWLock".into()),
+            ..base_backend()
+        };
+        let running = || ActivityBackend {
+            state: Some("active".into()),
+            ..base_backend()
+        };
+        let typed = activity_typed(vec![lwlock, running(), running(), running()]);
+        assert!(
+            run_lens(
+                &InternalWaitConcentrationLens,
+                PG_STAT_ACTIVITY,
+                "wait_event_type",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn internal_wait_withholds_ratio_without_complete_snapshot_markers() {
+        let backends = vec![
+            ActivityBackend {
+                state: Some("active".into()),
+                wait_event_type: Some("LWLock".into()),
+                ..base_backend()
+            },
+            ActivityBackend {
+                state: Some("active".into()),
+                wait_event_type: Some("LWLock".into()),
+                ..base_backend()
+            },
+            ActivityBackend {
+                state: Some("active".into()),
+                ..base_backend()
+            },
+        ];
+        let mut typed = TypedInputs::new();
+        for ts in [3, 5, 7] {
+            typed.insert_activity_snapshot(ActivitySnapshot {
+                ts,
+                backends: backends.clone(),
+                completeness: SnapshotCompleteness::Unknown,
+            });
+        }
+        assert!(
+            run_lens(
+                &InternalWaitConcentrationLens,
+                PG_STAT_ACTIVITY,
+                "wait_event_type",
+                &typed
+            )
+            .is_empty()
+        );
+    }
+
+    fn lock_typed(edges: Vec<LockEdge>) -> TypedInputs {
+        let mut typed = TypedInputs::new();
+        typed.insert_lock_snapshot(LockSnapshot { ts: 5, edges });
+        typed
+    }
+
+    #[test]
+    fn lock_wait_graph_leads_at_high_confidence_on_a_sampled_edge() {
+        let typed = lock_typed(vec![LockEdge {
+            waiter_pid: 20,
+            blocker_pid: 10,
+        }]);
+        let findings = run_lens(&LockWaitGraphLens, PG_LOCKS, "blocked_by", &typed);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].0, Role::Lead, "the lock edge proves direction");
+        assert_eq!(
+            findings[0].1.label(),
+            "high",
+            "direct edge evidence reaches high confidence"
+        );
+    }
+
+    #[test]
+    fn lock_wait_graph_without_edges_reports_nothing() {
+        // A pg_locks episode with no sampled edge is the honest boundary: the
+        // lens is active but has no direct evidence to stand on.
+        assert!(
+            run_lens(
+                &LockWaitGraphLens,
+                PG_LOCKS,
+                "blocked_by",
+                &lock_typed(vec![])
+            )
+            .is_empty()
+        );
+        assert!(
+            run_lens(
+                &LockWaitGraphLens,
+                PG_LOCKS,
+                "blocked_by",
+                &TypedInputs::new()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_lens_ignores_a_cluster_without_its_section() {
+        let typed = activity_typed(vec![ActivityBackend {
+            xmin_age: Some(2_000_000),
+            state: Some("idle in transaction".into()),
+            ..base_backend()
+        }]);
+        assert!(run_lens(&XminHorizonHoldLens, PG_STAT_DATABASE, "blks_read", &typed).is_empty());
+    }
+
+    #[test]
+    fn wait_classifiers_cover_their_event_sets() {
+        assert!(is_syncrep(Some("SyncRep")));
+        assert!(!is_syncrep(Some("ClientRead")));
+        assert!(!is_syncrep(None));
+
+        for internal in ["LWLock", "BufferPin", "IO"] {
+            assert!(is_internal_wait(Some(internal)), "{internal} is internal");
+        }
+        assert!(!is_internal_wait(Some("Client")), "client wait is external");
+        assert!(!is_internal_wait(None));
+
+        for idle in ["idle in transaction", "idle in transaction (aborted)"] {
+            assert!(idle_in_transaction(Some(idle)), "{idle} pins the horizon");
+        }
+        assert!(!idle_in_transaction(Some("active")));
+        assert!(!idle_in_transaction(None));
     }
 }

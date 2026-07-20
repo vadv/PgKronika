@@ -7,16 +7,13 @@ ENV NIX_CONFIG="experimental-features = nix-command flakes"
 WORKDIR /work
 RUN find /work -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
-# Use the real workspace so crane computes the same `cargoArtifacts` derivation
-# that `nix build .#image` reuses. Manifest, lockfile, flake, or Dockerfile
-# changes get a new builder tag; source-only changes can reuse the old one.
+# Use the dependency-only workspace so crane computes the same `cargoArtifacts`
+# derivation and Nix realizes the complete source-independent image closure.
+# Manifest, lockfile, flake, or Dockerfile changes get a new builder tag;
+# source-only changes can reuse the old one.
 COPY . .
 
 RUN nix build \
-    .#cargoArtifacts \
-    .#postgresql_15_plans \
-    .#postgresql_16_plans \
-    .#postgresql_17_plans \
-    .#postgresql_18_plans \
-    --out-link /tmp/bdd-deps \
-  && rm -f /tmp/bdd-deps
+    .#image \
+    --out-link /tmp/bdd-image \
+  && rm -f /tmp/bdd-image

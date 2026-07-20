@@ -171,7 +171,7 @@ pub(crate) enum AnalyzeError {
     Cluster(ClusterError),
 }
 
-fn finding_order(a: &Finding, b: &Finding) -> Ordering {
+pub(super) fn finding_order(a: &Finding, b: &Finding) -> Ordering {
     b.confidence()
         .cmp(&a.confidence())
         .then_with(|| a.role().cmp(&b.role()))

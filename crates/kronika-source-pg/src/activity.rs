@@ -8,6 +8,10 @@ use kronika_registry::pg_stat_activity::{PgStatActivityV1, PgStatActivityV2, PgS
 use kronika_registry::{StrId, Ts};
 use tokio_postgres::Client;
 
+/// Source-side all-or-nothing ceiling for one activity snapshot.
+pub const MAX_ACTIVITY_ROWS: usize = 4_096;
+const ACTIVITY_FETCH_ROWS: i64 = 4_097;
+
 /// Add the collector marker required by the SQL-transparency rule.
 macro_rules! marked {
     ($sql:literal) => {
@@ -66,7 +70,8 @@ pub const fn activity_query(version: ActivityVersion) -> &'static str {
              (extract(epoch from xact_start) * 1e6)::int8 AS xact_start_us, \
              (extract(epoch from query_start) * 1e6)::int8 AS query_start_us, \
              (extract(epoch from state_change) * 1e6)::int8 AS state_change_us, \
-             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             pg_has_role('pg_read_all_stats', 'member') AS full_visibility \
              FROM pg_stat_activity"
         ),
         ActivityVersion::V2 => marked!(
@@ -80,7 +85,8 @@ pub const fn activity_query(version: ActivityVersion) -> &'static str {
              (extract(epoch from xact_start) * 1e6)::int8 AS xact_start_us, \
              (extract(epoch from query_start) * 1e6)::int8 AS query_start_us, \
              (extract(epoch from state_change) * 1e6)::int8 AS state_change_us, \
-             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             pg_has_role('pg_read_all_stats', 'member') AS full_visibility \
              FROM pg_stat_activity"
         ),
         ActivityVersion::V3 => marked!(
@@ -94,10 +100,15 @@ pub const fn activity_query(version: ActivityVersion) -> &'static str {
              (extract(epoch from xact_start) * 1e6)::int8 AS xact_start_us, \
              (extract(epoch from query_start) * 1e6)::int8 AS query_start_us, \
              (extract(epoch from state_change) * 1e6)::int8 AS state_change_us, \
-             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us \
+             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             pg_has_role('pg_read_all_stats', 'member') AS full_visibility \
              FROM pg_stat_activity"
         ),
     }
+}
+
+fn bounded_activity_query(version: ActivityVersion) -> String {
+    format!("{} ORDER BY pid LIMIT $1", activity_query(version))
 }
 
 /// Raw `pg_stat_activity` row before string interning.
@@ -144,6 +155,22 @@ pub struct ActivityRow {
     pub query_start: Option<i64>,
     /// Last state change, unix microseconds.
     pub state_change: Option<i64>,
+}
+
+/// One bounded activity read and the provenance needed by snapshot-wide
+/// consumers. Rows are empty when `truncated` is true.
+#[derive(Debug, Clone)]
+pub struct ActivityRead {
+    /// Durable activity layout selected for the server major version.
+    pub version: ActivityVersion,
+    /// Parsed rows, empty when the source-side bound was exceeded.
+    pub rows: Vec<ActivityRow>,
+    /// Rows returned by the bounded read, including its possible guard row.
+    pub source_rows: usize,
+    /// Whether the guard row proved that the snapshot exceeded the bound.
+    pub truncated: bool,
+    /// Whether activity fields for all sessions were visible to the collector.
+    pub full_visibility: bool,
 }
 
 /// Intern an optional string, preserving `None`.
@@ -278,25 +305,49 @@ fn row_from_pg(row: &tokio_postgres::Row, version: ActivityVersion) -> ActivityR
     }
 }
 
-/// Collect a full `pg_stat_activity` snapshot. Returns the layout version and
-/// raw rows; the caller interns strings and builds the typed rows.
+/// Collect a bounded `pg_stat_activity` snapshot.
+///
+/// The source fetches at most one row beyond the ceiling. If that row exists,
+/// it returns no rows and sets the truncation flag; consumers must treat the
+/// snapshot as unavailable.
 ///
 /// # Errors
 /// Returns the [`tokio_postgres::Error`] if the query fails.
 pub async fn collect_activity(
     client: &Client,
     major: u32,
-) -> Result<(ActivityVersion, Vec<ActivityRow>), tokio_postgres::Error> {
+) -> Result<ActivityRead, tokio_postgres::Error> {
     let version = activity_version(major);
-    let rows = client.query(activity_query(version), &[]).await?;
+    let query = bounded_activity_query(version);
+    let rows = client.query(&query, &[&ACTIVITY_FETCH_ROWS]).await?;
+    let source_rows = rows.len();
+    let full_visibility = rows
+        .first()
+        .is_some_and(|row| row.get::<_, bool>("full_visibility"));
+    if rows.len() > MAX_ACTIVITY_ROWS {
+        return Ok(ActivityRead {
+            version,
+            rows: Vec::new(),
+            source_rows,
+            truncated: true,
+            full_visibility,
+        });
+    }
     let parsed = rows.iter().map(|row| row_from_pg(row, version)).collect();
-    Ok((version, parsed))
+    Ok(ActivityRead {
+        version,
+        rows: parsed,
+        source_rows,
+        truncated: false,
+        full_visibility,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityRow, ActivityVersion, activity_query, activity_version, to_v1, to_v2, to_v3,
+        ACTIVITY_FETCH_ROWS, ActivityRow, ActivityVersion, MAX_ACTIVITY_ROWS, activity_query,
+        activity_version, bounded_activity_query, to_v1, to_v2, to_v3,
     };
     use kronika_registry::StrId;
     use std::convert::Infallible;
@@ -363,6 +414,28 @@ mod tests {
         ] {
             assert!(activity_query(v).contains("pg_stat_activity"));
             assert!(activity_query(v).contains("pg_kronika"));
+        }
+    }
+
+    #[test]
+    fn collector_query_has_a_deterministic_source_side_guard_row() {
+        let query = bounded_activity_query(ActivityVersion::V3);
+        assert!(query.ends_with(" FROM pg_stat_activity ORDER BY pid LIMIT $1"));
+        assert_eq!(
+            ACTIVITY_FETCH_ROWS,
+            i64::try_from(MAX_ACTIVITY_ROWS).unwrap() + 1
+        );
+    }
+
+    #[test]
+    fn query_records_visibility_without_exposing_activity_text() {
+        for version in [
+            ActivityVersion::V1,
+            ActivityVersion::V2,
+            ActivityVersion::V3,
+        ] {
+            let query = activity_query(version);
+            assert!(query.contains("pg_has_role('pg_read_all_stats', 'member')"));
         }
     }
 

@@ -12,10 +12,7 @@ pub(crate) struct Confidence(u8);
 impl Confidence {
     pub(crate) const LOW: Self = Self(0);
     pub(crate) const MEDIUM: Self = Self(1);
-
-    const fn high() -> Self {
-        Self(2)
-    }
+    pub(crate) const HIGH: Self = Self(2);
 
     pub(crate) const fn label(self) -> &'static str {
         match self.0 {
@@ -38,7 +35,7 @@ impl ConfidenceCap {
         match self {
             Self::Low => Confidence::LOW,
             Self::Medium => Confidence::MEDIUM,
-            Self::High => Confidence::high(),
+            Self::High => Confidence::HIGH,
         }
     }
 
@@ -82,8 +79,11 @@ enum DirectEvidenceKind {
 }
 
 impl DirectEvidence {
-    #[cfg(test)]
-    const fn sampled_lock_edge() -> Self {
+    /// A sampled `pg_locks` blocking edge: `blocked_by` names a process that
+    /// prevented the waiter from acquiring the lock. It can be a queue
+    /// predecessor rather than a lock holder. This proves a structural
+    /// direction, so a lock lens may lead or trail and reach high confidence.
+    pub(crate) const fn sampled_lock_edge() -> Self {
         Self {
             kind: DirectEvidenceKind::SampledLockEdge,
         }
@@ -148,6 +148,7 @@ pub(crate) enum GaugeUnit {
     Bytes,
     Kibibytes,
     Microseconds,
+    Milliseconds,
     Ratio,
     BytesPerSecond,
 }
@@ -159,6 +160,7 @@ impl GaugeUnit {
             Self::Bytes => "bytes",
             Self::Kibibytes => "KiB",
             Self::Microseconds => "microseconds",
+            Self::Milliseconds => "milliseconds",
             Self::Ratio => "ratio",
             Self::BytesPerSecond => "bytes_per_second",
         }
@@ -403,7 +405,7 @@ fn evidence_ceiling(evidence: &[Evidence]) -> Confidence {
     if evidence.is_empty() {
         Confidence::LOW
     } else if evidence.iter().any(Evidence::justifies_high) {
-        Confidence::high()
+        Confidence::HIGH
     } else {
         Confidence::MEDIUM
     }
@@ -422,6 +424,21 @@ impl FindingScope {
             logical_section: reference.logical_section,
             column: reference.column,
             identity: Arc::clone(&reference.identity),
+        }
+    }
+
+    /// Scope built from a log event's own typed fields rather than an anomaly
+    /// episode. The identity must carry only non-sensitive fields, since it is
+    /// serialized into the response.
+    pub(crate) const fn from_parts(
+        logical_section: &'static str,
+        column: &'static str,
+        identity: Arc<[IdentityValue]>,
+    ) -> Self {
+        Self {
+            logical_section,
+            column,
+            identity,
         }
     }
 
@@ -720,7 +737,7 @@ mod tests {
     #[test]
     fn confidence_orders_low_medium_high() {
         assert!(Confidence::LOW < Confidence::MEDIUM);
-        assert!(Confidence::MEDIUM < Confidence::high());
+        assert!(Confidence::MEDIUM < Confidence::HIGH);
     }
 
     #[test]
@@ -759,7 +776,7 @@ mod tests {
                 None,
             ),
         );
-        assert_eq!(finding.confidence(), Confidence::high());
+        assert_eq!(finding.confidence(), Confidence::HIGH);
         assert_eq!(finding.role(), Role::Lead);
     }
 
@@ -775,7 +792,7 @@ mod tests {
                 None,
             ),
         );
-        assert_eq!(finding.confidence(), Confidence::high());
+        assert_eq!(finding.confidence(), Confidence::HIGH);
         assert_eq!(finding.role(), Role::Coincident);
     }
 
