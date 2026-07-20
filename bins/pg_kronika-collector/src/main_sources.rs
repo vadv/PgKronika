@@ -161,10 +161,24 @@ pub(crate) async fn collect_main_conn_sources(
             &[CollectionFamily::Activity.field(), field("source", source)],
         );
         match collect_activity(client, major).await {
-            Ok((version, rows)) => {
+            Ok((version, rows, truncated)) => {
                 let type_id = activity_type_id(version);
-                log_collection_finish(type_id, source, rows.len(), started.elapsed());
-                Some((version, rows))
+                if truncated {
+                    log_event(
+                        LogLevel::Warn,
+                        "collection_skip",
+                        &[
+                            CollectionFamily::Activity.field(),
+                            field("source", source),
+                            field("reason", "source_row_limit"),
+                            field("limit", kronika_source_pg::MAX_ACTIVITY_ROWS),
+                        ],
+                    );
+                    None
+                } else {
+                    log_collection_finish(type_id, source, rows.len(), started.elapsed());
+                    Some((version, rows))
+                }
             }
             Err(err) => {
                 log_event(

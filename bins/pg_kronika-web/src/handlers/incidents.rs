@@ -443,6 +443,13 @@ fn input_error_response(error: InputError) -> IncidentError {
             "result_too_large",
             &format!("the request exceeds the {max_cells}-cell reader ceiling"),
         ),
+        InputError::Read(QueryError::MaterializedBytesTooLarge { max_bytes }) => {
+            IncidentError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "result_too_large",
+                &format!("the request exceeds the {max_bytes}-byte reader ceiling"),
+            )
+        }
         InputError::Read(QueryError::BadCursor(_)) => IncidentError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "reader_invariant",

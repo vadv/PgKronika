@@ -976,7 +976,7 @@ mod tests {
     }
 
     /// The active lens ids the incidents endpoint advertises, in catalog order.
-    const ACTIVE_LENS_IDS: [&str; 23] = [
+    const ACTIVE_LENS_IDS: [&str; 26] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -996,10 +996,13 @@ mod tests {
         "PG-SLOT-016",
         "OS-CGMEM-023",
         "OS-FS-027",
-        "PG-HORIZON-013",
-        "PG-SYNC-018",
-        "PG-WAIT-019",
         "PG-LOCK-012",
+        "PG-EVT-001",
+        "PG-EVT-002",
+        "PG-EVT-003",
+        "PG-EVT-005",
+        "PG-EVT-007",
+        "PG-EVT-008",
     ];
 
     #[tokio::test]

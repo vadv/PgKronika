@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::query::cursor::Cursor;
 use crate::query::logical::{LogicalSection, logical_section};
 use crate::query::value::{Gap, OutRow, Value, cell_to_value};
-use crate::{Cell, LocalDirSnapshot, ReadError};
+use crate::{Cell, LocalDirSnapshot, ReadError, Resolved};
 
 /// How many times `sections` refreshes a stale snapshot before giving up on the
 /// stale unit and letting its time fall into a gap.
@@ -19,6 +19,8 @@ const MAX_REFRESH: u32 = 2;
 
 /// Maximum number of output cells retained by one query.
 const MAX_MATERIALIZED_CELLS: usize = 10_000_000;
+/// Maximum owned variable-width payload retained by one query.
+const MAX_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
 
 /// One logical section's answer for a source and time window.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,13 +43,24 @@ pub struct SectionPage {
 pub struct QueryLimits {
     rows: usize,
     cells: usize,
+    bytes: usize,
 }
 
 impl QueryLimits {
     /// Set the row and cell ceilings.
     #[must_use]
     pub const fn new(rows: usize, cells: usize) -> Self {
-        Self { rows, cells }
+        Self {
+            rows,
+            cells,
+            bytes: MAX_MATERIALIZED_BYTES,
+        }
+    }
+
+    /// Set row, cell, and owned variable-width byte ceilings.
+    #[must_use]
+    pub const fn with_bytes(rows: usize, cells: usize, bytes: usize) -> Self {
+        Self { rows, cells, bytes }
     }
 }
 
@@ -64,6 +77,11 @@ pub enum QueryError {
     ResultTooLarge {
         /// Maximum cells a query may retain.
         max_cells: usize,
+    },
+    /// Resolved strings, blobs, lists, and row keys exceed the byte budget.
+    MaterializedBytesTooLarge {
+        /// Maximum owned variable-width bytes a query may retain.
+        max_bytes: usize,
     },
 }
 
@@ -181,6 +199,7 @@ pub fn sections_with_limits(
     limits: QueryLimits,
 ) -> Result<BTreeMap<String, SectionPage>, QueryError> {
     let max_cells = limits.cells.min(MAX_MATERIALIZED_CELLS);
+    let max_bytes = limits.bytes.min(MAX_MATERIALIZED_BYTES);
     // Resolve every requested name up front; an unknown name fails the whole call.
     let mut requested: Vec<(String, LogicalSection)> = Vec::with_capacity(names.len());
     for &name in names {
@@ -196,7 +215,9 @@ pub fn sections_with_limits(
     let mut refreshed: u32 = 0;
     let (buffers, covered) = loop {
         let skip_stale = refreshed >= MAX_REFRESH;
-        match gather(snap, source, from, to, &requested, skip_stale, max_cells) {
+        match gather(
+            snap, source, from, to, &requested, skip_stale, max_cells, max_bytes,
+        ) {
             Ok(gathered) => break gathered,
             Err(GatherError::Stale) => {
                 snap.refresh()
@@ -206,6 +227,9 @@ pub fn sections_with_limits(
             Err(GatherError::Read(err)) => return Err(QueryError::Read(err)),
             Err(GatherError::ResultTooLarge) => {
                 return Err(QueryError::ResultTooLarge { max_cells });
+            }
+            Err(GatherError::MaterializedBytesTooLarge) => {
+                return Err(QueryError::MaterializedBytesTooLarge { max_bytes });
             }
         }
     };
@@ -272,6 +296,8 @@ enum GatherError {
     Read(ReadError),
     /// Retaining another row would exceed the materialization budget.
     ResultTooLarge,
+    /// Retaining another row would exceed the variable-width byte budget.
+    MaterializedBytesTooLarge,
 }
 
 /// Per-section row buffers plus the `[min, max]` ranges actually read.
@@ -291,6 +317,7 @@ fn gather(
     requested: &[(String, LogicalSection)],
     skip_stale: bool,
     max_cells: usize,
+    max_bytes: usize,
 ) -> Result<Gathered, GatherError> {
     let metas = snap.units();
     let in_window: Vec<usize> = metas
@@ -303,6 +330,7 @@ fn gather(
     let mut buffers: Vec<Vec<OutRow>> = vec![Vec::new(); requested.len()];
     let mut covered: Vec<(i64, i64)> = Vec::new();
     let mut materialized_cells = 0_usize;
+    let mut materialized_bytes = 0_usize;
 
     for &idx in &in_window {
         let unit = match snap.open_unit(idx) {
@@ -346,6 +374,24 @@ fn gather(
                         logical.columns.len(),
                         max_cells,
                     )?;
+                    let row_bytes = logical.columns.iter().zip(&cell_at).try_fold(
+                        0_usize,
+                        |total, (column, at)| {
+                            let value_bytes = at
+                                .and_then(|at| cells.get(at))
+                                .map_or(0, |cell| materialized_value_bytes(cell, &dict));
+                            total
+                                .checked_add(column.name.len())
+                                .and_then(|sum| sum.checked_add(value_bytes))
+                        },
+                    );
+                    let Some(row_bytes) = row_bytes else {
+                        return Err(GatherError::MaterializedBytesTooLarge);
+                    };
+                    materialized_bytes = materialized_bytes
+                        .checked_add(row_bytes)
+                        .filter(|total| *total <= max_bytes)
+                        .ok_or(GatherError::MaterializedBytesTooLarge)?;
                     let out: OutRow = logical
                         .columns
                         .iter()
@@ -363,6 +409,28 @@ fn gather(
         }
     }
     Ok((buffers, covered))
+}
+
+fn materialized_value_bytes(cell: &Cell, dict: &crate::Dictionary) -> usize {
+    match cell {
+        Cell::ListI32(values) => values.len().saturating_mul(size_of::<i32>()),
+        Cell::StrId(0)
+        | Cell::Null
+        | Cell::I16(_)
+        | Cell::I32(_)
+        | Cell::I64(_)
+        | Cell::U32(_)
+        | Cell::U64(_)
+        | Cell::F64(_)
+        | Cell::Bool(_)
+        | Cell::Ts(_) => 0,
+        Cell::StrId(id) => match dict.resolve(*id) {
+            Some(Resolved::String(bytes) | Resolved::Blob { bytes, .. }) => {
+                bytes.len().saturating_mul(3)
+            }
+            None => 0,
+        },
+    }
 }
 
 fn charge_materialization(
@@ -525,7 +593,10 @@ mod tests {
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
     use kronika_registry::{StrId, Ts};
 
-    use super::{Cursor, QueryError, Value, charge_materialization, section, sections};
+    use super::{
+        Cursor, QueryError, QueryLimits, Value, charge_materialization, section,
+        section_with_limits, sections,
+    };
     use crate::LocalDirSnapshot;
     use crate::snapshot::OPEN_UNIT_CALLS;
 
@@ -863,7 +934,8 @@ mod tests {
             QueryError::UnknownSection(name) => assert_eq!(name, "no_such_section"),
             other @ (QueryError::Read(_)
             | QueryError::BadCursor(_)
-            | QueryError::ResultTooLarge { .. }) => {
+            | QueryError::ResultTooLarge { .. }
+            | QueryError::MaterializedBytesTooLarge { .. }) => {
                 panic!("expected UnknownSection, got {other:?}")
             }
         }
@@ -882,6 +954,29 @@ mod tests {
     fn materialization_budget_rejects_integer_overflow() {
         let mut cells = usize::MAX;
         assert!(charge_materialization(&mut cells, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn variable_width_budget_rejects_before_building_output_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = PgStatArchiver::encode(&[archiver_row(1_000, 1)]).expect("encode");
+        let part = part_from(&[(1_008_001, 1, body)], 1_000, 1_000, 7);
+        fs::write(dir.path().join("1000.pgm"), &part).unwrap();
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let error = section_with_limits(
+            &mut snap,
+            "pg_stat_archiver",
+            7,
+            0,
+            10_000,
+            None,
+            QueryLimits::with_bytes(100, 10_000, 1),
+        )
+        .expect_err("column keys alone exceed one byte");
+        assert!(matches!(
+            error,
+            QueryError::MaterializedBytesTooLarge { max_bytes: 1 }
+        ));
     }
 
     #[test]

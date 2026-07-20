@@ -207,14 +207,14 @@ fn evidence_to_json(evidence: &Evidence) -> Value {
 }
 
 /// The log-event branch: self-contained facts, per-section coverage, and any
-/// bound the pass hit. `complete` is false when the event set was truncated or a
-/// lens was cut off, so a consumer never reads the facts as exhaustive.
+/// bound the pass hit. The current stderr source cannot prove exhaustive log
+/// coverage, so `complete` remains false even when evaluation finished.
 fn log_to_json(log: &EventOutcome) -> Value {
     let findings: Vec<Value> = log.findings.iter().map(finding_to_json).collect();
     let skipped: Vec<Value> = log.skipped.iter().map(engine_skip_to_json).collect();
     json!({
         "complete": log.complete,
-        "applied": applied_event_ids(),
+        "evaluated_lens_ids": applied_event_ids(),
         "findings": findings,
         "coverage": log_coverage_to_json(&log.coverage),
         "skipped": skipped,
@@ -239,7 +239,7 @@ fn log_coverage_to_json(coverage: &BTreeMap<&'static str, LogCoverage>) -> Value
 fn empty_log_json() -> Value {
     json!({
         "complete": false,
-        "applied": applied_event_ids(),
+        "evaluated_lens_ids": applied_event_ids(),
         "findings": Value::Array(Vec::new()),
         "coverage": json!({}),
         "skipped": Value::Array(Vec::new()),
@@ -280,7 +280,12 @@ fn catalog_to_json(
     input_skipped: &[SectionSkip],
     capability_by_section: &BTreeMap<&'static str, CapabilityInputState>,
 ) -> Value {
-    let applied_ids = crate::incident::active_catalog_ids();
+    let mut applied_ids = crate::incident::active_catalog_ids();
+    for id in crate::incident::event_catalog_ids() {
+        if !applied_ids.contains(&id) {
+            applied_ids.push(id);
+        }
+    }
     let applied: Vec<Value> = applied_ids.iter().copied().map(Value::from).collect();
     let capabilities: Vec<Value> = CONTRACT_CAPABILITIES
         .iter()
@@ -332,11 +337,15 @@ fn catalog_to_json(
         })
         .collect();
     json!({
+        "schema_version": 1,
         "status": "partial",
         "requirements_status": "incomplete",
         "diagnosis_available": !applied.is_empty(),
         "scope": "diagnostic_lenses",
         "applied": applied,
+        "active_count": applied_ids.len(),
+        "catalog_count": crate::incident::dormant_catalog().len()
+            + applied_ids.iter().filter(|id| id.starts_with("PG-EVT-")).count(),
         "capabilities": capabilities,
         "dormant": dormant_entries(crate::incident::dormant_catalog(), &applied_ids),
     })
@@ -351,6 +360,7 @@ const fn skip_reason_label(reason: SkipReason) -> &'static str {
         SkipReason::IdentityByteLimit { .. } => "identity_byte_limit",
         SkipReason::SeriesPointLimit { .. } => "series_point_limit",
         SkipReason::TypedGaugePointLimit { .. } => "typed_gauge_point_limit",
+        SkipReason::SnapshotRowLimit { .. } => "snapshot_row_limit",
     }
 }
 
@@ -468,6 +478,9 @@ fn section_skip_to_json(skip: &SectionSkip) -> Value {
         SkipReason::TypedGaugePointLimit { observed, limit } => {
             json!({ "kind": "typed_gauge_point_limit", "observed": observed, "limit": limit })
         }
+        SkipReason::SnapshotRowLimit { observed, limit } => {
+            json!({ "kind": "snapshot_row_limit", "observed": observed, "limit": limit })
+        }
     };
     json!({ "section": skip.section, "reason": reason })
 }
@@ -505,7 +518,7 @@ mod tests {
     use super::*;
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
-    const APPLIED_IDS: [&str; 23] = [
+    const APPLIED_IDS: [&str; 26] = [
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -525,10 +538,13 @@ mod tests {
         "PG-SLOT-016",
         "OS-CGMEM-023",
         "OS-FS-027",
-        "PG-HORIZON-013",
-        "PG-SYNC-018",
-        "PG-WAIT-019",
         "PG-LOCK-012",
+        "PG-EVT-001",
+        "PG-EVT-002",
+        "PG-EVT-003",
+        "PG-EVT-005",
+        "PG-EVT-007",
+        "PG-EVT-008",
     ];
 
     const MAX_ENTRY_JSON_BYTES: usize = 256
@@ -566,7 +582,7 @@ mod tests {
         };
 
         let mut events = LogEventInputs::new(EventInputLimits::production());
-        assert!(events.push_error(LogErrorGroup::new(0, Some("40P01".to_owned()), 3)));
+        assert!(events.push_error(LogErrorGroup::new(100, 0, Some("40P01".to_owned()), 3,)));
         events.set_coverage("pg_log_errors", LogCoverage::Unknown);
         events.set_coverage("pg_log_lifecycle", LogCoverage::NotCollected);
         let catalog = event_catalog();
@@ -594,23 +610,23 @@ mod tests {
         );
 
         let log_json = &body["log"];
-        assert_eq!(log_json["complete"], true);
+        assert_eq!(log_json["complete"], false);
         assert_eq!(
-            log_json["applied"].as_array().map(Vec::len),
+            log_json["evaluated_lens_ids"].as_array().map(Vec::len),
             Some(8),
             "the eight event lenses are advertised as applied"
         );
         let finding = &log_json["findings"][0];
         assert_eq!(finding["lens_id"], "PG-EVT-007");
-        assert_eq!(finding["confidence"], "high");
+        assert_eq!(finding["confidence"], "medium");
         assert_eq!(finding["role"], "coincident");
-        assert_eq!(finding["evidence"], json!(["direct"]));
+        assert_eq!(finding["evidence"], json!(["event"]));
         assert_eq!(finding["scope"]["logical_section"], "pg_log_errors");
         assert_eq!(finding["scope"]["column"], "sqlstate");
         assert_eq!(
             finding["scope"]["identity"],
-            json!(["40P01", 3]),
-            "only the code and count reach the response; no SQL, user, or address"
+            json!(["40P01", 100]),
+            "only the code and observation time reach the response"
         );
         assert_eq!(log_json["coverage"]["pg_log_errors"], "unknown");
         assert_eq!(log_json["coverage"]["pg_log_lifecycle"], "not_collected");
@@ -891,7 +907,9 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 28 - APPLIED_IDS.len());
+        assert_eq!(dormant.len(), 8);
+        assert_eq!(body["catalog"]["active_count"], 26);
+        assert_eq!(body["catalog"]["catalog_count"], 34);
         assert!(
             APPLIED_IDS.contains(&"PG-LOCK-012"),
             "the lock lens is now applied, not dormant"

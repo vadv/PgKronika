@@ -15,6 +15,7 @@ use super::gauge_contracts::{
     SlotRetentionLens, StorageCapacityLens,
 };
 use super::lens::Lens;
+use super::model::IdentityValue;
 use super::series::SeriesSet;
 use super::typed::{ActivityBackend, ActivitySnapshot, GaugeObjective, TypedInputs};
 
@@ -1292,7 +1293,8 @@ impl Lens for InternalWaitConcentrationLens {
 
 /// `PG-LOCK-012` (`lock_wait_graph`): a sampled lock wait-for graph. Reports a
 /// lead when a `pg_locks` snapshot in the incident window carries a `blocked_by`
-/// edge — direct evidence of who held the lock a waiter awaited. The lock edge
+/// edge — direct evidence of a process that prevented a waiter from acquiring
+/// the requested lock. It may be a queue predecessor rather than a lock holder. The edge
 /// proves a structural direction, so this is the one lens that may lead and
 /// reach high confidence.
 pub(crate) struct LockWaitGraphLens;
@@ -1327,7 +1329,7 @@ impl Lens for LockWaitGraphLens {
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
-        let Some(member) = cluster
+        let Some(_member) = cluster
             .members
             .iter()
             .find(|member| member.logical_section == PG_LOCKS)
@@ -1335,21 +1337,23 @@ impl Lens for LockWaitGraphLens {
             return Ok(());
         };
         let (start, end) = (context.incident_start_us, context.incident_end_us);
-        let examined: usize = typed
-            .lock_window(start, end)
-            .map(|snapshot| snapshot.edges.len())
-            .sum();
+        let snapshots: Vec<_> = typed.lock_window(start, end).collect();
+        let examined: usize = snapshots.iter().map(|snapshot| snapshot.edges.len()).sum();
         sink.charge_points(examined)?;
-        let has_edge = typed
-            .lock_window(start, end)
-            .any(|snapshot| !snapshot.edges.is_empty());
-        if has_edge {
-            sink.emit(FindingDraft::new(
-                Role::Lead,
-                FindingScope::from_episode(member),
-                vec![Evidence::Direct(DirectEvidence::sampled_lock_edge())],
-                None,
-            ))?;
+        for snapshot in snapshots {
+            for edge in &snapshot.edges {
+                let identity: Arc<[IdentityValue]> = Arc::from(vec![
+                    IdentityValue::I64(snapshot.ts),
+                    IdentityValue::I64(edge.waiter_pid),
+                    IdentityValue::I64(edge.blocker_pid),
+                ]);
+                sink.emit(FindingDraft::new(
+                    Role::Lead,
+                    FindingScope::from_parts(PG_LOCKS, "blocked_by", identity),
+                    vec![Evidence::Direct(DirectEvidence::sampled_lock_edge())],
+                    None,
+                ))?;
+            }
         }
         Ok(())
     }
@@ -1415,9 +1419,6 @@ pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
         Box::new(SlotRetentionLens),
         Box::new(CgroupMemoryLens),
         Box::new(StorageCapacityLens),
-        Box::new(XminHorizonHoldLens),
-        Box::new(SyncReplicationWaitLens),
-        Box::new(InternalWaitConcentrationLens),
         Box::new(LockWaitGraphLens),
     ]
 }
@@ -1431,7 +1432,7 @@ pub(crate) fn active_catalog_ids() -> Vec<&'static str> {
 mod tests {
     use super::super::evidence::Confidence;
     use super::*;
-    use crate::incident::model::{EnrichedEpisode, EpisodeRefV1, IdentityValue};
+    use crate::incident::model::{EnrichedEpisode, EpisodeRefV1};
     use crate::incident::{ClockRelation, IncidentConfig, LockEdge, LockSnapshot, analyze};
     use kronika_analytics::{DiffPoint, Direction, Episode, Evaluated, Scalar};
 
@@ -1574,9 +1575,6 @@ mod tests {
                 "PG-SLOT-016",
                 "OS-CGMEM-023",
                 "OS-FS-027",
-                "PG-HORIZON-013",
-                "PG-SYNC-018",
-                "PG-WAIT-019",
                 "PG-LOCK-012",
             ]
         );
@@ -2310,9 +2308,9 @@ mod tests {
     #[test]
     fn active_and_dormant_lenses_are_accounted_once() {
         let active = active_catalog_ids();
-        // Nine counter, ten gauge, and four activity/lock lenses are wired.
-        assert_eq!(active.len(), 23);
-        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 5);
+        // Nine counter, ten gauge, and one complete lock-snapshot lens are wired.
+        assert_eq!(active.len(), 20);
+        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 8);
         let unique: std::collections::BTreeSet<_> = active.iter().copied().collect();
         assert_eq!(unique.len(), active.len());
     }

@@ -8,6 +8,10 @@ use kronika_registry::pg_stat_activity::{PgStatActivityV1, PgStatActivityV2, PgS
 use kronika_registry::{StrId, Ts};
 use tokio_postgres::Client;
 
+/// Source-side all-or-nothing ceiling for one activity snapshot.
+pub const MAX_ACTIVITY_ROWS: usize = 4_096;
+const ACTIVITY_FETCH_ROWS: i64 = 4_097;
+
 /// Add the collector marker required by the SQL-transparency rule.
 macro_rules! marked {
     ($sql:literal) => {
@@ -278,19 +282,24 @@ fn row_from_pg(row: &tokio_postgres::Row, version: ActivityVersion) -> ActivityR
     }
 }
 
-/// Collect a full `pg_stat_activity` snapshot. Returns the layout version and
-/// raw rows; the caller interns strings and builds the typed rows.
+/// Collect a bounded `pg_stat_activity` snapshot. The source fetches at most
+/// one row beyond the ceiling. If that row exists, it returns no rows and sets
+/// the truncation flag; consumers must treat the snapshot as unavailable.
 ///
 /// # Errors
 /// Returns the [`tokio_postgres::Error`] if the query fails.
 pub async fn collect_activity(
     client: &Client,
     major: u32,
-) -> Result<(ActivityVersion, Vec<ActivityRow>), tokio_postgres::Error> {
+) -> Result<(ActivityVersion, Vec<ActivityRow>, bool), tokio_postgres::Error> {
     let version = activity_version(major);
-    let rows = client.query(activity_query(version), &[]).await?;
+    let query = format!("{} ORDER BY pid LIMIT $1", activity_query(version));
+    let rows = client.query(&query, &[&ACTIVITY_FETCH_ROWS]).await?;
+    if rows.len() > MAX_ACTIVITY_ROWS {
+        return Ok((version, Vec::new(), true));
+    }
     let parsed = rows.iter().map(|row| row_from_pg(row, version)).collect();
-    Ok((version, parsed))
+    Ok((version, parsed, false))
 }
 
 #[cfg(test)]

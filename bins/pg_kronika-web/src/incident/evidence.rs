@@ -76,12 +76,12 @@ pub(crate) struct DirectEvidence {
 enum DirectEvidenceKind {
     SampledLockEdge,
     ResourceLimitEvent,
-    LogEventOccurrence,
 }
 
 impl DirectEvidence {
-    /// A sampled `pg_locks` blocking edge: `blocked_by` names who held the lock
-    /// the waiter awaited. The one direct evidence that proves a structural
+    /// A sampled `pg_locks` blocking edge: `blocked_by` names a process that
+    /// prevented the waiter from acquiring the lock. It can be a queue
+    /// predecessor rather than a lock holder. The direct evidence proves a structural
     /// direction, so a lock lens may lead or trail and reach high confidence.
     pub(crate) const fn sampled_lock_edge() -> Self {
         Self {
@@ -93,15 +93,6 @@ impl DirectEvidence {
     const fn resource_limit_event() -> Self {
         Self {
             kind: DirectEvidenceKind::ResourceLimitEvent,
-        }
-    }
-
-    /// A typed log record certainly present in the source. Proves the occurrence
-    /// (justifies high), never the direction: a logged fact does not order cause
-    /// and effect, so a lens built on it cannot lead.
-    pub(crate) const fn log_event_occurrence() -> Self {
-        Self {
-            kind: DirectEvidenceKind::LogEventOccurrence,
         }
     }
 

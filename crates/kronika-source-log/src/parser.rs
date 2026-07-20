@@ -114,20 +114,22 @@ const STATEMENT_PREFIXES: &[&str] = &["STATEMENT:  ", "ОПЕРАТОР:  "];
 
 pub(crate) fn parse_stderr_line(line: &str) -> Option<ParsedLine<'_>> {
     let line = line.strip_suffix('\r').unwrap_or(line);
-    for &(keyword, severity) in SEVERITIES {
-        if let Some(pos) = line.find(keyword) {
-            let message = line.get(pos + keyword.len()..)?.trim();
-            if message.is_empty() {
-                return None;
-            }
-            let (sqlstate, message) = strip_sqlstate(message);
-            return Some(ParsedLine::Error {
-                ts: parse_prefix_ts(line),
-                severity,
-                sqlstate,
-                message,
-            });
+    let severity = SEVERITIES
+        .iter()
+        .filter_map(|&(keyword, severity)| line.find(keyword).map(|pos| (pos, keyword, severity)))
+        .min_by_key(|(pos, _, _)| *pos);
+    if let Some((pos, keyword, severity)) = severity {
+        let message = line.get(pos + keyword.len()..)?.trim();
+        if message.is_empty() {
+            return None;
         }
+        let (sqlstate, message) = strip_sqlstate(message);
+        return Some(ParsedLine::Error {
+            ts: parse_prefix_ts(line),
+            severity,
+            sqlstate,
+            message,
+        });
     }
 
     for (kind, prefixes) in [
@@ -300,6 +302,22 @@ mod tests {
             ParsedLine::Error {
                 severity: LogSeverity::Log,
                 message: "server process (PID 4242) was terminated by signal 9: Killed",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn message_text_cannot_spoof_a_later_more_severe_marker() {
+        let parsed = parse_stderr_line(
+            "2026-07-05 12:30:45 UTC [42]: ERROR:  user text contains PANIC:  but is not panic",
+        )
+        .expect("error parsed");
+        assert!(matches!(
+            parsed,
+            ParsedLine::Error {
+                severity: LogSeverity::Error,
+                message: "user text contains PANIC:  but is not panic",
                 ..
             }
         ));

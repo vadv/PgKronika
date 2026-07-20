@@ -4,8 +4,8 @@
 //! bounded, typed records the log source already grouped, never an anomaly
 //! episode. Every record is a positive fact — a lens reports that an event was
 //! logged, never infers anything from its absence, and never restates a logged
-//! fact as a cause. The model carries only non-sensitive fields (severity,
-//! SQLSTATE, count, signal), so no raw SQL, user, or address can reach a finding.
+//! fact as a cause. SQLSTATE-like tokens from stderr are heuristic evidence:
+//! the current source cannot prove a structured server error code.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -13,9 +13,7 @@ use std::sync::Arc;
 use super::dispatch::{LimitAxis, LimitHit, WorkBudget};
 use super::engine::{EngineSkip, finding_order};
 use super::evidence::sink::{FindingSink, OutputCounts, OutputLimits};
-use super::evidence::{
-    ConfidenceCap, DirectEvidence, Evidence, Finding, FindingDraft, FindingScope, Role,
-};
+use super::evidence::{ConfidenceCap, Evidence, Finding, FindingDraft, FindingScope, Role};
 use super::model::IdentityValue;
 
 const PG_LOG_ERRORS: &str = "pg_log_errors";
@@ -63,17 +61,23 @@ impl LogCoverage {
 /// and ordering cannot be recovered from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogErrorGroup {
+    observed_at_us: i64,
     severity: u8,
     sqlstate: Option<String>,
     count: u64,
 }
 
 impl LogErrorGroup {
-    /// A non-conforming SQLSTATE is dropped to `None`: only an exact five-char
-    /// code is a reliable structured match, and a group without one still counts
-    /// toward the severity facts.
-    pub(crate) fn new(severity: u8, sqlstate: Option<String>, count: u64) -> Self {
+    /// A non-conforming SQLSTATE-like token is dropped to `None`. Syntax alone
+    /// does not make the stderr token a structured server error code.
+    pub(crate) fn new(
+        observed_at_us: i64,
+        severity: u8,
+        sqlstate: Option<String>,
+        count: u64,
+    ) -> Self {
         Self {
+            observed_at_us,
             severity,
             sqlstate: sqlstate.filter(|code| is_sqlstate(code)),
             count,
@@ -91,6 +95,10 @@ impl LogErrorGroup {
     const fn count(&self) -> u64 {
         self.count
     }
+
+    const fn observed_at_us(&self) -> i64 {
+        self.observed_at_us
+    }
 }
 
 /// A `pg_log_lifecycle` record: a start, signal, or stop the postmaster logged.
@@ -103,13 +111,25 @@ pub(crate) enum LifecycleKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LifecycleEvent {
+    observed_at_us: i64,
+    pid: Option<i64>,
     kind: LifecycleKind,
     signal: Option<i32>,
 }
 
 impl LifecycleEvent {
-    pub(crate) const fn new(kind: LifecycleKind, signal: Option<i32>) -> Self {
-        Self { kind, signal }
+    pub(crate) const fn new(
+        observed_at_us: i64,
+        pid: Option<i64>,
+        kind: LifecycleKind,
+        signal: Option<i32>,
+    ) -> Self {
+        Self {
+            observed_at_us,
+            pid,
+            kind,
+            signal,
+        }
     }
 
     const fn kind(&self) -> LifecycleKind {
@@ -118,6 +138,14 @@ impl LifecycleEvent {
 
     const fn signal(&self) -> Option<i32> {
         self.signal
+    }
+
+    const fn observed_at_us(&self) -> i64 {
+        self.observed_at_us
+    }
+
+    const fn pid(&self) -> Option<i64> {
+        self.pid
     }
 }
 
@@ -226,14 +254,22 @@ pub(crate) trait EventLens {
     -> Result<(), LimitHit>;
 }
 
-/// Occurrence evidence for a logged event: proves the record was present, never
-/// its direction, so a finding built on it can reach high but stays coincident.
-fn occurrence() -> Vec<Evidence> {
-    vec![Evidence::Direct(DirectEvidence::log_event_occurrence())]
+/// A lifecycle template is still parsed from configurable stderr text; it is
+/// positive evidence but cannot justify exact/high confidence.
+fn typed_occurrence() -> Vec<Evidence> {
+    vec![Evidence::Event]
+}
+
+/// stderr severity and SQLSTATE-like tokens are parser observations, not a
+/// structured PostgreSQL code. They therefore cannot justify high confidence.
+fn stderr_observation() -> Vec<Evidence> {
+    vec![Evidence::Event]
 }
 
 /// Emit one coincident occurrence fact per error group whose SQLSTATE is one of
-/// `codes`. The scope carries the code and count only — both non-sensitive.
+/// `codes`. One stored group produces one fact. Its count is deliberately not
+/// exposed: the group timestamp identifies the first record in a collector
+/// batch, not the time distribution of all grouped records.
 fn emit_error_sqlstate(
     events: &LogEventInputs,
     sink: &mut FindingSink<'_>,
@@ -249,12 +285,12 @@ fn emit_error_sqlstate(
         }
         let identity: Arc<[IdentityValue]> = Arc::from(vec![
             IdentityValue::Text(sqlstate.to_owned()),
-            IdentityValue::U64(group.count()),
+            IdentityValue::I64(group.observed_at_us()),
         ]);
         sink.emit(FindingDraft::new(
             Role::Coincident,
             FindingScope::from_parts(PG_LOG_ERRORS, "sqlstate", identity),
-            occurrence(),
+            stderr_observation(),
             None,
         ))?;
     }
@@ -278,19 +314,25 @@ fn emit_crash_signal(
         if !matches(signal) {
             continue;
         }
-        let identity: Arc<[IdentityValue]> = Arc::from(vec![IdentityValue::I64(i64::from(signal))]);
+        let identity: Arc<[IdentityValue]> = Arc::from(vec![
+            IdentityValue::I64(event.observed_at_us()),
+            event
+                .pid()
+                .map_or(IdentityValue::Bool(false), IdentityValue::I64),
+            IdentityValue::I64(i64::from(signal)),
+        ]);
         sink.emit(FindingDraft::new(
             Role::Coincident,
             FindingScope::from_parts(PG_LOG_LIFECYCLE, "signal", identity),
-            occurrence(),
+            typed_occurrence(),
             None,
         ))?;
     }
     Ok(())
 }
 
-/// `PG-EVT-001` (`backend_sigkill`): a process was terminated by signal 9. High
-/// for the `SIGKILL` occurrence only — it does not prove kernel OOM, which needs
+/// `PG-EVT-001` (`backend_sigkill`): stderr reports signal 9 termination. It
+/// does not prove kernel OOM, which needs
 /// a victim record this source does not carry; `kill -9`, a watchdog, or a
 /// container runtime look identical here.
 pub(crate) struct BackendSigkillLens;
@@ -317,8 +359,8 @@ impl EventLens for BackendSigkillLens {
     }
 }
 
-/// `PG-EVT-002` (`backend_crash`): a process was terminated by a fault signal
-/// other than `SIGKILL`. High for the termination fact, never for the cause: an
+/// `PG-EVT-002` (`backend_crash`): stderr reports a process terminated by a
+/// signal other than `SIGKILL`. It does not identify the cause: an
 /// extension bug, assertion, hardware fault, or admin signal all reach here, and
 /// the terminated child is not necessarily a client backend.
 pub(crate) struct BackendCrashLens;
@@ -345,8 +387,8 @@ impl EventLens for BackendCrashLens {
     }
 }
 
-/// `PG-EVT-003` (`panic_shutdown`): a `PANIC` severity record was logged. High
-/// for the occurrence, never for data corruption or a proven outage: `PANIC`
+/// `PG-EVT-003` (`panic_shutdown`): stderr contains a parsed `PANIC` severity.
+/// This does not prove data corruption or a completed outage: `PANIC`
 /// aborts all sessions, but its cause ranges over I/O, shared-memory, and
 /// internal-invariant failures.
 pub(crate) struct PanicShutdownLens;
@@ -374,11 +416,12 @@ impl EventLens for PanicShutdownLens {
             if group.severity() != SEVERITY_PANIC || group.count() == 0 {
                 continue;
             }
-            let identity: Arc<[IdentityValue]> = Arc::from(vec![IdentityValue::U64(group.count())]);
+            let identity: Arc<[IdentityValue]> =
+                Arc::from(vec![IdentityValue::I64(group.observed_at_us())]);
             sink.emit(FindingDraft::new(
                 Role::Coincident,
                 FindingScope::from_parts(PG_LOG_ERRORS, "severity_panic", identity),
-                occurrence(),
+                stderr_observation(),
                 None,
             ))?;
         }
@@ -386,13 +429,13 @@ impl EventLens for PanicShutdownLens {
     }
 }
 
-/// `PG-EVT-004` (`disk_full_log`): a `53100` (disk full) error was logged. High
-/// for the ENOSPC failure, never for the affected mount: this source has no
-/// path-to-device join, and a quota or read-only filesystem can share the code.
+/// Log branch of `OS-FS-027`: a stderr token resembles SQLSTATE `53100`.
+/// It does not identify a mount or distinguish space, inode, quota, or shared
+/// memory exhaustion.
 pub(crate) struct DiskFullLogLens;
 
 impl DiskFullLogLens {
-    const ID: &'static str = "PG-EVT-004";
+    const ID: &'static str = "OS-FS-027";
 }
 
 impl EventLens for DiskFullLogLens {
@@ -413,8 +456,8 @@ impl EventLens for DiskFullLogLens {
     }
 }
 
-/// `PG-EVT-005` (`out_of_memory_log`): a `53200` (out of memory) error was
-/// logged. High for the allocation failure, never for physical RAM exhaustion:
+/// `PG-EVT-005` (`out_of_memory_log`): stderr contains a token resembling
+/// `53200` (out of memory). This does not prove physical RAM exhaustion:
 /// the same code covers allocator, lock-table, and shared-memory limits.
 pub(crate) struct OutOfMemoryLogLens;
 
@@ -440,14 +483,13 @@ impl EventLens for OutOfMemoryLogLens {
     }
 }
 
-/// `PG-EVT-006` (`connection_slots_exhausted`): a `53300` (too many clients)
-/// error was logged. High for the admission failure, never as the cause of a
-/// storm: it is a downstream symptom, and pool or reserved-slot misconfiguration
-/// share the code.
+/// Log branch of `PG-CONN-014`: a stderr token resembles SQLSTATE `53300`.
+/// It is compatible with a rejected connection, not proof of sustained slot
+/// saturation or its cause.
 pub(crate) struct ConnectionSlotsExhaustedLens;
 
 impl ConnectionSlotsExhaustedLens {
-    const ID: &'static str = "PG-EVT-006";
+    const ID: &'static str = "PG-CONN-014";
 }
 
 impl EventLens for ConnectionSlotsExhaustedLens {
@@ -468,8 +510,8 @@ impl EventLens for ConnectionSlotsExhaustedLens {
     }
 }
 
-/// `PG-EVT-007` (`deadlock`): a `40P01` (deadlock detected) error was logged.
-/// High for the logged deadlock fact, never for its cause or the cycle: the row
+/// `PG-EVT-007` (`deadlock`): stderr contains a token resembling `40P01`
+/// (deadlock detected). It does not identify the cause or cycle: the row
 /// is a count by SQLSTATE, so the participating transactions and their order are
 /// not recoverable, and the victim is not necessarily the initiator.
 pub(crate) struct DeadlockLens;
@@ -496,10 +538,9 @@ impl EventLens for DeadlockLens {
     }
 }
 
-/// `PG-EVT-008` (`data_corruption_log`): a `XX001`/`XX002` (data or index
-/// corrupted) checksum or page-validation error was logged. High for the
-/// completed validation failure, never for cluster-wide corruption: the scope is
-/// the block or relation that failed, not the instance.
+/// `PG-EVT-008` (`data_corruption_log`): stderr contains a token resembling
+/// `XX001`/`XX002`. It is not proof of cluster-wide corruption, and `PANIC`,
+/// generic I/O text, and "invalid record length" do not match this lens.
 pub(crate) struct DataCorruptionLogLens;
 
 impl DataCorruptionLogLens {
@@ -553,6 +594,7 @@ pub(crate) struct EventConfig {
     max_lens_evaluations: u64,
     max_findings: u64,
     max_evidence_rows: u64,
+    max_output_bytes: u64,
 }
 
 impl EventConfig {
@@ -562,6 +604,7 @@ impl EventConfig {
             max_lens_evaluations: 10_000,
             max_findings: 50_000,
             max_evidence_rows: 200_000,
+            max_output_bytes: 8 << 20,
         }
     }
 
@@ -571,18 +614,20 @@ impl EventConfig {
         max_lens_evaluations: u64,
         max_findings: u64,
         max_evidence_rows: u64,
+        max_output_bytes: u64,
     ) -> Self {
         Self {
             work_limit,
             max_lens_evaluations,
             max_findings,
             max_evidence_rows,
+            max_output_bytes,
         }
     }
 
     #[cfg(test)]
     const fn for_test() -> Self {
-        Self::with(u64::MAX, u64::MAX, u64::MAX, u64::MAX)
+        Self::with(u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX)
     }
 }
 
@@ -648,10 +693,17 @@ pub(crate) fn evaluate_events(
 
     let mut budget = WorkBudget::new(config.work_limit);
     let mut counts = OutputCounts::new();
-    let limits = OutputLimits::new(config.max_findings, config.max_evidence_rows);
+    let limits = OutputLimits::bounded(
+        config.max_findings,
+        config.max_evidence_rows,
+        config.max_output_bytes,
+    );
     let mut findings = Vec::new();
     let mut skipped = Vec::new();
-    let mut complete = !events.overflow();
+    // The current source proves positive occurrences only. It cannot prove
+    // complete format, rotation, configuration, or byte coverage, so this
+    // branch is never exhaustive even when evaluation itself finishes.
+    let mut complete = false;
     let mut evaluations = 0_u64;
 
     for lens in lenses {
@@ -700,11 +752,11 @@ mod tests {
     use super::*;
 
     fn error(severity: u8, sqlstate: Option<&str>, count: u64) -> LogErrorGroup {
-        LogErrorGroup::new(severity, sqlstate.map(str::to_owned), count)
+        LogErrorGroup::new(100, severity, sqlstate.map(str::to_owned), count)
     }
 
     fn crash(signal: Option<i32>) -> LifecycleEvent {
-        LifecycleEvent::new(LifecycleKind::Crash, signal)
+        LifecycleEvent::new(100, Some(42), LifecycleKind::Crash, signal)
     }
 
     fn inputs_with(errors: Vec<LogErrorGroup>, lifecycle: Vec<LifecycleEvent>) -> LogEventInputs {
@@ -759,80 +811,81 @@ mod tests {
     }
 
     #[test]
-    fn each_event_lens_emits_a_high_coincident_occurrence_fact() {
-        let cases: Vec<(Box<dyn EventLens>, LogEventInputs, &str, &str)> = vec![
+    fn each_event_lens_emits_a_bounded_coincident_occurrence_fact() {
+        let cases: Vec<(Box<dyn EventLens>, LogEventInputs, &str, &str, Confidence)> = vec![
             (
                 Box::new(BackendSigkillLens),
                 inputs_with(Vec::new(), vec![crash(Some(9))]),
                 "PG-EVT-001",
                 "signal",
+                Confidence::MEDIUM,
             ),
             (
                 Box::new(BackendCrashLens),
                 inputs_with(Vec::new(), vec![crash(Some(11))]),
                 "PG-EVT-002",
                 "signal",
+                Confidence::MEDIUM,
             ),
             (
                 Box::new(PanicShutdownLens),
                 inputs_with(vec![error(SEVERITY_PANIC, None, 1)], Vec::new()),
                 "PG-EVT-003",
                 "severity_panic",
+                Confidence::MEDIUM,
             ),
             (
                 Box::new(DiskFullLogLens),
                 inputs_with(vec![error(1, Some("53100"), 2)], Vec::new()),
-                "PG-EVT-004",
+                "OS-FS-027",
                 "sqlstate",
+                Confidence::MEDIUM,
             ),
             (
                 Box::new(OutOfMemoryLogLens),
                 inputs_with(vec![error(1, Some("53200"), 4)], Vec::new()),
                 "PG-EVT-005",
                 "sqlstate",
+                Confidence::MEDIUM,
             ),
             (
                 Box::new(ConnectionSlotsExhaustedLens),
                 inputs_with(vec![error(1, Some("53300"), 7)], Vec::new()),
-                "PG-EVT-006",
+                "PG-CONN-014",
                 "sqlstate",
+                Confidence::MEDIUM,
             ),
             (
                 Box::new(DeadlockLens),
                 inputs_with(vec![error(0, Some("40P01"), 1)], Vec::new()),
                 "PG-EVT-007",
                 "sqlstate",
+                Confidence::MEDIUM,
             ),
             (
                 Box::new(DataCorruptionLogLens),
                 inputs_with(vec![error(0, Some("XX001"), 1)], Vec::new()),
                 "PG-EVT-008",
                 "sqlstate",
+                Confidence::MEDIUM,
             ),
         ];
-        for (lens, events, id, column) in cases {
+        for (lens, events, id, column, confidence) in cases {
             let outcome = run(&events, lens.as_ref());
             assert_eq!(outcome.findings.len(), 1, "{id} emits one fact");
             let finding = &outcome.findings[0];
             assert_eq!(finding.lens_id(), id);
             assert_eq!(
                 finding.confidence(),
-                Confidence::HIGH,
-                "{id} is high for the occurrence"
+                confidence,
+                "{id} respects source evidence quality"
             );
             assert_eq!(
                 finding.role(),
                 Role::Coincident,
                 "{id} stays coincident without proven direction"
             );
-            assert_eq!(
-                finding
-                    .evidence()
-                    .iter()
-                    .map(Evidence::label)
-                    .collect::<Vec<_>>(),
-                vec!["direct"],
-            );
+            assert_eq!(finding.evidence().len(), 1);
             assert_eq!(finding.scope().column(), column);
         }
     }
@@ -845,6 +898,19 @@ mod tests {
         );
         let outcome = run(&events, &DataCorruptionLogLens);
         assert_eq!(outcome.findings.len(), 2, "both corruption codes are facts");
+    }
+
+    #[test]
+    fn panic_and_generic_errors_are_not_corruption_facts() {
+        let events = inputs_with(
+            vec![
+                error(SEVERITY_PANIC, None, 1),
+                error(0, None, 1), // includes messages such as invalid record length
+                error(0, Some("58030"), 1),
+            ],
+            Vec::new(),
+        );
+        assert!(findings(&events, &DataCorruptionLogLens).is_empty());
     }
 
     #[test]
@@ -874,8 +940,8 @@ mod tests {
         let events = inputs_with(
             Vec::new(),
             vec![
-                LifecycleEvent::new(LifecycleKind::Shutdown, Some(9)),
-                LifecycleEvent::new(LifecycleKind::Ready, None),
+                LifecycleEvent::new(100, Some(42), LifecycleKind::Shutdown, Some(9)),
+                LifecycleEvent::new(100, None, LifecycleKind::Ready, None),
             ],
         );
         assert!(
@@ -914,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn the_finding_scope_exposes_only_the_code_and_count() {
+    fn the_finding_scope_exposes_only_the_code_and_observation_time() {
         let events = inputs_with(vec![error(0, Some("40P01"), 3)], Vec::new());
         let outcome = run(&events, &DeadlockLens);
         let identity = outcome.findings[0].scope().identity();
@@ -922,9 +988,9 @@ mod tests {
             identity,
             &[
                 IdentityValue::Text("40P01".to_owned()),
-                IdentityValue::U64(3),
+                IdentityValue::I64(100),
             ],
-            "no sample, statement, user, or address reaches the scope",
+            "no count, sample, statement, user, or address reaches the scope",
         );
     }
 
@@ -949,7 +1015,7 @@ mod tests {
             vec![error(0, Some("40P01"), 1), error(0, Some("40P01"), 2)],
             Vec::new(),
         );
-        let config = EventConfig::with(1_000, 1_000, 1, 1_000);
+        let config = EventConfig::with(1_000, 1_000, 1, 1_000, 1_000_000);
         let outcome = evaluate_events(&events, &[&DeadlockLens], &config).expect("bounded partial");
         assert!(!outcome.complete);
         assert_eq!(outcome.findings.len(), 1);
@@ -960,10 +1026,20 @@ mod tests {
     fn the_work_limit_bounds_the_pass() {
         let events = inputs_with(vec![error(0, Some("40P01"), 1)], Vec::new());
         // One unit admits the lens; charging the scanned rows then fails.
-        let config = EventConfig::with(1, 1_000, 1_000, 1_000);
+        let config = EventConfig::with(1, 1_000, 1_000, 1_000, 1_000_000);
         let outcome = evaluate_events(&events, &[&DeadlockLens], &config).expect("bounded partial");
         assert!(!outcome.complete);
         assert_eq!(outcome.skipped[0].limit.axis, LimitAxis::Work);
+    }
+
+    #[test]
+    fn the_event_output_byte_limit_is_enforced() {
+        let events = inputs_with(vec![error(0, Some("40P01"), 1)], Vec::new());
+        let config = EventConfig::with(1_000, 1_000, 1_000, 1_000, 1);
+        let outcome = evaluate_events(&events, &[&DeadlockLens], &config).expect("bounded partial");
+        assert!(!outcome.complete);
+        assert!(outcome.findings.is_empty());
+        assert_eq!(outcome.skipped[0].limit.axis, LimitAxis::OutputBytes);
     }
 
     #[test]
@@ -988,9 +1064,9 @@ mod tests {
                 "PG-EVT-001",
                 "PG-EVT-002",
                 "PG-EVT-003",
-                "PG-EVT-004",
+                "OS-FS-027",
                 "PG-EVT-005",
-                "PG-EVT-006",
+                "PG-CONN-014",
                 "PG-EVT-007",
                 "PG-EVT-008",
             ]
@@ -1016,6 +1092,6 @@ mod tests {
             vec!["PG-EVT-001", "PG-EVT-003", "PG-EVT-007"],
             "sigkill, panic, and deadlock each fire once; nothing else matches",
         );
-        assert!(outcome.complete);
+        assert!(!outcome.complete, "stderr coverage is never exhaustive");
     }
 }

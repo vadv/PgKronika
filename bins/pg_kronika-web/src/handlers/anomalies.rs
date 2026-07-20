@@ -306,6 +306,11 @@ fn scan_one_section(
                 "the period exceeds the {max_cells}-cell materialization limit; narrow it"
             )));
         }
+        Err(QueryError::MaterializedBytesTooLarge { max_bytes }) => {
+            return Ok(Err(format!(
+                "the period exceeds the {max_bytes}-byte materialization limit; narrow it"
+            )));
+        }
         Err(err) => return Err(query_error_response(&err)),
     };
     if page.next_cursor.is_some() {

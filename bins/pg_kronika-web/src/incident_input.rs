@@ -62,6 +62,7 @@ pub(crate) struct InputLimits {
     units: usize,
     sections: usize,
     materialized_cells: usize,
+    materialized_bytes: usize,
     series_points: usize,
     typed_gauge_points: usize,
     identity_bytes: usize,
@@ -80,6 +81,7 @@ impl InputLimits {
             units: 4_096,
             sections: 64,
             materialized_cells: 2_000_000,
+            materialized_bytes: 32 * 1024 * 1024,
             series_points: 500_000,
             typed_gauge_points: 500_000,
             identity_bytes: 1 << 20,
@@ -102,6 +104,7 @@ impl InputLimits {
             units: 4_096,
             sections: 64,
             materialized_cells: 1_000_000,
+            materialized_bytes: 32 * 1024 * 1024,
             series_points: 1_000_000,
             typed_gauge_points: 1_000_000,
             identity_bytes: 1 << 20,
@@ -183,6 +186,8 @@ pub(crate) enum SkipReason {
     SeriesPointLimit { observed: usize, limit: usize },
     /// Retaining gauge evidence would exceed its independent point cap.
     TypedGaugePointLimit { observed: usize, limit: usize },
+    /// A complete activity or lock snapshot set would exceed its row/edge cap.
+    SnapshotRowLimit { observed: usize, limit: usize },
 }
 
 /// Owned engine input, coverage, and exclusion counters.
@@ -280,13 +285,15 @@ pub(crate) fn prepare_input(
 
 const PG_LOG_ERRORS: &str = "pg_log_errors";
 const PG_LOG_LIFECYCLE: &str = "pg_log_lifecycle";
+const PG_LOG_GAP: &str = "pg_log_gap";
 
 /// Extract bounded, typed log events from the already-materialized log-section
 /// pages, alongside — never through — the numeric series path.
 ///
 /// A section that was skipped or not read is `NotCollected`, so a lens never
-/// reads its silence as health. Grouped errors are summed per `(severity,
-/// sqlstate)`; lifecycle records stay per-event, since each is one occurrence.
+/// reads its silence as health. Stored groups stay separate because their
+/// timestamps belong to one collector batch and cannot support a request-wide
+/// count or historical merge.
 fn build_log_events(
     pages: &BTreeMap<String, SectionPage>,
     skipped: &[SectionSkip],
@@ -295,6 +302,13 @@ fn build_log_events(
     let mut events = LogEventInputs::new(limits);
     ingest_log_errors(pages.get(PG_LOG_ERRORS), skipped, &mut events);
     ingest_log_lifecycle(pages.get(PG_LOG_LIFECYCLE), skipped, &mut events);
+    if pages
+        .get(PG_LOG_GAP)
+        .is_some_and(|page| !page.rows.is_empty() || !page.gaps.is_empty())
+    {
+        events.set_coverage(PG_LOG_ERRORS, LogCoverage::Gap);
+        events.set_coverage(PG_LOG_LIFECYCLE, LogCoverage::Gap);
+    }
     events
 }
 
@@ -318,18 +332,20 @@ fn ingest_log_errors(
         events.set_coverage(PG_LOG_ERRORS, LogCoverage::NotCollected);
         return;
     };
-    let mut totals: BTreeMap<(u8, Option<String>), u64> = BTreeMap::new();
     for row in &page.rows {
-        let (Some(severity), Some(count)) = (read_u8(row, "severity"), read_u64(row, "count"))
-        else {
+        let (Some(ts), Some(severity), Some(count)) = (
+            read_ts(row, "ts"),
+            read_u8(row, "severity"),
+            read_u64(row, "count"),
+        ) else {
             continue;
         };
-        let key = (severity, read_str(row, "sqlstate"));
-        let entry = totals.entry(key).or_insert(0);
-        *entry = entry.saturating_add(count);
-    }
-    for ((severity, sqlstate), count) in totals {
-        if !events.push_error(LogErrorGroup::new(severity, sqlstate, count)) {
+        if !events.push_error(LogErrorGroup::new(
+            ts,
+            severity,
+            read_str(row, "sqlstate"),
+            count,
+        )) {
             break;
         }
     }
@@ -347,10 +363,18 @@ fn ingest_log_lifecycle(
         return;
     };
     for row in &page.rows {
-        let Some(kind) = read_u8(row, "kind").and_then(lifecycle_kind) else {
+        let (Some(ts), Some(kind)) = (
+            read_ts(row, "ts"),
+            read_u8(row, "kind").and_then(lifecycle_kind),
+        ) else {
             continue;
         };
-        if !events.push_lifecycle(LifecycleEvent::new(kind, read_i32(row, "signal"))) {
+        if !events.push_lifecycle(LifecycleEvent::new(
+            ts,
+            read_i64(row, "pid"),
+            kind,
+            read_i32(row, "signal"),
+        )) {
             break;
         }
     }
@@ -386,6 +410,21 @@ fn read_i32(row: &OutRow, name: &str) -> Option<i32> {
     match row_value(row, name)? {
         Value::I64(value) => i32::try_from(*value).ok(),
         Value::U64(value) => i32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn read_i64(row: &OutRow, name: &str) -> Option<i64> {
+    match row_value(row, name)? {
+        Value::I64(value) => Some(*value),
+        Value::U64(value) => i64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn read_ts(row: &OutRow, name: &str) -> Option<i64> {
+    match row_value(row, name)? {
+        Value::Ts(value) => Some(*value),
         _ => None,
     }
 }
@@ -453,7 +492,7 @@ fn read_input_pages(
         metadata_from,
         scan.to,
         None,
-        QueryLimits::new(DIFF_MAX_ROWS, remaining_cells),
+        QueryLimits::with_bytes(DIFF_MAX_ROWS, remaining_cells, limits.materialized_bytes),
     )
     .map_err(|err| map_query_error(err, limits.materialized_cells))?;
     charge_materialized_cells(
@@ -470,7 +509,7 @@ fn read_input_pages(
         scan.to,
         &read_names,
         &BTreeMap::new(),
-        QueryLimits::new(DIFF_MAX_ROWS, remaining_cells),
+        QueryLimits::with_bytes(DIFF_MAX_ROWS, remaining_cells, limits.materialized_bytes),
     );
     let (pages, skipped) = match batch {
         Ok(pages) => (pages, Vec::new()),
@@ -481,7 +520,13 @@ fn read_input_pages(
             &read_names,
             remaining_cells,
             limits.materialized_cells,
+            limits.materialized_bytes,
         )?,
+        Err(QueryError::MaterializedBytesTooLarge { .. }) => {
+            return Err(InputError::MaterializationLimit {
+                limit: limits.materialized_bytes,
+            });
+        }
         Err(error) => return Err(InputError::Read(error)),
     };
 
@@ -500,9 +545,11 @@ fn read_partial_pages(
     names: &[&str],
     mut remaining_cells: usize,
     materialization_limit: usize,
+    materialized_byte_limit: usize,
 ) -> Result<(BTreeMap<String, SectionPage>, Vec<SectionSkip>), InputError> {
     let mut pages = BTreeMap::new();
     let mut skipped = Vec::new();
+    let per_section_bytes = materialized_byte_limit / names.len().max(1);
     for &name in names {
         if remaining_cells == 0 {
             skipped.push(materialization_skip(name, materialization_limit)?);
@@ -515,13 +562,15 @@ fn read_partial_pages(
             scan.from,
             scan.to,
             None,
-            QueryLimits::new(DIFF_MAX_ROWS, remaining_cells),
+            QueryLimits::with_bytes(DIFF_MAX_ROWS, remaining_cells, per_section_bytes),
         ) {
             Ok(page) => {
                 charge_materialized_cells(&page, &mut remaining_cells, materialization_limit)?;
                 pages.insert(name.to_owned(), page);
             }
-            Err(QueryError::ResultTooLarge { .. }) => {
+            Err(
+                QueryError::ResultTooLarge { .. } | QueryError::MaterializedBytesTooLarge { .. },
+            ) => {
                 skipped.push(materialization_skip(name, materialization_limit)?);
                 remaining_cells = 0;
             }
@@ -607,6 +656,14 @@ impl BuildState {
             return Ok(());
         }
         self.record_page_state(logical.name, &page);
+
+        // Log rows contain deliberately retained diagnostic text. They feed only
+        // the typed event adapter below; admitting them to generic anomaly
+        // identities could expose patterns, statements, users, or addresses in
+        // incident keys and JSON.
+        if logical.name.starts_with("pg_log_") {
+            return Ok(());
+        }
 
         let identity = logical.diff_key();
         let (cumulative, gauges) = scorable_columns(logical);
@@ -821,22 +878,32 @@ impl BuildState {
     fn retain_snapshots(&mut self, section: &'static str, rows: &[OutRow]) {
         match section {
             PG_STAT_ACTIVITY => {
-                let snapshots = build_activity_snapshots(rows);
-                let observed = snapshots.iter().map(|snap| snap.backends.len()).sum();
-                if self.withhold_snapshots(observed) {
+                let observed = rows
+                    .iter()
+                    .filter(|row| matches!(row_value(row, "ts"), Some(Value::Ts(_))))
+                    .count();
+                if self.withhold_snapshots(section, observed) {
                     return;
                 }
-                for snapshot in snapshots {
+                for snapshot in build_activity_snapshots(rows) {
                     self.typed.insert_activity_snapshot(snapshot);
                 }
             }
             PG_LOCKS => {
-                let snapshots = build_lock_snapshots(rows);
-                let observed = snapshots.iter().map(|snap| snap.edges.len()).sum();
-                if self.withhold_snapshots(observed) {
+                let observed = rows
+                    .iter()
+                    .try_fold(0_usize, |total, row| {
+                        let edges = match row_value(row, "blocked_by") {
+                            Some(Value::ListI32(blockers)) => blockers.len(),
+                            _ => 0,
+                        };
+                        total.checked_add(edges)
+                    })
+                    .unwrap_or(usize::MAX);
+                if self.withhold_snapshots(section, observed) {
                     return;
                 }
-                for snapshot in snapshots {
+                for snapshot in build_lock_snapshots(rows) {
                     self.typed.insert_lock_snapshot(snapshot);
                 }
             }
@@ -847,12 +914,19 @@ impl BuildState {
     /// Charge `observed` snapshot rows against the request ceiling. Returns
     /// `true` when the section does not fit and must be withheld whole; the
     /// withheld rows are counted so the response reports the incompleteness.
-    fn withhold_snapshots(&mut self, observed: usize) -> bool {
+    fn withhold_snapshots(&mut self, section: &'static str, observed: usize) -> bool {
         if observed > self.remaining_snapshot_rows {
             self.quality.snapshot_rows_withheld = self
                 .quality
                 .snapshot_rows_withheld
                 .saturating_add(u64::try_from(observed).unwrap_or(u64::MAX));
+            self.skipped.push(SectionSkip {
+                section,
+                reason: SkipReason::SnapshotRowLimit {
+                    observed,
+                    limit: self.remaining_snapshot_rows,
+                },
+            });
             return true;
         }
         self.remaining_snapshot_rows -= observed;
@@ -911,7 +985,20 @@ fn str_value(row: &OutRow, name: &str) -> Option<Box<str>> {
 /// `blocked_by`) contributes no edge, so a snapshot with no contention is
 /// simply absent.
 fn build_lock_snapshots(rows: &[OutRow]) -> Vec<LockSnapshot> {
-    let mut by_ts: BTreeMap<i64, Vec<LockEdge>> = BTreeMap::new();
+    let mut pids_by_ts: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    for row in rows {
+        let (Some(Value::Ts(ts)), Some(Value::I64(pid))) =
+            (row_value(row, "ts"), row_value(row, "pid"))
+        else {
+            continue;
+        };
+        if *pid > 0 {
+            pids_by_ts.entry(*ts).or_default().insert(*pid);
+        }
+    }
+
+    let mut by_ts: BTreeMap<i64, BTreeSet<LockEdge>> = BTreeMap::new();
+    let mut invalid_ts = BTreeSet::new();
     for row in rows {
         let Some(Value::Ts(ts)) = row_value(row, "ts") else {
             continue;
@@ -927,15 +1014,31 @@ fn build_lock_snapshots(rows: &[OutRow]) -> Vec<LockSnapshot> {
         }
         let edges = by_ts.entry(*ts).or_default();
         for &blocker in blockers {
-            edges.push(LockEdge {
+            let blocker = i64::from(blocker);
+            if *waiter <= 0
+                || blocker < 0
+                || blocker == *waiter
+                || (blocker != 0
+                    && !pids_by_ts
+                        .get(ts)
+                        .is_some_and(|pids| pids.contains(&blocker)))
+            {
+                invalid_ts.insert(*ts);
+                continue;
+            }
+            edges.insert(LockEdge {
                 waiter_pid: *waiter,
-                blocker_pid: i64::from(blocker),
+                blocker_pid: blocker,
             });
         }
     }
     by_ts
         .into_iter()
-        .map(|(ts, edges)| LockSnapshot { ts, edges })
+        .filter(|(ts, _)| !invalid_ts.contains(ts))
+        .map(|(ts, edges)| LockSnapshot {
+            ts,
+            edges: edges.into_iter().collect(),
+        })
         .collect()
 }
 
@@ -997,9 +1100,11 @@ pub(crate) fn scan_position_count(scan: &ScanParams) -> Option<usize> {
 
 fn map_query_error(error: QueryError, materialization_limit: usize) -> InputError {
     match error {
-        QueryError::ResultTooLarge { .. } => InputError::MaterializationLimit {
-            limit: materialization_limit,
-        },
+        QueryError::ResultTooLarge { .. } | QueryError::MaterializedBytesTooLarge { .. } => {
+            InputError::MaterializationLimit {
+                limit: materialization_limit,
+            }
+        }
         other => InputError::Read(other),
     }
 }
@@ -2370,11 +2475,11 @@ mod tests {
             vec![
                 LockEdge {
                     waiter_pid: 20,
-                    blocker_pid: 10,
+                    blocker_pid: 0,
                 },
                 LockEdge {
                     waiter_pid: 20,
-                    blocker_pid: 0,
+                    blocker_pid: 10,
                 },
             ]
         );
@@ -2434,9 +2539,30 @@ mod tests {
     fn lock_edges_are_charged_against_the_row_ceiling() {
         let mut state = build_state(1);
         // One waiter blocked by two holders is two edges, over the ceiling of one.
-        state.retain_snapshots("pg_locks", &[lock_row(100, 20, vec![10, 30])]);
+        state.retain_snapshots(
+            "pg_locks",
+            &[
+                lock_row(100, 10, vec![]),
+                lock_row(100, 30, vec![]),
+                lock_row(100, 20, vec![10, 30]),
+            ],
+        );
         assert_eq!(state.quality.snapshot_rows_withheld, 2);
         assert_eq!(state.typed.lock_window(i64::MIN, i64::MAX).count(), 0);
+    }
+
+    #[test]
+    fn lock_snapshot_with_missing_or_self_endpoint_is_withheld() {
+        assert!(build_lock_snapshots(&[lock_row(100, 20, vec![10])]).is_empty());
+        assert!(build_lock_snapshots(&[lock_row(100, 20, vec![20])]).is_empty());
+    }
+
+    #[test]
+    fn duplicate_lock_edges_are_deduplicated_deterministically() {
+        let snapshots =
+            build_lock_snapshots(&[lock_row(100, 10, vec![]), lock_row(100, 20, vec![10, 10])]);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].edges.len(), 1);
     }
 
     fn error_row(severity: u64, sqlstate: Option<&str>, count: u64) -> OutRow {
@@ -2521,7 +2647,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_aggregate_by_severity_and_sqlstate_with_unknown_coverage() {
+    fn error_groups_keep_batch_boundaries_and_unknown_coverage() {
         let page = log_page(
             "pg_log_errors",
             vec![
@@ -2539,15 +2665,20 @@ mod tests {
             "a clean read is unknown, never proven-complete",
         );
         let facts = event_findings(&events);
+        assert_eq!(
+            facts.iter().filter(|(id, _)| id == "PG-EVT-007").count(),
+            2,
+            "stored groups are not merged into a request-wide historical count: {facts:?}",
+        );
         assert!(
-            facts.contains(&(
-                "PG-EVT-007".to_owned(),
-                vec![
-                    IdentityValue::Text("40P01".to_owned()),
-                    IdentityValue::U64(5),
-                ],
-            )),
-            "the two deadlock rows aggregate into one count-5 fact: {facts:?}",
+            facts
+                .iter()
+                .filter(|(id, _)| id == "PG-EVT-007")
+                .all(|(_, identity)| identity
+                    == &vec![
+                        IdentityValue::Text("40P01".to_owned()),
+                        IdentityValue::I64(0),
+                    ])
         );
         assert!(
             facts.iter().any(|(id, _)| id == "PG-EVT-003"),
@@ -2621,5 +2752,45 @@ mod tests {
             events.coverage().get("pg_log_errors"),
             Some(&LogCoverage::Gap),
         );
+    }
+
+    #[test]
+    fn sensitive_log_text_never_enters_generic_incident_identity() {
+        let secret = "select * from users where password='hunter2' -- 10.0.0.7 /var/lib/postgresql appdb alice";
+        let mut row = error_row(0, Some("40P01"), 1);
+        row.push(("pattern".to_owned(), Value::Str(secret.to_owned())));
+        row.push(("sample".to_owned(), Value::Str(secret.to_owned())));
+        row.push(("statement".to_owned(), Value::Str(secret.to_owned())));
+        row.push(("database".to_owned(), Value::Str("appdb".to_owned())));
+        row.push(("user".to_owned(), Value::Str("alice".to_owned())));
+        let page = log_page(PG_LOG_ERRORS, vec![row]);
+        let logical = logical_section(PG_LOG_ERRORS).expect("registered log section");
+        let limits = InputLimits::for_test();
+        let mut state = BuildState::new(&limits, limits.identity_bytes, Vec::new());
+        let gates = Gates::from_pages(std::slice::from_ref(&logical), &BTreeMap::new());
+        let scan = ScanParams {
+            from: 0,
+            to: 10,
+            window: 5,
+            step: 1,
+            threshold: 3.5,
+            eps_rel: 0.05,
+        };
+        state
+            .process(&logical, page.clone(), &gates, &scan, &limits)
+            .expect("typed log section is accepted");
+        assert!(
+            state.episodes.is_empty(),
+            "log patterns never form episode keys"
+        );
+        assert_eq!(state.quality.evaluated_positions, 0);
+
+        let mut pages = BTreeMap::new();
+        pages.insert(PG_LOG_ERRORS.to_owned(), page);
+        let events = build_log_events(&pages, &[], EventInputLimits::production());
+        let rendered = format!("{:?}", event_findings(&events));
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("10.0.0.7"));
     }
 }

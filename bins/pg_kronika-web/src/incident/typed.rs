@@ -462,7 +462,7 @@ pub(crate) struct ActivitySnapshot {
 /// One directed blocking edge from a `pg_locks` snapshot: `waiter_pid` waits on
 /// `blocker_pid`. A `blocker_pid` of `0` is a prepared-transaction holder with
 /// no live backend (`pg_blocking_pids` reports it as `0`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LockEdge {
     pub waiter_pid: i64,
     pub blocker_pid: i64,
@@ -791,7 +791,7 @@ impl TypedInputs {
         self.locks.push(snapshot);
     }
 
-    /// Activity snapshots whose collection time lies inside `[from_us, to_us]`.
+    /// Activity snapshots whose collection time lies inside `[from_us, to_us)`.
     pub(crate) fn activity_window(
         &self,
         from_us: i64,
@@ -799,10 +799,10 @@ impl TypedInputs {
     ) -> impl Iterator<Item = &ActivitySnapshot> {
         self.activity
             .iter()
-            .filter(move |snapshot| (from_us..=to_us).contains(&snapshot.ts))
+            .filter(move |snapshot| (from_us..to_us).contains(&snapshot.ts))
     }
 
-    /// Lock snapshots whose collection time lies inside `[from_us, to_us]`.
+    /// Lock snapshots whose collection time lies inside `[from_us, to_us)`.
     pub(crate) fn lock_window(
         &self,
         from_us: i64,
@@ -810,7 +810,7 @@ impl TypedInputs {
     ) -> impl Iterator<Item = &LockSnapshot> {
         self.locks
             .iter()
-            .filter(move |snapshot| (from_us..=to_us).contains(&snapshot.ts))
+            .filter(move |snapshot| (from_us..to_us).contains(&snapshot.ts))
     }
 }
 
@@ -1302,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_window_keeps_only_snapshots_inside_the_inclusive_bounds() {
+    fn activity_window_uses_half_open_request_bounds() {
         let mut typed = TypedInputs::new();
         typed.insert_activity_snapshot(activity_at(5, "before"));
         typed.insert_activity_snapshot(activity_at(10, "start"));
@@ -1314,7 +1314,7 @@ mod tests {
             .activity_window(10, 20)
             .map(|snapshot| snapshot.backends[0].state.as_deref().expect("state"))
             .collect();
-        assert_eq!(states, ["start", "inside", "end"], "bounds are inclusive");
+        assert_eq!(states, ["start", "inside"], "the end bound is excluded");
     }
 
     #[test]
