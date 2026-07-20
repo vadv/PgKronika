@@ -1,6 +1,6 @@
 //! BDD runner for Docker-only integration scenarios.
 //!
-//! Nix supplies `PostgreSQL` versions through `KRONIKA_PG_MATRIX`. Host
+//! Nix supplies the `PostgreSQL` 15–18 matrix through `KRONIKA_PG_MATRIX`. Host
 //! `cargo test --workspace` stays database-free.
 #![allow(
     clippy::trivial_regex,
