@@ -188,6 +188,8 @@ pub(crate) enum SkipReason {
     TypedGaugePointLimit { observed: usize, limit: usize },
     /// A complete activity or lock snapshot set would exceed its row/edge cap.
     SnapshotRowLimit { observed: usize, limit: usize },
+    /// Snapshot rows were present but did not form one complete edge set.
+    IncompleteSnapshot,
 }
 
 /// Owned engine input, coverage, and exclusion counters.
@@ -242,7 +244,14 @@ pub(crate) fn prepare_input(
             limit: limits.units,
         });
     }
-    let input = read_input_pages(snap, source, scan, sections, limits)?;
+    let mut input = read_input_pages(snap, source, scan, sections, limits)?;
+    let log_events = build_log_events(
+        &input.pages,
+        &input.skipped,
+        EventInputLimits::production(),
+        scan.from,
+        scan.to,
+    );
     let mut remaining_identity_bytes = limits.identity_bytes;
     let node_self_id = load_node_identity(
         &input.metadata,
@@ -252,7 +261,7 @@ pub(crate) fn prepare_input(
     let gates = Gates::from_pages(&input.logicals, &input.pages);
     let mut state = BuildState::new(limits, remaining_identity_bytes, input.skipped);
     for logical in &input.logicals {
-        let Some(page) = input.pages.get(logical.name).cloned() else {
+        let Some(page) = input.pages.remove(logical.name) else {
             if state
                 .skipped
                 .iter()
@@ -266,14 +275,6 @@ pub(crate) fn prepare_input(
         };
         state.process(logical, page, &gates, scan, limits)?;
     }
-
-    let log_events = build_log_events(
-        &input.pages,
-        &state.skipped,
-        EventInputLimits::production(),
-        scan.from,
-        scan.to,
-    );
 
     Ok(PreparedInput {
         source_id: source,
@@ -629,6 +630,7 @@ struct BuildState {
     remaining_identity_bytes: usize,
     remaining_scan: usize,
     remaining_snapshot_rows: usize,
+    snapshot_row_limit: usize,
     remaining_typed_gauge_points: usize,
     capability_by_section: BTreeMap<&'static str, CapabilityInputState>,
 }
@@ -649,6 +651,7 @@ impl BuildState {
             remaining_identity_bytes,
             remaining_scan: limits.score_work,
             remaining_snapshot_rows: limits.snapshot_rows,
+            snapshot_row_limit: limits.snapshot_rows,
             remaining_typed_gauge_points: limits.typed_gauge_points,
             capability_by_section: BTreeMap::new(),
         }
@@ -955,7 +958,17 @@ impl BuildState {
                 if self.withhold_snapshots(section, observed) {
                     return;
                 }
-                for snapshot in build_lock_snapshots(rows) {
+                let snapshots = build_lock_snapshots(rows);
+                if observed > 0 && snapshots.is_empty() {
+                    self.capability_by_section
+                        .insert(section, CapabilityInputState::Partial);
+                    self.skipped.push(SectionSkip {
+                        section,
+                        reason: SkipReason::IncompleteSnapshot,
+                    });
+                    return;
+                }
+                for snapshot in snapshots {
                     self.typed.insert_lock_snapshot(snapshot);
                 }
             }
@@ -975,8 +988,11 @@ impl BuildState {
             self.skipped.push(SectionSkip {
                 section,
                 reason: SkipReason::SnapshotRowLimit {
-                    observed,
-                    limit: self.remaining_snapshot_rows,
+                    observed: self
+                        .snapshot_row_limit
+                        .saturating_sub(self.remaining_snapshot_rows)
+                        .saturating_add(observed),
+                    limit: self.snapshot_row_limit,
                 },
             });
             return true;
@@ -1084,9 +1100,11 @@ fn build_lock_snapshots(rows: &[OutRow]) -> Vec<LockSnapshot> {
             });
         }
     }
+    if !invalid_ts.is_empty() {
+        return Vec::new();
+    }
     by_ts
         .into_iter()
-        .filter(|(ts, _)| !invalid_ts.contains(ts))
         .map(|(ts, edges)| LockSnapshot {
             ts,
             edges: edges.into_iter().collect(),
@@ -1096,6 +1114,7 @@ fn build_lock_snapshots(rows: &[OutRow]) -> Vec<LockSnapshot> {
 
 fn capability_state(section: &'static str, rows: &[OutRow]) -> Option<CapabilityInputState> {
     let empty_state = match section {
+        PG_LOCKS => CapabilityInputState::NotCollected,
         "pg_vacuum_observation" | "pg_replication_physical" | "pg_replication_slot_retention" => {
             CapabilityInputState::Available
         }
@@ -1106,6 +1125,9 @@ fn capability_state(section: &'static str, rows: &[OutRow]) -> Option<Capability
     };
     if rows.is_empty() {
         return Some(empty_state);
+    }
+    if section == PG_LOCKS {
+        return Some(CapabilityInputState::Available);
     }
     if matches!(section, "pg_storage_mount" | "pg_process_cgroup_memory") {
         let all_verified = rows.iter().all(|row| {
@@ -2581,6 +2603,18 @@ mod tests {
         assert!(
             build_lock_snapshots(&rows).is_empty(),
             "only roots means no contention and no snapshot"
+        );
+    }
+
+    #[test]
+    fn empty_lock_page_is_not_claimed_as_complete_collection() {
+        assert_eq!(
+            capability_state(PG_LOCKS, &[]),
+            Some(CapabilityInputState::NotCollected)
+        );
+        assert_eq!(
+            capability_state(PG_LOCKS, &[lock_row(100, 10, vec![])]),
+            Some(CapabilityInputState::Available)
         );
     }
 

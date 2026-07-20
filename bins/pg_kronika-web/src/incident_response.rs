@@ -287,6 +287,7 @@ fn identity_to_json(value: &IdentityValue) -> Value {
 }
 
 const CONTRACT_CAPABILITIES: &[(&str, &str)] = &[
+    ("PG-LOCK-012", "pg_locks"),
     ("PG-VACUUM-005", "pg_vacuum_observation"),
     ("PG-FREEZE-006", "pg_freeze_horizon"),
     ("PG-REPL-015", "pg_replication_physical"),
@@ -381,6 +382,7 @@ const fn skip_reason_label(reason: SkipReason) -> &'static str {
         SkipReason::SeriesPointLimit { .. } => "series_point_limit",
         SkipReason::TypedGaugePointLimit { .. } => "typed_gauge_point_limit",
         SkipReason::SnapshotRowLimit { .. } => "snapshot_row_limit",
+        SkipReason::IncompleteSnapshot => "incomplete_snapshot",
     }
 }
 
@@ -501,6 +503,7 @@ fn section_skip_to_json(skip: &SectionSkip) -> Value {
         SkipReason::SnapshotRowLimit { observed, limit } => {
             json!({ "kind": "snapshot_row_limit", "observed": observed, "limit": limit })
         }
+        SkipReason::IncompleteSnapshot => json!({ "kind": "incomplete_snapshot" }),
     };
     json!({ "section": skip.section, "reason": reason })
 }
