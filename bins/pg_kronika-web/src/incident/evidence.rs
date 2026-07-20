@@ -74,18 +74,76 @@ pub(crate) struct DirectEvidence {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum DirectEvidenceKind {
-    SampledLockEdge,
+    SampledLockEdge(SampledLockEdge),
     ResourceLimitEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LockParticipant {
+    Blocker,
+    Waiter,
+}
+
+impl LockParticipant {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Blocker => "blocker",
+            Self::Waiter => "waiter",
+        }
+    }
+
+    const fn proves_role(self, requested_role: Role) -> bool {
+        matches!(
+            (self, requested_role),
+            (Self::Blocker, Role::Lead) | (Self::Waiter, Role::Downstream)
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SampledLockEdge {
+    observed_at_us: i64,
+    waiter_pid: i64,
+    blocker_pid: i64,
+    participant: LockParticipant,
+}
+
+impl SampledLockEdge {
+    pub(crate) const fn observed_at_us(&self) -> i64 {
+        self.observed_at_us
+    }
+
+    pub(crate) const fn waiter_pid(&self) -> i64 {
+        self.waiter_pid
+    }
+
+    pub(crate) const fn blocker_pid(&self) -> i64 {
+        self.blocker_pid
+    }
+
+    pub(crate) const fn participant(&self) -> LockParticipant {
+        self.participant
+    }
 }
 
 impl DirectEvidence {
     /// A sampled `pg_locks` blocking edge: `blocked_by` names a process that
     /// prevented the waiter from acquiring the lock. It can be a queue
-    /// predecessor rather than a lock holder. This proves a structural
-    /// direction, so a lock lens may lead or trail and reach high confidence.
-    pub(crate) const fn sampled_lock_edge() -> Self {
+    /// predecessor rather than a lock holder. This proves the sampled edge's
+    /// direction; the lens still controls the confidence ceiling.
+    pub(crate) const fn sampled_lock_edge(
+        observed_at_us: i64,
+        waiter_pid: i64,
+        blocker_pid: i64,
+        participant: LockParticipant,
+    ) -> Self {
         Self {
-            kind: DirectEvidenceKind::SampledLockEdge,
+            kind: DirectEvidenceKind::SampledLockEdge(SampledLockEdge {
+                observed_at_us,
+                waiter_pid,
+                blocker_pid,
+                participant,
+            }),
         }
     }
 
@@ -96,8 +154,20 @@ impl DirectEvidence {
         }
     }
 
-    const fn proves_structural_direction(&self) -> bool {
-        matches!(self.kind, DirectEvidenceKind::SampledLockEdge)
+    const fn proves_structural_direction(&self, requested_role: Role) -> bool {
+        match &self.kind {
+            DirectEvidenceKind::SampledLockEdge(edge) => {
+                edge.participant.proves_role(requested_role)
+            }
+            DirectEvidenceKind::ResourceLimitEvent => false,
+        }
+    }
+
+    pub(crate) const fn lock_edge(&self) -> Option<&SampledLockEdge> {
+        match &self.kind {
+            DirectEvidenceKind::SampledLockEdge(edge) => Some(edge),
+            DirectEvidenceKind::ResourceLimitEvent => None,
+        }
     }
 }
 
@@ -151,6 +221,12 @@ pub(crate) enum GaugeUnit {
     Milliseconds,
     Ratio,
     BytesPerSecond,
+    MicrosecondsPerSecond,
+    MillisecondsPerRead,
+    MillisecondsPerCall,
+    MillisecondsPerOperation,
+    RowsPerCall,
+    BlocksPerCall,
 }
 
 impl GaugeUnit {
@@ -163,6 +239,12 @@ impl GaugeUnit {
             Self::Milliseconds => "milliseconds",
             Self::Ratio => "ratio",
             Self::BytesPerSecond => "bytes_per_second",
+            Self::MicrosecondsPerSecond => "microseconds_per_second",
+            Self::MillisecondsPerRead => "milliseconds_per_read",
+            Self::MillisecondsPerCall => "milliseconds_per_call",
+            Self::MillisecondsPerOperation => "milliseconds_per_operation",
+            Self::RowsPerCall => "rows_per_call",
+            Self::BlocksPerCall => "blocks_per_call",
         }
     }
 }
@@ -170,6 +252,7 @@ impl GaugeUnit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ThresholdKind {
     AtLeast,
+    Above,
     Below,
 }
 
@@ -177,6 +260,7 @@ impl ThresholdKind {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::AtLeast => "at_least",
+            Self::Above => "above",
             Self::Below => "below",
         }
     }
@@ -184,13 +268,20 @@ impl ThresholdKind {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum GaugeMeasurement {
-    Value(FiniteValue),
+    Value {
+        operand: &'static str,
+        value: FiniteValue,
+    },
     Ratio {
+        numerator_name: &'static str,
         numerator: FiniteValue,
+        numerator_unit: GaugeUnit,
+        denominator_name: &'static str,
         denominator: FiniteValue,
-        operand_unit: GaugeUnit,
+        denominator_unit: GaugeUnit,
     },
     Trend {
+        operand: &'static str,
         first: FiniteValue,
         last: FiniteValue,
         elapsed_us: u64,
@@ -200,12 +291,17 @@ pub(crate) enum GaugeMeasurement {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GaugeRatio {
+    numerator_name: &'static str,
     numerator: f64,
+    numerator_unit: GaugeUnit,
+    denominator_name: &'static str,
     denominator: f64,
-    operand_unit: GaugeUnit,
+    denominator_unit: GaugeUnit,
+    result_unit: GaugeUnit,
 }
 
 pub(crate) struct GaugeTrendInput {
+    pub operand: &'static str,
     pub first: f64,
     pub last: f64,
     pub operand_unit: GaugeUnit,
@@ -217,12 +313,53 @@ pub(crate) struct GaugeTrendInput {
     pub entity: GaugeEntity,
 }
 
+pub(crate) struct GaugeValueInput {
+    pub operand: &'static str,
+    pub value: f64,
+    pub unit: GaugeUnit,
+    pub threshold: f64,
+    pub threshold_kind: ThresholdKind,
+    pub observed_at_us: i64,
+    pub samples: usize,
+    pub entity: GaugeEntity,
+}
+
 impl GaugeRatio {
-    pub(crate) const fn new(numerator: f64, denominator: f64, operand_unit: GaugeUnit) -> Self {
+    pub(crate) const fn new(
+        numerator_name: &'static str,
+        numerator: f64,
+        denominator_name: &'static str,
+        denominator: f64,
+        operand_unit: GaugeUnit,
+    ) -> Self {
         Self {
+            numerator_name,
             numerator,
+            numerator_unit: operand_unit,
+            denominator_name,
             denominator,
-            operand_unit,
+            denominator_unit: operand_unit,
+            result_unit: GaugeUnit::Ratio,
+        }
+    }
+
+    pub(crate) const fn with_units(
+        numerator_name: &'static str,
+        numerator: f64,
+        numerator_unit: GaugeUnit,
+        denominator_name: &'static str,
+        denominator: f64,
+        denominator_unit: GaugeUnit,
+        result_unit: GaugeUnit,
+    ) -> Self {
+        Self {
+            numerator_name,
+            numerator,
+            numerator_unit,
+            denominator_name,
+            denominator,
+            denominator_unit,
+            result_unit,
         }
     }
 }
@@ -259,19 +396,24 @@ pub(crate) struct GaugeEvidence {
 }
 
 impl GaugeEvidence {
-    pub(crate) fn value(
-        value: f64,
-        unit: GaugeUnit,
-        threshold: f64,
-        threshold_kind: ThresholdKind,
-        observed_at_us: i64,
-        samples: usize,
-        entity: GaugeEntity,
-    ) -> Option<Self> {
+    pub(crate) fn value(input: GaugeValueInput) -> Option<Self> {
+        let GaugeValueInput {
+            operand,
+            value,
+            unit,
+            threshold,
+            threshold_kind,
+            observed_at_us,
+            samples,
+            entity,
+        } = input;
         let samples = u64::try_from(samples).ok()?;
-        (samples > 0 && !entity.section().is_empty()).then_some(())?;
+        (samples > 0 && !operand.is_empty() && !entity.section().is_empty()).then_some(())?;
         Some(Self {
-            measurement: GaugeMeasurement::Value(FiniteValue::new(value)?),
+            measurement: GaugeMeasurement::Value {
+                operand,
+                value: FiniteValue::new(value)?,
+            },
             unit,
             threshold: FiniteValue::new(threshold)?,
             threshold_kind,
@@ -289,17 +431,23 @@ impl GaugeEvidence {
         samples: usize,
         entity: GaugeEntity,
     ) -> Option<Self> {
-        (ratio.denominator > 0.0).then_some(())?;
+        (ratio.denominator > 0.0
+            && !ratio.numerator_name.is_empty()
+            && !ratio.denominator_name.is_empty())
+        .then_some(())?;
         FiniteValue::new(ratio.numerator / ratio.denominator)?;
         let samples = u64::try_from(samples).ok()?;
         (samples > 0 && !entity.section().is_empty()).then_some(())?;
         Some(Self {
             measurement: GaugeMeasurement::Ratio {
+                numerator_name: ratio.numerator_name,
                 numerator: FiniteValue::new(ratio.numerator)?,
+                numerator_unit: ratio.numerator_unit,
+                denominator_name: ratio.denominator_name,
                 denominator: FiniteValue::new(ratio.denominator)?,
-                operand_unit: ratio.operand_unit,
+                denominator_unit: ratio.denominator_unit,
             },
-            unit: GaugeUnit::Ratio,
+            unit: ratio.result_unit,
             threshold: FiniteValue::new(threshold)?,
             threshold_kind,
             observed_at_us,
@@ -310,6 +458,7 @@ impl GaugeEvidence {
 
     pub(crate) fn trend(input: GaugeTrendInput) -> Option<Self> {
         let GaugeTrendInput {
+            operand,
             first,
             last,
             operand_unit,
@@ -325,9 +474,10 @@ impl GaugeEvidence {
         let elapsed_seconds = std::time::Duration::from_micros(elapsed_us).as_secs_f64();
         FiniteValue::new((last - first) / elapsed_seconds)?;
         let samples = u64::try_from(samples).ok()?;
-        (samples >= 2 && !entity.section().is_empty()).then_some(())?;
+        (samples >= 2 && !operand.is_empty() && !entity.section().is_empty()).then_some(())?;
         Some(Self {
             measurement: GaugeMeasurement::Trend {
+                operand,
                 first: FiniteValue::new(first)?,
                 last: FiniteValue::new(last)?,
                 elapsed_us,
@@ -369,6 +519,327 @@ impl GaugeEvidence {
     pub(crate) const fn entity(&self) -> &GaugeEntity {
         &self.entity
     }
+
+    fn operand_name_bytes(&self) -> u64 {
+        let length = match &self.measurement {
+            GaugeMeasurement::Value { operand, .. } | GaugeMeasurement::Trend { operand, .. } => {
+                operand.len()
+            }
+            GaugeMeasurement::Ratio {
+                numerator_name,
+                denominator_name,
+                ..
+            } => numerator_name.len().saturating_add(denominator_name.len()),
+        };
+        u64::try_from(length).unwrap_or(u64::MAX)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CounterMeasurementKind {
+    Sum,
+    Ratio,
+    Rate,
+}
+
+impl CounterMeasurementKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Ratio => "ratio",
+            Self::Rate => "rate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CounterOperandPurpose {
+    Formula,
+    Qualification,
+    AlignedContext,
+}
+
+impl CounterOperandPurpose {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Formula => "formula",
+            Self::Qualification => "qualification",
+            Self::AlignedContext => "aligned_context",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CounterOperand {
+    name: &'static str,
+    value: FiniteValue,
+    unit: GaugeUnit,
+    purpose: CounterOperandPurpose,
+}
+
+impl CounterOperand {
+    pub(crate) fn new(
+        name: &'static str,
+        value: f64,
+        unit: GaugeUnit,
+        purpose: CounterOperandPurpose,
+    ) -> Option<Self> {
+        (!name.is_empty() && value >= 0.0).then_some(Self {
+            name,
+            value: FiniteValue::new(value)?,
+            unit,
+            purpose,
+        })
+    }
+
+    pub(crate) const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) const fn value(&self) -> FiniteValue {
+        self.value
+    }
+
+    pub(crate) const fn unit(&self) -> GaugeUnit {
+        self.unit
+    }
+
+    pub(crate) const fn purpose(&self) -> CounterOperandPurpose {
+        self.purpose
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CounterEvidenceWindow {
+    from_us: i64,
+    to_us: i64,
+    first_interval_start_us: i64,
+    first_interval_end_us: i64,
+    last_interval_end_us: i64,
+    usable_intervals: u64,
+    candidate_intervals: u64,
+    unmatched_endpoint_intervals: u64,
+    unusable_delta_intervals: u64,
+    unaligned_duration_intervals: u64,
+    numeric_limit_intervals: u64,
+    elapsed_us: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CounterEvidenceWindowInput {
+    pub selection_from_us: i64,
+    pub selection_to_us: i64,
+    pub first_interval_start_us: i64,
+    pub first_interval_end_us: i64,
+    pub last_interval_end_us: i64,
+    pub usable_intervals: usize,
+    pub candidate_intervals: usize,
+    pub unmatched_endpoint_intervals: usize,
+    pub unusable_delta_intervals: usize,
+    pub unaligned_duration_intervals: usize,
+    pub numeric_limit_intervals: usize,
+    pub elapsed_us: u64,
+}
+
+impl CounterEvidenceWindow {
+    pub(crate) fn new(input: CounterEvidenceWindowInput) -> Option<Self> {
+        let CounterEvidenceWindowInput {
+            selection_from_us: from_us,
+            selection_to_us: to_us,
+            first_interval_start_us,
+            first_interval_end_us,
+            last_interval_end_us,
+            usable_intervals,
+            candidate_intervals,
+            unmatched_endpoint_intervals,
+            unusable_delta_intervals,
+            unaligned_duration_intervals,
+            numeric_limit_intervals,
+            elapsed_us,
+        } = input;
+        let usable_intervals = u64::try_from(usable_intervals).ok()?;
+        let candidate_intervals = u64::try_from(candidate_intervals).ok()?;
+        let unmatched_endpoint_intervals = u64::try_from(unmatched_endpoint_intervals).ok()?;
+        let unusable_delta_intervals = u64::try_from(unusable_delta_intervals).ok()?;
+        let unaligned_duration_intervals = u64::try_from(unaligned_duration_intervals).ok()?;
+        let numeric_limit_intervals = u64::try_from(numeric_limit_intervals).ok()?;
+        let classified_intervals = usable_intervals
+            .checked_add(unmatched_endpoint_intervals)?
+            .checked_add(unusable_delta_intervals)?
+            .checked_add(unaligned_duration_intervals)?
+            .checked_add(numeric_limit_intervals)?;
+        (first_interval_start_us <= first_interval_end_us
+            && from_us <= first_interval_end_us
+            && first_interval_end_us <= last_interval_end_us
+            && last_interval_end_us <= to_us
+            && usable_intervals > 0
+            && usable_intervals <= candidate_intervals
+            && classified_intervals == candidate_intervals
+            && elapsed_us > 0)
+            .then_some(Self {
+                from_us,
+                to_us,
+                first_interval_start_us,
+                first_interval_end_us,
+                last_interval_end_us,
+                usable_intervals,
+                candidate_intervals,
+                unmatched_endpoint_intervals,
+                unusable_delta_intervals,
+                unaligned_duration_intervals,
+                numeric_limit_intervals,
+                elapsed_us,
+            })
+    }
+
+    pub(crate) const fn selection_from_us(&self) -> i64 {
+        self.from_us
+    }
+
+    pub(crate) const fn selection_to_us(&self) -> i64 {
+        self.to_us
+    }
+
+    pub(crate) const fn first_interval_start_us(&self) -> i64 {
+        self.first_interval_start_us
+    }
+
+    pub(crate) const fn first_interval_end_us(&self) -> i64 {
+        self.first_interval_end_us
+    }
+
+    pub(crate) const fn last_interval_end_us(&self) -> i64 {
+        self.last_interval_end_us
+    }
+
+    pub(crate) const fn usable_intervals(&self) -> u64 {
+        self.usable_intervals
+    }
+
+    pub(crate) const fn candidate_intervals(&self) -> u64 {
+        self.candidate_intervals
+    }
+
+    pub(crate) const fn excluded_intervals(&self) -> u64 {
+        self.candidate_intervals - self.usable_intervals
+    }
+
+    pub(crate) const fn unmatched_endpoint_intervals(&self) -> u64 {
+        self.unmatched_endpoint_intervals
+    }
+
+    pub(crate) const fn unusable_delta_intervals(&self) -> u64 {
+        self.unusable_delta_intervals
+    }
+
+    pub(crate) const fn unaligned_duration_intervals(&self) -> u64 {
+        self.unaligned_duration_intervals
+    }
+
+    pub(crate) const fn numeric_limit_intervals(&self) -> u64 {
+        self.numeric_limit_intervals
+    }
+
+    pub(crate) const fn elapsed_us(&self) -> u64 {
+        self.elapsed_us
+    }
+}
+
+pub(crate) struct CounterEvidenceInput {
+    pub kind: CounterMeasurementKind,
+    pub formula: &'static str,
+    pub value: f64,
+    pub unit: GaugeUnit,
+    pub threshold: f64,
+    pub threshold_kind: ThresholdKind,
+    pub operands: Vec<CounterOperand>,
+    pub window: CounterEvidenceWindow,
+    pub entity: GaugeEntity,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CounterEvidence {
+    kind: CounterMeasurementKind,
+    formula: &'static str,
+    value: FiniteValue,
+    unit: GaugeUnit,
+    threshold: FiniteValue,
+    threshold_kind: ThresholdKind,
+    operands: Box<[CounterOperand]>,
+    window: CounterEvidenceWindow,
+    entity: GaugeEntity,
+}
+
+impl CounterEvidence {
+    const MAX_OPERANDS: usize = 3;
+
+    pub(crate) fn new(input: CounterEvidenceInput) -> Option<Self> {
+        (1..=Self::MAX_OPERANDS)
+            .contains(&input.operands.len())
+            .then_some(())?;
+        input
+            .operands
+            .iter()
+            .any(|operand| operand.purpose() == CounterOperandPurpose::Formula)
+            .then_some(())?;
+        input
+            .operands
+            .iter()
+            .enumerate()
+            .all(|(index, operand)| {
+                input.operands[..index]
+                    .iter()
+                    .all(|previous| previous.name() != operand.name())
+            })
+            .then_some(())?;
+        (!input.formula.is_empty() && !input.entity.section().is_empty()).then_some(Self {
+            kind: input.kind,
+            formula: input.formula,
+            value: FiniteValue::new(input.value)?,
+            unit: input.unit,
+            threshold: FiniteValue::new(input.threshold)?,
+            threshold_kind: input.threshold_kind,
+            operands: input.operands.into_boxed_slice(),
+            window: input.window,
+            entity: input.entity,
+        })
+    }
+
+    pub(crate) const fn kind(&self) -> CounterMeasurementKind {
+        self.kind
+    }
+
+    pub(crate) const fn formula(&self) -> &'static str {
+        self.formula
+    }
+
+    pub(crate) const fn value(&self) -> FiniteValue {
+        self.value
+    }
+
+    pub(crate) const fn unit(&self) -> GaugeUnit {
+        self.unit
+    }
+
+    pub(crate) const fn threshold(&self) -> FiniteValue {
+        self.threshold
+    }
+
+    pub(crate) const fn threshold_kind(&self) -> ThresholdKind {
+        self.threshold_kind
+    }
+
+    pub(crate) const fn operands(&self) -> &[CounterOperand] {
+        &self.operands
+    }
+
+    pub(crate) const fn window(&self) -> &CounterEvidenceWindow {
+        &self.window
+    }
+
+    pub(crate) const fn entity(&self) -> &GaugeEntity {
+        &self.entity
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -376,6 +847,7 @@ pub(crate) enum Evidence {
     Direct(DirectEvidence),
     Ratio,
     GaugeObservation(GaugeEvidence),
+    CounterAggregate(CounterEvidence),
     Gauge,
     Counter,
     Event,
@@ -386,8 +858,8 @@ impl Evidence {
         matches!(self, Self::Direct(_))
     }
 
-    const fn proves_structural_direction(&self) -> bool {
-        matches!(self, Self::Direct(direct) if direct.proves_structural_direction())
+    const fn proves_structural_direction(&self, requested_role: Role) -> bool {
+        matches!(self, Self::Direct(direct) if direct.proves_structural_direction(requested_role))
     }
 
     pub(crate) const fn label(&self) -> &'static str {
@@ -395,7 +867,7 @@ impl Evidence {
             Self::Direct(_) => "direct",
             Self::Ratio => "ratio",
             Self::GaugeObservation(_) | Self::Gauge => "gauge",
-            Self::Counter => "counter",
+            Self::CounterAggregate(_) | Self::Counter => "counter",
             Self::Event => "event",
         }
     }
@@ -493,15 +965,23 @@ impl FindingDraft {
         let evidence = self.evidence.iter().fold(0_u64, |total, item| {
             let bytes = match item {
                 Evidence::GaugeObservation(gauge) => 512_u64
+                    .saturating_add(gauge.operand_name_bytes())
                     .saturating_add(
                         u64::try_from(gauge.entity().section().len()).unwrap_or(u64::MAX),
                     )
                     .saturating_add(identity_json_upper_bound(gauge.entity().identity())),
-                Evidence::Direct(_)
-                | Evidence::Ratio
-                | Evidence::Gauge
-                | Evidence::Counter
-                | Evidence::Event => 32,
+                Evidence::CounterAggregate(counter) => 1_024_u64
+                    .saturating_add(u64::try_from(counter.formula().len()).unwrap_or(u64::MAX))
+                    .saturating_add(counter.operands().iter().fold(0_u64, |bytes, operand| {
+                        bytes
+                            .saturating_add(u64::try_from(operand.name().len()).unwrap_or(u64::MAX))
+                    }))
+                    .saturating_add(
+                        u64::try_from(counter.entity().section().len()).unwrap_or(u64::MAX),
+                    )
+                    .saturating_add(identity_json_upper_bound(counter.entity().identity())),
+                Evidence::Direct(_) => 512,
+                Evidence::Ratio | Evidence::Gauge | Evidence::Counter | Evidence::Event => 32,
             };
             total.saturating_add(bytes)
         });
@@ -534,7 +1014,9 @@ impl Finding {
             evidence,
             temporal_direction,
         } = draft;
-        let structural_direction = evidence.iter().any(Evidence::proves_structural_direction);
+        let structural_direction = evidence
+            .iter()
+            .any(|item| item.proves_structural_direction(requested_role));
         let role = match requested_role {
             Role::Lead | Role::Downstream if !structural_direction && !temporal_direction => {
                 Role::Coincident
@@ -557,13 +1039,6 @@ impl Finding {
 
     pub(crate) const fn role(&self) -> Role {
         self.role
-    }
-
-    /// Retarget a coincident finding to a temporal lead/downstream. The engine
-    /// alone sees every signal in an incident, so cross-signal ordering is its
-    /// call, not a lens's.
-    pub(crate) const fn set_role(&mut self, role: Role) {
-        self.role = role;
     }
 
     pub(crate) const fn confidence(&self) -> Confidence {
@@ -779,12 +1254,54 @@ mod tests {
             FindingDraft::new(
                 Role::Lead,
                 scope(1),
-                vec![Evidence::Direct(DirectEvidence::sampled_lock_edge())],
+                vec![Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                    10,
+                    20,
+                    30,
+                    LockParticipant::Blocker,
+                ))],
                 None,
             ),
         );
         assert_eq!(finding.confidence(), Confidence::HIGH);
         assert_eq!(finding.role(), Role::Lead);
+    }
+
+    #[test]
+    fn sampled_lock_edge_only_proves_the_role_of_its_participant() {
+        let finding = Finding::from_draft(
+            "PG-LOCK-012",
+            ConfidenceCap::High,
+            FindingDraft::new(
+                Role::Downstream,
+                scope(1),
+                vec![Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                    10,
+                    20,
+                    30,
+                    LockParticipant::Blocker,
+                ))],
+                None,
+            ),
+        );
+        assert_eq!(finding.role(), Role::Coincident);
+
+        let finding = Finding::from_draft(
+            "PG-LOCK-012",
+            ConfidenceCap::High,
+            FindingDraft::new(
+                Role::Downstream,
+                scope(1),
+                vec![Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                    10,
+                    20,
+                    30,
+                    LockParticipant::Waiter,
+                ))],
+                None,
+            ),
+        );
+        assert_eq!(finding.role(), Role::Downstream);
     }
 
     #[test]
@@ -851,20 +1368,21 @@ mod tests {
     fn gauge_evidence_rejects_non_finite_values_and_zero_denominators() {
         let entity = Arc::from(vec![IdentityValue::I64(1)]);
         assert!(
-            GaugeEvidence::value(
-                f64::NAN,
-                GaugeUnit::Bytes,
-                1.0,
-                ThresholdKind::AtLeast,
-                10,
-                1,
-                GaugeEntity::new("section", Arc::clone(&entity)),
-            )
+            GaugeEvidence::value(GaugeValueInput {
+                operand: "bytes",
+                value: f64::NAN,
+                unit: GaugeUnit::Bytes,
+                threshold: 1.0,
+                threshold_kind: ThresholdKind::AtLeast,
+                observed_at_us: 10,
+                samples: 1,
+                entity: GaugeEntity::new("section", Arc::clone(&entity)),
+            })
             .is_none()
         );
         assert!(
             GaugeEvidence::ratio(
-                GaugeRatio::new(1.0, 0.0, GaugeUnit::Count),
+                GaugeRatio::new("a", 1.0, "b", 0.0, GaugeUnit::Count),
                 0.5,
                 ThresholdKind::AtLeast,
                 10,
@@ -875,7 +1393,7 @@ mod tests {
         );
         assert!(
             GaugeEvidence::ratio(
-                GaugeRatio::new(f64::MAX, f64::MIN_POSITIVE, GaugeUnit::Bytes),
+                GaugeRatio::new("a", f64::MAX, "b", f64::MIN_POSITIVE, GaugeUnit::Bytes,),
                 0.5,
                 ThresholdKind::AtLeast,
                 10,
@@ -885,15 +1403,93 @@ mod tests {
             .is_none()
         );
         assert!(
-            GaugeEvidence::value(
-                1.0,
+            GaugeEvidence::value(GaugeValueInput {
+                operand: "count",
+                value: 1.0,
+                unit: GaugeUnit::Count,
+                threshold: 1.0,
+                threshold_kind: ThresholdKind::AtLeast,
+                observed_at_us: 10,
+                samples: 0,
+                entity: GaugeEntity::new("section", Arc::from([])),
+            })
+            .is_none()
+        );
+
+        let per_call = GaugeEvidence::ratio(
+            GaugeRatio::with_units(
+                "total_exec_time",
+                100.0,
+                GaugeUnit::Milliseconds,
+                "calls",
+                2.0,
                 GaugeUnit::Count,
-                1.0,
-                ThresholdKind::AtLeast,
-                10,
-                0,
-                GaugeEntity::new("section", Arc::from([])),
-            )
+                GaugeUnit::MillisecondsPerCall,
+            ),
+            50.0,
+            ThresholdKind::AtLeast,
+            10,
+            1,
+            GaugeEntity::new("section", Arc::from([])),
+        )
+        .expect("finite mixed-unit ratio");
+        assert_eq!(per_call.unit(), GaugeUnit::MillisecondsPerCall);
+    }
+
+    #[test]
+    fn counter_evidence_bounds_and_names_its_operands() {
+        let operand = |name, purpose| {
+            CounterOperand::new(name, 1.0, GaugeUnit::Count, purpose).expect("valid operand")
+        };
+        let build = |operands| {
+            CounterEvidence::new(CounterEvidenceInput {
+                kind: CounterMeasurementKind::Ratio,
+                formula: "a / b",
+                value: 1.0,
+                unit: GaugeUnit::Ratio,
+                threshold: 0.5,
+                threshold_kind: ThresholdKind::AtLeast,
+                operands,
+                window: CounterEvidenceWindow::new(CounterEvidenceWindowInput {
+                    selection_from_us: 0,
+                    selection_to_us: 10,
+                    first_interval_start_us: 0,
+                    first_interval_end_us: 1,
+                    last_interval_end_us: 1,
+                    usable_intervals: 1,
+                    candidate_intervals: 1,
+                    unmatched_endpoint_intervals: 0,
+                    unusable_delta_intervals: 0,
+                    unaligned_duration_intervals: 0,
+                    numeric_limit_intervals: 0,
+                    elapsed_us: 1_000_000,
+                })
+                .expect("valid window"),
+                entity: GaugeEntity::new("section", Arc::from([])),
+            })
+        };
+
+        assert!(
+            build(vec![
+                operand("a", CounterOperandPurpose::Formula),
+                operand("b", CounterOperandPurpose::Formula),
+            ])
+            .is_some()
+        );
+        assert!(
+            build(vec![
+                operand("same", CounterOperandPurpose::Formula),
+                operand("same", CounterOperandPurpose::Formula),
+            ])
+            .is_none()
+        );
+        assert!(
+            build(vec![
+                operand("a", CounterOperandPurpose::Formula),
+                operand("b", CounterOperandPurpose::Formula),
+                operand("c", CounterOperandPurpose::AlignedContext),
+                operand("d", CounterOperandPurpose::AlignedContext),
+            ])
             .is_none()
         );
     }

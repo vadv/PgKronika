@@ -1187,9 +1187,14 @@ mod tests {
         assert_eq!(evidence["type"], "gauge");
         assert_eq!(evidence["claim"], "observed_threshold_crossing");
         assert_eq!(evidence["measurement"]["kind"], "ratio");
+        assert_eq!(evidence["measurement"]["numerator_name"], "mem_available");
         assert_eq!(evidence["measurement"]["numerator"], 10_000.0);
+        assert_eq!(evidence["measurement"]["numerator_unit"], "KiB");
+        assert_eq!(evidence["measurement"]["denominator_name"], "mem_total");
         assert_eq!(evidence["measurement"]["denominator"], 1_000_000.0);
+        assert_eq!(evidence["measurement"]["denominator_unit"], "KiB");
         assert_eq!(evidence["measurement"]["value"], 0.01);
+        assert_eq!(evidence["measurement"]["headroom"], 990_000.0);
         assert_eq!(evidence["measurement"]["operand_unit"], "KiB");
         assert_eq!(evidence["unit"], "ratio");
         assert_eq!(evidence["threshold"]["operator"], "below");

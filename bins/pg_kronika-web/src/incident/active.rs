@@ -8,8 +8,10 @@ use super::dispatch::{LimitHit, SectionColumn};
 use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
-    ConfidenceCap, DirectEvidence, Evidence, FindingDraft, FindingScope, GaugeEntity,
-    GaugeEvidence, GaugeRatio, GaugeUnit, Role, ThresholdKind,
+    ConfidenceCap, CounterEvidence, CounterEvidenceInput, CounterEvidenceWindow,
+    CounterEvidenceWindowInput, CounterMeasurementKind, CounterOperand, CounterOperandPurpose,
+    DirectEvidence, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
+    GaugeUnit, GaugeValueInput, LockParticipant, Role, ThresholdKind,
 };
 use super::gauge_contracts::{
     CgroupMemoryLens, FreezeHorizonLens, PhysicalReplicationLens, RunningVacuumLens,
@@ -20,7 +22,7 @@ use super::model::IdentityValue;
 use super::os_lenses::{BlockDeviceLens, HostCpuLens, ProcessIoWhoLens};
 use super::query_plan::{PlanChurnLens, QueryWorkLens};
 use super::series::SeriesSet;
-use super::typed::{ActivityBackend, GaugeObjective, TypedInputs};
+use super::typed::{ActivityBackend, GaugeObjective, PairedSums, TypedInputs};
 #[cfg(test)]
 use super::typed::{ActivitySnapshot, SnapshotCompleteness};
 
@@ -35,6 +37,95 @@ const PG_LOCKS: &str = "pg_locks";
 const OS_NETDEV: &str = "os_netdev";
 const OS_CGROUP_CPU: &str = "os_cgroup_cpu";
 const OS_MEMINFO: &str = "os_meminfo";
+
+struct CounterEvidenceSpec {
+    kind: CounterMeasurementKind,
+    formula: &'static str,
+    value: f64,
+    unit: GaugeUnit,
+    threshold: f64,
+    threshold_kind: ThresholdKind,
+    section: &'static str,
+    operands: Vec<CounterOperandSpec>,
+}
+
+struct CounterOperandSpec {
+    name: &'static str,
+    value: f64,
+    unit: GaugeUnit,
+    purpose: CounterOperandPurpose,
+}
+
+fn counter_evidence(
+    sums: PairedSums,
+    context: &EvalContext,
+    identity: &Arc<[IdentityValue]>,
+    spec: CounterEvidenceSpec,
+) -> Option<CounterEvidence> {
+    let window = CounterEvidenceWindow::new(CounterEvidenceWindowInput {
+        selection_from_us: context.incident_start_us,
+        selection_to_us: context.incident_end_us,
+        first_interval_start_us: sums.first_start_us?,
+        first_interval_end_us: sums.first_end_us?,
+        last_interval_end_us: sums.last_end_us?,
+        usable_intervals: sums.intervals,
+        candidate_intervals: sums.candidate_intervals,
+        unmatched_endpoint_intervals: sums.unmatched_endpoint_intervals,
+        unusable_delta_intervals: sums.unusable_delta_intervals,
+        unaligned_duration_intervals: sums.unaligned_duration_intervals,
+        numeric_limit_intervals: sums.numeric_limit_intervals,
+        elapsed_us: sums.elapsed_us,
+    })?;
+    CounterEvidence::new(CounterEvidenceInput {
+        kind: spec.kind,
+        formula: spec.formula,
+        value: spec.value,
+        unit: spec.unit,
+        threshold: spec.threshold,
+        threshold_kind: spec.threshold_kind,
+        operands: spec
+            .operands
+            .into_iter()
+            .map(|operand| {
+                CounterOperand::new(operand.name, operand.value, operand.unit, operand.purpose)
+            })
+            .collect::<Option<Vec<_>>>()?,
+        window,
+        entity: GaugeEntity::new(spec.section, Arc::clone(identity)),
+    })
+}
+
+fn paired_sums(
+    typed: &TypedInputs,
+    section: &'static str,
+    identity: &[IdentityValue],
+    column_a: &'static str,
+    column_b: &'static str,
+    context: &EvalContext,
+    sink: &mut FindingSink<'_>,
+) -> Result<Option<PairedSums>, LimitHit> {
+    sink.charge_points(typed.aligned_counter_points(section, identity, &[column_a, column_b]))?;
+    Ok(typed.paired_delta_sums(
+        section,
+        identity,
+        column_a,
+        column_b,
+        context.incident_start_us,
+        context.incident_end_us,
+    ))
+}
+
+const fn exact_u64_as_f64(value: u64) -> Option<f64> {
+    const MAX_EXACT_INTEGER: u64 = 1_u64 << 53;
+    if value > MAX_EXACT_INTEGER {
+        return None;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the preceding bound proves exact IEEE-754 integer representation"
+    )]
+    Some(value as f64)
+}
 
 /// `PG-CACHE-010` (`shared_buffer_misses`): shared-buffer miss pressure. Reports
 /// an elevated `sum(d(blks_read)) / sum(d(blks_read) + d(blks_hit))` over the
@@ -86,37 +177,59 @@ impl Lens for SharedBufferMissesLens {
             if member.logical_section != PG_STAT_DATABASE || member.column != "blks_read" {
                 continue;
             }
-            let Some(sums) = typed.paired_delta_sums(
+            let Some(sums) = paired_sums(
+                typed,
                 PG_STAT_DATABASE,
                 &member.identity,
                 "blks_read",
                 "blks_hit",
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
+                context,
+                sink,
+            )?
+            else {
                 continue;
             };
-            if sums.intervals < Self::MIN_INTERVALS {
+            if !sums.meets_pairing_coverage(Self::MIN_INTERVALS) {
                 continue;
             }
             let total = sums.sum_a + sums.sum_b;
             if total <= 0.0 || sums.sum_a / total < Self::MISS_THRESHOLD {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(sums.sum_a, total, GaugeUnit::Count),
-                Self::MISS_THRESHOLD,
-                ThresholdKind::AtLeast,
-                context.incident_end_us,
-                sums.intervals,
-                GaugeEntity::new(PG_STAT_DATABASE, Arc::clone(&member.identity)),
+            let Some(evidence) = counter_evidence(
+                sums,
+                context,
+                &member.identity,
+                CounterEvidenceSpec {
+                    kind: CounterMeasurementKind::Ratio,
+                    formula: "blks_read / (blks_read + blks_hit)",
+                    value: sums.sum_a / total,
+                    unit: GaugeUnit::Ratio,
+                    threshold: Self::MISS_THRESHOLD,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    section: PG_STAT_DATABASE,
+                    operands: vec![
+                        CounterOperandSpec {
+                            name: "blks_read",
+                            value: sums.sum_a,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "blks_hit",
+                            value: sums.sum_b,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                    ],
+                },
             ) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                vec![Evidence::CounterAggregate(evidence)],
                 None,
             ))?;
         }
@@ -173,36 +286,58 @@ impl Lens for WalAmplificationLens {
             if member.logical_section != PG_STAT_WAL || member.column != "wal_fpi" {
                 continue;
             }
-            let Some(sums) = typed.paired_delta_sums(
+            let Some(sums) = paired_sums(
+                typed,
                 PG_STAT_WAL,
                 &member.identity,
                 "wal_fpi",
                 "wal_records",
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
+                context,
+                sink,
+            )?
+            else {
                 continue;
             };
-            if sums.intervals < Self::MIN_INTERVALS {
+            if !sums.meets_pairing_coverage(Self::MIN_INTERVALS) {
                 continue;
             }
             if sums.sum_b <= 0.0 || sums.sum_a / sums.sum_b < Self::FPI_THRESHOLD {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(sums.sum_a, sums.sum_b, GaugeUnit::Count),
-                Self::FPI_THRESHOLD,
-                ThresholdKind::AtLeast,
-                context.incident_end_us,
-                sums.intervals,
-                GaugeEntity::new(PG_STAT_WAL, Arc::clone(&member.identity)),
+            let Some(evidence) = counter_evidence(
+                sums,
+                context,
+                &member.identity,
+                CounterEvidenceSpec {
+                    kind: CounterMeasurementKind::Ratio,
+                    formula: "wal_fpi / wal_records",
+                    value: sums.sum_a / sums.sum_b,
+                    unit: GaugeUnit::Ratio,
+                    threshold: Self::FPI_THRESHOLD,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    section: PG_STAT_WAL,
+                    operands: vec![
+                        CounterOperandSpec {
+                            name: "wal_fpi",
+                            value: sums.sum_a,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "wal_records",
+                            value: sums.sum_b,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                    ],
+                },
             ) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                vec![Evidence::CounterAggregate(evidence)],
                 None,
             ))?;
         }
@@ -257,37 +392,58 @@ impl Lens for TempSpillLens {
             if member.logical_section != PG_STAT_DATABASE || member.column != "temp_bytes" {
                 continue;
             }
-            let Some(sums) = typed.paired_delta_sums(
+            let Some(sums) = paired_sums(
+                typed,
                 PG_STAT_DATABASE,
                 &member.identity,
                 "temp_bytes",
                 "temp_files",
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
+                context,
+                sink,
+            )?
+            else {
                 continue;
             };
-            if sums.intervals < Self::MIN_INTERVALS {
+            if !sums.meets_pairing_coverage(Self::MIN_INTERVALS) {
                 continue;
             }
             if sums.sum_a <= 0.0 || sums.sum_b <= 0.0 {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::value(
-                sums.sum_a,
-                GaugeUnit::Bytes,
-                0.0,
-                ThresholdKind::AtLeast,
-                context.incident_end_us,
-                sums.intervals,
-                GaugeEntity::new(PG_STAT_DATABASE, Arc::clone(&member.identity)),
+            let Some(evidence) = counter_evidence(
+                sums,
+                context,
+                &member.identity,
+                CounterEvidenceSpec {
+                    kind: CounterMeasurementKind::Sum,
+                    formula: "temp_bytes",
+                    value: sums.sum_a,
+                    unit: GaugeUnit::Bytes,
+                    threshold: 0.0,
+                    threshold_kind: ThresholdKind::Above,
+                    section: PG_STAT_DATABASE,
+                    operands: vec![
+                        CounterOperandSpec {
+                            name: "temp_bytes",
+                            value: sums.sum_a,
+                            unit: GaugeUnit::Bytes,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "temp_files",
+                            value: sums.sum_b,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Qualification,
+                        },
+                    ],
+                },
             ) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                vec![Evidence::CounterAggregate(evidence)],
                 None,
             ))?;
         }
@@ -344,37 +500,59 @@ impl Lens for RequestedCheckpointsLens {
             if member.logical_section != CHECKPOINTER || member.column != "checkpoints_req" {
                 continue;
             }
-            let Some(sums) = typed.paired_delta_sums(
+            let Some(sums) = paired_sums(
+                typed,
                 CHECKPOINTER,
                 &member.identity,
                 "checkpoints_req",
                 "checkpoints_timed",
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
+                context,
+                sink,
+            )?
+            else {
                 continue;
             };
-            if sums.intervals < Self::MIN_INTERVALS {
+            if !sums.meets_pairing_coverage(Self::MIN_INTERVALS) {
                 continue;
             }
             let total = sums.sum_a + sums.sum_b;
             if total <= 0.0 || sums.sum_a / total < Self::REQUESTED_THRESHOLD {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(sums.sum_a, total, GaugeUnit::Count),
-                Self::REQUESTED_THRESHOLD,
-                ThresholdKind::AtLeast,
-                context.incident_end_us,
-                sums.intervals,
-                GaugeEntity::new(CHECKPOINTER, Arc::clone(&member.identity)),
+            let Some(evidence) = counter_evidence(
+                sums,
+                context,
+                &member.identity,
+                CounterEvidenceSpec {
+                    kind: CounterMeasurementKind::Ratio,
+                    formula: "checkpoints_req / (checkpoints_req + checkpoints_timed)",
+                    value: sums.sum_a / total,
+                    unit: GaugeUnit::Ratio,
+                    threshold: Self::REQUESTED_THRESHOLD,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    section: CHECKPOINTER,
+                    operands: vec![
+                        CounterOperandSpec {
+                            name: "checkpoints_req",
+                            value: sums.sum_a,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "checkpoints_timed",
+                            value: sums.sum_b,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                    ],
+                },
             ) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                vec![Evidence::CounterAggregate(evidence)],
                 None,
             ))?;
         }
@@ -430,37 +608,58 @@ impl Lens for BackendIoLatencyLens {
             if member.logical_section != PG_STAT_IO || member.column != "read_time" {
                 continue;
             }
-            let Some(sums) = typed.paired_delta_sums(
+            let Some(sums) = paired_sums(
+                typed,
                 PG_STAT_IO,
                 &member.identity,
                 "read_time",
                 "reads",
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
+                context,
+                sink,
+            )?
+            else {
                 continue;
             };
-            if sums.intervals < Self::MIN_INTERVALS {
+            if !sums.meets_pairing_coverage(Self::MIN_INTERVALS) {
                 continue;
             }
             if sums.sum_b <= 0.0 || sums.sum_a / sums.sum_b < Self::LATENCY_MS_THRESHOLD {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::value(
-                sums.sum_a / sums.sum_b,
-                GaugeUnit::Milliseconds,
-                Self::LATENCY_MS_THRESHOLD,
-                ThresholdKind::AtLeast,
-                context.incident_end_us,
-                sums.intervals,
-                GaugeEntity::new(PG_STAT_IO, Arc::clone(&member.identity)),
+            let Some(evidence) = counter_evidence(
+                sums,
+                context,
+                &member.identity,
+                CounterEvidenceSpec {
+                    kind: CounterMeasurementKind::Ratio,
+                    formula: "read_time / reads",
+                    value: sums.sum_a / sums.sum_b,
+                    unit: GaugeUnit::MillisecondsPerRead,
+                    threshold: Self::LATENCY_MS_THRESHOLD,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    section: PG_STAT_IO,
+                    operands: vec![
+                        CounterOperandSpec {
+                            name: "read_time",
+                            value: sums.sum_a,
+                            unit: GaugeUnit::Milliseconds,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "reads",
+                            value: sums.sum_b,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                    ],
+                },
             ) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                vec![Evidence::CounterAggregate(evidence)],
                 None,
             ))?;
         }
@@ -517,17 +716,19 @@ impl Lens for HotUpdateFailureLens {
             if member.logical_section != PG_STAT_USER_TABLES || member.column != "n_tup_upd" {
                 continue;
             }
-            let Some(sums) = typed.paired_delta_sums(
+            let Some(sums) = paired_sums(
+                typed,
                 PG_STAT_USER_TABLES,
                 &member.identity,
                 "n_tup_hot_upd",
                 "n_tup_upd",
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
+                context,
+                sink,
+            )?
+            else {
                 continue;
             };
-            if sums.intervals < Self::MIN_INTERVALS {
+            if !sums.meets_pairing_coverage(Self::MIN_INTERVALS) {
                 continue;
             }
             // `sum_a` (HOT) never exceeds `sum_b` (all updates), so the fraction
@@ -536,20 +737,40 @@ impl Lens for HotUpdateFailureLens {
             {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(sums.sum_b - sums.sum_a, sums.sum_b, GaugeUnit::Count),
-                Self::NON_HOT_THRESHOLD,
-                ThresholdKind::AtLeast,
-                context.incident_end_us,
-                sums.intervals,
-                GaugeEntity::new(PG_STAT_USER_TABLES, Arc::clone(&member.identity)),
+            let Some(evidence) = counter_evidence(
+                sums,
+                context,
+                &member.identity,
+                CounterEvidenceSpec {
+                    kind: CounterMeasurementKind::Ratio,
+                    formula: "(n_tup_upd - n_tup_hot_upd) / n_tup_upd",
+                    value: (sums.sum_b - sums.sum_a) / sums.sum_b,
+                    unit: GaugeUnit::Ratio,
+                    threshold: Self::NON_HOT_THRESHOLD,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    section: PG_STAT_USER_TABLES,
+                    operands: vec![
+                        CounterOperandSpec {
+                            name: "n_tup_hot_upd",
+                            value: sums.sum_a,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "n_tup_upd",
+                            value: sums.sum_b,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                    ],
+                },
             ) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                vec![Evidence::CounterAggregate(evidence)],
                 None,
             ))?;
         }
@@ -606,34 +827,56 @@ impl Lens for WalArchivingFailureLens {
             if member.logical_section != PG_STAT_ARCHIVER || member.column != "failed_count" {
                 continue;
             }
-            let Some(sums) = typed.paired_delta_sums(
+            let Some(sums) = paired_sums(
+                typed,
                 PG_STAT_ARCHIVER,
                 &member.identity,
                 "failed_count",
                 "archived_count",
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
+                context,
+                sink,
+            )?
+            else {
                 continue;
             };
-            if sums.intervals < Self::MIN_INTERVALS || sums.sum_a < Self::MIN_FAILURES {
+            if !sums.meets_pairing_coverage(Self::MIN_INTERVALS) || sums.sum_a < Self::MIN_FAILURES
+            {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::value(
-                sums.sum_a,
-                GaugeUnit::Count,
-                Self::MIN_FAILURES,
-                ThresholdKind::AtLeast,
-                context.incident_end_us,
-                sums.intervals,
-                GaugeEntity::new(PG_STAT_ARCHIVER, Arc::clone(&member.identity)),
+            let Some(evidence) = counter_evidence(
+                sums,
+                context,
+                &member.identity,
+                CounterEvidenceSpec {
+                    kind: CounterMeasurementKind::Sum,
+                    formula: "failed_count",
+                    value: sums.sum_a,
+                    unit: GaugeUnit::Count,
+                    threshold: Self::MIN_FAILURES,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    section: PG_STAT_ARCHIVER,
+                    operands: vec![
+                        CounterOperandSpec {
+                            name: "failed_count",
+                            value: sums.sum_a,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "archived_count",
+                            value: sums.sum_b,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::AlignedContext,
+                        },
+                    ],
+                },
             ) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
                 Role::Coincident,
                 FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                vec![Evidence::CounterAggregate(evidence)],
                 None,
             ))?;
         }
@@ -642,7 +885,7 @@ impl Lens for WalArchivingFailureLens {
 }
 
 /// `OS-NET-028` (`network_errors`): a network interface logging receive errors.
-/// Reports a coincident finding when the receive error fraction
+/// Reports a coincident finding when the receive error ratio
 /// `sum(d(rx_errs)) / sum(d(rx_packets))` is elevated. The design confidence is
 /// low, so its findings stay capped there.
 pub(crate) struct NetworkErrorsLens;
@@ -690,36 +933,58 @@ impl Lens for NetworkErrorsLens {
             if member.logical_section != OS_NETDEV || member.column != "rx_errs" {
                 continue;
             }
-            let Some(sums) = typed.paired_delta_sums(
+            let Some(sums) = paired_sums(
+                typed,
                 OS_NETDEV,
                 &member.identity,
                 "rx_errs",
                 "rx_packets",
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
+                context,
+                sink,
+            )?
+            else {
                 continue;
             };
-            if sums.intervals < Self::MIN_INTERVALS {
+            if !sums.meets_pairing_coverage(Self::MIN_INTERVALS) {
                 continue;
             }
             if sums.sum_b <= 0.0 || sums.sum_a / sums.sum_b < Self::ERROR_THRESHOLD {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(sums.sum_a, sums.sum_b, GaugeUnit::Count),
-                Self::ERROR_THRESHOLD,
-                ThresholdKind::AtLeast,
-                context.incident_end_us,
-                sums.intervals,
-                GaugeEntity::new(OS_NETDEV, Arc::clone(&member.identity)),
+            let Some(evidence) = counter_evidence(
+                sums,
+                context,
+                &member.identity,
+                CounterEvidenceSpec {
+                    kind: CounterMeasurementKind::Ratio,
+                    formula: "rx_errs / rx_packets",
+                    value: sums.sum_a / sums.sum_b,
+                    unit: GaugeUnit::Ratio,
+                    threshold: Self::ERROR_THRESHOLD,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    section: OS_NETDEV,
+                    operands: vec![
+                        CounterOperandSpec {
+                            name: "rx_errs",
+                            value: sums.sum_a,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "rx_packets",
+                            value: sums.sum_b,
+                            unit: GaugeUnit::Count,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                    ],
+                },
             ) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
                 Role::Coincident,
                 FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                vec![Evidence::CounterAggregate(evidence)],
                 None,
             ))?;
         }
@@ -728,10 +993,9 @@ impl Lens for NetworkErrorsLens {
 }
 
 /// `OS-CGRP-021` (`cgroup_cpu_throttling`): a cgroup denied the CPU it asked for.
-/// Reports an amplifier when the throttle fraction
-/// `sum(d(throttled_usec)) / sum(d(throttled_usec + usage_usec))` is elevated. It
-/// measures throttling itself, not whether host CPU was spare (a cross-section
-/// question); confidence is capped at medium.
+/// Reports elevated throttled microseconds per covered second. `usage_usec` is
+/// retained as aligned context, not used as a wall-time denominator. The role
+/// stays coincident until PG-to-cgroup scope and host spare CPU are correlated.
 pub(crate) struct CgroupCpuThrottlingLens;
 
 impl CgroupCpuThrottlingLens {
@@ -747,8 +1011,8 @@ impl CgroupCpuThrottlingLens {
         },
     ];
     const MIN_INTERVALS: usize = 3;
-    /// A tenth of the demanded CPU time lost to throttling bites latency.
-    const THROTTLE_THRESHOLD: f64 = 0.1;
+    /// One hundred milliseconds throttled per covered second is material.
+    const THROTTLE_RATE_THRESHOLD_US_PER_S: f64 = 100_000.0;
 }
 
 impl Lens for CgroupCpuThrottlingLens {
@@ -777,37 +1041,69 @@ impl Lens for CgroupCpuThrottlingLens {
             if member.logical_section != OS_CGROUP_CPU || member.column != "throttled_usec" {
                 continue;
             }
-            let Some(sums) = typed.paired_delta_sums(
+            let Some(sums) = paired_sums(
+                typed,
                 OS_CGROUP_CPU,
                 &member.identity,
                 "throttled_usec",
                 "usage_usec",
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
+                context,
+                sink,
+            )?
+            else {
                 continue;
             };
-            if sums.intervals < Self::MIN_INTERVALS {
+            if !sums.meets_pairing_coverage(Self::MIN_INTERVALS) {
                 continue;
             }
-            let total = sums.sum_a + sums.sum_b;
-            if total <= 0.0 || sums.sum_a / total < Self::THROTTLE_THRESHOLD {
+            let elapsed_seconds = std::time::Duration::from_micros(sums.elapsed_us).as_secs_f64();
+            let throttle_rate = sums.sum_a / elapsed_seconds;
+            if throttle_rate < Self::THROTTLE_RATE_THRESHOLD_US_PER_S {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(sums.sum_a, total, GaugeUnit::Microseconds),
-                Self::THROTTLE_THRESHOLD,
-                ThresholdKind::AtLeast,
-                context.incident_end_us,
-                sums.intervals,
-                GaugeEntity::new(OS_CGROUP_CPU, Arc::clone(&member.identity)),
+            let Some(elapsed_us) = exact_u64_as_f64(sums.elapsed_us) else {
+                continue;
+            };
+            let Some(evidence) = counter_evidence(
+                sums,
+                context,
+                &member.identity,
+                CounterEvidenceSpec {
+                    kind: CounterMeasurementKind::Rate,
+                    formula: "throttled_usec * 1000000 / summed_interval_duration_us",
+                    value: throttle_rate,
+                    unit: GaugeUnit::MicrosecondsPerSecond,
+                    threshold: Self::THROTTLE_RATE_THRESHOLD_US_PER_S,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    section: OS_CGROUP_CPU,
+                    operands: vec![
+                        CounterOperandSpec {
+                            name: "throttled_usec",
+                            value: sums.sum_a,
+                            unit: GaugeUnit::Microseconds,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "summed_interval_duration_us",
+                            value: elapsed_us,
+                            unit: GaugeUnit::Microseconds,
+                            purpose: CounterOperandPurpose::Formula,
+                        },
+                        CounterOperandSpec {
+                            name: "usage_usec",
+                            value: sums.sum_b,
+                            unit: GaugeUnit::Microseconds,
+                            purpose: CounterOperandPurpose::AlignedContext,
+                        },
+                    ],
+                },
             ) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
-                Role::Amplifier,
+                Role::Coincident,
                 FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                vec![Evidence::CounterAggregate(evidence)],
                 None,
             ))?;
         }
@@ -884,7 +1180,13 @@ impl Lens for StaleStatisticsLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(pair.a, denominator, GaugeUnit::Count),
+                GaugeRatio::new(
+                    "n_mod_since_analyze",
+                    pair.a,
+                    "abs_reltuples_floor_1",
+                    denominator,
+                    GaugeUnit::Count,
+                ),
                 Self::MODIFIED_FRACTION_FLOOR,
                 ThresholdKind::AtLeast,
                 pair.observed_at_us,
@@ -969,7 +1271,13 @@ impl Lens for ConnectionSaturationLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(pair.a, pair.b, GaugeUnit::Count),
+                GaugeRatio::new(
+                    "numbackends",
+                    pair.a,
+                    "datconnlimit",
+                    pair.b,
+                    GaugeUnit::Count,
+                ),
                 Self::SATURATION_FLOOR,
                 ThresholdKind::AtLeast,
                 pair.observed_at_us,
@@ -1054,7 +1362,13 @@ impl Lens for MemoryReclaimLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(pair.a, pair.b, GaugeUnit::Kibibytes),
+                GaugeRatio::new(
+                    "mem_available",
+                    pair.a,
+                    "mem_total",
+                    pair.b,
+                    GaugeUnit::Kibibytes,
+                ),
                 Self::AVAILABLE_FRACTION_FLOOR,
                 ThresholdKind::Below,
                 pair.observed_at_us,
@@ -1146,7 +1460,13 @@ impl Lens for WritebackPressureLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(numerator, reading.denominator, GaugeUnit::Kibibytes),
+                GaugeRatio::new(
+                    "dirty_plus_writeback",
+                    numerator,
+                    "mem_total",
+                    reading.denominator,
+                    GaugeUnit::Kibibytes,
+                ),
                 Self::DIRTY_FRACTION_FLOOR,
                 ThresholdKind::AtLeast,
                 reading.observed_at_us,
@@ -1248,28 +1568,30 @@ impl Lens for XminHorizonHoldLens {
             let Some(xmin_age) = backend.xmin_age.and_then(exact_i64_as_f64) else {
                 return Ok(());
             };
-            let Some(xmin_evidence) = GaugeEvidence::value(
-                xmin_age,
-                GaugeUnit::Count,
-                Self::MIN_XMIN_AGE_F64,
-                ThresholdKind::AtLeast,
+            let Some(xmin_evidence) = GaugeEvidence::value(GaugeValueInput {
+                operand: "xmin_age",
+                value: xmin_age,
+                unit: GaugeUnit::Count,
+                threshold: Self::MIN_XMIN_AGE_F64,
+                threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us,
-                1,
-                GaugeEntity::new(PG_STAT_ACTIVITY, Arc::clone(&identity)),
-            ) else {
+                samples: 1,
+                entity: GaugeEntity::new(PG_STAT_ACTIVITY, Arc::clone(&identity)),
+            }) else {
                 return Ok(());
             };
             let mut evidence = vec![Evidence::GaugeObservation(xmin_evidence)];
             if let Some(xact_age_us) = backend.xact_age_us.and_then(exact_i64_as_f64)
-                && let Some(xact_evidence) = GaugeEvidence::value(
-                    xact_age_us,
-                    GaugeUnit::Microseconds,
-                    Self::MIN_LONG_XACT_US_F64,
-                    ThresholdKind::AtLeast,
+                && let Some(xact_evidence) = GaugeEvidence::value(GaugeValueInput {
+                    operand: "xact_age_us",
+                    value: xact_age_us,
+                    unit: GaugeUnit::Microseconds,
+                    threshold: Self::MIN_LONG_XACT_US_F64,
+                    threshold_kind: ThresholdKind::AtLeast,
                     observed_at_us,
-                    1,
-                    GaugeEntity::new(PG_STAT_ACTIVITY, identity),
-                )
+                    samples: 1,
+                    entity: GaugeEntity::new(PG_STAT_ACTIVITY, identity),
+                })
             {
                 evidence.push(Evidence::GaugeObservation(xact_evidence));
             }
@@ -1360,15 +1682,16 @@ impl Lens for SyncReplicationWaitLens {
                 IdentityValue::I64(pid),
                 IdentityValue::I64(backend_start),
             ]);
-            let Some(evidence) = GaugeEvidence::value(
-                samples_value,
-                GaugeUnit::Count,
-                3.0,
-                ThresholdKind::AtLeast,
+            let Some(evidence) = GaugeEvidence::value(GaugeValueInput {
+                operand: "consecutive_syncrep_samples",
+                value: samples_value,
+                unit: GaugeUnit::Count,
+                threshold: 3.0,
+                threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us,
                 samples,
-                GaugeEntity::new(PG_STAT_ACTIVITY, identity),
-            ) else {
+                entity: GaugeEntity::new(PG_STAT_ACTIVITY, identity),
+            }) else {
                 return Ok(());
             };
             sink.emit(FindingDraft::new(
@@ -1486,7 +1809,13 @@ impl Lens for InternalWaitConcentrationLens {
                 return Ok(());
             };
             let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(waiting, active_total, GaugeUnit::Count),
+                GaugeRatio::new(
+                    "waiting_backends",
+                    waiting,
+                    "active_backends",
+                    active_total,
+                    GaugeUnit::Count,
+                ),
                 Self::WAIT_FRACTION,
                 ThresholdKind::AtLeast,
                 observed_at_us,
@@ -1510,8 +1839,8 @@ impl Lens for InternalWaitConcentrationLens {
 /// `blocked_by` edge in a `pg_locks` snapshot is direct evidence of a process
 /// that prevented a waiter from acquiring the requested lock (it may name a
 /// queue predecessor rather than the holder). The blocker is reported as the
-/// lead and the waiter as its downstream — both structural, both high
-/// confidence. This is the only lens with structural direction.
+/// lead and the waiter as its downstream for that sampled edge. Confidence is
+/// capped at medium until lock target and mode join the evidence.
 pub(crate) struct LockWaitGraphLens;
 
 impl LockWaitGraphLens {
@@ -1532,7 +1861,7 @@ impl Lens for LockWaitGraphLens {
     }
 
     fn confidence_cap(&self) -> ConfidenceCap {
-        ConfidenceCap::High
+        ConfidenceCap::Medium
     }
 
     fn evaluate(
@@ -1557,9 +1886,6 @@ impl Lens for LockWaitGraphLens {
         sink.charge_points(examined)?;
         for snapshot in snapshots {
             for edge in &snapshot.edges {
-                // The blocker holds the lock and leads; the waiter is stuck
-                // behind it and is the downstream party. Each side is scoped to
-                // its own process so the pair renders as two findings.
                 let blocker: Arc<[IdentityValue]> = Arc::from(vec![
                     IdentityValue::I64(snapshot.ts),
                     IdentityValue::I64(edge.blocker_pid),
@@ -1568,7 +1894,12 @@ impl Lens for LockWaitGraphLens {
                 sink.emit(FindingDraft::new(
                     Role::Lead,
                     FindingScope::from_parts(PG_LOCKS, "blocked_by", blocker),
-                    vec![Evidence::Direct(DirectEvidence::sampled_lock_edge())],
+                    vec![Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                        snapshot.ts,
+                        edge.waiter_pid,
+                        edge.blocker_pid,
+                        LockParticipant::Blocker,
+                    ))],
                     None,
                 ))?;
                 let waiter: Arc<[IdentityValue]> = Arc::from(vec![
@@ -1579,7 +1910,12 @@ impl Lens for LockWaitGraphLens {
                 sink.emit(FindingDraft::new(
                     Role::Downstream,
                     FindingScope::from_parts(PG_LOCKS, "blocked_by", waiter),
-                    vec![Evidence::Direct(DirectEvidence::sampled_lock_edge())],
+                    vec![Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                        snapshot.ts,
+                        edge.waiter_pid,
+                        edge.blocker_pid,
+                        LockParticipant::Waiter,
+                    ))],
                     None,
                 ))?;
             }
@@ -1679,10 +2015,12 @@ pub(crate) fn active_catalog_ids() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::evidence::{Confidence, GaugeMeasurement};
+    use super::super::evidence::Confidence;
     use super::*;
     use crate::incident::model::{EnrichedEpisode, EpisodeRefV1};
-    use crate::incident::{ClockRelation, IncidentConfig, LockEdge, LockSnapshot, analyze};
+    use crate::incident::{
+        ClockRelation, IncidentConfig, LimitAxis, LockEdge, LockSnapshot, analyze,
+    };
     use kronika_analytics::{DiffPoint, Direction, Episode, Evaluated, Scalar};
 
     fn id() -> Arc<[IdentityValue]> {
@@ -1716,10 +2054,10 @@ mod tests {
         }
     }
 
-    // One-second interval, so the recovered delta equals `delta`.
+    // One-second interval with the same delta and rate.
     fn point(delta: f64) -> DiffPoint {
         DiffPoint::Value {
-            delta: Scalar::Int(0),
+            delta: Scalar::Float(delta),
             rate: delta,
             dt_micros: 1_000_000,
         }
@@ -1762,6 +2100,27 @@ mod tests {
         // miss ratio 80/(80+20) = 0.8, three valid intervals.
         let findings = run(&typed(&[30.0, 30.0, 20.0], &[5.0, 5.0, 10.0]));
         assert_eq!(findings, vec![(Role::Amplifier, Confidence::MEDIUM)]);
+    }
+
+    #[test]
+    fn counter_pair_scan_is_admitted_before_reading_the_tracks() {
+        let typed = typed(&[30.0, 30.0, 20.0], &[5.0, 5.0, 10.0]);
+        let lens = SharedBufferMissesLens;
+        let lenses: [&dyn Lens; 1] = [&lens];
+        let config =
+            IncidentConfig::for_test_with_work_limit("node", 5, 1_000, ClockRelation::Unknown, 2);
+        let outcome = analyze(
+            vec![episode_window(0, 10)],
+            &SeriesSet::for_test(0),
+            &typed,
+            &lenses,
+            &config,
+        )
+        .expect("work exhaustion returns a partial result");
+
+        assert!(!outcome.complete);
+        assert!(outcome.incidents[0].findings.is_empty());
+        assert_eq!(outcome.skipped[0].limit.axis, LimitAxis::Work);
     }
 
     #[test]
@@ -1840,7 +2199,7 @@ mod tests {
         assert_eq!(active_catalog().len(), ids.len());
     }
 
-    // One-second interval; the recovered delta equals `delta`.
+    // One-second interval with the same delta and rate.
     fn pair(
         section: &'static str,
         column_a: &'static str,
@@ -1888,11 +2247,14 @@ mod tests {
         }
     }
 
-    /// The numeric reading a lens published as its first gauge observation.
-    struct GaugeReading {
+    struct CounterReading {
+        kind: CounterMeasurementKind,
+        formula: &'static str,
         unit: GaugeUnit,
         value: f64,
-        operands: Option<(f64, f64)>,
+        operands: Vec<(&'static str, f64, GaugeUnit, CounterOperandPurpose)>,
+        usable_intervals: u64,
+        excluded_intervals: u64,
     }
 
     fn first_reading(
@@ -1900,7 +2262,7 @@ mod tests {
         section: &'static str,
         column: &'static str,
         typed: &TypedInputs,
-    ) -> Option<GaugeReading> {
+    ) -> Option<CounterReading> {
         let lenses: [&dyn Lens; 1] = [lens];
         let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
         let outcome = analyze(
@@ -1912,31 +2274,29 @@ mod tests {
         )
         .expect("valid analysis");
         let finding = outcome.incidents[0].findings.first()?;
-        let Evidence::GaugeObservation(gauge) = finding.evidence().first()? else {
+        let Evidence::CounterAggregate(counter) = finding.evidence().first()? else {
             return None;
         };
-        let reading = match gauge.measurement() {
-            GaugeMeasurement::Value(v) => GaugeReading {
-                unit: gauge.unit(),
-                value: v.get(),
-                operands: None,
-            },
-            GaugeMeasurement::Ratio {
-                numerator,
-                denominator,
-                ..
-            } => GaugeReading {
-                unit: gauge.unit(),
-                value: numerator.get() / denominator.get(),
-                operands: Some((numerator.get(), denominator.get())),
-            },
-            GaugeMeasurement::Trend { first, last, .. } => GaugeReading {
-                unit: gauge.unit(),
-                value: last.get() - first.get(),
-                operands: None,
-            },
-        };
-        Some(reading)
+        Some(CounterReading {
+            kind: counter.kind(),
+            formula: counter.formula(),
+            unit: counter.unit(),
+            value: counter.value().get(),
+            operands: counter
+                .operands()
+                .iter()
+                .map(|operand| {
+                    (
+                        operand.name(),
+                        operand.value().get(),
+                        operand.unit(),
+                        operand.purpose(),
+                    )
+                })
+                .collect(),
+            usable_intervals: counter.window().usable_intervals(),
+            excluded_intervals: counter.window().excluded_intervals(),
+        })
     }
 
     fn run_lens(
@@ -1965,18 +2325,26 @@ mod tests {
 
     #[test]
     fn cold_cache_publishes_the_miss_ratio_operands() {
-        // 80 misses over 100 accesses: numerator 80, denominator 100.
+        // 80 reads and 20 hits produce an 0.8 miss ratio.
         let reading = first_reading(
             &SharedBufferMissesLens,
             PG_STAT_DATABASE,
             "blks_read",
             &typed(&[30.0, 30.0, 20.0], &[5.0, 5.0, 10.0]),
         )
-        .expect("a cold cache reports a gauge observation");
+        .expect("a cold cache reports counter evidence");
+        assert_eq!(reading.kind, CounterMeasurementKind::Ratio);
+        assert_eq!(reading.formula, "blks_read / (blks_read + blks_hit)");
         assert_eq!(reading.unit, GaugeUnit::Ratio);
-        let (numerator, denominator) = reading.operands.expect("a ratio carries operands");
-        assert!((numerator - 80.0).abs() < 1e-9);
-        assert!((denominator - 100.0).abs() < 1e-9);
+        assert!((reading.value - 0.8).abs() < 1e-9);
+        assert_eq!(reading.operands[0].0, "blks_read");
+        assert!((reading.operands[0].1 - 80.0).abs() < 1e-9);
+        assert_eq!(reading.operands[1].0, "blks_hit");
+        assert!((reading.operands[1].1 - 20.0).abs() < 1e-9);
+        assert_eq!(
+            (reading.usable_intervals, reading.excluded_intervals),
+            (3, 0)
+        );
     }
 
     #[test]
@@ -1989,10 +2357,14 @@ mod tests {
             &[1.0, 1.0, 1.0],
         );
         let reading = first_reading(&TempSpillLens, PG_STAT_DATABASE, "temp_bytes", &typed)
-            .expect("a spill reports a gauge observation");
+            .expect("a spill reports counter evidence");
+        assert_eq!(reading.kind, CounterMeasurementKind::Sum);
         assert_eq!(reading.unit, GaugeUnit::Bytes);
         assert!((reading.value - 24_576.0).abs() < 1e-9);
-        assert_eq!(reading.operands, None);
+        assert_eq!(reading.operands[0].0, "temp_bytes");
+        assert!((reading.operands[0].1 - 24_576.0).abs() < 1e-9);
+        assert_eq!(reading.operands[1].0, "temp_files");
+        assert!((reading.operands[1].1 - 3.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2006,10 +2378,14 @@ mod tests {
             &[4.0, 3.0, 3.0],
         );
         let reading = first_reading(&BackendIoLatencyLens, PG_STAT_IO, "read_time", &typed)
-            .expect("slow reads report a gauge observation");
-        assert_eq!(reading.unit, GaugeUnit::Milliseconds);
+            .expect("slow reads report counter evidence");
+        assert_eq!(reading.formula, "read_time / reads");
+        assert_eq!(reading.unit, GaugeUnit::MillisecondsPerRead);
         assert!((reading.value - 3.0).abs() < 1e-9);
-        assert_eq!(reading.operands, None);
+        assert_eq!(reading.operands[0].0, "read_time");
+        assert!((reading.operands[0].1 - 30.0).abs() < 1e-9);
+        assert_eq!(reading.operands[1].0, "reads");
+        assert!((reading.operands[1].1 - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2028,11 +2404,13 @@ mod tests {
             "n_tup_upd",
             &typed,
         )
-        .expect("hot-update failure reports a gauge observation");
+        .expect("hot-update failure reports counter evidence");
         assert_eq!(reading.unit, GaugeUnit::Ratio);
-        let (numerator, denominator) = reading.operands.expect("a ratio carries operands");
-        assert!((numerator - 9.0).abs() < 1e-9);
-        assert!((denominator - 15.0).abs() < 1e-9);
+        assert!((reading.value - 0.6).abs() < 1e-9);
+        assert_eq!(reading.operands[0].0, "n_tup_hot_upd");
+        assert!((reading.operands[0].1 - 6.0).abs() < 1e-9);
+        assert_eq!(reading.operands[1].0, "n_tup_upd");
+        assert!((reading.operands[1].1 - 15.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2051,10 +2429,13 @@ mod tests {
             "failed_count",
             &typed,
         )
-        .expect("an archiving failure reports a gauge observation");
+        .expect("an archiving failure reports counter evidence");
         assert_eq!(reading.unit, GaugeUnit::Count);
         assert!((reading.value - 5.0).abs() < 1e-9);
-        assert_eq!(reading.operands, None);
+        assert_eq!(reading.operands[0].0, "failed_count");
+        assert!((reading.operands[0].1 - 5.0).abs() < 1e-9);
+        assert_eq!(reading.operands[1].0, "archived_count");
+        assert!((reading.operands[1].1 - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2070,6 +2451,29 @@ mod tests {
         assert_eq!(
             run_lens(&WalAmplificationLens, PG_STAT_WAL, "wal_fpi", &typed),
             vec![(Role::Amplifier, Confidence::MEDIUM)]
+        );
+        let reading = first_reading(&WalAmplificationLens, PG_STAT_WAL, "wal_fpi", &typed)
+            .expect("WAL amplification reports counter evidence");
+        assert_eq!(reading.formula, "wal_fpi / wal_records");
+        assert_eq!(reading.unit, GaugeUnit::Ratio);
+        assert!((reading.value - 0.6).abs() < 1e-9);
+        assert_eq!(
+            reading.operands[0],
+            (
+                "wal_fpi",
+                6.0,
+                GaugeUnit::Count,
+                CounterOperandPurpose::Formula
+            )
+        );
+        assert_eq!(
+            reading.operands[1],
+            (
+                "wal_records",
+                10.0,
+                GaugeUnit::Count,
+                CounterOperandPurpose::Formula
+            )
         );
     }
 
@@ -2182,6 +2586,36 @@ mod tests {
                 &typed
             ),
             vec![(Role::Amplifier, Confidence::MEDIUM)]
+        );
+        let reading = first_reading(
+            &RequestedCheckpointsLens,
+            CHECKPOINTER,
+            "checkpoints_req",
+            &typed,
+        )
+        .expect("requested checkpoints report counter evidence");
+        assert_eq!(
+            reading.formula,
+            "checkpoints_req / (checkpoints_req + checkpoints_timed)"
+        );
+        assert!((reading.value - 0.75).abs() < 1e-9);
+        assert_eq!(
+            reading.operands[0],
+            (
+                "checkpoints_req",
+                9.0,
+                GaugeUnit::Count,
+                CounterOperandPurpose::Formula
+            )
+        );
+        assert_eq!(
+            reading.operands[1],
+            (
+                "checkpoints_timed",
+                3.0,
+                GaugeUnit::Count,
+                CounterOperandPurpose::Formula
+            )
         );
     }
 
@@ -2446,6 +2880,28 @@ mod tests {
             run_lens(&NetworkErrorsLens, OS_NETDEV, "rx_errs", &typed),
             vec![(Role::Coincident, Confidence::LOW)]
         );
+        let reading = first_reading(&NetworkErrorsLens, OS_NETDEV, "rx_errs", &typed)
+            .expect("network errors report counter evidence");
+        assert_eq!(reading.formula, "rx_errs / rx_packets");
+        assert!((reading.value - 0.02).abs() < 1e-9);
+        assert_eq!(
+            reading.operands[0],
+            (
+                "rx_errs",
+                2.0,
+                GaugeUnit::Count,
+                CounterOperandPurpose::Formula
+            )
+        );
+        assert_eq!(
+            reading.operands[1],
+            (
+                "rx_packets",
+                100.0,
+                GaugeUnit::Count,
+                CounterOperandPurpose::Formula
+            )
+        );
     }
 
     #[test]
@@ -2487,14 +2943,14 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_throttling_reports_a_medium_amplifier_above_the_floor() {
-        // 300 of 1000 us throttled = 0.3, three intervals.
+    fn cgroup_throttling_reports_a_medium_coincident_above_the_floor() {
+        // 600,000 throttled microseconds over three seconds = 200,000 us/s.
         let typed = pair(
             OS_CGROUP_CPU,
             "throttled_usec",
-            &[100.0, 100.0, 100.0],
+            &[200_000.0, 200_000.0, 200_000.0],
             "usage_usec",
-            &[200.0, 200.0, 300.0],
+            &[400_000.0, 400_000.0, 400_000.0],
         );
         assert_eq!(
             run_lens(
@@ -2503,19 +2959,60 @@ mod tests {
                 "throttled_usec",
                 &typed
             ),
-            vec![(Role::Amplifier, Confidence::MEDIUM)]
+            vec![(Role::Coincident, Confidence::MEDIUM)]
+        );
+        let reading = first_reading(
+            &CgroupCpuThrottlingLens,
+            OS_CGROUP_CPU,
+            "throttled_usec",
+            &typed,
+        )
+        .expect("cgroup throttling reports counter evidence");
+        assert_eq!(reading.kind, CounterMeasurementKind::Rate);
+        assert_eq!(
+            reading.formula,
+            "throttled_usec * 1000000 / summed_interval_duration_us"
+        );
+        assert_eq!(reading.unit, GaugeUnit::MicrosecondsPerSecond);
+        assert!((reading.value - 200_000.0).abs() < 1e-9);
+        assert_eq!(
+            reading.operands[0],
+            (
+                "throttled_usec",
+                600_000.0,
+                GaugeUnit::Microseconds,
+                CounterOperandPurpose::Formula
+            )
+        );
+        assert_eq!(
+            reading.operands[1],
+            (
+                "summed_interval_duration_us",
+                3_000_000.0,
+                GaugeUnit::Microseconds,
+                CounterOperandPurpose::Formula
+            )
+        );
+        assert_eq!(
+            reading.operands[2],
+            (
+                "usage_usec",
+                1_200_000.0,
+                GaugeUnit::Microseconds,
+                CounterOperandPurpose::AlignedContext
+            )
         );
     }
 
     #[test]
     fn cgroup_throttling_below_the_floor_reports_nothing() {
-        // 30 of 1030 us throttled = 3%, below 10%.
+        // 30,000 throttled microseconds over three seconds = 10,000 us/s.
         let typed = pair(
             OS_CGROUP_CPU,
             "throttled_usec",
-            &[10.0, 10.0, 10.0],
+            &[10_000.0, 10_000.0, 10_000.0],
             "usage_usec",
-            &[330.0, 330.0, 340.0],
+            &[330_000.0, 330_000.0, 340_000.0],
         );
         assert!(
             run_lens(
@@ -2533,9 +3030,9 @@ mod tests {
         let typed = pair(
             OS_CGROUP_CPU,
             "throttled_usec",
-            &[100.0, 100.0],
+            &[200_000.0, 200_000.0],
             "usage_usec",
-            &[100.0, 100.0],
+            &[400_000.0, 400_000.0],
         );
         assert!(
             run_lens(
@@ -2747,7 +3244,7 @@ mod tests {
         .expect("valid analysis");
         assert!(!outcome.complete);
         assert!(outcome.incidents[0].findings.is_empty());
-        assert_eq!(outcome.skipped[0].limit.axis, super::super::LimitAxis::Work);
+        assert_eq!(outcome.skipped[0].limit.axis, LimitAxis::Work);
         assert_eq!(outcome.skipped[0].limit.observed, 8);
         assert_eq!(outcome.skipped[0].limit.limit, 5);
     }
@@ -3041,8 +3538,8 @@ mod tests {
         assert!(
             findings
                 .iter()
-                .all(|(_, confidence)| confidence.label() == "high"),
-            "direct edge evidence reaches high confidence on both sides"
+                .all(|(_, confidence)| confidence.label() == "medium"),
+            "missing lock target and mode cap both sides at medium"
         );
     }
 
