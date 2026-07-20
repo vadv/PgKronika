@@ -862,6 +862,10 @@ impl Evidence {
         matches!(self, Self::Direct(direct) if direct.proves_structural_direction(requested_role))
     }
 
+    const fn is_sampled_lock_edge(&self) -> bool {
+        matches!(self, Self::Direct(direct) if direct.lock_edge().is_some())
+    }
+
     pub(crate) const fn label(&self) -> &'static str {
         match self {
             Self::Direct(_) => "direct",
@@ -1039,6 +1043,18 @@ impl Finding {
 
     pub(crate) const fn role(&self) -> Role {
         self.role
+    }
+
+    /// Apply observation-time ordering only as a fallback. A sampled lock edge
+    /// owns its structural direction, including when a malformed draft was
+    /// downgraded to coincident.
+    pub(crate) fn apply_temporal_role(&mut self, role: Role) {
+        if self.role == Role::Coincident
+            && matches!(role, Role::Lead | Role::Downstream)
+            && !self.evidence.iter().any(Evidence::is_sampled_lock_edge)
+        {
+            self.role = role;
+        }
     }
 
     pub(crate) const fn confidence(&self) -> Confidence {
@@ -1269,7 +1285,7 @@ mod tests {
 
     #[test]
     fn sampled_lock_edge_only_proves_the_role_of_its_participant() {
-        let finding = Finding::from_draft(
+        let mut finding = Finding::from_draft(
             "PG-LOCK-012",
             ConfidenceCap::High,
             FindingDraft::new(
@@ -1285,6 +1301,12 @@ mod tests {
             ),
         );
         assert_eq!(finding.role(), Role::Coincident);
+        finding.apply_temporal_role(Role::Lead);
+        assert_eq!(
+            finding.role(),
+            Role::Coincident,
+            "observation time cannot reinterpret a conflicting lock edge"
+        );
 
         let finding = Finding::from_draft(
             "PG-LOCK-012",
