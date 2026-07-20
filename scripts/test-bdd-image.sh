@@ -380,20 +380,26 @@ test_builder_context_has_stable_dummy_targets() {
 }
 
 test_builder_realizes_exact_image_closure() {
-  local dockerfile cargo_line pg15_line pg17_line image_line
+  local dockerfile packages toolchain_line cargo_line pg15_line pg17_line image_line
   dockerfile="$ROOT/Dockerfile.bdd-builder"
+  packages=$(sed -n '/packages = {/,/} \/\/ pgMatrix;/p' "$ROOT/flake.nix")
+  printf '%s\n' "$packages" | grep -Fx -- '            rustToolchain' >/dev/null \
+    || fail "rustToolchain must be a top-level flake package"
+  assert_contains "$dockerfile" '    .#rustToolchain'
   assert_contains "$dockerfile" '    .#cargoArtifacts'
   assert_contains "$dockerfile" '    .#postgresql_15_plans \'
   assert_contains "$dockerfile" '    .#postgresql_16_plans'
   assert_contains "$dockerfile" '    .#postgresql_17_plans \'
   assert_contains "$dockerfile" '    .#postgresql_18_plans'
   assert_contains "$dockerfile" '    .#image'
-  assert_eq "$(grep -c '^RUN nix build' "$dockerfile")" 4
+  assert_eq "$(grep -c '^RUN nix build' "$dockerfile")" 5
+  toolchain_line=$(grep -nF '.#rustToolchain' "$dockerfile" | cut -d: -f1)
   cargo_line=$(grep -nF '.#cargoArtifacts' "$dockerfile" | cut -d: -f1)
   pg15_line=$(grep -nF '.#postgresql_15_plans' "$dockerfile" | cut -d: -f1)
   pg17_line=$(grep -nF '.#postgresql_17_plans' "$dockerfile" | cut -d: -f1)
   image_line=$(grep -nF '.#image' "$dockerfile" | cut -d: -f1)
-  [ "$cargo_line" -lt "$pg15_line" ] && [ "$pg15_line" -lt "$pg17_line" ] && [ "$pg17_line" -lt "$image_line" ] \
+  [ "$toolchain_line" -lt "$cargo_line" ] && [ "$cargo_line" -lt "$pg15_line" ] \
+    && [ "$pg15_line" -lt "$pg17_line" ] && [ "$pg17_line" -lt "$image_line" ] \
     || fail "builder closure layers are out of order"
   assert_not_contains "$dockerfile" 'nix-store --realise'
 }

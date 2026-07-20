@@ -9,9 +9,14 @@ RUN find /work -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
 # Each command realizes a top-level flake output, so Docker can download the
 # independent closure groups concurrently without maintaining an incidental
-# package list. The final output still proves that the builder contains the
-# complete source-independent image closure.
+# package list. The toolchain is separate because the combined
+# toolchain/artifact layer dominated the manifest; the final output still
+# proves the complete source-independent image closure.
 COPY . .
+
+RUN nix build \
+    --no-link \
+    .#rustToolchain
 
 RUN nix build \
     --no-link \

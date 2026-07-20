@@ -178,6 +178,7 @@
             postgresql_16_plans
             postgresql_17_plans
             postgresql_18_plans
+            rustToolchain
             ;
         } // pgMatrix;
 
