@@ -976,7 +976,7 @@ mod tests {
     }
 
     /// The active lens ids the incidents endpoint advertises, in catalog order.
-    const ACTIVE_LENS_IDS: [&str; 29] = [
+    const ACTIVE_LENS_IDS: &[&str] = &[
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -996,6 +996,11 @@ mod tests {
         "PG-SLOT-016",
         "OS-CGMEM-023",
         "OS-FS-027",
+        "PG-QRY-001",
+        "PG-PLAN-002",
+        "OS-CPU-020",
+        "OS-BLOCK-024",
+        "OS-IOWHO-026",
         "PG-HORIZON-013",
         "PG-SYNC-018",
         "PG-WAIT-019",
@@ -1084,21 +1089,14 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(
-            dormant.len(),
-            5,
-            "28 core lenses minus 23 active core lenses"
-        );
+        assert_eq!(dormant.len(), 0, "all 28 core lenses are active");
         assert!(
             dormant
                 .iter()
                 .all(|entry| entry["lens_id"] != "PG-LOCK-012"),
             "the lock lens is now active, not dormant"
         );
-        assert!(
-            dormant.iter().any(|entry| entry["lens_id"] == "PG-QRY-001"),
-            "a still-dormant lens remains listed"
-        );
+        assert!(dormant.is_empty());
         let incidents = body["incidents"].as_array().expect("incidents is an array");
         assert!(
             !incidents.is_empty(),

@@ -86,6 +86,12 @@ pub struct StorageMount {
     pub total_bytes: Option<i64>,
     /// Bytes available to an unprivileged writer (`f_bavail`).
     pub available_bytes: Option<i64>,
+    /// Local block-device major number when the mount maps to one.
+    pub major: Option<i64>,
+    /// Local block-device minor number when the mount maps to one.
+    pub minor: Option<i64>,
+    /// `true` only for a nonzero local block-device pair.
+    pub block_device_exact: bool,
 }
 
 fn hash128(parts: &[&[u8]]) -> Hash128 {
@@ -280,6 +286,9 @@ fn storage_mount(
         mapping_state: reason.code(),
         total_bytes: None,
         available_bytes: None,
+        major: None,
+        minor: None,
+        block_device_exact: false,
     };
     if !raw_path.is_absolute() {
         return failure(JoinFailure::PathUnavailable);
@@ -309,6 +318,7 @@ fn storage_mount(
         mount.root.as_bytes(),
         mount.mount_point.as_bytes(),
     ]);
+    let block_device_exact = mount.major > 0 && mount.source.starts_with("/dev/");
     let Some(space) = statvfs(&mount.mount_point) else {
         return StorageMount {
             role,
@@ -318,6 +328,9 @@ fn storage_mount(
             mapping_state: JoinFailure::CapacityUnavailable.code(),
             total_bytes: None,
             available_bytes: None,
+            major: block_device_exact.then_some(i64::from(mount.major)),
+            minor: block_device_exact.then_some(i64::from(mount.minor)),
+            block_device_exact,
         };
     };
     StorageMount {
@@ -328,6 +341,9 @@ fn storage_mount(
         mapping_state: 1,
         total_bytes: Some(space.total_bytes),
         available_bytes: Some(space.free_bytes),
+        major: block_device_exact.then_some(i64::from(mount.major)),
+        minor: block_device_exact.then_some(i64::from(mount.minor)),
+        block_device_exact,
     }
 }
 
@@ -570,13 +586,41 @@ mod tests {
             mount(1, root.path().to_str().expect("utf8 root")),
             mount(2, wal.to_str().expect("utf8 wal")),
         ];
-        let rows =
-            map_postgresql_storage(&ProcFs::new(proc_root), namespace, &data, &[], &mounts, 2)
-                .expect("bounded map");
+        let rows = map_postgresql_storage(
+            &ProcFs::new(proc_root.clone()),
+            namespace,
+            &data,
+            &[],
+            &mounts,
+            2,
+        )
+        .expect("bounded map");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.mapping_state == 1));
         assert_ne!(rows[0].mount_hash, rows[1].mount_hash);
         assert!(rows.iter().all(|row| row.total_bytes.is_some()));
+        assert!(rows.iter().all(|row| row.block_device_exact));
+        assert_eq!((rows[0].major, rows[0].minor), (Some(8), Some(1)));
+        assert_eq!((rows[1].major, rows[1].minor), (Some(8), Some(2)));
+
+        let mut remote_mounts = mounts.clone();
+        for mount in &mut remote_mounts {
+            mount.source = "server:/volume".to_owned();
+        }
+        let remote = map_postgresql_storage(
+            &ProcFs::new(proc_root),
+            namespace,
+            &data,
+            &[],
+            &remote_mounts,
+            2,
+        )
+        .expect("remote mount map");
+        assert!(
+            remote.iter().all(|row| {
+                !row.block_device_exact && row.major.is_none() && row.minor.is_none()
+            })
+        );
     }
 
     #[test]

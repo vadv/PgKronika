@@ -185,7 +185,7 @@ pub(crate) async fn collect_main_conn_sources(
                             type_id,
                             1,
                             u8::from(!read.full_visibility),
-                            read.source_rows,
+                            u64::try_from(read.source_rows).unwrap_or(u64::MAX),
                             0,
                         )),
                     )
@@ -199,7 +199,7 @@ pub(crate) async fn collect_main_conn_sources(
                             type_id,
                             0,
                             u8::from(!read.full_visibility),
-                            read.source_rows,
+                            u64::try_from(read.source_rows).unwrap_or(u64::MAX),
                             collected,
                         )),
                     )

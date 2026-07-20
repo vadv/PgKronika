@@ -162,6 +162,7 @@ pub const fn registry() -> &'static [TypeContract] {
         incident_gauges::PgReplicationSlotRetentionV2::CONTRACT,
         incident_gauges::PgReplicationSlotRetentionV3::CONTRACT,
         incident_gauges::PgStorageMountV1::CONTRACT,
+        incident_gauges::PgStorageMountV2::CONTRACT,
         incident_gauges::PgProcessCgroupMemoryV1::CONTRACT,
         snapshot_coverage::SnapshotCoverageV1::CONTRACT,
         os_process::OsProcess::CONTRACT,

@@ -13,7 +13,7 @@
 //! a rated timeline, so a lens over it reports a sampled observation, never a
 //! direction inferred from a trend.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use kronika_analytics::DiffPoint;
@@ -54,6 +54,13 @@ impl CounterPoint {
             DiffPoint::Value { .. } | DiffPoint::NoData { .. } => None,
         }
     }
+
+    fn interval_us(self) -> Option<u64> {
+        match self.point {
+            DiffPoint::Value { dt_micros, .. } => u64::try_from(dt_micros).ok(),
+            DiffPoint::NoData { .. } => None,
+        }
+    }
 }
 
 /// Sum of two columns' deltas over the intervals where both are usable.
@@ -63,6 +70,45 @@ pub(crate) struct PairedSums {
     pub sum_b: f64,
     /// Number of intervals both columns contributed to.
     pub intervals: usize,
+}
+
+/// Sums for a fixed set of cumulative columns over exactly the same usable
+/// intervals. Lenses use `len` entries of `sums`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AlignedSums {
+    pub sums: [f64; 16],
+    pub len: usize,
+    pub intervals: usize,
+    pub last_end_us: i64,
+    pub elapsed_us: u64,
+}
+
+/// One privacy-reduced `pg_store_plans` row. Plan text and names never enter
+/// incident input.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PlanSample {
+    pub ts: i64,
+    pub fork: PlanFork,
+    pub queryid: i64,
+    pub planid: i64,
+    pub userid: u64,
+    pub dbid: u64,
+    pub calls: f64,
+    pub total_time_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PlanFork {
+    Ossc,
+    Vadv,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessCgroupSample {
+    pub ts: i64,
+    pub pid: i64,
+    pub starttime: i64,
+    pub cgroup_path: Box<str>,
 }
 
 /// One gauge column's raw readings for one series, in snapshot-time order.
@@ -508,6 +554,10 @@ pub(crate) struct TypedInputs {
     gauges: GaugeTracks,
     activity: Vec<ActivitySnapshot>,
     locks: Vec<LockSnapshot>,
+    plans: Vec<PlanSample>,
+    process_cgroups: BTreeMap<(i64, i64, i64), Box<str>>,
+    cgroup_devices: BTreeMap<Box<str>, Vec<Arc<[IdentityValue]>>>,
+    postgres_storage_devices: BTreeSet<(i64, i64)>,
 }
 
 impl TypedInputs {
@@ -517,6 +567,10 @@ impl TypedInputs {
             gauges: BTreeMap::new(),
             activity: Vec::new(),
             locks: Vec::new(),
+            plans: Vec::new(),
+            process_cgroups: BTreeMap::new(),
+            cgroup_devices: BTreeMap::new(),
+            postgres_storage_devices: BTreeSet::new(),
         }
     }
 
@@ -531,6 +585,15 @@ impl TypedInputs {
             .into_iter()
             .map(|(end_us, point)| CounterPoint { end_us, point })
             .collect();
+        if section == "os_cgroup_io"
+            && column == "rbytes"
+            && let [IdentityValue::Text(path), ..] = identity.as_ref()
+        {
+            let entities = self.cgroup_devices.entry(path.clone().into()).or_default();
+            if !entities.contains(&identity) {
+                entities.push(Arc::clone(&identity));
+            }
+        }
         self.counters.insert(
             TrackKey {
                 section,
@@ -552,6 +615,38 @@ impl TypedInputs {
             column,
             identity: Arc::from(identity),
         })
+    }
+
+    pub(crate) fn counter_identity_count(
+        &self,
+        section: &'static str,
+        column: &'static str,
+    ) -> usize {
+        self.counters
+            .keys()
+            .filter(|key| key.section == section && key.column == column)
+            .count()
+    }
+
+    pub(crate) fn has_counter(
+        &self,
+        section: &'static str,
+        column: &'static str,
+        identity: &[IdentityValue],
+    ) -> bool {
+        self.counter(section, column, identity).is_some()
+    }
+
+    pub(crate) fn counter_identities(
+        &self,
+        section: &'static str,
+        column: &'static str,
+    ) -> Vec<Arc<[IdentityValue]>> {
+        self.counters
+            .keys()
+            .filter(|key| key.section == section && key.column == column)
+            .map(|key| Arc::clone(&key.identity))
+            .collect()
     }
 
     /// Sum `column_a` and `column_b` deltas of one series inside
@@ -599,6 +694,166 @@ impl TypedInputs {
             }
         }
         Some(sums)
+    }
+
+    pub(crate) fn aligned_counter_points(
+        &self,
+        section: &'static str,
+        identity: &[IdentityValue],
+        columns: &[&'static str],
+    ) -> usize {
+        columns.iter().fold(0_usize, |total, column| {
+            total.saturating_add(
+                self.counter(section, column, identity)
+                    .map_or(0, |track| track.points.len()),
+            )
+        })
+    }
+
+    /// Sum at most 16 columns over the intersection of their usable interval
+    /// endpoints. A reset, gate, gap, or missing point removes the whole
+    /// interval from every operand.
+    pub(crate) fn aligned_delta_sums(
+        &self,
+        section: &'static str,
+        identity: &[IdentityValue],
+        columns: &[&'static str],
+        from_us: i64,
+        to_us: i64,
+    ) -> Option<AlignedSums> {
+        if columns.is_empty() || columns.len() > 16 || from_us > to_us {
+            return None;
+        }
+        let tracks: Vec<&CounterTrack> = columns
+            .iter()
+            .map(|column| self.counter(section, column, identity))
+            .collect::<Option<_>>()?;
+        let mut indexes = vec![0_usize; tracks.len()];
+        let mut result = AlignedSums {
+            sums: [0.0; 16],
+            len: tracks.len(),
+            intervals: 0,
+            last_end_us: from_us,
+            elapsed_us: 0,
+        };
+        loop {
+            let mut minimum = i64::MAX;
+            let mut maximum = i64::MIN;
+            for (track, &index) in tracks.iter().zip(&indexes) {
+                let Some(point) = track.points.get(index) else {
+                    return Some(result);
+                };
+                minimum = minimum.min(point.end_us);
+                maximum = maximum.max(point.end_us);
+            }
+            if minimum != maximum {
+                for (track, index) in tracks.iter().zip(&mut indexes) {
+                    if track.points[*index].end_us == minimum {
+                        *index += 1;
+                    }
+                }
+                continue;
+            }
+            if (from_us..=to_us).contains(&minimum) {
+                let mut deltas = [0.0_f64; 16];
+                let mut usable = true;
+                let mut interval_us = None;
+                for (slot, (track, &index)) in deltas.iter_mut().zip(tracks.iter().zip(&indexes)) {
+                    let point = track.points[index];
+                    let (Some(delta), Some(point_interval_us)) =
+                        (point.delta(), point.interval_us())
+                    else {
+                        usable = false;
+                        break;
+                    };
+                    if interval_us.is_some_and(|expected| expected != point_interval_us) {
+                        usable = false;
+                        break;
+                    }
+                    interval_us = Some(point_interval_us);
+                    *slot = delta;
+                }
+                if usable {
+                    for (sum, delta) in result.sums.iter_mut().zip(deltas) {
+                        *sum += delta;
+                    }
+                    result.intervals = result.intervals.saturating_add(1);
+                    result.last_end_us = minimum;
+                    result.elapsed_us = result
+                        .elapsed_us
+                        .saturating_add(interval_us.unwrap_or_default());
+                }
+            }
+            for index in &mut indexes {
+                *index += 1;
+            }
+        }
+    }
+
+    pub(crate) fn insert_plan_samples(&mut self, mut samples: Vec<PlanSample>) {
+        self.plans.append(&mut samples);
+        self.plans.sort_by_key(|sample| {
+            (
+                sample.ts,
+                sample.fork,
+                sample.dbid,
+                sample.userid,
+                sample.queryid,
+                sample.planid,
+            )
+        });
+    }
+
+    pub(crate) fn plan_window(&self, from_us: i64, to_us: i64) -> &[PlanSample] {
+        let start = self.plans.partition_point(|sample| sample.ts < from_us);
+        let end = self.plans.partition_point(|sample| sample.ts <= to_us);
+        &self.plans[start..end]
+    }
+
+    pub(crate) fn process_is_postgres_backend(
+        &self,
+        pid: i64,
+        starttime: i64,
+        from_us: i64,
+        to_us: i64,
+    ) -> bool {
+        self.activity_window(from_us, to_us).any(|snapshot| {
+            snapshot
+                .backends
+                .iter()
+                .any(|backend| backend.pid == pid && backend.backend_start == starttime)
+        })
+    }
+
+    pub(crate) fn insert_process_cgroups(&mut self, samples: Vec<ProcessCgroupSample>) {
+        for sample in samples {
+            self.process_cgroups.insert(
+                (sample.pid, sample.starttime, sample.ts),
+                sample.cgroup_path,
+            );
+        }
+    }
+
+    pub(crate) fn process_cgroup_at(&self, pid: i64, starttime: i64, ts: i64) -> Option<&str> {
+        self.process_cgroups
+            .get(&(pid, starttime, ts))
+            .map(AsRef::as_ref)
+    }
+
+    pub(crate) fn cgroup_devices(&self, cgroup_path: &str) -> &[Arc<[IdentityValue]>] {
+        self.cgroup_devices
+            .get(cgroup_path)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn insert_postgres_storage_device(&mut self, major: i64, minor: i64) {
+        if major > 0 && minor >= 0 {
+            self.postgres_storage_devices.insert((major, minor));
+        }
+    }
+
+    pub(crate) fn is_postgres_storage_device(&self, major: i64, minor: i64) -> bool {
+        self.postgres_storage_devices.contains(&(major, minor))
     }
 
     pub(crate) fn insert_gauge(

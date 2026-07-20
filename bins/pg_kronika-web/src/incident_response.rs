@@ -287,6 +287,14 @@ fn identity_to_json(value: &IdentityValue) -> Value {
 }
 
 const CONTRACT_CAPABILITIES: &[(&str, &str)] = &[
+    ("PG-QRY-001", "pg_stat_statements"),
+    ("PG-PLAN-002", "pg_store_plans"),
+    ("PG-HORIZON-013", "pg_stat_activity"),
+    ("PG-SYNC-018", "pg_stat_activity"),
+    ("PG-WAIT-019", "pg_stat_activity"),
+    ("OS-CPU-020", "os_cpu"),
+    ("OS-BLOCK-024", "os_diskstats"),
+    ("OS-IOWHO-026", "os_process"),
     ("PG-LOCK-012", "pg_locks"),
     ("PG-VACUUM-005", "pg_vacuum_observation"),
     ("PG-FREEZE-006", "pg_freeze_horizon"),
@@ -319,6 +327,7 @@ fn catalog_to_json(
                     "reason": skip_reason_label(skip.reason),
                 });
             }
+            let mut provenance_available = false;
             if let Some(state) = capability_by_section.get(section) {
                 match state {
                     CapabilityInputState::NotCollected => {
@@ -337,10 +346,19 @@ fn catalog_to_json(
                             "reason": "provenance_or_input_missing",
                         });
                     }
-                    CapabilityInputState::Available => {}
+                    CapabilityInputState::Available => provenance_available = true,
                 }
             }
             let Some(gaps) = coverage.and_then(|sections| sections.get(section)) else {
+                if provenance_available {
+                    return json!({
+                        "lens_id": lens_id,
+                        "section": section,
+                        "status": "available",
+                        "reason": "complete_provenance",
+                        "gap_count": 0,
+                    });
+                }
                 return json!({
                     "lens_id": lens_id,
                     "section": section,
@@ -365,10 +383,10 @@ fn catalog_to_json(
         "scope": "diagnostic_lenses",
         "applied": applied,
         "active_count": applied_ids.len(),
-        "catalog_count": crate::incident::dormant_catalog().len()
+        "catalog_count": crate::incident::core_catalog().len()
             + applied_ids.iter().filter(|id| id.starts_with("PG-EVT-")).count(),
         "capabilities": capabilities,
-        "dormant": dormant_entries(crate::incident::dormant_catalog(), &applied_ids),
+        "dormant": dormant_entries(crate::incident::core_catalog(), &applied_ids),
     })
 }
 
@@ -541,7 +559,7 @@ mod tests {
     use super::*;
 
     /// The active lens ids in catalog order, mirrored from [`active_catalog`].
-    const APPLIED_IDS: [&str; 29] = [
+    const APPLIED_IDS: &[&str] = &[
         "PG-CACHE-010",
         "PG-WAL-009",
         "PG-TEMP-003",
@@ -561,6 +579,11 @@ mod tests {
         "PG-SLOT-016",
         "OS-CGMEM-023",
         "OS-FS-027",
+        "PG-QRY-001",
+        "PG-PLAN-002",
+        "OS-CPU-020",
+        "OS-BLOCK-024",
+        "OS-IOWHO-026",
         "PG-HORIZON-013",
         "PG-SYNC-018",
         "PG-WAIT-019",
@@ -692,29 +715,7 @@ mod tests {
         assert!(!bytes.is_empty());
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
         assert!(catalog.get("log_dormant").is_none());
-        let entry = &catalog["dormant"][0];
-        let keys: std::collections::BTreeSet<_> = entry
-            .as_object()
-            .expect("catalog entry")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            keys,
-            [
-                "awaiting",
-                "confidence_cap",
-                "domain",
-                "lens_id",
-                "question",
-                "requirements_status",
-                "slug",
-                "text_locale",
-                "title",
-            ]
-            .into_iter()
-            .collect()
-        );
+        assert!(catalog["dormant"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[test]
@@ -933,8 +934,8 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 5);
-        assert_eq!(body["catalog"]["active_count"], 29);
+        assert_eq!(dormant.len(), 0);
+        assert_eq!(body["catalog"]["active_count"], 34);
         assert_eq!(body["catalog"]["catalog_count"], 34);
         assert!(
             APPLIED_IDS.contains(&"PG-LOCK-012"),

@@ -68,10 +68,17 @@ impl PlansRead {
         }
     }
 
-    const fn rows_len(&self) -> usize {
+    pub(crate) const fn rows_len(&self) -> usize {
         match self {
             Self::Vadv(rows) => rows.len(),
             Self::Ossc(rows) => rows.len(),
+        }
+    }
+
+    pub(crate) fn snapshot_ts(&self) -> Option<i64> {
+        match self {
+            Self::Vadv(rows) => rows.first().map(|row| row.ts),
+            Self::Ossc(rows) => rows.first().map(|row| row.ts),
         }
     }
 

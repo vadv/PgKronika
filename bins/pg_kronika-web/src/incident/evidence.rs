@@ -148,6 +148,7 @@ pub(crate) enum GaugeUnit {
     Bytes,
     Kibibytes,
     Microseconds,
+    Milliseconds,
     Ratio,
     BytesPerSecond,
 }
@@ -159,6 +160,7 @@ impl GaugeUnit {
             Self::Bytes => "bytes",
             Self::Kibibytes => "KiB",
             Self::Microseconds => "microseconds",
+            Self::Milliseconds => "milliseconds",
             Self::Ratio => "ratio",
             Self::BytesPerSecond => "bytes_per_second",
         }

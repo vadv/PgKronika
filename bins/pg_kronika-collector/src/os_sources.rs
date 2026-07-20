@@ -1,11 +1,12 @@
 use crate::buffering::buffer_row;
 use crate::config::env_u64;
+use crate::coverage::snapshot_coverage;
 use crate::logging::{
     LogLevel, field, layout_id, log_collection_finish, log_count_degraded, log_event, section_name,
 };
 use crate::scheduler::{DueSet, SourceKind};
 use anyhow::Result;
-use kronika_registry::incident_gauges::{PgProcessCgroupMemoryV1, PgStorageMountV1};
+use kronika_registry::incident_gauges::{PgProcessCgroupMemoryV1, PgStorageMountV2};
 use kronika_registry::os_cgroup_cpu::OsCgroupCpu;
 use kronika_registry::os_cgroup_io::OsCgroupIo;
 use kronika_registry::os_cgroup_mapping::OsCgroupMapping;
@@ -25,6 +26,7 @@ use kronika_registry::os_snmp::OsSnmp;
 use kronika_registry::os_stat::OsStat;
 use kronika_registry::os_topology::OsTopology;
 use kronika_registry::os_vmstat::OsVmstat;
+use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
 use kronika_registry::{StrId, Ts};
 use kronika_source_os::proc::cpuinfo;
 use kronika_source_os::proc::loadavg::parse_loadavg;
@@ -79,8 +81,9 @@ pub(crate) struct OsSources {
     cgroup_io: Vec<OsCgroupIo>,
     cgroup_pids: Vec<OsCgroupPids>,
     mount_entries: Vec<MountEntry>,
-    pg_storage_mounts: Vec<PgStorageMountV1>,
+    pg_storage_mounts: Vec<PgStorageMountV2>,
     pg_process_cgroup_memory: Option<PgProcessCgroupMemoryV1>,
+    snapshot_coverage: Vec<SnapshotCoverageV1>,
 }
 
 impl OsSources {
@@ -108,6 +111,7 @@ impl OsSources {
             mount_entries: Vec::new(),
             pg_storage_mounts: Vec::new(),
             pg_process_cgroup_memory: None,
+            snapshot_coverage: Vec::new(),
         }
     }
 
@@ -530,7 +534,7 @@ pub(crate) fn collect_pg_os_joins(fs: &ProcFs, facts: Option<&LocalJoinFacts>, o
         Ok(rows) => {
             os.pg_storage_mounts = rows
                 .into_iter()
-                .map(|row| PgStorageMountV1 {
+                .map(|row| PgStorageMountV2 {
                     ts: Ts(facts.ts),
                     role: row.role,
                     path_hash_hi: row.path_hash.hi,
@@ -541,10 +545,13 @@ pub(crate) fn collect_pg_os_joins(fs: &ProcFs, facts: Option<&LocalJoinFacts>, o
                     mapping_state: row.mapping_state,
                     total_bytes: row.total_bytes,
                     available_bytes: row.available_bytes,
+                    major: row.major,
+                    minor: row.minor,
+                    block_device_exact: row.block_device_exact,
                 })
                 .collect();
         }
-        Err(reason) => os.pg_storage_mounts.push(PgStorageMountV1 {
+        Err(reason) => os.pg_storage_mounts.push(PgStorageMountV2 {
             ts: Ts(facts.ts),
             role: 0,
             path_hash_hi: 0,
@@ -555,6 +562,9 @@ pub(crate) fn collect_pg_os_joins(fs: &ProcFs, facts: Option<&LocalJoinFacts>, o
             mapping_state: reason.code(),
             total_bytes: None,
             available_bytes: None,
+            major: None,
+            minor: None,
+            block_device_exact: false,
         }),
     }
 }

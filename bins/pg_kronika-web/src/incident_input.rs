@@ -14,13 +14,19 @@ use crate::handlers::v1::{DIFF_MAX_ROWS, Gates};
 use crate::incident::{
     ActivityBackend, ActivitySnapshot, EnrichedEpisode, EpisodeRefV1, EventInputLimits,
     GaugeQuality, GaugeTrackInput, IdentityValue, LifecycleEvent, LifecycleKind, LockEdge,
-    LockSnapshot, LogCoverage, LogErrorGroup, LogEventInputs, Series, SeriesError,
-    SeriesInsertError, SeriesSet, SnapshotCompleteness, TypedInputs,
+    LockSnapshot, LogCoverage, LogErrorGroup, LogEventInputs, PlanFork, PlanSample,
+    ProcessCgroupSample, Series, SeriesError, SeriesInsertError, SeriesSet, SnapshotCompleteness,
+    TypedInputs,
 };
 
 /// Sections whose raw snapshots the sampled activity and lock lenses read.
 const PG_STAT_ACTIVITY: &str = "pg_stat_activity";
 const PG_LOCKS: &str = "pg_locks";
+const PG_STORE_PLANS_OSSC: &str = "pg_store_plans_ossc";
+const PG_STORE_PLANS_VADV: &str = "pg_store_plans_vadv";
+const PG_STORE_PLANS: &str = "pg_store_plans";
+const PG_STORAGE_MOUNT: &str = "pg_storage_mount";
+const OS_CGROUP_MAPPING: &str = "os_cgroup_mapping";
 const SNAPSHOT_COVERAGE: &str = "snapshot_coverage";
 
 /// Data exclusions recorded while building engine input.
@@ -460,6 +466,39 @@ fn read_i64(row: &OutRow, name: &str) -> Option<i64> {
     }
 }
 
+fn read_number(row: &OutRow, name: &str) -> Option<f64> {
+    match row_value(row, name)? {
+        Value::F64(value) if value.is_finite() => Some(*value),
+        Value::I64(value) => exact_i64_as_f64(*value),
+        Value::U64(value) => exact_u64_as_f64(*value),
+        _ => None,
+    }
+}
+
+fn exact_i64_as_f64(value: i64) -> Option<f64> {
+    const MAX_EXACT_INTEGER: i64 = 1_i64 << 53;
+    if !(-MAX_EXACT_INTEGER..=MAX_EXACT_INTEGER).contains(&value) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the preceding bound proves exact IEEE-754 integer representation"
+    )]
+    Some(value as f64)
+}
+
+fn exact_u64_as_f64(value: u64) -> Option<f64> {
+    const MAX_EXACT_INTEGER: u64 = 1_u64 << 53;
+    if value > MAX_EXACT_INTEGER {
+        return None;
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the preceding bound proves exact IEEE-754 integer representation"
+    )]
+    Some(value as f64)
+}
+
 fn read_ts(row: &OutRow, name: &str) -> Option<i64> {
     match row_value(row, name)? {
         Value::Ts(value) => Some(*value),
@@ -632,18 +671,27 @@ fn materialization_skip(name: &str, limit: usize) -> Result<SectionSkip, InputEr
 enum SnapshotMarkerState {
     Complete,
     Restricted,
+    Partial,
     Unavailable,
     Unknown,
 }
 
 struct SnapshotProvenance {
     activity: BTreeMap<i64, SnapshotMarkerState>,
+    statements: BTreeMap<i64, SnapshotMarkerState>,
+    plans_ossc: BTreeMap<i64, SnapshotMarkerState>,
+    plans_vadv: BTreeMap<i64, SnapshotMarkerState>,
+    processes: BTreeMap<i64, SnapshotMarkerState>,
     page_partial: bool,
 }
 
 impl SnapshotProvenance {
     fn from_page(page: Option<&SectionPage>) -> Self {
         let mut activity = BTreeMap::new();
+        let mut statements = BTreeMap::new();
+        let mut plans_ossc = BTreeMap::new();
+        let mut plans_vadv = BTreeMap::new();
+        let mut processes = BTreeMap::new();
         let page_partial =
             page.is_none_or(|page| page.next_cursor.is_some() || !page.gaps.is_empty());
         if let Some(page) = page {
@@ -656,22 +704,30 @@ impl SnapshotProvenance {
                 ) else {
                     continue;
                 };
-                if !matches!(source_type_id, 1_001_001..=1_001_003) {
+                let (Some(source_total), Some(collected)) =
+                    (read_u64(row, "source_total"), read_u64(row, "collected"))
+                else {
                     continue;
-                }
-                let counts_match = matches!(
-                    (read_u64(row, "source_total"), read_u64(row, "collected")),
-                    (Some(total), Some(collected)) if total == collected
-                );
+                };
+                let counts_match = source_total == collected;
                 let session_valid = read_u64(row, "collector_pid").is_some_and(|pid| pid > 0)
                     && read_ts(row, "collector_started_at").is_some_and(|start| start > 0);
                 let marker = match (read_state, visibility, counts_match, session_valid) {
                     (0, 0, true, true) => SnapshotMarkerState::Complete,
                     (0, 1, true, true) => SnapshotMarkerState::Restricted,
+                    (1, _, _, true) if collected > 0 => SnapshotMarkerState::Partial,
                     (1..=4, _, _, true) => SnapshotMarkerState::Unavailable,
                     _ => SnapshotMarkerState::Unknown,
                 };
-                activity
+                let target = match source_type_id {
+                    1_001_001..=1_001_003 => &mut activity,
+                    1_002_001..=1_002_006 => &mut statements,
+                    1_003_001 => &mut plans_ossc,
+                    1_004_001 => &mut plans_vadv,
+                    1_100_001 => &mut processes,
+                    _ => continue,
+                };
+                target
                     .entry(ts)
                     .and_modify(|current| {
                         if *current != marker {
@@ -683,6 +739,10 @@ impl SnapshotProvenance {
         }
         Self {
             activity,
+            statements,
+            plans_ossc,
+            plans_vadv,
+            processes,
             page_partial,
         }
     }
@@ -691,24 +751,29 @@ impl SnapshotProvenance {
         match self.activity.get(&ts) {
             Some(SnapshotMarkerState::Complete) => SnapshotCompleteness::Complete,
             Some(SnapshotMarkerState::Restricted) => SnapshotCompleteness::Restricted,
-            Some(SnapshotMarkerState::Unavailable | SnapshotMarkerState::Unknown) | None => {
-                SnapshotCompleteness::Unknown
-            }
+            Some(
+                SnapshotMarkerState::Partial
+                | SnapshotMarkerState::Unavailable
+                | SnapshotMarkerState::Unknown,
+            )
+            | None => SnapshotCompleteness::Unknown,
         }
     }
 
     fn activity_capability(&self) -> CapabilityInputState {
-        if self.page_partial || self.activity.is_empty() {
+        self.capability(&self.activity)
+    }
+
+    fn capability(&self, markers: &BTreeMap<i64, SnapshotMarkerState>) -> CapabilityInputState {
+        if self.page_partial || markers.is_empty() {
             return CapabilityInputState::Partial;
         }
-        if self
-            .activity
+        if markers
             .values()
             .all(|state| matches!(state, SnapshotMarkerState::Complete))
         {
             CapabilityInputState::Available
-        } else if self
-            .activity
+        } else if markers
             .values()
             .all(|state| matches!(state, SnapshotMarkerState::Unavailable))
         {
@@ -745,6 +810,35 @@ impl BuildState {
         let activity_capability = snapshot_provenance.activity_capability();
         let mut capability_by_section = BTreeMap::new();
         capability_by_section.insert(PG_STAT_ACTIVITY, activity_capability);
+        capability_by_section.insert(
+            "pg_stat_statements",
+            snapshot_provenance.capability(&snapshot_provenance.statements),
+        );
+        capability_by_section.insert(
+            PG_STORE_PLANS_OSSC,
+            snapshot_provenance.capability(&snapshot_provenance.plans_ossc),
+        );
+        capability_by_section.insert(
+            PG_STORE_PLANS_VADV,
+            snapshot_provenance.capability(&snapshot_provenance.plans_vadv),
+        );
+        let plan_capability = match (
+            capability_by_section.get(PG_STORE_PLANS_OSSC),
+            capability_by_section.get(PG_STORE_PLANS_VADV),
+        ) {
+            (Some(CapabilityInputState::Available), _)
+            | (_, Some(CapabilityInputState::Available)) => CapabilityInputState::Available,
+            (
+                Some(CapabilityInputState::NotCollected),
+                Some(CapabilityInputState::NotCollected),
+            ) => CapabilityInputState::NotCollected,
+            _ => CapabilityInputState::Partial,
+        };
+        capability_by_section.insert(PG_STORE_PLANS, plan_capability);
+        capability_by_section.insert(
+            "os_process",
+            snapshot_provenance.capability(&snapshot_provenance.processes),
+        );
         Self {
             episodes: Vec::new(),
             series: SeriesSet::new(limits.series_points),
@@ -983,7 +1077,7 @@ impl BuildState {
         diffs: &[SeriesDiff],
     ) {
         for series in diffs {
-            let Some(identity) = accept_identity(&series.key) else {
+            let Some(identity) = accept_identity(section, &series.key) else {
                 continue;
             };
             for (&name, column) in cumulative.iter().zip(&series.columns) {
@@ -1013,7 +1107,7 @@ impl BuildState {
     ) {
         let quality = GaugeQuality::new(gaps);
         for series in gauge_series {
-            let Some(identity) = accept_identity(&series.key) else {
+            let Some(identity) = accept_identity(section, &series.key) else {
                 continue;
             };
             let shared_breaks: std::sync::Arc<[i64]> = duplicate_breaks
@@ -1082,6 +1176,56 @@ impl BuildState {
                 }
                 for snapshot in snapshots {
                     self.typed.insert_lock_snapshot(snapshot);
+                }
+            }
+            PG_STORE_PLANS_OSSC | PG_STORE_PLANS_VADV => {
+                let observed = rows.len();
+                if self.withhold_snapshots(section, observed) {
+                    return;
+                }
+                let fork = if section == PG_STORE_PLANS_OSSC {
+                    PlanFork::Ossc
+                } else {
+                    PlanFork::Vadv
+                };
+                let samples = rows
+                    .iter()
+                    .filter_map(|row| plan_sample(row, fork))
+                    .collect();
+                self.typed.insert_plan_samples(samples);
+            }
+            OS_CGROUP_MAPPING => {
+                if self.withhold_snapshots(section, rows.len()) {
+                    return;
+                }
+                let samples = rows
+                    .iter()
+                    .filter_map(|row| {
+                        Some(ProcessCgroupSample {
+                            ts: read_ts(row, "ts")?,
+                            pid: read_i64(row, "pid")?,
+                            starttime: read_ts(row, "starttime")?,
+                            cgroup_path: read_str(row, "cgroup_path")?.into(),
+                        })
+                    })
+                    .collect();
+                self.typed.insert_process_cgroups(samples);
+            }
+            PG_STORAGE_MOUNT => {
+                if self.withhold_snapshots(section, rows.len()) {
+                    return;
+                }
+                for row in rows {
+                    if read_u8(row, "mapping_state") == Some(1)
+                        && matches!(
+                            row_value(row, "block_device_exact"),
+                            Some(Value::Bool(true))
+                        )
+                        && let (Some(major), Some(minor)) =
+                            (read_i64(row, "major"), read_i64(row, "minor"))
+                    {
+                        self.typed.insert_postgres_storage_device(major, minor);
+                    }
                 }
             }
             _ => {}
@@ -1160,6 +1304,31 @@ fn activity_backend(row: &OutRow, ts: i64) -> ActivityBackend {
             _ => None,
         },
     }
+}
+
+fn plan_sample(row: &OutRow, fork: PlanFork) -> Option<PlanSample> {
+    let queryid = read_i64(
+        row,
+        if fork == PlanFork::Ossc {
+            "queryid"
+        } else {
+            "queryid_stat_statements"
+        },
+    )?;
+    let sample = PlanSample {
+        ts: read_ts(row, "ts")?,
+        fork,
+        queryid,
+        planid: read_i64(row, "planid")?,
+        userid: read_u64(row, "userid")?,
+        dbid: read_u64(row, "dbid")?,
+        calls: read_number(row, "calls")?,
+        total_time_ms: read_number(row, "total_time")?,
+    };
+    ((sample.fork == PlanFork::Vadv || sample.queryid != 0)
+        && sample.calls >= 0.0
+        && sample.total_time_ms >= 0.0)
+        .then_some(sample)
 }
 
 /// A resolved string label, or `None` for `NULL` or any non-string cell.
@@ -1364,6 +1533,9 @@ fn canonical_identity_values(row: &OutRow, names: &[&str]) -> Option<Vec<Identit
             Value::U64(value) => Some(IdentityValue::U64(*value)),
             Value::Bool(value) => Some(IdentityValue::Bool(*value)),
             Value::Str(value) => Some(IdentityValue::Text(value.clone())),
+            Value::Null if *name == "toplevel" => {
+                Some(IdentityValue::Text("pre_toplevel_layout".to_owned()))
+            }
             Value::Null | Value::F64(_) | Value::Ts(_) | Value::Blob { .. } | Value::ListI32(_) => {
                 None
             }
@@ -1561,7 +1733,7 @@ fn ingest_section(
     let mut built_series = Vec::new();
     let mut remaining_points = series.remaining_points();
     for hit in hits {
-        let Some(identity) = canonical_identity(&hit.key, quality) else {
+        let Some(identity) = canonical_identity(logical.name, &hit.key, quality) else {
             continue;
         };
         let column = resolve_column(logical, &hit.column)?;
@@ -1614,14 +1786,21 @@ fn ingest_section(
 /// Only signed/unsigned integers, booleans, and resolved text encode into a
 /// series identity; a `Null`, float, timestamp, blob, or list drops the whole
 /// episode with a counted reason (§5.2 conservative rejection).
-fn canonical_identity(key: &[Value], quality: &mut InputQuality) -> Option<Vec<IdentityValue>> {
+fn canonical_identity(
+    section: &'static str,
+    key: &[Value],
+    quality: &mut InputQuality,
+) -> Option<Vec<IdentityValue>> {
     let mut identity = Vec::with_capacity(key.len());
-    for value in key {
+    for (index, value) in key.iter().enumerate() {
         let scalar = match value {
             Value::I64(v) => IdentityValue::I64(*v),
             Value::U64(v) => IdentityValue::U64(*v),
             Value::Bool(v) => IdentityValue::Bool(*v),
             Value::Str(text) => IdentityValue::Text(text.clone()),
+            Value::Null if section == "pg_stat_statements" && index == 3 && key.len() == 4 => {
+                IdentityValue::Text("pre_toplevel_layout".to_owned())
+            }
             Value::Null | Value::F64(_) | Value::Ts(_) | Value::Blob { .. } | Value::ListI32(_) => {
                 quality.non_canonical_identity = quality.non_canonical_identity.saturating_add(1);
                 return None;
@@ -1635,14 +1814,20 @@ fn canonical_identity(key: &[Value], quality: &mut InputQuality) -> Option<Vec<I
 /// Convert a series key to a canonical identity without counting, for typed
 /// retention. Mirrors [`canonical_identity`]'s accepted kinds; a rejected kind
 /// drops the series, which the episode path already excluded and counted.
-fn accept_identity(key: &[Value]) -> Option<std::sync::Arc<[IdentityValue]>> {
+fn accept_identity(
+    section: &'static str,
+    key: &[Value],
+) -> Option<std::sync::Arc<[IdentityValue]>> {
     let mut out = Vec::with_capacity(key.len());
-    for value in key {
+    for (index, value) in key.iter().enumerate() {
         out.push(match value {
             Value::I64(v) => IdentityValue::I64(*v),
             Value::U64(v) => IdentityValue::U64(*v),
             Value::Bool(v) => IdentityValue::Bool(*v),
             Value::Str(v) => IdentityValue::Text(v.clone()),
+            Value::Null if section == "pg_stat_statements" && index == 3 && key.len() == 4 => {
+                IdentityValue::Text("pre_toplevel_layout".to_owned())
+            }
             _ => return None,
         });
     }
@@ -1807,6 +1992,7 @@ mod tests {
     fn every_canonical_scalar_converts_and_the_rest_drop_the_episode() {
         let mut q = quality();
         let accepted = canonical_identity(
+            "test",
             &[
                 Value::I64(-7),
                 Value::U64(9),
@@ -1839,7 +2025,7 @@ mod tests {
         ] {
             let mut q = quality();
             assert_eq!(
-                canonical_identity(&[Value::I64(1), rejected], &mut q),
+                canonical_identity("test", &[Value::I64(1), rejected], &mut q),
                 None,
                 "a non-canonical value drops the whole identity"
             );
@@ -1850,12 +2036,15 @@ mod tests {
     #[test]
     fn accept_identity_mirrors_canonical_kinds_without_counting() {
         assert_eq!(
-            accept_identity(&[
-                Value::I64(-7),
-                Value::U64(9),
-                Value::Bool(true),
-                Value::Str("db".to_owned()),
-            ])
+            accept_identity(
+                "test",
+                &[
+                    Value::I64(-7),
+                    Value::U64(9),
+                    Value::Bool(true),
+                    Value::Str("db".to_owned()),
+                ],
+            )
             .as_deref(),
             Some(
                 [
@@ -1880,7 +2069,7 @@ mod tests {
             Value::ListI32(vec![1]),
         ] {
             assert_eq!(
-                accept_identity(&[Value::I64(1), rejected]).as_deref(),
+                accept_identity("test", &[Value::I64(1), rejected]).as_deref(),
                 None,
                 "a non-canonical value drops the whole identity"
             );
@@ -1890,7 +2079,7 @@ mod tests {
     #[test]
     fn an_empty_identity_is_the_canonical_singleton_key() {
         let mut q = quality();
-        assert_eq!(canonical_identity(&[], &mut q), Some(Vec::new()));
+        assert_eq!(canonical_identity("test", &[], &mut q), Some(Vec::new()));
         assert_eq!(q.non_canonical_identity, 0);
     }
 
@@ -2822,6 +3011,30 @@ mod tests {
             conflicting.activity_capability(),
             CapabilityInputState::Partial
         );
+    }
+
+    #[test]
+    fn plan_adapter_uses_the_fork_specific_queryid_bridge_without_text() {
+        let common = |query_column: &str, queryid: i64| {
+            vec![
+                cell("ts", Value::Ts(100)),
+                cell(query_column, Value::I64(queryid)),
+                cell("planid", Value::I64(9)),
+                cell("userid", Value::U64(10)),
+                cell("dbid", Value::U64(20)),
+                cell("calls", Value::I64(3)),
+                cell("total_time", Value::F64(12.5)),
+                cell("plan", Value::Str("must not be retained".to_owned())),
+            ]
+        };
+        let ossc = plan_sample(&common("queryid", 42), PlanFork::Ossc).expect("exact bridge");
+        let vadv = plan_sample(&common("queryid_stat_statements", 42), PlanFork::Vadv)
+            .expect("best-effort bridge");
+        assert_eq!((ossc.queryid, ossc.planid, ossc.calls), (42, 9, 3.0));
+        assert_eq!(vadv.fork, PlanFork::Vadv);
+        let unattributed = plan_sample(&common("queryid_stat_statements", 0), PlanFork::Vadv)
+            .expect("plan identity does not depend on best-effort attribution");
+        assert_eq!(unattributed.queryid, 0);
     }
 
     #[test]

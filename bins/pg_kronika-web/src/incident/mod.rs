@@ -12,6 +12,8 @@ mod gauge_contracts;
 mod lens;
 mod lenses;
 mod model;
+mod os_lenses;
+mod query_plan;
 mod series;
 mod typed;
 
@@ -21,7 +23,7 @@ pub(crate) use model::{EnrichedEpisode, EpisodeRefV1, IdentityValue};
 pub(crate) use series::{Series, SeriesError, SeriesInsertError, SeriesSet};
 pub(crate) use typed::{
     ActivityBackend, ActivitySnapshot, GaugeQuality, GaugeTrackInput, LockEdge, LockSnapshot,
-    SnapshotCompleteness, TypedInputs,
+    PlanFork, PlanSample, ProcessCgroupSample, SnapshotCompleteness, TypedInputs,
 };
 
 pub(crate) use active::{active_catalog, active_catalog_ids};
@@ -40,7 +42,9 @@ pub(crate) use evidence::{Evidence, Finding, GaugeMeasurement};
     reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"
 )]
 pub(crate) use lens::Lens;
-pub(crate) use lenses::{DormantLens, dormant_catalog};
+#[cfg(test)]
+pub(crate) use lenses::dormant_catalog;
+pub(crate) use lenses::{DormantLens, core_catalog};
 #[cfg(test)]
 pub(crate) use lenses::{
     MAX_CATALOG_TEXT_BYTES, MAX_CATALOG_TOKEN_BYTES, MAX_DORMANT_LENSES, MAX_MISSING_PER_LENS,

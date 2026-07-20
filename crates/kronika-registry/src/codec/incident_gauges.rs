@@ -287,6 +287,54 @@ pub struct PgStorageMountV1 {
     pub available_bytes: Option<i64>,
 }
 
+/// Version 2 adds immutable local block-device provenance without changing V1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
+#[section(
+    id = 1_036_002,
+    name = "pg_storage_mount",
+    semantics = snapshot_full,
+    sort_key("role", "path_hash_hi", "path_hash_lo", "ts"),
+    identity(
+        "role",
+        "path_hash_hi",
+        "path_hash_lo",
+        "mount_hash_hi",
+        "mount_hash_lo",
+        "mount_namespace"
+    )
+)]
+pub struct PgStorageMountV2 {
+    #[column(t)]
+    pub ts: Ts,
+    #[column(l)]
+    pub role: u8,
+    #[column(l)]
+    pub path_hash_hi: u64,
+    #[column(l)]
+    pub path_hash_lo: u64,
+    #[column(l)]
+    pub mount_hash_hi: u64,
+    #[column(l)]
+    pub mount_hash_lo: u64,
+    #[column(l)]
+    pub mount_namespace: u64,
+    #[column(g)]
+    pub mapping_state: u8,
+    #[column(g)]
+    pub total_bytes: Option<i64>,
+    #[column(g)]
+    pub available_bytes: Option<i64>,
+    /// Local device major number; `None` for remote/pseudo/unresolved mounts.
+    #[column(g)]
+    pub major: Option<i64>,
+    /// Local device minor number; paired with `major`.
+    #[column(g)]
+    pub minor: Option<i64>,
+    /// Whether `(major, minor)` is an exact nonzero local block-device mapping.
+    #[column(g)]
+    pub block_device_exact: bool,
+}
+
 /// Redacted, race-checked `PostgreSQL` process to cgroup-memory observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
 #[section(
@@ -342,6 +390,7 @@ mod tests {
             PgReplicationSlotRetentionV2::CONTRACT,
             PgReplicationSlotRetentionV3::CONTRACT,
             PgStorageMountV1::CONTRACT,
+            PgStorageMountV2::CONTRACT,
             PgProcessCgroupMemoryV1::CONTRACT,
         ];
         assert_eq!(lint(&contracts), Ok(()));

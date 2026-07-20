@@ -29,7 +29,7 @@ pub(crate) fn snapshot_coverage(
     source_type_id: u32,
     read_state: u8,
     visibility: u8,
-    source_total: usize,
+    source_total: u64,
     collected: usize,
 ) -> SnapshotCoverageV1 {
     SnapshotCoverageV1 {

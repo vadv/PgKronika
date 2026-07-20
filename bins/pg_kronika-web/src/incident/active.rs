@@ -17,6 +17,8 @@ use super::gauge_contracts::{
 };
 use super::lens::Lens;
 use super::model::IdentityValue;
+use super::os_lenses::{BlockDeviceLens, HostCpuLens, ProcessIoWhoLens};
+use super::query_plan::{PlanChurnLens, QueryWorkLens};
 use super::series::SeriesSet;
 use super::typed::{ActivityBackend, GaugeObjective, TypedInputs};
 #[cfg(test)]
@@ -1549,6 +1551,11 @@ pub(crate) fn active_catalog() -> Vec<Box<dyn Lens>> {
         Box::new(SlotRetentionLens),
         Box::new(CgroupMemoryLens),
         Box::new(StorageCapacityLens),
+        Box::new(QueryWorkLens),
+        Box::new(PlanChurnLens),
+        Box::new(HostCpuLens),
+        Box::new(BlockDeviceLens),
+        Box::new(ProcessIoWhoLens),
         Box::new(XminHorizonHoldLens),
         Box::new(SyncReplicationWaitLens),
         Box::new(InternalWaitConcentrationLens),
@@ -1708,6 +1715,11 @@ mod tests {
                 "PG-SLOT-016",
                 "OS-CGMEM-023",
                 "OS-FS-027",
+                "PG-QRY-001",
+                "PG-PLAN-002",
+                "OS-CPU-020",
+                "OS-BLOCK-024",
+                "OS-IOWHO-026",
                 "PG-HORIZON-013",
                 "PG-SYNC-018",
                 "PG-WAIT-019",
@@ -2444,8 +2456,9 @@ mod tests {
     #[test]
     fn active_and_dormant_lenses_are_accounted_once() {
         let active = active_catalog_ids();
-        assert_eq!(active.len(), 23);
-        assert_eq!(crate::incident::dormant_catalog().len() - active.len(), 5);
+        assert_eq!(active.len(), 28);
+        assert_eq!(crate::incident::core_catalog().len(), active.len());
+        assert!(crate::incident::dormant_catalog().is_empty());
         let unique: std::collections::BTreeSet<_> = active.iter().copied().collect();
         assert_eq!(unique.len(), active.len());
     }
