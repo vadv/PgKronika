@@ -7,13 +7,26 @@ ENV NIX_CONFIG="experimental-features = nix-command flakes"
 WORKDIR /work
 RUN find /work -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
-# Use the dependency-only workspace so crane computes the same `cargoArtifacts`
-# derivation and Nix realizes the complete source-independent image closure.
-# Manifest, lockfile, flake, or Dockerfile changes get a new builder tag;
-# source-only changes can reuse the old one.
+# Each command realizes a top-level flake output, so Docker can download the
+# independent closure groups concurrently without maintaining an incidental
+# package list. The final output still proves that the builder contains the
+# complete source-independent image closure.
 COPY . .
 
 RUN nix build \
-    .#image \
-    --out-link /tmp/bdd-image \
-  && rm -f /tmp/bdd-image
+    --no-link \
+    .#cargoArtifacts
+
+RUN nix build \
+    --no-link \
+    .#postgresql_15_plans \
+    .#postgresql_16_plans
+
+RUN nix build \
+    --no-link \
+    .#postgresql_17_plans \
+    .#postgresql_18_plans
+
+RUN nix build \
+    --no-link \
+    .#image
