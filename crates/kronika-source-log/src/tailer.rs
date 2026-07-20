@@ -179,6 +179,7 @@ pub(crate) fn read_batch(
     );
 
     let mut file = File::open(path)?;
+    let mut verify_sparse_tail = false;
     if let Some(data_offset) = seek_next_data(&file, cursor, file_size)? {
         if data_offset > cursor {
             gaps.sparse_bytes_skipped = gaps
@@ -188,12 +189,8 @@ pub(crate) fn read_batch(
             skip_until_newline = true;
         }
     } else {
-        gaps.sparse_bytes_skipped = gaps.sparse_bytes_skipped.saturating_add(file_size - cursor);
-        return Ok(TailBatch {
-            lines: Vec::new(),
-            gaps,
-            next_state: Some(next_state(path, parser_kind, identity, file_size, true)),
-        });
+        // Buffered data can be readable before SEEK_DATA reports its extent.
+        verify_sparse_tail = true;
     }
     file.seek(SeekFrom::Start(cursor))?;
 
@@ -221,6 +218,18 @@ pub(crate) fn read_batch(
             break;
         }
         remaining -= n;
+
+        if verify_sparse_tail && started.elapsed() < caps.max_duration {
+            if buf[..n].iter().all(|byte| *byte == 0) {
+                let skipped = u64::try_from(n).unwrap_or(u64::MAX);
+                cursor = cursor.saturating_add(skipped);
+                committed = cursor;
+                skip_until_newline = true;
+                gaps.sparse_bytes_skipped = gaps.sparse_bytes_skipped.saturating_add(skipped);
+                continue;
+            }
+            verify_sparse_tail = false;
+        }
 
         let mut consumed = 0_usize;
         while consumed < n && lines.len() < caps.max_lines {
@@ -549,23 +558,67 @@ mod tests {
     }
 
     #[test]
-    fn copytruncate_resets_to_file_start() {
+    fn repeated_copytruncate_never_loses_complete_lines() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("postgresql.log");
-        std::fs::write(&path, "old line\n").expect("write");
-        let first =
-            read_batch(&path, ParserKind::Stderr, None, false, TailCaps::default()).expect("read");
-        std::fs::write(&path, "new\n").expect("truncate");
-        let batch = read_batch(
-            &path,
-            ParserKind::Stderr,
-            first.next_state.as_ref(),
-            false,
-            TailCaps::default(),
-        )
-        .expect("read");
-        assert_eq!(batch.gaps.rotations, 1);
-        assert_eq!(batch.lines[0].bytes, b"new");
+        std::fs::write(&path, "old line long enough to detect truncation\n").expect("write");
+        let caps = TailCaps {
+            max_duration: std::time::Duration::MAX,
+            ..TailCaps::default()
+        };
+        let first = read_batch(&path, ParserKind::Stderr, None, false, caps).expect("read");
+        let mut state = first.next_state.expect("state");
+
+        for round in 0..256 {
+            let new_line = format!("new {round}");
+            std::fs::write(&path, format!("{new_line}\n")).expect("truncate");
+            let batch =
+                read_batch(&path, ParserKind::Stderr, Some(&state), false, caps).expect("read");
+            let lines: Vec<_> = batch
+                .lines
+                .iter()
+                .map(|line| line.bytes.as_slice())
+                .collect();
+            assert_eq!(batch.gaps.rotations, 1, "round {round}");
+            assert_eq!(lines, [new_line.as_bytes()], "round {round}");
+            state = batch.next_state.expect("state");
+
+            let old_line = format!("old line {round} long enough to detect truncation");
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            writeln!(file, "{old_line}").expect("append");
+            let batch =
+                read_batch(&path, ParserKind::Stderr, Some(&state), false, caps).expect("read");
+            let lines: Vec<_> = batch
+                .lines
+                .iter()
+                .map(|line| line.bytes.as_slice())
+                .collect();
+            assert_eq!(lines, [old_line.as_bytes()], "round {round}");
+            state = batch.next_state.expect("state");
+        }
+    }
+
+    #[test]
+    fn sparse_tail_fallback_obeys_byte_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("postgresql.log");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(1_048_576).expect("sparse tail");
+        let caps = TailCaps {
+            max_bytes: 1024,
+            max_duration: std::time::Duration::MAX,
+            ..TailCaps::default()
+        };
+
+        let batch = read_batch(&path, ParserKind::Stderr, None, true, caps).expect("read");
+        let offset = batch.next_state.expect("state").offset;
+        assert!(batch.lines.is_empty());
+        assert!(offset > 0);
+        assert!(offset <= u64::try_from(caps.max_bytes).unwrap_or(u64::MAX));
+        assert!(batch.gaps.has_any());
     }
 
     #[test]
