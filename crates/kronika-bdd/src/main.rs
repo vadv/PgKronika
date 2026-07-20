@@ -46,7 +46,7 @@ async fn boot_matrix_step(world: &mut BddWorld) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() {
-    let features = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
+    let feature_path = std::env::var("KRONIKA_FEATURES").unwrap_or_else(|_| "features".to_owned());
     BddWorld::cucumber()
         .max_concurrent_scenarios(MAX_CONCURRENT_SCENARIOS)
         .fail_on_skipped()
@@ -75,6 +75,6 @@ async fn main() {
                 }
             })
         })
-        .run_and_exit(features)
+        .run_and_exit(feature_path)
         .await;
 }
