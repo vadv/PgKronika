@@ -1294,9 +1294,8 @@ impl Lens for InternalWaitConcentrationLens {
 /// `PG-LOCK-012` (`lock_wait_graph`): a sampled lock wait-for graph. Reports a
 /// lead when a `pg_locks` snapshot in the incident window carries a `blocked_by`
 /// edge — direct evidence of a process that prevented a waiter from acquiring
-/// the requested lock. It may be a queue predecessor rather than a lock holder. The edge
-/// proves a structural direction, so this is the one lens that may lead and
-/// reach high confidence.
+/// the requested lock. It may name a queue predecessor instead of a lock holder.
+/// This is the only snapshot lens with structural direction and high confidence.
 pub(crate) struct LockWaitGraphLens;
 
 impl LockWaitGraphLens {
@@ -2582,8 +2581,6 @@ mod tests {
 
     #[test]
     fn a_snapshot_lens_ignores_a_cluster_without_its_section() {
-        // An activity snapshot is present, but the incident is on another
-        // section, so the activity lens never fires.
         let typed = activity_typed(vec![ActivityBackend {
             xmin_age: Some(2_000_000),
             state: Some("idle in transaction".into()),

@@ -7,8 +7,8 @@
 //! anomaly, or a disabled source).
 //!
 //! Gauges are instantaneous levels, so they are indexed without differencing.
-//! Beside the counter and gauge timelines it carries the raw multi-row snapshots the
-//! activity and lock lenses read: `pg_stat_activity` backends and `pg_locks`
+//! It also carries the multi-row snapshots used by activity and lock lenses:
+//! `pg_stat_activity` backends and `pg_locks`
 //! blocking edges captured at each collection time. A snapshot is a moment, not
 //! a rated timeline, so a lens over it reports a sampled observation, never a
 //! direction inferred from a trend.

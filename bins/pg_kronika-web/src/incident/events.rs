@@ -2,9 +2,8 @@
 //!
 //! The event branch is separate from the numeric series path: a lens here reads
 //! bounded, typed records the log source already grouped, never an anomaly
-//! episode. Every record is a positive fact — a lens reports that an event was
-//! logged, never infers anything from its absence, and never restates a logged
-//! fact as a cause. SQLSTATE-like tokens from stderr are heuristic evidence:
+//! episode. Lenses report observed events, infer nothing from absence, and do
+//! not restate a logged fact as a cause. SQLSTATE-like tokens from stderr are heuristic evidence:
 //! the current source cannot prove a structured server error code.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -320,10 +319,10 @@ fn stderr_observation() -> Vec<Evidence> {
     vec![Evidence::Event]
 }
 
-/// Emit one coincident occurrence fact per error group whose SQLSTATE is one of
-/// `codes`. One stored group produces one fact. Its count is deliberately not
-/// exposed: the group timestamp identifies the first record in a collector
-/// batch, not the time distribution of all grouped records.
+/// Emit coincident occurrence facts for the selected SQLSTATEs.
+///
+/// Groups with the same code and observation time produce one fact. Counts are
+/// omitted because a batch timestamp does not describe every grouped record.
 fn emit_error_sqlstate(
     events: &LogEventInputs,
     sink: &mut FindingSink<'_>,
@@ -355,7 +354,7 @@ fn emit_error_sqlstate(
     Ok(())
 }
 
-/// Emit one coincident occurrence fact per crash record whose signal `matches`.
+/// Emit one fact per unique matching `(time, pid, signal)` crash record.
 fn emit_crash_signal(
     events: &LogEventInputs,
     sink: &mut FindingSink<'_>,

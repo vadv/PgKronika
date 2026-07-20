@@ -81,7 +81,7 @@ enum DirectEvidenceKind {
 impl DirectEvidence {
     /// A sampled `pg_locks` blocking edge: `blocked_by` names a process that
     /// prevented the waiter from acquiring the lock. It can be a queue
-    /// predecessor rather than a lock holder. The direct evidence proves a structural
+    /// predecessor rather than a lock holder. This proves a structural
     /// direction, so a lock lens may lead or trail and reach high confidence.
     pub(crate) const fn sampled_lock_edge() -> Self {
         Self {
