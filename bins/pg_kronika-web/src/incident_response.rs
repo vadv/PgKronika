@@ -1052,7 +1052,14 @@ mod tests {
         assert_eq!(finding["lens_id"], "PG-CACHE-010");
         assert_eq!(finding["role"], "amplifier");
         assert_eq!(finding["confidence"], "medium");
-        assert_eq!(finding["evidence"], json!(["ratio"]));
+        let evidence = &finding["evidence"][0];
+        assert_eq!(evidence["type"], "gauge");
+        assert_eq!(evidence["unit"], "ratio");
+        assert_eq!(evidence["measurement"]["kind"], "ratio");
+        // 80 reads over 100 accesses cross the 0.2 miss floor.
+        assert_eq!(evidence["measurement"]["numerator"], json!(80.0));
+        assert_eq!(evidence["measurement"]["denominator"], json!(100.0));
+        assert_eq!(evidence["threshold"]["value"], json!(0.2));
         assert_eq!(finding["scope"]["logical_section"], "pg_stat_database");
         assert_eq!(finding["scope"]["column"], "blks_read");
         assert_eq!(finding["scope"]["identity"], json!([5]));

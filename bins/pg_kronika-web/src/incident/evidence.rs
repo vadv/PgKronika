@@ -559,6 +559,13 @@ impl Finding {
         self.role
     }
 
+    /// Retarget a coincident finding to a temporal lead/downstream. The engine
+    /// alone sees every signal in an incident, so cross-signal ordering is its
+    /// call, not a lens's.
+    pub(crate) const fn set_role(&mut self, role: Role) {
+        self.role = role;
+    }
+
     pub(crate) const fn confidence(&self) -> Confidence {
         self.confidence
     }

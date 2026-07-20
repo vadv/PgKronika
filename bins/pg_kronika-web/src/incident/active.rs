@@ -1506,11 +1506,12 @@ impl Lens for InternalWaitConcentrationLens {
     }
 }
 
-/// `PG-LOCK-012` (`lock_wait_graph`): a sampled lock wait-for graph. Reports a
-/// lead when a `pg_locks` snapshot in the incident window carries a `blocked_by`
-/// edge — direct evidence of a process that prevented a waiter from acquiring
-/// the requested lock. It may name a queue predecessor instead of a lock holder.
-/// This is the only snapshot lens with structural direction and high confidence.
+/// `PG-LOCK-012` (`lock_wait_graph`): a sampled lock wait-for graph. Each
+/// `blocked_by` edge in a `pg_locks` snapshot is direct evidence of a process
+/// that prevented a waiter from acquiring the requested lock (it may name a
+/// queue predecessor rather than the holder). The blocker is reported as the
+/// lead and the waiter as its downstream — both structural, both high
+/// confidence. This is the only lens with structural direction.
 pub(crate) struct LockWaitGraphLens;
 
 impl LockWaitGraphLens {
@@ -1556,14 +1557,28 @@ impl Lens for LockWaitGraphLens {
         sink.charge_points(examined)?;
         for snapshot in snapshots {
             for edge in &snapshot.edges {
-                let identity: Arc<[IdentityValue]> = Arc::from(vec![
+                // The blocker holds the lock and leads; the waiter is stuck
+                // behind it and is the downstream party. Each side is scoped to
+                // its own process so the pair renders as two findings.
+                let blocker: Arc<[IdentityValue]> = Arc::from(vec![
+                    IdentityValue::I64(snapshot.ts),
+                    IdentityValue::I64(edge.blocker_pid),
+                    IdentityValue::I64(edge.waiter_pid),
+                ]);
+                sink.emit(FindingDraft::new(
+                    Role::Lead,
+                    FindingScope::from_parts(PG_LOCKS, "blocked_by", blocker),
+                    vec![Evidence::Direct(DirectEvidence::sampled_lock_edge())],
+                    None,
+                ))?;
+                let waiter: Arc<[IdentityValue]> = Arc::from(vec![
                     IdentityValue::I64(snapshot.ts),
                     IdentityValue::I64(edge.waiter_pid),
                     IdentityValue::I64(edge.blocker_pid),
                 ]);
                 sink.emit(FindingDraft::new(
-                    Role::Lead,
-                    FindingScope::from_parts(PG_LOCKS, "blocked_by", identity),
+                    Role::Downstream,
+                    FindingScope::from_parts(PG_LOCKS, "blocked_by", waiter),
                     vec![Evidence::Direct(DirectEvidence::sampled_lock_edge())],
                     None,
                 ))?;
@@ -2969,18 +2984,20 @@ mod tests {
     }
 
     #[test]
-    fn lock_wait_graph_leads_at_high_confidence_on_a_sampled_edge() {
+    fn lock_wait_graph_pairs_a_lead_blocker_with_a_downstream_waiter() {
         let typed = lock_typed(vec![LockEdge {
             waiter_pid: 20,
             blocker_pid: 10,
         }]);
         let findings = run_lens(&LockWaitGraphLens, PG_LOCKS, "blocked_by", &typed);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].0, Role::Lead, "the lock edge proves direction");
-        assert_eq!(
-            findings[0].1.label(),
-            "high",
-            "direct edge evidence reaches high confidence"
+        assert_eq!(findings.len(), 2, "the edge proves both sides");
+        assert_eq!(findings[0].0, Role::Lead, "the blocker leads");
+        assert_eq!(findings[1].0, Role::Downstream, "the waiter trails");
+        assert!(
+            findings
+                .iter()
+                .all(|(_, confidence)| confidence.label() == "high"),
+            "direct edge evidence reaches high confidence on both sides"
         );
     }
 
