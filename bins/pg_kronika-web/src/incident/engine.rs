@@ -261,7 +261,7 @@ fn charge_key_bytes(
 /// Assign lead/downstream to coincident findings from the capture time of their
 /// source signal: within one clock domain the earliest-starting signal in the
 /// incident leads and the latest trails, and equal starts stay coincident.
-/// Findings the lens already shaped — amplifiers, structural lead/downstream —
+/// Findings the lens already shaped (amplifiers, structural lead/downstream)
 /// are left alone. The engine owns this because only it sees every signal at
 /// once; a lens sees only its own.
 fn assign_temporal_direction(
@@ -912,6 +912,30 @@ mod tests {
             Some(Role::Downstream),
             "start 5 trails"
         );
+    }
+
+    #[test]
+    fn a_middle_signal_stays_coincident() {
+        let members = vec![
+            episode("pg_stat_database", 1, 0, 10).reference,
+            episode("pg_stat_activity", 2, 3, 12).reference,
+            episode("pg_locks", 3, 5, 15).reference,
+        ];
+        let mut findings = coincident_findings(&members);
+        assign_temporal_direction(&mut findings, &members, ClockRelation::SameDomain);
+        let role_of = |section| {
+            findings
+                .iter()
+                .find(|finding| finding.scope().logical_section() == section)
+                .map(Finding::role)
+        };
+        assert_eq!(role_of("pg_stat_database"), Some(Role::Lead));
+        assert_eq!(
+            role_of("pg_stat_activity"),
+            Some(Role::Coincident),
+            "a signal between earliest and latest keeps coincident"
+        );
+        assert_eq!(role_of("pg_locks"), Some(Role::Downstream));
     }
 
     #[test]

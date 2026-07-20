@@ -2013,6 +2013,51 @@ mod tests {
     }
 
     #[test]
+    fn hot_update_failure_publishes_the_non_hot_operands() {
+        // 6 HOT of 15 updates: 9 non-HOT over 15, a 0.6 fraction.
+        let typed = pair(
+            PG_STAT_USER_TABLES,
+            "n_tup_hot_upd",
+            &[2.0, 2.0, 2.0],
+            "n_tup_upd",
+            &[5.0, 5.0, 5.0],
+        );
+        let reading = first_reading(
+            &HotUpdateFailureLens,
+            PG_STAT_USER_TABLES,
+            "n_tup_upd",
+            &typed,
+        )
+        .expect("hot-update failure reports a gauge observation");
+        assert_eq!(reading.unit, GaugeUnit::Ratio);
+        let (numerator, denominator) = reading.operands.expect("a ratio carries operands");
+        assert!((numerator - 9.0).abs() < 1e-9);
+        assert!((denominator - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wal_archiving_failure_publishes_the_failure_count() {
+        // Three then two failures over two intervals: five in total.
+        let typed = pair(
+            PG_STAT_ARCHIVER,
+            "failed_count",
+            &[3.0, 2.0],
+            "archived_count",
+            &[1.0, 1.0],
+        );
+        let reading = first_reading(
+            &WalArchivingFailureLens,
+            PG_STAT_ARCHIVER,
+            "failed_count",
+            &typed,
+        )
+        .expect("an archiving failure reports a gauge observation");
+        assert_eq!(reading.unit, GaugeUnit::Count);
+        assert!((reading.value - 5.0).abs() < 1e-9);
+        assert_eq!(reading.operands, None);
+    }
+
+    #[test]
     fn wal_amplification_reports_a_medium_amplifier_above_the_fpi_floor() {
         // 6 FPIs over 10 records = 0.6, three intervals.
         let typed = pair(
