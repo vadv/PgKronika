@@ -367,6 +367,7 @@ test_workflow_has_only_exact_builder_cache_identity() {
   assert_contains "$workflow" 'deps_hash=$(./scripts/bdd-image.sh deps-key)'
   assert_contains "$workflow" 'BDD builder exact hit'
   assert_contains "$workflow" 'BDD builder exact miss'
+  assert_contains "$workflow" 'docker pull "${{ steps.meta.outputs.builder }}"'
   assert_contains "$workflow" 'BDD_RUNTIME_IMAGE: pgkronika-bdd:run-${{ github.run_id }}-${{ github.run_attempt }}'
   assert_contains "$workflow" "echo \"BDD source build seconds: \${elapsed}\""
   assert_contains "$workflow" '- source build: always runs; clean hosted runners do not cache first-party compilation'
@@ -383,6 +384,8 @@ test_workflow_has_only_exact_builder_cache_identity() {
   assert_not_contains "$workflow" 'ghcr.io/${owner}/pgkronika-bdd:'
   assert_not_contains "$workflow" 'BDD_RUNTIME_PUSH'
   assert_not_contains "$workflow" 'BDD_RUNTIME_REUSE_LOCAL'
+  assert_not_contains "$workflow" 'Free disk space for the BDD build'
+  assert_not_contains "$workflow" 'docker system prune'
 }
 
 for test in \
