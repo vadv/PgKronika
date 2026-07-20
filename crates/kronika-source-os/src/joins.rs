@@ -603,7 +603,7 @@ mod tests {
         assert_eq!((rows[0].major, rows[0].minor), (Some(8), Some(1)));
         assert_eq!((rows[1].major, rows[1].minor), (Some(8), Some(2)));
 
-        let mut remote_mounts = mounts.clone();
+        let mut remote_mounts = mounts;
         for mount in &mut remote_mounts {
             mount.source = "server:/volume".to_owned();
         }
