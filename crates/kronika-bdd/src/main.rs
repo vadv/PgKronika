@@ -50,14 +50,14 @@ async fn main() {
     BddWorld::cucumber()
         .max_concurrent_scenarios(MAX_CONCURRENT_SCENARIOS)
         .fail_on_skipped()
-        .after(|_feature, _rule, _scenario, ev, world| {
+        .after(|_feature, _rule, _scenario, scenario_event, world| {
             Box::pin(async move {
                 let failed = matches!(
-                    ev,
+                    scenario_event,
                     event::ScenarioFinished::StepFailed(..)
                         | event::ScenarioFinished::BeforeHookFailed(_)
                 );
-                if let event::ScenarioFinished::StepFailed(_, _, err) = ev {
+                if let event::ScenarioFinished::StepFailed(_, _, err) = scenario_event {
                     eprintln!("=== BDD step failed: {err} ===");
                 }
                 if let Some(world) = world {
