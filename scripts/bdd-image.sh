@@ -3,6 +3,10 @@ set -euo pipefail
 
 NIX_BASE_IMAGE=${BDD_NIX_BASE_IMAGE:-docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894}
 DOCKER=${BDD_DOCKER:-docker}
+readonly BDD_BUILDER_KEY_SCHEMA=builder-context-v3
+readonly BDD_BUILDER_COMPRESSION=zstd
+readonly BDD_BUILDER_COMPRESSION_LEVEL=6
+readonly BDD_BUILDER_OCI_MEDIA_TYPES=true
 
 BDD_DEPS_PATHS=(
   Dockerfile.bdd-builder
@@ -174,7 +178,13 @@ builder_context_tar() {
 
 deps_key() {
   {
-    printf 'builder-context-v2\0%s\0%s\0' "$NIX_BASE_IMAGE" "$(hash_git_paths "${BDD_DEPS_PATHS[@]}")"
+    printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+      "$BDD_BUILDER_KEY_SCHEMA" \
+      "$NIX_BASE_IMAGE" \
+      "$BDD_BUILDER_COMPRESSION" \
+      "$BDD_BUILDER_COMPRESSION_LEVEL" \
+      "$BDD_BUILDER_OCI_MEDIA_TYPES" \
+      "$(hash_git_paths "${BDD_DEPS_PATHS[@]}")"
     cargo_target_paths
   } | sha256_stream
 }
@@ -239,7 +249,7 @@ append_summary() {
 }
 
 build_builder() {
-  local root context image
+  local root context image registry_output
   root=$(repo_root)
   image=$(builder_image)
 
@@ -267,8 +277,7 @@ build_builder() {
     --target bdd-builder
     --platform "$(platform)"
     --build-arg "BDD_BUILDER_BASE=$NIX_BASE_IMAGE"
-    --load
-    -t "$image"
+    --provenance=false
   )
 
   context=$(mktemp -d)
@@ -276,21 +285,30 @@ build_builder() {
     rm -rf "$context"
     return 1
   fi
-  if ! docker_cmd buildx build "${args[@]}" "$context"; then
+  if [ "${BDD_BUILDER_PUSH:-0}" = "1" ]; then
+    if ! docker_cmd buildx build "${args[@]}" --output type=cacheonly "$context"; then
+      rm -rf "$context"
+      return 1
+    fi
+    if docker_cmd manifest inspect "$image" >/dev/null 2>&1; then
+      append_summary "- pushed exact: no, tag appeared before push"
+      docker_cmd pull "$image"
+      rm -rf "$context"
+      return
+    fi
+    registry_output="type=registry,name=$image,oci-mediatypes=$BDD_BUILDER_OCI_MEDIA_TYPES,compression=$BDD_BUILDER_COMPRESSION,compression-level=$BDD_BUILDER_COMPRESSION_LEVEL,force-compression=true"
+    if ! docker_cmd buildx build "${args[@]}" --output "$registry_output" "$context"; then
+      rm -rf "$context"
+      return 1
+    fi
+    docker_cmd pull "$image"
+    append_summary "- pushed exact: yes"
+    append_summary "- registry compression: \`$BDD_BUILDER_COMPRESSION\` level \`$BDD_BUILDER_COMPRESSION_LEVEL\`, OCI media types"
+  elif ! docker_cmd buildx build "${args[@]}" --load -t "$image" "$context"; then
     rm -rf "$context"
     return 1
   fi
   rm -rf "$context"
-
-  if [ "${BDD_BUILDER_PUSH:-0}" = "1" ]; then
-    if docker_cmd manifest inspect "$image" >/dev/null 2>&1; then
-      append_summary "- pushed exact: no, tag appeared before push"
-      docker_cmd pull "$image"
-      return
-    fi
-    docker_cmd push "$image"
-    append_summary "- pushed exact: yes"
-  fi
 }
 
 build_runtime() {

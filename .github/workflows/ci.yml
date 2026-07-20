@@ -98,7 +98,12 @@ jobs:
           if docker manifest inspect "${{ steps.meta.outputs.builder }}" >/dev/null 2>&1; then
             echo 'exists=true' >> "$GITHUB_OUTPUT"
             echo 'BDD builder exact hit'
+            started=$SECONDS
             docker pull "${{ steps.meta.outputs.builder }}"
+            elapsed=$((SECONDS - started))
+            echo "pull_seconds=${elapsed}" >> "$GITHUB_OUTPUT"
+            echo "BDD builder exact-hit pull seconds: ${elapsed}"
+            echo "- exact builder pull seconds: ${elapsed}" >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'exists=false' >> "$GITHUB_OUTPUT"
             echo 'BDD builder exact miss'

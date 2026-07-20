@@ -173,25 +173,41 @@ test_local_exact_builder_skips_pull_and_build() {
   assert_not_contains "$log" "buildx"
 }
 
-test_builder_miss_uses_pinned_base_and_pushes_only_exact_tag() {
+test_builder_miss_uses_registry_zstd_and_pushes_only_exact_tag() {
   local log image
   image=ghcr.io/acme/pgkronika-bdd-builder:builder-linux-amd64-new
   log=$(run_case builder-miss env BDD_BUILDER_IMAGE="$image" BDD_BUILDER_PUSH=1 "$SCRIPT" build-builder)
   assert_contains "$log" "buildx build"
   assert_contains "$log" "--build-arg BDD_BUILDER_BASE=docker.io/nixos/nix:2.31.2@sha256:29fc5fe207f159ceb0143c25c19c774062fee02ce5eda118f3067547b3054894"
-  assert_contains "$log" "push $image"
+  assert_contains "$log" "--provenance=false --output type=cacheonly"
+  assert_contains "$log" "--output type=registry,name=$image,oci-mediatypes=true,compression=zstd,compression-level=6,force-compression=true"
+  assert_contains "$log" "pull $image"
+  assert_not_contains "$log" "push $image"
+  assert_not_contains "$log" "--load"
   assert_not_contains "$log" "branch"
   assert_not_contains "$log" "cache-from"
   assert_not_contains "$log" "cache-to"
+}
+
+test_builder_miss_without_credentials_loads_locally_only() {
+  local log image
+  image=ghcr.io/acme/pgkronika-bdd-builder:builder-linux-amd64-fork
+  log=$(run_case builder-miss-no-push env BDD_BUILDER_IMAGE="$image" "$SCRIPT" build-builder)
+  assert_contains "$log" "buildx build"
+  assert_contains "$log" "--load -t $image"
+  assert_not_contains "$log" "type=registry"
+  assert_not_contains "$log" "type=cacheonly"
+  assert_not_contains "$log" "push $image"
 }
 
 test_exact_tag_is_not_overwritten_if_it_appears_before_push() {
   local log image
   image=ghcr.io/acme/pgkronika-bdd-builder:builder-linux-amd64-exact-appeared
   log=$(run_case exact-appeared env BDD_BUILDER_IMAGE="$image" BDD_BUILDER_PUSH=1 "$SCRIPT" build-builder)
+  assert_contains "$log" "--output type=cacheonly"
   assert_contains "$log" "manifest inspect $image"
   assert_contains "$log" "pull $image"
-  assert_not_contains "$log" "push $image"
+  assert_not_contains "$log" "type=registry"
 }
 
 test_runtime_tag_is_local_or_github_run_scoped() {
@@ -315,6 +331,16 @@ test_dependency_contract_files_change_dependency_key() {
   assert_ne "$after" "$before"
 }
 
+test_builder_transport_contract_changes_dependency_key() {
+  local repo script before after
+  repo=$(make_repo_copy)
+  script="$repo/scripts/bdd-image.sh"
+  before=$(run_bdd_image_script "$script" deps-key)
+  sed -i 's/BDD_BUILDER_COMPRESSION_LEVEL=6/BDD_BUILDER_COMPRESSION_LEVEL=7/' "$script"
+  after=$(run_bdd_image_script "$script" deps-key)
+  assert_ne "$after" "$before"
+}
+
 test_dependency_paths_cover_every_manifest() {
   local expected actual
   expected=$(
@@ -354,11 +380,22 @@ test_builder_context_has_stable_dummy_targets() {
 }
 
 test_builder_realizes_exact_image_closure() {
-  local dockerfile
+  local dockerfile cargo_line pg15_line pg17_line image_line
   dockerfile="$ROOT/Dockerfile.bdd-builder"
-  assert_contains "$dockerfile" '    .#image \'
-  assert_not_contains "$dockerfile" '.#cargoArtifacts'
-  assert_not_contains "$dockerfile" '.#postgresql_'
+  assert_contains "$dockerfile" '    .#cargoArtifacts'
+  assert_contains "$dockerfile" '    .#postgresql_15_plans \'
+  assert_contains "$dockerfile" '    .#postgresql_16_plans'
+  assert_contains "$dockerfile" '    .#postgresql_17_plans \'
+  assert_contains "$dockerfile" '    .#postgresql_18_plans'
+  assert_contains "$dockerfile" '    .#image'
+  assert_eq "$(grep -c '^RUN nix build' "$dockerfile")" 4
+  cargo_line=$(grep -nF '.#cargoArtifacts' "$dockerfile" | cut -d: -f1)
+  pg15_line=$(grep -nF '.#postgresql_15_plans' "$dockerfile" | cut -d: -f1)
+  pg17_line=$(grep -nF '.#postgresql_17_plans' "$dockerfile" | cut -d: -f1)
+  image_line=$(grep -nF '.#image' "$dockerfile" | cut -d: -f1)
+  [ "$cargo_line" -lt "$pg15_line" ] && [ "$pg15_line" -lt "$pg17_line" ] && [ "$pg17_line" -lt "$image_line" ] \
+    || fail "builder closure layers are out of order"
+  assert_not_contains "$dockerfile" 'nix-store --realise'
 }
 
 test_workflow_has_only_exact_builder_cache_identity() {
@@ -368,6 +405,7 @@ test_workflow_has_only_exact_builder_cache_identity() {
   assert_contains "$workflow" 'BDD builder exact hit'
   assert_contains "$workflow" 'BDD builder exact miss'
   assert_contains "$workflow" 'docker pull "${{ steps.meta.outputs.builder }}"'
+  assert_contains "$workflow" 'BDD builder exact-hit pull seconds:'
   assert_contains "$workflow" 'BDD_RUNTIME_IMAGE: pgkronika-bdd:run-${{ github.run_id }}-${{ github.run_attempt }}'
   assert_contains "$workflow" "echo \"BDD source build seconds: \${elapsed}\""
   assert_contains "$workflow" '- source build: always runs; clean hosted runners do not cache first-party compilation'
@@ -391,7 +429,8 @@ test_workflow_has_only_exact_builder_cache_identity() {
 for test in \
   test_exact_builder_hit_pulls_only_exact_builder \
   test_local_exact_builder_skips_pull_and_build \
-  test_builder_miss_uses_pinned_base_and_pushes_only_exact_tag \
+  test_builder_miss_uses_registry_zstd_and_pushes_only_exact_tag \
+  test_builder_miss_without_credentials_loads_locally_only \
   test_exact_tag_is_not_overwritten_if_it_appears_before_push \
   test_runtime_tag_is_local_or_github_run_scoped \
   test_runtime_build_always_compiles_from_filtered_source_tar \
@@ -400,6 +439,7 @@ for test in \
   test_runtime_sources_include_build_scripts_when_present \
   test_ordinary_source_and_features_do_not_change_dependency_identity \
   test_dependency_contract_files_change_dependency_key \
+  test_builder_transport_contract_changes_dependency_key \
   test_dependency_paths_cover_every_manifest \
   test_implicit_cargo_target_topology_is_dependency_contract \
   test_builder_context_has_stable_dummy_targets \
