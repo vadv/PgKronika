@@ -208,7 +208,8 @@ test_runtime_build_always_compiles_from_filtered_source_tar() {
     BDD_RUNTIME_IMAGE=pgkronika-bdd:run-123-1 \
     BDD_OUTPUT_TAR="$output" \
     "$SCRIPT" build-runtime)
-  assert_contains "$log" "run --rm -i pgkronika-bdd-builder:test sh -ceu"
+  assert_contains "$log" "run --rm -i --network none pgkronika-bdd-builder:test sh -ceu"
+  assert_contains "$log" "nix build --offline .#image --out-link /tmp/img"
   assert_contains "$log" "load -i $output"
   assert_contains "$log" "tag pgkronika-bdd:latest pgkronika-bdd:run-123-1"
   assert_not_contains "$log" "image inspect pgkronika-bdd"
@@ -232,7 +233,7 @@ test_local_runner_always_assembles_ephemeral_runtime() {
   ) > "$stdout" 2>&1
   assert_contains "$stdout" "Building ephemeral BDD runtime image pgkronika-bdd:local"
   assert_contains "$log" "pull ghcr.io/acme/pgkronika-bdd-builder:builder-linux-amd64-exact-hit"
-  assert_contains "$log" "run --rm -i ghcr.io/acme/pgkronika-bdd-builder:builder-linux-amd64-exact-hit sh -ceu"
+  assert_contains "$log" "run --rm -i --network none ghcr.io/acme/pgkronika-bdd-builder:builder-linux-amd64-exact-hit sh -ceu"
   assert_contains "$log" "tag pgkronika-bdd:latest pgkronika-bdd:local"
   assert_contains "$log" "run --rm -e DEBUG=1 pgkronika-bdd:local -vvv --tags @pg_log"
   assert_not_contains "$log" "buildx version"
@@ -348,6 +349,16 @@ test_builder_context_has_stable_dummy_targets() {
     || fail "builder context must contain dummy BDD bin target"
   grep -Fx -- 'fn main() {}' "$context/bins/pg_kronika-collector/src/main.rs" >/dev/null \
     || fail "builder context must contain dummy collector target"
+  [ -d "$context/crates/kronika-bdd/features" ] \
+    || fail "builder context must contain dummy BDD feature directory"
+}
+
+test_builder_realizes_exact_image_closure() {
+  local dockerfile
+  dockerfile="$ROOT/Dockerfile.bdd-builder"
+  assert_contains "$dockerfile" '    .#image \'
+  assert_not_contains "$dockerfile" '.#cargoArtifacts'
+  assert_not_contains "$dockerfile" '.#postgresql_'
 }
 
 test_workflow_has_only_exact_builder_cache_identity() {
@@ -389,6 +400,7 @@ for test in \
   test_dependency_paths_cover_every_manifest \
   test_implicit_cargo_target_topology_is_dependency_contract \
   test_builder_context_has_stable_dummy_targets \
+  test_builder_realizes_exact_image_closure \
   test_workflow_has_only_exact_builder_cache_identity
 do
   "$test"

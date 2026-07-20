@@ -152,6 +152,7 @@ write_dummy_builder_sources() {
       *) printf 'fn main() {}\n' > "$target" ;;
     esac
   done
+  mkdir -p "$context/crates/kronika-bdd/features"
 }
 
 write_builder_context() {
@@ -303,11 +304,11 @@ build_runtime() {
   append_summary "- local runtime: \`$runtime\`"
   append_summary "- published: no"
 
-  source_tar "${BDD_RUNTIME_SOURCE_PATHS[@]}" | docker_cmd run --rm -i "$builder" sh -ceu '
+  source_tar "${BDD_RUNTIME_SOURCE_PATHS[@]}" | docker_cmd run --rm -i --network none "$builder" sh -ceu '
     mkdir -p /tmp/src
     tar -C /tmp/src -xf -
     cd /tmp/src
-    nix build .#image --out-link /tmp/img
+    nix build --offline .#image --out-link /tmp/img
     /tmp/img
   ' > "$output"
 
