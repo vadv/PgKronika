@@ -58,80 +58,51 @@ jobs:
           name: coverage
           path: coverage.json
 
-  bdd-meta:
-    name: bdd metadata
-    runs-on: ubuntu-latest
-    outputs:
-      image_hash: ${{ steps.meta.outputs.image_hash }}
-      platform_slug: ${{ steps.meta.outputs.platform_slug }}
-      branch_name: ${{ steps.meta.outputs.branch_name }}
-      builder: ${{ steps.meta.outputs.builder }}
-      builder_branch_cache: ${{ steps.meta.outputs.builder_branch_cache }}
-      builder_main_cache: ${{ steps.meta.outputs.builder_main_cache }}
-      image: ${{ steps.meta.outputs.image }}
-      can_push: ${{ steps.meta.outputs.can_push }}
-    env:
-      BDD_IMAGE_CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      BDD_BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
-      BDD_PLATFORM: linux/amd64
-    steps:
-      - uses: actions/checkout@v4
-      - name: Compute image refs
-        id: meta
-        run: |
-          deps_hash=$(./scripts/bdd-image.sh deps-key)
-          image_hash=$(./scripts/bdd-image.sh image-key)
-          platform_slug=$(echo "${BDD_PLATFORM}" | tr '/_' '-')
-          branch_slug=$(./scripts/bdd-image.sh branch-slug "${BDD_BRANCH_NAME}")
-          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
-          {
-            echo "image_hash=${image_hash:0:16}"
-            echo "platform_slug=${platform_slug}"
-            echo "branch_name=${BDD_BRANCH_NAME}"
-            echo "builder=ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-${deps_hash:0:16}"
-            echo "builder_branch_cache=ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-branch-${branch_slug}"
-            echo "builder_main_cache=ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-branch-main"
-            echo "image=ghcr.io/${owner}/pgkronika-bdd:${platform_slug}-sha-${image_hash:0:16}"
-            echo "can_push=${BDD_IMAGE_CAN_PUSH}"
-          } >> "$GITHUB_OUTPUT"
-
   bdd-matrix:
     name: bdd matrix
-    needs: bdd-meta
     runs-on: ubuntu-latest
-    concurrency:
-      group: bdd-matrix-${{ needs.bdd-meta.outputs.platform_slug }}-${{ needs.bdd-meta.outputs.image_hash }}
-      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
     env:
       BDD_PLATFORM: linux/amd64
+      BDD_RUNTIME_IMAGE: pgkronika-bdd:run-${{ github.run_id }}-${{ github.run_attempt }}
+      BDD_BUILDER_CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v4
-      - name: Log in to GHCR
-        if: needs.bdd-meta.outputs.can_push == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Check cached BDD image
-        id: final_image
-        if: needs.bdd-meta.outputs.can_push == 'true'
+      - name: Compute exact dependency builder
+        id: meta
         run: |
-          image="${{ needs.bdd-meta.outputs.image }}"
-          if docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Reusing $image"
+          deps_hash=$(./scripts/bdd-image.sh deps-key)
+          platform_slug=$(./scripts/bdd-image.sh platform-slug)
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          builder="ghcr.io/${owner}/pgkronika-bdd-builder:builder-${platform_slug}-${deps_hash:0:16}"
+          {
+            echo "deps_hash=${deps_hash}"
+            echo "builder=${builder}"
+            echo "can_push=${BDD_BUILDER_CAN_PUSH}"
+          } >> "$GITHUB_OUTPUT"
+          echo "BDD dependency key: ${deps_hash}"
+          echo "BDD exact builder: ${builder}"
+          {
+            echo '## BDD cache'
+            echo
+            echo "- dependency key: \`${deps_hash}\`"
+            echo "- exact builder: \`${builder}\`"
+            echo "- local runtime: \`${BDD_RUNTIME_IMAGE}\` (never published)"
+            echo '- source build: always runs; clean hosted runners do not cache first-party compilation'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Check exact dependency builder
+        id: builder
+        run: |
+          if docker manifest inspect "${{ steps.meta.outputs.builder }}" >/dev/null 2>&1; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+            echo 'BDD builder exact hit'
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+            echo 'BDD builder exact miss'
           fi
-      - name: Pull cached BDD image
-        if: needs.bdd-meta.outputs.can_push == 'true' && steps.final_image.outputs.exists == 'true'
-        run: docker pull "${{ needs.bdd-meta.outputs.image }}"
-      - name: Free disk space for the Nix build
-        if: steps.final_image.outputs.exists != 'true'
+      - name: Free disk space for the BDD build
         run: |
           df -h
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/share/boost /opt/ghc
@@ -140,40 +111,37 @@ jobs:
           fi
           docker system prune -af || true
           df -h
+      - name: Pull exact dependency builder
+        if: steps.builder.outputs.exists == 'true'
+        run: docker pull "${{ steps.meta.outputs.builder }}"
+      - name: Log in to GHCR for missing builder
+        if: steps.builder.outputs.exists != 'true' && steps.meta.outputs.can_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v3
-        if: steps.final_image.outputs.exists != 'true'
-      - name: Build BDD builder
-        if: steps.final_image.outputs.exists != 'true'
+        if: steps.builder.outputs.exists != 'true'
+      - name: Build missing dependency builder
+        if: steps.builder.outputs.exists != 'true'
         run: |
-          export BDD_BUILDER_IMAGE="${{ needs.bdd-meta.outputs.builder }}"
-          export BDD_BRANCH_NAME="${{ needs.bdd-meta.outputs.branch_name }}"
-          export BDD_BUILDER_BRANCH_IMAGE="${{ needs.bdd-meta.outputs.builder_branch_cache }}"
-          export BDD_BUILDER_MAIN_IMAGE="${{ needs.bdd-meta.outputs.builder_main_cache }}"
-          export BDD_BUILDER_PULL=1
-          if [ "${{ needs.bdd-meta.outputs.can_push }}" = "true" ]; then
+          export BDD_BUILDER_IMAGE="${{ steps.meta.outputs.builder }}"
+          if [ "${{ steps.meta.outputs.can_push }}" = "true" ]; then
             export BDD_BUILDER_PUSH=1
-            export BDD_BUILDER_UPDATE_BRANCH_CACHE=1
           fi
           ./scripts/bdd-image.sh build-builder
-      - name: Build BDD image
-        if: steps.final_image.outputs.exists != 'true'
+      - name: Compile source and assemble local BDD runtime
         run: |
-          export BDD_BUILDER_IMAGE="${{ needs.bdd-meta.outputs.builder }}"
-          export BDD_RUNTIME_IMAGE="${{ needs.bdd-meta.outputs.image }}"
-          export BDD_RUNTIME_REUSE_LOCAL=1
+          export BDD_BUILDER_IMAGE="${{ steps.meta.outputs.builder }}"
           export BDD_OUTPUT_TAR=image.tar
+          started=$SECONDS
           ./scripts/bdd-image.sh build-runtime
+          elapsed=$((SECONDS - started))
+          echo "BDD source build seconds: ${elapsed}"
+          echo "- source build seconds: ${elapsed}" >> "$GITHUB_STEP_SUMMARY"
           rm -f image.tar
       - name: Verify PostgreSQL runtime
-        run: ./scripts/bdd-image.sh check-runtime "${{ needs.bdd-meta.outputs.image }}"
+        run: ./scripts/bdd-image.sh check-runtime
       - name: Run the PostgreSQL matrix
-        run: docker run --rm "${{ needs.bdd-meta.outputs.image }}"
-      - name: Push BDD image
-        if: needs.bdd-meta.outputs.can_push == 'true' && steps.final_image.outputs.exists != 'true'
-        run: |
-          image="${{ needs.bdd-meta.outputs.image }}"
-          if docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "Cache already published: $image"
-          else
-            docker push "$image"
-          fi
+        run: ./scripts/bdd-image.sh run
