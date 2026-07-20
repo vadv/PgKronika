@@ -487,7 +487,7 @@ fn exact_i64_as_f64(value: i64) -> Option<f64> {
     Some(value as f64)
 }
 
-fn exact_u64_as_f64(value: u64) -> Option<f64> {
+const fn exact_u64_as_f64(value: u64) -> Option<f64> {
     const MAX_EXACT_INTEGER: u64 = 1_u64 << 53;
     if value > MAX_EXACT_INTEGER {
         return None;

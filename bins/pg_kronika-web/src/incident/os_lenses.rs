@@ -1,5 +1,6 @@
 //! Linux host lenses over bounded counter and gauge evidence.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -15,7 +16,7 @@ use super::evidence::{
 use super::lens::Lens;
 use super::model::IdentityValue;
 use super::series::SeriesSet;
-use super::typed::TypedInputs;
+use super::typed::{AlignedSums, TypedInputs};
 
 const OS_CPU: &str = "os_cpu";
 const OS_PSI: &str = "os_psi";
@@ -31,6 +32,40 @@ impl HostCpuLens {
     const MIN_INTERVALS: usize = 3;
     const BUSY_FLOOR: f64 = 0.8;
     const STEAL_FLOOR: f64 = 0.05;
+
+    fn append_psi_evidence(
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+        evidence: &mut Vec<GaugeEvidence>,
+    ) -> Result<(), LimitHit> {
+        let identity = [IdentityValue::U64(0)];
+        let Some(window) = typed.gauge_window(
+            OS_PSI,
+            "some_avg10",
+            &identity,
+            context.incident_start_us,
+            context.incident_end_us,
+        ) else {
+            return Ok(());
+        };
+        sink.charge_points(window.inspected_points())?;
+        if let Some(reading) = window.max()
+            && (0.0..=100.0).contains(&reading.value)
+            && let Some(value) = GaugeEvidence::value(
+                reading.value / 100.0,
+                GaugeUnit::Ratio,
+                0.0,
+                ThresholdKind::AtLeast,
+                reading.observed_at_us,
+                reading.samples,
+                GaugeEntity::new(OS_PSI, Arc::from(identity)),
+            )
+        {
+            evidence.push(value);
+        }
+        Ok(())
+    }
 }
 
 impl Lens for HostCpuLens {
@@ -141,30 +176,7 @@ impl Lens for HostCpuLens {
         let Some(mut evidence) = evidence else {
             return Ok(());
         };
-        let psi_identity = [IdentityValue::U64(0)];
-        if let Some(window) = typed.gauge_window(
-            OS_PSI,
-            "some_avg10",
-            &psi_identity,
-            context.incident_start_us,
-            context.incident_end_us,
-        ) {
-            sink.charge_points(window.inspected_points())?;
-            if let Some(reading) = window.max()
-                && (0.0..=100.0).contains(&reading.value)
-                && let Some(value) = GaugeEvidence::value(
-                    reading.value / 100.0,
-                    GaugeUnit::Ratio,
-                    0.0,
-                    ThresholdKind::AtLeast,
-                    reading.observed_at_us,
-                    reading.samples,
-                    GaugeEntity::new(OS_PSI, Arc::from(psi_identity)),
-                )
-            {
-                evidence.push(value);
-            }
-        }
+        Self::append_psi_evidence(typed, context, sink, &mut evidence)?;
         sink.emit(FindingDraft::new(
             Role::Coincident,
             FindingScope::from_episode(member),
@@ -179,6 +191,14 @@ impl Lens for HostCpuLens {
 }
 
 pub(crate) struct BlockDeviceLens;
+
+struct BlockCandidate {
+    identity: Arc<[IdentityValue]>,
+    sums: AlignedSums,
+    operations: f64,
+    elapsed_ms: f64,
+    score: f64,
+}
 
 impl BlockDeviceLens {
     const COLUMNS: [&'static str; 5] = [
@@ -199,6 +219,65 @@ impl BlockDeviceLens {
             }
             _ => None,
         }
+    }
+
+    fn best_candidate(
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<Option<BlockCandidate>, LimitHit> {
+        sink.charge_points(typed.counter_identity_count(OS_DISKSTATS, "reads"))?;
+        let mut best: Option<BlockCandidate> = None;
+        for identity in typed.counter_identities(OS_DISKSTATS, "reads") {
+            sink.charge_points(typed.aligned_counter_points(
+                OS_DISKSTATS,
+                &identity,
+                &Self::COLUMNS,
+            ))?;
+            let Some(sums) = typed.aligned_delta_sums(
+                OS_DISKSTATS,
+                &identity,
+                &Self::COLUMNS,
+                context.incident_start_us,
+                context.incident_end_us,
+            ) else {
+                continue;
+            };
+            let operations = sums.sums[0] + sums.sums[2];
+            let operation_time_ms = sums.sums[1] + sums.sums[3];
+            let elapsed_ms =
+                std::time::Duration::from_micros(sums.elapsed_us).as_secs_f64() * 1_000.0;
+            if sums.intervals < Self::MIN_INTERVALS
+                || operations <= 0.0
+                || operation_time_ms < 0.0
+                || sums.sums[4] < 0.0
+                || elapsed_ms <= 0.0
+            {
+                continue;
+            }
+            let ms_per_op = operation_time_ms / operations;
+            let avg_in_flight = sums.sums[4] / elapsed_ms;
+            if !ms_per_op.is_finite()
+                || !avg_in_flight.is_finite()
+                || (ms_per_op < Self::MS_PER_OP_FLOOR && avg_in_flight < Self::AVG_IN_FLIGHT_FLOOR)
+            {
+                continue;
+            }
+            let candidate = BlockCandidate {
+                identity,
+                sums,
+                operations,
+                elapsed_ms,
+                score: ms_per_op.max(avg_in_flight * Self::MS_PER_OP_FLOOR),
+            };
+            if best
+                .as_ref()
+                .is_none_or(|current| candidate.score > current.score)
+            {
+                best = Some(candidate);
+            }
+        }
+        Ok(best)
     }
 }
 
@@ -245,55 +324,16 @@ impl Lens for BlockDeviceLens {
         else {
             return Ok(());
         };
-        sink.charge_points(typed.counter_identity_count(OS_DISKSTATS, "reads"))?;
-        let identities = typed.counter_identities(OS_DISKSTATS, "reads");
-        let mut best = None;
-        for identity in identities {
-            sink.charge_points(typed.aligned_counter_points(
-                OS_DISKSTATS,
-                &identity,
-                &Self::COLUMNS,
-            ))?;
-            let Some(sums) = typed.aligned_delta_sums(
-                OS_DISKSTATS,
-                &identity,
-                &Self::COLUMNS,
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
-                continue;
-            };
-            let operations = sums.sums[0] + sums.sums[2];
-            let operation_time_ms = sums.sums[1] + sums.sums[3];
-            let elapsed_ms =
-                std::time::Duration::from_micros(sums.elapsed_us).as_secs_f64() * 1_000.0;
-            if sums.intervals < Self::MIN_INTERVALS
-                || operations <= 0.0
-                || operation_time_ms < 0.0
-                || sums.sums[4] < 0.0
-                || elapsed_ms <= 0.0
-            {
-                continue;
-            }
-            let ms_per_op = operation_time_ms / operations;
-            let avg_in_flight = sums.sums[4] / elapsed_ms;
-            if !ms_per_op.is_finite()
-                || !avg_in_flight.is_finite()
-                || (ms_per_op < Self::MS_PER_OP_FLOOR && avg_in_flight < Self::AVG_IN_FLIGHT_FLOOR)
-            {
-                continue;
-            }
-            let score = ms_per_op.max(avg_in_flight * Self::MS_PER_OP_FLOOR);
-            if best
-                .as_ref()
-                .is_none_or(|(_, _, _, _, current)| score > *current)
-            {
-                best = Some((identity, sums, operations, elapsed_ms, score));
-            }
-        }
-        let Some((identity, sums, operations, elapsed_ms, _)) = best else {
+        let Some(candidate) = Self::best_candidate(typed, context, sink)? else {
             return Ok(());
         };
+        let BlockCandidate {
+            identity,
+            sums,
+            operations,
+            elapsed_ms,
+            ..
+        } = candidate;
         let Some((major, minor)) = Self::device_pair(&identity) else {
             return Ok(());
         };
@@ -403,11 +443,108 @@ impl ProcessIoWhoLens {
         hasher.update(starttime.to_be_bytes());
         let digest = hasher.finalize();
         let mut out = String::with_capacity(24);
-        use std::fmt::Write as _;
         for byte in &digest[..12] {
             let _ = write!(out, "{byte:02x}");
         }
         out
+    }
+
+    fn associated_device(
+        typed: &TypedInputs,
+        pid: i64,
+        starttime: i64,
+        observed_at_us: i64,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<Option<(u64, u64)>, LimitHit> {
+        let Some(cgroup_path) = typed.process_cgroup_at(pid, starttime, observed_at_us) else {
+            return Ok(None);
+        };
+        let devices = typed.cgroup_devices(cgroup_path);
+        sink.charge_points(devices.len())?;
+        let mut best = None;
+        let mut best_bytes = 0.0_f64;
+        for identity in devices {
+            sink.charge_points(typed.aligned_counter_points(
+                "os_cgroup_io",
+                identity,
+                &["rbytes", "wbytes"],
+            ))?;
+            let Some(sums) = typed.aligned_delta_sums(
+                "os_cgroup_io",
+                identity,
+                &["rbytes", "wbytes"],
+                observed_at_us,
+                observed_at_us,
+            ) else {
+                continue;
+            };
+            let [
+                IdentityValue::Text(_),
+                IdentityValue::U64(major),
+                IdentityValue::U64(minor),
+            ] = identity.as_ref()
+            else {
+                continue;
+            };
+            let bytes = sums.sums[0] + sums.sums[1];
+            if bytes > best_bytes && bytes.is_finite() {
+                best_bytes = bytes;
+                best = Some((*major, *minor));
+            }
+        }
+        Ok(best)
+    }
+
+    fn candidate(
+        typed: &TypedInputs,
+        context: &EvalContext,
+        sink: &mut FindingSink<'_>,
+        identity: Arc<[IdentityValue]>,
+    ) -> Result<Option<ProcessIoCandidate>, LimitHit> {
+        let Some((pid, starttime)) = Self::process_identity(&identity) else {
+            return Ok(None);
+        };
+        let columns = if typed.has_counter(OS_PROCESS, "cancelled_write_bytes", &identity) {
+            &Self::COLUMNS[..]
+        } else {
+            &Self::FALLBACK_COLUMNS[..]
+        };
+        sink.charge_points(typed.aligned_counter_points(OS_PROCESS, &identity, columns))?;
+        let Some(sums) = typed.aligned_delta_sums(
+            OS_PROCESS,
+            &identity,
+            columns,
+            context.incident_start_us,
+            context.incident_end_us,
+        ) else {
+            return Ok(None);
+        };
+        if sums.intervals < Self::MIN_INTERVALS {
+            return Ok(None);
+        }
+        let cancelled = if sums.len == 3 {
+            sums.sums[2].max(0.0)
+        } else {
+            0.0
+        };
+        let bytes = sums.sums[0] + (sums.sums[1] - cancelled).max(0.0);
+        if bytes <= 0.0 || !bytes.is_finite() {
+            return Ok(None);
+        }
+        let observed_at_us = sums.last_end_us;
+        Ok(Some(ProcessIoCandidate {
+            identity,
+            bytes,
+            intervals: sums.intervals,
+            observed_at_us,
+            postgres_backend: typed.process_is_postgres_backend(
+                pid,
+                starttime,
+                context.incident_start_us,
+                context.incident_end_us,
+            ),
+            device: Self::associated_device(typed, pid, starttime, observed_at_us, sink)?,
+        }))
     }
 }
 
@@ -454,86 +591,9 @@ impl Lens for ProcessIoWhoLens {
         let identities = typed.counter_identities(OS_PROCESS, "read_bytes");
         let mut candidates = Vec::new();
         for identity in identities {
-            let Some((pid, starttime)) = Self::process_identity(&identity) else {
-                continue;
-            };
-            let columns = if typed.has_counter(OS_PROCESS, "cancelled_write_bytes", &identity) {
-                &Self::COLUMNS[..]
-            } else {
-                &Self::FALLBACK_COLUMNS[..]
-            };
-            sink.charge_points(typed.aligned_counter_points(OS_PROCESS, &identity, columns))?;
-            let Some(sums) = typed.aligned_delta_sums(
-                OS_PROCESS,
-                &identity,
-                columns,
-                context.incident_start_us,
-                context.incident_end_us,
-            ) else {
-                continue;
-            };
-            if sums.intervals < Self::MIN_INTERVALS {
-                continue;
+            if let Some(candidate) = Self::candidate(typed, context, sink, identity)? {
+                candidates.push(candidate);
             }
-            let cancelled = if sums.len == 3 {
-                sums.sums[2].max(0.0)
-            } else {
-                0.0
-            };
-            let bytes = sums.sums[0] + (sums.sums[1] - cancelled).max(0.0);
-            if bytes <= 0.0 || !bytes.is_finite() {
-                continue;
-            }
-            let intervals = sums.intervals;
-            let observed_at_us = sums.last_end_us;
-            let mut device = None;
-            if let Some(cgroup_path) = typed.process_cgroup_at(pid, starttime, observed_at_us) {
-                let devices = typed.cgroup_devices(cgroup_path);
-                sink.charge_points(devices.len())?;
-                let mut best_device_bytes = 0.0_f64;
-                for cgroup_identity in devices {
-                    sink.charge_points(typed.aligned_counter_points(
-                        "os_cgroup_io",
-                        cgroup_identity,
-                        &["rbytes", "wbytes"],
-                    ))?;
-                    let Some(sums) = typed.aligned_delta_sums(
-                        "os_cgroup_io",
-                        cgroup_identity,
-                        &["rbytes", "wbytes"],
-                        observed_at_us,
-                        observed_at_us,
-                    ) else {
-                        continue;
-                    };
-                    let cgroup_bytes = sums.sums[0] + sums.sums[1];
-                    let [
-                        IdentityValue::Text(_),
-                        IdentityValue::U64(major),
-                        IdentityValue::U64(minor),
-                    ] = cgroup_identity.as_ref()
-                    else {
-                        continue;
-                    };
-                    if cgroup_bytes > best_device_bytes && cgroup_bytes.is_finite() {
-                        best_device_bytes = cgroup_bytes;
-                        device = Some((*major, *minor));
-                    }
-                }
-            }
-            candidates.push(ProcessIoCandidate {
-                identity,
-                bytes,
-                intervals,
-                observed_at_us,
-                postgres_backend: typed.process_is_postgres_backend(
-                    pid,
-                    starttime,
-                    context.incident_start_us,
-                    context.incident_end_us,
-                ),
-                device,
-            });
         }
         candidates.sort_by(|left, right| {
             right
