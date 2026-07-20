@@ -104,6 +104,10 @@ pub const fn activity_query(version: ActivityVersion) -> &'static str {
     }
 }
 
+fn bounded_activity_query(version: ActivityVersion) -> String {
+    format!("{} ORDER BY pid LIMIT $1", activity_query(version))
+}
+
 /// Raw `pg_stat_activity` row before string interning.
 ///
 /// Strings are owned; the caller interns them into the segment dictionary.
@@ -293,7 +297,7 @@ pub async fn collect_activity(
     major: u32,
 ) -> Result<(ActivityVersion, Vec<ActivityRow>, bool), tokio_postgres::Error> {
     let version = activity_version(major);
-    let query = format!("{} ORDER BY pid LIMIT $1", activity_query(version));
+    let query = bounded_activity_query(version);
     let rows = client.query(&query, &[&ACTIVITY_FETCH_ROWS]).await?;
     if rows.len() > MAX_ACTIVITY_ROWS {
         return Ok((version, Vec::new(), true));
@@ -305,7 +309,8 @@ pub async fn collect_activity(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityRow, ActivityVersion, activity_query, activity_version, to_v1, to_v2, to_v3,
+        ACTIVITY_FETCH_ROWS, ActivityRow, ActivityVersion, MAX_ACTIVITY_ROWS, activity_query,
+        activity_version, bounded_activity_query, to_v1, to_v2, to_v3,
     };
     use kronika_registry::StrId;
     use std::convert::Infallible;
@@ -373,6 +378,16 @@ mod tests {
             assert!(activity_query(v).contains("pg_stat_activity"));
             assert!(activity_query(v).contains("pg_kronika"));
         }
+    }
+
+    #[test]
+    fn collector_query_has_a_deterministic_source_side_guard_row() {
+        let query = bounded_activity_query(ActivityVersion::V3);
+        assert!(query.ends_with(" FROM pg_stat_activity ORDER BY pid LIMIT $1"));
+        assert_eq!(
+            ACTIVITY_FETCH_ROWS,
+            i64::try_from(MAX_ACTIVITY_ROWS).unwrap() + 1
+        );
     }
 
     #[test]

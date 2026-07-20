@@ -213,8 +213,10 @@ fn log_to_json(log: &EventOutcome) -> Value {
     let findings: Vec<Value> = log.findings.iter().map(finding_to_json).collect();
     let skipped: Vec<Value> = log.skipped.iter().map(engine_skip_to_json).collect();
     json!({
+        "schema_version": 1,
         "complete": log.complete,
         "evaluated_lens_ids": applied_event_ids(),
+        "catalog": event_catalog_to_json(),
         "findings": findings,
         "coverage": log_coverage_to_json(&log.coverage),
         "skipped": skipped,
@@ -228,6 +230,22 @@ fn applied_event_ids() -> Vec<Value> {
         .collect()
 }
 
+fn event_catalog_to_json() -> Vec<Value> {
+    crate::incident::event_catalog_metadata()
+        .iter()
+        .map(|entry| {
+            json!({
+                "lens_id": entry.lens_id,
+                "slug": entry.slug,
+                "question": entry.question,
+                "text_locale": "ru",
+                "source_format": "stderr",
+                "evidence_quality": "heuristic_positive_observation",
+            })
+        })
+        .collect()
+}
+
 fn log_coverage_to_json(coverage: &BTreeMap<&'static str, LogCoverage>) -> Value {
     let object: serde_json::Map<String, Value> = coverage
         .iter()
@@ -238,8 +256,10 @@ fn log_coverage_to_json(coverage: &BTreeMap<&'static str, LogCoverage>) -> Value
 
 fn empty_log_json() -> Value {
     json!({
+        "schema_version": 1,
         "complete": false,
         "evaluated_lens_ids": applied_event_ids(),
+        "catalog": event_catalog_to_json(),
         "findings": Value::Array(Vec::new()),
         "coverage": json!({}),
         "skipped": Value::Array(Vec::new()),

@@ -31,6 +31,60 @@ const SQLSTATE_DEADLOCK: &str = "40P01";
 const SQLSTATE_DATA_CORRUPTED: &str = "XX001";
 const SQLSTATE_INDEX_CORRUPTED: &str = "XX002";
 
+/// Versioned public metadata for one bounded log-evidence branch.
+pub(crate) struct EventCatalogEntry {
+    pub lens_id: &'static str,
+    pub slug: &'static str,
+    pub question: &'static str,
+}
+
+const EVENT_CATALOG_METADATA: &[EventCatalogEntry] = &[
+    EventCatalogEntry {
+        lens_id: "PG-EVT-001",
+        slug: "server_child_sigkill",
+        question: "Зафиксировал ли stderr завершение процесса PostgreSQL сигналом 9?",
+    },
+    EventCatalogEntry {
+        lens_id: "PG-EVT-002",
+        slug: "server_child_signal_termination",
+        question: "Зафиксировал ли stderr аварийное завершение процесса PostgreSQL сигналом?",
+    },
+    EventCatalogEntry {
+        lens_id: "PG-EVT-003",
+        slug: "panic_severity_observation",
+        question: "Наблюдалась ли в stderr запись с уровнем PANIC?",
+    },
+    EventCatalogEntry {
+        lens_id: "OS-FS-027",
+        slug: "filesystem_space",
+        question: "Есть ли признак отказа из-за нехватки пространства или связанного лимита?",
+    },
+    EventCatalogEntry {
+        lens_id: "PG-EVT-005",
+        slug: "postgres_out_of_memory_observation",
+        question: "Наблюдался ли в stderr признак ошибки PostgreSQL out_of_memory?",
+    },
+    EventCatalogEntry {
+        lens_id: "PG-CONN-014",
+        slug: "connection_saturation",
+        question: "Есть ли признак отклонённого подключения из-за лимита соединений?",
+    },
+    EventCatalogEntry {
+        lens_id: "PG-EVT-007",
+        slug: "deadlock_observation",
+        question: "Наблюдался ли в stderr признак обнаруженного PostgreSQL deadlock?",
+    },
+    EventCatalogEntry {
+        lens_id: "PG-EVT-008",
+        slug: "corruption_sqlstate_observation",
+        question: "Наблюдался ли в stderr признак SQLSTATE XX001 или XX002?",
+    },
+];
+
+pub(crate) const fn event_catalog_metadata() -> &'static [EventCatalogEntry] {
+    EVENT_CATALOG_METADATA
+}
+
 /// How much of a log section the request actually saw.
 ///
 /// There is no `Complete`: effective `PostgreSQL` logging configuration and the
@@ -1074,6 +1128,19 @@ mod tests {
         let unique: BTreeSet<_> = ids.iter().copied().collect();
         assert_eq!(unique.len(), ids.len(), "event ids are unique");
         assert_eq!(event_catalog().len(), ids.len());
+        assert_eq!(event_catalog_metadata().len(), ids.len());
+        assert_eq!(
+            event_catalog_metadata()
+                .iter()
+                .map(|entry| entry.lens_id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        let slugs: BTreeSet<_> = event_catalog_metadata()
+            .iter()
+            .map(|entry| entry.slug)
+            .collect();
+        assert_eq!(slugs.len(), ids.len(), "event slugs are unique");
     }
 
     #[test]

@@ -267,7 +267,13 @@ pub(crate) fn prepare_input(
         state.process(logical, page, &gates, scan, limits)?;
     }
 
-    let log_events = build_log_events(&input.pages, &state.skipped, EventInputLimits::production());
+    let log_events = build_log_events(
+        &input.pages,
+        &state.skipped,
+        EventInputLimits::production(),
+        scan.from,
+        scan.to,
+    );
 
     Ok(PreparedInput {
         source_id: source,
@@ -298,10 +304,24 @@ fn build_log_events(
     pages: &BTreeMap<String, SectionPage>,
     skipped: &[SectionSkip],
     limits: EventInputLimits,
+    from_us: i64,
+    to_us: i64,
 ) -> LogEventInputs {
     let mut events = LogEventInputs::new(limits);
-    ingest_log_errors(pages.get(PG_LOG_ERRORS), skipped, &mut events);
-    ingest_log_lifecycle(pages.get(PG_LOG_LIFECYCLE), skipped, &mut events);
+    ingest_log_errors(
+        pages.get(PG_LOG_ERRORS),
+        skipped,
+        &mut events,
+        from_us,
+        to_us,
+    );
+    ingest_log_lifecycle(
+        pages.get(PG_LOG_LIFECYCLE),
+        skipped,
+        &mut events,
+        from_us,
+        to_us,
+    );
     if pages
         .get(PG_LOG_GAP)
         .is_some_and(|page| !page.rows.is_empty() || !page.gaps.is_empty())
@@ -326,6 +346,8 @@ fn ingest_log_errors(
     page: Option<&SectionPage>,
     skipped: &[SectionSkip],
     events: &mut LogEventInputs,
+    from_us: i64,
+    to_us: i64,
 ) {
     let Some(page) = page.filter(|_| !skipped.iter().any(|skip| skip.section == PG_LOG_ERRORS))
     else {
@@ -340,6 +362,9 @@ fn ingest_log_errors(
         ) else {
             continue;
         };
+        if !(from_us..to_us).contains(&ts) {
+            continue;
+        }
         if !events.push_error(LogErrorGroup::new(
             ts,
             severity,
@@ -356,6 +381,8 @@ fn ingest_log_lifecycle(
     page: Option<&SectionPage>,
     skipped: &[SectionSkip],
     events: &mut LogEventInputs,
+    from_us: i64,
+    to_us: i64,
 ) {
     let Some(page) = page.filter(|_| !skipped.iter().any(|skip| skip.section == PG_LOG_LIFECYCLE))
     else {
@@ -369,6 +396,9 @@ fn ingest_log_lifecycle(
         ) else {
             continue;
         };
+        if !(from_us..to_us).contains(&ts) {
+            continue;
+        }
         if !events.push_lifecycle(LifecycleEvent::new(
             ts,
             read_i64(row, "pid"),
@@ -667,11 +697,33 @@ impl BuildState {
 
         let identity = logical.diff_key();
         let (cumulative, gauges) = scorable_columns(logical);
+        let snapshot_fields: &[&str] = match logical.name {
+            PG_STAT_ACTIVITY => &[
+                "backend_start",
+                "leader_pid",
+                "backend_type",
+                "state",
+                "wait_event_type",
+                "wait_event",
+                "backend_xmin_age",
+                "xact_start",
+                "query_start",
+            ],
+            PG_LOCKS => &[
+                "backend_start",
+                "blocked_by",
+                "waitstart",
+                "mode",
+                "locktype",
+            ],
+            _ => &[],
+        };
         let duplicate_gauge_breaks = match normalize_duplicate_rows(
             &mut page.rows,
             &identity,
             &cumulative,
             &gauges,
+            snapshot_fields,
             &mut self.quality,
             &mut self.remaining_identity_bytes,
             limits.identity_bytes,
@@ -1219,11 +1271,17 @@ fn normalize_duplicate_rows(
     identity: &[&str],
     cumulative: &[&str],
     gauges: &[&str],
+    snapshot_fields: &[&str],
     quality: &mut InputQuality,
     remaining_identity_bytes: &mut usize,
     identity_byte_limit: usize,
 ) -> Result<Vec<DuplicateGaugeBreak>, NormalizeError> {
-    let compared: Vec<&str> = cumulative.iter().chain(gauges).copied().collect();
+    let compared: Vec<&str> = cumulative
+        .iter()
+        .chain(gauges)
+        .chain(snapshot_fields)
+        .copied()
+        .collect();
     let mut seen: BTreeMap<(Vec<IdentityValue>, i64), usize> = BTreeMap::new();
     let mut kept = Vec::with_capacity(rows.len());
     let mut duplicate_breaks = Vec::new();
@@ -1706,6 +1764,7 @@ mod tests {
                 &[],
                 &["c"],
                 &[],
+                &[],
                 &mut q,
                 &mut identity_bytes,
                 100,
@@ -1734,6 +1793,7 @@ mod tests {
                 &[],
                 &["c"],
                 &[],
+                &[],
                 &mut forward_quality,
                 &mut forward_bytes,
                 100,
@@ -1746,11 +1806,38 @@ mod tests {
                 &[],
                 &["c"],
                 &[],
+                &[],
                 &mut reverse_quality,
                 &mut reverse_bytes,
                 100,
             ),
             Err(NormalizeError::Conflict(1))
+        );
+    }
+
+    #[test]
+    fn conflicting_snapshot_labels_are_not_silently_deduplicated() {
+        let mut first = activity_row(100, 7, "active", 10, 50);
+        first.push(cell("wait_event_type", Value::Str("IPC".to_owned())));
+        first.push(cell("wait_event", Value::Str("SyncRep".to_owned())));
+        let mut second = activity_row(100, 7, "active", 10, 50);
+        second.push(cell("wait_event_type", Value::Str("Client".to_owned())));
+        second.push(cell("wait_event", Value::Str("ClientRead".to_owned())));
+        let mut rows = vec![first, second];
+        let mut q = quality();
+        let mut identity_bytes = 1_000;
+        assert_eq!(
+            normalize_duplicate_rows(
+                &mut rows,
+                &["pid"],
+                &[],
+                &[],
+                &["wait_event_type", "wait_event"],
+                &mut q,
+                &mut identity_bytes,
+                1_000,
+            ),
+            Err(NormalizeError::Conflict(100))
         );
     }
 
@@ -1765,6 +1852,7 @@ mod tests {
                 &mut rows,
                 &[],
                 &["c"],
+                &[],
                 &[],
                 &mut q,
                 &mut identity_bytes,
@@ -1791,6 +1879,7 @@ mod tests {
                 &mut rows,
                 &["id"],
                 &["c"],
+                &[],
                 &[],
                 &mut q,
                 &mut identity_bytes,
@@ -1820,6 +1909,7 @@ mod tests {
                 &mut rows,
                 &["id"],
                 &["c"],
+                &[],
                 &[],
                 &mut q,
                 &mut identity_bytes,
@@ -2657,7 +2747,7 @@ mod tests {
             ],
         );
         let mut events = LogEventInputs::new(EventInputLimits::production());
-        ingest_log_errors(Some(&page), &[], &mut events);
+        ingest_log_errors(Some(&page), &[], &mut events, -1, 1);
 
         assert_eq!(
             events.coverage().get("pg_log_errors"),
@@ -2697,6 +2787,8 @@ mod tests {
                 reason: SkipReason::IncompletePage,
             }],
             &mut events,
+            -1,
+            1,
         );
         assert_eq!(
             events.coverage().get("pg_log_errors"),
@@ -2710,7 +2802,7 @@ mod tests {
 
     #[test]
     fn a_missing_page_is_not_collected() {
-        let events = build_log_events(&BTreeMap::new(), &[], EventInputLimits::production());
+        let events = build_log_events(&BTreeMap::new(), &[], EventInputLimits::production(), -1, 1);
         assert_eq!(
             events.coverage().get("pg_log_errors"),
             Some(&LogCoverage::NotCollected),
@@ -2733,7 +2825,7 @@ mod tests {
             ],
         );
         let mut events = LogEventInputs::new(EventInputLimits::production());
-        ingest_log_lifecycle(Some(&page), &[], &mut events);
+        ingest_log_lifecycle(Some(&page), &[], &mut events, -1, 1);
         let ids: Vec<_> = event_findings(&events)
             .into_iter()
             .map(|(id, _)| id)
@@ -2747,11 +2839,33 @@ mod tests {
         let mut page = log_page("pg_log_errors", vec![error_row(0, Some("40P01"), 1)]);
         page.gaps = vec![Gap { from: 0, to: 5 }];
         let mut events = LogEventInputs::new(EventInputLimits::production());
-        ingest_log_errors(Some(&page), &[], &mut events);
+        ingest_log_errors(Some(&page), &[], &mut events, -1, 1);
         assert_eq!(
             events.coverage().get("pg_log_errors"),
             Some(&LogCoverage::Gap),
         );
+    }
+
+    #[test]
+    fn log_event_adapter_uses_the_half_open_request_window() {
+        let at = |ts| {
+            let mut row = error_row(0, Some("40P01"), 1);
+            row[0].1 = Value::Ts(ts);
+            row
+        };
+        let page = log_page(PG_LOG_ERRORS, vec![at(-1), at(0), at(9), at(10)]);
+        let mut events = LogEventInputs::new(EventInputLimits::production());
+        ingest_log_errors(Some(&page), &[], &mut events, 0, 10);
+        let facts = event_findings(&events);
+        assert_eq!(facts.iter().filter(|(id, _)| id == "PG-EVT-007").count(), 2);
+        let timestamps: BTreeSet<_> = facts
+            .iter()
+            .filter_map(|(_, identity)| match identity.get(1) {
+                Some(IdentityValue::I64(ts)) => Some(*ts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(timestamps, BTreeSet::from([0, 9]));
     }
 
     #[test]
@@ -2787,7 +2901,7 @@ mod tests {
 
         let mut pages = BTreeMap::new();
         pages.insert(PG_LOG_ERRORS.to_owned(), page);
-        let events = build_log_events(&pages, &[], EventInputLimits::production());
+        let events = build_log_events(&pages, &[], EventInputLimits::production(), -1, 1);
         let rendered = format!("{:?}", event_findings(&events));
         assert!(!rendered.contains(secret));
         assert!(!rendered.contains("hunter2"));

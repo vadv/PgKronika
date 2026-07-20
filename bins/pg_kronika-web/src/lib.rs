@@ -1060,7 +1060,11 @@ mod tests {
         let dormant = body["catalog"]["dormant"]
             .as_array()
             .expect("catalog lists dormant lenses");
-        assert_eq!(dormant.len(), 5, "28 catalog lenses minus 23 active");
+        assert_eq!(
+            dormant.len(),
+            8,
+            "28 core lenses minus 20 active core lenses"
+        );
         assert!(
             dormant
                 .iter()
