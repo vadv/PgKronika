@@ -168,6 +168,12 @@ const ACTIVE_LENS_IDS: &[&str] = &[
     "PG-EVT-005",
     "PG-EVT-007",
     "PG-EVT-008",
+    "PG-EVT-009",
+    "PG-EVT-010",
+    "PG-EVT-011",
+    "PG-EVT-012",
+    "PG-EVT-013",
+    "PG-EVT-014",
 ];
 
 async fn assert_calm_incidents(uri: &str, to: i64) {
