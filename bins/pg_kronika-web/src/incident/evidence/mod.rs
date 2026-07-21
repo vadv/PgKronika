@@ -2,6 +2,7 @@
 
 mod confidence;
 mod counter;
+mod coverage;
 mod direct;
 mod finding;
 mod gauge;
@@ -19,6 +20,9 @@ pub(crate) use confidence::{ConfidenceCap, Role};
 pub(crate) use counter::{
     CounterEvidence, CounterEvidenceInput, CounterEvidenceWindow, CounterEvidenceWindowInput,
     CounterMeasurementKind, CounterOperand, CounterOperandPurpose,
+};
+pub(crate) use coverage::{
+    SourceWindow, observed_period_from_durations, observed_period_from_timestamps,
 };
 pub(crate) use direct::{DirectEvidence, LockParticipant, SampledLockEdge};
 pub(crate) use finding::{Evidence, Finding, FindingDraft, FindingScope};

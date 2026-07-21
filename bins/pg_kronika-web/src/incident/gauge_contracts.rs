@@ -114,6 +114,7 @@ impl Lens for FreezeHorizonLens {
                 ThresholdKind::AtLeast,
                 reading.observed_at_us,
                 reading.samples,
+                reading.source_window,
                 entity(FREEZE, &member.identity),
             ) else {
                 continue;
@@ -196,6 +197,7 @@ impl Lens for RunningVacuumLens {
                 threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us: reading.observed_at_us,
                 samples: reading.samples,
+                source_window: reading.source_window,
                 entity: entity(VACUUM, &member.identity),
             }) else {
                 continue;
@@ -310,6 +312,7 @@ impl Lens for PhysicalReplicationLens {
                 threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us: reading.observed_at_us,
                 samples: reading.samples,
+                source_window: reading.source_window,
                 entity: entity(REPLICATION, &member.identity),
             }) else {
                 continue;
@@ -436,6 +439,7 @@ impl Lens for SlotRetentionLens {
                 ThresholdKind::AtLeast,
                 reading.observed_at_us,
                 reading.samples,
+                reading.source_window,
                 entity(SLOT, &member.identity),
             ) else {
                 continue;
@@ -453,6 +457,7 @@ impl Lens for SlotRetentionLens {
                     first_at_us: trend.first_at_us,
                     last_at_us: trend.last_at_us,
                     samples: trend.samples,
+                    source_window: trend.source_window,
                     entity: entity(SLOT, &member.identity),
                 })
             {
@@ -539,6 +544,7 @@ impl Lens for StorageCapacityLens {
                 ThresholdKind::Below,
                 reading.observed_at_us,
                 reading.samples,
+                reading.source_window,
                 entity(STORAGE, &member.identity),
             ) else {
                 continue;
@@ -634,6 +640,7 @@ impl Lens for CgroupMemoryLens {
                 ThresholdKind::AtLeast,
                 reading.observed_at_us,
                 reading.samples,
+                reading.source_window,
                 entity(CGROUP, &member.identity),
             ) else {
                 continue;

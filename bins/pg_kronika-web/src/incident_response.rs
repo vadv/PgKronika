@@ -9,7 +9,7 @@ use crate::anomaly::ScanParams;
 use crate::incident::{
     CounterEvidence, DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence,
     Finding, GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
-    SampledLockEdge,
+    SampledLockEdge, SourceWindow,
 };
 use crate::incident_input::{CapabilityInputState, InputQuality, SectionSkip, SkipReason};
 
@@ -230,10 +230,32 @@ fn gauge_evidence_to_json(gauge: &GaugeEvidence) -> Value {
         },
         "observed_at_us": gauge.observed_at_us(),
         "sample_count": gauge.samples(),
+        "coverage": {
+            "source_period": source_window_json(&gauge.source_window()),
+        },
         "entity": {
             "logical_section": gauge.entity().section(),
             "identity": entity,
         },
+    })
+}
+
+/// The observed source-window coverage: the collection cadence derived from the
+/// series' own sample spacing, the intervals the incident window should have
+/// held at that cadence, and the fraction actually covered. `expected` is null
+/// and completeness is `unknown` (with a reason) when the cadence is unproven.
+/// Completeness is emitted raw; a value above one signals an underestimated
+/// period or data wider than the incident, not an error to clamp away.
+fn source_window_json(window: &SourceWindow) -> Value {
+    let completeness = window
+        .source_window_completeness()
+        .map_or_else(|| Value::from("unknown"), Value::from);
+    json!({
+        "basis": "observed_series_delta_median",
+        "observed_source_period_us": window.observed_period_us(),
+        "expected_interval_count": window.expected_interval_count(),
+        "expected_interval_count_reason": window.completeness_gap_reason(),
+        "source_window_completeness": completeness,
     })
 }
 
@@ -294,9 +316,7 @@ fn counter_evidence_to_json(counter: &CounterEvidence) -> Value {
             },
             "summed_interval_duration_us": window.elapsed_us(),
             "observed_endpoint_pairing_complete": window.excluded_intervals() == 0,
-            "expected_interval_count": Value::Null,
-            "expected_interval_count_reason": "runtime_source_period_unavailable",
-            "source_window_completeness": "unknown",
+            "source_period": source_window_json(&window.source_window()),
         },
         "entity": {
             "logical_section": counter.entity().section(),

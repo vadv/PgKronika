@@ -11,7 +11,7 @@ use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
     ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, GaugeValueInput, Role, ThresholdKind,
+    GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
 };
 use super::lens::Lens;
 use super::model::IdentityValue;
@@ -32,6 +32,66 @@ impl HostCpuLens {
     const MIN_INTERVALS: usize = 3;
     const BUSY_FLOOR: f64 = 0.8;
     const STEAL_FLOOR: f64 = 0.05;
+
+    fn cpu_share_evidence(
+        sums: &AlignedSums,
+        busy: f64,
+        total: f64,
+        steal: f64,
+        iowait: f64,
+        identity: &Arc<[IdentityValue]>,
+    ) -> Option<Vec<GaugeEvidence>> {
+        let entity = || GaugeEntity::new(OS_CPU, Arc::clone(identity));
+        [
+            GaugeEvidence::ratio(
+                GaugeRatio::new(
+                    "busy_non_iowait_ticks",
+                    busy,
+                    "total_non_guest_ticks",
+                    total,
+                    GaugeUnit::Count,
+                ),
+                Self::BUSY_FLOOR,
+                ThresholdKind::AtLeast,
+                sums.last_end_us,
+                sums.intervals,
+                sums.source_window,
+                entity(),
+            ),
+            GaugeEvidence::ratio(
+                GaugeRatio::new(
+                    "steal_ticks",
+                    steal,
+                    "total_non_guest_ticks",
+                    total,
+                    GaugeUnit::Count,
+                ),
+                Self::STEAL_FLOOR,
+                ThresholdKind::AtLeast,
+                sums.last_end_us,
+                sums.intervals,
+                sums.source_window,
+                entity(),
+            ),
+            GaugeEvidence::ratio(
+                GaugeRatio::new(
+                    "iowait_ticks",
+                    iowait,
+                    "total_non_guest_ticks",
+                    total,
+                    GaugeUnit::Count,
+                ),
+                0.0,
+                ThresholdKind::AtLeast,
+                sums.last_end_us,
+                sums.intervals,
+                sums.source_window,
+                entity(),
+            ),
+        ]
+        .into_iter()
+        .collect()
+    }
 
     fn append_psi_evidence(
         typed: &TypedInputs,
@@ -60,6 +120,7 @@ impl HostCpuLens {
                 threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us: reading.observed_at_us,
                 samples: reading.samples,
+                source_window: reading.source_window,
                 entity: GaugeEntity::new(OS_PSI, Arc::from(identity)),
             })
         {
@@ -145,54 +206,9 @@ impl Lens for HostCpuLens {
             return Ok(());
         }
         let entity_identity: Arc<[IdentityValue]> = Arc::from(identity);
-        let entity = || GaugeEntity::new(OS_CPU, Arc::clone(&entity_identity));
-        let evidence = [
-            GaugeEvidence::ratio(
-                GaugeRatio::new(
-                    "busy_non_iowait_ticks",
-                    busy,
-                    "total_non_guest_ticks",
-                    total,
-                    GaugeUnit::Count,
-                ),
-                Self::BUSY_FLOOR,
-                ThresholdKind::AtLeast,
-                sums.last_end_us,
-                sums.intervals,
-                entity(),
-            ),
-            GaugeEvidence::ratio(
-                GaugeRatio::new(
-                    "steal_ticks",
-                    steal,
-                    "total_non_guest_ticks",
-                    total,
-                    GaugeUnit::Count,
-                ),
-                Self::STEAL_FLOOR,
-                ThresholdKind::AtLeast,
-                sums.last_end_us,
-                sums.intervals,
-                entity(),
-            ),
-            GaugeEvidence::ratio(
-                GaugeRatio::new(
-                    "iowait_ticks",
-                    iowait,
-                    "total_non_guest_ticks",
-                    total,
-                    GaugeUnit::Count,
-                ),
-                0.0,
-                ThresholdKind::AtLeast,
-                sums.last_end_us,
-                sums.intervals,
-                entity(),
-            ),
-        ]
-        .into_iter()
-        .collect::<Option<Vec<_>>>();
-        let Some(mut evidence) = evidence else {
+        let Some(mut evidence) =
+            Self::cpu_share_evidence(&sums, busy, total, steal, iowait, &entity_identity)
+        else {
             return Ok(());
         };
         Self::append_psi_evidence(typed, context, sink, &mut evidence)?;
@@ -319,6 +335,7 @@ impl BlockDeviceLens {
                 ThresholdKind::AtLeast,
                 sums.last_end_us,
                 sums.intervals,
+                sums.source_window,
                 entity.clone(),
             ),
             // weighted_time / wall time is average in-flight I/O, not utilization.
@@ -336,6 +353,7 @@ impl BlockDeviceLens {
                 ThresholdKind::AtLeast,
                 sums.last_end_us,
                 sums.intervals,
+                sums.source_window,
                 entity.clone(),
             ),
         ]
@@ -431,6 +449,7 @@ impl Lens for BlockDeviceLens {
                     threshold_kind: ThresholdKind::AtLeast,
                     observed_at_us: reading.observed_at_us,
                     samples: reading.samples,
+                    source_window: reading.source_window,
                     entity,
                 })
             {
@@ -456,6 +475,7 @@ struct ProcessIoCandidate {
     bytes: f64,
     intervals: usize,
     observed_at_us: i64,
+    source_window: SourceWindow,
     postgres_backend: bool,
     device: Option<(u64, u64)>,
 }
@@ -577,6 +597,7 @@ impl ProcessIoWhoLens {
             bytes,
             intervals: sums.intervals,
             observed_at_us,
+            source_window: sums.source_window,
             postgres_backend: typed.process_is_postgres_backend(
                 pid,
                 starttime,
@@ -670,6 +691,7 @@ impl Lens for ProcessIoWhoLens {
                 threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us: candidate.observed_at_us,
                 samples: candidate.intervals,
+                source_window: candidate.source_window,
                 entity: GaugeEntity::new(OS_PROCESS, Arc::from(public_identity)),
             }) {
                 evidence.push(Evidence::GaugeObservation(row));

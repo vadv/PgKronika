@@ -38,6 +38,7 @@ pub(crate) use events::{
 };
 pub(crate) use evidence::{
     CounterEvidence, Evidence, Finding, GaugeEvidence, GaugeMeasurement, SampledLockEdge,
+    SourceWindow,
 };
 #[cfg(test)]
 pub(crate) use evidence::{DirectEvidence, LockParticipant};

@@ -18,6 +18,9 @@ use std::sync::Arc;
 
 use kronika_analytics::DiffPoint;
 
+use super::evidence::{
+    SourceWindow, observed_period_from_durations, observed_period_from_timestamps,
+};
 use super::model::IdentityValue;
 
 const MAX_EXACT_F64_INTEGER_I128: i128 = 1_i128 << 53;
@@ -111,6 +114,9 @@ pub(crate) struct PairedSums {
     pub last_end_us: Option<i64>,
     /// Sum of the usable, aligned interval durations.
     pub elapsed_us: u64,
+    /// Median of the usable interval durations; `None` when too few intervals
+    /// pin a stable source cadence.
+    pub observed_period_us: Option<u64>,
 }
 
 impl PairedSums {
@@ -134,13 +140,15 @@ enum PairExclusion {
     NumericLimit,
 }
 
+/// On success returns the accepted interval's duration in microseconds, so the
+/// caller can gather durations for the observed-period median.
 fn accumulate_counter_pair(
     sums: &mut PairedSums,
     first_sum_integer: &mut bool,
     second_sum_integer: &mut bool,
     first: CounterPoint,
     second: CounterPoint,
-) -> Result<(), PairExclusion> {
+) -> Result<u64, PairExclusion> {
     let (first_delta, second_delta) = match (first.delta(), second.delta()) {
         (Ok(first_delta), Ok(second_delta)) => (first_delta, second_delta),
         (Err(CounterDeltaError::NumericLimit), _) | (_, Err(CounterDeltaError::NumericLimit)) => {
@@ -192,7 +200,7 @@ fn accumulate_counter_pair(
     sums.elapsed_us = elapsed_us;
     *first_sum_integer &= first_delta.integer;
     *second_sum_integer &= second_delta.integer;
-    Ok(())
+    Ok(first_interval_us)
 }
 
 struct AlignedInterval {
@@ -229,15 +237,15 @@ fn aligned_interval(tracks: &[&CounterTrack], indexes: &[usize]) -> Option<Align
     })
 }
 
+/// On success returns the accepted interval's duration in microseconds, for the
+/// observed-period median; `None` when the interval was skipped.
 fn accumulate_aligned_interval(
     result: &mut AlignedSums,
     integer_sums: &mut [bool; 16],
     interval: &AlignedInterval,
     end_us: i64,
-) {
-    let Some(next_elapsed_us) = result.elapsed_us.checked_add(interval.duration_us) else {
-        return;
-    };
+) -> Option<u64> {
+    let next_elapsed_us = result.elapsed_us.checked_add(interval.duration_us)?;
     let sums_are_usable = result
         .sums
         .iter()
@@ -250,7 +258,7 @@ fn accumulate_aligned_interval(
                 && (!integer_sum || !integer_delta || sum <= MAX_EXACT_F64_INTEGER - delta)
         });
     if !sums_are_usable {
-        return;
+        return None;
     }
     for ((sum, integer_sum), (delta, integer_delta)) in result
         .sums
@@ -265,6 +273,7 @@ fn accumulate_aligned_interval(
     result.intervals = result.intervals.saturating_add(1);
     result.last_end_us = end_us;
     result.elapsed_us = next_elapsed_us;
+    Some(interval.duration_us)
 }
 
 /// Sums for a fixed set of cumulative columns over exactly the same usable
@@ -276,6 +285,8 @@ pub(crate) struct AlignedSums {
     pub intervals: usize,
     pub last_end_us: i64,
     pub elapsed_us: u64,
+    /// Incident-window coverage: span, observed cadence, and usable intervals.
+    pub source_window: SourceWindow,
 }
 
 /// One privacy-reduced `pg_store_plans` row. Plan text and names never enter
@@ -359,6 +370,7 @@ pub(crate) struct GaugeReading {
     pub observed_at_us: i64,
     /// Valid readings that fell inside the window.
     pub samples: usize,
+    pub source_window: SourceWindow,
 }
 
 /// Two gauge columns of one series at the shared timestamp that is worst for a
@@ -371,6 +383,7 @@ pub(crate) struct PairedGauge {
     /// Shared timestamps where both readings were valid and the objective was
     /// finite.
     pub samples: usize,
+    pub source_window: SourceWindow,
 }
 
 /// How a lens combines two same-timestamp gauge readings and which extreme is
@@ -418,13 +431,38 @@ impl GaugeObjective {
     }
 }
 
+/// Observed source cadence over a gauge window from its own sample timestamps.
+fn gauge_source_window(
+    from_us: i64,
+    to_us: i64,
+    sample_ts: &[i64],
+    samples: usize,
+) -> SourceWindow {
+    // Completeness compares intervals to intervals: N gauge samples span N-1
+    // sampling intervals, the same unit as expected_interval_count.
+    let usable_intervals = samples.saturating_sub(1);
+    SourceWindow::from_bounds(
+        from_us,
+        to_us,
+        observed_period_from_timestamps(sample_ts),
+        usable_intervals,
+    )
+}
+
 pub(crate) struct GaugeWindow<'a> {
     points: &'a [GaugePoint],
+    from_us: i64,
+    to_us: i64,
 }
 
 impl GaugeWindow<'_> {
     pub(crate) const fn inspected_points(&self) -> usize {
         self.points.len()
+    }
+
+    fn source_window(&self) -> SourceWindow {
+        let sample_ts: Vec<i64> = self.points.iter().map(|point| point.ts).collect();
+        gauge_source_window(self.from_us, self.to_us, &sample_ts, self.points.len())
     }
 
     pub(crate) fn max(&self) -> Option<GaugeReading> {
@@ -438,6 +476,7 @@ impl GaugeWindow<'_> {
             value: point.value,
             observed_at_us: point.ts,
             samples: self.points.len(),
+            source_window: self.source_window(),
         })
     }
 }
@@ -445,6 +484,8 @@ impl GaugeWindow<'_> {
 pub(crate) struct PairedGaugeWindow<'a> {
     a: &'a [GaugePoint],
     b: &'a [GaugePoint],
+    from_us: i64,
+    to_us: i64,
 }
 
 impl PairedGaugeWindow<'_> {
@@ -454,7 +495,7 @@ impl PairedGaugeWindow<'_> {
 
     pub(crate) fn reduce(&self, objective: GaugeObjective) -> Option<PairedGauge> {
         let mut best: Option<(f64, GaugePoint, GaugePoint)> = None;
-        let mut samples = 0;
+        let mut shared_ts: Vec<i64> = Vec::new();
         let (mut i, mut j) = (0, 0);
         while i < self.a.len() && j < self.b.len() {
             let a = self.a[i];
@@ -465,7 +506,7 @@ impl PairedGaugeWindow<'_> {
                 std::cmp::Ordering::Equal => {
                     let score = objective.score(a.value, b.value);
                     if score.is_finite() {
-                        samples += 1;
+                        shared_ts.push(a.ts);
                         let improves = best.is_none_or(|(best_score, _, _)| {
                             if objective.maximizes() {
                                 score > best_score
@@ -486,7 +527,13 @@ impl PairedGaugeWindow<'_> {
             a: a.value,
             b: b.value,
             observed_at_us: a.ts,
-            samples,
+            samples: shared_ts.len(),
+            source_window: gauge_source_window(
+                self.from_us,
+                self.to_us,
+                &shared_ts,
+                shared_ts.len(),
+            ),
         })
     }
 }
@@ -498,17 +545,22 @@ pub(crate) struct TripleGauge {
     pub denominator: f64,
     pub observed_at_us: i64,
     pub samples: usize,
+    pub source_window: SourceWindow,
 }
 
 pub(crate) struct TripleGaugeWindow<'a> {
     a: &'a [GaugePoint],
     b: &'a [GaugePoint],
     denominator: &'a [GaugePoint],
+    from_us: i64,
+    to_us: i64,
 }
 
 /// Exact-timestamp readings for a small fixed lens contract.
 pub(crate) struct GaugeSnapshotWindow<'a> {
     tracks: Vec<&'a [GaugePoint]>,
+    from_us: i64,
+    to_us: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -517,6 +569,7 @@ pub(crate) struct GaugeSnapshot {
     pub len: usize,
     pub observed_at_us: i64,
     pub samples: usize,
+    pub source_window: SourceWindow,
 }
 
 impl GaugeSnapshotWindow<'_> {
@@ -532,14 +585,17 @@ impl GaugeSnapshotWindow<'_> {
         }
         let mut indexes = vec![0_usize; self.tracks.len()];
         let mut best: Option<GaugeSnapshot> = None;
-        let mut samples = 0_usize;
+        let mut shared_ts: Vec<i64> = Vec::new();
         loop {
             let mut min_ts = i64::MAX;
             let mut max_ts = i64::MIN;
             for (track, &index) in self.tracks.iter().zip(&indexes) {
                 let Some(point) = track.get(index) else {
+                    let source_window =
+                        gauge_source_window(self.from_us, self.to_us, &shared_ts, shared_ts.len());
                     return best.map(|mut reading| {
-                        reading.samples = samples;
+                        reading.samples = shared_ts.len();
+                        reading.source_window = source_window;
                         reading
                     });
                 };
@@ -558,12 +614,18 @@ impl GaugeSnapshotWindow<'_> {
             for (slot, (track, index)) in values.iter_mut().zip(self.tracks.iter().zip(&indexes)) {
                 *slot = track[*index].value;
             }
-            samples = samples.saturating_add(1);
+            shared_ts.push(min_ts);
             let candidate = GaugeSnapshot {
                 values,
                 len: self.tracks.len(),
                 observed_at_us: min_ts,
-                samples,
+                samples: shared_ts.len(),
+                source_window: gauge_source_window(
+                    self.from_us,
+                    self.to_us,
+                    &shared_ts,
+                    shared_ts.len(),
+                ),
             };
             let score = candidate.values[score_index];
             if best.is_none_or(|current| {
@@ -600,6 +662,7 @@ pub(crate) struct GaugeTrend {
     pub first_at_us: i64,
     pub last_at_us: i64,
     pub samples: usize,
+    pub source_window: SourceWindow,
 }
 
 impl GaugeWindow<'_> {
@@ -612,6 +675,7 @@ impl GaugeWindow<'_> {
             first_at_us: first.ts,
             last_at_us: last.ts,
             samples: self.points.len(),
+            source_window: self.source_window(),
         })
     }
 }
@@ -626,7 +690,7 @@ impl TripleGaugeWindow<'_> {
 
     pub(crate) fn sum_ratio_max(&self) -> Option<TripleGauge> {
         let mut best: Option<(f64, GaugePoint, GaugePoint, GaugePoint)> = None;
-        let mut samples = 0;
+        let mut shared_ts: Vec<i64> = Vec::new();
         let (mut a_index, mut b_index, mut denominator_index) = (0, 0, 0);
         while a_index < self.a.len()
             && b_index < self.b.len()
@@ -652,7 +716,7 @@ impl TripleGaugeWindow<'_> {
             if denominator.value > 0.0 {
                 let score = (first.value + second.value) / denominator.value;
                 if score.is_finite() {
-                    samples += 1;
+                    shared_ts.push(first.ts);
                     if best.is_none_or(|(best_score, _, _, _)| score > best_score) {
                         best = Some((score, first, second, denominator));
                     }
@@ -667,7 +731,13 @@ impl TripleGaugeWindow<'_> {
             b: b.value,
             denominator: denominator.value,
             observed_at_us: a.ts,
-            samples,
+            samples: shared_ts.len(),
+            source_window: gauge_source_window(
+                self.from_us,
+                self.to_us,
+                &shared_ts,
+                shared_ts.len(),
+            ),
         })
     }
 }
@@ -876,7 +946,9 @@ impl TypedInputs {
             first_end_us: None,
             last_end_us: None,
             elapsed_us: 0,
+            observed_period_us: None,
         };
+        let mut durations_us: Vec<u64> = Vec::new();
         let (mut first_sum_integer, mut second_sum_integer) = (true, true);
         let (mut i, mut j) = (0, 0);
         while i < track_a.points.len() && j < track_b.points.len() {
@@ -909,7 +981,7 @@ impl TypedInputs {
                             a,
                             b,
                         ) {
-                            Ok(()) => {}
+                            Ok(interval_us) => durations_us.push(interval_us),
                             Err(PairExclusion::UnusableDelta) => {
                                 sums.unusable_delta_intervals =
                                     sums.unusable_delta_intervals.saturating_add(1);
@@ -947,6 +1019,7 @@ impl TypedInputs {
             }
             j += 1;
         }
+        sums.observed_period_us = observed_period_from_durations(&mut durations_us);
         Some(sums)
     }
 
@@ -990,12 +1063,20 @@ impl TypedInputs {
             intervals: 0,
             last_end_us: from_us,
             elapsed_us: 0,
+            source_window: SourceWindow::from_bounds(from_us, to_us, None, 0),
         };
+        let mut durations_us: Vec<u64> = Vec::new();
         loop {
             let mut minimum = i64::MAX;
             let mut maximum = i64::MIN;
             for (track, &index) in tracks.iter().zip(&indexes) {
                 let Some(point) = track.points.get(index) else {
+                    result.source_window = SourceWindow::from_bounds(
+                        from_us,
+                        to_us,
+                        observed_period_from_durations(&mut durations_us),
+                        result.intervals,
+                    );
                     return Some(result);
                 };
                 minimum = minimum.min(point.end_us);
@@ -1011,8 +1092,10 @@ impl TypedInputs {
             }
             if (from_us..=to_us).contains(&minimum)
                 && let Some(interval) = aligned_interval(&tracks, &indexes)
+                && let Some(duration_us) =
+                    accumulate_aligned_interval(&mut result, &mut integer_sums, &interval, minimum)
             {
-                accumulate_aligned_interval(&mut result, &mut integer_sums, &interval, minimum);
+                durations_us.push(duration_us);
             }
             for index in &mut indexes {
                 *index += 1;
@@ -1194,6 +1277,8 @@ impl TypedInputs {
         let end = track.points.partition_point(|point| point.ts < to_us);
         (start < end).then_some(GaugeWindow {
             points: &track.points[start..end],
+            from_us,
+            to_us,
         })
     }
 
@@ -1232,6 +1317,8 @@ impl TypedInputs {
         Some(PairedGaugeWindow {
             a: a.points,
             b: b.points,
+            from_us,
+            to_us,
         })
     }
 
@@ -1264,6 +1351,8 @@ impl TypedInputs {
             a: a.points,
             b: b.points,
             denominator: denominator.points,
+            from_us,
+            to_us,
         })
     }
 
@@ -1285,7 +1374,11 @@ impl TypedInputs {
                     .points,
             );
         }
-        Some(GaugeSnapshotWindow { tracks })
+        Some(GaugeSnapshotWindow {
+            tracks,
+            from_us,
+            to_us,
+        })
     }
 
     /// Append one `pg_stat_activity` snapshot. The adapter feeds snapshots in

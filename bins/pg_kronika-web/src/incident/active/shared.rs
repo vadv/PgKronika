@@ -61,6 +61,7 @@ pub(super) fn counter_evidence(
         unaligned_duration_intervals: sums.unaligned_duration_intervals,
         numeric_limit_intervals: sums.numeric_limit_intervals,
         elapsed_us: sums.elapsed_us,
+        observed_period_us: sums.observed_period_us,
     })?;
     CounterEvidence::new(CounterEvidenceInput {
         kind: spec.kind,

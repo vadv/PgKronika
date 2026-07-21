@@ -148,6 +148,7 @@ fn gauge_evidence_rejects_non_finite_values_and_zero_denominators() {
             threshold_kind: ThresholdKind::AtLeast,
             observed_at_us: 10,
             samples: 1,
+            source_window: SourceWindow::from_bounds(0, 0, None, 0),
             entity: GaugeEntity::new("section", Arc::clone(&entity)),
         })
         .is_none()
@@ -159,6 +160,7 @@ fn gauge_evidence_rejects_non_finite_values_and_zero_denominators() {
             ThresholdKind::AtLeast,
             10,
             1,
+            SourceWindow::from_bounds(0, 0, None, 0),
             GaugeEntity::new("section", entity),
         )
         .is_none()
@@ -170,6 +172,7 @@ fn gauge_evidence_rejects_non_finite_values_and_zero_denominators() {
             ThresholdKind::AtLeast,
             10,
             1,
+            SourceWindow::from_bounds(0, 0, None, 0),
             GaugeEntity::new("section", Arc::from([])),
         )
         .is_none()
@@ -183,6 +186,7 @@ fn gauge_evidence_rejects_non_finite_values_and_zero_denominators() {
             threshold_kind: ThresholdKind::AtLeast,
             observed_at_us: 10,
             samples: 0,
+            source_window: SourceWindow::from_bounds(0, 0, None, 0),
             entity: GaugeEntity::new("section", Arc::from([])),
         })
         .is_none()
@@ -202,6 +206,7 @@ fn gauge_evidence_rejects_non_finite_values_and_zero_denominators() {
         ThresholdKind::AtLeast,
         10,
         1,
+        SourceWindow::from_bounds(0, 0, None, 0),
         GaugeEntity::new("section", Arc::from([])),
     )
     .expect("finite mixed-unit ratio");
@@ -235,6 +240,7 @@ fn counter_evidence_bounds_and_names_its_operands() {
                 unaligned_duration_intervals: 0,
                 numeric_limit_intervals: 0,
                 elapsed_us: 1_000_000,
+                observed_period_us: None,
             })
             .expect("valid window"),
             entity: GaugeEntity::new("section", Arc::from([])),
