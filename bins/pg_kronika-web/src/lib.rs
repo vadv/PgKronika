@@ -21,6 +21,48 @@
     reason = "metrics-exporter-prometheus and axum pull duplicate transitive versions outside our control"
 )]
 
+macro_rules! closed_string_enum {
+    (
+        $(#[$meta:meta])*
+        $visibility:vis enum $name:ident {
+            $($variant:ident => $wire:literal),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $visibility enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            #[allow(
+                dead_code,
+                reason = "closed-enum count is part of the generated registry contract"
+            )]
+            $visibility const COUNT: usize = [$(stringify!($variant)),+].len();
+
+            #[cfg(test)]
+            $visibility const ALL: [Self; Self::COUNT] = [
+                $(Self::$variant),+
+            ];
+
+            $visibility const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+    };
+}
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -207,7 +249,9 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
             "/v1/sections/batch/diff",
             get(handlers::v1::sections_batch_diff),
         )
-        .method_not_allowed_fallback(|| async { problem::ApiProblem::method_not_allowed() })
+        .method_not_allowed_fallback(|| async {
+            problem::ApiProblem::method_not_allowed("GET, HEAD")
+        })
         .fallback(handlers::static_::static_handler);
     if let Some(cfg) = auth {
         // `layer`, not `route_layer`: auth must also cover the static fallback,

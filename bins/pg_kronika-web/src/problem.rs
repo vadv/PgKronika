@@ -17,72 +17,28 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 const RETRY_AFTER_SECONDS: u64 = 1;
 const MAX_PUBLIC_TOKEN_BYTES: usize = 64;
 
-/// Stable application-error codes exposed to API clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProblemCode {
-    Unauthorized,
-    RouteNotFound,
-    MethodNotAllowed,
-    MissingQueryParameter,
-    InvalidQueryParameter,
-    UnknownQueryParameter,
-    DuplicateQueryParameter,
-    InvalidQueryConstraint,
-    UnknownSection,
-    InvalidCursor,
-    QueryLimitExceeded,
-    AnalyticCapacityUnavailable,
-    StoreReadFailed,
-    InternalError,
-}
-
-impl Serialize for ProblemCode {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
+closed_string_enum! {
+    /// Stable application-error codes exposed to API clients.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ProblemCode {
+        Unauthorized => "unauthorized",
+        RouteNotFound => "route_not_found",
+        MethodNotAllowed => "method_not_allowed",
+        MissingQueryParameter => "missing_query_parameter",
+        InvalidQueryParameter => "invalid_query_parameter",
+        UnknownQueryParameter => "unknown_query_parameter",
+        DuplicateQueryParameter => "duplicate_query_parameter",
+        InvalidQueryConstraint => "invalid_query_constraint",
+        UnknownSection => "unknown_section",
+        InvalidCursor => "invalid_cursor",
+        QueryLimitExceeded => "query_limit_exceeded",
+        AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
+        StoreReadFailed => "store_read_failed",
+        InternalError => "internal_error",
     }
 }
 
 impl ProblemCode {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 14] = [
-        Self::Unauthorized,
-        Self::RouteNotFound,
-        Self::MethodNotAllowed,
-        Self::MissingQueryParameter,
-        Self::InvalidQueryParameter,
-        Self::UnknownQueryParameter,
-        Self::DuplicateQueryParameter,
-        Self::InvalidQueryConstraint,
-        Self::UnknownSection,
-        Self::InvalidCursor,
-        Self::QueryLimitExceeded,
-        Self::AnalyticCapacityUnavailable,
-        Self::StoreReadFailed,
-        Self::InternalError,
-    ];
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unauthorized => "unauthorized",
-            Self::RouteNotFound => "route_not_found",
-            Self::MethodNotAllowed => "method_not_allowed",
-            Self::MissingQueryParameter => "missing_query_parameter",
-            Self::InvalidQueryParameter => "invalid_query_parameter",
-            Self::UnknownQueryParameter => "unknown_query_parameter",
-            Self::DuplicateQueryParameter => "duplicate_query_parameter",
-            Self::InvalidQueryConstraint => "invalid_query_constraint",
-            Self::UnknownSection => "unknown_section",
-            Self::InvalidCursor => "invalid_cursor",
-            Self::QueryLimitExceeded => "query_limit_exceeded",
-            Self::AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
-            Self::StoreReadFailed => "store_read_failed",
-            Self::InternalError => "internal_error",
-        }
-    }
-
     pub(crate) const fn status(self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -126,53 +82,28 @@ impl ProblemCode {
     }
 }
 
-/// Bounded query-parameter identifiers allowed in Problem params.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum QueryParameter {
-    Query,
-    Source,
-    From,
-    To,
-    Window,
-    Step,
-    Threshold,
-    EpsRel,
-    Epsilon,
-    MaxClusterSpan,
-    Section,
-    Names,
-    Limit,
-    Cursor,
-}
-
-impl Serialize for QueryParameter {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
+closed_string_enum! {
+    /// Bounded query-parameter identifiers allowed in Problem params.
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum QueryParameter {
+        Source => "source",
+        From => "from",
+        To => "to",
+        Window => "window",
+        Step => "step",
+        Threshold => "threshold",
+        EpsRel => "eps_rel",
+        Epsilon => "epsilon",
+        MaxClusterSpan => "max_cluster_span",
+        Section => "section",
+        Names => "names",
+        Limit => "limit",
+        Cursor => "cursor",
     }
 }
 
 impl QueryParameter {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 14] = [
-        Self::Query,
-        Self::Source,
-        Self::From,
-        Self::To,
-        Self::Window,
-        Self::Step,
-        Self::Threshold,
-        Self::EpsRel,
-        Self::Epsilon,
-        Self::MaxClusterSpan,
-        Self::Section,
-        Self::Names,
-        Self::Limit,
-        Self::Cursor,
-    ];
-
     pub(crate) const fn from_query_name(name: &str) -> Option<Self> {
         match name.as_bytes() {
             b"source" => Some(Self::Source),
@@ -192,114 +123,83 @@ impl QueryParameter {
         }
     }
 
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Location accepted by `invalid_query_parameter`; raw query syntax is not a
+/// parameter and cannot be used by missing/duplicate constructors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvalidParameterLocation {
+    Query,
+    Parameter(QueryParameter),
+}
+
+impl From<QueryParameter> for InvalidParameterLocation {
+    fn from(parameter: QueryParameter) -> Self {
+        Self::Parameter(parameter)
+    }
+}
+
+impl Serialize for InvalidParameterLocation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
         match self {
-            Self::Query => "query",
-            Self::Source => "source",
-            Self::From => "from",
-            Self::To => "to",
-            Self::Window => "window",
-            Self::Step => "step",
-            Self::Threshold => "threshold",
-            Self::EpsRel => "eps_rel",
-            Self::Epsilon => "epsilon",
-            Self::MaxClusterSpan => "max_cluster_span",
-            Self::Section => "section",
-            Self::Names => "names",
-            Self::Limit => "limit",
-            Self::Cursor => "cursor",
+            Self::Query => serializer.serialize_str("query"),
+            Self::Parameter(parameter) => parameter.serialize(serializer),
         }
     }
 }
 
-/// Expected machine types for invalid query parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExpectedValue {
-    UrlEncodedQuery,
-    Uint64,
-    Int64,
-    PositiveDuration,
-    NonNegativeFiniteNumber,
-    NonNegativeInteger,
-    SectionList,
+closed_string_enum! {
+    /// Expected machine types for invalid query parameters.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ExpectedValue {
+        UrlEncodedQuery => "url_encoded_query",
+        Uint64 => "uint64",
+        Int64 => "int64",
+        PositiveDuration => "positive_duration",
+        NonNegativeFiniteNumber => "non_negative_finite_number",
+        NonNegativeInteger => "non_negative_integer",
+        SectionList => "section_list",
+    }
 }
 
-impl ExpectedValue {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 7] = [
-        Self::UrlEncodedQuery,
-        Self::Uint64,
-        Self::Int64,
-        Self::PositiveDuration,
-        Self::NonNegativeFiniteNumber,
-        Self::NonNegativeInteger,
-        Self::SectionList,
-    ];
+closed_string_enum! {
+    /// Cross-parameter constraints enforced before a query runs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum QueryConstraint {
+        FromBeforeTo => "from_before_to",
+        WindowWithinInterval => "window_within_interval",
+        EpsilonNotGreaterThanMaxClusterSpan => "epsilon_not_greater_than_max_cluster_span",
+        MaxClusterSpanWithinInterval => "max_cluster_span_within_interval",
+        FiniteScan => "finite_scan",
+    }
 }
 
-/// Cross-parameter constraints enforced before a query runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum QueryConstraint {
-    FromBeforeTo,
-    WindowWithinInterval,
-    EpsilonNotGreaterThanMaxClusterSpan,
-    MaxClusterSpanWithinInterval,
-    FiniteScan,
-}
-
-impl QueryConstraint {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 5] = [
-        Self::FromBeforeTo,
-        Self::WindowWithinInterval,
-        Self::EpsilonNotGreaterThanMaxClusterSpan,
-        Self::MaxClusterSpanWithinInterval,
-        Self::FiniteScan,
-    ];
-}
-
-/// Resource dimensions used by `query_limit_exceeded`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LimitResource {
-    QueryBytes,
-    QueryParameters,
-    QuerySpanUs,
-    WindowPositions,
-    Rows,
-    Cells,
-    Bytes,
-    Units,
-    Sections,
-    IdentityBytes,
-    SeriesPoints,
-    Episodes,
-    Clusters,
-    IncidentKeyBytes,
-    TotalIncidentKeyBytes,
-}
-
-impl LimitResource {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 15] = [
-        Self::QueryBytes,
-        Self::QueryParameters,
-        Self::QuerySpanUs,
-        Self::WindowPositions,
-        Self::Rows,
-        Self::Cells,
-        Self::Bytes,
-        Self::Units,
-        Self::Sections,
-        Self::IdentityBytes,
-        Self::SeriesPoints,
-        Self::Episodes,
-        Self::Clusters,
-        Self::IncidentKeyBytes,
-        Self::TotalIncidentKeyBytes,
-    ];
+closed_string_enum! {
+    /// Resource dimensions used by `query_limit_exceeded`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LimitResource {
+        QueryBytes => "query_bytes",
+        QueryParameters => "query_parameters",
+        QuerySpanUs => "query_span_us",
+        WindowPositions => "window_positions",
+        Rows => "rows",
+        Cells => "cells",
+        Bytes => "bytes",
+        Units => "units",
+        Sections => "sections",
+        IdentityBytes => "identity_bytes",
+        SeriesPoints => "series_points",
+        Episodes => "episodes",
+        Clusters => "clusters",
+        IncidentKeyBytes => "incident_key_bytes",
+        TotalIncidentKeyBytes => "total_incident_key_bytes",
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -321,7 +221,7 @@ struct ParameterParams {
 
 #[derive(Debug, Serialize)]
 struct InvalidParameterParams {
-    parameter: QueryParameter,
+    parameter: InvalidParameterLocation,
     expected: ExpectedValue,
 }
 
@@ -377,6 +277,8 @@ pub(crate) struct ApiProblem {
     instance: String,
     #[serde(skip)]
     request_id: String,
+    #[serde(skip)]
+    allow: Option<&'static str>,
 }
 
 impl ApiProblem {
@@ -387,8 +289,9 @@ impl ApiProblem {
             status: code.status().as_u16(),
             code,
             params,
-            instance: format!("urn:pgkronika:request:{request_id}"),
+            instance: format!("https://pgkronika.dev/problems/occurrences/{request_id}"),
             request_id,
+            allow: None,
         }
     }
 
@@ -400,8 +303,10 @@ impl ApiProblem {
         Self::empty(ProblemCode::RouteNotFound)
     }
 
-    pub(crate) fn method_not_allowed() -> Self {
-        Self::empty(ProblemCode::MethodNotAllowed)
+    pub(crate) fn method_not_allowed(allow: &'static str) -> Self {
+        let mut problem = Self::empty(ProblemCode::MethodNotAllowed);
+        problem.allow = Some(allow);
+        problem
     }
 
     pub(crate) fn missing_query_parameter(parameter: QueryParameter) -> Self {
@@ -412,13 +317,13 @@ impl ApiProblem {
     }
 
     pub(crate) fn invalid_query_parameter(
-        parameter: QueryParameter,
+        parameter: impl Into<InvalidParameterLocation>,
         expected: ExpectedValue,
     ) -> Self {
         Self::new(
             ProblemCode::InvalidQueryParameter,
             ProblemParams::InvalidParameter(InvalidParameterParams {
-                parameter,
+                parameter: parameter.into(),
                 expected,
             }),
         )
@@ -507,17 +412,40 @@ impl ApiProblem {
 }
 
 impl IntoResponse for ApiProblem {
-    fn into_response(self) -> Response {
+    fn into_response(mut self) -> Response {
         let status = self.code.status();
         let code = self.code;
-        let request_id = self.request_id.clone();
-        tracing::info!(
-            event = "api_problem_response",
-            request_id = request_id.as_str(),
-            code = code.as_str(),
-            status = status.as_u16(),
-            "API problem response"
-        );
+        let request_id = match HeaderValue::from_str(&self.request_id) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(
+                    event = "api_request_id_header_invalid",
+                    error = %error,
+                    "generated request id violated the header contract"
+                );
+                "invalid".clone_into(&mut self.request_id);
+                "https://pgkronika.dev/problems/occurrences/invalid".clone_into(&mut self.instance);
+                HeaderValue::from_static("invalid")
+            }
+        };
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(
+                event = "api_problem_response",
+                request_id = self.request_id.as_str(),
+                code = code.as_str(),
+                status = status.as_u16(),
+                "API problem response"
+            );
+        } else {
+            tracing::debug!(
+                event = "api_problem_response",
+                request_id = self.request_id.as_str(),
+                code = code.as_str(),
+                status = status.as_u16(),
+                "API problem response"
+            );
+        }
+        let allow = self.allow.take();
         let mut response = (status, Json(self)).into_response();
         let headers = response.headers_mut();
         headers.insert(
@@ -525,8 +453,6 @@ impl IntoResponse for ApiProblem {
             HeaderValue::from_static(PROBLEM_MEDIA_TYPE),
         );
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        let request_id = HeaderValue::from_str(&request_id)
-            .unwrap_or_else(|_error| HeaderValue::from_static("invalid"));
         headers.insert(REQUEST_ID_HEADER, request_id);
         match code {
             ProblemCode::Unauthorized => {
@@ -536,10 +462,12 @@ impl IntoResponse for ApiProblem {
                 );
             }
             ProblemCode::MethodNotAllowed => {
-                headers.insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+                if let Some(allow) = allow {
+                    headers.insert(header::ALLOW, HeaderValue::from_static(allow));
+                }
             }
             ProblemCode::AnalyticCapacityUnavailable => {
-                headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                headers.insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS));
             }
             _ => {}
         }
@@ -565,31 +493,54 @@ fn bounded_public_token(value: &str) -> String {
 }
 
 fn next_request_id() -> String {
-    static PROCESS_NONCE: LazyLock<[u8; 32]> = LazyLock::new(process_nonce);
+    static PROCESS_NONCE: LazyLock<u64> = LazyLock::new(process_nonce);
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let mut hasher = Sha256::new();
-    hasher.update(*PROCESS_NONCE);
-    hasher.update(sequence.to_be_bytes());
-    hasher.update(now.to_be_bytes());
-    let digest = hasher.finalize();
     let mut request_id = String::with_capacity(32);
-    for byte in &digest[..16] {
-        let _ = write!(request_id, "{byte:02x}");
-    }
+    let _ = write!(request_id, "{:016x}{sequence:016x}", *PROCESS_NONCE);
     request_id
 }
 
-fn process_nonce() -> [u8; 32] {
+fn process_nonce() -> u64 {
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     let mut hasher = Sha256::new();
     hasher.update(started.to_be_bytes());
     hasher.update(std::process::id().to_be_bytes());
-    hasher.finalize().into()
+    let digest = hasher.finalize();
+    u64::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_PUBLIC_TOKEN_BYTES, bounded_public_token};
+
+    #[test]
+    fn public_tokens_enforce_the_exact_grammar_and_byte_bound() {
+        assert_eq!(bounded_public_token("Az09_.-"), "Az09_.-");
+        assert_eq!(
+            bounded_public_token(&"a".repeat(MAX_PUBLIC_TOKEN_BYTES)),
+            "a".repeat(MAX_PUBLIC_TOKEN_BYTES)
+        );
+        assert_eq!(
+            bounded_public_token(&"a".repeat(MAX_PUBLIC_TOKEN_BYTES + 1)),
+            "invalid"
+        );
+        assert_eq!(bounded_public_token(""), "invalid");
+        assert_eq!(bounded_public_token("секрет"), "invalid");
+
+        for byte in 0_u8..=127 {
+            let token = char::from(byte).to_string();
+            let allowed = byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-');
+            assert_eq!(
+                bounded_public_token(&token),
+                if allowed { token } else { "invalid".to_owned() },
+                "ASCII byte {byte}"
+            );
+        }
+    }
 }

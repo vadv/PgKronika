@@ -201,7 +201,7 @@ fn assert_problem(
     );
     let instance = body["instance"].as_str().expect("problem instance string");
     let request_id = instance
-        .strip_prefix("urn:pgkronika:request:")
+        .strip_prefix("https://pgkronika.dev/problems/occurrences/")
         .expect("problem instance prefix");
     assert_eq!(request_id.len(), 32);
     assert!(

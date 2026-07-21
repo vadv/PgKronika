@@ -10,7 +10,10 @@ fn problem_example(code: ProblemCode) -> (ApiProblem, serde_json::Value) {
     match code {
         ProblemCode::Unauthorized => (ApiProblem::unauthorized(), serde_json::json!({})),
         ProblemCode::RouteNotFound => (ApiProblem::route_not_found(), serde_json::json!({})),
-        ProblemCode::MethodNotAllowed => (ApiProblem::method_not_allowed(), serde_json::json!({})),
+        ProblemCode::MethodNotAllowed => (
+            ApiProblem::method_not_allowed("GET, HEAD"),
+            serde_json::json!({}),
+        ),
         ProblemCode::MissingQueryParameter => (
             ApiProblem::missing_query_parameter(QueryParameter::Source),
             serde_json::json!({ "parameter": "source" }),
@@ -75,7 +78,7 @@ async fn every_problem_code_has_the_exact_body_and_headers() {
             .expect("problem request id");
         assert_eq!(
             response.body["instance"],
-            format!("urn:pgkronika:request:{request_id}")
+            format!("https://pgkronika.dev/problems/occurrences/{request_id}")
         );
         assert_eq!(
             response
@@ -96,7 +99,9 @@ async fn every_problem_code_has_the_exact_body_and_headers() {
                 .headers
                 .get(header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),
-            (code == ProblemCode::AnalyticCapacityUnavailable).then_some("1")
+            (code == ProblemCode::AnalyticCapacityUnavailable)
+                .then(|| response.body["params"]["retry_after_seconds"].to_string())
+                .as_deref()
         );
     }
 }
@@ -189,6 +194,98 @@ async fn routing_method_and_query_shape_use_the_closed_registry() {
         "unknown_section",
         serde_json::json!({ "section": "invalid" }),
     );
+
+    for malformed in ["%", "%0", "%GG", "%FF", "source=%FF"] {
+        let uri = format!("/v1/version?{malformed}");
+        let (_dir, response) = fixture_captured(&uri, &[]).await;
+        assert_problem(
+            &response.body,
+            StatusCode::BAD_REQUEST,
+            "invalid_query_parameter",
+            serde_json::json!({
+                "parameter": "query",
+                "expected": "url_encoded_query",
+            }),
+        );
+    }
+}
+
+#[tokio::test]
+async fn documented_v1_paths_reach_the_actual_router_with_contextual_allow() {
+    let document: serde_json::Value =
+        serde_json::from_str(include_str!("../../openapi.json")).expect("valid OpenAPI JSON");
+    for path in document["paths"]
+        .as_object()
+        .expect("OpenAPI paths")
+        .keys()
+        .filter(|path| path.starts_with("/v1"))
+    {
+        let concrete = path.replace("{name}", "pg_stat_archiver");
+        let (_dir, get_response) = fixture_captured(&concrete, &[]).await;
+        assert_ne!(
+            get_response.body["code"], "route_not_found",
+            "documented GET {path} must reach a registered route"
+        );
+
+        let (_dir, method_response) = fixture_request_captured(Method::POST, &concrete, &[]).await;
+        assert_problem(
+            &method_response.body,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            method_response
+                .headers
+                .get(header::ALLOW)
+                .and_then(|value| value.to_str().ok()),
+            Some("GET, HEAD"),
+            "Allow for {path}"
+        );
+
+        let documented_query: std::collections::BTreeSet<_> =
+            document["paths"][path]["get"]["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|parameter| parameter["$ref"].as_str())
+                .filter_map(|reference| reference.rsplit('/').next())
+                .filter_map(|name| {
+                    let parameter = &document["components"]["parameters"][name];
+                    (parameter["in"] == "query")
+                        .then(|| parameter["name"].as_str().expect("query parameter name"))
+                })
+                .collect();
+        for parameter in QueryParameter::ALL {
+            let uri = format!("{concrete}?{}=1", parameter.as_str());
+            let (_dir, response) = fixture_captured(&uri, &[]).await;
+            let rejected_as_unknown = response.body["code"] == "unknown_query_parameter";
+            assert_eq!(
+                rejected_as_unknown,
+                !documented_query.contains(parameter.as_str()),
+                "router/OpenAPI query allowlist for {path}: {}",
+                parameter.as_str()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn generated_request_ids_are_unique_and_match_the_instance_header_invariant() {
+    let mut ids = std::collections::BTreeSet::new();
+    for _ in 0..100 {
+        let response = capture_json(ApiProblem::internal_error().into_response()).await;
+        let request_id = response
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("server request id");
+        assert!(ids.insert(request_id.to_owned()), "duplicate request id");
+        assert_eq!(
+            response.body["instance"],
+            format!("https://pgkronika.dev/problems/occurrences/{request_id}")
+        );
+    }
 }
 
 #[tokio::test]
@@ -275,11 +372,16 @@ fn openapi_is_a_closed_projection_of_the_machine_registries() {
 
 fn assert_problem_schema(document: &serde_json::Value) {
     let problem = &document["components"]["schemas"]["Problem"];
+    assert!(
+        problem.get("$id").is_none(),
+        "embedded schemas inherit the document base URI"
+    );
     assert_eq!(problem["additionalProperties"], false);
     assert_eq!(
         problem["required"],
         serde_json::json!(["type", "status", "code", "params", "instance"])
     );
+    assert_eq!(problem["properties"]["instance"]["format"], "uri");
     let documented_codes: Vec<_> = problem["properties"]["code"]["enum"]
         .as_array()
         .expect("problem code enum")
@@ -315,10 +417,26 @@ fn assert_problem_schema(document: &serde_json::Value) {
         .expect("application problem content");
     assert_eq!(content.len(), 1);
     assert!(content.contains_key("application/problem+json"));
+    for (response, header_name) in [
+        ("UnauthorizedProblem", "WWW-Authenticate"),
+        ("MethodNotAllowedProblem", "Allow"),
+        ("AnalyticCapacityProblem", "Retry-After"),
+    ] {
+        assert!(
+            document["components"]["responses"][response]["headers"]
+                .as_object()
+                .is_some_and(|headers| headers.contains_key(header_name)),
+            "{response} documents {header_name}"
+        );
+    }
 }
 
 fn assert_reason_schema(document: &serde_json::Value) {
     let reason = &document["components"]["schemas"]["Reason"];
+    assert!(
+        reason.get("$id").is_none(),
+        "embedded schemas inherit the document base URI"
+    );
     assert_eq!(reason["additionalProperties"], false);
     assert_eq!(reason["required"], serde_json::json!(["kind", "params"]));
     let documented_kinds: Vec<_> = reason["properties"]["kind"]["enum"]
@@ -358,9 +476,25 @@ fn assert_reason_schema(document: &serde_json::Value) {
 fn assert_params_schemas(document: &serde_json::Value) {
     assert_schema_enum_matches(
         document,
-        "/components/schemas/AnyParameterLocation/enum",
+        "/components/schemas/KnownParameter/enum",
         &QueryParameter::ALL,
     );
+    let any_locations = document
+        .pointer("/components/schemas/AnyParameterLocation/enum")
+        .and_then(serde_json::Value::as_array)
+        .expect("all invalid-parameter locations");
+    let expected_locations: Vec<_> = std::iter::once("query")
+        .chain(QueryParameter::ALL.into_iter().map(QueryParameter::as_str))
+        .map(serde_json::Value::from)
+        .collect();
+    assert_eq!(any_locations, &expected_locations);
+    for parameter in QueryParameter::ALL {
+        assert_eq!(
+            QueryParameter::from_query_name(parameter.as_str()),
+            Some(parameter),
+            "query registry round-trip"
+        );
+    }
     assert_schema_enum_matches(
         document,
         "/components/schemas/InvalidParameterParams/properties/expected/enum",
@@ -413,6 +547,11 @@ fn assert_changed_success_schemas(document: &serde_json::Value) {
         "Segments",
         "Segment",
         "SegmentSection",
+        "DiffValuePoint",
+        "DiffNoDataPoint",
+        "DiffSeries",
+        "DiffSection",
+        "DiffResponse",
         "AnomalyResponse",
         "SectionReason",
         "IncidentResponse",
@@ -438,6 +577,10 @@ fn assert_changed_success_schemas(document: &serde_json::Value) {
             assert!(!properties.contains_key(forbidden), "{schema}.{forbidden}");
         }
     }
+    assert_eq!(
+        document["components"]["schemas"]["DiffNoDataPoint"]["properties"]["nodata"]["enum"],
+        serde_json::json!(["reset", "gap", "first_point", "anomaly", "not_collected"])
+    );
 }
 
 fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
@@ -470,8 +613,8 @@ fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
         ("/v1/segments", "Segments"),
         ("/v1/section/{name}", "NeutralObject"),
         ("/v1/sections/batch", "NeutralObject"),
-        ("/v1/section/{name}/diff", "NeutralObject"),
-        ("/v1/sections/batch/diff", "NeutralObject"),
+        ("/v1/section/{name}/diff", "DiffResponse"),
+        ("/v1/sections/batch/diff", "BatchDiffResponse"),
         ("/v1/anomalies", "AnomalyResponse"),
         ("/v1/incidents", "IncidentResponse"),
     ];
@@ -515,15 +658,26 @@ fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
             operation["responses"]["413"]["$ref"], "#/components/responses/ApplicationProblem",
             "{path} enforces the raw-query ceiling"
         );
+        assert_eq!(
+            operation["responses"]["401"]["$ref"], "#/components/responses/UnauthorizedProblem",
+            "{path} authentication response"
+        );
+        assert_eq!(
+            operation["responses"]["405"]["$ref"], "#/components/responses/MethodNotAllowedProblem",
+            "{path} method response"
+        );
         for (status, response) in operation["responses"]
             .as_object()
             .expect("operation responses")
         {
             if status != "200" {
-                assert_eq!(
-                    response["$ref"], "#/components/responses/ApplicationProblem",
-                    "{path} status {status}"
-                );
+                let expected = match status.as_str() {
+                    "401" => "#/components/responses/UnauthorizedProblem",
+                    "405" => "#/components/responses/MethodNotAllowedProblem",
+                    "503" => "#/components/responses/AnalyticCapacityProblem",
+                    _ => "#/components/responses/ApplicationProblem",
+                };
+                assert_eq!(response["$ref"], expected, "{path} status {status}");
             }
         }
         for parameter in operation["parameters"].as_array().into_iter().flatten() {

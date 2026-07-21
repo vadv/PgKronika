@@ -221,7 +221,9 @@ pub(crate) async fn assert_locale_neutral_problem(dir: &Path) -> Result<()> {
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())
             .context("problem response has no request id")?;
-        anyhow::ensure!(instance == format!("urn:pgkronika:request:{request_id}"));
+        anyhow::ensure!(
+            instance == format!("https://pgkronika.dev/problems/occurrences/{request_id}")
+        );
         anyhow::ensure!(
             request_id.len() == 32
                 && request_id
@@ -244,6 +246,19 @@ pub(crate) async fn assert_locale_neutral_problem(dir: &Path) -> Result<()> {
     anyhow::ensure!(
         english_body == russian_body,
         "Accept-Language changed the problem"
+    );
+
+    let oversized_uri = format!("/v1/version?{}", "x".repeat(8_193));
+    let oversized = request(dir, &oversized_uri, &[]).await?;
+    anyhow::ensure!(oversized.status == 413);
+    anyhow::ensure!(oversized.body["code"] == "query_limit_exceeded");
+    anyhow::ensure!(
+        oversized.body["params"]
+            == serde_json::json!({
+                "resource": "query_bytes",
+                "limit": 8_192,
+                "observed": 8_193,
+            })
     );
     Ok(())
 }

@@ -1,10 +1,10 @@
 //! Bounded query decoding and mapping of reader failures to API problems.
 
-use std::collections::HashMap;
-
 use kronika_reader::{Cursor, QueryError};
 
-use crate::problem::{ApiProblem, ExpectedValue, LimitResource, QueryParameter, count_u64};
+use crate::problem::{
+    ApiProblem, ExpectedValue, InvalidParameterLocation, LimitResource, QueryParameter, count_u64,
+};
 
 /// Rows returned when a request omits `limit`.
 pub(crate) const DEFAULT_LIMIT: usize = 1_000;
@@ -12,16 +12,16 @@ pub(crate) const DEFAULT_LIMIT: usize = 1_000;
 /// Hard ceiling on `limit`, applied even when a request asks for more.
 pub(crate) const MAX_LIMIT: usize = 10_000;
 
-/// Maximum raw query length decoded into owned parameter pairs.
+/// Maximum raw query length admitted for decoding.
 pub(crate) const MAX_QUERY_BYTES: usize = 8_192;
 
-/// Maximum query pairs decoded before uniqueness and route checks.
+/// Maximum query pairs admitted before decoding.
 pub(crate) const MAX_QUERY_PARAMETERS: usize = 32;
 
 /// A validated query whose keys are known, allowed for the route, and unique.
 #[derive(Debug)]
 pub(crate) struct QueryParams {
-    values: HashMap<QueryParameter, String>,
+    values: [Option<String>; QueryParameter::COUNT],
 }
 
 impl QueryParams {
@@ -35,37 +35,84 @@ impl QueryParams {
                 Some(count_u64(raw.len())),
             ));
         }
-        let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw).map_err(|_error| {
-            ApiProblem::invalid_query_parameter(
-                QueryParameter::Query,
-                ExpectedValue::UrlEncodedQuery,
-            )
-        })?;
-        if pairs.len() > MAX_QUERY_PARAMETERS {
+        let pair_count = raw
+            .split('&')
+            .filter(|component| !component.is_empty())
+            .count();
+        if pair_count > MAX_QUERY_PARAMETERS {
             return Err(ApiProblem::query_limit_exceeded(
                 LimitResource::QueryParameters,
                 count_u64(MAX_QUERY_PARAMETERS),
-                Some(count_u64(pairs.len())),
+                Some(count_u64(pair_count)),
             ));
         }
+        validate_query_encoding(raw)?;
 
-        let mut values = HashMap::with_capacity(pairs.len());
-        for (name, value) in pairs {
+        let mut values: [Option<String>; QueryParameter::COUNT] = std::array::from_fn(|_| None);
+        for (name, value) in form_urlencoded::parse(raw.as_bytes()) {
             let Some(parameter) = QueryParameter::from_query_name(&name) else {
                 return Err(ApiProblem::unknown_query_parameter(&name));
             };
             if !allowed.contains(&parameter) {
                 return Err(ApiProblem::unknown_query_parameter(&name));
             }
-            if values.insert(parameter, value).is_some() {
+            let slot = &mut values[parameter.index()];
+            if slot.is_some() {
                 return Err(ApiProblem::duplicate_query_parameter(parameter));
             }
+            *slot = Some(value.into_owned());
         }
         Ok(Self { values })
     }
 
     pub(crate) fn get(&self, parameter: QueryParameter) -> Option<&str> {
-        self.values.get(&parameter).map(String::as_str)
+        self.values[parameter.index()].as_deref()
+    }
+}
+
+fn validate_query_encoding(raw: &str) -> Result<(), ApiProblem> {
+    let invalid = || {
+        ApiProblem::invalid_query_parameter(
+            InvalidParameterLocation::Query,
+            ExpectedValue::UrlEncodedQuery,
+        )
+    };
+    let mut decoded = Vec::new();
+    for component in raw.split(['&', '=']) {
+        if !component.as_bytes().contains(&b'%') {
+            continue;
+        }
+        decoded.clear();
+        decoded.reserve(component.len().saturating_sub(decoded.capacity()));
+        let bytes = component.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at] != b'%' {
+                decoded.push(bytes[at]);
+                at += 1;
+                continue;
+            }
+            let high = bytes.get(at + 1).and_then(|byte| hex_value(*byte));
+            let low = bytes.get(at + 2).and_then(|byte| hex_value(*byte));
+            let (Some(high), Some(low)) = (high, low) else {
+                return Err(invalid());
+            };
+            decoded.push(high << 4 | low);
+            at += 3;
+        }
+        if std::str::from_utf8(&decoded).is_err() {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -197,13 +244,29 @@ pub(crate) fn query_error_response(error: &QueryError) -> ApiProblem {
     }
 }
 
+/// Map a reader failure for a request that has no cursor parameter.
+pub(crate) fn query_error_response_without_cursor(error: &QueryError) -> ApiProblem {
+    if matches!(error, QueryError::BadCursor(_)) {
+        let problem = ApiProblem::internal_error();
+        tracing::error!(
+            event = "api_reader_cursor_invariant",
+            request_id = problem.request_id(),
+            "reader returned a cursor error for a cursor-free request"
+        );
+        return problem;
+    }
+    query_error_response(error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_BYTES, MAX_QUERY_PARAMETERS, QueryParams, duration_us,
-        parse_f64_non_negative, parse_limit,
+        parse_f64_non_negative, parse_limit, query_error_response,
+        query_error_response_without_cursor,
     };
     use crate::problem::{ProblemCode, QueryParameter};
+    use kronika_reader::QueryError;
 
     fn params(raw: &str, allowed: &[QueryParameter]) -> QueryParams {
         QueryParams::parse(Some(raw), allowed).expect("valid query")
@@ -297,5 +360,39 @@ mod tests {
         let pair_error = QueryParams::parse(Some(&too_many), &[QueryParameter::Source])
             .expect_err("pair ceiling");
         assert_eq!(pair_error.code(), ProblemCode::QueryLimitExceeded);
+
+        let malformed_over_limit = std::iter::repeat_n("%FF", MAX_QUERY_PARAMETERS + 1)
+            .collect::<Vec<_>>()
+            .join("&");
+        let priority = QueryParams::parse(Some(&malformed_over_limit), &[])
+            .expect_err("pair admission precedes decoding");
+        assert_eq!(priority.code(), ProblemCode::QueryLimitExceeded);
+    }
+
+    #[test]
+    fn percent_triplets_and_decoded_utf8_are_strict() {
+        for malformed in ["%", "%0", "%GG", "%FF", "source=%C3", "source=%C3%28"] {
+            let error = QueryParams::parse(Some(malformed), &[QueryParameter::Source])
+                .expect_err("malformed encoding");
+            assert_eq!(error.code(), ProblemCode::InvalidQueryParameter);
+        }
+
+        let decoded = params("section=%D1%82", &[QueryParameter::Section]);
+        assert_eq!(decoded.get(QueryParameter::Section), Some("т"));
+        let ascii = params("source=%37", &[QueryParameter::Source]);
+        assert_eq!(ascii.get(QueryParameter::Source), Some("7"));
+    }
+
+    #[test]
+    fn cursor_errors_are_client_visible_only_on_cursor_routes() {
+        let error = QueryError::BadCursor("synthetic invariant probe".to_owned());
+        assert_eq!(
+            query_error_response(&error).code(),
+            ProblemCode::InvalidCursor
+        );
+        assert_eq!(
+            query_error_response_without_cursor(&error).code(),
+            ProblemCode::InternalError
+        );
     }
 }

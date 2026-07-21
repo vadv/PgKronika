@@ -81,7 +81,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" }
         }
@@ -101,7 +102,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" }
         }
@@ -121,7 +123,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" }
         }
@@ -146,7 +149,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" }
         }
@@ -174,7 +178,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "404": { "$ref": "#/components/responses/ApplicationProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" }
@@ -202,7 +207,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "404": { "$ref": "#/components/responses/ApplicationProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" }
@@ -224,12 +230,13 @@
             "description": "Machine counter deltas and no-data enums",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/NeutralObject" }
+                "schema": { "$ref": "#/components/schemas/DiffResponse" }
               }
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "404": { "$ref": "#/components/responses/ApplicationProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" }
@@ -251,12 +258,13 @@
             "description": "Diffs keyed by stable section name",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/NeutralObject" }
+                "schema": { "$ref": "#/components/schemas/BatchDiffResponse" }
               }
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "404": { "$ref": "#/components/responses/ApplicationProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" }
@@ -288,11 +296,12 @@
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "404": { "$ref": "#/components/responses/ApplicationProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" },
-          "503": { "$ref": "#/components/responses/ApplicationProblem" }
+          "503": { "$ref": "#/components/responses/AnalyticCapacityProblem" }
         }
       }
     },
@@ -322,11 +331,12 @@
             }
           },
           "400": { "$ref": "#/components/responses/ApplicationProblem" },
-          "401": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "404": { "$ref": "#/components/responses/ApplicationProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" },
-          "503": { "$ref": "#/components/responses/ApplicationProblem" }
+          "503": { "$ref": "#/components/responses/AnalyticCapacityProblem" }
         }
       }
     }
@@ -362,6 +372,18 @@
       "ProblemRequestId": {
         "description": "Opaque server-generated correlation id used by instance",
         "schema": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+      },
+      "ProblemWwwAuthenticate": {
+        "description": "Basic authentication challenge",
+        "schema": { "type": "string", "const": "Basic realm=\"pg_kronika-web\"" }
+      },
+      "ProblemAllow": {
+        "description": "Methods supported by the addressed API resource",
+        "schema": { "type": "string", "const": "GET, HEAD" }
+      },
+      "ProblemRetryAfter": {
+        "description": "Seconds before retrying an analytic capacity request",
+        "schema": { "type": "integer", "const": 1 }
       }
     },
     "responses": {
@@ -370,6 +392,45 @@
         "headers": {
           "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
           "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "#/components/schemas/Problem" }
+          }
+        }
+      },
+      "UnauthorizedProblem": {
+        "description": "Locale-neutral RFC 9457 authentication error",
+        "headers": {
+          "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
+          "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
+          "WWW-Authenticate": { "$ref": "#/components/headers/ProblemWwwAuthenticate" }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "#/components/schemas/Problem" }
+          }
+        }
+      },
+      "MethodNotAllowedProblem": {
+        "description": "Locale-neutral RFC 9457 method error",
+        "headers": {
+          "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
+          "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
+          "Allow": { "$ref": "#/components/headers/ProblemAllow" }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "#/components/schemas/Problem" }
+          }
+        }
+      },
+      "AnalyticCapacityProblem": {
+        "description": "Locale-neutral RFC 9457 analytic capacity error",
+        "headers": {
+          "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
+          "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
+          "Retry-After": { "$ref": "#/components/headers/ProblemRetryAfter" }
         },
         "content": {
           "application/problem+json": {
@@ -503,6 +564,91 @@
       "NeutralObject": {
         "type": "object",
         "description": "Machine data only; raw source and user strings remain literal"
+      },
+      "MachineValue": {
+        "oneOf": [
+          { "type": "null" },
+          { "type": "number" },
+          { "type": "boolean" },
+          { "type": "string" },
+          { "type": "array", "items": { "type": "integer", "format": "int32" } },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text", "full_len", "truncated"],
+            "properties": {
+              "text": { "type": "string" },
+              "full_len": { "type": "integer", "minimum": 0 },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        ]
+      },
+      "DiffValuePoint": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ts", "delta", "rate", "dt_micros"],
+        "properties": {
+          "ts": { "type": "integer", "format": "int64" },
+          "delta": { "type": ["number", "null"] },
+          "rate": { "type": ["number", "null"] },
+          "dt_micros": { "type": "integer", "format": "int64", "minimum": 1 }
+        }
+      },
+      "DiffNoDataPoint": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ts", "nodata"],
+        "properties": {
+          "ts": { "type": "integer", "format": "int64" },
+          "nodata": { "type": "string", "enum": ["reset", "gap", "first_point", "anomaly", "not_collected"] }
+        }
+      },
+      "DiffPoint": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/DiffValuePoint" },
+          { "$ref": "#/components/schemas/DiffNoDataPoint" }
+        ]
+      },
+      "DiffSeries": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "columns"],
+        "properties": {
+          "key": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/MachineValue" } },
+          "columns": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": { "$ref": "#/components/schemas/DiffPoint" }
+            }
+          }
+        }
+      },
+      "DiffSection": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section", "identity", "series"],
+        "properties": {
+          "section": { "type": "string" },
+          "identity": { "type": "array", "items": { "type": "string" } },
+          "series": { "type": "array", "items": { "$ref": "#/components/schemas/DiffSeries" } }
+        }
+      },
+      "DiffResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_id", "section", "identity", "series"],
+        "properties": {
+          "source_id": { "type": "integer", "minimum": 0 },
+          "section": { "type": "string" },
+          "identity": { "type": "array", "items": { "type": "string" } },
+          "series": { "type": "array", "items": { "$ref": "#/components/schemas/DiffSeries" } }
+        }
+      },
+      "BatchDiffResponse": {
+        "type": "object",
+        "additionalProperties": { "$ref": "#/components/schemas/DiffSection" }
       },
       "AnomalyResponse": {
         "type": "object",
@@ -726,7 +872,6 @@
         "properties": { "retry_after_seconds": { "type": "integer", "const": 1 } }
       },
       "Problem": {
-        "$id": "https://pgkronika.dev/schemas/problem.json",
         "type": "object",
         "additionalProperties": false,
         "required": ["type", "status", "code", "params", "instance"],
@@ -756,7 +901,7 @@
             "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "query_limit_exceeded", "analytic_capacity_unavailable", "store_read_failed", "internal_error"]
           },
           "params": { "type": "object" },
-          "instance": { "type": "string", "pattern": "^urn:pgkronika:request:[0-9a-f]{32}$" }
+          "instance": { "type": "string", "format": "uri", "pattern": "^https://pgkronika\\.dev/problems/occurrences/[0-9a-f]{32}$" }
         },
         "allOf": [
           { "if": { "properties": { "code": { "const": "unauthorized" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unauthorized" }, "status": { "const": 401 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
@@ -776,7 +921,6 @@
         ]
       },
       "Reason": {
-        "$id": "https://pgkronika.dev/schemas/reason.json",
         "type": "object",
         "additionalProperties": false,
         "required": ["kind", "params"],

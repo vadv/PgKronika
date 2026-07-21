@@ -313,6 +313,12 @@ mod tests {
                             dt_micros: 2_000,
                         },
                     },
+                    DiffAt {
+                        ts: 5_000,
+                        point: DiffPoint::NoData {
+                            reason: Reason::Reset,
+                        },
+                    },
                 ],
             }],
         }];
@@ -325,6 +331,7 @@ mod tests {
                     "calls": [
                         { "ts": 1_000, "nodata": "first_point" },
                         { "ts": 3_000, "delta": 10, "rate": 5.0, "dt_micros": 2_000 },
+                        { "ts": 5_000, "nodata": "reset" },
                     ]
                 }
             }])

@@ -5,69 +5,40 @@ use serde::ser::SerializeMap as _;
 
 use crate::problem::count_u64;
 
-/// Stable reason kinds owned by the product rather than a source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ReasonKind {
-    MaterializationLimit,
-    IncompletePage,
-    ScoringWorkBudget,
-    ScanBudget,
-    ConflictingTimestamp,
-    IdentityByteLimit,
-    SeriesPointLimit,
-    TypedGaugePointLimit,
-    SnapshotRowLimit,
-    IncompleteSnapshot,
-    RetentionLimit,
-    NoData,
-    MissingNodeIdentity,
-    ConflictingNodeIdentity,
-    ProducerUnavailable,
-    ProvenanceOrInputMissing,
-    CompleteProvenance,
-    SectionAbsent,
-    CompleteCoverage,
-    CoverageGap,
+closed_string_enum! {
+    /// Stable reason kinds owned by the product rather than a source.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ReasonKind {
+        MaterializationLimit => "materialization_limit",
+        IncompletePage => "incomplete_page",
+        ScoringWorkBudget => "scoring_work_budget",
+        ScanBudget => "scan_budget",
+        ConflictingTimestamp => "conflicting_timestamp",
+        IdentityByteLimit => "identity_byte_limit",
+        SeriesPointLimit => "series_point_limit",
+        TypedGaugePointLimit => "typed_gauge_point_limit",
+        SnapshotRowLimit => "snapshot_row_limit",
+        IncompleteSnapshot => "incomplete_snapshot",
+        RetentionLimit => "retention_limit",
+        NoData => "no_data",
+        MissingNodeIdentity => "missing_node_identity",
+        ConflictingNodeIdentity => "conflicting_node_identity",
+        ProducerUnavailable => "producer_unavailable",
+        ProvenanceOrInputMissing => "provenance_or_input_missing",
+        CompleteProvenance => "complete_provenance",
+        SectionAbsent => "section_absent",
+        CompleteCoverage => "complete_coverage",
+        CoverageGap => "coverage_gap",
+    }
 }
 
-impl ReasonKind {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 20] = [
-        Self::MaterializationLimit,
-        Self::IncompletePage,
-        Self::ScoringWorkBudget,
-        Self::ScanBudget,
-        Self::ConflictingTimestamp,
-        Self::IdentityByteLimit,
-        Self::SeriesPointLimit,
-        Self::TypedGaugePointLimit,
-        Self::SnapshotRowLimit,
-        Self::IncompleteSnapshot,
-        Self::RetentionLimit,
-        Self::NoData,
-        Self::MissingNodeIdentity,
-        Self::ConflictingNodeIdentity,
-        Self::ProducerUnavailable,
-        Self::ProvenanceOrInputMissing,
-        Self::CompleteProvenance,
-        Self::SectionAbsent,
-        Self::CompleteCoverage,
-        Self::CoverageGap,
-    ];
-}
-
-/// Materialized resource named by a success reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum MaterializationResource {
-    Cells,
-    Bytes,
-}
-
-impl MaterializationResource {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 2] = [Self::Cells, Self::Bytes];
+closed_string_enum! {
+    /// Materialized resource named by a success reason.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum MaterializationResource {
+        Cells => "cells",
+        Bytes => "bytes",
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

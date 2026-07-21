@@ -29,13 +29,13 @@ use tower::ServiceExt;
 // them keeps `unused_crate_dependencies` quiet without editing the library.
 use arc_swap as _;
 use base64 as _;
+use form_urlencoded as _;
 use kronika_analytics as _;
 use kronika_reader as _;
 use metrics as _;
 use rust_embed as _;
 use serde as _;
 use serde_json as _;
-use serde_urlencoded as _;
 use sha2 as _;
 use subtle as _;
 use tower_http as _;
