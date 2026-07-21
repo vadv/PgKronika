@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::params::{
     QueryParams, parse_cursor, parse_i64, parse_limit, parse_u64, query_error_response,
+    query_error_response_without_cursor,
 };
 use crate::problem::{ApiProblem, ExpectedValue, LimitResource, QueryParameter, count_u64};
 use crate::serialize::{
@@ -235,7 +236,7 @@ pub(crate) async fn sections_batch(
                 .collect();
             Ok(Json(Value::Object(object)))
         }
-        Err(err) => Err(query_error_response(&err)),
+        Err(err) => Err(query_error_response_without_cursor(&err)),
     }
 }
 
@@ -366,11 +367,12 @@ pub(crate) async fn section_diff(
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
 
-    let logical = logical_section(&name)
-        .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.clone())))?;
+    let logical = logical_section(&name).ok_or_else(|| {
+        query_error_response_without_cursor(&QueryError::UnknownSection(name.clone()))
+    })?;
     let mut snap = state.snapshot.load().as_ref().clone();
     let page = section(&mut snap, &name, source, from, to, DIFF_MAX_ROWS, None)
-        .map_err(|err| query_error_response(&err))?;
+        .map_err(|err| query_error_response_without_cursor(&err))?;
     let mut gate_pages = BTreeMap::new();
     for gate_section in Gates::sections(std::slice::from_ref(&logical)) {
         let gate_page = section(
@@ -382,7 +384,7 @@ pub(crate) async fn section_diff(
             DIFF_MAX_ROWS,
             None,
         )
-        .map_err(|err| query_error_response(&err))?;
+        .map_err(|err| query_error_response_without_cursor(&err))?;
         gate_pages.insert(gate_section.to_owned(), gate_page);
     }
     let gates = Gates::from_pages(std::slice::from_ref(&logical), &gate_pages);
@@ -419,8 +421,9 @@ pub(crate) async fn sections_batch_diff(
     let logicals: Vec<LogicalSection> = names
         .iter()
         .map(|&name| {
-            logical_section(name)
-                .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.to_owned())))
+            logical_section(name).ok_or_else(|| {
+                query_error_response_without_cursor(&QueryError::UnknownSection(name.to_owned()))
+            })
         })
         .collect::<Result<_, _>>()?;
 
@@ -443,14 +446,14 @@ pub(crate) async fn sections_batch_diff(
         DIFF_MAX_ROWS,
         &cursors,
     )
-    .map_err(|err| query_error_response(&err))?;
+    .map_err(|err| query_error_response_without_cursor(&err))?;
     let gates = Gates::from_pages(&logicals, &pages);
 
     let mut out = serde_json::Map::new();
     for (logical, &name) in logicals.iter().zip(&names) {
-        let page = pages
-            .get(name)
-            .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.to_owned())))?;
+        let page = pages.get(name).ok_or_else(|| {
+            query_error_response_without_cursor(&QueryError::UnknownSection(name.to_owned()))
+        })?;
         out.insert(
             name.to_owned(),
             Value::Object(section_diff_object(logical, page, &gates)?),

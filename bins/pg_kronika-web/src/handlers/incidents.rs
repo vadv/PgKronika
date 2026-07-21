@@ -17,13 +17,14 @@ use crate::incident::{
     AnalyzeError, ClockRelation, EventConfig, EventError, EventLens, IncidentConfig, Lens,
     active_catalog, analyze, evaluate_events, event_catalog,
 };
-use crate::incident_input::{InputError, InputLimits, prepare_input, scan_position_count};
+use crate::incident_input::{
+    InputError, InputLimits, MaterializationKind, prepare_input, scan_position_count,
+};
 use crate::incident_response::{
-    ResponseInput, build_response, identity_response, no_data_response,
+    IdentityIssue, ResponseInput, build_response, identity_response, no_data_response,
 };
 use crate::params::{QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64, parse_u64};
 use crate::problem::{ApiProblem, LimitResource, QueryConstraint, QueryParameter, count_u64};
-use crate::reason::ApiReason;
 
 const WINDOW_DEFAULT_US: i64 = 300 * 1_000_000;
 const STEP_DEFAULT_US: i64 = 60 * 1_000_000;
@@ -123,8 +124,7 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiPr
                 source,
                 &request.scan,
                 data_age,
-                "missing_node_identity",
-                ApiReason::missing_node_identity(),
+                IdentityIssue::Missing,
             )));
         }
         Err(InputError::ConflictingNodeIdentity) => {
@@ -132,8 +132,7 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiPr
                 source,
                 &request.scan,
                 data_age,
-                "conflicting_node_identity",
-                ApiReason::conflicting_node_identity(),
+                IdentityIssue::Conflicting,
             )));
         }
         Err(error) => return Err(input_error_response(error)),
@@ -307,9 +306,14 @@ fn input_error_response(error: InputError) -> ApiProblem {
             count_u64(limit),
             Some(count_u64(observed)),
         ),
-        InputError::MaterializationLimit { limit } => {
-            ApiProblem::query_limit_exceeded(LimitResource::Cells, count_u64(limit), None)
-        }
+        InputError::MaterializationLimit { resource, limit } => ApiProblem::query_limit_exceeded(
+            match resource {
+                MaterializationKind::Cells => LimitResource::Cells,
+                MaterializationKind::Bytes => LimitResource::Bytes,
+            },
+            count_u64(limit),
+            None,
+        ),
         InputError::IdentityByteLimit { observed, limit } => ApiProblem::query_limit_exceeded(
             LimitResource::IdentityBytes,
             count_u64(limit),
@@ -320,9 +324,13 @@ fn input_error_response(error: InputError) -> ApiProblem {
             count_u64(limit),
             Some(count_u64(observed)),
         ),
-        InputError::MissingNodeIdentity | InputError::ConflictingNodeIdentity => {
-            logged_internal_problem("api_identity_mapping_invariant", &"identity")
+        InputError::MissingNodeIdentity => {
+            logged_internal_problem("api_identity_mapping_invariant", &IdentityIssue::Missing)
         }
+        InputError::ConflictingNodeIdentity => logged_internal_problem(
+            "api_identity_mapping_invariant",
+            &IdentityIssue::Conflicting,
+        ),
         InputError::Read(error) => read_error_response(error),
         InputError::UnknownColumn { section, column } => {
             logged_internal_problem("api_registry_column_missing", &(section, column))
@@ -418,4 +426,32 @@ fn logged_store_read_problem(error: &impl std::fmt::Debug) -> ApiProblem {
         "incident store read failed"
     );
     problem
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::*;
+    use crate::problem::ProblemCode;
+
+    #[test]
+    fn materialization_failures_keep_their_resource_in_the_413_problem() {
+        for (resource, expected) in [
+            (MaterializationKind::Cells, "cells"),
+            (MaterializationKind::Bytes, "bytes"),
+        ] {
+            let problem = input_error_response(InputError::MaterializationLimit {
+                resource,
+                limit: 17,
+            });
+            assert_eq!(problem.code(), ProblemCode::QueryLimitExceeded);
+            assert_eq!(problem.code().status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body = serde_json::to_value(problem).expect("problem JSON");
+            assert_eq!(
+                body["params"],
+                serde_json::json!({ "resource": expected, "limit": 17 })
+            );
+        }
+    }
 }

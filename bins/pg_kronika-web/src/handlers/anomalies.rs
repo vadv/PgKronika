@@ -16,7 +16,7 @@ use crate::AppState;
 use crate::anomaly::{EpisodeHit, MAX_SCORE_WORK, ScanCounts, ScanParams, rank, scan_section};
 use crate::params::{
     QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64, parse_limit_default,
-    parse_u64, query_error_response,
+    parse_u64, query_error_response_without_cursor,
 };
 use crate::problem::{ApiProblem, LimitResource, QueryConstraint, QueryParameter};
 use crate::reason::{ApiReason, MaterializationResource};
@@ -294,7 +294,7 @@ fn load_gates(
     let mut pages = BTreeMap::new();
     for name in Gates::sections(logicals) {
         let page = query_section(snap, name, source, from, to, DIFF_MAX_ROWS, None)
-            .map_err(|err| query_error_response(&err))?;
+            .map_err(|err| query_error_response_without_cursor(&err))?;
         pages.insert(name.to_owned(), page);
     }
     Ok(Gates::from_pages(logicals, &pages))
@@ -323,13 +323,14 @@ fn scan_one_section(
                 max_bytes,
             )));
         }
-        Err(err) => return Err(query_error_response(&err)),
+        Err(err) => return Err(query_error_response_without_cursor(&err)),
     };
     if page.next_cursor.is_some() {
         return Ok(Err(ApiReason::incomplete_page()));
     }
-    let logical = logical_section(name)
-        .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.to_owned())))?;
+    let logical = logical_section(name).ok_or_else(|| {
+        query_error_response_without_cursor(&QueryError::UnknownSection(name.to_owned()))
+    })?;
     let identity = logical.diff_key();
     let (cumulative, gauges) = scorable_columns(&logical);
     let mut diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);

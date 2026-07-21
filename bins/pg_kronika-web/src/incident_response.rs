@@ -11,7 +11,9 @@ use crate::incident::{
     Finding, GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
     SampledLockEdge,
 };
-use crate::incident_input::{CapabilityInputState, InputQuality, SectionSkip, SkipReason};
+use crate::incident_input::{
+    CapabilityInputState, InputQuality, MaterializationKind, SectionSkip, SkipReason,
+};
 use crate::reason::{ApiReason, MaterializationResource};
 
 pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<u64>) -> Value {
@@ -33,14 +35,37 @@ pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<
     })
 }
 
+/// Identity condition that prevents incident analysis from starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityIssue {
+    Missing,
+    Conflicting,
+}
+
+impl IdentityIssue {
+    const fn analysis_status(self) -> &'static str {
+        match self {
+            Self::Missing => "missing_node_identity",
+            Self::Conflicting => "conflicting_node_identity",
+        }
+    }
+
+    const fn reason(self) -> ApiReason {
+        match self {
+            Self::Missing => ApiReason::missing_node_identity(),
+            Self::Conflicting => ApiReason::conflicting_node_identity(),
+        }
+    }
+}
+
 pub(crate) fn identity_response(
     source: u64,
     scan: &ScanParams,
     data_age: Option<u64>,
-    analysis_status: &'static str,
-    reason: ApiReason,
+    issue: IdentityIssue,
 ) -> Value {
     let quality = InputQuality::default();
+    let analysis_status = issue.analysis_status();
     json!({
         "source_id": source,
         "from": scan.from,
@@ -54,7 +79,7 @@ pub(crate) fn identity_response(
         "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
         "log": empty_log_json(),
         "data_quality": quality_to_json(&quality, analysis_status),
-        "skipped": skipped_to_json(&[], &[], 0, &quality, Some(reason)),
+        "skipped": skipped_to_json(&[], &[], 0, &quality, Some(issue.reason())),
     })
 }
 
@@ -517,8 +542,12 @@ fn catalog_to_json(
 
 fn section_skip_reason(reason: SkipReason) -> ApiReason {
     match reason {
-        SkipReason::MaterializationLimit { limit } => {
-            ApiReason::materialization_limit(MaterializationResource::Cells, limit)
+        SkipReason::MaterializationLimit { resource, limit } => {
+            let resource = match resource {
+                MaterializationKind::Cells => MaterializationResource::Cells,
+                MaterializationKind::Bytes => MaterializationResource::Bytes,
+            };
+            ApiReason::materialization_limit(resource, limit)
         }
         SkipReason::IncompletePage => ApiReason::incomplete_page(),
         SkipReason::ScanBudget {
@@ -921,6 +950,22 @@ mod tests {
     }
 
     #[test]
+    fn identity_issue_drives_status_quality_and_reason_together() {
+        for (issue, expected) in [
+            (IdentityIssue::Missing, "missing_node_identity"),
+            (IdentityIssue::Conflicting, "conflicting_node_identity"),
+        ] {
+            let body = identity_response(7, &scan(), None, issue);
+            assert_eq!(body["analysis_status"], expected);
+            assert_eq!(body["data_quality"]["node_identity"], expected);
+            assert_eq!(
+                body["skipped"]["analysis"][0]["reason"],
+                json!({ "kind": expected, "params": {} })
+            );
+        }
+    }
+
+    #[test]
     fn global_catalog_readiness_is_not_a_request_skip() {
         let body = no_data_response(7, &scan(), None);
         assert!(
@@ -1003,6 +1048,56 @@ mod tests {
             body["skipped"]["sections"][0]["reason"]
                 .as_object()
                 .is_some_and(|reason| reason.len() == 2)
+        );
+    }
+
+    #[test]
+    fn successful_partial_response_preserves_materialization_resource() {
+        let outcome = EngineOutcome {
+            incidents: Vec::new(),
+            span_splits: 0,
+            complete: true,
+            skipped: Vec::new(),
+        };
+        let skipped = [
+            SectionSkip {
+                section: "pg_stat_archiver",
+                reason: SkipReason::MaterializationLimit {
+                    resource: MaterializationKind::Cells,
+                    limit: 10,
+                },
+            },
+            SectionSkip {
+                section: "snapshot_coverage",
+                reason: SkipReason::MaterializationLimit {
+                    resource: MaterializationKind::Bytes,
+                    limit: 20,
+                },
+            },
+        ];
+        let body = build_response(
+            7,
+            &scan(),
+            None,
+            &outcome,
+            &empty_log(),
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &InputQuality::default(),
+                skipped: &skipped,
+                capability_by_section: &BTreeMap::new(),
+            },
+        );
+        let sections = body["skipped"]["sections"]
+            .as_array()
+            .expect("section skips");
+        assert_eq!(
+            sections[0]["reason"],
+            json!({ "kind": "materialization_limit", "params": { "resource": "cells", "limit": 10 } })
+        );
+        assert_eq!(
+            sections[1]["reason"],
+            json!({ "kind": "materialization_limit", "params": { "resource": "bytes", "limit": 20 } })
         );
     }
 
