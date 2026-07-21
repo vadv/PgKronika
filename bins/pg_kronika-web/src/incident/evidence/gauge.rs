@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::super::model::IdentityValue;
+use super::coverage::SourceWindow;
 use super::value::{FiniteValue, GaugeUnit, ThresholdKind};
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,6 +48,7 @@ pub(crate) struct GaugeTrendInput {
     pub first_at_us: i64,
     pub last_at_us: i64,
     pub samples: usize,
+    pub source_window: SourceWindow,
     pub entity: GaugeEntity,
 }
 
@@ -58,6 +60,7 @@ pub(crate) struct GaugeValueInput {
     pub threshold_kind: ThresholdKind,
     pub observed_at_us: i64,
     pub samples: usize,
+    pub source_window: SourceWindow,
     pub entity: GaugeEntity,
 }
 
@@ -129,6 +132,7 @@ pub(crate) struct GaugeEvidence {
     threshold_kind: ThresholdKind,
     observed_at_us: i64,
     samples: u64,
+    source_window: SourceWindow,
     entity: GaugeEntity,
 }
 
@@ -142,6 +146,7 @@ impl GaugeEvidence {
             threshold_kind,
             observed_at_us,
             samples,
+            source_window,
             entity,
         } = input;
         let samples = u64::try_from(samples).ok()?;
@@ -156,6 +161,7 @@ impl GaugeEvidence {
             threshold_kind,
             observed_at_us,
             samples,
+            source_window,
             entity,
         })
     }
@@ -166,6 +172,7 @@ impl GaugeEvidence {
         threshold_kind: ThresholdKind,
         observed_at_us: i64,
         samples: usize,
+        source_window: SourceWindow,
         entity: GaugeEntity,
     ) -> Option<Self> {
         (ratio.denominator > 0.0
@@ -189,6 +196,7 @@ impl GaugeEvidence {
             threshold_kind,
             observed_at_us,
             samples,
+            source_window,
             entity,
         })
     }
@@ -204,6 +212,7 @@ impl GaugeEvidence {
             first_at_us,
             last_at_us,
             samples,
+            source_window,
             entity,
         } = input;
         let elapsed_us = u64::try_from(last_at_us.checked_sub(first_at_us)?).ok()?;
@@ -225,6 +234,7 @@ impl GaugeEvidence {
             threshold_kind,
             observed_at_us: last_at_us,
             samples,
+            source_window,
             entity,
         })
     }
@@ -251,6 +261,10 @@ impl GaugeEvidence {
 
     pub(crate) const fn samples(&self) -> u64 {
         self.samples
+    }
+
+    pub(crate) const fn source_window(&self) -> SourceWindow {
+        self.source_window
     }
 
     pub(crate) const fn entity(&self) -> &GaugeEntity {

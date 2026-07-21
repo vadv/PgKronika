@@ -38,9 +38,14 @@ pub(crate) use events::{
 };
 pub(crate) use evidence::{
     CounterEvidence, Evidence, Finding, GaugeEvidence, GaugeMeasurement, SampledLockEdge,
+    SourceWindow,
 };
 #[cfg(test)]
-pub(crate) use evidence::{DirectEvidence, LockParticipant};
+pub(crate) use evidence::{
+    CounterEvidenceInput, CounterEvidenceWindow, CounterEvidenceWindowInput,
+    CounterMeasurementKind, CounterOperand, CounterOperandPurpose, DirectEvidence, GaugeEntity,
+    GaugeUnit, GaugeValueInput, LockParticipant, ThresholdKind,
+};
 #[allow(
     unused_imports,
     reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"

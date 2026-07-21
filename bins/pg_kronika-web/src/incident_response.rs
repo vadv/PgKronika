@@ -9,7 +9,7 @@ use crate::anomaly::ScanParams;
 use crate::incident::{
     CounterEvidence, DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence,
     Finding, GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
-    SampledLockEdge,
+    SampledLockEdge, SourceWindow,
 };
 use crate::incident_input::{
     CapabilityInputState, InputQuality, MaterializationKind, SectionSkip, SkipReason,
@@ -257,10 +257,32 @@ fn gauge_evidence_to_json(gauge: &GaugeEvidence) -> Value {
         },
         "observed_at_us": gauge.observed_at_us(),
         "sample_count": gauge.samples(),
+        "coverage": {
+            "source_period": source_window_json(&gauge.source_window()),
+        },
         "entity": {
             "logical_section": gauge.entity().section(),
             "identity": entity,
         },
+    })
+}
+
+/// The observed source-window coverage: the collection cadence derived from the
+/// series' own sample spacing, the intervals the incident window should have
+/// held at that cadence, and the fraction actually covered. `expected` is null
+/// and completeness is `unknown` (with a reason) when the cadence is unproven.
+/// Completeness is emitted raw; a value above one signals an underestimated
+/// period or data wider than the incident, not an error to clamp away.
+fn source_window_json(window: &SourceWindow) -> Value {
+    let completeness = window
+        .source_window_completeness()
+        .map_or_else(|| Value::from("unknown"), Value::from);
+    json!({
+        "basis": "observed_series_delta_median",
+        "observed_source_period_us": window.observed_period_us(),
+        "expected_interval_count": window.expected_interval_count(),
+        "expected_interval_count_reason": window.completeness_gap_reason(),
+        "source_window_completeness": completeness,
     })
 }
 
@@ -321,9 +343,7 @@ fn counter_evidence_to_json(counter: &CounterEvidence) -> Value {
             },
             "summed_interval_duration_us": window.elapsed_us(),
             "observed_endpoint_pairing_complete": window.excluded_intervals() == 0,
-            "expected_interval_count": Value::Null,
-            "expected_interval_count_reason": "runtime_source_period_unavailable",
-            "source_window_completeness": "unknown",
+            "source_period": source_window_json(&window.source_window()),
         },
         "entity": {
             "logical_section": counter.entity().section(),
@@ -757,6 +777,150 @@ mod tests {
             complete: true,
             skipped: Vec::new(),
         }
+    }
+
+    fn counter_json_with_source_period(observed_period_us: Option<u64>) -> Value {
+        use crate::incident::{
+            CounterEvidenceInput, CounterEvidenceWindow, CounterEvidenceWindowInput,
+            CounterMeasurementKind, CounterOperand, CounterOperandPurpose, GaugeEntity, GaugeUnit,
+            ThresholdKind,
+        };
+        use std::sync::Arc;
+
+        let counter = CounterEvidence::new(CounterEvidenceInput {
+            kind: CounterMeasurementKind::Sum,
+            formula: "writes",
+            value: 3.0,
+            unit: GaugeUnit::Count,
+            threshold: 1.0,
+            threshold_kind: ThresholdKind::AtLeast,
+            operands: vec![
+                CounterOperand::new(
+                    "writes",
+                    3.0,
+                    GaugeUnit::Count,
+                    CounterOperandPurpose::Formula,
+                )
+                .expect("valid operand"),
+            ],
+            window: CounterEvidenceWindow::new(CounterEvidenceWindowInput {
+                selection_from_us: 0,
+                selection_to_us: 4_000_000,
+                first_interval_start_us: 0,
+                first_interval_end_us: 1_000_000,
+                last_interval_end_us: 3_000_000,
+                usable_intervals: 3,
+                candidate_intervals: 3,
+                unmatched_endpoint_intervals: 0,
+                unusable_delta_intervals: 0,
+                unaligned_duration_intervals: 0,
+                numeric_limit_intervals: 0,
+                elapsed_us: 3_000_000,
+                observed_period_us,
+            })
+            .expect("valid counter window"),
+            entity: GaugeEntity::new("section", Arc::from([])),
+        })
+        .expect("valid counter evidence");
+
+        counter_evidence_to_json(&counter)
+    }
+
+    fn gauge_json_with_source_period(source_window: SourceWindow) -> Value {
+        use crate::incident::{GaugeEntity, GaugeUnit, GaugeValueInput, ThresholdKind};
+        use std::sync::Arc;
+
+        let gauge = GaugeEvidence::value(GaugeValueInput {
+            operand: "queue_depth",
+            value: 9.0,
+            unit: GaugeUnit::Count,
+            threshold: 8.0,
+            threshold_kind: ThresholdKind::AtLeast,
+            observed_at_us: 3_000_000,
+            samples: 4,
+            source_window,
+            entity: GaugeEntity::new("section", Arc::from([])),
+        })
+        .expect("valid gauge evidence");
+
+        gauge_evidence_to_json(&gauge)
+    }
+
+    #[test]
+    fn counter_json_renders_known_source_period_without_legacy_aliases() {
+        let evidence = counter_json_with_source_period(Some(1_000_000));
+
+        assert_eq!(
+            evidence["coverage"]["source_period"],
+            json!({
+                "basis": "observed_series_delta_median",
+                "observed_source_period_us": 1_000_000,
+                "expected_interval_count": 4,
+                "expected_interval_count_reason": null,
+                "source_window_completeness": 0.75,
+            })
+        );
+        for legacy_field in [
+            "observed_source_period_us",
+            "expected_interval_count",
+            "expected_interval_count_reason",
+            "source_window_completeness",
+        ] {
+            assert!(evidence["coverage"].get(legacy_field).is_none());
+        }
+    }
+
+    #[test]
+    fn counter_json_renders_unknown_source_period_with_machine_reason() {
+        let evidence = counter_json_with_source_period(None);
+
+        assert_eq!(
+            evidence["coverage"]["source_period"],
+            json!({
+                "basis": "observed_series_delta_median",
+                "observed_source_period_us": null,
+                "expected_interval_count": null,
+                "expected_interval_count_reason": "insufficient_intervals_for_observed_period",
+                "source_window_completeness": "unknown",
+            })
+        );
+    }
+
+    #[test]
+    fn gauge_json_renders_known_source_window_coverage() {
+        let evidence =
+            gauge_json_with_source_period(SourceWindow::new(4_000_000, Some(1_000_000), 3));
+
+        assert_eq!(
+            evidence["coverage"],
+            json!({
+                "source_period": {
+                    "basis": "observed_series_delta_median",
+                    "observed_source_period_us": 1_000_000,
+                    "expected_interval_count": 4,
+                    "expected_interval_count_reason": null,
+                    "source_window_completeness": 0.75,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn gauge_json_renders_unknown_source_window_coverage() {
+        let evidence = gauge_json_with_source_period(SourceWindow::new(4_000_000, None, 3));
+
+        assert_eq!(
+            evidence["coverage"],
+            json!({
+                "source_period": {
+                    "basis": "observed_series_delta_median",
+                    "observed_source_period_us": null,
+                    "expected_interval_count": null,
+                    "expected_interval_count_reason": "insufficient_intervals_for_observed_period",
+                    "source_window_completeness": "unknown",
+                }
+            })
+        );
     }
 
     #[test]

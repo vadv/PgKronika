@@ -9,7 +9,7 @@ use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
     ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, GaugeValueInput, Role, ThresholdKind,
+    GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
 };
 use super::lens::Lens;
 use super::model::IdentityValue;
@@ -87,6 +87,7 @@ impl QueryWorkLens {
                 threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us: aligned.last_end_us,
                 samples: aligned.intervals,
+                source_window: aligned.source_window,
                 entity: entity(),
             }),
             GaugeEvidence::ratio(
@@ -103,6 +104,7 @@ impl QueryWorkLens {
                 ThresholdKind::AtLeast,
                 aligned.last_end_us,
                 aligned.intervals,
+                aligned.source_window,
                 entity(),
             ),
             GaugeEvidence::ratio(
@@ -119,6 +121,7 @@ impl QueryWorkLens {
                 ThresholdKind::AtLeast,
                 aligned.last_end_us,
                 aligned.intervals,
+                aligned.source_window,
                 entity(),
             ),
             GaugeEvidence::ratio(
@@ -135,6 +138,7 @@ impl QueryWorkLens {
                 ThresholdKind::AtLeast,
                 aligned.last_end_us,
                 aligned.intervals,
+                aligned.source_window,
                 entity(),
             ),
         ]
@@ -397,6 +401,10 @@ impl Lens for PlanChurnLens {
             IdentityValue::I64(candidate.planid),
         ]);
         let entity = || GaugeEntity::new(member.logical_section, Arc::clone(&identity));
+        // A plan change is a two-point bridge, not a sampled series, so there is
+        // no cadence to derive: source-window completeness stays unproven.
+        let source_window =
+            SourceWindow::from_bounds(context.incident_start_us, context.incident_end_us, None, 2);
         let evidence = [
             GaugeEvidence::value(GaugeValueInput {
                 operand: "new_plan_calls_delta",
@@ -406,6 +414,7 @@ impl Lens for PlanChurnLens {
                 threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us: candidate.observed_at_us,
                 samples: 2,
+                source_window,
                 entity: entity(),
             }),
             GaugeEvidence::value(GaugeValueInput {
@@ -416,6 +425,7 @@ impl Lens for PlanChurnLens {
                 threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us: candidate.observed_at_us,
                 samples: 2,
+                source_window,
                 entity: entity(),
             }),
             GaugeEvidence::ratio(
@@ -430,6 +440,7 @@ impl Lens for PlanChurnLens {
                 ThresholdKind::AtLeast,
                 candidate.observed_at_us,
                 2,
+                source_window,
                 entity(),
             ),
         ]
