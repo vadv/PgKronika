@@ -36,7 +36,11 @@ pub(crate) use events::{
     LifecycleKind, LogCoverage, LogErrorGroup, LogEventInputs, evaluate_events, event_catalog,
     event_catalog_ids, event_catalog_metadata,
 };
-pub(crate) use evidence::{Evidence, Finding, GaugeMeasurement};
+pub(crate) use evidence::{
+    CounterEvidence, Evidence, Finding, GaugeEvidence, GaugeMeasurement, SampledLockEdge,
+};
+#[cfg(test)]
+pub(crate) use evidence::{DirectEvidence, LockParticipant};
 #[allow(
     unused_imports,
     reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"

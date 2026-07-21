@@ -53,20 +53,19 @@ mod tests {
     }
 
     #[test]
-    fn a_same_domain_clock_allows_temporal_direction() {
-        assert!(
-            EvalContext::for_test(super::super::engine::ClockRelation::SameDomain)
-                .temporal_direction()
-                .is_some()
+    fn context_preserves_an_unknown_clock_relation() {
+        assert_eq!(
+            EvalContext::for_test(super::super::engine::ClockRelation::Unknown).clock_relation(),
+            super::super::engine::ClockRelation::Unknown
         );
     }
 
     #[test]
-    fn an_unknown_clock_forbids_temporal_direction() {
-        assert!(
-            EvalContext::for_test(super::super::engine::ClockRelation::Unknown)
-                .temporal_direction()
-                .is_none()
+    fn context_preserves_the_simultaneous_observation_contract() {
+        assert_eq!(
+            EvalContext::for_test(super::super::engine::ClockRelation::Simultaneous)
+                .clock_relation(),
+            super::super::engine::ClockRelation::Simultaneous
         );
     }
 

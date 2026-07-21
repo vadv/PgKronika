@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 
 use crate::anomaly::ScanParams;
 use crate::incident::{
-    DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence, Finding,
-    GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
+    CounterEvidence, DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence,
+    Finding, GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
+    SampledLockEdge,
 };
 use crate::incident_input::{CapabilityInputState, InputQuality, SectionSkip, SkipReason};
 
@@ -146,33 +147,61 @@ fn finding_to_json(finding: &Finding) -> Value {
 }
 
 fn evidence_to_json(evidence: &Evidence) -> Value {
-    let Evidence::GaugeObservation(gauge) = evidence else {
-        return Value::from(evidence.label());
-    };
+    match evidence {
+        Evidence::GaugeObservation(gauge) => gauge_evidence_to_json(gauge),
+        Evidence::CounterAggregate(counter) => counter_evidence_to_json(counter),
+        Evidence::Direct(direct) => direct
+            .lock_edge()
+            .map_or_else(|| Value::from(evidence.label()), lock_edge_evidence_to_json),
+        Evidence::Ratio | Evidence::Gauge | Evidence::Counter | Evidence::Event => {
+            Value::from(evidence.label())
+        }
+    }
+}
+
+fn gauge_evidence_to_json(gauge: &GaugeEvidence) -> Value {
     let measurement = match gauge.measurement() {
-        GaugeMeasurement::Value(value) => json!({
+        GaugeMeasurement::Value { operand, value } => json!({
             "kind": "value",
+            "operand": operand,
             "value": value.get(),
         }),
         GaugeMeasurement::Ratio {
+            numerator_name,
             numerator,
+            numerator_unit,
+            denominator_name,
             denominator,
-            operand_unit,
+            denominator_unit,
         } => json!({
             "kind": "ratio",
+            "numerator_name": numerator_name,
             "numerator": numerator.get(),
+            "numerator_unit": numerator_unit.label(),
+            "denominator_name": denominator_name,
             "denominator": denominator.get(),
+            "denominator_unit": denominator_unit.label(),
             "value": numerator.get() / denominator.get(),
-            "operand_unit": operand_unit.label(),
-            "headroom": denominator.get() - numerator.get(),
+            "operand_unit": if numerator_unit == denominator_unit {
+                Value::from(numerator_unit.label())
+            } else {
+                Value::Null
+            },
+            "headroom": if numerator_unit == denominator_unit {
+                Value::from(denominator.get() - numerator.get())
+            } else {
+                Value::Null
+            },
         }),
         GaugeMeasurement::Trend {
+            operand,
             first,
             last,
             elapsed_us,
             operand_unit,
         } => json!({
             "kind": "trend",
+            "operand": operand,
             "first": first.get(),
             "last": last.get(),
             "change": last.get() - first.get(),
@@ -189,8 +218,10 @@ fn evidence_to_json(evidence: &Evidence) -> Value {
         .map(identity_to_json)
         .collect();
     json!({
+        "schema_version": 1,
         "type": "gauge",
         "claim": "observed_threshold_crossing",
+        "numeric_representation": "ieee754_binary64",
         "measurement": measurement,
         "unit": gauge.unit().label(),
         "threshold": {
@@ -203,6 +234,98 @@ fn evidence_to_json(evidence: &Evidence) -> Value {
             "logical_section": gauge.entity().section(),
             "identity": entity,
         },
+    })
+}
+
+fn counter_evidence_to_json(counter: &CounterEvidence) -> Value {
+    let operands: Vec<Value> = counter
+        .operands()
+        .iter()
+        .map(|operand| {
+            json!({
+                "name": operand.name(),
+                "aggregation": "delta_sum",
+                "value": operand.value().get(),
+                "unit": operand.unit().label(),
+                "purpose": operand.purpose().label(),
+                "numeric_representation": "ieee754_binary64",
+            })
+        })
+        .collect();
+    let entity: Vec<Value> = counter
+        .entity()
+        .identity()
+        .iter()
+        .map(identity_to_json)
+        .collect();
+    let window = counter.window();
+    json!({
+        "schema_version": 1,
+        "type": "counter_aggregate",
+        "claim": "derived_counter_threshold_crossing",
+        "numeric_representation": "ieee754_binary64",
+        "measurement": {
+            "kind": counter.kind().label(),
+            "formula": counter.formula(),
+            "operands": operands,
+            "value": counter.value().get(),
+        },
+        "unit": counter.unit().label(),
+        "threshold": {
+            "operator": counter.threshold_kind().label(),
+            "value": counter.threshold().get(),
+        },
+        "coverage": {
+            "basis": "paired_observed_interval_endpoints",
+            "selection_from_us": window.selection_from_us(),
+            "selection_to_us": window.selection_to_us(),
+            "interval_end_bounds": "inclusive",
+            "first_usable_interval_start_us": window.first_interval_start_us(),
+            "first_usable_interval_end_us": window.first_interval_end_us(),
+            "last_usable_interval_end_us": window.last_interval_end_us(),
+            "candidate_interval_count": window.candidate_intervals(),
+            "usable_interval_count": window.usable_intervals(),
+            "excluded_interval_count": window.excluded_intervals(),
+            "excluded_by_reason": {
+                "unmatched_endpoint": window.unmatched_endpoint_intervals(),
+                "unusable_delta": window.unusable_delta_intervals(),
+                "unaligned_or_invalid_duration": window.unaligned_duration_intervals(),
+                "numeric_limit": window.numeric_limit_intervals(),
+            },
+            "summed_interval_duration_us": window.elapsed_us(),
+            "observed_endpoint_pairing_complete": window.excluded_intervals() == 0,
+            "expected_interval_count": Value::Null,
+            "expected_interval_count_reason": "runtime_source_period_unavailable",
+            "source_window_completeness": "unknown",
+        },
+        "entity": {
+            "logical_section": counter.entity().section(),
+            "identity": entity,
+        },
+    })
+}
+
+fn lock_edge_evidence_to_json(edge: &SampledLockEdge) -> Value {
+    json!({
+        "schema_version": 1,
+        "type": "lock_edge",
+        "claim": "sampled_blocking_edge",
+        "source": "pg_blocking_pids",
+        "observed_at_us": edge.observed_at_us(),
+        "waiter_pid": edge.waiter_pid(),
+        "blocker_pid": edge.blocker_pid(),
+        "blocker_kind": if edge.blocker_pid() == 0 {
+            "prepared_transaction"
+        } else {
+            "backend"
+        },
+        "participant": edge.participant().label(),
+        "edge_semantics": "hard_or_soft_block",
+        "duplicate_policy": "deduplicated_by_waiter_and_blocker_pid",
+        "transitive_inference": false,
+        "evidence_completeness": "edge_only",
+        "lock_target_available": false,
+        "lock_mode_available": false,
     })
 }
 
@@ -867,8 +990,8 @@ mod tests {
     #[test]
     fn lock_lens_is_active_but_silent_without_sampled_edges() {
         use crate::incident::{
-            ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, Lens,
-            SeriesSet, TypedInputs, active_catalog, analyze,
+            ClockRelation, EnrichedEpisode, IncidentConfig, Lens, SeriesSet, TypedInputs,
+            active_catalog, analyze,
         };
         use kronika_analytics::{Direction, Episode, Evaluated};
         use std::sync::Arc;
@@ -961,19 +1084,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_cache_miss_finding_renders_role_evidence_and_scope() {
+    fn cache_miss_response() -> Value {
         use crate::incident::{
-            ClockRelation, EnrichedEpisode, EpisodeRefV1, IdentityValue, IncidentConfig, Lens,
-            SeriesSet, TypedInputs, active_catalog, analyze,
+            ClockRelation, EnrichedEpisode, IncidentConfig, Lens, SeriesSet, TypedInputs,
+            active_catalog, analyze,
         };
         use kronika_analytics::{DiffPoint, Direction, Episode, Evaluated, Scalar};
         use std::sync::Arc;
 
         let identity: Arc<[IdentityValue]> = Arc::from(vec![IdentityValue::U64(5)]);
-        // One-second intervals, so the recovered delta equals the rate.
+        // One-second intervals with the same delta and rate.
         let point = |delta: f64| DiffPoint::Value {
-            delta: Scalar::Int(0),
+            delta: Scalar::Float(delta),
             rate: delta,
             dt_micros: 1_000_000,
         };
@@ -1035,7 +1157,7 @@ mod tests {
         )
         .expect("valid analysis");
 
-        let body = build_response(
+        build_response(
             7,
             &scan(),
             None,
@@ -1047,12 +1169,72 @@ mod tests {
                 skipped: &[],
                 capability_by_section: &BTreeMap::new(),
             },
-        );
+        )
+    }
+
+    #[test]
+    fn a_cache_miss_finding_renders_role_evidence_and_scope() {
+        let body = cache_miss_response();
         let finding = &body["incidents"][0]["findings"][0];
         assert_eq!(finding["lens_id"], "PG-CACHE-010");
         assert_eq!(finding["role"], "amplifier");
         assert_eq!(finding["confidence"], "medium");
-        assert_eq!(finding["evidence"], json!(["ratio"]));
+        let evidence = &finding["evidence"][0];
+        assert_eq!(evidence["schema_version"], 1);
+        assert_eq!(evidence["type"], "counter_aggregate");
+        assert_eq!(evidence["unit"], "ratio");
+        assert_eq!(evidence["measurement"]["kind"], "ratio");
+        assert_eq!(
+            evidence["measurement"]["formula"],
+            "blks_read / (blks_read + blks_hit)"
+        );
+        assert_eq!(evidence["measurement"]["value"], json!(0.8));
+        assert_eq!(
+            evidence["measurement"]["operands"],
+            json!([
+                {
+                    "name": "blks_read",
+                    "aggregation": "delta_sum",
+                    "value": 80.0,
+                    "unit": "count",
+                    "purpose": "formula",
+                    "numeric_representation": "ieee754_binary64"
+                },
+                {
+                    "name": "blks_hit",
+                    "aggregation": "delta_sum",
+                    "value": 20.0,
+                    "unit": "count",
+                    "purpose": "formula",
+                    "numeric_representation": "ieee754_binary64"
+                }
+            ])
+        );
+        assert_eq!(evidence["threshold"]["value"], json!(0.2));
+        assert_eq!(evidence["coverage"]["candidate_interval_count"], 3);
+        assert_eq!(evidence["coverage"]["usable_interval_count"], 3);
+        assert_eq!(evidence["coverage"]["excluded_interval_count"], 0);
+        assert_eq!(
+            evidence["coverage"]["excluded_by_reason"],
+            json!({
+                "unmatched_endpoint": 0,
+                "unusable_delta": 0,
+                "unaligned_or_invalid_duration": 0,
+                "numeric_limit": 0,
+            })
+        );
+        assert_eq!(
+            evidence["coverage"]["first_usable_interval_start_us"],
+            -1_000_000
+        );
+        assert_eq!(
+            evidence["coverage"]["summed_interval_duration_us"],
+            3_000_000
+        );
+        assert_eq!(
+            evidence["coverage"]["observed_endpoint_pairing_complete"],
+            true
+        );
         assert_eq!(finding["scope"]["logical_section"], "pg_stat_database");
         assert_eq!(finding["scope"]["column"], "blks_read");
         assert_eq!(finding["scope"]["identity"], json!([5]));
@@ -1060,6 +1242,37 @@ mod tests {
         assert_eq!(
             body["incidents"][0]["finding_evaluation_status"],
             "complete"
+        );
+    }
+
+    #[test]
+    fn a_prepared_transaction_lock_edge_renders_exact_provenance() {
+        use crate::incident::{DirectEvidence, LockParticipant};
+
+        let direct = DirectEvidence::sampled_lock_edge(123, 42, 0, LockParticipant::Blocker);
+        let edge = direct
+            .lock_edge()
+            .expect("the direct evidence is a lock edge");
+
+        assert_eq!(
+            lock_edge_evidence_to_json(edge),
+            json!({
+                "schema_version": 1,
+                "type": "lock_edge",
+                "claim": "sampled_blocking_edge",
+                "source": "pg_blocking_pids",
+                "observed_at_us": 123,
+                "waiter_pid": 42,
+                "blocker_pid": 0,
+                "blocker_kind": "prepared_transaction",
+                "participant": "blocker",
+                "edge_semantics": "hard_or_soft_block",
+                "duplicate_policy": "deduplicated_by_waiter_and_blocker_pid",
+                "transitive_inference": false,
+                "evidence_completeness": "edge_only",
+                "lock_target_available": false,
+                "lock_mode_available": false,
+            })
         );
     }
 }
