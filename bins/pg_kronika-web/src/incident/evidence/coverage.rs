@@ -11,6 +11,14 @@
 /// samples bracket it. Two durations would let one gap corrupt the median.
 pub(crate) const MIN_INTERVALS_FOR_PERIOD: usize = 3;
 
+/// Why an observed source window has no numeric completeness value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceWindowGapReason {
+    EmptyIncidentWindow,
+    InsufficientIntervalsForObservedPeriod,
+    IncidentWindowShorterThanObservedPeriod,
+}
+
 /// Observed source cadence over one series' incident window, carried alongside
 /// gauge evidence, which has no interval window of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,7 +69,7 @@ impl SourceWindow {
         source_window_completeness(self.usable_samples, self.expected_interval_count()?)
     }
 
-    pub(crate) fn completeness_gap_reason(&self) -> Option<&'static str> {
+    pub(crate) fn completeness_gap_reason(&self) -> Option<SourceWindowGapReason> {
         source_window_gap_reason(Some(self.window_span_us), self.observed_period_us)
     }
 }
@@ -131,17 +139,17 @@ pub(crate) fn source_window_completeness(usable: u64, expected: u64) -> Option<f
 fn source_window_gap_reason(
     window_span_us: Option<u64>,
     observed_period_us: Option<u64>,
-) -> Option<&'static str> {
+) -> Option<SourceWindowGapReason> {
     let Some(span) = window_span_us else {
-        return Some("empty_incident_window");
+        return Some(SourceWindowGapReason::EmptyIncidentWindow);
     };
     let Some(period) = observed_period_us else {
-        return Some("insufficient_intervals_for_observed_period");
+        return Some(SourceWindowGapReason::InsufficientIntervalsForObservedPeriod);
     };
     match expected_interval_count(span, period) {
         Some(_) => None,
-        None if span == 0 => Some("empty_incident_window"),
-        None => Some("incident_window_shorter_than_observed_period"),
+        None if span == 0 => Some(SourceWindowGapReason::EmptyIncidentWindow),
+        None => Some(SourceWindowGapReason::IncidentWindowShorterThanObservedPeriod),
     }
 }
 
@@ -212,13 +220,13 @@ mod tests {
         assert_eq!(unproven.source_window_completeness(), None);
         assert_eq!(
             unproven.completeness_gap_reason(),
-            Some("insufficient_intervals_for_observed_period")
+            Some(SourceWindowGapReason::InsufficientIntervalsForObservedPeriod)
         );
 
         let narrow = SourceWindow::new(400_000, Some(1_000_000), 1);
         assert_eq!(
             narrow.completeness_gap_reason(),
-            Some("incident_window_shorter_than_observed_period")
+            Some(SourceWindowGapReason::IncidentWindowShorterThanObservedPeriod)
         );
     }
 
@@ -229,7 +237,7 @@ mod tests {
         assert_eq!(empty.source_window_completeness(), None);
         assert_eq!(
             empty.completeness_gap_reason(),
-            Some("empty_incident_window")
+            Some(SourceWindowGapReason::EmptyIncidentWindow)
         );
     }
 }

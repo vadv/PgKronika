@@ -333,6 +333,13 @@ fn reason_example(kind: ReasonKind) -> ApiReason {
         ReasonKind::SectionAbsent => ApiReason::section_absent(),
         ReasonKind::CompleteCoverage => ApiReason::complete_coverage(0),
         ReasonKind::CoverageGap => ApiReason::coverage_gap(2),
+        ReasonKind::EmptyIncidentWindow => ApiReason::empty_incident_window(),
+        ReasonKind::InsufficientIntervalsForObservedPeriod => {
+            ApiReason::insufficient_intervals_for_observed_period()
+        }
+        ReasonKind::IncidentWindowShorterThanObservedPeriod => {
+            ApiReason::incident_window_shorter_than_observed_period()
+        }
     }
 }
 

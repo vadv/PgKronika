@@ -9,7 +9,7 @@ use crate::anomaly::ScanParams;
 use crate::incident::{
     CounterEvidence, DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence,
     Finding, GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
-    SampledLockEdge, SourceWindow,
+    SampledLockEdge, SourceWindow, SourceWindowGapReason,
 };
 use crate::incident_input::{
     CapabilityInputState, InputQuality, MaterializationKind, SectionSkip, SkipReason,
@@ -277,13 +277,28 @@ fn source_window_json(window: &SourceWindow) -> Value {
     let completeness = window
         .source_window_completeness()
         .map_or_else(|| Value::from("unknown"), Value::from);
+    let reason = window
+        .completeness_gap_reason()
+        .map(source_window_gap_reason);
     json!({
         "basis": "observed_series_delta_median",
         "observed_source_period_us": window.observed_period_us(),
         "expected_interval_count": window.expected_interval_count(),
-        "expected_interval_count_reason": window.completeness_gap_reason(),
+        "expected_interval_count_reason": reason,
         "source_window_completeness": completeness,
     })
+}
+
+const fn source_window_gap_reason(reason: SourceWindowGapReason) -> ApiReason {
+    match reason {
+        SourceWindowGapReason::EmptyIncidentWindow => ApiReason::empty_incident_window(),
+        SourceWindowGapReason::InsufficientIntervalsForObservedPeriod => {
+            ApiReason::insufficient_intervals_for_observed_period()
+        }
+        SourceWindowGapReason::IncidentWindowShorterThanObservedPeriod => {
+            ApiReason::incident_window_shorter_than_observed_period()
+        }
+    }
 }
 
 fn counter_evidence_to_json(counter: &CounterEvidence) -> Value {
@@ -880,7 +895,10 @@ mod tests {
                 "basis": "observed_series_delta_median",
                 "observed_source_period_us": null,
                 "expected_interval_count": null,
-                "expected_interval_count_reason": "insufficient_intervals_for_observed_period",
+                "expected_interval_count_reason": {
+                    "kind": "insufficient_intervals_for_observed_period",
+                    "params": {},
+                },
                 "source_window_completeness": "unknown",
             })
         );
@@ -916,11 +934,38 @@ mod tests {
                     "basis": "observed_series_delta_median",
                     "observed_source_period_us": null,
                     "expected_interval_count": null,
-                    "expected_interval_count_reason": "insufficient_intervals_for_observed_period",
+                    "expected_interval_count_reason": {
+                        "kind": "insufficient_intervals_for_observed_period",
+                        "params": {},
+                    },
                     "source_window_completeness": "unknown",
                 }
             })
         );
+    }
+
+    #[test]
+    fn every_source_window_gap_uses_the_closed_reason_shape() {
+        for (window, kind) in [
+            (
+                SourceWindow::new(0, Some(1_000_000), 1),
+                "empty_incident_window",
+            ),
+            (
+                SourceWindow::new(4_000_000, None, 3),
+                "insufficient_intervals_for_observed_period",
+            ),
+            (
+                SourceWindow::new(400_000, Some(1_000_000), 1),
+                "incident_window_shorter_than_observed_period",
+            ),
+        ] {
+            let evidence = gauge_json_with_source_period(window);
+            assert_eq!(
+                evidence["coverage"]["source_period"]["expected_interval_count_reason"],
+                json!({ "kind": kind, "params": {} })
+            );
+        }
     }
 
     #[test]

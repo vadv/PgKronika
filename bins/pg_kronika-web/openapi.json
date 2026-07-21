@@ -927,13 +927,13 @@
         "properties": {
           "kind": {
             "type": "string",
-            "enum": ["materialization_limit", "incomplete_page", "scoring_work_budget", "scan_budget", "conflicting_timestamp", "identity_byte_limit", "series_point_limit", "typed_gauge_point_limit", "snapshot_row_limit", "incomplete_snapshot", "retention_limit", "no_data", "missing_node_identity", "conflicting_node_identity", "producer_unavailable", "provenance_or_input_missing", "complete_provenance", "section_absent", "complete_coverage", "coverage_gap"]
+            "enum": ["materialization_limit", "incomplete_page", "scoring_work_budget", "scan_budget", "conflicting_timestamp", "identity_byte_limit", "series_point_limit", "typed_gauge_point_limit", "snapshot_row_limit", "incomplete_snapshot", "retention_limit", "no_data", "missing_node_identity", "conflicting_node_identity", "producer_unavailable", "provenance_or_input_missing", "complete_provenance", "section_absent", "complete_coverage", "coverage_gap", "empty_incident_window", "insufficient_intervals_for_observed_period", "incident_window_shorter_than_observed_period"]
           },
           "params": { "type": "object" }
         },
         "allOf": [
           { "if": { "properties": { "kind": { "const": "materialization_limit" } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/MaterializationReasonParams" } } } },
-          { "if": { "properties": { "kind": { "enum": ["incomplete_page", "incomplete_snapshot", "no_data", "missing_node_identity", "conflicting_node_identity", "producer_unavailable", "provenance_or_input_missing", "section_absent"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "kind": { "enum": ["incomplete_page", "incomplete_snapshot", "no_data", "missing_node_identity", "conflicting_node_identity", "producer_unavailable", "provenance_or_input_missing", "section_absent", "empty_incident_window", "insufficient_intervals_for_observed_period", "incident_window_shorter_than_observed_period"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "kind": { "enum": ["scoring_work_budget", "scan_budget"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/WorkReasonParams" } } } },
           { "if": { "properties": { "kind": { "const": "conflicting_timestamp" } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/TimestampReasonParams" } } } },
           { "if": { "properties": { "kind": { "enum": ["identity_byte_limit", "series_point_limit", "typed_gauge_point_limit", "snapshot_row_limit"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/ObservedLimitReasonParams" } } } },

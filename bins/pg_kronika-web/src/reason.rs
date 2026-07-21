@@ -29,6 +29,9 @@ closed_string_enum! {
         SectionAbsent => "section_absent",
         CompleteCoverage => "complete_coverage",
         CoverageGap => "coverage_gap",
+        EmptyIncidentWindow => "empty_incident_window",
+        InsufficientIntervalsForObservedPeriod => "insufficient_intervals_for_observed_period",
+        IncidentWindowShorterThanObservedPeriod => "incident_window_shorter_than_observed_period",
     }
 }
 
@@ -196,6 +199,18 @@ impl ApiReason {
 
     pub(crate) fn coverage_gap(gap_count: usize) -> Self {
         Self::gap_count(ReasonKind::CoverageGap, gap_count)
+    }
+
+    pub(crate) const fn empty_incident_window() -> Self {
+        Self::empty(ReasonKind::EmptyIncidentWindow)
+    }
+
+    pub(crate) const fn insufficient_intervals_for_observed_period() -> Self {
+        Self::empty(ReasonKind::InsufficientIntervalsForObservedPeriod)
+    }
+
+    pub(crate) const fn incident_window_shorter_than_observed_period() -> Self {
+        Self::empty(ReasonKind::IncidentWindowShorterThanObservedPeriod)
     }
 
     const fn empty(kind: ReasonKind) -> Self {
