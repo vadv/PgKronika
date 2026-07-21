@@ -1,3 +1,4 @@
+use super::coverage::SourceWindow;
 use super::gauge::GaugeEntity;
 use super::value::{FiniteValue, GaugeUnit, ThresholdKind};
 
@@ -89,6 +90,7 @@ pub(crate) struct CounterEvidenceWindow {
     unaligned_duration_intervals: u64,
     numeric_limit_intervals: u64,
     elapsed_us: u64,
+    observed_period_us: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -105,6 +107,9 @@ pub(crate) struct CounterEvidenceWindowInput {
     pub unaligned_duration_intervals: usize,
     pub numeric_limit_intervals: usize,
     pub elapsed_us: u64,
+    /// Median of the usable interval durations; `None` when the window held too
+    /// few intervals to fix a stable source cadence.
+    pub observed_period_us: Option<u64>,
 }
 
 impl CounterEvidenceWindow {
@@ -122,6 +127,7 @@ impl CounterEvidenceWindow {
             unaligned_duration_intervals,
             numeric_limit_intervals,
             elapsed_us,
+            observed_period_us,
         } = input;
         let usable_intervals = u64::try_from(usable_intervals).ok()?;
         let candidate_intervals = u64::try_from(candidate_intervals).ok()?;
@@ -155,6 +161,7 @@ impl CounterEvidenceWindow {
                 unaligned_duration_intervals,
                 numeric_limit_intervals,
                 elapsed_us,
+                observed_period_us,
             })
     }
 
@@ -208,6 +215,18 @@ impl CounterEvidenceWindow {
 
     pub(crate) const fn elapsed_us(&self) -> u64 {
         self.elapsed_us
+    }
+
+    /// Incident-window coverage: the window is bounded by the incident, not by
+    /// the usable intervals, so a collection that started late or stopped early
+    /// shrinks completeness instead of hiding.
+    pub(crate) fn source_window(&self) -> SourceWindow {
+        SourceWindow::from_bounds(
+            self.from_us,
+            self.to_us,
+            self.observed_period_us,
+            usize::try_from(self.usable_intervals).unwrap_or(usize::MAX),
+        )
     }
 }
 

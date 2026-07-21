@@ -7,7 +7,7 @@ use super::super::engine::EvalContext;
 use super::super::evidence::sink::FindingSink;
 use super::super::evidence::{
     ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, GaugeValueInput, Role, ThresholdKind,
+    GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
 };
 use super::super::lens::Lens;
 use super::super::model::IdentityValue;
@@ -108,6 +108,7 @@ impl Lens for XminHorizonHoldLens {
                 threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us,
                 samples: 1,
+                source_window: SourceWindow::from_bounds(start, end, None, 1),
                 entity: GaugeEntity::new(PG_STAT_ACTIVITY, Arc::clone(&identity)),
             }) else {
                 return Ok(());
@@ -122,6 +123,7 @@ impl Lens for XminHorizonHoldLens {
                     threshold_kind: ThresholdKind::AtLeast,
                     observed_at_us,
                     samples: 1,
+                    source_window: SourceWindow::from_bounds(start, end, None, 1),
                     entity: GaugeEntity::new(PG_STAT_ACTIVITY, identity),
                 })
             {
@@ -221,6 +223,7 @@ impl Lens for SyncReplicationWaitLens {
                 threshold_kind: ThresholdKind::AtLeast,
                 observed_at_us,
                 samples,
+                source_window: SourceWindow::from_bounds(start, end, None, samples),
                 entity: GaugeEntity::new(PG_STAT_ACTIVITY, identity),
             }) else {
                 return Ok(());
@@ -350,6 +353,7 @@ impl Lens for InternalWaitConcentrationLens {
                 ThresholdKind::AtLeast,
                 observed_at_us,
                 snapshots,
+                SourceWindow::from_bounds(start, end, None, snapshots),
                 GaugeEntity::new(PG_STAT_ACTIVITY, identity),
             ) else {
                 return Ok(());

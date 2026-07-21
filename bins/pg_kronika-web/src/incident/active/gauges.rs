@@ -93,6 +93,7 @@ impl Lens for StaleStatisticsLens {
                 ThresholdKind::AtLeast,
                 pair.observed_at_us,
                 pair.samples,
+                pair.source_window,
                 GaugeEntity::new(PG_STAT_USER_TABLES, Arc::clone(&member.identity)),
             ) else {
                 continue;
@@ -183,6 +184,7 @@ impl Lens for ConnectionSaturationLens {
                 ThresholdKind::AtLeast,
                 pair.observed_at_us,
                 pair.samples,
+                pair.source_window,
                 GaugeEntity::new(PG_STAT_DATABASE, Arc::clone(&member.identity)),
             ) else {
                 continue;
@@ -273,6 +275,7 @@ impl Lens for MemoryReclaimLens {
                 ThresholdKind::Below,
                 pair.observed_at_us,
                 pair.samples,
+                pair.source_window,
                 GaugeEntity::new(OS_MEMINFO, Arc::clone(&member.identity)),
             ) else {
                 continue;
@@ -370,6 +373,7 @@ impl Lens for WritebackPressureLens {
                 ThresholdKind::AtLeast,
                 reading.observed_at_us,
                 reading.samples,
+                reading.source_window,
                 GaugeEntity::new(OS_MEMINFO, Arc::clone(&member.identity)),
             ) else {
                 continue;
