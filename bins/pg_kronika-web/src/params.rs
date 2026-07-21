@@ -1,7 +1,10 @@
-use axum::Json;
-use axum::http::StatusCode;
+//! Bounded query decoding and mapping of reader failures to API problems.
+
 use kronika_reader::{Cursor, QueryError};
-use serde_json::{Value, json};
+
+use crate::problem::{
+    ApiProblem, ExpectedValue, InvalidParameterLocation, LimitResource, QueryParameter, count_u64,
+};
 
 /// Rows returned when a request omits `limit`.
 pub(crate) const DEFAULT_LIMIT: usize = 1_000;
@@ -9,59 +12,149 @@ pub(crate) const DEFAULT_LIMIT: usize = 1_000;
 /// Hard ceiling on `limit`, applied even when a request asks for more.
 pub(crate) const MAX_LIMIT: usize = 10_000;
 
-/// A `400 Bad Request` with a `{ "error", "detail" }` JSON body.
-pub(crate) fn bad_request(detail: &str) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "error": "bad_request", "detail": detail })),
-    )
+/// Maximum raw query length admitted for decoding.
+pub(crate) const MAX_QUERY_BYTES: usize = 8_192;
+
+/// Maximum query pairs admitted before decoding.
+pub(crate) const MAX_QUERY_PARAMETERS: usize = 32;
+
+/// A validated query whose keys are known, allowed for the route, and unique.
+#[derive(Debug)]
+pub(crate) struct QueryParams {
+    values: [Option<String>; QueryParameter::COUNT],
 }
 
-/// Parse a required unsigned query parameter, or a `400` with a JSON body.
+impl QueryParams {
+    /// Decode and validate one raw query against the route allowlist.
+    pub(crate) fn parse(raw: Option<&str>, allowed: &[QueryParameter]) -> Result<Self, ApiProblem> {
+        let raw = raw.unwrap_or_default();
+        if raw.len() > MAX_QUERY_BYTES {
+            return Err(ApiProblem::query_limit_exceeded(
+                LimitResource::QueryBytes,
+                count_u64(MAX_QUERY_BYTES),
+                Some(count_u64(raw.len())),
+            ));
+        }
+        let pair_count = raw
+            .split('&')
+            .filter(|component| !component.is_empty())
+            .count();
+        if pair_count > MAX_QUERY_PARAMETERS {
+            return Err(ApiProblem::query_limit_exceeded(
+                LimitResource::QueryParameters,
+                count_u64(MAX_QUERY_PARAMETERS),
+                Some(count_u64(pair_count)),
+            ));
+        }
+        validate_query_encoding(raw)?;
+
+        let mut values: [Option<String>; QueryParameter::COUNT] = std::array::from_fn(|_| None);
+        for (name, value) in form_urlencoded::parse(raw.as_bytes()) {
+            let Some(parameter) = QueryParameter::from_query_name(&name) else {
+                return Err(ApiProblem::unknown_query_parameter(&name));
+            };
+            if !allowed.contains(&parameter) {
+                return Err(ApiProblem::unknown_query_parameter(&name));
+            }
+            let slot = &mut values[parameter.index()];
+            if slot.is_some() {
+                return Err(ApiProblem::duplicate_query_parameter(parameter));
+            }
+            *slot = Some(value.into_owned());
+        }
+        Ok(Self { values })
+    }
+
+    pub(crate) fn get(&self, parameter: QueryParameter) -> Option<&str> {
+        self.values[parameter.index()].as_deref()
+    }
+}
+
+fn validate_query_encoding(raw: &str) -> Result<(), ApiProblem> {
+    let invalid = || {
+        ApiProblem::invalid_query_parameter(
+            InvalidParameterLocation::Query,
+            ExpectedValue::UrlEncodedQuery,
+        )
+    };
+    let mut decoded = Vec::new();
+    for component in raw.split(['&', '=']) {
+        if !component.as_bytes().contains(&b'%') {
+            continue;
+        }
+        decoded.clear();
+        decoded.reserve(component.len().saturating_sub(decoded.capacity()));
+        let bytes = component.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at] != b'%' {
+                decoded.push(bytes[at]);
+                at += 1;
+                continue;
+            }
+            let high = bytes.get(at + 1).and_then(|byte| hex_value(*byte));
+            let low = bytes.get(at + 2).and_then(|byte| hex_value(*byte));
+            let (Some(high), Some(low)) = (high, low) else {
+                return Err(invalid());
+            };
+            decoded.push(high << 4 | low);
+            at += 3;
+        }
+        if std::str::from_utf8(&decoded).is_err() {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse a required unsigned query parameter.
 pub(crate) fn parse_u64(
-    params: &std::collections::HashMap<String, String>,
-    key: &str,
-) -> Result<u64, (StatusCode, Json<Value>)> {
+    params: &QueryParams,
+    parameter: QueryParameter,
+) -> Result<u64, ApiProblem> {
     params
-        .get(key)
-        .ok_or_else(|| bad_request(&format!("missing query parameter `{key}`")))?
+        .get(parameter)
+        .ok_or_else(|| ApiProblem::missing_query_parameter(parameter))?
         .parse()
-        .map_err(|_err| bad_request(&format!("`{key}` must be an unsigned integer")))
+        .map_err(|_error| ApiProblem::invalid_query_parameter(parameter, ExpectedValue::Uint64))
 }
 
-/// Parse a required signed query parameter, or a `400` with a JSON body.
+/// Parse a required signed query parameter.
 pub(crate) fn parse_i64(
-    params: &std::collections::HashMap<String, String>,
-    key: &str,
-) -> Result<i64, (StatusCode, Json<Value>)> {
+    params: &QueryParams,
+    parameter: QueryParameter,
+) -> Result<i64, ApiProblem> {
     params
-        .get(key)
-        .ok_or_else(|| bad_request(&format!("missing query parameter `{key}`")))?
+        .get(parameter)
+        .ok_or_else(|| ApiProblem::missing_query_parameter(parameter))?
         .parse()
-        .map_err(|_err| bad_request(&format!("`{key}` must be an integer")))
+        .map_err(|_error| ApiProblem::invalid_query_parameter(parameter, ExpectedValue::Int64))
 }
 
 /// Parse the optional `limit`: absent → [`DEFAULT_LIMIT`], present → clamped to
 /// [`MAX_LIMIT`], unparseable → `400`.
-pub(crate) fn parse_limit(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<usize, (StatusCode, Json<Value>)> {
+pub(crate) fn parse_limit(params: &QueryParams) -> Result<usize, ApiProblem> {
     parse_limit_default(params, DEFAULT_LIMIT)
 }
 
-/// Parse an optional duration parameter into microseconds: `250ms`, `90s`,
-/// `15m`, `2h`, or a bare number of seconds. Absent → `default_us`; zero,
-/// negative, or overflowing → `400`.
+/// Parse an optional duration parameter into microseconds.
 pub(crate) fn parse_duration_us(
-    params: &std::collections::HashMap<String, String>,
-    key: &str,
+    params: &QueryParams,
+    parameter: QueryParameter,
     default_us: i64,
-) -> Result<i64, (StatusCode, Json<Value>)> {
-    params.get(key).map_or(Ok(default_us), |raw| {
+) -> Result<i64, ApiProblem> {
+    params.get(parameter).map_or(Ok(default_us), |raw| {
         duration_us(raw).ok_or_else(|| {
-            bad_request(&format!(
-                "`{key}` must be a positive duration like `250ms`, `90s`, `15m`, or `2h`"
-            ))
+            ApiProblem::invalid_query_parameter(parameter, ExpectedValue::PositiveDuration)
         })
     })
 }
@@ -70,7 +163,6 @@ pub(crate) fn parse_duration_us(
 fn duration_us(raw: &str) -> Option<i64> {
     let suffixed =
         |suffix: &str, scale: i64| raw.strip_suffix(suffix).map(|digits| (digits, scale));
-    // `ms` before `s`: a millisecond literal also ends in `s`.
     let (digits, scale) = suffixed("ms", 1_000)
         .or_else(|| suffixed("s", 1_000_000))
         .or_else(|| suffixed("m", 60 * 1_000_000))
@@ -83,84 +175,102 @@ fn duration_us(raw: &str) -> Option<i64> {
     seconds.checked_mul(scale)
 }
 
-/// Parse an optional float parameter; absent → `default`. Non-finite and
-/// negative values are rejected: every caller's knob (a sigma threshold, a
-/// relative floor) is meaningless below zero.
+/// Parse an optional non-negative finite float parameter.
 pub(crate) fn parse_f64_non_negative(
-    params: &std::collections::HashMap<String, String>,
-    key: &str,
+    params: &QueryParams,
+    parameter: QueryParameter,
     default: f64,
-) -> Result<f64, (StatusCode, Json<Value>)> {
+) -> Result<f64, ApiProblem> {
     params
-        .get(key)
+        .get(parameter)
         .map_or(Ok(default), |raw| match raw.parse::<f64>() {
             Ok(value) if value.is_finite() && value >= 0.0 => Ok(value),
-            _ => Err(bad_request(&format!(
-                "`{key}` must be a non-negative finite number"
-            ))),
+            _ => Err(ApiProblem::invalid_query_parameter(
+                parameter,
+                ExpectedValue::NonNegativeFiniteNumber,
+            )),
         })
 }
 
-/// Parse the optional `limit` with a caller-chosen default, clamped to
-/// [`MAX_LIMIT`]; unparseable → `400`.
+/// Parse the optional `limit` with a caller-chosen default and hard ceiling.
 pub(crate) fn parse_limit_default(
-    params: &std::collections::HashMap<String, String>,
+    params: &QueryParams,
     default: usize,
-) -> Result<usize, (StatusCode, Json<Value>)> {
-    params.get("limit").map_or(Ok(default), |raw| {
-        raw.parse::<usize>()
-            .map(|limit| limit.min(MAX_LIMIT))
-            .map_err(|_err| bad_request("`limit` must be a non-negative integer"))
-    })
+) -> Result<usize, ApiProblem> {
+    params
+        .get(QueryParameter::Limit)
+        .map_or(Ok(default), |raw| {
+            raw.parse::<usize>()
+                .map(|limit| limit.min(MAX_LIMIT))
+                .map_err(|_error| {
+                    ApiProblem::invalid_query_parameter(
+                        QueryParameter::Limit,
+                        ExpectedValue::NonNegativeInteger,
+                    )
+                })
+        })
 }
 
-/// Parse the optional resume `cursor`: absent → `None`, present → decoded, or a
-/// `400` when it is malformed or belongs to another source.
-pub(crate) fn parse_cursor(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<Option<Cursor>, (StatusCode, Json<Value>)> {
-    params.get("cursor").map_or(Ok(None), |raw| {
+/// Parse an optional opaque resume cursor.
+pub(crate) fn parse_cursor(params: &QueryParams) -> Result<Option<Cursor>, ApiProblem> {
+    params.get(QueryParameter::Cursor).map_or(Ok(None), |raw| {
         Cursor::decode(raw)
             .map(Some)
-            .map_err(|err| query_error_response(&err))
+            .map_err(|_error| ApiProblem::invalid_cursor())
     })
 }
 
-/// Map a reader [`QueryError`] to an HTTP status and a `{ error, detail }` body.
-pub(crate) fn query_error_response(err: &QueryError) -> (StatusCode, Json<Value>) {
-    let (status, code, detail) = match err {
-        QueryError::UnknownSection(name) => (
-            StatusCode::NOT_FOUND,
-            "unknown_section",
-            format!("no section named `{name}`"),
-        ),
-        QueryError::BadCursor(message) => (StatusCode::BAD_REQUEST, "bad_cursor", message.clone()),
-        QueryError::Read(read) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "read_error",
-            read.to_string(),
-        ),
-        QueryError::ResultTooLarge { max_cells } => (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "result_too_large",
-            format!(
-                "query exceeds the {max_cells}-cell materialization limit; narrow the time range"
-            ),
-        ),
-        QueryError::MaterializedBytesTooLarge { max_bytes } => (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "result_too_large",
-            format!(
-                "query exceeds the {max_bytes}-byte materialization limit; narrow the time range"
-            ),
-        ),
-    };
-    (status, Json(json!({ "error": code, "detail": detail })))
+/// Map a reader failure without exposing paths, values, or error chains.
+pub(crate) fn query_error_response(error: &QueryError) -> ApiProblem {
+    match error {
+        QueryError::UnknownSection(name) => ApiProblem::unknown_section(name),
+        QueryError::BadCursor(_) => ApiProblem::invalid_cursor(),
+        QueryError::Read(read) => {
+            let problem = ApiProblem::store_read_failed();
+            tracing::error!(
+                event = "api_store_read_failed",
+                request_id = problem.request_id(),
+                error = %read,
+                "store query failed"
+            );
+            problem
+        }
+        QueryError::ResultTooLarge { max_cells } => {
+            ApiProblem::query_limit_exceeded(LimitResource::Cells, count_u64(*max_cells), None)
+        }
+        QueryError::MaterializedBytesTooLarge { max_bytes } => {
+            ApiProblem::query_limit_exceeded(LimitResource::Bytes, count_u64(*max_bytes), None)
+        }
+    }
+}
+
+/// Map a reader failure for a request that has no cursor parameter.
+pub(crate) fn query_error_response_without_cursor(error: &QueryError) -> ApiProblem {
+    if matches!(error, QueryError::BadCursor(_)) {
+        let problem = ApiProblem::internal_error();
+        tracing::error!(
+            event = "api_reader_cursor_invariant",
+            request_id = problem.request_id(),
+            "reader returned a cursor error for a cursor-free request"
+        );
+        return problem;
+    }
+    query_error_response(error)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_LIMIT, MAX_LIMIT, duration_us, parse_f64_non_negative, parse_limit};
+    use super::{
+        DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_BYTES, MAX_QUERY_PARAMETERS, QueryParams, duration_us,
+        parse_f64_non_negative, parse_limit, query_error_response,
+        query_error_response_without_cursor,
+    };
+    use crate::problem::{ProblemCode, QueryParameter};
+    use kronika_reader::QueryError;
+
+    fn params(raw: &str, allowed: &[QueryParameter]) -> QueryParams {
+        QueryParams::parse(Some(raw), allowed).expect("valid query")
+    }
 
     #[test]
     fn durations_parse_with_suffixes_and_reject_degenerate_values() {
@@ -186,23 +296,23 @@ mod tests {
 
     #[test]
     fn floats_default_when_absent_and_reject_non_finite_or_negative() {
-        let empty = std::collections::HashMap::new();
+        let empty = params("", &[QueryParameter::Threshold]);
         assert_eq!(
-            parse_f64_non_negative(&empty, "threshold", 3.5).ok(),
+            parse_f64_non_negative(&empty, QueryParameter::Threshold, 3.5).ok(),
             Some(3.5)
         );
 
-        let ok = std::collections::HashMap::from([("threshold".to_owned(), "2.0".to_owned())]);
+        let explicit = params("threshold=2.0", &[QueryParameter::Threshold]);
         assert_eq!(
-            parse_f64_non_negative(&ok, "threshold", 3.5).ok(),
+            parse_f64_non_negative(&explicit, QueryParameter::Threshold, 3.5).ok(),
             Some(2.0)
         );
 
         for bad in ["-1", "NaN", "inf", "abc"] {
-            let params =
-                std::collections::HashMap::from([("threshold".to_owned(), bad.to_owned())]);
+            let query = format!("threshold={bad}");
+            let params = params(&query, &[QueryParameter::Threshold]);
             assert!(
-                parse_f64_non_negative(&params, "threshold", 3.5).is_err(),
+                parse_f64_non_negative(&params, QueryParameter::Threshold, 3.5).is_err(),
                 "{bad:?} must be rejected"
             );
         }
@@ -210,31 +320,79 @@ mod tests {
 
     #[test]
     fn parse_limit_defaults_caps_and_rejects() {
-        let empty = std::collections::HashMap::new();
+        let empty = params("", &[QueryParameter::Limit]);
         assert_eq!(
             parse_limit(&empty).ok(),
             Some(DEFAULT_LIMIT),
             "an absent limit uses the default"
         );
 
-        let explicit = std::collections::HashMap::from([("limit".to_owned(), "50".to_owned())]);
+        let explicit = params("limit=50", &[QueryParameter::Limit]);
         assert_eq!(
             parse_limit(&explicit).ok(),
             Some(50),
             "an explicit limit is honored"
         );
 
-        let huge = std::collections::HashMap::from([("limit".to_owned(), "99999".to_owned())]);
+        let huge = params("limit=99999", &[QueryParameter::Limit]);
         assert_eq!(
             parse_limit(&huge).ok(),
             Some(MAX_LIMIT),
             "a limit above the ceiling is clamped"
         );
 
-        let bad = std::collections::HashMap::from([("limit".to_owned(), "-1".to_owned())]);
+        let bad = params("limit=-1", &[QueryParameter::Limit]);
         assert!(
             parse_limit(&bad).is_err(),
             "a non-numeric limit is rejected"
+        );
+    }
+
+    #[test]
+    fn raw_query_bounds_are_enforced_before_decoding() {
+        let oversized = "x".repeat(MAX_QUERY_BYTES + 1);
+        let byte_error = QueryParams::parse(Some(&oversized), &[]).expect_err("byte ceiling");
+        assert_eq!(byte_error.code(), ProblemCode::QueryLimitExceeded);
+
+        let too_many = std::iter::repeat_n("source=1", MAX_QUERY_PARAMETERS + 1)
+            .collect::<Vec<_>>()
+            .join("&");
+        let pair_error = QueryParams::parse(Some(&too_many), &[QueryParameter::Source])
+            .expect_err("pair ceiling");
+        assert_eq!(pair_error.code(), ProblemCode::QueryLimitExceeded);
+
+        let malformed_over_limit = std::iter::repeat_n("%FF", MAX_QUERY_PARAMETERS + 1)
+            .collect::<Vec<_>>()
+            .join("&");
+        let priority = QueryParams::parse(Some(&malformed_over_limit), &[])
+            .expect_err("pair admission precedes decoding");
+        assert_eq!(priority.code(), ProblemCode::QueryLimitExceeded);
+    }
+
+    #[test]
+    fn percent_triplets_and_decoded_utf8_are_strict() {
+        for malformed in ["%", "%0", "%GG", "%FF", "source=%C3", "source=%C3%28"] {
+            let error = QueryParams::parse(Some(malformed), &[QueryParameter::Source])
+                .expect_err("malformed encoding");
+            assert_eq!(error.code(), ProblemCode::InvalidQueryParameter);
+        }
+
+        let decoded = params("section=%D1%82", &[QueryParameter::Section]);
+        assert_eq!(decoded.get(QueryParameter::Section), Some("т"));
+        let ascii = params("source=%37", &[QueryParameter::Source]);
+        assert_eq!(ascii.get(QueryParameter::Source), Some("7"));
+    }
+
+    #[test]
+    fn cursor_errors_are_client_visible_only_on_cursor_routes() {
+        let error = QueryError::BadCursor("synthetic invariant probe".to_owned());
+        assert_eq!(
+            query_error_response(&error).code(),
+            ProblemCode::InvalidCursor
+        );
+        assert_eq!(
+            query_error_response_without_cursor(&error).code(),
+            ProblemCode::InternalError
         );
     }
 }

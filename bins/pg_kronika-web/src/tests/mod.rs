@@ -1,7 +1,8 @@
 use std::sync::OnceLock;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use axum::response::Response;
 use http_body_util::BodyExt;
 use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
@@ -24,6 +25,7 @@ mod anomalies;
 mod auth_static;
 mod incidents;
 mod probes_metrics;
+mod problems;
 mod sections;
 mod version_diff;
 
@@ -33,6 +35,21 @@ mod version_diff;
 /// it only runs once per test binary. All `app()` calls in tests share
 /// this handle.
 static TEST_RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
+
+#[derive(Debug)]
+struct CapturedResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: serde_json::Value,
+}
+
+impl CapturedResponse {
+    fn media_type(&self) -> Option<&str> {
+        self.headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+    }
+}
 
 fn test_metrics_handle() -> PrometheusHandle {
     TEST_RECORDER
@@ -52,9 +69,25 @@ fn test_metrics_handle() -> PrometheusHandle {
 /// Build an [`AppState`] over a temp directory holding one `build_part`
 /// segment, then answer one request against `app(state)` in-process.
 ///
-/// Returned to the caller are the response status and its body parsed as
-/// JSON, so later tasks reuse the same fixture-to-response path.
+/// Returned to the caller are the response status and its body parsed as JSON;
+/// callers that assert headers use [`fixture_captured`].
 async fn fixture_response(uri: &str) -> (tempfile::TempDir, StatusCode, serde_json::Value) {
+    let (dir, response) = fixture_captured(uri, &[]).await;
+    (dir, response.status, response.body)
+}
+
+async fn fixture_captured(
+    uri: &str,
+    request_headers: &[(&str, &str)],
+) -> (tempfile::TempDir, CapturedResponse) {
+    fixture_request_captured(Method::GET, uri, request_headers).await
+}
+
+async fn fixture_request_captured(
+    method: Method,
+    uri: &str,
+    request_headers: &[(&str, &str)],
+) -> (tempfile::TempDir, CapturedResponse) {
     let body = BgwriterCheckpointer::encode(&[]).expect("encode empty section");
     let bytes = build_part(
         &[SectionInput {
@@ -74,30 +107,15 @@ async fn fixture_response(uri: &str) -> (tempfile::TempDir, StatusCode, serde_js
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
     let state = AppState::new(snapshot);
 
+    let mut request = Request::builder().method(method).uri(uri);
+    for &(name, value) in request_headers {
+        request = request.header(name, value);
+    }
     let response = app(state, None, test_metrics_handle())
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .body(Body::empty())
-                .expect("build request"),
-        )
+        .oneshot(request.body(Body::empty()).expect("build request"))
         .await
         .expect("route request");
-    let status = response.status();
-    let json_body = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("application/json"));
-    assert!(json_body, "response must carry an application/json body");
-    let collected = response
-        .into_body()
-        .collect()
-        .await
-        .expect("read body")
-        .to_bytes();
-    let value: serde_json::Value = serde_json::from_slice(&collected).expect("body is valid JSON");
-    (dir, status, value)
+    (dir, capture_json(response).await)
 }
 
 /// Open a snapshot over a caller-built `dir` and answer one request.
@@ -105,26 +123,92 @@ async fn fixture_response(uri: &str) -> (tempfile::TempDir, StatusCode, serde_js
 /// Unlike [`fixture_response`], the test writes its own segments into `dir`
 /// first; this returns the response status and its JSON body.
 async fn serve(dir: &std::path::Path, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = serve_captured(dir, uri, &[]).await;
+    (response.status, response.body)
+}
+
+async fn serve_captured(
+    dir: &std::path::Path,
+    uri: &str,
+    request_headers: &[(&str, &str)],
+) -> CapturedResponse {
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
     let state = AppState::new(snapshot);
+    let mut request = Request::builder().uri(uri);
+    for &(name, value) in request_headers {
+        request = request.header(name, value);
+    }
     let response = app(state, None, test_metrics_handle())
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .body(Body::empty())
-                .expect("build request"),
-        )
+        .oneshot(request.body(Body::empty()).expect("build request"))
         .await
         .expect("route request");
+    capture_json(response).await
+}
+
+async fn capture_json(response: Response) -> CapturedResponse {
     let status = response.status();
+    let headers = response.headers().clone();
+    let media_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    assert!(
+        matches!(
+            media_type,
+            Some(value)
+                if value.starts_with("application/json")
+                    || value.starts_with("application/problem+json")
+        ),
+        "response must carry a JSON media type, got {media_type:?}"
+    );
     let bytes = response
         .into_body()
         .collect()
         .await
         .expect("read body")
         .to_bytes();
-    let value = serde_json::from_slice(&bytes).expect("body is valid JSON");
-    (status, value)
+    let body = serde_json::from_slice(&bytes).expect("body is valid JSON");
+    CapturedResponse {
+        status,
+        headers,
+        body,
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "callers construct one-use JSON params fixtures inline"
+)]
+fn assert_problem(
+    body: &serde_json::Value,
+    status: StatusCode,
+    code: &str,
+    params: serde_json::Value,
+) {
+    let object = body.as_object().expect("problem body is an object");
+    let mut keys: Vec<_> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["code", "instance", "params", "status", "type"],
+        "problem has exactly the normative fields"
+    );
+    assert_eq!(body["status"], u64::from(status.as_u16()));
+    assert_eq!(body["code"], code);
+    assert_eq!(body["params"], params);
+    assert_eq!(
+        body["type"],
+        format!("https://pgkronika.dev/problems/{}", code.replace('_', "-"))
+    );
+    let instance = body["instance"].as_str().expect("problem instance string");
+    let request_id = instance
+        .strip_prefix("https://pgkronika.dev/problems/occurrences/")
+        .expect("problem instance prefix");
+    assert_eq!(request_id.len(), 32);
+    assert!(
+        request_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "request id is lowercase hexadecimal"
+    );
+    assert_eq!(request_id, request_id.to_ascii_lowercase());
 }
 
 /// Write an empty `pg_stat_bgwriter + pg_stat_checkpointer` segment.

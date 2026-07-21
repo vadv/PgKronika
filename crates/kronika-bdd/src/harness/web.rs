@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{HeaderMap, Request, header};
 use http_body_util::BodyExt as _;
 use kronika_reader::LocalDirSnapshot;
 use kronika_registry::Cell;
@@ -36,21 +36,35 @@ fn bdd_metrics_handle() -> PrometheusHandle {
         .clone()
 }
 
-/// One in-process request against a fresh router over `dir`; returns the HTTP
-/// status and the parsed JSON body.
-async fn request(dir: &Path, uri: &str) -> Result<(u16, Value)> {
+/// Captured in-process response, including the transport contract.
+struct WebResponse {
+    status: u16,
+    headers: HeaderMap,
+    body: Value,
+}
+
+impl WebResponse {
+    fn media_type(&self) -> Option<&str> {
+        self.headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+    }
+}
+
+/// One in-process request against a fresh router over `dir`.
+async fn request(dir: &Path, uri: &str, request_headers: &[(&str, &str)]) -> Result<WebResponse> {
     let snapshot = LocalDirSnapshot::open(dir).context("open the store snapshot")?;
     let router = app(AppState::new(snapshot), None, bdd_metrics_handle());
+    let mut request = Request::builder().uri(uri);
+    for &(name, value) in request_headers {
+        request = request.header(name, value);
+    }
     let response = router
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .body(Body::empty())
-                .context("build the request")?,
-        )
+        .oneshot(request.body(Body::empty()).context("build the request")?)
         .await
         .context("route the request")?;
     let status = response.status().as_u16();
+    let headers = response.headers().clone();
     let bytes = response
         .into_body()
         .collect()
@@ -58,16 +72,24 @@ async fn request(dir: &Path, uri: &str) -> Result<(u16, Value)> {
         .context("read the response body")?
         .to_bytes();
     let body = serde_json::from_slice(&bytes).context("parse the JSON body")?;
-    Ok((status, body))
+    Ok(WebResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 /// The single source id the store holds, read through `/v1/sources`.
 ///
 /// A BDD scenario collects one instance, so the store carries exactly one source.
 pub(crate) async fn only_source(dir: &Path) -> Result<u64> {
-    let (status, body) = request(dir, "/v1/sources").await?;
-    anyhow::ensure!(status == 200, "/v1/sources returned status {status}");
-    let sources = body["sources"]
+    let response = request(dir, "/v1/sources", &[]).await?;
+    anyhow::ensure!(
+        response.status == 200,
+        "/v1/sources returned status {}",
+        response.status
+    );
+    let sources = response.body["sources"]
         .as_array()
         .context("`sources` is not an array")?;
     match sources.as_slice() {
@@ -80,9 +102,13 @@ pub(crate) async fn only_source(dir: &Path) -> Result<u64> {
 
 /// The single source's id and time span, read through `/v1/sources`.
 pub(crate) async fn source_span(dir: &Path) -> Result<(u64, i64, i64)> {
-    let (status, body) = request(dir, "/v1/sources").await?;
-    anyhow::ensure!(status == 200, "/v1/sources returned status {status}");
-    let sources = body["sources"]
+    let response = request(dir, "/v1/sources", &[]).await?;
+    anyhow::ensure!(
+        response.status == 200,
+        "/v1/sources returned status {}",
+        response.status
+    );
+    let sources = response.body["sources"]
         .as_array()
         .context("`sources` is not an array")?;
     let [source] = sources.as_slice() else {
@@ -104,22 +130,26 @@ pub(crate) async fn section_diff(dir: &Path, name: &str, source: u64) -> Result<
         i64::MIN,
         i64::MAX,
     );
-    let (status, body) = request(dir, &uri).await?;
+    let response = request(dir, &uri, &[]).await?;
     anyhow::ensure!(
-        status == 200,
-        "/v1/section/{name}/diff returned status {status}: {body}"
+        response.status == 200,
+        "/v1/section/{name}/diff returned status {}: {}",
+        response.status,
+        response.body
     );
-    Ok(body)
+    Ok(response.body)
 }
 
 /// The `/v1/anomalies` response over the store in `dir`.
 pub(crate) async fn anomalies(dir: &Path, query: &str) -> Result<Value> {
-    let (status, body) = request(dir, &format!("/v1/anomalies?{query}")).await?;
+    let response = request(dir, &format!("/v1/anomalies?{query}"), &[]).await?;
     anyhow::ensure!(
-        status == 200,
-        "/v1/anomalies returned status {status}: {body}"
+        response.status == 200,
+        "/v1/anomalies returned status {}: {}",
+        response.status,
+        response.body
     );
-    Ok(body)
+    Ok(response.body)
 }
 
 /// Fetch one section's page for `source` over the widest possible window.
@@ -129,12 +159,108 @@ pub(crate) async fn section_page(dir: &Path, name: &str, source: u64) -> Result<
         i64::MIN,
         i64::MAX,
     );
-    let (status, body) = request(dir, &uri).await?;
+    let response = request(dir, &uri, &[]).await?;
     anyhow::ensure!(
-        status == 200,
-        "/v1/section/{name} returned status {status}: {body}"
+        response.status == 200,
+        "/v1/section/{name} returned status {}: {}",
+        response.status,
+        response.body
     );
-    Ok(body)
+    Ok(response.body)
+}
+
+/// Verify that language preferences cannot change a Problem representation.
+pub(crate) async fn assert_locale_neutral_problem(dir: &Path) -> Result<()> {
+    const URI: &str = "/v1/segments?source=not-a-number&from=0&to=1";
+    let english = request(dir, URI, &[("accept-language", "en")]).await?;
+    let russian = request(dir, URI, &[("accept-language", "ru-RU, ru;q=0.9")]).await?;
+
+    for response in [&english, &russian] {
+        anyhow::ensure!(
+            response.status == 400,
+            "problem status was {}",
+            response.status
+        );
+        anyhow::ensure!(
+            response.media_type() == Some("application/problem+json"),
+            "problem media type was {:?}",
+            response.media_type()
+        );
+        anyhow::ensure!(
+            response
+                .headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                == Some("no-store"),
+            "problem response did not disable caching"
+        );
+        anyhow::ensure!(response.headers.get(header::CONTENT_LANGUAGE).is_none());
+        anyhow::ensure!(response.headers.get(header::VARY).is_none());
+
+        let object = response
+            .body
+            .as_object()
+            .context("problem body is not an object")?;
+        let mut keys: Vec<_> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        anyhow::ensure!(
+            keys == ["code", "instance", "params", "status", "type"],
+            "unexpected problem fields: {keys:?}"
+        );
+        anyhow::ensure!(response.body["status"] == 400);
+        anyhow::ensure!(response.body["code"] == "invalid_query_parameter");
+        anyhow::ensure!(
+            response.body["params"]
+                == serde_json::json!({ "parameter": "source", "expected": "uint64" })
+        );
+        let instance = response.body["instance"]
+            .as_str()
+            .context("problem instance is not a string")?;
+        let request_id = response
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .context("problem response has no request id")?;
+        anyhow::ensure!(
+            instance == format!("https://pgkronika.dev/problems/occurrences/{request_id}")
+        );
+        anyhow::ensure!(
+            request_id.len() == 32
+                && request_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "request id is not 32 lowercase hex characters"
+        );
+    }
+
+    let mut english_body = english.body;
+    let mut russian_body = russian.body;
+    english_body
+        .as_object_mut()
+        .context("English problem is not an object")?
+        .remove("instance");
+    russian_body
+        .as_object_mut()
+        .context("Russian problem is not an object")?
+        .remove("instance");
+    anyhow::ensure!(
+        english_body == russian_body,
+        "Accept-Language changed the problem"
+    );
+
+    let oversized_uri = format!("/v1/version?{}", "x".repeat(8_193));
+    let oversized = request(dir, &oversized_uri, &[]).await?;
+    anyhow::ensure!(oversized.status == 413);
+    anyhow::ensure!(oversized.body["code"] == "query_limit_exceeded");
+    anyhow::ensure!(
+        oversized.body["params"]
+            == serde_json::json!({
+                "resource": "query_bytes",
+                "limit": 8_192,
+                "observed": 8_193,
+            })
+    );
+    Ok(())
 }
 
 /// Assert the page holds exactly one row whose named columns match `expected`.

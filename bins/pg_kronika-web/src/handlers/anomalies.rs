@@ -3,8 +3,7 @@
 use std::collections::BTreeMap;
 
 use axum::Json;
-use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{RawQuery, State};
 use axum::response::{IntoResponse, Response};
 use kronika_reader::{
     LocalDirSnapshot, LogicalSection, QueryError, diff_section, gauge_section, logical_section,
@@ -16,9 +15,11 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::anomaly::{EpisodeHit, MAX_SCORE_WORK, ScanCounts, ScanParams, rank, scan_section};
 use crate::params::{
-    bad_request, parse_duration_us, parse_f64_non_negative, parse_i64, parse_limit_default,
-    parse_u64, query_error_response,
+    QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64, parse_limit_default,
+    parse_u64, query_error_response_without_cursor,
 };
+use crate::problem::{ApiProblem, LimitResource, QueryConstraint, QueryParameter};
+use crate::reason::{ApiReason, MaterializationResource};
 use crate::serialize::episode_to_json;
 
 use super::v1::{DIFF_MAX_ROWS, Gates};
@@ -36,10 +37,19 @@ const LIMIT_DEFAULT: usize = 50;
 /// cannot allocate unbounded score profiles.
 const MAX_POSITIONS: i64 = 10_000;
 
-const RETRY_AFTER_SECONDS: &str = "1";
+const ANOMALY_PARAMS: &[QueryParameter] = &[
+    QueryParameter::Source,
+    QueryParameter::From,
+    QueryParameter::To,
+    QueryParameter::Window,
+    QueryParameter::Step,
+    QueryParameter::Threshold,
+    QueryParameter::EpsRel,
+    QueryParameter::Limit,
+    QueryParameter::Section,
+];
 
-/// The error half of a handler result: an HTTP status and a JSON body.
-type ErrorResponse = (StatusCode, Json<Value>);
+type ErrorResponse = ApiProblem;
 
 struct SectionScan {
     identity: Vec<&'static str>,
@@ -91,30 +101,38 @@ fn counts_to_json(counts: &ScanCounts) -> Value {
     })
 }
 
-fn parse_scan_params(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<(ScanParams, usize), ErrorResponse> {
-    let from = parse_i64(params, "from")?;
-    let to = parse_i64(params, "to")?;
+fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorResponse> {
+    let from = parse_i64(params, QueryParameter::From)?;
+    let to = parse_i64(params, QueryParameter::To)?;
     if from >= to {
-        return Err(bad_request("`from` must be before `to`"));
+        return Err(ApiProblem::invalid_query_constraint(
+            QueryConstraint::FromBeforeTo,
+        ));
     }
-    let window = parse_duration_us(params, "window", WINDOW_DEFAULT_US)?;
-    let step = parse_duration_us(params, "step", (window / 4).max(1))?;
-    let threshold = parse_f64_non_negative(params, "threshold", THRESHOLD_DEFAULT)?;
-    let eps_rel = parse_f64_non_negative(params, "eps_rel", EPS_REL_DEFAULT)?;
+    let window = parse_duration_us(params, QueryParameter::Window, WINDOW_DEFAULT_US)?;
+    let step = parse_duration_us(params, QueryParameter::Step, (window / 4).max(1))?;
+    let threshold = parse_f64_non_negative(params, QueryParameter::Threshold, THRESHOLD_DEFAULT)?;
+    let eps_rel = parse_f64_non_negative(params, QueryParameter::EpsRel, EPS_REL_DEFAULT)?;
     let limit = parse_limit_default(params, LIMIT_DEFAULT)?;
     if from.checked_add(window).is_none_or(|first| first > to) {
-        return Err(bad_request("`window` must fit inside [from, to]"));
+        return Err(ApiProblem::invalid_query_constraint(
+            QueryConstraint::WindowWithinInterval,
+        ));
     }
     let positions = to
         .checked_sub(from)
         .and_then(|span| span.checked_sub(window))
         .map(|scannable| scannable / step + 2);
-    if positions.is_none_or(|count| count > MAX_POSITIONS) {
-        return Err(bad_request(
-            "the period and `step` produce too many window positions; \
-             widen `step` or narrow [from, to]",
+    let Some(positions) = positions else {
+        return Err(ApiProblem::invalid_query_constraint(
+            QueryConstraint::FiniteScan,
+        ));
+    };
+    if positions > MAX_POSITIONS {
+        return Err(ApiProblem::query_limit_exceeded(
+            LimitResource::WindowPositions,
+            u64::try_from(MAX_POSITIONS).unwrap_or(u64::MAX),
+            u64::try_from(positions).ok(),
         ));
     }
     Ok((
@@ -134,24 +152,17 @@ fn parse_scan_params(
 ///
 /// Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `limit`,
 /// and `section`. Oversized sections are reported in `skipped`.
-pub(crate) async fn anomalies(
-    State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Response {
+pub(crate) async fn anomalies(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let params = match QueryParams::parse(raw.as_deref(), ANOMALY_PARAMS) {
+        Ok(params) => params,
+        Err(problem) => return problem.into_response(),
+    };
     let request = match validate_request(&params) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
     let Ok(permit) = state.try_acquire_analytic() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, RETRY_AFTER_SECONDS)],
-            Json(json!({
-                "error": "analytic_capacity_unavailable",
-                "detail": "the analytic worker is busy; retry shortly",
-            })),
-        )
-            .into_response();
+        return ApiProblem::analytic_capacity_unavailable().into_response();
     };
 
     match tokio::task::spawn_blocking(move || {
@@ -162,14 +173,16 @@ pub(crate) async fn anomalies(
     {
         Ok(Ok(body)) => body.into_response(),
         Ok(Err(error)) => error.into_response(),
-        Err(_join) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "analytic_worker_failed",
-                "detail": "the analytic worker failed",
-            })),
-        )
-            .into_response(),
+        Err(join) => {
+            let problem = ApiProblem::internal_error();
+            tracing::error!(
+                event = "api_analytic_worker_failed",
+                request_id = problem.request_id(),
+                error = ?join,
+                "anomaly worker failed"
+            );
+            problem.into_response()
+        }
     }
 }
 
@@ -180,15 +193,12 @@ struct AnomalyRequest {
     names: Vec<&'static str>,
 }
 
-fn validate_request(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<AnomalyRequest, ErrorResponse> {
-    let source = parse_u64(params, "source")?;
+fn validate_request(params: &QueryParams) -> Result<AnomalyRequest, ErrorResponse> {
+    let source = parse_u64(params, QueryParameter::Source)?;
     let (scan, limit) = parse_scan_params(params)?;
-    let names = match params.get("section") {
+    let names = match params.get(QueryParameter::Section) {
         Some(name) => {
-            let logical = logical_section(name)
-                .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.clone())))?;
+            let logical = logical_section(name).ok_or_else(|| ApiProblem::unknown_section(name))?;
             vec![logical.name]
         }
         None => scannable_sections(),
@@ -284,7 +294,7 @@ fn load_gates(
     let mut pages = BTreeMap::new();
     for name in Gates::sections(logicals) {
         let page = query_section(snap, name, source, from, to, DIFF_MAX_ROWS, None)
-            .map_err(|err| query_error_response(&err))?;
+            .map_err(|err| query_error_response_without_cursor(&err))?;
         pages.insert(name.to_owned(), page);
     }
     Ok(Gates::from_pages(logicals, &pages))
@@ -298,28 +308,29 @@ fn scan_one_section(
     remaining_work: usize,
     hit_limit: usize,
     gates: &Gates,
-) -> Result<Result<SectionScan, String>, ErrorResponse> {
+) -> Result<Result<SectionScan, ApiReason>, ErrorResponse> {
     let page = match query_section(snap, name, source, scan.from, scan.to, DIFF_MAX_ROWS, None) {
         Ok(page) => page,
         Err(QueryError::ResultTooLarge { max_cells }) => {
-            return Ok(Err(format!(
-                "the period exceeds the {max_cells}-cell materialization limit; narrow it"
+            return Ok(Err(ApiReason::materialization_limit(
+                MaterializationResource::Cells,
+                max_cells,
             )));
         }
         Err(QueryError::MaterializedBytesTooLarge { max_bytes }) => {
-            return Ok(Err(format!(
-                "the period exceeds the {max_bytes}-byte materialization limit; narrow it"
+            return Ok(Err(ApiReason::materialization_limit(
+                MaterializationResource::Bytes,
+                max_bytes,
             )));
         }
-        Err(err) => return Err(query_error_response(&err)),
+        Err(err) => return Err(query_error_response_without_cursor(&err)),
     };
     if page.next_cursor.is_some() {
-        return Ok(Err(
-            "the period has too many rows to scan in one pass; narrow it".to_owned(),
-        ));
+        return Ok(Err(ApiReason::incomplete_page()));
     }
-    let logical = logical_section(name)
-        .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.to_owned())))?;
+    let logical = logical_section(name).ok_or_else(|| {
+        query_error_response_without_cursor(&QueryError::UnknownSection(name.to_owned()))
+    })?;
     let identity = logical.diff_key();
     let (cumulative, gauges) = scorable_columns(&logical);
     let mut diffs = diff_section(&identity, &cumulative, &page.rows, &page.gaps);
@@ -329,9 +340,9 @@ fn scan_one_section(
         match scan_section(&diffs, &gauge_series, scan, remaining_work, hit_limit) {
             Ok(scanned) => scanned,
             Err(limit) => {
-                return Ok(Err(format!(
-                    "scoring requires {} point-position pairs; {} remain in the request budget",
-                    limit.required, limit.available
+                return Ok(Err(ApiReason::scoring_work_budget(
+                    limit.required,
+                    limit.available,
                 )));
             }
         };

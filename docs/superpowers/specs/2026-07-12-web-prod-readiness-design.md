@@ -38,13 +38,17 @@
 значение останавливает запуск, но не выводится в ошибку или лог.
 
 Ожидаемый заголовок формируется при старте и сравнивается константно по времени.
-Промах возвращает `401` и `WWW-Authenticate: Basic`.
+Промах возвращает RFC 9457 `unauthorized` с media type
+`application/problem+json` и `WWW-Authenticate: Basic realm="pg_kronika-web"`.
 
 ## Статика и маршрутизация
 
 Ассеты из `bins/pg_kronika-web/static/` встроены в бинарник. Неизвестный UI-путь
-получает `index.html`; неизвестный `/v1/*` получает JSON `404`. `index.html`
+получает `index.html`; неизвестный `/v1/*` получает RFC 9457
+`route_not_found` с media type `application/problem+json`. `index.html`
 отдаётся с `no-cache`, хэшированные ассеты допускают длительное кэширование.
+Полный pre-release machine contract зафиксирован в
+`docs/superpowers/specs/2026-07-21-i18n-machine-api-contract.md`.
 
 ## Конфигурация и запуск
 

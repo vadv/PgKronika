@@ -38,7 +38,7 @@ pub(crate) use events::{
 };
 pub(crate) use evidence::{
     CounterEvidence, Evidence, Finding, GaugeEvidence, GaugeMeasurement, SampledLockEdge,
-    SourceWindow,
+    SourceWindow, SourceWindowGapReason,
 };
 #[cfg(test)]
 pub(crate) use evidence::{
@@ -55,6 +55,4 @@ pub(crate) use lens::Lens;
 pub(crate) use lenses::dormant_catalog;
 pub(crate) use lenses::{DormantLens, core_catalog};
 #[cfg(test)]
-pub(crate) use lenses::{
-    MAX_CATALOG_TEXT_BYTES, MAX_CATALOG_TOKEN_BYTES, MAX_DORMANT_LENSES, MAX_MISSING_PER_LENS,
-};
+pub(crate) use lenses::{MAX_CATALOG_TOKEN_BYTES, MAX_DORMANT_LENSES, MAX_MISSING_PER_LENS};

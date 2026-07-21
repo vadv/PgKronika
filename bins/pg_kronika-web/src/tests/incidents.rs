@@ -740,6 +740,13 @@ async fn incident_read_failure_is_sanitized() {
         .await
         .expect("route request");
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/problem+json")
+    );
     let bytes = response
         .into_body()
         .collect()
@@ -747,7 +754,12 @@ async fn incident_read_failure_is_sanitized() {
         .expect("read body")
         .to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON error");
-    assert_eq!(body["error"], "store_read_failed");
+    assert_problem(
+        &body,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "store_read_failed",
+        serde_json::json!({}),
+    );
     let rendered = String::from_utf8_lossy(&bytes);
     assert!(!rendered.contains("0.pgm"));
     assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
