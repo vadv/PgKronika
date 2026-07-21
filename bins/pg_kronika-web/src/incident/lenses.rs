@@ -278,7 +278,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         domain: Domain::Pg,
         title: "Граф ожидания блокировок",
         detects: "Кто блокировал ожидающего в момент снимка (`blocked_by` из `pg_locks`).",
-        confidence: ConfidenceCap::High,
+        confidence: ConfidenceCap::Medium,
         missing: &[Missing::BlockedByEdges, Missing::LockSnapshotCoverage],
     },
     DormantLens {
@@ -891,6 +891,7 @@ mod tests {
             requirements,
             ["sampled_blocked_by_edges", "lock_snapshot_coverage"]
         );
+        assert_eq!(lock.confidence(), ConfidenceCap::Medium);
     }
 
     #[test]

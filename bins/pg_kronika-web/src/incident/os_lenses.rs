@@ -11,7 +11,7 @@ use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
     ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, Role, ThresholdKind,
+    GaugeUnit, GaugeValueInput, Role, ThresholdKind,
 };
 use super::lens::Lens;
 use super::model::IdentityValue;
@@ -52,15 +52,16 @@ impl HostCpuLens {
         sink.charge_points(window.inspected_points())?;
         if let Some(reading) = window.max()
             && (0.0..=100.0).contains(&reading.value)
-            && let Some(value) = GaugeEvidence::value(
-                reading.value / 100.0,
-                GaugeUnit::Ratio,
-                0.0,
-                ThresholdKind::AtLeast,
-                reading.observed_at_us,
-                reading.samples,
-                GaugeEntity::new(OS_PSI, Arc::from(identity)),
-            )
+            && let Some(value) = GaugeEvidence::value(GaugeValueInput {
+                operand: "some_avg10_percent_as_ratio",
+                value: reading.value / 100.0,
+                unit: GaugeUnit::Ratio,
+                threshold: 0.0,
+                threshold_kind: ThresholdKind::AtLeast,
+                observed_at_us: reading.observed_at_us,
+                samples: reading.samples,
+                entity: GaugeEntity::new(OS_PSI, Arc::from(identity)),
+            })
         {
             evidence.push(value);
         }
@@ -147,7 +148,13 @@ impl Lens for HostCpuLens {
         let entity = || GaugeEntity::new(OS_CPU, Arc::clone(&entity_identity));
         let evidence = [
             GaugeEvidence::ratio(
-                GaugeRatio::new(busy, total, GaugeUnit::Count),
+                GaugeRatio::new(
+                    "busy_non_iowait_ticks",
+                    busy,
+                    "total_non_guest_ticks",
+                    total,
+                    GaugeUnit::Count,
+                ),
                 Self::BUSY_FLOOR,
                 ThresholdKind::AtLeast,
                 sums.last_end_us,
@@ -155,7 +162,13 @@ impl Lens for HostCpuLens {
                 entity(),
             ),
             GaugeEvidence::ratio(
-                GaugeRatio::new(steal, total, GaugeUnit::Count),
+                GaugeRatio::new(
+                    "steal_ticks",
+                    steal,
+                    "total_non_guest_ticks",
+                    total,
+                    GaugeUnit::Count,
+                ),
                 Self::STEAL_FLOOR,
                 ThresholdKind::AtLeast,
                 sums.last_end_us,
@@ -163,7 +176,13 @@ impl Lens for HostCpuLens {
                 entity(),
             ),
             GaugeEvidence::ratio(
-                GaugeRatio::new(iowait, total, GaugeUnit::Count),
+                GaugeRatio::new(
+                    "iowait_ticks",
+                    iowait,
+                    "total_non_guest_ticks",
+                    total,
+                    GaugeUnit::Count,
+                ),
                 0.0,
                 ThresholdKind::AtLeast,
                 sums.last_end_us,
@@ -184,7 +203,6 @@ impl Lens for HostCpuLens {
                 .into_iter()
                 .map(Evidence::GaugeObservation)
                 .collect(),
-            None,
         ))?;
         Ok(())
     }
@@ -279,6 +297,53 @@ impl BlockDeviceLens {
         }
         Ok(best)
     }
+
+    fn derived_evidence(
+        sums: AlignedSums,
+        operations: f64,
+        elapsed_ms: f64,
+        entity: &GaugeEntity,
+    ) -> Vec<Evidence> {
+        [
+            GaugeEvidence::ratio(
+                GaugeRatio::with_units(
+                    "read_time_ms_plus_write_time_ms",
+                    sums.sums[1] + sums.sums[3],
+                    GaugeUnit::Milliseconds,
+                    "reads_plus_writes",
+                    operations,
+                    GaugeUnit::Count,
+                    GaugeUnit::MillisecondsPerOperation,
+                ),
+                Self::MS_PER_OP_FLOOR,
+                ThresholdKind::AtLeast,
+                sums.last_end_us,
+                sums.intervals,
+                entity.clone(),
+            ),
+            // weighted_time / wall time is average in-flight I/O, not utilization.
+            GaugeEvidence::ratio(
+                GaugeRatio::with_units(
+                    "io_weighted_time_ms",
+                    sums.sums[4],
+                    GaugeUnit::Milliseconds,
+                    "summed_interval_duration_ms",
+                    elapsed_ms,
+                    GaugeUnit::Milliseconds,
+                    GaugeUnit::Count,
+                ),
+                Self::AVG_IN_FLIGHT_FLOOR,
+                ThresholdKind::AtLeast,
+                sums.last_end_us,
+                sums.intervals,
+                entity.clone(),
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .map(Evidence::GaugeObservation)
+        .collect()
+    }
 }
 
 impl Lens for BlockDeviceLens {
@@ -347,33 +412,8 @@ impl Lens for BlockDeviceLens {
             IdentityValue::I64(major),
             IdentityValue::I64(minor),
         ]);
-        let entity = || GaugeEntity::new(OS_DISKSTATS, Arc::clone(&public_identity));
-        let mut evidence = Vec::new();
-        if let Some(value) = GaugeEvidence::ratio(
-            GaugeRatio::new(
-                sums.sums[1] + sums.sums[3],
-                operations,
-                GaugeUnit::Milliseconds,
-            ),
-            Self::MS_PER_OP_FLOOR,
-            ThresholdKind::AtLeast,
-            sums.last_end_us,
-            sums.intervals,
-            entity(),
-        ) {
-            evidence.push(Evidence::GaugeObservation(value));
-        }
-        // weighted_time / wall time is average in-flight I/O, not utilization.
-        if let Some(value) = GaugeEvidence::ratio(
-            GaugeRatio::new(sums.sums[4], elapsed_ms, GaugeUnit::Milliseconds),
-            Self::AVG_IN_FLIGHT_FLOOR,
-            ThresholdKind::AtLeast,
-            sums.last_end_us,
-            sums.intervals,
-            entity(),
-        ) {
-            evidence.push(Evidence::GaugeObservation(value));
-        }
+        let entity = GaugeEntity::new(OS_DISKSTATS, public_identity);
+        let mut evidence = Self::derived_evidence(sums, operations, elapsed_ms, &entity);
         if let Some(window) = typed.gauge_window(
             OS_DISKSTATS,
             "io_in_progress",
@@ -383,15 +423,16 @@ impl Lens for BlockDeviceLens {
         ) {
             sink.charge_points(window.inspected_points())?;
             if let Some(reading) = window.max()
-                && let Some(value) = GaugeEvidence::value(
-                    reading.value,
-                    GaugeUnit::Count,
-                    0.0,
-                    ThresholdKind::AtLeast,
-                    reading.observed_at_us,
-                    reading.samples,
-                    entity(),
-                )
+                && let Some(value) = GaugeEvidence::value(GaugeValueInput {
+                    operand: "io_in_progress",
+                    value: reading.value,
+                    unit: GaugeUnit::Count,
+                    threshold: 0.0,
+                    threshold_kind: ThresholdKind::AtLeast,
+                    observed_at_us: reading.observed_at_us,
+                    samples: reading.samples,
+                    entity,
+                })
             {
                 evidence.push(Evidence::GaugeObservation(value));
             }
@@ -403,7 +444,6 @@ impl Lens for BlockDeviceLens {
             Role::Coincident,
             FindingScope::from_episode(member),
             evidence,
-            None,
         ))?;
         Ok(())
     }
@@ -622,15 +662,16 @@ impl Lens for ProcessIoWhoLens {
                 public_identity.push(IdentityValue::U64(major));
                 public_identity.push(IdentityValue::U64(minor));
             }
-            if let Some(row) = GaugeEvidence::value(
-                candidate.bytes,
-                GaugeUnit::Bytes,
-                1.0,
-                ThresholdKind::AtLeast,
-                candidate.observed_at_us,
-                candidate.intervals,
-                GaugeEntity::new(OS_PROCESS, Arc::from(public_identity)),
-            ) {
+            if let Some(row) = GaugeEvidence::value(GaugeValueInput {
+                operand: "read_bytes_plus_net_write_bytes",
+                value: candidate.bytes,
+                unit: GaugeUnit::Bytes,
+                threshold: 1.0,
+                threshold_kind: ThresholdKind::AtLeast,
+                observed_at_us: candidate.observed_at_us,
+                samples: candidate.intervals,
+                entity: GaugeEntity::new(OS_PROCESS, Arc::from(public_identity)),
+            }) {
                 evidence.push(Evidence::GaugeObservation(row));
             }
         }
@@ -641,7 +682,6 @@ impl Lens for ProcessIoWhoLens {
             Role::Coincident,
             FindingScope::from_episode(member),
             evidence,
-            None,
         ))?;
         Ok(())
     }
@@ -656,7 +696,7 @@ mod tests {
 
     fn point(value: f64) -> DiffPoint {
         DiffPoint::Value {
-            delta: Scalar::Int(0),
+            delta: Scalar::Float(value),
             rate: value,
             dt_micros: 1_000_000,
         }
@@ -793,6 +833,12 @@ mod tests {
             first.entity().identity()[0],
             IdentityValue::Text("postgres_storage_exact".to_owned())
         );
+        assert_eq!(first.unit(), GaugeUnit::MillisecondsPerOperation);
+        let Evidence::GaugeObservation(second) = &detected.incidents[0].findings[0].evidence()[1]
+        else {
+            panic!("typed observation");
+        };
+        assert_eq!(second.unit(), GaugeUnit::Count);
         typed.insert_counter(
             OS_DISKSTATS,
             "reads",

@@ -20,6 +20,9 @@ use kronika_analytics::DiffPoint;
 
 use super::model::IdentityValue;
 
+const MAX_EXACT_F64_INTEGER_I128: i128 = 1_i128 << 53;
+const MAX_EXACT_F64_INTEGER: f64 = 9_007_199_254_740_992.0;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TrackKey {
     section: &'static str,
@@ -38,26 +41,53 @@ struct CounterPoint {
     point: DiffPoint,
 }
 
+#[derive(Clone, Copy)]
+struct CounterDelta {
+    value: f64,
+    integer: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CounterDeltaError {
+    Unusable,
+    NumericLimit,
+}
+
 impl CounterPoint {
-    /// The interval delta as an `f64`, or `None` when the interval is unusable:
-    /// the reader marked it absent, or its rate is non-finite. Recovered as
-    /// `rate * dt` so the domain core never depends on the reader's scalar kind.
+    /// Return a usable delta or classify why it cannot enter numeric evidence.
     #[allow(
         clippy::cast_precision_loss,
-        reason = "dt_micros is a real interval length within f64's exact-integer range"
+        reason = "incident ratios are f64 values; the diff layer keeps integer subtraction exact"
     )]
-    fn delta(self) -> Option<f64> {
+    fn delta(self) -> Result<CounterDelta, CounterDeltaError> {
         match self.point {
             DiffPoint::Value {
-                rate, dt_micros, ..
-            } if rate.is_finite() => Some(rate * (dt_micros as f64) / 1_000_000.0),
-            DiffPoint::Value { .. } | DiffPoint::NoData { .. } => None,
+                delta: kronika_analytics::Scalar::Int(delta),
+                ..
+            } if (0..=MAX_EXACT_F64_INTEGER_I128).contains(&delta) => Ok(CounterDelta {
+                value: delta as f64,
+                integer: true,
+            }),
+            DiffPoint::Value {
+                delta: kronika_analytics::Scalar::Int(delta),
+                ..
+            } if delta > MAX_EXACT_F64_INTEGER_I128 => Err(CounterDeltaError::NumericLimit),
+            DiffPoint::Value {
+                delta: kronika_analytics::Scalar::Float(delta),
+                ..
+            } if delta.is_finite() && delta >= 0.0 => Ok(CounterDelta {
+                value: delta,
+                integer: false,
+            }),
+            DiffPoint::Value { .. } | DiffPoint::NoData { .. } => Err(CounterDeltaError::Unusable),
         }
     }
 
     fn interval_us(self) -> Option<u64> {
         match self.point {
-            DiffPoint::Value { dt_micros, .. } => u64::try_from(dt_micros).ok(),
+            DiffPoint::Value { dt_micros, .. } => {
+                u64::try_from(dt_micros).ok().filter(|dt| *dt > 0)
+            }
             DiffPoint::NoData { .. } => None,
         }
     }
@@ -70,6 +100,171 @@ pub(crate) struct PairedSums {
     pub sum_b: f64,
     /// Number of intervals both columns contributed to.
     pub intervals: usize,
+    /// Distinct interval endpoints seen in either column inside the window.
+    pub candidate_intervals: usize,
+    pub unmatched_endpoint_intervals: usize,
+    pub unusable_delta_intervals: usize,
+    pub unaligned_duration_intervals: usize,
+    pub numeric_limit_intervals: usize,
+    pub first_start_us: Option<i64>,
+    pub first_end_us: Option<i64>,
+    pub last_end_us: Option<i64>,
+    /// Sum of the usable, aligned interval durations.
+    pub elapsed_us: u64,
+}
+
+impl PairedSums {
+    /// Require enough usable pairs and at least 70% of the endpoints observed
+    /// in either operand. This checks pairing, not expected source coverage.
+    pub(crate) const fn meets_pairing_coverage(self, minimum_intervals: usize) -> bool {
+        self.intervals >= minimum_intervals
+            && self.candidate_intervals > 0
+            && (self.intervals as u128) * 10 >= (self.candidate_intervals as u128) * 7
+    }
+
+    pub(crate) const fn excluded_intervals(self) -> usize {
+        self.candidate_intervals.saturating_sub(self.intervals)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PairExclusion {
+    UnusableDelta,
+    UnalignedDuration,
+    NumericLimit,
+}
+
+fn accumulate_counter_pair(
+    sums: &mut PairedSums,
+    first_sum_integer: &mut bool,
+    second_sum_integer: &mut bool,
+    first: CounterPoint,
+    second: CounterPoint,
+) -> Result<(), PairExclusion> {
+    let (first_delta, second_delta) = match (first.delta(), second.delta()) {
+        (Ok(first_delta), Ok(second_delta)) => (first_delta, second_delta),
+        (Err(CounterDeltaError::NumericLimit), _) | (_, Err(CounterDeltaError::NumericLimit)) => {
+            return Err(PairExclusion::NumericLimit);
+        }
+        (Err(CounterDeltaError::Unusable), _) | (_, Err(CounterDeltaError::Unusable)) => {
+            return Err(PairExclusion::UnusableDelta);
+        }
+    };
+    let (Some(first_interval_us), Some(second_interval_us)) =
+        (first.interval_us(), second.interval_us())
+    else {
+        return Err(PairExclusion::UnalignedDuration);
+    };
+    if first_interval_us != second_interval_us {
+        return Err(PairExclusion::UnalignedDuration);
+    }
+    let interval_i64 =
+        i64::try_from(first_interval_us).map_err(|_conversion| PairExclusion::UnalignedDuration)?;
+    let interval_start_us = first
+        .end_us
+        .checked_sub(interval_i64)
+        .ok_or(PairExclusion::UnalignedDuration)?;
+    let next_first_sum = sums.sum_a + first_delta.value;
+    let next_second_sum = sums.sum_b + second_delta.value;
+    let first_sum_exact = !*first_sum_integer
+        || !first_delta.integer
+        || sums.sum_a <= MAX_EXACT_F64_INTEGER - first_delta.value;
+    let second_sum_exact = !*second_sum_integer
+        || !second_delta.integer
+        || sums.sum_b <= MAX_EXACT_F64_INTEGER - second_delta.value;
+    let elapsed_us = sums
+        .elapsed_us
+        .checked_add(first_interval_us)
+        .ok_or(PairExclusion::NumericLimit)?;
+    if !next_first_sum.is_finite()
+        || !next_second_sum.is_finite()
+        || !first_sum_exact
+        || !second_sum_exact
+    {
+        return Err(PairExclusion::NumericLimit);
+    }
+    sums.sum_a = next_first_sum;
+    sums.sum_b = next_second_sum;
+    sums.intervals = sums.intervals.saturating_add(1);
+    sums.first_start_us.get_or_insert(interval_start_us);
+    sums.first_end_us.get_or_insert(first.end_us);
+    sums.last_end_us = Some(first.end_us);
+    sums.elapsed_us = elapsed_us;
+    *first_sum_integer &= first_delta.integer;
+    *second_sum_integer &= second_delta.integer;
+    Ok(())
+}
+
+struct AlignedInterval {
+    deltas: [f64; 16],
+    integer_deltas: [bool; 16],
+    duration_us: u64,
+}
+
+fn aligned_interval(tracks: &[&CounterTrack], indexes: &[usize]) -> Option<AlignedInterval> {
+    let mut deltas = [0.0_f64; 16];
+    let mut integer_deltas = [false; 16];
+    let mut duration_us = None;
+    for ((slot, integer_delta), (track, &index)) in deltas
+        .iter_mut()
+        .zip(&mut integer_deltas)
+        .zip(tracks.iter().zip(indexes))
+    {
+        let point = track.points[index];
+        let delta = point.delta().ok()?;
+        let point_duration_us = point.interval_us()?;
+        let point_duration_i64 = i64::try_from(point_duration_us).ok()?;
+        point.end_us.checked_sub(point_duration_i64)?;
+        if duration_us.is_some_and(|expected| expected != point_duration_us) {
+            return None;
+        }
+        duration_us = Some(point_duration_us);
+        *slot = delta.value;
+        *integer_delta = delta.integer;
+    }
+    Some(AlignedInterval {
+        deltas,
+        integer_deltas,
+        duration_us: duration_us?,
+    })
+}
+
+fn accumulate_aligned_interval(
+    result: &mut AlignedSums,
+    integer_sums: &mut [bool; 16],
+    interval: &AlignedInterval,
+    end_us: i64,
+) {
+    let Some(next_elapsed_us) = result.elapsed_us.checked_add(interval.duration_us) else {
+        return;
+    };
+    let sums_are_usable = result
+        .sums
+        .iter()
+        .zip(interval.deltas)
+        .zip(integer_sums.iter().zip(interval.integer_deltas))
+        .take(result.len)
+        .all(|((&sum, delta), (&integer_sum, integer_delta))| {
+            let next = sum + delta;
+            next.is_finite()
+                && (!integer_sum || !integer_delta || sum <= MAX_EXACT_F64_INTEGER - delta)
+        });
+    if !sums_are_usable {
+        return;
+    }
+    for ((sum, integer_sum), (delta, integer_delta)) in result
+        .sums
+        .iter_mut()
+        .zip(integer_sums)
+        .zip(interval.deltas.into_iter().zip(interval.integer_deltas))
+        .take(result.len)
+    {
+        *sum += delta;
+        *integer_sum &= integer_delta;
+    }
+    result.intervals = result.intervals.saturating_add(1);
+    result.last_end_us = end_us;
+    result.elapsed_us = next_elapsed_us;
 }
 
 /// Sums for a fixed set of cumulative columns over exactly the same usable
@@ -672,26 +867,85 @@ impl TypedInputs {
             sum_a: 0.0,
             sum_b: 0.0,
             intervals: 0,
+            candidate_intervals: 0,
+            unmatched_endpoint_intervals: 0,
+            unusable_delta_intervals: 0,
+            unaligned_duration_intervals: 0,
+            numeric_limit_intervals: 0,
+            first_start_us: None,
+            first_end_us: None,
+            last_end_us: None,
+            elapsed_us: 0,
         };
+        let (mut first_sum_integer, mut second_sum_integer) = (true, true);
         let (mut i, mut j) = (0, 0);
         while i < track_a.points.len() && j < track_b.points.len() {
             let a = track_a.points[i];
             let b = track_b.points[j];
             match a.end_us.cmp(&b.end_us) {
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Less => {
+                    if (from_us..=to_us).contains(&a.end_us) {
+                        sums.candidate_intervals = sums.candidate_intervals.saturating_add(1);
+                        sums.unmatched_endpoint_intervals =
+                            sums.unmatched_endpoint_intervals.saturating_add(1);
+                    }
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    if (from_us..=to_us).contains(&b.end_us) {
+                        sums.candidate_intervals = sums.candidate_intervals.saturating_add(1);
+                        sums.unmatched_endpoint_intervals =
+                            sums.unmatched_endpoint_intervals.saturating_add(1);
+                    }
+                    j += 1;
+                }
                 std::cmp::Ordering::Equal => {
-                    if (from_us..=to_us).contains(&a.end_us)
-                        && let (Some(delta_a), Some(delta_b)) = (a.delta(), b.delta())
-                    {
-                        sums.sum_a += delta_a;
-                        sums.sum_b += delta_b;
-                        sums.intervals += 1;
+                    if (from_us..=to_us).contains(&a.end_us) {
+                        sums.candidate_intervals = sums.candidate_intervals.saturating_add(1);
+                        match accumulate_counter_pair(
+                            &mut sums,
+                            &mut first_sum_integer,
+                            &mut second_sum_integer,
+                            a,
+                            b,
+                        ) {
+                            Ok(()) => {}
+                            Err(PairExclusion::UnusableDelta) => {
+                                sums.unusable_delta_intervals =
+                                    sums.unusable_delta_intervals.saturating_add(1);
+                            }
+                            Err(PairExclusion::UnalignedDuration) => {
+                                sums.unaligned_duration_intervals =
+                                    sums.unaligned_duration_intervals.saturating_add(1);
+                            }
+                            Err(PairExclusion::NumericLimit) => {
+                                sums.numeric_limit_intervals =
+                                    sums.numeric_limit_intervals.saturating_add(1);
+                            }
+                        }
                     }
                     i += 1;
                     j += 1;
                 }
             }
+        }
+        while i < track_a.points.len() {
+            let end_us = track_a.points[i].end_us;
+            if (from_us..=to_us).contains(&end_us) {
+                sums.candidate_intervals = sums.candidate_intervals.saturating_add(1);
+                sums.unmatched_endpoint_intervals =
+                    sums.unmatched_endpoint_intervals.saturating_add(1);
+            }
+            i += 1;
+        }
+        while j < track_b.points.len() {
+            let end_us = track_b.points[j].end_us;
+            if (from_us..=to_us).contains(&end_us) {
+                sums.candidate_intervals = sums.candidate_intervals.saturating_add(1);
+                sums.unmatched_endpoint_intervals =
+                    sums.unmatched_endpoint_intervals.saturating_add(1);
+            }
+            j += 1;
         }
         Some(sums)
     }
@@ -729,6 +983,7 @@ impl TypedInputs {
             .map(|column| self.counter(section, column, identity))
             .collect::<Option<_>>()?;
         let mut indexes = vec![0_usize; tracks.len()];
+        let mut integer_sums = [true; 16];
         let mut result = AlignedSums {
             sums: [0.0; 16],
             len: tracks.len(),
@@ -754,35 +1009,10 @@ impl TypedInputs {
                 }
                 continue;
             }
-            if (from_us..=to_us).contains(&minimum) {
-                let mut deltas = [0.0_f64; 16];
-                let mut usable = true;
-                let mut interval_us = None;
-                for (slot, (track, &index)) in deltas.iter_mut().zip(tracks.iter().zip(&indexes)) {
-                    let point = track.points[index];
-                    let (Some(delta), Some(point_interval_us)) =
-                        (point.delta(), point.interval_us())
-                    else {
-                        usable = false;
-                        break;
-                    };
-                    if interval_us.is_some_and(|expected| expected != point_interval_us) {
-                        usable = false;
-                        break;
-                    }
-                    interval_us = Some(point_interval_us);
-                    *slot = delta;
-                }
-                if usable {
-                    for (sum, delta) in result.sums.iter_mut().zip(deltas) {
-                        *sum += delta;
-                    }
-                    result.intervals = result.intervals.saturating_add(1);
-                    result.last_end_us = minimum;
-                    result.elapsed_us = result
-                        .elapsed_us
-                        .saturating_add(interval_us.unwrap_or_default());
-                }
+            if (from_us..=to_us).contains(&minimum)
+                && let Some(interval) = aligned_interval(&tracks, &indexes)
+            {
+                accumulate_aligned_interval(&mut result, &mut integer_sums, &interval, minimum);
             }
             for index in &mut indexes {
                 *index += 1;
@@ -1133,13 +1363,28 @@ mod tests {
         Arc::from(vec![IdentityValue::I64(value)])
     }
 
-    // A one-second interval, so `CounterPoint::delta` (rate * dt) equals `delta`.
-    // The `Scalar` field is unread: the domain core recovers delta from `rate`.
+    // A one-second interval with the same delta and rate.
     fn value(delta: f64) -> DiffPoint {
         DiffPoint::Value {
-            delta: Scalar::Int(0),
+            delta: Scalar::Float(delta),
             rate: delta,
             dt_micros: 1_000_000,
+        }
+    }
+
+    fn value_with_dt(delta: f64, dt_micros: i64) -> DiffPoint {
+        DiffPoint::Value {
+            delta: Scalar::Float(delta),
+            rate: delta,
+            dt_micros,
+        }
+    }
+
+    fn integer_value(delta: i128, dt_micros: i64) -> DiffPoint {
+        DiffPoint::Value {
+            delta: Scalar::Int(delta),
+            rate: 0.0,
+            dt_micros,
         }
     }
 
@@ -1164,6 +1409,11 @@ mod tests {
             .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
             .expect("both columns present");
         assert_eq!(sums.intervals, 2);
+        assert_eq!(sums.candidate_intervals, 2);
+        assert_eq!(sums.first_start_us, Some(-999_990));
+        assert_eq!(sums.first_end_us, Some(10));
+        assert_eq!(sums.last_end_us, Some(20));
+        assert_eq!(sums.elapsed_us, 2_000_000);
         assert!((sums.sum_a - 10.0).abs() < 1e-9);
         assert!((sums.sum_b - 100.0).abs() < 1e-9);
     }
@@ -1181,6 +1431,9 @@ mod tests {
             sums.intervals, 1,
             "the reset interval is excluded from both"
         );
+        assert_eq!(sums.candidate_intervals, 2);
+        assert_eq!(sums.excluded_intervals(), 1);
+        assert_eq!(sums.unusable_delta_intervals, 1);
         assert!((sums.sum_a - 3.0).abs() < 1e-9);
         assert!((sums.sum_b - 30.0).abs() < 1e-9);
     }
@@ -1195,6 +1448,9 @@ mod tests {
             .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
             .expect("both columns present");
         assert_eq!(sums.intervals, 1, "only ts=20 is shared");
+        assert_eq!(sums.candidate_intervals, 3);
+        assert_eq!(sums.excluded_intervals(), 2);
+        assert_eq!(sums.unmatched_endpoint_intervals, 2);
         assert!((sums.sum_a - 7.0).abs() < 1e-9);
         assert!((sums.sum_b - 70.0).abs() < 1e-9);
     }
@@ -1217,14 +1473,16 @@ mod tests {
             .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
             .expect("both columns present");
         assert_eq!(sums.intervals, 0);
+        assert_eq!(sums.candidate_intervals, 1);
+        assert_eq!(sums.unusable_delta_intervals, 1);
         assert!(sums.sum_a.abs() < 1e-9);
         assert!(sums.sum_b.abs() < 1e-9);
     }
 
     #[test]
-    fn a_non_finite_rate_interval_is_unusable() {
+    fn a_typed_delta_does_not_depend_on_the_derived_rate() {
         let nan = DiffPoint::Value {
-            delta: Scalar::Int(0),
+            delta: Scalar::Int(5),
             rate: f64::NAN,
             dt_micros: 1_000_000,
         };
@@ -1235,9 +1493,9 @@ mod tests {
         let sums = typed
             .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", i64::MIN, i64::MAX)
             .expect("both columns present");
-        assert_eq!(sums.intervals, 1, "the non-finite interval is excluded");
-        assert!((sums.sum_a - 7.0).abs() < 1e-9);
-        assert!((sums.sum_b - 70.0).abs() < 1e-9);
+        assert_eq!(sums.intervals, 2, "the exact delta remains usable");
+        assert!((sums.sum_a - 12.0).abs() < 1e-9);
+        assert!((sums.sum_b - 100.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1262,8 +1520,134 @@ mod tests {
             .expect("both columns present");
 
         assert_eq!(sums.intervals, 2);
+        assert_eq!(sums.candidate_intervals, 2);
         assert!((sums.sum_a - 10.0).abs() < 1e-9);
         assert!((sums.sum_b - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mismatched_interval_lengths_are_excluded_and_counted() {
+        let typed = inputs(
+            vec![
+                (1_000_000, value_with_dt(3.0, 1_000_000)),
+                (2_000_000, value_with_dt(7.0, 1_000_000)),
+                (3_000_000, value_with_dt(8.0, 1_000_000)),
+            ],
+            vec![
+                (1_000_000, value_with_dt(30.0, 2_000_000)),
+                (2_000_000, value_with_dt(70.0, 1_000_000)),
+                (3_000_000, value_with_dt(80.0, 1_000_000)),
+            ],
+        );
+        let sums = typed
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", 0, 3_000_000)
+            .expect("both columns present");
+
+        assert_eq!(sums.intervals, 2);
+        assert_eq!(sums.candidate_intervals, 3);
+        assert_eq!(sums.excluded_intervals(), 1);
+        assert_eq!(sums.unaligned_duration_intervals, 1);
+        assert_eq!(sums.elapsed_us, 2_000_000);
+        assert_eq!(sums.first_start_us, Some(1_000_000));
+        assert!(!sums.meets_pairing_coverage(2));
+    }
+
+    #[test]
+    fn three_of_four_aligned_intervals_meet_pairing_coverage() {
+        let typed = inputs(
+            vec![
+                (1, value(1.0)),
+                (2, value(1.0)),
+                (3, absent(Reason::Reset)),
+                (4, value(1.0)),
+            ],
+            vec![
+                (1, value(1.0)),
+                (2, value(1.0)),
+                (3, value(1.0)),
+                (4, value(1.0)),
+            ],
+        );
+        let sums = typed
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", 0, 10)
+            .expect("both columns present");
+
+        assert_eq!((sums.intervals, sums.candidate_intervals), (3, 4));
+        assert!(sums.meets_pairing_coverage(3));
+    }
+
+    #[test]
+    fn integer_deltas_that_cannot_be_published_exactly_are_excluded() {
+        let too_large = (1_i128 << 53) + 1;
+        let typed = inputs(
+            vec![(1_000_000, integer_value(too_large, 1_000_000))],
+            vec![(1_000_000, integer_value(1, 1_000_000))],
+        );
+        let sums = typed
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", 0, 1_000_000)
+            .expect("both columns present");
+
+        assert_eq!((sums.intervals, sums.candidate_intervals), (0, 1));
+        assert_eq!(sums.numeric_limit_intervals, 1);
+    }
+
+    #[test]
+    fn integer_sum_precision_loss_excludes_the_overflowing_pair() {
+        let exact_limit = 1_i128 << 53;
+        let typed = inputs(
+            vec![
+                (1_000_000, integer_value(exact_limit, 1_000_000)),
+                (2_000_000, integer_value(1, 1_000_000)),
+            ],
+            vec![
+                (1_000_000, integer_value(1, 1_000_000)),
+                (2_000_000, integer_value(1, 1_000_000)),
+            ],
+        );
+        let sums = typed
+            .paired_delta_sums("db", &id(1), "blks_read", "blks_hit", 0, 2_000_000)
+            .expect("both columns present");
+
+        assert_eq!((sums.intervals, sums.candidate_intervals), (1, 2));
+        assert_eq!(sums.numeric_limit_intervals, 1);
+        assert!((sums.sum_a - 9_007_199_254_740_992.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn elapsed_duration_overflow_excludes_the_interval() {
+        let endpoints = [i64::MAX - 2, i64::MAX - 1, i64::MAX];
+        let points: Vec<_> = endpoints
+            .into_iter()
+            .map(|end| (end, value_with_dt(1.0, end)))
+            .collect();
+        let typed = inputs(points.clone(), points);
+        let sums = typed
+            .paired_delta_sums(
+                "db",
+                &id(1),
+                "blks_read",
+                "blks_hit",
+                i64::MAX - 2,
+                i64::MAX,
+            )
+            .expect("both columns present");
+
+        assert_eq!((sums.intervals, sums.candidate_intervals), (2, 3));
+        assert_eq!(sums.numeric_limit_intervals, 1);
+        assert!(!sums.meets_pairing_coverage(2));
+    }
+
+    #[test]
+    fn aligned_sums_exclude_an_interval_start_before_i64_min() {
+        let typed = inputs(
+            vec![(i64::MIN, value_with_dt(1.0, 1))],
+            vec![(i64::MIN, value_with_dt(1.0, 1))],
+        );
+        let sums = typed
+            .aligned_delta_sums("db", &id(1), &["blks_read", "blks_hit"], i64::MIN, i64::MIN)
+            .expect("both columns present");
+
+        assert_eq!(sums.intervals, 0);
     }
 
     fn gauges(section: &'static str, columns: &[(&'static str, &[(i64, f64)])]) -> TypedInputs {

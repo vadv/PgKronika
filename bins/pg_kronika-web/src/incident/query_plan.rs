@@ -9,12 +9,12 @@ use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
     ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, Role, ThresholdKind,
+    GaugeUnit, GaugeValueInput, Role, ThresholdKind,
 };
 use super::lens::Lens;
 use super::model::IdentityValue;
 use super::series::SeriesSet;
-use super::typed::{PlanFork, PlanSample, TypedInputs};
+use super::typed::{AlignedSums, PlanFork, PlanSample, TypedInputs};
 
 const STATEMENTS: &str = "pg_stat_statements";
 const PLANS_OSSC: &str = "pg_store_plans_ossc";
@@ -56,6 +56,97 @@ impl QueryWorkLens {
         "temp_blks_read",
         "temp_blks_written",
     ];
+
+    fn evidence(
+        aligned: AlignedSums,
+        time_column: &'static str,
+        identity: &Arc<[IdentityValue]>,
+    ) -> Option<Vec<Evidence>> {
+        let calls = aligned.sums[0];
+        let total_ms = aligned.sums[1];
+        let rows = aligned.sums[2];
+        let block_work: f64 = aligned.sums[3..aligned.len].iter().sum();
+        if calls <= 0.0 || total_ms < 0.0 || rows < 0.0 || block_work < 0.0 {
+            return None;
+        }
+        let ms_per_call = total_ms / calls;
+        let blocks_per_call = block_work / calls;
+        if !ms_per_call.is_finite()
+            || !blocks_per_call.is_finite()
+            || (ms_per_call < Self::MIN_MS_PER_CALL && blocks_per_call < Self::MIN_BLOCKS_PER_CALL)
+        {
+            return None;
+        }
+        let entity = || GaugeEntity::new(STATEMENTS, Arc::clone(identity));
+        [
+            GaugeEvidence::value(GaugeValueInput {
+                operand: "calls_delta_sum",
+                value: calls,
+                unit: GaugeUnit::Count,
+                threshold: 1.0,
+                threshold_kind: ThresholdKind::AtLeast,
+                observed_at_us: aligned.last_end_us,
+                samples: aligned.intervals,
+                entity: entity(),
+            }),
+            GaugeEvidence::ratio(
+                GaugeRatio::with_units(
+                    time_column,
+                    total_ms,
+                    GaugeUnit::Milliseconds,
+                    "calls",
+                    calls,
+                    GaugeUnit::Count,
+                    GaugeUnit::MillisecondsPerCall,
+                ),
+                Self::MIN_MS_PER_CALL,
+                ThresholdKind::AtLeast,
+                aligned.last_end_us,
+                aligned.intervals,
+                entity(),
+            ),
+            GaugeEvidence::ratio(
+                GaugeRatio::with_units(
+                    "rows",
+                    rows,
+                    GaugeUnit::Count,
+                    "calls",
+                    calls,
+                    GaugeUnit::Count,
+                    GaugeUnit::RowsPerCall,
+                ),
+                0.0,
+                ThresholdKind::AtLeast,
+                aligned.last_end_us,
+                aligned.intervals,
+                entity(),
+            ),
+            GaugeEvidence::ratio(
+                GaugeRatio::with_units(
+                    "block_accesses_sum",
+                    block_work,
+                    GaugeUnit::Count,
+                    "calls",
+                    calls,
+                    GaugeUnit::Count,
+                    GaugeUnit::BlocksPerCall,
+                ),
+                Self::MIN_BLOCKS_PER_CALL,
+                ThresholdKind::AtLeast,
+                aligned.last_end_us,
+                aligned.intervals,
+                entity(),
+            ),
+        ]
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .map(|evidence| {
+            evidence
+                .into_iter()
+                .map(Evidence::GaugeObservation)
+                .collect()
+        })
+    }
 }
 
 impl Lens for QueryWorkLens {
@@ -114,78 +205,20 @@ impl Lens for QueryWorkLens {
                     context.incident_end_us,
                 ) && candidate.intervals >= Self::MIN_INTERVALS
                 {
-                    aligned = Some(candidate);
+                    aligned = Some((candidate, columns[1]));
                     break;
                 }
             }
-            let Some(aligned) = aligned else {
+            let Some((aligned, time_column)) = aligned else {
                 continue;
             };
-            let calls = aligned.sums[0];
-            let total_ms = aligned.sums[1];
-            let rows = aligned.sums[2];
-            let block_work: f64 = aligned.sums[3..aligned.len].iter().sum();
-            if calls <= 0.0 || total_ms < 0.0 || rows < 0.0 || block_work < 0.0 {
-                continue;
-            }
-            let ms_per_call = total_ms / calls;
-            let blocks_per_call = block_work / calls;
-            if !ms_per_call.is_finite()
-                || !blocks_per_call.is_finite()
-                || (ms_per_call < Self::MIN_MS_PER_CALL
-                    && blocks_per_call < Self::MIN_BLOCKS_PER_CALL)
-            {
-                continue;
-            }
-            let entity = || GaugeEntity::new(STATEMENTS, Arc::clone(&member.identity));
-            let evidence = [
-                GaugeEvidence::value(
-                    calls,
-                    GaugeUnit::Count,
-                    1.0,
-                    ThresholdKind::AtLeast,
-                    aligned.last_end_us,
-                    aligned.intervals,
-                    entity(),
-                ),
-                GaugeEvidence::ratio(
-                    GaugeRatio::new(total_ms, calls, GaugeUnit::Milliseconds),
-                    Self::MIN_MS_PER_CALL,
-                    ThresholdKind::AtLeast,
-                    aligned.last_end_us,
-                    aligned.intervals,
-                    entity(),
-                ),
-                GaugeEvidence::ratio(
-                    GaugeRatio::new(rows, calls, GaugeUnit::Count),
-                    0.0,
-                    ThresholdKind::AtLeast,
-                    aligned.last_end_us,
-                    aligned.intervals,
-                    entity(),
-                ),
-                GaugeEvidence::ratio(
-                    GaugeRatio::new(block_work, calls, GaugeUnit::Count),
-                    Self::MIN_BLOCKS_PER_CALL,
-                    ThresholdKind::AtLeast,
-                    aligned.last_end_us,
-                    aligned.intervals,
-                    entity(),
-                ),
-            ]
-            .into_iter()
-            .collect::<Option<Vec<_>>>();
-            let Some(evidence) = evidence else {
+            let Some(evidence) = Self::evidence(aligned, time_column, &member.identity) else {
                 continue;
             };
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
-                evidence
-                    .into_iter()
-                    .map(Evidence::GaugeObservation)
-                    .collect(),
-                None,
+                evidence,
             ))?;
         }
         Ok(())
@@ -365,27 +398,31 @@ impl Lens for PlanChurnLens {
         ]);
         let entity = || GaugeEntity::new(member.logical_section, Arc::clone(&identity));
         let evidence = [
-            GaugeEvidence::value(
-                candidate.calls,
-                GaugeUnit::Count,
-                1.0,
-                ThresholdKind::AtLeast,
-                candidate.observed_at_us,
-                2,
-                entity(),
-            ),
-            GaugeEvidence::value(
-                candidate.total_time_ms,
-                GaugeUnit::Milliseconds,
-                0.0,
-                ThresholdKind::AtLeast,
-                candidate.observed_at_us,
-                2,
-                entity(),
-            ),
+            GaugeEvidence::value(GaugeValueInput {
+                operand: "new_plan_calls_delta",
+                value: candidate.calls,
+                unit: GaugeUnit::Count,
+                threshold: 1.0,
+                threshold_kind: ThresholdKind::AtLeast,
+                observed_at_us: candidate.observed_at_us,
+                samples: 2,
+                entity: entity(),
+            }),
+            GaugeEvidence::value(GaugeValueInput {
+                operand: "new_plan_total_time_ms_delta",
+                value: candidate.total_time_ms,
+                unit: GaugeUnit::Milliseconds,
+                threshold: 0.0,
+                threshold_kind: ThresholdKind::AtLeast,
+                observed_at_us: candidate.observed_at_us,
+                samples: 2,
+                entity: entity(),
+            }),
             GaugeEvidence::ratio(
                 GaugeRatio::new(
+                    "new_plan_calls_delta",
                     candidate.calls,
+                    "all_plan_calls_delta",
                     candidate.calls_denominator,
                     GaugeUnit::Count,
                 ),
@@ -408,7 +445,6 @@ impl Lens for PlanChurnLens {
                 .into_iter()
                 .map(Evidence::GaugeObservation)
                 .collect(),
-            None,
         ))?;
         Ok(())
     }
@@ -459,7 +495,7 @@ mod tests {
 
     fn delta(value: f64) -> DiffPoint {
         DiffPoint::Value {
-            delta: Scalar::Int(0),
+            delta: Scalar::Float(value),
             rate: value,
             dt_micros: 1_000_000,
         }
@@ -485,7 +521,11 @@ mod tests {
         typed
     }
 
-    fn findings(lens: &dyn Lens, episode: EnrichedEpisode, typed: &TypedInputs) -> usize {
+    fn outcome(
+        lens: &dyn Lens,
+        episode: EnrichedEpisode,
+        typed: &TypedInputs,
+    ) -> crate::incident::EngineOutcome {
         let lenses = [lens];
         analyze(
             vec![episode],
@@ -495,20 +535,36 @@ mod tests {
             &IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown),
         )
         .expect("analysis")
-        .incidents[0]
-            .findings
-            .len()
+    }
+
+    fn findings(lens: &dyn Lens, episode: EnrichedEpisode, typed: &TypedInputs) -> usize {
+        outcome(lens, episode, typed).incidents[0].findings.len()
     }
 
     #[test]
     fn query_work_uses_one_shared_valid_interval_set() {
+        let input = query_input(false);
         assert_eq!(
-            findings(
-                &QueryWorkLens,
-                episode(STATEMENTS, "calls"),
-                &query_input(false)
-            ),
+            findings(&QueryWorkLens, episode(STATEMENTS, "calls"), &input),
             1
+        );
+        let detected = outcome(&QueryWorkLens, episode(STATEMENTS, "calls"), &input);
+        let units: Vec<_> = detected.incidents[0].findings[0]
+            .evidence()
+            .iter()
+            .map(|evidence| match evidence {
+                Evidence::GaugeObservation(gauge) => gauge.unit(),
+                _ => panic!("query evidence is numeric"),
+            })
+            .collect();
+        assert_eq!(
+            units,
+            [
+                GaugeUnit::Count,
+                GaugeUnit::MillisecondsPerCall,
+                GaugeUnit::RowsPerCall,
+                GaugeUnit::BlocksPerCall,
+            ]
         );
         assert_eq!(
             findings(

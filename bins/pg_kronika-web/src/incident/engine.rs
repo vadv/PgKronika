@@ -2,7 +2,6 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::marker::PhantomData;
 
 use super::cluster::{ClusterError, ClusterOutcome, cluster_episodes};
 use super::dispatch::{
@@ -17,7 +16,7 @@ use super::typed::TypedInputs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClockRelation {
-    SameDomain,
+    Simultaneous,
     Unknown,
 }
 
@@ -27,17 +26,11 @@ pub(crate) struct EvalContext {
     clock_relation: ClockRelation,
 }
 
-pub(crate) struct TemporalDirectionPermit<'a> {
-    _context: PhantomData<&'a EvalContext>,
-}
-
 impl EvalContext {
-    pub(crate) fn temporal_direction(&self) -> Option<TemporalDirectionPermit<'_>> {
-        matches!(self.clock_relation, ClockRelation::SameDomain).then_some(
-            TemporalDirectionPermit {
-                _context: PhantomData,
-            },
-        )
+    /// Observation timestamps describe when metrics were sampled. This value
+    /// is descriptive only and never authorizes a causal role.
+    pub(crate) const fn clock_relation(&self) -> ClockRelation {
+        self.clock_relation
     }
 
     #[cfg(test)]
@@ -375,7 +368,8 @@ mod tests {
     use super::*;
     use crate::incident::cluster::Cluster;
     use crate::incident::evidence::{
-        Confidence, ConfidenceCap, Evidence, FindingDraft, FindingScope, Role,
+        Confidence, ConfidenceCap, DirectEvidence, Evidence, FindingDraft, FindingScope,
+        LockParticipant, Role,
     };
     use crate::incident::model::IdentityValue;
     use kronika_analytics::{Direction, Episode, Evaluated};
@@ -424,7 +418,7 @@ mod tests {
             cluster: &Cluster,
             _series: &SeriesSet,
             _typed: &TypedInputs,
-            context: &EvalContext,
+            _context: &EvalContext,
             sink: &mut FindingSink<'_>,
         ) -> Result<(), LimitHit> {
             let scope = FindingScope::from_episode(&cluster.members[0]);
@@ -432,8 +426,88 @@ mod tests {
                 self.role,
                 scope,
                 vec![self.evidence.build()],
-                context.temporal_direction().as_ref(),
             ))
+        }
+    }
+
+    struct CoincidentMembersLens;
+
+    impl Lens for CoincidentMembersLens {
+        fn id(&self) -> &'static str {
+            "COINCIDENT_MEMBERS"
+        }
+
+        fn inputs(&self) -> &'static [SectionColumn] {
+            CACHE
+        }
+
+        fn confidence_cap(&self) -> ConfidenceCap {
+            ConfidenceCap::Medium
+        }
+
+        fn evaluate(
+            &self,
+            cluster: &Cluster,
+            _series: &SeriesSet,
+            _typed: &TypedInputs,
+            _context: &EvalContext,
+            sink: &mut FindingSink<'_>,
+        ) -> Result<(), LimitHit> {
+            for member in &cluster.members {
+                sink.emit(FindingDraft::new(
+                    Role::Coincident,
+                    FindingScope::from_episode(member),
+                    vec![Evidence::Counter],
+                ))?;
+            }
+            Ok(())
+        }
+    }
+
+    struct StructuralMembersLens;
+
+    impl Lens for StructuralMembersLens {
+        fn id(&self) -> &'static str {
+            "STRUCTURAL_MEMBERS"
+        }
+
+        fn inputs(&self) -> &'static [SectionColumn] {
+            CACHE
+        }
+
+        fn confidence_cap(&self) -> ConfidenceCap {
+            ConfidenceCap::Medium
+        }
+
+        fn evaluate(
+            &self,
+            cluster: &Cluster,
+            _series: &SeriesSet,
+            _typed: &TypedInputs,
+            _context: &EvalContext,
+            sink: &mut FindingSink<'_>,
+        ) -> Result<(), LimitHit> {
+            for member in &cluster.members {
+                let Some(&IdentityValue::I64(id)) = member.identity.first() else {
+                    continue;
+                };
+                let (role, participant) = if id == 1 {
+                    (Role::Downstream, LockParticipant::Waiter)
+                } else {
+                    (Role::Lead, LockParticipant::Blocker)
+                };
+                sink.emit(FindingDraft::new(
+                    role,
+                    FindingScope::from_episode(member),
+                    vec![Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                        member.start_us,
+                        10,
+                        20,
+                        participant,
+                    ))],
+                ))?;
+            }
+            Ok(())
         }
     }
 
@@ -493,6 +567,26 @@ mod tests {
             max_evidence_rows: 100,
             max_output_bytes: 1 << 20,
         }
+    }
+
+    fn simultaneous_config(work_limit: u64) -> IncidentConfig {
+        let mut config = config(work_limit);
+        config.clock_relation = ClockRelation::Simultaneous;
+        config
+    }
+
+    fn role_for_identity(outcome: &EngineOutcome, id: i64) -> Role {
+        outcome.incidents[0]
+            .findings
+            .iter()
+            .find(|finding| {
+                matches!(
+                    finding.scope().identity(),
+                    [IdentityValue::I64(value)] if *value == id
+                )
+            })
+            .map(Finding::role)
+            .expect("finding for identity")
     }
 
     fn cache_lens(id: &'static str, evidence: TestEvidence) -> FixedLens {
@@ -614,7 +708,6 @@ mod tests {
                     Role::Amplifier,
                     scope.clone(),
                     vec![evidence],
-                    None,
                 ))
                 .expect("within limits");
             }
@@ -632,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_clock_rejects_an_unproven_lead() {
+    fn ordinary_metric_evidence_cannot_request_a_lead_role() {
         let lens = FixedLens {
             id: "TEMPORAL",
             inputs: CACHE,
@@ -645,10 +738,69 @@ mod tests {
             &SeriesSet::for_test(0),
             &TypedInputs::new(),
             &[&lens],
-            &config(100),
+            &simultaneous_config(100),
         )
         .expect("valid");
         assert_eq!(outcome.incidents[0].findings[0].role(), Role::Coincident);
+    }
+
+    #[test]
+    fn snapshot_metric_timestamps_do_not_assign_directional_roles() {
+        let outcome = analyze(
+            vec![
+                episode("pg_stat_database", 1, 0, 10),
+                episode("pg_stat_database", 2, 2, 12),
+                episode("pg_stat_database", 3, 4, 14),
+            ],
+            &SeriesSet::for_test(0),
+            &TypedInputs::new(),
+            &[&CoincidentMembersLens],
+            &simultaneous_config(100),
+        )
+        .expect("valid");
+
+        assert_eq!(role_for_identity(&outcome, 1), Role::Coincident);
+        assert_eq!(role_for_identity(&outcome, 2), Role::Coincident);
+        assert_eq!(role_for_identity(&outcome, 3), Role::Coincident);
+    }
+
+    #[test]
+    fn tied_snapshot_metric_timestamps_stay_coincident() {
+        let outcome = analyze(
+            vec![
+                episode("pg_stat_database", 1, 0, 10),
+                episode("pg_stat_database", 2, 0, 10),
+                episode("pg_stat_database", 3, 4, 14),
+                episode("pg_stat_database", 4, 4, 14),
+            ],
+            &SeriesSet::for_test(0),
+            &TypedInputs::new(),
+            &[&CoincidentMembersLens],
+            &simultaneous_config(100),
+        )
+        .expect("valid");
+
+        for id in 1..=4 {
+            assert_eq!(role_for_identity(&outcome, id), Role::Coincident);
+        }
+    }
+
+    #[test]
+    fn structural_lock_roles_survive_the_simultaneous_metric_convention() {
+        let outcome = analyze(
+            vec![
+                episode("pg_stat_database", 1, 0, 10),
+                episode("pg_stat_database", 2, 4, 14),
+            ],
+            &SeriesSet::for_test(0),
+            &TypedInputs::new(),
+            &[&StructuralMembersLens],
+            &simultaneous_config(100),
+        )
+        .expect("valid");
+
+        assert_eq!(role_for_identity(&outcome, 1), Role::Downstream);
+        assert_eq!(role_for_identity(&outcome, 2), Role::Lead);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use super::engine::EvalContext;
 use super::evidence::sink::FindingSink;
 use super::evidence::{
     ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeTrendInput, GaugeUnit, Role, ThresholdKind,
+    GaugeTrendInput, GaugeUnit, GaugeValueInput, Role, ThresholdKind,
 };
 use super::lens::Lens;
 use super::series::SeriesSet;
@@ -38,7 +38,6 @@ fn emit(
         Role::Coincident,
         FindingScope::from_episode(member),
         evidence,
-        None,
     ))
 }
 
@@ -110,7 +109,7 @@ impl Lens for FreezeHorizonLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(reading.a, reading.b, GaugeUnit::Count),
+                GaugeRatio::new(columns.0, reading.a, columns.1, reading.b, GaugeUnit::Count),
                 Self::LIMIT_FRACTION,
                 ThresholdKind::AtLeast,
                 reading.observed_at_us,
@@ -189,15 +188,16 @@ impl Lens for RunningVacuumLens {
             {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::value(
-                reading.values[0],
-                GaugeUnit::Microseconds,
-                Self::ELAPSED_FLOOR_US,
-                ThresholdKind::AtLeast,
-                reading.observed_at_us,
-                reading.samples,
-                entity(VACUUM, &member.identity),
-            ) else {
+            let Some(evidence) = GaugeEvidence::value(GaugeValueInput {
+                operand: "elapsed_us",
+                value: reading.values[0],
+                unit: GaugeUnit::Microseconds,
+                threshold: Self::ELAPSED_FLOOR_US,
+                threshold_kind: ThresholdKind::AtLeast,
+                observed_at_us: reading.observed_at_us,
+                samples: reading.samples,
+                entity: entity(VACUUM, &member.identity),
+            }) else {
                 continue;
             };
             emit(sink, member, vec![Evidence::GaugeObservation(evidence)])?;
@@ -302,15 +302,16 @@ impl Lens for PhysicalReplicationLens {
             {
                 continue;
             }
-            let Some(evidence) = GaugeEvidence::value(
-                reading.values[0],
+            let Some(evidence) = GaugeEvidence::value(GaugeValueInput {
+                operand: member.column,
+                value: reading.values[0],
                 unit,
                 threshold,
-                ThresholdKind::AtLeast,
-                reading.observed_at_us,
-                reading.samples,
-                entity(REPLICATION, &member.identity),
-            ) else {
+                threshold_kind: ThresholdKind::AtLeast,
+                observed_at_us: reading.observed_at_us,
+                samples: reading.samples,
+                entity: entity(REPLICATION, &member.identity),
+            }) else {
                 continue;
             };
             emit(sink, member, vec![Evidence::GaugeObservation(evidence)])?;
@@ -415,11 +416,22 @@ impl Lens for SlotRetentionLens {
             } else {
                 reading.values[1]
             };
+            let denominator_name = if is_safe_headroom {
+                "retained_bytes_plus_safe_wal_size"
+            } else {
+                "max_slot_wal_keep_size_bytes"
+            };
             if denominator <= 0.0 || reading.values[0] / denominator < Self::HEADROOM_FLOOR {
                 continue;
             }
             let Some(amount_evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(reading.values[0], denominator, GaugeUnit::Bytes),
+                GaugeRatio::new(
+                    "retained_bytes",
+                    reading.values[0],
+                    denominator_name,
+                    denominator,
+                    GaugeUnit::Bytes,
+                ),
                 Self::HEADROOM_FLOOR,
                 ThresholdKind::AtLeast,
                 reading.observed_at_us,
@@ -432,6 +444,7 @@ impl Lens for SlotRetentionLens {
             if let Some(trend) = trend
                 && trend.last > trend.first
                 && let Some(trend_evidence) = GaugeEvidence::trend(GaugeTrendInput {
+                    operand: "retained_bytes",
                     first: trend.first,
                     last: trend.last,
                     operand_unit: GaugeUnit::Bytes,
@@ -515,7 +528,13 @@ impl Lens for StorageCapacityLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(reading.values[0], reading.values[1], GaugeUnit::Bytes),
+                GaugeRatio::new(
+                    "available_bytes",
+                    reading.values[0],
+                    "total_bytes",
+                    reading.values[1],
+                    GaugeUnit::Bytes,
+                ),
                 Self::AVAILABLE_FLOOR,
                 ThresholdKind::Below,
                 reading.observed_at_us,
@@ -604,7 +623,13 @@ impl Lens for CgroupMemoryLens {
                 continue;
             }
             let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(reading.values[0], reading.values[1], GaugeUnit::Bytes),
+                GaugeRatio::new(
+                    "current_bytes",
+                    reading.values[0],
+                    "max_bytes",
+                    reading.values[1],
+                    GaugeUnit::Bytes,
+                ),
                 Self::UTILIZATION_FLOOR,
                 ThresholdKind::AtLeast,
                 reading.observed_at_us,
