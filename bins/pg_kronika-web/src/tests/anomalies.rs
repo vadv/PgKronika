@@ -307,18 +307,38 @@ async fn anomalies_reject_degenerate_parameters() {
         "/v1/anomalies?source=7&from=0&to=9000000000&window=0s",
         "/v1/anomalies?source=7&from=0&to=9000000000&threshold=-1",
         "/v1/anomalies?source=7&from=0&to=9000000000&eps_rel=NaN",
-        // a huge period over a tiny step: the position cap must reject it
-        // before anything allocates
-        "/v1/anomalies?source=7&from=0&to=900000000000000000&window=1h&step=1s",
     ] {
         let (status, _body) = serve(dir.path(), uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be rejected");
     }
 
-    let (status, _body) = serve(
+    let (status, body) = serve(
+        dir.path(),
+        "/v1/anomalies?source=7&from=0&to=900000000000000000&window=1h&step=1s",
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_problem(
+        &body,
+        status,
+        "query_limit_exceeded",
+        serde_json::json!({
+            "resource": "window_positions",
+            "limit": 10_000,
+            "observed": 899_999_996_402_u64,
+        }),
+    );
+
+    let (status, body) = serve(
         dir.path(),
         "/v1/anomalies?source=7&from=0&to=9000000000&section=nope",
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is a 404");
+    assert_problem(
+        &body,
+        status,
+        "unknown_section",
+        serde_json::json!({ "section": "nope" }),
+    );
 }

@@ -4,13 +4,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
-use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{RawQuery, State};
 use axum::response::{IntoResponse, Response};
 use kronika_reader::{LocalDirSnapshot, QueryError, logical_section};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::AppState;
 use crate::anomaly::ScanParams;
@@ -20,11 +17,14 @@ use crate::incident::{
     AnalyzeError, ClockRelation, EventConfig, EventError, EventLens, IncidentConfig, Lens,
     active_catalog, analyze, evaluate_events, event_catalog,
 };
-use crate::incident_input::{InputError, InputLimits, prepare_input, scan_position_count};
-use crate::incident_response::{
-    ResponseInput, build_response, identity_response, no_data_response,
+use crate::incident_input::{
+    InputError, InputLimits, MaterializationKind, prepare_input, scan_position_count,
 };
-use crate::params::{bad_request, parse_duration_us, parse_f64_non_negative, parse_i64, parse_u64};
+use crate::incident_response::{
+    IdentityIssue, ResponseInput, build_response, identity_response, no_data_response,
+};
+use crate::params::{QueryParams, parse_duration_us, parse_f64_non_negative, parse_i64, parse_u64};
+use crate::problem::{ApiProblem, LimitResource, QueryConstraint, QueryParameter, count_u64};
 
 const WINDOW_DEFAULT_US: i64 = 300 * 1_000_000;
 const STEP_DEFAULT_US: i64 = 60 * 1_000_000;
@@ -33,50 +33,23 @@ const EPS_REL_DEFAULT: f64 = 0.05;
 const MAX_CLUSTER_SPAN_DEFAULT_US: i64 = 3_600 * 1_000_000;
 /// Hard public interval for bounded store scans.
 const MAX_QUERY_SPAN_US: i64 = 24 * 3_600 * 1_000_000;
-const RETRY_AFTER_SECONDS: &str = "1";
+const INCIDENT_PARAMS: &[QueryParameter] = &[
+    QueryParameter::Source,
+    QueryParameter::From,
+    QueryParameter::To,
+    QueryParameter::Window,
+    QueryParameter::Step,
+    QueryParameter::Threshold,
+    QueryParameter::EpsRel,
+    QueryParameter::Epsilon,
+    QueryParameter::MaxClusterSpan,
+    QueryParameter::Section,
+];
 
 struct IncidentParams {
     scan: ScanParams,
     epsilon_us: i64,
     max_cluster_span_us: i64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct IncidentQuery {
-    source: Option<String>,
-    from: Option<String>,
-    to: Option<String>,
-    window: Option<String>,
-    step: Option<String>,
-    threshold: Option<String>,
-    eps_rel: Option<String>,
-    epsilon: Option<String>,
-    max_cluster_span: Option<String>,
-    section: Option<String>,
-}
-
-impl IncidentQuery {
-    fn into_params(self) -> std::collections::HashMap<String, String> {
-        let mut params = std::collections::HashMap::new();
-        for (name, value) in [
-            ("source", self.source),
-            ("from", self.from),
-            ("to", self.to),
-            ("window", self.window),
-            ("step", self.step),
-            ("threshold", self.threshold),
-            ("eps_rel", self.eps_rel),
-            ("epsilon", self.epsilon),
-            ("max_cluster_span", self.max_cluster_span),
-            ("section", self.section),
-        ] {
-            if let Some(value) = value {
-                params.insert(name.to_owned(), value);
-            }
-        }
-        params
-    }
 }
 
 struct ValidatedRequest {
@@ -85,84 +58,21 @@ struct ValidatedRequest {
     sections: Vec<&'static str>,
 }
 
-/// A handler failure as an HTTP status and a `{ error, detail }` body. The
-/// busy path additionally advertises `Retry-After`.
-struct IncidentError {
-    status: StatusCode,
-    body: Json<Value>,
-    retry_after: bool,
-}
-
-impl IncidentError {
-    fn new(status: StatusCode, code: &'static str, detail: &str) -> Self {
-        Self {
-            status,
-            body: Json(json!({ "error": code, "detail": detail })),
-            retry_after: false,
-        }
-    }
-
-    fn busy() -> Self {
-        let mut error = Self::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "analytic_capacity_unavailable",
-            "the analytic worker is busy; retry shortly",
-        );
-        error.retry_after = true;
-        error
-    }
-}
-
-impl IntoResponse for IncidentError {
-    fn into_response(self) -> Response {
-        if self.retry_after {
-            (
-                self.status,
-                [(header::RETRY_AFTER, RETRY_AFTER_SECONDS)],
-                self.body,
-            )
-                .into_response()
-        } else {
-            (self.status, self.body).into_response()
-        }
-    }
-}
-
-impl From<(StatusCode, Json<Value>)> for IncidentError {
-    fn from((status, body): (StatusCode, Json<Value>)) -> Self {
-        Self {
-            status,
-            body,
-            retry_after: false,
-        }
-    }
-}
-
 /// `GET /v1/incidents?source&from&to` returns clustered incidents.
 ///
 /// Optional parameters are `window`, `step`, `threshold`, `eps_rel`, `epsilon`,
 /// `max_cluster_span`, and `section`. All time inputs are unix microseconds.
-pub(crate) async fn incidents(
-    State(state): State<AppState>,
-    query: Result<Query<IncidentQuery>, QueryRejection>,
-) -> Response {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_rejection) => {
-            return IncidentError::new(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "query parameters must be known and may appear only once",
-            )
-            .into_response();
-        }
+pub(crate) async fn incidents(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let params = match QueryParams::parse(raw.as_deref(), INCIDENT_PARAMS) {
+        Ok(params) => params,
+        Err(problem) => return problem.into_response(),
     };
-    let request = match validate_request(&query.into_params()) {
+    let request = match validate_request(&params) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
     let Ok(permit) = state.try_acquire_analytic() else {
-        return IncidentError::busy().into_response();
+        return ApiProblem::analytic_capacity_unavailable().into_response();
     };
 
     match tokio::task::spawn_blocking(move || {
@@ -173,19 +83,12 @@ pub(crate) async fn incidents(
     {
         Ok(Ok(body)) => body.into_response(),
         Ok(Err(error)) => error.into_response(),
-        Err(_join) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "analytic_worker_failed",
-            "the analytic worker failed",
-        )
-        .into_response(),
+        Err(join) => logged_internal_problem("api_analytic_worker_failed", &join).into_response(),
     }
 }
 
-fn validate_request(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<ValidatedRequest, IncidentError> {
-    let source = parse_u64(params, "source")?;
+fn validate_request(params: &QueryParams) -> Result<ValidatedRequest, ApiProblem> {
+    let source = parse_u64(params, QueryParameter::Source)?;
     let request = parse_incident_params(params, &InputLimits::production())?;
     let sections = resolve_sections(params)?;
     Ok(ValidatedRequest {
@@ -195,7 +98,7 @@ fn validate_request(
     })
 }
 
-fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, IncidentError> {
+fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiProblem> {
     let ValidatedRequest {
         source,
         params: request,
@@ -221,7 +124,7 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
                 source,
                 &request.scan,
                 data_age,
-                "missing_node_identity",
+                IdentityIssue::Missing,
             )));
         }
         Err(InputError::ConflictingNodeIdentity) => {
@@ -229,7 +132,7 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
                 source,
                 &request.scan,
                 data_age,
-                "conflicting_node_identity",
+                IdentityIssue::Conflicting,
             )));
         }
         Err(error) => return Err(input_error_response(error)),
@@ -278,18 +181,10 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, Incid
     )))
 }
 
-fn resolve_sections(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<Vec<&'static str>, IncidentError> {
-    match params.get("section") {
+fn resolve_sections(params: &QueryParams) -> Result<Vec<&'static str>, ApiProblem> {
+    match params.get(QueryParameter::Section) {
         Some(name) => {
-            let logical = logical_section(name).ok_or_else(|| {
-                IncidentError::new(
-                    StatusCode::NOT_FOUND,
-                    "unknown_section",
-                    &format!("no section named `{name}`"),
-                )
-            })?;
+            let logical = logical_section(name).ok_or_else(|| ApiProblem::unknown_section(name))?;
             Ok(vec![logical.name])
         }
         None => Ok(scannable_sections()),
@@ -297,42 +192,50 @@ fn resolve_sections(
 }
 
 fn parse_incident_params(
-    params: &std::collections::HashMap<String, String>,
+    params: &QueryParams,
     limits: &InputLimits,
-) -> Result<IncidentParams, IncidentError> {
-    let from = parse_i64(params, "from")?;
-    let to = parse_i64(params, "to")?;
+) -> Result<IncidentParams, ApiProblem> {
+    let from = parse_i64(params, QueryParameter::From)?;
+    let to = parse_i64(params, QueryParameter::To)?;
     if from >= to {
-        return Err(bad_request("`from` must be before `to`").into());
+        return Err(ApiProblem::invalid_query_constraint(
+            QueryConstraint::FromBeforeTo,
+        ));
     }
     let span = to
         .checked_sub(from)
-        .ok_or_else(|| IncidentError::from(bad_request("the query interval overflows")))?;
+        .ok_or_else(|| ApiProblem::invalid_query_constraint(QueryConstraint::FiniteScan))?;
     if span > MAX_QUERY_SPAN_US {
-        return Err(IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "query_span_too_large",
-            "the query interval exceeds the 24-hour ceiling",
+        return Err(ApiProblem::query_limit_exceeded(
+            LimitResource::QuerySpanUs,
+            u64::try_from(MAX_QUERY_SPAN_US).unwrap_or(u64::MAX),
+            u64::try_from(span).ok(),
         ));
     }
-    let window = parse_duration_us(params, "window", WINDOW_DEFAULT_US)?;
-    let step = parse_duration_us(params, "step", STEP_DEFAULT_US)?;
-    let threshold = parse_f64_non_negative(params, "threshold", THRESHOLD_DEFAULT)?;
-    let eps_rel = parse_f64_non_negative(params, "eps_rel", EPS_REL_DEFAULT)?;
-    let epsilon_us = parse_duration_us(params, "epsilon", step)?;
+    let window = parse_duration_us(params, QueryParameter::Window, WINDOW_DEFAULT_US)?;
+    let step = parse_duration_us(params, QueryParameter::Step, STEP_DEFAULT_US)?;
+    let threshold = parse_f64_non_negative(params, QueryParameter::Threshold, THRESHOLD_DEFAULT)?;
+    let eps_rel = parse_f64_non_negative(params, QueryParameter::EpsRel, EPS_REL_DEFAULT)?;
+    let epsilon_us = parse_duration_us(params, QueryParameter::Epsilon, step)?;
     let max_cluster_span_us = parse_duration_us(
         params,
-        "max_cluster_span",
+        QueryParameter::MaxClusterSpan,
         MAX_CLUSTER_SPAN_DEFAULT_US.min(span),
     )?;
     if from.checked_add(window).is_none_or(|first| first > to) {
-        return Err(bad_request("`window` must fit inside [from, to]").into());
+        return Err(ApiProblem::invalid_query_constraint(
+            QueryConstraint::WindowWithinInterval,
+        ));
     }
     if epsilon_us > max_cluster_span_us {
-        return Err(bad_request("`epsilon` must not exceed `max_cluster_span`").into());
+        return Err(ApiProblem::invalid_query_constraint(
+            QueryConstraint::EpsilonNotGreaterThanMaxClusterSpan,
+        ));
     }
     if max_cluster_span_us > span {
-        return Err(bad_request("`max_cluster_span` must not exceed the query interval").into());
+        return Err(ApiProblem::invalid_query_constraint(
+            QueryConstraint::MaxClusterSpanWithinInterval,
+        ));
     }
     let scan_params = ScanParams {
         from,
@@ -343,12 +246,12 @@ fn parse_incident_params(
         eps_rel,
     };
     let positions = scan_position_count(&scan_params)
-        .ok_or_else(|| IncidentError::from(bad_request("the scan arithmetic is invalid")))?;
+        .ok_or_else(|| ApiProblem::invalid_query_constraint(QueryConstraint::FiniteScan))?;
     if positions > limits.position_limit() {
-        return Err(IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_many_positions",
-            "the scan exceeds the window-position ceiling",
+        return Err(ApiProblem::query_limit_exceeded(
+            LimitResource::WindowPositions,
+            count_u64(limits.position_limit()),
+            Some(count_u64(positions)),
         ));
     }
     Ok(IncidentParams {
@@ -379,170 +282,176 @@ fn source_data_age(snap: &LocalDirSnapshot, source: u64) -> Option<u64> {
 /// Admission caps hit before any scan runs are `413`; a malformed scan is a
 /// `400`; reader and registry-invariant failures are `500` — an absence of
 /// incidents is never masked as a read error.
-fn input_error_response(error: InputError) -> IncidentError {
+fn input_error_response(error: InputError) -> ApiProblem {
     match error {
-        InputError::NoData => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "no_data",
-            "the source has no unit over the requested period",
-        ),
-        InputError::UnknownSection(name) => IncidentError::new(
-            StatusCode::NOT_FOUND,
-            "unknown_section",
-            &format!("no section named `{name}`"),
-        ),
-        InputError::InvalidScan => IncidentError::new(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "the period, window, or step does not define a finite scan",
-        ),
-        InputError::PositionLimit { observed, limit } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_many_positions",
-            &format!(
-                "the scan would materialize {observed} window positions; the ceiling is {limit}"
-            ),
-        ),
-        InputError::UnitLimit { observed, limit } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_many_units",
-            &format!("{observed} store units overlap the request; the ceiling is {limit}"),
-        ),
-        InputError::SectionLimit { observed, limit } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_many_sections",
-            &format!("{observed} sections requested; the ceiling is {limit}"),
-        ),
-        InputError::MaterializationLimit { limit } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "result_too_large",
-            &format!("the request exceeds the {limit}-cell materialization ceiling; narrow it"),
-        ),
-        InputError::IdentityByteLimit { observed, limit } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "identity_too_large",
-            &format!("row identities need {observed} bytes; the ceiling is {limit}"),
-        ),
-        InputError::SeriesLimit { observed, limit } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_many_points",
-            &format!("the scan retains {observed} series points; the ceiling is {limit}"),
-        ),
-        InputError::MissingNodeIdentity | InputError::ConflictingNodeIdentity => {
-            IncidentError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "identity_mapping_invariant",
-                "identity quality was not mapped to a partial response",
-            )
+        InputError::NoData => logged_internal_problem("api_unmapped_no_data", &"no_data"),
+        InputError::UnknownSection(name) => {
+            logged_internal_problem("api_registry_section_missing", &name)
         }
+        InputError::InvalidScan => {
+            ApiProblem::invalid_query_constraint(QueryConstraint::FiniteScan)
+        }
+        InputError::PositionLimit { observed, limit } => ApiProblem::query_limit_exceeded(
+            LimitResource::WindowPositions,
+            count_u64(limit),
+            Some(count_u64(observed)),
+        ),
+        InputError::UnitLimit { observed, limit } => ApiProblem::query_limit_exceeded(
+            LimitResource::Units,
+            count_u64(limit),
+            Some(count_u64(observed)),
+        ),
+        InputError::SectionLimit { observed, limit } => ApiProblem::query_limit_exceeded(
+            LimitResource::Sections,
+            count_u64(limit),
+            Some(count_u64(observed)),
+        ),
+        InputError::MaterializationLimit { resource, limit } => ApiProblem::query_limit_exceeded(
+            match resource {
+                MaterializationKind::Cells => LimitResource::Cells,
+                MaterializationKind::Bytes => LimitResource::Bytes,
+            },
+            count_u64(limit),
+            None,
+        ),
+        InputError::IdentityByteLimit { observed, limit } => ApiProblem::query_limit_exceeded(
+            LimitResource::IdentityBytes,
+            count_u64(limit),
+            Some(count_u64(observed)),
+        ),
+        InputError::SeriesLimit { observed, limit } => ApiProblem::query_limit_exceeded(
+            LimitResource::SeriesPoints,
+            count_u64(limit),
+            Some(count_u64(observed)),
+        ),
+        InputError::MissingNodeIdentity => {
+            logged_internal_problem("api_identity_mapping_invariant", &IdentityIssue::Missing)
+        }
+        InputError::ConflictingNodeIdentity => logged_internal_problem(
+            "api_identity_mapping_invariant",
+            &IdentityIssue::Conflicting,
+        ),
         InputError::Read(error) => read_error_response(error),
-        InputError::UnknownColumn { section, column } => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "registry_invariant",
-            &format!("scanned column `{column}` is absent from section `{section}`"),
-        ),
-        InputError::DuplicateSeries { section, column } => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "duplicate_series",
-            &format!("section `{section}` column `{column}` was ingested twice"),
-        ),
+        InputError::UnknownColumn { section, column } => {
+            logged_internal_problem("api_registry_column_missing", &(section, column))
+        }
+        InputError::DuplicateSeries { section, column } => {
+            logged_internal_problem("api_duplicate_series", &(section, column))
+        }
         InputError::InvalidSeries {
             section,
             column,
             error,
-        } => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "invalid_series",
-            &format!(
-                "section `{section}` column `{column}` folded into an invalid series: {error:?}"
-            ),
-        ),
+        } => logged_internal_problem("api_invalid_series", &(section, column, error)),
     }
 }
 
-fn read_error_response(error: QueryError) -> IncidentError {
+fn read_error_response(error: QueryError) -> ApiProblem {
     match error {
-        QueryError::UnknownSection(name) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "registry_invariant",
-            &format!("resolved section `{name}` is absent from the registry"),
-        ),
-        QueryError::ResultTooLarge { max_cells } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "result_too_large",
-            &format!("the request exceeds the {max_cells}-cell reader ceiling"),
-        ),
-        QueryError::MaterializedBytesTooLarge { max_bytes } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "result_too_large",
-            &format!("the request exceeds the {max_bytes}-byte reader ceiling"),
-        ),
-        QueryError::BadCursor(_) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "reader_invariant",
-            "the incident reader produced an invalid internal cursor",
-        ),
-        QueryError::Read(_) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "store_read_failed",
-            "the store could not be read",
-        ),
+        QueryError::UnknownSection(name) => {
+            logged_internal_problem("api_registry_section_missing", &name)
+        }
+        QueryError::ResultTooLarge { max_cells } => {
+            ApiProblem::query_limit_exceeded(LimitResource::Cells, count_u64(max_cells), None)
+        }
+        QueryError::MaterializedBytesTooLarge { max_bytes } => {
+            ApiProblem::query_limit_exceeded(LimitResource::Bytes, count_u64(max_bytes), None)
+        }
+        QueryError::BadCursor(message) => {
+            logged_internal_problem("api_reader_cursor_invariant", &message)
+        }
+        QueryError::Read(read) => logged_store_read_problem(&read),
     }
 }
 
 /// Map an engine failure to an HTTP response. Admission caps are `413`; a
 /// registry inconsistency (duplicate lens id) is a `500`.
-fn analyze_error_response(error: AnalyzeError) -> IncidentError {
+fn analyze_error_response(error: AnalyzeError) -> ApiProblem {
     match error {
-        AnalyzeError::MissingNodeIdentity => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "missing_node_identity",
-            "the prepared input carried no node identity",
+        AnalyzeError::MissingNodeIdentity => {
+            logged_internal_problem("api_engine_identity_invariant", &"missing")
+        }
+        AnalyzeError::EpisodeLimit { observed, limit } => ApiProblem::query_limit_exceeded(
+            LimitResource::Episodes,
+            count_u64(limit),
+            Some(count_u64(observed)),
         ),
-        AnalyzeError::EpisodeLimit { observed, limit } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_many_episodes",
-            &format!("{observed} episodes clustered; the ceiling is {limit}"),
+        AnalyzeError::ClusterLimit { observed, limit } => ApiProblem::query_limit_exceeded(
+            LimitResource::Clusters,
+            count_u64(limit),
+            Some(count_u64(observed)),
         ),
-        AnalyzeError::ClusterLimit { observed, limit } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_many_clusters",
-            &format!("{observed} clusters formed; the ceiling is {limit}"),
+        AnalyzeError::Key(key) => ApiProblem::query_limit_exceeded(
+            LimitResource::IncidentKeyBytes,
+            count_u64(key.limit),
+            Some(count_u64(key.observed)),
         ),
-        AnalyzeError::Key(key) => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "incident_key_too_large",
-            &format!(
-                "an incident key needs {} bytes; the ceiling is {}",
-                key.observed, key.limit
-            ),
+        AnalyzeError::KeyBudget { observed, limit } => ApiProblem::query_limit_exceeded(
+            LimitResource::TotalIncidentKeyBytes,
+            count_u64(limit),
+            Some(count_u64(observed)),
         ),
-        AnalyzeError::KeyBudget { observed, limit } => IncidentError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "incident_keys_too_large",
-            &format!("incident keys need {observed} bytes; the ceiling is {limit}"),
-        ),
-        AnalyzeError::DuplicateLensId(_id) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "duplicate_lens_id",
-            "the lens catalog contains a duplicate id",
-        ),
-        AnalyzeError::Cluster(_) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cluster_error",
-            "clustering the episodes failed",
-        ),
+        AnalyzeError::DuplicateLensId(id) => logged_internal_problem("api_duplicate_lens_id", &id),
+        AnalyzeError::Cluster(error) => logged_internal_problem("api_cluster_invariant", &error),
     }
 }
 
 /// Map an event-pass failure to an HTTP response. A duplicate id is a static
 /// catalog inconsistency, so it is a `500`.
-fn event_error_response(error: EventError) -> IncidentError {
+fn event_error_response(error: EventError) -> ApiProblem {
     match error {
-        EventError::DuplicateLensId(_id) => IncidentError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "duplicate_lens_id",
-            "the event lens catalog contains a duplicate id",
-        ),
+        EventError::DuplicateLensId(id) => {
+            logged_internal_problem("api_duplicate_event_lens_id", &id)
+        }
+    }
+}
+
+fn logged_internal_problem(event: &'static str, error: &impl std::fmt::Debug) -> ApiProblem {
+    let problem = ApiProblem::internal_error();
+    tracing::error!(
+        event = event,
+        request_id = problem.request_id(),
+        error = ?error,
+        "internal API failure"
+    );
+    problem
+}
+
+fn logged_store_read_problem(error: &impl std::fmt::Debug) -> ApiProblem {
+    let problem = ApiProblem::store_read_failed();
+    tracing::error!(
+        event = "api_store_read_failed",
+        request_id = problem.request_id(),
+        error = ?error,
+        "incident store read failed"
+    );
+    problem
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::*;
+    use crate::problem::ProblemCode;
+
+    #[test]
+    fn materialization_failures_keep_their_resource_in_the_413_problem() {
+        for (resource, expected) in [
+            (MaterializationKind::Cells, "cells"),
+            (MaterializationKind::Bytes, "bytes"),
+        ] {
+            let problem = input_error_response(InputError::MaterializationLimit {
+                resource,
+                limit: 17,
+            });
+            assert_eq!(problem.code(), ProblemCode::QueryLimitExceeded);
+            assert_eq!(problem.code().status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body = serde_json::to_value(problem).expect("problem JSON");
+            assert_eq!(
+                body["params"],
+                serde_json::json!({ "resource": expected, "limit": 17 })
+            );
+        }
     }
 }

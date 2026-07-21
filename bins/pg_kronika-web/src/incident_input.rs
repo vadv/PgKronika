@@ -79,6 +79,13 @@ pub(crate) struct InputLimits {
     snapshot_rows: usize,
 }
 
+/// Resource dimension that exhausted a reader materialization budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaterializationKind {
+    Cells,
+    Bytes,
+}
+
 impl InputLimits {
     /// Fixed ceilings for collection sizes and work units.
     ///
@@ -147,7 +154,10 @@ pub(crate) enum InputError {
     /// More unique sections were requested than the request ceiling allows.
     SectionLimit { observed: usize, limit: usize },
     /// The requested pages exceeded the request-wide materialization ceiling.
-    MaterializationLimit { limit: usize },
+    MaterializationLimit {
+        resource: MaterializationKind,
+        limit: usize,
+    },
     /// No resolved node id covers the requested source and interval.
     MissingNodeIdentity,
     /// The interval spans more than one node id for the same source.
@@ -179,8 +189,11 @@ pub(crate) struct SectionSkip {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkipReason {
-    /// The section did not fit the remaining materialized-cell budget.
-    MaterializationLimit { limit: usize },
+    /// The section did not fit its materialization budget.
+    MaterializationLimit {
+        resource: MaterializationKind,
+        limit: usize,
+    },
     /// The period had more rows than one page could hold.
     IncompletePage,
     /// Scoring the section would exceed the request's numeric-scan budget.
@@ -572,7 +585,7 @@ fn read_input_pages(
         None,
         QueryLimits::with_bytes(DIFF_MAX_ROWS, remaining_cells, limits.materialized_bytes),
     )
-    .map_err(|err| map_query_error(err, limits.materialized_cells))?;
+    .map_err(|err| map_query_error(err, limits.materialized_cells, limits.materialized_bytes))?;
     charge_materialized_cells(
         &metadata_page,
         &mut remaining_cells,
@@ -602,6 +615,7 @@ fn read_input_pages(
         )?,
         Err(QueryError::MaterializedBytesTooLarge { .. }) => {
             return Err(InputError::MaterializationLimit {
+                resource: MaterializationKind::Bytes,
                 limit: limits.materialized_bytes,
             });
         }
@@ -630,7 +644,11 @@ fn read_partial_pages(
     let per_section_bytes = materialized_byte_limit / names.len().max(1);
     for &name in names {
         if remaining_cells == 0 {
-            skipped.push(materialization_skip(name, materialization_limit)?);
+            skipped.push(materialization_skip(
+                name,
+                MaterializationKind::Cells,
+                materialization_limit,
+            )?);
             continue;
         }
         match section_with_limits(
@@ -646,24 +664,33 @@ fn read_partial_pages(
                 charge_materialized_cells(&page, &mut remaining_cells, materialization_limit)?;
                 pages.insert(name.to_owned(), page);
             }
-            Err(
-                QueryError::ResultTooLarge { .. } | QueryError::MaterializedBytesTooLarge { .. },
-            ) => {
-                skipped.push(materialization_skip(name, materialization_limit)?);
+            Err(QueryError::ResultTooLarge { .. }) => {
+                skipped.push(materialization_skip(
+                    name,
+                    MaterializationKind::Cells,
+                    materialization_limit,
+                )?);
                 remaining_cells = 0;
             }
+            Err(QueryError::MaterializedBytesTooLarge { .. }) => skipped.push(
+                materialization_skip(name, MaterializationKind::Bytes, per_section_bytes)?,
+            ),
             Err(error) => return Err(InputError::Read(error)),
         }
     }
     Ok((pages, skipped))
 }
 
-fn materialization_skip(name: &str, limit: usize) -> Result<SectionSkip, InputError> {
+fn materialization_skip(
+    name: &str,
+    resource: MaterializationKind,
+    limit: usize,
+) -> Result<SectionSkip, InputError> {
     let logical =
         logical_section(name).ok_or_else(|| InputError::UnknownSection(name.to_owned()))?;
     Ok(SectionSkip {
         section: logical.name,
-        reason: SkipReason::MaterializationLimit { limit },
+        reason: SkipReason::MaterializationLimit { resource, limit },
     })
 }
 
@@ -1463,13 +1490,20 @@ pub(crate) fn scan_position_count(scan: &ScanParams) -> Option<usize> {
     usize::try_from(interior.checked_add(1)?).ok()
 }
 
-fn map_query_error(error: QueryError, materialization_limit: usize) -> InputError {
+fn map_query_error(
+    error: QueryError,
+    materialized_cell_limit: usize,
+    materialized_byte_limit: usize,
+) -> InputError {
     match error {
-        QueryError::ResultTooLarge { .. } | QueryError::MaterializedBytesTooLarge { .. } => {
-            InputError::MaterializationLimit {
-                limit: materialization_limit,
-            }
-        }
+        QueryError::ResultTooLarge { .. } => InputError::MaterializationLimit {
+            resource: MaterializationKind::Cells,
+            limit: materialized_cell_limit,
+        },
+        QueryError::MaterializedBytesTooLarge { .. } => InputError::MaterializationLimit {
+            resource: MaterializationKind::Bytes,
+            limit: materialized_byte_limit,
+        },
         other => InputError::Read(other),
     }
 }
@@ -1482,11 +1516,17 @@ fn charge_materialized_cells(
     let cells = page.rows.iter().try_fold(0_usize, |total, row| {
         total
             .checked_add(row.len())
-            .ok_or(InputError::MaterializationLimit { limit })
+            .ok_or(InputError::MaterializationLimit {
+                resource: MaterializationKind::Cells,
+                limit,
+            })
     })?;
     *remaining = remaining
         .checked_sub(cells)
-        .ok_or(InputError::MaterializationLimit { limit })?;
+        .ok_or(InputError::MaterializationLimit {
+            resource: MaterializationKind::Cells,
+            limit,
+        })?;
     Ok(())
 }
 
@@ -2808,18 +2848,81 @@ mod tests {
                 SectionSkip {
                     section: "pg_stat_archiver",
                     reason: SkipReason::MaterializationLimit {
+                        resource: MaterializationKind::Cells,
                         limit: limits.materialized_cells,
                     },
                 },
                 SectionSkip {
                     section: SNAPSHOT_COVERAGE,
                     reason: SkipReason::MaterializationLimit {
+                        resource: MaterializationKind::Cells,
                         limit: limits.materialized_cells,
                     },
                 },
             ]
         );
         assert!(prepared.episodes.is_empty());
+    }
+
+    #[test]
+    fn byte_materialization_is_typed_on_full_failure_and_partial_skip() {
+        use kronika_registry::Ts;
+        use kronika_registry::pg_stat_archiver::PgStatArchiver;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rows = [PgStatArchiver {
+            ts: Ts(0),
+            archived_count: 1,
+            last_archived_wal: None,
+            last_archived_time: None,
+            failed_count: 0,
+            last_failed_wal: None,
+            last_failed_time: None,
+            stats_reset: None,
+        }];
+        write_archiver_segment(&dir.path().join("0.pgm"), &rows, 0, MINUTE);
+        let scan = ScanParams {
+            from: 0,
+            to: MINUTE,
+            window: MINUTE,
+            step: MINUTE,
+            threshold: 3.5,
+            eps_rel: 0.05,
+        };
+
+        let mut limits = InputLimits::for_test();
+        limits.materialized_bytes = 1;
+        let mut snap = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+        assert!(matches!(
+            prepare_input(&mut snap, 7, &scan, &["pg_stat_archiver"], &limits),
+            Err(InputError::MaterializationLimit {
+                resource: MaterializationKind::Bytes,
+                limit: 1,
+            })
+        ));
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).expect("reopen snapshot");
+        let (pages, skipped) = read_partial_pages(
+            &mut snap,
+            7,
+            &scan,
+            &["pg_stat_archiver", "pg_stat_wal"],
+            limits.materialized_cells,
+            limits.materialized_cells,
+            2,
+        )
+        .expect("a per-section byte failure is a successful partial read");
+        assert!(pages.contains_key("pg_stat_wal"));
+        assert_eq!(
+            skipped,
+            vec![SectionSkip {
+                section: "pg_stat_archiver",
+                reason: SkipReason::MaterializationLimit {
+                    resource: MaterializationKind::Bytes,
+                    limit: 1,
+                },
+            }]
+        );
     }
 
     #[test]

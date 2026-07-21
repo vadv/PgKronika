@@ -1994,6 +1994,7 @@ dependencies = [
  "axum",
  "base64",
  "criterion",
+ "form_urlencoded",
  "http-body-util",
  "kronika-analytics",
  "kronika-format",

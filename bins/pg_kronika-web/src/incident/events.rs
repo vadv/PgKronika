@@ -34,49 +34,40 @@ const SQLSTATE_INDEX_CORRUPTED: &str = "XX002";
 pub(crate) struct EventCatalogEntry {
     pub lens_id: &'static str,
     pub slug: &'static str,
-    pub question: &'static str,
 }
 
 const EVENT_CATALOG_METADATA: &[EventCatalogEntry] = &[
     EventCatalogEntry {
         lens_id: "PG-EVT-001",
         slug: "server_child_sigkill",
-        question: "Зафиксировал ли stderr завершение процесса PostgreSQL сигналом 9?",
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-002",
         slug: "server_child_signal_termination",
-        question: "Зафиксировал ли stderr аварийное завершение процесса PostgreSQL сигналом?",
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-003",
         slug: "panic_severity_observation",
-        question: "Наблюдалась ли в stderr запись с уровнем PANIC?",
     },
     EventCatalogEntry {
         lens_id: "OS-FS-027",
         slug: "filesystem_space",
-        question: "Есть ли признак отказа из-за нехватки пространства или связанного лимита?",
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-005",
         slug: "postgres_out_of_memory_observation",
-        question: "Наблюдался ли в stderr признак ошибки PostgreSQL out_of_memory?",
     },
     EventCatalogEntry {
         lens_id: "PG-CONN-014",
         slug: "connection_saturation",
-        question: "Есть ли признак отклонённого подключения из-за лимита соединений?",
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-007",
         slug: "deadlock_observation",
-        question: "Наблюдался ли в stderr признак обнаруженного PostgreSQL deadlock?",
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-008",
         slug: "corruption_sqlstate_observation",
-        question: "Наблюдался ли в stderr признак SQLSTATE XX001 или XX002?",
     },
 ];
 

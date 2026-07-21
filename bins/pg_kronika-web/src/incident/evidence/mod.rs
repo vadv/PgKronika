@@ -22,7 +22,8 @@ pub(crate) use counter::{
     CounterMeasurementKind, CounterOperand, CounterOperandPurpose,
 };
 pub(crate) use coverage::{
-    SourceWindow, observed_period_from_durations, observed_period_from_timestamps,
+    SourceWindow, SourceWindowGapReason, observed_period_from_durations,
+    observed_period_from_timestamps,
 };
 pub(crate) use direct::{DirectEvidence, LockParticipant, SampledLockEdge};
 pub(crate) use finding::{Evidence, Finding, FindingDraft, FindingScope};

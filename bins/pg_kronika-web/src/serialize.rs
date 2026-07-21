@@ -267,6 +267,28 @@ mod tests {
     }
 
     #[test]
+    fn source_and_user_text_remains_literal() {
+        let literal = "ОШИБКА: relation пользователь.таблица; /srv/pg data; SELECT $1";
+        let literal_len = u64::try_from(literal.len()).expect("literal length fits u64");
+        assert_eq!(
+            value_to_json(&CellValue::Str(literal.to_owned())),
+            serde_json::json!(literal)
+        );
+        assert_eq!(
+            value_to_json(&CellValue::Blob {
+                text: literal.to_owned(),
+                full_len: literal_len,
+                truncated: false,
+            }),
+            serde_json::json!({
+                "text": literal,
+                "full_len": literal_len,
+                "truncated": false,
+            })
+        );
+    }
+
+    #[test]
     fn series_diff_to_json_shapes_keys_columns_and_reasons() {
         use kronika_reader::{ColumnDiff, DiffAt, DiffPoint, Reason, Scalar, SeriesDiff};
 
@@ -291,6 +313,12 @@ mod tests {
                             dt_micros: 2_000,
                         },
                     },
+                    DiffAt {
+                        ts: 5_000,
+                        point: DiffPoint::NoData {
+                            reason: Reason::Reset,
+                        },
+                    },
                 ],
             }],
         }];
@@ -303,6 +331,7 @@ mod tests {
                     "calls": [
                         { "ts": 1_000, "nodata": "first_point" },
                         { "ts": 3_000, "delta": 10, "rate": 5.0, "dt_micros": 2_000 },
+                        { "ts": 5_000, "nodata": "reset" },
                     ]
                 }
             }])

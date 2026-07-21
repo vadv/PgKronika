@@ -25,9 +25,11 @@ async fn segments_missing_a_required_parameter_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "a missing source is a client error"
     );
-    assert_eq!(
-        body["error"], "bad_request",
-        "the error body names the fault"
+    assert_problem(
+        &body,
+        status,
+        "missing_query_parameter",
+        serde_json::json!({ "parameter": "source" }),
     );
 }
 
@@ -42,15 +44,11 @@ async fn segments_non_numeric_parameter_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "a non-numeric source is a client error"
     );
-    assert_eq!(
-        body["error"], "bad_request",
-        "the error body names the fault"
-    );
-    assert!(
-        body["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("unsigned integer")),
-        "the detail explains the parse failure, distinct from a missing parameter"
+    assert_problem(
+        &body,
+        status,
+        "invalid_query_parameter",
+        serde_json::json!({ "parameter": "source", "expected": "uint64" }),
     );
 }
 
@@ -166,9 +164,11 @@ async fn section_unknown_name_is_not_found() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "an unknown section is 404");
-    assert_eq!(
-        body["error"], "unknown_section",
-        "the error body names the fault"
+    assert_problem(
+        &body,
+        status,
+        "unknown_section",
+        serde_json::json!({ "section": "does_not_exist" }),
     );
 }
 
@@ -194,9 +194,11 @@ async fn section_bad_parameter_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "a non-numeric source is 400"
     );
-    assert_eq!(
-        body["error"], "bad_request",
-        "the error body names the fault"
+    assert_problem(
+        &body,
+        status,
+        "invalid_query_parameter",
+        serde_json::json!({ "parameter": "source", "expected": "uint64" }),
     );
 }
 
@@ -275,10 +277,7 @@ async fn section_malformed_cursor_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "a malformed cursor is a client error"
     );
-    assert_eq!(
-        body["error"], "bad_cursor",
-        "the error body names the fault"
-    );
+    assert_problem(&body, status, "invalid_cursor", serde_json::json!({}));
 }
 
 #[tokio::test]
@@ -348,9 +347,11 @@ async fn sections_batch_without_names_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "batch without names is a client error"
     );
-    assert_eq!(
-        body["error"], "bad_request",
-        "the error body names the fault"
+    assert_problem(
+        &body,
+        status,
+        "missing_query_parameter",
+        serde_json::json!({ "parameter": "names" }),
     );
 }
 
@@ -376,8 +377,10 @@ async fn sections_batch_with_only_separators_is_a_bad_request() {
         StatusCode::BAD_REQUEST,
         "a names list of only separators names no section"
     );
-    assert_eq!(
-        body["error"], "bad_request",
-        "the error body names the fault"
+    assert_problem(
+        &body,
+        status,
+        "invalid_query_parameter",
+        serde_json::json!({ "parameter": "names", "expected": "section_list" }),
     );
 }

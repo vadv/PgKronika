@@ -1,0 +1,991 @@
+{
+  "openapi": "3.2.0",
+  "info": {
+    "title": "PgKronika machine API",
+    "version": "0.0.0",
+    "summary": "Pre-release locale-neutral API contract"
+  },
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "x-pgkronika-locale-policy": {
+    "data": "locale-neutral",
+    "problems": "locale-neutral",
+    "acceptLanguage": "ignored",
+    "contentLanguage": "absent",
+    "languageVary": "absent"
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "Process liveness representation",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Health" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "description": "Ready state",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Readiness" }
+              }
+            }
+          },
+          "503": {
+            "description": "Not-ready state; this probe representation is not Problem Details",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Readiness" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "metrics",
+        "responses": {
+          "200": {
+            "description": "Prometheus exposition",
+            "content": {
+              "text/plain; version=0.0.4": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/version": {
+      "get": {
+        "operationId": "version",
+        "security": [{ "basicAuth": [] }, {}],
+        "responses": {
+          "200": {
+            "description": "API and PGM format versions",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Version" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/sources": {
+      "get": {
+        "operationId": "sources",
+        "security": [{ "basicAuth": [] }, {}],
+        "responses": {
+          "200": {
+            "description": "Source catalog",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Sources" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/sections": {
+      "get": {
+        "operationId": "sections",
+        "security": [{ "basicAuth": [] }, {}],
+        "responses": {
+          "200": {
+            "description": "Stable registry metadata",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Sections" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/segments": {
+      "get": {
+        "operationId": "segments",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/source" },
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Overlapping segment metadata",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Segments" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/section/{name}": {
+      "get": {
+        "operationId": "sectionData",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/name" },
+          { "$ref": "#/components/parameters/source" },
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/cursor" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Typed rows; literal source and user strings are unchanged",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/NeutralObject" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "404": { "$ref": "#/components/responses/ApplicationProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/sections/batch": {
+      "get": {
+        "operationId": "sectionsBatch",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/source" },
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/names" },
+          { "$ref": "#/components/parameters/limit" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pages keyed by stable section name",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/NeutralObject" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "404": { "$ref": "#/components/responses/ApplicationProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/section/{name}/diff": {
+      "get": {
+        "operationId": "sectionDiff",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/name" },
+          { "$ref": "#/components/parameters/source" },
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Machine counter deltas and no-data enums",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DiffResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "404": { "$ref": "#/components/responses/ApplicationProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/sections/batch/diff": {
+      "get": {
+        "operationId": "sectionsBatchDiff",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/source" },
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/names" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Diffs keyed by stable section name",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BatchDiffResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "404": { "$ref": "#/components/responses/ApplicationProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/anomalies": {
+      "get": {
+        "operationId": "anomalies",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/source" },
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/window" },
+          { "$ref": "#/components/parameters/step" },
+          { "$ref": "#/components/parameters/threshold" },
+          { "$ref": "#/components/parameters/epsRel" },
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/section" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Locale-neutral anomaly result with typed reasons",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AnomalyResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "404": { "$ref": "#/components/responses/ApplicationProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" },
+          "503": { "$ref": "#/components/responses/AnalyticCapacityProblem" }
+        }
+      }
+    },
+    "/v1/incidents": {
+      "get": {
+        "operationId": "incidents",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/source" },
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/window" },
+          { "$ref": "#/components/parameters/step" },
+          { "$ref": "#/components/parameters/threshold" },
+          { "$ref": "#/components/parameters/epsRel" },
+          { "$ref": "#/components/parameters/epsilon" },
+          { "$ref": "#/components/parameters/maxClusterSpan" },
+          { "$ref": "#/components/parameters/section" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Locale-neutral incidents, evidence, catalogs, and typed reasons",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IncidentResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "404": { "$ref": "#/components/responses/ApplicationProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" },
+          "503": { "$ref": "#/components/responses/AnalyticCapacityProblem" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "basicAuth": {
+        "type": "http",
+        "scheme": "basic"
+      }
+    },
+    "parameters": {
+      "name": { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } },
+      "source": { "name": "source", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0 } },
+      "from": { "name": "from", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } },
+      "to": { "name": "to", "in": "query", "required": true, "schema": { "type": "integer", "format": "int64" } },
+      "window": { "name": "window", "in": "query", "required": false, "schema": { "type": "string" } },
+      "step": { "name": "step", "in": "query", "required": false, "schema": { "type": "string" } },
+      "threshold": { "name": "threshold", "in": "query", "required": false, "schema": { "type": "number", "minimum": 0 } },
+      "epsRel": { "name": "eps_rel", "in": "query", "required": false, "schema": { "type": "number", "minimum": 0 } },
+      "epsilon": { "name": "epsilon", "in": "query", "required": false, "schema": { "type": "string" } },
+      "maxClusterSpan": { "name": "max_cluster_span", "in": "query", "required": false, "schema": { "type": "string" } },
+      "section": { "name": "section", "in": "query", "required": false, "schema": { "type": "string" } },
+      "names": { "name": "names", "in": "query", "required": true, "schema": { "type": "string" } },
+      "limit": { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 10000 } },
+      "cursor": { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } }
+    },
+    "headers": {
+      "ProblemCacheControl": {
+        "description": "Always no-store",
+        "schema": { "type": "string", "const": "no-store" }
+      },
+      "ProblemRequestId": {
+        "description": "Opaque server-generated correlation id used by instance",
+        "schema": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+      },
+      "ProblemWwwAuthenticate": {
+        "description": "Basic authentication challenge",
+        "schema": { "type": "string", "const": "Basic realm=\"pg_kronika-web\"" }
+      },
+      "ProblemAllow": {
+        "description": "Methods supported by the addressed API resource",
+        "schema": { "type": "string", "const": "GET, HEAD" }
+      },
+      "ProblemRetryAfter": {
+        "description": "Seconds before retrying an analytic capacity request",
+        "schema": { "type": "integer", "const": 1 }
+      }
+    },
+    "responses": {
+      "ApplicationProblem": {
+        "description": "Locale-neutral RFC 9457 application error",
+        "headers": {
+          "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
+          "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "#/components/schemas/Problem" }
+          }
+        }
+      },
+      "UnauthorizedProblem": {
+        "description": "Locale-neutral RFC 9457 authentication error",
+        "headers": {
+          "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
+          "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
+          "WWW-Authenticate": { "$ref": "#/components/headers/ProblemWwwAuthenticate" }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "#/components/schemas/Problem" }
+          }
+        }
+      },
+      "MethodNotAllowedProblem": {
+        "description": "Locale-neutral RFC 9457 method error",
+        "headers": {
+          "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
+          "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
+          "Allow": { "$ref": "#/components/headers/ProblemAllow" }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "#/components/schemas/Problem" }
+          }
+        }
+      },
+      "AnalyticCapacityProblem": {
+        "description": "Locale-neutral RFC 9457 analytic capacity error",
+        "headers": {
+          "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
+          "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
+          "Retry-After": { "$ref": "#/components/headers/ProblemRetryAfter" }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "#/components/schemas/Problem" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Health": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status"],
+        "properties": { "status": { "type": "string", "const": "ok" } }
+      },
+      "Readiness": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ready", "seconds_since_refresh"],
+        "properties": {
+          "ready": { "type": "boolean" },
+          "seconds_since_refresh": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "Version": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["api", "format_version"],
+        "properties": {
+          "api": { "type": "string", "const": "v1" },
+          "format_version": { "type": "integer", "minimum": 1 }
+        }
+      },
+      "Sources": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sources"],
+        "properties": {
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source_id", "min_ts", "max_ts", "segments"],
+              "properties": {
+                "source_id": { "type": "integer", "minimum": 0 },
+                "min_ts": { "type": "integer", "format": "int64" },
+                "max_ts": { "type": "integer", "format": "int64" },
+                "segments": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        }
+      },
+      "Sections": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sections"],
+        "properties": {
+          "sections": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SectionCatalogEntry" }
+          }
+        }
+      },
+      "SectionCatalogEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "semantics", "sort_key", "columns"],
+        "properties": {
+          "name": { "type": "string" },
+          "semantics": {
+            "type": "string",
+            "enum": ["snapshot_full", "conditional_full", "event_stream", "changed", "on_change"]
+          },
+          "sort_key": { "type": "array", "items": { "type": "string" } },
+          "columns": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SectionColumn" }
+          }
+        }
+      },
+      "SectionColumn": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "type", "class"],
+        "properties": {
+          "name": { "type": "string" },
+          "type": {
+            "type": "string",
+            "enum": ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "bool", "ts", "str", "list_i32"]
+          },
+          "class": { "type": "string", "enum": ["c", "g", "l", "t"] }
+        }
+      },
+      "Segments": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["segments"],
+        "properties": {
+          "segments": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Segment" }
+          }
+        }
+      },
+      "Segment": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["segment_id", "source_id", "min_ts", "max_ts", "sections"],
+        "properties": {
+          "segment_id": { "type": "string", "pattern": "^-?[0-9]+$" },
+          "source_id": { "type": "integer", "minimum": 0 },
+          "min_ts": { "type": "integer", "format": "int64" },
+          "max_ts": { "type": "integer", "format": "int64" },
+          "sections": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SegmentSection" }
+          }
+        }
+      },
+      "SegmentSection": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "rows"],
+        "properties": {
+          "name": { "type": "string" },
+          "rows": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "NeutralObject": {
+        "type": "object",
+        "description": "Machine data only; raw source and user strings remain literal"
+      },
+      "MachineValue": {
+        "oneOf": [
+          { "type": "null" },
+          { "type": "number" },
+          { "type": "boolean" },
+          { "type": "string" },
+          { "type": "array", "items": { "type": "integer", "format": "int32" } },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text", "full_len", "truncated"],
+            "properties": {
+              "text": { "type": "string" },
+              "full_len": { "type": "integer", "minimum": 0 },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        ]
+      },
+      "DiffValuePoint": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ts", "delta", "rate", "dt_micros"],
+        "properties": {
+          "ts": { "type": "integer", "format": "int64" },
+          "delta": { "type": ["number", "null"] },
+          "rate": { "type": ["number", "null"] },
+          "dt_micros": { "type": "integer", "format": "int64", "minimum": 1 }
+        }
+      },
+      "DiffNoDataPoint": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ts", "nodata"],
+        "properties": {
+          "ts": { "type": "integer", "format": "int64" },
+          "nodata": { "type": "string", "enum": ["reset", "gap", "first_point", "anomaly", "not_collected"] }
+        }
+      },
+      "DiffPoint": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/DiffValuePoint" },
+          { "$ref": "#/components/schemas/DiffNoDataPoint" }
+        ]
+      },
+      "DiffSeries": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "columns"],
+        "properties": {
+          "key": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/MachineValue" } },
+          "columns": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": { "$ref": "#/components/schemas/DiffPoint" }
+            }
+          }
+        }
+      },
+      "DiffSection": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section", "identity", "series"],
+        "properties": {
+          "section": { "type": "string" },
+          "identity": { "type": "array", "items": { "type": "string" } },
+          "series": { "type": "array", "items": { "$ref": "#/components/schemas/DiffSeries" } }
+        }
+      },
+      "DiffResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_id", "section", "identity", "series"],
+        "properties": {
+          "source_id": { "type": "integer", "minimum": 0 },
+          "section": { "type": "string" },
+          "identity": { "type": "array", "items": { "type": "string" } },
+          "series": { "type": "array", "items": { "$ref": "#/components/schemas/DiffSeries" } }
+        }
+      },
+      "BatchDiffResponse": {
+        "type": "object",
+        "additionalProperties": { "$ref": "#/components/schemas/DiffSection" }
+      },
+      "AnomalyResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_id", "from", "to", "window_us", "step_us", "threshold", "eps_rel", "limit", "episodes", "sections", "skipped"],
+        "properties": {
+          "source_id": { "type": "integer", "minimum": 0 },
+          "from": { "type": "integer", "format": "int64" },
+          "to": { "type": "integer", "format": "int64" },
+          "window_us": { "type": "integer", "format": "int64", "minimum": 1 },
+          "step_us": { "type": "integer", "format": "int64", "minimum": 1 },
+          "threshold": { "type": "number", "minimum": 0 },
+          "eps_rel": { "type": "number", "minimum": 0 },
+          "limit": { "type": "integer", "minimum": 0 },
+          "episodes": { "type": "array", "items": { "$ref": "#/components/schemas/NeutralObject" } },
+          "sections": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/NeutralObject" } },
+          "skipped": { "type": "array", "items": { "$ref": "#/components/schemas/SectionReason" } }
+        }
+      },
+      "SectionReason": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section", "reason"],
+        "properties": {
+          "section": { "type": "string" },
+          "reason": { "$ref": "#/components/schemas/Reason" }
+        }
+      },
+      "IncidentResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_id", "from", "to", "complete", "clustering_complete", "analysis_status", "incidents", "coverage_by_section", "data_age_seconds", "catalog", "log", "data_quality", "skipped"],
+        "properties": {
+          "source_id": { "type": "integer", "minimum": 0 },
+          "from": { "type": "integer", "format": "int64" },
+          "to": { "type": "integer", "format": "int64" },
+          "complete": { "type": "boolean" },
+          "clustering_complete": { "type": "boolean" },
+          "analysis_status": { "type": "string", "enum": ["no_data", "partial", "insufficient_data", "calm", "incidents_detected", "missing_node_identity", "conflicting_node_identity"] },
+          "incidents": { "type": "array", "items": { "$ref": "#/components/schemas/NeutralObject" } },
+          "coverage_by_section": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/NeutralObject" } },
+          "data_age_seconds": { "type": ["integer", "null"], "minimum": 0 },
+          "catalog": { "$ref": "#/components/schemas/IncidentCatalog" },
+          "log": { "$ref": "#/components/schemas/IncidentLog" },
+          "data_quality": { "$ref": "#/components/schemas/NeutralObject" },
+          "skipped": { "$ref": "#/components/schemas/IncidentSkipped" }
+        }
+      },
+      "IncidentCatalog": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "status", "requirements_status", "diagnosis_available", "scope", "applied", "active_count", "catalog_count", "capabilities", "dormant"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "status": { "type": "string", "const": "partial" },
+          "requirements_status": { "type": "string", "const": "incomplete" },
+          "diagnosis_available": { "type": "boolean" },
+          "scope": { "type": "string", "const": "diagnostic_lenses" },
+          "applied": { "type": "array", "items": { "type": "string" } },
+          "active_count": { "type": "integer", "minimum": 0 },
+          "catalog_count": { "type": "integer", "minimum": 0 },
+          "capabilities": { "type": "array", "items": { "$ref": "#/components/schemas/LensCapability" } },
+          "dormant": { "type": "array", "items": { "$ref": "#/components/schemas/DormantLens" } }
+        }
+      },
+      "LensCapability": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lens_id", "section", "status", "reason"],
+        "properties": {
+          "lens_id": { "type": "string" },
+          "section": { "type": "string" },
+          "status": { "type": "string", "enum": ["available", "partial", "not_collected"] },
+          "reason": { "$ref": "#/components/schemas/Reason" }
+        }
+      },
+      "DormantLens": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lens_id", "slug", "domain", "confidence_cap", "awaiting", "requirements_status"],
+        "properties": {
+          "lens_id": { "type": "string" },
+          "slug": { "type": "string" },
+          "domain": { "type": "string" },
+          "confidence_cap": { "type": "string" },
+          "awaiting": { "type": "array", "items": { "type": "string" } },
+          "requirements_status": { "type": "string", "const": "incomplete" }
+        }
+      },
+      "IncidentLog": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "complete", "evaluated_lens_ids", "catalog", "findings", "coverage", "skipped"],
+        "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
+          "complete": { "type": "boolean" },
+          "evaluated_lens_ids": { "type": "array", "items": { "type": "string" } },
+          "catalog": { "type": "array", "items": { "$ref": "#/components/schemas/EventCatalogEntry" } },
+          "findings": { "type": "array", "items": { "$ref": "#/components/schemas/NeutralObject" } },
+          "coverage": { "type": "object", "additionalProperties": { "type": "string" } },
+          "skipped": { "type": "array", "items": { "$ref": "#/components/schemas/EngineSkip" } }
+        }
+      },
+      "EventCatalogEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lens_id", "slug", "source_format", "evidence_quality"],
+        "properties": {
+          "lens_id": { "type": "string" },
+          "slug": { "type": "string" },
+          "source_format": { "type": "string", "const": "stderr" },
+          "evidence_quality": { "type": "string", "const": "heuristic_positive_observation" }
+        }
+      },
+      "IncidentSkipped": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sections", "evaluations", "analysis", "span_splits"],
+        "properties": {
+          "sections": { "type": "array", "items": { "$ref": "#/components/schemas/SectionReason" } },
+          "evaluations": { "type": "array", "items": { "$ref": "#/components/schemas/EngineSkip" } },
+          "analysis": { "type": "array", "items": { "$ref": "#/components/schemas/AnalysisReason" } },
+          "span_splits": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "AnalysisReason": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scope", "reason"],
+        "properties": {
+          "scope": { "type": "string", "enum": ["episodes", "request"] },
+          "reason": { "$ref": "#/components/schemas/Reason" }
+        }
+      },
+      "EngineSkip": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lens_id", "axis", "observed", "limit"],
+        "properties": {
+          "lens_id": { "type": ["string", "null"] },
+          "axis": { "type": "string", "enum": ["work", "lens_evaluations", "findings", "evidence_rows", "output_bytes"] },
+          "observed": { "type": "integer", "minimum": 0 },
+          "limit": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "KnownParameter": {
+        "type": "string",
+        "enum": ["source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor"]
+      },
+      "AnyParameterLocation": {
+        "type": "string",
+        "enum": ["query", "source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor"]
+      },
+      "EmptyParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "maxProperties": 0
+      },
+      "ParameterParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["parameter"],
+        "properties": { "parameter": { "$ref": "#/components/schemas/KnownParameter" } }
+      },
+      "InvalidParameterParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["parameter", "expected"],
+        "properties": {
+          "parameter": { "$ref": "#/components/schemas/AnyParameterLocation" },
+          "expected": {
+            "type": "string",
+            "enum": ["url_encoded_query", "uint64", "int64", "positive_duration", "non_negative_finite_number", "non_negative_integer", "section_list"]
+          }
+        }
+      },
+      "UnknownParameterParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["parameter"],
+        "properties": {
+          "parameter": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" }
+        }
+      },
+      "ConstraintParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["constraint"],
+        "properties": {
+          "constraint": {
+            "type": "string",
+            "enum": ["from_before_to", "window_within_interval", "epsilon_not_greater_than_max_cluster_span", "max_cluster_span_within_interval", "finite_scan"]
+          }
+        }
+      },
+      "SectionParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section"],
+        "properties": {
+          "section": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" }
+        }
+      },
+      "LimitParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["resource", "limit"],
+        "properties": {
+          "resource": {
+            "type": "string",
+            "enum": ["query_bytes", "query_parameters", "query_span_us", "window_positions", "rows", "cells", "bytes", "units", "sections", "identity_bytes", "series_points", "episodes", "clusters", "incident_key_bytes", "total_incident_key_bytes"]
+          },
+          "limit": { "type": "integer", "minimum": 0 },
+          "observed": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "CapacityParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["retry_after_seconds"],
+        "properties": { "retry_after_seconds": { "type": "integer", "const": 1 } }
+      },
+      "Problem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "status", "code", "params", "instance"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "https://pgkronika.dev/problems/unauthorized",
+              "https://pgkronika.dev/problems/route-not-found",
+              "https://pgkronika.dev/problems/method-not-allowed",
+              "https://pgkronika.dev/problems/missing-query-parameter",
+              "https://pgkronika.dev/problems/invalid-query-parameter",
+              "https://pgkronika.dev/problems/unknown-query-parameter",
+              "https://pgkronika.dev/problems/duplicate-query-parameter",
+              "https://pgkronika.dev/problems/invalid-query-constraint",
+              "https://pgkronika.dev/problems/unknown-section",
+              "https://pgkronika.dev/problems/invalid-cursor",
+              "https://pgkronika.dev/problems/query-limit-exceeded",
+              "https://pgkronika.dev/problems/analytic-capacity-unavailable",
+              "https://pgkronika.dev/problems/store-read-failed",
+              "https://pgkronika.dev/problems/internal-error"
+            ]
+          },
+          "status": { "type": "integer", "enum": [400, 401, 404, 405, 413, 500, 503] },
+          "code": {
+            "type": "string",
+            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "query_limit_exceeded", "analytic_capacity_unavailable", "store_read_failed", "internal_error"]
+          },
+          "params": { "type": "object" },
+          "instance": { "type": "string", "format": "uri", "pattern": "^https://pgkronika\\.dev/problems/occurrences/[0-9a-f]{32}$" }
+        },
+        "allOf": [
+          { "if": { "properties": { "code": { "const": "unauthorized" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unauthorized" }, "status": { "const": 401 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "route_not_found" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/route-not-found" }, "status": { "const": 404 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "method_not_allowed" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/method-not-allowed" }, "status": { "const": 405 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "missing_query_parameter" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/missing-query-parameter" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/ParameterParams" } } } },
+          { "if": { "properties": { "code": { "const": "invalid_query_parameter" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-query-parameter" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/InvalidParameterParams" } } } },
+          { "if": { "properties": { "code": { "const": "unknown_query_parameter" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-query-parameter" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/UnknownParameterParams" } } } },
+          { "if": { "properties": { "code": { "const": "duplicate_query_parameter" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/duplicate-query-parameter" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/ParameterParams" } } } },
+          { "if": { "properties": { "code": { "const": "invalid_query_constraint" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-query-constraint" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/ConstraintParams" } } } },
+          { "if": { "properties": { "code": { "const": "unknown_section" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-section" }, "status": { "const": 404 }, "params": { "$ref": "#/components/schemas/SectionParams" } } } },
+          { "if": { "properties": { "code": { "const": "invalid_cursor" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-cursor" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "query_limit_exceeded" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/query-limit-exceeded" }, "status": { "const": 413 }, "params": { "$ref": "#/components/schemas/LimitParams" } } } },
+          { "if": { "properties": { "code": { "const": "analytic_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/analytic-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/CapacityParams" } } } },
+          { "if": { "properties": { "code": { "const": "store_read_failed" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/store-read-failed" }, "status": { "const": 500 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "internal_error" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/internal-error" }, "status": { "const": 500 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } }
+        ]
+      },
+      "Reason": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "params"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["materialization_limit", "incomplete_page", "scoring_work_budget", "scan_budget", "conflicting_timestamp", "identity_byte_limit", "series_point_limit", "typed_gauge_point_limit", "snapshot_row_limit", "incomplete_snapshot", "retention_limit", "no_data", "missing_node_identity", "conflicting_node_identity", "producer_unavailable", "provenance_or_input_missing", "complete_provenance", "section_absent", "complete_coverage", "coverage_gap", "empty_incident_window", "insufficient_intervals_for_observed_period", "incident_window_shorter_than_observed_period"]
+          },
+          "params": { "type": "object" }
+        },
+        "allOf": [
+          { "if": { "properties": { "kind": { "const": "materialization_limit" } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/MaterializationReasonParams" } } } },
+          { "if": { "properties": { "kind": { "enum": ["incomplete_page", "incomplete_snapshot", "no_data", "missing_node_identity", "conflicting_node_identity", "producer_unavailable", "provenance_or_input_missing", "section_absent", "empty_incident_window", "insufficient_intervals_for_observed_period", "incident_window_shorter_than_observed_period"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "kind": { "enum": ["scoring_work_budget", "scan_budget"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/WorkReasonParams" } } } },
+          { "if": { "properties": { "kind": { "const": "conflicting_timestamp" } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/TimestampReasonParams" } } } },
+          { "if": { "properties": { "kind": { "enum": ["identity_byte_limit", "series_point_limit", "typed_gauge_point_limit", "snapshot_row_limit"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/ObservedLimitReasonParams" } } } },
+          { "if": { "properties": { "kind": { "const": "retention_limit" } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/DroppedReasonParams" } } } },
+          { "if": { "properties": { "kind": { "enum": ["complete_provenance", "complete_coverage", "coverage_gap"] } } }, "then": { "properties": { "params": { "$ref": "#/components/schemas/GapCountReasonParams" } } } }
+        ]
+      },
+      "MaterializationReasonParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["resource", "limit"],
+        "properties": {
+          "resource": { "type": "string", "enum": ["cells", "bytes"] },
+          "limit": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "WorkReasonParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["required", "available"],
+        "properties": {
+          "required": { "type": "integer", "minimum": 0 },
+          "available": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "TimestampReasonParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["timestamp"],
+        "properties": { "timestamp": { "type": "integer", "format": "int64" } }
+      },
+      "ObservedLimitReasonParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["observed", "limit"],
+        "properties": {
+          "observed": { "type": "integer", "minimum": 0 },
+          "limit": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "DroppedReasonParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dropped"],
+        "properties": { "dropped": { "type": "integer", "minimum": 0 } }
+      },
+      "GapCountReasonParams": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gap_count"],
+        "properties": { "gap_count": { "type": "integer", "minimum": 0 } }
+      }
+    }
+  }
+}
