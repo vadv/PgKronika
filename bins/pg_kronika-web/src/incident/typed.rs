@@ -580,24 +580,29 @@ impl GaugeSnapshotWindow<'_> {
     }
 
     pub(crate) fn extreme(&self, score_index: usize, maximize: bool) -> Option<GaugeSnapshot> {
+        self.extreme_with_source_window(score_index, maximize, |shared_ts| {
+            gauge_source_window(self.from_us, self.to_us, shared_ts, shared_ts.len())
+        })
+    }
+
+    fn extreme_with_source_window(
+        &self,
+        score_index: usize,
+        maximize: bool,
+        mut source_window: impl FnMut(&[i64]) -> SourceWindow,
+    ) -> Option<GaugeSnapshot> {
         if self.tracks.is_empty() || self.tracks.len() > 8 || score_index >= self.tracks.len() {
             return None;
         }
         let mut indexes = vec![0_usize; self.tracks.len()];
-        let mut best: Option<GaugeSnapshot> = None;
+        let mut best: Option<([f64; 8], i64)> = None;
         let mut shared_ts: Vec<i64> = Vec::new();
-        loop {
+        'intersection: loop {
             let mut min_ts = i64::MAX;
             let mut max_ts = i64::MIN;
             for (track, &index) in self.tracks.iter().zip(&indexes) {
                 let Some(point) = track.get(index) else {
-                    let source_window =
-                        gauge_source_window(self.from_us, self.to_us, &shared_ts, shared_ts.len());
-                    return best.map(|mut reading| {
-                        reading.samples = shared_ts.len();
-                        reading.source_window = source_window;
-                        reading
-                    });
+                    break 'intersection;
                 };
                 min_ts = min_ts.min(point.ts);
                 max_ts = max_ts.max(point.ts);
@@ -615,32 +620,30 @@ impl GaugeSnapshotWindow<'_> {
                 *slot = track[*index].value;
             }
             shared_ts.push(min_ts);
-            let candidate = GaugeSnapshot {
-                values,
-                len: self.tracks.len(),
-                observed_at_us: min_ts,
-                samples: shared_ts.len(),
-                source_window: gauge_source_window(
-                    self.from_us,
-                    self.to_us,
-                    &shared_ts,
-                    shared_ts.len(),
-                ),
-            };
-            let score = candidate.values[score_index];
-            if best.is_none_or(|current| {
+            let score = values[score_index];
+            if best.is_none_or(|(current, _)| {
                 if maximize {
-                    score > current.values[score_index]
+                    score > current[score_index]
                 } else {
-                    score < current.values[score_index]
+                    score < current[score_index]
                 }
             }) {
-                best = Some(candidate);
+                best = Some((values, min_ts));
             }
             for index in &mut indexes {
                 *index += 1;
             }
         }
+
+        let (values, observed_at_us) = best?;
+        let samples = shared_ts.len();
+        Some(GaugeSnapshot {
+            values,
+            len: self.tracks.len(),
+            observed_at_us,
+            samples,
+            source_window: source_window(&shared_ts),
+        })
     }
 
     pub(crate) fn value_range(&self, index: usize) -> Option<(f64, f64, usize)> {
@@ -2012,6 +2015,73 @@ mod tests {
         assert_eq!(reading.samples, 1);
         assert_eq!(reading.observed_at_us, 10);
         assert_eq!(reading.values[..reading.len], [1.0, 1.0]);
+    }
+
+    #[test]
+    fn snapshot_extreme_keeps_the_best_values_and_full_source_window() {
+        let typed = gauges(
+            "join",
+            &[
+                ("score", &[(0, 2.0), (10, 9.0), (20, 7.0), (30, 4.0)]),
+                ("context", &[(0, 20.0), (10, 90.0), (20, 70.0), (30, 40.0)]),
+            ],
+        );
+        let window = typed
+            .gauge_snapshot_window("join", &id(1), &["score", "context"], 0, 40)
+            .expect("both tracks exist");
+
+        let reading = window.extreme(0, true).expect("shared snapshots");
+
+        assert_eq!(reading.values[..reading.len], [9.0, 90.0]);
+        assert_eq!(reading.observed_at_us, 10);
+        assert_eq!(reading.samples, 4);
+        assert_eq!(reading.source_window.observed_period_us(), Some(10));
+        assert_eq!(reading.source_window.expected_interval_count(), Some(4));
+        assert_eq!(
+            reading.source_window.source_window_completeness(),
+            Some(0.75)
+        );
+    }
+
+    #[test]
+    fn snapshot_extreme_reduces_cadence_once_for_the_whole_intersection() {
+        fn reduction_metrics(sample_count: usize) -> (usize, usize) {
+            let points: Vec<_> = (0..sample_count)
+                .map(|index| {
+                    let ts = i64::try_from(index).expect("test timestamp fits i64");
+                    let value = if index + 1 == sample_count { 1.0 } else { 0.0 };
+                    (ts, value)
+                })
+                .collect();
+            let context: Vec<_> = points.iter().map(|&(ts, _)| (ts, 1.0)).collect();
+            let typed = gauges(
+                "join",
+                &[
+                    ("score", points.as_slice()),
+                    ("context", context.as_slice()),
+                ],
+            );
+            let to_us = i64::try_from(sample_count).expect("test window fits i64");
+            let window = typed
+                .gauge_snapshot_window("join", &id(1), &["score", "context"], 0, to_us)
+                .expect("both tracks exist");
+            let inspected_points = window.inspected_points();
+            let mut cadence_reductions = 0;
+
+            let reading = window
+                .extreme_with_source_window(0, true, |shared_ts| {
+                    cadence_reductions += 1;
+                    gauge_source_window(0, to_us, shared_ts, shared_ts.len())
+                })
+                .expect("shared snapshots");
+
+            assert_eq!(reading.samples, sample_count);
+            assert_eq!(reading.observed_at_us, to_us - 1);
+            (inspected_points, cadence_reductions)
+        }
+
+        assert_eq!(reduction_metrics(4), (8, 1));
+        assert_eq!(reduction_metrics(4_096), (8_192, 1));
     }
 
     #[test]
