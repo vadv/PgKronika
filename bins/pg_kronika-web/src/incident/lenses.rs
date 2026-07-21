@@ -5,7 +5,6 @@ use super::evidence::ConfidenceCap;
 pub(crate) const MAX_DORMANT_LENSES: usize = 28;
 pub(crate) const MAX_MISSING_PER_LENS: usize = 6;
 pub(crate) const MAX_CATALOG_TOKEN_BYTES: usize = 40;
-pub(crate) const MAX_CATALOG_TEXT_BYTES: usize = 200;
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -61,13 +60,11 @@ impl Domain {
     }
 }
 
-/// A design-catalog entry with a human name and known missing capabilities.
+/// Stable semantic metadata and known missing capabilities for one lens.
 pub(crate) struct DormantLens {
     lens_id: &'static str,
     slug: &'static str,
     domain: Domain,
-    title: &'static str,
-    detects: &'static str,
     confidence: ConfidenceCap,
     missing: &'static [MissingCapability],
 }
@@ -83,14 +80,6 @@ impl DormantLens {
 
     pub(crate) const fn domain(&self) -> Domain {
         self.domain
-    }
-
-    pub(crate) const fn title(&self) -> &'static str {
-        self.title
-    }
-
-    pub(crate) const fn detects(&self) -> &'static str {
-        self.detects
     }
 
     pub(crate) const fn confidence(&self) -> ConfidenceCap {
@@ -109,8 +98,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-QRY-001",
         slug: "query_workload_shift",
         domain: Domain::Pg,
-        title: "Сдвиг профиля запроса",
-        detects: "У нормализованного запроса изменились частота, работа на вызов или время исполнения.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -123,8 +110,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-PLAN-002",
         slug: "plan_change",
         domain: Domain::Pg,
-        title: "Смена плана запроса",
-        detects: "Деградация запроса совпала с появлением или сменой `planid`.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -139,8 +124,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-TEMP-003",
         slug: "temp_spill",
         domain: Domain::Pg,
-        title: "Спил во временные файлы",
-        detects: "Рост работы через временные блоки и файлы.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -155,8 +138,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-ANALYZE-004",
         slug: "stale_statistics",
         domain: Domain::Pg,
-        title: "Модификации после analyze",
-        detects: "Наблюдаемая доля `n_mod_since_analyze / max(abs(reltuples), 1)` пересекла порог.",
         confidence: ConfidenceCap::Low,
         missing: &[
             Missing::GaugeSamples,
@@ -170,8 +151,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-VACUUM-005",
         slug: "vacuum_backlog",
         domain: Domain::Pg,
-        title: "Длительный текущий vacuum",
-        detects: "Текущий vacuum наблюдается дольше порога по серверным часам.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -186,8 +165,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-FREEZE-006",
         slug: "xid_wraparound_risk",
         domain: Domain::Pg,
-        title: "Приближение к пределу заморозки XID/MXID",
-        detects: "Возраст XID или MXID занял большую долю своего эффективного предела.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -201,8 +178,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-HOT-007",
         slug: "hot_update_failure",
         domain: Domain::Pg,
-        title: "Срыв HOT-обновлений",
-        detects: "Доля non-HOT updates растёт вместе с работой по индексам и WAL.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -216,8 +191,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-CHKPT-008",
         slug: "requested_checkpoints",
         domain: Domain::Pg,
-        title: "Внеплановые контрольные точки",
-        detects: "Растёт доля requested checkpoints и их write/sync-работа.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -231,8 +204,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-WAL-009",
         slug: "wal_amplification",
         domain: Domain::Pg,
-        title: "Раздувание WAL и FPI",
-        detects: "Растут WAL bytes на запись, доля FPI, `wal_buffers_full`.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -246,8 +217,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-CACHE-010",
         slug: "shared_buffer_misses",
         domain: Domain::Pg,
-        title: "Промахи shared buffers",
-        detects: "Растёт доля промахов shared buffers по базе/отношению/контексту.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -261,8 +230,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-IO-011",
         slug: "backend_io_latency",
         domain: Domain::Pg,
-        title: "Задержка I/O внутри PostgreSQL",
-        detects: "Растёт время на операцию или блок (`pg_stat_io`, PG16+).",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -276,8 +243,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-LOCK-012",
         slug: "lock_wait_graph",
         domain: Domain::Pg,
-        title: "Граф ожидания блокировок",
-        detects: "Кто блокировал ожидающего в момент снимка (`blocked_by` из `pg_locks`).",
         confidence: ConfidenceCap::Medium,
         missing: &[Missing::BlockedByEdges, Missing::LockSnapshotCoverage],
     },
@@ -285,8 +250,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-HORIZON-013",
         slug: "xmin_horizon_hold",
         domain: Domain::Pg,
-        title: "Удержание горизонта xmin",
-        detects: "Долгая или idle-in-transaction транзакция держит vacuum-горизонт.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -301,8 +264,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-CONN-014",
         slug: "connection_saturation",
         domain: Domain::Pg,
-        title: "Лимит соединений базы",
-        detects: "Наблюдаемое `numbackends / datconnlimit` базы пересекло порог.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -317,8 +278,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-REPL-015",
         slug: "replication_lag",
         domain: Domain::Pg,
-        title: "Отставание физической репликации",
-        detects: "На каком этапе LSN наблюдается байтовый или временной разрыв.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -332,8 +291,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-SLOT-016",
         slug: "slot_wal_retention",
         domain: Domain::Pg,
-        title: "Удержание WAL слотом репликации",
-        detects: "Слот удерживает WAL близко к пределу; изменение подтверждено двумя наблюдениями.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -346,8 +303,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-ARCH-017",
         slug: "wal_archiving_failure",
         domain: Domain::Pg,
-        title: "Ошибки архивации WAL",
-        detects: "Подтверждённые ошибки archive command/library (`failed_count`).",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -361,8 +316,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-SYNC-018",
         slug: "sync_replication_wait",
         domain: Domain::Pg,
-        title: "Ожидание синхронной репликации",
-        detects: "Backends висят на `wait_event='SyncRep'` при настроенной синхронной репликации.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::ActivityRows,
@@ -376,8 +329,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "PG-WAIT-019",
         slug: "internal_wait_concentration",
         domain: Domain::Pg,
-        title: "Концентрация внутренних ожиданий",
-        detects: "Растёт доля active backends на `LWLock`/`BufferPin`/`IO` wait.",
         confidence: ConfidenceCap::Low,
         missing: &[
             Missing::ActivityRows,
@@ -390,8 +341,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-CPU-020",
         slug: "cpu_saturation",
         domain: Domain::Os,
-        title: "Насыщение CPU хоста",
-        detects: "Runnable pressure, iowait, steal.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -405,8 +354,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-CGRP-021",
         slug: "cgroup_cpu_throttling",
         domain: Domain::Os,
-        title: "Троттлинг CPU в cgroup",
-        detects: "Реальный throttling cgroup при доступном CPU хоста.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::PidCgroupMapping,
@@ -420,8 +367,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-MEM-022",
         slug: "memory_reclaim",
         domain: Domain::Os,
-        title: "Низкий MemAvailable хоста",
-        detects: "Наблюдаемое `MemAvailable / MemTotal` опустилось ниже порога.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::GaugeSamples,
@@ -435,8 +380,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-CGMEM-023",
         slug: "cgroup_memory_limit",
         domain: Domain::Os,
-        title: "Лимит памяти cgroup",
-        detects: "Текущее потребление памяти PostgreSQL близко к конечному пределу cgroup.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::PidCgroupMapping,
@@ -451,8 +394,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-BLOCK-024",
         slug: "block_device_latency",
         domain: Domain::Os,
-        title: "Задержка блочного устройства",
-        detects: "Растут время завершения и очередь устройства.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -466,8 +407,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-WB-025",
         slug: "writeback_pressure",
         domain: Domain::Os,
-        title: "Dirty и Writeback хоста",
-        detects: "Наблюдаемое `(Dirty + Writeback) / MemTotal` пересекло порог.",
         confidence: ConfidenceCap::Low,
         missing: &[
             Missing::GaugeSamples,
@@ -481,8 +420,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-IOWHO-026",
         slug: "io_contender",
         domain: Domain::Os,
-        title: "Внешний потребитель I/O",
-        detects: "Какой процесс или cgroup нарастил block I/O рядом с давлением.",
         confidence: ConfidenceCap::Medium,
         missing: &[
             Missing::CounterDeltas,
@@ -496,8 +433,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-FS-027",
         slug: "filesystem_space",
         domain: Domain::Os,
-        title: "Исчерпание места хранения PostgreSQL",
-        detects: "Доказанно связанная точка монтирования близка к исчерпанию доступных байтов.",
         confidence: ConfidenceCap::High,
         missing: &[
             Missing::GaugeSamples,
@@ -511,8 +446,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         lens_id: "OS-NET-028",
         slug: "network_errors",
         domain: Domain::Os,
-        title: "Сетевые ошибки и ретрансмиты",
-        detects: "Растут счётчики ошибок интерфейса и TCP-ретрансмиссий.",
         confidence: ConfidenceCap::Low,
         missing: &[
             Missing::CounterDeltas,
@@ -698,21 +631,6 @@ const fn slug_is_valid(value: &str) -> bool {
     true
 }
 
-const fn json_text_is_bounded(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.is_empty() || bytes.len() > MAX_CATALOG_TEXT_BYTES {
-        return false;
-    }
-    let mut at = 0;
-    while at < bytes.len() {
-        if bytes[at].is_ascii_control() || bytes[at] == b'"' || bytes[at] == b'\\' {
-            return false;
-        }
-        at += 1;
-    }
-    true
-}
-
 const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
     if catalog.is_empty() || catalog.len() > MAX_DORMANT_LENSES {
         return false;
@@ -723,8 +641,6 @@ const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
         if lens.lens_id.is_empty()
             || lens.lens_id.len() > MAX_CATALOG_TOKEN_BYTES
             || !slug_is_valid(lens.slug)
-            || !json_text_is_bounded(lens.title)
-            || !json_text_is_bounded(lens.detects)
             || lens.missing.is_empty()
             || lens.missing.len() > MAX_MISSING_PER_LENS
         {
@@ -810,8 +726,6 @@ mod tests {
             lens_id,
             slug,
             domain: Domain::Pg,
-            title: "title",
-            detects: "detects",
             confidence: ConfidenceCap::Medium,
             missing,
         }
@@ -851,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn static_bounds_cover_missing_tokens_and_text() {
+    fn static_bounds_cover_missing_and_identifier_tokens() {
         let too_many = [fixture(
             "PG-A",
             "first",
@@ -873,7 +787,6 @@ mod tests {
         assert!(!catalog_is_valid(&too_many));
         assert!(!catalog_is_valid(&duplicate));
         assert!(!slug_is_valid("Not_Snake_Case"));
-        assert!(!json_text_is_bounded("raw \\\"quoted\\\" text"));
     }
 
     #[test]
@@ -948,24 +861,6 @@ mod tests {
                         assert!(split_facts.insert(*fact), "duplicate split fact `{fact}`");
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn public_metadata_contains_no_raw_sensitive_examples() {
-        const FORBIDDEN: &[&str] = &[
-            "select ",
-            "password=",
-            "postgresql://",
-            "/var/",
-            "archive_command=",
-            "192.168.",
-        ];
-        for lens in core_catalog() {
-            let text = format!("{} {}", lens.title(), lens.detects()).to_lowercase();
-            for marker in FORBIDDEN {
-                assert!(!text.contains(marker), "sensitive marker `{marker}`");
             }
         }
     }

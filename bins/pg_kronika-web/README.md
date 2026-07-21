@@ -49,7 +49,7 @@ analysis.
 | `GET /v1/section/{name}/diff` | `source`, `from`, `to` | Turns cumulative counters into per-identity changes and per-second rates. Each point contains `delta`, `rate`, and `dt_micros`, or a `nodata` reason when no honest rate can be computed. |
 | `GET /v1/sections/batch/diff` | `source`, `from`, `to`, comma-separated `names` | Returns the same counter-change view for several datasets, keyed by section name, after one segment pass. |
 | `GET /v1/anomalies` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `limit`, `section` | Finds intervals where counter rates or gauge values changed unusually during the selected period. It returns the affected series, metric, interval, direction, and peak statistics; ranks episodes by `abs(peak.m)`; and reports per-section evaluation counts plus any skipped sections. |
-| `GET /v1/incidents` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `epsilon`, `max_cluster_span`, `section` | Groups anomaly episodes that are close in time into incident candidates. It returns each candidate's interval and member metrics, plus coverage, data-quality, and skipped-work details; root-cause findings are not available. |
+| `GET /v1/incidents` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `epsilon`, `max_cluster_span`, `section` | Groups anomaly episodes that are close in time into incident candidates. It returns findings and machine-readable evidence where the inputs support them, plus coverage, data quality, catalog state, and skipped work. |
 | `GET /` | none | Opens the embedded browser UI over the same local snapshot. |
 
 `source` is the unsigned id returned by `/v1/sources`. `from` and `to` are
@@ -65,10 +65,21 @@ curl -u operator:change-me \
   'http://127.0.0.1:8688/v1/segments?source=1&from=0&to=9223372036854775807'
 ```
 
-Errors use `{ "error": "code", "detail": "message" }` when a detail is
-useful. Unknown sections return `404`, malformed parameters return `400`, and
-requests that exceed an enforced input or materialization ceiling return
-`413`.
+The success/data API is locale-neutral. `Accept-Language` does not change its
+representations, and `/v1` sends neither `Content-Language` nor a language
+`Vary`. Raw PostgreSQL, OS, and user strings remain literal; product-owned
+labels and explanations belong to the UI.
+
+Every `/v1` application error is an RFC 9457 Problem Details response with
+media type `application/problem+json` and exactly `type`, `status`, `code`,
+typed `params`, and an opaque `instance`. It has no human-language `title` or
+`detail`. Problem responses use `Cache-Control: no-store` and expose the same
+server-generated correlation token in `instance` and `X-Request-ID`.
+`WWW-Authenticate`, `Allow`, and `Retry-After` remain present where HTTP
+semantics require them. Unknown sections return `404`, malformed parameters
+return `400`, and enforced input or materialization ceilings return `413`.
+See the [OpenAPI contract](openapi.json) and the
+[normative machine API specification](../../docs/superpowers/specs/2026-07-21-i18n-machine-api-contract.md).
 
 ## Query and analysis contracts
 
@@ -93,11 +104,12 @@ requests that exceed an enforced input or materialization ceiling return
   by a limit. Requests are limited to 24 hours and have fixed ceilings for
   units, sections, materialized cells, series points, identity bytes, scoring
   work, and episodes.
+- Product-owned incomplete-result explanations use the closed
+  `{ "kind": "...", "params": { ... } }` reason schema. Lens ids, enum values,
+  formulas, units, and evidence remain stable machine data; incident catalogs
+  contain no localized title or question.
 - Only one anomaly or incident request runs at a time. A concurrent analysis
   request receives `503` with `Retry-After: 1`; it is not queued.
-- `/v1/incidents` currently stops after clustering. The response keeps
-  `complete` set to `false`, returns empty `findings`, and exposes the diagnostic
-  lens catalog as dormant.
 
 Store scan warnings and damaged journal regions remain available to the reader
 and affect gaps/completeness. They are never converted to successful rows.

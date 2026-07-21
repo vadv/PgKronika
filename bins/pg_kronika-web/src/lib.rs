@@ -53,13 +53,15 @@ mod auth;
 pub(crate) mod handlers;
 #[allow(
     dead_code,
-    reason = "finding, evidence, and lens types are exercised by engine tests but the HTTP \
-              endpoint currently exposes clustering only"
+    reason = "reserved bounded evidence variants are exercised by engine tests even when a \
+              production catalog does not construct them"
 )]
 mod incident;
 mod incident_input;
 mod incident_response;
 mod params;
+mod problem;
+mod reason;
 mod serialize;
 pub(crate) mod startup;
 
@@ -205,6 +207,7 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
             "/v1/sections/batch/diff",
             get(handlers::v1::sections_batch_diff),
         )
+        .method_not_allowed_fallback(|| async { problem::ApiProblem::method_not_allowed() })
         .fallback(handlers::static_::static_handler);
     if let Some(cfg) = auth {
         // `layer`, not `route_layer`: auth must also cover the static fallback,

@@ -69,3 +69,13 @@ async fn web_section_row_by_key(
     let page = web::section_page(dir, name, source).await?;
     web::assert_row_where(&page, &keys, &expected)
 }
+
+/// Assert the transport-level, locale-neutral Problem Details contract.
+#[then("an invalid web API request returns locale-neutral Problem Details")]
+async fn web_locale_neutral_problem(world: &mut BddWorld) -> Result<()> {
+    let segment = world.harness.segment()?.clone();
+    let dir = segment
+        .parent()
+        .context("the sealed segment has no parent directory")?;
+    web::assert_locale_neutral_problem(dir).await
+}

@@ -5,6 +5,12 @@ Feature: The web API serves collected sections over HTTP
   layer and the HTTP serialization agree with the sealed segment, end to end.
 
   @pg17 @serial
+  Scenario: the web API returns locale-neutral Problem Details
+    Given a fresh database on PostgreSQL 17
+    When the collector snapshots the segment
+    Then an invalid web API request returns locale-neutral Problem Details
+
+  @pg17 @serial
   Scenario: the web API serves the reset archiver row
     Given a fresh database on PostgreSQL 17
     And a database seeded with:

@@ -3,15 +3,15 @@
 //! The expected `Authorization` header is computed once from the configured
 //! credentials; each request is compared against it in constant time.
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Request, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
-use serde_json::json;
 use subtle::ConstantTimeEq as _;
+
+use crate::problem::ApiProblem;
 
 /// The exact `Authorization` header value an authenticated request must send.
 #[derive(Clone)]
@@ -64,12 +64,7 @@ pub(crate) async fn require_basic_auth(
     if check_basic_auth(header, &cfg) {
         next.run(req).await
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"pg_kronika-web\"")],
-            Json(json!({ "error": "unauthorized" })),
-        )
-            .into_response()
+        ApiProblem::unauthorized().into_response()
     }
 }
 

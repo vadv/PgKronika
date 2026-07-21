@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::rejection::PathRejection;
+use axum::extract::{Path, RawQuery, State};
 use kronika_reader::{
     GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, apply_collection_gating,
     diff_section, gate_readings, logical_section, section, sections as query_sections,
@@ -14,8 +14,9 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::params::{
-    bad_request, parse_cursor, parse_i64, parse_limit, parse_u64, query_error_response,
+    QueryParams, parse_cursor, parse_i64, parse_limit, parse_u64, query_error_response,
 };
+use crate::problem::{ApiProblem, ExpectedValue, LimitResource, QueryParameter, count_u64};
 use crate::serialize::{
     column_class_name, column_type_name, page_to_json, semantics_name, series_diff_to_json,
 };
@@ -24,15 +25,48 @@ use crate::serialize::{
 /// single request cannot pull an unbounded section into memory.
 pub(crate) const DIFF_MAX_ROWS: usize = 262_144;
 
+const RANGE_PARAMS: &[QueryParameter] = &[
+    QueryParameter::Source,
+    QueryParameter::From,
+    QueryParameter::To,
+];
+const PAGE_PARAMS: &[QueryParameter] = &[
+    QueryParameter::Source,
+    QueryParameter::From,
+    QueryParameter::To,
+    QueryParameter::Limit,
+    QueryParameter::Cursor,
+];
+const BATCH_PARAMS: &[QueryParameter] = &[
+    QueryParameter::Source,
+    QueryParameter::From,
+    QueryParameter::To,
+    QueryParameter::Names,
+    QueryParameter::Limit,
+];
+const BATCH_DIFF_PARAMS: &[QueryParameter] = &[
+    QueryParameter::Source,
+    QueryParameter::From,
+    QueryParameter::To,
+    QueryParameter::Names,
+];
+
 /// `GET /v1/version` — the API and container format versions this build serves.
 ///
 /// Static body, `application/json`.
-pub(crate) async fn version() -> Json<Value> {
-    Json(json!({ "api": "v1", "format_version": crate::FORMAT_VERSION }))
+pub(crate) async fn version(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiProblem> {
+    QueryParams::parse(raw.as_deref(), &[])?;
+    Ok(Json(
+        json!({ "api": "v1", "format_version": crate::FORMAT_VERSION }),
+    ))
 }
 
 /// `GET /v1/sources` — every source in the store and its overall time span.
-pub(crate) async fn sources(State(state): State<AppState>) -> Json<Value> {
+pub(crate) async fn sources(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, ApiProblem> {
+    QueryParams::parse(raw.as_deref(), &[])?;
     let snapshot = state.snapshot.load_full();
     let mut spans: BTreeMap<u64, (i64, i64, usize)> = BTreeMap::new();
     for unit in snapshot.units() {
@@ -49,14 +83,15 @@ pub(crate) async fn sources(State(state): State<AppState>) -> Json<Value> {
             json!({ "source_id": source_id, "min_ts": min_ts, "max_ts": max_ts, "segments": segments })
         })
         .collect();
-    Json(json!({ "sources": sources }))
+    Ok(Json(json!({ "sources": sources })))
 }
 
 /// `GET /v1/sections` — static catalog of section types from the registry.
 ///
 /// One entry per logical name: its semantics, sort key, and the union of its
 /// versions' columns (first appearance across ascending `type_id`).
-pub(crate) async fn sections() -> Json<Value> {
+pub(crate) async fn sections(RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiProblem> {
+    QueryParams::parse(raw.as_deref(), &[])?;
     let mut by_name: BTreeMap<&'static str, Vec<&'static kronika_registry::TypeContract>> =
         BTreeMap::new();
     for contract in registry() {
@@ -87,18 +122,19 @@ pub(crate) async fn sections() -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({ "sections": sections }))
+    Ok(Json(json!({ "sections": sections })))
 }
 
 /// `GET /v1/segments?source&from&to` — segments of `source` overlapping the
 /// window, catalog metadata only (no section bodies decoded).
 pub(crate) async fn segments(
     State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, ApiProblem> {
+    let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
+    let source = parse_u64(&params, QueryParameter::Source)?;
+    let from = parse_i64(&params, QueryParameter::From)?;
+    let to = parse_i64(&params, QueryParameter::To)?;
 
     let snapshot = state.snapshot.load_full();
     let units = snapshot.units();
@@ -143,12 +179,14 @@ pub(crate) async fn segments(
 /// gaps inside the reader, so it stays a `200`.
 pub(crate) async fn section_data(
     State(state): State<AppState>,
-    Path(name): Path<String>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
+    path: Result<Path<String>, PathRejection>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, ApiProblem> {
+    let Path(name) = path.map_err(|_rejection| ApiProblem::unknown_section("invalid"))?;
+    let params = QueryParams::parse(raw.as_deref(), PAGE_PARAMS)?;
+    let source = parse_u64(&params, QueryParameter::Source)?;
+    let from = parse_i64(&params, QueryParameter::From)?;
+    let to = parse_i64(&params, QueryParameter::To)?;
     let limit = parse_limit(&params)?;
     let cursor = parse_cursor(&params)?;
 
@@ -169,18 +207,22 @@ pub(crate) async fn section_data(
 /// the whole request.
 pub(crate) async fn sections_batch(
     State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, ApiProblem> {
+    let params = QueryParams::parse(raw.as_deref(), BATCH_PARAMS)?;
+    let source = parse_u64(&params, QueryParameter::Source)?;
+    let from = parse_i64(&params, QueryParameter::From)?;
+    let to = parse_i64(&params, QueryParameter::To)?;
     let limit = parse_limit(&params)?;
     let raw = params
-        .get("names")
-        .ok_or_else(|| bad_request("missing query parameter `names`"))?;
+        .get(QueryParameter::Names)
+        .ok_or_else(|| ApiProblem::missing_query_parameter(QueryParameter::Names))?;
     let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
     if names.is_empty() {
-        return Err(bad_request("`names` must list at least one section"));
+        return Err(ApiProblem::invalid_query_parameter(
+            QueryParameter::Names,
+            ExpectedValue::SectionList,
+        ));
     }
 
     let mut snap = state.snapshot.load().as_ref().clone();
@@ -197,8 +239,8 @@ pub(crate) async fn sections_batch(
     }
 }
 
-/// The error half of a handler result: an HTTP status and a JSON body.
-type ErrorResponse = (StatusCode, Json<Value>);
+/// The error half of a handler result: one closed Problem Details response.
+type ErrorResponse = ApiProblem;
 
 /// One section's diff as a JSON object (`section`, `identity`, `series`).
 type DiffObject = serde_json::Map<String, Value>;
@@ -286,8 +328,10 @@ fn section_diff_object(
     gates: &Gates,
 ) -> Result<DiffObject, ErrorResponse> {
     if page.next_cursor.is_some() {
-        return Err(bad_request(
-            "window has too many rows to diff in one response; narrow the window",
+        return Err(ApiProblem::query_limit_exceeded(
+            LimitResource::Rows,
+            count_u64(DIFF_MAX_ROWS),
+            None,
         ));
     }
     let identity = logical.diff_key();
@@ -313,12 +357,14 @@ fn section_diff_object(
 /// reads the window in one page, and folds each series through the diff core.
 pub(crate) async fn section_diff(
     State(state): State<AppState>,
-    Path(name): Path<String>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    path: Result<Path<String>, PathRejection>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ErrorResponse> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
+    let Path(name) = path.map_err(|_rejection| ApiProblem::unknown_section("invalid"))?;
+    let params = QueryParams::parse(raw.as_deref(), RANGE_PARAMS)?;
+    let source = parse_u64(&params, QueryParameter::Source)?;
+    let from = parse_i64(&params, QueryParameter::From)?;
+    let to = parse_i64(&params, QueryParameter::To)?;
 
     let logical = logical_section(&name)
         .ok_or_else(|| query_error_response(&QueryError::UnknownSection(name.clone())))?;
@@ -354,17 +400,21 @@ pub(crate) async fn section_diff(
 /// fails the whole request.
 pub(crate) async fn sections_batch_diff(
     State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ErrorResponse> {
-    let source = parse_u64(&params, "source")?;
-    let from = parse_i64(&params, "from")?;
-    let to = parse_i64(&params, "to")?;
+    let params = QueryParams::parse(raw.as_deref(), BATCH_DIFF_PARAMS)?;
+    let source = parse_u64(&params, QueryParameter::Source)?;
+    let from = parse_i64(&params, QueryParameter::From)?;
+    let to = parse_i64(&params, QueryParameter::To)?;
     let raw = params
-        .get("names")
-        .ok_or_else(|| bad_request("missing query parameter `names`"))?;
+        .get(QueryParameter::Names)
+        .ok_or_else(|| ApiProblem::missing_query_parameter(QueryParameter::Names))?;
     let names: Vec<&str> = raw.split(',').filter(|name| !name.is_empty()).collect();
     if names.is_empty() {
-        return Err(bad_request("`names` must list at least one section"));
+        return Err(ApiProblem::invalid_query_parameter(
+            QueryParameter::Names,
+            ExpectedValue::SectionList,
+        ));
     }
     let logicals: Vec<LogicalSection> = names
         .iter()

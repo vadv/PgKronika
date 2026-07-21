@@ -12,6 +12,7 @@ use crate::incident::{
     SampledLockEdge,
 };
 use crate::incident_input::{CapabilityInputState, InputQuality, SectionSkip, SkipReason};
+use crate::reason::{ApiReason, MaterializationResource};
 
 pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<u64>) -> Value {
     let quality = InputQuality::default();
@@ -28,7 +29,7 @@ pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<
         "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
         "log": empty_log_json(),
         "data_quality": quality_to_json(&quality, "unknown"),
-        "skipped": skipped_to_json(&[], &[], 0, &quality, Some("no_data")),
+        "skipped": skipped_to_json(&[], &[], 0, &quality, Some(ApiReason::no_data())),
     })
 }
 
@@ -36,7 +37,8 @@ pub(crate) fn identity_response(
     source: u64,
     scan: &ScanParams,
     data_age: Option<u64>,
-    reason: &'static str,
+    analysis_status: &'static str,
+    reason: ApiReason,
 ) -> Value {
     let quality = InputQuality::default();
     json!({
@@ -45,13 +47,13 @@ pub(crate) fn identity_response(
         "to": scan.to,
         "complete": false,
         "clustering_complete": false,
-        "analysis_status": reason,
+        "analysis_status": analysis_status,
         "incidents": Value::Array(Vec::new()),
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
         "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
         "log": empty_log_json(),
-        "data_quality": quality_to_json(&quality, reason),
+        "data_quality": quality_to_json(&quality, analysis_status),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some(reason)),
     })
 }
@@ -360,8 +362,6 @@ fn event_catalog_to_json() -> Vec<Value> {
             json!({
                 "lens_id": entry.lens_id,
                 "slug": entry.slug,
-                "question": entry.question,
-                "text_locale": "ru",
                 "source_format": "stderr",
                 "evidence_quality": "heuristic_positive_observation",
             })
@@ -447,7 +447,7 @@ fn catalog_to_json(
                     "lens_id": lens_id,
                     "section": section,
                     "status": "partial",
-                    "reason": skip_reason_label(skip.reason),
+                    "reason": section_skip_reason(skip.reason),
                 });
             }
             let mut provenance_available = false;
@@ -458,7 +458,7 @@ fn catalog_to_json(
                             "lens_id": lens_id,
                             "section": section,
                             "status": "not_collected",
-                            "reason": "producer_unavailable",
+                            "reason": ApiReason::producer_unavailable(),
                         });
                     }
                     CapabilityInputState::Partial => {
@@ -466,7 +466,7 @@ fn catalog_to_json(
                             "lens_id": lens_id,
                             "section": section,
                             "status": "partial",
-                            "reason": "provenance_or_input_missing",
+                            "reason": ApiReason::provenance_or_input_missing(),
                         });
                     }
                     CapabilityInputState::Available => provenance_available = true,
@@ -478,23 +478,25 @@ fn catalog_to_json(
                         "lens_id": lens_id,
                         "section": section,
                         "status": "available",
-                        "reason": "complete_provenance",
-                        "gap_count": 0,
+                        "reason": ApiReason::complete_provenance(0),
                     });
                 }
                 return json!({
                     "lens_id": lens_id,
                     "section": section,
                     "status": "not_collected",
-                    "reason": "section_absent",
+                    "reason": ApiReason::section_absent(),
                 });
             };
             json!({
                 "lens_id": lens_id,
                 "section": section,
                 "status": if gaps.is_empty() { "available" } else { "partial" },
-                "reason": if gaps.is_empty() { "complete_coverage" } else { "coverage_gap" },
-                "gap_count": gaps.len(),
+                "reason": if gaps.is_empty() {
+                    ApiReason::complete_coverage(gaps.len())
+                } else {
+                    ApiReason::coverage_gap(gaps.len())
+                },
             })
         })
         .collect();
@@ -513,17 +515,32 @@ fn catalog_to_json(
     })
 }
 
-const fn skip_reason_label(reason: SkipReason) -> &'static str {
+fn section_skip_reason(reason: SkipReason) -> ApiReason {
     match reason {
-        SkipReason::MaterializationLimit { .. } => "materialization_limit",
-        SkipReason::IncompletePage => "incomplete_page",
-        SkipReason::ScanBudget { .. } => "scan_budget",
-        SkipReason::ConflictingTimestamp { .. } => "conflicting_timestamp",
-        SkipReason::IdentityByteLimit { .. } => "identity_byte_limit",
-        SkipReason::SeriesPointLimit { .. } => "series_point_limit",
-        SkipReason::TypedGaugePointLimit { .. } => "typed_gauge_point_limit",
-        SkipReason::SnapshotRowLimit { .. } => "snapshot_row_limit",
-        SkipReason::IncompleteSnapshot => "incomplete_snapshot",
+        SkipReason::MaterializationLimit { limit } => {
+            ApiReason::materialization_limit(MaterializationResource::Cells, limit)
+        }
+        SkipReason::IncompletePage => ApiReason::incomplete_page(),
+        SkipReason::ScanBudget {
+            required,
+            available,
+        } => ApiReason::scan_budget(required, available),
+        SkipReason::ConflictingTimestamp { timestamp } => {
+            ApiReason::conflicting_timestamp(timestamp)
+        }
+        SkipReason::IdentityByteLimit { observed, limit } => {
+            ApiReason::identity_byte_limit(observed, limit)
+        }
+        SkipReason::SeriesPointLimit { observed, limit } => {
+            ApiReason::series_point_limit(observed, limit)
+        }
+        SkipReason::TypedGaugePointLimit { observed, limit } => {
+            ApiReason::typed_gauge_point_limit(observed, limit)
+        }
+        SkipReason::SnapshotRowLimit { observed, limit } => {
+            ApiReason::snapshot_row_limit(observed, limit)
+        }
+        SkipReason::IncompleteSnapshot => ApiReason::incomplete_snapshot(),
     }
 }
 
@@ -541,9 +558,6 @@ fn dormant_entries(catalog: &'static [DormantLens], applied: &[&'static str]) ->
                 "lens_id": lens.lens_id(),
                 "slug": lens.slug(),
                 "domain": lens.domain().as_str(),
-                "title": lens.title(),
-                "question": lens.detects(),
-                "text_locale": "ru",
                 "confidence_cap": lens.confidence().as_str(),
                 "awaiting": awaiting,
                 "requirements_status": "incomplete",
@@ -590,7 +604,7 @@ fn skipped_to_json(
     engine_skipped: &[EngineSkip],
     span_splits: u64,
     quality: &InputQuality,
-    analysis_reason: Option<&str>,
+    analysis_reason: Option<ApiReason>,
 ) -> Value {
     let mut sections: Vec<Value> = input_skipped.iter().map(section_skip_to_json).collect();
     sections.sort_by(|left, right| left["section"].as_str().cmp(&right["section"].as_str()));
@@ -599,16 +613,13 @@ fn skipped_to_json(
     if quality.episodes_truncated > 0 {
         analysis.push(json!({
             "scope": "episodes",
-            "reason": {
-                "kind": "retention_limit",
-                "dropped": quality.episodes_truncated,
-            },
+            "reason": ApiReason::retention_limit(quality.episodes_truncated),
         }));
     }
     if let Some(reason) = analysis_reason {
         analysis.push(json!({
             "scope": "request",
-            "reason": { "kind": reason },
+            "reason": reason,
         }));
     }
     json!({
@@ -620,33 +631,7 @@ fn skipped_to_json(
 }
 
 fn section_skip_to_json(skip: &SectionSkip) -> Value {
-    let reason = match skip.reason {
-        SkipReason::MaterializationLimit { limit } => {
-            json!({ "kind": "materialization_limit", "limit": limit })
-        }
-        SkipReason::IncompletePage => json!({ "kind": "incomplete_page" }),
-        SkipReason::ScanBudget {
-            required,
-            available,
-        } => json!({ "kind": "scan_budget", "required": required, "available": available }),
-        SkipReason::ConflictingTimestamp { timestamp } => {
-            json!({ "kind": "conflicting_timestamp", "timestamp": timestamp })
-        }
-        SkipReason::IdentityByteLimit { observed, limit } => {
-            json!({ "kind": "identity_byte_limit", "observed": observed, "limit": limit })
-        }
-        SkipReason::SeriesPointLimit { observed, limit } => {
-            json!({ "kind": "series_point_limit", "observed": observed, "limit": limit })
-        }
-        SkipReason::TypedGaugePointLimit { observed, limit } => {
-            json!({ "kind": "typed_gauge_point_limit", "observed": observed, "limit": limit })
-        }
-        SkipReason::SnapshotRowLimit { observed, limit } => {
-            json!({ "kind": "snapshot_row_limit", "observed": observed, "limit": limit })
-        }
-        SkipReason::IncompleteSnapshot => json!({ "kind": "incomplete_snapshot" }),
-    };
-    json!({ "section": skip.section, "reason": reason })
+    json!({ "section": skip.section, "reason": section_skip_reason(skip.reason) })
 }
 
 fn engine_skip_to_json(skip: &EngineSkip) -> Value {
@@ -721,7 +706,6 @@ mod tests {
 
     const MAX_ENTRY_JSON_BYTES: usize = 256
         + 2 * crate::incident::MAX_CATALOG_TOKEN_BYTES
-        + 2 * crate::incident::MAX_CATALOG_TEXT_BYTES
         + crate::incident::MAX_MISSING_PER_LENS * (crate::incident::MAX_CATALOG_TOKEN_BYTES + 3);
     const MAX_CATALOG_JSON_BYTES: usize =
         256 + crate::incident::MAX_DORMANT_LENSES * MAX_ENTRY_JSON_BYTES;
@@ -842,6 +826,31 @@ mod tests {
     }
 
     #[test]
+    fn catalog_metadata_contains_no_server_presentation() {
+        let event = event_catalog_to_json();
+        assert!(!event.is_empty());
+        for entry in &event {
+            let object = entry.as_object().expect("event catalog object");
+            let mut keys: Vec<_> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["evidence_quality", "lens_id", "slug", "source_format"]
+            );
+        }
+
+        let dormant = dormant_entries(crate::incident::core_catalog(), &[]);
+        assert_eq!(dormant.len(), crate::incident::MAX_DORMANT_LENSES);
+        for entry in &dormant {
+            let object = entry.as_object().expect("dormant catalog object");
+            assert!(object.get("title").is_none());
+            assert!(object.get("question").is_none());
+            assert!(object.get("text_locale").is_none());
+            assert_eq!(object.len(), 6);
+        }
+    }
+
+    #[test]
     fn active_contracts_report_typed_request_capability_absence() {
         let mut states = BTreeMap::new();
         states.insert("pg_freeze_horizon", CapabilityInputState::NotCollected);
@@ -857,12 +866,12 @@ mod tests {
         assert_eq!(capability_entry("PG-FREEZE-006")["status"], "not_collected");
         assert_eq!(
             capability_entry("PG-FREEZE-006")["reason"],
-            "producer_unavailable"
+            json!({ "kind": "producer_unavailable", "params": {} })
         );
         assert_eq!(capability_entry("OS-FS-027")["status"], "partial");
         assert_eq!(
             capability_entry("OS-FS-027")["reason"],
-            "provenance_or_input_missing"
+            json!({ "kind": "provenance_or_input_missing", "params": {} })
         );
         assert!(
             catalog["applied"]
@@ -951,8 +960,49 @@ mod tests {
         assert_eq!(body["catalog"]["status"], "partial");
         assert_eq!(body["catalog"]["applied"], json!(APPLIED_IDS));
         assert_eq!(
-            body["skipped"]["sections"][0]["reason"]["kind"],
-            "incomplete_page",
+            body["skipped"]["sections"][0]["reason"],
+            json!({ "kind": "incomplete_page", "params": {} }),
+        );
+    }
+
+    #[test]
+    fn skipped_reason_arguments_are_nested_under_params() {
+        let outcome = EngineOutcome {
+            incidents: Vec::new(),
+            span_splits: 0,
+            complete: true,
+            skipped: Vec::new(),
+        };
+        let body = build_response(
+            7,
+            &scan(),
+            None,
+            &outcome,
+            &empty_log(),
+            &ResponseInput {
+                coverage: &BTreeMap::new(),
+                quality: &InputQuality::default(),
+                skipped: &[SectionSkip {
+                    section: "pg_stat_archiver",
+                    reason: SkipReason::ScanBudget {
+                        required: 11,
+                        available: 10,
+                    },
+                }],
+                capability_by_section: &BTreeMap::new(),
+            },
+        );
+        assert_eq!(
+            body["skipped"]["sections"][0]["reason"],
+            json!({
+                "kind": "scan_budget",
+                "params": { "required": 11, "available": 10 },
+            })
+        );
+        assert!(
+            body["skipped"]["sections"][0]["reason"]
+                .as_object()
+                .is_some_and(|reason| reason.len() == 2)
         );
     }
 
