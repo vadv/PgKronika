@@ -766,6 +766,12 @@ mod tests {
         "PG-EVT-005",
         "PG-EVT-007",
         "PG-EVT-008",
+        "PG-EVT-009",
+        "PG-EVT-010",
+        "PG-EVT-011",
+        "PG-EVT-012",
+        "PG-EVT-013",
+        "PG-EVT-014",
     ];
 
     const MAX_ENTRY_JSON_BYTES: usize = 256
@@ -1007,8 +1013,8 @@ mod tests {
         assert_eq!(log_json["complete"], false);
         assert_eq!(
             log_json["evaluated_lens_ids"].as_array().map(Vec::len),
-            Some(8),
-            "the eight event lenses are advertised as applied"
+            Some(14),
+            "the fourteen event lenses are advertised as applied"
         );
         let finding = &log_json["findings"][0];
         assert_eq!(finding["lens_id"], "PG-EVT-007");
@@ -1412,8 +1418,8 @@ mod tests {
             .as_array()
             .expect("catalog lists dormant lenses");
         assert_eq!(dormant.len(), 0);
-        assert_eq!(body["catalog"]["active_count"], 34);
-        assert_eq!(body["catalog"]["catalog_count"], 34);
+        assert_eq!(body["catalog"]["active_count"], 40);
+        assert_eq!(body["catalog"]["catalog_count"], 40);
         assert!(
             APPLIED_IDS.contains(&"PG-LOCK-012"),
             "the lock lens is now applied, not dormant"
