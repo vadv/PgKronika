@@ -349,20 +349,23 @@ async fn spiking_incident_for_source_and_node(
 #[tokio::test]
 async fn incidents_propagate_storage_source_and_node_identity_to_engine_and_http() {
     let first = spiking_incident_for_source_and_node(7, "node-a").await;
-    let second = spiking_incident_for_source_and_node(8, "node-b").await;
+    let same_node_other_source = spiking_incident_for_source_and_node(8, "node-a").await;
+    let same_source_other_node = spiking_incident_for_source_and_node(7, "node-b").await;
 
     assert_eq!(first["source_id"], 7);
-    assert_eq!(second["source_id"], 8);
-    assert_eq!(first["data_quality"]["node_identity"], "node-a");
-    assert_eq!(second["data_quality"]["node_identity"], "node-b");
+    assert_eq!(same_node_other_source["source_id"], 8);
+    assert_eq!(same_source_other_node["source_id"], 7);
+    for body in [&first, &same_node_other_source, &same_source_other_node] {
+        assert_eq!(body["data_quality"]["node_identity"], "available");
+    }
 
     let first_key = first["incidents"][0]["incident_key"]
         .as_str()
         .expect("first storage-backed incident key");
-    let second_key = second["incidents"][0]["incident_key"]
+    let other_node_key = same_source_other_node["incidents"][0]["incident_key"]
         .as_str()
-        .expect("second storage-backed incident key");
-    assert_ne!(first_key, second_key);
+        .expect("other-node storage-backed incident key");
+    assert_ne!(first_key, other_node_key);
 }
 
 #[tokio::test]
