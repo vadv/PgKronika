@@ -1336,6 +1336,79 @@ fn xmin_hold_on_empty_input_reports_nothing() {
 }
 
 #[test]
+fn xmin_hold_attaches_a_lock_edge_when_the_holder_is_a_waiter() {
+    // A horizon-holding idle transaction whose pid is also a waiter in the
+    // pg_locks snapshot: the cross-section join names why it stays open — it is
+    // blocked — without changing the amplifier role.
+    let mut typed = activity_typed(vec![ActivityBackend {
+        pid: 42,
+        xmin_age: Some(2_000_000),
+        state: Some("idle in transaction".into()),
+        ..base_backend()
+    }]);
+    typed.insert_lock_snapshot(LockSnapshot {
+        ts: 5,
+        edges: vec![LockEdge {
+            waiter_pid: 42,
+            blocker_pid: 7,
+        }],
+    });
+    let episode = window_episode(PG_STAT_ACTIVITY, "backend_xmin_age");
+    let lenses: [&dyn Lens; 1] = [&XminHorizonHoldLens];
+    let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+    let outcome = analyze(
+        vec![episode],
+        &SeriesSet::for_test(0),
+        &typed,
+        &lenses,
+        &config,
+    )
+    .expect("valid analysis");
+    let finding = &outcome.incidents[0].findings[0];
+    assert_eq!(finding.role(), Role::Amplifier);
+    let edge = finding
+        .evidence()
+        .iter()
+        .find_map(|evidence| match evidence {
+            Evidence::Direct(direct) => direct.lock_edge(),
+            _ => None,
+        })
+        .expect("the blocked horizon-holder carries a sampled lock edge");
+    assert_eq!(edge.waiter_pid(), 42);
+    assert_eq!(edge.blocker_pid(), 7);
+}
+
+#[test]
+fn xmin_hold_reports_without_a_lock_edge_when_no_edge_names_the_holder() {
+    let typed = activity_typed(vec![ActivityBackend {
+        pid: 42,
+        xmin_age: Some(2_000_000),
+        state: Some("idle in transaction".into()),
+        ..base_backend()
+    }]);
+    let episode = window_episode(PG_STAT_ACTIVITY, "backend_xmin_age");
+    let lenses: [&dyn Lens; 1] = [&XminHorizonHoldLens];
+    let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
+    let outcome = analyze(
+        vec![episode],
+        &SeriesSet::for_test(0),
+        &typed,
+        &lenses,
+        &config,
+    )
+    .expect("valid analysis");
+    let finding = &outcome.incidents[0].findings[0];
+    assert_eq!(finding.role(), Role::Amplifier);
+    assert!(
+        finding
+            .evidence()
+            .iter()
+            .all(|evidence| !matches!(evidence, Evidence::Direct(_))),
+        "without a blocked_by edge the hold carries no lock evidence"
+    );
+}
+
+#[test]
 fn sync_replication_reports_a_medium_coincident_on_a_syncrep_wait() {
     let typed = repeated_activity_typed(&[ActivityBackend {
         wait_event: Some("SyncRep".into()),

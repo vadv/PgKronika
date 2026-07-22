@@ -6,15 +6,16 @@ use super::super::dispatch::{LimitHit, SectionColumn};
 use super::super::engine::EvalContext;
 use super::super::evidence::sink::FindingSink;
 use super::super::evidence::{
-    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
+    ConfidenceCap, DirectEvidence, Evidence, FindingDraft, FindingScope, GaugeEntity,
+    GaugeEvidence, GaugeRatio, GaugeUnit, GaugeValueInput, LockParticipant, Role, SourceWindow,
+    ThresholdKind,
 };
 use super::super::lens::Lens;
 use super::super::model::IdentityValue;
 use super::super::series::SeriesSet;
 use super::super::typed::{ActivityBackend, TypedInputs};
 use super::shared::{
-    PG_STAT_ACTIVITY, activity_backends_examined, activity_member, exact_i64_as_f64,
+    PG_LOCKS, PG_STAT_ACTIVITY, activity_backends_examined, activity_member, exact_i64_as_f64,
     idle_in_transaction, is_syncrep,
 };
 
@@ -34,6 +35,10 @@ impl XminHorizonHoldLens {
         SectionColumn {
             section: PG_STAT_ACTIVITY,
             column: "xact_start",
+        },
+        SectionColumn {
+            section: PG_LOCKS,
+            column: "blocked_by",
         },
     ];
     /// Below this xmin age the hold is ordinary transaction churn, not a horizon
@@ -128,6 +133,21 @@ impl Lens for XminHorizonHoldLens {
                 })
             {
                 evidence.push(Evidence::GaugeObservation(xact_evidence));
+            }
+            // Cross-section entity join by pid: when the horizon-holder is itself
+            // a waiter in a pg_locks blocked_by edge, that names why the
+            // transaction stays open — it is blocked, not merely idle.
+            if let Some((edge_ts, edge)) = typed
+                .lock_window(start, end)
+                .flat_map(|snapshot| snapshot.edges.iter().map(move |edge| (snapshot.ts, edge)))
+                .find(|(_, edge)| edge.waiter_pid == backend.pid)
+            {
+                evidence.push(Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                    edge_ts,
+                    edge.waiter_pid,
+                    edge.blocker_pid,
+                    LockParticipant::Waiter,
+                )));
             }
             sink.emit(FindingDraft::new(
                 Role::Amplifier,

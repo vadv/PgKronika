@@ -246,7 +246,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::ActivityRows,
-            Missing::EntityJoin,
             // Period undefined: a single sample or a before/after plan bridge is not a timed series.
             Missing::SourcePeriod,
             Missing::InputCoverage,
