@@ -8,10 +8,23 @@ fn write_archiver_with_node(
     min_ts: i64,
     max_ts: i64,
 ) {
+    write_archiver_with_source_and_node(dir, file, 7, node_self_id, rows, min_ts, max_ts);
+}
+
+fn write_archiver_with_source_and_node(
+    dir: &std::path::Path,
+    file: &str,
+    source_id: u64,
+    node_self_id: &str,
+    rows: &[PgStatArchiver],
+    min_ts: i64,
+    max_ts: i64,
+) {
     let archiver = PgStatArchiver::encode(rows).expect("encode archiver");
-    write_section_with_node(
+    write_section_with_source_and_node(
         dir,
         file,
+        source_id,
         node_self_id,
         1_008_001,
         u32::try_from(rows.len()).expect("fixture row count"),
@@ -28,6 +41,34 @@ fn write_archiver_with_node(
 fn write_section_with_node(
     dir: &std::path::Path,
     file: &str,
+    node_self_id: &str,
+    type_id: u32,
+    rows: u32,
+    body: &[u8],
+    min_ts: i64,
+    max_ts: i64,
+) {
+    write_section_with_source_and_node(
+        dir,
+        file,
+        7,
+        node_self_id,
+        type_id,
+        rows,
+        body,
+        min_ts,
+        max_ts,
+    );
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "fixture helper mirrors SectionInput and PartMeta fields"
+)]
+fn write_section_with_source_and_node(
+    dir: &std::path::Path,
+    file: &str,
+    source_id: u64,
     node_self_id: &str,
     type_id: u32,
     rows: u32,
@@ -98,7 +139,7 @@ fn write_section_with_node(
         PartMeta {
             min_ts,
             max_ts,
-            source_id: 7,
+            source_id,
         },
     );
     std::fs::write(dir.join(file), bytes).expect("write segment");
@@ -271,6 +312,60 @@ async fn assert_calm_incidents(uri: &str, to: i64) {
             "an empty response still carries {field}"
         );
     }
+}
+
+async fn spiking_incident_for_source_and_node(
+    source_id: u64,
+    node_self_id: &str,
+) -> serde_json::Value {
+    let to = 39 * 60 * 1_000_000;
+    let rows = archiver_rows(true);
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_archiver_with_source_and_node(
+        dir.path(),
+        "0.pgm",
+        source_id,
+        node_self_id,
+        &rows[..21],
+        0,
+        20 * 60 * 1_000_000,
+    );
+    write_archiver_with_source_and_node(
+        dir.path(),
+        "1.pgm",
+        source_id,
+        node_self_id,
+        &rows[20..],
+        20 * 60 * 1_000_000,
+        to,
+    );
+    let uri = format!("/v1/incidents?source={source_id}&from=0&to={to}&window=6m&step=2m");
+    let (status, response) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["analysis_status"], "incidents_detected");
+    response
+}
+
+#[tokio::test]
+async fn incidents_propagate_storage_source_and_node_identity_to_engine_and_http() {
+    let first = spiking_incident_for_source_and_node(7, "node-a").await;
+    let same_node_other_source = spiking_incident_for_source_and_node(8, "node-a").await;
+    let same_source_other_node = spiking_incident_for_source_and_node(7, "node-b").await;
+
+    assert_eq!(first["source_id"], 7);
+    assert_eq!(same_node_other_source["source_id"], 8);
+    assert_eq!(same_source_other_node["source_id"], 7);
+    for body in [&first, &same_node_other_source, &same_source_other_node] {
+        assert_eq!(body["data_quality"]["node_identity"], "available");
+    }
+
+    let first_key = first["incidents"][0]["incident_key"]
+        .as_str()
+        .expect("first storage-backed incident key");
+    let other_node_key = same_source_other_node["incidents"][0]["incident_key"]
+        .as_str()
+        .expect("other-node storage-backed incident key");
+    assert_ne!(first_key, other_node_key);
 }
 
 #[tokio::test]
