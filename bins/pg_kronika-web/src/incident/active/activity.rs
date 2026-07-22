@@ -16,8 +16,10 @@ use super::super::series::SeriesSet;
 use super::super::typed::{ActivityBackend, TypedInputs};
 use super::shared::{
     PG_LOCKS, PG_STAT_ACTIVITY, activity_backends_examined, activity_member, exact_i64_as_f64,
-    idle_in_transaction, is_syncrep,
+    idle_in_transaction, is_syncrep, lock_edges_examined,
 };
+
+const MAX_LOCK_EDGE_EVIDENCE: usize = 128;
 
 /// `PG-HORIZON-013` (`xmin_horizon_hold`): an observed old transaction with an
 /// assigned xmin capable of holding the vacuum horizon. Prepared transactions,
@@ -35,6 +37,10 @@ impl XminHorizonHoldLens {
         SectionColumn {
             section: PG_STAT_ACTIVITY,
             column: "xact_start",
+        },
+        SectionColumn {
+            section: PG_LOCKS,
+            column: "blocked_by",
         },
     ];
     /// Below this xmin age the hold is ordinary transaction churn, not a horizon
@@ -54,6 +60,35 @@ impl XminHorizonHoldLens {
                 || backend
                     .xact_age_us
                     .is_some_and(|age| age >= Self::MIN_LONG_XACT_US))
+    }
+
+    fn lock_edge_witnesses(
+        typed: &TypedInputs,
+        start: i64,
+        end: i64,
+        snapshot_ts: i64,
+        backend: &ActivityBackend,
+    ) -> BTreeSet<(i64, i64, i64)> {
+        let mut witnesses = BTreeSet::new();
+        for snapshot in typed.lock_window(start, end).filter(|snapshot| {
+            snapshot.ts == snapshot_ts && snapshot.activity_snapshot_ts == Some(snapshot_ts)
+        }) {
+            for edge in &snapshot.edges {
+                if edge.waiter_pid != backend.pid
+                    || edge.waiter_backend_start != Some(backend.backend_start)
+                    || edge.waiter_pid <= 0
+                    || edge.blocker_pid < 0
+                    || edge.blocker_pid == edge.waiter_pid
+                {
+                    continue;
+                }
+                witnesses.insert((snapshot.ts, edge.waiter_pid, edge.blocker_pid));
+                if witnesses.len() > MAX_LOCK_EDGE_EVIDENCE {
+                    let _ = witnesses.pop_last();
+                }
+            }
+        }
+        witnesses
     }
 }
 
@@ -94,6 +129,8 @@ impl Lens for XminHorizonHoldLens {
             })
             .max_by_key(|(_, backend)| backend.xmin_age.unwrap_or_default());
         if let Some((observed_at_us, backend)) = candidate {
+            sink.charge_points(lock_edges_examined(typed, start, end))?;
+            let lock_edges = Self::lock_edge_witnesses(typed, start, end, observed_at_us, backend);
             let identity: Arc<[IdentityValue]> = Arc::from(vec![
                 IdentityValue::I64(backend.pid),
                 IdentityValue::I64(backend.backend_start),
@@ -130,6 +167,14 @@ impl Lens for XminHorizonHoldLens {
             {
                 evidence.push(Evidence::GaugeObservation(xact_evidence));
             }
+            evidence.extend(lock_edges.into_iter().map(|(edge_ts, waiter, blocker)| {
+                Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                    edge_ts,
+                    waiter,
+                    blocker,
+                    LockParticipant::Waiter,
+                ))
+            }));
             sink.emit(FindingDraft::new(
                 Role::Amplifier,
                 FindingScope::from_episode(member),
@@ -272,7 +317,6 @@ impl InternalWaitConcentrationLens {
     const MIN_ACTIVE: usize = 3;
 
     const MIN_SNAPSHOTS: usize = 3;
-    const MAX_LOCK_EDGE_EVIDENCE: usize = 128;
     const WAIT_FRACTION: f64 = 0.5;
 
     fn index_lock_edges(typed: &TypedInputs, start: i64, end: i64) -> LockEdgeIndex {
@@ -319,7 +363,7 @@ impl InternalWaitConcentrationLens {
         }
         for (ts, waiter, _, blocker) in matching {
             witnesses.insert((ts, waiter, blocker));
-            if witnesses.len() > Self::MAX_LOCK_EDGE_EVIDENCE {
+            if witnesses.len() > MAX_LOCK_EDGE_EVIDENCE {
                 let _ = witnesses.pop_last();
             }
         }
@@ -478,13 +522,7 @@ impl Lens for InternalWaitConcentrationLens {
         let (start, end) = (context.incident_start_us, context.incident_end_us);
         let activity_points = activity_backends_examined(typed, start, end);
         sink.charge_points(activity_points)?;
-        let lock_edges = typed
-            .lock_window(start, end)
-            .filter(|snapshot| snapshot.activity_snapshot_ts == Some(snapshot.ts))
-            .fold(0_usize, |total, snapshot| {
-                total.saturating_add(snapshot.edges.len())
-            });
-        sink.charge_points(lock_edges)?;
+        sink.charge_points(lock_edges_examined(typed, start, end))?;
         // Every activity row is the conservative ceiling for one membership probe.
         sink.charge_points(activity_points)?;
         let lock_edges_by_waiter = Self::index_lock_edges(typed, start, end);

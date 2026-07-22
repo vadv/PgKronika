@@ -104,6 +104,11 @@ See the [OpenAPI contract](openapi.json) and the
   by a limit. Requests are limited to 24 hours and have fixed ceilings for
   units, sections, materialized cells, series points, identity bytes, scoring
   work, and episodes.
+- Cross-section lock evidence requires an explicit producer-stored shared
+  observation token and an exact `(snapshot timestamp, PID, backend_start)`
+  match. Equal timestamps do not prove the relation. The current activity and
+  lock collectors use separate statements, so `cross_section_entity_join`
+  remains unavailable until the producer stores that token.
 - Product-owned incomplete-result explanations use the closed
   `{ "kind": "...", "params": { ... } }` reason schema. Lens ids, enum values,
   formulas, units, and evidence remain stable machine data; incident catalogs

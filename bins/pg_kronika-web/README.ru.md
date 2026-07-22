@@ -103,6 +103,12 @@ Details с media type `application/problem+json` и ровно пятью пол
   объясняет работу, отброшенную из-за лимита. Период запроса ограничен 24 часами;
   также ограничены units, sections, materialized cells, series points, identity
   bytes, scoring work и episodes.
+- Lock-evidence между секциями требует явного сохранённого producer токена
+  общего наблюдения и точного совпадения `(snapshot timestamp, PID,
+  backend_start)`. Равные timestamps не доказывают связь. Текущие activity- и
+  lock-коллекторы выполняют разные statements, поэтому
+  `cross_section_entity_join` остаётся недоступным, пока producer не сохранит
+  такой токен.
 - Продуктовые объяснения неполного результата используют закрытую схему
   `{ "kind": "...", "params": { ... } }`. Lens ids, enum values, formulas,
   units и evidence остаются стабильными машинными данными; в incident catalog
