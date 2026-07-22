@@ -803,6 +803,9 @@ pub(crate) struct ActivitySnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LockEdge {
     pub waiter_pid: i64,
+    /// Session start from the waiter row; absent on layouts or rows that cannot
+    /// support a PID-reuse-safe cross-section join.
+    pub waiter_backend_start: Option<i64>,
     pub blocker_pid: i64,
 }
 
@@ -810,6 +813,9 @@ pub(crate) struct LockEdge {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LockSnapshot {
     pub ts: i64,
+    /// Activity snapshot captured by the same producer observation. Equal
+    /// wall-clock timestamps alone do not establish this provenance.
+    pub activity_snapshot_ts: Option<i64>,
     pub edges: Vec<LockEdge>,
 }
 
@@ -2151,15 +2157,18 @@ mod tests {
     fn lock_window_selects_snapshots_by_collection_time() {
         let edge = LockEdge {
             waiter_pid: 20,
+            waiter_backend_start: Some(1),
             blocker_pid: 10,
         };
         let mut typed = TypedInputs::new();
         typed.insert_lock_snapshot(LockSnapshot {
             ts: 5,
+            activity_snapshot_ts: None,
             edges: vec![edge],
         });
         typed.insert_lock_snapshot(LockSnapshot {
             ts: 12,
+            activity_snapshot_ts: None,
             edges: vec![edge],
         });
 

@@ -789,6 +789,28 @@ mod tests {
     }
 
     #[test]
+    fn internal_wait_keeps_the_cross_section_join_requirement() {
+        let wait = core_catalog()
+            .iter()
+            .find(|lens| lens.lens_id() == "PG-WAIT-019")
+            .expect("internal wait catalog entry");
+        let requirements: Vec<_> = wait
+            .missing()
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect();
+        assert_eq!(
+            requirements,
+            [
+                "sampled_activity_rows",
+                "cross_section_entity_join",
+                "source_period_provenance",
+                "request_input_coverage",
+            ]
+        );
+    }
+
+    #[test]
     fn proposal_event_candidates_are_accounted_once() {
         let expected = [
             "oom_kill",
