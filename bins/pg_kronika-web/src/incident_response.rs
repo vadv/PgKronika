@@ -1095,6 +1095,56 @@ mod tests {
     }
 
     #[test]
+    fn typed_entity_joins_project_only_the_stable_capability_token() {
+        let catalog = crate::incident::core_catalog();
+        let projected = dormant_entries(catalog, &[]);
+        let mut entity_join_entries = 0;
+        for lens in catalog {
+            let entry = projected
+                .iter()
+                .find(|entry| entry["lens_id"] == lens.lens_id())
+                .expect("projected dormant lens");
+            let expected: Vec<_> = lens
+                .missing()
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect();
+            assert_eq!(entry["awaiting"], json!(expected), "{}", lens.lens_id());
+            if lens.entity_join_contract().is_some() {
+                entity_join_entries += 1;
+                assert_eq!(
+                    entry["awaiting"]
+                        .as_array()
+                        .expect("awaiting capability list")
+                        .iter()
+                        .filter(|capability| {
+                            capability.as_str() == Some("cross_section_entity_join")
+                        })
+                        .count(),
+                    1,
+                    "{}",
+                    lens.lens_id(),
+                );
+            }
+        }
+        assert_eq!(entity_join_entries, 24);
+
+        let encoded = serde_json::to_string(&projected).expect("dormant catalog JSON");
+        for internal_token in [
+            "activity_lock_waiter",
+            "backend_relation_horizon",
+            "shared_snapshot_producer",
+            "typed_relation_producer",
+            "stored_mapping_producer",
+            "shared_snapshot_token",
+            "snapshot_scoped_relation",
+            "overlapping_lifetime_mapping",
+        ] {
+            assert!(!encoded.contains(internal_token), "{internal_token}");
+        }
+    }
+
+    #[test]
     fn active_contracts_report_typed_request_capability_absence() {
         let mut states = BTreeMap::new();
         states.insert("pg_freeze_horizon", CapabilityInputState::NotCollected);

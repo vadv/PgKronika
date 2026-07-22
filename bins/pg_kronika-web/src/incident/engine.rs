@@ -2,11 +2,13 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use super::cluster::{ClusterError, ClusterOutcome, cluster_episodes};
 use super::dispatch::{
     LimitAxis, LimitHit, SectionColumn, WorkBudget, candidate_lenses, section_index,
 };
+use super::entity_join::EntityScope;
 use super::evidence::Finding;
 use super::evidence::sink::{FindingSink, OutputCounts, OutputLimits};
 use super::lens::Lens;
@@ -23,6 +25,8 @@ pub(crate) enum ClockRelation {
 pub(crate) struct EvalContext {
     pub incident_start_us: i64,
     pub incident_end_us: i64,
+    source_id: u64,
+    node_self_id: Arc<str>,
     clock_relation: ClockRelation,
 }
 
@@ -33,18 +37,25 @@ impl EvalContext {
         self.clock_relation
     }
 
+    pub(crate) fn entity_scope(&self) -> Option<EntityScope<'_>> {
+        EntityScope::new(self.source_id, &self.node_self_id)
+    }
+
     #[cfg(test)]
-    pub(crate) const fn for_test(clock_relation: ClockRelation) -> Self {
+    pub(crate) fn for_test(clock_relation: ClockRelation) -> Self {
         Self {
             incident_start_us: 0,
             incident_end_us: 10,
+            source_id: 1,
+            node_self_id: Arc::from("node"),
             clock_relation,
         }
     }
 }
 
 pub(crate) struct IncidentConfig {
-    node_self_id: String,
+    source_id: u64,
+    node_self_id: Arc<str>,
     epsilon_us: i64,
     max_cluster_span_us: i64,
     clock_relation: ClockRelation,
@@ -64,13 +75,15 @@ impl IncidentConfig {
     ///
     /// These values do not claim a resident-memory budget.
     pub(crate) fn production(
+        source_id: u64,
         node_self_id: &str,
         epsilon_us: i64,
         max_cluster_span_us: i64,
         clock_relation: ClockRelation,
     ) -> Self {
         Self {
-            node_self_id: node_self_id.to_owned(),
+            source_id,
+            node_self_id: Arc::from(node_self_id),
             epsilon_us,
             max_cluster_span_us,
             clock_relation,
@@ -97,7 +110,8 @@ impl IncidentConfig {
         clock_relation: ClockRelation,
     ) -> Self {
         Self {
-            node_self_id: node_self_id.to_owned(),
+            source_id: 1,
+            node_self_id: Arc::from(node_self_id),
             epsilon_us,
             max_cluster_span_us,
             clock_relation,
@@ -286,6 +300,8 @@ pub(crate) fn analyze(
         let context = EvalContext {
             incident_start_us: cluster.start_us,
             incident_end_us: cluster.end_us,
+            source_id: config.source_id,
+            node_self_id: Arc::clone(&config.node_self_id),
             clock_relation: config.clock_relation,
         };
         let present: BTreeSet<&'static str> = cluster
@@ -373,7 +389,6 @@ mod tests {
     };
     use crate::incident::model::IdentityValue;
     use kronika_analytics::{Direction, Episode, Evaluated};
-    use std::sync::Arc;
 
     #[derive(Clone, Copy)]
     enum TestEvidence {
@@ -553,7 +568,8 @@ mod tests {
 
     fn config(work_limit: u64) -> IncidentConfig {
         IncidentConfig {
-            node_self_id: "node".to_owned(),
+            source_id: 1,
+            node_self_id: Arc::from("node"),
             epsilon_us: 5,
             max_cluster_span_us: 1_000,
             clock_relation: ClockRelation::Unknown,
@@ -849,7 +865,7 @@ mod tests {
     #[test]
     fn missing_node_and_input_limits_are_typed_errors() {
         let mut missing_node = config(100);
-        missing_node.node_self_id.clear();
+        missing_node.node_self_id = Arc::from("");
         assert!(matches!(
             analyze(
                 vec![],
