@@ -165,17 +165,16 @@ fn parse_continuation<'a>(
 
 pub(crate) fn strip_sqlstate(message: &str) -> (Option<&str>, &str) {
     let bytes = message.as_bytes();
-    if bytes.len() > 7
+    if bytes.len() >= 7
         && bytes[..5]
             .iter()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
         && bytes[5] == b':'
         && bytes[6] == b' '
-        && bytes[7] == b' '
     {
         return (
             message.get(..5),
-            message.get(8..).unwrap_or_default().trim(),
+            message.get(6..).unwrap_or_default().trim_start(),
         );
     }
     (None, message)
@@ -257,9 +256,9 @@ mod tests {
     use super::{ContinuationKind, LogSeverity, ParsedLine, parse_stderr_line, strip_sqlstate};
 
     #[test]
-    fn parses_stderr_error_and_sqlstate() {
+    fn parses_stderr_error_and_canonical_sqlstate() {
         let parsed = parse_stderr_line(
-            "2026-07-05 12:30:45.123 UTC [42]: ERROR:  42P01:  relation \"foo\" does not exist",
+            "2026-07-05 12:30:45.123 UTC [42]: ERROR:  42P01: relation \"foo\" does not exist",
         )
         .expect("error parsed");
         let ParsedLine::Error {
@@ -366,14 +365,35 @@ mod tests {
     }
 
     #[test]
-    fn strips_sqlstate_only_at_the_message_start() {
+    fn strips_sqlstate_with_canonical_and_legacy_spacing() {
+        assert_eq!(
+            strip_sqlstate("42P01: relation \"foo\" does not exist"),
+            (Some("42P01"), "relation \"foo\" does not exist")
+        );
         assert_eq!(
             strip_sqlstate("42P01:  relation \"foo\" does not exist"),
             (Some("42P01"), "relation \"foo\" does not exist")
         );
         assert_eq!(
-            strip_sqlstate("ERROR 42P01: text"),
-            (None, "ERROR 42P01: text")
+            strip_sqlstate("42P01:   \t relation \"foo\" does not exist"),
+            (Some("42P01"), "relation \"foo\" does not exist")
         );
+    }
+
+    #[test]
+    fn rejects_absent_or_malformed_sqlstate_prefixes() {
+        for message in [
+            "relation does not exist",
+            "ERROR 42P01: text",
+            " 42P01: text",
+            "42p01: text",
+            "42P0: text",
+            "42P010: text",
+            "42P-1: text",
+            "42P01:text",
+            "Ä2P01: text",
+        ] {
+            assert_eq!(strip_sqlstate(message), (None, message), "{message:?}");
+        }
     }
 }

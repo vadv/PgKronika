@@ -11,6 +11,7 @@ use kronika_registry::incident_gauges::{
     PgReplicationSlotRetentionV3, PgStorageMountV1, PgVacuumObservationV1,
 };
 use kronika_registry::os_meminfo::OsMeminfo;
+use kronika_registry::pg_log::PgLogErrorV1;
 use kronika_registry::pg_prepared_xacts::PgPreparedXacts;
 use kronika_registry::pg_stat_archiver::PgStatArchiver;
 use kronika_registry::pg_stat_database::PgStatDatabaseV1;
