@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::super::cluster::Cluster;
@@ -6,15 +6,16 @@ use super::super::dispatch::{LimitHit, SectionColumn};
 use super::super::engine::EvalContext;
 use super::super::evidence::sink::FindingSink;
 use super::super::evidence::{
-    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
+    ConfidenceCap, DirectEvidence, Evidence, FindingDraft, FindingScope, GaugeEntity,
+    GaugeEvidence, GaugeRatio, GaugeUnit, GaugeValueInput, LockParticipant, Role, SourceWindow,
+    ThresholdKind,
 };
 use super::super::lens::Lens;
 use super::super::model::IdentityValue;
 use super::super::series::SeriesSet;
 use super::super::typed::{ActivityBackend, TypedInputs};
 use super::shared::{
-    PG_STAT_ACTIVITY, activity_backends_examined, activity_member, exact_i64_as_f64,
+    PG_LOCKS, PG_STAT_ACTIVITY, activity_backends_examined, activity_member, exact_i64_as_f64,
     idle_in_transaction, is_syncrep,
 };
 
@@ -238,24 +239,215 @@ impl Lens for SyncReplicationWaitLens {
     }
 }
 
-/// `PG-WAIT-019` (`internal_wait_concentration`): active backends piling onto
-/// internal waits. Reports each bounded wait class separately only when at
-/// least three snapshots carry explicit complete-visibility provenance and the
-/// class accounts for at least half of the visible active-backend denominator.
+/// `PG-WAIT-019` (`internal_wait_concentration`): sampled wait-class
+/// concentration. A heavyweight `Lock` sample additionally requires an exact
+/// same-snapshot, same-session `blocked_by` edge.
 pub(crate) struct InternalWaitConcentrationLens;
+
+type LockEdgeIndex = BTreeSet<(i64, i64, i64, i64)>;
+type LockEdgeWitnesses = BTreeSet<(i64, i64, i64)>;
+
+struct WaitConcentration {
+    snapshots: usize,
+    active_total: usize,
+    class_totals: [usize; 4],
+    lock_edge_witnesses: LockEdgeWitnesses,
+    observed_at_us: i64,
+}
 
 impl InternalWaitConcentrationLens {
     const ID: &'static str = "PG-WAIT-019";
-    const INPUTS: &'static [SectionColumn] = &[SectionColumn {
-        section: PG_STAT_ACTIVITY,
-        column: "wait_event_type",
-    }];
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: PG_STAT_ACTIVITY,
+            column: "wait_event_type",
+        },
+        SectionColumn {
+            section: PG_LOCKS,
+            column: "blocked_by",
+        },
+    ];
     /// A fraction over too few active backends is noise; require a floor so the
     /// concentration is meaningful.
     const MIN_ACTIVE: usize = 3;
 
     const MIN_SNAPSHOTS: usize = 3;
+    const MAX_LOCK_EDGE_EVIDENCE: usize = 128;
     const WAIT_FRACTION: f64 = 0.5;
+
+    fn index_lock_edges(typed: &TypedInputs, start: i64, end: i64) -> LockEdgeIndex {
+        let mut indexed = BTreeSet::new();
+        for snapshot in typed.lock_window(start, end) {
+            if snapshot.activity_snapshot_ts != Some(snapshot.ts) {
+                continue;
+            }
+            for edge in &snapshot.edges {
+                let Some(waiter_start) = edge.waiter_backend_start.filter(|start| *start > 0)
+                else {
+                    continue;
+                };
+                if edge.waiter_pid <= 0
+                    || edge.blocker_pid < 0
+                    || edge.blocker_pid == edge.waiter_pid
+                {
+                    continue;
+                }
+                indexed.insert((snapshot.ts, edge.waiter_pid, waiter_start, edge.blocker_pid));
+            }
+        }
+        indexed
+    }
+
+    fn record_lock_witnesses(
+        indexed: &LockEdgeIndex,
+        snapshot_ts: i64,
+        backend: &ActivityBackend,
+        witnesses: &mut LockEdgeWitnesses,
+    ) -> bool {
+        if backend.pid <= 0 || backend.backend_start <= 0 {
+            return false;
+        }
+        let mut matching = indexed
+            .range(
+                (snapshot_ts, backend.pid, backend.backend_start, i64::MIN)
+                    ..=(snapshot_ts, backend.pid, backend.backend_start, i64::MAX),
+            )
+            .copied()
+            .peekable();
+        if matching.peek().is_none() {
+            return false;
+        }
+        for (ts, waiter, _, blocker) in matching {
+            witnesses.insert((ts, waiter, blocker));
+            if witnesses.len() > Self::MAX_LOCK_EDGE_EVIDENCE {
+                let _ = witnesses.pop_last();
+            }
+        }
+        true
+    }
+
+    fn measure(
+        typed: &TypedInputs,
+        start: i64,
+        end: i64,
+        indexed: &LockEdgeIndex,
+    ) -> WaitConcentration {
+        let mut measured = WaitConcentration {
+            snapshots: 0,
+            active_total: 0,
+            class_totals: [0; 4],
+            lock_edge_witnesses: BTreeSet::new(),
+            observed_at_us: start,
+        };
+        for snapshot in typed
+            .activity_window(start, end)
+            .filter(|snapshot| snapshot.completeness.denominator_usable())
+        {
+            let active = snapshot
+                .backends
+                .iter()
+                .filter(|backend| backend.state.as_deref() == Some("active"))
+                .count();
+            if active < Self::MIN_ACTIVE {
+                continue;
+            }
+            measured.snapshots = measured.snapshots.saturating_add(1);
+            measured.active_total = measured.active_total.saturating_add(active);
+            measured.observed_at_us = snapshot.ts;
+            for backend in snapshot
+                .backends
+                .iter()
+                .filter(|backend| backend.state.as_deref() == Some("active"))
+            {
+                let class = match backend.wait_event_type.as_deref() {
+                    Some("LWLock") => Some(0),
+                    Some("BufferPin") => Some(1),
+                    Some("IO") => Some(2),
+                    Some("Lock")
+                        if Self::record_lock_witnesses(
+                            indexed,
+                            snapshot.ts,
+                            backend,
+                            &mut measured.lock_edge_witnesses,
+                        ) =>
+                    {
+                        Some(3)
+                    }
+                    _ => None,
+                };
+                if let Some(class) = class {
+                    measured.class_totals[class] = measured.class_totals[class].saturating_add(1);
+                }
+            }
+        }
+        measured
+    }
+
+    fn emit(
+        measured: &WaitConcentration,
+        start: i64,
+        end: i64,
+        sink: &mut FindingSink<'_>,
+    ) -> Result<(), LimitHit> {
+        let Some(active_total) = u32::try_from(measured.active_total).ok().map(f64::from) else {
+            return Ok(());
+        };
+        for (class, waiting) in
+            measured
+                .class_totals
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, count)| {
+                    measured.snapshots >= Self::MIN_SNAPSHOTS
+                        && measured.active_total > 0
+                        && count.saturating_mul(2) >= measured.active_total
+                })
+        {
+            let class = ["LWLock", "BufferPin", "IO", "Lock"][class];
+            let Some(waiting) = u32::try_from(waiting).ok().map(f64::from) else {
+                continue;
+            };
+            let identity: Arc<[IdentityValue]> =
+                Arc::from(vec![IdentityValue::Text(class.to_owned())]);
+            let Some(gauge) = GaugeEvidence::ratio(
+                GaugeRatio::new(
+                    "waiting_backends",
+                    waiting,
+                    "active_backends",
+                    active_total,
+                    GaugeUnit::Count,
+                ),
+                Self::WAIT_FRACTION,
+                ThresholdKind::AtLeast,
+                measured.observed_at_us,
+                measured.snapshots,
+                SourceWindow::from_bounds(start, end, None, measured.snapshots),
+                GaugeEntity::new(PG_STAT_ACTIVITY, Arc::clone(&identity)),
+            ) else {
+                continue;
+            };
+            let mut evidence = vec![Evidence::GaugeObservation(gauge)];
+            if class == "Lock" {
+                evidence.extend(measured.lock_edge_witnesses.iter().map(
+                    |&(ts, waiter, blocker)| {
+                        Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                            ts,
+                            waiter,
+                            blocker,
+                            LockParticipant::Waiter,
+                        ))
+                    },
+                ));
+            }
+            sink.emit(FindingDraft::new(
+                Role::Coincident,
+                FindingScope::from_parts(PG_STAT_ACTIVITY, "wait_event_type", identity),
+                evidence,
+            ))?;
+        }
+        Ok(())
+    }
 }
 
 impl Lens for InternalWaitConcentrationLens {
@@ -280,90 +472,23 @@ impl Lens for InternalWaitConcentrationLens {
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
-        let Some(member) = activity_member(cluster) else {
+        if activity_member(cluster).is_none() {
             return Ok(());
-        };
+        }
         let (start, end) = (context.incident_start_us, context.incident_end_us);
-        sink.charge_points(activity_backends_examined(typed, start, end))?;
-        let mut snapshots = 0_usize;
-        let mut active_total = 0_usize;
-        let mut class_totals = [0_usize; 3];
-        let mut observed_at_us = start;
-        for snapshot in typed
-            .activity_window(start, end)
-            .filter(|snapshot| snapshot.completeness.denominator_usable())
-        {
-            let active = snapshot
-                .backends
-                .iter()
-                .filter(|backend| backend.state.as_deref() == Some("active"))
-                .count();
-            if active < Self::MIN_ACTIVE {
-                continue;
-            }
-            snapshots = snapshots.saturating_add(1);
-            active_total = active_total.saturating_add(active);
-            observed_at_us = snapshot.ts;
-            for backend in snapshot
-                .backends
-                .iter()
-                .filter(|backend| backend.state.as_deref() == Some("active"))
-            {
-                match backend.wait_event_type.as_deref() {
-                    Some("LWLock") => class_totals[0] = class_totals[0].saturating_add(1),
-                    Some("BufferPin") => class_totals[1] = class_totals[1].saturating_add(1),
-                    Some("IO") => class_totals[2] = class_totals[2].saturating_add(1),
-                    _ => {}
-                }
-            }
-        }
-        let concentrated = class_totals
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, count)| {
-                snapshots >= Self::MIN_SNAPSHOTS
-                    && active_total > 0
-                    && count.saturating_mul(2) >= active_total
-            })
-            .max_by_key(|(_, count)| *count);
-        if let Some((class, waiting)) = concentrated {
-            let class = match class {
-                0 => "LWLock",
-                1 => "BufferPin",
-                _ => "IO",
-            };
-            let identity: Arc<[IdentityValue]> =
-                Arc::from(vec![IdentityValue::Text(class.to_owned())]);
-            let (Some(waiting), Some(active_total)) = (
-                u32::try_from(waiting).ok().map(f64::from),
-                u32::try_from(active_total).ok().map(f64::from),
-            ) else {
-                return Ok(());
-            };
-            let Some(evidence) = GaugeEvidence::ratio(
-                GaugeRatio::new(
-                    "waiting_backends",
-                    waiting,
-                    "active_backends",
-                    active_total,
-                    GaugeUnit::Count,
-                ),
-                Self::WAIT_FRACTION,
-                ThresholdKind::AtLeast,
-                observed_at_us,
-                snapshots,
-                SourceWindow::from_bounds(start, end, None, snapshots),
-                GaugeEntity::new(PG_STAT_ACTIVITY, identity),
-            ) else {
-                return Ok(());
-            };
-            sink.emit(FindingDraft::new(
-                Role::Coincident,
-                FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
-            ))?;
-        }
-        Ok(())
+        let activity_points = activity_backends_examined(typed, start, end);
+        sink.charge_points(activity_points)?;
+        let lock_edges = typed
+            .lock_window(start, end)
+            .filter(|snapshot| snapshot.activity_snapshot_ts == Some(snapshot.ts))
+            .fold(0_usize, |total, snapshot| {
+                total.saturating_add(snapshot.edges.len())
+            });
+        sink.charge_points(lock_edges)?;
+        // Every activity row is the conservative ceiling for one membership probe.
+        sink.charge_points(activity_points)?;
+        let lock_edges_by_waiter = Self::index_lock_edges(typed, start, end);
+        let measured = Self::measure(typed, start, end, &lock_edges_by_waiter);
+        Self::emit(&measured, start, end, sink)
     }
 }
