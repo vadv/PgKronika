@@ -321,7 +321,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::Low,
         missing: &[
             Missing::ActivityRows,
-            Missing::EntityJoin,
             // Period derivable from the activity snapshot cadence, an input the catalog does not yet feed.
             Missing::SourcePeriod,
             Missing::InputCoverage,

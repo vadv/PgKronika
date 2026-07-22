@@ -1463,6 +1463,78 @@ fn internal_wait_ignores_a_low_fraction() {
     );
 }
 
+fn lock_waiting_backend(pid: i64) -> ActivityBackend {
+    ActivityBackend {
+        pid,
+        state: Some("active".into()),
+        wait_event_type: Some("Lock".into()),
+        ..base_backend()
+    }
+}
+
+fn lock_wait_snapshots(pids: &[i64]) -> TypedInputs {
+    let backends: Vec<_> = pids.iter().copied().map(lock_waiting_backend).collect();
+    let mut typed = TypedInputs::new();
+    for ts in [3, 5, 7] {
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts,
+            backends: backends.clone(),
+            completeness: SnapshotCompleteness::Complete,
+        });
+    }
+    typed
+}
+
+#[test]
+fn internal_wait_credits_lock_class_when_a_blocked_by_edge_names_the_pid() {
+    // Three active backends waiting on a heavyweight Lock, each also a waiter in
+    // the pg_locks snapshot: a confirmed lock-wait concentration by pid, not
+    // scheduler noise.
+    let mut typed = lock_wait_snapshots(&[10, 11, 12]);
+    typed.insert_lock_snapshot(LockSnapshot {
+        ts: 5,
+        edges: vec![
+            LockEdge {
+                waiter_pid: 10,
+                blocker_pid: 99,
+            },
+            LockEdge {
+                waiter_pid: 11,
+                blocker_pid: 99,
+            },
+            LockEdge {
+                waiter_pid: 12,
+                blocker_pid: 99,
+            },
+        ],
+    });
+    assert_eq!(
+        run_lens(
+            &InternalWaitConcentrationLens,
+            PG_STAT_ACTIVITY,
+            "wait_event_type",
+            &typed
+        ),
+        vec![(Role::Coincident, Confidence::LOW)]
+    );
+}
+
+#[test]
+fn internal_wait_ignores_lock_wait_without_a_blocked_by_edge() {
+    // The same Lock waits, but no pg_locks edge names these pids: `wait_event`
+    // alone cannot prove a lock holder, so the class is not credited.
+    let typed = lock_wait_snapshots(&[10, 11, 12]);
+    assert!(
+        run_lens(
+            &InternalWaitConcentrationLens,
+            PG_STAT_ACTIVITY,
+            "wait_event_type",
+            &typed
+        )
+        .is_empty()
+    );
+}
+
 #[test]
 fn internal_wait_withholds_ratio_without_complete_snapshot_markers() {
     let backends = vec![

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::super::cluster::Cluster;
@@ -14,7 +14,7 @@ use super::super::model::IdentityValue;
 use super::super::series::SeriesSet;
 use super::super::typed::{ActivityBackend, TypedInputs};
 use super::shared::{
-    PG_STAT_ACTIVITY, activity_backends_examined, activity_member, exact_i64_as_f64,
+    PG_LOCKS, PG_STAT_ACTIVITY, activity_backends_examined, activity_member, exact_i64_as_f64,
     idle_in_transaction, is_syncrep,
 };
 
@@ -246,10 +246,16 @@ pub(crate) struct InternalWaitConcentrationLens;
 
 impl InternalWaitConcentrationLens {
     const ID: &'static str = "PG-WAIT-019";
-    const INPUTS: &'static [SectionColumn] = &[SectionColumn {
-        section: PG_STAT_ACTIVITY,
-        column: "wait_event_type",
-    }];
+    const INPUTS: &'static [SectionColumn] = &[
+        SectionColumn {
+            section: PG_STAT_ACTIVITY,
+            column: "wait_event_type",
+        },
+        SectionColumn {
+            section: PG_LOCKS,
+            column: "blocked_by",
+        },
+    ];
     /// A fraction over too few active backends is noise; require a floor so the
     /// concentration is meaningful.
     const MIN_ACTIVE: usize = 3;
@@ -285,9 +291,21 @@ impl Lens for InternalWaitConcentrationLens {
         };
         let (start, end) = (context.incident_start_us, context.incident_end_us);
         sink.charge_points(activity_backends_examined(typed, start, end))?;
+        // Cross-section entity join by pid: a heavyweight-lock wait counts only
+        // when the same backend also appears as a waiter in a `pg_locks`
+        // blocked_by edge. The `wait_event` alone cannot name a lock holder, so
+        // the join separates a real block from `LWLock`/`IO` scheduler noise.
+        let mut lock_waiter_pids: BTreeSet<i64> = BTreeSet::new();
+        for snapshot in typed.lock_window(start, end) {
+            for edge in &snapshot.edges {
+                if edge.waiter_pid > 0 {
+                    lock_waiter_pids.insert(edge.waiter_pid);
+                }
+            }
+        }
         let mut snapshots = 0_usize;
         let mut active_total = 0_usize;
-        let mut class_totals = [0_usize; 3];
+        let mut class_totals = [0_usize; 4];
         let mut observed_at_us = start;
         for snapshot in typed
             .activity_window(start, end)
@@ -313,6 +331,9 @@ impl Lens for InternalWaitConcentrationLens {
                     Some("LWLock") => class_totals[0] = class_totals[0].saturating_add(1),
                     Some("BufferPin") => class_totals[1] = class_totals[1].saturating_add(1),
                     Some("IO") => class_totals[2] = class_totals[2].saturating_add(1),
+                    Some("Lock") if lock_waiter_pids.contains(&backend.pid) => {
+                        class_totals[3] = class_totals[3].saturating_add(1);
+                    }
                     _ => {}
                 }
             }
@@ -331,7 +352,8 @@ impl Lens for InternalWaitConcentrationLens {
             let class = match class {
                 0 => "LWLock",
                 1 => "BufferPin",
-                _ => "IO",
+                2 => "IO",
+                _ => "Lock",
             };
             let identity: Arc<[IdentityValue]> =
                 Arc::from(vec![IdentityValue::Text(class.to_owned())]);
