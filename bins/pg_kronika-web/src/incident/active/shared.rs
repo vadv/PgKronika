@@ -133,6 +133,16 @@ pub(super) fn activity_backends_examined(typed: &TypedInputs, start: i64, end: i
         .sum()
 }
 
+/// Total stored lock edges scanned in the incident window, including edges
+/// whose snapshot lacks the provenance required for a cross-section join.
+pub(super) fn lock_edges_examined(typed: &TypedInputs, start: i64, end: i64) -> usize {
+    typed
+        .lock_window(start, end)
+        .fold(0_usize, |total, snapshot| {
+            total.saturating_add(snapshot.edges.len())
+        })
+}
+
 /// Whether a session state is an open but idle transaction, which pins the
 /// vacuum horizon without doing work.
 pub(super) fn idle_in_transaction(state: Option<&str>) -> bool {

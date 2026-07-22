@@ -905,6 +905,20 @@ mod tests {
     }
 
     #[test]
+    fn xmin_horizon_keeps_the_cross_section_join_requirement() {
+        let horizon = core_catalog()
+            .iter()
+            .find(|lens| lens.lens_id() == "PG-HORIZON-013")
+            .expect("xmin horizon catalog entry");
+        assert!(
+            horizon
+                .missing()
+                .iter()
+                .any(|capability| capability.as_str() == "cross_section_entity_join")
+        );
+    }
+
+    #[test]
     fn proposal_event_candidates_are_accounted_once() {
         let expected = [
             "oom_kill",
