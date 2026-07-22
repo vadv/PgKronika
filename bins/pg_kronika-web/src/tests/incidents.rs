@@ -64,6 +64,12 @@ fn write_section_with_node(
         "fixture-3",
         "fixture-4",
         "fixture-5",
+        "55P03",
+        "57014",
+        "40001",
+        "28P01",
+        "28000",
+        "42501",
     ] {
         let _ = intern(value);
     }
@@ -175,6 +181,76 @@ const ACTIVE_LENS_IDS: &[&str] = &[
     "PG-EVT-013",
     "PG-EVT-014",
 ];
+
+#[tokio::test]
+async fn six_sqlstate_conditions_reach_the_http_log_projection() {
+    const MINUTE: i64 = 60 * 1_000_000;
+    let expected = [
+        ("PG-EVT-009", "55P03", "lock_not_available_observation"),
+        ("PG-EVT-010", "57014", "query_canceled_observation"),
+        ("PG-EVT-011", "40001", "serialization_failure_observation"),
+        ("PG-EVT-012", "28P01", "auth_failure_observation"),
+        ("PG-EVT-013", "28000", "authorization_failure_observation"),
+        ("PG-EVT-014", "42501", "permission_denied_observation"),
+    ];
+    let rows: Vec<_> = expected
+        .iter()
+        .enumerate()
+        .map(|(index, (_, sqlstate, _))| PgLogErrorV1 {
+            ts: Ts(i64::try_from(index + 1).expect("small fixture index") * MINUTE),
+            severity: 0,
+            category: 10,
+            sqlstate: Some(fixture_str_id(sqlstate)),
+            pattern: None,
+            count: 1,
+            sample: None,
+            detail: None,
+            hint: None,
+            context: None,
+            statement: None,
+            database: None,
+            username: None,
+            dict_dropped_fields: 0,
+        })
+        .collect();
+    let body = PgLogErrorV1::encode(&rows).expect("encode log errors");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let to = 10 * MINUTE;
+    write_section_with_node(
+        dir.path(),
+        "0.pgm",
+        "node-7",
+        1_022_001,
+        u32::try_from(rows.len()).expect("row count"),
+        &body,
+        0,
+        to,
+    );
+
+    let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=5m&step=1m");
+    let (status, response) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let findings = response["log"]["findings"]
+        .as_array()
+        .expect("log findings");
+    let catalog = response["log"]["catalog"].as_array().expect("log catalog");
+    for (lens_id, sqlstate, slug) in expected {
+        let finding = findings
+            .iter()
+            .find(|finding| finding["lens_id"] == lens_id)
+            .unwrap_or_else(|| panic!("missing {lens_id}: {response}"));
+        assert_eq!(finding["confidence"], "medium");
+        assert_eq!(finding["role"], "coincident");
+        assert_eq!(finding["scope"]["identity"][0], sqlstate);
+
+        let entry = catalog
+            .iter()
+            .find(|entry| entry["lens_id"] == lens_id)
+            .unwrap_or_else(|| panic!("missing catalog entry {lens_id}"));
+        assert_eq!(entry["slug"], slug);
+    }
+}
 
 async fn assert_calm_incidents(uri: &str, to: i64) {
     let calm = tempfile::tempdir().expect("tempdir");

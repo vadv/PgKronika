@@ -3,8 +3,9 @@
 //! The event branch is separate from the numeric series path: a lens here reads
 //! bounded, typed records the log source already grouped, never an anomaly
 //! episode. Lenses report observed events, infer nothing from absence, and do
-//! not restate a logged fact as a cause. SQLSTATE-like tokens from stderr are heuristic evidence:
-//! the current source cannot prove a structured server error code.
+//! not restate a logged fact as a cause. SQLSTATE-like tokens from stderr are
+//! heuristic evidence: the current source cannot prove a structured server error
+//! code.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -29,11 +30,11 @@ const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
 const SQLSTATE_DEADLOCK: &str = "40P01";
 const SQLSTATE_DATA_CORRUPTED: &str = "XX001";
 const SQLSTATE_INDEX_CORRUPTED: &str = "XX002";
-const SQLSTATE_LOCK_TIMEOUT: &str = "55P03";
-const SQLSTATE_STATEMENT_TIMEOUT: &str = "57014";
+const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
+const SQLSTATE_QUERY_CANCELED: &str = "57014";
 const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
 const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
-const SQLSTATE_INVALID_AUTHORIZATION: &str = "28000";
+const SQLSTATE_INVALID_AUTHORIZATION_SPECIFICATION: &str = "28000";
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 
 /// Versioned public metadata for one bounded log-evidence branch.
@@ -77,11 +78,11 @@ const EVENT_CATALOG_METADATA: &[EventCatalogEntry] = &[
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-009",
-        slug: "lock_timeout_observation",
+        slug: "lock_not_available_observation",
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-010",
-        slug: "statement_timeout_observation",
+        slug: "query_canceled_observation",
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-011",
@@ -93,7 +94,7 @@ const EVENT_CATALOG_METADATA: &[EventCatalogEntry] = &[
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-013",
-        slug: "hba_rejection_observation",
+        slug: "authorization_failure_observation",
     },
     EventCatalogEntry {
         lens_id: "PG-EVT-014",
@@ -652,22 +653,22 @@ impl EventLens for DataCorruptionLogLens {
     }
 }
 
-/// `PG-EVT-009` (`lock_timeout_observation`): stderr reports SQLSTATE 55P03
-/// (`lock_not_available`). One statement gave up waiting for a lock; it does not
-/// name the blocker, count affected sessions, or prove systemic contention.
-pub(crate) struct LockTimeoutLogLens;
+/// `PG-EVT-009` (`lock_not_available_observation`): stderr contains a token
+/// resembling SQLSTATE 55P03 (`lock_not_available`). It does not distinguish a
+/// timeout from `NOWAIT`, conditional lock acquisition, or other paths.
+pub(crate) struct LockNotAvailableLogLens;
 
-impl LockTimeoutLogLens {
+impl LockNotAvailableLogLens {
     const ID: &'static str = "PG-EVT-009";
 }
 
-impl EventLens for LockTimeoutLogLens {
+impl EventLens for LockNotAvailableLogLens {
     fn id(&self) -> &'static str {
         Self::ID
     }
 
     fn confidence_cap(&self) -> ConfidenceCap {
-        ConfidenceCap::High
+        ConfidenceCap::Medium
     }
 
     fn evaluate(
@@ -675,27 +676,26 @@ impl EventLens for LockTimeoutLogLens {
         events: &LogEventInputs,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
-        emit_error_sqlstate(events, sink, &[SQLSTATE_LOCK_TIMEOUT])
+        emit_error_sqlstate(events, sink, &[SQLSTATE_LOCK_NOT_AVAILABLE])
     }
 }
 
-/// `PG-EVT-010` (`statement_timeout_observation`): stderr reports SQLSTATE 57014
-/// (`query_canceled`). A statement was cancelled; the code also covers an
-/// explicit user cancel, so it marks a cancellation, not specifically a
-/// `statement_timeout` breach.
-pub(crate) struct StatementTimeoutLogLens;
+/// `PG-EVT-010` (`query_canceled_observation`): stderr contains a token resembling
+/// SQLSTATE 57014 (`query_canceled`). It does not distinguish statement timeout,
+/// user cancel, authentication timeout, or other cancellation paths.
+pub(crate) struct QueryCanceledLogLens;
 
-impl StatementTimeoutLogLens {
+impl QueryCanceledLogLens {
     const ID: &'static str = "PG-EVT-010";
 }
 
-impl EventLens for StatementTimeoutLogLens {
+impl EventLens for QueryCanceledLogLens {
     fn id(&self) -> &'static str {
         Self::ID
     }
 
     fn confidence_cap(&self) -> ConfidenceCap {
-        ConfidenceCap::High
+        ConfidenceCap::Medium
     }
 
     fn evaluate(
@@ -703,14 +703,13 @@ impl EventLens for StatementTimeoutLogLens {
         events: &LogEventInputs,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
-        emit_error_sqlstate(events, sink, &[SQLSTATE_STATEMENT_TIMEOUT])
+        emit_error_sqlstate(events, sink, &[SQLSTATE_QUERY_CANCELED])
     }
 }
 
 /// `PG-EVT-011` (`serialization_failure_observation`): stderr reports SQLSTATE
-/// 40001 (`serialization_failure`). A transaction aborted on a serialization
-/// conflict; the same code covers a recovery-conflict cancel on a standby, so it
-/// does not by itself separate the two.
+/// 40001 (`serialization_failure`). The code appears on concurrency, recovery,
+/// and replication paths, so the observation does not identify the cause.
 pub(crate) struct SerializationFailureLogLens;
 
 impl SerializationFailureLogLens {
@@ -723,7 +722,7 @@ impl EventLens for SerializationFailureLogLens {
     }
 
     fn confidence_cap(&self) -> ConfidenceCap {
-        ConfidenceCap::High
+        ConfidenceCap::Medium
     }
 
     fn evaluate(
@@ -735,9 +734,9 @@ impl EventLens for SerializationFailureLogLens {
     }
 }
 
-/// `PG-EVT-012` (`auth_failure_observation`): stderr reports SQLSTATE 28P01
-/// (`invalid_password`). One authentication attempt failed on a bad password; a
-/// single group does not distinguish a typo from a credential-stuffing burst.
+/// `PG-EVT-012` (`auth_failure_observation`): stderr contains a token resembling
+/// SQLSTATE 28P01 (`invalid_password`). It does not identify the credential state,
+/// role state, client intent, or operational cause.
 pub(crate) struct AuthPasswordFailureLogLens;
 
 impl AuthPasswordFailureLogLens {
@@ -750,7 +749,7 @@ impl EventLens for AuthPasswordFailureLogLens {
     }
 
     fn confidence_cap(&self) -> ConfidenceCap {
-        ConfidenceCap::High
+        ConfidenceCap::Medium
     }
 
     fn evaluate(
@@ -762,23 +761,22 @@ impl EventLens for AuthPasswordFailureLogLens {
     }
 }
 
-/// `PG-EVT-013` (`hba_rejection_observation`): stderr reports SQLSTATE 28000
-/// (`invalid_authorization_specification`). A connection was rejected by
-/// `pg_hba.conf`; it does not reveal the client identity or whether the rule is
-/// intended.
-pub(crate) struct HbaRejectionLogLens;
+/// `PG-EVT-013` (`authorization_failure_observation`): stderr contains a token
+/// resembling SQLSTATE 28000 (`invalid_authorization_specification`). It covers
+/// HBA rejection and other authentication or startup failures.
+pub(crate) struct AuthorizationFailureLogLens;
 
-impl HbaRejectionLogLens {
+impl AuthorizationFailureLogLens {
     const ID: &'static str = "PG-EVT-013";
 }
 
-impl EventLens for HbaRejectionLogLens {
+impl EventLens for AuthorizationFailureLogLens {
     fn id(&self) -> &'static str {
         Self::ID
     }
 
     fn confidence_cap(&self) -> ConfidenceCap {
-        ConfidenceCap::High
+        ConfidenceCap::Medium
     }
 
     fn evaluate(
@@ -786,13 +784,17 @@ impl EventLens for HbaRejectionLogLens {
         events: &LogEventInputs,
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
-        emit_error_sqlstate(events, sink, &[SQLSTATE_INVALID_AUTHORIZATION])
+        emit_error_sqlstate(
+            events,
+            sink,
+            &[SQLSTATE_INVALID_AUTHORIZATION_SPECIFICATION],
+        )
     }
 }
 
-/// `PG-EVT-014` (`permission_denied_observation`): stderr reports SQLSTATE 42501
-/// (`insufficient_privilege`). An operation was denied for lack of privilege; it
-/// marks the denial, not whether it is a misconfiguration or an intrusion probe.
+/// `PG-EVT-014` (`permission_denied_observation`): stderr contains a token
+/// resembling SQLSTATE 42501 (`insufficient_privilege`). It does not identify the
+/// failed permission check, actor intent, or operational cause.
 pub(crate) struct PermissionDeniedLogLens;
 
 impl PermissionDeniedLogLens {
@@ -805,7 +807,7 @@ impl EventLens for PermissionDeniedLogLens {
     }
 
     fn confidence_cap(&self) -> ConfidenceCap {
-        ConfidenceCap::High
+        ConfidenceCap::Medium
     }
 
     fn evaluate(
@@ -828,11 +830,11 @@ pub(crate) fn event_catalog() -> Vec<Box<dyn EventLens>> {
         Box::new(ConnectionSlotsExhaustedLens),
         Box::new(DeadlockLens),
         Box::new(DataCorruptionLogLens),
-        Box::new(LockTimeoutLogLens),
-        Box::new(StatementTimeoutLogLens),
+        Box::new(LockNotAvailableLogLens),
+        Box::new(QueryCanceledLogLens),
         Box::new(SerializationFailureLogLens),
         Box::new(AuthPasswordFailureLogLens),
-        Box::new(HbaRejectionLogLens),
+        Box::new(AuthorizationFailureLogLens),
         Box::new(PermissionDeniedLogLens),
     ]
 }
@@ -1145,14 +1147,14 @@ mod tests {
                 Confidence::MEDIUM,
             ),
             (
-                Box::new(LockTimeoutLogLens),
+                Box::new(LockNotAvailableLogLens),
                 inputs_with(vec![error(0, Some("55P03"), 1)], Vec::new()),
                 "PG-EVT-009",
                 "sqlstate",
                 Confidence::MEDIUM,
             ),
             (
-                Box::new(StatementTimeoutLogLens),
+                Box::new(QueryCanceledLogLens),
                 inputs_with(vec![error(0, Some("57014"), 1)], Vec::new()),
                 "PG-EVT-010",
                 "sqlstate",
@@ -1173,7 +1175,7 @@ mod tests {
                 Confidence::MEDIUM,
             ),
             (
-                Box::new(HbaRejectionLogLens),
+                Box::new(AuthorizationFailureLogLens),
                 inputs_with(vec![error(0, Some("28000"), 1)], Vec::new()),
                 "PG-EVT-013",
                 "sqlstate",
@@ -1204,6 +1206,26 @@ mod tests {
             );
             assert_eq!(finding.evidence().len(), 1);
             assert_eq!(finding.scope().column(), column);
+        }
+    }
+
+    #[test]
+    fn heuristic_sqlstate_lenses_cap_confidence_at_medium() {
+        let lenses: [&dyn EventLens; 6] = [
+            &LockNotAvailableLogLens,
+            &QueryCanceledLogLens,
+            &SerializationFailureLogLens,
+            &AuthPasswordFailureLogLens,
+            &AuthorizationFailureLogLens,
+            &PermissionDeniedLogLens,
+        ];
+        for lens in lenses {
+            assert_eq!(
+                lens.confidence_cap(),
+                ConfidenceCap::Medium,
+                "{}",
+                lens.id()
+            );
         }
     }
 
