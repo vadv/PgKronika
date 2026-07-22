@@ -1,7 +1,10 @@
 use super::super::evidence::Confidence;
 use super::*;
 use crate::incident::model::{EnrichedEpisode, EpisodeRefV1};
-use crate::incident::{ClockRelation, IncidentConfig, LimitAxis, LockEdge, LockSnapshot, analyze};
+use crate::incident::{
+    ClockRelation, EngineOutcome, IncidentConfig, LimitAxis, LockEdge, LockParticipant,
+    LockSnapshot, analyze,
+};
 use kronika_analytics::{DiffPoint, Direction, Episode, Evaluated, Scalar};
 
 fn id() -> Arc<[IdentityValue]> {
@@ -1463,6 +1466,309 @@ fn internal_wait_ignores_a_low_fraction() {
     );
 }
 
+fn lock_waiting_backend(pid: i64) -> ActivityBackend {
+    ActivityBackend {
+        pid,
+        state: Some("active".into()),
+        wait_event_type: Some("Lock".into()),
+        ..base_backend()
+    }
+}
+
+fn lock_edge(waiter_pid: i64, blocker_pid: i64) -> LockEdge {
+    LockEdge {
+        waiter_pid,
+        waiter_backend_start: Some(1),
+        blocker_pid,
+    }
+}
+
+fn lock_wait_snapshots(pids: &[i64]) -> TypedInputs {
+    let backends: Vec<_> = pids.iter().copied().map(lock_waiting_backend).collect();
+    let mut typed = TypedInputs::new();
+    for ts in [3, 5, 7] {
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts,
+            backends: backends.clone(),
+            completeness: SnapshotCompleteness::Complete,
+        });
+    }
+    typed
+}
+
+fn insert_lock_edges(typed: &mut TypedInputs, timestamps: &[i64], pids: &[i64], blockers: &[i64]) {
+    for &ts in timestamps {
+        let edges = pids
+            .iter()
+            .flat_map(|&waiter| {
+                blockers
+                    .iter()
+                    .map(move |&blocker| lock_edge(waiter, blocker))
+            })
+            .collect();
+        typed.insert_lock_snapshot(LockSnapshot {
+            ts,
+            activity_snapshot_ts: Some(ts),
+            edges,
+        });
+    }
+}
+
+fn internal_wait_outcome(typed: &TypedInputs, work_limit: u64) -> EngineOutcome {
+    let lens = InternalWaitConcentrationLens;
+    let lenses: [&dyn Lens; 1] = [&lens];
+    let config = IncidentConfig::for_test_with_work_limit(
+        "node",
+        5,
+        1_000,
+        ClockRelation::Unknown,
+        work_limit,
+    );
+    analyze(
+        vec![window_episode(PG_STAT_ACTIVITY, "wait_event_type")],
+        &SeriesSet::for_test(0),
+        typed,
+        &lenses,
+        &config,
+    )
+    .expect("valid internal-wait analysis")
+}
+
+fn assert_no_internal_wait(typed: &TypedInputs) {
+    assert!(
+        run_lens(
+            &InternalWaitConcentrationLens,
+            PG_STAT_ACTIVITY,
+            "wait_event_type",
+            typed,
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn internal_wait_credits_exact_same_snapshot_lock_edges() {
+    let mut typed = lock_wait_snapshots(&[10, 11, 12]);
+    insert_lock_edges(&mut typed, &[3, 5, 7], &[10, 11, 12], &[99]);
+    let outcome = internal_wait_outcome(&typed, u64::MAX);
+    let finding = &outcome.incidents[0].findings[0];
+    assert_eq!(
+        (finding.role(), finding.confidence()),
+        (Role::Coincident, Confidence::LOW)
+    );
+    assert_eq!(finding.scope().logical_section(), PG_STAT_ACTIVITY);
+    assert_eq!(finding.scope().column(), "wait_event_type");
+    assert_eq!(
+        finding.scope().identity(),
+        &[IdentityValue::Text("Lock".to_owned())]
+    );
+    let direct: Vec<_> = finding
+        .evidence()
+        .iter()
+        .filter_map(|evidence| match evidence {
+            Evidence::Direct(direct) => direct.lock_edge(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(direct.len(), 9);
+    assert!(
+        direct
+            .iter()
+            .all(|edge| edge.participant() == LockParticipant::Waiter)
+    );
+}
+
+#[test]
+fn internal_wait_ignores_lock_wait_without_a_blocked_by_edge() {
+    let typed = lock_wait_snapshots(&[10, 11, 12]);
+    assert_no_internal_wait(&typed);
+}
+
+#[test]
+fn internal_wait_does_not_join_the_same_pid_across_snapshot_times() {
+    let mut typed = lock_wait_snapshots(&[10, 11, 12]);
+    insert_lock_edges(&mut typed, &[5], &[10, 11, 12], &[99]);
+    assert_no_internal_wait(&typed);
+}
+
+#[test]
+fn internal_wait_does_not_infer_a_shared_snapshot_from_equal_timestamps() {
+    let mut typed = lock_wait_snapshots(&[10, 11, 12]);
+    for ts in [3, 5, 7] {
+        typed.insert_lock_snapshot(LockSnapshot {
+            ts,
+            activity_snapshot_ts: None,
+            edges: [10, 11, 12]
+                .into_iter()
+                .map(|pid| lock_edge(pid, 99))
+                .collect(),
+        });
+    }
+    assert_no_internal_wait(&typed);
+}
+
+#[test]
+fn internal_wait_does_not_join_a_reused_pid() {
+    let mut typed = TypedInputs::new();
+    for ts in [3, 5, 7] {
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts,
+            backends: [10, 11, 12]
+                .into_iter()
+                .map(|pid| ActivityBackend {
+                    backend_start: 2,
+                    ..lock_waiting_backend(pid)
+                })
+                .collect(),
+            completeness: SnapshotCompleteness::Complete,
+        });
+    }
+    insert_lock_edges(&mut typed, &[3, 5, 7], &[10, 11, 12], &[99]);
+    assert_no_internal_wait(&typed);
+}
+
+#[test]
+fn internal_wait_ignores_edges_without_matching_activity() {
+    let mut typed = lock_wait_snapshots(&[10, 11, 12]);
+    insert_lock_edges(&mut typed, &[3, 5, 7], &[20, 21, 22], &[99]);
+    assert_no_internal_wait(&typed);
+}
+
+#[test]
+fn internal_wait_deduplicates_multiple_blockers_and_accepts_prepared_holders() {
+    let mut typed = lock_wait_snapshots(&[10, 11, 12]);
+    insert_lock_edges(&mut typed, &[3, 5, 7], &[10, 11, 12], &[99, 0, 99]);
+    let outcome = internal_wait_outcome(&typed, u64::MAX);
+    let direct = outcome.incidents[0].findings[0]
+        .evidence()
+        .iter()
+        .filter(|evidence| matches!(evidence, Evidence::Direct(_)))
+        .count();
+    assert_eq!(direct, 18, "two unique blockers for each waiter snapshot");
+}
+
+#[test]
+fn internal_wait_bounds_direct_lock_edge_evidence() {
+    let mut typed = lock_wait_snapshots(&[1_000, 1_001, 1_002]);
+    let blockers: Vec<_> = (0..200).collect();
+    insert_lock_edges(&mut typed, &[3, 5, 7], &[1_000, 1_001, 1_002], &blockers);
+    let outcome = internal_wait_outcome(&typed, u64::MAX);
+    let direct: Vec<_> = outcome.incidents[0].findings[0]
+        .evidence()
+        .iter()
+        .filter_map(|evidence| match evidence {
+            Evidence::Direct(direct) => direct.lock_edge(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(direct.len(), 128);
+    assert_eq!(direct[0].observed_at_us(), 3);
+    assert_eq!(direct[0].waiter_pid(), 1_000);
+    assert_eq!(direct[0].blocker_pid(), 0);
+    assert_eq!(direct[127].blocker_pid(), 127);
+}
+
+#[test]
+fn internal_wait_rejects_malformed_lock_edges() {
+    let mut typed = lock_wait_snapshots(&[10, 11, 12]);
+    for ts in [3, 5, 7] {
+        typed.insert_lock_snapshot(LockSnapshot {
+            ts,
+            activity_snapshot_ts: Some(ts),
+            edges: vec![
+                lock_edge(0, 99),
+                lock_edge(-1, 99),
+                lock_edge(10, 10),
+                lock_edge(11, -1),
+                LockEdge {
+                    waiter_pid: 12,
+                    waiter_backend_start: None,
+                    blocker_pid: 99,
+                },
+            ],
+        });
+    }
+    assert_no_internal_wait(&typed);
+}
+
+#[test]
+fn internal_wait_lock_join_is_charged_before_membership_checks() {
+    let mut typed = lock_wait_snapshots(&[10, 11, 12]);
+    insert_lock_edges(&mut typed, &[3, 5, 7], &[10, 11, 12], &[99]);
+    let outcome = internal_wait_outcome(&typed, 20);
+    assert!(!outcome.complete);
+    assert!(outcome.incidents[0].findings.is_empty());
+    assert_eq!(outcome.skipped[0].limit.axis, LimitAxis::Work);
+    assert_eq!(outcome.skipped[0].limit.observed, 29);
+    assert_eq!(outcome.skipped[0].limit.limit, 20);
+}
+
+#[test]
+fn internal_wait_reports_each_class_at_an_exact_tie() {
+    let mut typed = TypedInputs::new();
+    for ts in [3, 5, 7] {
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts,
+            backends: vec![
+                ActivityBackend {
+                    pid: 1,
+                    state: Some("active".into()),
+                    wait_event_type: Some("LWLock".into()),
+                    ..base_backend()
+                },
+                ActivityBackend {
+                    pid: 2,
+                    state: Some("active".into()),
+                    wait_event_type: Some("LWLock".into()),
+                    ..base_backend()
+                },
+                lock_waiting_backend(10),
+                lock_waiting_backend(11),
+            ],
+            completeness: SnapshotCompleteness::Complete,
+        });
+    }
+    insert_lock_edges(&mut typed, &[3, 5, 7], &[10, 11], &[99]);
+    let outcome = internal_wait_outcome(&typed, u64::MAX);
+    let classes: Vec<_> = outcome.incidents[0]
+        .findings
+        .iter()
+        .map(|finding| match finding.scope().identity() {
+            [IdentityValue::Text(class)] => class.as_str(),
+            _ => panic!("wait-class scope"),
+        })
+        .collect();
+    assert_eq!(classes, ["LWLock", "Lock"]);
+}
+
+#[test]
+fn internal_wait_lock_edges_do_not_override_incomplete_activity() {
+    let mut typed = TypedInputs::new();
+    for ts in [3, 5, 7] {
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts,
+            backends: [10, 11, 12].into_iter().map(lock_waiting_backend).collect(),
+            completeness: SnapshotCompleteness::Restricted,
+        });
+    }
+    insert_lock_edges(&mut typed, &[3, 5, 7], &[10, 11, 12], &[99]);
+    assert_no_internal_wait(&typed);
+}
+
+#[test]
+fn internal_wait_excludes_the_incident_end_snapshot() {
+    let mut typed = TypedInputs::new();
+    for ts in [0, 5, 10] {
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts,
+            backends: [10, 11, 12].into_iter().map(lock_waiting_backend).collect(),
+            completeness: SnapshotCompleteness::Complete,
+        });
+    }
+    insert_lock_edges(&mut typed, &[0, 5, 10], &[10, 11, 12], &[99]);
+    assert_no_internal_wait(&typed);
+}
+
 #[test]
 fn internal_wait_withholds_ratio_without_complete_snapshot_markers() {
     let backends = vec![
@@ -1502,7 +1808,11 @@ fn internal_wait_withholds_ratio_without_complete_snapshot_markers() {
 
 fn lock_typed(edges: Vec<LockEdge>) -> TypedInputs {
     let mut typed = TypedInputs::new();
-    typed.insert_lock_snapshot(LockSnapshot { ts: 5, edges });
+    typed.insert_lock_snapshot(LockSnapshot {
+        ts: 5,
+        activity_snapshot_ts: None,
+        edges,
+    });
     typed
 }
 
@@ -1510,6 +1820,7 @@ fn lock_typed(edges: Vec<LockEdge>) -> TypedInputs {
 fn lock_wait_graph_pairs_a_lead_blocker_with_a_downstream_waiter() {
     let typed = lock_typed(vec![LockEdge {
         waiter_pid: 20,
+        waiter_backend_start: Some(1),
         blocker_pid: 10,
     }]);
     let findings = run_lens(&LockWaitGraphLens, PG_LOCKS, "blocked_by", &typed);

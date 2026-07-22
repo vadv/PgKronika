@@ -1392,6 +1392,7 @@ fn build_lock_snapshots(rows: &[OutRow]) -> Vec<LockSnapshot> {
         let Some(Value::I64(waiter)) = row_value(row, "pid") else {
             continue;
         };
+        let waiter_backend_start = read_ts(row, "backend_start");
         let Some(Value::ListI32(blockers)) = row_value(row, "blocked_by") else {
             continue;
         };
@@ -1414,6 +1415,7 @@ fn build_lock_snapshots(rows: &[OutRow]) -> Vec<LockSnapshot> {
             }
             edges.insert(LockEdge {
                 waiter_pid: *waiter,
+                waiter_backend_start,
                 blocker_pid: blocker,
             });
         }
@@ -1425,6 +1427,8 @@ fn build_lock_snapshots(rows: &[OutRow]) -> Vec<LockSnapshot> {
         .into_iter()
         .map(|(ts, edges)| LockSnapshot {
             ts,
+            // The current activity and lock collectors run separate statements.
+            activity_snapshot_ts: None,
             edges: edges.into_iter().collect(),
         })
         .collect()
@@ -3164,6 +3168,7 @@ mod tests {
         vec![
             cell("ts", Value::Ts(ts)),
             cell("pid", Value::I64(pid)),
+            cell("backend_start", Value::Ts(1)),
             cell("blocked_by", Value::ListI32(blocked_by)),
         ]
     }
@@ -3176,15 +3181,18 @@ mod tests {
         ];
         let snapshots = build_lock_snapshots(&rows);
         assert_eq!(snapshots.len(), 1, "root alone carries no edge snapshot");
+        assert_eq!(snapshots[0].activity_snapshot_ts, None);
         assert_eq!(
             snapshots[0].edges,
             vec![
                 LockEdge {
                     waiter_pid: 20,
+                    waiter_backend_start: Some(1),
                     blocker_pid: 0,
                 },
                 LockEdge {
                     waiter_pid: 20,
+                    waiter_backend_start: Some(1),
                     blocker_pid: 10,
                 },
             ]
@@ -3198,6 +3206,15 @@ mod tests {
             build_lock_snapshots(&rows).is_empty(),
             "only roots means no contention and no snapshot"
         );
+    }
+
+    #[test]
+    fn lock_edge_without_waiter_start_cannot_support_a_session_join() {
+        let root = lock_row(100, 10, vec![]);
+        let mut waiter = lock_row(100, 20, vec![10]);
+        waiter.retain(|(column, _)| column != "backend_start");
+        let snapshots = build_lock_snapshots(&[root, waiter]);
+        assert_eq!(snapshots[0].edges[0].waiter_backend_start, None);
     }
 
     #[test]
