@@ -321,6 +321,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::Low,
         missing: &[
             Missing::ActivityRows,
+            Missing::EntityJoin,
             // Period derivable from the activity snapshot cadence, an input the catalog does not yet feed.
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -785,6 +786,28 @@ mod tests {
             ["sampled_blocked_by_edges", "lock_snapshot_coverage"]
         );
         assert_eq!(lock.confidence(), ConfidenceCap::Medium);
+    }
+
+    #[test]
+    fn internal_wait_keeps_the_cross_section_join_requirement() {
+        let wait = core_catalog()
+            .iter()
+            .find(|lens| lens.lens_id() == "PG-WAIT-019")
+            .expect("internal wait catalog entry");
+        let requirements: Vec<_> = wait
+            .missing()
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect();
+        assert_eq!(
+            requirements,
+            [
+                "sampled_activity_rows",
+                "cross_section_entity_join",
+                "source_period_provenance",
+                "request_input_coverage",
+            ]
+        );
     }
 
     #[test]

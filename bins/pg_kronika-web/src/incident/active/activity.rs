@@ -6,8 +6,9 @@ use super::super::dispatch::{LimitHit, SectionColumn};
 use super::super::engine::EvalContext;
 use super::super::evidence::sink::FindingSink;
 use super::super::evidence::{
-    ConfidenceCap, Evidence, FindingDraft, FindingScope, GaugeEntity, GaugeEvidence, GaugeRatio,
-    GaugeUnit, GaugeValueInput, Role, SourceWindow, ThresholdKind,
+    ConfidenceCap, DirectEvidence, Evidence, FindingDraft, FindingScope, GaugeEntity,
+    GaugeEvidence, GaugeRatio, GaugeUnit, GaugeValueInput, LockParticipant, Role, SourceWindow,
+    ThresholdKind,
 };
 use super::super::lens::Lens;
 use super::super::model::IdentityValue;
@@ -238,10 +239,9 @@ impl Lens for SyncReplicationWaitLens {
     }
 }
 
-/// `PG-WAIT-019` (`internal_wait_concentration`): active backends piling onto
-/// internal waits. Reports each bounded wait class separately only when at
-/// least three snapshots carry explicit complete-visibility provenance and the
-/// class accounts for at least half of the visible active-backend denominator.
+/// `PG-WAIT-019` (`internal_wait_concentration`): sampled wait-class
+/// concentration. A heavyweight `Lock` sample additionally requires an exact
+/// same-snapshot, same-session `blocked_by` edge.
 pub(crate) struct InternalWaitConcentrationLens;
 
 impl InternalWaitConcentrationLens {
@@ -261,6 +261,7 @@ impl InternalWaitConcentrationLens {
     const MIN_ACTIVE: usize = 3;
 
     const MIN_SNAPSHOTS: usize = 3;
+    const MAX_LOCK_EDGE_EVIDENCE: usize = 128;
     const WAIT_FRACTION: f64 = 0.5;
 }
 
@@ -286,26 +287,51 @@ impl Lens for InternalWaitConcentrationLens {
         sink: &mut FindingSink<'_>,
     ) -> Result<(), LimitHit> {
         sink.charge_points(cluster.members.len())?;
-        let Some(member) = activity_member(cluster) else {
+        if activity_member(cluster).is_none() {
             return Ok(());
-        };
+        }
         let (start, end) = (context.incident_start_us, context.incident_end_us);
-        sink.charge_points(activity_backends_examined(typed, start, end))?;
-        // Cross-section entity join by pid: a heavyweight-lock wait counts only
-        // when the same backend also appears as a waiter in a `pg_locks`
-        // blocked_by edge. The `wait_event` alone cannot name a lock holder, so
-        // the join separates a real block from `LWLock`/`IO` scheduler noise.
-        let mut lock_waiter_pids: BTreeSet<i64> = BTreeSet::new();
+        let activity_points = activity_backends_examined(typed, start, end);
+        sink.charge_points(activity_points)?;
+        let lock_edges = typed
+            .lock_window(start, end)
+            .filter(|snapshot| snapshot.activity_snapshot_ts == Some(snapshot.ts))
+            .fold(0_usize, |total, snapshot| {
+                total.saturating_add(snapshot.edges.len())
+            });
+        sink.charge_points(lock_edges)?;
+        // Every activity row is the conservative ceiling for one membership probe.
+        sink.charge_points(activity_points)?;
+
+        // The explicit snapshot link plus session start prevent PID-only joins.
+        let mut lock_edges_by_waiter: BTreeSet<(i64, i64, i64, i64)> = BTreeSet::new();
         for snapshot in typed.lock_window(start, end) {
+            if snapshot.activity_snapshot_ts != Some(snapshot.ts) {
+                continue;
+            }
             for edge in &snapshot.edges {
-                if edge.waiter_pid > 0 {
-                    lock_waiter_pids.insert(edge.waiter_pid);
+                let Some(waiter_start) = edge.waiter_backend_start.filter(|start| *start > 0)
+                else {
+                    continue;
+                };
+                if edge.waiter_pid <= 0
+                    || edge.blocker_pid < 0
+                    || edge.blocker_pid == edge.waiter_pid
+                {
+                    continue;
                 }
+                lock_edges_by_waiter.insert((
+                    snapshot.ts,
+                    edge.waiter_pid,
+                    waiter_start,
+                    edge.blocker_pid,
+                ));
             }
         }
         let mut snapshots = 0_usize;
         let mut active_total = 0_usize;
         let mut class_totals = [0_usize; 4];
+        let mut matched_lock_edges = BTreeSet::new();
         let mut observed_at_us = start;
         for snapshot in typed
             .activity_window(start, end)
@@ -331,14 +357,29 @@ impl Lens for InternalWaitConcentrationLens {
                     Some("LWLock") => class_totals[0] = class_totals[0].saturating_add(1),
                     Some("BufferPin") => class_totals[1] = class_totals[1].saturating_add(1),
                     Some("IO") => class_totals[2] = class_totals[2].saturating_add(1),
-                    Some("Lock") if lock_waiter_pids.contains(&backend.pid) => {
-                        class_totals[3] = class_totals[3].saturating_add(1);
+                    Some("Lock") if backend.pid > 0 && backend.backend_start > 0 => {
+                        let mut matching = lock_edges_by_waiter
+                            .range(
+                                (snapshot.ts, backend.pid, backend.backend_start, i64::MIN)
+                                    ..=(snapshot.ts, backend.pid, backend.backend_start, i64::MAX),
+                            )
+                            .copied()
+                            .peekable();
+                        if matching.peek().is_some() {
+                            class_totals[3] = class_totals[3].saturating_add(1);
+                            for (ts, waiter, _, blocker) in matching {
+                                matched_lock_edges.insert((ts, waiter, blocker));
+                                if matched_lock_edges.len() > Self::MAX_LOCK_EDGE_EVIDENCE {
+                                    let _ = matched_lock_edges.pop_last();
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
             }
         }
-        let concentrated = class_totals
+        for (class, waiting) in class_totals
             .iter()
             .copied()
             .enumerate()
@@ -347,8 +388,7 @@ impl Lens for InternalWaitConcentrationLens {
                     && active_total > 0
                     && count.saturating_mul(2) >= active_total
             })
-            .max_by_key(|(_, count)| *count);
-        if let Some((class, waiting)) = concentrated {
+        {
             let class = match class {
                 0 => "LWLock",
                 1 => "BufferPin",
@@ -361,7 +401,7 @@ impl Lens for InternalWaitConcentrationLens {
                 u32::try_from(waiting).ok().map(f64::from),
                 u32::try_from(active_total).ok().map(f64::from),
             ) else {
-                return Ok(());
+                continue;
             };
             let Some(evidence) = GaugeEvidence::ratio(
                 GaugeRatio::new(
@@ -376,14 +416,25 @@ impl Lens for InternalWaitConcentrationLens {
                 observed_at_us,
                 snapshots,
                 SourceWindow::from_bounds(start, end, None, snapshots),
-                GaugeEntity::new(PG_STAT_ACTIVITY, identity),
+                GaugeEntity::new(PG_STAT_ACTIVITY, Arc::clone(&identity)),
             ) else {
-                return Ok(());
+                continue;
             };
+            let mut evidence = vec![Evidence::GaugeObservation(evidence)];
+            if class == "Lock" {
+                evidence.extend(matched_lock_edges.iter().map(|&(ts, waiter, blocker)| {
+                    Evidence::Direct(DirectEvidence::sampled_lock_edge(
+                        ts,
+                        waiter,
+                        blocker,
+                        LockParticipant::Waiter,
+                    ))
+                }));
+            }
             sink.emit(FindingDraft::new(
                 Role::Coincident,
-                FindingScope::from_episode(member),
-                vec![Evidence::GaugeObservation(evidence)],
+                FindingScope::from_parts(PG_STAT_ACTIVITY, "wait_event_type", identity),
+                evidence,
             ))?;
         }
         Ok(())
