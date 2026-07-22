@@ -712,6 +712,7 @@ const _: () = assert!(
 mod tests {
     use std::collections::BTreeSet;
 
+    use super::super::entity_join::EntityJoinActivation as Activation;
     use super::*;
 
     const EXPECTED_LENSES: [(&str, &str); 28] = [
@@ -868,37 +869,163 @@ mod tests {
 
     #[test]
     fn cross_section_requirements_are_typed_per_affected_lens() {
-        const EXPECTED: [(&str, Join); 24] = [
-            ("PG-TEMP-003", Join::QueryDatabaseTemp),
-            ("PG-ANALYZE-004", Join::RelationQueryPlan),
-            ("PG-VACUUM-005", Join::RelationVacuum),
-            ("PG-FREEZE-006", Join::RelationVacuumHorizon),
-            ("PG-HOT-007", Join::RelationIndexWal),
-            ("PG-WAL-009", Join::QueryWalCheckpoint),
-            ("PG-CACHE-010", Join::RelationQueryCache),
-            ("PG-IO-011", Join::PgIoBlockDevice),
-            ("PG-HORIZON-013", Join::BackendRelationHorizon),
-            ("PG-CONN-014", Join::DatabaseBackend),
-            ("PG-REPL-015", Join::ReplicationWal),
-            ("PG-SLOT-016", Join::SlotFilesystem),
-            ("PG-ARCH-017", Join::ArchiveFilesystem),
-            ("PG-SYNC-018", Join::BackendReplication),
-            ("PG-WAIT-019", Join::ActivityLockWaiter),
-            ("OS-CPU-020", Join::HostPgCpu),
-            ("OS-CGRP-021", Join::BackendCgroupCpu),
-            ("OS-MEM-022", Join::HostPgMemory),
-            ("OS-CGMEM-023", Join::BackendCgroupMemory),
-            ("OS-BLOCK-024", Join::PgStorageBlockDevice),
-            ("OS-WB-025", Join::WriterBlockDevice),
-            ("OS-IOWHO-026", Join::ProcessCgroupDevice),
-            ("OS-FS-027", Join::PgStorageFilesystem),
-            ("OS-NET-028", Join::PgEndpointNetwork),
+        const EXPECTED: [(&str, Join, &str, Activation); 24] = [
+            (
+                "PG-TEMP-003",
+                Join::QueryDatabaseTemp,
+                "query_database_temp",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-ANALYZE-004",
+                Join::RelationQueryPlan,
+                "relation_query_plan",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-VACUUM-005",
+                Join::RelationVacuum,
+                "relation_vacuum",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-FREEZE-006",
+                Join::RelationVacuumHorizon,
+                "relation_vacuum_horizon",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-HOT-007",
+                Join::RelationIndexWal,
+                "relation_index_wal",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-WAL-009",
+                Join::QueryWalCheckpoint,
+                "query_wal_checkpoint",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-CACHE-010",
+                Join::RelationQueryCache,
+                "relation_query_cache",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-IO-011",
+                Join::PgIoBlockDevice,
+                "pg_io_block_device",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "PG-HORIZON-013",
+                Join::BackendRelationHorizon,
+                "backend_relation_horizon",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-CONN-014",
+                Join::DatabaseBackend,
+                "database_backend",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-REPL-015",
+                Join::ReplicationWal,
+                "replication_wal",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-SLOT-016",
+                Join::SlotFilesystem,
+                "slot_filesystem",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "PG-ARCH-017",
+                Join::ArchiveFilesystem,
+                "archive_filesystem",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "PG-SYNC-018",
+                Join::BackendReplication,
+                "backend_replication",
+                Activation::SnapshotRelation,
+            ),
+            (
+                "PG-WAIT-019",
+                Join::ActivityLockWaiter,
+                "activity_lock_waiter",
+                Activation::SharedSnapshot,
+            ),
+            (
+                "OS-CPU-020",
+                Join::HostPgCpu,
+                "host_pg_cpu",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "OS-CGRP-021",
+                Join::BackendCgroupCpu,
+                "backend_cgroup_cpu",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "OS-MEM-022",
+                Join::HostPgMemory,
+                "host_pg_memory",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "OS-CGMEM-023",
+                Join::BackendCgroupMemory,
+                "backend_cgroup_memory",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "OS-BLOCK-024",
+                Join::PgStorageBlockDevice,
+                "pg_storage_block_device",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "OS-WB-025",
+                Join::WriterBlockDevice,
+                "writer_block_device",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "OS-IOWHO-026",
+                Join::ProcessCgroupDevice,
+                "process_cgroup_device",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "OS-FS-027",
+                Join::PgStorageFilesystem,
+                "pg_storage_filesystem",
+                Activation::LifetimeMapping,
+            ),
+            (
+                "OS-NET-028",
+                Join::PgEndpointNetwork,
+                "pg_endpoint_network",
+                Activation::LifetimeMapping,
+            ),
         ];
         let actual: Vec<_> = core_catalog()
             .iter()
             .filter_map(|lens| {
-                lens.entity_join_contract()
-                    .map(|contract| (lens.lens_id(), contract))
+                lens.entity_join_contract().map(|contract| {
+                    (
+                        lens.lens_id(),
+                        contract,
+                        contract.as_str(),
+                        contract.activation(),
+                    )
+                })
             })
             .collect();
         assert_eq!(actual, EXPECTED);

@@ -306,6 +306,42 @@ mod tests {
     }
 
     #[test]
+    fn activation_requirements_have_stable_machine_ids() {
+        let actual = [
+            EntityJoinActivation::SharedSnapshot,
+            EntityJoinActivation::SnapshotRelation,
+            EntityJoinActivation::LifetimeMapping,
+        ]
+        .map(|activation| {
+            (
+                activation.producer(),
+                activation.provenance(),
+                activation.coverage(),
+            )
+        });
+        assert_eq!(
+            actual,
+            [
+                (
+                    "shared_snapshot_producer",
+                    "shared_snapshot_token",
+                    "both_inputs_complete",
+                ),
+                (
+                    "typed_relation_producer",
+                    "snapshot_scoped_relation",
+                    "relation_and_inputs_complete",
+                ),
+                (
+                    "stored_mapping_producer",
+                    "overlapping_lifetime_mapping",
+                    "mapping_and_inputs_complete",
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn exact_scoped_snapshot_session_join_is_observable_and_ordered() {
         let request = scope(7, "node-a");
         let key = backend(100, 42, 10);
@@ -321,6 +357,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             [3, 9]
         );
+    }
+
+    #[test]
+    fn zero_relation_limit_rejects_without_creating_a_lookup_entry() {
+        let request = scope(7, "node-a");
+        let key = backend(100, 42, 10);
+        let mut index = EntityJoinIndex::new(request, 0);
+        assert_eq!(
+            index.insert(key.clone(), 9),
+            EntityJoinInsert::LimitExceeded {
+                observed: 1,
+                limit: 0,
+            }
+        );
+        assert!(index.matches(request, &key).is_none());
     }
 
     #[test]
@@ -403,6 +454,15 @@ mod tests {
                 limit: 1,
             }
         );
+        assert_eq!(
+            index
+                .matches(request, &backend(100, 42, 10))
+                .expect("first admitted relation")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [9]
+        );
     }
 
     #[test]
@@ -410,12 +470,14 @@ mod tests {
         let request = scope(7, "node-a");
         let mut index = EntityJoinIndex::new(request, usize::MAX);
         index.relation_count = usize::MAX;
+        let key = backend(100, 42, 10);
         assert_eq!(
-            index.insert(backend(100, 42, 10), 9),
+            index.insert(key.clone(), 9),
             EntityJoinInsert::LimitExceeded {
                 observed: usize::MAX,
                 limit: usize::MAX,
             }
         );
+        assert!(index.matches(request, &key).is_none());
     }
 }
