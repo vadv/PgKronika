@@ -246,6 +246,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::ActivityRows,
+            Missing::EntityJoin,
             // Period undefined: a single sample or a before/after plan bridge is not a timed series.
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -807,6 +808,20 @@ mod tests {
                 "request_input_coverage",
             ]
         );
+    }
+
+    #[test]
+    fn xmin_horizon_keeps_the_cross_section_join_requirement() {
+        let horizon = core_catalog()
+            .iter()
+            .find(|lens| lens.lens_id() == "PG-HORIZON-013")
+            .expect("xmin horizon catalog entry");
+        let requirements: Vec<_> = horizon
+            .missing()
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect();
+        assert!(requirements.contains(&"cross_section_entity_join"));
     }
 
     #[test]

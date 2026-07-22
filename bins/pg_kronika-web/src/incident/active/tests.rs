@@ -1338,77 +1338,192 @@ fn xmin_hold_on_empty_input_reports_nothing() {
     assert!(run_activity(&XminHorizonHoldLens, &TypedInputs::new()).is_empty());
 }
 
-#[test]
-fn xmin_hold_attaches_a_lock_edge_when_the_holder_is_a_waiter() {
-    // A horizon-holding idle transaction whose pid is also a waiter in the
-    // pg_locks snapshot: the cross-section join names why it stays open — it is
-    // blocked — without changing the amplifier role.
-    let mut typed = activity_typed(vec![ActivityBackend {
-        pid: 42,
+fn horizon_waiter(pid: i64, backend_start: i64) -> ActivityBackend {
+    ActivityBackend {
+        pid,
+        backend_start,
         xmin_age: Some(2_000_000),
-        state: Some("idle in transaction".into()),
+        state: Some("active".into()),
+        wait_event_type: Some("Lock".into()),
+        xact_age_us: Some(400_000_000),
         ..base_backend()
-    }]);
+    }
+}
+
+fn insert_horizon_lock_snapshot(
+    typed: &mut TypedInputs,
+    ts: i64,
+    activity_snapshot_ts: Option<i64>,
+    waiter_pid: i64,
+    waiter_backend_start: Option<i64>,
+    blockers: &[i64],
+) {
     typed.insert_lock_snapshot(LockSnapshot {
-        ts: 5,
-        edges: vec![LockEdge {
-            waiter_pid: 42,
-            blocker_pid: 7,
-        }],
+        ts,
+        activity_snapshot_ts,
+        edges: blockers
+            .iter()
+            .map(|&blocker_pid| LockEdge {
+                waiter_pid,
+                waiter_backend_start,
+                blocker_pid,
+            })
+            .collect(),
     });
+}
+
+fn xmin_outcome(typed: &TypedInputs, work_limit: u64) -> EngineOutcome {
     let episode = window_episode(PG_STAT_ACTIVITY, "backend_xmin_age");
     let lenses: [&dyn Lens; 1] = [&XminHorizonHoldLens];
-    let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
-    let outcome = analyze(
+    let config = IncidentConfig::for_test_with_work_limit(
+        "node",
+        5,
+        1_000,
+        ClockRelation::Unknown,
+        work_limit,
+    );
+    analyze(
         vec![episode],
         &SeriesSet::for_test(0),
-        &typed,
+        typed,
         &lenses,
         &config,
     )
-    .expect("valid analysis");
-    let finding = &outcome.incidents[0].findings[0];
-    assert_eq!(finding.role(), Role::Amplifier);
-    let edge = finding
-        .evidence()
+    .expect("valid xmin analysis")
+}
+
+fn sampled_lock_edges(evidence: &[Evidence]) -> Vec<(i64, i64, i64, LockParticipant)> {
+    evidence
         .iter()
-        .find_map(|evidence| match evidence {
-            Evidence::Direct(direct) => direct.lock_edge(),
+        .filter_map(|evidence| match evidence {
+            Evidence::Direct(direct) => direct.lock_edge().map(|edge| {
+                (
+                    edge.observed_at_us(),
+                    edge.waiter_pid(),
+                    edge.blocker_pid(),
+                    edge.participant(),
+                )
+            }),
             _ => None,
         })
-        .expect("the blocked horizon-holder carries a sampled lock edge");
-    assert_eq!(edge.waiter_pid(), 42);
-    assert_eq!(edge.blocker_pid(), 7);
+        .collect()
 }
 
 #[test]
-fn xmin_hold_reports_without_a_lock_edge_when_no_edge_names_the_holder() {
-    let typed = activity_typed(vec![ActivityBackend {
-        pid: 42,
-        xmin_age: Some(2_000_000),
-        state: Some("idle in transaction".into()),
-        ..base_backend()
-    }]);
-    let episode = window_episode(PG_STAT_ACTIVITY, "backend_xmin_age");
-    let lenses: [&dyn Lens; 1] = [&XminHorizonHoldLens];
-    let config = IncidentConfig::for_test("node", 5, 1_000, ClockRelation::Unknown);
-    let outcome = analyze(
-        vec![episode],
-        &SeriesSet::for_test(0),
-        &typed,
-        &lenses,
-        &config,
-    )
-    .expect("valid analysis");
+fn xmin_hold_attaches_all_exact_same_snapshot_blockers() {
+    let mut typed = activity_typed(vec![horizon_waiter(42, 11)]);
+    insert_horizon_lock_snapshot(&mut typed, 5, Some(5), 42, Some(11), &[9, 0, 7, 9]);
+    let outcome = xmin_outcome(&typed, u64::MAX);
     let finding = &outcome.incidents[0].findings[0];
-    assert_eq!(finding.role(), Role::Amplifier);
-    assert!(
-        finding
-            .evidence()
-            .iter()
-            .all(|evidence| !matches!(evidence, Evidence::Direct(_))),
-        "without a blocked_by edge the hold carries no lock evidence"
+    assert_eq!(
+        (finding.role(), finding.confidence()),
+        (Role::Amplifier, Confidence::MEDIUM)
     );
+    assert_eq!(
+        sampled_lock_edges(finding.evidence()),
+        [
+            (5, 42, 0, LockParticipant::Waiter),
+            (5, 42, 7, LockParticipant::Waiter),
+            (5, 42, 9, LockParticipant::Waiter),
+        ]
+    );
+}
+
+#[test]
+fn xmin_hold_does_not_infer_shared_provenance_from_equal_timestamps() {
+    let mut typed = activity_typed(vec![horizon_waiter(42, 11)]);
+    insert_horizon_lock_snapshot(&mut typed, 5, None, 42, Some(11), &[7]);
+    let outcome = xmin_outcome(&typed, u64::MAX);
+    let finding = &outcome.incidents[0].findings[0];
+    assert!(sampled_lock_edges(finding.evidence()).is_empty());
+}
+
+#[test]
+fn xmin_hold_rejects_other_snapshots_and_reused_pids() {
+    let mut other_snapshot = activity_typed(vec![horizon_waiter(42, 11)]);
+    insert_horizon_lock_snapshot(&mut other_snapshot, 4, Some(4), 42, Some(11), &[7]);
+    assert!(
+        sampled_lock_edges(
+            xmin_outcome(&other_snapshot, u64::MAX).incidents[0].findings[0].evidence()
+        )
+        .is_empty()
+    );
+
+    let mut reused_pid = activity_typed(vec![horizon_waiter(42, 11)]);
+    insert_horizon_lock_snapshot(&mut reused_pid, 5, Some(5), 42, Some(10), &[7]);
+    assert!(
+        sampled_lock_edges(xmin_outcome(&reused_pid, u64::MAX).incidents[0].findings[0].evidence())
+            .is_empty()
+    );
+}
+
+#[test]
+fn xmin_hold_rejects_invalid_lock_endpoints() {
+    let mut typed = activity_typed(vec![horizon_waiter(42, 11)]);
+    typed.insert_lock_snapshot(LockSnapshot {
+        ts: 5,
+        activity_snapshot_ts: Some(5),
+        edges: vec![
+            LockEdge {
+                waiter_pid: 0,
+                waiter_backend_start: Some(11),
+                blocker_pid: 7,
+            },
+            LockEdge {
+                waiter_pid: 42,
+                waiter_backend_start: Some(11),
+                blocker_pid: -1,
+            },
+            LockEdge {
+                waiter_pid: 42,
+                waiter_backend_start: Some(11),
+                blocker_pid: 42,
+            },
+            LockEdge {
+                waiter_pid: 42,
+                waiter_backend_start: None,
+                blocker_pid: 7,
+            },
+        ],
+    });
+    let finding = &xmin_outcome(&typed, u64::MAX).incidents[0].findings[0];
+    assert!(sampled_lock_edges(finding.evidence()).is_empty());
+}
+
+#[test]
+fn xmin_hold_bounds_and_orders_lock_evidence() {
+    let mut typed = activity_typed(vec![horizon_waiter(1_000, 11)]);
+    let blockers: Vec<_> = (0..200).rev().chain([199, 0]).collect();
+    insert_horizon_lock_snapshot(&mut typed, 5, Some(5), 1_000, Some(11), &blockers);
+    let finding = &xmin_outcome(&typed, u64::MAX).incidents[0].findings[0];
+    let edges = sampled_lock_edges(finding.evidence());
+    assert_eq!(edges.len(), 128);
+    assert_eq!(edges.first().map(|edge| edge.2), Some(0));
+    assert_eq!(edges.last().map(|edge| edge.2), Some(127));
+}
+
+#[test]
+fn xmin_hold_charges_the_lock_scan_before_emitting() {
+    let mut typed = activity_typed(vec![horizon_waiter(42, 11)]);
+    insert_horizon_lock_snapshot(&mut typed, 5, Some(5), 42, Some(11), &[7, 9]);
+    let outcome = xmin_outcome(&typed, 7);
+    assert!(!outcome.complete);
+    assert!(outcome.incidents[0].findings.is_empty());
+    assert_eq!(outcome.skipped[0].limit.axis, LimitAxis::Work);
+    assert_eq!(outcome.skipped[0].limit.observed, 9);
+    assert_eq!(outcome.skipped[0].limit.limit, 7);
+}
+
+#[test]
+fn xmin_hold_excludes_the_incident_end_snapshot() {
+    let mut typed = TypedInputs::new();
+    typed.insert_activity_snapshot(ActivitySnapshot {
+        ts: 10,
+        backends: vec![horizon_waiter(42, 11)],
+        completeness: SnapshotCompleteness::Complete,
+    });
+    insert_horizon_lock_snapshot(&mut typed, 10, Some(10), 42, Some(11), &[7]);
+    assert!(run_activity(&XminHorizonHoldLens, &typed).is_empty());
 }
 
 #[test]
@@ -1678,6 +1793,26 @@ fn internal_wait_does_not_infer_a_shared_snapshot_from_equal_timestamps() {
         });
     }
     assert_no_internal_wait(&typed);
+}
+
+#[test]
+fn internal_wait_charges_lock_edges_without_shared_provenance() {
+    let mut typed = lock_wait_snapshots(&[10, 11, 12]);
+    for ts in [3, 5, 7] {
+        typed.insert_lock_snapshot(LockSnapshot {
+            ts,
+            activity_snapshot_ts: None,
+            edges: [10, 11, 12]
+                .into_iter()
+                .map(|pid| lock_edge(pid, 99))
+                .collect(),
+        });
+    }
+    let outcome = internal_wait_outcome(&typed, 20);
+    assert!(!outcome.complete);
+    assert_eq!(outcome.skipped[0].limit.axis, LimitAxis::Work);
+    assert_eq!(outcome.skipped[0].limit.observed, 29);
+    assert_eq!(outcome.skipped[0].limit.limit, 20);
 }
 
 #[test]
