@@ -816,12 +816,12 @@ mod tests {
             .iter()
             .find(|lens| lens.lens_id() == "PG-HORIZON-013")
             .expect("xmin horizon catalog entry");
-        let requirements: Vec<_> = horizon
-            .missing()
-            .iter()
-            .map(|capability| capability.as_str())
-            .collect();
-        assert!(requirements.contains(&"cross_section_entity_join"));
+        assert!(
+            horizon
+                .missing()
+                .iter()
+                .any(|capability| capability.as_str() == "cross_section_entity_join")
+        );
     }
 
     #[test]
