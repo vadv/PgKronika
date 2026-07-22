@@ -139,6 +139,7 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiPr
     };
 
     let config = IncidentConfig::production(
+        prepared.source_id,
         &prepared.node_self_id,
         request.epsilon_us,
         request.max_cluster_span_us,

@@ -6,6 +6,7 @@ mod active;
 mod cluster;
 mod dispatch;
 mod engine;
+mod entity_join;
 mod events;
 mod evidence;
 mod gauge_contracts;

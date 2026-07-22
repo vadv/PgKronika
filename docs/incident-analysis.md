@@ -216,8 +216,8 @@ incident API не возвращает.
 - `events.rs` — event-линзы и их каталог;
 - `dispatch.rs`, `engine.rs`, `evidence.rs` — допуск работы, output limits,
   роли и confidence;
-- `model.rs`, `series.rs`, `typed.rs`, `cluster.rs` — identity, входные ряды и
-  кластеризация;
+- `model.rs`, `series.rs`, `typed.rs`, `cluster.rs`, `entity_join.rs` — identity,
+  входные ряды, кластеризация и типизированные связи сущностей;
 - `incident_input.rs` — bounded adapter reader → incident engine;
 - `incident_response.rs` — JSON transport.
 
@@ -225,6 +225,14 @@ incident API не возвращает.
 join, соблюдать общий work budget, лимиты findings/evidence и детерминированную
 сортировку. Стабильный `lens_id` менять нельзя; читаемое имя меняется через
 `slug`.
+
+Совпадение числового identity и нахождение эпизодов в одном временном кластере
+не образуют entity join. Cross-section ветка включается только после появления
+явного producer contract: одинаковые source/node, тип и полная identity
+сущности, общий snapshot token, сохранённая snapshot-scoped relation либо
+bounded mapping с пересекающимися lifetime, а также coverage обоих входов и
+самой relation/mapping. До этого `cross_section_entity_join` остаётся missing
+capability конкретной ветки.
 
 Ответ содержит 34 уникальных `lens_id`: 28 metric/snapshot-линз и восемь
 event-веток, две из которых переиспользуют `OS-FS-027` и `PG-CONN-014`. Формулы

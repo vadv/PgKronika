@@ -1,20 +1,20 @@
 //! Dormant diagnostic catalog metadata.
 
+use super::entity_join::EntityJoinContract;
 use super::evidence::ConfidenceCap;
 
 pub(crate) const MAX_DORMANT_LENSES: usize = 28;
 pub(crate) const MAX_MISSING_PER_LENS: usize = 6;
 pub(crate) const MAX_CATALOG_TOKEN_BYTES: usize = 40;
 
-#[derive(Clone, Copy)]
-#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MissingCapability {
     CounterDeltas,
     GaugeSamples,
     PairedIntervals,
     SourcePeriod,
     InputCoverage,
-    EntityJoin,
+    EntityJoin(EntityJoinContract),
     TrackPlanningGate,
     StorePlansBridge,
     BlockedByEdges,
@@ -32,7 +32,7 @@ impl MissingCapability {
             Self::PairedIntervals => "paired_interval_inputs",
             Self::SourcePeriod => "source_period_provenance",
             Self::InputCoverage => "request_input_coverage",
-            Self::EntityJoin => "cross_section_entity_join",
+            Self::EntityJoin(_) => "cross_section_entity_join",
             Self::TrackPlanningGate => "track_planning_gate",
             Self::StorePlansBridge => "store_plans_bridge",
             Self::BlockedByEdges => "sampled_blocked_by_edges",
@@ -40,6 +40,31 @@ impl MissingCapability {
             Self::ActivityRows => "sampled_activity_rows",
             Self::PidCgroupMapping => "pid_cgroup_mapping",
             Self::IncidentLogEventInput => "incident_log_event_input",
+        }
+    }
+
+    const fn kind_id(self) -> u8 {
+        match self {
+            Self::CounterDeltas => 0,
+            Self::GaugeSamples => 1,
+            Self::PairedIntervals => 2,
+            Self::SourcePeriod => 3,
+            Self::InputCoverage => 4,
+            Self::EntityJoin(_) => 5,
+            Self::TrackPlanningGate => 6,
+            Self::StorePlansBridge => 7,
+            Self::BlockedByEdges => 8,
+            Self::LockSnapshotCoverage => 9,
+            Self::ActivityRows => 10,
+            Self::PidCgroupMapping => 11,
+            Self::IncidentLogEventInput => 12,
+        }
+    }
+
+    const fn entity_join(self) -> Option<EntityJoinContract> {
+        match self {
+            Self::EntityJoin(contract) => Some(contract),
+            _ => None,
         }
     }
 }
@@ -89,8 +114,20 @@ impl DormantLens {
     pub(crate) const fn missing(&self) -> &'static [MissingCapability] {
         self.missing
     }
+
+    pub(crate) const fn entity_join_contract(&self) -> Option<EntityJoinContract> {
+        let mut at = 0;
+        while at < self.missing.len() {
+            if let Some(contract) = self.missing[at].entity_join() {
+                return Some(contract);
+            }
+            at += 1;
+        }
+        None
+    }
 }
 
+use EntityJoinContract as Join;
 use MissingCapability as Missing;
 
 const DORMANT_CATALOG: &[DormantLens] = &[
@@ -129,6 +166,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::IncidentLogEventInput,
+            Missing::EntityJoin(Join::QueryDatabaseTemp),
             Missing::InputCoverage,
         ],
     },
@@ -140,6 +178,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
+            Missing::EntityJoin(Join::RelationQueryPlan),
             Missing::InputCoverage,
         ],
     },
@@ -152,6 +191,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::IncidentLogEventInput,
+            Missing::EntityJoin(Join::RelationVacuum),
             Missing::InputCoverage,
         ],
     },
@@ -163,6 +203,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::IncidentLogEventInput,
+            Missing::EntityJoin(Join::RelationVacuumHorizon),
             Missing::InputCoverage,
         ],
     },
@@ -174,6 +215,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
+            Missing::EntityJoin(Join::RelationIndexWal),
             Missing::InputCoverage,
         ],
     },
@@ -197,6 +239,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
+            Missing::EntityJoin(Join::QueryWalCheckpoint),
             Missing::InputCoverage,
         ],
     },
@@ -208,6 +251,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
+            Missing::EntityJoin(Join::RelationQueryCache),
             Missing::InputCoverage,
         ],
     },
@@ -219,6 +263,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
+            Missing::EntityJoin(Join::PgIoBlockDevice),
             Missing::InputCoverage,
         ],
     },
@@ -238,6 +283,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::ActivityRows,
+            Missing::EntityJoin(Join::BackendRelationHorizon),
             // Period undefined: a single sample or a before/after plan bridge is not a timed series.
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -252,6 +298,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::ActivityRows,
+            Missing::EntityJoin(Join::DatabaseBackend),
             Missing::InputCoverage,
         ],
     },
@@ -263,6 +310,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
+            Missing::EntityJoin(Join::ReplicationWal),
             Missing::InputCoverage,
         ],
     },
@@ -271,7 +319,11 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         slug: "slot_wal_retention",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[Missing::GaugeSamples, Missing::InputCoverage],
+        missing: &[
+            Missing::GaugeSamples,
+            Missing::EntityJoin(Join::SlotFilesystem),
+            Missing::InputCoverage,
+        ],
     },
     DormantLens {
         lens_id: "PG-ARCH-017",
@@ -281,6 +333,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::GaugeSamples,
+            Missing::EntityJoin(Join::ArchiveFilesystem),
             Missing::InputCoverage,
         ],
     },
@@ -292,6 +345,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::ActivityRows,
             Missing::CounterDeltas,
+            Missing::EntityJoin(Join::BackendReplication),
             // Period derivable from the activity snapshot cadence, an input the catalog does not yet feed.
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -304,6 +358,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::Low,
         missing: &[
             Missing::ActivityRows,
+            Missing::EntityJoin(Join::ActivityLockWaiter),
             // Period derivable from the activity snapshot cadence, an input the catalog does not yet feed.
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -317,6 +372,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
+            Missing::EntityJoin(Join::HostPgCpu),
             Missing::InputCoverage,
         ],
     },
@@ -328,6 +384,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::PidCgroupMapping,
             Missing::CounterDeltas,
+            Missing::EntityJoin(Join::BackendCgroupCpu),
             Missing::InputCoverage,
         ],
     },
@@ -339,6 +396,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
+            Missing::EntityJoin(Join::HostPgMemory),
             Missing::InputCoverage,
         ],
     },
@@ -351,6 +409,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::PidCgroupMapping,
             Missing::GaugeSamples,
             Missing::CounterDeltas,
+            Missing::EntityJoin(Join::BackendCgroupMemory),
             Missing::InputCoverage,
         ],
     },
@@ -362,6 +421,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
+            Missing::EntityJoin(Join::PgStorageBlockDevice),
             Missing::InputCoverage,
         ],
     },
@@ -373,6 +433,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
+            Missing::EntityJoin(Join::WriterBlockDevice),
             Missing::InputCoverage,
         ],
     },
@@ -384,6 +445,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PidCgroupMapping,
+            Missing::EntityJoin(Join::ProcessCgroupDevice),
             Missing::InputCoverage,
         ],
     },
@@ -394,6 +456,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::High,
         missing: &[
             Missing::GaugeSamples,
+            Missing::EntityJoin(Join::PgStorageFilesystem),
             Missing::IncidentLogEventInput,
             Missing::InputCoverage,
         ],
@@ -406,6 +469,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
+            Missing::EntityJoin(Join::PgEndpointNetwork),
             Missing::InputCoverage,
         ],
     },
@@ -615,9 +679,19 @@ const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
             if capability.as_str().len() > MAX_CATALOG_TOKEN_BYTES {
                 return false;
             }
+            if let Some(contract) = capability.entity_join() {
+                let activation = contract.activation();
+                if contract.as_str().len() > MAX_CATALOG_TOKEN_BYTES
+                    || activation.producer().len() > MAX_CATALOG_TOKEN_BYTES
+                    || activation.provenance().len() > MAX_CATALOG_TOKEN_BYTES
+                    || activation.coverage().len() > MAX_CATALOG_TOKEN_BYTES
+                {
+                    return false;
+                }
+            }
             let mut previous_capability = 0;
             while previous_capability < capability_at {
-                if lens.missing[previous_capability] as u8 == capability as u8 {
+                if lens.missing[previous_capability].kind_id() == capability.kind_id() {
                     return false;
                 }
                 previous_capability += 1;
@@ -730,7 +804,7 @@ mod tests {
                 Missing::SourcePeriod,
                 Missing::InputCoverage,
                 Missing::ActivityRows,
-                Missing::EntityJoin,
+                Missing::EntityJoin(Join::ActivityLockWaiter),
             ],
         )];
         let duplicate = [fixture(
@@ -740,6 +814,15 @@ mod tests {
         )];
         assert!(!catalog_is_valid(&too_many));
         assert!(!catalog_is_valid(&duplicate));
+        let duplicate_join = [fixture(
+            "PG-A",
+            "first",
+            &[
+                Missing::EntityJoin(Join::ActivityLockWaiter),
+                Missing::EntityJoin(Join::DatabaseBackend),
+            ],
+        )];
+        assert!(!catalog_is_valid(&duplicate_join));
         assert!(!slug_is_valid("Not_Snake_Case"));
     }
 
@@ -781,6 +864,44 @@ mod tests {
                 "request_input_coverage",
             ]
         );
+    }
+
+    #[test]
+    fn cross_section_requirements_are_typed_per_affected_lens() {
+        const EXPECTED: [(&str, Join); 24] = [
+            ("PG-TEMP-003", Join::QueryDatabaseTemp),
+            ("PG-ANALYZE-004", Join::RelationQueryPlan),
+            ("PG-VACUUM-005", Join::RelationVacuum),
+            ("PG-FREEZE-006", Join::RelationVacuumHorizon),
+            ("PG-HOT-007", Join::RelationIndexWal),
+            ("PG-WAL-009", Join::QueryWalCheckpoint),
+            ("PG-CACHE-010", Join::RelationQueryCache),
+            ("PG-IO-011", Join::PgIoBlockDevice),
+            ("PG-HORIZON-013", Join::BackendRelationHorizon),
+            ("PG-CONN-014", Join::DatabaseBackend),
+            ("PG-REPL-015", Join::ReplicationWal),
+            ("PG-SLOT-016", Join::SlotFilesystem),
+            ("PG-ARCH-017", Join::ArchiveFilesystem),
+            ("PG-SYNC-018", Join::BackendReplication),
+            ("PG-WAIT-019", Join::ActivityLockWaiter),
+            ("OS-CPU-020", Join::HostPgCpu),
+            ("OS-CGRP-021", Join::BackendCgroupCpu),
+            ("OS-MEM-022", Join::HostPgMemory),
+            ("OS-CGMEM-023", Join::BackendCgroupMemory),
+            ("OS-BLOCK-024", Join::PgStorageBlockDevice),
+            ("OS-WB-025", Join::WriterBlockDevice),
+            ("OS-IOWHO-026", Join::ProcessCgroupDevice),
+            ("OS-FS-027", Join::PgStorageFilesystem),
+            ("OS-NET-028", Join::PgEndpointNetwork),
+        ];
+        let actual: Vec<_> = core_catalog()
+            .iter()
+            .filter_map(|lens| {
+                lens.entity_join_contract()
+                    .map(|contract| (lens.lens_id(), contract))
+            })
+            .collect();
+        assert_eq!(actual, EXPECTED);
     }
 
     #[test]
