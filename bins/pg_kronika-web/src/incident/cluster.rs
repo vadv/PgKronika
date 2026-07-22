@@ -17,6 +17,24 @@ impl Cluster {
             members: vec![episode],
         }
     }
+
+    /// Cross-section entity join: members from a different section whose identity
+    /// shares a scalar with `anchor` — the same table, database, or backend
+    /// observed elsewhere in the same incident. A shared identity scalar is the
+    /// join key; sections that never co-cluster yield nothing. The caller decides
+    /// whether a shared scalar is semantically the same entity for its lens.
+    pub(crate) fn joined_by_identity<'a>(
+        &'a self,
+        anchor: &'a EpisodeRefV1,
+    ) -> impl Iterator<Item = &'a EpisodeRefV1> {
+        self.members.iter().filter(move |member| {
+            member.logical_section != anchor.logical_section
+                && member
+                    .identity
+                    .iter()
+                    .any(|scalar| anchor.identity.contains(scalar))
+        })
+    }
 }
 
 pub(crate) struct ClusterOutcome {
@@ -120,6 +138,41 @@ mod tests {
             start_us: start,
             end_us: end,
         }
+    }
+
+    fn ep_in(section: &'static str, id: i64) -> EpisodeRefV1 {
+        EpisodeRefV1 {
+            logical_section: section,
+            column: "c",
+            identity: Arc::from(vec![IdentityValue::I64(id)]),
+            start_us: 0,
+            end_us: 10,
+        }
+    }
+
+    #[test]
+    fn joined_by_identity_links_a_shared_scalar_across_sections() {
+        let anchor = ep_in("pg_stat_user_tables", 42);
+        let cluster = Cluster {
+            start_us: 0,
+            end_us: 10,
+            members: vec![
+                anchor.clone(),
+                ep_in("pg_statio_user_tables", 42),
+                ep_in("pg_statio_user_tables", 99),
+                ep_in("pg_stat_user_tables", 42),
+            ],
+        };
+        let joined: Vec<_> = cluster
+            .joined_by_identity(&anchor)
+            .map(|member| (member.logical_section, member.identity[0].clone()))
+            .collect();
+        // The same relid in another section joins; the same section (even with
+        // the same relid) and a different relid do not.
+        assert_eq!(
+            joined,
+            vec![("pg_statio_user_tables", IdentityValue::I64(42))]
+        );
     }
 
     fn spans(outcome: &ClusterOutcome) -> Vec<(i64, i64, usize)> {

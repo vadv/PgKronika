@@ -129,7 +129,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::IncidentLogEventInput,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -141,7 +140,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -154,7 +152,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::IncidentLogEventInput,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -166,7 +163,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::IncidentLogEventInput,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -178,7 +174,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -202,7 +197,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -214,7 +208,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -226,7 +219,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -246,7 +238,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::ActivityRows,
-            Missing::EntityJoin,
             // Period undefined: a single sample or a before/after plan bridge is not a timed series.
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -261,7 +252,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::ActivityRows,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -273,7 +263,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -282,11 +271,7 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         slug: "slot_wal_retention",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
-            Missing::GaugeSamples,
-            Missing::EntityJoin,
-            Missing::InputCoverage,
-        ],
+        missing: &[Missing::GaugeSamples, Missing::InputCoverage],
     },
     DormantLens {
         lens_id: "PG-ARCH-017",
@@ -296,7 +281,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::GaugeSamples,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -308,7 +292,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::ActivityRows,
             Missing::CounterDeltas,
-            Missing::EntityJoin,
             // Period derivable from the activity snapshot cadence, an input the catalog does not yet feed.
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -321,7 +304,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::Low,
         missing: &[
             Missing::ActivityRows,
-            Missing::EntityJoin,
             // Period derivable from the activity snapshot cadence, an input the catalog does not yet feed.
             Missing::SourcePeriod,
             Missing::InputCoverage,
@@ -335,7 +317,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -347,7 +328,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::PidCgroupMapping,
             Missing::CounterDeltas,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -359,7 +339,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -372,7 +351,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::PidCgroupMapping,
             Missing::GaugeSamples,
             Missing::CounterDeltas,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -384,7 +362,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -396,7 +373,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -408,7 +384,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PidCgroupMapping,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -419,7 +394,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         confidence: ConfidenceCap::High,
         missing: &[
             Missing::GaugeSamples,
-            Missing::EntityJoin,
             Missing::IncidentLogEventInput,
             Missing::InputCoverage,
         ],
@@ -432,7 +406,6 @@ const DORMANT_CATALOG: &[DormantLens] = &[
         missing: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
-            Missing::EntityJoin,
             Missing::InputCoverage,
         ],
     },
@@ -756,8 +729,8 @@ mod tests {
                 Missing::PairedIntervals,
                 Missing::SourcePeriod,
                 Missing::InputCoverage,
-                Missing::EntityJoin,
                 Missing::ActivityRows,
+                Missing::EntityJoin,
             ],
         )];
         let duplicate = [fixture(
