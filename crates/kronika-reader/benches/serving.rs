@@ -29,12 +29,14 @@ use kronika_registry::pg_stat_statements::{
 use kronika_registry::{Section, StrId, Ts};
 use kronika_writer::{Interner, dict};
 
-// Dependencies the reader library pulls in but this bench does not touch; naming
-// them keeps `unused_crate_dependencies` quiet without editing the library.
+// Reader dependencies unused by this benchmark remain explicit lint anchors.
 use arrow_array as _;
+use arrow_schema as _;
 use kronika_analytics as _;
 use kronika_store as _;
 use parquet as _;
+use proptest as _;
+use sha2 as _;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
