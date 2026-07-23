@@ -32,6 +32,7 @@ use kronika_store as _;
 use kronika_writer as _;
 use parquet as _;
 use proptest as _;
+use rustix as _;
 use sha2 as _;
 
 #[global_allocator]

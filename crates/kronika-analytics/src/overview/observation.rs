@@ -559,6 +559,8 @@ pub enum ObservationPayload {
     ErrorGroup(Box<ErrorGroupPayload>),
     /// Child process terminated by a raw signal.
     ChildSignalTermination(Box<LifecyclePayload>),
+    /// Child process crash without a retained termination signal.
+    ChildProcessCrash(Box<LifecyclePayload>),
     /// Shutdown request.
     ShutdownRequested(Box<LifecyclePayload>),
     /// Server readiness record.
@@ -592,6 +594,7 @@ impl ObservationPayload {
         match self {
             Self::ErrorGroup(_) => "pg.log.error_group_observed",
             Self::ChildSignalTermination(_) => "pg.lifecycle.child_signal_termination",
+            Self::ChildProcessCrash(_) => "pg.lifecycle.child_process_crash",
             Self::ShutdownRequested(_) => "pg.lifecycle.shutdown_requested",
             Self::ReadyObserved(_) => "pg.lifecycle.ready_observed",
             Self::CheckpointStarted(_) => "pg.checkpoint.started",
@@ -688,7 +691,10 @@ impl EventObservation {
         }
         validate_time(shape, time)?;
         if matches!(payload, ObservationPayload::SlowQueryGroup(_))
-            && time.quality != TimeQuality::MaxDurationSample
+            && !matches!(
+                time.quality,
+                TimeQuality::MaxDurationSample | TimeQuality::CollectionFallback
+            )
         {
             return Err(InvalidObservation::TimeQualityShapeMismatch);
         }
@@ -706,7 +712,10 @@ impl EventObservation {
                     | TimeQuality::ParsedWithoutVerifiedOffset
                     | TimeQuality::CollectionFallback
             ),
-            ObservationPayload::SlowQueryGroup(_) => time.quality == TimeQuality::MaxDurationSample,
+            ObservationPayload::SlowQueryGroup(_) => matches!(
+                time.quality,
+                TimeQuality::MaxDurationSample | TimeQuality::CollectionFallback
+            ),
             ObservationPayload::LogGap(_) => time.quality == TimeQuality::IntervalOnly,
             _ => matches!(
                 time.quality,
@@ -1139,6 +1148,16 @@ mod tests {
                 fallback,
                 1,
                 ObservationPayload::ReadyObserved(lifecycle()),
+            )
+            .is_ok()
+        );
+        assert!(
+            make_observation(
+                provenance(1, Some(segment_locator)),
+                ObservationShape::GroupedCount,
+                fallback,
+                1,
+                slow_query(),
             )
             .is_ok()
         );

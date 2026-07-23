@@ -145,7 +145,8 @@ pub fn fold_counts(
                     count,
                 ));
             }
-            ObservationPayload::ChildSignalTermination(retained) => {
+            ObservationPayload::ChildSignalTermination(retained)
+            | ObservationPayload::ChildProcessCrash(retained) => {
                 crashes = crashes.checked_add(count).ok_or(CountError::Overflow)?;
                 if let Some(signal) = retained.signal {
                     if signals.len() == limits.max_input_entries {

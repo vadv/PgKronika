@@ -751,6 +751,7 @@ const fn payload_tag(payload: &ObservationPayload) -> u8 {
         ObservationPayload::LockAcquiredAfterWait(_) => 11,
         ObservationPayload::TempFileReported(_) => 12,
         ObservationPayload::LogGap(_) => 13,
+        ObservationPayload::ChildProcessCrash(_) => 14,
     }
 }
 
@@ -763,6 +764,7 @@ fn write_payload(
     match payload {
         ObservationPayload::ErrorGroup(inner) => write_error_group(writer, inner, strings),
         ObservationPayload::ChildSignalTermination(inner)
+        | ObservationPayload::ChildProcessCrash(inner)
         | ObservationPayload::ShutdownRequested(inner)
         | ObservationPayload::ReadyObserved(inner) => write_lifecycle(writer, inner, strings),
         ObservationPayload::CheckpointStarted(inner)
@@ -865,6 +867,12 @@ fn read_payload(
             text_budget,
         )?),
         13 => ObservationPayload::LogGap(read_log_gap(reader, strings, bounds, text_budget)?),
+        14 => ObservationPayload::ChildProcessCrash(read_lifecycle(
+            reader,
+            strings,
+            bounds,
+            text_budget,
+        )?),
         _ => return Err(BlockError::InvalidEnum),
     })
 }
@@ -954,6 +962,10 @@ impl EventObservationsBlock {
         &self.strings
     }
 
+    pub(super) fn into_observations(self) -> Vec<EventObservation> {
+        self.observations
+    }
+
     /// Decodes an observations block body against a segment lineage.
     ///
     /// All observations in the body must belong to `lineage`; the decoder
@@ -969,6 +981,26 @@ impl EventObservationsBlock {
         strings: &StringTableBlock,
         bounds: &Bounds,
     ) -> Result<Self, BlockError> {
+        let mut text_budget = bounds.decoded_block_len;
+        let mut item_budget = bounds.items_per_block;
+        Self::decode_with_budgets(
+            body,
+            lineage,
+            strings,
+            bounds,
+            &mut item_budget,
+            &mut text_budget,
+        )
+    }
+
+    pub(super) fn decode_with_budgets(
+        body: &[u8],
+        lineage: &SegmentIdentity,
+        strings: &StringTableBlock,
+        bounds: &Bounds,
+        item_budget: &mut u64,
+        text_budget: &mut u64,
+    ) -> Result<Self, BlockError> {
         if !bounds.is_within_absolute_limits() || body.len() as u64 > bounds.decoded_block_len {
             return Err(BlockError::AboveBound);
         }
@@ -976,9 +1008,11 @@ impl EventObservationsBlock {
             return Self::new(Vec::new(), bounds);
         }
         let mut reader = ByteReader::new(body);
-        let count = reader.uvarint(bounds.items_per_block)?;
+        let count = reader.uvarint(*item_budget)?;
+        *item_budget = item_budget
+            .checked_sub(count)
+            .ok_or(BlockError::AboveBound)?;
         let mut observations = Vec::with_capacity(count.min(4_096) as usize);
-        let mut text_budget = bounds.decoded_block_len;
         for _ in 0..count {
             let source_type_id = reader.u32_le()?;
             let provenance = read_provenance(&mut reader)?;
@@ -988,7 +1022,7 @@ impl EventObservationsBlock {
             let evidence_quality = evidence_quality_from(reader.u8()?)?;
             let quality_flags = QualityFlags(reader.u32_le()?);
             let loss = read_loss(&mut reader)?;
-            let payload = read_payload(&mut reader, strings, bounds, &mut text_budget)?;
+            let payload = read_payload(&mut reader, strings, bounds, text_budget)?;
             if !payload_has_valid_sqlstate(&payload) {
                 return Err(BlockError::Malformed);
             }
@@ -1092,6 +1126,7 @@ fn collect_payload_text(payload: &ObservationPayload, values: &mut Vec<Box<[u8]>
             retain(value.user.as_deref());
         }
         ObservationPayload::ChildSignalTermination(value)
+        | ObservationPayload::ChildProcessCrash(value)
         | ObservationPayload::ShutdownRequested(value)
         | ObservationPayload::ReadyObserved(value) => {
             retain(value.shutdown_mode.as_deref());
@@ -1138,6 +1173,7 @@ fn payload_is_bounded(payload: &ObservationPayload, bounds: &Bounds) -> bool {
                 && valid(value.user.as_deref())
         }
         ObservationPayload::ChildSignalTermination(value)
+        | ObservationPayload::ChildProcessCrash(value)
         | ObservationPayload::ShutdownRequested(value)
         | ObservationPayload::ReadyObserved(value) => {
             valid(value.shutdown_mode.as_deref())
@@ -1324,6 +1360,35 @@ mod tests {
         .expect("valid child signal")
     }
 
+    fn child_crash(row: u32) -> EventObservation {
+        let payload = LifecyclePayload {
+            pid: Some(4_322),
+            signal: None,
+            shutdown_mode: None,
+            message: Some("server process exited with exit code 1".into()),
+            query_detail: Some("select 1".into()),
+            dropped_field_count: DroppedFieldCount(0),
+        };
+        EventObservation::new(
+            lineage(),
+            1_028_001,
+            provenance(row),
+            ObservationShape::Individual,
+            ObservationTime {
+                sort_ts_us: 3_500,
+                occurred_at_us: Some(3_500),
+                observed_interval: None,
+                quality: TimeQuality::Exact,
+            },
+            1,
+            ObservationPayload::ChildProcessCrash(Box::new(payload)),
+            EvidenceQuality::Structured,
+            QualityFlags(0),
+            None,
+        )
+        .expect("valid child crash")
+    }
+
     fn log_gap(row: u32) -> EventObservation {
         let payload = LogGapPayload {
             source_path: Some("/var/log/postgresql/pg.log".into()),
@@ -1366,7 +1431,13 @@ mod tests {
     #[test]
     fn observations_round_trip_across_payload_kinds() {
         let block = EventObservationsBlock::new(
-            vec![ready(1), error_group(2), child_signal(3), log_gap(4)],
+            vec![
+                ready(1),
+                error_group(2),
+                child_signal(3),
+                child_crash(4),
+                log_gap(5),
+            ],
             &LIMIT,
         )
         .expect("valid block");
@@ -1378,7 +1449,16 @@ mod tests {
         )
         .expect("decode");
         assert_eq!(decoded, block);
-        assert_eq!(decoded.observations().len(), 4);
+        assert_eq!(decoded.observations().len(), 5);
+        assert_eq!(
+            payload_tag(child_crash(4).payload()),
+            14,
+            "new payload tags are append-only"
+        );
+        assert!(decoded.observations().iter().any(|observation| matches!(
+            observation.payload(),
+            ObservationPayload::ChildProcessCrash(_)
+        )));
     }
 
     #[test]

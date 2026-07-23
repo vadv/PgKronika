@@ -2,9 +2,11 @@
 //!
 //! A reference may occur in `dict.strings` or `dict.blobs`; the split threshold
 //! is not part of the reader contract. The resolver reads both section kinds
-//! and copies only requested values. Duplicate IDs or invalid truncation
-//! metadata make the dictionary inconsistent.
+//! and copies only requested values. Equivalent repeated IDs and full-value
+//! placement upgrades are reconciled; contradictory values or invalid
+//! truncation metadata make the dictionary inconsistent.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 use kronika_registry::{Bytes, CodecError};
@@ -159,8 +161,8 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
     pub fn resolve_overview_dictionary(
         &self,
         wanted: &BTreeSet<u64>,
+        bounds: &crate::Bounds,
     ) -> Result<TargetedDictionaryRead, ReadError> {
-        let bounds = &crate::LIMIT;
         validate_request(wanted, bounds).map_err(ReadError::Codec)?;
         let mut values = BTreeMap::new();
         let mut stats = TargetedDictionaryStats::default();
@@ -243,7 +245,7 @@ fn insert_bounded(
     bounds: &crate::Bounds,
     retained_bytes: &mut u64,
 ) -> Result<(), CodecError> {
-    if resolved.contains_key(&str_id) || !value.has_valid_storage() {
+    if !value.has_valid_storage() {
         return Err(CodecError::SchemaMismatch);
     }
     let stored_len = value.stored_len() as u64;
@@ -253,27 +255,63 @@ fn insert_bounded(
             max: usize::try_from(bounds.pattern_bytes).unwrap_or(usize::MAX),
         });
     }
-    *retained_bytes =
-        retained_bytes
-            .checked_add(stored_len)
-            .ok_or(CodecError::SectionTooLarge {
-                len: usize::MAX,
-                max: usize::try_from(bounds.string_table_bytes).unwrap_or(usize::MAX),
-            })?;
-    if *retained_bytes > bounds.string_table_bytes {
-        return Err(CodecError::SectionTooLarge {
-            len: usize::try_from(*retained_bytes).unwrap_or(usize::MAX),
-            max: usize::try_from(bounds.string_table_bytes).unwrap_or(usize::MAX),
-        });
+    match resolved.entry(str_id) {
+        Entry::Vacant(entry) => {
+            *retained_bytes =
+                retained_bytes
+                    .checked_add(stored_len)
+                    .ok_or(CodecError::SectionTooLarge {
+                        len: usize::MAX,
+                        max: usize::try_from(bounds.string_table_bytes).unwrap_or(usize::MAX),
+                    })?;
+            if *retained_bytes > bounds.string_table_bytes {
+                return Err(CodecError::SectionTooLarge {
+                    len: usize::try_from(*retained_bytes).unwrap_or(usize::MAX),
+                    max: usize::try_from(bounds.string_table_bytes).unwrap_or(usize::MAX),
+                });
+            }
+            entry.insert(value);
+        }
+        Entry::Occupied(mut entry) => {
+            let replace =
+                reconcile_repeat(entry.get(), &value).ok_or(CodecError::SchemaMismatch)?;
+            if replace {
+                entry.insert(value);
+            }
+        }
     }
-    resolved.insert(str_id, value);
     Ok(())
+}
+
+fn reconcile_repeat(existing: &ResolvedPattern, incoming: &ResolvedPattern) -> Option<bool> {
+    if existing == incoming {
+        return Some(false);
+    }
+    match (existing, incoming) {
+        (
+            ResolvedPattern::Text(existing),
+            ResolvedPattern::Blob {
+                bytes,
+                full_len,
+                truncated: false,
+            },
+        ) if existing == bytes && *full_len == bytes.len() as u64 => Some(true),
+        (
+            ResolvedPattern::Blob {
+                bytes,
+                full_len,
+                truncated: false,
+            },
+            ResolvedPattern::Text(incoming),
+        ) if bytes == incoming && *full_len == bytes.len() as u64 => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
 
     use kronika_format::{
@@ -284,7 +322,7 @@ mod tests {
 
     use crate::PgmUnit;
 
-    use super::{ResolvedPattern, resolve_targeted};
+    use super::{ResolvedPattern, insert_bounded, resolve_targeted};
 
     /// Interns a short value (into `dict.strings`) and a long one (into
     /// `dict.blobs`), then returns the encoded dictionary section bodies.
@@ -344,6 +382,81 @@ mod tests {
         )
         .expect("resolve");
         assert_eq!(resolved.len(), 1, "only the requested id is retained");
+    }
+
+    #[test]
+    fn equivalent_repeated_sections_do_not_double_count_retained_bytes() {
+        let (sections, short_id, _long_id) = dictionary_sections();
+        let wanted = BTreeSet::from([short_id]);
+        let repeated: Vec<_> = sections
+            .into_iter()
+            .flat_map(|(type_id, _rows, body)| [(type_id, body.clone()), (type_id, body)])
+            .collect();
+        let resolved =
+            resolve_targeted(repeated, &wanted, &crate::LIMIT).expect("resolve repeated sections");
+        assert_eq!(
+            resolved.get(&short_id),
+            Some(&ResolvedPattern::Text(b"idx_orders_pkey".to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_full_blob_upgrade_replaces_equivalent_string_placement() {
+        let mut resolved = BTreeMap::new();
+        let mut retained_bytes = 0;
+        let text = b"same value".to_vec();
+        insert_bounded(
+            &mut resolved,
+            7,
+            ResolvedPattern::Text(text.clone()),
+            &crate::LIMIT,
+            &mut retained_bytes,
+        )
+        .expect("insert string");
+        insert_bounded(
+            &mut resolved,
+            7,
+            ResolvedPattern::Blob {
+                bytes: text.clone(),
+                full_len: text.len() as u64,
+                truncated: false,
+            },
+            &crate::LIMIT,
+            &mut retained_bytes,
+        )
+        .expect("upgrade placement");
+        assert!(matches!(
+            resolved.get(&7),
+            Some(ResolvedPattern::Blob {
+                truncated: false,
+                ..
+            })
+        ));
+        assert_eq!(retained_bytes, text.len() as u64);
+    }
+
+    #[test]
+    fn contradictory_repeated_values_are_rejected() {
+        let mut resolved = BTreeMap::new();
+        let mut retained_bytes = 0;
+        insert_bounded(
+            &mut resolved,
+            7,
+            ResolvedPattern::Text(b"first".to_vec()),
+            &crate::LIMIT,
+            &mut retained_bytes,
+        )
+        .expect("insert first");
+        assert!(
+            insert_bounded(
+                &mut resolved,
+                7,
+                ResolvedPattern::Text(b"second".to_vec()),
+                &crate::LIMIT,
+                &mut retained_bytes,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -412,7 +525,7 @@ mod tests {
         let reads_before = reads.borrow().len();
 
         let result = unit
-            .resolve_overview_dictionary(&BTreeSet::from([short_id]))
+            .resolve_overview_dictionary(&BTreeSet::from([short_id]), &crate::LIMIT)
             .expect("resolve");
         let body_reads = &reads.borrow()[reads_before..];
         let dictionary_entries: Vec<_> = unit
@@ -481,7 +594,7 @@ mod tests {
         let reads_before = reads.borrow().len();
 
         let result = unit
-            .resolve_overview_dictionary(&BTreeSet::new())
+            .resolve_overview_dictionary(&BTreeSet::new(), &crate::LIMIT)
             .expect("empty request");
         assert!(result.values.is_empty());
         assert_eq!(result.stats, super::TargetedDictionaryStats::default());

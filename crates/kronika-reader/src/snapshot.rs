@@ -11,7 +11,9 @@ use kronika_format::{Catalog, DamageRegion, Entry};
 use kronika_registry::{DecodedSection, Row};
 use kronika_store::{LocalDir, LocalScan, StoreError, StoreWarning};
 
-use crate::{Dictionary, PgmUnit, ReadError};
+use crate::{
+    Bounds, BuildError, Dictionary, FactLoad, FactStore, PgmUnit, ReadError, SegmentContext,
+};
 
 // Counts `open_unit` calls so batch tests can assert a unit is opened once.
 // Thread-local, so parallel tests do not perturb each other; a test resets it
@@ -109,6 +111,62 @@ pub struct LocalDirSnapshot {
     scan: LocalScan,
     /// End of the last valid journal frame, carried across incremental refreshes.
     last_valid_len: u64,
+}
+
+/// Why a sealed snapshot unit could not produce persistent overview facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealedFactError {
+    /// The unit index is outside the pinned snapshot.
+    UnitOutOfRange {
+        /// Requested unit index.
+        unit_idx: usize,
+    },
+    /// The requested unit is an active journal part, not a sealed segment.
+    LiveUnit {
+        /// Requested unit index.
+        unit_idx: usize,
+    },
+    /// The sealed file changed after this snapshot was scanned.
+    StaleSnapshot {
+        /// Requested unit index.
+        unit_idx: usize,
+    },
+    /// Source extraction or a hard fact bound failed.
+    Build(BuildError),
+}
+
+impl std::fmt::Display for SealedFactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnitOutOfRange { unit_idx } => {
+                write!(f, "unit index {unit_idx} is out of range")
+            }
+            Self::LiveUnit { unit_idx } => {
+                write!(f, "unit {unit_idx} is live; sealed facts are unavailable")
+            }
+            Self::StaleSnapshot { unit_idx } => {
+                write!(f, "sealed unit {unit_idx} changed; refresh the snapshot")
+            }
+            Self::Build(error) => write!(f, "sealed fact build failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SealedFactError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Build(error) => Some(error),
+            Self::UnitOutOfRange { .. } | Self::LiveUnit { .. } | Self::StaleSnapshot { .. } => {
+                None
+            }
+        }
+    }
+}
+
+impl From<BuildError> for SealedFactError {
+    fn from(error: BuildError) -> Self {
+        Self::Build(error)
+    }
 }
 
 impl LocalDirSnapshot {
@@ -219,6 +277,49 @@ impl LocalDirSnapshot {
             Handle::Sealed(i) => &self.scan.sealed[i].catalog,
             Handle::Active(i) => &self.scan.active[i].catalog,
         })
+    }
+
+    /// Loads persistent overview facts for one sealed unit.
+    ///
+    /// The file is reopened and its catalog is compared with the pinned scan
+    /// before cache lookup. A same-name replacement therefore yields
+    /// [`SealedFactError::StaleSnapshot`] instead of facts for a different
+    /// descriptor. Active journal parts are rejected.
+    ///
+    /// `context` must carry the locator assigned by the reader's sealed-segment
+    /// registry; this method never derives it from row timestamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SealedFactError`] for an invalid/live unit, stale sealed file,
+    /// source failure, unsupported event layout, or hard fact bound.
+    pub fn load_sealed_facts(
+        &self,
+        idx: usize,
+        store: &FactStore,
+        context: &SegmentContext,
+        bounds: &Bounds,
+    ) -> Result<FactLoad, SealedFactError> {
+        let handle = self
+            .handles()
+            .nth(idx)
+            .ok_or(SealedFactError::UnitOutOfRange { unit_idx: idx })?;
+        let Handle::Sealed(sealed_idx) = handle else {
+            return Err(SealedFactError::LiveUnit { unit_idx: idx });
+        };
+        let sealed = &self.scan.sealed[sealed_idx];
+        let file = self
+            .dir
+            .open_sealed(sealed)
+            .map_err(ReadError::Io)
+            .map_err(BuildError::from)?;
+        let unit = PgmUnit::open(file).map_err(BuildError::from)?;
+        if unit.catalog() != &sealed.catalog {
+            return Err(SealedFactError::StaleSnapshot { unit_idx: idx });
+        }
+        store
+            .load_or_build(&unit, context, bounds)
+            .map_err(Into::into)
     }
 
     /// Decode one section from the unit at position `idx` in `units()`.
@@ -456,11 +557,15 @@ impl LocalDirSnapshot {
 mod tests {
     use std::fs;
 
+    use kronika_analytics::overview::{NamingContractId, SegmentLocator};
     use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
     use kronika_registry::Section;
+    use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::pg_log::PgLogLifecycleV1;
 
     use super::*;
+    use crate::{FactOrigin, LIMIT};
 
     /// Build one minimal valid part with a real section.
     fn make_part(min_ts: i64, max_ts: i64, source_id: u64) -> Vec<u8> {
@@ -490,6 +595,150 @@ mod tests {
         );
         buf.extend_from_slice(part_bytes);
         buf
+    }
+
+    fn lifecycle_part(source_id: u64) -> Vec<u8> {
+        let rows = [PgLogLifecycleV1 {
+            ts: Ts(1_500),
+            kind: 0,
+            pid: Some(42),
+            signal: Some(9),
+            shutdown_mode: None,
+            message: None,
+            query_detail: None,
+            dict_dropped_fields: 0,
+        }];
+        let body = PgLogLifecycleV1::encode(&rows).expect("encode lifecycle");
+        build_part(
+            &[SectionInput {
+                type_id: 1_028_001,
+                rows: 1,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: 1_500,
+                max_ts: 1_500,
+                source_id,
+            },
+        )
+    }
+
+    fn fact_context() -> SegmentContext {
+        SegmentContext::new(
+            b"snapshot-store".to_vec(),
+            NamingContractId([0x11; 16]),
+            SegmentLocator([0x22; 32]),
+        )
+        .expect("valid context")
+    }
+
+    #[test]
+    fn sealed_snapshot_cache_hit_after_reopen_reads_no_pgm_bodies() {
+        let source = tempfile::tempdir().expect("source directory");
+        let cache = tempfile::tempdir().expect("cache directory");
+        fs::write(source.path().join("1500.pgm"), lifecycle_part(7)).expect("write segment");
+        let store = FactStore::new(cache.path());
+
+        let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
+        let cold = snapshot
+            .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+            .expect("cold facts");
+        assert_eq!(cold.origin(), FactOrigin::Rebuilt);
+        assert_eq!(cold.pgm_body_read_stats().read_calls, 1);
+
+        let restarted = LocalDirSnapshot::open(source.path()).expect("restart snapshot");
+        let warm = restarted
+            .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+            .expect("warm facts");
+        assert_eq!(warm.origin(), FactOrigin::CacheHit);
+        assert_eq!(warm.pgm_body_read_stats().read_calls, 0);
+        assert_eq!(warm.facts().observations(), cold.facts().observations());
+    }
+
+    #[test]
+    fn same_name_replacement_invalidates_pinned_snapshot() {
+        let source = tempfile::tempdir().expect("source directory");
+        let cache = tempfile::tempdir().expect("cache directory");
+        let path = source.path().join("1500.pgm");
+        fs::write(&path, lifecycle_part(7)).expect("write first segment");
+        let pinned = LocalDirSnapshot::open(source.path()).expect("open pinned snapshot");
+        let store = FactStore::new(cache.path());
+        pinned
+            .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+            .expect("first facts");
+
+        fs::write(&path, lifecycle_part(8)).expect("replace segment");
+        assert!(matches!(
+            pinned.load_sealed_facts(0, &store, &fact_context(), &LIMIT),
+            Err(SealedFactError::StaleSnapshot { unit_idx: 0 })
+        ));
+
+        let refreshed = LocalDirSnapshot::open(source.path()).expect("refresh snapshot");
+        let replacement = refreshed
+            .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+            .expect("replacement facts");
+        assert_eq!(replacement.facts().identity().pgm_source_id, 8);
+        assert_eq!(replacement.origin(), FactOrigin::Rebuilt);
+    }
+
+    #[test]
+    fn removed_source_is_not_resurrected_by_an_orphan_fact_file() {
+        let source = tempfile::tempdir().expect("source directory");
+        let cache = tempfile::tempdir().expect("cache directory");
+        let path = source.path().join("1500.pgm");
+        fs::write(&path, lifecycle_part(7)).expect("write segment");
+        let store = FactStore::new(cache.path());
+        LocalDirSnapshot::open(source.path())
+            .expect("open snapshot")
+            .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+            .expect("build facts");
+        fs::remove_file(path).expect("remove authoritative segment");
+
+        let after_retention = LocalDirSnapshot::open(source.path()).expect("rescan source");
+        assert!(after_retention.units().is_empty());
+        assert!(matches!(
+            after_retention.load_sealed_facts(0, &store, &fact_context(), &LIMIT),
+            Err(SealedFactError::UnitOutOfRange { unit_idx: 0 })
+        ));
+        let orphan_exists = walk_files(cache.path())
+            .iter()
+            .any(|path| path.extension().and_then(|value| value.to_str()) == Some("ovf"));
+        assert!(
+            orphan_exists,
+            "source retention does not remove disposable cache files"
+        );
+    }
+
+    #[test]
+    fn active_part_is_rejected_by_sealed_fact_loader() {
+        let source = tempfile::tempdir().expect("source directory");
+        let cache = tempfile::tempdir().expect("cache directory");
+        fs::write(
+            source.path().join("active.parts"),
+            framed(&lifecycle_part(7)),
+        )
+        .expect("write active part");
+        let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
+        assert!(matches!(
+            snapshot.load_sealed_facts(0, &FactStore::new(cache.path()), &fact_context(), &LIMIT),
+            Err(SealedFactError::LiveUnit { unit_idx: 0 })
+        ));
+    }
+
+    fn walk_files(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut files = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).expect("walk cache") {
+                let path = entry.expect("cache entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
     }
 
     #[test]
@@ -849,8 +1098,8 @@ mod tests {
 
     use kronika_format::DictLimits;
     use kronika_registry::Cell;
+    use kronika_registry::StrId;
     use kronika_registry::pg_stat_archiver::PgStatArchiver;
-    use kronika_registry::{StrId, Ts};
     use kronika_writer::Interner;
     use kronika_writer::dict;
 

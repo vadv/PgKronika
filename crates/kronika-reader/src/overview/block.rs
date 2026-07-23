@@ -663,6 +663,36 @@ impl LossCoverageBlock {
         &self.known_gaps
     }
 
+    /// Whether this factor applies to the source.
+    #[must_use]
+    pub const fn applicability(&self) -> Applicability {
+        self.applicability
+    }
+
+    /// Provenance quality of the collection period.
+    #[must_use]
+    pub const fn period_quality(&self) -> PeriodQuality {
+        self.period_quality
+    }
+
+    /// Completeness of the source population.
+    #[must_use]
+    pub const fn source_completeness(&self) -> SourceCompleteness {
+        self.source_completeness
+    }
+
+    /// Exactness of retained values.
+    #[must_use]
+    pub const fn retained_exactness(&self) -> RetainedExactness {
+        self.retained_exactness
+    }
+
+    /// Meaning of the physical count.
+    #[must_use]
+    pub const fn physical_count(&self) -> PhysicalCountSemantics {
+        self.physical_count
+    }
+
     /// The proven lower bound on dropped records.
     #[must_use]
     pub const fn dropped_lower_bound(&self) -> u64 {
@@ -675,12 +705,29 @@ impl LossCoverageBlock {
     /// Returns [`BlockError`] for a truncated, out-of-order, out-of-bound,
     /// invalid-enum, or trailing-byte body.
     pub fn decode(body: &[u8], bounds: &Bounds) -> Result<Self, BlockError> {
+        let mut covered_budget = bounds.coverage_spans;
+        let mut gap_budget = bounds.coverage_spans;
+        Self::decode_with_span_budgets(body, bounds, &mut covered_budget, &mut gap_budget)
+    }
+
+    pub(super) fn decode_with_span_budgets(
+        body: &[u8],
+        bounds: &Bounds,
+        covered_budget: &mut u64,
+        gap_budget: &mut u64,
+    ) -> Result<Self, BlockError> {
         if !bounds.is_within_absolute_limits() || body.len() as u64 > bounds.decoded_block_len {
             return Err(BlockError::AboveBound);
         }
         let mut reader = ByteReader::new(body);
-        let covered = read_coverage(&mut reader, bounds.coverage_spans)?;
-        let known_gaps = read_coverage(&mut reader, bounds.coverage_spans)?;
+        let covered = read_coverage(&mut reader, *covered_budget)?;
+        *covered_budget = covered_budget
+            .checked_sub(covered.spans().len() as u64)
+            .ok_or(BlockError::AboveBound)?;
+        let known_gaps = read_coverage(&mut reader, *gap_budget)?;
+        *gap_budget = gap_budget
+            .checked_sub(known_gaps.spans().len() as u64)
+            .ok_or(BlockError::AboveBound)?;
         let applicability = applicability_from(reader.u8()?)?;
         let period_quality = period_quality_from(reader.u8()?)?;
         let source_completeness = source_completeness_from(reader.u8()?)?;

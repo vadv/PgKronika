@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
 use kronika_registry::{
@@ -16,6 +17,15 @@ use crate::{Dictionary, ReadError, Stored, decode_dictionary};
 
 /// Upper bound on the catalog block, checked before allocation.
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Completed PGM section-body I/O performed by one open unit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PgmBodyReadStats {
+    /// Number of section bodies read from the source.
+    pub read_calls: u64,
+    /// Stored section bytes read.
+    pub stored_bytes_read: u64,
+}
 
 /// One CRC-verified PGM section selected by catalog ordinal.
 pub struct OverviewSectionBody {
@@ -70,6 +80,8 @@ pub struct PgmUnit<R: kronika_format::ReadAt> {
     source_file_len: u64,
     tail_index_bytes: [u8; TAIL_INDEX_LEN],
     raw_catalog_bytes: Vec<u8>,
+    body_read_calls: AtomicU64,
+    body_bytes_read: AtomicU64,
 }
 
 impl<R: kronika_format::ReadAt> PgmUnit<R> {
@@ -87,6 +99,8 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             source_file_len: len,
             tail_index_bytes: opened.tail_index_bytes,
             raw_catalog_bytes: opened.raw_catalog_bytes,
+            body_read_calls: AtomicU64::new(0),
+            body_bytes_read: AtomicU64::new(0),
         })
     }
 
@@ -110,6 +124,15 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
     #[must_use]
     pub const fn source_file_len(&self) -> u64 {
         self.source_file_len
+    }
+
+    /// Completed section-body I/O since this unit was opened.
+    #[must_use]
+    pub fn body_read_stats(&self) -> PgmBodyReadStats {
+        PgmBodyReadStats {
+            read_calls: self.body_read_calls.load(Ordering::Relaxed),
+            stored_bytes_read: self.body_bytes_read.load(Ordering::Relaxed),
+        }
     }
 
     /// Reads one section by its segment-global catalog ordinal.
@@ -141,6 +164,50 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             descriptor,
             body,
         })
+    }
+
+    /// Reads, CRC-checks, and decodes one section without rereading its body.
+    ///
+    /// Returns the verified manifest descriptor with the named-cell rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for an invalid ordinal, unsafe length, I/O error,
+    /// CRC failure, typed decode failure, or row-count mismatch.
+    pub fn decode_overview_rows(
+        &self,
+        catalog_ordinal: u32,
+    ) -> Result<(crate::ManifestEntryDescriptor, Vec<Row>), ReadError> {
+        let index = usize::try_from(catalog_ordinal).map_err(|_error| {
+            ReadError::CatalogOrdinalOutOfRange {
+                ordinal: catalog_ordinal,
+            }
+        })?;
+        let entry = self
+            .catalog
+            .entries
+            .get(index)
+            .ok_or(ReadError::CatalogOrdinalOutOfRange {
+                ordinal: catalog_ordinal,
+            })?;
+        if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
+            return Err(ReadError::DictionarySection {
+                type_id: entry.type_id,
+            });
+        }
+        let verified = self.verified_body(entry)?;
+        let body = verified.clone().into_bytes();
+        let descriptor = crate::ManifestEntryDescriptor::from_verified(entry, body.as_ref());
+        let rows = decode_rows(entry.type_id, verified).map_err(ReadError::Codec)?;
+        let decoded = u64::try_from(rows.len()).map_err(|_error| ReadError::CounterOverflow)?;
+        if decoded != u64::from(entry.rows) {
+            return Err(ReadError::CatalogRowCountMismatch {
+                type_id: entry.type_id,
+                declared: entry.rows,
+                decoded,
+            });
+        }
+        Ok((descriptor, rows))
     }
 
     /// Read and decode one section by its catalog `entry`.
@@ -217,6 +284,16 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             .ok_or(ReadError::SectionTooLarge { len: entry.len })?;
         let mut body = vec![0_u8; len];
         self.reader.read_exact_at(&mut body, entry.offset)?;
+        self.body_read_calls
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_value| ReadError::CounterOverflow)?;
+        self.body_bytes_read
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(entry.len)
+            })
+            .map_err(|_value| ReadError::CounterOverflow)?;
         VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c).map_err(|source| {
             ReadError::Codec(CodecError::Section {
                 type_id: entry.type_id,
