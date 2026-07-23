@@ -50,6 +50,14 @@ pub(super) struct EventExtraction {
     pub known_gaps: Coverage,
     pub dropped_lower_bound: u64,
     pub pgm_body_read_stats: PgmBodyReadStats,
+    pub retained_text_bytes: u64,
+    pub dictionary_fingerprints: Vec<DictionaryFingerprint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DictionaryFingerprint {
+    pub str_id: u64,
+    pub context_id: DictionaryContextId,
 }
 
 struct PendingObservation {
@@ -61,12 +69,14 @@ struct PendingObservation {
 }
 
 struct TextBudget {
+    limit: u64,
     remaining: u64,
 }
 
 impl TextBudget {
     const fn new(bounds: &Bounds) -> Self {
         Self {
+            limit: bounds.decoded_block_len,
             remaining: bounds.decoded_block_len,
         }
     }
@@ -79,6 +89,10 @@ impl TextBudget {
         std::str::from_utf8(bytes)
             .map(Box::from)
             .map_err(|_error| BuildError::Source(SourceError::Corrupt))
+    }
+
+    const fn retained(&self) -> u64 {
+        self.limit - self.remaining
     }
 }
 
@@ -171,6 +185,7 @@ pub(super) fn extract_events<R: ReadAt>(
     if dictionary.values.len() != wanted.len() {
         return Err(BuildError::Source(SourceError::Corrupt));
     }
+    let dictionary_fingerprints = fingerprint_dictionary(&dictionary.values)?;
     pgm_body_read_stats.read_calls = pgm_body_read_stats
         .read_calls
         .checked_add(dictionary.stats.sections_read)
@@ -239,7 +254,32 @@ pub(super) fn extract_events<R: ReadAt>(
         known_gaps: Coverage::from_spans(known_gap_spans),
         dropped_lower_bound,
         pgm_body_read_stats,
+        retained_text_bytes: text_budget.retained(),
+        dictionary_fingerprints,
     })
+}
+
+pub(super) fn fingerprint_dictionary(
+    dictionary: &BTreeMap<u64, ResolvedPattern>,
+) -> Result<Vec<DictionaryFingerprint>, BuildError> {
+    dictionary
+        .iter()
+        .map(|(str_id, value)| {
+            let (bytes, full_len, truncated) = resolved_parts(value);
+            let entry = DictionaryContextEntry {
+                str_id: *str_id,
+                bytes,
+                full_len,
+                truncated,
+            };
+            let context_id =
+                dictionary_context_id(&[entry]).ok_or(BuildError::Source(SourceError::Corrupt))?;
+            Ok(DictionaryFingerprint {
+                str_id: *str_id,
+                context_id,
+            })
+        })
+        .collect()
 }
 
 fn estimated_row_bytes(row: &Row) -> Result<u64, BuildError> {

@@ -212,38 +212,73 @@ impl RawOracle for MemoryOracle {
         range: CoverageSpan,
         limits: OracleLimits,
     ) -> Result<OracleResult, OracleError> {
-        let mut observations =
-            Vec::with_capacity(self.observations.len().min(limits.max_observations));
-        for observation in &self.observations {
-            if !observation_in_range(observation, range) {
-                continue;
-            }
-            if observations.len() == limits.max_observations {
-                return Err(OracleError::LimitExceeded(OracleResource::Observations));
-            }
-            observations.push(observation.clone());
+        query_bounded(
+            &self.observations,
+            self.coverage.spans().iter().copied(),
+            range,
+            limits,
+        )
+    }
+}
+
+/// Queries borrowed canonical facts without cloning records above the output cap.
+///
+/// Exact duplicate IDs are collapsed. A conflicting duplicate is rejected.
+///
+/// # Errors
+///
+/// Returns [`OracleError`] when an output or count bound is exceeded or an ID
+/// collision is found.
+#[allow(
+    single_use_lifetimes,
+    reason = "anonymous lifetimes in impl Trait are not stable on the MSRV"
+)]
+pub fn query_bounded<'a>(
+    observations: impl IntoIterator<Item = &'a EventObservation>,
+    coverage_spans: impl IntoIterator<Item = CoverageSpan>,
+    range: CoverageSpan,
+    limits: OracleLimits,
+) -> Result<OracleResult, OracleError> {
+    let mut seen = BTreeMap::new();
+    for observation in observations {
+        if !observation_in_range(observation, range) {
+            continue;
         }
-        let counts = fold_counts(&observations, limits.count_limits)?;
-        let mut clipped =
-            Vec::with_capacity(self.coverage.spans().len().min(limits.max_coverage_spans));
-        for span in self.coverage.spans() {
-            let Some(span) = CoverageSpan::new(
-                span.start_us().max(range.start_us()),
-                span.end_us().min(range.end_us()),
-            ) else {
+        if let Some(existing) = seen.get(&observation.observation_id()) {
+            if *existing == observation {
                 continue;
-            };
-            if clipped.len() == limits.max_coverage_spans {
-                return Err(OracleError::LimitExceeded(OracleResource::CoverageSpans));
             }
+            return Err(OracleError::ObservationIdCollision);
+        }
+        if seen.len() == limits.max_observations {
+            return Err(OracleError::LimitExceeded(OracleResource::Observations));
+        }
+        seen.insert(observation.observation_id(), observation);
+    }
+
+    let mut selected: Vec<_> = seen.into_values().collect();
+    selected.sort_by(|left, right| EventObservation::canonical_cmp(left, right));
+    let observations: Vec<_> = selected.into_iter().cloned().collect();
+    let counts = fold_counts(&observations, limits.count_limits)?;
+
+    let mut clipped = Vec::new();
+    for span in coverage_spans {
+        if let Some(span) = CoverageSpan::new(
+            span.start_us().max(range.start_us()),
+            span.end_us().min(range.end_us()),
+        ) {
             clipped.push(span);
         }
-        Ok(OracleResult {
-            observations,
-            counts,
-            coverage: Coverage::from_spans(clipped),
-        })
     }
+    let coverage = Coverage::from_spans(clipped);
+    if coverage.spans().len() > limits.max_coverage_spans {
+        return Err(OracleError::LimitExceeded(OracleResource::CoverageSpans));
+    }
+    Ok(OracleResult {
+        observations,
+        counts,
+        coverage,
+    })
 }
 
 /// One semantic difference between two query paths.
