@@ -58,6 +58,26 @@ No-data states stay typed:
 An unchanged measured counter yields a real zero delta and rate. Diff does not
 bridge these no-data states and does not extrapolate across unsampled time.
 
+## Overview fact files
+
+`source_scope_id`, `SourceDescriptor`, `section_body_id`, and
+`dictionary_context_id` derive typed content identities from exact PGM
+metadata and retained values. `PgmUnit::read_overview_section` reads one
+catalog ordinal and verifies its CRC. `PgmUnit::resolve_overview_dictionary`
+reads only `dict.strings` and `dict.blobs`, retains requested IDs, and reports
+stored and decoded work.
+
+`FactFile::build` writes the canonical PGKOVF container. `FactFile::admit`
+validates the complete container, including physical layout, checksums,
+aggregate bounds, logical block contents, source provenance, and string
+references. `FactFileReader` reads the header and directory first, then
+CRC-checks only selected block bodies. `FactReadStats` exposes the resulting
+read calls and byte counts.
+
+All PGKOVF constructors and decoders enforce the absolute `LIMIT` values before
+large allocations. This crate does not publish, replace, delete, or rebuild
+fact files; it provides the codec and positional read primitives.
+
 ## Bounds and failures
 
 Catalogs are capped at 64 MiB. Registry limits cap each section at 8 MiB,
