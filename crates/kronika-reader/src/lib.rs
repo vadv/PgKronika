@@ -54,8 +54,9 @@ pub use query::{
     logical_section, section, section_with_limits, sections, sections_with_limits, select_gate,
 };
 pub use refresh::{
-    ByteRange, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor, PartId,
-    PartTransition, RefreshDelta, SegmentDescriptor, catalog_digest, classify_transition, part_id,
+    ByteRange, CatalogDigest, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor,
+    PartId, PartTransition, RefreshDelta, SegmentDescriptor, catalog_digest, classify_transition,
+    part_id,
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta};
 

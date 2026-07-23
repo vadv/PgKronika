@@ -127,6 +127,10 @@ pub struct LocalDirSnapshot {
     journal_identity: Option<JournalIdentity>,
     /// Sealed segment set captured at the last scan, for delta diffing.
     sealed_descriptors: Vec<SegmentDescriptor>,
+    /// Whether a delta consumer has received the current journal baseline.
+    delta_initialized: bool,
+    /// Unvalidated bytes after the current journal watermark.
+    tail_pending: Option<ByteRange>,
 }
 
 /// Why a sealed snapshot unit could not produce persistent overview facts.
@@ -193,10 +197,10 @@ impl LocalDirSnapshot {
     /// Returns an I/O error if the directory cannot be opened or scanned.
     pub fn open(root: &Path) -> io::Result<Self> {
         let dir = LocalDir::open(root)?;
-        let scan = dir.scan()?;
+        let (scan, journal_identity) = full_scan_consistent(&dir, root)?;
         let last_valid_len = scan.valid_len;
         let sealed_descriptors = sealed_descriptors(&scan);
-        let journal_identity = journal_identity(root);
+        let tail_pending = tail_pending(journal_identity, last_valid_len);
         Ok(Self {
             dir,
             scan,
@@ -206,6 +210,8 @@ impl LocalDirSnapshot {
             journal_generation: JournalGenerationId(0),
             journal_identity,
             sealed_descriptors,
+            delta_initialized: false,
+            tail_pending,
         })
     }
 
@@ -218,8 +224,8 @@ impl LocalDirSnapshot {
     ///
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh(&mut self) -> io::Result<()> {
-        self.scan = self.dir.scan()?;
-        self.last_valid_len = self.scan.valid_len;
+        let (scan, identity) = full_scan_consistent(&self.dir, &self.root)?;
+        self.install_baseline(scan, identity)?;
         Ok(())
     }
 
@@ -237,9 +243,8 @@ impl LocalDirSnapshot {
     ///
     /// Returns an I/O error if the directory cannot be re-scanned.
     pub fn refresh_incremental(&mut self) -> io::Result<()> {
-        let prev_active = std::mem::take(&mut self.scan.active);
-        self.scan = self.dir.scan_from(self.last_valid_len, prev_active)?;
-        self.last_valid_len = self.scan.valid_len;
+        let (scan, identity, _transition) = self.scan_incremental_consistent()?;
+        self.install_baseline(scan, identity)?;
         Ok(())
     }
 
@@ -258,29 +263,25 @@ impl LocalDirSnapshot {
     /// generation counter would overflow.
     pub fn refresh_incremental_delta(&mut self) -> io::Result<RefreshDelta> {
         let previous_valid_len = self.last_valid_len;
-        let previous_identity = self.journal_identity;
-        let previous_sealed = std::mem::take(&mut self.sealed_descriptors);
+        let previous_sealed = &self.sealed_descriptors;
         let previous_view_generation = self.view_generation;
+        let bootstrap = !self.delta_initialized;
 
-        self.refresh_incremental()?;
-        let current_identity = journal_identity(&self.root);
-        let new_valid_len = self.last_valid_len;
-
-        let transition =
-            classify_transition(previous_identity, current_identity, previous_valid_len);
+        let (mut scan, current_identity, transition) = self.scan_incremental_consistent()?;
+        let new_valid_len = scan.valid_len;
         let generation_id = if transition.preserves_generation() {
             self.journal_generation
         } else {
             JournalGenerationId(bump(self.journal_generation.0)?)
         };
 
-        let floor = if transition == PartTransition::Append {
+        let floor = if !bootstrap && transition == PartTransition::Append {
             previous_valid_len
         } else {
             0
         };
         let mut completed_parts = Vec::new();
-        for active in &self.scan.active {
+        for active in &scan.active {
             let offset = u64::try_from(active.part.offset)
                 .map_err(|_error| io::Error::other("journal part offset overflow"))?;
             if offset < floor {
@@ -296,31 +297,40 @@ impl LocalDirSnapshot {
             });
         }
 
-        let tail_pending = current_identity.and_then(|identity| {
-            (identity.len > new_valid_len).then_some(ByteRange {
-                start: new_valid_len,
-                end: identity.len,
-            })
-        });
+        let current_tail_pending = tail_pending(current_identity, new_valid_len);
+        if transition.preserves_generation() {
+            scan.damages =
+                merge_incremental_damages(&self.scan.damages, &scan.damages, previous_valid_len);
+        }
 
-        let current_sealed = sealed_descriptors(&self.scan);
-        let sealed_added = difference(&current_sealed, &previous_sealed);
-        let sealed_removed = difference(&previous_sealed, &current_sealed);
+        let current_sealed = sealed_descriptors(&scan);
+        let sealed_added = difference(&current_sealed, previous_sealed);
+        let sealed_removed = difference(previous_sealed, &current_sealed);
 
         let changed = !completed_parts.is_empty()
             || !sealed_added.is_empty()
             || !sealed_removed.is_empty()
-            || !transition.preserves_generation();
+            || !transition.preserves_generation()
+            || current_tail_pending != self.tail_pending
+            || scan.damages != self.scan.damages
+            || (bootstrap
+                && (current_tail_pending.is_some()
+                    || !scan.damages.is_empty()
+                    || !scan.active.is_empty()));
         let new_view_generation = if changed {
             bump(previous_view_generation)?
         } else {
             previous_view_generation
         };
 
+        self.scan = scan;
+        self.last_valid_len = new_valid_len;
         self.journal_generation = generation_id;
         self.journal_identity = current_identity;
         self.sealed_descriptors = current_sealed;
         self.view_generation = new_view_generation;
+        self.delta_initialized = true;
+        self.tail_pending = current_tail_pending;
 
         Ok(RefreshDelta {
             previous_view_generation,
@@ -333,10 +343,69 @@ impl LocalDirSnapshot {
                 new_valid_len,
                 completed_parts,
                 transition,
-                tail_pending,
+                tail_pending: current_tail_pending,
                 damages: self.scan.damages.clone(),
             },
         })
+    }
+
+    /// Scans from the current watermark when the journal identity permits it.
+    fn scan_incremental_consistent(
+        &self,
+    ) -> io::Result<(LocalScan, Option<JournalIdentity>, PartTransition)> {
+        let identity_before = journal_identity(&self.root)?;
+        let transition =
+            classify_transition(self.journal_identity, identity_before, self.last_valid_len);
+        let scan = if transition.preserves_generation() {
+            self.dir
+                .scan_from(self.last_valid_len, self.scan.active.clone())?
+        } else {
+            self.dir.scan()?
+        };
+        let identity_after = journal_identity(&self.root)?;
+        if identity_before == identity_after {
+            return Ok((scan, identity_after, transition));
+        }
+
+        let (scan, identity) = full_scan_consistent(&self.dir, &self.root)?;
+        let transition = classify_transition(self.journal_identity, identity, self.last_valid_len);
+        Ok((scan, identity, transition))
+    }
+
+    /// Installs a scan taken outside the delta API and resets delta delivery.
+    fn install_baseline(
+        &mut self,
+        scan: LocalScan,
+        identity: Option<JournalIdentity>,
+    ) -> io::Result<()> {
+        let transition = classify_transition(self.journal_identity, identity, self.last_valid_len);
+        let generation = if transition.preserves_generation() {
+            self.journal_generation
+        } else {
+            JournalGenerationId(bump(self.journal_generation.0)?)
+        };
+        let current_sealed = sealed_descriptors(&scan);
+        let current_tail_pending = tail_pending(identity, scan.valid_len);
+        let changed = !same_active_parts(&self.scan, &scan)
+            || current_sealed != self.sealed_descriptors
+            || scan.damages != self.scan.damages
+            || current_tail_pending != self.tail_pending
+            || !transition.preserves_generation();
+        let view_generation = if changed {
+            bump(self.view_generation)?
+        } else {
+            self.view_generation
+        };
+
+        self.last_valid_len = scan.valid_len;
+        self.scan = scan;
+        self.journal_identity = identity;
+        self.journal_generation = generation;
+        self.sealed_descriptors = current_sealed;
+        self.view_generation = view_generation;
+        self.delta_initialized = false;
+        self.tail_pending = current_tail_pending;
+        Ok(())
     }
 
     /// Current proven-continuous journal generation.
@@ -692,20 +761,56 @@ fn sealed_descriptors(scan: &LocalScan) -> Vec<SegmentDescriptor> {
         .collect()
 }
 
-/// Reads the observable identity of the `active.parts` journal file.
-///
-/// Returns `None` when the journal file is absent, which a refresh reads as an
-/// empty journal rather than an error.
-fn journal_identity(root: &Path) -> Option<JournalIdentity> {
-    let metadata = std::fs::metadata(root.join("active.parts")).ok()?;
-    let mtime_ns = i128::from(metadata.mtime())
-        .checked_mul(1_000_000_000)?
-        .checked_add(i128::from(metadata.mtime_nsec()))?;
-    Some(JournalIdentity {
+/// Performs a full scan while the journal identity remains stable.
+fn full_scan_consistent(
+    dir: &LocalDir,
+    root: &Path,
+) -> io::Result<(LocalScan, Option<JournalIdentity>)> {
+    for _attempt in 0..2 {
+        let identity_before = journal_identity(root)?;
+        let scan = dir.scan()?;
+        let identity_after = journal_identity(root)?;
+        if identity_before == identity_after {
+            return Ok((scan, identity_after));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "active.parts changed during two consecutive scans",
+    ))
+}
+
+/// Reads the observable identity of `active.parts`.
+fn journal_identity(root: &Path) -> io::Result<Option<JournalIdentity>> {
+    let metadata = match std::fs::metadata(root.join("active.parts")) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mtime_ns = timestamp_ns(metadata.mtime(), metadata.mtime_nsec())?;
+    let ctime_ns = timestamp_ns(metadata.ctime(), metadata.ctime_nsec())?;
+    Ok(Some(JournalIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
         len: metadata.len(),
         mtime_ns,
+        ctime_ns,
+    }))
+}
+
+fn timestamp_ns(seconds: i64, nanoseconds: i64) -> io::Result<i128> {
+    i128::from(seconds)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(nanoseconds)))
+        .ok_or_else(|| io::Error::other("filesystem timestamp overflow"))
+}
+
+fn tail_pending(identity: Option<JournalIdentity>, valid_len: u64) -> Option<ByteRange> {
+    identity.and_then(|identity| {
+        (identity.len > valid_len).then_some(ByteRange {
+            start: valid_len,
+            end: identity.len,
+        })
     })
 }
 
@@ -718,15 +823,53 @@ fn bump(value: u64) -> io::Result<u64> {
 
 /// Descriptors present in `left` but not in `right`, preserving `left` order.
 fn difference(left: &[SegmentDescriptor], right: &[SegmentDescriptor]) -> Vec<SegmentDescriptor> {
-    left.iter()
-        .filter(|descriptor| !right.contains(descriptor))
+    let mut remaining = std::collections::BTreeMap::<SegmentDescriptor, usize>::new();
+    for descriptor in right {
+        *remaining.entry(*descriptor).or_default() += 1;
+    }
+    let mut difference = Vec::new();
+    for descriptor in left {
+        match remaining.get_mut(descriptor) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => difference.push(*descriptor),
+        }
+    }
+    difference
+}
+
+fn merge_incremental_damages(
+    previous: &[DamageRegion],
+    current: &[DamageRegion],
+    previous_valid_len: u64,
+) -> Vec<DamageRegion> {
+    let mut merged: Vec<_> = previous
+        .iter()
         .copied()
-        .collect()
+        .filter(|damage| (damage.from as u128) < u128::from(previous_valid_len))
+        .collect();
+    for damage in current {
+        if !merged.contains(damage) {
+            merged.push(*damage);
+        }
+    }
+    merged.sort_by_key(|damage| damage.from);
+    merged
+}
+
+fn same_active_parts(previous: &LocalScan, current: &LocalScan) -> bool {
+    previous.active.len() == current.active.len()
+        && previous
+            .active
+            .iter()
+            .zip(&current.active)
+            .all(|(left, right)| left.part == right.part && left.catalog == right.catalog)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, FileTimes};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use kronika_analytics::overview::{NamingContractId, SegmentLocator};
     use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
@@ -1633,8 +1776,6 @@ mod tests {
         assert_eq!(OPEN_UNIT_CALLS.with(std::cell::Cell::get), 2);
     }
 
-    // ---- refresh_incremental_delta tests ----
-
     #[test]
     fn refresh_delta_reports_appended_part_as_completed_under_the_same_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1643,6 +1784,9 @@ mod tests {
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let generation_before = snap.journal_generation();
+        let initial = snap.refresh_incremental_delta().expect("initial delta");
+        assert_eq!(initial.journal.completed_parts.len(), 1);
+        assert_eq!(initial.journal.completed_parts[0].min_ts, 1000);
 
         let appended = framed(&make_part(3000, 4000, 1));
         let mut buf = fs::read(&journal_path).unwrap();
@@ -1669,6 +1813,8 @@ mod tests {
         fs::write(&journal_path, framed(&make_part(1000, 2000, 1))).unwrap();
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let initial = snap.refresh_incremental_delta().expect("initial delta");
+        assert_eq!(initial.journal.completed_parts.len(), 1);
         let mut buf = fs::read(&journal_path).unwrap();
         buf.extend_from_slice(&framed(&make_part(3000, 4000, 1)));
         fs::write(&journal_path, &buf).unwrap();
@@ -1714,6 +1860,8 @@ mod tests {
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
         let valid_before = snap.last_valid_len;
+        let initial = snap.refresh_incremental_delta().expect("initial delta");
+        assert_eq!(initial.journal.completed_parts.len(), 1);
 
         let full = framed(&make_part(3000, 4000, 1));
         let mut buf = base;
@@ -1747,11 +1895,91 @@ mod tests {
         .unwrap();
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let initial = snap.refresh_incremental_delta().expect("initial delta");
+        assert_eq!(initial.journal.completed_parts.len(), 1);
         fs::write(dir.path().join("0500.pgm"), make_part(500, 1000, 1)).unwrap();
 
         let delta = snap.refresh_incremental_delta().expect("delta");
         assert_eq!(delta.sealed_added.len(), 1);
         assert_eq!(delta.sealed_added[0].min_ts, 500);
         assert!(delta.sealed_removed.is_empty());
+    }
+
+    #[test]
+    fn first_delta_delivers_parts_found_during_open() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("active.parts"),
+            framed(&make_part(1000, 2000, 1)),
+        )
+        .unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let first = snap.refresh_incremental_delta().expect("first delta");
+        let second = snap.refresh_incremental_delta().expect("second delta");
+
+        assert_eq!(first.journal.completed_parts.len(), 1);
+        assert_eq!(first.journal.completed_parts[0].min_ts, 1000);
+        assert!(second.journal.completed_parts.is_empty());
+        assert_eq!(second.new_view_generation, first.new_view_generation);
+    }
+
+    #[test]
+    fn equal_length_rewrite_discards_the_cached_active_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        let first_part = framed(&make_part(1000, 2000, 1));
+        let replacement = framed(&make_part(3000, 4000, 1));
+        assert_eq!(first_part.len(), replacement.len());
+        fs::write(&journal_path, first_part).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        let initial = snap.refresh_incremental_delta().expect("initial delta");
+        let initial_generation = initial.journal.generation_id;
+
+        fs::write(&journal_path, replacement).unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&journal_path)
+            .unwrap();
+        file.set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+            .unwrap();
+
+        let delta = snap.refresh_incremental_delta().expect("replacement delta");
+        assert_eq!(delta.journal.transition, PartTransition::Uncertain);
+        assert_ne!(delta.journal.generation_id, initial_generation);
+        assert_eq!(delta.journal.completed_parts.len(), 1);
+        assert_eq!(delta.journal.completed_parts[0].min_ts, 3000);
+        assert_eq!(snap.units()[0].min_ts, 3000);
+    }
+
+    #[test]
+    fn failed_refresh_preserves_the_previous_delta_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("active.parts");
+        let mut bytes = framed(&make_part(1000, 2000, 1));
+        fs::write(&journal_path, &bytes).unwrap();
+
+        let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();
+        snap.refresh_incremental_delta().expect("initial delta");
+        bytes.extend_from_slice(&framed(&make_part(3000, 4000, 1)));
+        fs::write(&journal_path, bytes).unwrap();
+
+        let original_mode = fs::metadata(dir.path()).unwrap().permissions().mode();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0)).unwrap();
+        let failed = snap.refresh_incremental_delta();
+        fs::set_permissions(
+            dir.path(),
+            fs::Permissions::from_mode(original_mode & 0o7777),
+        )
+        .unwrap();
+
+        assert_eq!(
+            failed.expect_err("permission error").kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let recovered = snap.refresh_incremental_delta().expect("recovered delta");
+        assert_eq!(recovered.journal.completed_parts.len(), 1);
+        assert_eq!(recovered.journal.completed_parts[0].min_ts, 3000);
     }
 }

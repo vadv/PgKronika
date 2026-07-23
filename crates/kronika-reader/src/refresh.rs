@@ -1,23 +1,25 @@
-//! Semantic delta of one incremental store scan.
-//!
-//! A refresh reports more than a changed file length: it names the journal
-//! generation, the parts that completed since the last scan, the proven
-//! continuity class of the tail, any torn-tail bytes, and the sealed segments
-//! that appeared or disappeared. The live builder consumes this to fold each
-//! completed part exactly once and to decide when continuity is broken and a
-//! rebuild is required.
-//!
-//! [`classify_transition`] and [`part_id`] are pure: the scan-facing method on
-//! [`crate::LocalDirSnapshot`] captures file identity and calls them.
+//! Semantic deltas for incremental store scans.
 
 use kronika_format::{Catalog, DamageRegion};
+use sha2::{Digest as _, Sha256};
+
+const CATALOG_DIGEST_DOMAIN: &[u8] = b"pgk-overview-catalog-v1\0";
+
+/// SHA-256 identity of an offset-independent catalog descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CatalogDigest([u8; 32]);
+
+impl CatalogDigest {
+    /// Returns the digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// Monotone identifier of a proven-continuous journal generation.
 ///
-/// A new generation is minted whenever append continuity cannot be proven:
-/// device/inode replacement, truncation, or an equal-length rewrite. Within one
-/// generation a [`PartId`] is a stable idempotency key, so redelivering the same
-/// part does not fold it twice.
+/// A replacement, truncation, or unproven rewrite starts a new generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JournalGenerationId(pub u64);
 
@@ -47,9 +49,8 @@ impl PartTransition {
 
 /// Observable filesystem identity of the journal file at one scan.
 ///
-/// `mtime_ns` folds seconds and nanoseconds into one signed value so an
-/// equal-length rewrite that touches the modification time is distinguishable
-/// from a genuinely unchanged file.
+/// Nanosecond modification and metadata-change times distinguish an unchanged
+/// file from an equal-length in-place rewrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalIdentity {
     /// Backing device number.
@@ -60,6 +61,8 @@ pub struct JournalIdentity {
     pub len: u64,
     /// Modification time in nanoseconds since the Unix epoch.
     pub mtime_ns: i128,
+    /// Metadata-change time in nanoseconds since the Unix epoch.
+    pub ctime_ns: i128,
 }
 
 /// Idempotency key of one completed journal part within a generation.
@@ -75,8 +78,8 @@ pub struct PartId {
     pub frame_offset: u64,
     /// Length of the part body in bytes.
     pub body_len: u64,
-    /// CRC32C of the offset-independent catalog descriptor.
-    pub catalog_digest: u32,
+    /// SHA-256 identity of the offset-independent catalog descriptor.
+    pub catalog_digest: CatalogDigest,
 }
 
 /// A completed, CRC-valid part surfaced by a refresh.
@@ -94,9 +97,7 @@ pub struct PartDescriptor {
 
 /// Offset-independent identity of one sealed segment.
 ///
-/// Two segments compare equal when their content-derived catalog descriptors
-/// match, which lets a refresh report the sealed set difference without opening
-/// section bodies.
+/// The descriptor identifies catalog content, not a file path or section body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentDescriptor {
     /// Source identifier from the segment catalog.
@@ -105,8 +106,8 @@ pub struct SegmentDescriptor {
     pub min_ts: i64,
     /// Latest timestamp in the segment.
     pub max_ts: i64,
-    /// CRC32C of the offset-independent catalog descriptor.
-    pub catalog_digest: u32,
+    /// SHA-256 identity of the offset-independent catalog descriptor.
+    pub catalog_digest: CatalogDigest,
 }
 
 impl SegmentDescriptor {
@@ -199,13 +200,15 @@ pub const fn classify_transition(
             if current.len < previous_valid_len {
                 return PartTransition::Reset;
             }
-            if current.len > previous_valid_len {
+            if current.len > previous.len {
                 return PartTransition::Append;
             }
-            // Equal validated length under the same identity: only a byte-for-byte
-            // unchanged file proves an append; a rewrite that moves the mtime is
-            // not provably continuous.
-            if previous.mtime_ns == current.mtime_ns {
+            if current.len < previous.len {
+                return PartTransition::Uncertain;
+            }
+            // An equal-length change to either filesystem timestamp invalidates
+            // the cached prefix.
+            if previous.mtime_ns == current.mtime_ns && previous.ctime_ns == current.ctime_ns {
                 PartTransition::Append
             } else {
                 PartTransition::Uncertain
@@ -214,25 +217,27 @@ pub const fn classify_transition(
     }
 }
 
-/// Derives the offset-independent CRC32C digest of a part or segment catalog.
+/// Derives the offset-independent SHA-256 identity of a catalog.
 ///
 /// Section body offsets are excluded so a verbatim part keeps its digest after a
 /// seal that relocates bodies.
 #[must_use]
-pub fn catalog_digest(catalog: &Catalog) -> u32 {
-    let mut bytes = Vec::with_capacity(28 + catalog.entries.len() * 24);
-    bytes.extend_from_slice(&catalog.source_id.to_le_bytes());
-    bytes.extend_from_slice(&catalog.min_ts.to_le_bytes());
-    bytes.extend_from_slice(&catalog.max_ts.to_le_bytes());
-    bytes.extend_from_slice(&catalog.format_version.to_le_bytes());
+pub fn catalog_digest(catalog: &Catalog) -> CatalogDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(CATALOG_DIGEST_DOMAIN);
+    hasher.update(catalog.source_id.to_le_bytes());
+    hasher.update(catalog.min_ts.to_le_bytes());
+    hasher.update(catalog.max_ts.to_le_bytes());
+    hasher.update(catalog.format_version.to_le_bytes());
+    hasher.update((catalog.entries.len() as u128).to_le_bytes());
     for entry in &catalog.entries {
-        bytes.extend_from_slice(&entry.type_id.to_le_bytes());
-        bytes.extend_from_slice(&entry.flags.to_le_bytes());
-        bytes.extend_from_slice(&entry.len.to_le_bytes());
-        bytes.extend_from_slice(&entry.rows.to_le_bytes());
-        bytes.extend_from_slice(&entry.crc32c.to_le_bytes());
+        hasher.update(entry.type_id.to_le_bytes());
+        hasher.update(entry.flags.to_le_bytes());
+        hasher.update(entry.len.to_le_bytes());
+        hasher.update(entry.rows.to_le_bytes());
+        hasher.update(entry.crc32c.to_le_bytes());
     }
-    kronika_format::crc32c(&bytes)
+    CatalogDigest(hasher.finalize().into())
 }
 
 /// Derives the idempotency key of a completed part.
@@ -259,12 +264,13 @@ mod tests {
 
     use super::*;
 
-    fn identity(device: u64, inode: u64, len: u64, mtime_ns: i128) -> JournalIdentity {
+    fn identity(device: u64, inode: u64, len: u64, changed_ns: i128) -> JournalIdentity {
         JournalIdentity {
             device,
             inode,
             len,
-            mtime_ns,
+            mtime_ns: changed_ns,
+            ctime_ns: changed_ns,
         }
     }
 
@@ -330,6 +336,16 @@ mod tests {
     }
 
     #[test]
+    fn replacing_a_pending_tail_without_shrinking_the_valid_prefix_is_uncertain() {
+        let previous = identity(1, 2, 150, 10);
+        let current = identity(1, 2, 130, 20);
+        assert_eq!(
+            classify_transition(Some(previous), Some(current), 100),
+            PartTransition::Uncertain
+        );
+    }
+
+    #[test]
     fn a_changed_inode_at_the_same_length_is_a_replacement() {
         let previous = identity(1, 2, 100, 10);
         let replaced = identity(1, 9, 100, 10);
@@ -343,6 +359,19 @@ mod tests {
     fn an_equal_length_rewrite_that_moves_mtime_is_uncertain() {
         let previous = identity(1, 2, 100, 10);
         let rewritten = identity(1, 2, 100, 55);
+        assert_eq!(
+            classify_transition(Some(previous), Some(rewritten), 100),
+            PartTransition::Uncertain
+        );
+    }
+
+    #[test]
+    fn an_equal_length_rewrite_that_only_moves_ctime_is_uncertain() {
+        let previous = identity(1, 2, 100, 10);
+        let rewritten = JournalIdentity {
+            ctime_ns: 55,
+            ..previous
+        };
         assert_eq!(
             classify_transition(Some(previous), Some(rewritten), 100),
             PartTransition::Uncertain

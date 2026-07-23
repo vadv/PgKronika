@@ -376,12 +376,12 @@ pub fn reconcile_seal<R: ReadAt>(
 /// Two parts at different journal positions get different discriminators, so
 /// identical section bodies in different parts fold into distinct observation
 /// identities and neither is lost.
-fn part_discriminator(part_id: &PartId) -> [u8; 28] {
-    let mut bytes = [0_u8; 28];
+fn part_discriminator(part_id: &PartId) -> [u8; 56] {
+    let mut bytes = [0_u8; 56];
     bytes[0..8].copy_from_slice(&part_id.generation.0.to_le_bytes());
     bytes[8..16].copy_from_slice(&part_id.frame_offset.to_le_bytes());
     bytes[16..24].copy_from_slice(&part_id.body_len.to_le_bytes());
-    bytes[24..28].copy_from_slice(&part_id.catalog_digest.to_le_bytes());
+    bytes[24..56].copy_from_slice(part_id.catalog_digest.as_bytes());
     bytes
 }
 
