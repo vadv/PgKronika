@@ -20,6 +20,7 @@
 //! [`ReadError::StaleSnapshot`] as a refresh-and-retry signal; bounded query
 //! helpers perform a limited refresh retry and then expose the remaining gap.
 
+mod overview;
 mod query;
 mod snapshot;
 mod unit;
@@ -33,6 +34,14 @@ use mimalloc as _;
 
 pub use kronika_analytics::{DiffPoint, Reason, Scalar};
 pub use kronika_format::DamageRegion;
+pub use overview::{
+    BlockCodec, BlockContent, BlockDirectoryEntry, BlockError, BlockFlags, BlockKind, Bounds,
+    CacheReadError, CatalogEntryDescriptor, CounterSamplesBlock, DescriptorGap, EntityStateRecord,
+    EntityStatesBlock, EventObservationsBlock, FactFile, FactFileHeader, FactKeyPreimage,
+    GaugeSamplesBlock, HeaderIdentity, LIMIT, LossCoverageBlock, PersistError, PublishOutcome,
+    ResetMarker, ResetMarkersBlock, ResolvedPattern, SegmentContentDescriptor, SourceManifestBlock,
+    SourceScopePreimage, StringTableBlock, lineage_from_catalog, publish, resolve_targeted,
+};
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
     OutRow, QueryError, QueryLimits, SectionPage, SeriesDiff, SeriesValues, Value,

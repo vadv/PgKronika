@@ -1380,6 +1380,7 @@ dependencies = [
  "kronika-writer",
  "mimalloc",
  "parquet",
+ "proptest",
  "tempfile",
 ]
 

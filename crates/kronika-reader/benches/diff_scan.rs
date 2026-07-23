@@ -17,6 +17,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+// proptest is used by the lib's overview fuzz tests; anchored here so this
+// bench target does not trip `unused_crate_dependencies`.
+use proptest as _;
+
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_reader::{LocalDirSnapshot, OutRow, Value, diff_section, section, sections};
