@@ -117,7 +117,7 @@ crates.io.
 | [`kronika-writer`](crates/kronika-writer/) | Bounded section buffers, string interning, `active.parts`, and sealing. |
 | [`kronika-store`](crates/kronika-store/) | Read-only scan of a local segment directory and live journal. |
 | [`kronika-reader`](crates/kronika-reader/) | Verified section decode, snapshots, pagination, logical sections, gauges, and diffs. |
-| [`kronika-analytics`](crates/kronika-analytics/) | Source-independent counter-pair semantics and robust anomaly scoring. |
+| [`kronika-analytics`](crates/kronika-analytics/) | Source-independent counter, anomaly, and overview contract kernels. |
 | [`kronika-source-pg`](crates/kronika-source-pg/) | PostgreSQL queries and version-specific mapping into registry rows. |
 | [`kronika-source-os`](crates/kronika-source-os/) | Bounded Linux `/proc`, `/sys`, filesystem, process, and cgroup readers. |
 | [`kronika-source-log`](crates/kronika-source-log/) | Bounded stderr tailing, normalization, typed events, and gap reporting. |
