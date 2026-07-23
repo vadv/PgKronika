@@ -14,12 +14,15 @@ kronika-registry = { path = "../kronika-registry" }
 kronika-analytics = { path = "../kronika-analytics" }
 kronika-store = { path = "../kronika-store" }
 arrow-array = "55"
+arrow-schema = "55"
 parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 kronika-writer = { path = "../kronika-writer" }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
 mimalloc = { version = "0.1", features = ["override"] }
 
 [[bench]]
@@ -28,6 +31,10 @@ harness = false
 
 [[bench]]
 name = "diff_scan"
+harness = false
+
+[[bench]]
+name = "overview_codec"
 harness = false
 
 [lints]
