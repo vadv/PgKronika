@@ -17,10 +17,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-// proptest is used by the lib's overview fuzz tests; anchored here so this
-// bench target does not trip `unused_crate_dependencies`.
-use proptest as _;
-
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_reader::{LocalDirSnapshot, OutRow, Value, diff_section, section, sections};
@@ -28,13 +24,15 @@ use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 use kronika_registry::pg_stat_archiver::PgStatArchiver;
 use kronika_registry::{Section, Ts};
 
-// Dependencies the reader library pulls in but this bench does not touch; naming
-// them keeps `unused_crate_dependencies` quiet without editing the library.
+// Reader dependencies unused by this benchmark remain explicit lint anchors.
 use arrow_array as _;
+use arrow_schema as _;
 use kronika_analytics as _;
 use kronika_store as _;
 use kronika_writer as _;
 use parquet as _;
+use proptest as _;
+use sha2 as _;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

@@ -17,6 +17,49 @@ use crate::{Dictionary, ReadError, Stored, decode_dictionary};
 /// Upper bound on the catalog block, checked before allocation.
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 
+/// One CRC-verified PGM section selected by catalog ordinal.
+pub struct OverviewSectionBody {
+    catalog_ordinal: u32,
+    descriptor: crate::ManifestEntryDescriptor,
+    body: Bytes,
+}
+
+impl std::fmt::Debug for OverviewSectionBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverviewSectionBody")
+            .field("catalog_ordinal", &self.catalog_ordinal)
+            .field("descriptor", &self.descriptor)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
+impl OverviewSectionBody {
+    /// Segment-global catalog ordinal.
+    #[must_use]
+    pub const fn catalog_ordinal(&self) -> u32 {
+        self.catalog_ordinal
+    }
+
+    /// Catalog metadata and exact body identity.
+    #[must_use]
+    pub const fn descriptor(&self) -> crate::ManifestEntryDescriptor {
+        self.descriptor
+    }
+
+    /// CRC-verified section bytes.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        self.body.as_ref()
+    }
+
+    /// Consumes the wrapper and returns the verified bytes.
+    #[must_use]
+    pub fn into_body(self) -> Bytes {
+        self.body
+    }
+}
+
 /// A PGM container opened for reading over any [`kronika_format::ReadAt`] source.
 ///
 /// Works for sealed segment files (`File`) and in-memory journal parts (`&[u8]`).
@@ -24,6 +67,9 @@ const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 pub struct PgmUnit<R: kronika_format::ReadAt> {
     reader: R,
     catalog: Catalog,
+    source_file_len: u64,
+    tail_index_bytes: [u8; TAIL_INDEX_LEN],
+    raw_catalog_bytes: Vec<u8>,
 }
 
 impl<R: kronika_format::ReadAt> PgmUnit<R> {
@@ -34,14 +80,67 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
     /// Returns [`ReadError`] on I/O errors or invalid container framing.
     pub fn open(reader: R) -> Result<Self, ReadError> {
         let len = reader.byte_len()?;
-        let catalog = read_catalog(&reader, len)?;
-        Ok(Self { reader, catalog })
+        let opened = read_catalog_bytes(&reader, len)?;
+        Ok(Self {
+            reader,
+            catalog: opened.catalog,
+            source_file_len: len,
+            tail_index_bytes: opened.tail_index_bytes,
+            raw_catalog_bytes: opened.raw_catalog_bytes,
+        })
     }
 
     /// The container's end catalog.
     #[must_use]
     pub const fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Descriptor of the exact file length, tail index, and catalog bytes.
+    #[must_use]
+    pub fn source_descriptor(&self) -> crate::SourceDescriptor {
+        crate::SourceDescriptor::derive(
+            self.source_file_len,
+            &self.tail_index_bytes,
+            &self.raw_catalog_bytes,
+        )
+    }
+
+    /// Exact PGM file length used by [`Self::source_descriptor`].
+    #[must_use]
+    pub const fn source_file_len(&self) -> u64 {
+        self.source_file_len
+    }
+
+    /// Reads one section by its segment-global catalog ordinal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for an invalid ordinal, unsafe length, I/O error,
+    /// or body CRC mismatch.
+    pub fn read_overview_section(
+        &self,
+        catalog_ordinal: u32,
+    ) -> Result<OverviewSectionBody, ReadError> {
+        let index = usize::try_from(catalog_ordinal).map_err(|_error| {
+            ReadError::CatalogOrdinalOutOfRange {
+                ordinal: catalog_ordinal,
+            }
+        })?;
+        let entry = self
+            .catalog
+            .entries
+            .get(index)
+            .ok_or(ReadError::CatalogOrdinalOutOfRange {
+                ordinal: catalog_ordinal,
+            })?;
+        let body = self.verified_body(entry)?.into_bytes();
+        let descriptor = crate::ManifestEntryDescriptor::from_verified(entry, body.as_ref());
+        Ok(OverviewSectionBody {
+            catalog_ordinal,
+            descriptor,
+            body,
+        })
     }
 
     /// Read and decode one section by its catalog `entry`.
@@ -111,7 +210,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
     }
 
     /// Read and CRC-check a section body.
-    fn verified_body(&self, entry: &Entry) -> Result<VerifiedSection, ReadError> {
+    pub(crate) fn verified_body(&self, entry: &Entry) -> Result<VerifiedSection, ReadError> {
         let len = usize::try_from(entry.len)
             .ok()
             .filter(|&len| len <= MAX_SECTION_BYTES)
@@ -128,11 +227,16 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
     }
 }
 
-/// Read and decode the end catalog from a `ReadAt` source.
-pub(crate) fn read_catalog<R: kronika_format::ReadAt>(
+struct OpenedCatalog {
+    catalog: Catalog,
+    tail_index_bytes: [u8; TAIL_INDEX_LEN],
+    raw_catalog_bytes: Vec<u8>,
+}
+
+fn read_catalog_bytes<R: kronika_format::ReadAt>(
     reader: &R,
     len: u64,
-) -> Result<Catalog, ReadError> {
+) -> Result<OpenedCatalog, ReadError> {
     let tail_at = len
         .checked_sub(TAIL_INDEX_LEN as u64)
         .ok_or(ReadError::TooSmall { len })?;
@@ -178,7 +282,11 @@ pub(crate) fn read_catalog<R: kronika_format::ReadAt>(
             });
         }
     }
-    Ok(catalog)
+    Ok(OpenedCatalog {
+        catalog,
+        tail_index_bytes: tail_bytes,
+        raw_catalog_bytes: buf,
+    })
 }
 
 #[cfg(test)]
@@ -220,8 +328,35 @@ mod tests {
             .expect("open PgmUnit from file");
 
         assert_eq!(mem.catalog(), file.catalog());
+        assert_eq!(mem.source_descriptor(), file.source_descriptor());
+        assert_eq!(mem.source_file_len(), bytes.len() as u64);
+        let tail_start = bytes.len() - TAIL_INDEX_LEN;
+        let raw_tail: [u8; TAIL_INDEX_LEN] =
+            bytes[tail_start..].try_into().expect("tail index bytes");
+        let tail = TailIndex::decode(raw_tail).expect("tail index");
+        let catalog_start =
+            tail_start - usize::try_from(tail.catalog_len).expect("catalog length fits usize");
+        assert_eq!(
+            mem.source_descriptor(),
+            crate::SourceDescriptor::derive(
+                bytes.len() as u64,
+                &raw_tail,
+                &bytes[catalog_start..tail_start],
+            )
+        );
 
         let entry = &mem.catalog().entries[0];
+        let overview = mem.read_overview_section(0).expect("overview body");
+        assert_eq!(overview.catalog_ordinal(), 0);
+        assert_eq!(overview.body().len() as u64, entry.len);
+        assert_eq!(
+            overview.descriptor().section_body_id,
+            Some(crate::section_body_id(entry.type_id, overview.body()))
+        );
+        assert!(matches!(
+            mem.read_overview_section(1),
+            Err(ReadError::CatalogOrdinalOutOfRange { ordinal: 1 })
+        ));
         assert_eq!(
             mem.decode(entry).expect("decode mem").stats.rows,
             file.decode(entry).expect("decode file").stats.rows,
@@ -229,17 +364,22 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_body_fails_crc_before_decode() {
+    fn corrupt_overview_body_fails_crc_before_decode() {
         let mut bytes = a_part();
-        let off = bytes.len() / 2;
-        bytes[off] ^= 0xFF;
-        let unit = PgmUnit::open(bytes.as_slice());
-        // open may succeed (catalog at end, body is in the middle);
-        // decode must fail on CRC.
-        if let Ok(u) = unit {
-            let entry = &u.catalog().entries[0];
-            assert!(u.decode(entry).is_err(), "decode must fail on corrupt body");
-        }
-        // if open itself failed, that is also acceptable (catalog was corrupted)
+        let body_offset = {
+            let unit = PgmUnit::open(bytes.as_slice()).expect("open pristine part");
+            usize::try_from(unit.catalog().entries[0].offset).expect("body offset fits usize")
+        };
+        bytes[body_offset] ^= 0xFF;
+
+        let unit = PgmUnit::open(bytes.as_slice()).expect("body corruption leaves metadata valid");
+        assert!(matches!(
+            unit.read_overview_section(0),
+            Err(ReadError::Codec(_))
+        ));
+        assert!(matches!(
+            unit.decode(&unit.catalog().entries[0]),
+            Err(ReadError::Codec(_))
+        ));
     }
 }

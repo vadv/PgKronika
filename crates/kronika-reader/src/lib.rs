@@ -36,11 +36,13 @@ pub use kronika_analytics::{DiffPoint, Reason, Scalar};
 pub use kronika_format::DamageRegion;
 pub use overview::{
     BlockCodec, BlockContent, BlockDirectoryEntry, BlockError, BlockFlags, BlockKind, Bounds,
-    CacheReadError, CatalogEntryDescriptor, CounterSamplesBlock, DescriptorGap, EntityStateRecord,
-    EntityStatesBlock, EventObservationsBlock, FactFile, FactFileHeader, FactKeyPreimage,
-    GaugeSamplesBlock, HeaderIdentity, LIMIT, LossCoverageBlock, PersistError, PublishOutcome,
-    ResetMarker, ResetMarkersBlock, ResolvedPattern, SegmentContentDescriptor, SourceManifestBlock,
-    SourceScopePreimage, StringTableBlock, lineage_from_catalog, publish, resolve_targeted,
+    CacheReadError, CatalogEntryDescriptor, CounterSamplesBlock, DictionaryContextEntry,
+    EntityStateRecord, EntityStatesBlock, EventObservationsBlock, FactFile, FactFileHeader,
+    FactFileReader, FactReadStats, GaugeSamplesBlock, HeaderIdentity, LIMIT, LossCoverageBlock,
+    ManifestEntryDescriptor, ResetMarker, ResetMarkersBlock, ResolvedPattern, SourceDescriptor,
+    SourceManifestBlock, StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats,
+    dictionary_context_id, lineage_from_catalog, resolve_targeted, section_body_id,
+    source_scope_id,
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
@@ -50,23 +52,28 @@ pub use query::{
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, UnitMeta};
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::path::Path;
 
-use arrow_array::{Array, BinaryArray, BooleanArray, RecordBatch, UInt64Array};
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, RecordBatch, UInt64Array,
+};
+use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{Catalog, DecodeError, Entry};
 use kronika_registry::{
-    Bytes, CodecError, DICT_BLOBS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS, MAX_SECTION_ROWS,
+    Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS,
+    MAX_SECTION_ROWS,
 };
 use kronika_store::StoreError;
 
 pub use kronika_registry::{Cell, Row};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-pub use unit::PgmUnit;
+pub use unit::{OverviewSectionBody, PgmUnit};
 
 /// A sealed segment opened for reading.
 #[derive(Debug)]
@@ -133,6 +140,22 @@ pub enum ReadError {
         /// Index of the unit that triggered the staleness check.
         unit_idx: usize,
     },
+    /// A diagnostic byte, row, or operation counter overflowed.
+    CounterOverflow,
+    /// A requested segment-global catalog ordinal does not exist.
+    CatalogOrdinalOutOfRange {
+        /// Requested ordinal.
+        ordinal: u32,
+    },
+    /// Decoded dictionary rows disagree with their PGM catalog entry.
+    CatalogRowCountMismatch {
+        /// Dictionary section type.
+        type_id: u32,
+        /// Catalog-declared row count.
+        declared: u32,
+        /// Rows produced by the section decoder.
+        decoded: u64,
+    },
 }
 
 impl fmt::Display for ReadError {
@@ -166,6 +189,18 @@ impl fmt::Display for ReadError {
                     "unit {unit_idx}: active part changed since snapshot; call refresh()"
                 )
             }
+            Self::CounterOverflow => write!(f, "segment diagnostic counter overflow"),
+            Self::CatalogOrdinalOutOfRange { ordinal } => {
+                write!(f, "catalog ordinal {ordinal} is out of range")
+            }
+            Self::CatalogRowCountMismatch {
+                type_id,
+                declared,
+                decoded,
+            } => write!(
+                f,
+                "dictionary type {type_id} decoded {decoded} rows, but the catalog declares {declared}"
+            ),
         }
     }
 }
@@ -184,7 +219,10 @@ impl Error for ReadError {
             | Self::DictionarySection { .. }
             | Self::BadCatalogLen { .. }
             | Self::SectionTooLarge { .. }
-            | Self::StaleSnapshot { .. } => None,
+            | Self::StaleSnapshot { .. }
+            | Self::CounterOverflow
+            | Self::CatalogOrdinalOutOfRange { .. }
+            | Self::CatalogRowCountMismatch { .. } => None,
         }
     }
 }
@@ -316,6 +354,28 @@ pub(crate) fn decode_dictionary(
     body: Bytes,
     type_id: u32,
 ) -> Result<Vec<(u64, Stored)>, CodecError> {
+    decode_dictionary_selected(body, type_id, None, &LIMIT)
+        .map(|(entries, _rows, _decoded_bytes)| entries)
+}
+
+type DictionarySelection = (Vec<(u64, Stored)>, u64, u64);
+
+/// Decodes a dictionary section while copying only selected values.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass enforces cross-batch ordering and cumulative decode bounds"
+)]
+pub(crate) fn decode_dictionary_selected(
+    body: Bytes,
+    type_id: u32,
+    wanted: Option<&BTreeSet<u64>>,
+    bounds: &Bounds,
+) -> Result<DictionarySelection, CodecError> {
+    let is_blob = match type_id {
+        DICT_STRINGS_TYPE_ID => false,
+        DICT_BLOBS_TYPE_ID => true,
+        _ => return Err(CodecError::UnknownType { type_id }),
+    };
     let builder = ParquetRecordBatchReaderBuilder::try_new(body)?;
     let groups = builder.metadata().num_row_groups();
     if groups > MAX_ROW_GROUPS {
@@ -325,8 +385,8 @@ pub(crate) fn decode_dictionary(
         });
     }
     let claimed = builder.metadata().file_metadata().num_rows();
-    match usize::try_from(claimed) {
-        Ok(rows) if rows <= MAX_SECTION_ROWS => {}
+    let claimed_rows = match usize::try_from(claimed) {
+        Ok(rows) if rows <= MAX_SECTION_ROWS => rows,
         Ok(rows) => {
             return Err(CodecError::TooManyRows {
                 rows,
@@ -334,35 +394,150 @@ pub(crate) fn decode_dictionary(
             });
         }
         Err(_) => return Err(CodecError::InvalidRowCount { raw: claimed }),
+    };
+    let mut declared_decoded_bytes = 0_u64;
+    for row_group in builder.metadata().row_groups() {
+        for column in row_group.columns() {
+            let bytes = u64::try_from(column.uncompressed_size())
+                .map_err(|_error| CodecError::SchemaMismatch)?;
+            declared_decoded_bytes =
+                declared_decoded_bytes
+                    .checked_add(bytes)
+                    .ok_or(CodecError::SectionTooLarge {
+                        len: usize::MAX,
+                        max: usize::try_from(bounds.decoded_block_len).unwrap_or(usize::MAX),
+                    })?;
+        }
+    }
+    if declared_decoded_bytes > bounds.decoded_block_len {
+        return Err(CodecError::SectionTooLarge {
+            len: usize::try_from(declared_decoded_bytes).unwrap_or(usize::MAX),
+            max: usize::try_from(bounds.decoded_block_len).unwrap_or(usize::MAX),
+        });
+    }
+    if !dictionary_schema_matches(builder.schema(), is_blob) {
+        return Err(CodecError::SchemaMismatch);
     }
 
-    let is_blob = type_id == DICT_BLOBS_TYPE_ID;
     let value_column = if is_blob { "stored_bytes" } else { "bytes" };
     let mut out = Vec::new();
-    for batch in builder.build()? {
+    let mut rows_scanned = 0_u64;
+    let mut decoded_bytes = 0_u64;
+    let mut previous_id = None;
+    for batch in builder.with_batch_size(4_096).build()? {
         let batch = batch?;
+        rows_scanned =
+            rows_scanned
+                .checked_add(batch.num_rows() as u64)
+                .ok_or(CodecError::TooManyRows {
+                    rows: usize::MAX,
+                    max: MAX_SECTION_ROWS,
+                })?;
         let ids = u64_column(&batch, "str_id")?;
         let values = binary_column(&batch, value_column)?;
         if is_blob {
             let full_len = u64_column(&batch, "full_len")?;
             let truncated = bool_column(&batch, "truncated")?;
+            let full_sha256 = fixed_binary_column(&batch, "full_sha256")?;
             for row in 0..batch.num_rows() {
+                let str_id = ids.value(row);
+                if str_id == 0 || previous_id.is_some_and(|previous| str_id <= previous) {
+                    return Err(CodecError::SchemaMismatch);
+                }
+                previous_id = Some(str_id);
+                let bytes = values.value(row);
+                decoded_bytes = decoded_bytes.checked_add(bytes.len() as u64).ok_or(
+                    CodecError::SectionTooLarge {
+                        len: usize::MAX,
+                        max: usize::try_from(bounds.decoded_block_len).unwrap_or(usize::MAX),
+                    },
+                )?;
+                let full_len = full_len.value(row);
+                let truncated = truncated.value(row);
+                let has_full_hash = !full_sha256.is_null(row);
+                let valid_storage = if truncated {
+                    (bytes.len() as u64) < full_len && has_full_hash
+                } else {
+                    bytes.len() as u64 == full_len
+                        && !has_full_hash
+                        && kronika_format::StrId::of(bytes).map(kronika_format::StrId::get)
+                            == Some(str_id)
+                };
+                if !valid_storage {
+                    return Err(CodecError::SchemaMismatch);
+                }
+                if wanted.is_some_and(|wanted| !wanted.contains(&ids.value(row))) {
+                    continue;
+                }
                 out.push((
-                    ids.value(row),
+                    str_id,
                     Stored::Blob {
-                        bytes: values.value(row).to_vec(),
-                        full_len: full_len.value(row),
-                        truncated: truncated.value(row),
+                        bytes: bytes.to_vec(),
+                        full_len,
+                        truncated,
                     },
                 ));
             }
         } else {
             for row in 0..batch.num_rows() {
-                out.push((ids.value(row), Stored::String(values.value(row).to_vec())));
+                let str_id = ids.value(row);
+                if str_id == 0 || previous_id.is_some_and(|previous| str_id <= previous) {
+                    return Err(CodecError::SchemaMismatch);
+                }
+                previous_id = Some(str_id);
+                let bytes = values.value(row);
+                decoded_bytes = decoded_bytes.checked_add(bytes.len() as u64).ok_or(
+                    CodecError::SectionTooLarge {
+                        len: usize::MAX,
+                        max: usize::try_from(bounds.decoded_block_len).unwrap_or(usize::MAX),
+                    },
+                )?;
+                if kronika_format::StrId::of(bytes).map(kronika_format::StrId::get) != Some(str_id)
+                {
+                    return Err(CodecError::SchemaMismatch);
+                }
+                if wanted.is_some_and(|wanted| !wanted.contains(&ids.value(row))) {
+                    continue;
+                }
+                out.push((str_id, Stored::String(bytes.to_vec())));
             }
         }
+        if decoded_bytes > bounds.decoded_block_len {
+            return Err(CodecError::SectionTooLarge {
+                len: usize::try_from(decoded_bytes).unwrap_or(usize::MAX),
+                max: usize::try_from(bounds.decoded_block_len).unwrap_or(usize::MAX),
+            });
+        }
     }
-    Ok(out)
+    if rows_scanned != claimed_rows as u64 {
+        return Err(CodecError::SchemaMismatch);
+    }
+    Ok((out, rows_scanned, decoded_bytes))
+}
+
+fn dictionary_schema_matches(schema: &Schema, is_blob: bool) -> bool {
+    let fields = schema.fields();
+    if is_blob {
+        fields.len() == 5
+            && field_matches(&fields[0], "str_id", &DataType::UInt64, false)
+            && field_matches(&fields[1], "stored_bytes", &DataType::Binary, false)
+            && field_matches(&fields[2], "full_len", &DataType::UInt64, false)
+            && field_matches(&fields[3], "truncated", &DataType::Boolean, false)
+            && field_matches(
+                &fields[4],
+                "full_sha256",
+                &DataType::FixedSizeBinary(32),
+                true,
+            )
+    } else {
+        fields.len() == 2
+            && field_matches(&fields[0], "str_id", &DataType::UInt64, false)
+            && field_matches(&fields[1], "bytes", &DataType::Binary, false)
+    }
+}
+
+fn field_matches(field: &Field, name: &str, data_type: &DataType, nullable: bool) -> bool {
+    field.name() == name && field.data_type() == data_type && field.is_nullable() == nullable
 }
 
 fn u64_column<'a>(
@@ -396,6 +571,16 @@ fn bool_column<'a>(
         .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
         .ok_or(CodecError::ColumnType { name })?;
     reject_nulls(column, name).map(|()| column)
+}
+
+fn fixed_binary_column<'a>(
+    batch: &'a RecordBatch,
+    name: &'static str,
+) -> Result<&'a FixedSizeBinaryArray, CodecError> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
+        .ok_or(CodecError::ColumnType { name })
 }
 
 /// A dictionary column carries no `NULL`s.

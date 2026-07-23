@@ -157,6 +157,12 @@ impl SegmentIdentity {
     pub const fn quality(self) -> IdentityQuality {
         self.quality
     }
+
+    /// Source scope carried by this lineage.
+    #[must_use]
+    pub const fn source_scope_id(self) -> SourceScopeId {
+        self.source_scope_id
+    }
 }
 
 impl ObservationId {

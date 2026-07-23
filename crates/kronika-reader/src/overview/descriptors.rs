@@ -1,58 +1,38 @@
-//! Catalog-derived descriptors and the content-addressed identity preimages.
+//! Content-derived identities for overview facts.
 //!
-//! A segment's facts are named by identities that hash offset-independent
-//! catalog content: the section body descriptor, the segment lineage, the
-//! source scope, and the fact key. This module assembles the exact canonical
-//! preimage bytes for each identity from a real [`kronika_format::Catalog`],
-//! and derives the lineage through the analytics constructor that already owns
-//! the hash.
-//!
-//! # Reported gap
-//!
-//! The overview hash ([`kronika_analytics::overview`] domain-separated
-//! SHA-256) is private to analytics. Only [`SegmentIdentity`] and
-//! `EventObservation` expose public hashing constructors. Source scope,
-//! segment locator, section body, dictionary context, source descriptor, and
-//! fact key have no public constructor from their preimage. This module
-//! therefore produces their canonical preimage bytes and takes the already
-//! hashed 32-byte identities as opaque inputs where analytics cannot fold
-//! them. Folding those preimages must move into analytics before the reader
-//! can originate the identities itself.
+//! Namespace, section-body, and dictionary-value hashes include explicit
+//! length prefixes. Catalog entry descriptors omit offsets so resealing a
+//! verbatim section does not change its lineage.
 
 use kronika_analytics::overview::{
-    EXTRACTOR_SEMANTICS_VERSION, FACT_SCHEMA_VERSION, NamingContractId, REGISTRY_CONTRACT_VERSION,
-    SegmentIdentity, SegmentLineageId, SegmentLocator, SourceScopeId,
+    DictionaryContextId, NamingContractId, SectionBodyId, SegmentIdentity, SegmentLineageId,
+    SegmentLocator, SourceScopeId,
 };
 use kronika_format::{Catalog, Entry};
-
-/// The file kind stored in the fact-key preimage.
-const FILE_KIND_SEGMENT_FACTS: u16 = 1;
+use sha2::{Digest, Sha256};
 
 const SOURCE_SCOPE_TAG: &[u8] = b"pgk-overview-source-scope-v1";
 const CATALOG_DESCRIPTOR_TAG: &[u8] = b"pgk-pgm-catalog-descriptor-v1";
-const FACT_KEY_TAG: &[u8] = b"pgk-overview-fact-key-v1";
+const SECTION_BODY_TAG: &[u8] = b"pgk-overview-section-body-v1";
+const DICTIONARY_CONTEXT_TAG: &[u8] = b"pgk-overview-dictionary-context-v1";
 
 /// The offset-independent descriptor of one catalog entry.
-///
-/// It excludes the byte offset on purpose: the same section body keeps the
-/// same descriptor wherever it lands in the file, so lineage and body identity
-/// survive a verbatim reseal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogEntryDescriptor {
-    /// Section type and schema, from the registry `type_id`.
+    /// Registry type and layout identifier.
     pub type_id: u32,
-    /// Reserved catalog flags.
+    /// Catalog flags.
     pub flags: u32,
-    /// Section body length, bytes.
+    /// Section body length in bytes.
     pub body_len: u64,
-    /// Row or record count in the section.
+    /// Row count declared by the section.
     pub rows: u32,
     /// CRC32C of the section body.
     pub body_crc32c: u32,
 }
 
 impl CatalogEntryDescriptor {
-    /// Reads the offset-independent fields of a catalog entry.
+    /// Copies the offset-independent fields of a catalog entry.
     #[must_use]
     pub const fn of(entry: &Entry) -> Self {
         Self {
@@ -64,166 +44,159 @@ impl CatalogEntryDescriptor {
         }
     }
 
-    /// The canonical content-descriptor preimage bytes for this entry.
-    ///
-    /// This is the exact byte run hashed into a section body identity and,
-    /// for the first entry, into the segment lineage.
+    /// Encodes the descriptor in its canonical 24-byte representation.
     #[must_use]
-    pub fn content_descriptor(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(24);
-        out.extend_from_slice(&self.type_id.to_le_bytes());
-        out.extend_from_slice(&self.flags.to_le_bytes());
-        out.extend_from_slice(&self.body_len.to_le_bytes());
-        out.extend_from_slice(&self.rows.to_le_bytes());
-        out.extend_from_slice(&self.body_crc32c.to_le_bytes());
+    pub fn canonical_bytes(self) -> [u8; 24] {
+        let mut out = [0_u8; 24];
+        out[0..4].copy_from_slice(&self.type_id.to_le_bytes());
+        out[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        out[8..16].copy_from_slice(&self.body_len.to_le_bytes());
+        out[16..20].copy_from_slice(&self.rows.to_le_bytes());
+        out[20..24].copy_from_slice(&self.body_crc32c.to_le_bytes());
         out
     }
 }
 
-/// The inputs analytics still needs before the reader can hash an identity.
+/// Catalog metadata with an optional verified body identity.
 ///
-/// Each variant names an identity whose preimage this module builds but whose
-/// SHA-256 fold is not exposed by a public analytics constructor.
+/// The manifest records every catalog entry without reading unrelated bodies.
+/// A CRC-verified body adds its SHA-256 identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DescriptorGap {
-    /// No public constructor folds a source-scope preimage.
-    SourceScope,
-    /// No public constructor folds a sealed segment locator.
-    SegmentLocator,
-    /// No public constructor folds a section-body preimage.
-    SectionBody,
-    /// No public constructor folds a dictionary-context preimage.
-    DictionaryContext,
-    /// No public constructor folds a source-descriptor preimage.
-    SourceDescriptor,
-    /// No public constructor folds a fact-key preimage.
-    FactKey,
+pub struct ManifestEntryDescriptor {
+    /// Offset-independent catalog fields.
+    pub catalog: CatalogEntryDescriptor,
+    /// SHA-256 identity when the section body was read and verified.
+    pub section_body_id: Option<SectionBodyId>,
 }
 
-/// The canonical source-scope preimage `tag || namespace || source_id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceScopePreimage {
-    bytes: Vec<u8>,
-}
-
-impl SourceScopePreimage {
-    /// Builds the preimage from the store namespace and PGM source ID.
+impl ManifestEntryDescriptor {
+    /// Copies catalog metadata without claiming that the body was read.
     #[must_use]
-    pub fn new(normalized_store_namespace: &[u8], pgm_source_id: u64) -> Self {
-        let mut bytes =
-            Vec::with_capacity(SOURCE_SCOPE_TAG.len() + normalized_store_namespace.len() + 8);
-        bytes.extend_from_slice(SOURCE_SCOPE_TAG);
-        bytes.extend_from_slice(normalized_store_namespace);
-        bytes.extend_from_slice(&pgm_source_id.to_le_bytes());
-        Self { bytes }
+    pub const fn from_catalog(entry: &Entry) -> Self {
+        Self {
+            catalog: CatalogEntryDescriptor::of(entry),
+            section_body_id: None,
+        }
     }
 
-    /// The preimage bytes a future analytics constructor would fold.
+    /// Builds an entry after the caller has CRC-verified `body`.
     #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// The unfolded identity: this reader cannot hash it yet.
-    #[must_use]
-    #[allow(
-        clippy::unused_self,
-        reason = "the gap names this preimage's identity, a property of the type"
-    )]
-    pub const fn gap(&self) -> DescriptorGap {
-        DescriptorGap::SourceScope
+    pub fn from_verified(entry: &Entry, body: &[u8]) -> Self {
+        Self {
+            catalog: CatalogEntryDescriptor::of(entry),
+            section_body_id: Some(section_body_id(entry.type_id, body)),
+        }
     }
 }
 
-/// The canonical PGM catalog descriptor preimage.
+/// SHA-256 descriptor of the exact PGM tail index and catalog.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceDescriptor(pub [u8; 32]);
+
+impl std::fmt::Debug for SourceDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceDescriptor(")?;
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl SourceDescriptor {
+    /// Derives a descriptor from the exact bytes read while opening a PGM.
+    #[must_use]
+    pub fn derive(source_file_len: u64, tail_index_bytes: &[u8], raw_catalog_bytes: &[u8]) -> Self {
+        Self(hash_parts(&[
+            CATALOG_DESCRIPTOR_TAG,
+            &source_file_len.to_le_bytes(),
+            tail_index_bytes,
+            raw_catalog_bytes,
+        ]))
+    }
+}
+
+/// One resolved dictionary value included in an observation identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DictionaryContextEntry<'a> {
+    /// Dictionary `str_id`.
+    pub str_id: u64,
+    /// Stored value bytes.
+    pub bytes: &'a [u8],
+    /// Full source length for a possibly truncated blob.
+    pub full_len: u64,
+    /// Whether `bytes` is a retained prefix.
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for DictionaryContextEntry<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DictionaryContextEntry")
+            .field("str_id", &self.str_id)
+            .field("stored_len", &self.bytes.len())
+            .field("full_len", &self.full_len)
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
+/// Derives a source scope from a stable namespace and the PGM source ID.
+#[must_use]
+pub fn source_scope_id(normalized_store_namespace: &[u8], pgm_source_id: u64) -> SourceScopeId {
+    SourceScopeId(hash_parts(&[
+        SOURCE_SCOPE_TAG,
+        &length_prefix(normalized_store_namespace),
+        normalized_store_namespace,
+        &pgm_source_id.to_le_bytes(),
+    ]))
+}
+
+/// Derives the identity of an exact section body.
+#[must_use]
+pub fn section_body_id(type_id: u32, body: &[u8]) -> SectionBodyId {
+    SectionBodyId(hash_parts(&[
+        SECTION_BODY_TAG,
+        &type_id.to_le_bytes(),
+        &length_prefix(body),
+        body,
+    ]))
+}
+
+/// Derives the identity of canonically ordered dictionary values for one row.
 ///
-/// It binds the descriptor to the exact file length, tail index, and raw
-/// catalog block, so ordinary replacement or corruption changes it without any
-/// body read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentContentDescriptor {
-    bytes: Vec<u8>,
+/// Returns `None` unless `str_id`s are strictly increasing and each stored
+/// length matches its truncation flag and declared full length.
+#[must_use]
+pub fn dictionary_context_id(
+    entries: &[DictionaryContextEntry<'_>],
+) -> Option<DictionaryContextId> {
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].str_id >= pair[1].str_id)
+        || entries.iter().any(|entry| {
+            let stored_len = entry.bytes.len() as u64;
+            stored_len > entry.full_len
+                || (!entry.truncated && stored_len != entry.full_len)
+                || (entry.truncated && stored_len == entry.full_len)
+        })
+    {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(DICTIONARY_CONTEXT_TAG);
+    hasher.update((entries.len() as u64).to_le_bytes());
+    for entry in entries {
+        hasher.update(entry.str_id.to_le_bytes());
+        hasher.update(length_prefix(entry.bytes));
+        hasher.update(entry.bytes);
+        hasher.update(entry.full_len.to_le_bytes());
+        hasher.update([u8::from(entry.truncated)]);
+    }
+    Some(DictionaryContextId(hasher.finalize().into()))
 }
 
-impl SegmentContentDescriptor {
-    /// Builds the preimage from the file length, tail-index, and catalog bytes.
-    #[must_use]
-    pub fn new(source_file_len: u64, tail_index_bytes: &[u8], raw_catalog_bytes: &[u8]) -> Self {
-        let mut bytes = Vec::with_capacity(
-            CATALOG_DESCRIPTOR_TAG.len() + 8 + tail_index_bytes.len() + raw_catalog_bytes.len(),
-        );
-        bytes.extend_from_slice(CATALOG_DESCRIPTOR_TAG);
-        bytes.extend_from_slice(&source_file_len.to_le_bytes());
-        bytes.extend_from_slice(tail_index_bytes);
-        bytes.extend_from_slice(raw_catalog_bytes);
-        Self { bytes }
-    }
-
-    /// The preimage bytes a future analytics constructor would fold.
-    #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// The unfolded identity: this reader cannot hash it yet.
-    #[must_use]
-    #[allow(
-        clippy::unused_self,
-        reason = "the gap names this preimage's identity, a property of the type"
-    )]
-    pub const fn gap(&self) -> DescriptorGap {
-        DescriptorGap::SourceDescriptor
-    }
-}
-
-/// The canonical fact-key preimage that names a segment's fact file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FactKeyPreimage {
-    bytes: Vec<u8>,
-}
-
-impl FactKeyPreimage {
-    /// Builds the preimage from the scope, descriptor, and version axes.
-    ///
-    /// The `fact_schema`, `extractor`, and `registry` version axes come from
-    /// the analytics constants, so they cannot drift from the fact contract.
-    #[must_use]
-    pub fn new(source_scope_id: SourceScopeId, source_descriptor: [u8; 32]) -> Self {
-        let mut bytes = Vec::with_capacity(FACT_KEY_TAG.len() + 32 + 32 + 2 + 12);
-        bytes.extend_from_slice(FACT_KEY_TAG);
-        bytes.extend_from_slice(&source_scope_id.0);
-        bytes.extend_from_slice(&source_descriptor);
-        bytes.extend_from_slice(&FILE_KIND_SEGMENT_FACTS.to_le_bytes());
-        bytes.extend_from_slice(&FACT_SCHEMA_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&EXTRACTOR_SEMANTICS_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&REGISTRY_CONTRACT_VERSION.to_le_bytes());
-        Self { bytes }
-    }
-
-    /// The preimage bytes a future analytics constructor would fold.
-    #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// The unfolded identity: this reader cannot hash it yet.
-    #[must_use]
-    #[allow(
-        clippy::unused_self,
-        reason = "the gap names this preimage's identity, a property of the type"
-    )]
-    pub const fn gap(&self) -> DescriptorGap {
-        DescriptorGap::FactKey
-    }
-}
-
-/// Derives the segment lineage from a real catalog and its opaque scope inputs.
-///
-/// The lineage is the one identity M1 can originate: analytics folds it through
-/// [`SegmentIdentity::sealed`]. The first catalog entry supplies both the
-/// `first_entry_type` and its offset-independent content descriptor.
-///
-/// Returns `None` for a catalog with no entries, which cannot name a lineage.
+/// Derives a sealed segment lineage from its first catalog entry.
 #[must_use]
 pub fn lineage_from_catalog(
     catalog: &Catalog,
@@ -232,7 +205,7 @@ pub fn lineage_from_catalog(
     segment_locator: SegmentLocator,
 ) -> Option<SegmentLineageId> {
     let first = catalog.entries.first()?;
-    let descriptor = CatalogEntryDescriptor::of(first).content_descriptor();
+    let descriptor = CatalogEntryDescriptor::of(first).canonical_bytes();
     Some(
         SegmentIdentity::sealed(
             source_scope_id,
@@ -243,6 +216,18 @@ pub fn lineage_from_catalog(
         )
         .id(),
     )
+}
+
+const fn length_prefix(bytes: &[u8]) -> [u8; 8] {
+    (bytes.len() as u64).to_le_bytes()
+}
+
+fn hash_parts(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
@@ -261,62 +246,63 @@ mod tests {
     }
 
     #[test]
-    fn a_content_descriptor_ignores_the_byte_offset() {
-        let mut a = entry(1_022_001, 4_096, 12, 0xDEAD_BEEF);
-        let mut b = a;
-        a.offset = 12;
-        b.offset = 999_999;
+    fn catalog_entry_identity_does_not_depend_on_offset() {
+        let mut left = entry(1_022_001, 4_096, 12, 0xDEAD_BEEF);
+        let mut right = left;
+        left.offset = 12;
+        right.offset = 999_999;
         assert_eq!(
-            CatalogEntryDescriptor::of(&a).content_descriptor(),
-            CatalogEntryDescriptor::of(&b).content_descriptor(),
-            "offset must not change the descriptor"
+            CatalogEntryDescriptor::of(&left).canonical_bytes(),
+            CatalogEntryDescriptor::of(&right).canonical_bytes()
         );
     }
 
     #[test]
-    fn a_content_descriptor_reacts_to_every_retained_field() {
-        let base = CatalogEntryDescriptor::of(&entry(1, 2, 3, 4)).content_descriptor();
-        assert_ne!(
-            base,
-            CatalogEntryDescriptor::of(&entry(9, 2, 3, 4)).content_descriptor()
-        );
-        assert_ne!(
-            base,
-            CatalogEntryDescriptor::of(&entry(1, 9, 3, 4)).content_descriptor()
-        );
-        assert_ne!(
-            base,
-            CatalogEntryDescriptor::of(&entry(1, 2, 9, 4)).content_descriptor()
-        );
-        assert_ne!(
-            base,
-            CatalogEntryDescriptor::of(&entry(1, 2, 3, 9)).content_descriptor()
-        );
-        assert_eq!(base.len(), 24);
+    fn source_descriptor_binds_length_tail_and_catalog() {
+        let base = SourceDescriptor::derive(1_000, b"tail", b"catalog");
+        assert_ne!(base, SourceDescriptor::derive(1_001, b"tail", b"catalog"));
+        assert_ne!(base, SourceDescriptor::derive(1_000, b"TAIL", b"catalog"));
+        assert_ne!(base, SourceDescriptor::derive(1_000, b"tail", b"CATALOG"));
     }
 
     #[test]
-    fn preimages_are_domain_separated_and_bind_their_inputs() {
-        let scope = SourceScopePreimage::new(b"/srv/pgm", 7);
-        assert!(scope.bytes().starts_with(SOURCE_SCOPE_TAG));
-        assert_ne!(scope, SourceScopePreimage::new(b"/srv/pgm", 8));
-        assert_ne!(scope, SourceScopePreimage::new(b"/srv/other", 7));
-        assert_eq!(scope.gap(), DescriptorGap::SourceScope);
-
-        let descriptor = SegmentContentDescriptor::new(1_000, b"tail", b"catalog");
-        assert!(descriptor.bytes().starts_with(CATALOG_DESCRIPTOR_TAG));
-        assert_ne!(
-            descriptor,
-            SegmentContentDescriptor::new(1_001, b"tail", b"catalog")
-        );
-
-        let key = FactKeyPreimage::new(SourceScopeId([1; 32]), [2; 32]);
-        assert!(key.bytes().starts_with(FACT_KEY_TAG));
-        assert_ne!(key, FactKeyPreimage::new(SourceScopeId([9; 32]), [2; 32]));
+    fn source_scope_uses_unambiguous_namespace_encoding() {
+        assert_ne!(source_scope_id(b"ab", 7), source_scope_id(b"abc", 7));
+        assert_ne!(source_scope_id(b"ab", 7), source_scope_id(b"ab", 8));
     }
 
     #[test]
-    fn lineage_uses_the_first_entry_and_matches_the_analytics_constructor() {
+    fn section_body_identity_binds_type_length_and_bytes() {
+        let base = section_body_id(7, b"body");
+        assert_ne!(base, section_body_id(8, b"body"));
+        assert_ne!(base, section_body_id(7, b"body!"));
+    }
+
+    #[test]
+    fn dictionary_context_requires_canonical_order() {
+        let entries = [
+            DictionaryContextEntry {
+                str_id: 1,
+                bytes: b"one",
+                full_len: 3,
+                truncated: false,
+            },
+            DictionaryContextEntry {
+                str_id: 2,
+                bytes: b"tw",
+                full_len: 3,
+                truncated: true,
+            },
+        ];
+        let id = dictionary_context_id(&entries).expect("ordered context");
+        assert_ne!(id, DictionaryContextId([0; 32]));
+
+        let reversed = [entries[1], entries[0]];
+        assert_eq!(dictionary_context_id(&reversed), None);
+    }
+
+    #[test]
+    fn lineage_derivation_matches_segment_identity() {
         let catalog = Catalog {
             entries: vec![
                 entry(1_022_001, 4_096, 12, 0xABCD),
@@ -330,30 +316,9 @@ mod tests {
         let scope = SourceScopeId([3; 32]);
         let naming = NamingContractId([4; 16]);
         let locator = SegmentLocator([5; 32]);
-        let derived = lineage_from_catalog(&catalog, scope, naming, locator).expect("has entries");
-
-        let descriptor = CatalogEntryDescriptor::of(&catalog.entries[0]).content_descriptor();
+        let derived = lineage_from_catalog(&catalog, scope, naming, locator).expect("entry");
+        let descriptor = CatalogEntryDescriptor::of(&catalog.entries[0]).canonical_bytes();
         let expected = SegmentIdentity::sealed(scope, naming, locator, 1_022_001, &descriptor).id();
         assert_eq!(derived, expected);
-    }
-
-    #[test]
-    fn an_empty_catalog_names_no_lineage() {
-        let catalog = Catalog {
-            entries: vec![],
-            min_ts: 0,
-            max_ts: 0,
-            source_id: 0,
-            format_version: 1,
-        };
-        assert_eq!(
-            lineage_from_catalog(
-                &catalog,
-                SourceScopeId([0; 32]),
-                NamingContractId([0; 16]),
-                SegmentLocator([0; 32]),
-            ),
-            None
-        );
     }
 }

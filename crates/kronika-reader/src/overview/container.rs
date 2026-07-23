@@ -1,61 +1,47 @@
-//! The `PGKOVF` container: fixed header, block directory, and admission.
+//! Bounded `PGKOVF` framing, canonical block layout, and admission.
 //!
-//! The header is exactly 160 bytes and the directory entry exactly 64, both
-//! serialized field by field in little-endian order — never through native
-//! struct layout. Admission walks the format contract's ordered checks: header
-//! magic and CRC, checked directory arithmetic, directory CRC, expected
-//! identity, canonical layout with non-overlapping contiguous extents, per-block
-//! bounds, and per-block CRC. Any failure yields a typed [`CacheReadError`] so
-//! an untrusted file falls back to a raw rebuild instead of panicking.
-//!
-//! Physical admission stops at verified block bytes. Turning those bytes into
-//! logical facts is the block codec's job, because some blocks — observations —
-//! need the segment lineage as context.
+//! The fixed header and directory are serialized field by field in
+//! little-endian order. Full admission verifies physical framing and every
+//! known logical block. [`FactFileReader`] exposes the same metadata checks for
+//! positional sources and reads only requested block bodies.
+
+use std::collections::BTreeMap;
 
 use kronika_analytics::overview::{
     CONTAINER_VERSION, EXTRACTOR_SEMANTICS_VERSION, FACT_SCHEMA_VERSION, REGISTRY_CONTRACT_VERSION,
+    SegmentIdentity, SourceScopeId,
 };
-use kronika_format::crc32c;
+use kronika_format::{ReadAt, crc32c};
 
 use super::block::{
-    BlockCodec, BlockError, BlockFlags, BlockKind, CounterSamplesBlock, EntityStatesBlock,
-    GaugeSamplesBlock, LossCoverageBlock, ResetMarkersBlock, SourceManifestBlock, StringTableBlock,
+    BlockCodec, BlockError, BlockFlags, BlockKind, CounterSamplesBlock, EncodableBlock,
+    EntityStatesBlock, GaugeSamplesBlock, LossCoverageBlock, ResetMarkersBlock,
+    SourceManifestBlock, StringTableBlock,
 };
 use super::bytes::{ByteReader, ByteWriter};
+use super::descriptors::SourceDescriptor;
 use super::limits::Bounds;
 use super::observations::EventObservationsBlock;
 
-/// The container magic, `PGKOVF` padded to eight bytes.
 const MAGIC: [u8; 8] = *b"PGKOVF\0\0";
-/// The fixed header length.
 const HEADER_LEN: usize = 160;
-/// The fixed header length as the header's own `u16` field.
 const HEADER_LEN_U16: u16 = 160;
-/// The fixed header length as a `u64` offset.
 const HEADER_LEN_U64: u64 = 160;
-/// The fixed directory-entry length as the header's own `u16` field.
+const DIRECTORY_ENTRY_LEN: usize = 64;
 const DIRECTORY_ENTRY_LEN_U16: u16 = 64;
-/// The fixed directory-entry length as a `u64` stride.
-const DIRECTORY_ENTRY_LEN_U64: u64 = 64;
-/// The only file kind in version 1: sealed segment facts.
 const FILE_KIND_SEGMENT_FACTS: u16 = 1;
-/// The only descriptor kind in version 1: the PGM catalog descriptor.
 const DESCRIPTOR_KIND_CATALOG: u16 = 1;
-/// The block-schema version written for every block in version 1.
 const BLOCK_SCHEMA_VERSION: u16 = 1;
+const HEADER_CRC_OFFSET: usize = 156;
 
-/// The identity a reader expects a fact file to carry.
-///
-/// Admission compares every field against the header. A source-scope,
-/// descriptor, source-ID, range, format, or length mismatch is a wrong-source
-/// error; a fact-schema, extractor, or registry mismatch is incompatible.
+/// Source and compatibility identity serialized in a fact-file header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderIdentity {
     /// Logical fact-shape version.
     pub fact_schema_version: u32,
-    /// PGM-to-fact extraction and normalization version.
+    /// PGM-to-fact extraction version.
     pub extractor_semantics_version: u32,
-    /// Supported type and layout contract version.
+    /// Supported registry contract version.
     pub registry_contract_version: u32,
     /// PGM container version.
     pub source_format_version: u32,
@@ -68,13 +54,13 @@ pub struct HeaderIdentity {
     /// Exact PGM file length.
     pub source_file_len: u64,
     /// Dataset and deployment scope.
-    pub source_scope_id: [u8; 32],
-    /// Content-bound PGM descriptor.
-    pub source_descriptor: [u8; 32],
+    pub source_scope_id: SourceScopeId,
+    /// Content-derived PGM descriptor.
+    pub source_descriptor: SourceDescriptor,
 }
 
 impl HeaderIdentity {
-    /// Builds an identity whose version axes come from the analytics contract.
+    /// Builds an identity with version axes from the analytics contract.
     #[must_use]
     pub const fn from_current_contract(
         source_format_version: u32,
@@ -82,8 +68,8 @@ impl HeaderIdentity {
         source_min_ts_us: i64,
         source_max_ts_us: i64,
         source_file_len: u64,
-        source_scope_id: [u8; 32],
-        source_descriptor: [u8; 32],
+        source_scope_id: SourceScopeId,
+        source_descriptor: SourceDescriptor,
     ) -> Self {
         Self {
             fact_schema_version: FACT_SCHEMA_VERSION,
@@ -100,39 +86,39 @@ impl HeaderIdentity {
     }
 }
 
-/// The decoded fixed header.
+/// Decoded fixed header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FactFileHeader {
-    /// The identity fields the header carries.
+    /// Source and compatibility identity.
     pub identity: HeaderIdentity,
-    /// Offset of the block directory, always 160 in version 1.
+    /// Directory offset, fixed at 160 in version 1.
     pub directory_offset: u64,
-    /// Number of directory entries.
+    /// Directory entry count.
     pub directory_count: u32,
     /// Exact fact-file length.
     pub file_len: u64,
 }
 
-/// One decoded 64-byte block directory entry.
+/// Decoded 64-byte directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockDirectoryEntry {
     /// Stable block-kind code.
     pub block_kind: u32,
     /// Block schema version.
     pub block_schema_version: u16,
-    /// Parsed block flags.
+    /// Parsed flags.
     pub flags: BlockFlags,
-    /// Stable factor or source ID, or zero for segment-wide.
+    /// Stable factor or source ID, or zero for segment-wide data.
     pub logical_id: u32,
-    /// Absolute offset of the stored block bytes.
+    /// Absolute offset of stored bytes.
     pub offset: u64,
-    /// Stored block length, bytes.
+    /// Stored byte length.
     pub stored_len: u64,
-    /// Decoded block length, bytes.
+    /// Decoded byte length.
     pub decoded_len: u64,
     /// Logical item count.
     pub item_count: u32,
-    /// CRC32C of the stored block bytes.
+    /// CRC32C of stored bytes.
     pub block_crc32c: u32,
     /// Inclusive minimum item timestamp.
     pub min_ts_us: i64,
@@ -140,32 +126,40 @@ pub struct BlockDirectoryEntry {
     pub max_ts_us: i64,
 }
 
+/// Work performed by a positional fact-file read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FactReadStats {
+    /// Positional body or metadata reads.
+    pub read_calls: u64,
+    /// Stored bytes read.
+    pub stored_bytes_read: u64,
+    /// Declared decoded bytes for successfully read bodies.
+    pub decoded_bytes: u64,
+}
+
 /// Why a fact file could not be admitted.
 #[derive(Debug)]
 pub enum CacheReadError {
-    /// The fact file does not exist.
-    Missing,
-    /// The framing, versions, flags, or codec are from an unreadable contract.
+    /// A version, required schema, flag, or codec is unsupported.
     Incompatible,
-    /// A CRC, structure, order, or logical invariant failed.
+    /// CRC, layout, or logical validation failed.
     Corrupt,
-    /// The header identity does not match the expected source.
+    /// Header provenance differs from the expected source.
     WrongSource,
-    /// A safety bound was exceeded.
+    /// A hard safety limit was exceeded.
     Oversized,
-    /// A filesystem read failed.
+    /// A positional read failed.
     Io(std::io::Error),
 }
 
 impl std::fmt::Display for CacheReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Missing => write!(f, "fact file is missing"),
-            Self::Incompatible => write!(f, "fact file is from an unreadable contract"),
-            Self::Corrupt => write!(f, "fact file is corrupt"),
-            Self::WrongSource => write!(f, "fact file names a different source"),
-            Self::Oversized => write!(f, "fact file exceeds a safety bound"),
-            Self::Io(error) => write!(f, "fact file io: {error}"),
+            Self::Incompatible => f.write_str("fact file uses an incompatible contract"),
+            Self::Corrupt => f.write_str("fact file is corrupt"),
+            Self::WrongSource => f.write_str("fact file belongs to another source"),
+            Self::Oversized => f.write_str("fact file exceeds a safety limit"),
+            Self::Io(error) => write!(f, "fact file I/O: {error}"),
         }
     }
 }
@@ -174,18 +168,20 @@ impl std::error::Error for CacheReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Missing
-            | Self::Incompatible
-            | Self::Corrupt
-            | Self::WrongSource
-            | Self::Oversized => None,
+            Self::Incompatible | Self::Corrupt | Self::WrongSource | Self::Oversized => None,
         }
     }
 }
 
+impl From<std::io::Error> for CacheReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 impl From<BlockError> for CacheReadError {
-    fn from(value: BlockError) -> Self {
-        match value {
+    fn from(error: BlockError) -> Self {
+        match error {
             BlockError::AboveBound => Self::Oversized,
             BlockError::InvalidFlags => Self::Incompatible,
             BlockError::Truncated
@@ -200,37 +196,33 @@ impl From<BlockError> for CacheReadError {
     }
 }
 
-/// One canonical logical block, ready to be laid out in a fact file.
-///
-/// `EventFacts` carries no analytics type yet, so it is always an empty
-/// required block; see the module gap report.
+/// One logical block supplied to the canonical builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockContent {
-    /// The catalog inventory and source metadata.
+    /// Catalog inventory and source metadata.
     SourceManifest(Box<SourceManifestBlock>),
-    /// Retained observations.
+    /// Retained source observations.
     EventObservations(Box<EventObservationsBlock>),
-    /// Policy-neutral facts; empty until analytics defines the type.
+    /// Policy-neutral facts block; container version 1 requires an empty body.
     EventFacts,
-    /// Coverage and completeness quality.
+    /// Coverage and loss metadata.
     LossCoverage(Box<LossCoverageBlock>),
     /// Gauge samples.
     GaugeSamples(Box<GaugeSamplesBlock>),
     /// Counter samples.
     CounterSamples(Box<CounterSamplesBlock>),
-    /// Reset markers.
+    /// Counter reset markers.
     ResetMarkers(Box<ResetMarkersBlock>),
     /// Entity snapshots.
     EntityStates(Box<EntityStatesBlock>),
-    /// Retained text table.
+    /// Retained text and byte values.
     StringTable(Box<StringTableBlock>),
 }
 
 impl BlockContent {
-    /// The block kind.
+    /// Stable block kind.
     #[must_use]
     pub fn kind(&self) -> BlockKind {
-        use super::block::EncodableBlock;
         match self {
             Self::SourceManifest(block) => block.kind(),
             Self::EventObservations(block) => block.kind(),
@@ -244,121 +236,199 @@ impl BlockContent {
         }
     }
 
-    fn encoded(&self) -> (Vec<u8>, bool, u64, Option<(i64, i64)>) {
+    fn encoded(&self) -> EncodedBlock {
         match self {
-            Self::SourceManifest(block) => descriptor_of(block.as_ref()),
-            Self::EventObservations(block) => descriptor_of(block.as_ref()),
-            Self::EventFacts => (Vec::new(), true, 0, None),
-            Self::LossCoverage(block) => descriptor_of(block.as_ref()),
-            Self::GaugeSamples(block) => descriptor_of(block.as_ref()),
-            Self::CounterSamples(block) => descriptor_of(block.as_ref()),
-            Self::ResetMarkers(block) => descriptor_of(block.as_ref()),
-            Self::EntityStates(block) => descriptor_of(block.as_ref()),
-            Self::StringTable(block) => descriptor_of(block.as_ref()),
+            Self::SourceManifest(block) => encoded_block(block.as_ref()),
+            Self::EventObservations(block) => encoded_block(block.as_ref()),
+            Self::EventFacts => EncodedBlock {
+                body: Vec::new(),
+                sorted: true,
+                item_count: 0,
+                time_range: None,
+            },
+            Self::LossCoverage(block) => encoded_block(block.as_ref()),
+            Self::GaugeSamples(block) => encoded_block(block.as_ref()),
+            Self::CounterSamples(block) => encoded_block(block.as_ref()),
+            Self::ResetMarkers(block) => encoded_block(block.as_ref()),
+            Self::EntityStates(block) => encoded_block(block.as_ref()),
+            Self::StringTable(block) => encoded_block(block.as_ref()),
         }
     }
 }
 
-fn descriptor_of<B: super::block::EncodableBlock>(
-    block: &B,
-) -> (Vec<u8>, bool, u64, Option<(i64, i64)>) {
-    (
-        block.encode(),
-        block.canonically_sorted(),
-        block.item_count(),
-        block.time_range(),
-    )
+struct EncodedBlock {
+    body: Vec<u8>,
+    sorted: bool,
+    item_count: u64,
+    time_range: Option<(i64, i64)>,
 }
 
-/// A physically admitted fact file: verified header, directory, and block bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn encoded_block<B: EncodableBlock>(block: &B) -> EncodedBlock {
+    EncodedBlock {
+        body: block.encode(),
+        sorted: block.canonically_sorted(),
+        item_count: block.item_count(),
+        time_range: block.time_range(),
+    }
+}
+
+/// Fully admitted fact-file bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct FactFile {
     header: FactFileHeader,
     directory: Vec<BlockDirectoryEntry>,
-    bodies: Vec<Vec<u8>>,
+    bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for FactFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FactFile")
+            .field("header", &self.header)
+            .field("directory", &self.directory)
+            .field("stored_bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 impl FactFile {
-    /// The decoded header.
+    /// Decoded header.
     #[must_use]
     pub const fn header(&self) -> &FactFileHeader {
         &self.header
     }
 
-    /// The decoded directory.
+    /// Decoded directory.
     #[must_use]
     pub fn directory(&self) -> &[BlockDirectoryEntry] {
         &self.directory
     }
 
-    /// The verified stored bytes of the first block of `kind`, if present.
+    /// First admitted body of `kind`.
     #[must_use]
     pub fn block_body(&self, kind: BlockKind) -> Option<&[u8]> {
         self.directory
             .iter()
-            .position(|entry| entry.block_kind == kind.code())
-            .map(|index| self.bodies[index].as_slice())
+            .find(|entry| entry.block_kind == kind.code())
+            .and_then(|entry| {
+                let start = usize::try_from(entry.offset).ok()?;
+                let length = usize::try_from(entry.stored_len).ok()?;
+                let end = start.checked_add(length)?;
+                self.bytes.get(start..end)
+            })
     }
 
-    /// Builds a canonical fact file from a set of blocks.
+    /// Builds one canonical version-1 fact file.
     ///
-    /// Every required baseline kind is inserted empty when absent, so the
-    /// result always admits. Blocks are laid out contiguously in canonical
-    /// kind order after the directory.
+    /// `SOURCE_MANIFEST` is mandatory because its metadata must match the
+    /// header. Other missing baseline kinds are inserted as canonical empty
+    /// blocks.
     ///
     /// # Errors
-    /// Returns [`CacheReadError::Oversized`] when the block set, directory, or
-    /// file would exceed a safety bound.
+    ///
+    /// Returns [`CacheReadError`] for duplicate kinds, inconsistent source
+    /// metadata, or a safety-limit violation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixed header-directory-body assembly keeps offset and checksum state local"
+    )]
     pub fn build(
         identity: &HeaderIdentity,
         blocks: Vec<BlockContent>,
         bounds: &Bounds,
     ) -> Result<Vec<u8>, CacheReadError> {
+        validate_api_inputs(identity, bounds)?;
+
         let mut present = [false; BlockKind::ALL.len()];
-        let mut chosen: Vec<BlockContent> = Vec::with_capacity(BlockKind::ALL.len());
+        let mut selected = Vec::with_capacity(BlockKind::ALL.len());
         for block in blocks {
             let index = baseline_index(block.kind());
             if present[index] {
-                // One block per baseline kind in the version-1 builder.
                 return Err(CacheReadError::Corrupt);
             }
             present[index] = true;
-            chosen.push(block);
+            selected.push(block);
         }
-        for (index, &was_present) in present.iter().enumerate() {
+        if !present[baseline_index(BlockKind::SourceManifest)] {
+            return Err(CacheReadError::Corrupt);
+        }
+        let observation_strings = selected.iter().find_map(|block| match block {
+            BlockContent::EventObservations(observations) => {
+                Some(observations.string_table().clone())
+            }
+            _ => None,
+        });
+        if let Some(supplied) = selected.iter().find_map(|block| match block {
+            BlockContent::StringTable(strings) => Some(strings.as_ref()),
+            _ => None,
+        }) && observation_strings
+            .as_ref()
+            .is_some_and(|derived| derived != supplied)
+        {
+            return Err(CacheReadError::Corrupt);
+        }
+        for (index, was_present) in present.into_iter().enumerate() {
             if !was_present {
-                chosen.push(empty_block(BlockKind::ALL[index]));
+                let kind = BlockKind::ALL[index];
+                if kind == BlockKind::StringTable {
+                    selected.push(BlockContent::StringTable(Box::new(
+                        observation_strings
+                            .clone()
+                            .unwrap_or(StringTableBlock::new(Vec::new(), bounds)?),
+                    )));
+                } else {
+                    selected.push(empty_block(kind, bounds)?);
+                }
             }
         }
-        chosen.sort_by_key(|block| block.kind().code());
+        selected.sort_by_key(|block| block.kind().code());
 
-        let count = u32::try_from(chosen.len()).map_err(|_error| CacheReadError::Oversized)?;
-        if count == 0 || count > bounds.directory_entries {
-            return Err(CacheReadError::Oversized);
+        if let Some(BlockContent::SourceManifest(manifest)) = selected.first() {
+            verify_manifest_identity(manifest, identity)?;
+        } else {
+            return Err(CacheReadError::Corrupt);
         }
-        let directory_bytes = u64::from(count)
-            .checked_mul(DIRECTORY_ENTRY_LEN_U64)
+
+        let count = u32::try_from(selected.len()).map_err(|_error| CacheReadError::Oversized)?;
+        let directory_bytes = directory_bytes(count, bounds)?;
+        let mut offset = HEADER_LEN_U64
+            .checked_add(directory_bytes)
             .ok_or(CacheReadError::Oversized)?;
-        if directory_bytes > bounds.directory_bytes {
-            return Err(CacheReadError::Oversized);
-        }
-
-        let mut offset = HEADER_LEN_U64 + directory_bytes;
+        let mut decoded_sum = 0_u64;
         let mut directory = ByteWriter::new();
-        let mut body_bytes = ByteWriter::new();
-        for block in &chosen {
-            let (body, sorted, item_count, range) = block.encoded();
-            let stored_len = body.len() as u64;
+        let mut bodies = Vec::with_capacity(selected.len());
+
+        for block in &selected {
+            let encoded = block.encoded();
+            let stored_len = encoded.body.len() as u64;
             if stored_len > bounds.stored_block_len || stored_len > bounds.decoded_block_len {
                 return Err(CacheReadError::Oversized);
             }
+            decoded_sum = decoded_sum
+                .checked_add(stored_len)
+                .ok_or(CacheReadError::Oversized)?;
+            if decoded_sum > bounds.decoded_file_bytes {
+                return Err(CacheReadError::Oversized);
+            }
             let item_count =
-                u32::try_from(item_count).map_err(|_error| CacheReadError::Oversized)?;
-            let (min_ts, max_ts) =
-                range.unwrap_or((identity.source_min_ts_us, identity.source_max_ts_us));
+                u32::try_from(encoded.item_count).map_err(|_error| CacheReadError::Oversized)?;
+            if u64::from(item_count) > bounds.items_per_block {
+                return Err(CacheReadError::Oversized);
+            }
+            if (item_count == 0) != encoded.body.is_empty() {
+                return Err(CacheReadError::Corrupt);
+            }
+            let (min_ts_us, max_ts_us) = encoded.time_range.unwrap_or((0, 0));
+            if let Some((minimum, maximum)) = encoded.time_range
+                && (minimum > maximum
+                    || minimum < identity.source_min_ts_us
+                    || maximum > identity.source_max_ts_us)
+            {
+                return Err(CacheReadError::Corrupt);
+            }
             let flags = BlockFlags {
                 required_for_schema: true,
-                canonically_sorted: sorted,
+                canonically_sorted: encoded.sorted,
+                has_time_range: encoded.time_range.is_some(),
                 codec: BlockCodec::None,
             };
             write_directory_entry(
@@ -368,114 +438,273 @@ impl FactFile {
                 offset,
                 stored_len,
                 item_count,
-                crc32c(&body),
-                min_ts,
-                max_ts,
+                crc32c(&encoded.body),
+                min_ts_us,
+                max_ts_us,
             );
             offset = offset
                 .checked_add(stored_len)
                 .ok_or(CacheReadError::Oversized)?;
-            body_bytes.bytes(&body);
+            bodies.push(encoded.body);
         }
-        let file_len = offset;
-        if file_len > bounds.fact_file_len {
+        if offset > bounds.fact_file_len {
             return Err(CacheReadError::Oversized);
         }
 
         let directory = directory.into_bytes();
-        let directory_crc = crc32c(&directory);
-        let header = encode_header(identity, count, file_len, directory_crc);
-
-        let capacity = usize::try_from(file_len).map_err(|_error| CacheReadError::Oversized)?;
-        let mut out = Vec::with_capacity(capacity);
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&directory);
-        out.extend_from_slice(&body_bytes.into_bytes());
-        debug_assert_eq!(out.len(), capacity, "layout must match file_len");
-        Ok(out)
+        let header = encode_header(identity, count, offset, crc32c(&directory));
+        let capacity = usize::try_from(offset).map_err(|_error| CacheReadError::Oversized)?;
+        let mut output = Vec::with_capacity(capacity);
+        output.extend_from_slice(&header);
+        output.extend_from_slice(&directory);
+        for body in bodies {
+            output.extend_from_slice(&body);
+        }
+        if output.len() != capacity {
+            return Err(CacheReadError::Corrupt);
+        }
+        Ok(output)
     }
 
-    /// Admits fact-file bytes against an expected identity.
+    /// Admits complete bytes and validates all known logical blocks.
     ///
     /// # Errors
-    /// Returns [`CacheReadError`] for any framing, CRC, identity, bound, or
-    /// layout violation.
+    ///
+    /// Returns [`CacheReadError`] for physical corruption, incompatible
+    /// schemas, wrong provenance, unsafe lengths, or a logical block that
+    /// contradicts its directory metadata.
     pub fn admit(
         bytes: &[u8],
         expected: &HeaderIdentity,
+        lineage: &SegmentIdentity,
         bounds: &Bounds,
     ) -> Result<Self, CacheReadError> {
+        validate_api_inputs(expected, bounds)?;
+        if lineage.source_scope_id() != expected.source_scope_id {
+            return Err(CacheReadError::WrongSource);
+        }
         if bytes.len() as u64 > bounds.fact_file_len {
             return Err(CacheReadError::Oversized);
         }
         if bytes.len() < HEADER_LEN {
             return Err(CacheReadError::Corrupt);
         }
-        let (header, directory_crc32c) = decode_header(&bytes[..HEADER_LEN])?;
+        let (header, directory_crc) = decode_header(&bytes[..HEADER_LEN])?;
         verify_identity(&header.identity, expected)?;
-        if header.identity.source_min_ts_us > header.identity.source_max_ts_us {
-            return Err(CacheReadError::Corrupt);
-        }
         if header.file_len != bytes.len() as u64 {
             return Err(CacheReadError::Corrupt);
         }
-        if header.directory_offset != HEADER_LEN_U64 {
-            return Err(CacheReadError::Corrupt);
-        }
-        if header.directory_count == 0 || header.directory_count > bounds.directory_entries {
-            return Err(CacheReadError::Oversized);
-        }
-        let directory_bytes = u64::from(header.directory_count)
-            .checked_mul(DIRECTORY_ENTRY_LEN_U64)
-            .ok_or(CacheReadError::Oversized)?;
-        if directory_bytes > bounds.directory_bytes {
-            return Err(CacheReadError::Oversized);
-        }
-        let directory_end = (HEADER_LEN_U64)
-            .checked_add(directory_bytes)
-            .ok_or(CacheReadError::Oversized)?;
-        if directory_end > header.file_len {
-            return Err(CacheReadError::Corrupt);
-        }
+        let directory_end = checked_directory_end(&header, bounds)?;
         let directory_end_usize =
             usize::try_from(directory_end).map_err(|_error| CacheReadError::Corrupt)?;
-        let directory_slice = &bytes[HEADER_LEN..directory_end_usize];
-        if crc32c(directory_slice) != directory_crc32c {
+        let directory_bytes = &bytes[HEADER_LEN..directory_end_usize];
+        if crc32c(directory_bytes) != directory_crc {
             return Err(CacheReadError::Corrupt);
         }
-
-        let directory = decode_directory(directory_slice, header.directory_count, bounds)?;
-        verify_layout(&directory, directory_end, header.file_len, bounds)?;
-        verify_required_baseline(&directory)?;
+        let directory = decode_directory(directory_bytes, header.directory_count, bounds)?;
+        validate_directory(&directory, &header, directory_end, bounds)?;
 
         let mut bodies = Vec::with_capacity(directory.len());
         for entry in &directory {
             let start = usize::try_from(entry.offset).map_err(|_error| CacheReadError::Corrupt)?;
-            let stored =
+            let length =
                 usize::try_from(entry.stored_len).map_err(|_error| CacheReadError::Corrupt)?;
-            let end = start.checked_add(stored).ok_or(CacheReadError::Corrupt)?;
-            let body = &bytes[start..end];
+            let end = start.checked_add(length).ok_or(CacheReadError::Corrupt)?;
+            let body = bytes.get(start..end).ok_or(CacheReadError::Corrupt)?;
             if crc32c(body) != entry.block_crc32c {
                 return Err(CacheReadError::Corrupt);
             }
-            let flags = entry.flags;
-            if flags.codec != BlockCodec::None {
-                // Version 1 reads and writes only the identity codec; a
-                // compressed body is not decodable by this build.
-                return Err(CacheReadError::Incompatible);
-            }
-            if entry.stored_len != entry.decoded_len {
-                return Err(CacheReadError::Corrupt);
-            }
-            bodies.push(body.to_vec());
+            bodies.push(body);
         }
+        validate_logical_blocks(&directory, &bodies, &header.identity, lineage, bounds)?;
 
         Ok(Self {
             header,
             directory,
-            bodies,
+            bytes: bytes.to_vec(),
         })
     }
+}
+
+/// Metadata-admitted fact file over a positional byte source.
+#[derive(Debug)]
+pub struct FactFileReader<R: ReadAt> {
+    reader: R,
+    header: FactFileHeader,
+    directory: Vec<BlockDirectoryEntry>,
+    stats: FactReadStats,
+}
+
+impl<R: ReadAt> FactFileReader<R> {
+    /// Reads only the fixed header and bounded directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheReadError`] when metadata or source identity is invalid.
+    pub fn open(
+        reader: R,
+        expected: &HeaderIdentity,
+        bounds: &Bounds,
+    ) -> Result<Self, CacheReadError> {
+        validate_api_inputs(expected, bounds)?;
+        let file_len = reader.byte_len()?;
+        if file_len > bounds.fact_file_len {
+            return Err(CacheReadError::Oversized);
+        }
+        if file_len < HEADER_LEN_U64 {
+            return Err(CacheReadError::Corrupt);
+        }
+
+        let mut header_bytes = [0_u8; HEADER_LEN];
+        reader.read_exact_at(&mut header_bytes, 0)?;
+        let (header, directory_crc) = decode_header(&header_bytes)?;
+        verify_identity(&header.identity, expected)?;
+        if header.file_len != file_len {
+            return Err(CacheReadError::Corrupt);
+        }
+        let directory_end = checked_directory_end(&header, bounds)?;
+        let length = directory_end
+            .checked_sub(HEADER_LEN_U64)
+            .ok_or(CacheReadError::Corrupt)?;
+        let length = usize::try_from(length).map_err(|_error| CacheReadError::Oversized)?;
+        let mut directory_bytes = vec![0_u8; length];
+        reader.read_exact_at(&mut directory_bytes, HEADER_LEN_U64)?;
+        if crc32c(&directory_bytes) != directory_crc {
+            return Err(CacheReadError::Corrupt);
+        }
+        let directory = decode_directory(&directory_bytes, header.directory_count, bounds)?;
+        validate_directory(&directory, &header, directory_end, bounds)?;
+        let metadata_bytes = HEADER_LEN_U64
+            .checked_add(length as u64)
+            .ok_or(CacheReadError::Oversized)?;
+        Ok(Self {
+            reader,
+            header,
+            directory,
+            stats: FactReadStats {
+                read_calls: 2,
+                stored_bytes_read: metadata_bytes,
+                decoded_bytes: 0,
+            },
+        })
+    }
+
+    /// Decoded header.
+    #[must_use]
+    pub const fn header(&self) -> &FactFileHeader {
+        &self.header
+    }
+
+    /// Decoded directory.
+    #[must_use]
+    pub fn directory(&self) -> &[BlockDirectoryEntry] {
+        &self.directory
+    }
+
+    /// Current positional-read counters.
+    #[must_use]
+    pub const fn stats(&self) -> FactReadStats {
+        self.stats
+    }
+
+    /// Reads and CRC-checks every stored body of `kind`.
+    ///
+    /// Unknown or unselected bodies are not read. Call the corresponding
+    /// logical block decoder before using returned bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheReadError`] for an I/O error, CRC failure, or counter
+    /// overflow.
+    pub fn read_blocks(&mut self, kind: BlockKind) -> Result<Vec<Vec<u8>>, CacheReadError> {
+        self.read_matching_blocks(kind, None)
+    }
+
+    /// Reads blocks of `kind` that overlap the half-open range `[from, to)`.
+    ///
+    /// Non-temporal blocks are always selected. An empty or inverted query
+    /// range selects no temporal blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheReadError`] under the same conditions as
+    /// [`Self::read_blocks`].
+    pub fn read_blocks_in_range(
+        &mut self,
+        kind: BlockKind,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<Vec<u8>>, CacheReadError> {
+        self.read_matching_blocks(kind, Some((from, to)))
+    }
+
+    fn read_matching_blocks(
+        &mut self,
+        kind: BlockKind,
+        range: Option<(i64, i64)>,
+    ) -> Result<Vec<Vec<u8>>, CacheReadError> {
+        let selected: Vec<_> = self
+            .directory
+            .iter()
+            .copied()
+            .filter(|entry| entry.block_kind == kind.code())
+            .filter(|entry| {
+                range.is_none_or(|(from, to)| {
+                    !entry.flags.has_time_range
+                        || (from < to && entry.max_ts_us >= from && entry.min_ts_us < to)
+                })
+            })
+            .collect();
+        let mut bodies = Vec::with_capacity(selected.len());
+        for entry in selected {
+            let length =
+                usize::try_from(entry.stored_len).map_err(|_error| CacheReadError::Oversized)?;
+            let mut body = vec![0_u8; length];
+            if !body.is_empty() {
+                self.reader.read_exact_at(&mut body, entry.offset)?;
+                self.stats.read_calls = self
+                    .stats
+                    .read_calls
+                    .checked_add(1)
+                    .ok_or(CacheReadError::Oversized)?;
+                self.stats.stored_bytes_read = self
+                    .stats
+                    .stored_bytes_read
+                    .checked_add(entry.stored_len)
+                    .ok_or(CacheReadError::Oversized)?;
+            }
+            if crc32c(&body) != entry.block_crc32c {
+                return Err(CacheReadError::Corrupt);
+            }
+            self.stats.decoded_bytes = self
+                .stats
+                .decoded_bytes
+                .checked_add(entry.decoded_len)
+                .ok_or(CacheReadError::Oversized)?;
+            bodies.push(body);
+        }
+        Ok(bodies)
+    }
+}
+
+const fn validate_api_inputs(
+    identity: &HeaderIdentity,
+    bounds: &Bounds,
+) -> Result<(), CacheReadError> {
+    if !bounds.is_within_absolute_limits() {
+        return Err(CacheReadError::Oversized);
+    }
+    if identity.fact_schema_version != FACT_SCHEMA_VERSION
+        || identity.extractor_semantics_version != EXTRACTOR_SEMANTICS_VERSION
+        || identity.registry_contract_version != REGISTRY_CONTRACT_VERSION
+        || identity.source_format_version != kronika_format::FORMAT_VERSION
+    {
+        return Err(CacheReadError::Incompatible);
+    }
+    if identity.source_min_ts_us > identity.source_max_ts_us {
+        return Err(CacheReadError::Corrupt);
+    }
+    Ok(())
 }
 
 fn encode_header(
@@ -498,8 +727,8 @@ fn encode_header(
     writer.i64_le(identity.source_min_ts_us);
     writer.i64_le(identity.source_max_ts_us);
     writer.u64_le(identity.source_file_len);
-    writer.bytes(&identity.source_scope_id);
-    writer.bytes(&identity.source_descriptor);
+    writer.bytes(&identity.source_scope_id.0);
+    writer.bytes(&identity.source_descriptor.0);
     writer.u64_le(HEADER_LEN_U64);
     writer.u32_le(directory_count);
     writer.u16_le(DIRECTORY_ENTRY_LEN_U16);
@@ -507,21 +736,36 @@ fn encode_header(
     writer.u64_le(file_len);
     writer.u32_le(directory_crc32c);
     writer.u32_le(0);
+    let bytes = writer.into_bytes();
     let mut header = [0_u8; HEADER_LEN];
-    header.copy_from_slice(&writer.into_bytes());
-    let header_crc = crc32c(&header[..HEADER_LEN - 4]);
-    header[HEADER_LEN - 4..].copy_from_slice(&header_crc.to_le_bytes());
+    header.copy_from_slice(&bytes);
+    let checksum = crc32c(&header);
+    header[HEADER_CRC_OFFSET..].copy_from_slice(&checksum.to_le_bytes());
     header
 }
 
-/// Parses and CRC-checks the fixed header, returning it and the directory CRC.
 fn decode_header(bytes: &[u8]) -> Result<(FactFileHeader, u32), CacheReadError> {
+    if bytes.len() != HEADER_LEN {
+        return Err(CacheReadError::Corrupt);
+    }
+    let mut checksum_input = [0_u8; HEADER_LEN];
+    checksum_input.copy_from_slice(bytes);
+    let stored_checksum = u32::from_le_bytes(
+        bytes[HEADER_CRC_OFFSET..HEADER_LEN]
+            .try_into()
+            .map_err(|_error| CacheReadError::Corrupt)?,
+    );
+    checksum_input[HEADER_CRC_OFFSET..HEADER_LEN].fill(0);
+    if crc32c(&checksum_input) != stored_checksum {
+        return Err(CacheReadError::Corrupt);
+    }
+
     let mut reader = ByteReader::new(bytes);
     let magic: [u8; 8] = reader.array().map_err(|_error| CacheReadError::Corrupt)?;
     if magic != MAGIC {
         return Err(CacheReadError::Incompatible);
     }
-    let corrupt = |_error: super::bytes::ByteError| CacheReadError::Corrupt;
+    let corrupt = |_error| CacheReadError::Corrupt;
     let container_version = reader.u16_le().map_err(corrupt)?;
     let header_len = reader.u16_le().map_err(corrupt)?;
     let file_kind = reader.u16_le().map_err(corrupt)?;
@@ -542,21 +786,29 @@ fn decode_header(bytes: &[u8]) -> Result<(FactFileHeader, u32), CacheReadError> 
         source_min_ts_us: reader.i64_le().map_err(corrupt)?,
         source_max_ts_us: reader.i64_le().map_err(corrupt)?,
         source_file_len: reader.u64_le().map_err(corrupt)?,
-        source_scope_id: reader.array().map_err(corrupt)?,
-        source_descriptor: reader.array().map_err(corrupt)?,
+        source_scope_id: SourceScopeId(reader.array().map_err(corrupt)?),
+        source_descriptor: SourceDescriptor(reader.array().map_err(corrupt)?),
     };
+    if identity.fact_schema_version != FACT_SCHEMA_VERSION
+        || identity.extractor_semantics_version != EXTRACTOR_SEMANTICS_VERSION
+        || identity.registry_contract_version != REGISTRY_CONTRACT_VERSION
+        || identity.source_format_version != kronika_format::FORMAT_VERSION
+    {
+        return Err(CacheReadError::Incompatible);
+    }
     let directory_offset = reader.u64_le().map_err(corrupt)?;
     let directory_count = reader.u32_le().map_err(corrupt)?;
     let directory_entry_len = reader.u16_le().map_err(corrupt)?;
     let descriptor_kind = reader.u16_le().map_err(corrupt)?;
     let file_len = reader.u64_le().map_err(corrupt)?;
     let directory_crc32c = reader.u32_le().map_err(corrupt)?;
-    let stored_header_crc = reader.u32_le().map_err(corrupt)?;
+    let _header_crc32c = reader.u32_le().map_err(corrupt)?;
+    reader.finish().map_err(corrupt)?;
     if directory_entry_len != DIRECTORY_ENTRY_LEN_U16 || descriptor_kind != DESCRIPTOR_KIND_CATALOG
     {
         return Err(CacheReadError::Incompatible);
     }
-    if crc32c(&bytes[..HEADER_LEN - 4]) != stored_header_crc {
+    if identity.source_min_ts_us > identity.source_max_ts_us {
         return Err(CacheReadError::Corrupt);
     }
     Ok((
@@ -571,26 +823,54 @@ fn decode_header(bytes: &[u8]) -> Result<(FactFileHeader, u32), CacheReadError> 
 }
 
 fn verify_identity(
-    header: &HeaderIdentity,
+    actual: &HeaderIdentity,
     expected: &HeaderIdentity,
 ) -> Result<(), CacheReadError> {
-    if header.fact_schema_version != expected.fact_schema_version
-        || header.extractor_semantics_version != expected.extractor_semantics_version
-        || header.registry_contract_version != expected.registry_contract_version
+    if actual.fact_schema_version != expected.fact_schema_version
+        || actual.extractor_semantics_version != expected.extractor_semantics_version
+        || actual.registry_contract_version != expected.registry_contract_version
     {
         return Err(CacheReadError::Incompatible);
     }
-    if header.source_scope_id != expected.source_scope_id
-        || header.source_descriptor != expected.source_descriptor
-        || header.pgm_source_id != expected.pgm_source_id
-        || header.source_min_ts_us != expected.source_min_ts_us
-        || header.source_max_ts_us != expected.source_max_ts_us
-        || header.source_format_version != expected.source_format_version
-        || header.source_file_len != expected.source_file_len
+    if actual.source_scope_id != expected.source_scope_id
+        || actual.source_descriptor != expected.source_descriptor
+        || actual.pgm_source_id != expected.pgm_source_id
+        || actual.source_min_ts_us != expected.source_min_ts_us
+        || actual.source_max_ts_us != expected.source_max_ts_us
+        || actual.source_format_version != expected.source_format_version
+        || actual.source_file_len != expected.source_file_len
     {
         return Err(CacheReadError::WrongSource);
     }
     Ok(())
+}
+
+fn directory_bytes(count: u32, bounds: &Bounds) -> Result<u64, CacheReadError> {
+    if count == 0 || count > bounds.directory_entries {
+        return Err(CacheReadError::Oversized);
+    }
+    let bytes = u64::from(count)
+        .checked_mul(DIRECTORY_ENTRY_LEN as u64)
+        .ok_or(CacheReadError::Oversized)?;
+    if bytes > bounds.directory_bytes {
+        return Err(CacheReadError::Oversized);
+    }
+    Ok(bytes)
+}
+
+fn checked_directory_end(header: &FactFileHeader, bounds: &Bounds) -> Result<u64, CacheReadError> {
+    if header.directory_offset != HEADER_LEN_U64 {
+        return Err(CacheReadError::Corrupt);
+    }
+    let bytes = directory_bytes(header.directory_count, bounds)?;
+    let end = header
+        .directory_offset
+        .checked_add(bytes)
+        .ok_or(CacheReadError::Oversized)?;
+    if end > header.file_len {
+        return Err(CacheReadError::Corrupt);
+    }
+    Ok(end)
 }
 
 fn decode_directory(
@@ -598,8 +878,14 @@ fn decode_directory(
     count: u32,
     bounds: &Bounds,
 ) -> Result<Vec<BlockDirectoryEntry>, CacheReadError> {
+    let expected_len = usize::try_from(directory_bytes(count, bounds)?)
+        .map_err(|_error| CacheReadError::Oversized)?;
+    if bytes.len() != expected_len {
+        return Err(CacheReadError::Corrupt);
+    }
     let mut reader = ByteReader::new(bytes);
-    let mut entries = Vec::with_capacity(count as usize);
+    let capacity = usize::try_from(count).map_err(|_error| CacheReadError::Oversized)?;
+    let mut entries = Vec::with_capacity(capacity);
     for _ in 0..count {
         let block_kind = reader.u32_le().map_err(|_error| CacheReadError::Corrupt)?;
         let block_schema_version = reader.u16_le().map_err(|_error| CacheReadError::Corrupt)?;
@@ -617,17 +903,42 @@ fn decode_directory(
             return Err(CacheReadError::Corrupt);
         }
         let flags = BlockFlags::from_bits(raw_flags)?;
-        if BlockKind::from_code(block_kind).is_none() && flags.required_for_schema {
-            // An unknown required block makes the whole file incompatible.
+        if flags.codec != BlockCodec::None {
+            return Err(CacheReadError::Incompatible);
+        }
+        if let Some(kind) = BlockKind::from_code(block_kind) {
+            if block_schema_version != BLOCK_SCHEMA_VERSION {
+                return Err(CacheReadError::Incompatible);
+            }
+            if !flags.required_for_schema || flags.canonically_sorted != expected_sorted(kind) {
+                return Err(CacheReadError::Corrupt);
+            }
+        } else if flags.required_for_schema {
             return Err(CacheReadError::Incompatible);
         }
         if stored_len > bounds.stored_block_len || decoded_len > bounds.decoded_block_len {
             return Err(CacheReadError::Oversized);
         }
+        if stored_len != decoded_len {
+            return Err(CacheReadError::Corrupt);
+        }
         if u64::from(item_count) > bounds.items_per_block {
             return Err(CacheReadError::Oversized);
         }
-        if min_ts_us > max_ts_us {
+        if item_count == 0 {
+            if stored_len != 0
+                || decoded_len != 0
+                || flags.has_time_range
+                || min_ts_us != 0
+                || max_ts_us != 0
+            {
+                return Err(CacheReadError::Corrupt);
+            }
+        } else if flags.has_time_range {
+            if stored_len == 0 || min_ts_us > max_ts_us {
+                return Err(CacheReadError::Corrupt);
+            }
+        } else if stored_len == 0 || min_ts_us != 0 || max_ts_us != 0 {
             return Err(CacheReadError::Corrupt);
         }
         entries.push(BlockDirectoryEntry {
@@ -648,46 +959,216 @@ fn decode_directory(
     Ok(entries)
 }
 
-fn verify_layout(
+fn validate_directory(
     directory: &[BlockDirectoryEntry],
+    header: &FactFileHeader,
     directory_end: u64,
-    file_len: u64,
     bounds: &Bounds,
 ) -> Result<(), CacheReadError> {
-    let _ = bounds;
     let mut cursor = directory_end;
     let mut previous_order: Option<(u32, u32, i64)> = None;
+    let mut previous_range: BTreeMap<(u32, u32), Option<i64>> = BTreeMap::new();
+    let mut item_sums: BTreeMap<(u32, u32), u64> = BTreeMap::new();
+    let mut decoded_sum = 0_u64;
+
     for entry in directory {
         let order = (entry.block_kind, entry.logical_id, entry.min_ts_us);
-        if let Some(previous) = previous_order
-            && order <= previous
-        {
+        if previous_order.is_some_and(|previous| order <= previous) {
             return Err(CacheReadError::Corrupt);
         }
         previous_order = Some(order);
-        // Contiguous, non-overlapping extents with no gaps or trailing bytes.
         if entry.offset != cursor {
             return Err(CacheReadError::Corrupt);
         }
-        cursor = entry
-            .offset
+        cursor = cursor
             .checked_add(entry.stored_len)
             .ok_or(CacheReadError::Oversized)?;
-        if cursor > file_len {
+        if cursor > header.file_len {
+            return Err(CacheReadError::Corrupt);
+        }
+        decoded_sum = decoded_sum
+            .checked_add(entry.decoded_len)
+            .ok_or(CacheReadError::Oversized)?;
+        if decoded_sum > bounds.decoded_file_bytes {
+            return Err(CacheReadError::Oversized);
+        }
+        let key = (entry.block_kind, entry.logical_id);
+        let item_sum = item_sums.entry(key).or_default();
+        *item_sum = item_sum
+            .checked_add(u64::from(entry.item_count))
+            .ok_or(CacheReadError::Oversized)?;
+        if *item_sum > bounds.items_per_block {
+            return Err(CacheReadError::Oversized);
+        }
+        match previous_range.insert(key, entry.flags.has_time_range.then_some(entry.max_ts_us)) {
+            Some(Some(previous_max))
+                if !entry.flags.has_time_range || entry.min_ts_us <= previous_max =>
+            {
+                return Err(CacheReadError::Corrupt);
+            }
+            Some(None) => return Err(CacheReadError::Corrupt),
+            _ => {}
+        }
+        if entry.flags.has_time_range
+            && (entry.min_ts_us < header.identity.source_min_ts_us
+                || entry.max_ts_us > header.identity.source_max_ts_us)
+        {
             return Err(CacheReadError::Corrupt);
         }
     }
-    if cursor != file_len {
+    if cursor != header.file_len {
+        return Err(CacheReadError::Corrupt);
+    }
+    verify_required_baseline(directory)
+}
+
+fn verify_required_baseline(directory: &[BlockDirectoryEntry]) -> Result<(), CacheReadError> {
+    for kind in BlockKind::ALL {
+        let count = directory
+            .iter()
+            .filter(|entry| entry.block_kind == kind.code())
+            .count();
+        if count == 0 {
+            return Err(CacheReadError::Corrupt);
+        }
+        if matches!(
+            kind,
+            BlockKind::SourceManifest | BlockKind::EventFacts | BlockKind::StringTable
+        ) && count != 1
+        {
+            return Err(CacheReadError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn validate_logical_blocks(
+    directory: &[BlockDirectoryEntry],
+    bodies: &[&[u8]],
+    identity: &HeaderIdentity,
+    lineage: &SegmentIdentity,
+    bounds: &Bounds,
+) -> Result<(), CacheReadError> {
+    let manifest_index = directory
+        .iter()
+        .position(|entry| entry.block_kind == BlockKind::SourceManifest.code())
+        .ok_or(CacheReadError::Corrupt)?;
+    let manifest = SourceManifestBlock::decode(bodies[manifest_index], bounds)?;
+    verify_manifest_identity(&manifest, identity)?;
+    let strings_index = directory
+        .iter()
+        .position(|entry| entry.block_kind == BlockKind::StringTable.code())
+        .ok_or(CacheReadError::Corrupt)?;
+    let strings = StringTableBlock::decode(bodies[strings_index], bounds)?;
+    let mut referenced_strings = Vec::new();
+
+    for (entry, body) in directory.iter().zip(bodies) {
+        let Some(kind) = BlockKind::from_code(entry.block_kind) else {
+            continue;
+        };
+        let logical = match kind {
+            BlockKind::SourceManifest => logical_descriptor(&manifest),
+            BlockKind::EventObservations => {
+                let block = EventObservationsBlock::decode(body, lineage, &strings, bounds)?;
+                validate_observation_provenance(&block, &manifest)?;
+                referenced_strings.extend(block.string_table().values().iter().cloned());
+                logical_descriptor(&block)
+            }
+            BlockKind::EventFacts => {
+                if !body.is_empty() {
+                    return Err(CacheReadError::Corrupt);
+                }
+                LogicalDescriptor {
+                    sorted: true,
+                    item_count: 0,
+                    time_range: None,
+                }
+            }
+            BlockKind::LossCoverage => {
+                logical_descriptor(&LossCoverageBlock::decode(body, bounds)?)
+            }
+            BlockKind::GaugeSamples => {
+                logical_descriptor(&GaugeSamplesBlock::decode(body, bounds)?)
+            }
+            BlockKind::CounterSamples => {
+                logical_descriptor(&CounterSamplesBlock::decode(body, bounds)?)
+            }
+            BlockKind::ResetMarkers => {
+                logical_descriptor(&ResetMarkersBlock::decode(body, bounds)?)
+            }
+            BlockKind::EntityStates => {
+                logical_descriptor(&EntityStatesBlock::decode(body, bounds)?)
+            }
+            BlockKind::StringTable => logical_descriptor(&StringTableBlock::decode(body, bounds)?),
+        };
+        if logical.sorted != entry.flags.canonically_sorted
+            || logical.item_count != u64::from(entry.item_count)
+            || logical.time_range.is_some() != entry.flags.has_time_range
+        {
+            return Err(CacheReadError::Corrupt);
+        }
+        match logical.time_range {
+            Some((minimum, maximum))
+                if minimum != entry.min_ts_us || maximum != entry.max_ts_us =>
+            {
+                return Err(CacheReadError::Corrupt);
+            }
+            None if entry.min_ts_us != 0 || entry.max_ts_us != 0 => {
+                return Err(CacheReadError::Corrupt);
+            }
+            _ => {}
+        }
+    }
+    let referenced_strings = StringTableBlock::new(referenced_strings, bounds)?;
+    if referenced_strings != strings {
         return Err(CacheReadError::Corrupt);
     }
     Ok(())
 }
 
-fn verify_required_baseline(directory: &[BlockDirectoryEntry]) -> Result<(), CacheReadError> {
-    for kind in BlockKind::ALL {
-        if !directory
-            .iter()
-            .any(|entry| entry.block_kind == kind.code())
+struct LogicalDescriptor {
+    sorted: bool,
+    item_count: u64,
+    time_range: Option<(i64, i64)>,
+}
+
+fn logical_descriptor<B: EncodableBlock>(block: &B) -> LogicalDescriptor {
+    LogicalDescriptor {
+        sorted: block.canonically_sorted(),
+        item_count: block.item_count(),
+        time_range: block.time_range(),
+    }
+}
+
+fn verify_manifest_identity(
+    manifest: &SourceManifestBlock,
+    identity: &HeaderIdentity,
+) -> Result<(), CacheReadError> {
+    if manifest.source_id() != identity.pgm_source_id
+        || manifest.source_format_version() != identity.source_format_version
+        || manifest.source_time_range() != (identity.source_min_ts_us, identity.source_max_ts_us)
+        || manifest.source_file_len() != identity.source_file_len
+    {
+        return Err(CacheReadError::WrongSource);
+    }
+    Ok(())
+}
+
+fn validate_observation_provenance(
+    observations: &EventObservationsBlock,
+    manifest: &SourceManifestBlock,
+) -> Result<(), CacheReadError> {
+    for observation in observations.observations() {
+        let provenance = observation.provenance();
+        let ordinal = usize::try_from(provenance.catalog_entry_ordinal)
+            .map_err(|_error| CacheReadError::Corrupt)?;
+        let entry = manifest
+            .entries()
+            .get(ordinal)
+            .ok_or(CacheReadError::Corrupt)?;
+        if observation.source_type_id() != entry.catalog.type_id
+            || Some(provenance.section_body_id) != entry.section_body_id
+            || provenance.row_ordinal >= entry.catalog.rows
         {
             return Err(CacheReadError::Corrupt);
         }
@@ -695,9 +1176,13 @@ fn verify_required_baseline(directory: &[BlockDirectoryEntry]) -> Result<(), Cac
     Ok(())
 }
 
+fn expected_sorted(kind: BlockKind) -> bool {
+    kind != BlockKind::SourceManifest
+}
+
 #[allow(
     clippy::too_many_arguments,
-    reason = "the writer mirrors the fixed 64-byte directory entry"
+    reason = "arguments mirror the fixed directory entry"
 )]
 fn write_directory_entry(
     writer: &mut ByteWriter,
@@ -738,384 +1223,822 @@ const fn baseline_index(kind: BlockKind) -> usize {
     }
 }
 
-fn empty_block(kind: BlockKind) -> BlockContent {
-    let bounds = super::limits::LIMIT;
-    match kind {
-        BlockKind::SourceManifest => BlockContent::SourceManifest(Box::new(
-            SourceManifestBlock::new(0, 0, 0, 0, 0, Vec::new(), &bounds)
-                .expect("empty manifest is valid"),
-        )),
-        BlockKind::EventObservations => BlockContent::EventObservations(Box::new(
-            EventObservationsBlock::new(Vec::new(), &bounds).expect("empty observations are valid"),
-        )),
-        BlockKind::EventFacts => BlockContent::EventFacts,
-        BlockKind::LossCoverage => {
-            BlockContent::LossCoverage(Box::new(empty_loss_coverage(&bounds)))
-        }
-        BlockKind::GaugeSamples => BlockContent::GaugeSamples(Box::new(
-            GaugeSamplesBlock::new(Vec::new(), &bounds).expect("empty gauges are valid"),
-        )),
-        BlockKind::CounterSamples => BlockContent::CounterSamples(Box::new(
-            CounterSamplesBlock::new(Vec::new(), &bounds).expect("empty counters are valid"),
-        )),
-        BlockKind::ResetMarkers => BlockContent::ResetMarkers(Box::new(
-            ResetMarkersBlock::new(Vec::new(), &bounds).expect("empty resets are valid"),
-        )),
-        BlockKind::EntityStates => BlockContent::EntityStates(Box::new(
-            EntityStatesBlock::new(Vec::new(), &bounds).expect("empty entities are valid"),
-        )),
-        BlockKind::StringTable => BlockContent::StringTable(Box::new(
-            StringTableBlock::new(Vec::new(), &bounds).expect("empty string table is valid"),
-        )),
-    }
-}
-
-fn empty_loss_coverage(bounds: &Bounds) -> LossCoverageBlock {
+fn empty_block(kind: BlockKind, bounds: &Bounds) -> Result<BlockContent, CacheReadError> {
     use kronika_analytics::overview::{
         Applicability, Coverage, PeriodQuality, PhysicalCountSemantics, RetainedExactness,
         SourceCompleteness,
     };
-    LossCoverageBlock::new(
-        Coverage::empty(),
-        Coverage::empty(),
-        Applicability::Applicable,
-        PeriodQuality::Unknown,
-        SourceCompleteness::Unknown,
-        RetainedExactness::Unknown,
-        PhysicalCountSemantics::Unknown,
-        0,
-        bounds,
-    )
-    .expect("empty coverage is valid")
+
+    match kind {
+        BlockKind::SourceManifest => Err(CacheReadError::Corrupt),
+        BlockKind::EventObservations => Ok(BlockContent::EventObservations(Box::new(
+            EventObservationsBlock::new(Vec::new(), bounds)?,
+        ))),
+        BlockKind::EventFacts => Ok(BlockContent::EventFacts),
+        BlockKind::LossCoverage => Ok(BlockContent::LossCoverage(Box::new(
+            LossCoverageBlock::new(
+                Coverage::empty(),
+                Coverage::empty(),
+                Applicability::Applicable,
+                PeriodQuality::Unknown,
+                SourceCompleteness::Unknown,
+                RetainedExactness::Unknown,
+                PhysicalCountSemantics::Unknown,
+                0,
+                bounds,
+            )?,
+        ))),
+        BlockKind::GaugeSamples => Ok(BlockContent::GaugeSamples(Box::new(
+            GaugeSamplesBlock::new(Vec::new(), bounds)?,
+        ))),
+        BlockKind::CounterSamples => Ok(BlockContent::CounterSamples(Box::new(
+            CounterSamplesBlock::new(Vec::new(), bounds)?,
+        ))),
+        BlockKind::ResetMarkers => Ok(BlockContent::ResetMarkers(Box::new(
+            ResetMarkersBlock::new(Vec::new(), bounds)?,
+        ))),
+        BlockKind::EntityStates => Ok(BlockContent::EntityStates(Box::new(
+            EntityStatesBlock::new(Vec::new(), bounds)?,
+        ))),
+        BlockKind::StringTable => Ok(BlockContent::StringTable(Box::new(StringTableBlock::new(
+            Vec::new(),
+            bounds,
+        )?))),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use kronika_analytics::overview::{AlignmentId, CounterSample, GaugeSample, MetricSeriesId};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
+    use kronika_analytics::overview::{
+        AlignmentId, CounterSample, DroppedFieldCount, EventObservation, EvidenceQuality,
+        GaugeSample, LifecyclePayload, MetricSeriesId, NamingContractId, ObservationPayload,
+        ObservationProvenance, ObservationShape, ObservationTime, QualityFlags, SectionBodyId,
+        SegmentLocator, TimeQuality,
+    };
+
+    use super::super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor};
     use super::super::limits::LIMIT;
     use super::*;
 
     fn identity() -> HeaderIdentity {
-        HeaderIdentity::from_current_contract(1, 7, 1_000, 2_000, 4_096, [0x11; 32], [0x22; 32])
+        HeaderIdentity::from_current_contract(
+            1,
+            7,
+            1_000,
+            2_000,
+            4_096,
+            SourceScopeId([0x11; 32]),
+            SourceDescriptor([0x22; 32]),
+        )
+    }
+
+    fn lineage() -> SegmentIdentity {
+        SegmentIdentity::sealed(
+            identity().source_scope_id,
+            NamingContractId([0x33; 16]),
+            SegmentLocator([0x44; 32]),
+            1_006_001,
+            b"first",
+        )
+    }
+
+    fn event_lineage() -> SegmentIdentity {
+        SegmentIdentity::sealed(
+            identity().source_scope_id,
+            NamingContractId([0x33; 16]),
+            SegmentLocator([0x44; 32]),
+            1_028_001,
+            b"event",
+        )
+    }
+
+    fn manifest() -> SourceManifestBlock {
+        SourceManifestBlock::new(
+            7,
+            1,
+            1_000,
+            2_000,
+            4_096,
+            vec![ManifestEntryDescriptor {
+                catalog: CatalogEntryDescriptor {
+                    type_id: 1_006_001,
+                    flags: 0,
+                    body_len: 12,
+                    rows: 1,
+                    body_crc32c: 7,
+                },
+                section_body_id: None,
+            }],
+            &LIMIT,
+        )
+        .expect("manifest")
     }
 
     fn sample_blocks() -> Vec<BlockContent> {
-        let counter = CounterSample::new(MetricSeriesId([1; 16]), AlignmentId([1; 16]), 10, 5, 1);
-        let gauge = GaugeSample::new(MetricSeriesId([2; 16]), 20, 2.5).expect("finite");
+        let counter =
+            CounterSample::new(MetricSeriesId([1; 16]), AlignmentId([1; 16]), 1_500, 5, 1);
         vec![
+            BlockContent::SourceManifest(Box::new(manifest())),
             BlockContent::CounterSamples(Box::new(
-                CounterSamplesBlock::new(vec![counter], &LIMIT).expect("counter block"),
-            )),
-            BlockContent::GaugeSamples(Box::new(
-                GaugeSamplesBlock::new(vec![gauge], &LIMIT).expect("gauge block"),
-            )),
-            BlockContent::StringTable(Box::new(
-                StringTableBlock::new(vec![Box::from(b"pattern".as_slice())], &LIMIT)
-                    .expect("string table"),
+                CounterSamplesBlock::new(vec![counter], &LIMIT).expect("counter"),
             )),
         ]
     }
 
+    fn counter_file(samples: Vec<CounterSample>) -> Vec<u8> {
+        FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::CounterSamples(Box::new(
+                    CounterSamplesBlock::new(samples, &LIMIT).expect("counter samples"),
+                )),
+            ],
+            &LIMIT,
+        )
+        .expect("build counter file")
+    }
+
+    fn ready_observation() -> EventObservation {
+        EventObservation::new(
+            event_lineage(),
+            1_028_001,
+            ObservationProvenance {
+                segment_locator: Some(SegmentLocator([0x44; 32])),
+                section_body_id: SectionBodyId([0x66; 32]),
+                catalog_entry_ordinal: 0,
+                row_ordinal: 0,
+                dictionary_context_id: kronika_analytics::overview::DictionaryContextId([0x77; 32]),
+                source_locator: None,
+            },
+            ObservationShape::Individual,
+            ObservationTime {
+                sort_ts_us: 1_500,
+                occurred_at_us: Some(1_500),
+                observed_interval: None,
+                quality: TimeQuality::Exact,
+            },
+            1,
+            ObservationPayload::ReadyObserved(Box::new(LifecyclePayload {
+                pid: None,
+                signal: None,
+                shutdown_mode: None,
+                message: Some("database system is ready".into()),
+                query_detail: None,
+                dropped_field_count: DroppedFieldCount(0),
+            })),
+            EvidenceQuality::Structured,
+            QualityFlags(0),
+            None,
+        )
+        .expect("observation")
+    }
+
+    fn event_manifest() -> SourceManifestBlock {
+        SourceManifestBlock::new(
+            7,
+            1,
+            1_000,
+            2_000,
+            4_096,
+            vec![ManifestEntryDescriptor {
+                catalog: CatalogEntryDescriptor {
+                    type_id: 1_028_001,
+                    flags: 0,
+                    body_len: 128,
+                    rows: 1,
+                    body_crc32c: 9,
+                },
+                section_body_id: Some(SectionBodyId([0x66; 32])),
+            }],
+            &LIMIT,
+        )
+        .expect("event manifest")
+    }
+
+    fn observation_file() -> Vec<u8> {
+        let observations = EventObservationsBlock::new(vec![ready_observation()], &LIMIT)
+            .expect("observation block");
+        FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(event_manifest())),
+                BlockContent::EventObservations(Box::new(observations)),
+            ],
+            &LIMIT,
+        )
+        .expect("build observation file")
+    }
+
     fn valid_file() -> Vec<u8> {
-        FactFile::build(&identity(), sample_blocks(), &LIMIT).expect("valid build")
+        FactFile::build(&identity(), sample_blocks(), &LIMIT).expect("build")
     }
 
-    fn u32_at(bytes: &[u8], at: usize) -> u32 {
-        let field: [u8; 4] = bytes[at..at + 4].try_into().expect("four bytes");
-        u32::from_le_bytes(field)
+    fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("field"))
     }
 
-    /// Recomputes the directory and header CRCs so a mutated field passes CRC
-    /// and the semantic check under test is what actually fires.
-    fn reseal(bytes: &mut [u8]) {
+    fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("field"))
+    }
+
+    fn reseal_header(bytes: &mut [u8]) {
+        bytes[HEADER_CRC_OFFSET..HEADER_LEN].fill(0);
+        let checksum = crc32c(&bytes[..HEADER_LEN]);
+        bytes[HEADER_CRC_OFFSET..HEADER_LEN].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    fn reseal_directory(bytes: &mut [u8]) {
         let count = u32_at(bytes, 136) as usize;
-        let directory_end = HEADER_LEN + count * DIRECTORY_ENTRY_LEN_U16 as usize;
-        let directory_crc = crc32c(&bytes[HEADER_LEN..directory_end]);
-        bytes[152..156].copy_from_slice(&directory_crc.to_le_bytes());
+        let end = HEADER_LEN + count * DIRECTORY_ENTRY_LEN;
+        let checksum = crc32c(&bytes[HEADER_LEN..end]);
+        bytes[152..156].copy_from_slice(&checksum.to_le_bytes());
         reseal_header(bytes);
     }
 
-    /// Recomputes only the header CRC, for a field checked before the directory.
-    fn reseal_header(bytes: &mut [u8]) {
-        let header_crc = crc32c(&bytes[..HEADER_LEN - 4]);
-        bytes[HEADER_LEN - 4..HEADER_LEN].copy_from_slice(&header_crc.to_le_bytes());
+    fn entry_field(index: usize, offset: usize) -> usize {
+        HEADER_LEN + index * DIRECTORY_ENTRY_LEN + offset
     }
 
-    fn entry_field(index: usize, field_offset: usize) -> usize {
-        HEADER_LEN + index * DIRECTORY_ENTRY_LEN_U16 as usize + field_offset
+    fn entry_index(bytes: &[u8], kind: BlockKind) -> usize {
+        let count = u32_at(bytes, 136) as usize;
+        (0..count)
+            .find(|&index| u32_at(bytes, entry_field(index, 0)) == kind.code())
+            .expect("block kind is present")
     }
 
-    #[test]
-    fn a_built_file_round_trips_through_admission() {
-        let bytes = valid_file();
-        let file = FactFile::admit(&bytes, &identity(), &LIMIT).expect("admits");
-        assert_eq!(
-            usize::try_from(file.header().directory_count).expect("count fits usize"),
-            BlockKind::ALL.len()
+    fn entry_body_range(bytes: &[u8], index: usize) -> std::ops::Range<usize> {
+        let offset =
+            usize::try_from(u64_at(bytes, entry_field(index, 16))).expect("body offset fits usize");
+        let length =
+            usize::try_from(u64_at(bytes, entry_field(index, 24))).expect("body length fits usize");
+        offset..offset + length
+    }
+
+    fn reseal_block(bytes: &mut [u8], index: usize) {
+        let body = entry_body_range(bytes, index);
+        let checksum = crc32c(&bytes[body]);
+        let checksum_at = entry_field(index, 44);
+        bytes[checksum_at..checksum_at + 4].copy_from_slice(&checksum.to_le_bytes());
+        reseal_directory(bytes);
+    }
+
+    fn counter_partition(
+        offset: u64,
+        item_count: u32,
+        min_ts_us: i64,
+        max_ts_us: i64,
+    ) -> BlockDirectoryEntry {
+        BlockDirectoryEntry {
+            block_kind: BlockKind::CounterSamples.code(),
+            block_schema_version: BLOCK_SCHEMA_VERSION,
+            flags: BlockFlags {
+                required_for_schema: true,
+                canonically_sorted: true,
+                has_time_range: true,
+                codec: BlockCodec::None,
+            },
+            logical_id: 1,
+            offset,
+            stored_len: 1,
+            decoded_len: 1,
+            item_count,
+            block_crc32c: 0,
+            min_ts_us,
+            max_ts_us,
+        }
+    }
+
+    fn append_empty_optional_block(bytes: &mut Vec<u8>) {
+        let old_count = u32_at(bytes, 136) as usize;
+        let old_directory_end = HEADER_LEN + old_count * DIRECTORY_ENTRY_LEN;
+        let old_file_len = u64::from_le_bytes(bytes[144..152].try_into().expect("file length"));
+        bytes.splice(
+            old_directory_end..old_directory_end,
+            [0_u8; DIRECTORY_ENTRY_LEN],
         );
-        assert_eq!(file.header().file_len, bytes.len() as u64);
-
-        let body = file
-            .block_body(BlockKind::CounterSamples)
-            .expect("counter block present");
-        let decoded = CounterSamplesBlock::decode(body, &LIMIT).expect("decode");
-        assert_eq!(decoded.samples()[0].value(), 5);
+        for index in 0..old_count {
+            let at = entry_field(index, 16);
+            let old_offset = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("offset"));
+            bytes[at..at + 8]
+                .copy_from_slice(&(old_offset + DIRECTORY_ENTRY_LEN as u64).to_le_bytes());
+        }
+        let optional = entry_field(old_count, 0);
+        bytes[optional..optional + 4].copy_from_slice(&9_999_u32.to_le_bytes());
+        bytes[optional + 4..optional + 6].copy_from_slice(&77_u16.to_le_bytes());
+        bytes[optional + 16..optional + 24]
+            .copy_from_slice(&(old_file_len + DIRECTORY_ENTRY_LEN as u64).to_le_bytes());
+        bytes[optional + 44..optional + 48].copy_from_slice(&crc32c(&[]).to_le_bytes());
+        let new_count = u32::try_from(old_count + 1).expect("directory count fits u32");
+        bytes[136..140].copy_from_slice(&new_count.to_le_bytes());
+        bytes[144..152].copy_from_slice(&(old_file_len + DIRECTORY_ENTRY_LEN as u64).to_le_bytes());
+        reseal_directory(bytes);
     }
 
     #[test]
-    fn every_required_baseline_block_is_present() {
+    fn canonical_build_admits_and_empty_blocks_have_zero_lengths() {
         let bytes = valid_file();
-        let file = FactFile::admit(&bytes, &identity(), &LIMIT).expect("admits");
-        for kind in BlockKind::ALL {
-            assert!(
-                file.block_body(kind).is_some(),
-                "missing baseline block {kind:?}"
-            );
+        let admitted = FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT).expect("admit");
+        assert_eq!(admitted.header().file_len, bytes.len() as u64);
+        for entry in admitted.directory() {
+            if entry.item_count == 0 {
+                assert_eq!(entry.stored_len, 0);
+                assert_eq!(entry.decoded_len, 0);
+                assert!(!entry.flags.has_time_range);
+                assert_eq!((entry.min_ts_us, entry.max_ts_us), (0, 0));
+            }
         }
     }
 
     #[test]
-    fn a_bad_magic_is_incompatible() {
+    fn header_crc_covers_the_zeroed_checksum_field() {
         let mut bytes = valid_file();
-        bytes[0] ^= 0xFF;
+        bytes[HEADER_CRC_OFFSET] ^= 1;
         assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
+            Err(CacheReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn admission_rejects_a_stale_directory_crc() {
+        let mut bytes = valid_file();
+        bytes[entry_field(0, 0)] ^= 1;
+        assert!(matches!(
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
+            Err(CacheReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn admission_rejects_a_stale_block_crc() {
+        let mut bytes = valid_file();
+        let counter = entry_index(&bytes, BlockKind::CounterSamples);
+        let body = entry_body_range(&bytes, counter);
+        bytes[body.start] ^= 1;
+        assert!(matches!(
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
+            Err(CacheReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn admission_distinguishes_wrong_source_from_incompatible_versions() {
+        let bytes = valid_file();
+        let mut wrong_scope = identity();
+        wrong_scope.source_scope_id.0[0] ^= 1;
+        let mut wrong_descriptor = identity();
+        wrong_descriptor.source_descriptor.0[0] ^= 1;
+        for expected in [&wrong_scope, &wrong_descriptor] {
+            assert!(matches!(
+                FactFile::admit(&bytes, expected, &lineage(), &LIMIT),
+                Err(CacheReadError::WrongSource)
+            ));
+        }
+
+        let mut incompatible = identity();
+        incompatible.fact_schema_version += 1;
+        assert!(matches!(
+            FactFile::admit(&bytes, &incompatible, &lineage(), &LIMIT),
             Err(CacheReadError::Incompatible)
         ));
     }
 
     #[test]
-    fn an_unknown_container_version_is_incompatible() {
-        let mut bytes = valid_file();
-        bytes[8] = 2;
-        assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
-            Err(CacheReadError::Incompatible)
-        ));
+    #[allow(
+        clippy::format_collect,
+        reason = "a compact hex string keeps the 160-byte golden header reviewable"
+    )]
+    fn canonical_header_matches_the_golden_vector() {
+        let header = encode_header(&identity(), 9, 1_234, 0x1122_3344);
+        let encoded: String = header.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            encoded,
+            concat!(
+                "50474b4f564600000100a0000100000001000000010000000100000001000000",
+                "0700000000000000e803000000000000d0070000000000000010000000000000",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "a0000000000000000900000040000100d2040000000000004433221144b2353b",
+            )
+        );
     }
 
     #[test]
-    fn a_wrong_file_kind_or_flags_or_descriptor_is_incompatible() {
-        for at in [12_usize, 14, 142] {
+    fn known_schema_flags_and_time_metadata_are_enforced() {
+        for (entry, field, value) in [(0, 4, 2_u8), (0, 6, 0_u8), (5, 6, 3_u8)] {
             let mut bytes = valid_file();
-            bytes[at] = 9;
-            reseal(&mut bytes);
+            bytes[entry_field(entry, field)] = value;
+            reseal_directory(&mut bytes);
             assert!(
-                matches!(
-                    FactFile::admit(&bytes, &identity(), &LIMIT),
-                    Err(CacheReadError::Incompatible)
-                ),
-                "byte {at} should be incompatible"
+                FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT).is_err(),
+                "entry {entry}, field {field}"
             );
         }
     }
 
     #[test]
-    fn a_wrong_directory_entry_len_is_incompatible() {
-        let mut bytes = valid_file();
-        bytes[140] = 65;
-        reseal(&mut bytes);
-        assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
-            Err(CacheReadError::Incompatible)
-        ));
-    }
+    fn admission_rejects_resealed_unsorted_counter_samples() {
+        let series = MetricSeriesId([1; 16]);
+        let alignment = AlignmentId([1; 16]);
+        let mut bytes = counter_file(vec![
+            CounterSample::new(series, alignment, 1_500, 5, 1),
+            CounterSample::new(series, alignment, 1_600, 6, 1),
+        ]);
+        let counter = entry_index(&bytes, BlockKind::CounterSamples);
+        let body = entry_body_range(&bytes, counter);
+        let record_len = (body.len() - 1) / 2;
+        let first = bytes[body.start + 1..body.start + 1 + record_len].to_vec();
+        let second = bytes[body.start + 1 + record_len..body.start + 1 + 2 * record_len].to_vec();
+        bytes[body.start + 1..body.start + 1 + record_len].copy_from_slice(&second);
+        bytes[body.start + 1 + record_len..body.start + 1 + 2 * record_len].copy_from_slice(&first);
+        reseal_block(&mut bytes, counter);
 
-    #[test]
-    fn a_header_crc_mismatch_is_corrupt() {
-        let mut bytes = valid_file();
-        // Flip a byte inside the identity region without resealing the CRC.
-        bytes[64] ^= 0x01;
         assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
             Err(CacheReadError::Corrupt)
         ));
     }
 
     #[test]
-    fn a_directory_crc_mismatch_is_corrupt() {
+    fn admission_rejects_resealed_duplicate_counter_samples() {
+        let series = MetricSeriesId([1; 16]);
+        let alignment = AlignmentId([1; 16]);
+        let mut bytes = counter_file(vec![
+            CounterSample::new(series, alignment, 1_500, 5, 1),
+            CounterSample::new(series, alignment, 1_600, 6, 1),
+        ]);
+        let counter = entry_index(&bytes, BlockKind::CounterSamples);
+        let body = entry_body_range(&bytes, counter);
+        let record_len = (body.len() - 1) / 2;
+        let first = bytes[body.start + 1..body.start + 1 + record_len].to_vec();
+        bytes[body.start + 1 + record_len..body.start + 1 + 2 * record_len].copy_from_slice(&first);
+        reseal_block(&mut bytes, counter);
+
+        assert!(matches!(
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
+            Err(CacheReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn admission_rejects_a_resealed_non_finite_gauge() {
+        let gauge = GaugeSamplesBlock::new(
+            vec![GaugeSample::new(MetricSeriesId([2; 16]), 1_500, 1.0).expect("finite gauge")],
+            &LIMIT,
+        )
+        .expect("gauge block");
+        let mut bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest())),
+                BlockContent::GaugeSamples(Box::new(gauge)),
+            ],
+            &LIMIT,
+        )
+        .expect("build gauge file");
+        let gauge = entry_index(&bytes, BlockKind::GaugeSamples);
+        let body = entry_body_range(&bytes, gauge);
+        let value = body.start + 1 + 16 + 8;
+        bytes[value..value + 8].copy_from_slice(&f64::NAN.to_bits().to_le_bytes());
+        reseal_block(&mut bytes, gauge);
+
+        assert!(matches!(
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
+            Err(CacheReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn admission_rejects_a_resealed_invalid_coverage_enum() {
         let mut bytes = valid_file();
-        // Flip a byte inside the first directory entry, leaving the CRC stale.
-        let at = entry_field(0, 48);
-        bytes[at] ^= 0x01;
+        let coverage = entry_index(&bytes, BlockKind::LossCoverage);
+        let body = entry_body_range(&bytes, coverage);
+        bytes[body.start + 2] = u8::MAX;
+        reseal_block(&mut bytes, coverage);
+
         assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
             Err(CacheReadError::Corrupt)
         ));
     }
 
     #[test]
-    fn a_block_crc_mismatch_is_corrupt() {
+    fn admission_rejects_directory_item_count_mismatch() {
         let mut bytes = valid_file();
-        // The last byte belongs to the final block body.
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0x01;
+        let at = entry_field(5, 40);
+        bytes[at..at + 4].copy_from_slice(&2_u32.to_le_bytes());
+        reseal_directory(&mut bytes);
         assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
             Err(CacheReadError::Corrupt)
         ));
     }
 
     #[test]
-    fn a_truncated_header_is_corrupt() {
-        let bytes = valid_file();
+    fn source_manifest_must_match_the_header() {
+        let wrong = SourceManifestBlock::new(8, 1, 1_000, 2_000, 4_096, Vec::new(), &LIMIT)
+            .expect("manifest");
         assert!(matches!(
-            FactFile::admit(&bytes[..100], &identity(), &LIMIT),
-            Err(CacheReadError::Corrupt)
-        ));
-    }
-
-    #[test]
-    fn a_trailing_byte_or_wrong_file_len_is_corrupt() {
-        let mut bytes = valid_file();
-        bytes.push(0);
-        assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
-            Err(CacheReadError::Corrupt)
-        ));
-    }
-
-    #[test]
-    fn a_wrong_source_scope_or_descriptor_is_wrong_source() {
-        let bytes = valid_file();
-        let mut expected = identity();
-        expected.source_scope_id = [0x99; 32];
-        assert!(matches!(
-            FactFile::admit(&bytes, &expected, &LIMIT),
+            FactFile::build(
+                &identity(),
+                vec![BlockContent::SourceManifest(Box::new(wrong))],
+                &LIMIT
+            ),
             Err(CacheReadError::WrongSource)
         ));
     }
 
     #[test]
-    fn a_version_axis_mismatch_is_incompatible() {
-        let bytes = valid_file();
-        let mut expected = identity();
-        expected.fact_schema_version += 1;
+    fn admission_rejects_a_resealed_manifest_header_mismatch() {
+        let mut bytes = valid_file();
+        let manifest = entry_index(&bytes, BlockKind::SourceManifest);
+        let body = entry_body_range(&bytes, manifest);
+        bytes[body.start] ^= 1;
+        reseal_block(&mut bytes, manifest);
         assert!(matches!(
-            FactFile::admit(&bytes, &expected, &LIMIT),
-            Err(CacheReadError::Incompatible)
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
+            Err(CacheReadError::WrongSource)
         ));
     }
 
     #[test]
-    fn a_file_above_the_length_bound_is_oversized() {
-        let bytes = valid_file();
-        let bounds = Bounds {
-            fact_file_len: 64,
+    fn caller_cannot_expand_absolute_limits() {
+        let expanded = Bounds {
+            fact_file_len: LIMIT.fact_file_len + 1,
             ..LIMIT
         };
         assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &bounds),
+            FactFile::admit(&valid_file(), &identity(), &lineage(), &expanded),
             Err(CacheReadError::Oversized)
         ));
     }
 
     #[test]
-    fn a_directory_count_above_the_bound_is_oversized() {
-        let mut bytes = valid_file();
-        // A count above the bound is rejected before any directory read, so only
-        // the header CRC needs to stay valid.
-        bytes[136..140].copy_from_slice(&5_000_u32.to_le_bytes());
-        reseal_header(&mut bytes);
+    fn directory_aggregate_bounds_and_partition_ranges_are_enforced() {
+        let directory_end = HEADER_LEN_U64 + 2 * DIRECTORY_ENTRY_LEN as u64;
+        let header = FactFileHeader {
+            identity: identity(),
+            directory_offset: HEADER_LEN_U64,
+            directory_count: 2,
+            file_len: directory_end + 2,
+        };
+        let disjoint = [
+            counter_partition(directory_end, 1, 1_000, 1_200),
+            counter_partition(directory_end + 1, 1, 1_300, 1_600),
+        ];
+
+        let decoded_bound = Bounds {
+            decoded_file_bytes: 1,
+            ..LIMIT
+        };
         assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
+            validate_directory(&disjoint, &header, directory_end, &decoded_bound),
             Err(CacheReadError::Oversized)
         ));
-    }
 
-    #[test]
-    fn a_nonzero_reserved_field_is_corrupt() {
-        let mut bytes = valid_file();
-        let at = entry_field(0, 12);
-        bytes[at] = 1;
-        reseal(&mut bytes);
+        let item_bound = Bounds {
+            items_per_block: 1,
+            ..LIMIT
+        };
         assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
-            Err(CacheReadError::Corrupt)
+            validate_directory(&disjoint, &header, directory_end, &item_bound),
+            Err(CacheReadError::Oversized)
         ));
-    }
 
-    #[test]
-    fn an_unknown_block_flag_bit_is_incompatible() {
-        let mut bytes = valid_file();
-        let at = entry_field(0, 6);
-        // Set a reserved flag bit (bit 4).
-        bytes[at] |= 0x10;
-        reseal(&mut bytes);
-        assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
-            Err(CacheReadError::Incompatible)
-        ));
-    }
-
-    #[test]
-    fn a_compressed_codec_flag_is_incompatible_in_this_build() {
-        let mut bytes = valid_file();
-        let at = entry_field(0, 6);
-        // Set the codec nibble (bits 8..12) to Zstd on the first entry.
-        let flags = u16::from_le_bytes([bytes[at], bytes[at + 1]]) | 0x0100;
-        bytes[at..at + 2].copy_from_slice(&flags.to_le_bytes());
-        reseal(&mut bytes);
-        assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
-            Err(CacheReadError::Incompatible)
-        ));
-    }
-
-    #[test]
-    fn an_unknown_required_block_kind_is_incompatible() {
-        let mut bytes = valid_file();
-        let at = entry_field(0, 0);
-        bytes[at..at + 4].copy_from_slice(&9_999_u32.to_le_bytes());
-        reseal(&mut bytes);
-        assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
-            Err(CacheReadError::Incompatible)
-        ));
-    }
-
-    #[test]
-    fn an_overlapping_block_offset_is_corrupt() {
-        let mut bytes = valid_file();
-        // Shift the second entry's offset back so its extent overlaps the first.
-        let at = entry_field(1, 16);
-        bytes[at..at + 8].copy_from_slice(&HEADER_LEN_U64.to_le_bytes());
-        reseal(&mut bytes);
-        assert!(matches!(
-            FactFile::admit(&bytes, &identity(), &LIMIT),
-            Err(CacheReadError::Corrupt)
-        ));
-    }
-
-    #[test]
-    fn a_min_ts_above_max_ts_in_the_header_is_corrupt() {
-        // Build a file whose header range is inverted, then admit with the same
-        // identity so the range check, not the identity check, fires.
-        let mut inverted = identity();
-        inverted.source_min_ts_us = 5_000;
-        inverted.source_max_ts_us = 1_000;
-        let bytes = FactFile::build(&inverted, sample_blocks(), &LIMIT).expect("build");
-        assert!(matches!(
-            FactFile::admit(&bytes, &inverted, &LIMIT),
-            Err(CacheReadError::Corrupt)
-        ));
-    }
-
-    #[test]
-    fn build_rejects_two_blocks_of_the_same_kind() {
-        let counter = CounterSample::new(MetricSeriesId([1; 16]), AlignmentId([1; 16]), 10, 5, 1);
-        let duplicate = vec![
-            BlockContent::CounterSamples(Box::new(
-                CounterSamplesBlock::new(vec![counter], &LIMIT).expect("block"),
-            )),
-            BlockContent::CounterSamples(Box::new(
-                CounterSamplesBlock::new(vec![], &LIMIT).expect("block"),
-            )),
+        let overlapping = [
+            counter_partition(directory_end, 1, 1_000, 1_500),
+            counter_partition(directory_end + 1, 1, 1_500, 1_600),
         ];
         assert!(matches!(
-            FactFile::build(&identity(), duplicate, &LIMIT),
+            validate_directory(&overlapping, &header, directory_end, &LIMIT),
             Err(CacheReadError::Corrupt)
         ));
+    }
+
+    #[test]
+    fn unknown_required_blocks_are_incompatible() {
+        let mut bytes = valid_file();
+        bytes[entry_field(0, 0)..entry_field(0, 0) + 4].copy_from_slice(&9_999_u32.to_le_bytes());
+        reseal_directory(&mut bytes);
+        assert!(matches!(
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
+            Err(CacheReadError::Incompatible)
+        ));
+    }
+
+    #[test]
+    fn unknown_optional_blocks_are_skipped() {
+        let mut bytes = valid_file();
+        append_empty_optional_block(&mut bytes);
+        let admitted =
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT).expect("optional block");
+        assert_eq!(admitted.directory().len(), BlockKind::ALL.len() + 1);
+        assert_eq!(
+            admitted.directory().last().expect("entry").block_kind,
+            9_999
+        );
+    }
+
+    #[test]
+    fn zstd_is_rejected_before_any_decompression_allocation() {
+        let mut bytes = valid_file();
+        let flags_at = entry_field(0, 6);
+        let flags = u16::from_le_bytes(bytes[flags_at..flags_at + 2].try_into().expect("flags"));
+        bytes[flags_at..flags_at + 2].copy_from_slice(&(flags | 0x0100).to_le_bytes());
+        reseal_directory(&mut bytes);
+        assert!(matches!(
+            FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT),
+            Err(CacheReadError::Incompatible)
+        ));
+    }
+
+    #[test]
+    fn encoding_is_deterministic() {
+        assert_eq!(valid_file(), valid_file());
+    }
+
+    #[test]
+    fn observations_use_manifest_provenance_and_text_references() {
+        let bytes = observation_file();
+        let admitted =
+            FactFile::admit(&bytes, &identity(), &event_lineage(), &LIMIT).expect("admit");
+        let observation_body = admitted
+            .block_body(BlockKind::EventObservations)
+            .expect("observation body");
+        assert!(
+            !observation_body
+                .windows(b"database system is ready".len())
+                .any(|window| window == b"database system is ready")
+        );
+        let strings = StringTableBlock::decode(
+            admitted
+                .block_body(BlockKind::StringTable)
+                .expect("string table"),
+            &LIMIT,
+        )
+        .expect("decode strings");
+        assert_eq!(
+            strings.values(),
+            &[Box::from(b"database system is ready".as_slice())]
+        );
+    }
+
+    #[test]
+    fn admission_rejects_resealed_observation_provenance_mismatches() {
+        const SOURCE_TYPE_OFFSET: usize = 1;
+        const SECTION_BODY_ID_OFFSET: usize = 38;
+        const CATALOG_ORDINAL_OFFSET: usize = 70;
+        const ROW_ORDINAL_OFFSET: usize = 74;
+
+        #[derive(Debug, Clone, Copy)]
+        enum Mutation {
+            SourceType,
+            SectionBody,
+            CatalogOrdinal,
+            RowOrdinal,
+        }
+
+        for mutation in [
+            Mutation::SourceType,
+            Mutation::SectionBody,
+            Mutation::CatalogOrdinal,
+            Mutation::RowOrdinal,
+        ] {
+            let mut bytes = observation_file();
+            let observations = entry_index(&bytes, BlockKind::EventObservations);
+            let body = entry_body_range(&bytes, observations);
+            match mutation {
+                Mutation::SourceType => bytes
+                    [body.start + SOURCE_TYPE_OFFSET..body.start + SOURCE_TYPE_OFFSET + 4]
+                    .copy_from_slice(&1_027_001_u32.to_le_bytes()),
+                Mutation::SectionBody => bytes[body.start + SECTION_BODY_ID_OFFSET] ^= 1,
+                Mutation::CatalogOrdinal => bytes
+                    [body.start + CATALOG_ORDINAL_OFFSET..body.start + CATALOG_ORDINAL_OFFSET + 4]
+                    .copy_from_slice(&1_u32.to_le_bytes()),
+                Mutation::RowOrdinal => bytes
+                    [body.start + ROW_ORDINAL_OFFSET..body.start + ROW_ORDINAL_OFFSET + 4]
+                    .copy_from_slice(&1_u32.to_le_bytes()),
+            }
+            reseal_block(&mut bytes, observations);
+            assert!(
+                matches!(
+                    FactFile::admit(&bytes, &identity(), &event_lineage(), &LIMIT),
+                    Err(CacheReadError::Corrupt)
+                ),
+                "mutation {mutation:?} was admitted"
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingReader<'a> {
+        bytes: &'a [u8],
+        calls: Rc<Cell<u64>>,
+        read_bytes: Rc<Cell<u64>>,
+    }
+
+    impl ReadAt for CountingReader<'_> {
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            self.read_bytes
+                .set(self.read_bytes.get() + buf.len() as u64);
+            self.bytes.read_exact_at(buf, offset)
+        }
+
+        fn byte_len(&self) -> std::io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    #[test]
+    fn positional_reader_reads_only_metadata_and_selected_bodies() {
+        let bytes = valid_file();
+        let calls = Rc::new(Cell::new(0));
+        let read_bytes = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            bytes: &bytes,
+            calls: Rc::clone(&calls),
+            read_bytes: Rc::clone(&read_bytes),
+        };
+        let mut file = FactFileReader::open(reader, &identity(), &LIMIT).expect("open");
+        let metadata_bytes = HEADER_LEN_U64 + BlockKind::ALL.len() as u64 * 64;
+        assert_eq!(file.stats().read_calls, 2);
+        assert_eq!(file.stats().stored_bytes_read, metadata_bytes);
+        assert_eq!(calls.get(), file.stats().read_calls);
+        assert_eq!(read_bytes.get(), file.stats().stored_bytes_read);
+
+        let bodies = file
+            .read_blocks(BlockKind::CounterSamples)
+            .expect("selected body");
+        assert_eq!(bodies.len(), 1);
+        let counter = file
+            .directory()
+            .iter()
+            .find(|entry| entry.block_kind == BlockKind::CounterSamples.code())
+            .expect("entry");
+        assert_eq!(
+            file.stats().stored_bytes_read,
+            metadata_bytes + counter.stored_len
+        );
+        assert_eq!(file.stats().decoded_bytes, counter.decoded_len);
+        assert_eq!(calls.get(), file.stats().read_calls);
+        assert_eq!(read_bytes.get(), file.stats().stored_bytes_read);
+        assert!(file.stats().stored_bytes_read < bytes.len() as u64);
+
+        let before = file.stats();
+        let outside = file
+            .read_blocks_in_range(BlockKind::CounterSamples, 1_600, 1_700)
+            .expect("range read");
+        assert!(outside.is_empty());
+        assert_eq!(file.stats(), before);
+        assert_eq!(calls.get(), file.stats().read_calls);
+        assert_eq!(read_bytes.get(), file.stats().stored_bytes_read);
+    }
+
+    #[test]
+    fn positional_reader_verifies_the_selected_body_crc() {
+        let mut bytes = valid_file();
+        let counter = entry_index(&bytes, BlockKind::CounterSamples);
+        let body = entry_body_range(&bytes, counter);
+        bytes[body.start] ^= 1;
+
+        let calls = Rc::new(Cell::new(0));
+        let read_bytes = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            bytes: &bytes,
+            calls: Rc::clone(&calls),
+            read_bytes: Rc::clone(&read_bytes),
+        };
+        let mut file = FactFileReader::open(reader, &identity(), &LIMIT).expect("metadata");
+        let metadata_bytes = HEADER_LEN_U64 + BlockKind::ALL.len() as u64 * 64;
+        assert_eq!(calls.get(), 2);
+        assert_eq!(read_bytes.get(), metadata_bytes);
+
+        let counter_len = file.directory()[counter].stored_len;
+        assert!(matches!(
+            file.read_blocks(BlockKind::CounterSamples),
+            Err(CacheReadError::Corrupt)
+        ));
+        assert_eq!(calls.get(), 3);
+        assert_eq!(read_bytes.get(), metadata_bytes + counter_len);
+        assert_eq!(file.stats().read_calls, calls.get());
+        assert_eq!(file.stats().stored_bytes_read, read_bytes.get());
+        assert_eq!(file.stats().decoded_bytes, 0);
+        assert!(file.stats().stored_bytes_read < bytes.len() as u64);
+    }
+
+    #[test]
+    fn arbitrary_truncation_returns_an_error() {
+        let bytes = valid_file();
+        for end in 0..bytes.len() {
+            assert!(
+                FactFile::admit(&bytes[..end], &identity(), &lineage(), &LIMIT).is_err(),
+                "accepted prefix of {end} bytes"
+            );
+        }
     }
 }

@@ -1,9 +1,7 @@
 //! Property and fuzz coverage for the fact-file codec.
 //!
-//! Two invariants matter most: no untrusted byte string may drive a panic or an
-//! unbounded allocation, and any value that encodes must decode back unchanged.
-//! The generators feed adversarial identities, timestamps, and floats through
-//! every decoder and through a full build-and-admit round trip.
+//! Arbitrary bytes verify that decoders return without panicking; generated
+//! values exercise canonical build-and-admit round trips.
 
 use proptest::prelude::*;
 
@@ -17,21 +15,45 @@ use super::block::{
     ResetMarkersBlock, SourceManifestBlock, StringTableBlock,
 };
 use super::container::{BlockContent, FactFile, HeaderIdentity};
+use super::descriptors::{ManifestEntryDescriptor, SourceDescriptor};
 use super::limits::LIMIT;
 use super::observations::EventObservationsBlock;
 
 fn identity() -> HeaderIdentity {
-    HeaderIdentity::from_current_contract(1, 7, 0, 10_000, 0, [0x11; 32], [0x22; 32])
+    HeaderIdentity::from_current_contract(
+        1,
+        7,
+        i64::MIN,
+        i64::MAX,
+        4_096,
+        SourceScopeId([0x11; 32]),
+        SourceDescriptor([0x22; 32]),
+    )
 }
 
 fn lineage() -> SegmentIdentity {
     SegmentIdentity::sealed(
-        SourceScopeId([1; 32]),
+        SourceScopeId([0x11; 32]),
         NamingContractId([2; 16]),
         SegmentLocator([3; 32]),
         7,
         b"descriptor",
     )
+}
+
+fn manifest() -> BlockContent {
+    BlockContent::SourceManifest(Box::new(
+        SourceManifestBlock::new(
+            7,
+            1,
+            i64::MIN,
+            i64::MAX,
+            4_096,
+            Vec::<ManifestEntryDescriptor>::new(),
+            &LIMIT,
+        )
+        .expect("manifest"),
+    ))
 }
 
 fn arb_counter() -> impl Strategy<Value = CounterSample> {
@@ -66,8 +88,7 @@ fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
 proptest! {
     #[test]
     fn admit_never_panics_on_arbitrary_bytes(bytes in arb_bytes()) {
-        // The only contract is total: a typed result, never a panic or OOM.
-        drop(FactFile::admit(&bytes, &identity(), &LIMIT));
+        drop(FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT));
     }
 
     #[test]
@@ -79,7 +100,13 @@ proptest! {
         drop(EntityStatesBlock::decode(&bytes, &LIMIT));
         drop(StringTableBlock::decode(&bytes, &LIMIT));
         drop(SourceManifestBlock::decode(&bytes, &LIMIT));
-        drop(EventObservationsBlock::decode(&bytes, &lineage(), &LIMIT));
+        let strings = StringTableBlock::new(Vec::new(), &LIMIT).expect("empty text table");
+        drop(EventObservationsBlock::decode(
+            &bytes,
+            &lineage(),
+            &strings,
+            &LIMIT,
+        ));
     }
 
     #[test]
@@ -109,13 +136,15 @@ proptest! {
         let Ok(block) = CounterSamplesBlock::new(seed, &LIMIT) else {
             return Ok(());
         };
-        let blocks = vec![BlockContent::CounterSamples(Box::new(block))];
+        let blocks = vec![
+            manifest(),
+            BlockContent::CounterSamples(Box::new(block)),
+        ];
         let mut bytes = FactFile::build(&identity(), blocks, &LIMIT).expect("build");
         if index < bytes.len() {
             bytes[index] ^= xor;
         }
-        // A single-byte corruption must never escape as a panic.
-        drop(FactFile::admit(&bytes, &identity(), &LIMIT));
+        drop(FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT));
     }
 
     #[test]
@@ -123,7 +152,7 @@ proptest! {
         counters in prop::collection::vec(arb_counter(), 0..48),
         gauges in prop::collection::vec(arb_gauge(), 0..48),
     ) {
-        let mut blocks = Vec::new();
+        let mut blocks = vec![manifest()];
         let counter_block = CounterSamplesBlock::new(counters, &LIMIT).ok();
         let gauge_block = GaugeSamplesBlock::new(gauges, &LIMIT).ok();
         if let Some(block) = counter_block.clone() {
@@ -133,7 +162,8 @@ proptest! {
             blocks.push(BlockContent::GaugeSamples(Box::new(block)));
         }
         let bytes = FactFile::build(&identity(), blocks, &LIMIT).expect("build");
-        let file = FactFile::admit(&bytes, &identity(), &LIMIT).expect("own build admits");
+        let file = FactFile::admit(&bytes, &identity(), &lineage(), &LIMIT)
+            .expect("own build admits");
 
         if let Some(expected) = counter_block {
             let body = file

@@ -16,7 +16,7 @@ use kronika_analytics::overview::{
 };
 
 use super::bytes::{ByteError, ByteReader, ByteWriter};
-use super::descriptors::CatalogEntryDescriptor;
+use super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor};
 use super::limits::Bounds;
 
 /// A canonical block kind in the fact file.
@@ -105,15 +105,16 @@ pub enum BlockCodec {
 
 /// A parsed set of block directory flags.
 ///
-/// Bit 0 marks a block required for the fact schema, bit 1 marks canonical
-/// sort order, and bits 8..12 hold the codec. Any other set bit makes the
-/// file incompatible.
+/// Bit 0 marks a required block, bit 1 canonical order, bit 2 a time range,
+/// and bits 8..12 the codec. Other set bits are incompatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockFlags {
     /// Whether a reader that cannot decode this block must reject the file.
     pub required_for_schema: bool,
     /// Whether the block body is in canonical sort order.
     pub canonically_sorted: bool,
+    /// Whether the directory timestamps describe the block's items.
+    pub has_time_range: bool,
     /// The block-body codec.
     pub codec: BlockCodec,
 }
@@ -121,9 +122,11 @@ pub struct BlockFlags {
 impl BlockFlags {
     const REQUIRED_BIT: u16 = 1 << 0;
     const SORTED_BIT: u16 = 1 << 1;
+    const TIME_RANGE_BIT: u16 = 1 << 2;
     const CODEC_SHIFT: u16 = 8;
     const CODEC_MASK: u16 = 0x0F00;
-    const KNOWN_MASK: u16 = Self::REQUIRED_BIT | Self::SORTED_BIT | Self::CODEC_MASK;
+    const KNOWN_MASK: u16 =
+        Self::REQUIRED_BIT | Self::SORTED_BIT | Self::TIME_RANGE_BIT | Self::CODEC_MASK;
 
     /// Encodes the flags to their raw directory field.
     #[must_use]
@@ -138,6 +141,9 @@ impl BlockFlags {
         }
         if self.canonically_sorted {
             bits |= Self::SORTED_BIT;
+        }
+        if self.has_time_range {
+            bits |= Self::TIME_RANGE_BIT;
         }
         bits
     }
@@ -159,6 +165,7 @@ impl BlockFlags {
         Ok(Self {
             required_for_schema: bits & Self::REQUIRED_BIT != 0,
             canonically_sorted: bits & Self::SORTED_BIT != 0,
+            has_time_range: bits & Self::TIME_RANGE_BIT != 0,
             codec,
         })
     }
@@ -253,6 +260,9 @@ impl CounterSamplesBlock {
     /// Returns [`BlockError::Duplicate`] when two samples share the canonical
     /// key, and [`BlockError::AboveBound`] past the per-block item bound.
     pub fn new(mut samples: Vec<CounterSample>, bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() {
+            return Err(BlockError::AboveBound);
+        }
         if samples.len() as u64 > bounds.items_per_block {
             return Err(BlockError::AboveBound);
         }
@@ -278,6 +288,14 @@ impl CounterSamplesBlock {
     /// Returns [`BlockError`] for a truncated, out-of-order, out-of-bound, or
     /// trailing-byte body.
     pub fn decode(body: &[u8], bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() || body.len() as u64 > bounds.decoded_block_len {
+            return Err(BlockError::AboveBound);
+        }
+        if body.is_empty() {
+            return Ok(Self {
+                samples: Vec::new(),
+            });
+        }
         let mut reader = ByteReader::new(body);
         let count = reader.uvarint(bounds.items_per_block)?;
         let mut samples = Vec::with_capacity(count.min(4_096) as usize);
@@ -335,6 +353,9 @@ impl EncodableBlock for CounterSamplesBlock {
     }
 
     fn encode(&self) -> Vec<u8> {
+        if self.samples.is_empty() {
+            return Vec::new();
+        }
         let mut writer = ByteWriter::new();
         writer.uvarint(self.samples.len() as u64);
         for sample in &self.samples {
@@ -364,6 +385,9 @@ impl GaugeSamplesBlock {
     /// Returns [`BlockError::Duplicate`] when two samples share the canonical
     /// key, and [`BlockError::AboveBound`] past the per-block item bound.
     pub fn new(mut samples: Vec<GaugeSample>, bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() {
+            return Err(BlockError::AboveBound);
+        }
         if samples.len() as u64 > bounds.items_per_block {
             return Err(BlockError::AboveBound);
         }
@@ -389,6 +413,14 @@ impl GaugeSamplesBlock {
     /// Returns [`BlockError`] for a truncated, non-finite, out-of-order,
     /// out-of-bound, or trailing-byte body.
     pub fn decode(body: &[u8], bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() || body.len() as u64 > bounds.decoded_block_len {
+            return Err(BlockError::AboveBound);
+        }
+        if body.is_empty() {
+            return Ok(Self {
+                samples: Vec::new(),
+            });
+        }
         let mut reader = ByteReader::new(body);
         let count = reader.uvarint(bounds.items_per_block)?;
         let mut samples = Vec::with_capacity(count.min(4_096) as usize);
@@ -434,6 +466,9 @@ impl EncodableBlock for GaugeSamplesBlock {
     }
 
     fn encode(&self) -> Vec<u8> {
+        if self.samples.is_empty() {
+            return Vec::new();
+        }
         let mut writer = ByteWriter::new();
         writer.uvarint(self.samples.len() as u64);
         for sample in &self.samples {
@@ -596,6 +631,9 @@ impl LossCoverageBlock {
         dropped_lower_bound: u64,
         bounds: &Bounds,
     ) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() {
+            return Err(BlockError::AboveBound);
+        }
         if covered.spans().len() as u64 > bounds.coverage_spans
             || known_gaps.spans().len() as u64 > bounds.coverage_spans
         {
@@ -637,6 +675,9 @@ impl LossCoverageBlock {
     /// Returns [`BlockError`] for a truncated, out-of-order, out-of-bound,
     /// invalid-enum, or trailing-byte body.
     pub fn decode(body: &[u8], bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() || body.len() as u64 > bounds.decoded_block_len {
+            return Err(BlockError::AboveBound);
+        }
         let mut reader = ByteReader::new(body);
         let covered = read_coverage(&mut reader, bounds.coverage_spans)?;
         let known_gaps = read_coverage(&mut reader, bounds.coverage_spans)?;
@@ -670,7 +711,7 @@ impl EncodableBlock for LossCoverageBlock {
     }
 
     fn item_count(&self) -> u64 {
-        (self.covered.spans().len() + self.known_gaps.spans().len()) as u64
+        (self.covered.spans().len() + self.known_gaps.spans().len()) as u64 + 1
     }
 
     fn time_range(&self) -> Option<(i64, i64)> {
@@ -686,7 +727,8 @@ impl EncodableBlock for LossCoverageBlock {
             .iter()
             .chain(self.known_gaps.spans())
             .map(|span| span.end_us());
-        Some((starts.min()?, ends.max()?))
+        let end_exclusive = ends.max()?;
+        Some((starts.min()?, end_exclusive.checked_sub(1)?))
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -728,6 +770,9 @@ impl ResetMarkersBlock {
     /// `(series_id, ts_us)`, and [`BlockError::AboveBound`] past the item
     /// bound.
     pub fn new(mut markers: Vec<ResetMarker>, bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() {
+            return Err(BlockError::AboveBound);
+        }
         if markers.len() as u64 > bounds.items_per_block {
             return Err(BlockError::AboveBound);
         }
@@ -753,6 +798,14 @@ impl ResetMarkersBlock {
     /// Returns [`BlockError`] for a truncated, out-of-order, out-of-bound, or
     /// trailing-byte body.
     pub fn decode(body: &[u8], bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() || body.len() as u64 > bounds.decoded_block_len {
+            return Err(BlockError::AboveBound);
+        }
+        if body.is_empty() {
+            return Ok(Self {
+                markers: Vec::new(),
+            });
+        }
         let mut reader = ByteReader::new(body);
         let count = reader.uvarint(bounds.items_per_block)?;
         let mut markers = Vec::with_capacity(count.min(4_096) as usize);
@@ -800,6 +853,9 @@ impl EncodableBlock for ResetMarkersBlock {
     }
 
     fn encode(&self) -> Vec<u8> {
+        if self.markers.is_empty() {
+            return Vec::new();
+        }
         let mut writer = ByteWriter::new();
         writer.uvarint(self.markers.len() as u64);
         for marker in &self.markers {
@@ -838,6 +894,9 @@ impl EntityStatesBlock {
     /// `(series_id, ts_us)`, and [`BlockError::AboveBound`] past the item
     /// bound.
     pub fn new(mut records: Vec<EntityStateRecord>, bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() {
+            return Err(BlockError::AboveBound);
+        }
         if records.len() as u64 > bounds.items_per_block {
             return Err(BlockError::AboveBound);
         }
@@ -863,6 +922,14 @@ impl EntityStatesBlock {
     /// Returns [`BlockError`] for a truncated, out-of-order, out-of-bound, or
     /// trailing-byte body.
     pub fn decode(body: &[u8], bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() || body.len() as u64 > bounds.decoded_block_len {
+            return Err(BlockError::AboveBound);
+        }
+        if body.is_empty() {
+            return Ok(Self {
+                records: Vec::new(),
+            });
+        }
         let mut reader = ByteReader::new(body);
         let count = reader.uvarint(bounds.items_per_block)?;
         let mut records = Vec::with_capacity(count.min(4_096) as usize);
@@ -912,6 +979,9 @@ impl EncodableBlock for EntityStatesBlock {
     }
 
     fn encode(&self) -> Vec<u8> {
+        if self.records.is_empty() {
+            return Vec::new();
+        }
         let mut writer = ByteWriter::new();
         writer.uvarint(self.records.len() as u64);
         for record in &self.records {
@@ -927,9 +997,22 @@ impl EncodableBlock for EntityStatesBlock {
 /// A canonical, sorted-unique table of retained text and byte values.
 ///
 /// A retained text reference is the position of its value in the sorted table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StringTableBlock {
     entries: Vec<Box<[u8]>>,
+}
+
+impl std::fmt::Debug for StringTableBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stored_bytes = self
+            .entries
+            .iter()
+            .fold(0_usize, |total, entry| total.saturating_add(entry.len()));
+        f.debug_struct("StringTableBlock")
+            .field("entries", &self.entries.len())
+            .field("stored_bytes", &stored_bytes)
+            .finish()
+    }
 }
 
 impl StringTableBlock {
@@ -940,6 +1023,9 @@ impl StringTableBlock {
     /// bound, the table exceeds the decoded string bound, or the count exceeds
     /// the item bound.
     pub fn new(values: Vec<Box<[u8]>>, bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() {
+            return Err(BlockError::AboveBound);
+        }
         if values.len() as u64 > bounds.items_per_block {
             return Err(BlockError::AboveBound);
         }
@@ -973,6 +1059,14 @@ impl StringTableBlock {
     /// Returns [`BlockError`] for a truncated, out-of-order, duplicate,
     /// out-of-bound, or trailing-byte body.
     pub fn decode(body: &[u8], bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() || body.len() as u64 > bounds.decoded_block_len {
+            return Err(BlockError::AboveBound);
+        }
+        if body.is_empty() {
+            return Ok(Self {
+                entries: Vec::new(),
+            });
+        }
         let mut reader = ByteReader::new(body);
         let count = reader.uvarint(bounds.items_per_block)?;
         let mut entries: Vec<Box<[u8]>> = Vec::with_capacity(count.min(4_096) as usize);
@@ -1017,6 +1111,9 @@ impl EncodableBlock for StringTableBlock {
     }
 
     fn encode(&self) -> Vec<u8> {
+        if self.entries.is_empty() {
+            return Vec::new();
+        }
         let mut writer = ByteWriter::new();
         writer.uvarint(self.entries.len() as u64);
         for entry in &self.entries {
@@ -1037,7 +1134,7 @@ pub struct SourceManifestBlock {
     source_min_ts_us: i64,
     source_max_ts_us: i64,
     source_file_len: u64,
-    entries: Vec<CatalogEntryDescriptor>,
+    entries: Vec<ManifestEntryDescriptor>,
 }
 
 impl SourceManifestBlock {
@@ -1051,11 +1148,17 @@ impl SourceManifestBlock {
         source_min_ts_us: i64,
         source_max_ts_us: i64,
         source_file_len: u64,
-        entries: Vec<CatalogEntryDescriptor>,
+        entries: Vec<ManifestEntryDescriptor>,
         bounds: &Bounds,
     ) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() {
+            return Err(BlockError::AboveBound);
+        }
         if entries.len() as u64 > u64::from(bounds.directory_entries) {
             return Err(BlockError::AboveBound);
+        }
+        if source_min_ts_us > source_max_ts_us {
+            return Err(BlockError::Malformed);
         }
         Ok(Self {
             source_id,
@@ -1069,7 +1172,7 @@ impl SourceManifestBlock {
 
     /// The catalog inventory, in catalog order.
     #[must_use]
-    pub fn entries(&self) -> &[CatalogEntryDescriptor] {
+    pub fn entries(&self) -> &[ManifestEntryDescriptor] {
         &self.entries
     }
 
@@ -1085,18 +1188,36 @@ impl SourceManifestBlock {
         self.source_file_len
     }
 
+    /// PGM container version recorded for the segment.
+    #[must_use]
+    pub const fn source_format_version(&self) -> u32 {
+        self.source_format_version
+    }
+
+    /// Inclusive PGM timestamp range.
+    #[must_use]
+    pub const fn source_time_range(&self) -> (i64, i64) {
+        (self.source_min_ts_us, self.source_max_ts_us)
+    }
+
     /// Decodes a source-manifest block body.
     ///
     /// # Errors
     /// Returns [`BlockError`] for a truncated, out-of-bound, or trailing-byte
     /// body.
     pub fn decode(body: &[u8], bounds: &Bounds) -> Result<Self, BlockError> {
+        if !bounds.is_within_absolute_limits() || body.len() as u64 > bounds.decoded_block_len {
+            return Err(BlockError::AboveBound);
+        }
         let mut reader = ByteReader::new(body);
         let source_id = reader.u64_le()?;
         let source_format_version = reader.u32_le()?;
         let source_min_ts_us = reader.i64_le()?;
         let source_max_ts_us = reader.i64_le()?;
         let source_file_len = reader.u64_le()?;
+        if source_min_ts_us > source_max_ts_us {
+            return Err(BlockError::Malformed);
+        }
         let count = reader.uvarint(u64::from(bounds.directory_entries))?;
         let mut entries = Vec::with_capacity(count.min(4_096) as usize);
         for _ in 0..count {
@@ -1105,12 +1226,20 @@ impl SourceManifestBlock {
             let body_len = reader.u64_le()?;
             let rows = reader.u32_le()?;
             let body_crc32c = reader.u32_le()?;
-            entries.push(CatalogEntryDescriptor {
-                type_id,
-                flags,
-                body_len,
-                rows,
-                body_crc32c,
+            let section_body_id = match reader.u8()? {
+                0 => None,
+                1 => Some(kronika_analytics::overview::SectionBodyId(reader.array()?)),
+                _ => return Err(BlockError::Malformed),
+            };
+            entries.push(ManifestEntryDescriptor {
+                catalog: CatalogEntryDescriptor {
+                    type_id,
+                    flags,
+                    body_len,
+                    rows,
+                    body_crc32c,
+                },
+                section_body_id,
             });
         }
         reader.finish()?;
@@ -1135,11 +1264,11 @@ impl EncodableBlock for SourceManifestBlock {
     }
 
     fn item_count(&self) -> u64 {
-        self.entries.len() as u64
+        self.entries.len() as u64 + 1
     }
 
     fn time_range(&self) -> Option<(i64, i64)> {
-        Some((self.source_min_ts_us, self.source_max_ts_us))
+        None
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -1151,11 +1280,18 @@ impl EncodableBlock for SourceManifestBlock {
         writer.u64_le(self.source_file_len);
         writer.uvarint(self.entries.len() as u64);
         for entry in &self.entries {
-            writer.u32_le(entry.type_id);
-            writer.u32_le(entry.flags);
-            writer.u64_le(entry.body_len);
-            writer.u32_le(entry.rows);
-            writer.u32_le(entry.body_crc32c);
+            writer.u32_le(entry.catalog.type_id);
+            writer.u32_le(entry.catalog.flags);
+            writer.u64_le(entry.catalog.body_len);
+            writer.u32_le(entry.catalog.rows);
+            writer.u32_le(entry.catalog.body_crc32c);
+            match entry.section_body_id {
+                Some(section_body_id) => {
+                    writer.u8(1);
+                    writer.bytes(&section_body_id.0);
+                }
+                None => writer.u8(0),
+            }
         }
         writer.into_bytes()
     }
@@ -1202,6 +1338,7 @@ mod tests {
         let flags = BlockFlags {
             required_for_schema: true,
             canonically_sorted: true,
+            has_time_range: true,
             codec: BlockCodec::None,
         };
         assert_eq!(BlockFlags::from_bits(flags.to_bits()), Ok(flags));
@@ -1209,6 +1346,7 @@ mod tests {
         let zstd = BlockFlags {
             required_for_schema: false,
             canonically_sorted: true,
+            has_time_range: false,
             codec: BlockCodec::Zstd,
         };
         assert_eq!(BlockFlags::from_bits(zstd.to_bits()), Ok(zstd));
@@ -1481,26 +1619,32 @@ mod tests {
     #[test]
     fn source_manifest_round_trips_in_catalog_order() {
         let entries = vec![
-            CatalogEntryDescriptor {
-                type_id: 1_022_001,
-                flags: 0,
-                body_len: 4_096,
-                rows: 12,
-                body_crc32c: 0xAAAA,
+            ManifestEntryDescriptor {
+                catalog: CatalogEntryDescriptor {
+                    type_id: 1_022_001,
+                    flags: 0,
+                    body_len: 4_096,
+                    rows: 12,
+                    body_crc32c: 0xAAAA,
+                },
+                section_body_id: Some(kronika_analytics::overview::SectionBodyId([1; 32])),
             },
-            CatalogEntryDescriptor {
-                type_id: 1_028_001,
-                flags: 0,
-                body_len: 8,
-                rows: 1,
-                body_crc32c: 0xBBBB,
+            ManifestEntryDescriptor {
+                catalog: CatalogEntryDescriptor {
+                    type_id: 1_028_001,
+                    flags: 0,
+                    body_len: 8,
+                    rows: 1,
+                    body_crc32c: 0xBBBB,
+                },
+                section_body_id: None,
             },
         ];
         let block =
             SourceManifestBlock::new(7, 1, 1_000, 2_000, 65_536, entries, &BOUNDS).expect("valid");
         let decoded = SourceManifestBlock::decode(&block.encode(), &BOUNDS).expect("decode");
         assert_eq!(decoded, block);
-        assert_eq!(decoded.entries()[0].type_id, 1_022_001);
+        assert_eq!(decoded.entries()[0].catalog.type_id, 1_022_001);
         assert_eq!(decoded.source_id(), 7);
         assert_eq!(decoded.source_file_len(), 65_536);
     }

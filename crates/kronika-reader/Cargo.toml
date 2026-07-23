@@ -14,7 +14,9 @@ kronika-registry = { path = "../kronika-registry" }
 kronika-analytics = { path = "../kronika-analytics" }
 kronika-store = { path = "../kronika-store" }
 arrow-array = "55"
+arrow-schema = "55"
 parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 kronika-writer = { path = "../kronika-writer" }
@@ -29,6 +31,10 @@ harness = false
 
 [[bench]]
 name = "diff_scan"
+harness = false
+
+[[bench]]
+name = "overview_codec"
 harness = false
 
 [lints]

@@ -1372,6 +1372,7 @@ name = "kronika-reader"
 version = "0.0.0"
 dependencies = [
  "arrow-array",
+ "arrow-schema",
  "criterion",
  "kronika-analytics",
  "kronika-format",
@@ -1381,6 +1382,7 @@ dependencies = [
  "mimalloc",
  "parquet",
  "proptest",
+ "sha2 0.10.9",
  "tempfile",
 ]
 

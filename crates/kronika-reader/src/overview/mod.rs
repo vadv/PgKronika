@@ -1,14 +1,8 @@
-//! Physical fact-file format and selective extraction for the timeline overview.
+//! Bounded `PGKOVF` codec and positional reads for overview facts.
 //!
-//! This module owns the reader side of the overview index: the bounded
-//! `PGKOVF` container codec (header, block directory, and typed logical
-//! blocks), the safety bounds that guard every untrusted length before it
-//! reaches an allocation, durable publication, and the catalog-derived
-//! descriptors that name a segment's facts.
-//!
-//! Formula, notable, and HTTP semantics do not live here. The codec stores
-//! and validates content-addressed identities as opaque bytes; it never
-//! decides what a fact means.
+//! This module defines typed logical blocks, pre-allocation safety limits,
+//! catalog-derived identities, and selective reads. It does not interpret
+//! factor semantics.
 //!
 //! # Layering
 //!
@@ -26,7 +20,6 @@ mod limits;
 mod observations;
 #[cfg(test)]
 mod proptests;
-mod publish;
 
 pub use block::{
     BlockCodec, BlockError, BlockFlags, BlockKind, CounterSamplesBlock, EntityStateRecord,
@@ -34,13 +27,15 @@ pub use block::{
     SourceManifestBlock, StringTableBlock,
 };
 pub use container::{
-    BlockContent, BlockDirectoryEntry, CacheReadError, FactFile, FactFileHeader, HeaderIdentity,
+    BlockContent, BlockDirectoryEntry, CacheReadError, FactFile, FactFileHeader, FactFileReader,
+    FactReadStats, HeaderIdentity,
 };
 pub use descriptors::{
-    CatalogEntryDescriptor, DescriptorGap, FactKeyPreimage, SegmentContentDescriptor,
-    SourceScopePreimage, lineage_from_catalog,
+    CatalogEntryDescriptor, DictionaryContextEntry, ManifestEntryDescriptor, SourceDescriptor,
+    dictionary_context_id, lineage_from_catalog, section_body_id, source_scope_id,
 };
-pub use dictionary::{ResolvedPattern, resolve_targeted};
+pub use dictionary::{
+    ResolvedPattern, TargetedDictionaryRead, TargetedDictionaryStats, resolve_targeted,
+};
 pub use limits::{Bounds, LIMIT};
 pub use observations::EventObservationsBlock;
-pub use publish::{PersistError, PublishOutcome, publish};

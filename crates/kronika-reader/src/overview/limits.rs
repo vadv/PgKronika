@@ -1,14 +1,11 @@
 //! Correctness and denial-of-service bounds for the fact-file codec.
 //!
-//! Every value here is a hard cap checked before an allocation, not a
-//! performance claim. Exceeding a cap turns a segment `Uncacheable`; it never
-//! truncates canonical facts, and it never lets an untrusted length drive an
-//! allocation.
+//! Admission checks these hard caps before allocating from untrusted lengths.
+//! Encoders and decoders return a typed limit error instead of truncating data.
 
 /// The `PGKOVF` admission bounds from the format contract.
 ///
-/// The fields mirror the specification table one for one so a reviewer can
-/// compare them against it directly.
+/// Callers may provide tighter values. Values above [`LIMIT`] are rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bounds {
     /// Largest accepted fact-file length, bytes.
@@ -21,6 +18,8 @@ pub struct Bounds {
     pub stored_block_len: u64,
     /// Largest accepted decoded block size, bytes.
     pub decoded_block_len: u64,
+    /// Largest accepted sum of decoded block lengths in one file.
+    pub decoded_file_bytes: u64,
     /// Largest accepted item count in one block.
     pub items_per_block: u64,
     /// Largest accepted SQLSTATE-key count in one aggregate.
@@ -35,6 +34,23 @@ pub struct Bounds {
     pub string_table_bytes: u64,
 }
 
+impl Bounds {
+    pub(crate) const fn is_within_absolute_limits(self) -> bool {
+        self.fact_file_len <= LIMIT.fact_file_len
+            && self.directory_entries <= LIMIT.directory_entries
+            && self.directory_bytes <= LIMIT.directory_bytes
+            && self.stored_block_len <= LIMIT.stored_block_len
+            && self.decoded_block_len <= LIMIT.decoded_block_len
+            && self.decoded_file_bytes <= LIMIT.decoded_file_bytes
+            && self.items_per_block <= LIMIT.items_per_block
+            && self.sqlstate_keys <= LIMIT.sqlstate_keys
+            && self.signal_keys <= LIMIT.signal_keys
+            && self.coverage_spans <= LIMIT.coverage_spans
+            && self.pattern_bytes <= LIMIT.pattern_bytes
+            && self.string_table_bytes <= LIMIT.string_table_bytes
+    }
+}
+
 /// The version-1 admission bounds.
 pub const LIMIT: Bounds = Bounds {
     fact_file_len: 512 * MIB,
@@ -42,6 +58,7 @@ pub const LIMIT: Bounds = Bounds {
     directory_bytes: 256 * KIB,
     stored_block_len: 64 * MIB,
     decoded_block_len: 128 * MIB,
+    decoded_file_bytes: GIB,
     items_per_block: 1_048_576,
     sqlstate_keys: 65_536,
     signal_keys: 1_024,
@@ -52,18 +69,20 @@ pub const LIMIT: Bounds = Bounds {
 
 const KIB: u64 = 1_024;
 const MIB: u64 = 1_024 * 1_024;
+const GIB: u64 = 1_024 * MIB;
 
 #[cfg(test)]
 mod tests {
     use super::LIMIT;
 
     #[test]
-    fn published_bounds_match_the_format_contract() {
+    fn absolute_bounds_match_the_format_contract() {
         assert_eq!(LIMIT.fact_file_len, 536_870_912);
         assert_eq!(LIMIT.directory_entries, 4_096);
         assert_eq!(LIMIT.directory_bytes, 262_144);
         assert_eq!(LIMIT.stored_block_len, 67_108_864);
         assert_eq!(LIMIT.decoded_block_len, 134_217_728);
+        assert_eq!(LIMIT.decoded_file_bytes, 1_073_741_824);
         assert_eq!(LIMIT.items_per_block, 1_048_576);
         assert_eq!(LIMIT.sqlstate_keys, 65_536);
         assert_eq!(LIMIT.signal_keys, 1_024);
