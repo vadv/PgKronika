@@ -1,6 +1,6 @@
 [package]
 name = "kronika-analytics"
-description = "Source-independent analytics: counter diffs and spike scoring"
+description = "Source-independent counter, anomaly, and overview contract kernels"
 publish = false
 version.workspace = true
 edition.workspace = true
