@@ -411,7 +411,7 @@ impl FactFile {
             }
             let item_count =
                 u32::try_from(encoded.item_count).map_err(|_error| CacheReadError::Oversized)?;
-            if u64::from(item_count) > bounds.items_per_block {
+            if u64::from(item_count) > item_count_bound(block.kind().code(), bounds) {
                 return Err(CacheReadError::Oversized);
             }
             if (item_count == 0) != encoded.body.is_empty() {
@@ -617,6 +617,26 @@ impl<R: ReadAt> FactFileReader<R> {
     /// Returns [`CacheReadError`] for an I/O error, CRC failure, or counter
     /// overflow.
     pub fn read_blocks(&mut self, kind: BlockKind) -> Result<Vec<Vec<u8>>, CacheReadError> {
+        Ok(self
+            .read_matching_blocks(kind, None)?
+            .into_iter()
+            .map(|(_entry, body)| body)
+            .collect())
+    }
+
+    /// Reads blocks of `kind` with the admitted directory entry for each body.
+    ///
+    /// The entry lets a selective logical decoder verify item count, canonical
+    /// ordering, and time range without reading unrelated block kinds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheReadError`] under the same conditions as
+    /// [`Self::read_blocks`].
+    pub fn read_blocks_with_entries(
+        &mut self,
+        kind: BlockKind,
+    ) -> Result<Vec<(BlockDirectoryEntry, Vec<u8>)>, CacheReadError> {
         self.read_matching_blocks(kind, None)
     }
 
@@ -635,14 +655,18 @@ impl<R: ReadAt> FactFileReader<R> {
         from: i64,
         to: i64,
     ) -> Result<Vec<Vec<u8>>, CacheReadError> {
-        self.read_matching_blocks(kind, Some((from, to)))
+        Ok(self
+            .read_matching_blocks(kind, Some((from, to)))?
+            .into_iter()
+            .map(|(_entry, body)| body)
+            .collect())
     }
 
     fn read_matching_blocks(
         &mut self,
         kind: BlockKind,
         range: Option<(i64, i64)>,
-    ) -> Result<Vec<Vec<u8>>, CacheReadError> {
+    ) -> Result<Vec<(BlockDirectoryEntry, Vec<u8>)>, CacheReadError> {
         let selected: Vec<_> = self
             .directory
             .iter()
@@ -681,7 +705,7 @@ impl<R: ReadAt> FactFileReader<R> {
                 .decoded_bytes
                 .checked_add(entry.decoded_len)
                 .ok_or(CacheReadError::Oversized)?;
-            bodies.push(body);
+            bodies.push((entry, body));
         }
         Ok(bodies)
     }
@@ -922,7 +946,7 @@ fn decode_directory(
         if stored_len != decoded_len {
             return Err(CacheReadError::Corrupt);
         }
-        if u64::from(item_count) > bounds.items_per_block {
+        if u64::from(item_count) > item_count_bound(block_kind, bounds) {
             return Err(CacheReadError::Oversized);
         }
         if item_count == 0 {
@@ -969,6 +993,7 @@ fn validate_directory(
     let mut previous_order: Option<(u32, u32, i64)> = None;
     let mut previous_range: BTreeMap<(u32, u32), Option<i64>> = BTreeMap::new();
     let mut item_sums: BTreeMap<(u32, u32), u64> = BTreeMap::new();
+    let mut flattened_item_sums: BTreeMap<u32, u64> = BTreeMap::new();
     let mut decoded_sum = 0_u64;
 
     for entry in directory {
@@ -993,12 +1018,34 @@ fn validate_directory(
             return Err(CacheReadError::Oversized);
         }
         let key = (entry.block_kind, entry.logical_id);
-        let item_sum = item_sums.entry(key).or_default();
+        let is_coverage = BlockKind::from_code(entry.block_kind) == Some(BlockKind::LossCoverage);
+        let item_sum = item_sums
+            .entry(key)
+            .or_insert_with(|| u64::from(is_coverage));
+        let added_items = if is_coverage {
+            u64::from(entry.item_count)
+                .checked_sub(1)
+                .ok_or(CacheReadError::Corrupt)?
+        } else {
+            u64::from(entry.item_count)
+        };
         *item_sum = item_sum
-            .checked_add(u64::from(entry.item_count))
+            .checked_add(added_items)
             .ok_or(CacheReadError::Oversized)?;
-        if *item_sum > bounds.items_per_block {
+        if *item_sum > item_count_bound(entry.block_kind, bounds) {
             return Err(CacheReadError::Oversized);
+        }
+        if matches!(
+            BlockKind::from_code(entry.block_kind),
+            Some(BlockKind::EventObservations)
+        ) {
+            let flattened_sum = flattened_item_sums.entry(entry.block_kind).or_default();
+            *flattened_sum = flattened_sum
+                .checked_add(u64::from(entry.item_count))
+                .ok_or(CacheReadError::Oversized)?;
+            if *flattened_sum > bounds.items_per_block {
+                return Err(CacheReadError::Oversized);
+            }
         }
         match previous_range.insert(key, entry.flags.has_time_range.then_some(entry.max_ts_us)) {
             Some(Some(previous_max))
@@ -1020,6 +1067,14 @@ fn validate_directory(
         return Err(CacheReadError::Corrupt);
     }
     verify_required_baseline(directory)
+}
+
+fn item_count_bound(block_kind: u32, bounds: &Bounds) -> u64 {
+    if block_kind == BlockKind::SourceManifest.code() {
+        u64::from(bounds.directory_entries) + 1
+    } else {
+        bounds.items_per_block
+    }
 }
 
 fn verify_required_baseline(directory: &[BlockDirectoryEntry]) -> Result<(), CacheReadError> {
@@ -1061,6 +1116,10 @@ fn validate_logical_blocks(
         .ok_or(CacheReadError::Corrupt)?;
     let strings = StringTableBlock::decode(bodies[strings_index], bounds)?;
     let mut referenced_strings = Vec::new();
+    let mut remaining_observations = bounds.items_per_block;
+    let mut observation_text_budget = bounds.decoded_block_len;
+    let mut covered_span_budget = bounds.coverage_spans;
+    let mut gap_span_budget = bounds.coverage_spans;
 
     for (entry, body) in directory.iter().zip(bodies) {
         let Some(kind) = BlockKind::from_code(entry.block_kind) else {
@@ -1069,7 +1128,14 @@ fn validate_logical_blocks(
         let logical = match kind {
             BlockKind::SourceManifest => logical_descriptor(&manifest),
             BlockKind::EventObservations => {
-                let block = EventObservationsBlock::decode(body, lineage, &strings, bounds)?;
+                let block = EventObservationsBlock::decode_with_budgets(
+                    body,
+                    lineage,
+                    &strings,
+                    bounds,
+                    &mut remaining_observations,
+                    &mut observation_text_budget,
+                )?;
                 validate_observation_provenance(&block, &manifest)?;
                 referenced_strings.extend(block.string_table().values().iter().cloned());
                 logical_descriptor(&block)
@@ -1085,7 +1151,12 @@ fn validate_logical_blocks(
                 }
             }
             BlockKind::LossCoverage => {
-                logical_descriptor(&LossCoverageBlock::decode(body, bounds)?)
+                logical_descriptor(&LossCoverageBlock::decode_with_span_budgets(
+                    body,
+                    bounds,
+                    &mut covered_span_budget,
+                    &mut gap_span_budget,
+                )?)
             }
             BlockKind::GaugeSamples => {
                 logical_descriptor(&GaugeSamplesBlock::decode(body, bounds)?)
@@ -1101,23 +1172,7 @@ fn validate_logical_blocks(
             }
             BlockKind::StringTable => logical_descriptor(&StringTableBlock::decode(body, bounds)?),
         };
-        if logical.sorted != entry.flags.canonically_sorted
-            || logical.item_count != u64::from(entry.item_count)
-            || logical.time_range.is_some() != entry.flags.has_time_range
-        {
-            return Err(CacheReadError::Corrupt);
-        }
-        match logical.time_range {
-            Some((minimum, maximum))
-                if minimum != entry.min_ts_us || maximum != entry.max_ts_us =>
-            {
-                return Err(CacheReadError::Corrupt);
-            }
-            None if entry.min_ts_us != 0 || entry.max_ts_us != 0 => {
-                return Err(CacheReadError::Corrupt);
-            }
-            _ => {}
-        }
+        validate_logical_descriptor(entry, &logical)?;
     }
     let referenced_strings = StringTableBlock::new(referenced_strings, bounds)?;
     if referenced_strings != strings {
@@ -1140,7 +1195,33 @@ fn logical_descriptor<B: EncodableBlock>(block: &B) -> LogicalDescriptor {
     }
 }
 
-fn verify_manifest_identity(
+pub(super) fn validate_block_descriptor<B: EncodableBlock>(
+    entry: &BlockDirectoryEntry,
+    block: &B,
+) -> Result<(), CacheReadError> {
+    validate_logical_descriptor(entry, &logical_descriptor(block))
+}
+
+fn validate_logical_descriptor(
+    entry: &BlockDirectoryEntry,
+    logical: &LogicalDescriptor,
+) -> Result<(), CacheReadError> {
+    if logical.sorted != entry.flags.canonically_sorted
+        || logical.item_count != u64::from(entry.item_count)
+        || logical.time_range.is_some() != entry.flags.has_time_range
+    {
+        return Err(CacheReadError::Corrupt);
+    }
+    match logical.time_range {
+        Some((minimum, maximum)) if minimum != entry.min_ts_us || maximum != entry.max_ts_us => {
+            Err(CacheReadError::Corrupt)
+        }
+        None if entry.min_ts_us != 0 || entry.max_ts_us != 0 => Err(CacheReadError::Corrupt),
+        _ => Ok(()),
+    }
+}
+
+pub(super) fn verify_manifest_identity(
     manifest: &SourceManifestBlock,
     identity: &HeaderIdentity,
 ) -> Result<(), CacheReadError> {
@@ -1154,7 +1235,7 @@ fn verify_manifest_identity(
     Ok(())
 }
 
-fn validate_observation_provenance(
+pub(super) fn validate_observation_provenance(
     observations: &EventObservationsBlock,
     manifest: &SourceManifestBlock,
 ) -> Result<(), CacheReadError> {
@@ -1273,13 +1354,15 @@ mod tests {
     use std::rc::Rc;
 
     use kronika_analytics::overview::{
-        AlignmentId, CounterSample, DroppedFieldCount, EventObservation, EvidenceQuality,
-        GaugeSample, LifecyclePayload, MetricSeriesId, NamingContractId, ObservationPayload,
-        ObservationProvenance, ObservationShape, ObservationTime, QualityFlags, SectionBodyId,
-        SegmentLocator, TimeQuality,
+        AlignmentId, Applicability, CounterSample, Coverage, CoverageSpan, DroppedFieldCount,
+        EventObservation, EvidenceQuality, GaugeSample, LifecyclePayload, MetricSeriesId,
+        NamingContractId, ObservationPayload, ObservationProvenance, ObservationShape,
+        ObservationTime, PeriodQuality, PhysicalCountSemantics, QualityFlags, RetainedExactness,
+        SectionBodyId, SegmentLocator, SourceCompleteness, TimeQuality,
     };
 
     use super::super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor};
+    use super::super::facts::SegmentFacts;
     use super::super::limits::LIMIT;
     use super::*;
 
@@ -1363,6 +1446,15 @@ mod tests {
     }
 
     fn ready_observation() -> EventObservation {
+        ready_observation_at(0, 1_500, None, Some("database system is ready"))
+    }
+
+    fn ready_observation_at(
+        row_ordinal: u32,
+        sort_ts_us: i64,
+        shutdown_mode: Option<&str>,
+        message: Option<&str>,
+    ) -> EventObservation {
         EventObservation::new(
             event_lineage(),
             1_028_001,
@@ -1370,14 +1462,14 @@ mod tests {
                 segment_locator: Some(SegmentLocator([0x44; 32])),
                 section_body_id: SectionBodyId([0x66; 32]),
                 catalog_entry_ordinal: 0,
-                row_ordinal: 0,
+                row_ordinal,
                 dictionary_context_id: kronika_analytics::overview::DictionaryContextId([0x77; 32]),
                 source_locator: None,
             },
             ObservationShape::Individual,
             ObservationTime {
-                sort_ts_us: 1_500,
-                occurred_at_us: Some(1_500),
+                sort_ts_us,
+                occurred_at_us: Some(sort_ts_us),
                 observed_interval: None,
                 quality: TimeQuality::Exact,
             },
@@ -1385,8 +1477,8 @@ mod tests {
             ObservationPayload::ReadyObserved(Box::new(LifecyclePayload {
                 pid: None,
                 signal: None,
-                shutdown_mode: None,
-                message: Some("database system is ready".into()),
+                shutdown_mode: shutdown_mode.map(Into::into),
+                message: message.map(Into::into),
                 query_detail: None,
                 dropped_field_count: DroppedFieldCount(0),
             })),
@@ -1398,6 +1490,10 @@ mod tests {
     }
 
     fn event_manifest() -> SourceManifestBlock {
+        event_manifest_with_rows(1)
+    }
+
+    fn event_manifest_with_rows(rows: u32) -> SourceManifestBlock {
         SourceManifestBlock::new(
             7,
             1,
@@ -1409,7 +1505,7 @@ mod tests {
                     type_id: 1_028_001,
                     flags: 0,
                     body_len: 128,
-                    rows: 1,
+                    rows,
                     body_crc32c: 9,
                 },
                 section_body_id: Some(SectionBodyId([0x66; 32])),
@@ -1484,6 +1580,162 @@ mod tests {
         let checksum_at = entry_field(index, 44);
         bytes[checksum_at..checksum_at + 4].copy_from_slice(&checksum.to_le_bytes());
         reseal_directory(bytes);
+    }
+
+    fn insert_logical_block<B: EncodableBlock>(bytes: &mut Vec<u8>, logical_id: u32, block: &B) {
+        let old_count = u32_at(bytes, 136) as usize;
+        let old_file_len = u64_at(bytes, 144);
+        let source = entry_index(bytes, block.kind());
+        let insert = source + 1;
+        let source_offset = u64_at(bytes, entry_field(source, 16));
+        let source_len = u64_at(bytes, entry_field(source, 24));
+        let body_boundary = source_offset
+            .checked_add(source_len)
+            .expect("source body boundary");
+        let source_entry = entry_field(source, 0);
+        let cloned_entry = bytes[source_entry..source_entry + DIRECTORY_ENTRY_LEN].to_vec();
+        let directory_insert = entry_field(insert, 0);
+        bytes.splice(directory_insert..directory_insert, cloned_entry);
+
+        let body = block.encode();
+        let body_len = body.len() as u64;
+        for index in 0..=old_count {
+            if index == insert {
+                continue;
+            }
+            let offset_at = entry_field(index, 16);
+            let old_offset = u64_at(bytes, offset_at);
+            let body_shift = if old_offset >= body_boundary {
+                body_len
+            } else {
+                0
+            };
+            let shifted = old_offset
+                .checked_add(DIRECTORY_ENTRY_LEN as u64)
+                .and_then(|offset| offset.checked_add(body_shift))
+                .expect("shifted body offset");
+            bytes[offset_at..offset_at + 8].copy_from_slice(&shifted.to_le_bytes());
+        }
+
+        let body_offset = body_boundary
+            .checked_add(DIRECTORY_ENTRY_LEN as u64)
+            .expect("inserted body offset");
+        let body_at = usize::try_from(body_offset).expect("inserted body offset fits usize");
+        bytes.splice(body_at..body_at, body.iter().copied());
+
+        let entry = entry_field(insert, 0);
+        bytes[entry + 8..entry + 12].copy_from_slice(&logical_id.to_le_bytes());
+        bytes[entry + 16..entry + 24].copy_from_slice(&body_offset.to_le_bytes());
+        bytes[entry + 24..entry + 32].copy_from_slice(&body_len.to_le_bytes());
+        bytes[entry + 32..entry + 40].copy_from_slice(&body_len.to_le_bytes());
+        let item_count = u32::try_from(block.item_count()).expect("item count fits u32");
+        bytes[entry + 40..entry + 44].copy_from_slice(&item_count.to_le_bytes());
+        bytes[entry + 44..entry + 48].copy_from_slice(&crc32c(&body).to_le_bytes());
+        let (minimum, maximum) = block.time_range().expect("temporal test block");
+        bytes[entry + 48..entry + 56].copy_from_slice(&minimum.to_le_bytes());
+        bytes[entry + 56..entry + 64].copy_from_slice(&maximum.to_le_bytes());
+
+        let new_count = u32::try_from(old_count + 1).expect("directory count fits u32");
+        bytes[136..140].copy_from_slice(&new_count.to_le_bytes());
+        let new_file_len = old_file_len
+            .checked_add(DIRECTORY_ENTRY_LEN as u64)
+            .and_then(|length| length.checked_add(body_len))
+            .expect("fact file length");
+        bytes[144..152].copy_from_slice(&new_file_len.to_le_bytes());
+        assert_eq!(bytes.len() as u64, new_file_len);
+        reseal_directory(bytes);
+    }
+
+    fn partitioned_observation_file(
+        shutdown_mode: &str,
+        message: &str,
+    ) -> (Vec<u8>, Vec<CatalogEntryDescriptor>) {
+        let manifest = event_manifest_with_rows(4);
+        let expected_catalog = manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.catalog)
+            .collect();
+        let first = EventObservationsBlock::new(
+            vec![
+                ready_observation_at(0, 1_200, Some(shutdown_mode), Some(message)),
+                ready_observation_at(1, 1_300, None, None),
+                ready_observation_at(2, 1_400, None, None),
+            ],
+            &LIMIT,
+        )
+        .expect("first observation partition");
+        let second = EventObservationsBlock::new(
+            vec![ready_observation_at(
+                3,
+                1_500,
+                Some(shutdown_mode),
+                Some(message),
+            )],
+            &LIMIT,
+        )
+        .expect("second observation partition");
+        let mut bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest)),
+                BlockContent::EventObservations(Box::new(first)),
+            ],
+            &LIMIT,
+        )
+        .expect("build partitioned observation file");
+        insert_logical_block(&mut bytes, 1, &second);
+        (bytes, expected_catalog)
+    }
+
+    fn loss_coverage(covered: Coverage, known_gaps: Coverage) -> LossCoverageBlock {
+        LossCoverageBlock::new(
+            covered,
+            known_gaps,
+            Applicability::Applicable,
+            PeriodQuality::Unknown,
+            SourceCompleteness::BoundedSubset,
+            RetainedExactness::Exact,
+            PhysicalCountSemantics::LowerBound,
+            0,
+            &LIMIT,
+        )
+        .expect("loss coverage")
+    }
+
+    fn partitioned_coverage_file(gaps: bool) -> (Vec<u8>, Vec<CatalogEntryDescriptor>) {
+        let manifest = manifest();
+        let expected_catalog = manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.catalog)
+            .collect();
+        let first_span =
+            Coverage::from_spans(vec![CoverageSpan::new(1_000, 1_100).expect("first span")]);
+        let second_span =
+            Coverage::from_spans(vec![CoverageSpan::new(1_200, 1_300).expect("second span")]);
+        let empty = Coverage::empty();
+        let first = if gaps {
+            loss_coverage(empty.clone(), first_span)
+        } else {
+            loss_coverage(first_span, empty.clone())
+        };
+        let second = if gaps {
+            loss_coverage(empty, second_span)
+        } else {
+            loss_coverage(second_span, empty)
+        };
+        let mut bytes = FactFile::build(
+            &identity(),
+            vec![
+                BlockContent::SourceManifest(Box::new(manifest)),
+                BlockContent::LossCoverage(Box::new(first)),
+            ],
+            &LIMIT,
+        )
+        .expect("build partitioned coverage file");
+        insert_logical_block(&mut bytes, 1, &second);
+        (bytes, expected_catalog)
     }
 
     fn counter_partition(
@@ -1817,6 +2069,133 @@ mod tests {
             validate_directory(&overlapping, &header, directory_end, &LIMIT),
             Err(CacheReadError::Corrupt)
         ));
+    }
+
+    #[test]
+    fn observation_item_budget_spans_logical_blocks_without_limiting_string_references() {
+        let (bytes, expected_catalog) = partitioned_observation_file("fast", "ready");
+        let fits = Bounds {
+            items_per_block: 4,
+            ..LIMIT
+        };
+        FactFile::admit(&bytes, &identity(), &event_lineage(), &fits)
+            .expect("aggregate observation budget");
+        let (facts, _stats) = SegmentFacts::from_reader_with_stats(
+            bytes.as_slice(),
+            &identity(),
+            &event_lineage(),
+            &expected_catalog,
+            &fits,
+        )
+        .expect("selective aggregate observation load");
+        assert_eq!(facts.observations().len(), 4);
+
+        let tight = Bounds {
+            items_per_block: 3,
+            ..LIMIT
+        };
+        assert!(matches!(
+            FactFile::admit(&bytes, &identity(), &event_lineage(), &tight),
+            Err(CacheReadError::Oversized)
+        ));
+        assert!(matches!(
+            SegmentFacts::from_reader_with_stats(
+                bytes.as_slice(),
+                &identity(),
+                &event_lineage(),
+                &expected_catalog,
+                &tight,
+            ),
+            Err(CacheReadError::Oversized)
+        ));
+    }
+
+    #[test]
+    fn observation_text_budget_spans_logical_blocks() {
+        let shutdown_mode = "a".repeat(1_024);
+        let message = "z".repeat(1_024);
+        let (bytes, expected_catalog) = partitioned_observation_file(&shutdown_mode, &message);
+        let directory_count = u32_at(&bytes, 136) as usize;
+        let largest_body = (0..directory_count)
+            .map(|index| u64_at(&bytes, entry_field(index, 32)))
+            .max()
+            .expect("directory is non-empty");
+        let referenced_text = 2_u64
+            .checked_mul((shutdown_mode.len() + message.len()) as u64)
+            .expect("referenced text length");
+        assert!(largest_body < referenced_text);
+        let tight = Bounds {
+            decoded_block_len: largest_body,
+            ..LIMIT
+        };
+
+        assert!(matches!(
+            FactFile::admit(&bytes, &identity(), &event_lineage(), &tight),
+            Err(CacheReadError::Oversized)
+        ));
+        assert!(matches!(
+            SegmentFacts::from_reader_with_stats(
+                bytes.as_slice(),
+                &identity(),
+                &event_lineage(),
+                &expected_catalog,
+                &tight,
+            ),
+            Err(CacheReadError::Oversized)
+        ));
+    }
+
+    fn assert_partitioned_coverage_budget(gaps: bool) {
+        let (bytes, expected_catalog) = partitioned_coverage_file(gaps);
+        let fits = Bounds {
+            items_per_block: 3,
+            coverage_spans: 2,
+            ..LIMIT
+        };
+        FactFile::admit(&bytes, &identity(), &lineage(), &fits).expect("aggregate coverage budget");
+        let (facts, _stats) = SegmentFacts::from_reader_with_stats(
+            bytes.as_slice(),
+            &identity(),
+            &lineage(),
+            &expected_catalog,
+            &fits,
+        )
+        .expect("selective aggregate coverage load");
+        if gaps {
+            assert_eq!(facts.loss_coverage().known_gaps().spans().len(), 2);
+        } else {
+            assert_eq!(facts.loss_coverage().covered().spans().len(), 2);
+        }
+
+        let tight = Bounds {
+            items_per_block: 3,
+            coverage_spans: 1,
+            ..LIMIT
+        };
+        assert!(matches!(
+            FactFile::admit(&bytes, &identity(), &lineage(), &tight),
+            Err(CacheReadError::Oversized)
+        ));
+        assert!(matches!(
+            SegmentFacts::from_reader_with_stats(
+                bytes.as_slice(),
+                &identity(),
+                &lineage(),
+                &expected_catalog,
+                &tight,
+            ),
+            Err(CacheReadError::Oversized)
+        ));
+    }
+
+    #[test]
+    fn covered_span_budget_spans_logical_blocks() {
+        assert_partitioned_coverage_budget(false);
+    }
+
+    #[test]
+    fn known_gap_span_budget_spans_logical_blocks() {
+        assert_partitioned_coverage_budget(true);
     }
 
     #[test]

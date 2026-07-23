@@ -36,12 +36,14 @@ pub use kronika_analytics::{DiffPoint, Reason, Scalar};
 pub use kronika_format::DamageRegion;
 pub use overview::{
     BlockCodec, BlockContent, BlockDirectoryEntry, BlockError, BlockFlags, BlockKind, Bounds,
-    CacheReadError, CatalogEntryDescriptor, CounterSamplesBlock, DictionaryContextEntry,
-    EntityStateRecord, EntityStatesBlock, EventObservationsBlock, FactFile, FactFileHeader,
-    FactFileReader, FactReadStats, GaugeSamplesBlock, HeaderIdentity, LIMIT, LossCoverageBlock,
-    ManifestEntryDescriptor, ResetMarker, ResetMarkersBlock, ResolvedPattern, SourceDescriptor,
-    SourceManifestBlock, StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats,
-    dictionary_context_id, lineage_from_catalog, resolve_targeted, section_body_id,
+    BuildError, CacheReadError, CacheRebuildReason, CatalogEntryDescriptor, CounterSamplesBlock,
+    DictionaryContextEntry, EntityStateRecord, EntityStatesBlock, EventObservationsBlock, FactFile,
+    FactFileHeader, FactFileReader, FactKey, FactLoad, FactOrigin, FactReadStats, FactStore,
+    FileKind, GaugeSamplesBlock, HeaderIdentity, LIMIT, LossCoverageBlock, ManifestEntryDescriptor,
+    PersistError, ResetMarker, ResetMarkersBlock, ResolvedPattern, SegmentContext,
+    SegmentContextError, SegmentFacts, SourceDescriptor, SourceError, SourceManifestBlock,
+    StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats, dictionary_context_id,
+    lineage_from_catalog, placement, placement_dir, resolve_targeted, section_body_id,
     source_scope_id,
 };
 pub use query::{
@@ -50,7 +52,7 @@ pub use query::{
     apply_collection_gating, apply_gating, diff_section, gate_readings, gauge_section,
     logical_section, section, section_with_limits, sections, sections_with_limits, select_gate,
 };
-pub use snapshot::{LocalDirSnapshot, OpenUnit, UnitMeta};
+pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta};
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -73,7 +75,7 @@ use kronika_store::StoreError;
 pub use kronika_registry::{Cell, Row};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-pub use unit::{OverviewSectionBody, PgmUnit};
+pub use unit::{OverviewSectionBody, PgmBodyReadStats, PgmUnit};
 
 /// A sealed segment opened for reading.
 #[derive(Debug)]
@@ -147,9 +149,9 @@ pub enum ReadError {
         /// Requested ordinal.
         ordinal: u32,
     },
-    /// Decoded dictionary rows disagree with their PGM catalog entry.
+    /// Decoded section rows disagree with their PGM catalog entry.
     CatalogRowCountMismatch {
-        /// Dictionary section type.
+        /// Section type.
         type_id: u32,
         /// Catalog-declared row count.
         declared: u32,
@@ -199,7 +201,7 @@ impl fmt::Display for ReadError {
                 decoded,
             } => write!(
                 f,
-                "dictionary type {type_id} decoded {decoded} rows, but the catalog declares {declared}"
+                "section type {type_id} decoded {decoded} rows, but the catalog declares {declared}"
             ),
         }
     }
