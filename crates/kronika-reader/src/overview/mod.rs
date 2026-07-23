@@ -20,6 +20,7 @@ mod event_extract;
 mod factkey;
 mod facts;
 mod limits;
+mod live;
 mod observations;
 #[cfg(test)]
 mod proptests;
@@ -44,5 +45,8 @@ pub use dictionary::{
 pub use factkey::{FactKey, FileKind, placement, placement_dir};
 pub use facts::{BuildError, SegmentContext, SegmentContextError, SegmentFacts, SourceError};
 pub use limits::{Bounds, LIMIT};
+pub use live::{
+    FoldEffect, LiveBuilder, LiveFoldError, LiveState, LiveView, SealOutcome, reconcile_seal,
+};
 pub use observations::EventObservationsBlock;
 pub use publish::{CacheRebuildReason, FactLoad, FactOrigin, FactStore, PersistError};

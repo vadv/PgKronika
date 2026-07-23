@@ -22,6 +22,7 @@
 
 mod overview;
 mod query;
+mod refresh;
 mod snapshot;
 mod unit;
 
@@ -39,18 +40,22 @@ pub use overview::{
     BuildError, CacheReadError, CacheRebuildReason, CatalogEntryDescriptor, CounterSamplesBlock,
     DictionaryContextEntry, EntityStateRecord, EntityStatesBlock, EventObservationsBlock, FactFile,
     FactFileHeader, FactFileReader, FactKey, FactLoad, FactOrigin, FactReadStats, FactStore,
-    FileKind, GaugeSamplesBlock, HeaderIdentity, LIMIT, LossCoverageBlock, ManifestEntryDescriptor,
-    PersistError, ResetMarker, ResetMarkersBlock, ResolvedPattern, SegmentContext,
-    SegmentContextError, SegmentFacts, SourceDescriptor, SourceError, SourceManifestBlock,
-    StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats, dictionary_context_id,
-    lineage_from_catalog, placement, placement_dir, resolve_targeted, section_body_id,
-    source_scope_id,
+    FileKind, FoldEffect, GaugeSamplesBlock, HeaderIdentity, LIMIT, LiveBuilder, LiveFoldError,
+    LiveState, LiveView, LossCoverageBlock, ManifestEntryDescriptor, PersistError, ResetMarker,
+    ResetMarkersBlock, ResolvedPattern, SealOutcome, SegmentContext, SegmentContextError,
+    SegmentFacts, SourceDescriptor, SourceError, SourceManifestBlock, StringTableBlock,
+    TargetedDictionaryRead, TargetedDictionaryStats, dictionary_context_id, lineage_from_catalog,
+    placement, placement_dir, reconcile_seal, resolve_targeted, section_body_id, source_scope_id,
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
     OutRow, QueryError, QueryLimits, SectionPage, SeriesDiff, SeriesValues, Value,
     apply_collection_gating, apply_gating, diff_section, gate_readings, gauge_section,
     logical_section, section, section_with_limits, sections, sections_with_limits, select_gate,
+};
+pub use refresh::{
+    ByteRange, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor, PartId,
+    PartTransition, RefreshDelta, SegmentDescriptor, catalog_digest, classify_transition, part_id,
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta};
 

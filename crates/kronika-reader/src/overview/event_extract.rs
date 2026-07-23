@@ -37,6 +37,13 @@ const SUPPORTED_EVENT_TYPE_IDS: [u32; 8] = [
     TEMP_FILE_TYPE_ID,
 ];
 
+/// The log-gap reason whose presence forces a segment-wide timestamp fallback.
+///
+/// It is monotone across a full segment on a cold rebuild but only per-part in a
+/// live fold, so a live promotion consults it to decide whether the folded times
+/// would still match the rebuild.
+pub(super) const TIMESTAMP_FALLBACK_GAP_REASON: u8 = 15;
+
 pub(super) struct EventExtraction {
     pub manifest_entries: Vec<ManifestEntryDescriptor>,
     pub observations: Vec<EventObservation>,
@@ -82,7 +89,7 @@ impl TextBudget {
 pub(super) fn extract_events<R: ReadAt>(
     unit: &PgmUnit<R>,
     lineage: SegmentIdentity,
-    locator: SegmentLocator,
+    segment_locator: Option<SegmentLocator>,
     bounds: &Bounds,
 ) -> Result<EventExtraction, BuildError> {
     if !bounds.is_within_absolute_limits()
@@ -174,7 +181,9 @@ pub(super) fn extract_events<R: ReadAt>(
         .ok_or(BuildError::Overflow)?;
     let mut timestamp_fallback = false;
     for pending in &pending {
-        if pending.type_id == LOG_GAP_TYPE_ID && cell_u32(&pending.row, "reason")? == 15 {
+        if pending.type_id == LOG_GAP_TYPE_ID
+            && cell_u32(&pending.row, "reason")? == u32::from(TIMESTAMP_FALLBACK_GAP_REASON)
+        {
             timestamp_fallback = true;
         }
     }
@@ -186,7 +195,7 @@ pub(super) fn extract_events<R: ReadAt>(
     for pending in pending {
         let row_has_truncated_value = row_has_truncated_value(&pending.row, &dictionary.values)?;
         let provenance = ObservationProvenance {
-            segment_locator: Some(locator),
+            segment_locator,
             section_body_id: pending.section_body_id,
             catalog_entry_ordinal: pending.catalog_entry_ordinal,
             row_ordinal: pending.row_ordinal,

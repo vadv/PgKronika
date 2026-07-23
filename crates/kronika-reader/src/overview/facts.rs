@@ -10,10 +10,13 @@
 //! [`encode`]: SegmentFacts::encode
 //! [`from_reader`]: SegmentFacts::from_reader
 
+use std::sync::Arc;
+
 use kronika_analytics::overview::{
     Applicability, Coverage, CoverageSpan, EventObservation, MemoryOracle, NamingContractId,
-    OracleError, OracleLimits, OracleResult, PeriodQuality, PhysicalCountSemantics, RawOracle,
-    RetainedExactness, SegmentIdentity, SegmentLocator, SourceCompleteness,
+    ObservationPayload, ObservationProvenance, OracleError, OracleLimits, OracleResult,
+    PeriodQuality, PhysicalCountSemantics, RawOracle, RetainedExactness, SegmentIdentity,
+    SegmentLocator, SourceCompleteness,
 };
 use kronika_format::ReadAt;
 
@@ -26,7 +29,7 @@ use super::container::{
     validate_block_descriptor, validate_observation_provenance, verify_manifest_identity,
 };
 use super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor, source_scope_id};
-use super::event_extract::extract_events;
+use super::event_extract::{EventExtraction, TIMESTAMP_FALLBACK_GAP_REASON, extract_events};
 use super::limits::Bounds;
 use super::observations::EventObservationsBlock;
 
@@ -235,11 +238,182 @@ impl SegmentFacts {
         context: &SegmentContext,
         bounds: &Bounds,
     ) -> Result<(Self, PgmBodyReadStats), BuildError> {
-        let catalog = unit.catalog();
+        let (min_ts, max_ts) = (unit.catalog().min_ts, unit.catalog().max_ts);
         let (identity, lineage) = Self::provenance(unit, context)?;
-        let extracted = extract_events(unit, lineage, context.segment_locator, bounds)?;
+        let extracted = extract_events(unit, lineage, Some(context.segment_locator), bounds)?;
         let pgm_body_read_stats = extracted.pgm_body_read_stats;
-        let covered = segment_coverage(catalog.min_ts, catalog.max_ts)?;
+        let facts = Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds)?;
+        Ok((facts, pgm_body_read_stats))
+    }
+
+    /// Folds one completed active part into live overview facts.
+    ///
+    /// Live facts carry an `Approximate` lineage keyed by journal generation and
+    /// a per-part discriminator, so identical sections in different parts stay
+    /// distinct and no observation collides. The lineage never claims a sealed
+    /// locator; a seal that matches provenance re-keys these facts to the sealed
+    /// identity. Reads each supported event body once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError`] for source failures, unsupported event layouts,
+    /// unsafe work bounds, or checked-arithmetic overflow.
+    pub fn fold_live<R: ReadAt>(
+        unit: &PgmUnit<R>,
+        store_namespace: &[u8],
+        journal_generation: u64,
+        part_discriminator: &[u8],
+        bounds: &Bounds,
+    ) -> Result<Self, BuildError> {
+        let catalog = unit.catalog();
+        if catalog.entries.is_empty() {
+            return Err(BuildError::Source(SourceError::UnsupportedLayout));
+        }
+        let source_scope = source_scope_id(store_namespace, catalog.source_id);
+        let lineage =
+            SegmentIdentity::live_approximate(source_scope, journal_generation, part_discriminator);
+        let identity = HeaderIdentity::from_current_contract(
+            catalog.format_version,
+            catalog.source_id,
+            catalog.min_ts,
+            catalog.max_ts,
+            unit.source_file_len(),
+            source_scope,
+            unit.source_descriptor(),
+        );
+        let (min_ts, max_ts) = (catalog.min_ts, catalog.max_ts);
+        let extracted = extract_events(unit, lineage, None, bounds)?;
+        Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds)
+    }
+
+    /// Promotes matching live part facts to sealed facts without reading the
+    /// sealed section bodies.
+    ///
+    /// The parts must be the ordered constituents of the sealed segment: the
+    /// concatenation of their catalog descriptors must equal the sealed catalog,
+    /// which proves byte-identical bodies in seal order. On a proven match this
+    /// re-keys the already-folded observations to the sealed lineage and
+    /// segment-global catalog ordinals, so the result equals a cold rebuild.
+    /// It returns `Ok(None)` when provenance does not match or a segment-wide
+    /// timestamp fallback would change the folded records, so the caller rebuilds
+    /// from the PGM.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError`] when the sealed catalog is empty, a re-keyed
+    /// observation is invalid, or a checked counter overflows.
+    pub fn try_promote_from_parts<R: ReadAt>(
+        sealed_unit: &PgmUnit<R>,
+        sealed_context: &SegmentContext,
+        parts: &[Arc<Self>],
+        bounds: &Bounds,
+    ) -> Result<Option<Self>, BuildError> {
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        let sealed_descriptors: Vec<CatalogEntryDescriptor> = sealed_unit
+            .catalog()
+            .entries
+            .iter()
+            .map(CatalogEntryDescriptor::of)
+            .collect();
+        let candidate_descriptors: Vec<CatalogEntryDescriptor> = parts
+            .iter()
+            .flat_map(|part| part.catalog_descriptors())
+            .collect();
+        if sealed_descriptors != candidate_descriptors {
+            return Ok(None);
+        }
+        // A gap that forces a segment-wide timestamp fallback is not derivable
+        // from an isolated part fold, so those segments rebuild.
+        if parts.iter().any(|part| {
+            part.observations().iter().any(|observation| {
+                matches!(
+                    observation.payload(),
+                    ObservationPayload::LogGap(gap) if gap.reason == TIMESTAMP_FALLBACK_GAP_REASON
+                )
+            })
+        }) {
+            return Ok(None);
+        }
+
+        let (identity, lineage) = Self::provenance(sealed_unit, sealed_context)?;
+        let sealed_locator = sealed_context.segment_locator();
+
+        let mut observations = Vec::new();
+        let mut manifest_entries = Vec::new();
+        let mut known_gaps = Coverage::empty();
+        let mut dropped_lower_bound = 0_u64;
+        let mut base_ordinal: u32 = 0;
+        for part in parts {
+            for observation in part.observations() {
+                let source = observation.provenance();
+                let catalog_entry_ordinal = base_ordinal
+                    .checked_add(source.catalog_entry_ordinal)
+                    .ok_or(BuildError::Overflow)?;
+                let provenance = ObservationProvenance {
+                    segment_locator: Some(sealed_locator),
+                    section_body_id: source.section_body_id,
+                    catalog_entry_ordinal,
+                    row_ordinal: source.row_ordinal,
+                    dictionary_context_id: source.dictionary_context_id,
+                    source_locator: source.source_locator,
+                };
+                let promoted = EventObservation::new(
+                    lineage,
+                    observation.source_type_id(),
+                    provenance,
+                    observation.shape(),
+                    observation.time(),
+                    observation.occurrence_count(),
+                    observation.payload().clone(),
+                    observation.evidence_quality(),
+                    observation.quality_flags(),
+                    observation.loss().cloned(),
+                )
+                .map_err(|_error| BuildError::Internal)?;
+                observations.push(promoted);
+            }
+            manifest_entries.extend(part.manifest_entries().iter().copied());
+            known_gaps = known_gaps.union(part.loss_coverage().known_gaps());
+            dropped_lower_bound = dropped_lower_bound
+                .checked_add(part.loss_coverage().dropped_lower_bound())
+                .ok_or(BuildError::Overflow)?;
+            let part_entries = u32::try_from(part.manifest_entries().len())
+                .map_err(|_error| BuildError::Overflow)?;
+            base_ordinal = base_ordinal
+                .checked_add(part_entries)
+                .ok_or(BuildError::Overflow)?;
+        }
+        observations.sort_by(EventObservation::canonical_cmp);
+        if observations
+            .windows(2)
+            .any(|pair| pair[0].observation_id() == pair[1].observation_id())
+        {
+            return Ok(None);
+        }
+
+        let (min_ts, max_ts) = (sealed_unit.catalog().min_ts, sealed_unit.catalog().max_ts);
+        let extracted = EventExtraction {
+            manifest_entries,
+            observations,
+            known_gaps,
+            dropped_lower_bound,
+            pgm_body_read_stats: PgmBodyReadStats::default(),
+        };
+        Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds).map(Some)
+    }
+
+    /// Assembles canonical facts from an extraction and the catalog time range.
+    fn assemble(
+        identity: HeaderIdentity,
+        lineage: SegmentIdentity,
+        extracted: EventExtraction,
+        min_ts: i64,
+        max_ts: i64,
+        bounds: &Bounds,
+    ) -> Result<Self, BuildError> {
+        let covered = segment_coverage(min_ts, max_ts)?;
         let loss_coverage = LossCoverageBlock::new(
             covered,
             extracted.known_gaps,
@@ -255,16 +429,13 @@ impl SegmentFacts {
             super::block::BlockError::AboveBound => BuildError::LimitExceeded,
             _ => BuildError::Internal,
         })?;
-        Ok((
-            Self {
-                identity,
-                lineage,
-                manifest_entries: extracted.manifest_entries,
-                observations: extracted.observations,
-                loss_coverage,
-            },
-            pgm_body_read_stats,
-        ))
+        Ok(Self {
+            identity,
+            lineage,
+            manifest_entries: extracted.manifest_entries,
+            observations: extracted.observations,
+            loss_coverage,
+        })
     }
 
     /// Derives the header identity and lineage from the catalog alone.
@@ -680,8 +851,8 @@ fn merge_physical_count(
 #[cfg(test)]
 mod tests {
     use kronika_analytics::overview::{
-        CountLimits, ErrorCategory, EvidenceQuality, LossReason, ObservationPayload,
-        SemanticDivergence, SqlState, TimeQuality, semantic_divergences,
+        CountLimits, ErrorCategory, EvidenceQuality, LossReason, SemanticDivergence, SqlState,
+        TimeQuality, semantic_divergences,
     };
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
