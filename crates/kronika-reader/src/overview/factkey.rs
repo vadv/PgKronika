@@ -6,9 +6,9 @@
 //! deliberately excluded: they do not change retained facts, so they never
 //! invalidate a cached file.
 //!
-//! [`placement`] maps a key to a path under the cache root. The name carries no
-//! authority — the reader still admits the file's header against the expected
-//! identity before trusting it.
+//! [`placement`] maps a key to a path under the cache root. The reader does not
+//! infer identity from the path; it validates the file header against the
+//! expected identity.
 
 use std::path::{Path, PathBuf};
 
@@ -123,7 +123,7 @@ impl FactKey {
     }
 }
 
-/// The trusted path a fact file with `key` occupies under `cache_root`.
+/// The expected path for the fact file identified by `key` under `cache_root`.
 ///
 /// Layout: `<cache_root>/overview/v1/<scope_hex>/<prefix>/<key_hex>.ovf`.
 #[must_use]
@@ -136,10 +136,10 @@ pub fn placement(cache_root: &Path, source_scope_id: SourceScopeId, key: &FactKe
         .join(format!("{}.ovf", key.hex()))
 }
 
-/// The directory that holds every fact file for one key.
+/// The prefix directory containing `key`'s fact file and publication artifacts.
 ///
-/// Durable publication writes its temp file here so the final rename stays on
-/// the same filesystem.
+/// Temporary files are created here so publication can use a same-filesystem
+/// rename.
 #[must_use]
 pub fn placement_dir(cache_root: &Path, source_scope_id: SourceScopeId, key: &FactKey) -> PathBuf {
     cache_root
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_is_stable_for_identical_inputs() {
+    fn key_is_stable_for_identical_inputs() {
         let left = FactKey::derive(scope(1), descriptor(2), FileKind::SegmentFacts, 1, 1, 1);
         let right = FactKey::derive(scope(1), descriptor(2), FileKind::SegmentFacts, 1, 1, 1);
         assert_eq!(left, right);
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_and_descriptor_are_bound_into_the_key() {
+    fn fact_key_binds_scope_and_descriptor() {
         let base = FactKey::derive(scope(1), descriptor(2), FileKind::SegmentFacts, 1, 1, 1);
         assert_ne!(
             base,
@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_is_scoped_prefixed_and_named_by_the_key() {
+    fn placement_uses_scope_prefix_and_key_name() {
         let key = FactKey::for_current_segment(scope(0xAB), descriptor(0xCD));
         let path = placement(Path::new("/cache"), scope(0xAB), &key);
         let text = path.to_string_lossy();
@@ -224,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn the_prefix_is_the_first_key_byte() {
+    fn prefix_is_first_key_byte() {
         let key = FactKey::for_current_segment(scope(3), descriptor(4));
         assert_eq!(key.prefix(), format!("{:02x}", key.as_bytes()[0]));
         assert_eq!(key.hex().len(), 64);

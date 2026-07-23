@@ -16,7 +16,7 @@ mod bytes;
 mod container;
 mod descriptors;
 mod dictionary;
-mod factcache;
+mod event_extract;
 mod factkey;
 mod facts;
 mod limits;
@@ -41,9 +41,8 @@ pub use descriptors::{
 pub use dictionary::{
     ResolvedPattern, TargetedDictionaryRead, TargetedDictionaryStats, resolve_targeted,
 };
-pub use factcache::{BlockSlot, BoundedFactCache};
 pub use factkey::{FactKey, FileKind, placement, placement_dir};
-pub use facts::{BuildError, SegmentContext, SegmentFacts, SourceError};
+pub use facts::{BuildError, SegmentContext, SegmentContextError, SegmentFacts, SourceError};
 pub use limits::{Bounds, LIMIT};
 pub use observations::EventObservationsBlock;
-pub use publish::{FactStore, PersistError};
+pub use publish::{CacheRebuildReason, FactLoad, FactOrigin, FactStore, PersistError};
