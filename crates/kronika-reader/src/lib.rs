@@ -35,13 +35,15 @@ use mimalloc as _;
 pub use kronika_analytics::{DiffPoint, Reason, Scalar};
 pub use kronika_format::DamageRegion;
 pub use overview::{
-    BlockCodec, BlockContent, BlockDirectoryEntry, BlockError, BlockFlags, BlockKind, Bounds,
-    CacheReadError, CatalogEntryDescriptor, CounterSamplesBlock, DictionaryContextEntry,
-    EntityStateRecord, EntityStatesBlock, EventObservationsBlock, FactFile, FactFileHeader,
-    FactFileReader, FactReadStats, GaugeSamplesBlock, HeaderIdentity, LIMIT, LossCoverageBlock,
-    ManifestEntryDescriptor, ResetMarker, ResetMarkersBlock, ResolvedPattern, SourceDescriptor,
-    SourceManifestBlock, StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats,
-    dictionary_context_id, lineage_from_catalog, resolve_targeted, section_body_id,
+    BlockCodec, BlockContent, BlockDirectoryEntry, BlockError, BlockFlags, BlockKind, BlockSlot,
+    BoundedFactCache, Bounds, BuildError, CacheReadError, CatalogEntryDescriptor,
+    CounterSamplesBlock, DictionaryContextEntry, EntityStateRecord, EntityStatesBlock,
+    EventObservationsBlock, FactFile, FactFileHeader, FactFileReader, FactKey, FactReadStats,
+    FactStore, FileKind, GaugeSamplesBlock, HeaderIdentity, LIMIT, LossCoverageBlock,
+    ManifestEntryDescriptor, PersistError, ResetMarker, ResetMarkersBlock, ResolvedPattern,
+    SegmentContext, SegmentFacts, SourceDescriptor, SourceError, SourceManifestBlock,
+    StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats, dictionary_context_id,
+    lineage_from_catalog, placement, placement_dir, resolve_targeted, section_body_id,
     source_scope_id,
 };
 pub use query::{

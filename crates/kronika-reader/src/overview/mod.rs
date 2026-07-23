@@ -16,10 +16,14 @@ mod bytes;
 mod container;
 mod descriptors;
 mod dictionary;
+mod factcache;
+mod factkey;
+mod facts;
 mod limits;
 mod observations;
 #[cfg(test)]
 mod proptests;
+mod publish;
 
 pub use block::{
     BlockCodec, BlockError, BlockFlags, BlockKind, CounterSamplesBlock, EntityStateRecord,
@@ -37,5 +41,9 @@ pub use descriptors::{
 pub use dictionary::{
     ResolvedPattern, TargetedDictionaryRead, TargetedDictionaryStats, resolve_targeted,
 };
+pub use factcache::{BlockSlot, BoundedFactCache};
+pub use factkey::{FactKey, FileKind, placement, placement_dir};
+pub use facts::{BuildError, SegmentContext, SegmentFacts, SourceError};
 pub use limits::{Bounds, LIMIT};
 pub use observations::EventObservationsBlock;
+pub use publish::{FactStore, PersistError};
