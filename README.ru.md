@@ -118,7 +118,7 @@ Basic Auth.
 | [`kronika-writer`](crates/kronika-writer/) | Ограниченные буферы секций, интернер строк, `active.parts` и запечатывание. |
 | [`kronika-store`](crates/kronika-store/) | Read-only скан локального каталога сегментов и живого журнала. |
 | [`kronika-reader`](crates/kronika-reader/) | Проверенный декод секций, snapshots, pagination, logical sections, gauges и diff. |
-| [`kronika-analytics`](crates/kronika-analytics/) | Независимая от источника семантика пар счётчиков и устойчивый anomaly scoring. |
+| [`kronika-analytics`](crates/kronika-analytics/) | Независимые от источника ядра разностей счётчиков, поиска аномалий и контрактов overview. |
 | [`kronika-source-pg`](crates/kronika-source-pg/) | Запросы PostgreSQL и раскладка разных версий в строки реестра. |
 | [`kronika-source-os`](crates/kronika-source-os/) | Ограниченное чтение Linux `/proc`, `/sys`, файловых систем, процессов и cgroup. |
 | [`kronika-source-log`](crates/kronika-source-log/) | Ограниченный tail stderr, нормализация, типизированные события и gap-учёт. |
