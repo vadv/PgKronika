@@ -1,60 +1,91 @@
-//! Health evaluation: continuous pressure, trusted floors, and honest
-//! unknowns.
+//! Versioned health evaluation with strict coverage eligibility.
 //!
-//! A health point separates three claims that must never blur. The continuous
-//! score describes resource and operational pressure as a product of domain
-//! complements. Floor evidence records trusted catastrophic observations —
-//! a crash, proven integrity damage — that pin the state to `Critical`
-//! regardless of pressure. And unknown stays unknown: when a required domain
-//! has no proven coverage, both numeric scores are `None`; an empty bucket is
-//! never a healthy `1.0`, and a missing factor never contributes a zero
-//! penalty.
-//!
-//! Within a domain, correlated factors take the maximum penalty instead of
-//! multiplying, so one physical cause reported through two meters is not
-//! counted twice. Across domains, complements multiply into an ordinal
-//! operational index — not a probability.
+//! A required applicable factor contributes an explicit finite penalty,
+//! including zero, only when its full interval coverage and provenance are
+//! acceptable. Partial, lossy, mismatched, or assumed-current coverage keeps
+//! the numeric score unknown. Floor evidence is carried independently.
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::REGISTRY_CONTRACT_VERSION;
-use super::coverage::{Applicability, CoverageSpan, CoverageState};
+use super::coverage::{
+    Applicability, BoundaryQuality, CoverageSpan, CoverageState, PeriodQuality,
+    PhysicalCountSemantics, RetainedExactness, SourceCompleteness,
+};
 use super::observation::{FactId, LossReason};
 use super::sha256;
 
-/// Domain-separation tag of the factor-set preimage.
 const FACTOR_SET_DOMAIN_TAG: &[u8] = b"pgk-overview-factor-set-v1";
+const PROFILE_TOPOLOGY_DOMAIN_TAG: &[u8] = b"pgk-overview-profile-topology-v1";
 
-/// Stable identity of one health factor in the registry.
+/// Stable identity of one health factor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FactorId(pub u32);
 
-/// A health domain: one axis of operational pressure.
-///
-/// The closed v1 set; the discriminant is the stable index used in the
-/// factor-set preimage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Identity of one collection-cadence epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CadenceEpochId(pub [u8; 16]);
+
+/// Work and output limits for health operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the max_ prefix distinguishes hard caps in the public limits API"
+)]
+pub struct HealthLimits {
+    /// Maximum factors in one profile.
+    pub max_profile_factors: usize,
+    /// Maximum penalties in one cell.
+    pub max_cell_factors: usize,
+    /// Maximum coverage records in one cell.
+    pub max_coverage_entries: usize,
+    /// Maximum floor records in one cell or downsampled bucket.
+    pub max_floor_evidence: usize,
+    /// Maximum fine points scanned by downsampling.
+    pub max_downsample_points: usize,
+}
+
+/// Health input that exceeded a configured limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthResource {
+    /// Profile factor topology.
+    ProfileFactors,
+    /// Cell penalties.
+    CellFactors,
+    /// Cell coverage records.
+    CoverageEntries,
+    /// Loss-reason entries in one coverage record.
+    LossReasons,
+    /// Floor records.
+    FloorEvidence,
+    /// Fine points passed to downsampling.
+    DownsamplePoints,
+}
+
+/// One operational pressure domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DomainId {
-    /// Joint severity/category/SQLSTATE counts and session failure deltas.
+    /// Database errors and session failures.
     DatabaseErrorPressure = 0,
-    /// Connections against limits and retained 53300-like observations.
+    /// Connection capacity.
     ConnectionCapacity = 1,
-    /// Blocked sessions, lock waits, deadlock deltas.
+    /// Locking and blocked work.
     Contention = 2,
-    /// Host/cgroup CPU, PSI CPU, runnable pressure.
+    /// CPU pressure.
     CpuPressure = 3,
-    /// PSI memory, cgroup usage against limits, `OOM` facts.
+    /// Memory pressure.
     MemoryPressure = 4,
-    /// Disk I/O, proven mount capacity, temp and disk-full observations.
+    /// Storage pressure.
     StoragePressure = 5,
-    /// Checkpoint pressure and XID/MXID headroom.
+    /// Checkpoint and transaction-ID maintenance.
     Maintenance = 6,
-    /// Lag, state, and slot loss where replication is declared applicable.
+    /// Replication health when applicable.
     Replication = 7,
 }
 
 impl DomainId {
-    /// Every domain in stable-index order.
+    /// Domains in stable index order.
     pub const ALL: [Self; 8] = [
         Self::DatabaseErrorPressure,
         Self::ConnectionCapacity,
@@ -66,13 +97,13 @@ impl DomainId {
         Self::Replication,
     ];
 
-    /// The stable index, `0..8`.
+    /// Stable index in `0..8`.
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
     }
 
-    /// The stable machine code of this domain on the wire.
+    /// Stable locale-neutral machine code.
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
@@ -88,64 +119,56 @@ impl DomainId {
     }
 }
 
-/// The combined state shown to a user, never erasing unknown.
+/// Health state shown to callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthState {
-    /// Required coverage is missing and no trusted floor exists.
+    /// Required evidence is incomplete.
     Unknown,
-    /// No significant proven pressure.
+    /// Score is at or above the degraded threshold.
     Normal,
-    /// Proven pressure below the critical threshold.
+    /// Score is below the degraded threshold.
     Degraded,
-    /// A trusted floor or critical proven pressure.
+    /// Score is below the critical threshold or a floor is present.
     Critical,
 }
 
-/// A class of trusted catastrophic evidence.
-///
-/// Only evidence the source contract can prove belongs here: a lifecycle
-/// crash or structured `PANIC` is availability evidence, a checksum failure
-/// is integrity evidence. A lone signal 9, a heuristic category, or an
-/// immediate shutdown without context is not representable as a floor.
+/// Class assigned by a versioned policy to proven catastrophic evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FloorClass {
-    /// The server or a child provably stopped serving.
+    /// Proven service unavailability.
     Availability = 0,
-    /// Proven data or index integrity damage.
+    /// Proven integrity damage.
     Integrity = 1,
-    /// A proven kernel or cgroup `OOM` kill.
+    /// Proven kernel or cgroup OOM kill.
     OomKill = 2,
-    /// Proven exhaustion of a filesystem the server writes to.
+    /// Proven exhaustion of a writable filesystem.
     DiskFull = 3,
 }
 
-/// One piece of trusted floor evidence with the fact that proves it.
+/// Policy-validated floor evidence.
+///
+/// The type records a decision already made by the versioned policy. A raw
+/// signal, severity, or arbitrary [`FactId`] does not establish a floor by
+/// itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FloorEvidence {
-    /// The evidence class.
+    /// Assigned floor class.
     pub class: FloorClass,
-    /// The fact that carries the proof.
+    /// Fact containing the proof.
     pub supporting_fact_id: FactId,
 }
 
-/// One factor's curved penalty inside its domain.
-///
-/// The penalty is already normalized by the factor's monotonic curve; this
-/// type only guarantees it stays finite and inside `[0, 1]`, which keeps
-/// every derived score bounded.
+/// One normalized factor penalty.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FactorPenalty {
-    /// The factor this penalty came from.
-    pub factor_id: FactorId,
-    /// The domain the factor belongs to.
-    pub domain: DomainId,
-    /// The reduced fact the penalty was computed from.
-    pub supporting_fact_id: FactId,
+    factor_id: FactorId,
+    domain: DomainId,
+    supporting_fact_id: FactId,
     penalty: f64,
 }
 
 impl FactorPenalty {
-    /// Builds a penalty, rejecting a non-finite or out-of-range value.
+    /// Builds a finite penalty in `[0, 1]`.
     #[must_use]
     pub fn new(
         factor_id: FactorId,
@@ -157,174 +180,477 @@ impl FactorPenalty {
             factor_id,
             domain,
             supporting_fact_id,
-            penalty,
+            penalty: if penalty == 0.0 { 0.0 } else { penalty },
         })
     }
 
-    /// The normalized penalty, finite in `[0, 1]`.
+    /// Factor identity.
     #[must_use]
-    pub const fn penalty(&self) -> f64 {
+    pub const fn factor_id(self) -> FactorId {
+        self.factor_id
+    }
+
+    /// Factor domain.
+    #[must_use]
+    pub const fn domain(self) -> DomainId {
+        self.domain
+    }
+
+    /// Supporting fact.
+    #[must_use]
+    pub const fn supporting_fact_id(self) -> FactId {
+        self.supporting_fact_id
+    }
+
+    /// Normalized penalty.
+    #[must_use]
+    pub const fn penalty(self) -> f64 {
         self.penalty
     }
 }
 
-/// One domain's combined penalty and the factors that drive it.
+/// Maximum penalty selected for one domain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DomainPenalty {
-    /// The domain.
-    pub domain: DomainId,
-    /// The maximum factor penalty in the domain, in `[0, 1]`.
-    pub penalty: f64,
-    /// The factors whose penalty equals the domain penalty, sorted.
-    pub driving_factor_ids: Vec<FactorId>,
+    domain: DomainId,
+    penalty: f64,
+    driving_factor_ids: Vec<FactorId>,
 }
 
-/// The retained population behind a top-N factor input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourcePopulation {
-    /// How many members were retained.
-    pub collected: u64,
-    /// How many members the source reported in total.
-    pub total: u64,
+impl DomainPenalty {
+    /// Domain identity.
+    #[must_use]
+    pub const fn domain(&self) -> DomainId {
+        self.domain
+    }
+
+    /// Maximum factor penalty.
+    #[must_use]
+    pub const fn penalty(&self) -> f64 {
+        self.penalty
+    }
+
+    /// Sorted factor IDs tied for the maximum.
+    #[must_use]
+    pub fn driving_factor_ids(&self) -> &[FactorId] {
+        &self.driving_factor_ids
+    }
 }
 
-/// How exact a factor's retained input is.
+/// Quality of a source population total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Exactness {
-    /// Every retained record is counted exactly once.
-    RetainedExact,
-    /// Bounds dropped records; retained values are a lower bound.
+pub enum PopulationTotalQuality {
+    /// Exact source total.
+    Exact,
+    /// Lower bound on the source total.
     LowerBound,
-    /// Exactness cannot be determined.
+    /// Provenance of the total is unknown.
     Unknown,
 }
 
-/// The coverage of one factor over one evaluation interval.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FactorCoverage {
-    /// The factor.
-    pub factor_id: FactorId,
-    /// Whether the factor applies to this source at all.
-    pub applicability: Applicability,
-    /// The coverage state, keeping gap and not-collected apart from zero.
-    pub state: CoverageState,
-    /// The interval the entry describes.
-    pub interval: CoverageSpan,
-    /// The declared collection period, when the source has one.
-    pub expected_period_us: Option<u64>,
-    /// How many samples are actually present.
-    pub present_samples: u64,
-    /// How many microseconds of the interval are covered.
-    pub covered_duration_us: u64,
-    /// Population completeness behind a top-N input, when bounded.
-    pub source_population: Option<SourcePopulation>,
-    /// Proven loss reasons, sorted and unique.
-    pub loss_reasons: Vec<LossReason>,
-    /// The proven minimum number of lost records, when counted.
-    pub lost_count_lower_bound: Option<u64>,
-    /// How exact the retained input is.
-    pub exactness: Exactness,
+/// Population behind a bounded factor input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcePopulation {
+    /// Members retained.
+    pub collected: u64,
+    /// Source total, when reported.
+    pub total: Option<u64>,
+    /// Quality of `total`.
+    pub total_quality: PopulationTotalQuality,
 }
 
-/// Identity of the exact factor set that produced a health point.
-///
-/// Scores are comparable only under the same policy version and factor-set
-/// identity; a disappeared optional factor changes the ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Evidence coverage for one factor and interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactorCoverage {
+    /// Factor identity.
+    pub factor_id: FactorId,
+    /// Applicability to the source.
+    pub applicability: Applicability,
+    /// Coverage state.
+    pub state: CoverageState,
+    /// Exact interval described by this record.
+    pub interval: CoverageSpan,
+    /// Declared collection period.
+    pub expected_period_us: Option<u64>,
+    /// Provenance of the period.
+    pub period_quality: PeriodQuality,
+    /// Stable cadence epoch, when proven.
+    pub cadence_epoch_id: Option<CadenceEpochId>,
+    /// Whether a cadence/configuration boundary crosses the interval.
+    pub crosses_cadence_boundary: bool,
+    /// Present sample count.
+    pub present_samples: u64,
+    /// Exact covered duration inside `interval`.
+    pub covered_duration_us: u64,
+    /// Population information for bounded inputs.
+    pub source_population: Option<SourcePopulation>,
+    /// Sorted, unique proven loss reasons.
+    pub loss_reasons: Vec<LossReason>,
+    /// Proven lower bound on lost records.
+    pub lost_count_lower_bound: Option<u64>,
+    /// Exactness of retained values.
+    pub retained_exactness: RetainedExactness,
+    /// Completeness of the source population.
+    pub source_completeness: SourceCompleteness,
+    /// Semantics of physical counts used by the factor.
+    pub physical_count_semantics: PhysicalCountSemantics,
+    /// Pair-boundary attribution.
+    pub boundary_quality: BoundaryQuality,
+}
+
+impl FactorCoverage {
+    fn is_consistent(&self) -> bool {
+        let population_is_consistent = self.source_population.is_none_or(|population| {
+            population
+                .total
+                .is_none_or(|total| population.collected <= total)
+                && (population.total_quality != PopulationTotalQuality::Exact
+                    || population.total.is_some())
+        });
+        let loss_is_consistent = self
+            .lost_count_lower_bound
+            .is_none_or(|count| count == 0 || !self.loss_reasons.is_empty());
+        let state_is_consistent = match self.applicability {
+            Applicability::NotApplicable => self.is_valid_not_applicable(self.interval),
+            Applicability::Unsupported => {
+                matches!(
+                    self.state,
+                    CoverageState::Unknown | CoverageState::NotCollected
+                ) && self.present_samples == 0
+                    && self.covered_duration_us == 0
+            }
+            Applicability::Applicable => match self.state {
+                CoverageState::Complete => {
+                    self.present_samples > 0
+                        && self.covered_duration_us == self.interval.duration_us()
+                }
+                CoverageState::Partial => {
+                    self.present_samples > 0
+                        && self.covered_duration_us > 0
+                        && self.covered_duration_us < self.interval.duration_us()
+                }
+                CoverageState::Gap => self.covered_duration_us < self.interval.duration_us(),
+                CoverageState::Unknown | CoverageState::NotCollected => {
+                    self.covered_duration_us == 0
+                }
+            },
+        };
+        self.expected_period_us.is_none_or(|period| period > 0)
+            && self.covered_duration_us <= self.interval.duration_us()
+            && population_is_consistent
+            && loss_is_consistent
+            && state_is_consistent
+    }
+
+    fn is_strictly_eligible(&self, interval: CoverageSpan) -> bool {
+        let population_is_full = self.source_population.is_none_or(|population| {
+            population.total == Some(population.collected)
+                && population.total_quality == PopulationTotalQuality::Exact
+        });
+        self.interval == interval
+            && self.applicability == Applicability::Applicable
+            && self.state == CoverageState::Complete
+            && self.covered_duration_us == interval.duration_us()
+            && self.expected_period_us.is_some_and(|period| period > 0)
+            && matches!(
+                self.period_quality,
+                PeriodQuality::PersistedConfigEpoch | PeriodQuality::ObservedStable
+            )
+            && self.cadence_epoch_id.is_some()
+            && !self.crosses_cadence_boundary
+            && self.loss_reasons.is_empty()
+            && self.lost_count_lower_bound.is_none_or(|count| count == 0)
+            && self.retained_exactness == RetainedExactness::Exact
+            && self.source_completeness == SourceCompleteness::Full
+            && matches!(
+                self.physical_count_semantics,
+                PhysicalCountSemantics::Exact | PhysicalCountSemantics::NotApplicable
+            )
+            && self.boundary_quality != BoundaryQuality::Unknown
+            && population_is_full
+    }
+
+    fn is_valid_not_applicable(&self, interval: CoverageSpan) -> bool {
+        self.interval == interval
+            && self.applicability == Applicability::NotApplicable
+            && self.state == CoverageState::NotCollected
+            && self.expected_period_us.is_none()
+            && self.period_quality == PeriodQuality::Unknown
+            && self.cadence_epoch_id.is_none()
+            && !self.crosses_cadence_boundary
+            && self.present_samples == 0
+            && self.covered_duration_us == 0
+            && self.source_population.is_none()
+            && self.loss_reasons.is_empty()
+            && self.lost_count_lower_bound.is_none()
+            && self.retained_exactness == RetainedExactness::Unknown
+            && self.source_completeness == SourceCompleteness::Unknown
+            && self.physical_count_semantics == PhysicalCountSemantics::NotApplicable
+            && self.boundary_quality == BoundaryQuality::Unknown
+    }
+}
+
+/// Identity of the exact policy and factor topology used by a point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FactorSetId(pub [u8; 16]);
 
+/// Digest of required and optional factor assignments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProfileTopologyId(pub [u8; 16]);
+
 impl FactorSetId {
-    /// Derives the identity from the policy and the participating factors.
-    ///
-    /// The preimage covers the policy version, profile, the crate's registry
-    /// contract version, and the ordered `(factor, domain)` pairs that
-    /// actually participated; every field is fixed-width little-endian.
+    /// Derives an ID from policy axes and canonical factor sets.
     #[must_use]
     pub fn derive(
         health_policy_version: u32,
+        reduction_semantics_version: u32,
         profile_id: u32,
+        profile_topology_id: ProfileTopologyId,
+        applicable: &[(FactorId, DomainId)],
         participating: &[(FactorId, DomainId)],
     ) -> Self {
-        let mut parts: Vec<[u8; 8]> = Vec::with_capacity(participating.len());
-        for &(factor, domain) in participating {
-            let mut pair = [0_u8; 8];
-            pair[..4].copy_from_slice(&factor.0.to_le_bytes());
-            pair[4..].copy_from_slice(&(domain as u32).to_le_bytes());
-            parts.push(pair);
-        }
-        let policy_version = health_policy_version.to_le_bytes();
-        let profile = profile_id.to_le_bytes();
-        let registry = REGISTRY_CONTRACT_VERSION.to_le_bytes();
-        let mut preimage: Vec<&[u8]> =
-            vec![FACTOR_SET_DOMAIN_TAG, &policy_version, &profile, &registry];
-        preimage.extend(parts.iter().map(<[u8; 8]>::as_slice));
-        let digest = sha256::digest_parts(&preimage);
+        let applicable = encode_factor_pairs(applicable);
+        let participating = encode_factor_pairs(participating);
+        let digest = sha256::digest_parts(&[
+            FACTOR_SET_DOMAIN_TAG,
+            &health_policy_version.to_le_bytes(),
+            &reduction_semantics_version.to_le_bytes(),
+            &profile_id.to_le_bytes(),
+            &profile_topology_id.0,
+            &REGISTRY_CONTRACT_VERSION.to_le_bytes(),
+            &applicable,
+            &participating,
+        ]);
         let mut id = [0_u8; 16];
         id.copy_from_slice(&digest[..16]);
         Self(id)
     }
 }
 
-/// Which factors a profile requires before a score may exist.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RequiredFactorProfile {
-    /// Stable identity of the profile.
-    pub profile_id: u32,
-    /// Domains that must be known for any numeric score.
-    pub required_domains: Vec<DomainId>,
-    /// The factors each required domain needs, when applicable.
-    pub required_factors_by_domain: Vec<(DomainId, Vec<FactorId>)>,
-    /// Factors that refine the score but never block it.
-    pub optional_factors: Vec<FactorId>,
-    /// Minimum covered ratio per factor for partial coverage to count.
-    ///
-    /// A required factor with no declared ratio counts only when its
-    /// coverage is `Complete`; no threshold is invented for it.
-    pub minimum_covered_ratio_by_factor: Vec<(FactorId, f64)>,
+fn encode_factor_pairs(pairs: &[(FactorId, DomainId)]) -> Vec<u8> {
+    let mut pairs = pairs.to_vec();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let count = u64::try_from(pairs.len()).unwrap_or(u64::MAX);
+    let mut encoded = Vec::with_capacity(8 + pairs.len() * 8);
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for (factor, domain) in pairs {
+        encoded.extend_from_slice(&factor.0.to_le_bytes());
+        encoded.extend_from_slice(&(domain as u32).to_le_bytes());
+    }
+    encoded
 }
 
-/// The versioned health policy: profile plus state thresholds.
+/// Invalid required-factor profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidFactorProfile {
+    /// Profile exceeds its configured factor-work bound.
+    LimitExceeded,
+    /// No required domain was declared.
+    NoRequiredDomains,
+    /// A required domain has no factors.
+    EmptyRequiredDomain,
+    /// A domain or factor occurs more than once.
+    DuplicateEntry,
+    /// A factor is assigned to more than one domain or role.
+    ConflictingFactorAssignment,
+}
+
+/// Validated factor topology for one profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredFactorProfile {
+    profile_id: u32,
+    topology_id: ProfileTopologyId,
+    required_factors_by_domain: Vec<(DomainId, Vec<FactorId>)>,
+    optional_factors: Vec<(FactorId, DomainId)>,
+}
+
+impl RequiredFactorProfile {
+    /// Builds a profile with unique, nonempty required domains.
+    ///
+    /// # Errors
+    /// Returns [`InvalidFactorProfile`] for an empty or ambiguous topology.
+    pub fn new(
+        profile_id: u32,
+        mut required_factors_by_domain: Vec<(DomainId, Vec<FactorId>)>,
+        mut optional_factors: Vec<(FactorId, DomainId)>,
+        limits: HealthLimits,
+    ) -> Result<Self, InvalidFactorProfile> {
+        if required_factors_by_domain.is_empty() {
+            return Err(InvalidFactorProfile::NoRequiredDomains);
+        }
+        if required_factors_by_domain.len() > DomainId::ALL.len()
+            || optional_factors.len() > limits.max_profile_factors
+        {
+            return Err(InvalidFactorProfile::LimitExceeded);
+        }
+        let profile_factor_count = required_factors_by_domain.iter().try_fold(
+            optional_factors.len(),
+            |count, (_, factors)| {
+                if factors.is_empty() {
+                    return Err(InvalidFactorProfile::EmptyRequiredDomain);
+                }
+                count
+                    .checked_add(factors.len())
+                    .ok_or(InvalidFactorProfile::LimitExceeded)
+            },
+        )?;
+        if profile_factor_count > limits.max_profile_factors {
+            return Err(InvalidFactorProfile::LimitExceeded);
+        }
+        required_factors_by_domain.sort_unstable_by_key(|(domain, _)| *domain);
+        optional_factors.sort_unstable();
+        if required_factors_by_domain
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+            || optional_factors.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(InvalidFactorProfile::DuplicateEntry);
+        }
+        let mut assigned = BTreeMap::new();
+        for (domain, factors) in &mut required_factors_by_domain {
+            factors.sort_unstable();
+            if factors.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(InvalidFactorProfile::DuplicateEntry);
+            }
+            for factor in factors {
+                if assigned.insert(*factor, *domain).is_some() {
+                    return Err(InvalidFactorProfile::ConflictingFactorAssignment);
+                }
+            }
+        }
+        for &(factor, domain) in &optional_factors {
+            if assigned.insert(factor, domain).is_some() {
+                return Err(InvalidFactorProfile::ConflictingFactorAssignment);
+            }
+        }
+        let required_pairs: Vec<(FactorId, DomainId)> = required_factors_by_domain
+            .iter()
+            .flat_map(|(domain, factors)| factors.iter().copied().map(|factor| (factor, *domain)))
+            .collect();
+        let required_encoded = encode_factor_pairs(&required_pairs);
+        let optional_encoded = encode_factor_pairs(&optional_factors);
+        let topology_digest = sha256::digest_parts(&[
+            PROFILE_TOPOLOGY_DOMAIN_TAG,
+            &profile_id.to_le_bytes(),
+            &required_encoded,
+            &optional_encoded,
+        ]);
+        let mut topology_id = [0_u8; 16];
+        topology_id.copy_from_slice(&topology_digest[..16]);
+        Ok(Self {
+            profile_id,
+            topology_id: ProfileTopologyId(topology_id),
+            required_factors_by_domain,
+            optional_factors,
+        })
+    }
+
+    /// Stable profile ID.
+    #[must_use]
+    pub const fn profile_id(&self) -> u32 {
+        self.profile_id
+    }
+
+    /// Digest of required and optional assignments.
+    #[must_use]
+    pub const fn topology_id(&self) -> ProfileTopologyId {
+        self.topology_id
+    }
+
+    fn configured_domain(&self, factor: FactorId) -> Option<DomainId> {
+        self.required_factors_by_domain
+            .iter()
+            .find_map(|(domain, factors)| factors.contains(&factor).then_some(*domain))
+            .or_else(|| {
+                self.optional_factors
+                    .iter()
+                    .find_map(|&(candidate, domain)| (candidate == factor).then_some(domain))
+            })
+    }
+
+    fn factor_count(&self) -> usize {
+        self.required_factors_by_domain
+            .iter()
+            .map(|(_, factors)| factors.len())
+            .sum::<usize>()
+            + self.optional_factors.len()
+    }
+}
+
+/// Invalid health policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidHealthPolicy {
+    /// A policy version is zero.
+    ZeroVersion,
+    /// Thresholds are non-finite, out of range, or reversed.
+    InvalidThresholds,
+    /// Operation limits cannot hold one complete profile cell.
+    IncompatibleLimits,
+}
+
+/// Versioned policy and score thresholds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HealthPolicy {
-    /// The policy version stamped into every produced point.
-    pub version: u32,
-    /// The required-coverage profile.
-    pub profile: RequiredFactorProfile,
-    /// Scores below this are `Degraded`; expected above `critical_below`.
-    pub degraded_below: f64,
-    /// Scores below this are `Critical`.
-    pub critical_below: f64,
-}
-
-/// One evaluated health point over one interval.
-#[derive(Debug, Clone, PartialEq)]
-pub struct HealthPoint {
-    /// The evaluated interval.
-    pub interval: CoverageSpan,
-    /// Continuous pressure score, `None` when required coverage is missing.
-    pub continuous_score: Option<f64>,
-    /// The combined score: zero under a trusted floor, else continuous.
-    pub overall_score: Option<f64>,
-    /// The combined state, never erasing unknown.
-    pub overall_state: HealthState,
-    /// The policy version that produced this point.
-    pub health_policy_version: u32,
-    /// Identity of the factor set that actually participated.
-    pub factor_set_id: FactorSetId,
-    /// Normalized factor penalties, deterministically ordered.
-    pub factor_penalties: Vec<FactorPenalty>,
-    /// Domain penalties with their driving factors, in domain order.
-    pub domain_penalties: Vec<DomainPenalty>,
-    /// Trusted floor evidence, sorted and unique.
-    pub floor_evidence: Vec<FloorEvidence>,
-    /// Per-factor coverage of this interval.
-    pub coverage: Vec<FactorCoverage>,
+    version: u32,
+    reduction_semantics_version: u32,
+    profile: RequiredFactorProfile,
+    degraded_below: f64,
+    critical_below: f64,
+    limits: HealthLimits,
 }
 
 impl HealthPolicy {
-    /// Maps a known overall score to a state.
+    /// Builds a policy with ordered finite thresholds.
+    ///
+    /// # Errors
+    /// Returns [`InvalidHealthPolicy`] for invalid versions, thresholds, or
+    /// operation limits that cannot hold one complete profile cell.
+    pub fn new(
+        version: u32,
+        reduction_semantics_version: u32,
+        profile: RequiredFactorProfile,
+        degraded_below: f64,
+        critical_below: f64,
+        limits: HealthLimits,
+    ) -> Result<Self, InvalidHealthPolicy> {
+        if version == 0 || reduction_semantics_version == 0 {
+            return Err(InvalidHealthPolicy::ZeroVersion);
+        }
+        if !degraded_below.is_finite()
+            || !critical_below.is_finite()
+            || !(0.0..=1.0).contains(&critical_below)
+            || !(0.0..=1.0).contains(&degraded_below)
+            || critical_below > degraded_below
+        {
+            return Err(InvalidHealthPolicy::InvalidThresholds);
+        }
+        let profile_factor_count = profile.factor_count();
+        if profile_factor_count > limits.max_profile_factors
+            || profile_factor_count > limits.max_cell_factors
+            || profile_factor_count > limits.max_coverage_entries
+        {
+            return Err(InvalidHealthPolicy::IncompatibleLimits);
+        }
+        Ok(Self {
+            version,
+            reduction_semantics_version,
+            profile,
+            degraded_below,
+            critical_below,
+            limits,
+        })
+    }
+
+    /// Policy version.
     #[must_use]
-    pub fn state_from_score(&self, score: f64) -> HealthState {
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Maps a known score to a state.
+    #[must_use]
+    fn state_from_score(&self, score: f64) -> HealthState {
         if score < self.critical_below {
             HealthState::Critical
         } else if score < self.degraded_below {
@@ -334,229 +660,468 @@ impl HealthPolicy {
         }
     }
 
-    /// Evaluates one co-temporal cell into a health point.
+    /// Evaluates one co-temporal cell.
     ///
-    /// The decision table: a missing required domain makes both numeric
-    /// scores `None` — with a trusted floor the state is still `Critical`,
-    /// otherwise `Unknown`. With full required coverage the continuous score
-    /// is the product of domain complements; a trusted floor forces the
-    /// overall score to `0.0` and the state to `Critical`.
+    /// Missing or ineligible required evidence yields an `Unknown` numeric
+    /// score. Contradictory records return a typed error.
     ///
-    /// Every `FactorPenalty` presupposes a factor reduced from real covered
-    /// samples; an uncovered factor must not appear here at all.
-    #[must_use]
+    /// # Errors
+    /// Returns [`HealthEvaluationError`] for duplicate, foreign, or
+    /// contradictory evidence.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validation and construction form one atomic decision table"
+    )]
     pub fn evaluate_cell(
         &self,
         interval: CoverageSpan,
         factors: &[FactorPenalty],
-        coverage: Vec<FactorCoverage>,
+        mut coverage: Vec<FactorCoverage>,
         floor_evidence: Vec<FloorEvidence>,
-    ) -> HealthPoint {
-        let mut factor_penalties = factors.to_vec();
-        factor_penalties.sort_unstable_by(order_factor_penalties);
-
-        let domain_penalties = domain_penalties_of(&factor_penalties);
-        let floor_evidence = normalized_floors(floor_evidence);
-        let has_floor = !floor_evidence.is_empty();
-
-        let participating: Vec<(FactorId, DomainId)> = factor_penalties
-            .iter()
-            .map(|p| (p.factor_id, p.domain))
-            .collect();
-        let factor_set_id =
-            FactorSetId::derive(self.version, self.profile.profile_id, &participating);
-
-        let (continuous_score, overall_score, overall_state);
-        if self.required_domains_known(interval, &coverage) {
-            let product: f64 = domain_penalties.iter().map(|d| 1.0 - d.penalty).product();
-            continuous_score = Some(product);
-            overall_score = Some(if has_floor { 0.0 } else { product });
-            overall_state = if has_floor {
-                HealthState::Critical
-            } else {
-                self.state_from_score(product)
-            };
-        } else {
-            continuous_score = None;
-            overall_score = None;
-            overall_state = if has_floor {
-                HealthState::Critical
-            } else {
-                HealthState::Unknown
-            };
+    ) -> Result<HealthPoint, HealthEvaluationError> {
+        if factors.len() > self.limits.max_cell_factors {
+            return Err(HealthEvaluationError::LimitExceeded(
+                HealthResource::CellFactors,
+            ));
+        }
+        if coverage.len() > self.limits.max_coverage_entries {
+            return Err(HealthEvaluationError::LimitExceeded(
+                HealthResource::CoverageEntries,
+            ));
+        }
+        if floor_evidence.len() > self.limits.max_floor_evidence {
+            return Err(HealthEvaluationError::LimitExceeded(
+                HealthResource::FloorEvidence,
+            ));
+        }
+        coverage.sort_unstable_by_key(|entry| entry.factor_id);
+        if coverage
+            .windows(2)
+            .any(|pair| pair[0].factor_id == pair[1].factor_id)
+        {
+            return Err(HealthEvaluationError::DuplicateCoverage);
+        }
+        for entry in &mut coverage {
+            if entry.loss_reasons.len() > LossReason::ALL.len() {
+                return Err(HealthEvaluationError::LimitExceeded(
+                    HealthResource::LossReasons,
+                ));
+            }
+            entry.loss_reasons.sort_unstable();
+            entry.loss_reasons.dedup();
+            if entry.interval != interval {
+                return Err(HealthEvaluationError::CoverageIntervalMismatch);
+            }
+            if !entry.is_consistent() {
+                return Err(HealthEvaluationError::InvalidCoverage);
+            }
+            if self.profile.configured_domain(entry.factor_id).is_none() {
+                return Err(HealthEvaluationError::UnconfiguredFactor);
+            }
         }
 
-        HealthPoint {
+        let mut factor_penalties = factors.to_vec();
+        factor_penalties.sort_unstable_by(order_factor_penalties);
+        let mut seen_factors = BTreeSet::new();
+        for penalty in &factor_penalties {
+            if !seen_factors.insert(penalty.factor_id) {
+                return Err(HealthEvaluationError::DuplicatePenalty);
+            }
+            if self.profile.configured_domain(penalty.factor_id) != Some(penalty.domain) {
+                return Err(HealthEvaluationError::FactorDomainMismatch);
+            }
+            let Some(entry) = coverage
+                .iter()
+                .find(|entry| entry.factor_id == penalty.factor_id)
+            else {
+                return Err(HealthEvaluationError::PenaltyWithoutCoverage);
+            };
+            if !entry.is_strictly_eligible(interval) {
+                return Err(HealthEvaluationError::PenaltyWithIneligibleCoverage);
+            }
+        }
+
+        let floor_evidence = normalize_floors(floor_evidence)?;
+        let has_floor = !floor_evidence.is_empty();
+        let required_known =
+            self.profile
+                .required_factors_by_domain
+                .iter()
+                .all(|(_, required_factors)| {
+                    required_factors.iter().all(|factor| {
+                        let Some(entry) = coverage.iter().find(|entry| entry.factor_id == *factor)
+                        else {
+                            return false;
+                        };
+                        if entry.is_valid_not_applicable(interval) {
+                            return true;
+                        }
+                        entry.is_strictly_eligible(interval)
+                            && factor_penalties
+                                .iter()
+                                .any(|penalty| penalty.factor_id == *factor)
+                    })
+                });
+
+        let domain_penalties = domain_penalties_of(&factor_penalties);
+        let continuous_score = required_known.then(|| {
+            domain_penalties
+                .iter()
+                .map(|domain| 1.0 - domain.penalty)
+                .product::<f64>()
+        });
+        let overall_score = continuous_score.map(|score| if has_floor { 0.0 } else { score });
+        let overall_state = if has_floor {
+            HealthState::Critical
+        } else if let Some(score) = overall_score {
+            self.state_from_score(score)
+        } else {
+            HealthState::Unknown
+        };
+
+        let applicable: Vec<(FactorId, DomainId)> = coverage
+            .iter()
+            .filter(|entry| entry.applicability == Applicability::Applicable)
+            .filter_map(|entry| {
+                self.profile
+                    .configured_domain(entry.factor_id)
+                    .map(|domain| (entry.factor_id, domain))
+            })
+            .collect();
+        let participating: Vec<(FactorId, DomainId)> = factor_penalties
+            .iter()
+            .map(|penalty| (penalty.factor_id, penalty.domain))
+            .collect();
+        let factor_set_id = FactorSetId::derive(
+            self.version,
+            self.reduction_semantics_version,
+            self.profile.profile_id,
+            self.profile.topology_id,
+            &applicable,
+            &participating,
+        );
+
+        Ok(HealthPoint {
             interval,
             continuous_score,
             overall_score,
             overall_state,
             health_policy_version: self.version,
+            reduction_semantics_version: self.reduction_semantics_version,
+            profile_topology_id: self.profile.topology_id,
             factor_set_id,
             factor_penalties,
             domain_penalties,
             floor_evidence,
             coverage,
-        }
-    }
-
-    /// Whether every required domain has proven coverage in the cell.
-    fn required_domains_known(&self, interval: CoverageSpan, coverage: &[FactorCoverage]) -> bool {
-        self.profile.required_domains.iter().all(|&domain| {
-            let required = self
-                .profile
-                .required_factors_by_domain
-                .iter()
-                .find(|(d, _)| *d == domain)
-                .map(|(_, factors)| factors.as_slice())
-                .unwrap_or_default();
-            required
-                .iter()
-                .all(|&factor| self.factor_is_covered(factor, interval, coverage))
         })
     }
+}
 
-    /// Whether one required factor is applicably and sufficiently covered.
-    fn factor_is_covered(
-        &self,
-        factor: FactorId,
-        interval: CoverageSpan,
-        coverage: &[FactorCoverage],
-    ) -> bool {
-        let Some(entry) = coverage.iter().find(|c| c.factor_id == factor) else {
-            return false;
-        };
-        match entry.applicability {
-            // Not applicable: the factor does not block the domain.
-            Applicability::NotApplicable => return true,
-            Applicability::Unsupported => return false,
-            Applicability::Applicable => {}
-        }
-        match entry.state {
-            CoverageState::Complete => true,
-            CoverageState::Partial => self.partial_coverage_suffices(factor, interval, entry),
-            CoverageState::Gap | CoverageState::Unknown | CoverageState::NotCollected => false,
-        }
+/// Contradiction in cell evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthEvaluationError {
+    /// A configured work/output bound was exceeded.
+    LimitExceeded(HealthResource),
+    /// More than one coverage record exists for a factor.
+    DuplicateCoverage,
+    /// More than one penalty exists for a factor.
+    DuplicatePenalty,
+    /// Coverage describes a different interval.
+    CoverageIntervalMismatch,
+    /// Coverage fields contradict applicability or state.
+    InvalidCoverage,
+    /// A coverage record or penalty references an unconfigured factor.
+    UnconfiguredFactor,
+    /// Penalty domain differs from the profile.
+    FactorDomainMismatch,
+    /// A penalty has no coverage record.
+    PenaltyWithoutCoverage,
+    /// A penalty claims evidence that strict coverage rejects.
+    PenaltyWithIneligibleCoverage,
+    /// One fact ID was assigned conflicting floor classes.
+    ConflictingFloorEvidence,
+}
+
+/// Evaluated health point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HealthPoint {
+    interval: CoverageSpan,
+    continuous_score: Option<f64>,
+    overall_score: Option<f64>,
+    overall_state: HealthState,
+    health_policy_version: u32,
+    reduction_semantics_version: u32,
+    profile_topology_id: ProfileTopologyId,
+    factor_set_id: FactorSetId,
+    factor_penalties: Vec<FactorPenalty>,
+    domain_penalties: Vec<DomainPenalty>,
+    floor_evidence: Vec<FloorEvidence>,
+    coverage: Vec<FactorCoverage>,
+}
+
+impl HealthPoint {
+    /// Evaluated interval.
+    #[must_use]
+    pub const fn interval(&self) -> CoverageSpan {
+        self.interval
     }
 
-    /// Whether partial coverage clears the factor's declared minimum ratio.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "durations stay far below 2^53 microseconds, so the f64 \
-                  ratio is exact"
-    )]
-    fn partial_coverage_suffices(
-        &self,
-        factor: FactorId,
-        interval: CoverageSpan,
-        entry: &FactorCoverage,
-    ) -> bool {
-        let Some(&(_, minimum)) = self
-            .profile
-            .minimum_covered_ratio_by_factor
+    /// Continuous score, absent when required evidence is unknown.
+    #[must_use]
+    pub const fn continuous_score(&self) -> Option<f64> {
+        self.continuous_score
+    }
+
+    /// Overall score after applying floors.
+    #[must_use]
+    pub const fn overall_score(&self) -> Option<f64> {
+        self.overall_score
+    }
+
+    /// Overall state.
+    #[must_use]
+    pub const fn overall_state(&self) -> HealthState {
+        self.overall_state
+    }
+
+    /// Health-policy version.
+    #[must_use]
+    pub const fn health_policy_version(&self) -> u32 {
+        self.health_policy_version
+    }
+
+    /// Reduction-semantics version.
+    #[must_use]
+    pub const fn reduction_semantics_version(&self) -> u32 {
+        self.reduction_semantics_version
+    }
+
+    /// Required and optional factor topology.
+    #[must_use]
+    pub const fn profile_topology_id(&self) -> ProfileTopologyId {
+        self.profile_topology_id
+    }
+
+    /// Factor-set identity.
+    #[must_use]
+    pub const fn factor_set_id(&self) -> FactorSetId {
+        self.factor_set_id
+    }
+
+    /// Canonical factor penalties.
+    #[must_use]
+    pub fn factor_penalties(&self) -> &[FactorPenalty] {
+        &self.factor_penalties
+    }
+
+    /// Domain penalties.
+    #[must_use]
+    pub fn domain_penalties(&self) -> &[DomainPenalty] {
+        &self.domain_penalties
+    }
+
+    /// Canonical floor evidence.
+    #[must_use]
+    pub fn floor_evidence(&self) -> &[FloorEvidence] {
+        &self.floor_evidence
+    }
+
+    /// Factor coverage records.
+    #[must_use]
+    pub fn coverage(&self) -> &[FactorCoverage] {
+        &self.coverage
+    }
+}
+
+/// Downsample failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownsampleError {
+    /// A configured work/output bound was exceeded.
+    LimitExceeded(HealthResource),
+    /// Points use different health, reduction, or profile topology.
+    MixedPolicyAxes,
+    /// A point lies outside the requested bucket.
+    PointOutsideBucket,
+    /// One fact ID was assigned conflicting floor classes.
+    ConflictingFloorEvidence,
+}
+
+/// Bucket result that preserves the exact representative cell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownsampledHealthPoint {
+    bucket: CoverageSpan,
+    representative: HealthPoint,
+    floor_evidence: Vec<FloorEvidence>,
+}
+
+impl DownsampledHealthPoint {
+    /// Requested downsample bucket.
+    #[must_use]
+    pub const fn bucket(&self) -> CoverageSpan {
+        self.bucket
+    }
+
+    /// Selected fine cell and its original coverage interval.
+    #[must_use]
+    pub const fn representative(&self) -> &HealthPoint {
+        &self.representative
+    }
+
+    /// Canonical floor evidence from the complete bucket.
+    #[must_use]
+    pub fn floor_evidence(&self) -> &[FloorEvidence] {
+        &self.floor_evidence
+    }
+}
+
+/// Selects one representative cell for a bucket.
+///
+/// Floor cells win first, ordered by interval start and supporting fact ID.
+/// Without a floor, the minimum numeric score wins, then interval start and
+/// factor-set ID. The selected cell keeps its original interval and coverage.
+///
+/// # Errors
+/// Returns [`DownsampleError`] for mixed policy axes, out-of-bucket points, or
+/// conflicting floor evidence.
+pub fn downsample_worst(
+    points: &[HealthPoint],
+    bucket: CoverageSpan,
+    limits: HealthLimits,
+) -> Result<Option<DownsampledHealthPoint>, DownsampleError> {
+    if points.len() > limits.max_downsample_points {
+        return Err(DownsampleError::LimitExceeded(
+            HealthResource::DownsamplePoints,
+        ));
+    }
+    let Some(first) = points.first() else {
+        return Ok(None);
+    };
+    if points.iter().any(|point| {
+        point.health_policy_version != first.health_policy_version
+            || point.reduction_semantics_version != first.reduction_semantics_version
+            || point.profile_topology_id != first.profile_topology_id
+    }) {
+        return Err(DownsampleError::MixedPolicyAxes);
+    }
+    if points.iter().any(|point| {
+        point.interval.start_us() < bucket.start_us() || point.interval.end_us() > bucket.end_us()
+    }) {
+        return Err(DownsampleError::PointOutsideBucket);
+    }
+    let floor_count = points
+        .iter()
+        .try_fold(0_usize, |count, point| {
+            count.checked_add(point.floor_evidence.len())
+        })
+        .ok_or(DownsampleError::LimitExceeded(
+            HealthResource::FloorEvidence,
+        ))?;
+    if floor_count > limits.max_floor_evidence {
+        return Err(DownsampleError::LimitExceeded(
+            HealthResource::FloorEvidence,
+        ));
+    }
+    let all_floors = normalize_floors(
+        points
             .iter()
-            .find(|(f, _)| *f == factor)
-        else {
-            return false;
-        };
-        let ratio = entry.covered_duration_us as f64 / interval.duration_us() as f64;
-        ratio >= minimum
-    }
-}
+            .flat_map(|point| point.floor_evidence.iter().copied())
+            .collect(),
+    )
+    .map_err(|_conflict| DownsampleError::ConflictingFloorEvidence)?;
 
-/// Worst-point downsample of fine points into one bucket point.
-///
-/// The bucket takes the scores and penalties of the single computed point
-/// with the minimum overall score — never component-wise maxima from
-/// different moments. Floor evidence from every point carries into the
-/// bucket. When no point has a numeric score, the bucket stays `Unknown`
-/// (or `Critical` under a floor) with no invented penalties.
-///
-/// All points must come from the same policy version; returns `None` for an
-/// empty input.
-#[must_use]
-pub fn downsample_worst(points: &[HealthPoint], bucket: CoverageSpan) -> Option<HealthPoint> {
-    let first = points.first()?;
-
-    let mut floors: Vec<FloorEvidence> = points
+    let representative = points
         .iter()
-        .flat_map(|p| p.floor_evidence.iter().copied())
-        .collect();
-    floors = normalized_floors(floors);
-    let has_floor = !floors.is_empty();
-
-    let worst = points
-        .iter()
-        .filter(|p| p.overall_score.is_some())
-        .min_by(|a, b| {
-            let (Some(a_score), Some(b_score)) = (a.overall_score, b.overall_score) else {
-                return Ordering::Equal;
-            };
-            a_score.total_cmp(&b_score)
+        .filter(|point| !point.floor_evidence.is_empty())
+        .min_by(|left, right| floor_point_cmp(left, right))
+        .or_else(|| {
+            points
+                .iter()
+                .filter(|point| point.overall_score.is_some())
+                .min_by(|left, right| {
+                    left.overall_score
+                        .unwrap_or(1.0)
+                        .total_cmp(&right.overall_score.unwrap_or(1.0))
+                        .then_with(|| point_tie_cmp(left, right))
+                })
+        })
+        .unwrap_or_else(|| {
+            points
+                .iter()
+                .min_by(|left, right| point_tie_cmp(left, right))
+                .unwrap_or(first)
         });
+    Ok(Some(DownsampledHealthPoint {
+        bucket,
+        representative: representative.clone(),
+        floor_evidence: all_floors,
+    }))
+}
 
-    let mut point = worst.map_or_else(
-        || HealthPoint {
-            interval: bucket,
-            continuous_score: None,
-            overall_score: None,
-            overall_state: HealthState::Unknown,
-            health_policy_version: first.health_policy_version,
-            factor_set_id: first.factor_set_id,
-            factor_penalties: Vec::new(),
-            domain_penalties: Vec::new(),
-            floor_evidence: Vec::new(),
-            coverage: Vec::new(),
-        },
-        |p| HealthPoint {
-            interval: bucket,
-            ..p.clone()
-        },
-    );
+fn point_tie_cmp(left: &HealthPoint, right: &HealthPoint) -> Ordering {
+    (left.interval.start_us(), left.factor_set_id)
+        .cmp(&(right.interval.start_us(), right.factor_set_id))
+}
 
-    if has_floor {
-        point.overall_state = HealthState::Critical;
-        point.overall_score = point.overall_score.map(|_| 0.0);
+fn floor_point_cmp(left: &HealthPoint, right: &HealthPoint) -> Ordering {
+    let left_fact = left
+        .floor_evidence
+        .iter()
+        .map(|floor| floor.supporting_fact_id)
+        .min();
+    let right_fact = right
+        .floor_evidence
+        .iter()
+        .map(|floor| floor.supporting_fact_id)
+        .min();
+    (left.interval.start_us(), left_fact, left.factor_set_id).cmp(&(
+        right.interval.start_us(),
+        right_fact,
+        right.factor_set_id,
+    ))
+}
+
+fn order_factor_penalties(left: &FactorPenalty, right: &FactorPenalty) -> Ordering {
+    (left.domain, left.factor_id, left.supporting_fact_id)
+        .cmp(&(right.domain, right.factor_id, right.supporting_fact_id))
+        .then_with(|| left.penalty.total_cmp(&right.penalty))
+}
+
+fn normalize_floors(
+    mut floors: Vec<FloorEvidence>,
+) -> Result<Vec<FloorEvidence>, HealthEvaluationError> {
+    floors.sort_unstable_by_key(|floor| (floor.supporting_fact_id, floor.class));
+    for pair in floors.windows(2) {
+        if pair[0].supporting_fact_id == pair[1].supporting_fact_id
+            && pair[0].class != pair[1].class
+        {
+            return Err(HealthEvaluationError::ConflictingFloorEvidence);
+        }
     }
-    point.floor_evidence = floors;
-    Some(point)
-}
-
-/// Deterministic order of factor penalties inside a point.
-fn order_factor_penalties(a: &FactorPenalty, b: &FactorPenalty) -> Ordering {
-    (a.domain, a.factor_id, a.supporting_fact_id)
-        .cmp(&(b.domain, b.factor_id, b.supporting_fact_id))
-        .then_with(|| a.penalty.total_cmp(&b.penalty))
-}
-
-/// Sorted, deduplicated floor evidence.
-fn normalized_floors(mut floors: Vec<FloorEvidence>) -> Vec<FloorEvidence> {
-    floors.sort_unstable();
     floors.dedup();
-    floors
+    Ok(floors)
 }
 
-/// Per-domain maximum penalties with their driving factors.
-///
-/// The maximum, not a product: correlated meters of one physical cause must
-/// not multiply into stronger evidence. A fact cited by several factors of
-/// the domain counts once by construction of the maximum.
-fn domain_penalties_of(factor_penalties: &[FactorPenalty]) -> Vec<DomainPenalty> {
-    let mut out: Vec<DomainPenalty> = Vec::new();
+fn domain_penalties_of(factors: &[FactorPenalty]) -> Vec<DomainPenalty> {
+    let mut out = Vec::new();
     for domain in DomainId::ALL {
-        let in_domain = factor_penalties.iter().filter(|p| p.domain == domain);
-        let Some(max) = in_domain.clone().map(|p| p.penalty).max_by(f64::total_cmp) else {
+        let in_domain = factors.iter().filter(|factor| factor.domain == domain);
+        let Some(maximum) = in_domain
+            .clone()
+            .map(|factor| factor.penalty)
+            .max_by(f64::total_cmp)
+        else {
             continue;
         };
         let mut driving_factor_ids: Vec<FactorId> = in_domain
-            .filter(|p| p.penalty.total_cmp(&max) == Ordering::Equal)
-            .map(|p| p.factor_id)
+            .filter(|factor| factor.penalty.total_cmp(&maximum) == Ordering::Equal)
+            .map(|factor| factor.factor_id)
             .collect();
         driving_factor_ids.sort_unstable();
         driving_factor_ids.dedup();
         out.push(DomainPenalty {
             domain,
-            penalty: max,
+            penalty: maximum,
             driving_factor_ids,
         });
     }
@@ -567,36 +1132,42 @@ fn domain_penalties_of(factor_penalties: &[FactorPenalty]) -> Vec<DomainPenalty>
 mod tests {
     #![allow(
         clippy::float_cmp,
-        reason = "scores asserted are exact products of dyadic penalties"
+        reason = "fixtures use exactly representable values"
     )]
 
     use super::*;
 
+    const LIMITS: HealthLimits = HealthLimits {
+        max_profile_factors: 32,
+        max_cell_factors: 32,
+        max_coverage_entries: 32,
+        max_floor_evidence: 32,
+        max_downsample_points: 32,
+    };
+
     fn span(from_us: i64, to_us: i64) -> CoverageSpan {
-        CoverageSpan::new(from_us, to_us).expect("valid span in fixture")
+        CoverageSpan::new(from_us, to_us).expect("valid fixture span")
+    }
+
+    fn factor_of(domain: DomainId) -> FactorId {
+        FactorId(10 * (domain as u32 + 1))
+    }
+
+    fn profile(required: &[DomainId]) -> RequiredFactorProfile {
+        RequiredFactorProfile::new(
+            1,
+            required
+                .iter()
+                .map(|&domain| (domain, vec![factor_of(domain)]))
+                .collect(),
+            vec![(FactorId(999), DomainId::CpuPressure)],
+            LIMITS,
+        )
+        .expect("valid profile")
     }
 
     fn policy(required: &[DomainId]) -> HealthPolicy {
-        HealthPolicy {
-            version: 1,
-            profile: RequiredFactorProfile {
-                profile_id: 1,
-                required_domains: required.to_vec(),
-                required_factors_by_domain: required
-                    .iter()
-                    .map(|&d| (d, vec![factor_of(d)]))
-                    .collect(),
-                optional_factors: Vec::new(),
-                minimum_covered_ratio_by_factor: vec![(FactorId(100), 0.5)],
-            },
-            degraded_below: 0.9,
-            critical_below: 0.5,
-        }
-    }
-
-    /// One synthetic required factor per domain: factor 10 * index.
-    fn factor_of(domain: DomainId) -> FactorId {
-        FactorId(10 * (domain as u32 + 1))
+        HealthPolicy::new(1, 1, profile(required), 0.9, 0.5, LIMITS).expect("valid policy")
     }
 
     fn complete_coverage(domain: DomainId, interval: CoverageSpan) -> FactorCoverage {
@@ -606,18 +1177,24 @@ mod tests {
             state: CoverageState::Complete,
             interval,
             expected_period_us: Some(1_000_000),
+            period_quality: PeriodQuality::PersistedConfigEpoch,
+            cadence_epoch_id: Some(CadenceEpochId([7; 16])),
+            crosses_cadence_boundary: false,
             present_samples: 10,
             covered_duration_us: interval.duration_us(),
             source_population: None,
             loss_reasons: Vec::new(),
             lost_count_lower_bound: None,
-            exactness: Exactness::RetainedExact,
+            retained_exactness: RetainedExactness::Exact,
+            source_completeness: SourceCompleteness::Full,
+            physical_count_semantics: PhysicalCountSemantics::NotApplicable,
+            boundary_quality: BoundaryQuality::Contained,
         }
     }
 
-    fn penalty(factor: u32, domain: DomainId, value: f64, fact: u8) -> FactorPenalty {
-        FactorPenalty::new(FactorId(factor), domain, value, FactId([fact; 32]))
-            .expect("valid penalty in fixture")
+    fn penalty(domain: DomainId, value: f64, fact: u8) -> FactorPenalty {
+        FactorPenalty::new(factor_of(domain), domain, value, FactId([fact; 32]))
+            .expect("valid penalty")
     }
 
     fn floor(class: FloorClass, fact: u8) -> FloorEvidence {
@@ -628,354 +1205,557 @@ mod tests {
     }
 
     #[test]
-    fn penalty_rejects_non_finite_and_out_of_range_values() {
-        for bad in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
-            assert!(
-                FactorPenalty::new(FactorId(1), DomainId::Contention, bad, FactId([0; 32]))
-                    .is_none(),
-                "accepted {bad}"
+    fn profile_and_thresholds_reject_vacuous_or_invalid_policy() {
+        assert_eq!(
+            RequiredFactorProfile::new(1, Vec::new(), Vec::new(), LIMITS),
+            Err(InvalidFactorProfile::NoRequiredDomains)
+        );
+        assert_eq!(
+            HealthPolicy::new(
+                1,
+                1,
+                profile(&[DomainId::Contention]),
+                f64::NAN,
+                0.5,
+                LIMITS,
+            ),
+            Err(InvalidHealthPolicy::InvalidThresholds)
+        );
+        assert_eq!(
+            HealthPolicy::new(1, 1, profile(&[DomainId::Contention]), 0.4, 0.5, LIMITS,),
+            Err(InvalidHealthPolicy::InvalidThresholds)
+        );
+
+        let too_tight = HealthLimits {
+            max_profile_factors: 1,
+            max_cell_factors: 1,
+            max_coverage_entries: 1,
+            ..LIMITS
+        };
+        assert_eq!(
+            HealthPolicy::new(
+                1,
+                1,
+                profile(&[DomainId::Contention, DomainId::MemoryPressure]),
+                0.9,
+                0.5,
+                too_tight,
+            ),
+            Err(InvalidHealthPolicy::IncompatibleLimits)
+        );
+    }
+
+    #[test]
+    fn missing_required_penalty_is_unknown_even_with_complete_coverage() {
+        let interval = span(0, 1_000_000);
+        let point = policy(&[DomainId::Contention])
+            .evaluate_cell(
+                interval,
+                &[],
+                vec![complete_coverage(DomainId::Contention, interval)],
+                Vec::new(),
+            )
+            .expect("consistent input");
+        assert_eq!(point.overall_score(), None);
+        assert_eq!(point.overall_state(), HealthState::Unknown);
+    }
+
+    #[test]
+    fn every_required_factor_needs_coverage_and_a_penalty() {
+        let interval = span(0, 1_000_000);
+        let first = factor_of(DomainId::Contention);
+        let second = FactorId(first.0 + 1);
+        let required = RequiredFactorProfile::new(
+            2,
+            vec![(DomainId::Contention, vec![first, second])],
+            Vec::new(),
+            LIMITS,
+        )
+        .expect("valid profile");
+        let policy = HealthPolicy::new(1, 1, required, 0.9, 0.5, LIMITS).expect("valid policy");
+        let mut second_coverage = complete_coverage(DomainId::Contention, interval);
+        second_coverage.factor_id = second;
+        let point = policy
+            .evaluate_cell(
+                interval,
+                &[penalty(DomainId::Contention, 0.0, 1)],
+                vec![
+                    complete_coverage(DomainId::Contention, interval),
+                    second_coverage,
+                ],
+                Vec::new(),
+            )
+            .expect("consistent input");
+        assert_eq!(point.overall_score(), None);
+        assert_eq!(point.overall_state(), HealthState::Unknown);
+    }
+
+    #[test]
+    fn partial_lossy_assumed_or_foreign_coverage_never_turns_green() {
+        let interval = span(0, 1_000_000);
+        let p = policy(&[DomainId::Contention]);
+        let required_penalty = penalty(DomainId::Contention, 0.0, 1);
+        let mut cases = Vec::new();
+        let mut partial = complete_coverage(DomainId::Contention, interval);
+        partial.state = CoverageState::Partial;
+        partial.covered_duration_us -= 1;
+        cases.push(partial);
+        let mut lossy = complete_coverage(DomainId::Contention, interval);
+        lossy.loss_reasons.push(LossReason::ParserBound);
+        cases.push(lossy);
+        let mut assumed = complete_coverage(DomainId::Contention, interval);
+        assumed.period_quality = PeriodQuality::AssumedCurrentConfig;
+        cases.push(assumed);
+        let mut boundary = complete_coverage(DomainId::Contention, interval);
+        boundary.crosses_cadence_boundary = true;
+        cases.push(boundary);
+
+        for coverage in cases {
+            assert_eq!(
+                p.evaluate_cell(interval, &[required_penalty], vec![coverage], Vec::new()),
+                Err(HealthEvaluationError::PenaltyWithIneligibleCoverage)
             );
         }
-        assert!(
-            FactorPenalty::new(FactorId(1), DomainId::Contention, 1.0, FactId([0; 32])).is_some()
+
+        let foreign = complete_coverage(DomainId::Contention, span(0, 2_000_000));
+        assert_eq!(
+            p.evaluate_cell(interval, &[], vec![foreign], Vec::new()),
+            Err(HealthEvaluationError::CoverageIntervalMismatch)
         );
     }
 
     #[test]
-    fn score_stays_finite_and_bounded_over_a_penalty_sweep() {
-        let interval = span(0, 60_000_000);
-        let p = policy(&[DomainId::Contention]);
-        let coverage = vec![complete_coverage(DomainId::Contention, interval)];
+    fn every_strict_coverage_axis_is_enforced() {
+        let interval = span(0, 1_000_000);
+        let policy = policy(&[DomainId::Contention]);
+        let required_penalty = penalty(DomainId::Contention, 0.0, 1);
+        let mut cases = Vec::new();
+
+        let mut no_epoch = complete_coverage(DomainId::Contention, interval);
+        no_epoch.cadence_epoch_id = None;
+        cases.push(no_epoch);
+        let mut inexact = complete_coverage(DomainId::Contention, interval);
+        inexact.retained_exactness = RetainedExactness::LowerBound;
+        cases.push(inexact);
+        let mut incomplete = complete_coverage(DomainId::Contention, interval);
+        incomplete.source_completeness = SourceCompleteness::BoundedSubset;
+        cases.push(incomplete);
+        let mut lower_bound_count = complete_coverage(DomainId::Contention, interval);
+        lower_bound_count.physical_count_semantics = PhysicalCountSemantics::LowerBound;
+        cases.push(lower_bound_count);
+        let mut unknown_boundary = complete_coverage(DomainId::Contention, interval);
+        unknown_boundary.boundary_quality = BoundaryQuality::Unknown;
+        cases.push(unknown_boundary);
+        let mut incomplete_population = complete_coverage(DomainId::Contention, interval);
+        incomplete_population.source_population = Some(SourcePopulation {
+            collected: 1,
+            total: Some(2),
+            total_quality: PopulationTotalQuality::Exact,
+        });
+        cases.push(incomplete_population);
+
+        for coverage in cases {
+            assert_eq!(
+                policy.evaluate_cell(interval, &[required_penalty], vec![coverage], Vec::new(),),
+                Err(HealthEvaluationError::PenaltyWithIneligibleCoverage)
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_loss_reason_vector_is_rejected_before_sorting() {
+        let interval = span(0, 1_000_000);
+        let mut coverage = complete_coverage(DomainId::Contention, interval);
+        coverage.loss_reasons = vec![LossReason::ParserBound; LossReason::ALL.len() + 1];
+        assert_eq!(
+            policy(&[DomainId::Contention]).evaluate_cell(
+                interval,
+                &[],
+                vec![coverage],
+                Vec::new(),
+            ),
+            Err(HealthEvaluationError::LimitExceeded(
+                HealthResource::LossReasons,
+            ))
+        );
+    }
+
+    #[test]
+    fn invalid_optional_coverage_is_rejected_without_a_penalty() {
+        let interval = span(0, 1_000_000);
+        let mut coverage = complete_coverage(DomainId::CpuPressure, interval);
+        coverage.factor_id = FactorId(999);
+        coverage.covered_duration_us = 0;
+        assert_eq!(
+            policy(&[DomainId::Contention]).evaluate_cell(
+                interval,
+                &[],
+                vec![coverage],
+                Vec::new(),
+            ),
+            Err(HealthEvaluationError::InvalidCoverage)
+        );
+    }
+
+    #[test]
+    fn explicit_zero_penalty_with_strict_coverage_can_be_normal() {
+        let interval = span(0, 1_000_000);
+        let point = policy(&[DomainId::Contention])
+            .evaluate_cell(
+                interval,
+                &[penalty(DomainId::Contention, 0.0, 1)],
+                vec![complete_coverage(DomainId::Contention, interval)],
+                Vec::new(),
+            )
+            .expect("consistent input");
+        assert_eq!(point.overall_score(), Some(1.0));
+        assert_eq!(point.overall_state(), HealthState::Normal);
+    }
+
+    #[test]
+    fn inapplicable_required_factor_does_not_invent_a_measurement() {
+        let interval = span(0, 1_000_000);
+        let mut coverage = complete_coverage(DomainId::Replication, interval);
+        coverage.applicability = Applicability::NotApplicable;
+        coverage.state = CoverageState::NotCollected;
+        coverage.expected_period_us = None;
+        coverage.period_quality = PeriodQuality::Unknown;
+        coverage.cadence_epoch_id = None;
+        coverage.present_samples = 0;
+        coverage.covered_duration_us = 0;
+        coverage.retained_exactness = RetainedExactness::Unknown;
+        coverage.source_completeness = SourceCompleteness::Unknown;
+        coverage.physical_count_semantics = PhysicalCountSemantics::NotApplicable;
+        coverage.boundary_quality = BoundaryQuality::Unknown;
+        let point = policy(&[DomainId::Replication])
+            .evaluate_cell(interval, &[], vec![coverage], Vec::new())
+            .expect("consistent input");
+        assert_eq!(point.overall_score(), Some(1.0));
+        assert!(point.factor_penalties().is_empty());
+    }
+
+    #[test]
+    fn contradictory_not_applicable_evidence_cannot_turn_green() {
+        let interval = span(0, 1_000_000);
+        let mut coverage = complete_coverage(DomainId::Replication, interval);
+        coverage.applicability = Applicability::NotApplicable;
+        coverage.state = CoverageState::NotCollected;
+        coverage.present_samples = 0;
+        coverage.covered_duration_us = 0;
+        coverage.loss_reasons.push(LossReason::TailerBound);
+        assert_eq!(
+            policy(&[DomainId::Replication]).evaluate_cell(
+                interval,
+                &[],
+                vec![coverage],
+                Vec::new(),
+            ),
+            Err(HealthEvaluationError::InvalidCoverage)
+        );
+    }
+
+    #[test]
+    fn domain_maxima_multiply_across_domains() {
+        let interval = span(0, 1_000_000);
+        let required = [DomainId::Contention, DomainId::MemoryPressure];
+        let coverage = required
+            .iter()
+            .map(|&domain| complete_coverage(domain, interval))
+            .collect();
+        let point = policy(&required)
+            .evaluate_cell(
+                interval,
+                &[
+                    penalty(DomainId::Contention, 0.5, 1),
+                    penalty(DomainId::MemoryPressure, 0.25, 2),
+                ],
+                coverage,
+                Vec::new(),
+            )
+            .expect("consistent input");
+        assert_eq!(point.continuous_score(), Some(0.5 * 0.75));
+    }
+
+    #[test]
+    fn fixed_factor_set_scores_are_bounded_and_monotonic() {
+        let interval = span(0, 1_000_000);
+        let required = [DomainId::Contention, DomainId::MemoryPressure];
+        let coverage: Vec<FactorCoverage> = required
+            .iter()
+            .map(|&domain| complete_coverage(domain, interval))
+            .collect();
+        let policy = policy(&required);
         let grid = [0.0, 0.25, 0.5, 0.75, 1.0];
-        for a in grid {
-            for b in grid {
-                for c in grid {
-                    let factors = [
-                        penalty(1, DomainId::Contention, a, 1),
-                        penalty(2, DomainId::MemoryPressure, b, 2),
-                        penalty(3, DomainId::CpuPressure, c, 3),
-                    ];
-                    let point = p.evaluate_cell(interval, &factors, coverage.clone(), Vec::new());
-                    let score = point.overall_score.expect("required domain is covered");
-                    assert!(score.is_finite());
-                    assert!((0.0..=1.0).contains(&score), "score {score} out of bounds");
-                    assert_eq!(point.continuous_score, point.overall_score);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn across_domains_complements_multiply() {
-        let interval = span(0, 1_000_000);
-        let p = policy(&[]);
-        let factors = [
-            penalty(1, DomainId::Contention, 0.5, 1),
-            penalty(2, DomainId::MemoryPressure, 0.25, 2),
-        ];
-        let point = p.evaluate_cell(interval, &factors, Vec::new(), Vec::new());
-        assert_eq!(point.continuous_score, Some(0.5 * 0.75));
-    }
-
-    #[test]
-    fn within_a_domain_the_maximum_wins_not_the_product() {
-        let interval = span(0, 1_000_000);
-        let p = policy(&[]);
-        // Two correlated meters of one chain: 0.5 and 0.4 must give 0.5,
-        // not 1 - 0.5*0.6 = 0.7.
-        let factors = [
-            penalty(1, DomainId::MemoryPressure, 0.5, 1),
-            penalty(2, DomainId::MemoryPressure, 0.4, 2),
-        ];
-        let point = p.evaluate_cell(interval, &factors, Vec::new(), Vec::new());
-        assert_eq!(point.continuous_score, Some(0.5));
-        assert_eq!(point.domain_penalties.len(), 1);
-        assert_eq!(
-            point.domain_penalties[0].driving_factor_ids,
-            vec![FactorId(1)]
-        );
-    }
-
-    #[test]
-    fn one_supporting_fact_is_never_double_counted() {
-        let interval = span(0, 1_000_000);
-        let p = policy(&[]);
-        let base = [penalty(1, DomainId::Contention, 0.5, 7)];
-        let with_duplicate = [
-            penalty(1, DomainId::Contention, 0.5, 7),
-            // The same fact reported through a second factor of the domain.
-            penalty(2, DomainId::Contention, 0.5, 7),
-        ];
-        let a = p.evaluate_cell(interval, &base, Vec::new(), Vec::new());
-        let b = p.evaluate_cell(interval, &with_duplicate, Vec::new(), Vec::new());
-        assert_eq!(a.continuous_score, b.continuous_score);
-    }
-
-    #[test]
-    fn raising_one_penalty_in_a_fixed_set_never_raises_the_score() {
-        let interval = span(0, 1_000_000);
-        let p = policy(&[]);
-        let grid = [0.0, 0.1, 0.3, 0.6, 0.9, 1.0];
         for low in grid {
-            for high in grid {
-                if low > high {
-                    continue;
-                }
-                let weaker = [
-                    penalty(1, DomainId::Contention, low, 1),
-                    penalty(2, DomainId::CpuPressure, 0.3, 2),
-                ];
-                let stronger = [
-                    penalty(1, DomainId::Contention, high, 1),
-                    penalty(2, DomainId::CpuPressure, 0.3, 2),
-                ];
-                let weak = p.evaluate_cell(interval, &weaker, Vec::new(), Vec::new());
-                let strong = p.evaluate_cell(interval, &stronger, Vec::new(), Vec::new());
-                assert!(
-                    strong.continuous_score <= weak.continuous_score,
-                    "penalty {low} -> {high} raised the score"
-                );
+            for high in grid.into_iter().filter(|high| *high >= low) {
+                let evaluate = |contention| {
+                    policy
+                        .evaluate_cell(
+                            interval,
+                            &[
+                                penalty(DomainId::Contention, contention, 1),
+                                penalty(DomainId::MemoryPressure, 0.25, 2),
+                            ],
+                            coverage.clone(),
+                            Vec::new(),
+                        )
+                        .expect("consistent input")
+                        .continuous_score()
+                        .expect("required evidence is complete")
+                };
+                let weaker = evaluate(low);
+                let stronger = evaluate(high);
+                assert!(weaker.is_finite() && (0.0..=1.0).contains(&weaker));
+                assert!(stronger.is_finite() && (0.0..=1.0).contains(&stronger));
+                assert!(stronger <= weaker);
             }
         }
     }
 
     #[test]
-    fn factor_permutation_changes_nothing() {
+    fn factor_coverage_and_floor_permutations_do_not_change_a_point() {
         let interval = span(0, 1_000_000);
-        let p = policy(&[DomainId::Contention]);
-        let coverage = vec![complete_coverage(DomainId::Contention, interval)];
+        let required = [DomainId::Contention, DomainId::MemoryPressure];
         let factors = [
-            penalty(3, DomainId::CpuPressure, 0.2, 3),
-            penalty(1, DomainId::Contention, 0.5, 1),
-            penalty(2, DomainId::MemoryPressure, 0.4, 2),
+            penalty(DomainId::Contention, 0.5, 1),
+            penalty(DomainId::MemoryPressure, 0.25, 2),
         ];
-        let mut reversed = factors;
-        reversed.reverse();
-        let a = p.evaluate_cell(interval, &factors, coverage.clone(), Vec::new());
-        let b = p.evaluate_cell(interval, &reversed, coverage, Vec::new());
-        assert_eq!(a, b);
+        let coverage = [
+            complete_coverage(DomainId::Contention, interval),
+            complete_coverage(DomainId::MemoryPressure, interval),
+        ];
+        let floors = [
+            floor(FloorClass::Availability, 8),
+            floor(FloorClass::Integrity, 9),
+        ];
+        let point = policy(&required)
+            .evaluate_cell(interval, &factors, coverage.to_vec(), floors.to_vec())
+            .expect("consistent input");
+        let reversed = policy(&required)
+            .evaluate_cell(
+                interval,
+                &[factors[1], factors[0]],
+                vec![coverage[1].clone(), coverage[0].clone()],
+                vec![floors[1], floors[0]],
+            )
+            .expect("consistent input");
+        assert_eq!(point, reversed);
     }
 
     #[test]
-    fn missing_required_domain_gives_none_scores_never_one() {
+    fn floor_with_unknown_coverage_is_critical_without_numeric_zero() {
         let interval = span(0, 1_000_000);
-        let p = policy(&[DomainId::MemoryPressure]);
-        // Pressure elsewhere is known, but the required domain is not.
-        let factors = [penalty(1, DomainId::Contention, 0.0, 1)];
-        let point = p.evaluate_cell(interval, &factors, Vec::new(), Vec::new());
-        assert_eq!(point.continuous_score, None);
-        assert_eq!(point.overall_score, None);
-        assert_eq!(point.overall_state, HealthState::Unknown);
+        let point = policy(&[DomainId::MemoryPressure])
+            .evaluate_cell(
+                interval,
+                &[],
+                Vec::new(),
+                vec![floor(FloorClass::OomKill, 3)],
+            )
+            .expect("consistent input");
+        assert_eq!(point.continuous_score(), None);
+        assert_eq!(point.overall_score(), None);
+        assert_eq!(point.overall_state(), HealthState::Critical);
     }
 
     #[test]
-    fn gap_and_not_collected_and_unsupported_block_a_required_domain() {
+    fn conflicting_floor_classes_for_one_fact_are_rejected() {
         let interval = span(0, 1_000_000);
-        let p = policy(&[DomainId::MemoryPressure]);
-        for (state, applicability) in [
-            (CoverageState::Gap, Applicability::Applicable),
-            (CoverageState::Unknown, Applicability::Applicable),
-            (CoverageState::NotCollected, Applicability::Applicable),
-            (CoverageState::Complete, Applicability::Unsupported),
-        ] {
-            let mut entry = complete_coverage(DomainId::MemoryPressure, interval);
-            entry.state = state;
-            entry.applicability = applicability;
-            let point = p.evaluate_cell(interval, &[], vec![entry], Vec::new());
-            assert_eq!(point.overall_score, None, "{state:?}/{applicability:?}");
-            assert_eq!(point.overall_state, HealthState::Unknown);
-        }
+        assert_eq!(
+            policy(&[DomainId::Contention]).evaluate_cell(
+                interval,
+                &[],
+                Vec::new(),
+                vec![
+                    floor(FloorClass::Availability, 1),
+                    floor(FloorClass::Integrity, 1),
+                ],
+            ),
+            Err(HealthEvaluationError::ConflictingFloorEvidence)
+        );
     }
 
     #[test]
-    fn a_not_applicable_required_factor_does_not_block_the_domain() {
-        let interval = span(0, 1_000_000);
-        let p = policy(&[DomainId::Replication]);
-        let mut entry = complete_coverage(DomainId::Replication, interval);
-        entry.applicability = Applicability::NotApplicable;
-        entry.state = CoverageState::NotCollected;
-        let point = p.evaluate_cell(interval, &[], vec![entry], Vec::new());
-        assert_eq!(point.overall_score, Some(1.0));
-        assert_eq!(point.overall_state, HealthState::Normal);
-    }
-
-    #[test]
-    fn partial_coverage_counts_only_above_the_declared_ratio() {
-        let interval = span(0, 1_000_000);
-        let mut p = policy(&[DomainId::Contention]);
-        p.profile.required_factors_by_domain = vec![(DomainId::Contention, vec![FactorId(100)])];
-        let mut entry = complete_coverage(DomainId::Contention, interval);
-        entry.factor_id = FactorId(100);
-        entry.state = CoverageState::Partial;
-
-        entry.covered_duration_us = 600_000; // 0.6 >= declared 0.5
-        let known = p.evaluate_cell(interval, &[], vec![entry.clone()], Vec::new());
-        assert_eq!(known.overall_score, Some(1.0));
-
-        entry.covered_duration_us = 400_000; // 0.4 < declared 0.5
-        let unknown = p.evaluate_cell(interval, &[], vec![entry.clone()], Vec::new());
-        assert_eq!(unknown.overall_score, None);
-
-        // No declared ratio: partial coverage is never sufficient.
-        entry.factor_id = factor_of(DomainId::Contention);
-        entry.covered_duration_us = 999_999;
-        p.profile.required_factors_by_domain =
-            vec![(DomainId::Contention, vec![factor_of(DomainId::Contention)])];
-        let strict = p.evaluate_cell(interval, &[], vec![entry], Vec::new());
-        assert_eq!(strict.overall_score, None);
-    }
-
-    #[test]
-    fn a_trusted_floor_with_full_coverage_zeroes_the_overall_score() {
-        let interval = span(0, 1_000_000);
+    fn downsample_selects_earliest_floor_cell_before_numeric_minimum() {
         let p = policy(&[DomainId::Contention]);
-        let coverage = vec![complete_coverage(DomainId::Contention, interval)];
-        let factors = [penalty(1, DomainId::Contention, 0.25, 1)];
-        let point = p.evaluate_cell(
-            interval,
-            &factors,
-            coverage,
-            vec![floor(FloorClass::Availability, 9)],
+        let bucket = span(0, 3_000_000);
+        let unknown_floor = p
+            .evaluate_cell(
+                span(0, 1_000_000),
+                &[],
+                Vec::new(),
+                vec![floor(FloorClass::Availability, 9)],
+            )
+            .expect("consistent input");
+        let severe = p
+            .evaluate_cell(
+                span(1_000_000, 2_000_000),
+                &[penalty(DomainId::Contention, 0.9, 2)],
+                vec![complete_coverage(
+                    DomainId::Contention,
+                    span(1_000_000, 2_000_000),
+                )],
+                Vec::new(),
+            )
+            .expect("consistent input");
+        let result = downsample_worst(&[severe, unknown_floor], bucket, LIMITS)
+            .expect("compatible points")
+            .expect("nonempty");
+        assert_eq!(result.bucket(), bucket);
+        assert_eq!(
+            result.representative().overall_state(),
+            HealthState::Critical
         );
-        // The continuous pressure stays what it was; the floor zeroes only
-        // the overall score.
-        assert_eq!(point.continuous_score, Some(0.75));
-        assert_eq!(point.overall_score, Some(0.0));
-        assert_eq!(point.overall_state, HealthState::Critical);
+        assert_eq!(result.representative().overall_score(), None);
+        assert!(result.representative().factor_penalties().is_empty());
+        assert_eq!(result.representative().interval(), span(0, 1_000_000));
     }
 
     #[test]
-    fn a_trusted_floor_without_required_coverage_is_critical_with_none_scores() {
+    fn downsample_order_is_stable_and_bucket_floors_keep_their_time_scope() {
+        let policy = policy(&[DomainId::Contention]);
+        let bucket = span(0, 2_000_000);
+        let early = policy
+            .evaluate_cell(
+                span(0, 1_000_000),
+                &[],
+                Vec::new(),
+                vec![floor(FloorClass::Availability, 9)],
+            )
+            .expect("consistent input");
+        let late = policy
+            .evaluate_cell(
+                span(1_000_000, 2_000_000),
+                &[],
+                Vec::new(),
+                vec![floor(FloorClass::Integrity, 1)],
+            )
+            .expect("consistent input");
+        let forward = downsample_worst(&[early.clone(), late.clone()], bucket, LIMITS)
+            .expect("compatible points")
+            .expect("nonempty");
+        let reverse = downsample_worst(&[late, early], bucket, LIMITS)
+            .expect("compatible points")
+            .expect("nonempty");
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.representative().interval(), span(0, 1_000_000));
+        assert_eq!(
+            forward.representative().floor_evidence(),
+            &[floor(FloorClass::Availability, 9)]
+        );
+        assert_eq!(
+            forward.floor_evidence(),
+            &[
+                floor(FloorClass::Integrity, 1),
+                floor(FloorClass::Availability, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn downsample_keeps_representative_coverage_interval() {
+        let p = policy(&[DomainId::Contention]);
+        let cell = span(1_000_000, 2_000_000);
+        let point = p
+            .evaluate_cell(
+                cell,
+                &[penalty(DomainId::Contention, 0.2, 1)],
+                vec![complete_coverage(DomainId::Contention, cell)],
+                Vec::new(),
+            )
+            .expect("consistent input");
+        let result = downsample_worst(&[point], span(0, 3_000_000), LIMITS)
+            .expect("compatible point")
+            .expect("nonempty");
+        assert_eq!(result.representative().interval(), cell);
+        assert_eq!(result.representative().coverage()[0].interval, cell);
+    }
+
+    #[test]
+    fn downsample_rejects_mixed_reduction_versions() {
         let interval = span(0, 1_000_000);
-        let p = policy(&[DomainId::MemoryPressure]);
-        let point = p.evaluate_cell(
-            interval,
-            &[],
-            Vec::new(),
-            vec![floor(FloorClass::OomKill, 3)],
-        );
-        assert_eq!(point.continuous_score, None);
-        assert_eq!(point.overall_score, None);
-        assert_eq!(point.overall_state, HealthState::Critical);
-    }
-
-    #[test]
-    fn domain_codes_are_the_stable_wire_codes() {
-        let cases = [
-            (DomainId::DatabaseErrorPressure, "database_error_pressure"),
-            (DomainId::ConnectionCapacity, "connection_capacity"),
-            (DomainId::Contention, "contention"),
-            (DomainId::CpuPressure, "cpu_pressure"),
-            (DomainId::MemoryPressure, "memory_pressure"),
-            (DomainId::StoragePressure, "storage_pressure"),
-            (DomainId::Maintenance, "maintenance"),
-            (DomainId::Replication, "replication"),
-        ];
-        for (domain, code) in cases {
-            assert_eq!(domain.code(), code);
-        }
-    }
-
-    #[test]
-    fn a_floor_among_unknown_points_still_pins_the_bucket_critical() {
-        let p = policy(&[DomainId::MemoryPressure]);
-        let bucket = span(0, 2_000_000);
-        // Neither point has required coverage; one carries a trusted floor.
-        let unknown = p.evaluate_cell(span(0, 1_000_000), &[], Vec::new(), Vec::new());
-        let crashed = p.evaluate_cell(
-            span(1_000_000, 2_000_000),
-            &[],
-            Vec::new(),
-            vec![floor(FloorClass::Availability, 9)],
-        );
-        let bucketed = downsample_worst(&[unknown, crashed], bucket).expect("non-empty input");
-        assert_eq!(bucketed.overall_score, None);
-        assert_eq!(bucketed.overall_state, HealthState::Critical);
+        let coverage = vec![complete_coverage(DomainId::Contention, interval)];
+        let point_a = policy(&[DomainId::Contention])
+            .evaluate_cell(
+                interval,
+                &[penalty(DomainId::Contention, 0.1, 1)],
+                coverage.clone(),
+                Vec::new(),
+            )
+            .expect("consistent input");
+        let profile = profile(&[DomainId::Contention]);
+        let point_b = HealthPolicy::new(1, 2, profile, 0.9, 0.5, LIMITS)
+            .expect("valid policy")
+            .evaluate_cell(
+                interval,
+                &[penalty(DomainId::Contention, 0.1, 1)],
+                coverage,
+                Vec::new(),
+            )
+            .expect("consistent input");
         assert_eq!(
-            bucketed.floor_evidence,
-            vec![floor(FloorClass::Availability, 9)]
+            downsample_worst(&[point_a, point_b], interval, LIMITS),
+            Err(DownsampleError::MixedPolicyAxes)
         );
     }
 
     #[test]
-    fn state_thresholds_map_scores_in_order() {
-        let p = policy(&[]);
-        assert_eq!(p.state_from_score(0.95), HealthState::Normal);
-        assert_eq!(p.state_from_score(0.7), HealthState::Degraded);
-        assert_eq!(p.state_from_score(0.2), HealthState::Critical);
+    fn downsample_rejects_mixed_profile_topologies() {
+        let interval = span(0, 1_000_000);
+        let contention = policy(&[DomainId::Contention])
+            .evaluate_cell(interval, &[], Vec::new(), Vec::new())
+            .expect("consistent input");
+        let memory = policy(&[DomainId::MemoryPressure])
+            .evaluate_cell(interval, &[], Vec::new(), Vec::new())
+            .expect("consistent input");
+        assert_eq!(
+            downsample_worst(&[contention, memory], interval, LIMITS),
+            Err(DownsampleError::MixedPolicyAxes)
+        );
     }
 
     #[test]
-    fn factor_set_id_changes_when_a_factor_disappears() {
-        let both = [
-            (FactorId(1), DomainId::Contention),
+    fn factor_set_preimage_is_order_independent_and_axis_sensitive() {
+        let a = [
             (FactorId(2), DomainId::CpuPressure),
+            (FactorId(1), DomainId::Contention),
         ];
-        let full = FactorSetId::derive(1, 1, &both);
-        assert_eq!(full, FactorSetId::derive(1, 1, &both));
-        assert_ne!(full, FactorSetId::derive(1, 1, &both[..1]));
-        assert_ne!(full, FactorSetId::derive(2, 1, &both));
-    }
-
-    #[test]
-    fn downsample_picks_the_worst_computed_point_wholesale() {
-        let p = policy(&[]);
-        let bucket = span(0, 2_000_000);
-        let mild = p.evaluate_cell(
-            span(0, 1_000_000),
-            &[penalty(1, DomainId::Contention, 0.1, 1)],
-            Vec::new(),
-            Vec::new(),
-        );
-        let severe = p.evaluate_cell(
-            span(1_000_000, 2_000_000),
-            &[penalty(2, DomainId::CpuPressure, 0.8, 2)],
-            Vec::new(),
-            Vec::new(),
-        );
-        let bucketed = downsample_worst(&[mild, severe.clone()], bucket).expect("non-empty input");
-        assert_eq!(bucketed.interval, bucket);
-        assert_eq!(bucketed.overall_score, severe.overall_score);
-        // The penalties come from the same single point — no cross-moment
-        // mixture with the mild point's contention factor.
-        assert_eq!(bucketed.factor_penalties, severe.factor_penalties);
-        assert_eq!(bucketed.domain_penalties, severe.domain_penalties);
-    }
-
-    #[test]
-    fn floor_evidence_survives_downsample_from_any_point() {
-        let p = policy(&[]);
-        let bucket = span(0, 2_000_000);
-        // The floor sits in the *better*-scored point: it must still carry.
-        let crashed = p.evaluate_cell(
-            span(0, 1_000_000),
-            &[],
-            Vec::new(),
-            vec![floor(FloorClass::Availability, 9)],
-        );
-        let pressured = p.evaluate_cell(
-            span(1_000_000, 2_000_000),
-            &[penalty(2, DomainId::CpuPressure, 0.8, 2)],
-            Vec::new(),
-            Vec::new(),
-        );
-        let bucketed = downsample_worst(&[pressured, crashed], bucket).expect("non-empty input");
+        let b = [a[1], a[0]];
         assert_eq!(
-            bucketed.floor_evidence,
-            vec![floor(FloorClass::Availability, 9)]
+            FactorSetId::derive(
+                1,
+                1,
+                1,
+                profile(&[DomainId::Contention]).topology_id(),
+                &a,
+                &a
+            ),
+            FactorSetId::derive(
+                1,
+                1,
+                1,
+                profile(&[DomainId::Contention]).topology_id(),
+                &b,
+                &b
+            )
         );
-        assert_eq!(bucketed.overall_state, HealthState::Critical);
-        assert_eq!(bucketed.overall_score, Some(0.0));
-    }
-
-    #[test]
-    fn downsample_of_unknown_points_stays_unknown_not_healthy() {
-        let p = policy(&[DomainId::MemoryPressure]);
-        let bucket = span(0, 2_000_000);
-        let unknown = p.evaluate_cell(span(0, 1_000_000), &[], Vec::new(), Vec::new());
-        let bucketed = downsample_worst(&[unknown], bucket).expect("non-empty input");
-        assert_eq!(bucketed.overall_score, None);
-        assert_eq!(bucketed.overall_state, HealthState::Unknown);
-        assert!(downsample_worst(&[], bucket).is_none());
+        assert_ne!(
+            FactorSetId::derive(
+                1,
+                1,
+                1,
+                profile(&[DomainId::Contention]).topology_id(),
+                &a,
+                &a
+            ),
+            FactorSetId::derive(
+                1,
+                2,
+                1,
+                profile(&[DomainId::Contention]).topology_id(),
+                &a,
+                &a
+            )
+        );
     }
 }

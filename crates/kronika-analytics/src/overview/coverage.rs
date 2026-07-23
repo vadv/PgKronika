@@ -1,4 +1,4 @@
-//! Half-open coverage intervals and the honest ratio derived from them.
+//! Half-open coverage intervals and coverage-state contracts.
 //!
 //! Coverage is a set of `[from_us, to_us)` spans over which a source actually
 //! delivered samples. Spans combine by union, never by adding ratios: two
@@ -105,26 +105,41 @@ impl Coverage {
         Self::from_spans(spans)
     }
 
-    /// Covered fraction of `bucket`, in `[0, 1]`.
+    /// Covered duration inside `bucket`.
+    #[must_use]
+    pub fn covered_duration_in(&self, bucket: CoverageSpan) -> u64 {
+        self.spans
+            .iter()
+            .map(|span| {
+                let lo = span.from_us.max(bucket.from_us);
+                let hi = span.to_us.min(bucket.to_us);
+                if lo < hi {
+                    hi.wrapping_sub(lo).cast_unsigned()
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    /// Whether all of `bucket` is covered.
+    #[must_use]
+    pub fn covers(&self, bucket: CoverageSpan) -> bool {
+        self.covered_duration_in(bucket) == bucket.duration_us()
+    }
+
+    /// Approximate covered fraction of `bucket`, in `[0, 1]`.
     ///
     /// Only the part of the coverage intersecting the bucket counts, so the
     /// result is a true subset ratio and cannot exceed one.
     #[must_use]
     #[allow(
         clippy::cast_precision_loss,
-        reason = "a bucket duration stays far below 2^53 microseconds, so the \
-                  f64 ratio is exact"
+        reason = "the public ratio is an approximate presentation of exact \
+                  integer durations"
     )]
     pub fn covered_ratio(&self, bucket: CoverageSpan) -> f64 {
-        let mut covered = 0_u64;
-        for span in &self.spans {
-            let lo = span.from_us.max(bucket.from_us);
-            let hi = span.to_us.min(bucket.to_us);
-            if lo < hi {
-                covered += (hi - lo).cast_unsigned();
-            }
-        }
-        covered as f64 / bucket.duration_us() as f64
+        self.covered_duration_in(bucket) as f64 / bucket.duration_us() as f64
     }
 }
 
@@ -158,6 +173,69 @@ pub enum CoverageState {
     Unknown,
     /// The source is gated off, so absence is not a measured zero.
     NotCollected,
+}
+
+/// Provenance of a declared collection period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodQuality {
+    /// Period came from a persisted configuration epoch.
+    PersistedConfigEpoch,
+    /// Stable cadence was observed throughout the interval.
+    ObservedStable,
+    /// Current configuration was assumed to apply historically.
+    AssumedCurrentConfig,
+    /// Period provenance is unknown.
+    Unknown,
+}
+
+/// Completeness of the source population behind a factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCompleteness {
+    /// The source proves that the full population was retained.
+    Full,
+    /// The retained population is a bounded subset.
+    BoundedSubset,
+    /// Completeness cannot be established.
+    Unknown,
+}
+
+/// Exactness of values retained for a factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedExactness {
+    /// Every retained value is exact under the source contract.
+    Exact,
+    /// Retained values form only a lower bound.
+    LowerBound,
+    /// Exactness cannot be established.
+    Unknown,
+}
+
+/// Meaning of a physical count used by a factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalCountSemantics {
+    /// Count is exact for the declared source population.
+    Exact,
+    /// Count is a lower bound.
+    LowerBound,
+    /// The count semantics are unknown.
+    Unknown,
+    /// The factor does not use a physical count.
+    NotApplicable,
+}
+
+/// Attribution of sample-pair evidence at an interval boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryQuality {
+    /// Every contributing evidence interval is contained in the cell.
+    Contained,
+    /// At least one pair starts before the cell and is owned by its endpoint.
+    EndpointAttributedCrossBoundary,
+    /// Value comes from an explicitly declared hold model.
+    ModeledHold,
+    /// The reduction combines more than one boundary attribution.
+    Mixed,
+    /// Boundary attribution is not known.
+    Unknown,
 }
 
 #[cfg(test)]
@@ -247,5 +325,14 @@ mod tests {
         // Coverage entirely before the bucket contributes nothing.
         let outside = Coverage::from_spans(vec![span(-100, -10)]);
         assert_eq!(outside.covered_ratio(span(0, 100)), 0.0);
+    }
+
+    #[test]
+    fn full_i64_span_does_not_overflow_intersection_arithmetic() {
+        let whole = span(i64::MIN, i64::MAX);
+        let coverage = Coverage::from_spans(vec![whole]);
+        assert_eq!(coverage.covered_duration_in(whole), u64::MAX);
+        assert!(coverage.covers(whole));
+        assert_eq!(coverage.covered_ratio(whole), 1.0);
     }
 }

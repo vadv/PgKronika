@@ -1,101 +1,92 @@
-//! Formula-neutral facts and honesty-preserving algebra for the timeline
-//! overview.
+//! Formula-neutral contracts and bounded reductions for a timeline overview.
 //!
-//! This module is the pure core of the overview index: the fact and event
-//! types, the reductions that merge them, and the health evaluation. It knows
-//! nothing about `Catalog`, `Part`, `Row`, `StrId`, the filesystem, Parquet, or
-//! HTTP — a reader adapter extracts facts from PGM and a web adapter bounds and
-//! serves them.
+//! The module defines retained observations, reductions, coverage, health
+//! evaluation, and an adapter contract for semantic comparisons. It does not
+//! implement a PGM reader, persistent index, HTTP endpoint, or response cache.
 //!
-//! Two rules shape every type here. Merges are exact: counts add with checked
-//! arithmetic and saturate never, so a partition into parts and segments cannot
-//! change a total (a silent overflow would forge a smaller number). Absence is
-//! not zero: a missing sample, an unsupported factor, and a measured zero are
-//! distinct, so a gap never becomes a healthy score.
+//! Counts use checked arithmetic. Missing samples, unsupported factors, and
+//! measured zero remain distinct.
 //!
 //! # Version axes
 //!
-//! Each constant below guards a distinct compatibility surface, and they move
-//! independently. A stored fact file is keyed by the fact/extractor/registry
-//! versions; the health and notable versions key only projections, so
-//! re-scoring a range never rebuilds facts.
+//! Each constant reserves an independent compatibility axis for later storage
+//! and API adapters. This crate does not yet write fact files, caches, cursors,
+//! or responses.
 
 pub mod counts;
 pub mod coverage;
+mod finite;
 pub mod health;
 pub mod observation;
 pub mod oracle;
 pub mod reduce;
 mod sha256;
 
-pub use counts::{CountOverflow, ErrorCategory, EventCounts, LifecycleCounts, Severity, SqlState};
-pub use coverage::{Applicability, Coverage, CoverageSpan, CoverageState};
+pub use counts::{
+    CountError, CountLimits, CountOverflow, CountResource, ErrorCategory, EventCounts,
+    JointErrorKey, LifecycleCounts, Severity, SqlState,
+};
+pub use coverage::{
+    Applicability, BoundaryQuality, Coverage, CoverageSpan, CoverageState, PeriodQuality,
+    PhysicalCountSemantics, RetainedExactness, SourceCompleteness,
+};
+pub use finite::FiniteF64;
 pub use health::{
-    DomainId, DomainPenalty, Exactness, FactorCoverage, FactorId, FactorPenalty, FactorSetId,
-    FloorClass, FloorEvidence, HealthPoint, HealthPolicy, HealthState, RequiredFactorProfile,
-    SourcePopulation, downsample_worst,
+    CadenceEpochId, DomainId, DomainPenalty, DownsampleError, DownsampledHealthPoint,
+    FactorCoverage, FactorId, FactorPenalty, FactorSetId, FloorClass, FloorEvidence,
+    HealthEvaluationError, HealthLimits, HealthPoint, HealthPolicy, HealthResource, HealthState,
+    InvalidFactorProfile, InvalidHealthPolicy, PopulationTotalQuality, ProfileTopologyId,
+    RequiredFactorProfile, SourcePopulation, downsample_worst,
 };
 pub use observation::{
-    DictionaryContextId, DroppedFields, ErrorGroupPayload, EventObservation, EvidenceQuality,
-    FactId, IdentityQuality, InvalidObservation, LossReason, LossSummary, ObservationId,
-    ObservationPayload, ObservationProvenance, ObservationShape, ObservationTime, QualityFlags,
-    SectionBodyId, SegmentLineageId, SourceLocator, SourceScopeId, TimeQuality,
+    CheckpointPayload, DictionaryContextId, DroppedFieldCount, ErrorGroupPayload, EventObservation,
+    EvidenceQuality, FactId, IdentityQuality, InvalidObservation, LifecyclePayload,
+    LockWaitPayload, LogGapPayload, LossReason, LossSummary, MaintenancePayload, NamingContractId,
+    ObservationId, ObservationPayload, ObservationProvenance, ObservationShape, ObservationTime,
+    QualityFlags, SectionBodyId, SegmentIdentity, SegmentLineageId, SegmentLocator,
+    SlowQueryPayload, SourceLocator, SourceScopeId, TempFilePayload, TimeQuality,
 };
 pub use oracle::{
-    MemoryOracle, RawOracle, SemanticDivergence, fold_counts, observation_in_range,
-    semantic_divergences,
+    MemoryOracle, OracleError, OracleLimits, OracleResource, OracleResult, OracleSourceError,
+    RawOracle, SemanticDivergence, fold_counts, observation_in_range, semantic_divergences,
 };
 pub use reduce::{
-    CounterInterval, CounterReduction, CounterSample, GaugeReduction, GaugeSample, HoldModel,
-    PairQuality, RatioReduction, classify_series, time_weighted_mean,
+    AlignmentId, CounterInterval, CounterReduction, CounterSample, GaugeReduction, GaugeSample,
+    HoldModel, MetricSeriesId, PairQuality, RatioReduction, ReductionError, ReductionLimits,
+    TimeWeightedReduction, classify_series, time_weighted_mean,
 };
 
-/// Physical container framing: header, directory, and block layout.
-///
-/// Bumped only when the on-disk fact file structure changes, independent of the
-/// facts it carries.
+/// Reserved version for future fact-container framing.
 pub const CONTAINER_VERSION: u16 = 1;
 
-/// Logical shape of canonical facts and their fields.
-///
-/// A bump invalidates stored fact files: the decoder cannot trust an older
-/// logical layout.
+/// Reserved version for the future canonical fact schema.
 pub const FACT_SCHEMA_VERSION: u32 = 1;
 
-/// PGM-to-facts mapping, normalization, and reducer/reset semantics.
-///
-/// A bump invalidates stored fact files even when their shape is unchanged: the
-/// same bytes would now be extracted or reduced differently.
+/// Reserved version for PGM-to-fact extraction and normalization.
 pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 1;
 
-/// Supported PGM types, layouts, and required inputs.
+/// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///
-/// A bump invalidates stored fact files whose source contract the current
-/// registry no longer matches.
+/// Used by current health factor-set identity.
+pub const REDUCTION_SEMANTICS_VERSION: u32 = 1;
+
+/// Version of supported PGM contracts used by factor-set identity.
 pub const REGISTRY_CONTRACT_VERSION: u32 = 1;
 
-/// Factor set, penalty curves, domains, floors, and required profile.
-///
-/// A bump invalidates only health projections and responses, never stored
-/// facts.
+/// Reserved default version for health policy configuration.
 pub const HEALTH_POLICY_VERSION: u32 = 1;
 
-/// Notable selection, dedup, ranking, and caps.
-///
-/// A bump invalidates only event projections and responses, never stored facts.
+/// Reserved version for future notable-event policy.
 pub const NOTABLE_POLICY_VERSION: u32 = 1;
 
-/// Correlation and cause model for incident diagnosis.
-///
-/// A bump invalidates only diagnosis output, never stored facts.
+/// Reserved version for future response redaction policy.
+pub const REDACTION_POLICY_VERSION: u32 = 1;
+
+/// Reserved version for future incident diagnosis policy.
 pub const DIAGNOSIS_POLICY_VERSION: u32 = 1;
 
-/// JSON/wire response shape.
-///
-/// A bump invalidates only the serialized response cache.
+/// Reserved version for a future response schema.
 pub const RESPONSE_SCHEMA_VERSION: u32 = 1;
 
-/// Cursor encoding and validation.
-///
-/// A bump invalidates only outstanding cursors.
+/// Reserved version for future cursor encoding.
 pub const CURSOR_VERSION: u16 = 1;

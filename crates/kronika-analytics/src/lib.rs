@@ -1,4 +1,5 @@
-//! Source-independent counter differences and anomaly scoring.
+//! Source-independent counter differences, anomaly scoring, and overview
+//! contracts.
 //!
 //! [`diff`] interprets two numeric counter samples without extrapolation:
 //! integer deltas stay exact, decreases are resets, and non-positive time
@@ -13,8 +14,13 @@
 //! The functions allocate in proportion to their input slices or returned
 //! episodes. These functions do not impose request ceilings; adapters such as
 //! `pg_kronika-web` must bound samples, window positions, work, and output
-//! before calling it. The crate has no `PostgreSQL`, Linux, registry, reader,
-//! or transport knowledge.
+//! before calling them. The [`diff`] and [`anomaly`] kernels have no
+//! `PostgreSQL`, Linux, registry, reader, or transport knowledge.
+//!
+//! [`overview`] provides implementation-independent retained `PostgreSQL` event,
+//! reduction, coverage, health, and bounded oracle-adapter contracts. It does
+//! not implement PGM extraction, persistent indexing, or HTTP. See the
+//! [crate README](../README.md).
 
 pub mod anomaly;
 pub mod diff;

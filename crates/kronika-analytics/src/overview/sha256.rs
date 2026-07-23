@@ -1,9 +1,4 @@
-//! Minimal SHA-256 (FIPS 180-4) for content-derived identity.
-//!
-//! Observation and lineage IDs must be reproducible by every writer, reader,
-//! and rebuild path forever, so the digest function is part of the identity
-//! contract itself. A local implementation keeps the crate dependency-free;
-//! the tests below pin it to the FIPS 180-4 example vectors.
+//! Minimal SHA-256 used by content-derived identity contracts.
 
 const BLOCK_LEN: usize = 64;
 
@@ -92,10 +87,10 @@ pub(crate) fn digest_parts(parts: &[&[u8]]) -> [u8; 32] {
     let mut state = H_INIT;
     let mut buf = [0_u8; BLOCK_LEN];
     let mut buf_len = 0_usize;
-    let mut total_len = 0_usize;
+    let mut total_len = 0_u64;
 
     for part in parts {
-        total_len = total_len.wrapping_add(part.len());
+        total_len = total_len.wrapping_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
         let mut rest = *part;
         if buf_len > 0 {
             let take = rest.len().min(BLOCK_LEN - buf_len);
@@ -119,7 +114,7 @@ pub(crate) fn digest_parts(parts: &[&[u8]]) -> [u8; 32] {
     }
 
     // Padding: one 0x80 byte, zeros, then the big-endian bit length.
-    let bit_len = (total_len as u64).wrapping_mul(8);
+    let bit_len = total_len.wrapping_mul(8);
     buf[buf_len] = 0x80;
     if buf_len + 1 > BLOCK_LEN - 8 {
         buf[buf_len + 1..].fill(0);
@@ -194,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn fips_vector_empty_message() {
+    fn sha256_known_answer_empty_message() {
         assert_eq!(
             digest_parts(&[]),
             hex32("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
@@ -202,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn fips_vector_abc() {
+    fn sha256_known_answer_abc() {
         assert_eq!(
             digest_parts(&[b"abc"]),
             hex32("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
@@ -210,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn fips_vector_two_block_message() {
+    fn sha256_known_answer_two_block_message() {
         assert_eq!(
             digest_parts(&[b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"]),
             hex32("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
@@ -218,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn fips_vector_one_million_a() {
+    fn sha256_known_answer_one_million_a() {
         let message = vec![b'a'; 1_000_000];
         assert_eq!(
             digest_parts(&[&message]),

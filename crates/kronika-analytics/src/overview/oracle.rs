@@ -1,76 +1,141 @@
-//! The raw oracle contract: a forced path the index must semantically equal.
+//! Bounded snapshot contract for raw/index semantic comparisons.
 //!
-//! Every supported query has a raw counterpart that bypasses derived caches
-//! and recomputes from source rows. The index path earns trust only by
-//! matching it: same retained observations with the same IDs, counts, and
-//! order; same exact count sets; same coverage. The only permitted
-//! differences are explicitly versioned wire encodings and a documented
-//! floating-point tolerance — never a missing or reinterpreted record.
-//!
-//! [`MemoryOracle`] is the reference implementation golden fixtures are built
-//! on; [`semantic_divergences`] is the comparator both suites share.
+//! This module does not read PGM files. [`MemoryOracle`] is a deterministic
+//! fixture adapter; production reader and index adapters implement
+//! [`RawOracle`] later and must return one atomic result for a pinned view.
 
 use std::collections::BTreeMap;
 
-use super::counts::{CountOverflow, EventCounts, JointErrorKey, LifecycleCounts};
+use super::counts::{
+    CountError, CountLimits, CountResource, EventCounts, JointErrorKey, LifecycleCounts,
+};
 use super::coverage::{Coverage, CoverageSpan};
 use super::observation::{EventObservation, ObservationPayload, TimeQuality};
 
-/// A forced raw query path over one retained data set.
-///
-/// Implementations recompute answers from source rows on every call; nothing
-/// here may consult a derived cache. All ranges are half-open
-/// `[from_us, to_us)`.
-pub trait RawOracle {
-    /// The retained observations in the range, in canonical order.
-    fn observations(&self, range: CoverageSpan) -> Vec<EventObservation>;
-
-    /// The exact count set over the retained observations in the range.
-    ///
-    /// # Errors
-    /// Returns [`CountOverflow`] if a checked sum exceeds [`u64::MAX`].
-    fn counts(&self, range: CoverageSpan) -> Result<EventCounts, CountOverflow>;
-
-    /// The coverage actually delivered inside the range.
-    fn coverage(&self, range: CoverageSpan) -> Coverage;
+/// Output and sparse-dimension bounds for one oracle query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleLimits {
+    /// Maximum returned observations.
+    pub max_observations: usize,
+    /// Maximum clipped coverage spans.
+    pub max_coverage_spans: usize,
+    /// Count-dimension bounds.
+    pub count_limits: CountLimits,
 }
 
-/// Whether an observation belongs to a half-open range.
-///
-/// A point observation belongs to exactly one bucket by its sort timestamp;
-/// a grouped row belongs wholly to the bucket of its first retained
-/// timestamp and is never spread. An interval-only observation crosses every
-/// range its interval intersects — it is an interval fact, not a point
-/// event.
+/// Resource that exceeded its configured oracle limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleResource {
+    /// Returned observations.
+    Observations,
+    /// Returned coverage spans.
+    CoverageSpans,
+}
+
+/// Source failure class available to production adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleSourceError {
+    /// Source data could not be read.
+    ReadFailed,
+    /// A checksum or frame validation failed.
+    IntegrityFailure,
+    /// The source layout is unsupported or invalid.
+    InvalidLayout,
+    /// A pinned atomic view could not be obtained.
+    SnapshotUnavailable,
+}
+
+/// Oracle query or fixture failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleError {
+    /// A query output limit was exceeded.
+    LimitExceeded(OracleResource),
+    /// Count aggregation failed.
+    Counts(CountError),
+    /// Production source adapter failed.
+    Source(OracleSourceError),
+    /// One identity refers to different retained records.
+    ObservationIdCollision,
+}
+
+impl From<CountError> for OracleError {
+    fn from(error: CountError) -> Self {
+        Self::Counts(error)
+    }
+}
+
+/// Atomic result from one pinned oracle view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleResult {
+    observations: Vec<EventObservation>,
+    counts: EventCounts,
+    coverage: Coverage,
+}
+
+impl OracleResult {
+    /// Canonically ordered observations.
+    #[must_use]
+    pub fn observations(&self) -> &[EventObservation] {
+        &self.observations
+    }
+
+    /// Counts derived from exactly `observations`.
+    #[must_use]
+    pub const fn counts(&self) -> &EventCounts {
+        &self.counts
+    }
+
+    /// Delivered coverage clipped to the query range.
+    #[must_use]
+    pub const fn coverage(&self) -> &Coverage {
+        &self.coverage
+    }
+}
+
+/// Atomic semantic query over one pinned data view.
+pub trait RawOracle {
+    /// Returns observations, counts, and coverage from the same view.
+    ///
+    /// # Errors
+    /// Returns [`OracleError`] for source failures represented by an adapter,
+    /// invalid data, overflow, or configured bounds.
+    fn query(&self, range: CoverageSpan, limits: OracleLimits)
+    -> Result<OracleResult, OracleError>;
+}
+
+/// Whether an observation intersects a half-open range.
 #[must_use]
 pub fn observation_in_range(observation: &EventObservation, range: CoverageSpan) -> bool {
-    if observation.time.quality == TimeQuality::IntervalOnly
-        && let Some(interval) = observation.time.observed_interval
+    let time = observation.time();
+    if time.quality == TimeQuality::IntervalOnly
+        && let Some(interval) = time.observed_interval
     {
         return interval.start_us() < range.end_us() && interval.end_us() > range.start_us();
     }
-    let ts = observation.time.sort_ts_us;
-    range.start_us() <= ts && ts < range.end_us()
+    range.start_us() <= time.sort_ts_us && time.sort_ts_us < range.end_us()
 }
 
-/// Folds retained observations into the exact count set.
-///
-/// Error groups accumulate into the joint dimension with their retained
-/// `occurrence_count`; lifecycle observations accumulate into lifecycle
-/// counts. Other retained kinds carry no counts here. This is the raw
-/// reduction the index's stored counts must reproduce.
+/// Folds a bounded observation set into exact joint and lifecycle counts.
 ///
 /// # Errors
-/// Returns [`CountOverflow`] if a checked sum exceeds [`u64::MAX`].
-pub fn fold_counts(observations: &[EventObservation]) -> Result<EventCounts, CountOverflow> {
-    let mut joint: Vec<(JointErrorKey, u64)> = Vec::new();
-    let mut lifecycle = LifecycleCounts::default();
-    let mut signals: BTreeMap<i32, u64> = BTreeMap::new();
+/// Returns [`CountError`] for overflow or a sparse-dimension limit.
+pub fn fold_counts(
+    observations: &[EventObservation],
+    limits: CountLimits,
+) -> Result<EventCounts, CountError> {
+    let mut joint = Vec::new();
+    let mut crashes = 0_u64;
+    let mut shutdowns = 0_u64;
+    let mut ready = 0_u64;
+    let mut signals = Vec::new();
 
     for observation in observations {
-        let count = observation.occurrence_count;
-        match &observation.payload {
+        let count = observation.occurrence_count();
+        match observation.payload() {
             ObservationPayload::ErrorGroup(group) => {
+                if joint.len() == limits.max_input_entries {
+                    return Err(CountError::LimitExceeded(CountResource::InputEntries));
+                }
                 joint.push((
                     JointErrorKey {
                         severity: group.severity,
@@ -80,32 +145,30 @@ pub fn fold_counts(observations: &[EventObservation]) -> Result<EventCounts, Cou
                     count,
                 ));
             }
-            ObservationPayload::ChildSignalTermination { signal } => {
-                lifecycle.crashes = lifecycle.crashes.checked_add(count).ok_or(CountOverflow)?;
-                let slot = signals.entry(*signal).or_insert(0);
-                *slot = slot.checked_add(count).ok_or(CountOverflow)?;
+            ObservationPayload::ChildSignalTermination(retained) => {
+                crashes = crashes.checked_add(count).ok_or(CountError::Overflow)?;
+                if let Some(signal) = retained.signal {
+                    if signals.len() == limits.max_input_entries {
+                        return Err(CountError::LimitExceeded(CountResource::InputEntries));
+                    }
+                    signals.push((signal, count));
+                }
             }
-            ObservationPayload::ShutdownRequested => {
-                lifecycle.shutdowns = lifecycle
-                    .shutdowns
-                    .checked_add(count)
-                    .ok_or(CountOverflow)?;
+            ObservationPayload::ShutdownRequested(_) => {
+                shutdowns = shutdowns.checked_add(count).ok_or(CountError::Overflow)?;
             }
-            ObservationPayload::ReadyObserved => {
-                lifecycle.ready = lifecycle.ready.checked_add(count).ok_or(CountOverflow)?;
+            ObservationPayload::ReadyObserved(_) => {
+                ready = ready.checked_add(count).ok_or(CountError::Overflow)?;
             }
             _ => {}
         }
     }
 
-    lifecycle.signals = signals.into_iter().collect();
-    EventCounts::from_joint(joint, lifecycle)
+    let lifecycle = LifecycleCounts::new(crashes, shutdowns, ready, signals, limits)?;
+    EventCounts::from_joint(joint, lifecycle, limits)
 }
 
-/// The in-memory reference oracle golden fixtures run against.
-///
-/// Holds a canonical retained set and recomputes every answer from it on
-/// each call.
+/// Deterministic fixture adapter over an already decoded retained set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryOracle {
     observations: Vec<EventObservation>,
@@ -113,374 +176,375 @@ pub struct MemoryOracle {
 }
 
 impl MemoryOracle {
-    /// Builds the oracle, normalizing the observations into canonical order.
-    #[must_use]
-    pub fn new(mut observations: Vec<EventObservation>, coverage: Coverage) -> Self {
+    /// Builds a canonical fixture, deduplicating identical records by ID.
+    ///
+    /// # Errors
+    /// Returns [`OracleError::ObservationIdCollision`] when the same ID names
+    /// records with different content.
+    pub fn new(
+        mut observations: Vec<EventObservation>,
+        coverage: Coverage,
+    ) -> Result<Self, OracleError> {
         observations.sort_by(EventObservation::canonical_cmp);
-        Self {
-            observations,
-            coverage,
+        let mut canonical: Vec<EventObservation> = Vec::with_capacity(observations.len());
+        let mut seen: BTreeMap<_, usize> = BTreeMap::new();
+        for observation in observations {
+            if let Some(&position) = seen.get(&observation.observation_id()) {
+                if canonical[position] == observation {
+                    continue;
+                }
+                return Err(OracleError::ObservationIdCollision);
+            }
+            seen.insert(observation.observation_id(), canonical.len());
+            canonical.push(observation);
         }
+        Ok(Self {
+            observations: canonical,
+            coverage,
+        })
     }
 }
 
 impl RawOracle for MemoryOracle {
-    fn observations(&self, range: CoverageSpan) -> Vec<EventObservation> {
-        self.observations
-            .iter()
-            .filter(|observation| observation_in_range(observation, range))
-            .cloned()
-            .collect()
-    }
-
-    fn counts(&self, range: CoverageSpan) -> Result<EventCounts, CountOverflow> {
-        fold_counts(&self.observations(range))
-    }
-
-    fn coverage(&self, range: CoverageSpan) -> Coverage {
-        let clipped: Vec<CoverageSpan> = self
-            .coverage
-            .spans()
-            .iter()
-            .filter_map(|span| {
-                CoverageSpan::new(
-                    span.start_us().max(range.start_us()),
-                    span.end_us().min(range.end_us()),
-                )
-            })
-            .collect();
-        Coverage::from_spans(clipped)
+    fn query(
+        &self,
+        range: CoverageSpan,
+        limits: OracleLimits,
+    ) -> Result<OracleResult, OracleError> {
+        let mut observations =
+            Vec::with_capacity(self.observations.len().min(limits.max_observations));
+        for observation in &self.observations {
+            if !observation_in_range(observation, range) {
+                continue;
+            }
+            if observations.len() == limits.max_observations {
+                return Err(OracleError::LimitExceeded(OracleResource::Observations));
+            }
+            observations.push(observation.clone());
+        }
+        let counts = fold_counts(&observations, limits.count_limits)?;
+        let mut clipped =
+            Vec::with_capacity(self.coverage.spans().len().min(limits.max_coverage_spans));
+        for span in self.coverage.spans() {
+            let Some(span) = CoverageSpan::new(
+                span.start_us().max(range.start_us()),
+                span.end_us().min(range.end_us()),
+            ) else {
+                continue;
+            };
+            if clipped.len() == limits.max_coverage_spans {
+                return Err(OracleError::LimitExceeded(OracleResource::CoverageSpans));
+            }
+            clipped.push(span);
+        }
+        Ok(OracleResult {
+            observations,
+            counts,
+            coverage: Coverage::from_spans(clipped),
+        })
     }
 }
 
-/// One semantic difference between an index path and the raw oracle.
+/// One semantic difference between two query paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticDivergence {
-    /// The paths retained different numbers of observations.
+    /// Observation counts differ.
     ObservationCount {
-        /// How many the index path returned.
+        /// Left path count.
         index: usize,
-        /// How many the oracle returned.
+        /// Reference path count.
         oracle: usize,
     },
-    /// The observation at this position differs in identity, fields, or
-    /// order.
+    /// First differing canonical observation position.
     ObservationAt {
-        /// The first differing position in canonical order.
+        /// Zero-based position.
         position: usize,
     },
-    /// The exact count sets differ, including differing overflow outcomes.
+    /// Joint or lifecycle counts differ.
     Counts,
-    /// The delivered coverage differs.
+    /// Coverage differs.
     Coverage,
 }
 
-/// Compares an index path against the raw oracle over one range.
+/// Compares two atomic bounded results.
 ///
-/// Returns every detected divergence, empty when the paths semantically
-/// agree. Exact surfaces are compared exactly; there is no tolerance here —
-/// versioned encoding differences must be normalized by the caller before
-/// comparing.
-#[must_use]
+/// # Errors
+/// Returns an adapter error from either path.
 pub fn semantic_divergences<A, B>(
     index: &A,
     oracle: &B,
     range: CoverageSpan,
-) -> Vec<SemanticDivergence>
+    limits: OracleLimits,
+) -> Result<Vec<SemanticDivergence>, OracleError>
 where
     A: RawOracle + ?Sized,
     B: RawOracle + ?Sized,
 {
+    let index = index.query(range, limits)?;
+    let oracle = oracle.query(range, limits)?;
     let mut divergences = Vec::new();
-
-    let index_observations = index.observations(range);
-    let oracle_observations = oracle.observations(range);
-    if index_observations.len() != oracle_observations.len() {
+    if index.observations.len() != oracle.observations.len() {
         divergences.push(SemanticDivergence::ObservationCount {
-            index: index_observations.len(),
-            oracle: oracle_observations.len(),
+            index: index.observations.len(),
+            oracle: oracle.observations.len(),
         });
     }
-    let first_mismatch = index_observations
+    if let Some(position) = index
+        .observations
         .iter()
-        .zip(&oracle_observations)
-        .position(|(a, b)| a != b);
-    if let Some(position) = first_mismatch {
+        .zip(&oracle.observations)
+        .position(|(left, right)| left != right)
+    {
         divergences.push(SemanticDivergence::ObservationAt { position });
     }
-
-    if index.counts(range) != oracle.counts(range) {
+    if index.counts != oracle.counts {
         divergences.push(SemanticDivergence::Counts);
     }
-    if index.coverage(range) != oracle.coverage(range) {
+    if index.coverage != oracle.coverage {
         divergences.push(SemanticDivergence::Coverage);
     }
-    divergences
+    Ok(divergences)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::counts::{ErrorCategory, Severity, SqlState};
     use super::super::observation::{
-        DictionaryContextId, DroppedFields, ErrorGroupPayload, EvidenceQuality, IdentityQuality,
-        ObservationId, ObservationProvenance, ObservationShape, ObservationTime, QualityFlags,
-        SectionBodyId, SegmentLineageId, SourceScopeId,
+        DictionaryContextId, DroppedFieldCount, ErrorGroupPayload, EvidenceQuality,
+        LifecyclePayload, NamingContractId, ObservationProvenance, ObservationShape,
+        ObservationTime, QualityFlags, SectionBodyId, SegmentIdentity, SegmentLocator,
+        SourceScopeId,
     };
     use super::*;
+
+    const LIMITS: OracleLimits = OracleLimits {
+        max_observations: 32,
+        max_coverage_spans: 32,
+        count_limits: CountLimits {
+            max_input_entries: 32,
+            max_joint_keys: 32,
+            max_signal_keys: 32,
+        },
+    };
+
+    fn span(from_us: i64, to_us: i64) -> CoverageSpan {
+        CoverageSpan::new(from_us, to_us).expect("valid fixture span")
+    }
+
+    #[allow(
+        clippy::unnecessary_box_returns,
+        reason = "the fixture is passed directly to boxed payload variants"
+    )]
+    fn lifecycle() -> Box<LifecyclePayload> {
+        Box::new(LifecyclePayload {
+            pid: None,
+            signal: None,
+            shutdown_mode: None,
+            message: None,
+            query_detail: None,
+            dropped_field_count: DroppedFieldCount::default(),
+        })
+    }
+
+    fn error_group() -> ObservationPayload {
+        ObservationPayload::ErrorGroup(Box::new(ErrorGroupPayload {
+            severity: Severity::Fatal,
+            category: ErrorCategory::Resource,
+            sqlstate: Some(SqlState(*b"53300")),
+            normalized_pattern: Some("too many connections".into()),
+            sample: Some("remaining slots".into()),
+            detail: None,
+            hint: None,
+            context: None,
+            statement: None,
+            database: Some("postgres".into()),
+            user: None,
+            dropped_field_count: DroppedFieldCount::default(),
+        }))
+    }
 
     fn observation(
         row_ordinal: u32,
         sort_ts_us: i64,
+        occurrence_count: u64,
         payload: ObservationPayload,
     ) -> EventObservation {
-        let provenance = ObservationProvenance {
-            section_body_id: SectionBodyId([0xAA; 32]),
-            section_instance_ordinal: 0,
-            row_ordinal,
-            dictionary_context_id: DictionaryContextId([0xBB; 32]),
-            source_locator: None,
-        };
-        let lineage = SegmentLineageId::derive(SourceScopeId([1; 32]), 7, b"fixture");
+        let locator = SegmentLocator([3; 32]);
+        let lineage = SegmentIdentity::sealed(
+            SourceScopeId([1; 32]),
+            NamingContractId([2; 16]),
+            locator,
+            7,
+            b"fixture",
+        );
         let shape = match payload {
-            ObservationPayload::ErrorGroup(_) => ObservationShape::GroupedCount,
+            ObservationPayload::ErrorGroup(_) | ObservationPayload::SlowQueryGroup(_) => {
+                ObservationShape::GroupedCount
+            }
+            ObservationPayload::LogGap(_) => ObservationShape::Gap,
             _ => ObservationShape::Individual,
         };
-        let occurrence_count = match &payload {
-            ObservationPayload::ErrorGroup(group) => match group.severity {
-                Severity::Fatal => 7,
-                _ => 5,
-            },
-            _ => 1,
+        let quality = if shape == ObservationShape::GroupedCount {
+            TimeQuality::FirstInGroup
+        } else {
+            TimeQuality::Exact
         };
-        EventObservation {
-            observation_id: ObservationId::derive(lineage, 7, &provenance),
-            identity_quality: IdentityQuality::ContentDerived,
-            source_scope_id: SourceScopeId([1; 32]),
-            source_type_id: 7,
-            provenance,
+        EventObservation::new(
+            lineage,
+            7,
+            ObservationProvenance {
+                segment_locator: Some(locator),
+                section_body_id: SectionBodyId([0xAA; 32]),
+                catalog_entry_ordinal: 0,
+                row_ordinal,
+                dictionary_context_id: DictionaryContextId([0xBB; 32]),
+                source_locator: None,
+            },
             shape,
-            time: ObservationTime {
+            ObservationTime {
                 sort_ts_us,
                 occurred_at_us: Some(sort_ts_us),
                 observed_interval: None,
-                quality: TimeQuality::FirstInGroup,
+                quality,
             },
             occurrence_count,
             payload,
-            evidence_quality: EvidenceQuality::Structured,
-            quality_flags: QualityFlags::default(),
-            loss: None,
-        }
-    }
-
-    fn error_group(severity: Severity) -> ObservationPayload {
-        ObservationPayload::ErrorGroup(Box::new(ErrorGroupPayload {
-            severity,
-            category: ErrorCategory::Resource,
-            sqlstate: Some(SqlState(*b"53300")),
-            normalized_pattern: None,
-            database: None,
-            user: None,
-            dropped_fields: DroppedFields::default(),
-        }))
-    }
-
-    fn span(from_us: i64, to_us: i64) -> CoverageSpan {
-        CoverageSpan::new(from_us, to_us).expect("valid span in fixture")
+            EvidenceQuality::Structured,
+            QualityFlags::default(),
+            None,
+        )
+        .expect("valid fixture observation")
     }
 
     #[test]
-    fn observations_come_back_in_canonical_order() {
+    fn query_returns_one_canonical_atomic_result() {
         let oracle = MemoryOracle::new(
             vec![
-                observation(2, 300, ObservationPayload::ReadyObserved),
-                observation(1, 100, ObservationPayload::ShutdownRequested),
-                observation(3, 200, ObservationPayload::LogGap),
+                observation(2, 300, 1, ObservationPayload::ReadyObserved(lifecycle())),
+                observation(1, 100, 7, error_group()),
             ],
-            Coverage::empty(),
-        );
-        let ts: Vec<i64> = oracle
-            .observations(span(0, 1_000))
-            .iter()
-            .map(|o| o.time.sort_ts_us)
-            .collect();
-        assert_eq!(ts, vec![100, 200, 300]);
+            Coverage::from_spans(vec![span(0, 500)]),
+        )
+        .expect("valid fixture");
+        let result = oracle.query(span(100, 300), LIMITS).expect("bounded query");
+        assert_eq!(result.observations().len(), 1);
+        assert_eq!(result.observations()[0].time().sort_ts_us, 100);
+        assert_eq!(result.counts().total_occurrences(), Ok(7));
+        assert_eq!(result.coverage().spans(), &[span(100, 300)]);
     }
 
     #[test]
-    fn range_edges_are_half_open() {
+    fn ranges_are_half_open() {
         let oracle = MemoryOracle::new(
             vec![
-                observation(1, 100, ObservationPayload::ReadyObserved),
-                observation(2, 200, ObservationPayload::ReadyObserved),
+                observation(1, 100, 1, ObservationPayload::ReadyObserved(lifecycle())),
+                observation(2, 200, 1, ObservationPayload::ReadyObserved(lifecycle())),
             ],
             Coverage::empty(),
+        )
+        .expect("valid fixture");
+        let result = oracle.query(span(100, 200), LIMITS).expect("bounded query");
+        assert_eq!(result.observations().len(), 1);
+        assert_eq!(result.observations()[0].time().sort_ts_us, 100);
+    }
+
+    #[test]
+    fn grouped_count_is_not_expanded() {
+        let oracle = MemoryOracle::new(
+            vec![observation(1, 150, 42, error_group())],
+            Coverage::empty(),
+        )
+        .expect("valid fixture");
+        let result = oracle.query(span(100, 200), LIMITS).expect("bounded query");
+        assert_eq!(result.observations().len(), 1);
+        assert_eq!(result.counts().total_occurrences(), Ok(42));
+    }
+
+    #[test]
+    fn exact_duplicate_is_deduplicated_but_identity_collision_fails() {
+        let base = observation(1, 100, 1, ObservationPayload::ReadyObserved(lifecycle()));
+        let deduplicated = MemoryOracle::new(vec![base.clone(), base.clone()], Coverage::empty())
+            .expect("identical duplicate");
+        assert_eq!(
+            deduplicated
+                .query(span(0, 200), LIMITS)
+                .expect("bounded query")
+                .observations()
+                .len(),
+            1
         );
-        // The start is inclusive, the end is exclusive.
-        let hits = oracle.observations(span(100, 200));
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].time.sort_ts_us, 100);
-    }
-
-    #[test]
-    fn every_point_observation_belongs_to_exactly_one_bucket() {
-        let observations = vec![
-            observation(1, 0, ObservationPayload::ReadyObserved),
-            observation(2, 99, ObservationPayload::ReadyObserved),
-            observation(3, 100, ObservationPayload::ReadyObserved),
-            observation(4, 250, ObservationPayload::ReadyObserved),
-        ];
-        let oracle = MemoryOracle::new(observations.clone(), Coverage::empty());
-        let buckets = [span(0, 100), span(100, 200), span(200, 300)];
-        let total: usize = buckets
-            .iter()
-            .map(|&bucket| oracle.observations(bucket).len())
-            .sum();
-        assert_eq!(total, observations.len());
-    }
-
-    #[test]
-    fn a_grouped_row_stays_one_item_with_its_retained_count() {
-        let mut grouped = observation(1, 150, error_group(Severity::Fatal));
-        grouped.occurrence_count = 42;
-        let oracle = MemoryOracle::new(vec![grouped], Coverage::empty());
-
-        // Wholly owned by the bucket of its first timestamp.
-        assert_eq!(oracle.observations(span(100, 200)).len(), 1);
-        assert_eq!(oracle.observations(span(200, 300)).len(), 0);
-        let counts = oracle.counts(span(100, 200)).expect("no overflow");
-        assert_eq!(counts.total_occurrences(), Ok(42));
-    }
-
-    #[test]
-    fn an_interval_only_observation_crosses_intersecting_ranges() {
-        let mut interval_fact = observation(1, 10, ObservationPayload::LogGap);
-        interval_fact.time.quality = TimeQuality::IntervalOnly;
-        interval_fact.time.observed_interval = Some(span(10, 30));
-        interval_fact.shape = ObservationShape::Gap;
-        let oracle = MemoryOracle::new(vec![interval_fact], Coverage::empty());
-
-        assert_eq!(oracle.observations(span(0, 15)).len(), 1);
-        assert_eq!(oracle.observations(span(15, 40)).len(), 1);
-        assert_eq!(oracle.observations(span(40, 50)).len(), 0);
-    }
-
-    #[test]
-    fn byte_identical_rows_with_distinct_provenance_are_both_retained() {
-        // Same timestamp and payload; only the row ordinal differs.
-        let a = observation(1, 100, ObservationPayload::ReadyObserved);
-        let b = observation(2, 100, ObservationPayload::ReadyObserved);
-        assert_ne!(a.observation_id, b.observation_id);
-        let oracle = MemoryOracle::new(vec![a, b], Coverage::empty());
-        assert_eq!(oracle.observations(span(0, 1_000)).len(), 2);
-    }
-
-    #[test]
-    fn fold_counts_accumulates_joint_and_lifecycle_dimensions() {
-        let observations = vec![
-            observation(1, 10, error_group(Severity::Fatal)),
-            observation(2, 20, error_group(Severity::Fatal)),
-            observation(3, 30, error_group(Severity::Error)),
-            observation(
-                4,
-                40,
-                ObservationPayload::ChildSignalTermination { signal: 9 },
-            ),
-            observation(
-                5,
-                50,
-                ObservationPayload::ChildSignalTermination { signal: 6 },
-            ),
-            observation(6, 60, ObservationPayload::ShutdownRequested),
-            observation(7, 70, ObservationPayload::ReadyObserved),
-            // Kinds that carry no counts must fold to nothing.
-            observation(8, 80, ObservationPayload::CheckpointCompleted),
-        ];
-        let counts = fold_counts(&observations).expect("no overflow");
-
-        // Two Fatal groups of 7 and one Error group of 5.
-        assert_eq!(counts.total_occurrences(), Ok(19));
-        assert_eq!(counts.lifecycle.crashes, 2);
-        assert_eq!(counts.lifecycle.signals, vec![(6, 1), (9, 1)]);
-        assert_eq!(counts.lifecycle.shutdowns, 1);
-        assert_eq!(counts.lifecycle.ready, 1);
-    }
-
-    #[test]
-    fn fold_counts_reports_overflow_instead_of_saturating() {
-        let mut a = observation(
+        let collision = observation(
             1,
-            10,
-            ObservationPayload::ChildSignalTermination { signal: 9 },
+            100,
+            1,
+            ObservationPayload::ShutdownRequested(lifecycle()),
         );
-        a.occurrence_count = u64::MAX;
-        let b = observation(
-            2,
-            20,
-            ObservationPayload::ChildSignalTermination { signal: 9 },
-        );
-        assert_eq!(fold_counts(&[a, b]), Err(CountOverflow));
+        assert!(matches!(
+            MemoryOracle::new(vec![base, collision], Coverage::empty()),
+            Err(OracleError::ObservationIdCollision)
+        ));
     }
 
     #[test]
-    fn identical_paths_have_no_divergence() {
-        let observations = vec![
-            observation(1, 100, error_group(Severity::Fatal)),
-            observation(2, 200, ObservationPayload::ReadyObserved),
-        ];
-        let coverage = Coverage::from_spans(vec![span(0, 500)]);
-        let index = MemoryOracle::new(observations.clone(), coverage.clone());
-        let oracle = MemoryOracle::new(observations, coverage);
+    fn query_enforces_observation_and_sparse_key_limits() {
+        let oracle = MemoryOracle::new(
+            vec![
+                observation(1, 100, 1, ObservationPayload::ReadyObserved(lifecycle())),
+                observation(2, 200, 1, ObservationPayload::ReadyObserved(lifecycle())),
+            ],
+            Coverage::empty(),
+        )
+        .expect("valid fixture");
+        let tight = OracleLimits {
+            max_observations: 1,
+            max_coverage_spans: LIMITS.max_coverage_spans,
+            count_limits: LIMITS.count_limits,
+        };
         assert_eq!(
-            semantic_divergences(&index, &oracle, span(0, 1_000)),
-            vec![]
+            oracle.query(span(0, 300), tight),
+            Err(OracleError::LimitExceeded(OracleResource::Observations))
+        );
+
+        let count_oracle = MemoryOracle::new(
+            vec![
+                observation(1, 100, 1, error_group()),
+                observation(2, 200, 1, error_group()),
+            ],
+            Coverage::empty(),
+        )
+        .expect("valid fixture");
+        let count_tight = OracleLimits {
+            max_observations: LIMITS.max_observations,
+            max_coverage_spans: LIMITS.max_coverage_spans,
+            count_limits: CountLimits {
+                max_input_entries: 1,
+                ..LIMITS.count_limits
+            },
+        };
+        assert_eq!(
+            count_oracle.query(span(0, 300), count_tight),
+            Err(OracleError::Counts(CountError::LimitExceeded(
+                CountResource::InputEntries,
+            )))
         );
     }
 
     #[test]
-    fn a_dropped_observation_is_detected() {
+    fn semantic_comparison_detects_observations_counts_and_coverage() {
         let full = vec![
-            observation(1, 100, error_group(Severity::Fatal)),
-            observation(2, 200, ObservationPayload::ReadyObserved),
+            observation(1, 100, 7, error_group()),
+            observation(2, 200, 1, ObservationPayload::ReadyObserved(lifecycle())),
         ];
-        let index = MemoryOracle::new(full[..1].to_vec(), Coverage::empty());
-        let oracle = MemoryOracle::new(full, Coverage::empty());
-        let divergences = semantic_divergences(&index, &oracle, span(0, 1_000));
-        assert!(divergences.contains(&SemanticDivergence::ObservationCount {
+        let index =
+            MemoryOracle::new(full[..1].to_vec(), Coverage::empty()).expect("valid fixture");
+        let oracle = MemoryOracle::new(full, Coverage::from_spans(vec![span(0, 500)]))
+            .expect("valid fixture");
+        let differences = semantic_divergences(&index, &oracle, span(0, 1_000), LIMITS)
+            .expect("bounded comparison");
+        assert!(differences.contains(&SemanticDivergence::ObservationCount {
             index: 1,
-            oracle: 2
+            oracle: 2,
         }));
-        // Counts differ too: the dropped observation carried lifecycle
-        // counts.
-        assert!(divergences.contains(&SemanticDivergence::Counts));
-    }
-
-    #[test]
-    fn a_mutated_occurrence_count_is_detected() {
-        let base = observation(1, 100, error_group(Severity::Fatal));
-        let mut mutated = base.clone();
-        mutated.occurrence_count += 1;
-        let index = MemoryOracle::new(vec![mutated], Coverage::empty());
-        let oracle = MemoryOracle::new(vec![base], Coverage::empty());
-        let divergences = semantic_divergences(&index, &oracle, span(0, 1_000));
-        assert!(divergences.contains(&SemanticDivergence::ObservationAt { position: 0 }));
-        assert!(divergences.contains(&SemanticDivergence::Counts));
-    }
-
-    #[test]
-    fn a_coverage_mismatch_is_detected() {
-        let index = MemoryOracle::new(Vec::new(), Coverage::from_spans(vec![span(0, 100)]));
-        let oracle = MemoryOracle::new(Vec::new(), Coverage::from_spans(vec![span(0, 50)]));
-        assert_eq!(
-            semantic_divergences(&index, &oracle, span(0, 1_000)),
-            vec![SemanticDivergence::Coverage]
-        );
-    }
-
-    #[test]
-    fn oracle_coverage_is_clipped_to_the_range() {
-        let oracle = MemoryOracle::new(Vec::new(), Coverage::from_spans(vec![span(-100, 100)]));
-        assert_eq!(oracle.coverage(span(0, 50)).spans(), &[span(0, 50)]);
-        assert!(oracle.coverage(span(200, 300)).is_empty());
+        assert!(differences.contains(&SemanticDivergence::Coverage));
     }
 }
