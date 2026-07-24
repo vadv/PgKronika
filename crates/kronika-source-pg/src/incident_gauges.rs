@@ -32,25 +32,7 @@ pub async fn collect_local_join_facts(
     max_tablespaces: i64,
 ) -> Result<Option<LocalJoinFacts>, tokio_postgres::Error> {
     let rows = client
-        .query(
-            marked!(
-                "WITH local AS ( \
-                   SELECT statement_timestamp() AS observed_at, pg_backend_pid() AS backend_pid, \
-                          (SELECT backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()) AS backend_start, \
-                          current_setting('data_directory')::text AS data_directory, \
-                          inet_client_addr() IS NULL AS local_connection \
-                 ), spaces AS ( \
-                   SELECT oid, pg_tablespace_location(oid)::text AS location \
-                     FROM pg_tablespace WHERE pg_tablespace_location(oid) <> '' \
-                    ORDER BY oid LIMIT ($1 + 1) \
-                 ) \
-                 SELECT (extract(epoch from l.observed_at) * 1e6)::int8 AS ts_us, \
-                        l.backend_pid, (extract(epoch from l.backend_start) * 1e6)::int8 AS backend_start_us, \
-                        l.data_directory, l.local_connection, s.oid AS spcoid, s.location \
-                   FROM local l LEFT JOIN spaces s ON true"
-            ),
-            &[&max_tablespaces],
-        )
+        .query(local_join_facts_query(), &[&max_tablespaces])
         .await?;
     let Some(first) = rows.first() else {
         return Ok(None);
@@ -100,6 +82,31 @@ pub struct FreezeHorizonRow {
     pub mxid_age: i64,
     pub mxid_limit: i64,
     pub mxid_is_toast: bool,
+}
+
+/// SQL for the cross-source local join facts.
+///
+/// The `$1::int8` cast is load-bearing: without it `PostgreSQL` infers `$1`
+/// from the `+ 1` integer literal as `int4`, and binding the `i64` argument
+/// fails to serialize.
+#[must_use]
+pub const fn local_join_facts_query() -> &'static str {
+    marked!(
+        "WITH local AS ( \
+           SELECT statement_timestamp() AS observed_at, pg_backend_pid() AS backend_pid, \
+                  (SELECT backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()) AS backend_start, \
+                  current_setting('data_directory')::text AS data_directory, \
+                  inet_client_addr() IS NULL AS local_connection \
+         ), spaces AS ( \
+           SELECT oid, pg_tablespace_location(oid)::text AS location \
+             FROM pg_tablespace WHERE pg_tablespace_location(oid) <> '' \
+            ORDER BY oid LIMIT ($1::int8 + 1) \
+         ) \
+         SELECT (extract(epoch from l.observed_at) * 1e6)::int8 AS ts_us, \
+                l.backend_pid, (extract(epoch from l.backend_start) * 1e6)::int8 AS backend_start_us, \
+                l.data_directory, l.local_connection, s.oid AS spcoid, s.location \
+           FROM local l LEFT JOIN spaces s ON true"
+    )
 }
 
 /// SQL for separate XID and MXID top-N axes.
@@ -636,6 +643,16 @@ pub fn to_slot_retention_v3<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_join_query_casts_the_limit_parameter() {
+        let sql = local_join_facts_query();
+        assert!(
+            sql.contains("LIMIT ($1::int8 + 1)"),
+            "the LIMIT parameter must be cast to int8 or an i64 bind fails to serialize"
+        );
+        assert!(sql.contains("inet_client_addr() IS NULL AS local_connection"));
+    }
 
     #[test]
     fn freeze_query_has_separate_axes_and_effective_overrides() {
