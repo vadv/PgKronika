@@ -17,6 +17,8 @@ pub mod counts;
 pub mod coverage;
 mod finite;
 pub mod health;
+pub mod health_line;
+pub mod notable;
 pub mod observation;
 pub mod oracle;
 pub mod reduce;
@@ -37,6 +39,15 @@ pub use health::{
     HealthEvaluationError, HealthLimits, HealthPoint, HealthPolicy, HealthResource, HealthState,
     InvalidFactorProfile, InvalidHealthPolicy, PopulationTotalQuality, ProfileTopologyId,
     RequiredFactorProfile, SourcePopulation, downsample_worst,
+};
+pub use health_line::{
+    HealthConfigError, OVERVIEW_HEALTH_DOMAIN, OVERVIEW_HEALTH_FACTOR, OVERVIEW_HEALTH_LIMITS,
+    health_line, observation_floor, overview_health_policy,
+};
+pub use notable::{
+    DEFAULT_RESPONSE_CAP, InvalidNotablePolicy, MAX_RESPONSE_CAP, NotableClass,
+    NotableEvidenceClass, NotablePolicy, NotablePreview, RankedNotable, observation_severity,
+    passes_min_severity, severity_rank,
 };
 pub use observation::{
     CheckpointPayload, DictionaryContextId, DroppedFieldCount, ErrorGroupPayload, EventObservation,

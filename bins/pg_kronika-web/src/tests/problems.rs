@@ -39,6 +39,10 @@ fn problem_example(code: ProblemCode) -> (ApiProblem, serde_json::Value) {
             serde_json::json!({ "section": "unknown_section" }),
         ),
         ProblemCode::InvalidCursor => (ApiProblem::invalid_cursor(), serde_json::json!({})),
+        ProblemCode::CursorQueryMismatch => {
+            (ApiProblem::cursor_query_mismatch(), serde_json::json!({}))
+        }
+        ProblemCode::ViewGone => (ApiProblem::view_gone(), serde_json::json!({})),
         ProblemCode::QueryLimitExceeded => (
             ApiProblem::query_limit_exceeded(LimitResource::Rows, 10, Some(11)),
             serde_json::json!({ "resource": "rows", "limit": 10, "observed": 11 }),
@@ -590,7 +594,7 @@ fn assert_changed_success_schemas(document: &serde_json::Value) {
     );
 }
 
-fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
+fn assert_v1_documented_paths(document: &serde_json::Value) {
     let paths = document["paths"].as_object().expect("OpenAPI paths");
     let mut documented_paths: Vec<_> = paths.keys().map(String::as_str).collect();
     documented_paths.sort_unstable();
@@ -609,6 +613,9 @@ fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
             "/v1/sections/batch/diff",
             "/v1/segments",
             "/v1/sources",
+            "/v1/timeline/events",
+            "/v1/timeline/health",
+            "/v1/timeline/overview",
             "/v1/version",
         ]
     );
@@ -634,6 +641,11 @@ fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
             "{path} success schema"
         );
     }
+}
+
+fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
+    assert_v1_documented_paths(document);
+    let paths = document["paths"].as_object().expect("OpenAPI paths");
     let metrics_content = document["paths"]["/metrics"]["get"]["responses"]["200"]["content"]
         .as_object()
         .expect("metrics content");

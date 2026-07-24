@@ -155,8 +155,8 @@ async fn refresh_loop(state: AppState) {
         tokio::time::sleep(REFRESH_INTERVAL).await;
         state.refresh_loop_iterations.fetch_add(1, Relaxed);
         metrics::counter!("kronika_web_refresh_loop_iterations_total").increment(1);
-        match snap.refresh_incremental() {
-            Ok(()) => {
+        match snap.refresh_incremental_delta() {
+            Ok(delta) => {
                 let current = (snap.warnings().len(), snap.damages().len());
                 if current != health {
                     tracing::warn!(
@@ -170,6 +170,11 @@ async fn refresh_loop(state: AppState) {
                 metrics::gauge!("kronika_web_store_damages").set(current.1 as f64);
                 state.last_refresh.store(now_unix_secs(), Relaxed);
                 state.snapshot.store(Arc::new(snap.clone()));
+                // The refresh cycle is the single writer of the published index
+                // view: fold the delta's active parts and republish atomically.
+                state.republish_overview(&snap, &delta);
+                metrics::gauge!("kronika_web_overview_view_generation")
+                    .set(snap.view_generation() as f64);
             }
             Err(err) => {
                 metrics::counter!("kronika_web_refresh_errors_total").increment(1);

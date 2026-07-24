@@ -101,6 +101,7 @@ pub(crate) mod handlers;
 mod incident;
 mod incident_input;
 mod incident_response;
+pub(crate) mod overview;
 mod params;
 mod problem;
 mod reason;
@@ -133,6 +134,24 @@ pub struct AppState {
     /// Age threshold after which the store is considered stale.
     pub stale_after: Duration,
     analytic_requests: Arc<Semaphore>,
+    overview: overview::OverviewIndex,
+    /// The atomic overview index view, republished by the refresh cycle.
+    pub(crate) overview_view: Arc<ArcSwap<overview::view::IndexView>>,
+    /// Byte-bounded cache of exact serialized timeline responses.
+    pub(crate) response_cache: overview::cache::ResponseCache,
+}
+
+/// Byte budget for the exact response cache: 64 MiB.
+const RESPONSE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The persistent overview fact store rooted for this process.
+///
+/// The cache is content-addressed, so a shared per-process root is safe; a
+/// write failure degrades to a bounded memory fallback without losing
+/// correctness.
+fn default_overview_index() -> overview::OverviewIndex {
+    let cache_root = std::env::temp_dir().join("pgkronika-overview-cache");
+    overview::OverviewIndex::new(cache_root, b"pgkronika".to_vec())
 }
 
 impl AppState {
@@ -147,12 +166,17 @@ impl AppState {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let overview = default_overview_index();
+        let initial_view = Arc::new(ArcSwap::from_pointee(overview.assemble(&snapshot)));
         Self {
             snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
             last_refresh: Arc::new(AtomicU64::new(now)),
             refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
             stale_after: Duration::from_secs(10),
             analytic_requests: Arc::new(Semaphore::new(1)),
+            overview,
+            overview_view: initial_view,
+            response_cache: overview::cache::ResponseCache::new(RESPONSE_CACHE_BYTES),
         }
     }
 
@@ -166,18 +190,37 @@ impl AppState {
         last_refresh_secs: u64,
         stale_after: Duration,
     ) -> Self {
+        let overview = default_overview_index();
+        let initial_view = Arc::new(ArcSwap::from_pointee(overview.assemble(&snapshot)));
         Self {
             snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
             last_refresh: Arc::new(AtomicU64::new(last_refresh_secs)),
             refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
             stale_after,
             analytic_requests: Arc::new(Semaphore::new(1)),
+            overview,
+            overview_view: initial_view,
+            response_cache: overview::cache::ResponseCache::new(RESPONSE_CACHE_BYTES),
         }
     }
 
     /// Reserve the server's single heavy-analysis slot without queuing.
     pub(crate) fn try_acquire_analytic(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
         Arc::clone(&self.analytic_requests).try_acquire_owned()
+    }
+
+    /// Reassemble the overview index view and publish it atomically.
+    ///
+    /// The refresh cycle is the single writer of the published view. It folds
+    /// the delta's active parts into the live generation, so live events become
+    /// visible without a request ever decoding PGM bodies.
+    pub fn republish_overview(
+        &self,
+        snapshot: &LocalDirSnapshot,
+        delta: &kronika_reader::RefreshDelta,
+    ) {
+        let view = self.overview.assemble_with_live(snapshot, delta);
+        self.overview_view.store(Arc::new(view));
     }
 }
 
@@ -237,6 +280,9 @@ pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: Prometheus
 
     let mut protected = Router::new()
         .route("/v1/version", get(handlers::v1::version))
+        .route("/v1/timeline/overview", get(overview::handlers::overview))
+        .route("/v1/timeline/events", get(overview::handlers::events))
+        .route("/v1/timeline/health", get(overview::handlers::health))
         .route("/v1/anomalies", get(handlers::anomalies::anomalies))
         .route("/v1/incidents", get(handlers::incidents::incidents))
         .route("/v1/sources", get(handlers::v1::sources))

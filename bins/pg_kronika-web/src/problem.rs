@@ -31,6 +31,8 @@ closed_string_enum! {
         InvalidQueryConstraint => "invalid_query_constraint",
         UnknownSection => "unknown_section",
         InvalidCursor => "invalid_cursor",
+        CursorQueryMismatch => "cursor_query_mismatch",
+        ViewGone => "view_gone",
         QueryLimitExceeded => "query_limit_exceeded",
         AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
         StoreReadFailed => "store_read_failed",
@@ -49,7 +51,9 @@ impl ProblemCode {
             | Self::UnknownQueryParameter
             | Self::DuplicateQueryParameter
             | Self::InvalidQueryConstraint
-            | Self::InvalidCursor => StatusCode::BAD_REQUEST,
+            | Self::InvalidCursor
+            | Self::CursorQueryMismatch => StatusCode::BAD_REQUEST,
+            Self::ViewGone => StatusCode::GONE,
             Self::QueryLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
             Self::AnalyticCapacityUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::StoreReadFailed | Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
@@ -72,6 +76,8 @@ impl ProblemCode {
             }
             Self::UnknownSection => "https://pgkronika.dev/problems/unknown-section",
             Self::InvalidCursor => "https://pgkronika.dev/problems/invalid-cursor",
+            Self::CursorQueryMismatch => "https://pgkronika.dev/problems/cursor-query-mismatch",
+            Self::ViewGone => "https://pgkronika.dev/problems/view-gone",
             Self::QueryLimitExceeded => "https://pgkronika.dev/problems/query-limit-exceeded",
             Self::AnalyticCapacityUnavailable => {
                 "https://pgkronika.dev/problems/analytic-capacity-unavailable"
@@ -100,6 +106,8 @@ closed_string_enum! {
         Names => "names",
         Limit => "limit",
         Cursor => "cursor",
+        MinSeverity => "min_severity",
+        Kind => "kind",
     }
 }
 
@@ -119,6 +127,8 @@ impl QueryParameter {
             b"names" => Some(Self::Names),
             b"limit" => Some(Self::Limit),
             b"cursor" => Some(Self::Cursor),
+            b"min_severity" => Some(Self::MinSeverity),
+            b"kind" => Some(Self::Kind),
             _ => None,
         }
     }
@@ -165,6 +175,7 @@ closed_string_enum! {
         NonNegativeFiniteNumber => "non_negative_finite_number",
         NonNegativeInteger => "non_negative_integer",
         SectionList => "section_list",
+        Severity => "severity",
     }
 }
 
@@ -363,6 +374,14 @@ impl ApiProblem {
 
     pub(crate) fn invalid_cursor() -> Self {
         Self::empty(ProblemCode::InvalidCursor)
+    }
+
+    pub(crate) fn cursor_query_mismatch() -> Self {
+        Self::empty(ProblemCode::CursorQueryMismatch)
+    }
+
+    pub(crate) fn view_gone() -> Self {
+        Self::empty(ProblemCode::ViewGone)
     }
 
     pub(crate) fn query_limit_exceeded(

@@ -271,6 +271,88 @@
         }
       }
     },
+    "/v1/timeline/overview": {
+      "get": {
+        "operationId": "timelineOverview",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/step" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event and health summary of the range",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/timeline/events": {
+      "get": {
+        "operationId": "timelineEvents",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/limit" },
+          { "$ref": "#/components/parameters/cursor" },
+          { "$ref": "#/components/parameters/minSeverity" },
+          { "$ref": "#/components/parameters/kind" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated notable observations",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "410": { "$ref": "#/components/responses/ApplicationProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
+    "/v1/timeline/health": {
+      "get": {
+        "operationId": "timelineHealth",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/step" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Health line with honest per-point coverage",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" }
+        }
+      }
+    },
     "/v1/anomalies": {
       "get": {
         "operationId": "anomalies",
@@ -362,7 +444,9 @@
       "section": { "name": "section", "in": "query", "required": false, "schema": { "type": "string" } },
       "names": { "name": "names", "in": "query", "required": true, "schema": { "type": "string" } },
       "limit": { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 10000 } },
-      "cursor": { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } }
+      "cursor": { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } },
+      "minSeverity": { "name": "min_severity", "in": "query", "required": false, "schema": { "type": "string", "enum": ["error", "fatal", "panic", "warning", "log"] } },
+      "kind": { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" } }
     },
     "headers": {
       "ProblemCacheControl": {
@@ -796,11 +880,11 @@
       },
       "KnownParameter": {
         "type": "string",
-        "enum": ["source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor"]
+        "enum": ["source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
       },
       "AnyParameterLocation": {
         "type": "string",
-        "enum": ["query", "source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor"]
+        "enum": ["query", "source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
       },
       "EmptyParams": {
         "type": "object",
@@ -821,7 +905,7 @@
           "parameter": { "$ref": "#/components/schemas/AnyParameterLocation" },
           "expected": {
             "type": "string",
-            "enum": ["url_encoded_query", "uint64", "int64", "positive_duration", "non_negative_finite_number", "non_negative_integer", "section_list"]
+            "enum": ["url_encoded_query", "uint64", "int64", "positive_duration", "non_negative_finite_number", "non_negative_integer", "section_list", "severity"]
           }
         }
       },
@@ -889,16 +973,18 @@
               "https://pgkronika.dev/problems/invalid-query-constraint",
               "https://pgkronika.dev/problems/unknown-section",
               "https://pgkronika.dev/problems/invalid-cursor",
+              "https://pgkronika.dev/problems/cursor-query-mismatch",
+              "https://pgkronika.dev/problems/view-gone",
               "https://pgkronika.dev/problems/query-limit-exceeded",
               "https://pgkronika.dev/problems/analytic-capacity-unavailable",
               "https://pgkronika.dev/problems/store-read-failed",
               "https://pgkronika.dev/problems/internal-error"
             ]
           },
-          "status": { "type": "integer", "enum": [400, 401, 404, 405, 413, 500, 503] },
+          "status": { "type": "integer", "enum": [400, 401, 404, 405, 410, 413, 500, 503] },
           "code": {
             "type": "string",
-            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "query_limit_exceeded", "analytic_capacity_unavailable", "store_read_failed", "internal_error"]
+            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "view_gone", "query_limit_exceeded", "analytic_capacity_unavailable", "store_read_failed", "internal_error"]
           },
           "params": { "type": "object" },
           "instance": { "type": "string", "format": "uri", "pattern": "^https://pgkronika\\.dev/problems/occurrences/[0-9a-f]{32}$" }
@@ -914,6 +1000,8 @@
           { "if": { "properties": { "code": { "const": "invalid_query_constraint" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-query-constraint" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/ConstraintParams" } } } },
           { "if": { "properties": { "code": { "const": "unknown_section" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-section" }, "status": { "const": 404 }, "params": { "$ref": "#/components/schemas/SectionParams" } } } },
           { "if": { "properties": { "code": { "const": "invalid_cursor" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-cursor" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "cursor_query_mismatch" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-query-mismatch" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "view_gone" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/view-gone" }, "status": { "const": 410 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "query_limit_exceeded" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/query-limit-exceeded" }, "status": { "const": 413 }, "params": { "$ref": "#/components/schemas/LimitParams" } } } },
           { "if": { "properties": { "code": { "const": "analytic_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/analytic-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/CapacityParams" } } } },
           { "if": { "properties": { "code": { "const": "store_read_failed" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/store-read-failed" }, "status": { "const": 500 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
