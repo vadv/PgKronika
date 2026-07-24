@@ -23,6 +23,10 @@
     clippy::multiple_crate_versions,
     reason = "kronika-reader pulls duplicate transitive versions outside our control"
 )]
+#![allow(
+    unused_crate_dependencies,
+    reason = "the parquet/arrow dev-dependencies belong to the ignored research tests"
+)]
 
 mod cluster;
 mod collector;

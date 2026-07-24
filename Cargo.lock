@@ -1991,9 +1991,13 @@ name = "pg_kronika-demo"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-select",
+ "bytes",
  "kronika-analytics",
  "kronika-reader",
  "nix",
+ "parquet",
  "serde_json",
  "tokio",
  "tokio-postgres",
