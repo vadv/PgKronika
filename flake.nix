@@ -113,6 +113,11 @@
           CARGO_BUILD_TARGET = pkgs.stdenv.hostPlatform.config;
           # Limit the image build to the BDD runner and the collector.
           # `-p` replaces crane's default flags, so keep `--locked` here.
+          #
+          # The demo stand deliberately builds as a separate package
+          # (`demoBins`): folding its web-viewer dependency tree into these
+          # shared artifacts overflows the CI runner disk during the builder
+          # image build.
           cargoExtraArgs = "--locked -p kronika-bdd -p pg_kronika-collector";
           doCheck = false;
         };
@@ -130,6 +135,18 @@
           // {
             inherit cargoArtifacts;
             pname = "pgkronika-bins";
+          }
+        );
+
+        # Stand driver and web viewer, on top of the shared dependency
+        # artifacts; the missing web-stack dependencies compile here, from
+        # the vendored set, so `--offline` still works inside the builder.
+        demoBins = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            pname = "pgkronika-demo-bins";
+            cargoExtraArgs = "--locked -p pg_kronika-demo -p pg_kronika-web";
           }
         );
 
@@ -166,14 +183,56 @@
             ];
           };
         };
+        # Scratch image for the size-evaluation demo stand: one PG 17
+        # cluster, the collector, and the stand driver (docs/superpowers/
+        # specs/2026-07-24-demo-stand-size-eval.md).
+        #
+        # The BDD builder pre-realizes only `.#image`, and the stand build
+        # runs `nix build --offline .#demoImage` inside that builder: every
+        # input here must either be in `image`'s closure or build offline
+        # from the vendored dependency set (as `demoBins` does).
+        demoImage = pkgs.dockerTools.streamLayeredImage {
+          name = "pgkronika-demo";
+          tag = "latest";
+          maxLayers = 120;
+          contents = [
+            bins
+            demoBins
+            postgresql_17_plans
+            pkgs.dockerTools.fakeNss
+            # initdb uses popen, so the scratch image needs /bin/sh.
+            pkgs.dockerTools.binSh
+          ];
+          extraCommands = "mkdir -m 1777 tmp && mkdir -m 0777 data";
+          config = {
+            Entrypoint = [ "${demoBins}/bin/pg_kronika-demo" ];
+            Cmd = [ "stand" ];
+            User = "65534:65534";
+            ExposedPorts = {
+              "5432/tcp" = { };
+              "8080/tcp" = { };
+            };
+            Env = [
+              "HOME=/tmp"
+              "TMPDIR=/tmp"
+              "LC_ALL=C"
+              "LANG=C"
+              "KRONIKA_COLLECTOR_BIN=${bins}/bin/pg_kronika-collector"
+              "KRONIKA_WEB_BIN=${demoBins}/bin/pg_kronika-web"
+              "KRONIKA_PG_MATRIX=17=${postgresql_17_plans}/bin"
+            ];
+          };
+        };
       in
       {
         packages = {
           default = bins;
           inherit
             bins
+            demoBins
             cargoArtifacts
             image
+            demoImage
             postgresql_15_plans
             postgresql_16_plans
             postgresql_17_plans

@@ -2,3 +2,7 @@
 
 # SDD scratch (progress ledger, task briefs)
 .superpowers/
+
+# Demo-stand artifacts
+/demo-data/
+/demo-image.tar
