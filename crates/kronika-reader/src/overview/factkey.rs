@@ -13,7 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use kronika_analytics::overview::{
-    EXTRACTOR_SEMANTICS_VERSION, FACT_SCHEMA_VERSION, REGISTRY_CONTRACT_VERSION, SourceScopeId,
+    EXTRACTOR_SEMANTICS_VERSION, FACT_SCHEMA_VERSION, REGISTRY_CONTRACT_VERSION, SegmentLineageId,
+    SourceScopeId,
 };
 use sha2::{Digest, Sha256};
 
@@ -123,17 +124,26 @@ impl FactKey {
     }
 }
 
-/// The expected path for the fact file identified by `key` under `cache_root`.
+/// The expected path for the fact file identified by `key` and `lineage`.
 ///
-/// Layout: `<cache_root>/overview/v1/<scope_hex>/<prefix>/<key_hex>.ovf`.
+/// Layout:
+/// `<cache_root>/overview/v1/<scope_hex>/<prefix>/<key_hex>-<lineage_hex>.ovf`.
+///
+/// `FactKey` remains content-addressed. The lineage suffix distinguishes
+/// separate retained occurrences with identical PGM content.
 #[must_use]
-pub fn placement(cache_root: &Path, source_scope_id: SourceScopeId, key: &FactKey) -> PathBuf {
+pub fn placement(
+    cache_root: &Path,
+    source_scope_id: SourceScopeId,
+    key: &FactKey,
+    lineage: SegmentLineageId,
+) -> PathBuf {
     cache_root
         .join("overview")
         .join("v1")
         .join(to_hex(&source_scope_id.0))
         .join(key.prefix())
-        .join(format!("{}.ovf", key.hex()))
+        .join(format!("{}-{}.ovf", key.hex(), to_hex(&lineage.0)))
 }
 
 /// The prefix directory containing `key`'s fact file and publication artifacts.
@@ -210,17 +220,37 @@ mod tests {
     }
 
     #[test]
-    fn placement_uses_scope_prefix_and_key_name() {
+    fn placement_uses_scope_prefix_key_and_lineage_name() {
         let key = FactKey::for_current_segment(scope(0xAB), descriptor(0xCD));
-        let path = placement(Path::new("/cache"), scope(0xAB), &key);
+        let lineage = SegmentLineageId([0xEF; 32]);
+        let path = placement(Path::new("/cache"), scope(0xAB), &key, lineage);
         let text = path.to_string_lossy();
         assert!(text.starts_with("/cache/overview/v1/"));
-        assert!(text.ends_with(&format!("/{}.ovf", key.hex())));
+        assert!(text.ends_with(&format!("/{}-{}.ovf", key.hex(), to_hex(&lineage.0))));
         assert!(text.contains(&format!("/{}/", key.prefix())));
         assert_eq!(
             placement_dir(Path::new("/cache"), scope(0xAB), &key),
             path.parent().expect("named file has a parent")
         );
+    }
+
+    #[test]
+    fn placement_distinguishes_identical_content_under_distinct_lineages() {
+        let key = FactKey::for_current_segment(scope(1), descriptor(2));
+        let first = placement(
+            Path::new("/cache"),
+            scope(1),
+            &key,
+            SegmentLineageId([3; 32]),
+        );
+        let second = placement(
+            Path::new("/cache"),
+            scope(1),
+            &key,
+            SegmentLineageId([4; 32]),
+        );
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), second.parent());
     }
 
     #[test]

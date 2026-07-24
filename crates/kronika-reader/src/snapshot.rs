@@ -164,6 +164,21 @@ pub enum SealedFactError {
         /// Requested unit index.
         unit_idx: usize,
     },
+    /// The exact sealed descriptor is not readable in the current scan.
+    DescriptorUnavailable {
+        /// Stable direct-child file-name identity requested by the caller.
+        locator: SealedLocator,
+    },
+    /// A sealed locator now resolves to a different catalog descriptor.
+    StaleDescriptor {
+        /// Stable direct-child file-name identity requested by the caller.
+        locator: SealedLocator,
+    },
+    /// The supplied extraction context does not carry the descriptor's locator.
+    ContextLocatorMismatch {
+        /// Stable direct-child file-name identity requested by the caller.
+        locator: SealedLocator,
+    },
     /// Source extraction or a hard fact bound failed.
     Build(BuildError),
 }
@@ -180,6 +195,24 @@ impl std::fmt::Display for SealedFactError {
             Self::StaleSnapshot { unit_idx } => {
                 write!(f, "sealed unit {unit_idx} changed; refresh the snapshot")
             }
+            Self::DescriptorUnavailable { locator } => {
+                write!(
+                    f,
+                    "sealed descriptor {locator:?} is unavailable in this scan"
+                )
+            }
+            Self::StaleDescriptor { locator } => {
+                write!(
+                    f,
+                    "sealed descriptor {locator:?} changed; refresh the snapshot"
+                )
+            }
+            Self::ContextLocatorMismatch { locator } => {
+                write!(
+                    f,
+                    "segment context does not match sealed descriptor {locator:?}"
+                )
+            }
             Self::Build(error) => write!(f, "sealed fact build failed: {error}"),
         }
     }
@@ -189,9 +222,12 @@ impl std::error::Error for SealedFactError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Build(error) => Some(error),
-            Self::UnitOutOfRange { .. } | Self::LiveUnit { .. } | Self::StaleSnapshot { .. } => {
-                None
-            }
+            Self::UnitOutOfRange { .. }
+            | Self::LiveUnit { .. }
+            | Self::StaleSnapshot { .. }
+            | Self::DescriptorUnavailable { .. }
+            | Self::StaleDescriptor { .. }
+            | Self::ContextLocatorMismatch { .. } => None,
         }
     }
 }
@@ -565,6 +601,17 @@ impl LocalDirSnapshot {
         })
     }
 
+    /// Ordered sealed descriptors pinned by this snapshot.
+    ///
+    /// A descriptor preserved across a transient per-file scan warning remains
+    /// in this baseline, but an exact load reports
+    /// [`SealedFactError::DescriptorUnavailable`] until the file is readable
+    /// again.
+    #[must_use]
+    pub fn sealed_descriptors(&self) -> &[SegmentDescriptor] {
+        &self.sealed_baseline
+    }
+
     /// Loads persistent overview facts for one sealed unit.
     ///
     /// The file is reopened and its catalog is compared with the pinned scan
@@ -606,6 +653,143 @@ impl LocalDirSnapshot {
         store
             .load_or_build(&unit, context, bounds)
             .map_err(Into::into)
+    }
+
+    /// Loads overview facts for one exact reader-authored sealed descriptor.
+    ///
+    /// This avoids index lookup through the deduplicated query-unit view. The
+    /// direct-child locator and catalog descriptor must both still match, and
+    /// the extraction context must carry that exact locator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SealedFactError`] when the descriptor is unavailable or stale,
+    /// the context carries another locator, or source extraction/admission
+    /// fails.
+    pub fn load_sealed_facts_by_descriptor(
+        &self,
+        descriptor: &SegmentDescriptor,
+        store: &FactStore,
+        context: &SegmentContext,
+        bounds: &Bounds,
+    ) -> Result<FactLoad, SealedFactError> {
+        if context.segment_locator().0 != *descriptor.locator.as_bytes() {
+            return Err(SealedFactError::ContextLocatorMismatch {
+                locator: descriptor.locator,
+            });
+        }
+
+        let sealed = self
+            .scan
+            .sealed
+            .iter()
+            .find(|sealed| {
+                sealed
+                    .path
+                    .file_name()
+                    .map(|name| SealedLocator::from_file_name_bytes(name.as_bytes()))
+                    == Some(descriptor.locator)
+            })
+            .ok_or(SealedFactError::DescriptorUnavailable {
+                locator: descriptor.locator,
+            })?;
+        if SegmentDescriptor::from_catalog(descriptor.locator, &sealed.catalog) != *descriptor {
+            return Err(SealedFactError::StaleDescriptor {
+                locator: descriptor.locator,
+            });
+        }
+
+        let file = self.dir.open_sealed(sealed).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+            ) {
+                SealedFactError::StaleDescriptor {
+                    locator: descriptor.locator,
+                }
+            } else {
+                SealedFactError::Build(BuildError::from(ReadError::Io(error)))
+            }
+        })?;
+        let unit = PgmUnit::open(file).map_err(BuildError::from)?;
+        if unit.catalog() != &sealed.catalog {
+            return Err(SealedFactError::StaleDescriptor {
+                locator: descriptor.locator,
+            });
+        }
+        store
+            .load_or_build(&unit, context, bounds)
+            .map_err(Into::into)
+    }
+
+    /// Opens one active journal part by its exact refresh descriptor.
+    ///
+    /// The descriptor is matched against the journal generation, byte range,
+    /// and catalog digest rather than the deduplicated `units()` ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the descriptor is absent, the journal moved
+    /// after the scan, or the captured bytes fail PGM validation.
+    pub fn open_active_part(
+        &self,
+        descriptor: &PartDescriptor,
+    ) -> Result<PgmUnit<Vec<u8>>, ReadError> {
+        let active_idx = self
+            .scan
+            .active
+            .iter()
+            .position(|active| {
+                let Ok(frame_offset) = u64::try_from(active.part.offset) else {
+                    return false;
+                };
+                let Ok(body_len) = u64::try_from(active.part.len) else {
+                    return false;
+                };
+                PartDescriptor {
+                    part_id: part_id(
+                        self.journal_generation,
+                        frame_offset,
+                        body_len,
+                        &active.catalog,
+                    ),
+                    source_id: active.catalog.source_id,
+                    min_ts: active.catalog.min_ts,
+                    max_ts: active.catalog.max_ts,
+                } == *descriptor
+            })
+            .ok_or_else(|| {
+                ReadError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "active part {:?} is unavailable in journal generation {:?}",
+                        descriptor.part_id, self.journal_generation
+                    ),
+                ))
+            })?;
+        let active = &self.scan.active[active_idx];
+        let bytes = match self.dir.read_active_part(active) {
+            Ok(bytes) => bytes,
+            Err(StoreError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Err(ReadError::StaleSnapshot {
+                    unit_idx: active_idx,
+                });
+            }
+            Err(StoreError::Io(error)) => return Err(ReadError::Io(error)),
+            Err(error) => return Err(ReadError::Store(error)),
+        };
+        let unit = PgmUnit::open(bytes)?;
+        if unit.catalog() != &active.catalog {
+            return Err(ReadError::StaleSnapshot {
+                unit_idx: active_idx,
+            });
+        }
+        Ok(unit)
     }
 
     /// Decode one section from the unit at position `idx` in `units()`.
@@ -1181,6 +1365,15 @@ mod tests {
         .expect("valid context")
     }
 
+    fn descriptor_context(descriptor: &SegmentDescriptor) -> SegmentContext {
+        SegmentContext::new(
+            b"snapshot-store".to_vec(),
+            NamingContractId([0x11; 16]),
+            SegmentLocator(*descriptor.locator.as_bytes()),
+        )
+        .expect("valid descriptor context")
+    }
+
     #[test]
     fn sealed_snapshot_cache_hit_after_reopen_reads_no_pgm_bodies() {
         let source = tempfile::tempdir().expect("source directory");
@@ -1202,6 +1395,94 @@ mod tests {
         assert_eq!(warm.origin(), FactOrigin::CacheHit);
         assert_eq!(warm.pgm_body_read_stats().read_calls, 0);
         assert_eq!(warm.facts().observations(), cold.facts().observations());
+    }
+
+    #[test]
+    fn exact_sealed_descriptors_keep_identical_files_distinct_and_warm() {
+        let source = tempfile::tempdir().expect("source directory");
+        let cache = tempfile::tempdir().expect("cache directory");
+        let bytes = lifecycle_part(7);
+        fs::write(source.path().join("1500-a.pgm"), &bytes).expect("write first segment");
+        fs::write(source.path().join("1500-b.pgm"), &bytes).expect("write second segment");
+        let store = FactStore::new(cache.path());
+
+        let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
+        let descriptors = snapshot.sealed_descriptors();
+        assert_eq!(descriptors.len(), 2);
+        assert_ne!(descriptors[0].locator, descriptors[1].locator);
+        assert_eq!(descriptors[0].catalog_digest, descriptors[1].catalog_digest);
+        for descriptor in descriptors {
+            let load = snapshot
+                .load_sealed_facts_by_descriptor(
+                    descriptor,
+                    &store,
+                    &descriptor_context(descriptor),
+                    &LIMIT,
+                )
+                .expect("cold exact load");
+            assert_eq!(load.origin(), FactOrigin::Rebuilt);
+        }
+
+        let restarted = LocalDirSnapshot::open(source.path()).expect("restart snapshot");
+        for descriptor in restarted.sealed_descriptors() {
+            let load = restarted
+                .load_sealed_facts_by_descriptor(
+                    descriptor,
+                    &FactStore::new(cache.path()),
+                    &descriptor_context(descriptor),
+                    &LIMIT,
+                )
+                .expect("warm exact load");
+            assert_eq!(load.origin(), FactOrigin::CacheHit);
+            assert_eq!(load.pgm_body_read_stats().read_calls, 0);
+        }
+    }
+
+    #[test]
+    fn exact_active_part_open_is_independent_of_query_unit_deduplication() {
+        let source = tempfile::tempdir().expect("source directory");
+        let bytes = lifecycle_part(7);
+        fs::write(source.path().join("1500.pgm"), &bytes).expect("write sealed segment");
+        fs::write(source.path().join("active.parts"), framed(&bytes)).expect("write active part");
+
+        let mut snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
+        assert_eq!(snapshot.units().len(), 1, "query view suppresses duplicate");
+        let delta = snapshot
+            .refresh_incremental_delta()
+            .expect("bootstrap exact descriptors");
+        let descriptor = delta
+            .journal
+            .completed_parts
+            .first()
+            .expect("active descriptor");
+        let active = snapshot
+            .open_active_part(descriptor)
+            .expect("open exact active part");
+        assert_eq!(active.catalog().source_id, 7);
+        assert_eq!(
+            active.catalog(),
+            snapshot.unit_catalog(0).expect("sealed catalog")
+        );
+    }
+
+    #[test]
+    fn exact_sealed_load_rejects_a_context_for_another_locator() {
+        let source = tempfile::tempdir().expect("source directory");
+        let cache = tempfile::tempdir().expect("cache directory");
+        fs::write(source.path().join("1500.pgm"), lifecycle_part(7)).expect("write segment");
+        let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
+        let descriptor = snapshot.sealed_descriptors()[0];
+
+        assert!(matches!(
+            snapshot.load_sealed_facts_by_descriptor(
+                &descriptor,
+                &FactStore::new(cache.path()),
+                &fact_context(),
+                &LIMIT,
+            ),
+            Err(SealedFactError::ContextLocatorMismatch { locator })
+                if locator == descriptor.locator
+        ));
     }
 
     #[test]
