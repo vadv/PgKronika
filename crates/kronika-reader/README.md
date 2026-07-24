@@ -25,8 +25,11 @@ reference. This yields `ReadError::StaleSnapshot`. Query helpers refresh a
 bounded number of times and surface a gap if the unit remains unstable.
 
 `LiveBuilder`, `LiveView`, and seal reconciliation provide bounded overview
-fold and handoff primitives. `pg_kronika-web` does not publish that live
-timeline yet; production requests still query `LocalDirSnapshot`.
+fold and handoff primitives. The production web refresh owner retains one
+builder, folds only newly completed journal parts, and reconciles a live
+generation with its exact sealed descriptor before publishing an immutable
+timeline view. Ordinary logical-section requests continue to query
+`LocalDirSnapshot`.
 
 ## Logical queries
 
@@ -83,8 +86,11 @@ read calls and byte counts.
 All PGKOVF constructors and decoders enforce the absolute `LIMIT` values before
 large allocations. `FactStore` loads and validates versioned per-segment fact
 files. A missing or rejected candidate triggers bounded extraction from PGM;
-the store then publishes the rebuilt facts under their content key. Persistence
-failures remain visible alongside the freshly extracted facts.
+the store then publishes the rebuilt facts under the content key and exact
+sealed lineage. The lineage also qualifies the publication lock and final
+placement, so byte-identical files under different locators remain independently
+restart-warm. Persistence failures remain visible alongside the freshly
+extracted facts.
 
 Persistent files remain primary. If canonical encoding and full admission
 succeed but publication fails for a recoverable cache/storage reason,

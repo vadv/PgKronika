@@ -20,11 +20,12 @@ use kronika_registry::{Section, StrId, Ts};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tower::ServiceExt;
 
-use super::{AppState, AuthConfig, app};
+use super::{AppState, AuthConfig, OverviewConfig, app};
 
 mod anomalies;
 mod auth_static;
 mod incidents;
+mod overview_timeline;
 mod probes_metrics;
 mod problems;
 mod sections;
@@ -106,7 +107,7 @@ async fn fixture_request_captured(
     std::fs::write(dir.path().join("143000.pgm"), &bytes).expect("write segment");
 
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-    let state = AppState::new(snapshot);
+    let state = AppState::new(snapshot).expect("state");
 
     let mut request = Request::builder().method(method).uri(uri);
     for &(name, value) in request_headers {
@@ -128,13 +129,40 @@ async fn serve(dir: &std::path::Path, uri: &str) -> (StatusCode, serde_json::Val
     (response.status, response.body)
 }
 
+async fn serve_state(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = app(state, None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("route request");
+    let captured = capture_json(response).await;
+    (captured.status, captured.body)
+}
+
+fn state_for_dir(dir: &std::path::Path) -> AppState {
+    let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
+    AppState::with_overview_config(
+        snapshot,
+        0,
+        std::time::Duration::from_secs(10),
+        OverviewConfig::new(
+            dir.join(".test-overview-cache"),
+            dir.as_os_str().as_encoded_bytes().to_vec(),
+        ),
+    )
+    .expect("state")
+}
+
 async fn serve_captured(
     dir: &std::path::Path,
     uri: &str,
     request_headers: &[(&str, &str)],
 ) -> CapturedResponse {
-    let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
-    let state = AppState::new(snapshot);
+    let state = state_for_dir(dir);
     let mut request = Request::builder().uri(uri);
     for &(name, value) in request_headers {
         request = request.header(name, value);

@@ -221,7 +221,7 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
     let (from, to) = (scan.from, scan.to);
     let (window, step) = (scan.window, scan.step);
 
-    let mut snap = state.snapshot.load().as_ref().clone();
+    let mut snap = state.snapshot().as_ref().clone();
     let logicals: Vec<LogicalSection> = names
         .iter()
         .filter_map(|&name| logical_section(name))

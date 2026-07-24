@@ -338,6 +338,10 @@ impl LossSummary {
     pub fn reasons(&self) -> &[LossReason] {
         &self.reasons
     }
+
+    const fn resident_heap_bytes(&self) -> Option<usize> {
+        self.reasons.capacity().checked_mul(size_of::<LossReason>())
+    }
 }
 
 /// Number of text fields the source could not intern.
@@ -610,6 +614,55 @@ impl ObservationPayload {
         }
     }
 
+    fn resident_heap_bytes(&self) -> Option<usize> {
+        match self {
+            Self::ErrorGroup(payload) => checked_payload_bytes::<ErrorGroupPayload>(&[
+                &payload.normalized_pattern,
+                &payload.sample,
+                &payload.detail,
+                &payload.hint,
+                &payload.context,
+                &payload.statement,
+                &payload.database,
+                &payload.user,
+            ]),
+            Self::ChildSignalTermination(payload)
+            | Self::ChildProcessCrash(payload)
+            | Self::ShutdownRequested(payload)
+            | Self::ReadyObserved(payload) => checked_payload_bytes::<LifecyclePayload>(&[
+                &payload.shutdown_mode,
+                &payload.message,
+                &payload.query_detail,
+            ]),
+            Self::CheckpointStarted(payload)
+            | Self::CheckpointCompleted(payload)
+            | Self::CheckpointTooFrequent(payload) => {
+                checked_payload_bytes::<CheckpointPayload>(&[&payload.reason])
+            }
+            Self::AutovacuumReported(payload) | Self::AutoanalyzeReported(payload) => {
+                checked_payload_bytes::<MaintenancePayload>(&[&payload.relation])
+            }
+            Self::SlowQueryGroup(payload) => {
+                checked_payload_bytes::<SlowQueryPayload>(&[&payload.pattern, &payload.sample])
+            }
+            Self::LockWaitReported(payload) | Self::LockAcquiredAfterWait(payload) => {
+                checked_payload_bytes::<LockWaitPayload>(&[
+                    &payload.lock_mode,
+                    &payload.lock_target,
+                    &payload.detail,
+                    &payload.context,
+                    &payload.statement,
+                ])
+            }
+            Self::TempFileReported(payload) => {
+                checked_payload_bytes::<TempFilePayload>(&[&payload.path, &payload.statement])
+            }
+            Self::LogGap(payload) => {
+                checked_payload_bytes::<LogGapPayload>(&[&payload.source_path])
+            }
+        }
+    }
+
     const fn expected_shape(&self) -> ObservationShape {
         match self {
             Self::ErrorGroup(_) | Self::SlowQueryGroup(_) => ObservationShape::GroupedCount,
@@ -617,6 +670,12 @@ impl ObservationPayload {
             _ => ObservationShape::Individual,
         }
     }
+}
+
+fn checked_payload_bytes<T>(text: &[&Option<Box<str>>]) -> Option<usize> {
+    text.iter().try_fold(size_of::<T>(), |total, value| {
+        total.checked_add(value.as_deref().map_or(0, str::len))
+    })
 }
 
 /// Validation failure while constructing an observation.
@@ -816,6 +875,19 @@ impl EventObservation {
         self.loss.as_ref()
     }
 
+    /// Heap bytes retained below this observation's inline vector slot.
+    ///
+    /// The count includes the concrete boxed payload, every retained UTF-8
+    /// payload allocation, and the capacity of the optional loss-reason vector.
+    /// Returns `None` when the platform-sized total cannot be represented.
+    #[must_use]
+    pub fn resident_heap_bytes(&self) -> Option<usize> {
+        let payload = self.payload.resident_heap_bytes()?;
+        self.loss.as_ref().map_or(Some(payload), |loss| {
+            payload.checked_add(loss.resident_heap_bytes()?)
+        })
+    }
+
     /// Canonical order by timestamp and identity.
     #[must_use]
     pub fn canonical_cmp(&self, other: &Self) -> Ordering {
@@ -975,6 +1047,57 @@ mod tests {
             total_duration_ms: FiniteF64::new(3.0).expect("finite fixture"),
             dropped_field_count: DroppedFieldCount::default(),
         }))
+    }
+
+    #[test]
+    fn resident_heap_bytes_include_error_text_and_loss_capacity() {
+        let retained = [
+            "normalized-pattern",
+            "sample message",
+            "detail text",
+            "hint text",
+            "context text",
+            "statement text",
+            "database",
+            "user",
+        ];
+        let loss = LossSummary::new(LossReason::ALL, Some(9));
+        let expected = size_of::<ErrorGroupPayload>()
+            + retained.iter().map(|text| text.len()).sum::<usize>()
+            + loss.reasons.capacity() * size_of::<LossReason>();
+        let observation = EventObservation::new(
+            lineage(locator(3)),
+            7,
+            provenance(1, Some(locator(3))),
+            ObservationShape::GroupedCount,
+            ObservationTime {
+                sort_ts_us: 1,
+                occurred_at_us: Some(1),
+                observed_interval: None,
+                quality: TimeQuality::FirstInGroup,
+            },
+            2,
+            ObservationPayload::ErrorGroup(Box::new(ErrorGroupPayload {
+                severity: Severity::Error,
+                category: ErrorCategory::Other,
+                sqlstate: Some(SqlState(*b"XX000")),
+                normalized_pattern: Some(retained[0].into()),
+                sample: Some(retained[1].into()),
+                detail: Some(retained[2].into()),
+                hint: Some(retained[3].into()),
+                context: Some(retained[4].into()),
+                statement: Some(retained[5].into()),
+                database: Some(retained[6].into()),
+                user: Some(retained[7].into()),
+                dropped_field_count: DroppedFieldCount::default(),
+            })),
+            EvidenceQuality::Structured,
+            QualityFlags::default(),
+            Some(loss),
+        )
+        .expect("error payload fixture is valid");
+
+        assert_eq!(observation.resident_heap_bytes(), Some(expected));
     }
 
     #[test]

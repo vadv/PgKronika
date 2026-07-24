@@ -462,6 +462,42 @@ impl SegmentFacts {
         self.retained_text_bytes
     }
 
+    /// Checked logical bytes owned by this materialized fact set.
+    ///
+    /// The count includes the inline value, every reserved vector slot,
+    /// concrete observation payload boxes and their retained text, loss-reason
+    /// storage, coverage/gap spans, and dictionary fingerprints. Returns
+    /// `None` rather than saturating if a platform-sized total overflows.
+    #[must_use]
+    pub fn resident_bytes(&self) -> Option<usize> {
+        let manifest = self
+            .manifest_entries
+            .capacity()
+            .checked_mul(size_of::<ManifestEntryDescriptor>())?;
+        let observation_slots = self
+            .observations
+            .capacity()
+            .checked_mul(size_of::<EventObservation>())?;
+        let observation_heap = self
+            .observations
+            .iter()
+            .try_fold(0_usize, |total, observation| {
+                total.checked_add(observation.resident_heap_bytes()?)
+            })?;
+        let dictionary = self
+            .dictionary_fingerprints
+            .capacity()
+            .checked_mul(size_of::<DictionaryFingerprint>())?;
+
+        size_of::<Self>()
+            .checked_add(manifest)?
+            .checked_add(observation_slots)?
+            .checked_add(observation_heap)?
+            .checked_add(self.loss_coverage.covered().resident_heap_bytes()?)?
+            .checked_add(self.loss_coverage.known_gaps().resident_heap_bytes()?)?
+            .checked_add(dictionary)
+    }
+
     /// Offset-independent catalog descriptors expected on a cache reload.
     #[must_use]
     pub fn catalog_descriptors(&self) -> Vec<CatalogEntryDescriptor> {

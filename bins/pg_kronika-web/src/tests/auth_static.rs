@@ -15,11 +15,15 @@ async fn auth_status(auth: Option<AuthConfig>, uri: &str, header: Option<&str>) 
     if let Some(value) = header {
         builder = builder.header(header::AUTHORIZATION, value);
     }
-    app(AppState::new(snapshot), auth, test_metrics_handle())
-        .oneshot(builder.body(Body::empty()).expect("build request"))
-        .await
-        .expect("route request")
-        .status()
+    app(
+        AppState::new(snapshot).expect("state"),
+        auth,
+        test_metrics_handle(),
+    )
+    .oneshot(builder.body(Body::empty()).expect("build request"))
+    .await
+    .expect("route request")
+    .status()
 }
 
 #[tokio::test]
@@ -98,10 +102,14 @@ async fn raw_request(
     if let Some(value) = header {
         builder = builder.header(header::AUTHORIZATION, value);
     }
-    let response = app(AppState::new(snapshot), auth, test_metrics_handle())
-        .oneshot(builder.body(Body::empty()).expect("build request"))
-        .await
-        .expect("route request");
+    let response = app(
+        AppState::new(snapshot).expect("state"),
+        auth,
+        test_metrics_handle(),
+    )
+    .oneshot(builder.body(Body::empty()).expect("build request"))
+    .await
+    .expect("route request");
     let status = response.status();
     let content_type = response
         .headers()

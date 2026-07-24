@@ -1997,6 +1997,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "base64",
+ "bytes",
  "criterion",
  "form_urlencoded",
  "http-body-util",

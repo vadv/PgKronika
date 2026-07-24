@@ -90,9 +90,9 @@ fn snapshot_arc_swap_round_trips_and_clone_stays_queryable() {
     std::fs::write(dir.path().join("143000.pgm"), &bytes).expect("write segment");
 
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-    let state = AppState::new(snapshot);
+    let state = AppState::new(snapshot).expect("state");
 
-    let mut snap = state.snapshot.load().as_ref().clone();
+    let mut snap = state.snapshot().as_ref().clone();
     let page = kronika_reader::section(
         &mut snap,
         "pg_stat_bgwriter + pg_stat_checkpointer",

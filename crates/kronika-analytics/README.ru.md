@@ -3,7 +3,8 @@
 [English version](README.md)
 
 `kronika-analytics` содержит независимые от источника разности счётчиков,
-поиск аномалий и ядро контрактов будущего timeline overview.
+поиск аномалий и ядро контрактов, которое использует production timeline
+overview.
 
 ## Ядро контрактов overview
 
@@ -25,6 +26,14 @@ Catalog ordinal считается по всему сегменту. Counter int
 сохраняет поля типизированной строки PostgreSQL log; machine kind не является
 диагнозом. В частности, raw signal сам по себе не доказывает OOM.
 
+Event counts хранят совместную severity/category/SQLSTATE истину и выводят из
+неё marginal counts с проверяемой арифметикой. Web-проекция раздельно сообщает
+число retained error occurrences, retained error groups и retained observation
+rows. Суммы по severity и category, SQLSTATE buckets top/other/missing и joint
+buckets top/other обязаны независимо сходиться с числом retained error
+occurrences. Выбор важных событий также ограничен и детерминирован, а число
+пропущенных элементов остаётся явным.
+
 ## Редукции и health
 
 Counter pair требует один series, возрастающее время, общий reset epoch и
@@ -43,14 +52,20 @@ Health score требует явный penalty и строгое полное п
 score отсутствующим. Проверенный policy floor может дать `Critical`, не
 подставляя числовой ноль. Downsample сначала выбирает floor cell, иначе — cell
 с минимальным numeric score и детерминированными tie-breaks.
+Floor может установить только structured или derived-exact evidence:
+`PANIC` такого качества доказывает availability, а `XX001` или `XX002` такого
+же качества — integrity. Parsed или heuristic evidence, child termination и
+`53100` остаются важными, но сами по себе floor не устанавливают.
 
 ## Границы и ошибки
 
 Sparse count keys, counter pairs, gauge samples, возвращаемые observations и
 oracle coverage spans ограничиваются параметрами вызывающего кода. Overflow и
-превышение лимитов возвращаются типизированно. Один oracle query возвращает
-observations, counts и coverage из одного pinned вызова адаптера.
+превышение лимитов возвращаются типизированно. Вариант materialized query до
+клонирования учитывает каждую observation, её boxed payload, сохранённый текст
+и loss storage в переданном вызывающим кодом byte limit. Один oracle query
+возвращает observations, counts и coverage из одного pinned вызова адаптера.
 `MemoryOracle` служит только для fixtures над уже декодированными records;
-production raw и index adapters здесь не реализованы.
+production reader-backed adapter находится в `pg_kronika-web`, вне этого крейта.
 
 Public surface перечислен в [`src/lib.rs`](src/lib.rs).

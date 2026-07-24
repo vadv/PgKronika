@@ -28,6 +28,8 @@ pub struct OracleLimits {
 pub enum OracleResource {
     /// Returned observations.
     Observations,
+    /// Bytes charged for materialized observations and their owned payloads.
+    MaterializedBytes,
     /// Returned coverage spans.
     CoverageSpans,
 }
@@ -204,6 +206,26 @@ impl MemoryOracle {
             coverage,
         })
     }
+
+    /// Queries this fixture with an explicit bound on cloned observation bytes.
+    ///
+    /// # Errors
+    /// Returns [`OracleError`] for invalid data, overflow, or configured
+    /// output, count, coverage, and materialization bounds.
+    pub fn query_materialized_bounded(
+        &self,
+        range: CoverageSpan,
+        limits: OracleLimits,
+        max_materialized_bytes: usize,
+    ) -> Result<OracleResult, OracleError> {
+        query_bounded_materialized(
+            &self.observations,
+            self.coverage.spans().iter().copied(),
+            range,
+            limits,
+            max_materialized_bytes,
+        )
+    }
 }
 
 impl RawOracle for MemoryOracle {
@@ -239,7 +261,54 @@ pub fn query_bounded<'a>(
     range: CoverageSpan,
     limits: OracleLimits,
 ) -> Result<OracleResult, OracleError> {
+    query_bounded_inner(observations, coverage_spans, range, limits, None)
+}
+
+/// Queries borrowed canonical facts with a bound on cloned observation bytes.
+///
+/// The byte charge covers each returned [`EventObservation`], its boxed
+/// payload, owned strings, and loss-reason storage. The logical charge is
+/// checked before any selected observation is cloned.
+///
+/// # Errors
+///
+/// Returns [`OracleError::LimitExceeded`] with
+/// [`OracleResource::MaterializedBytes`] when the next unique observation
+/// would exceed `max_materialized_bytes`. Other errors match
+/// [`query_bounded`].
+#[allow(
+    single_use_lifetimes,
+    reason = "anonymous lifetimes in impl Trait are not stable on the MSRV"
+)]
+pub fn query_bounded_materialized<'a>(
+    observations: impl IntoIterator<Item = &'a EventObservation>,
+    coverage_spans: impl IntoIterator<Item = CoverageSpan>,
+    range: CoverageSpan,
+    limits: OracleLimits,
+    max_materialized_bytes: usize,
+) -> Result<OracleResult, OracleError> {
+    query_bounded_inner(
+        observations,
+        coverage_spans,
+        range,
+        limits,
+        Some(max_materialized_bytes),
+    )
+}
+
+#[allow(
+    single_use_lifetimes,
+    reason = "anonymous lifetimes in impl Trait are not stable on the MSRV"
+)]
+fn query_bounded_inner<'a>(
+    observations: impl IntoIterator<Item = &'a EventObservation>,
+    coverage_spans: impl IntoIterator<Item = CoverageSpan>,
+    range: CoverageSpan,
+    limits: OracleLimits,
+    max_materialized_bytes: Option<usize>,
+) -> Result<OracleResult, OracleError> {
     let mut seen = BTreeMap::new();
+    let mut materialized_bytes = 0_usize;
     for observation in observations {
         if !observation_in_range(observation, range) {
             continue;
@@ -252,6 +321,14 @@ pub fn query_bounded<'a>(
         }
         if seen.len() == limits.max_observations {
             return Err(OracleError::LimitExceeded(OracleResource::Observations));
+        }
+        if let Some(max_materialized_bytes) = max_materialized_bytes {
+            materialized_bytes = materialized_bytes
+                .checked_add(observation_materialized_charge(observation)?)
+                .filter(|bytes| *bytes <= max_materialized_bytes)
+                .ok_or(OracleError::LimitExceeded(
+                    OracleResource::MaterializedBytes,
+                ))?;
         }
         seen.insert(observation.observation_id(), observation);
     }
@@ -267,18 +344,31 @@ pub fn query_bounded<'a>(
             span.start_us().max(range.start_us()),
             span.end_us().min(range.end_us()),
         ) {
+            if clipped.len() == limits.max_coverage_spans {
+                return Err(OracleError::LimitExceeded(OracleResource::CoverageSpans));
+            }
             clipped.push(span);
         }
     }
     let coverage = Coverage::from_spans(clipped);
-    if coverage.spans().len() > limits.max_coverage_spans {
-        return Err(OracleError::LimitExceeded(OracleResource::CoverageSpans));
-    }
+    debug_assert!(
+        coverage.spans().len() <= limits.max_coverage_spans,
+        "normalization cannot increase the number of coverage spans"
+    );
     Ok(OracleResult {
         observations,
         counts,
         coverage,
     })
+}
+
+fn observation_materialized_charge(observation: &EventObservation) -> Result<usize, OracleError> {
+    observation
+        .resident_heap_bytes()
+        .and_then(|heap_bytes| size_of::<EventObservation>().checked_add(heap_bytes))
+        .ok_or(OracleError::LimitExceeded(
+            OracleResource::MaterializedBytes,
+        ))
 }
 
 /// One semantic difference between two query paths.
@@ -562,6 +652,55 @@ mod tests {
             Err(OracleError::Counts(CountError::LimitExceeded(
                 CountResource::InputEntries,
             )))
+        );
+    }
+
+    #[test]
+    fn materialized_query_rejects_a_payload_above_the_byte_cap_before_cloning() {
+        let sample_bytes = 64 * 1024;
+        let payload = ObservationPayload::ErrorGroup(Box::new(ErrorGroupPayload {
+            severity: Severity::Fatal,
+            category: ErrorCategory::Resource,
+            sqlstate: Some(SqlState(*b"53300")),
+            normalized_pattern: Some("bounded pattern".into()),
+            sample: Some("x".repeat(sample_bytes).into_boxed_str()),
+            detail: None,
+            hint: None,
+            context: None,
+            statement: None,
+            database: None,
+            user: None,
+            dropped_field_count: DroppedFieldCount::default(),
+        }));
+        let observation = observation(1, 100, 1, payload);
+        let charge =
+            observation_materialized_charge(&observation).expect("fixture charge is representable");
+        assert!(charge > sample_bytes);
+
+        let error =
+            query_bounded_materialized([&observation], [], span(0, 200), LIMITS, charge - 1)
+                .expect_err("one byte below the logical charge must fail");
+        assert_eq!(
+            error,
+            OracleError::LimitExceeded(OracleResource::MaterializedBytes)
+        );
+
+        let result = query_bounded_materialized([&observation], [], span(0, 200), LIMITS, charge)
+            .expect("the exact logical charge is sufficient");
+        assert_eq!(result.observations(), &[observation]);
+    }
+
+    #[test]
+    fn clipped_coverage_input_is_bounded_before_normalization() {
+        let tight = OracleLimits {
+            max_coverage_spans: 1,
+            ..LIMITS
+        };
+        let error = query_bounded([], [span(0, 100), span(0, 100)], span(0, 100), tight)
+            .expect_err("raw clipped spans must respect the work bound");
+        assert_eq!(
+            error,
+            OracleError::LimitExceeded(OracleResource::CoverageSpans)
         );
     }
 

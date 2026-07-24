@@ -29,6 +29,7 @@ use tower::ServiceExt;
 // them keeps `unused_crate_dependencies` quiet without editing the library.
 use arc_swap as _;
 use base64 as _;
+use bytes as _;
 use form_urlencoded as _;
 use kronika_analytics as _;
 use kronika_reader as _;
@@ -219,7 +220,7 @@ fn bench_anomalies_endpoint(c: &mut Criterion) {
     let tmp = tempfile::tempdir().expect("tempdir");
     build_fixture(tmp.path());
     let snapshot = kronika_reader::LocalDirSnapshot::open(tmp.path()).expect("open snapshot");
-    let state = AppState::new(snapshot);
+    let state = AppState::new(snapshot).expect("state");
     let router = app(state, None, metrics_handle());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

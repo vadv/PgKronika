@@ -219,7 +219,7 @@ impl FactStore {
         match self.read_with_stats(unit, context, bounds) {
             Ok((facts, stats)) => {
                 let facts = Arc::new(facts);
-                self.discard_fallback_for(facts.identity());
+                self.discard_fallback_for(facts.identity(), facts.lineage());
                 Ok(FactLoad {
                     facts,
                     origin: FactOrigin::CacheHit,
@@ -291,7 +291,7 @@ impl FactStore {
             .encode(bounds)
             .map_err(|_error| PersistError::InvalidFacts)?;
         let path = self.publish_encoded(facts, &bytes, bounds)?;
-        self.discard_fallback_for(facts.identity());
+        self.discard_fallback_for(facts.identity(), facts.lineage());
         Ok(path)
     }
 
@@ -317,9 +317,9 @@ impl FactStore {
         );
 
         let persist_error = self.publish_encoded(&admitted, &bytes, bounds).err();
-        let durable_key = FactKey::for_identity(admitted.identity(), FileKind::SegmentFacts);
+        let fallback_key = FallbackFactKey::for_facts(&admitted);
         match persist_error {
-            None => self.discard_fallback(durable_key),
+            None => self.discard_fallback(fallback_key),
             Some(error) if error.is_fallback_eligible() => {
                 self.with_fallback(|fallback| {
                     fallback.insert_after_publication_failure(
@@ -338,7 +338,7 @@ impl FactStore {
                     )
                     .is_ok()
                 {
-                    self.discard_fallback(durable_key);
+                    self.discard_fallback(fallback_key);
                 }
             }
             Some(_error) => {}
@@ -353,11 +353,18 @@ impl FactStore {
         bounds: &Bounds,
     ) -> Result<PathBuf, PersistError> {
         let key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
-        let final_path = placement(&self.cache_root, facts.identity().source_scope_id, &key);
+        let lineage = facts.lineage().id();
+        let final_path = placement(
+            &self.cache_root,
+            facts.identity().source_scope_id,
+            &key,
+            lineage,
+        );
         let directory = self
             .open_key_directory(facts.identity(), &key, true)
             .map_err(PersistError::from_io)?;
-        let lock_name = format!(".lock-{}", key.hex());
+        let lineage_hex = hex(&lineage.0);
+        let lock_name = format!(".lock-{}-{lineage_hex}", key.hex());
         let lock = open_file_at(
             &directory,
             &lock_name,
@@ -374,7 +381,7 @@ impl FactStore {
             Err(error) => return Err(PersistError::from_errno(error)),
         }
 
-        let final_name = format!("{}.ovf", key.hex());
+        let final_name = format!("{}-{lineage_hex}.ovf", key.hex());
         let expected_catalog = facts.catalog_descriptors();
         if let Ok(existing) = open_regular_at(&directory, &final_name) {
             if SegmentFacts::from_reader(
@@ -441,17 +448,17 @@ impl FactStore {
         let directory = self
             .open_key_directory(identity, &key, false)
             .map_err(CacheReadError::Io)?;
-        let final_name = format!("{}.ovf", key.hex());
+        let final_name = format!("{}-{}.ovf", key.hex(), hex(&lineage.id().0));
         let file = open_regular_at(&directory, &final_name).map_err(CacheReadError::Io)?;
         SegmentFacts::from_reader_with_stats(file, identity, lineage, expected_catalog, bounds)
     }
 
-    fn discard_fallback_for(&self, identity: &HeaderIdentity) {
-        self.discard_fallback(FactKey::for_identity(identity, FileKind::SegmentFacts));
+    fn discard_fallback_for(&self, identity: &HeaderIdentity, lineage: &SegmentIdentity) {
+        self.discard_fallback(FallbackFactKey::for_expected(identity, lineage));
     }
 
-    fn discard_fallback(&self, durable_key: FactKey) {
-        self.with_fallback(|fallback| fallback.discard_durable(durable_key));
+    fn discard_fallback(&self, fallback_key: FallbackFactKey) {
+        self.with_fallback(|fallback| fallback.discard_durable(fallback_key));
     }
 
     fn with_fallback<T>(&self, operation: impl FnOnce(&mut FallbackFactLru) -> T) -> T {
@@ -852,6 +859,52 @@ mod tests {
     }
 
     #[test]
+    fn identical_content_under_distinct_locators_stays_restart_warm() {
+        let directory = TempDir::new().expect("cache directory");
+        let bytes = lifecycle_pgm(7);
+        let first_context = context_for(b"store-a", 0x44);
+        let second_context = context_for(b"store-a", 0x45);
+        let store = FactStore::new(directory.path());
+
+        let first = store
+            .load_or_build(&unit(&bytes), &first_context, &LIMIT)
+            .expect("first occurrence");
+        let second = store
+            .load_or_build(&unit(&bytes), &second_context, &LIMIT)
+            .expect("second occurrence");
+        assert_eq!(first.origin(), FactOrigin::Rebuilt);
+        assert_eq!(second.origin(), FactOrigin::Rebuilt);
+        assert_eq!(first.facts().identity(), second.facts().identity());
+        assert_ne!(first.facts().lineage(), second.facts().lineage());
+
+        let key = FactKey::for_identity(first.facts().identity(), FileKind::SegmentFacts);
+        let first_path = placement(
+            directory.path(),
+            first.facts().identity().source_scope_id,
+            &key,
+            first.facts().lineage().id(),
+        );
+        let second_path = placement(
+            directory.path(),
+            second.facts().identity().source_scope_id,
+            &key,
+            second.facts().lineage().id(),
+        );
+        assert_ne!(first_path, second_path);
+        assert!(first_path.is_file());
+        assert!(second_path.is_file());
+
+        let restarted = FactStore::new(directory.path());
+        for context in [&first_context, &second_context] {
+            let warm = restarted
+                .load_or_build(&unit(&bytes), context, &LIMIT)
+                .expect("restart-warm occurrence");
+            assert_eq!(warm.origin(), FactOrigin::CacheHit);
+            assert_eq!(warm.pgm_body_read_stats(), PgmBodyReadStats::default());
+        }
+    }
+
+    #[test]
     fn corrupt_target_is_quarantined_and_rebuilt() {
         let directory = TempDir::new().expect("cache directory");
         let store = FactStore::new(directory.path());
@@ -986,6 +1039,7 @@ mod tests {
             directory.path(),
             facts.identity().source_scope_id,
             &FactKey::for_identity(facts.identity(), FileKind::SegmentFacts),
+            facts.lineage().id(),
         );
         let temps = std::fs::read_dir(path.parent().expect("parent"))
             .expect("list final directory")

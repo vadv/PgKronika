@@ -25,8 +25,11 @@ part скрывается только при точном совпадении 
 ограниченно повторяют refresh, после чего нестабильный unit отражается gap.
 
 `LiveBuilder`, `LiveView` и seal reconciliation предоставляют ограниченные
-примитивы для overview fold и handoff. `pg_kronika-web` пока не публикует этот
-live timeline: production-запросы по-прежнему обращаются к `LocalDirSnapshot`.
+примитивы для overview fold и handoff. Production web refresh owner сохраняет
+один builder, сворачивает только новые завершённые части журнала и сверяет live
+generation с точным sealed descriptor до публикации неизменяемого timeline
+view. Обычные запросы logical sections продолжают обращаться к
+`LocalDirSnapshot`.
 
 ## Logical queries
 
@@ -82,8 +85,11 @@ source cursor отклоняется, а не используется как of
 Все конструкторы и декодеры PGKOVF применяют абсолютные пределы `LIMIT` до
 крупных аллокаций. `FactStore` загружает и проверяет версионированные файлы
 фактов для отдельных сегментов. При отсутствии или отклонении файла крейт
-ограниченно извлекает факты из PGM, после чего store публикует их по content
-key. Ошибка сохранения остаётся видна вместе со свежими извлечёнными фактами.
+ограниченно извлекает факты из PGM, после чего store публикует их по content key
+и точному sealed lineage. Lineage также входит в identity publication lock и
+конечного размещения, поэтому byte-identical файлы с разными locators остаются
+независимо restart-warm. Ошибка сохранения остаётся видна вместе со свежими
+извлечёнными фактами.
 
 Постоянные файлы остаются основным источником кэша. Если canonical encoding и
 полная admission-проверка успешны, но publication завершилась восстанавливаемой

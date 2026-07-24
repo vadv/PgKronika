@@ -157,6 +157,7 @@ impl FallbackFactKey {
 
     /// Content-addressed durable fact key.
     #[must_use]
+    #[cfg(test)]
     pub(super) const fn durable(self) -> FactKey {
         self.durable
     }
@@ -354,16 +355,12 @@ impl FallbackFactLru {
         }
     }
 
-    pub(super) fn discard_durable(&mut self, durable: FactKey) {
-        let keys = self
-            .entries
-            .keys()
-            .copied()
-            .filter(|key| key.durable() == durable)
-            .collect::<Vec<_>>();
-        for key in keys {
-            self.remove_replaced(&key);
-        }
+    /// Removes the exact lineage whose durable publication succeeded.
+    ///
+    /// A content-identical occurrence under another sealed locator remains a
+    /// separate fallback entry until its own durable file is admitted.
+    pub(super) fn discard_durable(&mut self, key: FallbackFactKey) {
+        self.remove_replaced(&key);
     }
 
     fn remove_replaced(&mut self, key: &FallbackFactKey) {
@@ -714,20 +711,23 @@ mod tests {
     }
 
     #[test]
-    fn durable_publication_discards_every_lineage_without_an_eviction() {
+    fn durable_publication_discards_only_the_published_lineage() {
         let first = facts(1, 1_500, 1_700);
         let second = facts(2, 1_500, 1_700);
-        let durable_key = FallbackFactKey::for_facts(&first).durable();
-        assert_eq!(FallbackFactKey::for_facts(&second).durable(), durable_key);
+        let first_key = FallbackFactKey::for_facts(&first);
+        let second_key = FallbackFactKey::for_facts(&second);
+        assert_eq!(second_key.durable(), first_key.durable());
         let mut cache = FallbackFactLru::new(config(2, 100));
         cache.insert_after_publication_failure(first, canonical_len(10), LIMIT);
         cache.insert_after_publication_failure(second, canonical_len(10), LIMIT);
 
-        cache.discard_durable(durable_key);
+        cache.discard_durable(first_key);
 
-        assert_eq!(cache.stats().resident_entries, 0);
-        assert_eq!(cache.stats().resident_segment_hours, 0);
-        assert_eq!(cache.stats().resident_bytes, 0);
+        assert_eq!(cache.stats().resident_entries, 1);
+        assert_eq!(cache.stats().resident_segment_hours, 1);
+        assert_eq!(cache.stats().resident_bytes, 10);
+        assert!(cache.get(&first_key, LIMIT).is_none());
+        assert!(cache.get(&second_key, LIMIT).is_some());
         assert_eq!(cache.stats().evictions, 0);
     }
 

@@ -271,6 +271,96 @@
         }
       }
     },
+    "/v1/timeline/overview": {
+      "get": {
+        "operationId": "timelineOverview",
+        "description": "Queries one half-open source range of at most 31 days. Selection is limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/timelineSource" },
+          { "$ref": "#/components/parameters/timelineFrom" },
+          { "$ref": "#/components/parameters/timelineTo" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event and health summary of the range",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TimelineOverviewResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" },
+          "503": { "$ref": "#/components/responses/AnalyticCapacityProblem" }
+        }
+      }
+    },
+    "/v1/timeline/events": {
+      "get": {
+        "operationId": "timelineEvents",
+        "description": "Queries a canonical source set over a half-open range of at most 31 days. Selection is limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/timelineEventSources" },
+          { "$ref": "#/components/parameters/timelineFrom" },
+          { "$ref": "#/components/parameters/timelineTo" },
+          { "$ref": "#/components/parameters/timelineEventsLimit" },
+          { "$ref": "#/components/parameters/timelineEventsCursor" },
+          { "$ref": "#/components/parameters/minSeverity" },
+          { "$ref": "#/components/parameters/kind" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated notable event facts",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TimelineEventsResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "410": { "$ref": "#/components/responses/ApplicationProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" },
+          "503": { "$ref": "#/components/responses/TimelineCapacityProblem" }
+        }
+      }
+    },
+    "/v1/timeline/health": {
+      "get": {
+        "operationId": "timelineHealth",
+        "description": "Queries one half-open source range of at most 31 days. Selection is limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "security": [{ "basicAuth": [] }, {}],
+        "parameters": [
+          { "$ref": "#/components/parameters/timelineSource" },
+          { "$ref": "#/components/parameters/timelineFrom" },
+          { "$ref": "#/components/parameters/timelineTo" },
+          { "$ref": "#/components/parameters/timelineHealthStep" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Health line with explicit per-point coverage",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TimelineHealthResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
+          "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
+          "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "500": { "$ref": "#/components/responses/ApplicationProblem" },
+          "503": { "$ref": "#/components/responses/AnalyticCapacityProblem" }
+        }
+      }
+    },
     "/v1/anomalies": {
       "get": {
         "operationId": "anomalies",
@@ -362,7 +452,66 @@
       "section": { "name": "section", "in": "query", "required": false, "schema": { "type": "string" } },
       "names": { "name": "names", "in": "query", "required": true, "schema": { "type": "string" } },
       "limit": { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 10000 } },
-      "cursor": { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } }
+      "cursor": { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" } },
+      "minSeverity": { "name": "min_severity", "in": "query", "required": false, "schema": { "type": "string", "enum": ["error", "fatal", "panic", "warning", "log"] } },
+      "kind": { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" } },
+      "timelineSource": {
+        "name": "source",
+        "in": "query",
+        "required": true,
+        "description": "Numeric source identifier",
+        "schema": { "type": "integer", "minimum": 0 }
+      },
+      "timelineEventSources": {
+        "name": "source",
+        "in": "query",
+        "required": true,
+        "description": "Canonical source set; repeat source once per identifier",
+        "style": "form",
+        "explode": true,
+        "schema": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "timelineFrom": {
+        "name": "from",
+        "in": "query",
+        "required": true,
+        "description": "Inclusive range start in Unix microseconds",
+        "schema": { "type": "integer", "format": "int64" }
+      },
+      "timelineTo": {
+        "name": "to",
+        "in": "query",
+        "required": true,
+        "description": "Exclusive range end in Unix microseconds",
+        "schema": { "type": "integer", "format": "int64" }
+      },
+      "timelineHealthStep": {
+        "name": "step",
+        "in": "query",
+        "required": false,
+        "description": "Requested health bucket width in microseconds",
+        "schema": { "type": "integer", "minimum": 0 }
+      },
+      "timelineEventsLimit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Maximum events returned on one page",
+        "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }
+      },
+      "timelineEventsCursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "Opaque authenticated continuation token",
+        "schema": { "$ref": "#/components/schemas/TimelineEventsCursor" }
+      }
     },
     "headers": {
       "ProblemCacheControl": {
@@ -431,6 +580,22 @@
           "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
           "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
           "Retry-After": { "$ref": "#/components/headers/ProblemRetryAfter" }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "#/components/schemas/Problem" }
+          }
+        }
+      },
+      "TimelineCapacityProblem": {
+        "description": "Timeline analytic-work or cursor-registry capacity error",
+        "headers": {
+          "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
+          "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
+          "Retry-After": {
+            "description": "Present only for analytic_capacity_unavailable; absent for cursor_capacity_unavailable",
+            "schema": { "type": "integer", "const": 1 }
+          }
         },
         "content": {
           "application/problem+json": {
@@ -794,13 +959,745 @@
           "limit": { "type": "integer", "minimum": 0 }
         }
       },
+      "B64UrlSha256": {
+        "type": "string",
+        "description": "Unpadded base64url encoding of a SHA-256 value",
+        "minLength": 43,
+        "maxLength": 43,
+        "pattern": "^[A-Za-z0-9_-]{43}$"
+      },
+      "TimelineEventsCursor": {
+        "type": "string",
+        "description": "Versioned authenticated timeline cursor",
+        "minLength": 312,
+        "maxLength": 312,
+        "pattern": "^[A-Za-z0-9_-]{312}$"
+      },
+      "CoverageSpan": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from_us", "to_us"],
+        "properties": {
+          "from_us": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Inclusive Unix-microsecond boundary"
+          },
+          "to_us": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Exclusive Unix-microsecond boundary"
+          }
+        }
+      },
+      "TimelineSourceStatus": {
+        "type": "string",
+        "enum": ["complete_for_contract", "partial", "warming", "gap", "unavailable"]
+      },
+      "TimelineSourceCompleteness": {
+        "type": "string",
+        "enum": ["full", "bounded_subset", "unknown"]
+      },
+      "TimelineRetainedExactness": {
+        "type": "string",
+        "enum": ["exact", "lower_bound", "unknown"]
+      },
+      "TimelinePhysicalCountSemantics": {
+        "type": "string",
+        "enum": ["exact", "lower_bound", "unknown", "not_applicable"]
+      },
+      "SourceFreshness": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_id",
+          "source_scope_id",
+          "data_through_us",
+          "source_status",
+          "source_completeness",
+          "retained_exactness",
+          "physical_count_semantics"
+        ],
+        "properties": {
+          "source_id": { "type": "integer", "minimum": 0 },
+          "source_scope_id": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/B64UrlSha256" },
+              { "type": "null" }
+            ]
+          },
+          "data_through_us": { "type": ["integer", "null"], "format": "int64" },
+          "source_status": { "$ref": "#/components/schemas/TimelineSourceStatus" },
+          "source_completeness": { "$ref": "#/components/schemas/TimelineSourceCompleteness" },
+          "retained_exactness": { "$ref": "#/components/schemas/TimelineRetainedExactness" },
+          "physical_count_semantics": { "$ref": "#/components/schemas/TimelinePhysicalCountSemantics" }
+        }
+      },
+      "SourceLoss": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_id", "known_gaps", "dropped_count_lower_bound"],
+        "properties": {
+          "source_id": { "type": "integer", "minimum": 0 },
+          "known_gaps": {
+            "type": "array",
+            "maxItems": 262144,
+            "items": { "$ref": "#/components/schemas/CoverageSpan" }
+          },
+          "dropped_count_lower_bound": { "type": ["integer", "null"], "minimum": 0 }
+        }
+      },
+      "TimelineMeta": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "response_schema_version",
+          "view_generation",
+          "fact_set_id",
+          "requested_range",
+          "effective_range",
+          "effective_step_us",
+          "sources",
+          "available_sources",
+          "data_through_us",
+          "store_data_through_us",
+          "tail_pending",
+          "source_status",
+          "source_freshness",
+          "loss"
+        ],
+        "properties": {
+          "response_schema_version": { "type": "integer", "const": 1 },
+          "view_generation": { "type": "integer", "minimum": 0 },
+          "fact_set_id": { "$ref": "#/components/schemas/B64UrlSha256" },
+          "requested_range": { "$ref": "#/components/schemas/CoverageSpan" },
+          "effective_range": { "$ref": "#/components/schemas/CoverageSpan" },
+          "effective_step_us": { "type": ["integer", "null"], "minimum": 1 },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "uniqueItems": true,
+            "items": { "type": "integer", "minimum": 0 }
+          },
+          "available_sources": {
+            "type": "array",
+            "maxItems": 32,
+            "uniqueItems": true,
+            "items": { "type": "integer", "minimum": 0 }
+          },
+          "data_through_us": { "type": ["integer", "null"], "format": "int64" },
+          "store_data_through_us": { "type": ["integer", "null"], "format": "int64" },
+          "tail_pending": { "type": ["integer", "null"], "minimum": 0 },
+          "source_status": { "$ref": "#/components/schemas/TimelineSourceStatus" },
+          "source_freshness": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": { "$ref": "#/components/schemas/SourceFreshness" }
+          },
+          "loss": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": { "$ref": "#/components/schemas/SourceLoss" }
+          }
+        }
+      },
+      "SupportingEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "observation_id",
+          "section_body_id",
+          "catalog_entry_ordinal",
+          "row_ordinal",
+          "dictionary_context_id",
+          "segment_locator"
+        ],
+        "properties": {
+          "observation_id": { "$ref": "#/components/schemas/B64UrlSha256" },
+          "section_body_id": { "$ref": "#/components/schemas/B64UrlSha256" },
+          "catalog_entry_ordinal": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "row_ordinal": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "dictionary_context_id": { "$ref": "#/components/schemas/B64UrlSha256" },
+          "segment_locator": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/B64UrlSha256" },
+              { "type": "null" }
+            ]
+          }
+        }
+      },
+      "EventLoss": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reasons", "lost_count_lower_bound"],
+        "properties": {
+          "reasons": {
+            "type": "array",
+            "maxItems": 5,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "group_cap_exceeded",
+                "lifecycle_cap_exceeded",
+                "parser_bound",
+                "tailer_bound",
+                "dictionary_bound"
+              ]
+            }
+          },
+          "lost_count_lower_bound": { "type": ["integer", "null"], "minimum": 0 }
+        }
+      },
+      "ErrorEventPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "severity", "category", "sqlstate", "dropped_field_count"],
+        "properties": {
+          "kind": { "type": "string", "const": "pg.log.error_group_observed" },
+          "severity": {
+            "type": "string",
+            "enum": ["error", "fatal", "panic", "warning", "log"]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "lock",
+              "constraint",
+              "serialization",
+              "timeout",
+              "connection",
+              "auth",
+              "syntax",
+              "resource",
+              "data_corruption",
+              "system",
+              "other"
+            ]
+          },
+          "sqlstate": {
+            "type": ["string", "null"],
+            "minLength": 5,
+            "maxLength": 5
+          },
+          "dropped_field_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          }
+        }
+      },
+      "LifecycleEventPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "pid", "signal", "dropped_field_count"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "pg.lifecycle.child_signal_termination",
+              "pg.lifecycle.child_process_crash",
+              "pg.lifecycle.shutdown_requested",
+              "pg.lifecycle.ready_observed"
+            ]
+          },
+          "pid": { "type": ["integer", "null"], "format": "int32" },
+          "signal": { "type": ["integer", "null"], "format": "int32" },
+          "dropped_field_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          }
+        }
+      },
+      "EventPayload": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/ErrorEventPayload" },
+          { "$ref": "#/components/schemas/LifecycleEventPayload" }
+        ]
+      },
+      "EventFact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_id",
+          "event_instance_id",
+          "source_id",
+          "source_scope_id",
+          "source_type_id",
+          "identity_quality",
+          "sort_ts_us",
+          "occurred_at_us",
+          "occurrence_count",
+          "event_kind",
+          "notable_class",
+          "evidence_quality",
+          "quality_flags",
+          "payload",
+          "supporting_evidence",
+          "loss"
+        ],
+        "properties": {
+          "event_id": {
+            "allOf": [{ "$ref": "#/components/schemas/B64UrlSha256" }],
+              "description": "Semantic identifier derived from published semantic fields"
+          },
+          "event_instance_id": {
+            "allOf": [{ "$ref": "#/components/schemas/B64UrlSha256" }],
+            "description": "Physical retained-observation identifier"
+          },
+          "source_id": { "type": "integer", "minimum": 0 },
+          "source_scope_id": { "$ref": "#/components/schemas/B64UrlSha256" },
+          "source_type_id": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "identity_quality": {
+            "type": "string",
+            "enum": ["source_exact", "content_derived", "approximate"]
+          },
+          "sort_ts_us": { "type": "integer", "format": "int64" },
+          "occurred_at_us": { "type": ["integer", "null"], "format": "int64" },
+          "occurrence_count": { "type": "integer", "minimum": 1 },
+          "event_kind": {
+            "type": "string",
+            "enum": [
+              "pg.log.error_group_observed",
+              "pg.lifecycle.child_signal_termination",
+              "pg.lifecycle.child_process_crash",
+              "pg.lifecycle.shutdown_requested",
+              "pg.lifecycle.ready_observed"
+            ]
+          },
+          "notable_class": {
+            "type": "string",
+            "enum": [
+              "server_child_sigkill",
+              "server_child_signal_termination",
+              "panic_severity_observation",
+              "filesystem_space",
+              "postgres_out_of_memory_observation",
+              "connection_saturation",
+              "deadlock_observation",
+              "corruption_sqlstate_observation",
+              "lock_not_available_observation",
+              "query_canceled_observation",
+              "serialization_failure_observation",
+              "auth_failure_observation",
+              "authorization_failure_observation",
+              "permission_denied_observation"
+            ]
+          },
+          "evidence_quality": {
+            "type": "string",
+            "enum": ["structured", "parsed", "heuristic", "derived_exact"]
+          },
+          "quality_flags": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "payload": { "$ref": "#/components/schemas/EventPayload" },
+          "supporting_evidence": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1,
+            "items": { "$ref": "#/components/schemas/SupportingEvidence" }
+          },
+          "loss": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/EventLoss" },
+              { "type": "null" }
+            ]
+          }
+        }
+      },
+      "SqlstateCount": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "count"],
+        "properties": {
+          "code": { "type": "string", "minLength": 5, "maxLength": 5 },
+          "count": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "JointCount": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "category", "sqlstate", "count"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["error", "fatal", "panic", "warning", "log"]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "lock",
+              "constraint",
+              "serialization",
+              "timeout",
+              "connection",
+              "auth",
+              "syntax",
+              "resource",
+              "data_corruption",
+              "system",
+              "other"
+            ]
+          },
+          "sqlstate": {
+            "type": ["string", "null"],
+            "minLength": 5,
+            "maxLength": 5
+          },
+          "count": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "SignalCount": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signal", "count"],
+        "properties": {
+          "signal": { "type": "integer", "format": "int32" },
+          "count": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "LifecycleDigest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["crashes", "shutdowns", "ready", "signals"],
+        "properties": {
+          "crashes": { "type": "integer", "minimum": 0 },
+          "shutdowns": { "type": "integer", "minimum": 0 },
+          "ready": { "type": "integer", "minimum": 0 },
+          "signals": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": { "$ref": "#/components/schemas/SignalCount" }
+          }
+        }
+      },
+      "EventDigest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "retained_error_occurrence_count",
+          "retained_error_group_count",
+          "retained_observation_row_count",
+          "by_severity",
+          "by_category",
+          "by_sqlstate",
+          "sqlstate_missing_count",
+          "sqlstate_other_count",
+          "joint_top",
+          "joint_other_count",
+          "lifecycle",
+          "exactness"
+        ],
+        "properties": {
+          "retained_error_occurrence_count": { "type": "integer", "minimum": 0 },
+          "retained_error_group_count": { "type": "integer", "minimum": 0 },
+          "retained_observation_row_count": { "type": "integer", "minimum": 0 },
+          "by_severity": {
+            "type": "array",
+            "description": "Counts in error, fatal, panic, warning, log order",
+            "minItems": 5,
+            "maxItems": 5,
+            "items": { "type": "integer", "minimum": 0 }
+          },
+          "by_category": {
+            "type": "array",
+            "description": "Counts in lock, constraint, serialization, timeout, connection, auth, syntax, resource, data_corruption, system, other order",
+            "minItems": 11,
+            "maxItems": 11,
+            "items": { "type": "integer", "minimum": 0 }
+          },
+          "by_sqlstate": {
+            "type": "array",
+            "maxItems": 16,
+            "items": { "$ref": "#/components/schemas/SqlstateCount" }
+          },
+          "sqlstate_missing_count": { "type": "integer", "minimum": 0 },
+          "sqlstate_other_count": { "type": "integer", "minimum": 0 },
+          "joint_top": {
+            "type": "array",
+            "maxItems": 16,
+            "items": { "$ref": "#/components/schemas/JointCount" }
+          },
+          "joint_other_count": { "type": "integer", "minimum": 0 },
+          "lifecycle": { "$ref": "#/components/schemas/LifecycleDigest" },
+          "exactness": { "type": "string", "const": "exact" }
+        }
+      },
+      "NotablePreview": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["observations", "omitted_count", "events_query_hash"],
+        "properties": {
+          "observations": {
+            "type": "array",
+            "maxItems": 100,
+            "items": { "$ref": "#/components/schemas/EventFact" }
+          },
+          "omitted_count": { "type": "integer", "minimum": 0 },
+          "events_query_hash": { "$ref": "#/components/schemas/B64UrlSha256" }
+        }
+      },
+      "HealthDomainPenalty": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["domain", "penalty", "driving_factor_ids"],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "enum": [
+              "database_error_pressure",
+              "connection_capacity",
+              "contention",
+              "cpu_pressure",
+              "memory_pressure",
+              "storage_pressure",
+              "maintenance",
+              "replication"
+            ]
+          },
+          "penalty": { "type": "number", "minimum": 0, "maximum": 1 },
+          "driving_factor_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            }
+          }
+        }
+      },
+      "HealthFloorEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["class", "supporting_fact_id"],
+        "properties": {
+          "class": {
+            "type": "string",
+            "enum": ["availability", "integrity", "oom_kill", "disk_full"]
+          },
+          "supporting_fact_id": { "$ref": "#/components/schemas/B64UrlSha256" }
+        }
+      },
+      "HealthFactorCoverage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "factor_id",
+          "applicability",
+          "state",
+          "interval",
+          "present_samples",
+          "covered_duration_us",
+          "retained_exactness"
+        ],
+        "properties": {
+          "factor_id": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "applicability": {
+            "type": "string",
+            "enum": ["applicable", "not_applicable", "unsupported"]
+          },
+          "state": {
+            "type": "string",
+            "enum": ["complete", "partial", "gap", "unknown", "not_collected"]
+          },
+          "interval": { "$ref": "#/components/schemas/CoverageSpan" },
+          "present_samples": { "type": "integer", "minimum": 0 },
+          "covered_duration_us": { "type": "integer", "minimum": 0 },
+          "retained_exactness": {
+            "type": "string",
+            "enum": ["retained_exact", "lower_bound", "unknown"]
+          }
+        }
+      },
+      "HealthPoint": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "interval",
+          "continuous_score",
+          "overall_score",
+          "overall_state",
+          "health_policy_version",
+          "factor_set_id",
+          "domains",
+          "floor_evidence",
+          "coverage"
+        ],
+        "properties": {
+          "interval": { "$ref": "#/components/schemas/CoverageSpan" },
+          "continuous_score": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "maximum": 1
+          },
+          "overall_score": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "maximum": 1
+          },
+          "overall_state": {
+            "type": "string",
+            "enum": ["unknown", "normal", "degraded", "critical"]
+          },
+          "health_policy_version": { "type": "integer", "const": 1 },
+          "factor_set_id": { "$ref": "#/components/schemas/B64UrlSha256" },
+          "domains": {
+            "type": "array",
+            "maxItems": 8,
+            "items": { "$ref": "#/components/schemas/HealthDomainPenalty" }
+          },
+          "floor_evidence": {
+            "type": "array",
+            "maxItems": 65536,
+            "items": { "$ref": "#/components/schemas/HealthFloorEvidence" }
+          },
+          "coverage": {
+            "type": "array",
+            "maxItems": 8,
+            "items": { "$ref": "#/components/schemas/HealthFactorCoverage" }
+          }
+        }
+      },
+      "TimelineHealthSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["worst_point", "latest_point"],
+        "properties": {
+          "worst_point": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/HealthPoint" },
+              { "type": "null" }
+            ]
+          },
+          "latest_point": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/HealthPoint" },
+              { "type": "null" }
+            ]
+          }
+        }
+      },
+      "TimelineOverviewResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "meta",
+          "event_digest",
+          "notable_preview",
+          "health_summary",
+          "coverage",
+          "retained_coverage_duration_us"
+        ],
+        "properties": {
+          "meta": { "$ref": "#/components/schemas/TimelineMeta" },
+          "event_digest": { "$ref": "#/components/schemas/EventDigest" },
+          "notable_preview": { "$ref": "#/components/schemas/NotablePreview" },
+          "health_summary": { "$ref": "#/components/schemas/TimelineHealthSummary" },
+          "coverage": {
+            "type": "array",
+            "maxItems": 8,
+            "items": { "$ref": "#/components/schemas/HealthFactorCoverage" }
+          },
+          "retained_coverage_duration_us": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "TimelineEventsResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "meta",
+          "notable_policy_version",
+          "events",
+          "next_cursor",
+          "omitted_by_response_filter",
+          "retained_exactness",
+          "source_completeness",
+          "physical_count_semantics",
+          "coverage"
+        ],
+        "properties": {
+          "meta": { "$ref": "#/components/schemas/TimelineMeta" },
+          "notable_policy_version": { "type": "integer", "const": 1 },
+          "events": {
+            "type": "array",
+            "maxItems": 1000,
+            "items": { "$ref": "#/components/schemas/EventFact" }
+          },
+          "next_cursor": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/TimelineEventsCursor" },
+              { "type": "null" }
+            ]
+          },
+          "omitted_by_response_filter": { "type": "integer", "minimum": 0 },
+          "retained_exactness": { "$ref": "#/components/schemas/TimelineRetainedExactness" },
+          "source_completeness": { "$ref": "#/components/schemas/TimelineSourceCompleteness" },
+          "physical_count_semantics": { "$ref": "#/components/schemas/TimelinePhysicalCountSemantics" },
+          "coverage": {
+            "type": "array",
+            "maxItems": 262144,
+            "items": { "$ref": "#/components/schemas/CoverageSpan" }
+          }
+        }
+      },
+      "TimelineHealthResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["meta", "health_policy_version", "factor_set_ids", "points", "coverage"],
+        "properties": {
+          "meta": { "$ref": "#/components/schemas/TimelineMeta" },
+          "health_policy_version": { "type": "integer", "const": 1 },
+          "factor_set_ids": {
+            "type": "array",
+            "maxItems": 2000,
+            "uniqueItems": true,
+            "items": { "$ref": "#/components/schemas/B64UrlSha256" }
+          },
+          "points": {
+            "type": "array",
+            "maxItems": 2000,
+            "items": { "$ref": "#/components/schemas/HealthPoint" }
+          },
+          "coverage": {
+            "type": "array",
+            "maxItems": 8,
+            "items": { "$ref": "#/components/schemas/HealthFactorCoverage" }
+          }
+        }
+      },
       "KnownParameter": {
         "type": "string",
-        "enum": ["source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor"]
+        "enum": ["source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
       },
       "AnyParameterLocation": {
         "type": "string",
-        "enum": ["query", "source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor"]
+        "enum": ["query", "source", "from", "to", "window", "step", "threshold", "eps_rel", "epsilon", "max_cluster_span", "section", "names", "limit", "cursor", "min_severity", "kind"]
       },
       "EmptyParams": {
         "type": "object",
@@ -821,7 +1718,7 @@
           "parameter": { "$ref": "#/components/schemas/AnyParameterLocation" },
           "expected": {
             "type": "string",
-            "enum": ["url_encoded_query", "uint64", "int64", "positive_duration", "non_negative_finite_number", "non_negative_integer", "section_list"]
+            "enum": ["url_encoded_query", "uint64", "int64", "positive_duration", "positive_integer", "non_negative_finite_number", "non_negative_integer", "section_list", "severity"]
           }
         }
       },
@@ -889,16 +1786,20 @@
               "https://pgkronika.dev/problems/invalid-query-constraint",
               "https://pgkronika.dev/problems/unknown-section",
               "https://pgkronika.dev/problems/invalid-cursor",
+              "https://pgkronika.dev/problems/cursor-query-mismatch",
+              "https://pgkronika.dev/problems/cursor-expired",
+              "https://pgkronika.dev/problems/view-gone",
               "https://pgkronika.dev/problems/query-limit-exceeded",
+              "https://pgkronika.dev/problems/cursor-capacity-unavailable",
               "https://pgkronika.dev/problems/analytic-capacity-unavailable",
               "https://pgkronika.dev/problems/store-read-failed",
               "https://pgkronika.dev/problems/internal-error"
             ]
           },
-          "status": { "type": "integer", "enum": [400, 401, 404, 405, 413, 500, 503] },
+          "status": { "type": "integer", "enum": [400, 401, 404, 405, 410, 413, 500, 503] },
           "code": {
             "type": "string",
-            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "query_limit_exceeded", "analytic_capacity_unavailable", "store_read_failed", "internal_error"]
+            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "cursor_expired", "view_gone", "query_limit_exceeded", "cursor_capacity_unavailable", "analytic_capacity_unavailable", "store_read_failed", "internal_error"]
           },
           "params": { "type": "object" },
           "instance": { "type": "string", "format": "uri", "pattern": "^https://pgkronika\\.dev/problems/occurrences/[0-9a-f]{32}$" }
@@ -914,7 +1815,11 @@
           { "if": { "properties": { "code": { "const": "invalid_query_constraint" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-query-constraint" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/ConstraintParams" } } } },
           { "if": { "properties": { "code": { "const": "unknown_section" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/unknown-section" }, "status": { "const": 404 }, "params": { "$ref": "#/components/schemas/SectionParams" } } } },
           { "if": { "properties": { "code": { "const": "invalid_cursor" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/invalid-cursor" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "cursor_query_mismatch" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-query-mismatch" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "cursor_expired" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-expired" }, "status": { "const": 410 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
+          { "if": { "properties": { "code": { "const": "view_gone" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/view-gone" }, "status": { "const": 410 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "query_limit_exceeded" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/query-limit-exceeded" }, "status": { "const": 413 }, "params": { "$ref": "#/components/schemas/LimitParams" } } } },
+          { "if": { "properties": { "code": { "const": "cursor_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "analytic_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/analytic-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/CapacityParams" } } } },
           { "if": { "properties": { "code": { "const": "store_read_failed" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/store-read-failed" }, "status": { "const": 500 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "internal_error" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/internal-error" }, "status": { "const": 500 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } }

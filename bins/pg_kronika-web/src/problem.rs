@@ -31,7 +31,11 @@ closed_string_enum! {
         InvalidQueryConstraint => "invalid_query_constraint",
         UnknownSection => "unknown_section",
         InvalidCursor => "invalid_cursor",
+        CursorQueryMismatch => "cursor_query_mismatch",
+        CursorExpired => "cursor_expired",
+        ViewGone => "view_gone",
         QueryLimitExceeded => "query_limit_exceeded",
+        CursorCapacityUnavailable => "cursor_capacity_unavailable",
         AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
         StoreReadFailed => "store_read_failed",
         InternalError => "internal_error",
@@ -49,9 +53,13 @@ impl ProblemCode {
             | Self::UnknownQueryParameter
             | Self::DuplicateQueryParameter
             | Self::InvalidQueryConstraint
-            | Self::InvalidCursor => StatusCode::BAD_REQUEST,
+            | Self::InvalidCursor
+            | Self::CursorQueryMismatch => StatusCode::BAD_REQUEST,
+            Self::CursorExpired | Self::ViewGone => StatusCode::GONE,
             Self::QueryLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::AnalyticCapacityUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::CursorCapacityUnavailable | Self::AnalyticCapacityUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::StoreReadFailed | Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -72,7 +80,13 @@ impl ProblemCode {
             }
             Self::UnknownSection => "https://pgkronika.dev/problems/unknown-section",
             Self::InvalidCursor => "https://pgkronika.dev/problems/invalid-cursor",
+            Self::CursorQueryMismatch => "https://pgkronika.dev/problems/cursor-query-mismatch",
+            Self::CursorExpired => "https://pgkronika.dev/problems/cursor-expired",
+            Self::ViewGone => "https://pgkronika.dev/problems/view-gone",
             Self::QueryLimitExceeded => "https://pgkronika.dev/problems/query-limit-exceeded",
+            Self::CursorCapacityUnavailable => {
+                "https://pgkronika.dev/problems/cursor-capacity-unavailable"
+            }
             Self::AnalyticCapacityUnavailable => {
                 "https://pgkronika.dev/problems/analytic-capacity-unavailable"
             }
@@ -100,6 +114,8 @@ closed_string_enum! {
         Names => "names",
         Limit => "limit",
         Cursor => "cursor",
+        MinSeverity => "min_severity",
+        Kind => "kind",
     }
 }
 
@@ -119,6 +135,8 @@ impl QueryParameter {
             b"names" => Some(Self::Names),
             b"limit" => Some(Self::Limit),
             b"cursor" => Some(Self::Cursor),
+            b"min_severity" => Some(Self::MinSeverity),
+            b"kind" => Some(Self::Kind),
             _ => None,
         }
     }
@@ -162,9 +180,11 @@ closed_string_enum! {
         Uint64 => "uint64",
         Int64 => "int64",
         PositiveDuration => "positive_duration",
+        PositiveInteger => "positive_integer",
         NonNegativeFiniteNumber => "non_negative_finite_number",
         NonNegativeInteger => "non_negative_integer",
         SectionList => "section_list",
+        Severity => "severity",
     }
 }
 
@@ -214,33 +234,33 @@ impl Serialize for EmptyParams {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ParameterParams {
     parameter: QueryParameter,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct InvalidParameterParams {
     parameter: InvalidParameterLocation,
     expected: ExpectedValue,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct UnknownParameterParams {
     parameter: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ConstraintParams {
     constraint: QueryConstraint,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SectionParams {
     section: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct LimitParams {
     resource: LimitResource,
     limit: u64,
@@ -248,12 +268,12 @@ struct LimitParams {
     observed: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct CapacityParams {
     retry_after_seconds: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 enum ProblemParams {
     Empty(EmptyParams),
@@ -267,7 +287,7 @@ enum ProblemParams {
 }
 
 /// A closed, machine-only RFC 9457 response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ApiProblem {
     #[serde(rename = "type")]
     type_uri: &'static str,
@@ -365,6 +385,18 @@ impl ApiProblem {
         Self::empty(ProblemCode::InvalidCursor)
     }
 
+    pub(crate) fn cursor_query_mismatch() -> Self {
+        Self::empty(ProblemCode::CursorQueryMismatch)
+    }
+
+    pub(crate) fn cursor_expired() -> Self {
+        Self::empty(ProblemCode::CursorExpired)
+    }
+
+    pub(crate) fn view_gone() -> Self {
+        Self::empty(ProblemCode::ViewGone)
+    }
+
     pub(crate) fn query_limit_exceeded(
         resource: LimitResource,
         limit: u64,
@@ -378,6 +410,10 @@ impl ApiProblem {
                 observed,
             }),
         )
+    }
+
+    pub(crate) fn cursor_capacity_unavailable() -> Self {
+        Self::empty(ProblemCode::CursorCapacityUnavailable)
     }
 
     pub(crate) fn analytic_capacity_unavailable() -> Self {

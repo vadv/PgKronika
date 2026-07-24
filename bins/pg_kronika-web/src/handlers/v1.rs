@@ -68,7 +68,7 @@ pub(crate) async fn sources(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiProblem> {
     QueryParams::parse(raw.as_deref(), &[])?;
-    let snapshot = state.snapshot.load_full();
+    let snapshot = state.snapshot();
     let mut spans: BTreeMap<u64, (i64, i64, usize)> = BTreeMap::new();
     for unit in snapshot.units() {
         let span = spans
@@ -137,7 +137,7 @@ pub(crate) async fn segments(
     let from = parse_i64(&params, QueryParameter::From)?;
     let to = parse_i64(&params, QueryParameter::To)?;
 
-    let snapshot = state.snapshot.load_full();
+    let snapshot = state.snapshot();
     let units = snapshot.units();
     let mut out = Vec::new();
     for (idx, unit) in units.iter().enumerate() {
@@ -193,7 +193,7 @@ pub(crate) async fn section_data(
 
     // section() takes `&mut`; clone the shared snapshot (catalog metadata, not
     // section bodies) and query the private copy.
-    let mut snap = state.snapshot.load().as_ref().clone();
+    let mut snap = state.snapshot().as_ref().clone();
     match section(&mut snap, &name, source, from, to, limit, cursor) {
         Ok(page) => Ok(Json(page_to_json(&page))),
         Err(err) => Err(query_error_response(&err)),
@@ -226,7 +226,7 @@ pub(crate) async fn sections_batch(
         ));
     }
 
-    let mut snap = state.snapshot.load().as_ref().clone();
+    let mut snap = state.snapshot().as_ref().clone();
     let cursors = BTreeMap::new();
     match query_sections(&mut snap, source, from, to, &names, limit, &cursors) {
         Ok(pages) => {
@@ -370,7 +370,7 @@ pub(crate) async fn section_diff(
     let logical = logical_section(&name).ok_or_else(|| {
         query_error_response_without_cursor(&QueryError::UnknownSection(name.clone()))
     })?;
-    let mut snap = state.snapshot.load().as_ref().clone();
+    let mut snap = state.snapshot().as_ref().clone();
     let page = section(&mut snap, &name, source, from, to, DIFF_MAX_ROWS, None)
         .map_err(|err| query_error_response_without_cursor(&err))?;
     let mut gate_pages = BTreeMap::new();
@@ -427,7 +427,7 @@ pub(crate) async fn sections_batch_diff(
         })
         .collect::<Result<_, _>>()?;
 
-    let mut snap = state.snapshot.load().as_ref().clone();
+    let mut snap = state.snapshot().as_ref().clone();
     let cursors = BTreeMap::new();
     // Gate sections ride the same gather; requested names stay first so the
     // response loop below only walks them.
