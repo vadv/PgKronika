@@ -470,7 +470,14 @@ impl AppState {
             .map_err(|_error| OverviewBuildError::WriterPoisoned)?;
         let timeline = overview.assemble_with_live(&snapshot, delta)?;
         let diagnostics = overview.diagnostics();
+        let gc = overview.collect_fact_garbage();
         drop(overview);
+        if let Some(gc) = gc {
+            metrics::counter!("kronika_web_overview_gc_deleted_total").increment(gc.deleted);
+            metrics::counter!("kronika_web_overview_gc_freed_bytes_total")
+                .increment(gc.freed_bytes);
+            metrics::gauge!("kronika_web_overview_gc_pending").set(gc.pending as f64);
+        }
         metrics::gauge!("kronika_web_overview_durable_hits_total")
             .set(diagnostics.durable_hits as f64);
         metrics::gauge!("kronika_web_overview_fallback_hits_total")

@@ -5,14 +5,15 @@
 //! and only newly completed journal parts are folded. Requests receive immutable
 //! `IndexView` values and never perform PGM extraction.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use kronika_analytics::overview::{NamingContractId, SegmentLocator};
 use kronika_reader::{
-    FactLoad, FactOrigin, FactStore, FallbackConfig, LIMIT, LiveBuilder, LiveConfigError,
-    LiveFoldError, LiveView, LocalDirSnapshot, PersistError, RefreshDelta, SealOutcome,
-    SealedFactError, SealedLocator, SegmentContext, SegmentDescriptor, reconcile_seal,
+    FactLoad, FactOrigin, FactStore, FallbackConfig, GcOutcome, LIMIT, LiveBuilder,
+    LiveConfigError, LiveFoldError, LiveView, LocalDirSnapshot, PersistError, RefreshDelta,
+    SealOutcome, SealedFactError, SealedLocator, SegmentContext, SegmentDescriptor, reconcile_seal,
 };
 
 use super::view::{IndexView, SealedEntry};
@@ -88,6 +89,13 @@ impl OverviewDiagnostics {
     }
 }
 
+/// Refresh passes between fact-cache garbage collections.
+///
+/// The refresh loop runs about once a second, so this reclaims disk roughly
+/// once a minute — often enough to bound orphan fact files, rare enough that
+/// the directory walk is not on the per-tick path.
+const GC_INTERVAL_PASSES: u64 = 60;
+
 /// The only mutable owner of sealed facts and live fold state.
 #[derive(Debug)]
 pub(crate) struct OverviewWriter {
@@ -97,12 +105,13 @@ pub(crate) struct OverviewWriter {
     unavailable: BTreeSet<SealedLocator>,
     live: LiveBuilder,
     diagnostics: OverviewDiagnostics,
+    passes_since_gc: u64,
 }
 
 impl OverviewWriter {
     /// Builds a writer with explicit durable and fallback storage policy.
     pub(crate) fn new(
-        cache_root: std::path::PathBuf,
+        cache_root: PathBuf,
         namespace: Vec<u8>,
         fallback: FallbackConfig,
     ) -> Result<Self, OverviewBuildError> {
@@ -115,7 +124,29 @@ impl OverviewWriter {
             unavailable: BTreeSet::new(),
             live,
             diagnostics: OverviewDiagnostics::default(),
+            passes_since_gc: 0,
         })
+    }
+
+    /// Reclaims fact files of dropped segments, at most once per
+    /// [`GC_INTERVAL_PASSES`] refreshes.
+    ///
+    /// Returns the pass outcome only when GC ran. The live set is every
+    /// currently retained sealed segment's fact-file path; a file outside it
+    /// is unlinked after its grace window inside [`FactStore`].
+    pub(crate) fn collect_fact_garbage(&mut self) -> Option<GcOutcome> {
+        self.passes_since_gc += 1;
+        if self.passes_since_gc < GC_INTERVAL_PASSES {
+            return None;
+        }
+        self.passes_since_gc = 0;
+        let cache_root = self.store.cache_root().to_path_buf();
+        let live: HashSet<PathBuf> = self
+            .sealed
+            .values()
+            .map(|entry| entry.fact_file_path(&cache_root))
+            .collect();
+        Some(self.store.collect_garbage(&live))
     }
 
     /// Applies one reader delta and returns the next immutable view.
@@ -441,6 +472,102 @@ mod tests {
         assert!(
             !view.coverage_envelope().is_empty(),
             "the sealed segment binds coverage into the view"
+        );
+    }
+
+    fn ovf_files(cache_root: &std::path::Path) -> usize {
+        fn walk(dir: &std::path::Path, count: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, count);
+                } else if path.extension().is_some_and(|ext| ext == "ovf") {
+                    *count += 1;
+                }
+            }
+        }
+        let mut count = 0;
+        walk(cache_root, &mut count);
+        count
+    }
+
+    #[test]
+    fn gc_reclaims_the_fact_file_of_a_dropped_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
+        let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+        let delta = snapshot
+            .refresh_incremental_delta()
+            .expect("bootstrap delta");
+        let mut index = OverviewIndex::new(
+            cache.path().to_path_buf(),
+            b"deployment".to_vec(),
+            FallbackConfig::default(),
+        )
+        .expect("writer");
+        index.assemble(&snapshot, &delta).expect("view");
+        assert_eq!(
+            ovf_files(cache.path()),
+            1,
+            "the sealed segment published a fact file"
+        );
+
+        // While the segment is live its fact file survives GC: the live-set
+        // path must equal what publication wrote, so a drift in placement or
+        // the fact key fails here instead of silently deleting live facts.
+        for _ in 0..GC_INTERVAL_PASSES {
+            index.collect_fact_garbage();
+        }
+        assert_eq!(
+            ovf_files(cache.path()),
+            1,
+            "a live segment's fact file survives GC"
+        );
+
+        // The segment disappears from the source; the view drops it but the
+        // fact file lingers until GC reclaims it after its grace window.
+        std::fs::remove_file(dir.path().join("143000.pgm")).expect("drop segment");
+        let drop_delta = snapshot.refresh_incremental_delta().expect("drop delta");
+        index
+            .assemble_with_live(&snapshot, &drop_delta)
+            .expect("view without the segment");
+
+        let mut last = None;
+        for _ in 0..(GC_INTERVAL_PASSES * 2) {
+            if let Some(outcome) = index.collect_fact_garbage() {
+                last = Some(outcome);
+            }
+        }
+        let outcome = last.expect("GC ran across the two intervals");
+        assert_eq!(
+            outcome.deleted, 1,
+            "the dropped segment's fact file is unlinked"
+        );
+        assert_eq!(ovf_files(cache.path()), 0, "no orphan fact file remains");
+    }
+
+    #[test]
+    fn gc_runs_only_on_the_interval_boundary() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let mut index = OverviewIndex::new(
+            cache.path().to_path_buf(),
+            b"deployment".to_vec(),
+            FallbackConfig::default(),
+        )
+        .expect("writer");
+        for _ in 0..(GC_INTERVAL_PASSES - 1) {
+            assert!(
+                index.collect_fact_garbage().is_none(),
+                "no GC before the boundary"
+            );
+        }
+        assert!(
+            index.collect_fact_garbage().is_some(),
+            "GC runs on the boundary pass"
         );
     }
 

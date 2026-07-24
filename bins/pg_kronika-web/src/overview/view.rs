@@ -126,6 +126,16 @@ impl SealedEntry {
     fn facts(&self) -> &SegmentFacts {
         &self.facts
     }
+
+    /// The durable fact-file path this segment publishes under `cache_root`.
+    pub(crate) fn fact_file_path(&self, cache_root: &std::path::Path) -> std::path::PathBuf {
+        kronika_reader::placement(
+            cache_root,
+            self.facts.identity().source_scope_id,
+            &self.fact_key,
+            self.facts.lineage().id(),
+        )
+    }
 }
 
 /// An atomic snapshot of ordered sealed facts and one live generation.
