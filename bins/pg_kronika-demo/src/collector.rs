@@ -46,8 +46,17 @@ impl Collector {
     /// Segment age, caps, and interval variables pass through from the
     /// process environment, so `docker run -e KRONIKA_...` reaches the
     /// collector unchanged.
+    ///
+    /// The stand enables PG log collection by default so measured segments
+    /// carry the event sections; the collector ships it off by default. An
+    /// operator `-e KRONIKA_PG_LOG_ENABLED=0` still wins, since it reaches the
+    /// inherited environment before this default applies.
     pub(crate) fn spawn(dsn: &str, paths: &StandPaths, config: &Config) -> Result<Self> {
-        Self::spawn_with(dsn, paths, config, &[])
+        let mut extra_env: Vec<(&str, &str)> = Vec::new();
+        if std::env::var_os("KRONIKA_PG_LOG_ENABLED").is_none() {
+            extra_env.push(("KRONIKA_PG_LOG_ENABLED", "1"));
+        }
+        Self::spawn_with(dsn, paths, config, &extra_env)
     }
 
     fn spawn_with(
