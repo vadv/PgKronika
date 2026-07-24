@@ -826,7 +826,7 @@ pub enum SealOutcome {
     /// The live candidate matched sealed provenance and was re-keyed.
     Promoted {
         /// Canonical sealed facts.
-        facts: SegmentFacts,
+        facts: Arc<SegmentFacts>,
         /// Best-effort durable publication failure.
         persist_error: Option<PersistError>,
     },
@@ -838,9 +838,9 @@ pub enum SealOutcome {
 impl SealOutcome {
     /// The reconciled sealed facts, whichever path produced them.
     #[must_use]
-    pub const fn facts(&self) -> &SegmentFacts {
+    pub fn facts(&self) -> &SegmentFacts {
         match self {
-            Self::Promoted { facts, .. } => facts,
+            Self::Promoted { facts, .. } => facts.as_ref(),
             Self::Rebuilt(load) => load.facts(),
         }
     }
@@ -884,9 +884,9 @@ pub fn reconcile_seal<R: ReadAt>(
         && let Some(promoted) =
             SegmentFacts::try_promote_from_parts(sealed_unit, sealed_context, &parts, bounds)?
     {
-        let persist_error = store.publish(&promoted, bounds).err();
+        let (facts, persist_error) = store.admit_publish_or_fallback(promoted, bounds)?;
         return Ok(SealOutcome::Promoted {
-            facts: promoted,
+            facts,
             persist_error,
         });
     }
@@ -1840,6 +1840,15 @@ mod tests {
             Some(PersistError::PermissionDenied)
         );
         assert_eq!(outcome.facts().observations(), rebuilt.observations());
+        assert_eq!(store.fallback_stats().resident_entries, 1);
+        let fallback = store
+            .load_or_build(&sealed_unit, &context, &LIMIT)
+            .expect("promoted fallback load");
+        assert_eq!(fallback.origin(), super::super::FactOrigin::FallbackHit);
+        assert_eq!(
+            fallback.pgm_body_read_stats(),
+            crate::PgmBodyReadStats::default()
+        );
     }
 
     #[test]

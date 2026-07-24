@@ -86,6 +86,18 @@ files. A missing or rejected candidate triggers bounded extraction from PGM;
 the store then publishes the rebuilt facts under their content key. Persistence
 failures remain visible alongside the freshly extracted facts.
 
+Persistent files remain primary. If canonical encoding and full admission
+succeed but publication fails for a recoverable cache/storage reason,
+`FactStore` may retain the immutable `Arc<SegmentFacts>` in a process-local
+fallback LRU. Its complete key combines `FactKey` with sealed lineage, and each
+lookup still tries durable storage first. The default budgets are 24
+segment-hours and 64 MiB of canonical fact bytes; configuration is capped at
+744 segment-hours and 256 MiB. Duration rounds up to whole hours, with one hour
+charged for a point, empty, or unknown interval. Entries that exceed either
+budget are returned to the caller but not retained. `FallbackStats` reports
+hits, misses, inserts, evictions, oversized entries, publication-failure
+offers, and exact residency.
+
 ## Bounds and failures
 
 Catalogs are capped at 64 MiB. Registry limits cap each section at 8 MiB,

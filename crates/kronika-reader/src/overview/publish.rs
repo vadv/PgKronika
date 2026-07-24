@@ -6,9 +6,12 @@
 
 use std::fs::File;
 use std::io::{self, Write as _};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use kronika_analytics::overview::SegmentIdentity;
 use kronika_format::ReadAt;
 use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags, RenameFlags};
 
@@ -16,6 +19,7 @@ use super::container::{CacheReadError, FactReadStats, HeaderIdentity};
 use super::descriptors::CatalogEntryDescriptor;
 use super::factkey::{FactKey, FileKind, placement};
 use super::facts::{BuildError, SegmentContext, SegmentFacts};
+use super::fallback::{FallbackConfig, FallbackFactKey, FallbackFactLru, FallbackStats};
 use super::limits::Bounds;
 use crate::unit::{PgmBodyReadStats, PgmUnit};
 
@@ -86,6 +90,8 @@ pub enum CacheRebuildReason {
 pub enum FactOrigin {
     /// A committed fact file served the request.
     CacheHit,
+    /// A fully admitted in-memory fallback served the request.
+    FallbackHit,
     /// PGM section bodies were decoded.
     Rebuilt,
 }
@@ -93,7 +99,7 @@ pub enum FactOrigin {
 /// Facts with bounded read and persistence diagnostics.
 #[derive(Debug)]
 pub struct FactLoad {
-    facts: SegmentFacts,
+    facts: Arc<SegmentFacts>,
     origin: FactOrigin,
     rebuild_reason: Option<CacheRebuildReason>,
     persist_error: Option<PersistError>,
@@ -104,23 +110,35 @@ pub struct FactLoad {
 impl FactLoad {
     /// Loaded canonical facts.
     #[must_use]
-    pub const fn facts(&self) -> &SegmentFacts {
-        &self.facts
+    pub fn facts(&self) -> &SegmentFacts {
+        self.facts.as_ref()
+    }
+
+    /// Shares the admitted immutable facts without copying their payloads.
+    #[must_use]
+    pub fn shared_facts(&self) -> Arc<SegmentFacts> {
+        Arc::clone(&self.facts)
     }
 
     /// Consumes the diagnostic wrapper.
     #[must_use]
     pub fn into_facts(self) -> SegmentFacts {
+        Arc::unwrap_or_clone(self.facts)
+    }
+
+    /// Consumes the diagnostic wrapper without copying admitted payloads.
+    #[must_use]
+    pub fn into_shared_facts(self) -> Arc<SegmentFacts> {
         self.facts
     }
 
-    /// Cache hit or source rebuild.
+    /// Durable hit, fallback hit, or source rebuild.
     #[must_use]
     pub const fn origin(&self) -> FactOrigin {
         self.origin
     }
 
-    /// Cache rejection that preceded a rebuild.
+    /// Durable candidate rejection that preceded fallback lookup or rebuild.
     #[must_use]
     pub const fn rebuild_reason(&self) -> Option<CacheRebuildReason> {
         self.rebuild_reason
@@ -149,14 +167,25 @@ impl FactLoad {
 #[derive(Debug, Clone)]
 pub struct FactStore {
     cache_root: PathBuf,
+    fallback: Arc<Mutex<FallbackFactLru>>,
 }
 
 impl FactStore {
     /// Creates a fact store under an operator-trusted cache root.
     #[must_use]
     pub fn new(cache_root: impl Into<PathBuf>) -> Self {
+        Self::with_fallback_config(cache_root, FallbackConfig::default())
+    }
+
+    /// Creates a fact store with validated process-local fallback budgets.
+    #[must_use]
+    pub fn with_fallback_config(
+        cache_root: impl Into<PathBuf>,
+        fallback_config: FallbackConfig,
+    ) -> Self {
         Self {
             cache_root: cache_root.into(),
+            fallback: Arc::new(Mutex::new(FallbackFactLru::new(fallback_config))),
         }
     }
 
@@ -164,6 +193,12 @@ impl FactStore {
     #[must_use]
     pub fn cache_root(&self) -> &Path {
         &self.cache_root
+    }
+
+    /// Returns fallback lifetime counters and exact current residency.
+    #[must_use]
+    pub fn fallback_stats(&self) -> FallbackStats {
+        self.with_fallback(|fallback| fallback.stats())
     }
 
     /// Loads a committed fact file or extracts facts from the source PGM.
@@ -182,19 +217,38 @@ impl FactStore {
         bounds: &Bounds,
     ) -> Result<FactLoad, BuildError> {
         match self.read_with_stats(unit, context, bounds) {
-            Ok((facts, stats)) => Ok(FactLoad {
-                facts,
-                origin: FactOrigin::CacheHit,
-                rebuild_reason: None,
-                persist_error: None,
-                fact_read_stats: Some(stats),
-                pgm_body_read_stats: PgmBodyReadStats::default(),
-            }),
+            Ok((facts, stats)) => {
+                let facts = Arc::new(facts);
+                self.discard_fallback_for(facts.identity());
+                Ok(FactLoad {
+                    facts,
+                    origin: FactOrigin::CacheHit,
+                    rebuild_reason: None,
+                    persist_error: None,
+                    fact_read_stats: Some(stats),
+                    pgm_body_read_stats: PgmBodyReadStats::default(),
+                })
+            }
             Err(cache_error) => {
                 let rebuild_reason = cache_rebuild_reason(&cache_error);
+                let (identity, lineage) = SegmentFacts::provenance(unit, context)?;
+                let fallback_key = FallbackFactKey::for_expected(&identity, &lineage);
+                if let Some(facts) =
+                    self.with_fallback(|fallback| fallback.get(&fallback_key, *bounds))
+                {
+                    return Ok(FactLoad {
+                        facts,
+                        origin: FactOrigin::FallbackHit,
+                        rebuild_reason: Some(rebuild_reason),
+                        persist_error: None,
+                        fact_read_stats: None,
+                        pgm_body_read_stats: PgmBodyReadStats::default(),
+                    });
+                }
+
                 let (facts, pgm_body_read_stats) =
                     SegmentFacts::extract_with_stats(unit, context, bounds)?;
-                let persist_error = self.publish(&facts, bounds).err();
+                let (facts, persist_error) = self.admit_publish_or_fallback(facts, bounds)?;
                 Ok(FactLoad {
                     facts,
                     origin: FactOrigin::Rebuilt,
@@ -233,6 +287,71 @@ impl FactStore {
     ///
     /// Returns [`PersistError`] when the cache cannot be mutated safely.
     pub fn publish(&self, facts: &SegmentFacts, bounds: &Bounds) -> Result<PathBuf, PersistError> {
+        let bytes = facts
+            .encode(bounds)
+            .map_err(|_error| PersistError::InvalidFacts)?;
+        let path = self.publish_encoded(facts, &bytes, bounds)?;
+        self.discard_fallback_for(facts.identity());
+        Ok(path)
+    }
+
+    pub(super) fn admit_publish_or_fallback(
+        &self,
+        facts: SegmentFacts,
+        bounds: &Bounds,
+    ) -> Result<(Arc<SegmentFacts>, Option<PersistError>), BuildError> {
+        let bytes = facts.encode(bounds).map_err(BuildError::from)?;
+        let canonical_byte_len = u64::try_from(bytes.len())
+            .map_err(|_error| BuildError::Overflow)
+            .and_then(|length| NonZeroU64::new(length).ok_or(BuildError::Internal))?;
+        let expected_catalog = facts.catalog_descriptors();
+        let admitted = Arc::new(
+            SegmentFacts::from_bytes(
+                &bytes,
+                facts.identity(),
+                facts.lineage(),
+                &expected_catalog,
+                bounds,
+            )
+            .map_err(BuildError::from)?,
+        );
+
+        let persist_error = self.publish_encoded(&admitted, &bytes, bounds).err();
+        let durable_key = FactKey::for_identity(admitted.identity(), FileKind::SegmentFacts);
+        match persist_error {
+            None => self.discard_fallback(durable_key),
+            Some(error) if error.is_fallback_eligible() => {
+                self.with_fallback(|fallback| {
+                    fallback.insert_after_publication_failure(
+                        Arc::clone(&admitted),
+                        canonical_byte_len,
+                        *bounds,
+                    );
+                });
+
+                if self
+                    .read_expected_with_stats(
+                        admitted.identity(),
+                        admitted.lineage(),
+                        &expected_catalog,
+                        bounds,
+                    )
+                    .is_ok()
+                {
+                    self.discard_fallback(durable_key);
+                }
+            }
+            Some(_error) => {}
+        }
+        Ok((admitted, persist_error))
+    }
+
+    fn publish_encoded(
+        &self,
+        facts: &SegmentFacts,
+        bytes: &[u8],
+        bounds: &Bounds,
+    ) -> Result<PathBuf, PersistError> {
         let key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
         let final_path = placement(&self.cache_root, facts.identity().source_scope_id, &key);
         let directory = self
@@ -274,12 +393,8 @@ impl FactStore {
             quarantine(&directory, &final_name, &key)?;
         }
 
-        let bytes = facts
-            .encode(bounds)
-            .map_err(|_error| PersistError::InvalidFacts)?;
         let (temp_name, temp_file) = create_temp(&directory, &key)?;
-        let write_result = write_synced(temp_file, &bytes);
-        drop(bytes);
+        let write_result = write_synced(temp_file, bytes);
         if let Err(error) = write_result {
             unlink_ignoring_missing(&directory, &temp_name);
             return Err(error);
@@ -306,19 +421,45 @@ impl FactStore {
     ) -> Result<(SegmentFacts, FactReadStats), CacheReadError> {
         let (identity, lineage) =
             SegmentFacts::provenance(unit, context).map_err(|_error| CacheReadError::Corrupt)?;
-        let key = FactKey::for_identity(&identity, FileKind::SegmentFacts);
-        let directory = self
-            .open_key_directory(&identity, &key, false)
-            .map_err(CacheReadError::Io)?;
-        let final_name = format!("{}.ovf", key.hex());
-        let file = open_regular_at(&directory, &final_name).map_err(CacheReadError::Io)?;
         let expected_catalog: Vec<_> = unit
             .catalog()
             .entries
             .iter()
             .map(CatalogEntryDescriptor::of)
             .collect();
-        SegmentFacts::from_reader_with_stats(file, &identity, &lineage, &expected_catalog, bounds)
+        self.read_expected_with_stats(&identity, &lineage, &expected_catalog, bounds)
+    }
+
+    fn read_expected_with_stats(
+        &self,
+        identity: &HeaderIdentity,
+        lineage: &SegmentIdentity,
+        expected_catalog: &[CatalogEntryDescriptor],
+        bounds: &Bounds,
+    ) -> Result<(SegmentFacts, FactReadStats), CacheReadError> {
+        let key = FactKey::for_identity(identity, FileKind::SegmentFacts);
+        let directory = self
+            .open_key_directory(identity, &key, false)
+            .map_err(CacheReadError::Io)?;
+        let final_name = format!("{}.ovf", key.hex());
+        let file = open_regular_at(&directory, &final_name).map_err(CacheReadError::Io)?;
+        SegmentFacts::from_reader_with_stats(file, identity, lineage, expected_catalog, bounds)
+    }
+
+    fn discard_fallback_for(&self, identity: &HeaderIdentity) {
+        self.discard_fallback(FactKey::for_identity(identity, FileKind::SegmentFacts));
+    }
+
+    fn discard_fallback(&self, durable_key: FactKey) {
+        self.with_fallback(|fallback| fallback.discard_durable(durable_key));
+    }
+
+    fn with_fallback<T>(&self, operation: impl FnOnce(&mut FallbackFactLru) -> T) -> T {
+        let mut fallback = match self.fallback.lock() {
+            Ok(fallback) => fallback,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        operation(&mut fallback)
     }
 
     fn open_key_directory(
@@ -406,12 +547,23 @@ fn open_child_directory(parent: &File, name: &str, create: bool) -> Result<File,
             Err(error) => return Err(errno_to_io(error)),
         }
     }
-    let child = open_file_at(
+    let child = match open_file_at(
         parent,
         name,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
+    ) {
+        Ok(child) => child,
+        Err(error)
+            if error.raw_os_error().is_some_and(|code| {
+                code == rustix::io::Errno::LOOP.raw_os_error()
+                    || code == rustix::io::Errno::NOTDIR.raw_os_error()
+            }) =>
+        {
+            return Err(errno_to_io(rustix::io::Errno::LOOP));
+        }
+        Err(error) => return Err(error),
+    };
     if create {
         rustix::fs::fchmod(&child, DIR_MODE).map_err(errno_to_io)?;
     }
@@ -527,6 +679,18 @@ fn cache_rebuild_reason(error: &CacheReadError) -> CacheRebuildReason {
 }
 
 impl PersistError {
+    const fn is_fallback_eligible(self) -> bool {
+        matches!(
+            self,
+            Self::ReadOnlyFilesystem
+                | Self::PermissionDenied
+                | Self::NoSpace
+                | Self::QuotaExceeded
+                | Self::Busy
+                | Self::Io
+        )
+    }
+
     fn from_errno(error: rustix::io::Errno) -> Self {
         if error == rustix::io::Errno::ROFS {
             Self::ReadOnlyFilesystem
@@ -589,10 +753,14 @@ mod tests {
     use super::*;
 
     fn context() -> SegmentContext {
+        context_for(b"store-a", 0x44)
+    }
+
+    fn context_for(namespace: &[u8], locator: u8) -> SegmentContext {
         SegmentContext::new(
-            b"store-a".to_vec(),
+            namespace.to_vec(),
             NamingContractId([0x33; 16]),
-            SegmentLocator([0x44; 32]),
+            SegmentLocator([locator; 32]),
         )
         .expect("valid context")
     }
@@ -673,6 +841,14 @@ mod tests {
         assert_eq!(warm.pgm_body_read_stats(), PgmBodyReadStats::default());
         assert!(warm.fact_read_stats().is_some());
         assert_eq!(warm.facts().observations(), cold.facts().observations());
+        assert_eq!(
+            store.fallback_stats(),
+            FallbackStats {
+                misses: 1,
+                ..FallbackStats::default()
+            },
+            "a durable hit neither consults nor duplicates the fallback"
+        );
     }
 
     #[test]
@@ -776,6 +952,8 @@ mod tests {
                 .count(),
             0
         );
+        assert_eq!(store.fallback_stats().inserts, 0);
+        assert_eq!(store.fallback_stats().resident_entries, 0);
     }
 
     #[test]
@@ -818,6 +996,44 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_publication_failures_leave_one_correct_fallback_entry() {
+        let directory = TempDir::new().expect("cache parent");
+        let cache_root = directory.path().join("not-a-directory");
+        std::fs::write(&cache_root, b"blocks durable publication").expect("write cache blocker");
+        let store = Arc::new(FactStore::new(cache_root.as_path()));
+        let bytes = Arc::new(lifecycle_pgm(7));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _worker in 0..2 {
+            let store = Arc::clone(&store);
+            let bytes = Arc::clone(&bytes);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let unit = unit(&bytes);
+                barrier.wait();
+                store.load_or_build(&unit, &context(), &LIMIT)
+            }));
+        }
+        barrier.wait();
+
+        for worker in workers {
+            let loaded = worker.join().expect("worker").expect("load");
+            assert_eq!(loaded.facts().observations().len(), 2);
+            assert!(matches!(
+                loaded.origin(),
+                FactOrigin::Rebuilt | FactOrigin::FallbackHit
+            ));
+        }
+        let stats = store.fallback_stats();
+        assert_eq!(stats.resident_entries, 1);
+        assert_eq!(
+            stats.hits.checked_add(stats.publication_failure_fallbacks),
+            Some(2)
+        );
+        assert_eq!(stats.inserts, stats.publication_failure_fallbacks);
+    }
+
+    #[test]
     fn stale_temp_does_not_block_publication() {
         let directory = TempDir::new().expect("cache directory");
         let store = FactStore::new(directory.path());
@@ -842,15 +1058,208 @@ mod tests {
     }
 
     #[test]
-    fn persistence_failure_does_not_hide_computed_facts() {
-        let store = FactStore::new("/proc/pgkronika-overview-cache-test");
+    fn publication_failure_returns_fresh_facts_then_serves_the_fallback() {
+        let directory = TempDir::new().expect("cache parent");
+        let cache_root = directory.path().join("not-a-directory");
+        std::fs::write(&cache_root, b"blocks durable publication").expect("write cache blocker");
+        let store = FactStore::new(cache_root.as_path());
         let bytes = lifecycle_pgm(7);
-        let loaded = store
+        let fresh = store
             .load_or_build(&unit(&bytes), &context(), &LIMIT)
             .expect("source build");
-        assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
-        assert!(loaded.persist_error().is_some());
-        assert_eq!(loaded.facts().observations().len(), 2);
+        assert_eq!(fresh.origin(), FactOrigin::Rebuilt);
+        assert_eq!(fresh.persist_error(), Some(PersistError::Io));
+        assert_eq!(fresh.facts().observations().len(), 2);
+        let canonical_bytes = u64::try_from(
+            fresh
+                .facts()
+                .encode(&LIMIT)
+                .expect("encode admitted facts")
+                .len(),
+        )
+        .expect("canonical length fits");
+        assert_eq!(
+            store.fallback_stats(),
+            FallbackStats {
+                misses: 1,
+                inserts: 1,
+                publication_failure_fallbacks: 1,
+                resident_entries: 1,
+                resident_segment_hours: 1,
+                resident_bytes: canonical_bytes,
+                ..FallbackStats::default()
+            }
+        );
+
+        let fallback = store
+            .load_or_build(&unit(&bytes), &context(), &LIMIT)
+            .expect("fallback load");
+        assert_eq!(fallback.origin(), FactOrigin::FallbackHit);
+        assert_eq!(fallback.pgm_body_read_stats(), PgmBodyReadStats::default());
+        assert!(Arc::ptr_eq(&fresh.shared_facts(), &fallback.shared_facts()));
+        assert_eq!(store.fallback_stats().hits, 1);
+
+        std::fs::remove_file(&cache_root).expect("remove cache blocker");
+        std::fs::create_dir(&cache_root).expect("create durable cache root");
+        store
+            .publish(fresh.facts(), &LIMIT)
+            .expect("publish admitted facts");
+        let before_durable = store.fallback_stats();
+        assert_eq!(before_durable.resident_entries, 0);
+        let durable = store
+            .load_or_build(&unit(&bytes), &context(), &LIMIT)
+            .expect("durable load");
+        assert_eq!(durable.origin(), FactOrigin::CacheHit);
+        assert_eq!(
+            store.fallback_stats(),
+            before_durable,
+            "durable lookup is preferred without a fallback lookup"
+        );
+    }
+
+    #[test]
+    fn fallback_identity_separates_locator_scope_and_source() {
+        let directory = TempDir::new().expect("cache parent");
+        let cache_root = directory.path().join("not-a-directory");
+        std::fs::write(&cache_root, b"blocks durable publication").expect("write cache blocker");
+        let store = FactStore::new(cache_root.as_path());
+        let bytes = lifecycle_pgm(7);
+
+        let first = store
+            .load_or_build(&unit(&bytes), &context_for(b"store-a", 1), &LIMIT)
+            .expect("first build");
+        let other_locator = store
+            .load_or_build(&unit(&bytes), &context_for(b"store-a", 2), &LIMIT)
+            .expect("other locator build");
+        let other_scope = store
+            .load_or_build(&unit(&bytes), &context_for(b"store-b", 1), &LIMIT)
+            .expect("other scope build");
+        let other_source_bytes = lifecycle_pgm(8);
+        let other_source = store
+            .load_or_build(
+                &unit(&other_source_bytes),
+                &context_for(b"store-a", 1),
+                &LIMIT,
+            )
+            .expect("other source build");
+
+        for loaded in [&first, &other_locator, &other_scope, &other_source] {
+            assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
+            assert!(loaded.pgm_body_read_stats().read_calls > 0);
+        }
+        let stats = store.fallback_stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 4);
+        assert_eq!(stats.inserts, 4);
+        assert_eq!(stats.resident_entries, 4);
+    }
+
+    #[test]
+    fn tighter_admission_does_not_reuse_a_looser_fallback_entry() {
+        let directory = TempDir::new().expect("cache parent");
+        let cache_root = directory.path().join("not-a-directory");
+        std::fs::write(&cache_root, b"blocks durable publication").expect("write cache blocker");
+        let store = FactStore::new(cache_root.as_path());
+        let bytes = lifecycle_pgm(7);
+        store
+            .load_or_build(&unit(&bytes), &context(), &LIMIT)
+            .expect("populate fallback");
+        let tighter = Bounds {
+            items_per_block: 1,
+            ..LIMIT
+        };
+
+        assert!(matches!(
+            store.load_or_build(&unit(&bytes), &context(), &tighter),
+            Err(BuildError::LimitExceeded)
+        ));
+        let stats = store.fallback_stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.inserts, 1);
+        assert_eq!(stats.resident_entries, 1);
+    }
+
+    #[test]
+    fn production_fallback_enforces_lru_hour_byte_and_oversized_budgets() {
+        let hours_parent = TempDir::new().expect("hours cache parent");
+        let hours_root = hours_parent.path().join("not-a-directory");
+        std::fs::write(&hours_root, b"blocks durable publication").expect("write hours blocker");
+        let hour_store = FactStore::with_fallback_config(
+            hours_root.as_path(),
+            FallbackConfig::new(2, crate::MAX_FALLBACK_BYTES).expect("hour config"),
+        );
+        let sources = [lifecycle_pgm(1), lifecycle_pgm(2), lifecycle_pgm(3)];
+        for bytes in &sources[..2] {
+            hour_store
+                .load_or_build(&unit(bytes), &context(), &LIMIT)
+                .expect("populate hour fallback");
+        }
+        assert_eq!(
+            hour_store
+                .load_or_build(&unit(&sources[0]), &context(), &LIMIT)
+                .expect("refresh recency")
+                .origin(),
+            FactOrigin::FallbackHit
+        );
+        hour_store
+            .load_or_build(&unit(&sources[2]), &context(), &LIMIT)
+            .expect("evict least recent hour");
+        assert_eq!(
+            hour_store
+                .load_or_build(&unit(&sources[0]), &context(), &LIMIT)
+                .expect("recent entry remains")
+                .origin(),
+            FactOrigin::FallbackHit
+        );
+        assert_eq!(
+            hour_store
+                .load_or_build(&unit(&sources[1]), &context(), &LIMIT)
+                .expect("evicted hour rebuilds")
+                .origin(),
+            FactOrigin::Rebuilt
+        );
+        assert!(hour_store.fallback_stats().evictions > 0);
+        assert_eq!(hour_store.fallback_stats().resident_segment_hours, 2);
+
+        let encoded_len = u64::try_from(
+            built(&sources[0])
+                .encode(&LIMIT)
+                .expect("encode byte-budget fact")
+                .len(),
+        )
+        .expect("encoded length fits");
+        let two_entries = encoded_len.checked_mul(2).expect("two facts fit");
+        let bytes_parent = TempDir::new().expect("bytes cache parent");
+        let bytes_root = bytes_parent.path().join("not-a-directory");
+        std::fs::write(&bytes_root, b"blocks durable publication").expect("write bytes blocker");
+        let byte_store = FactStore::with_fallback_config(
+            bytes_root.as_path(),
+            FallbackConfig::new(10, two_entries).expect("byte config"),
+        );
+        for bytes in &sources {
+            byte_store
+                .load_or_build(&unit(bytes), &context(), &LIMIT)
+                .expect("populate byte fallback");
+        }
+        let byte_stats = byte_store.fallback_stats();
+        assert!(byte_stats.evictions > 0);
+        assert!(byte_stats.resident_bytes <= two_entries);
+
+        let oversized_parent = TempDir::new().expect("oversized cache parent");
+        let oversized_root = oversized_parent.path().join("not-a-directory");
+        std::fs::write(&oversized_root, b"blocks durable publication")
+            .expect("write oversized blocker");
+        let oversized_store = FactStore::with_fallback_config(
+            oversized_root.as_path(),
+            FallbackConfig::new(10, encoded_len - 1).expect("oversized config"),
+        );
+        let returned = oversized_store
+            .load_or_build(&unit(&sources[0]), &context(), &LIMIT)
+            .expect("oversized facts remain available");
+        assert_eq!(returned.origin(), FactOrigin::Rebuilt);
+        assert_eq!(oversized_store.fallback_stats().oversized, 1);
+        assert_eq!(oversized_store.fallback_stats().resident_entries, 0);
     }
 
     #[test]
@@ -868,6 +1277,8 @@ mod tests {
             store.load_or_build(&corrupt, &context(), &LIMIT),
             Err(BuildError::Source(_))
         ));
+        assert_eq!(store.fallback_stats().inserts, 0);
+        assert_eq!(store.fallback_stats().resident_entries, 0);
     }
 
     #[test]

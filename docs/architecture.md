@@ -86,6 +86,13 @@ oracle interface. `kronika-reader::overview` извлекает факты из 
 fold и сверяет seal handoff. Web пока не публикует live view в production
 timeline и не предоставляет overview HTTP endpoints.
 
+Версионированный файл фактов остаётся primary cache. После успешных extraction,
+canonical encoding и повторной admission-проверки recoverable publication
+failure может оставить `Arc<SegmentFacts>` в process-local LRU, ограниченном
+одновременно segment-hours и canonical bytes. Durable lookup всегда выполняется
+раньше fallback lookup; ключ включает полный `FactKey` и sealed lineage.
+Oversized entry возвращается текущему запросу без сохранения.
+
 Web держит в общей структуре metadata snapshot, а не декодированные section
 bodies. Каждый handler клонирует snapshot metadata и выполняет синхронное
 чтение на своей копии. Фоновый refresh публикует новую копию раз в секунду.

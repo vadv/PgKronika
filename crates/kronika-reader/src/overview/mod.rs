@@ -19,6 +19,7 @@ mod dictionary;
 mod event_extract;
 mod factkey;
 mod facts;
+mod fallback;
 mod limits;
 mod live;
 mod observations;
@@ -44,6 +45,10 @@ pub use dictionary::{
 };
 pub use factkey::{FactKey, FileKind, placement, placement_dir};
 pub use facts::{BuildError, SegmentContext, SegmentContextError, SegmentFacts, SourceError};
+pub use fallback::{
+    DEFAULT_FALLBACK_BYTES, DEFAULT_FALLBACK_SEGMENT_HOURS, FallbackConfig, FallbackConfigError,
+    FallbackStats, MAX_FALLBACK_BYTES, MAX_FALLBACK_SEGMENT_HOURS,
+};
 pub use limits::{Bounds, LIMIT};
 pub use live::{
     FoldEffect, LiveBuilder, LiveConfigError, LiveFoldError, LiveState, LiveView, SealOutcome,

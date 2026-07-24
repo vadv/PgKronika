@@ -84,6 +84,18 @@ source cursor отклоняется, а не используется как of
 ограниченно извлекает факты из PGM, после чего store публикует их по content
 key. Ошибка сохранения остаётся видна вместе со свежими извлечёнными фактами.
 
+Постоянные файлы остаются основным источником кэша. Если canonical encoding и
+полная admission-проверка успешны, но publication завершилась восстанавливаемой
+ошибкой cache/storage, `FactStore` может сохранить неизменяемый
+`Arc<SegmentFacts>` в process-local fallback LRU. Полный ключ объединяет
+`FactKey` и sealed lineage, а каждое чтение сначала проверяет durable storage.
+По умолчанию доступны 24 segment-hours и 64 MiB canonical fact bytes; верхние
+границы конфигурации — 744 segment-hours и 256 MiB. Длительность округляется
+вверх до целого часа, а точечный, пустой или неизвестный интервал занимает один
+час. Запись, которая сама превышает любой предел, возвращается вызывающему коду,
+но не сохраняется. `FallbackStats` сообщает hits, misses, inserts, evictions,
+oversized, publication-failure offers и точную текущую residency.
+
 ## Границы и отказы
 
 Каталог ограничен 64 MiB. Registry принимает не более 8 MiB, 65 536 rows и 16
