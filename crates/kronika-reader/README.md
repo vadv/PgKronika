@@ -13,12 +13,12 @@ in-memory active part. It opens the end catalog first, validates format version
 and bounds, reads section bytes on demand, checks CRC, then invokes the registry
 codec. `Segment` is the sealed-file convenience wrapper.
 
-`LocalDirSnapshot` lists sealed units and scans `active.parts` sequentially
-through `kronika-store`; those operations do not capture one atomic combined
-view. Sealed units come first, followed by live parts. A live part is suppressed
-only when its catalog exactly matches a sealed unit; overlapping time ranges do
-not prove identity. Store warnings and journal damage remain available to
-callers.
+`kronika-store::LocalDir` scans `active.parts` first and then lists sealed units;
+those operations do not capture one atomic combined view. `LocalDirSnapshot`
+returns the observed sealed units first, followed by live parts. A live part is
+suppressed only when its catalog exactly matches a sealed unit; overlapping
+time ranges do not prove identity. Store warnings and journal damage remain
+available to callers.
 
 A writer may seal or reset `active.parts` after a snapshot captured a part
 reference. This yields `ReadError::StaleSnapshot`. Query helpers refresh a

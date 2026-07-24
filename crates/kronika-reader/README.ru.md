@@ -13,11 +13,12 @@
 читает тело по требованию, сверяет CRC и только затем вызывает registry codec.
 `Segment` — удобная оболочка для готового файла.
 
-`LocalDirSnapshot` последовательно получает список sealed units и сканирует
-`active.parts` через `kronika-store`; эти операции не образуют единый атомарный
-снимок. Сначала идут sealed units, затем live parts. Live part скрывается только
-при точном совпадении каталога с sealed unit; пересечения по времени
-недостаточно. Store warnings и damage regions доступны вызывающему коду.
+`kronika-store::LocalDir` сначала сканирует `active.parts`, затем получает список
+sealed units; эти операции не образуют единый атомарный снимок.
+`LocalDirSnapshot` возвращает наблюдённые sealed units перед live parts. Live
+part скрывается только при точном совпадении каталога с sealed unit; пересечения
+по времени недостаточно. Store warnings и damage regions доступны вызывающему
+коду.
 
 После создания snapshot writer может запечатать или сбросить `active.parts`.
 Изменившаяся ссылка возвращает `ReadError::StaleSnapshot`. Query helpers
