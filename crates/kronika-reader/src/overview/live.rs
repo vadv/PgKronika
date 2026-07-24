@@ -1071,6 +1071,15 @@ mod tests {
     }
 
     fn seal_sections(sections: &[(u32, u32, Vec<u8>)], min_ts: i64, max_ts: i64) -> Vec<u8> {
+        seal_sections_for_source(sections, min_ts, max_ts, 7)
+    }
+
+    fn seal_sections_for_source(
+        sections: &[(u32, u32, Vec<u8>)],
+        min_ts: i64,
+        max_ts: i64,
+        source_id: u64,
+    ) -> Vec<u8> {
         let inputs: Vec<_> = sections
             .iter()
             .map(|(type_id, rows, body)| SectionInput {
@@ -1084,7 +1093,7 @@ mod tests {
             PartMeta {
                 min_ts,
                 max_ts,
-                source_id: 7,
+                source_id,
             },
         )
     }
@@ -1910,9 +1919,9 @@ mod tests {
 
     #[test]
     fn source_zero_parts_do_not_cross_store_namespaces() {
-        let (dictionary_bytes, _sections) = dictionary_only_part();
-        let sealed_unit =
-            PgmUnit::open(dictionary_bytes.as_slice()).expect("open sealed dictionary");
+        let (dictionary_bytes, sections) = dictionary_only_part();
+        let sealed_bytes = seal_sections_for_source(&sections, 0, 0, 0);
+        let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed dictionary");
         let mut builder =
             LiveBuilder::new(b"another-store".to_vec(), LIMIT).expect("valid live builder");
         fold_bytes(&mut builder, &[dictionary_bytes.as_slice()]);
@@ -1930,6 +1939,10 @@ mod tests {
         assert!(
             !outcome.was_promoted(),
             "source zero still carries the store namespace scope"
+        );
+        assert!(
+            outcome.persist_error().is_none(),
+            "an empty timestamp envelope remains durably admissible"
         );
     }
 
