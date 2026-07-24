@@ -4,9 +4,9 @@
 //! Continuous resource pressure needs gauge and counter factors, which the
 //! current fact schema does not yet retain, so every bucket's continuous and
 //! overall numeric scores are `None`: a missing required domain never becomes a
-//! false green. Trusted floor observations — a crash, a `PANIC`, a disk-full or
-//! an integrity error — still drive a bucket to `Critical` through the health
-//! decision table.
+//! false green. Only structured evidence that satisfies the floor policy can
+//! drive a bucket to `Critical`; parsed `PostgreSQL` log text remains notable
+//! evidence but is not an outage, mount, or corruption proof.
 //!
 //! The formula lives here, not in the web layer: the caller buckets a range,
 //! calls [`health_line`], and serializes the returned points.
@@ -18,12 +18,11 @@ use super::coverage::{
 };
 use super::health::{
     DomainId, FactorCoverage, FactorId, FloorClass, FloorEvidence, HealthEvaluationError,
-    HealthLimits, HealthPoint, HealthPolicy, InvalidFactorProfile, InvalidHealthPolicy,
-    RequiredFactorProfile,
+    HealthLimits, HealthPoint, HealthPolicy, HealthResource, InvalidFactorProfile,
+    InvalidHealthPolicy, RequiredFactorProfile,
 };
-use super::observation::{EventObservation, FactId, ObservationPayload};
+use super::observation::{EventObservation, EvidenceQuality, FactId, ObservationPayload};
 
-const SQLSTATE_DISK_FULL: SqlState = SqlState(*b"53100");
 const SQLSTATE_DATA_CORRUPTED: SqlState = SqlState(*b"XX001");
 const SQLSTATE_INDEX_CORRUPTED: SqlState = SqlState(*b"XX002");
 
@@ -82,26 +81,38 @@ pub fn overview_health_policy() -> Result<HealthPolicy, HealthConfigError> {
 
 /// The trusted floor class of an observation, if it is one.
 ///
-/// Only evidence that stands on its own is a floor: a crash or `PANIC` is an
-/// availability floor, a disk-full error a storage floor, an `XX001`/`XX002`
-/// error an integrity floor. An out-of-memory error is not a floor without
-/// kernel OOM-kill evidence, which events do not carry.
+/// A lifecycle line does not prove postmaster unavailability. Parsed or
+/// heuristic error text also cannot prove a floor. A structured `PANIC` can
+/// prove an availability floor and a structured `XX001`/`XX002` can prove an
+/// integrity floor. `53100` remains non-floor evidence without a mount-specific
+/// capacity fact.
 #[must_use]
 pub fn observation_floor(observation: &EventObservation) -> Option<FloorClass> {
     match observation.payload() {
-        ObservationPayload::ChildProcessCrash(_)
-        | ObservationPayload::ChildSignalTermination(_) => Some(FloorClass::Availability),
-        ObservationPayload::ErrorGroup(payload) => error_floor(payload.severity, payload.sqlstate),
+        ObservationPayload::ErrorGroup(payload) => error_floor(
+            observation.evidence_quality(),
+            payload.severity,
+            payload.sqlstate,
+        ),
         _ => None,
     }
 }
 
-fn error_floor(severity: Severity, sqlstate: Option<SqlState>) -> Option<FloorClass> {
+fn error_floor(
+    evidence_quality: EvidenceQuality,
+    severity: Severity,
+    sqlstate: Option<SqlState>,
+) -> Option<FloorClass> {
+    if !matches!(
+        evidence_quality,
+        EvidenceQuality::Structured | EvidenceQuality::DerivedExact
+    ) {
+        return None;
+    }
     if severity == Severity::Panic {
         return Some(FloorClass::Availability);
     }
     match sqlstate {
-        Some(SQLSTATE_DISK_FULL) => Some(FloorClass::DiskFull),
         Some(SQLSTATE_DATA_CORRUPTED | SQLSTATE_INDEX_CORRUPTED) => Some(FloorClass::Integrity),
         _ => None,
     }
@@ -124,33 +135,54 @@ pub fn health_line(
     policy: &HealthPolicy,
 ) -> Result<Vec<HealthPoint>, HealthEvaluationError> {
     let step = i64::try_from(step_us.max(1)).unwrap_or(i64::MAX);
-    let mut points = Vec::new();
+    let mut buckets = Vec::new();
     let mut start = range.start_us();
     while start < range.end_us() {
+        if buckets.len() == OVERVIEW_HEALTH_LIMITS.max_downsample_points {
+            return Err(HealthEvaluationError::LimitExceeded(
+                HealthResource::DownsamplePoints,
+            ));
+        }
         let end = start.saturating_add(step).min(range.end_us());
         let Some(bucket) = CoverageSpan::new(start, end) else {
             break;
         };
-        let floors = bucket_floors(observations, start, end);
-        let coverage = vec![uncovered_required_coverage(bucket)];
-        points.push(policy.evaluate_cell(bucket, &[], coverage, floors)?);
+        buckets.push((bucket, Vec::new()));
         start = end;
     }
-    Ok(points)
-}
 
-fn bucket_floors(observations: &[EventObservation], start: i64, end: i64) -> Vec<FloorEvidence> {
-    observations
-        .iter()
-        .filter(|observation| {
-            let ts = observation.time().sort_ts_us;
-            ts >= start && ts < end
-        })
-        .filter_map(|observation| {
-            observation_floor(observation).map(|class| FloorEvidence {
+    for observation in observations {
+        let ts = observation.time().sort_ts_us;
+        if ts < range.start_us() || ts >= range.end_us() {
+            continue;
+        }
+        let relative = i128::from(ts) - i128::from(range.start_us());
+        let index = usize::try_from(relative / i128::from(step)).map_err(|_error| {
+            HealthEvaluationError::LimitExceeded(HealthResource::DownsamplePoints)
+        })?;
+        let Some((_, floors)) = buckets.get_mut(index) else {
+            return Err(HealthEvaluationError::LimitExceeded(
+                HealthResource::DownsamplePoints,
+            ));
+        };
+        if let Some(class) = observation_floor(observation) {
+            if floors.len() == OVERVIEW_HEALTH_LIMITS.max_floor_evidence {
+                return Err(HealthEvaluationError::LimitExceeded(
+                    HealthResource::FloorEvidence,
+                ));
+            }
+            floors.push(FloorEvidence {
                 class,
                 supporting_fact_id: FactId(observation.observation_id().0),
-            })
+            });
+        }
+    }
+
+    buckets
+        .into_iter()
+        .map(|(bucket, floors)| {
+            let coverage = vec![uncovered_required_coverage(bucket)];
+            policy.evaluate_cell(bucket, &[], coverage, floors)
         })
         .collect()
 }
@@ -184,7 +216,7 @@ mod tests {
     use super::super::health::HealthState;
     use super::*;
     use crate::overview::observation::{
-        DroppedFieldCount, ErrorGroupPayload, EvidenceQuality, LifecyclePayload, NamingContractId,
+        DroppedFieldCount, ErrorGroupPayload, LifecyclePayload, NamingContractId,
         ObservationProvenance, ObservationShape, ObservationTime, QualityFlags, SectionBodyId,
         SegmentIdentity, SegmentLocator, SourceScopeId, TimeQuality,
     };
@@ -215,7 +247,7 @@ mod tests {
         }
     }
 
-    fn panic(row: u32, ts: i64) -> EventObservation {
+    fn panic(row: u32, ts: i64, evidence_quality: EvidenceQuality) -> EventObservation {
         let payload = ErrorGroupPayload {
             severity: Severity::Panic,
             category: ErrorCategory::System,
@@ -243,7 +275,7 @@ mod tests {
             },
             1,
             ObservationPayload::ErrorGroup(Box::new(payload)),
-            EvidenceQuality::Parsed,
+            evidence_quality,
             QualityFlags::default(),
             None,
         )
@@ -279,7 +311,12 @@ mod tests {
         .expect("valid crash fixture")
     }
 
-    fn error(row: u32, ts: i64, sqlstate: [u8; 5]) -> EventObservation {
+    fn error(
+        row: u32,
+        ts: i64,
+        sqlstate: [u8; 5],
+        evidence_quality: EvidenceQuality,
+    ) -> EventObservation {
         let payload = ErrorGroupPayload {
             severity: Severity::Error,
             category: ErrorCategory::Resource,
@@ -307,7 +344,7 @@ mod tests {
             },
             1,
             ObservationPayload::ErrorGroup(Box::new(payload)),
-            EvidenceQuality::Parsed,
+            evidence_quality,
             QualityFlags::default(),
             None,
         )
@@ -315,25 +352,37 @@ mod tests {
     }
 
     #[test]
-    fn only_trusted_evidence_is_a_floor() {
+    fn parsed_log_evidence_and_child_termination_are_not_floors() {
         assert_eq!(
-            observation_floor(&panic(0, 1)),
+            observation_floor(&panic(0, 1, EvidenceQuality::Parsed)),
+            None
+        );
+        assert_eq!(observation_floor(&crash(0, 1)), None);
+        assert_eq!(
+            observation_floor(&error(0, 1, *b"53100", EvidenceQuality::Parsed)),
+            None
+        );
+        assert_eq!(
+            observation_floor(&error(0, 1, *b"XX001", EvidenceQuality::Parsed)),
+            None
+        );
+    }
+
+    #[test]
+    fn structured_panic_and_integrity_evidence_can_set_floors() {
+        assert_eq!(
+            observation_floor(&panic(0, 1, EvidenceQuality::Structured)),
             Some(FloorClass::Availability)
         );
         assert_eq!(
-            observation_floor(&crash(0, 1)),
-            Some(FloorClass::Availability)
-        );
-        assert_eq!(
-            observation_floor(&error(0, 1, *b"53100")),
-            Some(FloorClass::DiskFull)
-        );
-        assert_eq!(
-            observation_floor(&error(0, 1, *b"XX001")),
+            observation_floor(&error(0, 1, *b"XX001", EvidenceQuality::Structured)),
             Some(FloorClass::Integrity)
         );
-        // Out-of-memory needs kernel evidence; a 53200 error is not a floor.
-        assert_eq!(observation_floor(&error(0, 1, *b"53200")), None);
+        assert_eq!(
+            observation_floor(&error(0, 1, *b"53100", EvidenceQuality::Structured)),
+            None,
+            "a SQLSTATE alone does not identify a full mount"
+        );
     }
 
     #[test]
@@ -350,7 +399,13 @@ mod tests {
     #[test]
     fn a_floor_bucket_is_critical_without_inventing_a_zero_score() {
         let policy = overview_health_policy().expect("valid policy");
-        let points = health_line(&[panic(0, 5)], span(0, 100), 100, &policy).expect("health line");
+        let points = health_line(
+            &[panic(0, 5, EvidenceQuality::Structured)],
+            span(0, 100),
+            100,
+            &policy,
+        )
+        .expect("health line");
         let point = &points[0];
         assert_eq!(point.overall_state(), HealthState::Critical);
         assert_eq!(
@@ -364,8 +419,16 @@ mod tests {
     #[test]
     fn buckets_partition_the_range_and_own_their_floors() {
         let policy = overview_health_policy().expect("valid policy");
-        let points =
-            health_line(&[panic(0, 5), crash(1, 55)], span(0, 100), 50, &policy).expect("line");
+        let points = health_line(
+            &[
+                panic(0, 5, EvidenceQuality::Structured),
+                panic(1, 55, EvidenceQuality::Structured),
+            ],
+            span(0, 100),
+            50,
+            &policy,
+        )
+        .expect("line");
         assert_eq!(points.len(), 2, "two 50us buckets partition the range");
         assert_eq!(
             points[0].floor_evidence().len(),
@@ -376,6 +439,25 @@ mod tests {
             points[1].floor_evidence().len(),
             1,
             "second floor in bucket 1"
+        );
+    }
+
+    #[test]
+    fn bucket_work_is_linear_and_accepts_unsorted_input() {
+        let policy = overview_health_policy().expect("valid policy");
+        let observations = [
+            panic(2, 95, EvidenceQuality::Structured),
+            panic(0, 5, EvidenceQuality::Structured),
+            panic(1, 55, EvidenceQuality::Structured),
+        ];
+        let points = health_line(&observations, span(0, 100), 10, &policy).expect("line");
+        assert_eq!(points.len(), 10);
+        assert_eq!(
+            points
+                .iter()
+                .map(|point| point.floor_evidence().len())
+                .sum::<usize>(),
+            3
         );
     }
 }

@@ -13,9 +13,10 @@
 //! subset; the cap keeps the head and reports how many items it omitted.
 
 use core::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 use super::counts::{ErrorCategory, Severity, SqlState};
-use super::observation::{EventObservation, ObservationId, ObservationPayload};
+use super::observation::{EventObservation, ObservationPayload};
 
 /// `SIGKILL` signal number; an uncatchable process termination.
 const SIGNAL_SIGKILL: i32 = 9;
@@ -124,20 +125,20 @@ impl NotableClass {
     #[must_use]
     pub const fn wire_code(self) -> &'static str {
         match self {
-            Self::ChildSigkill => "postgres_child_sigkill_observed",
-            Self::ChildSignalTermination => "postgres_child_signal_termination",
-            Self::Panic => "postgres_panic_observed",
-            Self::DiskFull => "postgres_disk_full_observed",
-            Self::OutOfMemory => "postgres_out_of_memory_observed",
-            Self::ConnectionSlotsExhausted => "postgres_connection_slots_exhausted_observed",
-            Self::Deadlock => "postgres_deadlock_observed",
-            Self::IntegrityError => "postgres_integrity_error_observed",
-            Self::LockNotAvailable => "postgres_lock_not_available_observed",
-            Self::QueryCancelled => "postgres_query_cancelled_observed",
-            Self::SerializationFailure => "postgres_serialization_failure_observed",
-            Self::AuthenticationFailure => "postgres_authentication_failure_observed",
-            Self::AuthorizationFailure => "postgres_authorization_failure_observed",
-            Self::PermissionDenied => "postgres_permission_denied_observed",
+            Self::ChildSigkill => "server_child_sigkill",
+            Self::ChildSignalTermination => "server_child_signal_termination",
+            Self::Panic => "panic_severity_observation",
+            Self::DiskFull => "filesystem_space",
+            Self::OutOfMemory => "postgres_out_of_memory_observation",
+            Self::ConnectionSlotsExhausted => "connection_saturation",
+            Self::Deadlock => "deadlock_observation",
+            Self::IntegrityError => "corruption_sqlstate_observation",
+            Self::LockNotAvailable => "lock_not_available_observation",
+            Self::QueryCancelled => "query_canceled_observation",
+            Self::SerializationFailure => "serialization_failure_observation",
+            Self::AuthenticationFailure => "auth_failure_observation",
+            Self::AuthorizationFailure => "authorization_failure_observation",
+            Self::PermissionDenied => "permission_denied_observation",
         }
     }
 
@@ -303,13 +304,13 @@ impl NotablePolicy {
     pub fn classify(self, observation: &EventObservation) -> Option<NotableClass> {
         match observation.payload() {
             ObservationPayload::ChildSignalTermination(payload)
-            | ObservationPayload::ChildProcessCrash(payload) => {
-                if payload.signal == Some(SIGNAL_SIGKILL) {
-                    Some(NotableClass::ChildSigkill)
+            | ObservationPayload::ChildProcessCrash(payload) => payload.signal.map(|signal| {
+                if signal == SIGNAL_SIGKILL {
+                    NotableClass::ChildSigkill
                 } else {
-                    Some(NotableClass::ChildSignalTermination)
+                    NotableClass::ChildSignalTermination
                 }
-            }
+            }),
             ObservationPayload::ErrorGroup(payload) => {
                 classify_error_group(payload.severity, payload.category, payload.sqlstate)
             }
@@ -323,30 +324,36 @@ impl NotablePolicy {
     /// first, then observation id. Distinct ids make the order deterministic.
     #[must_use]
     pub fn preview(self, observations: &[EventObservation]) -> NotablePreview {
-        let mut sortable: Vec<(u8, Reverse<i64>, ObservationId, usize, NotableClass)> = Vec::new();
+        let mut ranked = BinaryHeap::with_capacity(self.response_cap);
+        let mut total_notable = 0_u64;
         for (index, observation) in observations.iter().enumerate() {
             if let Some(class) = self.classify(observation) {
-                sortable.push((
+                total_notable += 1;
+                let candidate = (
                     class.priority(),
                     Reverse(observation.time().sort_ts_us),
                     observation.observation_id(),
                     index,
                     class,
-                ));
+                );
+                if ranked.len() < self.response_cap {
+                    ranked.push(candidate);
+                } else if ranked.peek().is_some_and(|worst| candidate < *worst) {
+                    let _ = ranked.pop();
+                    ranked.push(candidate);
+                }
             }
         }
-        sortable.sort_unstable();
-
-        let total_notable = saturating_u64(sortable.len());
-        let ranked: Vec<RankedNotable> = sortable
-            .iter()
-            .take(self.response_cap)
+        let ranked: Vec<RankedNotable> = ranked
+            .into_sorted_vec()
+            .into_iter()
             .map(|entry| RankedNotable {
                 index: entry.3,
                 class: entry.4,
             })
             .collect();
-        let omitted_count = total_notable.saturating_sub(saturating_u64(ranked.len()));
+        let ranked_count = ranked.len() as u64;
+        let omitted_count = total_notable - ranked_count;
         NotablePreview {
             ranked,
             total_notable,
@@ -428,10 +435,6 @@ fn classify_error_group(
         return Some(NotableClass::AuthenticationFailure);
     }
     None
-}
-
-fn saturating_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -636,6 +639,37 @@ mod tests {
     }
 
     #[test]
+    fn crash_without_a_signal_does_not_invent_signal_termination() {
+        let payload = LifecyclePayload {
+            pid: Some(4242),
+            signal: None,
+            shutdown_mode: None,
+            message: None,
+            query_detail: None,
+            dropped_field_count: DroppedFieldCount::default(),
+        };
+        let observation = EventObservation::new(
+            lineage(),
+            7,
+            provenance(0),
+            ObservationShape::Individual,
+            ObservationTime {
+                sort_ts_us: 10,
+                occurred_at_us: Some(10),
+                observed_interval: None,
+                quality: TimeQuality::Exact,
+            },
+            1,
+            ObservationPayload::ChildProcessCrash(Box::new(payload)),
+            EvidenceQuality::Structured,
+            QualityFlags::default(),
+            None,
+        )
+        .expect("valid crash fixture");
+        assert_eq!(NotablePolicy::v1().classify(&observation), None);
+    }
+
+    #[test]
     fn preview_ranks_by_priority_then_recency() {
         let policy = NotablePolicy::v1();
         let observations = vec![
@@ -727,7 +761,7 @@ mod tests {
         assert_eq!(codes.len(), unique, "every class has a distinct wire code");
         assert_eq!(
             NotableClass::ChildSigkill.wire_code(),
-            "postgres_child_sigkill_observed"
+            "server_child_sigkill"
         );
     }
 }
