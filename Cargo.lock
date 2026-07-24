@@ -1987,6 +1987,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg_kronika-demo"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "kronika-analytics",
+ "kronika-reader",
+ "nix",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "pg_kronika-dump"
 version = "0.0.0"
 

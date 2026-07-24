@@ -15,6 +15,7 @@ members = [
     "bins/pg_kronika-collector",
     "bins/pg_kronika-web",
     "bins/pg_kronika-archiver",
+    "bins/pg_kronika-demo",
     "bins/pg_kronika-dump",
     "xtask",
 ]
