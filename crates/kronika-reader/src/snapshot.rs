@@ -353,6 +353,7 @@ impl LocalDirSnapshot {
         Ok(RefreshDelta {
             previous_view_generation,
             new_view_generation,
+            view_changed: changed,
             sealed_added: sealed.added,
             sealed_removed: sealed.removed,
             journal: JournalDelta {
@@ -2301,6 +2302,7 @@ mod tests {
         let unavailable = snap
             .refresh_incremental_delta()
             .expect("warning-bearing delta");
+        assert!(unavailable.view_changed);
         assert!(unavailable.sealed_removed.is_empty());
         assert!(
             snap.warnings()
@@ -2312,8 +2314,20 @@ mod tests {
             "warning-visible raw state advances the view generation"
         );
 
+        let repeated_unavailable = snap
+            .refresh_incremental_delta()
+            .expect("repeated warning-bearing delta");
+        assert!(!repeated_unavailable.view_changed);
+        assert_eq!(
+            repeated_unavailable.new_view_generation,
+            repeated_unavailable.previous_view_generation
+        );
+        assert!(repeated_unavailable.sealed_added.is_empty());
+        assert!(repeated_unavailable.sealed_removed.is_empty());
+
         fs::write(&sealed_path, &valid_segment).unwrap();
         let recovered = snap.refresh_incremental_delta().expect("readable recovery");
+        assert!(recovered.view_changed);
         assert!(recovered.sealed_added.is_empty());
         assert!(recovered.sealed_removed.is_empty());
         assert!(recovered.new_view_generation > recovered.previous_view_generation);

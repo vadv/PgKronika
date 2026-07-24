@@ -346,11 +346,14 @@ impl LiveBuilder {
             self.state = LiveState::NeedsRebuild;
             return Err(LiveFoldError::ViewGenerationMismatch);
         }
-        let changes_view = self.refresh_changes_view(delta);
+        if self.refresh_changes_view(delta) && !delta.view_changed {
+            self.state = LiveState::NeedsRebuild;
+            return Err(LiveFoldError::RefreshMismatch);
+        }
         if let Err(error) = validate_view_generation(
             delta.previous_view_generation,
             delta.new_view_generation,
-            changes_view,
+            delta.view_changed,
         ) {
             self.state = match error {
                 LiveFoldError::Overflow => LiveState::Incomplete,
@@ -438,15 +441,9 @@ impl LiveBuilder {
             || !delta.sealed_removed.is_empty()
             || !delta.journal.completed_parts.is_empty()
             || !delta.journal.transition.preserves_generation()
-            || !delta.journal.current_parts_complete
             || delta.journal.current_parts != self.folded_parts
             || delta.journal.new_valid_len != self.folded_through_offset
             || delta.journal.tail_pending != self.completed_tail_pending
-            || !completion_damage_is_valid(
-                delta.journal.new_valid_len,
-                delta.journal.tail_pending,
-                &delta.journal.damages,
-            )
     }
 
     /// Completes the pending refresh as one immutable availability boundary.
@@ -1159,6 +1156,7 @@ mod tests {
         RefreshDelta {
             previous_view_generation: builder.view_generation(),
             new_view_generation: builder.view_generation() + 1,
+            view_changed: true,
             sealed_added: Vec::new(),
             sealed_removed: Vec::new(),
             journal: crate::refresh::JournalDelta {
@@ -1393,6 +1391,7 @@ mod tests {
         let delta = RefreshDelta {
             previous_view_generation: u64::MAX,
             new_view_generation: u64::MAX,
+            view_changed: false,
             sealed_added: Vec::new(),
             sealed_removed: Vec::new(),
             journal: crate::refresh::JournalDelta {
@@ -1412,6 +1411,36 @@ mod tests {
         builder.begin_refresh(&delta).expect("begin no-op");
         builder.complete_refresh().expect("complete no-op");
         assert_eq!(builder.view_generation(), u64::MAX);
+        assert_eq!(builder.state(), LiveState::Current);
+    }
+
+    #[test]
+    fn producer_visible_warning_change_can_advance_an_unchanged_descriptor_view() {
+        let mut builder = live_builder();
+        fold_slices(&mut builder, &[&stream()]);
+        let delta = RefreshDelta {
+            previous_view_generation: builder.view_generation(),
+            new_view_generation: builder.view_generation() + 1,
+            view_changed: true,
+            sealed_added: Vec::new(),
+            sealed_removed: Vec::new(),
+            journal: crate::refresh::JournalDelta {
+                bootstrap: false,
+                generation_id: builder.generation(),
+                previous_valid_len: builder.folded_through_offset(),
+                new_valid_len: builder.folded_through_offset(),
+                completed_parts: Vec::new(),
+                current_parts: builder.folded_parts.clone(),
+                current_parts_complete: true,
+                transition: PartTransition::Append,
+                tail_pending: builder.completed_tail_pending,
+                damages: Vec::new(),
+            },
+        };
+
+        builder.begin_refresh(&delta).expect("begin warning change");
+        builder.complete_refresh().expect("complete warning change");
+        assert_eq!(builder.view_generation(), delta.new_view_generation);
         assert_eq!(builder.state(), LiveState::Current);
     }
 

@@ -205,6 +205,11 @@ pub struct RefreshDelta {
     pub previous_view_generation: u64,
     /// View generation captured after this refresh.
     pub new_view_generation: u64,
+    /// Whether the producer observed any raw state change at this boundary.
+    ///
+    /// This includes changes, such as a warning appearing or clearing, that
+    /// cannot be reconstructed from the semantic descriptor lists alone.
+    pub view_changed: bool,
     /// Sealed segments newly visible in this scan.
     pub sealed_added: Vec<SegmentDescriptor>,
     /// Sealed segments no longer visible in this scan.
@@ -485,6 +490,7 @@ mod tests {
         let delta = RefreshDelta {
             previous_view_generation: 4,
             new_view_generation: 5,
+            view_changed: true,
             sealed_added: Vec::new(),
             sealed_removed: Vec::new(),
             journal: JournalDelta {
