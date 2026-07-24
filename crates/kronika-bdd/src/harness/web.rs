@@ -54,7 +54,8 @@ impl WebResponse {
 /// One in-process request against a fresh router over `dir`.
 async fn request(dir: &Path, uri: &str, request_headers: &[(&str, &str)]) -> Result<WebResponse> {
     let snapshot = LocalDirSnapshot::open(dir).context("open the store snapshot")?;
-    let router = app(AppState::new(snapshot), None, bdd_metrics_handle());
+    let state = AppState::new(snapshot).context("build the web state")?;
+    let router = app(state, None, bdd_metrics_handle());
     let mut request = Request::builder().uri(uri);
     for &(name, value) in request_headers {
         request = request.header(name, value);
