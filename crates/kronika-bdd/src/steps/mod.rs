@@ -181,6 +181,7 @@ mod settings;
 mod smoke;
 mod statements;
 mod store_plans;
+mod timeline;
 mod user_tables;
 mod wal;
 mod web;

@@ -6,10 +6,12 @@
 //! serialization) against the same live-PostgreSQL oracle the direct-decode
 //! steps use.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
+use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, header};
 use http_body_util::BodyExt as _;
@@ -56,11 +58,21 @@ async fn request(dir: &Path, uri: &str, request_headers: &[(&str, &str)]) -> Res
     let snapshot = LocalDirSnapshot::open(dir).context("open the store snapshot")?;
     let state = AppState::new(snapshot).context("build the web state")?;
     let router = app(state, None, bdd_metrics_handle());
+    request_with_router(&router, uri, request_headers).await
+}
+
+/// One request against an already-built router and its immutable publication.
+async fn request_with_router(
+    router: &Router,
+    uri: &str,
+    request_headers: &[(&str, &str)],
+) -> Result<WebResponse> {
     let mut request = Request::builder().uri(uri);
     for &(name, value) in request_headers {
         request = request.header(name, value);
     }
     let response = router
+        .clone()
         .oneshot(request.body(Body::empty()).context("build the request")?)
         .await
         .context("route the request")?;
@@ -168,6 +180,461 @@ pub(crate) async fn section_page(dir: &Path, name: &str, source: u64) -> Result<
         response.body
     );
     Ok(response.body)
+}
+
+/// Verify the fixed log fixture through one shared timeline publication.
+///
+/// The router is built once so the overview preview, `/events`, and `/health`
+/// all read the same immutable fact set and cursor registry. This is the
+/// end-to-end collector → PGM → reader → HTTP assertion used by the `PostgreSQL`
+/// 15–18 feature matrix.
+pub(crate) async fn assert_timeline_pg_log_contract(
+    dir: &Path,
+    from_us: i64,
+    to_us: i64,
+) -> Result<()> {
+    anyhow::ensure!(from_us < to_us, "timeline fixture range is empty");
+    let snapshot = LocalDirSnapshot::open(dir).context("open the store snapshot")?;
+    let state = AppState::new(snapshot).context("build the timeline web state")?;
+    let router = app(state, None, bdd_metrics_handle());
+
+    let sources = request_with_router(&router, "/v1/sources", &[]).await?;
+    anyhow::ensure!(
+        sources.status == 200,
+        "/v1/sources returned status {}: {}",
+        sources.status,
+        sources.body
+    );
+    let source_rows = sources.body["sources"]
+        .as_array()
+        .context("`sources` is not an array")?;
+    let [source_row] = source_rows.as_slice() else {
+        bail!("expected exactly one source, got {}", source_rows.len());
+    };
+    let source = source_row["source_id"]
+        .as_u64()
+        .context("`source_id` is not a number")?;
+
+    assert_timeline_source_required(&router, from_us, to_us).await?;
+
+    let overview = timeline_ok(
+        &router,
+        &format!("/v1/timeline/overview?source={source}&from={from_us}&to={to_us}"),
+        "overview",
+    )
+    .await?;
+    let events = timeline_ok(
+        &router,
+        &format!("/v1/timeline/events?source={source}&from={from_us}&to={to_us}"),
+        "events",
+    )
+    .await?;
+    let health = timeline_ok(
+        &router,
+        &format!(
+            "/v1/timeline/health?source={source}&from={from_us}&to={to_us}&step={}",
+            to_us
+                .checked_sub(from_us)
+                .context("timeline fixture range subtraction overflowed")?
+        ),
+        "health",
+    )
+    .await?;
+
+    for (name, body) in [
+        ("overview", &overview),
+        ("events", &events),
+        ("health", &health),
+    ] {
+        assert_source_meta(name, body, source)?;
+    }
+    assert_same_publication(&overview, &events, &health)?;
+    assert_digest_reconciles(&overview)?;
+    assert_shared_event_facts(&overview, &events, source)?;
+    assert_parsed_panic_and_child_termination_do_not_set_health_floor(&health)?;
+    Ok(())
+}
+
+async fn assert_timeline_source_required(router: &Router, from_us: i64, to_us: i64) -> Result<()> {
+    let uris = [
+        format!("/v1/timeline/overview?from={from_us}&to={to_us}"),
+        format!("/v1/timeline/events?from={from_us}&to={to_us}"),
+        format!("/v1/timeline/health?from={from_us}&to={to_us}"),
+    ];
+    for uri in uris {
+        let response = request_with_router(router, &uri, &[]).await?;
+        anyhow::ensure!(
+            response.status == 400,
+            "{uri} without source returned status {}: {}",
+            response.status,
+            response.body
+        );
+        anyhow::ensure!(
+            response.body["code"] == "missing_query_parameter",
+            "{uri} did not reject the missing source: {}",
+            response.body
+        );
+        anyhow::ensure!(
+            response.body["params"]["parameter"] == "source",
+            "{uri} reported the wrong missing parameter: {}",
+            response.body
+        );
+    }
+    Ok(())
+}
+
+async fn timeline_ok(router: &Router, uri: &str, label: &str) -> Result<Value> {
+    let response = request_with_router(router, uri, &[]).await?;
+    anyhow::ensure!(
+        response.status == 200,
+        "timeline {label} returned status {}: {}",
+        response.status,
+        response.body
+    );
+    Ok(response.body)
+}
+
+fn assert_source_meta(label: &str, body: &Value, source: u64) -> Result<()> {
+    let meta = body["meta"]
+        .as_object()
+        .with_context(|| format!("{label} `meta` is not an object"))?;
+    anyhow::ensure!(
+        meta.get("sources") == Some(&serde_json::json!([source])),
+        "{label} did not retain the selected source: {}",
+        body["meta"]
+    );
+    anyhow::ensure!(
+        meta.get("available_sources") == Some(&serde_json::json!([source])),
+        "{label} did not report the selected source as available: {}",
+        body["meta"]
+    );
+    anyhow::ensure!(
+        meta.get("source_status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != "unavailable"),
+        "{label} source status is unavailable: {}",
+        body["meta"]
+    );
+
+    let freshness = meta
+        .get("source_freshness")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} `source_freshness` is not an array"))?;
+    let [freshness] = freshness.as_slice() else {
+        bail!(
+            "{label} expected one source freshness record, got {}",
+            freshness.len()
+        );
+    };
+    anyhow::ensure!(freshness["source_id"] == source);
+    anyhow::ensure!(
+        freshness["source_scope_id"]
+            .as_str()
+            .is_some_and(|scope| !scope.is_empty())
+    );
+    anyhow::ensure!(freshness["source_completeness"] == "bounded_subset");
+    anyhow::ensure!(freshness["retained_exactness"] == "exact");
+    anyhow::ensure!(freshness["physical_count_semantics"] == "lower_bound");
+
+    let loss = meta
+        .get("loss")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} `loss` is not an array"))?;
+    let [loss] = loss.as_slice() else {
+        bail!(
+            "{label} expected one source loss record, got {}",
+            loss.len()
+        );
+    };
+    anyhow::ensure!(loss["source_id"] == source);
+    anyhow::ensure!(loss["known_gaps"].is_array());
+    anyhow::ensure!(
+        loss["dropped_count_lower_bound"].is_null() || loss["dropped_count_lower_bound"].is_u64()
+    );
+    Ok(())
+}
+
+fn assert_same_publication(overview: &Value, events: &Value, health: &Value) -> Result<()> {
+    let fact_set_id = overview["meta"]["fact_set_id"]
+        .as_str()
+        .context("overview fact_set_id is not a string")?;
+    anyhow::ensure!(!fact_set_id.is_empty(), "overview fact_set_id is empty");
+    for (label, body) in [("events", events), ("health", health)] {
+        anyhow::ensure!(
+            body["meta"]["fact_set_id"] == fact_set_id,
+            "{label} used a different fact set: {}",
+            body["meta"]
+        );
+        anyhow::ensure!(
+            body["meta"]["view_generation"] == overview["meta"]["view_generation"],
+            "{label} used a different view generation: {}",
+            body["meta"]
+        );
+    }
+    Ok(())
+}
+
+fn assert_digest_reconciles(overview: &Value) -> Result<()> {
+    let digest = &overview["event_digest"];
+    let total = json_u64(
+        &digest["retained_error_occurrence_count"],
+        "retained_error_occurrence_count",
+    )?;
+    anyhow::ensure!(
+        total == 3,
+        "fixed fixture retained {total} error occurrences instead of 3: {digest}"
+    );
+    anyhow::ensure!(
+        digest["retained_error_group_count"] == 3,
+        "fixed fixture did not retain three error groups: {digest}"
+    );
+    anyhow::ensure!(
+        json_u64(
+            &digest["retained_observation_row_count"],
+            "retained_observation_row_count"
+        )? >= total
+    );
+    anyhow::ensure!(digest["exactness"] == "exact");
+
+    let severity_total = checked_json_array_sum(&digest["by_severity"], "by_severity")?;
+    let category_total = checked_json_array_sum(&digest["by_category"], "by_category")?;
+    let sqlstate_top = checked_json_entry_sum(&digest["by_sqlstate"], "count", "by_sqlstate")?;
+    let sqlstate_total = json_u64(&digest["sqlstate_missing_count"], "sqlstate_missing_count")?
+        .checked_add(json_u64(
+            &digest["sqlstate_other_count"],
+            "sqlstate_other_count",
+        )?)
+        .and_then(|sum| sum.checked_add(sqlstate_top))
+        .context("SQLSTATE digest count overflowed")?;
+    let joint_top = checked_json_entry_sum(&digest["joint_top"], "count", "joint_top")?;
+    let joint_total = json_u64(&digest["joint_other_count"], "joint_other_count")?
+        .checked_add(joint_top)
+        .context("joint digest count overflowed")?;
+
+    anyhow::ensure!(
+        [severity_total, category_total, sqlstate_total, joint_total]
+            .into_iter()
+            .all(|sum| sum == total),
+        "overview count axes do not reconcile to {total}: {digest}"
+    );
+    anyhow::ensure!(digest["lifecycle"]["crashes"] == 1);
+    let signals = digest["lifecycle"]["signals"]
+        .as_array()
+        .context("lifecycle signals is not an array")?;
+    anyhow::ensure!(
+        signals
+            .iter()
+            .any(|signal| signal["signal"] == 9 && signal["count"] == 1),
+        "fixed child termination is absent from lifecycle counts: {digest}"
+    );
+    Ok(())
+}
+
+fn checked_json_array_sum(value: &Value, label: &str) -> Result<u64> {
+    let values = value
+        .as_array()
+        .with_context(|| format!("`{label}` is not an array"))?;
+    values.iter().try_fold(0_u64, |sum, value| {
+        sum.checked_add(json_u64(value, label)?)
+            .with_context(|| format!("`{label}` count overflowed"))
+    })
+}
+
+fn checked_json_entry_sum(value: &Value, field: &str, label: &str) -> Result<u64> {
+    let entries = value
+        .as_array()
+        .with_context(|| format!("`{label}` is not an array"))?;
+    entries.iter().try_fold(0_u64, |sum, entry| {
+        sum.checked_add(json_u64(&entry[field], label)?)
+            .with_context(|| format!("`{label}` count overflowed"))
+    })
+}
+
+fn json_u64(value: &Value, label: &str) -> Result<u64> {
+    value
+        .as_u64()
+        .with_context(|| format!("`{label}` is not an unsigned integer: {value}"))
+}
+
+fn assert_shared_event_facts(overview: &Value, events: &Value, source: u64) -> Result<()> {
+    let preview = overview["notable_preview"]["observations"]
+        .as_array()
+        .context("overview notable observations is not an array")?;
+    let page = events["events"]
+        .as_array()
+        .context("events page is not an array")?;
+    anyhow::ensure!(
+        preview == page,
+        "overview preview and /events projected different EventFacts:\npreview={preview:?}\nevents={page:?}"
+    );
+    anyhow::ensure!(
+        preview.len() == 3,
+        "fixed fixture produced {} notable facts instead of 3: {preview:?}",
+        preview.len()
+    );
+    anyhow::ensure!(overview["notable_preview"]["omitted_count"] == 0);
+    anyhow::ensure!(events["next_cursor"].is_null());
+    anyhow::ensure!(events["omitted_by_response_filter"] == 0);
+    anyhow::ensure!(events["retained_exactness"] == "exact");
+    anyhow::ensure!(events["source_completeness"] == "bounded_subset");
+    anyhow::ensure!(events["physical_count_semantics"] == "lower_bound");
+
+    let mut seen_event_ids = BTreeSet::new();
+    let mut seen_instance_ids = BTreeSet::new();
+    for fact in preview {
+        let (event_id, instance_id) = assert_event_fact(fact, source)?;
+        anyhow::ensure!(!event_id.is_empty() && seen_event_ids.insert(event_id));
+        anyhow::ensure!(!instance_id.is_empty() && seen_instance_ids.insert(instance_id));
+    }
+
+    let classes = preview
+        .iter()
+        .filter_map(|fact| fact["notable_class"].as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_classes = BTreeSet::from([
+        "deadlock_observation",
+        "panic_severity_observation",
+        "server_child_sigkill",
+    ]);
+    anyhow::ensure!(
+        classes == expected_classes,
+        "fixed fixture produced unexpected notable classes: {classes:?}"
+    );
+    Ok(())
+}
+
+fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
+    let expected_fields = BTreeSet::from([
+        "event_id",
+        "event_instance_id",
+        "source_id",
+        "source_scope_id",
+        "source_type_id",
+        "identity_quality",
+        "sort_ts_us",
+        "occurred_at_us",
+        "occurrence_count",
+        "event_kind",
+        "notable_class",
+        "evidence_quality",
+        "quality_flags",
+        "payload",
+        "supporting_evidence",
+        "loss",
+    ]);
+    let object = fact.as_object().context("EventFact is not an object")?;
+    let fields = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        fields == expected_fields,
+        "EventFact fields changed: {fields:?}"
+    );
+    let event_id = fact["event_id"]
+        .as_str()
+        .context("EventFact.event_id is not a string")?;
+    let instance_id = fact["event_instance_id"]
+        .as_str()
+        .context("EventFact.event_instance_id is not a string")?;
+    anyhow::ensure!(fact["source_id"] == source);
+    anyhow::ensure!(
+        fact["source_scope_id"]
+            .as_str()
+            .is_some_and(|scope| !scope.is_empty())
+    );
+    anyhow::ensure!(fact["source_type_id"].is_u64());
+    anyhow::ensure!(fact["identity_quality"] == "content_derived");
+    anyhow::ensure!(fact["sort_ts_us"].is_i64());
+    anyhow::ensure!(fact["occurred_at_us"].is_i64() || fact["occurred_at_us"].is_null());
+    anyhow::ensure!(
+        fact["occurrence_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    anyhow::ensure!(
+        fact["payload"]["kind"] == fact["event_kind"],
+        "typed payload kind disagrees with EventFact kind: {fact}"
+    );
+    anyhow::ensure!(fact["notable_class"].is_string());
+    let expected_evidence_quality = match fact["event_kind"].as_str() {
+        Some("pg.lifecycle.child_signal_termination") => "parsed",
+        _ => "heuristic",
+    };
+    anyhow::ensure!(
+        fact["evidence_quality"] == expected_evidence_quality,
+        "fixed log fact carried the wrong evidence quality: {fact}"
+    );
+    anyhow::ensure!(fact["quality_flags"].is_u64());
+    anyhow::ensure!(fact["loss"].is_null() || fact["loss"].is_object());
+    assert_supporting_evidence(fact)?;
+    Ok((event_id, instance_id))
+}
+
+fn assert_supporting_evidence(fact: &Value) -> Result<()> {
+    let expected_fields = BTreeSet::from([
+        "observation_id",
+        "section_body_id",
+        "catalog_entry_ordinal",
+        "row_ordinal",
+        "dictionary_context_id",
+        "segment_locator",
+    ]);
+    let evidence = fact["supporting_evidence"]
+        .as_array()
+        .context("supporting_evidence is not an array")?;
+    let [evidence] = evidence.as_slice() else {
+        bail!(
+            "EventFact expected one supporting observation, got {}: {fact}",
+            evidence.len()
+        );
+    };
+    let fields = evidence
+        .as_object()
+        .context("supporting evidence is not an object")?
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        fields == expected_fields,
+        "supporting evidence fields changed: {fields:?}"
+    );
+    for field in ["observation_id", "section_body_id", "dictionary_context_id"] {
+        anyhow::ensure!(
+            evidence[field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "supporting evidence `{field}` is empty: {evidence}"
+        );
+    }
+    anyhow::ensure!(evidence["catalog_entry_ordinal"].is_u64());
+    anyhow::ensure!(evidence["row_ordinal"].is_u64());
+    anyhow::ensure!(
+        evidence["segment_locator"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    Ok(())
+}
+
+fn assert_parsed_panic_and_child_termination_do_not_set_health_floor(health: &Value) -> Result<()> {
+    let points = health["points"]
+        .as_array()
+        .context("health points is not an array")?;
+    anyhow::ensure!(
+        !points.is_empty(),
+        "health response did not cover the fixed fixture range"
+    );
+    for point in points {
+        anyhow::ensure!(
+            point["floor_evidence"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "parsed PANIC or child termination created trusted floor evidence: {point}"
+        );
+        anyhow::ensure!(
+            point["overall_state"] != "critical",
+            "parsed PANIC or child termination created critical health: {point}"
+        );
+    }
+    Ok(())
 }
 
 /// Verify that language preferences cannot change a Problem representation.
