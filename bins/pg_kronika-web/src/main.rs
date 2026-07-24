@@ -59,7 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .overview_namespace
         .clone()
         .unwrap_or_else(|| canonical_store.as_os_str().as_bytes().to_vec());
-    let overview = OverviewConfig::new(cfg.overview_cache_dir.clone(), namespace);
+    let mut overview = OverviewConfig::new(cfg.overview_cache_dir.clone(), namespace);
+    overview.fallback = cfg.overview_fallback;
+    overview.response_cache_bytes = cfg.overview_response_cache_bytes;
+    overview.response_cache_entries = cfg.overview_response_cache_entries;
+    overview.cursor_max_views = cfg.overview_cursor_max_views;
+    overview.cursor_max_bytes = cfg.overview_cursor_max_bytes;
+    overview.cursor_ttl = cfg.overview_cursor_ttl;
     let state =
         AppState::with_overview_config(snapshot, now_unix_secs(), cfg.stale_after, overview)?;
     let auth = cfg
@@ -162,6 +168,7 @@ async fn refresh_loop(state: AppState) {
 
     loop {
         tokio::time::sleep(REFRESH_INTERVAL).await;
+        state.prune_timeline_cursors(now_unix_secs());
         state.refresh_loop_iterations.fetch_add(1, Relaxed);
         metrics::counter!("kronika_web_refresh_loop_iterations_total").increment(1);
         let fallback_snapshot = snap.clone();
@@ -205,8 +212,10 @@ async fn refresh_loop(state: AppState) {
                 metrics::gauge!("kronika_web_store_warnings").set(current.0 as f64);
                 metrics::gauge!("kronika_web_store_damages").set(current.1 as f64);
                 state.last_refresh.store(now_unix_secs(), Relaxed);
-                metrics::gauge!("kronika_web_overview_view_generation")
+                metrics::gauge!("kronika_web_store_view_generation")
                     .set(snap.view_generation() as f64);
+                metrics::gauge!("kronika_web_overview_view_generation")
+                    .set(state.overview_view_generation() as f64);
                 if let Err(error) = publication {
                     metrics::counter!("kronika_web_overview_refresh_errors_total").increment(1);
                     tracing::warn!(%error, "overview refresh retained the last timeline view");

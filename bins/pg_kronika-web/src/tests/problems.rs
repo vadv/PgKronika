@@ -42,10 +42,15 @@ fn problem_example(code: ProblemCode) -> (ApiProblem, serde_json::Value) {
         ProblemCode::CursorQueryMismatch => {
             (ApiProblem::cursor_query_mismatch(), serde_json::json!({}))
         }
+        ProblemCode::CursorExpired => (ApiProblem::cursor_expired(), serde_json::json!({})),
         ProblemCode::ViewGone => (ApiProblem::view_gone(), serde_json::json!({})),
         ProblemCode::QueryLimitExceeded => (
             ApiProblem::query_limit_exceeded(LimitResource::Rows, 10, Some(11)),
             serde_json::json!({ "resource": "rows", "limit": 10, "observed": 11 }),
+        ),
+        ProblemCode::CursorCapacityUnavailable => (
+            ApiProblem::cursor_capacity_unavailable(),
+            serde_json::json!({}),
         ),
         ProblemCode::AnalyticCapacityUnavailable => (
             ApiProblem::analytic_capacity_unavailable(),
@@ -377,6 +382,7 @@ fn openapi_is_a_closed_projection_of_the_machine_registries() {
     assert_reason_schema(&document);
     assert_params_schemas(&document);
     assert_changed_success_schemas(&document);
+    assert_timeline_contract(&document);
     assert_v1_media_and_locale_contract(&document);
     assert_local_refs_resolve(&document, &document);
 }
@@ -594,6 +600,172 @@ fn assert_changed_success_schemas(document: &serde_json::Value) {
     );
 }
 
+fn assert_timeline_contract(document: &serde_json::Value) {
+    assert_timeline_schema_contract(document);
+    assert_timeline_endpoint_contract(document);
+}
+
+fn assert_timeline_schema_contract(document: &serde_json::Value) {
+    let schemas = &document["components"]["schemas"];
+    for schema in [
+        "CoverageSpan",
+        "SourceFreshness",
+        "SourceLoss",
+        "TimelineMeta",
+        "SupportingEvidence",
+        "EventLoss",
+        "ErrorEventPayload",
+        "LifecycleEventPayload",
+        "EventFact",
+        "SqlstateCount",
+        "JointCount",
+        "SignalCount",
+        "LifecycleDigest",
+        "EventDigest",
+        "NotablePreview",
+        "HealthDomainPenalty",
+        "HealthFloorEvidence",
+        "HealthFactorCoverage",
+        "HealthPoint",
+        "TimelineHealthSummary",
+        "TimelineOverviewResponse",
+        "TimelineEventsResponse",
+        "TimelineHealthResponse",
+    ] {
+        let object = &schemas[schema];
+        assert_eq!(
+            object["additionalProperties"], false,
+            "{schema} must reject undeclared fields"
+        );
+        let properties: std::collections::BTreeSet<_> = object["properties"]
+            .as_object()
+            .expect("timeline schema properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let required: std::collections::BTreeSet<_> = object["required"]
+            .as_array()
+            .expect("timeline schema required fields")
+            .iter()
+            .map(|field| field.as_str().expect("required field name"))
+            .collect();
+        assert_eq!(
+            required, properties,
+            "{schema} must require every serialized field, including nullable fields"
+        );
+    }
+
+    assert_eq!(schemas["B64UrlSha256"]["pattern"], "^[A-Za-z0-9_-]{43}$");
+    assert_eq!(
+        schemas["TimelineEventsCursor"]["pattern"],
+        "^[A-Za-z0-9_-]{312}$"
+    );
+    assert_eq!(
+        schemas["EventFact"]["properties"]["source_id"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        schemas["EventFact"]["properties"]["supporting_evidence"]["minItems"],
+        1
+    );
+    assert_eq!(
+        schemas["EventFact"]["properties"]["supporting_evidence"]["maxItems"],
+        1
+    );
+    assert_eq!(
+        schemas["EventFact"]["properties"]["payload"]["$ref"],
+        "#/components/schemas/EventPayload"
+    );
+    assert_eq!(
+        schemas["NotablePreview"]["properties"]["observations"]["maxItems"],
+        100
+    );
+    assert_eq!(
+        schemas["TimelineEventsResponse"]["properties"]["events"]["maxItems"],
+        1000
+    );
+    assert_eq!(
+        schemas["TimelineHealthResponse"]["properties"]["points"]["maxItems"],
+        2000
+    );
+    for (property, width) in [("by_severity", 5), ("by_category", 11)] {
+        assert_eq!(
+            schemas["EventDigest"]["properties"][property]["minItems"],
+            width
+        );
+        assert_eq!(
+            schemas["EventDigest"]["properties"][property]["maxItems"],
+            width
+        );
+    }
+    for property in ["by_sqlstate", "joint_top"] {
+        assert_eq!(
+            schemas["EventDigest"]["properties"][property]["maxItems"],
+            16
+        );
+    }
+}
+
+fn assert_timeline_endpoint_contract(document: &serde_json::Value) {
+    let parameters = &document["components"]["parameters"];
+    let event_sources = &parameters["timelineEventSources"];
+    assert_eq!(event_sources["name"], "source");
+    assert_eq!(event_sources["required"], true);
+    assert_eq!(event_sources["style"], "form");
+    assert_eq!(event_sources["explode"], true);
+    assert_eq!(event_sources["schema"]["type"], "array");
+    assert_eq!(event_sources["schema"]["minItems"], 1);
+    assert_eq!(event_sources["schema"]["maxItems"], 32);
+    assert_eq!(event_sources["schema"]["uniqueItems"], true);
+    assert_eq!(parameters["timelineSource"]["schema"]["type"], "integer");
+    assert_eq!(parameters["timelineFrom"]["schema"]["format"], "int64");
+    assert_eq!(parameters["timelineTo"]["schema"]["format"], "int64");
+    assert_eq!(
+        parameters["timelineHealthStep"]["schema"]["type"],
+        "integer"
+    );
+    assert_eq!(parameters["timelineEventsLimit"]["schema"]["default"], 100);
+    assert_eq!(parameters["timelineEventsLimit"]["schema"]["minimum"], 1);
+    assert_eq!(parameters["timelineEventsLimit"]["schema"]["maximum"], 1000);
+
+    let paths = &document["paths"];
+    assert_eq!(
+        paths["/v1/timeline/overview"]["get"]["parameters"],
+        serde_json::json!([
+            { "$ref": "#/components/parameters/timelineSource" },
+            { "$ref": "#/components/parameters/timelineFrom" },
+            { "$ref": "#/components/parameters/timelineTo" }
+        ])
+    );
+    assert_eq!(
+        paths["/v1/timeline/events"]["get"]["parameters"][0]["$ref"],
+        "#/components/parameters/timelineEventSources"
+    );
+    assert_eq!(
+        paths["/v1/timeline/health"]["get"]["parameters"],
+        serde_json::json!([
+            { "$ref": "#/components/parameters/timelineSource" },
+            { "$ref": "#/components/parameters/timelineFrom" },
+            { "$ref": "#/components/parameters/timelineTo" },
+            { "$ref": "#/components/parameters/timelineHealthStep" }
+        ])
+    );
+    assert_eq!(
+        paths["/v1/timeline/events"]["get"]["responses"]["410"]["$ref"],
+        "#/components/responses/ApplicationProblem"
+    );
+    assert_eq!(
+        paths["/v1/timeline/events"]["get"]["responses"]["503"]["$ref"],
+        "#/components/responses/TimelineCapacityProblem"
+    );
+    for path in ["/v1/timeline/overview", "/v1/timeline/health"] {
+        assert_eq!(
+            paths[path]["get"]["responses"]["503"]["$ref"],
+            "#/components/responses/AnalyticCapacityProblem"
+        );
+    }
+}
+
 fn assert_v1_documented_paths(document: &serde_json::Value) {
     let paths = document["paths"].as_object().expect("OpenAPI paths");
     let mut documented_paths: Vec<_> = paths.keys().map(String::as_str).collect();
@@ -629,6 +801,9 @@ fn assert_v1_documented_paths(document: &serde_json::Value) {
         ("/v1/sections/batch", "NeutralObject"),
         ("/v1/section/{name}/diff", "DiffResponse"),
         ("/v1/sections/batch/diff", "BatchDiffResponse"),
+        ("/v1/timeline/overview", "TimelineOverviewResponse"),
+        ("/v1/timeline/events", "TimelineEventsResponse"),
+        ("/v1/timeline/health", "TimelineHealthResponse"),
         ("/v1/anomalies", "AnomalyResponse"),
         ("/v1/incidents", "IncidentResponse"),
     ];
@@ -693,6 +868,9 @@ fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
                 let expected = match status.as_str() {
                     "401" => "#/components/responses/UnauthorizedProblem",
                     "405" => "#/components/responses/MethodNotAllowedProblem",
+                    "503" if path == "/v1/timeline/events" => {
+                        "#/components/responses/TimelineCapacityProblem"
+                    }
                     "503" => "#/components/responses/AnalyticCapacityProblem",
                     _ => "#/components/responses/ApplicationProblem",
                 };

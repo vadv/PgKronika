@@ -177,10 +177,16 @@ pub struct OverviewConfig {
     pub namespace: Vec<u8>,
     /// Bounded durable-publication fallback.
     pub fallback: FallbackConfig,
-    /// Conservative serialized-response cache byte ceiling.
+    /// Logical serialized-response cache byte ceiling.
     pub response_cache_bytes: usize,
     /// Secondary serialized-response entry ceiling.
     pub response_cache_entries: usize,
+    /// Maximum simultaneously pinned event views.
+    pub cursor_max_views: usize,
+    /// Logical byte ceiling for pinned event views.
+    pub cursor_max_bytes: usize,
+    /// Lifetime of one event cursor and its pinned view.
+    pub cursor_ttl: Duration,
 }
 
 impl OverviewConfig {
@@ -194,6 +200,9 @@ impl OverviewConfig {
             fallback: FallbackConfig::default(),
             response_cache_bytes: RESPONSE_CACHE_BYTES,
             response_cache_entries: RESPONSE_CACHE_ENTRIES,
+            cursor_max_views: 64,
+            cursor_max_bytes: 512 * 1024 * 1024,
+            cursor_ttl: Duration::from_mins(5),
         }
     }
 }
@@ -205,6 +214,8 @@ pub enum StateBuildError {
     Snapshot(std::io::Error),
     /// Overview configuration or assembly failed.
     Overview(OverviewBuildError),
+    /// Cursor registry configuration or authentication-key setup failed.
+    CursorRegistry(std::io::Error),
 }
 
 impl std::fmt::Display for StateBuildError {
@@ -212,6 +223,7 @@ impl std::fmt::Display for StateBuildError {
         match self {
             Self::Snapshot(error) => write!(f, "initial store refresh: {error}"),
             Self::Overview(error) => write!(f, "initial overview build: {error}"),
+            Self::CursorRegistry(error) => write!(f, "cursor registry: {error}"),
         }
     }
 }
@@ -219,7 +231,7 @@ impl std::fmt::Display for StateBuildError {
 impl std::error::Error for StateBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Snapshot(error) => Some(error),
+            Self::Snapshot(error) | Self::CursorRegistry(error) => Some(error),
             Self::Overview(error) => Some(error),
         }
     }
@@ -239,6 +251,7 @@ pub struct AppState {
     pub stale_after: Duration,
     analytic_requests: Arc<Semaphore>,
     timeline_flights: Arc<Mutex<HashMap<overview::cache::ResponseKey, Arc<TimelineFlight>>>>,
+    cursor_registry: Arc<overview::cursor::CursorRegistry>,
     overview: Arc<Mutex<overview::OverviewIndex>>,
     /// Byte-bounded cache of exact serialized timeline responses.
     pub(crate) response_cache: overview::cache::ResponseCache,
@@ -325,6 +338,9 @@ impl AppState {
             fallback,
             response_cache_bytes,
             response_cache_entries,
+            cursor_max_views,
+            cursor_max_bytes,
+            cursor_ttl,
         } = config;
         let delta = snapshot
             .refresh_incremental_delta()
@@ -334,6 +350,13 @@ impl AppState {
         let timeline = overview
             .assemble(&snapshot, &delta)
             .map_err(StateBuildError::Overview)?;
+        let cursor_registry =
+            overview::cursor::CursorRegistry::new(overview::cursor::CursorConfig {
+                max_views: cursor_max_views,
+                max_bytes: cursor_max_bytes,
+                ttl_secs: cursor_ttl.as_secs(),
+            })
+            .map_err(StateBuildError::CursorRegistry)?;
         let published = PublishedStoreView {
             snapshot: Arc::new(snapshot),
             timeline: Arc::new(timeline),
@@ -345,6 +368,7 @@ impl AppState {
             stale_after,
             analytic_requests: Arc::new(Semaphore::new(1)),
             timeline_flights: Arc::new(Mutex::new(HashMap::new())),
+            cursor_registry: Arc::new(cursor_registry),
             overview: Arc::new(Mutex::new(overview)),
             response_cache: overview::cache::ResponseCache::new(
                 response_cache_bytes,
@@ -364,11 +388,13 @@ impl AppState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(flight) = flights.get(key) {
+            metrics::counter!("kronika_web_timeline_singleflight_joins_total").increment(1);
             return TimelineFlightRole::Follower(Arc::clone(flight));
         }
         let flight = Arc::new(TimelineFlight::pending());
         flights.insert(key.clone(), Arc::clone(&flight));
         drop(flights);
+        metrics::counter!("kronika_web_timeline_singleflight_leaders_total").increment(1);
         TimelineFlightRole::Leader(flight)
     }
 
@@ -395,6 +421,18 @@ impl AppState {
         }
     }
 
+    pub(crate) fn cursor_registry(&self) -> &overview::cursor::CursorRegistry {
+        &self.cursor_registry
+    }
+
+    /// Reclaims timeline cursor views whose TTL has elapsed.
+    ///
+    /// The refresh loop calls this independently of store/timeline build
+    /// success, so a failing collector cannot prolong pinned-view retention.
+    pub fn prune_timeline_cursors(&self, now_secs: u64) {
+        self.cursor_registry.prune(now_secs);
+    }
+
     /// Current snapshot from one coherent publication.
     #[must_use]
     pub fn snapshot(&self) -> Arc<LocalDirSnapshot> {
@@ -403,6 +441,12 @@ impl AppState {
 
     pub(crate) fn overview_view(&self) -> Arc<overview::view::IndexView> {
         Arc::clone(&self.published.load().timeline)
+    }
+
+    /// Generation of the timeline view currently published to HTTP readers.
+    #[must_use]
+    pub fn overview_view_generation(&self) -> u64 {
+        self.published.load().timeline.view_generation()
     }
 
     /// Builds and publishes one coherent store/timeline pair.
@@ -437,6 +481,14 @@ impl AppState {
             .set(diagnostics.persistence_failures as f64);
         metrics::gauge!("kronika_web_overview_sealed_failures_total")
             .set(diagnostics.sealed_failures as f64);
+        metrics::gauge!("kronika_web_overview_data_through_us")
+            .set(timeline.data_through_us().unwrap_or_default() as f64);
+        self.cursor_registry.prune(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
         self.published.store(Arc::new(PublishedStoreView {
             snapshot: Arc::new(snapshot),
             timeline: Arc::new(timeline),

@@ -32,8 +32,10 @@ closed_string_enum! {
         UnknownSection => "unknown_section",
         InvalidCursor => "invalid_cursor",
         CursorQueryMismatch => "cursor_query_mismatch",
+        CursorExpired => "cursor_expired",
         ViewGone => "view_gone",
         QueryLimitExceeded => "query_limit_exceeded",
+        CursorCapacityUnavailable => "cursor_capacity_unavailable",
         AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
         StoreReadFailed => "store_read_failed",
         InternalError => "internal_error",
@@ -53,9 +55,11 @@ impl ProblemCode {
             | Self::InvalidQueryConstraint
             | Self::InvalidCursor
             | Self::CursorQueryMismatch => StatusCode::BAD_REQUEST,
-            Self::ViewGone => StatusCode::GONE,
+            Self::CursorExpired | Self::ViewGone => StatusCode::GONE,
             Self::QueryLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::AnalyticCapacityUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::CursorCapacityUnavailable | Self::AnalyticCapacityUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::StoreReadFailed | Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -77,8 +81,12 @@ impl ProblemCode {
             Self::UnknownSection => "https://pgkronika.dev/problems/unknown-section",
             Self::InvalidCursor => "https://pgkronika.dev/problems/invalid-cursor",
             Self::CursorQueryMismatch => "https://pgkronika.dev/problems/cursor-query-mismatch",
+            Self::CursorExpired => "https://pgkronika.dev/problems/cursor-expired",
             Self::ViewGone => "https://pgkronika.dev/problems/view-gone",
             Self::QueryLimitExceeded => "https://pgkronika.dev/problems/query-limit-exceeded",
+            Self::CursorCapacityUnavailable => {
+                "https://pgkronika.dev/problems/cursor-capacity-unavailable"
+            }
             Self::AnalyticCapacityUnavailable => {
                 "https://pgkronika.dev/problems/analytic-capacity-unavailable"
             }
@@ -172,6 +180,7 @@ closed_string_enum! {
         Uint64 => "uint64",
         Int64 => "int64",
         PositiveDuration => "positive_duration",
+        PositiveInteger => "positive_integer",
         NonNegativeFiniteNumber => "non_negative_finite_number",
         NonNegativeInteger => "non_negative_integer",
         SectionList => "section_list",
@@ -380,6 +389,10 @@ impl ApiProblem {
         Self::empty(ProblemCode::CursorQueryMismatch)
     }
 
+    pub(crate) fn cursor_expired() -> Self {
+        Self::empty(ProblemCode::CursorExpired)
+    }
+
     pub(crate) fn view_gone() -> Self {
         Self::empty(ProblemCode::ViewGone)
     }
@@ -397,6 +410,10 @@ impl ApiProblem {
                 observed,
             }),
         )
+    }
+
+    pub(crate) fn cursor_capacity_unavailable() -> Self {
+        Self::empty(ProblemCode::CursorCapacityUnavailable)
     }
 
     pub(crate) fn analytic_capacity_unavailable() -> Self {

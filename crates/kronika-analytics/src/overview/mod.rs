@@ -60,7 +60,7 @@ pub use observation::{
 pub use oracle::{
     MemoryOracle, OracleError, OracleLimits, OracleResource, OracleResult, OracleSourceError,
     RawOracle, SemanticDivergence, fold_counts, observation_in_range, query_bounded,
-    semantic_divergences,
+    query_bounded_materialized, semantic_divergences,
 };
 pub use reduce::{
     AlignmentId, CounterInterval, CounterReduction, CounterSample, GaugeReduction, GaugeSample,

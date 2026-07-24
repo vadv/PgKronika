@@ -6,6 +6,20 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kronika_reader::{FallbackConfig, FallbackConfigError};
+
+use crate::OverviewConfig;
+
+const OVERVIEW_CACHE_DIR_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_DIR";
+const OVERVIEW_NAMESPACE_ENV: &str = "KRONIKA_WEB_OVERVIEW_NAMESPACE";
+const FALLBACK_SEGMENT_HOURS_ENV: &str = "KRONIKA_WEB_OVERVIEW_FALLBACK_SEGMENT_HOURS";
+const FALLBACK_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_FALLBACK_BYTES";
+const RESPONSE_CACHE_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES";
+const RESPONSE_CACHE_ENTRIES_ENV: &str = "KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_ENTRIES";
+const CURSOR_MAX_VIEWS_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS";
+const CURSOR_MAX_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_MAX_BYTES";
+const CURSOR_TTL_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_TTL_S";
+
 /// Normalises a request's method and matched path into metric label values.
 ///
 /// `matched_path` must come from axum's `MatchedPath` extension, not
@@ -61,6 +75,130 @@ pub(crate) fn parse_basic_auth(raw: &str) -> Result<(String, String), String> {
     Ok((user.to_owned(), pass.to_owned()))
 }
 
+#[derive(Clone, Copy, Default)]
+struct OverviewConfigRaw<'a> {
+    cache_dir: Option<&'a str>,
+    namespace: Option<&'a str>,
+    fallback_segment_hours: Option<&'a str>,
+    fallback_bytes: Option<&'a str>,
+    response_cache_bytes: Option<&'a str>,
+    response_cache_entries: Option<&'a str>,
+    cursor_max_views: Option<&'a str>,
+    cursor_max_bytes: Option<&'a str>,
+    cursor_ttl_secs: Option<&'a str>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedOverviewConfig {
+    cache_dir: PathBuf,
+    namespace: Option<Vec<u8>>,
+    fallback: FallbackConfig,
+    response_cache_bytes: usize,
+    response_cache_entries: usize,
+    cursor_max_views: usize,
+    cursor_max_bytes: usize,
+    cursor_ttl: Duration,
+}
+
+fn parse_overview_config(
+    raw: OverviewConfigRaw<'_>,
+    default_cache_dir: PathBuf,
+) -> Result<ParsedOverviewConfig, String> {
+    let defaults = OverviewConfig::new(default_cache_dir, b"default".to_vec());
+    let cache_dir = match raw.cache_dir {
+        Some("") => return Err(format!("{OVERVIEW_CACHE_DIR_ENV} must not be empty")),
+        Some(path) => PathBuf::from(path),
+        None => defaults.cache_root,
+    };
+    let namespace = match raw.namespace {
+        Some("") => return Err(format!("{OVERVIEW_NAMESPACE_ENV} must not be empty")),
+        Some(namespace) => Some(namespace.as_bytes().to_vec()),
+        None => None,
+    };
+    let fallback_segment_hours = parse_nonzero_u64(
+        raw.fallback_segment_hours,
+        FALLBACK_SEGMENT_HOURS_ENV,
+        defaults.fallback.segment_hours(),
+    )?;
+    let fallback_bytes = parse_nonzero_u64(
+        raw.fallback_bytes,
+        FALLBACK_BYTES_ENV,
+        defaults.fallback.bytes(),
+    )?;
+    let fallback =
+        FallbackConfig::new(fallback_segment_hours, fallback_bytes).map_err(|error| {
+            let name = match error {
+                FallbackConfigError::ZeroSegmentHours
+                | FallbackConfigError::SegmentHoursAboveMaximum => FALLBACK_SEGMENT_HOURS_ENV,
+                FallbackConfigError::ZeroBytes | FallbackConfigError::BytesAboveMaximum => {
+                    FALLBACK_BYTES_ENV
+                }
+            };
+            format!("{name}: {error}")
+        })?;
+    let response_cache_bytes = parse_nonzero_usize(
+        raw.response_cache_bytes,
+        RESPONSE_CACHE_BYTES_ENV,
+        defaults.response_cache_bytes,
+    )?;
+    let response_cache_entries = parse_nonzero_usize(
+        raw.response_cache_entries,
+        RESPONSE_CACHE_ENTRIES_ENV,
+        defaults.response_cache_entries,
+    )?;
+    let cursor_max_views = parse_nonzero_usize(
+        raw.cursor_max_views,
+        CURSOR_MAX_VIEWS_ENV,
+        defaults.cursor_max_views,
+    )?;
+    let cursor_max_bytes = parse_nonzero_usize(
+        raw.cursor_max_bytes,
+        CURSOR_MAX_BYTES_ENV,
+        defaults.cursor_max_bytes,
+    )?;
+    let cursor_ttl_secs = parse_nonzero_u64(
+        raw.cursor_ttl_secs,
+        CURSOR_TTL_ENV,
+        defaults.cursor_ttl.as_secs(),
+    )?;
+    Ok(ParsedOverviewConfig {
+        cache_dir,
+        namespace,
+        fallback,
+        response_cache_bytes,
+        response_cache_entries,
+        cursor_max_views,
+        cursor_max_bytes,
+        cursor_ttl: Duration::from_secs(cursor_ttl_secs),
+    })
+}
+
+fn parse_nonzero_u64(raw: Option<&str>, name: &str, default: u64) -> Result<u64, String> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value = raw
+        .parse::<u64>()
+        .map_err(|error| format!("{name} must be a u64: {error}"))?;
+    if value == 0 {
+        return Err(format!("{name} must be non-zero"));
+    }
+    Ok(value)
+}
+
+fn parse_nonzero_usize(raw: Option<&str>, name: &str, default: usize) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value = raw
+        .parse::<u128>()
+        .map_err(|error| format!("{name} must be an unsigned integer: {error}"))?;
+    if value == 0 {
+        return Err(format!("{name} must be non-zero"));
+    }
+    usize::try_from(value).map_err(|_error| format!("{name} does not fit usize"))
+}
+
 /// Validated server configuration parsed from env-var strings.
 pub struct WebConfig {
     /// Store directory to serve.
@@ -78,6 +216,18 @@ pub struct WebConfig {
     /// Explicit stable overview namespace; `None` derives it from the canonical
     /// store path at startup.
     pub overview_namespace: Option<Vec<u8>>,
+    /// Bounded fallback used only after recoverable durable-publication failure.
+    pub overview_fallback: FallbackConfig,
+    /// Serialized overview/health response-cache byte ceiling.
+    pub overview_response_cache_bytes: usize,
+    /// Serialized overview/health response-cache entry ceiling.
+    pub overview_response_cache_entries: usize,
+    /// Maximum simultaneously pinned event views.
+    pub overview_cursor_max_views: usize,
+    /// Logical-byte ceiling for cursor-pinned event views.
+    pub overview_cursor_max_bytes: usize,
+    /// Lifetime of an event cursor and its pinned view.
+    pub overview_cursor_ttl: Duration,
 }
 
 impl std::fmt::Debug for WebConfig {
@@ -100,6 +250,18 @@ impl std::fmt::Debug for WebConfig {
                     .as_ref()
                     .map(|namespace| format!("<{} bytes>", namespace.len())),
             )
+            .field("overview_fallback", &self.overview_fallback)
+            .field(
+                "overview_response_cache_bytes",
+                &self.overview_response_cache_bytes,
+            )
+            .field(
+                "overview_response_cache_entries",
+                &self.overview_response_cache_entries,
+            )
+            .field("overview_cursor_max_views", &self.overview_cursor_max_views)
+            .field("overview_cursor_max_bytes", &self.overview_cursor_max_bytes)
+            .field("overview_cursor_ttl", &self.overview_cursor_ttl)
             .finish()
     }
 }
@@ -110,12 +272,31 @@ impl WebConfig {
     /// `basic_auth_raw`: `Some("user:pass")` or `None` (auth disabled).
     /// `stale_raw`: seconds as a decimal string; `None` defaults to 10 s.
     /// Returns `Err` with a human-readable message on any validation failure.
+    #[cfg(test)]
     pub(crate) fn parse(
         dir: &str,
         addr: &str,
         basic_auth_raw: Option<&str>,
         stale_raw: Option<&str>,
         log: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::parse_with_overview(
+            dir,
+            addr,
+            basic_auth_raw,
+            stale_raw,
+            log,
+            OverviewConfigRaw::default(),
+        )
+    }
+
+    fn parse_with_overview(
+        dir: &str,
+        addr: &str,
+        basic_auth_raw: Option<&str>,
+        stale_raw: Option<&str>,
+        log: Option<&str>,
+        overview_raw: OverviewConfigRaw<'_>,
     ) -> Result<Self, String> {
         let basic_auth = basic_auth_raw.map(parse_basic_auth).transpose()?;
 
@@ -130,14 +311,21 @@ impl WebConfig {
         };
 
         let dir = PathBuf::from(dir);
+        let overview = parse_overview_config(overview_raw, dir.join(".pgkronika-overview-cache"))?;
         Ok(Self {
-            overview_cache_dir: dir.join(".pgkronika-overview-cache"),
+            overview_cache_dir: overview.cache_dir,
             dir,
             addr: addr.to_owned(),
             basic_auth,
             stale_after,
             log: log.unwrap_or("info").to_owned(),
-            overview_namespace: None,
+            overview_namespace: overview.namespace,
+            overview_fallback: overview.fallback,
+            overview_response_cache_bytes: overview.response_cache_bytes,
+            overview_response_cache_entries: overview.response_cache_entries,
+            overview_cursor_max_views: overview.cursor_max_views,
+            overview_cursor_max_bytes: overview.cursor_max_bytes,
+            overview_cursor_ttl: overview.cursor_ttl,
         })
     }
 
@@ -145,7 +333,7 @@ impl WebConfig {
     ///
     /// Required: `KRONIKA_WEB_DIR`, `KRONIKA_WEB_ADDR`.
     /// Optional: `KRONIKA_WEB_BASIC_AUTH`, `KRONIKA_WEB_STALE_AFTER_S`,
-    /// `KRONIKA_WEB_LOG`.
+    /// `KRONIKA_WEB_LOG`, and the `KRONIKA_WEB_OVERVIEW_*` policy variables.
     ///
     /// # Errors
     /// Returns a message when a required variable is unset or a value is invalid.
@@ -157,27 +345,34 @@ impl WebConfig {
         let basic_auth_raw = std::env::var("KRONIKA_WEB_BASIC_AUTH").ok();
         let stale_raw = std::env::var("KRONIKA_WEB_STALE_AFTER_S").ok();
         let log = std::env::var("KRONIKA_WEB_LOG").ok();
+        let overview_cache_dir = std::env::var(OVERVIEW_CACHE_DIR_ENV).ok();
+        let overview_namespace = std::env::var(OVERVIEW_NAMESPACE_ENV).ok();
+        let fallback_segment_hours = std::env::var(FALLBACK_SEGMENT_HOURS_ENV).ok();
+        let fallback_bytes = std::env::var(FALLBACK_BYTES_ENV).ok();
+        let response_cache_bytes = std::env::var(RESPONSE_CACHE_BYTES_ENV).ok();
+        let response_cache_entries = std::env::var(RESPONSE_CACHE_ENTRIES_ENV).ok();
+        let cursor_max_views = std::env::var(CURSOR_MAX_VIEWS_ENV).ok();
+        let cursor_max_bytes = std::env::var(CURSOR_MAX_BYTES_ENV).ok();
+        let cursor_ttl_secs = std::env::var(CURSOR_TTL_ENV).ok();
 
-        let mut config = Self::parse(
+        Self::parse_with_overview(
             &dir,
             &addr,
             basic_auth_raw.as_deref(),
             stale_raw.as_deref(),
             log.as_deref(),
-        )?;
-        if let Ok(cache_dir) = std::env::var("KRONIKA_WEB_OVERVIEW_CACHE_DIR") {
-            if cache_dir.is_empty() {
-                return Err("KRONIKA_WEB_OVERVIEW_CACHE_DIR must not be empty".to_owned());
-            }
-            config.overview_cache_dir = PathBuf::from(cache_dir);
-        }
-        if let Ok(namespace) = std::env::var("KRONIKA_WEB_OVERVIEW_NAMESPACE") {
-            if namespace.is_empty() {
-                return Err("KRONIKA_WEB_OVERVIEW_NAMESPACE must not be empty".to_owned());
-            }
-            config.overview_namespace = Some(namespace.into_bytes());
-        }
-        Ok(config)
+            OverviewConfigRaw {
+                cache_dir: overview_cache_dir.as_deref(),
+                namespace: overview_namespace.as_deref(),
+                fallback_segment_hours: fallback_segment_hours.as_deref(),
+                fallback_bytes: fallback_bytes.as_deref(),
+                response_cache_bytes: response_cache_bytes.as_deref(),
+                response_cache_entries: response_cache_entries.as_deref(),
+                cursor_max_views: cursor_max_views.as_deref(),
+                cursor_max_bytes: cursor_max_bytes.as_deref(),
+                cursor_ttl_secs: cursor_ttl_secs.as_deref(),
+            },
+        )
     }
 }
 
@@ -298,6 +493,201 @@ mod tests {
             PathBuf::from("/data/.pgkronika-overview-cache")
         );
         assert!(cfg.overview_namespace.is_none());
+    }
+
+    #[test]
+    fn overview_raw_defaults_match_runtime_overview_defaults() {
+        let cache_dir = PathBuf::from("/data/cache");
+        let parsed = parse_overview_config(OverviewConfigRaw::default(), cache_dir.clone())
+            .expect("default overview policy is valid");
+        let defaults = OverviewConfig::new(cache_dir.clone(), b"default".to_vec());
+        let expected = ParsedOverviewConfig {
+            cache_dir,
+            namespace: None,
+            fallback: defaults.fallback,
+            response_cache_bytes: defaults.response_cache_bytes,
+            response_cache_entries: defaults.response_cache_entries,
+            cursor_max_views: defaults.cursor_max_views,
+            cursor_max_bytes: defaults.cursor_max_bytes,
+            cursor_ttl: defaults.cursor_ttl,
+        };
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn overview_raw_custom_values_reach_web_config() {
+        let cfg = WebConfig::parse_with_overview(
+            "/data",
+            "127.0.0.1:9000",
+            None,
+            None,
+            None,
+            OverviewConfigRaw {
+                cache_dir: Some("/cache"),
+                namespace: Some("deployment-a"),
+                fallback_segment_hours: Some("48"),
+                fallback_bytes: Some("1048576"),
+                response_cache_bytes: Some("2097152"),
+                response_cache_entries: Some("128"),
+                cursor_max_views: Some("16"),
+                cursor_max_bytes: Some("4194304"),
+                cursor_ttl_secs: Some("60"),
+            },
+        )
+        .expect("custom overview policy is valid");
+        assert_eq!(cfg.overview_cache_dir, PathBuf::from("/cache"));
+        assert_eq!(cfg.overview_namespace, Some(b"deployment-a".to_vec()));
+        assert_eq!(
+            cfg.overview_fallback,
+            FallbackConfig::new(48, 1_048_576).expect("fixture fallback is valid")
+        );
+        assert_eq!(cfg.overview_response_cache_bytes, 2_097_152);
+        assert_eq!(cfg.overview_response_cache_entries, 128);
+        assert_eq!(cfg.overview_cursor_max_views, 16);
+        assert_eq!(cfg.overview_cursor_max_bytes, 4_194_304);
+        assert_eq!(cfg.overview_cursor_ttl, Duration::from_mins(1));
+    }
+
+    #[test]
+    fn web_config_debug_redacts_credentials_and_namespace() {
+        let cfg = WebConfig::parse_with_overview(
+            "/data",
+            "127.0.0.1:9000",
+            Some("alice:secret-password"),
+            None,
+            None,
+            OverviewConfigRaw {
+                namespace: Some("secret-deployment"),
+                ..OverviewConfigRaw::default()
+            },
+        )
+        .expect("config with secrets is valid");
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("secret-password"), "{debug}");
+        assert!(!debug.contains("secret-deployment"), "{debug}");
+        assert!(debug.contains("overview_cursor_max_bytes"), "{debug}");
+    }
+
+    #[test]
+    fn overview_raw_rejects_zero_budgets() {
+        let cases = [
+            (
+                FALLBACK_SEGMENT_HOURS_ENV,
+                OverviewConfigRaw {
+                    fallback_segment_hours: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                FALLBACK_BYTES_ENV,
+                OverviewConfigRaw {
+                    fallback_bytes: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                RESPONSE_CACHE_BYTES_ENV,
+                OverviewConfigRaw {
+                    response_cache_bytes: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                RESPONSE_CACHE_ENTRIES_ENV,
+                OverviewConfigRaw {
+                    response_cache_entries: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                CURSOR_MAX_VIEWS_ENV,
+                OverviewConfigRaw {
+                    cursor_max_views: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                CURSOR_MAX_BYTES_ENV,
+                OverviewConfigRaw {
+                    cursor_max_bytes: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                CURSOR_TTL_ENV,
+                OverviewConfigRaw {
+                    cursor_ttl_secs: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+        ];
+        for (name, raw) in cases {
+            let error = parse_overview_config(raw, PathBuf::from("/cache"))
+                .expect_err("zero budget must fail");
+            assert!(error.contains(name), "wrong error for {name}: {error}");
+        }
+    }
+
+    #[test]
+    fn overview_raw_rejects_fallback_hours_above_hard_maximum() {
+        let value = (kronika_reader::MAX_FALLBACK_SEGMENT_HOURS + 1).to_string();
+        let error = parse_overview_config(
+            OverviewConfigRaw {
+                fallback_segment_hours: Some(&value),
+                ..OverviewConfigRaw::default()
+            },
+            PathBuf::from("/cache"),
+        )
+        .expect_err("fallback hours above the hard maximum must fail");
+        assert!(error.contains(FALLBACK_SEGMENT_HOURS_ENV), "{error}");
+        assert!(error.contains("hard ceiling"), "{error}");
+    }
+
+    #[test]
+    fn overview_raw_rejects_fallback_bytes_above_hard_maximum() {
+        let value = (kronika_reader::MAX_FALLBACK_BYTES + 1).to_string();
+        let error = parse_overview_config(
+            OverviewConfigRaw {
+                fallback_bytes: Some(&value),
+                ..OverviewConfigRaw::default()
+            },
+            PathBuf::from("/cache"),
+        )
+        .expect_err("fallback bytes above the hard maximum must fail");
+        assert!(error.contains(FALLBACK_BYTES_ENV), "{error}");
+        assert!(error.contains("hard ceiling"), "{error}");
+    }
+
+    #[test]
+    fn overview_usize_budget_rejects_platform_overflow() {
+        let value = u128::MAX.to_string();
+        let error = parse_nonzero_usize(Some(&value), RESPONSE_CACHE_BYTES_ENV, 1)
+            .expect_err("a value wider than usize must fail");
+        assert!(error.contains("does not fit usize"), "{error}");
+    }
+
+    #[test]
+    fn overview_raw_rejects_empty_path_and_namespace() {
+        for (name, raw) in [
+            (
+                OVERVIEW_CACHE_DIR_ENV,
+                OverviewConfigRaw {
+                    cache_dir: Some(""),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                OVERVIEW_NAMESPACE_ENV,
+                OverviewConfigRaw {
+                    namespace: Some(""),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+        ] {
+            let error = parse_overview_config(raw, PathBuf::from("/cache"))
+                .expect_err("empty overview identity input must fail");
+            assert!(error.contains(name), "wrong error for {name}: {error}");
+        }
     }
 
     #[test]

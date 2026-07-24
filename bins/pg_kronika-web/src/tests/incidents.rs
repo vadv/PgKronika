@@ -876,9 +876,9 @@ async fn analytic_endpoints_share_fail_fast_admission() {
     for uri in [
         "/v1/incidents?source=7&from=0&to=600000000&window=1m&step=1m",
         "/v1/anomalies?source=7&from=0&to=600000000&window=1m&step=1m",
-        "/v1/timeline/overview?from=0&to=600000000",
-        "/v1/timeline/events?from=0&to=600000000",
-        "/v1/timeline/health?from=0&to=600000000&step=60000000",
+        "/v1/timeline/overview?source=7&from=0&to=600000000",
+        "/v1/timeline/events?source=7&from=0&to=600000000",
+        "/v1/timeline/health?source=7&from=0&to=600000000&step=60000000",
     ] {
         let response = app(state.clone(), None, test_metrics_handle())
             .oneshot(

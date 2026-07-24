@@ -7,6 +7,7 @@
 
 pub(crate) mod cache;
 pub(crate) mod cursor;
+pub(crate) mod dto;
 pub(crate) mod handlers;
 pub(crate) mod health;
 pub(crate) mod live;

@@ -784,6 +784,29 @@ impl LiveView {
         &self.chunks
     }
 
+    /// Checked logical resident charge for this view and its fact chunks.
+    ///
+    /// The charge includes the view, reserved chunk slots, `Arc` counters, and
+    /// each referenced fact set. It returns `None` if a platform-sized total
+    /// cannot be represented.
+    #[must_use]
+    pub fn resident_bytes(&self) -> Option<usize> {
+        const ARC_COUNTER_BYTES: usize = 2 * size_of::<usize>();
+
+        let chunk_slots = self
+            .chunks
+            .capacity()
+            .checked_mul(size_of::<Arc<SegmentFacts>>())?;
+        self.chunks.iter().try_fold(
+            size_of::<Self>().checked_add(chunk_slots)?,
+            |total, facts| {
+                total
+                    .checked_add(ARC_COUNTER_BYTES)?
+                    .checked_add(facts.resident_bytes()?)
+            },
+        )
+    }
+
     /// Catalog coverage envelope across every folded part.
     #[must_use]
     pub fn coverage(&self) -> Coverage {

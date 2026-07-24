@@ -129,13 +129,23 @@ async fn serve(dir: &std::path::Path, uri: &str) -> (StatusCode, serde_json::Val
     (response.status, response.body)
 }
 
-async fn serve_captured(
-    dir: &std::path::Path,
-    uri: &str,
-    request_headers: &[(&str, &str)],
-) -> CapturedResponse {
+async fn serve_state(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = app(state, None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("route request");
+    let captured = capture_json(response).await;
+    (captured.status, captured.body)
+}
+
+fn state_for_dir(dir: &std::path::Path) -> AppState {
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
-    let state = AppState::with_overview_config(
+    AppState::with_overview_config(
         snapshot,
         0,
         std::time::Duration::from_secs(10),
@@ -144,7 +154,15 @@ async fn serve_captured(
             dir.as_os_str().as_encoded_bytes().to_vec(),
         ),
     )
-    .expect("state");
+    .expect("state")
+}
+
+async fn serve_captured(
+    dir: &std::path::Path,
+    uri: &str,
+    request_headers: &[(&str, &str)],
+) -> CapturedResponse {
+    let state = state_for_dir(dir);
     let mut request = Request::builder().uri(uri);
     for &(name, value) in request_headers {
         request = request.header(name, value);

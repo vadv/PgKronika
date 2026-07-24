@@ -91,6 +91,14 @@ impl Coverage {
         self.spans.is_empty()
     }
 
+    /// Heap bytes reserved by the normalized span vector.
+    ///
+    /// Returns `None` if the platform-sized byte count cannot be represented.
+    #[must_use]
+    pub const fn resident_heap_bytes(&self) -> Option<usize> {
+        self.spans.capacity().checked_mul(size_of::<CoverageSpan>())
+    }
+
     /// Total covered microseconds. Overlaps count once by construction.
     #[must_use]
     pub fn covered_duration_us(&self) -> u64 {

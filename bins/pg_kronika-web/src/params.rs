@@ -18,15 +18,28 @@ pub(crate) const MAX_QUERY_BYTES: usize = 8_192;
 /// Maximum query pairs admitted before decoding.
 pub(crate) const MAX_QUERY_PARAMETERS: usize = 32;
 
-/// A validated query whose keys are known, allowed for the route, and unique.
+/// A validated query whose keys are known and allowed for the route.
+///
+/// Values are unique unless the route explicitly opts a parameter into bounded
+/// repetition. This keeps scalar duplicate rejection while allowing canonical
+/// source sets on the timeline events endpoint.
 #[derive(Debug)]
 pub(crate) struct QueryParams {
-    values: [Option<String>; QueryParameter::COUNT],
+    values: [Vec<String>; QueryParameter::COUNT],
 }
 
 impl QueryParams {
     /// Decode and validate one raw query against the route allowlist.
     pub(crate) fn parse(raw: Option<&str>, allowed: &[QueryParameter]) -> Result<Self, ApiProblem> {
+        Self::parse_with_repeatable(raw, allowed, &[])
+    }
+
+    /// Decode a query with an explicit set of repeatable parameters.
+    pub(crate) fn parse_with_repeatable(
+        raw: Option<&str>,
+        allowed: &[QueryParameter],
+        repeatable: &[QueryParameter],
+    ) -> Result<Self, ApiProblem> {
         let raw = raw.unwrap_or_default();
         if raw.len() > MAX_QUERY_BYTES {
             return Err(ApiProblem::query_limit_exceeded(
@@ -48,7 +61,7 @@ impl QueryParams {
         }
         validate_query_encoding(raw)?;
 
-        let mut values: [Option<String>; QueryParameter::COUNT] = std::array::from_fn(|_| None);
+        let mut values: [Vec<String>; QueryParameter::COUNT] = std::array::from_fn(|_| Vec::new());
         for (name, value) in form_urlencoded::parse(raw.as_bytes()) {
             let Some(parameter) = QueryParameter::from_query_name(&name) else {
                 return Err(ApiProblem::unknown_query_parameter(&name));
@@ -57,16 +70,20 @@ impl QueryParams {
                 return Err(ApiProblem::unknown_query_parameter(&name));
             }
             let slot = &mut values[parameter.index()];
-            if slot.is_some() {
+            if !slot.is_empty() && !repeatable.contains(&parameter) {
                 return Err(ApiProblem::duplicate_query_parameter(parameter));
             }
-            *slot = Some(value.into_owned());
+            slot.push(value.into_owned());
         }
         Ok(Self { values })
     }
 
     pub(crate) fn get(&self, parameter: QueryParameter) -> Option<&str> {
-        self.values[parameter.index()].as_deref()
+        self.values[parameter.index()].first().map(String::as_str)
+    }
+
+    pub(crate) fn values(&self, parameter: QueryParameter) -> &[String] {
+        &self.values[parameter.index()]
     }
 }
 
