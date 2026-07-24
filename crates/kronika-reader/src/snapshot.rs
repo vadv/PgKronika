@@ -901,10 +901,10 @@ fn sealed_delta(
 
 fn sealed_warning_locator(warning: &StoreWarning, root: &Path) -> Option<SealedLocator> {
     if warning.path.parent() != Some(root)
-        || !warning
+        || warning
             .path
             .extension()
-            .is_some_and(|extension| extension.as_bytes() == b"pgm")
+            .is_none_or(|extension| extension.as_bytes() != b"pgm")
     {
         return None;
     }
@@ -983,7 +983,7 @@ fn journal_prefix_digest(root: &Path, valid_len: u64) -> io::Result<JournalPrefi
 
     let mut file = std::fs::File::open(root.join("active.parts"))?;
     let mut remaining = valid_len;
-    let mut buffer = [0_u8; JOURNAL_HASH_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; JOURNAL_HASH_BUFFER_BYTES].into_boxed_slice();
     let buffer_len = u64::try_from(buffer.len())
         .map_err(|_error| io::Error::other("journal hash buffer length overflow"))?;
     while remaining > 0 {

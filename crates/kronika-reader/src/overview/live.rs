@@ -330,42 +330,7 @@ impl LiveBuilder {
     /// journal generation does not continue this builder, or the descriptor
     /// sequence contradicts the validated journal watermark.
     pub fn begin_refresh(&mut self, delta: &RefreshDelta) -> Result<(), LiveFoldError> {
-        if self.pending_refresh.is_some() {
-            return Err(LiveFoldError::InvalidState);
-        }
-        let bootstrap = delta.journal.bootstrap;
-        if bootstrap && self.baseline_pinned {
-            self.state = LiveState::NeedsRebuild;
-            return Err(LiveFoldError::RefreshMismatch);
-        }
-        if !bootstrap && !self.baseline_pinned {
-            self.state = LiveState::NeedsRebuild;
-            return Err(LiveFoldError::RefreshMismatch);
-        }
-        if !bootstrap && delta.previous_view_generation != self.view_generation {
-            self.state = LiveState::NeedsRebuild;
-            return Err(LiveFoldError::ViewGenerationMismatch);
-        }
-        if self.refresh_changes_view(delta) && !delta.view_changed {
-            self.state = LiveState::NeedsRebuild;
-            return Err(LiveFoldError::RefreshMismatch);
-        }
-        if let Err(error) = validate_view_generation(
-            delta.previous_view_generation,
-            delta.new_view_generation,
-            delta.view_changed,
-        ) {
-            self.state = match error {
-                LiveFoldError::Overflow => LiveState::Incomplete,
-                _ => LiveState::NeedsRebuild,
-            };
-            return Err(error);
-        }
-        if bootstrap {
-            self.view_generation = delta.previous_view_generation;
-            self.clear_folded(delta.journal.generation_id);
-            self.baseline_pinned = true;
-        }
+        let bootstrap = self.prepare_refresh_baseline(delta)?;
 
         if let Err(error) = validate_descriptor_sequence(
             &delta.journal.current_parts,
@@ -434,6 +399,46 @@ impl LiveBuilder {
         });
         self.state = LiveState::Warming;
         Ok(())
+    }
+
+    fn prepare_refresh_baseline(&mut self, delta: &RefreshDelta) -> Result<bool, LiveFoldError> {
+        if self.pending_refresh.is_some() {
+            return Err(LiveFoldError::InvalidState);
+        }
+        let bootstrap = delta.journal.bootstrap;
+        if bootstrap && self.baseline_pinned {
+            self.state = LiveState::NeedsRebuild;
+            return Err(LiveFoldError::RefreshMismatch);
+        }
+        if !bootstrap && !self.baseline_pinned {
+            self.state = LiveState::NeedsRebuild;
+            return Err(LiveFoldError::RefreshMismatch);
+        }
+        if !bootstrap && delta.previous_view_generation != self.view_generation {
+            self.state = LiveState::NeedsRebuild;
+            return Err(LiveFoldError::ViewGenerationMismatch);
+        }
+        if self.refresh_changes_view(delta) && !delta.view_changed {
+            self.state = LiveState::NeedsRebuild;
+            return Err(LiveFoldError::RefreshMismatch);
+        }
+        if let Err(error) = validate_view_generation(
+            delta.previous_view_generation,
+            delta.new_view_generation,
+            delta.view_changed,
+        ) {
+            self.state = match error {
+                LiveFoldError::Overflow => LiveState::Incomplete,
+                _ => LiveState::NeedsRebuild,
+            };
+            return Err(error);
+        }
+        if bootstrap {
+            self.view_generation = delta.previous_view_generation;
+            self.clear_folded(delta.journal.generation_id);
+            self.baseline_pinned = true;
+        }
+        Ok(bootstrap)
     }
 
     fn refresh_changes_view(&self, delta: &RefreshDelta) -> bool {
@@ -884,7 +889,7 @@ pub fn reconcile_seal<R: ReadAt>(
         && let Some(promoted) =
             SegmentFacts::try_promote_from_parts(sealed_unit, sealed_context, &parts, bounds)?
     {
-        let (facts, persist_error) = store.admit_publish_or_fallback(promoted, bounds)?;
+        let (facts, persist_error) = store.admit_publish_or_fallback(&promoted, bounds)?;
         return Ok(SealOutcome::Promoted {
             facts,
             persist_error,

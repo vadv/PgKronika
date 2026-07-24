@@ -248,7 +248,7 @@ impl FactStore {
 
                 let (facts, pgm_body_read_stats) =
                     SegmentFacts::extract_with_stats(unit, context, bounds)?;
-                let (facts, persist_error) = self.admit_publish_or_fallback(facts, bounds)?;
+                let (facts, persist_error) = self.admit_publish_or_fallback(&facts, bounds)?;
                 Ok(FactLoad {
                     facts,
                     origin: FactOrigin::Rebuilt,
@@ -297,7 +297,7 @@ impl FactStore {
 
     pub(super) fn admit_publish_or_fallback(
         &self,
-        facts: SegmentFacts,
+        facts: &SegmentFacts,
         bounds: &Bounds,
     ) -> Result<(Arc<SegmentFacts>, Option<PersistError>), BuildError> {
         let bytes = facts.encode(bounds).map_err(BuildError::from)?;
@@ -741,7 +741,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-    use std::sync::{Arc, Barrier};
+    use std::sync::Barrier;
 
     use kronika_analytics::overview::{NamingContractId, SegmentLocator};
     use kronika_format::{PartMeta, SectionInput, build_part};

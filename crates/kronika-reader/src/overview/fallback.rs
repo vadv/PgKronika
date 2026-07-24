@@ -50,7 +50,7 @@ pub enum FallbackConfigError {
 }
 
 impl std::fmt::Display for FallbackConfigError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
             Self::ZeroSegmentHours => "fallback segment-hour budget must be non-zero",
             Self::SegmentHoursAboveMaximum => {
@@ -59,7 +59,7 @@ impl std::fmt::Display for FallbackConfigError {
             Self::ZeroBytes => "fallback byte budget must be non-zero",
             Self::BytesAboveMaximum => "fallback byte budget exceeds the hard ceiling",
         };
-        formatter.write_str(message)
+        f.write_str(message)
     }
 }
 
@@ -237,9 +237,8 @@ pub(super) struct FallbackFactLru {
 }
 
 impl std::fmt::Debug for FallbackFactLru {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FallbackFactLru")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FallbackFactLru")
             .field("config", &self.config)
             .field("stats", &self.stats())
             .finish_non_exhaustive()
@@ -432,17 +431,15 @@ fn segment_hour_weight(min_ts_us: i64, max_ts_us: i64) -> u64 {
     u64::try_from(hours.max(1)).unwrap_or(u64::MAX)
 }
 
-fn saturating_increment(counter: &mut u64) {
+const fn saturating_increment(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Barrier, Mutex};
 
-    use kronika_analytics::overview::{
-        NamingContractId, SegmentLineageId, SegmentLocator, SourceScopeId,
-    };
+    use kronika_analytics::overview::{NamingContractId, SegmentLocator, SourceScopeId};
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_registry::pg_log::PgLogLifecycleV1;
     use kronika_registry::{Section, Ts};
@@ -765,6 +762,7 @@ mod tests {
         assert_eq!(cache.stats().resident_bytes, 10);
         assert_eq!(cache.stats().inserts, 4);
         assert_eq!(cache.stats().publication_failure_fallbacks, 4);
+        drop(cache);
     }
 
     #[test]
