@@ -56,8 +56,8 @@ pub use query::{
 };
 pub use refresh::{
     ByteRange, CatalogDigest, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor,
-    PartId, PartTransition, RefreshDelta, SegmentDescriptor, catalog_digest, classify_transition,
-    part_id,
+    PartId, PartTransition, RefreshDelta, SealedLocator, SegmentDescriptor, catalog_digest,
+    classify_transition, part_id,
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta};
 

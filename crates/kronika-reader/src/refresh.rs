@@ -4,6 +4,7 @@ use kronika_format::{Catalog, DamageRegion};
 use sha2::{Digest as _, Sha256};
 
 const CATALOG_DIGEST_DOMAIN: &[u8] = b"pgk-overview-catalog-v1\0";
+const SEALED_LOCATOR_DOMAIN: &[u8] = b"pgk-overview-sealed-locator-v1\0";
 
 /// SHA-256 identity of an offset-independent catalog descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -11,6 +12,32 @@ pub struct CatalogDigest([u8; 32]);
 
 impl CatalogDigest {
     /// Returns the digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Stable identity of one direct-child sealed file name.
+///
+/// The locator deliberately excludes the root directory, so moving a complete
+/// store does not rename its segments. It includes the exact Unix file-name
+/// bytes, so two names containing identical segment content remain distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SealedLocator([u8; 32]);
+
+impl SealedLocator {
+    /// Derives a domain-separated locator from direct-child file-name bytes.
+    #[must_use]
+    pub fn from_file_name_bytes(file_name: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(SEALED_LOCATOR_DOMAIN);
+        hasher.update((file_name.len() as u128).to_le_bytes());
+        hasher.update(file_name);
+        Self(hasher.finalize().into())
+    }
+
+    /// Returns the locator bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -95,11 +122,14 @@ pub struct PartDescriptor {
     pub max_ts: i64,
 }
 
-/// Offset-independent identity of one sealed segment.
+/// Stable identity and offset-independent catalog descriptor of one sealed segment.
 ///
-/// The descriptor identifies catalog content, not a file path or section body.
+/// The locator identifies the direct-child file name, while the catalog digest
+/// identifies its content without depending on section-body offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentDescriptor {
+    /// Stable identity derived from the exact direct-child file-name bytes.
+    pub locator: SealedLocator,
     /// Source identifier from the segment catalog.
     pub source_id: u64,
     /// Earliest timestamp in the segment.
@@ -111,10 +141,11 @@ pub struct SegmentDescriptor {
 }
 
 impl SegmentDescriptor {
-    /// Derives a segment descriptor from a decoded catalog.
+    /// Derives a segment descriptor from a stable locator and decoded catalog.
     #[must_use]
-    pub fn from_catalog(catalog: &Catalog) -> Self {
+    pub fn from_catalog(locator: SealedLocator, catalog: &Catalog) -> Self {
         Self {
+            locator,
             source_id: catalog.source_id,
             min_ts: catalog.min_ts,
             max_ts: catalog.max_ts,
@@ -135,6 +166,12 @@ pub struct ByteRange {
 /// Journal-scoped portion of a refresh delta.
 #[derive(Debug, Clone)]
 pub struct JournalDelta {
+    /// Whether this delta delivers a baseline that has not been consumed yet.
+    ///
+    /// A bootstrap re-lists every current part even though
+    /// `previous_valid_len` remains the physical watermark captured by the
+    /// preceding open or non-delta refresh.
+    pub bootstrap: bool,
     /// Generation the post-refresh journal belongs to.
     pub generation_id: JournalGenerationId,
     /// Validated journal length before this refresh.
@@ -143,6 +180,16 @@ pub struct JournalDelta {
     pub new_valid_len: u64,
     /// Parts that completed since the previous scan, in journal order.
     pub completed_parts: Vec<PartDescriptor>,
+    /// Every valid part in the post-refresh journal, in journal order.
+    ///
+    /// This is the authoritative completion target when
+    /// [`current_parts_complete`](Self::current_parts_complete) is `true`.
+    pub current_parts: Vec<PartDescriptor>,
+    /// Whether `current_parts` is an authoritative descriptor set.
+    ///
+    /// An `active.parts` warning makes this `false`: callers must not publish a
+    /// view from a scan that may have skipped journal content.
+    pub current_parts_complete: bool,
     /// Proven continuity class of the tail.
     pub transition: PartTransition,
     /// Torn-tail bytes past the validated prefix, when present.
@@ -411,9 +458,26 @@ mod tests {
 
     #[test]
     fn distinct_catalog_content_yields_distinct_segment_digests() {
-        let first = SegmentDescriptor::from_catalog(&part_catalog(1_000, 2_000, 7));
-        let later = SegmentDescriptor::from_catalog(&part_catalog(3_000, 4_000, 7));
+        let locator = SealedLocator::from_file_name_bytes(b"1000.pgm");
+        let first = SegmentDescriptor::from_catalog(locator, &part_catalog(1_000, 2_000, 7));
+        let later = SegmentDescriptor::from_catalog(locator, &part_catalog(3_000, 4_000, 7));
         assert_ne!(first.catalog_digest, later.catalog_digest);
+    }
+
+    #[test]
+    fn identical_catalogs_under_distinct_names_have_distinct_locators() {
+        let catalog = part_catalog(1_000, 2_000, 7);
+        let first = SegmentDescriptor::from_catalog(
+            SealedLocator::from_file_name_bytes(b"1000.pgm"),
+            &catalog,
+        );
+        let alias = SegmentDescriptor::from_catalog(
+            SealedLocator::from_file_name_bytes(b"segment-copy.pgm"),
+            &catalog,
+        );
+
+        assert_eq!(first.catalog_digest, alias.catalog_digest);
+        assert_ne!(first.locator, alias.locator);
     }
 
     #[test]
@@ -424,10 +488,13 @@ mod tests {
             sealed_added: Vec::new(),
             sealed_removed: Vec::new(),
             journal: JournalDelta {
+                bootstrap: false,
                 generation_id: JournalGenerationId(5),
                 previous_valid_len: 100,
                 new_valid_len: 100,
                 completed_parts: Vec::new(),
+                current_parts: Vec::new(),
+                current_parts_complete: true,
                 transition: PartTransition::Uncertain,
                 tail_pending: None,
                 damages: Vec::new(),

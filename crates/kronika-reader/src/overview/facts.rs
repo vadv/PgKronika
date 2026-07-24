@@ -293,9 +293,9 @@ impl SegmentFacts {
 
     /// Promotes matching live parts without rereading sealed event bodies.
     ///
-    /// The parts must be the ordered constituents of the sealed segment: the
-    /// Their ordered catalogs, source identity, timestamp envelope, and
-    /// referenced dictionary values must match the sealed PGM. Dictionary
+    /// The parts must be the ordered constituents of the sealed segment. Their
+    /// catalogs, source identity, timestamp envelope, and referenced dictionary
+    /// values must match the sealed PGM. Dictionary
     /// sections are read when rows contain references. A match re-keys retained
     /// observations to sealed provenance; a mismatch returns `Ok(None)`.
     ///
@@ -324,7 +324,7 @@ impl SegmentFacts {
         }
 
         let (identity, lineage) = Self::provenance(sealed_unit, sealed_context)?;
-        if !promotion_source_matches(identity, parts) {
+        if !promotion_source_matches(identity, sealed_context, parts) {
             return Ok(None);
         }
         let Some(dictionary_fingerprints) = promotion_dictionary(sealed_unit, parts, bounds)?
@@ -661,7 +661,11 @@ fn parts_have_timestamp_fallback(parts: &[&SegmentFacts]) -> bool {
     })
 }
 
-fn promotion_source_matches(identity: HeaderIdentity, parts: &[&SegmentFacts]) -> bool {
+fn promotion_source_matches(
+    identity: HeaderIdentity,
+    sealed_context: &SegmentContext,
+    parts: &[&SegmentFacts],
+) -> bool {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     for part in parts {
@@ -678,6 +682,8 @@ fn promotion_source_matches(identity: HeaderIdentity, parts: &[&SegmentFacts]) -
         && parts.iter().all(|part| {
             part.identity.source_format_version == identity.source_format_version
                 && (part.identity.pgm_source_id == 0
+                    && part.identity.source_scope_id
+                        == source_scope_id(sealed_context.store_namespace(), 0)
                     || (part.identity.pgm_source_id == identity.pgm_source_id
                         && part.identity.source_scope_id == identity.source_scope_id))
         })

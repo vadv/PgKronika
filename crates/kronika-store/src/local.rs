@@ -57,9 +57,9 @@ impl LocalDir {
     pub fn scan(&self) -> io::Result<LocalScan> {
         let mut warnings = Vec::new();
 
-        // Scan active.parts before sealed files. During seal, this captures the
-        // journal copy before reset; after seal, the later sealed-file scan
-        // finds the .pgm copy and the snapshot layer deduplicates.
+        // Scan active.parts before sealed files to narrow the seal window. This
+        // ordering is not an atomic cross-file view; the snapshot layer can
+        // deduplicate only copies whose catalogs are both observed.
         let journal_path = self.root.join("active.parts");
         let (active, damages, valid_len) = match File::open(&journal_path) {
             Ok(file) => {

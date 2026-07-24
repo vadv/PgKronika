@@ -4,12 +4,14 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use kronika_analytics::overview::{
-    Coverage, CoverageSpan, OracleError, OracleLimits, OracleResult, RawOracle, query_bounded,
+    Coverage, CoverageSpan, OracleError, OracleLimits, OracleResult, OracleSourceError, RawOracle,
+    query_bounded,
 };
-use kronika_format::ReadAt;
+use kronika_format::{DamageKind, DamageRegion, FRAME_HEADER_LEN, ReadAt};
 
 use crate::refresh::{
-    JournalGenerationId, PartDescriptor, PartId, catalog_digest as refresh_catalog_digest,
+    ByteRange, JournalGenerationId, PartDescriptor, PartId, RefreshDelta,
+    catalog_digest as refresh_catalog_digest,
 };
 use crate::unit::PgmUnit;
 
@@ -62,6 +64,13 @@ pub enum LiveFoldError {
     LimitExceeded,
     /// The builder must be reset before it can accept another part.
     InvalidState,
+    /// The refresh does not continue the builder's pinned view generation.
+    ViewGenerationMismatch,
+    /// The refresh's complete descriptor set is inconsistent with its
+    /// transition or validated byte watermark.
+    RefreshMismatch,
+    /// The refresh did not provide one authoritative, damage-safe active view.
+    IncompleteRefresh,
     /// A folded offset or watermark exceeded the checked integer range.
     Overflow,
 }
@@ -77,6 +86,15 @@ impl std::fmt::Display for LiveFoldError {
             Self::NonMonotonePart => f.write_str("part position overlaps or precedes folded state"),
             Self::LimitExceeded => f.write_str("live view safety limit exceeded"),
             Self::InvalidState => f.write_str("live builder requires a reset"),
+            Self::ViewGenerationMismatch => {
+                f.write_str("refresh does not continue the pinned view generation")
+            }
+            Self::RefreshMismatch => {
+                f.write_str("refresh descriptors do not match its journal watermark")
+            }
+            Self::IncompleteRefresh => {
+                f.write_str("refresh did not produce an authoritative active view")
+            }
             Self::Overflow => f.write_str("folded offset or watermark overflow"),
         }
     }
@@ -91,6 +109,9 @@ impl std::error::Error for LiveFoldError {
             | Self::NonMonotonePart
             | Self::LimitExceeded
             | Self::InvalidState
+            | Self::ViewGenerationMismatch
+            | Self::RefreshMismatch
+            | Self::IncompleteRefresh
             | Self::Overflow => None,
         }
     }
@@ -125,6 +146,7 @@ struct LiveUsage {
     manifest_entries: u64,
     observations: u64,
     coverage_spans: u64,
+    known_gap_spans: u64,
     retained_text_bytes: u64,
 }
 
@@ -135,6 +157,8 @@ impl LiveUsage {
         let observations =
             u64::try_from(facts.observations().len()).map_err(|_error| LiveFoldError::Overflow)?;
         let coverage_spans = u64::try_from(facts.coverage().spans().len())
+            .map_err(|_error| LiveFoldError::Overflow)?;
+        let known_gap_spans = u64::try_from(facts.loss_coverage().known_gaps().spans().len())
             .map_err(|_error| LiveFoldError::Overflow)?;
         Ok(Self {
             parts: self.parts.checked_add(1).ok_or(LiveFoldError::Overflow)?,
@@ -150,6 +174,10 @@ impl LiveUsage {
                 .coverage_spans
                 .checked_add(coverage_spans)
                 .ok_or(LiveFoldError::Overflow)?,
+            known_gap_spans: self
+                .known_gap_spans
+                .checked_add(known_gap_spans)
+                .ok_or(LiveFoldError::Overflow)?,
             retained_text_bytes: self
                 .retained_text_bytes
                 .checked_add(facts.retained_text_bytes())
@@ -162,8 +190,19 @@ impl LiveUsage {
             && self.manifest_entries <= u64::from(bounds.directory_entries)
             && self.observations <= bounds.items_per_block
             && self.coverage_spans <= bounds.coverage_spans
+            && self.known_gap_spans <= bounds.coverage_spans
             && self.retained_text_bytes <= bounds.string_table_bytes
     }
+}
+
+#[derive(Debug, Clone)]
+struct PendingRefresh {
+    new_view_generation: u64,
+    new_valid_len: u64,
+    current_parts: Vec<PartDescriptor>,
+    current_parts_complete: bool,
+    tail_pending: Option<ByteRange>,
+    damages: Vec<DamageRegion>,
 }
 
 /// The single mutable writer that folds completed parts into live facts.
@@ -172,13 +211,19 @@ pub struct LiveBuilder {
     store_namespace: Vec<u8>,
     bounds: Bounds,
     state: LiveState,
+    baseline_pinned: bool,
+    rebaseline_prepared: bool,
+    view_generation: u64,
     generation: JournalGenerationId,
     folded_part_ids: BTreeSet<PartId>,
+    folded_parts: Vec<PartDescriptor>,
     chunks: Vec<Arc<SegmentFacts>>,
     usage: LiveUsage,
     source_id: Option<u64>,
     watermark_us: Option<i64>,
     folded_through_offset: u64,
+    completed_tail_pending: Option<ByteRange>,
+    pending_refresh: Option<PendingRefresh>,
 }
 
 impl LiveBuilder {
@@ -205,14 +250,20 @@ impl LiveBuilder {
         Ok(Self {
             store_namespace,
             bounds,
-            state: LiveState::Empty,
+            state: LiveState::Warming,
+            baseline_pinned: false,
+            rebaseline_prepared: false,
+            view_generation: 0,
             generation: JournalGenerationId(0),
             folded_part_ids: BTreeSet::new(),
+            folded_parts: Vec::new(),
             chunks: Vec::new(),
             usage: LiveUsage::default(),
             source_id: None,
             watermark_us: None,
             folded_through_offset: 0,
+            completed_tail_pending: None,
+            pending_refresh: None,
         })
     }
 
@@ -226,6 +277,12 @@ impl LiveBuilder {
     #[must_use]
     pub const fn generation(&self) -> JournalGenerationId {
         self.generation
+    }
+
+    /// Snapshot generation consumed by the last completed refresh.
+    #[must_use]
+    pub const fn view_generation(&self) -> u64 {
+        self.view_generation
     }
 
     /// Number of folded chunks (one per completed part).
@@ -248,18 +305,192 @@ impl LiveBuilder {
 
     /// Discards folded state and enters a fresh generation.
     ///
-    /// A refresh that cannot prove append continuity (reset, replacement, or an
-    /// uncertain rewrite) calls this before re-folding the current parts, so a
-    /// part from a stale generation is never mixed into the new view.
+    /// This prepares an explicit caller-directed rebaseline. The next
+    /// [`begin_refresh`](Self::begin_refresh) must carry this generation and
+    /// re-deliver its complete current descriptor set; direct part folding
+    /// remains unavailable.
     pub fn reset_to(&mut self, generation: JournalGenerationId) {
-        self.generation = generation;
-        self.folded_part_ids.clear();
-        self.chunks.clear();
-        self.usage = LiveUsage::default();
-        self.source_id = None;
-        self.watermark_us = None;
-        self.folded_through_offset = 0;
+        self.clear_folded(generation);
+        self.pending_refresh = None;
+        self.baseline_pinned = true;
+        self.rebaseline_prepared = true;
         self.state = LiveState::Warming;
+    }
+
+    /// Starts consumption of one complete snapshot refresh.
+    ///
+    /// The builder copies the refresh's authoritative descriptor set and
+    /// completion evidence before accepting any PGM body. Until
+    /// [`complete_refresh`](Self::complete_refresh) succeeds, published views
+    /// remain unavailable for queries and promotion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiveFoldError`] when another refresh is pending, the view or
+    /// journal generation does not continue this builder, or the descriptor
+    /// sequence contradicts the validated journal watermark.
+    pub fn begin_refresh(&mut self, delta: &RefreshDelta) -> Result<(), LiveFoldError> {
+        if self.pending_refresh.is_some() {
+            return Err(LiveFoldError::InvalidState);
+        }
+        let bootstrap = delta.journal.bootstrap;
+        if bootstrap && self.baseline_pinned {
+            self.state = LiveState::NeedsRebuild;
+            return Err(LiveFoldError::RefreshMismatch);
+        }
+        if !bootstrap && !self.baseline_pinned {
+            self.state = LiveState::NeedsRebuild;
+            return Err(LiveFoldError::RefreshMismatch);
+        }
+        if !bootstrap && delta.previous_view_generation != self.view_generation {
+            self.state = LiveState::NeedsRebuild;
+            return Err(LiveFoldError::ViewGenerationMismatch);
+        }
+        let changes_view = self.refresh_changes_view(delta);
+        if let Err(error) = validate_view_generation(
+            delta.previous_view_generation,
+            delta.new_view_generation,
+            changes_view,
+        ) {
+            self.state = match error {
+                LiveFoldError::Overflow => LiveState::Incomplete,
+                _ => LiveState::NeedsRebuild,
+            };
+            return Err(error);
+        }
+        if bootstrap {
+            self.view_generation = delta.previous_view_generation;
+            self.clear_folded(delta.journal.generation_id);
+            self.baseline_pinned = true;
+        }
+
+        if let Err(error) = validate_descriptor_sequence(
+            &delta.journal.current_parts,
+            delta.journal.generation_id,
+            delta.journal.new_valid_len,
+        ) {
+            self.state = LiveState::Incomplete;
+            return Err(error);
+        }
+
+        if bootstrap {
+            if delta.journal.completed_parts != delta.journal.current_parts {
+                self.state = LiveState::NeedsRebuild;
+                return Err(LiveFoldError::RefreshMismatch);
+            }
+        } else if self.rebaseline_prepared {
+            if delta.journal.generation_id != self.generation
+                || delta.journal.completed_parts != delta.journal.current_parts
+            {
+                self.state = LiveState::NeedsRebuild;
+                return Err(LiveFoldError::RefreshMismatch);
+            }
+        } else if delta.journal.transition.preserves_generation() {
+            if matches!(self.state, LiveState::NeedsRebuild | LiveState::Incomplete) {
+                return Err(LiveFoldError::InvalidState);
+            }
+            if delta.journal.generation_id != self.generation {
+                self.state = LiveState::NeedsRebuild;
+                return Err(LiveFoldError::GenerationMismatch);
+            }
+            if delta.journal.current_parts_complete
+                && (delta.journal.previous_valid_len != self.folded_through_offset
+                    || !delta.journal.current_parts.starts_with(&self.folded_parts)
+                    || delta.journal.completed_parts
+                        != delta.journal.current_parts[self.folded_parts.len()..])
+            {
+                self.state = LiveState::NeedsRebuild;
+                return Err(LiveFoldError::RefreshMismatch);
+            }
+        } else {
+            let Some(next_generation) = self.generation.0.checked_add(1) else {
+                self.state = LiveState::Incomplete;
+                return Err(LiveFoldError::Overflow);
+            };
+            if delta.journal.generation_id != JournalGenerationId(next_generation) {
+                self.state = LiveState::NeedsRebuild;
+                return Err(LiveFoldError::GenerationMismatch);
+            }
+            if delta.journal.current_parts_complete
+                && delta.journal.completed_parts != delta.journal.current_parts
+            {
+                self.state = LiveState::NeedsRebuild;
+                return Err(LiveFoldError::RefreshMismatch);
+            }
+            self.clear_folded(delta.journal.generation_id);
+        }
+
+        self.rebaseline_prepared = false;
+        self.pending_refresh = Some(PendingRefresh {
+            new_view_generation: delta.new_view_generation,
+            new_valid_len: delta.journal.new_valid_len,
+            current_parts: delta.journal.current_parts.clone(),
+            current_parts_complete: delta.journal.current_parts_complete,
+            tail_pending: delta.journal.tail_pending,
+            damages: delta.journal.damages.clone(),
+        });
+        self.state = LiveState::Warming;
+        Ok(())
+    }
+
+    fn refresh_changes_view(&self, delta: &RefreshDelta) -> bool {
+        !delta.sealed_added.is_empty()
+            || !delta.sealed_removed.is_empty()
+            || !delta.journal.completed_parts.is_empty()
+            || !delta.journal.transition.preserves_generation()
+            || !delta.journal.current_parts_complete
+            || delta.journal.current_parts != self.folded_parts
+            || delta.journal.new_valid_len != self.folded_through_offset
+            || delta.journal.tail_pending != self.completed_tail_pending
+            || !completion_damage_is_valid(
+                delta.journal.new_valid_len,
+                delta.journal.tail_pending,
+                &delta.journal.damages,
+            )
+    }
+
+    /// Completes the pending refresh as one immutable availability boundary.
+    ///
+    /// A complete refresh must account for the exact ordered active descriptor
+    /// set and end at the validated journal watermark. A single torn tail that
+    /// starts at that watermark is valid pending input; middle or quarantined
+    /// damage is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiveFoldError::InvalidState`] without a matching
+    /// [`begin_refresh`](Self::begin_refresh), or
+    /// [`LiveFoldError::IncompleteRefresh`] when discovery or folding was not
+    /// complete.
+    pub fn complete_refresh(&mut self) -> Result<(), LiveFoldError> {
+        let pending = self
+            .pending_refresh
+            .take()
+            .ok_or(LiveFoldError::InvalidState)?;
+        self.view_generation = pending.new_view_generation;
+        if self.state != LiveState::Warming
+            || !pending.current_parts_complete
+            || self.folded_parts != pending.current_parts
+            || self.folded_through_offset != pending.new_valid_len
+            || (pending.current_parts.is_empty()
+                && (pending.tail_pending.is_some() || !pending.damages.is_empty()))
+            || !completion_damage_is_valid(
+                pending.new_valid_len,
+                pending.tail_pending,
+                &pending.damages,
+            )
+        {
+            self.state = LiveState::Incomplete;
+            return Err(LiveFoldError::IncompleteRefresh);
+        }
+
+        self.state = if self.folded_parts.is_empty() {
+            LiveState::Empty
+        } else {
+            LiveState::Current
+        };
+        self.completed_tail_pending = pending.tail_pending;
+        Ok(())
     }
 
     /// Folds one completed part into the live view exactly once.
@@ -277,12 +508,33 @@ impl LiveBuilder {
         part: &PartDescriptor,
         unit: &PgmUnit<R>,
     ) -> Result<FoldEffect, LiveFoldError> {
-        if matches!(self.state, LiveState::NeedsRebuild | LiveState::Incomplete) {
+        if self.state != LiveState::Warming || self.pending_refresh.is_none() {
             return Err(LiveFoldError::InvalidState);
         }
         if part.part_id.generation != self.generation {
-            self.state = LiveState::NeedsRebuild;
+            self.invalidate_pending(LiveState::NeedsRebuild);
             return Err(LiveFoldError::GenerationMismatch);
+        }
+        if self.folded_part_ids.contains(&part.part_id)
+            && let Some(existing) = self
+                .folded_parts
+                .iter()
+                .find(|descriptor| descriptor.part_id == part.part_id)
+        {
+            if existing == part {
+                return Ok(FoldEffect::Duplicate);
+            }
+            self.invalidate_pending(LiveState::Incomplete);
+            return Err(LiveFoldError::DescriptorMismatch);
+        }
+        if self
+            .pending_refresh
+            .as_ref()
+            .and_then(|pending| pending.current_parts.get(self.folded_parts.len()))
+            != Some(part)
+        {
+            self.invalidate_pending(LiveState::Incomplete);
+            return Err(LiveFoldError::DescriptorMismatch);
         }
         let catalog = unit.catalog();
         if part.source_id != catalog.source_id
@@ -291,7 +543,7 @@ impl LiveBuilder {
             || part.part_id.body_len != unit.source_file_len()
             || part.part_id.catalog_digest != refresh_catalog_digest(catalog)
         {
-            self.state = LiveState::Incomplete;
+            self.invalidate_pending(LiveState::Incomplete);
             return Err(LiveFoldError::DescriptorMismatch);
         }
         if part.source_id != 0
@@ -299,22 +551,19 @@ impl LiveBuilder {
                 .source_id
                 .is_some_and(|source_id| source_id != part.source_id)
         {
-            self.state = LiveState::Incomplete;
+            self.invalidate_pending(LiveState::Incomplete);
             return Err(LiveFoldError::DescriptorMismatch);
-        }
-        if self.folded_part_ids.contains(&part.part_id) {
-            return Ok(FoldEffect::Duplicate);
         }
         let end_offset = part
             .part_id
             .frame_offset
             .checked_add(part.part_id.body_len)
             .ok_or_else(|| {
-                self.state = LiveState::Incomplete;
+                self.invalidate_pending(LiveState::Incomplete);
                 LiveFoldError::Overflow
             })?;
         if !self.chunks.is_empty() && part.part_id.frame_offset < self.folded_through_offset {
-            self.state = LiveState::Incomplete;
+            self.invalidate_pending(LiveState::Incomplete);
             return Err(LiveFoldError::NonMonotonePart);
         }
         let discriminator = part_discriminator(&part.part_id);
@@ -325,20 +574,29 @@ impl LiveBuilder {
             &discriminator,
             &self.bounds,
         )
-        .map_err(|error| {
-            self.state = LiveState::Incomplete;
-            LiveFoldError::Build(error)
-        })?;
-        let usage = self.usage.checked_add(&facts).inspect_err(|_error| {
-            self.state = LiveState::Incomplete;
-        })?;
+        .map_err(LiveFoldError::Build);
+        let facts = match facts {
+            Ok(facts) => facts,
+            Err(error) => {
+                self.invalidate_pending(LiveState::Incomplete);
+                return Err(error);
+            }
+        };
+        let usage = match self.usage.checked_add(&facts) {
+            Ok(usage) => usage,
+            Err(error) => {
+                self.invalidate_pending(LiveState::Incomplete);
+                return Err(error);
+            }
+        };
         if !usage.is_within(&self.bounds) {
-            self.state = LiveState::Incomplete;
+            self.invalidate_pending(LiveState::Incomplete);
             return Err(LiveFoldError::LimitExceeded);
         }
 
         self.chunks.push(Arc::new(facts));
         self.folded_part_ids.insert(part.part_id);
+        self.folded_parts.push(*part);
         self.usage = usage;
         if part.source_id != 0 {
             self.source_id = Some(part.source_id);
@@ -350,19 +608,35 @@ impl LiveBuilder {
             );
         }
         self.folded_through_offset = self.folded_through_offset.max(end_offset);
-        if self.state != LiveState::Incomplete {
-            self.state = LiveState::Current;
-        }
         Ok(FoldEffect::Folded)
     }
 
-    /// Publishes an immutable snapshot of the folded view.
+    fn clear_folded(&mut self, generation: JournalGenerationId) {
+        self.generation = generation;
+        self.folded_part_ids.clear();
+        self.folded_parts.clear();
+        self.chunks.clear();
+        self.usage = LiveUsage::default();
+        self.source_id = None;
+        self.watermark_us = None;
+        self.folded_through_offset = 0;
+        self.completed_tail_pending = None;
+    }
+
+    fn invalidate_pending(&mut self, state: LiveState) {
+        self.pending_refresh = None;
+        self.state = state;
+    }
+
+    /// Returns an immutable candidate snapshot of the folded state.
     ///
-    /// Publication copies at most the configured part count of shared pointers;
-    /// observation payloads remain shared.
+    /// The candidate copies at most the configured part count of shared
+    /// pointers; observation payloads remain shared. Callers must still inspect
+    /// its state, and queries enforce the same availability gate.
     #[must_use]
     pub fn publish(&self) -> LiveView {
         LiveView {
+            view_generation: self.view_generation,
             generation: self.generation,
             state: self.state,
             watermark_us: self.watermark_us,
@@ -378,9 +652,86 @@ impl LiveBuilder {
     }
 }
 
+fn validate_view_generation(
+    previous: u64,
+    new: u64,
+    changes_view: bool,
+) -> Result<(), LiveFoldError> {
+    if !changes_view {
+        return (new == previous)
+            .then_some(())
+            .ok_or(LiveFoldError::ViewGenerationMismatch);
+    }
+    let next = previous.checked_add(1).ok_or(LiveFoldError::Overflow)?;
+    (new == next)
+        .then_some(())
+        .ok_or(LiveFoldError::ViewGenerationMismatch)
+}
+
+fn validate_descriptor_sequence(
+    parts: &[PartDescriptor],
+    generation: JournalGenerationId,
+    valid_len: u64,
+) -> Result<(), LiveFoldError> {
+    if parts.is_empty() {
+        return if valid_len == 0 {
+            Ok(())
+        } else {
+            Err(LiveFoldError::RefreshMismatch)
+        };
+    }
+
+    let frame_header_len =
+        u64::try_from(FRAME_HEADER_LEN).map_err(|_error| LiveFoldError::Overflow)?;
+    let mut expected_body_offset = frame_header_len;
+    let mut seen = BTreeSet::new();
+    let mut last_end = 0_u64;
+    for part in parts {
+        if part.part_id.generation != generation {
+            return Err(LiveFoldError::GenerationMismatch);
+        }
+        if !seen.insert(part.part_id) || part.part_id.frame_offset != expected_body_offset {
+            return Err(LiveFoldError::RefreshMismatch);
+        }
+        last_end = part
+            .part_id
+            .frame_offset
+            .checked_add(part.part_id.body_len)
+            .ok_or(LiveFoldError::Overflow)?;
+        expected_body_offset = last_end
+            .checked_add(frame_header_len)
+            .ok_or(LiveFoldError::Overflow)?;
+    }
+    if last_end != valid_len {
+        return Err(LiveFoldError::RefreshMismatch);
+    }
+    Ok(())
+}
+
+fn completion_damage_is_valid(
+    valid_len: u64,
+    tail_pending: Option<ByteRange>,
+    damages: &[DamageRegion],
+) -> bool {
+    match (tail_pending, damages) {
+        (None, []) => true,
+        (Some(tail), [damage]) => {
+            let Ok(damage_from) = u64::try_from(damage.from) else {
+                return false;
+            };
+            tail.start == valid_len
+                && tail.end > tail.start
+                && damage_from == valid_len
+                && damage.kind == DamageKind::TornTail
+        }
+        _ => false,
+    }
+}
+
 /// An immutable snapshot of the live view at one publication.
 #[derive(Debug, Clone)]
 pub struct LiveView {
+    view_generation: u64,
     generation: JournalGenerationId,
     state: LiveState,
     watermark_us: Option<i64>,
@@ -389,6 +740,12 @@ pub struct LiveView {
 }
 
 impl LiveView {
+    /// Snapshot generation captured at this boundary.
+    #[must_use]
+    pub const fn view_generation(&self) -> u64 {
+        self.view_generation
+    }
+
     /// Generation this view belongs to.
     #[must_use]
     pub const fn generation(&self) -> JournalGenerationId {
@@ -453,6 +810,9 @@ impl RawOracle for LiveView {
         range: CoverageSpan,
         limits: OracleLimits,
     ) -> Result<OracleResult, OracleError> {
+        if !matches!(self.state, LiveState::Empty | LiveState::Current) {
+            return Err(OracleError::Source(OracleSourceError::SnapshotUnavailable));
+        }
         let coverage = self.coverage();
         query_bounded(
             self.chunks.iter().flat_map(|chunk| chunk.observations()),
@@ -567,7 +927,7 @@ mod tests {
     use super::super::SourceError;
     use super::super::limits::LIMIT;
     use super::*;
-    use crate::refresh::part_id;
+    use crate::refresh::{PartTransition, part_id};
 
     const LIMITS: OracleLimits = OracleLimits {
         max_observations: 4_096,
@@ -580,6 +940,8 @@ mod tests {
     };
 
     const NAMESPACE: &[u8] = b"live-store";
+
+    type EncodedSections = Vec<(u32, u32, Vec<u8>)>;
 
     fn row(ts: i64, kind: u8, pid: Option<i32>, signal: Option<i32>) -> PgLogLifecycleV1 {
         PgLogLifecycleV1 {
@@ -625,7 +987,7 @@ mod tests {
         limits: DictLimits,
         force_blob: bool,
         ts: i64,
-    ) -> (Vec<u8>, Vec<(u32, u32, Vec<u8>)>) {
+    ) -> (Vec<u8>, EncodedSections) {
         let mut interner = Interner::new(limits);
         let id = if force_blob {
             interner.intern_blob(value)
@@ -676,7 +1038,7 @@ mod tests {
         (bytes, sections)
     }
 
-    fn dictionary_only_part() -> (Vec<u8>, Vec<(u32, u32, Vec<u8>)>) {
+    fn dictionary_only_part() -> (Vec<u8>, EncodedSections) {
         let limits = DictLimits::new(64, 1_024).expect("dictionary limits");
         let mut interner = Interner::new(limits);
         interner
@@ -744,25 +1106,112 @@ mod tests {
         SegmentFacts::extract(&unit, &sealed_context(), &LIMIT).expect("extract unsplit")
     }
 
-    fn fold_slices(builder: &mut LiveBuilder, slices: &[&[PgLogLifecycleV1]]) {
-        for (index, rows) in slices.iter().enumerate() {
-            let bytes = lifecycle_part(rows);
-            let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
-            let offset = (u64::try_from(index).expect("index fits") + 1) * 4_096;
-            let key = part_id(
-                builder.generation(),
-                offset,
+    fn descriptor(
+        generation: JournalGenerationId,
+        frame_offset: u64,
+        bytes: &[u8],
+    ) -> PartDescriptor {
+        let unit = PgmUnit::open(bytes).expect("open descriptor part");
+        PartDescriptor {
+            part_id: part_id(
+                generation,
+                frame_offset,
                 u64::try_from(bytes.len()).expect("len fits"),
                 unit.catalog(),
-            );
-            let descriptor = PartDescriptor {
-                part_id: key,
-                source_id: unit.catalog().source_id,
-                min_ts: unit.catalog().min_ts,
-                max_ts: unit.catalog().max_ts,
-            };
-            builder.fold_part(&descriptor, &unit).expect("fold part");
+            ),
+            source_id: unit.catalog().source_id,
+            min_ts: unit.catalog().min_ts,
+            max_ts: unit.catalog().max_ts,
         }
+    }
+
+    fn complete_delta(
+        builder: &LiveBuilder,
+        current_parts: Vec<PartDescriptor>,
+        transition: PartTransition,
+    ) -> RefreshDelta {
+        let generation_id = if transition.preserves_generation() {
+            builder.generation()
+        } else {
+            JournalGenerationId(
+                builder
+                    .generation()
+                    .0
+                    .checked_add(1)
+                    .expect("test generation fits"),
+            )
+        };
+        let current_parts: Vec<_> = current_parts
+            .into_iter()
+            .map(|mut part| {
+                part.part_id.generation = generation_id;
+                part
+            })
+            .collect();
+        let completed_parts = if transition.preserves_generation() {
+            current_parts[builder.folded_parts.len()..].to_vec()
+        } else {
+            current_parts.clone()
+        };
+        let new_valid_len = current_parts
+            .last()
+            .map_or(0, |part| part.part_id.frame_offset + part.part_id.body_len);
+        RefreshDelta {
+            previous_view_generation: builder.view_generation(),
+            new_view_generation: builder.view_generation() + 1,
+            sealed_added: Vec::new(),
+            sealed_removed: Vec::new(),
+            journal: crate::refresh::JournalDelta {
+                generation_id,
+                bootstrap: !builder.baseline_pinned,
+                previous_valid_len: builder.folded_through_offset(),
+                new_valid_len,
+                completed_parts,
+                current_parts,
+                current_parts_complete: true,
+                transition,
+                tail_pending: None,
+                damages: Vec::new(),
+            },
+        }
+    }
+
+    fn descriptors_for_bytes(builder: &LiveBuilder, bytes: &[&[u8]]) -> Vec<PartDescriptor> {
+        let mut frame_offset = u64::try_from(FRAME_HEADER_LEN).expect("header length fits");
+        bytes
+            .iter()
+            .map(|part_bytes| {
+                let part = descriptor(builder.generation(), frame_offset, part_bytes);
+                frame_offset = part
+                    .part_id
+                    .frame_offset
+                    .checked_add(part.part_id.body_len)
+                    .and_then(|end| {
+                        end.checked_add(
+                            u64::try_from(FRAME_HEADER_LEN).expect("header length fits"),
+                        )
+                    })
+                    .expect("test journal length fits");
+                part
+            })
+            .collect()
+    }
+
+    fn fold_bytes(builder: &mut LiveBuilder, bytes: &[&[u8]]) {
+        let descriptors = descriptors_for_bytes(builder, bytes);
+        let delta = complete_delta(builder, descriptors.clone(), PartTransition::Append);
+        builder.begin_refresh(&delta).expect("begin refresh");
+        for (part_bytes, descriptor) in bytes.iter().zip(&descriptors) {
+            let unit = PgmUnit::open(*part_bytes).expect("open part");
+            builder.fold_part(descriptor, &unit).expect("fold part");
+        }
+        builder.complete_refresh().expect("complete refresh");
+    }
+
+    fn fold_slices(builder: &mut LiveBuilder, slices: &[&[PgLogLifecycleV1]]) {
+        let bytes: Vec<_> = slices.iter().map(|rows| lifecycle_part(rows)).collect();
+        let slices: Vec<_> = bytes.iter().map(Vec::as_slice).collect();
+        fold_bytes(builder, &slices);
     }
 
     fn envelope(coverage: &Coverage) -> Option<(i64, i64)> {
@@ -785,11 +1234,15 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_builder_is_empty() {
+    fn a_fresh_builder_is_unavailable_until_an_authoritative_delta() {
         let builder = live_builder();
-        assert_eq!(builder.state(), LiveState::Empty);
+        assert_eq!(builder.state(), LiveState::Warming);
         assert_eq!(builder.folded_part_count(), 0);
         assert_eq!(builder.watermark_us(), None);
+        assert_eq!(
+            builder.publish().query(full_span(), LIMITS),
+            Err(OracleError::Source(OracleSourceError::SnapshotUnavailable))
+        );
     }
 
     #[test]
@@ -822,23 +1275,273 @@ mod tests {
     }
 
     #[test]
+    fn a_part_fold_remains_unavailable_until_the_whole_refresh_completes() {
+        let mut builder = live_builder();
+        let bytes = lifecycle_part(&stream());
+        let parts = descriptors_for_bytes(&builder, &[bytes.as_slice()]);
+        let delta = complete_delta(&builder, parts.clone(), PartTransition::Append);
+        builder.begin_refresh(&delta).expect("begin refresh");
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
+        builder.fold_part(&parts[0], &unit).expect("fold part");
+
+        let candidate = builder.publish();
+        assert_eq!(candidate.state(), LiveState::Warming);
+        assert!(!candidate.is_current());
+        assert_eq!(
+            candidate.query(full_span(), LIMITS),
+            Err(OracleError::Source(OracleSourceError::SnapshotUnavailable))
+        );
+
+        builder.complete_refresh().expect("complete refresh");
+        assert_eq!(builder.state(), LiveState::Current);
+        builder
+            .publish()
+            .query(full_span(), LIMITS)
+            .expect("completed query");
+    }
+
+    #[test]
+    fn completion_rejects_a_missing_descriptor_from_the_current_set() {
+        let rows = stream();
+        let bytes = [lifecycle_part(&rows[..3]), lifecycle_part(&rows[3..])];
+        let slices = [bytes[0].as_slice(), bytes[1].as_slice()];
+        let mut builder = live_builder();
+        let parts = descriptors_for_bytes(&builder, &slices);
+        let delta = complete_delta(&builder, parts.clone(), PartTransition::Append);
+        builder.begin_refresh(&delta).expect("begin refresh");
+        let unit = PgmUnit::open(bytes[0].as_slice()).expect("open first part");
+        builder
+            .fold_part(&parts[0], &unit)
+            .expect("fold first part");
+
+        assert_eq!(
+            builder.complete_refresh(),
+            Err(LiveFoldError::IncompleteRefresh)
+        );
+        assert_eq!(builder.state(), LiveState::Incomplete);
+        assert_eq!(
+            builder.publish().query(full_span(), LIMITS),
+            Err(OracleError::Source(OracleSourceError::SnapshotUnavailable))
+        );
+    }
+
+    #[test]
+    fn a_fresh_builder_accepts_a_truthful_bootstrap_watermark() {
+        let mut builder = live_builder();
+        let bytes = lifecycle_part(&stream());
+        let parts = descriptors_for_bytes(&builder, &[bytes.as_slice()]);
+        let mut delta = complete_delta(&builder, parts.clone(), PartTransition::Append);
+        delta.journal.bootstrap = true;
+        delta.journal.previous_valid_len = delta.journal.new_valid_len;
+        builder.begin_refresh(&delta).expect("begin bootstrap");
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
+        builder.fold_part(&parts[0], &unit).expect("fold bootstrap");
+        builder.complete_refresh().expect("complete bootstrap");
+
+        assert_eq!(builder.state(), LiveState::Current);
+        assert_eq!(builder.view_generation(), delta.new_view_generation);
+    }
+
+    #[test]
+    fn a_fresh_builder_pins_nonzero_bootstrap_generations() {
+        let mut builder = live_builder();
+        let bytes = lifecycle_part(&stream());
+        let mut parts = descriptors_for_bytes(&builder, &[bytes.as_slice()]);
+        for part in &mut parts {
+            part.part_id.generation = JournalGenerationId(41);
+        }
+        let mut delta = complete_delta(&builder, parts.clone(), PartTransition::Append);
+        delta.previous_view_generation = 17;
+        delta.new_view_generation = 18;
+        delta.journal.generation_id = JournalGenerationId(41);
+        delta.journal.completed_parts.clone_from(&parts);
+        delta.journal.current_parts.clone_from(&parts);
+
+        builder.begin_refresh(&delta).expect("begin bootstrap");
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
+        builder.fold_part(&parts[0], &unit).expect("fold part");
+        builder.complete_refresh().expect("complete bootstrap");
+
+        assert_eq!(builder.view_generation(), 18);
+        assert_eq!(builder.generation(), JournalGenerationId(41));
+        assert_eq!(builder.state(), LiveState::Current);
+    }
+
+    #[test]
+    fn a_bootstrap_delta_is_rejected_after_the_initial_boundary() {
+        let mut builder = live_builder();
+        fold_slices(&mut builder, &[&stream()]);
+        let mut delta = complete_delta(
+            &builder,
+            builder.folded_parts.clone(),
+            PartTransition::Append,
+        );
+        delta.journal.bootstrap = true;
+
+        assert_eq!(
+            builder.begin_refresh(&delta),
+            Err(LiveFoldError::RefreshMismatch)
+        );
+        assert_eq!(builder.state(), LiveState::NeedsRebuild);
+    }
+
+    #[test]
+    fn an_unchanged_boundary_can_retain_the_maximum_view_generation() {
+        let mut builder = live_builder();
+        fold_slices(&mut builder, &[&stream()]);
+        builder.view_generation = u64::MAX;
+        let delta = RefreshDelta {
+            previous_view_generation: u64::MAX,
+            new_view_generation: u64::MAX,
+            sealed_added: Vec::new(),
+            sealed_removed: Vec::new(),
+            journal: crate::refresh::JournalDelta {
+                bootstrap: false,
+                generation_id: builder.generation(),
+                previous_valid_len: builder.folded_through_offset(),
+                new_valid_len: builder.folded_through_offset(),
+                completed_parts: Vec::new(),
+                current_parts: builder.folded_parts.clone(),
+                current_parts_complete: true,
+                transition: PartTransition::Append,
+                tail_pending: builder.completed_tail_pending,
+                damages: Vec::new(),
+            },
+        };
+
+        builder.begin_refresh(&delta).expect("begin no-op");
+        builder.complete_refresh().expect("complete no-op");
+        assert_eq!(builder.view_generation(), u64::MAX);
+        assert_eq!(builder.state(), LiveState::Current);
+    }
+
+    #[test]
+    fn a_changed_boundary_must_advance_the_view_generation() {
+        let mut builder = live_builder();
+        fold_slices(&mut builder, &[&stream()]);
+        let delta = complete_delta(&builder, Vec::new(), PartTransition::Reset);
+        let stale = RefreshDelta {
+            new_view_generation: delta.previous_view_generation,
+            ..delta
+        };
+
+        assert_eq!(
+            builder.begin_refresh(&stale),
+            Err(LiveFoldError::ViewGenerationMismatch)
+        );
+        assert_eq!(builder.state(), LiveState::NeedsRebuild);
+    }
+
+    #[test]
+    fn a_clean_reset_completes_as_empty() {
+        let mut builder = live_builder();
+        fold_slices(&mut builder, &[&stream()]);
+        let delta = complete_delta(&builder, Vec::new(), PartTransition::Reset);
+
+        builder.begin_refresh(&delta).expect("begin reset");
+        assert_eq!(builder.state(), LiveState::Warming);
+        builder.complete_refresh().expect("complete reset");
+
+        assert_eq!(builder.state(), LiveState::Empty);
+        assert_eq!(builder.folded_part_count(), 0);
+        assert_eq!(builder.watermark_us(), None);
+        let result = builder
+            .publish()
+            .query(full_span(), LIMITS)
+            .expect("empty query");
+        assert!(result.observations().is_empty());
+    }
+
+    #[test]
+    fn a_validated_prefix_with_a_torn_tail_can_complete() {
+        let mut builder = live_builder();
+        let bytes = lifecycle_part(&stream());
+        let parts = descriptors_for_bytes(&builder, &[bytes.as_slice()]);
+        let mut delta = complete_delta(&builder, parts.clone(), PartTransition::Append);
+        let valid_len = delta.journal.new_valid_len;
+        delta.journal.tail_pending = Some(ByteRange {
+            start: valid_len,
+            end: valid_len + 3,
+        });
+        delta.journal.damages = vec![DamageRegion {
+            from: usize::try_from(valid_len).expect("valid length fits"),
+            kind: DamageKind::TornTail,
+        }];
+        builder.begin_refresh(&delta).expect("begin refresh");
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
+        builder.fold_part(&parts[0], &unit).expect("fold part");
+
+        builder.complete_refresh().expect("complete valid prefix");
+        assert_eq!(builder.state(), LiveState::Current);
+    }
+
+    #[test]
+    fn a_torn_tail_without_a_valid_part_is_not_a_clean_empty_view() {
+        let mut builder = live_builder();
+        let mut delta = complete_delta(&builder, Vec::new(), PartTransition::Append);
+        delta.journal.tail_pending = Some(ByteRange { start: 0, end: 3 });
+        delta.journal.damages = vec![DamageRegion {
+            from: 0,
+            kind: DamageKind::TornTail,
+        }];
+        builder.begin_refresh(&delta).expect("begin refresh");
+
+        assert_eq!(
+            builder.complete_refresh(),
+            Err(LiveFoldError::IncompleteRefresh)
+        );
+        assert_eq!(builder.state(), LiveState::Incomplete);
+    }
+
+    #[test]
+    fn non_authoritative_active_discovery_never_completes() {
+        let mut builder = live_builder();
+        let mut delta = complete_delta(&builder, Vec::new(), PartTransition::Append);
+        delta.journal.current_parts_complete = false;
+        builder.begin_refresh(&delta).expect("begin refresh");
+
+        assert_eq!(
+            builder.complete_refresh(),
+            Err(LiveFoldError::IncompleteRefresh)
+        );
+        assert_eq!(builder.state(), LiveState::Incomplete);
+    }
+
+    #[test]
+    fn an_invalid_end_watermark_makes_the_prior_view_unavailable() {
+        let mut builder = live_builder();
+        fold_slices(&mut builder, &[&stream()]);
+        let mut delta = complete_delta(
+            &builder,
+            builder.folded_parts.clone(),
+            PartTransition::Append,
+        );
+        delta.journal.new_valid_len += 1;
+
+        assert_eq!(
+            builder.begin_refresh(&delta),
+            Err(LiveFoldError::RefreshMismatch)
+        );
+        assert_eq!(builder.state(), LiveState::Incomplete);
+        assert_eq!(
+            builder.publish().query(full_span(), LIMITS),
+            Err(OracleError::Source(OracleSourceError::SnapshotUnavailable))
+        );
+    }
+
+    #[test]
     fn re_delivering_the_same_part_is_idempotent() {
         let mut builder = live_builder();
         let rows = stream();
         let bytes = lifecycle_part(&rows);
         let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
-        let key = part_id(
+        let descriptor = descriptor(
             builder.generation(),
-            4_096,
-            u64::try_from(bytes.len()).expect("len fits"),
-            unit.catalog(),
+            u64::try_from(FRAME_HEADER_LEN).expect("header length fits"),
+            &bytes,
         );
-        let descriptor = PartDescriptor {
-            part_id: key,
-            source_id: unit.catalog().source_id,
-            min_ts: unit.catalog().min_ts,
-            max_ts: unit.catalog().max_ts,
-        };
+        let delta = complete_delta(&builder, vec![descriptor], PartTransition::Append);
+        builder.begin_refresh(&delta).expect("begin refresh");
         assert_eq!(
             builder.fold_part(&descriptor, &unit).expect("fold"),
             FoldEffect::Folded
@@ -847,6 +1550,7 @@ mod tests {
             builder.fold_part(&descriptor, &unit).expect("re-fold"),
             FoldEffect::Duplicate
         );
+        builder.complete_refresh().expect("complete refresh");
         assert_eq!(builder.folded_part_count(), 1, "redelivery adds no chunk");
     }
 
@@ -856,18 +1560,15 @@ mod tests {
         let rows = stream();
         let bytes = lifecycle_part(&rows);
         let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
-        let key = part_id(
-            JournalGenerationId(99),
-            4_096,
-            u64::try_from(bytes.len()).expect("len fits"),
-            unit.catalog(),
+        let expected = descriptor(
+            builder.generation(),
+            u64::try_from(FRAME_HEADER_LEN).expect("header length fits"),
+            &bytes,
         );
-        let descriptor = PartDescriptor {
-            part_id: key,
-            source_id: unit.catalog().source_id,
-            min_ts: unit.catalog().min_ts,
-            max_ts: unit.catalog().max_ts,
-        };
+        let delta = complete_delta(&builder, vec![expected], PartTransition::Append);
+        builder.begin_refresh(&delta).expect("begin refresh");
+        let mut descriptor = expected;
+        descriptor.part_id.generation = JournalGenerationId(99);
         assert_eq!(
             builder.fold_part(&descriptor, &unit),
             Err(LiveFoldError::GenerationMismatch)
@@ -885,16 +1586,16 @@ mod tests {
         let bytes = lifecycle_part(&rows);
         let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
         let mut builder = live_builder();
+        let expected = descriptor(
+            builder.generation(),
+            u64::try_from(FRAME_HEADER_LEN).expect("header length fits"),
+            &bytes,
+        );
+        let delta = complete_delta(&builder, vec![expected], PartTransition::Append);
+        builder.begin_refresh(&delta).expect("begin refresh");
         let descriptor = PartDescriptor {
-            part_id: part_id(
-                builder.generation(),
-                4_096,
-                u64::try_from(bytes.len()).expect("len fits"),
-                unit.catalog(),
-            ),
             source_id: unit.catalog().source_id + 1,
-            min_ts: unit.catalog().min_ts,
-            max_ts: unit.catalog().max_ts,
+            ..expected
         };
 
         assert_eq!(
@@ -911,21 +1612,13 @@ mod tests {
         fold_slices(&mut builder, &[&rows[..3]]);
 
         let bytes = lifecycle_part(&rows[3..]);
-        let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
-        let descriptor = PartDescriptor {
-            part_id: part_id(
-                builder.generation(),
-                4_097,
-                u64::try_from(bytes.len()).expect("len fits"),
-                unit.catalog(),
-            ),
-            source_id: unit.catalog().source_id,
-            min_ts: unit.catalog().min_ts,
-            max_ts: unit.catalog().max_ts,
-        };
+        let descriptor = descriptor(builder.generation(), 17, &bytes);
+        let mut current = builder.folded_parts.clone();
+        current.push(descriptor);
+        let delta = complete_delta(&builder, current, PartTransition::Append);
         assert_eq!(
-            builder.fold_part(&descriptor, &unit),
-            Err(LiveFoldError::NonMonotonePart)
+            builder.begin_refresh(&delta),
+            Err(LiveFoldError::RefreshMismatch)
         );
         assert_eq!(builder.state(), LiveState::Incomplete);
     }
@@ -934,11 +1627,15 @@ mod tests {
     fn reset_discards_folded_state_and_enters_warming() {
         let mut builder = live_builder();
         fold_slices(&mut builder, &[&stream()]);
-        builder.reset_to(JournalGenerationId(4));
+        let delta = complete_delta(&builder, Vec::new(), PartTransition::Reset);
+        builder.reset_to(delta.journal.generation_id);
         assert_eq!(builder.state(), LiveState::Warming);
-        assert_eq!(builder.generation(), JournalGenerationId(4));
+        assert_eq!(builder.generation(), delta.journal.generation_id);
         assert_eq!(builder.folded_part_count(), 0);
         assert_eq!(builder.watermark_us(), None);
+        builder.begin_refresh(&delta).expect("begin rebaseline");
+        builder.complete_refresh().expect("complete rebaseline");
+        assert_eq!(builder.state(), LiveState::Empty);
     }
 
     #[test]
@@ -998,8 +1695,6 @@ mod tests {
     fn full_span() -> CoverageSpan {
         CoverageSpan::new(0, 1_000_000).expect("valid range")
     }
-
-    // ---- seal handoff (promotion) tests ----
 
     fn sealed_from_slices(slices: &[&[PgLogLifecycleV1]]) -> Vec<u8> {
         let bodies: Vec<Vec<u8>> = slices
@@ -1100,7 +1795,7 @@ mod tests {
             .expect("cache metadata")
             .permissions()
             .mode();
-        fs::set_permissions(cache_dir.path(), fs::Permissions::from_mode(0))
+        fs::set_permissions(cache_dir.path(), fs::Permissions::from_mode(0o000))
             .expect("make cache read-only");
         let outcome = reconcile_seal(&builder.publish(), &sealed_unit, &context, &store, &LIMIT);
         fs::set_permissions(
@@ -1132,24 +1827,10 @@ mod tests {
         let rebuilt = SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("cold rebuild");
 
         let mut builder = live_builder();
-        let mut offset = 4_096_u64;
-        for bytes in [&first_bytes, &second_bytes] {
-            let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
-            let body_len = u64::try_from(bytes.len()).expect("part length fits");
-            let descriptor = PartDescriptor {
-                part_id: part_id(builder.generation(), offset, body_len, unit.catalog()),
-                source_id: unit.catalog().source_id,
-                min_ts: unit.catalog().min_ts,
-                max_ts: unit.catalog().max_ts,
-            };
-            builder
-                .fold_part(&descriptor, &unit)
-                .expect("fold dictionary part");
-            offset = offset
-                .checked_add(body_len)
-                .and_then(|value| value.checked_add(4_096))
-                .expect("offset fits");
-        }
+        fold_bytes(
+            &mut builder,
+            &[first_bytes.as_slice(), second_bytes.as_slice()],
+        );
 
         let (_cache_dir, store) = store();
         let outcome = reconcile_seal(&builder.publish(), &sealed_unit, &context, &store, &LIMIT)
@@ -1171,22 +1852,10 @@ mod tests {
         let rebuilt = SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("cold rebuild");
 
         let mut builder = live_builder();
-        let mut offset = 4_096_u64;
-        for bytes in [&dictionary_bytes, &lifecycle_bytes] {
-            let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
-            let body_len = u64::try_from(bytes.len()).expect("part length fits");
-            let descriptor = PartDescriptor {
-                part_id: part_id(builder.generation(), offset, body_len, unit.catalog()),
-                source_id: unit.catalog().source_id,
-                min_ts: unit.catalog().min_ts,
-                max_ts: unit.catalog().max_ts,
-            };
-            builder.fold_part(&descriptor, &unit).expect("fold part");
-            offset = offset
-                .checked_add(body_len)
-                .and_then(|value| value.checked_add(4_096))
-                .expect("offset fits");
-        }
+        fold_bytes(
+            &mut builder,
+            &[dictionary_bytes.as_slice(), lifecycle_bytes.as_slice()],
+        );
         assert_eq!(builder.watermark_us(), Some(1_000));
 
         let (_cache_dir, store) = store();
@@ -1194,6 +1863,31 @@ mod tests {
             .expect("reconcile");
         assert!(outcome.was_promoted());
         assert_eq!(outcome.facts().observations(), rebuilt.observations());
+    }
+
+    #[test]
+    fn source_zero_parts_do_not_cross_store_namespaces() {
+        let (dictionary_bytes, _sections) = dictionary_only_part();
+        let sealed_unit =
+            PgmUnit::open(dictionary_bytes.as_slice()).expect("open sealed dictionary");
+        let mut builder =
+            LiveBuilder::new(b"another-store".to_vec(), LIMIT).expect("valid live builder");
+        fold_bytes(&mut builder, &[dictionary_bytes.as_slice()]);
+
+        let (_cache_dir, store) = store();
+        let outcome = reconcile_seal(
+            &builder.publish(),
+            &sealed_unit,
+            &sealed_context(),
+            &store,
+            &LIMIT,
+        )
+        .expect("reconcile");
+
+        assert!(
+            !outcome.was_promoted(),
+            "source zero still carries the store namespace scope"
+        );
     }
 
     #[test]
@@ -1209,24 +1903,10 @@ mod tests {
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
 
         let mut builder = live_builder();
-        let mut offset = 4_096_u64;
-        for bytes in [&first_bytes, &second_bytes] {
-            let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
-            let body_len = u64::try_from(bytes.len()).expect("part length fits");
-            let descriptor = PartDescriptor {
-                part_id: part_id(builder.generation(), offset, body_len, unit.catalog()),
-                source_id: unit.catalog().source_id,
-                min_ts: unit.catalog().min_ts,
-                max_ts: unit.catalog().max_ts,
-            };
-            builder
-                .fold_part(&descriptor, &unit)
-                .expect("fold dictionary part");
-            offset = offset
-                .checked_add(body_len)
-                .and_then(|value| value.checked_add(4_096))
-                .expect("offset fits");
-        }
+        fold_bytes(
+            &mut builder,
+            &[first_bytes.as_slice(), second_bytes.as_slice()],
+        );
 
         let (_cache_dir, store) = store();
         assert!(matches!(
@@ -1293,8 +1973,6 @@ mod tests {
         );
         assert_eq!(outcome.facts().observations(), rebuilt.observations());
     }
-
-    // ---- partition/seal metamorphic suite (§17.3) ----
 
     /// Small deterministic generator so the metamorphic sweep is reproducible
     /// without a randomness dependency.
@@ -1375,7 +2053,7 @@ mod tests {
             let mut merged = Vec::new();
             let mut coverage = Coverage::empty();
             let mut builder = live_builder();
-            let mut live_offset = 0_u64;
+            let mut live_parts = Vec::new();
             for (index, window) in cuts.windows(2).enumerate() {
                 let group = &rows[window[0]..window[1]];
                 if group.is_empty() {
@@ -1387,25 +2065,12 @@ mod tests {
                     merged.extend_from_slice(facts.observations());
                     coverage = coverage.union(facts.coverage());
                 } else {
-                    live_offset += 4_096;
-                    let bytes = lifecycle_part(group);
-                    let unit = PgmUnit::open(bytes.as_slice()).expect("open live part");
-                    let key = part_id(
-                        builder.generation(),
-                        live_offset,
-                        u64::try_from(bytes.len()).expect("len fits"),
-                        unit.catalog(),
-                    );
-                    let descriptor = PartDescriptor {
-                        part_id: key,
-                        source_id: unit.catalog().source_id,
-                        min_ts: unit.catalog().min_ts,
-                        max_ts: unit.catalog().max_ts,
-                    };
-                    builder
-                        .fold_part(&descriptor, &unit)
-                        .expect("fold live part");
+                    live_parts.push(lifecycle_part(group));
                 }
+            }
+            if !live_parts.is_empty() {
+                let live_slices: Vec<_> = live_parts.iter().map(Vec::as_slice).collect();
+                fold_bytes(&mut builder, &live_slices);
             }
             for chunk in builder.publish().chunks() {
                 merged.extend_from_slice(chunk.observations());
@@ -1510,6 +2175,66 @@ mod tests {
         )
     }
 
+    fn empty_interval_gap_part(ts: i64) -> Vec<u8> {
+        let gaps = [kronika_registry::pg_log::PgLogGapV1 {
+            ts: Ts(ts),
+            source_path: None,
+            parser_kind: 0,
+            reason: 1,
+            dev: Some(1),
+            inode: Some(2),
+            offset: Some(3),
+            bytes_skipped: 1,
+            truncated_lines: 0,
+            invalid_utf8: 0,
+            binary_dropped: 0,
+            rotations: 0,
+            missing_files: 0,
+            budget_exhaustions: 0,
+            dict_dropped_fields: 0,
+            parser_dropped_lines: 0,
+        }];
+        let gap_body = kronika_registry::pg_log::PgLogGapV1::encode(&gaps).expect("encode gap");
+        build_part(
+            &[SectionInput {
+                type_id: 1_029_001,
+                rows: 1,
+                body: &gap_body,
+            }],
+            PartMeta {
+                min_ts: i64::MAX,
+                max_ts: i64::MIN,
+                source_id: 7,
+            },
+        )
+    }
+
+    #[test]
+    fn cumulative_known_gap_spans_have_an_independent_bound() {
+        let tight = Bounds {
+            coverage_spans: 1,
+            ..LIMIT
+        };
+        let mut builder = LiveBuilder::new(NAMESPACE.to_vec(), tight).expect("valid live builder");
+        let bytes = [
+            empty_interval_gap_part(1_000),
+            empty_interval_gap_part(2_000),
+        ];
+        let slices = [bytes[0].as_slice(), bytes[1].as_slice()];
+        let parts = descriptors_for_bytes(&builder, &slices);
+        let delta = complete_delta(&builder, parts.clone(), PartTransition::Append);
+        builder.begin_refresh(&delta).expect("begin refresh");
+
+        let first = PgmUnit::open(bytes[0].as_slice()).expect("open first gap");
+        assert_eq!(builder.fold_part(&parts[0], &first), Ok(FoldEffect::Folded));
+        let second = PgmUnit::open(bytes[1].as_slice()).expect("open second gap");
+        assert_eq!(
+            builder.fold_part(&parts[1], &second),
+            Err(LiveFoldError::LimitExceeded)
+        );
+        assert_eq!(builder.state(), LiveState::Incomplete);
+    }
+
     #[test]
     fn a_timestamp_fallback_gap_rebuilds_instead_of_promoting() {
         let part_bytes = fallback_gap_part();
@@ -1518,20 +2243,7 @@ mod tests {
         let rebuilt = SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("rebuild");
 
         let mut builder = live_builder();
-        let unit = PgmUnit::open(part_bytes.as_slice()).expect("open part");
-        let key = part_id(
-            builder.generation(),
-            4_096,
-            u64::try_from(part_bytes.len()).expect("len fits"),
-            unit.catalog(),
-        );
-        let descriptor = PartDescriptor {
-            part_id: key,
-            source_id: unit.catalog().source_id,
-            min_ts: unit.catalog().min_ts,
-            max_ts: unit.catalog().max_ts,
-        };
-        builder.fold_part(&descriptor, &unit).expect("fold part");
+        fold_bytes(&mut builder, &[part_bytes.as_slice()]);
 
         let (_dir, store) = store();
         let outcome = reconcile_seal(&builder.publish(), &sealed_unit, &context, &store, &LIMIT)
@@ -1559,18 +2271,15 @@ mod tests {
         fold_slices(&mut builder, &slices[0..1]);
         let bytes = lifecycle_part(slices[1]);
         let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
-        let key = part_id(
-            builder.generation(),
-            9_999,
-            u64::try_from(bytes.len()).expect("len fits"),
-            unit.catalog(),
-        );
-        let descriptor = PartDescriptor {
-            part_id: key,
-            source_id: unit.catalog().source_id,
-            min_ts: unit.catalog().min_ts,
-            max_ts: unit.catalog().max_ts,
-        };
+        let frame_offset = builder
+            .folded_through_offset()
+            .checked_add(u64::try_from(FRAME_HEADER_LEN).expect("header length fits"))
+            .expect("offset fits");
+        let descriptor = descriptor(builder.generation(), frame_offset, &bytes);
+        let mut current_parts = builder.folded_parts.clone();
+        current_parts.push(descriptor);
+        let delta = complete_delta(&builder, current_parts, PartTransition::Append);
+        builder.begin_refresh(&delta).expect("begin refresh");
         assert_eq!(
             builder.fold_part(&descriptor, &unit),
             Err(LiveFoldError::LimitExceeded)
