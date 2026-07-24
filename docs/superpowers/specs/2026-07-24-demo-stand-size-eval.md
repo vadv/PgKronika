@@ -4,7 +4,7 @@
 
 Цель этой итерации — один: получить **реальные размеры** сегмента PGM и факт-файла `.ovf` под представительной нагрузкой, чтобы решить, нести ли charts в индекс или считать их on-demand из PGM. Web-UI, MCP, визуализация — следующая итерация, здесь вне scope.
 
-Образец — demo-стенд reftool (`reftool demo/` + крейт `reftool-demo`): один самодостаточный Docker-контейнер с PostgreSQL под синтетической нагрузкой. Повторяем его подход, только вместо reftool собирает `pg_kronika-collector`, и добавляем шаг построения `.ovf` + замер.
+Форма стенда: один самодостаточный Docker-контейнер с PostgreSQL под синтетической нагрузкой; рядом `pg_kronika-collector` пишет реальные сегменты, затем шаг построения `.ovf` + замер.
 
 ## 1. Что уже есть и переиспользуется
 
@@ -16,9 +16,9 @@
 
 ## 2. Компоненты стенда
 
-### 2.1 PostgreSQL-окружение (копия подхода reftool)
+### 2.1 PostgreSQL-окружение
 
-Контейнер: PG (сначала одна версия, 17) + `pg_stat_statements` + `pg_store_plans` + два tablespace. `postgresql.conf` по образцу reftool, с наблюдаемостью для событийных блоков:
+Контейнер: PG (сначала одна версия, 17) + `pg_stat_statements` + `pg_store_plans` + два tablespace. `postgresql.conf` с включённой наблюдаемостью для событийных блоков:
 
 ```
 max_connections = 100
@@ -38,7 +38,7 @@ cgroup v2 доступен в контейнере (для OS-метрик colle
 
 ### 2.2 Генератор нагрузки
 
-Крейт `bins/pg_kronika-demo` (аналог `reftool-demo`; допустимо прямо переиспользовать схему reftool-demo). Задача — **насытить** профиль до лимитов collector, чтобы замер был по верхней планке.
+Крейт `bins/pg_kronika-demo`. Задача — **насытить** профиль до лимитов collector, чтобы замер был по верхней планке.
 
 Схема (реалистичный OLTP + фон):
 - `accounts` (~10 000 строк, seed батчами), `orders`, `locked_resource` — OLTP-ядро.
@@ -46,12 +46,12 @@ cgroup v2 доступен в контейнере (для OS-метрик colle
 - `audit.logs` / `audit.events` — вставочная нагрузка.
 - Параметр `DEMO_TABLES` — доп. пустые/мелкие таблицы + индексы, чтобы дойти до сотен объектов (упереться в top-500).
 
-Сценарии (потоки, как в reftool-demo):
+Сценарии (независимые потоки):
 - OLTP: INSERT/UPDATE — TPS, tuple writes, buffer hits.
 - Seq-scan по `large_scan` — buffer eviction, disk read.
 - Lock-contention на `locked_resource` — lock waits, изредка deadlock.
 - Фон: autovacuum, checkpoints (из конфига), редкие ошибки (нарушение constraint, statement timeout) — для событийных блоков `.ovf`.
-- Опционально crash-recovery (флаг), как в reftool.
+- Опционально crash-recovery (флаг).
 
 Параметры (env, чтобы гонять разные профили):
 - `DEMO_BACKENDS` — число активных соединений (20–50).
