@@ -49,6 +49,23 @@ impl Bounds {
             && self.pattern_bytes <= LIMIT.pattern_bytes
             && self.string_table_bytes <= LIMIT.string_table_bytes
     }
+
+    pub(crate) const fn admits_profile(self, admitted: Self) -> bool {
+        self.is_within_absolute_limits()
+            && admitted.is_within_absolute_limits()
+            && self.fact_file_len >= admitted.fact_file_len
+            && self.directory_entries >= admitted.directory_entries
+            && self.directory_bytes >= admitted.directory_bytes
+            && self.stored_block_len >= admitted.stored_block_len
+            && self.decoded_block_len >= admitted.decoded_block_len
+            && self.decoded_file_bytes >= admitted.decoded_file_bytes
+            && self.items_per_block >= admitted.items_per_block
+            && self.sqlstate_keys >= admitted.sqlstate_keys
+            && self.signal_keys >= admitted.signal_keys
+            && self.coverage_spans >= admitted.coverage_spans
+            && self.pattern_bytes >= admitted.pattern_bytes
+            && self.string_table_bytes >= admitted.string_table_bytes
+    }
 }
 
 /// The version-1 admission bounds.

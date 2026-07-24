@@ -13,14 +13,20 @@ in-memory active part. It opens the end catalog first, validates format version
 and bounds, reads section bytes on demand, checks CRC, then invokes the registry
 codec. `Segment` is the sealed-file convenience wrapper.
 
-`LocalDirSnapshot` combines units returned by `kronika-store`. Sealed units
-come first, followed by live parts. A live part is suppressed only when its
-catalog exactly matches a sealed unit; overlapping time ranges do not prove
-identity. Store warnings and journal damage remain available to callers.
+`kronika-store::LocalDir` scans `active.parts` first and then lists sealed units;
+those operations do not capture one atomic combined view. `LocalDirSnapshot`
+returns the observed sealed units first, followed by live parts. A live part is
+suppressed only when its catalog exactly matches a sealed unit; overlapping
+time ranges do not prove identity. Store warnings and journal damage remain
+available to callers.
 
 A writer may seal or reset `active.parts` after a snapshot captured a part
 reference. This yields `ReadError::StaleSnapshot`. Query helpers refresh a
 bounded number of times and surface a gap if the unit remains unstable.
+
+`LiveBuilder`, `LiveView`, and seal reconciliation provide bounded overview
+fold and handoff primitives. `pg_kronika-web` does not publish that live
+timeline yet; production requests still query `LocalDirSnapshot`.
 
 ## Logical queries
 
@@ -75,8 +81,22 @@ CRC-checks only selected block bodies. `FactReadStats` exposes the resulting
 read calls and byte counts.
 
 All PGKOVF constructors and decoders enforce the absolute `LIMIT` values before
-large allocations. This crate does not publish, replace, delete, or rebuild
-fact files; it provides the codec and positional read primitives.
+large allocations. `FactStore` loads and validates versioned per-segment fact
+files. A missing or rejected candidate triggers bounded extraction from PGM;
+the store then publishes the rebuilt facts under their content key. Persistence
+failures remain visible alongside the freshly extracted facts.
+
+Persistent files remain primary. If canonical encoding and full admission
+succeed but publication fails for a recoverable cache/storage reason,
+`FactStore` may retain the immutable `Arc<SegmentFacts>` in a process-local
+fallback LRU. Its complete key combines `FactKey` with sealed lineage, and each
+lookup still tries durable storage first. The default budgets are 24
+segment-hours and 64 MiB of canonical fact bytes; configuration is capped at
+744 segment-hours and 256 MiB. Duration rounds up to whole hours, with one hour
+charged for a point, empty, or unknown interval. Entries that exceed either
+budget are returned to the caller but not retained. `FallbackStats` reports
+hits, misses, inserts, evictions, oversized entries, publication-failure
+offers, and exact residency.
 
 ## Bounds and failures
 
@@ -85,6 +105,6 @@ Catalogs are capped at 64 MiB. Registry limits cap each section at 8 MiB,
 Dictionary decode follows the same row and row-group guards. Errors distinguish
 I/O, framing, unsupported format, bounds, CRC/codec, storage, and staleness.
 
-The crate owns no HTTP status mapping, cache policy, remote storage, anomaly
-request budget, or PostgreSQL behavior. See [`src/lib.rs`](src/lib.rs) for the
-canonical public surface.
+The crate owns no HTTP status mapping, remote storage, anomaly request budget,
+or PostgreSQL behavior. See [`src/lib.rs`](src/lib.rs) for the canonical public
+surface.

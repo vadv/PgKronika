@@ -10,10 +10,13 @@
 //! [`encode`]: SegmentFacts::encode
 //! [`from_reader`]: SegmentFacts::from_reader
 
+use std::collections::BTreeSet as DictionaryIdSet;
+
 use kronika_analytics::overview::{
-    Applicability, Coverage, CoverageSpan, EventObservation, MemoryOracle, NamingContractId,
-    OracleError, OracleLimits, OracleResult, PeriodQuality, PhysicalCountSemantics, RawOracle,
-    RetainedExactness, SegmentIdentity, SegmentLocator, SourceCompleteness,
+    Applicability, Coverage, CoverageSpan, EventObservation, NamingContractId, ObservationPayload,
+    ObservationProvenance, OracleError, OracleLimits, OracleResult, PeriodQuality,
+    PhysicalCountSemantics, RawOracle, RetainedExactness, SegmentIdentity, SegmentLocator,
+    SourceCompleteness, query_bounded,
 };
 use kronika_format::ReadAt;
 
@@ -26,11 +29,14 @@ use super::container::{
     validate_block_descriptor, validate_observation_provenance, verify_manifest_identity,
 };
 use super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor, source_scope_id};
-use super::event_extract::extract_events;
+use super::event_extract::{
+    DictionaryFingerprint, EventExtraction, TIMESTAMP_FALLBACK_GAP_REASON, extract_events,
+    fingerprint_dictionary,
+};
 use super::limits::Bounds;
 use super::observations::EventObservationsBlock;
 
-const MAX_STORE_NAMESPACE_BYTES: usize = 4 * 1024;
+pub(super) const MAX_STORE_NAMESPACE_BYTES: usize = 4 * 1024;
 
 /// Reader configuration that scopes a sealed segment's facts.
 ///
@@ -209,6 +215,8 @@ pub struct SegmentFacts {
     manifest_entries: Vec<ManifestEntryDescriptor>,
     observations: Vec<EventObservation>,
     loss_coverage: LossCoverageBlock,
+    retained_text_bytes: u64,
+    dictionary_fingerprints: Vec<DictionaryFingerprint>,
 }
 
 impl SegmentFacts {
@@ -235,11 +243,119 @@ impl SegmentFacts {
         context: &SegmentContext,
         bounds: &Bounds,
     ) -> Result<(Self, PgmBodyReadStats), BuildError> {
-        let catalog = unit.catalog();
+        let (min_ts, max_ts) = (unit.catalog().min_ts, unit.catalog().max_ts);
         let (identity, lineage) = Self::provenance(unit, context)?;
-        let extracted = extract_events(unit, lineage, context.segment_locator, bounds)?;
+        let extracted = extract_events(unit, lineage, Some(context.segment_locator), bounds)?;
         let pgm_body_read_stats = extracted.pgm_body_read_stats;
-        let covered = segment_coverage(catalog.min_ts, catalog.max_ts)?;
+        let facts = Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds)?;
+        Ok((facts, pgm_body_read_stats))
+    }
+
+    /// Folds one completed active part into live overview facts.
+    ///
+    /// Live facts carry an `Approximate` lineage keyed by journal generation and
+    /// a per-part discriminator, so identical sections in different parts stay
+    /// distinct and no observation collides. The lineage never claims a sealed
+    /// locator; a seal that matches provenance re-keys these facts to the sealed
+    /// identity. Reads each supported event body once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError`] for source failures, unsupported event layouts,
+    /// unsafe work bounds, or checked-arithmetic overflow.
+    pub fn fold_live<R: ReadAt>(
+        unit: &PgmUnit<R>,
+        store_namespace: &[u8],
+        journal_generation: u64,
+        part_discriminator: &[u8],
+        bounds: &Bounds,
+    ) -> Result<Self, BuildError> {
+        let catalog = unit.catalog();
+        if catalog.entries.is_empty() {
+            return Err(BuildError::Source(SourceError::UnsupportedLayout));
+        }
+        let source_scope = source_scope_id(store_namespace, catalog.source_id);
+        let lineage =
+            SegmentIdentity::live_approximate(source_scope, journal_generation, part_discriminator);
+        let identity = HeaderIdentity::from_current_contract(
+            catalog.format_version,
+            catalog.source_id,
+            catalog.min_ts,
+            catalog.max_ts,
+            unit.source_file_len(),
+            source_scope,
+            unit.source_descriptor(),
+        );
+        let (min_ts, max_ts) = (catalog.min_ts, catalog.max_ts);
+        let extracted = extract_events(unit, lineage, None, bounds)?;
+        Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds)
+    }
+
+    /// Promotes matching live parts without rereading sealed event bodies.
+    ///
+    /// The parts must be the ordered constituents of the sealed segment. Their
+    /// catalogs, source identity, timestamp envelope, and referenced dictionary
+    /// values must match the sealed PGM. Dictionary
+    /// sections are read when rows contain references. A match re-keys retained
+    /// observations to sealed provenance; a mismatch returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError`] when the sealed catalog is empty, a re-keyed
+    /// observation is invalid, or a checked counter overflows.
+    pub(super) fn try_promote_from_parts<R: ReadAt>(
+        sealed_unit: &PgmUnit<R>,
+        sealed_context: &SegmentContext,
+        parts: &[&Self],
+        bounds: &Bounds,
+    ) -> Result<Option<Self>, BuildError> {
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        if !bounds.is_within_absolute_limits()
+            || u64::try_from(sealed_unit.catalog().entries.len())
+                .map_err(|_error| BuildError::Overflow)?
+                > u64::from(bounds.directory_entries)
+        {
+            return Err(BuildError::LimitExceeded);
+        }
+        if !promotion_catalogs_match(sealed_unit, parts) || parts_have_timestamp_fallback(parts) {
+            return Ok(None);
+        }
+
+        let (identity, lineage) = Self::provenance(sealed_unit, sealed_context)?;
+        if !promotion_source_matches(identity, sealed_context, parts) {
+            return Ok(None);
+        }
+        let Some(dictionary_fingerprints) = promotion_dictionary(sealed_unit, parts, bounds)?
+        else {
+            return Ok(None);
+        };
+        let Some(extracted) = rekey_promoted_parts(
+            parts,
+            lineage,
+            sealed_context.segment_locator(),
+            dictionary_fingerprints,
+            bounds,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let (min_ts, max_ts) = (sealed_unit.catalog().min_ts, sealed_unit.catalog().max_ts);
+        Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds).map(Some)
+    }
+
+    /// Assembles canonical facts from an extraction and the catalog time range.
+    fn assemble(
+        identity: HeaderIdentity,
+        lineage: SegmentIdentity,
+        extracted: EventExtraction,
+        min_ts: i64,
+        max_ts: i64,
+        bounds: &Bounds,
+    ) -> Result<Self, BuildError> {
+        let covered = segment_coverage(min_ts, max_ts)?;
         let loss_coverage = LossCoverageBlock::new(
             covered,
             extracted.known_gaps,
@@ -255,16 +371,15 @@ impl SegmentFacts {
             super::block::BlockError::AboveBound => BuildError::LimitExceeded,
             _ => BuildError::Internal,
         })?;
-        Ok((
-            Self {
-                identity,
-                lineage,
-                manifest_entries: extracted.manifest_entries,
-                observations: extracted.observations,
-                loss_coverage,
-            },
-            pgm_body_read_stats,
-        ))
+        Ok(Self {
+            identity,
+            lineage,
+            manifest_entries: extracted.manifest_entries,
+            observations: extracted.observations,
+            loss_coverage,
+            retained_text_bytes: extracted.retained_text_bytes,
+            dictionary_fingerprints: extracted.dictionary_fingerprints,
+        })
     }
 
     /// Derives the header identity and lineage from the catalog alone.
@@ -339,6 +454,12 @@ impl SegmentFacts {
     #[must_use]
     pub fn manifest_entries(&self) -> &[ManifestEntryDescriptor] {
         &self.manifest_entries
+    }
+
+    /// Retained UTF-8 payload bytes.
+    #[must_use]
+    pub const fn retained_text_bytes(&self) -> u64 {
+        self.retained_text_bytes
     }
 
     /// Offset-independent catalog descriptors expected on a cache reload.
@@ -482,6 +603,10 @@ impl SegmentFacts {
         }
 
         let coverage = merge_coverage_blocks(&mut fact_reader, bounds)?;
+        let retained_text_bytes = bounds
+            .decoded_block_len
+            .checked_sub(text_budget)
+            .ok_or(CacheReadError::Corrupt)?;
         let stats = fact_reader.stats();
         Ok((
             Self {
@@ -490,6 +615,8 @@ impl SegmentFacts {
                 manifest_entries: manifest.entries().to_vec(),
                 observations: observations.into_observations(),
                 loss_coverage: coverage,
+                retained_text_bytes,
+                dictionary_fingerprints: Vec::new(),
             },
             stats,
         ))
@@ -502,12 +629,216 @@ impl RawOracle for SegmentFacts {
         range: CoverageSpan,
         limits: OracleLimits,
     ) -> Result<OracleResult, OracleError> {
-        MemoryOracle::new(self.observations.clone(), self.coverage().clone())?.query(range, limits)
+        query_bounded(
+            &self.observations,
+            self.coverage().spans().iter().copied(),
+            range,
+            limits,
+        )
     }
+}
+
+fn promotion_catalogs_match<R: ReadAt>(sealed_unit: &PgmUnit<R>, parts: &[&SegmentFacts]) -> bool {
+    sealed_unit
+        .catalog()
+        .entries
+        .iter()
+        .map(CatalogEntryDescriptor::of)
+        .eq(parts
+            .iter()
+            .flat_map(|part| &part.manifest_entries)
+            .map(|entry| entry.catalog))
+}
+
+fn parts_have_timestamp_fallback(parts: &[&SegmentFacts]) -> bool {
+    parts.iter().any(|part| {
+        part.observations.iter().any(|observation| {
+            matches!(
+                observation.payload(),
+                ObservationPayload::LogGap(gap) if gap.reason == TIMESTAMP_FALLBACK_GAP_REASON
+            )
+        })
+    })
+}
+
+fn promotion_source_matches(
+    identity: HeaderIdentity,
+    sealed_context: &SegmentContext,
+    parts: &[&SegmentFacts],
+) -> bool {
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+    for part in parts {
+        if part.identity.source_min_ts_us <= part.identity.source_max_ts_us {
+            min_ts = min_ts.min(part.identity.source_min_ts_us);
+            max_ts = max_ts.max(part.identity.source_max_ts_us);
+        }
+    }
+    if min_ts > max_ts {
+        (min_ts, max_ts) = (0, 0);
+    }
+    min_ts == identity.source_min_ts_us
+        && max_ts == identity.source_max_ts_us
+        && parts.iter().all(|part| {
+            part.identity.source_format_version == identity.source_format_version
+                && (part.identity.pgm_source_id == 0
+                    && part.identity.source_scope_id
+                        == source_scope_id(sealed_context.store_namespace(), 0)
+                    || (part.identity.pgm_source_id == identity.pgm_source_id
+                        && part.identity.source_scope_id == identity.source_scope_id))
+        })
+}
+
+fn promotion_dictionary<R: ReadAt>(
+    sealed_unit: &PgmUnit<R>,
+    parts: &[&SegmentFacts],
+    bounds: &Bounds,
+) -> Result<Option<Vec<DictionaryFingerprint>>, BuildError> {
+    let mut wanted = DictionaryIdSet::new();
+    for fingerprint in parts.iter().flat_map(|part| &part.dictionary_fingerprints) {
+        if !wanted.contains(&fingerprint.str_id)
+            && u64::try_from(wanted.len()).map_err(|_error| BuildError::Overflow)?
+                == bounds.items_per_block
+        {
+            return Err(BuildError::LimitExceeded);
+        }
+        wanted.insert(fingerprint.str_id);
+    }
+    let sealed_dictionary = sealed_unit.resolve_overview_dictionary(&wanted, bounds)?;
+    if sealed_dictionary.values.len() != wanted.len() {
+        return Err(BuildError::Source(SourceError::Corrupt));
+    }
+    let sealed = fingerprint_dictionary(&sealed_dictionary.values)?;
+    let matches = parts.iter().all(|part| {
+        part.dictionary_fingerprints.iter().all(|part_value| {
+            sealed
+                .binary_search_by_key(&part_value.str_id, |value| value.str_id)
+                .ok()
+                .is_some_and(|index| sealed[index].context_id == part_value.context_id)
+        })
+    });
+    Ok(matches.then_some(sealed))
+}
+
+struct PromotionUsage {
+    observations: usize,
+    manifest_entries: usize,
+    known_gaps: usize,
+    retained_text_bytes: u64,
+}
+
+impl PromotionUsage {
+    fn for_parts(parts: &[&SegmentFacts], bounds: &Bounds) -> Result<Self, BuildError> {
+        let usage = Self {
+            observations: sum_len(parts, |part| part.observations.len())?,
+            manifest_entries: sum_len(parts, |part| part.manifest_entries.len())?,
+            known_gaps: sum_len(parts, |part| part.loss_coverage.known_gaps().spans().len())?,
+            retained_text_bytes: parts.iter().try_fold(0_u64, |bytes, part| {
+                bytes
+                    .checked_add(part.retained_text_bytes)
+                    .ok_or(BuildError::Overflow)
+            })?,
+        };
+        if u64::try_from(usage.observations).map_err(|_error| BuildError::Overflow)?
+            > bounds.items_per_block
+            || u64::try_from(usage.manifest_entries).map_err(|_error| BuildError::Overflow)?
+                > u64::from(bounds.directory_entries)
+            || u64::try_from(usage.known_gaps).map_err(|_error| BuildError::Overflow)?
+                > bounds.coverage_spans
+            || usage.retained_text_bytes > bounds.string_table_bytes
+        {
+            return Err(BuildError::LimitExceeded);
+        }
+        Ok(usage)
+    }
+}
+
+fn sum_len(
+    parts: &[&SegmentFacts],
+    len: impl Fn(&SegmentFacts) -> usize,
+) -> Result<usize, BuildError> {
+    parts.iter().try_fold(0_usize, |count, part| {
+        count.checked_add(len(part)).ok_or(BuildError::Overflow)
+    })
+}
+
+fn rekey_promoted_parts(
+    parts: &[&SegmentFacts],
+    lineage: SegmentIdentity,
+    sealed_locator: SegmentLocator,
+    dictionary_fingerprints: Vec<DictionaryFingerprint>,
+    bounds: &Bounds,
+) -> Result<Option<EventExtraction>, BuildError> {
+    let usage = PromotionUsage::for_parts(parts, bounds)?;
+    let mut observations = Vec::with_capacity(usage.observations);
+    let mut manifest_entries = Vec::with_capacity(usage.manifest_entries);
+    let mut known_gap_spans = Vec::with_capacity(usage.known_gaps);
+    let mut dropped_lower_bound = 0_u64;
+    let mut base_ordinal = 0_u32;
+    for part in parts {
+        for observation in &part.observations {
+            let source = observation.provenance();
+            let provenance = ObservationProvenance {
+                segment_locator: Some(sealed_locator),
+                section_body_id: source.section_body_id,
+                catalog_entry_ordinal: base_ordinal
+                    .checked_add(source.catalog_entry_ordinal)
+                    .ok_or(BuildError::Overflow)?,
+                row_ordinal: source.row_ordinal,
+                dictionary_context_id: source.dictionary_context_id,
+                source_locator: source.source_locator,
+            };
+            observations.push(
+                EventObservation::new(
+                    lineage,
+                    observation.source_type_id(),
+                    provenance,
+                    observation.shape(),
+                    observation.time(),
+                    observation.occurrence_count(),
+                    observation.payload().clone(),
+                    observation.evidence_quality(),
+                    observation.quality_flags(),
+                    observation.loss().cloned(),
+                )
+                .map_err(|_error| BuildError::Internal)?,
+            );
+        }
+        manifest_entries.extend(part.manifest_entries.iter().copied());
+        known_gap_spans.extend_from_slice(part.loss_coverage.known_gaps().spans());
+        dropped_lower_bound = dropped_lower_bound
+            .checked_add(part.loss_coverage.dropped_lower_bound())
+            .ok_or(BuildError::Overflow)?;
+        base_ordinal = base_ordinal
+            .checked_add(
+                u32::try_from(part.manifest_entries.len())
+                    .map_err(|_error| BuildError::Overflow)?,
+            )
+            .ok_or(BuildError::Overflow)?;
+    }
+    observations.sort_by(EventObservation::canonical_cmp);
+    if observations
+        .windows(2)
+        .any(|pair| pair[0].observation_id() == pair[1].observation_id())
+    {
+        return Ok(None);
+    }
+    Ok(Some(EventExtraction {
+        manifest_entries,
+        observations,
+        known_gaps: Coverage::from_spans(known_gap_spans),
+        dropped_lower_bound,
+        pgm_body_read_stats: PgmBodyReadStats::default(),
+        retained_text_bytes: usage.retained_text_bytes,
+        dictionary_fingerprints,
+    }))
 }
 
 /// Half-open coverage of an inclusive catalog time range.
 fn segment_coverage(min_ts_us: i64, max_ts_us: i64) -> Result<Coverage, BuildError> {
+    if min_ts_us > max_ts_us {
+        return Ok(Coverage::empty());
+    }
     let end = max_ts_us.checked_add(1).ok_or(BuildError::Overflow)?;
     let span = CoverageSpan::new(min_ts_us, end).ok_or(BuildError::Internal)?;
     Ok(Coverage::from_spans(vec![span]))
@@ -680,8 +1011,8 @@ fn merge_physical_count(
 #[cfg(test)]
 mod tests {
     use kronika_analytics::overview::{
-        CountLimits, ErrorCategory, EvidenceQuality, LossReason, ObservationPayload,
-        SemanticDivergence, SqlState, TimeQuality, semantic_divergences,
+        CountLimits, ErrorCategory, EvidenceQuality, LossReason, SemanticDivergence, SqlState,
+        TimeQuality, semantic_divergences,
     };
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;

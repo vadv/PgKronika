@@ -13,14 +13,20 @@
 читает тело по требованию, сверяет CRC и только затем вызывает registry codec.
 `Segment` — удобная оболочка для готового файла.
 
-`LocalDirSnapshot` объединяет units из `kronika-store`: сначала sealed, затем
-live. Live part скрывается только при точном совпадении каталога с sealed unit;
-пересечения по времени недостаточно. Store warnings и damage regions доступны
-вызывающему коду.
+`kronika-store::LocalDir` сначала сканирует `active.parts`, затем получает список
+sealed units; эти операции не образуют единый атомарный снимок.
+`LocalDirSnapshot` возвращает наблюдённые sealed units перед live parts. Live
+part скрывается только при точном совпадении каталога с sealed unit; пересечения
+по времени недостаточно. Store warnings и damage regions доступны вызывающему
+коду.
 
 После создания snapshot writer может запечатать или сбросить `active.parts`.
 Изменившаяся ссылка возвращает `ReadError::StaleSnapshot`. Query helpers
 ограниченно повторяют refresh, после чего нестабильный unit отражается gap.
+
+`LiveBuilder`, `LiveView` и seal reconciliation предоставляют ограниченные
+примитивы для overview fold и handoff. `pg_kronika-web` пока не публикует этот
+live timeline: production-запросы по-прежнему обращаются к `LocalDirSnapshot`.
 
 ## Logical queries
 
@@ -74,9 +80,22 @@ source cursor отклоняется, а не используется как of
 у выбранных тел блоков. `FactReadStats` сообщает число чтений и объём данных.
 
 Все конструкторы и декодеры PGKOVF применяют абсолютные пределы `LIMIT` до
-крупных аллокаций. Крейт не публикует, не заменяет, не удаляет и не
-перестраивает файлы фактов; он предоставляет кодек и примитивы позиционного
-чтения.
+крупных аллокаций. `FactStore` загружает и проверяет версионированные файлы
+фактов для отдельных сегментов. При отсутствии или отклонении файла крейт
+ограниченно извлекает факты из PGM, после чего store публикует их по content
+key. Ошибка сохранения остаётся видна вместе со свежими извлечёнными фактами.
+
+Постоянные файлы остаются основным источником кэша. Если canonical encoding и
+полная admission-проверка успешны, но publication завершилась восстанавливаемой
+ошибкой cache/storage, `FactStore` может сохранить неизменяемый
+`Arc<SegmentFacts>` в process-local fallback LRU. Полный ключ объединяет
+`FactKey` и sealed lineage, а каждое чтение сначала проверяет durable storage.
+По умолчанию доступны 24 segment-hours и 64 MiB canonical fact bytes; верхние
+границы конфигурации — 744 segment-hours и 256 MiB. Длительность округляется
+вверх до целого часа, а точечный, пустой или неизвестный интервал занимает один
+час. Запись, которая сама превышает любой предел, возвращается вызывающему коду,
+но не сохраняется. `FallbackStats` сообщает hits, misses, inserts, evictions,
+oversized, publication-failure offers и точную текущую residency.
 
 ## Границы и отказы
 
@@ -85,6 +104,5 @@ Parquet row groups на секцию. Декод словаря использу
 guards. Ошибки разделяют I/O, framing, unsupported format, bounds, CRC/codec,
 storage и staleness.
 
-Крейт не владеет HTTP status mapping, cache policy, remote storage, anomaly
-budget или поведением PostgreSQL. Канонический public surface —
-[`src/lib.rs`](src/lib.rs).
+Крейт не владеет HTTP status mapping, remote storage, anomaly budget или
+поведением PostgreSQL. Канонический public surface — [`src/lib.rs`](src/lib.rs).
