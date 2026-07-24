@@ -225,33 +225,33 @@ impl Serialize for EmptyParams {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ParameterParams {
     parameter: QueryParameter,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct InvalidParameterParams {
     parameter: InvalidParameterLocation,
     expected: ExpectedValue,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct UnknownParameterParams {
     parameter: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ConstraintParams {
     constraint: QueryConstraint,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SectionParams {
     section: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct LimitParams {
     resource: LimitResource,
     limit: u64,
@@ -259,12 +259,12 @@ struct LimitParams {
     observed: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct CapacityParams {
     retry_after_seconds: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 enum ProblemParams {
     Empty(EmptyParams),
@@ -278,7 +278,7 @@ enum ProblemParams {
 }
 
 /// A closed, machine-only RFC 9457 response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ApiProblem {
     #[serde(rename = "type")]
     type_uri: &'static str,

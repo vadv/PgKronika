@@ -19,12 +19,12 @@ use kronika_analytics::overview::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::AppState;
 use crate::overview::cache::{Endpoint, ResponseKey};
 use crate::overview::cursor::{CursorError, EventsCursor};
 use crate::overview::view::IndexView;
 use crate::params::QueryParams;
 use crate::problem::{ApiProblem, QueryParameter};
+use crate::{AppState, TimelineFlightRole};
 
 /// Absolute query span for the overview endpoint: 31 days.
 const MAX_OVERVIEW_SPAN_US: i64 = 31 * 24 * 3_600 * 1_000_000;
@@ -72,7 +72,7 @@ pub(crate) async fn overview(State(state): State<AppState>, RawQuery(raw): RawQu
         Ok(request) => request,
         Err(problem) => return problem.into_response(),
     };
-    let view = state.overview_view.load_full();
+    let view = state.overview_view();
     let key = overview_key(&view, request);
     serve(state, key, move || render_overview(&view, request)).await
 }
@@ -87,27 +87,58 @@ where
     R: FnOnce() -> Result<Value, ApiProblem> + Send + 'static,
 {
     if let Some(bytes) = state.response_cache.get(&key) {
-        return json_bytes_response(&bytes);
+        return json_bytes_response(bytes);
     }
-    let cache = state.response_cache.clone();
-    let rendered = tokio::task::spawn_blocking(move || -> Result<Arc<[u8]>, ApiProblem> {
-        let value = render()?;
-        let bytes: Arc<[u8]> = serde_json::to_vec(&value)
-            .map_err(|_error| ApiProblem::internal_error())?
-            .into();
-        cache.insert(key, Arc::clone(&bytes));
-        Ok(bytes)
-    })
-    .await;
-    match rendered {
-        Ok(Ok(bytes)) => json_bytes_response(&bytes),
-        Ok(Err(problem)) => problem.into_response(),
-        Err(_join) => ApiProblem::internal_error().into_response(),
+    let flight = match state.timeline_flight(&key) {
+        TimelineFlightRole::Follower(flight) => flight,
+        TimelineFlightRole::Leader(flight) => {
+            if let Some(bytes) = state.response_cache.get(&key) {
+                state.finish_timeline_flight(&key, &flight, Ok(bytes));
+            } else {
+                let Ok(permit) = state.try_acquire_analytic() else {
+                    state.finish_timeline_flight(
+                        &key,
+                        &flight,
+                        Err(ApiProblem::analytic_capacity_unavailable()),
+                    );
+                    return match flight.wait().await {
+                        Ok(bytes) => json_bytes_response(bytes),
+                        Err(problem) => problem.into_response(),
+                    };
+                };
+                let worker_state = state.clone();
+                let worker_key = key.clone();
+                let worker_flight = Arc::clone(&flight);
+                tokio::spawn(async move {
+                    let cache = worker_state.response_cache.clone();
+                    let render_key = worker_key.clone();
+                    let rendered =
+                        tokio::task::spawn_blocking(move || -> Result<Arc<[u8]>, ApiProblem> {
+                            let _permit = permit;
+                            let value = render()?;
+                            let bytes: Arc<[u8]> = serde_json::to_vec(&value)
+                                .map_err(|_error| ApiProblem::internal_error())?
+                                .into();
+                            cache.insert(render_key, Arc::clone(&bytes));
+                            Ok(bytes)
+                        })
+                        .await
+                        .unwrap_or_else(|_join| Err(ApiProblem::internal_error()));
+                    worker_state.finish_timeline_flight(&worker_key, &worker_flight, rendered);
+                });
+            }
+            flight
+        }
+    };
+    match flight.wait().await {
+        Ok(bytes) => json_bytes_response(bytes),
+        Err(problem) => problem.into_response(),
     }
 }
 
-fn json_bytes_response(bytes: &[u8]) -> Response {
-    ([(header::CONTENT_TYPE, "application/json")], bytes.to_vec()).into_response()
+fn json_bytes_response(bytes: Arc<[u8]>) -> Response {
+    let body = axum::body::Body::from(bytes::Bytes::from_owner(bytes));
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 const fn overview_key(view: &IndexView, request: OverviewRequest) -> ResponseKey {
@@ -198,7 +229,7 @@ pub(crate) async fn health(State(state): State<AppState>, RawQuery(raw): RawQuer
         Ok(request) => request,
         Err(problem) => return problem.into_response(),
     };
-    let view = state.overview_view.load_full();
+    let view = state.overview_view();
     let key = health_key(&view, request);
     serve(state, key, move || render_health(&view, request)).await
 }
@@ -327,7 +358,7 @@ pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuer
         Ok(request) => request,
         Err(problem) => return problem.into_response(),
     };
-    let view = state.overview_view.load_full();
+    let view = state.overview_view();
     let key = events_key(&view, &request);
     serve(state, key, move || render_events(&view, &request)).await
 }

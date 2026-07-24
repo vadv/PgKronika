@@ -679,6 +679,26 @@ impl LocalDirSnapshot {
             });
         }
 
+        let unit = self.open_sealed_by_descriptor(descriptor)?;
+        store
+            .load_or_build(&unit, context, bounds)
+            .map_err(Into::into)
+    }
+
+    /// Opens one exact reader-authored sealed descriptor.
+    ///
+    /// The direct-child locator and catalog descriptor must both still match
+    /// the pinned scan. This is the source-authority path used by seal
+    /// reconciliation before durable fact publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SealedFactError`] when the descriptor is unavailable or stale,
+    /// or the source PGM cannot be opened and validated.
+    pub fn open_sealed_by_descriptor(
+        &self,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<PgmUnit<std::fs::File>, SealedFactError> {
         let sealed = self
             .scan
             .sealed
@@ -717,9 +737,7 @@ impl LocalDirSnapshot {
                 locator: descriptor.locator,
             });
         }
-        store
-            .load_or_build(&unit, context, bounds)
-            .map_err(Into::into)
+        Ok(unit)
     }
 
     /// Opens one active journal part by its exact refresh descriptor.

@@ -63,8 +63,10 @@ macro_rules! closed_string_enum {
     };
 }
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -74,9 +76,9 @@ use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
-use kronika_reader::LocalDirSnapshot;
+use kronika_reader::{FallbackConfig, LocalDirSnapshot};
 use metrics_exporter_prometheus::PrometheusHandle;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 // These crates are used by the binary target. Keep the imports here so the
 // library target satisfies `unused_crate_dependencies`.
 use mimalloc as _;
@@ -110,6 +112,7 @@ pub(crate) mod startup;
 
 pub use auth::AuthConfig;
 use auth::require_basic_auth;
+pub use overview::live::OverviewBuildError;
 pub use startup::WebConfig;
 
 /// Container format version this build serves, mirrored into `/v1/version`.
@@ -120,13 +123,114 @@ pub const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
-/// Shared router state: the store snapshot and readiness counters.
+/// Atomically published store metadata and timeline facts.
+#[derive(Debug)]
+pub(crate) struct PublishedStoreView {
+    snapshot: Arc<LocalDirSnapshot>,
+    timeline: Arc<overview::view::IndexView>,
+}
+
+type TimelineFlightResult = Result<Arc<[u8]>, problem::ApiProblem>;
+
+#[derive(Debug)]
+pub(crate) struct TimelineFlight {
+    result: Mutex<Option<TimelineFlightResult>>,
+    notify: Notify,
+}
+
+impl TimelineFlight {
+    fn pending() -> Self {
+        Self {
+            result: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+
+    pub(crate) async fn wait(&self) -> TimelineFlightResult {
+        loop {
+            let notified = self.notify.notified();
+            let result = self
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(result) = result {
+                return result;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TimelineFlightRole {
+    Leader(Arc<TimelineFlight>),
+    Follower(Arc<TimelineFlight>),
+}
+
+/// Explicit overview storage and memory policy.
+#[derive(Debug, Clone)]
+pub struct OverviewConfig {
+    /// Durable fact-cache root.
+    pub cache_root: PathBuf,
+    /// Stable normalized store/deployment identity.
+    pub namespace: Vec<u8>,
+    /// Bounded durable-publication fallback.
+    pub fallback: FallbackConfig,
+    /// Conservative serialized-response cache byte ceiling.
+    pub response_cache_bytes: usize,
+    /// Secondary serialized-response entry ceiling.
+    pub response_cache_entries: usize,
+}
+
+impl OverviewConfig {
+    /// Builds the default bounded policy for an explicit cache root and
+    /// namespace.
+    #[must_use]
+    pub fn new(cache_root: PathBuf, namespace: Vec<u8>) -> Self {
+        Self {
+            cache_root,
+            namespace,
+            fallback: FallbackConfig::default(),
+            response_cache_bytes: RESPONSE_CACHE_BYTES,
+            response_cache_entries: RESPONSE_CACHE_ENTRIES,
+        }
+    }
+}
+
+/// Startup failure before a coherent store/timeline pair exists.
+#[derive(Debug)]
+pub enum StateBuildError {
+    /// The initial incremental scan failed.
+    Snapshot(std::io::Error),
+    /// Overview configuration or assembly failed.
+    Overview(OverviewBuildError),
+}
+
+impl std::fmt::Display for StateBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Snapshot(error) => write!(f, "initial store refresh: {error}"),
+            Self::Overview(error) => write!(f, "initial overview build: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StateBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Snapshot(error) => Some(error),
+            Self::Overview(error) => Some(error),
+        }
+    }
+}
+
+/// Shared router state: one coherent store view and readiness counters.
 ///
 /// All fields use `Arc` so `Clone` is cheap; the router clones this per request.
 #[derive(Debug, Clone)]
 pub struct AppState {
-    /// The current store snapshot, replaced wholesale on each refresh.
-    pub snapshot: Arc<ArcSwap<LocalDirSnapshot>>,
+    published: Arc<ArcSwap<PublishedStoreView>>,
     /// Unix timestamp (seconds) of the last successful snapshot refresh.
     pub last_refresh: Arc<AtomicU64>,
     /// Number of completed refresh loop iterations (successful or not).
@@ -134,24 +238,27 @@ pub struct AppState {
     /// Age threshold after which the store is considered stale.
     pub stale_after: Duration,
     analytic_requests: Arc<Semaphore>,
-    overview: overview::OverviewIndex,
-    /// The atomic overview index view, republished by the refresh cycle.
-    pub(crate) overview_view: Arc<ArcSwap<overview::view::IndexView>>,
+    timeline_flights: Arc<Mutex<HashMap<overview::cache::ResponseKey, Arc<TimelineFlight>>>>,
+    overview: Arc<Mutex<overview::OverviewIndex>>,
     /// Byte-bounded cache of exact serialized timeline responses.
     pub(crate) response_cache: overview::cache::ResponseCache,
 }
 
 /// Byte budget for the exact response cache: 64 MiB.
 const RESPONSE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Secondary response-cache ceiling for small bodies.
+const RESPONSE_CACHE_ENTRIES: usize = 4_096;
 
-/// The persistent overview fact store rooted for this process.
-///
-/// The cache is content-addressed, so a shared per-process root is safe; a
-/// write failure degrades to a bounded memory fallback without losing
-/// correctness.
-fn default_overview_index() -> overview::OverviewIndex {
-    let cache_root = std::env::temp_dir().join("pgkronika-overview-cache");
-    overview::OverviewIndex::new(cache_root, b"pgkronika".to_vec())
+fn default_overview_config() -> OverviewConfig {
+    static INSTANCE: AtomicU64 = AtomicU64::new(0);
+    let instance = INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    OverviewConfig::new(
+        std::env::temp_dir().join(format!(
+            "pgkronika-overview-test-{}-{instance}",
+            std::process::id()
+        )),
+        format!("test-store-{}-{instance}", std::process::id()).into_bytes(),
+    )
 }
 
 impl AppState {
@@ -160,48 +267,90 @@ impl AppState {
     /// `last_refresh` is initialised to the current wall-clock second so that
     /// `/readyz` reports ready immediately after startup. `stale_after` defaults
     /// to 10 s, matching the refresh loop cadence.
-    #[must_use]
-    pub fn new(snapshot: LocalDirSnapshot) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed startup error when the initial snapshot refresh or
+    /// overview assembly cannot produce one coherent published view.
+    pub fn new(snapshot: LocalDirSnapshot) -> Result<Self, StateBuildError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let overview = default_overview_index();
-        let initial_view = Arc::new(ArcSwap::from_pointee(overview.assemble(&snapshot)));
-        Self {
-            snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
-            last_refresh: Arc::new(AtomicU64::new(now)),
-            refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
-            stale_after: Duration::from_secs(10),
-            analytic_requests: Arc::new(Semaphore::new(1)),
-            overview,
-            overview_view: initial_view,
-            response_cache: overview::cache::ResponseCache::new(RESPONSE_CACHE_BYTES),
-        }
+        Self::with_overview_config(
+            snapshot,
+            now,
+            Duration::from_secs(10),
+            default_overview_config(),
+        )
     }
 
     /// Construct state with an explicit `last_refresh` and `stale_after`.
     ///
     /// The server passes the configured staleness threshold and the current
     /// time; tests use it to drive `/readyz` from an injected `last_refresh`.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed startup error when the initial snapshot refresh or
+    /// overview assembly cannot produce one coherent published view.
     pub fn with_readiness(
         snapshot: LocalDirSnapshot,
         last_refresh_secs: u64,
         stale_after: Duration,
-    ) -> Self {
-        let overview = default_overview_index();
-        let initial_view = Arc::new(ArcSwap::from_pointee(overview.assemble(&snapshot)));
-        Self {
-            snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+    ) -> Result<Self, StateBuildError> {
+        Self::with_overview_config(
+            snapshot,
+            last_refresh_secs,
+            stale_after,
+            default_overview_config(),
+        )
+    }
+
+    /// Constructs state from an explicit production overview policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed startup error when the snapshot cannot refresh or the
+    /// configured writer cannot publish its initial view.
+    pub fn with_overview_config(
+        mut snapshot: LocalDirSnapshot,
+        last_refresh_secs: u64,
+        stale_after: Duration,
+        config: OverviewConfig,
+    ) -> Result<Self, StateBuildError> {
+        let OverviewConfig {
+            cache_root,
+            namespace,
+            fallback,
+            response_cache_bytes,
+            response_cache_entries,
+        } = config;
+        let delta = snapshot
+            .refresh_incremental_delta()
+            .map_err(StateBuildError::Snapshot)?;
+        let mut overview = overview::OverviewIndex::new(cache_root, namespace, fallback)
+            .map_err(StateBuildError::Overview)?;
+        let timeline = overview
+            .assemble(&snapshot, &delta)
+            .map_err(StateBuildError::Overview)?;
+        let published = PublishedStoreView {
+            snapshot: Arc::new(snapshot),
+            timeline: Arc::new(timeline),
+        };
+        Ok(Self {
+            published: Arc::new(ArcSwap::from_pointee(published)),
             last_refresh: Arc::new(AtomicU64::new(last_refresh_secs)),
             refresh_loop_iterations: Arc::new(AtomicU64::new(0)),
             stale_after,
             analytic_requests: Arc::new(Semaphore::new(1)),
-            overview,
-            overview_view: initial_view,
-            response_cache: overview::cache::ResponseCache::new(RESPONSE_CACHE_BYTES),
-        }
+            timeline_flights: Arc::new(Mutex::new(HashMap::new())),
+            overview: Arc::new(Mutex::new(overview)),
+            response_cache: overview::cache::ResponseCache::new(
+                response_cache_bytes,
+                response_cache_entries,
+            ),
+        })
     }
 
     /// Reserve the server's single heavy-analysis slot without queuing.
@@ -209,18 +358,99 @@ impl AppState {
         Arc::clone(&self.analytic_requests).try_acquire_owned()
     }
 
-    /// Reassemble the overview index view and publish it atomically.
-    ///
-    /// The refresh cycle is the single writer of the published view. It folds
-    /// the delta's active parts into the live generation, so live events become
-    /// visible without a request ever decoding PGM bodies.
-    pub fn republish_overview(
+    pub(crate) fn timeline_flight(&self, key: &overview::cache::ResponseKey) -> TimelineFlightRole {
+        let mut flights = self
+            .timeline_flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(flight) = flights.get(key) {
+            return TimelineFlightRole::Follower(Arc::clone(flight));
+        }
+        let flight = Arc::new(TimelineFlight::pending());
+        flights.insert(key.clone(), Arc::clone(&flight));
+        drop(flights);
+        TimelineFlightRole::Leader(flight)
+    }
+
+    pub(crate) fn finish_timeline_flight(
         &self,
-        snapshot: &LocalDirSnapshot,
-        delta: &kronika_reader::RefreshDelta,
+        key: &overview::cache::ResponseKey,
+        flight: &Arc<TimelineFlight>,
+        result: TimelineFlightResult,
     ) {
-        let view = self.overview.assemble_with_live(snapshot, delta);
-        self.overview_view.store(Arc::new(view));
+        *flight
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+        flight.notify.notify_waiters();
+        let mut flights = self
+            .timeline_flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flights
+            .get(key)
+            .is_some_and(|registered| Arc::ptr_eq(registered, flight))
+        {
+            flights.remove(key);
+        }
+    }
+
+    /// Current snapshot from one coherent publication.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<LocalDirSnapshot> {
+        Arc::clone(&self.published.load().snapshot)
+    }
+
+    pub(crate) fn overview_view(&self) -> Arc<overview::view::IndexView> {
+        Arc::clone(&self.published.load().timeline)
+    }
+
+    /// Builds and publishes one coherent store/timeline pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed build error without changing the published pair when
+    /// live folding or writer access fails.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Prometheus gauges use f64; integer counters remain exact through 2^53"
+    )]
+    pub fn republish_store_view(
+        &self,
+        snapshot: LocalDirSnapshot,
+        delta: &kronika_reader::RefreshDelta,
+    ) -> Result<(), OverviewBuildError> {
+        let mut overview = self
+            .overview
+            .lock()
+            .map_err(|_error| OverviewBuildError::WriterPoisoned)?;
+        let timeline = overview.assemble_with_live(&snapshot, delta)?;
+        let diagnostics = overview.diagnostics();
+        drop(overview);
+        metrics::gauge!("kronika_web_overview_durable_hits_total")
+            .set(diagnostics.durable_hits as f64);
+        metrics::gauge!("kronika_web_overview_fallback_hits_total")
+            .set(diagnostics.fallback_hits as f64);
+        metrics::gauge!("kronika_web_overview_rebuilt_total").set(diagnostics.rebuilt as f64);
+        metrics::gauge!("kronika_web_overview_promotions_total").set(diagnostics.promotions as f64);
+        metrics::gauge!("kronika_web_overview_persistence_failures_total")
+            .set(diagnostics.persistence_failures as f64);
+        metrics::gauge!("kronika_web_overview_sealed_failures_total")
+            .set(diagnostics.sealed_failures as f64);
+        self.published.store(Arc::new(PublishedStoreView {
+            snapshot: Arc::new(snapshot),
+            timeline: Arc::new(timeline),
+        }));
+        Ok(())
+    }
+
+    /// Publishes a fresh metadata snapshot with the last usable timeline view.
+    pub fn publish_snapshot_with_last_timeline(&self, snapshot: LocalDirSnapshot) {
+        let timeline = self.overview_view();
+        self.published.store(Arc::new(PublishedStoreView {
+            snapshot: Arc::new(snapshot),
+            timeline,
+        }));
     }
 }
 

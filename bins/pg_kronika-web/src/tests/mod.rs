@@ -20,7 +20,7 @@ use kronika_registry::{Section, StrId, Ts};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tower::ServiceExt;
 
-use super::{AppState, AuthConfig, app};
+use super::{AppState, AuthConfig, OverviewConfig, app};
 
 mod anomalies;
 mod auth_static;
@@ -107,7 +107,7 @@ async fn fixture_request_captured(
     std::fs::write(dir.path().join("143000.pgm"), &bytes).expect("write segment");
 
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-    let state = AppState::new(snapshot);
+    let state = AppState::new(snapshot).expect("state");
 
     let mut request = Request::builder().method(method).uri(uri);
     for &(name, value) in request_headers {
@@ -135,7 +135,16 @@ async fn serve_captured(
     request_headers: &[(&str, &str)],
 ) -> CapturedResponse {
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
-    let state = AppState::new(snapshot);
+    let state = AppState::with_overview_config(
+        snapshot,
+        0,
+        std::time::Duration::from_secs(10),
+        OverviewConfig::new(
+            dir.join(".test-overview-cache"),
+            dir.as_os_str().as_encoded_bytes().to_vec(),
+        ),
+    )
+    .expect("state");
     let mut request = Request::builder().uri(uri);
     for &(name, value) in request_headers {
         request = request.header(name, value);

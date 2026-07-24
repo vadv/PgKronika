@@ -868,7 +868,7 @@ async fn analytic_endpoints_share_fail_fast_admission() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_bgwriter_segment(dir.path(), "0.pgm", 7, 0, 10 * 60 * 1_000_000);
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-    let state = AppState::new(snapshot);
+    let state = AppState::new(snapshot).expect("state");
     let _permit = state
         .try_acquire_analytic()
         .expect("reserve the shared analytic slot");
@@ -876,6 +876,9 @@ async fn analytic_endpoints_share_fail_fast_admission() {
     for uri in [
         "/v1/incidents?source=7&from=0&to=600000000&window=1m&step=1m",
         "/v1/anomalies?source=7&from=0&to=600000000&window=1m&step=1m",
+        "/v1/timeline/overview?from=0&to=600000000",
+        "/v1/timeline/events?from=0&to=600000000",
+        "/v1/timeline/health?from=0&to=600000000&step=60000000",
     ] {
         let response = app(state.clone(), None, test_metrics_handle())
             .oneshot(
@@ -904,7 +907,7 @@ async fn incident_read_failure_is_sanitized() {
     let to = 39 * 60 * 1_000_000;
     write_archiver_with_identity(dir.path(), &archiver_rows(true), 0, to);
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-    let state = AppState::new(snapshot);
+    let state = AppState::new(snapshot).expect("state");
     std::fs::remove_file(dir.path().join("0.pgm")).expect("remove fixture after snapshot");
     let uri = format!("/v1/incidents?source=7&from=0&to={to}&window=6m&step=2m");
     let response = app(state, None, test_metrics_handle())

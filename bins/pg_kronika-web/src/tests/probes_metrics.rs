@@ -25,7 +25,7 @@ async fn probe(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
 #[tokio::test]
 async fn healthz_returns_200_ok() {
     let (_dir, snapshot) = empty_snapshot();
-    let state = AppState::new(snapshot);
+    let state = AppState::new(snapshot).expect("state");
     let (status, body) = probe(state, "/healthz").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, serde_json::json!({"status": "ok"}));
@@ -40,7 +40,8 @@ async fn readyz_fresh_snapshot_returns_200_ready() {
         .unwrap_or_default()
         .as_secs();
     // last_refresh = now; stale_after = 10s => age == 0, not stale
-    let state = AppState::with_readiness(snapshot, now, std::time::Duration::from_secs(10));
+    let state =
+        AppState::with_readiness(snapshot, now, std::time::Duration::from_secs(10)).expect("state");
     let (status, body) = probe(state, "/readyz").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ready"], serde_json::json!(true));
@@ -59,7 +60,8 @@ async fn readyz_stale_snapshot_returns_503_not_ready() {
         snapshot,
         now.saturating_sub(3600),
         std::time::Duration::from_secs(10),
-    );
+    )
+    .expect("state");
     let (status, body) = probe(state, "/readyz").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["ready"], serde_json::json!(false));
@@ -73,18 +75,22 @@ async fn metrics_endpoint_lists_metric_names_after_traffic() {
     // increment, which runs after a handler returns. Warm it with one
     // request so the scrape sees it without leaning on sibling tests.
     let (_warm_dir, warm_snapshot) = empty_snapshot();
-    app(AppState::new(warm_snapshot), None, handle.clone())
-        .oneshot(
-            Request::builder()
-                .uri("/healthz")
-                .body(Body::empty())
-                .expect("build request"),
-        )
-        .await
-        .expect("route warmup request");
+    app(
+        AppState::new(warm_snapshot).expect("state"),
+        None,
+        handle.clone(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .expect("build request"),
+    )
+    .await
+    .expect("route warmup request");
 
     let (_dir, snapshot) = empty_snapshot();
-    let response = app(AppState::new(snapshot), None, handle)
+    let response = app(AppState::new(snapshot).expect("state"), None, handle)
         .oneshot(
             Request::builder()
                 .uri("/metrics")

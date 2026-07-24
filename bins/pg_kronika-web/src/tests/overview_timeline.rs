@@ -3,8 +3,11 @@ use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_registry::pg_log::PgLogErrorV1;
 use kronika_registry::{Section, Ts};
 use serde_json::json;
+use std::sync::Arc;
 
 use super::{assert_problem, fixture_response, serve};
+use crate::overview::cache::{Endpoint, ResponseKey};
+use crate::{AppState, TimelineFlightRole};
 
 /// Writes a sealed segment of `count` panic error groups a millisecond apart.
 ///
@@ -183,7 +186,7 @@ async fn a_cursor_walks_the_retained_set_exactly_once() {
 }
 
 #[tokio::test]
-async fn health_reports_a_critical_floor_without_a_false_green() {
+async fn parsed_panic_does_not_assert_a_trusted_health_floor() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_panic_segment(dir.path(), 1);
     let (status, body) = serve(
@@ -194,24 +197,24 @@ async fn health_reports_a_critical_floor_without_a_false_green() {
     assert_eq!(status, StatusCode::OK, "health served: {body}");
     assert_eq!(body["health_policy_version"], 1);
     let points = body["points"].as_array().expect("points array");
-    let critical = points
-        .iter()
-        .find(|point| point["overall_state"] == "critical")
-        .expect("the panic bucket is critical");
     assert!(
-        critical["overall_score"].is_null(),
-        "a trusted floor does not invent a zero score"
+        points
+            .iter()
+            .all(|point| point["overall_state"] != "critical"),
+        "parsed log text cannot prove a catastrophic floor"
     );
     assert!(
-        critical["continuous_score"].is_null(),
+        points
+            .iter()
+            .all(|point| point["continuous_score"].is_null()),
         "an uncovered required domain is never a false green"
     );
     assert!(
-        !critical["floor_evidence"]
+        points.iter().all(|point| point["floor_evidence"]
             .as_array()
             .expect("floor evidence")
-            .is_empty(),
-        "the floor evidence is reported"
+            .is_empty()),
+        "untrusted panic text is not published as floor evidence"
     );
 }
 
@@ -249,4 +252,40 @@ async fn a_cursor_presented_to_a_changed_query_is_a_mismatch() {
     let (status, body) = serve(dir.path(), &changed).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "cursor_query_mismatch");
+}
+
+#[tokio::test]
+async fn identical_timeline_misses_share_one_flight() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
+    let state = AppState::new(snapshot).expect("state");
+    let key = ResponseKey {
+        endpoint: Endpoint::Events,
+        response_schema_version: 1,
+        fact_set_id: [7; 32],
+        from_us: 0,
+        to_us: 10,
+        step_us: None,
+        notable_policy_version: 1,
+        health_policy_version: 1,
+        filters: "limit=2".to_owned(),
+        page: None,
+    };
+    let leader = match state.timeline_flight(&key) {
+        TimelineFlightRole::Leader(flight) => flight,
+        TimelineFlightRole::Follower(_) => panic!("first request must lead"),
+    };
+    let follower = match state.timeline_flight(&key) {
+        TimelineFlightRole::Follower(flight) => flight,
+        TimelineFlightRole::Leader(_) => panic!("same key must join"),
+    };
+    assert!(Arc::ptr_eq(&leader, &follower));
+
+    let expected: Arc<[u8]> = br#"{"events":[]}"#.as_slice().into();
+    state.finish_timeline_flight(&key, &leader, Ok(Arc::clone(&expected)));
+    assert_eq!(follower.wait().await.expect("flight result"), expected);
+    assert!(matches!(
+        state.timeline_flight(&key),
+        TimelineFlightRole::Leader(_)
+    ));
 }

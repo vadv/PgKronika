@@ -105,7 +105,7 @@ fn run(state: &AppState, request: ValidatedRequest) -> Result<Json<Value>, ApiPr
         sections,
     } = request;
 
-    let mut snap = state.snapshot.load().as_ref().clone();
+    let mut snap = state.snapshot().as_ref().clone();
     let data_age = source_data_age(&snap, source);
 
     let prepared = match prepare_input(

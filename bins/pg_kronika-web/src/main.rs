@@ -18,14 +18,14 @@
     reason = "gauge values are small integer counts that fit an f64 exactly"
 )]
 
-use std::sync::Arc;
+use std::os::unix::ffi::OsStrExt as _;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kronika_reader::LocalDirSnapshot;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use pg_kronika_web::{
-    AppState, AuthConfig, FORMAT_VERSION, REQUEST_DURATION_BUCKETS, WebConfig, app,
+    AppState, AuthConfig, FORMAT_VERSION, OverviewConfig, REQUEST_DURATION_BUCKETS, WebConfig, app,
 };
 use tower_http::trace::TraceLayer;
 
@@ -51,9 +51,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing(&cfg.log);
     let metrics_handle = install_metrics()?;
 
-    let snapshot = LocalDirSnapshot::open(&cfg.dir)
+    let canonical_store = std::fs::canonicalize(&cfg.dir)
+        .map_err(|err| format!("failed to resolve store at {}: {err}", cfg.dir.display()))?;
+    let snapshot = LocalDirSnapshot::open(&canonical_store)
         .map_err(|err| format!("failed to open store at {}: {err}", cfg.dir.display()))?;
-    let state = AppState::with_readiness(snapshot, now_unix_secs(), cfg.stale_after);
+    let namespace = cfg
+        .overview_namespace
+        .clone()
+        .unwrap_or_else(|| canonical_store.as_os_str().as_bytes().to_vec());
+    let overview = OverviewConfig::new(cfg.overview_cache_dir.clone(), namespace);
+    let state =
+        AppState::with_overview_config(snapshot, now_unix_secs(), cfg.stale_after, overview)?;
     let auth = cfg
         .basic_auth
         .as_ref()
@@ -66,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         version = env!("CARGO_PKG_VERSION"),
         format_version = FORMAT_VERSION,
         store = %cfg.dir.display(),
+        overview_cache = %cfg.overview_cache_dir.display(),
         "pg_kronika-web starting"
     );
 
@@ -139,7 +148,7 @@ fn install_metrics() -> Result<PrometheusHandle, Box<dyn std::error::Error>> {
     reason = "the refresh task runs until the server aborts it on shutdown"
 )]
 async fn refresh_loop(state: AppState) {
-    let mut snap = state.snapshot.load().as_ref().clone();
+    let mut snap = state.snapshot().as_ref().clone();
     let mut health = (snap.warnings().len(), snap.damages().len());
     if health != (0, 0) {
         tracing::warn!(
@@ -155,8 +164,35 @@ async fn refresh_loop(state: AppState) {
         tokio::time::sleep(REFRESH_INTERVAL).await;
         state.refresh_loop_iterations.fetch_add(1, Relaxed);
         metrics::counter!("kronika_web_refresh_loop_iterations_total").increment(1);
-        match snap.refresh_incremental_delta() {
-            Ok(delta) => {
+        let fallback_snapshot = snap.clone();
+        let worker_state = state.clone();
+        let refreshed = tokio::task::spawn_blocking(move || {
+            let scan = snap.refresh_incremental_delta();
+            let publication = match &scan {
+                Ok(delta) => match worker_state.republish_store_view(snap.clone(), delta) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        worker_state.publish_snapshot_with_last_timeline(snap.clone());
+                        Err(error)
+                    }
+                },
+                Err(_error) => Ok(()),
+            };
+            (snap, scan, publication)
+        })
+        .await;
+        let (next_snapshot, scan, publication) = match refreshed {
+            Ok(result) => result,
+            Err(error) => {
+                metrics::counter!("kronika_web_refresh_errors_total").increment(1);
+                tracing::error!(%error, "overview refresh worker failed");
+                snap = fallback_snapshot;
+                continue;
+            }
+        };
+        snap = next_snapshot;
+        match scan {
+            Ok(_delta) => {
                 let current = (snap.warnings().len(), snap.damages().len());
                 if current != health {
                     tracing::warn!(
@@ -169,12 +205,12 @@ async fn refresh_loop(state: AppState) {
                 metrics::gauge!("kronika_web_store_warnings").set(current.0 as f64);
                 metrics::gauge!("kronika_web_store_damages").set(current.1 as f64);
                 state.last_refresh.store(now_unix_secs(), Relaxed);
-                state.snapshot.store(Arc::new(snap.clone()));
-                // The refresh cycle is the single writer of the published index
-                // view: fold the delta's active parts and republish atomically.
-                state.republish_overview(&snap, &delta);
                 metrics::gauge!("kronika_web_overview_view_generation")
                     .set(snap.view_generation() as f64);
+                if let Err(error) = publication {
+                    metrics::counter!("kronika_web_overview_refresh_errors_total").increment(1);
+                    tracing::warn!(%error, "overview refresh retained the last timeline view");
+                }
             }
             Err(err) => {
                 metrics::counter!("kronika_web_refresh_errors_total").increment(1);

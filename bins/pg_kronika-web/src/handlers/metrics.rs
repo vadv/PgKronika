@@ -28,7 +28,7 @@ pub(crate) async fn metrics_handler(
         .as_secs();
 
     // Snapshot-derived gauges.
-    let snapshot = state.snapshot.load_full();
+    let snapshot = state.snapshot();
     let units = snapshot.units();
     let unit_count = units.len();
     // Gauge precision: unit counts never exceed 2^52 in practice.

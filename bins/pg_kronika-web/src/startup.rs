@@ -17,6 +17,9 @@ pub(crate) fn metric_labels(method: &str, matched_path: Option<&str>) -> (String
         Some("/readyz") => "/readyz",
         Some("/metrics") => "/metrics",
         Some("/v1/version") => "/v1/version",
+        Some("/v1/timeline/overview") => "/v1/timeline/overview",
+        Some("/v1/timeline/events") => "/v1/timeline/events",
+        Some("/v1/timeline/health") => "/v1/timeline/health",
         Some("/v1/anomalies") => "/v1/anomalies",
         Some("/v1/incidents") => "/v1/incidents",
         Some("/v1/sources") => "/v1/sources",
@@ -70,6 +73,11 @@ pub struct WebConfig {
     pub stale_after: Duration,
     /// Log filter directive (e.g. `info`).
     pub log: String,
+    /// Durable overview fact-cache directory.
+    pub overview_cache_dir: PathBuf,
+    /// Explicit stable overview namespace; `None` derives it from the canonical
+    /// store path at startup.
+    pub overview_namespace: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for WebConfig {
@@ -84,6 +92,14 @@ impl std::fmt::Debug for WebConfig {
             )
             .field("stale_after", &self.stale_after)
             .field("log", &self.log)
+            .field("overview_cache_dir", &self.overview_cache_dir)
+            .field(
+                "overview_namespace",
+                &self
+                    .overview_namespace
+                    .as_ref()
+                    .map(|namespace| format!("<{} bytes>", namespace.len())),
+            )
             .finish()
     }
 }
@@ -113,12 +129,15 @@ impl WebConfig {
             }
         };
 
+        let dir = PathBuf::from(dir);
         Ok(Self {
-            dir: PathBuf::from(dir),
+            overview_cache_dir: dir.join(".pgkronika-overview-cache"),
+            dir,
             addr: addr.to_owned(),
             basic_auth,
             stale_after,
             log: log.unwrap_or("info").to_owned(),
+            overview_namespace: None,
         })
     }
 
@@ -139,13 +158,26 @@ impl WebConfig {
         let stale_raw = std::env::var("KRONIKA_WEB_STALE_AFTER_S").ok();
         let log = std::env::var("KRONIKA_WEB_LOG").ok();
 
-        Self::parse(
+        let mut config = Self::parse(
             &dir,
             &addr,
             basic_auth_raw.as_deref(),
             stale_raw.as_deref(),
             log.as_deref(),
-        )
+        )?;
+        if let Ok(cache_dir) = std::env::var("KRONIKA_WEB_OVERVIEW_CACHE_DIR") {
+            if cache_dir.is_empty() {
+                return Err("KRONIKA_WEB_OVERVIEW_CACHE_DIR must not be empty".to_owned());
+            }
+            config.overview_cache_dir = PathBuf::from(cache_dir);
+        }
+        if let Ok(namespace) = std::env::var("KRONIKA_WEB_OVERVIEW_NAMESPACE") {
+            if namespace.is_empty() {
+                return Err("KRONIKA_WEB_OVERVIEW_NAMESPACE must not be empty".to_owned());
+            }
+            config.overview_namespace = Some(namespace.into_bytes());
+        }
+        Ok(config)
     }
 }
 
@@ -165,7 +197,13 @@ mod tests {
 
     #[test]
     fn analytic_metric_paths_use_fixed_labels() {
-        for path in ["/v1/anomalies", "/v1/incidents"] {
+        for path in [
+            "/v1/anomalies",
+            "/v1/incidents",
+            "/v1/timeline/overview",
+            "/v1/timeline/events",
+            "/v1/timeline/health",
+        ] {
             assert_eq!(metric_labels("GET", Some(path)).1, path);
         }
     }
@@ -255,6 +293,11 @@ mod tests {
             "default stale_after is 10s"
         );
         assert_eq!(cfg.log, "info", "default log level is info");
+        assert_eq!(
+            cfg.overview_cache_dir,
+            PathBuf::from("/data/.pgkronika-overview-cache")
+        );
+        assert!(cfg.overview_namespace.is_none());
     }
 
     #[test]
