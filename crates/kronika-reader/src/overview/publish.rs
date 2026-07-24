@@ -4,6 +4,7 @@
 //! failures, and persistence failures return the computed facts with a typed
 //! diagnostic.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::num::NonZeroU64;
@@ -20,6 +21,7 @@ use super::descriptors::CatalogEntryDescriptor;
 use super::factkey::{FactKey, FileKind, placement};
 use super::facts::{BuildError, SegmentContext, SegmentFacts};
 use super::fallback::{FallbackConfig, FallbackFactKey, FallbackFactLru, FallbackStats};
+use super::gc::GcOutcome;
 use super::limits::Bounds;
 use crate::unit::{PgmBodyReadStats, PgmUnit};
 
@@ -168,6 +170,9 @@ impl FactLoad {
 pub struct FactStore {
     cache_root: PathBuf,
     fallback: Arc<Mutex<FallbackFactLru>>,
+    /// Per-file grace counter for [`collect_garbage`](Self::collect_garbage),
+    /// carried across passes.
+    gc_pending: Arc<Mutex<HashMap<PathBuf, u32>>>,
 }
 
 impl FactStore {
@@ -186,7 +191,24 @@ impl FactStore {
         Self {
             cache_root: cache_root.into(),
             fallback: Arc::new(Mutex::new(FallbackFactLru::new(fallback_config))),
+            gc_pending: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Unlinks committed fact files whose segment is no longer live.
+    ///
+    /// `live` holds the absolute paths of fact files still backing a segment
+    /// in the current snapshot ([`placement`] for each). A non-live file is
+    /// held for a short grace window before unlinking, so a segment that
+    /// briefly disappears and returns is not rebuilt. Safe to call only from
+    /// the thread that owns publication.
+    #[must_use]
+    pub fn collect_garbage(&self, live: &HashSet<PathBuf>) -> GcOutcome {
+        let mut pending = match self.gc_pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        super::gc::collect(&self.cache_root, live, &mut pending)
     }
 
     /// Operator-trusted cache root.
