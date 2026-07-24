@@ -5,8 +5,9 @@
 PgKronika records diagnostic history for a PostgreSQL instance in local,
 immutable PGM segment files. A collector reads PostgreSQL statistics, Linux
 `/proc` and cgroup data, and optionally PostgreSQL stderr logs. A separate web
-process serves the recorded rows, counter diffs, anomaly episodes, and incident
-clusters through a local UI and JSON API.
+process serves the recorded rows, counter diffs, source-scoped timeline
+digests, health lines, notable events, anomaly episodes, and incident clusters
+through a local UI and JSON API.
 
 The project is under active development. The collector, local segment store,
 reader, and web API are implemented and covered by PostgreSQL 15–18 BDD tests.
@@ -27,7 +28,7 @@ PostgreSQL 15–18       Linux /proc, /sys, cgroups       stderr log
                  kronika-store -> kronika-reader
                               |
              kronika-analytics -> pg_kronika-web
-                    diff, anomaly       JSON/UI, incidents
+              diff, anomaly, health     JSON/UI, timeline, incidents
 ```
 
 The collector runs on the database host and opens no network listener. It
@@ -116,13 +117,13 @@ crates.io.
 | [`kronika-registry`](crates/kronika-registry/) | Stable type ids, schemas, column semantics, gates, codecs, and registry linting. |
 | [`kronika-writer`](crates/kronika-writer/) | Bounded section buffers, string interning, `active.parts`, and sealing. |
 | [`kronika-store`](crates/kronika-store/) | Read-only scan of a local segment directory and live journal. |
-| [`kronika-reader`](crates/kronika-reader/) | Verified section decode, snapshots, pagination, logical sections, gauges, and diffs. |
-| [`kronika-analytics`](crates/kronika-analytics/) | Source-independent counter, anomaly, and overview contract kernels. |
+| [`kronika-reader`](crates/kronika-reader/) | Verified section decode, snapshots, pagination, logical sections, gauges, diffs, and durable-first overview facts. |
+| [`kronika-analytics`](crates/kronika-analytics/) | Source-independent counter, anomaly, notable-event, count, and health policy kernels. |
 | [`kronika-source-pg`](crates/kronika-source-pg/) | PostgreSQL queries and version-specific mapping into registry rows. |
 | [`kronika-source-os`](crates/kronika-source-os/) | Bounded Linux `/proc`, `/sys`, filesystem, process, and cgroup readers. |
 | [`kronika-source-log`](crates/kronika-source-log/) | Bounded stderr tailing, normalization, typed events, and gap reporting. |
 | [`pg_kronika-collector`](bins/pg_kronika-collector/) | Collection lifecycle, pacing, budgets, coverage, journaling, and rotation. |
-| [`pg_kronika-web`](bins/pg_kronika-web/) | Local UI, JSON API, auth, readiness, bounded queries, anomalies, incident clustering, and diagnostic findings. |
+| [`pg_kronika-web`](bins/pg_kronika-web/) | Local UI, JSON API, auth, readiness, bounded source-scoped timelines, anomalies, incident clustering, and diagnostic findings. |
 | [`kronika-bdd`](crates/kronika-bdd/) | Docker/Nix integration runner for the PostgreSQL 15–18 matrix. |
 | [`xtask`](xtask/) | Dependency-boundary check used by CI. |
 | `pg_kronika-archiver`, `pg_kronika-dump` | Placeholders that print an error and exit with status 2. |
@@ -140,16 +141,23 @@ allow lists with `cargo run -p xtask -- check-deps`.
 - **Durability.** A journal frame is synchronized before append returns. Sealing
   writes and synchronizes a temporary file, then publishes without overwriting
   an existing segment. A torn final journal frame is truncated on recovery;
-  other damage remains visible in scan diagnostics.
+  other damage remains visible in scan diagnostics. For sealed segments, the
+  timeline index checks admitted durable fact files with matching lineage
+  before the bounded process-local fallback. Only a recoverable publication
+  failure can place the same immutable facts in that fallback.
 - **Resource bounds.** Registry sections are capped at 65,536 rows, 8 MiB of
   encoded bytes, and 16 Parquet row groups. The collector applies source,
   dictionary, cycle-time, journal, and cardinality caps. Reader queries have
-  row and materialized-cell limits. Web permits one heavy anomaly/incident
-  request at a time and returns `503` when that slot is busy.
+  row and materialized-cell limits. Web permits one heavy anomaly, incident, or
+  uncached timeline request at a time and returns `503` when that slot is busy.
+  The timeline response cache has count and byte bounds. Cursor-pinned views
+  have independent count, byte, and lifetime bounds.
 - **Data quality.** A real unchanged counter produces a zero delta. Resets,
   missing coverage, first points, invalid time order, and disabled collection
-  gates produce explicit no-data reasons. They are not converted to zero and
-  are not bridged by diff or anomaly analysis.
+  gates produce explicit no-data reasons. Timeline responses report retained
+  exactness, source completeness, physical-count semantics, and known loss as
+  separate facts. Missing data is not converted to zero or bridged by diff or
+  anomaly analysis.
 - **Security.** Segment files can contain SQL, plans, object names, process
   arguments, and log text. Protect the output directory and backups. The
   collector does not encrypt or redact them. Bind web to loopback or place it

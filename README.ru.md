@@ -5,8 +5,9 @@
 PgKronika сохраняет диагностическую историю экземпляра PostgreSQL в локальных
 неизменяемых файлах PGM. Коллектор читает статистику PostgreSQL, данные Linux
 из `/proc` и cgroup, а при настройке — stderr-журнал PostgreSQL. Отдельный
-web-процесс показывает записанные строки, разницы счётчиков, эпизоды аномалий и
-кластеры инцидентов через локальный интерфейс и JSON API.
+web-процесс показывает записанные строки, разницы счётчиков, привязанные к
+источнику timeline-дайджесты, линии здоровья, важные события, эпизоды аномалий
+и кластеры инцидентов через локальный интерфейс и JSON API.
 
 Проект активно развивается. Коллектор, локальное хранилище сегментов, reader и
 web API реализованы и проверяются BDD-матрицей PostgreSQL 15–18. Готовой
@@ -27,7 +28,7 @@ PostgreSQL 15–18       Linux /proc, /sys, cgroups       stderr log
                  kronika-store -> kronika-reader
                               |
              kronika-analytics -> pg_kronika-web
-                    diff, anomaly       JSON/UI, incidents
+              diff, anomaly, health     JSON/UI, timeline, incidents
 ```
 
 Коллектор работает на сервере базы данных и не открывает сетевой порт. Он пишет
@@ -117,13 +118,13 @@ Basic Auth.
 | [`kronika-registry`](crates/kronika-registry/) | Стабильные type id, схемы, семантика колонок, gates, кодеки и linter реестра. |
 | [`kronika-writer`](crates/kronika-writer/) | Ограниченные буферы секций, интернер строк, `active.parts` и запечатывание. |
 | [`kronika-store`](crates/kronika-store/) | Read-only скан локального каталога сегментов и живого журнала. |
-| [`kronika-reader`](crates/kronika-reader/) | Проверенный декод секций, snapshots, pagination, logical sections, gauges и diff. |
-| [`kronika-analytics`](crates/kronika-analytics/) | Независимые от источника ядра разностей счётчиков, поиска аномалий и контрактов overview. |
+| [`kronika-reader`](crates/kronika-reader/) | Проверенный декод секций, snapshots, pagination, logical sections, gauges, diff и overview-факты с приоритетом постоянного хранилища. |
+| [`kronika-analytics`](crates/kronika-analytics/) | Независимые от источника ядра счётчиков, аномалий, важных событий, counts и health-политик. |
 | [`kronika-source-pg`](crates/kronika-source-pg/) | Запросы PostgreSQL и раскладка разных версий в строки реестра. |
 | [`kronika-source-os`](crates/kronika-source-os/) | Ограниченное чтение Linux `/proc`, `/sys`, файловых систем, процессов и cgroup. |
 | [`kronika-source-log`](crates/kronika-source-log/) | Ограниченный tail stderr, нормализация, типизированные события и gap-учёт. |
 | [`pg_kronika-collector`](bins/pg_kronika-collector/) | Жизненный цикл сбора, интервалы, бюджеты, coverage, журнал и ротация. |
-| [`pg_kronika-web`](bins/pg_kronika-web/) | Локальный UI, JSON API, auth, readiness, bounded queries, аномалии, кластеризация инцидентов и диагностические выводы (`findings`). |
+| [`pg_kronika-web`](bins/pg_kronika-web/) | Локальный UI, JSON API, auth, readiness, ограниченные timeline-запросы с явным выбором источников, аномалии, кластеризация инцидентов и диагностические выводы (`findings`). |
 | [`kronika-bdd`](crates/kronika-bdd/) | Docker/Nix runner интеграционных сценариев для PostgreSQL 15–18. |
 | [`xtask`](xtask/) | Проверка границ зависимостей в CI. |
 | `pg_kronika-archiver`, `pg_kronika-dump` | Заглушки: печатают ошибку и завершаются с кодом 2. |
@@ -142,15 +143,22 @@ Basic Auth.
   При запечатывании writer записывает и синхронизирует временный файл, затем
   публикует его без перезаписи существующего сегмента. Оборванный последний
   кадр обрезается при восстановлении; другая порча остаётся в диагностике.
+  Для запечатанных сегментов timeline-индекс сначала проверяет допущенные
+  постоянные файлы фактов с совпадающим происхождением и лишь затем обращается
+  к ограниченному локальному fallback процесса. В этот fallback те же
+  неизменяемые факты попадают только после восстанавливаемой ошибки публикации.
 - **Границы ресурсов.** Секция ограничена 65 536 строками, 8 MiB кодированных
   данных и 16 группами строк Parquet. Коллектор ограничивает cardinality,
   словари, время цикла и журнал. У reader есть лимиты строк и materialized
-  cells. Web допускает один тяжёлый anomaly/incident request и отвечает `503`,
-  если этот слот занят.
+  cells. Web допускает один тяжёлый запрос anomaly, incident или некэшированного
+  timeline и отвечает `503`, если этот слот занят. Кэш ответов timeline
+  ограничен по числу записей и байтам. У представлений, закреплённых курсорами,
+  есть отдельные ограничения по числу, байтам и времени жизни.
 - **Качество данных.** Неизменившийся счётчик даёт настоящий нулевой diff.
   Сброс, разрыв покрытия, первая точка, неверный порядок времени и выключенный
-  gate дают разные no-data reasons. Diff и anomaly не заменяют их нулями и не
-  соединяют ряд через разрыв.
+  gate дают разные no-data reasons. Timeline-ответы раздельно сообщают retained
+  exactness, source completeness, семантику physical count и известную потерю.
+  Diff и anomaly не заменяют пропуски нулями и не соединяют ряд через разрыв.
 - **Безопасность.** Сегменты могут содержать SQL, планы, имена объектов,
   аргументы процессов и текст журнала. Ограничьте доступ к каталогу и копиям:
   коллектор не шифрует и не редактирует содержимое. Web следует слушать на
