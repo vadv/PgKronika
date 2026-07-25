@@ -25,14 +25,18 @@ pub struct LocalJoinFacts {
 
 /// Collect the bounded facts needed for co-located OS joins.
 ///
+/// `max_tablespaces` bounds retained rows. The query requests one extra row
+/// so the result can report truncation.
+///
 /// # Errors
 /// Returns the `PostgreSQL` query error unchanged.
 pub async fn collect_local_join_facts(
     client: &Client,
-    max_tablespaces: i64,
+    max_tablespaces: u32,
 ) -> Result<Option<LocalJoinFacts>, tokio_postgres::Error> {
+    let query_limit = local_join_query_limit(max_tablespaces);
     let rows = client
-        .query(local_join_facts_query(), &[&max_tablespaces])
+        .query(local_join_facts_query(), &[&query_limit])
         .await?;
     let Some(first) = rows.first() else {
         return Ok(None);
@@ -40,8 +44,11 @@ pub async fn collect_local_join_facts(
     if !first.get::<_, bool>("local_connection") {
         return Ok(None);
     }
-    let tablespaces_complete =
-        i64::try_from(rows.len()).is_ok_and(|count| count <= max_tablespaces);
+    let observed_tablespaces = rows
+        .iter()
+        .filter(|row| row.get::<_, Option<u32>>("spcoid").is_some())
+        .count();
+    let tablespaces_complete = tablespace_rows_complete(observed_tablespaces, max_tablespaces);
     Ok(Some(LocalJoinFacts {
         ts: first.get("ts_us"),
         backend_pid: first.get("backend_pid"),
@@ -49,11 +56,19 @@ pub async fn collect_local_join_facts(
         data_directory: first.get("data_directory"),
         tablespaces: rows
             .iter()
-            .take(usize::try_from(max_tablespaces).unwrap_or(0))
             .filter_map(|row| Some((row.get::<_, Option<u32>>("spcoid")?, row.get("location"))))
+            .take(usize::try_from(max_tablespaces).unwrap_or(usize::MAX))
             .collect(),
         tablespaces_complete,
     }))
+}
+
+fn local_join_query_limit(max_tablespaces: u32) -> i64 {
+    i64::from(max_tablespaces) + 1
+}
+
+fn tablespace_rows_complete(observed_tablespaces: usize, max_tablespaces: u32) -> bool {
+    u64::try_from(observed_tablespaces).is_ok_and(|observed| observed <= u64::from(max_tablespaces))
 }
 
 macro_rules! marked {
@@ -86,9 +101,8 @@ pub struct FreezeHorizonRow {
 
 /// SQL for the cross-source local join facts.
 ///
-/// The `$1::int8` cast is load-bearing: without it `PostgreSQL` infers `$1`
-/// from the `+ 1` integer literal as `int4`, and binding the `i64` argument
-/// fails to serialize.
+/// `$1` is the `int8` query limit computed by
+/// [`collect_local_join_facts`], including its truncation row.
 #[must_use]
 pub const fn local_join_facts_query() -> &'static str {
     marked!(
@@ -100,7 +114,7 @@ pub const fn local_join_facts_query() -> &'static str {
          ), spaces AS ( \
            SELECT oid, pg_tablespace_location(oid)::text AS location \
              FROM pg_tablespace WHERE pg_tablespace_location(oid) <> '' \
-            ORDER BY oid LIMIT ($1::int8 + 1) \
+            ORDER BY oid LIMIT $1::int8 \
          ) \
          SELECT (extract(epoch from l.observed_at) * 1e6)::int8 AS ts_us, \
                 l.backend_pid, (extract(epoch from l.backend_start) * 1e6)::int8 AS backend_start_us, \
@@ -645,13 +659,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_join_query_casts_the_limit_parameter() {
+    fn local_join_query_binds_the_precomputed_int8_limit() {
         let sql = local_join_facts_query();
         assert!(
-            sql.contains("LIMIT ($1::int8 + 1)"),
-            "the LIMIT parameter must be cast to int8 or an i64 bind fails to serialize"
+            sql.contains("LIMIT $1::int8"),
+            "the i64 query limit must have an explicit PostgreSQL int8 type"
         );
+        assert!(!sql.contains("$1::int8 + 1"));
         assert!(sql.contains("inet_client_addr() IS NULL AS local_connection"));
+    }
+
+    #[test]
+    fn local_join_limit_adds_a_truncation_row_without_overflow() {
+        assert_eq!(local_join_query_limit(0), 1);
+        assert_eq!(local_join_query_limit(u32::MAX), i64::from(u32::MAX) + 1);
+    }
+
+    #[test]
+    fn local_join_completeness_counts_only_tablespace_rows() {
+        assert!(tablespace_rows_complete(0, 0));
+        assert!(!tablespace_rows_complete(1, 0));
+        assert!(tablespace_rows_complete(1, 1));
+        assert!(tablespace_rows_complete(256, 256));
+        assert!(!tablespace_rows_complete(257, 256));
     }
 
     #[test]
