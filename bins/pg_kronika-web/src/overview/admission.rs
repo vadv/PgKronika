@@ -86,6 +86,19 @@ impl ColdWorkWeight {
             publications: self.publications.checked_sub(other.publications)?,
         })
     }
+
+    fn component_max(self, other: Self) -> Self {
+        Self {
+            workers: self.workers.max(other.workers),
+            pgm_bytes: self.pgm_bytes.max(other.pgm_bytes),
+            decoded_bytes: self.decoded_bytes.max(other.decoded_bytes),
+            cpu: self.cpu.max(other.cpu),
+            file_descriptors: self.file_descriptors.max(other.file_descriptors),
+            read_bytes: self.read_bytes.max(other.read_bytes),
+            write_bytes: self.write_bytes.max(other.write_bytes),
+            publications: self.publications.max(other.publications),
+        }
+    }
 }
 
 fn byte_units(bytes: u64) -> u32 {
@@ -241,6 +254,15 @@ struct AdmissionState {
     used: ColdWorkWeight,
     queue: VecDeque<Arc<Waiter>>,
     next_ticket: u64,
+    peak_used: ColdWorkWeight,
+    peak_queue: usize,
+}
+
+impl AdmissionState {
+    fn observe_peak(&mut self) {
+        self.peak_used = self.peak_used.component_max(self.used);
+        self.peak_queue = self.peak_queue.max(self.queue.len());
+    }
 }
 
 #[derive(Debug)]
@@ -286,7 +308,7 @@ impl ColdAdmission {
                     .used
                     .checked_add(weight)
                     .expect("validated admission charge fits");
-                record_admission_state(&state);
+                record_admission_state(&mut state);
                 metrics::histogram!("overview_cold_wait_seconds").record(started.elapsed());
                 return Ok(ColdPermit {
                     inner: Arc::clone(&self.inner),
@@ -306,7 +328,7 @@ impl ColdAdmission {
             });
             state.next_ticket = state.next_ticket.wrapping_add(1);
             state.queue.push_back(Arc::clone(&waiter));
-            record_admission_state(&state);
+            record_admission_state(&mut state);
             drop(state);
             waiter
         };
@@ -345,6 +367,28 @@ impl ColdAdmission {
     fn queued(&self) -> usize {
         lock_state(&self.inner).queue.len()
     }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) fn qualification_snapshot(&self) -> AdmissionSnapshot {
+        let state = lock_state(&self.inner);
+        AdmissionSnapshot {
+            used: state.used,
+            peak_used: state.peak_used,
+            queued: state.queue.len(),
+            peak_queue: state.peak_queue,
+            capacity: self.inner.config.capacity,
+        }
+    }
+}
+
+#[cfg(feature = "qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmissionSnapshot {
+    pub(crate) used: ColdWorkWeight,
+    pub(crate) peak_used: ColdWorkWeight,
+    pub(crate) queued: usize,
+    pub(crate) peak_queue: usize,
+    pub(crate) capacity: ColdWorkWeight,
 }
 
 #[derive(Debug)]
@@ -373,7 +417,7 @@ impl Drop for QueuedAdmission {
             drop(state.queue.remove(position));
         }
         schedule(&self.inner, &mut state);
-        record_admission_state(&state);
+        record_admission_state(&mut state);
         drop(state);
     }
 }
@@ -393,7 +437,7 @@ impl Drop for ColdPermit {
             .checked_sub(self.weight)
             .expect("active admission charge is resident");
         schedule(&self.inner, &mut state);
-        record_admission_state(&state);
+        record_admission_state(&mut state);
         drop(state);
     }
 }
@@ -437,7 +481,8 @@ fn record_rejection(error: ColdAdmissionError) {
     clippy::cast_precision_loss,
     reason = "Prometheus gauges use f64 and configured admission bounds are small"
 )]
-fn record_admission_state(state: &AdmissionState) {
+fn record_admission_state(state: &mut AdmissionState) {
+    state.observe_peak();
     metrics::gauge!("overview_cold_queue_depth").set(state.queue.len() as f64);
     metrics::gauge!("overview_cold_work_inflight", "kind" => "workers")
         .set(f64::from(state.used.workers));

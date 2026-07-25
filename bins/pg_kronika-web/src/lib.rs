@@ -107,6 +107,9 @@ mod incident_response;
 pub(crate) mod overview;
 mod params;
 mod problem;
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub mod qualification;
 mod reason;
 mod serialize;
 pub(crate) mod startup;

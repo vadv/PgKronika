@@ -1,7 +1,7 @@
 use axum::http::StatusCode;
-use kronika_format::{PartMeta, SectionInput, build_part};
+use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
 use kronika_reader::LocalDirSnapshot;
-use kronika_registry::pg_log::PgLogErrorV1;
+use kronika_registry::pg_log::{PgLogErrorV1, PgLogLifecycleV1};
 use kronika_registry::pg_stat_database::PgStatDatabaseV1;
 use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
@@ -161,6 +161,39 @@ fn write_database_metric_segment(dir: &std::path::Path) {
     std::fs::write(dir.join("database-metrics.pgm"), bytes).expect("write metric segment");
 }
 
+fn framed_lifecycle_part(ts_us: i64) -> Vec<u8> {
+    let rows = [PgLogLifecycleV1 {
+        ts: Ts(ts_us),
+        kind: 0,
+        pid: Some(42),
+        signal: Some(9),
+        shutdown_mode: None,
+        message: None,
+        query_detail: None,
+        dict_dropped_fields: 0,
+    }];
+    let body = PgLogLifecycleV1::encode(&rows).expect("encode lifecycle");
+    let part = build_part(
+        &[SectionInput {
+            type_id: 1_028_001,
+            rows: 1,
+            body: &body,
+        }],
+        PartMeta {
+            min_ts: ts_us,
+            max_ts: ts_us,
+            source_id: 7,
+        },
+    );
+    let mut framed = FrameHeader {
+        part_len: u64::try_from(part.len()).expect("part length"),
+    }
+    .encode()
+    .to_vec();
+    framed.extend_from_slice(&part);
+    framed
+}
+
 #[tokio::test]
 async fn overview_returns_a_digest_over_a_valid_range() {
     let (_dir, status, body) =
@@ -219,6 +252,31 @@ async fn overview_returns_a_digest_over_a_valid_range() {
     );
     assert_eq!(notable["omitted_count"], 0);
     assert!(notable["events_query_hash"].is_string());
+}
+
+#[tokio::test]
+async fn timeline_meta_publishes_the_exact_incomplete_active_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut journal = framed_lifecycle_part(10);
+    let from_offset = u64::try_from(journal.len()).expect("journal offset");
+    let pending = FrameHeader { part_len: 128 }.encode();
+    journal.extend_from_slice(&pending[..4]);
+    let to_offset = u64::try_from(journal.len()).expect("pending offset");
+    std::fs::write(dir.path().join("active.parts"), journal).expect("write active journal");
+
+    let state = state_for_dir(dir.path());
+    let (status, body) =
+        serve_state(state, "/v1/timeline/events?source=7&from=0&to=100").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["meta"]["tail_pending"],
+        json!({
+            "from_offset_bytes": from_offset,
+            "to_offset_bytes": to_offset,
+        })
+    );
+    assert_eq!(body["events"].as_array().map(Vec::len), Some(1));
 }
 
 #[tokio::test]

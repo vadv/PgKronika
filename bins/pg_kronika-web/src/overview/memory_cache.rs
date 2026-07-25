@@ -137,6 +137,29 @@ impl DecodedFactCache {
     fn resident_bytes(&self) -> usize {
         self.inner.lock().expect("cache lock").bytes
     }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) fn qualification_snapshot(&self) -> DecodedCacheSnapshot {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        DecodedCacheSnapshot {
+            entries: inner.entries.len(),
+            resident_bytes: inner.bytes,
+            max_entries: self.max_entries,
+            max_bytes: self.max_bytes,
+        }
+    }
+}
+
+#[cfg(feature = "qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedCacheSnapshot {
+    pub(crate) entries: usize,
+    pub(crate) resident_bytes: usize,
+    pub(crate) max_entries: usize,
+    pub(crate) max_bytes: usize,
 }
 
 fn evict_lru(entries: &mut HashMap<FactBuildKey, Entry>) -> bool {

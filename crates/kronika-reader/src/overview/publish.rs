@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "qualification"))]
 use std::collections::VecDeque;
 
 use kronika_analytics::overview::SegmentIdentity;
@@ -216,11 +216,11 @@ pub struct FactStore {
     publication_gate: Arc<Mutex<()>>,
     /// Write mode and retry backoff for sibling sidecars.
     persist: Arc<Mutex<PersistState>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     test_publish_faults: Arc<Mutex<VecDeque<PersistError>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     test_publish_attempts: Arc<AtomicU64>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     test_recovery_gc_attempts: Arc<AtomicU64>,
 }
 
@@ -304,11 +304,11 @@ impl FactStore {
             owner: Arc::new(Mutex::new(None)),
             publication_gate: Arc::new(Mutex::new(())),
             persist: Arc::new(Mutex::new(PersistState::new(jitter_seed))),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
             test_publish_faults: Arc::new(Mutex::new(VecDeque::new())),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
             test_publish_attempts: Arc::new(AtomicU64::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
             test_recovery_gc_attempts: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -679,7 +679,7 @@ impl FactStore {
         bytes: &[u8],
         bounds: &Bounds,
     ) -> Result<PathBuf, PersistError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "qualification"))]
         {
             self.test_publish_attempts.fetch_add(1, Ordering::Relaxed);
             let injected = lock_unpoisoned(&self.test_publish_faults).pop_front();
@@ -781,26 +781,63 @@ impl FactStore {
         Err(PersistError::TransientIo)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(super) fn inject_publish_faults(&self, faults: impl IntoIterator<Item = PersistError>) {
         *lock_unpoisoned(&self.test_publish_faults) = faults.into_iter().collect();
         self.test_publish_attempts.store(0, Ordering::Relaxed);
         self.test_recovery_gc_attempts.store(0, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(super) fn test_publish_attempts(&self) -> u64 {
         self.test_publish_attempts.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(super) fn test_recovery_gc_attempts(&self) -> u64 {
         self.test_recovery_gc_attempts.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(super) fn force_persistence_probe_due(&self) {
         self.with_persist(|persist| persist.force_due(Instant::now()));
+    }
+
+    /// Installs a deterministic persistence-failure sequence for the M6
+    /// qualification executable.
+    ///
+    /// This hook is not present in production builds.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    pub fn qualification_inject_publish_faults(
+        &self,
+        faults: impl IntoIterator<Item = PersistError>,
+    ) {
+        self.inject_publish_faults(faults);
+    }
+
+    /// Makes the standing retry probe immediately due in an M6 qualification
+    /// build. This hook is not present in production builds.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    pub fn qualification_force_persistence_probe_due(&self) {
+        self.force_persistence_probe_due();
+    }
+
+    /// Exact publication-attempt count for an M6 qualification build.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn qualification_publish_attempts(&self) -> u64 {
+        self.test_publish_attempts()
+    }
+
+    /// Exact capacity-recovery GC attempt count for an M6 qualification build.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn qualification_recovery_gc_attempts(&self) -> u64 {
+        self.test_recovery_gc_attempts()
     }
 
     fn read_with_stats<R: ReadAt>(

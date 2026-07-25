@@ -144,6 +144,13 @@ pub(crate) struct CoverageSpanDto {
     pub(crate) to_us: i64,
 }
 
+/// One incomplete active-journal byte range.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct TailPendingDto {
+    pub(crate) from_offset_bytes: u64,
+    pub(crate) to_offset_bytes: u64,
+}
+
 /// Per-source publication freshness and independent quality axes.
 #[derive(Debug, Serialize)]
 pub(crate) struct SourceFreshnessDto {
@@ -176,7 +183,7 @@ pub(crate) struct TimelineMetaDto {
     pub(crate) available_sources: Vec<u64>,
     pub(crate) data_through_us: Option<i64>,
     pub(crate) store_data_through_us: Option<i64>,
-    pub(crate) tail_pending: Option<u64>,
+    pub(crate) tail_pending: Option<TailPendingDto>,
     pub(crate) source_status: &'static str,
     pub(crate) source_freshness: Vec<SourceFreshnessDto>,
     pub(crate) loss: Vec<SourceLossDto>,

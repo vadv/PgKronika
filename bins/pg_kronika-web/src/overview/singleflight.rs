@@ -1,6 +1,7 @@
 //! Cancellation-safe exact-key coordination for sealed-fact loads.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kronika_reader::FactBuildKey;
@@ -25,6 +26,8 @@ impl<T> Flight<T> {
 struct RegistryInner<T> {
     max_entries: usize,
     active: Mutex<HashMap<FactBuildKey, Arc<Flight<T>>>>,
+    leaders: AtomicU64,
+    waiters: AtomicU64,
 }
 
 /// Exact-`FactBuildKey` work registry with a hard active-entry bound.
@@ -56,6 +59,8 @@ where
             inner: Arc::new(RegistryInner {
                 max_entries,
                 active: Mutex::new(HashMap::new()),
+                leaders: AtomicU64::new(0),
+                waiters: AtomicU64::new(0),
             }),
         }
     }
@@ -91,6 +96,7 @@ where
         };
 
         if leader {
+            self.inner.leaders.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("overview_singleflight_builds").increment(1);
             let inner = Arc::clone(&self.inner);
             let worker_flight = Arc::clone(&flight);
@@ -112,6 +118,7 @@ where
                 drop(active);
             });
         } else {
+            self.inner.waiters.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("overview_singleflight_waiters").increment(1);
         }
 
@@ -133,6 +140,23 @@ where
     fn active(&self) -> usize {
         lock_active(&self.inner).len()
     }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) fn qualification_snapshot(&self) -> SingleflightSnapshot {
+        SingleflightSnapshot {
+            leaders: self.inner.leaders.load(Ordering::Relaxed),
+            waiters: self.inner.waiters.load(Ordering::Relaxed),
+            active: lock_active(&self.inner).len(),
+        }
+    }
+}
+
+#[cfg(feature = "qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SingleflightSnapshot {
+    pub(crate) leaders: u64,
+    pub(crate) waiters: u64,
+    pub(crate) active: usize,
 }
 
 fn lock_active<T>(
@@ -146,7 +170,7 @@ fn lock_active<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     use kronika_analytics::overview::SegmentLineageId;
     use kronika_reader::{FactKey, FileKind};

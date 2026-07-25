@@ -1009,6 +1009,23 @@
           }
         }
       },
+      "TailPending": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from_offset_bytes", "to_offset_bytes"],
+        "properties": {
+          "from_offset_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Inclusive byte offset of the incomplete active-journal tail"
+          },
+          "to_offset_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Exclusive byte offset observed at the publication boundary"
+          }
+        }
+      },
       "TimelineSourceStatus": {
         "type": "string",
         "enum": ["complete_for_contract", "partial", "warming", "gap", "unavailable"]
@@ -1100,7 +1117,12 @@
           },
           "data_through_us": { "type": ["integer", "null"], "format": "int64" },
           "store_data_through_us": { "type": ["integer", "null"], "format": "int64" },
-          "tail_pending": { "type": ["integer", "null"], "minimum": 0 },
+          "tail_pending": {
+            "oneOf": [
+              { "type": "null" },
+              { "$ref": "#/components/schemas/TailPending" }
+            ]
+          },
           "source_status": { "$ref": "#/components/schemas/TimelineSourceStatus" },
           "source_freshness": {
             "type": "array",

@@ -100,6 +100,25 @@ pub(crate) struct OverviewWriter {
     live: LiveBuilder,
     passes_since_gc: u64,
     view_generation: u64,
+    live_fold_stats: LiveFoldStats,
+}
+
+/// Exact source-body work performed while folding completed active parts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LiveFoldStats {
+    pub(crate) completed_parts: u64,
+    pub(crate) pgm_body_reads: u64,
+    pub(crate) pgm_body_bytes: u64,
+}
+
+impl LiveFoldStats {
+    fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            completed_parts: self.completed_parts.checked_add(other.completed_parts)?,
+            pgm_body_reads: self.pgm_body_reads.checked_add(other.pgm_body_reads)?,
+            pgm_body_bytes: self.pgm_body_bytes.checked_add(other.pgm_body_bytes)?,
+        })
+    }
 }
 
 impl OverviewWriter {
@@ -147,6 +166,7 @@ impl OverviewWriter {
             live,
             passes_since_gc: 0,
             view_generation: 0,
+            live_fold_stats: LiveFoldStats::default(),
         })
     }
 
@@ -217,16 +237,25 @@ impl OverviewWriter {
         self.refresh_sealed(snapshot, &mut sealed, &mut unavailable);
 
         let mut live = self.live.clone();
-        if let Err(first_error) = fold_refresh(&mut live, snapshot, delta) {
-            let mut rebuilt = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
-            let baseline = full_live_baseline(delta);
-            fold_refresh(&mut rebuilt, snapshot, &baseline).map_err(|_error| first_error)?;
-            live = rebuilt;
-        }
+        let fold_stats = match fold_refresh(&mut live, snapshot, delta) {
+            Ok(stats) => stats,
+            Err(first_error) => {
+                let mut rebuilt = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
+                let baseline = full_live_baseline(delta);
+                let stats =
+                    fold_refresh(&mut rebuilt, snapshot, &baseline).map_err(|_error| first_error)?;
+                live = rebuilt;
+                stats
+            }
+        };
 
         self.sealed = sealed;
         self.unavailable = unavailable;
         self.live = live;
+        self.live_fold_stats = self
+            .live_fold_stats
+            .checked_add(fold_stats)
+            .ok_or(OverviewBuildError::Live(LiveFoldError::Overflow))?;
         self.view_generation = snapshot.view_generation();
         let promotion_locators = delta
             .sealed_added
@@ -237,6 +266,11 @@ impl OverviewWriter {
             .collect::<BTreeSet<_>>();
         let promotion = PromotionCandidate::new(prior_live, promotion_locators);
         Ok(self.current_view(self.view_generation, promotion))
+    }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) const fn qualification_live_fold_stats(&self) -> LiveFoldStats {
+        self.live_fold_stats
     }
 
     /// Seeds an empty writer from a snapshot bootstrap delta.
@@ -432,7 +466,8 @@ fn fold_refresh(
     builder: &mut LiveBuilder,
     snapshot: &LocalDirSnapshot,
     delta: &RefreshDelta,
-) -> Result<(), OverviewBuildError> {
+) -> Result<LiveFoldStats, OverviewBuildError> {
+    let mut stats = LiveFoldStats::default();
     builder
         .begin_refresh(delta)
         .map_err(OverviewBuildError::Live)?;
@@ -446,8 +481,17 @@ fn fold_refresh(
         if effect == FoldEffect::Folded {
             metrics::counter!("overview_live_folded_parts_total").increment(1);
         }
+        let reads = unit.body_read_stats();
+        stats.completed_parts = stats.completed_parts.saturating_add(1);
+        stats.pgm_body_reads = stats.pgm_body_reads.saturating_add(reads.read_calls);
+        stats.pgm_body_bytes = stats
+            .pgm_body_bytes
+            .saturating_add(reads.stored_bytes_read);
     }
-    builder.complete_refresh().map_err(OverviewBuildError::Live)
+    builder
+        .complete_refresh()
+        .map_err(OverviewBuildError::Live)?;
+    Ok(stats)
 }
 
 #[allow(

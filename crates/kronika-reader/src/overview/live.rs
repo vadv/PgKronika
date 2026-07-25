@@ -616,8 +616,10 @@ impl LiveBuilder {
             view_generation: self.view_generation,
             generation: self.generation,
             state: self.state,
+            source_id: self.source_id,
             watermark_us: self.watermark_us,
             folded_through_offset: self.folded_through_offset,
+            tail_pending: self.completed_tail_pending,
             chunks: self.chunks.clone(),
         }
     }
@@ -711,8 +713,10 @@ pub struct LiveView {
     view_generation: u64,
     generation: JournalGenerationId,
     state: LiveState,
+    source_id: Option<u64>,
     watermark_us: Option<i64>,
     folded_through_offset: u64,
+    tail_pending: Option<ByteRange>,
     chunks: Vec<Arc<SegmentFacts>>,
 }
 
@@ -735,6 +739,12 @@ impl LiveView {
         self.state
     }
 
+    /// Numeric source represented by the active journal, when established.
+    #[must_use]
+    pub const fn source_id(&self) -> Option<u64> {
+        self.source_id
+    }
+
     /// Whether the view is a promotion-eligible `Current` view.
     #[must_use]
     pub fn is_current(&self) -> bool {
@@ -751,6 +761,12 @@ impl LiveView {
     #[must_use]
     pub const fn folded_through_offset(&self) -> u64 {
         self.folded_through_offset
+    }
+
+    /// Torn, not-yet-valid journal tail retained at this publication boundary.
+    #[must_use]
+    pub const fn tail_pending(&self) -> Option<ByteRange> {
+        self.tail_pending
     }
 
     /// The folded chunks backing this view, in fold order.

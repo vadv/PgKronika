@@ -777,6 +777,17 @@ impl IndexView {
             .max()
     }
 
+    /// Incomplete active-journal byte range for the selected live source.
+    pub(crate) fn live_tail_pending_for(
+        &self,
+        sources: &[u64],
+    ) -> Option<kronika_reader::ByteRange> {
+        self.live
+            .source_id()
+            .filter(|source| sources.binary_search(source).is_ok())
+            .and(self.live.tail_pending())
+    }
+
     /// Returns sorted, range-clipped metadata for every requested source.
     ///
     /// An unknown source remains explicit with unknown quality instead of

@@ -27,7 +27,8 @@ use crate::overview::cursor::{CursorError, EventsCursor};
 use crate::overview::dto::{
     CoverageSpanDto, EventDigestDto, EventFact, EventFactPosition, EventFactProjection,
     EventsResponseDto, JointCountDto, LifecycleDigestDto, NotablePreviewDto, OverviewResponseDto,
-    SignalCountDto, SourceFreshnessDto, SourceLossDto, SqlstateCountDto, TimelineMetaDto,
+    SignalCountDto, SourceFreshnessDto, SourceLossDto, SqlstateCountDto, TailPendingDto,
+    TimelineMetaDto,
     category_name, severity_name, sqlstate_text,
 };
 use crate::overview::loader::FactLoadFailure;
@@ -1061,7 +1062,12 @@ fn timeline_meta_with_metadata(
         available_sources,
         data_through_us,
         store_data_through_us: view.data_through_us(),
-        tail_pending: None,
+        tail_pending: view
+            .live_tail_pending_for(sources)
+            .map(|pending| TailPendingDto {
+                from_offset_bytes: pending.start,
+                to_offset_bytes: pending.end,
+            }),
         source_status,
         source_freshness,
         loss,
