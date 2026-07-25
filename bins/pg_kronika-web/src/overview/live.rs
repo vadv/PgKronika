@@ -277,7 +277,7 @@ impl OverviewWriter {
                 unavailable.remove(&descriptor.locator);
                 continue;
             }
-            match self.describe_sealed(snapshot, descriptor) {
+            match Self::describe_sealed(snapshot, descriptor) {
                 Ok(entry) => {
                     sealed.insert(descriptor.locator, entry);
                     unavailable.remove(&descriptor.locator);
@@ -383,7 +383,6 @@ impl OverviewWriter {
     }
 
     fn describe_sealed(
-        &self,
         snapshot: &LocalDirSnapshot,
         descriptor: &SegmentDescriptor,
     ) -> Result<DescriptorEntry, SealedFactError> {

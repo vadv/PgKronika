@@ -90,7 +90,7 @@ fn state_with_limit(dir: &std::path::Path, limit: usize) -> AppState {
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
     let mut config = OverviewConfig::new();
     config.max_selected_segments = limit;
-    AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), config)
+    AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), &config)
         .expect("state")
 }
 
@@ -101,9 +101,13 @@ fn programmatic_policy_rejects_zero_and_values_above_the_absolute_ceiling() {
         let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let mut config = OverviewConfig::new();
         config.max_selected_segments = configured;
-        let error =
-            AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), config)
-                .expect_err("invalid programmatic limit must fail before state construction");
+        let error = AppState::with_overview_config(
+            snapshot,
+            0,
+            std::time::Duration::from_secs(10),
+            &config,
+        )
+        .expect_err("invalid programmatic limit must fail before state construction");
         assert!(matches!(
             error,
             StateBuildError::Overview(
@@ -424,7 +428,7 @@ async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
     config.max_selected_segments = 1;
     config.cold.retry_after_seconds = 7;
     let state =
-        AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), config)
+        AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), &config)
             .expect("state");
     install_oversized_real_entry(&state);
 
@@ -506,7 +510,7 @@ async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
         first_snapshot,
         0,
         std::time::Duration::from_secs(10),
-        OverviewConfig::new(),
+        &OverviewConfig::new(),
     )
     .expect("first state");
     let cold = app(first_state.clone(), None, test_metrics_handle())
@@ -527,7 +531,7 @@ async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
         restarted_snapshot,
         0,
         std::time::Duration::from_secs(10),
-        OverviewConfig::new(),
+        &OverviewConfig::new(),
     )
     .expect("restarted state");
     install_oversized_real_entry(&restarted);

@@ -225,7 +225,7 @@ impl Default for OverviewColdConfig {
 }
 
 /// Explicit overview memory, retention, and work policy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct OverviewConfig {
     /// Bounded durable-publication fallback.
     pub fallback: FallbackConfig,
@@ -257,6 +257,12 @@ impl OverviewConfig {
     /// Builds the default bounded policy.
     #[must_use]
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for OverviewConfig {
+    fn default() -> Self {
         Self {
             fallback: FallbackConfig::default(),
             gc: GcConfig::default(),
@@ -472,7 +478,7 @@ impl AppState {
             snapshot,
             now,
             Duration::from_secs(10),
-            default_overview_config(),
+            &default_overview_config(),
         )
     }
 
@@ -494,7 +500,7 @@ impl AppState {
             snapshot,
             last_refresh_secs,
             stale_after,
-            default_overview_config(),
+            &default_overview_config(),
         )
     }
 
@@ -508,7 +514,7 @@ impl AppState {
         mut snapshot: LocalDirSnapshot,
         last_refresh_secs: u64,
         stale_after: Duration,
-        config: OverviewConfig,
+        config: &OverviewConfig,
     ) -> Result<Self, StateBuildError> {
         let OverviewConfig {
             fallback,
@@ -523,7 +529,7 @@ impl AppState {
             cursor_ttl,
             max_selected_segments,
             cold,
-        } = config;
+        } = *config;
         if max_selected_segments == 0 || max_selected_segments > ABSOLUTE_MAX_SELECTED_SEGMENTS {
             return Err(StateBuildError::Overview(
                 OverviewBuildError::SelectedSegmentLimit {

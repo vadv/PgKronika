@@ -151,7 +151,7 @@ fn state_for_dir(dir: &std::path::Path) -> AppState {
         snapshot,
         0,
         std::time::Duration::from_secs(10),
-        OverviewConfig::new(),
+        &OverviewConfig::new(),
     )
     .expect("state")
 }

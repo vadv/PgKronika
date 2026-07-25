@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     overview.max_selected_segments = cfg.overview_max_selected_segments;
     overview.cold = cfg.overview_cold;
     let state =
-        AppState::with_overview_config(snapshot, now_unix_secs(), cfg.stale_after, overview)?;
+        AppState::with_overview_config(snapshot, now_unix_secs(), cfg.stale_after, &overview)?;
     let auth = cfg
         .basic_auth
         .as_ref()

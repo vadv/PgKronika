@@ -71,7 +71,7 @@ async fn a_metadata_only_fallback_keeps_the_snapshot_that_authorized_its_descrip
         initial_snapshot,
         0,
         Duration::from_secs(10),
-        OverviewConfig::new(),
+        &OverviewConfig::new(),
     )
     .expect("state");
 
@@ -110,7 +110,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
         first_snapshot,
         0,
         Duration::from_secs(10),
-        OverviewConfig::new(),
+        &OverviewConfig::new(),
     )
     .expect("first state");
     let first = app(first_state, None, test_metrics_handle())
@@ -132,7 +132,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
         restarted_snapshot,
         0,
         Duration::from_secs(10),
-        OverviewConfig::new(),
+        &OverviewConfig::new(),
     )
     .expect("restarted state");
     let restarted = app(restarted_state, None, test_metrics_handle())
@@ -157,9 +157,13 @@ async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
     let segment_path = dir.path().join("one.pgm");
     write_overview_event_segment(dir.path());
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
-    let state =
-        AppState::with_overview_config(snapshot, 0, Duration::from_secs(10), OverviewConfig::new())
-            .expect("state");
+    let state = AppState::with_overview_config(
+        snapshot,
+        0,
+        Duration::from_secs(10),
+        &OverviewConfig::new(),
+    )
+    .expect("state");
     corrupt_first_section_body(&segment_path);
 
     let response = app(state.clone(), None, test_metrics_handle())
@@ -201,7 +205,7 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
     let mut config = OverviewConfig::new();
     config.source_scrub_interval = Duration::from_millis(10);
-    let state = AppState::with_overview_config(snapshot, 0, Duration::from_secs(10), config)
+    let state = AppState::with_overview_config(snapshot, 0, Duration::from_secs(10), &config)
         .expect("state");
 
     let complete = app(state.clone(), None, test_metrics_handle())

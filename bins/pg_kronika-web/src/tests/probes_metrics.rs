@@ -155,7 +155,7 @@ fn selected_segment_policy_exports_one_static_rejection_series_and_its_effective
                 snapshot,
                 0,
                 std::time::Duration::from_secs(10),
-                config,
+                &config,
             )
             .expect("state");
             let response = app(state, None, handle.clone())
