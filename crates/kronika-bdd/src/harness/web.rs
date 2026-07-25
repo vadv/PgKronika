@@ -7,6 +7,7 @@
 //! steps use.
 
 use std::collections::BTreeSet;
+use std::fs::File;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -15,7 +16,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, header};
 use http_body_util::BodyExt as _;
-use kronika_reader::LocalDirSnapshot;
+use kronika_reader::{LocalDirSnapshot, PgmUnit};
 use kronika_registry::Cell;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pg_kronika_web::{AppState, app};
@@ -188,12 +189,7 @@ pub(crate) async fn section_page(dir: &Path, name: &str, source: u64) -> Result<
 /// all read the same immutable fact set and cursor registry. This is the
 /// end-to-end collector → PGM → reader → HTTP assertion used by the `PostgreSQL`
 /// 15–18 feature matrix.
-pub(crate) async fn assert_timeline_pg_log_contract(
-    segment: &Path,
-    from_us: i64,
-    to_us: i64,
-) -> Result<()> {
-    anyhow::ensure!(from_us < to_us, "timeline fixture range is empty");
+pub(crate) async fn assert_timeline_pg_log_contract(segment: &Path) -> Result<()> {
     anyhow::ensure!(
         segment
             .extension()
@@ -201,6 +197,15 @@ pub(crate) async fn assert_timeline_pg_log_contract(
         "timeline fixture is not a sealed PGM: {}",
         segment.display()
     );
+    let unit = PgmUnit::open(File::open(segment).context("open timeline fixture PGM")?)
+        .context("read timeline fixture catalog")?;
+    let from_us = unit.catalog().min_ts;
+    let to_us = unit
+        .catalog()
+        .max_ts
+        .checked_add(1)
+        .context("timeline fixture range cannot form a half-open interval")?;
+    anyhow::ensure!(from_us < to_us, "timeline fixture range is empty");
     let dir = segment
         .parent()
         .context("the sealed segment has no parent directory")?;

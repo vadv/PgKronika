@@ -8,7 +8,7 @@ Feature: Real web processes recover same-stem timeline indexes
   @pg15 @serial
   Scenario: PostgreSQL 15 real web process recovers sibling indexes across lifecycle boundaries
     Given a fresh database on PostgreSQL 15
-    And a fixed timeline PostgreSQL stderr log fixture
+    And a time-local fixed-semantics PostgreSQL stderr log fixture
     When the collector snapshots the segment
     Then a real web process builds the sibling and a new process reuses it without PGM body reads
     And a corrupt sibling is rebuilt atomically and survives another real-process restart
@@ -21,7 +21,7 @@ Feature: Real web processes recover same-stem timeline indexes
   @pg16 @serial
   Scenario: PostgreSQL 16 real web process recovers sibling indexes across lifecycle boundaries
     Given a fresh database on PostgreSQL 16
-    And a fixed timeline PostgreSQL stderr log fixture
+    And a time-local fixed-semantics PostgreSQL stderr log fixture
     When the collector snapshots the segment
     Then a real web process builds the sibling and a new process reuses it without PGM body reads
     And a corrupt sibling is rebuilt atomically and survives another real-process restart
@@ -34,7 +34,7 @@ Feature: Real web processes recover same-stem timeline indexes
   @pg17 @serial
   Scenario: PostgreSQL 17 real web process recovers sibling indexes across lifecycle boundaries
     Given a fresh database on PostgreSQL 17
-    And a fixed timeline PostgreSQL stderr log fixture
+    And a time-local fixed-semantics PostgreSQL stderr log fixture
     When the collector snapshots the segment
     Then a real web process builds the sibling and a new process reuses it without PGM body reads
     And a corrupt sibling is rebuilt atomically and survives another real-process restart
@@ -47,7 +47,7 @@ Feature: Real web processes recover same-stem timeline indexes
   @pg18 @serial
   Scenario: PostgreSQL 18 real web process recovers sibling indexes across lifecycle boundaries
     Given a fresh database on PostgreSQL 18
-    And a fixed timeline PostgreSQL stderr log fixture
+    And a time-local fixed-semantics PostgreSQL stderr log fixture
     When the collector snapshots the segment
     Then a real web process builds the sibling and a new process reuses it without PGM body reads
     And a corrupt sibling is rebuilt atomically and survives another real-process restart
