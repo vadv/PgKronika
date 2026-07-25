@@ -1709,7 +1709,7 @@ Process-cold и storage-cold/page-cache-cold называются отдельн
 8. Disjoint cold workload остаётся в global budget; RSS/FD/build concurrency не выходят за configured caps.
 9. Completed active frame visibility p95 не больше 2.5 s при 1-second refresh loop; pending tail явно отмечен.
 10. Formula/notable-only bump: zero PGM reads, unchanged fact files и mtimes.
-11. Fixed metric fact component измеряется как exact encoded bytes с относимой долей header/directory и allocation overhead на retained sample. Variable event/string bytes выводятся отдельно. Qualification блокируется, пока результат не укладывается в заранее утверждённые disk и dense-hour budgets; универсальный bytes/sample claim без artifact запрещён.
+11. Fixed metric fact component измеряется как exact encoded bytes с относимой долей header/directory и allocation overhead на retained sample. Variable event/string bytes выводятся отдельно. Если владелец задал disk и dense-hour budgets, qualification блокируется при их превышении. Пока значения остаются owner-deferred по §23, artifact записывает точные размеры и статус `owner_deferred` без deployment verdict; это не отменяет structural/I/O/performance gates. Универсальный bytes/sample claim без artifact запрещён.
 12. Cache quota stress: steady-state не выше configured quota; temporary excess не больше bounded in-flight publication budget.
 13. Memory-only dense-hour request остаётся корректным; если working set ниже ceiling, повтор обслуживается без PGM reread.
 
@@ -1841,7 +1841,7 @@ M5 делится на независимо проверяемые обязат�
 M6 также проходит отдельными gates:
 
 1. Полный forced-raw oracle, metamorphic partition/seal/live suite и corruption/admission suite для всех реализованных canonical families.
-2. Versioned dense-hour fixture и измерение decoded/resident/pinned overhead относительно утверждённых deployment budgets.
+2. Versioned dense-hour fixture и точное измерение decoded/resident/pinned overhead. Утверждённые deployment budgets проверяются обязательно; до решения владельца artifact сохраняет `owner_deferred` без deployment verdict.
 3. Cold/restart/hot/range-warm/live/concurrent/memory-only benchmarks §18 на одном exact host/filesystem profile.
 4. Production API/presenter fixtures §20.2. Настоящие render tests появляются только вместе с отдельным owner-approved UI contract и не подменяются fake UI.
 5. Единый machine-readable dossier, который закрывает все 18 строк §20.1 на одном exact head.
@@ -1898,4 +1898,8 @@ Charts не входят ни в data closure, ни в M5/M6. Возврат к 
 3. Maintenance/topology declarations, которые позволят подавлять planned shutdown и определять required replication members.
 4. Scope и rendering/i18n contract будущего production UI, если владелец решит его добавить.
 
-Их изменение версионирует policy/configuration, но не меняет PGM, physical fact identity или data-honesty invariants.
+Отсутствие калибруемых значений не ослабляет обязательные data, structural, I/O
+и performance gates и не создаёт deployment-size claim. Заданные значения
+проверяются как обязательные deployment gates. Их изменение версионирует
+policy/configuration, но не меняет PGM, physical fact identity или data-honesty
+invariants.

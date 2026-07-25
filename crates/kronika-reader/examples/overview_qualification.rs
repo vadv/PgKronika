@@ -122,6 +122,7 @@ struct Budgets {
     resident_bytes: Option<u64>,
     disk_within_budget: Option<bool>,
     resident_within_budget: Option<bool>,
+    deployment_budget_status: &'static str,
     qualification_blocked: bool,
 }
 
@@ -627,11 +628,28 @@ fn accounting(facts: &SegmentFacts, file: &FactFile, fact_file_bytes: usize) -> 
 fn budgets(accounting: &Accounting) -> Budgets {
     let disk_bytes = env_u64("OVERVIEW_DENSE_DISK_BUDGET_BYTES");
     let resident_bytes = env_u64("OVERVIEW_DENSE_RESIDENT_BUDGET_BYTES");
+    let disk_within_budget = disk_bytes.map(|limit| accounting.fact_file_bytes as u64 <= limit);
+    let resident_within_budget =
+        resident_bytes.map(|limit| accounting.pinned_fact_bytes as u64 <= limit);
+    let deployment_budget_status = match (
+        disk_bytes,
+        resident_bytes,
+        disk_within_budget,
+        resident_within_budget,
+    ) {
+        (None, None, None, None) => "owner_deferred",
+        (Some(_), Some(_), Some(true), Some(true)) => "within_approved",
+        (Some(_), Some(_), Some(_), Some(_)) => "exceeds_approved",
+        _ => "incomplete_configuration",
+    };
     Budgets {
-        disk_within_budget: disk_bytes.map(|limit| accounting.fact_file_bytes as u64 <= limit),
-        resident_within_budget: resident_bytes
-            .map(|limit| accounting.pinned_fact_bytes as u64 <= limit),
-        qualification_blocked: disk_bytes.is_none() || resident_bytes.is_none(),
+        disk_within_budget,
+        resident_within_budget,
+        deployment_budget_status,
+        qualification_blocked: matches!(
+            deployment_budget_status,
+            "exceeds_approved" | "incomplete_configuration"
+        ),
         disk_bytes,
         resident_bytes,
     }

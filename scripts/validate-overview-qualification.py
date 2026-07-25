@@ -36,6 +36,66 @@ def check(condition: bool, message: str, failures: list[str]) -> None:
         failures.append(message)
 
 
+def validate_budgets(
+    budgets: dict[str, object],
+    final: bool,
+    failures: list[str],
+    warnings: list[str],
+) -> None:
+    disk_bytes = budgets.get("disk_bytes")
+    resident_bytes = budgets.get("resident_bytes")
+    disk_within = budgets.get("disk_within_budget")
+    resident_within = budgets.get("resident_within_budget")
+    status = budgets.get("deployment_budget_status")
+    blocked = budgets.get("qualification_blocked")
+
+    if disk_bytes is None and resident_bytes is None:
+        check(
+            disk_within is None and resident_within is None,
+            "owner-deferred budgets contain a deployment verdict",
+            failures,
+        )
+        check(status == "owner_deferred", "wrong owner-deferred budget status", failures)
+        check(blocked is False, "owner-deferred budgets block qualification", failures)
+        warnings.append(
+            "deployment budgets are owner-deferred; exact size accounting has no deployment verdict"
+        )
+        return
+
+    if (disk_bytes is None) != (resident_bytes is None):
+        check(False, "dense deployment budgets must be configured together", failures)
+        check(
+            status == "incomplete_configuration",
+            "wrong incomplete deployment budget status",
+            failures,
+        )
+        check(blocked is True, "incomplete deployment budgets do not block", failures)
+        return
+
+    within_approved = disk_within is True and resident_within is True
+    expected_status = "within_approved" if within_approved else "exceeds_approved"
+    expected_blocked = not within_approved
+    check(status == expected_status, "wrong configured deployment budget status", failures)
+    check(
+        blocked is expected_blocked,
+        "configured deployment budget block state is inconsistent",
+        failures,
+    )
+    if final:
+        check(
+            disk_within is True,
+            "dense fact file exceeds its approved disk budget",
+            failures,
+        )
+        check(
+            resident_within is True,
+            "dense pinned working set exceeds its approved resident budget",
+            failures,
+        )
+    elif not within_approved:
+        warnings.append("dense accounting exceeds a configured deployment budget")
+
+
 def main() -> int:
     args = arguments()
     artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
@@ -146,23 +206,7 @@ def main() -> int:
     if args.final:
         check(bool(ci.get("run_id")), "final artifact has no CI run ID", failures)
         check(bool(ci.get("run_attempt")), "final artifact has no CI run attempt", failures)
-        check(
-            not artifact.get("budgets", {}).get("qualification_blocked", True),
-            "dense deployment budgets were not configured",
-            failures,
-        )
-        check(
-            artifact.get("budgets", {}).get("disk_within_budget") is True,
-            "dense fact file exceeds its approved disk budget",
-            failures,
-        )
-        check(
-            artifact.get("budgets", {}).get("resident_within_budget") is True,
-            "dense pinned working set exceeds its approved resident budget",
-            failures,
-        )
-    elif artifact.get("budgets", {}).get("qualification_blocked", True):
-        warnings.append("deployment budgets absent; candidate cannot become final PASS")
+    validate_budgets(artifact.get("budgets", {}), args.final, failures, warnings)
 
     result = {
         "schema": "pgkronika-overview-qualification-validation-v1",

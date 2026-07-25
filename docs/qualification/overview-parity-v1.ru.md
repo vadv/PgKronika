@@ -18,15 +18,18 @@ gauges, resets, coverage и event facts. Runner записывает:
 - точное число рядов, samples, resets, states, coverage и facts;
 - fixed metric bytes на сохранённый sample без универсального budget claim.
 
-Disk и resident limits задаёт deployment:
+Disk и resident limits утверждает владелец deployment:
 
 ```text
 OVERVIEW_DENSE_DISK_BUDGET_BYTES
 OVERVIEW_DENSE_RESIDENT_BUDGET_BYTES
 ```
 
-Без обоих значений артефакт остаётся candidate. Validator не выдаёт final PASS,
-если budget отсутствует или превышен.
+Если оба значения отсутствуют, артефакт записывает `owner_deferred`: точные
+размеры, I/O и performance gates всё равно проверяются, но deployment-budget
+verdict не заявляется. Только одно заданное значение считается ошибкой. Если
+заданы оба значения, final validation требует, чтобы оба измеренных working set
+укладывались в них.
 
 ## Режимы и coldness
 
@@ -55,8 +58,9 @@ python3 scripts/validate-overview-qualification.py \
   target/qualification/overview.json
 ```
 
-CI загружает raw JSON, JSON структурной проверки и их SHA-256. Final validation
-для точного release head:
+CI выполняет final structural, I/O и performance validation, затем загружает
+raw JSON, JSON проверки и их SHA-256. Сохранённый артефакт для точного release
+head проверяется так:
 
 ```bash
 python3 scripts/validate-overview-qualification.py \
@@ -66,3 +70,5 @@ python3 scripts/validate-overview-qualification.py \
 Итоговое доказательство parity также требует, чтобы все связанные test, BDD,
 coverage и qualification jobs принадлежали одной попытке Actions на том же
 точном head. Артефакты разных запусков и dirty-tree результаты недействительны.
+Статус owner-deferred не утверждает, что размер одобрен для deployment; если
+budgets заданы, deployment обязан соблюдать их.

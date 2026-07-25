@@ -80,18 +80,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Measure exact-head dense-hour modes
         run: |
+          python3 scripts/test_validate_overview_qualification.py
           cargo run --release -p kronika-reader --example overview_qualification -- --output target/qualification/overview.json
-          python3 scripts/validate-overview-qualification.py target/qualification/overview.json --exact-head "${EXACT_SOURCE_HEAD}" --output target/qualification/validation.json
+          python3 scripts/validate-overview-qualification.py target/qualification/overview.json --exact-head "${EXACT_SOURCE_HEAD}" --final --output target/qualification/validation.json
           sha256sum target/qualification/overview.json > target/qualification/overview.json.sha256
           sha256sum target/qualification/validation.json > target/qualification/validation.json.sha256
           {
-            echo '## Overview qualification candidate'
+            echo '## Overview qualification'
             echo
             echo "- exact head: \`${EXACT_SOURCE_HEAD}\`"
             echo "- run attempt: \`${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}\`"
             echo "- artifact: \`overview-qualification\`"
             echo
-            echo 'Final PASS also requires every acceptance job on this exact head.'
+            echo 'Structural, I/O, and performance gates passed. Configured deployment budgets are enforced; absent budgets remain owner-deferred.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:

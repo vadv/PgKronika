@@ -18,15 +18,17 @@ counter, gauge, reset, coverage, and event-fact blocks. The runner records:
 - exact retained series, sample, reset, state, coverage, and fact counts;
 - fixed metric bytes per retained sample without claiming a universal budget.
 
-Disk and resident limits are deployment inputs:
+Disk and resident limits are owner-approved deployment inputs:
 
 ```text
 OVERVIEW_DENSE_DISK_BUDGET_BYTES
 OVERVIEW_DENSE_RESIDENT_BUDGET_BYTES
 ```
 
-An artifact without both inputs remains a candidate. The validator refuses a
-final PASS when either budget is absent or exceeded.
+When both values are absent, the artifact records `owner_deferred`: exact
+sizing, I/O, and performance gates still run, but the artifact makes no
+deployment-budget claim. Supplying only one value is invalid. When both values
+are configured, final validation requires both measured working sets to fit.
 
 ## Modes and coldness
 
@@ -55,8 +57,9 @@ python3 scripts/validate-overview-qualification.py \
   target/qualification/overview.json
 ```
 
-The CI job uploads the raw JSON, structural validation JSON, and SHA-256 files.
-For final validation, use the artifact from the exact release head and run:
+The CI job runs final structural, I/O, and performance validation, then uploads
+the raw JSON, validation JSON, and SHA-256 files. To verify a preserved
+artifact from the exact release head, run:
 
 ```bash
 python3 scripts/validate-overview-qualification.py \
@@ -65,4 +68,6 @@ python3 scripts/validate-overview-qualification.py \
 
 Final parity evidence additionally requires every referenced test, BDD job,
 coverage job, and the qualification job to come from the same Actions run
-attempt and exact head. Mixed-run or dirty-tree evidence is invalid.
+attempt and exact head. Mixed-run or dirty-tree evidence is invalid. An
+owner-deferred deployment budget is not a size approval; configured budgets
+remain mandatory for a deployment that uses them.
