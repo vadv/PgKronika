@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kronika_reader::{FallbackConfig, FallbackConfigError};
+use kronika_reader::{FallbackConfig, FallbackConfigError, GcConfig, GcConfigError};
 
 use crate::OverviewConfig;
 
@@ -14,6 +14,12 @@ const OVERVIEW_CACHE_DIR_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_DIR";
 const OVERVIEW_NAMESPACE_ENV: &str = "KRONIKA_WEB_OVERVIEW_NAMESPACE";
 const FALLBACK_SEGMENT_HOURS_ENV: &str = "KRONIKA_WEB_OVERVIEW_FALLBACK_SEGMENT_HOURS";
 const FALLBACK_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_FALLBACK_BYTES";
+const GC_MAX_ENTRIES_ENV: &str = "KRONIKA_WEB_OVERVIEW_GC_MAX_ENTRIES";
+const GC_GRACE_GENERATIONS_ENV: &str = "KRONIKA_WEB_OVERVIEW_GC_GRACE_GENERATIONS";
+const GC_WALL_GRACE_ENV: &str = "KRONIKA_WEB_OVERVIEW_GC_WALL_GRACE_S";
+const GC_ARTIFACT_GRACE_ENV: &str = "KRONIKA_WEB_OVERVIEW_GC_ARTIFACT_GRACE_S";
+const CACHE_MAX_LOGICAL_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_MAX_LOGICAL_BYTES";
+const CACHE_MAX_FILES_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_MAX_FILES";
 const RESPONSE_CACHE_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES";
 const RESPONSE_CACHE_ENTRIES_ENV: &str = "KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_ENTRIES";
 const CURSOR_MAX_VIEWS_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS";
@@ -81,6 +87,12 @@ struct OverviewConfigRaw<'a> {
     namespace: Option<&'a str>,
     fallback_segment_hours: Option<&'a str>,
     fallback_bytes: Option<&'a str>,
+    gc_max_entries: Option<&'a str>,
+    gc_grace_generations: Option<&'a str>,
+    gc_wall_grace_secs: Option<&'a str>,
+    gc_artifact_grace_secs: Option<&'a str>,
+    cache_max_logical_bytes: Option<&'a str>,
+    cache_max_files: Option<&'a str>,
     response_cache_bytes: Option<&'a str>,
     response_cache_entries: Option<&'a str>,
     cursor_max_views: Option<&'a str>,
@@ -93,6 +105,7 @@ struct ParsedOverviewConfig {
     cache_dir: PathBuf,
     namespace: Option<Vec<u8>>,
     fallback: FallbackConfig,
+    gc: GcConfig,
     response_cache_bytes: usize,
     response_cache_entries: usize,
     cursor_max_views: usize,
@@ -136,6 +149,7 @@ fn parse_overview_config(
             };
             format!("{name}: {error}")
         })?;
+    let gc = parse_gc_config(raw, defaults.gc)?;
     let response_cache_bytes = parse_nonzero_usize(
         raw.response_cache_bytes,
         RESPONSE_CACHE_BYTES_ENV,
@@ -165,11 +179,54 @@ fn parse_overview_config(
         cache_dir,
         namespace,
         fallback,
+        gc,
         response_cache_bytes,
         response_cache_entries,
         cursor_max_views,
         cursor_max_bytes,
         cursor_ttl: Duration::from_secs(cursor_ttl_secs),
+    })
+}
+
+fn parse_gc_config(raw: OverviewConfigRaw<'_>, defaults: GcConfig) -> Result<GcConfig, String> {
+    let max_entries = parse_nonzero_usize(
+        raw.gc_max_entries,
+        GC_MAX_ENTRIES_ENV,
+        defaults.max_entries(),
+    )?;
+    let grace_generations = parse_nonzero_u32(
+        raw.gc_grace_generations,
+        GC_GRACE_GENERATIONS_ENV,
+        defaults.grace_generations(),
+    )?;
+    let wall_grace_secs = parse_nonzero_u64(
+        raw.gc_wall_grace_secs,
+        GC_WALL_GRACE_ENV,
+        defaults.wall_grace().as_secs(),
+    )?;
+    let artifact_grace_secs = parse_nonzero_u64(
+        raw.gc_artifact_grace_secs,
+        GC_ARTIFACT_GRACE_ENV,
+        defaults.artifact_grace().as_secs(),
+    )?;
+    let max_logical_bytes =
+        parse_optional_nonzero_u64(raw.cache_max_logical_bytes, CACHE_MAX_LOGICAL_BYTES_ENV)?;
+    let max_files = parse_optional_nonzero_u64(raw.cache_max_files, CACHE_MAX_FILES_ENV)?;
+    GcConfig::new(
+        max_entries,
+        grace_generations,
+        Duration::from_secs(wall_grace_secs),
+        Duration::from_secs(artifact_grace_secs),
+        max_logical_bytes,
+        max_files,
+    )
+    .map_err(|error| {
+        let name = match error {
+            GcConfigError::EntryLimit => GC_MAX_ENTRIES_ENV,
+            GcConfigError::GenerationGrace => GC_GRACE_GENERATIONS_ENV,
+            GcConfigError::Quota => "KRONIKA_WEB_OVERVIEW_CACHE_MAX_LOGICAL_BYTES/CACHE_MAX_FILES",
+        };
+        format!("{name}: {error}")
     })
 }
 
@@ -184,6 +241,16 @@ fn parse_nonzero_u64(raw: Option<&str>, name: &str, default: u64) -> Result<u64,
         return Err(format!("{name} must be non-zero"));
     }
     Ok(value)
+}
+
+fn parse_optional_nonzero_u64(raw: Option<&str>, name: &str) -> Result<Option<u64>, String> {
+    raw.map(|value| parse_nonzero_u64(Some(value), name, 1))
+        .transpose()
+}
+
+fn parse_nonzero_u32(raw: Option<&str>, name: &str, default: u32) -> Result<u32, String> {
+    let value = parse_nonzero_u64(raw, name, u64::from(default))?;
+    u32::try_from(value).map_err(|_error| format!("{name} does not fit u32"))
 }
 
 fn parse_nonzero_usize(raw: Option<&str>, name: &str, default: usize) -> Result<usize, String> {
@@ -218,6 +285,8 @@ pub struct WebConfig {
     pub overview_namespace: Option<Vec<u8>>,
     /// Bounded fallback used only after recoverable durable-publication failure.
     pub overview_fallback: FallbackConfig,
+    /// Bounded GC and optional hard durable-cache quota.
+    pub overview_gc: GcConfig,
     /// Serialized overview/health response-cache byte ceiling.
     pub overview_response_cache_bytes: usize,
     /// Serialized overview/health response-cache entry ceiling.
@@ -251,6 +320,7 @@ impl std::fmt::Debug for WebConfig {
                     .map(|namespace| format!("<{} bytes>", namespace.len())),
             )
             .field("overview_fallback", &self.overview_fallback)
+            .field("overview_gc", &self.overview_gc)
             .field(
                 "overview_response_cache_bytes",
                 &self.overview_response_cache_bytes,
@@ -321,6 +391,7 @@ impl WebConfig {
             log: log.unwrap_or("info").to_owned(),
             overview_namespace: overview.namespace,
             overview_fallback: overview.fallback,
+            overview_gc: overview.gc,
             overview_response_cache_bytes: overview.response_cache_bytes,
             overview_response_cache_entries: overview.response_cache_entries,
             overview_cursor_max_views: overview.cursor_max_views,
@@ -349,6 +420,12 @@ impl WebConfig {
         let overview_namespace = std::env::var(OVERVIEW_NAMESPACE_ENV).ok();
         let fallback_segment_hours = std::env::var(FALLBACK_SEGMENT_HOURS_ENV).ok();
         let fallback_bytes = std::env::var(FALLBACK_BYTES_ENV).ok();
+        let gc_max_entries = std::env::var(GC_MAX_ENTRIES_ENV).ok();
+        let gc_grace_generations = std::env::var(GC_GRACE_GENERATIONS_ENV).ok();
+        let gc_wall_grace_secs = std::env::var(GC_WALL_GRACE_ENV).ok();
+        let gc_artifact_grace_secs = std::env::var(GC_ARTIFACT_GRACE_ENV).ok();
+        let cache_max_logical_bytes = std::env::var(CACHE_MAX_LOGICAL_BYTES_ENV).ok();
+        let cache_max_files = std::env::var(CACHE_MAX_FILES_ENV).ok();
         let response_cache_bytes = std::env::var(RESPONSE_CACHE_BYTES_ENV).ok();
         let response_cache_entries = std::env::var(RESPONSE_CACHE_ENTRIES_ENV).ok();
         let cursor_max_views = std::env::var(CURSOR_MAX_VIEWS_ENV).ok();
@@ -366,6 +443,12 @@ impl WebConfig {
                 namespace: overview_namespace.as_deref(),
                 fallback_segment_hours: fallback_segment_hours.as_deref(),
                 fallback_bytes: fallback_bytes.as_deref(),
+                gc_max_entries: gc_max_entries.as_deref(),
+                gc_grace_generations: gc_grace_generations.as_deref(),
+                gc_wall_grace_secs: gc_wall_grace_secs.as_deref(),
+                gc_artifact_grace_secs: gc_artifact_grace_secs.as_deref(),
+                cache_max_logical_bytes: cache_max_logical_bytes.as_deref(),
+                cache_max_files: cache_max_files.as_deref(),
                 response_cache_bytes: response_cache_bytes.as_deref(),
                 response_cache_entries: response_cache_entries.as_deref(),
                 cursor_max_views: cursor_max_views.as_deref(),
@@ -505,6 +588,7 @@ mod tests {
             cache_dir,
             namespace: None,
             fallback: defaults.fallback,
+            gc: defaults.gc,
             response_cache_bytes: defaults.response_cache_bytes,
             response_cache_entries: defaults.response_cache_entries,
             cursor_max_views: defaults.cursor_max_views,
@@ -527,6 +611,12 @@ mod tests {
                 namespace: Some("deployment-a"),
                 fallback_segment_hours: Some("48"),
                 fallback_bytes: Some("1048576"),
+                gc_max_entries: Some("1000"),
+                gc_grace_generations: Some("3"),
+                gc_wall_grace_secs: Some("180"),
+                gc_artifact_grace_secs: Some("900"),
+                cache_max_logical_bytes: Some("8388608"),
+                cache_max_files: Some("100"),
                 response_cache_bytes: Some("2097152"),
                 response_cache_entries: Some("128"),
                 cursor_max_views: Some("16"),
@@ -540,6 +630,18 @@ mod tests {
         assert_eq!(
             cfg.overview_fallback,
             FallbackConfig::new(48, 1_048_576).expect("fixture fallback is valid")
+        );
+        assert_eq!(
+            cfg.overview_gc,
+            GcConfig::new(
+                1_000,
+                3,
+                Duration::from_mins(3),
+                Duration::from_mins(15),
+                Some(8_388_608),
+                Some(100),
+            )
+            .expect("fixture GC policy is valid")
         );
         assert_eq!(cfg.overview_response_cache_bytes, 2_097_152);
         assert_eq!(cfg.overview_response_cache_entries, 128);
@@ -582,6 +684,48 @@ mod tests {
                 FALLBACK_BYTES_ENV,
                 OverviewConfigRaw {
                     fallback_bytes: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                GC_MAX_ENTRIES_ENV,
+                OverviewConfigRaw {
+                    gc_max_entries: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                GC_GRACE_GENERATIONS_ENV,
+                OverviewConfigRaw {
+                    gc_grace_generations: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                GC_WALL_GRACE_ENV,
+                OverviewConfigRaw {
+                    gc_wall_grace_secs: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                GC_ARTIFACT_GRACE_ENV,
+                OverviewConfigRaw {
+                    gc_artifact_grace_secs: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                CACHE_MAX_LOGICAL_BYTES_ENV,
+                OverviewConfigRaw {
+                    cache_max_logical_bytes: Some("0"),
+                    ..OverviewConfigRaw::default()
+                },
+            ),
+            (
+                CACHE_MAX_FILES_ENV,
+                OverviewConfigRaw {
+                    cache_max_files: Some("0"),
                     ..OverviewConfigRaw::default()
                 },
             ),

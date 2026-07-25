@@ -111,6 +111,12 @@ impl FactKey {
         &self.0
     }
 
+    /// Parses the canonical lowercase hexadecimal encoding.
+    #[must_use]
+    pub fn from_hex(value: &str) -> Option<Self> {
+        parse_hex_32(value).map(Self)
+    }
+
     /// The lowercase hex encoding of the key.
     #[must_use]
     pub fn hex(&self) -> String {
@@ -121,6 +127,63 @@ impl FactKey {
     #[must_use]
     pub fn prefix(&self) -> String {
         format!("{:02x}", self.0[0])
+    }
+}
+
+/// Complete immutable identity of one segment-fact build.
+///
+/// Content-identical retained occurrences remain distinct because their
+/// lineage IDs differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FactBuildKey {
+    fact_key: FactKey,
+    segment_lineage_id: SegmentLineageId,
+}
+
+impl FactBuildKey {
+    /// Binds a content-addressed key to one retained segment occurrence.
+    #[must_use]
+    pub const fn new(fact_key: FactKey, segment_lineage_id: SegmentLineageId) -> Self {
+        Self {
+            fact_key,
+            segment_lineage_id,
+        }
+    }
+
+    /// Content-addressed fact identity.
+    #[must_use]
+    pub const fn fact_key(self) -> FactKey {
+        self.fact_key
+    }
+
+    /// Retained segment occurrence.
+    #[must_use]
+    pub const fn segment_lineage_id(self) -> SegmentLineageId {
+        self.segment_lineage_id
+    }
+
+    /// Canonical committed filename.
+    #[must_use]
+    pub fn final_name(self) -> String {
+        format!(
+            "{}-{}.ovf",
+            self.fact_key.hex(),
+            to_hex(&self.segment_lineage_id.0)
+        )
+    }
+
+    /// Parses an exact canonical committed filename.
+    #[must_use]
+    pub fn from_final_name(value: &str) -> Option<Self> {
+        let stem = value.strip_suffix(".ovf")?;
+        let (key, lineage) = stem.split_once('-')?;
+        if stem.matches('-').count() != 1 {
+            return None;
+        }
+        Some(Self::new(
+            FactKey::from_hex(key)?,
+            SegmentLineageId(parse_hex_32(lineage)?),
+        ))
     }
 }
 
@@ -143,7 +206,7 @@ pub fn placement(
         .join("v1")
         .join(to_hex(&source_scope_id.0))
         .join(key.prefix())
-        .join(format!("{}-{}.ovf", key.hex(), to_hex(&lineage.0)))
+        .join(FactBuildKey::new(*key, lineage).final_name())
 }
 
 /// The prefix directory containing `key`'s fact file and publication artifacts.
@@ -168,6 +231,27 @@ fn to_hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+pub(super) fn parse_hex_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = lowercase_hex_nibble(pair[0])?;
+        let low = lowercase_hex_nibble(pair[1])?;
+        decoded[index] = (high << 4) | low;
+    }
+    Some(decoded)
+}
+
+const fn lowercase_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -258,5 +342,16 @@ mod tests {
         let key = FactKey::for_current_segment(scope(3), descriptor(4));
         assert_eq!(key.prefix(), format!("{:02x}", key.as_bytes()[0]));
         assert_eq!(key.hex().len(), 64);
+    }
+
+    #[test]
+    fn build_key_round_trips_only_canonical_final_names() {
+        let key = FactKey::for_current_segment(scope(0xAB), descriptor(0xCD));
+        let build = FactBuildKey::new(key, SegmentLineageId([0xEF; 32]));
+        let name = build.final_name();
+        assert_eq!(FactBuildKey::from_final_name(&name), Some(build));
+        assert!(FactBuildKey::from_final_name(&name.to_uppercase()).is_none());
+        assert!(FactBuildKey::from_final_name("abcd-1111.ovf").is_none());
+        assert!(FactBuildKey::from_final_name(&format!("{name}.tmp")).is_none());
     }
 }

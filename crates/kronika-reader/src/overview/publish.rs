@@ -4,31 +4,32 @@
 //! failures, and persistence failures return the computed facts with a typed
 //! diagnostic.
 
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use kronika_analytics::overview::SegmentIdentity;
 use kronika_format::ReadAt;
 use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags, RenameFlags};
 
+use super::cache_owner::{
+    CacheOwner, CacheOwnerError, open_child_directory, open_file_at, open_namespace,
+};
 use super::container::{CacheReadError, FactReadStats, HeaderIdentity};
 use super::descriptors::CatalogEntryDescriptor;
-use super::factkey::{FactKey, FileKind, placement};
+use super::factkey::{FactBuildKey, FactKey, FileKind, placement};
 use super::facts::{BuildError, SegmentContext, SegmentFacts};
 use super::fallback::{FallbackConfig, FallbackFactKey, FallbackFactLru, FallbackStats};
-use super::gc::GcOutcome;
+use super::gc::{GcAdmissionError, GcConfig, GcMark, GcOutcome, GcSkipReason, GcState};
 use super::limits::Bounds;
 use super::persist_mode::{PersistModeSnapshot, PersistState};
 use crate::unit::{PgmBodyReadStats, PgmUnit};
 
 const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
-const DIR_MODE: Mode = Mode::RWXU;
 const NAME_RETRIES: usize = 32;
 
 static PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -172,9 +173,10 @@ impl FactLoad {
 pub struct FactStore {
     cache_root: PathBuf,
     fallback: Arc<Mutex<FallbackFactLru>>,
-    /// Per-file grace counter for [`collect_garbage`](Self::collect_garbage),
-    /// carried across passes.
-    gc_pending: Arc<Mutex<HashMap<PathBuf, u32>>>,
+    gc_config: GcConfig,
+    gc: Arc<Mutex<GcState>>,
+    owner: Arc<Mutex<Option<Arc<CacheOwner>>>>,
+    publication_gate: Arc<Mutex<()>>,
     /// Write mode and retry backoff for the durable cache.
     persist: Arc<Mutex<PersistState>>,
 }
@@ -192,10 +194,23 @@ impl FactStore {
         cache_root: impl Into<PathBuf>,
         fallback_config: FallbackConfig,
     ) -> Self {
+        Self::with_configs(cache_root, fallback_config, GcConfig::default())
+    }
+
+    /// Creates a fact store with validated fallback and GC/quota policies.
+    #[must_use]
+    pub fn with_configs(
+        cache_root: impl Into<PathBuf>,
+        fallback_config: FallbackConfig,
+        gc_config: GcConfig,
+    ) -> Self {
         Self {
             cache_root: cache_root.into(),
             fallback: Arc::new(Mutex::new(FallbackFactLru::new(fallback_config))),
-            gc_pending: Arc::new(Mutex::new(HashMap::new())),
+            gc_config,
+            gc: Arc::new(Mutex::new(GcState::default())),
+            owner: Arc::new(Mutex::new(None)),
+            publication_gate: Arc::new(Mutex::new(())),
             persist: Arc::new(Mutex::new(PersistState::default())),
         }
     }
@@ -214,20 +229,47 @@ impl FactStore {
         operation(&mut persist)
     }
 
-    /// Unlinks committed fact files whose segment is no longer live.
+    fn acquire_owner(&self) -> Result<Arc<CacheOwner>, PersistError> {
+        let mut owner = lock_unpoisoned(&self.owner);
+        if let Some(owner) = owner.as_ref() {
+            return Ok(Arc::clone(owner));
+        }
+        let acquired = Arc::new(CacheOwner::acquire(&self.cache_root).map_err(
+            |error| match error {
+                CacheOwnerError::Contended => PersistError::Busy,
+                CacheOwnerError::UnsafePath => PersistError::UnsafePath,
+                CacheOwnerError::Io(error) => PersistError::from_io(error),
+            },
+        )?);
+        *owner = Some(Arc::clone(&acquired));
+        drop(owner);
+        Ok(acquired)
+    }
+
+    /// Performs bounded GC from one complete typed source-view mark.
     ///
-    /// `live` holds the absolute paths of fact files still backing a segment
-    /// in the current snapshot ([`placement`] for each). A non-live file is
-    /// held for a short grace window before unlinking, so a segment that
-    /// briefly disappears and returns is not rebuilt. Safe to call only from
-    /// the thread that owns publication.
+    /// A non-authoritative mark, owner contention, incomplete scan, or entry
+    /// cap produces no deletion and does not advance grace.
     #[must_use]
-    pub fn collect_garbage(&self, live: &HashSet<PathBuf>) -> GcOutcome {
-        let mut pending = match self.gc_pending.lock() {
-            Ok(pending) => pending,
-            Err(poisoned) => poisoned.into_inner(),
+    pub fn collect_garbage(&self, mark: &GcMark) -> GcOutcome {
+        let _publication = lock_unpoisoned(&self.publication_gate);
+        if self.acquire_owner().is_err() {
+            return GcOutcome {
+                skip_reason: Some(GcSkipReason::OwnerUnavailable),
+                ..GcOutcome::default()
+            };
+        }
+        let namespace = match open_namespace(&self.cache_root, true) {
+            Ok(namespace) => namespace,
+            Err(_error) => {
+                return GcOutcome {
+                    skip_reason: Some(GcSkipReason::OwnerUnavailable),
+                    ..GcOutcome::default()
+                };
+            }
         };
-        super::gc::collect(&self.cache_root, live, &mut pending)
+        let mut gc = lock_unpoisoned(&self.gc);
+        super::gc::collect(&namespace, mark, &mut gc, self.gc_config, SystemTime::now())
     }
 
     /// Operator-trusted cache root.
@@ -240,6 +282,12 @@ impl FactStore {
     #[must_use]
     pub fn fallback_stats(&self) -> FallbackStats {
         self.with_fallback(|fallback| fallback.stats())
+    }
+
+    /// Active GC and optional hard-quota policy.
+    #[must_use]
+    pub const fn gc_config(&self) -> GcConfig {
+        self.gc_config
     }
 
     /// Loads a committed fact file or extracts facts from the source PGM.
@@ -422,8 +470,11 @@ impl FactStore {
         bytes: &[u8],
         bounds: &Bounds,
     ) -> Result<PathBuf, PersistError> {
+        let _publication = lock_unpoisoned(&self.publication_gate);
+        let _owner = self.acquire_owner()?;
         let key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
         let lineage = facts.lineage().id();
+        let build_key = FactBuildKey::new(key, lineage);
         let final_path = placement(
             &self.cache_root,
             facts.identity().source_scope_id,
@@ -451,7 +502,7 @@ impl FactStore {
             Err(error) => return Err(PersistError::from_errno(error)),
         }
 
-        let final_name = format!("{}-{lineage_hex}.ovf", key.hex());
+        let final_name = build_key.final_name();
         let expected_catalog = facts.catalog_descriptors();
         if let Ok(existing) = open_regular_at(&directory, &final_name) {
             if SegmentFacts::from_reader(
@@ -463,11 +514,24 @@ impl FactStore {
             )
             .is_ok()
             {
+                lock_unpoisoned(&self.gc).record_publication(build_key, SystemTime::now());
                 return Ok(final_path);
             }
             quarantine(&directory, &final_name, &key)?;
         } else if path_exists_at(&directory, &final_name)? {
             quarantine(&directory, &final_name, &key)?;
+        }
+
+        if self.gc_config.max_logical_bytes().is_some() || self.gc_config.max_files().is_some() {
+            let incoming =
+                u64::try_from(bytes.len()).map_err(|_error| PersistError::QuotaExceeded)?;
+            let namespace =
+                open_namespace(&self.cache_root, true).map_err(PersistError::from_io)?;
+            match super::gc::admit_publication(&namespace, self.gc_config, incoming) {
+                Ok(usage) => lock_unpoisoned(&self.gc).update_usage(usage, self.gc_config),
+                Err(GcAdmissionError::Capped) => return Err(PersistError::QuotaExceeded),
+                Err(GcAdmissionError::Incomplete) => return Err(PersistError::Io),
+            }
         }
 
         let (temp_name, temp_file) = create_temp(&directory, &key)?;
@@ -487,7 +551,10 @@ impl FactStore {
             bounds,
         );
         unlink_ignoring_missing(&directory, &temp_name);
-        outcome.map(|()| final_path)
+        outcome.map(|()| {
+            lock_unpoisoned(&self.gc).record_publication(build_key, SystemTime::now());
+            final_path
+        })
     }
 
     fn read_with_stats<R: ReadAt>(
@@ -545,18 +612,9 @@ impl FactStore {
         key: &FactKey,
         create: bool,
     ) -> Result<File, io::Error> {
-        if create {
-            std::fs::create_dir_all(&self.cache_root)?;
-        }
-        let mut directory = File::open(&self.cache_root)?;
-        if !directory.metadata()?.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotADirectory,
-                "cache root is not a directory",
-            ));
-        }
+        let mut directory = open_namespace(&self.cache_root, create)?;
         let scope = hex(&identity.source_scope_id.0);
-        for component in ["overview", "v1", scope.as_str(), key.prefix().as_str()] {
+        for component in [scope.as_str(), key.prefix().as_str()] {
             directory = open_child_directory(&directory, component, create)?;
         }
         Ok(directory)
@@ -615,41 +673,6 @@ fn commit_temp(
     Err(PersistError::Io)
 }
 
-fn open_child_directory(parent: &File, name: &str, create: bool) -> Result<File, io::Error> {
-    let mut created = false;
-    if create {
-        match rustix::fs::mkdirat(parent, name, DIR_MODE) {
-            Ok(()) => created = true,
-            Err(error) if error == rustix::io::Errno::EXIST => {}
-            Err(error) => return Err(errno_to_io(error)),
-        }
-    }
-    let child = match open_file_at(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(child) => child,
-        Err(error)
-            if error.raw_os_error().is_some_and(|code| {
-                code == rustix::io::Errno::LOOP.raw_os_error()
-                    || code == rustix::io::Errno::NOTDIR.raw_os_error()
-            }) =>
-        {
-            return Err(errno_to_io(rustix::io::Errno::LOOP));
-        }
-        Err(error) => return Err(error),
-    };
-    if create {
-        rustix::fs::fchmod(&child, DIR_MODE).map_err(errno_to_io)?;
-    }
-    if created {
-        parent.sync_all()?;
-    }
-    Ok(child)
-}
-
 fn open_regular_at(directory: &File, name: &str) -> Result<File, io::Error> {
     let file = open_file_at(
         directory,
@@ -664,17 +687,6 @@ fn open_regular_at(directory: &File, name: &str) -> Result<File, io::Error> {
         ));
     }
     Ok(file)
-}
-
-fn open_file_at(
-    directory: &File,
-    name: &str,
-    flags: OFlags,
-    mode: Mode,
-) -> Result<File, io::Error> {
-    rustix::fs::openat(directory, name, flags, mode)
-        .map(File::from)
-        .map_err(errno_to_io)
 }
 
 fn create_temp(directory: &File, key: &FactKey) -> Result<(String, File), PersistError> {
@@ -801,8 +813,11 @@ impl PersistError {
     }
 }
 
-fn errno_to_io(error: rustix::io::Errno) -> io::Error {
-    io::Error::from_raw_os_error(error.raw_os_error())
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
