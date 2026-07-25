@@ -30,6 +30,10 @@ pub enum MetricFactor {
     PgDatabaseSessionsFatal,
     /// `pg_stat_database.sessions_killed`.
     PgDatabaseSessionsKilled,
+    /// Explicit `pg_stat_database` reset timestamp.
+    PgStatisticsResetAt,
+    /// Explicit PostgreSQL postmaster start timestamp.
+    PgPostmasterStartTime,
     /// Current per-database connection count.
     PgDatabaseConnections,
     /// Per-database connection limit.
@@ -48,6 +52,10 @@ pub enum MetricFactor {
     PgReplicationReplayLag,
     /// Replication slot state.
     PgReplicationSlotState,
+    /// Complete physical-sender snapshot population boundary.
+    PgReplicationSenderSnapshotPopulation,
+    /// Complete replication-slot snapshot population boundary.
+    PgReplicationSlotSnapshotPopulation,
     /// Filesystem total bytes.
     PgFilesystemTotalBytes,
     /// Filesystem available bytes.
@@ -87,6 +95,8 @@ impl MetricFactor {
             Self::PgDatabaseSessionsAbandoned => 103,
             Self::PgDatabaseSessionsFatal => 104,
             Self::PgDatabaseSessionsKilled => 105,
+            Self::PgStatisticsResetAt => 106,
+            Self::PgPostmasterStartTime => 107,
             Self::PgDatabaseConnections => 110,
             Self::PgDatabaseConnectionLimit => 111,
             Self::PgDatabaseFrozenXidAge => 112,
@@ -96,6 +106,8 @@ impl MetricFactor {
             Self::PgReplicationSenderState => 122,
             Self::PgReplicationReplayLag => 123,
             Self::PgReplicationSlotState => 124,
+            Self::PgReplicationSenderSnapshotPopulation => 125,
+            Self::PgReplicationSlotSnapshotPopulation => 126,
             Self::PgFilesystemTotalBytes => 130,
             Self::PgFilesystemAvailableBytes => 131,
             Self::OsCgroupMemoryCurrentBytes => 200,
@@ -122,6 +134,8 @@ impl MetricFactor {
             103 => Some(Self::PgDatabaseSessionsAbandoned),
             104 => Some(Self::PgDatabaseSessionsFatal),
             105 => Some(Self::PgDatabaseSessionsKilled),
+            106 => Some(Self::PgStatisticsResetAt),
+            107 => Some(Self::PgPostmasterStartTime),
             110 => Some(Self::PgDatabaseConnections),
             111 => Some(Self::PgDatabaseConnectionLimit),
             112 => Some(Self::PgDatabaseFrozenXidAge),
@@ -131,6 +145,8 @@ impl MetricFactor {
             122 => Some(Self::PgReplicationSenderState),
             123 => Some(Self::PgReplicationReplayLag),
             124 => Some(Self::PgReplicationSlotState),
+            125 => Some(Self::PgReplicationSenderSnapshotPopulation),
+            126 => Some(Self::PgReplicationSlotSnapshotPopulation),
             130 => Some(Self::PgFilesystemTotalBytes),
             131 => Some(Self::PgFilesystemAvailableBytes),
             200 => Some(Self::OsCgroupMemoryCurrentBytes),
@@ -158,6 +174,8 @@ impl MetricFactor {
             Self::PgDatabaseSessionsAbandoned => "pg.database.sessions_abandoned",
             Self::PgDatabaseSessionsFatal => "pg.database.sessions_fatal",
             Self::PgDatabaseSessionsKilled => "pg.database.sessions_killed",
+            Self::PgStatisticsResetAt => "pg.statistics.reset_at_us",
+            Self::PgPostmasterStartTime => "pg.postmaster.start_time_us",
             Self::PgDatabaseConnections => "pg.database.connections",
             Self::PgDatabaseConnectionLimit => "pg.database.connection_limit",
             Self::PgDatabaseFrozenXidAge => "pg.database.frozen_xid_age",
@@ -167,6 +185,12 @@ impl MetricFactor {
             Self::PgReplicationSenderState => "pg.replication.sender_state",
             Self::PgReplicationReplayLag => "pg.replication.replay_lag_us",
             Self::PgReplicationSlotState => "pg.replication.slot_state",
+            Self::PgReplicationSenderSnapshotPopulation => {
+                "pg.replication.sender_snapshot_population"
+            }
+            Self::PgReplicationSlotSnapshotPopulation => {
+                "pg.replication.slot_snapshot_population"
+            }
             Self::PgFilesystemTotalBytes => "pg.filesystem.total_bytes",
             Self::PgFilesystemAvailableBytes => "pg.filesystem.available_bytes",
             Self::OsCgroupMemoryCurrentBytes => "os.cgroup.memory.current_bytes",

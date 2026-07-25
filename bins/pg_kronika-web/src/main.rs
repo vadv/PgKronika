@@ -18,7 +18,6 @@
     reason = "gauge values are small integer counts that fit an f64 exactly"
 )]
 
-use std::os::unix::ffi::OsStrExt as _;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -56,19 +55,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|err| format!("failed to resolve store at {}: {err}", cfg.dir.display()))?;
     let snapshot = LocalDirSnapshot::open(&canonical_store)
         .map_err(|err| format!("failed to open store at {}: {err}", cfg.dir.display()))?;
-    let namespace = cfg
-        .overview_namespace
-        .clone()
-        .unwrap_or_else(|| canonical_store.as_os_str().as_bytes().to_vec());
-    let mut overview = OverviewConfig::new(cfg.overview_cache_dir.clone(), namespace);
+    let mut overview = OverviewConfig::new(
+        cfg.overview_cache_dir.clone(),
+        cfg.overview_namespace.clone(),
+    );
     overview.fallback = cfg.overview_fallback;
     overview.gc = cfg.overview_gc;
     overview.response_cache_bytes = cfg.overview_response_cache_bytes;
     overview.response_cache_entries = cfg.overview_response_cache_entries;
+    overview.decoded_cache_bytes = cfg.overview_decoded_cache_bytes;
+    overview.decoded_cache_entries = cfg.overview_decoded_cache_entries;
+    overview.source_scrub_interval = cfg.overview_source_scrub_interval;
     overview.cursor_max_views = cfg.overview_cursor_max_views;
     overview.cursor_max_bytes = cfg.overview_cursor_max_bytes;
     overview.cursor_ttl = cfg.overview_cursor_ttl;
     overview.max_selected_segments = cfg.overview_max_selected_segments;
+    overview.cold = cfg.overview_cold;
     let state =
         AppState::with_overview_config(snapshot, now_unix_secs(), cfg.stale_after, overview)?;
     let auth = cfg

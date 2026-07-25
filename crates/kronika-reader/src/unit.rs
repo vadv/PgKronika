@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
+use kronika_format::{
+    Catalog, Crc32c, Entry, FORMAT_VERSION, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c,
+};
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
     Row, VerifiedSection, decode_any, decode_rows,
@@ -17,6 +19,7 @@ use crate::{Dictionary, ReadError, Stored, decode_dictionary};
 
 /// Upper bound on the catalog block, checked before allocation.
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
+const SCRUB_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Completed PGM section-body I/O performed by one open unit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -164,6 +167,77 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             descriptor,
             body,
         })
+    }
+
+    /// Streams and CRC-checks one section without materializing its body.
+    ///
+    /// The fixed scratch buffer bounds scrub RSS independently of section
+    /// length. The ordinal is segment-global and comes from the opened
+    /// catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for an invalid ordinal, unsafe length, I/O error,
+    /// counter overflow, or body CRC mismatch.
+    pub fn scrub_overview_section(&self, catalog_ordinal: u32) -> Result<(), ReadError> {
+        let index = usize::try_from(catalog_ordinal).map_err(|_error| {
+            ReadError::CatalogOrdinalOutOfRange {
+                ordinal: catalog_ordinal,
+            }
+        })?;
+        let entry = self
+            .catalog
+            .entries
+            .get(index)
+            .ok_or(ReadError::CatalogOrdinalOutOfRange {
+                ordinal: catalog_ordinal,
+            })?;
+        let len = usize::try_from(entry.len)
+            .ok()
+            .filter(|&len| len <= MAX_SECTION_BYTES)
+            .ok_or(ReadError::SectionTooLarge { len: entry.len })?;
+        self.body_read_calls
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_value| ReadError::CounterOverflow)?;
+
+        let mut checksum = Crc32c::new();
+        let mut scratch = [0_u8; SCRUB_BUFFER_BYTES];
+        let mut consumed = 0_usize;
+        while consumed < len {
+            let chunk_len = (len - consumed).min(scratch.len());
+            let offset = entry
+                .offset
+                .checked_add(
+                    u64::try_from(consumed).map_err(|_error| ReadError::CounterOverflow)?,
+                )
+                .ok_or(ReadError::CounterOverflow)?;
+            self.reader
+                .read_exact_at(&mut scratch[..chunk_len], offset)?;
+            checksum.update(&scratch[..chunk_len]);
+            self.body_bytes_read
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(u64::try_from(chunk_len).ok()?)
+                })
+                .map_err(|_value| ReadError::CounterOverflow)?;
+            consumed = consumed
+                .checked_add(chunk_len)
+                .ok_or(ReadError::CounterOverflow)?;
+        }
+
+        let got = checksum.finalize();
+        if got != entry.crc32c {
+            return Err(ReadError::Codec(CodecError::Section {
+                type_id: entry.type_id,
+                bytes_in: len,
+                source: Box::new(CodecError::SectionCrcMismatch {
+                    expected: entry.crc32c,
+                    got,
+                }),
+            }));
+        }
+        Ok(())
     }
 
     /// Reads, CRC-checks, and decodes one section without rereading its body.

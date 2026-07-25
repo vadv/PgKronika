@@ -159,6 +159,7 @@ where
                             return;
                         }
                     };
+                    let cacheable = loaded.fact_set_id() == worker_key.fact_set_id;
                     let Ok(permit) = worker_state.try_acquire_analytic() else {
                         metrics::counter!("kronika_web_timeline_capacity_rejections_total")
                             .increment(1);
@@ -170,7 +171,7 @@ where
                         return;
                     };
                     let cache = worker_state.response_cache.clone();
-                    let render_cache_key = cache_key;
+                    let render_cache_key = cacheable.then_some(cache_key).flatten();
                     let rendered =
                         tokio::task::spawn_blocking(move || -> Result<Arc<[u8]>, ApiProblem> {
                             let _permit = permit;
@@ -231,13 +232,16 @@ fn select_plan(
 
 fn fact_load_problem(error: FactLoadFailure) -> ApiProblem {
     match error {
-        FactLoadFailure::CapacityUnavailable => {
+        FactLoadFailure::ColdBuildOverloaded {
+            retry_after_seconds,
+            reason,
+        } => {
             metrics::counter!(
                 "kronika_web_overview_cold_work_rejections_total",
-                "reason" => "capacity"
+                "reason" => reason
             )
             .increment(1);
-            ApiProblem::overview_capacity_unavailable()
+            ApiProblem::cold_build_overloaded(retry_after_seconds)
         }
         FactLoadFailure::Source(_error) => ApiProblem::store_read_failed(),
         FactLoadFailure::WorkerFailed | FactLoadFailure::IdentityMismatch => {

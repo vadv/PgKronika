@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use kronika_analytics::overview::{NamingContractId, SegmentLocator};
 use kronika_reader::{
@@ -19,6 +20,7 @@ use super::admission::{ColdAdmissionConfig, ColdWorkWeight};
 use super::loader::OverviewFactLoader;
 use super::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
 use super::view::{DescriptorEntry, DescriptorView, PromotionCandidate};
+use crate::OverviewColdConfig;
 
 /// Deployment naming-contract identity for overview facts.
 ///
@@ -37,6 +39,8 @@ pub enum OverviewBuildError {
     ActiveRead(kronika_reader::ReadError),
     /// The process-wide cold-work bounds are invalid.
     ColdAdmission,
+    /// The bounded source-scrub cadence is zero.
+    SourceScrubInterval,
     /// The selected-segment request policy is outside the v1 range.
     SelectedSegmentLimit {
         /// Rejected configured value.
@@ -55,6 +59,9 @@ impl std::fmt::Display for OverviewBuildError {
             Self::Live(error) => write!(f, "overview live fold: {error}"),
             Self::ActiveRead(error) => write!(f, "overview active read: {error}"),
             Self::ColdAdmission => f.write_str("overview cold admission limits are invalid"),
+            Self::SourceScrubInterval => {
+                f.write_str("overview source scrub interval must be non-zero")
+            }
             Self::SelectedSegmentLimit {
                 configured,
                 maximum,
@@ -73,7 +80,10 @@ impl std::error::Error for OverviewBuildError {
             Self::Config(error) => Some(error),
             Self::Live(error) => Some(error),
             Self::ActiveRead(error) => Some(error),
-            Self::ColdAdmission | Self::SelectedSegmentLimit { .. } | Self::WriterPoisoned => None,
+            Self::ColdAdmission
+            | Self::SourceScrubInterval
+            | Self::SelectedSegmentLimit { .. }
+            | Self::WriterPoisoned => None,
         }
     }
 }
@@ -91,6 +101,10 @@ pub(crate) struct OverviewWriter {
     namespace: Vec<u8>,
     sealed: BTreeMap<SealedLocator, DescriptorEntry>,
     unavailable: BTreeMap<SealedLocator, SegmentDescriptor>,
+    scrub_damaged: BTreeMap<SealedLocator, SegmentDescriptor>,
+    scrub_cursor: Option<(SealedLocator, u32)>,
+    scrub_every_passes: u64,
+    passes_since_scrub: u64,
     live: LiveBuilder,
     passes_since_gc: u64,
     view_generation: u64,
@@ -108,12 +122,33 @@ impl OverviewWriter {
     }
 
     /// Builds a writer with explicit fallback and durable GC/quota policies.
+    #[cfg(test)]
     pub(crate) fn with_gc_config(
         cache_root: PathBuf,
         namespace: Vec<u8>,
         fallback: FallbackConfig,
         gc: GcConfig,
     ) -> Result<Self, OverviewBuildError> {
+        Self::with_runtime_config(
+            cache_root,
+            namespace,
+            fallback,
+            gc,
+            Duration::from_secs(60),
+        )
+    }
+
+    /// Builds a writer with the complete production storage policy.
+    pub(crate) fn with_runtime_config(
+        cache_root: PathBuf,
+        namespace: Vec<u8>,
+        fallback: FallbackConfig,
+        gc: GcConfig,
+        source_scrub_interval: Duration,
+    ) -> Result<Self, OverviewBuildError> {
+        if source_scrub_interval.is_zero() {
+            return Err(OverviewBuildError::SourceScrubInterval);
+        }
         let live =
             LiveBuilder::new(namespace.clone(), LIMIT).map_err(OverviewBuildError::Config)?;
         Ok(Self {
@@ -121,6 +156,10 @@ impl OverviewWriter {
             namespace,
             sealed: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            scrub_damaged: BTreeMap::new(),
+            scrub_cursor: None,
+            scrub_every_passes: source_scrub_interval.as_secs().max(1),
+            passes_since_scrub: 0,
             live,
             passes_since_gc: 0,
             view_generation: 0,
@@ -139,10 +178,20 @@ impl OverviewWriter {
 
     pub(crate) fn fact_loader(
         &self,
-        config: ColdAdmissionConfig,
+        policy: OverviewColdConfig,
+        decoded_cache_bytes: usize,
+        decoded_cache_entries: usize,
     ) -> Result<OverviewFactLoader, OverviewBuildError> {
-        OverviewFactLoader::new(self.store.clone(), self.namespace.clone(), config)
-            .map_err(|_error| OverviewBuildError::ColdAdmission)
+        let config = ColdAdmissionConfig::from_operator(policy)
+            .map_err(|_error| OverviewBuildError::ColdAdmission)?;
+        OverviewFactLoader::new(
+            self.store.clone(),
+            self.namespace.clone(),
+            config,
+            decoded_cache_bytes,
+            decoded_cache_entries,
+        )
+        .map_err(|_error| OverviewBuildError::ColdAdmission)
     }
 
     /// Requests a bounded GC scan at most once per [`GC_INTERVAL_PASSES`]
@@ -179,6 +228,7 @@ impl OverviewWriter {
         delta: &RefreshDelta,
     ) -> Result<DescriptorView, OverviewBuildError> {
         let prior_live = Arc::new(self.live.publish());
+        self.scrub_one_source_section(snapshot);
         let mut sealed = self.sealed.clone();
         let mut unavailable = self.unavailable.clone();
         self.refresh_sealed(snapshot, &mut sealed, &mut unavailable);
@@ -217,7 +267,7 @@ impl OverviewWriter {
     }
 
     fn refresh_sealed(
-        &self,
+        &mut self,
         snapshot: &LocalDirSnapshot,
         sealed: &mut BTreeMap<SealedLocator, DescriptorEntry>,
         unavailable: &mut BTreeMap<SealedLocator, SegmentDescriptor>,
@@ -227,6 +277,8 @@ impl OverviewWriter {
             .iter()
             .map(|descriptor| (descriptor.locator, *descriptor))
             .collect::<BTreeMap<_, _>>();
+        self.scrub_damaged
+            .retain(|locator, descriptor| baseline.get(locator) == Some(descriptor));
         sealed.retain(|locator, entry| {
             baseline
                 .get(locator)
@@ -234,6 +286,11 @@ impl OverviewWriter {
         });
         unavailable.retain(|locator, descriptor| baseline.get(locator) == Some(descriptor));
         for descriptor in baseline.values() {
+            if self.scrub_damaged.get(&descriptor.locator) == Some(descriptor) {
+                sealed.remove(&descriptor.locator);
+                unavailable.insert(descriptor.locator, *descriptor);
+                continue;
+            }
             if sealed.contains_key(&descriptor.locator) {
                 unavailable.remove(&descriptor.locator);
                 continue;
@@ -249,6 +306,92 @@ impl OverviewWriter {
                 }
             }
         }
+    }
+
+    fn scrub_one_source_section(&mut self, snapshot: &LocalDirSnapshot) {
+        self.passes_since_scrub = self.passes_since_scrub.saturating_add(1);
+        if self.passes_since_scrub < self.scrub_every_passes {
+            return;
+        }
+        self.passes_since_scrub = 0;
+
+        let descriptors = snapshot.sealed_descriptors();
+        if descriptors.is_empty() {
+            self.scrub_cursor = None;
+            return;
+        }
+        let (position, ordinal) = self.scrub_position(descriptors);
+        let descriptor = descriptors[position];
+        let started = Instant::now();
+        let unit = match snapshot.open_sealed_by_descriptor(&descriptor) {
+            Ok(unit) => unit,
+            Err(_error) => {
+                self.mark_scrub_damage(descriptor);
+                self.advance_scrub_cursor(descriptors, position);
+                record_scrub("open_error", 0, started);
+                return;
+            }
+        };
+        if unit.catalog().entries.is_empty() {
+            self.scrub_damaged.remove(&descriptor.locator);
+            self.advance_scrub_cursor(descriptors, position);
+            record_scrub("empty", 0, started);
+            return;
+        }
+        let ordinal = ordinal.min(
+            u32::try_from(unit.catalog().entries.len() - 1).unwrap_or(u32::MAX),
+        );
+        let result = unit.scrub_overview_section(ordinal);
+        let stats = unit.body_read_stats();
+        match result {
+            Ok(()) => {
+                let next = usize::try_from(ordinal)
+                    .ok()
+                    .and_then(|ordinal| ordinal.checked_add(1));
+                if next.is_some_and(|next| next < unit.catalog().entries.len()) {
+                    self.scrub_cursor = Some((descriptor.locator, ordinal.saturating_add(1)));
+                } else {
+                    self.scrub_damaged.remove(&descriptor.locator);
+                    self.advance_scrub_cursor(descriptors, position);
+                }
+                record_scrub("ok", stats.stored_bytes_read, started);
+            }
+            Err(_error) => {
+                self.mark_scrub_damage(descriptor);
+                self.advance_scrub_cursor(descriptors, position);
+                record_scrub("damage", stats.stored_bytes_read, started);
+            }
+        }
+        metrics::gauge!("overview_source_damaged_segments")
+            .set(self.scrub_damaged.len() as f64);
+    }
+
+    fn scrub_position(&self, descriptors: &[SegmentDescriptor]) -> (usize, u32) {
+        let Some((locator, ordinal)) = self.scrub_cursor else {
+            return (0, 0);
+        };
+        descriptors
+            .iter()
+            .position(|descriptor| descriptor.locator == locator)
+            .map_or((0, 0), |position| (position, ordinal))
+    }
+
+    fn advance_scrub_cursor(&mut self, descriptors: &[SegmentDescriptor], position: usize) {
+        let next = position.saturating_add(1);
+        self.scrub_cursor = Some((
+            descriptors
+                .get(next)
+                .unwrap_or(&descriptors[0])
+                .locator,
+            0,
+        ));
+    }
+
+    fn mark_scrub_damage(&mut self, descriptor: SegmentDescriptor) {
+        self.scrub_damaged
+            .insert(descriptor.locator, descriptor);
+        self.sealed.remove(&descriptor.locator);
+        self.unavailable.insert(descriptor.locator, descriptor);
     }
 
     fn describe_sealed(
@@ -295,6 +438,12 @@ impl OverviewWriter {
     }
 }
 
+fn record_scrub(outcome: &'static str, bytes: u64, started: Instant) {
+    metrics::counter!("overview_source_scrub_total", "outcome" => outcome).increment(1);
+    metrics::counter!("overview_source_scrub_bytes_total").increment(bytes);
+    metrics::histogram!("overview_source_scrub_seconds").record(started.elapsed());
+}
+
 fn fold_refresh(
     builder: &mut LiveBuilder,
     snapshot: &LocalDirSnapshot,
@@ -329,7 +478,6 @@ pub(crate) type OverviewIndex = OverviewWriter;
 mod tests {
     use super::*;
     use std::io::Write as _;
-    use std::time::Duration;
 
     use kronika_analytics::overview::{CountLimits, CoverageSpan, OracleLimits, RawOracle};
     use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
@@ -431,7 +579,7 @@ mod tests {
         )
         .expect("selected plan");
         writer
-            .fact_loader(ColdAdmissionConfig::default())
+            .fact_loader(OverviewColdConfig::default(), 16 * 1024 * 1024, 16)
             .expect("fact loader")
             .load_selected(Arc::new(snapshot.clone()), &plan)
             .await

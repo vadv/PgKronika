@@ -13,8 +13,8 @@ use super::coverage::{CoverageSpan, RetainedExactness};
 use super::finite::FiniteF64;
 use super::metric::{MetricFactor, MetricSeriesDescriptor, MetricUnit};
 use super::observation::{
-    DroppedFieldCount, EventObservation, EvidenceQuality, FactId, LossSummary, ObservationId,
-    ObservationPayload, ObservationShape, SourceScopeId,
+    DroppedFieldCount, EventObservation, EvidenceQuality, FactId, LossReason, LossSummary,
+    ObservationId, ObservationPayload, ObservationShape, SourceScopeId,
 };
 use super::reduce::{CounterInterval, CounterSample, GaugeSample, PairQuality};
 use super::sha256;
@@ -23,6 +23,7 @@ const EVENT_FACT_DOMAIN_TAG: &[u8] = b"pgk-overview-canonical-event-fact-v1";
 const METRIC_FACT_DOMAIN_TAG: &[u8] = b"pgk-overview-canonical-metric-fact-v1";
 const COUNTER_SAMPLE_OBSERVATION_TAG: &[u8] = b"pgk-overview-counter-sample-observation-v1";
 const GAUGE_SAMPLE_OBSERVATION_TAG: &[u8] = b"pgk-overview-gauge-sample-observation-v1";
+const COLLECTOR_LOSS_OBSERVATION_TAG: &[u8] = b"pgk-overview-collector-loss-observation-v1";
 
 /// Stable event taxonomy represented by canonical facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -749,6 +750,159 @@ impl EventFact {
         .map(Some)
     }
 
+    /// Derives a reset or postmaster marker from two explicit metadata samples.
+    ///
+    /// # Errors
+    /// Returns [`InvalidEventFact`] when the current timestamp overflows.
+    pub fn from_metadata_change(
+        descriptor: MetricSeriesDescriptor,
+        previous: GaugeSample,
+        current: GaugeSample,
+    ) -> Result<Option<Self>, InvalidEventFact> {
+        if descriptor.series_id != previous.series_id()
+            || descriptor.series_id != current.series_id()
+            || descriptor.unit != MetricUnit::Microseconds
+            || current.ts_us() <= previous.ts_us()
+            || current.value() == previous.value()
+            || previous.value().fract() != 0.0
+            || current.value().fract() != 0.0
+        {
+            return Ok(None);
+        }
+        let kind = match MetricFactor::from_id(descriptor.factor_id) {
+            Some(MetricFactor::PgStatisticsResetAt) => EventKind::PgStatisticsResetObserved,
+            Some(MetricFactor::PgPostmasterStartTime) => EventKind::PgPostmasterStartChanged,
+            _ => return Ok(None),
+        };
+        let evidence = canonical_evidence([
+            gauge_sample_observation_id(previous),
+            gauge_sample_observation_id(current),
+        ]);
+        Self::new(
+            metric_fact_id(kind, &evidence),
+            kind,
+            FactShape::Individual,
+            point_interval(current.ts_us())?,
+            1,
+            descriptor.entity,
+            EventPayload::Marker,
+            evidence,
+            EvidenceQuality::DerivedExact,
+            CoverageRef {
+                source_scope_id: descriptor.source_scope_id,
+                retained_exactness: RetainedExactness::Exact,
+                loss: None,
+            },
+        )
+        .map(Some)
+    }
+
+    /// Derives a sender disappearance from adjacent complete snapshot sets.
+    ///
+    /// # Errors
+    /// Returns [`InvalidEventFact`] when the current boundary overflows.
+    pub fn from_sender_disappearance(
+        sender: MetricSeriesDescriptor,
+        previous_ts_us: i64,
+        previous_state: u32,
+        boundary: MetricSeriesDescriptor,
+        current_boundary: GaugeSample,
+        current_population_total: u64,
+    ) -> Result<Option<Self>, InvalidEventFact> {
+        if MetricFactor::from_id(sender.factor_id)
+            != Some(MetricFactor::PgReplicationSenderState)
+            || MetricFactor::from_id(boundary.factor_id)
+                != Some(MetricFactor::PgReplicationSenderSnapshotPopulation)
+            || sender.source_scope_id != boundary.source_scope_id
+            || sender.source_type_id != boundary.source_type_id
+            || sender.entity.is_none()
+            || current_boundary.series_id() != boundary.series_id
+            || current_boundary.ts_us() <= previous_ts_us
+        {
+            return Ok(None);
+        }
+        let previous = GaugeSample::new(sender.series_id, previous_ts_us, f64::from(previous_state))
+            .expect("u32 state is finite");
+        let evidence = canonical_evidence([
+            gauge_sample_observation_id(previous),
+            gauge_sample_observation_id(current_boundary),
+        ]);
+        let kind = EventKind::PgReplicationSenderDisappeared;
+        Self::new(
+            metric_fact_id(kind, &evidence),
+            kind,
+            FactShape::Individual,
+            point_interval(current_boundary.ts_us())?,
+            1,
+            sender.entity,
+            EventPayload::StateTransition(StateTransitionFactPayload {
+                factor_id: sender.factor_id,
+                previous_state,
+                current_state: u32::MAX,
+                population_total: current_population_total,
+            }),
+            evidence,
+            EvidenceQuality::DerivedExact,
+            CoverageRef {
+                source_scope_id: sender.source_scope_id,
+                retained_exactness: RetainedExactness::Exact,
+                loss: None,
+            },
+        )
+        .map(Some)
+    }
+
+    /// Materializes one retained collector-loss marker.
+    ///
+    /// # Errors
+    /// Returns [`InvalidEventFact`] when `ts_us` overflows.
+    pub fn from_collector_loss(
+        source_scope_id: SourceScopeId,
+        source_type_id: u32,
+        ts_us: i64,
+        kind: EventKind,
+        reasons: &[LossReason],
+        lost_count_lower_bound: Option<u64>,
+    ) -> Result<Option<Self>, InvalidEventFact> {
+        if !matches!(
+            kind,
+            EventKind::CollectorSnapshotGap
+                | EventKind::CollectorSourceReadFailure
+                | EventKind::CollectorVisibilityRestricted
+        ) || reasons.is_empty()
+        {
+            return Ok(None);
+        }
+        let loss = LossSummary::new(reasons.iter().copied(), lost_count_lower_bound);
+        let mut evidence_input = Vec::with_capacity(16 + 4 + 8 + 2 + loss.reasons().len());
+        evidence_input.extend_from_slice(&source_scope_id.0);
+        evidence_input.extend_from_slice(&source_type_id.to_le_bytes());
+        evidence_input.extend_from_slice(&ts_us.to_le_bytes());
+        evidence_input.extend_from_slice(&kind.code().to_le_bytes());
+        evidence_input.extend(loss.reasons().iter().map(|reason| reason.code()));
+        let evidence = vec![ObservationId(sha256::digest_parts(&[
+            COLLECTOR_LOSS_OBSERVATION_TAG,
+            &evidence_input,
+        ]))];
+        Self::new(
+            metric_fact_id(kind, &evidence),
+            kind,
+            FactShape::Individual,
+            point_interval(ts_us)?,
+            1,
+            None,
+            EventPayload::Marker,
+            evidence,
+            EvidenceQuality::Structured,
+            CoverageRef {
+                source_scope_id,
+                retained_exactness: RetainedExactness::LowerBound,
+                loss: Some(loss),
+            },
+        )
+        .map(Some)
+    }
+
     /// Derives an exact state change between complete compatible snapshots.
     ///
     /// Callers supply state records retained only from complete populations.
@@ -1012,7 +1166,7 @@ impl EventFact {
         let loss = self.coverage.loss.as_ref().map_or(Some(0), |loss| {
             loss.reasons()
                 .len()
-                .checked_mul(size_of::<super::observation::LossReason>())
+                .checked_mul(size_of::<LossReason>())
         })?;
         evidence.checked_add(payload)?.checked_add(loss)
     }

@@ -395,6 +395,7 @@ impl SegmentFacts {
             .filter_map(|observation| EventFact::from_observation(observation).transpose())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_error| BuildError::Internal)?;
+        event_facts.extend(metrics.event_facts.iter().cloned());
         let covered = segment_coverage(min_ts, max_ts)?;
         let counter_samples = CounterSamplesBlock::new_with_series(
             metrics.counter_series,
@@ -1170,6 +1171,37 @@ fn derive_metric_event_facts(
         start = end;
     }
 
+    for descriptor in gauges.series().iter().filter(|descriptor| {
+        matches!(
+            kronika_analytics::overview::MetricFactor::from_id(descriptor.factor_id),
+            Some(
+                kronika_analytics::overview::MetricFactor::PgStatisticsResetAt
+                    | kronika_analytics::overview::MetricFactor::PgPostmasterStartTime
+            )
+        )
+    }) {
+        let samples = gauges
+            .samples()
+            .iter()
+            .filter(|sample| sample.series_id() == descriptor.series_id)
+            .copied()
+            .collect::<Vec<_>>();
+        for pair in samples.windows(2) {
+            if known_gaps.spans().iter().any(|gap| {
+                gap.start_us() < pair[1].ts_us() && gap.end_us() > pair[0].ts_us()
+            }) {
+                continue;
+            }
+            if let Some(fact) = EventFact::from_metadata_change(*descriptor, pair[0], pair[1])
+                .map_err(|_error| BuildError::Internal)?
+            {
+                push_fact(&mut facts, fact, bounds)?;
+            }
+        }
+    }
+
+    derive_sender_disappearances(gauges, states, known_gaps, bounds, &mut facts)?;
+
     let mut totals = BTreeMap::new();
     let mut available_by_key = BTreeMap::new();
     for descriptor in gauges.series() {
@@ -1237,6 +1269,85 @@ fn derive_metric_event_facts(
     Ok(facts)
 }
 
+fn derive_sender_disappearances(
+    gauges: &GaugeSamplesBlock,
+    states: &EntityStatesBlock,
+    known_gaps: &Coverage,
+    bounds: &Bounds,
+    facts: &mut Vec<EventFact>,
+) -> Result<(), BuildError> {
+    let mut boundaries =
+        BTreeMap::<u32, Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
+    let mut snapshots = BTreeMap::<
+        (u32, i64),
+        BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
+    >::new();
+    for record in states.records() {
+        let descriptor = series_descriptor(gauges.series(), record.series_id)?;
+        match kronika_analytics::overview::MetricFactor::from_id(descriptor.factor_id) {
+            Some(
+                kronika_analytics::overview::MetricFactor::PgReplicationSenderSnapshotPopulation,
+            ) => boundaries
+                .entry(descriptor.source_type_id)
+                .or_default()
+                .push((descriptor, *record)),
+            Some(kronika_analytics::overview::MetricFactor::PgReplicationSenderState) => {
+                snapshots
+                    .entry((descriptor.source_type_id, record.ts_us))
+                    .or_default()
+                    .insert(descriptor.series_id, (descriptor, *record));
+            }
+            _ => {}
+        }
+    }
+    for (source_type, source_boundaries) in &mut boundaries {
+        source_boundaries.sort_unstable_by_key(|(_descriptor, record)| record.ts_us);
+        for pair in source_boundaries.windows(2) {
+            let previous = pair[0].1;
+            let (current_descriptor, current) = pair[1];
+            if previous.population_total == 0
+                || previous.population_total != current.population_total
+                || known_gaps.spans().iter().any(|gap| {
+                    gap.start_us() < current.ts_us && gap.end_us() > previous.ts_us
+                })
+            {
+                continue;
+            }
+            let empty = BTreeMap::new();
+            let previous_entities = snapshots
+                .get(&(*source_type, previous.ts_us))
+                .unwrap_or(&empty);
+            let current_entities = snapshots
+                .get(&(*source_type, current.ts_us))
+                .unwrap_or(&empty);
+            let current_sample = GaugeSample::new(
+                current_descriptor.series_id,
+                current.ts_us,
+                f64::from(current.state_code),
+            )
+            .expect("u32 population is finite");
+            for (series_id, (sender_descriptor, sender)) in previous_entities {
+                if current_entities.contains_key(series_id) {
+                    continue;
+                }
+                if let Some(fact) = EventFact::from_sender_disappearance(
+                    *sender_descriptor,
+                    sender.ts_us,
+                    sender.state_code,
+                    current_descriptor,
+                    current_sample,
+                    u64::from(current.state_code),
+                )
+                .map_err(|_error| BuildError::Internal)?
+                {
+                    push_fact(facts, fact, bounds)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn series_descriptor(
     series: &[MetricSeriesDescriptor],
     id: MetricSeriesId,
@@ -1278,6 +1389,7 @@ fn promote_metrics(
     let mut gauges = Vec::new();
     let mut entity_states = Vec::new();
     let mut factor_coverage = Vec::new();
+    let mut event_facts = Vec::new();
     for part in parts {
         if !merge_metric_series(
             &mut counter_series,
@@ -1310,6 +1422,20 @@ fn promote_metrics(
             part.loss_coverage.factor_coverage(),
             bounds.items_per_block,
         )?;
+        for fact in part.event_facts.iter().filter(|fact| {
+            matches!(
+                fact.kind(),
+                kronika_analytics::overview::EventKind::CollectorSnapshotGap
+                    | kronika_analytics::overview::EventKind::CollectorSourceReadFailure
+                    | kronika_analytics::overview::EventKind::CollectorVisibilityRestricted
+            )
+        }) {
+            checked_extend(
+                &mut event_facts,
+                std::slice::from_ref(fact),
+                bounds.items_per_block,
+            )?;
+        }
     }
     counters.sort_unstable_by_key(|sample| {
         (
@@ -1350,6 +1476,8 @@ fn promote_metrics(
         return Ok(None);
     }
     let reset_markers = reset_markers_for_samples(&counters);
+    event_facts.sort_by(EventFact::canonical_cmp);
+    event_facts.dedup_by_key(|fact| fact.fact_id());
     Ok(Some(MetricExtraction {
         descriptor_replacements: Vec::new(),
         counter_series: counter_series.into_values().collect(),
@@ -1359,6 +1487,7 @@ fn promote_metrics(
         reset_markers,
         entity_states,
         factor_coverage,
+        event_facts,
         pgm_body_read_stats: PgmBodyReadStats::default(),
     }))
 }

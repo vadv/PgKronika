@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use kronika_reader::{FallbackConfig, FallbackConfigError, GcConfig, GcConfigError};
 
-use crate::OverviewConfig;
+use crate::{OverviewColdConfig, OverviewConfig};
 use crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
 
 const OVERVIEW_CACHE_DIR_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_DIR";
@@ -23,10 +23,26 @@ const CACHE_MAX_LOGICAL_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_MAX_LOGICA
 const CACHE_MAX_FILES_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_MAX_FILES";
 const RESPONSE_CACHE_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES";
 const RESPONSE_CACHE_ENTRIES_ENV: &str = "KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_ENTRIES";
+const DECODED_CACHE_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_DECODED_CACHE_BYTES";
+const DECODED_CACHE_ENTRIES_ENV: &str = "KRONIKA_WEB_OVERVIEW_DECODED_CACHE_ENTRIES";
+const SOURCE_SCRUB_INTERVAL_ENV: &str = "KRONIKA_WEB_OVERVIEW_SOURCE_SCRUB_INTERVAL_S";
 const CURSOR_MAX_VIEWS_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS";
 const CURSOR_MAX_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_MAX_BYTES";
 const CURSOR_TTL_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_TTL_S";
 const MAX_SELECTED_SEGMENTS_ENV: &str = "KRONIKA_WEB_OVERVIEW_MAX_SELECTED_SEGMENTS";
+const COLD_MAX_WORKERS_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_MAX_WORKERS";
+const COLD_MAX_QUEUE_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_MAX_QUEUE";
+const COLD_PER_REQUEST_PARALLELISM_ENV: &str =
+    "KRONIKA_WEB_OVERVIEW_COLD_PER_REQUEST_PARALLELISM";
+const COLD_WAIT_TIMEOUT_MS_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_WAIT_TIMEOUT_MS";
+const COLD_RETRY_AFTER_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_RETRY_AFTER_S";
+const COLD_PGM_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_PGM_BYTES";
+const COLD_DECODED_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_DECODED_BYTES";
+const COLD_CPU_ROWS_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_CPU_ROWS";
+const COLD_FILE_DESCRIPTORS_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_FILE_DESCRIPTORS";
+const COLD_READ_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_READ_BYTES";
+const COLD_WRITE_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_WRITE_BYTES";
+const COLD_PUBLICATIONS_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_PUBLICATIONS";
 
 /// Normalises a request's method and matched path into metric label values.
 ///
@@ -97,24 +113,43 @@ struct OverviewConfigRaw<'a> {
     cache_max_files: Option<&'a str>,
     response_cache_bytes: Option<&'a str>,
     response_cache_entries: Option<&'a str>,
+    decoded_cache_bytes: Option<&'a str>,
+    decoded_cache_entries: Option<&'a str>,
+    source_scrub_interval_secs: Option<&'a str>,
     cursor_max_views: Option<&'a str>,
     cursor_max_bytes: Option<&'a str>,
     cursor_ttl_secs: Option<&'a str>,
     max_selected_segments: Option<&'a str>,
+    cold_max_workers: Option<&'a str>,
+    cold_max_queue: Option<&'a str>,
+    cold_per_request_parallelism: Option<&'a str>,
+    cold_wait_timeout_ms: Option<&'a str>,
+    cold_retry_after_secs: Option<&'a str>,
+    cold_pgm_bytes: Option<&'a str>,
+    cold_decoded_bytes: Option<&'a str>,
+    cold_cpu_rows: Option<&'a str>,
+    cold_file_descriptors: Option<&'a str>,
+    cold_read_bytes: Option<&'a str>,
+    cold_write_bytes: Option<&'a str>,
+    cold_publications: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedOverviewConfig {
     cache_dir: PathBuf,
-    namespace: Option<Vec<u8>>,
+    namespace: Vec<u8>,
     fallback: FallbackConfig,
     gc: GcConfig,
     response_cache_bytes: usize,
     response_cache_entries: usize,
+    decoded_cache_bytes: usize,
+    decoded_cache_entries: usize,
+    source_scrub_interval: Duration,
     cursor_max_views: usize,
     cursor_max_bytes: usize,
     cursor_ttl: Duration,
     max_selected_segments: usize,
+    cold: OverviewColdConfig,
 }
 
 fn parse_overview_config(
@@ -129,8 +164,8 @@ fn parse_overview_config(
     };
     let namespace = match raw.namespace {
         Some("") => return Err(format!("{OVERVIEW_NAMESPACE_ENV} must not be empty")),
-        Some(namespace) => Some(namespace.as_bytes().to_vec()),
-        None => None,
+        Some(namespace) => namespace.as_bytes().to_vec(),
+        None => return Err(format!("{OVERVIEW_NAMESPACE_ENV} is not set")),
     };
     let fallback_segment_hours = parse_nonzero_u64(
         raw.fallback_segment_hours,
@@ -164,6 +199,21 @@ fn parse_overview_config(
         RESPONSE_CACHE_ENTRIES_ENV,
         defaults.response_cache_entries,
     )?;
+    let decoded_cache_bytes = parse_nonzero_usize(
+        raw.decoded_cache_bytes,
+        DECODED_CACHE_BYTES_ENV,
+        defaults.decoded_cache_bytes,
+    )?;
+    let decoded_cache_entries = parse_nonzero_usize(
+        raw.decoded_cache_entries,
+        DECODED_CACHE_ENTRIES_ENV,
+        defaults.decoded_cache_entries,
+    )?;
+    let source_scrub_interval = Duration::from_secs(parse_nonzero_u64(
+        raw.source_scrub_interval_secs,
+        SOURCE_SCRUB_INTERVAL_ENV,
+        defaults.source_scrub_interval.as_secs(),
+    )?);
     let cursor_max_views = parse_nonzero_usize(
         raw.cursor_max_views,
         CURSOR_MAX_VIEWS_ENV,
@@ -189,6 +239,7 @@ fn parse_overview_config(
             "{MAX_SELECTED_SEGMENTS_ENV} must be at most {ABSOLUTE_MAX_SELECTED_SEGMENTS}"
         ));
     }
+    let cold = parse_cold_config(raw, defaults.cold)?;
     Ok(ParsedOverviewConfig {
         cache_dir,
         namespace,
@@ -196,10 +247,82 @@ fn parse_overview_config(
         gc,
         response_cache_bytes,
         response_cache_entries,
+        decoded_cache_bytes,
+        decoded_cache_entries,
+        source_scrub_interval,
         cursor_max_views,
         cursor_max_bytes,
         cursor_ttl: Duration::from_secs(cursor_ttl_secs),
         max_selected_segments,
+        cold,
+    })
+}
+
+fn parse_cold_config(
+    raw: OverviewConfigRaw<'_>,
+    defaults: OverviewColdConfig,
+) -> Result<OverviewColdConfig, String> {
+    Ok(OverviewColdConfig {
+        max_workers: parse_nonzero_u32(
+            raw.cold_max_workers,
+            COLD_MAX_WORKERS_ENV,
+            defaults.max_workers,
+        )?,
+        max_queue: parse_nonzero_usize(
+            raw.cold_max_queue,
+            COLD_MAX_QUEUE_ENV,
+            defaults.max_queue,
+        )?,
+        per_request_parallelism: parse_nonzero_usize(
+            raw.cold_per_request_parallelism,
+            COLD_PER_REQUEST_PARALLELISM_ENV,
+            defaults.per_request_parallelism,
+        )?,
+        wait_timeout: Duration::from_millis(parse_nonzero_u64(
+            raw.cold_wait_timeout_ms,
+            COLD_WAIT_TIMEOUT_MS_ENV,
+            u64::try_from(defaults.wait_timeout.as_millis()).unwrap_or(u64::MAX),
+        )?),
+        retry_after_seconds: parse_nonzero_u64(
+            raw.cold_retry_after_secs,
+            COLD_RETRY_AFTER_ENV,
+            defaults.retry_after_seconds,
+        )?,
+        pgm_bytes: parse_nonzero_u64(
+            raw.cold_pgm_bytes,
+            COLD_PGM_BYTES_ENV,
+            defaults.pgm_bytes,
+        )?,
+        decoded_bytes: parse_nonzero_u64(
+            raw.cold_decoded_bytes,
+            COLD_DECODED_BYTES_ENV,
+            defaults.decoded_bytes,
+        )?,
+        cpu_rows: parse_nonzero_u64(
+            raw.cold_cpu_rows,
+            COLD_CPU_ROWS_ENV,
+            defaults.cpu_rows,
+        )?,
+        file_descriptors: parse_nonzero_u32(
+            raw.cold_file_descriptors,
+            COLD_FILE_DESCRIPTORS_ENV,
+            defaults.file_descriptors,
+        )?,
+        read_bytes: parse_nonzero_u64(
+            raw.cold_read_bytes,
+            COLD_READ_BYTES_ENV,
+            defaults.read_bytes,
+        )?,
+        write_bytes: parse_nonzero_u64(
+            raw.cold_write_bytes,
+            COLD_WRITE_BYTES_ENV,
+            defaults.write_bytes,
+        )?,
+        publications: parse_nonzero_u32(
+            raw.cold_publications,
+            COLD_PUBLICATIONS_ENV,
+            defaults.publications,
+        )?,
     })
 }
 
@@ -295,9 +418,8 @@ pub struct WebConfig {
     pub log: String,
     /// Durable overview fact-cache directory.
     pub overview_cache_dir: PathBuf,
-    /// Explicit stable overview namespace; `None` derives it from the canonical
-    /// store path at startup.
-    pub overview_namespace: Option<Vec<u8>>,
+    /// Explicit stable overview namespace.
+    pub overview_namespace: Vec<u8>,
     /// Bounded fallback used only after recoverable durable-publication failure.
     pub overview_fallback: FallbackConfig,
     /// Bounded GC and optional hard durable-cache quota.
@@ -306,6 +428,12 @@ pub struct WebConfig {
     pub overview_response_cache_bytes: usize,
     /// Serialized overview/health response-cache entry ceiling.
     pub overview_response_cache_entries: usize,
+    /// Decoded sealed-fact L2 byte ceiling.
+    pub overview_decoded_cache_bytes: usize,
+    /// Decoded sealed-fact L2 entry ceiling.
+    pub overview_decoded_cache_entries: usize,
+    /// Streaming source CRC scrub cadence.
+    pub overview_source_scrub_interval: Duration,
     /// Maximum simultaneously pinned event views.
     pub overview_cursor_max_views: usize,
     /// Logical-byte ceiling for cursor-pinned event views.
@@ -314,6 +442,8 @@ pub struct WebConfig {
     pub overview_cursor_ttl: Duration,
     /// Effective selected sealed-segment request limit.
     pub overview_max_selected_segments: usize,
+    /// Process-wide cold sealed-fact construction policy.
+    pub overview_cold: OverviewColdConfig,
 }
 
 impl std::fmt::Debug for WebConfig {
@@ -331,10 +461,7 @@ impl std::fmt::Debug for WebConfig {
             .field("overview_cache_dir", &self.overview_cache_dir)
             .field(
                 "overview_namespace",
-                &self
-                    .overview_namespace
-                    .as_ref()
-                    .map(|namespace| format!("<{} bytes>", namespace.len())),
+                &format!("<{} bytes>", self.overview_namespace.len()),
             )
             .field("overview_fallback", &self.overview_fallback)
             .field("overview_gc", &self.overview_gc)
@@ -346,6 +473,18 @@ impl std::fmt::Debug for WebConfig {
                 "overview_response_cache_entries",
                 &self.overview_response_cache_entries,
             )
+            .field(
+                "overview_decoded_cache_bytes",
+                &self.overview_decoded_cache_bytes,
+            )
+            .field(
+                "overview_decoded_cache_entries",
+                &self.overview_decoded_cache_entries,
+            )
+            .field(
+                "overview_source_scrub_interval",
+                &self.overview_source_scrub_interval,
+            )
             .field("overview_cursor_max_views", &self.overview_cursor_max_views)
             .field("overview_cursor_max_bytes", &self.overview_cursor_max_bytes)
             .field("overview_cursor_ttl", &self.overview_cursor_ttl)
@@ -353,6 +492,7 @@ impl std::fmt::Debug for WebConfig {
                 "overview_max_selected_segments",
                 &self.overview_max_selected_segments,
             )
+            .field("overview_cold", &self.overview_cold)
             .finish()
     }
 }
@@ -377,7 +517,10 @@ impl WebConfig {
             basic_auth_raw,
             stale_raw,
             log,
-            OverviewConfigRaw::default(),
+            OverviewConfigRaw {
+                namespace: Some("test"),
+                ..OverviewConfigRaw::default()
+            },
         )
     }
 
@@ -415,10 +558,14 @@ impl WebConfig {
             overview_gc: overview.gc,
             overview_response_cache_bytes: overview.response_cache_bytes,
             overview_response_cache_entries: overview.response_cache_entries,
+            overview_decoded_cache_bytes: overview.decoded_cache_bytes,
+            overview_decoded_cache_entries: overview.decoded_cache_entries,
+            overview_source_scrub_interval: overview.source_scrub_interval,
             overview_cursor_max_views: overview.cursor_max_views,
             overview_cursor_max_bytes: overview.cursor_max_bytes,
             overview_cursor_ttl: overview.cursor_ttl,
             overview_max_selected_segments: overview.max_selected_segments,
+            overview_cold: overview.cold,
         })
     }
 
@@ -450,10 +597,26 @@ impl WebConfig {
         let cache_max_files = std::env::var(CACHE_MAX_FILES_ENV).ok();
         let response_cache_bytes = std::env::var(RESPONSE_CACHE_BYTES_ENV).ok();
         let response_cache_entries = std::env::var(RESPONSE_CACHE_ENTRIES_ENV).ok();
+        let decoded_cache_bytes = std::env::var(DECODED_CACHE_BYTES_ENV).ok();
+        let decoded_cache_entries = std::env::var(DECODED_CACHE_ENTRIES_ENV).ok();
+        let source_scrub_interval_secs = std::env::var(SOURCE_SCRUB_INTERVAL_ENV).ok();
         let cursor_max_views = std::env::var(CURSOR_MAX_VIEWS_ENV).ok();
         let cursor_max_bytes = std::env::var(CURSOR_MAX_BYTES_ENV).ok();
         let cursor_ttl_secs = std::env::var(CURSOR_TTL_ENV).ok();
         let max_selected_segments = std::env::var(MAX_SELECTED_SEGMENTS_ENV).ok();
+        let cold_max_workers = std::env::var(COLD_MAX_WORKERS_ENV).ok();
+        let cold_max_queue = std::env::var(COLD_MAX_QUEUE_ENV).ok();
+        let cold_per_request_parallelism =
+            std::env::var(COLD_PER_REQUEST_PARALLELISM_ENV).ok();
+        let cold_wait_timeout_ms = std::env::var(COLD_WAIT_TIMEOUT_MS_ENV).ok();
+        let cold_retry_after_secs = std::env::var(COLD_RETRY_AFTER_ENV).ok();
+        let cold_pgm_bytes = std::env::var(COLD_PGM_BYTES_ENV).ok();
+        let cold_decoded_bytes = std::env::var(COLD_DECODED_BYTES_ENV).ok();
+        let cold_cpu_rows = std::env::var(COLD_CPU_ROWS_ENV).ok();
+        let cold_file_descriptors = std::env::var(COLD_FILE_DESCRIPTORS_ENV).ok();
+        let cold_read_bytes = std::env::var(COLD_READ_BYTES_ENV).ok();
+        let cold_write_bytes = std::env::var(COLD_WRITE_BYTES_ENV).ok();
+        let cold_publications = std::env::var(COLD_PUBLICATIONS_ENV).ok();
 
         Self::parse_with_overview(
             &dir,
@@ -474,10 +637,25 @@ impl WebConfig {
                 cache_max_files: cache_max_files.as_deref(),
                 response_cache_bytes: response_cache_bytes.as_deref(),
                 response_cache_entries: response_cache_entries.as_deref(),
+                decoded_cache_bytes: decoded_cache_bytes.as_deref(),
+                decoded_cache_entries: decoded_cache_entries.as_deref(),
+                source_scrub_interval_secs: source_scrub_interval_secs.as_deref(),
                 cursor_max_views: cursor_max_views.as_deref(),
                 cursor_max_bytes: cursor_max_bytes.as_deref(),
                 cursor_ttl_secs: cursor_ttl_secs.as_deref(),
                 max_selected_segments: max_selected_segments.as_deref(),
+                cold_max_workers: cold_max_workers.as_deref(),
+                cold_max_queue: cold_max_queue.as_deref(),
+                cold_per_request_parallelism: cold_per_request_parallelism.as_deref(),
+                cold_wait_timeout_ms: cold_wait_timeout_ms.as_deref(),
+                cold_retry_after_secs: cold_retry_after_secs.as_deref(),
+                cold_pgm_bytes: cold_pgm_bytes.as_deref(),
+                cold_decoded_bytes: cold_decoded_bytes.as_deref(),
+                cold_cpu_rows: cold_cpu_rows.as_deref(),
+                cold_file_descriptors: cold_file_descriptors.as_deref(),
+                cold_read_bytes: cold_read_bytes.as_deref(),
+                cold_write_bytes: cold_write_bytes.as_deref(),
+                cold_publications: cold_publications.as_deref(),
             },
         )
     }
@@ -486,6 +664,13 @@ impl WebConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_overview_raw() -> OverviewConfigRaw<'static> {
+        OverviewConfigRaw {
+            namespace: Some("test"),
+            ..OverviewConfigRaw::default()
+        }
+    }
 
     #[test]
     fn metric_labels_known_path_is_preserved() {
@@ -599,26 +784,36 @@ mod tests {
             cfg.overview_cache_dir,
             PathBuf::from("/data/.pgkronika-overview-cache")
         );
-        assert!(cfg.overview_namespace.is_none());
+        assert_eq!(cfg.overview_namespace, b"test".to_vec());
     }
 
     #[test]
     fn overview_raw_defaults_match_runtime_overview_defaults() {
         let cache_dir = PathBuf::from("/data/cache");
-        let parsed = parse_overview_config(OverviewConfigRaw::default(), cache_dir.clone())
+        let parsed = parse_overview_config(
+            OverviewConfigRaw {
+                namespace: Some("default"),
+                ..OverviewConfigRaw::default()
+            },
+            cache_dir.clone(),
+        )
             .expect("default overview policy is valid");
         let defaults = OverviewConfig::new(cache_dir.clone(), b"default".to_vec());
         let expected = ParsedOverviewConfig {
             cache_dir,
-            namespace: None,
+            namespace: b"default".to_vec(),
             fallback: defaults.fallback,
             gc: defaults.gc,
             response_cache_bytes: defaults.response_cache_bytes,
             response_cache_entries: defaults.response_cache_entries,
+            decoded_cache_bytes: defaults.decoded_cache_bytes,
+            decoded_cache_entries: defaults.decoded_cache_entries,
+            source_scrub_interval: defaults.source_scrub_interval,
             cursor_max_views: defaults.cursor_max_views,
             cursor_max_bytes: defaults.cursor_max_bytes,
             cursor_ttl: defaults.cursor_ttl,
             max_selected_segments: defaults.max_selected_segments,
+            cold: defaults.cold,
         };
         assert_eq!(parsed, expected);
         assert_eq!(
@@ -633,7 +828,7 @@ mod tests {
             let parsed = parse_overview_config(
                 OverviewConfigRaw {
                     max_selected_segments: Some(raw),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
                 PathBuf::from("/cache"),
             )
@@ -648,7 +843,7 @@ mod tests {
             let error = parse_overview_config(
                 OverviewConfigRaw {
                     max_selected_segments: Some(raw),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
                 PathBuf::from("/cache"),
             )
@@ -682,11 +877,26 @@ mod tests {
                 cursor_max_bytes: Some("4194304"),
                 cursor_ttl_secs: Some("60"),
                 max_selected_segments: Some("4096"),
+                decoded_cache_bytes: Some("16777216"),
+                decoded_cache_entries: Some("64"),
+                source_scrub_interval_secs: Some("30"),
+                cold_max_workers: Some("2"),
+                cold_max_queue: Some("8"),
+                cold_per_request_parallelism: Some("2"),
+                cold_wait_timeout_ms: Some("250"),
+                cold_retry_after_secs: Some("3"),
+                cold_pgm_bytes: Some("33554432"),
+                cold_decoded_bytes: Some("67108864"),
+                cold_cpu_rows: Some("131072"),
+                cold_file_descriptors: Some("8"),
+                cold_read_bytes: Some("134217728"),
+                cold_write_bytes: Some("67108864"),
+                cold_publications: Some("2"),
             },
         )
         .expect("custom overview policy is valid");
         assert_eq!(cfg.overview_cache_dir, PathBuf::from("/cache"));
-        assert_eq!(cfg.overview_namespace, Some(b"deployment-a".to_vec()));
+        assert_eq!(cfg.overview_namespace, b"deployment-a".to_vec());
         assert_eq!(
             cfg.overview_fallback,
             FallbackConfig::new(48, 1_048_576).expect("fixture fallback is valid")
@@ -705,10 +915,33 @@ mod tests {
         );
         assert_eq!(cfg.overview_response_cache_bytes, 2_097_152);
         assert_eq!(cfg.overview_response_cache_entries, 128);
+        assert_eq!(cfg.overview_decoded_cache_bytes, 16_777_216);
+        assert_eq!(cfg.overview_decoded_cache_entries, 64);
+        assert_eq!(
+            cfg.overview_source_scrub_interval,
+            Duration::from_secs(30)
+        );
         assert_eq!(cfg.overview_cursor_max_views, 16);
         assert_eq!(cfg.overview_cursor_max_bytes, 4_194_304);
         assert_eq!(cfg.overview_cursor_ttl, Duration::from_mins(1));
         assert_eq!(cfg.overview_max_selected_segments, 4_096);
+        assert_eq!(
+            cfg.overview_cold,
+            OverviewColdConfig {
+                max_workers: 2,
+                max_queue: 8,
+                per_request_parallelism: 2,
+                wait_timeout: Duration::from_millis(250),
+                retry_after_seconds: 3,
+                pgm_bytes: 33_554_432,
+                decoded_bytes: 67_108_864,
+                cpu_rows: 131_072,
+                file_descriptors: 8,
+                read_bytes: 134_217_728,
+                write_bytes: 67_108_864,
+                publications: 2,
+            }
+        );
     }
 
     #[test]
@@ -738,91 +971,91 @@ mod tests {
                 FALLBACK_SEGMENT_HOURS_ENV,
                 OverviewConfigRaw {
                     fallback_segment_hours: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 FALLBACK_BYTES_ENV,
                 OverviewConfigRaw {
                     fallback_bytes: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 GC_MAX_ENTRIES_ENV,
                 OverviewConfigRaw {
                     gc_max_entries: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 GC_GRACE_GENERATIONS_ENV,
                 OverviewConfigRaw {
                     gc_grace_generations: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 GC_WALL_GRACE_ENV,
                 OverviewConfigRaw {
                     gc_wall_grace_secs: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 GC_ARTIFACT_GRACE_ENV,
                 OverviewConfigRaw {
                     gc_artifact_grace_secs: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 CACHE_MAX_LOGICAL_BYTES_ENV,
                 OverviewConfigRaw {
                     cache_max_logical_bytes: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 CACHE_MAX_FILES_ENV,
                 OverviewConfigRaw {
                     cache_max_files: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 RESPONSE_CACHE_BYTES_ENV,
                 OverviewConfigRaw {
                     response_cache_bytes: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 RESPONSE_CACHE_ENTRIES_ENV,
                 OverviewConfigRaw {
                     response_cache_entries: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 CURSOR_MAX_VIEWS_ENV,
                 OverviewConfigRaw {
                     cursor_max_views: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 CURSOR_MAX_BYTES_ENV,
                 OverviewConfigRaw {
                     cursor_max_bytes: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
             (
                 CURSOR_TTL_ENV,
                 OverviewConfigRaw {
                     cursor_ttl_secs: Some("0"),
-                    ..OverviewConfigRaw::default()
+                    ..valid_overview_raw()
                 },
             ),
         ];
@@ -839,7 +1072,7 @@ mod tests {
         let error = parse_overview_config(
             OverviewConfigRaw {
                 fallback_segment_hours: Some(&value),
-                ..OverviewConfigRaw::default()
+                ..valid_overview_raw()
             },
             PathBuf::from("/cache"),
         )
@@ -854,7 +1087,7 @@ mod tests {
         let error = parse_overview_config(
             OverviewConfigRaw {
                 fallback_bytes: Some(&value),
-                ..OverviewConfigRaw::default()
+                ..valid_overview_raw()
             },
             PathBuf::from("/cache"),
         )

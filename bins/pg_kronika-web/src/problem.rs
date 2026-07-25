@@ -37,7 +37,7 @@ closed_string_enum! {
         QueryLimitExceeded => "query_limit_exceeded",
         CursorCapacityUnavailable => "cursor_capacity_unavailable",
         AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
-        OverviewCapacityUnavailable => "overview_capacity_unavailable",
+        ColdBuildOverloaded => "cold_build_overloaded",
         StoreReadFailed => "store_read_failed",
         InternalError => "internal_error",
     }
@@ -60,7 +60,7 @@ impl ProblemCode {
             Self::QueryLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
             Self::CursorCapacityUnavailable
             | Self::AnalyticCapacityUnavailable
-            | Self::OverviewCapacityUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::ColdBuildOverloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::StoreReadFailed | Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -91,8 +91,8 @@ impl ProblemCode {
             Self::AnalyticCapacityUnavailable => {
                 "https://pgkronika.dev/problems/analytic-capacity-unavailable"
             }
-            Self::OverviewCapacityUnavailable => {
-                "https://pgkronika.dev/problems/overview-capacity-unavailable"
+            Self::ColdBuildOverloaded => {
+                "https://pgkronika.dev/problems/cold-build-overloaded"
             }
             Self::StoreReadFailed => "https://pgkronika.dev/problems/store-read-failed",
             Self::InternalError => "https://pgkronika.dev/problems/internal-error",
@@ -304,6 +304,8 @@ pub(crate) struct ApiProblem {
     request_id: String,
     #[serde(skip)]
     allow: Option<&'static str>,
+    #[serde(skip)]
+    retry_after_seconds: Option<u64>,
 }
 
 impl ApiProblem {
@@ -317,6 +319,7 @@ impl ApiProblem {
             instance: format!("https://pgkronika.dev/problems/occurrences/{request_id}"),
             request_id,
             allow: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -432,21 +435,25 @@ impl ApiProblem {
     }
 
     pub(crate) fn analytic_capacity_unavailable() -> Self {
-        Self::new(
+        let mut problem = Self::new(
             ProblemCode::AnalyticCapacityUnavailable,
             ProblemParams::Capacity(CapacityParams {
                 retry_after_seconds: RETRY_AFTER_SECONDS,
             }),
-        )
+        );
+        problem.retry_after_seconds = Some(RETRY_AFTER_SECONDS);
+        problem
     }
 
-    pub(crate) fn overview_capacity_unavailable() -> Self {
-        Self::new(
-            ProblemCode::OverviewCapacityUnavailable,
+    pub(crate) fn cold_build_overloaded(retry_after_seconds: u64) -> Self {
+        let mut problem = Self::new(
+            ProblemCode::ColdBuildOverloaded,
             ProblemParams::Capacity(CapacityParams {
-                retry_after_seconds: RETRY_AFTER_SECONDS,
+                retry_after_seconds,
             }),
-        )
+        );
+        problem.retry_after_seconds = Some(retry_after_seconds);
+        problem
     }
 
     pub(crate) fn store_read_failed() -> Self {
@@ -506,6 +513,7 @@ impl IntoResponse for ApiProblem {
             );
         }
         let allow = self.allow.take();
+        let retry_after_seconds = self.retry_after_seconds;
         let mut response = (status, Json(self)).into_response();
         let headers = response.headers_mut();
         headers.insert(
@@ -526,8 +534,10 @@ impl IntoResponse for ApiProblem {
                     headers.insert(header::ALLOW, HeaderValue::from_static(allow));
                 }
             }
-            ProblemCode::AnalyticCapacityUnavailable | ProblemCode::OverviewCapacityUnavailable => {
-                headers.insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS));
+            ProblemCode::AnalyticCapacityUnavailable | ProblemCode::ColdBuildOverloaded => {
+                if let Some(seconds) = retry_after_seconds {
+                    headers.insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+                }
             }
             _ => {}
         }

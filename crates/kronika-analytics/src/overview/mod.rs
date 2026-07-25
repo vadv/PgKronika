@@ -91,7 +91,10 @@ pub const CONTAINER_VERSION: u16 = 1;
 pub const FACT_SCHEMA_VERSION: u32 = 2;
 
 /// Version for PGM-to-fact extraction and normalization.
-pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 2;
+///
+/// Version 3 adds reset/postmaster markers, complete empty-snapshot
+/// boundaries, entity disappearance, and retained collector-loss facts.
+pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 3;
 
 /// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///

@@ -114,7 +114,6 @@ pub(crate) mod startup;
 
 pub use auth::AuthConfig;
 use auth::require_basic_auth;
-use overview::admission::ColdAdmissionConfig;
 pub use overview::live::OverviewBuildError;
 use overview::selection::{
     ABSOLUTE_MAX_SELECTED_SEGMENTS, DEFAULT_MAX_SELECTED_SEGMENTS, SelectedSealedPlan,
@@ -175,6 +174,57 @@ pub(crate) enum TimelineFlightRole {
     Follower(Arc<TimelineFlight>),
 }
 
+/// Process-wide policy for cold sealed-fact construction.
+///
+/// Byte and row limits are rounded up to the scheduler's fixed accounting
+/// quanta. All fields must be non-zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverviewColdConfig {
+    /// Maximum active sealed-fact workers.
+    pub max_workers: u32,
+    /// Maximum queued exact fact builds.
+    pub max_queue: usize,
+    /// Maximum concurrent fact loads started by one request.
+    pub per_request_parallelism: usize,
+    /// Maximum time a request may wait in the FIFO admission queue.
+    pub wait_timeout: Duration,
+    /// Stable `Retry-After` value returned for cold-build overload.
+    pub retry_after_seconds: u64,
+    /// Aggregate source-PGM bytes admitted at once.
+    pub pgm_bytes: u64,
+    /// Aggregate decoded working-set bytes admitted at once.
+    pub decoded_bytes: u64,
+    /// Aggregate source rows charged as CPU work at once.
+    pub cpu_rows: u64,
+    /// Aggregate file descriptors reserved for cold work.
+    pub file_descriptors: u32,
+    /// Aggregate source and durable-cache read bytes admitted at once.
+    pub read_bytes: u64,
+    /// Aggregate durable-cache write bytes admitted at once.
+    pub write_bytes: u64,
+    /// Aggregate durable publications admitted at once.
+    pub publications: u32,
+}
+
+impl Default for OverviewColdConfig {
+    fn default() -> Self {
+        Self {
+            max_workers: 4,
+            max_queue: 64,
+            per_request_parallelism: 4,
+            wait_timeout: Duration::from_secs(5),
+            retry_after_seconds: 1,
+            pgm_bytes: 1024 * 1024 * 1024,
+            decoded_bytes: 1024 * 1024 * 1024,
+            cpu_rows: 32 * 65_536,
+            file_descriptors: 16,
+            read_bytes: 1024 * 1024 * 1024,
+            write_bytes: 1024 * 1024 * 1024,
+            publications: 4,
+        }
+    }
+}
+
 /// Explicit overview storage and memory policy.
 #[derive(Debug, Clone)]
 pub struct OverviewConfig {
@@ -190,6 +240,12 @@ pub struct OverviewConfig {
     pub response_cache_bytes: usize,
     /// Secondary serialized-response entry ceiling.
     pub response_cache_entries: usize,
+    /// Logical decoded-fact L2 byte ceiling.
+    pub decoded_cache_bytes: usize,
+    /// Secondary decoded-fact L2 entry ceiling.
+    pub decoded_cache_entries: usize,
+    /// Cadence for streaming CRC scrub of one sealed source section.
+    pub source_scrub_interval: Duration,
     /// Maximum simultaneously pinned event views.
     pub cursor_max_views: usize,
     /// Logical byte ceiling for pinned event views.
@@ -198,7 +254,8 @@ pub struct OverviewConfig {
     pub cursor_ttl: Duration,
     /// Effective selected sealed-segment limit.
     pub max_selected_segments: usize,
-    cold_admission: ColdAdmissionConfig,
+    /// Process-wide cold sealed-fact construction policy.
+    pub cold: OverviewColdConfig,
 }
 
 impl OverviewConfig {
@@ -213,11 +270,14 @@ impl OverviewConfig {
             gc: GcConfig::default(),
             response_cache_bytes: RESPONSE_CACHE_BYTES,
             response_cache_entries: RESPONSE_CACHE_ENTRIES,
+            decoded_cache_bytes: 256 * 1024 * 1024,
+            decoded_cache_entries: 4_096,
+            source_scrub_interval: Duration::from_secs(60),
             cursor_max_views: 64,
             cursor_max_bytes: 512 * 1024 * 1024,
             cursor_ttl: Duration::from_mins(5),
             max_selected_segments: DEFAULT_MAX_SELECTED_SEGMENTS,
-            cold_admission: ColdAdmissionConfig::default(),
+            cold: OverviewColdConfig::default(),
         }
     }
 }
@@ -440,11 +500,14 @@ impl AppState {
             gc,
             response_cache_bytes,
             response_cache_entries,
+            decoded_cache_bytes,
+            decoded_cache_entries,
+            source_scrub_interval,
             cursor_max_views,
             cursor_max_bytes,
             cursor_ttl,
             max_selected_segments,
-            cold_admission,
+            cold,
         } = config;
         if max_selected_segments == 0 || max_selected_segments > ABSOLUTE_MAX_SELECTED_SEGMENTS {
             return Err(StateBuildError::Overview(
@@ -464,13 +527,19 @@ impl AppState {
             .refresh_incremental_delta()
             .map_err(StateBuildError::Snapshot)?;
         let mut overview =
-            overview::OverviewIndex::with_gc_config(cache_root, namespace, fallback, gc)
+            overview::OverviewIndex::with_runtime_config(
+                cache_root,
+                namespace,
+                fallback,
+                gc,
+                source_scrub_interval,
+            )
                 .map_err(StateBuildError::Overview)?;
         let timeline = overview
             .assemble(&snapshot, &delta)
             .map_err(StateBuildError::Overview)?;
         let overview_loader = overview
-            .fact_loader(cold_admission)
+            .fact_loader(cold, decoded_cache_bytes, decoded_cache_entries)
             .map_err(StateBuildError::Overview)?;
         overview::resilience::record_persist_snapshot(overview.persist_mode());
         record_gc_metrics(None);

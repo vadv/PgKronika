@@ -56,8 +56,8 @@ fn problem_example(code: ProblemCode) -> (ApiProblem, serde_json::Value) {
             ApiProblem::analytic_capacity_unavailable(),
             serde_json::json!({ "retry_after_seconds": 1 }),
         ),
-        ProblemCode::OverviewCapacityUnavailable => (
-            ApiProblem::overview_capacity_unavailable(),
+        ProblemCode::ColdBuildOverloaded => (
+            ApiProblem::cold_build_overloaded(1),
             serde_json::json!({ "retry_after_seconds": 1 }),
         ),
         ProblemCode::StoreReadFailed => (ApiProblem::store_read_failed(), serde_json::json!({})),
@@ -114,7 +114,7 @@ async fn every_problem_code_has_the_exact_body_and_headers() {
                 .and_then(|value| value.to_str().ok()),
             matches!(
                 code,
-                ProblemCode::AnalyticCapacityUnavailable | ProblemCode::OverviewCapacityUnavailable
+                ProblemCode::AnalyticCapacityUnavailable | ProblemCode::ColdBuildOverloaded
             )
             .then(|| response.body["params"]["retry_after_seconds"].to_string())
             .as_deref()

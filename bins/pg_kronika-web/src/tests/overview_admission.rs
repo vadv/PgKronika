@@ -429,7 +429,7 @@ async fn a_cold_weight_above_capacity_is_a_typed_no_store_http_overload() {
     assert_problem(
         &response.body,
         StatusCode::SERVICE_UNAVAILABLE,
-        "overview_capacity_unavailable",
+        "cold_build_overloaded",
         serde_json::json!({ "retry_after_seconds": 1 }),
     );
     assert_eq!(

@@ -13,6 +13,7 @@ pub(crate) mod handlers;
 pub(crate) mod health;
 pub(crate) mod live;
 pub(crate) mod loader;
+pub(crate) mod memory_cache;
 pub(crate) mod resilience;
 pub(crate) mod selection;
 pub(crate) mod singleflight;

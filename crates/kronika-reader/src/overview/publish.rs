@@ -408,6 +408,53 @@ impl FactStore {
         self.gc_config
     }
 
+    /// Looks up durable or admitted fallback facts without extracting PGM
+    /// section bodies or attempting publication.
+    ///
+    /// A cache rejection is reported as `Ok(None)`: callers may then enter
+    /// cold-work admission and call [`Self::load_or_build`], which rechecks the
+    /// durable/fallback layers to close races with another process.
+    ///
+    /// # Errors
+    /// Returns [`BuildError`] only when the catalog cannot establish the
+    /// expected source identity needed for fallback lookup.
+    pub fn load_cached<R: ReadAt>(
+        &self,
+        unit: &PgmUnit<R>,
+        context: &SegmentContext,
+        bounds: &Bounds,
+    ) -> Result<Option<FactLoad>, BuildError> {
+        match self.read_with_stats(unit, context, bounds) {
+            Ok((facts, stats)) => {
+                let facts = Arc::new(facts);
+                self.discard_fallback_for(facts.identity(), facts.lineage());
+                Ok(Some(FactLoad {
+                    facts,
+                    origin: FactOrigin::CacheHit,
+                    rebuild_reason: None,
+                    persist_error: None,
+                    fact_read_stats: Some(stats),
+                    pgm_body_read_stats: PgmBodyReadStats::default(),
+                }))
+            }
+            Err(cache_error) => {
+                let rebuild_reason = cache_rebuild_reason(&cache_error);
+                let (identity, lineage) = SegmentFacts::provenance(unit, context)?;
+                let fallback_key = FallbackFactKey::for_expected(&identity, &lineage);
+                Ok(self
+                    .with_fallback(|fallback| fallback.get(&fallback_key, *bounds))
+                    .map(|facts| FactLoad {
+                        facts,
+                        origin: FactOrigin::FallbackHit,
+                        rebuild_reason: Some(rebuild_reason),
+                        persist_error: None,
+                        fact_read_stats: None,
+                        pgm_body_read_stats: PgmBodyReadStats::default(),
+                    }))
+            }
+        }
+    }
+
     /// Loads a committed fact file or extracts facts from the source PGM.
     ///
     /// Persistence is best effort. A successful source build is returned with

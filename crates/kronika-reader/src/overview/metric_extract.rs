@@ -10,10 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kronika_analytics::overview::{
     Applicability, BoundaryQuality, CadenceEpochId, CounterSample, CoverageSpan,
-    CoverageState, EntityKind, FactorCoverage, FactorId, GaugeSample, LossReason, MetricFactor,
-    MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality, PhysicalCountSemantics,
-    PopulationTotalQuality, ResetFamily, RetainedExactness, SourceCompleteness,
-    SourcePopulation, SourceScopeId, derive_alignment, derive_entity,
+    CoverageState, EntityKind, EventFact, EventKind, FactorCoverage, FactorId, GaugeSample,
+    LossReason, MetricFactor, MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality,
+    PhysicalCountSemantics, PopulationTotalQuality, ResetFamily, RetainedExactness,
+    SourceCompleteness, SourcePopulation, SourceScopeId, derive_alignment, derive_entity,
 };
 #[cfg(test)]
 use kronika_analytics::overview::AlignmentId;
@@ -50,6 +50,7 @@ pub(super) struct MetricExtraction {
     pub reset_markers: Vec<ResetMarker>,
     pub entity_states: Vec<EntityStateRecord>,
     pub factor_coverage: Vec<FactorCoverage>,
+    pub event_facts: Vec<EventFact>,
     pub pgm_body_read_stats: PgmBodyReadStats,
 }
 
@@ -104,6 +105,7 @@ impl ResetContext {
 
 #[derive(Debug, Clone, Copy)]
 struct CoverageRecord {
+    ts_us: i64,
     read_state: u8,
     visibility: u8,
     source_total: u64,
@@ -196,6 +198,41 @@ impl MetricAccumulator {
         }
         Ok(())
     }
+
+    fn snapshot_boundary(
+        &mut self,
+        factor: MetricFactor,
+        source_type_id: u32,
+        scope: SourceScopeId,
+        entity_kind: EntityKind,
+        ts_us: i64,
+        population_total: u32,
+        postmaster_epoch: u64,
+    ) -> Result<(), BuildError> {
+        let entity = derive_entity(
+            scope,
+            entity_kind,
+            &[
+                b"complete-snapshot".as_slice(),
+                source_type_id.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        self.state(
+            series(
+                factor,
+                scope,
+                source_type_id,
+                MetricUnit::StateCode,
+                Some(entity),
+                None,
+                b"complete-snapshot",
+            ),
+            ts_us,
+            population_total,
+            Some(postmaster_epoch),
+        )
+    }
 }
 
 /// Extracts every allow-listed metric section body exactly once.
@@ -274,6 +311,14 @@ pub(super) fn extract_metrics<R: ReadAt>(
             _ => return Err(BuildError::Internal),
         }
     }
+    extract_reset_metadata(&mut metrics, &decoded, source_scope_id)?;
+    extract_snapshot_boundaries(
+        &mut metrics,
+        &snapshot_coverage,
+        source_scope_id,
+        reset_context,
+    )?;
+    let event_facts = collector_event_facts(&snapshot_coverage, source_scope_id, bounds)?;
 
     if !reset_context.has_pg_context() {
         for factor in [
@@ -336,6 +381,7 @@ pub(super) fn extract_metrics<R: ReadAt>(
         reset_markers,
         entity_states: metrics.entity_states,
         factor_coverage,
+        event_facts,
         pgm_body_read_stats: stats,
     })
 }
@@ -578,8 +624,9 @@ fn extract_replication_senders(
     scope: SourceScopeId,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
 ) -> Result<(), BuildError> {
-    let population = proven_population(section.type_id, coverage);
     for row in &section.rows {
+        let ts_us = required_ts(row, "ts")?;
+        let population = proven_population(section.type_id, ts_us, coverage);
         let pid = required_i64(row, "pid")?;
         let backend_start = required_i64(row, "backend_start_key")?;
         let identity = [pid.to_le_bytes().as_slice(), backend_start.to_le_bytes().as_slice()]
@@ -596,7 +643,7 @@ fn extract_replication_senders(
                 None,
                 &identity,
             ),
-            required_ts(row, "ts")?,
+            ts_us,
             state_code,
             population,
         )?;
@@ -610,8 +657,9 @@ fn extract_replication_slots(
     scope: SourceScopeId,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
 ) -> Result<(), BuildError> {
-    let population = proven_population(section.type_id, coverage);
     for row in &section.rows {
+        let ts_us = required_ts(row, "ts")?;
+        let population = proven_population(section.type_id, ts_us, coverage);
         let slot_name = required_str_id(row, "slot_name")?;
         let identity = slot_name.to_le_bytes();
         let entity = derive_entity(scope, EntityKind::ReplicationSlot, &identity);
@@ -625,7 +673,7 @@ fn extract_replication_slots(
                 None,
                 &identity,
             ),
-            required_ts(row, "ts")?,
+            ts_us,
             required_u32(row, "wal_status_code")?,
             population,
         )?;
@@ -746,6 +794,178 @@ fn reset_context(sections: &[DecodedMetricSection]) -> Result<ResetContext, Buil
     Ok(context)
 }
 
+fn extract_reset_metadata(
+    out: &mut MetricAccumulator,
+    sections: &[DecodedMetricSection],
+    scope: SourceScopeId,
+) -> Result<(), BuildError> {
+    let entity = derive_entity(scope, EntityKind::Postmaster, b"instance");
+    for section in sections
+        .iter()
+        .filter(|section| section.type_id == RESET_METADATA)
+    {
+        for row in &section.rows {
+            let ts_us = required_ts(row, "ts")?;
+            out.gauge(
+                series(
+                    MetricFactor::PgPostmasterStartTime,
+                    scope,
+                    section.type_id,
+                    MetricUnit::Microseconds,
+                    Some(entity),
+                    None,
+                    b"postmaster-start",
+                ),
+                ts_us,
+                required_ts(row, "postmaster_start_time")? as f64,
+            )?;
+            if let Some(reset_at) = optional_ts(row, "pg_stat_database_reset_max_at")? {
+                out.gauge(
+                    series(
+                        MetricFactor::PgStatisticsResetAt,
+                        scope,
+                        section.type_id,
+                        MetricUnit::Microseconds,
+                        Some(entity),
+                        None,
+                        b"pg-stat-database-reset",
+                    ),
+                    ts_us,
+                    reset_at as f64,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_snapshot_boundaries(
+    out: &mut MetricAccumulator,
+    coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
+    scope: SourceScopeId,
+    reset: ResetContext,
+) -> Result<(), BuildError> {
+    let postmaster_epoch = reset
+        .postmaster_start_us
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(0);
+    let mut seen = BTreeSet::new();
+    for (source_type, records) in coverage {
+        let (factor, entity_kind) = if *source_type == PG_REPLICATION_PHYSICAL {
+            (
+                MetricFactor::PgReplicationSenderSnapshotPopulation,
+                EntityKind::ReplicationSender,
+            )
+        } else if PG_REPLICATION_SLOT_TYPES.contains(source_type) {
+            (
+                MetricFactor::PgReplicationSlotSnapshotPopulation,
+                EntityKind::ReplicationSlot,
+            )
+        } else {
+            continue;
+        };
+        for record in records.iter().filter(|record| complete_snapshot(record)) {
+            if !seen.insert((*source_type, record.ts_us)) {
+                continue;
+            }
+            out.snapshot_boundary(
+                factor,
+                *source_type,
+                scope,
+                entity_kind,
+                record.ts_us,
+                u32::try_from(record.source_total).map_err(|_error| BuildError::Overflow)?,
+                postmaster_epoch,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn collector_event_facts(
+    coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
+    scope: SourceScopeId,
+    bounds: &Bounds,
+) -> Result<Vec<EventFact>, BuildError> {
+    let mut facts = Vec::new();
+    for (source_type, records) in coverage {
+        for record in records {
+            let lost = record.source_total.checked_sub(record.collected);
+            let primary = match record.read_state {
+                0 if record.collected == record.source_total => None,
+                0 | 1 => Some((
+                    EventKind::CollectorSnapshotGap,
+                    LossReason::SnapshotSourceLimit,
+                )),
+                2 => Some((
+                    EventKind::CollectorVisibilityRestricted,
+                    LossReason::PermissionDenied,
+                )),
+                3 => Some((
+                    EventKind::CollectorSourceReadFailure,
+                    LossReason::SourceReadFailure,
+                )),
+                _ => Some((
+                    EventKind::CollectorSnapshotGap,
+                    LossReason::CollectorLimit,
+                )),
+            };
+            if let Some((kind, reason)) = primary
+                && let Some(fact) = EventFact::from_collector_loss(
+                    scope,
+                    *source_type,
+                    record.ts_us,
+                    kind,
+                    &[reason],
+                    lost,
+                )
+                .map_err(|_error| BuildError::Internal)?
+            {
+                push_collector_fact(&mut facts, fact, bounds)?;
+            }
+            if record.visibility != 0
+                && !matches!(
+                    primary,
+                    Some((EventKind::CollectorVisibilityRestricted, _))
+                )
+                && let Some(fact) = EventFact::from_collector_loss(
+                    scope,
+                    *source_type,
+                    record.ts_us,
+                    EventKind::CollectorVisibilityRestricted,
+                    &[LossReason::VisibilityRestricted],
+                    lost,
+                )
+                .map_err(|_error| BuildError::Internal)?
+            {
+                push_collector_fact(&mut facts, fact, bounds)?;
+            }
+        }
+    }
+    facts.sort_by(EventFact::canonical_cmp);
+    facts.dedup_by_key(|fact| fact.fact_id());
+    Ok(facts)
+}
+
+fn push_collector_fact(
+    facts: &mut Vec<EventFact>,
+    fact: EventFact,
+    bounds: &Bounds,
+) -> Result<(), BuildError> {
+    if facts.len() as u64 == bounds.items_per_block {
+        return Err(BuildError::LimitExceeded);
+    }
+    facts.push(fact);
+    Ok(())
+}
+
+const fn complete_snapshot(record: &CoverageRecord) -> bool {
+    record.read_state == 0
+        && record.visibility == 0
+        && record.total_exact
+        && record.collected == record.source_total
+}
+
 fn source_coverage(
     sections: &[DecodedMetricSection],
 ) -> Result<BTreeMap<u32, Vec<CoverageRecord>>, BuildError> {
@@ -758,6 +978,7 @@ fn source_coverage(
                         .entry(required_u32(row, "source_type_id")?)
                         .or_default()
                         .push(CoverageRecord {
+                            ts_us: required_ts(row, "ts")?,
                             read_state: u8::try_from(required_u32(row, "read_state")?)
                                 .map_err(|_error| BuildError::Source(SourceError::Corrupt))?,
                             visibility: u8::try_from(required_u32(row, "visibility")?)
@@ -776,6 +997,7 @@ fn source_coverage(
                         .entry(required_u32(row, "source_type_id")?)
                         .or_default()
                         .push(CoverageRecord {
+                            ts_us: required_ts(row, "ts")?,
                             read_state: match reason {
                                 2 => 2,
                                 1 | 3 => 3,
@@ -993,17 +1215,13 @@ fn reset_markers(samples: &[CounterSample]) -> Vec<ResetMarker> {
 
 fn proven_population(
     source_type: u32,
+    ts_us: i64,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
 ) -> Option<u64> {
     coverage
         .get(&source_type)
-        .and_then(|records| records.last())
-        .filter(|record| {
-            record.read_state == 0
-                && record.visibility == 0
-                && record.total_exact
-                && record.collected == record.source_total
-        })
+        .and_then(|records| records.iter().find(|record| record.ts_us == ts_us))
+        .filter(|record| complete_snapshot(record))
         .map(|record| record.source_total)
 }
 
