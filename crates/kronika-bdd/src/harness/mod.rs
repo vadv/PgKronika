@@ -252,6 +252,16 @@ impl HarnessState {
         Ok(cluster.conn_string_db(self.database()?))
     }
 
+    /// The selected database's DSN through the cluster's Unix socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no `use_database` step has run.
+    pub(crate) fn local_database_dsn(&self) -> Result<String> {
+        let cluster = self.cluster()?;
+        Ok(cluster.local_conn_string_db(self.database()?))
+    }
+
     /// Insert an opened session under `name`, replacing any previous one.
     pub(crate) fn insert_session(&mut self, name: String, session: Session) {
         self.sessions.insert(name, session);

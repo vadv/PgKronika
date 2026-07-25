@@ -22,6 +22,16 @@ fn fixture_proc_tree(world: &mut BddWorld) -> Result<()> {
     world.harness.seed_default_proc_fixture()
 }
 
+/// Route only the scenario's collector through the cluster's Unix socket.
+#[given("the collector connects through the PostgreSQL Unix socket")]
+fn collector_uses_unix_socket(world: &mut BddWorld) -> Result<()> {
+    let dsn = world.harness.local_database_dsn()?;
+    world
+        .harness
+        .add_collector_env("KRONIKA_PG_DSN".to_owned(), dsn);
+    Ok(())
+}
+
 /// Write the step's docstring to `<fixture-root>/<rel>`.
 ///
 /// A later `And the fixture proc file "stat" contains:` step overwrites the
@@ -57,6 +67,43 @@ fn section_row_count(world: &mut BddWorld, type_id: String, count: usize) -> Res
                 "section {type_id}: expected {count} row(s), got {}",
                 rows.len()
             ),
+            &rows,
+            &failure_log,
+            &[],
+        )
+    );
+    Ok(())
+}
+
+/// Assert that a section exists and contains at least one decoded row.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+#[then(regex = r"^section ([\w.+-]+) is non-empty$")]
+fn section_is_nonempty(world: &mut BddWorld, type_id: String) -> Result<()> {
+    let type_id = parse_type_id(&type_id)?;
+    let segment = world.harness.segment()?.clone();
+    let failure_log = world.harness.failure_log()?;
+    let (rows, _dict) = match decode_section(&segment, type_id) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            anyhow::bail!(
+                "{}",
+                dump::section_dump(
+                    &format!("section {type_id}: decode failed: {err:#}"),
+                    &[],
+                    &failure_log,
+                    &[],
+                )
+            );
+        }
+    };
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "{}",
+        dump::section_dump(
+            &format!("section {type_id}: expected at least one row"),
             &rows,
             &failure_log,
             &[],
