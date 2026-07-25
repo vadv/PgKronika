@@ -13,11 +13,12 @@
 use std::collections::{BTreeMap, BTreeSet as DictionaryIdSet};
 
 use kronika_analytics::overview::{
-    Applicability, CounterSample, Coverage, CoverageSpan, EventFact, EventObservation,
-    FactorCoverage, GaugeSample, MetricSeriesDescriptor, MetricSeriesId, NamingContractId,
-    ObservationPayload, ObservationProvenance, OracleError, OracleLimits, OracleResult,
-    PeriodQuality, PhysicalCountSemantics, RawOracle, RetainedExactness, SegmentIdentity,
-    SegmentLocator, SourceCompleteness, query_bounded,
+    Applicability, BoundaryQuality, CounterSample, Coverage, CoverageSpan, CoverageState,
+    EventFact, EventObservation, FactorCoverage, FactorId, GaugeSample, MetricSeriesDescriptor,
+    MetricSeriesId, NamingContractId, ObservationPayload, ObservationProvenance, OracleError,
+    OracleLimits, OracleResult, PeriodQuality, PhysicalCountSemantics, PopulationTotalQuality,
+    RawOracle, RetainedExactness, SegmentIdentity, SegmentLocator, SourceCompleteness,
+    SourcePopulation, query_bounded,
 };
 use kronika_format::ReadAt;
 
@@ -39,7 +40,9 @@ use super::event_extract::{
 };
 use super::event_facts::EventFactsBlock;
 use super::limits::Bounds;
-use super::metric_extract::{MetricExtraction, extract_metrics};
+use super::metric_extract::{
+    MetricExtraction, cadence_covered_duration, extract_metrics, observed_cadence,
+};
 use super::observations::EventObservationsBlock;
 
 pub(super) const MAX_STORE_NAMESPACE_BYTES: usize = 4 * 1024;
@@ -214,7 +217,7 @@ impl From<CacheReadError> for BuildError {
 }
 
 /// Retained sealed-segment facts materialized from one PGM container.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentFacts {
     identity: HeaderIdentity,
     lineage: SegmentIdentity,
@@ -369,10 +372,16 @@ impl SegmentFacts {
             return Ok(None);
         };
 
-        let Some(metrics) = promote_metrics(parts, identity.source_scope_id, bounds)? else {
+        let (min_ts, max_ts) = (sealed_unit.catalog().min_ts, sealed_unit.catalog().max_ts);
+        let Some(metrics) = promote_metrics(
+            parts,
+            identity.source_scope_id,
+            segment_span(min_ts, max_ts)?,
+            bounds,
+        )?
+        else {
             return Ok(None);
         };
-        let (min_ts, max_ts) = (sealed_unit.catalog().min_ts, sealed_unit.catalog().max_ts);
         Self::assemble(
             identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
         )
@@ -1386,6 +1395,7 @@ const fn block_build_error(error: super::block::BlockError) -> BuildError {
 fn promote_metrics(
     parts: &[&SegmentFacts],
     expected_scope: kronika_analytics::overview::SourceScopeId,
+    interval: CoverageSpan,
     bounds: &Bounds,
 ) -> Result<Option<MetricExtraction>, BuildError> {
     let mut counter_series = BTreeMap::new();
@@ -1393,7 +1403,6 @@ fn promote_metrics(
     let mut counters = Vec::new();
     let mut gauges = Vec::new();
     let mut entity_states = Vec::new();
-    let mut factor_coverage = Vec::new();
     let mut event_facts = Vec::new();
     for part in parts {
         if !merge_metric_series(
@@ -1420,11 +1429,6 @@ fn promote_metrics(
         checked_extend(
             &mut entity_states,
             part.entity_states.records(),
-            bounds.items_per_block,
-        )?;
-        checked_extend(
-            &mut factor_coverage,
-            part.loss_coverage.factor_coverage(),
             bounds.items_per_block,
         )?;
         for fact in part.event_facts.iter().filter(|fact| {
@@ -1468,18 +1472,16 @@ fn promote_metrics(
     }) {
         return Ok(None);
     }
-    factor_coverage.sort_unstable_by_key(|coverage| {
-        (
-            coverage.factor_id.0,
-            coverage.interval.start_us(),
-            coverage.interval.end_us(),
-        )
-    });
-    if factor_coverage.windows(2).any(|pair| {
-        pair[0].factor_id == pair[1].factor_id && pair[0].interval == pair[1].interval
-    }) {
-        return Ok(None);
-    }
+    let factor_coverage = promoted_factor_coverage(
+        parts,
+        &counter_series,
+        &counters,
+        &gauge_series,
+        &gauges,
+        &entity_states,
+        interval,
+        bounds,
+    )?;
     let reset_markers = reset_markers_for_samples(&counters);
     event_facts.sort_by(EventFact::canonical_cmp);
     event_facts.dedup_by_key(|fact| fact.fact_id());
@@ -1495,6 +1497,233 @@ fn promote_metrics(
         event_facts,
         pgm_body_read_stats: PgmBodyReadStats::default(),
     }))
+}
+
+fn promoted_factor_coverage(
+    parts: &[&SegmentFacts],
+    counter_series: &BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
+    counters: &[CounterSample],
+    gauge_series: &BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
+    gauges: &[GaugeSample],
+    entity_states: &[EntityStateRecord],
+    interval: CoverageSpan,
+    bounds: &Bounds,
+) -> Result<Vec<FactorCoverage>, BuildError> {
+    let mut records = BTreeMap::<FactorId, Vec<&FactorCoverage>>::new();
+    for part in parts {
+        for coverage in part.loss_coverage.factor_coverage() {
+            records.entry(coverage.factor_id).or_default().push(coverage);
+        }
+    }
+    if records.len() as u64 > bounds.items_per_block {
+        return Err(BuildError::LimitExceeded);
+    }
+
+    let mut times = BTreeMap::<FactorId, Vec<i64>>::new();
+    for sample in counters {
+        let descriptor = counter_series
+            .get(&sample.series_id())
+            .ok_or(BuildError::Internal)?;
+        times
+            .entry(descriptor.factor_id)
+            .or_default()
+            .push(sample.ts_us());
+    }
+    for sample in gauges {
+        let descriptor = gauge_series
+            .get(&sample.series_id())
+            .ok_or(BuildError::Internal)?;
+        times
+            .entry(descriptor.factor_id)
+            .or_default()
+            .push(sample.ts_us());
+    }
+    let mut latest_population_by_source = BTreeMap::<u32, (i64, u64)>::new();
+    for state in entity_states {
+        let descriptor = gauge_series
+            .get(&state.series_id)
+            .ok_or(BuildError::Internal)?;
+        let latest = latest_population_by_source
+            .entry(descriptor.source_type_id)
+            .or_insert((state.ts_us, state.population_total));
+        if state.ts_us > latest.0 {
+            *latest = (state.ts_us, state.population_total);
+        }
+    }
+
+    records
+        .into_iter()
+        .map(|(factor_id, mut records)| {
+            records.sort_unstable_by_key(|coverage| {
+                (coverage.interval.start_us(), coverage.interval.end_us())
+            });
+            let applicability = records
+                .first()
+                .map(|coverage| coverage.applicability)
+                .ok_or(BuildError::Internal)?;
+            if records
+                .iter()
+                .any(|coverage| coverage.applicability != applicability)
+            {
+                return Err(BuildError::Internal);
+            }
+            if applicability == Applicability::Unsupported {
+                return Ok(unsupported_promoted_coverage(factor_id, interval));
+            }
+            if applicability != Applicability::Applicable {
+                return Err(BuildError::Internal);
+            }
+
+            let mut loss_reasons = records
+                .iter()
+                .flat_map(|coverage| coverage.loss_reasons.iter().copied())
+                .collect::<Vec<_>>();
+            loss_reasons.sort_unstable();
+            loss_reasons.dedup();
+            let lost_count_lower_bound = records
+                .iter()
+                .filter_map(|coverage| coverage.lost_count_lower_bound)
+                .max()
+                .filter(|lost| *lost != 0);
+            let mut source_population = records
+                .iter()
+                .rev()
+                .find_map(|coverage| coverage.source_population);
+            let mut factor_sources = counter_series
+                .values()
+                .chain(gauge_series.values())
+                .filter(|descriptor| descriptor.factor_id == factor_id)
+                .map(|descriptor| descriptor.source_type_id)
+                .collect::<Vec<_>>();
+            factor_sources.sort_unstable();
+            factor_sources.dedup();
+            if let [source_type_id] = factor_sources.as_slice()
+                && let Some((_ts_us, population_total)) =
+                    latest_population_by_source.get(source_type_id)
+            {
+                source_population = Some(SourcePopulation {
+                    collected: *population_total,
+                    total: Some(*population_total),
+                    total_quality: PopulationTotalQuality::Exact,
+                });
+            }
+            let source_completeness = if records
+                .iter()
+                .all(|coverage| coverage.source_completeness == SourceCompleteness::Full)
+            {
+                SourceCompleteness::Full
+            } else if records
+                .iter()
+                .all(|coverage| coverage.source_completeness == SourceCompleteness::Unknown)
+            {
+                SourceCompleteness::Unknown
+            } else {
+                SourceCompleteness::BoundedSubset
+            };
+
+            let factor_times = times.remove(&factor_id).unwrap_or_default();
+            let present_samples =
+                u64::try_from(factor_times.len()).map_err(|_error| BuildError::Overflow)?;
+            let cadence = observed_cadence(&factor_times);
+            let covered_duration_us = cadence.map_or(0, |(period, _cadence_id)| {
+                cadence_covered_duration(&factor_times, interval, period)
+            });
+            let state = promoted_coverage_state(
+                present_samples,
+                cadence.is_some(),
+                covered_duration_us,
+                interval,
+                loss_reasons.is_empty(),
+            );
+
+            Ok(FactorCoverage {
+                factor_id,
+                applicability,
+                state,
+                interval,
+                expected_period_us: cadence.map(|(period, _cadence_id)| period),
+                period_quality: cadence.map_or(PeriodQuality::Unknown, |_| {
+                    PeriodQuality::ObservedStable
+                }),
+                cadence_epoch_id: cadence.map(|(_period, id)| id),
+                crosses_cadence_boundary: false,
+                present_samples,
+                covered_duration_us,
+                source_population,
+                loss_reasons,
+                lost_count_lower_bound,
+                retained_exactness: if records
+                    .iter()
+                    .all(|coverage| coverage.retained_exactness == RetainedExactness::Exact)
+                    && lost_count_lower_bound.is_none()
+                {
+                    RetainedExactness::Exact
+                } else {
+                    RetainedExactness::Unknown
+                },
+                source_completeness,
+                physical_count_semantics: PhysicalCountSemantics::NotApplicable,
+                boundary_quality: BoundaryQuality::Contained,
+            })
+        })
+        .collect()
+}
+
+const fn promoted_coverage_state(
+    present_samples: u64,
+    has_cadence: bool,
+    covered_duration_us: u64,
+    interval: CoverageSpan,
+    losses_empty: bool,
+) -> CoverageState {
+    if present_samples == 0 {
+        if losses_empty {
+            CoverageState::NotCollected
+        } else {
+            CoverageState::Gap
+        }
+    } else if !has_cadence {
+        if losses_empty {
+            CoverageState::Unknown
+        } else {
+            CoverageState::Gap
+        }
+    } else if covered_duration_us == interval.duration_us() {
+        CoverageState::Complete
+    } else if covered_duration_us == 0 {
+        if losses_empty {
+            CoverageState::Unknown
+        } else {
+            CoverageState::Gap
+        }
+    } else {
+        CoverageState::Partial
+    }
+}
+
+const fn unsupported_promoted_coverage(
+    factor_id: FactorId,
+    interval: CoverageSpan,
+) -> FactorCoverage {
+    FactorCoverage {
+        factor_id,
+        applicability: Applicability::Unsupported,
+        state: CoverageState::NotCollected,
+        interval,
+        expected_period_us: None,
+        period_quality: PeriodQuality::Unknown,
+        cadence_epoch_id: None,
+        crosses_cadence_boundary: false,
+        present_samples: 0,
+        covered_duration_us: 0,
+        source_population: None,
+        loss_reasons: Vec::new(),
+        lost_count_lower_bound: None,
+        retained_exactness: RetainedExactness::Unknown,
+        source_completeness: SourceCompleteness::Unknown,
+        physical_count_semantics: PhysicalCountSemantics::NotApplicable,
+        boundary_quality: BoundaryQuality::Unknown,
+    }
 }
 
 fn merge_metric_series(
@@ -1861,8 +2090,9 @@ fn merge_physical_count(
 #[cfg(test)]
 mod tests {
     use kronika_analytics::overview::{
-        CountLimits, ErrorCategory, EventKind, EventPayload, EvidenceQuality, LossReason,
-        MetricFactor, SemanticDivergence, SqlState, TimeQuality, semantic_divergences,
+        CountLimits, CounterReduction, ErrorCategory, EventKind, EventPayload, EvidenceQuality,
+        LossReason, MetricFactor, ReductionLimits, SemanticDivergence, SqlState, TimeQuality,
+        classify_series, semantic_divergences,
     };
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
@@ -1877,6 +2107,9 @@ mod tests {
     use kronika_writer::{Interner, dict};
 
     use super::super::limits::LIMIT;
+    use super::super::qualification_fixture::{
+        ALL_FAMILY_SCHEMA_VERSION, all_family_fixture,
+    };
     use super::*;
 
     const LIMITS: OracleLimits = OracleLimits {
@@ -1887,6 +2120,13 @@ mod tests {
             max_joint_keys: 256,
             max_signal_keys: 256,
         },
+    };
+
+    const REDUCTION_LIMITS: ReductionLimits = ReductionLimits {
+        max_input_items: 256,
+        max_gap_spans: 256,
+        max_counter_pairs: 256,
+        max_gauge_samples: 256,
     };
 
     fn context() -> SegmentContext {
@@ -1969,6 +2209,10 @@ mod tests {
     }
 
     fn replication_sender(ts_us: i64) -> PgReplicationPhysicalV1 {
+        replication_sender_state(ts_us, 3)
+    }
+
+    fn replication_sender_state(ts_us: i64, state_code: u8) -> PgReplicationPhysicalV1 {
         PgReplicationPhysicalV1 {
             ts: Ts(ts_us),
             pid: 42,
@@ -1979,7 +2223,7 @@ mod tests {
             state: StrId(4),
             sync_state: StrId(5),
             scope_code: 1,
-            state_code: 3,
+            state_code,
             current_to_sent_bytes: None,
             sent_to_write_bytes: None,
             write_to_flush_bytes: None,
@@ -2984,6 +3228,230 @@ mod tests {
         let divergences =
             semantic_divergences(&index, &raw, full_range(), LIMITS).expect("bounded comparison");
         assert_eq!(divergences, Vec::<SemanticDivergence>::new());
+    }
+
+    #[test]
+    fn every_populated_canonical_block_matches_forced_raw_and_restart_warm() {
+        let fixture = all_family_fixture();
+        assert_eq!(fixture.schema_version, ALL_FAMILY_SCHEMA_VERSION);
+        assert_eq!(fixture.source_id, 7);
+        assert_eq!(fixture.cadence_us, 10);
+        let bytes = fixture.sealed_bytes();
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
+        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("forced raw extract");
+
+        assert!(!raw.observations().is_empty());
+        assert!(!raw.event_facts().is_empty());
+        assert!(!raw.counter_samples().series().is_empty());
+        assert!(!raw.counter_samples().samples().is_empty());
+        assert!(!raw.gauge_samples().series().is_empty());
+        assert!(!raw.gauge_samples().samples().is_empty());
+        assert!(!raw.reset_markers().markers().is_empty());
+        assert!(!raw.entity_states().records().is_empty());
+        assert!(!raw.loss_coverage().factor_coverage().is_empty());
+        for kind in [
+            EventKind::PgDatabaseDeadlockDelta,
+            EventKind::PgReplicationSenderStateChanged,
+            EventKind::PgReplicationSenderDisappeared,
+            EventKind::CollectorSourceReadFailure,
+        ] {
+            assert!(
+                raw.event_facts().iter().any(|fact| fact.kind() == kind),
+                "fixture did not materialize {kind:?}"
+            );
+        }
+
+        let encoded = raw.encode(&LIMIT).expect("encode all canonical blocks");
+        let restart_warm = SegmentFacts::from_reader(
+            encoded.as_slice(),
+            raw.identity(),
+            raw.lineage(),
+            &raw.catalog_descriptors(),
+            &LIMIT,
+        )
+        .expect("restart-warm all canonical blocks");
+        assert_eq!(
+            restart_warm, raw,
+            "restart-warm must preserve every canonical block, descriptor, and coverage axis"
+        );
+
+        let recomputed =
+            SegmentFacts::extract(&unit, &context(), &LIMIT).expect("forced recompute");
+        assert_eq!(
+            recomputed, raw,
+            "forced raw recomputation must be byte-semantically stable"
+        );
+    }
+
+    #[test]
+    fn every_canonical_block_crc_is_enforced_for_the_all_family_fixture() {
+        let bytes = all_family_fixture().sealed_bytes();
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
+        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract all families");
+        let encoded = raw.encode(&LIMIT).expect("encode every canonical block");
+        let admitted = FactFile::admit(&encoded, raw.identity(), raw.lineage(), &LIMIT)
+            .expect("admit pristine fact file");
+
+        assert_eq!(
+            admitted
+                .directory()
+                .iter()
+                .map(|entry| entry.block_kind)
+                .collect::<Vec<_>>(),
+            BlockKind::ALL
+                .into_iter()
+                .map(BlockKind::code)
+                .collect::<Vec<_>>(),
+            "the qualification fixture must encode every canonical block exactly once"
+        );
+
+        for entry in admitted.directory() {
+            assert_ne!(
+                entry.stored_len, 0,
+                "canonical block {} must have a CRC-covered body",
+                entry.block_kind
+            );
+            let mut corrupted = encoded.clone();
+            let offset = usize::try_from(entry.offset).expect("fixture offset fits usize");
+            corrupted[offset] ^= 0x80;
+            assert!(
+                matches!(
+                    SegmentFacts::from_bytes(
+                        &corrupted,
+                        raw.identity(),
+                        raw.lineage(),
+                        &raw.catalog_descriptors(),
+                        &LIMIT,
+                    ),
+                    Err(CacheReadError::Corrupt)
+                ),
+                "block {} accepted a stale body CRC",
+                entry.block_kind
+            );
+        }
+    }
+
+    #[test]
+    fn every_all_family_source_body_crc_failure_stays_a_source_error() {
+        let pristine = all_family_fixture().sealed_bytes();
+        let catalog = PgmUnit::open(pristine.as_slice())
+            .expect("open pristine all-family PGM")
+            .catalog()
+            .entries
+            .clone();
+        assert!(
+            catalog.len() > BlockKind::ALL.len(),
+            "the source fixture must exercise repeated section layouts"
+        );
+
+        for (ordinal, entry) in catalog.iter().enumerate() {
+            assert_ne!(entry.len, 0, "fixture source body must not be empty");
+            let mut damaged = pristine.clone();
+            let offset = usize::try_from(entry.offset).expect("fixture source offset fits usize");
+            damaged[offset] ^= 0x40;
+            let unit = PgmUnit::open(damaged.as_slice()).expect("catalog remains readable");
+            assert!(
+                matches!(
+                    SegmentFacts::extract(&unit, &context(), &LIMIT),
+                    Err(BuildError::Source(SourceError::Corrupt))
+                ),
+                "source section ordinal {ordinal} type {} was masked by derived extraction",
+                entry.type_id
+            );
+        }
+    }
+
+    #[test]
+    fn all_family_range_edges_use_half_open_ownership_and_one_left_halo() {
+        let bytes = all_family_fixture().sealed_bytes();
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
+        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract all families");
+
+        let left_range = CoverageSpan::new(10, 20).expect("left range");
+        let right_range = CoverageSpan::new(20, 31).expect("right range");
+        let left = facts.query(left_range, LIMITS).expect("left query");
+        let right = facts.query(right_range, LIMITS).expect("right query");
+        assert_eq!(left.observations().len(), 1);
+        assert_eq!(right.observations().len(), 2);
+        assert_eq!(
+            left.observations().len() + right.observations().len(),
+            facts.observations().len(),
+            "an event exactly at the split belongs only to the right range"
+        );
+
+        let deadlock_series = facts
+            .counter_samples()
+            .series()
+            .iter()
+            .find(|series| series.factor_id == MetricFactor::PgDatabaseDeadlocks.id())
+            .expect("deadlock series")
+            .series_id;
+        let samples: Vec<_> = facts
+            .counter_samples()
+            .samples()
+            .iter()
+            .copied()
+            .filter(|sample| sample.series_id() == deadlock_series)
+            .collect();
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.ts_us())
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+
+        let bucket = CoverageSpan::new(15, 31).expect("unaligned bucket");
+        let whole_intervals = classify_series(
+            None,
+            &samples,
+            facts.loss_coverage().known_gaps(),
+            REDUCTION_LIMITS,
+        )
+        .expect("classify whole series");
+        let whole = CounterReduction::from_intervals(
+            &whole_intervals,
+            bucket,
+            REDUCTION_LIMITS,
+        )
+        .expect("reduce whole series")
+        .expect("two owned pairs");
+
+        let halo = samples[0];
+        let selected = &samples[1..];
+        let ranged_intervals = classify_series(
+            Some(halo),
+            selected,
+            facts.loss_coverage().known_gaps(),
+            REDUCTION_LIMITS,
+        )
+        .expect("classify selected series with halo");
+        let ranged = CounterReduction::from_intervals(
+            &ranged_intervals,
+            bucket,
+            REDUCTION_LIMITS,
+        )
+        .expect("reduce selected range")
+        .expect("halo restores both pairs");
+        assert_eq!(ranged, whole);
+        assert_eq!(ranged.valid_pairs(), 2);
+
+        let no_halo = classify_series(
+            None,
+            selected,
+            facts.loss_coverage().known_gaps(),
+            REDUCTION_LIMITS,
+        )
+        .expect("classify without halo");
+        let no_halo =
+            CounterReduction::from_intervals(&no_halo, bucket, REDUCTION_LIMITS)
+                .expect("reduce without halo")
+                .expect("later pair remains");
+        assert_eq!(
+            no_halo.valid_pairs(),
+            1,
+            "the qualification proves the predecessor is semantically required"
+        );
     }
 
     #[test]

@@ -31,6 +31,8 @@ mod persist_mode;
 #[cfg(test)]
 mod proptests;
 mod publish;
+#[cfg(test)]
+mod qualification_fixture;
 
 pub use block::{
     BlockCodec, BlockError, BlockFlags, BlockKind, CounterSamplesBlock, EntityStateRecord,

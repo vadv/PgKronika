@@ -966,6 +966,7 @@ mod tests {
 
     use super::super::SourceError;
     use super::super::limits::LIMIT;
+    use super::super::qualification_fixture::all_family_fixture;
     use super::*;
     use crate::refresh::{PartTransition, part_id};
 
@@ -1857,6 +1858,50 @@ mod tests {
                 .read(&sealed_unit, &context, &LIMIT)
                 .expect("promoted facts were published");
             assert_eq!(cached.observations(), rebuilt.observations());
+        }
+    }
+
+    #[test]
+    fn every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts() {
+        let fixture = all_family_fixture();
+        let sealed_bytes = fixture.sealed_bytes();
+        let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open all-family seal");
+        let context = sealed_context();
+        let cold =
+            SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("cold all-family rebuild");
+
+        let partitions = fixture.contiguous_partitions();
+        assert_eq!(partitions.len(), 4);
+        for part_bytes in partitions {
+            let part_slices: Vec<_> = part_bytes.iter().map(Vec::as_slice).collect();
+            let mut builder = live_builder();
+            fold_bytes(&mut builder, &part_slices);
+            let live = builder.publish();
+            assert_eq!(live.state(), LiveState::Current);
+            assert_eq!(live.chunks().len(), part_bytes.len());
+
+            let (_cache_dir, store) = store();
+            let promoted = reconcile_seal(&live, &sealed_unit, &context, &store, &LIMIT)
+                .expect("promote all-family facts");
+            assert!(
+                promoted.was_promoted(),
+                "matching {}-part catalog must remain promotion-eligible",
+                part_bytes.len()
+            );
+            assert_eq!(
+                promoted.facts(),
+                &cold,
+                "promotion from {} parts changed a canonical block",
+                part_bytes.len()
+            );
+            assert_eq!(
+                &store
+                    .read(&sealed_unit, &context, &LIMIT)
+                    .expect("read promoted all-family facts"),
+                &cold,
+                "published restart-warm facts differ for {} parts",
+                part_bytes.len()
+            );
         }
     }
 

@@ -1349,7 +1349,11 @@ fn factor_coverage(
     Ok(result)
 }
 
-fn cadence_covered_duration(times: &[i64], interval: CoverageSpan, period_us: u64) -> u64 {
+pub(super) fn cadence_covered_duration(
+    times: &[i64],
+    interval: CoverageSpan,
+    period_us: u64,
+) -> u64 {
     let period = i64::try_from(period_us).unwrap_or(i64::MAX);
     let mut times = times.to_vec();
     times.sort_unstable();
@@ -1392,7 +1396,7 @@ const fn unsupported_coverage(factor_id: FactorId, interval: CoverageSpan) -> Fa
     }
 }
 
-fn observed_cadence(times: &[i64]) -> Option<(u64, CadenceEpochId)> {
+pub(super) fn observed_cadence(times: &[i64]) -> Option<(u64, CadenceEpochId)> {
     let mut times = times.to_vec();
     times.sort_unstable();
     times.dedup();
