@@ -1891,7 +1891,7 @@ mod tests {
 
     #[test]
     fn known_schema_flags_and_time_metadata_are_enforced() {
-        for (entry, field, value) in [(0, 4, 3_u8), (0, 6, 0_u8), (5, 6, 3_u8)] {
+        for (entry, field, value) in [(0, 4, 2_u8), (0, 6, 0_u8), (5, 6, 3_u8)] {
             let mut bytes = valid_file();
             bytes[entry_field(entry, field)] = value;
             reseal_directory(&mut bytes);
