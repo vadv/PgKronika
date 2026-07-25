@@ -124,6 +124,24 @@ not evaluated. Later positions use only data after that boundary and also
 remain not evaluated until they have at least 20 reference and three current
 values.
 
+#### How many values are required
+
+The current `pg_kronika-web` policy fixes `min_cur=3` and `min_ref=20`.
+HTTP query parameters cannot change these values.
+
+| Result being computed | Minimum data |
+| --- | --- |
+| One cumulative-counter rate point | Two adjacent source samples: the previous and current values. |
+| One anomaly score | Three eligible values in the current window and 20 eligible reference values, for at least 23 values from one uninterrupted series. |
+| One anomaly score for `xact_commit` | At least 24 source counter samples: the first establishes the starting value and the next 23 produce 23 rate points. |
+| One anomaly score for a gauge | At least 23 source measurements: three current and 20 reference values. No adjacent-value difference is computed. |
+
+`window` specifies a time span, not a point count. A position is not evaluated
+if only two eligible values fall inside its window, even when the whole request
+contains plenty of data. Likewise, 19 reference values are insufficient. A
+reset or gap starts a new uninterrupted segment, so values on opposite sides
+of that boundary cannot be combined to meet the minimum.
+
 #### Example: transaction-rate increase
 
 For `pg_stat_database.xact_commit`, PgKronika first derives the commit rate. A
@@ -132,10 +150,15 @@ counter increase from `1,000,000` to `1,000,100` over one second produces
 cumulative value. `xact_commit` and `xact_rollback` are scored separately for
 each database; the detector does not add them into a total TPS series.
 
-For a compact example, use `window=2m`, `step=1m`, `eps_rel=0.05`, and
-`threshold=3.5`. At the `12:30` position:
+The example uses exactly the minimum required data: three current rate values
+and 20 reference values, for 23 rate points in total. Producing them from
+`xact_commit` required 24 source counter samples.
 
-- current window: `119`, `120`, `121 transactions/s`, with median `120`;
+Use `window=2m`, `step=1m`, `eps_rel=0.05`, and `threshold=3.5`. At the
+`12:30` position:
+
+- current window: `119`, `120`, `121 transactions/s` at `12:28`, `12:29`,
+  and `12:30`, with median `120`;
 - reference: ten values of `98` and ten values of `102 transactions/s`, with
   median `100` and median absolute deviation `MAD=2`.
 
