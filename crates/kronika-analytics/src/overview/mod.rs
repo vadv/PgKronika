@@ -15,9 +15,11 @@
 
 pub mod counts;
 pub mod coverage;
+pub mod fact;
 mod finite;
 pub mod health;
 pub mod health_line;
+pub mod metric;
 pub mod notable;
 pub mod observation;
 pub mod oracle;
@@ -33,6 +35,12 @@ pub use coverage::{
     PhysicalCountSemantics, RetainedExactness, SourceCompleteness,
 };
 pub use finite::FiniteF64;
+pub use fact::{
+    CapacityFactPayload, CheckpointFactPayload, CounterDeltaFactPayload, CoverageRef, EntityKind,
+    EntityRef, ErrorFactPayload, EventFact, EventKind, EventPayload, FactShape,
+    InvalidEventFact, LifecycleFactPayload, LockWaitFactPayload, MaintenanceFactPayload,
+    SlowQueryFactPayload, StateTransitionFactPayload, TempFileFactPayload,
+};
 pub use health::{
     CadenceEpochId, DomainId, DomainPenalty, DownsampleError, DownsampledHealthPoint,
     FactorCoverage, FactorId, FactorPenalty, FactorSetId, FloorClass, FloorEvidence,
@@ -43,6 +51,10 @@ pub use health::{
 pub use health_line::{
     HealthConfigError, OVERVIEW_HEALTH_DOMAIN, OVERVIEW_HEALTH_FACTOR, OVERVIEW_HEALTH_LIMITS,
     health_line, observation_floor, overview_health_policy,
+};
+pub use metric::{
+    MetricFactor, MetricSeriesDescriptor, MetricUnit, ResetFamily, derive_alignment,
+    derive_entity,
 };
 pub use notable::{
     DEFAULT_RESPONSE_CAP, InvalidNotablePolicy, MAX_RESPONSE_CAP, NotableClass,
@@ -71,11 +83,14 @@ pub use reduce::{
 /// Reserved version for future fact-container framing.
 pub const CONTAINER_VERSION: u16 = 1;
 
-/// Reserved version for the future canonical fact schema.
-pub const FACT_SCHEMA_VERSION: u32 = 1;
+/// Canonical fact schema version.
+///
+/// Version 2 materializes policy-neutral event facts and typed metric-series
+/// metadata instead of leaving the reserved blocks empty.
+pub const FACT_SCHEMA_VERSION: u32 = 2;
 
-/// Reserved version for PGM-to-fact extraction and normalization.
-pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 1;
+/// Version for PGM-to-fact extraction and normalization.
+pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 2;
 
 /// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///
