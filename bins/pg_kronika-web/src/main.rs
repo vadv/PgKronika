@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| canonical_store.as_os_str().as_bytes().to_vec());
     let mut overview = OverviewConfig::new(cfg.overview_cache_dir.clone(), namespace);
     overview.fallback = cfg.overview_fallback;
+    overview.gc = cfg.overview_gc;
     overview.response_cache_bytes = cfg.overview_response_cache_bytes;
     overview.response_cache_entries = cfg.overview_response_cache_entries;
     overview.cursor_max_views = cfg.overview_cursor_max_views;

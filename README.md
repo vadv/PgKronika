@@ -145,6 +145,13 @@ allow lists with `cargo run -p xtask -- check-deps`.
   timeline index checks admitted durable fact files with matching lineage
   before the bounded process-local fallback. Only a recoverable publication
   failure can place the same immutable facts in that fallback.
+- **Derived fact cache.** One independently constructed `FactStore` or process
+  may mutate a cache root; clones share that owner lease. Other stores can
+  still read committed facts. Garbage collection is confined to
+  `overview/v1`, refuses to sweep after an unavailable, incomplete, or capped
+  scan, and does not delete source PGM, locks, symlinks, or unrecognized files.
+  Logical-byte and file-count ceilings are disabled unless configured. Write
+  backoff never suppresses durable reads.
 - **Resource bounds.** Registry sections are capped at 65,536 rows, 8 MiB of
   encoded bytes, and 16 Parquet row groups. The collector applies source,
   dictionary, cycle-time, journal, and cardinality caps. Reader queries have

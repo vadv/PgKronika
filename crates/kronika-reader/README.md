@@ -104,6 +104,50 @@ budget are returned to the caller but not retained. `FallbackStats` reports
 hits, misses, inserts, evictions, oversized entries, publication-failure
 offers, and exact residency.
 
+`FactBuildKey` is the exact pair `(FactKey, SegmentLineageId)`. It identifies
+one retained segment occurrence for publication, fallback lookup, and garbage
+collection. Before any mutation, `FactStore` takes an advisory owner lock in
+the cache namespace. Clones share that lease; a separately constructed store
+or process cannot write or collect the same root while the owner is alive.
+Committed-file reads do not require the mutation lease.
+
+`GcConfig` bounds every namespace inventory. The defaults allow 100,000
+entries, require two distinct authoritative GC generations and 120 seconds
+since the first absent observation, and retain recognized temporary or
+quarantine files for 600 seconds. An unavailable live set, a scan error, or an
+entry-cap hit authorizes no deletion and does not advance grace. GC validates
+the canonical scope, prefix, final name, and PGKOVF header before a file can be
+deleted. It never follows symlinks or removes lock, foreign, or unrecognized
+entries. A final-file unlink also takes the publication lock and checks the
+opened inode and device again.
+
+Logical-byte and file-count ceilings are optional and disabled by default.
+When configured, admission counts committed facts, recognized publication
+artifacts, locks, and foreign files from one complete scan. The byte ceiling
+uses logical `st_size`, not free blocks or a physical-filesystem quota. If the
+complete accounted namespace cannot admit a publication, the write returns
+`QuotaExceeded`; live and source files are not evicted.
+
+All durable write APIs share one `PersistMode` state machine. Read-only,
+permission, capacity, stale-filesystem, and selected transient I/O failures
+arm bounded backoff and may populate the fallback. Per-key or root contention
+may use the fallback for that call but does not disable the store. Invalid
+facts, unsafe paths, invalid cache layout, and unclassified I/O remain
+permanent typed failures and do not arm global backoff. `ENOSPC` and quota
+failures may run one GC pass from the last complete authoritative mark and
+retry the publication once. `FactStore::probe_persistence` reserves one due
+probe, writes and synchronizes a sentinel, removes it, and clears backoff only
+after success. Durable reads remain first and do not reset write state.
+
+Permission and read-only probes start at the five-minute cap. Capacity and
+transient failures use per-store jittered exponential delay, also capped at
+five minutes. `PersistModeSnapshot` reports the typed reason, consecutive
+failure count, remaining delay, and reservation state.
+
+Fact-build single-flight by `FactBuildKey` and weighted global cold-work
+admission are still required M5 work. `FactStore` does not implement or waive
+those two contracts.
+
 ## Bounds and failures
 
 Catalogs are capped at 64 MiB. Registry limits cap each section at 8 MiB,

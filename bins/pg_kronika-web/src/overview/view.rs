@@ -17,7 +17,9 @@ use kronika_analytics::overview::{
     RawOracle, RetainedExactness, SourceCompleteness, SourceScopeId, query_bounded,
     query_bounded_materialized,
 };
-use kronika_reader::{FactKey, FileKind, LiveState, LiveView, SegmentDescriptor, SegmentFacts};
+use kronika_reader::{
+    FactBuildKey, FactKey, FileKind, LiveState, LiveView, SegmentDescriptor, SegmentFacts,
+};
 use sha2::{Digest, Sha256};
 
 /// Domain separator for the response/cache fact-set identity.
@@ -104,17 +106,18 @@ struct SourceAccumulator {
 pub(crate) struct SealedEntry {
     descriptor: SegmentDescriptor,
     facts: Arc<SegmentFacts>,
-    fact_key: FactKey,
+    fact_build_key: FactBuildKey,
 }
 
 impl SealedEntry {
     /// Binds sealed facts, computing the content-addressed fact key.
     pub(crate) fn new(descriptor: SegmentDescriptor, facts: Arc<SegmentFacts>) -> Self {
         let fact_key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
+        let fact_build_key = FactBuildKey::new(fact_key, facts.lineage().id());
         Self {
             descriptor,
             facts,
-            fact_key,
+            fact_build_key,
         }
     }
 
@@ -125,6 +128,11 @@ impl SealedEntry {
 
     fn facts(&self) -> &SegmentFacts {
         &self.facts
+    }
+
+    /// Exact durable build identity represented by this retained segment.
+    pub(crate) const fn fact_build_key(&self) -> FactBuildKey {
+        self.fact_build_key
     }
 }
 
@@ -446,7 +454,7 @@ impl IndexView {
         for entry in sealed {
             hasher.update(entry.descriptor.locator.as_bytes());
             hasher.update(entry.descriptor.source_id.to_le_bytes());
-            hasher.update(entry.fact_key.as_bytes());
+            hasher.update(entry.fact_build_key.fact_key().as_bytes());
         }
         hasher.update(live.generation().0.to_le_bytes());
         hasher.update(live.folded_through_offset().to_le_bytes());

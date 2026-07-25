@@ -76,7 +76,9 @@ use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
-use kronika_reader::{FallbackConfig, LocalDirSnapshot};
+use kronika_reader::{
+    FallbackConfig, GcCategoryUsage, GcConfig, GcOutcome, GcSkipReason, LocalDirSnapshot,
+};
 use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 // These crates are used by the binary target. Keep the imports here so the
@@ -177,6 +179,8 @@ pub struct OverviewConfig {
     pub namespace: Vec<u8>,
     /// Bounded durable-publication fallback.
     pub fallback: FallbackConfig,
+    /// Bounded GC and optional hard durable-cache quota.
+    pub gc: GcConfig,
     /// Logical serialized-response cache byte ceiling.
     pub response_cache_bytes: usize,
     /// Secondary serialized-response entry ceiling.
@@ -198,6 +202,7 @@ impl OverviewConfig {
             cache_root,
             namespace,
             fallback: FallbackConfig::default(),
+            gc: GcConfig::default(),
             response_cache_bytes: RESPONSE_CACHE_BYTES,
             response_cache_entries: RESPONSE_CACHE_ENTRIES,
             cursor_max_views: 64,
@@ -261,6 +266,102 @@ pub struct AppState {
 const RESPONSE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Secondary response-cache ceiling for small bodies.
 const RESPONSE_CACHE_ENTRIES: usize = 4_096;
+
+/// Numeric encoding of the persistence write mode for the mode gauge:
+/// `0` read-write, `1` read-only backoff, `2` unavailable backoff.
+const fn persist_mode_code(mode: kronika_reader::PersistMode) -> f64 {
+    match mode {
+        kronika_reader::PersistMode::ReadWrite => 0.0,
+        kronika_reader::PersistMode::ReadOnlyBackoff => 1.0,
+        kronika_reader::PersistMode::UnavailableBackoff => 2.0,
+    }
+}
+
+const fn gc_skip_reason(reason: GcSkipReason) -> &'static str {
+    match reason {
+        GcSkipReason::OwnerUnavailable => "owner_unavailable",
+        GcSkipReason::MarkUnavailable => "mark_unavailable",
+        GcSkipReason::LiveSetCapped => "live_set_capped",
+        GcSkipReason::ScanError => "scan_error",
+        GcSkipReason::ScanCapped => "scan_capped",
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64; exact counters remain integer counters"
+)]
+fn record_gc_category(kind: &'static str, usage: GcCategoryUsage) {
+    metrics::gauge!("kronika_web_overview_cache_files", "kind" => kind).set(usage.files as f64);
+    metrics::gauge!("kronika_web_overview_cache_logical_bytes", "kind" => kind)
+        .set(usage.logical_bytes as f64);
+    metrics::gauge!("kronika_web_overview_cache_allocated_bytes", "kind" => kind)
+        .set(usage.allocated_bytes as f64);
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64; exact cumulative quantities remain counters"
+)]
+fn record_gc_metrics(outcome: Option<GcOutcome>) {
+    let Some(outcome) = outcome else {
+        metrics::gauge!("kronika_web_overview_gc_scan_complete").set(0.0);
+        metrics::gauge!("kronika_web_overview_gc_sweep_authorized").set(0.0);
+        metrics::gauge!("kronika_web_overview_gc_quota_exceeded").set(0.0);
+        metrics::gauge!("kronika_web_overview_gc_pending").set(0.0);
+        metrics::gauge!("kronika_web_overview_gc_scanned_entries").set(0.0);
+        for kind in ["committed", "temporary", "quarantine", "lock", "foreign"] {
+            record_gc_category(kind, GcCategoryUsage::default());
+        }
+        return;
+    };
+
+    metrics::gauge!("kronika_web_overview_gc_scan_complete").set(f64::from(outcome.scan_complete));
+    metrics::gauge!("kronika_web_overview_gc_sweep_authorized")
+        .set(f64::from(outcome.sweep_authorized));
+    metrics::gauge!("kronika_web_overview_gc_scanned_entries").set(outcome.scanned as f64);
+    metrics::counter!("kronika_web_overview_gc_deleted_finals_total")
+        .increment(outcome.deleted_finals);
+    metrics::counter!("kronika_web_overview_gc_deleted_artifacts_total")
+        .increment(outcome.deleted_artifacts);
+    metrics::counter!("kronika_web_overview_gc_unlinked_logical_bytes_total")
+        .increment(outcome.unlinked_logical_bytes);
+    metrics::counter!("kronika_web_overview_gc_unlinked_allocated_bytes_total")
+        .increment(outcome.unlinked_allocated_bytes);
+    if let Some(reason) = outcome.skip_reason {
+        metrics::counter!(
+            "kronika_web_overview_gc_skipped_total",
+            "reason" => gc_skip_reason(reason)
+        )
+        .increment(1);
+    }
+    if outcome.scan_complete {
+        metrics::gauge!("kronika_web_overview_gc_quota_exceeded")
+            .set(f64::from(outcome.quota_exceeded));
+        metrics::gauge!("kronika_web_overview_gc_pending").set(outcome.pending as f64);
+        for (kind, usage) in [
+            ("committed", outcome.usage.committed),
+            ("temporary", outcome.usage.temporary),
+            ("quarantine", outcome.usage.quarantine),
+            ("lock", outcome.usage.locks),
+            ("foreign", outcome.usage.foreign),
+        ] {
+            record_gc_category(kind, usage);
+        }
+    }
+}
+
+fn record_overview_diagnostics(diagnostics: overview::live::OverviewDiagnostics) {
+    metrics::counter!("kronika_web_overview_durable_hits_total").absolute(diagnostics.durable_hits);
+    metrics::counter!("kronika_web_overview_fallback_hits_total")
+        .absolute(diagnostics.fallback_hits);
+    metrics::counter!("kronika_web_overview_rebuilt_total").absolute(diagnostics.rebuilt);
+    metrics::counter!("kronika_web_overview_promotions_total").absolute(diagnostics.promotions);
+    metrics::counter!("kronika_web_overview_persistence_failures_total")
+        .absolute(diagnostics.persistence_failures);
+    metrics::counter!("kronika_web_overview_sealed_failures_total")
+        .absolute(diagnostics.sealed_failures);
+}
 
 fn default_overview_config() -> OverviewConfig {
     static INSTANCE: AtomicU64 = AtomicU64::new(0);
@@ -336,6 +437,7 @@ impl AppState {
             cache_root,
             namespace,
             fallback,
+            gc,
             response_cache_bytes,
             response_cache_entries,
             cursor_max_views,
@@ -345,11 +447,15 @@ impl AppState {
         let delta = snapshot
             .refresh_incremental_delta()
             .map_err(StateBuildError::Snapshot)?;
-        let mut overview = overview::OverviewIndex::new(cache_root, namespace, fallback)
-            .map_err(StateBuildError::Overview)?;
+        let mut overview =
+            overview::OverviewIndex::with_gc_config(cache_root, namespace, fallback, gc)
+                .map_err(StateBuildError::Overview)?;
         let timeline = overview
             .assemble(&snapshot, &delta)
             .map_err(StateBuildError::Overview)?;
+        overview::resilience::record_persist_snapshot(overview.persist_mode());
+        record_overview_diagnostics(overview.diagnostics());
+        record_gc_metrics(None);
         let cursor_registry =
             overview::cursor::CursorRegistry::new(overview::cursor::CursorConfig {
                 max_views: cursor_max_views,
@@ -468,19 +574,27 @@ impl AppState {
             .overview
             .lock()
             .map_err(|_error| OverviewBuildError::WriterPoisoned)?;
-        let timeline = overview.assemble_with_live(&snapshot, delta)?;
+        let probe = overview.probe_persistence();
+        let timeline = match overview.assemble_with_live(&snapshot, delta) {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                let persist = overview.persist_mode();
+                drop(overview);
+                overview::resilience::record_probe_metrics(probe);
+                overview::resilience::record_persist_snapshot(persist);
+                return Err(error);
+            }
+        };
         let diagnostics = overview.diagnostics();
+        let gc = overview.collect_fact_garbage();
+        let persist = overview.persist_mode();
         drop(overview);
-        metrics::gauge!("kronika_web_overview_durable_hits_total")
-            .set(diagnostics.durable_hits as f64);
-        metrics::gauge!("kronika_web_overview_fallback_hits_total")
-            .set(diagnostics.fallback_hits as f64);
-        metrics::gauge!("kronika_web_overview_rebuilt_total").set(diagnostics.rebuilt as f64);
-        metrics::gauge!("kronika_web_overview_promotions_total").set(diagnostics.promotions as f64);
-        metrics::gauge!("kronika_web_overview_persistence_failures_total")
-            .set(diagnostics.persistence_failures as f64);
-        metrics::gauge!("kronika_web_overview_sealed_failures_total")
-            .set(diagnostics.sealed_failures as f64);
+        overview::resilience::record_probe_metrics(probe);
+        overview::resilience::record_persist_snapshot(persist);
+        if gc.is_some() {
+            record_gc_metrics(gc);
+        }
+        record_overview_diagnostics(diagnostics);
         metrics::gauge!("kronika_web_overview_data_through_us")
             .set(timeline.data_through_us().unwrap_or_default() as f64);
         self.cursor_registry.prune(

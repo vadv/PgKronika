@@ -11,6 +11,7 @@ pub(crate) mod dto;
 pub(crate) mod handlers;
 pub(crate) mod health;
 pub(crate) mod live;
+pub(crate) mod resilience;
 pub(crate) mod view;
 
 pub(crate) use live::OverviewIndex;

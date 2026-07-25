@@ -23,6 +23,12 @@ timeline views.
 | `KRONIKA_WEB_OVERVIEW_NAMESPACE` | байты canonical store path | Стабильная identity store/deployment в ключах timeline-фактов. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_SEGMENT_HOURS` | `24` | Общий лимит segment-hours, сохраняемых после восстанавливаемой ошибки durable publication. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_BYTES` | `67108864` | Byte budget canonical facts для process-local fallback. |
+| `KRONIKA_WEB_OVERVIEW_GC_MAX_ENTRIES` | `100000` | Максимальное число записей в полном сканировании кэша фактов; достижение предела запрещает удаление. |
+| `KRONIKA_WEB_OVERVIEW_GC_GRACE_GENERATIONS` | `2` | Число разных авторитетных поколений GC до допуска неактуального готового файла к удалению. |
+| `KRONIKA_WEB_OVERVIEW_GC_WALL_GRACE_S` | `120` | Минимальное время после первого авторитетного обнаружения неактуального файла, секунды. |
+| `KRONIKA_WEB_OVERVIEW_GC_ARTIFACT_GRACE_S` | `600` | Минимальный возраст распознанного временного или карантинного файла перед удалением, секунды. |
+| `KRONIKA_WEB_OVERVIEW_CACHE_MAX_LOGICAL_BYTES` | не задан | Необязательный предел суммы логических `st_size` учтённых файлов в пространстве имён кэша. |
+| `KRONIKA_WEB_OVERVIEW_CACHE_MAX_FILES` | не задан | Необязательный предел числа учтённых файлов в пространстве имён кэша. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES` | `67108864` | Logical-byte budget serialized response cache overview/health. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_ENTRIES` | `4096` | Лимит entries в serialized response cache overview/health. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS` | `64` | Максимальное число event views, закреплённых для продолжения cursor. |
@@ -46,6 +52,10 @@ Auth закрывает UI и `/v1/*`; `/healthz`, `/readyz` и `/metrics` вс�
 | Ресурс | Дефолт | Ограничение или ceiling |
 | --- | ---: | ---: |
 | Fallback после восстанавливаемой ошибки durable publication | 24 segment-hours, 64 MiB | 744 hours, 256 MiB |
+| Сканирование кэша фактов | 100 000 записей | 1 000 000 записей |
+| Grace для неактуального готового файла | 2 разных авторитетных поколения GC и 120 s | Оба значения ненулевые; поколений должно быть не меньше 2 |
+| Grace служебных файлов публикации | 600 s | Ненулевое значение |
+| Допуск в постоянный кэш фактов | По умолчанию нет предела байтов и файлов | Необязательные ненулевые пределы логических байтов и числа файлов |
 | Serialized response cache overview/health | 4 096 entries, logical charge 64 MiB | Оба настраиваемых budget ненулевые и помещаются в `usize`. |
 | Закреплённые event views для cursors | 64 views, logical charge 512 MiB, TTL 300 s | Все budgets ненулевые; число и байты помещаются в `usize`. |
 | Период timeline query | — | 31 сутки |
@@ -54,11 +64,45 @@ Auth закрывает UI и `/v1/*`; `/healthz`, `/readyz` и `/metrics` вс�
 | Notable preview | 100 элементов | Фиксируется notable policy v1 |
 | Health line | — | 2 000 points |
 
-Все семь числовых budget-переменных `KRONIKA_WEB_OVERVIEW_*` принимают
-ненулевые беззнаковые десятичные целые числа. Byte-, entry- и view-budgets
-должны помещаться в платформенный `usize`. Fallback дополнительно отклоняет
-значения больше 744 segment-hours или 268435456 bytes. Неверное значение
-останавливает startup до bind listener.
+Числовые параметры `KRONIKA_WEB_OVERVIEW_*` задаются беззнаковыми десятичными
+целыми. Обязательные бюджеты и интервалы должны быть ненулевыми; оба предела
+постоянного кэша можно не задавать. Значения байтов, записей и представлений,
+которые преобразуются в размер процесса, должны помещаться в платформенный
+`usize`. Fallback дополнительно отклоняет значения больше 744 segment-hours
+или 268435456 bytes. Неверное значение завершает запуск до открытия listener.
+
+## Работа постоянного кэша фактов
+
+Выделяйте каждому web-процессу отдельный каталог кэша, если развёртывание не
+предусматривает один процесс с правом записи. Первый `FactStore`, захвативший
+корневую блокировку, удерживает её всё время своей работы. Другие процессы с
+тем же каталогом могут читать готовые факты, но публикация и GC возвращают
+конфликт; новые факты остаются в ограниченном локальном fallback процесса.
+
+Web запрашивает GC после каждых 60 успешных публикаций timeline. Grace по
+поколениям продвигается только при разных полных авторитетных сканированиях GC,
+а не при обычных обновлениях. При настройках по умолчанию с первого
+сканирования, которое не нашло готовый файл в актуальном наборе, также должно
+пройти 120 секунд; поэтому удаление может потребовать ещё одного сканирования.
+Недоступный запечатанный сегмент, ошибка сканирования или достижение лимита
+запрещают удаление и не продвигают grace. GC работает только внутри
+`overview/v1`, проверяет идентичность готового файла и не касается исходных
+PGM, `active.parts`, блокировок, символьных ссылок и посторонних файлов.
+
+Необязательные пределы постоянного кэша считают логические размеры и число
+файлов. Это не свободное место и не физическая квота файловой системы. Если
+полное сканирование не может допустить публикацию без превышения заданного
+предела, ответ всё равно использует ограниченный fallback в памяти. При
+`ENOSPC` или исчерпании настроенной квоты выполняется не больше одного
+авторитетного прохода GC и одной повторной публикации.
+
+Задержка повторной записи не блокирует чтение готовых фактов. Даже если новых
+фактов нет, обновление запускает одну созревшую проверку восстановления. После
+ошибок доступа и файловой системы только для чтения первая проверка выполняется
+через пять минут. При нехватке места и временных ошибках I/O действует
+экспоненциальная задержка с индивидуальным для каждого экземпляра разбросом и
+пределом пять минут. Ошибки пути, структуры кэша и идентичности, а также
+неклассифицированные ошибки I/O сообщаются без включения общей задержки.
 
 ## Endpoints
 
@@ -188,17 +232,34 @@ Warnings сканирования и повреждённые диапазоны
 
 ## Метрики timeline
 
-`/metrics` публикует gauges/counters для timeline:
+`/metrics` публикует монотонные счётчики работы timeline:
 `kronika_web_overview_durable_hits_total`,
 `kronika_web_overview_fallback_hits_total`,
 `kronika_web_overview_rebuilt_total`,
 `kronika_web_overview_promotions_total`,
 `kronika_web_overview_persistence_failures_total`,
-`kronika_web_overview_sealed_failures_total`,
+`kronika_web_overview_sealed_failures_total`. Они включают первоначальную
+сборку view. Продвижение представления показывают
 `kronika_web_store_view_generation`,
 `kronika_web_overview_view_generation`,
 `kronika_web_overview_data_through_us` и
-`kronika_web_overview_refresh_errors_total`. Давление cursor registry видно в
+`kronika_web_overview_refresh_errors_total`.
+
+Состояние постоянной записи показывают
+`kronika_web_overview_persist_{mode,failures,retry_after_seconds,probe_in_flight}`,
+взаимоисключающие gauges с закрытым набором значений labels
+`kronika_web_overview_persist_reason{reason}` и
+`kronika_web_overview_persist_failure_class{class}`, а также
+`kronika_web_overview_persist_probe_{attempts,failures,skipped}_total`. GC
+публикует gauges полноты сканирования, разрешения удаления, превышения квоты,
+ожидающих файлов и числа просмотренных записей; gauges файлов, логических и
+выделенных байтов для закрытых классов
+`kind={committed,temporary,quarantine,lock,foreign}`; счётчики пропусков,
+удалённых файлов и отвязанных логических/выделенных байтов. «Отвязанные
+выделенные байты» — значение `st_blocks` открытого inode перед unlink; открытый
+дескриптор или другая жёсткая ссылка могут сохранить эти блоки на диске.
+
+Давление cursor registry видно в
 `kronika_web_timeline_cursor_views`, `kronika_web_timeline_cursor_bytes` и
 `kronika_web_timeline_cursor_pins_total`,
 `kronika_web_timeline_cursor_resolves_total`,
@@ -221,5 +282,5 @@ build завершается ошибкой, web публикует свежую
 environment configuration, ошибка первого открытия store/overview или
 недоступная энтропия ОС для аутентификации cursor завершают процесс до bind.
 
-У бинарника нет CLI-флагов. MCP, удалённые хранилища, retention и доставка
-алертов не реализованы.
+У бинарника нет CLI-флагов. MCP, удалённые хранилища, retention исходных
+сегментов и доставка алертов не реализованы.
