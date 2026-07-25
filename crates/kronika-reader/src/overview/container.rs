@@ -1320,9 +1320,11 @@ fn empty_block(kind: BlockKind, bounds: &Bounds) -> Result<BlockContent, CacheRe
         BlockKind::EventObservations => Ok(BlockContent::EventObservations(Box::new(
             EventObservationsBlock::new(Vec::new(), bounds)?,
         ))),
-        BlockKind::EventFacts => Ok(BlockContent::EventFacts(Box::new(
-            EventFactsBlock::new(Vec::new(), &StringTableBlock::new(Vec::new(), bounds)?, bounds)?,
-        ))),
+        BlockKind::EventFacts => Ok(BlockContent::EventFacts(Box::new(EventFactsBlock::new(
+            Vec::new(),
+            &StringTableBlock::new(Vec::new(), bounds)?,
+            bounds,
+        )?))),
         BlockKind::LossCoverage => Ok(BlockContent::LossCoverage(Box::new(
             LossCoverageBlock::new(
                 Coverage::empty(),
@@ -1877,18 +1879,18 @@ mod tests {
         assert_eq!(
             encoded,
             concat!(
-                "50474b4f564600000100a0000100000001000000010000000100000001000000",
+                "50474b4f564600000100a0000100000002000000040000000100000001000000",
                 "0700000000000000e803000000000000d0070000000000000010000000000000",
                 "1111111111111111111111111111111111111111111111111111111111111111",
                 "2222222222222222222222222222222222222222222222222222222222222222",
-                "a0000000000000000900000040000100d2040000000000004433221144b2353b",
+                "a0000000000000000900000040000100d20400000000000044332211c468a744",
             )
         );
     }
 
     #[test]
     fn known_schema_flags_and_time_metadata_are_enforced() {
-        for (entry, field, value) in [(0, 4, 2_u8), (0, 6, 0_u8), (5, 6, 3_u8)] {
+        for (entry, field, value) in [(0, 4, 3_u8), (0, 6, 0_u8), (5, 6, 3_u8)] {
             let mut bytes = valid_file();
             bytes[entry_field(entry, field)] = value;
             reseal_directory(&mut bytes);
@@ -1961,7 +1963,7 @@ mod tests {
         .expect("build gauge file");
         let gauge = entry_index(&bytes, BlockKind::GaugeSamples);
         let body = entry_body_range(&bytes, gauge);
-        let value = body.start + 1 + 16 + 8;
+        let value = body.end - size_of::<f64>();
         bytes[value..value + 8].copy_from_slice(&f64::NAN.to_bits().to_le_bytes());
         reseal_block(&mut bytes, gauge);
 

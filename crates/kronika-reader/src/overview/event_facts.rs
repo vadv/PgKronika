@@ -6,12 +6,12 @@
 //! them. Every count and text reference is bounded before allocation.
 
 use kronika_analytics::overview::{
-    CapacityFactPayload, CheckpointFactPayload, CounterDeltaFactPayload, CoverageRef,
-    CoverageSpan, DroppedFieldCount, EntityKind, EntityRef, ErrorCategory, ErrorFactPayload,
-    EventFact, EventKind, EventPayload, EvidenceQuality, FactId, FactShape, FiniteF64,
-    InvalidEventFact, LifecycleFactPayload, LockWaitFactPayload, LossReason, LossSummary,
-    MaintenanceFactPayload, ObservationId, RetainedExactness, Severity, SlowQueryFactPayload,
-    SourceScopeId, SqlState, StateTransitionFactPayload, TempFileFactPayload,
+    CapacityFactPayload, CheckpointFactPayload, CounterDeltaFactPayload, CoverageRef, CoverageSpan,
+    DroppedFieldCount, EntityKind, EntityRef, ErrorCategory, ErrorFactPayload, EventFact,
+    EventKind, EventPayload, EvidenceQuality, FactId, FactShape, FiniteF64, InvalidEventFact,
+    LifecycleFactPayload, LockWaitFactPayload, LossReason, LossSummary, MaintenanceFactPayload,
+    ObservationId, RetainedExactness, Severity, SlowQueryFactPayload, SourceScopeId, SqlState,
+    StateTransitionFactPayload, TempFileFactPayload,
 };
 
 use super::block::{BlockError, BlockKind, EncodableBlock, StringTableBlock};
@@ -43,10 +43,7 @@ impl EventFactsBlock {
             return Err(BlockError::AboveBound);
         }
         facts.sort_by(EventFact::canonical_cmp);
-        if facts
-            .windows(2)
-            .any(|pair| pair[0].fact_id() == pair[1].fact_id())
-        {
+        if has_duplicate_fact_id(&facts) {
             return Err(BlockError::Duplicate);
         }
         for fact in &facts {
@@ -118,6 +115,9 @@ impl EventFactsBlock {
                 std::cmp::Ordering::Equal => return Err(BlockError::Duplicate),
                 std::cmp::Ordering::Greater => return Err(BlockError::Unsorted),
             }
+        }
+        if has_duplicate_fact_id(&facts) {
+            return Err(BlockError::Duplicate);
         }
         Ok(Self {
             facts,
@@ -233,8 +233,15 @@ const fn map_invalid_fact(error: InvalidEventFact) -> BlockError {
         InvalidEventFact::MissingSupportingEvidence
         | InvalidEventFact::ZeroCount
         | InvalidEventFact::IndividualCountNotOne
-        | InvalidEventFact::TimestampOverflow => BlockError::Reconstruct,
+        | InvalidEventFact::TimestampOverflow
+        | InvalidEventFact::SemanticMismatch => BlockError::Reconstruct,
     }
+}
+
+fn has_duplicate_fact_id(facts: &[EventFact]) -> bool {
+    let mut ids = facts.iter().map(EventFact::fact_id).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.windows(2).any(|pair| pair[0] == pair[1])
 }
 
 const fn shape_code(shape: FactShape) -> u8 {
@@ -344,20 +351,13 @@ fn read_loss(
             if reasons.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(BlockError::Unsorted);
             }
-            Ok(Some(LossSummary::new(
-                reasons,
-                read_optional_u64(reader)?,
-            )))
+            Ok(Some(LossSummary::new(reasons, read_optional_u64(reader)?)))
         }
         _ => Err(BlockError::InvalidEnum),
     }
 }
 
-fn write_payload(
-    writer: &mut ByteWriter,
-    payload: &EventPayload,
-    strings: &StringTableBlock,
-) {
+fn write_payload(writer: &mut ByteWriter, payload: &EventPayload, strings: &StringTableBlock) {
     match payload {
         EventPayload::Error(value) => {
             writer.u8(1);
@@ -571,9 +571,7 @@ fn validate_fact_text(
     strings: &StringTableBlock,
 ) -> Result<(), BlockError> {
     let values: &[&Option<Box<str>>] = match payload {
-        EventPayload::Error(value) => {
-            &[&value.normalized_pattern, &value.database, &value.user]
-        }
+        EventPayload::Error(value) => &[&value.normalized_pattern, &value.database, &value.user],
         EventPayload::Lifecycle(value) => &[&value.shutdown_mode],
         EventPayload::Checkpoint(value) => &[&value.reason],
         EventPayload::Maintenance(value) => &[&value.relation],
@@ -615,10 +613,7 @@ fn read_text_ref(
             let maximum = strings.values().len().saturating_sub(1) as u64;
             let index = usize::try_from(reader.uvarint(maximum)?)
                 .map_err(|_error| BlockError::AboveBound)?;
-            let bytes = strings
-                .values()
-                .get(index)
-                .ok_or(BlockError::Malformed)?;
+            let bytes = strings.values().get(index).ok_or(BlockError::Malformed)?;
             let text = std::str::from_utf8(bytes).map_err(|_error| BlockError::Malformed)?;
             Ok(Some(text.into()))
         }
@@ -781,11 +776,6 @@ const fn category_from(code: u8) -> Result<ErrorCategory, BlockError> {
 
 #[cfg(test)]
 mod tests {
-    use kronika_analytics::overview::{
-        CoverageRef, EntityKind, EventFact, EventKind, EventPayload, EvidenceQuality, FactId,
-        FactShape, LifecycleFactPayload, ObservationId, RetainedExactness, SourceScopeId,
-    };
-
     use super::*;
     use crate::overview::limits::LIMIT;
 
@@ -796,10 +786,7 @@ mod tests {
             FactShape::Individual,
             CoverageSpan::new(ts, ts + 1).expect("interval"),
             1,
-            Some(EntityRef {
-                kind: EntityKind::Postmaster,
-                id: [9; 16],
-            }),
+            None,
             EventPayload::Lifecycle(Box::new(LifecycleFactPayload {
                 pid: Some(42),
                 signal: None,
@@ -819,17 +806,15 @@ mod tests {
 
     #[test]
     fn event_facts_round_trip_in_canonical_order() {
-        let strings =
-            StringTableBlock::new(vec![b"smart".to_vec().into_boxed_slice()], &LIMIT)
-                .expect("strings");
+        let strings = StringTableBlock::new(vec![b"smart".to_vec().into_boxed_slice()], &LIMIT)
+            .expect("strings");
         let block = EventFactsBlock::new(
             vec![fact(2, 20, None), fact(1, 10, Some("smart"))],
             &strings,
             &LIMIT,
         )
         .expect("block");
-        let decoded =
-            EventFactsBlock::decode(&block.encode(), &strings, &LIMIT).expect("decode");
+        let decoded = EventFactsBlock::decode(&block.encode(), &strings, &LIMIT).expect("decode");
         assert_eq!(decoded, block);
         assert_eq!(decoded.facts()[0].interval().start_us(), 10);
     }
@@ -847,7 +832,26 @@ mod tests {
     fn duplicate_fact_identity_is_rejected() {
         let strings = StringTableBlock::new(Vec::new(), &LIMIT).expect("strings");
         assert_eq!(
-            EventFactsBlock::new(vec![fact(1, 10, None), fact(1, 20, None)], &strings, &LIMIT),
+            EventFactsBlock::new(
+                vec![fact(1, 10, None), fact(2, 15, None), fact(1, 20, None)],
+                &strings,
+                &LIMIT
+            ),
+            Err(BlockError::Duplicate)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_an_interleaved_duplicate_fact_identity() {
+        let strings = StringTableBlock::new(Vec::new(), &LIMIT).expect("strings");
+        let facts = [fact(1, 10, None), fact(2, 15, None), fact(1, 20, None)];
+        let mut writer = ByteWriter::new();
+        writer.uvarint(facts.len() as u64);
+        for fact in &facts {
+            write_fact(&mut writer, fact, &strings);
+        }
+        assert_eq!(
+            EventFactsBlock::decode(&writer.into_bytes(), &strings, &LIMIT),
             Err(BlockError::Duplicate)
         );
     }

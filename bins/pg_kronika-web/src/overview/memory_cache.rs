@@ -155,9 +155,7 @@ fn evict_lru(entries: &mut HashMap<FactBuildKey, Entry>) -> bool {
     removed
 }
 
-fn logical_resident_charge(
-    entries: &HashMap<FactBuildKey, Entry>,
-) -> Option<usize> {
+fn logical_resident_charge(entries: &HashMap<FactBuildKey, Entry>) -> Option<usize> {
     if entries.is_empty() {
         return Some(0);
     }
@@ -194,8 +192,7 @@ fn record_gauges(inner: &CacheInner) {
     );
     metrics::gauge!("overview_cache_entries", "class" => "decoded_facts")
         .set(inner.entries.len() as f64);
-    metrics::gauge!("overview_cache_bytes", "class" => "decoded_facts")
-        .set(inner.bytes as f64);
+    metrics::gauge!("overview_cache_bytes", "class" => "decoded_facts").set(inner.bytes as f64);
 }
 
 #[cfg(test)]

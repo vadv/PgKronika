@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use kronika_reader::{FallbackConfig, FallbackConfigError, GcConfig, GcConfigError};
 
-use crate::{OverviewColdConfig, OverviewConfig};
 use crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
+use crate::{OverviewColdConfig, OverviewConfig};
 
 const OVERVIEW_CACHE_DIR_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_DIR";
 const OVERVIEW_NAMESPACE_ENV: &str = "KRONIKA_WEB_OVERVIEW_NAMESPACE";
@@ -32,8 +32,7 @@ const CURSOR_TTL_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_TTL_S";
 const MAX_SELECTED_SEGMENTS_ENV: &str = "KRONIKA_WEB_OVERVIEW_MAX_SELECTED_SEGMENTS";
 const COLD_MAX_WORKERS_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_MAX_WORKERS";
 const COLD_MAX_QUEUE_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_MAX_QUEUE";
-const COLD_PER_REQUEST_PARALLELISM_ENV: &str =
-    "KRONIKA_WEB_OVERVIEW_COLD_PER_REQUEST_PARALLELISM";
+const COLD_PER_REQUEST_PARALLELISM_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_PER_REQUEST_PARALLELISM";
 const COLD_WAIT_TIMEOUT_MS_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_WAIT_TIMEOUT_MS";
 const COLD_RETRY_AFTER_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_RETRY_AFTER_S";
 const COLD_PGM_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_COLD_PGM_BYTES";
@@ -268,11 +267,7 @@ fn parse_cold_config(
             COLD_MAX_WORKERS_ENV,
             defaults.max_workers,
         )?,
-        max_queue: parse_nonzero_usize(
-            raw.cold_max_queue,
-            COLD_MAX_QUEUE_ENV,
-            defaults.max_queue,
-        )?,
+        max_queue: parse_nonzero_usize(raw.cold_max_queue, COLD_MAX_QUEUE_ENV, defaults.max_queue)?,
         per_request_parallelism: parse_nonzero_usize(
             raw.cold_per_request_parallelism,
             COLD_PER_REQUEST_PARALLELISM_ENV,
@@ -288,21 +283,13 @@ fn parse_cold_config(
             COLD_RETRY_AFTER_ENV,
             defaults.retry_after_seconds,
         )?,
-        pgm_bytes: parse_nonzero_u64(
-            raw.cold_pgm_bytes,
-            COLD_PGM_BYTES_ENV,
-            defaults.pgm_bytes,
-        )?,
+        pgm_bytes: parse_nonzero_u64(raw.cold_pgm_bytes, COLD_PGM_BYTES_ENV, defaults.pgm_bytes)?,
         decoded_bytes: parse_nonzero_u64(
             raw.cold_decoded_bytes,
             COLD_DECODED_BYTES_ENV,
             defaults.decoded_bytes,
         )?,
-        cpu_rows: parse_nonzero_u64(
-            raw.cold_cpu_rows,
-            COLD_CPU_ROWS_ENV,
-            defaults.cpu_rows,
-        )?,
+        cpu_rows: parse_nonzero_u64(raw.cold_cpu_rows, COLD_CPU_ROWS_ENV, defaults.cpu_rows)?,
         file_descriptors: parse_nonzero_u32(
             raw.cold_file_descriptors,
             COLD_FILE_DESCRIPTORS_ENV,
@@ -606,8 +593,7 @@ impl WebConfig {
         let max_selected_segments = std::env::var(MAX_SELECTED_SEGMENTS_ENV).ok();
         let cold_max_workers = std::env::var(COLD_MAX_WORKERS_ENV).ok();
         let cold_max_queue = std::env::var(COLD_MAX_QUEUE_ENV).ok();
-        let cold_per_request_parallelism =
-            std::env::var(COLD_PER_REQUEST_PARALLELISM_ENV).ok();
+        let cold_per_request_parallelism = std::env::var(COLD_PER_REQUEST_PARALLELISM_ENV).ok();
         let cold_wait_timeout_ms = std::env::var(COLD_WAIT_TIMEOUT_MS_ENV).ok();
         let cold_retry_after_secs = std::env::var(COLD_RETRY_AFTER_ENV).ok();
         let cold_pgm_bytes = std::env::var(COLD_PGM_BYTES_ENV).ok();
@@ -797,7 +783,7 @@ mod tests {
             },
             cache_dir.clone(),
         )
-            .expect("default overview policy is valid");
+        .expect("default overview policy is valid");
         let defaults = OverviewConfig::new(cache_dir.clone(), b"default".to_vec());
         let expected = ParsedOverviewConfig {
             cache_dir,
@@ -917,10 +903,7 @@ mod tests {
         assert_eq!(cfg.overview_response_cache_entries, 128);
         assert_eq!(cfg.overview_decoded_cache_bytes, 16_777_216);
         assert_eq!(cfg.overview_decoded_cache_entries, 64);
-        assert_eq!(
-            cfg.overview_source_scrub_interval,
-            Duration::from_secs(30)
-        );
+        assert_eq!(cfg.overview_source_scrub_interval, Duration::from_secs(30));
         assert_eq!(cfg.overview_cursor_max_views, 16);
         assert_eq!(cfg.overview_cursor_max_bytes, 4_194_304);
         assert_eq!(cfg.overview_cursor_ttl, Duration::from_mins(1));
@@ -1235,11 +1218,8 @@ mod tests {
 
     #[test]
     fn overview_raw_requires_an_explicit_namespace() {
-        let error = parse_overview_config(
-            OverviewConfigRaw::default(),
-            PathBuf::from("/cache"),
-        )
-        .expect_err("implicit deployment identity must not be accepted");
+        let error = parse_overview_config(OverviewConfigRaw::default(), PathBuf::from("/cache"))
+            .expect_err("implicit deployment identity must not be accepted");
         assert_eq!(error, format!("{OVERVIEW_NAMESPACE_ENV} is not set"));
     }
 

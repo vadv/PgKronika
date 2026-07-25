@@ -10,9 +10,9 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::overview::{
-    EntityKind, ErrorCategory, EventFact as CanonicalEventFact,
-    EventPayload as CanonicalEventPayload, EventObservation, EvidenceQuality, IdentityQuality,
-    LossReason, LossSummary, NotableClass, NotablePolicy, ObservationPayload, Severity,
+    EntityKind, ErrorCategory, EventFact as CanonicalEventFact, EventObservation,
+    EventPayload as CanonicalEventPayload, EvidenceQuality, IdentityQuality, LossReason,
+    LossSummary, NotableClass, NotablePolicy, ObservationPayload, Severity,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -415,13 +415,11 @@ fn canonical_payload(fact: &CanonicalEventFact) -> Option<EventPayload> {
                 population_total: value.population_total,
             }))
         }
-        CanonicalEventPayload::Capacity(value) => {
-            Some(EventPayload::Capacity(CapacityPayload {
-                kind,
-                total_bytes: value.total_bytes,
-                available_bytes: value.available_bytes,
-            }))
-        }
+        CanonicalEventPayload::Capacity(value) => Some(EventPayload::Capacity(CapacityPayload {
+            kind,
+            total_bytes: value.total_bytes,
+            available_bytes: value.available_bytes,
+        })),
         CanonicalEventPayload::Marker => Some(EventPayload::Marker(MarkerPayload { kind })),
         _ => None,
     }

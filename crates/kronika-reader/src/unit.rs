@@ -209,9 +209,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             let chunk_len = (len - consumed).min(scratch.len());
             let offset = entry
                 .offset
-                .checked_add(
-                    u64::try_from(consumed).map_err(|_error| ReadError::CounterOverflow)?,
-                )
+                .checked_add(u64::try_from(consumed).map_err(|_error| ReadError::CounterOverflow)?)
                 .ok_or(ReadError::CounterOverflow)?;
             self.reader
                 .read_exact_at(&mut scratch[..chunk_len], offset)?;

@@ -72,8 +72,7 @@ pub(crate) fn record_persist_snapshot(snapshot: PersistModeSnapshot) {
     metrics::gauge!("kronika_web_overview_persist_failures").set(f64::from(snapshot.failures));
     metrics::gauge!("kronika_web_overview_persist_retry_after_seconds")
         .set(snapshot.retry_after.as_secs_f64());
-    metrics::gauge!("overview_persist_backoff_seconds")
-        .set(snapshot.retry_after.as_secs_f64());
+    metrics::gauge!("overview_persist_backoff_seconds").set(snapshot.retry_after.as_secs_f64());
     metrics::gauge!("kronika_web_overview_persist_probe_in_flight")
         .set(f64::from(snapshot.probe_in_flight));
 
@@ -86,7 +85,9 @@ pub(crate) fn record_persist_snapshot(snapshot: PersistModeSnapshot) {
                 "mode" => candidate_mode,
                 "reason" => candidate_reason
             )
-            .set(f64::from(candidate_mode == mode && candidate_reason == reason));
+            .set(f64::from(
+                candidate_mode == mode && candidate_reason == reason,
+            ));
         }
     }
     for candidate in PERSIST_REASONS {

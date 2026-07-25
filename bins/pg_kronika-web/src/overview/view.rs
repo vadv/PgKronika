@@ -11,8 +11,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use kronika_analytics::overview::{
-    CounterSample, Coverage, CoverageSpan, EventFact as CanonicalEventFact, FactorCoverage,
-    FactId, GaugeSample, MetricFactor, MetricSeriesDescriptor, MetricSeriesId, OracleError, OracleLimits,
+    CounterSample, Coverage, CoverageSpan, EventFact as CanonicalEventFact, FactId, FactorCoverage,
+    GaugeSample, MetricFactor, MetricSeriesDescriptor, MetricSeriesId, OracleError, OracleLimits,
     OracleResult, PhysicalCountSemantics, RawOracle, RetainedExactness, SourceCompleteness,
     SourceScopeId, query_bounded, query_bounded_materialized,
 };
@@ -483,8 +483,7 @@ impl DescriptorView {
             |descriptor| (descriptor.min_ts, descriptor.max_ts),
         );
         output.extend(intersections.into_iter().filter_map(|index| {
-            descriptor_gap(self.unavailable[index], range)
-                .map(|span| SourceGap::new(source, span))
+            descriptor_gap(self.unavailable[index], range).map(|span| SourceGap::new(source, span))
         }));
         output.sort_unstable();
         output.dedup();
@@ -1042,9 +1041,14 @@ impl IndexView {
         let mut materialized_samples = 0_usize;
 
         for gap in &self.source_gaps {
-            let Some(scope) = self.source_descriptors.iter().find_map(|source| {
-                (source.source_id() == gap.source_id()).then_some(source.source_scope_id())
-            }).flatten() else {
+            let Some(scope) = self
+                .source_descriptors
+                .iter()
+                .find_map(|source| {
+                    (source.source_id() == gap.source_id()).then_some(source.source_scope_id())
+                })
+                .flatten()
+            else {
                 continue;
             };
             gaps.entry(scope)
@@ -1155,13 +1159,11 @@ impl IndexView {
             if samples
                 .windows(2)
                 .any(|pair| pair[0].ts_us() == pair[1].ts_us())
-                || samples
-                    .first()
-                    .is_some_and(|first| {
-                        samples
-                            .iter()
-                            .any(|sample| sample.alignment_id() != first.alignment_id())
-                    })
+                || samples.first().is_some_and(|first| {
+                    samples
+                        .iter()
+                        .any(|sample| sample.alignment_id() != first.alignment_id())
+                })
             {
                 return Err(CanonicalFactQueryError::ContradictoryFacts);
             }
@@ -1185,10 +1187,7 @@ impl IndexView {
         for (descriptor, samples) in gauge_series.values().filter(|(descriptor, _samples)| {
             matches!(
                 MetricFactor::from_id(descriptor.factor_id),
-                Some(
-                    MetricFactor::PgStatisticsResetAt
-                        | MetricFactor::PgPostmasterStartTime
-                )
+                Some(MetricFactor::PgStatisticsResetAt | MetricFactor::PgPostmasterStartTime)
             )
         }) {
             let mut samples = samples.clone();
@@ -1208,8 +1207,7 @@ impl IndexView {
                 if pair[1].ts_us() < range.start_us()
                     || pair[1].ts_us() >= range.end_us()
                     || known_gaps.spans().iter().any(|gap| {
-                        gap.start_us() < pair[1].ts_us()
-                            && gap.end_us() > pair[0].ts_us()
+                        gap.start_us() < pair[1].ts_us() && gap.end_us() > pair[0].ts_us()
                     })
                 {
                     continue;
@@ -1223,21 +1221,11 @@ impl IndexView {
             }
         }
 
-        derive_sender_disappearances(
-            &state_series,
-            &gaps,
-            range,
-            max_facts,
-            &mut facts,
-        )?;
+        derive_sender_disappearances(&state_series, &gaps, range, max_facts, &mut facts)?;
 
         for (_series_id, (descriptor, mut records)) in state_series {
             records.sort_unstable_by_key(|record| {
-                (
-                    record.ts_us,
-                    record.state_code,
-                    record.population_total,
-                )
+                (record.ts_us, record.state_code, record.population_total)
             });
             records.dedup();
             if records
@@ -1254,9 +1242,11 @@ impl IndexView {
                 if pair[1].ts_us < range.start_us() || pair[1].ts_us >= range.end_us() {
                     continue;
                 }
-                if known_gaps.spans().iter().any(|gap| {
-                    gap.start_us() < pair[1].ts_us && gap.end_us() > pair[0].ts_us
-                }) {
+                if known_gaps
+                    .spans()
+                    .iter()
+                    .any(|gap| gap.start_us() < pair[1].ts_us && gap.end_us() > pair[0].ts_us)
+                {
                     continue;
                 }
                 if let Some(fact) = CanonicalEventFact::from_state_transition(
@@ -1352,10 +1342,15 @@ impl IndexView {
             .queryable_facts()
             .filter(|facts| source_selected(sources, facts.identity().pgm_source_id))
         {
-            for record in segment.loss_coverage().factor_coverage().iter().filter(|record| {
-                record.interval.start_us() < range.end_us()
-                    && record.interval.end_us() > range.start_us()
-            }) {
+            for record in segment
+                .loss_coverage()
+                .factor_coverage()
+                .iter()
+                .filter(|record| {
+                    record.interval.start_us() < range.end_us()
+                        && record.interval.end_us() > range.start_us()
+                })
+            {
                 if coverage.len() == max_records {
                     return Err(CanonicalFactQueryError::LimitExceeded);
                 }
@@ -1517,19 +1512,14 @@ impl RawOracle for IndexView {
 }
 
 fn derive_sender_disappearances(
-    states: &BTreeMap<
-        MetricSeriesId,
-        (MetricSeriesDescriptor, Vec<EntityStateRecord>),
-    >,
+    states: &BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, Vec<EntityStateRecord>)>,
     gaps: &BTreeMap<SourceScopeId, Coverage>,
     range: CoverageSpan,
     max_facts: usize,
     facts: &mut BTreeMap<FactId, CanonicalEventFact>,
 ) -> Result<(), CanonicalFactQueryError> {
-    let mut boundaries = BTreeMap::<
-        (SourceScopeId, u32),
-        Vec<(MetricSeriesDescriptor, EntityStateRecord)>,
-    >::new();
+    let mut boundaries =
+        BTreeMap::<(SourceScopeId, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
     let mut snapshots = BTreeMap::<
         (SourceScopeId, u32, i64),
         BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
@@ -1901,8 +1891,8 @@ mod tests {
             )
             .expect("plan")
             .selected_count(),
-            1,
-            "a range touching only the first segment selects one"
+            2,
+            "the intersecting segment retains the nearest right halo"
         );
         assert_eq!(
             crate::overview::selection::SelectedSealedPlan::build(
@@ -1913,8 +1903,8 @@ mod tests {
             )
             .expect("plan")
             .selected_count(),
-            0,
-            "a range in the gap selects none"
+            2,
+            "a range between segments retains both boundary halos"
         );
     }
 

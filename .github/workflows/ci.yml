@@ -175,7 +175,6 @@ jobs:
           elapsed=$((SECONDS - started))
           echo "BDD source build seconds: ${elapsed}"
           echo "- source build seconds: ${elapsed}" >> "$GITHUB_STEP_SUMMARY"
-          rm -f image.tar
       - name: Verify PostgreSQL runtime
         run: ./scripts/bdd-image.sh check-runtime
       - name: Run the PostgreSQL matrix

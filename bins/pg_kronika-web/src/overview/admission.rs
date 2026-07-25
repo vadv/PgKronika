@@ -36,13 +36,13 @@ impl ColdWorkWeight {
         let rows = catalog.entries.iter().fold(0_u64, |total, entry| {
             total.saturating_add(u64::from(entry.rows))
         });
-        let pgm_bytes = byte_units(unit.source_file_len(), 64);
-        let decoded_bytes = byte_units(stored_bytes.saturating_mul(4), 64);
+        let pgm_bytes = byte_units(unit.source_file_len());
+        let decoded_bytes = byte_units(stored_bytes.saturating_mul(4));
         Self {
             workers: 1,
             pgm_bytes,
             decoded_bytes,
-            cpu: row_units(rows, 32),
+            cpu: row_units(rows),
             file_descriptors: 4,
             read_bytes: pgm_bytes.max(decoded_bytes),
             write_bytes: decoded_bytes,
@@ -88,19 +88,17 @@ impl ColdWorkWeight {
     }
 }
 
-fn byte_units(bytes: u64, maximum: u32) -> u32 {
-    units(bytes, BYTE_WEIGHT_QUANTUM, maximum)
+fn byte_units(bytes: u64) -> u32 {
+    units(bytes, BYTE_WEIGHT_QUANTUM)
 }
 
-fn row_units(rows: u64, maximum: u32) -> u32 {
-    units(rows, ROW_WEIGHT_QUANTUM, maximum)
+fn row_units(rows: u64) -> u32 {
+    units(rows, ROW_WEIGHT_QUANTUM)
 }
 
-fn units(value: u64, quantum: u64, maximum: u32) -> u32 {
+fn units(value: u64, quantum: u64) -> u32 {
     let rounded = value.saturating_add(quantum - 1) / quantum;
-    u32::try_from(rounded.max(1))
-        .unwrap_or(u32::MAX)
-        .min(maximum)
+    u32::try_from(rounded.max(1)).unwrap_or(u32::MAX)
 }
 
 /// Fixed process-wide cold-work limits.
@@ -484,6 +482,13 @@ mod tests {
             write_bytes: 1,
             publications: 1,
         }
+    }
+
+    #[test]
+    fn work_units_are_not_clamped_to_default_capacity() {
+        assert_eq!(byte_units(65 * BYTE_WEIGHT_QUANTUM), 65);
+        assert_eq!(row_units(33 * ROW_WEIGHT_QUANTUM), 33);
+        assert_eq!(units(u64::MAX, 1), u32::MAX);
     }
 
     async fn wait_for_queue(admission: &ColdAdmission, expected: usize) {

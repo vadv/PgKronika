@@ -34,14 +34,14 @@ pub use coverage::{
     Applicability, BoundaryQuality, Coverage, CoverageSpan, CoverageState, PeriodQuality,
     PhysicalCountSemantics, RetainedExactness, SourceCompleteness,
 };
-pub use finite::FiniteF64;
 pub use fact::{
     CapacityFactPayload, CheckpointFactPayload, CounterDeltaFactPayload, CoverageRef, EntityKind,
-    EntityRef, ErrorFactPayload, EventFact, EventKind, EventPayload, FactShape,
-    InvalidEventFact, LifecycleFactPayload, LockWaitFactPayload, MaintenanceFactPayload,
-    SlowQueryFactPayload, StateTransitionFactPayload, TempFileFactPayload,
-    counter_sample_observation_id, gauge_sample_observation_id,
+    EntityRef, ErrorFactPayload, EventFact, EventKind, EventPayload, FactShape, InvalidEventFact,
+    LifecycleFactPayload, LockWaitFactPayload, MaintenanceFactPayload, SlowQueryFactPayload,
+    StateTransitionFactPayload, TempFileFactPayload, counter_sample_observation_id,
+    gauge_sample_observation_id,
 };
+pub use finite::FiniteF64;
 pub use health::{
     CadenceEpochId, DomainId, DomainPenalty, DownsampleError, DownsampledHealthPoint,
     FactorCoverage, FactorId, FactorPenalty, FactorSetId, FloorClass, FloorEvidence,
@@ -54,8 +54,7 @@ pub use health_line::{
     health_line, observation_floor, overview_health_policy,
 };
 pub use metric::{
-    MetricFactor, MetricSeriesDescriptor, MetricUnit, ResetFamily, derive_alignment,
-    derive_entity,
+    MetricFactor, MetricSeriesDescriptor, MetricUnit, ResetFamily, derive_alignment, derive_entity,
 };
 pub use notable::{
     DEFAULT_RESPONSE_CAP, InvalidNotablePolicy, MAX_RESPONSE_CAP, NotableClass,
@@ -92,9 +91,9 @@ pub const FACT_SCHEMA_VERSION: u32 = 2;
 
 /// Version for PGM-to-fact extraction and normalization.
 ///
-/// Version 3 adds reset/postmaster markers, complete empty-snapshot
-/// boundaries, entity disappearance, and retained collector-loss facts.
-pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 3;
+/// Version 4 makes retained collector-loss identity include its optional
+/// lower bound.
+pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 4;
 
 /// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///

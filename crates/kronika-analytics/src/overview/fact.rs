@@ -203,28 +203,18 @@ impl EventKind {
     pub const fn wire_code(self) -> &'static str {
         match self {
             Self::PgLogErrorGroupObserved => "pg.log.error_group_observed",
-            Self::PgLifecycleChildSignalTermination => {
-                "pg.lifecycle.child_signal_termination"
-            }
+            Self::PgLifecycleChildSignalTermination => "pg.lifecycle.child_signal_termination",
             Self::PgLifecycleChildProcessCrash => "pg.lifecycle.child_process_crash",
             Self::PgLifecycleShutdownRequested => "pg.lifecycle.shutdown_requested",
             Self::PgLifecycleReadyObserved => "pg.lifecycle.ready_observed",
             Self::PgCheckpointStarted => "pg.checkpoint.started",
             Self::PgCheckpointCompleted => "pg.checkpoint.completed",
-            Self::PgCheckpointTooFrequentReported => {
-                "pg.checkpoint.too_frequent_reported"
-            }
-            Self::PgMaintenanceAutovacuumReported => {
-                "pg.maintenance.autovacuum_reported"
-            }
-            Self::PgMaintenanceAutoanalyzeReported => {
-                "pg.maintenance.autoanalyze_reported"
-            }
+            Self::PgCheckpointTooFrequentReported => "pg.checkpoint.too_frequent_reported",
+            Self::PgMaintenanceAutovacuumReported => "pg.maintenance.autovacuum_reported",
+            Self::PgMaintenanceAutoanalyzeReported => "pg.maintenance.autoanalyze_reported",
             Self::PgQuerySlowGroupReported => "pg.query.slow_group_reported",
             Self::PgLockWaitReported => "pg.lock.wait_reported",
-            Self::PgLockAcquiredAfterWaitReported => {
-                "pg.lock.acquired_after_wait_reported"
-            }
+            Self::PgLockAcquiredAfterWaitReported => "pg.lock.acquired_after_wait_reported",
             Self::PgTempFileReported => "pg.temp_file.reported",
             Self::PgDatabaseDeadlockDelta => "pg.database.deadlock_delta",
             Self::PgDatabaseRecoveryConflictDelta => "pg.database.recovery_conflict_delta",
@@ -246,9 +236,7 @@ impl EventKind {
             Self::OsCgroupOomKillDelta => "os.cgroup.oom_kill_delta",
             Self::OsHostOomKillDelta => "os.host.oom_kill_delta",
             Self::OsFilesystemCapacityObservation => "os.filesystem.capacity_observation",
-            Self::OsFilesystemCapacityZeroTransition => {
-                "os.filesystem.capacity_zero_transition"
-            }
+            Self::OsFilesystemCapacityZeroTransition => "os.filesystem.capacity_zero_transition",
             Self::CollectorSnapshotGap => "collector.snapshot_gap",
             Self::CollectorSourceReadFailure => "collector.source_read_failure",
             Self::CollectorVisibilityRestricted => "collector.visibility_restricted",
@@ -559,6 +547,8 @@ pub enum InvalidEventFact {
     ZeroCount,
     /// An individual fact has a count other than one.
     IndividualCountNotOne,
+    /// Kind, payload, shape, entity, or retained-loss semantics disagree.
+    SemanticMismatch,
 }
 
 /// One validated, policy-neutral canonical event fact.
@@ -614,6 +604,18 @@ impl EventFact {
         {
             return Err(InvalidEventFact::NonCanonicalSupportingEvidence);
         }
+        if !valid_fact_semantics(
+            kind,
+            shape,
+            count,
+            entity,
+            &payload,
+            supporting_observation_ids.len(),
+            evidence_quality,
+            &coverage,
+        ) {
+            return Err(InvalidEventFact::SemanticMismatch);
+        }
         Ok(Self {
             fact_id,
             kind,
@@ -653,8 +655,8 @@ impl EventFact {
             .sort_ts_us
             .checked_add(1)
             .ok_or(InvalidEventFact::TimestampOverflow)?;
-        let interval = CoverageSpan::new(time.sort_ts_us, end)
-            .ok_or(InvalidEventFact::TimestampOverflow)?;
+        let interval =
+            CoverageSpan::new(time.sort_ts_us, end).ok_or(InvalidEventFact::TimestampOverflow)?;
         let observation_id = observation.observation_id();
         let fact_id = FactId(sha256::digest_parts(&[
             EVENT_FACT_DOMAIN_TAG,
@@ -809,8 +811,7 @@ impl EventFact {
         current_boundary: GaugeSample,
         current_population_total: u64,
     ) -> Result<Option<Self>, InvalidEventFact> {
-        if MetricFactor::from_id(sender.factor_id)
-            != Some(MetricFactor::PgReplicationSenderState)
+        if MetricFactor::from_id(sender.factor_id) != Some(MetricFactor::PgReplicationSenderState)
             || MetricFactor::from_id(boundary.factor_id)
                 != Some(MetricFactor::PgReplicationSenderSnapshotPopulation)
             || sender.source_scope_id != boundary.source_scope_id
@@ -821,8 +822,9 @@ impl EventFact {
         {
             return Ok(None);
         }
-        let previous = GaugeSample::new(sender.series_id, previous_ts_us, f64::from(previous_state))
-            .expect("u32 state is finite");
+        let previous =
+            GaugeSample::new(sender.series_id, previous_ts_us, f64::from(previous_state))
+                .expect("u32 state is finite");
         let evidence = canonical_evidence([
             gauge_sample_observation_id(previous),
             gauge_sample_observation_id(current_boundary),
@@ -874,12 +876,19 @@ impl EventFact {
             return Ok(None);
         }
         let loss = LossSummary::new(reasons.iter().copied(), lost_count_lower_bound);
-        let mut evidence_input = Vec::with_capacity(16 + 4 + 8 + 2 + loss.reasons().len());
+        let mut evidence_input = Vec::with_capacity(16 + 4 + 8 + 2 + loss.reasons().len() + 1 + 8);
         evidence_input.extend_from_slice(&source_scope_id.0);
         evidence_input.extend_from_slice(&source_type_id.to_le_bytes());
         evidence_input.extend_from_slice(&ts_us.to_le_bytes());
         evidence_input.extend_from_slice(&kind.code().to_le_bytes());
         evidence_input.extend(loss.reasons().iter().map(|reason| reason.code()));
+        match loss.lost_count_lower_bound {
+            Some(value) => {
+                evidence_input.push(1);
+                evidence_input.extend_from_slice(&value.to_le_bytes());
+            }
+            None => evidence_input.push(0),
+        }
         let evidence = vec![ObservationId(sha256::digest_parts(&[
             COLLECTOR_LOSS_OBSERVATION_TAG,
             &evidence_input,
@@ -938,9 +947,12 @@ impl EventFact {
             f64::from(previous_state),
         )
         .expect("u32 state is finite");
-        let current =
-            GaugeSample::new(descriptor.series_id, current_ts_us, f64::from(current_state))
-                .expect("u32 state is finite");
+        let current = GaugeSample::new(
+            descriptor.series_id,
+            current_ts_us,
+            f64::from(current_state),
+        )
+        .expect("u32 state is finite");
         let evidence = canonical_evidence([
             gauge_sample_observation_id(previous),
             gauge_sample_observation_id(current),
@@ -983,8 +995,7 @@ impl EventFact {
         available: GaugeSample,
     ) -> Result<Option<Self>, InvalidEventFact> {
         if total_descriptor.factor_id != MetricFactor::PgFilesystemTotalBytes.id()
-            || available_descriptor.factor_id
-                != MetricFactor::PgFilesystemAvailableBytes.id()
+            || available_descriptor.factor_id != MetricFactor::PgFilesystemAvailableBytes.id()
             || total_descriptor.source_scope_id != available_descriptor.source_scope_id
             || total_descriptor.entity != available_descriptor.entity
             || total_descriptor.entity.is_none()
@@ -1058,10 +1069,11 @@ impl EventFact {
             || previous_available.ts_us() >= current_available.ts_us()
             || previous_available.value() <= 0.0
             || current_available.value() != 0.0
-            || known_gaps.spans().iter().any(|gap| {
-                gap.start_us() < current_available.ts_us()
-                    && gap.end_us() > previous_available.ts_us()
-            })
+            || coverage_intersects(
+                known_gaps,
+                previous_available.ts_us(),
+                current_available.ts_us(),
+            )
         {
             return Ok(None);
         }
@@ -1163,13 +1175,190 @@ impl EventFact {
             .capacity()
             .checked_mul(size_of::<ObservationId>())?;
         let payload = payload_heap_bytes(&self.payload)?;
-        let loss = self.coverage.loss.as_ref().map_or(Some(0), |loss| {
-            loss.reasons()
-                .len()
-                .checked_mul(size_of::<LossReason>())
-        })?;
+        let loss = self
+            .coverage
+            .loss
+            .as_ref()
+            .map_or(Some(0), LossSummary::resident_heap_bytes)?;
         evidence.checked_add(payload)?.checked_add(loss)
     }
+}
+
+fn valid_fact_semantics(
+    kind: EventKind,
+    shape: FactShape,
+    count: u64,
+    entity: Option<EntityRef>,
+    payload: &EventPayload,
+    supporting_count: usize,
+    evidence_quality: EvidenceQuality,
+    coverage: &CoverageRef,
+) -> bool {
+    let log_payload = match kind {
+        EventKind::PgLogErrorGroupObserved => {
+            matches!(payload, EventPayload::Error(_)) && shape == FactShape::GroupedCount
+        }
+        EventKind::PgLifecycleChildSignalTermination
+        | EventKind::PgLifecycleChildProcessCrash
+        | EventKind::PgLifecycleShutdownRequested
+        | EventKind::PgLifecycleReadyObserved => {
+            matches!(payload, EventPayload::Lifecycle(_)) && shape == FactShape::Individual
+        }
+        EventKind::PgCheckpointStarted
+        | EventKind::PgCheckpointCompleted
+        | EventKind::PgCheckpointTooFrequentReported => {
+            matches!(payload, EventPayload::Checkpoint(_)) && shape == FactShape::Individual
+        }
+        EventKind::PgMaintenanceAutovacuumReported
+        | EventKind::PgMaintenanceAutoanalyzeReported => {
+            matches!(payload, EventPayload::Maintenance(_)) && shape == FactShape::Individual
+        }
+        EventKind::PgQuerySlowGroupReported => {
+            matches!(payload, EventPayload::SlowQuery(_)) && shape == FactShape::GroupedCount
+        }
+        EventKind::PgLockWaitReported | EventKind::PgLockAcquiredAfterWaitReported => {
+            matches!(payload, EventPayload::LockWait(_)) && shape == FactShape::Individual
+        }
+        EventKind::PgTempFileReported => {
+            matches!(payload, EventPayload::TempFile(_)) && shape == FactShape::Individual
+        }
+        _ => false,
+    };
+    if log_payload {
+        return entity.is_none()
+            && supporting_count == 1
+            && match &coverage.loss {
+                Some(_) => coverage.retained_exactness == RetainedExactness::LowerBound,
+                None => coverage.retained_exactness == RetainedExactness::Exact,
+            };
+    }
+
+    if let EventPayload::CounterDelta(value) = payload {
+        return counter_event_kind(value.factor_id) == Some(kind)
+            && value.delta > 0
+            && value.duration_us > 0
+            && count == value.delta
+            && entity.is_some()
+            && supporting_count == 2
+            && shape
+                == if value.delta == 1 {
+                    FactShape::Individual
+                } else {
+                    FactShape::GroupedCount
+                }
+            && exact_derived(evidence_quality, coverage);
+    }
+
+    if let EventPayload::StateTransition(value) = payload {
+        let kind_matches = match kind {
+            EventKind::PgRecoveryRoleChanged => {
+                MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgRecoveryRole)
+            }
+            EventKind::PgTimelineChanged => {
+                MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgTimeline)
+            }
+            EventKind::PgReplicationSenderStateChanged => {
+                MetricFactor::from_id(value.factor_id)
+                    == Some(MetricFactor::PgReplicationSenderState)
+                    && value.current_state != u32::MAX
+            }
+            EventKind::PgReplicationSenderDisappeared => {
+                MetricFactor::from_id(value.factor_id)
+                    == Some(MetricFactor::PgReplicationSenderState)
+                    && value.current_state == u32::MAX
+            }
+            EventKind::PgReplicationSlotStateChanged => {
+                MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgReplicationSlotState)
+                    && value.current_state != 4
+            }
+            EventKind::PgReplicationSlotLost => {
+                MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgReplicationSlotState)
+                    && value.current_state == 4
+            }
+            _ => false,
+        };
+        return kind_matches
+            && value.previous_state != value.current_state
+            && shape == FactShape::Individual
+            && count == 1
+            && entity.is_some()
+            && supporting_count == 2
+            && exact_derived(evidence_quality, coverage);
+    }
+
+    if let EventPayload::Capacity(value) = payload {
+        let evidence_matches = match kind {
+            EventKind::OsFilesystemCapacityObservation => {
+                evidence_quality == EvidenceQuality::Structured
+            }
+            EventKind::OsFilesystemCapacityZeroTransition => {
+                evidence_quality == EvidenceQuality::DerivedExact
+            }
+            _ => false,
+        };
+        return matches!(
+            kind,
+            EventKind::OsFilesystemCapacityObservation
+                | EventKind::OsFilesystemCapacityZeroTransition
+        ) && value.available_bytes <= value.total_bytes
+            && (kind != EventKind::OsFilesystemCapacityZeroTransition
+                || value.available_bytes == 0)
+            && shape == FactShape::Individual
+            && count == 1
+            && entity.is_some_and(|entity| entity.kind == EntityKind::Filesystem)
+            && supporting_count
+                == if kind == EventKind::OsFilesystemCapacityObservation {
+                    2
+                } else {
+                    3
+                }
+            && evidence_matches
+            && coverage.retained_exactness == RetainedExactness::Exact
+            && coverage.loss.is_none();
+    }
+
+    if !matches!(payload, EventPayload::Marker) {
+        return false;
+    }
+    match kind {
+        EventKind::PgStatisticsResetObserved | EventKind::PgPostmasterStartChanged => {
+            shape == FactShape::Individual
+                && count == 1
+                && entity.is_some()
+                && supporting_count == 2
+                && exact_derived(evidence_quality, coverage)
+        }
+        EventKind::CollectorSnapshotGap
+        | EventKind::CollectorSourceReadFailure
+        | EventKind::CollectorVisibilityRestricted => {
+            shape == FactShape::Individual
+                && count == 1
+                && entity.is_none()
+                && supporting_count == 1
+                && coverage.retained_exactness == RetainedExactness::LowerBound
+                && coverage
+                    .loss
+                    .as_ref()
+                    .is_some_and(|loss| !loss.reasons().is_empty())
+        }
+        _ => false,
+    }
+}
+
+fn exact_derived(evidence_quality: EvidenceQuality, coverage: &CoverageRef) -> bool {
+    evidence_quality == EvidenceQuality::DerivedExact
+        && coverage.retained_exactness == RetainedExactness::Exact
+        && coverage.loss.is_none()
+}
+
+fn coverage_intersects(coverage: &super::coverage::Coverage, from_us: i64, to_us: i64) -> bool {
+    let index = coverage
+        .spans()
+        .partition_point(|span| span.end_us() <= from_us);
+    coverage
+        .spans()
+        .get(index)
+        .is_some_and(|span| span.start_us() < to_us)
 }
 
 /// Stable evidence identity of one canonical cumulative sample.
@@ -1240,12 +1429,8 @@ const fn counter_event_kind(factor_id: super::health::FactorId) -> Option<EventK
         Some(MetricFactor::PgDatabaseSessionsKilled) => {
             Some(EventKind::PgDatabaseSessionsKilledDelta)
         }
-        Some(MetricFactor::OsCgroupMemoryHighEvents) => {
-            Some(EventKind::OsCgroupMemoryHighDelta)
-        }
-        Some(MetricFactor::OsCgroupMemoryMaxEvents) => {
-            Some(EventKind::OsCgroupMemoryMaxDelta)
-        }
+        Some(MetricFactor::OsCgroupMemoryHighEvents) => Some(EventKind::OsCgroupMemoryHighDelta),
+        Some(MetricFactor::OsCgroupMemoryMaxEvents) => Some(EventKind::OsCgroupMemoryMaxDelta),
         Some(MetricFactor::OsCgroupOomEvents) => Some(EventKind::OsCgroupOomDelta),
         Some(MetricFactor::OsCgroupOomKills) => Some(EventKind::OsCgroupOomKillDelta),
         Some(MetricFactor::OsHostOomKills) => Some(EventKind::OsHostOomKillDelta),
@@ -1303,14 +1488,12 @@ fn project_payload(payload: &ObservationPayload) -> Option<(EventKind, EventPayl
             EventKind::PgLifecycleReadyObserved,
             lifecycle_payload(value),
         ),
-        ObservationPayload::CheckpointStarted(value) => (
-            EventKind::PgCheckpointStarted,
-            checkpoint_payload(value),
-        ),
-        ObservationPayload::CheckpointCompleted(value) => (
-            EventKind::PgCheckpointCompleted,
-            checkpoint_payload(value),
-        ),
+        ObservationPayload::CheckpointStarted(value) => {
+            (EventKind::PgCheckpointStarted, checkpoint_payload(value))
+        }
+        ObservationPayload::CheckpointCompleted(value) => {
+            (EventKind::PgCheckpointCompleted, checkpoint_payload(value))
+        }
         ObservationPayload::CheckpointTooFrequent(value) => (
             EventKind::PgCheckpointTooFrequentReported,
             checkpoint_payload(value),
@@ -1332,10 +1515,9 @@ fn project_payload(payload: &ObservationPayload) -> Option<(EventKind, EventPayl
                 dropped_field_count: value.dropped_field_count,
             })),
         ),
-        ObservationPayload::LockWaitReported(value) => (
-            EventKind::PgLockWaitReported,
-            lock_wait_payload(value),
-        ),
+        ObservationPayload::LockWaitReported(value) => {
+            (EventKind::PgLockWaitReported, lock_wait_payload(value))
+        }
         ObservationPayload::LockAcquiredAfterWait(value) => (
             EventKind::PgLockAcquiredAfterWaitReported,
             lock_wait_payload(value),
@@ -1417,14 +1599,14 @@ fn lock_wait_payload(value: &super::observation::LockWaitPayload) -> EventPayloa
 
 fn payload_heap_bytes(payload: &EventPayload) -> Option<usize> {
     match payload {
-        EventPayload::Error(value) => size_of::<ErrorFactPayload>()
-            .checked_add(text_bytes(&[
-                &value.normalized_pattern,
-                &value.database,
-                &value.user,
-            ])),
-        EventPayload::Lifecycle(value) => size_of::<LifecycleFactPayload>()
-            .checked_add(text_bytes(&[&value.shutdown_mode])),
+        EventPayload::Error(value) => size_of::<ErrorFactPayload>().checked_add(text_bytes(&[
+            &value.normalized_pattern,
+            &value.database,
+            &value.user,
+        ])),
+        EventPayload::Lifecycle(value) => {
+            size_of::<LifecycleFactPayload>().checked_add(text_bytes(&[&value.shutdown_mode]))
+        }
         EventPayload::Checkpoint(value) => {
             size_of::<CheckpointFactPayload>().checked_add(text_bytes(&[&value.reason]))
         }
@@ -1445,9 +1627,9 @@ fn payload_heap_bytes(payload: &EventPayload) -> Option<usize> {
 }
 
 fn text_bytes(values: &[&Option<Box<str>>]) -> usize {
-    values
-        .iter()
-        .fold(0_usize, |total, value| total.saturating_add(value.as_deref().map_or(0, str::len)))
+    values.iter().fold(0_usize, |total, value| {
+        total.saturating_add(value.as_deref().map_or(0, str::len))
+    })
 }
 
 #[cfg(test)]
@@ -1455,11 +1637,14 @@ mod tests {
     use super::*;
     use crate::overview::{
         DictionaryContextId, LifecyclePayload, NamingContractId, ObservationProvenance,
-        ObservationTime, QualityFlags, SectionBodyId, SegmentIdentity, SegmentLocator,
-        TimeQuality,
+        ObservationTime, QualityFlags, SectionBodyId, SegmentIdentity, SegmentLocator, TimeQuality,
     };
 
-    fn observation(payload: ObservationPayload, shape: ObservationShape, count: u64) -> EventObservation {
+    fn observation(
+        payload: ObservationPayload,
+        shape: ObservationShape,
+        count: u64,
+    ) -> EventObservation {
         let locator = SegmentLocator([3; 32]);
         EventObservation::new(
             SegmentIdentity::sealed(
@@ -1521,21 +1706,27 @@ mod tests {
         };
         assert_eq!(payload.pid, Some(42));
         assert_eq!(payload.shutdown_mode.as_deref(), Some("smart"));
-        assert_eq!(fact.supporting_observation_ids(), &[source.observation_id()]);
+        assert_eq!(
+            fact.supporting_observation_ids(),
+            &[source.observation_id()]
+        );
     }
 
     #[test]
     fn grouped_count_and_loss_survive_projection() {
         let source = observation(
-            ObservationPayload::ErrorGroup(Box::new(ErrorFactPayload {
-                severity: Severity::Fatal,
-                category: ErrorCategory::Connection,
-                sqlstate: Some(SqlState(*b"57P01")),
-                normalized_pattern: Some("terminating connection".into()),
-                database: None,
-                user: None,
-                dropped_field_count: DroppedFieldCount(0),
-            }.into_observation_payload())),
+            ObservationPayload::ErrorGroup(Box::new(
+                ErrorFactPayload {
+                    severity: Severity::Fatal,
+                    category: ErrorCategory::Connection,
+                    sqlstate: Some(SqlState(*b"57P01")),
+                    normalized_pattern: Some("terminating connection".into()),
+                    database: None,
+                    user: None,
+                    dropped_field_count: DroppedFieldCount(0),
+                }
+                .into_observation_payload(),
+            )),
             ObservationShape::GroupedCount,
             7,
         );
@@ -1552,6 +1743,52 @@ mod tests {
             EventKind::from_code(EventKind::OsCgroupOomKillDelta.code()),
             Some(EventKind::OsCgroupOomKillDelta)
         );
+    }
+
+    #[test]
+    fn collector_loss_identity_includes_the_retained_lower_bound() {
+        let first = EventFact::from_collector_loss(
+            SourceScopeId([1; 32]),
+            7,
+            10,
+            EventKind::CollectorSnapshotGap,
+            &[LossReason::CollectorLimit],
+            Some(1),
+        )
+        .expect("valid loss")
+        .expect("fact");
+        let second = EventFact::from_collector_loss(
+            SourceScopeId([1; 32]),
+            7,
+            10,
+            EventKind::CollectorSnapshotGap,
+            &[LossReason::CollectorLimit],
+            Some(2),
+        )
+        .expect("valid loss")
+        .expect("fact");
+        assert_ne!(first.fact_id(), second.fact_id());
+    }
+
+    #[test]
+    fn kind_and_payload_semantics_cannot_disagree() {
+        let result = EventFact::new(
+            FactId([1; 32]),
+            EventKind::PgLifecycleReadyObserved,
+            FactShape::Individual,
+            CoverageSpan::new(10, 11).expect("interval"),
+            1,
+            None,
+            EventPayload::Marker,
+            vec![ObservationId([2; 32])],
+            EvidenceQuality::Structured,
+            CoverageRef {
+                source_scope_id: SourceScopeId([3; 32]),
+                retained_exactness: RetainedExactness::Exact,
+                loss: None,
+            },
+        );
+        assert_eq!(result, Err(InvalidEventFact::SemanticMismatch));
     }
 
     impl ErrorFactPayload {

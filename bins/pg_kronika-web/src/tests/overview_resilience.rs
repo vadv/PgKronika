@@ -2,9 +2,12 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_reader::{
     PersistError, PersistMode, PersistModeSnapshot, PersistenceProbeOutcome, PgmUnit,
 };
+use kronika_registry::pg_log::PgLogErrorV1;
+use kronika_registry::{Section, Ts};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tower::ServiceExt as _;
 
@@ -12,6 +15,39 @@ use crate::overview::resilience::{record_persist_snapshot, record_probe_metrics}
 use crate::{AppState, OverviewConfig, app};
 
 use super::{capture_json, test_metrics_handle, write_bgwriter_segment};
+
+fn write_overview_event_segment(dir: &std::path::Path) {
+    let body = PgLogErrorV1::encode(&[PgLogErrorV1 {
+        ts: Ts(1),
+        severity: 2,
+        category: 9,
+        sqlstate: None,
+        pattern: None,
+        count: 1,
+        sample: None,
+        detail: None,
+        hint: None,
+        context: None,
+        statement: None,
+        database: None,
+        username: None,
+        dict_dropped_fields: 0,
+    }])
+    .expect("encode overview event");
+    let bytes = build_part(
+        &[SectionInput {
+            type_id: 1_022_001,
+            rows: 1,
+            body: &body,
+        }],
+        PartMeta {
+            min_ts: 0,
+            max_ts: 1,
+            source_id: 7,
+        },
+    );
+    std::fs::write(dir.join("one.pgm"), bytes).expect("write overview event segment");
+}
 
 fn corrupt_first_section_body(path: &std::path::Path) {
     let mut bytes = std::fs::read(path).expect("read segment");
@@ -71,7 +107,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
     let segment_path = dir.path().join("one.pgm");
     let cache_root = dir.path().join(".overview-cache");
     let namespace = b"durable-first-restart".to_vec();
-    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    write_overview_event_segment(dir.path());
 
     let first_snapshot =
         kronika_reader::LocalDirSnapshot::open(dir.path()).expect("first snapshot");
@@ -124,7 +160,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
 async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
     let dir = tempfile::tempdir().expect("tempdir");
     let segment_path = dir.path().join("one.pgm");
-    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    write_overview_event_segment(dir.path());
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
     let state = AppState::with_overview_config(
         snapshot,
@@ -148,8 +184,16 @@ async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
         .await
         .expect("route");
     let response = capture_json(response).await;
-    assert_eq!(response.status, StatusCode::OK, "partial view remains queryable");
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "partial view remains queryable"
+    );
     assert_eq!(response.body["meta"]["source_status"], "gap");
+    assert_eq!(
+        response.body["meta"]["source_freshness"][0]["source_status"],
+        "gap"
+    );
     assert_eq!(
         response.body["meta"]["loss"][0]["known_gaps"],
         serde_json::json!([{ "from_us": 0, "to_us": 2 }])
@@ -165,15 +209,15 @@ async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
 async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
     let dir = tempfile::tempdir().expect("tempdir");
     let segment_path = dir.path().join("one.pgm");
-    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    write_overview_event_segment(dir.path());
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
     let mut config = OverviewConfig::new(
         dir.path().join(".overview-cache"),
         b"source-scrub-damage".to_vec(),
     );
-    config.source_scrub_interval = Duration::from_secs(1);
-    let state =
-        AppState::with_overview_config(snapshot, 0, Duration::from_secs(10), config).expect("state");
+    config.source_scrub_interval = Duration::from_millis(10);
+    let state = AppState::with_overview_config(snapshot, 0, Duration::from_secs(10), config)
+        .expect("state");
 
     let complete = app(state.clone(), None, test_metrics_handle())
         .oneshot(
@@ -186,11 +230,15 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
         .expect("complete route");
     let complete = capture_json(complete).await;
     assert_eq!(complete.status, StatusCode::OK);
-    assert_eq!(complete.body["meta"]["source_status"], "complete_for_contract");
+    assert_eq!(
+        complete.body["meta"]["source_status"],
+        "complete_for_contract"
+    );
     let cached_complete_responses = state.response_cache.len();
     assert_eq!(cached_complete_responses, 1);
 
     corrupt_first_section_body(&segment_path);
+    tokio::time::sleep(Duration::from_millis(20)).await;
     let mut snapshot = (*state.snapshot()).clone();
     let delta = snapshot
         .refresh_incremental_delta()
@@ -205,7 +253,10 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
             kronika_analytics::overview::CoverageSpan::new(0, 2).expect("range"),
         )
         .expect("damaged source selection");
-    assert!(plan.sealed_gap(), "scrub damage becomes an unavailable descriptor");
+    assert!(
+        plan.sealed_gap(),
+        "scrub damage becomes an unavailable descriptor"
+    );
 
     let damaged = app(state.clone(), None, test_metrics_handle())
         .oneshot(
@@ -219,6 +270,10 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
     let damaged = capture_json(damaged).await;
     assert_eq!(damaged.status, StatusCode::OK);
     assert_eq!(damaged.body["meta"]["source_status"], "gap");
+    assert_eq!(
+        damaged.body["meta"]["source_freshness"][0]["source_status"],
+        "gap"
+    );
     assert_eq!(
         damaged.body["meta"]["loss"][0]["known_gaps"],
         serde_json::json!([{ "from_us": 0, "to_us": 2 }])

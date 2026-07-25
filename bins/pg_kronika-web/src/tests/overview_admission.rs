@@ -250,7 +250,7 @@ fn selection_is_source_scoped_aggregate_and_requires_canonical_sources() {
 }
 
 #[test]
-fn selection_uses_inclusive_segment_end_and_exclusive_request_end() {
+fn selection_keeps_half_open_intersection_with_boundary_halos() {
     let mut entries = synthetic_entries(1, 7, -10, 0, 0);
     entries.extend(synthetic_entries(1, 7, 10, 20, 1));
     entries.extend(synthetic_entries(1, 7, i64::MIN, i64::MIN, 2));
@@ -265,9 +265,11 @@ fn selection_uses_inclusive_segment_end_and_exclusive_request_end() {
             4,
         )
         .expect("boundary plan")
-        .selected_count(),
-        1,
-        "max_ts == from is selected and min_ts == to is excluded"
+        .entries()
+        .map(|entry| (entry.descriptor().min_ts, entry.descriptor().max_ts))
+        .collect::<Vec<_>>(),
+        vec![(i64::MIN, i64::MIN), (-10, 0), (10, 20)],
+        "the intersecting segment is surrounded by one left and right halo"
     );
     assert_eq!(
         SelectedSealedPlan::build(
@@ -277,8 +279,10 @@ fn selection_uses_inclusive_segment_end_and_exclusive_request_end() {
             4,
         )
         .expect("minimum range")
-        .selected_count(),
-        1
+        .entries()
+        .map(|entry| (entry.descriptor().min_ts, entry.descriptor().max_ts))
+        .collect::<Vec<_>>(),
+        vec![(i64::MIN, i64::MIN), (-10, 0)]
     );
     assert_eq!(
         SelectedSealedPlan::build(
@@ -288,9 +292,11 @@ fn selection_uses_inclusive_segment_end_and_exclusive_request_end() {
             4,
         )
         .expect("maximum range")
-        .selected_count(),
-        0,
-        "a segment beginning at the exclusive request end is not selected"
+        .entries()
+        .map(|entry| (entry.descriptor().min_ts, entry.descriptor().max_ts))
+        .collect::<Vec<_>>(),
+        vec![(10, 20), (i64::MAX, i64::MAX)],
+        "the exclusive-end segment is retained only as the right halo"
     );
 }
 
@@ -430,6 +436,7 @@ async fn events_counts_the_deduplicated_source_union_against_one_effective_limit
 #[tokio::test]
 async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
     let dir = tempfile::tempdir().expect("tempdir");
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
     let mut config = OverviewConfig::new(
         dir.path().join(".overview-cache"),
@@ -437,26 +444,10 @@ async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
     );
     config.max_selected_segments = 1;
     config.cold.retry_after_seconds = 7;
-    let state = AppState::with_overview_config(
-        snapshot,
-        0,
-        std::time::Duration::from_secs(10),
-        config,
-    )
-    .expect("state");
-    let entry = synthetic_entries(1, 7, 0, 1, 0)
-        .pop()
-        .expect("synthetic entry");
-    let oversized = DescriptorEntry::new(
-        *entry.descriptor(),
-        entry.fact_build_key(),
-        ColdWorkWeight {
-            workers: u32::MAX,
-            ..one_weight()
-        },
-        entry.source_scope_id(),
-    );
-    install_view(&state, synthetic_view(vec![oversized], Vec::new()));
+    let state =
+        AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), config)
+            .expect("state");
+    install_oversized_real_entry(&state);
 
     let response = app(state.clone(), None, test_metrics_handle())
         .oneshot(

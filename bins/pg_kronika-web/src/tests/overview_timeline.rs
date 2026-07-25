@@ -126,11 +126,9 @@ fn database_coverage_row(ts_us: i64) -> SnapshotCoverageV1 {
 }
 
 fn write_database_metric_segment(dir: &std::path::Path) {
-    let database = PgStatDatabaseV1::encode(&[
-        database_metric_row(10, 7),
-        database_metric_row(20, 8),
-    ])
-    .expect("encode database metrics");
+    let database =
+        PgStatDatabaseV1::encode(&[database_metric_row(10, 7), database_metric_row(20, 8)])
+            .expect("encode database metrics");
     let reset = ResetMetadata::encode(&[metric_reset_row(10), metric_reset_row(20)])
         .expect("encode reset metadata");
     let coverage =
@@ -328,11 +326,8 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
         serve_state(state.clone(), &format!("/v1/timeline/events?{query}")).await;
     let (overview_status, overview) =
         serve_state(state.clone(), &format!("/v1/timeline/overview?{query}")).await;
-    let (health_status, health) = serve_state(
-        state,
-        &format!("/v1/timeline/health?{query}&step=11"),
-    )
-    .await;
+    let (health_status, health) =
+        serve_state(state, &format!("/v1/timeline/health?{query}&step=11")).await;
     assert_eq!(events_status, StatusCode::OK, "{events}");
     assert_eq!(overview_status, StatusCode::OK, "{overview}");
     assert_eq!(health_status, StatusCode::OK, "{health}");
@@ -350,7 +345,10 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
     assert_eq!(fact["identity_quality"], "content_derived");
     assert_eq!(fact["sort_ts_us"], 20);
     assert_eq!(fact["occurred_at_us"], 20);
-    assert_eq!(fact["observed_interval"], json!({"from_us": 20, "to_us": 21}));
+    assert_eq!(
+        fact["observed_interval"],
+        json!({"from_us": 20, "to_us": 21})
+    );
     assert_eq!(fact["occurrence_count"], 1);
     assert_eq!(fact["evidence_quality"], "derived_exact");
     assert_eq!(fact["quality_flags"], 0);

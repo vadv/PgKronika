@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use kronika_analytics::overview::{MetricFactor, NamingContractId, SegmentLocator};
 use kronika_reader::{
-    BuildError, CacheRebuildReason, FactLoad, FactOrigin, FactStore, FallbackStats, LIMIT, LiveView,
-    LocalDirSnapshot, SealOutcome, SealedFactError, SegmentContext, SegmentFacts, SourceError,
-    reconcile_seal,
+    BuildError, CacheRebuildReason, FactLoad, FactOrigin, FactStore, FallbackStats, LIMIT,
+    LiveView, LocalDirSnapshot, SealOutcome, SealedFactError, SegmentContext, SegmentFacts,
+    SourceError, reconcile_seal,
 };
 use tokio::task::JoinSet;
 
@@ -157,9 +157,7 @@ impl OverviewFactLoader {
             return SealedEntry::from_descriptor(&entry, facts)
                 .ok_or(FactLoadFailure::IdentityMismatch);
         }
-        let cached = self
-            .load_cached(Arc::clone(&snapshot), entry.clone())
-            .await;
+        let cached = self.load_cached(Arc::clone(&snapshot), entry.clone()).await;
         self.record_fallback_metrics();
         if let Some(facts) = cached? {
             self.decoded.insert(key, Arc::clone(&facts));
@@ -195,9 +193,7 @@ impl OverviewFactLoader {
                         let _permit = admission
                             .acquire(worker_entry.cold_weight())
                             .await
-                            .map_err(|error| {
-                                map_admission_error(error, retry_after_seconds)
-                            })?;
+                            .map_err(|error| map_admission_error(error, retry_after_seconds))?;
                         let started = Instant::now();
                         let descriptor = *worker_entry.descriptor();
                         let result = tokio::task::spawn_blocking(move || {
@@ -431,8 +427,8 @@ fn record_fact_quality(facts: &SegmentFacts) {
         .increment(1);
     }
     for coverage in facts.loss_coverage().factor_coverage() {
-        let factor = MetricFactor::from_id(coverage.factor_id)
-            .map_or("unknown", MetricFactor::wire_code);
+        let factor =
+            MetricFactor::from_id(coverage.factor_id).map_or("unknown", MetricFactor::wire_code);
         for reason in &coverage.loss_reasons {
             metrics::counter!(
                 "overview_coverage_loss_total",

@@ -15,8 +15,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::overview::{
     CountError, CountLimits, CountResource, CoverageSpan, EventCounts,
     EventFact as CanonicalEventFact, EventObservation, EventPayload as CanonicalEventPayload,
-    NotableClass, NotablePolicy, OracleError, OracleLimits, OracleResource,
-    PhysicalCountSemantics, RetainedExactness, Severity, SourceCompleteness, SourceScopeId,
+    NotableClass, NotablePolicy, OracleError, OracleLimits, OracleResource, PhysicalCountSemantics,
+    RetainedExactness, Severity, SourceCompleteness, SourceScopeId,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -32,7 +32,9 @@ use crate::overview::dto::{
 };
 use crate::overview::loader::FactLoadFailure;
 use crate::overview::selection::{SelectedSealedPlan, SelectionError};
-use crate::overview::view::{CanonicalFactQueryError, IndexView, SourceMetadata};
+use crate::overview::view::{
+    CanonicalFactQueryError, IndexView, SourceMetadata, SourceStatus,
+};
 use crate::params::QueryParams;
 use crate::problem::{ApiProblem, QueryParameter};
 use crate::{AppState, TimelineFlightRole};
@@ -819,11 +821,9 @@ fn render_events(
         .iter()
         .map(|candidate| {
             match candidate.source {
-                PageCandidateSource::Observation(observation) => EventFactProjection::project(
-                    observation,
-                    candidate.class,
-                    candidate.source_id,
-                ),
+                PageCandidateSource::Observation(observation) => {
+                    EventFactProjection::project(observation, candidate.class, candidate.source_id)
+                }
                 PageCandidateSource::Canonical(fact) => EventFactProjection::project_canonical(
                     fact,
                     candidate.class,
@@ -864,11 +864,7 @@ fn render_events(
     let completeness = aggregate_source_completeness(&source_metadata);
     let physical_count = aggregate_physical_count(&source_metadata);
     let coverage = view
-        .query_factor_coverage(
-            &request.sources,
-            request.range,
-            MAX_FACTOR_COVERAGE_RECORDS,
-        )
+        .query_factor_coverage(&request.sources, request.range, MAX_FACTOR_COVERAGE_RECORDS)
         .map_err(canonical_fact_problem)?
         .iter()
         .map(crate::overview::health::factor_coverage_json)
@@ -1032,11 +1028,12 @@ fn timeline_meta_with_metadata(
     effective_step_us: Option<u64>,
     source_metadata: &[SourceMetadata],
 ) -> TimelineMetaDto {
+    let view_status = view.source_status();
     let all_available = source_metadata
         .iter()
         .all(|source| source.source_scope_id.is_some());
-    let source_status = if all_available {
-        view.source_status().wire_code()
+    let source_status = if matches!(view_status, SourceStatus::Gap) || all_available {
+        view_status.wire_code()
     } else {
         "unavailable"
     };
@@ -1048,8 +1045,8 @@ fn timeline_meta_with_metadata(
                 .source_scope_id
                 .map(|scope| URL_SAFE_NO_PAD.encode(scope.0)),
             data_through_us: source.data_through_us,
-            source_status: if source.source_scope_id.is_some() {
-                view.source_status().wire_code()
+            source_status: if !source.known_gaps.is_empty() || source.source_scope_id.is_some() {
+                view_status.wire_code()
             } else {
                 "unavailable"
             },
@@ -1419,7 +1416,7 @@ fn notable_preview_dto(
                 return Err(ApiProblem::store_read_failed());
             };
             EventFactProjection::project(observation, candidate.class, candidate.source_id)
-            .ok_or_else(ApiProblem::store_read_failed)
+                .ok_or_else(ApiProblem::store_read_failed)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(NotablePreviewDto {

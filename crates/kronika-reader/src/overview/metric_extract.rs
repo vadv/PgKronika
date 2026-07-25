@@ -8,15 +8,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+use kronika_analytics::overview::AlignmentId;
 use kronika_analytics::overview::{
-    Applicability, BoundaryQuality, CadenceEpochId, CounterSample, CoverageSpan,
-    CoverageState, EntityKind, EventFact, EventKind, FactorCoverage, FactorId, GaugeSample,
-    LossReason, MetricFactor, MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality,
+    Applicability, BoundaryQuality, CadenceEpochId, CounterSample, CoverageSpan, CoverageState,
+    EntityKind, EventFact, EventKind, FactorCoverage, FactorId, GaugeSample, LossReason,
+    MetricFactor, MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality,
     PhysicalCountSemantics, PopulationTotalQuality, ResetFamily, RetainedExactness,
     SourceCompleteness, SourcePopulation, SourceScopeId, derive_alignment, derive_entity,
 };
-#[cfg(test)]
-use kronika_analytics::overview::AlignmentId;
 use kronika_format::ReadAt;
 use kronika_registry::{Cell, Row};
 use sha2::{Digest as _, Sha256};
@@ -54,9 +54,56 @@ pub(super) struct MetricExtraction {
     pub pgm_body_read_stats: PgmBodyReadStats,
 }
 
+impl MetricExtraction {
+    fn empty(
+        descriptor_replacements: Vec<(usize, ManifestEntryDescriptor)>,
+        pgm_body_read_stats: PgmBodyReadStats,
+    ) -> Self {
+        Self {
+            descriptor_replacements,
+            counter_series: Vec::new(),
+            counters: Vec::new(),
+            gauge_series: Vec::new(),
+            gauges: Vec::new(),
+            reset_markers: Vec::new(),
+            entity_states: Vec::new(),
+            factor_coverage: Vec::new(),
+            event_facts: Vec::new(),
+            pgm_body_read_stats,
+        }
+    }
+}
+
 struct DecodedMetricSection {
     type_id: u32,
     rows: Vec<Row>,
+}
+
+fn decoded_rows_resident_bytes(rows: &[Row], row_capacity: usize) -> Result<u64, BuildError> {
+    let row_slots = row_capacity
+        .checked_mul(size_of::<Row>())
+        .ok_or(BuildError::Overflow)?;
+    let bytes = rows.iter().try_fold(row_slots, |total, row| {
+        let cell_slots = row
+            .cells()
+            .len()
+            .checked_mul(size_of::<Cell>())
+            .ok_or(BuildError::Overflow)?;
+        row.cells().iter().try_fold(
+            total.checked_add(cell_slots).ok_or(BuildError::Overflow)?,
+            |total, cell| {
+                let list_bytes = match cell {
+                    Cell::ListI32(values) => values
+                        .capacity()
+                        .checked_mul(size_of::<i32>())
+                        .ok_or(BuildError::Overflow)?,
+                    _ => 0,
+                };
+                total.checked_add(list_bytes).ok_or(BuildError::Overflow)
+            },
+        )
+    })?;
+    u64::try_from(bytes).map_err(|_error| BuildError::Overflow)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,9 +143,7 @@ impl ResetContext {
     fn os_epoch(self, sample_ts_us: i64) -> u64 {
         epoch(&[
             self.boot_id.unwrap_or(0).to_le_bytes(),
-            self.boot_time_us
-                .unwrap_or(sample_ts_us)
-                .to_le_bytes(),
+            self.boot_time_us.unwrap_or(sample_ts_us).to_le_bytes(),
         ])
     }
 
@@ -122,12 +167,14 @@ impl ResetTimeline {
         let mut context = ResetContext::missing();
         if let Some((_context_ts, postmaster_start_us, database_reset_us)) =
             latest_at(&self.pg, ts_us, |point| point.0)
+                .or_else(|| self.pg.first().filter(|point| point.1 <= ts_us))
         {
             context.postmaster_start_us = Some(*postmaster_start_us);
-            context.database_reset_us = *database_reset_us;
+            context.database_reset_us = database_reset_us.filter(|reset| *reset <= ts_us);
         }
         if let Some((_context_ts, boot_id, boot_time_us)) =
             latest_at(&self.os, ts_us, |point| point.0)
+                .or_else(|| self.os.first().filter(|point| point.2 <= ts_us))
         {
             context.boot_id = Some(*boot_id);
             context.boot_time_us = Some(*boot_time_us);
@@ -161,8 +208,8 @@ struct CoverageRecord {
     total_exact: bool,
 }
 
-#[derive(Default)]
 struct MetricAccumulator {
+    item_limit: u64,
     counter_series: BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
     counters: Vec<CounterSample>,
     gauge_series: BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
@@ -173,7 +220,34 @@ struct MetricAccumulator {
     factor_losses: BTreeMap<FactorId, BTreeSet<LossReason>>,
 }
 
+impl Default for MetricAccumulator {
+    fn default() -> Self {
+        Self::with_item_limit(u64::MAX)
+    }
+}
+
 impl MetricAccumulator {
+    fn with_item_limit(item_limit: u64) -> Self {
+        Self {
+            item_limit,
+            counter_series: BTreeMap::new(),
+            counters: Vec::new(),
+            gauge_series: BTreeMap::new(),
+            gauges: Vec::new(),
+            entity_states: Vec::new(),
+            factor_sources: BTreeMap::new(),
+            factor_times: BTreeMap::new(),
+            factor_losses: BTreeMap::new(),
+        }
+    }
+
+    fn admit_item(&self, current_len: usize) -> Result<(), BuildError> {
+        if current_len as u64 >= self.item_limit {
+            return Err(BuildError::LimitExceeded);
+        }
+        Ok(())
+    }
+
     fn register_factor(&mut self, factor: MetricFactor, source_type_id: u32) {
         self.factor_sources
             .entry(factor.id())
@@ -199,6 +273,7 @@ impl MetricAccumulator {
                 .insert(LossReason::InvalidCounterValue);
             return Ok(());
         }
+        self.admit_item(self.counters.len())?;
         let alignment_id = derive_alignment(descriptor.source_scope_id, descriptor.entity);
         self.counters.push(CounterSample::new(
             descriptor.series_id,
@@ -227,6 +302,7 @@ impl MetricAccumulator {
         let Some(sample) = GaugeSample::new(descriptor.series_id, ts_us, value) else {
             return Err(BuildError::Source(SourceError::Corrupt));
         };
+        self.admit_item(self.gauges.len())?;
         self.gauges.push(sample);
         self.factor_times
             .entry(descriptor.factor_id)
@@ -242,6 +318,9 @@ impl MetricAccumulator {
         state_code: u32,
         population_total: Option<u64>,
     ) -> Result<(), BuildError> {
+        if population_total.is_some() {
+            self.admit_item(self.entity_states.len())?;
+        }
         self.gauge(descriptor, ts_us, f64::from(state_code))?;
         if let Some(population_total) = population_total {
             self.entity_states.push(EntityStateRecord {
@@ -294,18 +373,47 @@ impl MetricAccumulator {
 pub(super) fn extract_metrics<R: ReadAt>(
     unit: &PgmUnit<R>,
     source_scope_id: SourceScopeId,
-    segment_range: CoverageSpan,
+    segment_range: Option<CoverageSpan>,
     bounds: &Bounds,
 ) -> Result<MetricExtraction, BuildError> {
-    let mut decoded = Vec::new();
+    if !bounds.is_within_absolute_limits() {
+        return Err(BuildError::LimitExceeded);
+    }
+    let supported_sections = unit
+        .catalog()
+        .entries
+        .iter()
+        .filter(|entry| supported_metric_source(entry.type_id))
+        .count();
+    let mut decoded = Vec::with_capacity(supported_sections);
     let mut descriptor_replacements = Vec::new();
     let mut stats = PgmBodyReadStats::default();
+    let mut decoded_rows = 0_u64;
+    let mut decoded_bytes = u64::try_from(
+        decoded
+            .capacity()
+            .checked_mul(size_of::<DecodedMetricSection>())
+            .ok_or(BuildError::Overflow)?,
+    )
+    .map_err(|_error| BuildError::Overflow)?;
     for (index, entry) in unit.catalog().entries.iter().enumerate() {
         if !supported_metric_source(entry.type_id) {
             continue;
         }
+        decoded_rows = decoded_rows
+            .checked_add(u64::from(entry.rows))
+            .ok_or(BuildError::Overflow)?;
+        if decoded_rows > bounds.items_per_block {
+            return Err(BuildError::LimitExceeded);
+        }
         let ordinal = u32::try_from(index).map_err(|_error| BuildError::Overflow)?;
         let (descriptor, rows) = unit.decode_overview_rows(ordinal)?;
+        decoded_bytes = decoded_bytes
+            .checked_add(decoded_rows_resident_bytes(&rows, rows.capacity())?)
+            .ok_or(BuildError::Overflow)?;
+        if decoded_bytes > bounds.decoded_file_bytes {
+            return Err(BuildError::LimitExceeded);
+        }
         descriptor_replacements.push((index, descriptor));
         stats.read_calls = stats
             .read_calls
@@ -321,24 +429,24 @@ pub(super) fn extract_metrics<R: ReadAt>(
         });
     }
 
+    let Some(segment_range) = segment_range else {
+        if decoded.iter().any(|section| !section.rows.is_empty()) {
+            return Err(BuildError::Source(SourceError::UnsupportedLayout));
+        }
+        return Ok(MetricExtraction::empty(descriptor_replacements, stats));
+    };
     let reset_timeline = reset_timeline(&decoded)?;
     let snapshot_coverage = source_coverage(&decoded)?;
-    let mut metrics = MetricAccumulator::default();
+    let mut metrics = MetricAccumulator::with_item_limit(bounds.items_per_block);
     for section in &decoded {
         register_factor_inventory(&mut metrics, section.type_id);
         match section.type_id {
-            type_id if PG_STAT_DATABASE_TYPES.contains(&type_id) => extract_pg_database(
-                &mut metrics,
-                section,
-                source_scope_id,
-                &reset_timeline,
-            )?,
-            OS_CGROUP_MEMORY => extract_cgroup_memory(
-                &mut metrics,
-                section,
-                source_scope_id,
-                &reset_timeline,
-            )?,
+            type_id if PG_STAT_DATABASE_TYPES.contains(&type_id) => {
+                extract_pg_database(&mut metrics, section, source_scope_id, &reset_timeline)?
+            }
+            OS_CGROUP_MEMORY => {
+                extract_cgroup_memory(&mut metrics, section, source_scope_id, &reset_timeline)?
+            }
             OS_VMSTAT => {
                 extract_vmstat(&mut metrics, section, source_scope_id, &reset_timeline)?;
             }
@@ -422,12 +530,7 @@ pub(super) fn extract_metrics<R: ReadAt>(
         .entity_states
         .sort_unstable_by_key(|state| (state.series_id.0, state.ts_us));
     let reset_markers = reset_markers(&metrics.counters);
-    let factor_coverage = factor_coverage(
-        &metrics,
-        &snapshot_coverage,
-        segment_range,
-        bounds,
-    )?;
+    let factor_coverage = factor_coverage(&metrics, &snapshot_coverage, segment_range, bounds)?;
     Ok(MetricExtraction {
         descriptor_replacements,
         counter_series: metrics.counter_series.into_values().collect(),
@@ -520,10 +623,7 @@ fn extract_pg_database(
         let epoch = context.pg_database_epoch(optional_ts(row, "stats_reset")?, ts);
         for (factor, field) in [
             (MetricFactor::PgDatabaseDeadlocks, "deadlocks"),
-            (
-                MetricFactor::PgDatabaseRecoveryConflicts,
-                "conflicts",
-            ),
+            (MetricFactor::PgDatabaseRecoveryConflicts, "conflicts"),
             (
                 MetricFactor::PgDatabaseChecksumFailures,
                 "checksum_failures",
@@ -608,8 +708,11 @@ fn extract_cgroup_memory(
         let context = reset.context_at(ts);
         let path = required_str_id(row, "cgroup_path")?;
         let source_scope = required_u32(row, "scope")?;
-        let identity = [path.to_le_bytes().as_slice(), source_scope.to_le_bytes().as_slice()]
-            .concat();
+        let identity = [
+            path.to_le_bytes().as_slice(),
+            source_scope.to_le_bytes().as_slice(),
+        ]
+        .concat();
         let entity = derive_entity(scope, EntityKind::Cgroup, &identity);
         for (factor, field) in [
             (MetricFactor::OsCgroupMemoryCurrentBytes, "current"),
@@ -725,7 +828,8 @@ fn extract_replication_instance(
             Some(1),
         )?;
         let timeline = required_i64(row, "timeline_id")?;
-        let timeline = u32::try_from(timeline).map_err(|_error| BuildError::Source(SourceError::Corrupt))?;
+        let timeline =
+            u32::try_from(timeline).map_err(|_error| BuildError::Source(SourceError::Corrupt))?;
         out.state(
             series(
                 MetricFactor::PgTimeline,
@@ -771,10 +875,16 @@ fn extract_replication_senders(
         let population = proven_population(section.type_id, ts_us, coverage);
         let pid = required_i64(row, "pid")?;
         let backend_start = required_i64(row, "backend_start_key")?;
-        let identity = [pid.to_le_bytes().as_slice(), backend_start.to_le_bytes().as_slice()]
-            .concat();
+        let identity = [
+            pid.to_le_bytes().as_slice(),
+            backend_start.to_le_bytes().as_slice(),
+        ]
+        .concat();
         let entity = derive_entity(scope, EntityKind::ReplicationSender, &identity);
         let state_code = required_u32(row, "state_code")?;
+        if state_code > 5 {
+            return Err(BuildError::Source(SourceError::Corrupt));
+        }
         out.state(
             series(
                 MetricFactor::PgReplicationSenderState,
@@ -805,6 +915,10 @@ fn extract_replication_slots(
         let slot_name = required_str_id(row, "slot_name")?;
         let identity = slot_name.to_le_bytes();
         let entity = derive_entity(scope, EntityKind::ReplicationSlot, &identity);
+        let state_code = required_u32(row, "wal_status_code")?;
+        if state_code > 4 {
+            return Err(BuildError::Source(SourceError::Corrupt));
+        }
         out.state(
             series(
                 MetricFactor::PgReplicationSlotState,
@@ -816,7 +930,7 @@ fn extract_replication_slots(
                 &identity,
             ),
             ts_us,
-            required_u32(row, "wal_status_code")?,
+            state_code,
             population,
         )?;
     }
@@ -847,10 +961,7 @@ fn extract_storage_mounts(
         let ts = required_ts(row, "ts")?;
         for (factor, field) in [
             (MetricFactor::PgFilesystemTotalBytes, "total_bytes"),
-            (
-                MetricFactor::PgFilesystemAvailableBytes,
-                "available_bytes",
-            ),
+            (MetricFactor::PgFilesystemAvailableBytes, "available_bytes"),
         ] {
             if let Some(value) = optional_f64(row, field)? {
                 if value < 0.0 {
@@ -922,21 +1033,32 @@ fn reset_timeline(sections: &[DecodedMetricSection]) -> Result<ResetTimeline, Bu
             match section.type_id {
                 RESET_METADATA => {
                     let ts_us = required_ts(row, "ts")?;
-                    let point = (
-                        required_ts(row, "postmaster_start_time")?,
-                        optional_ts(row, "pg_stat_database_reset_max_at")?,
-                    );
-                    if pg.insert(ts_us, point).is_some_and(|previous| previous != point) {
+                    let postmaster_start_us = required_ts(row, "postmaster_start_time")?;
+                    let database_reset_us = optional_ts(row, "pg_stat_database_reset_max_at")?;
+                    if postmaster_start_us > ts_us
+                        || database_reset_us.is_some_and(|reset| reset > ts_us)
+                    {
+                        return Err(BuildError::Source(SourceError::Corrupt));
+                    }
+                    let point = (postmaster_start_us, database_reset_us);
+                    if pg
+                        .insert(ts_us, point)
+                        .is_some_and(|previous| previous != point)
+                    {
                         return Err(BuildError::Source(SourceError::Corrupt));
                     }
                 }
                 INSTANCE_METADATA => {
                     let ts_us = required_ts(row, "ts")?;
-                    let point = (
-                        required_str_id(row, "boot_id")?,
-                        required_ts(row, "btime")?,
-                    );
-                    if os.insert(ts_us, point).is_some_and(|previous| previous != point) {
+                    let boot_time_us = required_ts(row, "btime")?;
+                    if boot_time_us > ts_us {
+                        return Err(BuildError::Source(SourceError::Corrupt));
+                    }
+                    let point = (required_str_id(row, "boot_id")?, boot_time_us);
+                    if os
+                        .insert(ts_us, point)
+                        .is_some_and(|previous| previous != point)
+                    {
                         return Err(BuildError::Source(SourceError::Corrupt));
                     }
                 }
@@ -1072,10 +1194,7 @@ fn collector_event_facts(
                     EventKind::CollectorSourceReadFailure,
                     LossReason::SourceReadFailure,
                 )),
-                _ => Some((
-                    EventKind::CollectorSnapshotGap,
-                    LossReason::CollectorLimit,
-                )),
+                _ => Some((EventKind::CollectorSnapshotGap, LossReason::CollectorLimit)),
             };
             if let Some((kind, reason)) = primary
                 && let Some(fact) = EventFact::from_collector_loss(
@@ -1091,10 +1210,7 @@ fn collector_event_facts(
                 push_collector_fact(&mut facts, fact, bounds)?;
             }
             if record.visibility != 0
-                && !matches!(
-                    primary,
-                    Some((EventKind::CollectorVisibilityRestricted, _))
-                )
+                && !matches!(primary, Some((EventKind::CollectorVisibilityRestricted, _)))
                 && let Some(fact) = EventFact::from_collector_loss(
                     scope,
                     *source_type,
@@ -1110,7 +1226,10 @@ fn collector_event_facts(
         }
     }
     facts.sort_by(EventFact::canonical_cmp);
-    facts.dedup_by_key(|fact| fact.fact_id());
+    let mut ids = BTreeSet::new();
+    if facts.iter().any(|fact| !ids.insert(fact.fact_id())) {
+        return Err(BuildError::Source(SourceError::Corrupt));
+    }
     Ok(facts)
 }
 
@@ -1136,51 +1255,87 @@ const fn complete_snapshot(record: &CoverageRecord) -> bool {
 fn source_coverage(
     sections: &[DecodedMetricSection],
 ) -> Result<BTreeMap<u32, Vec<CoverageRecord>>, BuildError> {
-    let mut coverage: BTreeMap<u32, Vec<CoverageRecord>> = BTreeMap::new();
+    let mut canonical = BTreeMap::<(u32, i64), CoverageRecord>::new();
     for section in sections {
         match section.type_id {
             SNAPSHOT_COVERAGE => {
                 for row in &section.rows {
-                    coverage
-                        .entry(required_u32(row, "source_type_id")?)
-                        .or_default()
-                        .push(CoverageRecord {
-                            ts_us: required_ts(row, "ts")?,
-                            read_state: u8::try_from(required_u32(row, "read_state")?)
-                                .map_err(|_error| BuildError::Source(SourceError::Corrupt))?,
-                            visibility: u8::try_from(required_u32(row, "visibility")?)
-                                .map_err(|_error| BuildError::Source(SourceError::Corrupt))?,
-                            source_total: u64::from(required_u32(row, "source_total")?),
-                            collected: u64::from(required_u32(row, "collected")?),
-                            total_exact: true,
-                        });
+                    let source_type = required_u32(row, "source_type_id")?;
+                    let ts_us = required_ts(row, "ts")?;
+                    let read_state = required_u32(row, "read_state")?;
+                    let visibility = required_u32(row, "visibility")?;
+                    let source_total = u64::from(required_u32(row, "source_total")?);
+                    let collected = u64::from(required_u32(row, "collected")?);
+                    if read_state > 4
+                        || visibility > 2
+                        || collected > source_total
+                        || read_state == 0 && collected != source_total
+                    {
+                        return Err(BuildError::Source(SourceError::Corrupt));
+                    }
+                    let record = CoverageRecord {
+                        ts_us,
+                        read_state: u8::try_from(read_state)
+                            .map_err(|_error| BuildError::Source(SourceError::Corrupt))?,
+                        visibility: u8::try_from(visibility)
+                            .map_err(|_error| BuildError::Source(SourceError::Corrupt))?,
+                        source_total,
+                        collected,
+                        total_exact: true,
+                    };
+                    insert_coverage(&mut canonical, source_type, record)?;
                 }
             }
             COLLECTION_COVERAGE => {
                 for row in &section.rows {
                     let reason = required_u32(row, "reason")?;
+                    if reason > 3 {
+                        return Err(BuildError::Source(SourceError::Corrupt));
+                    }
                     let unknown_total = required_bool(row, "unknown_total")?;
-                    coverage
-                        .entry(required_u32(row, "source_type_id")?)
-                        .or_default()
-                        .push(CoverageRecord {
-                            ts_us: required_ts(row, "ts")?,
-                            read_state: match reason {
-                                2 => 2,
-                                1 | 3 => 3,
-                                _ => 1,
-                            },
-                            visibility: u8::from(reason == 2),
-                            source_total: u64::from(required_u32(row, "total")?),
-                            collected: u64::from(required_u32(row, "collected")?),
-                            total_exact: !unknown_total,
-                        });
+                    let source_type = required_u32(row, "source_type_id")?;
+                    let source_total = u64::from(required_u32(row, "total")?);
+                    let collected = u64::from(required_u32(row, "collected")?);
+                    if collected > source_total {
+                        return Err(BuildError::Source(SourceError::Corrupt));
+                    }
+                    let record = CoverageRecord {
+                        ts_us: required_ts(row, "ts")?,
+                        read_state: match reason {
+                            2 => 2,
+                            1 | 3 => 3,
+                            _ => 1,
+                        },
+                        visibility: u8::from(reason == 2),
+                        source_total,
+                        collected,
+                        total_exact: !unknown_total,
+                    };
+                    insert_coverage(&mut canonical, source_type, record)?;
                 }
             }
             _ => {}
         }
     }
+    let mut coverage: BTreeMap<u32, Vec<CoverageRecord>> = BTreeMap::new();
+    for ((source_type, _ts_us), record) in canonical {
+        coverage.entry(source_type).or_default().push(record);
+    }
     Ok(coverage)
+}
+
+fn insert_coverage(
+    coverage: &mut BTreeMap<(u32, i64), CoverageRecord>,
+    source_type: u32,
+    record: CoverageRecord,
+) -> Result<(), BuildError> {
+    if coverage
+        .insert((source_type, record.ts_us), record)
+        .is_some()
+    {
+        return Err(BuildError::Source(SourceError::Corrupt));
+    }
+    Ok(())
 }
 
 fn factor_coverage(
@@ -1189,7 +1344,11 @@ fn factor_coverage(
     interval: CoverageSpan,
     bounds: &Bounds,
 ) -> Result<Vec<FactorCoverage>, BuildError> {
-    let mut factor_ids = metrics.factor_sources.keys().copied().collect::<BTreeSet<_>>();
+    let mut factor_ids = metrics
+        .factor_sources
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
     for factor in [
         MetricFactor::CpuPressureUnsupported,
         MetricFactor::MemoryPsiUnsupported,
@@ -1257,9 +1416,9 @@ fn factor_coverage(
         }
         let source_complete = !sources.is_empty()
             && sources.iter().all(|source| {
-                snapshot
-                    .get(source)
-                    .is_some_and(|records| !records.is_empty() && records.iter().all(complete_snapshot))
+                snapshot.get(source).is_some_and(|records| {
+                    !records.is_empty() && records.iter().all(complete_snapshot)
+                })
             });
         let times = metrics
             .factor_times
@@ -1267,8 +1426,7 @@ fn factor_coverage(
             .cloned()
             .unwrap_or_default();
         let cadence = observed_cadence(&times);
-        let present_samples =
-            u64::try_from(times.len()).map_err(|_error| BuildError::Overflow)?;
+        let present_samples = u64::try_from(times.len()).map_err(|_error| BuildError::Overflow)?;
         let covered_duration = cadence.map_or(0, |(period, _cadence_id)| {
             cadence_covered_duration(&times, interval, period)
         });
@@ -1320,9 +1478,8 @@ fn factor_coverage(
             state,
             interval,
             expected_period_us: cadence.map(|(period, _)| period),
-            period_quality: cadence.map_or(PeriodQuality::Unknown, |_| {
-                PeriodQuality::ObservedStable
-            }),
+            period_quality: cadence
+                .map_or(PeriodQuality::Unknown, |_| PeriodQuality::ObservedStable),
             cadence_epoch_id: cadence.map(|(_, id)| id),
             crosses_cadence_boundary: false,
             present_samples,
@@ -1638,6 +1795,48 @@ mod tests {
     }
 
     #[test]
+    fn context_falls_forward_only_when_the_epoch_predates_the_sample() {
+        let timeline = ResetTimeline {
+            pg: vec![(200, 50, Some(150))],
+            os: vec![(200, 7, 40)],
+        };
+        let context = timeline.context_at(100);
+        assert_eq!(context.postmaster_start_us, Some(50));
+        assert_eq!(context.database_reset_us, None);
+        assert_eq!(context.boot_id, Some(7));
+        assert_eq!(context.boot_time_us, Some(40));
+
+        let restarted = ResetTimeline {
+            pg: vec![(200, 150, None)],
+            os: vec![(200, 8, 150)],
+        }
+        .context_at(100);
+        assert!(!restarted.has_pg_context());
+        assert!(!restarted.has_os_context());
+    }
+
+    #[test]
+    fn expanded_metric_samples_stop_at_the_output_bound() {
+        let scope = SourceScopeId([1; 32]);
+        let descriptor = series(
+            MetricFactor::PgDatabaseConnections,
+            scope,
+            PG_STAT_DATABASE_TYPES[0],
+            MetricUnit::Connections,
+            None,
+            None,
+            b"bounded",
+        );
+        let mut metrics = MetricAccumulator::with_item_limit(1);
+        assert_eq!(metrics.gauge(descriptor, 10, 1.0), Ok(()));
+        assert_eq!(
+            metrics.gauge(descriptor, 20, 2.0),
+            Err(BuildError::LimitExceeded)
+        );
+        assert_eq!(metrics.gauges.len(), 1);
+    }
+
+    #[test]
     fn stable_cadence_requires_equal_positive_intervals() {
         assert_eq!(observed_cadence(&[10]), None);
         assert_eq!(observed_cadence(&[10, 20, 31]), None);
@@ -1665,8 +1864,7 @@ mod tests {
     #[test]
     fn unsupported_factor_coverage_is_explicit() {
         let interval = CoverageSpan::new(0, 10).expect("interval");
-        let coverage =
-            unsupported_coverage(MetricFactor::CpuPressureUnsupported.id(), interval);
+        let coverage = unsupported_coverage(MetricFactor::CpuPressureUnsupported.id(), interval);
         assert_eq!(coverage.applicability, Applicability::Unsupported);
         assert_eq!(coverage.state, CoverageState::NotCollected);
         assert_eq!(coverage.present_samples, 0);
@@ -1679,10 +1877,7 @@ mod tests {
             MetricFactor::PgDatabaseDeadlocks,
             &[PG_STAT_DATABASE_TYPES[0]],
             &[10],
-            BTreeMap::from([(
-                PG_STAT_DATABASE_TYPES[0],
-                vec![complete_record(10, 1)],
-            )]),
+            BTreeMap::from([(PG_STAT_DATABASE_TYPES[0], vec![complete_record(10, 1)])]),
             interval,
         );
 
@@ -1702,10 +1897,7 @@ mod tests {
             MetricFactor::PgDatabaseDeadlocks,
             &[source],
             &[10, 20],
-            BTreeMap::from([(
-                source,
-                vec![complete_record(10, 1), complete_record(20, 1)],
-            )]),
+            BTreeMap::from([(source, vec![complete_record(10, 1), complete_record(20, 1)])]),
             interval,
         );
 
@@ -1776,10 +1968,7 @@ mod tests {
         );
 
         assert_eq!(coverage.lost_count_lower_bound, Some(3));
-        assert_eq!(
-            coverage.loss_reasons,
-            vec![LossReason::SnapshotSourceLimit]
-        );
+        assert_eq!(coverage.loss_reasons, vec![LossReason::SnapshotSourceLimit]);
         assert_eq!(
             coverage.source_completeness,
             SourceCompleteness::BoundedSubset

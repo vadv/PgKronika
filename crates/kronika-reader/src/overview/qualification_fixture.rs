@@ -70,14 +70,14 @@ impl VersionedFixture {
                 let mut group_max = None;
                 for (index, part) in self.parts.iter().enumerate() {
                     sections.extend(part.sections().iter().cloned());
-                    group_min = Some(group_min.map_or(part.min_ts_us, |value: i64| {
-                        value.min(part.min_ts_us)
-                    }));
-                    group_max = Some(group_max.map_or(part.max_ts_us, |value: i64| {
-                        value.max(part.max_ts_us)
-                    }));
-                    let cut_after = index + 1 == self.parts.len()
-                        || cut_mask & (1_usize << index) != 0;
+                    group_min = Some(
+                        group_min.map_or(part.min_ts_us, |value: i64| value.min(part.min_ts_us)),
+                    );
+                    group_max = Some(
+                        group_max.map_or(part.max_ts_us, |value: i64| value.max(part.max_ts_us)),
+                    );
+                    let cut_after =
+                        index + 1 == self.parts.len() || cut_mask & (1_usize << index) != 0;
                     if cut_after {
                         encoded.push(build_fixture_part(
                             &sections,
@@ -235,12 +235,7 @@ fn encoded_section<S: Section>(type_id: u32, rows: &[S]) -> FixtureSection {
     }
 }
 
-fn lifecycle_row(
-    ts_us: i64,
-    kind: u8,
-    pid: Option<i32>,
-    signal: Option<i32>,
-) -> PgLogLifecycleV1 {
+fn lifecycle_row(ts_us: i64, kind: u8, pid: Option<i32>, signal: Option<i32>) -> PgLogLifecycleV1 {
     PgLogLifecycleV1 {
         ts: Ts(ts_us),
         kind,

@@ -553,9 +553,7 @@ fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
     anyhow::ensure!(fact["identity_quality"] == "content_derived");
     anyhow::ensure!(fact["sort_ts_us"].is_i64());
     anyhow::ensure!(fact["occurred_at_us"].is_i64() || fact["occurred_at_us"].is_null());
-    anyhow::ensure!(
-        fact["observed_interval"].is_object() || fact["observed_interval"].is_null()
-    );
+    anyhow::ensure!(fact["observed_interval"].is_object() || fact["observed_interval"].is_null());
     anyhow::ensure!(fact["entity"].is_null());
     anyhow::ensure!(
         fact["occurrence_count"]
@@ -627,11 +625,7 @@ fn assert_supporting_evidence(fact: &Value) -> Result<()> {
     Ok(())
 }
 
-fn assert_metric_factor_coverage(
-    overview: &Value,
-    events: &Value,
-    health: &Value,
-) -> Result<()> {
+fn assert_metric_factor_coverage(overview: &Value, events: &Value, health: &Value) -> Result<()> {
     anyhow::ensure!(
         overview["coverage"] == events["coverage"] && events["coverage"] == health["coverage"],
         "timeline endpoints projected different factor coverage"

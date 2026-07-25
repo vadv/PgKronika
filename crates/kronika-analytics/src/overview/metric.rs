@@ -188,9 +188,7 @@ impl MetricFactor {
             Self::PgReplicationSenderSnapshotPopulation => {
                 "pg.replication.sender_snapshot_population"
             }
-            Self::PgReplicationSlotSnapshotPopulation => {
-                "pg.replication.slot_snapshot_population"
-            }
+            Self::PgReplicationSlotSnapshotPopulation => "pg.replication.slot_snapshot_population",
             Self::PgFilesystemTotalBytes => "pg.filesystem.total_bytes",
             Self::PgFilesystemAvailableBytes => "pg.filesystem.available_bytes",
             Self::OsCgroupMemoryCurrentBytes => "os.cgroup.memory.current_bytes",
@@ -373,10 +371,7 @@ pub fn derive_entity(
 
 /// Derives alignment shared by compatible samples of one source entity.
 #[must_use]
-pub fn derive_alignment(
-    source_scope_id: SourceScopeId,
-    entity: Option<EntityRef>,
-) -> AlignmentId {
+pub fn derive_alignment(source_scope_id: SourceScopeId, entity: Option<EntityRef>) -> AlignmentId {
     let entity_kind = entity.map_or(0, |value| value.kind.code());
     let entity_id = entity.map_or([0_u8; 16], |value| value.id);
     let digest = sha256::digest_parts(&[
@@ -404,11 +399,7 @@ mod tests {
             assert_eq!(MetricFactor::from_id(factor.id()), Some(factor));
             assert!(!factor.wire_code().is_empty());
         }
-        for unit in [
-            MetricUnit::Count,
-            MetricUnit::Bytes,
-            MetricUnit::StateCode,
-        ] {
+        for unit in [MetricUnit::Count, MetricUnit::Bytes, MetricUnit::StateCode] {
             assert_eq!(MetricUnit::from_code(unit.code()), Some(unit));
         }
     }

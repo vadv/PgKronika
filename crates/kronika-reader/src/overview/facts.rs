@@ -15,10 +15,10 @@ use std::collections::{BTreeMap, BTreeSet as DictionaryIdSet};
 use kronika_analytics::overview::{
     Applicability, BoundaryQuality, CounterSample, Coverage, CoverageSpan, CoverageState,
     EventFact, EventObservation, FactorCoverage, FactorId, GaugeSample, MetricSeriesDescriptor,
-    MetricSeriesId, NamingContractId, ObservationPayload, ObservationProvenance, OracleError,
-    OracleLimits, OracleResult, PeriodQuality, PhysicalCountSemantics, PopulationTotalQuality,
-    RawOracle, RetainedExactness, SegmentIdentity, SegmentLocator, SourceCompleteness,
-    SourcePopulation, query_bounded,
+    MetricSeriesId, MetricUnit, NamingContractId, ObservationId, ObservationPayload,
+    ObservationProvenance, OracleError, OracleLimits, OracleResult, PeriodQuality,
+    PhysicalCountSemantics, PopulationTotalQuality, RawOracle, RetainedExactness, SegmentIdentity,
+    SegmentLocator, SourceCompleteness, SourcePopulation, SourceScopeId, query_bounded,
 };
 use kronika_format::ReadAt;
 
@@ -259,8 +259,7 @@ impl SegmentFacts {
     ) -> Result<(Self, PgmBodyReadStats), BuildError> {
         let (min_ts, max_ts) = (unit.catalog().min_ts, unit.catalog().max_ts);
         let (identity, lineage) = Self::provenance(unit, context)?;
-        let mut extracted =
-            extract_events(unit, lineage, Some(context.segment_locator), bounds)?;
+        let mut extracted = extract_events(unit, lineage, Some(context.segment_locator), bounds)?;
         let metrics = extract_metrics(
             unit,
             identity.source_scope_id,
@@ -270,7 +269,9 @@ impl SegmentFacts {
         apply_descriptor_replacements(&mut extracted, &metrics)?;
         let pgm_body_read_stats =
             checked_add_read_stats(extracted.pgm_body_read_stats, metrics.pgm_body_read_stats)?;
-        let facts = Self::assemble(identity, lineage, extracted, metrics, min_ts, max_ts, bounds)?;
+        let facts = Self::assemble(
+            identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
+        )?;
         Ok((facts, pgm_body_read_stats))
     }
 
@@ -318,7 +319,9 @@ impl SegmentFacts {
             bounds,
         )?;
         apply_descriptor_replacements(&mut extracted, &metrics)?;
-        Self::assemble(identity, lineage, extracted, metrics, min_ts, max_ts, bounds)
+        Self::assemble(
+            identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
+        )
     }
 
     /// Promotes matching live parts without rereading sealed event bodies.
@@ -406,12 +409,9 @@ impl SegmentFacts {
             .map_err(|_error| BuildError::Internal)?;
         event_facts.extend(metrics.event_facts.iter().cloned());
         let covered = segment_coverage(min_ts, max_ts)?;
-        let counter_samples = CounterSamplesBlock::new_with_series(
-            metrics.counter_series,
-            metrics.counters,
-            bounds,
-        )
-        .map_err(block_build_error)?;
+        let counter_samples =
+            CounterSamplesBlock::new_with_series(metrics.counter_series, metrics.counters, bounds)
+                .map_err(block_build_error)?;
         let gauge_samples =
             GaugeSamplesBlock::new_with_series(metrics.gauge_series, metrics.gauges, bounds)
                 .map_err(block_build_error)?;
@@ -427,10 +427,7 @@ impl SegmentFacts {
             bounds,
         )?);
         event_facts.sort_by(EventFact::canonical_cmp);
-        if event_facts
-            .windows(2)
-            .any(|pair| pair[0].fact_id() == pair[1].fact_id())
-        {
+        if has_duplicate_fact_id(&event_facts) {
             return Err(BuildError::Internal);
         }
         let loss_coverage = LossCoverageBlock::new_with_factors(
@@ -601,60 +598,18 @@ impl SegmentFacts {
             .event_facts
             .capacity()
             .checked_mul(size_of::<EventFact>())?;
-        let event_fact_heap = self
-            .event_facts
-            .iter()
-            .try_fold(0_usize, |total, fact| {
-                total.checked_add(fact.resident_heap_bytes()?)
-            })?;
+        let event_fact_heap = self.event_facts.iter().try_fold(0_usize, |total, fact| {
+            total.checked_add(fact.resident_heap_bytes()?)
+        })?;
         let dictionary = self
             .dictionary_fingerprints
             .capacity()
             .checked_mul(size_of::<DictionaryFingerprint>())?;
-        let counter_series = self
-            .counter_samples
-            .series()
-            .len()
-            .checked_mul(size_of::<MetricSeriesDescriptor>())?;
-        let counters = self
-            .counter_samples
-            .samples()
-            .len()
-            .checked_mul(size_of::<CounterSample>())?;
-        let gauge_series = self
-            .gauge_samples
-            .series()
-            .len()
-            .checked_mul(size_of::<MetricSeriesDescriptor>())?;
-        let gauges = self
-            .gauge_samples
-            .samples()
-            .len()
-            .checked_mul(size_of::<GaugeSample>())?;
-        let resets = self
-            .reset_markers
-            .markers()
-            .len()
-            .checked_mul(size_of::<ResetMarker>())?;
-        let entity_states = self
-            .entity_states
-            .records()
-            .len()
-            .checked_mul(size_of::<EntityStateRecord>())?;
-        let factor_coverage = self
-            .loss_coverage
-            .factor_coverage()
-            .iter()
-            .try_fold(0_usize, |total, coverage| {
-                total
-                    .checked_add(size_of::<FactorCoverage>())?
-                    .checked_add(
-                        coverage
-                            .loss_reasons
-                            .capacity()
-                            .checked_mul(size_of::<kronika_analytics::overview::LossReason>())?,
-                    )
-            })?;
+        let counter_samples = self.counter_samples.resident_heap_bytes()?;
+        let gauge_samples = self.gauge_samples.resident_heap_bytes()?;
+        let resets = self.reset_markers.resident_heap_bytes()?;
+        let entity_states = self.entity_states.resident_heap_bytes()?;
+        let factor_coverage = self.loss_coverage.resident_factor_bytes()?;
 
         size_of::<Self>()
             .checked_add(manifest)?
@@ -664,10 +619,8 @@ impl SegmentFacts {
             .checked_add(event_fact_heap)?
             .checked_add(self.loss_coverage.covered().resident_heap_bytes()?)?
             .checked_add(self.loss_coverage.known_gaps().resident_heap_bytes()?)?
-            .checked_add(counter_series)?
-            .checked_add(counters)?
-            .checked_add(gauge_series)?
-            .checked_add(gauges)?
+            .checked_add(counter_samples)?
+            .checked_add(gauge_samples)?
             .checked_add(resets)?
             .checked_add(entity_states)?
             .checked_add(factor_coverage)?
@@ -820,8 +773,7 @@ impl SegmentFacts {
             return Err(CacheReadError::Corrupt);
         }
 
-        let (facts_entry, facts_body) =
-            singleton_body(&mut fact_reader, BlockKind::EventFacts)?;
+        let (facts_entry, facts_body) = singleton_body(&mut fact_reader, BlockKind::EventFacts)?;
         let event_facts = EventFactsBlock::decode(&facts_body, &strings, bounds)?;
         validate_block_descriptor(&facts_entry, &event_facts)?;
 
@@ -831,14 +783,12 @@ impl SegmentFacts {
         validate_block_descriptor(&counter_entry, &counter_samples)?;
         validate_metric_scope(counter_samples.series(), expected.source_scope_id)?;
 
-        let (gauge_entry, gauge_body) =
-            singleton_body(&mut fact_reader, BlockKind::GaugeSamples)?;
+        let (gauge_entry, gauge_body) = singleton_body(&mut fact_reader, BlockKind::GaugeSamples)?;
         let gauge_samples = GaugeSamplesBlock::decode(&gauge_body, bounds)?;
         validate_block_descriptor(&gauge_entry, &gauge_samples)?;
         validate_metric_scope(gauge_samples.series(), expected.source_scope_id)?;
 
-        let (reset_entry, reset_body) =
-            singleton_body(&mut fact_reader, BlockKind::ResetMarkers)?;
+        let (reset_entry, reset_body) = singleton_body(&mut fact_reader, BlockKind::ResetMarkers)?;
         let reset_markers = ResetMarkersBlock::decode(&reset_body, bounds)?;
         validate_block_descriptor(&reset_entry, &reset_markers)?;
         validate_reset_series(&reset_markers, &counter_samples)?;
@@ -853,6 +803,7 @@ impl SegmentFacts {
             &observations,
             &counter_samples,
             &gauge_samples,
+            expected.source_scope_id,
         )?;
 
         let coverage = merge_coverage_blocks(&mut fact_reader, bounds)?;
@@ -1137,8 +1088,7 @@ fn derive_metric_event_facts(
     while start < counters.samples().len() {
         let series_id = counters.samples()[start].series_id();
         let end = start
-            + counters.samples()[start..]
-                .partition_point(|sample| sample.series_id() == series_id);
+            + counters.samples()[start..].partition_point(|sample| sample.series_id() == series_id);
         let descriptor = series_descriptor(counters.series(), series_id)?;
         for pair in counters.samples()[start..end].windows(2) {
             if let Some(fact) =
@@ -1155,13 +1105,10 @@ fn derive_metric_event_facts(
     while start < states.records().len() {
         let series_id = states.records()[start].series_id;
         let end = start
-            + states.records()[start..]
-                .partition_point(|record| record.series_id == series_id);
+            + states.records()[start..].partition_point(|record| record.series_id == series_id);
         let descriptor = series_descriptor(gauges.series(), series_id)?;
         for pair in states.records()[start..end].windows(2) {
-            if known_gaps.spans().iter().any(|gap| {
-                gap.start_us() < pair[1].ts_us && gap.end_us() > pair[0].ts_us
-            }) {
+            if coverage_intersects(known_gaps, pair[0].ts_us, pair[1].ts_us) {
                 continue;
             }
             if let Some(fact) = EventFact::from_state_transition(
@@ -1189,16 +1136,9 @@ fn derive_metric_event_facts(
             )
         )
     }) {
-        let samples = gauges
-            .samples()
-            .iter()
-            .filter(|sample| sample.series_id() == descriptor.series_id)
-            .copied()
-            .collect::<Vec<_>>();
+        let samples = gauge_samples_for_series(gauges.samples(), descriptor.series_id);
         for pair in samples.windows(2) {
-            if known_gaps.spans().iter().any(|gap| {
-                gap.start_us() < pair[1].ts_us() && gap.end_us() > pair[0].ts_us()
-            }) {
+            if coverage_intersects(known_gaps, pair[0].ts_us(), pair[1].ts_us()) {
                 continue;
             }
             if let Some(fact) = EventFact::from_metadata_change(*descriptor, pair[0], pair[1])
@@ -1217,22 +1157,17 @@ fn derive_metric_event_facts(
         let Some(entity) = descriptor.entity else {
             continue;
         };
-        let destination = match kronika_analytics::overview::MetricFactor::from_id(
-            descriptor.factor_id,
-        ) {
-            Some(kronika_analytics::overview::MetricFactor::PgFilesystemTotalBytes) => {
-                &mut totals
-            }
-            Some(kronika_analytics::overview::MetricFactor::PgFilesystemAvailableBytes) => {
-                &mut available_by_key
-            }
-            _ => continue,
-        };
-        for sample in gauges
-            .samples()
-            .iter()
-            .filter(|sample| sample.series_id() == descriptor.series_id)
-        {
+        let destination =
+            match kronika_analytics::overview::MetricFactor::from_id(descriptor.factor_id) {
+                Some(kronika_analytics::overview::MetricFactor::PgFilesystemTotalBytes) => {
+                    &mut totals
+                }
+                Some(kronika_analytics::overview::MetricFactor::PgFilesystemAvailableBytes) => {
+                    &mut available_by_key
+                }
+                _ => continue,
+            };
+        for sample in gauge_samples_for_series(gauges.samples(), descriptor.series_id) {
             if destination
                 .insert((entity, sample.ts_us()), (*descriptor, *sample))
                 .is_some()
@@ -1242,8 +1177,7 @@ fn derive_metric_event_facts(
         }
     }
     for (key, (total_descriptor, total)) in totals {
-        let Some((available_descriptor, available_sample)) =
-            available_by_key.get(&key).copied()
+        let Some((available_descriptor, available_sample)) = available_by_key.get(&key).copied()
         else {
             continue;
         };
@@ -1285,12 +1219,10 @@ fn derive_sender_disappearances(
     bounds: &Bounds,
     facts: &mut Vec<EventFact>,
 ) -> Result<(), BuildError> {
-    let mut boundaries = BTreeMap::<
-        (kronika_analytics::overview::SourceScopeId, u32),
-        Vec<(MetricSeriesDescriptor, EntityStateRecord)>,
-    >::new();
+    let mut boundaries =
+        BTreeMap::<(SourceScopeId, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
     let mut snapshots = BTreeMap::<
-        (kronika_analytics::overview::SourceScopeId, u32, i64),
+        (SourceScopeId, u32, i64),
         BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
     >::new();
     for record in states.records() {
@@ -1321,9 +1253,7 @@ fn derive_sender_disappearances(
             let (previous_descriptor, previous) = pair[0];
             let (current_descriptor, current) = pair[1];
             if previous_descriptor.series_id != current_descriptor.series_id
-                || known_gaps.spans().iter().any(|gap| {
-                    gap.start_us() < current.ts_us && gap.end_us() > previous.ts_us
-                })
+                || coverage_intersects(known_gaps, previous.ts_us, current.ts_us)
             {
                 continue;
             }
@@ -1373,6 +1303,22 @@ fn series_descriptor(
         .ok_or(BuildError::Internal)
 }
 
+fn gauge_samples_for_series(samples: &[GaugeSample], series_id: MetricSeriesId) -> &[GaugeSample] {
+    let start = samples.partition_point(|sample| sample.series_id() < series_id);
+    let end = start + samples[start..].partition_point(|sample| sample.series_id() == series_id);
+    &samples[start..end]
+}
+
+fn coverage_intersects(coverage: &Coverage, from_us: i64, to_us: i64) -> bool {
+    let index = coverage
+        .spans()
+        .partition_point(|span| span.end_us() <= from_us);
+    coverage
+        .spans()
+        .get(index)
+        .is_some_and(|span| span.start_us() < to_us)
+}
+
 fn push_fact(
     destination: &mut Vec<EventFact>,
     fact: EventFact,
@@ -1394,10 +1340,39 @@ const fn block_build_error(error: super::block::BlockError) -> BuildError {
 
 fn promote_metrics(
     parts: &[&SegmentFacts],
-    expected_scope: kronika_analytics::overview::SourceScopeId,
-    interval: CoverageSpan,
+    expected_scope: SourceScopeId,
+    interval: Option<CoverageSpan>,
     bounds: &Bounds,
 ) -> Result<Option<MetricExtraction>, BuildError> {
+    let Some(interval) = interval else {
+        let has_metric_data = parts.iter().any(|part| {
+            !part.counter_samples.samples().is_empty()
+                || !part.gauge_samples.samples().is_empty()
+                || !part.reset_markers.markers().is_empty()
+                || !part.entity_states.records().is_empty()
+                || !part.loss_coverage.factor_coverage().is_empty()
+                || part.event_facts.iter().any(|fact| {
+                    matches!(
+                        fact.kind(),
+                        kronika_analytics::overview::EventKind::CollectorSnapshotGap
+                            | kronika_analytics::overview::EventKind::CollectorSourceReadFailure
+                            | kronika_analytics::overview::EventKind::CollectorVisibilityRestricted
+                    )
+                })
+        });
+        return Ok((!has_metric_data).then(|| MetricExtraction {
+            descriptor_replacements: Vec::new(),
+            counter_series: Vec::new(),
+            counters: Vec::new(),
+            gauge_series: Vec::new(),
+            gauges: Vec::new(),
+            reset_markers: Vec::new(),
+            entity_states: Vec::new(),
+            factor_coverage: Vec::new(),
+            event_facts: Vec::new(),
+            pgm_body_read_stats: PgmBodyReadStats::default(),
+        }));
+    };
     let mut counter_series = BTreeMap::new();
     let mut gauge_series = BTreeMap::new();
     let mut counters = Vec::new();
@@ -1467,9 +1442,10 @@ fn promote_metrics(
         return Ok(None);
     }
     entity_states.sort_unstable_by_key(|record| (record.series_id.0, record.ts_us));
-    if entity_states.windows(2).any(|pair| {
-        pair[0].series_id == pair[1].series_id && pair[0].ts_us == pair[1].ts_us
-    }) {
+    if entity_states
+        .windows(2)
+        .any(|pair| pair[0].series_id == pair[1].series_id && pair[0].ts_us == pair[1].ts_us)
+    {
         return Ok(None);
     }
     let factor_coverage = promoted_factor_coverage(
@@ -1484,7 +1460,9 @@ fn promote_metrics(
     )?;
     let reset_markers = reset_markers_for_samples(&counters);
     event_facts.sort_by(EventFact::canonical_cmp);
-    event_facts.dedup_by_key(|fact| fact.fact_id());
+    if has_duplicate_fact_id(&event_facts) {
+        return Ok(None);
+    }
     Ok(Some(MetricExtraction {
         descriptor_replacements: Vec::new(),
         counter_series: counter_series.into_values().collect(),
@@ -1512,7 +1490,10 @@ fn promoted_factor_coverage(
     let mut records = BTreeMap::<FactorId, Vec<&FactorCoverage>>::new();
     for part in parts {
         for coverage in part.loss_coverage.factor_coverage() {
-            records.entry(coverage.factor_id).or_default().push(coverage);
+            records
+                .entry(coverage.factor_id)
+                .or_default()
+                .push(coverage);
         }
     }
     if records.len() as u64 > bounds.items_per_block {
@@ -1642,9 +1623,8 @@ fn promoted_factor_coverage(
                 state,
                 interval,
                 expected_period_us: cadence.map(|(period, _cadence_id)| period),
-                period_quality: cadence.map_or(PeriodQuality::Unknown, |_| {
-                    PeriodQuality::ObservedStable
-                }),
+                period_quality: cadence
+                    .map_or(PeriodQuality::Unknown, |_| PeriodQuality::ObservedStable),
                 cadence_epoch_id: cadence.map(|(_period, id)| id),
                 crosses_cadence_boundary: false,
                 present_samples,
@@ -1729,7 +1709,7 @@ const fn unsupported_promoted_coverage(
 fn merge_metric_series(
     destination: &mut BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
     incoming: &[MetricSeriesDescriptor],
-    expected_scope: kronika_analytics::overview::SourceScopeId,
+    expected_scope: SourceScopeId,
 ) -> bool {
     incoming.iter().all(|descriptor| {
         if descriptor.source_scope_id != expected_scope {
@@ -1780,7 +1760,7 @@ fn reset_markers_for_samples(samples: &[CounterSample]) -> Vec<ResetMarker> {
 
 fn validate_metric_scope(
     series: &[MetricSeriesDescriptor],
-    expected_scope: kronika_analytics::overview::SourceScopeId,
+    expected_scope: SourceScopeId,
 ) -> Result<(), CacheReadError> {
     if series
         .iter()
@@ -1795,14 +1775,8 @@ fn validate_reset_series(
     markers: &ResetMarkersBlock,
     counters: &CounterSamplesBlock,
 ) -> Result<(), CacheReadError> {
-    for marker in markers.markers() {
-        if counters.samples().iter().all(|sample| {
-            sample.series_id() != marker.series_id
-                || sample.ts_us() != marker.ts_us
-                || sample.reset_epoch() != marker.reset_epoch
-        }) {
-            return Err(CacheReadError::Corrupt);
-        }
+    if markers.markers() != reset_markers_for_samples(counters.samples()) {
+        return Err(CacheReadError::Corrupt);
     }
     Ok(())
 }
@@ -1812,26 +1786,35 @@ fn validate_state_series(
     gauges: &GaugeSamplesBlock,
 ) -> Result<(), CacheReadError> {
     for state in states.records() {
-        let has_entity_descriptor = gauges
+        let descriptor = gauges
             .series()
             .binary_search_by_key(&state.series_id.0, |descriptor| descriptor.series_id.0)
             .ok()
-            .is_some_and(|index| gauges.series()[index].entity.is_some());
-        let matching_sample = gauges.samples().iter().any(|sample| {
-            sample.series_id() == state.series_id
-                && sample.ts_us() == state.ts_us
-                && sample.value() == f64::from(state.state_code)
-        });
-        if !has_entity_descriptor || !matching_sample {
+            .map(|index| gauges.series()[index]);
+        let sample = gauges
+            .samples()
+            .binary_search_by_key(&(state.series_id.0, state.ts_us), |sample| {
+                (sample.series_id().0, sample.ts_us())
+            })
+            .ok()
+            .map(|index| gauges.samples()[index]);
+        if descriptor.is_none_or(|descriptor| {
+            descriptor.entity.is_none() || descriptor.unit != MetricUnit::StateCode
+        }) || sample.is_none_or(|sample| sample.value() != f64::from(state.state_code))
+        {
             return Err(CacheReadError::Corrupt);
         }
     }
     Ok(())
 }
 
-fn segment_span(min_ts_us: i64, max_ts_us: i64) -> Result<CoverageSpan, BuildError> {
+fn segment_span(min_ts_us: i64, max_ts_us: i64) -> Result<Option<CoverageSpan>, BuildError> {
+    if min_ts_us > max_ts_us {
+        return Ok(None);
+    }
     let end = max_ts_us.checked_add(1).ok_or(BuildError::Overflow)?;
     CoverageSpan::new(min_ts_us, end)
+        .map(Some)
         .ok_or(BuildError::Source(SourceError::UnsupportedLayout))
 }
 
@@ -1861,67 +1844,79 @@ fn validate_event_fact_evidence(
     observations: &EventObservationsBlock,
     counters: &CounterSamplesBlock,
     gauges: &GaugeSamplesBlock,
+    expected_scope: SourceScopeId,
 ) -> Result<(), CacheReadError> {
-    let mut observation_ids: DictionaryIdSet<_> = observations
-        .observations()
-        .iter()
-        .map(EventObservation::observation_id)
-        .collect();
-    observation_ids.extend(
-        counters
-            .samples()
-            .iter()
-            .copied()
-            .map(kronika_analytics::overview::counter_sample_observation_id),
-    );
-    observation_ids.extend(
-        gauges
-            .samples()
-            .iter()
-            .copied()
-            .map(kronika_analytics::overview::gauge_sample_observation_id),
-    );
+    let mut scopes = BTreeMap::<ObservationId, SourceScopeId>::new();
+    for observation in observations.observations() {
+        insert_evidence_scope(
+            &mut scopes,
+            observation.observation_id(),
+            observation.source_scope_id(),
+        )?;
+    }
+    for sample in counters.samples() {
+        insert_evidence_scope(
+            &mut scopes,
+            kronika_analytics::overview::counter_sample_observation_id(*sample),
+            metric_scope(counters.series(), sample.series_id())?,
+        )?;
+    }
+    for sample in gauges.samples() {
+        insert_evidence_scope(
+            &mut scopes,
+            kronika_analytics::overview::gauge_sample_observation_id(*sample),
+            metric_scope(gauges.series(), sample.series_id())?,
+        )?;
+    }
     for fact in facts.facts() {
+        if fact.coverage().source_scope_id != expected_scope {
+            return Err(CacheReadError::WrongSource);
+        }
+        if matches!(
+            fact.kind(),
+            kronika_analytics::overview::EventKind::CollectorSnapshotGap
+                | kronika_analytics::overview::EventKind::CollectorSourceReadFailure
+                | kronika_analytics::overview::EventKind::CollectorVisibilityRestricted
+        ) {
+            continue;
+        }
         if fact
             .supporting_observation_ids()
             .iter()
-            .any(|id| !observation_ids.contains(id))
+            .any(|id| scopes.get(id) != Some(&fact.coverage().source_scope_id))
         {
-            return Err(CacheReadError::Corrupt);
-        }
-        let observation_scope = fact.supporting_observation_ids().first().and_then(|id| {
-            observations
-                .observations()
-                .iter()
-                .find(|observation| observation.observation_id() == *id)
-                .map(EventObservation::source_scope_id)
-        });
-        let counter_scope = fact.supporting_observation_ids().first().and_then(|id| {
-            counters.samples().iter().find_map(|sample| {
-                (kronika_analytics::overview::counter_sample_observation_id(*sample) == *id)
-                    .then(|| {
-                        series_descriptor(counters.series(), sample.series_id())
-                            .map(|descriptor| descriptor.source_scope_id)
-                    })
-            })
-        });
-        let gauge_scope = fact.supporting_observation_ids().first().and_then(|id| {
-            gauges.samples().iter().find_map(|sample| {
-                (kronika_analytics::overview::gauge_sample_observation_id(*sample) == *id)
-                    .then(|| {
-                        series_descriptor(gauges.series(), sample.series_id())
-                            .map(|descriptor| descriptor.source_scope_id)
-                    })
-            })
-        });
-        let expected_scope = observation_scope
-            .or_else(|| counter_scope.transpose().ok().flatten())
-            .or_else(|| gauge_scope.transpose().ok().flatten());
-        if expected_scope != Some(fact.coverage().source_scope_id) {
             return Err(CacheReadError::Corrupt);
         }
     }
     Ok(())
+}
+
+fn insert_evidence_scope(
+    scopes: &mut BTreeMap<ObservationId, SourceScopeId>,
+    id: ObservationId,
+    scope: SourceScopeId,
+) -> Result<(), CacheReadError> {
+    if scopes.insert(id, scope).is_some() {
+        return Err(CacheReadError::Corrupt);
+    }
+    Ok(())
+}
+
+fn metric_scope(
+    descriptors: &[MetricSeriesDescriptor],
+    series_id: MetricSeriesId,
+) -> Result<SourceScopeId, CacheReadError> {
+    descriptors
+        .binary_search_by_key(&series_id.0, |descriptor| descriptor.series_id.0)
+        .ok()
+        .map(|index| descriptors[index].source_scope_id)
+        .ok_or(CacheReadError::Corrupt)
+}
+
+fn has_duplicate_fact_id(facts: &[EventFact]) -> bool {
+    let mut ids = facts.iter().map(EventFact::fact_id).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.windows(2).any(|pair| pair[0] == pair[1])
 }
 
 fn merge_coverage_blocks<R: ReadAt>(
@@ -2107,9 +2102,7 @@ mod tests {
     use kronika_writer::{Interner, dict};
 
     use super::super::limits::LIMIT;
-    use super::super::qualification_fixture::{
-        ALL_FAMILY_SCHEMA_VERSION, all_family_fixture,
-    };
+    use super::super::qualification_fixture::{ALL_FAMILY_SCHEMA_VERSION, all_family_fixture};
     use super::*;
 
     const LIMITS: OracleLimits = OracleLimits {
@@ -2260,8 +2253,7 @@ mod tests {
         let reset_body = ResetMetadata::encode(resets).expect("encode reset metadata");
         let sender_body =
             PgReplicationPhysicalV1::encode(senders).expect("encode replication senders");
-        let coverage_body =
-            SnapshotCoverageV1::encode(coverage).expect("encode snapshot coverage");
+        let coverage_body = SnapshotCoverageV1::encode(coverage).expect("encode snapshot coverage");
         let min_ts = resets
             .iter()
             .map(|row| row.ts.0)
@@ -2307,10 +2299,7 @@ mod tests {
         let bytes = replication_snapshot_pgm(
             &[reset_metadata(10, 1), reset_metadata(20, 1)],
             &[replication_sender(10)],
-            &[
-                sender_coverage(10, 0, 1, 1),
-                sender_coverage(20, 0, 0, 0),
-            ],
+            &[sender_coverage(10, 0, 1, 1), sender_coverage(20, 0, 0, 0)],
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open replication fixture");
         let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
@@ -2356,10 +2345,7 @@ mod tests {
         let bytes = replication_snapshot_pgm(
             &[reset_metadata(10, 1), reset_metadata(20, 2)],
             &[replication_sender(10)],
-            &[
-                sender_coverage(10, 0, 1, 1),
-                sender_coverage(20, 0, 0, 0),
-            ],
+            &[sender_coverage(10, 0, 1, 1), sender_coverage(20, 0, 0, 0)],
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open restart fixture");
         let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
@@ -3284,7 +3270,7 @@ mod tests {
     }
 
     #[test]
-    fn every_canonical_block_crc_is_enforced_for_the_all_family_fixture() {
+    fn every_populated_block_crc_is_enforced_for_the_all_family_fixture() {
         let bytes = all_family_fixture().sealed_bytes();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
         let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract all families");
@@ -3306,11 +3292,14 @@ mod tests {
         );
 
         for entry in admitted.directory() {
-            assert_ne!(
-                entry.stored_len, 0,
-                "canonical block {} must have a CRC-covered body",
-                entry.block_kind
-            );
+            if entry.stored_len == 0 {
+                assert_eq!(
+                    entry.block_kind,
+                    BlockKind::StringTable.code(),
+                    "only the fixture's intentionally text-free string table is empty"
+                );
+                continue;
+            }
             let mut corrupted = encoded.clone();
             let offset = usize::try_from(entry.offset).expect("fixture offset fits usize");
             corrupted[offset] ^= 0x80;
@@ -3409,13 +3398,9 @@ mod tests {
             REDUCTION_LIMITS,
         )
         .expect("classify whole series");
-        let whole = CounterReduction::from_intervals(
-            &whole_intervals,
-            bucket,
-            REDUCTION_LIMITS,
-        )
-        .expect("reduce whole series")
-        .expect("two owned pairs");
+        let whole = CounterReduction::from_intervals(&whole_intervals, bucket, REDUCTION_LIMITS)
+            .expect("reduce whole series")
+            .expect("two owned pairs");
 
         let halo = samples[0];
         let selected = &samples[1..];
@@ -3426,13 +3411,9 @@ mod tests {
             REDUCTION_LIMITS,
         )
         .expect("classify selected series with halo");
-        let ranged = CounterReduction::from_intervals(
-            &ranged_intervals,
-            bucket,
-            REDUCTION_LIMITS,
-        )
-        .expect("reduce selected range")
-        .expect("halo restores both pairs");
+        let ranged = CounterReduction::from_intervals(&ranged_intervals, bucket, REDUCTION_LIMITS)
+            .expect("reduce selected range")
+            .expect("halo restores both pairs");
         assert_eq!(ranged, whole);
         assert_eq!(ranged.valid_pairs(), 2);
 
@@ -3443,10 +3424,9 @@ mod tests {
             REDUCTION_LIMITS,
         )
         .expect("classify without halo");
-        let no_halo =
-            CounterReduction::from_intervals(&no_halo, bucket, REDUCTION_LIMITS)
-                .expect("reduce without halo")
-                .expect("later pair remains");
+        let no_halo = CounterReduction::from_intervals(&no_halo, bucket, REDUCTION_LIMITS)
+            .expect("reduce without halo")
+            .expect("later pair remains");
         assert_eq!(
             no_halo.valid_pairs(),
             1,

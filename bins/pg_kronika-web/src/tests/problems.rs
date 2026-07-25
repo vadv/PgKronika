@@ -770,8 +770,7 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
         "TimelineHealthResponse",
     ] {
         assert_eq!(
-            schemas[response]["properties"]["coverage"]["maxItems"],
-            65_536,
+            schemas[response]["properties"]["coverage"]["maxItems"], 65_536,
             "{response} factor coverage bound must match the handler"
         );
         assert_eq!(

@@ -19,9 +19,7 @@ use kronika_analytics::overview::{
     CountLimits, CoverageSpan, NamingContractId, OracleLimits, RawOracle, SegmentLocator,
 };
 use kronika_format::{PartMeta, SectionInput, build_part};
-use kronika_reader::{
-    BlockKind, FactFile, LIMIT, PgmUnit, SegmentContext, SegmentFacts,
-};
+use kronika_reader::{BlockKind, FactFile, LIMIT, PgmUnit, SegmentContext, SegmentFacts};
 use kronika_registry::pg_stat_database::PgStatDatabaseV1;
 use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
@@ -222,9 +220,8 @@ fn main() {
     modes.push(measure("range-cold/facts-warm", ITERATIONS, || {
         let offset = i64::try_from(range_counter.get() % 60).expect("offset fits") * CADENCE_US;
         range_counter.set(range_counter.get() + 1);
-        let range =
-            CoverageSpan::new(1_000_000 + offset, 1_000_000 + offset + 300_000_000)
-                .expect("range-warm interval");
+        let range = CoverageSpan::new(1_000_000 + offset, 1_000_000 + offset + 300_000_000)
+            .expect("range-warm interval");
         std::hint::black_box(raw.query(range, ORACLE_LIMITS).expect("range-warm query"));
         Work {
             successful_responses: 1,
@@ -283,8 +280,7 @@ fn main() {
         for worker in 0..CONCURRENT_WORKERS {
             let facts = Arc::clone(&raw);
             workers.push(std::thread::spawn(move || {
-                let start = 1_000_000
-                    + i64::try_from(worker).expect("worker fits") * 30_000_000;
+                let start = 1_000_000 + i64::try_from(worker).expect("worker fits") * 30_000_000;
                 let range = CoverageSpan::new(start, start + 30_000_000).expect("disjoint range");
                 facts.query(range, ORACLE_LIMITS).expect("disjoint query")
             }));
@@ -299,7 +295,10 @@ fn main() {
     }));
     modes.push(measure("memory-only", ITERATIONS, || {
         let before = unit.body_read_stats();
-        std::hint::black_box(raw.query(full_range, ORACLE_LIMITS).expect("memory-only query"));
+        std::hint::black_box(
+            raw.query(full_range, ORACLE_LIMITS)
+                .expect("memory-only query"),
+        );
         let after = unit.body_read_stats();
         assert_eq!(after, before, "memory-only query reread the PGM");
         Work {
@@ -494,11 +493,7 @@ fn fixture_profile(
 }
 
 fn accounting(facts: &SegmentFacts, file: &FactFile, fact_file_bytes: usize) -> Accounting {
-    let decoded_block_bytes = file
-        .directory()
-        .iter()
-        .map(|entry| entry.decoded_len)
-        .sum();
+    let decoded_block_bytes = file.directory().iter().map(|entry| entry.decoded_len).sum();
     let metric_kinds = [
         BlockKind::LossCoverage,
         BlockKind::GaugeSamples,
@@ -639,21 +634,57 @@ fn command_output(program: &str, arguments: &[&str]) -> String {
 fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
     const ROWS: [(&str, &[&str]); 18] = [
         ("restart-warm zero PGM reads", &["restart-warm"]),
-        ("raw/index equality", &["oracle-profile", "reader all-family oracle"]),
-        ("partition/seal invariance", &["reader all-family contiguous partitions"]),
+        (
+            "raw/index equality",
+            &["oracle-profile", "reader all-family oracle"],
+        ),
+        (
+            "partition/seal invariance",
+            &["reader all-family contiguous partitions"],
+        ),
         ("cache fallback", &["reader publish fallback suite"]),
-        ("source damage visible", &["reader all-family source CRC suite"]),
-        ("policy bump avoids rebuild", &["web overview response cache suite"]),
+        (
+            "source damage visible",
+            &["reader all-family source CRC suite"],
+        ),
+        (
+            "policy bump avoids rebuild",
+            &["web overview response cache suite"],
+        ),
         ("cursor exact scan", &["web overview cursor suite"]),
-        ("live/seal stable identities", &["reader live promotion suite"]),
+        (
+            "live/seal stable identities",
+            &["reader live promotion suite"],
+        ),
         ("lossless live builder", &["reader live state suite"]),
-        ("required gap stays unknown", &["web overview health fixtures"]),
-        ("trusted floor survives", &["analytics health/downsample properties"]),
-        ("per-factor loss and applicability", &["web all-family API fixtures"]),
-        ("counter reset/gap/range semantics", &["reader all-family halo fixture"]),
-        ("source taxonomy mapping", &["reader metric extraction suite"]),
-        ("hit bypass and cold admission", &["web overview admission suite"]),
-        ("bounded memory-only fallback", &["memory-only", "dense accounting"]),
+        (
+            "required gap stays unknown",
+            &["web overview health fixtures"],
+        ),
+        (
+            "trusted floor survives",
+            &["analytics health/downsample properties"],
+        ),
+        (
+            "per-factor loss and applicability",
+            &["web all-family API fixtures"],
+        ),
+        (
+            "counter reset/gap/range semantics",
+            &["reader all-family halo fixture"],
+        ),
+        (
+            "source taxonomy mapping",
+            &["reader metric extraction suite"],
+        ),
+        (
+            "hit bypass and cold admission",
+            &["web overview admission suite"],
+        ),
+        (
+            "bounded memory-only fallback",
+            &["memory-only", "dense accounting"],
+        ),
         ("retention-safe quota and GC", &["reader GC suite"]),
         ("nine reproducible modes", &["this artifact"]),
     ];

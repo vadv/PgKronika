@@ -561,15 +561,14 @@ impl AppState {
         let delta = snapshot
             .refresh_incremental_delta()
             .map_err(StateBuildError::Snapshot)?;
-        let mut overview =
-            overview::OverviewIndex::with_runtime_config(
-                cache_root,
-                namespace,
-                fallback,
-                gc,
-                source_scrub_interval,
-            )
-                .map_err(StateBuildError::Overview)?;
+        let mut overview = overview::OverviewIndex::with_runtime_config(
+            cache_root,
+            namespace,
+            fallback,
+            gc,
+            source_scrub_interval,
+        )
+        .map_err(StateBuildError::Overview)?;
         let timeline = overview
             .assemble(&snapshot, &delta)
             .map_err(StateBuildError::Overview)?;

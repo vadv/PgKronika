@@ -406,7 +406,7 @@ impl LossSummary {
         &self.reasons
     }
 
-    const fn resident_heap_bytes(&self) -> Option<usize> {
+    pub(crate) const fn resident_heap_bytes(&self) -> Option<usize> {
         self.reasons.capacity().checked_mul(size_of::<LossReason>())
     }
 }

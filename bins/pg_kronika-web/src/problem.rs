@@ -91,9 +91,7 @@ impl ProblemCode {
             Self::AnalyticCapacityUnavailable => {
                 "https://pgkronika.dev/problems/analytic-capacity-unavailable"
             }
-            Self::ColdBuildOverloaded => {
-                "https://pgkronika.dev/problems/cold-build-overloaded"
-            }
+            Self::ColdBuildOverloaded => "https://pgkronika.dev/problems/cold-build-overloaded",
             Self::StoreReadFailed => "https://pgkronika.dev/problems/store-read-failed",
             Self::InternalError => "https://pgkronika.dev/problems/internal-error",
         }

@@ -103,8 +103,8 @@ pub(crate) struct OverviewWriter {
     unavailable: BTreeMap<SealedLocator, SegmentDescriptor>,
     scrub_damaged: BTreeMap<SealedLocator, SegmentDescriptor>,
     scrub_cursor: Option<(SealedLocator, u32)>,
-    scrub_every_passes: u64,
-    passes_since_scrub: u64,
+    source_scrub_interval: Duration,
+    next_source_scrub: Instant,
     live: LiveBuilder,
     passes_since_gc: u64,
     view_generation: u64,
@@ -129,13 +129,7 @@ impl OverviewWriter {
         fallback: FallbackConfig,
         gc: GcConfig,
     ) -> Result<Self, OverviewBuildError> {
-        Self::with_runtime_config(
-            cache_root,
-            namespace,
-            fallback,
-            gc,
-            Duration::from_secs(60),
-        )
+        Self::with_runtime_config(cache_root, namespace, fallback, gc, Duration::from_secs(60))
     }
 
     /// Builds a writer with the complete production storage policy.
@@ -149,6 +143,9 @@ impl OverviewWriter {
         if source_scrub_interval.is_zero() {
             return Err(OverviewBuildError::SourceScrubInterval);
         }
+        let next_source_scrub = Instant::now()
+            .checked_add(source_scrub_interval)
+            .ok_or(OverviewBuildError::SourceScrubInterval)?;
         let live =
             LiveBuilder::new(namespace.clone(), LIMIT).map_err(OverviewBuildError::Config)?;
         Ok(Self {
@@ -158,8 +155,8 @@ impl OverviewWriter {
             unavailable: BTreeMap::new(),
             scrub_damaged: BTreeMap::new(),
             scrub_cursor: None,
-            scrub_every_passes: source_scrub_interval.as_secs().max(1),
-            passes_since_scrub: 0,
+            source_scrub_interval,
+            next_source_scrub,
             live,
             passes_since_gc: 0,
             view_generation: 0,
@@ -311,14 +308,15 @@ impl OverviewWriter {
                 }
             }
         }
+        record_damaged_sources(self.scrub_damaged.len());
     }
 
     fn scrub_one_source_section(&mut self, snapshot: &LocalDirSnapshot) {
-        self.passes_since_scrub = self.passes_since_scrub.saturating_add(1);
-        if self.passes_since_scrub < self.scrub_every_passes {
+        let now = Instant::now();
+        if now < self.next_source_scrub {
             return;
         }
-        self.passes_since_scrub = 0;
+        self.next_source_scrub = now.checked_add(self.source_scrub_interval).unwrap_or(now);
 
         let descriptors = snapshot.sealed_descriptors();
         if descriptors.is_empty() {
@@ -348,9 +346,8 @@ impl OverviewWriter {
             record_scrub("empty", 0, started);
             return;
         }
-        let ordinal = ordinal.min(
-            u32::try_from(unit.catalog().entries.len() - 1).unwrap_or(u32::MAX),
-        );
+        let ordinal =
+            ordinal.min(u32::try_from(unit.catalog().entries.len() - 1).unwrap_or(u32::MAX));
         let result = unit.scrub_overview_section(ordinal);
         let stats = unit.body_read_stats();
         match result {
@@ -377,8 +374,6 @@ impl OverviewWriter {
                 record_scrub("damage", stats.stored_bytes_read, started);
             }
         }
-        metrics::gauge!("overview_source_damaged_segments")
-            .set(self.scrub_damaged.len() as f64);
     }
 
     fn scrub_position(&self, descriptors: &[SegmentDescriptor]) -> (usize, u32) {
@@ -393,18 +388,11 @@ impl OverviewWriter {
 
     fn advance_scrub_cursor(&mut self, descriptors: &[SegmentDescriptor], position: usize) {
         let next = position.saturating_add(1);
-        self.scrub_cursor = Some((
-            descriptors
-                .get(next)
-                .unwrap_or(&descriptors[0])
-                .locator,
-            0,
-        ));
+        self.scrub_cursor = Some((descriptors.get(next).unwrap_or(&descriptors[0]).locator, 0));
     }
 
     fn mark_scrub_damage(&mut self, descriptor: SegmentDescriptor) {
-        self.scrub_damaged
-            .insert(descriptor.locator, descriptor);
+        self.scrub_damaged.insert(descriptor.locator, descriptor);
         self.sealed.remove(&descriptor.locator);
         self.unavailable.insert(descriptor.locator, descriptor);
     }
@@ -461,6 +449,14 @@ fn record_scrub(outcome: &'static str, bytes: u64, started: Instant) {
     metrics::histogram!("overview_source_scrub_seconds").record(started.elapsed());
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64 and the descriptor count is tightly bounded"
+)]
+fn record_damaged_sources(count: usize) {
+    metrics::gauge!("overview_source_damaged_segments").set(count as f64);
+}
+
 fn fold_refresh(
     builder: &mut LiveBuilder,
     snapshot: &LocalDirSnapshot,
@@ -508,7 +504,9 @@ fn record_live_metrics(view: &DescriptorView) {
             "state" => candidate_state,
             "reason" => candidate_reason
         )
-        .set(f64::from(candidate_state == state && candidate_reason == reason));
+        .set(f64::from(
+            candidate_state == state && candidate_reason == reason,
+        ));
     }
     let watermark = live.watermark_us().unwrap_or_default();
     metrics::gauge!("overview_live_data_through_us").set(watermark as f64);

@@ -50,12 +50,7 @@ impl SelectedSealedPlan {
         let stop_after = limit.checked_add(1).ok_or(SelectionError::InvalidLimit)?;
         let mut selected_indices = Vec::with_capacity(stop_after.min(64));
         for source in sources {
-            if view.extend_selected_with_halo(
-                *source,
-                range,
-                stop_after,
-                &mut selected_indices,
-            ) {
+            if view.extend_selected_with_halo(*source, range, stop_after, &mut selected_indices) {
                 return Err(SelectionError::LimitExceeded { limit });
             }
         }
@@ -110,12 +105,17 @@ impl SelectedSealedPlan {
             if descriptor.max_ts < self.range.start_us() {
                 CoverageSpan::new(
                     self.range.start_us(),
-                    self.range.start_us().saturating_add(1).min(self.range.end_us()),
+                    self.range
+                        .start_us()
+                        .saturating_add(1)
+                        .min(self.range.end_us()),
                 )
                 .expect("a valid request range has a left boundary interval")
             } else {
                 CoverageSpan::new(
-                    self.range.start_us().max(self.range.end_us().saturating_sub(1)),
+                    self.range
+                        .start_us()
+                        .max(self.range.end_us().saturating_sub(1)),
                     self.range.end_us(),
                 )
                 .expect("a valid request range has a right boundary interval")

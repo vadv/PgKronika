@@ -450,6 +450,17 @@ impl CounterSamplesBlock {
         &self.samples
     }
 
+    pub(super) fn resident_heap_bytes(&self) -> Option<usize> {
+        self.series
+            .capacity()
+            .checked_mul(size_of::<MetricSeriesDescriptor>())?
+            .checked_add(
+                self.samples
+                    .capacity()
+                    .checked_mul(size_of::<CounterSample>())?,
+            )
+    }
+
     /// Decodes a counter-samples block body.
     ///
     /// # Errors
@@ -602,6 +613,17 @@ impl GaugeSamplesBlock {
     #[must_use]
     pub fn samples(&self) -> &[GaugeSample] {
         &self.samples
+    }
+
+    pub(super) fn resident_heap_bytes(&self) -> Option<usize> {
+        self.series
+            .capacity()
+            .checked_mul(size_of::<MetricSeriesDescriptor>())?
+            .checked_add(
+                self.samples
+                    .capacity()
+                    .checked_mul(size_of::<GaugeSample>())?,
+            )
     }
 
     /// Decodes a gauge-samples block body.
@@ -947,6 +969,24 @@ impl LossCoverageBlock {
         &self.factor_coverage
     }
 
+    pub(super) fn resident_factor_bytes(&self) -> Option<usize> {
+        self.factor_coverage
+            .capacity()
+            .checked_mul(size_of::<FactorCoverage>())?
+            .checked_add(
+                self.factor_coverage
+                    .iter()
+                    .try_fold(0_usize, |total, coverage| {
+                        total.checked_add(
+                            coverage
+                                .loss_reasons
+                                .capacity()
+                                .checked_mul(size_of::<LossReason>())?,
+                        )
+                    })?,
+            )
+    }
+
     /// Decodes a coverage block body.
     ///
     /// # Errors
@@ -986,13 +1026,10 @@ impl LossCoverageBlock {
         let mut factor_coverage = Vec::with_capacity(factor_count.min(4_096) as usize);
         let mut loss_budget = bounds.items_per_block;
         for _ in 0..factor_count {
-            factor_coverage.push(read_factor_coverage(
-                &mut reader,
-                bounds,
-                &mut loss_budget,
-            )?);
+            factor_coverage.push(read_factor_coverage(&mut reader, bounds, &mut loss_budget)?);
         }
         reader.finish()?;
+        validate_canonical_factor_coverage(&factor_coverage)?;
         Self::new_with_factors(
             covered,
             known_gaps,
@@ -1008,6 +1045,26 @@ impl LossCoverageBlock {
     }
 }
 
+fn validate_canonical_factor_coverage(coverage: &[FactorCoverage]) -> Result<(), BlockError> {
+    for pair in coverage.windows(2) {
+        match factor_coverage_key(&pair[0]).cmp(&factor_coverage_key(&pair[1])) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => return Err(BlockError::Duplicate),
+            std::cmp::Ordering::Greater => return Err(BlockError::Unsorted),
+        }
+    }
+    for item in coverage {
+        for pair in item.loss_reasons.windows(2) {
+            match pair[0].cmp(&pair[1]) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => return Err(BlockError::Duplicate),
+                std::cmp::Ordering::Greater => return Err(BlockError::Unsorted),
+            }
+        }
+    }
+    Ok(())
+}
+
 impl EncodableBlock for LossCoverageBlock {
     fn kind(&self) -> BlockKind {
         BlockKind::LossCoverage
@@ -1018,9 +1075,8 @@ impl EncodableBlock for LossCoverageBlock {
     }
 
     fn item_count(&self) -> u64 {
-        (self.covered.spans().len()
-            + self.known_gaps.spans().len()
-            + self.factor_coverage.len()) as u64
+        (self.covered.spans().len() + self.known_gaps.spans().len() + self.factor_coverage.len())
+            as u64
             + 1
     }
 
@@ -1087,15 +1143,13 @@ fn normalize_factor_coverage(
     for item in coverage {
         if item.expected_period_us == Some(0)
             || item.covered_duration_us > item.interval.duration_us()
-            || item
-                .source_population
-                .is_some_and(|population| {
-                    population
-                        .total
-                        .is_some_and(|total| population.collected > total)
-                        || population.total_quality == PopulationTotalQuality::Exact
-                            && population.total.is_none()
-                })
+            || item.source_population.is_some_and(|population| {
+                population
+                    .total
+                    .is_some_and(|total| population.collected > total)
+                    || population.total_quality == PopulationTotalQuality::Exact
+                        && population.total.is_none()
+            })
             || item
                 .lost_count_lower_bound
                 .is_some_and(|lost| lost > 0 && item.loss_reasons.is_empty())
@@ -1162,8 +1216,8 @@ fn read_factor_coverage(
     let factor_id = FactorId(reader.u32_le()?);
     let applicability = applicability_from(reader.u8()?)?;
     let state = coverage_state_from(reader.u8()?)?;
-    let interval = CoverageSpan::new(reader.i64_le()?, reader.i64_le()?)
-        .ok_or(BlockError::Malformed)?;
+    let interval =
+        CoverageSpan::new(reader.i64_le()?, reader.i64_le()?).ok_or(BlockError::Malformed)?;
     let expected_period_us = read_optional_u64(reader)?;
     let period_quality = period_quality_from(reader.u8()?)?;
     let cadence_epoch_id = match reader.u8()? {
@@ -1189,9 +1243,7 @@ fn read_factor_coverage(
         .ok_or(BlockError::AboveBound)?;
     let mut loss_reasons = Vec::with_capacity(loss_count.min(64) as usize);
     for _ in 0..loss_count {
-        loss_reasons.push(
-            LossReason::from_code(reader.u8()?).ok_or(BlockError::InvalidEnum)?,
-        );
+        loss_reasons.push(LossReason::from_code(reader.u8()?).ok_or(BlockError::InvalidEnum)?);
     }
     let lost_count_lower_bound = read_optional_u64(reader)?;
     let retained_exactness = retained_exactness_from(reader.u8()?)?;
@@ -1351,6 +1403,12 @@ impl ResetMarkersBlock {
         &self.markers
     }
 
+    pub(super) const fn resident_heap_bytes(&self) -> Option<usize> {
+        self.markers
+            .capacity()
+            .checked_mul(size_of::<ResetMarker>())
+    }
+
     /// Decodes a reset-markers block body.
     ///
     /// # Errors
@@ -1473,6 +1531,12 @@ impl EntityStatesBlock {
     #[must_use]
     pub fn records(&self) -> &[EntityStateRecord] {
         &self.records
+    }
+
+    pub(super) const fn resident_heap_bytes(&self) -> Option<usize> {
+        self.records
+            .capacity()
+            .checked_mul(size_of::<EntityStateRecord>())
     }
 
     /// Decodes an entity-states block body.
@@ -2078,6 +2142,70 @@ mod tests {
         body.extend_from_slice(&30_i64.to_le_bytes());
         body.extend_from_slice(&0_i64.to_le_bytes());
         body.extend_from_slice(&10_i64.to_le_bytes());
+        assert_eq!(
+            LossCoverageBlock::decode(&body, &BOUNDS),
+            Err(BlockError::Unsorted)
+        );
+    }
+
+    fn factor_record(factor: u32, loss_reasons: Vec<LossReason>) -> FactorCoverage {
+        FactorCoverage {
+            factor_id: FactorId(factor),
+            applicability: Applicability::Applicable,
+            state: CoverageState::Unknown,
+            interval: span(0, 10),
+            expected_period_us: None,
+            period_quality: PeriodQuality::Unknown,
+            cadence_epoch_id: None,
+            crosses_cadence_boundary: false,
+            present_samples: 0,
+            covered_duration_us: 0,
+            source_population: None,
+            lost_count_lower_bound: (!loss_reasons.is_empty()).then_some(1),
+            loss_reasons,
+            retained_exactness: RetainedExactness::Unknown,
+            source_completeness: SourceCompleteness::Unknown,
+            physical_count_semantics: PhysicalCountSemantics::NotApplicable,
+            boundary_quality: BoundaryQuality::Unknown,
+        }
+    }
+
+    fn encoded_loss_coverage(factors: &[FactorCoverage]) -> Vec<u8> {
+        let mut writer = ByteWriter::new();
+        write_coverage(&mut writer, &Coverage::empty());
+        write_coverage(&mut writer, &Coverage::empty());
+        writer.u8(applicability_code(Applicability::Applicable));
+        writer.u8(period_quality_code(PeriodQuality::Unknown));
+        writer.u8(source_completeness_code(SourceCompleteness::Unknown));
+        writer.u8(retained_exactness_code(RetainedExactness::Unknown));
+        writer.u8(physical_count_code(PhysicalCountSemantics::Unknown));
+        writer.u64_le(0);
+        writer.uvarint(factors.len() as u64);
+        for factor in factors {
+            write_factor_coverage(&mut writer, factor);
+        }
+        writer.into_bytes()
+    }
+
+    #[test]
+    fn loss_coverage_decode_rejects_unsorted_factor_records() {
+        let body =
+            encoded_loss_coverage(&[factor_record(2, Vec::new()), factor_record(1, Vec::new())]);
+        assert_eq!(
+            LossCoverageBlock::decode(&body, &BOUNDS),
+            Err(BlockError::Unsorted)
+        );
+    }
+
+    #[test]
+    fn loss_coverage_decode_rejects_unsorted_loss_reasons() {
+        let body = encoded_loss_coverage(&[factor_record(
+            1,
+            vec![
+                LossReason::VisibilityRestricted,
+                LossReason::PermissionDenied,
+            ],
+        )]);
         assert_eq!(
             LossCoverageBlock::decode(&body, &BOUNDS),
             Err(BlockError::Unsorted)
