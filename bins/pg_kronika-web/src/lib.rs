@@ -369,6 +369,18 @@ fn record_gc_category(kind: &'static str, usage: GcCategoryUsage) {
         .set(usage.logical_bytes as f64);
     metrics::gauge!("kronika_web_overview_cache_allocated_bytes", "kind" => kind)
         .set(usage.allocated_bytes as f64);
+    metrics::gauge!("overview_cache_entries", "class" => format!("durable_{kind}"))
+        .set(usage.files as f64);
+    metrics::gauge!(
+        "overview_cache_bytes",
+        "class" => format!("durable_{kind}_logical")
+    )
+    .set(usage.logical_bytes as f64);
+    metrics::gauge!(
+        "overview_cache_bytes",
+        "class" => format!("durable_{kind}_allocated")
+    )
+    .set(usage.allocated_bytes as f64);
 }
 
 #[allow(
@@ -394,16 +406,39 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
     metrics::gauge!("kronika_web_overview_gc_scanned_entries").set(outcome.scanned as f64);
     metrics::counter!("kronika_web_overview_gc_deleted_finals_total")
         .increment(outcome.deleted_finals);
+    metrics::counter!(
+        "overview_gc_files_total",
+        "action" => "deleted",
+        "reason" => "final"
+    )
+    .increment(outcome.deleted_finals);
     metrics::counter!("kronika_web_overview_gc_deleted_artifacts_total")
         .increment(outcome.deleted_artifacts);
+    metrics::counter!(
+        "overview_gc_files_total",
+        "action" => "deleted",
+        "reason" => "artifact"
+    )
+    .increment(outcome.deleted_artifacts);
     metrics::counter!("kronika_web_overview_gc_unlinked_logical_bytes_total")
         .increment(outcome.unlinked_logical_bytes);
     metrics::counter!("kronika_web_overview_gc_unlinked_allocated_bytes_total")
         .increment(outcome.unlinked_allocated_bytes);
+    metrics::counter!("overview_gc_bytes_total", "action" => "unlinked_logical")
+        .increment(outcome.unlinked_logical_bytes);
+    metrics::counter!("overview_gc_bytes_total", "action" => "unlinked_allocated")
+        .increment(outcome.unlinked_allocated_bytes);
     if let Some(reason) = outcome.skip_reason {
+        let reason = gc_skip_reason(reason);
         metrics::counter!(
             "kronika_web_overview_gc_skipped_total",
-            "reason" => gc_skip_reason(reason)
+            "reason" => reason
+        )
+        .increment(1);
+        metrics::counter!(
+            "overview_gc_files_total",
+            "action" => "skipped",
+            "reason" => reason
         )
         .increment(1);
     }
@@ -791,6 +826,7 @@ async fn track_metrics(req: Request<axum::body::Body>, next: Next) -> Response {
 pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: PrometheusHandle) -> Router {
     use axum::Extension;
 
+    overview::telemetry::describe_operational_metrics();
     let public = Router::new()
         .route("/healthz", get(handlers::probes::healthz))
         .route("/readyz", get(handlers::probes::readyz))

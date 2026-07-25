@@ -7,13 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kronika_analytics::overview::{NamingContractId, SegmentLocator};
 use kronika_reader::{
-    FactBuildKey, FactKey, FactStore, FallbackConfig, FileKind, GcConfig, GcMark, GcOutcome, LIMIT,
-    LiveBuilder, LiveConfigError, LiveFoldError, LocalDirSnapshot, RefreshDelta, SealedFactError,
-    SealedLocator, SegmentContext, SegmentDescriptor, SegmentFacts,
+    FactBuildKey, FactKey, FactStore, FallbackConfig, FileKind, FoldEffect, GcConfig, GcMark,
+    GcOutcome, LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState, LocalDirSnapshot,
+    RefreshDelta, SealedFactError, SealedLocator, SegmentContext, SegmentDescriptor, SegmentFacts,
 };
 
 use super::admission::{ColdAdmissionConfig, ColdWorkWeight};
@@ -302,6 +302,11 @@ impl OverviewWriter {
                 }
                 Err(_error) => {
                     metrics::counter!("kronika_web_overview_sealed_failures_total").increment(1);
+                    metrics::counter!(
+                        "overview_source_failures_total",
+                        "reason" => "sealed_descriptor"
+                    )
+                    .increment(1);
                     unavailable.insert(descriptor.locator, *descriptor);
                 }
             }
@@ -328,6 +333,11 @@ impl OverviewWriter {
             Err(_error) => {
                 self.mark_scrub_damage(descriptor);
                 self.advance_scrub_cursor(descriptors, position);
+                metrics::counter!(
+                    "overview_source_failures_total",
+                    "reason" => "scrub_open"
+                )
+                .increment(1);
                 record_scrub("open_error", 0, started);
                 return;
             }
@@ -359,6 +369,11 @@ impl OverviewWriter {
             Err(_error) => {
                 self.mark_scrub_damage(descriptor);
                 self.advance_scrub_cursor(descriptors, position);
+                metrics::counter!(
+                    "overview_source_failures_total",
+                    "reason" => "scrub_damage"
+                )
+                .increment(1);
                 record_scrub("damage", stats.stored_bytes_read, started);
             }
         }
@@ -428,13 +443,15 @@ impl OverviewWriter {
         view_generation: u64,
         promotion: Option<PromotionCandidate>,
     ) -> DescriptorView {
-        DescriptorView::new(
+        let view = DescriptorView::new(
             view_generation,
             self.sealed.values().cloned().collect(),
             self.unavailable.values().copied().collect(),
             Arc::new(self.live.publish()),
             promotion,
-        )
+        );
+        record_live_metrics(&view);
+        view
     }
 }
 
@@ -456,11 +473,55 @@ fn fold_refresh(
         let unit = snapshot
             .open_active_part(part)
             .map_err(OverviewBuildError::ActiveRead)?;
-        builder
+        let effect = builder
             .fold_part(part, &unit)
             .map_err(OverviewBuildError::Live)?;
+        if effect == FoldEffect::Folded {
+            metrics::counter!("overview_live_folded_parts_total").increment(1);
+        }
     }
     builder.complete_refresh().map_err(OverviewBuildError::Live)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64; timestamps remain exact enough for operational lag"
+)]
+fn record_live_metrics(view: &DescriptorView) {
+    let live = view.live();
+    let (state, reason) = match live.state() {
+        LiveState::Empty => ("empty", "proven_empty"),
+        LiveState::Warming => ("warming", "bootstrap"),
+        LiveState::Current => ("current", "none"),
+        LiveState::NeedsRebuild => ("needs_rebuild", "continuity"),
+        LiveState::Incomplete => ("incomplete", "loss_or_limit"),
+    };
+    for (candidate_state, candidate_reason) in [
+        ("empty", "proven_empty"),
+        ("warming", "bootstrap"),
+        ("current", "none"),
+        ("needs_rebuild", "continuity"),
+        ("incomplete", "loss_or_limit"),
+    ] {
+        metrics::gauge!(
+            "overview_live_state",
+            "state" => candidate_state,
+            "reason" => candidate_reason
+        )
+        .set(f64::from(candidate_state == state && candidate_reason == reason));
+    }
+    let watermark = live.watermark_us().unwrap_or_default();
+    metrics::gauge!("overview_live_data_through_us").set(watermark as f64);
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let lag_seconds = live.watermark_us().map_or(0.0, |watermark| {
+        let lag_us = u128::from(u64::try_from(watermark).unwrap_or_default());
+        now_us.saturating_sub(lag_us) as f64 / 1_000_000.0
+    });
+    metrics::gauge!("overview_live_visibility_lag_seconds").set(lag_seconds);
+    metrics::gauge!("overview_view_generation").set(view.view_generation() as f64);
 }
 
 fn full_live_baseline(delta: &RefreshDelta) -> RefreshDelta {

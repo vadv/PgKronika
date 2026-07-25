@@ -2,6 +2,9 @@ use axum::http::StatusCode;
 use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_reader::LocalDirSnapshot;
 use kronika_registry::pg_log::PgLogErrorV1;
+use kronika_registry::pg_stat_database::PgStatDatabaseV1;
+use kronika_registry::reset_metadata::ResetMetadata;
+use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
 use kronika_registry::{Section, Ts};
 use serde_json::json;
 use std::sync::Arc;
@@ -57,6 +60,107 @@ fn write_panic_segment_for(
         },
     );
     std::fs::write(dir.join(file), &bytes).expect("write panic segment");
+}
+
+fn database_metric_row(ts_us: i64, deadlocks: i64) -> PgStatDatabaseV1 {
+    PgStatDatabaseV1 {
+        ts: Ts(ts_us),
+        datid: 16_384,
+        datname: None,
+        numbackends: Some(3),
+        xact_commit: 0,
+        xact_rollback: 0,
+        blks_read: 0,
+        blks_hit: 0,
+        tup_returned: 0,
+        tup_fetched: 0,
+        tup_inserted: 0,
+        tup_updated: 0,
+        tup_deleted: 0,
+        conflicts: 0,
+        temp_files: 0,
+        temp_bytes: 0,
+        deadlocks,
+        blk_read_time: 0.0,
+        blk_write_time: 0.0,
+        stats_reset: None,
+        frozen_xid_age: Some(1_000),
+        min_mxid_age: Some(100),
+        datconnlimit: Some(100),
+        datallowconn: Some(true),
+        datistemplate: Some(false),
+    }
+}
+
+fn metric_reset_row(ts_us: i64) -> ResetMetadata {
+    ResetMetadata {
+        ts: Ts(ts_us),
+        postmaster_start_time: Ts(1),
+        pg_stat_database_reset_max_at: None,
+        pg_stat_statements_reset_at: None,
+        pg_store_plans_reset_at: None,
+        pg_stat_bgwriter_reset_at: None,
+        pg_stat_checkpointer_reset_at: None,
+        pg_stat_wal_reset_at: None,
+        pg_stat_archiver_reset_at: None,
+        pg_stat_io_reset_at: None,
+        ext_pg_stat_statements_version: None,
+        ext_pg_store_plans_version: None,
+        compute_query_id: None,
+        track_io_timing: Some(false),
+        track_wal_io_timing: Some(false),
+    }
+}
+
+fn database_coverage_row(ts_us: i64) -> SnapshotCoverageV1 {
+    SnapshotCoverageV1 {
+        ts: Ts(ts_us),
+        source_type_id: 1_005_001,
+        collector_pid: 42,
+        collector_started_at: Ts(1),
+        read_state: 0,
+        visibility: 0,
+        source_total: 1,
+        collected: 1,
+    }
+}
+
+fn write_database_metric_segment(dir: &std::path::Path) {
+    let database = PgStatDatabaseV1::encode(&[
+        database_metric_row(10, 7),
+        database_metric_row(20, 8),
+    ])
+    .expect("encode database metrics");
+    let reset = ResetMetadata::encode(&[metric_reset_row(10), metric_reset_row(20)])
+        .expect("encode reset metadata");
+    let coverage =
+        SnapshotCoverageV1::encode(&[database_coverage_row(10), database_coverage_row(20)])
+            .expect("encode database coverage");
+    let bytes = build_part(
+        &[
+            SectionInput {
+                type_id: 1_005_001,
+                rows: 2,
+                body: &database,
+            },
+            SectionInput {
+                type_id: 1_020_001,
+                rows: 2,
+                body: &reset,
+            },
+            SectionInput {
+                type_id: 1_038_001,
+                rows: 2,
+                body: &coverage,
+            },
+        ],
+        PartMeta {
+            min_ts: 10,
+            max_ts: 20,
+            source_id: 7,
+        },
+    );
+    std::fs::write(dir.join("database-metrics.pgm"), bytes).expect("write metric segment");
 }
 
 #[tokio::test]
@@ -207,10 +311,138 @@ async fn events_returns_a_machine_neutral_page() {
         body["next_cursor"].is_null(),
         "an exhausted page has no cursor"
     );
-    assert_eq!(body["notable_policy_version"], 1);
+    assert_eq!(body["notable_policy_version"], 2);
     assert_eq!(body["retained_exactness"], "exact");
     assert_eq!(body["omitted_by_response_filter"], 0);
     assert!(body["meta"].is_object(), "events carries timeline meta");
+}
+
+#[tokio::test]
+async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_database_metric_segment(dir.path());
+    let state = state_for_dir(dir.path());
+    let query = "source=7&from=10&to=21";
+
+    let (events_status, events) =
+        serve_state(state.clone(), &format!("/v1/timeline/events?{query}")).await;
+    let (overview_status, overview) =
+        serve_state(state.clone(), &format!("/v1/timeline/overview?{query}")).await;
+    let (health_status, health) = serve_state(
+        state,
+        &format!("/v1/timeline/health?{query}&step=11"),
+    )
+    .await;
+    assert_eq!(events_status, StatusCode::OK, "{events}");
+    assert_eq!(overview_status, StatusCode::OK, "{overview}");
+    assert_eq!(health_status, StatusCode::OK, "{health}");
+    assert_eq!(events["meta"]["response_schema_version"], 2);
+    assert_eq!(events["notable_policy_version"], 2);
+
+    let facts = events["events"].as_array().expect("events");
+    let [fact] = facts.as_slice() else {
+        panic!("expected one canonical deadlock fact, got {facts:?}");
+    };
+    assert_eq!(fact["event_kind"], "pg.database.deadlock_delta");
+    assert_eq!(fact["notable_class"], "deadlock_observation");
+    assert_eq!(fact["source_id"], 7);
+    assert!(fact["source_type_id"].is_null());
+    assert_eq!(fact["identity_quality"], "content_derived");
+    assert_eq!(fact["sort_ts_us"], 20);
+    assert_eq!(fact["occurred_at_us"], 20);
+    assert_eq!(fact["observed_interval"], json!({"from_us": 20, "to_us": 21}));
+    assert_eq!(fact["occurrence_count"], 1);
+    assert_eq!(fact["evidence_quality"], "derived_exact");
+    assert_eq!(fact["quality_flags"], 0);
+    assert_eq!(fact["entity"]["kind"], "database");
+    assert_eq!(fact["entity"]["id"].as_str().expect("entity id").len(), 22);
+    assert_eq!(
+        fact["payload"],
+        json!({
+            "kind": "pg.database.deadlock_delta",
+            "factor_id": 100,
+            "delta": 1,
+            "duration_us": 10,
+            "reset_epoch": fact["payload"]["reset_epoch"],
+        })
+    );
+    assert!(fact["payload"]["reset_epoch"].is_u64());
+    let evidence = fact["supporting_evidence"]
+        .as_array()
+        .expect("supporting evidence");
+    assert_eq!(evidence.len(), 2);
+    for item in evidence {
+        assert_eq!(
+            item.as_object().expect("evidence object").len(),
+            6,
+            "all nullable provenance fields stay explicit"
+        );
+        assert_eq!(
+            item["observation_id"]
+                .as_str()
+                .expect("observation id")
+                .len(),
+            43
+        );
+        for field in [
+            "section_body_id",
+            "catalog_entry_ordinal",
+            "row_ordinal",
+            "dictionary_context_id",
+            "segment_locator",
+        ] {
+            assert!(item[field].is_null(), "{field} is not invented: {item}");
+        }
+    }
+
+    assert_eq!(overview["coverage"], events["coverage"]);
+    assert_eq!(health["coverage"], events["coverage"]);
+    let coverage = events["coverage"].as_array().expect("factor coverage");
+    let deadlocks = coverage
+        .iter()
+        .find(|entry| entry["factor_id"] == 100)
+        .expect("deadlock coverage");
+    assert_eq!(
+        deadlocks,
+        &json!({
+            "factor_id": 100,
+            "applicability": "applicable",
+            "state": "complete",
+            "interval": {"from_us": 10, "to_us": 21},
+            "expected_period_us": 10,
+            "period_quality": "observed_stable",
+            "cadence_epoch_id": deadlocks["cadence_epoch_id"],
+            "crosses_cadence_boundary": false,
+            "present_samples": 2,
+            "covered_duration_us": 11,
+            "source_population": {
+                "collected": 1,
+                "total": 1,
+                "total_quality": "exact",
+            },
+            "loss_reasons": [],
+            "lost_count_lower_bound": null,
+            "retained_exactness": "retained_exact",
+            "source_completeness": "full",
+            "physical_count_semantics": "not_applicable",
+            "boundary_quality": "contained",
+        })
+    );
+    assert_eq!(
+        deadlocks["cadence_epoch_id"]
+            .as_str()
+            .expect("cadence epoch")
+            .len(),
+        22
+    );
+    let unsupported = coverage
+        .iter()
+        .find(|entry| entry["factor_id"] == 900)
+        .expect("explicit unsupported factor");
+    assert_eq!(unsupported["applicability"], "unsupported");
+    assert_eq!(unsupported["state"], "not_collected");
+    assert_eq!(unsupported["present_samples"], 0);
+    assert_eq!(unsupported["covered_duration_us"], 0);
 }
 
 #[tokio::test]
@@ -556,12 +788,12 @@ async fn identical_timeline_misses_share_one_flight() {
     let state = AppState::new(snapshot).expect("state");
     let key = ResponseKey {
         endpoint: Endpoint::Events,
-        response_schema_version: 1,
+        response_schema_version: 2,
         fact_set_id: [7; 32],
         from_us: 0,
         to_us: 10,
         step_us: None,
-        notable_policy_version: 1,
+        notable_policy_version: 2,
         health_policy_version: 1,
         filters: "limit=2".to_owned(),
         page: None,

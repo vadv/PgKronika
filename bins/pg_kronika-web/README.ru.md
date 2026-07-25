@@ -21,7 +21,7 @@ timeline-индекс, обновляет опубликованный store vie
 | `KRONIKA_WEB_STALE_AFTER_S` | `10` | `/readyz` возвращает `503`, если успешный refresh старше этого времени. |
 | `KRONIKA_WEB_LOG` | `info` | Filter directive для `tracing-subscriber`. |
 | `KRONIKA_WEB_OVERVIEW_CACHE_DIR` | `<KRONIKA_WEB_DIR>/.pgkronika-overview-cache` | Durable cache timeline-фактов для отдельных сегментов. |
-| `KRONIKA_WEB_OVERVIEW_NAMESPACE` | байты canonical store path | Стабильная identity store/deployment в ключах timeline-фактов. |
+| `KRONIKA_WEB_OVERVIEW_NAMESPACE` | обязательна | Явная стабильная identity store/deployment в ключах timeline-фактов. Не меняйте её после перезапуска или смены эквивалентного mount path. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_SEGMENT_HOURS` | `24` | Общий лимит segment-hours, сохраняемых после восстанавливаемой ошибки durable publication. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_BYTES` | `67108864` | Byte budget canonical facts для process-local fallback. |
 | `KRONIKA_WEB_OVERVIEW_GC_MAX_ENTRIES` | `100000` | Максимальное число записей в полном сканировании кэша фактов; достижение предела запрещает удаление. |
@@ -32,14 +32,30 @@ timeline-индекс, обновляет опубликованный store vie
 | `KRONIKA_WEB_OVERVIEW_CACHE_MAX_FILES` | не задан | Необязательный предел числа учтённых файлов в пространстве имён кэша. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES` | `67108864` | Logical-byte budget serialized response cache overview/health. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_ENTRIES` | `4096` | Лимит entries в serialized response cache overview/health. |
+| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_BYTES` | `268435456` | Лимит logical resident bytes в L2 cache декодированных sealed-фактов. |
+| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_ENTRIES` | `4096` | Лимит entries в L2 cache декодированных sealed-фактов. |
+| `KRONIKA_WEB_OVERVIEW_SOURCE_SCRUB_INTERVAL_S` | `60` | Число успешных refresh passes между потоковыми проверками CRC; один проход проверяет одну sealed-секцию. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS` | `64` | Максимальное число event views, закреплённых для продолжения cursor. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_BYTES` | `536870912` | Logical-byte budget закреплённых cursor event views. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_TTL_S` | `300` | Время жизни cursor и закреплённого view в секундах. |
 | `KRONIKA_WEB_OVERVIEW_MAX_SELECTED_SEGMENTS` | `1024` | Действующий лимит sealed-сегментов в одном timeline-запросе; допустимый диапазон `1..=4096`. |
+| `KRONIKA_WEB_OVERVIEW_COLD_MAX_WORKERS` | `4` | Максимальное число активных workers для sealed-фактов. |
+| `KRONIKA_WEB_OVERVIEW_COLD_MAX_QUEUE` | `64` | Максимальное число exact builds sealed-фактов в очереди. |
+| `KRONIKA_WEB_OVERVIEW_COLD_PER_REQUEST_PARALLELISM` | `4` | Максимум cold loads, одновременно начатых одним запросом. |
+| `KRONIKA_WEB_OVERVIEW_COLD_WAIT_TIMEOUT_MS` | `5000` | Максимальное ожидание в FIFO до отказа cold build. |
+| `KRONIKA_WEB_OVERVIEW_COLD_RETRY_AFTER_S` | `1` | Значение `Retry-After` при перегрузке cold build. |
+| `KRONIKA_WEB_OVERVIEW_COLD_PGM_BYTES` | `1073741824` | Общая ёмкость байтов исходных PGM для активной холодной работы. |
+| `KRONIKA_WEB_OVERVIEW_COLD_DECODED_BYTES` | `1073741824` | Общая ёмкость декодированного working set для активной холодной работы. |
+| `KRONIKA_WEB_OVERVIEW_COLD_CPU_ROWS` | `2097152` | Общая CPU-оценка строк источника для активной холодной работы. |
+| `KRONIKA_WEB_OVERVIEW_COLD_FILE_DESCRIPTORS` | `16` | Общий резерв файловых дескрипторов для активной холодной работы. |
+| `KRONIKA_WEB_OVERVIEW_COLD_READ_BYTES` | `1073741824` | Общая ёмкость чтения источников и durable cache для активной холодной работы. |
+| `KRONIKA_WEB_OVERVIEW_COLD_WRITE_BYTES` | `1073741824` | Общая ёмкость записи durable cache для активной холодной работы. |
+| `KRONIKA_WEB_OVERVIEW_COLD_PUBLICATIONS` | `4` | Общая ёмкость durable publications для активной холодной работы. |
 
 ```sh
 KRONIKA_WEB_DIR=/var/lib/pg_kronika \
 KRONIKA_WEB_ADDR=127.0.0.1:8688 \
+KRONIKA_WEB_OVERVIEW_NAMESPACE=prod-primary \
 KRONIKA_WEB_BASIC_AUTH='operator:change-me' \
 pg_kronika-web
 ```
@@ -59,21 +75,27 @@ Auth закрывает UI и `/v1/*`; `/healthz`, `/readyz` и `/metrics` вс�
 | Grace служебных файлов публикации | 600 s | Ненулевое значение |
 | Допуск в постоянный кэш фактов | По умолчанию нет предела байтов и файлов | Необязательные ненулевые пределы логических байтов и числа файлов |
 | Serialized response cache overview/health | 4 096 entries, logical charge 64 MiB | Оба настраиваемых budget ненулевые и помещаются в `usize`. |
+| L2 cache декодированных sealed-фактов | 4 096 entries, logical resident charge 256 MiB | Exact hits обходят cold admission; оба настраиваемых budget ненулевые и помещаются в `usize`. |
+| Потоковая проверка источника | Одна sealed-секция каждые 60 успешных refresh passes | Интервал ненулевой; ошибка CRC исключает источник из набора пригодных дескрипторов. |
 | Закреплённые event views для cursors | 64 views, logical charge 512 MiB, TTL 300 s | Все budgets ненулевые; число и байты помещаются в `usize`. |
 | Выбранные sealed-сегменты в одном timeline-запросе | 1 024 | Настраивается от 1 до абсолютного предела v1: 4 096 |
+| Планировщик cold builds sealed-фактов | 4 workers, FIFO-очередь 64, parallelism одного запроса 4, ожидание 5 s | Все пределы ненулевые; отказ очереди, превышение веса и timeout возвращают настроенную подсказку retry. |
+| Взвешенная ёмкость cold work | По 1 GiB для PGM/decoded/read/write, 2 097 152 строк, 16 файловых дескрипторов, 4 publications | Общие для процесса пределы; байты и строки округляются вверх по фиксированным квантам планировщика. |
 | Период timeline query | — | 31 сутки |
 | Материализованный timeline query | — | Cloned-observation charge 64 MiB; 1 048 576 observations/count inputs, 262 144 clipped coverage spans, 65 536 joint keys, 1 024 signal keys |
 | Страница events | 100 элементов | 1 000 элементов |
 | Notable preview | 100 элементов | Фиксируется notable policy v1 |
 | Health line | — | 2 000 points |
 
-Числовые параметры `KRONIKA_WEB_OVERVIEW_*` задаются беззнаковыми десятичными
-целыми. Обязательные бюджеты и интервалы должны быть ненулевыми; оба предела
-постоянного кэша можно не задавать. Значения байтов, записей и представлений,
-которые преобразуются в размер процесса, должны помещаться в платформенный
-`usize`. Fallback дополнительно отклоняет значения больше 744 segment-hours
-или 268435456 bytes. Лимит выбранных сегментов должен находиться в диапазоне
-`1..=4096`. Неверное значение завершает запуск до открытия listener.
+`KRONIKA_WEB_OVERVIEW_NAMESPACE` обязательна и не может быть пустой. Числовые
+параметры `KRONIKA_WEB_OVERVIEW_*` задаются беззнаковыми десятичными целыми.
+Обязательные бюджеты, интервалы, размеры очереди и взвешенные ёмкости должны
+быть ненулевыми; оба предела постоянного кэша можно не задавать. Значения
+байтов, entries, очереди и представлений, которые преобразуются в размер
+процесса, должны помещаться в платформенный `usize`. Fallback дополнительно
+отклоняет значения больше 744 segment-hours или 268435456 bytes. Лимит
+выбранных сегментов должен находиться в диапазоне `1..=4096`. Неверное значение
+завершает запуск до открытия listener.
 
 ## Работа постоянного кэша фактов
 
@@ -197,13 +219,20 @@ Details с media type `application/problem+json` и ровно пятью пол
 - При обновлении timeline публикуются полученные из каталогов
   sealed-дескрипторы и одно ограниченное поколение live-данных; тела секций
   sealed-сегментов при этом не декодируются. Допущенный запрос загружает только
-  факты из выбранного плана source/range. Холодная сборка разделяется по
-  полному lineage-qualified `FactBuildKey`, продолжается после отмены запроса
-  и проходит через глобальный FIFO-диспетчер: четыре worker, очередь из
-  64 элементов, не более четырёх загрузок от одного запроса и общие веса для
-  PGM, декодированной памяти, CPU, файловых дескрипторов, чтения, записи и
-  публикации. Отказ по capacity даёт `503` с
-  `code=overview_capacity_unavailable` и `Retry-After: 1`.
+  факты из выбранного плана source/range. Exact hits в decoded L2, durable
+  cache и recoverable fallback обходят cold admission. Для отсутствующих exact
+  facts работа разделяется по полному lineage-qualified `FactBuildKey`,
+  продолжается после отмены запроса и входит в настраиваемый общий для процесса
+  FIFO-планировщик. Исчерпание очереди, превышение веса или FIFO timeout дают
+  `503` с `code=cold_build_overloaded` и настроенным `Retry-After`.
+- Если выбранный sealed source не читается во время загрузки фактов, он не
+  превращается в успешный пустой сегмент и не завершает весь запрос ошибкой.
+  Ответ `200` содержит его интервал в `known_gaps`, пониженную completeness и
+  identity fact set, отличную от запланированного полного набора. Такой
+  частичный ответ не сохраняется под ключом полного response cache. Фоновая
+  потоковая проверка CRC обнаруживает незаметное повреждение тела секции,
+  помечает сегмент недоступным и не позволяет старому durable derived fact
+  скрыть этот разрыв источника.
 - Event counts используют checked arithmetic. Суммы severity и category,
   SQLSTATE buckets top/other/missing и joint buckets top/other независимо
   сходятся с числом retained error occurrences; retained groups и физические
@@ -297,8 +326,49 @@ cache и single-flight отражают
 сегментов показывают `kronika_web_timeline_selected_segments_limit` и
 `kronika_web_timeline_query_limit_rejections_total{resource="selected_segments"}`.
 Перегрузку холодной загрузки фактов считает
-`kronika_web_overview_cold_work_rejections_total{reason="capacity"}`. Наборы
-этих labels фиксированы; labels HTTP-запросов используют matched route
+`overview_cold_reject_total{reason}` с закрытым набором причин
+`queue_full`, `weight_exceeds_capacity` и `timeout`. Давление планировщика
+показывают `overview_cold_wait_seconds`, `overview_cold_queue_depth`,
+`overview_cold_work_inflight{kind="workers"}`,
+`overview_inflight_bytes{kind="pgm"|"decoded"}` и `overview_open_files`.
+Совместимый счётчик
+`kronika_web_overview_cold_work_rejections_total{reason="capacity"}`
+увеличивается для HTTP-ответов о перегрузке.
+
+Работу decoded и durable lookup показывают
+`overview_fact_lookup_total{layer,result,reason}`,
+`overview_fact_read_bytes`, `overview_pgm_body_read_bytes`,
+`overview_pgm_sections_decoded`,
+`overview_fact_build_total{result,source_type}` и
+`overview_fact_build_seconds`; записи считает `overview_fact_write_bytes`.
+Decoded L2 публикует
+`overview_cache_{entries,bytes}{class="decoded_facts"}` и
+`overview_cache_evictions_total{class="decoded_facts",reason}`.
+
+В operational inventory parity-v1 также входят взаимоисключающая
+`overview_cache_mode{mode,reason}`, `overview_persist_failures_total{reason}`,
+`overview_persist_backoff_seconds`,
+`overview_singleflight_{builds,waiters}`,
+`overview_live_state{state,reason}`, `overview_live_folded_parts_total`,
+`overview_live_data_through_us`, `overview_live_visibility_lag_seconds`,
+`overview_view_generation`, `overview_cursor_views`,
+`overview_cursor_view_bytes` и `overview_cursor_expired_total{reason}`.
+Корректность показывают `overview_source_failures_total{reason}`,
+`overview_coverage_loss_total{source,factor,reason}`,
+`overview_retained_observations_total{kind}`,
+`overview_overflow_total{kind}`, `overview_raw_fallback_total{reason}`,
+`overview_gc_files_total{action,reason}` и
+`overview_gc_bytes_total{action}`. При сборке router для каждого имени
+регистрируются тип и help-текст. Динамические source/factor берутся только из
+ограниченных опубликованных inventories, остальные значения labels имеют
+закрытый набор.
+
+Целостность источника и частичные результаты показывают
+`overview_source_read_failures_total{outcome="partial"}`,
+`overview_source_scrub_total{outcome}`,
+`overview_source_scrub_bytes_total`, `overview_source_scrub_seconds` и
+`overview_source_damaged_segments`. Наборы labels этих метрик,
+планировщика и cache фиксированы; labels HTTP-запросов используют matched route
 templates, а не raw URI.
 
 ## Завершение и отказы

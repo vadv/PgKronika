@@ -91,6 +91,7 @@ where
         };
 
         if leader {
+            metrics::counter!("overview_singleflight_builds").increment(1);
             let inner = Arc::clone(&self.inner);
             let worker_flight = Arc::clone(&flight);
             tokio::spawn(async move {
@@ -110,6 +111,8 @@ where
                 }
                 drop(active);
             });
+        } else {
+            metrics::counter!("overview_singleflight_waiters").increment(1);
         }
 
         loop {

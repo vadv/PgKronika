@@ -497,6 +497,15 @@ mod tests {
         );
 
         let entry = &mem.catalog().entries[0];
+        mem.scrub_overview_section(0)
+            .expect("streaming scrub accepts the valid body");
+        assert_eq!(
+            mem.body_read_stats(),
+            PgmBodyReadStats {
+                read_calls: 1,
+                stored_bytes_read: entry.len,
+            }
+        );
         let overview = mem.read_overview_section(0).expect("overview body");
         assert_eq!(overview.catalog_ordinal(), 0);
         assert_eq!(overview.body().len() as u64, entry.len);
@@ -506,6 +515,10 @@ mod tests {
         );
         assert!(matches!(
             mem.read_overview_section(1),
+            Err(ReadError::CatalogOrdinalOutOfRange { ordinal: 1 })
+        ));
+        assert!(matches!(
+            mem.scrub_overview_section(1),
             Err(ReadError::CatalogOrdinalOutOfRange { ordinal: 1 })
         ));
         assert_eq!(
@@ -524,6 +537,18 @@ mod tests {
         bytes[body_offset] ^= 0xFF;
 
         let unit = PgmUnit::open(bytes.as_slice()).expect("body corruption leaves metadata valid");
+        assert!(matches!(
+            unit.scrub_overview_section(0),
+            Err(ReadError::Codec(_))
+        ));
+        assert_eq!(
+            unit.body_read_stats(),
+            PgmBodyReadStats {
+                read_calls: 1,
+                stored_bytes_read: unit.catalog().entries[0].len,
+            },
+            "the scrub verifies the complete stored body with bounded scratch space"
+        );
         assert!(matches!(
             unit.read_overview_section(0),
             Err(ReadError::Codec(_))

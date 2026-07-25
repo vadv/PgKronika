@@ -142,6 +142,35 @@ fn install_view(state: &AppState, view: Arc<DescriptorView>) {
     }));
 }
 
+fn install_oversized_real_entry(state: &AppState) {
+    let (snapshot, original) = state.overview_request_view();
+    let entry = original
+        .entries()
+        .first()
+        .expect("fixture has one real sealed descriptor");
+    assert_eq!(original.entries().len(), 1);
+    let oversized = DescriptorEntry::new(
+        *entry.descriptor(),
+        entry.fact_build_key(),
+        ColdWorkWeight {
+            workers: u32::MAX,
+            ..entry.cold_weight()
+        },
+        entry.source_scope_id(),
+    );
+    state.published.store(Arc::new(PublishedStoreView {
+        snapshot: Arc::clone(&snapshot),
+        timeline_snapshot: snapshot,
+        timeline: Arc::new(DescriptorView::new(
+            original.view_generation(),
+            vec![oversized],
+            Vec::new(),
+            Arc::clone(original.live()),
+            None,
+        )),
+    }));
+}
+
 #[test]
 fn canonical_plan_enforces_zero_one_limit_and_limit_plus_one() {
     let range = CoverageSpan::new(0, 2).expect("range");
@@ -399,9 +428,22 @@ async fn events_counts_the_deduplicated_source_union_against_one_effective_limit
 }
 
 #[tokio::test]
-async fn a_cold_weight_above_capacity_is_a_typed_no_store_http_overload() {
+async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_with_limit(dir.path(), 1);
+    let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+    let mut config = OverviewConfig::new(
+        dir.path().join(".overview-cache"),
+        SYNTHETIC_NAMESPACE.to_vec(),
+    );
+    config.max_selected_segments = 1;
+    config.cold.retry_after_seconds = 7;
+    let state = AppState::with_overview_config(
+        snapshot,
+        0,
+        std::time::Duration::from_secs(10),
+        config,
+    )
+    .expect("state");
     let entry = synthetic_entries(1, 7, 0, 1, 0)
         .pop()
         .expect("synthetic entry");
@@ -430,14 +472,14 @@ async fn a_cold_weight_above_capacity_is_a_typed_no_store_http_overload() {
         &response.body,
         StatusCode::SERVICE_UNAVAILABLE,
         "cold_build_overloaded",
-        serde_json::json!({ "retry_after_seconds": 1 }),
+        serde_json::json!({ "retry_after_seconds": 7 }),
     );
     assert_eq!(
         response
             .headers
             .get(header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok()),
-        Some("1")
+        Some("7")
     );
     assert_eq!(
         response
@@ -447,6 +489,94 @@ async fn a_cold_weight_above_capacity_is_a_typed_no_store_http_overload() {
         Some("no-store")
     );
     assert_eq!(state.response_cache.len(), 0);
+}
+
+#[tokio::test]
+async fn an_exact_decoded_hit_bypasses_cold_admission() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    let state = state_with_limit(dir.path(), 1);
+
+    let cold = app(state.clone(), None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("cold request"),
+        )
+        .await
+        .expect("cold route");
+    assert_eq!(cold.status(), StatusCode::OK);
+
+    install_oversized_real_entry(&state);
+    let decoded = app(state, None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/events?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("decoded request"),
+        )
+        .await
+        .expect("decoded route");
+    assert_eq!(
+        decoded.status(),
+        StatusCode::OK,
+        "an exact L2 fact must be returned before the oversized cold charge is considered"
+    );
+}
+
+#[tokio::test]
+async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache_root = dir.path().join(".overview-cache");
+    let namespace = b"durable-admission-bypass".to_vec();
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+
+    let first_snapshot =
+        kronika_reader::LocalDirSnapshot::open(dir.path()).expect("first snapshot");
+    let first_state = AppState::with_overview_config(
+        first_snapshot,
+        0,
+        std::time::Duration::from_secs(10),
+        OverviewConfig::new(cache_root.clone(), namespace.clone()),
+    )
+    .expect("first state");
+    let cold = app(first_state.clone(), None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("cold request"),
+        )
+        .await
+        .expect("cold route");
+    assert_eq!(cold.status(), StatusCode::OK);
+    drop(first_state);
+
+    let restarted_snapshot =
+        kronika_reader::LocalDirSnapshot::open(dir.path()).expect("restart snapshot");
+    let restarted = AppState::with_overview_config(
+        restarted_snapshot,
+        0,
+        std::time::Duration::from_secs(10),
+        OverviewConfig::new(cache_root, namespace),
+    )
+    .expect("restarted state");
+    install_oversized_real_entry(&restarted);
+    let durable = app(restarted, None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/events?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("durable request"),
+        )
+        .await
+        .expect("durable route");
+    assert_eq!(
+        durable.status(),
+        StatusCode::OK,
+        "an exact durable fact must be returned before the oversized cold charge is considered"
+    );
 }
 
 #[tokio::test]

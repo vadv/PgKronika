@@ -50,6 +50,7 @@ pub(crate) fn record_probe_metrics(outcome: PersistenceProbeOutcome) {
             .increment(1);
         }
         PersistenceProbeOutcome::Failed(error) => {
+            let reason = persist_reason(Some(error));
             metrics::counter!(
                 "kronika_web_overview_persist_probe_attempts_total",
                 "result" => "failure"
@@ -57,9 +58,10 @@ pub(crate) fn record_probe_metrics(outcome: PersistenceProbeOutcome) {
             .increment(1);
             metrics::counter!(
                 "kronika_web_overview_persist_probe_failures_total",
-                "reason" => persist_reason(Some(error))
+                "reason" => reason
             )
             .increment(1);
+            metrics::counter!("overview_persist_failures_total", "reason" => reason).increment(1);
         }
     }
 }
@@ -70,10 +72,23 @@ pub(crate) fn record_persist_snapshot(snapshot: PersistModeSnapshot) {
     metrics::gauge!("kronika_web_overview_persist_failures").set(f64::from(snapshot.failures));
     metrics::gauge!("kronika_web_overview_persist_retry_after_seconds")
         .set(snapshot.retry_after.as_secs_f64());
+    metrics::gauge!("overview_persist_backoff_seconds")
+        .set(snapshot.retry_after.as_secs_f64());
     metrics::gauge!("kronika_web_overview_persist_probe_in_flight")
         .set(f64::from(snapshot.probe_in_flight));
 
     let reason = persist_reason(snapshot.reason);
+    let mode = persist_mode(snapshot.mode);
+    for candidate_mode in ["read_write", "read_only_backoff", "unavailable_backoff"] {
+        for candidate_reason in PERSIST_REASONS {
+            metrics::gauge!(
+                "overview_cache_mode",
+                "mode" => candidate_mode,
+                "reason" => candidate_reason
+            )
+            .set(f64::from(candidate_mode == mode && candidate_reason == reason));
+        }
+    }
     for candidate in PERSIST_REASONS {
         metrics::gauge!(
             "kronika_web_overview_persist_reason",
@@ -91,7 +106,15 @@ pub(crate) fn record_persist_snapshot(snapshot: PersistModeSnapshot) {
     }
 }
 
-const fn persist_reason(error: Option<PersistError>) -> &'static str {
+const fn persist_mode(mode: kronika_reader::PersistMode) -> &'static str {
+    match mode {
+        kronika_reader::PersistMode::ReadWrite => "read_write",
+        kronika_reader::PersistMode::ReadOnlyBackoff => "read_only_backoff",
+        kronika_reader::PersistMode::UnavailableBackoff => "unavailable_backoff",
+    }
+}
+
+pub(crate) const fn persist_reason(error: Option<PersistError>) -> &'static str {
     match error {
         None => "none",
         Some(PersistError::ReadOnlyFilesystem) => "read_only_filesystem",

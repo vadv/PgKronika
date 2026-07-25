@@ -1276,10 +1276,12 @@ fn derive_sender_disappearances(
     bounds: &Bounds,
     facts: &mut Vec<EventFact>,
 ) -> Result<(), BuildError> {
-    let mut boundaries =
-        BTreeMap::<u32, Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
+    let mut boundaries = BTreeMap::<
+        (kronika_analytics::overview::SourceScopeId, u32),
+        Vec<(MetricSeriesDescriptor, EntityStateRecord)>,
+    >::new();
     let mut snapshots = BTreeMap::<
-        (u32, i64),
+        (kronika_analytics::overview::SourceScopeId, u32, i64),
         BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
     >::new();
     for record in states.records() {
@@ -1288,25 +1290,28 @@ fn derive_sender_disappearances(
             Some(
                 kronika_analytics::overview::MetricFactor::PgReplicationSenderSnapshotPopulation,
             ) => boundaries
-                .entry(descriptor.source_type_id)
+                .entry((descriptor.source_scope_id, descriptor.source_type_id))
                 .or_default()
                 .push((descriptor, *record)),
             Some(kronika_analytics::overview::MetricFactor::PgReplicationSenderState) => {
                 snapshots
-                    .entry((descriptor.source_type_id, record.ts_us))
+                    .entry((
+                        descriptor.source_scope_id,
+                        descriptor.source_type_id,
+                        record.ts_us,
+                    ))
                     .or_default()
                     .insert(descriptor.series_id, (descriptor, *record));
             }
             _ => {}
         }
     }
-    for (source_type, source_boundaries) in &mut boundaries {
+    for ((source_scope, source_type), source_boundaries) in &mut boundaries {
         source_boundaries.sort_unstable_by_key(|(_descriptor, record)| record.ts_us);
         for pair in source_boundaries.windows(2) {
-            let previous = pair[0].1;
+            let (previous_descriptor, previous) = pair[0];
             let (current_descriptor, current) = pair[1];
-            if previous.population_total == 0
-                || previous.population_total != current.population_total
+            if previous_descriptor.series_id != current_descriptor.series_id
                 || known_gaps.spans().iter().any(|gap| {
                     gap.start_us() < current.ts_us && gap.end_us() > previous.ts_us
                 })
@@ -1315,10 +1320,10 @@ fn derive_sender_disappearances(
             }
             let empty = BTreeMap::new();
             let previous_entities = snapshots
-                .get(&(*source_type, previous.ts_us))
+                .get(&(*source_scope, *source_type, previous.ts_us))
                 .unwrap_or(&empty);
             let current_entities = snapshots
-                .get(&(*source_type, current.ts_us))
+                .get(&(*source_scope, *source_type, current.ts_us))
                 .unwrap_or(&empty);
             let current_sample = GaugeSample::new(
                 current_descriptor.series_id,
@@ -1336,7 +1341,7 @@ fn derive_sender_disappearances(
                     sender.state_code,
                     current_descriptor,
                     current_sample,
-                    u64::from(current.state_code),
+                    current.population_total,
                 )
                 .map_err(|_error| BuildError::Internal)?
                 {
@@ -1856,15 +1861,18 @@ fn merge_physical_count(
 #[cfg(test)]
 mod tests {
     use kronika_analytics::overview::{
-        CountLimits, ErrorCategory, EvidenceQuality, LossReason, SemanticDivergence, SqlState,
-        TimeQuality, semantic_divergences,
+        CountLimits, ErrorCategory, EventKind, EventPayload, EvidenceQuality, LossReason,
+        MetricFactor, SemanticDivergence, SqlState, TimeQuality, semantic_divergences,
     };
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::incident_gauges::PgReplicationPhysicalV1;
     use kronika_registry::pg_log::{
         PgLogAutovacuumV1, PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1,
         PgLogLockWaitV1, PgLogSlowQueryV1, PgLogTempFileV1,
     };
+    use kronika_registry::reset_metadata::ResetMetadata;
+    use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
     use kronika_registry::{Section, StrId, Ts};
     use kronika_writer::{Interner, dict};
 
@@ -1938,6 +1946,231 @@ mod tests {
 
     fn full_range() -> CoverageSpan {
         CoverageSpan::new(0, 10_000).expect("valid range")
+    }
+
+    fn reset_metadata(ts_us: i64, postmaster_start_us: i64) -> ResetMetadata {
+        ResetMetadata {
+            ts: Ts(ts_us),
+            postmaster_start_time: Ts(postmaster_start_us),
+            pg_stat_database_reset_max_at: None,
+            pg_stat_statements_reset_at: None,
+            pg_store_plans_reset_at: None,
+            pg_stat_bgwriter_reset_at: None,
+            pg_stat_checkpointer_reset_at: None,
+            pg_stat_wal_reset_at: None,
+            pg_stat_archiver_reset_at: None,
+            pg_stat_io_reset_at: None,
+            ext_pg_stat_statements_version: None,
+            ext_pg_store_plans_version: None,
+            compute_query_id: None,
+            track_io_timing: None,
+            track_wal_io_timing: None,
+        }
+    }
+
+    fn replication_sender(ts_us: i64) -> PgReplicationPhysicalV1 {
+        PgReplicationPhysicalV1 {
+            ts: Ts(ts_us),
+            pid: 42,
+            backend_start_key: 5,
+            application_name: StrId(1),
+            slot_name: StrId(2),
+            slot_type: StrId(3),
+            state: StrId(4),
+            sync_state: StrId(5),
+            scope_code: 1,
+            state_code: 3,
+            current_to_sent_bytes: None,
+            sent_to_write_bytes: None,
+            write_to_flush_bytes: None,
+            flush_to_replay_bytes: None,
+            write_lag_us: None,
+            flush_lag_us: None,
+            replay_lag_us: None,
+        }
+    }
+
+    fn sender_coverage(
+        ts_us: i64,
+        read_state: u8,
+        source_total: u32,
+        collected: u32,
+    ) -> SnapshotCoverageV1 {
+        SnapshotCoverageV1 {
+            ts: Ts(ts_us),
+            source_type_id: 1_033_001,
+            collector_pid: 99,
+            collector_started_at: Ts(1),
+            read_state,
+            visibility: 0,
+            source_total,
+            collected,
+        }
+    }
+
+    fn replication_snapshot_pgm(
+        resets: &[ResetMetadata],
+        senders: &[PgReplicationPhysicalV1],
+        coverage: &[SnapshotCoverageV1],
+    ) -> Vec<u8> {
+        let reset_body = ResetMetadata::encode(resets).expect("encode reset metadata");
+        let sender_body =
+            PgReplicationPhysicalV1::encode(senders).expect("encode replication senders");
+        let coverage_body =
+            SnapshotCoverageV1::encode(coverage).expect("encode snapshot coverage");
+        let min_ts = resets
+            .iter()
+            .map(|row| row.ts.0)
+            .chain(senders.iter().map(|row| row.ts.0))
+            .chain(coverage.iter().map(|row| row.ts.0))
+            .min()
+            .expect("fixture has a timestamp");
+        let max_ts = resets
+            .iter()
+            .map(|row| row.ts.0)
+            .chain(senders.iter().map(|row| row.ts.0))
+            .chain(coverage.iter().map(|row| row.ts.0))
+            .max()
+            .expect("fixture has a timestamp");
+        build_part(
+            &[
+                SectionInput {
+                    type_id: 1_020_001,
+                    rows: row_count(resets),
+                    body: &reset_body,
+                },
+                SectionInput {
+                    type_id: 1_033_001,
+                    rows: row_count(senders),
+                    body: &sender_body,
+                },
+                SectionInput {
+                    type_id: 1_038_001,
+                    rows: row_count(coverage),
+                    body: &coverage_body,
+                },
+            ],
+            PartMeta {
+                min_ts,
+                max_ts,
+                source_id: 7,
+            },
+        )
+    }
+
+    #[test]
+    fn complete_empty_sender_snapshot_is_a_boundary_and_proves_disappearance() {
+        let bytes = replication_snapshot_pgm(
+            &[reset_metadata(10, 1), reset_metadata(20, 1)],
+            &[replication_sender(10)],
+            &[
+                sender_coverage(10, 0, 1, 1),
+                sender_coverage(20, 0, 0, 0),
+            ],
+        );
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open replication fixture");
+        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+
+        let boundary_series = facts
+            .gauge_samples()
+            .series()
+            .iter()
+            .find(|descriptor| {
+                MetricFactor::from_id(descriptor.factor_id)
+                    == Some(MetricFactor::PgReplicationSenderSnapshotPopulation)
+            })
+            .expect("snapshot boundary series");
+        let boundaries = facts
+            .entity_states()
+            .records()
+            .iter()
+            .filter(|record| record.series_id == boundary_series.series_id)
+            .collect::<Vec<_>>();
+        assert_eq!(boundaries.len(), 2);
+        assert_eq!(boundaries[0].state_code, 0);
+        assert_eq!(boundaries[0].population_total, 1);
+        assert_eq!(boundaries[1].state_code, 0);
+        assert_eq!(boundaries[1].population_total, 0);
+
+        let disappearance = facts
+            .event_facts()
+            .iter()
+            .find(|fact| fact.kind() == EventKind::PgReplicationSenderDisappeared)
+            .expect("complete empty snapshot proves sender disappearance");
+        assert_eq!(disappearance.interval().start_us(), 20);
+        assert!(matches!(
+            disappearance.payload(),
+            EventPayload::StateTransition(payload)
+                if payload.previous_state == 3
+                    && payload.current_state == u32::MAX
+                    && payload.population_total == 0
+        ));
+    }
+
+    #[test]
+    fn postmaster_change_rekeys_population_boundary_and_suppresses_disappearance() {
+        let bytes = replication_snapshot_pgm(
+            &[reset_metadata(10, 1), reset_metadata(20, 2)],
+            &[replication_sender(10)],
+            &[
+                sender_coverage(10, 0, 1, 1),
+                sender_coverage(20, 0, 0, 0),
+            ],
+        );
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open restart fixture");
+        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+
+        let boundary_series = facts
+            .gauge_samples()
+            .series()
+            .iter()
+            .filter(|descriptor| {
+                MetricFactor::from_id(descriptor.factor_id)
+                    == Some(MetricFactor::PgReplicationSenderSnapshotPopulation)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            boundary_series.len(),
+            2,
+            "the postmaster epoch is part of the complete-boundary identity"
+        );
+        assert!(
+            facts
+                .event_facts()
+                .iter()
+                .all(|fact| fact.kind() != EventKind::PgReplicationSenderDisappeared)
+        );
+        assert!(
+            facts
+                .event_facts()
+                .iter()
+                .any(|fact| fact.kind() == EventKind::PgPostmasterStartChanged)
+        );
+    }
+
+    #[test]
+    fn collector_read_failure_is_retained_as_a_canonical_coverage_fact() {
+        let bytes = replication_snapshot_pgm(
+            &[reset_metadata(10, 1)],
+            &[],
+            &[sender_coverage(10, 3, 2, 0)],
+        );
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open collector-loss fixture");
+        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        assert!(
+            facts
+                .event_facts()
+                .iter()
+                .any(|fact| fact.kind() == EventKind::CollectorSourceReadFailure)
+        );
+        assert!(
+            facts
+                .entity_states()
+                .records()
+                .iter()
+                .all(|record| record.population_total != 2),
+            "an incomplete snapshot cannot authorize an entity-population boundary"
+        );
     }
 
     #[allow(

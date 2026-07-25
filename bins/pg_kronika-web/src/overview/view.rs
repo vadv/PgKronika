@@ -1526,22 +1526,28 @@ fn derive_sender_disappearances(
     max_facts: usize,
     facts: &mut BTreeMap<FactId, CanonicalEventFact>,
 ) -> Result<(), CanonicalFactQueryError> {
-    let mut boundaries =
-        BTreeMap::<u32, Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
+    let mut boundaries = BTreeMap::<
+        (SourceScopeId, u32),
+        Vec<(MetricSeriesDescriptor, EntityStateRecord)>,
+    >::new();
     let mut snapshots = BTreeMap::<
-        (u32, i64),
+        (SourceScopeId, u32, i64),
         BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
     >::new();
     for (descriptor, records) in states.values() {
         for record in records {
             match MetricFactor::from_id(descriptor.factor_id) {
                 Some(MetricFactor::PgReplicationSenderSnapshotPopulation) => boundaries
-                    .entry(descriptor.source_type_id)
+                    .entry((descriptor.source_scope_id, descriptor.source_type_id))
                     .or_default()
                     .push((*descriptor, *record)),
                 Some(MetricFactor::PgReplicationSenderState) => {
                     if snapshots
-                        .entry((descriptor.source_type_id, record.ts_us))
+                        .entry((
+                            descriptor.source_scope_id,
+                            descriptor.source_type_id,
+                            record.ts_us,
+                        ))
                         .or_default()
                         .insert(descriptor.series_id, (*descriptor, *record))
                         .is_some()
@@ -1553,7 +1559,7 @@ fn derive_sender_disappearances(
             }
         }
     }
-    for (source_type, source_boundaries) in &mut boundaries {
+    for ((source_scope, source_type), source_boundaries) in &mut boundaries {
         source_boundaries.sort_unstable_by_key(|(_descriptor, record)| record.ts_us);
         if source_boundaries
             .windows(2)
@@ -1562,12 +1568,11 @@ fn derive_sender_disappearances(
             return Err(CanonicalFactQueryError::ContradictoryFacts);
         }
         for pair in source_boundaries.windows(2) {
-            let previous = pair[0].1;
+            let (previous_descriptor, previous) = pair[0];
             let (current_descriptor, current) = pair[1];
             if current.ts_us < range.start_us()
                 || current.ts_us >= range.end_us()
-                || previous.population_total == 0
-                || previous.population_total != current.population_total
+                || previous_descriptor.series_id != current_descriptor.series_id
                 || gaps
                     .get(&current_descriptor.source_scope_id)
                     .is_some_and(|known| {
@@ -1580,10 +1585,10 @@ fn derive_sender_disappearances(
             }
             let empty = BTreeMap::new();
             let previous_entities = snapshots
-                .get(&(*source_type, previous.ts_us))
+                .get(&(*source_scope, *source_type, previous.ts_us))
                 .unwrap_or(&empty);
             let current_entities = snapshots
-                .get(&(*source_type, current.ts_us))
+                .get(&(*source_scope, *source_type, current.ts_us))
                 .unwrap_or(&empty);
             let current_sample = GaugeSample::new(
                 current_descriptor.series_id,
@@ -1601,7 +1606,7 @@ fn derive_sender_disappearances(
                     sender.state_code,
                     current_descriptor,
                     current_sample,
-                    u64::from(current.state_code),
+                    current.population_total,
                 )
                 .map_err(|_error| CanonicalFactQueryError::ContradictoryFacts)?
                 {

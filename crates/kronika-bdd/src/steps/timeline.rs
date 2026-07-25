@@ -24,7 +24,7 @@ fn fixed_timeline_log_fixture(world: &mut BddWorld) -> Result<()> {
     Ok(())
 }
 
-#[then("the fixed log facts reconcile through the source-scoped timeline")]
+#[then("the fixed log and metric facts reconcile through the source-scoped timeline")]
 async fn source_scoped_timeline_reconciles(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();
     let dir = segment

@@ -62,7 +62,12 @@ impl DecodedFactCache {
 
     /// Retains an exact decoded fact set if it fits the configured L2 budget.
     pub(crate) fn insert(&self, key: FactBuildKey, facts: Arc<SegmentFacts>) {
-        if self.max_bytes == 0 || self.max_entries == 0 || facts.resident_bytes().is_none() {
+        let resident_bytes = facts.resident_bytes();
+        if resident_bytes.is_none() {
+            metrics::counter!("overview_overflow_total", "kind" => "decoded_fact_charge")
+                .increment(1);
+        }
+        if self.max_bytes == 0 || self.max_entries == 0 || resident_bytes.is_none() {
             metrics::counter!(
                 "overview_cache_evictions_total",
                 "class" => "decoded_facts",

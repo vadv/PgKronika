@@ -11,7 +11,19 @@ use tower::ServiceExt as _;
 use crate::overview::resilience::{record_persist_snapshot, record_probe_metrics};
 use crate::{AppState, OverviewConfig, app};
 
-use super::{test_metrics_handle, write_bgwriter_segment};
+use super::{capture_json, test_metrics_handle, write_bgwriter_segment};
+
+fn corrupt_first_section_body(path: &std::path::Path) {
+    let mut bytes = std::fs::read(path).expect("read segment");
+    let body_offset = {
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open segment catalog");
+        let entry = unit.catalog().entries.first().expect("section entry");
+        assert_ne!(entry.len, 0, "fixture section body is non-empty");
+        usize::try_from(entry.offset).expect("section offset fits usize")
+    };
+    bytes[body_offset] ^= 0xff;
+    std::fs::write(path, bytes).expect("corrupt only the source section body");
+}
 
 #[tokio::test]
 async fn a_metadata_only_fallback_keeps_the_snapshot_that_authorized_its_descriptors() {
@@ -81,15 +93,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
         .expect("first route");
     assert_eq!(first.status(), StatusCode::OK);
 
-    let mut bytes = std::fs::read(&segment_path).expect("read segment");
-    let body_offset = {
-        let unit = PgmUnit::open(bytes.as_slice()).expect("open segment catalog");
-        let entry = unit.catalog().entries.first().expect("section entry");
-        assert_ne!(entry.len, 0, "fixture section body is non-empty");
-        usize::try_from(entry.offset).expect("section offset fits usize")
-    };
-    bytes[body_offset] ^= 0xff;
-    std::fs::write(&segment_path, bytes).expect("corrupt only the source section body");
+    corrupt_first_section_body(&segment_path);
 
     let restarted_snapshot =
         kronika_reader::LocalDirSnapshot::open(dir.path()).expect("restart snapshot");
@@ -113,6 +117,116 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
         restarted.status(),
         StatusCode::OK,
         "a durable exact-key hit must not decode the changed source body"
+    );
+}
+
+#[tokio::test]
+async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let segment_path = dir.path().join("one.pgm");
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
+    let state = AppState::with_overview_config(
+        snapshot,
+        0,
+        Duration::from_secs(10),
+        OverviewConfig::new(
+            dir.path().join(".overview-cache"),
+            b"source-read-partial".to_vec(),
+        ),
+    )
+    .expect("state");
+    corrupt_first_section_body(&segment_path);
+
+    let response = app(state.clone(), None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route");
+    let response = capture_json(response).await;
+    assert_eq!(response.status, StatusCode::OK, "partial view remains queryable");
+    assert_eq!(response.body["meta"]["source_status"], "gap");
+    assert_eq!(
+        response.body["meta"]["loss"][0]["known_gaps"],
+        serde_json::json!([{ "from_us": 0, "to_us": 2 }])
+    );
+    assert_eq!(
+        state.response_cache.len(),
+        0,
+        "a partial fact-set identity must never populate the complete response cache key"
+    );
+}
+
+#[tokio::test]
+async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let segment_path = dir.path().join("one.pgm");
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
+    let mut config = OverviewConfig::new(
+        dir.path().join(".overview-cache"),
+        b"source-scrub-damage".to_vec(),
+    );
+    config.source_scrub_interval = Duration::from_secs(1);
+    let state =
+        AppState::with_overview_config(snapshot, 0, Duration::from_secs(10), config).expect("state");
+
+    let complete = app(state.clone(), None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("complete request"),
+        )
+        .await
+        .expect("complete route");
+    let complete = capture_json(complete).await;
+    assert_eq!(complete.status, StatusCode::OK);
+    assert_eq!(complete.body["meta"]["source_status"], "complete_for_contract");
+    let cached_complete_responses = state.response_cache.len();
+    assert_eq!(cached_complete_responses, 1);
+
+    corrupt_first_section_body(&segment_path);
+    let mut snapshot = (*state.snapshot()).clone();
+    let delta = snapshot
+        .refresh_incremental_delta()
+        .expect("same-catalog source refresh");
+    state
+        .republish_store_view(snapshot, &delta)
+        .expect("scrubbed publication");
+    let plan = state
+        .select_overview(
+            state.overview_view(),
+            &[7],
+            kronika_analytics::overview::CoverageSpan::new(0, 2).expect("range"),
+        )
+        .expect("damaged source selection");
+    assert!(plan.sealed_gap(), "scrub damage becomes an unavailable descriptor");
+
+    let damaged = app(state.clone(), None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/events?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("damaged request"),
+        )
+        .await
+        .expect("damaged route");
+    let damaged = capture_json(damaged).await;
+    assert_eq!(damaged.status, StatusCode::OK);
+    assert_eq!(damaged.body["meta"]["source_status"], "gap");
+    assert_eq!(
+        damaged.body["meta"]["loss"][0]["known_gaps"],
+        serde_json::json!([{ "from_us": 0, "to_us": 2 }])
+    );
+    assert_eq!(
+        state.response_cache.len(),
+        cached_complete_responses,
+        "the partial response is not cached and the old durable fact is not consulted"
     );
 }
 

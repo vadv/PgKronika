@@ -20,7 +20,7 @@ views. Sealed fact bodies are loaded only for admitted timeline requests.
 | `KRONIKA_WEB_STALE_AFTER_S` | `10` | `/readyz` returns `503` when the last successful refresh is older than this. |
 | `KRONIKA_WEB_LOG` | `info` | `tracing-subscriber` filter directive. |
 | `KRONIKA_WEB_OVERVIEW_CACHE_DIR` | `<KRONIKA_WEB_DIR>/.pgkronika-overview-cache` | Durable per-segment timeline fact cache. |
-| `KRONIKA_WEB_OVERVIEW_NAMESPACE` | canonical store-path bytes | Stable store/deployment identity used in timeline fact keys. |
+| `KRONIKA_WEB_OVERVIEW_NAMESPACE` | required | Explicit stable store/deployment identity used in timeline fact keys. Keep it unchanged across restarts and equivalent mount paths. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_SEGMENT_HOURS` | `24` | Total admitted segment-hours retained after recoverable durable-publication failures. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_BYTES` | `67108864` | Canonical fact-byte budget for the process-local fallback. |
 | `KRONIKA_WEB_OVERVIEW_GC_MAX_ENTRIES` | `100000` | Maximum entries in one complete fact-cache inventory; reaching the bound forbids a sweep. |
@@ -31,14 +31,30 @@ views. Sealed fact bodies are loaded only for admitted timeline requests.
 | `KRONIKA_WEB_OVERVIEW_CACHE_MAX_FILES` | unset | Optional file-count ceiling for the accounted fact-cache namespace. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES` | `67108864` | Logical-byte budget for the serialized overview/health response cache. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_ENTRIES` | `4096` | Serialized overview/health response-cache entry budget. |
+| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_BYTES` | `268435456` | Logical resident-byte budget for the decoded sealed-fact L2 cache. |
+| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_ENTRIES` | `4096` | Entry budget for the decoded sealed-fact L2 cache. |
+| `KRONIKA_WEB_OVERVIEW_SOURCE_SCRUB_INTERVAL_S` | `60` | Successful refresh passes between streaming CRC scrubs; each due pass scrubs one sealed section. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS` | `64` | Maximum event views pinned for cursor continuation. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_BYTES` | `536870912` | Logical-byte budget for cursor-pinned event views. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_TTL_S` | `300` | Cursor and pinned-view lifetime in seconds. |
 | `KRONIKA_WEB_OVERVIEW_MAX_SELECTED_SEGMENTS` | `1024` | Effective sealed-segment admission limit for one timeline request; accepted range `1..=4096`. |
+| `KRONIKA_WEB_OVERVIEW_COLD_MAX_WORKERS` | `4` | Maximum active sealed-fact workers. |
+| `KRONIKA_WEB_OVERVIEW_COLD_MAX_QUEUE` | `64` | Maximum queued exact sealed-fact builds. |
+| `KRONIKA_WEB_OVERVIEW_COLD_PER_REQUEST_PARALLELISM` | `4` | Maximum cold loads started concurrently by one request. |
+| `KRONIKA_WEB_OVERVIEW_COLD_WAIT_TIMEOUT_MS` | `5000` | Maximum FIFO wait before a cold build is rejected. |
+| `KRONIKA_WEB_OVERVIEW_COLD_RETRY_AFTER_S` | `1` | `Retry-After` value for cold-build overload responses. |
+| `KRONIKA_WEB_OVERVIEW_COLD_PGM_BYTES` | `1073741824` | Aggregate source-PGM byte capacity for active cold work. |
+| `KRONIKA_WEB_OVERVIEW_COLD_DECODED_BYTES` | `1073741824` | Aggregate decoded working-set byte capacity for active cold work. |
+| `KRONIKA_WEB_OVERVIEW_COLD_CPU_ROWS` | `2097152` | Aggregate source-row CPU charge for active cold work. |
+| `KRONIKA_WEB_OVERVIEW_COLD_FILE_DESCRIPTORS` | `16` | Aggregate file-descriptor reservation for active cold work. |
+| `KRONIKA_WEB_OVERVIEW_COLD_READ_BYTES` | `1073741824` | Aggregate source and durable-cache read capacity for active cold work. |
+| `KRONIKA_WEB_OVERVIEW_COLD_WRITE_BYTES` | `1073741824` | Aggregate durable-cache write capacity for active cold work. |
+| `KRONIKA_WEB_OVERVIEW_COLD_PUBLICATIONS` | `4` | Aggregate durable-publication capacity for active cold work. |
 
 ```sh
 KRONIKA_WEB_DIR=/var/lib/pg_kronika \
 KRONIKA_WEB_ADDR=127.0.0.1:8688 \
+KRONIKA_WEB_OVERVIEW_NAMESPACE=prod-primary \
 KRONIKA_WEB_BASIC_AUTH='operator:change-me' \
 pg_kronika-web
 ```
@@ -58,21 +74,26 @@ Timeline resource policy defaults and constraints are:
 | Recognized publication-artifact grace | 600 s | Must be nonzero |
 | Persistent fact-cache admission | No byte or file ceiling by default | Optional nonzero logical-byte and file-count ceilings |
 | Serialized overview/health response cache | 4,096 entries, 64 MiB logical charge | Both configured budgets are nonzero and fit `usize`. |
+| Decoded sealed-fact L2 cache | 4,096 entries, 256 MiB logical resident charge | Exact hits bypass cold admission; both configured budgets are nonzero and fit `usize`. |
+| Streaming source scrub | One sealed section every 60 successful refresh passes | Interval is nonzero; CRC failure removes the source from the usable descriptor set. |
 | Cursor-pinned event views | 64 views, 512 MiB logical charge, 300 s TTL | All budgets are nonzero; count and bytes fit `usize`. |
 | Selected sealed segments per timeline request | 1,024 | Configurable from 1 through the absolute v1 ceiling of 4,096 |
+| Cold sealed-fact scheduler | 4 workers, FIFO queue 64, per-request parallelism 4, wait 5 s | All limits are nonzero; queue rejection, overweight work, and timeout return an operator-configured retry hint. |
+| Cold weighted capacity | 1 GiB each PGM/decoded/read/write, 2,097,152 rows, 16 file descriptors, 4 publications | Values are process-wide aggregate ceilings; byte and row charges round up to fixed scheduler quanta. |
 | Timeline query range | — | 31 days |
 | Materialized timeline query | — | 64 MiB cloned-observation charge; 1,048,576 observations/count inputs, 262,144 clipped coverage spans, 65,536 joint keys, 1,024 signal keys |
 | Events page | 100 items | 1,000 items |
 | Notable preview | 100 items | Fixed by notable policy v1 |
 | Health line | — | 2,000 points |
 
-Numeric `KRONIKA_WEB_OVERVIEW_*` policy variables accept unsigned decimal
-integers. Required budgets and grace values must be nonzero; either persistent
-cache ceiling may remain unset. Byte, entry, and view budgets that become
-process sizes must fit the platform's `usize`. The fallback additionally
-rejects values above 744 segment-hours or 268435456 bytes. The selected-segment
-limit must be in `1..=4096`. Invalid values stop startup before the listener
-binds.
+`KRONIKA_WEB_OVERVIEW_NAMESPACE` is mandatory and must not be empty. Numeric
+`KRONIKA_WEB_OVERVIEW_*` policy variables accept unsigned decimal integers.
+Required budgets, intervals, queue sizes, and weighted capacities must be
+nonzero; either persistent cache ceiling may remain unset. Byte, entry, queue,
+and view budgets that become process sizes must fit the platform's `usize`.
+The fallback additionally rejects values above 744 segment-hours or 268435456
+bytes. The selected-segment limit must be in `1..=4096`. Invalid values stop
+startup before the listener binds.
 
 ## Persistent fact-cache operation
 
@@ -192,13 +213,21 @@ See the [OpenAPI contract](openapi.json) and the
   event_instance_id)`.
 - Timeline refresh publishes catalog-derived sealed descriptors and one
   bounded live generation without decoding sealed section bodies. An admitted
-  request loads only the descriptors selected by its source/range plan. Cold
-  fact work is shared by the full lineage-qualified `FactBuildKey`, survives
-  request cancellation, and enters a global FIFO scheduler with four workers,
-  a 64-entry queue, at most four loads started by one request, and aggregate
-  PGM, decoded-memory, CPU, file-descriptor, read, write, and publication
-  weights. Capacity rejection returns `503` with
-  `code=overview_capacity_unavailable` and `Retry-After: 1`.
+  request loads only the descriptors selected by its source/range plan.
+  Exact decoded-L2, durable, and recoverable-fallback hits bypass cold
+  admission. Missing exact facts share work by the full lineage-qualified
+  `FactBuildKey`, survive request cancellation, and enter the configurable
+  process-wide FIFO scheduler. Queue exhaustion, an overweight build, or FIFO
+  timeout returns `503` with `code=cold_build_overloaded` and the configured
+  `Retry-After`.
+- A selected sealed source that fails while the request is loading facts does
+  not become a successful empty segment and does not fail the whole request.
+  The response is `200` with that interval in `known_gaps`, reduced
+  completeness, and a fact-set identity distinct from the planned complete
+  input. Such a partial response is not retained under the complete response
+  cache key. The background streaming CRC scrub detects silent section-body
+  damage, marks the segment unavailable, and prevents an older durable derived
+  fact from masking that source gap.
 - Event counts use checked arithmetic. Severity and category totals,
   SQLSTATE top/other/missing buckets, and joint top/other buckets independently
   reconcile to retained error occurrences; retained groups and physical
@@ -287,9 +316,49 @@ single-flight activity use
 policy uses `kronika_web_timeline_selected_segments_limit` and
 `kronika_web_timeline_query_limit_rejections_total{resource="selected_segments"}`.
 Cold fact-work overload uses
-`kronika_web_overview_cold_work_rejections_total{reason="capacity"}`. These
-labels are fixed; HTTP request labels use matched route templates rather than
-raw URIs.
+`overview_cold_reject_total{reason}` with the closed reasons
+`queue_full`, `weight_exceeds_capacity`, and `timeout`;
+`overview_cold_wait_seconds`, `overview_cold_queue_depth`,
+`overview_cold_work_inflight{kind="workers"}`,
+`overview_inflight_bytes{kind="pgm"|"decoded"}`, and `overview_open_files`
+show scheduler pressure. The compatibility counter
+`kronika_web_overview_cold_work_rejections_total{reason="capacity"}` advances
+for HTTP overload responses.
+
+Decoded and durable lookup work uses
+`overview_fact_lookup_total{layer,result,reason}`,
+`overview_fact_read_bytes`, `overview_pgm_body_read_bytes`,
+`overview_pgm_sections_decoded`,
+`overview_fact_build_total{result,source_type}`, and
+`overview_fact_build_seconds`; writes use `overview_fact_write_bytes`. The
+decoded L2 publishes
+`overview_cache_{entries,bytes}{class="decoded_facts"}` and
+`overview_cache_evictions_total{class="decoded_facts",reason}`.
+
+The parity-v1 operational inventory also includes the one-hot
+`overview_cache_mode{mode,reason}`, `overview_persist_failures_total{reason}`,
+`overview_persist_backoff_seconds`,
+`overview_singleflight_{builds,waiters}`,
+`overview_live_state{state,reason}`, `overview_live_folded_parts_total`,
+`overview_live_data_through_us`, `overview_live_visibility_lag_seconds`,
+`overview_view_generation`, `overview_cursor_views`,
+`overview_cursor_view_bytes`, and `overview_cursor_expired_total{reason}`.
+Correctness signals are `overview_source_failures_total{reason}`,
+`overview_coverage_loss_total{source,factor,reason}`,
+`overview_retained_observations_total{kind}`,
+`overview_overflow_total{kind}`, `overview_raw_fallback_total{reason}`,
+`overview_gc_files_total{action,reason}`, and
+`overview_gc_bytes_total{action}`. Every name is registered with a metric type
+and help text when the router is built; dynamic source/factor values come only
+from bounded published inventories, while all other label values are closed.
+
+Source integrity and partial-result behavior use
+`overview_source_read_failures_total{outcome="partial"}`,
+`overview_source_scrub_total{outcome}`,
+`overview_source_scrub_bytes_total`, `overview_source_scrub_seconds`, and
+`overview_source_damaged_segments`. These and the scheduler/cache label sets
+are fixed; HTTP request labels use matched route templates rather than raw
+URIs.
 
 ## Shutdown and failure behavior
 

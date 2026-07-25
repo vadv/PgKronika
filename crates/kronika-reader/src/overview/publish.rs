@@ -140,6 +140,7 @@ pub struct FactLoad {
     rebuild_reason: Option<CacheRebuildReason>,
     persist_error: Option<PersistError>,
     fact_read_stats: Option<FactReadStats>,
+    fact_write_bytes: u64,
     pgm_body_read_stats: PgmBodyReadStats,
 }
 
@@ -190,6 +191,12 @@ impl FactLoad {
     #[must_use]
     pub const fn fact_read_stats(&self) -> Option<FactReadStats> {
         self.fact_read_stats
+    }
+
+    /// Canonical fact bytes committed by this load.
+    #[must_use]
+    pub const fn fact_write_bytes(&self) -> u64 {
+        self.fact_write_bytes
     }
 
     /// PGM body reads performed by this load.
@@ -434,6 +441,7 @@ impl FactStore {
                     rebuild_reason: None,
                     persist_error: None,
                     fact_read_stats: Some(stats),
+                    fact_write_bytes: 0,
                     pgm_body_read_stats: PgmBodyReadStats::default(),
                 }))
             }
@@ -449,6 +457,7 @@ impl FactStore {
                         rebuild_reason: Some(rebuild_reason),
                         persist_error: None,
                         fact_read_stats: None,
+                        fact_write_bytes: 0,
                         pgm_body_read_stats: PgmBodyReadStats::default(),
                     }))
             }
@@ -480,6 +489,7 @@ impl FactStore {
                     rebuild_reason: None,
                     persist_error: None,
                     fact_read_stats: Some(stats),
+                    fact_write_bytes: 0,
                     pgm_body_read_stats: PgmBodyReadStats::default(),
                 })
             }
@@ -496,19 +506,22 @@ impl FactStore {
                         rebuild_reason: Some(rebuild_reason),
                         persist_error: None,
                         fact_read_stats: None,
+                        fact_write_bytes: 0,
                         pgm_body_read_stats: PgmBodyReadStats::default(),
                     });
                 }
 
                 let (facts, pgm_body_read_stats) =
                     SegmentFacts::extract_with_stats(unit, context, bounds)?;
-                let (facts, persist_error) = self.admit_publish_or_fallback(&facts, bounds)?;
+                let (facts, persist_error, fact_write_bytes) =
+                    self.admit_publish_or_fallback(&facts, bounds)?;
                 Ok(FactLoad {
                     facts,
                     origin: FactOrigin::Rebuilt,
                     rebuild_reason: Some(rebuild_reason),
                     persist_error,
                     fact_read_stats: None,
+                    fact_write_bytes,
                     pgm_body_read_stats,
                 })
             }
@@ -553,7 +566,7 @@ impl FactStore {
         &self,
         facts: &SegmentFacts,
         bounds: &Bounds,
-    ) -> Result<(Arc<SegmentFacts>, Option<PersistError>), BuildError> {
+    ) -> Result<(Arc<SegmentFacts>, Option<PersistError>, u64), BuildError> {
         let bytes = facts.encode(bounds).map_err(BuildError::from)?;
         let canonical_byte_len = u64::try_from(bytes.len())
             .map_err(|_error| BuildError::Overflow)
@@ -597,7 +610,12 @@ impl FactStore {
             }
             Some(_error) => {}
         }
-        Ok((admitted, persist_error))
+        let fact_write_bytes = if persist_error.is_none() {
+            canonical_byte_len.get()
+        } else {
+            0
+        };
+        Ok((admitted, persist_error, fact_write_bytes))
     }
 
     fn persist_encoded(
@@ -1218,7 +1236,7 @@ mod tests {
         store.inject_publish_faults([PersistError::TransientIo]);
         let facts = built(&lifecycle_pgm(7));
 
-        let (_first, first_error) = store
+        let (_first, first_error, _first_write_bytes) = store
             .admit_publish_or_fallback(&facts, &LIMIT)
             .expect("first admit");
         assert_eq!(first_error, Some(PersistError::TransientIo));
@@ -1230,7 +1248,7 @@ mod tests {
 
         // The second call reports the standing reason without entering
         // `publish_encoded`, so no new publication failure is recorded.
-        let (_second, second_error) = store
+        let (_second, second_error, _second_write_bytes) = store
             .admit_publish_or_fallback(&facts, &LIMIT)
             .expect("second admit");
         assert!(

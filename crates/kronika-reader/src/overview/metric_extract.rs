@@ -77,20 +77,28 @@ impl ResetContext {
         }
     }
 
-    fn pg_database_epoch(self, row_reset_us: Option<i64>) -> u64 {
+    fn pg_database_epoch(self, row_reset_us: Option<i64>, sample_ts_us: i64) -> u64 {
         epoch(&[
             self.postmaster_start_us.unwrap_or(i64::MIN).to_le_bytes(),
             row_reset_us
                 .or(self.database_reset_us)
-                .unwrap_or(i64::MIN)
+                .unwrap_or_else(|| {
+                    if self.postmaster_start_us.is_some() {
+                        i64::MIN
+                    } else {
+                        sample_ts_us
+                    }
+                })
                 .to_le_bytes(),
         ])
     }
 
-    fn os_epoch(self) -> u64 {
+    fn os_epoch(self, sample_ts_us: i64) -> u64 {
         epoch(&[
             self.boot_id.unwrap_or(0).to_le_bytes(),
-            self.boot_time_us.unwrap_or(i64::MIN).to_le_bytes(),
+            self.boot_time_us
+                .unwrap_or(sample_ts_us)
+                .to_le_bytes(),
         ])
     }
 
@@ -101,6 +109,46 @@ impl ResetContext {
     const fn has_os_context(self) -> bool {
         self.boot_id.is_some() && self.boot_time_us.is_some()
     }
+}
+
+#[derive(Debug, Default)]
+struct ResetTimeline {
+    pg: Vec<(i64, i64, Option<i64>)>,
+    os: Vec<(i64, u64, i64)>,
+}
+
+impl ResetTimeline {
+    fn context_at(&self, ts_us: i64) -> ResetContext {
+        let mut context = ResetContext::missing();
+        if let Some((_context_ts, postmaster_start_us, database_reset_us)) =
+            latest_at(&self.pg, ts_us, |point| point.0)
+        {
+            context.postmaster_start_us = Some(*postmaster_start_us);
+            context.database_reset_us = *database_reset_us;
+        }
+        if let Some((_context_ts, boot_id, boot_time_us)) =
+            latest_at(&self.os, ts_us, |point| point.0)
+        {
+            context.boot_id = Some(*boot_id);
+            context.boot_time_us = Some(*boot_time_us);
+        }
+        context
+    }
+
+    const fn has_pg_context(&self) -> bool {
+        !self.pg.is_empty()
+    }
+
+    const fn has_os_context(&self) -> bool {
+        !self.os.is_empty()
+    }
+}
+
+fn latest_at<T>(values: &[T], ts_us: i64, timestamp: impl Fn(&T) -> i64) -> Option<&T> {
+    values
+        .partition_point(|value| timestamp(value) <= ts_us)
+        .checked_sub(1)
+        .map(|index| &values[index])
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,6 +174,13 @@ struct MetricAccumulator {
 }
 
 impl MetricAccumulator {
+    fn register_factor(&mut self, factor: MetricFactor, source_type_id: u32) {
+        self.factor_sources
+            .entry(factor.id())
+            .or_default()
+            .insert(source_type_id);
+    }
+
     fn counter(
         &mut self,
         descriptor: MetricSeriesDescriptor,
@@ -206,18 +261,18 @@ impl MetricAccumulator {
         scope: SourceScopeId,
         entity_kind: EntityKind,
         ts_us: i64,
-        population_total: u32,
+        population_total: u64,
         postmaster_epoch: u64,
     ) -> Result<(), BuildError> {
-        let entity = derive_entity(
-            scope,
-            entity_kind,
-            &[
-                b"complete-snapshot".as_slice(),
-                source_type_id.to_le_bytes().as_slice(),
-            ]
-            .concat(),
-        );
+        let source_type = source_type_id.to_le_bytes();
+        let epoch = postmaster_epoch.to_le_bytes();
+        let identity = [
+            b"complete-snapshot".as_slice(),
+            source_type.as_slice(),
+            epoch.as_slice(),
+        ]
+        .concat();
+        let entity = derive_entity(scope, entity_kind, &identity);
         self.state(
             series(
                 factor,
@@ -226,11 +281,11 @@ impl MetricAccumulator {
                 MetricUnit::StateCode,
                 Some(entity),
                 None,
-                b"complete-snapshot",
+                &identity,
             ),
             ts_us,
-            population_total,
-            Some(postmaster_epoch),
+            0,
+            Some(population_total),
         )
     }
 }
@@ -266,25 +321,26 @@ pub(super) fn extract_metrics<R: ReadAt>(
         });
     }
 
-    let reset_context = reset_context(&decoded)?;
+    let reset_timeline = reset_timeline(&decoded)?;
     let snapshot_coverage = source_coverage(&decoded)?;
     let mut metrics = MetricAccumulator::default();
     for section in &decoded {
+        register_factor_inventory(&mut metrics, section.type_id);
         match section.type_id {
             type_id if PG_STAT_DATABASE_TYPES.contains(&type_id) => extract_pg_database(
                 &mut metrics,
                 section,
                 source_scope_id,
-                reset_context,
+                &reset_timeline,
             )?,
             OS_CGROUP_MEMORY => extract_cgroup_memory(
                 &mut metrics,
                 section,
                 source_scope_id,
-                reset_context,
+                &reset_timeline,
             )?,
             OS_VMSTAT => {
-                extract_vmstat(&mut metrics, section, source_scope_id, reset_context)?;
+                extract_vmstat(&mut metrics, section, source_scope_id, &reset_timeline)?;
             }
             REPLICATION_INSTANCE => {
                 extract_replication_instance(&mut metrics, section, source_scope_id)?;
@@ -316,11 +372,11 @@ pub(super) fn extract_metrics<R: ReadAt>(
         &mut metrics,
         &snapshot_coverage,
         source_scope_id,
-        reset_context,
+        &reset_timeline,
     )?;
     let event_facts = collector_event_facts(&snapshot_coverage, source_scope_id, bounds)?;
 
-    if !reset_context.has_pg_context() {
+    if !reset_timeline.has_pg_context() {
         for factor in [
             MetricFactor::PgDatabaseDeadlocks,
             MetricFactor::PgDatabaseRecoveryConflicts,
@@ -336,7 +392,7 @@ pub(super) fn extract_metrics<R: ReadAt>(
                 .insert(LossReason::MissingResetContext);
         }
     }
-    if !reset_context.has_os_context() {
+    if !reset_timeline.has_os_context() {
         for factor in [
             MetricFactor::OsCgroupMemoryHighEvents,
             MetricFactor::OsCgroupMemoryMaxEvents,
@@ -386,17 +442,82 @@ pub(super) fn extract_metrics<R: ReadAt>(
     })
 }
 
+fn register_factor_inventory(out: &mut MetricAccumulator, source_type_id: u32) {
+    let factors: &[MetricFactor] = if PG_STAT_DATABASE_TYPES.contains(&source_type_id) {
+        &[
+            MetricFactor::PgDatabaseDeadlocks,
+            MetricFactor::PgDatabaseRecoveryConflicts,
+            MetricFactor::PgDatabaseChecksumFailures,
+            MetricFactor::PgDatabaseSessionsAbandoned,
+            MetricFactor::PgDatabaseSessionsFatal,
+            MetricFactor::PgDatabaseSessionsKilled,
+            MetricFactor::PgDatabaseConnections,
+            MetricFactor::PgDatabaseConnectionLimit,
+            MetricFactor::PgDatabaseFrozenXidAge,
+            MetricFactor::PgDatabaseMinMxidAge,
+        ]
+    } else if source_type_id == RESET_METADATA {
+        &[
+            MetricFactor::PgStatisticsResetAt,
+            MetricFactor::PgPostmasterStartTime,
+        ]
+    } else if source_type_id == REPLICATION_INSTANCE {
+        &[
+            MetricFactor::PgRecoveryRole,
+            MetricFactor::PgTimeline,
+            MetricFactor::PgReplicationReplayLag,
+        ]
+    } else if source_type_id == PG_REPLICATION_PHYSICAL {
+        &[
+            MetricFactor::PgReplicationSenderState,
+            MetricFactor::PgReplicationSenderSnapshotPopulation,
+        ]
+    } else if PG_REPLICATION_SLOT_TYPES.contains(&source_type_id) {
+        &[
+            MetricFactor::PgReplicationSlotState,
+            MetricFactor::PgReplicationSlotSnapshotPopulation,
+        ]
+    } else if PG_STORAGE_MOUNT_TYPES.contains(&source_type_id) {
+        &[
+            MetricFactor::PgFilesystemTotalBytes,
+            MetricFactor::PgFilesystemAvailableBytes,
+        ]
+    } else if source_type_id == PG_PROCESS_CGROUP_MEMORY {
+        &[
+            MetricFactor::OsCgroupMemoryCurrentBytes,
+            MetricFactor::OsCgroupMemoryMaxBytes,
+        ]
+    } else if source_type_id == OS_CGROUP_MEMORY {
+        &[
+            MetricFactor::OsCgroupMemoryCurrentBytes,
+            MetricFactor::OsCgroupMemoryMaxBytes,
+            MetricFactor::OsCgroupMemoryHighEvents,
+            MetricFactor::OsCgroupMemoryMaxEvents,
+            MetricFactor::OsCgroupOomEvents,
+            MetricFactor::OsCgroupOomKills,
+        ]
+    } else if source_type_id == OS_VMSTAT {
+        &[MetricFactor::OsHostOomKills]
+    } else {
+        &[]
+    };
+    for factor in factors {
+        out.register_factor(*factor, source_type_id);
+    }
+}
+
 fn extract_pg_database(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
     scope: SourceScopeId,
-    reset: ResetContext,
+    reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         let ts = required_ts(row, "ts")?;
         let datid = required_u32(row, "datid")?;
         let entity = derive_entity(scope, EntityKind::Database, &datid.to_le_bytes());
-        let epoch = reset.pg_database_epoch(optional_ts(row, "stats_reset")?);
+        let context = reset.context_at(ts);
+        let epoch = context.pg_database_epoch(optional_ts(row, "stats_reset")?, ts);
         for (factor, field) in [
             (MetricFactor::PgDatabaseDeadlocks, "deadlocks"),
             (
@@ -417,6 +538,12 @@ fn extract_pg_database(
             let Some(value) = optional_i64(row, field)? else {
                 continue;
             };
+            if !context.has_pg_context() {
+                out.factor_losses
+                    .entry(factor.id())
+                    .or_default()
+                    .insert(LossReason::MissingResetContext);
+            }
             let descriptor = series(
                 factor,
                 scope,
@@ -474,10 +601,11 @@ fn extract_cgroup_memory(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
     scope: SourceScopeId,
-    reset: ResetContext,
+    reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         let ts = required_ts(row, "ts")?;
+        let context = reset.context_at(ts);
         let path = required_str_id(row, "cgroup_path")?;
         let source_scope = required_u32(row, "scope")?;
         let identity = [path.to_le_bytes().as_slice(), source_scope.to_le_bytes().as_slice()]
@@ -510,6 +638,12 @@ fn extract_cgroup_memory(
             (MetricFactor::OsCgroupOomKills, "oom_kill"),
         ] {
             let value = required_i64(row, field)?;
+            if !context.has_os_context() {
+                out.factor_losses
+                    .entry(factor.id())
+                    .or_default()
+                    .insert(LossReason::MissingResetContext);
+            }
             out.counter(
                 series(
                     factor,
@@ -522,7 +656,7 @@ fn extract_cgroup_memory(
                 ),
                 ts,
                 value,
-                reset.os_epoch(),
+                context.os_epoch(ts),
             )?;
         }
     }
@@ -533,12 +667,20 @@ fn extract_vmstat(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
     scope: SourceScopeId,
-    reset: ResetContext,
+    reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         let Some(value) = optional_i64(row, "oom_kill")? else {
             continue;
         };
+        let ts = required_ts(row, "ts")?;
+        let context = reset.context_at(ts);
+        if !context.has_os_context() {
+            out.factor_losses
+                .entry(MetricFactor::OsHostOomKills.id())
+                .or_default()
+                .insert(LossReason::MissingResetContext);
+        }
         let source_scope = required_u32(row, "scope")?;
         let identity = source_scope.to_le_bytes();
         let entity = derive_entity(scope, EntityKind::Host, &identity);
@@ -552,9 +694,9 @@ fn extract_vmstat(
                 Some(ResetFamily::HostBoot),
                 &identity,
             ),
-            required_ts(row, "ts")?,
+            ts,
             value,
-            reset.os_epoch(),
+            context.os_epoch(ts),
         )?;
     }
     Ok(())
@@ -772,26 +914,48 @@ fn extract_process_cgroup_memory(
     Ok(())
 }
 
-fn reset_context(sections: &[DecodedMetricSection]) -> Result<ResetContext, BuildError> {
-    let mut context = ResetContext::missing();
+fn reset_timeline(sections: &[DecodedMetricSection]) -> Result<ResetTimeline, BuildError> {
+    let mut pg = BTreeMap::new();
+    let mut os = BTreeMap::new();
     for section in sections {
         for row in &section.rows {
             match section.type_id {
                 RESET_METADATA => {
-                    context.postmaster_start_us =
-                        Some(required_ts(row, "postmaster_start_time")?);
-                    context.database_reset_us =
-                        optional_ts(row, "pg_stat_database_reset_max_at")?;
+                    let ts_us = required_ts(row, "ts")?;
+                    let point = (
+                        required_ts(row, "postmaster_start_time")?,
+                        optional_ts(row, "pg_stat_database_reset_max_at")?,
+                    );
+                    if pg.insert(ts_us, point).is_some_and(|previous| previous != point) {
+                        return Err(BuildError::Source(SourceError::Corrupt));
+                    }
                 }
                 INSTANCE_METADATA => {
-                    context.boot_id = Some(required_str_id(row, "boot_id")?);
-                    context.boot_time_us = Some(required_ts(row, "btime")?);
+                    let ts_us = required_ts(row, "ts")?;
+                    let point = (
+                        required_str_id(row, "boot_id")?,
+                        required_ts(row, "btime")?,
+                    );
+                    if os.insert(ts_us, point).is_some_and(|previous| previous != point) {
+                        return Err(BuildError::Source(SourceError::Corrupt));
+                    }
                 }
                 _ => {}
             }
         }
     }
-    Ok(context)
+    Ok(ResetTimeline {
+        pg: pg
+            .into_iter()
+            .map(|(ts_us, (postmaster_start_us, database_reset_us))| {
+                (ts_us, postmaster_start_us, database_reset_us)
+            })
+            .collect(),
+        os: os
+            .into_iter()
+            .map(|(ts_us, (boot_id, boot_time_us))| (ts_us, boot_id, boot_time_us))
+            .collect(),
+    })
 }
 
 fn extract_reset_metadata(
@@ -843,12 +1007,8 @@ fn extract_snapshot_boundaries(
     out: &mut MetricAccumulator,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
     scope: SourceScopeId,
-    reset: ResetContext,
+    reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
-    let postmaster_epoch = reset
-        .postmaster_start_us
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(0);
     let mut seen = BTreeSet::new();
     for (source_type, records) in coverage {
         let (factor, entity_kind) = if *source_type == PG_REPLICATION_PHYSICAL {
@@ -865,6 +1025,13 @@ fn extract_snapshot_boundaries(
             continue;
         };
         for record in records.iter().filter(|record| complete_snapshot(record)) {
+            let Some(postmaster_epoch) = reset
+                .context_at(record.ts_us)
+                .postmaster_start_us
+                .and_then(|value| u64::try_from(value).ok())
+            else {
+                continue;
+            };
             if !seen.insert((*source_type, record.ts_us)) {
                 continue;
             }
@@ -874,7 +1041,7 @@ fn extract_snapshot_boundaries(
                 scope,
                 entity_kind,
                 record.ts_us,
-                u32::try_from(record.source_total).map_err(|_error| BuildError::Overflow)?,
+                record.source_total,
                 postmaster_epoch,
             )?;
         }
@@ -1059,11 +1226,12 @@ fn factor_coverage(
             .get(&factor_id)
             .cloned()
             .unwrap_or_default();
-        let records = sources
+        let mut records = sources
             .iter()
             .flat_map(|source| snapshot.get(source).into_iter().flatten())
             .copied()
             .collect::<Vec<_>>();
+        records.sort_unstable_by_key(|record| record.ts_us);
         for record in &records {
             match record.read_state {
                 0 => {}
@@ -1083,16 +1251,16 @@ fn factor_coverage(
             if record.visibility != 0 {
                 losses.insert(LossReason::VisibilityRestricted);
             }
+            if record.collected < record.source_total {
+                losses.insert(LossReason::SnapshotSourceLimit);
+            }
         }
-        let source_complete = !records.is_empty()
-            && records
-                .iter()
-                .all(|record| {
-                    record.read_state == 0
-                        && record.visibility == 0
-                        && record.total_exact
-                        && record.collected == record.source_total
-                });
+        let source_complete = !sources.is_empty()
+            && sources.iter().all(|source| {
+                snapshot
+                    .get(source)
+                    .is_some_and(|records| !records.is_empty() && records.iter().all(complete_snapshot))
+            });
         let times = metrics
             .factor_times
             .get(&factor_id)
@@ -1101,25 +1269,50 @@ fn factor_coverage(
         let cadence = observed_cadence(&times);
         let present_samples =
             u64::try_from(times.len()).map_err(|_error| BuildError::Overflow)?;
-        let covered_duration = present_samples.min(interval.duration_us());
-        let state = if present_samples == 0 {
-            CoverageState::NotCollected
-        } else if source_complete && covered_duration == interval.duration_us() {
-            CoverageState::Complete
-        } else if covered_duration < interval.duration_us() {
-            CoverageState::Partial
-        } else {
-            CoverageState::Gap
-        };
-        let population = records.last().map(|record| SourcePopulation {
-            collected: record.collected,
-            total: Some(record.source_total),
-            total_quality: if record.total_exact {
-                PopulationTotalQuality::Exact
-            } else {
-                PopulationTotalQuality::LowerBound
-            },
+        let covered_duration = cadence.map_or(0, |(period, _cadence_id)| {
+            cadence_covered_duration(&times, interval, period)
         });
+        let state = if present_samples == 0 {
+            if losses.is_empty() {
+                CoverageState::NotCollected
+            } else {
+                CoverageState::Gap
+            }
+        } else if cadence.is_none() {
+            if losses.is_empty() {
+                CoverageState::Unknown
+            } else {
+                CoverageState::Gap
+            }
+        } else if covered_duration == interval.duration_us() {
+            CoverageState::Complete
+        } else if covered_duration == 0 {
+            if losses.is_empty() {
+                CoverageState::Unknown
+            } else {
+                CoverageState::Gap
+            }
+        } else {
+            CoverageState::Partial
+        };
+        let population = (sources.len() == 1)
+            .then(|| {
+                records.last().map(|record| SourcePopulation {
+                    collected: record.collected,
+                    total: Some(record.source_total),
+                    total_quality: if record.total_exact {
+                        PopulationTotalQuality::Exact
+                    } else {
+                        PopulationTotalQuality::LowerBound
+                    },
+                })
+            })
+            .flatten();
+        let lost_count_lower_bound = records
+            .iter()
+            .map(|record| record.source_total.saturating_sub(record.collected))
+            .max()
+            .filter(|lost| *lost != 0);
         let retained_exact = losses.is_empty();
         result.push(FactorCoverage {
             factor_id,
@@ -1136,7 +1329,7 @@ fn factor_coverage(
             covered_duration_us: covered_duration,
             source_population: population,
             loss_reasons: losses.into_iter().collect(),
-            lost_count_lower_bound: None,
+            lost_count_lower_bound,
             retained_exactness: if retained_exact {
                 RetainedExactness::Exact
             } else {
@@ -1154,6 +1347,27 @@ fn factor_coverage(
         });
     }
     Ok(result)
+}
+
+fn cadence_covered_duration(times: &[i64], interval: CoverageSpan, period_us: u64) -> u64 {
+    let period = i64::try_from(period_us).unwrap_or(i64::MAX);
+    let mut times = times.to_vec();
+    times.sort_unstable();
+    times.dedup();
+    let mut covered = 0_u64;
+    let mut covered_through = interval.start_us();
+    for ts_us in times {
+        let start = ts_us.max(interval.start_us()).max(covered_through);
+        let end = ts_us.saturating_add(period).min(interval.end_us());
+        if end <= start {
+            continue;
+        }
+        covered = covered.saturating_add(
+            u64::try_from(end - start).expect("positive timestamp duration fits u64"),
+        );
+        covered_through = covered_through.max(end);
+    }
+    covered.min(interval.duration_us())
 }
 
 const fn unsupported_coverage(factor_id: FactorId, interval: CoverageSpan) -> FactorCoverage {
@@ -1389,6 +1603,36 @@ fn optional_f64(row: &Row, field: &str) -> Result<Option<f64>, BuildError> {
 mod tests {
     use super::*;
 
+    fn coverage_for(
+        factor: MetricFactor,
+        sources: &[u32],
+        times: &[i64],
+        snapshot: BTreeMap<u32, Vec<CoverageRecord>>,
+        interval: CoverageSpan,
+    ) -> FactorCoverage {
+        let mut metrics = MetricAccumulator::default();
+        metrics
+            .factor_sources
+            .insert(factor.id(), sources.iter().copied().collect());
+        metrics.factor_times.insert(factor.id(), times.to_vec());
+        factor_coverage(&metrics, &snapshot, interval, &super::super::limits::LIMIT)
+            .expect("coverage")
+            .into_iter()
+            .find(|coverage| coverage.factor_id == factor.id())
+            .expect("requested factor")
+    }
+
+    const fn complete_record(ts_us: i64, population: u64) -> CoverageRecord {
+        CoverageRecord {
+            ts_us,
+            read_state: 0,
+            visibility: 0,
+            source_total: population,
+            collected: population,
+            total_exact: true,
+        }
+    }
+
     #[test]
     fn stable_cadence_requires_equal_positive_intervals() {
         assert_eq!(observed_cadence(&[10]), None);
@@ -1422,5 +1666,119 @@ mod tests {
         assert_eq!(coverage.applicability, Applicability::Unsupported);
         assert_eq!(coverage.state, CoverageState::NotCollected);
         assert_eq!(coverage.present_samples, 0);
+    }
+
+    #[test]
+    fn one_snapshot_is_unknown_without_inventing_a_historical_period() {
+        let interval = CoverageSpan::new(10, 21).expect("interval");
+        let coverage = coverage_for(
+            MetricFactor::PgDatabaseDeadlocks,
+            &[PG_STAT_DATABASE_TYPES[0]],
+            &[10],
+            BTreeMap::from([(
+                PG_STAT_DATABASE_TYPES[0],
+                vec![complete_record(10, 1)],
+            )]),
+            interval,
+        );
+
+        assert_eq!(coverage.state, CoverageState::Unknown);
+        assert_eq!(coverage.expected_period_us, None);
+        assert_eq!(coverage.period_quality, PeriodQuality::Unknown);
+        assert_eq!(coverage.present_samples, 1);
+        assert_eq!(coverage.covered_duration_us, 0);
+        assert_eq!(coverage.source_completeness, SourceCompleteness::Full);
+    }
+
+    #[test]
+    fn stable_samples_cover_time_independently_from_population_completeness() {
+        let source = PG_STAT_DATABASE_TYPES[0];
+        let interval = CoverageSpan::new(10, 21).expect("interval");
+        let coverage = coverage_for(
+            MetricFactor::PgDatabaseDeadlocks,
+            &[source],
+            &[10, 20],
+            BTreeMap::from([(
+                source,
+                vec![complete_record(10, 1), complete_record(20, 1)],
+            )]),
+            interval,
+        );
+
+        assert_eq!(coverage.state, CoverageState::Complete);
+        assert_eq!(coverage.expected_period_us, Some(10));
+        assert_eq!(coverage.period_quality, PeriodQuality::ObservedStable);
+        assert_eq!(coverage.present_samples, 2);
+        assert_eq!(coverage.covered_duration_us, interval.duration_us());
+        assert_eq!(coverage.source_completeness, SourceCompleteness::Full);
+        assert_eq!(
+            coverage.source_population,
+            Some(SourcePopulation {
+                collected: 1,
+                total: Some(1),
+                total_quality: PopulationTotalQuality::Exact,
+            })
+        );
+    }
+
+    #[test]
+    fn every_contributing_source_must_prove_its_population() {
+        let first = PG_PROCESS_CGROUP_MEMORY;
+        let second = OS_CGROUP_MEMORY;
+        let interval = CoverageSpan::new(10, 21).expect("interval");
+        let coverage = coverage_for(
+            MetricFactor::OsCgroupMemoryCurrentBytes,
+            &[first, second],
+            &[10, 20],
+            BTreeMap::from([(first, vec![complete_record(10, 1)])]),
+            interval,
+        );
+
+        assert_eq!(coverage.state, CoverageState::Complete);
+        assert_eq!(
+            coverage.source_completeness,
+            SourceCompleteness::BoundedSubset
+        );
+        assert_eq!(
+            coverage.source_population, None,
+            "populations from unlike source families must not be added together"
+        );
+    }
+
+    #[test]
+    fn missing_population_members_have_a_nonzero_proven_loss_bound() {
+        let source = PG_STAT_DATABASE_TYPES[0];
+        let interval = CoverageSpan::new(10, 21).expect("interval");
+        let coverage = coverage_for(
+            MetricFactor::PgDatabaseDeadlocks,
+            &[source],
+            &[10, 20],
+            BTreeMap::from([(
+                source,
+                vec![
+                    CoverageRecord {
+                        collected: 2,
+                        source_total: 5,
+                        ..complete_record(10, 5)
+                    },
+                    CoverageRecord {
+                        collected: 4,
+                        source_total: 5,
+                        ..complete_record(20, 5)
+                    },
+                ],
+            )]),
+            interval,
+        );
+
+        assert_eq!(coverage.lost_count_lower_bound, Some(3));
+        assert_eq!(
+            coverage.loss_reasons,
+            vec![LossReason::SnapshotSourceLimit]
+        );
+        assert_eq!(
+            coverage.source_completeness,
+            SourceCompleteness::BoundedSubset
+        );
     }
 }

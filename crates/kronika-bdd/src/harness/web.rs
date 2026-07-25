@@ -251,6 +251,7 @@ pub(crate) async fn assert_timeline_pg_log_contract(
     assert_same_publication(&overview, &events, &health)?;
     assert_digest_reconciles(&overview)?;
     assert_shared_event_facts(&overview, &events, source)?;
+    assert_metric_factor_coverage(&overview, &events, &health)?;
     assert_parsed_panic_and_child_termination_do_not_set_health_floor(&health)?;
     Ok(())
 }
@@ -298,6 +299,11 @@ fn assert_source_meta(label: &str, body: &Value, source: u64) -> Result<()> {
     let meta = body["meta"]
         .as_object()
         .with_context(|| format!("{label} `meta` is not an object"))?;
+    anyhow::ensure!(
+        meta.get("response_schema_version") == Some(&Value::from(2)),
+        "{label} used the wrong response schema: {}",
+        body["meta"]
+    );
     anyhow::ensure!(
         meta.get("sources") == Some(&serde_json::json!([source])),
         "{label} did not retain the selected source: {}",
@@ -475,6 +481,7 @@ fn assert_shared_event_facts(overview: &Value, events: &Value, source: u64) -> R
     anyhow::ensure!(overview["notable_preview"]["omitted_count"] == 0);
     anyhow::ensure!(events["next_cursor"].is_null());
     anyhow::ensure!(events["omitted_by_response_filter"] == 0);
+    anyhow::ensure!(events["notable_policy_version"] == 2);
     anyhow::ensure!(events["retained_exactness"] == "exact");
     anyhow::ensure!(events["source_completeness"] == "bounded_subset");
     anyhow::ensure!(events["physical_count_semantics"] == "lower_bound");
@@ -513,11 +520,13 @@ fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
         "identity_quality",
         "sort_ts_us",
         "occurred_at_us",
+        "observed_interval",
         "occurrence_count",
         "event_kind",
         "notable_class",
         "evidence_quality",
         "quality_flags",
+        "entity",
         "payload",
         "supporting_evidence",
         "loss",
@@ -544,6 +553,10 @@ fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
     anyhow::ensure!(fact["identity_quality"] == "content_derived");
     anyhow::ensure!(fact["sort_ts_us"].is_i64());
     anyhow::ensure!(fact["occurred_at_us"].is_i64() || fact["occurred_at_us"].is_null());
+    anyhow::ensure!(
+        fact["observed_interval"].is_object() || fact["observed_interval"].is_null()
+    );
+    anyhow::ensure!(fact["entity"].is_null());
     anyhow::ensure!(
         fact["occurrence_count"]
             .as_u64()
@@ -611,6 +624,103 @@ fn assert_supporting_evidence(fact: &Value) -> Result<()> {
             .as_str()
             .is_some_and(|value| !value.is_empty())
     );
+    Ok(())
+}
+
+fn assert_metric_factor_coverage(
+    overview: &Value,
+    events: &Value,
+    health: &Value,
+) -> Result<()> {
+    anyhow::ensure!(
+        overview["coverage"] == events["coverage"] && events["coverage"] == health["coverage"],
+        "timeline endpoints projected different factor coverage"
+    );
+    let coverage = events["coverage"]
+        .as_array()
+        .context("events factor coverage is not an array")?;
+    let deadlocks = coverage
+        .iter()
+        .find(|entry| entry["factor_id"] == 100)
+        .context("pg_stat_database deadlock coverage is absent")?;
+    let connections = coverage
+        .iter()
+        .find(|entry| entry["factor_id"] == 110)
+        .context("pg_stat_database connection coverage is absent")?;
+    for (label, entry) in [("deadlocks", deadlocks), ("connections", connections)] {
+        assert_factor_coverage_shape(label, entry)?;
+        anyhow::ensure!(entry["applicability"] == "applicable");
+        anyhow::ensure!(
+            entry["present_samples"]
+                .as_u64()
+                .is_some_and(|samples| samples > 0),
+            "{label} did not retain a collected metric sample: {entry}"
+        );
+        anyhow::ensure!(
+            entry["state"] == "unknown",
+            "one snapshot invented historical cadence for {label}: {entry}"
+        );
+        anyhow::ensure!(entry["expected_period_us"].is_null());
+        anyhow::ensure!(entry["period_quality"] == "unknown");
+        anyhow::ensure!(entry["cadence_epoch_id"].is_null());
+        anyhow::ensure!(entry["covered_duration_us"] == 0);
+        anyhow::ensure!(entry["loss_reasons"].as_array().is_some_and(Vec::is_empty));
+        anyhow::ensure!(entry["retained_exactness"] == "retained_exact");
+    }
+
+    let unsupported = coverage
+        .iter()
+        .find(|entry| entry["factor_id"] == 900)
+        .context("explicit CPU-pressure unsupported coverage is absent")?;
+    assert_factor_coverage_shape("unsupported CPU pressure", unsupported)?;
+    anyhow::ensure!(unsupported["applicability"] == "unsupported");
+    anyhow::ensure!(unsupported["state"] == "not_collected");
+    anyhow::ensure!(unsupported["present_samples"] == 0);
+    anyhow::ensure!(unsupported["covered_duration_us"] == 0);
+    anyhow::ensure!(unsupported["source_population"].is_null());
+    Ok(())
+}
+
+fn assert_factor_coverage_shape(label: &str, entry: &Value) -> Result<()> {
+    let expected_fields = BTreeSet::from([
+        "factor_id",
+        "applicability",
+        "state",
+        "interval",
+        "expected_period_us",
+        "period_quality",
+        "cadence_epoch_id",
+        "crosses_cadence_boundary",
+        "present_samples",
+        "covered_duration_us",
+        "source_population",
+        "loss_reasons",
+        "lost_count_lower_bound",
+        "retained_exactness",
+        "source_completeness",
+        "physical_count_semantics",
+        "boundary_quality",
+    ]);
+    let fields = entry
+        .as_object()
+        .with_context(|| format!("{label} coverage is not an object"))?
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        fields == expected_fields,
+        "{label} factor coverage fields changed: {fields:?}"
+    );
+    anyhow::ensure!(entry["interval"]["from_us"].is_i64());
+    anyhow::ensure!(entry["interval"]["to_us"].is_i64());
+    anyhow::ensure!(entry["crosses_cadence_boundary"].is_boolean());
+    anyhow::ensure!(entry["loss_reasons"].is_array());
+    anyhow::ensure!(
+        entry["lost_count_lower_bound"].is_null() || entry["lost_count_lower_bound"].is_u64()
+    );
+    anyhow::ensure!(entry["source_completeness"].is_string());
+    anyhow::ensure!(entry["physical_count_semantics"].is_string());
+    anyhow::ensure!(entry["boundary_quality"].is_string());
     Ok(())
 }
 

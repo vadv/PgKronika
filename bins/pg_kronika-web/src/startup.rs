@@ -1038,6 +1038,27 @@ mod tests {
                 },
             ),
             (
+                DECODED_CACHE_BYTES_ENV,
+                OverviewConfigRaw {
+                    decoded_cache_bytes: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                DECODED_CACHE_ENTRIES_ENV,
+                OverviewConfigRaw {
+                    decoded_cache_entries: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                SOURCE_SCRUB_INTERVAL_ENV,
+                OverviewConfigRaw {
+                    source_scrub_interval_secs: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
                 CURSOR_MAX_VIEWS_ENV,
                 OverviewConfigRaw {
                     cursor_max_views: Some("0"),
@@ -1055,6 +1076,90 @@ mod tests {
                 CURSOR_TTL_ENV,
                 OverviewConfigRaw {
                     cursor_ttl_secs: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_MAX_WORKERS_ENV,
+                OverviewConfigRaw {
+                    cold_max_workers: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_MAX_QUEUE_ENV,
+                OverviewConfigRaw {
+                    cold_max_queue: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_PER_REQUEST_PARALLELISM_ENV,
+                OverviewConfigRaw {
+                    cold_per_request_parallelism: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_WAIT_TIMEOUT_MS_ENV,
+                OverviewConfigRaw {
+                    cold_wait_timeout_ms: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_RETRY_AFTER_ENV,
+                OverviewConfigRaw {
+                    cold_retry_after_secs: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_PGM_BYTES_ENV,
+                OverviewConfigRaw {
+                    cold_pgm_bytes: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_DECODED_BYTES_ENV,
+                OverviewConfigRaw {
+                    cold_decoded_bytes: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_CPU_ROWS_ENV,
+                OverviewConfigRaw {
+                    cold_cpu_rows: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_FILE_DESCRIPTORS_ENV,
+                OverviewConfigRaw {
+                    cold_file_descriptors: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_READ_BYTES_ENV,
+                OverviewConfigRaw {
+                    cold_read_bytes: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_WRITE_BYTES_ENV,
+                OverviewConfigRaw {
+                    cold_write_bytes: Some("0"),
+                    ..valid_overview_raw()
+                },
+            ),
+            (
+                COLD_PUBLICATIONS_ENV,
+                OverviewConfigRaw {
+                    cold_publications: Some("0"),
                     ..valid_overview_raw()
                 },
             ),
@@ -1126,6 +1231,16 @@ mod tests {
                 .expect_err("empty overview identity input must fail");
             assert!(error.contains(name), "wrong error for {name}: {error}");
         }
+    }
+
+    #[test]
+    fn overview_raw_requires_an_explicit_namespace() {
+        let error = parse_overview_config(
+            OverviewConfigRaw::default(),
+            PathBuf::from("/cache"),
+        )
+        .expect_err("implicit deployment identity must not be accepted");
+        assert_eq!(error, format!("{OVERVIEW_NAMESPACE_ENV} is not set"));
     }
 
     #[test]

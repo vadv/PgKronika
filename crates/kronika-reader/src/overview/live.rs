@@ -857,6 +857,8 @@ pub enum SealOutcome {
         facts: Arc<SegmentFacts>,
         /// Best-effort durable publication failure.
         persist_error: Option<PersistError>,
+        /// Canonical fact bytes committed by the promotion.
+        fact_write_bytes: u64,
     },
     /// The candidate was lossy, absent, or its provenance did not match, so the
     /// facts were rebuilt from the PGM.
@@ -887,6 +889,17 @@ impl SealOutcome {
             Self::Rebuilt(load) => load.persist_error(),
         }
     }
+
+    /// Canonical fact bytes committed by reconciliation.
+    #[must_use]
+    pub const fn fact_write_bytes(&self) -> u64 {
+        match self {
+            Self::Promoted {
+                fact_write_bytes, ..
+            } => *fact_write_bytes,
+            Self::Rebuilt(load) => load.fact_write_bytes(),
+        }
+    }
 }
 
 /// Reconciles a newly sealed segment against the current live view.
@@ -912,10 +925,12 @@ pub fn reconcile_seal<R: ReadAt>(
         && let Some(promoted) =
             SegmentFacts::try_promote_from_parts(sealed_unit, sealed_context, &parts, bounds)?
     {
-        let (facts, persist_error) = store.admit_publish_or_fallback(&promoted, bounds)?;
+        let (facts, persist_error, fact_write_bytes) =
+            store.admit_publish_or_fallback(&promoted, bounds)?;
         return Ok(SealOutcome::Promoted {
             facts,
             persist_error,
+            fact_write_bytes,
         });
     }
     let load = store.load_or_build(sealed_unit, sealed_context, bounds)?;
