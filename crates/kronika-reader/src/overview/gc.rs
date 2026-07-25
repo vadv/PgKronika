@@ -31,7 +31,7 @@ const MAX_GC_ENTRIES: usize = 1_000_000;
 pub enum GcConfigError {
     /// The scan bound is zero or above the compiled hard maximum.
     EntryLimit,
-    /// Fewer than two distinct view generations cannot establish grace.
+    /// Fewer than two distinct authoritative GC generations cannot establish grace.
     GenerationGrace,
     /// A configured hard quota is zero.
     Quota,
@@ -41,7 +41,9 @@ impl std::fmt::Display for GcConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::EntryLimit => "GC entry limit is outside the supported range",
-            Self::GenerationGrace => "GC grace must cover at least two distinct view generations",
+            Self::GenerationGrace => {
+                "GC grace must cover at least two distinct authoritative scan generations"
+            }
             Self::Quota => "GC quotas must be greater than zero",
         })
     }
@@ -49,7 +51,7 @@ impl std::fmt::Display for GcConfigError {
 
 impl std::error::Error for GcConfigError {}
 
-/// Bounded retention and optional hard-quota policy for one cache root.
+/// Bounded retention and optional logical-byte/file policy for one cache root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcConfig {
     max_entries: usize,
@@ -176,7 +178,7 @@ impl GcMark {
         }
     }
 
-    /// Source-view generation represented by this mark.
+    /// Source-view generation observed by this GC scan.
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
@@ -300,10 +302,12 @@ pub struct GcOutcome {
     pub deleted_finals: u64,
     /// Recognized stale temp or quarantine files unlinked.
     pub deleted_artifacts: u64,
-    /// Logical bytes measured from an opened inode immediately before unlink.
-    pub freed_bytes: u64,
-    /// Allocated bytes measured from that same inode.
-    pub freed_allocated_bytes: u64,
+    /// Logical bytes measured from opened inodes that were then unlinked.
+    pub unlinked_logical_bytes: u64,
+    /// Allocated bytes measured from those same unlinked inodes.
+    ///
+    /// Open descriptors or hard links may keep the physical blocks allocated.
+    pub unlinked_allocated_bytes: u64,
     /// Whether the entire namespace inventory completed.
     pub scan_complete: bool,
     /// Whether an authoritative mark permitted destructive work.
@@ -321,8 +325,6 @@ pub(super) struct GcState {
     pending: HashMap<FactBuildKey, PendingEntry>,
     recently_published: HashMap<FactBuildKey, SystemTime>,
     last_authoritative_mark: Option<GcMark>,
-    usage: Option<GcUsage>,
-    quota_exceeded: bool,
 }
 
 impl GcState {
@@ -331,25 +333,8 @@ impl GcState {
         self.recently_published.insert(key, now);
     }
 
-    #[allow(
-        dead_code,
-        reason = "consumed by the typed one-GC recovery path in the next logical slice"
-    )]
     pub(super) fn last_authoritative_mark(&self) -> Option<GcMark> {
         self.last_authoritative_mark.clone()
-    }
-
-    #[allow(
-        dead_code,
-        reason = "consumed by the typed one-GC recovery path in the next logical slice"
-    )]
-    pub(super) const fn quota_exceeded(&self) -> bool {
-        self.quota_exceeded
-    }
-
-    pub(super) fn update_usage(&mut self, usage: GcUsage, config: GcConfig) {
-        self.quota_exceeded = exceeds_quota(usage, config, 0, 0);
-        self.usage = Some(usage);
     }
 }
 
@@ -502,9 +487,10 @@ pub(super) fn collect(
             Ok(Some((logical_bytes, allocated_bytes))) => {
                 outcome.deleted = outcome.deleted.saturating_add(1);
                 outcome.deleted_finals = outcome.deleted_finals.saturating_add(1);
-                outcome.freed_bytes = outcome.freed_bytes.saturating_add(logical_bytes);
-                outcome.freed_allocated_bytes = outcome
-                    .freed_allocated_bytes
+                outcome.unlinked_logical_bytes =
+                    outcome.unlinked_logical_bytes.saturating_add(logical_bytes);
+                outcome.unlinked_allocated_bytes = outcome
+                    .unlinked_allocated_bytes
                     .saturating_add(allocated_bytes);
                 outcome
                     .usage
@@ -519,7 +505,6 @@ pub(super) fn collect(
     }
 
     outcome.quota_exceeded = exceeds_quota(outcome.usage, config, 0, 0);
-    state.update_usage(outcome.usage, config);
     outcome
 }
 
@@ -528,7 +513,7 @@ pub(super) fn admit_publication(
     namespace: &File,
     config: GcConfig,
     incoming_logical_bytes: u64,
-) -> Result<GcUsage, GcAdmissionError> {
+) -> Result<(), GcAdmissionError> {
     let inventory =
         scan_namespace(namespace, config.max_entries).map_err(|(error, _scanned)| match error {
             ScanError::Capped => GcAdmissionError::Capped,
@@ -537,7 +522,7 @@ pub(super) fn admit_publication(
     if exceeds_quota(inventory.usage, config, incoming_logical_bytes, 1) {
         Err(GcAdmissionError::Capped)
     } else {
-        Ok(inventory.usage)
+        Ok(())
     }
 }
 
@@ -799,9 +784,10 @@ fn delete_stale_artifacts(
         let allocated_bytes = metadata.blocks().saturating_mul(512);
         outcome.deleted = outcome.deleted.saturating_add(1);
         outcome.deleted_artifacts = outcome.deleted_artifacts.saturating_add(1);
-        outcome.freed_bytes = outcome.freed_bytes.saturating_add(logical_bytes);
-        outcome.freed_allocated_bytes = outcome
-            .freed_allocated_bytes
+        outcome.unlinked_logical_bytes =
+            outcome.unlinked_logical_bytes.saturating_add(logical_bytes);
+        outcome.unlinked_allocated_bytes = outcome
+            .unlinked_allocated_bytes
             .saturating_add(allocated_bytes);
         match artifact.kind {
             ArtifactKind::Temporary => outcome

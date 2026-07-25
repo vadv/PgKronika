@@ -92,9 +92,8 @@ impl OverviewDiagnostics {
 
 /// Refresh passes between fact-cache garbage collections.
 ///
-/// This is a scan cadence, not retention grace. Deletion still requires two
-/// distinct authoritative source-view generations and the configured wall
-/// grace.
+/// This is a scan interval, not retention grace. Deletion requires absence in
+/// the configured number of distinct authoritative GC scans plus wall grace.
 const GC_INTERVAL_PASSES: u64 = 60;
 
 /// The only mutable owner of sealed facts and live fold state.
@@ -558,8 +557,8 @@ mod tests {
         );
 
         // The segment disappears from the source; the view drops it but the
-        // fact file lingers until two distinct successful source-view
-        // generations have both marked it absent.
+        // fact file lingers until two GC scans carrying different successful
+        // source-view generations have both marked it absent.
         std::fs::remove_file(dir.path().join("143000.pgm")).expect("drop segment");
         let drop_delta = snapshot.refresh_incremental_delta().expect("drop delta");
         index
@@ -573,7 +572,7 @@ mod tests {
         assert_eq!(
             first_absence.expect("first absence scan").deleted,
             0,
-            "one successful generation cannot delete"
+            "one authoritative absence scan cannot delete"
         );
         write_segment(dir.path(), "143001.pgm", 3_000, 4_000);
         let next_delta = snapshot

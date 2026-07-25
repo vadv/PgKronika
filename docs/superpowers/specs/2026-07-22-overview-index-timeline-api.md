@@ -1216,7 +1216,7 @@ Backoff v1: initial 1 s, multiplier 2, cap 5 min, jitter ±20%; для permissio
 
 Cache persistence state виден в metrics/admin diagnostics. Он не попадает в source coverage и не делает корректный timeline partial.
 
-Полная state machine с retry/backoff, one-GC retry и background probe — target M5. Текущая реализация уже возвращает корректно admitted facts через bounded L1f при recoverable publication failure, но это не считается реализацией backoff/mode/quota contract.
+Текущий implementation snapshot реализует эту write state machine для всех API `FactStore`: один due reservation, cancellation cleanup, один bounded GC retry и background probe из web refresh. Durable reads не проверяют write backoff. Это закрывает только persistence-recovery slice M5; fact-build single-flight и weighted admission остаются отдельными обязательными требованиями.
 
 ### 13.5 Quota
 
@@ -1225,6 +1225,8 @@ Cache persistence state виден в metrics/admin diagnostics. Он не по�
 - Временное превышение ограничено одним bounded in-flight file на writer slot.
 - Eviction никогда не удаляет in-use `Arc`; file unlink безопасен только после исключения из lookup и с учётом platform semantics.
 - При невозможности освободить quota system остаётся memory-only, а не обрезает facts.
+
+Текущий implementation snapshot поддерживает необязательные пределы суммы логических `st_size` и числа учтённых файлов. Они выключены по умолчанию. Admission требует полного bounded scan и при неопределённости ничего не удаляет. Эта реализация не называется physical-filesystem quota и не закрывает dense working-set qualification.
 
 ## 14. Конкурентность, single-flight и admission
 
@@ -1494,7 +1496,7 @@ Formula/notable/HTTP semantics в reader codec не живут.
 
 Внутреннее разбиение: `live`, `view`, `admission`, `memory_cache`, `response_cache`, `cursor`, `handlers`. Новый crate для v1 не нужен: disk index имеет одного reader consumer, а чистая алгебра уже помещается в analytics.
 
-Текущий M4 уже имеет atomic publication пары snapshot/timeline, handlers, pinned cursors, byte-bounded response cache, `ResponseKey` flight и fail-fast heavy-analysis limit. Fact-build flight, weighted cold admission, persistent backoff, quota/GC и source scrub из списка выше остаются target M5.
+Текущий implementation snapshot сохраняет M4 atomic publication пары snapshot/timeline, handlers, pinned cursors, byte-bounded response cache, `ResponseKey` flight и fail-fast heavy-analysis limit. После M4 добавлены точный `FactBuildKey`, durable-first dual-budget fallback, один root owner, необязательные logical-byte/file ceilings, fail-closed GC и typed persistence backoff/probe. Fact-build flight, weighted cold admission и source scrub остаются обязательными M5 slices.
 
 ### 16.4 Typed error model
 
@@ -1782,8 +1784,8 @@ Structured logs включают request ID, source scope, `FactKey` и lineage 
 | 13 | Counter rates используют actual adjacent interval, reset families и gaps; storage boundary не меняет результат | Частично: algebra существует в analytics, production `COUNTER_SAMPLES`/`RESET_MARKERS` пусты |
 | 14 | Каждая target taxonomy/factor family имеет проверяемый source→retained row→fact/sample/state→identity/units/reset→coverage/loss mapping и представлена fact/factor либо explicit gap | Частично: §7.6 подтверждает восемь log layouts; остальные mappings остаются explicit gaps |
 | 15 | Cache hits обходят cold admission; identical `FactBuildKey` misses single-flight, disjoint misses globally bounded | Открыто для fact builds; текущий M4 объединяет только identical `ResponseKey` |
-| 16 | Memory-only fallback ограничен bytes и segment-hours; retry/backoff наблюдаемы, dense-hour sizing проверено | Частично: dual-budget LRU есть; persistence modes/backoff и dense-hour qualification открыты |
-| 17 | Quota/GC учитывает все derived bytes, безопасен при concurrent readers и никогда не удаляет source | Открыто |
+| 16 | Memory-only fallback ограничен bytes и segment-hours; retry/backoff наблюдаемы, dense-hour sizing проверено | Частично: dual-budget LRU и typed observable backoff/probe реализованы; dense-hour qualification открыта |
+| 17 | Quota/GC учитывает все derived bytes, безопасен при concurrent readers и никогда не удаляет source | Частично: есть optional logical-byte/file ceilings и fail-closed exact-namespace GC с owner/lock/inode checks; physical/dense accounting и итоговая qualification открыты |
 | 18 | Benchmark modes и gates §18 воспроизводимо проходят на зафиксированном host/filesystem profile | Открыто; текущие точечные measurements не являются M6 dossier |
 
 ### 20.2 Доказательство приёмки
@@ -1831,6 +1833,8 @@ M5 делится на независимо проверяемые обязат�
 6. Все metrics §19, dense working-set accounting и typed overload/persistence diagnostics.
 
 Во всех slices сохраняются durable-first order, dual-budget fallback, atomic fact publication и atomic view publication.
+
+Текущий implementation snapshot покрывает persistence-recovery slice 3 и ограниченную logical-quota/fail-closed-GC часть slice 4. Это не закрывает всю строку §20.1 без exact-head qualification. Slices 1 (`FactBuildKey` single-flight) и 2 (weighted/fair admission) остаются `OPEN` и не отменяются текущей сериализацией web refresh. Source scrub и оставшаяся metrics/dense qualification также открыты.
 
 ### 21.4 M6. Parity qualification
 

@@ -324,10 +324,10 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
         .increment(outcome.deleted_finals);
     metrics::counter!("kronika_web_overview_gc_deleted_artifacts_total")
         .increment(outcome.deleted_artifacts);
-    metrics::counter!("kronika_web_overview_gc_freed_logical_bytes_total")
-        .increment(outcome.freed_bytes);
-    metrics::counter!("kronika_web_overview_gc_freed_allocated_bytes_total")
-        .increment(outcome.freed_allocated_bytes);
+    metrics::counter!("kronika_web_overview_gc_unlinked_logical_bytes_total")
+        .increment(outcome.unlinked_logical_bytes);
+    metrics::counter!("kronika_web_overview_gc_unlinked_allocated_bytes_total")
+        .increment(outcome.unlinked_allocated_bytes);
     if let Some(reason) = outcome.skip_reason {
         metrics::counter!(
             "kronika_web_overview_gc_skipped_total",
@@ -349,6 +349,18 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
             record_gc_category(kind, usage);
         }
     }
+}
+
+fn record_overview_diagnostics(diagnostics: overview::live::OverviewDiagnostics) {
+    metrics::counter!("kronika_web_overview_durable_hits_total").absolute(diagnostics.durable_hits);
+    metrics::counter!("kronika_web_overview_fallback_hits_total")
+        .absolute(diagnostics.fallback_hits);
+    metrics::counter!("kronika_web_overview_rebuilt_total").absolute(diagnostics.rebuilt);
+    metrics::counter!("kronika_web_overview_promotions_total").absolute(diagnostics.promotions);
+    metrics::counter!("kronika_web_overview_persistence_failures_total")
+        .absolute(diagnostics.persistence_failures);
+    metrics::counter!("kronika_web_overview_sealed_failures_total")
+        .absolute(diagnostics.sealed_failures);
 }
 
 fn default_overview_config() -> OverviewConfig {
@@ -442,6 +454,7 @@ impl AppState {
             .assemble(&snapshot, &delta)
             .map_err(StateBuildError::Overview)?;
         overview::resilience::record_persist_snapshot(overview.persist_mode());
+        record_overview_diagnostics(overview.diagnostics());
         record_gc_metrics(None);
         let cursor_registry =
             overview::cursor::CursorRegistry::new(overview::cursor::CursorConfig {
@@ -578,17 +591,10 @@ impl AppState {
         drop(overview);
         overview::resilience::record_probe_metrics(probe);
         overview::resilience::record_persist_snapshot(persist);
-        record_gc_metrics(gc);
-        metrics::gauge!("kronika_web_overview_durable_hits_total")
-            .set(diagnostics.durable_hits as f64);
-        metrics::gauge!("kronika_web_overview_fallback_hits_total")
-            .set(diagnostics.fallback_hits as f64);
-        metrics::gauge!("kronika_web_overview_rebuilt_total").set(diagnostics.rebuilt as f64);
-        metrics::gauge!("kronika_web_overview_promotions_total").set(diagnostics.promotions as f64);
-        metrics::gauge!("kronika_web_overview_persistence_failures_total")
-            .set(diagnostics.persistence_failures as f64);
-        metrics::gauge!("kronika_web_overview_sealed_failures_total")
-            .set(diagnostics.sealed_failures as f64);
+        if gc.is_some() {
+            record_gc_metrics(gc);
+        }
+        record_overview_diagnostics(diagnostics);
         metrics::gauge!("kronika_web_overview_data_through_us")
             .set(timeline.data_through_us().unwrap_or_default() as f64);
         self.cursor_registry.prune(

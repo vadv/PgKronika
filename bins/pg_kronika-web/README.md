@@ -22,6 +22,12 @@ sealed segments, and atomically publishes immutable timeline views.
 | `KRONIKA_WEB_OVERVIEW_NAMESPACE` | canonical store-path bytes | Stable store/deployment identity used in timeline fact keys. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_SEGMENT_HOURS` | `24` | Total admitted segment-hours retained after recoverable durable-publication failures. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_BYTES` | `67108864` | Canonical fact-byte budget for the process-local fallback. |
+| `KRONIKA_WEB_OVERVIEW_GC_MAX_ENTRIES` | `100000` | Maximum entries in one complete fact-cache inventory; reaching the bound forbids a sweep. |
+| `KRONIKA_WEB_OVERVIEW_GC_GRACE_GENERATIONS` | `2` | Distinct authoritative GC generations required before a non-live final is eligible. |
+| `KRONIKA_WEB_OVERVIEW_GC_WALL_GRACE_S` | `120` | Minimum seconds since the first authoritative non-live observation. |
+| `KRONIKA_WEB_OVERVIEW_GC_ARTIFACT_GRACE_S` | `600` | Minimum age of a recognized temporary or quarantine file before cleanup. |
+| `KRONIKA_WEB_OVERVIEW_CACHE_MAX_LOGICAL_BYTES` | unset | Optional logical-`st_size` ceiling for accounted files in the fact-cache namespace. |
+| `KRONIKA_WEB_OVERVIEW_CACHE_MAX_FILES` | unset | Optional file-count ceiling for the accounted fact-cache namespace. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES` | `67108864` | Logical-byte budget for the serialized overview/health response cache. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_ENTRIES` | `4096` | Serialized overview/health response-cache entry budget. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS` | `64` | Maximum event views pinned for cursor continuation. |
@@ -45,6 +51,10 @@ Timeline resource policy defaults and constraints are:
 | Resource | Default | Constraint or ceiling |
 | --- | ---: | ---: |
 | Recoverable durable-publication fallback | 24 segment-hours, 64 MiB | 744 hours, 256 MiB |
+| Fact-cache GC inventory | 100,000 entries | 1,000,000 entries |
+| Non-live final grace | 2 distinct authoritative GC generations and 120 s | Both values must be nonzero; generation grace must be at least 2 |
+| Recognized publication-artifact grace | 600 s | Must be nonzero |
+| Persistent fact-cache admission | No byte or file ceiling by default | Optional nonzero logical-byte and file-count ceilings |
 | Serialized overview/health response cache | 4,096 entries, 64 MiB logical charge | Both configured budgets are nonzero and fit `usize`. |
 | Cursor-pinned event views | 64 views, 512 MiB logical charge, 300 s TTL | All budgets are nonzero; count and bytes fit `usize`. |
 | Timeline query range | — | 31 days |
@@ -53,11 +63,43 @@ Timeline resource policy defaults and constraints are:
 | Notable preview | 100 items | Fixed by notable policy v1 |
 | Health line | — | 2,000 points |
 
-All seven numeric `KRONIKA_WEB_OVERVIEW_*` budget variables accept nonzero
-unsigned decimal integers. Byte, entry, and view budgets must fit the
-platform's `usize`. The fallback additionally rejects values above 744
-segment-hours or 268435456 bytes. Invalid values stop startup before the
-listener binds.
+Numeric `KRONIKA_WEB_OVERVIEW_*` policy variables accept unsigned decimal
+integers. Required budgets and grace values must be nonzero; either persistent
+cache ceiling may remain unset. Byte, entry, and view budgets that become
+process sizes must fit the platform's `usize`. The fallback additionally
+rejects values above 744 segment-hours or 268435456 bytes. Invalid values stop
+startup before the listener binds.
+
+## Persistent fact-cache operation
+
+Give each web process a separate cache directory unless the deployment
+intentionally uses one mutating process. The first `FactStore` to acquire a
+root holds its advisory owner lock for the store lifetime. Other processes
+pointed at that root can read committed facts, but publication and GC report
+contention; newly built facts remain in the bounded process-local fallback.
+
+The web writer requests GC after every 60 successful timeline publications.
+The generation grace advances only on distinct, complete, authoritative GC
+scans, not on ordinary refreshes. With the defaults, deletion also requires
+120 seconds since the first scan that found a final non-live; the wall grace
+can therefore require a later scan. Any unavailable sealed source, scan error,
+or entry-cap hit authorizes no deletion and does not advance grace. GC is
+confined to `overview/v1`. It validates final-file identity and leaves source
+PGM, `active.parts`, locks, symlinks, and foreign files untouched.
+
+The optional persistent ceilings count logical file sizes and file entries;
+they are not free-space limits or physical filesystem quotas. If a complete
+scan cannot admit a publication without exceeding a configured ceiling, the
+response still uses the bounded in-memory fallback. `ENOSPC` and configured
+quota failures receive at most one authoritative GC pass and one publication
+retry.
+
+Durable reads continue while writes are backed off. A refresh with no new fact
+build still runs the single due recovery probe. Permission and read-only
+failures wait five minutes before the first probe. Capacity and transient I/O
+use per-store jittered exponential delay capped at five minutes. Permanent
+path, layout, identity, and unclassified I/O failures are reported without
+arming global backoff.
 
 ## Endpoints
 
@@ -184,17 +226,32 @@ and affect gaps/completeness. They are never converted to successful rows.
 
 ## Timeline metrics
 
-`/metrics` exposes timeline publication gauges/counters
+`/metrics` exposes timeline publication counters
 `kronika_web_overview_durable_hits_total`,
 `kronika_web_overview_fallback_hits_total`,
 `kronika_web_overview_rebuilt_total`,
 `kronika_web_overview_promotions_total`,
 `kronika_web_overview_persistence_failures_total`,
-`kronika_web_overview_sealed_failures_total`,
+`kronika_web_overview_sealed_failures_total`; these are monotonic counters,
+including work done by the initial view build. View progress uses
 `kronika_web_store_view_generation`,
 `kronika_web_overview_view_generation`,
 `kronika_web_overview_data_through_us`, and
-`kronika_web_overview_refresh_errors_total`. Cursor pressure is visible through
+`kronika_web_overview_refresh_errors_total`.
+
+Persistence state uses
+`kronika_web_overview_persist_{mode,failures,retry_after_seconds,probe_in_flight}`,
+the closed one-hot gauges `kronika_web_overview_persist_reason{reason}` and
+`kronika_web_overview_persist_failure_class{class}`, and
+`kronika_web_overview_persist_probe_{attempts,failures,skipped}_total`.
+GC publishes scan-complete, sweep-authorized, quota, pending, and scanned-entry
+gauges; cache file/logical-byte/allocated-byte gauges by the closed
+`kind={committed,temporary,quarantine,lock,foreign}` label; skip counters; and
+deleted-file plus unlinked logical/allocated-byte counters. “Unlinked
+allocated bytes” is the opened inode's `st_blocks` charge before unlink; open
+descriptors or hard links can keep those blocks allocated.
+
+Cursor pressure is visible through
 `kronika_web_timeline_cursor_views`, `kronika_web_timeline_cursor_bytes`, and
 `kronika_web_timeline_cursor_pins_total`,
 `kronika_web_timeline_cursor_resolves_total`,
@@ -217,5 +274,5 @@ usable timeline and never exposes a partially built timeline. A bad
 environment, initial store/overview failure, or unavailable OS entropy for
 cursor authentication exits before binding the listener.
 
-The binary has no CLI flags and does not implement MCP, remote stores,
-retention, or alert delivery.
+The binary has no CLI flags and does not implement MCP, remote stores, source
+segment retention, or alert delivery.

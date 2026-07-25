@@ -56,7 +56,7 @@ pub enum PersistError {
     StaleFilesystem,
     /// Computed facts could not be encoded under the configured bounds.
     InvalidFacts,
-    /// Another cache owner currently publishes this key.
+    /// Another owner or in-process publication holds the required reservation.
     Busy,
     /// A generated cache component resolved through an unsafe file type.
     UnsafePath,
@@ -671,7 +671,7 @@ impl FactStore {
             let namespace =
                 open_namespace(&self.cache_root, true).map_err(PersistError::from_io)?;
             match super::gc::admit_publication(&namespace, self.gc_config, incoming) {
-                Ok(usage) => lock_unpoisoned(&self.gc).update_usage(usage, self.gc_config),
+                Ok(()) => {}
                 Err(GcAdmissionError::Capped) => return Err(PersistError::QuotaExceeded),
                 Err(GcAdmissionError::Incomplete) => return Err(PersistError::TransientIo),
             }
@@ -1165,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn a_suppressed_write_does_not_attempt_the_disk_again() {
+    fn backoff_suppresses_a_second_publication_attempt() {
         let temp = TempDir::new().expect("cache directory");
         let store = FactStore::new(temp.path());
         store.inject_publish_faults([PersistError::TransientIo]);
@@ -1181,10 +1181,8 @@ mod tests {
             "the first failure arms backoff"
         );
 
-        // The second attempt is inside the backoff window: it reports the
-        // standing reason without touching the disk, so no new failure is
-        // recorded. A regression that ran the write before the gate would
-        // advance the count here.
+        // The second call reports the standing reason without entering
+        // `publish_encoded`, so no new publication failure is recorded.
         let (_second, second_error) = store
             .admit_publish_or_fallback(&facts, &LIMIT)
             .expect("second admit");
@@ -1195,7 +1193,7 @@ mod tests {
         assert_eq!(
             store.persist_mode().failures,
             1,
-            "a suppressed write does not attempt the disk"
+            "a suppressed write does not enter publication"
         );
         assert_eq!(store.test_publish_attempts(), 1);
     }

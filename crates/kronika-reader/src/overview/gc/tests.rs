@@ -276,7 +276,7 @@ fn quota_overrun_keeps_live_fact_and_files_outside_the_exact_namespace() {
 }
 
 #[test]
-fn freed_bytes_come_from_the_reopened_validated_inode() {
+fn unlinked_bytes_come_from_the_reopened_validated_inode() {
     let directory = TempDir::new().expect("cache directory");
     let store = store(directory.path(), immediate_config(128));
     let facts = facts(8);
@@ -287,7 +287,7 @@ fn freed_bytes_come_from_the_reopened_validated_inode() {
     let outcome = store.collect_garbage(&GcMark::authoritative(11, []));
 
     assert_eq!(outcome.deleted_finals, 1);
-    assert_eq!(outcome.freed_bytes, expected);
+    assert_eq!(outcome.unlinked_logical_bytes, expected);
 }
 
 #[test]

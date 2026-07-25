@@ -25,6 +25,7 @@ use super::{AppState, AuthConfig, OverviewConfig, app};
 mod anomalies;
 mod auth_static;
 mod incidents;
+mod overview_resilience;
 mod overview_timeline;
 mod probes_metrics;
 mod problems;
