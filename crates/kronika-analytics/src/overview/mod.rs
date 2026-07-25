@@ -15,9 +15,11 @@
 
 pub mod counts;
 pub mod coverage;
+pub mod fact;
 mod finite;
 pub mod health;
 pub mod health_line;
+pub mod metric;
 pub mod notable;
 pub mod observation;
 pub mod oracle;
@@ -32,6 +34,13 @@ pub use coverage::{
     Applicability, BoundaryQuality, Coverage, CoverageSpan, CoverageState, PeriodQuality,
     PhysicalCountSemantics, RetainedExactness, SourceCompleteness,
 };
+pub use fact::{
+    CapacityFactPayload, CheckpointFactPayload, CounterDeltaFactPayload, CoverageRef, EntityKind,
+    EntityRef, ErrorFactPayload, EventFact, EventKind, EventPayload, FactShape, InvalidEventFact,
+    LifecycleFactPayload, LockWaitFactPayload, MaintenanceFactPayload, SlowQueryFactPayload,
+    StateTransitionFactPayload, TempFileFactPayload, counter_sample_observation_id,
+    gauge_sample_observation_id,
+};
 pub use finite::FiniteF64;
 pub use health::{
     CadenceEpochId, DomainId, DomainPenalty, DownsampleError, DownsampledHealthPoint,
@@ -44,6 +53,9 @@ pub use health_line::{
     HealthConfigError, OVERVIEW_HEALTH_DOMAIN, OVERVIEW_HEALTH_FACTOR, OVERVIEW_HEALTH_LIMITS,
     health_line, observation_floor, overview_health_policy,
 };
+pub use metric::{
+    MetricFactor, MetricSeriesDescriptor, MetricUnit, ResetFamily, derive_alignment, derive_entity,
+};
 pub use notable::{
     DEFAULT_RESPONSE_CAP, InvalidNotablePolicy, MAX_RESPONSE_CAP, NotableClass,
     NotableEvidenceClass, NotablePolicy, NotablePreview, RankedNotable, observation_severity,
@@ -52,10 +64,10 @@ pub use notable::{
 pub use observation::{
     CheckpointPayload, DictionaryContextId, DroppedFieldCount, ErrorGroupPayload, EventObservation,
     EvidenceQuality, FactId, IdentityQuality, InvalidObservation, LifecyclePayload,
-    LockWaitPayload, LogGapPayload, LossReason, LossSummary, MaintenancePayload, NamingContractId,
-    ObservationId, ObservationPayload, ObservationProvenance, ObservationShape, ObservationTime,
-    QualityFlags, SectionBodyId, SegmentIdentity, SegmentLineageId, SegmentLocator,
-    SlowQueryPayload, SourceLocator, SourceScopeId, TempFilePayload, TimeQuality,
+    LockWaitPayload, LogGapPayload, LossReason, LossSummary, MaintenancePayload, ObservationId,
+    ObservationPayload, ObservationProvenance, ObservationShape, ObservationTime, QualityFlags,
+    SectionBodyId, SegmentIdentity, SegmentLineageId, SlowQueryPayload, SourceLocator,
+    TempFilePayload, TimeQuality,
 };
 pub use oracle::{
     MemoryOracle, OracleError, OracleLimits, OracleResource, OracleResult, OracleSourceError,
@@ -68,14 +80,21 @@ pub use reduce::{
     TimeWeightedReduction, classify_series, time_weighted_mean,
 };
 
-/// Reserved version for future fact-container framing.
-pub const CONTAINER_VERSION: u16 = 1;
+/// Fact-container framing version.
+///
+/// Version 2 stores the fact key and segment lineage in each sibling sidecar
+/// header.
+pub const CONTAINER_VERSION: u16 = 2;
 
-/// Reserved version for the future canonical fact schema.
-pub const FACT_SCHEMA_VERSION: u32 = 1;
+/// Canonical fact schema version.
+///
+/// Version 3 uses the numeric PGM source ID throughout canonical facts.
+pub const FACT_SCHEMA_VERSION: u32 = 3;
 
-/// Reserved version for PGM-to-fact extraction and normalization.
-pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 1;
+/// Version for PGM-to-fact extraction and normalization.
+///
+/// Version 5 derives sealed lineage from exact PGM metadata.
+pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 5;
 
 /// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///
@@ -89,7 +108,7 @@ pub const REGISTRY_CONTRACT_VERSION: u32 = 1;
 pub const HEALTH_POLICY_VERSION: u32 = 1;
 
 /// Reserved version for future notable-event policy.
-pub const NOTABLE_POLICY_VERSION: u32 = 1;
+pub const NOTABLE_POLICY_VERSION: u32 = 2;
 
 /// Reserved version for future response redaction policy.
 pub const REDACTION_POLICY_VERSION: u32 = 1;
@@ -98,7 +117,7 @@ pub const REDACTION_POLICY_VERSION: u32 = 1;
 pub const DIAGNOSIS_POLICY_VERSION: u32 = 1;
 
 /// Reserved version for a future response schema.
-pub const RESPONSE_SCHEMA_VERSION: u32 = 1;
+pub const RESPONSE_SCHEMA_VERSION: u32 = 2;
 
 /// Reserved version for future cursor encoding.
 pub const CURSOR_VERSION: u16 = 1;

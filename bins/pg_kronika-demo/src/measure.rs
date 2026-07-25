@@ -8,10 +8,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use kronika_analytics::overview::{NamingContractId, SegmentLocator};
-use kronika_reader::{
-    BlockKind, FactFileReader, FactKey, FactStore, FileKind, LIMIT, PgmUnit, SegmentContext,
-};
+use kronika_reader::{BlockKind, FactFileReader, FactStore, LIMIT, PgmUnit, SegmentContext};
 
 /// Stored/decoded sizes of one fact-file block.
 #[derive(Debug, Clone, Copy)]
@@ -52,11 +49,11 @@ pub(crate) struct Report {
 
 /// Builds fact files for every sealed segment under `segments` and measures
 /// both sides.
-pub(crate) fn measure(segments: &Path, cache_root: &Path, chart_series: u32) -> Result<Report> {
-    let store = FactStore::new(cache_root);
+pub(crate) fn measure(segments: &Path, chart_series: u32) -> Result<Report> {
+    let store = FactStore::new(segments);
     let mut reports = Vec::new();
     for pgm_path in sealed_segments(segments)? {
-        reports.push(measure_segment(&store, cache_root, &pgm_path)?);
+        reports.push(measure_segment(&store, &pgm_path)?);
     }
     ensure!(
         !reports.is_empty(),
@@ -85,7 +82,7 @@ fn sealed_segments(segments: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn measure_segment(store: &FactStore, cache_root: &Path, pgm_path: &Path) -> Result<SegmentReport> {
+fn measure_segment(store: &FactStore, pgm_path: &Path) -> Result<SegmentReport> {
     let name = pgm_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -97,12 +94,7 @@ fn measure_segment(store: &FactStore, cache_root: &Path, pgm_path: &Path) -> Res
 
     let file = File::open(pgm_path).with_context(|| format!("open {}", pgm_path.display()))?;
     let unit = PgmUnit::open(file).with_context(|| format!("parse {}", pgm_path.display()))?;
-    let context = SegmentContext::new(
-        b"demo-stand".to_vec(),
-        NamingContractId([0; 16]),
-        segment_locator(&name),
-    )
-    .context("build the segment context")?;
+    let context = SegmentContext::new(name.clone()).context("build the segment context")?;
     let load = store
         .load_or_build(&unit, &context, &LIMIT)
         .with_context(|| format!("build facts for {name}"))?;
@@ -111,9 +103,7 @@ fn measure_segment(store: &FactStore, cache_root: &Path, pgm_path: &Path) -> Res
     }
 
     let facts = load.facts();
-    let key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
-    let ovf_path = find_fact_file(cache_root, &key)
-        .with_context(|| format!("locate the fact file for {name}"))?;
+    let ovf_path = pgm_path.with_extension("ovf");
     let ovf_bytes = std::fs::metadata(&ovf_path)
         .with_context(|| format!("stat {}", ovf_path.display()))?
         .len();
@@ -140,39 +130,6 @@ fn measure_segment(store: &FactStore, cache_root: &Path, pgm_path: &Path) -> Res
         ovf_bytes,
         blocks,
     })
-}
-
-/// A deterministic per-segment locator derived from the file name.
-fn segment_locator(name: &str) -> SegmentLocator {
-    let mut locator = [0_u8; 32];
-    for (index, byte) in name.bytes().enumerate() {
-        locator[index % 32] = locator[index % 32].wrapping_mul(31).wrapping_add(byte);
-    }
-    locator[31] = locator[31].wrapping_add(u8::try_from(name.len() % 251).unwrap_or(0));
-    SegmentLocator(locator)
-}
-
-/// Finds `<key>.ovf` under the cache; the key hex is globally unique.
-fn find_fact_file(cache_root: &Path, key: &FactKey) -> Result<PathBuf> {
-    let wanted = format!("{}.ovf", key.hex());
-    let mut stack = vec![cache_root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy() == *wanted)
-            {
-                return Ok(path);
-            }
-        }
-    }
-    anyhow::bail!("{wanted} not found under {}", cache_root.display())
 }
 
 /// Sums gauge blocks across segments for a stand-wide extrapolation basis.
@@ -468,11 +425,10 @@ mod tests {
     }
 
     #[test]
-    fn locators_differ_for_different_segment_names() {
-        assert_ne!(
-            segment_locator("143000.pgm").0,
-            segment_locator("143900.pgm").0,
-            "distinct names must map to distinct locators"
+    fn sidecar_uses_the_same_stem_as_its_segment() {
+        assert_eq!(
+            Path::new("143000.pgm").with_extension("ovf"),
+            PathBuf::from("143000.ovf")
         );
     }
 

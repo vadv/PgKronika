@@ -1,8 +1,12 @@
-//! Minimal SHA-256 used by content-derived identity contracts.
+//! SHA-256 used by content-derived identity contracts.
 
+use sha2::{Digest as _, Sha256};
+
+#[cfg(test)]
 const BLOCK_LEN: usize = 64;
 
 /// Fractional parts of the cube roots of the first 64 primes.
+#[cfg(test)]
 const K: [u32; 64] = [
     0x428a_2f98,
     0x7137_4491,
@@ -71,6 +75,7 @@ const K: [u32; 64] = [
 ];
 
 /// Fractional parts of the square roots of the first 8 primes.
+#[cfg(test)]
 const H_INIT: [u32; 8] = [
     0x6a09_e667,
     0xbb67_ae85,
@@ -84,6 +89,15 @@ const H_INIT: [u32; 8] = [
 
 /// Digest of the concatenation of `parts`, without materializing it.
 pub(crate) fn digest_parts(parts: &[&[u8]]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update(part);
+    }
+    digest.finalize().into()
+}
+
+#[cfg(test)]
+fn digest_parts_reference(parts: &[&[u8]]) -> [u8; 32] {
     let mut state = H_INIT;
     let mut buf = [0_u8; BLOCK_LEN];
     let mut buf_len = 0_usize;
@@ -137,6 +151,7 @@ pub(crate) fn digest_parts(parts: &[&[u8]]) -> [u8; 32] {
     clippy::many_single_char_names,
     reason = "a..h are the FIPS 180-4 working-variable names"
 )]
+#[cfg(test)]
 fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
     let mut w = [0_u32; 64];
     for (slot, chunk) in w.iter_mut().zip(block.as_chunks::<4>().0) {
@@ -227,7 +242,7 @@ mod tests {
         // and whole-block paths.
         let whole: Vec<u8> = (0..150_u8).collect();
         let whole = whole.as_slice();
-        let expected = digest_parts(&[whole]);
+        let expected = digest_parts_reference(&[whole]);
         // Every split point, including ones straddling the 64-byte block edge.
         for split in 0..whole.len() {
             assert_eq!(

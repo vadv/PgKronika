@@ -6,8 +6,7 @@
 use proptest::prelude::*;
 
 use kronika_analytics::overview::{
-    AlignmentId, CounterSample, GaugeSample, MetricSeriesId, NamingContractId, SegmentIdentity,
-    SegmentLocator, SourceScopeId,
+    AlignmentId, CounterSample, GaugeSample, MetricSeriesId, SegmentIdentity,
 };
 
 use super::block::{
@@ -20,25 +19,20 @@ use super::limits::LIMIT;
 use super::observations::EventObservationsBlock;
 
 fn identity() -> HeaderIdentity {
+    let lineage = lineage();
     HeaderIdentity::from_current_contract(
         1,
         7,
         i64::MIN,
         i64::MAX,
         4_096,
-        SourceScopeId([0x11; 32]),
         SourceDescriptor([0x22; 32]),
+        lineage.id(),
     )
 }
 
 fn lineage() -> SegmentIdentity {
-    SegmentIdentity::sealed(
-        SourceScopeId([0x11; 32]),
-        NamingContractId([2; 16]),
-        SegmentLocator([3; 32]),
-        7,
-        b"descriptor",
-    )
+    SegmentIdentity::sealed(7, [0x22; 32], 7, b"descriptor")
 }
 
 fn manifest() -> BlockContent {

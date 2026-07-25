@@ -1,4 +1,4 @@
-//! Exclusive ownership of one persistent overview-cache root.
+//! Exclusive mutation ownership for overview sidecars in one data directory.
 
 use std::fs::File;
 use std::io;
@@ -6,32 +6,31 @@ use std::path::Path;
 
 use rustix::fs::{FlockOperation, Mode, OFlags};
 
-const DIR_MODE: Mode = Mode::RWXU;
 const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
-const OWNER_LOCK_NAME: &str = ".owner.lock";
+pub(super) const OWNER_LOCK_NAME: &str = ".pgkronika-overview.owner.lock";
 
-/// Failure to establish the destructive/write owner of a cache root.
+/// Failure to establish the sole sidecar writer for a data directory.
 #[derive(Debug)]
-pub(super) enum CacheOwnerError {
-    /// Another process or independently constructed store owns this root.
+pub(super) enum SidecarOwnerError {
+    /// Another process or independently constructed store owns this directory.
     Contended,
-    /// A generated namespace component is not a real directory or file.
+    /// The configured data-directory path resolves through an unsafe file type.
     UnsafePath,
     /// The filesystem rejected the ownership operation.
     Io(io::Error),
 }
 
-/// Lifetime token for the only process allowed to mutate a cache root.
+/// Lifetime token for the only process allowed to mutate overview sidecars.
 #[derive(Debug)]
-pub(super) struct CacheOwner {
+pub(super) struct SidecarOwner {
     _lock: File,
 }
 
-impl CacheOwner {
-    pub(super) fn acquire(cache_root: &Path) -> Result<Self, CacheOwnerError> {
-        let namespace = open_namespace(cache_root, true).map_err(classify_io)?;
+impl SidecarOwner {
+    pub(super) fn acquire(data_dir: &Path) -> Result<Self, SidecarOwnerError> {
+        let directory = open_data_dir(data_dir).map_err(classify_io)?;
         let lock = open_file_at(
-            &namespace,
+            &directory,
             OWNER_LOCK_NAME,
             OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             FILE_MODE,
@@ -39,78 +38,37 @@ impl CacheOwner {
         .map_err(classify_io)?;
         rustix::fs::fchmod(&lock, FILE_MODE)
             .map_err(errno_to_io)
-            .map_err(CacheOwnerError::Io)?;
+            .map_err(SidecarOwnerError::Io)?;
         match rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(Self { _lock: lock }),
-            Err(error) if error == rustix::io::Errno::WOULDBLOCK => Err(CacheOwnerError::Contended),
-            Err(error) => Err(CacheOwnerError::Io(errno_to_io(error))),
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                Err(SidecarOwnerError::Contended)
+            }
+            Err(error) => Err(SidecarOwnerError::Io(errno_to_io(error))),
         }
     }
 }
 
-pub(super) fn open_namespace(cache_root: &Path, create: bool) -> io::Result<File> {
-    let root = open_root(cache_root, create)?;
-    let overview = open_child_directory(&root, "overview", create)?;
-    open_child_directory(&overview, "v1", create)
-}
-
-pub(super) fn open_root(cache_root: &Path, create: bool) -> io::Result<File> {
-    if create {
-        std::fs::create_dir_all(cache_root)?;
-    }
-    let root = rustix::fs::open(
-        cache_root,
+pub(super) fn open_data_dir(data_dir: &Path) -> io::Result<File> {
+    let directory = rustix::fs::open(
+        data_dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map(File::from)
     .map_err(errno_to_io)?;
-    if !root.metadata()?.is_dir() {
+    if !directory.metadata()?.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotADirectory,
-            "cache root is not a directory",
+            "data directory is not a directory",
         ));
     }
-    Ok(root)
+    Ok(directory)
 }
 
-pub(super) fn open_child_directory(parent: &File, name: &str, create: bool) -> io::Result<File> {
-    let mut created = false;
-    if create {
-        match rustix::fs::mkdirat(parent, name, DIR_MODE) {
-            Ok(()) => created = true,
-            Err(error) if error == rustix::io::Errno::EXIST => {}
-            Err(error) => return Err(errno_to_io(error)),
-        }
-    }
-    let child = open_file_at(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| {
-        if error.raw_os_error().is_some_and(|code| {
-            code == rustix::io::Errno::LOOP.raw_os_error()
-                || code == rustix::io::Errno::NOTDIR.raw_os_error()
-        }) {
-            errno_to_io(rustix::io::Errno::LOOP)
-        } else {
-            error
-        }
-    })?;
-    if create {
-        rustix::fs::fchmod(&child, DIR_MODE).map_err(errno_to_io)?;
-    }
-    if created {
-        parent.sync_all()?;
-    }
-    Ok(child)
-}
-
-pub(super) fn open_file_at(
+pub(super) fn open_file_at<P: rustix::path::Arg>(
     directory: &File,
-    name: &str,
+    name: P,
     flags: OFlags,
     mode: Mode,
 ) -> io::Result<File> {
@@ -119,15 +77,15 @@ pub(super) fn open_file_at(
         .map_err(errno_to_io)
 }
 
-fn classify_io(error: io::Error) -> CacheOwnerError {
+fn classify_io(error: io::Error) -> SidecarOwnerError {
     if error
         .raw_os_error()
         .is_some_and(|code| code == rustix::io::Errno::LOOP.raw_os_error())
         || error.kind() == io::ErrorKind::NotADirectory
     {
-        CacheOwnerError::UnsafePath
+        SidecarOwnerError::UnsafePath
     } else {
-        CacheOwnerError::Io(error)
+        SidecarOwnerError::Io(error)
     }
 }
 

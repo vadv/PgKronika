@@ -280,11 +280,16 @@ fn prune_expired(inner: &mut RegistryInner, now_secs: u64) -> u64 {
 fn record_registry_metrics(inner: &RegistryInner, expired: u64, evicted: u64) {
     metrics::gauge!("kronika_web_timeline_cursor_views").set(inner.views.len() as f64);
     metrics::gauge!("kronika_web_timeline_cursor_bytes").set(inner.bytes as f64);
+    metrics::gauge!("overview_cursor_views").set(inner.views.len() as f64);
+    metrics::gauge!("overview_cursor_view_bytes").set(inner.bytes as f64);
     if expired != 0 {
         metrics::counter!("kronika_web_timeline_cursor_expired_total").increment(expired);
+        metrics::counter!("overview_cursor_expired_total", "reason" => "ttl").increment(expired);
     }
     if evicted != 0 {
         metrics::counter!("kronika_web_timeline_cursor_evictions_total").increment(evicted);
+        metrics::counter!("overview_cursor_expired_total", "reason" => "capacity")
+            .increment(evicted);
     }
 }
 
@@ -469,7 +474,7 @@ mod tests {
     }
 
     fn empty_view(view_generation: u64) -> Arc<IndexView> {
-        let mut builder = LiveBuilder::new(b"cursor-test".to_vec(), LIMIT).expect("live builder");
+        let mut builder = LiveBuilder::new(LIMIT).expect("live builder");
         let delta = RefreshDelta {
             previous_view_generation: view_generation.saturating_sub(1),
             new_view_generation: view_generation,

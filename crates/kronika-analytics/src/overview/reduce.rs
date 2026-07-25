@@ -150,10 +150,13 @@ impl CounterInterval {
         known_gaps: &Coverage,
     ) -> Self {
         let has_gap = previous.is_some_and(|previous| {
+            let index = known_gaps
+                .spans()
+                .partition_point(|gap| gap.end_us() <= previous.ts_us);
             known_gaps
                 .spans()
-                .iter()
-                .any(|gap| gap.start_us() < current.ts_us && gap.end_us() > previous.ts_us)
+                .get(index)
+                .is_some_and(|gap| gap.start_us() < current.ts_us)
         });
         Self::classify_with_gap(previous, current, has_gap)
     }

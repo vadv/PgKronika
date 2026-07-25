@@ -56,8 +56,8 @@ fn problem_example(code: ProblemCode) -> (ApiProblem, serde_json::Value) {
             ApiProblem::analytic_capacity_unavailable(),
             serde_json::json!({ "retry_after_seconds": 1 }),
         ),
-        ProblemCode::OverviewCapacityUnavailable => (
-            ApiProblem::overview_capacity_unavailable(),
+        ProblemCode::ColdBuildOverloaded => (
+            ApiProblem::cold_build_overloaded(1),
             serde_json::json!({ "retry_after_seconds": 1 }),
         ),
         ProblemCode::StoreReadFailed => (ApiProblem::store_read_failed(), serde_json::json!({})),
@@ -114,7 +114,7 @@ async fn every_problem_code_has_the_exact_body_and_headers() {
                 .and_then(|value| value.to_str().ok()),
             matches!(
                 code,
-                ProblemCode::AnalyticCapacityUnavailable | ProblemCode::OverviewCapacityUnavailable
+                ProblemCode::AnalyticCapacityUnavailable | ProblemCode::ColdBuildOverloaded
             )
             .then(|| response.body["params"]["retry_after_seconds"].to_string())
             .as_deref()
@@ -664,6 +664,10 @@ fn assert_timeline_contract(document: &serde_json::Value) {
     assert_timeline_endpoint_contract(document);
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the assertions enumerate the complete public timeline schema contract"
+)]
 fn assert_timeline_schema_contract(document: &serde_json::Value) {
     let schemas = &document["components"]["schemas"];
     for schema in [
@@ -675,6 +679,9 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
         "EventLoss",
         "ErrorEventPayload",
         "LifecycleEventPayload",
+        "CounterDeltaEventPayload",
+        "CapacityEventPayload",
+        "EventEntity",
         "EventFact",
         "SqlstateCount",
         "JointCount",
@@ -684,6 +691,7 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
         "NotablePreview",
         "HealthDomainPenalty",
         "HealthFloorEvidence",
+        "HealthSourcePopulation",
         "HealthFactorCoverage",
         "HealthPoint",
         "TimelineHealthSummary",
@@ -715,6 +723,7 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
     }
 
     assert_eq!(schemas["B64UrlSha256"]["pattern"], "^[A-Za-z0-9_-]{43}$");
+    assert_eq!(schemas["B64Url128"]["pattern"], "^[A-Za-z0-9_-]{22}$");
     assert_eq!(
         schemas["TimelineEventsCursor"]["pattern"],
         "^[A-Za-z0-9_-]{312}$"
@@ -724,12 +733,16 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
         "integer"
     );
     assert_eq!(
+        schemas["EventFact"]["properties"]["source_type_id"]["type"],
+        serde_json::json!(["integer", "null"])
+    );
+    assert_eq!(
         schemas["EventFact"]["properties"]["supporting_evidence"]["minItems"],
         1
     );
     assert_eq!(
         schemas["EventFact"]["properties"]["supporting_evidence"]["maxItems"],
-        1
+        3
     );
     assert_eq!(
         schemas["EventFact"]["properties"]["payload"]["$ref"],
@@ -747,6 +760,28 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
         schemas["TimelineHealthResponse"]["properties"]["points"]["maxItems"],
         2000
     );
+    assert_eq!(
+        schemas["TimelineMeta"]["properties"]["response_schema_version"]["const"],
+        2
+    );
+    assert_eq!(
+        schemas["TimelineEventsResponse"]["properties"]["notable_policy_version"]["const"],
+        2
+    );
+    for response in [
+        "TimelineOverviewResponse",
+        "TimelineEventsResponse",
+        "TimelineHealthResponse",
+    ] {
+        assert_eq!(
+            schemas[response]["properties"]["coverage"]["maxItems"], 65_536,
+            "{response} factor coverage bound must match the handler"
+        );
+        assert_eq!(
+            schemas[response]["properties"]["coverage"]["items"]["$ref"],
+            "#/components/schemas/HealthFactorCoverage"
+        );
+    }
     for (property, width) in [("by_severity", 5), ("by_category", 11)] {
         assert_eq!(
             schemas["EventDigest"]["properties"][property]["minItems"],

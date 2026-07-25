@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use kronika_analytics::overview::{CoverageSpan, NamingContractId, SegmentLocator};
+use kronika_analytics::overview::CoverageSpan;
 use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
 use kronika_reader::{
     FactBuildKey, FactKey, LIMIT, LiveBuilder, PgmUnit, SealedLocator, SegmentDescriptor,
-    lineage_from_catalog, source_scope_id,
+    lineage_from_catalog,
 };
 use kronika_registry::Section;
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
@@ -19,8 +19,6 @@ use crate::overview::selection::{
 };
 use crate::overview::view::{DescriptorEntry, DescriptorView};
 use crate::{AppState, OverviewConfig, PublishedStoreView, StateBuildError, app};
-
-const SYNTHETIC_NAMESPACE: &[u8] = b"overview-admission-test";
 
 fn one_weight() -> ColdWorkWeight {
     ColdWorkWeight {
@@ -56,26 +54,19 @@ fn synthetic_entries(
         },
     );
     let unit = PgmUnit::open(bytes.as_slice()).expect("open synthetic catalog");
-    let source_scope = source_scope_id(SYNTHETIC_NAMESPACE, source_id);
-    let fact_key = FactKey::for_current_segment(source_scope, unit.source_descriptor());
+    let fact_key = FactKey::for_current_segment(source_id, unit.source_descriptor());
     (0..count)
         .map(|offset| {
             let ordinal = ordinal_base.checked_add(offset).expect("synthetic ordinal");
             let file_name = format!("synthetic-{source_id}-{ordinal}.pgm");
             let locator = SealedLocator::from_file_name_bytes(file_name.as_bytes());
             let descriptor = SegmentDescriptor::from_catalog(locator, unit.catalog());
-            let lineage = lineage_from_catalog(
-                unit.catalog(),
-                source_scope,
-                NamingContractId([1; 16]),
-                SegmentLocator(*locator.as_bytes()),
-            )
-            .expect("catalog has one entry");
+            let lineage = lineage_from_catalog(unit.catalog(), unit.source_descriptor())
+                .expect("catalog has one entry");
             DescriptorEntry::new(
                 descriptor,
                 FactBuildKey::new(fact_key, lineage),
                 one_weight(),
-                source_scope,
             )
         })
         .collect()
@@ -85,9 +76,7 @@ fn synthetic_view(
     entries: Vec<DescriptorEntry>,
     unavailable: Vec<SegmentDescriptor>,
 ) -> Arc<DescriptorView> {
-    let live = LiveBuilder::new(SYNTHETIC_NAMESPACE.to_vec(), LIMIT)
-        .expect("live builder")
-        .publish();
+    let live = LiveBuilder::new(LIMIT).expect("live builder").publish();
     Arc::new(DescriptorView::new(
         1,
         entries,
@@ -99,12 +88,9 @@ fn synthetic_view(
 
 fn state_with_limit(dir: &std::path::Path, limit: usize) -> AppState {
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
-    let mut config = OverviewConfig::new(
-        dir.join(".overview-cache"),
-        dir.as_os_str().as_encoded_bytes().to_vec(),
-    );
+    let mut config = OverviewConfig::new();
     config.max_selected_segments = limit;
-    AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), config)
+    AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), &config)
         .expect("state")
 }
 
@@ -113,14 +99,15 @@ fn programmatic_policy_rejects_zero_and_values_above_the_absolute_ceiling() {
     for configured in [0, ABSOLUTE_MAX_SELECTED_SEGMENTS + 1] {
         let dir = tempfile::tempdir().expect("tempdir");
         let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-        let mut config = OverviewConfig::new(
-            dir.path().join(".overview-cache"),
-            SYNTHETIC_NAMESPACE.to_vec(),
-        );
+        let mut config = OverviewConfig::new();
         config.max_selected_segments = configured;
-        let error =
-            AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), config)
-                .expect_err("invalid programmatic limit must fail before state construction");
+        let error = AppState::with_overview_config(
+            snapshot,
+            0,
+            std::time::Duration::from_secs(10),
+            &config,
+        )
+        .expect_err("invalid programmatic limit must fail before state construction");
         assert!(matches!(
             error,
             StateBuildError::Overview(
@@ -139,6 +126,34 @@ fn install_view(state: &AppState, view: Arc<DescriptorView>) {
         snapshot: Arc::clone(&snapshot),
         timeline_snapshot: snapshot,
         timeline: view,
+    }));
+}
+
+fn install_oversized_real_entry(state: &AppState) {
+    let (snapshot, original) = state.overview_request_view();
+    let entry = original
+        .entries()
+        .first()
+        .expect("fixture has one real sealed descriptor");
+    assert_eq!(original.entries().len(), 1);
+    let oversized = DescriptorEntry::new(
+        *entry.descriptor(),
+        entry.fact_build_key(),
+        ColdWorkWeight {
+            workers: u32::MAX,
+            ..entry.cold_weight()
+        },
+    );
+    state.published.store(Arc::new(PublishedStoreView {
+        snapshot: Arc::clone(&snapshot),
+        timeline_snapshot: snapshot,
+        timeline: Arc::new(DescriptorView::new(
+            original.view_generation(),
+            vec![oversized],
+            Vec::new(),
+            Arc::clone(original.live()),
+            None,
+        )),
     }));
 }
 
@@ -221,7 +236,7 @@ fn selection_is_source_scoped_aggregate_and_requires_canonical_sources() {
 }
 
 #[test]
-fn selection_uses_inclusive_segment_end_and_exclusive_request_end() {
+fn selection_keeps_half_open_intersection_with_boundary_halos() {
     let mut entries = synthetic_entries(1, 7, -10, 0, 0);
     entries.extend(synthetic_entries(1, 7, 10, 20, 1));
     entries.extend(synthetic_entries(1, 7, i64::MIN, i64::MIN, 2));
@@ -236,9 +251,11 @@ fn selection_uses_inclusive_segment_end_and_exclusive_request_end() {
             4,
         )
         .expect("boundary plan")
-        .selected_count(),
-        1,
-        "max_ts == from is selected and min_ts == to is excluded"
+        .entries()
+        .map(|entry| (entry.descriptor().min_ts, entry.descriptor().max_ts))
+        .collect::<Vec<_>>(),
+        vec![(i64::MIN, i64::MIN), (-10, 0), (10, 20)],
+        "the intersecting segment is surrounded by one left and right halo"
     );
     assert_eq!(
         SelectedSealedPlan::build(
@@ -248,8 +265,10 @@ fn selection_uses_inclusive_segment_end_and_exclusive_request_end() {
             4,
         )
         .expect("minimum range")
-        .selected_count(),
-        1
+        .entries()
+        .map(|entry| (entry.descriptor().min_ts, entry.descriptor().max_ts))
+        .collect::<Vec<_>>(),
+        vec![(i64::MIN, i64::MIN), (-10, 0)]
     );
     assert_eq!(
         SelectedSealedPlan::build(
@@ -259,9 +278,11 @@ fn selection_uses_inclusive_segment_end_and_exclusive_request_end() {
             4,
         )
         .expect("maximum range")
-        .selected_count(),
-        0,
-        "a segment beginning at the exclusive request end is not selected"
+        .entries()
+        .map(|entry| (entry.descriptor().min_ts, entry.descriptor().max_ts))
+        .collect::<Vec<_>>(),
+        vec![(10, 20), (i64::MAX, i64::MAX)],
+        "the exclusive-end segment is retained only as the right halo"
     );
 }
 
@@ -399,22 +420,17 @@ async fn events_counts_the_deduplicated_source_union_against_one_effective_limit
 }
 
 #[tokio::test]
-async fn a_cold_weight_above_capacity_is_a_typed_no_store_http_overload() {
+async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_with_limit(dir.path(), 1);
-    let entry = synthetic_entries(1, 7, 0, 1, 0)
-        .pop()
-        .expect("synthetic entry");
-    let oversized = DescriptorEntry::new(
-        *entry.descriptor(),
-        entry.fact_build_key(),
-        ColdWorkWeight {
-            workers: u32::MAX,
-            ..one_weight()
-        },
-        entry.source_scope_id(),
-    );
-    install_view(&state, synthetic_view(vec![oversized], Vec::new()));
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+    let mut config = OverviewConfig::new();
+    config.max_selected_segments = 1;
+    config.cold.retry_after_seconds = 7;
+    let state =
+        AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), &config)
+            .expect("state");
+    install_oversized_real_entry(&state);
 
     let response = app(state.clone(), None, test_metrics_handle())
         .oneshot(
@@ -429,15 +445,15 @@ async fn a_cold_weight_above_capacity_is_a_typed_no_store_http_overload() {
     assert_problem(
         &response.body,
         StatusCode::SERVICE_UNAVAILABLE,
-        "overview_capacity_unavailable",
-        serde_json::json!({ "retry_after_seconds": 1 }),
+        "cold_build_overloaded",
+        serde_json::json!({ "retry_after_seconds": 7 }),
     );
     assert_eq!(
         response
             .headers
             .get(header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok()),
-        Some("1")
+        Some("7")
     );
     assert_eq!(
         response
@@ -450,7 +466,93 @@ async fn a_cold_weight_above_capacity_is_a_typed_no_store_http_overload() {
 }
 
 #[tokio::test]
-async fn foreign_synthetic_descriptors_do_not_block_or_load_a_selected_real_source() {
+async fn an_exact_decoded_hit_bypasses_cold_admission() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    let state = state_with_limit(dir.path(), 1);
+
+    let cold = app(state.clone(), None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("cold request"),
+        )
+        .await
+        .expect("cold route");
+    assert_eq!(cold.status(), StatusCode::OK);
+
+    install_oversized_real_entry(&state);
+    let decoded = app(state, None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/events?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("decoded request"),
+        )
+        .await
+        .expect("decoded route");
+    assert_eq!(
+        decoded.status(),
+        StatusCode::OK,
+        "an exact L2 fact must be returned before the oversized cold charge is considered"
+    );
+}
+
+#[tokio::test]
+async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+
+    let first_snapshot =
+        kronika_reader::LocalDirSnapshot::open(dir.path()).expect("first snapshot");
+    let first_state = AppState::with_overview_config(
+        first_snapshot,
+        0,
+        std::time::Duration::from_secs(10),
+        &OverviewConfig::new(),
+    )
+    .expect("first state");
+    let cold = app(first_state.clone(), None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("cold request"),
+        )
+        .await
+        .expect("cold route");
+    assert_eq!(cold.status(), StatusCode::OK);
+    drop(first_state);
+
+    let restarted_snapshot =
+        kronika_reader::LocalDirSnapshot::open(dir.path()).expect("restart snapshot");
+    let restarted = AppState::with_overview_config(
+        restarted_snapshot,
+        0,
+        std::time::Duration::from_secs(10),
+        &OverviewConfig::new(),
+    )
+    .expect("restarted state");
+    install_oversized_real_entry(&restarted);
+    let durable = app(restarted, None, test_metrics_handle())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/timeline/events?source=7&from=0&to=2")
+                .body(Body::empty())
+                .expect("durable request"),
+        )
+        .await
+        .expect("durable route");
+    assert_eq!(
+        durable.status(),
+        StatusCode::OK,
+        "an exact durable fact must be returned before the oversized cold charge is considered"
+    );
+}
+
+#[tokio::test]
+async fn unselected_synthetic_descriptors_do_not_block_or_load_a_real_source() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_bgwriter_segment(dir.path(), "real-source-7.pgm", 7, 0, 1);
     let state = state_with_limit(dir.path(), 1);

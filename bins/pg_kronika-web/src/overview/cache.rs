@@ -107,6 +107,7 @@ impl ResponseCache {
     pub(crate) fn get(&self, key: &CacheKey) -> Option<Arc<[u8]>> {
         let Ok(mut inner) = self.inner.lock() else {
             metrics::counter!("kronika_web_timeline_response_cache_misses_total").increment(1);
+            record_lookup("miss", "lock_poisoned");
             return None;
         };
         inner.clock = inner.clock.wrapping_add(1);
@@ -115,6 +116,7 @@ impl ResponseCache {
             let Some(entry) = inner.entries.get_mut(key) else {
                 drop(inner);
                 metrics::counter!("kronika_web_timeline_response_cache_misses_total").increment(1);
+                record_lookup("miss", "absent");
                 return None;
             };
             entry.last_used = now;
@@ -123,6 +125,7 @@ impl ResponseCache {
         record_cache_gauges(&inner);
         drop(inner);
         metrics::counter!("kronika_web_timeline_response_cache_hits_total").increment(1);
+        record_lookup("hit", "none");
         Some(body)
     }
 
@@ -169,6 +172,12 @@ impl ResponseCache {
         if evicted != 0 {
             metrics::counter!("kronika_web_timeline_response_cache_evictions_total")
                 .increment(evicted);
+            metrics::counter!(
+                "overview_cache_evictions_total",
+                "class" => "responses",
+                "reason" => "budget"
+            )
+            .increment(evicted);
         }
     }
 
@@ -261,6 +270,19 @@ fn record_cache_gauges(inner: &CacheInner) {
     );
     metrics::gauge!("kronika_web_timeline_response_cache_entries").set(inner.entries.len() as f64);
     metrics::gauge!("kronika_web_timeline_response_cache_bytes").set(inner.bytes as f64);
+    metrics::gauge!("overview_cache_entries", "class" => "responses")
+        .set(inner.entries.len() as f64);
+    metrics::gauge!("overview_cache_bytes", "class" => "responses").set(inner.bytes as f64);
+}
+
+fn record_lookup(result: &'static str, reason: &'static str) {
+    metrics::counter!(
+        "overview_fact_lookup_total",
+        "layer" => "l3",
+        "result" => result,
+        "reason" => reason
+    )
+    .increment(1);
 }
 
 #[cfg(test)]
@@ -270,12 +292,12 @@ mod tests {
     fn response_key(fact_set_id: u8, endpoint: Endpoint, page: Option<&str>) -> ResponseKey {
         ResponseKey {
             endpoint,
-            response_schema_version: 1,
+            response_schema_version: 2,
             fact_set_id: [fact_set_id; 32],
             from_us: 0,
             to_us: 1_000,
             step_us: None,
-            notable_policy_version: 1,
+            notable_policy_version: 2,
             health_policy_version: 1,
             filters: String::new(),
             page: page.map(str::to_owned),

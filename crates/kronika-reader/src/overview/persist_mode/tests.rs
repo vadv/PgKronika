@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::io;
 use std::sync::{Arc, Barrier, Mutex};
 
-use kronika_analytics::overview::{NamingContractId, SegmentLocator};
 use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_registry::pg_log::PgLogLifecycleV1;
 use kronika_registry::{Section, Ts};
@@ -23,12 +22,7 @@ fn reservation_id(reservation: Reservation) -> u64 {
 }
 
 fn context() -> SegmentContext {
-    SegmentContext::new(
-        b"persist-mode-tests".to_vec(),
-        NamingContractId([0x33; 16]),
-        SegmentLocator([0x44; 32]),
-    )
-    .expect("valid context")
+    SegmentContext::new("persist-mode-tests.pgm").expect("valid context")
 }
 
 fn lifecycle_pgm() -> Vec<u8> {
@@ -71,7 +65,12 @@ fn lifecycle_pgm() -> Vec<u8> {
 
 fn facts(bytes: &[u8]) -> SegmentFacts {
     let unit = PgmUnit::open(bytes).expect("open PGM");
-    SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract facts")
+    SegmentFacts::extract(&unit, &LIMIT).expect("extract facts")
+}
+
+fn write_source(directory: &TempDir, bytes: &[u8]) {
+    std::fs::write(directory.path().join(context().pgm_file_name()), bytes)
+        .expect("write sibling PGM");
 }
 
 fn seed_authoritative_mark(store: &FactStore) {
@@ -219,7 +218,7 @@ fn contention_and_permanent_failures_do_not_arm_global_backoff() {
         PersistError::Busy,
         PersistError::InvalidFacts,
         PersistError::UnsafePath,
-        PersistError::InvalidCacheState,
+        PersistError::InvalidSidecarState,
         PersistError::Io,
     ] {
         let mut state = PersistState::new(29);
@@ -242,7 +241,7 @@ fn permanent_failure_during_recovery_does_not_clear_the_standing_reason() {
     state.finish(first, Err(PersistError::TransientIo), now);
     state.force_due(now);
     let recovery = reservation_id(state.reserve_due_probe(now));
-    state.finish(recovery, Err(PersistError::InvalidCacheState), now);
+    state.finish(recovery, Err(PersistError::InvalidSidecarState), now);
     let snapshot = state.snapshot(now);
     assert_eq!(snapshot.failures, 1);
     assert_eq!(snapshot.reason, Some(PersistError::TransientIo));
@@ -269,7 +268,7 @@ fn persistence_errors_have_closed_recovery_classes() {
     for error in [
         PersistError::InvalidFacts,
         PersistError::UnsafePath,
-        PersistError::InvalidCacheState,
+        PersistError::InvalidSidecarState,
         PersistError::Io,
     ] {
         assert_eq!(error.class(), PersistFailureClass::Permanent);
@@ -297,7 +296,7 @@ fn filesystem_error_mapping_distinguishes_recovery_policy() {
     }
     assert_eq!(
         PersistError::from_io(io::Error::new(io::ErrorKind::NotADirectory, "invalid root",)),
-        PersistError::InvalidCacheState
+        PersistError::InvalidSidecarState
     );
 }
 
@@ -314,7 +313,7 @@ fn capacity_failure_runs_at_most_one_gc_and_one_publication_retry() {
 
     let bytes = lifecycle_pgm();
     let error = store
-        .publish(&facts(&bytes), &LIMIT)
+        .publish(&facts(&bytes), &context(), &LIMIT)
         .expect_err("the bounded retry still fails");
     assert_eq!(error, PersistError::NoSpace);
     assert_eq!(store.test_publish_attempts(), 2);
@@ -330,8 +329,9 @@ fn one_gc_retry_can_recover_and_reset_persistence_state() {
     store.inject_publish_faults([PersistError::QuotaExceeded]);
 
     let bytes = lifecycle_pgm();
+    write_source(&directory, &bytes);
     store
-        .publish(&facts(&bytes), &LIMIT)
+        .publish(&facts(&bytes), &context(), &LIMIT)
         .expect("second publication attempt succeeds");
     assert_eq!(store.test_publish_attempts(), 2);
     assert_eq!(store.test_recovery_gc_attempts(), 1);
@@ -342,21 +342,23 @@ fn one_gc_retry_can_recover_and_reset_persistence_state() {
 #[test]
 fn incomplete_recovery_scan_forbids_the_capacity_retry() {
     let directory = TempDir::new().expect("cache directory");
-    let store = FactStore::new(directory.path());
+    let gc_config =
+        super::super::gc::GcConfig::new(2, 2, Duration::ZERO, Duration::ZERO, None, None)
+            .expect("valid bounded GC config");
+    let store = FactStore::with_configs(
+        directory.path(),
+        super::super::fallback::FallbackConfig::default(),
+        gc_config,
+    );
     seed_authoritative_mark(&store);
-    std::fs::create_dir(
-        directory
-            .path()
-            .join("overview")
-            .join("v1")
-            .join("foreign-tree"),
-    )
-    .expect("foreign directory");
     store.inject_publish_faults([PersistError::NoSpace, PersistError::NoSpace]);
 
     let bytes = lifecycle_pgm();
+    write_source(&directory, &bytes);
+    std::fs::write(directory.path().join("active.parts"), b"active view")
+        .expect("write active view");
     assert_eq!(
-        store.publish(&facts(&bytes), &LIMIT),
+        store.publish(&facts(&bytes), &context(), &LIMIT),
         Err(PersistError::NoSpace)
     );
     assert_eq!(store.test_publish_attempts(), 1);
@@ -369,10 +371,13 @@ fn durable_reads_continue_during_write_backoff_and_do_not_reset_it() {
     let store = FactStore::new(directory.path());
     let bytes = lifecycle_pgm();
     let facts = facts(&bytes);
-    store.publish(&facts, &LIMIT).expect("initial publication");
+    write_source(&directory, &bytes);
+    store
+        .publish(&facts, &context(), &LIMIT)
+        .expect("initial publication");
     store.inject_publish_faults([PersistError::TransientIo]);
     assert_eq!(
-        store.publish(&facts, &LIMIT),
+        store.publish(&facts, &context(), &LIMIT),
         Err(PersistError::TransientIo)
     );
 
@@ -392,7 +397,7 @@ fn due_probe_resets_backoff_and_removes_its_sentinel() {
     let facts = facts(&bytes);
     store.inject_publish_faults([PersistError::TransientIo]);
     assert_eq!(
-        store.publish(&facts, &LIMIT),
+        store.publish(&facts, &context(), &LIMIT),
         Err(PersistError::TransientIo)
     );
     store.force_persistence_probe_due();
@@ -402,11 +407,15 @@ fn due_probe_resets_backoff_and_removes_its_sentinel() {
         PersistenceProbeOutcome::Succeeded
     );
     assert_eq!(store.persist_mode().mode, PersistMode::ReadWrite);
-    let namespace = directory.path().join("overview").join("v1");
-    let probes = std::fs::read_dir(namespace)
-        .expect("namespace")
+    let probes = std::fs::read_dir(directory.path())
+        .expect("data directory")
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".probe-"))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".pgkronika-overview.probe-")
+        })
         .count();
     assert_eq!(probes, 0);
 }

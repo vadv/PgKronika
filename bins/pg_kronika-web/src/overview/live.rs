@@ -7,29 +7,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kronika_analytics::overview::{NamingContractId, SegmentLocator};
 use kronika_reader::{
-    FactBuildKey, FactKey, FactStore, FallbackConfig, FileKind, GcConfig, GcMark, GcOutcome, LIMIT,
-    LiveBuilder, LiveConfigError, LiveFoldError, LocalDirSnapshot, RefreshDelta, SealedFactError,
-    SealedLocator, SegmentContext, SegmentDescriptor, SegmentFacts,
+    FactBuildKey, FactKey, FactStore, FallbackConfig, FileKind, FoldEffect, GcConfig, GcMark,
+    GcOutcome, LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState, LocalDirSnapshot,
+    RefreshDelta, SealedFactError, SealedLocator, SegmentDescriptor, SegmentFacts,
 };
 
 use super::admission::{ColdAdmissionConfig, ColdWorkWeight};
 use super::loader::OverviewFactLoader;
 use super::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
 use super::view::{DescriptorEntry, DescriptorView, PromotionCandidate};
-
-/// Deployment naming-contract identity for overview facts.
-///
-/// The contract binds the registry/extractor version into segment identity; a
-/// fixed value scopes every segment in this deployment consistently.
-const OVERVIEW_NAMING_CONTRACT: NamingContractId = NamingContractId([1; 16]);
+use crate::OverviewColdConfig;
 
 /// One refresh failure that prevents a coherent timeline publication.
 #[derive(Debug)]
 pub enum OverviewBuildError {
-    /// The configured namespace or live bounds are invalid.
+    /// The configured live bounds are invalid.
     Config(LiveConfigError),
     /// A completed active part could not be opened or folded.
     Live(LiveFoldError),
@@ -37,6 +32,8 @@ pub enum OverviewBuildError {
     ActiveRead(kronika_reader::ReadError),
     /// The process-wide cold-work bounds are invalid.
     ColdAdmission,
+    /// The bounded source-scrub cadence is zero.
+    SourceScrubInterval,
     /// The selected-segment request policy is outside the v1 range.
     SelectedSegmentLimit {
         /// Rejected configured value.
@@ -55,6 +52,9 @@ impl std::fmt::Display for OverviewBuildError {
             Self::Live(error) => write!(f, "overview live fold: {error}"),
             Self::ActiveRead(error) => write!(f, "overview active read: {error}"),
             Self::ColdAdmission => f.write_str("overview cold admission limits are invalid"),
+            Self::SourceScrubInterval => {
+                f.write_str("overview source scrub interval must be non-zero")
+            }
             Self::SelectedSegmentLimit {
                 configured,
                 maximum,
@@ -73,7 +73,10 @@ impl std::error::Error for OverviewBuildError {
             Self::Config(error) => Some(error),
             Self::Live(error) => Some(error),
             Self::ActiveRead(error) => Some(error),
-            Self::ColdAdmission | Self::SelectedSegmentLimit { .. } | Self::WriterPoisoned => None,
+            Self::ColdAdmission
+            | Self::SourceScrubInterval
+            | Self::SelectedSegmentLimit { .. }
+            | Self::WriterPoisoned => None,
         }
     }
 }
@@ -88,9 +91,12 @@ const GC_INTERVAL_PASSES: u64 = 60;
 #[derive(Debug)]
 pub(crate) struct OverviewWriter {
     store: FactStore,
-    namespace: Vec<u8>,
     sealed: BTreeMap<SealedLocator, DescriptorEntry>,
     unavailable: BTreeMap<SealedLocator, SegmentDescriptor>,
+    scrub_damaged: BTreeMap<SealedLocator, SegmentDescriptor>,
+    scrub_cursor: Option<(SealedLocator, u32)>,
+    source_scrub_interval: Duration,
+    next_source_scrub: Instant,
     live: LiveBuilder,
     passes_since_gc: u64,
     view_generation: u64,
@@ -100,27 +106,44 @@ impl OverviewWriter {
     /// Builds a writer with explicit durable and fallback storage policy.
     #[cfg(test)]
     pub(crate) fn new(
-        cache_root: PathBuf,
-        namespace: Vec<u8>,
+        data_dir: PathBuf,
         fallback: FallbackConfig,
     ) -> Result<Self, OverviewBuildError> {
-        Self::with_gc_config(cache_root, namespace, fallback, GcConfig::default())
+        Self::with_gc_config(data_dir, fallback, GcConfig::default())
     }
 
     /// Builds a writer with explicit fallback and durable GC/quota policies.
+    #[cfg(test)]
     pub(crate) fn with_gc_config(
-        cache_root: PathBuf,
-        namespace: Vec<u8>,
+        data_dir: PathBuf,
         fallback: FallbackConfig,
         gc: GcConfig,
     ) -> Result<Self, OverviewBuildError> {
-        let live =
-            LiveBuilder::new(namespace.clone(), LIMIT).map_err(OverviewBuildError::Config)?;
+        Self::with_runtime_config(data_dir, fallback, gc, Duration::from_mins(1))
+    }
+
+    /// Builds a writer with the complete production storage policy.
+    pub(crate) fn with_runtime_config(
+        data_dir: PathBuf,
+        fallback: FallbackConfig,
+        gc: GcConfig,
+        source_scrub_interval: Duration,
+    ) -> Result<Self, OverviewBuildError> {
+        if source_scrub_interval.is_zero() {
+            return Err(OverviewBuildError::SourceScrubInterval);
+        }
+        let next_source_scrub = Instant::now()
+            .checked_add(source_scrub_interval)
+            .ok_or(OverviewBuildError::SourceScrubInterval)?;
+        let live = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
         Ok(Self {
-            store: FactStore::with_configs(cache_root, fallback, gc),
-            namespace,
+            store: FactStore::with_configs(data_dir, fallback, gc),
             sealed: BTreeMap::new(),
             unavailable: BTreeMap::new(),
+            scrub_damaged: BTreeMap::new(),
+            scrub_cursor: None,
+            source_scrub_interval,
+            next_source_scrub,
             live,
             passes_since_gc: 0,
             view_generation: 0,
@@ -139,10 +162,19 @@ impl OverviewWriter {
 
     pub(crate) fn fact_loader(
         &self,
-        config: ColdAdmissionConfig,
+        policy: OverviewColdConfig,
+        decoded_cache_bytes: usize,
+        decoded_cache_entries: usize,
     ) -> Result<OverviewFactLoader, OverviewBuildError> {
-        OverviewFactLoader::new(self.store.clone(), self.namespace.clone(), config)
-            .map_err(|_error| OverviewBuildError::ColdAdmission)
+        let config = ColdAdmissionConfig::from_operator(policy)
+            .map_err(|_error| OverviewBuildError::ColdAdmission)?;
+        OverviewFactLoader::new(
+            self.store.clone(),
+            config,
+            decoded_cache_bytes,
+            decoded_cache_entries,
+        )
+        .map_err(|_error| OverviewBuildError::ColdAdmission)
     }
 
     /// Requests a bounded GC scan at most once per [`GC_INTERVAL_PASSES`]
@@ -179,14 +211,14 @@ impl OverviewWriter {
         delta: &RefreshDelta,
     ) -> Result<DescriptorView, OverviewBuildError> {
         let prior_live = Arc::new(self.live.publish());
+        self.scrub_one_source_section(snapshot);
         let mut sealed = self.sealed.clone();
         let mut unavailable = self.unavailable.clone();
         self.refresh_sealed(snapshot, &mut sealed, &mut unavailable);
 
         let mut live = self.live.clone();
         if let Err(first_error) = fold_refresh(&mut live, snapshot, delta) {
-            let mut rebuilt = LiveBuilder::new(self.namespace.clone(), LIMIT)
-                .map_err(OverviewBuildError::Config)?;
+            let mut rebuilt = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
             let baseline = full_live_baseline(delta);
             fold_refresh(&mut rebuilt, snapshot, &baseline).map_err(|_error| first_error)?;
             live = rebuilt;
@@ -217,7 +249,7 @@ impl OverviewWriter {
     }
 
     fn refresh_sealed(
-        &self,
+        &mut self,
         snapshot: &LocalDirSnapshot,
         sealed: &mut BTreeMap<SealedLocator, DescriptorEntry>,
         unavailable: &mut BTreeMap<SealedLocator, SegmentDescriptor>,
@@ -227,6 +259,8 @@ impl OverviewWriter {
             .iter()
             .map(|descriptor| (descriptor.locator, *descriptor))
             .collect::<BTreeMap<_, _>>();
+        self.scrub_damaged
+            .retain(|locator, descriptor| baseline.get(locator) == Some(descriptor));
         sealed.retain(|locator, entry| {
             baseline
                 .get(locator)
@@ -234,50 +268,133 @@ impl OverviewWriter {
         });
         unavailable.retain(|locator, descriptor| baseline.get(locator) == Some(descriptor));
         for descriptor in baseline.values() {
+            if self.scrub_damaged.get(&descriptor.locator) == Some(descriptor) {
+                sealed.remove(&descriptor.locator);
+                unavailable.insert(descriptor.locator, *descriptor);
+                continue;
+            }
             if sealed.contains_key(&descriptor.locator) {
                 unavailable.remove(&descriptor.locator);
                 continue;
             }
-            match self.describe_sealed(snapshot, descriptor) {
+            match Self::describe_sealed(snapshot, descriptor) {
                 Ok(entry) => {
                     sealed.insert(descriptor.locator, entry);
                     unavailable.remove(&descriptor.locator);
                 }
                 Err(_error) => {
                     metrics::counter!("kronika_web_overview_sealed_failures_total").increment(1);
+                    metrics::counter!(
+                        "overview_source_failures_total",
+                        "reason" => "sealed_descriptor"
+                    )
+                    .increment(1);
                     unavailable.insert(descriptor.locator, *descriptor);
                 }
             }
         }
+        record_damaged_sources(self.scrub_damaged.len());
+    }
+
+    fn scrub_one_source_section(&mut self, snapshot: &LocalDirSnapshot) {
+        let now = Instant::now();
+        if now < self.next_source_scrub {
+            return;
+        }
+        self.next_source_scrub = now.checked_add(self.source_scrub_interval).unwrap_or(now);
+
+        let descriptors = snapshot.sealed_descriptors();
+        if descriptors.is_empty() {
+            self.scrub_cursor = None;
+            return;
+        }
+        let (position, ordinal) = self.scrub_position(descriptors);
+        let descriptor = descriptors[position];
+        let started = Instant::now();
+        let unit = match snapshot.open_sealed_by_descriptor(&descriptor) {
+            Ok(unit) => unit,
+            Err(_error) => {
+                self.mark_scrub_damage(descriptor);
+                self.advance_scrub_cursor(descriptors, position);
+                metrics::counter!(
+                    "overview_source_failures_total",
+                    "reason" => "scrub_open"
+                )
+                .increment(1);
+                record_scrub("open_error", 0, started);
+                return;
+            }
+        };
+        if unit.catalog().entries.is_empty() {
+            self.scrub_damaged.remove(&descriptor.locator);
+            self.advance_scrub_cursor(descriptors, position);
+            record_scrub("empty", 0, started);
+            return;
+        }
+        let ordinal =
+            ordinal.min(u32::try_from(unit.catalog().entries.len() - 1).unwrap_or(u32::MAX));
+        let result = unit.scrub_overview_section(ordinal);
+        let stats = unit.body_read_stats();
+        match result {
+            Ok(()) => {
+                let next = usize::try_from(ordinal)
+                    .ok()
+                    .and_then(|ordinal| ordinal.checked_add(1));
+                if next.is_some_and(|next| next < unit.catalog().entries.len()) {
+                    self.scrub_cursor = Some((descriptor.locator, ordinal.saturating_add(1)));
+                } else {
+                    self.scrub_damaged.remove(&descriptor.locator);
+                    self.advance_scrub_cursor(descriptors, position);
+                }
+                record_scrub("ok", stats.stored_bytes_read, started);
+            }
+            Err(_error) => {
+                self.mark_scrub_damage(descriptor);
+                self.advance_scrub_cursor(descriptors, position);
+                metrics::counter!(
+                    "overview_source_failures_total",
+                    "reason" => "scrub_damage"
+                )
+                .increment(1);
+                record_scrub("damage", stats.stored_bytes_read, started);
+            }
+        }
+    }
+
+    fn scrub_position(&self, descriptors: &[SegmentDescriptor]) -> (usize, u32) {
+        let Some((locator, ordinal)) = self.scrub_cursor else {
+            return (0, 0);
+        };
+        descriptors
+            .iter()
+            .position(|descriptor| descriptor.locator == locator)
+            .map_or((0, 0), |position| (position, ordinal))
+    }
+
+    fn advance_scrub_cursor(&mut self, descriptors: &[SegmentDescriptor], position: usize) {
+        let next = position.saturating_add(1);
+        self.scrub_cursor = Some((descriptors.get(next).unwrap_or(&descriptors[0]).locator, 0));
+    }
+
+    fn mark_scrub_damage(&mut self, descriptor: SegmentDescriptor) {
+        self.scrub_damaged.insert(descriptor.locator, descriptor);
+        self.sealed.remove(&descriptor.locator);
+        self.unavailable.insert(descriptor.locator, descriptor);
     }
 
     fn describe_sealed(
-        &self,
         snapshot: &LocalDirSnapshot,
         descriptor: &SegmentDescriptor,
     ) -> Result<DescriptorEntry, SealedFactError> {
-        let context = self.context(descriptor)?;
         let unit = snapshot.open_sealed_by_descriptor(descriptor)?;
         let (identity, lineage) =
-            SegmentFacts::provenance(&unit, &context).map_err(SealedFactError::Build)?;
+            SegmentFacts::provenance(&unit).map_err(SealedFactError::Build)?;
         let fact_key = FactKey::for_identity(&identity, FileKind::SegmentFacts);
         Ok(DescriptorEntry::new(
             *descriptor,
             FactBuildKey::new(fact_key, lineage.id()),
             ColdWorkWeight::for_unit(&unit),
-            identity.source_scope_id,
         ))
-    }
-
-    fn context(&self, descriptor: &SegmentDescriptor) -> Result<SegmentContext, SealedFactError> {
-        SegmentContext::new(
-            self.namespace.clone(),
-            OVERVIEW_NAMING_CONTRACT,
-            SegmentLocator(*descriptor.locator.as_bytes()),
-        )
-        .map_err(|_error| SealedFactError::ContextLocatorMismatch {
-            locator: descriptor.locator,
-        })
     }
 
     fn current_view(
@@ -285,14 +402,30 @@ impl OverviewWriter {
         view_generation: u64,
         promotion: Option<PromotionCandidate>,
     ) -> DescriptorView {
-        DescriptorView::new(
+        let view = DescriptorView::new(
             view_generation,
             self.sealed.values().cloned().collect(),
             self.unavailable.values().copied().collect(),
             Arc::new(self.live.publish()),
             promotion,
-        )
+        );
+        record_live_metrics(&view);
+        view
     }
+}
+
+fn record_scrub(outcome: &'static str, bytes: u64, started: Instant) {
+    metrics::counter!("overview_source_scrub_total", "outcome" => outcome).increment(1);
+    metrics::counter!("overview_source_scrub_bytes_total").increment(bytes);
+    metrics::histogram!("overview_source_scrub_seconds").record(started.elapsed());
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64 and the descriptor count is tightly bounded"
+)]
+fn record_damaged_sources(count: usize) {
+    metrics::gauge!("overview_source_damaged_segments").set(count as f64);
 }
 
 fn fold_refresh(
@@ -307,11 +440,57 @@ fn fold_refresh(
         let unit = snapshot
             .open_active_part(part)
             .map_err(OverviewBuildError::ActiveRead)?;
-        builder
+        let effect = builder
             .fold_part(part, &unit)
             .map_err(OverviewBuildError::Live)?;
+        if effect == FoldEffect::Folded {
+            metrics::counter!("overview_live_folded_parts_total").increment(1);
+        }
     }
     builder.complete_refresh().map_err(OverviewBuildError::Live)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64; timestamps remain exact enough for operational lag"
+)]
+fn record_live_metrics(view: &DescriptorView) {
+    let live = view.live();
+    let (state, reason) = match live.state() {
+        LiveState::Empty => ("empty", "proven_empty"),
+        LiveState::Warming => ("warming", "bootstrap"),
+        LiveState::Current => ("current", "none"),
+        LiveState::NeedsRebuild => ("needs_rebuild", "continuity"),
+        LiveState::Incomplete => ("incomplete", "loss_or_limit"),
+    };
+    for (candidate_state, candidate_reason) in [
+        ("empty", "proven_empty"),
+        ("warming", "bootstrap"),
+        ("current", "none"),
+        ("needs_rebuild", "continuity"),
+        ("incomplete", "loss_or_limit"),
+    ] {
+        metrics::gauge!(
+            "overview_live_state",
+            "state" => candidate_state,
+            "reason" => candidate_reason
+        )
+        .set(f64::from(
+            candidate_state == state && candidate_reason == reason,
+        ));
+    }
+    let watermark = live.watermark_us().unwrap_or_default();
+    metrics::gauge!("overview_live_data_through_us").set(watermark as f64);
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let lag_seconds = live.watermark_us().map_or(0.0, |watermark| {
+        let lag_us = u128::from(u64::try_from(watermark).unwrap_or_default());
+        now_us.saturating_sub(lag_us) as f64 / 1_000_000.0
+    });
+    metrics::gauge!("overview_live_visibility_lag_seconds").set(lag_seconds);
+    metrics::gauge!("overview_view_generation").set(view.view_generation() as f64);
 }
 
 fn full_live_baseline(delta: &RefreshDelta) -> RefreshDelta {
@@ -329,7 +508,6 @@ pub(crate) type OverviewIndex = OverviewWriter;
 mod tests {
     use super::*;
     use std::io::Write as _;
-    use std::time::Duration;
 
     use kronika_analytics::overview::{CountLimits, CoverageSpan, OracleLimits, RawOracle};
     use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
@@ -431,7 +609,7 @@ mod tests {
         )
         .expect("selected plan");
         writer
-            .fact_loader(ColdAdmissionConfig::default())
+            .fact_loader(OverviewColdConfig::default(), 16 * 1024 * 1024, 16)
             .expect("fact loader")
             .load_selected(Arc::new(snapshot.clone()), &plan)
             .await
@@ -441,17 +619,12 @@ mod tests {
     #[tokio::test]
     async fn an_empty_store_assembles_an_empty_current_view() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
-        let mut index = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut index = OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         let descriptors = index.assemble(&snapshot, &delta).expect("view");
         let view = load_selected(
             &index,
@@ -468,21 +641,16 @@ mod tests {
     #[tokio::test]
     async fn a_sealed_segment_is_loaded_only_after_its_plan_is_admitted() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
-        let mut index = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut index = OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         let descriptors = index.assemble(&snapshot, &delta).expect("view");
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             0,
             "descriptor publication does not build a fact file"
         );
@@ -498,10 +666,10 @@ mod tests {
             !view.coverage_envelope().is_empty(),
             "the admitted sealed segment binds coverage into the query view"
         );
-        assert_eq!(ovf_files(cache.path()), 1);
+        assert_eq!(ovf_files(dir.path()), 1);
     }
 
-    fn ovf_files(cache_root: &std::path::Path) -> usize {
+    fn ovf_files(data_dir: &std::path::Path) -> usize {
         fn walk(dir: &std::path::Path, count: &mut usize) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
@@ -516,22 +684,20 @@ mod tests {
             }
         }
         let mut count = 0;
-        walk(cache_root, &mut count);
+        walk(data_dir, &mut count);
         count
     }
 
     #[tokio::test]
     async fn gc_reclaims_the_fact_file_of_a_dropped_segment() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
         let mut index = OverviewIndex::with_gc_config(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
+            dir.path().to_path_buf(),
             FallbackConfig::default(),
             GcConfig::new(1_000, 2, Duration::ZERO, Duration::ZERO, None, None)
                 .expect("test GC policy"),
@@ -549,7 +715,7 @@ mod tests {
             .await,
         );
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             1,
             "the sealed segment published a fact file"
         );
@@ -560,7 +726,7 @@ mod tests {
             let _ = index.collect_fact_garbage();
         }
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             1,
             "a live segment's fact file survives GC"
         );
@@ -610,7 +776,7 @@ mod tests {
             "the dropped segment's fact file is unlinked"
         );
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             1,
             "only the newly added live segment's fact file remains"
         );
@@ -619,12 +785,8 @@ mod tests {
     #[test]
     fn gc_runs_only_on_the_interval_boundary() {
         let cache = tempfile::tempdir().expect("cache dir");
-        let mut index = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut index = OverviewIndex::new(cache.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         for _ in 0..(GC_INTERVAL_PASSES - 1) {
             assert!(
                 index.collect_fact_garbage().is_none(),
@@ -640,18 +802,13 @@ mod tests {
     #[test]
     fn repeat_assembly_is_deterministic_in_plan_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let first_delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
-        let mut index = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut index = OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         let first = index.assemble(&snapshot, &first_delta).expect("first view");
         let second_delta = snapshot
             .refresh_incremental_delta()
@@ -674,28 +831,11 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_namespace_fails_instead_of_aliasing() {
-        let cache = tempfile::tempdir().expect("cache dir");
-        assert!(matches!(
-            OverviewIndex::new(
-                cache.path().to_path_buf(),
-                Vec::new(),
-                FallbackConfig::default()
-            ),
-            Err(OverviewBuildError::Config(
-                LiveConfigError::EmptyStoreNamespace
-            ))
-        ));
-        assert!(matches!(
-            OverviewIndex::new(
-                cache.path().to_path_buf(),
-                vec![b'x'; 4097],
-                FallbackConfig::default()
-            ),
-            Err(OverviewBuildError::Config(
-                LiveConfigError::StoreNamespaceTooLong
-            ))
-        ));
+    fn writer_has_no_separate_namespace_or_cache_tree() {
+        let dir = tempfile::tempdir().expect("data directory");
+        OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer needs only the owned data directory");
+        assert!(!dir.path().join("overview").exists());
     }
 
     #[tokio::test]
@@ -705,7 +845,6 @@ mod tests {
     )]
     async fn append_then_seal_keeps_one_coherent_event_set() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         let first = lifecycle_row(1_500, 41);
         let second = lifecycle_row(2_500, 42);
         let first_part = lifecycle_part(std::slice::from_ref(&first));
@@ -716,12 +855,8 @@ mod tests {
         let bootstrap = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
-        let mut writer = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut writer = OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         let first_descriptors = writer
             .assemble(&snapshot, &bootstrap)
             .expect("first live view");
@@ -805,7 +940,7 @@ mod tests {
             "seal reconciliation neither drops nor duplicates live observations"
         );
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             1,
             "the reconciled sealed facts are durably published"
         );

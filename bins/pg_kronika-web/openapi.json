@@ -274,7 +274,7 @@
     "/v1/timeline/overview": {
       "get": {
         "operationId": "timelineOverview",
-        "description": "Queries one half-open source range of at most 31 days. Before fact-cache or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries one half-open source range of at most 31 days. Before sidecar or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission. A selected source read failure returns an uncached partial 200 response with an explicit known gap; FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineSource" },
@@ -302,7 +302,7 @@
     "/v1/timeline/events": {
       "get": {
         "operationId": "timelineEvents",
-        "description": "Queries a canonical source set over a half-open range of at most 31 days. Before fact-cache or source access, one aggregate limit applies to intersecting sealed segments across the deduplicated source set (default 1024, operator range 1..=4096). Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries a canonical source set over a half-open range of at most 31 days. Before sidecar or source access, one aggregate limit applies to intersecting sealed segments across the deduplicated source set (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission; selected source failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineEventSources" },
@@ -335,7 +335,7 @@
     "/v1/timeline/health": {
       "get": {
         "operationId": "timelineHealth",
-        "description": "Queries one half-open source range of at most 31 days. Before fact-cache or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries one half-open source range of at most 31 days. Before sidecar or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission; selected source failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineSource" },
@@ -532,7 +532,7 @@
       },
       "ProblemRetryAfter": {
         "description": "Seconds before retrying a rejected capacity request",
-        "schema": { "type": "integer", "const": 1 }
+        "schema": { "type": "integer", "minimum": 1 }
       }
     },
     "responses": {
@@ -605,8 +605,8 @@
           "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
           "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
           "Retry-After": {
-            "description": "Present for overview_capacity_unavailable and analytic_capacity_unavailable; absent for cursor_capacity_unavailable",
-            "schema": { "type": "integer", "const": 1 }
+            "description": "Present for cold_build_overloaded and analytic_capacity_unavailable; absent for cursor_capacity_unavailable. Cold-build delay is operator-configured.",
+            "schema": { "type": "integer", "minimum": 1 }
           }
         },
         "content": {
@@ -978,6 +978,13 @@
         "maxLength": 43,
         "pattern": "^[A-Za-z0-9_-]{43}$"
       },
+      "B64Url128": {
+        "type": "string",
+        "description": "Unpadded base64url encoding of a 128-bit stable identifier",
+        "minLength": 22,
+        "maxLength": 22,
+        "pattern": "^[A-Za-z0-9_-]{22}$"
+      },
       "TimelineEventsCursor": {
         "type": "string",
         "description": "Versioned authenticated timeline cursor",
@@ -1023,7 +1030,6 @@
         "additionalProperties": false,
         "required": [
           "source_id",
-          "source_scope_id",
           "data_through_us",
           "source_status",
           "source_completeness",
@@ -1032,12 +1038,6 @@
         ],
         "properties": {
           "source_id": { "type": "integer", "minimum": 0 },
-          "source_scope_id": {
-            "oneOf": [
-              { "$ref": "#/components/schemas/B64UrlSha256" },
-              { "type": "null" }
-            ]
-          },
           "data_through_us": { "type": ["integer", "null"], "format": "int64" },
           "source_status": { "$ref": "#/components/schemas/TimelineSourceStatus" },
           "source_completeness": { "$ref": "#/components/schemas/TimelineSourceCompleteness" },
@@ -1079,7 +1079,7 @@
           "loss"
         ],
         "properties": {
-          "response_schema_version": { "type": "integer", "const": 1 },
+          "response_schema_version": { "type": "integer", "const": 2 },
           "view_generation": { "type": "integer", "minimum": 0 },
           "fact_set_id": { "$ref": "#/components/schemas/B64UrlSha256" },
           "requested_range": { "$ref": "#/components/schemas/CoverageSpan" },
@@ -1124,24 +1124,27 @@
           "section_body_id",
           "catalog_entry_ordinal",
           "row_ordinal",
-          "dictionary_context_id",
-          "segment_locator"
+          "dictionary_context_id"
         ],
         "properties": {
           "observation_id": { "$ref": "#/components/schemas/B64UrlSha256" },
-          "section_body_id": { "$ref": "#/components/schemas/B64UrlSha256" },
+          "section_body_id": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/B64UrlSha256" },
+              { "type": "null" }
+            ]
+          },
           "catalog_entry_ordinal": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "minimum": 0,
             "maximum": 4294967295
           },
           "row_ordinal": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "minimum": 0,
             "maximum": 4294967295
           },
-          "dictionary_context_id": { "$ref": "#/components/schemas/B64UrlSha256" },
-          "segment_locator": {
+          "dictionary_context_id": {
             "oneOf": [
               { "$ref": "#/components/schemas/B64UrlSha256" },
               { "type": "null" }
@@ -1156,7 +1159,7 @@
         "properties": {
           "reasons": {
             "type": "array",
-            "maxItems": 5,
+            "maxItems": 12,
             "uniqueItems": true,
             "items": {
               "type": "string",
@@ -1165,7 +1168,14 @@
                 "lifecycle_cap_exceeded",
                 "parser_bound",
                 "tailer_bound",
-                "dictionary_bound"
+                "dictionary_bound",
+                "snapshot_source_limit",
+                "permission_denied",
+                "source_read_failure",
+                "collector_limit",
+                "visibility_restricted",
+                "missing_reset_context",
+                "invalid_counter_value"
               ]
             }
           },
@@ -1233,11 +1243,70 @@
           }
         }
       },
+      "CounterDeltaEventPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "factor_id", "delta", "duration_us", "reset_epoch"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "pg.database.deadlock_delta",
+              "os.cgroup.oom_delta",
+              "os.cgroup.oom_kill_delta",
+              "os.host.oom_kill_delta"
+            ]
+          },
+          "factor_id": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "delta": { "type": "integer", "minimum": 1 },
+          "duration_us": { "type": "integer", "minimum": 1 },
+          "reset_epoch": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "CapacityEventPayload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "total_bytes", "available_bytes"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "os.filesystem.capacity_zero_transition"
+          },
+          "total_bytes": { "type": "integer", "minimum": 0 },
+          "available_bytes": { "type": "integer", "const": 0 }
+        }
+      },
       "EventPayload": {
         "oneOf": [
           { "$ref": "#/components/schemas/ErrorEventPayload" },
-          { "$ref": "#/components/schemas/LifecycleEventPayload" }
+          { "$ref": "#/components/schemas/LifecycleEventPayload" },
+          { "$ref": "#/components/schemas/CounterDeltaEventPayload" },
+          { "$ref": "#/components/schemas/CapacityEventPayload" }
         ]
+      },
+      "EventEntity": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "id"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "database",
+              "postmaster",
+              "replication_sender",
+              "replication_slot",
+              "cgroup",
+              "host",
+              "filesystem"
+            ]
+          },
+          "id": { "$ref": "#/components/schemas/B64Url128" }
+        }
       },
       "EventFact": {
         "type": "object",
@@ -1246,16 +1315,17 @@
           "event_id",
           "event_instance_id",
           "source_id",
-          "source_scope_id",
           "source_type_id",
           "identity_quality",
           "sort_ts_us",
           "occurred_at_us",
+          "observed_interval",
           "occurrence_count",
           "event_kind",
           "notable_class",
           "evidence_quality",
           "quality_flags",
+          "entity",
           "payload",
           "supporting_evidence",
           "loss"
@@ -1270,9 +1340,8 @@
             "description": "Physical retained-observation identifier"
           },
           "source_id": { "type": "integer", "minimum": 0 },
-          "source_scope_id": { "$ref": "#/components/schemas/B64UrlSha256" },
           "source_type_id": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "minimum": 0,
             "maximum": 4294967295
           },
@@ -1282,6 +1351,12 @@
           },
           "sort_ts_us": { "type": "integer", "format": "int64" },
           "occurred_at_us": { "type": ["integer", "null"], "format": "int64" },
+          "observed_interval": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/CoverageSpan" },
+              { "type": "null" }
+            ]
+          },
           "occurrence_count": { "type": "integer", "minimum": 1 },
           "event_kind": {
             "type": "string",
@@ -1290,7 +1365,12 @@
               "pg.lifecycle.child_signal_termination",
               "pg.lifecycle.child_process_crash",
               "pg.lifecycle.shutdown_requested",
-              "pg.lifecycle.ready_observed"
+              "pg.lifecycle.ready_observed",
+              "pg.database.deadlock_delta",
+              "os.cgroup.oom_delta",
+              "os.cgroup.oom_kill_delta",
+              "os.host.oom_kill_delta",
+              "os.filesystem.capacity_zero_transition"
             ]
           },
           "notable_class": {
@@ -1309,7 +1389,9 @@
               "serialization_failure_observation",
               "auth_failure_observation",
               "authorization_failure_observation",
-              "permission_denied_observation"
+              "permission_denied_observation",
+              "oom_kill_observation",
+              "filesystem_capacity_zero"
             ]
           },
           "evidence_quality": {
@@ -1321,11 +1403,17 @@
             "minimum": 0,
             "maximum": 4294967295
           },
+          "entity": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/EventEntity" },
+              { "type": "null" }
+            ]
+          },
           "payload": { "$ref": "#/components/schemas/EventPayload" },
           "supporting_evidence": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 1,
+            "maxItems": 3,
             "items": { "$ref": "#/components/schemas/SupportingEvidence" }
           },
           "loss": {
@@ -1512,6 +1600,19 @@
           "supporting_fact_id": { "$ref": "#/components/schemas/B64UrlSha256" }
         }
       },
+      "HealthSourcePopulation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["collected", "total", "total_quality"],
+        "properties": {
+          "collected": { "type": "integer", "minimum": 0 },
+          "total": { "type": ["integer", "null"], "minimum": 0 },
+          "total_quality": {
+            "type": "string",
+            "enum": ["exact", "lower_bound", "unknown"]
+          }
+        }
+      },
       "HealthFactorCoverage": {
         "type": "object",
         "additionalProperties": false,
@@ -1520,9 +1621,19 @@
           "applicability",
           "state",
           "interval",
+          "expected_period_us",
+          "period_quality",
+          "cadence_epoch_id",
+          "crosses_cadence_boundary",
           "present_samples",
           "covered_duration_us",
-          "retained_exactness"
+          "source_population",
+          "loss_reasons",
+          "lost_count_lower_bound",
+          "retained_exactness",
+          "source_completeness",
+          "physical_count_semantics",
+          "boundary_quality"
         ],
         "properties": {
           "factor_id": {
@@ -1539,11 +1650,78 @@
             "enum": ["complete", "partial", "gap", "unknown", "not_collected"]
           },
           "interval": { "$ref": "#/components/schemas/CoverageSpan" },
+          "expected_period_us": { "type": ["integer", "null"], "minimum": 1 },
+          "period_quality": {
+            "type": "string",
+            "enum": [
+              "persisted_config_epoch",
+              "observed_stable",
+              "assumed_current_config",
+              "unknown"
+            ]
+          },
+          "cadence_epoch_id": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/B64Url128" },
+              { "type": "null" }
+            ]
+          },
+          "crosses_cadence_boundary": { "type": "boolean" },
           "present_samples": { "type": "integer", "minimum": 0 },
           "covered_duration_us": { "type": "integer", "minimum": 0 },
+          "source_population": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/HealthSourcePopulation" },
+              { "type": "null" }
+            ]
+          },
+          "loss_reasons": {
+            "type": "array",
+            "maxItems": 12,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "group_cap_exceeded",
+                "lifecycle_cap_exceeded",
+                "parser_bound",
+                "tailer_bound",
+                "dictionary_bound",
+                "snapshot_source_limit",
+                "permission_denied",
+                "source_read_failure",
+                "collector_limit",
+                "visibility_restricted",
+                "missing_reset_context",
+                "invalid_counter_value"
+              ]
+            }
+          },
+          "lost_count_lower_bound": {
+            "type": ["integer", "null"],
+            "minimum": 0
+          },
           "retained_exactness": {
             "type": "string",
             "enum": ["retained_exact", "lower_bound", "unknown"]
+          },
+          "source_completeness": {
+            "type": "string",
+            "enum": ["full", "bounded_subset", "unknown"]
+          },
+          "physical_count_semantics": {
+            "type": "string",
+            "enum": ["exact", "lower_bound", "unknown", "not_applicable"]
+          },
+          "boundary_quality": {
+            "type": "string",
+            "enum": [
+              "contained",
+              "endpoint_attributed_cross_boundary",
+              "modeled_hold",
+              "mixed",
+              "unknown"
+            ]
           }
         }
       },
@@ -1633,7 +1811,7 @@
           "health_summary": { "$ref": "#/components/schemas/TimelineHealthSummary" },
           "coverage": {
             "type": "array",
-            "maxItems": 8,
+            "maxItems": 65536,
             "items": { "$ref": "#/components/schemas/HealthFactorCoverage" }
           },
           "retained_coverage_duration_us": { "type": "integer", "minimum": 0 }
@@ -1655,7 +1833,7 @@
         ],
         "properties": {
           "meta": { "$ref": "#/components/schemas/TimelineMeta" },
-          "notable_policy_version": { "type": "integer", "const": 1 },
+          "notable_policy_version": { "type": "integer", "const": 2 },
           "events": {
             "type": "array",
             "maxItems": 1000,
@@ -1673,8 +1851,8 @@
           "physical_count_semantics": { "$ref": "#/components/schemas/TimelinePhysicalCountSemantics" },
           "coverage": {
             "type": "array",
-            "maxItems": 262144,
-            "items": { "$ref": "#/components/schemas/CoverageSpan" }
+            "maxItems": 65536,
+            "items": { "$ref": "#/components/schemas/HealthFactorCoverage" }
           }
         }
       },
@@ -1698,7 +1876,7 @@
           },
           "coverage": {
             "type": "array",
-            "maxItems": 8,
+            "maxItems": 65536,
             "items": { "$ref": "#/components/schemas/HealthFactorCoverage" }
           }
         }
@@ -1778,7 +1956,7 @@
         "type": "object",
         "additionalProperties": false,
         "required": ["retry_after_seconds"],
-        "properties": { "retry_after_seconds": { "type": "integer", "const": 1 } }
+        "properties": { "retry_after_seconds": { "type": "integer", "minimum": 1 } }
       },
       "Problem": {
         "type": "object",
@@ -1804,7 +1982,7 @@
               "https://pgkronika.dev/problems/query-limit-exceeded",
               "https://pgkronika.dev/problems/cursor-capacity-unavailable",
               "https://pgkronika.dev/problems/analytic-capacity-unavailable",
-              "https://pgkronika.dev/problems/overview-capacity-unavailable",
+              "https://pgkronika.dev/problems/cold-build-overloaded",
               "https://pgkronika.dev/problems/store-read-failed",
               "https://pgkronika.dev/problems/internal-error"
             ]
@@ -1812,7 +1990,7 @@
           "status": { "type": "integer", "enum": [400, 401, 404, 405, 410, 413, 500, 503] },
           "code": {
             "type": "string",
-            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "cursor_expired", "view_gone", "query_limit_exceeded", "cursor_capacity_unavailable", "analytic_capacity_unavailable", "overview_capacity_unavailable", "store_read_failed", "internal_error"]
+            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "cursor_expired", "view_gone", "query_limit_exceeded", "cursor_capacity_unavailable", "analytic_capacity_unavailable", "cold_build_overloaded", "store_read_failed", "internal_error"]
           },
           "params": { "type": "object" },
           "instance": { "type": "string", "format": "uri", "pattern": "^https://pgkronika\\.dev/problems/occurrences/[0-9a-f]{32}$" }
@@ -1857,7 +2035,7 @@
           },
           { "if": { "properties": { "code": { "const": "cursor_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "analytic_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/analytic-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/CapacityParams" } } } },
-          { "if": { "properties": { "code": { "const": "overview_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/overview-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/CapacityParams" } } } },
+          { "if": { "properties": { "code": { "const": "cold_build_overloaded" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cold-build-overloaded" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/CapacityParams" } } } },
           { "if": { "properties": { "code": { "const": "store_read_failed" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/store-read-failed" }, "status": { "const": 500 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "internal_error" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/internal-error" }, "status": { "const": 500 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } }
         ]

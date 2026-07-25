@@ -5,6 +5,44 @@ use crc::{CRC_32_ISCSI, Crc};
 /// Castagnoli CRC32C polynomial.
 const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
+/// Incremental Castagnoli CRC32C calculation for bounded streaming reads.
+pub struct Crc32c {
+    digest: crc::Digest<'static, u32>,
+}
+
+impl std::fmt::Debug for Crc32c {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Crc32c").finish_non_exhaustive()
+    }
+}
+
+impl Crc32c {
+    /// Starts an empty CRC32C calculation.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            digest: CRC32C.digest(),
+        }
+    }
+
+    /// Adds the next contiguous byte chunk.
+    pub const fn update(&mut self, bytes: &[u8]) {
+        self.digest.update(bytes);
+    }
+
+    /// Completes the checksum.
+    #[must_use]
+    pub const fn finalize(self) -> u32 {
+        self.digest.finalize()
+    }
+}
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Return the CRC32C checksum of `bytes`.
 ///
 /// PGM uses CRC32C for section bodies, the end catalog, and `active.parts`
@@ -30,7 +68,7 @@ pub(crate) fn crc32c_with_zeroed_field(bytes: &[u8], zero_at: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::crc32c;
+    use super::{Crc32c, crc32c};
 
     /// The canonical CRC32C check value: `crc32c(b"123456789")`.
     /// Catches accidentally swapping the polynomial (e.g. plain CRC32).
@@ -42,5 +80,14 @@ mod tests {
     #[test]
     fn empty_input() {
         assert_eq!(crc32c(b""), 0);
+    }
+
+    #[test]
+    fn incremental_chunks_match_one_shot_crc32c() {
+        let mut checksum = Crc32c::new();
+        checksum.update(b"123");
+        checksum.update(b"456");
+        checksum.update(b"789");
+        assert_eq!(checksum.finalize(), crc32c(b"123456789"));
     }
 }

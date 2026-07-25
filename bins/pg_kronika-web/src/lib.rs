@@ -64,7 +64,6 @@ macro_rules! closed_string_enum {
 }
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -114,7 +113,6 @@ pub(crate) mod startup;
 
 pub use auth::AuthConfig;
 use auth::require_basic_auth;
-use overview::admission::ColdAdmissionConfig;
 pub use overview::live::OverviewBuildError;
 use overview::selection::{
     ABSOLUTE_MAX_SELECTED_SEGMENTS, DEFAULT_MAX_SELECTED_SEGMENTS, SelectedSealedPlan,
@@ -175,13 +173,60 @@ pub(crate) enum TimelineFlightRole {
     Follower(Arc<TimelineFlight>),
 }
 
-/// Explicit overview storage and memory policy.
-#[derive(Debug, Clone)]
+/// Process-wide policy for cold sealed-fact construction.
+///
+/// Byte and row limits are rounded up to the scheduler's fixed accounting
+/// quanta. All fields must be non-zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverviewColdConfig {
+    /// Maximum active sealed-fact workers.
+    pub max_workers: u32,
+    /// Maximum queued exact fact builds.
+    pub max_queue: usize,
+    /// Maximum concurrent fact loads started by one request.
+    pub per_request_parallelism: usize,
+    /// Maximum time a request may wait in the FIFO admission queue.
+    pub wait_timeout: Duration,
+    /// Stable `Retry-After` value returned for cold-build overload.
+    pub retry_after_seconds: u64,
+    /// Aggregate source-PGM bytes admitted at once.
+    pub pgm_bytes: u64,
+    /// Aggregate decoded working-set bytes admitted at once.
+    pub decoded_bytes: u64,
+    /// Aggregate source rows charged as CPU work at once.
+    pub cpu_rows: u64,
+    /// Aggregate file descriptors reserved for cold work.
+    pub file_descriptors: u32,
+    /// Aggregate source and durable-cache read bytes admitted at once.
+    pub read_bytes: u64,
+    /// Aggregate durable-cache write bytes admitted at once.
+    pub write_bytes: u64,
+    /// Aggregate durable publications admitted at once.
+    pub publications: u32,
+}
+
+impl Default for OverviewColdConfig {
+    fn default() -> Self {
+        Self {
+            max_workers: 4,
+            max_queue: 64,
+            per_request_parallelism: 4,
+            wait_timeout: Duration::from_secs(5),
+            retry_after_seconds: 1,
+            pgm_bytes: 1024 * 1024 * 1024,
+            decoded_bytes: 1024 * 1024 * 1024,
+            cpu_rows: 32 * 65_536,
+            file_descriptors: 16,
+            read_bytes: 1024 * 1024 * 1024,
+            write_bytes: 1024 * 1024 * 1024,
+            publications: 4,
+        }
+    }
+}
+
+/// Explicit overview memory, retention, and work policy.
+#[derive(Debug, Clone, Copy)]
 pub struct OverviewConfig {
-    /// Durable fact-cache root.
-    pub cache_root: PathBuf,
-    /// Stable normalized store/deployment identity.
-    pub namespace: Vec<u8>,
     /// Bounded durable-publication fallback.
     pub fallback: FallbackConfig,
     /// Bounded GC and optional hard durable-cache quota.
@@ -190,6 +235,12 @@ pub struct OverviewConfig {
     pub response_cache_bytes: usize,
     /// Secondary serialized-response entry ceiling.
     pub response_cache_entries: usize,
+    /// Logical decoded-fact L2 byte ceiling.
+    pub decoded_cache_bytes: usize,
+    /// Secondary decoded-fact L2 entry ceiling.
+    pub decoded_cache_entries: usize,
+    /// Cadence for streaming CRC scrub of one sealed source section.
+    pub source_scrub_interval: Duration,
     /// Maximum simultaneously pinned event views.
     pub cursor_max_views: usize,
     /// Logical byte ceiling for pinned event views.
@@ -198,26 +249,33 @@ pub struct OverviewConfig {
     pub cursor_ttl: Duration,
     /// Effective selected sealed-segment limit.
     pub max_selected_segments: usize,
-    cold_admission: ColdAdmissionConfig,
+    /// Process-wide cold sealed-fact construction policy.
+    pub cold: OverviewColdConfig,
 }
 
 impl OverviewConfig {
-    /// Builds the default bounded policy for an explicit cache root and
-    /// namespace.
+    /// Builds the default bounded policy.
     #[must_use]
-    pub fn new(cache_root: PathBuf, namespace: Vec<u8>) -> Self {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for OverviewConfig {
+    fn default() -> Self {
         Self {
-            cache_root,
-            namespace,
             fallback: FallbackConfig::default(),
             gc: GcConfig::default(),
             response_cache_bytes: RESPONSE_CACHE_BYTES,
             response_cache_entries: RESPONSE_CACHE_ENTRIES,
+            decoded_cache_bytes: 256 * 1024 * 1024,
+            decoded_cache_entries: 4_096,
+            source_scrub_interval: Duration::from_mins(1),
             cursor_max_views: 64,
             cursor_max_bytes: 512 * 1024 * 1024,
             cursor_ttl: Duration::from_mins(5),
             max_selected_segments: DEFAULT_MAX_SELECTED_SEGMENTS,
-            cold_admission: ColdAdmissionConfig::default(),
+            cold: OverviewColdConfig::default(),
         }
     }
 }
@@ -309,6 +367,18 @@ fn record_gc_category(kind: &'static str, usage: GcCategoryUsage) {
         .set(usage.logical_bytes as f64);
     metrics::gauge!("kronika_web_overview_cache_allocated_bytes", "kind" => kind)
         .set(usage.allocated_bytes as f64);
+    metrics::gauge!("overview_cache_entries", "class" => format!("durable_{kind}"))
+        .set(usage.files as f64);
+    metrics::gauge!(
+        "overview_cache_bytes",
+        "class" => format!("durable_{kind}_logical")
+    )
+    .set(usage.logical_bytes as f64);
+    metrics::gauge!(
+        "overview_cache_bytes",
+        "class" => format!("durable_{kind}_allocated")
+    )
+    .set(usage.allocated_bytes as f64);
 }
 
 #[allow(
@@ -322,7 +392,7 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
         metrics::gauge!("kronika_web_overview_gc_quota_exceeded").set(0.0);
         metrics::gauge!("kronika_web_overview_gc_pending").set(0.0);
         metrics::gauge!("kronika_web_overview_gc_scanned_entries").set(0.0);
-        for kind in ["committed", "temporary", "quarantine", "lock", "foreign"] {
+        for kind in ["sidecar", "temporary", "lock"] {
             record_gc_category(kind, GcCategoryUsage::default());
         }
         return;
@@ -332,18 +402,41 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
     metrics::gauge!("kronika_web_overview_gc_sweep_authorized")
         .set(f64::from(outcome.sweep_authorized));
     metrics::gauge!("kronika_web_overview_gc_scanned_entries").set(outcome.scanned as f64);
-    metrics::counter!("kronika_web_overview_gc_deleted_finals_total")
-        .increment(outcome.deleted_finals);
+    metrics::counter!("kronika_web_overview_gc_deleted_sidecars_total")
+        .increment(outcome.deleted_sidecars);
+    metrics::counter!(
+        "overview_gc_files_total",
+        "action" => "deleted",
+        "reason" => "sidecar"
+    )
+    .increment(outcome.deleted_sidecars);
     metrics::counter!("kronika_web_overview_gc_deleted_artifacts_total")
         .increment(outcome.deleted_artifacts);
+    metrics::counter!(
+        "overview_gc_files_total",
+        "action" => "deleted",
+        "reason" => "artifact"
+    )
+    .increment(outcome.deleted_artifacts);
     metrics::counter!("kronika_web_overview_gc_unlinked_logical_bytes_total")
         .increment(outcome.unlinked_logical_bytes);
     metrics::counter!("kronika_web_overview_gc_unlinked_allocated_bytes_total")
         .increment(outcome.unlinked_allocated_bytes);
+    metrics::counter!("overview_gc_bytes_total", "action" => "unlinked_logical")
+        .increment(outcome.unlinked_logical_bytes);
+    metrics::counter!("overview_gc_bytes_total", "action" => "unlinked_allocated")
+        .increment(outcome.unlinked_allocated_bytes);
     if let Some(reason) = outcome.skip_reason {
+        let reason = gc_skip_reason(reason);
         metrics::counter!(
             "kronika_web_overview_gc_skipped_total",
-            "reason" => gc_skip_reason(reason)
+            "reason" => reason
+        )
+        .increment(1);
+        metrics::counter!(
+            "overview_gc_files_total",
+            "action" => "skipped",
+            "reason" => reason
         )
         .increment(1);
     }
@@ -352,11 +445,9 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
             .set(f64::from(outcome.quota_exceeded));
         metrics::gauge!("kronika_web_overview_gc_pending").set(outcome.pending as f64);
         for (kind, usage) in [
-            ("committed", outcome.usage.committed),
+            ("sidecar", outcome.usage.sidecars),
             ("temporary", outcome.usage.temporary),
-            ("quarantine", outcome.usage.quarantine),
             ("lock", outcome.usage.locks),
-            ("foreign", outcome.usage.foreign),
         ] {
             record_gc_category(kind, usage);
         }
@@ -364,15 +455,7 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
 }
 
 fn default_overview_config() -> OverviewConfig {
-    static INSTANCE: AtomicU64 = AtomicU64::new(0);
-    let instance = INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    OverviewConfig::new(
-        std::env::temp_dir().join(format!(
-            "pgkronika-overview-test-{}-{instance}",
-            std::process::id()
-        )),
-        format!("test-store-{}-{instance}", std::process::id()).into_bytes(),
-    )
+    OverviewConfig::new()
 }
 
 impl AppState {
@@ -395,7 +478,7 @@ impl AppState {
             snapshot,
             now,
             Duration::from_secs(10),
-            default_overview_config(),
+            &default_overview_config(),
         )
     }
 
@@ -417,7 +500,7 @@ impl AppState {
             snapshot,
             last_refresh_secs,
             stale_after,
-            default_overview_config(),
+            &default_overview_config(),
         )
     }
 
@@ -431,21 +514,22 @@ impl AppState {
         mut snapshot: LocalDirSnapshot,
         last_refresh_secs: u64,
         stale_after: Duration,
-        config: OverviewConfig,
+        config: &OverviewConfig,
     ) -> Result<Self, StateBuildError> {
         let OverviewConfig {
-            cache_root,
-            namespace,
             fallback,
             gc,
             response_cache_bytes,
             response_cache_entries,
+            decoded_cache_bytes,
+            decoded_cache_entries,
+            source_scrub_interval,
             cursor_max_views,
             cursor_max_bytes,
             cursor_ttl,
             max_selected_segments,
-            cold_admission,
-        } = config;
+            cold,
+        } = *config;
         if max_selected_segments == 0 || max_selected_segments > ABSOLUTE_MAX_SELECTED_SEGMENTS {
             return Err(StateBuildError::Overview(
                 OverviewBuildError::SelectedSegmentLimit {
@@ -463,14 +547,18 @@ impl AppState {
         let delta = snapshot
             .refresh_incremental_delta()
             .map_err(StateBuildError::Snapshot)?;
-        let mut overview =
-            overview::OverviewIndex::with_gc_config(cache_root, namespace, fallback, gc)
-                .map_err(StateBuildError::Overview)?;
+        let mut overview = overview::OverviewIndex::with_runtime_config(
+            snapshot.data_dir().to_path_buf(),
+            fallback,
+            gc,
+            source_scrub_interval,
+        )
+        .map_err(StateBuildError::Overview)?;
         let timeline = overview
             .assemble(&snapshot, &delta)
             .map_err(StateBuildError::Overview)?;
         let overview_loader = overview
-            .fact_loader(cold_admission)
+            .fact_loader(cold, decoded_cache_bytes, decoded_cache_entries)
             .map_err(StateBuildError::Overview)?;
         overview::resilience::record_persist_snapshot(overview.persist_mode());
         record_gc_metrics(None);
@@ -722,6 +810,7 @@ async fn track_metrics(req: Request<axum::body::Body>, next: Next) -> Response {
 pub fn app(state: AppState, auth: Option<AuthConfig>, metrics_handle: PrometheusHandle) -> Router {
     use axum::Extension;
 
+    overview::telemetry::describe_operational_metrics();
     let public = Router::new()
         .route("/healthz", get(handlers::probes::healthz))
         .route("/readyz", get(handlers::probes::readyz))

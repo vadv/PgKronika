@@ -108,7 +108,7 @@ async fn run_stand() -> Result<()> {
     drop(client);
     cluster.stop().await;
 
-    let report = measure::measure(&paths.segments, &paths.ovf_cache, config.chart_series)?;
+    let report = measure::measure(&paths.segments, config.chart_series)?;
     let rendered = measure::render(&report);
     println!("{rendered}");
     let json =
@@ -165,7 +165,7 @@ async fn run_load_only() -> Result<()> {
 fn run_measure() -> Result<()> {
     let config = config::Config::from_env()?;
     let paths = config::StandPaths::under(&config.root);
-    let report = measure::measure(&paths.segments, &paths.ovf_cache, config.chart_series)?;
+    let report = measure::measure(&paths.segments, config.chart_series)?;
     let rendered = measure::render(&report);
     println!("{rendered}");
     Ok(())

@@ -74,8 +74,6 @@ pub(crate) struct StandPaths {
     pub(crate) tablespaces: [PathBuf; 2],
     /// Collector output directory with `.pgm` segments.
     pub(crate) segments: PathBuf,
-    /// Fact-file cache root for built `.ovf` files.
-    pub(crate) ovf_cache: PathBuf,
     /// Final JSON report path.
     pub(crate) report: PathBuf,
 }
@@ -86,7 +84,6 @@ impl StandPaths {
             pgdata: root.join("pgdata"),
             tablespaces: [root.join("ts_hot"), root.join("ts_cold")],
             segments: root.join("segments"),
-            ovf_cache: root.join("ovf-cache"),
             report: root.join("report.json"),
         }
     }
@@ -94,10 +91,8 @@ impl StandPaths {
     /// Creates the durable stand directories; `pgdata` and the tablespaces
     /// are throwaway and belong to [`Cluster::boot`](crate::cluster::Cluster).
     pub(crate) fn create(&self) -> Result<()> {
-        for dir in [&self.segments, &self.ovf_cache] {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("create directory {}", dir.display()))?;
-        }
+        std::fs::create_dir_all(&self.segments)
+            .with_context(|| format!("create directory {}", self.segments.display()))?;
         Ok(())
     }
 }

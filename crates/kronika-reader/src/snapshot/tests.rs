@@ -2,7 +2,6 @@ use std::fs::{self, FileTimes};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::time::{Duration, UNIX_EPOCH};
 
-use kronika_analytics::overview::{NamingContractId, SegmentLocator};
 use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
 use kronika_registry::Section;
 use kronika_registry::Ts;
@@ -68,41 +67,22 @@ fn lifecycle_part(source_id: u64) -> Vec<u8> {
     )
 }
 
-fn fact_context() -> SegmentContext {
-    SegmentContext::new(
-        b"snapshot-store".to_vec(),
-        NamingContractId([0x11; 16]),
-        SegmentLocator([0x22; 32]),
-    )
-    .expect("valid context")
-}
-
-fn descriptor_context(descriptor: &SegmentDescriptor) -> SegmentContext {
-    SegmentContext::new(
-        b"snapshot-store".to_vec(),
-        NamingContractId([0x11; 16]),
-        SegmentLocator(*descriptor.locator.as_bytes()),
-    )
-    .expect("valid descriptor context")
-}
-
 #[test]
 fn sealed_snapshot_cache_hit_after_reopen_reads_no_pgm_bodies() {
     let source = tempfile::tempdir().expect("source directory");
-    let cache = tempfile::tempdir().expect("cache directory");
     fs::write(source.path().join("1500.pgm"), lifecycle_part(7)).expect("write segment");
-    let store = FactStore::new(cache.path());
+    let store = FactStore::new(source.path());
 
     let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
     let cold = snapshot
-        .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+        .load_sealed_facts(0, &store, &LIMIT)
         .expect("cold facts");
     assert_eq!(cold.origin(), FactOrigin::Rebuilt);
     assert_eq!(cold.pgm_body_read_stats().read_calls, 1);
 
     let restarted = LocalDirSnapshot::open(source.path()).expect("restart snapshot");
     let warm = restarted
-        .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+        .load_sealed_facts(0, &store, &LIMIT)
         .expect("warm facts");
     assert_eq!(warm.origin(), FactOrigin::CacheHit);
     assert_eq!(warm.pgm_body_read_stats().read_calls, 0);
@@ -112,11 +92,10 @@ fn sealed_snapshot_cache_hit_after_reopen_reads_no_pgm_bodies() {
 #[test]
 fn exact_sealed_descriptors_keep_identical_files_distinct_and_warm() {
     let source = tempfile::tempdir().expect("source directory");
-    let cache = tempfile::tempdir().expect("cache directory");
     let bytes = lifecycle_part(7);
     fs::write(source.path().join("1500-a.pgm"), &bytes).expect("write first segment");
     fs::write(source.path().join("1500-b.pgm"), &bytes).expect("write second segment");
-    let store = FactStore::new(cache.path());
+    let store = FactStore::new(source.path());
 
     let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
     let descriptors = snapshot.sealed_descriptors();
@@ -125,12 +104,7 @@ fn exact_sealed_descriptors_keep_identical_files_distinct_and_warm() {
     assert_eq!(descriptors[0].catalog_digest, descriptors[1].catalog_digest);
     for descriptor in descriptors {
         let load = snapshot
-            .load_sealed_facts_by_descriptor(
-                descriptor,
-                &store,
-                &descriptor_context(descriptor),
-                &LIMIT,
-            )
+            .load_sealed_facts_by_descriptor(descriptor, &store, &LIMIT)
             .expect("cold exact load");
         assert_eq!(load.origin(), FactOrigin::Rebuilt);
     }
@@ -138,12 +112,7 @@ fn exact_sealed_descriptors_keep_identical_files_distinct_and_warm() {
     let restarted = LocalDirSnapshot::open(source.path()).expect("restart snapshot");
     for descriptor in restarted.sealed_descriptors() {
         let load = restarted
-            .load_sealed_facts_by_descriptor(
-                descriptor,
-                &FactStore::new(cache.path()),
-                &descriptor_context(descriptor),
-                &LIMIT,
-            )
+            .load_sealed_facts_by_descriptor(descriptor, &FactStore::new(source.path()), &LIMIT)
             .expect("warm exact load");
         assert_eq!(load.origin(), FactOrigin::CacheHit);
         assert_eq!(load.pgm_body_read_stats().read_calls, 0);
@@ -178,46 +147,38 @@ fn exact_active_part_open_is_independent_of_query_unit_deduplication() {
 }
 
 #[test]
-fn exact_sealed_load_rejects_a_context_for_another_locator() {
+fn exact_sealed_context_uses_the_pgm_stem() {
     let source = tempfile::tempdir().expect("source directory");
-    let cache = tempfile::tempdir().expect("cache directory");
     fs::write(source.path().join("1500.pgm"), lifecycle_part(7)).expect("write segment");
     let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
     let descriptor = snapshot.sealed_descriptors()[0];
-
-    assert!(matches!(
-        snapshot.load_sealed_facts_by_descriptor(
-            &descriptor,
-            &FactStore::new(cache.path()),
-            &fact_context(),
-            &LIMIT,
-        ),
-        Err(SealedFactError::ContextLocatorMismatch { locator })
-            if locator == descriptor.locator
-    ));
+    let context = snapshot
+        .sealed_context(&descriptor)
+        .expect("derive sealed context");
+    assert_eq!(context.pgm_file_name(), "1500.pgm");
+    assert_eq!(context.sidecar_file_name(), "1500.ovf");
 }
 
 #[test]
 fn same_name_replacement_invalidates_pinned_snapshot() {
     let source = tempfile::tempdir().expect("source directory");
-    let cache = tempfile::tempdir().expect("cache directory");
     let path = source.path().join("1500.pgm");
     fs::write(&path, lifecycle_part(7)).expect("write first segment");
     let pinned = LocalDirSnapshot::open(source.path()).expect("open pinned snapshot");
-    let store = FactStore::new(cache.path());
+    let store = FactStore::new(source.path());
     pinned
-        .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+        .load_sealed_facts(0, &store, &LIMIT)
         .expect("first facts");
 
     fs::write(&path, lifecycle_part(8)).expect("replace segment");
     assert!(matches!(
-        pinned.load_sealed_facts(0, &store, &fact_context(), &LIMIT),
+        pinned.load_sealed_facts(0, &store, &LIMIT),
         Err(SealedFactError::StaleSnapshot { unit_idx: 0 })
     ));
 
     let refreshed = LocalDirSnapshot::open(source.path()).expect("refresh snapshot");
     let replacement = refreshed
-        .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+        .load_sealed_facts(0, &store, &LIMIT)
         .expect("replacement facts");
     assert_eq!(replacement.facts().identity().pgm_source_id, 8);
     assert_eq!(replacement.origin(), FactOrigin::Rebuilt);
@@ -226,35 +187,33 @@ fn same_name_replacement_invalidates_pinned_snapshot() {
 #[test]
 fn removed_source_is_not_resurrected_by_an_orphan_fact_file() {
     let source = tempfile::tempdir().expect("source directory");
-    let cache = tempfile::tempdir().expect("cache directory");
     let path = source.path().join("1500.pgm");
     fs::write(&path, lifecycle_part(7)).expect("write segment");
-    let store = FactStore::new(cache.path());
+    let store = FactStore::new(source.path());
     LocalDirSnapshot::open(source.path())
         .expect("open snapshot")
-        .load_sealed_facts(0, &store, &fact_context(), &LIMIT)
+        .load_sealed_facts(0, &store, &LIMIT)
         .expect("build facts");
     fs::remove_file(path).expect("remove authoritative segment");
 
     let after_retention = LocalDirSnapshot::open(source.path()).expect("rescan source");
     assert!(after_retention.units().is_empty());
     assert!(matches!(
-        after_retention.load_sealed_facts(0, &store, &fact_context(), &LIMIT),
+        after_retention.load_sealed_facts(0, &store, &LIMIT),
         Err(SealedFactError::UnitOutOfRange { unit_idx: 0 })
     ));
-    let orphan_exists = walk_files(cache.path())
+    let orphan_exists = walk_files(source.path())
         .iter()
         .any(|path| path.extension().and_then(|value| value.to_str()) == Some("ovf"));
     assert!(
         orphan_exists,
-        "source retention does not remove disposable cache files"
+        "source retention does not remove its sibling sidecar"
     );
 }
 
 #[test]
 fn active_part_is_rejected_by_sealed_fact_loader() {
     let source = tempfile::tempdir().expect("source directory");
-    let cache = tempfile::tempdir().expect("cache directory");
     fs::write(
         source.path().join("active.parts"),
         framed(&lifecycle_part(7)),
@@ -262,7 +221,7 @@ fn active_part_is_rejected_by_sealed_fact_loader() {
     .expect("write active part");
     let snapshot = LocalDirSnapshot::open(source.path()).expect("open snapshot");
     assert!(matches!(
-        snapshot.load_sealed_facts(0, &FactStore::new(cache.path()), &fact_context(), &LIMIT),
+        snapshot.load_sealed_facts(0, &FactStore::new(source.path()), &LIMIT),
         Err(SealedFactError::LiveUnit { unit_idx: 0 })
     ));
 }
@@ -1396,7 +1355,7 @@ fn root_warning_suppresses_removal_but_journal_warning_does_not() {
         .catalog()
         .clone();
     let visible_replacement = LocalScan {
-        sealed: vec![kronika_store::SealedUnit {
+        sealed: vec![SealedUnit {
             path: dir.path().join("1000.pgm"),
             catalog: replacement_catalog,
         }],

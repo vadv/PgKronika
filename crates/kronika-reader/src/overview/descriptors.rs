@@ -1,17 +1,15 @@
 //! Content-derived identities for overview facts.
 //!
-//! Namespace, section-body, and dictionary-value hashes include explicit
-//! length prefixes. Catalog entry descriptors omit offsets so resealing a
-//! verbatim section does not change its lineage.
+//! Section-body and dictionary-value hashes include explicit length prefixes.
+//! Catalog entry descriptors omit offsets so resealing a verbatim section does
+//! not change its lineage.
 
 use kronika_analytics::overview::{
-    DictionaryContextId, NamingContractId, SectionBodyId, SegmentIdentity, SegmentLineageId,
-    SegmentLocator, SourceScopeId,
+    DictionaryContextId, SectionBodyId, SegmentIdentity, SegmentLineageId,
 };
 use kronika_format::{Catalog, Entry};
 use sha2::{Digest, Sha256};
 
-const SOURCE_SCOPE_TAG: &[u8] = b"pgk-overview-source-scope-v1";
 const CATALOG_DESCRIPTOR_TAG: &[u8] = b"pgk-pgm-catalog-descriptor-v1";
 const SECTION_BODY_TAG: &[u8] = b"pgk-overview-section-body-v1";
 const DICTIONARY_CONTEXT_TAG: &[u8] = b"pgk-overview-dictionary-context-v1";
@@ -140,17 +138,6 @@ impl std::fmt::Debug for DictionaryContextEntry<'_> {
     }
 }
 
-/// Derives a source scope from a stable namespace and the PGM source ID.
-#[must_use]
-pub fn source_scope_id(normalized_store_namespace: &[u8], pgm_source_id: u64) -> SourceScopeId {
-    SourceScopeId(hash_parts(&[
-        SOURCE_SCOPE_TAG,
-        &length_prefix(normalized_store_namespace),
-        normalized_store_namespace,
-        &pgm_source_id.to_le_bytes(),
-    ]))
-}
-
 /// Derives the identity of an exact section body.
 #[must_use]
 pub fn section_body_id(type_id: u32, body: &[u8]) -> SectionBodyId {
@@ -200,17 +187,14 @@ pub fn dictionary_context_id(
 #[must_use]
 pub fn lineage_from_catalog(
     catalog: &Catalog,
-    source_scope_id: SourceScopeId,
-    naming_contract_id: NamingContractId,
-    segment_locator: SegmentLocator,
+    source_descriptor: SourceDescriptor,
 ) -> Option<SegmentLineageId> {
     let first = catalog.entries.first()?;
     let descriptor = CatalogEntryDescriptor::of(first).canonical_bytes();
     Some(
         SegmentIdentity::sealed(
-            source_scope_id,
-            naming_contract_id,
-            segment_locator,
+            catalog.source_id,
+            source_descriptor.0,
             first.type_id,
             &descriptor,
         )
@@ -266,12 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn source_scope_uses_unambiguous_namespace_encoding() {
-        assert_ne!(source_scope_id(b"ab", 7), source_scope_id(b"abc", 7));
-        assert_ne!(source_scope_id(b"ab", 7), source_scope_id(b"ab", 8));
-    }
-
-    #[test]
     fn section_body_identity_binds_type_length_and_bytes() {
         let base = section_body_id(7, b"body");
         assert_ne!(base, section_body_id(8, b"body"));
@@ -313,12 +291,16 @@ mod tests {
             source_id: 7,
             format_version: 1,
         };
-        let scope = SourceScopeId([3; 32]);
-        let naming = NamingContractId([4; 16]);
-        let locator = SegmentLocator([5; 32]);
-        let derived = lineage_from_catalog(&catalog, scope, naming, locator).expect("entry");
+        let source_descriptor = SourceDescriptor([3; 32]);
+        let derived = lineage_from_catalog(&catalog, source_descriptor).expect("entry");
         let descriptor = CatalogEntryDescriptor::of(&catalog.entries[0]).canonical_bytes();
-        let expected = SegmentIdentity::sealed(scope, naming, locator, 1_022_001, &descriptor).id();
+        let expected = SegmentIdentity::sealed(
+            catalog.source_id,
+            source_descriptor.0,
+            1_022_001,
+            &descriptor,
+        )
+        .id();
         assert_eq!(derived, expected);
     }
 }

@@ -21,11 +21,19 @@ web layer owns request windows, budgets, incident clustering, and JSON/UI
 serialization. Analytics deliberately contains no PGM decoding, filesystem or
 network I/O, PostgreSQL access, HTTP handling, redaction, or diagnosis.
 
+Observation identities do not depend on a filesystem path:
+
+- a sealed PGM produces rebuild-stable content-derived lineage from its
+  numeric source ID, exact source descriptor, and first catalog descriptor;
+- a live view uses its journal generation and first-part descriptor and reports
+  `IdentityQuality::Approximate` until a sealed handoff is proven.
+
 ## Place in the data flow
 
 ```text
-pg_kronika-collector -> kronika-writer -> active.parts / *.pgm
-        -> kronika-reader decodes rows and marks gaps and resets
+pg_kronika-collector -> kronika-writer -> active.parts / N.pgm
+        -> kronika-reader decodes rows, marks gaps and resets,
+           and publishes the same-stem sibling N.ovf
 
 adjacent counter samples -> kronika-analytics::diff_pair -> DiffPoint
         -> kronika-reader assembles SeriesDiff

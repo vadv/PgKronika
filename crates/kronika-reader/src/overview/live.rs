@@ -15,7 +15,7 @@ use crate::refresh::{
 };
 use crate::unit::PgmUnit;
 
-use super::facts::{BuildError, MAX_STORE_NAMESPACE_BYTES, SegmentContext, SegmentFacts};
+use super::facts::{BuildError, SegmentContext, SegmentFacts};
 use super::limits::Bounds;
 use super::publish::{FactLoad, FactStore, PersistError};
 
@@ -120,10 +120,6 @@ impl std::error::Error for LiveFoldError {
 /// Invalid immutable configuration for a live builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveConfigError {
-    /// A stable store namespace is required for source identity.
-    EmptyStoreNamespace,
-    /// The store namespace exceeds the identity-input bound.
-    StoreNamespaceTooLong,
     /// A bound exceeds the format's absolute limits.
     InvalidBounds,
 }
@@ -131,8 +127,6 @@ pub enum LiveConfigError {
 impl std::fmt::Display for LiveConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyStoreNamespace => f.write_str("store namespace must not be empty"),
-            Self::StoreNamespaceTooLong => f.write_str("store namespace exceeds 4096 bytes"),
             Self::InvalidBounds => f.write_str("live bounds exceed absolute limits"),
         }
     }
@@ -208,7 +202,6 @@ struct PendingRefresh {
 /// The single mutable writer that folds completed parts into live facts.
 #[derive(Debug, Clone)]
 pub struct LiveBuilder {
-    store_namespace: Vec<u8>,
     bounds: Bounds,
     state: LiveState,
     baseline_pinned: bool,
@@ -227,28 +220,16 @@ pub struct LiveBuilder {
 }
 
 impl LiveBuilder {
-    /// Creates an empty builder scoped to a store namespace.
+    /// Creates an empty builder under the supplied safety bounds.
     ///
     /// # Errors
     ///
-    /// Returns [`LiveConfigError`] for an empty or oversized namespace or
-    /// bounds above the absolute format limits.
-    pub fn new(
-        store_namespace: impl Into<Vec<u8>>,
-        bounds: Bounds,
-    ) -> Result<Self, LiveConfigError> {
-        let store_namespace = store_namespace.into();
-        if store_namespace.is_empty() {
-            return Err(LiveConfigError::EmptyStoreNamespace);
-        }
-        if store_namespace.len() > MAX_STORE_NAMESPACE_BYTES {
-            return Err(LiveConfigError::StoreNamespaceTooLong);
-        }
+    /// Returns [`LiveConfigError`] for bounds above the absolute format limits.
+    pub fn new(bounds: Bounds) -> Result<Self, LiveConfigError> {
         if !bounds.is_within_absolute_limits() {
             return Err(LiveConfigError::InvalidBounds);
         }
         Ok(Self {
-            store_namespace,
             bounds,
             state: LiveState::Warming,
             baseline_pinned: false,
@@ -569,14 +550,8 @@ impl LiveBuilder {
             return Err(LiveFoldError::NonMonotonePart);
         }
         let discriminator = part_discriminator(&part.part_id);
-        let facts = SegmentFacts::fold_live(
-            unit,
-            &self.store_namespace,
-            self.generation.0,
-            &discriminator,
-            &self.bounds,
-        )
-        .map_err(LiveFoldError::Build);
+        let facts = SegmentFacts::fold_live(unit, self.generation.0, &discriminator, &self.bounds)
+            .map_err(LiveFoldError::Build);
         let facts = match facts {
             Ok(facts) => facts,
             Err(error) => {
@@ -857,6 +832,8 @@ pub enum SealOutcome {
         facts: Arc<SegmentFacts>,
         /// Best-effort durable publication failure.
         persist_error: Option<PersistError>,
+        /// Canonical fact bytes committed by the promotion.
+        fact_write_bytes: u64,
     },
     /// The candidate was lossy, absent, or its provenance did not match, so the
     /// facts were rebuilt from the PGM.
@@ -887,6 +864,17 @@ impl SealOutcome {
             Self::Rebuilt(load) => load.persist_error(),
         }
     }
+
+    /// Canonical fact bytes committed by reconciliation.
+    #[must_use]
+    pub const fn fact_write_bytes(&self) -> u64 {
+        match self {
+            Self::Promoted {
+                fact_write_bytes, ..
+            } => *fact_write_bytes,
+            Self::Rebuilt(load) => load.fact_write_bytes(),
+        }
+    }
 }
 
 /// Reconciles a newly sealed segment against the current live view.
@@ -909,13 +897,14 @@ pub fn reconcile_seal<R: ReadAt>(
 ) -> Result<SealOutcome, BuildError> {
     let parts: Vec<_> = candidate.chunks().iter().map(Arc::as_ref).collect();
     if candidate.is_current()
-        && let Some(promoted) =
-            SegmentFacts::try_promote_from_parts(sealed_unit, sealed_context, &parts, bounds)?
+        && let Some(promoted) = SegmentFacts::try_promote_from_parts(sealed_unit, &parts, bounds)?
     {
-        let (facts, persist_error) = store.admit_publish_or_fallback(&promoted, bounds)?;
+        let (facts, persist_error, fact_write_bytes) =
+            store.admit_publish_or_fallback(&promoted, sealed_context, bounds)?;
         return Ok(SealOutcome::Promoted {
             facts,
             persist_error,
+            fact_write_bytes,
         });
     }
     let load = store.load_or_build(sealed_unit, sealed_context, bounds)?;
@@ -941,9 +930,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
 
-    use kronika_analytics::overview::{
-        CountLimits, MemoryOracle, NamingContractId, SegmentLocator,
-    };
+    use kronika_analytics::overview::{CountLimits, MemoryOracle};
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::pg_log::{PgLogErrorV1, PgLogLifecycleV1};
     use kronika_registry::{Section, StrId, Ts};
@@ -951,6 +938,7 @@ mod tests {
 
     use super::super::SourceError;
     use super::super::limits::LIMIT;
+    use super::super::qualification_fixture::all_family_fixture;
     use super::*;
     use crate::refresh::{PartTransition, part_id};
 
@@ -963,8 +951,6 @@ mod tests {
             max_signal_keys: 4_096,
         },
     };
-
-    const NAMESPACE: &[u8] = b"live-store";
 
     type EncodedSections = Vec<(u32, u32, Vec<u8>)>;
 
@@ -1122,22 +1108,17 @@ mod tests {
     }
 
     fn sealed_context() -> SegmentContext {
-        SegmentContext::new(
-            NAMESPACE.to_vec(),
-            NamingContractId([0x51; 16]),
-            SegmentLocator([0x52; 32]),
-        )
-        .expect("valid context")
+        SegmentContext::new("sealed.pgm").expect("valid context")
     }
 
     fn live_builder() -> LiveBuilder {
-        LiveBuilder::new(NAMESPACE.to_vec(), LIMIT).expect("valid live builder")
+        LiveBuilder::new(LIMIT).expect("valid live builder")
     }
 
     fn raw_oracle(rows: &[PgLogLifecycleV1]) -> SegmentFacts {
         let bytes = lifecycle_part(rows);
         let unit = PgmUnit::open(bytes.as_slice()).expect("open unsplit");
-        SegmentFacts::extract(&unit, &sealed_context(), &LIMIT).expect("extract unsplit")
+        SegmentFacts::extract(&unit, &LIMIT).expect("extract unsplit")
     }
 
     fn descriptor(
@@ -1282,20 +1263,12 @@ mod tests {
 
     #[test]
     fn builder_configuration_is_bounded() {
-        assert!(matches!(
-            LiveBuilder::new(Vec::new(), LIMIT),
-            Err(LiveConfigError::EmptyStoreNamespace)
-        ));
-        assert!(matches!(
-            LiveBuilder::new(vec![b'x'; MAX_STORE_NAMESPACE_BYTES + 1], LIMIT),
-            Err(LiveConfigError::StoreNamespaceTooLong)
-        ));
         let invalid = Bounds {
             items_per_block: LIMIT.items_per_block + 1,
             ..LIMIT
         };
         assert!(matches!(
-            LiveBuilder::new(NAMESPACE.to_vec(), invalid),
+            LiveBuilder::new(invalid),
             Err(LiveConfigError::InvalidBounds)
         ));
     }
@@ -1798,8 +1771,9 @@ mod tests {
         )
     }
 
-    fn store() -> (tempfile::TempDir, FactStore) {
-        let directory = tempfile::TempDir::new().expect("cache directory");
+    fn store(sealed_bytes: &[u8]) -> (tempfile::TempDir, FactStore) {
+        let directory = tempfile::TempDir::new().expect("data directory");
+        fs::write(directory.path().join("sealed.pgm"), sealed_bytes).expect("write sealed PGM");
         let store = FactStore::new(directory.path());
         (directory, store)
     }
@@ -1813,13 +1787,12 @@ mod tests {
             let sealed_bytes = sealed_from_slices(&slices);
             let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
             let context = sealed_context();
-            let rebuilt =
-                SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("cold rebuild");
+            let rebuilt = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold rebuild");
 
             let mut builder = live_builder();
             fold_slices(&mut builder, &slices);
             let view = builder.publish();
-            let (_cache_dir, store) = store();
+            let (_cache_dir, store) = store(&sealed_bytes);
             let outcome = reconcile_seal(&view, &sealed_unit, &context, &store, &LIMIT)
                 .expect("reconcile seal");
 
@@ -1846,17 +1819,60 @@ mod tests {
     }
 
     #[test]
+    fn every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts() {
+        let fixture = all_family_fixture();
+        let sealed_bytes = fixture.sealed_bytes();
+        let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open all-family seal");
+        let context = sealed_context();
+        let cold = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold all-family rebuild");
+
+        let partitions = fixture.contiguous_partitions();
+        assert_eq!(partitions.len(), 4);
+        for part_bytes in partitions {
+            let part_slices: Vec<_> = part_bytes.iter().map(Vec::as_slice).collect();
+            let mut builder = live_builder();
+            fold_bytes(&mut builder, &part_slices);
+            let live = builder.publish();
+            assert_eq!(live.state(), LiveState::Current);
+            assert_eq!(live.chunks().len(), part_bytes.len());
+
+            let (_cache_dir, store) = store(&sealed_bytes);
+            let promoted = reconcile_seal(&live, &sealed_unit, &context, &store, &LIMIT)
+                .expect("promote all-family facts");
+            assert!(
+                promoted.was_promoted(),
+                "matching {}-part catalog must remain promotion-eligible",
+                part_bytes.len()
+            );
+            assert_eq!(
+                promoted.facts(),
+                &cold,
+                "promotion from {} parts changed a canonical block",
+                part_bytes.len()
+            );
+            assert_eq!(
+                &store
+                    .read(&sealed_unit, &context, &LIMIT)
+                    .expect("read promoted all-family facts"),
+                &cold,
+                "published restart-warm facts differ for {} parts",
+                part_bytes.len()
+            );
+        }
+    }
+
+    #[test]
     fn promotion_survives_an_unwritable_cache() {
         let rows = stream();
         let slices: Vec<&[PgLogLifecycleV1]> = rows.chunks(2).collect();
         let sealed_bytes = sealed_from_slices(&slices);
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
         let context = sealed_context();
-        let rebuilt = SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("rebuild");
+        let rebuilt = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("rebuild");
         let mut builder = live_builder();
         fold_slices(&mut builder, &slices);
 
-        let (cache_dir, store) = store();
+        let (cache_dir, store) = store(&sealed_bytes);
         let original_mode = fs::metadata(cache_dir.path())
             .expect("cache metadata")
             .permissions()
@@ -1899,7 +1915,7 @@ mod tests {
         let sealed_bytes = seal_sections(&sealed_sections, 1_000, 2_000);
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
         let context = sealed_context();
-        let rebuilt = SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("cold rebuild");
+        let rebuilt = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold rebuild");
 
         let mut builder = live_builder();
         fold_bytes(
@@ -1907,7 +1923,7 @@ mod tests {
             &[first_bytes.as_slice(), second_bytes.as_slice()],
         );
 
-        let (_cache_dir, store) = store();
+        let (_cache_dir, store) = store(&sealed_bytes);
         let outcome = reconcile_seal(&builder.publish(), &sealed_unit, &context, &store, &LIMIT)
             .expect("reconcile");
         assert!(outcome.was_promoted());
@@ -1924,7 +1940,7 @@ mod tests {
         let sealed_bytes = seal_sections(&sealed_sections, 1_000, 1_000);
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
         let context = sealed_context();
-        let rebuilt = SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("cold rebuild");
+        let rebuilt = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold rebuild");
 
         let mut builder = live_builder();
         fold_bytes(
@@ -1933,7 +1949,7 @@ mod tests {
         );
         assert_eq!(builder.watermark_us(), Some(1_000));
 
-        let (_cache_dir, store) = store();
+        let (_cache_dir, store) = store(&sealed_bytes);
         let outcome = reconcile_seal(&builder.publish(), &sealed_unit, &context, &store, &LIMIT)
             .expect("reconcile");
         assert!(outcome.was_promoted());
@@ -1941,15 +1957,14 @@ mod tests {
     }
 
     #[test]
-    fn source_zero_parts_do_not_cross_store_namespaces() {
+    fn source_zero_parts_promote_when_descriptors_match() {
         let (dictionary_bytes, sections) = dictionary_only_part();
         let sealed_bytes = seal_sections_for_source(&sections, 0, 0, 0);
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed dictionary");
-        let mut builder =
-            LiveBuilder::new(b"another-store".to_vec(), LIMIT).expect("valid live builder");
+        let mut builder = LiveBuilder::new(LIMIT).expect("valid live builder");
         fold_bytes(&mut builder, &[dictionary_bytes.as_slice()]);
 
-        let (_cache_dir, store) = store();
+        let (_cache_dir, store) = store(&sealed_bytes);
         let outcome = reconcile_seal(
             &builder.publish(),
             &sealed_unit,
@@ -1959,10 +1974,7 @@ mod tests {
         )
         .expect("reconcile");
 
-        assert!(
-            !outcome.was_promoted(),
-            "source zero still carries the store namespace scope"
-        );
+        assert!(outcome.was_promoted());
         assert!(
             outcome.persist_error().is_none(),
             "an empty timestamp envelope remains durably admissible"
@@ -1987,7 +1999,7 @@ mod tests {
             &[first_bytes.as_slice(), second_bytes.as_slice()],
         );
 
-        let (_cache_dir, store) = store();
+        let (_cache_dir, store) = store(&sealed_bytes);
         assert!(matches!(
             reconcile_seal(
                 &builder.publish(),
@@ -2013,7 +2025,7 @@ mod tests {
         let mut builder = live_builder();
         fold_slices(&mut builder, &slices);
         let view = builder.publish();
-        let (_dir, store) = store();
+        let (_dir, store) = store(&sealed_bytes);
         let promoted =
             reconcile_seal(&view, &sealed_unit, &context, &store, &LIMIT).expect("reconcile seal");
         assert!(promoted.was_promoted());
@@ -2037,12 +2049,12 @@ mod tests {
         let sealed_bytes = sealed_from_slices(&all);
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
         let context = sealed_context();
-        let rebuilt = SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("rebuild");
+        let rebuilt = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("rebuild");
 
         let mut builder = live_builder();
         fold_slices(&mut builder, &[&rows[0..3], &rows[3..5]]);
         let view = builder.publish();
-        let (_dir, store) = store();
+        let (_dir, store) = store(&sealed_bytes);
         let outcome =
             reconcile_seal(&view, &sealed_unit, &context, &store, &LIMIT).expect("reconcile seal");
 
@@ -2094,16 +2106,10 @@ mod tests {
             .collect()
     }
 
-    fn sealed_facts_with_locator(rows: &[PgLogLifecycleV1], locator: u8) -> SegmentFacts {
+    fn sealed_facts(rows: &[PgLogLifecycleV1]) -> SegmentFacts {
         let bytes = lifecycle_part(rows);
         let unit = PgmUnit::open(bytes.as_slice()).expect("open sealed group");
-        let context = SegmentContext::new(
-            NAMESPACE.to_vec(),
-            NamingContractId([0x51; 16]),
-            SegmentLocator([locator; 32]),
-        )
-        .expect("valid context");
-        SegmentFacts::extract(&unit, &context, &LIMIT).expect("extract sealed group")
+        SegmentFacts::extract(&unit, &LIMIT).expect("extract sealed group")
     }
 
     /// Random contiguous group boundaries covering `0..len`.
@@ -2133,14 +2139,13 @@ mod tests {
             let mut coverage = Coverage::empty();
             let mut builder = live_builder();
             let mut live_parts = Vec::new();
-            for (index, window) in cuts.windows(2).enumerate() {
+            for window in cuts.windows(2) {
                 let group = &rows[window[0]..window[1]];
                 if group.is_empty() {
                     continue;
                 }
                 if rng.below(2) == 0 {
-                    let facts =
-                        sealed_facts_with_locator(group, u8::try_from(index + 1).unwrap_or(1));
+                    let facts = sealed_facts(group);
                     merged.extend_from_slice(facts.observations());
                     coverage = coverage.union(facts.coverage());
                 } else {
@@ -2192,12 +2197,12 @@ mod tests {
             let sealed_bytes = sealed_from_slices(&slices);
             let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
             let context = sealed_context();
-            let rebuilt = SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("rebuild");
+            let rebuilt = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("rebuild");
 
             let mut builder = live_builder();
             fold_slices(&mut builder, &slices);
             let view = builder.publish();
-            let (_dir, store) = store();
+            let (_dir, store) = store(&sealed_bytes);
             let outcome =
                 reconcile_seal(&view, &sealed_unit, &context, &store, &LIMIT).expect("reconcile");
 
@@ -2294,7 +2299,7 @@ mod tests {
             coverage_spans: 1,
             ..LIMIT
         };
-        let mut builder = LiveBuilder::new(NAMESPACE.to_vec(), tight).expect("valid live builder");
+        let mut builder = LiveBuilder::new(tight).expect("valid live builder");
         let bytes = [
             empty_interval_gap_part(1_000),
             empty_interval_gap_part(2_000),
@@ -2319,12 +2324,12 @@ mod tests {
         let part_bytes = fallback_gap_part();
         let sealed_unit = PgmUnit::open(part_bytes.as_slice()).expect("open sealed");
         let context = sealed_context();
-        let rebuilt = SegmentFacts::extract(&sealed_unit, &context, &LIMIT).expect("rebuild");
+        let rebuilt = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("rebuild");
 
         let mut builder = live_builder();
         fold_bytes(&mut builder, &[part_bytes.as_slice()]);
 
-        let (_dir, store) = store();
+        let (_dir, store) = store(&part_bytes);
         let outcome = reconcile_seal(&builder.publish(), &sealed_unit, &context, &store, &LIMIT)
             .expect("reconcile seal");
         assert!(
@@ -2346,7 +2351,7 @@ mod tests {
             items_per_block: 4,
             ..LIMIT
         };
-        let mut builder = LiveBuilder::new(NAMESPACE.to_vec(), tight).expect("valid live builder");
+        let mut builder = LiveBuilder::new(tight).expect("valid live builder");
         fold_slices(&mut builder, &slices[0..1]);
         let bytes = lifecycle_part(slices[1]);
         let unit = PgmUnit::open(bytes.as_slice()).expect("open part");
@@ -2366,7 +2371,7 @@ mod tests {
         assert_eq!(builder.state(), LiveState::Incomplete);
 
         let view = builder.publish();
-        let (_dir, store) = store();
+        let (_dir, store) = store(&sealed_bytes);
         let outcome =
             reconcile_seal(&view, &sealed_unit, &context, &store, &LIMIT).expect("reconcile seal");
         assert!(

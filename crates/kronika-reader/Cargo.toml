@@ -25,6 +25,8 @@ tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 mimalloc = { version = "0.1", features = ["override"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[bench]]
 name = "serving"

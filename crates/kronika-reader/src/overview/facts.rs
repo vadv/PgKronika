@@ -10,59 +10,63 @@
 //! [`encode`]: SegmentFacts::encode
 //! [`from_reader`]: SegmentFacts::from_reader
 
-use std::collections::BTreeSet as DictionaryIdSet;
+use std::collections::{BTreeMap, BTreeSet as DictionaryIdSet};
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 
 use kronika_analytics::overview::{
-    Applicability, Coverage, CoverageSpan, EventObservation, NamingContractId, ObservationPayload,
-    ObservationProvenance, OracleError, OracleLimits, OracleResult, PeriodQuality,
-    PhysicalCountSemantics, RawOracle, RetainedExactness, SegmentIdentity, SegmentLocator,
-    SourceCompleteness, query_bounded,
+    Applicability, BoundaryQuality, CounterSample, Coverage, CoverageSpan, CoverageState,
+    EventFact, EventObservation, FactorCoverage, FactorId, GaugeSample, MetricSeriesDescriptor,
+    MetricSeriesId, MetricUnit, ObservationId, ObservationPayload, ObservationProvenance,
+    OracleError, OracleLimits, OracleResult, PeriodQuality, PhysicalCountSemantics,
+    PopulationTotalQuality, RawOracle, RetainedExactness, SegmentIdentity, SourceCompleteness,
+    SourcePopulation, query_bounded,
 };
 use kronika_format::ReadAt;
 
 use crate::unit::PgmUnit;
 use crate::{PgmBodyReadStats, ReadError};
 
-use super::block::{BlockKind, LossCoverageBlock, SourceManifestBlock, StringTableBlock};
+use super::block::{
+    BlockKind, CounterSamplesBlock, EntityStateRecord, EntityStatesBlock, GaugeSamplesBlock,
+    LossCoverageBlock, ResetMarker, ResetMarkersBlock, SourceManifestBlock, StringTableBlock,
+};
 use super::container::{
     BlockContent, CacheReadError, FactFile, FactFileReader, FactReadStats, HeaderIdentity,
     validate_block_descriptor, validate_observation_provenance, verify_manifest_identity,
 };
-use super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor, source_scope_id};
+use super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor};
 use super::event_extract::{
     DictionaryFingerprint, EventExtraction, TIMESTAMP_FALLBACK_GAP_REASON, extract_events,
     fingerprint_dictionary,
 };
+use super::event_facts::EventFactsBlock;
 use super::limits::Bounds;
+use super::metric_extract::{
+    MetricExtraction, cadence_covered_duration, extract_metrics, observed_cadence,
+};
 use super::observations::EventObservationsBlock;
 
-pub(super) const MAX_STORE_NAMESPACE_BYTES: usize = 4 * 1024;
-
-/// Reader configuration that scopes a sealed segment's facts.
-///
-/// The namespace and locator come from the reader's segment registry, not from
-/// PGM row timestamps.
+/// Filesystem address of one sealed PGM and its sibling overview sidecar.
 #[derive(Debug, Clone)]
 pub struct SegmentContext {
-    normalized_store_namespace: Vec<u8>,
-    naming_contract_id: NamingContractId,
-    segment_locator: SegmentLocator,
+    pgm_file_name: OsString,
+    sidecar_file_name: OsString,
 }
 
-/// Invalid reader configuration for sealed-segment identity.
+/// Invalid direct-child PGM filename for a sibling sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentContextError {
-    /// Production identity requires a stable non-empty store namespace.
-    EmptyStoreNamespace,
-    /// The configured namespace exceeds the fixed identity-input bound.
-    StoreNamespaceTooLong,
+    /// The value is not one direct-child filename ending in `.pgm`.
+    InvalidPgmFileName,
 }
 
 impl std::fmt::Display for SegmentContextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyStoreNamespace => f.write_str("store namespace is empty"),
-            Self::StoreNamespaceTooLong => f.write_str("store namespace exceeds 4096 bytes"),
+            Self::InvalidPgmFileName => {
+                f.write_str("PGM filename must be one direct child ending in .pgm")
+            }
         }
     }
 }
@@ -70,47 +74,42 @@ impl std::fmt::Display for SegmentContextError {
 impl std::error::Error for SegmentContextError {}
 
 impl SegmentContext {
-    /// Builds a bounded context from a reader-supplied namespace and sealed
-    /// segment locator.
+    /// Derives the sibling `.ovf` name from one direct-child `.pgm` name.
     ///
     /// # Errors
     ///
-    /// Returns [`SegmentContextError`] for an empty or oversized namespace.
-    pub fn new(
-        normalized_store_namespace: impl Into<Vec<u8>>,
-        naming_contract_id: NamingContractId,
-        segment_locator: SegmentLocator,
-    ) -> Result<Self, SegmentContextError> {
-        let normalized_store_namespace = normalized_store_namespace.into();
-        if normalized_store_namespace.is_empty() {
-            return Err(SegmentContextError::EmptyStoreNamespace);
+    /// Returns [`SegmentContextError`] unless the value is a safe direct-child
+    /// filename with a non-empty stem and exact `.pgm` extension.
+    pub fn new(pgm_file_name: impl Into<OsString>) -> Result<Self, SegmentContextError> {
+        let pgm_file_name = pgm_file_name.into();
+        let bytes = pgm_file_name.as_bytes();
+        if bytes.len() <= 4
+            || !bytes.ends_with(b".pgm")
+            || bytes.contains(&b'/')
+            || bytes.contains(&0)
+            || bytes == b"."
+            || bytes == b".."
+        {
+            return Err(SegmentContextError::InvalidPgmFileName);
         }
-        if normalized_store_namespace.len() > MAX_STORE_NAMESPACE_BYTES {
-            return Err(SegmentContextError::StoreNamespaceTooLong);
-        }
+        let mut sidecar = bytes[..bytes.len() - 4].to_vec();
+        sidecar.extend_from_slice(b".ovf");
         Ok(Self {
-            normalized_store_namespace,
-            naming_contract_id,
-            segment_locator,
+            pgm_file_name,
+            sidecar_file_name: OsString::from_vec(sidecar),
         })
     }
 
-    /// Stable normalized store namespace.
+    /// Direct-child PGM filename.
     #[must_use]
-    pub fn store_namespace(&self) -> &[u8] {
-        &self.normalized_store_namespace
+    pub fn pgm_file_name(&self) -> &OsStr {
+        &self.pgm_file_name
     }
 
-    /// Versioned naming contract for the supplied locator.
+    /// Direct-child sibling OVF filename with the same stem.
     #[must_use]
-    pub const fn naming_contract_id(&self) -> NamingContractId {
-        self.naming_contract_id
-    }
-
-    /// Reader-supplied locator of the sealed segment.
-    #[must_use]
-    pub const fn segment_locator(&self) -> SegmentLocator {
-        self.segment_locator
+    pub fn sidecar_file_name(&self) -> &OsStr {
+        &self.sidecar_file_name
     }
 }
 
@@ -208,12 +207,17 @@ impl From<CacheReadError> for BuildError {
 }
 
 /// Retained sealed-segment facts materialized from one PGM container.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentFacts {
     identity: HeaderIdentity,
     lineage: SegmentIdentity,
     manifest_entries: Vec<ManifestEntryDescriptor>,
     observations: Vec<EventObservation>,
+    event_facts: Vec<EventFact>,
+    counter_samples: CounterSamplesBlock,
+    gauge_samples: GaugeSamplesBlock,
+    reset_markers: ResetMarkersBlock,
+    entity_states: EntityStatesBlock,
     loss_coverage: LossCoverageBlock,
     retained_text_bytes: u64,
     dictionary_fingerprints: Vec<DictionaryFingerprint>,
@@ -230,24 +234,29 @@ impl SegmentFacts {
     ///
     /// Returns [`BuildError`] for source failures, unsupported event layouts,
     /// unsafe work bounds, or checked-arithmetic overflow.
-    pub fn extract<R: ReadAt>(
-        unit: &PgmUnit<R>,
-        context: &SegmentContext,
-        bounds: &Bounds,
-    ) -> Result<Self, BuildError> {
-        Self::extract_with_stats(unit, context, bounds).map(|(facts, _stats)| facts)
+    pub fn extract<R: ReadAt>(unit: &PgmUnit<R>, bounds: &Bounds) -> Result<Self, BuildError> {
+        Self::extract_with_stats(unit, bounds).map(|(facts, _stats)| facts)
     }
 
     pub(super) fn extract_with_stats<R: ReadAt>(
         unit: &PgmUnit<R>,
-        context: &SegmentContext,
         bounds: &Bounds,
     ) -> Result<(Self, PgmBodyReadStats), BuildError> {
         let (min_ts, max_ts) = (unit.catalog().min_ts, unit.catalog().max_ts);
-        let (identity, lineage) = Self::provenance(unit, context)?;
-        let extracted = extract_events(unit, lineage, Some(context.segment_locator), bounds)?;
-        let pgm_body_read_stats = extracted.pgm_body_read_stats;
-        let facts = Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds)?;
+        let (identity, lineage) = Self::provenance(unit)?;
+        let mut extracted = extract_events(unit, lineage, bounds)?;
+        let metrics = extract_metrics(
+            unit,
+            identity.pgm_source_id,
+            segment_span(min_ts, max_ts)?,
+            bounds,
+        )?;
+        apply_descriptor_replacements(&mut extracted, &metrics)?;
+        let pgm_body_read_stats =
+            checked_add_read_stats(extracted.pgm_body_read_stats, metrics.pgm_body_read_stats)?;
+        let facts = Self::assemble(
+            identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
+        )?;
         Ok((facts, pgm_body_read_stats))
     }
 
@@ -265,7 +274,6 @@ impl SegmentFacts {
     /// unsafe work bounds, or checked-arithmetic overflow.
     pub fn fold_live<R: ReadAt>(
         unit: &PgmUnit<R>,
-        store_namespace: &[u8],
         journal_generation: u64,
         part_discriminator: &[u8],
         bounds: &Bounds,
@@ -274,21 +282,32 @@ impl SegmentFacts {
         if catalog.entries.is_empty() {
             return Err(BuildError::Source(SourceError::UnsupportedLayout));
         }
-        let source_scope = source_scope_id(store_namespace, catalog.source_id);
-        let lineage =
-            SegmentIdentity::live_approximate(source_scope, journal_generation, part_discriminator);
+        let lineage = SegmentIdentity::live_approximate(
+            catalog.source_id,
+            journal_generation,
+            part_discriminator,
+        );
         let identity = HeaderIdentity::from_current_contract(
             catalog.format_version,
             catalog.source_id,
             catalog.min_ts,
             catalog.max_ts,
             unit.source_file_len(),
-            source_scope,
             unit.source_descriptor(),
+            lineage.id(),
         );
         let (min_ts, max_ts) = (catalog.min_ts, catalog.max_ts);
-        let extracted = extract_events(unit, lineage, None, bounds)?;
-        Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds)
+        let mut extracted = extract_events(unit, lineage, bounds)?;
+        let metrics = extract_metrics(
+            unit,
+            identity.pgm_source_id,
+            segment_span(min_ts, max_ts)?,
+            bounds,
+        )?;
+        apply_descriptor_replacements(&mut extracted, &metrics)?;
+        Self::assemble(
+            identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
+        )
     }
 
     /// Promotes matching live parts without rereading sealed event bodies.
@@ -305,7 +324,6 @@ impl SegmentFacts {
     /// observation is invalid, or a checked counter overflows.
     pub(super) fn try_promote_from_parts<R: ReadAt>(
         sealed_unit: &PgmUnit<R>,
-        sealed_context: &SegmentContext,
         parts: &[&Self],
         bounds: &Bounds,
     ) -> Result<Option<Self>, BuildError> {
@@ -323,27 +341,34 @@ impl SegmentFacts {
             return Ok(None);
         }
 
-        let (identity, lineage) = Self::provenance(sealed_unit, sealed_context)?;
-        if !promotion_source_matches(identity, sealed_context, parts) {
+        let (identity, lineage) = Self::provenance(sealed_unit)?;
+        if !promotion_source_matches(identity, parts) {
             return Ok(None);
         }
         let Some(dictionary_fingerprints) = promotion_dictionary(sealed_unit, parts, bounds)?
         else {
             return Ok(None);
         };
-        let Some(extracted) = rekey_promoted_parts(
-            parts,
-            lineage,
-            sealed_context.segment_locator(),
-            dictionary_fingerprints,
-            bounds,
-        )?
+        let Some(extracted) =
+            rekey_promoted_parts(parts, lineage, dictionary_fingerprints, bounds)?
         else {
             return Ok(None);
         };
 
         let (min_ts, max_ts) = (sealed_unit.catalog().min_ts, sealed_unit.catalog().max_ts);
-        Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds).map(Some)
+        let Some(metrics) = promote_metrics(
+            parts,
+            identity.pgm_source_id,
+            segment_span(min_ts, max_ts)?,
+            bounds,
+        )?
+        else {
+            return Ok(None);
+        };
+        Self::assemble(
+            identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
+        )
+        .map(Some)
     }
 
     /// Assembles canonical facts from an extraction and the catalog time range.
@@ -351,12 +376,41 @@ impl SegmentFacts {
         identity: HeaderIdentity,
         lineage: SegmentIdentity,
         extracted: EventExtraction,
+        metrics: MetricExtraction,
         min_ts: i64,
         max_ts: i64,
         bounds: &Bounds,
     ) -> Result<Self, BuildError> {
+        let mut event_facts = extracted
+            .observations
+            .iter()
+            .filter_map(|observation| EventFact::from_observation(observation).transpose())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_error| BuildError::Internal)?;
+        event_facts.extend(metrics.event_facts.iter().cloned());
         let covered = segment_coverage(min_ts, max_ts)?;
-        let loss_coverage = LossCoverageBlock::new(
+        let counter_samples =
+            CounterSamplesBlock::new_with_series(metrics.counter_series, metrics.counters, bounds)
+                .map_err(block_build_error)?;
+        let gauge_samples =
+            GaugeSamplesBlock::new_with_series(metrics.gauge_series, metrics.gauges, bounds)
+                .map_err(block_build_error)?;
+        let reset_markers =
+            ResetMarkersBlock::new(metrics.reset_markers, bounds).map_err(block_build_error)?;
+        let entity_states =
+            EntityStatesBlock::new(metrics.entity_states, bounds).map_err(block_build_error)?;
+        event_facts.extend(derive_metric_event_facts(
+            &counter_samples,
+            &gauge_samples,
+            &entity_states,
+            &extracted.known_gaps,
+            bounds,
+        )?);
+        event_facts.sort_by(EventFact::canonical_cmp);
+        if has_duplicate_fact_id(&event_facts) {
+            return Err(BuildError::Internal);
+        }
+        let loss_coverage = LossCoverageBlock::new_with_factors(
             covered,
             extracted.known_gaps,
             Applicability::Applicable,
@@ -365,6 +419,7 @@ impl SegmentFacts {
             RetainedExactness::Exact,
             PhysicalCountSemantics::LowerBound,
             extracted.dropped_lower_bound,
+            metrics.factor_coverage,
             bounds,
         )
         .map_err(|error| match error {
@@ -376,6 +431,11 @@ impl SegmentFacts {
             lineage,
             manifest_entries: extracted.manifest_entries,
             observations: extracted.observations,
+            event_facts,
+            counter_samples,
+            gauge_samples,
+            reset_markers,
+            entity_states,
             loss_coverage,
             retained_text_bytes: extracted.retained_text_bytes,
             dictionary_fingerprints: extracted.dictionary_fingerprints,
@@ -393,18 +453,15 @@ impl SegmentFacts {
     /// Returns [`BuildError::Source`] when the PGM has no catalog entries.
     pub fn provenance<R: ReadAt>(
         unit: &PgmUnit<R>,
-        context: &SegmentContext,
     ) -> Result<(HeaderIdentity, SegmentIdentity), BuildError> {
         let catalog = unit.catalog();
         let first = catalog
             .entries
             .first()
             .ok_or(BuildError::Source(SourceError::UnsupportedLayout))?;
-        let source_scope = source_scope_id(context.store_namespace(), catalog.source_id);
         let lineage = SegmentIdentity::sealed(
-            source_scope,
-            context.naming_contract_id(),
-            context.segment_locator(),
+            catalog.source_id,
+            unit.source_descriptor().0,
             first.type_id,
             &CatalogEntryDescriptor::of(first).canonical_bytes(),
         );
@@ -414,13 +471,13 @@ impl SegmentFacts {
             catalog.min_ts,
             catalog.max_ts,
             unit.source_file_len(),
-            source_scope,
             unit.source_descriptor(),
+            lineage.id(),
         );
         Ok((identity, lineage))
     }
 
-    /// Header identity carrying source scope, descriptor, and version axes.
+    /// Header identity carrying source provenance and contract versions.
     #[must_use]
     pub const fn identity(&self) -> &HeaderIdentity {
         &self.identity
@@ -436,6 +493,36 @@ impl SegmentFacts {
     #[must_use]
     pub fn observations(&self) -> &[EventObservation] {
         &self.observations
+    }
+
+    /// Policy-neutral canonical event facts in canonical order.
+    #[must_use]
+    pub fn event_facts(&self) -> &[EventFact] {
+        &self.event_facts
+    }
+
+    /// Typed cumulative samples retained for reset-aware deltas.
+    #[must_use]
+    pub const fn counter_samples(&self) -> &CounterSamplesBlock {
+        &self.counter_samples
+    }
+
+    /// Typed instantaneous samples retained for gauge cells and state inputs.
+    #[must_use]
+    pub const fn gauge_samples(&self) -> &GaugeSamplesBlock {
+        &self.gauge_samples
+    }
+
+    /// Counter epoch boundaries retained independently of sample selection.
+    #[must_use]
+    pub const fn reset_markers(&self) -> &ResetMarkersBlock {
+        &self.reset_markers
+    }
+
+    /// Bounded complete-population entity snapshots.
+    #[must_use]
+    pub const fn entity_states(&self) -> &EntityStatesBlock {
+        &self.entity_states
     }
 
     /// Segment coverage spans.
@@ -484,17 +571,36 @@ impl SegmentFacts {
             .try_fold(0_usize, |total, observation| {
                 total.checked_add(observation.resident_heap_bytes()?)
             })?;
+        let event_fact_slots = self
+            .event_facts
+            .capacity()
+            .checked_mul(size_of::<EventFact>())?;
+        let event_fact_heap = self.event_facts.iter().try_fold(0_usize, |total, fact| {
+            total.checked_add(fact.resident_heap_bytes()?)
+        })?;
         let dictionary = self
             .dictionary_fingerprints
             .capacity()
             .checked_mul(size_of::<DictionaryFingerprint>())?;
+        let counter_samples = self.counter_samples.resident_heap_bytes()?;
+        let gauge_samples = self.gauge_samples.resident_heap_bytes()?;
+        let resets = self.reset_markers.resident_heap_bytes()?;
+        let entity_states = self.entity_states.resident_heap_bytes()?;
+        let factor_coverage = self.loss_coverage.resident_factor_bytes()?;
 
         size_of::<Self>()
             .checked_add(manifest)?
             .checked_add(observation_slots)?
             .checked_add(observation_heap)?
+            .checked_add(event_fact_slots)?
+            .checked_add(event_fact_heap)?
             .checked_add(self.loss_coverage.covered().resident_heap_bytes()?)?
             .checked_add(self.loss_coverage.known_gaps().resident_heap_bytes()?)?
+            .checked_add(counter_samples)?
+            .checked_add(gauge_samples)?
+            .checked_add(resets)?
+            .checked_add(entity_states)?
+            .checked_add(factor_coverage)?
             .checked_add(dictionary)
     }
 
@@ -526,13 +632,19 @@ impl SegmentFacts {
         )?;
         let observations = EventObservationsBlock::new(self.observations.clone(), bounds)?;
         let strings = observations.string_table().clone();
+        let event_facts = EventFactsBlock::new(self.event_facts.clone(), &strings, bounds)?;
         FactFile::build(
             &self.identity,
             vec![
                 BlockContent::SourceManifest(Box::new(manifest)),
                 BlockContent::StringTable(Box::new(strings)),
                 BlockContent::EventObservations(Box::new(observations)),
+                BlockContent::EventFacts(Box::new(event_facts)),
                 BlockContent::LossCoverage(Box::new(self.loss_coverage.clone())),
+                BlockContent::GaugeSamples(Box::new(self.gauge_samples.clone())),
+                BlockContent::CounterSamples(Box::new(self.counter_samples.clone())),
+                BlockContent::ResetMarkers(Box::new(self.reset_markers.clone())),
+                BlockContent::EntityStates(Box::new(self.entity_states.clone())),
             ],
             bounds,
         )
@@ -589,7 +701,7 @@ impl SegmentFacts {
         expected_catalog: &[CatalogEntryDescriptor],
         bounds: &Bounds,
     ) -> Result<(Self, FactReadStats), CacheReadError> {
-        if lineage.source_scope_id() != expected.source_scope_id {
+        if lineage.id() != expected.segment_lineage_id {
             return Err(CacheReadError::WrongSource);
         }
         let mut fact_reader = FactFileReader::open(reader, expected, bounds)?;
@@ -638,6 +750,39 @@ impl SegmentFacts {
             return Err(CacheReadError::Corrupt);
         }
 
+        let (facts_entry, facts_body) = singleton_body(&mut fact_reader, BlockKind::EventFacts)?;
+        let event_facts = EventFactsBlock::decode(&facts_body, &strings, bounds)?;
+        validate_block_descriptor(&facts_entry, &event_facts)?;
+
+        let (counter_entry, counter_body) =
+            singleton_body(&mut fact_reader, BlockKind::CounterSamples)?;
+        let counter_samples = CounterSamplesBlock::decode(&counter_body, bounds)?;
+        validate_block_descriptor(&counter_entry, &counter_samples)?;
+        validate_metric_source(counter_samples.series(), expected.pgm_source_id)?;
+
+        let (gauge_entry, gauge_body) = singleton_body(&mut fact_reader, BlockKind::GaugeSamples)?;
+        let gauge_samples = GaugeSamplesBlock::decode(&gauge_body, bounds)?;
+        validate_block_descriptor(&gauge_entry, &gauge_samples)?;
+        validate_metric_source(gauge_samples.series(), expected.pgm_source_id)?;
+
+        let (reset_entry, reset_body) = singleton_body(&mut fact_reader, BlockKind::ResetMarkers)?;
+        let reset_markers = ResetMarkersBlock::decode(&reset_body, bounds)?;
+        validate_block_descriptor(&reset_entry, &reset_markers)?;
+        validate_reset_series(&reset_markers, &counter_samples)?;
+
+        let (states_entry, states_body) =
+            singleton_body(&mut fact_reader, BlockKind::EntityStates)?;
+        let entity_states = EntityStatesBlock::decode(&states_body, bounds)?;
+        validate_block_descriptor(&states_entry, &entity_states)?;
+        validate_state_series(&entity_states, &gauge_samples)?;
+        validate_event_fact_evidence(
+            &event_facts,
+            &observations,
+            &counter_samples,
+            &gauge_samples,
+            expected.pgm_source_id,
+        )?;
+
         let coverage = merge_coverage_blocks(&mut fact_reader, bounds)?;
         let retained_text_bytes = bounds
             .decoded_block_len
@@ -650,6 +795,11 @@ impl SegmentFacts {
                 lineage: *lineage,
                 manifest_entries: manifest.entries().to_vec(),
                 observations: observations.into_observations(),
+                event_facts: event_facts.into_facts(),
+                counter_samples,
+                gauge_samples,
+                reset_markers,
+                entity_states,
                 loss_coverage: coverage,
                 retained_text_bytes,
                 dictionary_fingerprints: Vec::new(),
@@ -697,11 +847,7 @@ fn parts_have_timestamp_fallback(parts: &[&SegmentFacts]) -> bool {
     })
 }
 
-fn promotion_source_matches(
-    identity: HeaderIdentity,
-    sealed_context: &SegmentContext,
-    parts: &[&SegmentFacts],
-) -> bool {
+fn promotion_source_matches(identity: HeaderIdentity, parts: &[&SegmentFacts]) -> bool {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     for part in parts {
@@ -718,10 +864,7 @@ fn promotion_source_matches(
         && parts.iter().all(|part| {
             part.identity.source_format_version == identity.source_format_version
                 && (part.identity.pgm_source_id == 0
-                    && part.identity.source_scope_id
-                        == source_scope_id(sealed_context.store_namespace(), 0)
-                    || (part.identity.pgm_source_id == identity.pgm_source_id
-                        && part.identity.source_scope_id == identity.source_scope_id))
+                    || part.identity.pgm_source_id == identity.pgm_source_id)
         })
 }
 
@@ -801,7 +944,6 @@ fn sum_len(
 fn rekey_promoted_parts(
     parts: &[&SegmentFacts],
     lineage: SegmentIdentity,
-    sealed_locator: SegmentLocator,
     dictionary_fingerprints: Vec<DictionaryFingerprint>,
     bounds: &Bounds,
 ) -> Result<Option<EventExtraction>, BuildError> {
@@ -815,7 +957,6 @@ fn rekey_promoted_parts(
         for observation in &part.observations {
             let source = observation.provenance();
             let provenance = ObservationProvenance {
-                segment_locator: Some(sealed_locator),
                 section_body_id: source.section_body_id,
                 catalog_entry_ordinal: base_ordinal
                     .checked_add(source.catalog_entry_ordinal)
@@ -870,6 +1011,797 @@ fn rekey_promoted_parts(
     }))
 }
 
+fn apply_descriptor_replacements(
+    events: &mut EventExtraction,
+    metrics: &MetricExtraction,
+) -> Result<(), BuildError> {
+    for (index, replacement) in &metrics.descriptor_replacements {
+        let current = events
+            .manifest_entries
+            .get_mut(*index)
+            .ok_or(BuildError::Internal)?;
+        if current.catalog != replacement.catalog {
+            return Err(BuildError::Internal);
+        }
+        *current = *replacement;
+    }
+    Ok(())
+}
+
+fn checked_add_read_stats(
+    left: PgmBodyReadStats,
+    right: PgmBodyReadStats,
+) -> Result<PgmBodyReadStats, BuildError> {
+    Ok(PgmBodyReadStats {
+        read_calls: left
+            .read_calls
+            .checked_add(right.read_calls)
+            .ok_or(BuildError::Overflow)?,
+        stored_bytes_read: left
+            .stored_bytes_read
+            .checked_add(right.stored_bytes_read)
+            .ok_or(BuildError::Overflow)?,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function performs one bounded canonical pass over each metric fact family"
+)]
+fn derive_metric_event_facts(
+    counters: &CounterSamplesBlock,
+    gauges: &GaugeSamplesBlock,
+    states: &EntityStatesBlock,
+    known_gaps: &Coverage,
+    bounds: &Bounds,
+) -> Result<Vec<EventFact>, BuildError> {
+    let mut facts = Vec::new();
+    let mut start = 0;
+    while start < counters.samples().len() {
+        let series_id = counters.samples()[start].series_id();
+        let end = start
+            + counters.samples()[start..].partition_point(|sample| sample.series_id() == series_id);
+        let descriptor = series_descriptor(counters.series(), series_id)?;
+        for pair in counters.samples()[start..end].windows(2) {
+            if let Some(fact) =
+                EventFact::from_counter_pair(descriptor, pair[0], pair[1], known_gaps)
+                    .map_err(|_error| BuildError::Internal)?
+            {
+                push_fact(&mut facts, fact, bounds)?;
+            }
+        }
+        start = end;
+    }
+
+    let mut start = 0;
+    while start < states.records().len() {
+        let series_id = states.records()[start].series_id;
+        let end = start
+            + states.records()[start..].partition_point(|record| record.series_id == series_id);
+        let descriptor = series_descriptor(gauges.series(), series_id)?;
+        for pair in states.records()[start..end].windows(2) {
+            if coverage_intersects(known_gaps, pair[0].ts_us, pair[1].ts_us) {
+                continue;
+            }
+            if let Some(fact) = EventFact::from_state_transition(
+                descriptor,
+                pair[0].ts_us,
+                pair[0].state_code,
+                pair[1].ts_us,
+                pair[1].state_code,
+                pair[1].population_total,
+            )
+            .map_err(|_error| BuildError::Internal)?
+            {
+                push_fact(&mut facts, fact, bounds)?;
+            }
+        }
+        start = end;
+    }
+
+    for descriptor in gauges.series().iter().filter(|descriptor| {
+        matches!(
+            kronika_analytics::overview::MetricFactor::from_id(descriptor.factor_id),
+            Some(
+                kronika_analytics::overview::MetricFactor::PgStatisticsResetAt
+                    | kronika_analytics::overview::MetricFactor::PgPostmasterStartTime
+            )
+        )
+    }) {
+        let samples = gauge_samples_for_series(gauges.samples(), descriptor.series_id);
+        for pair in samples.windows(2) {
+            if coverage_intersects(known_gaps, pair[0].ts_us(), pair[1].ts_us()) {
+                continue;
+            }
+            if let Some(fact) = EventFact::from_metadata_change(*descriptor, pair[0], pair[1])
+                .map_err(|_error| BuildError::Internal)?
+            {
+                push_fact(&mut facts, fact, bounds)?;
+            }
+        }
+    }
+
+    derive_sender_disappearances(gauges, states, known_gaps, bounds, &mut facts)?;
+
+    let mut totals = BTreeMap::new();
+    let mut available_by_key = BTreeMap::new();
+    for descriptor in gauges.series() {
+        let Some(entity) = descriptor.entity else {
+            continue;
+        };
+        let destination =
+            match kronika_analytics::overview::MetricFactor::from_id(descriptor.factor_id) {
+                Some(kronika_analytics::overview::MetricFactor::PgFilesystemTotalBytes) => {
+                    &mut totals
+                }
+                Some(kronika_analytics::overview::MetricFactor::PgFilesystemAvailableBytes) => {
+                    &mut available_by_key
+                }
+                _ => continue,
+            };
+        for sample in gauge_samples_for_series(gauges.samples(), descriptor.series_id) {
+            if destination
+                .insert((entity, sample.ts_us()), (*descriptor, *sample))
+                .is_some()
+            {
+                return Err(BuildError::Internal);
+            }
+        }
+    }
+    for (key, (total_descriptor, total)) in totals {
+        let Some((available_descriptor, available_sample)) = available_by_key.get(&key).copied()
+        else {
+            continue;
+        };
+        if let Some(fact) = EventFact::from_capacity_samples(
+            total_descriptor,
+            total,
+            available_descriptor,
+            available_sample,
+        )
+        .map_err(|_error| BuildError::Internal)?
+        {
+            push_fact(&mut facts, fact, bounds)?;
+        }
+        let previous = available_by_key
+            .range((key.0, i64::MIN)..key)
+            .next_back()
+            .map(|(_key, (_descriptor, sample))| *sample);
+        if let Some(previous) = previous
+            && let Some(fact) = EventFact::from_capacity_zero_transition(
+                total_descriptor,
+                total,
+                available_descriptor,
+                previous,
+                available_sample,
+                known_gaps,
+            )
+            .map_err(|_error| BuildError::Internal)?
+        {
+            push_fact(&mut facts, fact, bounds)?;
+        }
+    }
+    Ok(facts)
+}
+
+fn derive_sender_disappearances(
+    gauges: &GaugeSamplesBlock,
+    states: &EntityStatesBlock,
+    known_gaps: &Coverage,
+    bounds: &Bounds,
+    facts: &mut Vec<EventFact>,
+) -> Result<(), BuildError> {
+    let mut boundaries =
+        BTreeMap::<(u64, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
+    let mut snapshots = BTreeMap::<
+        (u64, u32, i64),
+        BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
+    >::new();
+    for record in states.records() {
+        let descriptor = series_descriptor(gauges.series(), record.series_id)?;
+        match kronika_analytics::overview::MetricFactor::from_id(descriptor.factor_id) {
+            Some(
+                kronika_analytics::overview::MetricFactor::PgReplicationSenderSnapshotPopulation,
+            ) => boundaries
+                .entry((descriptor.source_id, descriptor.source_type_id))
+                .or_default()
+                .push((descriptor, *record)),
+            Some(kronika_analytics::overview::MetricFactor::PgReplicationSenderState) => {
+                snapshots
+                    .entry((
+                        descriptor.source_id,
+                        descriptor.source_type_id,
+                        record.ts_us,
+                    ))
+                    .or_default()
+                    .insert(descriptor.series_id, (descriptor, *record));
+            }
+            _ => {}
+        }
+    }
+    for ((source_id, source_type), source_boundaries) in &mut boundaries {
+        source_boundaries.sort_unstable_by_key(|(_descriptor, record)| record.ts_us);
+        for pair in source_boundaries.windows(2) {
+            let (previous_descriptor, previous) = pair[0];
+            let (current_descriptor, current) = pair[1];
+            if previous_descriptor.series_id != current_descriptor.series_id
+                || coverage_intersects(known_gaps, previous.ts_us, current.ts_us)
+            {
+                continue;
+            }
+            let empty = BTreeMap::new();
+            let previous_entities = snapshots
+                .get(&(*source_id, *source_type, previous.ts_us))
+                .unwrap_or(&empty);
+            let current_entities = snapshots
+                .get(&(*source_id, *source_type, current.ts_us))
+                .unwrap_or(&empty);
+            let current_sample = GaugeSample::new(
+                current_descriptor.series_id,
+                current.ts_us,
+                f64::from(current.state_code),
+            )
+            .expect("u32 population is finite");
+            for (series_id, (sender_descriptor, sender)) in previous_entities {
+                if current_entities.contains_key(series_id) {
+                    continue;
+                }
+                if let Some(fact) = EventFact::from_sender_disappearance(
+                    *sender_descriptor,
+                    sender.ts_us,
+                    sender.state_code,
+                    current_descriptor,
+                    current_sample,
+                    current.population_total,
+                )
+                .map_err(|_error| BuildError::Internal)?
+                {
+                    push_fact(facts, fact, bounds)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn series_descriptor(
+    series: &[MetricSeriesDescriptor],
+    id: MetricSeriesId,
+) -> Result<MetricSeriesDescriptor, BuildError> {
+    series
+        .binary_search_by_key(&id.0, |descriptor| descriptor.series_id.0)
+        .ok()
+        .map(|index| series[index])
+        .ok_or(BuildError::Internal)
+}
+
+fn gauge_samples_for_series(samples: &[GaugeSample], series_id: MetricSeriesId) -> &[GaugeSample] {
+    let start = samples.partition_point(|sample| sample.series_id() < series_id);
+    let end = start + samples[start..].partition_point(|sample| sample.series_id() == series_id);
+    &samples[start..end]
+}
+
+fn coverage_intersects(coverage: &Coverage, from_us: i64, to_us: i64) -> bool {
+    let index = coverage
+        .spans()
+        .partition_point(|span| span.end_us() <= from_us);
+    coverage
+        .spans()
+        .get(index)
+        .is_some_and(|span| span.start_us() < to_us)
+}
+
+fn push_fact(
+    destination: &mut Vec<EventFact>,
+    fact: EventFact,
+    bounds: &Bounds,
+) -> Result<(), BuildError> {
+    if destination.len() as u64 == bounds.items_per_block {
+        return Err(BuildError::LimitExceeded);
+    }
+    destination.push(fact);
+    Ok(())
+}
+
+const fn block_build_error(error: super::block::BlockError) -> BuildError {
+    match error {
+        super::block::BlockError::AboveBound => BuildError::LimitExceeded,
+        _ => BuildError::Internal,
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "promotion validates and assembles the complete persisted metric contract in one pass"
+)]
+fn promote_metrics(
+    parts: &[&SegmentFacts],
+    expected_source_id: u64,
+    interval: Option<CoverageSpan>,
+    bounds: &Bounds,
+) -> Result<Option<MetricExtraction>, BuildError> {
+    let Some(interval) = interval else {
+        let has_metric_data = parts.iter().any(|part| {
+            !part.counter_samples.samples().is_empty()
+                || !part.gauge_samples.samples().is_empty()
+                || !part.reset_markers.markers().is_empty()
+                || !part.entity_states.records().is_empty()
+                || !part.loss_coverage.factor_coverage().is_empty()
+                || part.event_facts.iter().any(|fact| {
+                    matches!(
+                        fact.kind(),
+                        kronika_analytics::overview::EventKind::CollectorSnapshotGap
+                            | kronika_analytics::overview::EventKind::CollectorSourceReadFailure
+                            | kronika_analytics::overview::EventKind::CollectorVisibilityRestricted
+                    )
+                })
+        });
+        return Ok((!has_metric_data).then(|| MetricExtraction {
+            descriptor_replacements: Vec::new(),
+            counter_series: Vec::new(),
+            counters: Vec::new(),
+            gauge_series: Vec::new(),
+            gauges: Vec::new(),
+            reset_markers: Vec::new(),
+            entity_states: Vec::new(),
+            factor_coverage: Vec::new(),
+            event_facts: Vec::new(),
+            pgm_body_read_stats: PgmBodyReadStats::default(),
+        }));
+    };
+    let mut counter_series = BTreeMap::new();
+    let mut gauge_series = BTreeMap::new();
+    let mut counters = Vec::new();
+    let mut gauges = Vec::new();
+    let mut entity_states = Vec::new();
+    let mut event_facts = Vec::new();
+    for part in parts {
+        if !merge_metric_series(
+            &mut counter_series,
+            part.counter_samples.series(),
+            expected_source_id,
+        ) || !merge_metric_series(
+            &mut gauge_series,
+            part.gauge_samples.series(),
+            expected_source_id,
+        ) {
+            return Ok(None);
+        }
+        checked_extend(
+            &mut counters,
+            part.counter_samples.samples(),
+            bounds.items_per_block,
+        )?;
+        checked_extend(
+            &mut gauges,
+            part.gauge_samples.samples(),
+            bounds.items_per_block,
+        )?;
+        checked_extend(
+            &mut entity_states,
+            part.entity_states.records(),
+            bounds.items_per_block,
+        )?;
+        for fact in part.event_facts.iter().filter(|fact| {
+            matches!(
+                fact.kind(),
+                kronika_analytics::overview::EventKind::CollectorSnapshotGap
+                    | kronika_analytics::overview::EventKind::CollectorSourceReadFailure
+                    | kronika_analytics::overview::EventKind::CollectorVisibilityRestricted
+            )
+        }) {
+            checked_extend(
+                &mut event_facts,
+                std::slice::from_ref(fact),
+                bounds.items_per_block,
+            )?;
+        }
+    }
+    counters.sort_unstable_by_key(|sample| {
+        (
+            sample.series_id().0,
+            sample.alignment_id().0,
+            sample.ts_us(),
+        )
+    });
+    if counters.windows(2).any(|pair| {
+        pair[0].series_id() == pair[1].series_id()
+            && pair[0].alignment_id() == pair[1].alignment_id()
+            && pair[0].ts_us() == pair[1].ts_us()
+    }) {
+        return Ok(None);
+    }
+    gauges.sort_unstable_by_key(|sample| (sample.series_id().0, sample.ts_us()));
+    if gauges.windows(2).any(|pair| {
+        pair[0].series_id() == pair[1].series_id() && pair[0].ts_us() == pair[1].ts_us()
+    }) {
+        return Ok(None);
+    }
+    entity_states.sort_unstable_by_key(|record| (record.series_id.0, record.ts_us));
+    if entity_states
+        .windows(2)
+        .any(|pair| pair[0].series_id == pair[1].series_id && pair[0].ts_us == pair[1].ts_us)
+    {
+        return Ok(None);
+    }
+    let factor_coverage = promoted_factor_coverage(
+        parts,
+        &counter_series,
+        &counters,
+        &gauge_series,
+        &gauges,
+        &entity_states,
+        interval,
+        bounds,
+    )?;
+    let reset_markers = reset_markers_for_samples(&counters);
+    event_facts.sort_by(EventFact::canonical_cmp);
+    if has_duplicate_fact_id(&event_facts) {
+        return Ok(None);
+    }
+    Ok(Some(MetricExtraction {
+        descriptor_replacements: Vec::new(),
+        counter_series: counter_series.into_values().collect(),
+        counters,
+        gauge_series: gauge_series.into_values().collect(),
+        gauges,
+        reset_markers,
+        entity_states,
+        factor_coverage,
+        event_facts,
+        pgm_body_read_stats: PgmBodyReadStats::default(),
+    }))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the inputs and steps mirror the complete promoted factor-coverage contract"
+)]
+fn promoted_factor_coverage(
+    parts: &[&SegmentFacts],
+    counter_series: &BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
+    counters: &[CounterSample],
+    gauge_series: &BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
+    gauges: &[GaugeSample],
+    entity_states: &[EntityStateRecord],
+    interval: CoverageSpan,
+    bounds: &Bounds,
+) -> Result<Vec<FactorCoverage>, BuildError> {
+    let mut records = BTreeMap::<FactorId, Vec<&FactorCoverage>>::new();
+    for part in parts {
+        for coverage in part.loss_coverage.factor_coverage() {
+            records
+                .entry(coverage.factor_id)
+                .or_default()
+                .push(coverage);
+        }
+    }
+    if records.len() as u64 > bounds.items_per_block {
+        return Err(BuildError::LimitExceeded);
+    }
+
+    let mut times = BTreeMap::<FactorId, Vec<i64>>::new();
+    for sample in counters {
+        let descriptor = counter_series
+            .get(&sample.series_id())
+            .ok_or(BuildError::Internal)?;
+        times
+            .entry(descriptor.factor_id)
+            .or_default()
+            .push(sample.ts_us());
+    }
+    for sample in gauges {
+        let descriptor = gauge_series
+            .get(&sample.series_id())
+            .ok_or(BuildError::Internal)?;
+        times
+            .entry(descriptor.factor_id)
+            .or_default()
+            .push(sample.ts_us());
+    }
+    let mut latest_population_by_source = BTreeMap::<u32, (i64, u64)>::new();
+    for state in entity_states {
+        let descriptor = gauge_series
+            .get(&state.series_id)
+            .ok_or(BuildError::Internal)?;
+        let latest = latest_population_by_source
+            .entry(descriptor.source_type_id)
+            .or_insert((state.ts_us, state.population_total));
+        if state.ts_us > latest.0 {
+            *latest = (state.ts_us, state.population_total);
+        }
+    }
+
+    records
+        .into_iter()
+        .map(|(factor_id, mut records)| {
+            records.sort_unstable_by_key(|coverage| {
+                (coverage.interval.start_us(), coverage.interval.end_us())
+            });
+            let applicability = records
+                .first()
+                .map(|coverage| coverage.applicability)
+                .ok_or(BuildError::Internal)?;
+            if records
+                .iter()
+                .any(|coverage| coverage.applicability != applicability)
+            {
+                return Err(BuildError::Internal);
+            }
+            if applicability == Applicability::Unsupported {
+                return Ok(unsupported_promoted_coverage(factor_id, interval));
+            }
+            if applicability != Applicability::Applicable {
+                return Err(BuildError::Internal);
+            }
+
+            let mut loss_reasons = records
+                .iter()
+                .flat_map(|coverage| coverage.loss_reasons.iter().copied())
+                .collect::<Vec<_>>();
+            loss_reasons.sort_unstable();
+            loss_reasons.dedup();
+            let lost_count_lower_bound = records
+                .iter()
+                .filter_map(|coverage| coverage.lost_count_lower_bound)
+                .max()
+                .filter(|lost| *lost != 0);
+            let mut source_population = records
+                .iter()
+                .rev()
+                .find_map(|coverage| coverage.source_population);
+            let mut factor_sources = counter_series
+                .values()
+                .chain(gauge_series.values())
+                .filter(|descriptor| descriptor.factor_id == factor_id)
+                .map(|descriptor| descriptor.source_type_id)
+                .collect::<Vec<_>>();
+            factor_sources.sort_unstable();
+            factor_sources.dedup();
+            if let [source_type_id] = factor_sources.as_slice()
+                && let Some((_ts_us, population_total)) =
+                    latest_population_by_source.get(source_type_id)
+            {
+                source_population = Some(SourcePopulation {
+                    collected: *population_total,
+                    total: Some(*population_total),
+                    total_quality: PopulationTotalQuality::Exact,
+                });
+            }
+            let source_completeness = if records
+                .iter()
+                .all(|coverage| coverage.source_completeness == SourceCompleteness::Full)
+            {
+                SourceCompleteness::Full
+            } else if records
+                .iter()
+                .all(|coverage| coverage.source_completeness == SourceCompleteness::Unknown)
+            {
+                SourceCompleteness::Unknown
+            } else {
+                SourceCompleteness::BoundedSubset
+            };
+
+            let factor_times = times.remove(&factor_id).unwrap_or_default();
+            let present_samples =
+                u64::try_from(factor_times.len()).map_err(|_error| BuildError::Overflow)?;
+            let cadence = observed_cadence(&factor_times);
+            let covered_duration_us = cadence.map_or(0, |(period, _cadence_id)| {
+                cadence_covered_duration(&factor_times, interval, period)
+            });
+            let state = promoted_coverage_state(
+                present_samples,
+                cadence.is_some(),
+                covered_duration_us,
+                interval,
+                loss_reasons.is_empty(),
+            );
+
+            Ok(FactorCoverage {
+                factor_id,
+                applicability,
+                state,
+                interval,
+                expected_period_us: cadence.map(|(period, _cadence_id)| period),
+                period_quality: cadence
+                    .map_or(PeriodQuality::Unknown, |_| PeriodQuality::ObservedStable),
+                cadence_epoch_id: cadence.map(|(_period, id)| id),
+                crosses_cadence_boundary: false,
+                present_samples,
+                covered_duration_us,
+                source_population,
+                loss_reasons,
+                lost_count_lower_bound,
+                retained_exactness: if records
+                    .iter()
+                    .all(|coverage| coverage.retained_exactness == RetainedExactness::Exact)
+                    && lost_count_lower_bound.is_none()
+                {
+                    RetainedExactness::Exact
+                } else {
+                    RetainedExactness::Unknown
+                },
+                source_completeness,
+                physical_count_semantics: PhysicalCountSemantics::NotApplicable,
+                boundary_quality: BoundaryQuality::Contained,
+            })
+        })
+        .collect()
+}
+
+const fn promoted_coverage_state(
+    present_samples: u64,
+    has_cadence: bool,
+    covered_duration_us: u64,
+    interval: CoverageSpan,
+    losses_empty: bool,
+) -> CoverageState {
+    if present_samples == 0 {
+        if losses_empty {
+            CoverageState::NotCollected
+        } else {
+            CoverageState::Gap
+        }
+    } else if !has_cadence {
+        if losses_empty {
+            CoverageState::Unknown
+        } else {
+            CoverageState::Gap
+        }
+    } else if covered_duration_us == interval.duration_us() {
+        CoverageState::Complete
+    } else if covered_duration_us == 0 {
+        if losses_empty {
+            CoverageState::Unknown
+        } else {
+            CoverageState::Gap
+        }
+    } else {
+        CoverageState::Partial
+    }
+}
+
+const fn unsupported_promoted_coverage(
+    factor_id: FactorId,
+    interval: CoverageSpan,
+) -> FactorCoverage {
+    FactorCoverage {
+        factor_id,
+        applicability: Applicability::Unsupported,
+        state: CoverageState::NotCollected,
+        interval,
+        expected_period_us: None,
+        period_quality: PeriodQuality::Unknown,
+        cadence_epoch_id: None,
+        crosses_cadence_boundary: false,
+        present_samples: 0,
+        covered_duration_us: 0,
+        source_population: None,
+        loss_reasons: Vec::new(),
+        lost_count_lower_bound: None,
+        retained_exactness: RetainedExactness::Unknown,
+        source_completeness: SourceCompleteness::Unknown,
+        physical_count_semantics: PhysicalCountSemantics::NotApplicable,
+        boundary_quality: BoundaryQuality::Unknown,
+    }
+}
+
+fn merge_metric_series(
+    destination: &mut BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
+    incoming: &[MetricSeriesDescriptor],
+    expected_source_id: u64,
+) -> bool {
+    incoming.iter().all(|descriptor| {
+        if descriptor.source_id != expected_source_id {
+            return false;
+        }
+        match destination.entry(descriptor.series_id) {
+            std::collections::btree_map::Entry::Occupied(existing) => {
+                *existing.get() == *descriptor
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(*descriptor);
+                true
+            }
+        }
+    })
+}
+
+fn checked_extend<T: Clone>(
+    destination: &mut Vec<T>,
+    incoming: &[T],
+    bound: u64,
+) -> Result<(), BuildError> {
+    let next = destination
+        .len()
+        .checked_add(incoming.len())
+        .ok_or(BuildError::Overflow)?;
+    if next as u64 > bound {
+        return Err(BuildError::LimitExceeded);
+    }
+    destination.extend_from_slice(incoming);
+    Ok(())
+}
+
+fn reset_markers_for_samples(samples: &[CounterSample]) -> Vec<ResetMarker> {
+    let mut markers = Vec::new();
+    let mut previous = None;
+    for sample in samples {
+        let epoch = (sample.series_id(), sample.reset_epoch());
+        if previous != Some(epoch) {
+            markers.push(ResetMarker {
+                series_id: sample.series_id(),
+                ts_us: sample.ts_us(),
+                reset_epoch: sample.reset_epoch(),
+            });
+            previous = Some(epoch);
+        }
+    }
+    markers
+}
+
+fn validate_metric_source(
+    series: &[MetricSeriesDescriptor],
+    expected_source_id: u64,
+) -> Result<(), CacheReadError> {
+    if series
+        .iter()
+        .any(|descriptor| descriptor.source_id != expected_source_id)
+    {
+        return Err(CacheReadError::WrongSource);
+    }
+    Ok(())
+}
+
+fn validate_reset_series(
+    markers: &ResetMarkersBlock,
+    counters: &CounterSamplesBlock,
+) -> Result<(), CacheReadError> {
+    if markers.markers() != reset_markers_for_samples(counters.samples()) {
+        return Err(CacheReadError::Corrupt);
+    }
+    Ok(())
+}
+
+fn validate_state_series(
+    states: &EntityStatesBlock,
+    gauges: &GaugeSamplesBlock,
+) -> Result<(), CacheReadError> {
+    for state in states.records() {
+        let descriptor = gauges
+            .series()
+            .binary_search_by_key(&state.series_id.0, |descriptor| descriptor.series_id.0)
+            .ok()
+            .map(|index| gauges.series()[index]);
+        let sample = gauges
+            .samples()
+            .binary_search_by_key(&(state.series_id.0, state.ts_us), |sample| {
+                (sample.series_id().0, sample.ts_us())
+            })
+            .ok()
+            .map(|index| gauges.samples()[index]);
+        if descriptor.is_none_or(|descriptor| {
+            descriptor.entity.is_none() || descriptor.unit != MetricUnit::StateCode
+        }) || sample
+            .is_none_or(|sample| sample.value().to_bits() != f64::from(state.state_code).to_bits())
+        {
+            return Err(CacheReadError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn segment_span(min_ts_us: i64, max_ts_us: i64) -> Result<Option<CoverageSpan>, BuildError> {
+    if min_ts_us > max_ts_us {
+        return Ok(None);
+    }
+    let end = max_ts_us.checked_add(1).ok_or(BuildError::Overflow)?;
+    CoverageSpan::new(min_ts_us, end)
+        .map(Some)
+        .ok_or(BuildError::Source(SourceError::UnsupportedLayout))
+}
+
 /// Half-open coverage of an inclusive catalog time range.
 fn segment_coverage(min_ts_us: i64, max_ts_us: i64) -> Result<Coverage, BuildError> {
     if min_ts_us > max_ts_us {
@@ -891,6 +1823,86 @@ fn singleton_body<R: ReadAt>(
     bodies.pop().ok_or(CacheReadError::Corrupt)
 }
 
+fn validate_event_fact_evidence(
+    facts: &EventFactsBlock,
+    observations: &EventObservationsBlock,
+    counters: &CounterSamplesBlock,
+    gauges: &GaugeSamplesBlock,
+    expected_source_id: u64,
+) -> Result<(), CacheReadError> {
+    let mut source_ids = BTreeMap::<ObservationId, u64>::new();
+    for observation in observations.observations() {
+        insert_evidence_source(
+            &mut source_ids,
+            observation.observation_id(),
+            observation.source_id(),
+        )?;
+    }
+    for sample in counters.samples() {
+        insert_evidence_source(
+            &mut source_ids,
+            kronika_analytics::overview::counter_sample_observation_id(*sample),
+            metric_source(counters.series(), sample.series_id())?,
+        )?;
+    }
+    for sample in gauges.samples() {
+        insert_evidence_source(
+            &mut source_ids,
+            kronika_analytics::overview::gauge_sample_observation_id(*sample),
+            metric_source(gauges.series(), sample.series_id())?,
+        )?;
+    }
+    for fact in facts.facts() {
+        if fact.coverage().source_id != expected_source_id {
+            return Err(CacheReadError::WrongSource);
+        }
+        if matches!(
+            fact.kind(),
+            kronika_analytics::overview::EventKind::CollectorSnapshotGap
+                | kronika_analytics::overview::EventKind::CollectorSourceReadFailure
+                | kronika_analytics::overview::EventKind::CollectorVisibilityRestricted
+        ) {
+            continue;
+        }
+        if fact
+            .supporting_observation_ids()
+            .iter()
+            .any(|id| source_ids.get(id) != Some(&fact.coverage().source_id))
+        {
+            return Err(CacheReadError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn insert_evidence_source(
+    source_ids: &mut BTreeMap<ObservationId, u64>,
+    id: ObservationId,
+    source_id: u64,
+) -> Result<(), CacheReadError> {
+    if source_ids.insert(id, source_id).is_some() {
+        return Err(CacheReadError::Corrupt);
+    }
+    Ok(())
+}
+
+fn metric_source(
+    descriptors: &[MetricSeriesDescriptor],
+    series_id: MetricSeriesId,
+) -> Result<u64, CacheReadError> {
+    descriptors
+        .binary_search_by_key(&series_id.0, |descriptor| descriptor.series_id.0)
+        .ok()
+        .map(|index| descriptors[index].source_id)
+        .ok_or(CacheReadError::Corrupt)
+}
+
+fn has_duplicate_fact_id(facts: &[EventFact]) -> bool {
+    let mut ids = facts.iter().map(EventFact::fact_id).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.windows(2).any(|pair| pair[0] == pair[1])
+}
+
 fn merge_coverage_blocks<R: ReadAt>(
     reader: &mut FactFileReader<R>,
     bounds: &Bounds,
@@ -907,6 +1919,7 @@ fn merge_coverage_blocks<R: ReadAt>(
     let mut retained_exactness = None;
     let mut physical_count = None;
     let mut dropped_lower_bound = 0_u64;
+    let mut factor_coverage = Vec::new();
     let mut covered_span_budget = bounds.coverage_spans;
     let mut gap_span_budget = bounds.coverage_spans;
     for (entry, body) in blocks {
@@ -933,8 +1946,16 @@ fn merge_coverage_blocks<R: ReadAt>(
         dropped_lower_bound = dropped_lower_bound
             .checked_add(block.dropped_lower_bound())
             .ok_or(CacheReadError::Corrupt)?;
+        let next_factor_count = factor_coverage
+            .len()
+            .checked_add(block.factor_coverage().len())
+            .ok_or(CacheReadError::Oversized)?;
+        if next_factor_count as u64 > bounds.items_per_block {
+            return Err(CacheReadError::Oversized);
+        }
+        factor_coverage.extend_from_slice(block.factor_coverage());
     }
-    LossCoverageBlock::new(
+    LossCoverageBlock::new_with_factors(
         covered,
         known_gaps,
         applicability.ok_or(CacheReadError::Corrupt)?,
@@ -943,6 +1964,7 @@ fn merge_coverage_blocks<R: ReadAt>(
         retained_exactness.ok_or(CacheReadError::Corrupt)?,
         physical_count.ok_or(CacheReadError::Corrupt)?,
         dropped_lower_bound,
+        factor_coverage,
         bounds,
     )
     .map_err(Into::into)
@@ -1047,19 +2069,24 @@ fn merge_physical_count(
 #[cfg(test)]
 mod tests {
     use kronika_analytics::overview::{
-        CountLimits, ErrorCategory, EvidenceQuality, LossReason, SemanticDivergence, SqlState,
-        TimeQuality, semantic_divergences,
+        CountLimits, CounterReduction, ErrorCategory, EventKind, EventPayload, EvidenceQuality,
+        LossReason, MetricFactor, ReductionLimits, SemanticDivergence, SqlState, TimeQuality,
+        classify_series, semantic_divergences,
     };
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
+    use kronika_registry::incident_gauges::PgReplicationPhysicalV1;
     use kronika_registry::pg_log::{
         PgLogAutovacuumV1, PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1,
         PgLogLockWaitV1, PgLogSlowQueryV1, PgLogTempFileV1,
     };
+    use kronika_registry::reset_metadata::ResetMetadata;
+    use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
     use kronika_registry::{Section, StrId, Ts};
     use kronika_writer::{Interner, dict};
 
     use super::super::limits::LIMIT;
+    use super::super::qualification_fixture::{ALL_FAMILY_SCHEMA_VERSION, all_family_fixture};
     use super::*;
 
     const LIMITS: OracleLimits = OracleLimits {
@@ -1072,14 +2099,12 @@ mod tests {
         },
     };
 
-    fn context() -> SegmentContext {
-        SegmentContext::new(
-            b"store-a".to_vec(),
-            NamingContractId([0x33; 16]),
-            SegmentLocator([0x44; 32]),
-        )
-        .expect("valid context")
-    }
+    const REDUCTION_LIMITS: ReductionLimits = ReductionLimits {
+        max_input_items: 256,
+        max_gap_spans: 256,
+        max_counter_pairs: 256,
+        max_gauge_samples: 256,
+    };
 
     fn lifecycle_row(ts: i64, kind: u8, pid: Option<i32>, signal: Option<i32>) -> PgLogLifecycleV1 {
         PgLogLifecycleV1 {
@@ -1129,6 +2154,227 @@ mod tests {
 
     fn full_range() -> CoverageSpan {
         CoverageSpan::new(0, 10_000).expect("valid range")
+    }
+
+    fn reset_metadata(ts_us: i64, postmaster_start_us: i64) -> ResetMetadata {
+        ResetMetadata {
+            ts: Ts(ts_us),
+            postmaster_start_time: Ts(postmaster_start_us),
+            pg_stat_database_reset_max_at: None,
+            pg_stat_statements_reset_at: None,
+            pg_store_plans_reset_at: None,
+            pg_stat_bgwriter_reset_at: None,
+            pg_stat_checkpointer_reset_at: None,
+            pg_stat_wal_reset_at: None,
+            pg_stat_archiver_reset_at: None,
+            pg_stat_io_reset_at: None,
+            ext_pg_stat_statements_version: None,
+            ext_pg_store_plans_version: None,
+            compute_query_id: None,
+            track_io_timing: None,
+            track_wal_io_timing: None,
+        }
+    }
+
+    fn replication_sender(ts_us: i64) -> PgReplicationPhysicalV1 {
+        replication_sender_state(ts_us, 3)
+    }
+
+    fn replication_sender_state(ts_us: i64, state_code: u8) -> PgReplicationPhysicalV1 {
+        PgReplicationPhysicalV1 {
+            ts: Ts(ts_us),
+            pid: 42,
+            backend_start_key: 5,
+            application_name: StrId(1),
+            slot_name: StrId(2),
+            slot_type: StrId(3),
+            state: StrId(4),
+            sync_state: StrId(5),
+            scope_code: 1,
+            state_code,
+            current_to_sent_bytes: None,
+            sent_to_write_bytes: None,
+            write_to_flush_bytes: None,
+            flush_to_replay_bytes: None,
+            write_lag_us: None,
+            flush_lag_us: None,
+            replay_lag_us: None,
+        }
+    }
+
+    fn sender_coverage(
+        ts_us: i64,
+        read_state: u8,
+        source_total: u32,
+        collected: u32,
+    ) -> SnapshotCoverageV1 {
+        SnapshotCoverageV1 {
+            ts: Ts(ts_us),
+            source_type_id: 1_033_001,
+            collector_pid: 99,
+            collector_started_at: Ts(1),
+            read_state,
+            visibility: 0,
+            source_total,
+            collected,
+        }
+    }
+
+    fn replication_snapshot_pgm(
+        resets: &[ResetMetadata],
+        senders: &[PgReplicationPhysicalV1],
+        coverage: &[SnapshotCoverageV1],
+    ) -> Vec<u8> {
+        let reset_body = ResetMetadata::encode(resets).expect("encode reset metadata");
+        let sender_body =
+            PgReplicationPhysicalV1::encode(senders).expect("encode replication senders");
+        let coverage_body = SnapshotCoverageV1::encode(coverage).expect("encode snapshot coverage");
+        let min_ts = resets
+            .iter()
+            .map(|row| row.ts.0)
+            .chain(senders.iter().map(|row| row.ts.0))
+            .chain(coverage.iter().map(|row| row.ts.0))
+            .min()
+            .expect("fixture has a timestamp");
+        let max_ts = resets
+            .iter()
+            .map(|row| row.ts.0)
+            .chain(senders.iter().map(|row| row.ts.0))
+            .chain(coverage.iter().map(|row| row.ts.0))
+            .max()
+            .expect("fixture has a timestamp");
+        build_part(
+            &[
+                SectionInput {
+                    type_id: 1_020_001,
+                    rows: row_count(resets),
+                    body: &reset_body,
+                },
+                SectionInput {
+                    type_id: 1_033_001,
+                    rows: row_count(senders),
+                    body: &sender_body,
+                },
+                SectionInput {
+                    type_id: 1_038_001,
+                    rows: row_count(coverage),
+                    body: &coverage_body,
+                },
+            ],
+            PartMeta {
+                min_ts,
+                max_ts,
+                source_id: 7,
+            },
+        )
+    }
+
+    #[test]
+    fn complete_empty_sender_snapshot_is_a_boundary_and_proves_disappearance() {
+        let bytes = replication_snapshot_pgm(
+            &[reset_metadata(10, 1), reset_metadata(20, 1)],
+            &[replication_sender(10)],
+            &[sender_coverage(10, 0, 1, 1), sender_coverage(20, 0, 0, 0)],
+        );
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open replication fixture");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
+
+        let boundary_series = facts
+            .gauge_samples()
+            .series()
+            .iter()
+            .find(|descriptor| {
+                MetricFactor::from_id(descriptor.factor_id)
+                    == Some(MetricFactor::PgReplicationSenderSnapshotPopulation)
+            })
+            .expect("snapshot boundary series");
+        let boundaries = facts
+            .entity_states()
+            .records()
+            .iter()
+            .filter(|record| record.series_id == boundary_series.series_id)
+            .collect::<Vec<_>>();
+        assert_eq!(boundaries.len(), 2);
+        assert_eq!(boundaries[0].state_code, 0);
+        assert_eq!(boundaries[0].population_total, 1);
+        assert_eq!(boundaries[1].state_code, 0);
+        assert_eq!(boundaries[1].population_total, 0);
+
+        let disappearance = facts
+            .event_facts()
+            .iter()
+            .find(|fact| fact.kind() == EventKind::PgReplicationSenderDisappeared)
+            .expect("complete empty snapshot proves sender disappearance");
+        assert_eq!(disappearance.interval().start_us(), 20);
+        assert!(matches!(
+            disappearance.payload(),
+            EventPayload::StateTransition(payload)
+                if payload.previous_state == 3
+                    && payload.current_state == u32::MAX
+                    && payload.population_total == 0
+        ));
+    }
+
+    #[test]
+    fn postmaster_change_rekeys_population_boundary_and_suppresses_disappearance() {
+        let bytes = replication_snapshot_pgm(
+            &[reset_metadata(10, 1), reset_metadata(20, 2)],
+            &[replication_sender(10)],
+            &[sender_coverage(10, 0, 1, 1), sender_coverage(20, 0, 0, 0)],
+        );
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open restart fixture");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
+
+        let boundary_series_count = facts
+            .gauge_samples()
+            .series()
+            .iter()
+            .filter(|descriptor| {
+                MetricFactor::from_id(descriptor.factor_id)
+                    == Some(MetricFactor::PgReplicationSenderSnapshotPopulation)
+            })
+            .count();
+        assert_eq!(
+            boundary_series_count, 2,
+            "the postmaster epoch is part of the complete-boundary identity"
+        );
+        assert!(
+            facts
+                .event_facts()
+                .iter()
+                .all(|fact| fact.kind() != EventKind::PgReplicationSenderDisappeared)
+        );
+        assert!(
+            facts
+                .event_facts()
+                .iter()
+                .any(|fact| fact.kind() == EventKind::PgPostmasterStartChanged)
+        );
+    }
+
+    #[test]
+    fn collector_read_failure_is_retained_as_a_canonical_coverage_fact() {
+        let bytes = replication_snapshot_pgm(
+            &[reset_metadata(10, 1)],
+            &[],
+            &[sender_coverage(10, 3, 2, 0)],
+        );
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open collector-loss fixture");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
+        assert!(
+            facts
+                .event_facts()
+                .iter()
+                .any(|fact| fact.kind() == EventKind::CollectorSourceReadFailure)
+        );
+        assert!(
+            facts
+                .entity_states()
+                .records()
+                .iter()
+                .all(|record| record.population_total != 2),
+            "an incomplete snapshot cannot authorize an entity-population boundary"
+        );
     }
 
     #[allow(
@@ -1585,7 +2831,7 @@ mod tests {
     fn extracts_registered_log_event_layouts_once_with_conservative_quality() {
         let bytes = all_log_event_types_pgm();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
         assert_eq!(facts.observations().len(), 8);
         let kinds: std::collections::BTreeSet<_> = facts
             .observations()
@@ -1669,7 +2915,7 @@ mod tests {
     fn subkinds_gap_dispositions_and_timestamp_fallback_are_preserved() {
         let bytes = all_event_variants_pgm();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
         assert_eq!(facts.observations().len(), 40);
 
         let categories: Vec<_> = facts
@@ -1810,7 +3056,7 @@ mod tests {
             ..LIMIT
         };
         assert!(matches!(
-            SegmentFacts::extract(&unit, &context(), &tight),
+            SegmentFacts::extract(&unit, &tight),
             Err(BuildError::LimitExceeded)
         ));
     }
@@ -1843,7 +3089,7 @@ mod tests {
             ..LIMIT
         };
         assert!(matches!(
-            SegmentFacts::extract(&unit, &context(), &tight),
+            SegmentFacts::extract(&unit, &tight),
             Err(BuildError::LimitExceeded)
         ));
         assert_eq!(unit.body_read_stats(), PgmBodyReadStats::default());
@@ -1856,8 +3102,7 @@ mod tests {
         unit.decode_overview_rows(0)
             .expect("independent section read");
         let before = unit.body_read_stats();
-        let (_facts, local) =
-            SegmentFacts::extract_with_stats(&unit, &context(), &LIMIT).expect("extract");
+        let (_facts, local) = SegmentFacts::extract_with_stats(&unit, &LIMIT).expect("extract");
         assert_eq!(local.read_calls, 1);
         assert_eq!(local.stored_bytes_read, unit.catalog().entries[0].len);
         assert_eq!(
@@ -1902,7 +3147,7 @@ mod tests {
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
         assert!(matches!(
-            SegmentFacts::extract(&unit, &context(), &LIMIT),
+            SegmentFacts::extract(&unit, &LIMIT),
             Err(BuildError::Source(SourceError::Corrupt))
         ));
     }
@@ -1911,7 +3156,7 @@ mod tests {
     fn extract_materializes_one_observation_per_lifecycle_row() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
         assert_eq!(facts.observations().len(), 3);
         assert_eq!(facts.manifest_entries().len(), 1);
         assert_eq!(
@@ -1929,7 +3174,7 @@ mod tests {
     fn fact_file_reload_matches_forced_raw_decode() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("raw extract");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let encoded = raw.encode(&LIMIT).expect("encode fact file");
         let index = SegmentFacts::from_bytes(
             &encoded,
@@ -1945,10 +3190,227 @@ mod tests {
     }
 
     #[test]
+    fn every_populated_canonical_block_matches_forced_raw_and_restart_warm() {
+        let fixture = all_family_fixture();
+        assert_eq!(fixture.schema_version, ALL_FAMILY_SCHEMA_VERSION);
+        assert_eq!(fixture.source_id, 7);
+        assert_eq!(fixture.cadence_us, 10);
+        let bytes = fixture.sealed_bytes();
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("forced raw extract");
+
+        assert!(!raw.observations().is_empty());
+        assert!(!raw.event_facts().is_empty());
+        assert!(!raw.counter_samples().series().is_empty());
+        assert!(!raw.counter_samples().samples().is_empty());
+        assert!(!raw.gauge_samples().series().is_empty());
+        assert!(!raw.gauge_samples().samples().is_empty());
+        assert!(!raw.reset_markers().markers().is_empty());
+        assert!(!raw.entity_states().records().is_empty());
+        assert!(!raw.loss_coverage().factor_coverage().is_empty());
+        for kind in [
+            EventKind::PgDatabaseDeadlockDelta,
+            EventKind::PgReplicationSenderStateChanged,
+            EventKind::PgReplicationSenderDisappeared,
+            EventKind::CollectorSourceReadFailure,
+        ] {
+            assert!(
+                raw.event_facts().iter().any(|fact| fact.kind() == kind),
+                "fixture did not materialize {kind:?}"
+            );
+        }
+
+        let encoded = raw.encode(&LIMIT).expect("encode all canonical blocks");
+        let restart_warm = SegmentFacts::from_reader(
+            encoded.as_slice(),
+            raw.identity(),
+            raw.lineage(),
+            &raw.catalog_descriptors(),
+            &LIMIT,
+        )
+        .expect("restart-warm all canonical blocks");
+        assert_eq!(
+            restart_warm, raw,
+            "restart-warm must preserve every canonical block, descriptor, and coverage axis"
+        );
+
+        let recomputed = SegmentFacts::extract(&unit, &LIMIT).expect("forced recompute");
+        assert_eq!(
+            recomputed, raw,
+            "forced raw recomputation must be byte-semantically stable"
+        );
+    }
+
+    #[test]
+    fn every_populated_block_crc_is_enforced_for_the_all_family_fixture() {
+        let bytes = all_family_fixture().sealed_bytes();
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("extract all families");
+        let encoded = raw.encode(&LIMIT).expect("encode every canonical block");
+        let admitted = FactFile::admit(&encoded, raw.identity(), raw.lineage(), &LIMIT)
+            .expect("admit pristine fact file");
+
+        assert_eq!(
+            admitted
+                .directory()
+                .iter()
+                .map(|entry| entry.block_kind)
+                .collect::<Vec<_>>(),
+            BlockKind::ALL
+                .into_iter()
+                .map(BlockKind::code)
+                .collect::<Vec<_>>(),
+            "the qualification fixture must encode every canonical block exactly once"
+        );
+
+        for entry in admitted.directory() {
+            if entry.stored_len == 0 {
+                assert_eq!(
+                    entry.block_kind,
+                    BlockKind::StringTable.code(),
+                    "only the fixture's intentionally text-free string table is empty"
+                );
+                continue;
+            }
+            let mut corrupted = encoded.clone();
+            let offset = usize::try_from(entry.offset).expect("fixture offset fits usize");
+            corrupted[offset] ^= 0x80;
+            assert!(
+                matches!(
+                    SegmentFacts::from_bytes(
+                        &corrupted,
+                        raw.identity(),
+                        raw.lineage(),
+                        &raw.catalog_descriptors(),
+                        &LIMIT,
+                    ),
+                    Err(CacheReadError::Corrupt)
+                ),
+                "block {} accepted a stale body CRC",
+                entry.block_kind
+            );
+        }
+    }
+
+    #[test]
+    fn every_all_family_source_body_crc_failure_stays_a_source_error() {
+        let pristine = all_family_fixture().sealed_bytes();
+        let catalog = PgmUnit::open(pristine.as_slice())
+            .expect("open pristine all-family PGM")
+            .catalog()
+            .entries
+            .clone();
+        assert!(
+            catalog.len() > BlockKind::ALL.len(),
+            "the source fixture must exercise repeated section layouts"
+        );
+
+        for (ordinal, entry) in catalog.iter().enumerate() {
+            assert_ne!(entry.len, 0, "fixture source body must not be empty");
+            let mut damaged = pristine.clone();
+            let offset = usize::try_from(entry.offset).expect("fixture source offset fits usize");
+            damaged[offset] ^= 0x40;
+            let unit = PgmUnit::open(damaged.as_slice()).expect("catalog remains readable");
+            assert!(
+                matches!(
+                    SegmentFacts::extract(&unit, &LIMIT),
+                    Err(BuildError::Source(SourceError::Corrupt))
+                ),
+                "source section ordinal {ordinal} type {} was masked by derived extraction",
+                entry.type_id
+            );
+        }
+    }
+
+    #[test]
+    fn all_family_range_edges_use_half_open_ownership_and_one_left_halo() {
+        let bytes = all_family_fixture().sealed_bytes();
+        let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract all families");
+
+        let left_range = CoverageSpan::new(10, 20).expect("left range");
+        let right_range = CoverageSpan::new(20, 31).expect("right range");
+        let left = facts.query(left_range, LIMITS).expect("left query");
+        let right = facts.query(right_range, LIMITS).expect("right query");
+        assert_eq!(left.observations().len(), 1);
+        assert_eq!(right.observations().len(), 2);
+        assert_eq!(
+            left.observations().len() + right.observations().len(),
+            facts.observations().len(),
+            "an event exactly at the split belongs only to the right range"
+        );
+
+        let deadlock_series = facts
+            .counter_samples()
+            .series()
+            .iter()
+            .find(|series| series.factor_id == MetricFactor::PgDatabaseDeadlocks.id())
+            .expect("deadlock series")
+            .series_id;
+        let samples: Vec<_> = facts
+            .counter_samples()
+            .samples()
+            .iter()
+            .copied()
+            .filter(|sample| sample.series_id() == deadlock_series)
+            .collect();
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.ts_us())
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+
+        let bucket = CoverageSpan::new(15, 31).expect("unaligned bucket");
+        let whole_intervals = classify_series(
+            None,
+            &samples,
+            facts.loss_coverage().known_gaps(),
+            REDUCTION_LIMITS,
+        )
+        .expect("classify whole series");
+        let whole = CounterReduction::from_intervals(&whole_intervals, bucket, REDUCTION_LIMITS)
+            .expect("reduce whole series")
+            .expect("two owned pairs");
+
+        let halo = samples[0];
+        let selected = &samples[1..];
+        let ranged_intervals = classify_series(
+            Some(halo),
+            selected,
+            facts.loss_coverage().known_gaps(),
+            REDUCTION_LIMITS,
+        )
+        .expect("classify selected series with halo");
+        let ranged = CounterReduction::from_intervals(&ranged_intervals, bucket, REDUCTION_LIMITS)
+            .expect("reduce selected range")
+            .expect("halo restores both pairs");
+        assert_eq!(ranged, whole);
+        assert_eq!(ranged.valid_pairs(), 2);
+
+        let no_halo = classify_series(
+            None,
+            selected,
+            facts.loss_coverage().known_gaps(),
+            REDUCTION_LIMITS,
+        )
+        .expect("classify without halo");
+        let no_halo = CounterReduction::from_intervals(&no_halo, bucket, REDUCTION_LIMITS)
+            .expect("reduce without halo")
+            .expect("later pair remains");
+        assert_eq!(
+            no_halo.valid_pairs(),
+            1,
+            "the qualification proves the predecessor is semantically required"
+        );
+    }
+
+    #[test]
     fn retained_observations_survive_fact_file_round_trip() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("raw extract");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let encoded = raw.encode(&LIMIT).expect("encode fact file");
         let index = SegmentFacts::from_bytes(
             &encoded,
@@ -1970,9 +3432,8 @@ mod tests {
     fn forced_recompute_matches_derived_answer() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let derived = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("first build");
-        let recomputed =
-            SegmentFacts::extract(&unit, &context(), &LIMIT).expect("forced recompute");
+        let derived = SegmentFacts::extract(&unit, &LIMIT).expect("first build");
+        let recomputed = SegmentFacts::extract(&unit, &LIMIT).expect("forced recompute");
         let divergences = semantic_divergences(&derived, &recomputed, full_range(), LIMITS)
             .expect("bounded comparison");
         assert!(divergences.is_empty());
@@ -1982,7 +3443,7 @@ mod tests {
     fn range_slices_partition_retained_facts_without_double_counting() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
 
         let left = facts
             .query(CoverageSpan::new(0, 1_600).expect("left"), LIMITS)
@@ -2003,7 +3464,7 @@ mod tests {
     fn positional_reload_requires_no_pgm_source() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("raw extract");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let encoded = raw.encode(&LIMIT).expect("encode fact file");
 
         // The positional reader is handed only the fact-file bytes; it never has
@@ -2022,40 +3483,24 @@ mod tests {
     }
 
     #[test]
-    fn store_namespace_changes_identity_not_counts() {
+    fn repeated_extraction_has_stable_content_identity_and_counts() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let here = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("here");
-        let elsewhere = SegmentFacts::extract(
-            &unit,
-            &SegmentContext::new(
-                b"store-b".to_vec(),
-                NamingContractId([0x33; 16]),
-                SegmentLocator([0x44; 32]),
-            )
-            .expect("valid context"),
-            &LIMIT,
-        )
-        .expect("elsewhere");
-        assert_ne!(
-            here.identity().source_scope_id,
-            elsewhere.identity().source_scope_id
-        );
-        // Scope feeds the lineage, so observation identities differ, yet the
-        // scope-independent counts are unchanged.
-        assert_eq!(here.observations().len(), elsewhere.observations().len());
-        let here_result = here.query(full_range(), LIMITS).expect("here query");
-        let elsewhere_result = elsewhere
-            .query(full_range(), LIMITS)
-            .expect("elsewhere query");
-        assert_eq!(here_result.counts(), elsewhere_result.counts());
+        let first = SegmentFacts::extract(&unit, &LIMIT).expect("first");
+        let second = SegmentFacts::extract(&unit, &LIMIT).expect("second");
+        assert_eq!(first.identity(), second.identity());
+        assert_eq!(first.lineage(), second.lineage());
+        assert_eq!(first.observations(), second.observations());
+        let first_result = first.query(full_range(), LIMITS).expect("first query");
+        let second_result = second.query(full_range(), LIMITS).expect("second query");
+        assert_eq!(first_result.counts(), second_result.counts());
     }
 
     #[test]
     fn corrupt_fact_buffer_returns_typed_error() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("raw extract");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let mut encoded = raw.encode(&LIMIT).expect("encode fact file");
         let last = encoded.len() - 1;
         encoded[last] ^= 0xFF;
@@ -2076,7 +3521,7 @@ mod tests {
     fn lifecycle_events_fold_into_lifecycle_counts() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
         let result = facts.query(full_range(), LIMITS).expect("query");
         let lifecycle = result.counts().lifecycle();
         assert_eq!(lifecycle.crashes(), 1);

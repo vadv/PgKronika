@@ -37,6 +37,8 @@ use kronika_store as _;
 use parquet as _;
 use proptest as _;
 use rustix as _;
+use serde as _;
+use serde_json as _;
 use sha2 as _;
 
 #[global_allocator]

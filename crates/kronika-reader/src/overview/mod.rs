@@ -18,17 +18,21 @@ mod container;
 mod descriptors;
 mod dictionary;
 mod event_extract;
+mod event_facts;
 mod factkey;
 mod facts;
 mod fallback;
 mod gc;
 mod limits;
 mod live;
+mod metric_extract;
 mod observations;
 mod persist_mode;
 #[cfg(test)]
 mod proptests;
 mod publish;
+#[cfg(test)]
+mod qualification_fixture;
 
 pub use block::{
     BlockCodec, BlockError, BlockFlags, BlockKind, CounterSamplesBlock, EntityStateRecord,
@@ -41,12 +45,13 @@ pub use container::{
 };
 pub use descriptors::{
     CatalogEntryDescriptor, DictionaryContextEntry, ManifestEntryDescriptor, SourceDescriptor,
-    dictionary_context_id, lineage_from_catalog, section_body_id, source_scope_id,
+    dictionary_context_id, lineage_from_catalog, section_body_id,
 };
 pub use dictionary::{
     ResolvedPattern, TargetedDictionaryRead, TargetedDictionaryStats, resolve_targeted,
 };
-pub use factkey::{FactBuildKey, FactKey, FileKind, placement, placement_dir};
+pub use event_facts::EventFactsBlock;
+pub use factkey::{FactBuildKey, FactKey, FileKind};
 pub use facts::{BuildError, SegmentContext, SegmentContextError, SegmentFacts, SourceError};
 pub use fallback::{
     DEFAULT_FALLBACK_BYTES, DEFAULT_FALLBACK_SEGMENT_HOURS, FallbackConfig, FallbackConfigError,

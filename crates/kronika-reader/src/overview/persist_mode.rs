@@ -1,4 +1,4 @@
-//! Persistent-cache write state with exclusive due-probe reservation.
+//! Sidecar write state with exclusive due-probe reservation.
 //!
 //! Durable reads never consult this state. Recoverable write failures arm a
 //! bounded delay; once due, exactly one caller owns the probe or publication
@@ -12,7 +12,7 @@ use super::publish::PersistError;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 
-/// Write capability of the persistent cache.
+/// Write capability for persistent sibling sidecars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistMode {
     /// Writes are attempted normally.

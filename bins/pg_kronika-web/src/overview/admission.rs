@@ -3,9 +3,12 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use kronika_reader::PgmUnit;
 use tokio::sync::Notify;
+
+use crate::OverviewColdConfig;
 
 const BYTE_WEIGHT_QUANTUM: u64 = 16 * 1024 * 1024;
 const ROW_WEIGHT_QUANTUM: u64 = 65_536;
@@ -33,13 +36,13 @@ impl ColdWorkWeight {
         let rows = catalog.entries.iter().fold(0_u64, |total, entry| {
             total.saturating_add(u64::from(entry.rows))
         });
-        let pgm_bytes = byte_units(unit.source_file_len(), 64);
-        let decoded_bytes = byte_units(stored_bytes.saturating_mul(4), 64);
+        let pgm_bytes = byte_units(unit.source_file_len());
+        let decoded_bytes = byte_units(stored_bytes.saturating_mul(4));
         Self {
             workers: 1,
             pgm_bytes,
             decoded_bytes,
-            cpu: row_units(rows, 32),
+            cpu: row_units(rows),
             file_descriptors: 4,
             read_bytes: pgm_bytes.max(decoded_bytes),
             write_bytes: decoded_bytes,
@@ -85,19 +88,17 @@ impl ColdWorkWeight {
     }
 }
 
-fn byte_units(bytes: u64, maximum: u32) -> u32 {
-    units(bytes, BYTE_WEIGHT_QUANTUM, maximum)
+fn byte_units(bytes: u64) -> u32 {
+    units(bytes, BYTE_WEIGHT_QUANTUM)
 }
 
-fn row_units(rows: u64, maximum: u32) -> u32 {
-    units(rows, ROW_WEIGHT_QUANTUM, maximum)
+fn row_units(rows: u64) -> u32 {
+    units(rows, ROW_WEIGHT_QUANTUM)
 }
 
-fn units(value: u64, quantum: u64, maximum: u32) -> u32 {
+fn units(value: u64, quantum: u64) -> u32 {
     let rounded = value.saturating_add(quantum - 1) / quantum;
-    u32::try_from(rounded.max(1))
-        .unwrap_or(u32::MAX)
-        .min(maximum)
+    u32::try_from(rounded.max(1)).unwrap_or(u32::MAX)
 }
 
 /// Fixed process-wide cold-work limits.
@@ -109,6 +110,10 @@ pub(crate) struct ColdAdmissionConfig {
     pub max_queue: usize,
     /// Maximum concurrent fact loads started by one request.
     pub per_request_parallelism: usize,
+    /// Maximum time a request may wait in the process-wide FIFO.
+    pub wait_timeout: Duration,
+    /// Stable overload retry hint returned to HTTP clients.
+    pub retry_after_seconds: u64,
     /// Aggregate weighted capacities.
     pub(crate) capacity: ColdWorkWeight,
 }
@@ -119,6 +124,8 @@ impl Default for ColdAdmissionConfig {
             max_workers: 4,
             max_queue: 64,
             per_request_parallelism: 4,
+            wait_timeout: Duration::from_secs(5),
+            retry_after_seconds: 1,
             capacity: ColdWorkWeight {
                 workers: 4,
                 pgm_bytes: 64,
@@ -134,10 +141,36 @@ impl Default for ColdAdmissionConfig {
 }
 
 impl ColdAdmissionConfig {
+    pub(crate) fn from_operator(
+        policy: OverviewColdConfig,
+    ) -> Result<Self, ColdAdmissionConfigError> {
+        let capacity = ColdWorkWeight {
+            workers: policy.max_workers,
+            pgm_bytes: capacity_units(policy.pgm_bytes, BYTE_WEIGHT_QUANTUM)?,
+            decoded_bytes: capacity_units(policy.decoded_bytes, BYTE_WEIGHT_QUANTUM)?,
+            cpu: capacity_units(policy.cpu_rows, ROW_WEIGHT_QUANTUM)?,
+            file_descriptors: policy.file_descriptors,
+            read_bytes: capacity_units(policy.read_bytes, BYTE_WEIGHT_QUANTUM)?,
+            write_bytes: capacity_units(policy.write_bytes, BYTE_WEIGHT_QUANTUM)?,
+            publications: policy.publications,
+        };
+        Self {
+            max_workers: policy.max_workers,
+            max_queue: policy.max_queue,
+            per_request_parallelism: policy.per_request_parallelism,
+            wait_timeout: policy.wait_timeout,
+            retry_after_seconds: policy.retry_after_seconds,
+            capacity,
+        }
+        .validate()
+    }
+
     pub(crate) const fn validate(self) -> Result<Self, ColdAdmissionConfigError> {
         if self.max_workers == 0
             || self.max_queue == 0
             || self.per_request_parallelism == 0
+            || self.wait_timeout.is_zero()
+            || self.retry_after_seconds == 0
             || self.capacity.workers != self.max_workers
             || !(ColdWorkWeight {
                 workers: 1,
@@ -157,6 +190,14 @@ impl ColdAdmissionConfig {
     }
 }
 
+fn capacity_units(value: u64, quantum: u64) -> Result<u32, ColdAdmissionConfigError> {
+    if value == 0 {
+        return Err(ColdAdmissionConfigError);
+    }
+    let rounded = value.saturating_add(quantum - 1) / quantum;
+    u32::try_from(rounded).map_err(|_error| ColdAdmissionConfigError)
+}
+
 /// Invalid cold-admission bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ColdAdmissionConfigError;
@@ -174,6 +215,17 @@ impl std::error::Error for ColdAdmissionConfigError {}
 pub(crate) enum ColdAdmissionError {
     QueueFull,
     WeightExceedsCapacity,
+    TimedOut,
+}
+
+impl ColdAdmissionError {
+    pub(crate) const fn metric_reason(self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::WeightExceedsCapacity => "weight_exceeds_capacity",
+            Self::TimedOut => "timeout",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -222,9 +274,11 @@ impl ColdAdmission {
         weight: ColdWorkWeight,
     ) -> Result<ColdPermit, ColdAdmissionError> {
         if !weight.fits(self.inner.config.capacity) {
+            record_rejection(ColdAdmissionError::WeightExceedsCapacity);
             return Err(ColdAdmissionError::WeightExceedsCapacity);
         }
 
+        let started = Instant::now();
         let waiter = {
             let mut state = lock_state(&self.inner);
             if state.queue.is_empty() && can_admit(state.used, weight, self.inner.config.capacity) {
@@ -232,12 +286,16 @@ impl ColdAdmission {
                     .used
                     .checked_add(weight)
                     .expect("validated admission charge fits");
+                record_admission_state(&state);
+                metrics::histogram!("overview_cold_wait_seconds").record(started.elapsed());
                 return Ok(ColdPermit {
                     inner: Arc::clone(&self.inner),
                     weight,
                 });
             }
             if state.queue.len() >= self.inner.config.max_queue {
+                drop(state);
+                record_rejection(ColdAdmissionError::QueueFull);
                 return Err(ColdAdmissionError::QueueFull);
             }
             let waiter = Arc::new(Waiter {
@@ -248,6 +306,8 @@ impl ColdAdmission {
             });
             state.next_ticket = state.next_ticket.wrapping_add(1);
             state.queue.push_back(Arc::clone(&waiter));
+            record_admission_state(&state);
+            drop(state);
             waiter
         };
 
@@ -256,16 +316,28 @@ impl ColdAdmission {
             waiter,
             claimed: false,
         };
-        loop {
-            let notified = queued.waiter.notify.notified();
-            if queued.waiter.granted.load(Ordering::Acquire) {
-                queued.claimed = true;
-                return Ok(ColdPermit {
-                    inner: Arc::clone(&queued.inner),
-                    weight: queued.waiter.weight,
-                });
+        let wait = async {
+            loop {
+                let notified = queued.waiter.notify.notified();
+                if queued.waiter.granted.load(Ordering::Acquire) {
+                    queued.claimed = true;
+                    return ColdPermit {
+                        inner: Arc::clone(&queued.inner),
+                        weight: queued.waiter.weight,
+                    };
+                }
+                notified.await;
             }
-            notified.await;
+        };
+        match tokio::time::timeout(self.inner.config.wait_timeout, wait).await {
+            Ok(permit) => {
+                metrics::histogram!("overview_cold_wait_seconds").record(started.elapsed());
+                Ok(permit)
+            }
+            Err(_elapsed) => {
+                record_rejection(ColdAdmissionError::TimedOut);
+                Err(ColdAdmissionError::TimedOut)
+            }
         }
     }
 
@@ -301,6 +373,7 @@ impl Drop for QueuedAdmission {
             drop(state.queue.remove(position));
         }
         schedule(&self.inner, &mut state);
+        record_admission_state(&state);
         drop(state);
     }
 }
@@ -320,6 +393,7 @@ impl Drop for ColdPermit {
             .checked_sub(self.weight)
             .expect("active admission charge is resident");
         schedule(&self.inner, &mut state);
+        record_admission_state(&state);
         drop(state);
     }
 }
@@ -351,6 +425,29 @@ fn schedule(inner: &AdmissionInner, state: &mut AdmissionState) {
     }
 }
 
+fn record_rejection(error: ColdAdmissionError) {
+    metrics::counter!(
+        "overview_cold_reject_total",
+        "reason" => error.metric_reason()
+    )
+    .increment(1);
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauges use f64 and configured admission bounds are small"
+)]
+fn record_admission_state(state: &AdmissionState) {
+    metrics::gauge!("overview_cold_queue_depth").set(state.queue.len() as f64);
+    metrics::gauge!("overview_cold_work_inflight", "kind" => "workers")
+        .set(f64::from(state.used.workers));
+    metrics::gauge!("overview_inflight_bytes", "kind" => "pgm")
+        .set(f64::from(state.used.pgm_bytes) * BYTE_WEIGHT_QUANTUM as f64);
+    metrics::gauge!("overview_inflight_bytes", "kind" => "decoded")
+        .set(f64::from(state.used.decoded_bytes) * BYTE_WEIGHT_QUANTUM as f64);
+    metrics::gauge!("overview_open_files").set(f64::from(state.used.file_descriptors));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +457,8 @@ mod tests {
             max_workers: workers,
             max_queue: queue,
             per_request_parallelism: 1,
+            wait_timeout: Duration::from_secs(30),
+            retry_after_seconds: 1,
             capacity: ColdWorkWeight {
                 workers,
                 pgm_bytes: workers,
@@ -384,6 +483,13 @@ mod tests {
             write_bytes: 1,
             publications: 1,
         }
+    }
+
+    #[test]
+    fn work_units_are_not_clamped_to_default_capacity() {
+        assert_eq!(byte_units(65 * BYTE_WEIGHT_QUANTUM), 65);
+        assert_eq!(row_units(33 * ROW_WEIGHT_QUANTUM), 33);
+        assert_eq!(units(u64::MAX, 1), u32::MAX);
     }
 
     async fn wait_for_queue(admission: &ColdAdmission, expected: usize) {
@@ -500,5 +606,24 @@ mod tests {
         waiting.abort();
         drop(waiting.await);
         drop(active);
+    }
+
+    #[tokio::test]
+    async fn timed_out_waiter_releases_its_fifo_ticket() {
+        let mut limits = config(1, 2);
+        limits.wait_timeout = Duration::from_millis(10);
+        let admission = ColdAdmission::new(limits).expect("valid config");
+        let active = admission.acquire(one()).await.expect("first permit");
+        let waiting_admission = admission.clone();
+        let waiting = tokio::spawn(async move { waiting_admission.acquire(one()).await });
+        wait_for_queue(&admission, 1).await;
+
+        assert!(matches!(
+            waiting.await.expect("waiting task"),
+            Err(ColdAdmissionError::TimedOut)
+        ));
+        assert_eq!(admission.queued(), 0);
+        drop(active);
+        let _replacement = admission.acquire(one()).await.expect("replacement permit");
     }
 }

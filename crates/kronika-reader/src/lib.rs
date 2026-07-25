@@ -32,6 +32,10 @@ mod unit;
 use criterion as _;
 #[cfg(test)]
 use mimalloc as _;
+#[cfg(test)]
+use serde as _;
+#[cfg(test)]
+use serde_json as _;
 
 pub use kronika_analytics::{DiffPoint, Reason, Scalar};
 pub use kronika_format::DamageRegion;
@@ -39,18 +43,17 @@ pub use overview::{
     BlockCodec, BlockContent, BlockDirectoryEntry, BlockError, BlockFlags, BlockKind, Bounds,
     BuildError, CacheReadError, CacheRebuildReason, CatalogEntryDescriptor, CounterSamplesBlock,
     DEFAULT_FALLBACK_BYTES, DEFAULT_FALLBACK_SEGMENT_HOURS, DictionaryContextEntry,
-    EntityStateRecord, EntityStatesBlock, EventObservationsBlock, FactBuildKey, FactFile,
-    FactFileHeader, FactFileReader, FactKey, FactLoad, FactOrigin, FactReadStats, FactStore,
-    FallbackConfig, FallbackConfigError, FallbackStats, FileKind, FoldEffect, GaugeSamplesBlock,
-    GcCategoryUsage, GcConfig, GcConfigError, GcMark, GcOutcome, GcSkipReason, GcUsage,
-    HeaderIdentity, LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState, LiveView,
-    LossCoverageBlock, MAX_FALLBACK_BYTES, MAX_FALLBACK_SEGMENT_HOURS, ManifestEntryDescriptor,
-    PersistError, PersistFailureClass, PersistMode, PersistModeSnapshot, PersistenceProbeOutcome,
-    ResetMarker, ResetMarkersBlock, ResolvedPattern, SealOutcome, SegmentContext,
-    SegmentContextError, SegmentFacts, SourceDescriptor, SourceError, SourceManifestBlock,
-    StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats, dictionary_context_id,
-    lineage_from_catalog, placement, placement_dir, reconcile_seal, resolve_targeted,
-    section_body_id, source_scope_id,
+    EntityStateRecord, EntityStatesBlock, EventFactsBlock, EventObservationsBlock, FactBuildKey,
+    FactFile, FactFileHeader, FactFileReader, FactKey, FactLoad, FactOrigin, FactReadStats,
+    FactStore, FallbackConfig, FallbackConfigError, FallbackStats, FileKind, FoldEffect,
+    GaugeSamplesBlock, GcCategoryUsage, GcConfig, GcConfigError, GcMark, GcOutcome, GcSkipReason,
+    GcUsage, HeaderIdentity, LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState,
+    LiveView, LossCoverageBlock, MAX_FALLBACK_BYTES, MAX_FALLBACK_SEGMENT_HOURS,
+    ManifestEntryDescriptor, PersistError, PersistFailureClass, PersistMode, PersistModeSnapshot,
+    PersistenceProbeOutcome, ResetMarker, ResetMarkersBlock, ResolvedPattern, SealOutcome,
+    SegmentContext, SegmentContextError, SegmentFacts, SourceDescriptor, SourceError,
+    SourceManifestBlock, StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats,
+    dictionary_context_id, lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,

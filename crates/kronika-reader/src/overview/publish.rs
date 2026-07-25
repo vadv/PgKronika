@@ -1,9 +1,10 @@
 //! Lookup and publication of disposable segment fact files.
 //!
-//! Cache rejection triggers a PGM rebuild. Source failures remain source
+//! Sidecar rejection triggers a PGM rebuild. Source failures remain source
 //! failures, and persistence failures return the computed facts with a typed
 //! diagnostic.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::io::{self, Write as _};
@@ -18,14 +19,12 @@ use std::collections::VecDeque;
 
 use kronika_analytics::overview::SegmentIdentity;
 use kronika_format::ReadAt;
-use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags, RenameFlags};
+use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 
-use super::cache_owner::{
-    CacheOwner, CacheOwnerError, open_child_directory, open_file_at, open_namespace,
-};
+use super::cache_owner::{SidecarOwner, SidecarOwnerError, open_data_dir, open_file_at};
 use super::container::{CacheReadError, FactReadStats, HeaderIdentity};
 use super::descriptors::CatalogEntryDescriptor;
-use super::factkey::{FactBuildKey, FactKey, FileKind, placement};
+use super::factkey::{FactBuildKey, FactKey, FileKind};
 use super::facts::{BuildError, SegmentContext, SegmentFacts};
 use super::fallback::{FallbackConfig, FallbackFactKey, FallbackFactLru, FallbackStats};
 use super::gc::{GcAdmissionError, GcConfig, GcMark, GcOutcome, GcSkipReason, GcState};
@@ -44,7 +43,7 @@ static STORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub enum PersistError {
     /// The target filesystem is mounted read-only.
     ReadOnlyFilesystem,
-    /// The process lacks permission to mutate the cache.
+    /// The process lacks permission to publish the sidecar.
     PermissionDenied,
     /// The filesystem has no free blocks.
     NoSpace,
@@ -58,20 +57,20 @@ pub enum PersistError {
     InvalidFacts,
     /// Another owner or in-process publication holds the required reservation.
     Busy,
-    /// A generated cache component resolved through an unsafe file type.
+    /// A source or sidecar name resolved through an unsafe file type.
     UnsafePath,
-    /// The cache namespace has a structurally invalid entry or layout.
-    InvalidCacheState,
+    /// The data directory or sibling sidecar has an invalid structure.
+    InvalidSidecarState,
     /// An unclassified I/O failure occurred and requires operator diagnosis.
     Io,
 }
 
-/// Stable operational class for a persistent-cache failure.
+/// Stable operational class for a sidecar-persistence failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistFailureClass {
     /// The backing filesystem is mounted read-only.
     ReadOnly,
-    /// The process lacks permission to mutate the cache.
+    /// The process lacks permission to publish the sidecar.
     Permission,
     /// Free space or configured quota is exhausted.
     Capacity,
@@ -86,17 +85,17 @@ pub enum PersistFailureClass {
 impl std::fmt::Display for PersistError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
-            Self::ReadOnlyFilesystem => "cache filesystem is read-only",
-            Self::PermissionDenied => "cache write permission denied",
-            Self::NoSpace => "cache filesystem is out of space",
-            Self::QuotaExceeded => "cache filesystem quota is exhausted",
-            Self::TransientIo => "cache filesystem I/O failed transiently",
-            Self::StaleFilesystem => "cache filesystem handle is stale",
+            Self::ReadOnlyFilesystem => "data filesystem is read-only",
+            Self::PermissionDenied => "sidecar write permission denied",
+            Self::NoSpace => "data filesystem is out of space",
+            Self::QuotaExceeded => "derived-file quota is exhausted",
+            Self::TransientIo => "sidecar filesystem I/O failed transiently",
+            Self::StaleFilesystem => "data filesystem handle is stale",
             Self::InvalidFacts => "computed facts cannot be encoded",
-            Self::Busy => "cache key is being published by another owner",
-            Self::UnsafePath => "cache path contains an unsafe file type",
-            Self::InvalidCacheState => "cache namespace is structurally invalid",
-            Self::Io => "cache I/O failed",
+            Self::Busy => "sidecar publication is held by another owner",
+            Self::UnsafePath => "source or sidecar path contains an unsafe file type",
+            Self::InvalidSidecarState => "data directory or sibling sidecar is invalid",
+            Self::Io => "sidecar I/O failed",
         };
         f.write_str(text)
     }
@@ -140,6 +139,7 @@ pub struct FactLoad {
     rebuild_reason: Option<CacheRebuildReason>,
     persist_error: Option<PersistError>,
     fact_read_stats: Option<FactReadStats>,
+    fact_write_bytes: u64,
     pgm_body_read_stats: PgmBodyReadStats,
 }
 
@@ -192,6 +192,12 @@ impl FactLoad {
         self.fact_read_stats
     }
 
+    /// Canonical fact bytes committed by this load.
+    #[must_use]
+    pub const fn fact_write_bytes(&self) -> u64 {
+        self.fact_write_bytes
+    }
+
     /// PGM body reads performed by this load.
     #[must_use]
     pub const fn pgm_body_read_stats(&self) -> PgmBodyReadStats {
@@ -199,16 +205,16 @@ impl FactLoad {
     }
 }
 
-/// Disposable per-segment fact-file cache used by the reader.
+/// Disposable per-segment fact-sidecar store used by the reader.
 #[derive(Debug, Clone)]
 pub struct FactStore {
-    cache_root: PathBuf,
+    data_dir: PathBuf,
     fallback: Arc<Mutex<FallbackFactLru>>,
     gc_config: GcConfig,
     gc: Arc<Mutex<GcState>>,
-    owner: Arc<Mutex<Option<Arc<CacheOwner>>>>,
+    owner: Arc<Mutex<Option<Arc<SidecarOwner>>>>,
     publication_gate: Arc<Mutex<()>>,
-    /// Write mode and retry backoff for the durable cache.
+    /// Write mode and retry backoff for sibling sidecars.
     persist: Arc<Mutex<PersistState>>,
     #[cfg(test)]
     test_publish_faults: Arc<Mutex<VecDeque<PersistError>>>,
@@ -266,32 +272,32 @@ pub enum PersistenceProbeOutcome {
 }
 
 impl FactStore {
-    /// Creates a fact store under an operator-trusted cache root.
+    /// Creates a fact store in the PgKronika-owned data directory.
     #[must_use]
-    pub fn new(cache_root: impl Into<PathBuf>) -> Self {
-        Self::with_fallback_config(cache_root, FallbackConfig::default())
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self::with_fallback_config(data_dir, FallbackConfig::default())
     }
 
     /// Creates a fact store with validated process-local fallback budgets.
     #[must_use]
     pub fn with_fallback_config(
-        cache_root: impl Into<PathBuf>,
+        data_dir: impl Into<PathBuf>,
         fallback_config: FallbackConfig,
     ) -> Self {
-        Self::with_configs(cache_root, fallback_config, GcConfig::default())
+        Self::with_configs(data_dir, fallback_config, GcConfig::default())
     }
 
     /// Creates a fact store with validated fallback and GC/quota policies.
     #[must_use]
     pub fn with_configs(
-        cache_root: impl Into<PathBuf>,
+        data_dir: impl Into<PathBuf>,
         fallback_config: FallbackConfig,
         gc_config: GcConfig,
     ) -> Self {
-        let cache_root = cache_root.into();
-        let jitter_seed = store_jitter_seed(&cache_root);
+        let data_dir = data_dir.into();
+        let jitter_seed = store_jitter_seed(&data_dir);
         Self {
-            cache_root,
+            data_dir,
             fallback: Arc::new(Mutex::new(FallbackFactLru::new(fallback_config))),
             gc_config,
             gc: Arc::new(Mutex::new(GcState::default())),
@@ -347,16 +353,16 @@ impl FactStore {
         operation(&mut persist)
     }
 
-    fn acquire_owner(&self) -> Result<Arc<CacheOwner>, PersistError> {
+    fn acquire_owner(&self) -> Result<Arc<SidecarOwner>, PersistError> {
         let mut owner = lock_unpoisoned(&self.owner);
         if let Some(owner) = owner.as_ref() {
             return Ok(Arc::clone(owner));
         }
-        let acquired = Arc::new(CacheOwner::acquire(&self.cache_root).map_err(
+        let acquired = Arc::new(SidecarOwner::acquire(&self.data_dir).map_err(
             |error| match error {
-                CacheOwnerError::Contended => PersistError::Busy,
-                CacheOwnerError::UnsafePath => PersistError::UnsafePath,
-                CacheOwnerError::Io(error) => PersistError::from_io(error),
+                SidecarOwnerError::Contended => PersistError::Busy,
+                SidecarOwnerError::UnsafePath => PersistError::UnsafePath,
+                SidecarOwnerError::Io(error) => PersistError::from_io(error),
             },
         )?);
         *owner = Some(Arc::clone(&acquired));
@@ -377,8 +383,8 @@ impl FactStore {
                 ..GcOutcome::default()
             };
         }
-        let namespace = match open_namespace(&self.cache_root, true) {
-            Ok(namespace) => namespace,
+        let directory = match open_data_dir(&self.data_dir) {
+            Ok(directory) => directory,
             Err(_error) => {
                 return GcOutcome {
                     skip_reason: Some(GcSkipReason::OwnerUnavailable),
@@ -387,13 +393,13 @@ impl FactStore {
             }
         };
         let mut gc = lock_unpoisoned(&self.gc);
-        super::gc::collect(&namespace, mark, &mut gc, self.gc_config, SystemTime::now())
+        super::gc::collect(&directory, mark, &mut gc, self.gc_config, SystemTime::now())
     }
 
-    /// Operator-trusted cache root.
+    /// PgKronika-owned data directory containing PGM and OVF siblings.
     #[must_use]
-    pub fn cache_root(&self) -> &Path {
-        &self.cache_root
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     /// Returns fallback lifetime counters and exact current residency.
@@ -406,6 +412,55 @@ impl FactStore {
     #[must_use]
     pub const fn gc_config(&self) -> GcConfig {
         self.gc_config
+    }
+
+    /// Looks up durable or admitted fallback facts without extracting PGM
+    /// section bodies or attempting publication.
+    ///
+    /// A cache rejection is reported as `Ok(None)`: callers may then enter
+    /// cold-work admission and call [`Self::load_or_build`], which rechecks the
+    /// durable/fallback layers to close races with another process.
+    ///
+    /// # Errors
+    /// Returns [`BuildError`] only when the catalog cannot establish the
+    /// expected source identity needed for fallback lookup.
+    pub fn load_cached<R: ReadAt>(
+        &self,
+        unit: &PgmUnit<R>,
+        context: &SegmentContext,
+        bounds: &Bounds,
+    ) -> Result<Option<FactLoad>, BuildError> {
+        match self.read_with_stats(unit, context, bounds) {
+            Ok((facts, stats)) => {
+                let facts = Arc::new(facts);
+                self.discard_fallback_for(facts.identity(), facts.lineage());
+                Ok(Some(FactLoad {
+                    facts,
+                    origin: FactOrigin::CacheHit,
+                    rebuild_reason: None,
+                    persist_error: None,
+                    fact_read_stats: Some(stats),
+                    fact_write_bytes: 0,
+                    pgm_body_read_stats: PgmBodyReadStats::default(),
+                }))
+            }
+            Err(cache_error) => {
+                let rebuild_reason = cache_rebuild_reason(&cache_error);
+                let (identity, lineage) = SegmentFacts::provenance(unit)?;
+                let fallback_key = FallbackFactKey::for_expected(&identity, &lineage);
+                Ok(self
+                    .with_fallback(|fallback| fallback.get(&fallback_key, *bounds))
+                    .map(|facts| FactLoad {
+                        facts,
+                        origin: FactOrigin::FallbackHit,
+                        rebuild_reason: Some(rebuild_reason),
+                        persist_error: None,
+                        fact_read_stats: None,
+                        fact_write_bytes: 0,
+                        pgm_body_read_stats: PgmBodyReadStats::default(),
+                    }))
+            }
+        }
     }
 
     /// Loads a committed fact file or extracts facts from the source PGM.
@@ -433,12 +488,13 @@ impl FactStore {
                     rebuild_reason: None,
                     persist_error: None,
                     fact_read_stats: Some(stats),
+                    fact_write_bytes: 0,
                     pgm_body_read_stats: PgmBodyReadStats::default(),
                 })
             }
             Err(cache_error) => {
                 let rebuild_reason = cache_rebuild_reason(&cache_error);
-                let (identity, lineage) = SegmentFacts::provenance(unit, context)?;
+                let (identity, lineage) = SegmentFacts::provenance(unit)?;
                 let fallback_key = FallbackFactKey::for_expected(&identity, &lineage);
                 if let Some(facts) =
                     self.with_fallback(|fallback| fallback.get(&fallback_key, *bounds))
@@ -449,19 +505,21 @@ impl FactStore {
                         rebuild_reason: Some(rebuild_reason),
                         persist_error: None,
                         fact_read_stats: None,
+                        fact_write_bytes: 0,
                         pgm_body_read_stats: PgmBodyReadStats::default(),
                     });
                 }
 
-                let (facts, pgm_body_read_stats) =
-                    SegmentFacts::extract_with_stats(unit, context, bounds)?;
-                let (facts, persist_error) = self.admit_publish_or_fallback(&facts, bounds)?;
+                let (facts, pgm_body_read_stats) = SegmentFacts::extract_with_stats(unit, bounds)?;
+                let (facts, persist_error, fact_write_bytes) =
+                    self.admit_publish_or_fallback(&facts, context, bounds)?;
                 Ok(FactLoad {
                     facts,
                     origin: FactOrigin::Rebuilt,
                     rebuild_reason: Some(rebuild_reason),
                     persist_error,
                     fact_read_stats: None,
+                    fact_write_bytes,
                     pgm_body_read_stats,
                 })
             }
@@ -484,20 +542,24 @@ impl FactStore {
             .map(|(facts, _stats)| facts)
     }
 
-    /// Publishes `facts` with owner-only files and atomic no-replace rename.
+    /// Atomically publishes `facts` as the named PGM's sibling `.ovf`.
     ///
-    /// An invalid existing target is moved to a bounded quarantine name while
-    /// the per-key owner lock is held. Publication never follows generated
-    /// namespace symlinks.
+    /// A stale sidecar is replaced at the same path. Source and sidecar opens
+    /// never follow symlinks.
     ///
     /// # Errors
     ///
     /// Returns [`PersistError`] when the cache cannot be mutated safely.
-    pub fn publish(&self, facts: &SegmentFacts, bounds: &Bounds) -> Result<PathBuf, PersistError> {
+    pub fn publish(
+        &self,
+        facts: &SegmentFacts,
+        context: &SegmentContext,
+        bounds: &Bounds,
+    ) -> Result<PathBuf, PersistError> {
         let bytes = facts
             .encode(bounds)
             .map_err(|_error| PersistError::InvalidFacts)?;
-        let path = self.persist_encoded(facts, &bytes, bounds)?;
+        let path = self.persist_encoded(facts, context, &bytes, bounds)?;
         self.discard_fallback_for(facts.identity(), facts.lineage());
         Ok(path)
     }
@@ -505,8 +567,9 @@ impl FactStore {
     pub(super) fn admit_publish_or_fallback(
         &self,
         facts: &SegmentFacts,
+        context: &SegmentContext,
         bounds: &Bounds,
-    ) -> Result<(Arc<SegmentFacts>, Option<PersistError>), BuildError> {
+    ) -> Result<(Arc<SegmentFacts>, Option<PersistError>, u64), BuildError> {
         let bytes = facts.encode(bounds).map_err(BuildError::from)?;
         let canonical_byte_len = u64::try_from(bytes.len())
             .map_err(|_error| BuildError::Overflow)
@@ -523,7 +586,9 @@ impl FactStore {
             .map_err(BuildError::from)?,
         );
 
-        let persist_error = self.persist_encoded(&admitted, &bytes, bounds).err();
+        let persist_error = self
+            .persist_encoded(&admitted, context, &bytes, bounds)
+            .err();
         let fallback_key = FallbackFactKey::for_facts(&admitted);
         match persist_error {
             None => self.discard_fallback(fallback_key),
@@ -538,6 +603,7 @@ impl FactStore {
 
                 if self
                     .read_expected_with_stats(
+                        context,
                         admitted.identity(),
                         admitted.lineage(),
                         &expected_catalog,
@@ -550,12 +616,18 @@ impl FactStore {
             }
             Some(_error) => {}
         }
-        Ok((admitted, persist_error))
+        let fact_write_bytes = if persist_error.is_none() {
+            canonical_byte_len.get()
+        } else {
+            0
+        };
+        Ok((admitted, persist_error, fact_write_bytes))
     }
 
     fn persist_encoded(
         &self,
         facts: &SegmentFacts,
+        context: &SegmentContext,
         bytes: &[u8],
         bounds: &Bounds,
     ) -> Result<PathBuf, PersistError> {
@@ -567,21 +639,22 @@ impl FactStore {
             Reservation::NotNeeded => return Err(PersistError::Io),
         };
         PersistAttempt::new(Arc::clone(&self.persist), reservation)
-            .finish(self.publish_with_capacity_recovery(facts, bytes, bounds))
+            .finish(self.publish_with_capacity_recovery(facts, context, bytes, bounds))
     }
 
     fn publish_with_capacity_recovery(
         &self,
         facts: &SegmentFacts,
+        context: &SegmentContext,
         bytes: &[u8],
         bounds: &Bounds,
     ) -> Result<PathBuf, PersistError> {
-        match self.publish_encoded(facts, bytes, bounds) {
+        match self.publish_encoded(facts, context, bytes, bounds) {
             Err(error)
                 if error.class() == PersistFailureClass::Capacity
                     && self.recover_capacity_once() =>
             {
-                self.publish_encoded(facts, bytes, bounds)
+                self.publish_encoded(facts, context, bytes, bounds)
             }
             outcome => outcome,
         }
@@ -602,6 +675,7 @@ impl FactStore {
     fn publish_encoded(
         &self,
         facts: &SegmentFacts,
+        context: &SegmentContext,
         bytes: &[u8],
         bounds: &Bounds,
     ) -> Result<PathBuf, PersistError> {
@@ -618,37 +692,14 @@ impl FactStore {
         let key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
         let lineage = facts.lineage().id();
         let build_key = FactBuildKey::new(key, lineage);
-        let final_path = placement(
-            &self.cache_root,
-            facts.identity().source_scope_id,
-            &key,
-            lineage,
-        );
-        let directory = self
-            .open_key_directory(facts.identity(), &key, true)
+        let directory = open_data_dir(&self.data_dir).map_err(PersistError::from_io)?;
+        validate_sibling_source(&directory, context, facts.identity())
             .map_err(PersistError::from_io)?;
-        let lineage_hex = hex(&lineage.0);
-        let lock_name = format!(".lock-{}-{lineage_hex}", key.hex());
-        let lock = open_file_at(
-            &directory,
-            &lock_name,
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            FILE_MODE,
-        )
-        .map_err(PersistError::from_io)?;
-        rustix::fs::fchmod(&lock, FILE_MODE).map_err(PersistError::from_errno)?;
-        match rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => {}
-            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                return Err(PersistError::Busy);
-            }
-            Err(error) => return Err(PersistError::from_errno(error)),
-        }
-
-        let final_name = build_key.final_name();
+        let final_name = context.sidecar_file_name();
+        let final_path = self.data_dir.join(final_name);
         let expected_catalog = facts.catalog_descriptors();
-        if let Ok(existing) = open_regular_at(&directory, &final_name) {
-            if SegmentFacts::from_reader(
+        if let Ok(existing) = open_regular_at(&directory, final_name)
+            && SegmentFacts::from_reader(
                 existing,
                 facts.identity(),
                 facts.lineage(),
@@ -656,28 +707,22 @@ impl FactStore {
                 bounds,
             )
             .is_ok()
-            {
-                lock_unpoisoned(&self.gc).record_publication(build_key, SystemTime::now());
-                return Ok(final_path);
-            }
-            quarantine(&directory, &final_name, &key)?;
-        } else if path_exists_at(&directory, &final_name)? {
-            quarantine(&directory, &final_name, &key)?;
+        {
+            lock_unpoisoned(&self.gc).record_publication(build_key, SystemTime::now());
+            return Ok(final_path);
         }
 
         if self.gc_config.max_logical_bytes().is_some() || self.gc_config.max_files().is_some() {
             let incoming =
                 u64::try_from(bytes.len()).map_err(|_error| PersistError::QuotaExceeded)?;
-            let namespace =
-                open_namespace(&self.cache_root, true).map_err(PersistError::from_io)?;
-            match super::gc::admit_publication(&namespace, self.gc_config, incoming) {
+            match super::gc::admit_publication(&directory, self.gc_config, incoming) {
                 Ok(()) => {}
                 Err(GcAdmissionError::Capped) => return Err(PersistError::QuotaExceeded),
                 Err(GcAdmissionError::Incomplete) => return Err(PersistError::TransientIo),
             }
         }
 
-        let (temp_name, temp_file) = create_temp(&directory, &key)?;
+        let (temp_name, temp_file) = create_temp(&directory)?;
         let write_result = write_synced(temp_file, bytes);
         if let Err(error) = write_result {
             unlink_ignoring_missing(&directory, &temp_name);
@@ -687,10 +732,9 @@ impl FactStore {
         let outcome = commit_temp(
             &directory,
             &temp_name,
-            &final_name,
+            final_name,
             facts,
             &expected_catalog,
-            &key,
             bounds,
         );
         unlink_ignoring_missing(&directory, &temp_name);
@@ -703,12 +747,15 @@ impl FactStore {
     fn probe_once(&self) -> Result<(), PersistError> {
         let _publication = lock_unpoisoned(&self.publication_gate);
         let _owner = self.acquire_owner()?;
-        let namespace = open_namespace(&self.cache_root, true).map_err(PersistError::from_io)?;
+        let directory = open_data_dir(&self.data_dir).map_err(PersistError::from_io)?;
         for _ in 0..NAME_RETRIES {
             let sequence = PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let name = format!(".probe-{}-{sequence}", std::process::id());
+            let name = format!(
+                ".pgkronika-overview.probe-{}-{sequence}",
+                std::process::id()
+            );
             let mut file = match open_file_at(
-                &namespace,
+                &directory,
                 &name,
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 FILE_MODE,
@@ -723,12 +770,12 @@ impl FactStore {
                 .and_then(|()| file.sync_all().map_err(PersistError::from_io));
             drop(file);
             if let Err(error) = probe_result {
-                unlink_ignoring_missing(&namespace, &name);
+                unlink_ignoring_missing(&directory, &name);
                 return Err(error);
             }
-            rustix::fs::unlinkat(&namespace, &name, AtFlags::empty())
+            rustix::fs::unlinkat(&directory, &name, AtFlags::empty())
                 .map_err(PersistError::from_errno)?;
-            namespace.sync_all().map_err(PersistError::from_io)?;
+            directory.sync_all().map_err(PersistError::from_io)?;
             return Ok(());
         }
         Err(PersistError::TransientIo)
@@ -763,29 +810,28 @@ impl FactStore {
         bounds: &Bounds,
     ) -> Result<(SegmentFacts, FactReadStats), CacheReadError> {
         let (identity, lineage) =
-            SegmentFacts::provenance(unit, context).map_err(|_error| CacheReadError::Corrupt)?;
+            SegmentFacts::provenance(unit).map_err(|_error| CacheReadError::Corrupt)?;
         let expected_catalog: Vec<_> = unit
             .catalog()
             .entries
             .iter()
             .map(CatalogEntryDescriptor::of)
             .collect();
-        self.read_expected_with_stats(&identity, &lineage, &expected_catalog, bounds)
+        self.read_expected_with_stats(context, &identity, &lineage, &expected_catalog, bounds)
     }
 
     fn read_expected_with_stats(
         &self,
+        context: &SegmentContext,
         identity: &HeaderIdentity,
         lineage: &SegmentIdentity,
         expected_catalog: &[CatalogEntryDescriptor],
         bounds: &Bounds,
     ) -> Result<(SegmentFacts, FactReadStats), CacheReadError> {
-        let key = FactKey::for_identity(identity, FileKind::SegmentFacts);
-        let directory = self
-            .open_key_directory(identity, &key, false)
-            .map_err(CacheReadError::Io)?;
-        let final_name = format!("{}-{}.ovf", key.hex(), hex(&lineage.id().0));
-        let file = open_regular_at(&directory, &final_name).map_err(CacheReadError::Io)?;
+        let directory = open_data_dir(&self.data_dir).map_err(CacheReadError::Io)?;
+        validate_sibling_source(&directory, context, identity).map_err(CacheReadError::Io)?;
+        let file =
+            open_regular_at(&directory, context.sidecar_file_name()).map_err(CacheReadError::Io)?;
         SegmentFacts::from_reader_with_stats(file, identity, lineage, expected_catalog, bounds)
     }
 
@@ -804,29 +850,14 @@ impl FactStore {
         };
         operation(&mut fallback)
     }
-
-    fn open_key_directory(
-        &self,
-        identity: &HeaderIdentity,
-        key: &FactKey,
-        create: bool,
-    ) -> Result<File, io::Error> {
-        let mut directory = open_namespace(&self.cache_root, create)?;
-        let scope = hex(&identity.source_scope_id.0);
-        for component in [scope.as_str(), key.prefix().as_str()] {
-            directory = open_child_directory(&directory, component, create)?;
-        }
-        Ok(directory)
-    }
 }
 
 fn commit_temp(
     directory: &File,
     temp_name: &str,
-    final_name: &str,
+    final_name: &OsStr,
     facts: &SegmentFacts,
     expected_catalog: &[CatalogEntryDescriptor],
-    key: &FactKey,
     bounds: &Bounds,
 ) -> Result<(), PersistError> {
     let temp = open_regular_at(directory, temp_name).map_err(PersistError::from_io)?;
@@ -837,42 +868,20 @@ fn commit_temp(
         expected_catalog,
         bounds,
     )
-    .map_err(|_error| PersistError::InvalidCacheState)?;
+    .map_err(|_error| PersistError::InvalidSidecarState)?;
 
-    for _ in 0..2 {
-        match rustix::fs::renameat_with(
-            directory,
-            temp_name,
-            directory,
-            final_name,
-            RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => {
-                directory.sync_all().map_err(PersistError::from_io)?;
-                return Ok(());
-            }
-            Err(error) if error == rustix::io::Errno::EXIST => {
-                if let Ok(existing) = open_regular_at(directory, final_name)
-                    && SegmentFacts::from_reader(
-                        existing,
-                        facts.identity(),
-                        facts.lineage(),
-                        expected_catalog,
-                        bounds,
-                    )
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-                quarantine(directory, final_name, key)?;
-            }
-            Err(error) => return Err(PersistError::from_errno(error)),
-        }
-    }
-    Err(PersistError::Busy)
+    rustix::fs::renameat_with(
+        directory,
+        temp_name,
+        directory,
+        final_name,
+        RenameFlags::empty(),
+    )
+    .map_err(PersistError::from_errno)?;
+    directory.sync_all().map_err(PersistError::from_io)
 }
 
-fn open_regular_at(directory: &File, name: &str) -> Result<File, io::Error> {
+fn open_regular_at<P: rustix::path::Arg>(directory: &File, name: P) -> Result<File, io::Error> {
     let file = open_file_at(
         directory,
         name,
@@ -888,10 +897,10 @@ fn open_regular_at(directory: &File, name: &str) -> Result<File, io::Error> {
     Ok(file)
 }
 
-fn create_temp(directory: &File, key: &FactKey) -> Result<(String, File), PersistError> {
+fn create_temp(directory: &File) -> Result<(String, File), PersistError> {
     for _ in 0..NAME_RETRIES {
         let sequence = PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = format!(".tmp-{}-{sequence}-{}", std::process::id(), key.prefix());
+        let name = format!(".pgkronika-overview.tmp-{}-{sequence}", std::process::id());
         match open_file_at(
             directory,
             &name,
@@ -914,43 +923,31 @@ fn write_synced(mut file: File, bytes: &[u8]) -> Result<(), PersistError> {
     file.sync_all().map_err(PersistError::from_io)
 }
 
-fn quarantine(directory: &File, final_name: &str, key: &FactKey) -> Result<(), PersistError> {
-    for _ in 0..NAME_RETRIES {
-        let sequence = PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let quarantine = format!(".bad-{}-{sequence}-{}", std::process::id(), key.prefix());
-        match rustix::fs::renameat_with(
-            directory,
-            final_name,
-            directory,
-            quarantine,
-            RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => {
-                directory.sync_all().map_err(PersistError::from_io)?;
-                return Ok(());
-            }
-            Err(error) if error == rustix::io::Errno::EXIST => {}
-            Err(error) if error == rustix::io::Errno::NOENT => return Ok(()),
-            Err(error) => return Err(PersistError::from_errno(error)),
-        }
-    }
-    Err(PersistError::TransientIo)
-}
-
-fn path_exists_at(directory: &File, name: &str) -> Result<bool, PersistError> {
-    match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_stat) => Ok(true),
-        Err(error) if error == rustix::io::Errno::NOENT => Ok(false),
-        Err(error) => Err(PersistError::from_errno(error)),
-    }
-}
-
 fn unlink_ignoring_missing(directory: &File, name: &str) {
     match rustix::fs::unlinkat(directory, name, AtFlags::empty()) {
         Ok(()) => {}
         Err(error) if error == rustix::io::Errno::NOENT => {}
         Err(_error) => {}
     }
+}
+
+fn validate_sibling_source(
+    directory: &File,
+    context: &SegmentContext,
+    expected: &HeaderIdentity,
+) -> io::Result<()> {
+    let source = open_regular_at(directory, context.pgm_file_name())?;
+    let unit = PgmUnit::open(source)
+        .map_err(|_error| io::Error::new(io::ErrorKind::InvalidData, "invalid sibling PGM"))?;
+    let (actual, _lineage) = SegmentFacts::provenance(&unit)
+        .map_err(|_error| io::Error::new(io::ErrorKind::InvalidData, "invalid sibling PGM"))?;
+    if actual != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sibling PGM does not match overview facts",
+        ));
+    }
+    Ok(())
 }
 
 fn cache_rebuild_reason(error: &CacheReadError) -> CacheRebuildReason {
@@ -976,7 +973,7 @@ impl PersistError {
             Self::NoSpace | Self::QuotaExceeded => PersistFailureClass::Capacity,
             Self::TransientIo | Self::StaleFilesystem => PersistFailureClass::Transient,
             Self::Busy => PersistFailureClass::Contended,
-            Self::InvalidFacts | Self::UnsafePath | Self::InvalidCacheState | Self::Io => {
+            Self::InvalidFacts | Self::UnsafePath | Self::InvalidSidecarState | Self::Io => {
                 PersistFailureClass::Permanent
             }
         }
@@ -1035,7 +1032,7 @@ impl PersistError {
             io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
                 Self::TransientIo
             }
-            io::ErrorKind::InvalidData | io::ErrorKind::NotADirectory => Self::InvalidCacheState,
+            io::ErrorKind::InvalidData | io::ErrorKind::NotADirectory => Self::InvalidSidecarState,
             _ => error
                 .raw_os_error()
                 .map(rustix::io::Errno::from_raw_os_error)
@@ -1044,9 +1041,9 @@ impl PersistError {
     }
 }
 
-fn store_jitter_seed(cache_root: &Path) -> u64 {
+fn store_jitter_seed(data_dir: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
-    cache_root.hash(&mut hasher);
+    data_dir.hash(&mut hasher);
     std::process::id().hash(&mut hasher);
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1065,22 +1062,11 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use std::os::unix::fs::{MetadataExt as _, symlink};
     use std::sync::Barrier;
 
-    use kronika_analytics::overview::{NamingContractId, SegmentLocator};
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_registry::pg_log::PgLogLifecycleV1;
     use kronika_registry::{Section, Ts};
@@ -1090,16 +1076,16 @@ mod tests {
     use super::*;
 
     fn context() -> SegmentContext {
-        context_for(b"store-a", 0x44)
+        context_for("segment")
     }
 
-    fn context_for(namespace: &[u8], locator: u8) -> SegmentContext {
-        SegmentContext::new(
-            namespace.to_vec(),
-            NamingContractId([0x33; 16]),
-            SegmentLocator([locator; 32]),
-        )
-        .expect("valid context")
+    fn context_for(stem: &str) -> SegmentContext {
+        SegmentContext::new(format!("{stem}.pgm")).expect("valid context")
+    }
+
+    fn write_pgm(directory: &TempDir, context: &SegmentContext, bytes: &[u8]) {
+        std::fs::write(directory.path().join(context.pgm_file_name()), bytes)
+            .expect("write sibling PGM");
     }
 
     fn lifecycle_pgm(source_id: u64) -> Vec<u8> {
@@ -1145,7 +1131,7 @@ mod tests {
     }
 
     fn built(bytes: &[u8]) -> SegmentFacts {
-        SegmentFacts::extract(&unit(bytes), &context(), &LIMIT).expect("extract")
+        SegmentFacts::extract(&unit(bytes), &LIMIT).expect("extract")
     }
 
     #[test]
@@ -1171,8 +1157,8 @@ mod tests {
         store.inject_publish_faults([PersistError::TransientIo]);
         let facts = built(&lifecycle_pgm(7));
 
-        let (_first, first_error) = store
-            .admit_publish_or_fallback(&facts, &LIMIT)
+        let (_first, first_error, _first_write_bytes) = store
+            .admit_publish_or_fallback(&facts, &context(), &LIMIT)
             .expect("first admit");
         assert_eq!(first_error, Some(PersistError::TransientIo));
         assert_eq!(
@@ -1183,8 +1169,8 @@ mod tests {
 
         // The second call reports the standing reason without entering
         // `publish_encoded`, so no new publication failure is recorded.
-        let (_second, second_error) = store
-            .admit_publish_or_fallback(&facts, &LIMIT)
+        let (_second, second_error, _second_write_bytes) = store
+            .admit_publish_or_fallback(&facts, &context(), &LIMIT)
             .expect("second admit");
         assert!(
             second_error.is_some(),
@@ -1203,6 +1189,7 @@ mod tests {
         let directory = TempDir::new().expect("cache directory");
         let store = FactStore::new(directory.path());
         let bytes = lifecycle_pgm(7);
+        write_pgm(&directory, &context(), &bytes);
         let cold_unit = unit(&bytes);
         let cold = store
             .load_or_build(&cold_unit, &context(), &LIMIT)
@@ -1239,11 +1226,13 @@ mod tests {
     }
 
     #[test]
-    fn identical_content_under_distinct_locators_stays_restart_warm() {
-        let directory = TempDir::new().expect("cache directory");
+    fn identical_pgms_use_distinct_same_stem_sidecars_and_stay_restart_warm() {
+        let directory = TempDir::new().expect("data directory");
         let bytes = lifecycle_pgm(7);
-        let first_context = context_for(b"store-a", 0x44);
-        let second_context = context_for(b"store-a", 0x45);
+        let first_context = context_for("first");
+        let second_context = context_for("second");
+        write_pgm(&directory, &first_context, &bytes);
+        write_pgm(&directory, &second_context, &bytes);
         let store = FactStore::new(directory.path());
 
         let first = store
@@ -1255,21 +1244,10 @@ mod tests {
         assert_eq!(first.origin(), FactOrigin::Rebuilt);
         assert_eq!(second.origin(), FactOrigin::Rebuilt);
         assert_eq!(first.facts().identity(), second.facts().identity());
-        assert_ne!(first.facts().lineage(), second.facts().lineage());
+        assert_eq!(first.facts().lineage(), second.facts().lineage());
 
-        let key = FactKey::for_identity(first.facts().identity(), FileKind::SegmentFacts);
-        let first_path = placement(
-            directory.path(),
-            first.facts().identity().source_scope_id,
-            &key,
-            first.facts().lineage().id(),
-        );
-        let second_path = placement(
-            directory.path(),
-            second.facts().identity().source_scope_id,
-            &key,
-            second.facts().lineage().id(),
-        );
+        let first_path = directory.path().join("first.ovf");
+        let second_path = directory.path().join("second.ovf");
         assert_ne!(first_path, second_path);
         assert!(first_path.is_file());
         assert!(second_path.is_file());
@@ -1285,12 +1263,13 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_target_is_quarantined_and_rebuilt() {
-        let directory = TempDir::new().expect("cache directory");
+    fn corrupt_sidecar_is_atomically_replaced_at_the_same_path() {
+        let directory = TempDir::new().expect("data directory");
         let store = FactStore::new(directory.path());
         let bytes = lifecycle_pgm(7);
+        write_pgm(&directory, &context(), &bytes);
         let facts = built(&bytes);
-        let path = store.publish(&facts, &LIMIT).expect("publish");
+        let path = store.publish(&facts, &context(), &LIMIT).expect("publish");
         let mut damaged = std::fs::read(&path).expect("read facts");
         let last = damaged.len() - 1;
         damaged[last] ^= 0xff;
@@ -1305,11 +1284,17 @@ mod tests {
         store
             .read(&unit(&bytes), &context(), &LIMIT)
             .expect("replacement is valid");
-        let quarantined = std::fs::read_dir(path.parent().expect("parent"))
-            .expect("list cache directory")
+        let artifacts = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("list data directory")
             .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().starts_with(".bad-"));
-        assert!(quarantined, "invalid target must be quarantined");
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pgkronika-overview.tmp-")
+            })
+            .count();
+        assert_eq!(artifacts, 0);
     }
 
     #[test]
@@ -1318,16 +1303,20 @@ mod tests {
         let store = FactStore::new(directory.path());
         let bytes_a = lifecycle_pgm(7);
         let bytes_b = lifecycle_pgm(8);
+        let context_a = context_for("source-a");
+        let context_b = context_for("source-b");
+        write_pgm(&directory, &context_a, &bytes_a);
+        write_pgm(&directory, &context_b, &bytes_b);
         let path_a = store
-            .publish(&built(&bytes_a), &LIMIT)
+            .publish(&built(&bytes_a), &context_a, &LIMIT)
             .expect("publish source A");
         let path_b = store
-            .publish(&built(&bytes_b), &LIMIT)
+            .publish(&built(&bytes_b), &context_b, &LIMIT)
             .expect("publish source B");
         std::fs::copy(path_a, &path_b).expect("place wrong-source candidate");
 
         let loaded = store
-            .load_or_build(&unit(&bytes_b), &context(), &LIMIT)
+            .load_or_build(&unit(&bytes_b), &context_b, &LIMIT)
             .expect("rebuild source B");
         assert_eq!(
             loaded.rebuild_reason(),
@@ -1335,17 +1324,18 @@ mod tests {
         );
         assert_eq!(loaded.facts().identity().pgm_source_id, 8);
         store
-            .read(&unit(&bytes_b), &context(), &LIMIT)
+            .read(&unit(&bytes_b), &context_b, &LIMIT)
             .expect("source B replacement");
     }
 
     #[test]
-    fn symlink_candidate_is_quarantined_without_touching_target() {
-        let directory = TempDir::new().expect("cache directory");
+    fn symlink_sidecar_is_atomically_replaced_without_touching_target() {
+        let directory = TempDir::new().expect("data directory");
         let store = FactStore::new(directory.path());
         let bytes = lifecycle_pgm(7);
+        write_pgm(&directory, &context(), &bytes);
         let facts = built(&bytes);
-        let path = store.publish(&facts, &LIMIT).expect("publish");
+        let path = store.publish(&facts, &context(), &LIMIT).expect("publish");
         std::fs::remove_file(&path).expect("remove fact target");
         let victim = directory.path().join("victim");
         std::fs::write(&victim, b"source authority").expect("write victim");
@@ -1368,32 +1358,30 @@ mod tests {
     }
 
     #[test]
-    fn symlink_namespace_fails_closed_and_returns_rebuilt_facts() {
-        let directory = TempDir::new().expect("cache directory");
+    fn symlink_pgm_fails_closed_and_returns_rebuilt_facts() {
+        let directory = TempDir::new().expect("data directory");
         let outside = TempDir::new().expect("outside directory");
-        symlink(outside.path(), directory.path().join("overview")).expect("plant namespace link");
-        let store = FactStore::new(directory.path());
         let bytes = lifecycle_pgm(7);
+        let outside_pgm = outside.path().join("source.pgm");
+        std::fs::write(&outside_pgm, &bytes).expect("write outside PGM");
+        symlink(&outside_pgm, directory.path().join("segment.pgm")).expect("plant PGM symlink");
+        let store = FactStore::new(directory.path());
         let loaded = store
             .load_or_build(&unit(&bytes), &context(), &LIMIT)
             .expect("source build remains available");
         assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
-        assert!(loaded.persist_error().is_some());
-        assert_eq!(
-            std::fs::read_dir(outside.path())
-                .expect("outside listing")
-                .count(),
-            0
-        );
+        assert_eq!(loaded.persist_error(), Some(PersistError::UnsafePath));
+        assert_eq!(std::fs::read(&outside_pgm).expect("outside PGM"), bytes);
         assert_eq!(store.fallback_stats().inserts, 0);
         assert_eq!(store.fallback_stats().resident_entries, 0);
     }
 
     #[test]
     fn concurrent_builders_leave_one_valid_committed_file() {
-        let directory = TempDir::new().expect("cache directory");
-        let store = Arc::new(FactStore::new(directory.path()));
+        let directory = TempDir::new().expect("data directory");
         let bytes = Arc::new(lifecycle_pgm(7));
+        write_pgm(&directory, &context(), &bytes);
+        let store = Arc::new(FactStore::new(directory.path()));
         let barrier = Arc::new(Barrier::new(3));
         let mut workers = Vec::new();
         for _ in 0..2 {
@@ -1414,17 +1402,17 @@ mod tests {
         store
             .read(&unit(&bytes), &context(), &LIMIT)
             .expect("committed winner");
-        let facts = built(&bytes);
-        let path = placement(
-            directory.path(),
-            facts.identity().source_scope_id,
-            &FactKey::for_identity(facts.identity(), FileKind::SegmentFacts),
-            facts.lineage().id(),
-        );
-        let temps = std::fs::read_dir(path.parent().expect("parent"))
-            .expect("list final directory")
+        let path = directory.path().join("segment.ovf");
+        assert!(path.is_file());
+        let temps = std::fs::read_dir(directory.path())
+            .expect("list data directory")
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp-"))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pgkronika-overview.tmp-")
+            })
             .count();
         assert_eq!(temps, 0, "completed builders clean their temp files");
     }
@@ -1468,12 +1456,13 @@ mod tests {
 
     #[test]
     fn stale_temp_does_not_block_publication() {
-        let directory = TempDir::new().expect("cache directory");
+        let directory = TempDir::new().expect("data directory");
         let store = FactStore::new(directory.path());
         let bytes = lifecycle_pgm(7);
+        write_pgm(&directory, &context(), &bytes);
         let facts = built(&bytes);
-        let path = store.publish(&facts, &LIMIT).expect("publish");
-        let stale = path.parent().expect("parent").join(".tmp-stale-owned");
+        let path = store.publish(&facts, &context(), &LIMIT).expect("publish");
+        let stale = directory.path().join(".pgkronika-overview.tmp-12-34");
         std::fs::write(&stale, b"torn").expect("write stale temp");
         std::fs::remove_file(&path).expect("remove committed target");
 
@@ -1496,6 +1485,7 @@ mod tests {
         let store = FactStore::new(directory.path());
         store.inject_publish_faults([PersistError::TransientIo]);
         let bytes = lifecycle_pgm(7);
+        write_pgm(&directory, &context(), &bytes);
         let fresh = store
             .load_or_build(&unit(&bytes), &context(), &LIMIT)
             .expect("source build");
@@ -1533,7 +1523,7 @@ mod tests {
 
         store.force_persistence_probe_due();
         store
-            .publish(fresh.facts(), &LIMIT)
+            .publish(fresh.facts(), &context(), &LIMIT)
             .expect("publish admitted facts");
         let before_durable = store.fallback_stats();
         assert_eq!(before_durable.resident_entries, 0);
@@ -1549,39 +1539,33 @@ mod tests {
     }
 
     #[test]
-    fn fallback_identity_separates_locator_scope_and_source() {
-        let directory = TempDir::new().expect("cache directory");
+    fn fallback_identity_is_path_independent_and_separates_sources() {
+        let directory = TempDir::new().expect("data directory");
         let store = FactStore::new(directory.path());
         store.inject_publish_faults([PersistError::TransientIo]);
         let bytes = lifecycle_pgm(7);
 
         let first = store
-            .load_or_build(&unit(&bytes), &context_for(b"store-a", 1), &LIMIT)
+            .load_or_build(&unit(&bytes), &context_for("first"), &LIMIT)
             .expect("first build");
-        let other_locator = store
-            .load_or_build(&unit(&bytes), &context_for(b"store-a", 2), &LIMIT)
-            .expect("other locator build");
-        let other_scope = store
-            .load_or_build(&unit(&bytes), &context_for(b"store-b", 1), &LIMIT)
-            .expect("other scope build");
+        let same_source = store
+            .load_or_build(&unit(&bytes), &context_for("second"), &LIMIT)
+            .expect("same source fallback");
         let other_source_bytes = lifecycle_pgm(8);
         let other_source = store
-            .load_or_build(
-                &unit(&other_source_bytes),
-                &context_for(b"store-a", 1),
-                &LIMIT,
-            )
+            .load_or_build(&unit(&other_source_bytes), &context_for("third"), &LIMIT)
             .expect("other source build");
 
-        for loaded in [&first, &other_locator, &other_scope, &other_source] {
+        for loaded in [&first, &other_source] {
             assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
             assert!(loaded.pgm_body_read_stats().read_calls > 0);
         }
+        assert_eq!(same_source.origin(), FactOrigin::FallbackHit);
         let stats = store.fallback_stats();
-        assert_eq!(stats.hits, 0);
-        assert_eq!(stats.misses, 4);
-        assert_eq!(stats.inserts, 4);
-        assert_eq!(stats.resident_entries, 4);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.inserts, 2);
+        assert_eq!(stats.resident_entries, 2);
     }
 
     #[test]
@@ -1707,23 +1691,24 @@ mod tests {
     }
 
     #[test]
-    fn fact_and_key_directory_modes_are_owner_only() {
-        let directory = TempDir::new().expect("cache directory");
+    fn sidecar_and_owner_lock_modes_are_owner_only() {
+        let directory = TempDir::new().expect("data directory");
         let store = FactStore::new(directory.path());
+        let bytes = lifecycle_pgm(7);
+        write_pgm(&directory, &context(), &bytes);
         let path = store
-            .publish(&built(&lifecycle_pgm(7)), &LIMIT)
+            .publish(&built(&bytes), &context(), &LIMIT)
             .expect("publish");
         assert_eq!(
             std::fs::metadata(&path).expect("fact metadata").mode() & 0o777,
             0o600
         );
         assert_eq!(
-            std::fs::metadata(path.parent().expect("parent"))
-                .expect("directory metadata")
-                .permissions()
+            std::fs::metadata(directory.path().join(".pgkronika-overview.owner.lock"))
+                .expect("owner lock metadata")
                 .mode()
                 & 0o777,
-            0o700
+            0o600
         );
     }
 }
