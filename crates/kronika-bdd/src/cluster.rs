@@ -171,6 +171,15 @@ impl Cluster {
         )
     }
 
+    /// Connection string targeting a database through this cluster's Unix socket.
+    pub(crate) fn local_conn_string_db(&self, dbname: &str) -> String {
+        format!(
+            "host={} port={} user=postgres dbname={dbname}",
+            self.data_dir.path().display(),
+            self.port
+        )
+    }
+
     pub(crate) async fn connect(&self) -> Result<Conn> {
         let (client, connection) =
             tokio_postgres::connect(&self.conn_string(), tokio_postgres::NoTls)
