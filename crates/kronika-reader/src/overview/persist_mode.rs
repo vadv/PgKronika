@@ -112,8 +112,13 @@ const fn mode_for(error: PersistError) -> PersistMode {
 }
 
 /// Exponential backoff `INITIAL_BACKOFF * 2^(failures-1)` capped at
-/// [`MAX_BACKOFF`], with deterministic ±20% jitter so many stores do not
-/// retry in lockstep.
+/// [`MAX_BACKOFF`], with a deterministic ±20% perturbation of the ladder.
+///
+/// The perturbation is derived from `failures` alone: it keeps the schedule
+/// off round numbers without pulling in a randomness dependency and stays
+/// reproducible in tests. It does not desynchronize independent stores —
+/// they share the same delay at the same failure count; process refresh
+/// clocks already run out of phase.
 ///
 /// `failures` is 1-based (the first failure yields the initial delay).
 fn backoff_delay(failures: u32) -> Duration {
@@ -131,15 +136,14 @@ fn backoff_delay(failures: u32) -> Duration {
     let millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
     // Jitter factor in [0.8, 1.2), derived from the failure count so a test
     // is deterministic and no randomness dependency enters the reader.
-    let spread = jitter_permille(failures); // 0..=400
+    let spread = spread_permille(failures); // 0..=400
     let jittered = millis.saturating_mul(800 + u64::from(spread)) / 1000;
     Duration::from_millis(jittered)
 }
 
-/// Deterministic pseudo-random spread in `0..=400` (the width of ±20%).
-const fn jitter_permille(failures: u32) -> u32 {
-    // A cheap integer hash; the exact distribution does not matter, only that
-    // consecutive failure counts do not land on the same factor.
+/// Deterministic spread in `0..=400` (the width of ±20%) from the failure
+/// count, so consecutive counts do not land on the same factor.
+const fn spread_permille(failures: u32) -> u32 {
     let mixed = failures.wrapping_mul(2_654_435_761);
     mixed % 401
 }

@@ -889,6 +889,47 @@ mod tests {
     }
 
     #[test]
+    fn a_suppressed_write_does_not_attempt_the_disk_again() {
+        // A file where the cache root is expected makes every publish fail.
+        let temp = TempDir::new().expect("temp");
+        let blocker = temp.path().join("blocker");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let root = blocker.join("cache");
+        let store = FactStore::new(&root);
+        let facts = built(&lifecycle_pgm(7));
+
+        let (_first, first_error) = store
+            .admit_publish_or_fallback(&facts, &LIMIT)
+            .expect("first admit");
+        assert!(
+            first_error.is_some(),
+            "publishing under a file-as-root fails"
+        );
+        assert_eq!(
+            store.persist_mode().failures,
+            1,
+            "the first failure arms backoff"
+        );
+
+        // The second attempt is inside the backoff window: it reports the
+        // standing reason without touching the disk, so no new failure is
+        // recorded. A regression that ran the write before the gate would
+        // advance the count here.
+        let (_second, second_error) = store
+            .admit_publish_or_fallback(&facts, &LIMIT)
+            .expect("second admit");
+        assert!(
+            second_error.is_some(),
+            "a suppressed write still reports the standing reason"
+        );
+        assert_eq!(
+            store.persist_mode().failures,
+            1,
+            "a suppressed write does not attempt the disk"
+        );
+    }
+
+    #[test]
     fn cold_build_and_cache_hit_report_exact_io_origins() {
         let directory = TempDir::new().expect("cache directory");
         let store = FactStore::new(directory.path());
