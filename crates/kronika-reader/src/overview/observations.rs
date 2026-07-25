@@ -255,6 +255,13 @@ const fn loss_reason_code(reason: LossReason) -> u8 {
         LossReason::ParserBound => 2,
         LossReason::TailerBound => 3,
         LossReason::DictionaryBound => 4,
+        LossReason::SnapshotSourceLimit => 5,
+        LossReason::PermissionDenied => 6,
+        LossReason::SourceReadFailure => 7,
+        LossReason::CollectorLimit => 8,
+        LossReason::VisibilityRestricted => 9,
+        LossReason::MissingResetContext => 10,
+        LossReason::InvalidCounterValue => 11,
     }
 }
 
@@ -265,6 +272,13 @@ const fn loss_reason_from(code: u8) -> Result<LossReason, BlockError> {
         2 => Ok(LossReason::ParserBound),
         3 => Ok(LossReason::TailerBound),
         4 => Ok(LossReason::DictionaryBound),
+        5 => Ok(LossReason::SnapshotSourceLimit),
+        6 => Ok(LossReason::PermissionDenied),
+        7 => Ok(LossReason::SourceReadFailure),
+        8 => Ok(LossReason::CollectorLimit),
+        9 => Ok(LossReason::VisibilityRestricted),
+        10 => Ok(LossReason::MissingResetContext),
+        11 => Ok(LossReason::InvalidCounterValue),
         _ => Err(BlockError::InvalidEnum),
     }
 }

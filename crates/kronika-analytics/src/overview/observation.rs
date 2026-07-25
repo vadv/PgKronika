@@ -282,15 +282,36 @@ pub enum LossReason {
     TailerBound,
     /// Dictionary bounds dropped values.
     DictionaryBound,
+    /// A complete snapshot exceeded its configured source-row limit.
+    SnapshotSourceLimit,
+    /// The collector lacked permission to observe the full source.
+    PermissionDenied,
+    /// The collector could not read the source.
+    SourceReadFailure,
+    /// A collector work/cap limit withheld rows.
+    CollectorLimit,
+    /// Source visibility was explicitly restricted.
+    VisibilityRestricted,
+    /// A cumulative source lacked the reset context needed for continuity.
+    MissingResetContext,
+    /// A signed source counter was negative and could not be retained as u64.
+    InvalidCounterValue,
 }
 
 impl LossReason {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::GroupCapExceeded,
         Self::LifecycleCapExceeded,
         Self::ParserBound,
         Self::TailerBound,
         Self::DictionaryBound,
+        Self::SnapshotSourceLimit,
+        Self::PermissionDenied,
+        Self::SourceReadFailure,
+        Self::CollectorLimit,
+        Self::VisibilityRestricted,
+        Self::MissingResetContext,
+        Self::InvalidCounterValue,
     ];
 
     const fn index(self) -> usize {
@@ -300,6 +321,13 @@ impl LossReason {
             Self::ParserBound => 2,
             Self::TailerBound => 3,
             Self::DictionaryBound => 4,
+            Self::SnapshotSourceLimit => 5,
+            Self::PermissionDenied => 6,
+            Self::SourceReadFailure => 7,
+            Self::CollectorLimit => 8,
+            Self::VisibilityRestricted => 9,
+            Self::MissingResetContext => 10,
+            Self::InvalidCounterValue => 11,
         }
     }
 
@@ -312,6 +340,13 @@ impl LossReason {
             Self::ParserBound => 3,
             Self::TailerBound => 4,
             Self::DictionaryBound => 5,
+            Self::SnapshotSourceLimit => 6,
+            Self::PermissionDenied => 7,
+            Self::SourceReadFailure => 8,
+            Self::CollectorLimit => 9,
+            Self::VisibilityRestricted => 10,
+            Self::MissingResetContext => 11,
+            Self::InvalidCounterValue => 12,
         }
     }
 
@@ -324,6 +359,13 @@ impl LossReason {
             3 => Some(Self::ParserBound),
             4 => Some(Self::TailerBound),
             5 => Some(Self::DictionaryBound),
+            6 => Some(Self::SnapshotSourceLimit),
+            7 => Some(Self::PermissionDenied),
+            8 => Some(Self::SourceReadFailure),
+            9 => Some(Self::CollectorLimit),
+            10 => Some(Self::VisibilityRestricted),
+            11 => Some(Self::MissingResetContext),
+            12 => Some(Self::InvalidCounterValue),
             _ => None,
         }
     }

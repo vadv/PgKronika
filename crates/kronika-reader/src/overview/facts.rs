@@ -10,20 +10,24 @@
 //! [`encode`]: SegmentFacts::encode
 //! [`from_reader`]: SegmentFacts::from_reader
 
-use std::collections::BTreeSet as DictionaryIdSet;
+use std::collections::{BTreeMap, BTreeSet as DictionaryIdSet};
 
 use kronika_analytics::overview::{
-    Applicability, Coverage, CoverageSpan, EventFact, EventObservation, NamingContractId,
-    ObservationPayload, ObservationProvenance, OracleError, OracleLimits, OracleResult, PeriodQuality,
-    PhysicalCountSemantics, RawOracle, RetainedExactness, SegmentIdentity, SegmentLocator,
-    SourceCompleteness, query_bounded,
+    Applicability, CounterSample, Coverage, CoverageSpan, EventFact, EventObservation,
+    FactorCoverage, GaugeSample, MetricSeriesDescriptor, MetricSeriesId, NamingContractId,
+    ObservationPayload, ObservationProvenance, OracleError, OracleLimits, OracleResult,
+    PeriodQuality, PhysicalCountSemantics, RawOracle, RetainedExactness, SegmentIdentity,
+    SegmentLocator, SourceCompleteness, query_bounded,
 };
 use kronika_format::ReadAt;
 
 use crate::unit::PgmUnit;
 use crate::{PgmBodyReadStats, ReadError};
 
-use super::block::{BlockKind, LossCoverageBlock, SourceManifestBlock, StringTableBlock};
+use super::block::{
+    BlockKind, CounterSamplesBlock, EntityStateRecord, EntityStatesBlock, GaugeSamplesBlock,
+    LossCoverageBlock, ResetMarker, ResetMarkersBlock, SourceManifestBlock, StringTableBlock,
+};
 use super::container::{
     BlockContent, CacheReadError, FactFile, FactFileReader, FactReadStats, HeaderIdentity,
     validate_block_descriptor, validate_observation_provenance, verify_manifest_identity,
@@ -35,6 +39,7 @@ use super::event_extract::{
 };
 use super::event_facts::EventFactsBlock;
 use super::limits::Bounds;
+use super::metric_extract::{MetricExtraction, extract_metrics};
 use super::observations::EventObservationsBlock;
 
 pub(super) const MAX_STORE_NAMESPACE_BYTES: usize = 4 * 1024;
@@ -216,6 +221,10 @@ pub struct SegmentFacts {
     manifest_entries: Vec<ManifestEntryDescriptor>,
     observations: Vec<EventObservation>,
     event_facts: Vec<EventFact>,
+    counter_samples: CounterSamplesBlock,
+    gauge_samples: GaugeSamplesBlock,
+    reset_markers: ResetMarkersBlock,
+    entity_states: EntityStatesBlock,
     loss_coverage: LossCoverageBlock,
     retained_text_bytes: u64,
     dictionary_fingerprints: Vec<DictionaryFingerprint>,
@@ -247,9 +256,18 @@ impl SegmentFacts {
     ) -> Result<(Self, PgmBodyReadStats), BuildError> {
         let (min_ts, max_ts) = (unit.catalog().min_ts, unit.catalog().max_ts);
         let (identity, lineage) = Self::provenance(unit, context)?;
-        let extracted = extract_events(unit, lineage, Some(context.segment_locator), bounds)?;
-        let pgm_body_read_stats = extracted.pgm_body_read_stats;
-        let facts = Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds)?;
+        let mut extracted =
+            extract_events(unit, lineage, Some(context.segment_locator), bounds)?;
+        let metrics = extract_metrics(
+            unit,
+            identity.source_scope_id,
+            segment_span(min_ts, max_ts)?,
+            bounds,
+        )?;
+        apply_descriptor_replacements(&mut extracted, &metrics)?;
+        let pgm_body_read_stats =
+            checked_add_read_stats(extracted.pgm_body_read_stats, metrics.pgm_body_read_stats)?;
+        let facts = Self::assemble(identity, lineage, extracted, metrics, min_ts, max_ts, bounds)?;
         Ok((facts, pgm_body_read_stats))
     }
 
@@ -289,8 +307,15 @@ impl SegmentFacts {
             unit.source_descriptor(),
         );
         let (min_ts, max_ts) = (catalog.min_ts, catalog.max_ts);
-        let extracted = extract_events(unit, lineage, None, bounds)?;
-        Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds)
+        let mut extracted = extract_events(unit, lineage, None, bounds)?;
+        let metrics = extract_metrics(
+            unit,
+            identity.source_scope_id,
+            segment_span(min_ts, max_ts)?,
+            bounds,
+        )?;
+        apply_descriptor_replacements(&mut extracted, &metrics)?;
+        Self::assemble(identity, lineage, extracted, metrics, min_ts, max_ts, bounds)
     }
 
     /// Promotes matching live parts without rereading sealed event bodies.
@@ -344,8 +369,14 @@ impl SegmentFacts {
             return Ok(None);
         };
 
+        let Some(metrics) = promote_metrics(parts, identity.source_scope_id, bounds)? else {
+            return Ok(None);
+        };
         let (min_ts, max_ts) = (sealed_unit.catalog().min_ts, sealed_unit.catalog().max_ts);
-        Self::assemble(identity, lineage, extracted, min_ts, max_ts, bounds).map(Some)
+        Self::assemble(
+            identity, lineage, extracted, metrics, min_ts, max_ts, bounds,
+        )
+        .map(Some)
     }
 
     /// Assembles canonical facts from an extraction and the catalog time range.
@@ -353,6 +384,7 @@ impl SegmentFacts {
         identity: HeaderIdentity,
         lineage: SegmentIdentity,
         extracted: EventExtraction,
+        metrics: MetricExtraction,
         min_ts: i64,
         max_ts: i64,
         bounds: &Bounds,
@@ -364,7 +396,7 @@ impl SegmentFacts {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_error| BuildError::Internal)?;
         let covered = segment_coverage(min_ts, max_ts)?;
-        let loss_coverage = LossCoverageBlock::new(
+        let loss_coverage = LossCoverageBlock::new_with_factors(
             covered,
             extracted.known_gaps,
             Applicability::Applicable,
@@ -373,18 +405,36 @@ impl SegmentFacts {
             RetainedExactness::Exact,
             PhysicalCountSemantics::LowerBound,
             extracted.dropped_lower_bound,
+            metrics.factor_coverage,
             bounds,
         )
         .map_err(|error| match error {
             super::block::BlockError::AboveBound => BuildError::LimitExceeded,
             _ => BuildError::Internal,
         })?;
+        let counter_samples = CounterSamplesBlock::new_with_series(
+            metrics.counter_series,
+            metrics.counters,
+            bounds,
+        )
+        .map_err(block_build_error)?;
+        let gauge_samples =
+            GaugeSamplesBlock::new_with_series(metrics.gauge_series, metrics.gauges, bounds)
+                .map_err(block_build_error)?;
+        let reset_markers =
+            ResetMarkersBlock::new(metrics.reset_markers, bounds).map_err(block_build_error)?;
+        let entity_states =
+            EntityStatesBlock::new(metrics.entity_states, bounds).map_err(block_build_error)?;
         Ok(Self {
             identity,
             lineage,
             manifest_entries: extracted.manifest_entries,
             observations: extracted.observations,
             event_facts,
+            counter_samples,
+            gauge_samples,
+            reset_markers,
+            entity_states,
             loss_coverage,
             retained_text_bytes: extracted.retained_text_bytes,
             dictionary_fingerprints: extracted.dictionary_fingerprints,
@@ -453,6 +503,30 @@ impl SegmentFacts {
         &self.event_facts
     }
 
+    /// Typed cumulative samples retained for reset-aware deltas.
+    #[must_use]
+    pub fn counter_samples(&self) -> &CounterSamplesBlock {
+        &self.counter_samples
+    }
+
+    /// Typed instantaneous samples retained for gauge cells and state inputs.
+    #[must_use]
+    pub fn gauge_samples(&self) -> &GaugeSamplesBlock {
+        &self.gauge_samples
+    }
+
+    /// Counter epoch boundaries retained independently of sample selection.
+    #[must_use]
+    pub fn reset_markers(&self) -> &ResetMarkersBlock {
+        &self.reset_markers
+    }
+
+    /// Bounded complete-population entity snapshots.
+    #[must_use]
+    pub fn entity_states(&self) -> &EntityStatesBlock {
+        &self.entity_states
+    }
+
     /// Segment coverage spans.
     #[must_use]
     pub const fn coverage(&self) -> &Coverage {
@@ -513,6 +587,50 @@ impl SegmentFacts {
             .dictionary_fingerprints
             .capacity()
             .checked_mul(size_of::<DictionaryFingerprint>())?;
+        let counter_series = self
+            .counter_samples
+            .series()
+            .len()
+            .checked_mul(size_of::<MetricSeriesDescriptor>())?;
+        let counters = self
+            .counter_samples
+            .samples()
+            .len()
+            .checked_mul(size_of::<CounterSample>())?;
+        let gauge_series = self
+            .gauge_samples
+            .series()
+            .len()
+            .checked_mul(size_of::<MetricSeriesDescriptor>())?;
+        let gauges = self
+            .gauge_samples
+            .samples()
+            .len()
+            .checked_mul(size_of::<GaugeSample>())?;
+        let resets = self
+            .reset_markers
+            .markers()
+            .len()
+            .checked_mul(size_of::<ResetMarker>())?;
+        let entity_states = self
+            .entity_states
+            .records()
+            .len()
+            .checked_mul(size_of::<EntityStateRecord>())?;
+        let factor_coverage = self
+            .loss_coverage
+            .factor_coverage()
+            .iter()
+            .try_fold(0_usize, |total, coverage| {
+                total
+                    .checked_add(size_of::<FactorCoverage>())?
+                    .checked_add(
+                        coverage
+                            .loss_reasons
+                            .capacity()
+                            .checked_mul(size_of::<kronika_analytics::overview::LossReason>())?,
+                    )
+            })?;
 
         size_of::<Self>()
             .checked_add(manifest)?
@@ -522,6 +640,13 @@ impl SegmentFacts {
             .checked_add(event_fact_heap)?
             .checked_add(self.loss_coverage.covered().resident_heap_bytes()?)?
             .checked_add(self.loss_coverage.known_gaps().resident_heap_bytes()?)?
+            .checked_add(counter_series)?
+            .checked_add(counters)?
+            .checked_add(gauge_series)?
+            .checked_add(gauges)?
+            .checked_add(resets)?
+            .checked_add(entity_states)?
+            .checked_add(factor_coverage)?
             .checked_add(dictionary)
     }
 
@@ -562,6 +687,10 @@ impl SegmentFacts {
                 BlockContent::EventObservations(Box::new(observations)),
                 BlockContent::EventFacts(Box::new(event_facts)),
                 BlockContent::LossCoverage(Box::new(self.loss_coverage.clone())),
+                BlockContent::GaugeSamples(Box::new(self.gauge_samples.clone())),
+                BlockContent::CounterSamples(Box::new(self.counter_samples.clone())),
+                BlockContent::ResetMarkers(Box::new(self.reset_markers.clone())),
+                BlockContent::EntityStates(Box::new(self.entity_states.clone())),
             ],
             bounds,
         )
@@ -673,6 +802,30 @@ impl SegmentFacts {
         validate_block_descriptor(&facts_entry, &event_facts)?;
         validate_event_fact_evidence(&event_facts, &observations)?;
 
+        let (counter_entry, counter_body) =
+            singleton_body(&mut fact_reader, BlockKind::CounterSamples)?;
+        let counter_samples = CounterSamplesBlock::decode(&counter_body, bounds)?;
+        validate_block_descriptor(&counter_entry, &counter_samples)?;
+        validate_metric_scope(counter_samples.series(), expected.source_scope_id)?;
+
+        let (gauge_entry, gauge_body) =
+            singleton_body(&mut fact_reader, BlockKind::GaugeSamples)?;
+        let gauge_samples = GaugeSamplesBlock::decode(&gauge_body, bounds)?;
+        validate_block_descriptor(&gauge_entry, &gauge_samples)?;
+        validate_metric_scope(gauge_samples.series(), expected.source_scope_id)?;
+
+        let (reset_entry, reset_body) =
+            singleton_body(&mut fact_reader, BlockKind::ResetMarkers)?;
+        let reset_markers = ResetMarkersBlock::decode(&reset_body, bounds)?;
+        validate_block_descriptor(&reset_entry, &reset_markers)?;
+        validate_reset_series(&reset_markers, &counter_samples)?;
+
+        let (states_entry, states_body) =
+            singleton_body(&mut fact_reader, BlockKind::EntityStates)?;
+        let entity_states = EntityStatesBlock::decode(&states_body, bounds)?;
+        validate_block_descriptor(&states_entry, &entity_states)?;
+        validate_state_series(&entity_states, &gauge_samples)?;
+
         let coverage = merge_coverage_blocks(&mut fact_reader, bounds)?;
         let retained_text_bytes = bounds
             .decoded_block_len
@@ -686,6 +839,10 @@ impl SegmentFacts {
                 manifest_entries: manifest.entries().to_vec(),
                 observations: observations.into_observations(),
                 event_facts: event_facts.into_facts(),
+                counter_samples,
+                gauge_samples,
+                reset_markers,
+                entity_states,
                 loss_coverage: coverage,
                 retained_text_bytes,
                 dictionary_fingerprints: Vec::new(),
@@ -906,6 +1063,251 @@ fn rekey_promoted_parts(
     }))
 }
 
+fn apply_descriptor_replacements(
+    events: &mut EventExtraction,
+    metrics: &MetricExtraction,
+) -> Result<(), BuildError> {
+    for (index, replacement) in &metrics.descriptor_replacements {
+        let current = events
+            .manifest_entries
+            .get_mut(*index)
+            .ok_or(BuildError::Internal)?;
+        if current.catalog != replacement.catalog {
+            return Err(BuildError::Internal);
+        }
+        *current = *replacement;
+    }
+    Ok(())
+}
+
+fn checked_add_read_stats(
+    left: PgmBodyReadStats,
+    right: PgmBodyReadStats,
+) -> Result<PgmBodyReadStats, BuildError> {
+    Ok(PgmBodyReadStats {
+        read_calls: left
+            .read_calls
+            .checked_add(right.read_calls)
+            .ok_or(BuildError::Overflow)?,
+        stored_bytes_read: left
+            .stored_bytes_read
+            .checked_add(right.stored_bytes_read)
+            .ok_or(BuildError::Overflow)?,
+    })
+}
+
+const fn block_build_error(error: super::block::BlockError) -> BuildError {
+    match error {
+        super::block::BlockError::AboveBound => BuildError::LimitExceeded,
+        _ => BuildError::Internal,
+    }
+}
+
+fn promote_metrics(
+    parts: &[&SegmentFacts],
+    expected_scope: kronika_analytics::overview::SourceScopeId,
+    bounds: &Bounds,
+) -> Result<Option<MetricExtraction>, BuildError> {
+    let mut counter_series = BTreeMap::new();
+    let mut gauge_series = BTreeMap::new();
+    let mut counters = Vec::new();
+    let mut gauges = Vec::new();
+    let mut entity_states = Vec::new();
+    let mut factor_coverage = Vec::new();
+    for part in parts {
+        if !merge_metric_series(
+            &mut counter_series,
+            part.counter_samples.series(),
+            expected_scope,
+        ) || !merge_metric_series(
+            &mut gauge_series,
+            part.gauge_samples.series(),
+            expected_scope,
+        ) {
+            return Ok(None);
+        }
+        checked_extend(
+            &mut counters,
+            part.counter_samples.samples(),
+            bounds.items_per_block,
+        )?;
+        checked_extend(
+            &mut gauges,
+            part.gauge_samples.samples(),
+            bounds.items_per_block,
+        )?;
+        checked_extend(
+            &mut entity_states,
+            part.entity_states.records(),
+            bounds.items_per_block,
+        )?;
+        checked_extend(
+            &mut factor_coverage,
+            part.loss_coverage.factor_coverage(),
+            bounds.items_per_block,
+        )?;
+    }
+    counters.sort_unstable_by_key(|sample| {
+        (
+            sample.series_id().0,
+            sample.alignment_id().0,
+            sample.ts_us(),
+        )
+    });
+    if counters.windows(2).any(|pair| {
+        pair[0].series_id() == pair[1].series_id()
+            && pair[0].alignment_id() == pair[1].alignment_id()
+            && pair[0].ts_us() == pair[1].ts_us()
+    }) {
+        return Ok(None);
+    }
+    gauges.sort_unstable_by_key(|sample| (sample.series_id().0, sample.ts_us()));
+    if gauges.windows(2).any(|pair| {
+        pair[0].series_id() == pair[1].series_id() && pair[0].ts_us() == pair[1].ts_us()
+    }) {
+        return Ok(None);
+    }
+    entity_states.sort_unstable_by_key(|record| (record.series_id.0, record.ts_us));
+    if entity_states.windows(2).any(|pair| {
+        pair[0].series_id == pair[1].series_id && pair[0].ts_us == pair[1].ts_us
+    }) {
+        return Ok(None);
+    }
+    factor_coverage.sort_unstable_by_key(|coverage| {
+        (
+            coverage.factor_id.0,
+            coverage.interval.start_us(),
+            coverage.interval.end_us(),
+        )
+    });
+    if factor_coverage.windows(2).any(|pair| {
+        pair[0].factor_id == pair[1].factor_id && pair[0].interval == pair[1].interval
+    }) {
+        return Ok(None);
+    }
+    let reset_markers = reset_markers_for_samples(&counters);
+    Ok(Some(MetricExtraction {
+        descriptor_replacements: Vec::new(),
+        counter_series: counter_series.into_values().collect(),
+        counters,
+        gauge_series: gauge_series.into_values().collect(),
+        gauges,
+        reset_markers,
+        entity_states,
+        factor_coverage,
+        pgm_body_read_stats: PgmBodyReadStats::default(),
+    }))
+}
+
+fn merge_metric_series(
+    destination: &mut BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
+    incoming: &[MetricSeriesDescriptor],
+    expected_scope: kronika_analytics::overview::SourceScopeId,
+) -> bool {
+    incoming.iter().all(|descriptor| {
+        if descriptor.source_scope_id != expected_scope {
+            return false;
+        }
+        match destination.get(&descriptor.series_id) {
+            Some(existing) => *existing == *descriptor,
+            None => {
+                destination.insert(descriptor.series_id, *descriptor);
+                true
+            }
+        }
+    })
+}
+
+fn checked_extend<T: Clone>(
+    destination: &mut Vec<T>,
+    incoming: &[T],
+    bound: u64,
+) -> Result<(), BuildError> {
+    let next = destination
+        .len()
+        .checked_add(incoming.len())
+        .ok_or(BuildError::Overflow)?;
+    if next as u64 > bound {
+        return Err(BuildError::LimitExceeded);
+    }
+    destination.extend_from_slice(incoming);
+    Ok(())
+}
+
+fn reset_markers_for_samples(samples: &[CounterSample]) -> Vec<ResetMarker> {
+    let mut markers = Vec::new();
+    let mut previous = None;
+    for sample in samples {
+        let epoch = (sample.series_id(), sample.reset_epoch());
+        if previous != Some(epoch) {
+            markers.push(ResetMarker {
+                series_id: sample.series_id(),
+                ts_us: sample.ts_us(),
+                reset_epoch: sample.reset_epoch(),
+            });
+            previous = Some(epoch);
+        }
+    }
+    markers
+}
+
+fn validate_metric_scope(
+    series: &[MetricSeriesDescriptor],
+    expected_scope: kronika_analytics::overview::SourceScopeId,
+) -> Result<(), CacheReadError> {
+    if series
+        .iter()
+        .any(|descriptor| descriptor.source_scope_id != expected_scope)
+    {
+        return Err(CacheReadError::WrongSource);
+    }
+    Ok(())
+}
+
+fn validate_reset_series(
+    markers: &ResetMarkersBlock,
+    counters: &CounterSamplesBlock,
+) -> Result<(), CacheReadError> {
+    for marker in markers.markers() {
+        if counters.samples().iter().all(|sample| {
+            sample.series_id() != marker.series_id
+                || sample.ts_us() != marker.ts_us
+                || sample.reset_epoch() != marker.reset_epoch
+        }) {
+            return Err(CacheReadError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn validate_state_series(
+    states: &EntityStatesBlock,
+    gauges: &GaugeSamplesBlock,
+) -> Result<(), CacheReadError> {
+    for state in states.records() {
+        let has_entity_descriptor = gauges
+            .series()
+            .binary_search_by_key(&state.series_id.0, |descriptor| descriptor.series_id.0)
+            .ok()
+            .is_some_and(|index| gauges.series()[index].entity.is_some());
+        let matching_sample = gauges.samples().iter().any(|sample| {
+            sample.series_id() == state.series_id
+                && sample.ts_us() == state.ts_us
+                && sample.value() == f64::from(state.state_code)
+        });
+        if !has_entity_descriptor || !matching_sample {
+            return Err(CacheReadError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn segment_span(min_ts_us: i64, max_ts_us: i64) -> Result<CoverageSpan, BuildError> {
+    let end = max_ts_us.checked_add(1).ok_or(BuildError::Overflow)?;
+    CoverageSpan::new(min_ts_us, end)
+        .ok_or(BuildError::Source(SourceError::UnsupportedLayout))
+}
+
 /// Half-open coverage of an inclusive catalog time range.
 fn segment_coverage(min_ts_us: i64, max_ts_us: i64) -> Result<Coverage, BuildError> {
     if min_ts_us > max_ts_us {
@@ -977,6 +1379,7 @@ fn merge_coverage_blocks<R: ReadAt>(
     let mut retained_exactness = None;
     let mut physical_count = None;
     let mut dropped_lower_bound = 0_u64;
+    let mut factor_coverage = Vec::new();
     let mut covered_span_budget = bounds.coverage_spans;
     let mut gap_span_budget = bounds.coverage_spans;
     for (entry, body) in blocks {
@@ -1003,8 +1406,16 @@ fn merge_coverage_blocks<R: ReadAt>(
         dropped_lower_bound = dropped_lower_bound
             .checked_add(block.dropped_lower_bound())
             .ok_or(CacheReadError::Corrupt)?;
+        let next_factor_count = factor_coverage
+            .len()
+            .checked_add(block.factor_coverage().len())
+            .ok_or(CacheReadError::Oversized)?;
+        if next_factor_count as u64 > bounds.items_per_block {
+            return Err(CacheReadError::Oversized);
+        }
+        factor_coverage.extend_from_slice(block.factor_coverage());
     }
-    LossCoverageBlock::new(
+    LossCoverageBlock::new_with_factors(
         covered,
         known_gaps,
         applicability.ok_or(CacheReadError::Corrupt)?,
@@ -1013,6 +1424,7 @@ fn merge_coverage_blocks<R: ReadAt>(
         retained_exactness.ok_or(CacheReadError::Corrupt)?,
         physical_count.ok_or(CacheReadError::Corrupt)?,
         dropped_lower_bound,
+        factor_coverage,
         bounds,
     )
     .map_err(Into::into)

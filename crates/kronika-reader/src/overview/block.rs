@@ -11,9 +11,11 @@
 //! to the container, not here.
 
 use kronika_analytics::overview::{
-    AlignmentId, Applicability, CounterSample, Coverage, CoverageSpan, EntityKind, EntityRef,
-    FactorId, GaugeSample, MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality,
-    PhysicalCountSemantics, ResetFamily, RetainedExactness, SourceCompleteness, SourceScopeId,
+    AlignmentId, Applicability, BoundaryQuality, CadenceEpochId, CounterSample, Coverage,
+    CoverageSpan, CoverageState, EntityKind, EntityRef, FactorCoverage, FactorId, GaugeSample,
+    LossReason, MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality,
+    PhysicalCountSemantics, PopulationTotalQuality, ResetFamily, RetainedExactness,
+    SourceCompleteness, SourcePopulation, SourceScopeId,
 };
 
 use super::bytes::{ByteError, ByteReader, ByteWriter};
@@ -807,6 +809,7 @@ pub struct LossCoverageBlock {
     retained_exactness: RetainedExactness,
     physical_count: PhysicalCountSemantics,
     dropped_lower_bound: u64,
+    factor_coverage: Vec<FactorCoverage>,
 }
 
 impl LossCoverageBlock {
@@ -830,6 +833,44 @@ impl LossCoverageBlock {
         dropped_lower_bound: u64,
         bounds: &Bounds,
     ) -> Result<Self, BlockError> {
+        Self::new_with_factors(
+            covered,
+            known_gaps,
+            applicability,
+            period_quality,
+            source_completeness,
+            retained_exactness,
+            physical_count,
+            dropped_lower_bound,
+            Vec::new(),
+            bounds,
+        )
+    }
+
+    /// Builds segment coverage together with canonical per-factor evidence.
+    ///
+    /// Factor records are sorted by `(factor_id, interval)` and must be unique.
+    /// Their variable-sized loss lists share the block item bound.
+    ///
+    /// # Errors
+    /// Returns [`BlockError`] for duplicate or malformed factor records, or
+    /// when a span/item limit is exceeded.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor mirrors the persisted coverage contract"
+    )]
+    pub fn new_with_factors(
+        covered: Coverage,
+        known_gaps: Coverage,
+        applicability: Applicability,
+        period_quality: PeriodQuality,
+        source_completeness: SourceCompleteness,
+        retained_exactness: RetainedExactness,
+        physical_count: PhysicalCountSemantics,
+        dropped_lower_bound: u64,
+        mut factor_coverage: Vec<FactorCoverage>,
+        bounds: &Bounds,
+    ) -> Result<Self, BlockError> {
         if !bounds.is_within_absolute_limits() {
             return Err(BlockError::AboveBound);
         }
@@ -838,6 +879,7 @@ impl LossCoverageBlock {
         {
             return Err(BlockError::AboveBound);
         }
+        normalize_factor_coverage(&mut factor_coverage, bounds)?;
         Ok(Self {
             covered,
             known_gaps,
@@ -847,6 +889,7 @@ impl LossCoverageBlock {
             retained_exactness,
             physical_count,
             dropped_lower_bound,
+            factor_coverage,
         })
     }
 
@@ -898,6 +941,12 @@ impl LossCoverageBlock {
         self.dropped_lower_bound
     }
 
+    /// Canonical per-factor applicability, cadence, population and loss proof.
+    #[must_use]
+    pub fn factor_coverage(&self) -> &[FactorCoverage] {
+        &self.factor_coverage
+    }
+
     /// Decodes a coverage block body.
     ///
     /// # Errors
@@ -933,8 +982,18 @@ impl LossCoverageBlock {
         let retained_exactness = retained_exactness_from(reader.u8()?)?;
         let physical_count = physical_count_from(reader.u8()?)?;
         let dropped_lower_bound = reader.u64_le()?;
+        let factor_count = reader.uvarint(bounds.items_per_block)?;
+        let mut factor_coverage = Vec::with_capacity(factor_count.min(4_096) as usize);
+        let mut loss_budget = bounds.items_per_block;
+        for _ in 0..factor_count {
+            factor_coverage.push(read_factor_coverage(
+                &mut reader,
+                bounds,
+                &mut loss_budget,
+            )?);
+        }
         reader.finish()?;
-        Ok(Self {
+        Self::new_with_factors(
             covered,
             known_gaps,
             applicability,
@@ -943,7 +1002,9 @@ impl LossCoverageBlock {
             retained_exactness,
             physical_count,
             dropped_lower_bound,
-        })
+            factor_coverage,
+            bounds,
+        )
     }
 }
 
@@ -957,7 +1018,10 @@ impl EncodableBlock for LossCoverageBlock {
     }
 
     fn item_count(&self) -> u64 {
-        (self.covered.spans().len() + self.known_gaps.spans().len()) as u64 + 1
+        (self.covered.spans().len()
+            + self.known_gaps.spans().len()
+            + self.factor_coverage.len()) as u64
+            + 1
     }
 
     fn time_range(&self) -> Option<(i64, i64)> {
@@ -987,7 +1051,256 @@ impl EncodableBlock for LossCoverageBlock {
         writer.u8(retained_exactness_code(self.retained_exactness));
         writer.u8(physical_count_code(self.physical_count));
         writer.u64_le(self.dropped_lower_bound);
+        writer.uvarint(self.factor_coverage.len() as u64);
+        for coverage in &self.factor_coverage {
+            write_factor_coverage(&mut writer, coverage);
+        }
         writer.into_bytes()
+    }
+}
+
+type FactorCoverageKey = (u32, i64, i64);
+
+fn factor_coverage_key(coverage: &FactorCoverage) -> FactorCoverageKey {
+    (
+        coverage.factor_id.0,
+        coverage.interval.start_us(),
+        coverage.interval.end_us(),
+    )
+}
+
+fn normalize_factor_coverage(
+    coverage: &mut [FactorCoverage],
+    bounds: &Bounds,
+) -> Result<(), BlockError> {
+    if coverage.len() as u64 > bounds.items_per_block {
+        return Err(BlockError::AboveBound);
+    }
+    coverage.sort_unstable_by_key(factor_coverage_key);
+    if coverage
+        .windows(2)
+        .any(|pair| factor_coverage_key(&pair[0]) == factor_coverage_key(&pair[1]))
+    {
+        return Err(BlockError::Duplicate);
+    }
+    let mut loss_count = 0_u64;
+    for item in coverage {
+        if item.expected_period_us == Some(0)
+            || item.covered_duration_us > item.interval.duration_us()
+            || item
+                .source_population
+                .is_some_and(|population| {
+                    population
+                        .total
+                        .is_some_and(|total| population.collected > total)
+                        || population.total_quality == PopulationTotalQuality::Exact
+                            && population.total.is_none()
+                })
+            || item
+                .lost_count_lower_bound
+                .is_some_and(|lost| lost > 0 && item.loss_reasons.is_empty())
+        {
+            return Err(BlockError::Malformed);
+        }
+        item.loss_reasons.sort_unstable();
+        if item.loss_reasons.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(BlockError::Duplicate);
+        }
+        loss_count = loss_count
+            .checked_add(item.loss_reasons.len() as u64)
+            .ok_or(BlockError::AboveBound)?;
+        if loss_count > bounds.items_per_block {
+            return Err(BlockError::AboveBound);
+        }
+    }
+    Ok(())
+}
+
+fn write_factor_coverage(writer: &mut ByteWriter, coverage: &FactorCoverage) {
+    writer.u32_le(coverage.factor_id.0);
+    writer.u8(applicability_code(coverage.applicability));
+    writer.u8(coverage_state_code(coverage.state));
+    writer.i64_le(coverage.interval.start_us());
+    writer.i64_le(coverage.interval.end_us());
+    write_optional_u64(writer, coverage.expected_period_us);
+    writer.u8(period_quality_code(coverage.period_quality));
+    match coverage.cadence_epoch_id {
+        Some(id) => {
+            writer.u8(1);
+            writer.bytes(&id.0);
+        }
+        None => writer.u8(0),
+    }
+    writer.u8(u8::from(coverage.crosses_cadence_boundary));
+    writer.u64_le(coverage.present_samples);
+    writer.u64_le(coverage.covered_duration_us);
+    match coverage.source_population {
+        Some(population) => {
+            writer.u8(1);
+            writer.u64_le(population.collected);
+            write_optional_u64(writer, population.total);
+            writer.u8(population_quality_code(population.total_quality));
+        }
+        None => writer.u8(0),
+    }
+    writer.uvarint(coverage.loss_reasons.len() as u64);
+    for reason in &coverage.loss_reasons {
+        writer.u8(reason.code());
+    }
+    write_optional_u64(writer, coverage.lost_count_lower_bound);
+    writer.u8(retained_exactness_code(coverage.retained_exactness));
+    writer.u8(source_completeness_code(coverage.source_completeness));
+    writer.u8(physical_count_code(coverage.physical_count_semantics));
+    writer.u8(boundary_quality_code(coverage.boundary_quality));
+}
+
+fn read_factor_coverage(
+    reader: &mut ByteReader<'_>,
+    bounds: &Bounds,
+    loss_budget: &mut u64,
+) -> Result<FactorCoverage, BlockError> {
+    let factor_id = FactorId(reader.u32_le()?);
+    let applicability = applicability_from(reader.u8()?)?;
+    let state = coverage_state_from(reader.u8()?)?;
+    let interval = CoverageSpan::new(reader.i64_le()?, reader.i64_le()?)
+        .ok_or(BlockError::Malformed)?;
+    let expected_period_us = read_optional_u64(reader)?;
+    let period_quality = period_quality_from(reader.u8()?)?;
+    let cadence_epoch_id = match reader.u8()? {
+        0 => None,
+        1 => Some(CadenceEpochId(reader.array()?)),
+        _ => return Err(BlockError::InvalidEnum),
+    };
+    let crosses_cadence_boundary = read_bool(reader)?;
+    let present_samples = reader.u64_le()?;
+    let covered_duration_us = reader.u64_le()?;
+    let source_population = match reader.u8()? {
+        0 => None,
+        1 => Some(SourcePopulation {
+            collected: reader.u64_le()?,
+            total: read_optional_u64(reader)?,
+            total_quality: population_quality_from(reader.u8()?)?,
+        }),
+        _ => return Err(BlockError::InvalidEnum),
+    };
+    let loss_count = reader.uvarint((*loss_budget).min(bounds.items_per_block))?;
+    *loss_budget = loss_budget
+        .checked_sub(loss_count)
+        .ok_or(BlockError::AboveBound)?;
+    let mut loss_reasons = Vec::with_capacity(loss_count.min(64) as usize);
+    for _ in 0..loss_count {
+        loss_reasons.push(
+            LossReason::from_code(reader.u8()?).ok_or(BlockError::InvalidEnum)?,
+        );
+    }
+    let lost_count_lower_bound = read_optional_u64(reader)?;
+    let retained_exactness = retained_exactness_from(reader.u8()?)?;
+    let source_completeness = source_completeness_from(reader.u8()?)?;
+    let physical_count_semantics = physical_count_from(reader.u8()?)?;
+    let boundary_quality = boundary_quality_from(reader.u8()?)?;
+    Ok(FactorCoverage {
+        factor_id,
+        applicability,
+        state,
+        interval,
+        expected_period_us,
+        period_quality,
+        cadence_epoch_id,
+        crosses_cadence_boundary,
+        present_samples,
+        covered_duration_us,
+        source_population,
+        loss_reasons,
+        lost_count_lower_bound,
+        retained_exactness,
+        source_completeness,
+        physical_count_semantics,
+        boundary_quality,
+    })
+}
+
+fn write_optional_u64(writer: &mut ByteWriter, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            writer.u8(1);
+            writer.u64_le(value);
+        }
+        None => writer.u8(0),
+    }
+}
+
+fn read_optional_u64(reader: &mut ByteReader<'_>) -> Result<Option<u64>, BlockError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(reader.u64_le()?)),
+        _ => Err(BlockError::InvalidEnum),
+    }
+}
+
+fn read_bool(reader: &mut ByteReader<'_>) -> Result<bool, BlockError> {
+    match reader.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(BlockError::InvalidEnum),
+    }
+}
+
+const fn coverage_state_code(value: CoverageState) -> u8 {
+    match value {
+        CoverageState::Complete => 0,
+        CoverageState::Partial => 1,
+        CoverageState::Gap => 2,
+        CoverageState::Unknown => 3,
+        CoverageState::NotCollected => 4,
+    }
+}
+
+const fn coverage_state_from(code: u8) -> Result<CoverageState, BlockError> {
+    match code {
+        0 => Ok(CoverageState::Complete),
+        1 => Ok(CoverageState::Partial),
+        2 => Ok(CoverageState::Gap),
+        3 => Ok(CoverageState::Unknown),
+        4 => Ok(CoverageState::NotCollected),
+        _ => Err(BlockError::InvalidEnum),
+    }
+}
+
+const fn population_quality_code(value: PopulationTotalQuality) -> u8 {
+    match value {
+        PopulationTotalQuality::Exact => 0,
+        PopulationTotalQuality::LowerBound => 1,
+        PopulationTotalQuality::Unknown => 2,
+    }
+}
+
+const fn population_quality_from(code: u8) -> Result<PopulationTotalQuality, BlockError> {
+    match code {
+        0 => Ok(PopulationTotalQuality::Exact),
+        1 => Ok(PopulationTotalQuality::LowerBound),
+        2 => Ok(PopulationTotalQuality::Unknown),
+        _ => Err(BlockError::InvalidEnum),
+    }
+}
+
+const fn boundary_quality_code(value: BoundaryQuality) -> u8 {
+    match value {
+        BoundaryQuality::Contained => 0,
+        BoundaryQuality::EndpointAttributedCrossBoundary => 1,
+        BoundaryQuality::ModeledHold => 2,
+        BoundaryQuality::Mixed => 3,
+        BoundaryQuality::Unknown => 4,
+    }
+}
+
+const fn boundary_quality_from(code: u8) -> Result<BoundaryQuality, BlockError> {
+    match code {
+        0 => Ok(BoundaryQuality::Contained),
+        1 => Ok(BoundaryQuality::EndpointAttributedCrossBoundary),
+        2 => Ok(BoundaryQuality::ModeledHold),
+        3 => Ok(BoundaryQuality::Mixed),
+        4 => Ok(BoundaryQuality::Unknown),
+        _ => Err(BlockError::InvalidEnum),
     }
 }
 

@@ -25,6 +25,7 @@ mod fallback;
 mod gc;
 mod limits;
 mod live;
+mod metric_extract;
 mod observations;
 mod persist_mode;
 #[cfg(test)]

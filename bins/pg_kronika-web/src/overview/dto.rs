@@ -446,6 +446,13 @@ const fn loss_reason_name(reason: LossReason) -> &'static str {
         LossReason::ParserBound => "parser_bound",
         LossReason::TailerBound => "tailer_bound",
         LossReason::DictionaryBound => "dictionary_bound",
+        LossReason::SnapshotSourceLimit => "snapshot_source_limit",
+        LossReason::PermissionDenied => "permission_denied",
+        LossReason::SourceReadFailure => "source_read_failure",
+        LossReason::CollectorLimit => "collector_limit",
+        LossReason::VisibilityRestricted => "visibility_restricted",
+        LossReason::MissingResetContext => "missing_reset_context",
+        LossReason::InvalidCounterValue => "invalid_counter_value",
     }
 }
 
