@@ -1230,6 +1230,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::limits::LIMIT;
+    use super::super::qualification_fixture::all_family_fixture;
     use super::*;
 
     fn context() -> SegmentContext {
@@ -1483,6 +1484,62 @@ mod tests {
         store
             .read(&unit(&bytes_b), &context_b, &LIMIT)
             .expect("source B replacement");
+    }
+
+    #[test]
+    fn oversized_candidate_is_rebuilt_and_atomically_replaced() {
+        let directory = TempDir::new().expect("data directory");
+        let store = FactStore::new(directory.path());
+        let target_bytes = lifecycle_pgm(7);
+        let target_facts = built(&target_bytes);
+        let target_encoded = target_facts
+            .encode(&LIMIT)
+            .expect("encode target facts under absolute bounds");
+        write_pgm(&directory, &context(), &target_bytes);
+
+        let large_source = all_family_fixture().sealed_bytes();
+        let large_encoded = built(&large_source)
+            .encode(&LIMIT)
+            .expect("encode deliberately larger candidate");
+        assert!(
+            large_encoded.len() > target_encoded.len(),
+            "qualification candidate must exceed the target fact file"
+        );
+        let sidecar = directory.path().join(context().sidecar_file_name());
+        std::fs::write(&sidecar, &large_encoded).expect("seed oversized candidate");
+
+        let mut tight = LIMIT;
+        tight.fact_file_len =
+            u64::try_from(target_encoded.len()).expect("target fact length fits u64");
+        let source_before =
+            std::fs::read(directory.path().join(context().pgm_file_name())).expect("read source");
+        let loaded = store
+            .load_or_build(&unit(&target_bytes), &context(), &tight)
+            .expect("rebuild target below the configured bound");
+
+        assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
+        assert_eq!(
+            loaded.rebuild_reason(),
+            Some(CacheRebuildReason::Oversized)
+        );
+        assert_eq!(loaded.persist_error(), None);
+        assert_eq!(loaded.facts(), &target_facts);
+        assert!(
+            std::fs::metadata(&sidecar)
+                .expect("replacement metadata")
+                .len()
+                <= tight.fact_file_len,
+            "replacement must satisfy the same admission bound"
+        );
+        store
+            .read(&unit(&target_bytes), &context(), &tight)
+            .expect("replacement is restart-admissible");
+        assert_eq!(
+            std::fs::read(directory.path().join(context().pgm_file_name()))
+                .expect("reread source"),
+            source_before,
+            "rebuild must not alter the source PGM"
+        );
     }
 
     #[test]

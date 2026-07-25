@@ -553,7 +553,9 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    use kronika_analytics::overview::{CountLimits, CoverageSpan, OracleLimits, RawOracle};
+    use kronika_analytics::overview::{
+        CountLimits, CoverageSpan, OracleLimits, RawOracle, notable_event_id,
+    };
     use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::pg_log::PgLogLifecycleV1;
@@ -906,14 +908,16 @@ mod tests {
             .expect("first live view");
         let range = CoverageSpan::new(0, 10_000).expect("range");
         let first_view = load_selected(&writer, &snapshot, first_descriptors, &[7], range).await;
+        let first_result = first_view.query(range, QUERY_LIMITS).expect("first query");
         assert_eq!(
-            first_view
-                .query(range, QUERY_LIMITS)
-                .expect("first query")
-                .observations()
-                .len(),
+            first_result.observations().len(),
             1
         );
+        let first_public_ids = first_result
+            .observations()
+            .iter()
+            .map(|observation| notable_event_id(observation).expect("notable lifecycle event"))
+            .collect::<Vec<_>>();
 
         let second_part = lifecycle_part(std::slice::from_ref(&second));
         std::fs::OpenOptions::new()
@@ -928,13 +932,25 @@ mod tests {
             .assemble_with_live(&snapshot, &appended)
             .expect("appended live view");
         let second_view = load_selected(&writer, &snapshot, second_descriptors, &[7], range).await;
+        let second_result = second_view.query(range, QUERY_LIMITS).expect("second query");
         assert_eq!(
-            second_view
-                .query(range, QUERY_LIMITS)
-                .expect("second query")
-                .observations()
-                .len(),
+            second_result.observations().len(),
             2
+        );
+        let second_public_ids = second_result
+            .observations()
+            .iter()
+            .map(|observation| notable_event_id(observation).expect("notable lifecycle event"))
+            .collect::<Vec<_>>();
+        let live_observation_ids = second_result
+            .observations()
+            .iter()
+            .map(kronika_analytics::overview::EventObservation::observation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &second_public_ids[..first_public_ids.len()],
+            first_public_ids,
+            "append must preserve the stable public identity of prior live rows"
         );
 
         let first_body =
@@ -974,14 +990,29 @@ mod tests {
             "the seal publication retains one bounded prior-live candidate"
         );
         let sealed_view = load_selected(&writer, &snapshot, sealed_descriptors, &[7], range).await;
+        let sealed_result = sealed_view.query(range, QUERY_LIMITS).expect("sealed query");
         assert_eq!(
-            sealed_view
-                .query(range, QUERY_LIMITS)
-                .expect("sealed query")
-                .observations()
-                .len(),
+            sealed_result.observations().len(),
             2,
             "seal reconciliation neither drops nor duplicates live observations"
+        );
+        let sealed_public_ids = sealed_result
+            .observations()
+            .iter()
+            .map(|observation| notable_event_id(observation).expect("notable lifecycle event"))
+            .collect::<Vec<_>>();
+        let sealed_observation_ids = sealed_result
+            .observations()
+            .iter()
+            .map(kronika_analytics::overview::EventObservation::observation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sealed_public_ids, second_public_ids,
+            "ordinary live-to-sealed promotion must preserve semantic event IDs"
+        );
+        assert_ne!(
+            sealed_observation_ids, live_observation_ids,
+            "physical observation identity must still distinguish live and sealed lineages"
         );
         assert_eq!(
             ovf_files(dir.path()),

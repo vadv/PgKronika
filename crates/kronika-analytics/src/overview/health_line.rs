@@ -213,7 +213,7 @@ const fn uncovered_required_coverage(bucket: CoverageSpan) -> FactorCoverage {
 
 #[cfg(test)]
 mod tests {
-    use super::super::health::HealthState;
+    use super::super::health::{HealthState, downsample_worst};
     use super::*;
     use crate::overview::observation::{
         DroppedFieldCount, ErrorGroupPayload, LifecyclePayload, ObservationProvenance,
@@ -432,6 +432,57 @@ mod tests {
             points[1].floor_evidence().len(),
             1,
             "second floor in bucket 1"
+        );
+    }
+
+    #[test]
+    fn trusted_floors_and_unknown_scores_survive_partition_merge_and_downsample() {
+        let policy = overview_health_policy().expect("valid policy");
+        let observations = [
+            panic(0, 5, EvidenceQuality::Structured),
+            error(1, 55, *b"XX001", EvidenceQuality::Structured),
+        ];
+        let merged = health_line(&observations, span(0, 100), 50, &policy)
+            .expect("merged health line");
+        let mut partitioned = health_line(&observations[..1], span(0, 50), 50, &policy)
+            .expect("first partition");
+        partitioned.extend(
+            health_line(&observations[1..], span(50, 100), 50, &policy)
+                .expect("second partition"),
+        );
+        assert_eq!(
+            partitioned, merged,
+            "merging sealed/live partitions must preserve every trusted floor"
+        );
+
+        let merged_worst = downsample_worst(
+            &merged,
+            span(0, 100),
+            OVERVIEW_HEALTH_LIMITS,
+        )
+        .expect("downsample merged points")
+        .expect("merged points are nonempty");
+        let partitioned_worst = downsample_worst(
+            &partitioned,
+            span(0, 100),
+            OVERVIEW_HEALTH_LIMITS,
+        )
+        .expect("downsample partitioned points")
+        .expect("partitioned points are nonempty");
+        assert_eq!(partitioned_worst, merged_worst);
+        assert_eq!(
+            merged_worst.representative().overall_state(),
+            HealthState::Critical
+        );
+        assert_eq!(
+            merged_worst.representative().overall_score(),
+            None,
+            "a trusted floor must not invent a numeric zero for unknown coverage"
+        );
+        assert_eq!(
+            merged_worst.floor_evidence().len(),
+            2,
+            "worst-point reduction must retain both floor evidence records"
         );
     }
 

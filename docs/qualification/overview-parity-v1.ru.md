@@ -68,13 +68,44 @@ dense-hour.ovf
 нужна отдельная управляемая процедура на конкретной связке узла и файловой
 системы; подменять ею этот результат нельзя.
 
+## BDD для PostgreSQL и жизненного цикла процесса
+
+Точный перечень подтверждений включает восемь сценариев: по одному сценарию
+сквозной временной шкалы и жизненного цикла настоящего web-процесса для каждой
+версии PostgreSQL с 15-й по 18-ю. Сценарии жизненного цикла запускаются так:
+
+```bash
+DEBUG=1 make test-bdd TAGS=@timeline_web_lifecycle
+DEBUG=1 make test-bdd TAGS='@timeline_web_lifecycle and @pg15'
+```
+
+Первая команда проверяет PostgreSQL 15–18, вторая оставляет только PG15 для
+целевой диагностики. В каждом сценарии запускается настоящий исполняемый файл
+`pg_kronika-web` с отдельным принадлежащим проверке каталогом данных. Запросы
+overview, events, health, cursor и Prometheus выполняются по настоящему HTTP,
+а для проверки перезапуска создаются новые процессы. Готовность определяется
+явным сообщением после открытия порта. Для завершения используется штатная
+остановка или проверяемое аварийное завершение, а место публикации управляется
+барьером. Фиксированных задержек и циклов повторных запросов нет.
+
+Сценарии подтверждают создание и проверку соседнего `N.ovf`, повторное чтение
+без тел PGM и перезаписи OVF, атомарное восстановление после повреждения и
+всех видов устаревшего идентификатора, отказ от временного файла незавершённой
+публикации, ограниченный резервный слой памяти с последующим устойчивым
+восстановлением, восстановление после отмены, истечение курсора прошлого
+процесса, сохранность исходных файлов и однозначный конфликт второго
+владельца. Валидатор артефакта принимает только восемь точных сочетаний файла
+и имени сценария, перечисленных в
+`docs/qualification/overview-m6-traceability.md`.
+
 ## Локальная проверка
 
 ```bash
-cargo run --release -p kronika-reader --example overview_qualification -- \
-  --output target/qualification/overview.json
+cargo run --release --manifest-path bins/pg_kronika-web/Cargo.toml \
+  --example overview_qualification --features qualification -- \
+  --output target/qualification/overview.raw.json
 python3 scripts/validate-overview-qualification.py \
-  target/qualification/overview.json
+  target/qualification/overview.raw.json
 ```
 
 В CI выполняется итоговая проверка структуры, ввода-вывода и
@@ -84,7 +115,7 @@ python3 scripts/validate-overview-qualification.py \
 
 ```bash
 python3 scripts/validate-overview-qualification.py \
-  overview.json --exact-head GIT_SHA --final
+  overview.final.json --exact-head GIT_SHA --final
 ```
 
 Итоговое подтверждение также требует, чтобы все связанные проверки, задания

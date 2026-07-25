@@ -331,6 +331,28 @@ mod tests {
     }
 
     #[test]
+    fn policy_versions_rekey_only_the_response_projection() {
+        let base = response_key(1, Endpoint::Overview, None);
+        let mut notable_changed = base.clone();
+        notable_changed.notable_policy_version += 1;
+        let mut health_changed = base.clone();
+        health_changed.health_policy_version += 1;
+
+        assert_eq!(notable_changed.fact_set_id, base.fact_set_id);
+        assert_eq!(health_changed.fact_set_id, base.fact_set_id);
+        assert_ne!(
+            CacheKey::new(base.clone()),
+            CacheKey::new(notable_changed),
+            "a notable-policy change must invalidate only its serialized projection"
+        );
+        assert_ne!(
+            CacheKey::new(base),
+            CacheKey::new(health_changed),
+            "a health-policy change must invalidate only its serialized projection"
+        );
+    }
+
+    #[test]
     fn the_byte_budget_evicts_least_recently_used() {
         let sizing_cache = ResponseCache::new(usize::MAX, 2);
         sizing_cache.insert(key(1), body(60));

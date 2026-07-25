@@ -61,13 +61,42 @@ in-memory state. It does not evict the host page cache, and the artifact says
 `storage_cold=false`. A storage-cold result requires a separately controlled
 host/filesystem procedure and must not replace or relabel this measurement.
 
+## PostgreSQL and process-lifecycle BDD
+
+The exact evidence manifest names eight scenarios: one source-scoped timeline
+scenario and one real-web-process lifecycle scenario for each PostgreSQL major
+from 15 through 18. Run the lifecycle set with:
+
+```bash
+DEBUG=1 make test-bdd TAGS=@timeline_web_lifecycle
+DEBUG=1 make test-bdd TAGS='@timeline_web_lifecycle and @pg15'
+```
+
+The first command covers PostgreSQL 15–18; the second is a targeted PG15
+diagnostic. Every lifecycle scenario launches the actual
+`pg_kronika-web` executable over an isolated owned data directory, sends real
+overview, events, health, cursor, and Prometheus HTTP requests, and starts new
+processes for restart assertions. Explicit post-bind readiness, graceful
+shutdown or asserted process death, and a publication barrier replace timing
+sleeps and retry loops.
+
+The scenarios prove creation and validation of the same-stem `N.ovf`, durable
+reuse without PGM body reads or rewrites, atomic recovery from corrupt and
+every stale identity class, rejection of interrupted temporary publication,
+bounded fallback followed by durable recovery, cancellation recovery,
+process-local cursor expiry, source preservation, and deterministic
+second-owner contention. The artifact validator accepts only the eight exact
+feature/scenario coordinates recorded in
+`docs/qualification/overview-m6-traceability.md`.
+
 ## Local candidate
 
 ```bash
-cargo run --release -p kronika-reader --example overview_qualification -- \
-  --output target/qualification/overview.json
+cargo run --release --manifest-path bins/pg_kronika-web/Cargo.toml \
+  --example overview_qualification --features qualification -- \
+  --output target/qualification/overview.raw.json
 python3 scripts/validate-overview-qualification.py \
-  target/qualification/overview.json
+  target/qualification/overview.raw.json
 ```
 
 The CI job runs final structural, I/O, and performance validation, then uploads
@@ -76,7 +105,7 @@ artifact from the exact release head, run:
 
 ```bash
 python3 scripts/validate-overview-qualification.py \
-  overview.json --exact-head GIT_SHA --final
+  overview.final.json --exact-head GIT_SHA --final
 ```
 
 Final parity evidence additionally requires every referenced test, BDD job,

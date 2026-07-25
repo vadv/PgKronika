@@ -728,6 +728,22 @@ fn assert_timeline_schema_contract(document: &serde_json::Value) {
         schemas["TimelineEventsCursor"]["pattern"],
         "^[A-Za-z0-9_-]{312}$"
     );
+    let cursor_description = schemas["TimelineEventsCursor"]["description"]
+        .as_str()
+        .expect("timeline cursor description");
+    assert!(cursor_description.contains("process-local"));
+    assert!(cursor_description.contains("not durable across process restarts"));
+    let event_properties = &schemas["EventFact"]["properties"];
+    let event_id_description = event_properties["event_id"]["description"]
+        .as_str()
+        .expect("event ID description");
+    assert!(event_id_description.contains("excludes storage path"));
+    assert!(event_id_description.contains("active-to-sealed"));
+    let event_instance_description = event_properties["event_instance_id"]["description"]
+        .as_str()
+        .expect("event instance ID description");
+    assert!(event_instance_description.contains("retained occurrences"));
+    assert!(event_instance_description.contains("provenance"));
     assert_eq!(
         schemas["EventFact"]["properties"]["source_id"]["type"],
         "integer"
@@ -852,6 +868,17 @@ fn assert_timeline_endpoint_contract(document: &serde_json::Value) {
         paths["/v1/timeline/events"]["get"]["responses"]["503"]["$ref"],
         "#/components/responses/TimelineCapacityProblem"
     );
+    let events_description = paths["/v1/timeline/events"]["get"]["description"]
+        .as_str()
+        .expect("timeline events description");
+    assert!(events_description.contains("process-local"));
+    assert!(events_description.contains("cursor_expired"));
+    assert!(events_description.contains("HTTP 410"));
+    let cursor_description = parameters["timelineEventsCursor"]["description"]
+        .as_str()
+        .expect("timeline cursor parameter description");
+    assert!(cursor_description.contains("previous process"));
+    assert!(cursor_description.contains("cursor_expired"));
     for path in [
         "/v1/timeline/overview",
         "/v1/timeline/events",

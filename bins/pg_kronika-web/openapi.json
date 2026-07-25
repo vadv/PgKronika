@@ -302,7 +302,7 @@
     "/v1/timeline/events": {
       "get": {
         "operationId": "timelineEvents",
-        "description": "Queries a canonical source set over a half-open range of at most 31 days. Before sidecar or source access, one aggregate limit applies to intersecting sealed segments across the deduplicated source set (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission; selected source failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries a canonical source set over a half-open range of at most 31 days. Before sidecar or source access, one aggregate limit applies to intersecting sealed segments across the deduplicated source set (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission; selected source failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. A cursor pins a process-local view: after a process restart it returns cursor_expired with HTTP 410, while a new ordinary query can regenerate the same data. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineEventSources" },
@@ -509,7 +509,7 @@
         "name": "cursor",
         "in": "query",
         "required": false,
-        "description": "Opaque authenticated continuation token",
+        "description": "Opaque authenticated continuation token for a process-local pinned view; a token from a previous process returns cursor_expired with HTTP 410",
         "schema": { "$ref": "#/components/schemas/TimelineEventsCursor" }
       }
     },
@@ -987,7 +987,7 @@
       },
       "TimelineEventsCursor": {
         "type": "string",
-        "description": "Versioned authenticated timeline cursor",
+        "description": "Versioned authenticated cursor for a process-local pinned timeline view; it is not durable across process restarts",
         "minLength": 312,
         "maxLength": 312,
         "pattern": "^[A-Za-z0-9_-]{312}$"
@@ -1355,11 +1355,11 @@
         "properties": {
           "event_id": {
             "allOf": [{ "$ref": "#/components/schemas/B64UrlSha256" }],
-              "description": "Semantic identifier derived from published semantic fields"
+            "description": "Semantic identifier derived from published semantic fields; excludes storage path, file name, and physical segment lineage, and remains stable across an ordinary active-to-sealed transition"
           },
           "event_instance_id": {
             "allOf": [{ "$ref": "#/components/schemas/B64UrlSha256" }],
-            "description": "Physical retained-observation identifier"
+            "description": "Physical retained-observation identifier that distinguishes retained occurrences and their provenance"
           },
           "source_id": { "type": "integer", "minimum": 0 },
           "source_type_id": {

@@ -76,166 +76,365 @@ BDD_SCENARIOS = (
     ),
 )
 
+def rust_evidence(binary: str, path: str, name: str) -> tuple[str, str, str, str]:
+    return ("rust_test", binary, path, name)
+
+
+def mode_evidence(name: str) -> tuple[str, str, str, str]:
+    return (
+        "mode",
+        "pg-kronika-web::example/overview_qualification",
+        "qualification",
+        name,
+    )
+
+
+TIMELINE_BDD_EVIDENCE = tuple(
+    (
+        "bdd_scenario",
+        "kronika-bdd",
+        "crates/kronika-bdd/features/timeline_overview.feature",
+        f"PostgreSQL {version} publishes one reconciled source-scoped timeline",
+    )
+    for version in range(15, 19)
+)
+
+LIFECYCLE_BDD_EVIDENCE = tuple(
+    (
+        "bdd_scenario",
+        "kronika-bdd",
+        "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+        (
+            f"PostgreSQL {version} real web process recovers sibling indexes "
+            "across lifecycle boundaries"
+        ),
+    )
+    for version in range(15, 19)
+)
+
 EXPECTED_EVIDENCE = (
     (
-        (
-            "mode",
-            "pg-kronika-web::example/overview_qualification",
-            "qualification",
-            "restart-warm",
+        mode_evidence("restart-warm"),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/publish.rs",
+            "cold_build_and_cache_hit_report_exact_io_origins",
         ),
+        *LIFECYCLE_BDD_EVIDENCE,
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/facts.rs",
             "every_populated_canonical_block_matches_forced_raw_and_restart_warm",
         ),
-    ),
-    (
-        (
-            "rust_test",
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/facts.rs",
+            "all_family_range_edges_use_half_open_ownership_and_one_left_halo",
+        ),
+        rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/live.rs",
             "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
         ),
+        mode_evidence("oracle-profile"),
+        *TIMELINE_BDD_EVIDENCE,
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/live.rs",
+            "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/live.rs",
+            "ten_thousand_random_partition_seal_and_merge_seeds_are_invariant",
+        ),
+    ),
+    (
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/publish.rs",
+            "corrupt_sidecar_is_atomically_replaced_at_the_same_path",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/publish.rs",
+            "wrong_source_at_the_expected_name_is_rejected",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/publish.rs",
+            "oversized_candidate_is_rebuilt_and_atomically_replaced",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/container.rs",
+            "admission_distinguishes_wrong_source_from_incompatible_versions",
+        ),
+        rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/publish.rs",
             "publication_failure_returns_fresh_facts_then_serves_the_fallback",
         ),
-        *(
-            (
-                "bdd_scenario",
-                "kronika-bdd",
-                "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
-                (
-                    f"PostgreSQL {version} real web process recovers sibling indexes "
-                    "across lifecycle boundaries"
-                ),
-            )
-            for version in range(15, 19)
-        ),
+        *LIFECYCLE_BDD_EVIDENCE,
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
             "pg-kronika-web",
             "bins/pg_kronika-web/src/tests/overview_resilience.rs",
             "scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage",
         ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/facts.rs",
+            "every_all_family_source_body_crc_failure_stays_a_source_error",
+        ),
     ),
     (
-        (
-            "rust_test",
+        mode_evidence("range-cold/facts-warm"),
+        rust_evidence(
+            "pg-kronika-web",
+            "bins/pg_kronika-web/src/overview/cache.rs",
+            "policy_versions_rekey_only_the_response_projection",
+        ),
+        rust_evidence(
             "pg-kronika-web",
             "bins/pg_kronika-web/src/tests/overview_timeline.rs",
             "preview_and_events_share_typed_fact_ids_and_canonical_order",
         ),
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
             "pg-kronika-web",
             "bins/pg_kronika-web/src/tests/overview_timeline.rs",
             "a_cursor_walks_the_retained_set_exactly_once",
         ),
+        rust_evidence(
+            "pg-kronika-web",
+            "bins/pg_kronika-web/src/tests/overview_timeline.rs",
+            "a_cursor_resolves_its_pinned_view_after_a_new_publication",
+        ),
+        rust_evidence(
+            "pg-kronika-web",
+            "bins/pg_kronika-web/src/tests/overview_timeline.rs",
+            "a_cursor_presented_to_a_changed_query_is_a_mismatch",
+        ),
+        *LIFECYCLE_BDD_EVIDENCE,
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
             "pg-kronika-web",
             "bins/pg_kronika-web/src/overview/live.rs",
             "append_then_seal_keeps_one_coherent_event_set",
         ),
+        rust_evidence(
+            "kronika-analytics",
+            "crates/kronika-analytics/src/overview/notable.rs",
+            "public_event_identity_ignores_lineage_but_retains_content",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/live.rs",
+            "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+        ),
+        rust_evidence(
+            "pg-kronika-web",
+            "bins/pg_kronika-web/src/tests/overview_timeline.rs",
+            "duplicate_segment_contents_do_not_invent_path_based_identity",
+        ),
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/live.rs",
+            "a_stream_split_into_parts_reports_the_unsplit_counts_and_coverage_envelope",
+        ),
+        rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/live.rs",
             "an_incomplete_candidate_is_never_promoted",
         ),
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
             "pg-kronika-web",
             "bins/pg_kronika-web/src/tests/overview_timeline.rs",
             "health_of_an_empty_range_is_unknown_not_green",
         ),
-    ),
-    (
-        (
-            "rust_test",
+        rust_evidence(
             "kronika-analytics",
             "crates/kronika-analytics/src/overview/health.rs",
-            "floor_with_unknown_coverage_is_critical_without_numeric_zero",
+            "missing_required_penalty_is_unknown_even_with_complete_coverage",
         ),
-        (
-            "rust_test",
+        rust_evidence(
             "kronika-analytics",
             "crates/kronika-analytics/src/overview/health.rs",
-            "downsample_selects_earliest_floor_cell_before_numeric_minimum",
+            "partial_lossy_assumed_or_foreign_coverage_never_turns_green",
+        ),
+        *TIMELINE_BDD_EVIDENCE,
+    ),
+    (
+        rust_evidence(
+            "kronika-analytics",
+            "crates/kronika-analytics/src/overview/health_line.rs",
+            "trusted_floors_and_unknown_scores_survive_partition_merge_and_downsample",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/live.rs",
+            "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
         ),
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
             "pg-kronika-web",
             "bins/pg_kronika-web/src/tests/overview_timeline.rs",
             "all_supported_factor_families_reach_every_timeline_endpoint",
         ),
+        rust_evidence(
+            "kronika-analytics",
+            "crates/kronika-analytics/src/overview/health.rs",
+            "every_strict_coverage_axis_is_enforced",
+        ),
+        *TIMELINE_BDD_EVIDENCE,
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/facts.rs",
             "all_family_range_edges_use_half_open_ownership_and_one_left_halo",
         ),
+        rust_evidence(
+            "kronika-analytics",
+            "crates/kronika-analytics/src/overview/reduce.rs",
+            "reset_gap_and_mixed_series_never_become_zero_deltas",
+        ),
+        rust_evidence(
+            "kronika-analytics",
+            "crates/kronika-analytics/src/overview/reduce.rs",
+            "boundary_attribution_is_partition_invariant",
+        ),
+        rust_evidence(
+            "kronika-analytics",
+            "crates/kronika-analytics/src/overview/reduce.rs",
+            "halo_bridge_is_counted_once_for_every_partition",
+        ),
     ),
     (
-        (
-            "rust_test",
+        rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/facts.rs",
             "every_populated_canonical_block_matches_forced_raw_and_restart_warm",
         ),
-    ),
-    (
-        (
-            "mode",
-            "pg-kronika-web::example/overview_qualification",
-            "qualification",
-            "concurrent-identical",
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/facts.rs",
+            "extracts_registered_log_event_layouts_once_with_conservative_quality",
         ),
-        (
-            "mode",
-            "pg-kronika-web::example/overview_qualification",
-            "qualification",
-            "concurrent-disjoint",
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/metric_extract.rs",
+            "unsupported_factor_coverage_is_explicit",
         ),
-    ),
-    (
-        (
-            "mode",
-            "pg-kronika-web::example/overview_qualification",
-            "qualification",
-            "memory-only",
+        rust_evidence(
+            "kronika-analytics",
+            "crates/kronika-analytics/src/overview/metric.rs",
+            "factor_codes_and_units_round_trip",
+        ),
+        rust_evidence(
+            "kronika-analytics",
+            "crates/kronika-analytics/src/overview/fact.rs",
+            "event_taxonomy_codes_round_trip_exhaustively",
         ),
     ),
     (
-        (
-            "rust_test",
+        mode_evidence("concurrent-identical"),
+        mode_evidence("concurrent-disjoint"),
+        rust_evidence(
+            "pg-kronika-web",
+            "bins/pg_kronika-web/src/tests/overview_admission.rs",
+            "an_exact_decoded_hit_bypasses_cold_admission",
+        ),
+        rust_evidence(
+            "pg-kronika-web",
+            "bins/pg_kronika-web/src/tests/overview_admission.rs",
+            "an_exact_durable_hit_bypasses_cold_admission_after_restart",
+        ),
+        rust_evidence(
+            "pg-kronika-web",
+            "bins/pg_kronika-web/src/overview/singleflight.rs",
+            "same_fact_key_with_distinct_lineages_runs_independently",
+        ),
+        rust_evidence(
+            "pg-kronika-web",
+            "bins/pg_kronika-web/src/overview/singleflight.rs",
+            "cancelling_the_request_does_not_cancel_the_leader",
+        ),
+        rust_evidence(
+            "pg-kronika-web",
+            "bins/pg_kronika-web/src/overview/admission.rs",
+            "cancelling_a_waiter_removes_its_ticket",
+        ),
+    ),
+    (
+        mode_evidence("memory-only"),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/publish.rs",
+            "production_fallback_enforces_lru_hour_byte_and_oversized_budgets",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/publish.rs",
+            "backoff_suppresses_a_second_publication_attempt",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/publish.rs",
+            "publication_failure_returns_fresh_facts_then_serves_the_fallback",
+        ),
+        *LIFECYCLE_BDD_EVIDENCE,
+    ),
+    (
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/gc/tests.rs",
+            "quota_accounts_only_derived_files_in_the_owned_data_directory",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/gc/tests.rs",
+            "optional_quota_blocks_publication_without_touching_the_source",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/gc/tests.rs",
+            "data_directory_owner_contention_fails_closed",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/gc/tests.rs",
+            "unlinked_bytes_come_from_the_reopened_validated_inode",
+        ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/gc/tests.rs",
+            "source_entries_and_symlinks_are_never_followed_or_removed",
+        ),
+        rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/gc/tests.rs",
             "concurrent_live_gc_read_and_publish_preserve_the_sidecar",
         ),
+        rust_evidence(
+            "kronika-reader",
+            "crates/kronika-reader/src/overview/gc/tests.rs",
+            "complete_typed_live_set_preserves_each_sibling_sidecar",
+        ),
+        *LIFECYCLE_BDD_EVIDENCE,
     ),
     (
         (
@@ -1263,8 +1462,10 @@ def validate_acceptance(
                     continue
                 check(
                     binary == "kronika-bdd"
-                    and path
-                    == "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+                    and any(
+                        path == expected_path and name == expected_name
+                        for expected_path, expected_name, _postgres in BDD_SCENARIOS
+                    ),
                     f"acceptance row {index} has invalid BDD evidence coordinates",
                     failures,
                 )

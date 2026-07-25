@@ -238,6 +238,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_fact_key_with_distinct_lineages_runs_independently() {
+        let flights = FactSingleflight::new(4);
+        let fact_key = key(7).fact_key();
+        let first_key = FactBuildKey::new(fact_key, SegmentLineageId([0x11; 32]));
+        let second_key = FactBuildKey::new(fact_key, SegmentLineageId([0x22; 32]));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+
+        let first_flights = flights.clone();
+        let first_executions = Arc::clone(&executions);
+        let first_release = Arc::clone(&release);
+        let first = tokio::spawn(async move {
+            first_flights
+                .run(
+                    first_key,
+                    move || async move {
+                        first_executions.fetch_add(1, Ordering::SeqCst);
+                        first_release.notified().await;
+                        11_u8
+                    },
+                    || 0,
+                )
+                .await
+        });
+        let second_flights = flights.clone();
+        let second_executions = Arc::clone(&executions);
+        let second_release = Arc::clone(&release);
+        let second = tokio::spawn(async move {
+            second_flights
+                .run(
+                    second_key,
+                    move || async move {
+                        second_executions.fetch_add(1, Ordering::SeqCst);
+                        second_release.notified().await;
+                        22_u8
+                    },
+                    || 0,
+                )
+                .await
+        });
+
+        wait_for_active(&flights, 2).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            2,
+            "equal logical facts in distinct physical lineages must not share work"
+        );
+        release.notify_waiters();
+        assert_eq!(first.await.expect("first lineage task"), Ok(11));
+        assert_eq!(second.await.expect("second lineage task"), Ok(22));
+        wait_for_active(&flights, 0).await;
+    }
+
+    #[tokio::test]
     async fn cancelling_the_request_does_not_cancel_the_leader() {
         let flights = FactSingleflight::new(4);
         let release = Arc::new(Notify::new());
