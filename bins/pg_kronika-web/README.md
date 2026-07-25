@@ -99,8 +99,8 @@ facts have the same stem:
 
 ```text
 /data/active.parts
-/data/1721916000000000.pgm
-/data/1721916000000000.ovf
+/data/N.pgm
+/data/N.ovf
 ```
 
 The first `FactStore` to acquire `.pgkronika-overview.owner.lock` holds the

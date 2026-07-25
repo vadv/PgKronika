@@ -150,8 +150,8 @@ allow lists with `cargo run -p xtask -- check-deps`.
 
   ```text
   /data/active.parts
-  /data/1721916000000000.pgm
-  /data/1721916000000000.ovf
+  /data/N.pgm
+  /data/N.ovf
   ```
 
   One independently constructed `FactStore` or process holds the directory
