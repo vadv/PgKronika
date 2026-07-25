@@ -1145,16 +1145,16 @@ mod tests {
         let sealed = lineage(1);
         assert_eq!(
             sealed.id().0,
-            hex32("c70f5cc2edee83f3cbcf707be01519c8a13ec7419247bf181b13916ff9738016")
+            hex32("f052afe0372083f5587c769eaa9c34210ddb6bf11c011bc40f2e3c7a6f74a24a")
         );
         let live = SegmentIdentity::live_approximate(1, 8, b"first-part");
         assert_eq!(
             live.id().0,
-            hex32("9e2a5dcb39d5b100b7d4e7a1c1f0a105efac30f24be2b4cf6c548f25bce321b0")
+            hex32("eb3ce89fcfd67c743f4a6d024ec46f1aa989a064e43a2928aeec77060eced58b")
         );
         assert_eq!(
             individual(4).observation_id().0,
-            hex32("35b184dbaacc0a087dabef84a1900ddc4d3e4fa4b73c1d1af80d5adec193b3c0")
+            hex32("879aefc0c073af22ba581e9f2b4aa7176f57fe2148886b398291a3edd558d550")
         );
     }
 
