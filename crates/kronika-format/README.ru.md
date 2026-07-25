@@ -21,7 +21,7 @@ kronika-registry кодирует типизированные записи в �
 kronika-writer строит самодостаточную часть PGM
         |
         v
-active.parts --формирование итогового PGM--> <первая_метка_времени>.pgm
+active.parts --завершение сегмента--> <первая_метка_времени>.pgm
                                       |
                                       v
                           kronika-store / kronika-reader
