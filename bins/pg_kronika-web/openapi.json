@@ -274,7 +274,7 @@
     "/v1/timeline/overview": {
       "get": {
         "operationId": "timelineOverview",
-        "description": "Queries one half-open source range of at most 31 days. Selection is limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries one half-open source range of at most 31 days. Before fact-cache or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineSource" },
@@ -290,19 +290,19 @@
               }
             }
           },
-          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "400": { "$ref": "#/components/responses/TimelineRequestProblem" },
           "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
           "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" },
-          "503": { "$ref": "#/components/responses/AnalyticCapacityProblem" }
+          "503": { "$ref": "#/components/responses/TimelineCapacityProblem" }
         }
       }
     },
     "/v1/timeline/events": {
       "get": {
         "operationId": "timelineEvents",
-        "description": "Queries a canonical source set over a half-open range of at most 31 days. Selection is limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries a canonical source set over a half-open range of at most 31 days. Before fact-cache or source access, one aggregate limit applies to intersecting sealed segments across the deduplicated source set (default 1024, operator range 1..=4096). Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineEventSources" },
@@ -322,7 +322,7 @@
               }
             }
           },
-          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "400": { "$ref": "#/components/responses/TimelineRequestProblem" },
           "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
           "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "410": { "$ref": "#/components/responses/ApplicationProblem" },
@@ -335,7 +335,7 @@
     "/v1/timeline/health": {
       "get": {
         "operationId": "timelineHealth",
-        "description": "Queries one half-open source range of at most 31 days. Selection is limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries one half-open source range of at most 31 days. Before fact-cache or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineSource" },
@@ -352,12 +352,12 @@
               }
             }
           },
-          "400": { "$ref": "#/components/responses/ApplicationProblem" },
+          "400": { "$ref": "#/components/responses/TimelineRequestProblem" },
           "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
           "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" },
-          "503": { "$ref": "#/components/responses/AnalyticCapacityProblem" }
+          "503": { "$ref": "#/components/responses/TimelineCapacityProblem" }
         }
       }
     },
@@ -531,13 +531,25 @@
         "schema": { "type": "string", "const": "GET, HEAD" }
       },
       "ProblemRetryAfter": {
-        "description": "Seconds before retrying an analytic capacity request",
+        "description": "Seconds before retrying a rejected capacity request",
         "schema": { "type": "integer", "const": 1 }
       }
     },
     "responses": {
       "ApplicationProblem": {
         "description": "Locale-neutral RFC 9457 application error",
+        "headers": {
+          "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
+          "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": { "$ref": "#/components/schemas/Problem" }
+          }
+        }
+      },
+      "TimelineRequestProblem": {
+        "description": "Locale-neutral RFC 9457 request error. A selected sealed-segment count above the configured effective limit is query_limit_exceeded with status 400 and params.resource=selected_segments.",
         "headers": {
           "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
           "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" }
@@ -588,12 +600,12 @@
         }
       },
       "TimelineCapacityProblem": {
-        "description": "Timeline analytic-work or cursor-registry capacity error",
+        "description": "Timeline cold-work, analytic-work, or cursor-registry capacity error",
         "headers": {
           "Cache-Control": { "$ref": "#/components/headers/ProblemCacheControl" },
           "X-Request-ID": { "$ref": "#/components/headers/ProblemRequestId" },
           "Retry-After": {
-            "description": "Present only for analytic_capacity_unavailable; absent for cursor_capacity_unavailable",
+            "description": "Present for overview_capacity_unavailable and analytic_capacity_unavailable; absent for cursor_capacity_unavailable",
             "schema": { "type": "integer", "const": 1 }
           }
         },
@@ -1756,7 +1768,7 @@
         "properties": {
           "resource": {
             "type": "string",
-            "enum": ["query_bytes", "query_parameters", "query_span_us", "window_positions", "rows", "cells", "bytes", "units", "sections", "identity_bytes", "series_points", "episodes", "clusters", "incident_key_bytes", "total_incident_key_bytes"]
+            "enum": ["query_bytes", "query_parameters", "query_span_us", "window_positions", "rows", "cells", "bytes", "units", "sections", "identity_bytes", "series_points", "episodes", "clusters", "incident_key_bytes", "total_incident_key_bytes", "selected_segments"]
           },
           "limit": { "type": "integer", "minimum": 0 },
           "observed": { "type": "integer", "minimum": 0 }
@@ -1792,6 +1804,7 @@
               "https://pgkronika.dev/problems/query-limit-exceeded",
               "https://pgkronika.dev/problems/cursor-capacity-unavailable",
               "https://pgkronika.dev/problems/analytic-capacity-unavailable",
+              "https://pgkronika.dev/problems/overview-capacity-unavailable",
               "https://pgkronika.dev/problems/store-read-failed",
               "https://pgkronika.dev/problems/internal-error"
             ]
@@ -1799,7 +1812,7 @@
           "status": { "type": "integer", "enum": [400, 401, 404, 405, 410, 413, 500, 503] },
           "code": {
             "type": "string",
-            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "cursor_expired", "view_gone", "query_limit_exceeded", "cursor_capacity_unavailable", "analytic_capacity_unavailable", "store_read_failed", "internal_error"]
+            "enum": ["unauthorized", "route_not_found", "method_not_allowed", "missing_query_parameter", "invalid_query_parameter", "unknown_query_parameter", "duplicate_query_parameter", "invalid_query_constraint", "unknown_section", "invalid_cursor", "cursor_query_mismatch", "cursor_expired", "view_gone", "query_limit_exceeded", "cursor_capacity_unavailable", "analytic_capacity_unavailable", "overview_capacity_unavailable", "store_read_failed", "internal_error"]
           },
           "params": { "type": "object" },
           "instance": { "type": "string", "format": "uri", "pattern": "^https://pgkronika\\.dev/problems/occurrences/[0-9a-f]{32}$" }
@@ -1818,9 +1831,33 @@
           { "if": { "properties": { "code": { "const": "cursor_query_mismatch" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-query-mismatch" }, "status": { "const": 400 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "cursor_expired" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-expired" }, "status": { "const": 410 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "view_gone" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/view-gone" }, "status": { "const": 410 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
-          { "if": { "properties": { "code": { "const": "query_limit_exceeded" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/query-limit-exceeded" }, "status": { "const": 413 }, "params": { "$ref": "#/components/schemas/LimitParams" } } } },
+          {
+            "if": { "properties": { "code": { "const": "query_limit_exceeded" } } },
+            "then": {
+              "properties": {
+                "type": { "const": "https://pgkronika.dev/problems/query-limit-exceeded" },
+                "status": { "enum": [400, 413] },
+                "params": { "$ref": "#/components/schemas/LimitParams" }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "params": {
+                        "properties": { "resource": { "const": "selected_segments" } },
+                        "required": ["resource"]
+                      }
+                    }
+                  },
+                  "then": { "properties": { "status": { "const": 400 } } },
+                  "else": { "properties": { "status": { "const": 413 } } }
+                }
+              ]
+            }
+          },
           { "if": { "properties": { "code": { "const": "cursor_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/cursor-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "analytic_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/analytic-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/CapacityParams" } } } },
+          { "if": { "properties": { "code": { "const": "overview_capacity_unavailable" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/overview-capacity-unavailable" }, "status": { "const": 503 }, "params": { "$ref": "#/components/schemas/CapacityParams" } } } },
           { "if": { "properties": { "code": { "const": "store_read_failed" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/store-read-failed" }, "status": { "const": 500 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } },
           { "if": { "properties": { "code": { "const": "internal_error" } } }, "then": { "properties": { "type": { "const": "https://pgkronika.dev/problems/internal-error" }, "status": { "const": 500 }, "params": { "$ref": "#/components/schemas/EmptyParams" } } } }
         ]

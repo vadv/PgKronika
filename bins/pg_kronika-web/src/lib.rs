@@ -114,7 +114,11 @@ pub(crate) mod startup;
 
 pub use auth::AuthConfig;
 use auth::require_basic_auth;
+use overview::admission::ColdAdmissionConfig;
 pub use overview::live::OverviewBuildError;
+use overview::selection::{
+    ABSOLUTE_MAX_SELECTED_SEGMENTS, DEFAULT_MAX_SELECTED_SEGMENTS, SelectedSealedPlan,
+};
 pub use startup::WebConfig;
 
 /// Container format version this build serves, mirrored into `/v1/version`.
@@ -125,11 +129,12 @@ pub const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
-/// Atomically published store metadata and timeline facts.
+/// Atomically published store snapshot, sealed descriptors, and live state.
 #[derive(Debug)]
 pub(crate) struct PublishedStoreView {
     snapshot: Arc<LocalDirSnapshot>,
-    timeline: Arc<overview::view::IndexView>,
+    timeline_snapshot: Arc<LocalDirSnapshot>,
+    timeline: Arc<overview::view::DescriptorView>,
 }
 
 type TimelineFlightResult = Result<Arc<[u8]>, problem::ApiProblem>;
@@ -191,6 +196,9 @@ pub struct OverviewConfig {
     pub cursor_max_bytes: usize,
     /// Lifetime of one event cursor and its pinned view.
     pub cursor_ttl: Duration,
+    /// Effective selected sealed-segment limit.
+    pub max_selected_segments: usize,
+    cold_admission: ColdAdmissionConfig,
 }
 
 impl OverviewConfig {
@@ -208,6 +216,8 @@ impl OverviewConfig {
             cursor_max_views: 64,
             cursor_max_bytes: 512 * 1024 * 1024,
             cursor_ttl: Duration::from_mins(5),
+            max_selected_segments: DEFAULT_MAX_SELECTED_SEGMENTS,
+            cold_admission: ColdAdmissionConfig::default(),
         }
     }
 }
@@ -258,6 +268,8 @@ pub struct AppState {
     timeline_flights: Arc<Mutex<HashMap<overview::cache::ResponseKey, Arc<TimelineFlight>>>>,
     cursor_registry: Arc<overview::cursor::CursorRegistry>,
     overview: Arc<Mutex<overview::OverviewIndex>>,
+    overview_loader: overview::loader::OverviewFactLoader,
+    max_selected_segments: usize,
     /// Byte-bounded cache of exact serialized timeline responses.
     pub(crate) response_cache: overview::cache::ResponseCache,
 }
@@ -351,18 +363,6 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
     }
 }
 
-fn record_overview_diagnostics(diagnostics: overview::live::OverviewDiagnostics) {
-    metrics::counter!("kronika_web_overview_durable_hits_total").absolute(diagnostics.durable_hits);
-    metrics::counter!("kronika_web_overview_fallback_hits_total")
-        .absolute(diagnostics.fallback_hits);
-    metrics::counter!("kronika_web_overview_rebuilt_total").absolute(diagnostics.rebuilt);
-    metrics::counter!("kronika_web_overview_promotions_total").absolute(diagnostics.promotions);
-    metrics::counter!("kronika_web_overview_persistence_failures_total")
-        .absolute(diagnostics.persistence_failures);
-    metrics::counter!("kronika_web_overview_sealed_failures_total")
-        .absolute(diagnostics.sealed_failures);
-}
-
 fn default_overview_config() -> OverviewConfig {
     static INSTANCE: AtomicU64 = AtomicU64::new(0);
     let instance = INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -443,7 +443,23 @@ impl AppState {
             cursor_max_views,
             cursor_max_bytes,
             cursor_ttl,
+            max_selected_segments,
+            cold_admission,
         } = config;
+        if max_selected_segments == 0 || max_selected_segments > ABSOLUTE_MAX_SELECTED_SEGMENTS {
+            return Err(StateBuildError::Overview(
+                OverviewBuildError::SelectedSegmentLimit {
+                    configured: max_selected_segments,
+                    maximum: ABSOLUTE_MAX_SELECTED_SEGMENTS,
+                },
+            ));
+        }
+        let selected_segments_gauge = u32::try_from(max_selected_segments).map_err(|_error| {
+            StateBuildError::Overview(OverviewBuildError::SelectedSegmentLimit {
+                configured: max_selected_segments,
+                maximum: ABSOLUTE_MAX_SELECTED_SEGMENTS,
+            })
+        })?;
         let delta = snapshot
             .refresh_incremental_delta()
             .map_err(StateBuildError::Snapshot)?;
@@ -453,9 +469,13 @@ impl AppState {
         let timeline = overview
             .assemble(&snapshot, &delta)
             .map_err(StateBuildError::Overview)?;
+        let overview_loader = overview
+            .fact_loader(cold_admission)
+            .map_err(StateBuildError::Overview)?;
         overview::resilience::record_persist_snapshot(overview.persist_mode());
-        record_overview_diagnostics(overview.diagnostics());
         record_gc_metrics(None);
+        metrics::gauge!("kronika_web_timeline_selected_segments_limit")
+            .set(f64::from(selected_segments_gauge));
         let cursor_registry =
             overview::cursor::CursorRegistry::new(overview::cursor::CursorConfig {
                 max_views: cursor_max_views,
@@ -463,8 +483,10 @@ impl AppState {
                 ttl_secs: cursor_ttl.as_secs(),
             })
             .map_err(StateBuildError::CursorRegistry)?;
+        let snapshot = Arc::new(snapshot);
         let published = PublishedStoreView {
-            snapshot: Arc::new(snapshot),
+            snapshot: Arc::clone(&snapshot),
+            timeline_snapshot: snapshot,
             timeline: Arc::new(timeline),
         };
         Ok(Self {
@@ -476,6 +498,8 @@ impl AppState {
             timeline_flights: Arc::new(Mutex::new(HashMap::new())),
             cursor_registry: Arc::new(cursor_registry),
             overview: Arc::new(Mutex::new(overview)),
+            overview_loader,
+            max_selected_segments,
             response_cache: overview::cache::ResponseCache::new(
                 response_cache_bytes,
                 response_cache_entries,
@@ -531,6 +555,33 @@ impl AppState {
         &self.cursor_registry
     }
 
+    pub(crate) fn overview_request_view(
+        &self,
+    ) -> (Arc<LocalDirSnapshot>, Arc<overview::view::DescriptorView>) {
+        let published = self.published.load();
+        (
+            Arc::clone(&published.timeline_snapshot),
+            Arc::clone(&published.timeline),
+        )
+    }
+
+    pub(crate) fn select_overview(
+        &self,
+        view: Arc<overview::view::DescriptorView>,
+        sources: &[u64],
+        range: kronika_analytics::overview::CoverageSpan,
+    ) -> Result<SelectedSealedPlan, overview::selection::SelectionError> {
+        SelectedSealedPlan::build(view, sources, range, self.max_selected_segments)
+    }
+
+    pub(crate) async fn load_overview_selection(
+        &self,
+        snapshot: Arc<LocalDirSnapshot>,
+        plan: &SelectedSealedPlan,
+    ) -> Result<Arc<overview::view::IndexView>, overview::loader::FactLoadFailure> {
+        self.overview_loader.load_selected(snapshot, plan).await
+    }
+
     /// Reclaims timeline cursor views whose TTL has elapsed.
     ///
     /// The refresh loop calls this independently of store/timeline build
@@ -539,13 +590,14 @@ impl AppState {
         self.cursor_registry.prune(now_secs);
     }
 
-    /// Current snapshot from one coherent publication.
+    /// Current store metadata snapshot.
     #[must_use]
     pub fn snapshot(&self) -> Arc<LocalDirSnapshot> {
         Arc::clone(&self.published.load().snapshot)
     }
 
-    pub(crate) fn overview_view(&self) -> Arc<overview::view::IndexView> {
+    #[cfg(test)]
+    pub(crate) fn overview_view(&self) -> Arc<overview::view::DescriptorView> {
         Arc::clone(&self.published.load().timeline)
     }
 
@@ -585,7 +637,6 @@ impl AppState {
                 return Err(error);
             }
         };
-        let diagnostics = overview.diagnostics();
         let gc = overview.collect_fact_garbage();
         let persist = overview.persist_mode();
         drop(overview);
@@ -594,7 +645,6 @@ impl AppState {
         if gc.is_some() {
             record_gc_metrics(gc);
         }
-        record_overview_diagnostics(diagnostics);
         metrics::gauge!("kronika_web_overview_data_through_us")
             .set(timeline.data_through_us().unwrap_or_default() as f64);
         self.cursor_registry.prune(
@@ -603,8 +653,10 @@ impl AppState {
                 .unwrap_or_default()
                 .as_secs(),
         );
+        let snapshot = Arc::new(snapshot);
         self.published.store(Arc::new(PublishedStoreView {
-            snapshot: Arc::new(snapshot),
+            snapshot: Arc::clone(&snapshot),
+            timeline_snapshot: snapshot,
             timeline: Arc::new(timeline),
         }));
         Ok(())
@@ -612,10 +664,11 @@ impl AppState {
 
     /// Publishes a fresh metadata snapshot with the last usable timeline view.
     pub fn publish_snapshot_with_last_timeline(&self, snapshot: LocalDirSnapshot) {
-        let timeline = self.overview_view();
+        let published = self.published.load_full();
         self.published.store(Arc::new(PublishedStoreView {
             snapshot: Arc::new(snapshot),
-            timeline,
+            timeline_snapshot: Arc::clone(&published.timeline_snapshot),
+            timeline: Arc::clone(&published.timeline),
         }));
     }
 }

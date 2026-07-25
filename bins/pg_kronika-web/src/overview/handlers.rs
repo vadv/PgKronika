@@ -1,9 +1,8 @@
-//! Thin axum handler for `GET /v1/timeline/overview`.
+//! Axum handlers for the three timeline projections.
 //!
-//! The handler validates the request, assembles the atomic index view off the
-//! async runtime, queries the requested range, and serializes a compact event
-//! and health summary. It orchestrates only: counts, notable selection, and
-//! coverage come from `kronika-analytics`.
+//! Each first-page request validates and admits a descriptor plan before
+//! response-level work. Rendering then uses the selected immutable fact view;
+//! counts, notable selection, and coverage remain in `kronika-analytics`.
 
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
@@ -30,6 +29,8 @@ use crate::overview::dto::{
     SignalCountDto, SourceFreshnessDto, SourceLossDto, SqlstateCountDto, TimelineMetaDto,
     category_name, severity_name, sqlstate_text,
 };
+use crate::overview::loader::FactLoadFailure;
+use crate::overview::selection::{SelectedSealedPlan, SelectionError};
 use crate::overview::view::{IndexView, SourceMetadata};
 use crate::params::QueryParams;
 use crate::problem::{ApiProblem, QueryParameter};
@@ -85,19 +86,37 @@ pub(crate) async fn overview(State(state): State<AppState>, RawQuery(raw): RawQu
         Ok(request) => request,
         Err(problem) => return problem.into_response(),
     };
-    let view = state.overview_view();
-    let key = overview_key(&view, request);
-    serve(state, key, move || render_overview(&view, request)).await
+    let (snapshot, view) = state.overview_request_view();
+    let plan = match select_plan(&state, view, &[request.source], request.range) {
+        Ok(plan) => plan,
+        Err(problem) => return problem.into_response(),
+    };
+    let key = overview_key(plan.fact_set_id(), request);
+    serve(
+        state,
+        key,
+        TimelineViewSource::Selected { snapshot, plan },
+        move |loaded| render_overview(loaded, request),
+    )
+    .await
 }
 
-/// Serves a cached body or renders and caches one.
-///
-/// A cache hit returns the retained bytes without spawning a blocking task or
-/// touching the analytic semaphore (§14.2). A miss renders off the async
-/// runtime, caches the serialized body, and returns it.
-async fn serve<R, T>(state: AppState, key: ResponseKey, render: R) -> Response
+enum TimelineViewSource {
+    Selected {
+        snapshot: Arc<kronika_reader::LocalDirSnapshot>,
+        plan: SelectedSealedPlan,
+    },
+    Loaded(Arc<IndexView>),
+}
+
+async fn serve<R, T>(
+    state: AppState,
+    key: ResponseKey,
+    source: TimelineViewSource,
+    render: R,
+) -> Response
 where
-    R: FnOnce() -> Result<T, ApiProblem> + Send + 'static,
+    R: FnOnce(&Arc<IndexView>) -> Result<T, ApiProblem> + Send + 'static,
     T: Serialize + Send + 'static,
 {
     let cache_key = CacheKey::new(key.clone());
@@ -116,29 +135,44 @@ where
             {
                 state.finish_timeline_flight(&key, &flight, Ok(bytes));
             } else {
-                let Ok(permit) = state.try_acquire_analytic() else {
-                    metrics::counter!("kronika_web_timeline_capacity_rejections_total")
-                        .increment(1);
-                    state.finish_timeline_flight(
-                        &key,
-                        &flight,
-                        Err(ApiProblem::analytic_capacity_unavailable()),
-                    );
-                    return match flight.wait().await {
-                        Ok(bytes) => json_bytes_response(bytes),
-                        Err(problem) => problem.into_response(),
-                    };
-                };
                 let worker_state = state.clone();
                 let worker_key = key.clone();
                 let worker_flight = Arc::clone(&flight);
                 tokio::spawn(async move {
+                    let loaded = match source {
+                        TimelineViewSource::Selected { snapshot, plan } => worker_state
+                            .load_overview_selection(snapshot, &plan)
+                            .await
+                            .map_err(fact_load_problem),
+                        TimelineViewSource::Loaded(view) => Ok(view),
+                    };
+                    let loaded = match loaded {
+                        Ok(loaded) => loaded,
+                        Err(problem) => {
+                            worker_state.finish_timeline_flight(
+                                &worker_key,
+                                &worker_flight,
+                                Err(problem),
+                            );
+                            return;
+                        }
+                    };
+                    let Ok(permit) = worker_state.try_acquire_analytic() else {
+                        metrics::counter!("kronika_web_timeline_capacity_rejections_total")
+                            .increment(1);
+                        worker_state.finish_timeline_flight(
+                            &worker_key,
+                            &worker_flight,
+                            Err(ApiProblem::analytic_capacity_unavailable()),
+                        );
+                        return;
+                    };
                     let cache = worker_state.response_cache.clone();
                     let render_cache_key = cache_key;
                     let rendered =
                         tokio::task::spawn_blocking(move || -> Result<Arc<[u8]>, ApiProblem> {
                             let _permit = permit;
-                            let value = render()?;
+                            let value = render(&loaded)?;
                             let bytes: Arc<[u8]> = serde_json::to_vec(&value)
                                 .map_err(|_error| ApiProblem::internal_error())?
                                 .into();
@@ -166,11 +200,55 @@ fn json_bytes_response(bytes: Arc<[u8]>) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
-fn overview_key(view: &IndexView, request: OverviewRequest) -> ResponseKey {
+fn select_plan(
+    state: &AppState,
+    view: Arc<crate::overview::view::DescriptorView>,
+    sources: &[u64],
+    range: CoverageSpan,
+) -> Result<SelectedSealedPlan, ApiProblem> {
+    state
+        .select_overview(view, sources, range)
+        .map_err(|error| match error {
+            SelectionError::LimitExceeded { limit } => {
+                metrics::counter!(
+                    "kronika_web_timeline_query_limit_rejections_total",
+                    "resource" => "selected_segments"
+                )
+                .increment(1);
+                ApiProblem::query_shape_limit_exceeded(
+                    crate::problem::LimitResource::SelectedSegments,
+                    crate::problem::count_u64(limit),
+                    None,
+                )
+            }
+            SelectionError::InvalidLimit | SelectionError::SourcesNotCanonical => {
+                ApiProblem::internal_error()
+            }
+        })
+}
+
+fn fact_load_problem(error: FactLoadFailure) -> ApiProblem {
+    match error {
+        FactLoadFailure::CapacityUnavailable => {
+            metrics::counter!(
+                "kronika_web_overview_cold_work_rejections_total",
+                "reason" => "capacity"
+            )
+            .increment(1);
+            ApiProblem::overview_capacity_unavailable()
+        }
+        FactLoadFailure::Source(_error) => ApiProblem::store_read_failed(),
+        FactLoadFailure::WorkerFailed | FactLoadFailure::IdentityMismatch => {
+            ApiProblem::internal_error()
+        }
+    }
+}
+
+fn overview_key(fact_set_id: [u8; 32], request: OverviewRequest) -> ResponseKey {
     ResponseKey {
         endpoint: Endpoint::Overview,
         response_schema_version: RESPONSE_SCHEMA_VERSION,
-        fact_set_id: view.fact_set_id(),
+        fact_set_id,
         from_us: request.from_us,
         to_us: request.to_us,
         step_us: None,
@@ -259,9 +337,19 @@ pub(crate) async fn health(State(state): State<AppState>, RawQuery(raw): RawQuer
         Ok(request) => request,
         Err(problem) => return problem.into_response(),
     };
-    let view = state.overview_view();
-    let key = health_key(&view, request);
-    serve(state, key, move || render_health(&view, request)).await
+    let (snapshot, view) = state.overview_request_view();
+    let plan = match select_plan(&state, view, &[request.source], request.range) {
+        Ok(plan) => plan,
+        Err(problem) => return problem.into_response(),
+    };
+    let key = health_key(plan.fact_set_id(), request);
+    serve(
+        state,
+        key,
+        TimelineViewSource::Selected { snapshot, plan },
+        move |loaded| render_health(loaded, request),
+    )
+    .await
 }
 
 fn validate_health(params: &QueryParams) -> Result<HealthRequest, ApiProblem> {
@@ -303,11 +391,11 @@ fn parse_optional_u64(
     })
 }
 
-fn health_key(view: &IndexView, request: HealthRequest) -> ResponseKey {
+fn health_key(fact_set_id: [u8; 32], request: HealthRequest) -> ResponseKey {
     ResponseKey {
         endpoint: Endpoint::Health,
         response_schema_version: RESPONSE_SCHEMA_VERSION,
-        fact_set_id: view.fact_set_id(),
+        fact_set_id,
         from_us: request.from_us,
         to_us: request.to_us,
         step_us: Some(request.effective_step_us),
@@ -415,35 +503,45 @@ pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuer
     let source_set_hash = source_set_hash(&request.sources);
     let now_secs = cursor_now_secs();
     state.cursor_registry().prune(now_secs);
-    let (view, start_after) = match request.cursor.as_deref() {
-        Some(token) => {
-            let cursor = match EventsCursor::decode(
-                token,
-                state.cursor_registry(),
-                query_hash,
-                source_set_hash,
-                now_secs,
-            ) {
-                Ok(cursor) => cursor,
-                Err(error) => return cursor_problem(error).into_response(),
-            };
-            let view = match state.cursor_registry().resolve(
-                cursor.lease.fact_set_id,
-                source_set_hash,
-                now_secs,
-            ) {
-                Ok(view) => view,
-                Err(error) => return cursor_problem(error).into_response(),
-            };
-            (view, Some(cursor))
-        }
-        None => (state.overview_view(), None),
+    let (view_source, start_after, fact_set_id) = if let Some(token) = request.cursor.as_deref() {
+        let cursor = match EventsCursor::decode(
+            token,
+            state.cursor_registry(),
+            query_hash,
+            source_set_hash,
+            now_secs,
+        ) {
+            Ok(cursor) => cursor,
+            Err(error) => return cursor_problem(error).into_response(),
+        };
+        let view = match state.cursor_registry().resolve(
+            cursor.lease.fact_set_id,
+            source_set_hash,
+            now_secs,
+        ) {
+            Ok(view) => view,
+            Err(error) => return cursor_problem(error).into_response(),
+        };
+        let fact_set_id = view.fact_set_id();
+        (TimelineViewSource::Loaded(view), Some(cursor), fact_set_id)
+    } else {
+        let (snapshot, view) = state.overview_request_view();
+        let plan = match select_plan(&state, view, &request.sources, request.range) {
+            Ok(plan) => plan,
+            Err(problem) => return problem.into_response(),
+        };
+        let fact_set_id = plan.fact_set_id();
+        (
+            TimelineViewSource::Selected { snapshot, plan },
+            None,
+            fact_set_id,
+        )
     };
-    let key = events_key(&view, &request);
+    let key = events_key(fact_set_id, &request);
     let cursor_state = state.clone();
-    serve(state, key, move || {
+    serve(state, key, view_source, move |view| {
         render_events(
-            &view,
+            view,
             &request,
             start_after,
             query_hash,
@@ -454,11 +552,11 @@ pub(crate) async fn events(State(state): State<AppState>, RawQuery(raw): RawQuer
     .await
 }
 
-fn events_key(view: &IndexView, request: &EventsRequest) -> ResponseKey {
+fn events_key(fact_set_id: [u8; 32], request: &EventsRequest) -> ResponseKey {
     ResponseKey {
         endpoint: Endpoint::Events,
         response_schema_version: RESPONSE_SCHEMA_VERSION,
-        fact_set_id: view.fact_set_id(),
+        fact_set_id,
         from_us: request.from_us,
         to_us: request.to_us,
         step_us: None,

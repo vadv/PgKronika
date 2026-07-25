@@ -7,7 +7,8 @@ and Prometheus endpoint. It opens sealed segments and valid `active.parts`
 frames through `LocalDirSnapshot`, maintains a source-scoped timeline index,
 refreshes the published store view every second, and never connects to
 PostgreSQL. One retained writer folds journal deltas, promotes exactly matched
-sealed segments, and atomically publishes immutable timeline views.
+sealed segments, and atomically publishes immutable descriptor and live
+views. Sealed fact bodies are loaded only for admitted timeline requests.
 
 ## Configuration
 
@@ -33,6 +34,7 @@ sealed segments, and atomically publishes immutable timeline views.
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS` | `64` | Maximum event views pinned for cursor continuation. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_BYTES` | `536870912` | Logical-byte budget for cursor-pinned event views. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_TTL_S` | `300` | Cursor and pinned-view lifetime in seconds. |
+| `KRONIKA_WEB_OVERVIEW_MAX_SELECTED_SEGMENTS` | `1024` | Effective sealed-segment admission limit for one timeline request; accepted range `1..=4096`. |
 
 ```sh
 KRONIKA_WEB_DIR=/var/lib/pg_kronika \
@@ -57,6 +59,7 @@ Timeline resource policy defaults and constraints are:
 | Persistent fact-cache admission | No byte or file ceiling by default | Optional nonzero logical-byte and file-count ceilings |
 | Serialized overview/health response cache | 4,096 entries, 64 MiB logical charge | Both configured budgets are nonzero and fit `usize`. |
 | Cursor-pinned event views | 64 views, 512 MiB logical charge, 300 s TTL | All budgets are nonzero; count and bytes fit `usize`. |
+| Selected sealed segments per timeline request | 1,024 | Configurable from 1 through the absolute v1 ceiling of 4,096 |
 | Timeline query range | — | 31 days |
 | Materialized timeline query | — | 64 MiB cloned-observation charge; 1,048,576 observations/count inputs, 262,144 clipped coverage spans, 65,536 joint keys, 1,024 signal keys |
 | Events page | 100 items | 1,000 items |
@@ -67,8 +70,9 @@ Numeric `KRONIKA_WEB_OVERVIEW_*` policy variables accept unsigned decimal
 integers. Required budgets and grace values must be nonzero; either persistent
 cache ceiling may remain unset. Byte, entry, and view budgets that become
 process sizes must fit the platform's `usize`. The fallback additionally
-rejects values above 744 segment-hours or 268435456 bytes. Invalid values stop
-startup before the listener binds.
+rejects values above 744 segment-hours or 268435456 bytes. The selected-segment
+limit must be in `1..=4096`. Invalid values stop startup before the listener
+binds.
 
 ## Persistent fact-cache operation
 
@@ -137,10 +141,17 @@ Timeline `from`/`to` ranges are half-open and limited to 31 days. Overview and
 health reject missing or repeated `source`; events canonicalizes a repeatable
 source set by sorting and deduplicating it. Timeline health `step` is an integer
 number of microseconds and is raised when necessary to keep the result within
-2,000 points. Events pages default to 100 facts and never exceed 1,000. An
-invalid or query-mismatched event cursor returns `400`. Expired and post-restart
-cursors return `410` with `code=cursor_expired`; an evicted or otherwise absent
-pinned view returns `410` with `code=view_gone`. Registry capacity failure returns
+2,000 points. Before response-cache lookup, response-flight registration,
+analytic admission, or a new cursor pin, each first-page request plans the
+intersecting sealed descriptors from its canonical source set. More than the
+configured effective limit returns `400` with
+`code=query_limit_exceeded` and `params.resource=selected_segments`. Events
+applies one aggregate limit to the deduplicated source union. Live journal data
+is not charged as a sealed segment and remains subject to its separate bounds.
+Events pages default to 100 facts and never exceed 1,000. An invalid or
+query-mismatched event cursor returns `400`. Expired and post-restart cursors
+return `410` with `code=cursor_expired`; an evicted or otherwise absent pinned
+view returns `410` with `code=view_gone`. Registry capacity failure returns
 `503` with `code=cursor_capacity_unavailable` and no `Retry-After`.
 
 Example:
@@ -162,7 +173,8 @@ typed `params`, and an opaque `instance`. It has no human-language `title` or
 server-generated correlation token in `instance` and `X-Request-ID`.
 `WWW-Authenticate`, `Allow`, and `Retry-After` remain present where HTTP
 semantics require them. Unknown sections return `404`, malformed parameters
-return `400`, and enforced input or materialization ceilings return `413`.
+return `400`, and existing input or materialization ceilings return `413`.
+The selected sealed-segment request-shape limit is a `400`.
 See the [OpenAPI contract](openapi.json) and the
 [normative machine API specification](../../docs/superpowers/specs/2026-07-21-i18n-machine-api-contract.md).
 
@@ -178,6 +190,15 @@ See the [OpenAPI contract](openapi.json) and the
   evidence classes, quality flags, a typed payload, supporting evidence, and
   attached loss. Pagination order is exactly `(sort_ts_us, event_id,
   event_instance_id)`.
+- Timeline refresh publishes catalog-derived sealed descriptors and one
+  bounded live generation without decoding sealed section bodies. An admitted
+  request loads only the descriptors selected by its source/range plan. Cold
+  fact work is shared by the full lineage-qualified `FactBuildKey`, survives
+  request cancellation, and enters a global FIFO scheduler with four workers,
+  a 64-entry queue, at most four loads started by one request, and aggregate
+  PGM, decoded-memory, CPU, file-descriptor, read, write, and publication
+  weights. Capacity rejection returns `503` with
+  `code=overview_capacity_unavailable` and `Retry-After: 1`.
 - Event counts use checked arithmetic. Severity and category totals,
   SQLSTATE top/other/missing buckets, and joint top/other buckets independently
   reconcile to retained error occurrences; retained groups and physical
@@ -216,9 +237,9 @@ See the [OpenAPI contract](openapi.json) and the
   `{ "kind": "...", "params": { ... } }` reason schema. Lens ids, enum values,
   formulas, units, and evidence remain stable machine data; incident catalogs
   contain no localized title or question.
-- Only one anomaly, incident, or uncached timeline request runs at a time. Equal
-  timeline misses share one single-flight build; cache hits do not consume
-  the slot. Another distinct heavy request receives `503` with
+- Only one anomaly, incident, or uncached timeline response projection runs at
+  a time. Equal timeline response misses share one response flight; cache hits
+  do not consume the slot. Another distinct heavy request receives `503` with
   `code=analytic_capacity_unavailable` and `Retry-After: 1`; it is not queued.
 
 Store scan warnings and damaged journal regions remain available to the reader
@@ -232,8 +253,9 @@ and affect gaps/completeness. They are never converted to successful rows.
 `kronika_web_overview_rebuilt_total`,
 `kronika_web_overview_promotions_total`,
 `kronika_web_overview_persistence_failures_total`,
-`kronika_web_overview_sealed_failures_total`; these are monotonic counters,
-including work done by the initial view build. View progress uses
+`kronika_web_overview_sealed_failures_total`; these are monotonic counters.
+Fact-load counters advance when admitted requests load selected facts; the
+initial publication is descriptor-only. View progress uses
 `kronika_web_store_view_generation`,
 `kronika_web_overview_view_generation`,
 `kronika_web_overview_data_through_us`, and
@@ -261,8 +283,13 @@ Cursor pressure is visible through
 single-flight activity use
 `kronika_web_timeline_response_cache_{hits,misses,evictions}_total`,
 `kronika_web_timeline_response_cache_{entries,bytes}`, and
-`kronika_web_timeline_singleflight_{leaders,joins}_total`. HTTP request labels
-use fixed matched route templates rather than raw URIs.
+`kronika_web_timeline_singleflight_{leaders,joins}_total`. Selected-segment
+policy uses `kronika_web_timeline_selected_segments_limit` and
+`kronika_web_timeline_query_limit_rejections_total{resource="selected_segments"}`.
+Cold fact-work overload uses
+`kronika_web_overview_cold_work_rejections_total{reason="capacity"}`. These
+labels are fixed; HTTP request labels use matched route templates rather than
+raw URIs.
 
 ## Shutdown and failure behavior
 
