@@ -2070,8 +2070,8 @@ fn merge_physical_count(
 mod tests {
     use kronika_analytics::overview::{
         CountLimits, CounterReduction, ErrorCategory, EventKind, EventPayload, EvidenceQuality,
-        LossReason, MetricFactor, ReductionLimits, SemanticDivergence, SqlState, TimeQuality,
-        classify_series, semantic_divergences,
+        LossReason, MetricFactor, ReductionLimits, ResetFamily, SemanticDivergence, SqlState,
+        TimeQuality, classify_series, semantic_divergences,
     };
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
@@ -3210,13 +3210,93 @@ mod tests {
         assert!(!raw.loss_coverage().factor_coverage().is_empty());
         for kind in [
             EventKind::PgDatabaseDeadlockDelta,
+            EventKind::PgDatabaseRecoveryConflictDelta,
+            EventKind::PgDatabaseChecksumFailureDelta,
+            EventKind::PgDatabaseSessionsAbandonedDelta,
+            EventKind::PgDatabaseSessionsFatalDelta,
+            EventKind::PgDatabaseSessionsKilledDelta,
+            EventKind::PgStatisticsResetObserved,
+            EventKind::PgPostmasterStartChanged,
+            EventKind::PgRecoveryRoleChanged,
+            EventKind::PgTimelineChanged,
             EventKind::PgReplicationSenderStateChanged,
             EventKind::PgReplicationSenderDisappeared,
+            EventKind::PgReplicationSlotStateChanged,
+            EventKind::PgReplicationSlotLost,
+            EventKind::OsCgroupMemoryHighDelta,
+            EventKind::OsCgroupMemoryMaxDelta,
+            EventKind::OsCgroupOomDelta,
+            EventKind::OsCgroupOomKillDelta,
+            EventKind::OsHostOomKillDelta,
+            EventKind::OsFilesystemCapacityObservation,
+            EventKind::OsFilesystemCapacityZeroTransition,
             EventKind::CollectorSourceReadFailure,
         ] {
             assert!(
                 raw.event_facts().iter().any(|fact| fact.kind() == kind),
                 "fixture did not materialize {kind:?}"
+            );
+        }
+        let mut covered_factor_ids = raw
+            .loss_coverage()
+            .factor_coverage()
+            .iter()
+            .map(|coverage| coverage.factor_id)
+            .collect::<Vec<_>>();
+        covered_factor_ids.sort_unstable();
+        assert_eq!(
+            covered_factor_ids,
+            MetricFactor::ALL
+                .into_iter()
+                .map(MetricFactor::id)
+                .collect::<Vec<_>>(),
+            "qualification coverage must enumerate the complete stable factor inventory"
+        );
+        for coverage in raw.loss_coverage().factor_coverage() {
+            let factor = MetricFactor::from_id(coverage.factor_id).expect("known factor");
+            assert_eq!(
+                coverage.applicability,
+                if factor.id().0 >= 900 {
+                    Applicability::Unsupported
+                } else {
+                    Applicability::Applicable
+                },
+                "wrong applicability for {}",
+                factor.wire_code()
+            );
+        }
+
+        let descriptors = raw
+            .counter_samples()
+            .series()
+            .iter()
+            .chain(raw.gauge_samples().series());
+        let mut populated_factor_ids = descriptors
+            .clone()
+            .map(|descriptor| descriptor.factor_id)
+            .collect::<Vec<_>>();
+        populated_factor_ids.sort_unstable();
+        populated_factor_ids.dedup();
+        assert_eq!(
+            populated_factor_ids,
+            MetricFactor::ALL[..28]
+                .iter()
+                .copied()
+                .map(MetricFactor::id)
+                .collect::<Vec<_>>(),
+            "every supported factor needs at least one canonical series"
+        );
+        for descriptor in descriptors {
+            let factor = MetricFactor::from_id(descriptor.factor_id).expect("known factor");
+            assert_eq!(descriptor.source_id, fixture.source_id);
+            assert!(descriptor.entity.is_some(), "{} has no entity", factor.wire_code());
+            let (unit, reset_family) = qualification_metric_contract(factor);
+            assert_eq!(descriptor.unit, unit, "wrong unit for {}", factor.wire_code());
+            assert_eq!(
+                descriptor.reset_family,
+                reset_family,
+                "wrong reset family for {}",
+                factor.wire_code()
             );
         }
 
@@ -3239,6 +3319,56 @@ mod tests {
             recomputed, raw,
             "forced raw recomputation must be byte-semantically stable"
         );
+    }
+
+    fn qualification_metric_contract(
+        factor: MetricFactor,
+    ) -> (MetricUnit, Option<ResetFamily>) {
+        match factor {
+            MetricFactor::PgDatabaseDeadlocks
+            | MetricFactor::PgDatabaseRecoveryConflicts
+            | MetricFactor::PgDatabaseChecksumFailures
+            | MetricFactor::PgDatabaseSessionsAbandoned
+            | MetricFactor::PgDatabaseSessionsFatal
+            | MetricFactor::PgDatabaseSessionsKilled => {
+                (MetricUnit::Count, Some(ResetFamily::PgStatDatabase))
+            }
+            MetricFactor::OsCgroupMemoryHighEvents
+            | MetricFactor::OsCgroupMemoryMaxEvents
+            | MetricFactor::OsCgroupOomEvents
+            | MetricFactor::OsCgroupOomKills => {
+                (MetricUnit::Count, Some(ResetFamily::CgroupBoot))
+            }
+            MetricFactor::OsHostOomKills => {
+                (MetricUnit::Count, Some(ResetFamily::HostBoot))
+            }
+            MetricFactor::PgStatisticsResetAt
+            | MetricFactor::PgPostmasterStartTime
+            | MetricFactor::PgReplicationReplayLag => (MetricUnit::Microseconds, None),
+            MetricFactor::PgDatabaseConnections | MetricFactor::PgDatabaseConnectionLimit => {
+                (MetricUnit::Connections, None)
+            }
+            MetricFactor::PgDatabaseFrozenXidAge => (MetricUnit::Transactions, None),
+            MetricFactor::PgDatabaseMinMxidAge => (MetricUnit::Multixacts, None),
+            MetricFactor::PgRecoveryRole
+            | MetricFactor::PgTimeline
+            | MetricFactor::PgReplicationSenderState
+            | MetricFactor::PgReplicationSlotState
+            | MetricFactor::PgReplicationSenderSnapshotPopulation
+            | MetricFactor::PgReplicationSlotSnapshotPopulation => {
+                (MetricUnit::StateCode, None)
+            }
+            MetricFactor::PgFilesystemTotalBytes
+            | MetricFactor::PgFilesystemAvailableBytes
+            | MetricFactor::OsCgroupMemoryCurrentBytes
+            | MetricFactor::OsCgroupMemoryMaxBytes => (MetricUnit::Bytes, None),
+            MetricFactor::CpuPressureUnsupported
+            | MetricFactor::MemoryPsiUnsupported
+            | MetricFactor::StorageThroughputUnsupported
+            | MetricFactor::BlockedSessionsUnsupported => {
+                panic!("unsupported factors cannot have canonical series")
+            }
+        }
     }
 
     #[test]

@@ -1827,7 +1827,7 @@ mod tests {
         let cold = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold all-family rebuild");
 
         let partitions = fixture.contiguous_partitions();
-        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions.len(), 8);
         for part_bytes in partitions {
             let part_slices: Vec<_> = part_bytes.iter().map(Vec::as_slice).collect();
             let mut builder = live_builder();
