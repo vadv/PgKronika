@@ -21,9 +21,7 @@ use kronika_analytics::overview::SegmentIdentity;
 use kronika_format::ReadAt;
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 
-use super::cache_owner::{
-    SidecarOwner, SidecarOwnerError, open_data_dir, open_file_at,
-};
+use super::cache_owner::{SidecarOwner, SidecarOwnerError, open_data_dir, open_file_at};
 use super::container::{CacheReadError, FactReadStats, HeaderIdentity};
 use super::descriptors::CatalogEntryDescriptor;
 use super::factkey::{FactBuildKey, FactKey, FileKind};
@@ -512,8 +510,7 @@ impl FactStore {
                     });
                 }
 
-                let (facts, pgm_body_read_stats) =
-                    SegmentFacts::extract_with_stats(unit, bounds)?;
+                let (facts, pgm_body_read_stats) = SegmentFacts::extract_with_stats(unit, bounds)?;
                 let (facts, persist_error, fact_write_bytes) =
                     self.admit_publish_or_fallback(&facts, context, bounds)?;
                 Ok(FactLoad {
@@ -719,11 +716,7 @@ impl FactStore {
         if self.gc_config.max_logical_bytes().is_some() || self.gc_config.max_files().is_some() {
             let incoming =
                 u64::try_from(bytes.len()).map_err(|_error| PersistError::QuotaExceeded)?;
-            match super::gc::admit_publication(
-                &directory,
-                self.gc_config,
-                incoming,
-            ) {
+            match super::gc::admit_publication(&directory, self.gc_config, incoming) {
                 Ok(()) => {}
                 Err(GcAdmissionError::Capped) => return Err(PersistError::QuotaExceeded),
                 Err(GcAdmissionError::Incomplete) => return Err(PersistError::TransientIo),
@@ -758,7 +751,10 @@ impl FactStore {
         let directory = open_data_dir(&self.data_dir).map_err(PersistError::from_io)?;
         for _ in 0..NAME_RETRIES {
             let sequence = PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let name = format!(".pgkronika-overview.probe-{}-{sequence}", std::process::id());
+            let name = format!(
+                ".pgkronika-overview.probe-{}-{sequence}",
+                std::process::id()
+            );
             let mut file = match open_file_at(
                 &directory,
                 &name,
@@ -855,7 +851,6 @@ impl FactStore {
         };
         operation(&mut fallback)
     }
-
 }
 
 fn commit_temp(
@@ -1038,9 +1033,7 @@ impl PersistError {
             io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
                 Self::TransientIo
             }
-            io::ErrorKind::InvalidData | io::ErrorKind::NotADirectory => {
-                Self::InvalidSidecarState
-            }
+            io::ErrorKind::InvalidData | io::ErrorKind::NotADirectory => Self::InvalidSidecarState,
             _ => error
                 .raw_os_error()
                 .map(rustix::io::Errno::from_raw_os_error)
@@ -1277,9 +1270,7 @@ mod tests {
         let bytes = lifecycle_pgm(7);
         write_pgm(&directory, &context(), &bytes);
         let facts = built(&bytes);
-        let path = store
-            .publish(&facts, &context(), &LIMIT)
-            .expect("publish");
+        let path = store.publish(&facts, &context(), &LIMIT).expect("publish");
         let mut damaged = std::fs::read(&path).expect("read facts");
         let last = damaged.len() - 1;
         damaged[last] ^= 0xff;
@@ -1345,9 +1336,7 @@ mod tests {
         let bytes = lifecycle_pgm(7);
         write_pgm(&directory, &context(), &bytes);
         let facts = built(&bytes);
-        let path = store
-            .publish(&facts, &context(), &LIMIT)
-            .expect("publish");
+        let path = store.publish(&facts, &context(), &LIMIT).expect("publish");
         std::fs::remove_file(&path).expect("remove fact target");
         let victim = directory.path().join("victim");
         std::fs::write(&victim, b"source authority").expect("write victim");
@@ -1383,10 +1372,7 @@ mod tests {
             .expect("source build remains available");
         assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
         assert_eq!(loaded.persist_error(), Some(PersistError::UnsafePath));
-        assert_eq!(
-            std::fs::read(&outside_pgm).expect("outside PGM"),
-            bytes
-        );
+        assert_eq!(std::fs::read(&outside_pgm).expect("outside PGM"), bytes);
         assert_eq!(store.fallback_stats().inserts, 0);
         assert_eq!(store.fallback_stats().resident_entries, 0);
     }
@@ -1476,9 +1462,7 @@ mod tests {
         let bytes = lifecycle_pgm(7);
         write_pgm(&directory, &context(), &bytes);
         let facts = built(&bytes);
-        let path = store
-            .publish(&facts, &context(), &LIMIT)
-            .expect("publish");
+        let path = store.publish(&facts, &context(), &LIMIT).expect("publish");
         let stale = directory.path().join(".pgkronika-overview.tmp-12-34");
         std::fs::write(&stale, b"torn").expect("write stale temp");
         std::fs::remove_file(&path).expect("remove committed target");
@@ -1570,11 +1554,7 @@ mod tests {
             .expect("same source fallback");
         let other_source_bytes = lifecycle_pgm(8);
         let other_source = store
-            .load_or_build(
-                &unit(&other_source_bytes),
-                &context_for("third"),
-                &LIMIT,
-            )
+            .load_or_build(&unit(&other_source_bytes), &context_for("third"), &LIMIT)
             .expect("other source build");
 
         for loaded in [&first, &other_source] {

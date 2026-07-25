@@ -388,7 +388,8 @@ impl OverviewWriter {
         descriptor: &SegmentDescriptor,
     ) -> Result<DescriptorEntry, SealedFactError> {
         let unit = snapshot.open_sealed_by_descriptor(descriptor)?;
-        let (identity, lineage) = SegmentFacts::provenance(&unit).map_err(SealedFactError::Build)?;
+        let (identity, lineage) =
+            SegmentFacts::provenance(&unit).map_err(SealedFactError::Build)?;
         let fact_key = FactKey::for_identity(&identity, FileKind::SegmentFacts);
         Ok(DescriptorEntry::new(
             *descriptor,
@@ -623,11 +624,8 @@ mod tests {
         let delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
-        let mut index = OverviewIndex::new(
-            dir.path().to_path_buf(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut index = OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         let descriptors = index.assemble(&snapshot, &delta).expect("view");
         let view = load_selected(
             &index,
@@ -649,11 +647,8 @@ mod tests {
         let delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
-        let mut index = OverviewIndex::new(
-            dir.path().to_path_buf(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut index = OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         let descriptors = index.assemble(&snapshot, &delta).expect("view");
         assert_eq!(
             ovf_files(dir.path()),
@@ -791,11 +786,8 @@ mod tests {
     #[test]
     fn gc_runs_only_on_the_interval_boundary() {
         let cache = tempfile::tempdir().expect("cache dir");
-        let mut index = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut index = OverviewIndex::new(cache.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         for _ in 0..(GC_INTERVAL_PASSES - 1) {
             assert!(
                 index.collect_fact_garbage().is_none(),
@@ -816,11 +808,8 @@ mod tests {
         let first_delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
-        let mut index = OverviewIndex::new(
-            dir.path().to_path_buf(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut index = OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         let first = index.assemble(&snapshot, &first_delta).expect("first view");
         let second_delta = snapshot
             .refresh_incremental_delta()
@@ -867,11 +856,8 @@ mod tests {
         let bootstrap = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
-        let mut writer = OverviewIndex::new(
-            dir.path().to_path_buf(),
-            FallbackConfig::default(),
-        )
-        .expect("writer");
+        let mut writer = OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer");
         let first_descriptors = writer
             .assemble(&snapshot, &bootstrap)
             .expect("first live view");

@@ -58,6 +58,7 @@ struct QualificationArtifact {
     generated_unix_ms: u128,
     ci: CiProfile,
     host: HostProfile,
+    storage: StorageProfile,
     fixture: FixtureProfile,
     accounting: Accounting,
     budgets: Budgets,
@@ -83,6 +84,15 @@ struct HostProfile {
     filesystem: String,
     process_cold: bool,
     storage_cold: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageProfile {
+    model: &'static str,
+    active_journal_name: &'static str,
+    pgm_file_name: String,
+    sidecar_file_name: String,
+    same_stem: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,7 +141,7 @@ struct Work {
     fact_reads: u64,
     fact_stored_bytes: u64,
     fact_decoded_bytes: u64,
-    cache_writes: u64,
+    sidecar_writes: u64,
     successful_responses: u64,
 }
 
@@ -188,6 +198,10 @@ fn main() {
     FactStore::new(&restart_root)
         .publish(raw.as_ref(), context.as_ref(), &LIMIT)
         .expect("seed restart-warm fact file");
+    assert!(
+        restart_root.join(context.sidecar_file_name()).is_file(),
+        "restart-warm publication did not create the sibling sidecar"
+    );
 
     let mut modes = Vec::new();
     let derived_counter = std::cell::Cell::new(0_usize);
@@ -203,13 +217,13 @@ fn main() {
         fs::write(data_dir.join(context.pgm_file_name()), pgm.as_ref())
             .expect("write derived-cold PGM");
         let unit = PgmUnit::open(pgm.as_ref()).expect("open cold PGM");
-        let loaded = FactStore::new(data_dir)
+        let loaded = FactStore::new(&data_dir)
             .load_or_build(&unit, context.as_ref(), &LIMIT)
             .expect("cold build and durable publication");
         assert_eq!(
             loaded.origin(),
             FactOrigin::Rebuilt,
-            "an absent derived-cold root must rebuild"
+            "a new derived-cold data directory must rebuild"
         );
         assert_eq!(
             loaded.persist_error(),
@@ -226,11 +240,15 @@ fn main() {
             raw.as_ref(),
             "derived-cold extraction diverged from the admitted fixture"
         );
+        assert!(
+            data_dir.join(context.sidecar_file_name()).is_file(),
+            "derived-cold publication did not create the sibling sidecar"
+        );
         let pgm = loaded.pgm_body_read_stats();
         Work {
             pgm_body_reads: pgm.read_calls,
             pgm_body_bytes: pgm.stored_bytes_read,
-            cache_writes: 1,
+            sidecar_writes: 1,
             successful_responses: 1,
             ..Work::default()
         }
@@ -290,13 +308,8 @@ fn main() {
     }));
     modes.push(measure("live", ITERATIONS, || {
         let unit = PgmUnit::open(pgm.as_ref()).expect("open live part");
-        let live = SegmentFacts::fold_live(
-            &unit,
-            1,
-            b"dense-hour-active-part",
-            &LIMIT,
-        )
-        .expect("fold live part");
+        let live = SegmentFacts::fold_live(&unit, 1, b"dense-hour-active-part", &LIMIT)
+            .expect("fold live part");
         assert_eq!(
             live.counter_samples().samples().len(),
             raw.counter_samples().samples().len(),
@@ -399,6 +412,7 @@ fn main() {
             .as_millis(),
         ci: ci_profile(),
         host: host_profile(),
+        storage: storage_profile(context.as_ref()),
         fixture,
         accounting,
         budgets,
@@ -449,6 +463,19 @@ fn dense_end() -> i64 {
 
 fn context() -> SegmentContext {
     SegmentContext::new("dense-hour.pgm").expect("qualification context")
+}
+
+fn storage_profile(context: &SegmentContext) -> StorageProfile {
+    let pgm_file_name = context.pgm_file_name().to_string_lossy().into_owned();
+    let sidecar_file_name = context.sidecar_file_name().to_string_lossy().into_owned();
+    StorageProfile {
+        model: "owned-data-directory-sibling-sidecars-v1",
+        active_journal_name: "active.parts",
+        same_stem: Path::new(&pgm_file_name).file_stem()
+            == Path::new(&sidecar_file_name).file_stem(),
+        pgm_file_name,
+        sidecar_file_name,
+    }
 }
 
 fn dense_hour_pgm() -> Vec<u8> {
@@ -743,7 +770,10 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
             "partition/seal invariance",
             &["reader all-family contiguous partitions"],
         ),
-        ("cache fallback", &["reader publish fallback suite"]),
+        (
+            "sidecar publication fallback",
+            &["reader publish fallback suite"],
+        ),
         (
             "source damage visible",
             &["reader all-family source CRC suite"],
@@ -779,7 +809,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
             &["reader metric extraction suite"],
         ),
         (
-            "hit bypass and cold admission",
+            "hit bypass and source-build admission",
             &["web overview admission suite"],
         ),
         (

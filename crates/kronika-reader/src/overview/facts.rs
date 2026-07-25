@@ -234,10 +234,7 @@ impl SegmentFacts {
     ///
     /// Returns [`BuildError`] for source failures, unsupported event layouts,
     /// unsafe work bounds, or checked-arithmetic overflow.
-    pub fn extract<R: ReadAt>(
-        unit: &PgmUnit<R>,
-        bounds: &Bounds,
-    ) -> Result<Self, BuildError> {
+    pub fn extract<R: ReadAt>(unit: &PgmUnit<R>, bounds: &Bounds) -> Result<Self, BuildError> {
         Self::extract_with_stats(unit, bounds).map(|(facts, _stats)| facts)
     }
 
@@ -352,12 +349,8 @@ impl SegmentFacts {
         else {
             return Ok(None);
         };
-        let Some(extracted) = rekey_promoted_parts(
-            parts,
-            lineage,
-            dictionary_fingerprints,
-            bounds,
-        )?
+        let Some(extracted) =
+            rekey_promoted_parts(parts, lineage, dictionary_fingerprints, bounds)?
         else {
             return Ok(None);
         };
@@ -854,10 +847,7 @@ fn parts_have_timestamp_fallback(parts: &[&SegmentFacts]) -> bool {
     })
 }
 
-fn promotion_source_matches(
-    identity: HeaderIdentity,
-    parts: &[&SegmentFacts],
-) -> bool {
+fn promotion_source_matches(identity: HeaderIdentity, parts: &[&SegmentFacts]) -> bool {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     for part in parts {
@@ -3112,8 +3102,7 @@ mod tests {
         unit.decode_overview_rows(0)
             .expect("independent section read");
         let before = unit.body_read_stats();
-        let (_facts, local) =
-            SegmentFacts::extract_with_stats(&unit, &LIMIT).expect("extract");
+        let (_facts, local) = SegmentFacts::extract_with_stats(&unit, &LIMIT).expect("extract");
         assert_eq!(local.read_calls, 1);
         assert_eq!(local.stored_bytes_read, unit.catalog().entries[0].len);
         assert_eq!(
@@ -3245,8 +3234,7 @@ mod tests {
             "restart-warm must preserve every canonical block, descriptor, and coverage axis"
         );
 
-        let recomputed =
-            SegmentFacts::extract(&unit, &LIMIT).expect("forced recompute");
+        let recomputed = SegmentFacts::extract(&unit, &LIMIT).expect("forced recompute");
         assert_eq!(
             recomputed, raw,
             "forced raw recomputation must be byte-semantically stable"
@@ -3445,8 +3433,7 @@ mod tests {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
         let derived = SegmentFacts::extract(&unit, &LIMIT).expect("first build");
-        let recomputed =
-            SegmentFacts::extract(&unit, &LIMIT).expect("forced recompute");
+        let recomputed = SegmentFacts::extract(&unit, &LIMIT).expect("forced recompute");
         let divergences = semantic_divergences(&derived, &recomputed, full_range(), LIMITS)
             .expect("bounded comparison");
         assert!(divergences.is_empty());
@@ -3505,9 +3492,7 @@ mod tests {
         assert_eq!(first.lineage(), second.lineage());
         assert_eq!(first.observations(), second.observations());
         let first_result = first.query(full_range(), LIMITS).expect("first query");
-        let second_result = second
-            .query(full_range(), LIMITS)
-            .expect("second query");
+        let second_result = second.query(full_range(), LIMITS).expect("second query");
         assert_eq!(first_result.counts(), second_result.counts());
     }
 

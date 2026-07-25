@@ -1129,8 +1129,7 @@ mod tests {
     fn sealed_lineage_uses_source_and_descriptors() {
         let base = lineage(1).id();
         assert_ne!(base, lineage(2).id());
-        let changed_descriptor =
-            SegmentIdentity::sealed(1, [9; 32], 7, b"type=7 rows=3 crc=abc");
+        let changed_descriptor = SegmentIdentity::sealed(1, [9; 32], 7, b"type=7 rows=3 crc=abc");
         assert_ne!(base, changed_descriptor.id());
     }
 

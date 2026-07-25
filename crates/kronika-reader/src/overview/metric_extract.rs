@@ -461,18 +461,12 @@ pub(super) fn extract_metrics<R: ReadAt>(
             REPLICATION_INSTANCE => {
                 extract_replication_instance(&mut metrics, section, source_id)?;
             }
-            PG_REPLICATION_PHYSICAL => extract_replication_senders(
-                &mut metrics,
-                section,
-                source_id,
-                &snapshot_coverage,
-            )?,
-            type_id if PG_REPLICATION_SLOT_TYPES.contains(&type_id) => extract_replication_slots(
-                &mut metrics,
-                section,
-                source_id,
-                &snapshot_coverage,
-            )?,
+            PG_REPLICATION_PHYSICAL => {
+                extract_replication_senders(&mut metrics, section, source_id, &snapshot_coverage)?
+            }
+            type_id if PG_REPLICATION_SLOT_TYPES.contains(&type_id) => {
+                extract_replication_slots(&mut metrics, section, source_id, &snapshot_coverage)?
+            }
             type_id if PG_STORAGE_MOUNT_TYPES.contains(&type_id) => {
                 extract_storage_mounts(&mut metrics, section, source_id)?;
             }
@@ -484,12 +478,7 @@ pub(super) fn extract_metrics<R: ReadAt>(
         }
     }
     extract_reset_metadata(&mut metrics, &decoded, source_id)?;
-    extract_snapshot_boundaries(
-        &mut metrics,
-        &snapshot_coverage,
-        source_id,
-        &reset_timeline,
-    )?;
+    extract_snapshot_boundaries(&mut metrics, &snapshot_coverage, source_id, &reset_timeline)?;
     let event_facts = collector_event_facts(&snapshot_coverage, source_id, bounds)?;
 
     if !reset_timeline.has_pg_context() {

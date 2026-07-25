@@ -14,11 +14,10 @@ serve HTTP, or define response redaction.
 
 Observation identities distinguish two cases:
 
-- a sealed or externally proven locator produces a rebuild-stable
-  content-derived lineage from source scope, naming contract, segment locator,
-  and the first catalog descriptor;
-- a live view without a proven future locator uses a separate discriminator
-  and reports `IdentityQuality::Approximate`.
+- a sealed PGM produces rebuild-stable content-derived lineage from its
+  numeric source ID, exact source descriptor, and first catalog descriptor;
+- a live view uses its journal generation and first-part descriptor and reports
+  `IdentityQuality::Approximate` until a sealed handoff is proven.
 
 The catalog ordinal is segment-global. Counter intervals and state changes are
 derived facts, not retained event observations. Event payloads preserve the

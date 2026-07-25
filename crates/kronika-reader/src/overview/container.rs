@@ -725,10 +725,7 @@ impl<R: ReadAt> FactFileReader<R> {
     }
 }
 
-fn validate_api_inputs(
-    identity: &HeaderIdentity,
-    bounds: &Bounds,
-) -> Result<(), CacheReadError> {
+fn validate_api_inputs(identity: &HeaderIdentity, bounds: &Bounds) -> Result<(), CacheReadError> {
     if !bounds.is_within_absolute_limits() {
         return Err(CacheReadError::Oversized);
     }
@@ -1795,8 +1792,7 @@ mod tests {
         bytes[optional + 44..optional + 48].copy_from_slice(&crc32c(&[]).to_le_bytes());
         let new_count = u32::try_from(old_count + 1).expect("directory count fits u32");
         bytes[168..172].copy_from_slice(&new_count.to_le_bytes());
-        bytes[176..184]
-            .copy_from_slice(&(old_file_len + DIRECTORY_ENTRY_LEN as u64).to_le_bytes());
+        bytes[176..184].copy_from_slice(&(old_file_len + DIRECTORY_ENTRY_LEN as u64).to_le_bytes());
         reseal_directory(bytes);
     }
 

@@ -53,8 +53,7 @@ pub use overview::{
     PersistenceProbeOutcome, ResetMarker, ResetMarkersBlock, ResolvedPattern, SealOutcome,
     SegmentContext, SegmentContextError, SegmentFacts, SourceDescriptor, SourceError,
     SourceManifestBlock, StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats,
-    dictionary_context_id, lineage_from_catalog, reconcile_seal, resolve_targeted,
-    section_body_id,
+    dictionary_context_id, lineage_from_catalog, reconcile_seal, resolve_targeted, section_body_id,
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,

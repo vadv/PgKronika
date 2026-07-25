@@ -140,7 +140,6 @@ impl DescriptorEntry {
     pub(crate) const fn cold_weight(&self) -> ColdWorkWeight {
         self.cold_weight
     }
-
 }
 
 /// Descriptor-derived source identity and freshness without a fact body.
@@ -186,7 +185,6 @@ impl DescriptorSource {
     pub(crate) const fn data_through_us(self) -> Option<i64> {
         self.data_through_us
     }
-
 }
 
 /// One bounded opportunity to re-key the immediately preceding live view.

@@ -1,8 +1,8 @@
 @timeline
 Feature: Source-scoped timeline facts stay coherent across supported PostgreSQL versions
   A fixed PostgreSQL log fixture and the collected database metrics must produce
-  one reconciled publication through collection, sealed storage, canonical fact
-  extraction, factor coverage, and the HTTP timeline.
+  one reconciled publication through collection, sealed storage, a same-stem
+  sibling OVF, canonical fact extraction, factor coverage, and the HTTP timeline.
 
   @pg15 @serial
   Scenario: PostgreSQL 15 publishes one reconciled source-scoped timeline

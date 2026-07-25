@@ -1,43 +1,55 @@
-# PgKronika — overview-index и timeline API
+# PgKronika — индекс обзора и API временной шкалы
 
-Версия: 0.4
-Дата: 2026-07-24
-Статус: целевой контракт parity v1 с таблицей текущей реализации
+Версия: 0.5
+Дата: 2026-07-25
+Статус: реализованный контракт `parity-v1`, ожидающий итоговой проверки
 
 ## 1. Цель и статус решений
 
-PgKronika должна быстро строить событийный обзор и health-line для произвольного временного диапазона. Повторный запрос, запрос после перезапуска процесса и многодневный диапазон не должны заново декодировать тела PGM-сегментов, если для них существует валидный fact index. Свежие данные из `active.parts` должны появляться с задержкой не больше нескольких refresh-циклов.
+PgKronika должна быстро строить обзор событий и линию состояния для
+произвольного временного диапазона. Повторный запрос, запрос после перезапуска
+процесса и многодневный диапазон не должны заново декодировать тела
+PGM-сегментов, если рядом с ними находятся допустимые файлы фактов. Свежие
+данные из `active.parts` должны появляться с задержкой не больше нескольких
+циклов обновления.
 
-Parity v1 включает reader-owned persistent on-disk fact index. In-memory cache без дискового слоя может быть промежуточным этапом разработки, но не считается parity-релизом.
+`Parity-v1` включает постоянный индекс фактов на диске, которым управляет
+считыватель. Хранение только в памяти может быть промежуточным этапом
+разработки, но не считается выпуском `parity-v1`.
 
-PGM остаётся единственным источником истины. Writer, формат PGM и протокол seal не меняются. Индекс принадлежит reader-слою, хранит formula-neutral facts и удаляется без потери исходных данных.
+PGM остаётся единственным источником истины. Средство записи, формат PGM и
+протокол запечатывания не меняются. Индекс принадлежит слою считывания, хранит
+факты, не зависящие от формул представления, и может быть удалён без потери
+исходных данных.
 
-Документ разделяет два слоя. Нормативные разделы задают целевой контракт parity v1. Пометки «текущая реализация» и таблицы статуса фиксируют фактически доступный data path после M0–M4; они не превращают открытые пункты M5/M6 или незаполненные canonical blocks в реализованное поведение. Проверяемое соответствие target contract закрывается только критериями §20.
+Нормативные разделы задают контракт `parity-v1`. Таблицы состояния фиксируют
+поведение, реализованное в PR #114. Окончательное соответствие подтверждается
+только критериями §20 на одном точном коммите и в одной попытке CI.
 
 Числовые health-кривые и продуктовые пороги требуют отдельной калибровки. Эта спецификация фиксирует их входы, алгебру, coverage, версионирование и ограничения, но не выдаёт непроверенные пороги за доказанную модель здоровья.
 
-Нормативные слова «обязан», «нельзя» и «допускается» задают контракт v1. Псевдокод описывает wire и storage semantics, а не Rust ABI.
+Нормативные слова «обязан», «нельзя» и «допускается» задают контракт v1.
+Псевдокод описывает семантику протокола и хранения, а не ABI Rust.
 
 ## 2. Определения
 
 | Термин | Значение |
 | --- | --- |
-| PGM | Иммутабельный sealed-сегмент PgKronika, источник истины для закрытого диапазона. |
-| Active part | Завершённый CRC-валидный frame в `active.parts`. Незавершённый tail не считается частью. |
-| Segment descriptor | Content-bound identity PGM, вычисленная из его catalog/tail/length и source scope. |
-| Segment facts | Целевой formula-neutral индекс одного sealed PGM: retained observations, canonical facts, timestamped metric samples, reset/state/gap/coverage и provenance. Текущая наполненность указана в §9.1. |
-| Live builder | Единственный mutable lossless builder, сворачивающий завершённые active parts ровно один раз. |
-| Live view | Иммутабельный снимок live facts с journal generation и folded watermark. |
-| Index view | Атомарный снимок ordered sealed descriptors и одной точной live generation. Все части одного запроса читаются из одного view. |
-| EventObservation | Сохранённое PGM-наблюдение в форме источника: individual row, grouped row или gap. |
-| EventFact | Canonical policy-neutral нормализованный факт, выведенный из одного или нескольких observations/samples с явной provenance. Не равен одноимённому текущему web DTO, описанному в §7.4. |
-| NotablePolicy | Версионированная чистая проекция, которая классифицирует, выбирает и ранжирует входные observations/facts для `/events` и preview; результат не записывается в canonical blocks. |
-| IncidentDiagnosis | Отдельный корреляционный вывод о возможной причине с evidence и confidence. Не является observation или fact и в текущей реализации отсутствует. |
-| FactKey | Content-addressed identity, связывающая source descriptor и version axes; определена в §10.1. |
-| FactBuildKey | Полная immutable identity одного build: `(FactKey, SegmentLineageId)`. Она квалифицирует placement, owner lock, fallback и будущий fact-build single-flight. |
+| PGM | Неизменяемый запечатанный сегмент PgKronika, источник истины для закрытого диапазона. |
+| Активная часть | Завершённый кадр с допустимой CRC в `active.parts`. Незавершённый хвост частью не считается. |
+| Дескриптор сегмента | Идентификатор содержимого PGM, вычисленный из его каталога, хвоста и длины. |
+| Факты сегмента | Канонический индекс одного запечатанного PGM: сохранённые наблюдения и факты, отсчёты метрик с временными метками, сбросы, состояния, пропуски, покрытие и происхождение. |
+| Построитель активных данных | Единственный изменяемый построитель без потерь, который сворачивает каждую завершённую активную часть ровно один раз. |
+| Представление активных данных | Неизменяемый снимок активных фактов с поколением журнала и обработанной позицией. |
+| Представление индекса | Атомарный снимок упорядоченных дескрипторов запечатанных сегментов и одного точного поколения активных данных. Все части запроса читаются из одного снимка. |
+| `EventObservation` | Сохранённое PGM-наблюдение в форме источника: отдельная строка, сгруппированная строка или пропуск. |
+| `EventFact` | Канонический нормализованный факт, не зависящий от политики представления и выведенный из одного или нескольких наблюдений или отсчётов с явным происхождением. Не равен одноимённой текущей структуре веб-API из §7.4. |
+| `NotablePolicy` | Версионированное чистое преобразование, которое классифицирует, выбирает и упорядочивает наблюдения и факты для `/events` и краткого списка; результат не записывается в канонические блоки. |
+| `IncidentDiagnosis` | Отдельный корреляционный вывод о возможной причине с подтверждениями и оценкой уверенности. Не является наблюдением или фактом и в текущей реализации отсутствует. |
+| `FactKey` | Идентификатор фактов, связывающий числовой идентификатор источника, точный дескриптор содержимого и версии контрактов; определён в §10.1. |
+| `FactBuildKey` | Полный неизменяемый идентификатор одной задачи построения: `(FactKey, SegmentLineageId)`. Он используется для допуска, координации одной задачи, резервного хранения в памяти и проверки; путь файла от него не зависит. |
 | Retained exactness | Точность относительно строк и counts, которые фактически дошли до PGM. Она не означает полноту исходного PostgreSQL log. |
-| Projection | Health, notable, digest, downsample или HTTP-представление, вычисленное из facts текущей policy version. |
-| Source scope | Identity набора PGM, вычисленная из обязательного explicit `store_namespace` и `pgm_source_id`; она отделяет одинаковые source IDs в разных stores. |
+| Проекция | Состояние, краткий список, сводка, прореживание или HTTP-представление, вычисленное из фактов для текущей версии правил. |
 
 ## 3. Продуктовый scope и parity contract
 
@@ -46,22 +58,34 @@ PGM остаётся единственным источником истины.
 - `GET /v1/timeline/overview` для компактной событийной и health-сводки диапазона.
 - `GET /v1/timeline/health` для health-line с честным per-point coverage.
 - `GET /v1/timeline/events` для стабильной пагинации notable observations/facts.
-- Reader-owned per-segment fact files в отдельном cache directory.
-- Инкрементальный lossless live builder для завершённых active parts.
-- Raw PGM fallback и ленивый rebuild отсутствующего, несовместимого или повреждённого cache.
-- Bounded memory caches для fact blocks, projections и exact responses.
-- Memory-only fallback при невозможности писать cache directory.
-- Bounded, cancellation-safe cold builds и per-key single-flight.
-- Quota, GC, metrics, corruption tests и restart benchmarks.
+- Соседний файл фактов `N.ovf` для каждого запечатанного `N.pgm` в одном
+  каталоге `KRONIKA_WEB_DIR`, который целиком принадлежит PgKronika.
+- Инкрементальный построитель активных данных без потерь для завершённых частей.
+- Прямое чтение PGM и ленивое перестроение отсутствующего, несовместимого,
+  повреждённого или не соответствующего источнику OVF.
+- Ограниченное хранение в памяти декодированных фактов, проекций и точных
+  ответов.
+- Ограниченное резервное хранение в памяти, если публикация OVF невозможна.
+- Ограниченные, безопасные при отмене задачи построения и координация одной
+  задачи по каждому `FactBuildKey`.
+- Квоты, сборка мусора, метрики, проверки повреждений и измерения после
+  перезапуска.
 
 ### 3.2 Наблюдаемый parity contract
 
-1. Повторный identical sealed query в одном процессе не читает тела PGM и не повторяет projection work при exact response hit.
-2. После process restart валидные fact files обслуживают sealed interior без PGM body reads и section decode.
-3. Новый range, step или фильтр поверх уже существующих facts не требует PGM decode, если сохранённых dimensions достаточно.
-4. Многодневный запрос читает только пересекающиеся компактные blocks с bounded parallelism.
-5. Завершённый active frame становится виден не позже установленного live freshness gate; pending/torn tail отмечается отдельно.
-6. Seal, разбиение на parts/segments и порядок merge не меняют retained facts, coverage или результат одной policy version.
+1. Повторный одинаковый запрос к запечатанным данным в одном процессе не читает
+   тела PGM и не повторяет вычисление представления, если точный ответ уже есть
+   в памяти.
+2. После перезапуска допустимый соседний OVF обслуживает внутреннюю часть
+   запечатанного диапазона без чтения тел PGM и декодирования секций.
+3. Новый диапазон, шаг или фильтр поверх уже существующих фактов не требует
+   декодирования PGM, если сохранённых измерений достаточно.
+4. Многодневный запрос читает только пересекающиеся компактные блоки с
+   ограниченным параллелизмом.
+5. Завершённый кадр активных данных становится виден не позже установленного
+   предела свежести; ожидающий или оборванный хвост отмечается отдельно.
+6. Запечатывание, разбиение на части и сегменты и порядок объединения не меняют
+   сохранённые факты, покрытие и результат одной версии правил.
 7. Ни один пропуск required data не превращается в `score=1.0`.
 8. Numeric health принимается по зафиксированным oracle fixtures, coverage и отсутствию false-green; latency и размер проверяются на versioned host/filesystem profile без неподтверждённых сравнительных claims.
 
@@ -70,19 +94,24 @@ PGM остаётся единственным источником истины.
 - Новые collectors и новые PGM sections не требуются.
 - Текущий stderr source остаётся bounded и grouped; overview не обещает восстановить отброшенные строки.
 - Историческая причина incident не выводится из одного token/signal/category.
-- Cache не становится архивом и не продлевает retention PGM.
+- OVF не становится архивом и не продлевает срок хранения PGM.
 - Charts отложены владельцем: chart extraction, chart-specific blocks, endpoint и render contract не входят в parity v1. Их стоимость не измерена и не оценивается подстановкой синтетических размеров.
 
 ## 4. Инварианты и честность данных
 
-### 4.1 Источник истины и disposable cache
+### 4.1 Источник истины и производные файлы
 
 1. PGM и valid completed active parts — единственные источники фактов.
-2. Fact file versioned и disposable. Missing, incompatible, corrupt, oversized или wrong-source file игнорируется и перестраивается из PGM.
-3. In-place migration fact files запрещена. Новая несовместимая версия получает новый key/namespace.
-4. Cache read/write/GC failure не превращает корректный вычисленный ответ в ошибку.
-5. Source PGM failure не маскируется как cache miss. Он становится source gap или typed source error.
-6. Удаление всех derived files влияет только на latency первого чтения.
+2. Файл фактов версионируется и является производным. Отсутствующий,
+   несовместимый, повреждённый, слишком большой или не соответствующий PGM
+   файл игнорируется и перестраивается из PGM.
+3. Изменять несовместимый файл фактов на месте нельзя. Новые факты атомарно
+   заменяют тот же соседний `N.ovf`.
+4. Ошибка чтения, записи или сборки мусора не превращает корректно вычисленный
+   ответ в ошибку.
+5. Ошибка исходного PGM не маскируется как отсутствие OVF. Она становится
+   пропуском источника или типизированной ошибкой источника.
+6. Удаление всех производных OVF влияет только на задержку первого чтения.
 
 ### 4.2 Три уровня exactness
 
@@ -155,7 +184,10 @@ metric/state rows ──> samples/reset/state ──> EventFact when applicable
                        overview / health / events response
 ```
 
-В текущем data path верхняя ветвь останавливается на `EventObservation`: canonical `EventFact` block ещё пуст. Metric/state rows пока остаются manifest-only и не материализуются в samples/reset/state. Эти пробелы перечислены в §9.1, §20 и последовательности перед M5 в §21; diagram выше задаёт target flow, а не утверждает его полную реализацию.
+Текущая реализация проходит весь показанный путь для поддерживаемого реестра:
+создаёт `EventObservation`, канонические `EventFact`, отсчёты счётчиков и
+измерений, маркеры сбросов, состояния сущностей и покрытие. Неподдерживаемая
+раскладка остаётся явной ошибкой или пропуском, а не предполагаемым нулём.
 
 ### 5.1 Refresh delta
 
@@ -189,19 +221,22 @@ RefreshDelta {
 
 1. Захватывает один `Arc<IndexView>`.
 2. Валидирует `[from_us,to_us)`, limits и выбранные sources.
-3. Строит ordered plan sealed descriptors, одной live generation и boundary halo.
-4. Проверяет exact response cache.
-5. Загружает нужные fact blocks из memory/disk; miss запускает bounded single-flight build.
+3. Строит упорядоченный план дескрипторов запечатанных сегментов, одного
+   поколения активных данных и граничных соседних отсчётов.
+4. Проверяет хранилище точных ответов в памяти.
+5. Загружает нужные блоки фактов из памяти или соседних OVF; при отсутствии
+   запускает ограниченную общую задачу построения.
 6. Обрезает observations/samples по точному диапазону и применяет reducer semantics §6.
 7. Применяет текущие health/notable policies.
 8. Формирует coverage/loss и response metadata из того же view.
-9. Кеширует projection/response только под полным `FactSetId`.
+9. Сохраняет проекцию или ответ в памяти только под полным `FactSetId`.
 
 Запрос никогда не смешивает новый sealed set со старым live view.
 
 ### 5.3 Multi-segment merge
 
-- Segment selection использует source snapshot как authoritative range catalog; cache directory не сканируется на каждый request.
+- Выбор сегментов использует снимок источника как авторитетный каталог
+  диапазонов; каталог данных не сканируется при каждом запросе.
 - Facts merge-ятся в deterministic range/source/provenance order.
 - Additive counts складываются checked.
 - Coverage merge-ится как union half-open intervals, а не как сумма ratios.
@@ -322,7 +357,7 @@ EventObservation {
   observation_id: [u8; 32],
   identity_quality: SourceExact | ContentDerived | Approximate,
 
-  source_scope_id: [u8; 32],
+  source_id: u64,
   source_type_id: u32,
   provenance: ObservationProvenance,
 
@@ -345,7 +380,6 @@ ObservationTime {
 }
 
 ObservationProvenance {
-  segment_locator: Option<SegmentLocator>,
   section_body_id: [u8; 32],
   catalog_entry_ordinal: u32,
   row_ordinal: u32,
@@ -365,9 +399,8 @@ Writer при seal копирует section bodies verbatim и сохраняе�
 ```text
 segment_lineage_id = SHA-256(
   "pgk-overview-lineage-v1" ||
-  source_scope_id ||
-  naming_contract_id ||
-  segment_locator ||
+  source_id ||
+  source_descriptor ||
   first_catalog_entry_type ||
   first_catalog_entry_descriptor_len_le ||
   first_catalog_entry_content_descriptor
@@ -384,14 +417,24 @@ observation_id = SHA-256(
 )
 ```
 
-`first_catalog_entry_content_descriptor` строится из offset-independent catalog fields (`type/schema/flags/body_len/rows/body_crc32c`), поэтому для lineage не требуется читать нерелевантное body. `section_body_id` хеширует exact relevant section body вместе с `type_id` и длиной. `catalog_entry_ordinal` считается по всему segment catalog и вместе с `row_ordinal` различает повторения одинакового body внутри lineage. Ordinals остаются теми же после normal seal.
+`first_catalog_entry_content_descriptor` строится из полей каталога, не
+зависящих от смещения: `type`, `schema`, `flags`, `body_len`, `rows` и
+`body_crc32c`. Поэтому для вычисления происхождения не нужно читать
+не относящиеся к нему тела. `section_body_id` хеширует точное тело нужной
+секции вместе с `type_id` и длиной. `catalog_entry_ordinal` считается по всему
+каталогу сегмента и вместе с `row_ordinal` различает повторения одинакового
+тела внутри одного происхождения. Порядковые номера сохраняются после обычного
+запечатывания.
 
 Гарантия ограничена текущим source contract:
 
-- ID стабилен при normal active→sealed handoff и повторном derived rebuild;
+- идентификатор стабилен при обычном переходе от активных данных к
+  запечатанным и при повторном построении производных фактов;
 - policy/formula version в ID не входит;
 - repack/resegmentation может изменить lineage;
-- byte-identical source bodies под разными proven locators имеют разные lineage и observation IDs;
+- числовой `source_id`, дескриптор PGM и первый дескриптор записи каталога
+  определяют происхождение без пути, имени файла или отдельного идентификатора
+  хранилища;
 - когда source не содержит file offset/session identity, API возвращает `identity_quality=ContentDerived`, а не обещает source-level identity.
 
 Target logical dedup, например compatibility error row и lifecycle row одного crash, может выполнять `NotablePolicy` только по доказанной relation. Он не меняет canonical observation IDs и не складывает независимые counts. Текущий policy классифицирует observations по одной записи и такой relation не заявляет.
@@ -413,9 +456,17 @@ EventFact {
 }
 ```
 
-EventFact остаётся policy-neutral: он может утверждать `pg.lifecycle.child_signal_termination` или `os.cgroup.oom_kill_delta`, но не `postgres_was_killed_by_oom` без отдельного diagnosis.
+`EventFact` остаётся независимым от политики представления: он может утверждать
+`pg.lifecycle.child_signal_termination` или `os.cgroup.oom_kill_delta`, но не
+`postgres_was_killed_by_oom` без отдельной диагностики.
 
-Текущая реализация не материализует этот тип и оставляет `EVENT_FACTS` canonical-empty. Тип `EventFact` в `pg_kronika-web` — стабильный redacted DTO одной выбранной `EventObservation`: у него отдельные semantic `event_id` и physical `event_instance_id`, а `supporting_evidence` содержит ровно эту observation. Совпадение имени не делает DTO canonical fact. После заполнения `EVENT_FACTS` presenter обязан либо сохранить совместимый wire contract, либо повысить `response_schema_version`.
+Текущая реализация материализует и проверяет `EVENT_FACTS`. Веб-API сохраняет
+стабильную внешнюю структуру `EventFact`: для наблюдений она содержит
+семантический `event_id`, физический `event_instance_id` и точное
+подтверждающее наблюдение; для канонических фактов метрик и состояний она
+использует `fact_id`, сущность, интервал и сохранённые идентификаторы
+подтверждений. Изменение внешней формы требует повышения
+`response_schema_version`.
 
 ### 7.5 Поддерживаемая taxonomy v1
 
@@ -474,24 +525,42 @@ PSI, CPU, memory ratio, cgroup pids, disk throughput, blocked count и wraparoun
 
 Перечень §7.5 — target taxonomy. Фактически подтверждённое преобразование текущего PGM приведено ниже; отсутствующий mapping нельзя считать реализованным только потому, что machine code перечислен в taxonomy.
 
-### 7.6 Проверенный current source mapping
+### 7.6 Проверенное соответствие источников
 
-Для всех восьми поддерживаемых log sections `observation_id` выводится из `SegmentLineageId`, `source_type_id`, section body identity, catalog/row ordinal и dictionary context. Normal sealed lineage включает explicit source scope и locator/naming contract; live identity имеет `Approximate` quality до доказанного handoff. Эта identity не заменяет source-level occurrence UUID, которого PGM не хранит.
+Для всех восьми поддерживаемых секций журнала `observation_id` выводится из
+`SegmentLineageId`, `source_type_id`, идентификатора тела секции, порядковых
+номеров записи каталога и строки, а также контекста словаря. Происхождение
+запечатанного сегмента включает числовой `source_id` и точный дескриптор PGM и
+не зависит от пути. Идентификатор активных данных имеет качество `Approximate`
+до доказанного перехода.
 
-| PGM source / retained row | Текущая materialization | Identity, units и reset | Coverage/loss | Открытый target mapping |
-| --- | --- | --- | --- | --- |
-| `1_022_001 pg_log_errors`, grouped row с `count > 0` | `EventObservation::GroupedCount(ErrorGroup)`, `occurrence_count=count`, evidence `Heuristic` | Общая provenance identity; единица count — retained occurrences; reset не применим | Dictionary truncation/drop отмечается как loss; timestamp может стать `CollectionFallback`; source completeness из отсутствия gap не выводится | Canonical `EventFact` отсутствует |
-| `1_024_001 pg_log_checkpoints`, одна retained row | Individual `CheckpointStarted`, `CheckpointCompleted` или `CheckpointTooFrequent`, evidence `Parsed` | Общая provenance identity; `ms`, `kB` и counts остаются полями typed payload; counter/reset family не определены | Dictionary loss и timestamp fallback сохраняются | Нет metric sample/reset mapping; canonical `EventFact` отсутствует |
-| `1_025_001 pg_log_autovacuum`, одна retained row | Individual `AutovacuumReported` или `AutoanalyzeReported`, evidence `Parsed` | Общая provenance identity; source units остаются в typed payload; stable entity/reset contract не определён | Dictionary loss и timestamp fallback сохраняются | Нет sample/entity-state mapping; canonical `EventFact` отсутствует |
-| `1_026_001 pg_log_slow_queries`, grouped row с `count > 0` | `EventObservation::GroupedCount(SlowQueryGroup)`, время относится к max-duration sample, evidence `Parsed` | Общая provenance identity; duration — `ms`, count — retained occurrences; reset не применим | Dictionary loss и timestamp fallback сохраняются | Canonical `EventFact` отсутствует |
-| `1_027_001 pg_log_lock_waits`, одна retained row | Individual `LockWaitReported` или `LockAcquiredAfterWait`, evidence `Parsed` | Общая provenance identity; duration — `ms`; stable lock entity/reset contract не определён | Dictionary loss и timestamp fallback сохраняются | Нет state/counter mapping; canonical `EventFact` отсутствует |
-| `1_028_001 pg_log_lifecycle`, одна retained row | Individual child signal/crash, shutdown или ready observation, evidence `Parsed` | Общая provenance identity; PID/signal — retained payload, не causal identity; reset не применим | Dictionary loss и timestamp fallback сохраняются | Canonical `EventFact` и `IncidentDiagnosis` отсутствуют |
-| `1_029_001 pg_log_gap`, одна retained row | `EventObservation::Gap(LogGap)` с interval `[ts, ts+1)`, evidence `DerivedExact` | Общая provenance identity; skipped bytes и dropped-line counters сохраняют исходные единицы; reset не применим | Known gap, loss reasons и доказанный lower bound выводятся из retained gap row | Дополнительный fact не требуется; factor applicability для других source families остаётся открытой |
-| `1_030_001 pg_log_temp_files`, одна retained row | Individual `TempFileReported`, evidence `Parsed` | Общая provenance identity; size — bytes; entity/reset contract не определён | Dictionary loss и timestamp fallback сохраняются | Нет gauge/counter mapping; canonical `EventFact` отсутствует |
-| Другие catalog entries с semantics не `EventStream` | Event/metric facts не создаются; descriptor остаётся в `SOURCE_MANIFEST`. Targeted dictionary bodies могут читаться только для разрешения ссылок уже выбранных observations | Units, reset family и entity identity для overview не определены | Presence в manifest не доказывает factor coverage | Explicit unsupported mapping; не zero и не sample/state |
-| Новый registered `EventStream` вне восьми строк выше | Build завершается `UnsupportedLayout` | Identity/facts не создаются | Ошибка влияет на source result/coverage, а не маскируется cache miss | Сначала требуется явный bounded mapping и version bump |
+| Секция PGM | Канонический результат | Единицы, происхождение и потери |
+| --- | --- | --- |
+| `1_022_001 pg_log_errors` | Сгруппированное `EventObservation::ErrorGroup` и соответствующий `EventFact`; `occurrence_count` равен сохранённому `count` | Число сохранённых появлений; усечение словаря и потеря групп отмечаются явно |
+| `1_024_001 pg_log_checkpoints` | Отдельное наблюдение и факт начала, завершения или слишком частой контрольной точки | Миллисекунды, KiB и счётчики остаются типизированными полями; потери словаря и качество времени сохраняются |
+| `1_025_001 pg_log_autovacuum` | Отдельное наблюдение и факт autovacuum или autoanalyze | Единицы исходных полей сохраняются; несуществующая сущность или сброс не придумываются |
+| `1_026_001 pg_log_slow_queries` | Сгруппированное наблюдение и факт медленного запроса | Длительность в миллисекундах, число сохранённых появлений и время представительного запроса |
+| `1_027_001 pg_log_lock_waits` | Отдельное наблюдение и факт ожидания или получения блокировки | Длительность в миллисекундах; неподтверждённое постоянство сущности не предполагается |
+| `1_028_001 pg_log_lifecycle` | Отдельное наблюдение и факт сигнала дочернему процессу, сбоя, завершения или готовности | PID и сигнал — полезная нагрузка, а не доказательство причины |
+| `1_029_001 pg_log_gap` | `EventObservation::Gap` и явное покрытие с потерями | Сохраняются пропущенные байты, число отброшенных строк и доказанный нижний предел |
+| `1_030_001 pg_log_temp_files` | Отдельное наблюдение и факт временного файла | Размер в байтах; сущность или сброс без доказательства не создаются |
 
-Таким образом, текущий source→retained row→observation path проверяем, но source→metric sample/state и source→canonical `EventFact` остаются открытыми. Для них нельзя угадывать units, reset family, entity identity, applicability или loss по имени section либо тексту.
+Разрешённый список метрик материализует:
+
+- `pg_stat_database` типов `1_005_001..=1_005_004`;
+- состояние экземпляра и сбросов `1_015_001`, `1_020_001`, `1_021_001`;
+- физическую репликацию `1_033_001` и слоты `1_034_001..=1_034_003`;
+- файловые системы PostgreSQL `1_036_001..=1_036_002`;
+- память процесса в cgroup `1_037_001`;
+- `vmstat` `1_106_001` и память cgroup `1_202_001`;
+- покрытие сбора `1_023_001` и `1_038_001`.
+
+Для этих типов извлечение создаёт доказанные описания рядов, отсчёты
+счётчиков и измерений, маркеры сбросов, состояния сущностей, покрытие факторов
+и связанные факты событий. Тип, единица, сущность, семейство сброса и качество
+покрытия задаются разрешённым списком, а не выводятся из имени столбца. Новая
+зарегистрированная раскладка вне списка завершается `UnsupportedLayout`; это
+влияет на покрытие источника и не превращается в нулевое измерение.
 
 ### 7.7 Payload error group
 
@@ -534,7 +603,9 @@ NotablePolicy {
 - сохранять upstream loss отдельно от response omission;
 - различать `PANIC`, `integrity_evidence`, `out_of_memory_observation`, `sigkill_observation`, `storage_capacity`, `authentication`, `contention`, `connection_capacity`, `replication`, `maintenance` и `system` без причинного overclaim.
 
-Текущий `NotablePolicy::v1` классифицирует retained `EventObservation` по одной записи, не создаёт canonical fact и не делает causal correlation. Его фактические stable wire codes:
+Текущий `NotablePolicy::v1` классифицирует сохранённые `EventObservation` и
+доказанные канонические факты метрик или состояний, но не выполняет причинную
+корреляцию. Его стабильные коды внешнего протокола:
 
 - `server_child_sigkill` и `server_child_signal_termination`;
 - `panic_severity_observation`;
@@ -549,6 +620,8 @@ NotablePolicy {
 - `auth_failure_observation`;
 - `authorization_failure_observation`;
 - `permission_denied_observation`.
+- `oom_kill_observation`;
+- `filesystem_capacity_zero`.
 
 Эти codes называют observations. `sigkill`, `out_of_memory` и `integrity_error` остаются разными evidence classes и не объединяются в cause без `IncidentDiagnosis`.
 
@@ -734,27 +807,35 @@ V1 не публикует искусственные additive `contributions`. 
 
 Это однозначно объясняет score. Если позже понадобится allocation total drop между factors, он получает отдельную versioned математическую спецификацию.
 
-## 9. Логическое содержимое per-segment fact index
+## 9. Логическое содержимое фактов сегмента
 
-### 9.1 Canonical required blocks
+### 9.1 Обязательные канонические блоки
 
-Каждый fact file содержит следующие block kinds. Block может быть пустым, но required baseline block не может отсутствовать. Target content и фактическая наполненность текущего writer различаются:
+Каждый OVF содержит следующие виды блоков. Блок может быть естественно пустым,
+если выбранный PGM не содержит соответствующих строк, но обязательный базовый
+блок не может отсутствовать:
 
-| Block | Целевое содержимое | Текущая реализация |
+| Блок | Содержимое | Реализация |
 | --- | --- | --- |
-| `SOURCE_MANIFEST` | Catalog-entry inventory, PGM layout/schema, supported/unsupported sections, body/content provenance, source/range metadata | Заполнен для всех catalog entries |
-| `EVENT_OBSERVATIONS` | Retained source-shaped observations, sorted by `(sort_ts_us, observation_id)` | Заполнен только для восьми log `EventStream` layouts из §7.6 |
-| `EVENT_FACTS` | Policy-neutral normalized facts и links к observations | Canonical-empty; web DTO с таким именем не записывается сюда |
-| `LOSS_COVERAGE` | Section presence, coverage intervals, `pg_log_gap`, caps/drop counters, population completeness, tail/source quality | Заполнен доступными catalog coverage, known gaps и retained lower bounds; полнота неподдержанных factors не додумывается |
-| `GAUGE_SAMPLES` | Timestamped values, factor/series/entity identity, units, quality и coverage epoch | Canonical-empty |
-| `COUNTER_SAMPLES` | Timestamped cumulative values, series/entity, counter family и reset epoch | Canonical-empty |
-| `RESET_MARKERS` | Per-family reset/postmaster/source epoch boundaries | Canonical-empty |
-| `ENTITY_STATES` | Complete bounded entity snapshots, population totals и state needed for proven transitions | Canonical-empty |
-| `STRING_TABLE` | Bounded canonical UTF-8/bytes для normalized patterns и других explicitly retained text refs | Заполняется строками, на которые ссылаются текущие `EVENT_OBSERVATIONS`; может быть естественно пустым |
+| `SOURCE_MANIFEST` | Перечень записей каталога, раскладка и схема PGM, поддерживаемые и неподдерживаемые секции, происхождение содержимого, источник и диапазон | Заполняется для каждой записи каталога |
+| `EVENT_OBSERVATIONS` | Сохранённые наблюдения в форме источника, упорядоченные по `(sort_ts_us, observation_id)` | Заполняется для восьми разрешённых раскладок журнала из §7.6 |
+| `EVENT_FACTS` | Нормализованные факты, не зависящие от политики, и ссылки на подтверждающие наблюдения | Заполняется фактами журнала, счётчиков и переходов состояний |
+| `LOSS_COVERAGE` | Наличие секций, интервалы покрытия, `pg_log_gap`, ограничения и потери, полнота состава, качество хвоста и источника | Заполняется покрытием каталога и сборщиков, известными пропусками и доказанными нижними пределами |
+| `GAUGE_SAMPLES` | Значения с временными метками, идентификаторы фактора, ряда и сущности, единицы, качество и эпоха покрытия | Заполняется разрешёнными измерениями PostgreSQL, ОС и cgroup |
+| `COUNTER_SAMPLES` | Накопительные значения с временными метками, ряд и сущность, семейство сброса и эпоха | Заполняется разрешёнными накопительными метриками |
+| `RESET_MARKERS` | Границы сбросов по семействам, перезапуска postmaster и источника | Заполняется доказанным контекстом PostgreSQL и ОС |
+| `ENTITY_STATES` | Полные ограниченные снимки сущностей, размер состава и состояние для доказанных переходов | Заполняется для репликации, слотов и других поддерживаемых составов |
+| `STRING_TABLE` | Ограниченные канонические строки UTF-8 или байты для нормализованных шаблонов и других явно сохранённых ссылок | Заполняется общими строками наблюдений и фактов; может быть естественно пустым |
 
-Текущий container всегда создаёт девять directory entries, поэтому число blocks само по себе не доказывает наличие canonical event facts или metric/state data. Canonical-empty block имеет нулевые item count и body и остаётся отличим от отсутствующего required block.
+Контейнер создаёт девять записей каталога блоков. Число записей само по себе не
+доказывает наличие данных: естественно пустой блок имеет нулевые число
+элементов и тело и остаётся отличим от отсутствующего обязательного блока.
 
-Target layout допускает partitioning по kind, logical factor/source ID и time range, чтобы query декодировал только пересечение и соседний halo. Текущий PGKOVF writer создаёт ровно один baseline block каждого kind и отвергает duplicate kind; multi-block partitioning требует явного format/schema extension.
+Формат допускает будущее разбиение по виду, логическому идентификатору фактора
+или источника и временному диапазону, чтобы запрос декодировал только
+пересечение и соседние граничные отсчёты. Текущий писатель PGKOVF создаёт один
+базовый блок каждого вида и отвергает дубликат вида; несколько блоков одного
+вида требуют явного расширения формата и схемы.
 
 ### 9.2 Optional accelerator blocks
 
@@ -796,22 +877,29 @@ V1 выбирает compact timestamped samples. Coarse canonical base buckets �
 - Decoder consumes the whole decoded block; trailing bytes invalidate block.
 - Text bytes bounded, validated by declared text kind, and never implicitly localized.
 
-## 10. Физический per-segment формат
+## 10. Физический формат фактов сегмента
 
-### 10.1 Placement и file key
+### 10.1 Размещение и `FactKey`
 
-Fact files физически отделены от store directory:
+`KRONIKA_WEB_DIR` — один каталог, который целиком принадлежит PgKronika.
+Активный журнал, запечатанный PGM и его производный OVF находятся рядом:
 
 ```text
-<cache_root>/overview/v1/<source_scope_hex>/<prefix>/<fact_key_hex>-<segment_lineage_hex>.ovf
+<KRONIKA_WEB_DIR>/active.parts
+<KRONIKA_WEB_DIR>/N.pgm
+<KRONIKA_WEB_DIR>/N.ovf
 ```
 
-`prefix` — первые байты `fact_key`, только для ограничения числа directory entries. PGM filename и `first_ts` могут использоваться в diagnostic metadata, но не участвуют как correctness identity.
+`N.ovf` имеет в точности ту же основную часть имени, что и `N.pgm`.
+`SegmentContext` принимает только имя непосредственного дочернего файла с
+непустой основной частью и точным расширением `.pgm`; разделители пути и
+нулевой байт запрещены. Дополнительного каталога, идентификатора хранилища,
+хеша пути или производного имени нет.
 
 ```text
 FactKey = SHA-256(
   "pgk-overview-fact-key-v1" ||
-  source_scope_id ||
+  pgm_source_id ||
   source_descriptor ||
   file_kind ||
   fact_schema_version ||
@@ -820,35 +908,25 @@ FactKey = SHA-256(
 )
 ```
 
-Полная immutable build identity:
+Полный неизменяемый идентификатор задачи построения:
 
 ```text
 FactBuildKey = (FactKey, SegmentLineageId)
 ```
 
-`FactKey` остаётся content-addressed identity для descriptor/version axes. `SegmentLineageId` отделяет разные retained occurrences с одинаковым содержимым. Поэтому `FactBuildKey`, а не один `FactKey`, квалифицирует:
+`FactKey` связывает содержимое источника и версии контрактов.
+`SegmentLineageId` различает сохранённые появления одинакового содержимого.
+`FactBuildKey` используется для координации одной задачи построения, допуска
+ресурсов, резервного хранения в памяти и декодированных записей. Он не
+участвует в имени `N.ovf` и не создаёт отдельную блокировку для каждого ключа.
 
-- durable filename;
-- owner lock `.lock-<fact_key_hex>-<segment_lineage_hex>`;
-- process-local fallback residency;
-- будущий cancellation-safe fact-build single-flight;
-- decoded fact-block cache entry.
+Два сегмента с одинаковым `FactKey`, но разным `SegmentLineageId` не
+объединяют задачи построения или записи в памяти. Версии правил состояния,
+краткого списка и HTTP-ответа в `FactKey` не входят.
 
-Два segments с одинаковым `FactKey`, но разными lineage не coalesce и не используют один final file. Health/notable/response versions в `FactKey` не входят.
+### 10.2 Дескриптор PGM и происхождение
 
-### 10.2 Source scope и PGM descriptor
-
-```text
-source_scope_id = SHA-256(
-  "pgk-overview-source-scope-v1" ||
-  normalized_store_namespace ||
-  pgm_source_id
-)
-```
-
-Target contract требует `normalized_store_namespace` из explicit reader configuration. Текущие внутренние constructors отклоняют пустое значение и namespace длиннее 4096 bytes. Однако production web startup при отсутствии настройки пока подставляет canonical absolute store path; это implementation gap, а не разрешённый target fallback. До §20 `PASS` этот путь должен быть удалён: перенос store path не должен неявно менять или переиспользовать identity. Правила нормализации explicit namespace являются частью deployment configuration и должны оставаться стабильными для существующего store.
-
-Descriptor kind v1:
+Дескриптор содержимого v1:
 
 ```text
 source_descriptor = SHA-256(
@@ -859,23 +937,36 @@ source_descriptor = SHA-256(
 )
 ```
 
-Raw catalog содержит source/range/format и per-section type, offset, length, rows и CRC32C. Descriptor тем самым связан с PGM contents в пределах PGM catalog integrity model и обнаруживает обычную replacement/corruption без чтения bodies.
+Исходный каталог содержит идентификатор источника, диапазон, формат, а для
+каждой секции — тип, смещение, длину, число строк и CRC32C. Дескриптор тем
+самым связан с содержимым PGM в пределах модели целостности каталога и
+обнаруживает обычную замену или повреждение без чтения тел секций.
 
-Threat model v1: PGM/cache принадлежат тому же доверенному OS user, PGM после publication иммутабелен, CRC32C защищает от случайного damage, а не от hostile writer. SHA-256 над catalog с CRC не превращает CRC в криптографическую аутентификацию body.
+Модель угроз v1 предполагает, что PGM и OVF принадлежат одному доверенному
+пользователю операционной системы, а PGM после публикации неизменяем. CRC32C
+защищает от случайного повреждения, но не от злоумышленника с правом записи.
+SHA-256 над каталогом с CRC не превращает CRC в криптографическую проверку
+подлинности тела.
 
-Restart-warm gate требует zero PGM body reads. Поэтому silent body bit flip при неизменном catalog не может одновременно обнаруживаться на каждом cache hit. Его обнаруживает отдельный bounded source scrub или последующий raw read; после scrub failure segment помечается source-corrupt и derived cache больше не маскирует gap.
+Проверка после перезапуска требует нулевого числа чтений тел PGM. Поэтому
+незаметное изменение бита в теле при неизменном каталоге нельзя одновременно
+обнаруживать при каждом чтении OVF. Его обнаруживает ограниченная фоновая
+проверка исходных секций или последующее прямое чтение. После ошибки такой
+проверки сегмент помечается как повреждённый источник, и старый OVF больше не
+маскирует пропуск.
 
-### 10.3 Fixed header v1
+### 10.3 Фиксированный заголовок v2
 
-Все поля сериализуются field-by-field, little-endian. Rust `repr(C)` и native struct layout запрещены.
+Все поля сериализуются по отдельности в порядке little-endian. Использовать
+`repr(C)` Rust или размещение полей структуры в памяти нельзя.
 
-Header v1 — ровно 160 bytes:
+Заголовок v2 занимает ровно 192 байта:
 
 | Offset | Поле | Тип | Контракт |
 | ---: | --- | --- | --- |
 | 0 | `magic` | `[u8;8]` | `b"PGKOVF\0\0"` |
-| 8 | `container_version` | `u16` | `1` |
-| 10 | `header_len` | `u16` | `160` |
+| 8 | `container_version` | `u16` | `2` |
+| 10 | `header_len` | `u16` | `192` |
 | 12 | `file_kind` | `u16` | `1 = SegmentFacts` |
 | 14 | `header_flags` | `u16` | v1: `0` |
 | 16 | `fact_schema_version` | `u32` | Logical fact shape |
@@ -886,17 +977,21 @@ Header v1 — ровно 160 bytes:
 | 40 | `source_min_ts_us` | `i64` | Inclusive PGM metadata |
 | 48 | `source_max_ts_us` | `i64` | Inclusive PGM metadata |
 | 56 | `source_file_len` | `u64` | Exact PGM length |
-| 64 | `source_scope_id` | `[u8;32]` | Dataset/deployment scope |
-| 96 | `source_descriptor` | `[u8;32]` | Content-bound PGM descriptor |
-| 128 | `directory_offset` | `u64` | v1: `160` |
-| 136 | `directory_count` | `u32` | `1..=MAX_DIRECTORY_ENTRIES` |
-| 140 | `directory_entry_len` | `u16` | v1: `64` |
-| 142 | `descriptor_kind` | `u16` | v1: catalog descriptor `1` |
-| 144 | `file_len` | `u64` | Exact fact-file length |
-| 152 | `directory_crc32c` | `u32` | CRC exact directory bytes |
-| 156 | `header_crc32c` | `u32` | CRC header с этим полем zeroed |
+| 64 | `source_descriptor` | `[u8;32]` | Дескриптор содержимого PGM |
+| 96 | `fact_key` | `[u8;32]` | Проверяемый `FactKey` |
+| 128 | `segment_lineage_id` | `[u8;32]` | Проверяемое происхождение сегмента |
+| 160 | `directory_offset` | `u64` | v2: `192` |
+| 168 | `directory_count` | `u32` | `1..=MAX_DIRECTORY_ENTRIES` |
+| 172 | `directory_entry_len` | `u16` | v2: `64` |
+| 174 | `descriptor_kind` | `u16` | Дескриптор каталога `1` |
+| 176 | `file_len` | `u64` | Точная длина файла фактов |
+| 184 | `directory_crc32c` | `u32` | CRC точных байтов каталога блоков |
+| 188 | `header_crc32c` | `u32` | CRC заголовка с обнулённым полем CRC |
 
-Unknown magic/version/kind/flags/descriptor kind делает file incompatible. `source_min_ts_us <= source_max_ts_us` обязательно.
+Неизвестные magic, версия, вид файла, флаги или вид дескриптора делают файл
+несовместимым. Условие `source_min_ts_us <= source_max_ts_us` обязательно.
+Числовой идентификатор источника, дескриптор, `FactKey`, происхождение, версии,
+диапазон и длина PGM сверяются с выбранным источником до допуска блоков.
 
 ### 10.4 Block directory entry v1
 
@@ -960,32 +1055,54 @@ V1 safety bounds — correctness/DoS limits, а не benchmark claims:
 
 Превышение bound не обрезает canonical facts. Segment становится `Uncacheable(limit)`, ответ строится streaming/raw под request work limits и публикует соответствующую acceleration metric. Если одновременно сработал canonical live bound, live state становится `Incomplete` по §4.4.
 
-Admission order:
+Порядок допуска:
 
-1. Resolve deterministic target только внутри trusted cache root; не следовать symlink из cache namespace.
-2. Открыть regular file и проверить stat/file length bound.
-3. Прочитать 160-byte header; проверить magic, versions, kind, flags и header CRC.
-4. Checked-арифметикой проверить directory offset/count/entry length и exact directory range.
-5. Прочитать bounded directory и проверить directory CRC.
-6. Сравнить expected source scope/descriptor/source ID/range/format/file length и полный `FactBuildKey`.
-7. Проверить canonical order, known flags, zero reserved fields, timestamp bounds, non-overlapping block extents и exact final `file_len`.
-8. Выбрать только нужные blocks; до allocation проверить stored/decoded length и item count.
-9. Проверить block CRC и `None` length equality; для любого включённого в будущем codec — decoded bound и exact-length decompression; затем проверить logical decoder invariants.
-10. Проверить sorted/unique keys, enum ranges, finite floats, count overflow, references и полное потребление block.
+1. Проверить безопасное имя непосредственного дочернего `N.pgm` и вывести из
+   него только соседнее имя `N.ovf`.
+2. Открыть каталог данных, PGM и OVF относительно дескриптора каталога с
+   `NOFOLLOW`; принимать только обычные файлы.
+3. Проверить длину OVF и прочитать 192-байтовый заголовок; проверить magic,
+   версии, вид, флаги и CRC заголовка.
+4. Проверяемой арифметикой подтвердить смещение, число и размер записей
+   каталога блоков, а также точный диапазон каталога.
+5. Прочитать ограниченный каталог блоков и проверить его CRC.
+6. Сравнить ожидаемые числовой идентификатор источника, дескриптор PGM,
+   `FactKey`, `SegmentLineageId`, диапазон, формат и длину источника.
+7. Проверить канонический порядок, известные флаги, нулевые зарезервированные
+   поля, временные границы, непересекающиеся диапазоны блоков и точный
+   `file_len`.
+8. Выбрать только нужные блоки; до выделения памяти проверить сохранённую и
+   декодированную длину и число элементов.
+9. Проверить CRC блока и равенство длин для `None`. Для любого будущего кодека
+   сначала проверить предел декодированной длины и точную длину результата,
+   затем логические инварианты декодера.
+10. Проверить упорядоченность и уникальность ключей, диапазоны перечислений,
+    конечность чисел с плавающей точкой, переполнение счётчиков, ссылки и
+    полное потребление блока.
 
-Bad selected block отвергает весь segment fact file. Partial use хороших blocks из corrupt file запрещено: PGM rebuild остаётся однозначным fallback.
+Ошибка в выбранном блоке отвергает весь OVF. Частично использовать исправные
+блоки повреждённого файла нельзя: однозначным запасным путём остаётся
+перестроение из PGM.
 
 ### 10.7 Durable publication
 
-1. Создать process-unique temp в том же cache directory через `create_new`, с правами не шире `0600`; cache namespace не шире `0700`, если operator явно не задал другой безопасный режим.
-2. Записать header placeholder, directory и blocks; flush.
-3. Записать финальные CRC/lengths, вызвать `sync_all(file)`.
-4. Повторно валидировать собственный file тем же admission path.
-5. Выполнить atomic same-filesystem rename с no-clobber semantics. Если platform не даёт no-clobber rename, owner по полному `FactBuildKey` сериализует rename; существующий target не перезаписывается до validation. Content-addressed race winner допустим, loser принимает winner только после полной validation.
-6. Вызвать `sync_all(parent_directory)`.
-7. Удалить собственный temp best-effort.
+1. Получить исключительное право записи в каталог через
+   `.pgkronika-overview.owner.lock` и локальный шлюз публикации.
+2. Повторно открыть и проверить соседний `N.pgm` с `NOFOLLOW`.
+3. Создать уникальный временный файл
+   `.pgkronika-overview.tmp-<pid>-<sequence>` в том же каталоге с
+   `CREATE|EXCL|NOFOLLOW` и правами `0600`.
+4. Записать полностью сформированный контейнер и вызвать `sync_all(file)`.
+5. Повторно проверить временный файл тем же путём допуска и с ожидаемыми
+   заголовочными данными.
+6. Атомарно переименовать временный файл поверх того же `N.ovf` и вызвать
+   `sync_all` для каталога.
+7. Удалить только собственный временный файл при ошибке или после завершения.
 
-Cache persistence failure после успешного build не отменяет computed response.
+Допустимый существующий `N.ovf` переиспользуется. Устаревший, несовместимый,
+повреждённый или не соответствующий выбранному PGM файл безопасно заменяется
+атомарным переименованием по тому же пути. Ошибка публикации после успешного
+построения не отменяет вычисленный ответ.
 
 ## 11. Версии и identity
 
@@ -1023,8 +1140,9 @@ TTL не является identity. Любое изменение active generat
 ### 11.3 Cache file compatibility
 
 - Container decoder может поддерживать несколько старых compatible versions.
-- Fact/extractor/registry mismatch не мигрируется in place: old file игнорируется, новый строится рядом.
-- Старые namespaces удаляет GC после grace period.
+- Несовпадение версий фактов, извлечения или реестра не исправляется внутри
+  старого содержимого: соседний OVF отвергается, факты строятся из PGM и
+  атомарно заменяют тот же файл.
 - Unknown required input layout запрещает считать absence measured zero. Segment rebuild завершается `UnsupportedLayout`/coverage unknown, если текущий extractor его не понимает.
 
 ## 12. Машины состояний
@@ -1047,9 +1165,16 @@ Build --target global admission + FactBuildKey single-flight--> Building
   └─ fact safety limit ------------------------------> Uncacheable
 ```
 
-`Missing`, `Incompatible`, `Corrupt`, `WrongSource` и cache I/O error являются soft cache errors. `SourceMissing`, `SourceIo`, `SourceCorrupt` и `UnsupportedLayout` влияют на result coverage и не переименовываются в cache miss.
+`Missing`, `Incompatible`, `Corrupt`, `WrongSource` и ошибка ввода-вывода OVF
+являются устранимыми ошибками производного файла. `SourceMissing`, `SourceIo`,
+`SourceCorrupt` и `UnsupportedLayout` влияют на покрытие результата и не
+переименовываются в отсутствие OVF.
 
-Текущий M4 path уже выполняет durable lookup и bounded fallback до raw build, но отдельного fact-build single-flight и weighted global cold-work admission ещё нет. Переход к `Building` выше является target M5 contract; он не описывает уже существующий response-level `ResponseKey` flight.
+Текущая реализация сначала проверяет декодированные факты в памяти и допустимый
+соседний OVF. Только затем она входит в ограниченный планировщик построения.
+Одинаковые `FactBuildKey` объединяются одной безопасной при отмене задачей, а
+разные задачи ограничены общей взвешенной ёмкостью, числом работников,
+очередью, параллелизмом одного запроса и временем ожидания.
 
 ### 12.2 Live builder
 
@@ -1092,50 +1217,77 @@ Response caps никогда не влияют на promotion.
 
 ### 12.4 Restart
 
-1. Reader строит authoritative sealed catalog из PGM headers/catalogs.
-2. Fact paths вычисляются из descriptors; cache directory не является source catalog.
-3. Headers/directories валидируются лениво или bounded startup scan, bodies fact blocks — on demand.
-4. Valid fact file даёт restart-warm path без PGM body read.
-5. Active journal получает новую доказанную generation и входит в `Warming`.
-6. Completed frames fold-ятся один раз. До `Current` responses показывают warming/tail state или используют admitted direct fold.
-7. RAM fact/projection/response caches начинают пустыми.
+1. Считыватель строит авторитетный каталог запечатанных данных из заголовков и
+   каталогов PGM.
+2. Для каждого непосредственного дочернего `N.pgm` рассматривается только
+   соседний `N.ovf`; каталог данных не становится источником диапазонов.
+3. Заголовки и каталоги OVF проверяются лениво, а тела блоков читаются по
+   необходимости.
+4. Допустимый OVF обслуживает запрос после перезапуска без чтения тела PGM.
+5. Активный журнал получает новое доказанное поколение и входит в `Warming`.
+6. Завершённые кадры сворачиваются ровно один раз. До состояния `Current`
+   ответы показывают прогрев и состояние хвоста либо используют допущенное
+   прямое сворачивание.
+7. Хранилища фактов, проекций и ответов в памяти начинают работу пустыми.
 
 ### 12.5 Corruption и schema change
 
 - Torn active tail не продвигает valid watermark и публикуется как `tail_pending`; это не corruption completed frame.
-- Corrupt/incompatible fact file закрывается, учитывается metric и rebuild-ится из PGM.
-- Wrong-source file никогда не допускается по совпадению filename.
-- Corrupt source PGM создаёт source gap/error; старый derived file не становится автономным source of truth после обнаруженного source damage.
+- Повреждённый или несовместимый OVF закрывается, учитывается метрикой,
+  перестраивается из PGM и атомарно заменяется по тому же пути.
+- Файл, заголовок которого описывает другой источник, никогда не допускается
+  только из-за совпадения имени.
+- Повреждённый исходный PGM создаёт пропуск или ошибку источника; старый OVF не
+  становится самостоятельным источником истины после обнаружения повреждения.
 - Formula/notable-only change очищает projection/response keys, но не меняет fact files/mtimes.
-- Fact/extractor/registry change создаёт новый cache key; old file остаётся orphan до GC.
+- Изменение версии фактов, извлечения или реестра меняет `FactKey`; старый OVF
+  перестраивается и атомарно заменяется на том же соседнем пути.
 
 ### 12.6 Retention и GC
 
-- Mark set строится только из последнего успешного полного store scan.
-- Directory-level uncertainty запрещает sweep.
-- PGM, исчезнувший из authoritative view, немедленно перестаёт участвовать в новых responses.
-- Derived orphan не продлевает source retention.
-- Физическое удаление facts откладывается минимум на две successful view generations и configured grace period.
-- GC учитывает fact, projection, response-persistence (если появится), temp и orphan bytes/files.
-- Stale temps и старые schema namespaces очищаются только по owned naming pattern.
-- Content-addressed blob races безопасны; GC и multi-process writer требуют single-owner lock/lease. V1 может требовать один cache owner process.
-- GC никогда не удаляет PGM или `active.parts`.
+- Набор живых `FactBuildKey` строится только из последнего успешного полного
+  снимка источников.
+- Неопределённость при сканировании каталога запрещает удаление и не продвигает
+  льготный период.
+- PGM, исчезнувший из авторитетного представления, немедленно перестаёт
+  участвовать в новых ответах.
+- Производный OVF не продлевает срок хранения источника.
+- Удаление устаревшего OVF откладывается минимум на два разных авторитетных
+  поколения и на заданный временной льготный период.
+- Плоское ограниченное сканирование учитывает только распознанные соседние OVF
+  и собственные временные файлы публикации. Квоты по логическому размеру и
+  числу файлов применяются только к этим производным объектам.
+- Перед удалением повторно проверяются имя, вид файла, inode, заголовок и
+  ожидаемый `FactBuildKey`; открытие выполняется с `NOFOLLOW`.
+- Право изменения каталога удерживает один процесс через
+  `.pgkronika-overview.owner.lock`. Остальные процессы могут читать допустимые
+  OVF, но не публикуют файлы и не выполняют сборку мусора.
+- Сборка мусора никогда не удаляет PGM, `active.parts` или другие файлы
+  источника.
 
-## 13. Иерархия cache и memory-only fallback
+## 13. Слои чтения и резервные данные в памяти
 
 ### 13.1 Слои
 
 ```text
 L0 source: immutable PGM + completed active parts
-L1 disk:   per-segment canonical fact files
-L1f memory: admitted publication-failure fallback
-L2 memory:  byte-bounded decoded fact blocks + projections
-L3 memory:  exact serialized response cache
+L1 disk:   соседние канонические файлы N.ovf
+L1f memory: допущенные факты после ошибки публикации
+L2 memory:  ограниченные по объёму декодированные блоки и проекции
+L3 memory:  точные сериализованные ответы
 ```
 
-L1 переживает restart. L1f/L2/L3 очищаются при restart. Ни один слой не меняет correctness semantics нижнего слоя.
+L1 сохраняется после перезапуска. L1f/L2/L3 существуют только в процессе.
+Ни один слой не меняет семантику корректности нижнего слоя.
 
-Текущий `FactStore::load_or_build` соблюдает строгий порядок: durable read → lookup в fallback → raw PGM build → best-effort durable publication. L1f заполняется только после recoverable publication failure уже построенного и admitted fact set. Это deterministic LRU по полному `FactBuildKey`, одновременно ограниченный canonical bytes и суммой segment-hours; oversized entry обслуживает текущий request, но не остаётся resident. Общий decoded-block/projection L2 остаётся target work. Текущие exact responses уже byte-bounded и имеют отдельный `ResponseKey` single-flight.
+`FactStore::load_or_build` соблюдает строгий порядок: чтение соседнего OVF →
+поиск в резервных данных памяти → построение из PGM → попытка атомарной
+публикации OVF. Резервный слой заполняется только после устранимой ошибки
+публикации уже построенного и полностью проверенного набора фактов. Это
+детерминированный LRU по полному `FactBuildKey`, одновременно ограниченный
+каноническими байтами и суммой часов сегментов. Слишком крупная запись
+обслуживает текущий запрос, но не остаётся в памяти. Декодированные факты и
+точные ответы также имеют отдельные ограничения по объёму и числу записей.
 
 ### 13.2 Memory fact/projection cache
 
@@ -1171,7 +1323,7 @@ effective_fact_budget = min(
 ResponseKey {
   endpoint,
   response_schema_version,
-  source_scope_ids,
+  source_ids,
   fact_set_id,
   requested_range,
   effective_range,
@@ -1185,11 +1337,14 @@ ResponseKey {
 }
 ```
 
-Value — immutable serialized body плюс content type/status metadata. Cache byte-bounded. Live response key всегда включает journal generation и folded watermark; короткий TTL не заменяет эту identity.
+Значение — неизменяемое сериализованное тело вместе с типом содержимого и
+метаданными состояния. Хранилище ограничено по числу байтов. Ключ ответа с
+активными данными всегда включает поколение журнала и обработанную позицию;
+короткий TTL не заменяет эти признаки.
 
 ### 13.4 Persistent cache modes
 
-Disk read и disk write capabilities ведутся независимо:
+Возможности чтения и записи OVF отслеживаются независимо:
 
 ```text
 PersistentCacheMode =
@@ -1204,29 +1359,41 @@ PersistFailure =
 
 При `EROFS`, `EACCES`, `ENOSPC`, quota или transient I/O:
 
-1. computed `SegmentFacts` остаётся в memory и обслуживает текущий response;
-2. новые builds работают memory-only;
-3. уже валидные disk facts продолжают читаться, если read path доступен;
-4. причина учитывается отдельно от source PGM errors;
-5. `ENOSPC`/quota один раз запускает bounded GC, затем write retry;
-6. повторные writes подавляются backoff, чтобы каждый request не повторял одну ошибку;
-7. background probe возвращает `ReadWrite` после успешной durable temp publication.
+1. вычисленные `SegmentFacts` остаются в памяти и обслуживают текущий ответ;
+2. новые задачи построения используют ограниченный резервный слой памяти;
+3. уже допустимые OVF продолжают читаться, если чтение доступно;
+4. причина учитывается отдельно от ошибок исходного PGM;
+5. `ENOSPC` или превышение квоты один раз запускает ограниченную сборку мусора,
+   затем повторяет запись;
+6. задержка между попытками не позволяет каждому запросу повторять одну и ту
+   же ошибку;
+7. фоновая проба возвращает `ReadWrite` после успешного создания,
+   синхронизации и удаления собственного временного файла.
 
 Backoff v1: initial 1 s, multiplier 2, cap 5 min, jitter ±20%; для permission/read-only причин первая повторная проверка начинается с capped interval. Успех сбрасывает backoff. Эти значения operational, а не health/benchmark thresholds.
 
 Cache persistence state виден в metrics/admin diagnostics. Он не попадает в source coverage и не делает корректный timeline partial.
 
-Текущий implementation snapshot реализует эту write state machine для всех API `FactStore`: один due reservation, cancellation cleanup, один bounded GC retry и background probe из web refresh. Durable reads не проверяют write backoff. Это закрывает только persistence-recovery slice M5; fact-build single-flight и weighted admission остаются отдельными обязательными требованиями.
+Текущая реализация использует эту машину состояний записи во всех API
+`FactStore`: одна готовая резервировка, очистка при отмене, одна ограниченная
+попытка сборки мусора и фоновая проба из обновления веб-сервера. Чтение OVF не
+зависит от задержки повторной записи. Координация построений и взвешенный
+допуск реализованы отдельно и не блокируют попадания в память или OVF.
 
 ### 13.5 Quota
 
 - Отдельные byte budgets: disk facts, memory facts/projections, exact responses, pinned cursor views и in-flight builds.
-- Disk quota считает committed files, stale namespaces, orphans и temp files.
+- Дисковая квота считает распознанные соседние OVF и собственные временные
+  файлы публикации; PGM и `active.parts` в неё не входят.
 - Временное превышение ограничено одним bounded in-flight file на writer slot.
 - Eviction никогда не удаляет in-use `Arc`; file unlink безопасен только после исключения из lookup и с учётом platform semantics.
 - При невозможности освободить quota system остаётся memory-only, а не обрезает facts.
 
-Текущий implementation snapshot поддерживает необязательные пределы суммы логических `st_size` и числа учтённых файлов. Они выключены по умолчанию. Admission требует полного bounded scan и при неопределённости ничего не удаляет. Эта реализация не называется physical-filesystem quota и не закрывает dense working-set qualification.
+Текущая реализация поддерживает необязательные пределы суммы логических
+`st_size` и числа распознанных производных файлов. По умолчанию они отключены.
+Допуск требует полного ограниченного сканирования и при неопределённости ничего
+не удаляет. Это не квота физической файловой системы; рабочий набор «плотного
+часа» проверяется отдельным квалификационным артефактом.
 
 ## 14. Конкурентность, single-flight и admission
 
@@ -1255,23 +1422,29 @@ get_or_build(build_key):
 - transient cache/source failure не кешируется навечно;
 - panic/abort owned task превращается в typed terminal error и очищает slot.
 
-Текущий M4 single-flight действует только для exact HTTP `ResponseKey`; он не coalesce cold fact extraction. M5 обязан добавить отдельный registry по `FactBuildKey` и не объединять разные `SegmentLineageId`.
+Текущая реализация содержит отдельные координаторы для точного HTTP
+`ResponseKey` и для `FactBuildKey`. Одинаковые задачи построения получают один
+общий результат. Разные `SegmentLineageId` не объединяются, отмена ожидающего
+запроса не отменяет общую задачу, а завершение или ошибка освобождает запись.
 
 ### 14.2 Global cold-work bounds
 
-Fact-build single-flight не защищает от одного запроса на сотни разных cold segments. Target M5 одновременно требует:
+Координация одной задачи не защищает от запроса на сотни разных сегментов,
+которые нужно построить из PGM. Поэтому реализация одновременно ограничивает:
 
 - weighted global budget по estimated PGM bytes, decoded bytes и CPU work units;
 - hard max concurrently building keys;
 - bounded blocking worker pool;
 - per-request parallelism;
 - max in-flight FD/read/write bytes;
-- max concurrent cache publications;
+- число одновременных публикаций OVF;
 - fair queue между requests/sources;
 - admission timeout и `Retry-After` для overload;
 - max range/segments/points/page до materialization.
 
-Cache hits и response hits не занимают cold-build permits и не проходят через существующий global heavy-analysis semaphore. Короткая LRU metadata mutation допускается; payload возвращается как `Arc` без копирования.
+Попадания в декодированные данные памяти, OVF и точные ответы не занимают
+разрешения на построение из PGM. Короткое изменение метаданных LRU допустимо;
+полезная нагрузка возвращается как `Arc` без копирования.
 
 ### 14.3 HTTP safety limits v1
 
@@ -1289,7 +1462,12 @@ Deployment может снижать defaults. Повышение до absolute 
 
 ## 15. Машинный HTTP-контракт
 
-Routes `/v1/timeline/overview`, `/v1/timeline/health` и `/v1/timeline/events` существуют в текущем M4. Текущие query contracts: overview — `source/from/to`; health — `source/from/to/step`; events — repeatable `source`, `from/to/limit/cursor/min_severity/kind`. `profile` и `entity` ниже остаются target additions. Структуры задают target schema; фактический production surface проверяется OpenAPI/handler fixtures, а незаполненные canonical blocks не считаются доступными только из-за наличия поля в target response.
+Рабочие маршруты `/v1/timeline/overview`, `/v1/timeline/health` и
+`/v1/timeline/events` описаны в OpenAPI. Параметры обзора —
+`source/from/to`; состояния — `source/from/to/step`; событий — повторяемый
+`source` и `from/to/limit/cursor/min_severity/kind`. Параметры `profile` и
+`entity` в псевдокоде ниже остаются будущими расширениями. Фактическая внешняя
+форма проверяется OpenAPI и наборами данных обработчиков.
 
 ### 15.1 Общая metadata
 
@@ -1428,7 +1606,11 @@ EventsCursor {
 }
 ```
 
-`source_set_id` хеширует ordered selected source scopes. `query_hash` включает range, normalized filters, order, notable policy и response schema. Первая страница pin-ит immutable query/index view. Следующая страница обязана использовать ту же generation и тот же query hash.
+`source_set_id` хеширует упорядоченный набор выбранных числовых
+идентификаторов источников. `query_hash` включает диапазон, нормализованные
+фильтры, порядок, версию правил краткого списка и схему ответа. Первая страница
+закрепляет неизменяемое представление запроса и индекса. Следующая страница
+обязана использовать то же поколение и тот же хеш запроса.
 
 `min_severity` применяется только к observations с severity. Typed lifecycle/state facts без severity остаются eligible по `kind` и NotablePolicy; caller, которому нужны только log error groups, задаёт соответствующий `kind` filter.
 
@@ -1444,13 +1626,16 @@ Cursor errors:
 
 После process restart in-memory pinned views исчезают, поэтому старые cursors честно expire. Stateless continuation на новом live generation запрещено.
 
-### 15.6 Source errors, cache errors и overload
+### 15.6 Ошибки источника, OVF и перегрузка
 
-- Cache corruption/write failure не включается в source loss response; это acceleration diagnostics.
+- Повреждение OVF или ошибка его записи не включается в потери источника; это
+  диагностические сведения об ускоряющем слое.
 - Unreadable/corrupt source segment становится explicit segment/source gap. Если другие данные позволяют корректный partial response, endpoint возвращает `200` с `source_status=Partial/Gap`.
 - Если authoritative store view вообще недоступен, возвращается `503 source_unavailable`.
 - Request shape выше hard limit — `400 query_limit_exceeded` или `413` для oversized body, без partial work.
-- Cold admission timeout — `503 cold_build_overloaded` с `Retry-After`; cache-hit path не должен попадать в этот ответ.
+- Истечение ожидания допуска построения — `503 cold_build_overloaded` с
+  `Retry-After`; попадание в память или допустимый OVF не должно приводить к
+  такому ответу.
 
 ## 16. Границы модулей и крейтов
 
@@ -1472,10 +1657,11 @@ Reader-owned persistent index:
 
 - selective PGM section/body extraction;
 - targeted dictionary resolver;
-- source scope, segment/part/body descriptors и provenance;
+- числовой идентификатор источника, дескрипторы сегмента, части и тела, а также
+  происхождение;
 - semantic `RefreshDelta`;
 - disk header/directory/block codec;
-- cache admission, durable publication и typed read/persist errors;
+- допуск OVF, атомарная публикация и типизированные ошибки чтения и записи;
 - raw oracle path и fact builder;
 - boundary block lookup.
 
@@ -1496,7 +1682,13 @@ Formula/notable/HTTP semantics в reader codec не живут.
 
 Внутреннее разбиение: `live`, `view`, `admission`, `memory_cache`, `response_cache`, `cursor`, `handlers`. Новый crate для v1 не нужен: disk index имеет одного reader consumer, а чистая алгебра уже помещается в analytics.
 
-Текущий implementation snapshot сохраняет M4 atomic publication пары snapshot/timeline, handlers, pinned cursors, byte-bounded response cache, `ResponseKey` flight и fail-fast heavy-analysis limit. После M4 добавлены точный `FactBuildKey`, durable-first dual-budget fallback, один root owner, необязательные logical-byte/file ceilings, fail-closed GC и typed persistence backoff/probe. Fact-build flight, weighted cold admission и source scrub остаются обязательными M5 slices.
+Текущая реализация атомарно публикует пару снимка источников и временной шкалы,
+обслуживает конечные точки, закрепляет представления курсоров и ограничивает
+точные ответы по объёму. После M4 добавлены полный `FactBuildKey`, резервный
+слой памяти с двумя пределами, единственный владелец каталога, необязательные
+пределы размера и числа производных файлов, безопасная сборка мусора,
+типизированное восстановление записи, координация построений, взвешенный допуск
+и фоновая проверка исходных секций.
 
 ### 16.4 Typed error model
 
@@ -1535,7 +1727,11 @@ Cache errors допускают fallback. Source errors меняют coverage/re
 
 Разрешены только явно versioned различия wire encoding/order полей и заданная tolerance floating arithmetic.
 
-Текущий oracle уже сравнивает retained observations/counts/coverage в реализованном log data scope и имеет restart-warm/raw-index checks. M6 не считается закрытым, пока oracle не охватит все заполненные canonical event/sample/reset/state blocks, live/seal variants, ranges, identities, units и loss из §7.6.
+Текущий эталон прямого чтения сравнивает все заполненные блоки событий,
+отсчётов, сбросов, состояний и покрытия. Проверки охватывают активный и
+запечатанный пути, повторное чтение OVF после перезапуска, границы диапазонов,
+идентификаторы, единицы и потери из §7.6. Итоговый M6 подтверждается только
+артефактом и CI по правилам §20.
 
 ### 17.2 Property tests algebra
 
@@ -1620,8 +1816,10 @@ Valid interval — 10 seconds, не 5. Rate равен 100%, а не 200%. Ес�
 - unsorted/duplicate keys, invalid enums, NaN/infinity;
 - missing/unknown required block;
 - unknown optional accelerator skip;
-- wrong source scope/descriptor/range/source ID;
-- publish race, invalid winner и stale temp cleanup;
+- неверные `source_descriptor`, `FactKey`, `SegmentLineageId`, диапазон,
+  длина или `source_id`;
+- состязание публикаций, замена устаревшего OVF и очистка собственных временных
+  файлов;
 - cross-version rebuild without in-place mutation.
 
 Каждый invalid fact file либо даёт raw fallback, либо source error от PGM. Panic/OOM allocation от untrusted lengths запрещены.
@@ -1662,7 +1860,7 @@ Valid interval — 10 seconds, не 5. Rate равен 100%, а не 200%. Ес�
 - FATAL/error storm до collector caps;
 - explicit `pg_log_gap`;
 - two sources;
-- two store scopes с `source_id=0`;
+- два источника с различными `source_id`;
 - corrupt fact block;
 - corrupt PGM section;
 - dense one-hour working set;
@@ -1670,17 +1868,22 @@ Valid interval — 10 seconds, не 5. Rate равен 100%, а не 200%. Ес�
 
 ### 18.2 Режимы
 
-1. `derived-cold`: новый process, пустой cache directory.
-2. `restart-warm`: новый process, valid disk facts, пустые RAM caches.
-3. `process-hot`: второй и последующие identical requests.
-4. `range-cold/facts-warm`: новый range/step/filter, response miss, facts hit.
+1. `derived-cold`: новый каталог данных с PGM без соседнего OVF и пустое
+   состояние процесса.
+2. `restart-warm`: новый процесс, допустимый соседний OVF и пустые хранилища
+   памяти.
+3. `process-hot`: второй и последующие одинаковые запросы.
+4. `range-cold/facts-warm`: новый диапазон, шаг или фильтр при наличии фактов.
 5. `live`: sealed facts + active parts + pending tail.
 6. `concurrent-identical`: 16 simultaneous cold misses одного fact set.
 7. `concurrent-disjoint`: 16 simultaneous different cold ranges.
-8. `memory-only`: persistent write failure, facts остаются в byte-bounded RAM.
-9. `oracle-profile`: зафиксированные raw и fact fixtures, exact data cardinality, один versioned host/filesystem profile.
+8. `memory-only`: ошибка публикации OVF; факты остаются в памяти с ограничением
+   по объёму.
+9. `oracle-profile`: зафиксированные исходные данные и файлы фактов, точная
+   мощность набора и один версионированный профиль узла и файловой системы.
 
-Process-cold и storage-cold/page-cache-cold называются отдельно. Нельзя выдавать warm OS page cache за cold disk.
+Новое состояние процесса и холодный накопитель или страничный кэш называются
+отдельно. Нельзя выдавать прогретый страничный кэш ОС за холодный накопитель.
 
 ### 18.3 Измерения
 
@@ -1759,147 +1962,217 @@ Metrics минимум:
 - `overview_gc_files_total{action,reason}`
 - `overview_gc_bytes_total{action}`
 
-Structured logs включают request ID, source scope, `FactKey` и lineage prefixes, view generation и error chain. Full paths, raw patterns и user/database text не логируются без explicit debug/redaction policy.
+Структурированные журналы включают идентификатор запроса, числовой
+`source_id`, сокращённые `FactKey` и `SegmentLineageId`, поколение
+представления и цепочку ошибок. Полные пути, исходные шаблоны и текст
+пользователя или базы данных не записываются без явного режима диагностики и
+правил сокрытия данных.
 
 ## 20. Критерии приёмки parity v1
 
-### 20.1 Target acceptance и текущий статус
+### 20.1 Матрица приёмки и состояние реализации
 
-Статусы «Есть в current scope», «Частично» и «Открыто» описывают implementation snapshot, а не waiver. Parity v1 принимается только когда все строки имеют доказанный `PASS` на одном exact release head.
+Все восемнадцать требований реализованы и имеют локальные проверки-кандидаты.
+Итоговый `PASS` присваивается всему набору только после успешной проверки
+структуры квалификационного артефакта и всех связанных заданий в одной попытке
+GitHub Actions на одном точном коммите.
 
-| ID | Обязательное target acceptance | Текущий статус |
+| ID | Обязательное требование | Реализация и проверка-кандидат |
 | ---: | --- | --- |
-| 1 | Valid disk facts после process restart дают zero PGM body reads для sealed interior | Есть в current log scope: durable file читается без PGM bodies |
-| 2 | Raw-vs-index semantic equality доказана для exact/partial ranges, single/multi-segment и sealed+live | Частично: observations/counts/coverage покрыты; canonical event/sample/reset/state blocks ещё пусты |
-| 3 | Random partition/seal invariance не находит duplicates, loss или boundary drift | Частично: current observation/live identity имеет properties; полный target data set не проверен |
-| 4 | Missing/corrupt/incompatible/wrong-source cache всегда fallback-ится; cache persistence failure не ломает correct response | Есть в current log scope, включая admitted bounded fallback после recoverable publication failure |
-| 5 | Source corruption остаётся видимым source gap/error и не скрывается derived data после обнаружения | Частично: source errors отделены от cache misses; bounded background source scrub ещё не реализован |
-| 6 | Formula/notable response change не rebuild-ит facts, пока facts содержат нужные dimensions | Есть для текущих dimensions: policy versions не входят в `FactKey` |
-| 7 | Каждый retained notable item проходит cursor scan ровно один раз; grouped count и upstream loss сохраняются | Частично: current observation projection и cursor это проверяют; canonical `EventFact` input отсутствует |
-| 8 | Stable event IDs переживают normal live→seal handoff; `store_namespace` задаётся явно; ограничения content-derived identity опубликованы | Частично: handoff и different-lineage isolation есть, но web startup ещё допускает path-derived namespace |
-| 9 | Canonical live builder lossless; hard truncation маркирует `Incomplete` и запрещает promotion | Есть для текущего observation data scope |
-| 10 | Required-domain gap всегда даёт numeric `None`, никогда green one | Частично: current event-only health сохраняет unknown, но required metric factors не materialized |
-| 11 | Trusted floor evidence сохраняется при partition, seal и worst downsample; numeric unknown остаётся unknown | Частично: evidence-quality floor rules существуют; полная factor/partition qualification открыта |
-| 12 | Per-factor coverage/applicability/loss присутствует; один display ratio не используется как correctness gate | Открыто для metric factors; current coverage описывает retained event scope |
-| 13 | Counter rates используют actual adjacent interval, reset families и gaps; storage boundary не меняет результат | Частично: algebra существует в analytics, production `COUNTER_SAMPLES`/`RESET_MARKERS` пусты |
-| 14 | Каждая target taxonomy/factor family имеет проверяемый source→retained row→fact/sample/state→identity/units/reset→coverage/loss mapping и представлена fact/factor либо explicit gap | Частично: §7.6 подтверждает восемь log layouts; остальные mappings остаются explicit gaps |
-| 15 | Cache hits обходят cold admission; identical `FactBuildKey` misses single-flight, disjoint misses globally bounded | Открыто для fact builds; текущий M4 объединяет только identical `ResponseKey` |
-| 16 | Memory-only fallback ограничен bytes и segment-hours; retry/backoff наблюдаемы, dense-hour sizing проверено | Частично: dual-budget LRU и typed observable backoff/probe реализованы; dense-hour qualification открыта |
-| 17 | Quota/GC учитывает все derived bytes, безопасен при concurrent readers и никогда не удаляет source | Частично: есть optional logical-byte/file ceilings и fail-closed exact-namespace GC с owner/lock/inode checks; physical/dense accounting и итоговая qualification открыты |
-| 18 | Benchmark modes и gates §18 воспроизводимо проходят на зафиксированном host/filesystem profile | Открыто; текущие точечные measurements не являются M6 dossier |
+| 1 | После перезапуска допустимый соседний OVF обслуживает внутреннюю часть запечатанного диапазона без чтения тел PGM | `restart-warm` и счётчики ввода-вывода требуют ноль чтений тел и ноль записей |
+| 2 | Прямое чтение и индекс дают одинаковый результат для полных и частичных диапазонов, одного и нескольких сегментов, запечатанных и активных данных | Проверки всех семейств фактов сравнивают события, метрики, состояния, покрытие и границы диапазонов с исходным эталоном |
+| 3 | Случайное разбиение и запечатывание не создают повторов, потерь или смещения границ | Метафорфные и свойственные проверки охватывают происхождение, объединение, граничные отсчёты и переход активных данных |
+| 4 | Отсутствующий, повреждённый, несовместимый, слишком большой или чужой OVF перестраивается; ошибка публикации не ломает корректный ответ | Набор проверок контейнера и публикации подтверждает перестроение, атомарную замену и ограниченный резервный слой памяти |
+| 5 | Обнаруженное повреждение PGM остаётся видимым пропуском или ошибкой источника и не скрывается старым OVF | Фоновая потоковая проверка CRC исключает повреждённый источник из допустимого набора и не использует его OVF |
+| 6 | Изменение формулы состояния или правил краткого списка не перестраивает факты, пока сохранённых измерений достаточно | Эти версии не входят в `FactKey`; проверки версий подтверждают разделение фактов и представления |
+| 7 | Каждый сохранённый элемент краткого списка встречается при проходе курсором ровно один раз; групповой счётчик и потери сохраняются | Проверки курсора используют закреплённое представление и канонический порядок событий |
+| 8 | Идентификаторы событий сохраняются при обычном переходе активных данных в запечатанные; ограничения идентификатора по содержимому опубликованы | Проверки перехода и разных `SegmentLineageId` не используют путь, имя файла или отдельный идентификатор хранилища |
+| 9 | Канонический построитель активных данных не теряет факты; превышение жёсткого предела даёт `Incomplete` и запрещает продвижение | Проверки машины состояний активных данных и продвижения подтверждают оба пути |
+| 10 | Пропуск обязательного домена всегда даёт числовое `None`, а не ложное зелёное значение | Наборы данных веб-API и свойства аналитического ядра проверяют неизвестный результат |
+| 11 | Доверенный нижний предел сохраняется при разбиении, запечатывании и худшем прореживании; неизвестное значение остаётся неизвестным | Свойства состояния и прореживания проверяют сохранение подтверждений |
+| 12 | Для каждого фактора опубликованы покрытие, применимость и потери; один отображаемый коэффициент не служит критерием корректности | Проверки API охватывают все реализованные семейства и причины потерь |
+| 13 | Скорости счётчиков используют фактический соседний интервал, семейства сбросов и пропуски; граница файла не меняет результат | Проверка граничных отсчётов охватывает сбросы, пропуски и произвольный диапазон |
+| 14 | Каждое семейство имеет проверяемый путь от источника к факту, отсчёту или состоянию с единицами, сбросом, покрытием и потерями | Проверки извлечения охватывают реестр событий и метрик и отвергают неподдерживаемую раскладку явно |
+| 15 | Попадания в память и OVF обходят допуск построения; одинаковые `FactBuildKey` объединяются, разные задачи глобально ограничены | Проверки веб-допуска охватывают очередь, взвешенную ёмкость, ожидание, отмену и независимые ключи |
+| 16 | Резервный слой памяти ограничен байтами и часами сегментов; повторные попытки наблюдаемы; размер «плотного часа» измерен | Режим `memory-only`, точный учёт памяти и машина восстановления записи входят в квалификационный артефакт |
+| 17 | Квота и сборка мусора учитывают производные файлы, безопасны при нескольких читателях и никогда не удаляют источник | Плоское сканирование, единственный владелец, льготный период, повторная проверка inode и сохранение PGM/`active.parts` покрыты набором GC |
+| 18 | Все девять режимов §18 воспроизводимо выполняются на зафиксированном профиле узла и файловой системы | Средство `overview_qualification` записывает режимы, размеры, ввод-вывод, задержки, профиль хранения и ссылки на проверки |
 
 ### 20.2 Доказательство приёмки
 
-Для каждой строки §20.1 итоговый пакет обязан связать exact requirement с test/benchmark name, fixture schema, exact git head, CI run/attempt/jobs, artifact checksum, raw result и pass/fail. Любой `Частично`, `Открыто`, mixed-run artifact или результат не с exact head блокирует parity qualification; требование при этом не ослабляется.
+Для каждой строки §20.1 итоговый пакет обязан связать требование с именем
+проверки или измерения, схемой набора данных, точным коммитом Git, запуском,
+попыткой и заданиями CI, контрольной суммой артефакта, исходным результатом и
+решением `PASS` или `FAIL`. Смешивание разных запусков, результат из рабочего
+дерева с незакоммиченными изменениями или несовпадающий коммит блокируют
+приёмку.
 
 M6 presentation evidence применяется к существующим production handlers и OpenAPI/JSON fixtures. Оно обязано проверить `score=null`/unknown при required gap, сохранение trusted floor, явные loss/partial/applicability, отсутствие interpolation и locale-neutral stable machine fields. Это API/presenter acceptance, не утверждение о render coverage несуществующего UI.
 
-## 21. Вехи реализации parity v1
+## 21. Вехи реализации `parity-v1`
 
-Все этапы ниже входят в parity v1. Persistent disk index остаётся обязательным и не переносится в будущую продуктовую веху.
+Все этапы входят в `parity-v1`. Постоянные соседние OVF обязательны и не
+переносятся в будущую продуктовую веху.
 
-### 21.1 Фактически влитые M0–M4
+### 21.1 Основные этапы
 
-| Веха | Merge | Реализовано в текущем data scope | Не закрывает target contract |
-| --- | --- | --- | --- |
-| M0 | PR #97, `ed812259a64f12f5b12f75cb87bde3939ce9de7f` | `EventObservation`, counts/coverage/reduction contracts, half-open oracle и базовые properties | Canonical `EventFact` и production metric mappings |
-| M1 | PR #98, `8cfc560cf7d927514b649719fe794fb5805e2eb7` | Selective PGM reads, descriptors, targeted dictionary resolution, bounded PGKOVF header/directory/block admission | Наполнение всех target blocks; `Zstd` не реализован, current codec — `None` |
-| M2 | PR #99, `6a21924b797d4b6aa5e55c931d42166f6ec418cf` | Extraction восьми log layouts, sealed `SegmentFacts`, atomic no-replace durable publication, raw fallback и restart-warm path | `EVENT_FACTS`, gauges, counters, resets и entity states остаются canonical-empty |
-| M3 | PR #100, `be39d8c1f9989565def797bb32eb0d7fb72ef894` | Authoritative refresh, live/seal state machines, lineage, provenance-gated promotion, durable-first dual-budget fallback LRU | Persistence backoff, quota/GC, source scrub и fact-build admission |
-| M4 | PR #103, `0c1a37e347d112b02943aaed0c28f6ad90a4e7f3` | Atomic publication одной snapshot/timeline pair, timeline APIs, pinned cursors, byte-bounded response cache и `ResponseKey` single-flight | Canonical event/metric data, explicit-only startup namespace, fact-build single-flight, weighted cold admission и full numeric health |
+| Этап | Изменение | Результат |
+| --- | --- | --- |
+| M0–M4 | PR #97–#103 | Наблюдения и покрытие, выборочное чтение PGM, контейнер PGKOVF, извлечение событий, активные данные, атомарные представления, API временной шкалы, курсоры и точные ответы в памяти |
+| Завершение данных | PR #114, `de70586a`–`5454381e` | Канонические события, счётчики, измерения, сбросы и состояния; извлечение метрик; граничные отсчёты; запросы по всем поддерживаемым семействам |
+| Устойчивость M5 | PR #114, `4da60055`–`8521384a` | Координация по `FactBuildKey`, взвешенный допуск, очередь и работники, типизированная перегрузка, фоновая проверка источника и полное покрытие API |
+| Проверка M6 | PR #114, начиная с `5610686c` | Исходный эталон для всех семейств, квалификационный артефакт, валидатор, девять режимов и строгие локальные и CI-проверки |
+| Соседнее хранение | PR #114, начиная с `ad57c6dd` | Один каталог `KRONIKA_WEB_DIR`, пары `N.pgm`/`N.ovf`, заголовок v2, атомарная замена, безопасные операции `NOFOLLOW`, единственный владелец и плоская сборка мусора |
 
-Test-only split PR #106 (`0b3d0bacfa1f4253294e46daa06681b719e9b19e`) не меняет production semantics. Demo PR #105 (`d6852a64759ce6852ec6b2492ba248961ed4c4a6`) не является доказательством §20 или M6 qualification.
+Точный итоговый коммит PR #114 указывается квалификационным артефактом и
+запуском CI. Промежуточный коммит или смешанные результаты доказательством
+приёмки не являются.
 
-### 21.2 Data closure перед финальной qualification
+### 21.2 Завершение канонических данных
 
-Следующие slices заполняют уже зарезервированный target schema. Каждый начинается только после подтверждённой строки source mapping; неизвестные units/reset/entity/coverage остаются explicit gap.
+PR #114 заполняет зарезервированные блоки только при доказанном соответствии
+источника:
 
-1. Материализовать policy-neutral `EVENT_FACTS` для поддерживаемых observations, сохранив supporting IDs, grouped counts, evidence и lineage. `NotablePolicy` остаётся projection, `IncidentDiagnosis` не персистится.
-2. Заполнить `COUNTER_SAMPLES` и `RESET_MARKERS` только для существующих PGM sections с доказанными unit, series/entity identity, reset family, coverage и loss.
-3. Заполнить `GAUGE_SAMPLES`, `ENTITY_STATES` и factor coverage только из natural timestamped samples и complete bounded populations. Готовые health points и chart buckets не сохраняются.
-4. Интегрировать versioned health profiles только после решения владельца по curves, required profiles и thresholds.
+1. `EVENT_FACTS` хранит нейтральные к политике факты с идентификаторами
+   подтверждающих наблюдений, групповыми счётчиками, качеством подтверждений и
+   происхождением. `NotablePolicy` остаётся проекцией, а
+   `IncidentDiagnosis` не сохраняется.
+2. `COUNTER_SAMPLES` и `RESET_MARKERS` создаются только для секций PGM с
+   доказанными единицами, идентификаторами рядов и сущностей, семейством сброса,
+   покрытием и потерями.
+3. `GAUGE_SAMPLES`, `ENTITY_STATES` и покрытие факторов строятся из
+   естественных отсчётов с временными метками и полных ограниченных составов.
+   Готовые точки состояния и интервалы графиков не сохраняются.
+4. Неизвестные единицы, сброс, сущность или покрытие дают явный пропуск или
+   `UnsupportedLayout`, а не предполагаемое нулевое значение.
 
-M5 infrastructure может разрабатываться параллельно data closure, но M6 full oracle и итоговый §20 dossier не начинаются как финальная qualification до заполнения согласованного data scope.
+### 21.3 M5. Устойчивость и допуск
 
-### 21.3 M5. Resilience и admission
+M5 реализован отдельными проверяемыми частями:
 
-M5 делится на независимо проверяемые обязательные slices:
+1. Безопасная при отмене координация построения по `FactBuildKey`, включая
+   разделение разных `SegmentLineageId`, отмену ожидающего запроса и очистку
+   после любого результата.
+2. Справедливый взвешенный допуск по байтам PGM, декодированным байтам, строкам
+   для обработки, файловым дескрипторам, чтению, записи и публикации; число
+   работников, очередь, параллелизм запроса и ожидание ограничены.
+3. Состояния записи и задержка повторных попыток для `EROFS`, `EACCES`,
+   `ENOSPC`, квоты и временных ошибок ввода-вывода; допускаются одна попытка
+   сборки мусора и одна фоновая проба.
+4. Квота и безопасная для срока хранения сборка мусора по полному
+   авторитетному снимку, двум поколениям и временному льготному периоду.
+   Изменять каталог может только владелец; PGM и `active.parts` не удаляются.
+5. Ограниченная потоковая проверка CRC исходных секций, после которой
+   повреждённый источник не может быть скрыт старым OVF.
+6. Метрики §19, точный учёт рабочего набора «плотного часа» и типизированная
+   диагностика перегрузки и публикации.
 
-1. Cancellation-safe fact-build single-flight по `FactBuildKey`, включая different-lineage isolation, waiter cancellation и typed terminal cleanup.
-2. Weighted/fair global cold-work admission: PGM bytes, decoded bytes, CPU, FD/read/write/publication bounds, bounded workers/queue, per-request parallelism и `Retry-After`.
-3. Persistent cache modes и retry/backoff для `EROFS`, `EACCES`, `ENOSPC`, quota и transient I/O; один bounded GC retry и successful background probe.
-4. Disk quota и retention-safe GC по authoritative successful scan, two-generation grace и single owner; concurrent readers безопасны, PGM/`active.parts` никогда не удаляются.
-5. Bounded source scrub, который после обнаружения source damage не позволяет старому derived file маскировать gap.
-6. Все metrics §19, dense working-set accounting и typed overload/persistence diagnostics.
+На всех путях сохраняются первоочередное чтение OVF, резервный слой памяти с
+двумя пределами, атомарная публикация OVF и атомарная публикация представления.
 
-Во всех slices сохраняются durable-first order, dual-budget fallback, atomic fact publication и atomic view publication.
+### 21.4 M6. Итоговая проверка
 
-Текущий implementation snapshot покрывает persistence-recovery slice 3 и ограниченную logical-quota/fail-closed-GC часть slice 4. Это не закрывает всю строку §20.1 без exact-head qualification. Slices 1 (`FactBuildKey` single-flight) и 2 (weighted/fair admission) остаются `OPEN` и не отменяются текущей сериализацией web refresh. Source scrub и оставшаяся metrics/dense qualification также открыты.
+M6 состоит из отдельных обязательных проверок:
 
-### 21.4 M6. Parity qualification
+1. Полный эталон прямого чтения, метаморфные проверки разбиения,
+   запечатывания и активных данных, а также проверки повреждений и допуска для
+   всех реализованных канонических семейств.
+2. Версионированный набор «плотный час» и точное измерение декодированного,
+   размещённого и закреплённого объёма. Утверждённые пределы развёртывания
+   обязательны; до решения владельца артефакт сохраняет `owner_deferred` без
+   вывода о допустимости размера.
+3. Девять режимов §18 на одном точном профиле узла и файловой системы.
+4. Проверки рабочего API и его JSON по §20.2. Проверки отрисовки появляются
+   только вместе с отдельно утверждённым контрактом пользовательского
+   интерфейса.
+5. Один машиночитаемый артефакт, который связывает все восемнадцать строк
+   §20.1 с одной попыткой CI и одним точным коммитом.
 
-M6 также проходит отдельными gates:
+Графики не входят в завершение данных, M5 или M6. Возврат к ним требует
+отдельного решения владельца, точного перечня рядов, соответствия источникам,
+реально поддерживаемого кодека и измеренного изменения размера.
 
-1. Полный forced-raw oracle, metamorphic partition/seal/live suite и corruption/admission suite для всех реализованных canonical families.
-2. Versioned dense-hour fixture и точное измерение decoded/resident/pinned overhead. Утверждённые deployment budgets проверяются обязательно; до решения владельца artifact сохраняет `owner_deferred` без deployment verdict.
-3. Cold/restart/hot/range-warm/live/concurrent/memory-only benchmarks §18 на одном exact host/filesystem profile.
-4. Production API/presenter fixtures §20.2. Настоящие render tests появляются только вместе с отдельным owner-approved UI contract и не подменяются fake UI.
-5. Единый machine-readable dossier, который закрывает все 18 строк §20.1 на одном exact head.
+## 22. Явные нецели и отклонённые варианты
 
-Charts не входят ни в data closure, ни в M5/M6. Возврат к ним требует отдельного решения владельца, exact series inventory, source mapping, реально поддерживаемого codec и измеренного encoded delta.
+### 22.1 Нецели v1
 
-## 22. Явные нецели и отклонённые alternatives
+- Изменение средства записи, PGM или контрактов источников сборщиков.
+- Точная история каждой строки журнала, если её нет в PGM.
+- Согласованность производных данных между узлами.
+- Криптографическая подлинность при недоверенном процессе записи без
+  отдельного требования безопасности.
+- Использование OVF как архива после удаления PGM.
+- Неограниченный предварительный прогрев всего срока хранения.
+- SSE до стабилизации представлений и курсоров.
+- Новый крейт только для фактов обзора.
+- Сохранение `IncidentDiagnosis` как факта источника.
+- Универсальная вероятность «здоровья» без калибровочного набора и исхода.
 
-### 22.1 Non-goals v1
+### 22.2 Отклонённые физические варианты
 
-- Изменение writer, PGM или collector source contracts.
-- Source-exact per-log-line history, которой нет в PGM.
-- Cross-host/distributed cache coherence.
-- Hostile-writer authenticity/signatures без отдельного security requirement.
-- Cache как архив после удаления PGM.
-- Unbounded startup prewarm всего retention.
-- SSE до стабилизации view/cursor semantics.
-- Новый crate только ради overview cache.
-- Сохранение IncidentDiagnosis как source fact.
-- Универсальная вероятность «здоровья» без calibration dataset/outcome.
+**Принадлежащие средству записи `.heatmap` или `.charts`.** Такой вариант
+замораживает семантику скоростей и состояния, меняет владельца PGM и требует
+перестраивать данные при изменении формулы.
 
-### 22.2 Отклонённые physical alternatives
+**Глобальный дописываемый производный индекс.** Для v1 он создаёт второй журнал
+предзаписи с кадрами, блокировками, надгробиями, уплотнением и широкой областью
+последствий повреждения.
 
-**Writer-owned `.heatmap`/`.charts`.** Отклонено: замораживает rates/health semantics, меняет writer/PGM ownership и заставляет data rebuild при formula change.
+**Гибридные объекты с авторитетным манифестом.** Авторитетный каталог
+сегментов и диапазонов уже даёт считывателю снимок, а манифест не устраняет
+выборочное чтение нескольких полезных нагрузок. Восстанавливаемая подсказка
+допустима позже, если измерения докажут узкое место при запуске, сканировании
+каталога или сборке мусора либо появится второй потребитель.
 
-**Global append-only derived index.** Отклонено для v1: создаёт второй WAL с framing, locks, tombstones, compaction и большим corruption blast radius.
+**Только LRU в памяти.** Не обеспечивает быстрый путь после перезапуска и для
+многодневного диапазона.
 
-**Hybrid blobs + manifest как authority.** Не нужен в v1: authoritative segment/range catalog уже даёт reader snapshot, а manifest не устраняет N selective payload reads. Позже допускается rebuildable hint, если profiling докажет directory/startup/GC bottleneck или появится второй consumer.
+**Только постоянные точные ответы.** Не заменяют факты: новый диапазон, шаг или
+фильтр снова потребует чтения PGM, а правила признания ответа устаревшим станут
+комбинаторными.
 
-**Только in-memory LRU.** Полезен как prototype, но не достигает restart-warm и multi-day parity.
+**Сводка событий на весь сегмент.** Недостаточна для произвольного частичного
+диапазона, скоростей с учётом сбросов и стабильной постраничной выдачи.
 
-**Только persistent exact responses.** Не заменяет facts: новый range/step/filter снова потребует raw PGM, а invalidation станет combinatorial.
+**Заранее вычисленные `HealthPoint` или краткий список.** Изменение правил
+потребует перестроения, а объединение готовых штрафов и оценок нарушит
+инвариантность разбиения.
 
-**Segment-wide EventDigest/endpoints.** Недостаточно для arbitrary partial range, reset-aware rate и stable event pagination.
+**Краткий список активных данных с потерями.** Несовместим с авторитетной
+сохранённой выдачей `/events` и продвижением после запечатывания.
 
-**Canonical precomputed HealthPoint/notable list.** Отклонено: policy change заставляет rebuild, merge готовых penalties/scores нарушает partition invariance.
-
-**Lossy live top-N.** Отклонено для canonical state: несовместимо с authoritative retained `/events` и seal promotion.
-
-**Gap interpolation.** Запрещено для health и counter continuity: рисует данные, которых source не наблюдал.
+**Интерполяция пропусков.** Запрещена для состояния и непрерывности счётчиков:
+она изображает данные, которых источник не наблюдал.
 
 ## 23. Оставшиеся продуктовые решения
 
 Следующие решения уже закрыты:
 
-- target contract требует explicit non-empty `store_namespace`; path-derived fallback не допускается, а имеющийся startup fallback остаётся implementation gap, не открытым продуктовым выбором;
-- charts owner-deferred и не входят в parity v1; их стоимость не измерена;
-- пока production UI отсутствует, M6 проверяет API/presenter fixtures, а не заявляет render coverage.
+- `KRONIKA_WEB_DIR` — один каталог, который целиком принадлежит PgKronika;
+  `active.parts`, `N.pgm` и `N.ovf` находятся рядом, а PGM и OVF имеют
+  одинаковую основную часть имени;
+- дополнительного корня, уровня каталогов, идентификатора хранилища, хеша пути
+  и производного имени файла нет; `FactKey`, происхождение и версии контрактов
+  остаются проверяемыми данными заголовка;
+- графики отложены владельцем и не входят в `parity-v1`; их стоимость не
+  измерена;
+- пока рабочего пользовательского интерфейса нет, M6 проверяет API и его JSON,
+  но не заявляет покрытие отрисовки.
 
 Открыты четыре калибруемых продуктовых решения:
 
-1. Конкретные factor curves, required profiles и state thresholds после выбора outcome и calibration fixtures.
-2. Deployment budgets disk/RAM/FD/build queue и cursor TTL в пределах absolute safety caps.
-3. Maintenance/topology declarations, которые позволят подавлять planned shutdown и определять required replication members.
-4. Scope и rendering/i18n contract будущего production UI, если владелец решит его добавить.
+1. Конкретные кривые факторов, обязательные профили и пороги состояния после
+   выбора измеримого исхода и калибровочных наборов.
+2. Пределы диска, памяти, файловых дескрипторов, очереди построения и времени
+   жизни курсора для конкретного развёртывания в пределах абсолютных
+   ограничений безопасности.
+3. Описания обслуживания и топологии, которые позволят подавлять плановое
+   завершение и определять обязательных участников репликации.
+4. Объём, отрисовка и локализация будущего рабочего пользовательского
+   интерфейса, если владелец решит его добавить.
 
-Отсутствие калибруемых значений не ослабляет обязательные data, structural, I/O
-и performance gates и не создаёт deployment-size claim. Заданные значения
-проверяются как обязательные deployment gates. Их изменение версионирует
-policy/configuration, но не меняет PGM, physical fact identity или data-honesty
-invariants.
+Отсутствие калибруемых значений не ослабляет обязательные проверки данных,
+структуры, ввода-вывода и производительности и не означает одобрения размера
+для развёртывания. Заданные значения становятся обязательными проверками
+развёртывания. Их изменение версионирует правила или конфигурацию, но не меняет
+PGM, физическое соответствие PGM/OVF или инварианты честности данных.

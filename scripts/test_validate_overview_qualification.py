@@ -105,5 +105,37 @@ class DeploymentBudgetValidationTests(unittest.TestCase):
         self.assertIn("dense fact file exceeds its approved disk budget", failures)
 
 
+class StorageValidationTests(unittest.TestCase):
+    def test_owned_directory_uses_same_stem_siblings(self) -> None:
+        failures: list[str] = []
+        VALIDATOR.validate_storage(
+            {
+                "model": "owned-data-directory-sibling-sidecars-v1",
+                "active_journal_name": "active.parts",
+                "pgm_file_name": "dense-hour.pgm",
+                "sidecar_file_name": "dense-hour.ovf",
+                "same_stem": True,
+            },
+            failures,
+        )
+        self.assertEqual(failures, [])
+
+    def test_different_stems_are_rejected(self) -> None:
+        failures: list[str] = []
+        VALIDATOR.validate_storage(
+            {
+                "model": "owned-data-directory-sibling-sidecars-v1",
+                "active_journal_name": "active.parts",
+                "pgm_file_name": "dense-hour.pgm",
+                "sidecar_file_name": "other.ovf",
+                "same_stem": False,
+            },
+            failures,
+        )
+        self.assertIn(
+            "qualification files are not same-stem PGM/OVF siblings", failures
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

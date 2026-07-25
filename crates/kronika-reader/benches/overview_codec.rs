@@ -236,9 +236,7 @@ fn benchmark(criterion: &mut Criterion) {
         cold.throughput(Throughput::Elements(2_048));
         cold.bench_function("extract_2048_lifecycle_rows", |bencher| {
             bencher.iter(|| {
-                black_box(
-                    SegmentFacts::extract(black_box(&unit), &LIMIT).expect("extract"),
-                );
+                black_box(SegmentFacts::extract(black_box(&unit), &LIMIT).expect("extract"));
             });
         });
         cold.finish();

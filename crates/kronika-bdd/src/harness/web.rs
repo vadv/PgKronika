@@ -189,11 +189,21 @@ pub(crate) async fn section_page(dir: &Path, name: &str, source: u64) -> Result<
 /// end-to-end collector → PGM → reader → HTTP assertion used by the `PostgreSQL`
 /// 15–18 feature matrix.
 pub(crate) async fn assert_timeline_pg_log_contract(
-    dir: &Path,
+    segment: &Path,
     from_us: i64,
     to_us: i64,
 ) -> Result<()> {
     anyhow::ensure!(from_us < to_us, "timeline fixture range is empty");
+    anyhow::ensure!(
+        segment
+            .extension()
+            .is_some_and(|extension| extension == "pgm"),
+        "timeline fixture is not a sealed PGM: {}",
+        segment.display()
+    );
+    let dir = segment
+        .parent()
+        .context("the sealed segment has no parent directory")?;
     let snapshot = LocalDirSnapshot::open(dir).context("open the store snapshot")?;
     let state = AppState::new(snapshot).context("build the timeline web state")?;
     let router = app(state, None, bdd_metrics_handle());
@@ -253,6 +263,12 @@ pub(crate) async fn assert_timeline_pg_log_contract(
     assert_shared_event_facts(&overview, &events, source)?;
     assert_metric_factor_coverage(&overview, &events, &health)?;
     assert_parsed_panic_and_child_termination_do_not_set_health_floor(&health)?;
+    let sidecar = segment.with_extension("ovf");
+    anyhow::ensure!(
+        sidecar.is_file() && sidecar.parent() == Some(dir),
+        "timeline did not publish the same-stem sibling sidecar: {}",
+        sidecar.display()
+    );
     Ok(())
 }
 

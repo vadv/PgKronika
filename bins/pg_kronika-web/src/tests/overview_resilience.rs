@@ -157,13 +157,9 @@ async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
     let segment_path = dir.path().join("one.pgm");
     write_overview_event_segment(dir.path());
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
-    let state = AppState::with_overview_config(
-        snapshot,
-        0,
-        Duration::from_secs(10),
-        OverviewConfig::new(),
-    )
-    .expect("state");
+    let state =
+        AppState::with_overview_config(snapshot, 0, Duration::from_secs(10), OverviewConfig::new())
+            .expect("state");
     corrupt_first_section_body(&segment_path);
 
     let response = app(state.clone(), None, test_metrics_handle())

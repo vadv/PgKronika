@@ -294,9 +294,13 @@ mod tests {
         let source_descriptor = SourceDescriptor([3; 32]);
         let derived = lineage_from_catalog(&catalog, source_descriptor).expect("entry");
         let descriptor = CatalogEntryDescriptor::of(&catalog.entries[0]).canonical_bytes();
-        let expected =
-            SegmentIdentity::sealed(catalog.source_id, source_descriptor.0, 1_022_001, &descriptor)
-                .id();
+        let expected = SegmentIdentity::sealed(
+            catalog.source_id,
+            source_descriptor.0,
+            1_022_001,
+            &descriptor,
+        )
+        .id();
         assert_eq!(derived, expected);
     }
 }

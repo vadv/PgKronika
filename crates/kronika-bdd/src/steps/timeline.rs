@@ -1,6 +1,6 @@
 //! Supported-major timeline regression over deterministic `PostgreSQL` log facts.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cucumber::{given, then};
 
 use crate::BddWorld;
@@ -27,8 +27,5 @@ fn fixed_timeline_log_fixture(world: &mut BddWorld) -> Result<()> {
 #[then("the fixed log and metric facts reconcile through the source-scoped timeline")]
 async fn source_scoped_timeline_reconciles(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();
-    let dir = segment
-        .parent()
-        .context("the sealed segment has no parent directory")?;
-    web::assert_timeline_pg_log_contract(dir, FIXTURE_FROM_US, FIXTURE_TO_US).await
+    web::assert_timeline_pg_log_contract(&segment, FIXTURE_FROM_US, FIXTURE_TO_US).await
 }

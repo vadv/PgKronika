@@ -530,8 +530,7 @@ fn scan_directory(directory: &File, max_entries: usize) -> Result<Inventory, (Sc
         if inventory.scanned > u64::try_from(max_entries).unwrap_or(u64::MAX) {
             return Err((ScanError::Capped, inventory.scanned));
         }
-        let stat = stat_entry(directory, name)
-            .map_err(|error| (error, inventory.scanned))?;
+        let stat = stat_entry(directory, name).map_err(|error| (error, inventory.scanned))?;
         if name.to_bytes() == OWNER_LOCK_NAME.as_bytes() {
             account(&mut inventory.usage.locks, &stat);
             continue;

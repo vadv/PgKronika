@@ -550,13 +550,8 @@ impl LiveBuilder {
             return Err(LiveFoldError::NonMonotonePart);
         }
         let discriminator = part_discriminator(&part.part_id);
-        let facts = SegmentFacts::fold_live(
-            unit,
-            self.generation.0,
-            &discriminator,
-            &self.bounds,
-        )
-        .map_err(LiveFoldError::Build);
+        let facts = SegmentFacts::fold_live(unit, self.generation.0, &discriminator, &self.bounds)
+            .map_err(LiveFoldError::Build);
         let facts = match facts {
             Ok(facts) => facts,
             Err(error) => {
@@ -902,8 +897,7 @@ pub fn reconcile_seal<R: ReadAt>(
 ) -> Result<SealOutcome, BuildError> {
     let parts: Vec<_> = candidate.chunks().iter().map(Arc::as_ref).collect();
     if candidate.is_current()
-        && let Some(promoted) =
-            SegmentFacts::try_promote_from_parts(sealed_unit, &parts, bounds)?
+        && let Some(promoted) = SegmentFacts::try_promote_from_parts(sealed_unit, &parts, bounds)?
     {
         let (facts, persist_error, fact_write_bytes) =
             store.admit_publish_or_fallback(&promoted, sealed_context, bounds)?;
@@ -1793,8 +1787,7 @@ mod tests {
             let sealed_bytes = sealed_from_slices(&slices);
             let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
             let context = sealed_context();
-            let rebuilt =
-                SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold rebuild");
+            let rebuilt = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold rebuild");
 
             let mut builder = live_builder();
             fold_slices(&mut builder, &slices);
@@ -1831,8 +1824,7 @@ mod tests {
         let sealed_bytes = fixture.sealed_bytes();
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open all-family seal");
         let context = sealed_context();
-        let cold =
-            SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold all-family rebuild");
+        let cold = SegmentFacts::extract(&sealed_unit, &LIMIT).expect("cold all-family rebuild");
 
         let partitions = fixture.contiguous_partitions();
         assert_eq!(partitions.len(), 4);

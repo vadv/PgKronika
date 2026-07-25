@@ -274,7 +274,7 @@
     "/v1/timeline/overview": {
       "get": {
         "operationId": "timelineOverview",
-        "description": "Queries one half-open source range of at most 31 days. Before fact-cache or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Decoded and durable exact hits bypass cold admission. A selected source read failure returns an uncached partial 200 response with an explicit known gap; cold FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries one half-open source range of at most 31 days. Before sidecar or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission. A selected source read failure returns an uncached partial 200 response with an explicit known gap; FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineSource" },
@@ -302,7 +302,7 @@
     "/v1/timeline/events": {
       "get": {
         "operationId": "timelineEvents",
-        "description": "Queries a canonical source set over a half-open range of at most 31 days. Before fact-cache or source access, one aggregate limit applies to intersecting sealed segments across the deduplicated source set (default 1024, operator range 1..=4096). Exact decoded and durable hits bypass cold admission; selected source failures remain explicit partial gaps, while cold FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries a canonical source set over a half-open range of at most 31 days. Before sidecar or source access, one aggregate limit applies to intersecting sealed segments across the deduplicated source set (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission; selected source failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineEventSources" },
@@ -335,7 +335,7 @@
     "/v1/timeline/health": {
       "get": {
         "operationId": "timelineHealth",
-        "description": "Queries one half-open source range of at most 31 days. Before fact-cache or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Exact decoded and durable hits bypass cold admission; selected source failures remain explicit partial gaps, while cold FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
+        "description": "Queries one half-open source range of at most 31 days. Before sidecar or source access, the request is limited to the configured number of intersecting sealed segments (default 1024, operator range 1..=4096). Decoded-memory and valid sibling-OVF hits bypass source-build admission; selected source failures remain explicit partial gaps, while FIFO rejection or timeout returns cold_build_overloaded. Admitted work remains limited to 1,048,576 retained observations and a 64 MiB cloned-observation charge.",
         "security": [{ "basicAuth": [] }, {}],
         "parameters": [
           { "$ref": "#/components/parameters/timelineSource" },

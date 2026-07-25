@@ -96,13 +96,9 @@ fn publication_uses_one_flat_same_stem_sidecar() {
         .expect("write active view");
     let store = store(directory.path(), immediate_config(128));
 
-    let (_facts, _context, sidecar) =
-        published(&store, &directory, 1, "1721916000000000");
+    let (_facts, _context, sidecar) = published(&store, &directory, 1, "1721916000000000");
 
-    assert_eq!(
-        sidecar,
-        directory.path().join("1721916000000000.ovf")
-    );
+    assert_eq!(sidecar, directory.path().join("1721916000000000.ovf"));
     assert!(directory.path().join("active.parts").is_file());
     assert!(directory.path().join("1721916000000000.pgm").is_file());
     assert!(directory.path().join("1721916000000000.ovf").is_file());
@@ -198,7 +194,10 @@ fn source_entries_and_symlinks_are_never_followed_or_removed() {
         std::fs::read(directory.path().join("segment.pgm")).expect("source survives"),
         lifecycle_pgm(5)
     );
-    assert_eq!(std::fs::read(&active).expect("active view survives"), b"active view");
+    assert_eq!(
+        std::fs::read(&active).expect("active view survives"),
+        b"active view"
+    );
     assert!(
         std::fs::symlink_metadata(&linked)
             .expect("symlink survives")
@@ -244,8 +243,8 @@ fn quota_accounts_only_derived_files_in_the_owned_data_directory() {
     let directory = TempDir::new().expect("data directory");
     let bytes = lifecycle_pgm(8);
     let facts = facts(&bytes);
-    let encoded_len = u64::try_from(facts.encode(&LIMIT).expect("encode facts").len())
-        .expect("encoded size");
+    let encoded_len =
+        u64::try_from(facts.encode(&LIMIT).expect("encode facts").len()).expect("encoded size");
     std::fs::write(directory.path().join("segment.pgm"), &bytes).expect("write source PGM");
     std::fs::write(directory.path().join("active.parts"), vec![0_u8; 64 * 1024])
         .expect("write active view");
@@ -345,10 +344,8 @@ fn concurrent_live_gc_read_and_publish_preserve_the_sidecar() {
 fn complete_typed_live_set_preserves_each_sibling_sidecar() {
     let directory = TempDir::new().expect("data directory");
     let store = store(directory.path(), immediate_config(256));
-    let (first, _first_context, first_path) =
-        published(&store, &directory, 12, "first");
-    let (second, _second_context, second_path) =
-        published(&store, &directory, 13, "second");
+    let (first, _first_context, first_path) = published(&store, &directory, 12, "first");
+    let (second, _second_context, second_path) = published(&store, &directory, 13, "second");
     let live: HashSet<_> = [key(&first), key(&second)].into_iter().collect();
 
     for generation in 1..=3 {

@@ -219,8 +219,7 @@ mod tests {
             },
         );
         let unit = PgmUnit::open(bytes).expect("open fixture");
-        let facts =
-            Arc::new(SegmentFacts::extract(&unit, &LIMIT).expect("extract fixture facts"));
+        let facts = Arc::new(SegmentFacts::extract(&unit, &LIMIT).expect("extract fixture facts"));
         let key = FactBuildKey::new(
             FactKey::for_identity(facts.identity(), FileKind::SegmentFacts),
             facts.lineage().id(),

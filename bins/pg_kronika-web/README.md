@@ -14,26 +14,24 @@ views. Sealed fact bodies are loaded only for admitted timeline requests.
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `KRONIKA_WEB_DIR` | required | Directory containing `.pgm` files and optional `active.parts`. |
+| `KRONIKA_WEB_DIR` | required | PgKronika-owned directory containing `active.parts`, sealed `.pgm` files, and same-stem `.ovf` sidecars. |
 | `KRONIKA_WEB_ADDR` | required | Listen address in `host:port` form. |
 | `KRONIKA_WEB_BASIC_AUTH` | unset | `user:password`; when absent, UI and `/v1/*` are open. |
 | `KRONIKA_WEB_STALE_AFTER_S` | `10` | `/readyz` returns `503` when the last successful refresh is older than this. |
 | `KRONIKA_WEB_LOG` | `info` | `tracing-subscriber` filter directive. |
-| `KRONIKA_WEB_OVERVIEW_CACHE_DIR` | `<KRONIKA_WEB_DIR>/.pgkronika-overview-cache` | Durable per-segment timeline fact cache. |
-| `KRONIKA_WEB_OVERVIEW_NAMESPACE` | required | Explicit stable store/deployment identity used in timeline fact keys. Keep it unchanged across restarts and equivalent mount paths. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_SEGMENT_HOURS` | `24` | Total admitted segment-hours retained after recoverable durable-publication failures. |
 | `KRONIKA_WEB_OVERVIEW_FALLBACK_BYTES` | `67108864` | Canonical fact-byte budget for the process-local fallback. |
-| `KRONIKA_WEB_OVERVIEW_GC_MAX_ENTRIES` | `100000` | Maximum entries in one complete fact-cache inventory; reaching the bound forbids a sweep. |
+| `KRONIKA_WEB_OVERVIEW_GC_MAX_ENTRIES` | `100000` | Maximum entries in one complete data-directory inventory; reaching the bound forbids a sweep. |
 | `KRONIKA_WEB_OVERVIEW_GC_GRACE_GENERATIONS` | `2` | Distinct authoritative GC generations required before a non-live final is eligible. |
 | `KRONIKA_WEB_OVERVIEW_GC_WALL_GRACE_S` | `120` | Minimum seconds since the first authoritative non-live observation. |
-| `KRONIKA_WEB_OVERVIEW_GC_ARTIFACT_GRACE_S` | `600` | Minimum age of a recognized temporary or quarantine file before cleanup. |
-| `KRONIKA_WEB_OVERVIEW_CACHE_MAX_LOGICAL_BYTES` | unset | Optional logical-`st_size` ceiling for accounted files in the fact-cache namespace. |
-| `KRONIKA_WEB_OVERVIEW_CACHE_MAX_FILES` | unset | Optional file-count ceiling for the accounted fact-cache namespace. |
+| `KRONIKA_WEB_OVERVIEW_GC_ARTIFACT_GRACE_S` | `600` | Minimum age of a recognized publication temporary file before cleanup. |
+| `KRONIKA_WEB_OVERVIEW_CACHE_MAX_LOGICAL_BYTES` | unset | Optional logical-`st_size` ceiling for recognized derived sidecars and publication artifacts. |
+| `KRONIKA_WEB_OVERVIEW_CACHE_MAX_FILES` | unset | Optional file-count ceiling for recognized derived sidecars and publication artifacts. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_BYTES` | `67108864` | Logical-byte budget for the serialized overview/health response cache. |
 | `KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_ENTRIES` | `4096` | Serialized overview/health response-cache entry budget. |
-| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_BYTES` | `268435456` | Logical resident-byte budget for the decoded sealed-fact L2 cache. |
-| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_ENTRIES` | `4096` | Entry budget for the decoded sealed-fact L2 cache. |
-| `KRONIKA_WEB_OVERVIEW_SOURCE_SCRUB_INTERVAL_S` | `60` | Successful refresh passes between streaming CRC scrubs; each due pass scrubs one sealed section. |
+| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_BYTES` | `268435456` | Logical resident-byte budget for decoded sealed facts retained in memory. |
+| `KRONIKA_WEB_OVERVIEW_DECODED_CACHE_ENTRIES` | `4096` | Entry budget for decoded sealed facts retained in memory. |
+| `KRONIKA_WEB_OVERVIEW_SOURCE_SCRUB_INTERVAL_S` | `60` | Seconds between streaming CRC scrubs; each due scrub checks one sealed section. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS` | `64` | Maximum event views pinned for cursor continuation. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_MAX_BYTES` | `536870912` | Logical-byte budget for cursor-pinned event views. |
 | `KRONIKA_WEB_OVERVIEW_CURSOR_TTL_S` | `300` | Cursor and pinned-view lifetime in seconds. |
@@ -47,14 +45,13 @@ views. Sealed fact bodies are loaded only for admitted timeline requests.
 | `KRONIKA_WEB_OVERVIEW_COLD_DECODED_BYTES` | `1073741824` | Aggregate decoded working-set byte capacity for active cold work. |
 | `KRONIKA_WEB_OVERVIEW_COLD_CPU_ROWS` | `2097152` | Aggregate source-row CPU charge for active cold work. |
 | `KRONIKA_WEB_OVERVIEW_COLD_FILE_DESCRIPTORS` | `16` | Aggregate file-descriptor reservation for active cold work. |
-| `KRONIKA_WEB_OVERVIEW_COLD_READ_BYTES` | `1073741824` | Aggregate source and durable-cache read capacity for active cold work. |
-| `KRONIKA_WEB_OVERVIEW_COLD_WRITE_BYTES` | `1073741824` | Aggregate durable-cache write capacity for active cold work. |
+| `KRONIKA_WEB_OVERVIEW_COLD_READ_BYTES` | `1073741824` | Aggregate PGM and sidecar read capacity for active cold work. |
+| `KRONIKA_WEB_OVERVIEW_COLD_WRITE_BYTES` | `1073741824` | Aggregate sidecar write capacity for active cold work. |
 | `KRONIKA_WEB_OVERVIEW_COLD_PUBLICATIONS` | `4` | Aggregate durable-publication capacity for active cold work. |
 
 ```sh
 KRONIKA_WEB_DIR=/var/lib/pg_kronika \
 KRONIKA_WEB_ADDR=127.0.0.1:8688 \
-KRONIKA_WEB_OVERVIEW_NAMESPACE=prod-primary \
 KRONIKA_WEB_BASIC_AUTH='operator:change-me' \
 pg_kronika-web
 ```
@@ -69,13 +66,13 @@ Timeline resource policy defaults and constraints are:
 | Resource | Default | Constraint or ceiling |
 | --- | ---: | ---: |
 | Recoverable durable-publication fallback | 24 segment-hours, 64 MiB | 744 hours, 256 MiB |
-| Fact-cache GC inventory | 100,000 entries | 1,000,000 entries |
+| Data-directory GC inventory | 100,000 entries | 1,000,000 entries |
 | Non-live final grace | 2 distinct authoritative GC generations and 120 s | Both values must be nonzero; generation grace must be at least 2 |
 | Recognized publication-artifact grace | 600 s | Must be nonzero |
-| Persistent fact-cache admission | No byte or file ceiling by default | Optional nonzero logical-byte and file-count ceilings |
+| Derived sidecar admission | No byte or file ceiling by default | Optional nonzero logical-byte and file-count ceilings |
 | Serialized overview/health response cache | 4,096 entries, 64 MiB logical charge | Both configured budgets are nonzero and fit `usize`. |
-| Decoded sealed-fact L2 cache | 4,096 entries, 256 MiB logical resident charge | Exact hits bypass cold admission; both configured budgets are nonzero and fit `usize`. |
-| Streaming source scrub | One sealed section every 60 successful refresh passes | Interval is nonzero; CRC failure removes the source from the usable descriptor set. |
+| Decoded sealed facts in memory | 4,096 entries, 256 MiB logical resident charge | Exact hits bypass source-build admission; both configured budgets are nonzero and fit `usize`. |
+| Streaming source scrub | One sealed section every 60 s | Interval is nonzero; CRC failure removes the source from the usable descriptor set. |
 | Cursor-pinned event views | 64 views, 512 MiB logical charge, 300 s TTL | All budgets are nonzero; count and bytes fit `usize`. |
 | Selected sealed segments per timeline request | 1,024 | Configurable from 1 through the absolute v1 ceiling of 4,096 |
 | Cold sealed-fact scheduler | 4 workers, FIFO queue 64, per-request parallelism 4, wait 5 s | All limits are nonzero; queue rejection, overweight work, and timeout return an operator-configured retry hint. |
@@ -86,33 +83,43 @@ Timeline resource policy defaults and constraints are:
 | Notable preview | 100 items | Fixed by notable policy v1 |
 | Health line | — | 2,000 points |
 
-`KRONIKA_WEB_OVERVIEW_NAMESPACE` is mandatory and must not be empty. Numeric
-`KRONIKA_WEB_OVERVIEW_*` policy variables accept unsigned decimal integers.
+Numeric `KRONIKA_WEB_OVERVIEW_*` policy variables accept unsigned decimal integers.
 Required budgets, intervals, queue sizes, and weighted capacities must be
-nonzero; either persistent cache ceiling may remain unset. Byte, entry, queue,
+nonzero; either derived-sidecar ceiling may remain unset. Byte, entry, queue,
 and view budgets that become process sizes must fit the platform's `usize`.
 The fallback additionally rejects values above 744 segment-hours or 268435456
 bytes. The selected-segment limit must be in `1..=4096`. Invalid values stop
 startup before the listener binds.
 
-## Persistent fact-cache operation
+## Sibling fact sidecars
 
-Give each web process a separate cache directory unless the deployment
-intentionally uses one mutating process. The first `FactStore` to acquire a
-root holds its advisory owner lock for the store lifetime. Other processes
-pointed at that root can read committed facts, but publication and GC report
-contention; newly built facts remain in the bounded process-local fallback.
+`KRONIKA_WEB_DIR` is one exclusively PgKronika-owned data directory and requires
+no additional storage address or identifier. A sealed segment and its derived
+facts have the same stem:
+
+```text
+/data/active.parts
+/data/1721916000000000.pgm
+/data/1721916000000000.ovf
+```
+
+The first `FactStore` to acquire `.pgkronika-overview.owner.lock` holds the
+only mutation right for the directory during its lifetime. Other processes
+using the same directory may read admitted sidecars; publication and GC report
+contention, and newly built facts remain in the bounded process-local fallback.
 
 The web writer requests GC after every 60 successful timeline publications.
 The generation grace advances only on distinct, complete, authoritative GC
 scans, not on ordinary refreshes. With the defaults, deletion also requires
 120 seconds since the first scan that found a final non-live; the wall grace
 can therefore require a later scan. Any unavailable sealed source, scan error,
-or entry-cap hit authorizes no deletion and does not advance grace. GC is
-confined to `overview/v1`. It validates final-file identity and leaves source
-PGM, `active.parts`, locks, symlinks, and foreign files untouched.
+or entry-cap hit authorizes no deletion and does not advance grace. GC scans
+the owned directory directly with a hard entry bound. It admits a same-stem
+`.ovf` only after validating the PGKOVF header against its PGM, never follows
+symlinks, and never removes PGM, `active.parts`, or the owner lock.
 
-The optional persistent ceilings count logical file sizes and file entries;
+The optional derived-file ceilings count recognized sidecar and publication
+artifact sizes and entries;
 they are not free-space limits or physical filesystem quotas. If a complete
 scan cannot admit a publication without exceeding a configured ceiling, the
 response still uses the bounded in-memory fallback. `ENOSPC` and configured
@@ -123,8 +130,8 @@ Durable reads continue while writes are backed off. A refresh with no new fact
 build still runs the single due recovery probe. Permission and read-only
 failures wait five minutes before the first probe. Capacity and transient I/O
 use per-store jittered exponential delay capped at five minutes. Permanent
-path, layout, identity, and unclassified I/O failures are reported without
-arming global backoff.
+path, sidecar-state, identity, and unclassified I/O failures are reported
+without arming global backoff.
 
 ## Endpoints
 
@@ -213,9 +220,9 @@ See the [OpenAPI contract](openapi.json) and the
   event_instance_id)`.
 - Timeline refresh publishes catalog-derived sealed descriptors and one
   bounded live generation without decoding sealed section bodies. An admitted
-  request loads only the descriptors selected by its source/range plan.
-  Exact decoded-L2, durable, and recoverable-fallback hits bypass cold
-  admission. Missing exact facts share work by the full lineage-qualified
+  request loads only the descriptors selected for its sources and interval.
+  Hits in decoded memory, a valid sibling `.ovf`, or the recoverable in-memory
+  fallback bypass source-build admission. Missing facts share work by the full
   `FactBuildKey`, survive request cancellation, and enter the configurable
   process-wide FIFO scheduler. Queue exhaustion, an overweight build, or FIFO
   timeout returns `503` with `code=cold_build_overloaded` and the configured
@@ -226,17 +233,17 @@ See the [OpenAPI contract](openapi.json) and the
   completeness, and a fact-set identity distinct from the planned complete
   input. Such a partial response is not retained under the complete response
   cache key. The background streaming CRC scrub detects silent section-body
-  damage, marks the segment unavailable, and prevents an older durable derived
-  fact from masking that source gap.
+  damage, marks the segment unavailable, and prevents an older sidecar from
+  masking that source gap.
 - Event counts use checked arithmetic. Severity and category totals,
   SQLSTATE top/other/missing buckets, and joint top/other buckets independently
   reconcile to retained error occurrences; retained groups and physical
   observation rows are separate counts. Retained exactness, source
   completeness, physical-count semantics, freshness, and known loss remain
   independent response fields.
-- Durable lineage-qualified fact files are always consulted before the bounded
-  process-local fallback. Only a recoverable publication failure may populate
-  that fallback. Exact overview/health response caching is bounded by entry
+- A valid sibling sidecar is always consulted before the bounded process-local
+  fallback. Only a recoverable publication failure may populate that fallback.
+  Exact overview/health response caching is bounded by entry
   count and bytes. Event cursors pin an exact immutable view in a count-, byte-,
   and TTL-bounded registry and bind the canonical source set, query, policy,
   and last sort position with a process-local OS-random authentication key.
@@ -297,7 +304,7 @@ the closed one-hot gauges `kronika_web_overview_persist_reason{reason}` and
 `kronika_web_overview_persist_probe_{attempts,failures,skipped}_total`.
 GC publishes scan-complete, sweep-authorized, quota, pending, and scanned-entry
 gauges; cache file/logical-byte/allocated-byte gauges by the closed
-`kind={committed,temporary,quarantine,lock,foreign}` label; skip counters; and
+`kind={sidecar,temporary,lock}` label; skip counters; and
 deleted-file plus unlinked logical/allocated-byte counters. “Unlinked
 allocated bytes” is the opened inode's `st_blocks` charge before unlink; open
 descriptors or hard links can keep those blocks allocated.
@@ -331,7 +338,7 @@ Decoded and durable lookup work uses
 `overview_pgm_sections_decoded`,
 `overview_fact_build_total{result,source_type}`, and
 `overview_fact_build_seconds`; writes use `overview_fact_write_bytes`. The
-decoded L2 publishes
+decoded in-memory layer publishes
 `overview_cache_{entries,bytes}{class="decoded_facts"}` and
 `overview_cache_evictions_total{class="decoded_facts",reason}`.
 

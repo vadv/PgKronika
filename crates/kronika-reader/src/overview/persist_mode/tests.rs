@@ -342,15 +342,9 @@ fn one_gc_retry_can_recover_and_reset_persistence_state() {
 #[test]
 fn incomplete_recovery_scan_forbids_the_capacity_retry() {
     let directory = TempDir::new().expect("cache directory");
-    let gc_config = super::super::gc::GcConfig::new(
-        2,
-        2,
-        Duration::ZERO,
-        Duration::ZERO,
-        None,
-        None,
-    )
-    .expect("valid bounded GC config");
+    let gc_config =
+        super::super::gc::GcConfig::new(2, 2, Duration::ZERO, Duration::ZERO, None, None)
+            .expect("valid bounded GC config");
     let store = FactStore::with_configs(
         directory.path(),
         super::super::fallback::FallbackConfig::default(),

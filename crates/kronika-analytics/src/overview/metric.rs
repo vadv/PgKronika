@@ -352,11 +352,7 @@ impl MetricSeriesDescriptor {
 
 /// Derives a source-qualified entity reference.
 #[must_use]
-pub fn derive_entity(
-    source_id: u64,
-    kind: EntityKind,
-    source_identity: &[u8],
-) -> EntityRef {
+pub fn derive_entity(source_id: u64, kind: EntityKind, source_identity: &[u8]) -> EntityRef {
     let digest = sha256::digest_parts(&[
         METRIC_ENTITY_DOMAIN_TAG,
         &source_id.to_le_bytes(),

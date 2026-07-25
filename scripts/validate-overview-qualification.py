@@ -96,6 +96,31 @@ def validate_budgets(
         warnings.append("dense accounting exceeds a configured deployment budget")
 
 
+def validate_storage(storage: dict[str, object], failures: list[str]) -> None:
+    pgm_name = storage.get("pgm_file_name")
+    sidecar_name = storage.get("sidecar_file_name")
+    check(
+        storage.get("model") == "owned-data-directory-sibling-sidecars-v1",
+        "wrong overview storage model",
+        failures,
+    )
+    check(
+        storage.get("active_journal_name") == "active.parts",
+        "wrong active journal name",
+        failures,
+    )
+    check(
+        isinstance(pgm_name, str)
+        and isinstance(sidecar_name, str)
+        and pgm_name.endswith(".pgm")
+        and sidecar_name.endswith(".ovf")
+        and pgm_name.removesuffix(".pgm") == sidecar_name.removesuffix(".ovf")
+        and storage.get("same_stem") is True,
+        "qualification files are not same-stem PGM/OVF siblings",
+        failures,
+    )
+
+
 def main() -> int:
     args = arguments()
     artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
@@ -134,6 +159,7 @@ def main() -> int:
         "fixed metric byte accounting is empty",
         failures,
     )
+    validate_storage(artifact.get("storage", {}), failures)
 
     mode_rows = artifact.get("modes", [])
     modes = {row.get("mode"): row for row in mode_rows}
@@ -155,8 +181,8 @@ def main() -> int:
         )
         check(
             hot["work_per_iteration"]["pgm_body_reads"] == 0
-            and hot["work_per_iteration"]["cache_writes"] == 0,
-            "process-hot performed cold I/O or a cache write",
+            and hot["work_per_iteration"]["sidecar_writes"] == 0,
+            "process-hot performed cold I/O or a sidecar write",
             failures,
         )
         check(

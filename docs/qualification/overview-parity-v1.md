@@ -1,7 +1,7 @@
 # Overview parity-v1 qualification
 
 The overview qualification artifact is generated from source data at one exact
-Git head. It is evidence for the contract in
+Git commit. It is evidence for the contract in
 `docs/superpowers/specs/2026-07-22-overview-index-timeline-api.md`; it is not a
 portable performance promise.
 
@@ -32,19 +32,32 @@ are configured, final validation requires both measured working sets to fit.
 
 ## Modes and coldness
 
+The artifact records the storage model as one PgKronika-owned data directory.
+The active journal and each sealed source/fact pair are siblings:
+
+```text
+active.parts
+dense-hour.pgm
+dense-hour.ovf
+```
+
+It also records the exact PGM and OVF names and verifies that their stems
+match.
+
 The runner records all nine required modes: `derived-cold`, `restart-warm`,
 `process-hot`, `range-cold/facts-warm`, `live`, `concurrent-identical`,
 `concurrent-disjoint`, `memory-only`, and `oracle-profile`.
 
-`derived-cold` uses a distinct absent cache root for every iteration and times
-the production build path through canonical admission and durable atomic
-publication. `restart-warm` seeds one valid fact file before measurement, then
-uses a newly constructed fact store for each iteration so no process-local
-fallback or decoded cache survives. The runner preserves these cache trees next
+`derived-cold` starts each iteration with a new owned data directory containing
+only `dense-hour.pgm`, then times the production build path through canonical
+admission and atomic publication of the sibling `dense-hour.ovf`.
+`restart-warm` seeds one valid sibling OVF before measurement, then constructs a
+new fact store for each iteration so no process-local fallback or decoded
+in-memory entry survives. The runner preserves these mode data directories next
 to its output artifact as supporting evidence.
 
-“Cold” in this runner means a newly constructed process-level reader or cache
-state. It does not evict the host page cache, and the artifact says
+“Cold” in this runner means newly constructed process-level reader and
+in-memory state. It does not evict the host page cache, and the artifact says
 `storage_cold=false`. A storage-cold result requires a separately controlled
 host/filesystem procedure and must not replace or relabel this measurement.
 

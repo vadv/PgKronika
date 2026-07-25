@@ -104,11 +104,7 @@ fn exact_sealed_descriptors_keep_identical_files_distinct_and_warm() {
     assert_eq!(descriptors[0].catalog_digest, descriptors[1].catalog_digest);
     for descriptor in descriptors {
         let load = snapshot
-            .load_sealed_facts_by_descriptor(
-                descriptor,
-                &store,
-                &LIMIT,
-            )
+            .load_sealed_facts_by_descriptor(descriptor, &store, &LIMIT)
             .expect("cold exact load");
         assert_eq!(load.origin(), FactOrigin::Rebuilt);
     }
@@ -116,11 +112,7 @@ fn exact_sealed_descriptors_keep_identical_files_distinct_and_warm() {
     let restarted = LocalDirSnapshot::open(source.path()).expect("restart snapshot");
     for descriptor in restarted.sealed_descriptors() {
         let load = restarted
-            .load_sealed_facts_by_descriptor(
-                descriptor,
-                &FactStore::new(source.path()),
-                &LIMIT,
-            )
+            .load_sealed_facts_by_descriptor(descriptor, &FactStore::new(source.path()), &LIMIT)
             .expect("warm exact load");
         assert_eq!(load.origin(), FactOrigin::CacheHit);
         assert_eq!(load.pgm_body_read_stats().read_calls, 0);

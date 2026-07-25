@@ -6,8 +6,8 @@ use std::time::Instant;
 use kronika_analytics::overview::MetricFactor;
 use kronika_reader::{
     BuildError, CacheRebuildReason, FactLoad, FactOrigin, FactStore, FallbackStats, LIMIT,
-    LiveView, LocalDirSnapshot, SealOutcome, SealedFactError, SegmentFacts,
-    SourceError, reconcile_seal,
+    LiveView, LocalDirSnapshot, SealOutcome, SealedFactError, SegmentFacts, SourceError,
+    reconcile_seal,
 };
 use tokio::task::JoinSet;
 
@@ -173,12 +173,9 @@ impl OverviewFactLoader {
                         if let Some(facts) = decoded.get(key) {
                             return Ok(facts);
                         }
-                        if let Some(facts) = load_cached(
-                            Arc::clone(&snapshot),
-                            worker_entry.clone(),
-                            store.clone(),
-                        )
-                        .await?
+                        if let Some(facts) =
+                            load_cached(Arc::clone(&snapshot), worker_entry.clone(), store.clone())
+                                .await?
                         {
                             decoded.insert(key, Arc::clone(&facts));
                             return Ok(facts);
@@ -234,12 +231,7 @@ impl OverviewFactLoader {
         snapshot: Arc<LocalDirSnapshot>,
         entry: DescriptorEntry,
     ) -> Result<Option<Arc<SegmentFacts>>, FactLoadFailure> {
-        load_cached(
-            snapshot,
-            entry,
-            self.store.clone(),
-        )
-        .await
+        load_cached(snapshot, entry, self.store.clone()).await
     }
 
     #[allow(

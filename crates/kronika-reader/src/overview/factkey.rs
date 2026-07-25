@@ -83,10 +83,7 @@ impl FactKey {
 
     /// Derives the current `SegmentFacts` key for one exact PGM source.
     #[must_use]
-    pub fn for_current_segment(
-        pgm_source_id: u64,
-        source_descriptor: SourceDescriptor,
-    ) -> Self {
+    pub fn for_current_segment(pgm_source_id: u64, source_descriptor: SourceDescriptor) -> Self {
         Self::derive(
             pgm_source_id,
             source_descriptor,

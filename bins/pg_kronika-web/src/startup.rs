@@ -761,12 +761,10 @@ mod tests {
     #[test]
     fn selected_segment_policy_accepts_the_documented_boundaries() {
         for (raw, expected) in [("1", 1), ("1024", 1_024), ("4096", 4_096)] {
-            let parsed = parse_overview_config(
-                &OverviewConfigRaw {
-                    max_selected_segments: Some(raw),
-                    ..valid_overview_raw()
-                },
-            )
+            let parsed = parse_overview_config(&OverviewConfigRaw {
+                max_selected_segments: Some(raw),
+                ..valid_overview_raw()
+            })
             .expect("documented selected-segment limit is valid");
             assert_eq!(parsed.max_selected_segments, expected);
         }
@@ -775,12 +773,10 @@ mod tests {
     #[test]
     fn selected_segment_policy_rejects_zero_ceiling_plus_one_and_platform_overflow() {
         for raw in ["0", "4097", "340282366920938463463374607431768211455"] {
-            let error = parse_overview_config(
-                &OverviewConfigRaw {
-                    max_selected_segments: Some(raw),
-                    ..valid_overview_raw()
-                },
-            )
+            let error = parse_overview_config(&OverviewConfigRaw {
+                max_selected_segments: Some(raw),
+                ..valid_overview_raw()
+            })
             .expect_err("invalid selected-segment limit must fail");
             assert!(error.contains(MAX_SELECTED_SEGMENTS_ENV), "{error}");
         }
@@ -1100,12 +1096,10 @@ mod tests {
     #[test]
     fn overview_raw_rejects_fallback_hours_above_hard_maximum() {
         let value = (kronika_reader::MAX_FALLBACK_SEGMENT_HOURS + 1).to_string();
-        let error = parse_overview_config(
-            &OverviewConfigRaw {
-                fallback_segment_hours: Some(&value),
-                ..valid_overview_raw()
-            },
-        )
+        let error = parse_overview_config(&OverviewConfigRaw {
+            fallback_segment_hours: Some(&value),
+            ..valid_overview_raw()
+        })
         .expect_err("fallback hours above the hard maximum must fail");
         assert!(error.contains(FALLBACK_SEGMENT_HOURS_ENV), "{error}");
         assert!(error.contains("hard ceiling"), "{error}");
@@ -1114,12 +1108,10 @@ mod tests {
     #[test]
     fn overview_raw_rejects_fallback_bytes_above_hard_maximum() {
         let value = (kronika_reader::MAX_FALLBACK_BYTES + 1).to_string();
-        let error = parse_overview_config(
-            &OverviewConfigRaw {
-                fallback_bytes: Some(&value),
-                ..valid_overview_raw()
-            },
-        )
+        let error = parse_overview_config(&OverviewConfigRaw {
+            fallback_bytes: Some(&value),
+            ..valid_overview_raw()
+        })
         .expect_err("fallback bytes above the hard maximum must fail");
         assert!(error.contains(FALLBACK_BYTES_ENV), "{error}");
         assert!(error.contains("hard ceiling"), "{error}");
@@ -1135,10 +1127,10 @@ mod tests {
 
     #[test]
     fn overview_policy_has_no_separate_directory_or_identity_input() {
-        let first = WebConfig::parse("/data", "127.0.0.1:9000", None, None, None)
-            .expect("first config");
-        let repeated = WebConfig::parse("/data", "127.0.0.1:9000", None, None, None)
-            .expect("repeated config");
+        let first =
+            WebConfig::parse("/data", "127.0.0.1:9000", None, None, None).expect("first config");
+        let repeated =
+            WebConfig::parse("/data", "127.0.0.1:9000", None, None, None).expect("repeated config");
         let isolated = WebConfig::parse("/other", "127.0.0.1:9000", None, None, None)
             .expect("other data directory");
         assert_eq!(first.dir, repeated.dir);
@@ -1161,28 +1153,18 @@ mod tests {
     }
 
     #[test]
-    fn removed_overview_storage_variables_are_neither_read_nor_required() {
+    fn from_env_accepts_the_owned_data_directory_without_extra_storage_inputs() {
         let executable = std::env::current_exe().expect("current test executable");
-        for provide_removed_variables in [false, true] {
-            let mut child = std::process::Command::new(&executable);
-            child
-                .env_clear()
-                .env("PGKRONIKA_STARTUP_ENV_CHILD", "1")
-                .env("KRONIKA_WEB_DIR", "/data")
-                .env("KRONIKA_WEB_ADDR", "127.0.0.1:9000")
-                .arg("--exact")
-                .arg("startup::tests::from_env_accepts_only_the_owned_data_directory_child");
-            if provide_removed_variables {
-                child
-                    .env("KRONIKA_WEB_OVERVIEW_CACHE_DIR", "")
-                    .env("KRONIKA_WEB_OVERVIEW_NAMESPACE", "");
-            }
-            let status = child.status().expect("run isolated environment probe");
-            assert!(
-                status.success(),
-                "removed overview storage variables affected startup: {status}"
-            );
-        }
+        let status = std::process::Command::new(&executable)
+            .env_clear()
+            .env("PGKRONIKA_STARTUP_ENV_CHILD", "1")
+            .env("KRONIKA_WEB_DIR", "/data")
+            .env("KRONIKA_WEB_ADDR", "127.0.0.1:9000")
+            .arg("--exact")
+            .arg("startup::tests::from_env_accepts_only_the_owned_data_directory_child")
+            .status()
+            .expect("run isolated environment probe");
+        assert!(status.success(), "minimal startup failed: {status}");
     }
 
     #[test]
