@@ -462,10 +462,10 @@ pub(super) fn extract_metrics<R: ReadAt>(
                 extract_replication_instance(&mut metrics, section, source_id)?;
             }
             PG_REPLICATION_PHYSICAL => {
-                extract_replication_senders(&mut metrics, section, source_id, &snapshot_coverage)?
+                extract_replication_senders(&mut metrics, section, source_id, &snapshot_coverage)?;
             }
             type_id if PG_REPLICATION_SLOT_TYPES.contains(&type_id) => {
-                extract_replication_slots(&mut metrics, section, source_id, &snapshot_coverage)?
+                extract_replication_slots(&mut metrics, section, source_id, &snapshot_coverage)?;
             }
             type_id if PG_STORAGE_MOUNT_TYPES.contains(&type_id) => {
                 extract_storage_mounts(&mut metrics, section, source_id)?;

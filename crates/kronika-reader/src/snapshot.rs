@@ -29,7 +29,7 @@ fn segment_context(sealed: &SealedUnit) -> Result<SegmentContext, SealedFactErro
     let name = sealed
         .path
         .file_name()
-        .ok_or(SealedFactError::DescriptorUnavailable {
+        .ok_or_else(|| SealedFactError::DescriptorUnavailable {
             locator: SealedLocator::from_file_name_bytes(b""),
         })?;
     SegmentContext::new(name.to_os_string()).map_err(|_error| {

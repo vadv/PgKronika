@@ -698,8 +698,8 @@ impl FactStore {
         let final_name = context.sidecar_file_name();
         let final_path = self.data_dir.join(final_name);
         let expected_catalog = facts.catalog_descriptors();
-        if let Ok(existing) = open_regular_at(&directory, final_name) {
-            if SegmentFacts::from_reader(
+        if let Ok(existing) = open_regular_at(&directory, final_name)
+            && SegmentFacts::from_reader(
                 existing,
                 facts.identity(),
                 facts.lineage(),
@@ -707,10 +707,9 @@ impl FactStore {
                 bounds,
             )
             .is_ok()
-            {
-                lock_unpoisoned(&self.gc).record_publication(build_key, SystemTime::now());
-                return Ok(final_path);
-            }
+        {
+            lock_unpoisoned(&self.gc).record_publication(build_key, SystemTime::now());
+            return Ok(final_path);
         }
 
         if self.gc_config.max_logical_bytes().is_some() || self.gc_config.max_files().is_some() {
