@@ -87,6 +87,7 @@ impl ColdWorkWeight {
         })
     }
 
+    #[cfg(feature = "qualification")]
     fn component_max(self, other: Self) -> Self {
         Self {
             workers: self.workers.max(other.workers),
@@ -254,11 +255,14 @@ struct AdmissionState {
     used: ColdWorkWeight,
     queue: VecDeque<Arc<Waiter>>,
     next_ticket: u64,
+    #[cfg(feature = "qualification")]
     peak_used: ColdWorkWeight,
+    #[cfg(feature = "qualification")]
     peak_queue: usize,
 }
 
 impl AdmissionState {
+    #[cfg(feature = "qualification")]
     fn observe_peak(&mut self) {
         self.peak_used = self.peak_used.component_max(self.used);
         self.peak_queue = self.peak_queue.max(self.queue.len());
@@ -481,7 +485,15 @@ fn record_rejection(error: ColdAdmissionError) {
     clippy::cast_precision_loss,
     reason = "Prometheus gauges use f64 and configured admission bounds are small"
 )]
+#[cfg_attr(
+    not(feature = "qualification"),
+    allow(
+        clippy::needless_pass_by_ref_mut,
+        reason = "qualification builds update peak state through the shared interface"
+    )
+)]
 fn record_admission_state(state: &mut AdmissionState) {
+    #[cfg(feature = "qualification")]
     state.observe_peak();
     metrics::gauge!("overview_cold_queue_depth").set(state.queue.len() as f64);
     metrics::gauge!("overview_cold_work_inflight", "kind" => "workers")

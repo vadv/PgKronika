@@ -7,7 +7,7 @@ portable performance promise.
 
 ## Dense-hour fixture
 
-`overview-dense-hour-v1` contains exactly 720 `pg_stat_database` snapshots at a
+`overview-dense-hour-v2` contains exactly 720 `pg_stat_database` snapshots at a
 five-second cadence, one reset-context row, and complete source-population
 coverage for every snapshot. Production extraction creates the canonical
 counter, gauge, reset, coverage, and event-fact blocks. The runner records:

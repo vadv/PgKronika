@@ -460,7 +460,7 @@ async fn timeline(client: WebClient, case: &WebCase) -> Result<TimelineResponses
     // The overview is deliberately the first HTTP request after readiness: it
     // is the request that must build or durably admit the sibling.
     let overview = request_overview(client, case).await?;
-    let events = client.get_json(&events_target(case, 10_000, None)).await?;
+    let events = client.get_json(&events_target(case, 1_000, None)).await?;
     let health = client.get_json(&health_target(case)).await?;
     let healthz = client.get("/healthz").await?;
     ensure!(

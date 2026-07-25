@@ -773,7 +773,7 @@ impl FactStore {
         let Some(mark) = mark else {
             return false;
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "qualification"))]
         self.test_recovery_gc_attempts
             .fetch_add(1, Ordering::Relaxed);
         let outcome = self.collect_garbage(&mark);

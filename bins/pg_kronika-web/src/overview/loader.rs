@@ -1,5 +1,6 @@
 //! Request-scoped sealed-fact loading over exact-key shared work.
 
+#[cfg(feature = "qualification")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -42,6 +43,7 @@ pub(crate) struct OverviewFactLoader {
     decoded: DecodedFactCache,
     flights: FactSingleflight<FactResult>,
     fallback_metrics: Arc<Mutex<FallbackStats>>,
+    #[cfg(feature = "qualification")]
     qualification: Arc<LoaderCounters>,
     per_request_parallelism: usize,
     retry_after_seconds: u64,
@@ -65,6 +67,7 @@ impl OverviewFactLoader {
             decoded: DecodedFactCache::new(decoded_cache_bytes, decoded_cache_entries),
             flights: FactSingleflight::new(max_flights),
             fallback_metrics: Arc::new(Mutex::new(FallbackStats::default())),
+            #[cfg(feature = "qualification")]
             qualification: Arc::new(LoaderCounters::default()),
             per_request_parallelism: config.per_request_parallelism,
             retry_after_seconds: config.retry_after_seconds,
@@ -152,6 +155,7 @@ impl OverviewFactLoader {
     ) -> Result<SealedEntry, FactLoadFailure> {
         let key = entry.fact_build_key();
         if let Some(facts) = self.decoded.get(key) {
+            #[cfg(feature = "qualification")]
             self.qualification
                 .decoded_hits
                 .fetch_add(1, Ordering::Relaxed);
@@ -170,6 +174,7 @@ impl OverviewFactLoader {
         let store = self.store.clone();
         let admission = self.admission.clone();
         let decoded = self.decoded.clone();
+        #[cfg(feature = "qualification")]
         let qualification = Arc::clone(&self.qualification);
         let retry_after_seconds = self.retry_after_seconds;
         let facts =
@@ -184,6 +189,7 @@ impl OverviewFactLoader {
                             Arc::clone(&snapshot),
                             worker_entry.clone(),
                             store.clone(),
+                            #[cfg(feature = "qualification")]
                             Arc::clone(&qualification),
                         )
                         .await?
@@ -216,6 +222,7 @@ impl OverviewFactLoader {
                                     |error| FactLoadFailure::Source(SealedFactError::Build(error)),
                                 )?;
                                 record_load(&load);
+                                #[cfg(feature = "qualification")]
                                 qualification.record(&load);
                                 load.into_shared_facts()
                             };
@@ -247,6 +254,7 @@ impl OverviewFactLoader {
             snapshot,
             entry,
             self.store.clone(),
+            #[cfg(feature = "qualification")]
             Arc::clone(&self.qualification),
         )
         .await
@@ -313,7 +321,7 @@ async fn load_cached(
     snapshot: Arc<LocalDirSnapshot>,
     entry: DescriptorEntry,
     store: FactStore,
-    qualification: Arc<LoaderCounters>,
+    #[cfg(feature = "qualification")] qualification: Arc<LoaderCounters>,
 ) -> Result<Option<Arc<SegmentFacts>>, FactLoadFailure> {
     tokio::task::spawn_blocking(move || {
         let descriptor = *entry.descriptor();
@@ -328,6 +336,7 @@ async fn load_cached(
             .map_err(|error| FactLoadFailure::Source(SealedFactError::Build(error)))?;
         Ok(load.map(|load| {
             record_load(&load);
+            #[cfg(feature = "qualification")]
             qualification.record(&load);
             load.into_shared_facts()
         }))
@@ -336,6 +345,7 @@ async fn load_cached(
     .unwrap_or(Err(FactLoadFailure::WorkerFailed))
 }
 
+#[cfg(feature = "qualification")]
 #[derive(Debug, Default)]
 struct LoaderCounters {
     decoded_hits: AtomicU64,
@@ -351,6 +361,7 @@ struct LoaderCounters {
     fact_write_bytes: AtomicU64,
 }
 
+#[cfg(feature = "qualification")]
 impl LoaderCounters {
     fn record(&self, load: &FactLoad) {
         match load.origin() {
@@ -379,7 +390,6 @@ impl LoaderCounters {
             .fetch_add(load.fact_write_bytes(), Ordering::Relaxed);
     }
 
-    #[cfg(feature = "qualification")]
     fn snapshot(&self) -> LoaderIoSnapshot {
         LoaderIoSnapshot {
             decoded_hits: self.decoded_hits.load(Ordering::Relaxed),

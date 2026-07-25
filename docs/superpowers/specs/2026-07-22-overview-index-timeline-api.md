@@ -1743,16 +1743,28 @@ TimelineMeta {
   effective_range: { from_us: i64, to_us: i64 },
   effective_step_us: Option<u64>,
 
+  sources: Vec<u64>,
+  available_sources: Vec<u64>,
   data_through_us: Option<i64>,
-  tail_pending: Option<{ from_us: i64, to_us: Option<i64> }>,
-  source_status: CompleteForContract | Partial | Warming | Gap | Unknown,
-  loss: Vec<LossSummary>,
+  store_data_through_us: Option<i64>,
+  tail_pending: Option<{
+    from_offset_bytes: u64,
+    to_offset_bytes: u64,
+  }>,
+  source_status: CompleteForContract | Partial | Warming | Gap | Unavailable,
+  source_freshness: Vec<SourceFreshness>,
+  loss: Vec<SourceLoss>,
 }
 ```
 
 `CompleteForContract` означает полноту выбранного контракта сохранённых данных
 и источника, а не физического журнала PostgreSQL, если сборщик не может её
 доказать.
+
+`tail_pending` относится к выбранному активному источнику и задаёт
+полуоткрытый диапазон байтов незавершённого хвоста
+`[from_offset_bytes, to_offset_bytes)`. Это не временной интервал и не
+повреждение уже завершённой части журнала.
 
 Ответы нейтральны к языку: они содержат стабильные коды и перечисления, числа
 и идентификаторы. Локализованный текст для человека не входит в контракт API.
@@ -1840,29 +1852,40 @@ EventsResponse {
   next_cursor: Option<String>,
   omitted_by_response_filter: u64,
   retained_exactness: RetainedExact | LowerBound | Unknown,
+  source_completeness: Full | BoundedSubset | Unknown,
+  physical_count_semantics: Exact | LowerBound | Unknown | NotApplicable,
   coverage: Vec<FactorCoverage>,
 }
 
 EventObservationView {
   event_id: Base64Url,
+  event_instance_id: Base64Url,
+  source_id: u64,
+  source_type_id: Option<u32>,
   identity_quality: SourceExact | ContentDerived | Approximate,
   sort_ts_us: i64,
   occurred_at_us: Option<i64>,
   observed_interval: Option<{ from_us: i64, to_us: i64 }>,
-  time_quality: TimeQuality,
   occurrence_count: u64,
   event_kind: stable code,
   notable_class: stable code,
   evidence_quality: EvidenceQuality,
+  quality_flags: u32,
   entity: Option<EntityRef>,
   payload: typed union,
-  source_loss: Option<LossSummary>,
+  supporting_evidence: Vec<SupportingEvidence>,
+  loss: Option<EventLoss>,
 }
 ```
 
-Канонический порядок: `(sort_ts_us ASC, event_id ASC)`. Побайтово одинаковые
-строки не теряются, пока происхождение источника позволяет их различать.
-Сгруппированная строка остаётся одним элементом страницы.
+Канонический порядок:
+`(sort_ts_us ASC, event_id ASC, event_instance_id ASC)`. `event_id` зависит
+только от опубликованной семантики и не включает путь, имя файла или
+физическое происхождение сегмента, поэтому остаётся стабильным при обычном
+переходе из активных данных в запечатанные. `event_instance_id` отдельно
+сохраняет физическое происхождение: семантически одинаковые сохранённые
+наблюдения не теряются при сортировке и постраничной выдаче. Сгруппированная
+строка остаётся одним элементом страницы.
 
 В текущей схеме ответа `events` сериализует веб-проекцию `EventFact` из §7.4,
 а не канонический блок `EVENT_FACTS`. Приёмка представления M6 проверяет именно
@@ -1873,26 +1896,31 @@ EventObservationView {
 
 ### 15.5 Курсор
 
-Курсор внешнего протокола непрозрачен и заверен секретом сервера; после
-декодирования v1 имеет следующую форму:
+Курсор внешнего протокола непрозрачен и заверен секретом процесса; после
+декодирования v2 имеет следующую форму:
 
 ```text
 EventsCursor {
   cursor_version: u16,
-  view_generation: u64,
-  source_set_id: [u8;32],
+  key_id: [u8;16],
+  issued_at: u64,
+  expires_at: u64,
+  fact_set_id: [u8;32],
+  source_set_hash: [u8;32],
   query_hash: [u8;32],
   last_ts_us: i64,
   last_event_id: [u8;32],
-  issued_at_us: i64,
+  last_event_instance_id: [u8;32],
 }
 ```
 
-`source_set_id` хеширует упорядоченный набор выбранных числовых
+`source_set_hash` хеширует упорядоченный набор выбранных числовых
 идентификаторов источников. `query_hash` включает диапазон, нормализованные
-фильтры, порядок, версию правил краткого списка и схему ответа. Первая страница
-закрепляет неизменяемое представление запроса и индекса. Следующая страница
-обязана использовать то же поколение и тот же хеш запроса.
+фильтры, трёхкомпонентный порядок, версию правил краткого списка и схему
+ответа. `fact_set_id` привязывает курсор к неизменяемому набору фактов.
+`issued_at` и `expires_at` задаются в секундах Unix. Первая страница закрепляет
+неизменяемое представление запроса и индекса. Следующая страница обязана
+использовать тот же набор фактов, набор источников и хеш запроса.
 
 `min_severity` применяется только к наблюдениям с уровнем. Типизированные факты
 жизненного цикла или состояния без уровня остаются доступными по `kind` и
@@ -1909,7 +1937,8 @@ EventsCursor {
 
 - `invalid_cursor` — декодирование, MAC или версия;
 - `cursor_query_mismatch` — изменён диапазон, фильтр или правила;
-- `cursor_expired` — истёк TTL или представление вытеснено по пределу числа;
+- `cursor_expired` — истёк TTL, представление вытеснено по пределу числа или
+  `key_id` принадлежит прежнему процессу;
 - `view_gone` — источник или представление больше нельзя удержать;
 - состояние HTTP для истёкшего или утраченного представления — `410 Gone`;
   для недопустимого курсора или несовпадения — `400 Bad Request`.

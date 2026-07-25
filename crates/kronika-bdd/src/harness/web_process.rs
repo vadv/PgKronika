@@ -43,6 +43,7 @@ use tokio::time::timeout;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CAPTURED_STDERR_BYTES: usize = 1_048_576;
 const OVF_HEADER_LEN: usize = 192;
 const OVF_HEADER_CRC_OFFSET: usize = 188;
 
@@ -293,7 +294,7 @@ fn spawn_stderr_drain(mut stderr: ChildStderr, sink: Arc<Mutex<Vec<u8>>>) -> Joi
                 Ok(0) | Err(_) => break,
                 Ok(length) => {
                     if let Ok(mut bytes) = sink.lock() {
-                        bytes.extend_from_slice(&buffer[..length]);
+                        append_captured_stderr(&mut bytes, &buffer[..length]);
                     }
                 }
             }
@@ -301,11 +302,22 @@ fn spawn_stderr_drain(mut stderr: ChildStderr, sink: Arc<Mutex<Vec<u8>>>) -> Joi
     })
 }
 
+fn append_captured_stderr(bytes: &mut Vec<u8>, chunk: &[u8]) {
+    let available = MAX_CAPTURED_STDERR_BYTES.saturating_sub(bytes.len());
+    bytes.extend_from_slice(&chunk[..chunk.len().min(available)]);
+}
+
 fn captured_stderr(bytes: &Mutex<Vec<u8>>) -> String {
     let bytes = bytes
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    String::from_utf8_lossy(&bytes).into_owned()
+    let mut captured = String::from_utf8_lossy(&bytes).into_owned();
+    let capped = bytes.len() == MAX_CAPTURED_STDERR_BYTES;
+    drop(bytes);
+    if capped {
+        captured.push_str("\n[stderr capture capped at 1048576 bytes]");
+    }
+    captured
 }
 
 /// One fresh, exclusively owned data directory derived from a sealed fixture.
@@ -695,4 +707,23 @@ fn escape_prometheus_label(value: &str) -> String {
         .replace('\\', r"\\")
         .replace('"', r#"\""#)
         .replace('\n', r"\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_stderr_capture_has_a_hard_byte_bound() {
+        let mut bytes = vec![b'a'; MAX_CAPTURED_STDERR_BYTES - 2];
+        append_captured_stderr(&mut bytes, b"bcdef");
+        append_captured_stderr(&mut bytes, b"ignored");
+
+        assert_eq!(bytes.len(), MAX_CAPTURED_STDERR_BYTES);
+        assert!(bytes.ends_with(b"bc"));
+        assert!(
+            captured_stderr(&Mutex::new(bytes))
+                .ends_with("[stderr capture capped at 1048576 bytes]")
+        );
+    }
 }
