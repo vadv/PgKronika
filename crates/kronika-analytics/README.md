@@ -149,21 +149,26 @@ m = (120 - 100) / 5 = 4.0
 
 Because `4.0 > 3.5`, the `12:30` position is an anomalous increase.
 
-With the same reference, the outcomes are:
+Every row below uses the same reference: ten values of `98` and ten values of
+`102 transactions/s`. Its median is `100`, `MAD=2`, and the scale used is
+`sigma=5 transactions/s`. The three values in the first column are used only
+to compute the current-window median; they are not compared with each other.
 
-| Current-window values, transactions/s | Median | `m` | Result |
-| --- | ---: | ---: | --- |
-| `119`, `120`, `121` | `120` | `4.0` | Anomalous increase |
-| `116`, `117.5`, `119` | `117.5` | `3.5` | No trigger: the score reaches but does not exceed the threshold |
-| `114`, `115`, `116` | `115` | `3.0` | No trigger |
-| `79`, `80`, `81` | `80` | `-4.0` | Anomalous decrease: `abs(-4.0) > 3.5` |
+| Current window, transactions/s | Current median | Reference median | `sigma` | Calculation of `m` | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `119`, `120`, `121` | `120` | `100` | `5` | `(120 - 100) / 5 = 4.0` | Anomalous increase |
+| `116`, `117.5`, `119` | `117.5` | `100` | `5` | `(117.5 - 100) / 5 = 3.5` | No trigger: the score reaches but does not exceed the threshold |
+| `114`, `115`, `116` | `115` | `100` | `5` | `(115 - 100) / 5 = 3.0` | No trigger |
+| `79`, `80`, `81` | `80` | `100` | `5` | `(80 - 100) / 5 = -4.0` | Anomalous decrease: `abs(-4.0) > 3.5` |
 
 The sign of `m` gives the direction: positive means an increase and negative
 means a decrease. Triggering uses the absolute score, so both directions are
-checked. For the final row:
+checked. In the final row, the current median `80` is compared with the
+reference median `100`:
 
 ```text
-m = (80 - 100) / 5 = -4.0
+median difference = 80 - 100 = -20 transactions/s
+m = -20 / 5 = -4.0
 abs(m) = 4.0 > 3.5
 ```
 
