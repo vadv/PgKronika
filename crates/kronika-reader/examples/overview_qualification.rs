@@ -7,7 +7,7 @@
 //! page cache honestly.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,7 +19,9 @@ use kronika_analytics::overview::{
     CountLimits, CoverageSpan, NamingContractId, OracleLimits, RawOracle, SegmentLocator,
 };
 use kronika_format::{PartMeta, SectionInput, build_part};
-use kronika_reader::{BlockKind, FactFile, LIMIT, PgmUnit, SegmentContext, SegmentFacts};
+use kronika_reader::{
+    BlockKind, FactFile, FactOrigin, FactStore, LIMIT, PgmUnit, SegmentContext, SegmentFacts,
+};
 use kronika_registry::pg_stat_database::PgStatDatabaseV1;
 use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
@@ -173,42 +175,82 @@ fn main() {
     let accounting = accounting(&facts, &admitted, fact_bytes.len());
     let budgets = budgets(&accounting);
     let fixture = fixture_profile(&unit, &facts, pgm.len());
+    let runtime_root = runtime_root(output.as_deref());
 
     let raw = Arc::new(facts);
     let fact_bytes: Arc<[u8]> = fact_bytes.into();
     let catalog = Arc::new(catalog);
     let context = Arc::new(context);
     let full_range = CoverageSpan::new(1_000_000, dense_end()).expect("dense full range");
+    let restart_root = runtime_root.join("restart-warm");
+    FactStore::new(&restart_root)
+        .publish(raw.as_ref(), &LIMIT)
+        .expect("seed restart-warm fact file");
 
     let mut modes = Vec::new();
+    let derived_counter = std::cell::Cell::new(0_usize);
     modes.push(measure("derived-cold", ITERATIONS, || {
+        let iteration = derived_counter.get();
+        derived_counter.set(iteration + 1);
+        let cache_root = runtime_root.join(format!("derived-cold-{iteration:02}"));
+        assert!(
+            !cache_root.exists(),
+            "derived-cold cache root must start absent"
+        );
         let unit = PgmUnit::open(pgm.as_ref()).expect("open cold PGM");
-        let before = unit.body_read_stats();
-        let extracted =
-            SegmentFacts::extract(&unit, context.as_ref(), &LIMIT).expect("cold extract");
+        let loaded = FactStore::new(cache_root)
+            .load_or_build(&unit, context.as_ref(), &LIMIT)
+            .expect("cold build and durable publication");
         assert_eq!(
-            extracted, *raw,
+            loaded.origin(),
+            FactOrigin::Rebuilt,
+            "an absent derived-cold root must rebuild"
+        );
+        assert_eq!(
+            loaded.persist_error(),
+            None,
+            "derived-cold qualification requires durable publication"
+        );
+        assert_eq!(
+            loaded.fact_write_bytes(),
+            fact_bytes.len() as u64,
+            "derived-cold publication must write the canonical fact bytes"
+        );
+        assert_eq!(
+            loaded.facts(),
+            raw.as_ref(),
             "derived-cold extraction diverged from the admitted fixture"
         );
-        let after = unit.body_read_stats();
+        let pgm = loaded.pgm_body_read_stats();
         Work {
-            pgm_body_reads: after.read_calls - before.read_calls,
-            pgm_body_bytes: after.stored_bytes_read - before.stored_bytes_read,
+            pgm_body_reads: pgm.read_calls,
+            pgm_body_bytes: pgm.stored_bytes_read,
+            cache_writes: 1,
             successful_responses: 1,
             ..Work::default()
         }
     }));
     modes.push(measure("restart-warm", ITERATIONS, || {
-        let (warm, stats) = SegmentFacts::from_reader_with_stats(
-            fact_bytes.as_ref(),
-            raw.identity(),
-            raw.lineage(),
-            catalog.as_ref(),
-            &LIMIT,
-        )
-        .expect("restart-warm");
+        let unit = PgmUnit::open(pgm.as_ref()).expect("open restart-warm PGM metadata");
+        let loaded = FactStore::new(&restart_root)
+            .load_or_build(&unit, context.as_ref(), &LIMIT)
+            .expect("restart-warm");
         assert_eq!(
-            warm, *raw,
+            loaded.origin(),
+            FactOrigin::CacheHit,
+            "restart-warm must use the seeded durable fact file"
+        );
+        assert_eq!(
+            loaded.pgm_body_read_stats().read_calls,
+            0,
+            "restart-warm must not read a PGM body"
+        );
+        let stats = loaded
+            .fact_read_stats()
+            .expect("restart-warm has exact fact read counters");
+        assert_eq!(
+            loaded.facts(),
+            raw.as_ref(),
             "restart-warm decoding diverged from the admitted fixture"
         );
         Work {
@@ -383,6 +425,18 @@ fn output_path() -> Result<Option<PathBuf>, &'static str> {
         (Some(flag), Some(path), None) if flag == "--output" => Ok(Some(path.into())),
         _ => Err("usage: overview_qualification [--output PATH]"),
     }
+}
+
+fn runtime_root(output: Option<&Path>) -> PathBuf {
+    let parent = output
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("target/qualification"), Path::to_path_buf);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    parent.join(format!("overview-runtime-{}-{nonce}", std::process::id()))
 }
 
 fn dense_end() -> i64 {

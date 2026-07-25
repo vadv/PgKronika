@@ -34,6 +34,13 @@ Runner записывает все девять режимов: `derived-cold`, 
 `process-hot`, `range-cold/facts-warm`, `live`, `concurrent-identical`,
 `concurrent-disjoint`, `memory-only` и `oracle-profile`.
 
+Для каждой итерации `derived-cold` использует отдельный отсутствующий корень
+кэша и измеряет production-путь построения, включая canonical admission и
+долговечную атомарную публикацию. Перед измерением `restart-warm` создаётся один
+валидный fact-файл, а в каждой итерации используется новый fact store, поэтому
+process-local fallback и декодированный кэш не сохраняются. Runner сохраняет
+эти деревья кэша рядом с выходным artifact как подтверждающие данные.
+
 Слово cold здесь означает новый reader или пустое process-local состояние.
 Runner не вытесняет page cache ОС и честно пишет `storage_cold=false`.
 Storage-cold результат требует отдельной контролируемой процедуры для

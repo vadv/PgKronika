@@ -34,6 +34,13 @@ The runner records all nine required modes: `derived-cold`, `restart-warm`,
 `process-hot`, `range-cold/facts-warm`, `live`, `concurrent-identical`,
 `concurrent-disjoint`, `memory-only`, and `oracle-profile`.
 
+`derived-cold` uses a distinct absent cache root for every iteration and times
+the production build path through canonical admission and durable atomic
+publication. `restart-warm` seeds one valid fact file before measurement, then
+uses a newly constructed fact store for each iteration so no process-local
+fallback or decoded cache survives. The runner preserves these cache trees next
+to its output artifact as supporting evidence.
+
 “Cold” in this runner means a newly constructed process-level reader or cache
 state. It does not evict the host page cache, and the artifact says
 `storage_cold=false`. A storage-cold result requires a separately controlled
