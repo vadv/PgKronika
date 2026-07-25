@@ -32,6 +32,7 @@
 | `pg_store_plans` | расширение установлено в одной из БД пула, права на view/function | тип отсутствует или plan/reset поля `NULL` |
 | `pg_settings` | доступ к `pg_settings`; часть `sourcefile`/`sourceline` может быть скрыта | скрытые поля `NULL` |
 | представления репликации | права на `pg_stat_replication`, `pg_replication_slots`; часто нужна роль мониторинга | типы репликации отсутствуют или частично `NULL` |
+| local OS joins: `pg_storage_mount` (`1_036_002`), `pg_process_cgroup_memory` (`1_037_001`) | Unix-соединение с PostgreSQL и право читать `data_directory` через `pg_read_all_settings` или `pg_monitor` | при TCP обе секции отсутствуют; при ошибке запроса они отсутствуют и пишется `collection_skip` с `reason=local_join_facts_unavailable` |
 | PostgreSQL logs | файловый доступ к stderr-логу или доставка sidecar | `1_029_001` фиксирует `source_unavailable`/`unsupported_format`/`permission_denied`/`disabled`/`query_failed`; типизированные stderr-события: checkpoint, autovacuum/autoanalyze, slow query, lock wait, lifecycle, temporary file; `csvlog` не входит в near-term scope |
 
 Нули не используются как замена недоступных значений. Недоступность источника
