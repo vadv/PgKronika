@@ -441,9 +441,7 @@ impl AppState {
         let timeline = overview
             .assemble(&snapshot, &delta)
             .map_err(StateBuildError::Overview)?;
-        let persist = overview.persist_mode();
-        metrics::gauge!("kronika_web_overview_persist_mode").set(persist_mode_code(persist.mode));
-        metrics::gauge!("kronika_web_overview_persist_failures").set(f64::from(persist.failures));
+        overview::resilience::record_persist_snapshot(overview.persist_mode());
         record_gc_metrics(None);
         let cursor_registry =
             overview::cursor::CursorRegistry::new(overview::cursor::CursorConfig {
@@ -563,13 +561,23 @@ impl AppState {
             .overview
             .lock()
             .map_err(|_error| OverviewBuildError::WriterPoisoned)?;
-        let timeline = overview.assemble_with_live(&snapshot, delta)?;
+        let probe = overview.probe_persistence();
+        let timeline = match overview.assemble_with_live(&snapshot, delta) {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                let persist = overview.persist_mode();
+                drop(overview);
+                overview::resilience::record_probe_metrics(probe);
+                overview::resilience::record_persist_snapshot(persist);
+                return Err(error);
+            }
+        };
         let diagnostics = overview.diagnostics();
         let gc = overview.collect_fact_garbage();
         let persist = overview.persist_mode();
         drop(overview);
-        metrics::gauge!("kronika_web_overview_persist_mode").set(persist_mode_code(persist.mode));
-        metrics::gauge!("kronika_web_overview_persist_failures").set(f64::from(persist.failures));
+        overview::resilience::record_probe_metrics(probe);
+        overview::resilience::record_persist_snapshot(persist);
         record_gc_metrics(gc);
         metrics::gauge!("kronika_web_overview_durable_hits_total")
             .set(diagnostics.durable_hits as f64);

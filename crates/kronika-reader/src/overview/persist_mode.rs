@@ -1,19 +1,15 @@
-//! Persistent-cache write mode with retry backoff.
+//! Persistent-cache write state with exclusive due-probe reservation.
 //!
-//! A recoverable publication failure (read-only mount, no space, quota,
-//! permission, transient I/O) must not make every subsequent build retry the
-//! same failing write. The store records a mode and a next-retry deadline;
-//! while backed off, builds stay memory-only and never touch the disk until
-//! the deadline passes. One success resets the schedule.
+//! Durable reads never consult this state. Recoverable write failures arm a
+//! bounded delay; once due, exactly one caller owns the probe or publication
+//! attempt. A dropped reservation restores a bounded retry rather than leaving
+//! the store permanently in flight.
 
 use std::time::{Duration, Instant};
 
 use super::publish::PersistError;
 
-/// Initial backoff after the first failure.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-
-/// Backoff never grows past this.
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 
 /// Write capability of the persistent cache.
@@ -21,87 +17,175 @@ const MAX_BACKOFF: Duration = Duration::from_mins(5);
 pub enum PersistMode {
     /// Writes are attempted normally.
     ReadWrite,
-    /// The filesystem rejects writes but committed facts may still be read
-    /// (read-only mount, permission denied).
+    /// A read-only mount or permission policy is backed off; reads continue.
     ReadOnlyBackoff,
-    /// Writes fail for a condition that may clear (no space, quota, transient
-    /// I/O); reads may also be affected.
+    /// Capacity or transient write I/O is backed off; reads still continue.
     UnavailableBackoff,
 }
 
-/// A snapshot of the store's persistence mode for diagnostics.
+/// A snapshot of the store's write state for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistModeSnapshot {
     /// Current write mode.
     pub mode: PersistMode,
-    /// Consecutive recoverable failures since the last success.
+    /// Consecutive recoverable failures since the last write/probe success.
     pub failures: u32,
-    /// Standing failure reason while backed off.
+    /// Standing recoverable failure reason.
     pub reason: Option<PersistError>,
+    /// Remaining delay before one caller may reserve recovery.
+    pub retry_after: Duration,
+    /// Whether one write or recovery probe currently owns the reservation.
+    pub probe_in_flight: bool,
 }
 
-/// Retry-backoff state machine for the persistent cache.
+#[allow(
+    variant_size_differences,
+    reason = "the u64 reservation token prevents ABA reuse; outcomes are short-lived"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Reservation {
+    Acquired(u64),
+    Backoff(PersistError),
+    InFlight,
+    NotNeeded,
+}
+
+/// Retry-backoff state machine for one `FactStore`.
 #[derive(Debug)]
 pub(super) struct PersistState {
     mode: PersistMode,
     failures: u32,
     reason: Option<PersistError>,
     next_retry_at: Option<Instant>,
+    reservation: Option<u64>,
+    next_reservation: u64,
+    jitter_seed: u64,
 }
 
-impl Default for PersistState {
-    fn default() -> Self {
+impl PersistState {
+    pub(super) const fn new(jitter_seed: u64) -> Self {
         Self {
             mode: PersistMode::ReadWrite,
             failures: 0,
             reason: None,
             next_retry_at: None,
+            reservation: None,
+            next_reservation: 1,
+            jitter_seed,
         }
     }
-}
 
-impl PersistState {
-    /// Whether a disk write should be attempted now, or suppressed by an
-    /// unexpired backoff.
-    pub(super) fn should_attempt_write(&self, now: Instant) -> bool {
-        self.next_retry_at.is_none_or(|deadline| now >= deadline)
+    /// Reserves any permitted write, including the single due recovery attempt.
+    pub(super) fn reserve_write(&mut self, now: Instant) -> Reservation {
+        if self.reservation.is_some() {
+            return Reservation::InFlight;
+        }
+        if let Some(deadline) = self.next_retry_at
+            && now < deadline
+        {
+            return Reservation::Backoff(self.standing_reason());
+        }
+        self.acquire_reservation()
     }
 
-    /// Records a successful publication: clears backoff and returns to
-    /// [`PersistMode::ReadWrite`].
-    pub(super) const fn on_success(&mut self) {
+    /// Reserves recovery only when a standing failure is due.
+    pub(super) fn reserve_due_probe(&mut self, now: Instant) -> Reservation {
+        if self.failures == 0 {
+            return Reservation::NotNeeded;
+        }
+        self.reserve_write(now)
+    }
+
+    /// Completes an owned reservation.
+    pub(super) fn finish(
+        &mut self,
+        reservation: u64,
+        result: Result<(), PersistError>,
+        now: Instant,
+    ) {
+        if self.reservation != Some(reservation) {
+            return;
+        }
+        self.reservation = None;
+        match result {
+            Err(error) if error.is_backoff_eligible() => self.on_failure(error, now),
+            Err(_) if self.failures != 0 => self.defer_standing_failure(now),
+            Ok(()) | Err(_) => self.on_success(),
+        }
+    }
+
+    /// Releases a cancelled/panicked owner without leaving a stuck flight.
+    pub(super) fn cancel(&mut self, reservation: u64, now: Instant) {
+        if self.reservation != Some(reservation) {
+            return;
+        }
+        self.reservation = None;
+        if self.failures == 0 {
+            self.on_success();
+        } else {
+            self.defer_standing_failure(now);
+        }
+    }
+
+    pub(super) fn snapshot(&self, now: Instant) -> PersistModeSnapshot {
+        PersistModeSnapshot {
+            mode: self.mode,
+            failures: self.failures,
+            reason: self.reason,
+            retry_after: self.next_retry_at.map_or(Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(now)
+            }),
+            probe_in_flight: self.reservation.is_some(),
+        }
+    }
+
+    pub(super) const fn standing_reason(&self) -> PersistError {
+        match self.reason {
+            Some(error) => error,
+            None => PersistError::TransientIo,
+        }
+    }
+
+    fn acquire_reservation(&mut self) -> Reservation {
+        let reservation = self.next_reservation;
+        self.next_reservation = self.next_reservation.wrapping_add(1).max(1);
+        self.reservation = Some(reservation);
+        Reservation::Acquired(reservation)
+    }
+
+    const fn on_success(&mut self) {
         self.mode = PersistMode::ReadWrite;
         self.failures = 0;
         self.reason = None;
         self.next_retry_at = None;
     }
 
-    /// Records a recoverable failure, arming the next backoff deadline.
-    pub(super) fn on_failure(&mut self, error: PersistError, now: Instant) {
+    fn on_failure(&mut self, error: PersistError, now: Instant) {
         self.failures = self.failures.saturating_add(1);
         self.reason = Some(error);
         self.mode = mode_for(error);
-        self.next_retry_at = Some(now + backoff_delay(self.failures));
+        self.next_retry_at = Some(deadline_after(
+            now,
+            backoff_delay(error, self.failures, self.jitter_seed),
+        ));
     }
 
-    /// The reason a suppressed write reports without touching the disk.
-    pub(super) const fn standing_reason(&self) -> PersistError {
-        match self.reason {
-            Some(error) => error,
-            None => PersistError::Io,
-        }
+    fn defer_standing_failure(&mut self, now: Instant) {
+        self.next_retry_at = Some(deadline_after(now, INITIAL_BACKOFF));
     }
 
-    pub(super) const fn snapshot(&self) -> PersistModeSnapshot {
-        PersistModeSnapshot {
-            mode: self.mode,
-            failures: self.failures,
-            reason: self.reason,
+    #[cfg(test)]
+    pub(super) const fn force_due(&mut self, now: Instant) {
+        if self.failures != 0 {
+            self.next_retry_at = Some(now);
         }
     }
 }
 
-/// Read-only conditions keep read access; the rest may lose it.
+fn deadline_after(now: Instant, delay: Duration) -> Instant {
+    now.checked_add(delay).unwrap_or(now)
+}
+
 const fn mode_for(error: PersistError) -> PersistMode {
     match error {
         PersistError::ReadOnlyFilesystem | PersistError::PermissionDenied => {
@@ -111,19 +195,15 @@ const fn mode_for(error: PersistError) -> PersistMode {
     }
 }
 
-/// Exponential backoff `INITIAL_BACKOFF * 2^(failures-1)` capped at
-/// [`MAX_BACKOFF`], with a deterministic ±20% perturbation of the ladder.
-///
-/// The perturbation is derived from `failures` alone: it keeps the schedule
-/// off round numbers without pulling in a randomness dependency and stays
-/// reproducible in tests. It does not desynchronize independent stores —
-/// they share the same delay at the same failure count; process refresh
-/// clocks already run out of phase.
-///
-/// `failures` is 1-based (the first failure yields the initial delay).
-fn backoff_delay(failures: u32) -> Duration {
+fn backoff_delay(error: PersistError, failures: u32, seed: u64) -> Duration {
     if failures == 0 {
         return Duration::ZERO;
+    }
+    if matches!(
+        error,
+        PersistError::ReadOnlyFilesystem | PersistError::PermissionDenied
+    ) {
+        return MAX_BACKOFF;
     }
     let shift = failures - 1;
     let base = if shift >= 32 {
@@ -134,108 +214,20 @@ fn backoff_delay(failures: u32) -> Duration {
             .map_or(MAX_BACKOFF, |scaled| scaled.min(MAX_BACKOFF))
     };
     let millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
-    // Jitter factor in [0.8, 1.2), derived from the failure count so a test
-    // is deterministic and no randomness dependency enters the reader.
-    let spread = spread_permille(failures); // 0..=400
-    let jittered = millis.saturating_mul(800 + u64::from(spread)) / 1000;
-    Duration::from_millis(jittered)
+    let spread = spread_permille(seed, failures);
+    let jittered = millis.saturating_mul(800 + u64::from(spread)) / 1_000;
+    Duration::from_millis(jittered).min(MAX_BACKOFF)
 }
 
-/// Deterministic spread in `0..=400` (the width of ±20%) from the failure
-/// count, so consecutive counts do not land on the same factor.
-const fn spread_permille(failures: u32) -> u32 {
-    let mixed = failures.wrapping_mul(2_654_435_761);
-    mixed % 401
+fn spread_permille(seed: u64, failures: u32) -> u32 {
+    let mut mixed = seed ^ u64::from(failures).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    mixed ^= mixed >> 30;
+    mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed ^= mixed >> 27;
+    mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^= mixed >> 31;
+    (mixed % 401) as u32
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_write_always_attempts() {
-        let state = PersistState::default();
-        assert!(
-            state.should_attempt_write(Instant::now()),
-            "a fresh store writes without backoff"
-        );
-    }
-
-    #[test]
-    fn a_failure_suppresses_until_the_deadline() {
-        let mut state = PersistState::default();
-        let now = Instant::now();
-        state.on_failure(PersistError::NoSpace, now);
-        assert!(
-            !state.should_attempt_write(now),
-            "the write is suppressed immediately after a failure"
-        );
-        assert!(
-            state.should_attempt_write(now + Duration::from_secs(2)),
-            "the write is retried once the backoff elapses"
-        );
-    }
-
-    #[test]
-    fn success_clears_backoff_and_reason() {
-        let mut state = PersistState::default();
-        state.on_failure(PersistError::QuotaExceeded, Instant::now());
-        state.on_success();
-        let snapshot = state.snapshot();
-        assert_eq!(
-            snapshot.mode,
-            PersistMode::ReadWrite,
-            "success returns to read-write"
-        );
-        assert_eq!(snapshot.failures, 0, "success clears the failure count");
-        assert!(
-            snapshot.reason.is_none(),
-            "success clears the standing reason"
-        );
-    }
-
-    #[test]
-    fn read_only_and_unavailable_modes_split_by_reason() {
-        let mut read_only = PersistState::default();
-        read_only.on_failure(PersistError::ReadOnlyFilesystem, Instant::now());
-        assert_eq!(read_only.snapshot().mode, PersistMode::ReadOnlyBackoff);
-
-        let mut unavailable = PersistState::default();
-        unavailable.on_failure(PersistError::NoSpace, Instant::now());
-        assert_eq!(unavailable.snapshot().mode, PersistMode::UnavailableBackoff);
-    }
-
-    #[test]
-    fn backoff_grows_and_caps() {
-        // First failure ≈ 1 s (± 20%), and it never exceeds the cap + jitter.
-        let first = backoff_delay(1);
-        assert!(
-            first >= Duration::from_millis(800) && first < Duration::from_millis(1200),
-            "first backoff is one second ± 20%, got {first:?}"
-        );
-        let capped = backoff_delay(100);
-        assert!(
-            capped <= Duration::from_mins(6),
-            "backoff never exceeds the cap plus jitter, got {capped:?}"
-        );
-        assert!(
-            capped >= Duration::from_mins(4),
-            "a deep failure count still backs off near the cap, got {capped:?}"
-        );
-    }
-
-    #[test]
-    fn zero_failures_has_no_delay() {
-        assert_eq!(backoff_delay(0), Duration::ZERO, "no failure means no wait");
-    }
-
-    #[test]
-    fn standing_reason_defaults_when_absent() {
-        let state = PersistState::default();
-        assert_eq!(
-            state.standing_reason(),
-            PersistError::Io,
-            "absent reason falls back to Io"
-        );
-    }
-}
+mod tests;

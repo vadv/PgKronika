@@ -60,4 +60,7 @@ pub use live::{
 };
 pub use observations::EventObservationsBlock;
 pub use persist_mode::{PersistMode, PersistModeSnapshot};
-pub use publish::{CacheRebuildReason, FactLoad, FactOrigin, FactStore, PersistError};
+pub use publish::{
+    CacheRebuildReason, FactLoad, FactOrigin, FactStore, PersistError, PersistFailureClass,
+    PersistenceProbeOutcome,
+};

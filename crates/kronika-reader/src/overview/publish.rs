@@ -5,12 +5,16 @@
 //! diagnostic.
 
 use std::fs::File;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::io::{self, Write as _};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+use std::collections::VecDeque;
 
 use kronika_analytics::overview::SegmentIdentity;
 use kronika_format::ReadAt;
@@ -26,13 +30,14 @@ use super::facts::{BuildError, SegmentContext, SegmentFacts};
 use super::fallback::{FallbackConfig, FallbackFactKey, FallbackFactLru, FallbackStats};
 use super::gc::{GcAdmissionError, GcConfig, GcMark, GcOutcome, GcSkipReason, GcState};
 use super::limits::Bounds;
-use super::persist_mode::{PersistModeSnapshot, PersistState};
+use super::persist_mode::{PersistModeSnapshot, PersistState, Reservation};
 use crate::unit::{PgmBodyReadStats, PgmUnit};
 
 const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 const NAME_RETRIES: usize = 32;
 
 static PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static STORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Why a fact-file write could not be published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,14 +50,37 @@ pub enum PersistError {
     NoSpace,
     /// The filesystem quota is exhausted.
     QuotaExceeded,
+    /// A retryable filesystem operation failed.
+    TransientIo,
+    /// A network or remote filesystem handle became stale.
+    StaleFilesystem,
     /// Computed facts could not be encoded under the configured bounds.
     InvalidFacts,
     /// Another cache owner currently publishes this key.
     Busy,
     /// A generated cache component resolved through an unsafe file type.
     UnsafePath,
-    /// Another I/O failure occurred.
+    /// The cache namespace has a structurally invalid entry or layout.
+    InvalidCacheState,
+    /// An unclassified I/O failure occurred and requires operator diagnosis.
     Io,
+}
+
+/// Stable operational class for a persistent-cache failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistFailureClass {
+    /// The backing filesystem is mounted read-only.
+    ReadOnly,
+    /// The process lacks permission to mutate the cache.
+    Permission,
+    /// Free space or configured quota is exhausted.
+    Capacity,
+    /// A bounded retry may recover from the I/O failure.
+    Transient,
+    /// Another owner currently has the required lock or reservation.
+    Contended,
+    /// Retrying without an operator or code change is unsafe.
+    Permanent,
 }
 
 impl std::fmt::Display for PersistError {
@@ -62,9 +90,12 @@ impl std::fmt::Display for PersistError {
             Self::PermissionDenied => "cache write permission denied",
             Self::NoSpace => "cache filesystem is out of space",
             Self::QuotaExceeded => "cache filesystem quota is exhausted",
+            Self::TransientIo => "cache filesystem I/O failed transiently",
+            Self::StaleFilesystem => "cache filesystem handle is stale",
             Self::InvalidFacts => "computed facts cannot be encoded",
             Self::Busy => "cache key is being published by another owner",
             Self::UnsafePath => "cache path contains an unsafe file type",
+            Self::InvalidCacheState => "cache namespace is structurally invalid",
             Self::Io => "cache I/O failed",
         };
         f.write_str(text)
@@ -179,6 +210,59 @@ pub struct FactStore {
     publication_gate: Arc<Mutex<()>>,
     /// Write mode and retry backoff for the durable cache.
     persist: Arc<Mutex<PersistState>>,
+    #[cfg(test)]
+    test_publish_faults: Arc<Mutex<VecDeque<PersistError>>>,
+    #[cfg(test)]
+    test_publish_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    test_recovery_gc_attempts: Arc<AtomicU64>,
+}
+
+struct PersistAttempt {
+    state: Arc<Mutex<PersistState>>,
+    reservation: u64,
+    completed: bool,
+}
+
+impl PersistAttempt {
+    const fn new(state: Arc<Mutex<PersistState>>, reservation: u64) -> Self {
+        Self {
+            state,
+            reservation,
+            completed: false,
+        }
+    }
+
+    fn finish<T>(mut self, result: Result<T, PersistError>) -> Result<T, PersistError> {
+        let state_result = match &result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(*error),
+        };
+        lock_unpoisoned(&self.state).finish(self.reservation, state_result, Instant::now());
+        self.completed = true;
+        result
+    }
+}
+
+impl Drop for PersistAttempt {
+    fn drop(&mut self) {
+        if !self.completed {
+            lock_unpoisoned(&self.state).cancel(self.reservation, Instant::now());
+        }
+    }
+}
+
+/// Result of checking whether a backed-off store can write again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceProbeOutcome {
+    /// No standing failure is due for a probe.
+    NotDue,
+    /// Another publication or recovery probe owns the reservation.
+    InFlight,
+    /// The probe durably created and removed its sentinel file.
+    Succeeded,
+    /// The probe failed with a typed persistence error.
+    Failed(PersistError),
 }
 
 impl FactStore {
@@ -204,21 +288,55 @@ impl FactStore {
         fallback_config: FallbackConfig,
         gc_config: GcConfig,
     ) -> Self {
+        let cache_root = cache_root.into();
+        let jitter_seed = store_jitter_seed(&cache_root);
         Self {
-            cache_root: cache_root.into(),
+            cache_root,
             fallback: Arc::new(Mutex::new(FallbackFactLru::new(fallback_config))),
             gc_config,
             gc: Arc::new(Mutex::new(GcState::default())),
             owner: Arc::new(Mutex::new(None)),
             publication_gate: Arc::new(Mutex::new(())),
-            persist: Arc::new(Mutex::new(PersistState::default())),
+            persist: Arc::new(Mutex::new(PersistState::new(jitter_seed))),
+            #[cfg(test)]
+            test_publish_faults: Arc::new(Mutex::new(VecDeque::new())),
+            #[cfg(test)]
+            test_publish_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_recovery_gc_attempts: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// The current persistence write mode and backoff diagnostics.
     #[must_use]
     pub fn persist_mode(&self) -> PersistModeSnapshot {
-        self.with_persist(|persist| persist.snapshot())
+        self.with_persist(|persist| persist.snapshot(Instant::now()))
+    }
+
+    /// Runs the single due recovery probe without changing durable-read paths.
+    ///
+    /// At most one caller receives the due reservation. A capacity failure may
+    /// first run one bounded GC pass from the last complete authoritative mark.
+    #[must_use]
+    pub fn probe_persistence(&self) -> PersistenceProbeOutcome {
+        let now = Instant::now();
+        let (reservation, standing_reason) = self
+            .with_persist(|persist| (persist.reserve_due_probe(now), persist.standing_reason()));
+        let reservation = match reservation {
+            Reservation::Acquired(reservation) => reservation,
+            Reservation::InFlight => return PersistenceProbeOutcome::InFlight,
+            Reservation::Backoff(_) | Reservation::NotNeeded => {
+                return PersistenceProbeOutcome::NotDue;
+            }
+        };
+        let attempt = PersistAttempt::new(Arc::clone(&self.persist), reservation);
+        if standing_reason.class() == PersistFailureClass::Capacity {
+            let _recovered = self.recover_capacity_once();
+        }
+        match attempt.finish(self.probe_once()) {
+            Ok(()) => PersistenceProbeOutcome::Succeeded,
+            Err(error) => PersistenceProbeOutcome::Failed(error),
+        }
     }
 
     fn with_persist<T>(&self, operation: impl FnOnce(&mut PersistState) -> T) -> T {
@@ -379,7 +497,7 @@ impl FactStore {
         let bytes = facts
             .encode(bounds)
             .map_err(|_error| PersistError::InvalidFacts)?;
-        let path = self.publish_encoded(facts, &bytes, bounds)?;
+        let path = self.persist_encoded(facts, &bytes, bounds)?;
         self.discard_fallback_for(facts.identity(), facts.lineage());
         Ok(path)
     }
@@ -405,7 +523,7 @@ impl FactStore {
             .map_err(BuildError::from)?,
         );
 
-        let persist_error = self.publish_with_backoff(&admitted, &bytes, bounds);
+        let persist_error = self.persist_encoded(&admitted, &bytes, bounds).err();
         let fallback_key = FallbackFactKey::for_facts(&admitted);
         match persist_error {
             None => self.discard_fallback(fallback_key),
@@ -435,33 +553,50 @@ impl FactStore {
         Ok((admitted, persist_error))
     }
 
-    /// Publishes `facts` unless an unexpired backoff suppresses the write.
-    ///
-    /// While backed off the disk is not touched; the standing failure reason
-    /// is reported and facts stay memory-only. An attempted write updates the
-    /// mode: success clears backoff, a recoverable failure arms the next
-    /// retry deadline.
-    fn publish_with_backoff(
+    fn persist_encoded(
         &self,
         facts: &SegmentFacts,
         bytes: &[u8],
         bounds: &Bounds,
-    ) -> Option<PersistError> {
-        if !self.with_persist(|persist| persist.should_attempt_write(Instant::now())) {
-            return Some(self.with_persist(|persist| persist.standing_reason()));
-        }
+    ) -> Result<PathBuf, PersistError> {
+        let reservation = self.with_persist(|persist| persist.reserve_write(Instant::now()));
+        let reservation = match reservation {
+            Reservation::Acquired(reservation) => reservation,
+            Reservation::Backoff(error) => return Err(error),
+            Reservation::InFlight => return Err(PersistError::Busy),
+            Reservation::NotNeeded => return Err(PersistError::Io),
+        };
+        PersistAttempt::new(Arc::clone(&self.persist), reservation)
+            .finish(self.publish_with_capacity_recovery(facts, bytes, bounds))
+    }
+
+    fn publish_with_capacity_recovery(
+        &self,
+        facts: &SegmentFacts,
+        bytes: &[u8],
+        bounds: &Bounds,
+    ) -> Result<PathBuf, PersistError> {
         match self.publish_encoded(facts, bytes, bounds) {
-            Ok(_path) => {
-                self.with_persist(PersistState::on_success);
-                None
+            Err(error)
+                if error.class() == PersistFailureClass::Capacity
+                    && self.recover_capacity_once() =>
+            {
+                self.publish_encoded(facts, bytes, bounds)
             }
-            Err(error) => {
-                if error.is_fallback_eligible() {
-                    self.with_persist(|persist| persist.on_failure(error, Instant::now()));
-                }
-                Some(error)
-            }
+            outcome => outcome,
         }
+    }
+
+    fn recover_capacity_once(&self) -> bool {
+        let mark = lock_unpoisoned(&self.gc).last_authoritative_mark();
+        let Some(mark) = mark else {
+            return false;
+        };
+        #[cfg(test)]
+        self.test_recovery_gc_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let outcome = self.collect_garbage(&mark);
+        outcome.scan_complete && outcome.sweep_authorized
     }
 
     fn publish_encoded(
@@ -470,6 +605,14 @@ impl FactStore {
         bytes: &[u8],
         bounds: &Bounds,
     ) -> Result<PathBuf, PersistError> {
+        #[cfg(test)]
+        {
+            self.test_publish_attempts.fetch_add(1, Ordering::Relaxed);
+            let injected = lock_unpoisoned(&self.test_publish_faults).pop_front();
+            if let Some(error) = injected {
+                return Err(error);
+            }
+        }
         let _publication = lock_unpoisoned(&self.publication_gate);
         let _owner = self.acquire_owner()?;
         let key = FactKey::for_identity(facts.identity(), FileKind::SegmentFacts);
@@ -530,7 +673,7 @@ impl FactStore {
             match super::gc::admit_publication(&namespace, self.gc_config, incoming) {
                 Ok(usage) => lock_unpoisoned(&self.gc).update_usage(usage, self.gc_config),
                 Err(GcAdmissionError::Capped) => return Err(PersistError::QuotaExceeded),
-                Err(GcAdmissionError::Incomplete) => return Err(PersistError::Io),
+                Err(GcAdmissionError::Incomplete) => return Err(PersistError::TransientIo),
             }
         }
 
@@ -555,6 +698,62 @@ impl FactStore {
             lock_unpoisoned(&self.gc).record_publication(build_key, SystemTime::now());
             final_path
         })
+    }
+
+    fn probe_once(&self) -> Result<(), PersistError> {
+        let _publication = lock_unpoisoned(&self.publication_gate);
+        let _owner = self.acquire_owner()?;
+        let namespace = open_namespace(&self.cache_root, true).map_err(PersistError::from_io)?;
+        for _ in 0..NAME_RETRIES {
+            let sequence = PUBLISH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let name = format!(".probe-{}-{sequence}", std::process::id());
+            let mut file = match open_file_at(
+                &namespace,
+                &name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                FILE_MODE,
+            ) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(PersistError::from_io(error)),
+            };
+            let probe_result = rustix::fs::fchmod(&file, FILE_MODE)
+                .map_err(PersistError::from_errno)
+                .and_then(|()| file.write_all(b"p").map_err(PersistError::from_io))
+                .and_then(|()| file.sync_all().map_err(PersistError::from_io));
+            drop(file);
+            if let Err(error) = probe_result {
+                unlink_ignoring_missing(&namespace, &name);
+                return Err(error);
+            }
+            rustix::fs::unlinkat(&namespace, &name, AtFlags::empty())
+                .map_err(PersistError::from_errno)?;
+            namespace.sync_all().map_err(PersistError::from_io)?;
+            return Ok(());
+        }
+        Err(PersistError::TransientIo)
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_publish_faults(&self, faults: impl IntoIterator<Item = PersistError>) {
+        *lock_unpoisoned(&self.test_publish_faults) = faults.into_iter().collect();
+        self.test_publish_attempts.store(0, Ordering::Relaxed);
+        self.test_recovery_gc_attempts.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_publish_attempts(&self) -> u64 {
+        self.test_publish_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_recovery_gc_attempts(&self) -> u64 {
+        self.test_recovery_gc_attempts.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_persistence_probe_due(&self) {
+        self.with_persist(|persist| persist.force_due(Instant::now()));
     }
 
     fn read_with_stats<R: ReadAt>(
@@ -638,7 +837,7 @@ fn commit_temp(
         expected_catalog,
         bounds,
     )
-    .map_err(|_error| PersistError::Io)?;
+    .map_err(|_error| PersistError::InvalidCacheState)?;
 
     for _ in 0..2 {
         match rustix::fs::renameat_with(
@@ -670,7 +869,7 @@ fn commit_temp(
             Err(error) => return Err(PersistError::from_errno(error)),
         }
     }
-    Err(PersistError::Io)
+    Err(PersistError::Busy)
 }
 
 fn open_regular_at(directory: &File, name: &str) -> Result<File, io::Error> {
@@ -707,7 +906,7 @@ fn create_temp(directory: &File, key: &FactKey) -> Result<(String, File), Persis
             Err(error) => return Err(PersistError::from_io(error)),
         }
     }
-    Err(PersistError::Io)
+    Err(PersistError::TransientIo)
 }
 
 fn write_synced(mut file: File, bytes: &[u8]) -> Result<(), PersistError> {
@@ -735,7 +934,7 @@ fn quarantine(directory: &File, final_name: &str, key: &FactKey) -> Result<(), P
             Err(error) => return Err(PersistError::from_errno(error)),
         }
     }
-    Err(PersistError::Io)
+    Err(PersistError::TransientIo)
 }
 
 fn path_exists_at(directory: &File, name: &str) -> Result<bool, PersistError> {
@@ -768,19 +967,36 @@ fn cache_rebuild_reason(error: &CacheReadError) -> CacheRebuildReason {
 }
 
 impl PersistError {
-    const fn is_fallback_eligible(self) -> bool {
+    /// Stable recovery policy class for this failure.
+    #[must_use]
+    pub const fn class(self) -> PersistFailureClass {
+        match self {
+            Self::ReadOnlyFilesystem => PersistFailureClass::ReadOnly,
+            Self::PermissionDenied => PersistFailureClass::Permission,
+            Self::NoSpace | Self::QuotaExceeded => PersistFailureClass::Capacity,
+            Self::TransientIo | Self::StaleFilesystem => PersistFailureClass::Transient,
+            Self::Busy => PersistFailureClass::Contended,
+            Self::InvalidFacts | Self::UnsafePath | Self::InvalidCacheState | Self::Io => {
+                PersistFailureClass::Permanent
+            }
+        }
+    }
+
+    pub(super) const fn is_backoff_eligible(self) -> bool {
         matches!(
-            self,
-            Self::ReadOnlyFilesystem
-                | Self::PermissionDenied
-                | Self::NoSpace
-                | Self::QuotaExceeded
-                | Self::Busy
-                | Self::Io
+            self.class(),
+            PersistFailureClass::ReadOnly
+                | PersistFailureClass::Permission
+                | PersistFailureClass::Capacity
+                | PersistFailureClass::Transient
         )
     }
 
-    fn from_errno(error: rustix::io::Errno) -> Self {
+    const fn is_fallback_eligible(self) -> bool {
+        self.is_backoff_eligible() || matches!(self.class(), PersistFailureClass::Contended)
+    }
+
+    pub(super) fn from_errno(error: rustix::io::Errno) -> Self {
         if error == rustix::io::Errno::ROFS {
             Self::ReadOnlyFilesystem
         } else if matches!(error, rustix::io::Errno::ACCESS | rustix::io::Errno::PERM) {
@@ -789,8 +1005,19 @@ impl PersistError {
             Self::NoSpace
         } else if error == rustix::io::Errno::DQUOT {
             Self::QuotaExceeded
+        } else if error == rustix::io::Errno::STALE {
+            Self::StaleFilesystem
         } else if error == rustix::io::Errno::LOOP {
             Self::UnsafePath
+        } else if matches!(
+            error,
+            rustix::io::Errno::IO
+                | rustix::io::Errno::AGAIN
+                | rustix::io::Errno::BUSY
+                | rustix::io::Errno::INTR
+                | rustix::io::Errno::TIMEDOUT
+        ) {
+            Self::TransientIo
         } else {
             Self::Io
         }
@@ -800,17 +1027,35 @@ impl PersistError {
         clippy::needless_pass_by_value,
         reason = "the owned signature is used directly as an I/O Result map_err callback"
     )]
-    fn from_io(error: io::Error) -> Self {
+    pub(super) fn from_io(error: io::Error) -> Self {
         match error.kind() {
             io::ErrorKind::PermissionDenied => Self::PermissionDenied,
             io::ErrorKind::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
             io::ErrorKind::StorageFull => Self::NoSpace,
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+                Self::TransientIo
+            }
+            io::ErrorKind::InvalidData | io::ErrorKind::NotADirectory => Self::InvalidCacheState,
             _ => error
                 .raw_os_error()
                 .map(rustix::io::Errno::from_raw_os_error)
                 .map_or(Self::Io, Self::from_errno),
         }
     }
+}
+
+fn store_jitter_seed(cache_root: &Path) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    cache_root.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos())
+        .hash(&mut hasher);
+    STORE_SEQUENCE
+        .fetch_add(1, Ordering::Relaxed)
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -904,22 +1149,32 @@ mod tests {
     }
 
     #[test]
+    fn dropped_persist_attempt_releases_its_reservation() {
+        let now = Instant::now();
+        let state = Arc::new(Mutex::new(PersistState::new(7)));
+        let reserved = lock_unpoisoned(&state).reserve_write(now);
+        let reservation = match reserved {
+            Reservation::Acquired(reservation) => reservation,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        drop(PersistAttempt::new(Arc::clone(&state), reservation));
+        assert!(matches!(
+            lock_unpoisoned(&state).reserve_write(now),
+            Reservation::Acquired(_)
+        ));
+    }
+
+    #[test]
     fn a_suppressed_write_does_not_attempt_the_disk_again() {
-        // A file where the cache root is expected makes every publish fail.
-        let temp = TempDir::new().expect("temp");
-        let blocker = temp.path().join("blocker");
-        std::fs::write(&blocker, b"x").expect("write blocker file");
-        let root = blocker.join("cache");
-        let store = FactStore::new(&root);
+        let temp = TempDir::new().expect("cache directory");
+        let store = FactStore::new(temp.path());
+        store.inject_publish_faults([PersistError::TransientIo]);
         let facts = built(&lifecycle_pgm(7));
 
         let (_first, first_error) = store
             .admit_publish_or_fallback(&facts, &LIMIT)
             .expect("first admit");
-        assert!(
-            first_error.is_some(),
-            "publishing under a file-as-root fails"
-        );
+        assert_eq!(first_error, Some(PersistError::TransientIo));
         assert_eq!(
             store.persist_mode().failures,
             1,
@@ -942,6 +1197,7 @@ mod tests {
             1,
             "a suppressed write does not attempt the disk"
         );
+        assert_eq!(store.test_publish_attempts(), 1);
     }
 
     #[test]
@@ -1177,10 +1433,9 @@ mod tests {
 
     #[test]
     fn concurrent_publication_failures_leave_one_correct_fallback_entry() {
-        let directory = TempDir::new().expect("cache parent");
-        let cache_root = directory.path().join("not-a-directory");
-        std::fs::write(&cache_root, b"blocks durable publication").expect("write cache blocker");
-        let store = Arc::new(FactStore::new(cache_root.as_path()));
+        let directory = TempDir::new().expect("cache directory");
+        let store = Arc::new(FactStore::new(directory.path()));
+        store.inject_publish_faults([PersistError::TransientIo]);
         let bytes = Arc::new(lifecycle_pgm(7));
         let barrier = Arc::new(Barrier::new(3));
         let mut workers = Vec::new();
@@ -1239,16 +1494,15 @@ mod tests {
 
     #[test]
     fn publication_failure_returns_fresh_facts_then_serves_the_fallback() {
-        let directory = TempDir::new().expect("cache parent");
-        let cache_root = directory.path().join("not-a-directory");
-        std::fs::write(&cache_root, b"blocks durable publication").expect("write cache blocker");
-        let store = FactStore::new(cache_root.as_path());
+        let directory = TempDir::new().expect("cache directory");
+        let store = FactStore::new(directory.path());
+        store.inject_publish_faults([PersistError::TransientIo]);
         let bytes = lifecycle_pgm(7);
         let fresh = store
             .load_or_build(&unit(&bytes), &context(), &LIMIT)
             .expect("source build");
         assert_eq!(fresh.origin(), FactOrigin::Rebuilt);
-        assert_eq!(fresh.persist_error(), Some(PersistError::Io));
+        assert_eq!(fresh.persist_error(), Some(PersistError::TransientIo));
         assert_eq!(fresh.facts().observations().len(), 2);
         let canonical_bytes = u64::try_from(
             fresh
@@ -1279,8 +1533,7 @@ mod tests {
         assert!(Arc::ptr_eq(&fresh.shared_facts(), &fallback.shared_facts()));
         assert_eq!(store.fallback_stats().hits, 1);
 
-        std::fs::remove_file(&cache_root).expect("remove cache blocker");
-        std::fs::create_dir(&cache_root).expect("create durable cache root");
+        store.force_persistence_probe_due();
         store
             .publish(fresh.facts(), &LIMIT)
             .expect("publish admitted facts");
@@ -1299,10 +1552,9 @@ mod tests {
 
     #[test]
     fn fallback_identity_separates_locator_scope_and_source() {
-        let directory = TempDir::new().expect("cache parent");
-        let cache_root = directory.path().join("not-a-directory");
-        std::fs::write(&cache_root, b"blocks durable publication").expect("write cache blocker");
-        let store = FactStore::new(cache_root.as_path());
+        let directory = TempDir::new().expect("cache directory");
+        let store = FactStore::new(directory.path());
+        store.inject_publish_faults([PersistError::TransientIo]);
         let bytes = lifecycle_pgm(7);
 
         let first = store
@@ -1336,10 +1588,9 @@ mod tests {
 
     #[test]
     fn tighter_admission_does_not_reuse_a_looser_fallback_entry() {
-        let directory = TempDir::new().expect("cache parent");
-        let cache_root = directory.path().join("not-a-directory");
-        std::fs::write(&cache_root, b"blocks durable publication").expect("write cache blocker");
-        let store = FactStore::new(cache_root.as_path());
+        let directory = TempDir::new().expect("cache directory");
+        let store = FactStore::new(directory.path());
+        store.inject_publish_faults([PersistError::TransientIo]);
         let bytes = lifecycle_pgm(7);
         store
             .load_or_build(&unit(&bytes), &context(), &LIMIT)
@@ -1362,13 +1613,12 @@ mod tests {
 
     #[test]
     fn production_fallback_enforces_lru_hour_byte_and_oversized_budgets() {
-        let hours_parent = TempDir::new().expect("hours cache parent");
-        let hours_root = hours_parent.path().join("not-a-directory");
-        std::fs::write(&hours_root, b"blocks durable publication").expect("write hours blocker");
+        let hours_root = TempDir::new().expect("hours cache directory");
         let hour_store = FactStore::with_fallback_config(
-            hours_root.as_path(),
+            hours_root.path(),
             FallbackConfig::new(2, crate::MAX_FALLBACK_BYTES).expect("hour config"),
         );
+        hour_store.inject_publish_faults([PersistError::TransientIo]);
         let sources = [lifecycle_pgm(1), lifecycle_pgm(2), lifecycle_pgm(3)];
         for bytes in &sources[..2] {
             hour_store
@@ -1410,13 +1660,12 @@ mod tests {
         )
         .expect("encoded length fits");
         let two_entries = encoded_len.checked_mul(2).expect("two facts fit");
-        let bytes_parent = TempDir::new().expect("bytes cache parent");
-        let bytes_root = bytes_parent.path().join("not-a-directory");
-        std::fs::write(&bytes_root, b"blocks durable publication").expect("write bytes blocker");
+        let bytes_root = TempDir::new().expect("bytes cache directory");
         let byte_store = FactStore::with_fallback_config(
-            bytes_root.as_path(),
+            bytes_root.path(),
             FallbackConfig::new(10, two_entries).expect("byte config"),
         );
+        byte_store.inject_publish_faults([PersistError::TransientIo]);
         for bytes in &sources {
             byte_store
                 .load_or_build(&unit(bytes), &context(), &LIMIT)
@@ -1426,14 +1675,12 @@ mod tests {
         assert!(byte_stats.evictions > 0);
         assert!(byte_stats.resident_bytes <= two_entries);
 
-        let oversized_parent = TempDir::new().expect("oversized cache parent");
-        let oversized_root = oversized_parent.path().join("not-a-directory");
-        std::fs::write(&oversized_root, b"blocks durable publication")
-            .expect("write oversized blocker");
+        let oversized_root = TempDir::new().expect("oversized cache directory");
         let oversized_store = FactStore::with_fallback_config(
-            oversized_root.as_path(),
+            oversized_root.path(),
             FallbackConfig::new(10, encoded_len - 1).expect("oversized config"),
         );
+        oversized_store.inject_publish_faults([PersistError::TransientIo]);
         let returned = oversized_store
             .load_or_build(&unit(&sources[0]), &context(), &LIMIT)
             .expect("oversized facts remain available");

@@ -147,6 +147,11 @@ impl OverviewWriter {
         self.store.persist_mode()
     }
 
+    /// Runs the single due recovery probe independently of fact construction.
+    pub(crate) fn probe_persistence(&self) -> kronika_reader::PersistenceProbeOutcome {
+        super::resilience::run_due_probe(&self.store)
+    }
+
     /// Requests a bounded GC scan at most once per [`GC_INTERVAL_PASSES`]
     /// successful refreshes.
     ///

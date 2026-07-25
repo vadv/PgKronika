@@ -45,11 +45,12 @@ pub use overview::{
     GcCategoryUsage, GcConfig, GcConfigError, GcMark, GcOutcome, GcSkipReason, GcUsage,
     HeaderIdentity, LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState, LiveView,
     LossCoverageBlock, MAX_FALLBACK_BYTES, MAX_FALLBACK_SEGMENT_HOURS, ManifestEntryDescriptor,
-    PersistError, PersistMode, PersistModeSnapshot, ResetMarker, ResetMarkersBlock,
-    ResolvedPattern, SealOutcome, SegmentContext, SegmentContextError, SegmentFacts,
-    SourceDescriptor, SourceError, SourceManifestBlock, StringTableBlock, TargetedDictionaryRead,
-    TargetedDictionaryStats, dictionary_context_id, lineage_from_catalog, placement, placement_dir,
-    reconcile_seal, resolve_targeted, section_body_id, source_scope_id,
+    PersistError, PersistFailureClass, PersistMode, PersistModeSnapshot, PersistenceProbeOutcome,
+    ResetMarker, ResetMarkersBlock, ResolvedPattern, SealOutcome, SegmentContext,
+    SegmentContextError, SegmentFacts, SourceDescriptor, SourceError, SourceManifestBlock,
+    StringTableBlock, TargetedDictionaryRead, TargetedDictionaryStats, dictionary_context_id,
+    lineage_from_catalog, placement, placement_dir, reconcile_seal, resolve_targeted,
+    section_body_id, source_scope_id,
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
