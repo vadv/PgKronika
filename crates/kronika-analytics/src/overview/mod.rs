@@ -40,6 +40,7 @@ pub use fact::{
     EntityRef, ErrorFactPayload, EventFact, EventKind, EventPayload, FactShape,
     InvalidEventFact, LifecycleFactPayload, LockWaitFactPayload, MaintenanceFactPayload,
     SlowQueryFactPayload, StateTransitionFactPayload, TempFileFactPayload,
+    counter_sample_observation_id, gauge_sample_observation_id,
 };
 pub use health::{
     CadenceEpochId, DomainId, DomainPenalty, DownsampleError, DownsampledHealthPoint,
@@ -104,7 +105,7 @@ pub const REGISTRY_CONTRACT_VERSION: u32 = 1;
 pub const HEALTH_POLICY_VERSION: u32 = 1;
 
 /// Reserved version for future notable-event policy.
-pub const NOTABLE_POLICY_VERSION: u32 = 1;
+pub const NOTABLE_POLICY_VERSION: u32 = 2;
 
 /// Reserved version for future response redaction policy.
 pub const REDACTION_POLICY_VERSION: u32 = 1;
@@ -113,7 +114,7 @@ pub const REDACTION_POLICY_VERSION: u32 = 1;
 pub const DIAGNOSIS_POLICY_VERSION: u32 = 1;
 
 /// Reserved version for a future response schema.
-pub const RESPONSE_SCHEMA_VERSION: u32 = 1;
+pub const RESPONSE_SCHEMA_VERSION: u32 = 2;
 
 /// Reserved version for future cursor encoding.
 pub const CURSOR_VERSION: u16 = 1;

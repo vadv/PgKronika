@@ -16,6 +16,7 @@ use core::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use super::counts::{ErrorCategory, Severity, SqlState};
+use super::fact::{EventFact, EventKind};
 use super::observation::{EventObservation, ObservationPayload};
 
 /// `SIGKILL` signal number; an uncatchable process termination.
@@ -100,11 +101,15 @@ pub enum NotableClass {
     AuthorizationFailure,
     /// A permission-denied error (`SQLSTATE` `42501`).
     PermissionDenied,
+    /// A proven kernel or cgroup OOM kill counter delta.
+    OomKill,
+    /// Available bytes transitioned from positive to zero.
+    FilesystemCapacityZero,
 }
 
 impl NotableClass {
     /// Every class in stable discriminant order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::ChildSigkill,
         Self::ChildSignalTermination,
         Self::Panic,
@@ -119,6 +124,8 @@ impl NotableClass {
         Self::AuthenticationFailure,
         Self::AuthorizationFailure,
         Self::PermissionDenied,
+        Self::OomKill,
+        Self::FilesystemCapacityZero,
     ];
 
     /// The stable wire code of this class.
@@ -139,6 +146,8 @@ impl NotableClass {
             Self::AuthenticationFailure => "auth_failure_observation",
             Self::AuthorizationFailure => "authorization_failure_observation",
             Self::PermissionDenied => "permission_denied_observation",
+            Self::OomKill => "oom_kill_observation",
+            Self::FilesystemCapacityZero => "filesystem_capacity_zero",
         }
     }
 
@@ -160,6 +169,8 @@ impl NotableClass {
             Self::AuthenticationFailure | Self::AuthorizationFailure | Self::PermissionDenied => {
                 NotableEvidenceClass::Authentication
             }
+            Self::OomKill => NotableEvidenceClass::OutOfMemory,
+            Self::FilesystemCapacityZero => NotableEvidenceClass::StorageCapacity,
         }
     }
 
@@ -171,7 +182,11 @@ impl NotableClass {
     const fn priority(self) -> u8 {
         match self {
             Self::Panic | Self::ChildSigkill => 0,
-            Self::OutOfMemory | Self::DiskFull | Self::IntegrityError => 1,
+            Self::OutOfMemory
+            | Self::DiskFull
+            | Self::IntegrityError
+            | Self::OomKill
+            | Self::FilesystemCapacityZero => 1,
             Self::ChildSignalTermination => 2,
             Self::ConnectionSlotsExhausted | Self::Deadlock | Self::LockNotAvailable => 3,
             Self::SerializationFailure | Self::QueryCancelled => 4,
@@ -313,6 +328,30 @@ impl NotablePolicy {
             }),
             ObservationPayload::ErrorGroup(payload) => {
                 classify_error_group(payload.severity, payload.category, payload.sqlstate)
+            }
+            _ => None,
+        }
+    }
+
+    /// Classifies canonical metric/state facts admitted to `/events`.
+    ///
+    /// Only source-proven catastrophe or contention facts are selected here;
+    /// ordinary gauges and state changes stay queryable facts without being
+    /// promoted to notable incidents.
+    #[must_use]
+    #[allow(
+        clippy::unused_self,
+        reason = "classification is policy-versioned; the v2 rule set is fixed"
+    )]
+    pub const fn classify_fact(self, fact: &EventFact) -> Option<NotableClass> {
+        match fact.kind() {
+            EventKind::PgDatabaseDeadlockDelta => Some(NotableClass::Deadlock),
+            EventKind::OsCgroupOomKillDelta | EventKind::OsHostOomKillDelta => {
+                Some(NotableClass::OomKill)
+            }
+            EventKind::OsCgroupOomDelta => Some(NotableClass::OutOfMemory),
+            EventKind::OsFilesystemCapacityZeroTransition => {
+                Some(NotableClass::FilesystemCapacityZero)
             }
             _ => None,
         }

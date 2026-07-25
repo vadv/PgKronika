@@ -11,13 +11,18 @@ use std::cmp::Ordering;
 use super::counts::{ErrorCategory, Severity, SqlState};
 use super::coverage::{CoverageSpan, RetainedExactness};
 use super::finite::FiniteF64;
+use super::metric::{MetricFactor, MetricSeriesDescriptor, MetricUnit};
 use super::observation::{
     DroppedFieldCount, EventObservation, EvidenceQuality, FactId, LossSummary, ObservationId,
     ObservationPayload, ObservationShape, SourceScopeId,
 };
+use super::reduce::{CounterInterval, CounterSample, GaugeSample, PairQuality};
 use super::sha256;
 
 const EVENT_FACT_DOMAIN_TAG: &[u8] = b"pgk-overview-canonical-event-fact-v1";
+const METRIC_FACT_DOMAIN_TAG: &[u8] = b"pgk-overview-canonical-metric-fact-v1";
+const COUNTER_SAMPLE_OBSERVATION_TAG: &[u8] = b"pgk-overview-counter-sample-observation-v1";
+const GAUGE_SAMPLE_OBSERVATION_TAG: &[u8] = b"pgk-overview-gauge-sample-observation-v1";
 
 /// Stable event taxonomy represented by canonical facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -678,6 +683,255 @@ impl EventFact {
         .map(Some)
     }
 
+    /// Derives one exact event fact from a valid adjacent cumulative pair.
+    ///
+    /// The later sample owns the event. Reset/decrease/gap/misalignment and a
+    /// measured zero delta produce no event rather than a fabricated zero.
+    ///
+    /// # Errors
+    /// Returns [`InvalidEventFact`] only when the current timestamp cannot form
+    /// a point interval or the supplied evidence violates the fact contract.
+    pub fn from_counter_pair(
+        descriptor: MetricSeriesDescriptor,
+        previous: CounterSample,
+        current: CounterSample,
+        known_gaps: &super::coverage::Coverage,
+    ) -> Result<Option<Self>, InvalidEventFact> {
+        if descriptor.series_id != previous.series_id()
+            || descriptor.series_id != current.series_id()
+            || descriptor.unit != MetricUnit::Count
+            || descriptor.reset_family.is_none()
+        {
+            return Ok(None);
+        }
+        let interval = CounterInterval::classify(Some(previous), current, known_gaps);
+        if interval.quality() != PairQuality::Valid {
+            return Ok(None);
+        }
+        let Some(delta) = interval.delta().filter(|delta| *delta != 0) else {
+            return Ok(None);
+        };
+        let Some(duration_us) = interval.duration_us() else {
+            return Ok(None);
+        };
+        let Some(kind) = counter_event_kind(descriptor.factor_id) else {
+            return Ok(None);
+        };
+        let evidence = canonical_evidence([
+            counter_sample_observation_id(previous),
+            counter_sample_observation_id(current),
+        ]);
+        Self::new(
+            metric_fact_id(kind, &evidence),
+            kind,
+            if delta == 1 {
+                FactShape::Individual
+            } else {
+                FactShape::GroupedCount
+            },
+            point_interval(current.ts_us())?,
+            delta,
+            descriptor.entity,
+            EventPayload::CounterDelta(CounterDeltaFactPayload {
+                factor_id: descriptor.factor_id,
+                delta,
+                duration_us,
+                reset_epoch: current.reset_epoch(),
+            }),
+            evidence,
+            EvidenceQuality::DerivedExact,
+            CoverageRef {
+                source_scope_id: descriptor.source_scope_id,
+                retained_exactness: RetainedExactness::Exact,
+                loss: None,
+            },
+        )
+        .map(Some)
+    }
+
+    /// Derives an exact state change between complete compatible snapshots.
+    ///
+    /// Callers supply state records retained only from complete populations.
+    /// Equal states and non-advancing timestamps create no fact.
+    ///
+    /// # Errors
+    /// Returns [`InvalidEventFact`] when the current timestamp overflows.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "both complete snapshot records are explicit evidence inputs"
+    )]
+    pub fn from_state_transition(
+        descriptor: MetricSeriesDescriptor,
+        previous_ts_us: i64,
+        previous_state: u32,
+        current_ts_us: i64,
+        current_state: u32,
+        population_total: u64,
+    ) -> Result<Option<Self>, InvalidEventFact> {
+        if descriptor.unit != MetricUnit::StateCode
+            || descriptor.entity.is_none()
+            || current_ts_us <= previous_ts_us
+            || current_state == previous_state
+        {
+            return Ok(None);
+        }
+        let Some(kind) = state_event_kind(descriptor.factor_id, current_state) else {
+            return Ok(None);
+        };
+        let previous = GaugeSample::new(
+            descriptor.series_id,
+            previous_ts_us,
+            f64::from(previous_state),
+        )
+        .expect("u32 state is finite");
+        let current =
+            GaugeSample::new(descriptor.series_id, current_ts_us, f64::from(current_state))
+                .expect("u32 state is finite");
+        let evidence = canonical_evidence([
+            gauge_sample_observation_id(previous),
+            gauge_sample_observation_id(current),
+        ]);
+        Self::new(
+            metric_fact_id(kind, &evidence),
+            kind,
+            FactShape::Individual,
+            point_interval(current_ts_us)?,
+            1,
+            descriptor.entity,
+            EventPayload::StateTransition(StateTransitionFactPayload {
+                factor_id: descriptor.factor_id,
+                previous_state,
+                current_state,
+                population_total,
+            }),
+            evidence,
+            EvidenceQuality::DerivedExact,
+            CoverageRef {
+                source_scope_id: descriptor.source_scope_id,
+                retained_exactness: RetainedExactness::Exact,
+                loss: None,
+            },
+        )
+        .map(Some)
+    }
+
+    /// Materializes one proven filesystem capacity observation.
+    ///
+    /// Total and available samples must describe the same source/entity and
+    /// timestamp. Low-space thresholds remain a policy concern.
+    ///
+    /// # Errors
+    /// Returns [`InvalidEventFact`] when the sample timestamp overflows.
+    pub fn from_capacity_samples(
+        total_descriptor: MetricSeriesDescriptor,
+        total: GaugeSample,
+        available_descriptor: MetricSeriesDescriptor,
+        available: GaugeSample,
+    ) -> Result<Option<Self>, InvalidEventFact> {
+        if total_descriptor.factor_id != MetricFactor::PgFilesystemTotalBytes.id()
+            || available_descriptor.factor_id
+                != MetricFactor::PgFilesystemAvailableBytes.id()
+            || total_descriptor.source_scope_id != available_descriptor.source_scope_id
+            || total_descriptor.entity != available_descriptor.entity
+            || total_descriptor.entity.is_none()
+            || total.ts_us() != available.ts_us()
+            || total.value() < 0.0
+            || available.value() < 0.0
+            || total.value().fract() != 0.0
+            || available.value().fract() != 0.0
+            || total.value() > u64::MAX as f64
+            || available.value() > u64::MAX as f64
+        {
+            return Ok(None);
+        }
+        let total_bytes = total.value() as u64;
+        let available_bytes = available.value() as u64;
+        if available_bytes > total_bytes {
+            return Ok(None);
+        }
+        let evidence = canonical_evidence([
+            gauge_sample_observation_id(total),
+            gauge_sample_observation_id(available),
+        ]);
+        let kind = EventKind::OsFilesystemCapacityObservation;
+        Self::new(
+            metric_fact_id(kind, &evidence),
+            kind,
+            FactShape::Individual,
+            point_interval(total.ts_us())?,
+            1,
+            total_descriptor.entity,
+            EventPayload::Capacity(CapacityFactPayload {
+                total_bytes,
+                available_bytes,
+            }),
+            evidence,
+            EvidenceQuality::Structured,
+            CoverageRef {
+                source_scope_id: total_descriptor.source_scope_id,
+                retained_exactness: RetainedExactness::Exact,
+                loss: None,
+            },
+        )
+        .map(Some)
+    }
+
+    /// Derives a proven transition from positive to zero available bytes.
+    ///
+    /// The previous and current available samples must be the same series and
+    /// the total/current pair must pass [`Self::from_capacity_samples`].
+    ///
+    /// # Errors
+    /// Returns [`InvalidEventFact`] when the current timestamp overflows.
+    pub fn from_capacity_zero_transition(
+        total_descriptor: MetricSeriesDescriptor,
+        total: GaugeSample,
+        available_descriptor: MetricSeriesDescriptor,
+        previous_available: GaugeSample,
+        current_available: GaugeSample,
+        known_gaps: &super::coverage::Coverage,
+    ) -> Result<Option<Self>, InvalidEventFact> {
+        let Some(capacity) = Self::from_capacity_samples(
+            total_descriptor,
+            total,
+            available_descriptor,
+            current_available,
+        )?
+        else {
+            return Ok(None);
+        };
+        if previous_available.series_id() != current_available.series_id()
+            || previous_available.ts_us() >= current_available.ts_us()
+            || previous_available.value() <= 0.0
+            || current_available.value() != 0.0
+            || known_gaps.spans().iter().any(|gap| {
+                gap.start_us() < current_available.ts_us()
+                    && gap.end_us() > previous_available.ts_us()
+            })
+        {
+            return Ok(None);
+        }
+        let evidence = canonical_evidence([
+            gauge_sample_observation_id(previous_available),
+            gauge_sample_observation_id(total),
+            gauge_sample_observation_id(current_available),
+        ]);
+        let kind = EventKind::OsFilesystemCapacityZeroTransition;
+        Self::new(
+            metric_fact_id(kind, &evidence),
+            kind,
+            FactShape::Individual,
+            capacity.interval(),
+            1,
+            capacity.entity(),
+            capacity.payload().clone(),
+            evidence,
+            EvidenceQuality::DerivedExact,
+            capacity.coverage().clone(),
+        )
+        .map(Some)
+    }
+
     /// Stable fact identity.
     #[must_use]
     pub const fn fact_id(&self) -> FactId {
@@ -761,6 +1015,107 @@ impl EventFact {
                 .checked_mul(size_of::<super::observation::LossReason>())
         })?;
         evidence.checked_add(payload)?.checked_add(loss)
+    }
+}
+
+/// Stable evidence identity of one canonical cumulative sample.
+#[must_use]
+pub fn counter_sample_observation_id(sample: CounterSample) -> ObservationId {
+    ObservationId(sha256::digest_parts(&[
+        COUNTER_SAMPLE_OBSERVATION_TAG,
+        &sample.series_id().0,
+        &sample.alignment_id().0,
+        &sample.ts_us().to_le_bytes(),
+        &sample.value().to_le_bytes(),
+        &sample.reset_epoch().to_le_bytes(),
+    ]))
+}
+
+/// Stable evidence identity of one canonical instantaneous sample.
+#[must_use]
+pub fn gauge_sample_observation_id(sample: GaugeSample) -> ObservationId {
+    ObservationId(sha256::digest_parts(&[
+        GAUGE_SAMPLE_OBSERVATION_TAG,
+        &sample.series_id().0,
+        &sample.ts_us().to_le_bytes(),
+        &sample.value().to_bits().to_le_bytes(),
+    ]))
+}
+
+fn point_interval(ts_us: i64) -> Result<CoverageSpan, InvalidEventFact> {
+    CoverageSpan::new(
+        ts_us,
+        ts_us
+            .checked_add(1)
+            .ok_or(InvalidEventFact::TimestampOverflow)?,
+    )
+    .ok_or(InvalidEventFact::TimestampOverflow)
+}
+
+fn canonical_evidence<const N: usize>(ids: [ObservationId; N]) -> Vec<ObservationId> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn metric_fact_id(kind: EventKind, evidence: &[ObservationId]) -> FactId {
+    let mut input = Vec::with_capacity(2 + evidence.len() * 32);
+    input.extend_from_slice(&kind.code().to_le_bytes());
+    for id in evidence {
+        input.extend_from_slice(&id.0);
+    }
+    FactId(sha256::digest_parts(&[METRIC_FACT_DOMAIN_TAG, &input]))
+}
+
+const fn counter_event_kind(factor_id: super::health::FactorId) -> Option<EventKind> {
+    match MetricFactor::from_id(factor_id) {
+        Some(MetricFactor::PgDatabaseDeadlocks) => Some(EventKind::PgDatabaseDeadlockDelta),
+        Some(MetricFactor::PgDatabaseRecoveryConflicts) => {
+            Some(EventKind::PgDatabaseRecoveryConflictDelta)
+        }
+        Some(MetricFactor::PgDatabaseChecksumFailures) => {
+            Some(EventKind::PgDatabaseChecksumFailureDelta)
+        }
+        Some(MetricFactor::PgDatabaseSessionsAbandoned) => {
+            Some(EventKind::PgDatabaseSessionsAbandonedDelta)
+        }
+        Some(MetricFactor::PgDatabaseSessionsFatal) => {
+            Some(EventKind::PgDatabaseSessionsFatalDelta)
+        }
+        Some(MetricFactor::PgDatabaseSessionsKilled) => {
+            Some(EventKind::PgDatabaseSessionsKilledDelta)
+        }
+        Some(MetricFactor::OsCgroupMemoryHighEvents) => {
+            Some(EventKind::OsCgroupMemoryHighDelta)
+        }
+        Some(MetricFactor::OsCgroupMemoryMaxEvents) => {
+            Some(EventKind::OsCgroupMemoryMaxDelta)
+        }
+        Some(MetricFactor::OsCgroupOomEvents) => Some(EventKind::OsCgroupOomDelta),
+        Some(MetricFactor::OsCgroupOomKills) => Some(EventKind::OsCgroupOomKillDelta),
+        Some(MetricFactor::OsHostOomKills) => Some(EventKind::OsHostOomKillDelta),
+        _ => None,
+    }
+}
+
+const fn state_event_kind(
+    factor_id: super::health::FactorId,
+    current_state: u32,
+) -> Option<EventKind> {
+    match MetricFactor::from_id(factor_id) {
+        Some(MetricFactor::PgRecoveryRole) => Some(EventKind::PgRecoveryRoleChanged),
+        Some(MetricFactor::PgTimeline) => Some(EventKind::PgTimelineChanged),
+        Some(MetricFactor::PgReplicationSenderState) => {
+            Some(EventKind::PgReplicationSenderStateChanged)
+        }
+        Some(MetricFactor::PgReplicationSlotState) if current_state == 4 => {
+            Some(EventKind::PgReplicationSlotLost)
+        }
+        Some(MetricFactor::PgReplicationSlotState) => {
+            Some(EventKind::PgReplicationSlotStateChanged)
+        }
+        _ => None,
     }
 }
 

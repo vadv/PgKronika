@@ -48,7 +48,12 @@ impl SelectedSealedPlan {
         let stop_after = limit.checked_add(1).ok_or(SelectionError::InvalidLimit)?;
         let mut selected_indices = Vec::with_capacity(stop_after.min(64));
         for source in sources {
-            if view.extend_selected(*source, range, stop_after, &mut selected_indices) {
+            if view.extend_selected_with_halo(
+                *source,
+                range,
+                stop_after,
+                &mut selected_indices,
+            ) {
                 return Err(SelectionError::LimitExceeded { limit });
             }
         }

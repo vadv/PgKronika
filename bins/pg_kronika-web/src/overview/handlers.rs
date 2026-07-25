@@ -13,9 +13,10 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::overview::{
-    CountError, CountLimits, CountResource, CoverageSpan, EventCounts, EventObservation,
-    NotableClass, NotablePolicy, OracleError, OracleLimits, OracleResource, PhysicalCountSemantics,
-    RetainedExactness, Severity, SourceCompleteness, SourceScopeId,
+    CountError, CountLimits, CountResource, CoverageSpan, EventCounts,
+    EventFact as CanonicalEventFact, EventObservation, EventPayload as CanonicalEventPayload,
+    NotableClass, NotablePolicy, OracleError, OracleLimits, OracleResource,
+    PhysicalCountSemantics, RetainedExactness, Severity, SourceCompleteness, SourceScopeId,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -31,7 +32,7 @@ use crate::overview::dto::{
 };
 use crate::overview::loader::FactLoadFailure;
 use crate::overview::selection::{SelectedSealedPlan, SelectionError};
-use crate::overview::view::{IndexView, SourceMetadata};
+use crate::overview::view::{CanonicalFactQueryError, IndexView, SourceMetadata};
 use crate::params::QueryParams;
 use crate::problem::{ApiProblem, QueryParameter};
 use crate::{AppState, TimelineFlightRole};
@@ -66,6 +67,7 @@ const QUERY_LIMITS: OracleLimits = OracleLimits {
 
 /// Maximum logical bytes cloned into one timeline oracle result.
 const QUERY_MATERIALIZED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FACTOR_COVERAGE_RECORDS: usize = 65_536;
 
 /// A validated overview request range.
 #[derive(Debug, Clone, Copy)]
@@ -297,8 +299,19 @@ fn render_overview(
     let notable_preview = notable_preview_dto(&policy, observations, request)?;
     let meta = timeline_meta(view, request, &[request.source], None)?;
     let covered_duration_us = result.coverage().covered_duration_in(request.range);
-    let (health_summary, coverage) =
+    let (health_summary, _policy_coverage) =
         crate::overview::health::overview_health_summary(observations, request.range);
+    let coverage = Value::Array(
+        view.query_factor_coverage(
+            &[request.source],
+            request.range,
+            MAX_FACTOR_COVERAGE_RECORDS,
+        )
+        .map_err(canonical_fact_problem)?
+        .iter()
+        .map(crate::overview::health::factor_coverage_json)
+        .collect(),
+    );
 
     Ok(OverviewResponseDto {
         meta,
@@ -416,6 +429,16 @@ fn render_health(view: &IndexView, request: HealthRequest) -> Result<Value, ApiP
         request.effective_step_us,
     )
     .ok_or_else(ApiProblem::internal_error)?;
+    let coverage = view
+        .query_factor_coverage(
+            &[request.source],
+            request.range,
+            MAX_FACTOR_COVERAGE_RECORDS,
+        )
+        .map_err(canonical_fact_problem)?
+        .iter()
+        .map(crate::overview::health::factor_coverage_json)
+        .collect::<Vec<_>>();
 
     let meta = timeline_meta(
         view,
@@ -433,7 +456,7 @@ fn render_health(view: &IndexView, request: HealthRequest) -> Result<Value, ApiP
         "health_policy_version": line.policy_version,
         "factor_set_ids": line.factor_set_ids,
         "points": line.points,
-        "coverage": line.coverage,
+        "coverage": coverage,
     }))
 }
 
@@ -680,6 +703,14 @@ fn render_events(
         })
         .collect::<Result<BTreeMap<SourceScopeId, u64>, _>>()?;
     let observations = result.observations();
+    let canonical_facts = view
+        .query_canonical_facts(
+            &request.sources,
+            request.range,
+            QUERY_LIMITS.max_observations,
+            QUERY_LIMITS.max_observations,
+        )
+        .map_err(canonical_fact_problem)?;
     let mut notable = BinaryHeap::with_capacity(request.limit.saturating_add(1));
     let mut omitted_by_response_filter = 0_u64;
     for observation in observations {
@@ -710,7 +741,57 @@ fn render_events(
             .ok_or_else(ApiProblem::store_read_failed)?;
         let candidate = PageCandidate {
             position: fact_position,
-            observation,
+            source: PageCandidateSource::Observation(observation),
+            class,
+            source_id,
+        };
+        let retained_cap = request.limit.saturating_add(1);
+        if notable.len() < retained_cap {
+            notable.push(candidate);
+        } else if notable
+            .peek()
+            .is_some_and(|worst| candidate.position < worst.position)
+        {
+            let _ = notable.pop();
+            notable.push(candidate);
+        }
+    }
+    for fact in canonical_facts.iter().filter(|fact| {
+        matches!(
+            fact.payload(),
+            CanonicalEventPayload::CounterDelta(_)
+                | CanonicalEventPayload::StateTransition(_)
+                | CanonicalEventPayload::Capacity(_)
+                | CanonicalEventPayload::Marker
+        )
+    }) {
+        let Some(class) = policy.classify_fact(fact) else {
+            continue;
+        };
+        if !passes_canonical_response_filter(fact, request) {
+            omitted_by_response_filter = omitted_by_response_filter
+                .checked_add(1)
+                .ok_or_else(ApiProblem::store_read_failed)?;
+            continue;
+        }
+        let position = EventFactProjection::canonical_position(fact);
+        if let Some(cursor) = start_after
+            && position
+                <= (EventFactPosition {
+                    sort_ts_us: cursor.last_ts_us,
+                    event_id: cursor.last_event_id,
+                    event_instance_id: cursor.last_event_instance_id,
+                })
+        {
+            continue;
+        }
+        let source_id = source_ids_by_scope
+            .get(&fact.coverage().source_scope_id)
+            .copied()
+            .ok_or_else(ApiProblem::store_read_failed)?;
+        let candidate = PageCandidate {
+            position,
+            source: PageCandidateSource::Canonical(fact),
             class,
             source_id,
         };
@@ -733,11 +814,18 @@ fn render_events(
     let events: Vec<EventFact> = page
         .iter()
         .map(|candidate| {
-            EventFactProjection::project(
-                candidate.observation,
-                candidate.class,
-                candidate.source_id,
-            )
+            match candidate.source {
+                PageCandidateSource::Observation(observation) => EventFactProjection::project(
+                    observation,
+                    candidate.class,
+                    candidate.source_id,
+                ),
+                PageCandidateSource::Canonical(fact) => EventFactProjection::project_canonical(
+                    fact,
+                    candidate.class,
+                    candidate.source_id,
+                ),
+            }
             .ok_or_else(ApiProblem::store_read_failed)
         })
         .collect::<Result<_, _>>()?;
@@ -771,15 +859,16 @@ fn render_events(
     let exactness = aggregate_retained_exactness(&source_metadata);
     let completeness = aggregate_source_completeness(&source_metadata);
     let physical_count = aggregate_physical_count(&source_metadata);
-    let coverage = result
-        .coverage()
-        .spans()
+    let coverage = view
+        .query_factor_coverage(
+            &request.sources,
+            request.range,
+            MAX_FACTOR_COVERAGE_RECORDS,
+        )
+        .map_err(canonical_fact_problem)?
         .iter()
-        .map(|span| CoverageSpanDto {
-            from_us: span.start_us(),
-            to_us: span.end_us(),
-        })
-        .collect::<Vec<_>>();
+        .map(crate::overview::health::factor_coverage_json)
+        .collect();
     let meta = timeline_meta_with_metadata(
         view,
         OverviewRequest {
@@ -807,9 +896,15 @@ fn render_events(
 
 struct PageCandidate<'a> {
     position: EventFactPosition,
-    observation: &'a EventObservation,
+    source: PageCandidateSource<'a>,
     class: NotableClass,
     source_id: u64,
+}
+
+#[derive(Clone, Copy)]
+enum PageCandidateSource<'a> {
+    Observation(&'a EventObservation),
+    Canonical(&'a CanonicalEventFact),
 }
 
 impl PartialEq for PageCandidate<'_> {
@@ -841,6 +936,13 @@ fn passes_response_filter(observation: &EventObservation, request: &EventsReques
         .kind
         .as_deref()
         .is_none_or(|kind| observation.payload().kind_code() == kind)
+}
+
+fn passes_canonical_response_filter(fact: &CanonicalEventFact, request: &EventsRequest) -> bool {
+    request
+        .kind
+        .as_deref()
+        .is_none_or(|kind| fact.kind().wire_code() == kind)
 }
 
 fn cursor_problem(error: CursorError) -> ApiProblem {
@@ -888,6 +990,17 @@ fn oracle_problem(error: OracleError) -> ApiProblem {
     limit.map_or_else(ApiProblem::store_read_failed, |(resource, limit)| {
         ApiProblem::query_limit_exceeded(resource, crate::problem::count_u64(limit), None)
     })
+}
+
+fn canonical_fact_problem(error: CanonicalFactQueryError) -> ApiProblem {
+    match error {
+        CanonicalFactQueryError::LimitExceeded => ApiProblem::query_limit_exceeded(
+            crate::problem::LimitResource::Rows,
+            crate::problem::count_u64(MAX_FACTOR_COVERAGE_RECORDS),
+            None,
+        ),
+        CanonicalFactQueryError::ContradictoryFacts => ApiProblem::store_read_failed(),
+    }
 }
 
 fn timeline_meta(
@@ -1278,7 +1391,7 @@ fn notable_preview_dto(
         let candidate = PageCandidate {
             position: EventFactProjection::position(observation, class)
                 .ok_or_else(ApiProblem::store_read_failed)?,
-            observation,
+            source: PageCandidateSource::Observation(observation),
             class,
             source_id: request.source,
         };
@@ -1298,11 +1411,10 @@ fn notable_preview_dto(
     let observations = selected
         .into_iter()
         .map(|candidate| {
-            EventFactProjection::project(
-                candidate.observation,
-                candidate.class,
-                candidate.source_id,
-            )
+            let PageCandidateSource::Observation(observation) = candidate.source else {
+                return Err(ApiProblem::store_read_failed());
+            };
+            EventFactProjection::project(observation, candidate.class, candidate.source_id)
             .ok_or_else(ApiProblem::store_read_failed)
         })
         .collect::<Result<Vec<_>, _>>()?;

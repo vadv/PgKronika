@@ -10,8 +10,9 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::overview::{
-    ErrorCategory, EventObservation, EvidenceQuality, IdentityQuality, LossReason, LossSummary,
-    NotableClass, NotablePolicy, ObservationPayload, Severity,
+    EntityKind, ErrorCategory, EventFact as CanonicalEventFact,
+    EventPayload as CanonicalEventPayload, EventObservation, EvidenceQuality, IdentityQuality,
+    LossReason, LossSummary, NotableClass, NotablePolicy, ObservationPayload, Severity,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -32,17 +33,19 @@ pub(crate) struct EventFact {
     pub(crate) event_instance_id: String,
     pub(crate) source_id: u64,
     pub(crate) source_scope_id: String,
-    pub(crate) source_type_id: u32,
+    pub(crate) source_type_id: Option<u32>,
     pub(crate) identity_quality: &'static str,
     pub(crate) sort_ts_us: i64,
     pub(crate) occurred_at_us: Option<i64>,
+    pub(crate) observed_interval: Option<CoverageSpanDto>,
     pub(crate) occurrence_count: u64,
     pub(crate) event_kind: &'static str,
     pub(crate) notable_class: &'static str,
     pub(crate) evidence_quality: &'static str,
     pub(crate) quality_flags: u32,
+    pub(crate) entity: Option<EntityDto>,
     pub(crate) payload: EventPayload,
-    pub(crate) supporting_evidence: [SupportingEvidence; 1],
+    pub(crate) supporting_evidence: Vec<SupportingEvidence>,
     pub(crate) loss: Option<EventLoss>,
 }
 
@@ -52,6 +55,10 @@ pub(crate) struct EventFact {
 pub(crate) enum EventPayload {
     Error(ErrorPayload),
     Lifecycle(LifecyclePayload),
+    CounterDelta(CounterDeltaPayload),
+    StateTransition(StateTransitionPayload),
+    Capacity(CapacityPayload),
+    Marker(MarkerPayload),
 }
 
 /// Published grouped-error fields.
@@ -73,14 +80,55 @@ pub(crate) struct LifecyclePayload {
     pub(crate) dropped_field_count: u32,
 }
 
+/// Published exact counter-pair fields.
+#[derive(Debug, Serialize)]
+pub(crate) struct CounterDeltaPayload {
+    pub(crate) kind: &'static str,
+    pub(crate) factor_id: u32,
+    pub(crate) delta: u64,
+    pub(crate) duration_us: u64,
+    pub(crate) reset_epoch: u64,
+}
+
+/// Published complete-snapshot state transition.
+#[derive(Debug, Serialize)]
+pub(crate) struct StateTransitionPayload {
+    pub(crate) kind: &'static str,
+    pub(crate) factor_id: u32,
+    pub(crate) previous_state: u32,
+    pub(crate) current_state: u32,
+    pub(crate) population_total: u64,
+}
+
+/// Published filesystem capacity evidence.
+#[derive(Debug, Serialize)]
+pub(crate) struct CapacityPayload {
+    pub(crate) kind: &'static str,
+    pub(crate) total_bytes: u64,
+    pub(crate) available_bytes: u64,
+}
+
+/// Event kind with no extra dimensions.
+#[derive(Debug, Serialize)]
+pub(crate) struct MarkerPayload {
+    pub(crate) kind: &'static str,
+}
+
+/// Source-qualified entity identity.
+#[derive(Debug, Serialize)]
+pub(crate) struct EntityDto {
+    pub(crate) kind: &'static str,
+    pub(crate) id: String,
+}
+
 /// One physical observation supporting an event fact.
 #[derive(Debug, Serialize)]
 pub(crate) struct SupportingEvidence {
     pub(crate) observation_id: String,
-    pub(crate) section_body_id: String,
-    pub(crate) catalog_entry_ordinal: u32,
-    pub(crate) row_ordinal: u32,
-    pub(crate) dictionary_context_id: String,
+    pub(crate) section_body_id: Option<String>,
+    pub(crate) catalog_entry_ordinal: Option<u32>,
+    pub(crate) row_ordinal: Option<u32>,
+    pub(crate) dictionary_context_id: Option<String>,
     pub(crate) segment_locator: Option<String>,
 }
 
@@ -217,7 +265,7 @@ pub(crate) struct EventsResponseDto {
     pub(crate) retained_exactness: &'static str,
     pub(crate) source_completeness: &'static str,
     pub(crate) physical_count_semantics: &'static str,
-    pub(crate) coverage: Vec<CoverageSpanDto>,
+    pub(crate) coverage: Vec<Value>,
 }
 
 /// Shared `EventFact` projection for preview and paginated responses.
@@ -254,28 +302,140 @@ impl EventFactProjection {
             event_instance_id: URL_SAFE_NO_PAD.encode(position.event_instance_id),
             source_id,
             source_scope_id: URL_SAFE_NO_PAD.encode(observation.source_scope_id().0),
-            source_type_id: observation.source_type_id(),
+            source_type_id: Some(observation.source_type_id()),
             identity_quality: identity_quality_name(observation.identity_quality()),
             sort_ts_us: time.sort_ts_us,
             occurred_at_us: time.occurred_at_us,
+            observed_interval: time.observed_interval.map(|interval| CoverageSpanDto {
+                from_us: interval.start_us(),
+                to_us: interval.end_us(),
+            }),
             occurrence_count: observation.occurrence_count(),
             event_kind: observation.payload().kind_code(),
             notable_class: class.wire_code(),
             evidence_quality: evidence_quality_name(observation.evidence_quality()),
             quality_flags: observation.quality_flags().0,
+            entity: None,
             payload: event_payload(observation.payload())?,
-            supporting_evidence: [SupportingEvidence {
+            supporting_evidence: vec![SupportingEvidence {
                 observation_id: URL_SAFE_NO_PAD.encode(observation.observation_id().0),
-                section_body_id: URL_SAFE_NO_PAD.encode(provenance.section_body_id.0),
-                catalog_entry_ordinal: provenance.catalog_entry_ordinal,
-                row_ordinal: provenance.row_ordinal,
-                dictionary_context_id: URL_SAFE_NO_PAD.encode(provenance.dictionary_context_id.0),
+                section_body_id: Some(URL_SAFE_NO_PAD.encode(provenance.section_body_id.0)),
+                catalog_entry_ordinal: Some(provenance.catalog_entry_ordinal),
+                row_ordinal: Some(provenance.row_ordinal),
+                dictionary_context_id: Some(
+                    URL_SAFE_NO_PAD.encode(provenance.dictionary_context_id.0),
+                ),
                 segment_locator: provenance
                     .segment_locator
                     .map(|locator| URL_SAFE_NO_PAD.encode(locator.0)),
             }],
             loss: observation.loss().map(event_loss),
         })
+    }
+
+    /// Cursor position of one canonical metric/state fact.
+    pub(crate) fn canonical_position(fact: &CanonicalEventFact) -> EventFactPosition {
+        let mut instance = Sha256::new();
+        instance.update(b"pgk-overview-canonical-event-instance-v1");
+        instance.update(fact.fact_id().0);
+        EventFactPosition {
+            sort_ts_us: fact.interval().start_us(),
+            event_id: fact.fact_id().0,
+            event_instance_id: instance.finalize().into(),
+        }
+    }
+
+    /// Projects a canonical metric/state fact without inventing physical row
+    /// provenance for its sample evidence.
+    pub(crate) fn project_canonical(
+        fact: &CanonicalEventFact,
+        class: NotableClass,
+        source_id: u64,
+    ) -> Option<EventFact> {
+        let position = Self::canonical_position(fact);
+        let interval = fact.interval();
+        Some(EventFact {
+            event_id: URL_SAFE_NO_PAD.encode(position.event_id),
+            event_instance_id: URL_SAFE_NO_PAD.encode(position.event_instance_id),
+            source_id,
+            source_scope_id: URL_SAFE_NO_PAD.encode(fact.coverage().source_scope_id.0),
+            source_type_id: None,
+            identity_quality: "content_derived",
+            sort_ts_us: interval.start_us(),
+            occurred_at_us: Some(interval.start_us()),
+            observed_interval: Some(CoverageSpanDto {
+                from_us: interval.start_us(),
+                to_us: interval.end_us(),
+            }),
+            occurrence_count: fact.count(),
+            event_kind: fact.kind().wire_code(),
+            notable_class: class.wire_code(),
+            evidence_quality: evidence_quality_name(fact.evidence_quality()),
+            quality_flags: 0,
+            entity: fact.entity().map(|entity| EntityDto {
+                kind: entity_kind_name(entity.kind),
+                id: URL_SAFE_NO_PAD.encode(entity.id),
+            }),
+            payload: canonical_payload(fact)?,
+            supporting_evidence: fact
+                .supporting_observation_ids()
+                .iter()
+                .map(|id| SupportingEvidence {
+                    observation_id: URL_SAFE_NO_PAD.encode(id.0),
+                    section_body_id: None,
+                    catalog_entry_ordinal: None,
+                    row_ordinal: None,
+                    dictionary_context_id: None,
+                    segment_locator: None,
+                })
+                .collect(),
+            loss: fact.coverage().loss.as_ref().map(event_loss),
+        })
+    }
+}
+
+fn canonical_payload(fact: &CanonicalEventFact) -> Option<EventPayload> {
+    let kind = fact.kind().wire_code();
+    match fact.payload() {
+        CanonicalEventPayload::CounterDelta(value) => {
+            Some(EventPayload::CounterDelta(CounterDeltaPayload {
+                kind,
+                factor_id: value.factor_id.0,
+                delta: value.delta,
+                duration_us: value.duration_us,
+                reset_epoch: value.reset_epoch,
+            }))
+        }
+        CanonicalEventPayload::StateTransition(value) => {
+            Some(EventPayload::StateTransition(StateTransitionPayload {
+                kind,
+                factor_id: value.factor_id.0,
+                previous_state: value.previous_state,
+                current_state: value.current_state,
+                population_total: value.population_total,
+            }))
+        }
+        CanonicalEventPayload::Capacity(value) => {
+            Some(EventPayload::Capacity(CapacityPayload {
+                kind,
+                total_bytes: value.total_bytes,
+                available_bytes: value.available_bytes,
+            }))
+        }
+        CanonicalEventPayload::Marker => Some(EventPayload::Marker(MarkerPayload { kind })),
+        _ => None,
+    }
+}
+
+const fn entity_kind_name(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Database => "database",
+        EntityKind::Postmaster => "postmaster",
+        EntityKind::ReplicationSender => "replication_sender",
+        EntityKind::ReplicationSlot => "replication_slot",
+        EntityKind::Cgroup => "cgroup",
+        EntityKind::Host => "host",
+        EntityKind::Filesystem => "filesystem",
     }
 }
 
@@ -439,7 +599,7 @@ const fn evidence_quality_name(quality: EvidenceQuality) -> &'static str {
     }
 }
 
-const fn loss_reason_name(reason: LossReason) -> &'static str {
+pub(crate) const fn loss_reason_name(reason: LossReason) -> &'static str {
     match reason {
         LossReason::GroupCapExceeded => "group_cap_exceeded",
         LossReason::LifecycleCapExceeded => "lifecycle_cap_exceeded",

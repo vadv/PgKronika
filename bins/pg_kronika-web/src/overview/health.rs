@@ -8,9 +8,10 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::overview::{
-    Applicability, CoverageSpan, CoverageState, DomainPenalty, EventObservation, FactorCoverage,
-    FloorClass, FloorEvidence, HealthPoint, HealthState, OVERVIEW_HEALTH_LIMITS, RetainedExactness,
-    downsample_worst, health_line, overview_health_policy,
+    Applicability, BoundaryQuality, CoverageSpan, CoverageState, DomainPenalty, EventObservation,
+    FactorCoverage, FloorClass, FloorEvidence, HealthPoint, HealthState, OVERVIEW_HEALTH_LIMITS,
+    PeriodQuality, PhysicalCountSemantics, PopulationTotalQuality, RetainedExactness,
+    SourceCompleteness, downsample_worst, health_line, overview_health_policy,
 };
 use serde_json::{Value, json};
 
@@ -139,9 +140,26 @@ pub(crate) fn factor_coverage_json(coverage: &FactorCoverage) -> Value {
         "applicability": applicability_name(coverage.applicability),
         "state": coverage_state_name(coverage.state),
         "interval": span_json(coverage.interval),
+        "expected_period_us": coverage.expected_period_us,
+        "period_quality": period_quality_name(coverage.period_quality),
+        "cadence_epoch_id": coverage.cadence_epoch_id.map(|id| URL_SAFE_NO_PAD.encode(id.0)),
+        "crosses_cadence_boundary": coverage.crosses_cadence_boundary,
         "present_samples": coverage.present_samples,
         "covered_duration_us": coverage.covered_duration_us,
+        "source_population": coverage.source_population.map(|population| json!({
+            "collected": population.collected,
+            "total": population.total,
+            "total_quality": population_quality_name(population.total_quality),
+        })),
+        "loss_reasons": coverage.loss_reasons.iter()
+            .copied()
+            .map(crate::overview::dto::loss_reason_name)
+            .collect::<Vec<_>>(),
+        "lost_count_lower_bound": coverage.lost_count_lower_bound,
         "retained_exactness": retained_exactness_name(coverage.retained_exactness),
+        "source_completeness": source_completeness_name(coverage.source_completeness),
+        "physical_count_semantics": physical_count_name(coverage.physical_count_semantics),
+        "boundary_quality": boundary_quality_name(coverage.boundary_quality),
     })
 }
 
@@ -190,6 +208,50 @@ const fn retained_exactness_name(exactness: RetainedExactness) -> &'static str {
         RetainedExactness::Exact => "retained_exact",
         RetainedExactness::LowerBound => "lower_bound",
         RetainedExactness::Unknown => "unknown",
+    }
+}
+
+const fn period_quality_name(quality: PeriodQuality) -> &'static str {
+    match quality {
+        PeriodQuality::PersistedConfigEpoch => "persisted_config_epoch",
+        PeriodQuality::ObservedStable => "observed_stable",
+        PeriodQuality::AssumedCurrentConfig => "assumed_current_config",
+        PeriodQuality::Unknown => "unknown",
+    }
+}
+
+const fn population_quality_name(quality: PopulationTotalQuality) -> &'static str {
+    match quality {
+        PopulationTotalQuality::Exact => "exact",
+        PopulationTotalQuality::LowerBound => "lower_bound",
+        PopulationTotalQuality::Unknown => "unknown",
+    }
+}
+
+const fn source_completeness_name(value: SourceCompleteness) -> &'static str {
+    match value {
+        SourceCompleteness::Full => "full",
+        SourceCompleteness::BoundedSubset => "bounded_subset",
+        SourceCompleteness::Unknown => "unknown",
+    }
+}
+
+const fn physical_count_name(value: PhysicalCountSemantics) -> &'static str {
+    match value {
+        PhysicalCountSemantics::Exact => "exact",
+        PhysicalCountSemantics::LowerBound => "lower_bound",
+        PhysicalCountSemantics::Unknown => "unknown",
+        PhysicalCountSemantics::NotApplicable => "not_applicable",
+    }
+}
+
+const fn boundary_quality_name(value: BoundaryQuality) -> &'static str {
+    match value {
+        BoundaryQuality::Contained => "contained",
+        BoundaryQuality::EndpointAttributedCrossBoundary => "endpoint_attributed_cross_boundary",
+        BoundaryQuality::ModeledHold => "modeled_hold",
+        BoundaryQuality::Mixed => "mixed",
+        BoundaryQuality::Unknown => "unknown",
     }
 }
 

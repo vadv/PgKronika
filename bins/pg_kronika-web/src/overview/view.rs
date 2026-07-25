@@ -11,18 +11,26 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use kronika_analytics::overview::{
-    Coverage, CoverageSpan, OracleError, OracleLimits, OracleResult, PhysicalCountSemantics,
-    RawOracle, RetainedExactness, SourceCompleteness, SourceScopeId, query_bounded,
-    query_bounded_materialized,
+    CounterSample, Coverage, CoverageSpan, EventFact as CanonicalEventFact, FactorCoverage,
+    FactId, GaugeSample, MetricFactor, MetricSeriesDescriptor, MetricSeriesId, OracleError, OracleLimits,
+    OracleResult, PhysicalCountSemantics, RawOracle, RetainedExactness, SourceCompleteness,
+    SourceScopeId, query_bounded, query_bounded_materialized,
 };
 use kronika_reader::{
-    FactBuildKey, FactKey, FileKind, LiveState, LiveView, SealedLocator, SegmentDescriptor,
-    SegmentFacts,
+    EntityStateRecord, FactBuildKey, FactKey, FileKind, LiveState, LiveView, SealedLocator,
+    SegmentDescriptor, SegmentFacts,
 };
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use super::admission::ColdWorkWeight;
+
+/// A canonical metric/fact query exceeded a bound or found contradictory data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalFactQueryError {
+    LimitExceeded,
+    ContradictoryFacts,
+}
 
 /// Domain separator for the response/cache fact-set identity.
 #[cfg(test)]
@@ -383,19 +391,42 @@ impl DescriptorView {
         self.view_generation
     }
 
-    pub(crate) fn extend_selected(
+    pub(crate) fn extend_selected_with_halo(
         &self,
         source: u64,
         range: CoverageSpan,
         stop_after: usize,
         selected: &mut Vec<usize>,
     ) -> bool {
-        self.source_indices.get(&source).is_some_and(|index| {
-            index.extend_intersections(&self.sealed, range, stop_after, selected, |entry| {
-                let descriptor = entry.descriptor();
-                (descriptor.min_ts, descriptor.max_ts)
-            })
-        })
+        let Some(index) = self.source_indices.get(&source) else {
+            return false;
+        };
+        if index.extend_intersections(&self.sealed, range, stop_after, selected, |entry| {
+            let descriptor = entry.descriptor();
+            (descriptor.min_ts, descriptor.max_ts)
+        }) {
+            return true;
+        }
+        let source_entries = &self.sealed[index.range.clone()];
+        let left_halo = source_entries
+            .iter()
+            .rposition(|entry| entry.descriptor().max_ts < range.start_us())
+            .map(|offset| index.range.start + offset);
+        let right_halo = source_entries
+            .iter()
+            .position(|entry| entry.descriptor().min_ts >= range.end_us())
+            .map(|offset| index.range.start + offset);
+        for halo in [left_halo, right_halo].into_iter().flatten() {
+            if !selected.contains(&halo) {
+                selected.push(halo);
+                if selected.len() == stop_after {
+                    return true;
+                }
+            }
+        }
+        selected.sort_unstable();
+        selected.dedup();
+        selected.len() == stop_after
     }
 
     pub(crate) fn unavailable_intersects(&self, source: u64, range: CoverageSpan) -> bool {
@@ -910,6 +941,297 @@ impl IndexView {
         }
     }
 
+    /// Queries canonical persisted facts and reset-aware metric derivations.
+    ///
+    /// Selected sealed facts already include the left/right descriptor halo.
+    /// This method replays all selected natural samples, so a pair crossing a
+    /// fact-file boundary is equivalent to the same samples in one file.
+    pub(crate) fn query_canonical_facts(
+        &self,
+        sources: &[u64],
+        range: CoverageSpan,
+        max_facts: usize,
+        max_samples: usize,
+    ) -> Result<Vec<CanonicalEventFact>, CanonicalFactQueryError> {
+        let mut facts = BTreeMap::<FactId, CanonicalEventFact>::new();
+        let mut counter_series =
+            BTreeMap::<MetricSeriesId, (MetricSeriesDescriptor, Vec<CounterSample>)>::new();
+        let mut state_series =
+            BTreeMap::<MetricSeriesId, (MetricSeriesDescriptor, Vec<EntityStateRecord>)>::new();
+        let mut gauge_series =
+            BTreeMap::<MetricSeriesId, (MetricSeriesDescriptor, Vec<GaugeSample>)>::new();
+        let mut gaps = BTreeMap::<SourceScopeId, Coverage>::new();
+        let mut materialized_samples = 0_usize;
+
+        for segment in self
+            .queryable_facts()
+            .filter(|facts| source_selected(sources, facts.identity().pgm_source_id))
+        {
+            for fact in segment.event_facts().iter().filter(|fact| {
+                fact.interval().start_us() < range.end_us()
+                    && fact.interval().end_us() > range.start_us()
+            }) {
+                insert_canonical_fact(&mut facts, fact.clone(), max_facts)?;
+            }
+            gaps.entry(segment.identity().source_scope_id)
+                .and_modify(|coverage| {
+                    *coverage = coverage.union(segment.loss_coverage().known_gaps());
+                })
+                .or_insert_with(|| segment.loss_coverage().known_gaps().clone());
+            for descriptor in segment.counter_samples().series() {
+                let entry = counter_series
+                    .entry(descriptor.series_id)
+                    .or_insert_with(|| (*descriptor, Vec::new()));
+                if entry.0 != *descriptor {
+                    return Err(CanonicalFactQueryError::ContradictoryFacts);
+                }
+            }
+            for sample in segment.counter_samples().samples() {
+                materialized_samples = materialized_samples
+                    .checked_add(1)
+                    .ok_or(CanonicalFactQueryError::LimitExceeded)?;
+                if materialized_samples > max_samples {
+                    return Err(CanonicalFactQueryError::LimitExceeded);
+                }
+                counter_series
+                    .get_mut(&sample.series_id())
+                    .ok_or(CanonicalFactQueryError::ContradictoryFacts)?
+                    .1
+                    .push(*sample);
+            }
+            for descriptor in segment.gauge_samples().series() {
+                match gauge_series.entry(descriptor.series_id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((*descriptor, Vec::new()));
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get().0 != *descriptor =>
+                    {
+                        return Err(CanonicalFactQueryError::ContradictoryFacts);
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+                match state_series.entry(descriptor.series_id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((*descriptor, Vec::new()));
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get().0 != *descriptor =>
+                    {
+                        return Err(CanonicalFactQueryError::ContradictoryFacts);
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+            }
+            for sample in segment.gauge_samples().samples() {
+                materialized_samples = materialized_samples
+                    .checked_add(1)
+                    .ok_or(CanonicalFactQueryError::LimitExceeded)?;
+                if materialized_samples > max_samples {
+                    return Err(CanonicalFactQueryError::LimitExceeded);
+                }
+                gauge_series
+                    .get_mut(&sample.series_id())
+                    .ok_or(CanonicalFactQueryError::ContradictoryFacts)?
+                    .1
+                    .push(*sample);
+            }
+            for record in segment.entity_states().records() {
+                materialized_samples = materialized_samples
+                    .checked_add(1)
+                    .ok_or(CanonicalFactQueryError::LimitExceeded)?;
+                if materialized_samples > max_samples {
+                    return Err(CanonicalFactQueryError::LimitExceeded);
+                }
+                state_series
+                    .get_mut(&record.series_id)
+                    .ok_or(CanonicalFactQueryError::ContradictoryFacts)?
+                    .1
+                    .push(*record);
+            }
+        }
+
+        for (_series_id, (descriptor, mut samples)) in counter_series {
+            samples.sort_unstable_by_key(|sample| {
+                (
+                    sample.ts_us(),
+                    sample.alignment_id().0,
+                    sample.value(),
+                    sample.reset_epoch(),
+                )
+            });
+            samples.dedup();
+            if samples
+                .windows(2)
+                .any(|pair| pair[0].ts_us() == pair[1].ts_us())
+                || samples
+                    .first()
+                    .is_some_and(|first| {
+                        samples
+                            .iter()
+                            .any(|sample| sample.alignment_id() != first.alignment_id())
+                    })
+            {
+                return Err(CanonicalFactQueryError::ContradictoryFacts);
+            }
+            let known_gaps = gaps
+                .get(&descriptor.source_scope_id)
+                .cloned()
+                .unwrap_or_else(Coverage::empty);
+            for pair in samples.windows(2) {
+                if pair[1].ts_us() < range.start_us() || pair[1].ts_us() >= range.end_us() {
+                    continue;
+                }
+                if let Some(fact) =
+                    CanonicalEventFact::from_counter_pair(descriptor, pair[0], pair[1], &known_gaps)
+                        .map_err(|_error| CanonicalFactQueryError::ContradictoryFacts)?
+                {
+                    insert_canonical_fact(&mut facts, fact, max_facts)?;
+                }
+            }
+        }
+
+        for (_series_id, (descriptor, mut records)) in state_series {
+            records.sort_unstable_by_key(|record| {
+                (
+                    record.ts_us,
+                    record.state_code,
+                    record.population_total,
+                )
+            });
+            records.dedup();
+            if records
+                .windows(2)
+                .any(|pair| pair[0].ts_us == pair[1].ts_us)
+            {
+                return Err(CanonicalFactQueryError::ContradictoryFacts);
+            }
+            let known_gaps = gaps
+                .get(&descriptor.source_scope_id)
+                .cloned()
+                .unwrap_or_else(Coverage::empty);
+            for pair in records.windows(2) {
+                if pair[1].ts_us < range.start_us() || pair[1].ts_us >= range.end_us() {
+                    continue;
+                }
+                if known_gaps.spans().iter().any(|gap| {
+                    gap.start_us() < pair[1].ts_us && gap.end_us() > pair[0].ts_us
+                }) {
+                    continue;
+                }
+                if let Some(fact) = CanonicalEventFact::from_state_transition(
+                    descriptor,
+                    pair[0].ts_us,
+                    pair[0].state_code,
+                    pair[1].ts_us,
+                    pair[1].state_code,
+                    pair[1].population_total,
+                )
+                .map_err(|_error| CanonicalFactQueryError::ContradictoryFacts)?
+                {
+                    insert_canonical_fact(&mut facts, fact, max_facts)?;
+                }
+            }
+        }
+
+        let mut capacity_total = BTreeMap::new();
+        let mut capacity_available = BTreeMap::new();
+        for (_series_id, (descriptor, mut samples)) in gauge_series {
+            samples.sort_unstable_by_key(|sample| (sample.ts_us(), sample.value().to_bits()));
+            samples.dedup();
+            if samples
+                .windows(2)
+                .any(|pair| pair[0].ts_us() == pair[1].ts_us())
+            {
+                return Err(CanonicalFactQueryError::ContradictoryFacts);
+            }
+            let Some(entity) = descriptor.entity else {
+                continue;
+            };
+            let destination = match MetricFactor::from_id(descriptor.factor_id) {
+                Some(MetricFactor::PgFilesystemTotalBytes) => &mut capacity_total,
+                Some(MetricFactor::PgFilesystemAvailableBytes) => &mut capacity_available,
+                _ => continue,
+            };
+            for sample in samples {
+                if destination
+                    .insert((entity, sample.ts_us()), (descriptor, sample))
+                    .is_some()
+                {
+                    return Err(CanonicalFactQueryError::ContradictoryFacts);
+                }
+            }
+        }
+        for (key, (total_descriptor, total)) in &capacity_total {
+            let Some((available_descriptor, current_available)) =
+                capacity_available.get(key).copied()
+            else {
+                continue;
+            };
+            let previous_available = capacity_available
+                .range((key.0, i64::MIN)..*key)
+                .next_back()
+                .map(|(_key, (_descriptor, sample))| *sample);
+            if let Some(previous_available) = previous_available
+                && current_available.ts_us() >= range.start_us()
+                && current_available.ts_us() < range.end_us()
+            {
+                let known_gaps = gaps
+                    .get(&available_descriptor.source_scope_id)
+                    .cloned()
+                    .unwrap_or_else(Coverage::empty);
+                if let Some(fact) = CanonicalEventFact::from_capacity_zero_transition(
+                    *total_descriptor,
+                    *total,
+                    available_descriptor,
+                    previous_available,
+                    current_available,
+                    &known_gaps,
+                )
+                .map_err(|_error| CanonicalFactQueryError::ContradictoryFacts)?
+                {
+                    insert_canonical_fact(&mut facts, fact, max_facts)?;
+                }
+            }
+        }
+
+        let mut output = facts.into_values().collect::<Vec<_>>();
+        output.sort_by(CanonicalEventFact::canonical_cmp);
+        Ok(output)
+    }
+
+    /// Returns bounded factor coverage records intersecting a query interval.
+    pub(crate) fn query_factor_coverage(
+        &self,
+        sources: &[u64],
+        range: CoverageSpan,
+        max_records: usize,
+    ) -> Result<Vec<FactorCoverage>, CanonicalFactQueryError> {
+        let mut coverage = Vec::new();
+        for segment in self
+            .queryable_facts()
+            .filter(|facts| source_selected(sources, facts.identity().pgm_source_id))
+        {
+            for record in segment.loss_coverage().factor_coverage().iter().filter(|record| {
+                record.interval.start_us() < range.end_us()
+                    && record.interval.end_us() > range.start_us()
+            }) {
+                if coverage.len() == max_records {
+                    return Err(CanonicalFactQueryError::LimitExceeded);
+                }
+                coverage.push(record.clone());
+            }
+        }
+        coverage.sort_unstable_by_key(|record| {
+            (
+                record.factor_id.0,
+                record.interval.start_us(),
+                record.interval.end_us(),
+            )
+        });
+        Ok(coverage)
+    }
+
     /// Checked logical resident charge retained while a cursor pins this view.
     ///
     /// The charge includes reserved container slots, `Arc` counters, sealed and
@@ -1042,6 +1364,26 @@ impl RawOracle for IndexView {
             query_bounded(sealed_observations, spans, range, limits)
         }
     }
+}
+
+fn insert_canonical_fact(
+    facts: &mut BTreeMap<FactId, CanonicalEventFact>,
+    fact: CanonicalEventFact,
+    max_facts: usize,
+) -> Result<(), CanonicalFactQueryError> {
+    if !facts.contains_key(&fact.fact_id()) && facts.len() == max_facts {
+        return Err(CanonicalFactQueryError::LimitExceeded);
+    }
+    match facts.entry(fact.fact_id()) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(fact);
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &fact => {
+            return Err(CanonicalFactQueryError::ContradictoryFacts);
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {}
+    }
+    Ok(())
 }
 
 fn source_selected(sources: &[u64], source: u64) -> bool {

@@ -9,12 +9,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kronika_analytics::overview::{
-    AlignmentId, Applicability, BoundaryQuality, CadenceEpochId, CounterSample, CoverageSpan,
+    Applicability, BoundaryQuality, CadenceEpochId, CounterSample, CoverageSpan,
     CoverageState, EntityKind, FactorCoverage, FactorId, GaugeSample, LossReason, MetricFactor,
     MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality, PhysicalCountSemantics,
     PopulationTotalQuality, ResetFamily, RetainedExactness, SourceCompleteness,
     SourcePopulation, SourceScopeId, derive_alignment, derive_entity,
 };
+#[cfg(test)]
+use kronika_analytics::overview::AlignmentId;
 use kronika_format::ReadAt;
 use kronika_registry::{Cell, Row};
 use sha2::{Digest as _, Sha256};
@@ -29,6 +31,7 @@ const PG_STAT_DATABASE_TYPES: [u32; 4] = [1_005_001, 1_005_002, 1_005_003, 1_005
 const REPLICATION_INSTANCE: u32 = 1_015_001;
 const RESET_METADATA: u32 = 1_020_001;
 const INSTANCE_METADATA: u32 = 1_021_001;
+const COLLECTION_COVERAGE: u32 = 1_023_001;
 const PG_REPLICATION_PHYSICAL: u32 = 1_033_001;
 const PG_REPLICATION_SLOT_TYPES: [u32; 3] = [1_034_001, 1_034_002, 1_034_003];
 const PG_STORAGE_MOUNT_TYPES: [u32; 2] = [1_036_001, 1_036_002];
@@ -105,6 +108,7 @@ struct CoverageRecord {
     visibility: u8,
     source_total: u64,
     collected: u64,
+    total_exact: bool,
 }
 
 #[derive(Default)]
@@ -179,15 +183,17 @@ impl MetricAccumulator {
         descriptor: MetricSeriesDescriptor,
         ts_us: i64,
         state_code: u32,
-        population_total: u64,
+        population_total: Option<u64>,
     ) -> Result<(), BuildError> {
         self.gauge(descriptor, ts_us, f64::from(state_code))?;
-        self.entity_states.push(EntityStateRecord {
-            series_id: descriptor.series_id,
-            ts_us,
-            state_code,
-            population_total,
-        });
+        if let Some(population_total) = population_total {
+            self.entity_states.push(EntityStateRecord {
+                series_id: descriptor.series_id,
+                ts_us,
+                state_code,
+                population_total,
+            });
+        }
         Ok(())
     }
 }
@@ -224,7 +230,7 @@ pub(super) fn extract_metrics<R: ReadAt>(
     }
 
     let reset_context = reset_context(&decoded)?;
-    let snapshot_coverage = snapshot_coverage(&decoded)?;
+    let snapshot_coverage = source_coverage(&decoded)?;
     let mut metrics = MetricAccumulator::default();
     for section in &decoded {
         match section.type_id {
@@ -264,7 +270,7 @@ pub(super) fn extract_metrics<R: ReadAt>(
             PG_PROCESS_CGROUP_MEMORY => {
                 extract_process_cgroup_memory(&mut metrics, section, source_scope_id)?;
             }
-            RESET_METADATA | INSTANCE_METADATA | SNAPSHOT_COVERAGE => {}
+            RESET_METADATA | INSTANCE_METADATA | COLLECTION_COVERAGE | SNAPSHOT_COVERAGE => {}
             _ => return Err(BuildError::Internal),
         }
     }
@@ -528,7 +534,7 @@ fn extract_replication_instance(
             ),
             ts,
             u32::from(required_bool(row, "is_in_recovery")?),
-            1,
+            Some(1),
         )?;
         let timeline = required_i64(row, "timeline_id")?;
         let timeline = u32::try_from(timeline).map_err(|_error| BuildError::Source(SourceError::Corrupt))?;
@@ -544,7 +550,7 @@ fn extract_replication_instance(
             ),
             ts,
             timeline,
-            1,
+            Some(1),
         )?;
         if let Some(seconds) = optional_i64(row, "replay_lag_s")? {
             let micros = seconds.checked_mul(1_000_000).ok_or(BuildError::Overflow)?;
@@ -572,7 +578,7 @@ fn extract_replication_senders(
     scope: SourceScopeId,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
 ) -> Result<(), BuildError> {
-    let population = proven_population(section.type_id, section.rows.len(), coverage);
+    let population = proven_population(section.type_id, coverage);
     for row in &section.rows {
         let pid = required_i64(row, "pid")?;
         let backend_start = required_i64(row, "backend_start_key")?;
@@ -604,7 +610,7 @@ fn extract_replication_slots(
     scope: SourceScopeId,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
 ) -> Result<(), BuildError> {
-    let population = proven_population(section.type_id, section.rows.len(), coverage);
+    let population = proven_population(section.type_id, coverage);
     for row in &section.rows {
         let slot_name = required_str_id(row, "slot_name")?;
         let identity = slot_name.to_le_bytes();
@@ -740,26 +746,49 @@ fn reset_context(sections: &[DecodedMetricSection]) -> Result<ResetContext, Buil
     Ok(context)
 }
 
-fn snapshot_coverage(
+fn source_coverage(
     sections: &[DecodedMetricSection],
 ) -> Result<BTreeMap<u32, Vec<CoverageRecord>>, BuildError> {
     let mut coverage: BTreeMap<u32, Vec<CoverageRecord>> = BTreeMap::new();
     for section in sections {
-        if section.type_id != SNAPSHOT_COVERAGE {
-            continue;
-        }
-        for row in &section.rows {
-            coverage
-                .entry(required_u32(row, "source_type_id")?)
-                .or_default()
-                .push(CoverageRecord {
-                    read_state: u8::try_from(required_u32(row, "read_state")?)
-                        .map_err(|_error| BuildError::Source(SourceError::Corrupt))?,
-                    visibility: u8::try_from(required_u32(row, "visibility")?)
-                        .map_err(|_error| BuildError::Source(SourceError::Corrupt))?,
-                    source_total: u64::from(required_u32(row, "source_total")?),
-                    collected: u64::from(required_u32(row, "collected")?),
-                });
+        match section.type_id {
+            SNAPSHOT_COVERAGE => {
+                for row in &section.rows {
+                    coverage
+                        .entry(required_u32(row, "source_type_id")?)
+                        .or_default()
+                        .push(CoverageRecord {
+                            read_state: u8::try_from(required_u32(row, "read_state")?)
+                                .map_err(|_error| BuildError::Source(SourceError::Corrupt))?,
+                            visibility: u8::try_from(required_u32(row, "visibility")?)
+                                .map_err(|_error| BuildError::Source(SourceError::Corrupt))?,
+                            source_total: u64::from(required_u32(row, "source_total")?),
+                            collected: u64::from(required_u32(row, "collected")?),
+                            total_exact: true,
+                        });
+                }
+            }
+            COLLECTION_COVERAGE => {
+                for row in &section.rows {
+                    let reason = required_u32(row, "reason")?;
+                    let unknown_total = required_bool(row, "unknown_total")?;
+                    coverage
+                        .entry(required_u32(row, "source_type_id")?)
+                        .or_default()
+                        .push(CoverageRecord {
+                            read_state: match reason {
+                                2 => 2,
+                                1 | 3 => 3,
+                                _ => 1,
+                            },
+                            visibility: u8::from(reason == 2),
+                            source_total: u64::from(required_u32(row, "total")?),
+                            collected: u64::from(required_u32(row, "collected")?),
+                            total_exact: !unknown_total,
+                        });
+                }
+            }
+            _ => {}
         }
     }
     Ok(coverage)
@@ -836,7 +865,12 @@ fn factor_coverage(
         let source_complete = !records.is_empty()
             && records
                 .iter()
-                .all(|record| record.read_state == 0 && record.visibility == 0);
+                .all(|record| {
+                    record.read_state == 0
+                        && record.visibility == 0
+                        && record.total_exact
+                        && record.collected == record.source_total
+                });
         let times = metrics
             .factor_times
             .get(&factor_id)
@@ -845,16 +879,10 @@ fn factor_coverage(
         let cadence = observed_cadence(&times);
         let present_samples =
             u64::try_from(times.len()).map_err(|_error| BuildError::Overflow)?;
-        let covered_duration = if present_samples == 0 {
-            0
-        } else if source_complete {
-            interval.duration_us()
-        } else {
-            present_samples.min(interval.duration_us())
-        };
+        let covered_duration = present_samples.min(interval.duration_us());
         let state = if present_samples == 0 {
             CoverageState::NotCollected
-        } else if source_complete {
+        } else if source_complete && covered_duration == interval.duration_us() {
             CoverageState::Complete
         } else if covered_duration < interval.duration_us() {
             CoverageState::Partial
@@ -864,8 +892,13 @@ fn factor_coverage(
         let population = records.last().map(|record| SourcePopulation {
             collected: record.collected,
             total: Some(record.source_total),
-            total_quality: PopulationTotalQuality::Exact,
+            total_quality: if record.total_exact {
+                PopulationTotalQuality::Exact
+            } else {
+                PopulationTotalQuality::LowerBound
+            },
         });
+        let retained_exact = losses.is_empty();
         result.push(FactorCoverage {
             factor_id,
             applicability: Applicability::Applicable,
@@ -882,7 +915,7 @@ fn factor_coverage(
             source_population: population,
             loss_reasons: losses.into_iter().collect(),
             lost_count_lower_bound: None,
-            retained_exactness: if losses_is_empty(metrics, factor_id) {
+            retained_exactness: if retained_exact {
                 RetainedExactness::Exact
             } else {
                 RetainedExactness::Unknown
@@ -895,17 +928,10 @@ fn factor_coverage(
                 SourceCompleteness::BoundedSubset
             },
             physical_count_semantics: PhysicalCountSemantics::NotApplicable,
-            boundary_quality: BoundaryQuality::Exact,
+            boundary_quality: BoundaryQuality::Contained,
         });
     }
     Ok(result)
-}
-
-fn losses_is_empty(metrics: &MetricAccumulator, factor_id: FactorId) -> bool {
-    metrics
-        .factor_losses
-        .get(&factor_id)
-        .is_none_or(BTreeSet::is_empty)
 }
 
 const fn unsupported_coverage(factor_id: FactorId, interval: CoverageSpan) -> FactorCoverage {
@@ -967,17 +993,18 @@ fn reset_markers(samples: &[CounterSample]) -> Vec<ResetMarker> {
 
 fn proven_population(
     source_type: u32,
-    retained: usize,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
-) -> u64 {
+) -> Option<u64> {
     coverage
         .get(&source_type)
         .and_then(|records| records.last())
-        .filter(|record| record.read_state == 0 && record.visibility == 0)
-        .map_or_else(
-            || u64::try_from(retained).unwrap_or(u64::MAX),
-            |record| record.source_total,
-        )
+        .filter(|record| {
+            record.read_state == 0
+                && record.visibility == 0
+                && record.total_exact
+                && record.collected == record.source_total
+        })
+        .map(|record| record.source_total)
 }
 
 fn insert_descriptor(
@@ -1023,6 +1050,7 @@ fn supported_metric_source(type_id: u32) -> bool {
             REPLICATION_INSTANCE
                 | RESET_METADATA
                 | INSTANCE_METADATA
+                | COLLECTION_COVERAGE
                 | PG_REPLICATION_PHYSICAL
                 | PG_PROCESS_CGROUP_MEMORY
                 | SNAPSHOT_COVERAGE

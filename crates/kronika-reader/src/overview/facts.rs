@@ -389,13 +389,40 @@ impl SegmentFacts {
         max_ts: i64,
         bounds: &Bounds,
     ) -> Result<Self, BuildError> {
-        let event_facts = extracted
+        let mut event_facts = extracted
             .observations
             .iter()
             .filter_map(|observation| EventFact::from_observation(observation).transpose())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_error| BuildError::Internal)?;
         let covered = segment_coverage(min_ts, max_ts)?;
+        let counter_samples = CounterSamplesBlock::new_with_series(
+            metrics.counter_series,
+            metrics.counters,
+            bounds,
+        )
+        .map_err(block_build_error)?;
+        let gauge_samples =
+            GaugeSamplesBlock::new_with_series(metrics.gauge_series, metrics.gauges, bounds)
+                .map_err(block_build_error)?;
+        let reset_markers =
+            ResetMarkersBlock::new(metrics.reset_markers, bounds).map_err(block_build_error)?;
+        let entity_states =
+            EntityStatesBlock::new(metrics.entity_states, bounds).map_err(block_build_error)?;
+        event_facts.extend(derive_metric_event_facts(
+            &counter_samples,
+            &gauge_samples,
+            &entity_states,
+            &extracted.known_gaps,
+            bounds,
+        )?);
+        event_facts.sort_by(EventFact::canonical_cmp);
+        if event_facts
+            .windows(2)
+            .any(|pair| pair[0].fact_id() == pair[1].fact_id())
+        {
+            return Err(BuildError::Internal);
+        }
         let loss_coverage = LossCoverageBlock::new_with_factors(
             covered,
             extracted.known_gaps,
@@ -412,19 +439,6 @@ impl SegmentFacts {
             super::block::BlockError::AboveBound => BuildError::LimitExceeded,
             _ => BuildError::Internal,
         })?;
-        let counter_samples = CounterSamplesBlock::new_with_series(
-            metrics.counter_series,
-            metrics.counters,
-            bounds,
-        )
-        .map_err(block_build_error)?;
-        let gauge_samples =
-            GaugeSamplesBlock::new_with_series(metrics.gauge_series, metrics.gauges, bounds)
-                .map_err(block_build_error)?;
-        let reset_markers =
-            ResetMarkersBlock::new(metrics.reset_markers, bounds).map_err(block_build_error)?;
-        let entity_states =
-            EntityStatesBlock::new(metrics.entity_states, bounds).map_err(block_build_error)?;
         Ok(Self {
             identity,
             lineage,
@@ -800,7 +814,6 @@ impl SegmentFacts {
             singleton_body(&mut fact_reader, BlockKind::EventFacts)?;
         let event_facts = EventFactsBlock::decode(&facts_body, &strings, bounds)?;
         validate_block_descriptor(&facts_entry, &event_facts)?;
-        validate_event_fact_evidence(&event_facts, &observations)?;
 
         let (counter_entry, counter_body) =
             singleton_body(&mut fact_reader, BlockKind::CounterSamples)?;
@@ -825,6 +838,12 @@ impl SegmentFacts {
         let entity_states = EntityStatesBlock::decode(&states_body, bounds)?;
         validate_block_descriptor(&states_entry, &entity_states)?;
         validate_state_series(&entity_states, &gauge_samples)?;
+        validate_event_fact_evidence(
+            &event_facts,
+            &observations,
+            &counter_samples,
+            &gauge_samples,
+        )?;
 
         let coverage = merge_coverage_blocks(&mut fact_reader, bounds)?;
         let retained_text_bytes = bounds
@@ -1096,6 +1115,151 @@ fn checked_add_read_stats(
     })
 }
 
+fn derive_metric_event_facts(
+    counters: &CounterSamplesBlock,
+    gauges: &GaugeSamplesBlock,
+    states: &EntityStatesBlock,
+    known_gaps: &Coverage,
+    bounds: &Bounds,
+) -> Result<Vec<EventFact>, BuildError> {
+    let mut facts = Vec::new();
+    let mut start = 0;
+    while start < counters.samples().len() {
+        let series_id = counters.samples()[start].series_id();
+        let end = start
+            + counters.samples()[start..]
+                .partition_point(|sample| sample.series_id() == series_id);
+        let descriptor = series_descriptor(counters.series(), series_id)?;
+        for pair in counters.samples()[start..end].windows(2) {
+            if let Some(fact) =
+                EventFact::from_counter_pair(descriptor, pair[0], pair[1], known_gaps)
+                    .map_err(|_error| BuildError::Internal)?
+            {
+                push_fact(&mut facts, fact, bounds)?;
+            }
+        }
+        start = end;
+    }
+
+    let mut start = 0;
+    while start < states.records().len() {
+        let series_id = states.records()[start].series_id;
+        let end = start
+            + states.records()[start..]
+                .partition_point(|record| record.series_id == series_id);
+        let descriptor = series_descriptor(gauges.series(), series_id)?;
+        for pair in states.records()[start..end].windows(2) {
+            if known_gaps.spans().iter().any(|gap| {
+                gap.start_us() < pair[1].ts_us && gap.end_us() > pair[0].ts_us
+            }) {
+                continue;
+            }
+            if let Some(fact) = EventFact::from_state_transition(
+                descriptor,
+                pair[0].ts_us,
+                pair[0].state_code,
+                pair[1].ts_us,
+                pair[1].state_code,
+                pair[1].population_total,
+            )
+            .map_err(|_error| BuildError::Internal)?
+            {
+                push_fact(&mut facts, fact, bounds)?;
+            }
+        }
+        start = end;
+    }
+
+    let mut totals = BTreeMap::new();
+    let mut available_by_key = BTreeMap::new();
+    for descriptor in gauges.series() {
+        let Some(entity) = descriptor.entity else {
+            continue;
+        };
+        let destination = match kronika_analytics::overview::MetricFactor::from_id(
+            descriptor.factor_id,
+        ) {
+            Some(kronika_analytics::overview::MetricFactor::PgFilesystemTotalBytes) => {
+                &mut totals
+            }
+            Some(kronika_analytics::overview::MetricFactor::PgFilesystemAvailableBytes) => {
+                &mut available_by_key
+            }
+            _ => continue,
+        };
+        for sample in gauges
+            .samples()
+            .iter()
+            .filter(|sample| sample.series_id() == descriptor.series_id)
+        {
+            if destination
+                .insert((entity, sample.ts_us()), (*descriptor, *sample))
+                .is_some()
+            {
+                return Err(BuildError::Internal);
+            }
+        }
+    }
+    for (key, (total_descriptor, total)) in totals {
+        let Some((available_descriptor, available_sample)) =
+            available_by_key.get(&key).copied()
+        else {
+            continue;
+        };
+        if let Some(fact) = EventFact::from_capacity_samples(
+            total_descriptor,
+            total,
+            available_descriptor,
+            available_sample,
+        )
+        .map_err(|_error| BuildError::Internal)?
+        {
+            push_fact(&mut facts, fact, bounds)?;
+        }
+        let previous = available_by_key
+            .range((key.0, i64::MIN)..key)
+            .next_back()
+            .map(|(_key, (_descriptor, sample))| *sample);
+        if let Some(previous) = previous
+            && let Some(fact) = EventFact::from_capacity_zero_transition(
+                total_descriptor,
+                total,
+                available_descriptor,
+                previous,
+                available_sample,
+                known_gaps,
+            )
+            .map_err(|_error| BuildError::Internal)?
+        {
+            push_fact(&mut facts, fact, bounds)?;
+        }
+    }
+    Ok(facts)
+}
+
+fn series_descriptor(
+    series: &[MetricSeriesDescriptor],
+    id: MetricSeriesId,
+) -> Result<MetricSeriesDescriptor, BuildError> {
+    series
+        .binary_search_by_key(&id.0, |descriptor| descriptor.series_id.0)
+        .ok()
+        .map(|index| series[index])
+        .ok_or(BuildError::Internal)
+}
+
+fn push_fact(
+    destination: &mut Vec<EventFact>,
+    fact: EventFact,
+    bounds: &Bounds,
+) -> Result<(), BuildError> {
+    if destination.len() as u64 == bounds.items_per_block {
+        return Err(BuildError::LimitExceeded);
+    }
+    destination.push(fact);
+    Ok(())
+}
+
 const fn block_build_error(error: super::block::BlockError) -> BuildError {
     match error {
         super::block::BlockError::AboveBound => BuildError::LimitExceeded,
@@ -1332,12 +1496,28 @@ fn singleton_body<R: ReadAt>(
 fn validate_event_fact_evidence(
     facts: &EventFactsBlock,
     observations: &EventObservationsBlock,
+    counters: &CounterSamplesBlock,
+    gauges: &GaugeSamplesBlock,
 ) -> Result<(), CacheReadError> {
-    let observation_ids: DictionaryIdSet<_> = observations
+    let mut observation_ids: DictionaryIdSet<_> = observations
         .observations()
         .iter()
         .map(EventObservation::observation_id)
         .collect();
+    observation_ids.extend(
+        counters
+            .samples()
+            .iter()
+            .copied()
+            .map(kronika_analytics::overview::counter_sample_observation_id),
+    );
+    observation_ids.extend(
+        gauges
+            .samples()
+            .iter()
+            .copied()
+            .map(kronika_analytics::overview::gauge_sample_observation_id),
+    );
     for fact in facts.facts() {
         if fact
             .supporting_observation_ids()
@@ -1346,16 +1526,34 @@ fn validate_event_fact_evidence(
         {
             return Err(CacheReadError::Corrupt);
         }
-        let expected_scope = fact
-            .supporting_observation_ids()
-            .first()
-            .and_then(|id| {
-                observations
-                    .observations()
-                    .iter()
-                    .find(|observation| observation.observation_id() == *id)
+        let observation_scope = fact.supporting_observation_ids().first().and_then(|id| {
+            observations
+                .observations()
+                .iter()
+                .find(|observation| observation.observation_id() == *id)
+                .map(EventObservation::source_scope_id)
+        });
+        let counter_scope = fact.supporting_observation_ids().first().and_then(|id| {
+            counters.samples().iter().find_map(|sample| {
+                (kronika_analytics::overview::counter_sample_observation_id(*sample) == *id)
+                    .then(|| {
+                        series_descriptor(counters.series(), sample.series_id())
+                            .map(|descriptor| descriptor.source_scope_id)
+                    })
             })
-            .map(EventObservation::source_scope_id);
+        });
+        let gauge_scope = fact.supporting_observation_ids().first().and_then(|id| {
+            gauges.samples().iter().find_map(|sample| {
+                (kronika_analytics::overview::gauge_sample_observation_id(*sample) == *id)
+                    .then(|| {
+                        series_descriptor(gauges.series(), sample.series_id())
+                            .map(|descriptor| descriptor.source_scope_id)
+                    })
+            })
+        });
+        let expected_scope = observation_scope
+            .or_else(|| counter_scope.transpose().ok().flatten())
+            .or_else(|| gauge_scope.transpose().ok().flatten());
         if expected_scope != Some(fact.coverage().source_scope_id) {
             return Err(CacheReadError::Corrupt);
         }

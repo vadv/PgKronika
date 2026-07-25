@@ -434,7 +434,7 @@ impl CounterSamplesBlock {
         {
             return Err(BlockError::Duplicate);
         }
-        validate_sample_series(&series, samples.iter().map(CounterSample::series_id))?;
+        validate_sample_series(&series, samples.iter().map(|sample| sample.series_id()))?;
         Ok(Self { series, samples })
     }
 
@@ -491,7 +491,7 @@ impl CounterSamplesBlock {
                 std::cmp::Ordering::Greater => return Err(BlockError::Unsorted),
             }
         }
-        validate_sample_series(&series, samples.iter().map(CounterSample::series_id))?;
+        validate_sample_series(&series, samples.iter().map(|sample| sample.series_id()))?;
         Ok(Self { series, samples })
     }
 }
@@ -588,7 +588,7 @@ impl GaugeSamplesBlock {
         {
             return Err(BlockError::Duplicate);
         }
-        validate_sample_series(&series, samples.iter().map(GaugeSample::series_id))?;
+        validate_sample_series(&series, samples.iter().map(|sample| sample.series_id()))?;
         Ok(Self { series, samples })
     }
 
@@ -639,7 +639,7 @@ impl GaugeSamplesBlock {
                 std::cmp::Ordering::Greater => return Err(BlockError::Unsorted),
             }
         }
-        validate_sample_series(&series, samples.iter().map(GaugeSample::series_id))?;
+        validate_sample_series(&series, samples.iter().map(|sample| sample.series_id()))?;
         Ok(Self { series, samples })
     }
 }
