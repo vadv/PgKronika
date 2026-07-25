@@ -13,6 +13,7 @@
 | Проверка BDD image helper без PostgreSQL | `scripts/test-bdd-image.sh` |
 | Полный BDD через Docker/Nix | `DEBUG=1 make test-bdd` |
 | BDD по тегу через Docker/Nix | `DEBUG=1 make test-bdd TAGS=@pg_log` |
+| Жизненный цикл реального web-процесса на PG15–18 | `DEBUG=1 make test-bdd TAGS=@timeline_web_lifecycle` |
 | Полный BDD image run | `./scripts/bdd-image.sh build-builder && ./scripts/bdd-image.sh build-runtime && ./scripts/bdd-image.sh run` |
 | Архитектурные зависимости | `cargo run -p xtask -- check-deps` |
 
@@ -65,6 +66,20 @@ DEBUG=1 make test-bdd TAGS=@pg_log
 весь BDD suite. Если `TAGS` задан, значение валидируется как Cucumber tag
 expression и передаётся в Cucumber как `--tags`. `DEBUG=1` включает verbose
 Cucumber output (`-vvv`) и передаётся в контейнер как переменная окружения.
+
+Сценарии перезапуска и восстановления используют настоящий
+`pg_kronika-web`, включённый в BDD-образ:
+
+```sh
+DEBUG=1 make test-bdd TAGS=@timeline_web_lifecycle
+DEBUG=1 make test-bdd TAGS='@timeline_web_lifecycle and @pg15'
+```
+
+Первый вариант проверяет PostgreSQL 15–18, второй оставляет только PG15 для
+целевой диагностики. Harness ждёт явного сообщения готовности после открытия
+порта, завершает процесс сигналом и управляет публикацией через Unix socket
+между синхронизацией временного OVF и атомарным переименованием. Фиксированных
+задержек и циклов повторных запросов в этих проверках нет.
 
 Этот путь использует тот же dependency builder и тот же Nix build, что и CI.
 Runtime получает только локальный тег:

@@ -54,13 +54,26 @@ CI_JOBS = (
     "bdd-matrix",
 )
 
-BDD_SCENARIOS = tuple(
-    (
-        "crates/kronika-bdd/features/timeline_overview.feature",
-        f"PostgreSQL {version} publishes one reconciled source-scoped timeline",
-        version,
-    )
-    for version in range(15, 19)
+BDD_SCENARIOS = (
+    *(
+        (
+            "crates/kronika-bdd/features/timeline_overview.feature",
+            f"PostgreSQL {version} publishes one reconciled source-scoped timeline",
+            version,
+        )
+        for version in range(15, 19)
+    ),
+    *(
+        (
+            "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+            (
+                f"PostgreSQL {version} real web process recovers sibling indexes "
+                "across lifecycle boundaries"
+            ),
+            version,
+        )
+        for version in range(15, 19)
+    ),
 )
 
 EXPECTED_EVIDENCE = (
@@ -94,6 +107,18 @@ EXPECTED_EVIDENCE = (
             "kronika-reader",
             "crates/kronika-reader/src/overview/publish.rs",
             "publication_failure_returns_fresh_facts_then_serves_the_fallback",
+        ),
+        *(
+            (
+                "bdd_scenario",
+                "kronika-bdd",
+                "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+                (
+                    f"PostgreSQL {version} real web process recovers sibling indexes "
+                    "across lifecycle boundaries"
+                ),
+            )
+            for version in range(15, 19)
         ),
     ),
     (
@@ -1225,6 +1250,36 @@ def validate_acceptance(
                     f"acceptance row {index} names the wrong Rust test binary",
                     failures,
                 )
+            elif kind == "bdd_scenario":
+                source = (repo_root / path).resolve()
+                try:
+                    source.relative_to(repo_root)
+                except ValueError:
+                    check(
+                        False,
+                        f"acceptance row {index} BDD path escapes the repository",
+                        failures,
+                    )
+                    continue
+                check(
+                    binary == "kronika-bdd"
+                    and path
+                    == "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+                    f"acceptance row {index} has invalid BDD evidence coordinates",
+                    failures,
+                )
+                check(
+                    source.is_file(),
+                    f"acceptance row {index} BDD feature is absent",
+                    failures,
+                )
+                if source.is_file():
+                    text = source.read_text(encoding="utf-8")
+                    check(
+                        f"Scenario: {name}" in text,
+                        f"acceptance row {index} BDD scenario {name!r} is absent",
+                        failures,
+                    )
             elif kind == "mode":
                 check(
                     path == "qualification"
@@ -1299,7 +1354,7 @@ def validate_bdd_scenarios(
         actual.append((row.get("path"), row.get("name"), row.get("postgres")))
     check(
         tuple(actual) == BDD_SCENARIOS,
-        "final artifact does not name the exact PostgreSQL 15-18 timeline scenarios",
+        "final artifact does not name the exact PostgreSQL 15-18 timeline and lifecycle scenarios",
         failures,
     )
     for path, name, _version in BDD_SCENARIOS:

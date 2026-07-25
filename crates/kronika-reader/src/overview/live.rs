@@ -946,7 +946,9 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
 
-    use kronika_analytics::overview::{CountLimits, MemoryOracle};
+    use kronika_analytics::overview::{
+        CountLimits, MemoryOracle, ObservationPayload, notable_event_id,
+    };
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::pg_log::{PgLogErrorV1, PgLogLifecycleV1};
     use kronika_registry::{Section, StrId, Ts};
@@ -2108,7 +2110,7 @@ mod tests {
     fn long_stream(len: usize) -> Vec<PgLogLifecycleV1> {
         (0..len)
             .map(|index| {
-                let ts = 1_000 + i64::try_from(index / 2).expect("timestamp fits") * 10;
+                let ts = 1_000 + i64::try_from(index / 2).expect("timestamp fits");
                 let kind = u8::try_from(index % 3).expect("kind fits");
                 if kind == 0 {
                     let signal = (index % 2 == 0)
@@ -2230,6 +2232,366 @@ mod tests {
             );
             assert_eq!(outcome.facts().coverage(), rebuilt.coverage());
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SemanticEvent {
+        event_id: [u8; 32],
+        source_id: u64,
+        source_type_id: u32,
+        sort_ts_us: i64,
+        occurrence_count: u64,
+        payload: ObservationPayload,
+    }
+
+    fn semantic_events(result: &OracleResult) -> Vec<SemanticEvent> {
+        let mut events = result
+            .observations()
+            .iter()
+            .map(|observation| SemanticEvent {
+                event_id: notable_event_id(observation)
+                    .expect("lifecycle observations have a stable public identity"),
+                source_id: observation.source_id(),
+                source_type_id: observation.source_type_id(),
+                sort_ts_us: observation.time().sort_ts_us,
+                occurrence_count: observation.occurrence_count(),
+                payload: observation.payload().clone(),
+            })
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            (
+                left.sort_ts_us,
+                left.event_id,
+                left.source_id,
+                left.source_type_id,
+            )
+                .cmp(&(
+                    right.sort_ts_us,
+                    right.event_id,
+                    right.source_id,
+                    right.source_type_id,
+                ))
+        });
+        events
+    }
+
+    fn exact_boundaries(
+        rng: &mut Lcg,
+        start: usize,
+        end: usize,
+        groups: usize,
+    ) -> Vec<usize> {
+        assert!(start < end);
+        assert!((1..=end - start).contains(&groups));
+        let mut candidates = (start + 1..end).collect::<Vec<_>>();
+        for index in 0..groups.saturating_sub(1) {
+            let selected = index + rng.below(candidates.len() - index);
+            candidates.swap(index, selected);
+        }
+        let mut cuts = Vec::with_capacity(groups + 1);
+        cuts.push(start);
+        cuts.extend_from_slice(&candidates[..groups.saturating_sub(1)]);
+        cuts.push(end);
+        cuts.sort_unstable();
+        cuts
+    }
+
+    fn shuffle<T>(rng: &mut Lcg, values: &mut [T]) {
+        for end in (1..values.len()).rev() {
+            values.swap(end, rng.below(end + 1));
+        }
+    }
+
+    fn oracle_from_chunks(chunks: &[Arc<SegmentFacts>]) -> MemoryOracle {
+        let mut observations = Vec::new();
+        let mut coverage = Coverage::empty();
+        for chunk in chunks {
+            observations.extend_from_slice(chunk.observations());
+            coverage = coverage.union(chunk.coverage());
+        }
+        MemoryOracle::new(observations, coverage).expect("partition has no identity collision")
+    }
+
+    fn oracle_from_observation_chunks(
+        chunks: &[&[kronika_analytics::overview::EventObservation]],
+        coverage: &Coverage,
+    ) -> MemoryOracle {
+        let mut observations = Vec::new();
+        for chunk in chunks {
+            observations.extend_from_slice(chunk);
+        }
+        MemoryOracle::new(observations, coverage.clone())
+            .expect("observation partition has no identity collision")
+    }
+
+    fn assert_partition_path(
+        seed: u64,
+        label: &str,
+        path: &MemoryOracle,
+        range: CoverageSpan,
+        expected_events: &[SemanticEvent],
+        expected_counts: &kronika_analytics::overview::EventCounts,
+        expected_coverage: &Coverage,
+    ) {
+        let actual = path.query(range, LIMITS).expect("query partitioned path");
+        assert_eq!(
+            semantic_events(&actual),
+            expected_events,
+            "{label} changed public IDs, payloads, counts, or order at seed {seed}"
+        );
+        assert_eq!(
+            actual.counts(),
+            expected_counts,
+            "{label} changed exact counters at seed {seed}"
+        );
+        assert_eq!(
+            actual.coverage(),
+            expected_coverage,
+            "{label} changed exact coverage at seed {seed}"
+        );
+    }
+
+    fn assert_boundary_and_cap(
+        seed: u64,
+        label: &str,
+        path: &MemoryOracle,
+        range: CoverageSpan,
+        step_us: i64,
+        expected_events: &[SemanticEvent],
+    ) {
+        let range_width = range
+            .end_us()
+            .checked_sub(range.start_us())
+            .expect("nonempty range width");
+        let bucket_count = range_width
+            .checked_add(step_us - 1)
+            .expect("bucket count numerator")
+            / step_us;
+        let boundary_bucket = 1
+            + i64::try_from(seed % u64::try_from(bucket_count - 1).expect("bucket count fits"))
+                .expect("boundary bucket fits");
+        let split = range
+            .start_us()
+            .checked_add(boundary_bucket * step_us)
+            .expect("boundary split")
+            .min(range.end_us() - 1);
+        let left = path
+            .query(
+                CoverageSpan::new(range.start_us(), split).expect("left partition"),
+                LIMITS,
+            )
+            .expect("query left partition");
+        let right = path
+            .query(
+                CoverageSpan::new(split, range.end_us()).expect("right partition"),
+                LIMITS,
+            )
+            .expect("query right partition");
+        let mut partitioned = semantic_events(&left);
+        partitioned.extend(semantic_events(&right));
+        partitioned.sort_by(|left, right| {
+            (left.sort_ts_us, left.event_id).cmp(&(right.sort_ts_us, right.event_id))
+        });
+        assert_eq!(
+            partitioned, expected_events,
+            "{label} lost or duplicated a half-open boundary event at seed {seed}"
+        );
+
+        let page_cap = 1 + usize::try_from(seed % 17).expect("small cap");
+        let _page = &expected_events[..expected_events.len().min(page_cap)];
+        let full_after = path.query(range, LIMITS).expect("repeat after page cap");
+        assert_eq!(
+            semantic_events(&full_after),
+            expected_events,
+            "a response cap mutated authoritative {label} facts at seed {seed}"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one metamorphic loop keeps all five production representations and seed diagnostics together"
+    )]
+    fn ten_thousand_random_partition_seal_and_merge_seeds_are_invariant() {
+        const SEEDS: u64 = 10_000;
+        const ROWS: usize = 120;
+        const MAX_ACTIVE_PARTS: usize = 100;
+        const MAX_SEALED_SEGMENTS: usize = 20;
+
+        let rows = long_stream(ROWS);
+        let raw = sealed_facts(&rows);
+        let full = raw.coverage().spans()[0];
+        assert_eq!(full, CoverageSpan::new(1_000, 1_060).expect("full span"));
+        assert_eq!(
+            raw.observations().len(),
+            ROWS,
+            "canonical lifecycle stream retains one observation per source row"
+        );
+
+        let mut seen_active_parts = [false; MAX_ACTIVE_PARTS];
+        let mut seen_sealed_segments = [false; MAX_SEALED_SEGMENTS];
+
+        for seed in 0..SEEDS {
+            let mut rng = Lcg::new(seed);
+            let active_parts = if seed < MAX_ACTIVE_PARTS as u64 {
+                usize::try_from(seed).expect("seed fits") + 1
+            } else {
+                1 + rng.below(MAX_ACTIVE_PARTS)
+            };
+            let sealed_segments = if seed < MAX_SEALED_SEGMENTS as u64 {
+                usize::try_from(seed).expect("seed fits") + 1
+            } else {
+                1 + rng.below(MAX_SEALED_SEGMENTS)
+            };
+            seen_active_parts[active_parts - 1] = true;
+            seen_sealed_segments[sealed_segments - 1] = true;
+
+            let earliest_seal = sealed_segments;
+            let latest_seal = ROWS - active_parts;
+            let seal_point = earliest_seal
+                + rng.below(
+                    latest_seal
+                        .checked_sub(earliest_seal)
+                        .expect("part counts fit canonical stream")
+                        + 1,
+                );
+            let sealed_cuts =
+                exact_boundaries(&mut rng, 0, seal_point, sealed_segments);
+            let active_cuts =
+                exact_boundaries(&mut rng, seal_point, ROWS, active_parts);
+
+            let sealed_observations = sealed_cuts
+                .windows(2)
+                .map(|window| &raw.observations()[window[0]..window[1]])
+                .collect::<Vec<_>>();
+            let active_observations = active_cuts
+                .windows(2)
+                .map(|window| &raw.observations()[window[0]..window[1]])
+                .collect::<Vec<_>>();
+            let mut rebuilt_chunks = sealed_observations.clone();
+            rebuilt_chunks.push(&raw.observations()[seal_point..ROWS]);
+            shuffle(&mut rng, &mut rebuilt_chunks);
+            let sealed_only =
+                oracle_from_observation_chunks(&rebuilt_chunks, raw.coverage());
+
+            let mut mixed_chunks = sealed_observations.clone();
+            mixed_chunks.extend(active_observations);
+            shuffle(&mut rng, &mut mixed_chunks);
+            let mixed = oracle_from_observation_chunks(&mixed_chunks, raw.coverage());
+
+            let mut promoted_chunks = sealed_observations;
+            promoted_chunks.push(&raw.observations()[seal_point..ROWS]);
+            shuffle(&mut rng, &mut promoted_chunks);
+            let promoted =
+                oracle_from_observation_chunks(&promoted_chunks, raw.coverage());
+
+            // Exercise the actual PGM → live chunks → promoted/rebuilt path for
+            // every active-part count and the actual sealed-prefix path for
+            // every sealed-segment count. The remaining seeds run the same
+            // canonical production oracle over lightweight partition slices,
+            // keeping the mandatory 10,000-seed algebra bounded in CI.
+            if seed < MAX_ACTIVE_PARTS as u64 {
+                let active_slices = active_cuts
+                    .windows(2)
+                    .map(|window| &rows[window[0]..window[1]])
+                    .collect::<Vec<_>>();
+                let active_bytes = active_slices
+                    .iter()
+                    .map(|slice| lifecycle_part(slice))
+                    .collect::<Vec<_>>();
+                let active_byte_slices = active_bytes
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect::<Vec<_>>();
+                let mut builder = live_builder();
+                fold_bytes(&mut builder, &active_byte_slices);
+                let live = builder.publish();
+                assert_eq!(live.state(), LiveState::Current, "seed {seed}");
+                assert_eq!(live.chunks().len(), active_parts, "seed {seed}");
+                let sealed_suffix_bytes = sealed_from_slices(&active_slices);
+                let sealed_suffix =
+                    PgmUnit::open(sealed_suffix_bytes.as_slice()).expect("open sealed suffix");
+                let rebuilt_suffix = SegmentFacts::extract(&sealed_suffix, &LIMIT)
+                    .expect("rebuild sealed suffix");
+                let live_parts = live.chunks().iter().map(Arc::as_ref).collect::<Vec<_>>();
+                let promoted_suffix =
+                    SegmentFacts::try_promote_from_parts(&sealed_suffix, &live_parts, &LIMIT)
+                        .expect("attempt suffix promotion")
+                        .expect("matching active parts promote");
+                assert_eq!(
+                    promoted_suffix, rebuilt_suffix,
+                    "promotion changed canonical facts or physical IDs at seed {seed}"
+                );
+            }
+            if seed < MAX_SEALED_SEGMENTS as u64 {
+                let mut actual = sealed_cuts
+                    .windows(2)
+                    .map(|window| Arc::new(sealed_facts(&rows[window[0]..window[1]])))
+                    .collect::<Vec<_>>();
+                actual.push(Arc::new(sealed_facts(&rows[seal_point..ROWS])));
+                shuffle(&mut rng, &mut actual);
+                let actual = oracle_from_chunks(&actual);
+                let actual_result = actual.query(full, LIMITS).expect("query actual sealed path");
+                let raw_result = raw.query(full, LIMITS).expect("query raw sealed path");
+                assert_eq!(
+                    semantic_events(&actual_result),
+                    semantic_events(&raw_result),
+                    "actual sealed partition changed public events at seed {seed}"
+                );
+                assert_eq!(actual_result.counts(), raw_result.counts(), "seed {seed}");
+                assert_eq!(actual_result.coverage(), raw_result.coverage(), "seed {seed}");
+            }
+
+            let (range, step_us) = match seed % 4 {
+                0 => (full, 1),
+                1 => (
+                    CoverageSpan::new(1_010, 1_040).expect("aligned range"),
+                    2,
+                ),
+                2 => (
+                    CoverageSpan::new(1_007, 1_053).expect("unaligned range"),
+                    7,
+                ),
+                _ => (
+                    CoverageSpan::new(1_029, 1_060).expect("boundary range"),
+                    13,
+                ),
+            };
+            let expected = raw.query(range, LIMITS).expect("query unsplit raw path");
+            let expected_events = semantic_events(&expected);
+            for (label, path) in [
+                ("sealed-only", &sealed_only),
+                ("sealed-plus-active", &mixed),
+                ("promoted", &promoted),
+            ] {
+                assert_partition_path(
+                    seed,
+                    label,
+                    path,
+                    range,
+                    &expected_events,
+                    expected.counts(),
+                    expected.coverage(),
+                );
+            }
+            let (label, path) = match seed % 3 {
+                0 => ("sealed-only", &sealed_only),
+                1 => ("sealed-plus-active", &mixed),
+                _ => ("promoted", &promoted),
+            };
+            assert_boundary_and_cap(seed, label, path, range, step_us, &expected_events);
+        }
+
+        assert!(
+            seen_active_parts.into_iter().all(std::convert::identity),
+            "the sweep must exercise every active part count in 1..=100"
+        );
+        assert!(
+            seen_sealed_segments
+                .into_iter()
+                .all(std::convert::identity),
+            "the sweep must exercise every sealed segment count in 1..=20"
+        );
     }
 
     fn fallback_gap_part() -> Vec<u8> {

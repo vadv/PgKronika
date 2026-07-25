@@ -456,6 +456,16 @@ class FinalizationTests(unittest.TestCase):
         self.assertTrue(
             all(row["decision"] == "PASS" for row in final["acceptance"])
         )
+        self.assertEqual(len(final["final_ci"]["bdd_scenarios"]), 8)
+        self.assertEqual(
+            {
+                row["path"] for row in final["final_ci"]["bdd_scenarios"]
+            },
+            {
+                "crates/kronika-bdd/features/timeline_overview.feature",
+                "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+            },
+        )
 
     def test_attempt_two_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "attempt 1"):
@@ -528,6 +538,29 @@ class FinalizationTests(unittest.TestCase):
             self.assertIn(
                 "final CI exact head differs from the artifact head", failures
             )
+
+    def test_missing_real_process_lifecycle_scenario_is_rejected(self) -> None:
+        raw = raw_finalization_input()
+        final = FINALIZER.final_artifact(
+            copy.deepcopy(raw),
+            exact_head="a" * 40,
+            run_id="123",
+            run_attempt="1",
+            jobs=dict.fromkeys(FINALIZER.CI_JOBS, "success"),
+            raw_digest="b" * 64,
+        )
+        final["final_ci"]["bdd_scenarios"].pop()
+        failures: list[str] = []
+        VALIDATOR.validate_final_ci(
+            final,
+            raw_artifact=None,
+            repo_root=REPO_ROOT,
+            failures=failures,
+        )
+        self.assertIn(
+            "final artifact does not name the exact PostgreSQL 15-18 timeline and lifecycle scenarios",
+            failures,
+        )
 
 
 class AccountingAndChecksumTests(unittest.TestCase):

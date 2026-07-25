@@ -10,13 +10,16 @@ repository.workspace = true
 
 [dependencies]
 kronika-registry = { path = "../kronika-registry" }
-kronika-reader = { path = "../kronika-reader" }
+kronika-reader = { path = "../kronika-reader", features = ["qualification"] }
 kronika-format = { path = "../kronika-format" }
-pg_kronika-web = { path = "../../bins/pg_kronika-web" }
+pg_kronika-web = { path = "../../bins/pg_kronika-web", features = ["qualification"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = "1"
+sha2 = "0.10"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 cucumber = "0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util", "sync"] }

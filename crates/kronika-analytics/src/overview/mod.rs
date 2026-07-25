@@ -58,8 +58,8 @@ pub use metric::{
 };
 pub use notable::{
     DEFAULT_RESPONSE_CAP, InvalidNotablePolicy, MAX_RESPONSE_CAP, NotableClass,
-    NotableEvidenceClass, NotablePolicy, NotablePreview, RankedNotable, observation_severity,
-    passes_min_severity, severity_rank,
+    NotableEvidenceClass, NotablePolicy, NotablePreview, RankedNotable, notable_event_id,
+    observation_severity, passes_min_severity, severity_rank,
 };
 pub use observation::{
     CheckpointPayload, DictionaryContextId, DroppedFieldCount, ErrorGroupPayload, EventObservation,

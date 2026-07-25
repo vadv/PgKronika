@@ -227,7 +227,12 @@ fn encoded_section<S: Section>(type_id: u32, rows: &[S]) -> FixtureSection {
     }
 }
 
-fn lifecycle_row(ts_us: i64, kind: u8, pid: Option<i32>, signal: Option<i32>) -> PgLogLifecycleV1 {
+const fn lifecycle_row(
+    ts_us: i64,
+    kind: u8,
+    pid: Option<i32>,
+    signal: Option<i32>,
+) -> PgLogLifecycleV1 {
     PgLogLifecycleV1 {
         ts: Ts(ts_us),
         kind,
@@ -240,7 +245,7 @@ fn lifecycle_row(ts_us: i64, kind: u8, pid: Option<i32>, signal: Option<i32>) ->
     }
 }
 
-fn reset_row(ts_us: i64, snapshot: u8) -> ResetMetadata {
+const fn reset_row(ts_us: i64, snapshot: u8) -> ResetMetadata {
     ResetMetadata {
         ts: Ts(ts_us),
         postmaster_start_time: Ts(if snapshot < 3 { 1 } else { 35 }),
@@ -260,7 +265,7 @@ fn reset_row(ts_us: i64, snapshot: u8) -> ResetMetadata {
     }
 }
 
-fn instance_row(ts_us: i64, snapshot: u8) -> InstanceMetadata {
+const fn instance_row(ts_us: i64, snapshot: u8) -> InstanceMetadata {
     InstanceMetadata {
         ts: Ts(ts_us),
         hostname: StrId(1),
@@ -378,7 +383,7 @@ fn slot_row(ts_us: i64, snapshot: u8) -> PgReplicationSlotRetentionV3 {
         wal_status_code: state_code,
         is_in_recovery: false,
         conflicting: Some(false),
-        invalidation_code: if snapshot < 2 { 0 } else { 1 },
+        invalidation_code: snapshot / 2,
     }
 }
 
@@ -433,7 +438,7 @@ fn vmstat_row(ts_us: i64, snapshot: u8) -> OsVmstat {
     }
 }
 
-fn sender_row(ts_us: i64, state_code: u8) -> PgReplicationPhysicalV1 {
+const fn sender_row(ts_us: i64, state_code: u8) -> PgReplicationPhysicalV1 {
     PgReplicationPhysicalV1 {
         ts: Ts(ts_us),
         pid: 42,
@@ -480,7 +485,7 @@ fn coverage_rows(ts_us: i64, snapshot: u8) -> Vec<SnapshotCoverageV1> {
     .collect()
 }
 
-fn coverage_row(
+const fn coverage_row(
     source_type_id: u32,
     ts_us: i64,
     read_state: u8,

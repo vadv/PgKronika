@@ -29,6 +29,8 @@ pub(crate) mod oracle;
 pub(crate) mod session;
 pub(crate) mod snapshot;
 pub(crate) mod web;
+pub(crate) mod web_lifecycle;
+pub(crate) mod web_process;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -121,6 +123,9 @@ pub(crate) struct HarnessState {
     sessions: BTreeMap<String, Session>,
     /// Sealed segment from the most recent `snapshots the segment` step.
     segment: Option<PathBuf>,
+    /// Canonical real-process timeline and sibling bytes established by the
+    /// first lifecycle assertion in a scenario.
+    web_lifecycle_baseline: Option<web_lifecycle::TimelineBaseline>,
     /// Segments sealed by the internal-timer step, in seal order.
     timer_segments: Vec<PathBuf>,
     /// The collector's stderr from the most recent snapshot, for failure dumps.
@@ -320,6 +325,19 @@ impl HarnessState {
         self.segment
             .as_ref()
             .context("no snapshot taken; run `When the collector snapshots the segment` first")
+    }
+
+    pub(crate) fn set_web_lifecycle_baseline(
+        &mut self,
+        baseline: web_lifecycle::TimelineBaseline,
+    ) {
+        self.web_lifecycle_baseline = Some(baseline);
+    }
+
+    pub(crate) fn web_lifecycle_baseline(&self) -> Result<&web_lifecycle::TimelineBaseline> {
+        self.web_lifecycle_baseline
+            .as_ref()
+            .context("real-process lifecycle baseline has not been established")
     }
 
     /// Record the collector's stderr from the most recent snapshot.
@@ -690,6 +708,7 @@ impl HarnessState {
         }
         self.window_floors.clear();
         self.segment = None;
+        self.web_lifecycle_baseline = None;
         self.timer_segments.clear();
         self.collector_log = None;
         self.collector_output_dirs.clear();

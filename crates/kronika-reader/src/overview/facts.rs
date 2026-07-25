@@ -3190,6 +3190,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end assertion inventories every canonical fact family and contract"
+    )]
     fn every_populated_canonical_block_matches_forced_raw_and_restart_warm() {
         let fixture = all_family_fixture();
         assert_eq!(fixture.schema_version, ALL_FAMILY_SCHEMA_VERSION);
@@ -3459,11 +3463,11 @@ mod tests {
         let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract all families");
 
         let left_range = CoverageSpan::new(10, 20).expect("left range");
-        let right_range = CoverageSpan::new(20, 31).expect("right range");
+        let right_range = CoverageSpan::new(20, 41).expect("right range");
         let left = facts.query(left_range, LIMITS).expect("left query");
         let right = facts.query(right_range, LIMITS).expect("right query");
         assert_eq!(left.observations().len(), 1);
-        assert_eq!(right.observations().len(), 2);
+        assert_eq!(right.observations().len(), 3);
         assert_eq!(
             left.observations().len() + right.observations().len(),
             facts.observations().len(),
@@ -3489,7 +3493,7 @@ mod tests {
                 .iter()
                 .map(|sample| sample.ts_us())
                 .collect::<Vec<_>>(),
-            vec![10, 20, 30]
+            vec![10, 20, 30, 40]
         );
 
         let bucket = CoverageSpan::new(15, 31).expect("unaligned bucket");

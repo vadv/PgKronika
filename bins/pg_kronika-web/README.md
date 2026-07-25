@@ -377,5 +377,33 @@ usable timeline and never exposes a partially built timeline. A bad
 environment, initial store/overview failure, or unavailable OS entropy for
 cursor authentication exits before binding the listener.
 
+## Real-process restart and recovery BDD
+
+The PostgreSQL 15–18 BDD matrix runs
+`timeline_web_lifecycle.feature` against the packaged `pg_kronika-web`
+executable, not an in-process router or a reconstructed `AppState`. Each
+scenario copies one sealed collector PGM into an owned temporary data
+directory and starts several fresh processes over that same directory. Real
+HTTP calls verify cold sibling creation, a stable inode/mtime/hash on a durable
+restart hit, zero PGM body reads and section decodes, corrupt and stale-header
+rebuilds, interrupted temporary-file recovery, bounded publication fallback,
+process-local cursor expiry, and deterministic writer-owner contention.
+
+Readiness comes from a post-bind process announcement, graceful exits are
+asserted, and crash/contended publication uses a qualification-only Unix
+socket barrier after the temporary OVF is synced and before its atomic rename.
+The harness does not use sleeps or retry loops to decide these outcomes. Run
+the complete lifecycle matrix with:
+
+```sh
+DEBUG=1 make test-bdd TAGS=@timeline_web_lifecycle
+```
+
+For one supported major, use a Cucumber tag expression such as:
+
+```sh
+DEBUG=1 make test-bdd TAGS='@timeline_web_lifecycle and @pg15'
+```
+
 The binary has no CLI flags and does not implement MCP, remote stores, source
 segment retention, or alert delivery.

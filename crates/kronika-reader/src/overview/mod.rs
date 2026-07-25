@@ -69,6 +69,11 @@ pub use publish::{
     CacheRebuildReason, FactLoad, FactOrigin, FactStore, PersistError, PersistFailureClass,
     PersistenceProbeOutcome,
 };
+#[cfg(feature = "qualification")]
+pub use publish::{
+    QUALIFICATION_PUBLISH_BARRIER_ENV, QUALIFICATION_PUBLISH_BARRIER_READY,
+    QUALIFICATION_PUBLISH_BARRIER_RELEASE, QUALIFICATION_PUBLISH_FAULT_ENV,
+};
 
 #[cfg(feature = "qualification")]
 pub(crate) fn qualification_all_family_pgm() -> Vec<u8> {

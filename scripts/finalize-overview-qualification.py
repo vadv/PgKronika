@@ -19,12 +19,25 @@ CI_JOBS = (
 )
 
 BDD_SCENARIOS = [
-    {
-        "path": "crates/kronika-bdd/features/timeline_overview.feature",
-        "name": f"PostgreSQL {version} publishes one reconciled source-scoped timeline",
-        "postgres": version,
-    }
-    for version in range(15, 19)
+    *[
+        {
+            "path": "crates/kronika-bdd/features/timeline_overview.feature",
+            "name": f"PostgreSQL {version} publishes one reconciled source-scoped timeline",
+            "postgres": version,
+        }
+        for version in range(15, 19)
+    ],
+    *[
+        {
+            "path": "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+            "name": (
+                f"PostgreSQL {version} real web process recovers sibling indexes "
+                "across lifecycle boundaries"
+            ),
+            "postgres": version,
+        }
+        for version in range(15, 19)
+    ],
 ]
 
 RAW_FIELDS = {
@@ -161,7 +174,7 @@ def final_artifact(
         "run_attempt": run_attempt,
         "acceptance_job": "overview-m6-acceptance",
         "jobs": jobs,
-        "bdd_scenarios": BDD_SCENARIOS,
+        "bdd_scenarios": [dict(row) for row in BDD_SCENARIOS],
         "raw_artifact_sha256": raw_digest,
         "finalized_unix_ms": time.time_ns() // 1_000_000,
         "decision": "PASS",

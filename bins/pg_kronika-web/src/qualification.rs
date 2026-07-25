@@ -46,6 +46,22 @@ const ITERATIONS: usize = 20;
 const CONCURRENT_WORKERS: usize = 16;
 const SOURCE_ID: u64 = 7;
 
+/// Prefix emitted by a qualification-enabled real server after its listener
+/// has bound successfully.
+#[doc(hidden)]
+pub const PROCESS_READY_PREFIX: &str = "PGKRONIKA_QUALIFICATION_WEB_READY ";
+
+/// Announces the exact ephemeral listener address to the process BDD harness.
+///
+/// Production builds do not contain this function or write to stdout.
+#[doc(hidden)]
+pub fn announce_process_ready(address: std::net::SocketAddr) -> std::io::Result<()> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    writeln!(stdout, "{PROCESS_READY_PREFIX}{address}")?;
+    stdout.flush()
+}
+
 const ORACLE_LIMITS: OracleLimits = OracleLimits {
     max_observations: 65_536,
     max_coverage_spans: 65_536,
@@ -1609,11 +1625,33 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
         ),
         (
             "ovf-fault-fallback",
-            &[(
-                "rust_test",
-                "crates/kronika-reader/src/overview/publish.rs",
-                "publication_failure_returns_fresh_facts_then_serves_the_fallback",
-            )],
+            &[
+                (
+                    "rust_test",
+                    "crates/kronika-reader/src/overview/publish.rs",
+                    "publication_failure_returns_fresh_facts_then_serves_the_fallback",
+                ),
+                (
+                    "bdd_scenario",
+                    "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+                    "PostgreSQL 15 real web process recovers sibling indexes across lifecycle boundaries",
+                ),
+                (
+                    "bdd_scenario",
+                    "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+                    "PostgreSQL 16 real web process recovers sibling indexes across lifecycle boundaries",
+                ),
+                (
+                    "bdd_scenario",
+                    "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+                    "PostgreSQL 17 real web process recovers sibling indexes across lifecycle boundaries",
+                ),
+                (
+                    "bdd_scenario",
+                    "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+                    "PostgreSQL 18 real web process recovers sibling indexes across lifecycle boundaries",
+                ),
+            ],
         ),
         (
             "source-damage-visible",
@@ -1764,6 +1802,9 @@ fn evidence_binary(kind: &str, path: &str) -> &'static str {
             "kronika-analytics"
         }
         ("rust_test", path) if path.starts_with("bins/pg_kronika-web/") => "pg-kronika-web",
+        ("bdd_scenario", "crates/kronika-bdd/features/timeline_web_lifecycle.feature") => {
+            "kronika-bdd"
+        }
         _ => panic!("unknown qualification evidence {kind}:{path}"),
     }
 }

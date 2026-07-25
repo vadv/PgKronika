@@ -8,8 +8,14 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::io::{self, Write as _};
+#[cfg(feature = "qualification")]
+use std::io::{BufRead as _, BufReader};
 use std::num::NonZeroU64;
+#[cfg(feature = "qualification")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "qualification")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -35,8 +41,77 @@ use crate::unit::{PgmBodyReadStats, PgmUnit};
 const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 const NAME_RETRIES: usize = 32;
 
+/// Qualification-only Unix socket used to stop a real web process immediately
+/// before the atomic sidecar rename.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub const QUALIFICATION_PUBLISH_BARRIER_ENV: &str =
+    "KRONIKA_WEB_QUALIFICATION_PUBLISH_BARRIER_SOCKET";
+
+/// Qualification-only publication fault consumed by the first sidecar write.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub const QUALIFICATION_PUBLISH_FAULT_ENV: &str =
+    "KRONIKA_WEB_QUALIFICATION_PUBLISH_FAULT";
+
+/// Barrier message sent after a fully synced temporary sidecar is ready.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub const QUALIFICATION_PUBLISH_BARRIER_READY: &str = "before_commit";
+
+/// Exact release line accepted by the qualification publication barrier.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub const QUALIFICATION_PUBLISH_BARRIER_RELEASE: &str = "continue\n";
+
 static PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static STORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "qualification")]
+#[derive(Debug)]
+struct QualificationPublishBarrier {
+    socket: Option<PathBuf>,
+    armed: AtomicBool,
+}
+
+#[cfg(feature = "qualification")]
+impl QualificationPublishBarrier {
+    fn from_env() -> Self {
+        let socket = std::env::var_os(QUALIFICATION_PUBLISH_BARRIER_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        Self {
+            armed: AtomicBool::new(socket.is_some()),
+            socket,
+        }
+    }
+
+    fn wait_before_commit(&self, temporary_name: &str) -> Result<(), PersistError> {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let socket = self
+            .socket
+            .as_deref()
+            .ok_or(PersistError::TransientIo)?;
+        let mut stream = UnixStream::connect(socket).map_err(PersistError::from_io)?;
+        writeln!(
+            stream,
+            "{QUALIFICATION_PUBLISH_BARRIER_READY} {temporary_name}"
+        )
+        .map_err(PersistError::from_io)?;
+        stream.flush().map_err(PersistError::from_io)?;
+        let mut release = String::new();
+        BufReader::new(&mut stream)
+            .read_line(&mut release)
+            .map_err(PersistError::from_io)?;
+        if release == QUALIFICATION_PUBLISH_BARRIER_RELEASE {
+            Ok(())
+        } else {
+            Err(PersistError::TransientIo)
+        }
+    }
+}
 
 /// Why a fact-file write could not be published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +138,30 @@ pub enum PersistError {
     InvalidSidecarState,
     /// An unclassified I/O failure occurred and requires operator diagnosis.
     Io,
+}
+
+#[cfg(feature = "qualification")]
+fn qualification_publish_faults_from_env() -> VecDeque<PersistError> {
+    let Some(raw) = std::env::var_os(QUALIFICATION_PUBLISH_FAULT_ENV) else {
+        return VecDeque::new();
+    };
+    raw.to_str()
+        .and_then(|value| match value {
+            "read_only_filesystem" => Some(PersistError::ReadOnlyFilesystem),
+            "permission_denied" => Some(PersistError::PermissionDenied),
+            "no_space" => Some(PersistError::NoSpace),
+            "quota_exceeded" => Some(PersistError::QuotaExceeded),
+            "transient_io" => Some(PersistError::TransientIo),
+            "stale_filesystem" => Some(PersistError::StaleFilesystem),
+            "invalid_facts" => Some(PersistError::InvalidFacts),
+            "busy" => Some(PersistError::Busy),
+            "unsafe_path" => Some(PersistError::UnsafePath),
+            "invalid_sidecar_state" => Some(PersistError::InvalidSidecarState),
+            "io" => Some(PersistError::Io),
+            _ => None,
+        })
+        .into_iter()
+        .collect()
 }
 
 /// Stable operational class for a sidecar-persistence failure.
@@ -222,6 +321,8 @@ pub struct FactStore {
     test_publish_attempts: Arc<AtomicU64>,
     #[cfg(any(test, feature = "qualification"))]
     test_recovery_gc_attempts: Arc<AtomicU64>,
+    #[cfg(feature = "qualification")]
+    qualification_publish_barrier: Arc<QualificationPublishBarrier>,
 }
 
 struct PersistAttempt {
@@ -305,11 +406,22 @@ impl FactStore {
             publication_gate: Arc::new(Mutex::new(())),
             persist: Arc::new(Mutex::new(PersistState::new(jitter_seed))),
             #[cfg(any(test, feature = "qualification"))]
-            test_publish_faults: Arc::new(Mutex::new(VecDeque::new())),
+            test_publish_faults: Arc::new(Mutex::new({
+                #[cfg(feature = "qualification")]
+                {
+                    qualification_publish_faults_from_env()
+                }
+                #[cfg(not(feature = "qualification"))]
+                {
+                    VecDeque::new()
+                }
+            })),
             #[cfg(any(test, feature = "qualification"))]
             test_publish_attempts: Arc::new(AtomicU64::new(0)),
             #[cfg(any(test, feature = "qualification"))]
             test_recovery_gc_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "qualification")]
+            qualification_publish_barrier: Arc::new(QualificationPublishBarrier::from_env()),
         }
     }
 
@@ -725,6 +837,14 @@ impl FactStore {
         let (temp_name, temp_file) = create_temp(&directory)?;
         let write_result = write_synced(temp_file, bytes);
         if let Err(error) = write_result {
+            unlink_ignoring_missing(&directory, &temp_name);
+            return Err(error);
+        }
+        #[cfg(feature = "qualification")]
+        if let Err(error) = self
+            .qualification_publish_barrier
+            .wait_before_commit(&temp_name)
+        {
             unlink_ignoring_missing(&directory, &temp_name);
             return Err(error);
         }

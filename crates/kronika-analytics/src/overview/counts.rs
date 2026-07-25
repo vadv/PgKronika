@@ -42,6 +42,18 @@ impl Severity {
     pub const fn index(self) -> usize {
         self as usize
     }
+
+    /// Stable machine code used by wire projections and content identities.
+    #[must_use]
+    pub const fn wire_code(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Fatal => "fatal",
+            Self::Panic => "panic",
+            Self::Warning => "warning",
+            Self::Log => "log",
+        }
+    }
 }
 
 /// A normalized error category.
@@ -94,6 +106,24 @@ impl ErrorCategory {
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
+    }
+
+    /// Stable machine code used by wire projections and content identities.
+    #[must_use]
+    pub const fn wire_code(self) -> &'static str {
+        match self {
+            Self::Lock => "lock",
+            Self::Constraint => "constraint",
+            Self::Serialization => "serialization",
+            Self::Timeout => "timeout",
+            Self::Connection => "connection",
+            Self::Auth => "auth",
+            Self::Syntax => "syntax",
+            Self::Resource => "resource",
+            Self::DataCorruption => "data_corruption",
+            Self::System => "system",
+            Self::Other => "other",
+        }
     }
 }
 
