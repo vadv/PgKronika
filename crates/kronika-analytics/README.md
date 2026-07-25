@@ -156,7 +156,25 @@ With the same reference, the outcomes are:
 | `119`, `120`, `121` | `120` | `4.0` | Anomalous increase |
 | `116`, `117.5`, `119` | `117.5` | `3.5` | No trigger: the score reaches but does not exceed the threshold |
 | `114`, `115`, `116` | `115` | `3.0` | No trigger |
-| `79`, `80`, `81` | `80` | `-4.0` | Anomalous decrease |
+| `79`, `80`, `81` | `80` | `-4.0` | Anomalous decrease: `abs(-4.0) > 3.5` |
+
+The sign of `m` gives the direction: positive means an increase and negative
+means a decrease. Triggering uses the absolute score, so both directions are
+checked. For the final row:
+
+```text
+m = (80 - 100) / 5 = -4.0
+abs(m) = 4.0 > 3.5
+```
+
+The current-window median is `20 transactions/s` below its usual level, a
+change four times the scale of `5 transactions/s`. The position is therefore
+an anomalous decrease.
+
+Here, anomaly means a statistically unusual change, not a diagnosis. A TPS
+drop may be an expected reduction in load or a symptom of a problem. The
+analytics kernel only marks the deviation; incident processing adds context
+and possible explanations.
 
 The threshold is not a fixed percentage. A noisier normal series requires a
 larger change. For example, a reference containing ten values of `90` and ten
