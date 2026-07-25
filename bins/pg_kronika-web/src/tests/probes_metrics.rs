@@ -132,3 +132,72 @@ async fn metrics_endpoint_lists_metric_names_after_traffic() {
         "/metrics body must contain kronika_web_units_total"
     );
 }
+
+#[test]
+fn selected_segment_policy_exports_one_static_rejection_series_and_its_effective_limit() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    write_bgwriter_segment(dir.path(), "two.pgm", 7, 0, 1);
+
+    metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(async {
+            let snapshot =
+                kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
+            let mut config = OverviewConfig::new(
+                dir.path().join(".overview-cache"),
+                dir.path().as_os_str().as_encoded_bytes().to_vec(),
+            );
+            config.max_selected_segments = 1;
+            let state = AppState::with_overview_config(
+                snapshot,
+                0,
+                std::time::Duration::from_secs(10),
+                config,
+            )
+            .expect("state");
+            let response = app(state, None, handle.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/timeline/overview?source=7&from=0&to=2")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("route");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        });
+    });
+
+    let rendered = handle.render();
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line == "kronika_web_timeline_selected_segments_limit 1"),
+        "{rendered}"
+    );
+    let rejection_lines = rendered
+        .lines()
+        .filter(|line| line.starts_with("kronika_web_timeline_query_limit_rejections_total{"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejection_lines,
+        ["kronika_web_timeline_query_limit_rejections_total{resource=\"selected_segments\"} 1"]
+    );
+    for forbidden in [
+        "kronika_web_timeline_response_cache_misses_total",
+        "kronika_web_timeline_singleflight_leaders_total",
+        "kronika_web_timeline_capacity_rejections_total",
+        "kronika_web_overview_cold_work_rejections_total",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "shape admission must precede cache, response flight, analytic and cold work:\n{rendered}"
+        );
+    }
+}

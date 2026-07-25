@@ -9,6 +9,7 @@ use std::time::Duration;
 use kronika_reader::{FallbackConfig, FallbackConfigError, GcConfig, GcConfigError};
 
 use crate::OverviewConfig;
+use crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
 
 const OVERVIEW_CACHE_DIR_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_DIR";
 const OVERVIEW_NAMESPACE_ENV: &str = "KRONIKA_WEB_OVERVIEW_NAMESPACE";
@@ -25,6 +26,7 @@ const RESPONSE_CACHE_ENTRIES_ENV: &str = "KRONIKA_WEB_OVERVIEW_RESPONSE_CACHE_EN
 const CURSOR_MAX_VIEWS_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_MAX_VIEWS";
 const CURSOR_MAX_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_MAX_BYTES";
 const CURSOR_TTL_ENV: &str = "KRONIKA_WEB_OVERVIEW_CURSOR_TTL_S";
+const MAX_SELECTED_SEGMENTS_ENV: &str = "KRONIKA_WEB_OVERVIEW_MAX_SELECTED_SEGMENTS";
 
 /// Normalises a request's method and matched path into metric label values.
 ///
@@ -98,6 +100,7 @@ struct OverviewConfigRaw<'a> {
     cursor_max_views: Option<&'a str>,
     cursor_max_bytes: Option<&'a str>,
     cursor_ttl_secs: Option<&'a str>,
+    max_selected_segments: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -111,6 +114,7 @@ struct ParsedOverviewConfig {
     cursor_max_views: usize,
     cursor_max_bytes: usize,
     cursor_ttl: Duration,
+    max_selected_segments: usize,
 }
 
 fn parse_overview_config(
@@ -175,6 +179,16 @@ fn parse_overview_config(
         CURSOR_TTL_ENV,
         defaults.cursor_ttl.as_secs(),
     )?;
+    let max_selected_segments = parse_nonzero_usize(
+        raw.max_selected_segments,
+        MAX_SELECTED_SEGMENTS_ENV,
+        defaults.max_selected_segments,
+    )?;
+    if max_selected_segments > ABSOLUTE_MAX_SELECTED_SEGMENTS {
+        return Err(format!(
+            "{MAX_SELECTED_SEGMENTS_ENV} must be at most {ABSOLUTE_MAX_SELECTED_SEGMENTS}"
+        ));
+    }
     Ok(ParsedOverviewConfig {
         cache_dir,
         namespace,
@@ -185,6 +199,7 @@ fn parse_overview_config(
         cursor_max_views,
         cursor_max_bytes,
         cursor_ttl: Duration::from_secs(cursor_ttl_secs),
+        max_selected_segments,
     })
 }
 
@@ -297,6 +312,8 @@ pub struct WebConfig {
     pub overview_cursor_max_bytes: usize,
     /// Lifetime of an event cursor and its pinned view.
     pub overview_cursor_ttl: Duration,
+    /// Effective selected sealed-segment request limit.
+    pub overview_max_selected_segments: usize,
 }
 
 impl std::fmt::Debug for WebConfig {
@@ -332,6 +349,10 @@ impl std::fmt::Debug for WebConfig {
             .field("overview_cursor_max_views", &self.overview_cursor_max_views)
             .field("overview_cursor_max_bytes", &self.overview_cursor_max_bytes)
             .field("overview_cursor_ttl", &self.overview_cursor_ttl)
+            .field(
+                "overview_max_selected_segments",
+                &self.overview_max_selected_segments,
+            )
             .finish()
     }
 }
@@ -397,6 +418,7 @@ impl WebConfig {
             overview_cursor_max_views: overview.cursor_max_views,
             overview_cursor_max_bytes: overview.cursor_max_bytes,
             overview_cursor_ttl: overview.cursor_ttl,
+            overview_max_selected_segments: overview.max_selected_segments,
         })
     }
 
@@ -431,6 +453,7 @@ impl WebConfig {
         let cursor_max_views = std::env::var(CURSOR_MAX_VIEWS_ENV).ok();
         let cursor_max_bytes = std::env::var(CURSOR_MAX_BYTES_ENV).ok();
         let cursor_ttl_secs = std::env::var(CURSOR_TTL_ENV).ok();
+        let max_selected_segments = std::env::var(MAX_SELECTED_SEGMENTS_ENV).ok();
 
         Self::parse_with_overview(
             &dir,
@@ -454,6 +477,7 @@ impl WebConfig {
                 cursor_max_views: cursor_max_views.as_deref(),
                 cursor_max_bytes: cursor_max_bytes.as_deref(),
                 cursor_ttl_secs: cursor_ttl_secs.as_deref(),
+                max_selected_segments: max_selected_segments.as_deref(),
             },
         )
     }
@@ -594,8 +618,43 @@ mod tests {
             cursor_max_views: defaults.cursor_max_views,
             cursor_max_bytes: defaults.cursor_max_bytes,
             cursor_ttl: defaults.cursor_ttl,
+            max_selected_segments: defaults.max_selected_segments,
         };
         assert_eq!(parsed, expected);
+        assert_eq!(
+            parsed.max_selected_segments, 1_024,
+            "the normal deployment default is below the absolute v1 ceiling"
+        );
+    }
+
+    #[test]
+    fn selected_segment_policy_accepts_the_documented_boundaries() {
+        for (raw, expected) in [("1", 1), ("1024", 1_024), ("4096", 4_096)] {
+            let parsed = parse_overview_config(
+                OverviewConfigRaw {
+                    max_selected_segments: Some(raw),
+                    ..OverviewConfigRaw::default()
+                },
+                PathBuf::from("/cache"),
+            )
+            .expect("documented selected-segment limit is valid");
+            assert_eq!(parsed.max_selected_segments, expected);
+        }
+    }
+
+    #[test]
+    fn selected_segment_policy_rejects_zero_ceiling_plus_one_and_platform_overflow() {
+        for raw in ["0", "4097", "340282366920938463463374607431768211455"] {
+            let error = parse_overview_config(
+                OverviewConfigRaw {
+                    max_selected_segments: Some(raw),
+                    ..OverviewConfigRaw::default()
+                },
+                PathBuf::from("/cache"),
+            )
+            .expect_err("invalid selected-segment limit must fail");
+            assert!(error.contains(MAX_SELECTED_SEGMENTS_ENV), "{error}");
+        }
     }
 
     #[test]
@@ -622,6 +681,7 @@ mod tests {
                 cursor_max_views: Some("16"),
                 cursor_max_bytes: Some("4194304"),
                 cursor_ttl_secs: Some("60"),
+                max_selected_segments: Some("4096"),
             },
         )
         .expect("custom overview policy is valid");
@@ -648,6 +708,7 @@ mod tests {
         assert_eq!(cfg.overview_cursor_max_views, 16);
         assert_eq!(cfg.overview_cursor_max_bytes, 4_194_304);
         assert_eq!(cfg.overview_cursor_ttl, Duration::from_mins(1));
+        assert_eq!(cfg.overview_max_selected_segments, 4_096);
     }
 
     #[test]

@@ -29,9 +29,10 @@ use pg_kronika_web::{
 };
 use tower_http::trace::TraceLayer;
 
-/// Process-wide allocator: mimalloc, chosen for the allocation-heavy
-/// snapshot-clone-per-request path. The `override` feature also routes C-side
-/// malloc (zstd in the parquet decode path) through mimalloc.
+/// Process-wide allocator for fact decoding and response materialization.
+///
+/// The `override` feature also routes C-side malloc, including zstd's
+/// allocations in the parquet decode path, through mimalloc.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -67,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     overview.cursor_max_views = cfg.overview_cursor_max_views;
     overview.cursor_max_bytes = cfg.overview_cursor_max_bytes;
     overview.cursor_ttl = cfg.overview_cursor_ttl;
+    overview.max_selected_segments = cfg.overview_max_selected_segments;
     let state =
         AppState::with_overview_config(snapshot, now_unix_secs(), cfg.stale_after, overview)?;
     let auth = cfg
@@ -82,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format_version = FORMAT_VERSION,
         store = %cfg.dir.display(),
         overview_cache = %cfg.overview_cache_dir.display(),
+        overview_max_selected_segments = cfg.overview_max_selected_segments,
         "pg_kronika-web starting"
     );
 

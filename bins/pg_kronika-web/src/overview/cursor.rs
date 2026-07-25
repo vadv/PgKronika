@@ -238,6 +238,15 @@ impl CursorRegistry {
         record_registry_metrics(&inner, expired, 0);
         drop(inner);
     }
+
+    #[cfg(test)]
+    pub(crate) fn pinned_views(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .views
+            .len()
+    }
 }
 
 fn capacity_unavailable() -> CursorError {

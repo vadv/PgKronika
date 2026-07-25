@@ -56,6 +56,10 @@ fn problem_example(code: ProblemCode) -> (ApiProblem, serde_json::Value) {
             ApiProblem::analytic_capacity_unavailable(),
             serde_json::json!({ "retry_after_seconds": 1 }),
         ),
+        ProblemCode::OverviewCapacityUnavailable => (
+            ApiProblem::overview_capacity_unavailable(),
+            serde_json::json!({ "retry_after_seconds": 1 }),
+        ),
         ProblemCode::StoreReadFailed => (ApiProblem::store_read_failed(), serde_json::json!({})),
         ProblemCode::InternalError => (ApiProblem::internal_error(), serde_json::json!({})),
     }
@@ -108,11 +112,46 @@ async fn every_problem_code_has_the_exact_body_and_headers() {
                 .headers
                 .get(header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),
-            (code == ProblemCode::AnalyticCapacityUnavailable)
-                .then(|| response.body["params"]["retry_after_seconds"].to_string())
-                .as_deref()
+            matches!(
+                code,
+                ProblemCode::AnalyticCapacityUnavailable | ProblemCode::OverviewCapacityUnavailable
+            )
+            .then(|| response.body["params"]["retry_after_seconds"].to_string())
+            .as_deref()
         );
     }
+}
+
+#[tokio::test]
+async fn selected_segment_shape_limit_is_400_without_changing_other_limit_statuses() {
+    let selected = capture_json(
+        ApiProblem::query_shape_limit_exceeded(LimitResource::SelectedSegments, 1_024, None)
+            .into_response(),
+    )
+    .await;
+    assert_problem(
+        &selected.body,
+        StatusCode::BAD_REQUEST,
+        "query_limit_exceeded",
+        serde_json::json!({
+            "resource": "selected_segments",
+            "limit": 1_024,
+        }),
+    );
+    assert_eq!(selected.media_type(), Some("application/problem+json"));
+    assert_eq!(
+        selected
+            .headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+
+    let existing = capture_json(
+        ApiProblem::query_limit_exceeded(LimitResource::Rows, 10, Some(11)).into_response(),
+    )
+    .await;
+    assert_eq!(existing.status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]
@@ -421,10 +460,30 @@ fn assert_problem_schema(document: &serde_json::Value) {
             branch["then"]["properties"]["type"]["const"],
             code.type_uri()
         );
-        assert_eq!(
-            branch["then"]["properties"]["status"]["const"],
-            u64::from(code.status().as_u16())
-        );
+        if code == ProblemCode::QueryLimitExceeded {
+            assert_eq!(
+                branch["then"]["properties"]["status"]["enum"],
+                serde_json::json!([400, 413])
+            );
+            let selected = &branch["then"]["allOf"][0];
+            assert_eq!(
+                selected["if"]["properties"]["params"]["properties"]["resource"]["const"],
+                "selected_segments"
+            );
+            assert_eq!(
+                selected["then"]["properties"]["status"]["const"],
+                StatusCode::BAD_REQUEST.as_u16()
+            );
+            assert_eq!(
+                selected["else"]["properties"]["status"]["const"],
+                StatusCode::PAYLOAD_TOO_LARGE.as_u16()
+            );
+        } else {
+            assert_eq!(
+                branch["then"]["properties"]["status"]["const"],
+                u64::from(code.status().as_u16())
+            );
+        }
         assert!(branch["then"]["properties"]["params"]["$ref"].is_string());
     }
     assert_eq!(branches.len(), ProblemCode::ALL.len());
@@ -437,7 +496,7 @@ fn assert_problem_schema(document: &serde_json::Value) {
     for (response, header_name) in [
         ("UnauthorizedProblem", "WWW-Authenticate"),
         ("MethodNotAllowedProblem", "Allow"),
-        ("AnalyticCapacityProblem", "Retry-After"),
+        ("TimelineCapacityProblem", "Retry-After"),
     ] {
         assert!(
             document["components"]["responses"][response]["headers"]
@@ -758,11 +817,24 @@ fn assert_timeline_endpoint_contract(document: &serde_json::Value) {
         paths["/v1/timeline/events"]["get"]["responses"]["503"]["$ref"],
         "#/components/responses/TimelineCapacityProblem"
     );
-    for path in ["/v1/timeline/overview", "/v1/timeline/health"] {
+    for path in [
+        "/v1/timeline/overview",
+        "/v1/timeline/events",
+        "/v1/timeline/health",
+    ] {
+        assert_eq!(
+            paths[path]["get"]["responses"]["400"]["$ref"],
+            "#/components/responses/TimelineRequestProblem"
+        );
         assert_eq!(
             paths[path]["get"]["responses"]["503"]["$ref"],
-            "#/components/responses/AnalyticCapacityProblem"
+            "#/components/responses/TimelineCapacityProblem"
         );
+        let description = paths[path]["get"]["description"]
+            .as_str()
+            .expect("timeline description");
+        assert!(description.contains("1024"));
+        assert!(description.contains("4096"));
     }
 }
 
@@ -868,7 +940,20 @@ fn assert_v1_media_and_locale_contract(document: &serde_json::Value) {
                 let expected = match status.as_str() {
                     "401" => "#/components/responses/UnauthorizedProblem",
                     "405" => "#/components/responses/MethodNotAllowedProblem",
-                    "503" if path == "/v1/timeline/events" => {
+                    "400"
+                        if matches!(
+                            path.as_str(),
+                            "/v1/timeline/overview" | "/v1/timeline/events" | "/v1/timeline/health"
+                        ) =>
+                    {
+                        "#/components/responses/TimelineRequestProblem"
+                    }
+                    "503"
+                        if matches!(
+                            path.as_str(),
+                            "/v1/timeline/overview" | "/v1/timeline/events" | "/v1/timeline/health"
+                        ) =>
+                    {
                         "#/components/responses/TimelineCapacityProblem"
                     }
                     "503" => "#/components/responses/AnalyticCapacityProblem",

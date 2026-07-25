@@ -1,9 +1,8 @@
 //! Single-writer assembly of immutable timeline index views.
 //!
-//! The writer retains admitted sealed facts and one `LiveBuilder`. Refresh work
-//! is proportional to semantic deltas: unchanged sealed files are not reopened,
-//! and only newly completed journal parts are folded. Requests receive immutable
-//! `IndexView` values and never perform PGM extraction.
+//! The writer retains exact sealed descriptors and one `LiveBuilder`. Refresh
+//! derives fact identities from catalog metadata, while selected request
+//! leaders load bodies through bounded shared work.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -11,13 +10,15 @@ use std::sync::Arc;
 
 use kronika_analytics::overview::{NamingContractId, SegmentLocator};
 use kronika_reader::{
-    FactLoad, FactOrigin, FactStore, FallbackConfig, GcConfig, GcMark, GcOutcome, LIMIT,
-    LiveBuilder, LiveConfigError, LiveFoldError, LiveView, LocalDirSnapshot, PersistError,
-    RefreshDelta, SealOutcome, SealedFactError, SealedLocator, SegmentContext, SegmentDescriptor,
-    reconcile_seal,
+    FactBuildKey, FactKey, FactStore, FallbackConfig, FileKind, GcConfig, GcMark, GcOutcome, LIMIT,
+    LiveBuilder, LiveConfigError, LiveFoldError, LocalDirSnapshot, RefreshDelta, SealedFactError,
+    SealedLocator, SegmentContext, SegmentDescriptor, SegmentFacts,
 };
 
-use super::view::{IndexView, SealedEntry};
+use super::admission::{ColdAdmissionConfig, ColdWorkWeight};
+use super::loader::OverviewFactLoader;
+use super::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
+use super::view::{DescriptorEntry, DescriptorView, PromotionCandidate};
 
 /// Deployment naming-contract identity for overview facts.
 ///
@@ -34,6 +35,15 @@ pub enum OverviewBuildError {
     Live(LiveFoldError),
     /// A completed active part could not be reopened from the pinned snapshot.
     ActiveRead(kronika_reader::ReadError),
+    /// The process-wide cold-work bounds are invalid.
+    ColdAdmission,
+    /// The selected-segment request policy is outside the v1 range.
+    SelectedSegmentLimit {
+        /// Rejected configured value.
+        configured: usize,
+        /// Absolute v1 ceiling.
+        maximum: usize,
+    },
     /// The single-writer mutex was poisoned by a previous panic.
     WriterPoisoned,
 }
@@ -44,6 +54,14 @@ impl std::fmt::Display for OverviewBuildError {
             Self::Config(error) => write!(f, "overview configuration: {error}"),
             Self::Live(error) => write!(f, "overview live fold: {error}"),
             Self::ActiveRead(error) => write!(f, "overview active read: {error}"),
+            Self::ColdAdmission => f.write_str("overview cold admission limits are invalid"),
+            Self::SelectedSegmentLimit {
+                configured,
+                maximum,
+            } => write!(
+                f,
+                "overview selected-segment limit {configured} must be in 1..={maximum}"
+            ),
             Self::WriterPoisoned => f.write_str("overview writer lock is poisoned"),
         }
     }
@@ -55,37 +73,7 @@ impl std::error::Error for OverviewBuildError {
             Self::Config(error) => Some(error),
             Self::Live(error) => Some(error),
             Self::ActiveRead(error) => Some(error),
-            Self::WriterPoisoned => None,
-        }
-    }
-}
-
-/// Cumulative single-writer load diagnostics.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct OverviewDiagnostics {
-    pub(crate) durable_hits: u64,
-    pub(crate) fallback_hits: u64,
-    pub(crate) rebuilt: u64,
-    pub(crate) promotions: u64,
-    pub(crate) persistence_failures: u64,
-    pub(crate) sealed_failures: u64,
-}
-
-impl OverviewDiagnostics {
-    const fn record_load(&mut self, load: &FactLoad) {
-        match load.origin() {
-            FactOrigin::CacheHit => self.durable_hits = self.durable_hits.saturating_add(1),
-            FactOrigin::FallbackHit => self.fallback_hits = self.fallback_hits.saturating_add(1),
-            FactOrigin::Rebuilt => self.rebuilt = self.rebuilt.saturating_add(1),
-        }
-        if load.persist_error().is_some() {
-            self.persistence_failures = self.persistence_failures.saturating_add(1);
-        }
-    }
-
-    const fn record_persist_error(&mut self, error: Option<PersistError>) {
-        if error.is_some() {
-            self.persistence_failures = self.persistence_failures.saturating_add(1);
+            Self::ColdAdmission | Self::SelectedSegmentLimit { .. } | Self::WriterPoisoned => None,
         }
     }
 }
@@ -101,10 +89,9 @@ const GC_INTERVAL_PASSES: u64 = 60;
 pub(crate) struct OverviewWriter {
     store: FactStore,
     namespace: Vec<u8>,
-    sealed: BTreeMap<SealedLocator, SealedEntry>,
-    unavailable: BTreeSet<SealedLocator>,
+    sealed: BTreeMap<SealedLocator, DescriptorEntry>,
+    unavailable: BTreeMap<SealedLocator, SegmentDescriptor>,
     live: LiveBuilder,
-    diagnostics: OverviewDiagnostics,
     passes_since_gc: u64,
     view_generation: u64,
 }
@@ -133,9 +120,8 @@ impl OverviewWriter {
             store: FactStore::with_configs(cache_root, fallback, gc),
             namespace,
             sealed: BTreeMap::new(),
-            unavailable: BTreeSet::new(),
+            unavailable: BTreeMap::new(),
             live,
-            diagnostics: OverviewDiagnostics::default(),
             passes_since_gc: 0,
             view_generation: 0,
         })
@@ -149,6 +135,14 @@ impl OverviewWriter {
     /// Runs the single due recovery probe independently of fact construction.
     pub(crate) fn probe_persistence(&self) -> kronika_reader::PersistenceProbeOutcome {
         super::resilience::run_due_probe(&self.store)
+    }
+
+    pub(crate) fn fact_loader(
+        &self,
+        config: ColdAdmissionConfig,
+    ) -> Result<OverviewFactLoader, OverviewBuildError> {
+        OverviewFactLoader::new(self.store.clone(), self.namespace.clone(), config)
+            .map_err(|_error| OverviewBuildError::ColdAdmission)
     }
 
     /// Requests a bounded GC scan at most once per [`GC_INTERVAL_PASSES`]
@@ -166,7 +160,7 @@ impl OverviewWriter {
         let mark = if self.unavailable.is_empty() {
             GcMark::authoritative(
                 self.view_generation,
-                self.sealed.values().map(SealedEntry::fact_build_key),
+                self.sealed.values().map(DescriptorEntry::fact_build_key),
             )
         } else {
             GcMark::unavailable(self.view_generation)
@@ -183,17 +177,11 @@ impl OverviewWriter {
         &mut self,
         snapshot: &LocalDirSnapshot,
         delta: &RefreshDelta,
-    ) -> Result<IndexView, OverviewBuildError> {
+    ) -> Result<DescriptorView, OverviewBuildError> {
+        let prior_live = Arc::new(self.live.publish());
         let mut sealed = self.sealed.clone();
         let mut unavailable = self.unavailable.clone();
-        let mut diagnostics = self.diagnostics;
-        self.refresh_sealed(
-            snapshot,
-            delta,
-            &mut sealed,
-            &mut unavailable,
-            &mut diagnostics,
-        );
+        self.refresh_sealed(snapshot, &mut sealed, &mut unavailable);
 
         let mut live = self.live.clone();
         if let Err(first_error) = fold_refresh(&mut live, snapshot, delta) {
@@ -207,9 +195,16 @@ impl OverviewWriter {
         self.sealed = sealed;
         self.unavailable = unavailable;
         self.live = live;
-        self.diagnostics = diagnostics;
         self.view_generation = snapshot.view_generation();
-        Ok(self.current_view(self.view_generation))
+        let promotion_locators = delta
+            .sealed_added
+            .iter()
+            .map(|descriptor| descriptor.locator)
+            .filter(|locator| self.sealed.contains_key(locator))
+            .take(ABSOLUTE_MAX_SELECTED_SEGMENTS)
+            .collect::<BTreeSet<_>>();
+        let promotion = PromotionCandidate::new(prior_live, promotion_locators);
+        Ok(self.current_view(self.view_generation, promotion))
     }
 
     /// Seeds an empty writer from a snapshot bootstrap delta.
@@ -217,17 +212,15 @@ impl OverviewWriter {
         &mut self,
         snapshot: &LocalDirSnapshot,
         delta: &RefreshDelta,
-    ) -> Result<IndexView, OverviewBuildError> {
+    ) -> Result<DescriptorView, OverviewBuildError> {
         self.assemble_with_live(snapshot, delta)
     }
 
     fn refresh_sealed(
         &self,
         snapshot: &LocalDirSnapshot,
-        delta: &RefreshDelta,
-        sealed: &mut BTreeMap<SealedLocator, SealedEntry>,
-        unavailable: &mut BTreeSet<SealedLocator>,
-        diagnostics: &mut OverviewDiagnostics,
+        sealed: &mut BTreeMap<SealedLocator, DescriptorEntry>,
+        unavailable: &mut BTreeMap<SealedLocator, SegmentDescriptor>,
     ) {
         let baseline = snapshot
             .sealed_descriptors()
@@ -239,76 +232,41 @@ impl OverviewWriter {
                 .get(locator)
                 .is_some_and(|descriptor| descriptor == entry.descriptor())
         });
-        unavailable.retain(|locator| baseline.contains_key(locator));
-
-        let prior_live = self.live.publish();
-        let added = delta
-            .sealed_added
-            .iter()
-            .map(|descriptor| descriptor.locator)
-            .collect::<BTreeSet<_>>();
+        unavailable.retain(|locator, descriptor| baseline.get(locator) == Some(descriptor));
         for descriptor in baseline.values() {
             if sealed.contains_key(&descriptor.locator) {
                 unavailable.remove(&descriptor.locator);
                 continue;
             }
-            let result = if added.contains(&descriptor.locator) {
-                self.reconcile_added(snapshot, descriptor, &prior_live, diagnostics)
-            } else {
-                self.load_sealed(snapshot, descriptor, diagnostics)
-            };
-            match result {
+            match self.describe_sealed(snapshot, descriptor) {
                 Ok(entry) => {
                     sealed.insert(descriptor.locator, entry);
                     unavailable.remove(&descriptor.locator);
                 }
                 Err(_error) => {
-                    diagnostics.sealed_failures = diagnostics.sealed_failures.saturating_add(1);
-                    unavailable.insert(descriptor.locator);
+                    metrics::counter!("kronika_web_overview_sealed_failures_total").increment(1);
+                    unavailable.insert(descriptor.locator, *descriptor);
                 }
             }
         }
     }
 
-    fn load_sealed(
+    fn describe_sealed(
         &self,
         snapshot: &LocalDirSnapshot,
         descriptor: &SegmentDescriptor,
-        diagnostics: &mut OverviewDiagnostics,
-    ) -> Result<SealedEntry, SealedFactError> {
-        let context = self.context(descriptor)?;
-        let load =
-            snapshot.load_sealed_facts_by_descriptor(descriptor, &self.store, &context, &LIMIT)?;
-        diagnostics.record_load(&load);
-        Ok(SealedEntry::new(*descriptor, load.into_shared_facts()))
-    }
-
-    fn reconcile_added(
-        &self,
-        snapshot: &LocalDirSnapshot,
-        descriptor: &SegmentDescriptor,
-        prior_live: &LiveView,
-        diagnostics: &mut OverviewDiagnostics,
-    ) -> Result<SealedEntry, SealedFactError> {
+    ) -> Result<DescriptorEntry, SealedFactError> {
         let context = self.context(descriptor)?;
         let unit = snapshot.open_sealed_by_descriptor(descriptor)?;
-        let outcome = reconcile_seal(prior_live, &unit, &context, &self.store, &LIMIT)
-            .map_err(SealedFactError::Build)?;
-        let facts = match outcome {
-            SealOutcome::Promoted {
-                facts,
-                persist_error,
-            } => {
-                diagnostics.promotions = diagnostics.promotions.saturating_add(1);
-                diagnostics.record_persist_error(persist_error);
-                facts
-            }
-            SealOutcome::Rebuilt(load) => {
-                diagnostics.record_load(&load);
-                load.into_shared_facts()
-            }
-        };
-        Ok(SealedEntry::new(*descriptor, facts))
+        let (identity, lineage) =
+            SegmentFacts::provenance(&unit, &context).map_err(SealedFactError::Build)?;
+        let fact_key = FactKey::for_identity(&identity, FileKind::SegmentFacts);
+        Ok(DescriptorEntry::new(
+            *descriptor,
+            FactBuildKey::new(fact_key, lineage.id()),
+            ColdWorkWeight::for_unit(&unit),
+            identity.source_scope_id,
+        ))
     }
 
     fn context(&self, descriptor: &SegmentDescriptor) -> Result<SegmentContext, SealedFactError> {
@@ -322,22 +280,18 @@ impl OverviewWriter {
         })
     }
 
-    fn current_view(&self, view_generation: u64) -> IndexView {
-        let mut sealed = self.sealed.values().cloned().collect::<Vec<_>>();
-        sealed.sort_by_key(|entry| {
-            let descriptor = entry.descriptor();
-            (descriptor.min_ts, descriptor.locator)
-        });
-        IndexView::new(
+    fn current_view(
+        &self,
+        view_generation: u64,
+        promotion: Option<PromotionCandidate>,
+    ) -> DescriptorView {
+        DescriptorView::new(
             view_generation,
-            sealed,
+            self.sealed.values().cloned().collect(),
+            self.unavailable.values().copied().collect(),
             Arc::new(self.live.publish()),
-            !self.unavailable.is_empty(),
+            promotion,
         )
-    }
-
-    pub(crate) const fn diagnostics(&self) -> OverviewDiagnostics {
-        self.diagnostics
     }
 }
 
@@ -383,7 +337,8 @@ mod tests {
     use kronika_registry::pg_log::PgLogLifecycleV1;
     use kronika_registry::{Section, Ts};
 
-    use crate::overview::view::SourceStatus;
+    use crate::overview::selection::SelectedSealedPlan;
+    use crate::overview::view::{IndexView, SourceStatus};
 
     const QUERY_LIMITS: OracleLimits = OracleLimits {
         max_observations: 32,
@@ -461,8 +416,30 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn an_empty_store_assembles_an_empty_current_view() {
+    async fn load_selected(
+        writer: &OverviewIndex,
+        snapshot: &LocalDirSnapshot,
+        descriptors: DescriptorView,
+        sources: &[u64],
+        range: CoverageSpan,
+    ) -> Arc<IndexView> {
+        let plan = SelectedSealedPlan::build(
+            Arc::new(descriptors),
+            sources,
+            range,
+            ABSOLUTE_MAX_SELECTED_SEGMENTS,
+        )
+        .expect("selected plan");
+        writer
+            .fact_loader(ColdAdmissionConfig::default())
+            .expect("fact loader")
+            .load_selected(Arc::new(snapshot.clone()), &plan)
+            .await
+            .expect("loaded selected view")
+    }
+
+    #[tokio::test]
+    async fn an_empty_store_assembles_an_empty_current_view() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = tempfile::tempdir().expect("cache dir");
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
@@ -475,13 +452,21 @@ mod tests {
             FallbackConfig::default(),
         )
         .expect("writer");
-        let view = index.assemble(&snapshot, &delta).expect("view");
+        let descriptors = index.assemble(&snapshot, &delta).expect("view");
+        let view = load_selected(
+            &index,
+            &snapshot,
+            descriptors,
+            &[7],
+            CoverageSpan::new(0, 1).expect("range"),
+        )
+        .await;
         assert!(view.coverage_envelope().is_empty());
         assert_eq!(view.source_status(), SourceStatus::CompleteForContract);
     }
 
-    #[test]
-    fn a_sealed_segment_is_bound_into_the_view() {
+    #[tokio::test]
+    async fn a_sealed_segment_is_loaded_only_after_its_plan_is_admitted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = tempfile::tempdir().expect("cache dir");
         write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
@@ -495,11 +480,25 @@ mod tests {
             FallbackConfig::default(),
         )
         .expect("writer");
-        let view = index.assemble(&snapshot, &delta).expect("view");
+        let descriptors = index.assemble(&snapshot, &delta).expect("view");
+        assert_eq!(
+            ovf_files(cache.path()),
+            0,
+            "descriptor publication does not build a fact file"
+        );
+        let view = load_selected(
+            &index,
+            &snapshot,
+            descriptors,
+            &[7],
+            CoverageSpan::new(0, 10_000).expect("range"),
+        )
+        .await;
         assert!(
             !view.coverage_envelope().is_empty(),
-            "the sealed segment binds coverage into the view"
+            "the admitted sealed segment binds coverage into the query view"
         );
+        assert_eq!(ovf_files(cache.path()), 1);
     }
 
     fn ovf_files(cache_root: &std::path::Path) -> usize {
@@ -521,8 +520,8 @@ mod tests {
         count
     }
 
-    #[test]
-    fn gc_reclaims_the_fact_file_of_a_dropped_segment() {
+    #[tokio::test]
+    async fn gc_reclaims_the_fact_file_of_a_dropped_segment() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = tempfile::tempdir().expect("cache dir");
         write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
@@ -538,7 +537,17 @@ mod tests {
                 .expect("test GC policy"),
         )
         .expect("writer");
-        index.assemble(&snapshot, &delta).expect("view");
+        let descriptors = index.assemble(&snapshot, &delta).expect("view");
+        drop(
+            load_selected(
+                &index,
+                &snapshot,
+                descriptors,
+                &[7],
+                CoverageSpan::new(0, 10_000).expect("range"),
+            )
+            .await,
+        );
         assert_eq!(
             ovf_files(cache.path()),
             1,
@@ -578,9 +587,19 @@ mod tests {
         let next_delta = snapshot
             .refresh_incremental_delta()
             .expect("advance source view with a distinct retained set");
-        index
+        let next_view = index
             .assemble_with_live(&snapshot, &next_delta)
             .expect("next successful view");
+        drop(
+            load_selected(
+                &index,
+                &snapshot,
+                next_view,
+                &[7],
+                CoverageSpan::new(0, 10_000).expect("range"),
+            )
+            .await,
+        );
         let mut second_absence = None;
         for _ in 0..GC_INTERVAL_PASSES {
             second_absence = index.collect_fact_garbage().or(second_absence);
@@ -619,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn repeat_assembly_is_deterministic_in_identity() {
+    fn repeat_assembly_is_deterministic_in_plan_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = tempfile::tempdir().expect("cache dir");
         write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
@@ -640,11 +659,18 @@ mod tests {
         let second = index
             .assemble_with_live(&snapshot, &second_delta)
             .expect("second view");
-        assert_eq!(
-            first.fact_set_id(),
-            second.fact_set_id(),
-            "an unchanged snapshot assembles an identical fact-set id"
-        );
+        let range = CoverageSpan::new(0, 10_000).expect("range");
+        let first =
+            SelectedSealedPlan::build(Arc::new(first), &[7], range, ABSOLUTE_MAX_SELECTED_SEGMENTS)
+                .expect("first plan");
+        let second = SelectedSealedPlan::build(
+            Arc::new(second),
+            &[7],
+            range,
+            ABSOLUTE_MAX_SELECTED_SEGMENTS,
+        )
+        .expect("second plan");
+        assert_eq!(first.fact_set_id(), second.fact_set_id());
     }
 
     #[test]
@@ -672,8 +698,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn append_then_seal_keeps_one_coherent_event_set() {
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test verifies one append-to-seal transition across three publications"
+    )]
+    async fn append_then_seal_keeps_one_coherent_event_set() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = tempfile::tempdir().expect("cache dir");
         let first = lifecycle_row(1_500, 41);
@@ -692,10 +722,11 @@ mod tests {
             FallbackConfig::default(),
         )
         .expect("writer");
-        let first_view = writer
+        let first_descriptors = writer
             .assemble(&snapshot, &bootstrap)
             .expect("first live view");
         let range = CoverageSpan::new(0, 10_000).expect("range");
+        let first_view = load_selected(&writer, &snapshot, first_descriptors, &[7], range).await;
         assert_eq!(
             first_view
                 .query(range, QUERY_LIMITS)
@@ -714,9 +745,10 @@ mod tests {
             .expect("append second frame");
         let appended = snapshot.refresh_incremental_delta().expect("append delta");
         assert_eq!(appended.journal.completed_parts.len(), 1);
-        let second_view = writer
+        let second_descriptors = writer
             .assemble_with_live(&snapshot, &appended)
             .expect("appended live view");
+        let second_view = load_selected(&writer, &snapshot, second_descriptors, &[7], range).await;
         assert_eq!(
             second_view
                 .query(range, QUERY_LIMITS)
@@ -753,9 +785,16 @@ mod tests {
         std::fs::write(dir.path().join("active.parts"), []).expect("reset journal");
         let sealed_delta = snapshot.refresh_incremental_delta().expect("seal delta");
         assert_eq!(sealed_delta.sealed_added.len(), 1);
-        let sealed_view = writer
+        let sealed_descriptors = writer
             .assemble_with_live(&snapshot, &sealed_delta)
             .expect("sealed view");
+        assert!(
+            sealed_descriptors
+                .promotion_for(sealed_delta.sealed_added[0].locator)
+                .is_some(),
+            "the seal publication retains one bounded prior-live candidate"
+        );
+        let sealed_view = load_selected(&writer, &snapshot, sealed_descriptors, &[7], range).await;
         assert_eq!(
             sealed_view
                 .query(range, QUERY_LIMITS)
@@ -765,6 +804,10 @@ mod tests {
             2,
             "seal reconciliation neither drops nor duplicates live observations"
         );
-        assert_eq!(writer.diagnostics().promotions, 1);
+        assert_eq!(
+            ovf_files(cache.path()),
+            1,
+            "the reconciled sealed facts are durably published"
+        );
     }
 }

@@ -37,6 +37,7 @@ closed_string_enum! {
         QueryLimitExceeded => "query_limit_exceeded",
         CursorCapacityUnavailable => "cursor_capacity_unavailable",
         AnalyticCapacityUnavailable => "analytic_capacity_unavailable",
+        OverviewCapacityUnavailable => "overview_capacity_unavailable",
         StoreReadFailed => "store_read_failed",
         InternalError => "internal_error",
     }
@@ -57,9 +58,9 @@ impl ProblemCode {
             | Self::CursorQueryMismatch => StatusCode::BAD_REQUEST,
             Self::CursorExpired | Self::ViewGone => StatusCode::GONE,
             Self::QueryLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::CursorCapacityUnavailable | Self::AnalyticCapacityUnavailable => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::CursorCapacityUnavailable
+            | Self::AnalyticCapacityUnavailable
+            | Self::OverviewCapacityUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::StoreReadFailed | Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -89,6 +90,9 @@ impl ProblemCode {
             }
             Self::AnalyticCapacityUnavailable => {
                 "https://pgkronika.dev/problems/analytic-capacity-unavailable"
+            }
+            Self::OverviewCapacityUnavailable => {
+                "https://pgkronika.dev/problems/overview-capacity-unavailable"
             }
             Self::StoreReadFailed => "https://pgkronika.dev/problems/store-read-failed",
             Self::InternalError => "https://pgkronika.dev/problems/internal-error",
@@ -413,6 +417,16 @@ impl ApiProblem {
         )
     }
 
+    pub(crate) fn query_shape_limit_exceeded(
+        resource: LimitResource,
+        limit: u64,
+        observed: Option<u64>,
+    ) -> Self {
+        let mut problem = Self::query_limit_exceeded(resource, limit, observed);
+        problem.status = StatusCode::BAD_REQUEST.as_u16();
+        problem
+    }
+
     pub(crate) fn cursor_capacity_unavailable() -> Self {
         Self::empty(ProblemCode::CursorCapacityUnavailable)
     }
@@ -420,6 +434,15 @@ impl ApiProblem {
     pub(crate) fn analytic_capacity_unavailable() -> Self {
         Self::new(
             ProblemCode::AnalyticCapacityUnavailable,
+            ProblemParams::Capacity(CapacityParams {
+                retry_after_seconds: RETRY_AFTER_SECONDS,
+            }),
+        )
+    }
+
+    pub(crate) fn overview_capacity_unavailable() -> Self {
+        Self::new(
+            ProblemCode::OverviewCapacityUnavailable,
             ProblemParams::Capacity(CapacityParams {
                 retry_after_seconds: RETRY_AFTER_SECONDS,
             }),
@@ -450,7 +473,7 @@ impl ApiProblem {
 
 impl IntoResponse for ApiProblem {
     fn into_response(mut self) -> Response {
-        let status = self.code.status();
+        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let code = self.code;
         let request_id = match HeaderValue::from_str(&self.request_id) {
             Ok(value) => value,
@@ -503,7 +526,7 @@ impl IntoResponse for ApiProblem {
                     headers.insert(header::ALLOW, HeaderValue::from_static(allow));
                 }
             }
-            ProblemCode::AnalyticCapacityUnavailable => {
+            ProblemCode::AnalyticCapacityUnavailable | ProblemCode::OverviewCapacityUnavailable => {
                 headers.insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS));
             }
             _ => {}
