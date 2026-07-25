@@ -26,8 +26,8 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use kronika_format::crc32c;
 use kronika_reader::{
-    FactFile, LIMIT, PgmUnit, SegmentFacts, QUALIFICATION_PUBLISH_BARRIER_ENV,
-    QUALIFICATION_PUBLISH_BARRIER_READY, QUALIFICATION_PUBLISH_BARRIER_RELEASE,
+    FactFile, LIMIT, PgmUnit, QUALIFICATION_PUBLISH_BARRIER_ENV,
+    QUALIFICATION_PUBLISH_BARRIER_READY, QUALIFICATION_PUBLISH_BARRIER_RELEASE, SegmentFacts,
 };
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -613,10 +613,7 @@ impl SidecarMismatch {
 
 /// Produce a physically framed candidate whose named identity class cannot be
 /// admitted for the current PGM.
-pub(crate) fn mismatched_sidecar(
-    canonical: &[u8],
-    mismatch: SidecarMismatch,
-) -> Result<Vec<u8>> {
+pub(crate) fn mismatched_sidecar(canonical: &[u8], mismatch: SidecarMismatch) -> Result<Vec<u8>> {
     ensure!(
         canonical.len() >= OVF_HEADER_LEN,
         "canonical sidecar has no complete header"
@@ -688,12 +685,8 @@ pub(crate) fn metric(
     }
     match matches.as_slice() {
         [value] => Ok(*value),
-        [] => bail!(
-            "metric {name} with labels {required_labels:?} is absent:\n{exposition}"
-        ),
-        _ => bail!(
-            "metric {name} with labels {required_labels:?} is ambiguous: {matches:?}"
-        ),
+        [] => bail!("metric {name} with labels {required_labels:?} is absent:\n{exposition}"),
+        _ => bail!("metric {name} with labels {required_labels:?} is ambiguous: {matches:?}"),
     }
 }
 

@@ -266,8 +266,7 @@ async fn timeline_meta_publishes_the_exact_incomplete_active_tail() {
     std::fs::write(dir.path().join("active.parts"), journal).expect("write active journal");
 
     let state = state_for_dir(dir.path());
-    let (status, body) =
-        serve_state(state, "/v1/timeline/events?source=7&from=0&to=100").await;
+    let (status, body) = serve_state(state, "/v1/timeline/events?source=7&from=0&to=100").await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -506,6 +505,10 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one endpoint-parity test keeps the complete bounded factor-family response contract together"
+)]
 async fn all_supported_factor_families_reach_every_timeline_endpoint() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
@@ -518,8 +521,11 @@ async fn all_supported_factor_families_reach_every_timeline_endpoint() {
 
     let (overview_status, overview) =
         serve_state(state.clone(), &format!("/v1/timeline/overview?{query}")).await;
-    let (events_status, events) =
-        serve_state(state.clone(), &format!("/v1/timeline/events?{query}&limit=1000")).await;
+    let (events_status, events) = serve_state(
+        state.clone(),
+        &format!("/v1/timeline/events?{query}&limit=1000"),
+    )
+    .await;
     let (health_status, health) =
         serve_state(state, &format!("/v1/timeline/health?{query}&step=10")).await;
     assert_eq!(overview_status, StatusCode::OK, "{overview}");
@@ -606,9 +612,9 @@ async fn all_supported_factor_families_reach_every_timeline_endpoint() {
     let points = health["points"].as_array().expect("health points");
     assert!(!points.is_empty());
     assert!(
-        points.windows(2).all(|pair| {
-            pair[0]["interval"]["to_us"] == pair[1]["interval"]["from_us"]
-        }),
+        points
+            .windows(2)
+            .all(|pair| { pair[0]["interval"]["to_us"] == pair[1]["interval"]["from_us"] }),
         "health buckets must form a non-interpolated half-open partition"
     );
 }

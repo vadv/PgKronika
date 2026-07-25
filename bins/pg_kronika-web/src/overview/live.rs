@@ -242,8 +242,8 @@ impl OverviewWriter {
             Err(first_error) => {
                 let mut rebuilt = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
                 let baseline = full_live_baseline(delta);
-                let stats =
-                    fold_refresh(&mut rebuilt, snapshot, &baseline).map_err(|_error| first_error)?;
+                let stats = fold_refresh(&mut rebuilt, snapshot, &baseline)
+                    .map_err(|_error| first_error)?;
                 live = rebuilt;
                 stats
             }
@@ -484,9 +484,7 @@ fn fold_refresh(
         let reads = unit.body_read_stats();
         stats.completed_parts = stats.completed_parts.saturating_add(1);
         stats.pgm_body_reads = stats.pgm_body_reads.saturating_add(reads.read_calls);
-        stats.pgm_body_bytes = stats
-            .pgm_body_bytes
-            .saturating_add(reads.stored_bytes_read);
+        stats.pgm_body_bytes = stats.pgm_body_bytes.saturating_add(reads.stored_bytes_read);
     }
     builder
         .complete_refresh()
@@ -909,10 +907,7 @@ mod tests {
         let range = CoverageSpan::new(0, 10_000).expect("range");
         let first_view = load_selected(&writer, &snapshot, first_descriptors, &[7], range).await;
         let first_result = first_view.query(range, QUERY_LIMITS).expect("first query");
-        assert_eq!(
-            first_result.observations().len(),
-            1
-        );
+        assert_eq!(first_result.observations().len(), 1);
         let first_public_ids = first_result
             .observations()
             .iter()
@@ -932,11 +927,10 @@ mod tests {
             .assemble_with_live(&snapshot, &appended)
             .expect("appended live view");
         let second_view = load_selected(&writer, &snapshot, second_descriptors, &[7], range).await;
-        let second_result = second_view.query(range, QUERY_LIMITS).expect("second query");
-        assert_eq!(
-            second_result.observations().len(),
-            2
-        );
+        let second_result = second_view
+            .query(range, QUERY_LIMITS)
+            .expect("second query");
+        assert_eq!(second_result.observations().len(), 2);
         let second_public_ids = second_result
             .observations()
             .iter()
@@ -990,7 +984,9 @@ mod tests {
             "the seal publication retains one bounded prior-live candidate"
         );
         let sealed_view = load_selected(&writer, &snapshot, sealed_descriptors, &[7], range).await;
-        let sealed_result = sealed_view.query(range, QUERY_LIMITS).expect("sealed query");
+        let sealed_result = sealed_view
+            .query(range, QUERY_LIMITS)
+            .expect("sealed query");
         assert_eq!(
             sealed_result.observations().len(),
             2,

@@ -28,8 +28,7 @@ use crate::overview::dto::{
     CoverageSpanDto, EventDigestDto, EventFact, EventFactPosition, EventFactProjection,
     EventsResponseDto, JointCountDto, LifecycleDigestDto, NotablePreviewDto, OverviewResponseDto,
     SignalCountDto, SourceFreshnessDto, SourceLossDto, SqlstateCountDto, TailPendingDto,
-    TimelineMetaDto,
-    category_name, severity_name, sqlstate_text,
+    TimelineMetaDto, category_name, severity_name, sqlstate_text,
 };
 use crate::overview::loader::FactLoadFailure;
 use crate::overview::selection::{SelectedSealedPlan, SelectionError};

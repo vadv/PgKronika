@@ -51,8 +51,7 @@ pub const QUALIFICATION_PUBLISH_BARRIER_ENV: &str =
 /// Qualification-only publication fault consumed by the first sidecar write.
 #[cfg(feature = "qualification")]
 #[doc(hidden)]
-pub const QUALIFICATION_PUBLISH_FAULT_ENV: &str =
-    "KRONIKA_WEB_QUALIFICATION_PUBLISH_FAULT";
+pub const QUALIFICATION_PUBLISH_FAULT_ENV: &str = "KRONIKA_WEB_QUALIFICATION_PUBLISH_FAULT";
 
 /// Barrier message sent after a fully synced temporary sidecar is ready.
 #[cfg(feature = "qualification")]
@@ -90,10 +89,7 @@ impl QualificationPublishBarrier {
         if !self.armed.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        let socket = self
-            .socket
-            .as_deref()
-            .ok_or(PersistError::TransientIo)?;
+        let socket = self.socket.as_deref().ok_or(PersistError::TransientIo)?;
         let mut stream = UnixStream::connect(socket).map_err(PersistError::from_io)?;
         writeln!(
             stream,
@@ -1518,10 +1514,7 @@ mod tests {
             .expect("rebuild target below the configured bound");
 
         assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
-        assert_eq!(
-            loaded.rebuild_reason(),
-            Some(CacheRebuildReason::Oversized)
-        );
+        assert_eq!(loaded.rebuild_reason(), Some(CacheRebuildReason::Oversized));
         assert_eq!(loaded.persist_error(), None);
         assert_eq!(loaded.facts(), &target_facts);
         assert!(
@@ -1535,8 +1528,7 @@ mod tests {
             .read(&unit(&target_bytes), &context(), &tight)
             .expect("replacement is restart-admissible");
         assert_eq!(
-            std::fs::read(directory.path().join(context().pgm_file_name()))
-                .expect("reread source"),
+            std::fs::read(directory.path().join(context().pgm_file_name())).expect("reread source"),
             source_before,
             "rebuild must not alter the source PGM"
         );

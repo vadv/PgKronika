@@ -3293,9 +3293,18 @@ mod tests {
         for descriptor in descriptors {
             let factor = MetricFactor::from_id(descriptor.factor_id).expect("known factor");
             assert_eq!(descriptor.source_id, fixture.source_id);
-            assert!(descriptor.entity.is_some(), "{} has no entity", factor.wire_code());
+            assert!(
+                descriptor.entity.is_some(),
+                "{} has no entity",
+                factor.wire_code()
+            );
             let (unit, reset_family) = qualification_metric_contract(factor);
-            assert_eq!(descriptor.unit, unit, "wrong unit for {}", factor.wire_code());
+            assert_eq!(
+                descriptor.unit,
+                unit,
+                "wrong unit for {}",
+                factor.wire_code()
+            );
             assert_eq!(
                 descriptor.reset_family,
                 reset_family,
@@ -3325,9 +3334,7 @@ mod tests {
         );
     }
 
-    fn qualification_metric_contract(
-        factor: MetricFactor,
-    ) -> (MetricUnit, Option<ResetFamily>) {
+    fn qualification_metric_contract(factor: MetricFactor) -> (MetricUnit, Option<ResetFamily>) {
         match factor {
             MetricFactor::PgDatabaseDeadlocks
             | MetricFactor::PgDatabaseRecoveryConflicts
@@ -3340,12 +3347,8 @@ mod tests {
             MetricFactor::OsCgroupMemoryHighEvents
             | MetricFactor::OsCgroupMemoryMaxEvents
             | MetricFactor::OsCgroupOomEvents
-            | MetricFactor::OsCgroupOomKills => {
-                (MetricUnit::Count, Some(ResetFamily::CgroupBoot))
-            }
-            MetricFactor::OsHostOomKills => {
-                (MetricUnit::Count, Some(ResetFamily::HostBoot))
-            }
+            | MetricFactor::OsCgroupOomKills => (MetricUnit::Count, Some(ResetFamily::CgroupBoot)),
+            MetricFactor::OsHostOomKills => (MetricUnit::Count, Some(ResetFamily::HostBoot)),
             MetricFactor::PgStatisticsResetAt
             | MetricFactor::PgPostmasterStartTime
             | MetricFactor::PgReplicationReplayLag => (MetricUnit::Microseconds, None),
@@ -3359,9 +3362,7 @@ mod tests {
             | MetricFactor::PgReplicationSenderState
             | MetricFactor::PgReplicationSlotState
             | MetricFactor::PgReplicationSenderSnapshotPopulation
-            | MetricFactor::PgReplicationSlotSnapshotPopulation => {
-                (MetricUnit::StateCode, None)
-            }
+            | MetricFactor::PgReplicationSlotSnapshotPopulation => (MetricUnit::StateCode, None),
             MetricFactor::PgFilesystemTotalBytes
             | MetricFactor::PgFilesystemAvailableBytes
             | MetricFactor::OsCgroupMemoryCurrentBytes

@@ -83,7 +83,7 @@ def rust_evidence(binary: str, path: str, name: str) -> tuple[str, str, str, str
 def mode_evidence(name: str) -> tuple[str, str, str, str]:
     return (
         "mode",
-        "pg-kronika-web::example/overview_qualification",
+        "pg-kronika-web::example/overview_m6_qualification",
         "qualification",
         name,
     )
@@ -439,7 +439,7 @@ EXPECTED_EVIDENCE = (
     (
         (
             "mode_set",
-            "pg-kronika-web::example/overview_qualification",
+            "pg-kronika-web::example/overview_m6_qualification",
             "qualification",
             "all-nine-modes",
         ),
@@ -1484,7 +1484,7 @@ def validate_acceptance(
             elif kind == "mode":
                 check(
                     path == "qualification"
-                    and binary == "pg-kronika-web::example/overview_qualification"
+                    and binary == "pg-kronika-web::example/overview_m6_qualification"
                     and name in MODES,
                     f"acceptance row {index} has invalid mode evidence",
                     failures,
@@ -1494,7 +1494,7 @@ def validate_acceptance(
                 check(
                     index == 18
                     and path == "qualification"
-                    and binary == "pg-kronika-web::example/overview_qualification"
+                    and binary == "pg-kronika-web::example/overview_m6_qualification"
                     and name == "all-nine-modes",
                     f"acceptance row {index} has invalid mode-set evidence",
                     failures,

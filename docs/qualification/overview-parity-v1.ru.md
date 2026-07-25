@@ -102,7 +102,7 @@ overview, events, health, cursor и Prometheus выполняются по на�
 
 ```bash
 cargo run --release --manifest-path bins/pg_kronika-web/Cargo.toml \
-  --example overview_qualification --features qualification -- \
+  --example overview_m6_qualification --features qualification -- \
   --output target/qualification/overview.raw.json
 python3 scripts/validate-overview-qualification.py \
   target/qualification/overview.raw.json

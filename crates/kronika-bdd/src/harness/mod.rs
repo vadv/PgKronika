@@ -327,10 +327,7 @@ impl HarnessState {
             .context("no snapshot taken; run `When the collector snapshots the segment` first")
     }
 
-    pub(crate) fn set_web_lifecycle_baseline(
-        &mut self,
-        baseline: web_lifecycle::TimelineBaseline,
-    ) {
+    pub(crate) fn set_web_lifecycle_baseline(&mut self, baseline: web_lifecycle::TimelineBaseline) {
         self.web_lifecycle_baseline = Some(baseline);
     }
 

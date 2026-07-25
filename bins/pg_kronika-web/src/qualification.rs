@@ -32,10 +32,8 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt as _;
 
-use crate::overview::loader::{
-    LoaderIoSnapshot, LoaderQualificationSnapshot,
-};
 use crate::overview::live::LiveFoldStats;
+use crate::overview::loader::{LoaderIoSnapshot, LoaderQualificationSnapshot};
 use crate::{AppState, OverviewConfig, app};
 
 const ARTIFACT_SCHEMA: &str = "pgkronika-overview-qualification-v2";
@@ -85,6 +83,10 @@ const MODES: [&str; 9] = [
 ];
 
 /// Runs the qualification coordinator or one private worker invocation.
+#[allow(
+    clippy::exit,
+    reason = "invalid standalone CLI usage must return a nonzero process status"
+)]
 pub fn run_cli() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     match arguments.as_slice() {
@@ -105,8 +107,8 @@ pub fn run_cli() {
         [flag, output] if flag == "--output" => run_coordinator(Path::new(output)),
         _ => {
             eprintln!(
-                "usage: overview_qualification --output PATH\n\
-                 private: overview_qualification --worker MODE ROOT"
+                "usage: overview_m6_qualification --output PATH\n\
+                 private: overview_m6_qualification --worker MODE ROOT"
             );
             std::process::exit(2);
         }
@@ -253,7 +255,7 @@ struct ProcIo {
 }
 
 impl ProcIo {
-    fn saturating_sub(self, earlier: Self) -> Self {
+    const fn saturating_sub(self, earlier: Self) -> Self {
         Self {
             rchar: self.rchar.saturating_sub(earlier.rchar),
             wchar: self.wchar.saturating_sub(earlier.wchar),
@@ -416,8 +418,8 @@ fn prepare_mode(mode: &str, root: &Path) {
         "concurrent-disjoint" => {
             for worker in 0..CONCURRENT_WORKERS {
                 let source = 100 + u64::try_from(worker).expect("worker source");
-                let start = 1_000_000
-                    + i64::try_from(worker).expect("worker range") * 1_000_000_000;
+                let start =
+                    1_000_000 + i64::try_from(worker).expect("worker range") * 1_000_000_000;
                 let bytes = dense_hour_pgm(source, start, 32);
                 fs::write(root.join(format!("segment-{worker:02}.pgm")), bytes)
                     .expect("write disjoint PGM");
@@ -430,8 +432,7 @@ fn prepare_mode(mode: &str, root: &Path) {
             )
             .expect("write live sealed PGM");
             let first = lifecycle_part(dense_end() + 10, 41);
-            fs::write(root.join("active.parts"), framed(&first))
-                .expect("write first active frame");
+            fs::write(root.join("active.parts"), framed(&first)).expect("write first active frame");
         }
         _ => {
             let bytes = dense_hour_pgm(SOURCE_ID, 1_000_000, SAMPLES);
@@ -528,7 +529,7 @@ fn parse_strace_summary(summary: &str) -> SyscallCounts {
                 counts.renames = counts.renames.saturating_add(calls);
             }
             "unlink" | "unlinkat" => counts.unlinks = counts.unlinks.saturating_add(calls),
-            _ => panic!("unclassified traced syscall {syscall}"),
+            _ => unreachable!("unclassified traced syscall {syscall}"),
         }
     }
     assert!(counts.total_traced > 0, "empty strace evidence");
@@ -546,12 +547,12 @@ async fn run_worker(mode: &str, root: &Path) -> WorkerOutcome {
         "concurrent-disjoint" => concurrent_disjoint(root).await,
         "memory-only" => memory_only(root),
         "oracle-profile" => oracle_profile(root),
-        _ => panic!("unknown qualification mode {mode}"),
+        _ => unreachable!("unknown qualification mode {mode}"),
     }
 }
 
 async fn http_cold(root: &Path, restart: bool) -> WorkerOutcome {
-    let state = state(root, OverviewConfig::new());
+    let state = state(root, &OverviewConfig::new());
     let before = state.overview_loader.qualification_snapshot();
     let measurement = Measurement::start();
     let body = request_json(
@@ -563,16 +564,31 @@ async fn http_cold(root: &Path, restart: bool) -> WorkerOutcome {
     )
     .await;
     let after = state.overview_loader.qualification_snapshot();
-    let work = loader_work(before, after, 1, body.len(), SAMPLES);
-    assert_eq!(work.source_builds, u64::from(!restart));
-    assert_eq!(work.pgm_body_reads == 0, restart);
-    assert_eq!(work.sidecar_writes, u64::from(!restart));
-    assert!(root.join("dense-hour.ovf").is_file());
+    let work = loader_work(&before, &after, 1, body.len(), SAMPLES);
+    assert_eq!(
+        work.source_builds,
+        u64::from(!restart),
+        "only the derived-cold mode may build source facts"
+    );
+    assert_eq!(
+        work.pgm_body_reads == 0,
+        restart,
+        "only restart-warm must avoid PGM body reads"
+    );
+    assert_eq!(
+        work.sidecar_writes,
+        u64::from(!restart),
+        "only the derived-cold mode may publish the sidecar"
+    );
+    assert!(
+        root.join("dense-hour.ovf").is_file(),
+        "cold and restart modes must leave one durable sibling sidecar"
+    );
     measurement.finish(work)
 }
 
 async fn process_hot(root: &Path) -> WorkerOutcome {
-    let state = state(root, OverviewConfig::new());
+    let state = state(root, &OverviewConfig::new());
     let uri = format!(
         "/v1/timeline/overview?source={SOURCE_ID}&from=1000000&to={}",
         dense_end()
@@ -582,16 +598,19 @@ async fn process_hot(root: &Path) -> WorkerOutcome {
     let measurement = Measurement::start();
     let body = request_json(state.clone(), &uri).await;
     let after = state.overview_loader.qualification_snapshot();
-    let work = loader_work(before, after, 1, body.len(), SAMPLES);
-    assert_eq!(work.pgm_body_reads, 0);
-    assert_eq!(work.fact_reads, 0);
-    assert_eq!(work.sidecar_writes, 0);
-    assert_eq!(work.source_builds, 0);
+    let work = loader_work(&before, &after, 1, body.len(), SAMPLES);
+    assert_eq!(work.pgm_body_reads, 0, "a process-hot hit read PGM bodies");
+    assert_eq!(work.fact_reads, 0, "a process-hot hit read the sidecar");
+    assert_eq!(
+        work.sidecar_writes, 0,
+        "a process-hot hit rewrote the sidecar"
+    );
+    assert_eq!(work.source_builds, 0, "a process-hot hit rebuilt facts");
     measurement.finish(work)
 }
 
 async fn range_cold(root: &Path) -> WorkerOutcome {
-    let state = state(root, OverviewConfig::new());
+    let state = state(root, &OverviewConfig::new());
     drop(
         request_json(
             state.clone(),
@@ -620,12 +639,21 @@ async fn range_cold(root: &Path) -> WorkerOutcome {
     )
     .await;
     let after = state.overview_loader.qualification_snapshot();
-    let work = loader_work(before, after, 1, body.len(), SAMPLES);
-    assert_eq!(work.pgm_body_reads, 0);
-    assert_eq!(work.fact_reads, 0);
-    assert_eq!(work.sidecar_writes, 0);
-    assert_eq!(work.source_builds, 0);
-    assert!(work.decoded_cache_entries > 0);
+    let work = loader_work(&before, &after, 1, body.len(), SAMPLES);
+    assert_eq!(
+        work.pgm_body_reads, 0,
+        "a policy-only query read PGM bodies"
+    );
+    assert_eq!(work.fact_reads, 0, "a policy-only query reread the sidecar");
+    assert_eq!(
+        work.sidecar_writes, 0,
+        "a policy-only query rewrote the sidecar"
+    );
+    assert_eq!(work.source_builds, 0, "a policy-only query rebuilt facts");
+    assert!(
+        work.decoded_cache_entries > 0,
+        "the policy-only query did not reuse decoded canonical facts"
+    );
     let outcome = measurement.finish(work);
     let metadata_after = fs::metadata(&sidecar).expect("restat policy-neutral sidecar");
     assert_eq!(
@@ -648,7 +676,7 @@ async fn range_cold(root: &Path) -> WorkerOutcome {
 }
 
 async fn concurrent_identical(root: &Path) -> WorkerOutcome {
-    let state = state(root, OverviewConfig::new());
+    let state = state(root, &OverviewConfig::new());
     let (snapshot, view) = state.overview_request_view();
     let plan = state
         .select_overview(
@@ -680,17 +708,23 @@ async fn concurrent_identical(root: &Path) -> WorkerOutcome {
             .expect("identical fact view");
     }
     let after = state.overview_loader.qualification_snapshot();
-    let work = loader_work(
-        before,
-        after,
-        CONCURRENT_WORKERS,
-        0,
-        SAMPLES,
+    let work = loader_work(&before, &after, CONCURRENT_WORKERS, 0, SAMPLES);
+    assert_eq!(
+        work.singleflight_builds, 1,
+        "identical requests did not share one singleflight leader"
     );
-    assert_eq!(work.singleflight_builds, 1);
-    assert_eq!(work.source_builds, 1);
-    assert_eq!(work.successful_responses, CONCURRENT_WORKERS as u64);
-    assert!(work.max_inflight_builds <= 4);
+    assert_eq!(
+        work.source_builds, 1,
+        "identical requests performed more than one source build"
+    );
+    assert_eq!(
+        work.successful_responses, CONCURRENT_WORKERS as u64,
+        "an identical concurrent request did not complete"
+    );
+    assert!(
+        work.max_inflight_builds <= 4,
+        "identical work exceeded the worker capacity"
+    );
     measurement.finish(work)
 }
 
@@ -700,20 +734,18 @@ async fn concurrent_disjoint(root: &Path) -> WorkerOutcome {
     config.cold.per_request_parallelism = 1;
     config.cold.publications = 4;
     config.cold.file_descriptors = 16;
-    let state = state(root, config);
+    let state = state(root, &config);
     let (snapshot, view) = state.overview_request_view();
     let mut plans = Vec::with_capacity(CONCURRENT_WORKERS);
     for worker in 0..CONCURRENT_WORKERS {
         let source = 100 + u64::try_from(worker).expect("worker source");
-        let start =
-            1_000_000 + i64::try_from(worker).expect("worker range") * 1_000_000_000;
+        let start = 1_000_000 + i64::try_from(worker).expect("worker range") * 1_000_000_000;
         plans.push(
             state
                 .select_overview(
                     Arc::clone(&view),
                     &[source],
-                    CoverageSpan::new(start, start + 32 * CADENCE_US)
-                        .expect("disjoint range"),
+                    CoverageSpan::new(start, start + 32 * CADENCE_US).expect("disjoint range"),
                 )
                 .expect("disjoint plan"),
         );
@@ -740,18 +772,36 @@ async fn concurrent_disjoint(root: &Path) -> WorkerOutcome {
             .expect("disjoint fact view");
     }
     let after = state.overview_loader.qualification_snapshot();
-    let work = loader_work(before, after, CONCURRENT_WORKERS, 0, 32);
-    assert_eq!(work.singleflight_builds, CONCURRENT_WORKERS as u64);
-    assert_eq!(work.source_builds, CONCURRENT_WORKERS as u64);
-    assert_eq!(work.successful_responses, CONCURRENT_WORKERS as u64);
-    assert!(work.max_inflight_builds <= config.cold.max_workers);
-    assert!(work.max_inflight_file_descriptors <= config.cold.file_descriptors);
-    assert!(work.max_queue_depth <= config.cold.max_queue);
+    let work = loader_work(&before, &after, CONCURRENT_WORKERS, 0, 32);
+    assert_eq!(
+        work.singleflight_builds, CONCURRENT_WORKERS as u64,
+        "disjoint keys unexpectedly shared singleflight work"
+    );
+    assert_eq!(
+        work.source_builds, CONCURRENT_WORKERS as u64,
+        "a disjoint source build was lost"
+    );
+    assert_eq!(
+        work.successful_responses, CONCURRENT_WORKERS as u64,
+        "a disjoint concurrent request did not complete"
+    );
+    assert!(
+        work.max_inflight_builds <= config.cold.max_workers,
+        "disjoint work exceeded the worker capacity"
+    );
+    assert!(
+        work.max_inflight_file_descriptors <= config.cold.file_descriptors,
+        "disjoint work exceeded the file-descriptor capacity"
+    );
+    assert!(
+        work.max_queue_depth <= config.cold.max_queue,
+        "disjoint work exceeded the queue capacity"
+    );
     measurement.finish(work)
 }
 
 async fn live_mode(root: &Path) -> WorkerOutcome {
-    let state = state(root, OverviewConfig::new());
+    let state = state(root, &OverviewConfig::new());
     let before_loader = state.overview_loader.qualification_snapshot();
     let before_live = live_stats(&state);
     let second = lifecycle_part(dense_end() + 20, 42);
@@ -786,7 +836,11 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
     let delta = snapshot
         .refresh_incremental_delta()
         .expect("refresh appended active frame");
-    assert_eq!(delta.journal.completed_parts.len(), 1);
+    assert_eq!(
+        delta.journal.completed_parts.len(),
+        1,
+        "incremental refresh did not admit exactly one completed active part"
+    );
     state
         .republish_store_view(snapshot, &delta)
         .expect("publish appended live view");
@@ -803,9 +857,7 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
     assert_eq!(
         events
             .iter()
-            .filter(|event| {
-                event["event_kind"] == "pg.lifecycle.child_signal_termination"
-            })
+            .filter(|event| { event["event_kind"] == "pg.lifecycle.child_signal_termination" })
             .count(),
         2,
         "both completed active lifecycle frames must be visible"
@@ -820,33 +872,47 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
     );
     let after_loader = state.overview_loader.qualification_snapshot();
     let after_live = live_stats(&state);
-    let mut work = loader_work(before_loader, after_loader, 1, body.len(), SAMPLES);
+    let mut work = loader_work(&before_loader, &after_loader, 1, body.len(), SAMPLES);
     work.completed_active_parts = after_live
         .completed_parts
         .saturating_sub(before_live.completed_parts);
-    work.pgm_body_reads = work
-        .pgm_body_reads
-        .saturating_add(after_live.pgm_body_reads.saturating_sub(before_live.pgm_body_reads));
-    work.pgm_body_bytes = work
-        .pgm_body_bytes
-        .saturating_add(after_live.pgm_body_bytes.saturating_sub(before_live.pgm_body_bytes));
+    work.pgm_body_reads = work.pgm_body_reads.saturating_add(
+        after_live
+            .pgm_body_reads
+            .saturating_sub(before_live.pgm_body_reads),
+    );
+    work.pgm_body_bytes = work.pgm_body_bytes.saturating_add(
+        after_live
+            .pgm_body_bytes
+            .saturating_sub(before_live.pgm_body_bytes),
+    );
     work.visibility_lag_us =
         u64::try_from(measurement.started.elapsed().as_micros()).unwrap_or(u64::MAX);
     work.tail_pending_from_offset_bytes = pending_from;
     work.tail_pending_to_offset_bytes = pending_to;
-    assert_eq!(work.completed_active_parts, 1);
-    assert!(work.visibility_lag_us <= 2_500_000);
+    assert_eq!(
+        work.completed_active_parts, 1,
+        "live evidence did not account for the completed part"
+    );
+    assert!(
+        work.visibility_lag_us <= 2_500_000,
+        "live visibility exceeded the 2.5-second contract"
+    );
     measurement.finish(work)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one mode must keep fallback, recovery, restart, and accounting evidence in a single measured process"
+)]
 fn memory_only(root: &Path) -> WorkerOutcome {
     let snapshot = LocalDirSnapshot::open(root).expect("memory snapshot");
     let descriptor = snapshot.sealed_descriptors()[0];
     let context = snapshot
         .sealed_context(&descriptor)
         .expect("memory context");
-    let fallback_config = FallbackConfig::new(2, 16 * 1024 * 1024)
-        .expect("memory qualification bounds");
+    let fallback_config =
+        FallbackConfig::new(2, 16 * 1024 * 1024).expect("memory qualification bounds");
     let store = FactStore::with_fallback_config(root, fallback_config);
     store.qualification_inject_publish_faults([PersistError::TransientIo]);
     let measurement = Measurement::start();
@@ -857,12 +923,29 @@ fn memory_only(root: &Path) -> WorkerOutcome {
     let fresh = store
         .load_or_build(&first_unit, &context, &LIMIT)
         .expect("memory source build");
-    assert_eq!(fresh.origin(), FactOrigin::Rebuilt);
-    assert_eq!(fresh.persist_error(), Some(PersistError::TransientIo));
+    assert_eq!(
+        fresh.origin(),
+        FactOrigin::Rebuilt,
+        "the first memory-only request did not build fresh facts"
+    );
+    assert_eq!(
+        fresh.persist_error(),
+        Some(PersistError::TransientIo),
+        "the injected publication failure lost its typed taxonomy"
+    );
     let resident = store.fallback_stats();
-    assert_eq!(resident.resident_entries, 1);
-    assert!(resident.resident_bytes <= fallback_config.bytes());
-    assert!(resident.resident_segment_hours <= fallback_config.segment_hours());
+    assert_eq!(
+        resident.resident_entries, 1,
+        "the recoverable publication failure did not retain one fallback entry"
+    );
+    assert!(
+        resident.resident_bytes <= fallback_config.bytes(),
+        "the fallback exceeded its byte budget"
+    );
+    assert!(
+        resident.resident_segment_hours <= fallback_config.segment_hours(),
+        "the fallback exceeded its segment-hour budget"
+    );
 
     let second = store
         .load_or_build(
@@ -873,13 +956,22 @@ fn memory_only(root: &Path) -> WorkerOutcome {
             &LIMIT,
         )
         .expect("memory fallback hit");
-    assert_eq!(second.origin(), FactOrigin::FallbackHit);
-    assert_eq!(second.pgm_body_read_stats().read_calls, 0);
+    assert_eq!(
+        second.origin(),
+        FactOrigin::FallbackHit,
+        "the repeated request did not reuse the memory fallback"
+    );
+    assert_eq!(
+        second.pgm_body_read_stats().read_calls,
+        0,
+        "the fallback hit reread PGM bodies"
+    );
 
     store.qualification_force_persistence_probe_due();
     assert_eq!(
         store.probe_persistence(),
-        PersistenceProbeOutcome::Succeeded
+        PersistenceProbeOutcome::Succeeded,
+        "the forced recovery probe did not restore persistence"
     );
     assert_eq!(
         store.qualification_recovery_gc_attempts(),
@@ -889,7 +981,11 @@ fn memory_only(root: &Path) -> WorkerOutcome {
     store
         .publish(fresh.facts(), &context, &LIMIT)
         .expect("recovered durable publication");
-    assert_eq!(store.fallback_stats().resident_entries, 0);
+    assert_eq!(
+        store.fallback_stats().resident_entries,
+        0,
+        "durable publication did not retire the fallback entry"
+    );
     let restarted = FactStore::new(root)
         .load_or_build(
             &snapshot
@@ -899,8 +995,16 @@ fn memory_only(root: &Path) -> WorkerOutcome {
             &LIMIT,
         )
         .expect("restart after recovery");
-    assert_eq!(restarted.origin(), FactOrigin::CacheHit);
-    assert_eq!(restarted.pgm_body_read_stats().read_calls, 0);
+    assert_eq!(
+        restarted.origin(),
+        FactOrigin::CacheHit,
+        "the recovered sibling sidecar was not restart-admissible"
+    );
+    assert_eq!(
+        restarted.pgm_body_read_stats().read_calls,
+        0,
+        "the recovered restart hit reread PGM bodies"
+    );
 
     let pgm = fresh.pgm_body_read_stats();
     let fact = restarted.fact_read_stats().expect("recovered fact reads");
@@ -953,7 +1057,11 @@ fn oracle_profile(root: &Path) -> WorkerOutcome {
             &LIMIT,
         )
         .expect("oracle durable read");
-    assert_eq!(indexed.origin(), FactOrigin::CacheHit);
+    assert_eq!(
+        indexed.origin(),
+        FactOrigin::CacheHit,
+        "the oracle profile did not use the prepared sibling sidecar"
+    );
     for range in [
         CoverageSpan::new(1_000_000, dense_end()).expect("full oracle range"),
         CoverageSpan::new(61_000_000, 361_000_000).expect("partial oracle range"),
@@ -963,7 +1071,8 @@ fn oracle_profile(root: &Path) -> WorkerOutcome {
             indexed
                 .facts()
                 .query(range, ORACLE_LIMITS)
-                .expect("indexed oracle query")
+                .expect("indexed oracle query"),
+            "forced raw and indexed facts diverged for range {range:?}"
         );
     }
     let pgm = raw_unit.body_read_stats();
@@ -981,12 +1090,12 @@ fn oracle_profile(root: &Path) -> WorkerOutcome {
     })
 }
 
-fn state(root: &Path, config: OverviewConfig) -> AppState {
+fn state(root: &Path, config: &OverviewConfig) -> AppState {
     AppState::with_overview_config(
         LocalDirSnapshot::open(root).expect("open mode snapshot"),
         0,
         Duration::from_secs(10),
-        &config,
+        config,
     )
     .expect("build qualification state")
 }
@@ -1013,8 +1122,8 @@ async fn request_json(state: AppState, uri: &str) -> Vec<u8> {
 }
 
 fn loader_work(
-    before: LoaderQualificationSnapshot,
-    after: LoaderQualificationSnapshot,
+    before: &LoaderQualificationSnapshot,
+    after: &LoaderQualificationSnapshot,
     responses: usize,
     response_bytes: usize,
     rows_per_build: usize,
@@ -1023,12 +1132,22 @@ fn loader_work(
     let builds = after.flight.leaders.saturating_sub(before.flight.leaders);
     let persistence_failures = io.persistence_failures;
     assert_eq!(after.flight.active, 0, "singleflight entry leaked");
-    assert_eq!(after.admission.used, Default::default());
-    assert_eq!(after.admission.queued, 0);
-    assert!(after.admission.peak_used.workers <= after.admission.capacity.workers);
+    assert_eq!(
+        after.admission.used,
+        crate::overview::admission::ColdWorkWeight::default(),
+        "cold admission capacity leaked after the request"
+    );
+    assert_eq!(
+        after.admission.queued, 0,
+        "cold admission queue retained a completed request"
+    );
     assert!(
-        after.admission.peak_used.file_descriptors
-            <= after.admission.capacity.file_descriptors
+        after.admission.peak_used.workers <= after.admission.capacity.workers,
+        "observed workers exceeded cold admission capacity"
+    );
+    assert!(
+        after.admission.peak_used.file_descriptors <= after.admission.capacity.file_descriptors,
+        "observed file descriptors exceeded cold admission capacity"
     );
     Work {
         pgm_body_reads: io.pgm_body_reads,
@@ -1044,10 +1163,7 @@ fn loader_work(
         sidecar_write_bytes: io.fact_write_bytes,
         source_builds: io.source_builds,
         singleflight_builds: builds,
-        singleflight_waiters: after
-            .flight
-            .waiters
-            .saturating_sub(before.flight.waiters),
+        singleflight_waiters: after.flight.waiters.saturating_sub(before.flight.waiters),
         persistence_failures,
         max_inflight_builds: after.admission.peak_used.workers,
         max_inflight_file_descriptors: after.admission.peak_used.file_descriptors,
@@ -1064,7 +1180,7 @@ fn loader_work(
     }
 }
 
-fn io_delta(before: LoaderIoSnapshot, after: LoaderIoSnapshot) -> LoaderIoSnapshot {
+const fn io_delta(before: LoaderIoSnapshot, after: LoaderIoSnapshot) -> LoaderIoSnapshot {
     LoaderIoSnapshot {
         decoded_hits: after.decoded_hits.saturating_sub(before.decoded_hits),
         durable_hits: after.durable_hits.saturating_sub(before.durable_hits),
@@ -1218,8 +1334,14 @@ fn mode_result(
     samples: Vec<WorkerOutcome>,
     syscalls: SyscallCounts,
 ) -> ModeResult {
-    let mut wall = samples.iter().map(|sample| sample.wall_ns).collect::<Vec<_>>();
-    let mut cpu = samples.iter().map(|sample| sample.cpu_ns).collect::<Vec<_>>();
+    let mut wall = samples
+        .iter()
+        .map(|sample| sample.wall_ns)
+        .collect::<Vec<_>>();
+    let mut cpu = samples
+        .iter()
+        .map(|sample| sample.cpu_ns)
+        .collect::<Vec<_>>();
     wall.sort_unstable();
     cpu.sort_unstable();
     validate_mode_samples(mode, &samples);
@@ -1249,42 +1371,100 @@ fn mode_result(
 }
 
 fn validate_mode_samples(mode: &str, samples: &[WorkerOutcome]) {
-    assert_eq!(samples.len(), iterations());
+    assert_eq!(
+        samples.len(),
+        iterations(),
+        "{mode} did not record the configured sample count"
+    );
     for sample in samples {
-        assert!(sample.wall_ns > 0);
-        assert!(sample.fd_peak >= sample.fd_start);
-        assert!(sample.fd_peak >= sample.fd_end);
+        assert!(sample.wall_ns > 0, "{mode} recorded zero wall time");
+        assert!(
+            sample.fd_peak >= sample.fd_start,
+            "{mode} peak FD count is below the starting count"
+        );
+        assert!(
+            sample.fd_peak >= sample.fd_end,
+            "{mode} peak FD count is below the ending count"
+        );
         match mode {
             "restart-warm" => {
-                assert_eq!(sample.work.pgm_body_reads, 0);
-                assert_eq!(sample.work.source_builds, 0);
-                assert!(sample.work.fact_reads > 0);
+                assert_eq!(
+                    sample.work.pgm_body_reads, 0,
+                    "restart-warm read PGM bodies"
+                );
+                assert_eq!(
+                    sample.work.source_builds, 0,
+                    "restart-warm rebuilt source facts"
+                );
+                assert!(
+                    sample.work.fact_reads > 0,
+                    "restart-warm did not read the durable sidecar"
+                );
             }
             "process-hot" | "range-cold/facts-warm" => {
-                assert_eq!(sample.work.pgm_body_reads, 0);
-                assert_eq!(sample.work.fact_reads, 0);
-                assert_eq!(sample.work.sidecar_writes, 0);
+                assert_eq!(sample.work.pgm_body_reads, 0, "{mode} read PGM bodies");
+                assert_eq!(sample.work.fact_reads, 0, "{mode} reread the sidecar");
+                assert_eq!(sample.work.sidecar_writes, 0, "{mode} rewrote the sidecar");
             }
             "concurrent-identical" => {
-                assert_eq!(sample.work.singleflight_builds, 1);
-                assert_eq!(sample.work.source_builds, 1);
-                assert_eq!(sample.work.successful_responses, 16);
+                assert_eq!(
+                    sample.work.singleflight_builds, 1,
+                    "identical requests did not share one leader"
+                );
+                assert_eq!(
+                    sample.work.source_builds, 1,
+                    "identical requests did not share one source build"
+                );
+                assert_eq!(
+                    sample.work.successful_responses, 16,
+                    "an identical concurrent response was lost"
+                );
             }
             "concurrent-disjoint" => {
-                assert_eq!(sample.work.singleflight_builds, 16);
-                assert_eq!(sample.work.source_builds, 16);
-                assert_eq!(sample.work.successful_responses, 16);
-                assert!(sample.work.max_inflight_builds <= 4);
-                assert!(sample.work.max_inflight_file_descriptors <= 16);
+                assert_eq!(
+                    sample.work.singleflight_builds, 16,
+                    "disjoint keys unexpectedly shared leaders"
+                );
+                assert_eq!(
+                    sample.work.source_builds, 16,
+                    "a disjoint source build was lost"
+                );
+                assert_eq!(
+                    sample.work.successful_responses, 16,
+                    "a disjoint concurrent response was lost"
+                );
+                assert!(
+                    sample.work.max_inflight_builds <= 4,
+                    "disjoint work exceeded the worker capacity"
+                );
+                assert!(
+                    sample.work.max_inflight_file_descriptors <= 16,
+                    "disjoint work exceeded the file-descriptor capacity"
+                );
             }
             "memory-only" => {
-                assert_eq!(sample.work.persistence_failures, 1);
-                assert_eq!(sample.work.fallback_hits, 1);
-                assert!(sample.work.fallback_resident_entries > 0);
+                assert_eq!(
+                    sample.work.persistence_failures, 1,
+                    "memory-only did not record one publication failure"
+                );
+                assert_eq!(
+                    sample.work.fallback_hits, 1,
+                    "memory-only did not record one fallback hit"
+                );
+                assert!(
+                    sample.work.fallback_resident_entries > 0,
+                    "memory-only did not retain the bounded fallback"
+                );
             }
             "live" => {
-                assert_eq!(sample.work.completed_active_parts, 1);
-                assert!(sample.work.visibility_lag_us <= 2_500_000);
+                assert_eq!(
+                    sample.work.completed_active_parts, 1,
+                    "live mode did not fold one completed part"
+                );
+                assert!(
+                    sample.work.visibility_lag_us <= 2_500_000,
+                    "live mode exceeded the 2.5-second visibility contract"
+                );
             }
             _ => {}
         }
@@ -1304,6 +1484,8 @@ fn dense_hour_pgm(source_id: u64, start_us: i64, samples: usize) -> Vec<u8> {
     let database = (0..samples)
         .map(|index| {
             let index = i64::try_from(index).expect("sample index");
+            let index_f64 =
+                f64::from(u32::try_from(index).expect("sample index fits exact f64 integer range"));
             PgStatDatabaseV1 {
                 ts: Ts(start_us + index * CADENCE_US),
                 datid: 16_384,
@@ -1322,8 +1504,8 @@ fn dense_hour_pgm(source_id: u64, start_us: i64, samples: usize) -> Vec<u8> {
                 temp_files: index / 100,
                 temp_bytes: index * 4_096,
                 deadlocks: index / 180,
-                blk_read_time: index as f64 * 0.25,
-                blk_write_time: index as f64 * 0.125,
+                blk_read_time: index_f64 * 0.25,
+                blk_write_time: index_f64 * 0.125,
                 stats_reset: None,
                 frozen_xid_age: Some(1_000 + index),
                 min_mxid_age: Some(100 + index),
@@ -1473,7 +1655,11 @@ fn accounting(
     fact_file_bytes: usize,
     metadata: &fs::Metadata,
 ) -> Accounting {
-    let stored_block_bytes = file.directory().iter().map(|entry| entry.stored_len).sum::<u64>();
+    let stored_block_bytes = file
+        .directory()
+        .iter()
+        .map(|entry| entry.stored_len)
+        .sum::<u64>();
     let decoded_block_bytes = file.directory().iter().map(|entry| entry.decoded_len).sum();
     let header_and_directory_bytes = u64::try_from(fact_file_bytes)
         .expect("fact bytes fit")
@@ -1489,7 +1675,11 @@ fn accounting(
     let fixed_metric_stored_bytes = file
         .directory()
         .iter()
-        .filter(|entry| metric_kinds.iter().any(|kind| kind.code() == entry.block_kind))
+        .filter(|entry| {
+            metric_kinds
+                .iter()
+                .any(|kind| kind.code() == entry.block_kind)
+        })
         .map(|entry| entry.stored_len)
         .sum();
     let variable_event_string_stored_bytes = file
@@ -1526,8 +1716,7 @@ fn accounting(
         retained_metric_samples,
         fixed_metric_bytes_per_sample_numerator: fixed_metric_stored_bytes,
         fixed_metric_bytes_per_sample_denominator: retained_metric_samples,
-        identity_holds: header_and_directory_bytes
-            .saturating_add(stored_block_bytes)
+        identity_holds: header_and_directory_bytes.saturating_add(stored_block_bytes)
             == fact_file_bytes as u64,
     }
 }
@@ -1610,7 +1799,7 @@ fn command_output(program: &str, arguments: &[&str]) -> String {
     let output = Command::new(program)
         .args(arguments)
         .output()
-        .unwrap_or_else(|error| panic!("run {program}: {error}"));
+        .expect("run qualification support command");
     assert!(output.status.success(), "{program} failed");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
@@ -2126,12 +2315,10 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
 fn evidence_binary(kind: &str, path: &str) -> &'static str {
     match (kind, path) {
         ("mode" | "mode_set", "qualification") => {
-            "pg-kronika-web::example/overview_qualification"
+            "pg-kronika-web::example/overview_m6_qualification"
         }
         ("rust_test", path) if path.starts_with("crates/kronika-reader/") => "kronika-reader",
-        ("rust_test", path) if path.starts_with("crates/kronika-analytics/") => {
-            "kronika-analytics"
-        }
+        ("rust_test", path) if path.starts_with("crates/kronika-analytics/") => "kronika-analytics",
         ("rust_test", path) if path.starts_with("bins/pg_kronika-web/") => "pg-kronika-web",
         ("bdd_scenario", path) if path.starts_with("crates/kronika-bdd/features/") => "kronika-bdd",
         _ => "unknown-evidence-binary",

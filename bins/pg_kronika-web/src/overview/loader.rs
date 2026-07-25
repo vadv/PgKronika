@@ -1,7 +1,7 @@
 //! Request-scoped sealed-fact loading over exact-key shared work.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use kronika_analytics::overview::MetricFactor;
@@ -180,14 +180,13 @@ impl OverviewFactLoader {
                         if let Some(facts) = decoded.get(key) {
                             return Ok(facts);
                         }
-                        if let Some(facts) =
-                            load_cached(
-                                Arc::clone(&snapshot),
-                                worker_entry.clone(),
-                                store.clone(),
-                                Arc::clone(&qualification),
-                            )
-                            .await?
+                        if let Some(facts) = load_cached(
+                            Arc::clone(&snapshot),
+                            worker_entry.clone(),
+                            store.clone(),
+                            Arc::clone(&qualification),
+                        )
+                        .await?
                         {
                             decoded.insert(key, Arc::clone(&facts));
                             return Ok(facts);

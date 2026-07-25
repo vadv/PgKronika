@@ -785,7 +785,7 @@ impl IndexView {
         self.live
             .source_id()
             .filter(|source| sources.binary_search(source).is_ok())
-            .and(self.live.tail_pending())
+            .and_then(|_| self.live.tail_pending())
     }
 
     /// Returns sorted, range-clipped metadata for every requested source.

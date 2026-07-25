@@ -188,9 +188,7 @@ fn fixture_part(ts_us: i64, snapshot: u8) -> FixturePart {
     }
     let slot = slot_row(ts_us, snapshot);
     sections.push(encoded_section(1_034_003, &[slot]));
-    sections.extend([
-        encoded_section(1_038_001, &coverage),
-    ]);
+    sections.extend([encoded_section(1_038_001, &coverage)]);
     sections.sort_unstable_by_key(|section| section.type_id);
 
     FixturePart {
@@ -462,14 +460,7 @@ const fn sender_row(ts_us: i64, state_code: u8) -> PgReplicationPhysicalV1 {
 
 fn coverage_rows(ts_us: i64, snapshot: u8) -> Vec<SnapshotCoverageV1> {
     [
-        1_005_004,
-        1_015_001,
-        1_020_001,
-        1_033_001,
-        1_034_003,
-        1_036_002,
-        1_037_001,
-        1_106_001,
+        1_005_004, 1_015_001, 1_020_001, 1_033_001, 1_034_003, 1_036_002, 1_037_001, 1_106_001,
         1_202_001,
     ]
     .into_iter()

@@ -59,7 +59,8 @@ name = "anomalies"
 harness = false
 
 [[example]]
-name = "overview_qualification"
+name = "overview_m6_qualification"
+path = "examples/overview_qualification.rs"
 required-features = ["qualification"]
 
 [lints]

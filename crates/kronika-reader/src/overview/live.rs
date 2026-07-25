@@ -2275,12 +2275,7 @@ mod tests {
         events
     }
 
-    fn exact_boundaries(
-        rng: &mut Lcg,
-        start: usize,
-        end: usize,
-        groups: usize,
-    ) -> Vec<usize> {
+    fn exact_boundaries(rng: &mut Lcg, start: usize, end: usize, groups: usize) -> Vec<usize> {
         assert!(start < end);
         assert!((1..=end - start).contains(&groups));
         let mut candidates = (start + 1..end).collect::<Vec<_>>();
@@ -2367,8 +2362,8 @@ mod tests {
             .checked_add(step_us - 1)
             .expect("bucket count numerator")
             / step_us;
-        let boundary_bucket = 1
-            + i64::try_from(seed % u64::try_from(bucket_count - 1).expect("bucket count fits"))
+        let boundary_bucket =
+            1 + i64::try_from(seed % u64::try_from(bucket_count - 1).expect("bucket count fits"))
                 .expect("boundary bucket fits");
         let split = range
             .start_us()
@@ -2455,10 +2450,8 @@ mod tests {
                         .expect("part counts fit canonical stream")
                         + 1,
                 );
-            let sealed_cuts =
-                exact_boundaries(&mut rng, 0, seal_point, sealed_segments);
-            let active_cuts =
-                exact_boundaries(&mut rng, seal_point, ROWS, active_parts);
+            let sealed_cuts = exact_boundaries(&mut rng, 0, seal_point, sealed_segments);
+            let active_cuts = exact_boundaries(&mut rng, seal_point, ROWS, active_parts);
 
             let sealed_observations = sealed_cuts
                 .windows(2)
@@ -2471,8 +2464,7 @@ mod tests {
             let mut rebuilt_chunks = sealed_observations.clone();
             rebuilt_chunks.push(&raw.observations()[seal_point..ROWS]);
             shuffle(&mut rng, &mut rebuilt_chunks);
-            let sealed_only =
-                oracle_from_observation_chunks(&rebuilt_chunks, raw.coverage());
+            let sealed_only = oracle_from_observation_chunks(&rebuilt_chunks, raw.coverage());
 
             let mut mixed_chunks = sealed_observations.clone();
             mixed_chunks.extend(active_observations);
@@ -2482,8 +2474,7 @@ mod tests {
             let mut promoted_chunks = sealed_observations;
             promoted_chunks.push(&raw.observations()[seal_point..ROWS]);
             shuffle(&mut rng, &mut promoted_chunks);
-            let promoted =
-                oracle_from_observation_chunks(&promoted_chunks, raw.coverage());
+            let promoted = oracle_from_observation_chunks(&promoted_chunks, raw.coverage());
 
             // Exercise the actual PGM → live chunks → promoted/rebuilt path for
             // every active-part count and the actual sealed-prefix path for
@@ -2499,10 +2490,7 @@ mod tests {
                     .iter()
                     .map(|slice| lifecycle_part(slice))
                     .collect::<Vec<_>>();
-                let active_byte_slices = active_bytes
-                    .iter()
-                    .map(Vec::as_slice)
-                    .collect::<Vec<_>>();
+                let active_byte_slices = active_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
                 let mut builder = live_builder();
                 fold_bytes(&mut builder, &active_byte_slices);
                 let live = builder.publish();
@@ -2511,8 +2499,8 @@ mod tests {
                 let sealed_suffix_bytes = sealed_from_slices(&active_slices);
                 let sealed_suffix =
                     PgmUnit::open(sealed_suffix_bytes.as_slice()).expect("open sealed suffix");
-                let rebuilt_suffix = SegmentFacts::extract(&sealed_suffix, &LIMIT)
-                    .expect("rebuild sealed suffix");
+                let rebuilt_suffix =
+                    SegmentFacts::extract(&sealed_suffix, &LIMIT).expect("rebuild sealed suffix");
                 let live_parts = live.chunks().iter().map(Arc::as_ref).collect::<Vec<_>>();
                 let promoted_suffix =
                     SegmentFacts::try_promote_from_parts(&sealed_suffix, &live_parts, &LIMIT)
@@ -2531,7 +2519,9 @@ mod tests {
                 actual.push(Arc::new(sealed_facts(&rows[seal_point..ROWS])));
                 shuffle(&mut rng, &mut actual);
                 let actual = oracle_from_chunks(&actual);
-                let actual_result = actual.query(full, LIMITS).expect("query actual sealed path");
+                let actual_result = actual
+                    .query(full, LIMITS)
+                    .expect("query actual sealed path");
                 let raw_result = raw.query(full, LIMITS).expect("query raw sealed path");
                 assert_eq!(
                     semantic_events(&actual_result),
@@ -2539,23 +2529,18 @@ mod tests {
                     "actual sealed partition changed public events at seed {seed}"
                 );
                 assert_eq!(actual_result.counts(), raw_result.counts(), "seed {seed}");
-                assert_eq!(actual_result.coverage(), raw_result.coverage(), "seed {seed}");
+                assert_eq!(
+                    actual_result.coverage(),
+                    raw_result.coverage(),
+                    "seed {seed}"
+                );
             }
 
             let (range, step_us) = match seed % 4 {
                 0 => (full, 1),
-                1 => (
-                    CoverageSpan::new(1_010, 1_040).expect("aligned range"),
-                    2,
-                ),
-                2 => (
-                    CoverageSpan::new(1_007, 1_053).expect("unaligned range"),
-                    7,
-                ),
-                _ => (
-                    CoverageSpan::new(1_029, 1_060).expect("boundary range"),
-                    13,
-                ),
+                1 => (CoverageSpan::new(1_010, 1_040).expect("aligned range"), 2),
+                2 => (CoverageSpan::new(1_007, 1_053).expect("unaligned range"), 7),
+                _ => (CoverageSpan::new(1_029, 1_060).expect("boundary range"), 13),
             };
             let expected = raw.query(range, LIMITS).expect("query unsplit raw path");
             let expected_events = semantic_events(&expected);
@@ -2587,9 +2572,7 @@ mod tests {
             "the sweep must exercise every active part count in 1..=100"
         );
         assert!(
-            seen_sealed_segments
-                .into_iter()
-                .all(std::convert::identity),
+            seen_sealed_segments.into_iter().all(std::convert::identity),
             "the sweep must exercise every sealed segment count in 1..=20"
         );
     }

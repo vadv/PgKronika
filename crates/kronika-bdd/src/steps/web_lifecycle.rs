@@ -35,7 +35,9 @@ async fn interrupted_publication_recovers(world: &mut BddWorld) -> Result<()> {
     web_lifecycle::assert_interrupted_publication_recovery(&segment, &baseline).await
 }
 
-#[then("a recoverable publication failure uses bounded fallback then becomes a durable restart hit")]
+#[then(
+    "a recoverable publication failure uses bounded fallback then becomes a durable restart hit"
+)]
 async fn recoverable_failure_recovers(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();
     let baseline = world.harness.web_lifecycle_baseline()?.clone();

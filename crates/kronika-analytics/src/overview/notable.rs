@@ -610,13 +610,7 @@ mod tests {
 
     #[test]
     fn public_event_identity_ignores_lineage_but_retains_content() {
-        let first = error_group(
-            0,
-            1_000,
-            Severity::Panic,
-            ErrorCategory::System,
-            None,
-        );
+        let first = error_group(0, 1_000, Severity::Panic, ErrorCategory::System, None);
         let same_content = EventObservation::new(
             SegmentIdentity::sealed(1, [9; 32], 7, b"alternate"),
             first.source_type_id(),
@@ -643,13 +637,7 @@ mod tests {
             "physical promotion must not change the public event ID"
         );
 
-        let changed = error_group(
-            1,
-            1_001,
-            Severity::Panic,
-            ErrorCategory::System,
-            None,
-        );
+        let changed = error_group(1, 1_001, Severity::Panic, ErrorCategory::System, None);
         assert_ne!(notable_event_id(&first), notable_event_id(&changed));
     }
 

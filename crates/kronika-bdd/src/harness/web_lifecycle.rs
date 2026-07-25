@@ -3,9 +3,7 @@
 use std::fs;
 
 use anyhow::{Context, Result, ensure};
-use kronika_reader::{
-    FallbackConfig, QUALIFICATION_PUBLISH_FAULT_ENV,
-};
+use kronika_reader::{FallbackConfig, QUALIFICATION_PUBLISH_FAULT_ENV};
 use serde_json::Value;
 
 use super::web_process::{
@@ -30,7 +28,9 @@ struct TimelineResponses {
 }
 
 /// Missing sibling → cold build → graceful restart → durable zero-PGM hit.
-pub(crate) async fn establish_restart_baseline(segment: &std::path::Path) -> Result<TimelineBaseline> {
+pub(crate) async fn establish_restart_baseline(
+    segment: &std::path::Path,
+) -> Result<TimelineBaseline> {
     let case = WebCase::from_segment(segment, "missing-restart")?;
     ensure!(
         !case.sidecar().exists(),
@@ -166,9 +166,7 @@ pub(crate) async fn assert_interrupted_publication_recovery(
     baseline: &TimelineBaseline,
 ) -> Result<()> {
     let case = WebCase::from_segment(segment, "interrupted-publication")?;
-    let preexisting = case
-        .data_dir()
-        .join(".pgkronika-overview.tmp-preexisting");
+    let preexisting = case.data_dir().join(".pgkronika-overview.tmp-preexisting");
     fs::write(&preexisting, b"not an admitted sidecar")
         .context("seed interrupted-publication residue")?;
     let barrier = PublishBarrier::bind(case.control_path("publication.sock")?)?;
@@ -396,9 +394,7 @@ pub(crate) async fn assert_writer_contention(
     );
 
     lease.release().await?;
-    let owner_overview = owner_request
-        .await
-        .context("join owner HTTP request")??;
+    let owner_overview = owner_request.await.context("join owner HTTP request")??;
     ensure!(
         normalized(owner_overview) == baseline.overview,
         "owner process returned a different overview after release"
@@ -444,10 +440,7 @@ impl TimelineBaseline {
     }
 }
 
-fn assert_timeline_equal(
-    expected: &TimelineResponses,
-    actual: &TimelineResponses,
-) -> Result<()> {
+fn assert_timeline_equal(expected: &TimelineResponses, actual: &TimelineResponses) -> Result<()> {
     ensure!(
         normalized(expected.overview.clone()) == normalized(actual.overview.clone()),
         "overview changed across a graceful real-process restart"
@@ -470,7 +463,11 @@ async fn timeline(client: WebClient, case: &WebCase) -> Result<TimelineResponses
     let events = client.get_json(&events_target(case, 10_000, None)).await?;
     let health = client.get_json(&health_target(case)).await?;
     let healthz = client.get("/healthz").await?;
-    ensure!(healthz.status == 200, "/healthz returned {}", healthz.status);
+    ensure!(
+        healthz.status == 200,
+        "/healthz returned {}",
+        healthz.status
+    );
     let readyz = client.get("/readyz").await?;
     ensure!(readyz.status == 200, "/readyz returned {}", readyz.status);
     let sources = client.get_json("/v1/sources").await?;

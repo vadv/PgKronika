@@ -442,33 +442,25 @@ mod tests {
             panic(0, 5, EvidenceQuality::Structured),
             error(1, 55, *b"XX001", EvidenceQuality::Structured),
         ];
-        let merged = health_line(&observations, span(0, 100), 50, &policy)
-            .expect("merged health line");
-        let mut partitioned = health_line(&observations[..1], span(0, 50), 50, &policy)
-            .expect("first partition");
+        let merged =
+            health_line(&observations, span(0, 100), 50, &policy).expect("merged health line");
+        let mut partitioned =
+            health_line(&observations[..1], span(0, 50), 50, &policy).expect("first partition");
         partitioned.extend(
-            health_line(&observations[1..], span(50, 100), 50, &policy)
-                .expect("second partition"),
+            health_line(&observations[1..], span(50, 100), 50, &policy).expect("second partition"),
         );
         assert_eq!(
             partitioned, merged,
             "merging sealed/live partitions must preserve every trusted floor"
         );
 
-        let merged_worst = downsample_worst(
-            &merged,
-            span(0, 100),
-            OVERVIEW_HEALTH_LIMITS,
-        )
-        .expect("downsample merged points")
-        .expect("merged points are nonempty");
-        let partitioned_worst = downsample_worst(
-            &partitioned,
-            span(0, 100),
-            OVERVIEW_HEALTH_LIMITS,
-        )
-        .expect("downsample partitioned points")
-        .expect("partitioned points are nonempty");
+        let merged_worst = downsample_worst(&merged, span(0, 100), OVERVIEW_HEALTH_LIMITS)
+            .expect("downsample merged points")
+            .expect("merged points are nonempty");
+        let partitioned_worst =
+            downsample_worst(&partitioned, span(0, 100), OVERVIEW_HEALTH_LIMITS)
+                .expect("downsample partitioned points")
+                .expect("partitioned points are nonempty");
         assert_eq!(partitioned_worst, merged_worst);
         assert_eq!(
             merged_worst.representative().overall_state(),
