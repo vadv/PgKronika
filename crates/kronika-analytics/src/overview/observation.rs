@@ -302,6 +302,31 @@ impl LossReason {
             Self::DictionaryBound => 4,
         }
     }
+
+    /// Stable codec discriminant.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::GroupCapExceeded => 1,
+            Self::LifecycleCapExceeded => 2,
+            Self::ParserBound => 3,
+            Self::TailerBound => 4,
+            Self::DictionaryBound => 5,
+        }
+    }
+
+    /// Decodes a stable codec discriminant.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::GroupCapExceeded),
+            2 => Some(Self::LifecycleCapExceeded),
+            3 => Some(Self::ParserBound),
+            4 => Some(Self::TailerBound),
+            5 => Some(Self::DictionaryBound),
+            _ => None,
+        }
+    }
 }
 
 /// Proven source loss attached to an observation.

@@ -11,8 +11,9 @@
 //! to the container, not here.
 
 use kronika_analytics::overview::{
-    AlignmentId, Applicability, CounterSample, Coverage, CoverageSpan, GaugeSample, MetricSeriesId,
-    PeriodQuality, PhysicalCountSemantics, RetainedExactness, SourceCompleteness,
+    AlignmentId, Applicability, CounterSample, Coverage, CoverageSpan, EntityKind, EntityRef,
+    FactorId, GaugeSample, MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality,
+    PhysicalCountSemantics, ResetFamily, RetainedExactness, SourceCompleteness, SourceScopeId,
 };
 
 use super::bytes::{ByteError, ByteReader, ByteWriter};
@@ -244,12 +245,149 @@ fn time_range_of(times: impl IntoIterator<Item = i64>) -> Option<(i64, i64)> {
     Some(iter.fold((first, first), |(lo, hi), ts| (lo.min(ts), hi.max(ts))))
 }
 
+fn untyped_series_for_counters(samples: &[CounterSample]) -> Vec<MetricSeriesDescriptor> {
+    untyped_series(samples.iter().map(|sample| sample.series_id()))
+}
+
+fn untyped_series_for_gauges(samples: &[GaugeSample]) -> Vec<MetricSeriesDescriptor> {
+    untyped_series(samples.iter().map(|sample| sample.series_id()))
+}
+
+fn untyped_series(
+    series_ids: impl IntoIterator<Item = MetricSeriesId>,
+) -> Vec<MetricSeriesDescriptor> {
+    let mut ids = series_ids.into_iter().collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter()
+        .map(|series_id| MetricSeriesDescriptor {
+            series_id,
+            factor_id: FactorId(0),
+            source_scope_id: SourceScopeId([0; 32]),
+            source_type_id: 0,
+            unit: MetricUnit::Count,
+            entity: None,
+            reset_family: None,
+        })
+        .collect()
+}
+
+fn normalize_series(series: &mut [MetricSeriesDescriptor]) -> Result<(), BlockError> {
+    series.sort_unstable_by_key(|descriptor| descriptor.series_id);
+    if series
+        .windows(2)
+        .any(|pair| pair[0].series_id == pair[1].series_id)
+    {
+        return Err(BlockError::Duplicate);
+    }
+    Ok(())
+}
+
+fn validate_sample_series(
+    series: &[MetricSeriesDescriptor],
+    sample_ids: impl IntoIterator<Item = MetricSeriesId>,
+) -> Result<(), BlockError> {
+    let mut referenced = Vec::new();
+    for id in sample_ids {
+        if series
+            .binary_search_by_key(&id, |descriptor| descriptor.series_id)
+            .is_err()
+        {
+            return Err(BlockError::Reconstruct);
+        }
+        referenced.push(id);
+    }
+    referenced.sort_unstable();
+    referenced.dedup();
+    if referenced.len() != series.len()
+        || referenced
+            .iter()
+            .zip(series)
+            .any(|(id, descriptor)| *id != descriptor.series_id)
+    {
+        return Err(BlockError::Reconstruct);
+    }
+    Ok(())
+}
+
+fn write_series_descriptors(writer: &mut ByteWriter, series: &[MetricSeriesDescriptor]) {
+    writer.uvarint(series.len() as u64);
+    for descriptor in series {
+        write_series_id(writer, descriptor.series_id);
+        writer.u32_le(descriptor.factor_id.0);
+        writer.bytes(&descriptor.source_scope_id.0);
+        writer.u32_le(descriptor.source_type_id);
+        writer.u8(descriptor.unit.code());
+        match descriptor.entity {
+            Some(entity) => {
+                writer.u8(1);
+                writer.u8(entity.kind.code());
+                writer.bytes(&entity.id);
+            }
+            None => writer.u8(0),
+        }
+        match descriptor.reset_family {
+            Some(family) => {
+                writer.u8(1);
+                writer.u8(family.code());
+            }
+            None => writer.u8(0),
+        }
+    }
+}
+
+fn read_series_descriptors(
+    reader: &mut ByteReader<'_>,
+    bounds: &Bounds,
+) -> Result<Vec<MetricSeriesDescriptor>, BlockError> {
+    let count = reader.uvarint(bounds.items_per_block)?;
+    let mut series = Vec::with_capacity(count.min(4_096) as usize);
+    for _ in 0..count {
+        let series_id = read_series_id(reader)?;
+        let factor_id = FactorId(reader.u32_le()?);
+        let source_scope_id = SourceScopeId(reader.array()?);
+        let source_type_id = reader.u32_le()?;
+        let unit = MetricUnit::from_code(reader.u8()?).ok_or(BlockError::InvalidEnum)?;
+        let entity = match reader.u8()? {
+            0 => None,
+            1 => Some(EntityRef {
+                kind: EntityKind::from_code(reader.u8()?).ok_or(BlockError::InvalidEnum)?,
+                id: reader.array()?,
+            }),
+            _ => return Err(BlockError::InvalidEnum),
+        };
+        let reset_family = match reader.u8()? {
+            0 => None,
+            1 => Some(ResetFamily::from_code(reader.u8()?).ok_or(BlockError::InvalidEnum)?),
+            _ => return Err(BlockError::InvalidEnum),
+        };
+        series.push(MetricSeriesDescriptor {
+            series_id,
+            factor_id,
+            source_scope_id,
+            source_type_id,
+            unit,
+            entity,
+            reset_family,
+        });
+    }
+    for pair in series.windows(2) {
+        match pair[0].series_id.cmp(&pair[1].series_id) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => return Err(BlockError::Duplicate),
+            std::cmp::Ordering::Greater => return Err(BlockError::Unsorted),
+        }
+    }
+    Ok(series)
+}
+
 /// A canonical, sorted-unique set of cumulative counter samples.
 ///
 /// The canonical order is `(series_id, alignment_id, ts_us)`; two samples
 /// sharing that key are a duplicate and never both retained.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterSamplesBlock {
+    series: Vec<MetricSeriesDescriptor>,
     samples: Vec<CounterSample>,
 }
 
@@ -259,13 +397,34 @@ impl CounterSamplesBlock {
     /// # Errors
     /// Returns [`BlockError::Duplicate`] when two samples share the canonical
     /// key, and [`BlockError::AboveBound`] past the per-block item bound.
-    pub fn new(mut samples: Vec<CounterSample>, bounds: &Bounds) -> Result<Self, BlockError> {
+    pub fn new(samples: Vec<CounterSample>, bounds: &Bounds) -> Result<Self, BlockError> {
+        let series = untyped_series_for_counters(&samples);
+        Self::new_with_series(series, samples, bounds)
+    }
+
+    /// Normalizes typed series metadata and samples into canonical order.
+    ///
+    /// Every retained sample must reference exactly one descriptor. Production
+    /// extraction uses this constructor so factor, unit, source scope, entity
+    /// and reset family are never inferred by the disk codec.
+    ///
+    /// # Errors
+    /// Returns [`BlockError`] for duplicate descriptors/samples, an unmapped
+    /// sample, contradictory descriptor identity, or a configured bound.
+    pub fn new_with_series(
+        mut series: Vec<MetricSeriesDescriptor>,
+        mut samples: Vec<CounterSample>,
+        bounds: &Bounds,
+    ) -> Result<Self, BlockError> {
         if !bounds.is_within_absolute_limits() {
             return Err(BlockError::AboveBound);
         }
-        if samples.len() as u64 > bounds.items_per_block {
+        if samples.len() as u64 > bounds.items_per_block
+            || series.len() as u64 > bounds.items_per_block
+        {
             return Err(BlockError::AboveBound);
         }
+        normalize_series(&mut series)?;
         samples.sort_unstable_by_key(counter_key);
         if samples
             .windows(2)
@@ -273,7 +432,14 @@ impl CounterSamplesBlock {
         {
             return Err(BlockError::Duplicate);
         }
-        Ok(Self { samples })
+        validate_sample_series(&series, samples.iter().map(CounterSample::series_id))?;
+        Ok(Self { series, samples })
+    }
+
+    /// Typed metadata of every referenced series.
+    #[must_use]
+    pub fn series(&self) -> &[MetricSeriesDescriptor] {
+        &self.series
     }
 
     /// The canonical samples.
@@ -293,10 +459,12 @@ impl CounterSamplesBlock {
         }
         if body.is_empty() {
             return Ok(Self {
+                series: Vec::new(),
                 samples: Vec::new(),
             });
         }
         let mut reader = ByteReader::new(body);
+        let series = read_series_descriptors(&mut reader, bounds)?;
         let count = reader.uvarint(bounds.items_per_block)?;
         let mut samples = Vec::with_capacity(count.min(4_096) as usize);
         for _ in 0..count {
@@ -321,7 +489,8 @@ impl CounterSamplesBlock {
                 std::cmp::Ordering::Greater => return Err(BlockError::Unsorted),
             }
         }
-        Ok(Self { samples })
+        validate_sample_series(&series, samples.iter().map(CounterSample::series_id))?;
+        Ok(Self { series, samples })
     }
 }
 
@@ -357,6 +526,7 @@ impl EncodableBlock for CounterSamplesBlock {
             return Vec::new();
         }
         let mut writer = ByteWriter::new();
+        write_series_descriptors(&mut writer, &self.series);
         writer.uvarint(self.samples.len() as u64);
         for sample in &self.samples {
             write_series_id(&mut writer, sample.series_id());
@@ -375,6 +545,7 @@ impl EncodableBlock for CounterSamplesBlock {
 /// are a duplicate and never both retained.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GaugeSamplesBlock {
+    series: Vec<MetricSeriesDescriptor>,
     samples: Vec<GaugeSample>,
 }
 
@@ -384,13 +555,30 @@ impl GaugeSamplesBlock {
     /// # Errors
     /// Returns [`BlockError::Duplicate`] when two samples share the canonical
     /// key, and [`BlockError::AboveBound`] past the per-block item bound.
-    pub fn new(mut samples: Vec<GaugeSample>, bounds: &Bounds) -> Result<Self, BlockError> {
+    pub fn new(samples: Vec<GaugeSample>, bounds: &Bounds) -> Result<Self, BlockError> {
+        let series = untyped_series_for_gauges(&samples);
+        Self::new_with_series(series, samples, bounds)
+    }
+
+    /// Normalizes typed series metadata and gauge samples.
+    ///
+    /// # Errors
+    /// Returns [`BlockError`] for duplicate descriptors/samples, an unmapped
+    /// sample, contradictory descriptor identity, or a configured bound.
+    pub fn new_with_series(
+        mut series: Vec<MetricSeriesDescriptor>,
+        mut samples: Vec<GaugeSample>,
+        bounds: &Bounds,
+    ) -> Result<Self, BlockError> {
         if !bounds.is_within_absolute_limits() {
             return Err(BlockError::AboveBound);
         }
-        if samples.len() as u64 > bounds.items_per_block {
+        if samples.len() as u64 > bounds.items_per_block
+            || series.len() as u64 > bounds.items_per_block
+        {
             return Err(BlockError::AboveBound);
         }
+        normalize_series(&mut series)?;
         samples.sort_unstable_by_key(gauge_key);
         if samples
             .windows(2)
@@ -398,7 +586,14 @@ impl GaugeSamplesBlock {
         {
             return Err(BlockError::Duplicate);
         }
-        Ok(Self { samples })
+        validate_sample_series(&series, samples.iter().map(GaugeSample::series_id))?;
+        Ok(Self { series, samples })
+    }
+
+    /// Typed metadata of every referenced series.
+    #[must_use]
+    pub fn series(&self) -> &[MetricSeriesDescriptor] {
+        &self.series
     }
 
     /// The canonical samples.
@@ -418,10 +613,12 @@ impl GaugeSamplesBlock {
         }
         if body.is_empty() {
             return Ok(Self {
+                series: Vec::new(),
                 samples: Vec::new(),
             });
         }
         let mut reader = ByteReader::new(body);
+        let series = read_series_descriptors(&mut reader, bounds)?;
         let count = reader.uvarint(bounds.items_per_block)?;
         let mut samples = Vec::with_capacity(count.min(4_096) as usize);
         for _ in 0..count {
@@ -440,7 +637,8 @@ impl GaugeSamplesBlock {
                 std::cmp::Ordering::Greater => return Err(BlockError::Unsorted),
             }
         }
-        Ok(Self { samples })
+        validate_sample_series(&series, samples.iter().map(GaugeSample::series_id))?;
+        Ok(Self { series, samples })
     }
 }
 
@@ -470,6 +668,7 @@ impl EncodableBlock for GaugeSamplesBlock {
             return Vec::new();
         }
         let mut writer = ByteWriter::new();
+        write_series_descriptors(&mut writer, &self.series);
         writer.uvarint(self.samples.len() as u64);
         for sample in &self.samples {
             write_series_id(&mut writer, sample.series_id());

@@ -20,6 +20,7 @@ use super::block::{
 };
 use super::bytes::{ByteReader, ByteWriter};
 use super::descriptors::SourceDescriptor;
+use super::event_facts::EventFactsBlock;
 use super::limits::Bounds;
 use super::observations::EventObservationsBlock;
 
@@ -31,7 +32,7 @@ const DIRECTORY_ENTRY_LEN: usize = 64;
 const DIRECTORY_ENTRY_LEN_U16: u16 = 64;
 const FILE_KIND_SEGMENT_FACTS: u16 = 1;
 const DESCRIPTOR_KIND_CATALOG: u16 = 1;
-const BLOCK_SCHEMA_VERSION: u16 = 1;
+const BLOCK_SCHEMA_VERSION: u16 = 2;
 const HEADER_CRC_OFFSET: usize = 156;
 
 /// Source and compatibility identity serialized in a fact-file header.
@@ -203,8 +204,8 @@ pub enum BlockContent {
     SourceManifest(Box<SourceManifestBlock>),
     /// Retained source observations.
     EventObservations(Box<EventObservationsBlock>),
-    /// Policy-neutral facts block; container version 1 requires an empty body.
-    EventFacts,
+    /// Policy-neutral canonical event facts.
+    EventFacts(Box<EventFactsBlock>),
     /// Coverage and loss metadata.
     LossCoverage(Box<LossCoverageBlock>),
     /// Gauge samples.
@@ -226,7 +227,7 @@ impl BlockContent {
         match self {
             Self::SourceManifest(block) => block.kind(),
             Self::EventObservations(block) => block.kind(),
-            Self::EventFacts => BlockKind::EventFacts,
+            Self::EventFacts(block) => block.kind(),
             Self::LossCoverage(block) => block.kind(),
             Self::GaugeSamples(block) => block.kind(),
             Self::CounterSamples(block) => block.kind(),
@@ -240,12 +241,7 @@ impl BlockContent {
         match self {
             Self::SourceManifest(block) => encoded_block(block.as_ref()),
             Self::EventObservations(block) => encoded_block(block.as_ref()),
-            Self::EventFacts => EncodedBlock {
-                body: Vec::new(),
-                sorted: true,
-                item_count: 0,
-                time_range: None,
-            },
+            Self::EventFacts(block) => encoded_block(block.as_ref()),
             Self::LossCoverage(block) => encoded_block(block.as_ref()),
             Self::GaugeSamples(block) => encoded_block(block.as_ref()),
             Self::CounterSamples(block) => encoded_block(block.as_ref()),
@@ -357,11 +353,23 @@ impl FactFile {
             }
             _ => None,
         });
+        let fact_strings = selected.iter().find_map(|block| match block {
+            BlockContent::EventFacts(facts) => Some(facts.string_table().clone()),
+            _ => None,
+        });
+        if observation_strings
+            .as_ref()
+            .zip(fact_strings.as_ref())
+            .is_some_and(|(observations, facts)| observations != facts)
+        {
+            return Err(CacheReadError::Corrupt);
+        }
         if let Some(supplied) = selected.iter().find_map(|block| match block {
             BlockContent::StringTable(strings) => Some(strings.as_ref()),
             _ => None,
         }) && observation_strings
             .as_ref()
+            .or(fact_strings.as_ref())
             .is_some_and(|derived| derived != supplied)
         {
             return Err(CacheReadError::Corrupt);
@@ -1141,14 +1149,11 @@ fn validate_logical_blocks(
                 logical_descriptor(&block)
             }
             BlockKind::EventFacts => {
-                if !body.is_empty() {
+                let block = EventFactsBlock::decode(body, &strings, bounds)?;
+                if block.string_table() != &strings {
                     return Err(CacheReadError::Corrupt);
                 }
-                LogicalDescriptor {
-                    sorted: true,
-                    item_count: 0,
-                    time_range: None,
-                }
+                logical_descriptor(&block)
             }
             BlockKind::LossCoverage => {
                 logical_descriptor(&LossCoverageBlock::decode_with_span_budgets(
@@ -1315,7 +1320,9 @@ fn empty_block(kind: BlockKind, bounds: &Bounds) -> Result<BlockContent, CacheRe
         BlockKind::EventObservations => Ok(BlockContent::EventObservations(Box::new(
             EventObservationsBlock::new(Vec::new(), bounds)?,
         ))),
-        BlockKind::EventFacts => Ok(BlockContent::EventFacts),
+        BlockKind::EventFacts => Ok(BlockContent::EventFacts(Box::new(
+            EventFactsBlock::new(Vec::new(), &StringTableBlock::new(Vec::new(), bounds)?, bounds)?,
+        ))),
         BlockKind::LossCoverage => Ok(BlockContent::LossCoverage(Box::new(
             LossCoverageBlock::new(
                 Coverage::empty(),

@@ -39,7 +39,7 @@ pub use overview::{
     BlockCodec, BlockContent, BlockDirectoryEntry, BlockError, BlockFlags, BlockKind, Bounds,
     BuildError, CacheReadError, CacheRebuildReason, CatalogEntryDescriptor, CounterSamplesBlock,
     DEFAULT_FALLBACK_BYTES, DEFAULT_FALLBACK_SEGMENT_HOURS, DictionaryContextEntry,
-    EntityStateRecord, EntityStatesBlock, EventObservationsBlock, FactBuildKey, FactFile,
+    EntityStateRecord, EntityStatesBlock, EventFactsBlock, EventObservationsBlock, FactBuildKey, FactFile,
     FactFileHeader, FactFileReader, FactKey, FactLoad, FactOrigin, FactReadStats, FactStore,
     FallbackConfig, FallbackConfigError, FallbackStats, FileKind, FoldEffect, GaugeSamplesBlock,
     GcCategoryUsage, GcConfig, GcConfigError, GcMark, GcOutcome, GcSkipReason, GcUsage,

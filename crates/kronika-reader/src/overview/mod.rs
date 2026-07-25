@@ -18,6 +18,7 @@ mod container;
 mod descriptors;
 mod dictionary;
 mod event_extract;
+mod event_facts;
 mod factkey;
 mod facts;
 mod fallback;
@@ -46,6 +47,7 @@ pub use descriptors::{
 pub use dictionary::{
     ResolvedPattern, TargetedDictionaryRead, TargetedDictionaryStats, resolve_targeted,
 };
+pub use event_facts::EventFactsBlock;
 pub use factkey::{FactBuildKey, FactKey, FileKind, placement, placement_dir};
 pub use facts::{BuildError, SegmentContext, SegmentContextError, SegmentFacts, SourceError};
 pub use fallback::{

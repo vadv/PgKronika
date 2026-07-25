@@ -13,8 +13,8 @@
 use std::collections::BTreeSet as DictionaryIdSet;
 
 use kronika_analytics::overview::{
-    Applicability, Coverage, CoverageSpan, EventObservation, NamingContractId, ObservationPayload,
-    ObservationProvenance, OracleError, OracleLimits, OracleResult, PeriodQuality,
+    Applicability, Coverage, CoverageSpan, EventFact, EventObservation, NamingContractId,
+    ObservationPayload, ObservationProvenance, OracleError, OracleLimits, OracleResult, PeriodQuality,
     PhysicalCountSemantics, RawOracle, RetainedExactness, SegmentIdentity, SegmentLocator,
     SourceCompleteness, query_bounded,
 };
@@ -33,6 +33,7 @@ use super::event_extract::{
     DictionaryFingerprint, EventExtraction, TIMESTAMP_FALLBACK_GAP_REASON, extract_events,
     fingerprint_dictionary,
 };
+use super::event_facts::EventFactsBlock;
 use super::limits::Bounds;
 use super::observations::EventObservationsBlock;
 
@@ -214,6 +215,7 @@ pub struct SegmentFacts {
     lineage: SegmentIdentity,
     manifest_entries: Vec<ManifestEntryDescriptor>,
     observations: Vec<EventObservation>,
+    event_facts: Vec<EventFact>,
     loss_coverage: LossCoverageBlock,
     retained_text_bytes: u64,
     dictionary_fingerprints: Vec<DictionaryFingerprint>,
@@ -355,6 +357,12 @@ impl SegmentFacts {
         max_ts: i64,
         bounds: &Bounds,
     ) -> Result<Self, BuildError> {
+        let event_facts = extracted
+            .observations
+            .iter()
+            .filter_map(|observation| EventFact::from_observation(observation).transpose())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_error| BuildError::Internal)?;
         let covered = segment_coverage(min_ts, max_ts)?;
         let loss_coverage = LossCoverageBlock::new(
             covered,
@@ -376,6 +384,7 @@ impl SegmentFacts {
             lineage,
             manifest_entries: extracted.manifest_entries,
             observations: extracted.observations,
+            event_facts,
             loss_coverage,
             retained_text_bytes: extracted.retained_text_bytes,
             dictionary_fingerprints: extracted.dictionary_fingerprints,
@@ -438,6 +447,12 @@ impl SegmentFacts {
         &self.observations
     }
 
+    /// Policy-neutral canonical event facts in canonical order.
+    #[must_use]
+    pub fn event_facts(&self) -> &[EventFact] {
+        &self.event_facts
+    }
+
     /// Segment coverage spans.
     #[must_use]
     pub const fn coverage(&self) -> &Coverage {
@@ -484,6 +499,16 @@ impl SegmentFacts {
             .try_fold(0_usize, |total, observation| {
                 total.checked_add(observation.resident_heap_bytes()?)
             })?;
+        let event_fact_slots = self
+            .event_facts
+            .capacity()
+            .checked_mul(size_of::<EventFact>())?;
+        let event_fact_heap = self
+            .event_facts
+            .iter()
+            .try_fold(0_usize, |total, fact| {
+                total.checked_add(fact.resident_heap_bytes()?)
+            })?;
         let dictionary = self
             .dictionary_fingerprints
             .capacity()
@@ -493,6 +518,8 @@ impl SegmentFacts {
             .checked_add(manifest)?
             .checked_add(observation_slots)?
             .checked_add(observation_heap)?
+            .checked_add(event_fact_slots)?
+            .checked_add(event_fact_heap)?
             .checked_add(self.loss_coverage.covered().resident_heap_bytes()?)?
             .checked_add(self.loss_coverage.known_gaps().resident_heap_bytes()?)?
             .checked_add(dictionary)
@@ -526,12 +553,14 @@ impl SegmentFacts {
         )?;
         let observations = EventObservationsBlock::new(self.observations.clone(), bounds)?;
         let strings = observations.string_table().clone();
+        let event_facts = EventFactsBlock::new(self.event_facts.clone(), &strings, bounds)?;
         FactFile::build(
             &self.identity,
             vec![
                 BlockContent::SourceManifest(Box::new(manifest)),
                 BlockContent::StringTable(Box::new(strings)),
                 BlockContent::EventObservations(Box::new(observations)),
+                BlockContent::EventFacts(Box::new(event_facts)),
                 BlockContent::LossCoverage(Box::new(self.loss_coverage.clone())),
             ],
             bounds,
@@ -638,6 +667,12 @@ impl SegmentFacts {
             return Err(CacheReadError::Corrupt);
         }
 
+        let (facts_entry, facts_body) =
+            singleton_body(&mut fact_reader, BlockKind::EventFacts)?;
+        let event_facts = EventFactsBlock::decode(&facts_body, &strings, bounds)?;
+        validate_block_descriptor(&facts_entry, &event_facts)?;
+        validate_event_fact_evidence(&event_facts, &observations)?;
+
         let coverage = merge_coverage_blocks(&mut fact_reader, bounds)?;
         let retained_text_bytes = bounds
             .decoded_block_len
@@ -650,6 +685,7 @@ impl SegmentFacts {
                 lineage: *lineage,
                 manifest_entries: manifest.entries().to_vec(),
                 observations: observations.into_observations(),
+                event_facts: event_facts.into_facts(),
                 loss_coverage: coverage,
                 retained_text_bytes,
                 dictionary_fingerprints: Vec::new(),
@@ -889,6 +925,40 @@ fn singleton_body<R: ReadAt>(
         return Err(CacheReadError::Corrupt);
     }
     bodies.pop().ok_or(CacheReadError::Corrupt)
+}
+
+fn validate_event_fact_evidence(
+    facts: &EventFactsBlock,
+    observations: &EventObservationsBlock,
+) -> Result<(), CacheReadError> {
+    let observation_ids: DictionaryIdSet<_> = observations
+        .observations()
+        .iter()
+        .map(EventObservation::observation_id)
+        .collect();
+    for fact in facts.facts() {
+        if fact
+            .supporting_observation_ids()
+            .iter()
+            .any(|id| !observation_ids.contains(id))
+        {
+            return Err(CacheReadError::Corrupt);
+        }
+        let expected_scope = fact
+            .supporting_observation_ids()
+            .first()
+            .and_then(|id| {
+                observations
+                    .observations()
+                    .iter()
+                    .find(|observation| observation.observation_id() == *id)
+            })
+            .map(EventObservation::source_scope_id);
+        if expected_scope != Some(fact.coverage().source_scope_id) {
+            return Err(CacheReadError::Corrupt);
+        }
+    }
+    Ok(())
 }
 
 fn merge_coverage_blocks<R: ReadAt>(
