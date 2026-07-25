@@ -1,0 +1,61 @@
+# Проверка overview parity-v1
+
+Артефакт проверки overview строится из исходных данных на одном точном Git
+head. Это доказательство контракта из
+`docs/superpowers/specs/2026-07-22-overview-index-timeline-api.md`, а не
+переносимое обещание производительности.
+
+## Dense-hour fixture
+
+`overview-dense-hour-v1` содержит ровно 720 снимков `pg_stat_database` с шагом
+пять секунд, одну строку reset context и полное покрытие исходной популяции для
+каждого снимка. Production extraction создаёт канонические блоки counters,
+gauges, resets, coverage и event facts. Runner записывает:
+
+- байты источника, fact file и декодированных блоков;
+- логический resident size и размер одного pinned набора фактов;
+- fixed metric bytes отдельно от переменных event/string bytes;
+- точное число рядов, samples, resets, states, coverage и facts;
+- fixed metric bytes на сохранённый sample без универсального budget claim.
+
+Disk и resident limits задаёт deployment:
+
+```text
+OVERVIEW_DENSE_DISK_BUDGET_BYTES
+OVERVIEW_DENSE_RESIDENT_BUDGET_BYTES
+```
+
+Без обоих значений артефакт остаётся candidate. Validator не выдаёт final PASS,
+если budget отсутствует или превышен.
+
+## Режимы и coldness
+
+Runner записывает все девять режимов: `derived-cold`, `restart-warm`,
+`process-hot`, `range-cold/facts-warm`, `live`, `concurrent-identical`,
+`concurrent-disjoint`, `memory-only` и `oracle-profile`.
+
+Слово cold здесь означает новый reader или пустое process-local состояние.
+Runner не вытесняет page cache ОС и честно пишет `storage_cold=false`.
+Storage-cold результат требует отдельной контролируемой процедуры для
+конкретного host/filesystem profile.
+
+## Локальный candidate
+
+```bash
+cargo run --release -p kronika-reader --example overview_qualification -- \
+  --output target/qualification/overview.json
+python3 scripts/validate-overview-qualification.py \
+  target/qualification/overview.json
+```
+
+CI загружает raw JSON, JSON структурной проверки и их SHA-256. Final validation
+для точного release head:
+
+```bash
+python3 scripts/validate-overview-qualification.py \
+  overview.json --exact-head GIT_SHA --final
+```
+
+Итоговое доказательство parity также требует, чтобы все связанные test, BDD,
+coverage и qualification jobs принадлежали одной попытке Actions на том же
+точном head. Артефакты разных запусков и dirty-tree результаты недействительны.

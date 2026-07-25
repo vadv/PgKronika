@@ -8,6 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  EXACT_SOURCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
   # CI cargo jobs build for host gnu; .cargo/config pins musl for release
   # binaries, but runners have no musl std, so tests/lint can't find core.
   CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
@@ -18,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EXACT_SOURCE_HEAD }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
@@ -27,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EXACT_SOURCE_HEAD }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p xtask -- check-deps
       - run: bash scripts/test-bdd-image.sh
@@ -36,6 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EXACT_SOURCE_HEAD }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
@@ -44,6 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EXACT_SOURCE_HEAD }}
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Collect coverage
@@ -58,6 +67,41 @@ jobs:
           name: coverage
           path: coverage.json
 
+  overview-qualification:
+    name: overview qualification artifact
+    runs-on: ubuntu-latest
+    env:
+      OVERVIEW_DENSE_DISK_BUDGET_BYTES: ${{ vars.OVERVIEW_DENSE_DISK_BUDGET_BYTES }}
+      OVERVIEW_DENSE_RESIDENT_BUDGET_BYTES: ${{ vars.OVERVIEW_DENSE_RESIDENT_BUDGET_BYTES }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EXACT_SOURCE_HEAD }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure exact-head dense-hour modes
+        run: |
+          cargo run --release -p kronika-reader --example overview_qualification -- --output target/qualification/overview.json
+          python3 scripts/validate-overview-qualification.py target/qualification/overview.json --exact-head "${EXACT_SOURCE_HEAD}" --output target/qualification/validation.json
+          sha256sum target/qualification/overview.json > target/qualification/overview.json.sha256
+          sha256sum target/qualification/validation.json > target/qualification/validation.json.sha256
+          {
+            echo '## Overview qualification candidate'
+            echo
+            echo "- exact head: \`${EXACT_SOURCE_HEAD}\`"
+            echo "- run attempt: \`${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}\`"
+            echo "- artifact: \`overview-qualification\`"
+            echo
+            echo 'Final PASS also requires every acceptance job on this exact head.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overview-qualification
+          path: |
+            target/qualification/overview.json
+            target/qualification/overview.json.sha256
+            target/qualification/validation.json
+            target/qualification/validation.json.sha256
+
   bdd-matrix:
     name: bdd matrix
     runs-on: ubuntu-latest
@@ -70,6 +114,8 @@ jobs:
       BDD_BUILDER_CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EXACT_SOURCE_HEAD }}
       - name: Compute exact dependency builder
         id: meta
         run: |

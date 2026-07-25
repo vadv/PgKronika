@@ -183,6 +183,7 @@ Basic Auth.
 - Подключения и сбор по базам: [`docs/connection-and-multidb.md`](docs/connection-and-multidb.md)
 - Контракты типов и качества данных: [`docs/type-registry.md`](docs/type-registry.md)
 - Локальные и CI-тесты: [`docs/testing.md`](docs/testing.md)
+- Проверка overview parity: [`docs/qualification/overview-parity-v1.ru.md`](docs/qualification/overview-parity-v1.ru.md)
 - Правила и runner BDD: [`docs/bdd-testing-guide.md`](docs/bdd-testing-guide.md) и [`kronika-bdd`](crates/kronika-bdd/)
 - Текущая архитектура: [`docs/architecture.md`](docs/architecture.md)
 - Контейнер: [`kronika-format`](crates/kronika-format/) и исторический design note [`docs/segment-format.md`](docs/segment-format.md)

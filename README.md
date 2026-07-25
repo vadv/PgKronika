@@ -181,6 +181,7 @@ Detailed limits and failure variants live in each crate's README and rustdoc.
 - PostgreSQL connection and collection behavior: [`docs/connection-and-multidb.md`](docs/connection-and-multidb.md)
 - Type and data-quality contracts: [`docs/type-registry.md`](docs/type-registry.md)
 - Local and CI tests: [`docs/testing.md`](docs/testing.md)
+- Overview parity evidence: [`docs/qualification/overview-parity-v1.md`](docs/qualification/overview-parity-v1.md)
 - BDD conventions and runner: [`docs/bdd-testing-guide.md`](docs/bdd-testing-guide.md) and [`kronika-bdd`](crates/kronika-bdd/)
 - Current architecture: [`docs/architecture.md`](docs/architecture.md)
 - Container reference: [`kronika-format`](crates/kronika-format/) and the historical design note [`docs/segment-format.md`](docs/segment-format.md)
