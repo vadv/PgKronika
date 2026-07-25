@@ -128,6 +128,11 @@ impl OverviewWriter {
         })
     }
 
+    /// The persistent-cache write mode and backoff diagnostics.
+    pub(crate) fn persist_mode(&self) -> kronika_reader::PersistModeSnapshot {
+        self.store.persist_mode()
+    }
+
     /// Reclaims fact files of dropped segments, at most once per
     /// [`GC_INTERVAL_PASSES`] refreshes.
     ///

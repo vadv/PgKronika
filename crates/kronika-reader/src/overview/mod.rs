@@ -24,6 +24,7 @@ mod gc;
 mod limits;
 mod live;
 mod observations;
+mod persist_mode;
 #[cfg(test)]
 mod proptests;
 mod publish;
@@ -57,4 +58,5 @@ pub use live::{
     reconcile_seal,
 };
 pub use observations::EventObservationsBlock;
+pub use persist_mode::{PersistMode, PersistModeSnapshot};
 pub use publish::{CacheRebuildReason, FactLoad, FactOrigin, FactStore, PersistError};

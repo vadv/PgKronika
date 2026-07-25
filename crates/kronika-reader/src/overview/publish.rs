@@ -11,6 +11,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use kronika_analytics::overview::SegmentIdentity;
 use kronika_format::ReadAt;
@@ -23,6 +24,7 @@ use super::facts::{BuildError, SegmentContext, SegmentFacts};
 use super::fallback::{FallbackConfig, FallbackFactKey, FallbackFactLru, FallbackStats};
 use super::gc::GcOutcome;
 use super::limits::Bounds;
+use super::persist_mode::{PersistModeSnapshot, PersistState};
 use crate::unit::{PgmBodyReadStats, PgmUnit};
 
 const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
@@ -173,6 +175,8 @@ pub struct FactStore {
     /// Per-file grace counter for [`collect_garbage`](Self::collect_garbage),
     /// carried across passes.
     gc_pending: Arc<Mutex<HashMap<PathBuf, u32>>>,
+    /// Write mode and retry backoff for the durable cache.
+    persist: Arc<Mutex<PersistState>>,
 }
 
 impl FactStore {
@@ -192,7 +196,22 @@ impl FactStore {
             cache_root: cache_root.into(),
             fallback: Arc::new(Mutex::new(FallbackFactLru::new(fallback_config))),
             gc_pending: Arc::new(Mutex::new(HashMap::new())),
+            persist: Arc::new(Mutex::new(PersistState::default())),
         }
+    }
+
+    /// The current persistence write mode and backoff diagnostics.
+    #[must_use]
+    pub fn persist_mode(&self) -> PersistModeSnapshot {
+        self.with_persist(|persist| persist.snapshot())
+    }
+
+    fn with_persist<T>(&self, operation: impl FnOnce(&mut PersistState) -> T) -> T {
+        let mut persist = match self.persist.lock() {
+            Ok(persist) => persist,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        operation(&mut persist)
     }
 
     /// Unlinks committed fact files whose segment is no longer live.
@@ -338,7 +357,7 @@ impl FactStore {
             .map_err(BuildError::from)?,
         );
 
-        let persist_error = self.publish_encoded(&admitted, &bytes, bounds).err();
+        let persist_error = self.publish_with_backoff(&admitted, &bytes, bounds);
         let fallback_key = FallbackFactKey::for_facts(&admitted);
         match persist_error {
             None => self.discard_fallback(fallback_key),
@@ -366,6 +385,35 @@ impl FactStore {
             Some(_error) => {}
         }
         Ok((admitted, persist_error))
+    }
+
+    /// Publishes `facts` unless an unexpired backoff suppresses the write.
+    ///
+    /// While backed off the disk is not touched; the standing failure reason
+    /// is reported and facts stay memory-only. An attempted write updates the
+    /// mode: success clears backoff, a recoverable failure arms the next
+    /// retry deadline.
+    fn publish_with_backoff(
+        &self,
+        facts: &SegmentFacts,
+        bytes: &[u8],
+        bounds: &Bounds,
+    ) -> Option<PersistError> {
+        if !self.with_persist(|persist| persist.should_attempt_write(Instant::now())) {
+            return Some(self.with_persist(|persist| persist.standing_reason()));
+        }
+        match self.publish_encoded(facts, bytes, bounds) {
+            Ok(_path) => {
+                self.with_persist(PersistState::on_success);
+                None
+            }
+            Err(error) => {
+                if error.is_fallback_eligible() {
+                    self.with_persist(|persist| persist.on_failure(error, Instant::now()));
+                }
+                Some(error)
+            }
+        }
     }
 
     fn publish_encoded(

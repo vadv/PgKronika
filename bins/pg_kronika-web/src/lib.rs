@@ -262,6 +262,16 @@ const RESPONSE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Secondary response-cache ceiling for small bodies.
 const RESPONSE_CACHE_ENTRIES: usize = 4_096;
 
+/// Numeric encoding of the persistence write mode for the mode gauge:
+/// `0` read-write, `1` read-only backoff, `2` unavailable backoff.
+const fn persist_mode_code(mode: kronika_reader::PersistMode) -> f64 {
+    match mode {
+        kronika_reader::PersistMode::ReadWrite => 0.0,
+        kronika_reader::PersistMode::ReadOnlyBackoff => 1.0,
+        kronika_reader::PersistMode::UnavailableBackoff => 2.0,
+    }
+}
+
 fn default_overview_config() -> OverviewConfig {
     static INSTANCE: AtomicU64 = AtomicU64::new(0);
     let instance = INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -471,7 +481,10 @@ impl AppState {
         let timeline = overview.assemble_with_live(&snapshot, delta)?;
         let diagnostics = overview.diagnostics();
         let gc = overview.collect_fact_garbage();
+        let persist = overview.persist_mode();
         drop(overview);
+        metrics::gauge!("kronika_web_overview_persist_mode").set(persist_mode_code(persist.mode));
+        metrics::gauge!("kronika_web_overview_persist_failures").set(f64::from(persist.failures));
         if let Some(gc) = gc {
             metrics::counter!("kronika_web_overview_gc_deleted_total").increment(gc.deleted);
             metrics::counter!("kronika_web_overview_gc_freed_bytes_total")
