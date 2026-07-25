@@ -32,7 +32,6 @@ pub(crate) struct EventFact {
     pub(crate) event_id: String,
     pub(crate) event_instance_id: String,
     pub(crate) source_id: u64,
-    pub(crate) source_scope_id: String,
     pub(crate) source_type_id: Option<u32>,
     pub(crate) identity_quality: &'static str,
     pub(crate) sort_ts_us: i64,
@@ -129,7 +128,6 @@ pub(crate) struct SupportingEvidence {
     pub(crate) catalog_entry_ordinal: Option<u32>,
     pub(crate) row_ordinal: Option<u32>,
     pub(crate) dictionary_context_id: Option<String>,
-    pub(crate) segment_locator: Option<String>,
 }
 
 /// Proven upstream loss attached to one retained fact.
@@ -150,7 +148,6 @@ pub(crate) struct CoverageSpanDto {
 #[derive(Debug, Serialize)]
 pub(crate) struct SourceFreshnessDto {
     pub(crate) source_id: u64,
-    pub(crate) source_scope_id: Option<String>,
     pub(crate) data_through_us: Option<i64>,
     pub(crate) source_status: &'static str,
     pub(crate) source_completeness: &'static str,
@@ -301,7 +298,6 @@ impl EventFactProjection {
             event_id: URL_SAFE_NO_PAD.encode(position.event_id),
             event_instance_id: URL_SAFE_NO_PAD.encode(position.event_instance_id),
             source_id,
-            source_scope_id: URL_SAFE_NO_PAD.encode(observation.source_scope_id().0),
             source_type_id: Some(observation.source_type_id()),
             identity_quality: identity_quality_name(observation.identity_quality()),
             sort_ts_us: time.sort_ts_us,
@@ -325,9 +321,6 @@ impl EventFactProjection {
                 dictionary_context_id: Some(
                     URL_SAFE_NO_PAD.encode(provenance.dictionary_context_id.0),
                 ),
-                segment_locator: provenance
-                    .segment_locator
-                    .map(|locator| URL_SAFE_NO_PAD.encode(locator.0)),
             }],
             loss: observation.loss().map(event_loss),
         })
@@ -358,7 +351,6 @@ impl EventFactProjection {
             event_id: URL_SAFE_NO_PAD.encode(position.event_id),
             event_instance_id: URL_SAFE_NO_PAD.encode(position.event_instance_id),
             source_id,
-            source_scope_id: URL_SAFE_NO_PAD.encode(fact.coverage().source_scope_id.0),
             source_type_id: None,
             identity_quality: "content_derived",
             sort_ts_us: interval.start_us(),
@@ -386,7 +378,6 @@ impl EventFactProjection {
                     catalog_entry_ordinal: None,
                     row_ordinal: None,
                     dictionary_context_id: None,
-                    segment_locator: None,
                 })
                 .collect(),
             loss: fact.coverage().loss.as_ref().map(event_loss),
@@ -441,7 +432,7 @@ fn semantic_event_id(observation: &EventObservation) -> Option<[u8; 32]> {
     let time = observation.time();
     let mut hasher = Sha256::new();
     hasher.update(b"pgk-overview-event-fact-v1");
-    hasher.update(observation.source_scope_id().0);
+    hasher.update(observation.source_id().to_le_bytes());
     hasher.update(observation.source_type_id().to_le_bytes());
     hasher.update(time.sort_ts_us.to_le_bytes());
     match time.occurred_at_us {
@@ -509,13 +500,6 @@ fn event_instance_id(observation: &EventObservation) -> [u8; 32] {
     hasher.update(provenance.catalog_entry_ordinal.to_le_bytes());
     hasher.update(provenance.row_ordinal.to_le_bytes());
     hasher.update(provenance.dictionary_context_id.0);
-    match provenance.segment_locator {
-        Some(locator) => {
-            hasher.update([1]);
-            hasher.update(locator.0);
-        }
-        None => hasher.update([0]),
-    }
     hasher.finalize().into()
 }
 

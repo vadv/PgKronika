@@ -1030,7 +1030,6 @@
         "additionalProperties": false,
         "required": [
           "source_id",
-          "source_scope_id",
           "data_through_us",
           "source_status",
           "source_completeness",
@@ -1039,12 +1038,6 @@
         ],
         "properties": {
           "source_id": { "type": "integer", "minimum": 0 },
-          "source_scope_id": {
-            "oneOf": [
-              { "$ref": "#/components/schemas/B64UrlSha256" },
-              { "type": "null" }
-            ]
-          },
           "data_through_us": { "type": ["integer", "null"], "format": "int64" },
           "source_status": { "$ref": "#/components/schemas/TimelineSourceStatus" },
           "source_completeness": { "$ref": "#/components/schemas/TimelineSourceCompleteness" },
@@ -1131,8 +1124,7 @@
           "section_body_id",
           "catalog_entry_ordinal",
           "row_ordinal",
-          "dictionary_context_id",
-          "segment_locator"
+          "dictionary_context_id"
         ],
         "properties": {
           "observation_id": { "$ref": "#/components/schemas/B64UrlSha256" },
@@ -1153,12 +1145,6 @@
             "maximum": 4294967295
           },
           "dictionary_context_id": {
-            "oneOf": [
-              { "$ref": "#/components/schemas/B64UrlSha256" },
-              { "type": "null" }
-            ]
-          },
-          "segment_locator": {
             "oneOf": [
               { "$ref": "#/components/schemas/B64UrlSha256" },
               { "type": "null" }
@@ -1329,7 +1315,6 @@
           "event_id",
           "event_instance_id",
           "source_id",
-          "source_scope_id",
           "source_type_id",
           "identity_quality",
           "sort_ts_us",
@@ -1355,7 +1340,6 @@
             "description": "Physical retained-observation identifier"
           },
           "source_id": { "type": "integer", "minimum": 0 },
-          "source_scope_id": { "$ref": "#/components/schemas/B64UrlSha256" },
           "source_type_id": {
             "type": ["integer", "null"],
             "minimum": 0,

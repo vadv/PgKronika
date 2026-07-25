@@ -45,13 +45,13 @@ pub use container::{
 };
 pub use descriptors::{
     CatalogEntryDescriptor, DictionaryContextEntry, ManifestEntryDescriptor, SourceDescriptor,
-    dictionary_context_id, lineage_from_catalog, section_body_id, source_scope_id,
+    dictionary_context_id, lineage_from_catalog, section_body_id,
 };
 pub use dictionary::{
     ResolvedPattern, TargetedDictionaryRead, TargetedDictionaryStats, resolve_targeted,
 };
 pub use event_facts::EventFactsBlock;
-pub use factkey::{FactBuildKey, FactKey, FileKind, placement, placement_dir};
+pub use factkey::{FactBuildKey, FactKey, FileKind};
 pub use facts::{BuildError, SegmentContext, SegmentContextError, SegmentFacts, SourceError};
 pub use fallback::{
     DEFAULT_FALLBACK_BYTES, DEFAULT_FALLBACK_SEGMENT_HOURS, FallbackConfig, FallbackConfigError,

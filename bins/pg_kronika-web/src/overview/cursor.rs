@@ -474,7 +474,7 @@ mod tests {
     }
 
     fn empty_view(view_generation: u64) -> Arc<IndexView> {
-        let mut builder = LiveBuilder::new(b"cursor-test".to_vec(), LIMIT).expect("live builder");
+        let mut builder = LiveBuilder::new(LIMIT).expect("live builder");
         let delta = RefreshDelta {
             previous_view_generation: view_generation.saturating_sub(1),
             new_view_generation: view_generation,

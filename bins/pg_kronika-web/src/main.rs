@@ -55,10 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|err| format!("failed to resolve store at {}: {err}", cfg.dir.display()))?;
     let snapshot = LocalDirSnapshot::open(&canonical_store)
         .map_err(|err| format!("failed to open store at {}: {err}", cfg.dir.display()))?;
-    let mut overview = OverviewConfig::new(
-        cfg.overview_cache_dir.clone(),
-        cfg.overview_namespace.clone(),
-    );
+    let mut overview = OverviewConfig::new();
     overview.fallback = cfg.overview_fallback;
     overview.gc = cfg.overview_gc;
     overview.response_cache_bytes = cfg.overview_response_cache_bytes;
@@ -85,7 +82,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         version = env!("CARGO_PKG_VERSION"),
         format_version = FORMAT_VERSION,
         store = %cfg.dir.display(),
-        overview_cache = %cfg.overview_cache_dir.display(),
         overview_max_selected_segments = cfg.overview_max_selected_segments,
         "pg_kronika-web starting"
     );

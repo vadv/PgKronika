@@ -15,7 +15,7 @@ use kronika_analytics::overview::{
     CoverageSpan, CoverageState, EntityKind, EntityRef, FactorCoverage, FactorId, GaugeSample,
     LossReason, MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality,
     PhysicalCountSemantics, PopulationTotalQuality, ResetFamily, RetainedExactness,
-    SourceCompleteness, SourcePopulation, SourceScopeId,
+    SourceCompleteness, SourcePopulation,
 };
 
 use super::bytes::{ByteError, ByteReader, ByteWriter};
@@ -265,7 +265,7 @@ fn untyped_series(
         .map(|series_id| MetricSeriesDescriptor {
             series_id,
             factor_id: FactorId(0),
-            source_scope_id: SourceScopeId([0; 32]),
+            source_id: 0,
             source_type_id: 0,
             unit: MetricUnit::Count,
             entity: None,
@@ -317,7 +317,7 @@ fn write_series_descriptors(writer: &mut ByteWriter, series: &[MetricSeriesDescr
     for descriptor in series {
         write_series_id(writer, descriptor.series_id);
         writer.u32_le(descriptor.factor_id.0);
-        writer.bytes(&descriptor.source_scope_id.0);
+        writer.u64_le(descriptor.source_id);
         writer.u32_le(descriptor.source_type_id);
         writer.u8(descriptor.unit.code());
         match descriptor.entity {
@@ -347,7 +347,7 @@ fn read_series_descriptors(
     for _ in 0..count {
         let series_id = read_series_id(reader)?;
         let factor_id = FactorId(reader.u32_le()?);
-        let source_scope_id = SourceScopeId(reader.array()?);
+        let source_id = reader.u64_le()?;
         let source_type_id = reader.u32_le()?;
         let unit = MetricUnit::from_code(reader.u8()?).ok_or(BlockError::InvalidEnum)?;
         let entity = match reader.u8()? {
@@ -366,7 +366,7 @@ fn read_series_descriptors(
         series.push(MetricSeriesDescriptor {
             series_id,
             factor_id,
-            source_scope_id,
+            source_id,
             source_type_id,
             unit,
             entity,

@@ -71,10 +71,7 @@ async fn a_metadata_only_fallback_keeps_the_snapshot_that_authorized_its_descrip
         initial_snapshot,
         0,
         Duration::from_secs(10),
-        OverviewConfig::new(
-            dir.path().join(".overview-cache"),
-            b"last-good-descriptor-authority".to_vec(),
-        ),
+        OverviewConfig::new(),
     )
     .expect("state");
 
@@ -105,8 +102,6 @@ async fn a_metadata_only_fallback_keeps_the_snapshot_that_authorized_its_descrip
 async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_body() {
     let dir = tempfile::tempdir().expect("tempdir");
     let segment_path = dir.path().join("one.pgm");
-    let cache_root = dir.path().join(".overview-cache");
-    let namespace = b"durable-first-restart".to_vec();
     write_overview_event_segment(dir.path());
 
     let first_snapshot =
@@ -115,7 +110,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
         first_snapshot,
         0,
         Duration::from_secs(10),
-        OverviewConfig::new(cache_root.clone(), namespace.clone()),
+        OverviewConfig::new(),
     )
     .expect("first state");
     let first = app(first_state, None, test_metrics_handle())
@@ -137,7 +132,7 @@ async fn a_restart_uses_the_durable_fact_before_reading_a_now_corrupt_section_bo
         restarted_snapshot,
         0,
         Duration::from_secs(10),
-        OverviewConfig::new(cache_root, namespace),
+        OverviewConfig::new(),
     )
     .expect("restarted state");
     let restarted = app(restarted_state, None, test_metrics_handle())
@@ -166,10 +161,7 @@ async fn a_source_read_failure_returns_an_uncached_explicit_gap() {
         snapshot,
         0,
         Duration::from_secs(10),
-        OverviewConfig::new(
-            dir.path().join(".overview-cache"),
-            b"source-read-partial".to_vec(),
-        ),
+        OverviewConfig::new(),
     )
     .expect("state");
     corrupt_first_section_body(&segment_path);
@@ -211,10 +203,7 @@ async fn scheduled_source_scrub_prevents_a_durable_fact_from_masking_damage() {
     let segment_path = dir.path().join("one.pgm");
     write_overview_event_segment(dir.path());
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("snapshot");
-    let mut config = OverviewConfig::new(
-        dir.path().join(".overview-cache"),
-        b"source-scrub-damage".to_vec(),
-    );
+    let mut config = OverviewConfig::new();
     config.source_scrub_interval = Duration::from_millis(10);
     let state = AppState::with_overview_config(snapshot, 0, Duration::from_secs(10), config)
         .expect("state");

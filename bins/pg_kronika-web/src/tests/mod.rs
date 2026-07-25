@@ -151,10 +151,7 @@ fn state_for_dir(dir: &std::path::Path) -> AppState {
         snapshot,
         0,
         std::time::Duration::from_secs(10),
-        OverviewConfig::new(
-            dir.join(".test-overview-cache"),
-            dir.as_os_str().as_encoded_bytes().to_vec(),
-        ),
+        OverviewConfig::new(),
     )
     .expect("state")
 }

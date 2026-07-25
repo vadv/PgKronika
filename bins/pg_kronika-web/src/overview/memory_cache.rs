@@ -197,9 +197,8 @@ fn record_gauges(inner: &CacheInner) {
 
 #[cfg(test)]
 mod tests {
-    use kronika_analytics::overview::{NamingContractId, SegmentLocator};
     use kronika_format::{PartMeta, SectionInput, build_part};
-    use kronika_reader::{FactKey, FileKind, LIMIT, PgmUnit, SegmentContext};
+    use kronika_reader::{FactKey, FileKind, LIMIT, PgmUnit};
     use kronika_registry::Section as _;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 
@@ -220,15 +219,8 @@ mod tests {
             },
         );
         let unit = PgmUnit::open(bytes).expect("open fixture");
-        let context = SegmentContext::new(
-            b"cache-test".to_vec(),
-            NamingContractId([1; 16]),
-            SegmentLocator([seed; 32]),
-        )
-        .expect("context");
-        let facts = Arc::new(
-            SegmentFacts::extract(&unit, &context, &LIMIT).expect("extract fixture facts"),
-        );
+        let facts =
+            Arc::new(SegmentFacts::extract(&unit, &LIMIT).expect("extract fixture facts"));
         let key = FactBuildKey::new(
             FactKey::for_identity(facts.identity(), FileKind::SegmentFacts),
             facts.lineage().id(),

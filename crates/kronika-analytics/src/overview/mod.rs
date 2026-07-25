@@ -64,10 +64,10 @@ pub use notable::{
 pub use observation::{
     CheckpointPayload, DictionaryContextId, DroppedFieldCount, ErrorGroupPayload, EventObservation,
     EvidenceQuality, FactId, IdentityQuality, InvalidObservation, LifecyclePayload,
-    LockWaitPayload, LogGapPayload, LossReason, LossSummary, MaintenancePayload, NamingContractId,
-    ObservationId, ObservationPayload, ObservationProvenance, ObservationShape, ObservationTime,
-    QualityFlags, SectionBodyId, SegmentIdentity, SegmentLineageId, SegmentLocator,
-    SlowQueryPayload, SourceLocator, SourceScopeId, TempFilePayload, TimeQuality,
+    LockWaitPayload, LogGapPayload, LossReason, LossSummary, MaintenancePayload, ObservationId,
+    ObservationPayload, ObservationProvenance, ObservationShape, ObservationTime, QualityFlags,
+    SectionBodyId, SegmentIdentity, SegmentLineageId, SlowQueryPayload, SourceLocator,
+    TempFilePayload, TimeQuality,
 };
 pub use oracle::{
     MemoryOracle, OracleError, OracleLimits, OracleResource, OracleResult, OracleSourceError,
@@ -80,20 +80,21 @@ pub use reduce::{
     TimeWeightedReduction, classify_series, time_weighted_mean,
 };
 
-/// Reserved version for future fact-container framing.
-pub const CONTAINER_VERSION: u16 = 1;
+/// Fact-container framing version.
+///
+/// Version 2 stores the fact key and segment lineage in each sibling sidecar
+/// header.
+pub const CONTAINER_VERSION: u16 = 2;
 
 /// Canonical fact schema version.
 ///
-/// Version 2 materializes policy-neutral event facts and typed metric-series
-/// metadata instead of leaving the reserved blocks empty.
-pub const FACT_SCHEMA_VERSION: u32 = 2;
+/// Version 3 uses the numeric PGM source ID throughout canonical facts.
+pub const FACT_SCHEMA_VERSION: u32 = 3;
 
 /// Version for PGM-to-fact extraction and normalization.
 ///
-/// Version 4 makes retained collector-loss identity include its optional
-/// lower bound.
-pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 4;
+/// Version 5 derives sealed lineage from exact PGM metadata.
+pub const EXTRACTOR_SEMANTICS_VERSION: u32 = 5;
 
 /// Counter/gauge reduction, alignment, and bucket-attribution semantics.
 ///

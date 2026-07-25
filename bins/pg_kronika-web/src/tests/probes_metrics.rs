@@ -149,10 +149,7 @@ fn selected_segment_policy_exports_one_static_rejection_series_and_its_effective
         runtime.block_on(async {
             let snapshot =
                 kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-            let mut config = OverviewConfig::new(
-                dir.path().join(".overview-cache"),
-                dir.path().as_os_str().as_encoded_bytes().to_vec(),
-            );
+            let mut config = OverviewConfig::new();
             config.max_selected_segments = 1;
             let state = AppState::with_overview_config(
                 snapshot,

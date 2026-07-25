@@ -10,8 +10,8 @@ use kronika_analytics::overview::{
     ErrorGroupPayload, EventObservation, EvidenceQuality, FiniteF64, LifecyclePayload,
     LockWaitPayload, LogGapPayload, LossReason, LossSummary, MaintenancePayload,
     ObservationPayload, ObservationProvenance, ObservationShape, ObservationTime, QualityFlags,
-    SectionBodyId, SegmentIdentity, SegmentLocator, Severity, SlowQueryPayload, SourceLocator,
-    SqlState, TempFilePayload, TimeQuality,
+    SectionBodyId, SegmentIdentity, Severity, SlowQueryPayload, SourceLocator, SqlState,
+    TempFilePayload, TimeQuality,
 };
 
 use super::block::{BlockError, BlockKind, EncodableBlock, StringTableBlock};
@@ -287,26 +287,7 @@ const fn dropped_field_count(value: DroppedFieldCount) -> u32 {
     value.0
 }
 
-fn write_optional_id32(writer: &mut ByteWriter, value: Option<[u8; 32]>) {
-    match value {
-        Some(inner) => {
-            writer.u8(1);
-            writer.bytes(&inner);
-        }
-        None => writer.u8(0),
-    }
-}
-
-fn read_optional_id32(reader: &mut ByteReader<'_>) -> Result<Option<[u8; 32]>, BlockError> {
-    match reader.u8()? {
-        0 => Ok(None),
-        1 => Ok(Some(reader.array()?)),
-        _ => Err(BlockError::Malformed),
-    }
-}
-
 fn write_provenance(writer: &mut ByteWriter, provenance: &ObservationProvenance) {
-    write_optional_id32(writer, provenance.segment_locator.map(|locator| locator.0));
     writer.bytes(&provenance.section_body_id.0);
     writer.u32_le(provenance.catalog_entry_ordinal);
     writer.u32_le(provenance.row_ordinal);
@@ -322,7 +303,6 @@ fn write_provenance(writer: &mut ByteWriter, provenance: &ObservationProvenance)
 }
 
 fn read_provenance(reader: &mut ByteReader<'_>) -> Result<ObservationProvenance, BlockError> {
-    let segment_locator = read_optional_id32(reader)?.map(SegmentLocator);
     let section_body_id = SectionBodyId(reader.array()?);
     let catalog_entry_ordinal = reader.u32_le()?;
     let row_ordinal = reader.u32_le()?;
@@ -336,7 +316,6 @@ fn read_provenance(reader: &mut ByteReader<'_>) -> Result<ObservationProvenance,
         _ => return Err(BlockError::Malformed),
     };
     Ok(ObservationProvenance {
-        segment_locator,
         section_body_id,
         catalog_entry_ordinal,
         row_ordinal,
@@ -1245,24 +1224,15 @@ const fn is_event_source_type(type_id: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use kronika_analytics::overview::{NamingContractId, SourceScopeId};
-
     use super::super::limits::LIMIT;
     use super::*;
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(
-            SourceScopeId([1; 32]),
-            NamingContractId([2; 16]),
-            SegmentLocator([3; 32]),
-            7,
-            b"descriptor",
-        )
+        SegmentIdentity::sealed(1, [2; 32], 7, b"descriptor")
     }
 
     fn provenance(row_ordinal: u32) -> ObservationProvenance {
         ObservationProvenance {
-            segment_locator: Some(SegmentLocator([3; 32])),
             section_body_id: SectionBodyId([0xAA; 32]),
             catalog_entry_ordinal: 0,
             row_ordinal,
@@ -1534,18 +1504,15 @@ mod tests {
     }
 
     #[test]
-    fn decoding_with_the_wrong_lineage_is_a_reconstruct_error() {
+    fn decoding_derives_identity_from_the_validated_lineage_context() {
         let block = EventObservationsBlock::new(vec![ready(1)], &LIMIT).expect("valid");
-        let wrong = SegmentIdentity::sealed(
-            SourceScopeId([1; 32]),
-            NamingContractId([2; 16]),
-            SegmentLocator([9; 32]),
-            7,
-            b"descriptor",
-        );
-        assert_eq!(
-            EventObservationsBlock::decode(&block.encode(), &wrong, block.string_table(), &LIMIT),
-            Err(BlockError::Reconstruct)
+        let wrong = SegmentIdentity::sealed(1, [9; 32], 7, b"descriptor");
+        let decoded =
+            EventObservationsBlock::decode(&block.encode(), &wrong, block.string_table(), &LIMIT)
+                .expect("the enclosing container validates lineage");
+        assert_ne!(
+            decoded.observations()[0].observation_id(),
+            block.observations()[0].observation_id()
         );
     }
 

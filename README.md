@@ -142,16 +142,24 @@ allow lists with `cargo run -p xtask -- check-deps`.
   writes and synchronizes a temporary file, then publishes without overwriting
   an existing segment. A torn final journal frame is truncated on recovery;
   other damage remains visible in scan diagnostics. For sealed segments, the
-  timeline index checks admitted durable fact files with matching lineage
+  timeline index checks admitted sibling fact files with matching lineage
   before the bounded process-local fallback. Only a recoverable publication
   failure can place the same immutable facts in that fallback.
-- **Derived fact cache.** One independently constructed `FactStore` or process
-  may mutate a cache root; clones share that owner lease. Other stores can
-  still read committed facts. Garbage collection is confined to
-  `overview/v1`, refuses to sweep after an unavailable, incomplete, or capped
-  scan, and does not delete source PGM, locks, symlinks, or unrecognized files.
-  Logical-byte and file-count ceilings are disabled unless configured. Write
-  backoff never suppresses durable reads.
+- **Derived fact sidecars.** `KRONIKA_WEB_DIR` is one PgKronika-owned data
+  directory. Every sealed `N.pgm` has at most one `N.ovf` sibling:
+
+  ```text
+  /data/active.parts
+  /data/1721916000000000.pgm
+  /data/1721916000000000.ovf
+  ```
+
+  One independently constructed `FactStore` or process holds the directory
+  mutation lease; clones share it. Garbage collection scans the directory
+  with fixed bounds, refuses to sweep after an unavailable, incomplete, or
+  capped scan, and never deletes PGM source files or follows symlinks. Optional
+  logical-byte and file-count ceilings apply only to recognized derived
+  files. Write backoff never suppresses reads of valid sidecars.
 - **Resource bounds.** Registry sections are capped at 65,536 rows, 8 MiB of
   encoded bytes, and 16 Parquet row groups. The collector applies source,
   dictionary, cycle-time, journal, and cardinality caps. Reader queries have

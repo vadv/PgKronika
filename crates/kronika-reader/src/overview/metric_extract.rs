@@ -15,7 +15,7 @@ use kronika_analytics::overview::{
     EntityKind, EventFact, EventKind, FactorCoverage, FactorId, GaugeSample, LossReason,
     MetricFactor, MetricSeriesDescriptor, MetricSeriesId, MetricUnit, PeriodQuality,
     PhysicalCountSemantics, PopulationTotalQuality, ResetFamily, RetainedExactness,
-    SourceCompleteness, SourcePopulation, SourceScopeId, derive_alignment, derive_entity,
+    SourceCompleteness, SourcePopulation, derive_alignment, derive_entity,
 };
 use kronika_format::ReadAt;
 use kronika_registry::{Cell, Row};
@@ -274,7 +274,7 @@ impl MetricAccumulator {
             return Ok(());
         }
         self.admit_item(self.counters.len())?;
-        let alignment_id = derive_alignment(descriptor.source_scope_id, descriptor.entity);
+        let alignment_id = derive_alignment(descriptor.source_id, descriptor.entity);
         self.counters.push(CounterSample::new(
             descriptor.series_id,
             alignment_id,
@@ -341,7 +341,7 @@ impl MetricAccumulator {
         &mut self,
         factor: MetricFactor,
         source_type_id: u32,
-        scope: SourceScopeId,
+        scope: u64,
         entity_kind: EntityKind,
         ts_us: i64,
         population_total: u64,
@@ -380,7 +380,7 @@ impl MetricAccumulator {
 )]
 pub(super) fn extract_metrics<R: ReadAt>(
     unit: &PgmUnit<R>,
-    source_scope_id: SourceScopeId,
+    source_id: u64,
     segment_range: Option<CoverageSpan>,
     bounds: &Bounds,
 ) -> Result<MetricExtraction, BuildError> {
@@ -450,47 +450,47 @@ pub(super) fn extract_metrics<R: ReadAt>(
         register_factor_inventory(&mut metrics, section.type_id);
         match section.type_id {
             type_id if PG_STAT_DATABASE_TYPES.contains(&type_id) => {
-                extract_pg_database(&mut metrics, section, source_scope_id, &reset_timeline)?;
+                extract_pg_database(&mut metrics, section, source_id, &reset_timeline)?;
             }
             OS_CGROUP_MEMORY => {
-                extract_cgroup_memory(&mut metrics, section, source_scope_id, &reset_timeline)?;
+                extract_cgroup_memory(&mut metrics, section, source_id, &reset_timeline)?;
             }
             OS_VMSTAT => {
-                extract_vmstat(&mut metrics, section, source_scope_id, &reset_timeline)?;
+                extract_vmstat(&mut metrics, section, source_id, &reset_timeline)?;
             }
             REPLICATION_INSTANCE => {
-                extract_replication_instance(&mut metrics, section, source_scope_id)?;
+                extract_replication_instance(&mut metrics, section, source_id)?;
             }
             PG_REPLICATION_PHYSICAL => extract_replication_senders(
                 &mut metrics,
                 section,
-                source_scope_id,
+                source_id,
                 &snapshot_coverage,
             )?,
             type_id if PG_REPLICATION_SLOT_TYPES.contains(&type_id) => extract_replication_slots(
                 &mut metrics,
                 section,
-                source_scope_id,
+                source_id,
                 &snapshot_coverage,
             )?,
             type_id if PG_STORAGE_MOUNT_TYPES.contains(&type_id) => {
-                extract_storage_mounts(&mut metrics, section, source_scope_id)?;
+                extract_storage_mounts(&mut metrics, section, source_id)?;
             }
             PG_PROCESS_CGROUP_MEMORY => {
-                extract_process_cgroup_memory(&mut metrics, section, source_scope_id)?;
+                extract_process_cgroup_memory(&mut metrics, section, source_id)?;
             }
             RESET_METADATA | INSTANCE_METADATA | COLLECTION_COVERAGE | SNAPSHOT_COVERAGE => {}
             _ => return Err(BuildError::Internal),
         }
     }
-    extract_reset_metadata(&mut metrics, &decoded, source_scope_id)?;
+    extract_reset_metadata(&mut metrics, &decoded, source_id)?;
     extract_snapshot_boundaries(
         &mut metrics,
         &snapshot_coverage,
-        source_scope_id,
+        source_id,
         &reset_timeline,
     )?;
-    let event_facts = collector_event_facts(&snapshot_coverage, source_scope_id, bounds)?;
+    let event_facts = collector_event_facts(&snapshot_coverage, source_id, bounds)?;
 
     if !reset_timeline.has_pg_context() {
         for factor in [
@@ -620,7 +620,7 @@ fn register_factor_inventory(out: &mut MetricAccumulator, source_type_id: u32) {
 fn extract_pg_database(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: SourceScopeId,
+    scope: u64,
     reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
@@ -708,7 +708,7 @@ fn extract_pg_database(
 fn extract_cgroup_memory(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: SourceScopeId,
+    scope: u64,
     reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
@@ -777,7 +777,7 @@ fn extract_cgroup_memory(
 fn extract_vmstat(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: SourceScopeId,
+    scope: u64,
     reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
@@ -816,7 +816,7 @@ fn extract_vmstat(
 fn extract_replication_instance(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: SourceScopeId,
+    scope: u64,
 ) -> Result<(), BuildError> {
     let entity = derive_entity(scope, EntityKind::Postmaster, b"instance");
     for row in &section.rows {
@@ -875,7 +875,7 @@ fn extract_replication_instance(
 fn extract_replication_senders(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: SourceScopeId,
+    scope: u64,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
@@ -914,7 +914,7 @@ fn extract_replication_senders(
 fn extract_replication_slots(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: SourceScopeId,
+    scope: u64,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
@@ -948,7 +948,7 @@ fn extract_replication_slots(
 fn extract_storage_mounts(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: SourceScopeId,
+    scope: u64,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         if required_u32(row, "mapping_state")? != 1 {
@@ -997,7 +997,7 @@ fn extract_storage_mounts(
 fn extract_process_cgroup_memory(
     out: &mut MetricAccumulator,
     section: &DecodedMetricSection,
-    scope: SourceScopeId,
+    scope: u64,
 ) -> Result<(), BuildError> {
     for row in &section.rows {
         if required_u32(row, "mapping_state")? != 1 {
@@ -1091,7 +1091,7 @@ fn reset_timeline(sections: &[DecodedMetricSection]) -> Result<ResetTimeline, Bu
 fn extract_reset_metadata(
     out: &mut MetricAccumulator,
     sections: &[DecodedMetricSection],
-    scope: SourceScopeId,
+    scope: u64,
 ) -> Result<(), BuildError> {
     let entity = derive_entity(scope, EntityKind::Postmaster, b"instance");
     for section in sections
@@ -1136,7 +1136,7 @@ fn extract_reset_metadata(
 fn extract_snapshot_boundaries(
     out: &mut MetricAccumulator,
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
-    scope: SourceScopeId,
+    scope: u64,
     reset: &ResetTimeline,
 ) -> Result<(), BuildError> {
     let mut seen = BTreeSet::new();
@@ -1181,7 +1181,7 @@ fn extract_snapshot_boundaries(
 
 fn collector_event_facts(
     coverage: &BTreeMap<u32, Vec<CoverageRecord>>,
-    scope: SourceScopeId,
+    scope: u64,
     bounds: &Bounds,
 ) -> Result<Vec<EventFact>, BuildError> {
     let mut facts = Vec::new();
@@ -1628,7 +1628,7 @@ fn insert_descriptor(
 
 fn series(
     factor: MetricFactor,
-    source_scope_id: SourceScopeId,
+    source_id: u64,
     source_type_id: u32,
     unit: MetricUnit,
     entity: Option<kronika_analytics::overview::EntityRef>,
@@ -1637,7 +1637,7 @@ fn series(
 ) -> MetricSeriesDescriptor {
     MetricSeriesDescriptor::new(
         factor,
-        source_scope_id,
+        source_id,
         source_type_id,
         unit,
         entity,
@@ -1855,7 +1855,7 @@ mod tests {
 
     #[test]
     fn expanded_metric_samples_stop_at_the_output_bound() {
-        let scope = SourceScopeId([1; 32]);
+        let scope = 1;
         let descriptor = series(
             MetricFactor::PgDatabaseConnections,
             scope,

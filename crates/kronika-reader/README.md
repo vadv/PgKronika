@@ -69,12 +69,11 @@ bridge these no-data states and does not extrapolate across unsampled time.
 
 ## Overview fact files
 
-`source_scope_id`, `SourceDescriptor`, `section_body_id`, and
-`dictionary_context_id` derive typed content identities from exact PGM
-metadata and retained values. `PgmUnit::read_overview_section` reads one
-catalog ordinal and verifies its CRC. `PgmUnit::resolve_overview_dictionary`
-reads only `dict.strings` and `dict.blobs`, retains requested IDs, and reports
-stored and decoded work.
+`SourceDescriptor`, `section_body_id`, and `dictionary_context_id` derive
+typed content identities from exact PGM metadata and retained values.
+`PgmUnit::read_overview_section` reads one catalog ordinal and verifies its
+CRC. `PgmUnit::resolve_overview_dictionary` reads only `dict.strings` and
+`dict.blobs`, retains requested IDs, and reports stored and decoded work.
 
 `FactFile::build` writes the canonical PGKOVF container. `FactFile::admit`
 validates the complete container, including physical layout, checksums,
@@ -84,69 +83,78 @@ CRC-checks only selected block bodies. `FactReadStats` exposes the resulting
 read calls and byte counts.
 
 All PGKOVF constructors and decoders enforce the absolute `LIMIT` values before
-large allocations. `FactStore` loads and validates versioned per-segment fact
-files. A missing or rejected candidate triggers bounded extraction from PGM;
-the store then publishes the rebuilt facts under the content key and exact
-sealed lineage. The lineage also qualifies the publication lock and final
-placement, so byte-identical files under different locators remain independently
-restart-warm. Persistence failures remain visible alongside the freshly
-extracted facts.
+large allocations. PgKronika owns the whole data directory and uses one
+same-stem sidecar for each sealed segment:
 
-Persistent files remain primary. If canonical encoding and full admission
-succeed but publication fails for a recoverable cache/storage reason,
+```text
+/data/active.parts
+/data/1721916000000000.pgm
+/data/1721916000000000.ovf
+```
+
+`FactStore` derives the sidecar name only by replacing the exact `.pgm`
+extension with `.ovf`. The PGKOVF header stores the `FactKey`,
+`SegmentLineageId`, exact `SourceDescriptor`, source metadata, and the schema,
+extractor, registry, and source-format versions. Every read validates those
+fields against the selected PGM. A missing, stale, incompatible, corrupt, or
+mismatched sidecar triggers bounded extraction from that PGM. The replacement
+is written to a same-directory process-unique temporary file, synchronized,
+and atomically renamed over the same sidecar path. The PGM path does not
+participate in `FactKey` or lineage.
+
+The persistent sidecar remains the first lookup. If canonical encoding and
+full admission succeed but publication fails for a recoverable storage reason,
 `FactStore` may retain the immutable `Arc<SegmentFacts>` in a process-local
-fallback LRU. Its complete key combines `FactKey` with sealed lineage, and each
-lookup still tries durable storage first. The default budgets are 24
-segment-hours and 64 MiB of canonical fact bytes; configuration is capped at
-744 segment-hours and 256 MiB. Duration rounds up to whole hours, with one hour
-charged for a point, empty, or unknown interval. Entries that exceed either
-budget are returned to the caller but not retained. `FallbackStats` reports
-hits, misses, inserts, evictions, oversized entries, publication-failure
-offers, and exact residency.
+fallback LRU. Its complete key combines `FactKey` with
+`SegmentLineageId`. The default budgets are 24 segment-hours and 64 MiB of
+canonical fact bytes; configuration is capped at 744 segment-hours and
+256 MiB. Duration rounds up to whole hours, with one hour charged for a point,
+empty, or unknown interval. Entries that exceed either budget are returned to
+the caller but not retained. `FallbackStats` reports hits, misses, inserts,
+evictions, oversized entries, publication-failure offers, and exact residency.
 
-`FactBuildKey` is the exact pair `(FactKey, SegmentLineageId)`. It identifies
-one retained segment occurrence for publication, fallback lookup, and garbage
-collection. Before any mutation, `FactStore` takes an advisory owner lock in
-the cache namespace. Clones share that lease; a separately constructed store
-or process cannot write or collect the same root while the owner is alive.
-Committed-file reads do not require the mutation lease.
+`FactBuildKey` is the exact pair `(FactKey, SegmentLineageId)`. It qualifies
+single-flight, cold-work admission, and the process-local fallback; it is not a
+filename or directory key. Before any mutation, `FactStore` takes
+`.pgkronika-overview.owner.lock` in the data directory. Clones share that
+lease. Another independently constructed store or process may read valid
+sidecars but cannot publish or collect them while the owner is alive.
 
-`GcConfig` bounds every namespace inventory. The defaults allow 100,000
-entries, require two distinct authoritative GC generations and 120 seconds
-since the first absent observation, and retain recognized temporary or
-quarantine files for 600 seconds. An unavailable live set, a scan error, or an
-entry-cap hit authorizes no deletion and does not advance grace. GC validates
-the canonical scope, prefix, final name, and PGKOVF header before a file can be
-deleted. It never follows symlinks or removes lock, foreign, or unrecognized
-entries. A final-file unlink also takes the publication lock and checks the
-opened inode and device again.
+`GcConfig` bounds each direct scan of the data directory. The defaults allow
+100,000 entries, require two distinct authoritative GC generations and
+120 seconds since the first absent observation, and retain recognized
+publication temporary files for 600 seconds. An unavailable live set, a scan
+error, or an entry-cap hit authorizes no deletion and does not advance grace.
+GC admits a same-stem `.ovf` only after validating its PGKOVF header against
+the corresponding live descriptor. It never follows symlinks or removes PGM
+sources, `active.parts`, or the owner lock. A sidecar unlink also takes the
+publication gate and checks the opened inode and device again.
 
 Logical-byte and file-count ceilings are optional and disabled by default.
-When configured, admission counts committed facts, recognized publication
-artifacts, locks, and foreign files from one complete scan. The byte ceiling
+When configured, admission counts only recognized sidecars, publication
+temporary files, and the owner lock from one complete scan. The byte ceiling
 uses logical `st_size`, not free blocks or a physical-filesystem quota. If the
-complete accounted namespace cannot admit a publication, the write returns
-`QuotaExceeded`; live and source files are not evicted.
+complete derived-file inventory cannot admit a publication, the write returns
+`QuotaExceeded`; source files are not counted or evicted.
 
-All durable write APIs share one `PersistMode` state machine. Read-only,
+All sidecar write APIs share one `PersistMode` state machine. Read-only,
 permission, capacity, stale-filesystem, and selected transient I/O failures
 arm bounded backoff and may populate the fallback. Per-key or root contention
 may use the fallback for that call but does not disable the store. Invalid
-facts, unsafe paths, invalid cache layout, and unclassified I/O remain
+facts, unsafe paths, invalid sidecar state, and unclassified I/O remain
 permanent typed failures and do not arm global backoff. `ENOSPC` and quota
 failures may run one GC pass from the last complete authoritative mark and
 retry the publication once. `FactStore::probe_persistence` reserves one due
 probe, writes and synchronizes a sentinel, removes it, and clears backoff only
-after success. Durable reads remain first and do not reset write state.
+after success. Sidecar reads remain first and do not reset write state.
 
 Permission and read-only probes start at the five-minute cap. Capacity and
 transient failures use per-store jittered exponential delay, also capped at
 five minutes. `PersistModeSnapshot` reports the typed reason, consecutive
 failure count, remaining delay, and reservation state.
 
-Fact-build single-flight by `FactBuildKey` and weighted global cold-work
-admission are still required M5 work. `FactStore` does not implement or waive
-those two contracts.
+The web layer combines concurrent builds by `FactBuildKey` and applies
+weighted process-wide admission before extraction or publication.
 
 ## Bounds and failures
 

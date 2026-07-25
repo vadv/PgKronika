@@ -15,7 +15,7 @@ const PERSIST_REASONS: [&str; 12] = [
     "invalid_facts",
     "busy",
     "unsafe_path",
-    "invalid_cache_state",
+    "invalid_sidecar_state",
     "io",
 ];
 const PERSIST_CLASSES: [&str; 7] = [
@@ -127,7 +127,7 @@ pub(crate) const fn persist_reason(error: Option<PersistError>) -> &'static str 
         Some(PersistError::InvalidFacts) => "invalid_facts",
         Some(PersistError::Busy) => "busy",
         Some(PersistError::UnsafePath) => "unsafe_path",
-        Some(PersistError::InvalidCacheState) => "invalid_cache_state",
+        Some(PersistError::InvalidSidecarState) => "invalid_sidecar_state",
         Some(PersistError::Io) => "io",
     }
 }

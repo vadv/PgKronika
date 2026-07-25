@@ -14,7 +14,7 @@ use kronika_analytics::overview::{
     CounterSample, Coverage, CoverageSpan, EventFact as CanonicalEventFact, FactId, FactorCoverage,
     GaugeSample, MetricFactor, MetricSeriesDescriptor, MetricSeriesId, OracleError, OracleLimits,
     OracleResult, PhysicalCountSemantics, RawOracle, RetainedExactness, SourceCompleteness,
-    SourceScopeId, query_bounded, query_bounded_materialized,
+    query_bounded, query_bounded_materialized,
 };
 use kronika_reader::{
     EntityStateRecord, FactBuildKey, FactKey, FileKind, LiveState, LiveView, SealedLocator,
@@ -78,7 +78,6 @@ impl SourceStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceMetadata {
     pub(crate) source_id: u64,
-    pub(crate) source_scope_id: Option<SourceScopeId>,
     pub(crate) data_through_us: Option<i64>,
     pub(crate) covered: Coverage,
     pub(crate) known_gaps: Coverage,
@@ -95,13 +94,10 @@ pub(crate) enum MetadataError {
     CountOverflow,
     /// The selected metadata exceeded its explicit coverage/gap span budget.
     SpanLimitExceeded,
-    /// One numeric source resolved to contradictory scope identities.
-    SourceScopeConflict,
 }
 
 #[derive(Debug)]
 struct SourceAccumulator {
-    source_scope_id: Option<SourceScopeId>,
     data_through_us: Option<i64>,
     covered: Vec<CoverageSpan>,
     known_gaps: Vec<CoverageSpan>,
@@ -118,7 +114,6 @@ pub(crate) struct DescriptorEntry {
     descriptor: SegmentDescriptor,
     fact_build_key: FactBuildKey,
     cold_weight: ColdWorkWeight,
-    source_scope_id: SourceScopeId,
 }
 
 impl DescriptorEntry {
@@ -126,13 +121,11 @@ impl DescriptorEntry {
         descriptor: SegmentDescriptor,
         fact_build_key: FactBuildKey,
         cold_weight: ColdWorkWeight,
-        source_scope_id: SourceScopeId,
     ) -> Self {
         Self {
             descriptor,
             fact_build_key,
             cold_weight,
-            source_scope_id,
         }
     }
 
@@ -148,18 +141,13 @@ impl DescriptorEntry {
         self.cold_weight
     }
 
-    pub(crate) const fn source_scope_id(&self) -> SourceScopeId {
-        self.source_scope_id
-    }
 }
 
 /// Descriptor-derived source identity and freshness without a fact body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DescriptorSource {
     source_id: u64,
-    source_scope_id: Option<SourceScopeId>,
     data_through_us: Option<i64>,
-    scope_conflict: bool,
 }
 
 /// One explicit source interval omitted from a selected fact view.
@@ -187,9 +175,7 @@ impl DescriptorSource {
     const fn unknown(source_id: u64) -> Self {
         Self {
             source_id,
-            source_scope_id: None,
             data_through_us: None,
-            scope_conflict: false,
         }
     }
 
@@ -197,17 +183,10 @@ impl DescriptorSource {
         self.source_id
     }
 
-    pub(crate) const fn source_scope_id(self) -> Option<SourceScopeId> {
-        self.source_scope_id
-    }
-
     pub(crate) const fn data_through_us(self) -> Option<i64> {
         self.data_through_us
     }
 
-    const fn scope_conflict(self) -> bool {
-        self.scope_conflict
-    }
 }
 
 /// One bounded opportunity to re-key the immediately preceding live view.
@@ -560,7 +539,6 @@ fn descriptor_sources(
         merge_descriptor_source(
             &mut sources,
             entry.descriptor().source_id,
-            entry.source_scope_id(),
             entry.descriptor().max_ts,
         );
     }
@@ -570,7 +548,6 @@ fn descriptor_sources(
             merge_descriptor_source(
                 &mut sources,
                 identity.pgm_source_id,
-                identity.source_scope_id,
                 identity.source_max_ts_us,
             );
         }
@@ -581,21 +558,11 @@ fn descriptor_sources(
 fn merge_descriptor_source(
     sources: &mut BTreeMap<u64, DescriptorSource>,
     source_id: u64,
-    source_scope_id: SourceScopeId,
     data_through_us: i64,
 ) {
     let source = sources
         .entry(source_id)
         .or_insert_with(|| DescriptorSource::unknown(source_id));
-    if source
-        .source_scope_id
-        .is_some_and(|current| current != source_scope_id)
-    {
-        source.scope_conflict = true;
-        source.source_scope_id = None;
-    } else if !source.scope_conflict {
-        source.source_scope_id = Some(source_scope_id);
-    }
     source.data_through_us = Some(
         source
             .data_through_us
@@ -756,7 +723,6 @@ impl IndexView {
     ) -> Self {
         let source_ids = source_descriptors
             .iter()
-            .filter(|source| source.source_scope_id().is_some() && !source.scope_conflict())
             .map(|source| source.source_id())
             .collect();
         Self {
@@ -792,14 +758,6 @@ impl IndexView {
     /// Canonical numeric PGM source IDs represented by this view.
     pub(crate) fn source_ids(&self) -> &[u64] {
         &self.source_ids
-    }
-
-    /// Maps a retained source-scope identity back to its numeric PGM source.
-    pub(crate) fn source_id_for_scope(&self, scope: SourceScopeId) -> Option<u64> {
-        self.source_descriptors.iter().find_map(|source| {
-            (!source.scope_conflict() && source.source_scope_id() == Some(scope))
-                .then_some(source.source_id())
-        })
     }
 
     /// The precomputed union coverage of the queried sources.
@@ -847,7 +805,6 @@ impl IndexView {
                 (
                     *source_id,
                     SourceAccumulator {
-                        source_scope_id: source.source_scope_id(),
                         data_through_us: source.data_through_us(),
                         covered: Vec::new(),
                         known_gaps: Vec::new(),
@@ -860,13 +817,6 @@ impl IndexView {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        if self
-            .source_descriptors
-            .iter()
-            .any(|source| source.scope_conflict() && source_selected(sources, source.source_id()))
-        {
-            return Err(MetadataError::SourceScopeConflict);
-        }
         let mut remaining_spans = max_spans;
         for gap in &self.source_gaps {
             let Some(accumulator) = selected.get_mut(&gap.source_id()) else {
@@ -884,13 +834,6 @@ impl IndexView {
             let Some(accumulator) = selected.get_mut(&identity.pgm_source_id) else {
                 continue;
             };
-            match accumulator.source_scope_id {
-                Some(scope) if scope != identity.source_scope_id => {
-                    return Err(MetadataError::SourceScopeConflict);
-                }
-                None => accumulator.source_scope_id = Some(identity.source_scope_id),
-                Some(_) => {}
-            }
             accumulator.data_through_us = Some(
                 accumulator
                     .data_through_us
@@ -947,7 +890,6 @@ impl IndexView {
             .into_iter()
             .map(|(source_id, accumulator)| SourceMetadata {
                 source_id,
-                source_scope_id: accumulator.source_scope_id,
                 data_through_us: accumulator.data_through_us,
                 covered: Coverage::from_spans(accumulator.covered),
                 known_gaps: Coverage::from_spans(accumulator.known_gaps),
@@ -1037,21 +979,11 @@ impl IndexView {
             BTreeMap::<MetricSeriesId, (MetricSeriesDescriptor, Vec<EntityStateRecord>)>::new();
         let mut gauge_series =
             BTreeMap::<MetricSeriesId, (MetricSeriesDescriptor, Vec<GaugeSample>)>::new();
-        let mut gaps = BTreeMap::<SourceScopeId, Coverage>::new();
+        let mut gaps = BTreeMap::<u64, Coverage>::new();
         let mut materialized_samples = 0_usize;
 
         for gap in &self.source_gaps {
-            let Some(scope) = self
-                .source_descriptors
-                .iter()
-                .find_map(|source| {
-                    (source.source_id() == gap.source_id()).then_some(source.source_scope_id())
-                })
-                .flatten()
-            else {
-                continue;
-            };
-            gaps.entry(scope)
+            gaps.entry(gap.source_id())
                 .and_modify(|coverage| {
                     *coverage = coverage.union(&Coverage::from_spans(vec![gap.span()]));
                 })
@@ -1068,7 +1000,7 @@ impl IndexView {
             }) {
                 insert_canonical_fact(&mut facts, fact.clone(), max_facts)?;
             }
-            gaps.entry(segment.identity().source_scope_id)
+            gaps.entry(segment.identity().pgm_source_id)
                 .and_modify(|coverage| {
                     *coverage = coverage.union(segment.loss_coverage().known_gaps());
                 })
@@ -1168,7 +1100,7 @@ impl IndexView {
                 return Err(CanonicalFactQueryError::ContradictoryFacts);
             }
             let known_gaps = gaps
-                .get(&descriptor.source_scope_id)
+                .get(&descriptor.source_id)
                 .cloned()
                 .unwrap_or_else(Coverage::empty);
             for pair in samples.windows(2) {
@@ -1200,7 +1132,7 @@ impl IndexView {
                 return Err(CanonicalFactQueryError::ContradictoryFacts);
             }
             let known_gaps = gaps
-                .get(&descriptor.source_scope_id)
+                .get(&descriptor.source_id)
                 .cloned()
                 .unwrap_or_else(Coverage::empty);
             for pair in samples.windows(2) {
@@ -1235,7 +1167,7 @@ impl IndexView {
                 return Err(CanonicalFactQueryError::ContradictoryFacts);
             }
             let known_gaps = gaps
-                .get(&descriptor.source_scope_id)
+                .get(&descriptor.source_id)
                 .cloned()
                 .unwrap_or_else(Coverage::empty);
             for pair in records.windows(2) {
@@ -1307,7 +1239,7 @@ impl IndexView {
                 && current_available.ts_us() < range.end_us()
             {
                 let known_gaps = gaps
-                    .get(&available_descriptor.source_scope_id)
+                    .get(&available_descriptor.source_id)
                     .cloned()
                     .unwrap_or_else(Coverage::empty);
                 if let Some(fact) = CanonicalEventFact::from_capacity_zero_transition(
@@ -1464,7 +1396,6 @@ fn loaded_source_descriptors(
         merge_descriptor_source(
             &mut sources,
             identity.pgm_source_id,
-            identity.source_scope_id,
             identity.source_max_ts_us,
         );
     }
@@ -1474,7 +1405,6 @@ fn loaded_source_descriptors(
             merge_descriptor_source(
                 &mut sources,
                 identity.pgm_source_id,
-                identity.source_scope_id,
                 identity.source_max_ts_us,
             );
         }
@@ -1513,19 +1443,19 @@ impl RawOracle for IndexView {
 
 fn derive_sender_disappearances(
     states: &BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, Vec<EntityStateRecord>)>,
-    gaps: &BTreeMap<SourceScopeId, Coverage>,
+    gaps: &BTreeMap<u64, Coverage>,
     range: CoverageSpan,
     max_facts: usize,
     facts: &mut BTreeMap<FactId, CanonicalEventFact>,
 ) -> Result<(), CanonicalFactQueryError> {
     let mut boundaries =
-        BTreeMap::<(SourceScopeId, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
+        BTreeMap::<(u64, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
     let mut snapshots = SenderSnapshots::new();
     for (descriptor, records) in states.values() {
         for record in records {
             match MetricFactor::from_id(descriptor.factor_id) {
                 Some(MetricFactor::PgReplicationSenderSnapshotPopulation) => boundaries
-                    .entry((descriptor.source_scope_id, descriptor.source_type_id))
+                    .entry((descriptor.source_id, descriptor.source_type_id))
                     .or_default()
                     .push((*descriptor, *record)),
                 Some(MetricFactor::PgReplicationSenderState) => {
@@ -1535,7 +1465,7 @@ fn derive_sender_disappearances(
             }
         }
     }
-    for ((source_scope, source_type), source_boundaries) in &mut boundaries {
+    for ((source_id, source_type), source_boundaries) in &mut boundaries {
         source_boundaries.sort_unstable_by_key(|(_descriptor, record)| record.ts_us);
         if source_boundaries
             .windows(2)
@@ -1550,7 +1480,7 @@ fn derive_sender_disappearances(
                 || current.ts_us >= range.end_us()
                 || previous_descriptor.series_id != current_descriptor.series_id
                 || gaps
-                    .get(&current_descriptor.source_scope_id)
+                    .get(&current_descriptor.source_id)
                     .is_some_and(|known| {
                         known.spans().iter().any(|gap| {
                             gap.start_us() < current.ts_us && gap.end_us() > previous.ts_us
@@ -1561,10 +1491,10 @@ fn derive_sender_disappearances(
             }
             let empty = BTreeMap::new();
             let previous_entities = snapshots
-                .get(&(*source_scope, *source_type, previous.ts_us))
+                .get(&(*source_id, *source_type, previous.ts_us))
                 .unwrap_or(&empty);
             let current_entities = snapshots
-                .get(&(*source_scope, *source_type, current.ts_us))
+                .get(&(*source_id, *source_type, current.ts_us))
                 .unwrap_or(&empty);
             let current_sample = GaugeSample::new(
                 current_descriptor.series_id,
@@ -1595,7 +1525,7 @@ fn derive_sender_disappearances(
 }
 
 type SenderSnapshots = BTreeMap<
-    (SourceScopeId, u32, i64),
+    (u64, u32, i64),
     BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
 >;
 
@@ -1606,7 +1536,7 @@ fn insert_sender_snapshot(
 ) -> Result<(), CanonicalFactQueryError> {
     if snapshots
         .entry((
-            descriptor.source_scope_id,
+            descriptor.source_id,
             descriptor.source_type_id,
             record.ts_us,
         ))
@@ -1733,11 +1663,10 @@ const fn live_state_tag(state: LiveState) -> u8 {
 mod tests {
     use super::*;
     use kronika_analytics::overview::{CountLimits, OracleSourceError};
-    use kronika_analytics::overview::{NamingContractId, SegmentLocator};
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_reader::{
         JournalDelta, JournalGenerationId, LIMIT, LiveBuilder, PartTransition, PgmUnit,
-        RefreshDelta, SegmentContext,
+        RefreshDelta,
     };
     use kronika_registry::Section;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
@@ -1795,18 +1724,12 @@ mod tests {
         let unit = PgmUnit::open(bytes).expect("open sealed unit");
         let locator = SealedLocator::from_file_name_bytes(file.as_bytes());
         let descriptor = SegmentDescriptor::from_catalog(locator, unit.catalog());
-        let context = SegmentContext::new(
-            b"deployment".to_vec(),
-            NamingContractId([9; 16]),
-            SegmentLocator(*locator.as_bytes()),
-        )
-        .expect("valid segment context");
-        let facts = SegmentFacts::extract(&unit, &context, &LIMIT).expect("extract facts");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract facts");
         SealedEntry::new(descriptor, Arc::new(facts))
     }
 
     fn empty_live() -> Arc<LiveView> {
-        let mut builder = LiveBuilder::new(b"deployment".to_vec(), LIMIT).expect("live builder");
+        let mut builder = LiveBuilder::new(LIMIT).expect("live builder");
         let delta = RefreshDelta {
             previous_view_generation: 0,
             new_view_generation: 1,
@@ -1832,7 +1755,7 @@ mod tests {
     }
 
     fn warming_live() -> Arc<LiveView> {
-        let builder = LiveBuilder::new(b"deployment".to_vec(), LIMIT).expect("live builder");
+        let builder = LiveBuilder::new(LIMIT).expect("live builder");
         Arc::new(builder.publish())
     }
 
@@ -1865,7 +1788,6 @@ mod tests {
                 write_bytes: 1,
                 publications: 1,
             },
-            entry.facts().identity().source_scope_id,
         )
     }
 
@@ -1980,7 +1902,6 @@ mod tests {
             .expect("selected metadata");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].source_id, 7);
-        assert!(selected[0].source_scope_id.is_some());
         assert_eq!(selected[0].data_through_us, Some(2_000));
         assert!(!selected[0].covered.is_empty());
         assert_eq!(
@@ -2005,14 +1926,14 @@ mod tests {
         let unknown = view
             .selected_source_metadata(&[999], CoverageSpan::new(0, 10_000).expect("range"), 16)
             .expect("unknown metadata");
-        assert_eq!(unknown[0].source_scope_id, None);
+        assert_eq!(unknown[0].data_through_us, None);
         assert_eq!(unknown[0].source_completeness, SourceCompleteness::Unknown);
         assert_eq!(unknown[0].dropped_lower_bound, None);
 
         let disjoint = view
             .selected_source_metadata(&[7], CoverageSpan::new(10_000, 20_000).expect("range"), 16)
             .expect("disjoint metadata");
-        assert!(disjoint[0].source_scope_id.is_some());
+        assert_eq!(disjoint[0].data_through_us, Some(2_000));
         assert_eq!(disjoint[0].retained_exactness, RetainedExactness::Unknown);
         assert_eq!(disjoint[0].dropped_lower_bound, None);
     }

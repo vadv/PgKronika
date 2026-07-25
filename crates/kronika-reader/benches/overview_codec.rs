@@ -9,13 +9,12 @@ use arrow_array as _;
 use arrow_schema as _;
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use kronika_analytics::overview::{
-    AlignmentId, CounterSample, GaugeSample, MetricSeriesId, NamingContractId, SegmentIdentity,
-    SegmentLocator, SourceScopeId,
+    AlignmentId, CounterSample, GaugeSample, MetricSeriesId, SegmentIdentity,
 };
 use kronika_format::{PartMeta, ReadAt, SectionInput, build_part};
 use kronika_reader::{
     BlockContent, BlockKind, CounterSamplesBlock, FactFile, FactFileReader, GaugeSamplesBlock,
-    HeaderIdentity, LIMIT, SegmentContext, SegmentFacts, SourceDescriptor, SourceManifestBlock,
+    HeaderIdentity, LIMIT, SegmentFacts, SourceDescriptor, SourceManifestBlock,
 };
 use kronika_registry::pg_log::PgLogLifecycleV1;
 use kronika_registry::{Section, Ts};
@@ -34,21 +33,15 @@ use tempfile as _;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn fixture() -> (Vec<u8>, HeaderIdentity, SegmentIdentity) {
+    let lineage = SegmentIdentity::sealed(7, [0x22; 32], 1_006_001, b"first");
     let identity = HeaderIdentity::from_current_contract(
         1,
         7,
         0,
         9_999,
         1_048_576,
-        SourceScopeId([0x11; 32]),
         SourceDescriptor([0x22; 32]),
-    );
-    let lineage = SegmentIdentity::sealed(
-        identity.source_scope_id,
-        NamingContractId([0x33; 16]),
-        SegmentLocator([0x44; 32]),
-        1_006_001,
-        b"first",
+        lineage.id(),
     );
     let manifest =
         SourceManifestBlock::new(7, 1, 0, 9_999, 1_048_576, Vec::new(), &LIMIT).expect("manifest");
@@ -81,15 +74,6 @@ fn fixture() -> (Vec<u8>, HeaderIdentity, SegmentIdentity) {
     )
     .expect("fact file");
     (bytes, identity, lineage)
-}
-
-fn segment_context() -> SegmentContext {
-    SegmentContext::new(
-        b"benchmark-store".to_vec(),
-        NamingContractId([0x33; 16]),
-        SegmentLocator([0x44; 32]),
-    )
-    .expect("valid segment context")
 }
 
 fn pgm_fixture() -> Vec<u8> {
@@ -219,7 +203,7 @@ fn benchmark(criterion: &mut Criterion) {
     .expect("open PGM fixture");
     pgm_reads.store(0, std::sync::atomic::Ordering::Relaxed);
     pgm_bytes_read.store(0, std::sync::atomic::Ordering::Relaxed);
-    let facts = SegmentFacts::extract(&unit, &segment_context(), &LIMIT).expect("extract facts");
+    let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract facts");
     let fact_catalog = facts.catalog_descriptors();
     let cold_counters = (
         pgm_reads.load(std::sync::atomic::Ordering::Relaxed),
@@ -253,8 +237,7 @@ fn benchmark(criterion: &mut Criterion) {
         cold.bench_function("extract_2048_lifecycle_rows", |bencher| {
             bencher.iter(|| {
                 black_box(
-                    SegmentFacts::extract(black_box(&unit), black_box(&segment_context()), &LIMIT)
-                        .expect("extract"),
+                    SegmentFacts::extract(black_box(&unit), &LIMIT).expect("extract"),
                 );
             });
         });

@@ -15,9 +15,7 @@ use std::time::Instant;
 use arrow_array as _;
 use arrow_schema as _;
 use criterion as _;
-use kronika_analytics::overview::{
-    CountLimits, CoverageSpan, NamingContractId, OracleLimits, RawOracle, SegmentLocator,
-};
+use kronika_analytics::overview::{CountLimits, CoverageSpan, OracleLimits, RawOracle};
 use kronika_format::{PartMeta, SectionInput, build_part};
 use kronika_reader::{
     BlockKind, FactFile, FactOrigin, FactStore, LIMIT, PgmUnit, SegmentContext, SegmentFacts,
@@ -168,7 +166,7 @@ fn main() {
     let pgm: Arc<[u8]> = dense_hour_pgm().into();
     let context = context();
     let unit = PgmUnit::open(pgm.as_ref()).expect("open dense-hour PGM");
-    let facts = SegmentFacts::extract(&unit, &context, &LIMIT).expect("extract dense-hour facts");
+    let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract dense-hour facts");
     let fact_bytes = facts.encode(&LIMIT).expect("encode dense-hour facts");
     let catalog = facts.catalog_descriptors();
     let admitted = FactFile::admit(&fact_bytes, facts.identity(), facts.lineage(), &LIMIT)
@@ -184,8 +182,11 @@ fn main() {
     let context = Arc::new(context);
     let full_range = CoverageSpan::new(1_000_000, dense_end()).expect("dense full range");
     let restart_root = runtime_root.join("restart-warm");
+    fs::create_dir_all(&restart_root).expect("create restart-warm data directory");
+    fs::write(restart_root.join(context.pgm_file_name()), pgm.as_ref())
+        .expect("write restart-warm PGM");
     FactStore::new(&restart_root)
-        .publish(raw.as_ref(), &LIMIT)
+        .publish(raw.as_ref(), context.as_ref(), &LIMIT)
         .expect("seed restart-warm fact file");
 
     let mut modes = Vec::new();
@@ -193,13 +194,16 @@ fn main() {
     modes.push(measure("derived-cold", ITERATIONS, || {
         let iteration = derived_counter.get();
         derived_counter.set(iteration + 1);
-        let cache_root = runtime_root.join(format!("derived-cold-{iteration:02}"));
+        let data_dir = runtime_root.join(format!("derived-cold-{iteration:02}"));
         assert!(
-            !cache_root.exists(),
-            "derived-cold cache root must start absent"
+            !data_dir.exists(),
+            "derived-cold data directory must start absent"
         );
+        fs::create_dir(&data_dir).expect("create derived-cold data directory");
+        fs::write(data_dir.join(context.pgm_file_name()), pgm.as_ref())
+            .expect("write derived-cold PGM");
         let unit = PgmUnit::open(pgm.as_ref()).expect("open cold PGM");
-        let loaded = FactStore::new(cache_root)
+        let loaded = FactStore::new(data_dir)
             .load_or_build(&unit, context.as_ref(), &LIMIT)
             .expect("cold build and durable publication");
         assert_eq!(
@@ -288,7 +292,6 @@ fn main() {
         let unit = PgmUnit::open(pgm.as_ref()).expect("open live part");
         let live = SegmentFacts::fold_live(
             &unit,
-            b"qualification-store",
             1,
             b"dense-hour-active-part",
             &LIMIT,
@@ -445,12 +448,7 @@ fn dense_end() -> i64 {
 }
 
 fn context() -> SegmentContext {
-    SegmentContext::new(
-        b"qualification-store".to_vec(),
-        NamingContractId([0x31; 16]),
-        SegmentLocator([0x41; 32]),
-    )
-    .expect("qualification context")
+    SegmentContext::new("dense-hour.pgm").expect("qualification context")
 }
 
 fn dense_hour_pgm() -> Vec<u8> {

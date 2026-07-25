@@ -216,9 +216,9 @@ mod tests {
     use super::super::health::HealthState;
     use super::*;
     use crate::overview::observation::{
-        DroppedFieldCount, ErrorGroupPayload, LifecyclePayload, NamingContractId,
-        ObservationProvenance, ObservationShape, ObservationTime, QualityFlags, SectionBodyId,
-        SegmentIdentity, SegmentLocator, SourceScopeId, TimeQuality,
+        DroppedFieldCount, ErrorGroupPayload, LifecyclePayload, ObservationProvenance,
+        ObservationShape, ObservationTime, QualityFlags, SectionBodyId, SegmentIdentity,
+        TimeQuality,
     };
     use crate::overview::{DictionaryContextId, ErrorCategory};
 
@@ -227,18 +227,11 @@ mod tests {
     }
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(
-            SourceScopeId([1; 32]),
-            NamingContractId([2; 16]),
-            SegmentLocator([3; 32]),
-            7,
-            b"type=7",
-        )
+        SegmentIdentity::sealed(1, [2; 32], 7, b"type=7")
     }
 
     fn provenance(row: u32) -> ObservationProvenance {
         ObservationProvenance {
-            segment_locator: Some(SegmentLocator([3; 32])),
             section_body_id: SectionBodyId([0xAA; 32]),
             catalog_entry_ordinal: 0,
             row_ordinal: row,

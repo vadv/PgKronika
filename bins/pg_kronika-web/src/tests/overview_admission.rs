@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use kronika_analytics::overview::{CoverageSpan, NamingContractId, SegmentLocator};
+use kronika_analytics::overview::CoverageSpan;
 use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
 use kronika_reader::{
     FactBuildKey, FactKey, LIMIT, LiveBuilder, PgmUnit, SealedLocator, SegmentDescriptor,
-    lineage_from_catalog, source_scope_id,
+    lineage_from_catalog,
 };
 use kronika_registry::Section;
 use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
@@ -19,8 +19,6 @@ use crate::overview::selection::{
 };
 use crate::overview::view::{DescriptorEntry, DescriptorView};
 use crate::{AppState, OverviewConfig, PublishedStoreView, StateBuildError, app};
-
-const SYNTHETIC_NAMESPACE: &[u8] = b"overview-admission-test";
 
 fn one_weight() -> ColdWorkWeight {
     ColdWorkWeight {
@@ -56,26 +54,19 @@ fn synthetic_entries(
         },
     );
     let unit = PgmUnit::open(bytes.as_slice()).expect("open synthetic catalog");
-    let source_scope = source_scope_id(SYNTHETIC_NAMESPACE, source_id);
-    let fact_key = FactKey::for_current_segment(source_scope, unit.source_descriptor());
+    let fact_key = FactKey::for_current_segment(source_id, unit.source_descriptor());
     (0..count)
         .map(|offset| {
             let ordinal = ordinal_base.checked_add(offset).expect("synthetic ordinal");
             let file_name = format!("synthetic-{source_id}-{ordinal}.pgm");
             let locator = SealedLocator::from_file_name_bytes(file_name.as_bytes());
             let descriptor = SegmentDescriptor::from_catalog(locator, unit.catalog());
-            let lineage = lineage_from_catalog(
-                unit.catalog(),
-                source_scope,
-                NamingContractId([1; 16]),
-                SegmentLocator(*locator.as_bytes()),
-            )
-            .expect("catalog has one entry");
+            let lineage = lineage_from_catalog(unit.catalog(), unit.source_descriptor())
+                .expect("catalog has one entry");
             DescriptorEntry::new(
                 descriptor,
                 FactBuildKey::new(fact_key, lineage),
                 one_weight(),
-                source_scope,
             )
         })
         .collect()
@@ -85,9 +76,7 @@ fn synthetic_view(
     entries: Vec<DescriptorEntry>,
     unavailable: Vec<SegmentDescriptor>,
 ) -> Arc<DescriptorView> {
-    let live = LiveBuilder::new(SYNTHETIC_NAMESPACE.to_vec(), LIMIT)
-        .expect("live builder")
-        .publish();
+    let live = LiveBuilder::new(LIMIT).expect("live builder").publish();
     Arc::new(DescriptorView::new(
         1,
         entries,
@@ -99,10 +88,7 @@ fn synthetic_view(
 
 fn state_with_limit(dir: &std::path::Path, limit: usize) -> AppState {
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir).expect("open snapshot");
-    let mut config = OverviewConfig::new(
-        dir.join(".overview-cache"),
-        dir.as_os_str().as_encoded_bytes().to_vec(),
-    );
+    let mut config = OverviewConfig::new();
     config.max_selected_segments = limit;
     AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), config)
         .expect("state")
@@ -113,10 +99,7 @@ fn programmatic_policy_rejects_zero_and_values_above_the_absolute_ceiling() {
     for configured in [0, ABSOLUTE_MAX_SELECTED_SEGMENTS + 1] {
         let dir = tempfile::tempdir().expect("tempdir");
         let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-        let mut config = OverviewConfig::new(
-            dir.path().join(".overview-cache"),
-            SYNTHETIC_NAMESPACE.to_vec(),
-        );
+        let mut config = OverviewConfig::new();
         config.max_selected_segments = configured;
         let error =
             AppState::with_overview_config(snapshot, 0, std::time::Duration::from_secs(10), config)
@@ -156,7 +139,6 @@ fn install_oversized_real_entry(state: &AppState) {
             workers: u32::MAX,
             ..entry.cold_weight()
         },
-        entry.source_scope_id(),
     );
     state.published.store(Arc::new(PublishedStoreView {
         snapshot: Arc::clone(&snapshot),
@@ -438,10 +420,7 @@ async fn a_cold_weight_above_capacity_uses_the_configured_retry_contract() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
     let snapshot = kronika_reader::LocalDirSnapshot::open(dir.path()).expect("open snapshot");
-    let mut config = OverviewConfig::new(
-        dir.path().join(".overview-cache"),
-        SYNTHETIC_NAMESPACE.to_vec(),
-    );
+    let mut config = OverviewConfig::new();
     config.max_selected_segments = 1;
     config.cold.retry_after_seconds = 7;
     let state =
@@ -519,8 +498,6 @@ async fn an_exact_decoded_hit_bypasses_cold_admission() {
 #[tokio::test]
 async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let cache_root = dir.path().join(".overview-cache");
-    let namespace = b"durable-admission-bypass".to_vec();
     write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
 
     let first_snapshot =
@@ -529,7 +506,7 @@ async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
         first_snapshot,
         0,
         std::time::Duration::from_secs(10),
-        OverviewConfig::new(cache_root.clone(), namespace.clone()),
+        OverviewConfig::new(),
     )
     .expect("first state");
     let cold = app(first_state.clone(), None, test_metrics_handle())
@@ -550,7 +527,7 @@ async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
         restarted_snapshot,
         0,
         std::time::Duration::from_secs(10),
-        OverviewConfig::new(cache_root, namespace),
+        OverviewConfig::new(),
     )
     .expect("restarted state");
     install_oversized_real_entry(&restarted);
@@ -571,7 +548,7 @@ async fn an_exact_durable_hit_bypasses_cold_admission_after_restart() {
 }
 
 #[tokio::test]
-async fn foreign_synthetic_descriptors_do_not_block_or_load_a_selected_real_source() {
+async fn unselected_synthetic_descriptors_do_not_block_or_load_a_real_source() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_bgwriter_segment(dir.path(), "real-source-7.pgm", 7, 0, 1);
     let state = state_with_limit(dir.path(), 1);

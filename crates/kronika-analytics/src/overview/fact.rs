@@ -14,7 +14,7 @@ use super::finite::FiniteF64;
 use super::metric::{MetricFactor, MetricSeriesDescriptor, MetricUnit};
 use super::observation::{
     DroppedFieldCount, EventObservation, EvidenceQuality, FactId, LossReason, LossSummary,
-    ObservationId, ObservationPayload, ObservationShape, SourceScopeId,
+    ObservationId, ObservationPayload, ObservationShape,
 };
 use super::reduce::{CounterInterval, CounterSample, GaugeSample, PairQuality};
 use super::sha256;
@@ -310,15 +310,15 @@ impl EntityKind {
 pub struct EntityRef {
     /// Entity class.
     pub kind: EntityKind,
-    /// Source-scope-qualified content identity.
+    /// Source-qualified content identity.
     pub id: [u8; 16],
 }
 
 /// Coverage provenance attached to a canonical fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverageRef {
-    /// Scope in which supporting observations and samples are authoritative.
-    pub source_scope_id: SourceScopeId,
+    /// Numeric PGM source for supporting observations and samples.
+    pub source_id: u64,
     /// Exactness of values retained for this fact.
     pub retained_exactness: RetainedExactness,
     /// Proven upstream loss, if any.
@@ -678,7 +678,7 @@ impl EventFact {
             vec![observation_id],
             observation.evidence_quality(),
             CoverageRef {
-                source_scope_id: observation.source_scope_id(),
+                source_id: observation.source_id(),
                 retained_exactness,
                 loss: observation.loss().cloned(),
             },
@@ -744,7 +744,7 @@ impl EventFact {
             evidence,
             EvidenceQuality::DerivedExact,
             CoverageRef {
-                source_scope_id: descriptor.source_scope_id,
+                source_id: descriptor.source_id,
                 retained_exactness: RetainedExactness::Exact,
                 loss: None,
             },
@@ -791,7 +791,7 @@ impl EventFact {
             evidence,
             EvidenceQuality::DerivedExact,
             CoverageRef {
-                source_scope_id: descriptor.source_scope_id,
+                source_id: descriptor.source_id,
                 retained_exactness: RetainedExactness::Exact,
                 loss: None,
             },
@@ -814,7 +814,7 @@ impl EventFact {
         if MetricFactor::from_id(sender.factor_id) != Some(MetricFactor::PgReplicationSenderState)
             || MetricFactor::from_id(boundary.factor_id)
                 != Some(MetricFactor::PgReplicationSenderSnapshotPopulation)
-            || sender.source_scope_id != boundary.source_scope_id
+            || sender.source_id != boundary.source_id
             || sender.source_type_id != boundary.source_type_id
             || sender.entity.is_none()
             || current_boundary.series_id() != boundary.series_id
@@ -848,7 +848,7 @@ impl EventFact {
             evidence,
             EvidenceQuality::DerivedExact,
             CoverageRef {
-                source_scope_id: sender.source_scope_id,
+                source_id: sender.source_id,
                 retained_exactness: RetainedExactness::Exact,
                 loss: None,
             },
@@ -861,7 +861,7 @@ impl EventFact {
     /// # Errors
     /// Returns [`InvalidEventFact`] when `ts_us` overflows.
     pub fn from_collector_loss(
-        source_scope_id: SourceScopeId,
+        source_id: u64,
         source_type_id: u32,
         ts_us: i64,
         kind: EventKind,
@@ -878,8 +878,8 @@ impl EventFact {
             return Ok(None);
         }
         let loss = LossSummary::new(reasons.iter().copied(), lost_count_lower_bound);
-        let mut evidence_input = Vec::with_capacity(16 + 4 + 8 + 2 + loss.reasons().len() + 1 + 8);
-        evidence_input.extend_from_slice(&source_scope_id.0);
+        let mut evidence_input = Vec::with_capacity(8 + 4 + 8 + 2 + loss.reasons().len() + 1 + 8);
+        evidence_input.extend_from_slice(&source_id.to_le_bytes());
         evidence_input.extend_from_slice(&source_type_id.to_le_bytes());
         evidence_input.extend_from_slice(&ts_us.to_le_bytes());
         evidence_input.extend_from_slice(&kind.code().to_le_bytes());
@@ -906,7 +906,7 @@ impl EventFact {
             evidence,
             EvidenceQuality::Structured,
             CoverageRef {
-                source_scope_id,
+                source_id,
                 retained_exactness: RetainedExactness::LowerBound,
                 loss: Some(loss),
             },
@@ -977,7 +977,7 @@ impl EventFact {
             evidence,
             EvidenceQuality::DerivedExact,
             CoverageRef {
-                source_scope_id: descriptor.source_scope_id,
+                source_id: descriptor.source_id,
                 retained_exactness: RetainedExactness::Exact,
                 loss: None,
             },
@@ -1000,7 +1000,7 @@ impl EventFact {
     ) -> Result<Option<Self>, InvalidEventFact> {
         if total_descriptor.factor_id != MetricFactor::PgFilesystemTotalBytes.id()
             || available_descriptor.factor_id != MetricFactor::PgFilesystemAvailableBytes.id()
-            || total_descriptor.source_scope_id != available_descriptor.source_scope_id
+            || total_descriptor.source_id != available_descriptor.source_id
             || total_descriptor.entity != available_descriptor.entity
             || total_descriptor.entity.is_none()
             || total.ts_us() != available.ts_us()
@@ -1035,7 +1035,7 @@ impl EventFact {
             evidence,
             EvidenceQuality::Structured,
             CoverageRef {
-                source_scope_id: total_descriptor.source_scope_id,
+                source_id: total_descriptor.source_id,
                 retained_exactness: RetainedExactness::Exact,
                 loss: None,
             },
@@ -1692,8 +1692,8 @@ fn text_bytes(values: &[&Option<Box<str>>]) -> usize {
 mod tests {
     use super::*;
     use crate::overview::{
-        DictionaryContextId, LifecyclePayload, NamingContractId, ObservationProvenance,
-        ObservationTime, QualityFlags, SectionBodyId, SegmentIdentity, SegmentLocator, TimeQuality,
+        DictionaryContextId, LifecyclePayload, ObservationProvenance, ObservationTime,
+        QualityFlags, SectionBodyId, SegmentIdentity, TimeQuality,
     };
 
     fn observation(
@@ -1701,18 +1701,10 @@ mod tests {
         shape: ObservationShape,
         count: u64,
     ) -> EventObservation {
-        let locator = SegmentLocator([3; 32]);
         EventObservation::new(
-            SegmentIdentity::sealed(
-                SourceScopeId([1; 32]),
-                NamingContractId([2; 16]),
-                locator,
-                7,
-                b"entry",
-            ),
+            SegmentIdentity::sealed(1, [2; 32], 7, b"entry"),
             7,
             ObservationProvenance {
-                segment_locator: Some(locator),
                 section_body_id: SectionBodyId([4; 32]),
                 catalog_entry_ordinal: 0,
                 row_ordinal: 0,
@@ -1804,7 +1796,7 @@ mod tests {
     #[test]
     fn collector_loss_identity_includes_the_retained_lower_bound() {
         let first = EventFact::from_collector_loss(
-            SourceScopeId([1; 32]),
+            1,
             7,
             10,
             EventKind::CollectorSnapshotGap,
@@ -1814,7 +1806,7 @@ mod tests {
         .expect("valid loss")
         .expect("fact");
         let second = EventFact::from_collector_loss(
-            SourceScopeId([1; 32]),
+            1,
             7,
             10,
             EventKind::CollectorSnapshotGap,
@@ -1839,7 +1831,7 @@ mod tests {
             vec![ObservationId([2; 32])],
             EvidenceQuality::Structured,
             CoverageRef {
-                source_scope_id: SourceScopeId([3; 32]),
+                source_id: 3,
                 retained_exactness: RetainedExactness::Exact,
                 loss: None,
             },

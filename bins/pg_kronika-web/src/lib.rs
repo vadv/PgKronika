@@ -64,7 +64,6 @@ macro_rules! closed_string_enum {
 }
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -225,13 +224,9 @@ impl Default for OverviewColdConfig {
     }
 }
 
-/// Explicit overview storage and memory policy.
+/// Explicit overview memory, retention, and work policy.
 #[derive(Debug, Clone)]
 pub struct OverviewConfig {
-    /// Durable fact-cache root.
-    pub cache_root: PathBuf,
-    /// Stable normalized store/deployment identity.
-    pub namespace: Vec<u8>,
     /// Bounded durable-publication fallback.
     pub fallback: FallbackConfig,
     /// Bounded GC and optional hard durable-cache quota.
@@ -259,13 +254,10 @@ pub struct OverviewConfig {
 }
 
 impl OverviewConfig {
-    /// Builds the default bounded policy for an explicit cache root and
-    /// namespace.
+    /// Builds the default bounded policy.
     #[must_use]
-    pub fn new(cache_root: PathBuf, namespace: Vec<u8>) -> Self {
+    pub fn new() -> Self {
         Self {
-            cache_root,
-            namespace,
             fallback: FallbackConfig::default(),
             gc: GcConfig::default(),
             response_cache_bytes: RESPONSE_CACHE_BYTES,
@@ -394,7 +386,7 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
         metrics::gauge!("kronika_web_overview_gc_quota_exceeded").set(0.0);
         metrics::gauge!("kronika_web_overview_gc_pending").set(0.0);
         metrics::gauge!("kronika_web_overview_gc_scanned_entries").set(0.0);
-        for kind in ["committed", "temporary", "quarantine", "lock", "foreign"] {
+        for kind in ["sidecar", "temporary", "lock"] {
             record_gc_category(kind, GcCategoryUsage::default());
         }
         return;
@@ -404,14 +396,14 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
     metrics::gauge!("kronika_web_overview_gc_sweep_authorized")
         .set(f64::from(outcome.sweep_authorized));
     metrics::gauge!("kronika_web_overview_gc_scanned_entries").set(outcome.scanned as f64);
-    metrics::counter!("kronika_web_overview_gc_deleted_finals_total")
-        .increment(outcome.deleted_finals);
+    metrics::counter!("kronika_web_overview_gc_deleted_sidecars_total")
+        .increment(outcome.deleted_sidecars);
     metrics::counter!(
         "overview_gc_files_total",
         "action" => "deleted",
-        "reason" => "final"
+        "reason" => "sidecar"
     )
-    .increment(outcome.deleted_finals);
+    .increment(outcome.deleted_sidecars);
     metrics::counter!("kronika_web_overview_gc_deleted_artifacts_total")
         .increment(outcome.deleted_artifacts);
     metrics::counter!(
@@ -447,11 +439,9 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
             .set(f64::from(outcome.quota_exceeded));
         metrics::gauge!("kronika_web_overview_gc_pending").set(outcome.pending as f64);
         for (kind, usage) in [
-            ("committed", outcome.usage.committed),
+            ("sidecar", outcome.usage.sidecars),
             ("temporary", outcome.usage.temporary),
-            ("quarantine", outcome.usage.quarantine),
             ("lock", outcome.usage.locks),
-            ("foreign", outcome.usage.foreign),
         ] {
             record_gc_category(kind, usage);
         }
@@ -459,15 +449,7 @@ fn record_gc_metrics(outcome: Option<GcOutcome>) {
 }
 
 fn default_overview_config() -> OverviewConfig {
-    static INSTANCE: AtomicU64 = AtomicU64::new(0);
-    let instance = INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    OverviewConfig::new(
-        std::env::temp_dir().join(format!(
-            "pgkronika-overview-test-{}-{instance}",
-            std::process::id()
-        )),
-        format!("test-store-{}-{instance}", std::process::id()).into_bytes(),
-    )
+    OverviewConfig::new()
 }
 
 impl AppState {
@@ -529,8 +511,6 @@ impl AppState {
         config: OverviewConfig,
     ) -> Result<Self, StateBuildError> {
         let OverviewConfig {
-            cache_root,
-            namespace,
             fallback,
             gc,
             response_cache_bytes,
@@ -562,8 +542,7 @@ impl AppState {
             .refresh_incremental_delta()
             .map_err(StateBuildError::Snapshot)?;
         let mut overview = overview::OverviewIndex::with_runtime_config(
-            cache_root,
-            namespace,
+            snapshot.data_dir().to_path_buf(),
             fallback,
             gc,
             source_scrub_interval,

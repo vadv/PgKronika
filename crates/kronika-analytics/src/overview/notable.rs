@@ -479,24 +479,17 @@ mod tests {
     use super::super::DictionaryContextId;
     use super::*;
     use crate::overview::observation::{
-        DroppedFieldCount, ErrorGroupPayload, EvidenceQuality, LifecyclePayload, NamingContractId,
+        DroppedFieldCount, ErrorGroupPayload, EvidenceQuality, LifecyclePayload,
         ObservationProvenance, ObservationShape, ObservationTime, QualityFlags, SectionBodyId,
-        SegmentIdentity, SegmentLocator, SourceScopeId, TimeQuality,
+        SegmentIdentity, TimeQuality,
     };
 
     fn lineage() -> SegmentIdentity {
-        SegmentIdentity::sealed(
-            SourceScopeId([1; 32]),
-            NamingContractId([2; 16]),
-            SegmentLocator([3; 32]),
-            7,
-            b"type=7 rows=3 crc=abc",
-        )
+        SegmentIdentity::sealed(1, [2; 32], 7, b"type=7 rows=3 crc=abc")
     }
 
     fn provenance(row_ordinal: u32) -> ObservationProvenance {
         ObservationProvenance {
-            segment_locator: Some(SegmentLocator([3; 32])),
             section_body_id: SectionBodyId([0xAA; 32]),
             catalog_entry_ordinal: 0,
             row_ordinal,

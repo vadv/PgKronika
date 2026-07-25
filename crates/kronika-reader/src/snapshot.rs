@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use kronika_format::{Catalog, DamageRegion, Entry};
 use kronika_registry::{DecodedSection, Row};
-use kronika_store::{LocalDir, LocalScan, StoreError, StoreWarning};
+use kronika_store::{LocalDir, LocalScan, SealedUnit, StoreError, StoreWarning};
 use sha2::{Digest as _, Sha256};
 
 use crate::refresh::{
@@ -24,6 +24,20 @@ use crate::{
 
 const JOURNAL_PREFIX_DOMAIN: &[u8] = b"pgk-overview-journal-prefix-v1\0";
 const JOURNAL_HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+fn segment_context(sealed: &SealedUnit) -> Result<SegmentContext, SealedFactError> {
+    let name = sealed
+        .path
+        .file_name()
+        .ok_or(SealedFactError::DescriptorUnavailable {
+            locator: SealedLocator::from_file_name_bytes(b""),
+        })?;
+    SegmentContext::new(name.to_os_string()).map_err(|_error| {
+        SealedFactError::DescriptorUnavailable {
+            locator: SealedLocator::from_file_name_bytes(name.as_bytes()),
+        }
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JournalPrefixDigest([u8; 32]);
@@ -174,11 +188,6 @@ pub enum SealedFactError {
         /// Stable direct-child file-name identity requested by the caller.
         locator: SealedLocator,
     },
-    /// The supplied extraction context does not carry the descriptor's locator.
-    ContextLocatorMismatch {
-        /// Stable direct-child file-name identity requested by the caller.
-        locator: SealedLocator,
-    },
     /// Source extraction or a hard fact bound failed.
     Build(BuildError),
 }
@@ -207,12 +216,6 @@ impl std::fmt::Display for SealedFactError {
                     "sealed descriptor {locator:?} changed; refresh the snapshot"
                 )
             }
-            Self::ContextLocatorMismatch { locator } => {
-                write!(
-                    f,
-                    "segment context does not match sealed descriptor {locator:?}"
-                )
-            }
             Self::Build(error) => write!(f, "sealed fact build failed: {error}"),
         }
     }
@@ -226,8 +229,7 @@ impl std::error::Error for SealedFactError {
             | Self::LiveUnit { .. }
             | Self::StaleSnapshot { .. }
             | Self::DescriptorUnavailable { .. }
-            | Self::StaleDescriptor { .. }
-            | Self::ContextLocatorMismatch { .. } => None,
+            | Self::StaleDescriptor { .. } => None,
         }
     }
 }
@@ -265,6 +267,13 @@ impl LocalDirSnapshot {
             delta_initialized: false,
             tail_pending,
         })
+    }
+
+    /// PgKronika-owned directory containing the active view, sealed PGM files,
+    /// and their sibling OVF sidecars.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.root
     }
 
     /// Re-scan the directory, picking up new sealed files and journal appends.
@@ -619,8 +628,7 @@ impl LocalDirSnapshot {
     /// [`SealedFactError::StaleSnapshot`] instead of facts for a different
     /// descriptor. Active journal parts are rejected.
     ///
-    /// `context` must carry the locator assigned by the reader's sealed-segment
-    /// registry; this method never derives it from row timestamps.
+    /// `context` must name the exact direct-child PGM selected by the snapshot.
     ///
     /// # Errors
     ///
@@ -630,7 +638,6 @@ impl LocalDirSnapshot {
         &self,
         idx: usize,
         store: &FactStore,
-        context: &SegmentContext,
         bounds: &Bounds,
     ) -> Result<FactLoad, SealedFactError> {
         let handle = self
@@ -641,6 +648,7 @@ impl LocalDirSnapshot {
             return Err(SealedFactError::LiveUnit { unit_idx: idx });
         };
         let sealed = &self.scan.sealed[sealed_idx];
+        let context = segment_context(sealed)?;
         let file = self
             .dir
             .open_sealed(sealed)
@@ -651,15 +659,14 @@ impl LocalDirSnapshot {
             return Err(SealedFactError::StaleSnapshot { unit_idx: idx });
         }
         store
-            .load_or_build(&unit, context, bounds)
+            .load_or_build(&unit, &context, bounds)
             .map_err(Into::into)
     }
 
     /// Loads overview facts for one exact reader-authored sealed descriptor.
     ///
     /// This avoids index lookup through the deduplicated query-unit view. The
-    /// direct-child locator and catalog descriptor must both still match, and
-    /// the extraction context must carry that exact locator.
+    /// direct-child filename and catalog descriptor must both still match.
     ///
     /// # Errors
     ///
@@ -670,19 +677,44 @@ impl LocalDirSnapshot {
         &self,
         descriptor: &SegmentDescriptor,
         store: &FactStore,
-        context: &SegmentContext,
         bounds: &Bounds,
     ) -> Result<FactLoad, SealedFactError> {
-        if context.segment_locator().0 != *descriptor.locator.as_bytes() {
-            return Err(SealedFactError::ContextLocatorMismatch {
+        let context = self.sealed_context(descriptor)?;
+        let unit = self.open_sealed_by_descriptor(descriptor)?;
+        store
+            .load_or_build(&unit, &context, bounds)
+            .map_err(Into::into)
+    }
+
+    /// Derives sibling-sidecar addressing for one exact sealed descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SealedFactError`] when the descriptor is unavailable or stale.
+    pub fn sealed_context(
+        &self,
+        descriptor: &SegmentDescriptor,
+    ) -> Result<SegmentContext, SealedFactError> {
+        let sealed = self
+            .scan
+            .sealed
+            .iter()
+            .find(|sealed| {
+                sealed
+                    .path
+                    .file_name()
+                    .map(|name| SealedLocator::from_file_name_bytes(name.as_bytes()))
+                    == Some(descriptor.locator)
+            })
+            .ok_or(SealedFactError::DescriptorUnavailable {
+                locator: descriptor.locator,
+            })?;
+        if SegmentDescriptor::from_catalog(descriptor.locator, &sealed.catalog) != *descriptor {
+            return Err(SealedFactError::StaleDescriptor {
                 locator: descriptor.locator,
             });
         }
-
-        let unit = self.open_sealed_by_descriptor(descriptor)?;
-        store
-            .load_or_build(&unit, context, bounds)
-            .map_err(Into::into)
+        segment_context(sealed)
     }
 
     /// Opens one exact reader-authored sealed descriptor.

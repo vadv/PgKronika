@@ -333,11 +333,6 @@ fn assert_source_meta(label: &str, body: &Value, source: u64) -> Result<()> {
         );
     };
     anyhow::ensure!(freshness["source_id"] == source);
-    anyhow::ensure!(
-        freshness["source_scope_id"]
-            .as_str()
-            .is_some_and(|scope| !scope.is_empty())
-    );
     anyhow::ensure!(freshness["source_completeness"] == "bounded_subset");
     anyhow::ensure!(freshness["retained_exactness"] == "exact");
     anyhow::ensure!(freshness["physical_count_semantics"] == "lower_bound");
@@ -515,7 +510,6 @@ fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
         "event_id",
         "event_instance_id",
         "source_id",
-        "source_scope_id",
         "source_type_id",
         "identity_quality",
         "sort_ts_us",
@@ -544,11 +538,6 @@ fn assert_event_fact(fact: &Value, source: u64) -> Result<(&str, &str)> {
         .as_str()
         .context("EventFact.event_instance_id is not a string")?;
     anyhow::ensure!(fact["source_id"] == source);
-    anyhow::ensure!(
-        fact["source_scope_id"]
-            .as_str()
-            .is_some_and(|scope| !scope.is_empty())
-    );
     anyhow::ensure!(fact["source_type_id"].is_u64());
     anyhow::ensure!(fact["identity_quality"] == "content_derived");
     anyhow::ensure!(fact["sort_ts_us"].is_i64());
@@ -586,7 +575,6 @@ fn assert_supporting_evidence(fact: &Value) -> Result<()> {
         "catalog_entry_ordinal",
         "row_ordinal",
         "dictionary_context_id",
-        "segment_locator",
     ]);
     let evidence = fact["supporting_evidence"]
         .as_array()
@@ -617,11 +605,6 @@ fn assert_supporting_evidence(fact: &Value) -> Result<()> {
     }
     anyhow::ensure!(evidence["catalog_entry_ordinal"].is_u64());
     anyhow::ensure!(evidence["row_ordinal"].is_u64());
-    anyhow::ensure!(
-        evidence["segment_locator"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
-    );
     Ok(())
 }
 

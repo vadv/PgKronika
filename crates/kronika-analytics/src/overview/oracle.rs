@@ -437,9 +437,8 @@ mod tests {
     use super::super::counts::{ErrorCategory, Severity, SqlState};
     use super::super::observation::{
         DictionaryContextId, DroppedFieldCount, ErrorGroupPayload, EvidenceQuality,
-        LifecyclePayload, NamingContractId, ObservationProvenance, ObservationShape,
-        ObservationTime, QualityFlags, SectionBodyId, SegmentIdentity, SegmentLocator,
-        SourceScopeId,
+        LifecyclePayload, ObservationProvenance, ObservationShape, ObservationTime, QualityFlags,
+        SectionBodyId, SegmentIdentity,
     };
     use super::*;
 
@@ -495,14 +494,7 @@ mod tests {
         occurrence_count: u64,
         payload: ObservationPayload,
     ) -> EventObservation {
-        let locator = SegmentLocator([3; 32]);
-        let lineage = SegmentIdentity::sealed(
-            SourceScopeId([1; 32]),
-            NamingContractId([2; 16]),
-            locator,
-            7,
-            b"fixture",
-        );
+        let lineage = SegmentIdentity::sealed(1, [2; 32], 7, b"fixture");
         let shape = match payload {
             ObservationPayload::ErrorGroup(_) | ObservationPayload::SlowQueryGroup(_) => {
                 ObservationShape::GroupedCount
@@ -519,7 +511,6 @@ mod tests {
             lineage,
             7,
             ObservationProvenance {
-                segment_locator: Some(locator),
                 section_body_id: SectionBodyId([0xAA; 32]),
                 catalog_entry_ordinal: 0,
                 row_ordinal,

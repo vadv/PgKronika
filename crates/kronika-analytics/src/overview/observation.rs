@@ -16,18 +16,6 @@ const LINEAGE_DOMAIN_TAG: &[u8] = b"pgk-overview-lineage-v1";
 const LIVE_LINEAGE_DOMAIN_TAG: &[u8] = b"pgk-overview-live-view-v1";
 const OBSERVATION_DOMAIN_TAG: &[u8] = b"pgk-overview-observation-v1";
 
-/// Identity of the source scope a segment belongs to.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SourceScopeId(pub [u8; 32]);
-
-/// Versioned identity of the reader's canonical segment-naming contract.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NamingContractId(pub [u8; 16]);
-
-/// Canonical identity of an existing sealed segment.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SegmentLocator(pub [u8; 32]);
-
 /// Stable identity of one proven segment lineage.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentLineageId(pub [u8; 32]);
@@ -62,9 +50,6 @@ macro_rules! impl_id_debug {
     };
 }
 
-impl_id_debug!(SourceScopeId);
-impl_id_debug!(NamingContractId);
-impl_id_debug!(SegmentLocator);
 impl_id_debug!(SegmentLineageId);
 impl_id_debug!(SectionBodyId);
 impl_id_debug!(DictionaryContextId);
@@ -82,22 +67,20 @@ pub enum IdentityQuality {
     Approximate,
 }
 
-/// A lineage together with the scope, locator, and quality it proves.
+/// A lineage together with the numeric source and quality it proves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentIdentity {
     id: SegmentLineageId,
-    source_scope_id: SourceScopeId,
-    segment_locator: Option<SegmentLocator>,
+    source_id: u64,
     quality: IdentityQuality,
 }
 
 impl SegmentIdentity {
-    /// Derives a rebuild-stable lineage for a proven sealed locator.
+    /// Derives a rebuild-stable lineage from sealed PGM metadata.
     #[must_use]
     pub fn sealed(
-        source_scope_id: SourceScopeId,
-        naming_contract_id: NamingContractId,
-        segment_locator: SegmentLocator,
+        source_id: u64,
+        source_descriptor: [u8; 32],
         first_entry_type: u32,
         first_entry_content_descriptor: &[u8],
     ) -> Self {
@@ -106,17 +89,15 @@ impl SegmentIdentity {
             .to_le_bytes();
         let id = SegmentLineageId(sha256::digest_parts(&[
             LINEAGE_DOMAIN_TAG,
-            &source_scope_id.0,
-            &naming_contract_id.0,
-            &segment_locator.0,
+            &source_id.to_le_bytes(),
+            &source_descriptor,
             &first_entry_type.to_le_bytes(),
             &descriptor_len,
             first_entry_content_descriptor,
         ]));
         Self {
             id,
-            source_scope_id,
-            segment_locator: Some(segment_locator),
+            source_id,
             quality: IdentityQuality::ContentDerived,
         }
     }
@@ -124,7 +105,7 @@ impl SegmentIdentity {
     /// Derives a view-scoped lineage when a future sealed locator is unknown.
     #[must_use]
     pub fn live_approximate(
-        source_scope_id: SourceScopeId,
+        source_id: u64,
         journal_generation: u64,
         first_part_descriptor: &[u8],
     ) -> Self {
@@ -133,15 +114,14 @@ impl SegmentIdentity {
             .to_le_bytes();
         let id = SegmentLineageId(sha256::digest_parts(&[
             LIVE_LINEAGE_DOMAIN_TAG,
-            &source_scope_id.0,
+            &source_id.to_le_bytes(),
             &journal_generation.to_le_bytes(),
             &descriptor_len,
             first_part_descriptor,
         ]));
         Self {
             id,
-            source_scope_id,
-            segment_locator: None,
+            source_id,
             quality: IdentityQuality::Approximate,
         }
     }
@@ -158,10 +138,10 @@ impl SegmentIdentity {
         self.quality
     }
 
-    /// Source scope carried by this lineage.
+    /// Numeric PGM source carried by this lineage.
     #[must_use]
-    pub const fn source_scope_id(self) -> SourceScopeId {
-        self.source_scope_id
+    pub const fn source_id(self) -> u64 {
+        self.source_id
     }
 }
 
@@ -251,8 +231,6 @@ pub struct SourceLocator {
 /// Provenance of one retained row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationProvenance {
-    /// Sealed segment locator, absent for an approximate live view.
-    pub segment_locator: Option<SegmentLocator>,
     /// Digest of the exact section body.
     pub section_body_id: SectionBodyId,
     /// Segment-global catalog ordinal of the section entry.
@@ -748,8 +726,6 @@ fn checked_payload_bytes<T>(text: &[&Option<Box<str>>]) -> Option<usize> {
 /// Validation failure while constructing an observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidObservation {
-    /// Provenance locator does not match the lineage constructor.
-    SegmentLocatorMismatch,
     /// Payload kind and declared shape disagree.
     PayloadShapeMismatch,
     /// Occurrence count is zero.
@@ -769,7 +745,7 @@ pub enum InvalidObservation {
 pub struct EventObservation {
     observation_id: ObservationId,
     identity_quality: IdentityQuality,
-    source_scope_id: SourceScopeId,
+    source_id: u64,
     source_type_id: u32,
     provenance: ObservationProvenance,
     shape: ObservationShape,
@@ -803,9 +779,6 @@ impl EventObservation {
         quality_flags: QualityFlags,
         loss: Option<LossSummary>,
     ) -> Result<Self, InvalidObservation> {
-        if provenance.segment_locator != lineage.segment_locator {
-            return Err(InvalidObservation::SegmentLocatorMismatch);
-        }
         if shape != payload.expected_shape() {
             return Err(InvalidObservation::PayloadShapeMismatch);
         }
@@ -857,7 +830,7 @@ impl EventObservation {
         Ok(Self {
             observation_id,
             identity_quality: lineage.quality,
-            source_scope_id: lineage.source_scope_id,
+            source_id: lineage.source_id,
             source_type_id,
             provenance,
             shape,
@@ -882,10 +855,10 @@ impl EventObservation {
         self.identity_quality
     }
 
-    /// Source scope identity.
+    /// Numeric PGM source ID.
     #[must_use]
-    pub const fn source_scope_id(&self) -> SourceScopeId {
-        self.source_scope_id
+    pub const fn source_id(&self) -> u64 {
+        self.source_id
     }
 
     /// Source type ID.
@@ -1016,26 +989,12 @@ mod tests {
         out
     }
 
-    fn locator(value: u8) -> SegmentLocator {
-        SegmentLocator([value; 32])
+    fn lineage(source_id: u64) -> SegmentIdentity {
+        SegmentIdentity::sealed(source_id, [2; 32], 7, b"type=7 rows=3 crc=abc")
     }
 
-    fn lineage(segment_locator: SegmentLocator) -> SegmentIdentity {
-        SegmentIdentity::sealed(
-            SourceScopeId([1; 32]),
-            NamingContractId([2; 16]),
-            segment_locator,
-            7,
-            b"type=7 rows=3 crc=abc",
-        )
-    }
-
-    fn provenance(
-        row_ordinal: u32,
-        segment_locator: Option<SegmentLocator>,
-    ) -> ObservationProvenance {
+    fn provenance(row_ordinal: u32) -> ObservationProvenance {
         ObservationProvenance {
-            segment_locator,
             section_body_id: SectionBodyId([0xAA; 32]),
             catalog_entry_ordinal: 0,
             row_ordinal,
@@ -1060,9 +1019,8 @@ mod tests {
     }
 
     fn individual(row: u32) -> EventObservation {
-        let segment_locator = locator(3);
         make_observation(
-            provenance(row, Some(segment_locator)),
+            provenance(row),
             ObservationShape::Individual,
             ObservationTime {
                 sort_ts_us: 1_000,
@@ -1084,7 +1042,7 @@ mod tests {
         payload: ObservationPayload,
     ) -> Result<EventObservation, InvalidObservation> {
         EventObservation::new(
-            lineage(locator(3)),
+            lineage(1),
             7,
             provenance,
             shape,
@@ -1133,9 +1091,9 @@ mod tests {
             + retained.iter().map(|text| text.len()).sum::<usize>()
             + loss.reasons.capacity() * size_of::<LossReason>();
         let observation = EventObservation::new(
-            lineage(locator(3)),
+            lineage(1),
             7,
-            provenance(1, Some(locator(3))),
+            provenance(1),
             ObservationShape::GroupedCount,
             ObservationTime {
                 sort_ts_us: 1,
@@ -1168,34 +1126,29 @@ mod tests {
     }
 
     #[test]
-    fn sealed_lineage_uses_naming_contract_and_locator() {
-        let base = lineage(locator(3)).id();
-        assert_ne!(base, lineage(locator(4)).id());
-        let changed_contract = SegmentIdentity::sealed(
-            SourceScopeId([1; 32]),
-            NamingContractId([9; 16]),
-            locator(3),
-            7,
-            b"type=7 rows=3 crc=abc",
-        );
-        assert_ne!(base, changed_contract.id());
+    fn sealed_lineage_uses_source_and_descriptors() {
+        let base = lineage(1).id();
+        assert_ne!(base, lineage(2).id());
+        let changed_descriptor =
+            SegmentIdentity::sealed(1, [9; 32], 7, b"type=7 rows=3 crc=abc");
+        assert_ne!(base, changed_descriptor.id());
     }
 
     #[test]
     fn unproven_live_lineage_is_separate_and_approximate() {
-        let live = SegmentIdentity::live_approximate(SourceScopeId([1; 32]), 8, b"first-part");
+        let live = SegmentIdentity::live_approximate(1, 8, b"first-part");
         assert_eq!(live.quality(), IdentityQuality::Approximate);
-        assert_ne!(live.id(), lineage(locator(3)).id());
+        assert_ne!(live.id(), lineage(1).id());
     }
 
     #[test]
     fn identity_preimages_are_pinned() {
-        let sealed = lineage(locator(3));
+        let sealed = lineage(1);
         assert_eq!(
             sealed.id().0,
             hex32("c70f5cc2edee83f3cbcf707be01519c8a13ec7419247bf181b13916ff9738016")
         );
-        let live = SegmentIdentity::live_approximate(SourceScopeId([1; 32]), 8, b"first-part");
+        let live = SegmentIdentity::live_approximate(1, 8, b"first-part");
         assert_eq!(
             live.id().0,
             hex32("9e2a5dcb39d5b100b7d4e7a1c1f0a105efac30f24be2b4cf6c548f25bce321b0")
@@ -1208,12 +1161,11 @@ mod tests {
 
     #[test]
     fn catalog_and_row_ordinals_distinguish_identical_bodies() {
-        let segment_locator = locator(3);
         let base = individual(4);
-        let mut other_provenance = provenance(4, Some(segment_locator));
+        let mut other_provenance = provenance(4);
         other_provenance.catalog_entry_ordinal = 1;
         let other = EventObservation::new(
-            lineage(segment_locator),
+            lineage(1),
             7,
             other_provenance,
             ObservationShape::Individual,
@@ -1230,21 +1182,10 @@ mod tests {
     }
 
     #[test]
-    fn constructor_rejects_locator_shape_and_count_mismatches() {
-        let segment_locator = locator(3);
+    fn constructor_rejects_shape_and_count_mismatches() {
         assert_eq!(
             make_observation(
-                provenance(0, Some(locator(9))),
-                ObservationShape::Individual,
-                point_time(),
-                1,
-                ObservationPayload::ReadyObserved(lifecycle()),
-            ),
-            Err(InvalidObservation::SegmentLocatorMismatch)
-        );
-        assert_eq!(
-            make_observation(
-                provenance(0, Some(segment_locator)),
+                provenance(0),
                 ObservationShape::GroupedCount,
                 point_time(),
                 2,
@@ -1254,7 +1195,7 @@ mod tests {
         );
         assert_eq!(
             make_observation(
-                provenance(0, Some(segment_locator)),
+                provenance(0),
                 ObservationShape::Individual,
                 point_time(),
                 2,
@@ -1264,7 +1205,7 @@ mod tests {
         );
         assert_eq!(
             make_observation(
-                provenance(0, Some(segment_locator)),
+                provenance(0),
                 ObservationShape::Individual,
                 point_time(),
                 0,
@@ -1276,7 +1217,6 @@ mod tests {
 
     #[test]
     fn constructor_rejects_invalid_time_and_signal_contracts() {
-        let segment_locator = locator(3);
         let invalid_exact_time = ObservationTime {
             sort_ts_us: 1,
             occurred_at_us: None,
@@ -1285,7 +1225,7 @@ mod tests {
         };
         assert_eq!(
             make_observation(
-                provenance(0, Some(segment_locator)),
+                provenance(0),
                 ObservationShape::Individual,
                 invalid_exact_time,
                 1,
@@ -1302,7 +1242,7 @@ mod tests {
         };
         assert_eq!(
             make_observation(
-                provenance(0, Some(segment_locator)),
+                provenance(0),
                 ObservationShape::GroupedCount,
                 first_in_group,
                 1,
@@ -1312,7 +1252,7 @@ mod tests {
         );
         assert_eq!(
             make_observation(
-                provenance(0, Some(segment_locator)),
+                provenance(0),
                 ObservationShape::Individual,
                 point_time(),
                 1,
@@ -1324,7 +1264,6 @@ mod tests {
 
     #[test]
     fn constructor_accepts_fallback_and_slow_query_time_contracts() {
-        let segment_locator = locator(3);
         let fallback = ObservationTime {
             sort_ts_us: 1,
             occurred_at_us: None,
@@ -1333,7 +1272,7 @@ mod tests {
         };
         assert!(
             make_observation(
-                provenance(0, Some(segment_locator)),
+                provenance(0),
                 ObservationShape::Individual,
                 fallback,
                 1,
@@ -1343,7 +1282,7 @@ mod tests {
         );
         assert!(
             make_observation(
-                provenance(1, Some(segment_locator)),
+                provenance(1),
                 ObservationShape::GroupedCount,
                 fallback,
                 1,
@@ -1357,7 +1296,7 @@ mod tests {
         };
         assert!(
             make_observation(
-                provenance(0, Some(segment_locator)),
+                provenance(0),
                 ObservationShape::GroupedCount,
                 max_duration,
                 1,
@@ -1369,7 +1308,6 @@ mod tests {
 
     #[test]
     fn interval_only_gap_requires_a_matching_interval() {
-        let segment_locator = locator(3);
         let gap = Box::new(LogGapPayload {
             source_path: None,
             parser_kind: 2,
@@ -1389,9 +1327,9 @@ mod tests {
         });
         let interval = CoverageSpan::new(10, 30).expect("valid span");
         let observation = EventObservation::new(
-            lineage(segment_locator),
+            lineage(1),
             7,
-            provenance(0, Some(segment_locator)),
+            provenance(0),
             ObservationShape::Gap,
             ObservationTime {
                 sort_ts_us: 10,

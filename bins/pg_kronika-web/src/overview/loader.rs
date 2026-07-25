@@ -3,10 +3,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use kronika_analytics::overview::{MetricFactor, NamingContractId, SegmentLocator};
+use kronika_analytics::overview::MetricFactor;
 use kronika_reader::{
     BuildError, CacheRebuildReason, FactLoad, FactOrigin, FactStore, FallbackStats, LIMIT,
-    LiveView, LocalDirSnapshot, SealOutcome, SealedFactError, SegmentContext, SegmentFacts,
+    LiveView, LocalDirSnapshot, SealOutcome, SealedFactError, SegmentFacts,
     SourceError, reconcile_seal,
 };
 use tokio::task::JoinSet;
@@ -18,8 +18,6 @@ use super::memory_cache::DecodedFactCache;
 use super::selection::SelectedSealedPlan;
 use super::singleflight::{FactSingleflight, SingleflightError};
 use super::view::{DescriptorEntry, IndexView, SealedEntry};
-
-const OVERVIEW_NAMING_CONTRACT: NamingContractId = NamingContractId([1; 16]);
 
 type FactResult = Result<Arc<SegmentFacts>, FactLoadFailure>;
 
@@ -39,7 +37,6 @@ pub(crate) enum FactLoadFailure {
 #[derive(Debug, Clone)]
 pub(crate) struct OverviewFactLoader {
     store: FactStore,
-    namespace: Arc<[u8]>,
     admission: ColdAdmission,
     decoded: DecodedFactCache,
     flights: FactSingleflight<FactResult>,
@@ -51,7 +48,6 @@ pub(crate) struct OverviewFactLoader {
 impl OverviewFactLoader {
     pub(crate) fn new(
         store: FactStore,
-        namespace: Vec<u8>,
         config: ColdAdmissionConfig,
         decoded_cache_bytes: usize,
         decoded_cache_entries: usize,
@@ -63,7 +59,6 @@ impl OverviewFactLoader {
             .saturating_add(config.max_queue);
         Ok(Self {
             store,
-            namespace: namespace.into(),
             admission,
             decoded: DecodedFactCache::new(decoded_cache_bytes, decoded_cache_entries),
             flights: FactSingleflight::new(max_flights),
@@ -167,7 +162,6 @@ impl OverviewFactLoader {
 
         let worker_entry = entry.clone();
         let store = self.store.clone();
-        let namespace = Arc::clone(&self.namespace);
         let admission = self.admission.clone();
         let decoded = self.decoded.clone();
         let retry_after_seconds = self.retry_after_seconds;
@@ -183,7 +177,6 @@ impl OverviewFactLoader {
                             Arc::clone(&snapshot),
                             worker_entry.clone(),
                             store.clone(),
-                            Arc::clone(&namespace),
                         )
                         .await?
                         {
@@ -197,16 +190,9 @@ impl OverviewFactLoader {
                         let started = Instant::now();
                         let descriptor = *worker_entry.descriptor();
                         let result = tokio::task::spawn_blocking(move || {
-                            let context = SegmentContext::new(
-                                namespace.as_ref().to_vec(),
-                                OVERVIEW_NAMING_CONTRACT,
-                                SegmentLocator(*descriptor.locator.as_bytes()),
-                            )
-                            .map_err(|_error| {
-                                FactLoadFailure::Source(SealedFactError::ContextLocatorMismatch {
-                                    locator: descriptor.locator,
-                                })
-                            })?;
+                            let context = snapshot
+                                .sealed_context(&descriptor)
+                                .map_err(FactLoadFailure::Source)?;
                             let unit = snapshot
                                 .open_sealed_by_descriptor(&descriptor)
                                 .map_err(FactLoadFailure::Source)?;
@@ -252,7 +238,6 @@ impl OverviewFactLoader {
             snapshot,
             entry,
             self.store.clone(),
-            Arc::clone(&self.namespace),
         )
         .await
     }
@@ -307,20 +292,12 @@ async fn load_cached(
     snapshot: Arc<LocalDirSnapshot>,
     entry: DescriptorEntry,
     store: FactStore,
-    namespace: Arc<[u8]>,
 ) -> Result<Option<Arc<SegmentFacts>>, FactLoadFailure> {
     tokio::task::spawn_blocking(move || {
         let descriptor = *entry.descriptor();
-        let context = SegmentContext::new(
-            namespace.as_ref().to_vec(),
-            OVERVIEW_NAMING_CONTRACT,
-            SegmentLocator(*descriptor.locator.as_bytes()),
-        )
-        .map_err(|_error| {
-            FactLoadFailure::Source(SealedFactError::ContextLocatorMismatch {
-                locator: descriptor.locator,
-            })
-        })?;
+        let context = snapshot
+            .sealed_context(&descriptor)
+            .map_err(FactLoadFailure::Source)?;
         let unit = snapshot
             .open_sealed_by_descriptor(&descriptor)
             .map_err(FactLoadFailure::Source)?;
@@ -448,7 +425,6 @@ fn record_source_failure(error: SealedFactError) {
         SealedFactError::StaleSnapshot { .. } => "stale_snapshot",
         SealedFactError::DescriptorUnavailable { .. } => "descriptor_unavailable",
         SealedFactError::StaleDescriptor { .. } => "stale_descriptor",
-        SealedFactError::ContextLocatorMismatch { .. } => "context_locator_mismatch",
         SealedFactError::Build(BuildError::Source(SourceError::Io)) => "source_io",
         SealedFactError::Build(BuildError::Source(SourceError::Corrupt)) => "source_corrupt",
         SealedFactError::Build(BuildError::Source(SourceError::UnsupportedFormat)) => {

@@ -5,8 +5,8 @@ use kronika_analytics::overview::{
     ErrorCategory, ErrorGroupPayload, EventObservation, EvidenceQuality, FiniteF64,
     LifecyclePayload, LockWaitPayload, LogGapPayload, LossReason, LossSummary, MaintenancePayload,
     ObservationPayload, ObservationProvenance, ObservationShape, ObservationTime, QualityFlags,
-    SectionBodyId, SegmentIdentity, SegmentLocator, Severity, SlowQueryPayload, SqlState,
-    TempFilePayload, TimeQuality,
+    SectionBodyId, SegmentIdentity, Severity, SlowQueryPayload, SqlState, TempFilePayload,
+    TimeQuality,
 };
 use kronika_format::ReadAt;
 use kronika_registry::{Cell, Row, Semantics, registry};
@@ -103,7 +103,6 @@ impl TextBudget {
 pub(super) fn extract_events<R: ReadAt>(
     unit: &PgmUnit<R>,
     lineage: SegmentIdentity,
-    segment_locator: Option<SegmentLocator>,
     bounds: &Bounds,
 ) -> Result<EventExtraction, BuildError> {
     if !bounds.is_within_absolute_limits()
@@ -210,7 +209,6 @@ pub(super) fn extract_events<R: ReadAt>(
     for pending in pending {
         let row_has_truncated_value = row_has_truncated_value(&pending.row, &dictionary.values)?;
         let provenance = ObservationProvenance {
-            segment_locator,
             section_body_id: pending.section_body_id,
             catalog_entry_ordinal: pending.catalog_entry_ordinal,
             row_ordinal: pending.row_ordinal,

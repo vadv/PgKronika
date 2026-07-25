@@ -376,7 +376,7 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
     for item in evidence {
         assert_eq!(
             item.as_object().expect("evidence object").len(),
-            6,
+            5,
             "all nullable provenance fields stay explicit"
         );
         assert_eq!(
@@ -391,7 +391,6 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
             "catalog_entry_ordinal",
             "row_ordinal",
             "dictionary_context_id",
-            "segment_locator",
         ] {
             assert!(item[field].is_null(), "{field} is not invented: {item}");
         }
@@ -531,7 +530,6 @@ async fn preview_and_events_share_typed_fact_ids_and_canonical_order() {
         .iter()
         .map(|fact| {
             assert_eq!(fact["source_id"], 7);
-            assert!(fact["source_scope_id"].is_string());
             assert!(fact["payload"].is_object());
             assert!(fact["supporting_evidence"].is_array());
             (
@@ -576,21 +574,17 @@ async fn a_capped_preview_is_the_exact_first_events_page() {
 }
 
 #[tokio::test]
-async fn equal_semantic_facts_at_distinct_provenance_keep_both_instances() {
+async fn duplicate_segment_contents_do_not_invent_path_based_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_panic_segment_for(dir.path(), "first.pgm", 7, 0, 1);
     write_panic_segment_for(dir.path(), "second.pgm", 7, 0, 1);
     let (status, body) = serve(dir.path(), "/v1/timeline/events?source=7&from=0&to=1000000").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let events = body["events"].as_array().expect("events");
-    assert_eq!(events.len(), 2);
     assert_eq!(
-        events[0]["event_id"], events[1]["event_id"],
-        "semantic identity is independent of physical locator"
-    );
-    assert_ne!(
-        events[0]["event_instance_id"], events[1]["event_instance_id"],
-        "physical instances remain distinct"
+        events.len(),
+        1,
+        "identical PGM content is not distinguished by its directory path"
     );
 }
 

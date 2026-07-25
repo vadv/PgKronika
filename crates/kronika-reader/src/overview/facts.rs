@@ -11,14 +11,16 @@
 //! [`from_reader`]: SegmentFacts::from_reader
 
 use std::collections::{BTreeMap, BTreeSet as DictionaryIdSet};
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 
 use kronika_analytics::overview::{
     Applicability, BoundaryQuality, CounterSample, Coverage, CoverageSpan, CoverageState,
     EventFact, EventObservation, FactorCoverage, FactorId, GaugeSample, MetricSeriesDescriptor,
-    MetricSeriesId, MetricUnit, NamingContractId, ObservationId, ObservationPayload,
-    ObservationProvenance, OracleError, OracleLimits, OracleResult, PeriodQuality,
-    PhysicalCountSemantics, PopulationTotalQuality, RawOracle, RetainedExactness, SegmentIdentity,
-    SegmentLocator, SourceCompleteness, SourcePopulation, SourceScopeId, query_bounded,
+    MetricSeriesId, MetricUnit, ObservationId, ObservationPayload, ObservationProvenance,
+    OracleError, OracleLimits, OracleResult, PeriodQuality, PhysicalCountSemantics,
+    PopulationTotalQuality, RawOracle, RetainedExactness, SegmentIdentity, SourceCompleteness,
+    SourcePopulation, query_bounded,
 };
 use kronika_format::ReadAt;
 
@@ -33,7 +35,7 @@ use super::container::{
     BlockContent, CacheReadError, FactFile, FactFileReader, FactReadStats, HeaderIdentity,
     validate_block_descriptor, validate_observation_provenance, verify_manifest_identity,
 };
-use super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor, source_scope_id};
+use super::descriptors::{CatalogEntryDescriptor, ManifestEntryDescriptor};
 use super::event_extract::{
     DictionaryFingerprint, EventExtraction, TIMESTAMP_FALLBACK_GAP_REASON, extract_events,
     fingerprint_dictionary,
@@ -45,33 +47,26 @@ use super::metric_extract::{
 };
 use super::observations::EventObservationsBlock;
 
-pub(super) const MAX_STORE_NAMESPACE_BYTES: usize = 4 * 1024;
-
-/// Reader configuration that scopes a sealed segment's facts.
-///
-/// The namespace and locator come from the reader's segment registry, not from
-/// PGM row timestamps.
+/// Filesystem address of one sealed PGM and its sibling overview sidecar.
 #[derive(Debug, Clone)]
 pub struct SegmentContext {
-    normalized_store_namespace: Vec<u8>,
-    naming_contract_id: NamingContractId,
-    segment_locator: SegmentLocator,
+    pgm_file_name: OsString,
+    sidecar_file_name: OsString,
 }
 
-/// Invalid reader configuration for sealed-segment identity.
+/// Invalid direct-child PGM filename for a sibling sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentContextError {
-    /// Production identity requires a stable non-empty store namespace.
-    EmptyStoreNamespace,
-    /// The configured namespace exceeds the fixed identity-input bound.
-    StoreNamespaceTooLong,
+    /// The value is not one direct-child filename ending in `.pgm`.
+    InvalidPgmFileName,
 }
 
 impl std::fmt::Display for SegmentContextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyStoreNamespace => f.write_str("store namespace is empty"),
-            Self::StoreNamespaceTooLong => f.write_str("store namespace exceeds 4096 bytes"),
+            Self::InvalidPgmFileName => {
+                f.write_str("PGM filename must be one direct child ending in .pgm")
+            }
         }
     }
 }
@@ -79,47 +74,42 @@ impl std::fmt::Display for SegmentContextError {
 impl std::error::Error for SegmentContextError {}
 
 impl SegmentContext {
-    /// Builds a bounded context from a reader-supplied namespace and sealed
-    /// segment locator.
+    /// Derives the sibling `.ovf` name from one direct-child `.pgm` name.
     ///
     /// # Errors
     ///
-    /// Returns [`SegmentContextError`] for an empty or oversized namespace.
-    pub fn new(
-        normalized_store_namespace: impl Into<Vec<u8>>,
-        naming_contract_id: NamingContractId,
-        segment_locator: SegmentLocator,
-    ) -> Result<Self, SegmentContextError> {
-        let normalized_store_namespace = normalized_store_namespace.into();
-        if normalized_store_namespace.is_empty() {
-            return Err(SegmentContextError::EmptyStoreNamespace);
+    /// Returns [`SegmentContextError`] unless the value is a safe direct-child
+    /// filename with a non-empty stem and exact `.pgm` extension.
+    pub fn new(pgm_file_name: impl Into<OsString>) -> Result<Self, SegmentContextError> {
+        let pgm_file_name = pgm_file_name.into();
+        let bytes = pgm_file_name.as_bytes();
+        if bytes.len() <= 4
+            || !bytes.ends_with(b".pgm")
+            || bytes.contains(&b'/')
+            || bytes.contains(&0)
+            || bytes == b"."
+            || bytes == b".."
+        {
+            return Err(SegmentContextError::InvalidPgmFileName);
         }
-        if normalized_store_namespace.len() > MAX_STORE_NAMESPACE_BYTES {
-            return Err(SegmentContextError::StoreNamespaceTooLong);
-        }
+        let mut sidecar = bytes[..bytes.len() - 4].to_vec();
+        sidecar.extend_from_slice(b".ovf");
         Ok(Self {
-            normalized_store_namespace,
-            naming_contract_id,
-            segment_locator,
+            pgm_file_name,
+            sidecar_file_name: OsString::from_vec(sidecar),
         })
     }
 
-    /// Stable normalized store namespace.
+    /// Direct-child PGM filename.
     #[must_use]
-    pub fn store_namespace(&self) -> &[u8] {
-        &self.normalized_store_namespace
+    pub fn pgm_file_name(&self) -> &OsStr {
+        &self.pgm_file_name
     }
 
-    /// Versioned naming contract for the supplied locator.
+    /// Direct-child sibling OVF filename with the same stem.
     #[must_use]
-    pub const fn naming_contract_id(&self) -> NamingContractId {
-        self.naming_contract_id
-    }
-
-    /// Reader-supplied locator of the sealed segment.
-    #[must_use]
-    pub const fn segment_locator(&self) -> SegmentLocator {
-        self.segment_locator
+    pub fn sidecar_file_name(&self) -> &OsStr {
+        &self.sidecar_file_name
     }
 }
 
@@ -246,23 +236,21 @@ impl SegmentFacts {
     /// unsafe work bounds, or checked-arithmetic overflow.
     pub fn extract<R: ReadAt>(
         unit: &PgmUnit<R>,
-        context: &SegmentContext,
         bounds: &Bounds,
     ) -> Result<Self, BuildError> {
-        Self::extract_with_stats(unit, context, bounds).map(|(facts, _stats)| facts)
+        Self::extract_with_stats(unit, bounds).map(|(facts, _stats)| facts)
     }
 
     pub(super) fn extract_with_stats<R: ReadAt>(
         unit: &PgmUnit<R>,
-        context: &SegmentContext,
         bounds: &Bounds,
     ) -> Result<(Self, PgmBodyReadStats), BuildError> {
         let (min_ts, max_ts) = (unit.catalog().min_ts, unit.catalog().max_ts);
-        let (identity, lineage) = Self::provenance(unit, context)?;
-        let mut extracted = extract_events(unit, lineage, Some(context.segment_locator), bounds)?;
+        let (identity, lineage) = Self::provenance(unit)?;
+        let mut extracted = extract_events(unit, lineage, bounds)?;
         let metrics = extract_metrics(
             unit,
-            identity.source_scope_id,
+            identity.pgm_source_id,
             segment_span(min_ts, max_ts)?,
             bounds,
         )?;
@@ -289,7 +277,6 @@ impl SegmentFacts {
     /// unsafe work bounds, or checked-arithmetic overflow.
     pub fn fold_live<R: ReadAt>(
         unit: &PgmUnit<R>,
-        store_namespace: &[u8],
         journal_generation: u64,
         part_discriminator: &[u8],
         bounds: &Bounds,
@@ -298,23 +285,25 @@ impl SegmentFacts {
         if catalog.entries.is_empty() {
             return Err(BuildError::Source(SourceError::UnsupportedLayout));
         }
-        let source_scope = source_scope_id(store_namespace, catalog.source_id);
-        let lineage =
-            SegmentIdentity::live_approximate(source_scope, journal_generation, part_discriminator);
+        let lineage = SegmentIdentity::live_approximate(
+            catalog.source_id,
+            journal_generation,
+            part_discriminator,
+        );
         let identity = HeaderIdentity::from_current_contract(
             catalog.format_version,
             catalog.source_id,
             catalog.min_ts,
             catalog.max_ts,
             unit.source_file_len(),
-            source_scope,
             unit.source_descriptor(),
+            lineage.id(),
         );
         let (min_ts, max_ts) = (catalog.min_ts, catalog.max_ts);
-        let mut extracted = extract_events(unit, lineage, None, bounds)?;
+        let mut extracted = extract_events(unit, lineage, bounds)?;
         let metrics = extract_metrics(
             unit,
-            identity.source_scope_id,
+            identity.pgm_source_id,
             segment_span(min_ts, max_ts)?,
             bounds,
         )?;
@@ -338,7 +327,6 @@ impl SegmentFacts {
     /// observation is invalid, or a checked counter overflows.
     pub(super) fn try_promote_from_parts<R: ReadAt>(
         sealed_unit: &PgmUnit<R>,
-        sealed_context: &SegmentContext,
         parts: &[&Self],
         bounds: &Bounds,
     ) -> Result<Option<Self>, BuildError> {
@@ -356,8 +344,8 @@ impl SegmentFacts {
             return Ok(None);
         }
 
-        let (identity, lineage) = Self::provenance(sealed_unit, sealed_context)?;
-        if !promotion_source_matches(identity, sealed_context, parts) {
+        let (identity, lineage) = Self::provenance(sealed_unit)?;
+        if !promotion_source_matches(identity, parts) {
             return Ok(None);
         }
         let Some(dictionary_fingerprints) = promotion_dictionary(sealed_unit, parts, bounds)?
@@ -367,7 +355,6 @@ impl SegmentFacts {
         let Some(extracted) = rekey_promoted_parts(
             parts,
             lineage,
-            sealed_context.segment_locator(),
             dictionary_fingerprints,
             bounds,
         )?
@@ -378,7 +365,7 @@ impl SegmentFacts {
         let (min_ts, max_ts) = (sealed_unit.catalog().min_ts, sealed_unit.catalog().max_ts);
         let Some(metrics) = promote_metrics(
             parts,
-            identity.source_scope_id,
+            identity.pgm_source_id,
             segment_span(min_ts, max_ts)?,
             bounds,
         )?
@@ -473,18 +460,15 @@ impl SegmentFacts {
     /// Returns [`BuildError::Source`] when the PGM has no catalog entries.
     pub fn provenance<R: ReadAt>(
         unit: &PgmUnit<R>,
-        context: &SegmentContext,
     ) -> Result<(HeaderIdentity, SegmentIdentity), BuildError> {
         let catalog = unit.catalog();
         let first = catalog
             .entries
             .first()
             .ok_or(BuildError::Source(SourceError::UnsupportedLayout))?;
-        let source_scope = source_scope_id(context.store_namespace(), catalog.source_id);
         let lineage = SegmentIdentity::sealed(
-            source_scope,
-            context.naming_contract_id(),
-            context.segment_locator(),
+            catalog.source_id,
+            unit.source_descriptor().0,
             first.type_id,
             &CatalogEntryDescriptor::of(first).canonical_bytes(),
         );
@@ -494,13 +478,13 @@ impl SegmentFacts {
             catalog.min_ts,
             catalog.max_ts,
             unit.source_file_len(),
-            source_scope,
             unit.source_descriptor(),
+            lineage.id(),
         );
         Ok((identity, lineage))
     }
 
-    /// Header identity carrying source scope, descriptor, and version axes.
+    /// Header identity carrying source provenance and contract versions.
     #[must_use]
     pub const fn identity(&self) -> &HeaderIdentity {
         &self.identity
@@ -724,7 +708,7 @@ impl SegmentFacts {
         expected_catalog: &[CatalogEntryDescriptor],
         bounds: &Bounds,
     ) -> Result<(Self, FactReadStats), CacheReadError> {
-        if lineage.source_scope_id() != expected.source_scope_id {
+        if lineage.id() != expected.segment_lineage_id {
             return Err(CacheReadError::WrongSource);
         }
         let mut fact_reader = FactFileReader::open(reader, expected, bounds)?;
@@ -781,12 +765,12 @@ impl SegmentFacts {
             singleton_body(&mut fact_reader, BlockKind::CounterSamples)?;
         let counter_samples = CounterSamplesBlock::decode(&counter_body, bounds)?;
         validate_block_descriptor(&counter_entry, &counter_samples)?;
-        validate_metric_scope(counter_samples.series(), expected.source_scope_id)?;
+        validate_metric_source(counter_samples.series(), expected.pgm_source_id)?;
 
         let (gauge_entry, gauge_body) = singleton_body(&mut fact_reader, BlockKind::GaugeSamples)?;
         let gauge_samples = GaugeSamplesBlock::decode(&gauge_body, bounds)?;
         validate_block_descriptor(&gauge_entry, &gauge_samples)?;
-        validate_metric_scope(gauge_samples.series(), expected.source_scope_id)?;
+        validate_metric_source(gauge_samples.series(), expected.pgm_source_id)?;
 
         let (reset_entry, reset_body) = singleton_body(&mut fact_reader, BlockKind::ResetMarkers)?;
         let reset_markers = ResetMarkersBlock::decode(&reset_body, bounds)?;
@@ -803,7 +787,7 @@ impl SegmentFacts {
             &observations,
             &counter_samples,
             &gauge_samples,
-            expected.source_scope_id,
+            expected.pgm_source_id,
         )?;
 
         let coverage = merge_coverage_blocks(&mut fact_reader, bounds)?;
@@ -872,7 +856,6 @@ fn parts_have_timestamp_fallback(parts: &[&SegmentFacts]) -> bool {
 
 fn promotion_source_matches(
     identity: HeaderIdentity,
-    sealed_context: &SegmentContext,
     parts: &[&SegmentFacts],
 ) -> bool {
     let mut min_ts = i64::MAX;
@@ -891,10 +874,7 @@ fn promotion_source_matches(
         && parts.iter().all(|part| {
             part.identity.source_format_version == identity.source_format_version
                 && (part.identity.pgm_source_id == 0
-                    && part.identity.source_scope_id
-                        == source_scope_id(sealed_context.store_namespace(), 0)
-                    || (part.identity.pgm_source_id == identity.pgm_source_id
-                        && part.identity.source_scope_id == identity.source_scope_id))
+                    || part.identity.pgm_source_id == identity.pgm_source_id)
         })
 }
 
@@ -974,7 +954,6 @@ fn sum_len(
 fn rekey_promoted_parts(
     parts: &[&SegmentFacts],
     lineage: SegmentIdentity,
-    sealed_locator: SegmentLocator,
     dictionary_fingerprints: Vec<DictionaryFingerprint>,
     bounds: &Bounds,
 ) -> Result<Option<EventExtraction>, BuildError> {
@@ -988,7 +967,6 @@ fn rekey_promoted_parts(
         for observation in &part.observations {
             let source = observation.provenance();
             let provenance = ObservationProvenance {
-                segment_locator: Some(sealed_locator),
                 section_body_id: source.section_body_id,
                 catalog_entry_ordinal: base_ordinal
                     .checked_add(source.catalog_entry_ordinal)
@@ -1224,9 +1202,9 @@ fn derive_sender_disappearances(
     facts: &mut Vec<EventFact>,
 ) -> Result<(), BuildError> {
     let mut boundaries =
-        BTreeMap::<(SourceScopeId, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
+        BTreeMap::<(u64, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
     let mut snapshots = BTreeMap::<
-        (SourceScopeId, u32, i64),
+        (u64, u32, i64),
         BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
     >::new();
     for record in states.records() {
@@ -1235,13 +1213,13 @@ fn derive_sender_disappearances(
             Some(
                 kronika_analytics::overview::MetricFactor::PgReplicationSenderSnapshotPopulation,
             ) => boundaries
-                .entry((descriptor.source_scope_id, descriptor.source_type_id))
+                .entry((descriptor.source_id, descriptor.source_type_id))
                 .or_default()
                 .push((descriptor, *record)),
             Some(kronika_analytics::overview::MetricFactor::PgReplicationSenderState) => {
                 snapshots
                     .entry((
-                        descriptor.source_scope_id,
+                        descriptor.source_id,
                         descriptor.source_type_id,
                         record.ts_us,
                     ))
@@ -1251,7 +1229,7 @@ fn derive_sender_disappearances(
             _ => {}
         }
     }
-    for ((source_scope, source_type), source_boundaries) in &mut boundaries {
+    for ((source_id, source_type), source_boundaries) in &mut boundaries {
         source_boundaries.sort_unstable_by_key(|(_descriptor, record)| record.ts_us);
         for pair in source_boundaries.windows(2) {
             let (previous_descriptor, previous) = pair[0];
@@ -1263,10 +1241,10 @@ fn derive_sender_disappearances(
             }
             let empty = BTreeMap::new();
             let previous_entities = snapshots
-                .get(&(*source_scope, *source_type, previous.ts_us))
+                .get(&(*source_id, *source_type, previous.ts_us))
                 .unwrap_or(&empty);
             let current_entities = snapshots
-                .get(&(*source_scope, *source_type, current.ts_us))
+                .get(&(*source_id, *source_type, current.ts_us))
                 .unwrap_or(&empty);
             let current_sample = GaugeSample::new(
                 current_descriptor.series_id,
@@ -1348,7 +1326,7 @@ const fn block_build_error(error: super::block::BlockError) -> BuildError {
 )]
 fn promote_metrics(
     parts: &[&SegmentFacts],
-    expected_scope: SourceScopeId,
+    expected_source_id: u64,
     interval: Option<CoverageSpan>,
     bounds: &Bounds,
 ) -> Result<Option<MetricExtraction>, BuildError> {
@@ -1391,11 +1369,11 @@ fn promote_metrics(
         if !merge_metric_series(
             &mut counter_series,
             part.counter_samples.series(),
-            expected_scope,
+            expected_source_id,
         ) || !merge_metric_series(
             &mut gauge_series,
             part.gauge_samples.series(),
-            expected_scope,
+            expected_source_id,
         ) {
             return Ok(None);
         }
@@ -1722,10 +1700,10 @@ const fn unsupported_promoted_coverage(
 fn merge_metric_series(
     destination: &mut BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
     incoming: &[MetricSeriesDescriptor],
-    expected_scope: SourceScopeId,
+    expected_source_id: u64,
 ) -> bool {
     incoming.iter().all(|descriptor| {
-        if descriptor.source_scope_id != expected_scope {
+        if descriptor.source_id != expected_source_id {
             return false;
         }
         match destination.entry(descriptor.series_id) {
@@ -1773,13 +1751,13 @@ fn reset_markers_for_samples(samples: &[CounterSample]) -> Vec<ResetMarker> {
     markers
 }
 
-fn validate_metric_scope(
+fn validate_metric_source(
     series: &[MetricSeriesDescriptor],
-    expected_scope: SourceScopeId,
+    expected_source_id: u64,
 ) -> Result<(), CacheReadError> {
     if series
         .iter()
-        .any(|descriptor| descriptor.source_scope_id != expected_scope)
+        .any(|descriptor| descriptor.source_id != expected_source_id)
     {
         return Err(CacheReadError::WrongSource);
     }
@@ -1860,32 +1838,32 @@ fn validate_event_fact_evidence(
     observations: &EventObservationsBlock,
     counters: &CounterSamplesBlock,
     gauges: &GaugeSamplesBlock,
-    expected_scope: SourceScopeId,
+    expected_source_id: u64,
 ) -> Result<(), CacheReadError> {
-    let mut scopes = BTreeMap::<ObservationId, SourceScopeId>::new();
+    let mut source_ids = BTreeMap::<ObservationId, u64>::new();
     for observation in observations.observations() {
-        insert_evidence_scope(
-            &mut scopes,
+        insert_evidence_source(
+            &mut source_ids,
             observation.observation_id(),
-            observation.source_scope_id(),
+            observation.source_id(),
         )?;
     }
     for sample in counters.samples() {
-        insert_evidence_scope(
-            &mut scopes,
+        insert_evidence_source(
+            &mut source_ids,
             kronika_analytics::overview::counter_sample_observation_id(*sample),
-            metric_scope(counters.series(), sample.series_id())?,
+            metric_source(counters.series(), sample.series_id())?,
         )?;
     }
     for sample in gauges.samples() {
-        insert_evidence_scope(
-            &mut scopes,
+        insert_evidence_source(
+            &mut source_ids,
             kronika_analytics::overview::gauge_sample_observation_id(*sample),
-            metric_scope(gauges.series(), sample.series_id())?,
+            metric_source(gauges.series(), sample.series_id())?,
         )?;
     }
     for fact in facts.facts() {
-        if fact.coverage().source_scope_id != expected_scope {
+        if fact.coverage().source_id != expected_source_id {
             return Err(CacheReadError::WrongSource);
         }
         if matches!(
@@ -1899,7 +1877,7 @@ fn validate_event_fact_evidence(
         if fact
             .supporting_observation_ids()
             .iter()
-            .any(|id| scopes.get(id) != Some(&fact.coverage().source_scope_id))
+            .any(|id| source_ids.get(id) != Some(&fact.coverage().source_id))
         {
             return Err(CacheReadError::Corrupt);
         }
@@ -1907,25 +1885,25 @@ fn validate_event_fact_evidence(
     Ok(())
 }
 
-fn insert_evidence_scope(
-    scopes: &mut BTreeMap<ObservationId, SourceScopeId>,
+fn insert_evidence_source(
+    source_ids: &mut BTreeMap<ObservationId, u64>,
     id: ObservationId,
-    scope: SourceScopeId,
+    source_id: u64,
 ) -> Result<(), CacheReadError> {
-    if scopes.insert(id, scope).is_some() {
+    if source_ids.insert(id, source_id).is_some() {
         return Err(CacheReadError::Corrupt);
     }
     Ok(())
 }
 
-fn metric_scope(
+fn metric_source(
     descriptors: &[MetricSeriesDescriptor],
     series_id: MetricSeriesId,
-) -> Result<SourceScopeId, CacheReadError> {
+) -> Result<u64, CacheReadError> {
     descriptors
         .binary_search_by_key(&series_id.0, |descriptor| descriptor.series_id.0)
         .ok()
-        .map(|index| descriptors[index].source_scope_id)
+        .map(|index| descriptors[index].source_id)
         .ok_or(CacheReadError::Corrupt)
 }
 
@@ -2138,15 +2116,6 @@ mod tests {
         max_gauge_samples: 256,
     };
 
-    fn context() -> SegmentContext {
-        SegmentContext::new(
-            b"store-a".to_vec(),
-            NamingContractId([0x33; 16]),
-            SegmentLocator([0x44; 32]),
-        )
-        .expect("valid context")
-    }
-
     fn lifecycle_row(ts: i64, kind: u8, pid: Option<i32>, signal: Option<i32>) -> PgLogLifecycleV1 {
         PgLogLifecycleV1 {
             ts: Ts(ts),
@@ -2318,7 +2287,7 @@ mod tests {
             &[sender_coverage(10, 0, 1, 1), sender_coverage(20, 0, 0, 0)],
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open replication fixture");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
 
         let boundary_series = facts
             .gauge_samples()
@@ -2364,7 +2333,7 @@ mod tests {
             &[sender_coverage(10, 0, 1, 1), sender_coverage(20, 0, 0, 0)],
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open restart fixture");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
 
         let boundary_series_count = facts
             .gauge_samples()
@@ -2401,7 +2370,7 @@ mod tests {
             &[sender_coverage(10, 3, 2, 0)],
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open collector-loss fixture");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
         assert!(
             facts
                 .event_facts()
@@ -2872,7 +2841,7 @@ mod tests {
     fn extracts_registered_log_event_layouts_once_with_conservative_quality() {
         let bytes = all_log_event_types_pgm();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
         assert_eq!(facts.observations().len(), 8);
         let kinds: std::collections::BTreeSet<_> = facts
             .observations()
@@ -2956,7 +2925,7 @@ mod tests {
     fn subkinds_gap_dispositions_and_timestamp_fallback_are_preserved() {
         let bytes = all_event_variants_pgm();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
         assert_eq!(facts.observations().len(), 40);
 
         let categories: Vec<_> = facts
@@ -3097,7 +3066,7 @@ mod tests {
             ..LIMIT
         };
         assert!(matches!(
-            SegmentFacts::extract(&unit, &context(), &tight),
+            SegmentFacts::extract(&unit, &tight),
             Err(BuildError::LimitExceeded)
         ));
     }
@@ -3130,7 +3099,7 @@ mod tests {
             ..LIMIT
         };
         assert!(matches!(
-            SegmentFacts::extract(&unit, &context(), &tight),
+            SegmentFacts::extract(&unit, &tight),
             Err(BuildError::LimitExceeded)
         ));
         assert_eq!(unit.body_read_stats(), PgmBodyReadStats::default());
@@ -3144,7 +3113,7 @@ mod tests {
             .expect("independent section read");
         let before = unit.body_read_stats();
         let (_facts, local) =
-            SegmentFacts::extract_with_stats(&unit, &context(), &LIMIT).expect("extract");
+            SegmentFacts::extract_with_stats(&unit, &LIMIT).expect("extract");
         assert_eq!(local.read_calls, 1);
         assert_eq!(local.stored_bytes_read, unit.catalog().entries[0].len);
         assert_eq!(
@@ -3189,7 +3158,7 @@ mod tests {
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
         assert!(matches!(
-            SegmentFacts::extract(&unit, &context(), &LIMIT),
+            SegmentFacts::extract(&unit, &LIMIT),
             Err(BuildError::Source(SourceError::Corrupt))
         ));
     }
@@ -3198,7 +3167,7 @@ mod tests {
     fn extract_materializes_one_observation_per_lifecycle_row() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
         assert_eq!(facts.observations().len(), 3);
         assert_eq!(facts.manifest_entries().len(), 1);
         assert_eq!(
@@ -3216,7 +3185,7 @@ mod tests {
     fn fact_file_reload_matches_forced_raw_decode() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("raw extract");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let encoded = raw.encode(&LIMIT).expect("encode fact file");
         let index = SegmentFacts::from_bytes(
             &encoded,
@@ -3239,7 +3208,7 @@ mod tests {
         assert_eq!(fixture.cadence_us, 10);
         let bytes = fixture.sealed_bytes();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("forced raw extract");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("forced raw extract");
 
         assert!(!raw.observations().is_empty());
         assert!(!raw.event_facts().is_empty());
@@ -3277,7 +3246,7 @@ mod tests {
         );
 
         let recomputed =
-            SegmentFacts::extract(&unit, &context(), &LIMIT).expect("forced recompute");
+            SegmentFacts::extract(&unit, &LIMIT).expect("forced recompute");
         assert_eq!(
             recomputed, raw,
             "forced raw recomputation must be byte-semantically stable"
@@ -3288,7 +3257,7 @@ mod tests {
     fn every_populated_block_crc_is_enforced_for_the_all_family_fixture() {
         let bytes = all_family_fixture().sealed_bytes();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract all families");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("extract all families");
         let encoded = raw.encode(&LIMIT).expect("encode every canonical block");
         let admitted = FactFile::admit(&encoded, raw.identity(), raw.lineage(), &LIMIT)
             .expect("admit pristine fact file");
@@ -3356,7 +3325,7 @@ mod tests {
             let unit = PgmUnit::open(damaged.as_slice()).expect("catalog remains readable");
             assert!(
                 matches!(
-                    SegmentFacts::extract(&unit, &context(), &LIMIT),
+                    SegmentFacts::extract(&unit, &LIMIT),
                     Err(BuildError::Source(SourceError::Corrupt))
                 ),
                 "source section ordinal {ordinal} type {} was masked by derived extraction",
@@ -3369,7 +3338,7 @@ mod tests {
     fn all_family_range_edges_use_half_open_ownership_and_one_left_halo() {
         let bytes = all_family_fixture().sealed_bytes();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open all-family PGM");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract all families");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract all families");
 
         let left_range = CoverageSpan::new(10, 20).expect("left range");
         let right_range = CoverageSpan::new(20, 31).expect("right range");
@@ -3453,7 +3422,7 @@ mod tests {
     fn retained_observations_survive_fact_file_round_trip() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("raw extract");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let encoded = raw.encode(&LIMIT).expect("encode fact file");
         let index = SegmentFacts::from_bytes(
             &encoded,
@@ -3475,9 +3444,9 @@ mod tests {
     fn forced_recompute_matches_derived_answer() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let derived = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("first build");
+        let derived = SegmentFacts::extract(&unit, &LIMIT).expect("first build");
         let recomputed =
-            SegmentFacts::extract(&unit, &context(), &LIMIT).expect("forced recompute");
+            SegmentFacts::extract(&unit, &LIMIT).expect("forced recompute");
         let divergences = semantic_divergences(&derived, &recomputed, full_range(), LIMITS)
             .expect("bounded comparison");
         assert!(divergences.is_empty());
@@ -3487,7 +3456,7 @@ mod tests {
     fn range_slices_partition_retained_facts_without_double_counting() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
 
         let left = facts
             .query(CoverageSpan::new(0, 1_600).expect("left"), LIMITS)
@@ -3508,7 +3477,7 @@ mod tests {
     fn positional_reload_requires_no_pgm_source() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("raw extract");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let encoded = raw.encode(&LIMIT).expect("encode fact file");
 
         // The positional reader is handed only the fact-file bytes; it never has
@@ -3527,40 +3496,26 @@ mod tests {
     }
 
     #[test]
-    fn store_namespace_changes_identity_not_counts() {
+    fn repeated_extraction_has_stable_content_identity_and_counts() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let here = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("here");
-        let elsewhere = SegmentFacts::extract(
-            &unit,
-            &SegmentContext::new(
-                b"store-b".to_vec(),
-                NamingContractId([0x33; 16]),
-                SegmentLocator([0x44; 32]),
-            )
-            .expect("valid context"),
-            &LIMIT,
-        )
-        .expect("elsewhere");
-        assert_ne!(
-            here.identity().source_scope_id,
-            elsewhere.identity().source_scope_id
-        );
-        // Scope feeds the lineage, so observation identities differ, yet the
-        // scope-independent counts are unchanged.
-        assert_eq!(here.observations().len(), elsewhere.observations().len());
-        let here_result = here.query(full_range(), LIMITS).expect("here query");
-        let elsewhere_result = elsewhere
+        let first = SegmentFacts::extract(&unit, &LIMIT).expect("first");
+        let second = SegmentFacts::extract(&unit, &LIMIT).expect("second");
+        assert_eq!(first.identity(), second.identity());
+        assert_eq!(first.lineage(), second.lineage());
+        assert_eq!(first.observations(), second.observations());
+        let first_result = first.query(full_range(), LIMITS).expect("first query");
+        let second_result = second
             .query(full_range(), LIMITS)
-            .expect("elsewhere query");
-        assert_eq!(here_result.counts(), elsewhere_result.counts());
+            .expect("second query");
+        assert_eq!(first_result.counts(), second_result.counts());
     }
 
     #[test]
     fn corrupt_fact_buffer_returns_typed_error() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let raw = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("raw extract");
+        let raw = SegmentFacts::extract(&unit, &LIMIT).expect("raw extract");
         let mut encoded = raw.encode(&LIMIT).expect("encode fact file");
         let last = encoded.len() - 1;
         encoded[last] ^= 0xFF;
@@ -3581,7 +3536,7 @@ mod tests {
     fn lifecycle_events_fold_into_lifecycle_counts() {
         let bytes = three_lifecycle_events();
         let unit = PgmUnit::open(bytes.as_slice()).expect("open pgm");
-        let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
+        let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract");
         let result = facts.query(full_range(), LIMITS).expect("query");
         let lifecycle = result.counts().lifecycle();
         assert_eq!(lifecycle.crashes(), 1);

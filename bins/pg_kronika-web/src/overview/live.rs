@@ -9,11 +9,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kronika_analytics::overview::{NamingContractId, SegmentLocator};
 use kronika_reader::{
     FactBuildKey, FactKey, FactStore, FallbackConfig, FileKind, FoldEffect, GcConfig, GcMark,
     GcOutcome, LIMIT, LiveBuilder, LiveConfigError, LiveFoldError, LiveState, LocalDirSnapshot,
-    RefreshDelta, SealedFactError, SealedLocator, SegmentContext, SegmentDescriptor, SegmentFacts,
+    RefreshDelta, SealedFactError, SealedLocator, SegmentDescriptor, SegmentFacts,
 };
 
 use super::admission::{ColdAdmissionConfig, ColdWorkWeight};
@@ -22,16 +21,10 @@ use super::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
 use super::view::{DescriptorEntry, DescriptorView, PromotionCandidate};
 use crate::OverviewColdConfig;
 
-/// Deployment naming-contract identity for overview facts.
-///
-/// The contract binds the registry/extractor version into segment identity; a
-/// fixed value scopes every segment in this deployment consistently.
-const OVERVIEW_NAMING_CONTRACT: NamingContractId = NamingContractId([1; 16]);
-
 /// One refresh failure that prevents a coherent timeline publication.
 #[derive(Debug)]
 pub enum OverviewBuildError {
-    /// The configured namespace or live bounds are invalid.
+    /// The configured live bounds are invalid.
     Config(LiveConfigError),
     /// A completed active part could not be opened or folded.
     Live(LiveFoldError),
@@ -98,7 +91,6 @@ const GC_INTERVAL_PASSES: u64 = 60;
 #[derive(Debug)]
 pub(crate) struct OverviewWriter {
     store: FactStore,
-    namespace: Vec<u8>,
     sealed: BTreeMap<SealedLocator, DescriptorEntry>,
     unavailable: BTreeMap<SealedLocator, SegmentDescriptor>,
     scrub_damaged: BTreeMap<SealedLocator, SegmentDescriptor>,
@@ -114,28 +106,25 @@ impl OverviewWriter {
     /// Builds a writer with explicit durable and fallback storage policy.
     #[cfg(test)]
     pub(crate) fn new(
-        cache_root: PathBuf,
-        namespace: Vec<u8>,
+        data_dir: PathBuf,
         fallback: FallbackConfig,
     ) -> Result<Self, OverviewBuildError> {
-        Self::with_gc_config(cache_root, namespace, fallback, GcConfig::default())
+        Self::with_gc_config(data_dir, fallback, GcConfig::default())
     }
 
     /// Builds a writer with explicit fallback and durable GC/quota policies.
     #[cfg(test)]
     pub(crate) fn with_gc_config(
-        cache_root: PathBuf,
-        namespace: Vec<u8>,
+        data_dir: PathBuf,
         fallback: FallbackConfig,
         gc: GcConfig,
     ) -> Result<Self, OverviewBuildError> {
-        Self::with_runtime_config(cache_root, namespace, fallback, gc, Duration::from_mins(1))
+        Self::with_runtime_config(data_dir, fallback, gc, Duration::from_mins(1))
     }
 
     /// Builds a writer with the complete production storage policy.
     pub(crate) fn with_runtime_config(
-        cache_root: PathBuf,
-        namespace: Vec<u8>,
+        data_dir: PathBuf,
         fallback: FallbackConfig,
         gc: GcConfig,
         source_scrub_interval: Duration,
@@ -146,11 +135,9 @@ impl OverviewWriter {
         let next_source_scrub = Instant::now()
             .checked_add(source_scrub_interval)
             .ok_or(OverviewBuildError::SourceScrubInterval)?;
-        let live =
-            LiveBuilder::new(namespace.clone(), LIMIT).map_err(OverviewBuildError::Config)?;
+        let live = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
         Ok(Self {
-            store: FactStore::with_configs(cache_root, fallback, gc),
-            namespace,
+            store: FactStore::with_configs(data_dir, fallback, gc),
             sealed: BTreeMap::new(),
             unavailable: BTreeMap::new(),
             scrub_damaged: BTreeMap::new(),
@@ -183,7 +170,6 @@ impl OverviewWriter {
             .map_err(|_error| OverviewBuildError::ColdAdmission)?;
         OverviewFactLoader::new(
             self.store.clone(),
-            self.namespace.clone(),
             config,
             decoded_cache_bytes,
             decoded_cache_entries,
@@ -232,8 +218,7 @@ impl OverviewWriter {
 
         let mut live = self.live.clone();
         if let Err(first_error) = fold_refresh(&mut live, snapshot, delta) {
-            let mut rebuilt = LiveBuilder::new(self.namespace.clone(), LIMIT)
-                .map_err(OverviewBuildError::Config)?;
+            let mut rebuilt = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
             let baseline = full_live_baseline(delta);
             fold_refresh(&mut rebuilt, snapshot, &baseline).map_err(|_error| first_error)?;
             live = rebuilt;
@@ -402,28 +387,14 @@ impl OverviewWriter {
         snapshot: &LocalDirSnapshot,
         descriptor: &SegmentDescriptor,
     ) -> Result<DescriptorEntry, SealedFactError> {
-        let context = self.context(descriptor)?;
         let unit = snapshot.open_sealed_by_descriptor(descriptor)?;
-        let (identity, lineage) =
-            SegmentFacts::provenance(&unit, &context).map_err(SealedFactError::Build)?;
+        let (identity, lineage) = SegmentFacts::provenance(&unit).map_err(SealedFactError::Build)?;
         let fact_key = FactKey::for_identity(&identity, FileKind::SegmentFacts);
         Ok(DescriptorEntry::new(
             *descriptor,
             FactBuildKey::new(fact_key, lineage.id()),
             ColdWorkWeight::for_unit(&unit),
-            identity.source_scope_id,
         ))
-    }
-
-    fn context(&self, descriptor: &SegmentDescriptor) -> Result<SegmentContext, SealedFactError> {
-        SegmentContext::new(
-            self.namespace.clone(),
-            OVERVIEW_NAMING_CONTRACT,
-            SegmentLocator(*descriptor.locator.as_bytes()),
-        )
-        .map_err(|_error| SealedFactError::ContextLocatorMismatch {
-            locator: descriptor.locator,
-        })
     }
 
     fn current_view(
@@ -648,14 +619,12 @@ mod tests {
     #[tokio::test]
     async fn an_empty_store_assembles_an_empty_current_view() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
         let mut index = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
+            dir.path().to_path_buf(),
             FallbackConfig::default(),
         )
         .expect("writer");
@@ -675,21 +644,19 @@ mod tests {
     #[tokio::test]
     async fn a_sealed_segment_is_loaded_only_after_its_plan_is_admitted() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
         let mut index = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
+            dir.path().to_path_buf(),
             FallbackConfig::default(),
         )
         .expect("writer");
         let descriptors = index.assemble(&snapshot, &delta).expect("view");
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             0,
             "descriptor publication does not build a fact file"
         );
@@ -705,10 +672,10 @@ mod tests {
             !view.coverage_envelope().is_empty(),
             "the admitted sealed segment binds coverage into the query view"
         );
-        assert_eq!(ovf_files(cache.path()), 1);
+        assert_eq!(ovf_files(dir.path()), 1);
     }
 
-    fn ovf_files(cache_root: &std::path::Path) -> usize {
+    fn ovf_files(data_dir: &std::path::Path) -> usize {
         fn walk(dir: &std::path::Path, count: &mut usize) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
@@ -723,22 +690,20 @@ mod tests {
             }
         }
         let mut count = 0;
-        walk(cache_root, &mut count);
+        walk(data_dir, &mut count);
         count
     }
 
     #[tokio::test]
     async fn gc_reclaims_the_fact_file_of_a_dropped_segment() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
         let mut index = OverviewIndex::with_gc_config(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
+            dir.path().to_path_buf(),
             FallbackConfig::default(),
             GcConfig::new(1_000, 2, Duration::ZERO, Duration::ZERO, None, None)
                 .expect("test GC policy"),
@@ -756,7 +721,7 @@ mod tests {
             .await,
         );
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             1,
             "the sealed segment published a fact file"
         );
@@ -767,7 +732,7 @@ mod tests {
             let _ = index.collect_fact_garbage();
         }
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             1,
             "a live segment's fact file survives GC"
         );
@@ -817,7 +782,7 @@ mod tests {
             "the dropped segment's fact file is unlinked"
         );
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             1,
             "only the newly added live segment's fact file remains"
         );
@@ -828,7 +793,6 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache dir");
         let mut index = OverviewIndex::new(
             cache.path().to_path_buf(),
-            b"deployment".to_vec(),
             FallbackConfig::default(),
         )
         .expect("writer");
@@ -847,15 +811,13 @@ mod tests {
     #[test]
     fn repeat_assembly_is_deterministic_in_plan_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         write_segment(dir.path(), "143000.pgm", 1_000, 2_000);
         let mut snapshot = LocalDirSnapshot::open(dir.path()).expect("open snapshot");
         let first_delta = snapshot
             .refresh_incremental_delta()
             .expect("bootstrap delta");
         let mut index = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
+            dir.path().to_path_buf(),
             FallbackConfig::default(),
         )
         .expect("writer");
@@ -881,28 +843,11 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_namespace_fails_instead_of_aliasing() {
-        let cache = tempfile::tempdir().expect("cache dir");
-        assert!(matches!(
-            OverviewIndex::new(
-                cache.path().to_path_buf(),
-                Vec::new(),
-                FallbackConfig::default()
-            ),
-            Err(OverviewBuildError::Config(
-                LiveConfigError::EmptyStoreNamespace
-            ))
-        ));
-        assert!(matches!(
-            OverviewIndex::new(
-                cache.path().to_path_buf(),
-                vec![b'x'; 4097],
-                FallbackConfig::default()
-            ),
-            Err(OverviewBuildError::Config(
-                LiveConfigError::StoreNamespaceTooLong
-            ))
-        ));
+    fn writer_has_no_separate_namespace_or_cache_tree() {
+        let dir = tempfile::tempdir().expect("data directory");
+        OverviewIndex::new(dir.path().to_path_buf(), FallbackConfig::default())
+            .expect("writer needs only the owned data directory");
+        assert!(!dir.path().join("overview").exists());
     }
 
     #[tokio::test]
@@ -912,7 +857,6 @@ mod tests {
     )]
     async fn append_then_seal_keeps_one_coherent_event_set() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cache = tempfile::tempdir().expect("cache dir");
         let first = lifecycle_row(1_500, 41);
         let second = lifecycle_row(2_500, 42);
         let first_part = lifecycle_part(std::slice::from_ref(&first));
@@ -924,8 +868,7 @@ mod tests {
             .refresh_incremental_delta()
             .expect("bootstrap delta");
         let mut writer = OverviewIndex::new(
-            cache.path().to_path_buf(),
-            b"deployment".to_vec(),
+            dir.path().to_path_buf(),
             FallbackConfig::default(),
         )
         .expect("writer");
@@ -1012,7 +955,7 @@ mod tests {
             "seal reconciliation neither drops nor duplicates live observations"
         );
         assert_eq!(
-            ovf_files(cache.path()),
+            ovf_files(dir.path()),
             1,
             "the reconciled sealed facts are durably published"
         );

@@ -11,8 +11,6 @@ use kronika_reader::{FallbackConfig, FallbackConfigError, GcConfig, GcConfigErro
 use crate::overview::selection::ABSOLUTE_MAX_SELECTED_SEGMENTS;
 use crate::{OverviewColdConfig, OverviewConfig};
 
-const OVERVIEW_CACHE_DIR_ENV: &str = "KRONIKA_WEB_OVERVIEW_CACHE_DIR";
-const OVERVIEW_NAMESPACE_ENV: &str = "KRONIKA_WEB_OVERVIEW_NAMESPACE";
 const FALLBACK_SEGMENT_HOURS_ENV: &str = "KRONIKA_WEB_OVERVIEW_FALLBACK_SEGMENT_HOURS";
 const FALLBACK_BYTES_ENV: &str = "KRONIKA_WEB_OVERVIEW_FALLBACK_BYTES";
 const GC_MAX_ENTRIES_ENV: &str = "KRONIKA_WEB_OVERVIEW_GC_MAX_ENTRIES";
@@ -100,8 +98,6 @@ pub(crate) fn parse_basic_auth(raw: &str) -> Result<(String, String), String> {
 
 #[derive(Clone, Copy, Default)]
 struct OverviewConfigRaw<'a> {
-    cache_dir: Option<&'a str>,
-    namespace: Option<&'a str>,
     fallback_segment_hours: Option<&'a str>,
     fallback_bytes: Option<&'a str>,
     gc_max_entries: Option<&'a str>,
@@ -135,8 +131,6 @@ struct OverviewConfigRaw<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedOverviewConfig {
-    cache_dir: PathBuf,
-    namespace: Vec<u8>,
     fallback: FallbackConfig,
     gc: GcConfig,
     response_cache_bytes: usize,
@@ -151,21 +145,8 @@ struct ParsedOverviewConfig {
     cold: OverviewColdConfig,
 }
 
-fn parse_overview_config(
-    raw: &OverviewConfigRaw<'_>,
-    default_cache_dir: PathBuf,
-) -> Result<ParsedOverviewConfig, String> {
-    let defaults = OverviewConfig::new(default_cache_dir, b"default".to_vec());
-    let cache_dir = match raw.cache_dir {
-        Some("") => return Err(format!("{OVERVIEW_CACHE_DIR_ENV} must not be empty")),
-        Some(path) => PathBuf::from(path),
-        None => defaults.cache_root,
-    };
-    let namespace = match raw.namespace {
-        Some("") => return Err(format!("{OVERVIEW_NAMESPACE_ENV} must not be empty")),
-        Some(namespace) => namespace.as_bytes().to_vec(),
-        None => return Err(format!("{OVERVIEW_NAMESPACE_ENV} is not set")),
-    };
+fn parse_overview_config(raw: &OverviewConfigRaw<'_>) -> Result<ParsedOverviewConfig, String> {
+    let defaults = OverviewConfig::new();
     let fallback_segment_hours = parse_nonzero_u64(
         raw.fallback_segment_hours,
         FALLBACK_SEGMENT_HOURS_ENV,
@@ -240,8 +221,6 @@ fn parse_overview_config(
     }
     let cold = parse_cold_config(raw, defaults.cold)?;
     Ok(ParsedOverviewConfig {
-        cache_dir,
-        namespace,
         fallback,
         gc,
         response_cache_bytes,
@@ -403,10 +382,6 @@ pub struct WebConfig {
     pub stale_after: Duration,
     /// Log filter directive (e.g. `info`).
     pub log: String,
-    /// Durable overview fact-cache directory.
-    pub overview_cache_dir: PathBuf,
-    /// Explicit stable overview namespace.
-    pub overview_namespace: Vec<u8>,
     /// Bounded fallback used only after recoverable durable-publication failure.
     pub overview_fallback: FallbackConfig,
     /// Bounded GC and optional hard durable-cache quota.
@@ -445,11 +420,6 @@ impl std::fmt::Debug for WebConfig {
             )
             .field("stale_after", &self.stale_after)
             .field("log", &self.log)
-            .field("overview_cache_dir", &self.overview_cache_dir)
-            .field(
-                "overview_namespace",
-                &format!("<{} bytes>", self.overview_namespace.len()),
-            )
             .field("overview_fallback", &self.overview_fallback)
             .field("overview_gc", &self.overview_gc)
             .field(
@@ -504,10 +474,7 @@ impl WebConfig {
             basic_auth_raw,
             stale_raw,
             log,
-            &OverviewConfigRaw {
-                namespace: Some("test"),
-                ..OverviewConfigRaw::default()
-            },
+            &OverviewConfigRaw::default(),
         )
     }
 
@@ -519,6 +486,12 @@ impl WebConfig {
         log: Option<&str>,
         overview_raw: &OverviewConfigRaw<'_>,
     ) -> Result<Self, String> {
+        if dir.is_empty() {
+            return Err("KRONIKA_WEB_DIR must not be empty".to_owned());
+        }
+        if dir.as_bytes().contains(&0) {
+            return Err("KRONIKA_WEB_DIR contains a NUL byte".to_owned());
+        }
         let basic_auth = basic_auth_raw.map(parse_basic_auth).transpose()?;
 
         let stale_after = match stale_raw {
@@ -532,15 +505,13 @@ impl WebConfig {
         };
 
         let dir = PathBuf::from(dir);
-        let overview = parse_overview_config(overview_raw, dir.join(".pgkronika-overview-cache"))?;
+        let overview = parse_overview_config(overview_raw)?;
         Ok(Self {
-            overview_cache_dir: overview.cache_dir,
             dir,
             addr: addr.to_owned(),
             basic_auth,
             stale_after,
             log: log.unwrap_or("info").to_owned(),
-            overview_namespace: overview.namespace,
             overview_fallback: overview.fallback,
             overview_gc: overview.gc,
             overview_response_cache_bytes: overview.response_cache_bytes,
@@ -572,8 +543,6 @@ impl WebConfig {
         let basic_auth_raw = std::env::var("KRONIKA_WEB_BASIC_AUTH").ok();
         let stale_raw = std::env::var("KRONIKA_WEB_STALE_AFTER_S").ok();
         let log = std::env::var("KRONIKA_WEB_LOG").ok();
-        let overview_cache_dir = std::env::var(OVERVIEW_CACHE_DIR_ENV).ok();
-        let overview_namespace = std::env::var(OVERVIEW_NAMESPACE_ENV).ok();
         let fallback_segment_hours = std::env::var(FALLBACK_SEGMENT_HOURS_ENV).ok();
         let fallback_bytes = std::env::var(FALLBACK_BYTES_ENV).ok();
         let gc_max_entries = std::env::var(GC_MAX_ENTRIES_ENV).ok();
@@ -611,8 +580,6 @@ impl WebConfig {
             stale_raw.as_deref(),
             log.as_deref(),
             &OverviewConfigRaw {
-                cache_dir: overview_cache_dir.as_deref(),
-                namespace: overview_namespace.as_deref(),
                 fallback_segment_hours: fallback_segment_hours.as_deref(),
                 fallback_bytes: fallback_bytes.as_deref(),
                 gc_max_entries: gc_max_entries.as_deref(),
@@ -652,10 +619,7 @@ mod tests {
     use super::*;
 
     fn valid_overview_raw() -> OverviewConfigRaw<'static> {
-        OverviewConfigRaw {
-            namespace: Some("test"),
-            ..OverviewConfigRaw::default()
-        }
+        OverviewConfigRaw::default()
     }
 
     #[test]
@@ -766,28 +730,14 @@ mod tests {
             "default stale_after is 10s"
         );
         assert_eq!(cfg.log, "info", "default log level is info");
-        assert_eq!(
-            cfg.overview_cache_dir,
-            PathBuf::from("/data/.pgkronika-overview-cache")
-        );
-        assert_eq!(cfg.overview_namespace, b"test".to_vec());
     }
 
     #[test]
     fn overview_raw_defaults_match_runtime_overview_defaults() {
-        let cache_dir = PathBuf::from("/data/cache");
-        let parsed = parse_overview_config(
-            &OverviewConfigRaw {
-                namespace: Some("default"),
-                ..OverviewConfigRaw::default()
-            },
-            cache_dir.clone(),
-        )
-        .expect("default overview policy is valid");
-        let defaults = OverviewConfig::new(cache_dir.clone(), b"default".to_vec());
+        let parsed =
+            parse_overview_config(&OverviewConfigRaw::default()).expect("default policy is valid");
+        let defaults = OverviewConfig::new();
         let expected = ParsedOverviewConfig {
-            cache_dir,
-            namespace: b"default".to_vec(),
             fallback: defaults.fallback,
             gc: defaults.gc,
             response_cache_bytes: defaults.response_cache_bytes,
@@ -816,7 +766,6 @@ mod tests {
                     max_selected_segments: Some(raw),
                     ..valid_overview_raw()
                 },
-                PathBuf::from("/cache"),
             )
             .expect("documented selected-segment limit is valid");
             assert_eq!(parsed.max_selected_segments, expected);
@@ -831,7 +780,6 @@ mod tests {
                     max_selected_segments: Some(raw),
                     ..valid_overview_raw()
                 },
-                PathBuf::from("/cache"),
             )
             .expect_err("invalid selected-segment limit must fail");
             assert!(error.contains(MAX_SELECTED_SEGMENTS_ENV), "{error}");
@@ -847,8 +795,6 @@ mod tests {
             None,
             None,
             &OverviewConfigRaw {
-                cache_dir: Some("/cache"),
-                namespace: Some("deployment-a"),
                 fallback_segment_hours: Some("48"),
                 fallback_bytes: Some("1048576"),
                 gc_max_entries: Some("1000"),
@@ -881,8 +827,6 @@ mod tests {
             },
         )
         .expect("custom overview policy is valid");
-        assert_eq!(cfg.overview_cache_dir, PathBuf::from("/cache"));
-        assert_eq!(cfg.overview_namespace, b"deployment-a".to_vec());
         assert_eq!(
             cfg.overview_fallback,
             FallbackConfig::new(48, 1_048_576).expect("fixture fallback is valid")
@@ -928,22 +872,18 @@ mod tests {
     }
 
     #[test]
-    fn web_config_debug_redacts_credentials_and_namespace() {
+    fn web_config_debug_redacts_credentials() {
         let cfg = WebConfig::parse_with_overview(
             "/data",
             "127.0.0.1:9000",
             Some("alice:secret-password"),
             None,
             None,
-            &OverviewConfigRaw {
-                namespace: Some("secret-deployment"),
-                ..OverviewConfigRaw::default()
-            },
+            &OverviewConfigRaw::default(),
         )
         .expect("config with secrets is valid");
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("secret-password"), "{debug}");
-        assert!(!debug.contains("secret-deployment"), "{debug}");
         assert!(debug.contains("overview_cursor_max_bytes"), "{debug}");
     }
 
@@ -1152,8 +1092,7 @@ mod tests {
             ),
         ];
         for (name, raw) in cases {
-            let error = parse_overview_config(&raw, PathBuf::from("/cache"))
-                .expect_err("zero budget must fail");
+            let error = parse_overview_config(&raw).expect_err("zero budget must fail");
             assert!(error.contains(name), "wrong error for {name}: {error}");
         }
     }
@@ -1166,7 +1105,6 @@ mod tests {
                 fallback_segment_hours: Some(&value),
                 ..valid_overview_raw()
             },
-            PathBuf::from("/cache"),
         )
         .expect_err("fallback hours above the hard maximum must fail");
         assert!(error.contains(FALLBACK_SEGMENT_HOURS_ENV), "{error}");
@@ -1181,7 +1119,6 @@ mod tests {
                 fallback_bytes: Some(&value),
                 ..valid_overview_raw()
             },
-            PathBuf::from("/cache"),
         )
         .expect_err("fallback bytes above the hard maximum must fail");
         assert!(error.contains(FALLBACK_BYTES_ENV), "{error}");
@@ -1197,34 +1134,64 @@ mod tests {
     }
 
     #[test]
-    fn overview_raw_rejects_empty_path_and_namespace() {
-        for (name, raw) in [
-            (
-                OVERVIEW_CACHE_DIR_ENV,
-                OverviewConfigRaw {
-                    cache_dir: Some(""),
-                    ..OverviewConfigRaw::default()
-                },
-            ),
-            (
-                OVERVIEW_NAMESPACE_ENV,
-                OverviewConfigRaw {
-                    namespace: Some(""),
-                    ..OverviewConfigRaw::default()
-                },
-            ),
-        ] {
-            let error = parse_overview_config(&raw, PathBuf::from("/cache"))
-                .expect_err("empty overview identity input must fail");
-            assert!(error.contains(name), "wrong error for {name}: {error}");
+    fn overview_policy_has_no_separate_directory_or_identity_input() {
+        let first = WebConfig::parse("/data", "127.0.0.1:9000", None, None, None)
+            .expect("first config");
+        let repeated = WebConfig::parse("/data", "127.0.0.1:9000", None, None, None)
+            .expect("repeated config");
+        let isolated = WebConfig::parse("/other", "127.0.0.1:9000", None, None, None)
+            .expect("other data directory");
+        assert_eq!(first.dir, repeated.dir);
+        assert_ne!(first.dir, isolated.dir);
+        assert_eq!(
+            parse_overview_config(&OverviewConfigRaw::default()),
+            parse_overview_config(&OverviewConfigRaw::default())
+        );
+    }
+
+    #[test]
+    fn empty_and_invalid_store_directories_are_rejected_deterministically() {
+        let empty = WebConfig::parse("", "127.0.0.1:9000", None, None, None)
+            .expect_err("an empty store directory must fail");
+        assert_eq!(empty, "KRONIKA_WEB_DIR must not be empty");
+
+        let nul = WebConfig::parse("/data\0other", "127.0.0.1:9000", None, None, None)
+            .expect_err("a NUL byte cannot name a filesystem path");
+        assert_eq!(nul, "KRONIKA_WEB_DIR contains a NUL byte");
+    }
+
+    #[test]
+    fn removed_overview_storage_variables_are_neither_read_nor_required() {
+        let executable = std::env::current_exe().expect("current test executable");
+        for provide_removed_variables in [false, true] {
+            let mut child = std::process::Command::new(&executable);
+            child
+                .env_clear()
+                .env("PGKRONIKA_STARTUP_ENV_CHILD", "1")
+                .env("KRONIKA_WEB_DIR", "/data")
+                .env("KRONIKA_WEB_ADDR", "127.0.0.1:9000")
+                .arg("--exact")
+                .arg("startup::tests::from_env_accepts_only_the_owned_data_directory_child");
+            if provide_removed_variables {
+                child
+                    .env("KRONIKA_WEB_OVERVIEW_CACHE_DIR", "")
+                    .env("KRONIKA_WEB_OVERVIEW_NAMESPACE", "");
+            }
+            let status = child.status().expect("run isolated environment probe");
+            assert!(
+                status.success(),
+                "removed overview storage variables affected startup: {status}"
+            );
         }
     }
 
     #[test]
-    fn overview_raw_requires_an_explicit_namespace() {
-        let error = parse_overview_config(&OverviewConfigRaw::default(), PathBuf::from("/cache"))
-            .expect_err("implicit deployment identity must not be accepted");
-        assert_eq!(error, format!("{OVERVIEW_NAMESPACE_ENV} is not set"));
+    fn from_env_accepts_only_the_owned_data_directory_child() {
+        if std::env::var_os("PGKRONIKA_STARTUP_ENV_CHILD").is_none() {
+            return;
+        }
+        let config = WebConfig::from_env().expect("minimal startup environment");
+        assert_eq!(config.dir, PathBuf::from("/data"));
     }
 
     #[test]

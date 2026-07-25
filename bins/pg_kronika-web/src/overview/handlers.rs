@@ -16,7 +16,7 @@ use kronika_analytics::overview::{
     CountError, CountLimits, CountResource, CoverageSpan, EventCounts,
     EventFact as CanonicalEventFact, EventObservation, EventPayload as CanonicalEventPayload,
     NotableClass, NotablePolicy, OracleError, OracleLimits, OracleResource, PhysicalCountSemantics,
-    RetainedExactness, Severity, SourceCompleteness, SourceScopeId,
+    RetainedExactness, Severity, SourceCompleteness,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -693,19 +693,6 @@ fn render_events(
             QUERY_LIMITS.max_coverage_spans,
         )
         .map_err(|_error| ApiProblem::store_read_failed())?;
-    let source_ids_by_scope = source_metadata
-        .iter()
-        .filter_map(|source| {
-            source
-                .source_scope_id
-                .map(|scope| (scope, source.source_id))
-        })
-        .map(|(scope, source_id)| {
-            (view.source_id_for_scope(scope) == Some(source_id))
-                .then_some((scope, source_id))
-                .ok_or_else(ApiProblem::store_read_failed)
-        })
-        .collect::<Result<BTreeMap<SourceScopeId, u64>, _>>()?;
     let observations = result.observations();
     let canonical_facts = view
         .query_canonical_facts(
@@ -739,15 +726,11 @@ fn render_events(
         {
             continue;
         }
-        let source_id = source_ids_by_scope
-            .get(&observation.source_scope_id())
-            .copied()
-            .ok_or_else(ApiProblem::store_read_failed)?;
         let candidate = PageCandidate {
             position: fact_position,
             source: PageCandidateSource::Observation(observation),
             class,
-            source_id,
+            source_id: observation.source_id(),
         };
         let retained_cap = request.limit.saturating_add(1);
         if notable.len() < retained_cap {
@@ -789,15 +772,11 @@ fn render_events(
         {
             continue;
         }
-        let source_id = source_ids_by_scope
-            .get(&fact.coverage().source_scope_id)
-            .copied()
-            .ok_or_else(ApiProblem::store_read_failed)?;
         let candidate = PageCandidate {
             position,
             source: PageCandidateSource::Canonical(fact),
             class,
-            source_id,
+            source_id: fact.coverage().source_id,
         };
         let retained_cap = request.limit.saturating_add(1);
         if notable.len() < retained_cap {
@@ -1029,7 +1008,7 @@ fn timeline_meta_with_metadata(
     let view_status = view.source_status();
     let all_available = source_metadata
         .iter()
-        .all(|source| source.source_scope_id.is_some());
+        .all(|source| source.data_through_us.is_some());
     let source_status = if matches!(view_status, SourceStatus::Gap) || all_available {
         view_status.wire_code()
     } else {
@@ -1039,11 +1018,8 @@ fn timeline_meta_with_metadata(
         .iter()
         .map(|source| SourceFreshnessDto {
             source_id: source.source_id,
-            source_scope_id: source
-                .source_scope_id
-                .map(|scope| URL_SAFE_NO_PAD.encode(scope.0)),
             data_through_us: source.data_through_us,
-            source_status: if !source.known_gaps.is_empty() || source.source_scope_id.is_some() {
+            source_status: if !source.known_gaps.is_empty() || source.data_through_us.is_some() {
                 view_status.wire_code()
             } else {
                 "unavailable"
@@ -1598,7 +1574,6 @@ mod tests {
     fn source_with_physical_count(physical_count: PhysicalCountSemantics) -> SourceMetadata {
         SourceMetadata {
             source_id: 7,
-            source_scope_id: None,
             data_through_us: None,
             covered: Coverage::empty(),
             known_gaps: Coverage::empty(),

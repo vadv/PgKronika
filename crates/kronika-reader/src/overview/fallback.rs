@@ -122,11 +122,10 @@ impl Default for FallbackConfig {
 
 /// Full in-memory identity of one admitted sealed-segment fact set.
 ///
-/// The durable key binds source scope, the PGM tail/catalog descriptor, fact
-/// kind, schema, extractor, and registry versions. The lineage additionally
-/// binds the stable sealed locator and naming contract carried by the admitted
-/// observations. Consequently source changes, replacements, version changes,
-/// and distinct sealed occurrences miss naturally.
+/// The durable key binds the numeric source, exact PGM descriptor, fact kind,
+/// schema, extractor, and registry versions. The lineage additionally binds
+/// the retained source provenance carried by admitted observations. No
+/// filesystem path participates in this in-memory key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct FallbackFactKey {
     durable: FactKey,
@@ -356,9 +355,6 @@ impl FallbackFactLru {
     }
 
     /// Removes the exact lineage whose durable publication succeeded.
-    ///
-    /// A content-identical occurrence under another sealed locator remains a
-    /// separate fallback entry until its own durable file is admitted.
     pub(super) fn discard_durable(&mut self, key: FallbackFactKey) {
         self.remove_replaced(&key);
     }
@@ -436,13 +432,11 @@ const fn saturating_increment(counter: &mut u64) {
 mod tests {
     use std::sync::{Barrier, Mutex};
 
-    use kronika_analytics::overview::{NamingContractId, SegmentLocator, SourceScopeId};
     use kronika_format::{PartMeta, SectionInput, build_part};
     use kronika_registry::pg_log::PgLogLifecycleV1;
     use kronika_registry::{Section, Ts};
 
     use super::super::descriptors::SourceDescriptor;
-    use super::super::facts::SegmentContext;
     use super::super::limits::LIMIT;
     use super::*;
     use crate::unit::PgmUnit;
@@ -458,14 +452,14 @@ mod tests {
     fn key(durable_byte: u8, lineage_byte: u8) -> FallbackFactKey {
         FallbackFactKey::new(
             FactKey::for_current_segment(
-                SourceScopeId([durable_byte; 32]),
+                u64::from(durable_byte),
                 SourceDescriptor([durable_byte; 32]),
             ),
             SegmentLineageId([lineage_byte; 32]),
         )
     }
 
-    fn facts(locator_byte: u8, min_ts_us: i64, max_ts_us: i64) -> Arc<SegmentFacts> {
+    fn facts(source_id: u64, min_ts_us: i64, max_ts_us: i64) -> Arc<SegmentFacts> {
         let row = PgLogLifecycleV1 {
             ts: Ts(min_ts_us),
             kind: 2,
@@ -486,17 +480,11 @@ mod tests {
             PartMeta {
                 min_ts: min_ts_us,
                 max_ts: max_ts_us,
-                source_id: 7,
+                source_id,
             },
         );
         let unit = PgmUnit::open(bytes.as_slice()).expect("open PGM");
-        let context = SegmentContext::new(
-            b"fallback-test".to_vec(),
-            NamingContractId([0x33; 16]),
-            SegmentLocator([locator_byte; 32]),
-        )
-        .expect("valid segment context");
-        Arc::new(SegmentFacts::extract(&unit, &context, &LIMIT).expect("extract facts"))
+        Arc::new(SegmentFacts::extract(&unit, &LIMIT).expect("extract facts"))
     }
 
     #[test]
@@ -553,7 +541,7 @@ mod tests {
         assert_ne!(key(1, 1), key(2, 1));
         assert_ne!(key(1, 1), key(1, 2));
         let current = FactKey::derive(
-            SourceScopeId([1; 32]),
+            1,
             SourceDescriptor([1; 32]),
             FileKind::SegmentFacts,
             1,
@@ -561,7 +549,7 @@ mod tests {
             1,
         );
         let next_extractor = FactKey::derive(
-            SourceScopeId([1; 32]),
+            1,
             SourceDescriptor([1; 32]),
             FileKind::SegmentFacts,
             1,
@@ -577,7 +565,7 @@ mod tests {
         let replacement = facts(2, 1_500, 1_700);
         let first_key = FallbackFactKey::for_facts(&first);
         let replacement_key = FallbackFactKey::for_facts(&replacement);
-        assert_eq!(first_key.durable(), replacement_key.durable());
+        assert_ne!(first_key.durable(), replacement_key.durable());
         assert_ne!(first_key.lineage(), replacement_key.lineage());
         assert_ne!(first_key, replacement_key);
     }
@@ -711,12 +699,12 @@ mod tests {
     }
 
     #[test]
-    fn durable_publication_discards_only_the_published_lineage() {
+    fn durable_publication_discards_only_the_exact_build_key() {
         let first = facts(1, 1_500, 1_700);
         let second = facts(2, 1_500, 1_700);
         let first_key = FallbackFactKey::for_facts(&first);
         let second_key = FallbackFactKey::for_facts(&second);
-        assert_eq!(second_key.durable(), first_key.durable());
+        assert_ne!(second_key, first_key);
         let mut cache = FallbackFactLru::new(config(2, 100));
         cache.insert_after_publication_failure(first, canonical_len(10), LIMIT);
         cache.insert_after_publication_failure(second, canonical_len(10), LIMIT);
