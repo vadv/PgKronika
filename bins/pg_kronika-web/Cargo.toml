@@ -47,6 +47,7 @@ tower = { version = "0.5", features = ["util"], optional = true }
 
 [dev-dependencies]
 kronika-format = { path = "../../crates/kronika-format" }
+kronika-reader = { path = "../../crates/kronika-reader", features = ["qualification"] }
 kronika-writer = { path = "../../crates/kronika-writer" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

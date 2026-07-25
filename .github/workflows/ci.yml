@@ -80,28 +80,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Measure exact-head dense-hour modes
         run: |
+          command -v strace
           python3 scripts/test_validate_overview_qualification.py
-          cargo run --release -p kronika-reader --example overview_qualification -- --output target/qualification/overview.json
-          python3 scripts/validate-overview-qualification.py target/qualification/overview.json --exact-head "${EXACT_SOURCE_HEAD}" --final --output target/qualification/validation.json
-          sha256sum target/qualification/overview.json > target/qualification/overview.json.sha256
-          sha256sum target/qualification/validation.json > target/qualification/validation.json.sha256
+          cargo run --release --manifest-path bins/pg_kronika-web/Cargo.toml --example overview_qualification --features qualification -- --output target/qualification/overview.raw.json
+          python3 scripts/validate-overview-qualification.py target/qualification/overview.raw.json --exact-head "${EXACT_SOURCE_HEAD}" --output target/qualification/validation.preliminary.json
+          sha256sum target/qualification/overview.raw.json > target/qualification/overview.raw.json.sha256
+          sha256sum target/qualification/validation.preliminary.json > target/qualification/validation.preliminary.json.sha256
           {
-            echo '## Overview qualification'
+            echo '## Overview qualification measurements'
             echo
             echo "- exact head: \`${EXACT_SOURCE_HEAD}\`"
             echo "- run attempt: \`${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}\`"
-            echo "- artifact: \`overview-qualification\`"
+            echo "- raw artifact: \`overview-qualification-raw\`"
             echo
-            echo 'Structural, I/O, and performance gates passed. Configured deployment budgets are enforced; absent budgets remain owner-deferred.'
+            echo 'Nine production-path modes and their raw process, I/O, syscall, accounting, concurrency, recovery, and latency evidence passed preliminary validation.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: overview-qualification
+          name: overview-qualification-raw
           path: |
-            target/qualification/overview.json
-            target/qualification/overview.json.sha256
-            target/qualification/validation.json
-            target/qualification/validation.json.sha256
+            target/qualification/overview.raw.json
+            target/qualification/overview.raw.json.sha256
+            target/qualification/validation.preliminary.json
+            target/qualification/validation.preliminary.json.sha256
 
   bdd-matrix:
     name: bdd matrix
@@ -180,3 +181,68 @@ jobs:
         run: ./scripts/bdd-image.sh check-runtime
       - name: Run the PostgreSQL matrix
         run: ./scripts/bdd-image.sh run
+
+  overview-m6-acceptance:
+    name: overview M6 acceptance
+    if: ${{ always() }}
+    needs:
+      - lint
+      - deps
+      - test
+      - coverage
+      - overview-qualification
+      - bdd-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EXACT_SOURCE_HEAD }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: overview-qualification-raw
+          path: target/qualification
+      - name: Bind all M6 evidence to this exact green attempt
+        run: |
+          python3 scripts/finalize-overview-qualification.py \
+            target/qualification/overview.raw.json \
+            --output target/qualification/overview.final.json \
+            --exact-head "${EXACT_SOURCE_HEAD}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --job "lint=${{ needs.lint.result }}" \
+            --job "deps=${{ needs.deps.result }}" \
+            --job "test=${{ needs.test.result }}" \
+            --job "coverage=${{ needs.coverage.result }}" \
+            --job "overview-qualification=${{ needs.overview-qualification.result }}" \
+            --job "bdd-matrix=${{ needs.bdd-matrix.result }}"
+          sha256sum target/qualification/overview.final.json > target/qualification/overview.final.json.sha256
+          python3 scripts/validate-overview-qualification.py \
+            target/qualification/overview.final.json \
+            --exact-head "${EXACT_SOURCE_HEAD}" \
+            --final \
+            --raw-artifact target/qualification/overview.raw.json \
+            --checksum-file target/qualification/overview.final.json.sha256 \
+            --output target/qualification/validation.final.json
+          sha256sum target/qualification/validation.final.json > target/qualification/validation.final.json.sha256
+          {
+            echo '## Overview M6 acceptance'
+            echo
+            echo "- exact head: \`${EXACT_SOURCE_HEAD}\`"
+            echo "- Actions run/attempt: \`${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}\`"
+            echo "- artifact: \`overview-qualification-final\`"
+            echo "- decision: **PASS**"
+            echo
+            echo 'All 18 rows are IMPLEMENTED and bound to the six successful predecessor jobs, the PostgreSQL 15–18 scenarios, the raw measurement checksum, and this final artifact checksum.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overview-qualification-final
+          path: |
+            target/qualification/overview.raw.json
+            target/qualification/overview.raw.json.sha256
+            target/qualification/overview.final.json
+            target/qualification/overview.final.json.sha256
+            target/qualification/validation.preliminary.json
+            target/qualification/validation.preliminary.json.sha256
+            target/qualification/validation.final.json
+            target/qualification/validation.final.json.sha256

@@ -21,6 +21,7 @@ use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
 use kronika_registry::{Section, StrId, Ts};
 
 /// Schema version for [`all_family_fixture`].
+#[cfg(test)]
 pub(super) const ALL_FAMILY_SCHEMA_VERSION: u16 = 2;
 
 /// One encoded registry section retained by a fixture part.
@@ -49,8 +50,11 @@ impl FixturePart {
 /// A fixed source stream plus its active-part and sealed representations.
 #[derive(Debug, Clone)]
 pub(super) struct VersionedFixture {
+    #[cfg(test)]
     pub schema_version: u16,
+    #[cfg(test)]
     pub source_id: u64,
+    #[cfg(test)]
     pub cadence_us: i64,
     pub parts: Vec<FixturePart>,
 }
@@ -61,6 +65,7 @@ impl VersionedFixture {
     /// Every cut mask is represented. Section order remains identical to the
     /// sealed catalog, which is the provenance condition required for a
     /// lossless promotion.
+    #[cfg(test)]
     pub(super) fn contiguous_partitions(&self) -> Vec<Vec<Vec<u8>>> {
         let boundary_count = self.parts.len().saturating_sub(1);
         let variant_count = 1_usize
@@ -134,8 +139,11 @@ impl VersionedFixture {
 /// - exact and failed source coverage, including a collector failure fact.
 pub(super) fn all_family_fixture() -> VersionedFixture {
     VersionedFixture {
+        #[cfg(test)]
         schema_version: ALL_FAMILY_SCHEMA_VERSION,
+        #[cfg(test)]
         source_id: 7,
+        #[cfg(test)]
         cadence_us: 10,
         parts: vec![
             fixture_part(10, 0),

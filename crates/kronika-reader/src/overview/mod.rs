@@ -31,7 +31,7 @@ mod persist_mode;
 #[cfg(test)]
 mod proptests;
 mod publish;
-#[cfg(test)]
+#[cfg(any(test, feature = "qualification"))]
 mod qualification_fixture;
 
 pub use block::{
@@ -69,3 +69,8 @@ pub use publish::{
     CacheRebuildReason, FactLoad, FactOrigin, FactStore, PersistError, PersistFailureClass,
     PersistenceProbeOutcome,
 };
+
+#[cfg(feature = "qualification")]
+pub(crate) fn qualification_all_family_pgm() -> Vec<u8> {
+    qualification_fixture::all_family_fixture().sealed_bytes()
+}

@@ -219,6 +219,8 @@ struct Work {
     fallback_resident_bytes: u64,
     completed_active_parts: u64,
     visibility_lag_us: u64,
+    tail_pending_from_offset_bytes: u64,
+    tail_pending_to_offset_bytes: u64,
     successful_responses: u64,
     serialized_response_bytes: u64,
 }
@@ -294,6 +296,7 @@ struct SyscallCounts {
 #[derive(Debug, Serialize)]
 struct EvidenceRef {
     kind: &'static str,
+    binary: &'static str,
     path: &'static str,
     name: &'static str,
 }
@@ -707,10 +710,19 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
     let before_loader = state.overview_loader.qualification_snapshot();
     let before_live = live_stats(&state);
     let second = lifecycle_part(dense_end() + 20, 42);
+    let completed_frame = framed(&second);
     let next_header = FrameHeader {
         part_len: u64::try_from(second.len()).expect("active part length"),
     }
     .encode();
+    let pending_from = fs::metadata(root.join("active.parts"))
+        .expect("stat active journal")
+        .len()
+        .checked_add(u64::try_from(completed_frame.len()).expect("completed frame length"))
+        .expect("pending tail offset");
+    let pending_to = pending_from
+        .checked_add(4)
+        .expect("pending tail end offset");
 
     let measurement = Measurement::start();
     let mut journal = OpenOptions::new()
@@ -718,7 +730,7 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
         .open(root.join("active.parts"))
         .expect("open active journal");
     journal
-        .write_all(&framed(&second))
+        .write_all(&completed_frame)
         .expect("append completed active frame");
     journal
         .write_all(&next_header[..4])
@@ -753,9 +765,13 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
         2,
         "both completed active lifecycle frames must be visible"
     );
-    assert!(
-        !value["meta"]["tail_pending"].is_null(),
-        "truncated next frame must remain an explicit pending tail"
+    assert_eq!(
+        value["meta"]["tail_pending"],
+        serde_json::json!({
+            "from_offset_bytes": pending_from,
+            "to_offset_bytes": pending_to,
+        }),
+        "truncated next frame must publish its exact byte range"
     );
     let after_loader = state.overview_loader.qualification_snapshot();
     let after_live = live_stats(&state);
@@ -771,6 +787,8 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
         .saturating_add(after_live.pgm_body_bytes.saturating_sub(before_live.pgm_body_bytes));
     work.visibility_lag_us =
         u64::try_from(measurement.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    work.tail_pending_from_offset_bytes = pending_from;
+    work.tail_pending_to_offset_bytes = pending_to;
     assert_eq!(work.completed_active_parts, 1);
     assert!(work.visibility_lag_us <= 2_500_000);
     measurement.finish(work)
@@ -1665,7 +1683,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
             &[(
                 "rust_test",
                 "bins/pg_kronika-web/src/tests/overview_timeline.rs",
-                "metric_fact_and_full_coverage_axes_reach_all_timeline_responses",
+                "all_supported_factor_families_reach_every_timeline_endpoint",
             )],
         ),
         (
@@ -1686,11 +1704,10 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
         ),
         (
             "admission-singleflight-bounds",
-            &[(
-                "mode",
-                "qualification",
-                "concurrent-identical+concurrent-disjoint",
-            )],
+            &[
+                ("mode", "qualification", "concurrent-identical"),
+                ("mode", "qualification", "concurrent-disjoint"),
+            ],
         ),
         (
             "memory-fallback-recovery",
@@ -1711,7 +1728,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
         (
             "nine-modes-one-profile",
             &[(
-                "mode",
+                "mode_set",
                 "qualification",
                 "all-nine-modes",
             )],
@@ -1725,9 +1742,28 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
             implementation_status: "IMPLEMENTED",
             evidence: evidence
                 .iter()
-                .map(|(kind, path, name)| EvidenceRef { kind, path, name })
+                .map(|(kind, path, name)| EvidenceRef {
+                    kind,
+                    binary: evidence_binary(kind, path),
+                    path,
+                    name,
+                })
                 .collect(),
             decision: "PENDING_EXACT_HEAD_CI",
         })
         .collect()
+}
+
+fn evidence_binary(kind: &str, path: &str) -> &'static str {
+    match (kind, path) {
+        ("mode" | "mode_set", "qualification") => {
+            "pg-kronika-web::example/overview_qualification"
+        }
+        ("rust_test", path) if path.starts_with("crates/kronika-reader/") => "kronika-reader",
+        ("rust_test", path) if path.starts_with("crates/kronika-analytics/") => {
+            "kronika-analytics"
+        }
+        ("rust_test", path) if path.starts_with("bins/pg_kronika-web/") => "pg-kronika-web",
+        _ => panic!("unknown qualification evidence {kind}:{path}"),
+    }
 }

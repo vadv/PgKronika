@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use kronika_analytics::overview::MetricFactor;
 use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
 use kronika_reader::LocalDirSnapshot;
 use kronika_registry::pg_log::{PgLogErrorV1, PgLogLifecycleV1};
@@ -502,6 +503,114 @@ async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
     assert_eq!(unsupported["state"], "not_collected");
     assert_eq!(unsupported["present_samples"], 0);
     assert_eq!(unsupported["covered_duration_us"], 0);
+}
+
+#[tokio::test]
+async fn all_supported_factor_families_reach_every_timeline_endpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("all-families.pgm"),
+        kronika_reader::qualification_all_family_pgm(),
+    )
+    .expect("write all-family fixture");
+    let state = state_for_dir(dir.path());
+    let query = "source=7&from=10&to=41";
+
+    let (overview_status, overview) =
+        serve_state(state.clone(), &format!("/v1/timeline/overview?{query}")).await;
+    let (events_status, events) =
+        serve_state(state.clone(), &format!("/v1/timeline/events?{query}&limit=1000")).await;
+    let (health_status, health) =
+        serve_state(state, &format!("/v1/timeline/health?{query}&step=10")).await;
+    assert_eq!(overview_status, StatusCode::OK, "{overview}");
+    assert_eq!(events_status, StatusCode::OK, "{events}");
+    assert_eq!(health_status, StatusCode::OK, "{health}");
+
+    for body in [&overview, &events, &health] {
+        assert_eq!(body["meta"]["sources"], json!([7]));
+        assert_eq!(body["meta"]["available_sources"], json!([7]));
+        assert_eq!(body["meta"]["tail_pending"], serde_json::Value::Null);
+        assert_eq!(
+            body["meta"]["fact_set_id"], overview["meta"]["fact_set_id"],
+            "every endpoint must use the same immutable fact set"
+        );
+    }
+    assert_eq!(overview["coverage"], events["coverage"]);
+    assert_eq!(events["coverage"], health["coverage"]);
+
+    let coverage = events["coverage"].as_array().expect("factor coverage");
+    let expected_ids = MetricFactor::ALL
+        .into_iter()
+        .map(|factor| u64::from(factor.id().0))
+        .collect::<Vec<_>>();
+    let actual_ids = coverage
+        .iter()
+        .map(|entry| entry["factor_id"].as_u64().expect("numeric factor id"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual_ids, expected_ids,
+        "the HTTP coverage contract must enumerate every stable factor exactly once"
+    );
+    for (factor, entry) in MetricFactor::ALL.into_iter().zip(coverage) {
+        let supported = factor.id().0 < 900;
+        assert_eq!(
+            entry["applicability"],
+            if supported {
+                "applicable"
+            } else {
+                "unsupported"
+            },
+            "wrong applicability for {}",
+            factor.wire_code()
+        );
+        assert!(entry["interval"]["from_us"].is_i64());
+        assert!(entry["interval"]["to_us"].is_i64());
+        assert!(entry["loss_reasons"].is_array());
+        assert!(entry["retained_exactness"].is_string());
+        assert!(entry["source_completeness"].is_string());
+        assert!(entry["physical_count_semantics"].is_string());
+        if supported {
+            assert!(
+                entry["present_samples"]
+                    .as_u64()
+                    .is_some_and(|samples| samples > 0),
+                "{} has no retained HTTP sample",
+                factor.wire_code()
+            );
+        } else {
+            assert_eq!(entry["state"], "not_collected");
+            assert_eq!(entry["present_samples"], 0);
+            assert!(entry["source_population"].is_null());
+        }
+    }
+
+    let event_rows = events["events"].as_array().expect("event facts");
+    assert!(!event_rows.is_empty(), "all-family events must reach HTTP");
+    for event in event_rows {
+        assert!(event["event_id"].is_string());
+        assert!(event["event_instance_id"].is_string());
+        assert!(event["event_kind"].is_string());
+        assert_eq!(event["source_id"], 7);
+        if let Some(factor_id) = event["payload"]["factor_id"].as_u64() {
+            assert!(
+                expected_ids.contains(&factor_id),
+                "event payload published an unknown factor: {event}"
+            );
+            assert!(
+                event["entity"].is_object(),
+                "factor event lost its source-qualified entity: {event}"
+            );
+        }
+    }
+
+    let points = health["points"].as_array().expect("health points");
+    assert!(!points.is_empty());
+    assert!(
+        points.windows(2).all(|pair| {
+            pair[0]["interval"]["to_us"] == pair[1]["interval"]["from_us"]
+        }),
+        "health buckets must form a non-interpolated half-open partition"
+    );
 }
 
 #[tokio::test]
