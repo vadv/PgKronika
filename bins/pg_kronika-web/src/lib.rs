@@ -272,7 +272,7 @@ impl OverviewConfig {
             response_cache_entries: RESPONSE_CACHE_ENTRIES,
             decoded_cache_bytes: 256 * 1024 * 1024,
             decoded_cache_entries: 4_096,
-            source_scrub_interval: Duration::from_secs(60),
+            source_scrub_interval: Duration::from_mins(1),
             cursor_max_views: 64,
             cursor_max_bytes: 512 * 1024 * 1024,
             cursor_ttl: Duration::from_mins(5),

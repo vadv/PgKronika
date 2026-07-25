@@ -32,7 +32,7 @@ pub enum MetricFactor {
     PgDatabaseSessionsKilled,
     /// Explicit `pg_stat_database` reset timestamp.
     PgStatisticsResetAt,
-    /// Explicit PostgreSQL postmaster start timestamp.
+    /// Explicit `PostgreSQL` postmaster start timestamp.
     PgPostmasterStartTime,
     /// Current per-database connection count.
     PgDatabaseConnections,
@@ -42,9 +42,9 @@ pub enum MetricFactor {
     PgDatabaseFrozenXidAge,
     /// Age of `datminmxid`, multixacts.
     PgDatabaseMinMxidAge,
-    /// PostgreSQL recovery role.
+    /// `PostgreSQL` recovery role.
     PgRecoveryRole,
-    /// PostgreSQL timeline ID.
+    /// `PostgreSQL` timeline ID.
     PgTimeline,
     /// Physical replication sender state.
     PgReplicationSenderState,

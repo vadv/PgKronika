@@ -55,7 +55,7 @@ pub(super) struct MetricExtraction {
 }
 
 impl MetricExtraction {
-    fn empty(
+    const fn empty(
         descriptor_replacements: Vec<(usize, ManifestEntryDescriptor)>,
         pgm_body_read_stats: PgmBodyReadStats,
     ) -> Self {
@@ -227,7 +227,7 @@ impl Default for MetricAccumulator {
 }
 
 impl MetricAccumulator {
-    fn with_item_limit(item_limit: u64) -> Self {
+    const fn with_item_limit(item_limit: u64) -> Self {
         Self {
             item_limit,
             counter_series: BTreeMap::new(),
@@ -241,7 +241,7 @@ impl MetricAccumulator {
         }
     }
 
-    fn admit_item(&self, current_len: usize) -> Result<(), BuildError> {
+    const fn admit_item(&self, current_len: usize) -> Result<(), BuildError> {
         if current_len as u64 >= self.item_limit {
             return Err(BuildError::LimitExceeded);
         }
@@ -333,6 +333,10 @@ impl MetricAccumulator {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the arguments are the complete identity and value of one snapshot boundary"
+    )]
     fn snapshot_boundary(
         &mut self,
         factor: MetricFactor,
@@ -370,6 +374,10 @@ impl MetricAccumulator {
 }
 
 /// Extracts every allow-listed metric section body exactly once.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function is the bounded dispatcher for every allow-listed metric section"
+)]
 pub(super) fn extract_metrics<R: ReadAt>(
     unit: &PgmUnit<R>,
     source_scope_id: SourceScopeId,
@@ -442,10 +450,10 @@ pub(super) fn extract_metrics<R: ReadAt>(
         register_factor_inventory(&mut metrics, section.type_id);
         match section.type_id {
             type_id if PG_STAT_DATABASE_TYPES.contains(&type_id) => {
-                extract_pg_database(&mut metrics, section, source_scope_id, &reset_timeline)?
+                extract_pg_database(&mut metrics, section, source_scope_id, &reset_timeline)?;
             }
             OS_CGROUP_MEMORY => {
-                extract_cgroup_memory(&mut metrics, section, source_scope_id, &reset_timeline)?
+                extract_cgroup_memory(&mut metrics, section, source_scope_id, &reset_timeline)?;
             }
             OS_VMSTAT => {
                 extract_vmstat(&mut metrics, section, source_scope_id, &reset_timeline)?;
@@ -857,7 +865,7 @@ fn extract_replication_instance(
                     b"instance",
                 ),
                 ts,
-                micros as f64,
+                exact_i64_to_f64(micros)?,
             )?;
         }
     }
@@ -1103,7 +1111,7 @@ fn extract_reset_metadata(
                     b"postmaster-start",
                 ),
                 ts_us,
-                required_ts(row, "postmaster_start_time")? as f64,
+                exact_i64_to_f64(required_ts(row, "postmaster_start_time")?)?,
             )?;
             if let Some(reset_at) = optional_ts(row, "pg_stat_database_reset_max_at")? {
                 out.gauge(
@@ -1117,7 +1125,7 @@ fn extract_reset_metadata(
                         b"pg-stat-database-reset",
                     ),
                     ts_us,
-                    reset_at as f64,
+                    exact_i64_to_f64(reset_at)?,
                 )?;
             }
         }
@@ -1338,6 +1346,10 @@ fn insert_coverage(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function projects the complete canonical factor-coverage record in one bounded pass"
+)]
 fn factor_coverage(
     metrics: &MetricAccumulator,
     snapshot: &BTreeMap<u32, Vec<CoverageRecord>>,
@@ -1753,10 +1765,36 @@ fn optional_f64(row: &Row, field: &str) -> Result<Option<f64>, BuildError> {
         Some(Cell::F64(value)) if value.is_finite() => Ok(Some(*value)),
         Some(Cell::I16(value)) => Ok(Some(f64::from(*value))),
         Some(Cell::I32(value)) => Ok(Some(f64::from(*value))),
-        Some(Cell::I64(value)) => Ok(Some(*value as f64)),
+        Some(Cell::I64(value)) => exact_i64_to_f64(*value).map(Some),
         Some(Cell::U32(value)) => Ok(Some(f64::from(*value))),
-        Some(Cell::U64(value)) => Ok(Some(*value as f64)),
+        Some(Cell::U64(value)) => exact_u64_to_f64(*value).map(Some),
         Some(_) => Err(BuildError::Source(SourceError::Corrupt)),
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the explicit 53-bit range check guarantees exact IEEE-754 integer conversion"
+)]
+const fn exact_i64_to_f64(value: i64) -> Result<f64, BuildError> {
+    const EXACT_INTEGER_LIMIT: u64 = 1_u64 << 53;
+    if value.unsigned_abs() <= EXACT_INTEGER_LIMIT {
+        Ok(value as f64)
+    } else {
+        Err(BuildError::Source(SourceError::Corrupt))
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the explicit 53-bit range check guarantees exact IEEE-754 integer conversion"
+)]
+const fn exact_u64_to_f64(value: u64) -> Result<f64, BuildError> {
+    const EXACT_INTEGER_LIMIT: u64 = 1_u64 << 53;
+    if value <= EXACT_INTEGER_LIMIT {
+        Ok(value as f64)
+    } else {
+        Err(BuildError::Source(SourceError::Corrupt))
     }
 }
 
@@ -1768,7 +1806,7 @@ mod tests {
         factor: MetricFactor,
         sources: &[u32],
         times: &[i64],
-        snapshot: BTreeMap<u32, Vec<CoverageRecord>>,
+        snapshot: &BTreeMap<u32, Vec<CoverageRecord>>,
         interval: CoverageSpan,
     ) -> FactorCoverage {
         let mut metrics = MetricAccumulator::default();
@@ -1776,7 +1814,7 @@ mod tests {
             .factor_sources
             .insert(factor.id(), sources.iter().copied().collect());
         metrics.factor_times.insert(factor.id(), times.to_vec());
-        factor_coverage(&metrics, &snapshot, interval, &super::super::limits::LIMIT)
+        factor_coverage(&metrics, snapshot, interval, &super::super::limits::LIMIT)
             .expect("coverage")
             .into_iter()
             .find(|coverage| coverage.factor_id == factor.id())
@@ -1837,6 +1875,23 @@ mod tests {
     }
 
     #[test]
+    fn integer_gauges_reject_values_outside_the_exact_f64_range() {
+        const EXACT_LIMIT: u64 = 1_u64 << 53;
+        const EXACT_LIMIT_I64: i64 = 9_007_199_254_740_992;
+        const EXACT_LIMIT_F64: f64 = 9_007_199_254_740_992.0;
+        assert_eq!(exact_i64_to_f64(-EXACT_LIMIT_I64), Ok(-EXACT_LIMIT_F64));
+        assert_eq!(exact_u64_to_f64(EXACT_LIMIT), Ok(EXACT_LIMIT_F64));
+        assert_eq!(
+            exact_i64_to_f64(i64::try_from(EXACT_LIMIT + 1).expect("fits i64")),
+            Err(BuildError::Source(SourceError::Corrupt))
+        );
+        assert_eq!(
+            exact_u64_to_f64(EXACT_LIMIT + 1),
+            Err(BuildError::Source(SourceError::Corrupt))
+        );
+    }
+
+    #[test]
     fn stable_cadence_requires_equal_positive_intervals() {
         assert_eq!(observed_cadence(&[10]), None);
         assert_eq!(observed_cadence(&[10, 20, 31]), None);
@@ -1877,7 +1932,7 @@ mod tests {
             MetricFactor::PgDatabaseDeadlocks,
             &[PG_STAT_DATABASE_TYPES[0]],
             &[10],
-            BTreeMap::from([(PG_STAT_DATABASE_TYPES[0], vec![complete_record(10, 1)])]),
+            &BTreeMap::from([(PG_STAT_DATABASE_TYPES[0], vec![complete_record(10, 1)])]),
             interval,
         );
 
@@ -1897,7 +1952,7 @@ mod tests {
             MetricFactor::PgDatabaseDeadlocks,
             &[source],
             &[10, 20],
-            BTreeMap::from([(source, vec![complete_record(10, 1), complete_record(20, 1)])]),
+            &BTreeMap::from([(source, vec![complete_record(10, 1), complete_record(20, 1)])]),
             interval,
         );
 
@@ -1926,7 +1981,7 @@ mod tests {
             MetricFactor::OsCgroupMemoryCurrentBytes,
             &[first, second],
             &[10, 20],
-            BTreeMap::from([(first, vec![complete_record(10, 1)])]),
+            &BTreeMap::from([(first, vec![complete_record(10, 1)])]),
             interval,
         );
 
@@ -1949,7 +2004,7 @@ mod tests {
             MetricFactor::PgDatabaseDeadlocks,
             &[source],
             &[10, 20],
-            BTreeMap::from([(
+            &BTreeMap::from([(
                 source,
                 vec![
                     CoverageRecord {

@@ -153,8 +153,15 @@ struct AcceptanceEvidence {
     result: &'static str,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the qualification runner records all nine named modes in one auditable artifact"
+)]
 fn main() {
-    let output = output_path();
+    let output = output_path().unwrap_or_else(|message| {
+        eprintln!("{message}");
+        std::process::exit(2);
+    });
     let pgm: Arc<[u8]> = dense_hour_pgm().into();
     let context = context();
     let unit = PgmUnit::open(pgm.as_ref()).expect("open dense-hour PGM");
@@ -179,7 +186,10 @@ fn main() {
         let before = unit.body_read_stats();
         let extracted =
             SegmentFacts::extract(&unit, context.as_ref(), &LIMIT).expect("cold extract");
-        assert_eq!(extracted, *raw);
+        assert_eq!(
+            extracted, *raw,
+            "derived-cold extraction diverged from the admitted fixture"
+        );
         let after = unit.body_read_stats();
         Work {
             pgm_body_reads: after.read_calls - before.read_calls,
@@ -197,7 +207,10 @@ fn main() {
             &LIMIT,
         )
         .expect("restart-warm");
-        assert_eq!(warm, *raw);
+        assert_eq!(
+            warm, *raw,
+            "restart-warm decoding diverged from the admitted fixture"
+        );
         Work {
             fact_reads: stats.read_calls,
             fact_stored_bytes: stats.stored_bytes_read,
@@ -240,7 +253,8 @@ fn main() {
         .expect("fold live part");
         assert_eq!(
             live.counter_samples().samples().len(),
-            raw.counter_samples().samples().len()
+            raw.counter_samples().samples().len(),
+            "live folding retained a different counter-sample cardinality"
         );
         let stats = unit.body_read_stats();
         Work {
@@ -268,7 +282,11 @@ fn main() {
             }));
         }
         for worker in workers {
-            assert_eq!(worker.join().expect("identical worker"), *raw);
+            assert_eq!(
+                worker.join().expect("identical worker"),
+                *raw,
+                "concurrent identical decoding diverged from the admitted fixture"
+            );
         }
         Work {
             successful_responses: CONCURRENT_WORKERS as u64,
@@ -315,7 +333,10 @@ fn main() {
             &LIMIT,
         )
         .expect("oracle warm read");
-        assert_eq!(warm, *raw);
+        assert_eq!(
+            warm, *raw,
+            "oracle-profile decoding diverged from the admitted fixture"
+        );
         Work {
             successful_responses: 1,
             ..Work::default()
@@ -355,12 +376,12 @@ fn main() {
     }
 }
 
-fn output_path() -> Option<PathBuf> {
+fn output_path() -> Result<Option<PathBuf>, &'static str> {
     let mut arguments = std::env::args_os().skip(1);
     match (arguments.next(), arguments.next(), arguments.next()) {
-        (None, None, None) => None,
-        (Some(flag), Some(path), None) if flag == "--output" => Some(path.into()),
-        _ => panic!("usage: overview_qualification [--output PATH]"),
+        (None, None, None) => Ok(None),
+        (Some(flag), Some(path), None) if flag == "--output" => Ok(Some(path.into())),
+        _ => Err("usage: overview_qualification [--output PATH]"),
     }
 }
 
@@ -381,6 +402,7 @@ fn dense_hour_pgm() -> Vec<u8> {
     let database: Vec<_> = (0..SAMPLES)
         .map(|index| {
             let index = i64::try_from(index).expect("sample index fits");
+            let index_f64 = f64::from(i32::try_from(index).expect("dense fixture index fits i32"));
             PgStatDatabaseV1 {
                 ts: Ts(1_000_000 + index * CADENCE_US),
                 datid: 16_384,
@@ -399,8 +421,8 @@ fn dense_hour_pgm() -> Vec<u8> {
                 temp_files: index / 100,
                 temp_bytes: index * 4_096,
                 deadlocks: index / 180,
-                blk_read_time: index as f64 * 0.25,
-                blk_write_time: index as f64 * 0.125,
+                blk_read_time: index_f64 * 0.25,
+                blk_write_time: index_f64 * 0.125,
                 stats_reset: None,
                 frozen_xid_age: Some(1_000 + index),
                 min_mxid_age: Some(100 + index),
@@ -528,6 +550,14 @@ fn accounting(facts: &SegmentFacts, file: &FactFile, fact_file_bytes: usize) -> 
     let retained_metric_samples =
         facts.counter_samples().samples().len() + facts.gauge_samples().samples().len();
     let resident_fact_bytes = facts.resident_bytes().expect("resident size fits");
+    let fixed_metric_stored_bytes_f64 = f64::from(
+        u32::try_from(fixed_metric_stored_bytes)
+            .expect("the fixed dense qualification fixture fits u32 bytes"),
+    );
+    let retained_metric_samples_f64 = f64::from(
+        u32::try_from(retained_metric_samples)
+            .expect("the fixed dense qualification fixture fits u32 samples"),
+    );
     Accounting {
         fact_file_bytes,
         decoded_block_bytes,
@@ -536,8 +566,7 @@ fn accounting(facts: &SegmentFacts, file: &FactFile, fact_file_bytes: usize) -> 
         fixed_metric_stored_bytes,
         variable_event_string_stored_bytes,
         retained_metric_samples,
-        fixed_metric_bytes_per_sample: fixed_metric_stored_bytes as f64
-            / retained_metric_samples as f64,
+        fixed_metric_bytes_per_sample: fixed_metric_stored_bytes_f64 / retained_metric_samples_f64,
     }
 }
 
@@ -627,8 +656,10 @@ fn command_output(program: &str, arguments: &[&str]) -> String {
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .unwrap_or_else(|| "unavailable".to_owned())
+        .map_or_else(
+            || "unavailable".to_owned(),
+            |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        )
 }
 
 fn acceptance_evidence() -> Vec<AcceptanceEvidence> {

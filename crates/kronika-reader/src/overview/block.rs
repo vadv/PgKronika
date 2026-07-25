@@ -1117,7 +1117,7 @@ impl EncodableBlock for LossCoverageBlock {
 
 type FactorCoverageKey = (u32, i64, i64);
 
-fn factor_coverage_key(coverage: &FactorCoverage) -> FactorCoverageKey {
+const fn factor_coverage_key(coverage: &FactorCoverage) -> FactorCoverageKey {
     (
         coverage.factor_id.0,
         coverage.interval.start_us(),

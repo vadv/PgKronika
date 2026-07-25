@@ -526,25 +526,25 @@ impl SegmentFacts {
 
     /// Typed cumulative samples retained for reset-aware deltas.
     #[must_use]
-    pub fn counter_samples(&self) -> &CounterSamplesBlock {
+    pub const fn counter_samples(&self) -> &CounterSamplesBlock {
         &self.counter_samples
     }
 
     /// Typed instantaneous samples retained for gauge cells and state inputs.
     #[must_use]
-    pub fn gauge_samples(&self) -> &GaugeSamplesBlock {
+    pub const fn gauge_samples(&self) -> &GaugeSamplesBlock {
         &self.gauge_samples
     }
 
     /// Counter epoch boundaries retained independently of sample selection.
     #[must_use]
-    pub fn reset_markers(&self) -> &ResetMarkersBlock {
+    pub const fn reset_markers(&self) -> &ResetMarkersBlock {
         &self.reset_markers
     }
 
     /// Bounded complete-population entity snapshots.
     #[must_use]
-    pub fn entity_states(&self) -> &EntityStatesBlock {
+    pub const fn entity_states(&self) -> &EntityStatesBlock {
         &self.entity_states
     }
 
@@ -1076,6 +1076,10 @@ fn checked_add_read_stats(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function performs one bounded canonical pass over each metric fact family"
+)]
 fn derive_metric_event_facts(
     counters: &CounterSamplesBlock,
     gauges: &GaugeSamplesBlock,
@@ -1338,6 +1342,10 @@ const fn block_build_error(error: super::block::BlockError) -> BuildError {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "promotion validates and assembles the complete persisted metric contract in one pass"
+)]
 fn promote_metrics(
     parts: &[&SegmentFacts],
     expected_scope: SourceScopeId,
@@ -1477,6 +1485,11 @@ fn promote_metrics(
     }))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the inputs and steps mirror the complete promoted factor-coverage contract"
+)]
 fn promoted_factor_coverage(
     parts: &[&SegmentFacts],
     counter_series: &BTreeMap<MetricSeriesId, MetricSeriesDescriptor>,
@@ -1715,10 +1728,12 @@ fn merge_metric_series(
         if descriptor.source_scope_id != expected_scope {
             return false;
         }
-        match destination.get(&descriptor.series_id) {
-            Some(existing) => *existing == *descriptor,
-            None => {
-                destination.insert(descriptor.series_id, *descriptor);
+        match destination.entry(descriptor.series_id) {
+            std::collections::btree_map::Entry::Occupied(existing) => {
+                *existing.get() == *descriptor
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(*descriptor);
                 true
             }
         }
@@ -1800,7 +1815,8 @@ fn validate_state_series(
             .map(|index| gauges.samples()[index]);
         if descriptor.is_none_or(|descriptor| {
             descriptor.entity.is_none() || descriptor.unit != MetricUnit::StateCode
-        }) || sample.is_none_or(|sample| sample.value() != f64::from(state.state_code))
+        }) || sample
+            .is_none_or(|sample| sample.value().to_bits() != f64::from(state.state_code).to_bits())
         {
             return Err(CacheReadError::Corrupt);
         }
@@ -2350,7 +2366,7 @@ mod tests {
         let unit = PgmUnit::open(bytes.as_slice()).expect("open restart fixture");
         let facts = SegmentFacts::extract(&unit, &context(), &LIMIT).expect("extract");
 
-        let boundary_series = facts
+        let boundary_series_count = facts
             .gauge_samples()
             .series()
             .iter()
@@ -2358,10 +2374,9 @@ mod tests {
                 MetricFactor::from_id(descriptor.factor_id)
                     == Some(MetricFactor::PgReplicationSenderSnapshotPopulation)
             })
-            .collect::<Vec<_>>();
+            .count();
         assert_eq!(
-            boundary_series.len(),
-            2,
+            boundary_series_count, 2,
             "the postmaster epoch is part of the complete-boundary identity"
         );
         assert!(

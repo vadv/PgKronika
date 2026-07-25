@@ -316,6 +316,10 @@ async fn events_returns_a_machine_neutral_page() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture verifies the same metric, fact, and coverage axes across all endpoints"
+)]
 async fn metric_fact_and_full_coverage_axes_reach_all_timeline_responses() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_database_metric_segment(dir.path());

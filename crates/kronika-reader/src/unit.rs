@@ -203,7 +203,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
             .map_err(|_value| ReadError::CounterOverflow)?;
 
         let mut checksum = Crc32c::new();
-        let mut scratch = [0_u8; SCRUB_BUFFER_BYTES];
+        let mut scratch = vec![0_u8; SCRUB_BUFFER_BYTES].into_boxed_slice();
         let mut consumed = 0_usize;
         while consumed < len {
             let chunk_len = (len - consumed).min(scratch.len());

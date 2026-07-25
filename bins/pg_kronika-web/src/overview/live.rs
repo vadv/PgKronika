@@ -129,7 +129,7 @@ impl OverviewWriter {
         fallback: FallbackConfig,
         gc: GcConfig,
     ) -> Result<Self, OverviewBuildError> {
-        Self::with_runtime_config(cache_root, namespace, fallback, gc, Duration::from_secs(60))
+        Self::with_runtime_config(cache_root, namespace, fallback, gc, Duration::from_mins(1))
     }
 
     /// Builds a writer with the complete production storage policy.

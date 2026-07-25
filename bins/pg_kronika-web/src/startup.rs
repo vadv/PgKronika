@@ -152,7 +152,7 @@ struct ParsedOverviewConfig {
 }
 
 fn parse_overview_config(
-    raw: OverviewConfigRaw<'_>,
+    raw: &OverviewConfigRaw<'_>,
     default_cache_dir: PathBuf,
 ) -> Result<ParsedOverviewConfig, String> {
     let defaults = OverviewConfig::new(default_cache_dir, b"default".to_vec());
@@ -258,7 +258,7 @@ fn parse_overview_config(
 }
 
 fn parse_cold_config(
-    raw: OverviewConfigRaw<'_>,
+    raw: &OverviewConfigRaw<'_>,
     defaults: OverviewColdConfig,
 ) -> Result<OverviewColdConfig, String> {
     Ok(OverviewColdConfig {
@@ -313,7 +313,7 @@ fn parse_cold_config(
     })
 }
 
-fn parse_gc_config(raw: OverviewConfigRaw<'_>, defaults: GcConfig) -> Result<GcConfig, String> {
+fn parse_gc_config(raw: &OverviewConfigRaw<'_>, defaults: GcConfig) -> Result<GcConfig, String> {
     let max_entries = parse_nonzero_usize(
         raw.gc_max_entries,
         GC_MAX_ENTRIES_ENV,
@@ -504,7 +504,7 @@ impl WebConfig {
             basic_auth_raw,
             stale_raw,
             log,
-            OverviewConfigRaw {
+            &OverviewConfigRaw {
                 namespace: Some("test"),
                 ..OverviewConfigRaw::default()
             },
@@ -517,7 +517,7 @@ impl WebConfig {
         basic_auth_raw: Option<&str>,
         stale_raw: Option<&str>,
         log: Option<&str>,
-        overview_raw: OverviewConfigRaw<'_>,
+        overview_raw: &OverviewConfigRaw<'_>,
     ) -> Result<Self, String> {
         let basic_auth = basic_auth_raw.map(parse_basic_auth).transpose()?;
 
@@ -610,7 +610,7 @@ impl WebConfig {
             basic_auth_raw.as_deref(),
             stale_raw.as_deref(),
             log.as_deref(),
-            OverviewConfigRaw {
+            &OverviewConfigRaw {
                 cache_dir: overview_cache_dir.as_deref(),
                 namespace: overview_namespace.as_deref(),
                 fallback_segment_hours: fallback_segment_hours.as_deref(),
@@ -777,7 +777,7 @@ mod tests {
     fn overview_raw_defaults_match_runtime_overview_defaults() {
         let cache_dir = PathBuf::from("/data/cache");
         let parsed = parse_overview_config(
-            OverviewConfigRaw {
+            &OverviewConfigRaw {
                 namespace: Some("default"),
                 ..OverviewConfigRaw::default()
             },
@@ -812,7 +812,7 @@ mod tests {
     fn selected_segment_policy_accepts_the_documented_boundaries() {
         for (raw, expected) in [("1", 1), ("1024", 1_024), ("4096", 4_096)] {
             let parsed = parse_overview_config(
-                OverviewConfigRaw {
+                &OverviewConfigRaw {
                     max_selected_segments: Some(raw),
                     ..valid_overview_raw()
                 },
@@ -827,7 +827,7 @@ mod tests {
     fn selected_segment_policy_rejects_zero_ceiling_plus_one_and_platform_overflow() {
         for raw in ["0", "4097", "340282366920938463463374607431768211455"] {
             let error = parse_overview_config(
-                OverviewConfigRaw {
+                &OverviewConfigRaw {
                     max_selected_segments: Some(raw),
                     ..valid_overview_raw()
                 },
@@ -846,7 +846,7 @@ mod tests {
             None,
             None,
             None,
-            OverviewConfigRaw {
+            &OverviewConfigRaw {
                 cache_dir: Some("/cache"),
                 namespace: Some("deployment-a"),
                 fallback_segment_hours: Some("48"),
@@ -935,7 +935,7 @@ mod tests {
             Some("alice:secret-password"),
             None,
             None,
-            OverviewConfigRaw {
+            &OverviewConfigRaw {
                 namespace: Some("secret-deployment"),
                 ..OverviewConfigRaw::default()
             },
@@ -948,6 +948,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the table exhaustively checks every independently bounded overview setting"
+    )]
     fn overview_raw_rejects_zero_budgets() {
         let cases = [
             (
@@ -1148,7 +1152,7 @@ mod tests {
             ),
         ];
         for (name, raw) in cases {
-            let error = parse_overview_config(raw, PathBuf::from("/cache"))
+            let error = parse_overview_config(&raw, PathBuf::from("/cache"))
                 .expect_err("zero budget must fail");
             assert!(error.contains(name), "wrong error for {name}: {error}");
         }
@@ -1158,7 +1162,7 @@ mod tests {
     fn overview_raw_rejects_fallback_hours_above_hard_maximum() {
         let value = (kronika_reader::MAX_FALLBACK_SEGMENT_HOURS + 1).to_string();
         let error = parse_overview_config(
-            OverviewConfigRaw {
+            &OverviewConfigRaw {
                 fallback_segment_hours: Some(&value),
                 ..valid_overview_raw()
             },
@@ -1173,7 +1177,7 @@ mod tests {
     fn overview_raw_rejects_fallback_bytes_above_hard_maximum() {
         let value = (kronika_reader::MAX_FALLBACK_BYTES + 1).to_string();
         let error = parse_overview_config(
-            OverviewConfigRaw {
+            &OverviewConfigRaw {
                 fallback_bytes: Some(&value),
                 ..valid_overview_raw()
             },
@@ -1210,7 +1214,7 @@ mod tests {
                 },
             ),
         ] {
-            let error = parse_overview_config(raw, PathBuf::from("/cache"))
+            let error = parse_overview_config(&raw, PathBuf::from("/cache"))
                 .expect_err("empty overview identity input must fail");
             assert!(error.contains(name), "wrong error for {name}: {error}");
         }
@@ -1218,7 +1222,7 @@ mod tests {
 
     #[test]
     fn overview_raw_requires_an_explicit_namespace() {
-        let error = parse_overview_config(OverviewConfigRaw::default(), PathBuf::from("/cache"))
+        let error = parse_overview_config(&OverviewConfigRaw::default(), PathBuf::from("/cache"))
             .expect_err("implicit deployment identity must not be accepted");
         assert_eq!(error, format!("{OVERVIEW_NAMESPACE_ENV} is not set"));
     }

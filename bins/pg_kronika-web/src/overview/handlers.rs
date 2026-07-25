@@ -32,9 +32,7 @@ use crate::overview::dto::{
 };
 use crate::overview::loader::FactLoadFailure;
 use crate::overview::selection::{SelectedSealedPlan, SelectionError};
-use crate::overview::view::{
-    CanonicalFactQueryError, IndexView, SourceMetadata, SourceStatus,
-};
+use crate::overview::view::{CanonicalFactQueryError, IndexView, SourceMetadata, SourceStatus};
 use crate::params::QueryParams;
 use crate::problem::{ApiProblem, QueryParameter};
 use crate::{AppState, TimelineFlightRole};

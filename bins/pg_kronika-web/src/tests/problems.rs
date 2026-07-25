@@ -664,6 +664,10 @@ fn assert_timeline_contract(document: &serde_json::Value) {
     assert_timeline_endpoint_contract(document);
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the assertions enumerate the complete public timeline schema contract"
+)]
 fn assert_timeline_schema_contract(document: &serde_json::Value) {
     let schemas = &document["components"]["schemas"];
     for schema in [

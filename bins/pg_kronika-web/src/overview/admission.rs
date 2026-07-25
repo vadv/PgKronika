@@ -307,6 +307,7 @@ impl ColdAdmission {
             state.next_ticket = state.next_ticket.wrapping_add(1);
             state.queue.push_back(Arc::clone(&waiter));
             record_admission_state(&state);
+            drop(state);
             waiter
         };
 

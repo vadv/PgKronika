@@ -96,11 +96,7 @@ impl SelectedSealedPlan {
 
     pub(crate) fn gap_for(&self, descriptor: &SegmentDescriptor) -> SourceGap {
         let start = descriptor.min_ts.max(self.range.start_us());
-        let end = descriptor
-            .max_ts
-            .checked_add(1)
-            .unwrap_or(i64::MAX)
-            .min(self.range.end_us());
+        let end = descriptor.max_ts.saturating_add(1).min(self.range.end_us());
         let span = CoverageSpan::new(start, end).unwrap_or_else(|| {
             if descriptor.max_ts < self.range.start_us() {
                 CoverageSpan::new(

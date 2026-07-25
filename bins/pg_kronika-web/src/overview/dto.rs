@@ -394,7 +394,7 @@ impl EventFactProjection {
     }
 }
 
-fn canonical_payload(fact: &CanonicalEventFact) -> Option<EventPayload> {
+const fn canonical_payload(fact: &CanonicalEventFact) -> Option<EventPayload> {
     let kind = fact.kind().wire_code();
     match fact.payload() {
         CanonicalEventPayload::CounterDelta(value) => {

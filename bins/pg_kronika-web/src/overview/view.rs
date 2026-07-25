@@ -528,11 +528,7 @@ impl DescriptorView {
 
 fn descriptor_gap(descriptor: SegmentDescriptor, range: CoverageSpan) -> Option<CoverageSpan> {
     let start = descriptor.min_ts.max(range.start_us());
-    let end = descriptor
-        .max_ts
-        .checked_add(1)
-        .unwrap_or(i64::MAX)
-        .min(range.end_us());
+    let end = descriptor.max_ts.saturating_add(1).min(range.end_us());
     CoverageSpan::new(start, end)
 }
 
@@ -1023,6 +1019,10 @@ impl IndexView {
     /// Selected sealed facts already include the left/right descriptor halo.
     /// This method replays all selected natural samples, so a pair crossing a
     /// fact-file boundary is equivalent to the same samples in one file.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the query performs one bounded canonical merge across persisted metric families"
+    )]
     pub(crate) fn query_canonical_facts(
         &self,
         sources: &[u64],
@@ -1520,10 +1520,7 @@ fn derive_sender_disappearances(
 ) -> Result<(), CanonicalFactQueryError> {
     let mut boundaries =
         BTreeMap::<(SourceScopeId, u32), Vec<(MetricSeriesDescriptor, EntityStateRecord)>>::new();
-    let mut snapshots = BTreeMap::<
-        (SourceScopeId, u32, i64),
-        BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
-    >::new();
+    let mut snapshots = SenderSnapshots::new();
     for (descriptor, records) in states.values() {
         for record in records {
             match MetricFactor::from_id(descriptor.factor_id) {
@@ -1532,18 +1529,7 @@ fn derive_sender_disappearances(
                     .or_default()
                     .push((*descriptor, *record)),
                 Some(MetricFactor::PgReplicationSenderState) => {
-                    if snapshots
-                        .entry((
-                            descriptor.source_scope_id,
-                            descriptor.source_type_id,
-                            record.ts_us,
-                        ))
-                        .or_default()
-                        .insert(descriptor.series_id, (*descriptor, *record))
-                        .is_some()
-                    {
-                        return Err(CanonicalFactQueryError::ContradictoryFacts);
-                    }
+                    insert_sender_snapshot(&mut snapshots, *descriptor, *record)?;
                 }
                 _ => {}
             }
@@ -1604,6 +1590,31 @@ fn derive_sender_disappearances(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+type SenderSnapshots = BTreeMap<
+    (SourceScopeId, u32, i64),
+    BTreeMap<MetricSeriesId, (MetricSeriesDescriptor, EntityStateRecord)>,
+>;
+
+fn insert_sender_snapshot(
+    snapshots: &mut SenderSnapshots,
+    descriptor: MetricSeriesDescriptor,
+    record: EntityStateRecord,
+) -> Result<(), CanonicalFactQueryError> {
+    if snapshots
+        .entry((
+            descriptor.source_scope_id,
+            descriptor.source_type_id,
+            record.ts_us,
+        ))
+        .or_default()
+        .insert(descriptor.series_id, (descriptor, record))
+        .is_some()
+    {
+        return Err(CanonicalFactQueryError::ContradictoryFacts);
     }
     Ok(())
 }

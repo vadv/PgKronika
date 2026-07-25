@@ -357,6 +357,10 @@ fn read_loss(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the match is the complete stable payload schema"
+)]
 fn write_payload(writer: &mut ByteWriter, payload: &EventPayload, strings: &StringTableBlock) {
     match payload {
         EventPayload::Error(value) => {

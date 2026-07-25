@@ -158,8 +158,8 @@ impl NotableClass {
             Self::ChildSigkill => NotableEvidenceClass::Sigkill,
             Self::ChildSignalTermination => NotableEvidenceClass::Availability,
             Self::Panic => NotableEvidenceClass::Panic,
-            Self::DiskFull => NotableEvidenceClass::StorageCapacity,
-            Self::OutOfMemory => NotableEvidenceClass::OutOfMemory,
+            Self::DiskFull | Self::FilesystemCapacityZero => NotableEvidenceClass::StorageCapacity,
+            Self::OutOfMemory | Self::OomKill => NotableEvidenceClass::OutOfMemory,
             Self::ConnectionSlotsExhausted => NotableEvidenceClass::ConnectionCapacity,
             Self::Deadlock | Self::LockNotAvailable | Self::SerializationFailure => {
                 NotableEvidenceClass::Contention
@@ -169,8 +169,6 @@ impl NotableClass {
             Self::AuthenticationFailure | Self::AuthorizationFailure | Self::PermissionDenied => {
                 NotableEvidenceClass::Authentication
             }
-            Self::OomKill => NotableEvidenceClass::OutOfMemory,
-            Self::FilesystemCapacityZero => NotableEvidenceClass::StorageCapacity,
         }
     }
 

@@ -19,20 +19,20 @@ impl std::fmt::Debug for Crc32c {
 impl Crc32c {
     /// Starts an empty CRC32C calculation.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             digest: CRC32C.digest(),
         }
     }
 
     /// Adds the next contiguous byte chunk.
-    pub fn update(&mut self, bytes: &[u8]) {
+    pub const fn update(&mut self, bytes: &[u8]) {
         self.digest.update(bytes);
     }
 
     /// Completes the checksum.
     #[must_use]
-    pub fn finalize(self) -> u32 {
+    pub const fn finalize(self) -> u32 {
         self.digest.finalize()
     }
 }

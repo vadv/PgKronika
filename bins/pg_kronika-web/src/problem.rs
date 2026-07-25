@@ -296,7 +296,7 @@ pub(crate) struct ApiProblem {
     type_uri: &'static str,
     status: u16,
     code: ProblemCode,
-    params: ProblemParams,
+    params: Box<ProblemParams>,
     instance: String,
     #[serde(skip)]
     request_id: String,
@@ -313,7 +313,7 @@ impl ApiProblem {
             type_uri: code.type_uri(),
             status: code.status().as_u16(),
             code,
-            params,
+            params: Box::new(params),
             instance: format!("https://pgkronika.dev/problems/occurrences/{request_id}"),
             request_id,
             allow: None,
@@ -585,7 +585,15 @@ fn process_nonce() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PUBLIC_TOKEN_BYTES, bounded_public_token};
+    use super::{ApiProblem, MAX_PUBLIC_TOKEN_BYTES, bounded_public_token};
+
+    #[test]
+    fn problem_value_stays_below_the_large_result_threshold() {
+        assert!(
+            size_of::<ApiProblem>() <= 128,
+            "API problems should remain cheap Result errors"
+        );
+    }
 
     #[test]
     fn public_tokens_enforce_the_exact_grammar_and_byte_bound() {

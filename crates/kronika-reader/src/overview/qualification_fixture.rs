@@ -122,8 +122,8 @@ impl VersionedFixture {
 /// The three snapshots intentionally span every populated overview block:
 ///
 /// - retained lifecycle observations and policy-neutral event facts;
-/// - PostgreSQL and OS counters plus gauges;
-/// - PostgreSQL and boot reset epochs;
+/// - `PostgreSQL` and OS counters plus gauges;
+/// - `PostgreSQL` and boot reset epochs;
 /// - replication entity states and a complete-empty disappearance boundary;
 /// - exact and failed source coverage, including a collector failure fact.
 pub(super) fn all_family_fixture() -> VersionedFixture {

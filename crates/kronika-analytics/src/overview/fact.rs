@@ -28,7 +28,7 @@ const COLLECTOR_LOSS_OBSERVATION_TAG: &[u8] = b"pgk-overview-collector-loss-obse
 /// Stable event taxonomy represented by canonical facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EventKind {
-    /// Grouped PostgreSQL log error.
+    /// Grouped `PostgreSQL` log error.
     PgLogErrorGroupObserved,
     /// Child process terminated by a signal.
     PgLifecycleChildSignalTermination,
@@ -36,7 +36,7 @@ pub enum EventKind {
     PgLifecycleChildProcessCrash,
     /// Administrative shutdown request.
     PgLifecycleShutdownRequested,
-    /// PostgreSQL readiness observation.
+    /// `PostgreSQL` readiness observation.
     PgLifecycleReadyObserved,
     /// Checkpoint start.
     PgCheckpointStarted,
@@ -68,13 +68,13 @@ pub enum EventKind {
     PgDatabaseSessionsFatalDelta,
     /// Per-database operator-killed-session counter delta.
     PgDatabaseSessionsKilledDelta,
-    /// PostgreSQL statistics reset boundary.
+    /// `PostgreSQL` statistics reset boundary.
     PgStatisticsResetObserved,
     /// Postmaster start identity changed.
     PgPostmasterStartChanged,
     /// Recovery role changed.
     PgRecoveryRoleChanged,
-    /// PostgreSQL timeline changed.
+    /// `PostgreSQL` timeline changed.
     PgTimelineChanged,
     /// Replication sender state changed.
     PgReplicationSenderStateChanged,
@@ -94,7 +94,7 @@ pub enum EventKind {
     OsCgroupOomKillDelta,
     /// Host OOM-kill event delta.
     OsHostOomKillDelta,
-    /// Proven PostgreSQL filesystem-capacity observation.
+    /// Proven `PostgreSQL` filesystem-capacity observation.
     OsFilesystemCapacityObservation,
     /// Proven transition to zero available filesystem bytes.
     OsFilesystemCapacityZeroTransition,
@@ -258,9 +258,9 @@ pub enum FactShape {
 /// Stable entity class for a fact or metric series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EntityKind {
-    /// A PostgreSQL database.
+    /// A `PostgreSQL` database.
     Database,
-    /// A PostgreSQL postmaster instance.
+    /// A `PostgreSQL` postmaster instance.
     Postmaster,
     /// A physical replication sender.
     ReplicationSender,
@@ -270,7 +270,7 @@ pub enum EntityKind {
     Cgroup,
     /// The host.
     Host,
-    /// A proven PostgreSQL storage mount.
+    /// A proven `PostgreSQL` storage mount.
     Filesystem,
 }
 
@@ -604,16 +604,16 @@ impl EventFact {
         {
             return Err(InvalidEventFact::NonCanonicalSupportingEvidence);
         }
-        if !valid_fact_semantics(
+        if !valid_fact_semantics(&FactSemantics {
             kind,
             shape,
             count,
             entity,
-            &payload,
-            supporting_observation_ids.len(),
+            payload: &payload,
+            supporting_count: supporting_observation_ids.len(),
             evidence_quality,
-            &coverage,
-        ) {
+            coverage: &coverage,
+        }) {
             return Err(InvalidEventFact::SemanticMismatch);
         }
         Ok(Self {
@@ -765,7 +765,7 @@ impl EventFact {
             || descriptor.series_id != current.series_id()
             || descriptor.unit != MetricUnit::Microseconds
             || current.ts_us() <= previous.ts_us()
-            || current.value() == previous.value()
+            || current.value().to_bits() == previous.value().to_bits()
             || previous.value().fract() != 0.0
             || current.value().fract() != 0.0
         {
@@ -822,9 +822,11 @@ impl EventFact {
         {
             return Ok(None);
         }
-        let previous =
+        let Some(previous) =
             GaugeSample::new(sender.series_id, previous_ts_us, f64::from(previous_state))
-                .expect("u32 state is finite");
+        else {
+            return Err(InvalidEventFact::SemanticMismatch);
+        };
         let evidence = canonical_evidence([
             gauge_sample_observation_id(previous),
             gauge_sample_observation_id(current_boundary),
@@ -941,18 +943,20 @@ impl EventFact {
         let Some(kind) = state_event_kind(descriptor.factor_id, current_state) else {
             return Ok(None);
         };
-        let previous = GaugeSample::new(
+        let Some(previous) = GaugeSample::new(
             descriptor.series_id,
             previous_ts_us,
             f64::from(previous_state),
-        )
-        .expect("u32 state is finite");
-        let current = GaugeSample::new(
+        ) else {
+            return Err(InvalidEventFact::SemanticMismatch);
+        };
+        let Some(current) = GaugeSample::new(
             descriptor.series_id,
             current_ts_us,
             f64::from(current_state),
-        )
-        .expect("u32 state is finite");
+        ) else {
+            return Err(InvalidEventFact::SemanticMismatch);
+        };
         let evidence = canonical_evidence([
             gauge_sample_observation_id(previous),
             gauge_sample_observation_id(current),
@@ -1000,17 +1004,15 @@ impl EventFact {
             || total_descriptor.entity != available_descriptor.entity
             || total_descriptor.entity.is_none()
             || total.ts_us() != available.ts_us()
-            || total.value() < 0.0
-            || available.value() < 0.0
-            || total.value().fract() != 0.0
-            || available.value().fract() != 0.0
-            || total.value() > u64::MAX as f64
-            || available.value() > u64::MAX as f64
         {
             return Ok(None);
         }
-        let total_bytes = total.value() as u64;
-        let available_bytes = available.value() as u64;
+        let Some(total_bytes) = exact_u64(total.value()) else {
+            return Ok(None);
+        };
+        let Some(available_bytes) = exact_u64(available.value()) else {
+            return Ok(None);
+        };
         if available_bytes > total_bytes {
             return Ok(None);
         }
@@ -1184,165 +1186,219 @@ impl EventFact {
     }
 }
 
-fn valid_fact_semantics(
+struct FactSemantics<'a> {
     kind: EventKind,
     shape: FactShape,
     count: u64,
     entity: Option<EntityRef>,
-    payload: &EventPayload,
+    payload: &'a EventPayload,
     supporting_count: usize,
     evidence_quality: EvidenceQuality,
-    coverage: &CoverageRef,
-) -> bool {
-    let log_payload = match kind {
+    coverage: &'a CoverageRef,
+}
+
+fn valid_fact_semantics(fact: &FactSemantics<'_>) -> bool {
+    if is_log_fact_kind(fact.kind) {
+        return valid_log_fact(fact);
+    }
+    match fact.payload {
+        EventPayload::CounterDelta(value) => valid_counter_fact(fact, value),
+        EventPayload::StateTransition(value) => valid_state_fact(fact, value),
+        EventPayload::Capacity(value) => valid_capacity_fact(fact, value),
+        EventPayload::Marker => valid_marker_fact(fact),
+        EventPayload::Error(_)
+        | EventPayload::Lifecycle(_)
+        | EventPayload::Checkpoint(_)
+        | EventPayload::Maintenance(_)
+        | EventPayload::SlowQuery(_)
+        | EventPayload::LockWait(_)
+        | EventPayload::TempFile(_) => false,
+    }
+}
+
+const fn is_log_fact_kind(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::PgLogErrorGroupObserved
+            | EventKind::PgLifecycleChildSignalTermination
+            | EventKind::PgLifecycleChildProcessCrash
+            | EventKind::PgLifecycleShutdownRequested
+            | EventKind::PgLifecycleReadyObserved
+            | EventKind::PgCheckpointStarted
+            | EventKind::PgCheckpointCompleted
+            | EventKind::PgCheckpointTooFrequentReported
+            | EventKind::PgMaintenanceAutovacuumReported
+            | EventKind::PgMaintenanceAutoanalyzeReported
+            | EventKind::PgQuerySlowGroupReported
+            | EventKind::PgLockWaitReported
+            | EventKind::PgLockAcquiredAfterWaitReported
+            | EventKind::PgTempFileReported
+    )
+}
+
+fn valid_log_fact(fact: &FactSemantics<'_>) -> bool {
+    let payload_matches = match fact.kind {
         EventKind::PgLogErrorGroupObserved => {
-            matches!(payload, EventPayload::Error(_)) && shape == FactShape::GroupedCount
+            matches!(fact.payload, EventPayload::Error(_)) && fact.shape == FactShape::GroupedCount
         }
         EventKind::PgLifecycleChildSignalTermination
         | EventKind::PgLifecycleChildProcessCrash
         | EventKind::PgLifecycleShutdownRequested
         | EventKind::PgLifecycleReadyObserved => {
-            matches!(payload, EventPayload::Lifecycle(_)) && shape == FactShape::Individual
+            matches!(fact.payload, EventPayload::Lifecycle(_))
+                && fact.shape == FactShape::Individual
         }
         EventKind::PgCheckpointStarted
         | EventKind::PgCheckpointCompleted
         | EventKind::PgCheckpointTooFrequentReported => {
-            matches!(payload, EventPayload::Checkpoint(_)) && shape == FactShape::Individual
+            matches!(fact.payload, EventPayload::Checkpoint(_))
+                && fact.shape == FactShape::Individual
         }
         EventKind::PgMaintenanceAutovacuumReported
         | EventKind::PgMaintenanceAutoanalyzeReported => {
-            matches!(payload, EventPayload::Maintenance(_)) && shape == FactShape::Individual
+            matches!(fact.payload, EventPayload::Maintenance(_))
+                && fact.shape == FactShape::Individual
         }
         EventKind::PgQuerySlowGroupReported => {
-            matches!(payload, EventPayload::SlowQuery(_)) && shape == FactShape::GroupedCount
+            matches!(fact.payload, EventPayload::SlowQuery(_))
+                && fact.shape == FactShape::GroupedCount
         }
         EventKind::PgLockWaitReported | EventKind::PgLockAcquiredAfterWaitReported => {
-            matches!(payload, EventPayload::LockWait(_)) && shape == FactShape::Individual
+            matches!(fact.payload, EventPayload::LockWait(_)) && fact.shape == FactShape::Individual
         }
         EventKind::PgTempFileReported => {
-            matches!(payload, EventPayload::TempFile(_)) && shape == FactShape::Individual
+            matches!(fact.payload, EventPayload::TempFile(_)) && fact.shape == FactShape::Individual
         }
         _ => false,
     };
-    if log_payload {
-        return entity.is_none()
-            && supporting_count == 1
-            && match &coverage.loss {
-                Some(_) => coverage.retained_exactness == RetainedExactness::LowerBound,
-                None => coverage.retained_exactness == RetainedExactness::Exact,
-            };
-    }
+    payload_matches
+        && fact.entity.is_none()
+        && fact.supporting_count == 1
+        && match &fact.coverage.loss {
+            Some(_) => fact.coverage.retained_exactness == RetainedExactness::LowerBound,
+            None => fact.coverage.retained_exactness == RetainedExactness::Exact,
+        }
+}
 
-    if let EventPayload::CounterDelta(value) = payload {
-        return counter_event_kind(value.factor_id) == Some(kind)
-            && value.delta > 0
-            && value.duration_us > 0
-            && count == value.delta
-            && entity.is_some()
-            && supporting_count == 2
-            && shape
-                == if value.delta == 1 {
-                    FactShape::Individual
-                } else {
-                    FactShape::GroupedCount
-                }
-            && exact_derived(evidence_quality, coverage);
-    }
+fn valid_counter_fact(fact: &FactSemantics<'_>, value: &CounterDeltaFactPayload) -> bool {
+    counter_event_kind(value.factor_id) == Some(fact.kind)
+        && value.delta > 0
+        && value.duration_us > 0
+        && fact.count == value.delta
+        && fact.entity.is_some()
+        && fact.supporting_count == 2
+        && fact.shape
+            == if value.delta == 1 {
+                FactShape::Individual
+            } else {
+                FactShape::GroupedCount
+            }
+        && exact_derived(fact.evidence_quality, fact.coverage)
+}
 
-    if let EventPayload::StateTransition(value) = payload {
-        let kind_matches = match kind {
-            EventKind::PgRecoveryRoleChanged => {
-                MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgRecoveryRole)
-            }
-            EventKind::PgTimelineChanged => {
-                MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgTimeline)
-            }
-            EventKind::PgReplicationSenderStateChanged => {
-                MetricFactor::from_id(value.factor_id)
-                    == Some(MetricFactor::PgReplicationSenderState)
-                    && value.current_state != u32::MAX
-            }
-            EventKind::PgReplicationSenderDisappeared => {
-                MetricFactor::from_id(value.factor_id)
-                    == Some(MetricFactor::PgReplicationSenderState)
-                    && value.current_state == u32::MAX
-            }
-            EventKind::PgReplicationSlotStateChanged => {
-                MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgReplicationSlotState)
-                    && value.current_state != 4
-            }
-            EventKind::PgReplicationSlotLost => {
-                MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgReplicationSlotState)
-                    && value.current_state == 4
-            }
-            _ => false,
-        };
-        return kind_matches
-            && value.previous_state != value.current_state
-            && shape == FactShape::Individual
-            && count == 1
-            && entity.is_some()
-            && supporting_count == 2
-            && exact_derived(evidence_quality, coverage);
-    }
+fn valid_state_fact(fact: &FactSemantics<'_>, value: &StateTransitionFactPayload) -> bool {
+    let kind_matches = match fact.kind {
+        EventKind::PgRecoveryRoleChanged => {
+            MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgRecoveryRole)
+        }
+        EventKind::PgTimelineChanged => {
+            MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgTimeline)
+        }
+        EventKind::PgReplicationSenderStateChanged => {
+            MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgReplicationSenderState)
+                && value.current_state != u32::MAX
+        }
+        EventKind::PgReplicationSenderDisappeared => {
+            MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgReplicationSenderState)
+                && value.current_state == u32::MAX
+        }
+        EventKind::PgReplicationSlotStateChanged => {
+            MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgReplicationSlotState)
+                && value.current_state != 4
+        }
+        EventKind::PgReplicationSlotLost => {
+            MetricFactor::from_id(value.factor_id) == Some(MetricFactor::PgReplicationSlotState)
+                && value.current_state == 4
+        }
+        _ => false,
+    };
+    kind_matches
+        && value.previous_state != value.current_state
+        && fact.shape == FactShape::Individual
+        && fact.count == 1
+        && fact.entity.is_some()
+        && fact.supporting_count == 2
+        && exact_derived(fact.evidence_quality, fact.coverage)
+}
 
-    if let EventPayload::Capacity(value) = payload {
-        let evidence_matches = match kind {
-            EventKind::OsFilesystemCapacityObservation => {
-                evidence_quality == EvidenceQuality::Structured
+fn valid_capacity_fact(fact: &FactSemantics<'_>, value: &CapacityFactPayload) -> bool {
+    let evidence_matches = match fact.kind {
+        EventKind::OsFilesystemCapacityObservation => {
+            fact.evidence_quality == EvidenceQuality::Structured
+        }
+        EventKind::OsFilesystemCapacityZeroTransition => {
+            fact.evidence_quality == EvidenceQuality::DerivedExact
+        }
+        _ => false,
+    };
+    matches!(
+        fact.kind,
+        EventKind::OsFilesystemCapacityObservation | EventKind::OsFilesystemCapacityZeroTransition
+    ) && value.available_bytes <= value.total_bytes
+        && (fact.kind != EventKind::OsFilesystemCapacityZeroTransition
+            || value.available_bytes == 0)
+        && fact.shape == FactShape::Individual
+        && fact.count == 1
+        && fact
+            .entity
+            .is_some_and(|entity| entity.kind == EntityKind::Filesystem)
+        && fact.supporting_count
+            == if fact.kind == EventKind::OsFilesystemCapacityObservation {
+                2
+            } else {
+                3
             }
-            EventKind::OsFilesystemCapacityZeroTransition => {
-                evidence_quality == EvidenceQuality::DerivedExact
-            }
-            _ => false,
-        };
-        return matches!(
-            kind,
-            EventKind::OsFilesystemCapacityObservation
-                | EventKind::OsFilesystemCapacityZeroTransition
-        ) && value.available_bytes <= value.total_bytes
-            && (kind != EventKind::OsFilesystemCapacityZeroTransition
-                || value.available_bytes == 0)
-            && shape == FactShape::Individual
-            && count == 1
-            && entity.is_some_and(|entity| entity.kind == EntityKind::Filesystem)
-            && supporting_count
-                == if kind == EventKind::OsFilesystemCapacityObservation {
-                    2
-                } else {
-                    3
-                }
-            && evidence_matches
-            && coverage.retained_exactness == RetainedExactness::Exact
-            && coverage.loss.is_none();
-    }
+        && evidence_matches
+        && fact.coverage.retained_exactness == RetainedExactness::Exact
+        && fact.coverage.loss.is_none()
+}
 
-    if !matches!(payload, EventPayload::Marker) {
-        return false;
-    }
-    match kind {
+fn valid_marker_fact(fact: &FactSemantics<'_>) -> bool {
+    match fact.kind {
         EventKind::PgStatisticsResetObserved | EventKind::PgPostmasterStartChanged => {
-            shape == FactShape::Individual
-                && count == 1
-                && entity.is_some()
-                && supporting_count == 2
-                && exact_derived(evidence_quality, coverage)
+            fact.shape == FactShape::Individual
+                && fact.count == 1
+                && fact.entity.is_some()
+                && fact.supporting_count == 2
+                && exact_derived(fact.evidence_quality, fact.coverage)
         }
         EventKind::CollectorSnapshotGap
         | EventKind::CollectorSourceReadFailure
         | EventKind::CollectorVisibilityRestricted => {
-            shape == FactShape::Individual
-                && count == 1
-                && entity.is_none()
-                && supporting_count == 1
-                && coverage.retained_exactness == RetainedExactness::LowerBound
-                && coverage
+            fact.shape == FactShape::Individual
+                && fact.count == 1
+                && fact.entity.is_none()
+                && fact.supporting_count == 1
+                && fact.coverage.retained_exactness == RetainedExactness::LowerBound
+                && fact
+                    .coverage
                     .loss
                     .as_ref()
                     .is_some_and(|loss| !loss.reasons().is_empty())
         }
         _ => false,
     }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the exclusive finite integer range check makes this conversion exact"
+)]
+fn exact_u64(value: f64) -> Option<u64> {
+    // IEEE-754 bit pattern for 2^64, the first value outside the `u64` range.
+    const U64_UPPER_EXCLUSIVE: f64 = f64::from_bits(0x43f0_0000_0000_0000);
+    ((0.0..U64_UPPER_EXCLUSIVE).contains(&value) && value.fract() == 0.0).then_some(value as u64)
 }
 
 fn exact_derived(evidence_quality: EvidenceQuality, coverage: &CoverageRef) -> bool {
@@ -1789,6 +1845,15 @@ mod tests {
             },
         );
         assert_eq!(result, Err(InvalidEventFact::SemanticMismatch));
+    }
+
+    #[test]
+    fn capacity_conversion_rejects_fractional_and_u64_upper_boundary_values() {
+        let u64_upper_exclusive = f64::from_bits(0x43f0_0000_0000_0000);
+        assert_eq!(exact_u64(42.0), Some(42));
+        assert_eq!(exact_u64(-1.0), None);
+        assert_eq!(exact_u64(42.5), None);
+        assert_eq!(exact_u64(u64_upper_exclusive), None);
     }
 
     impl ErrorFactPayload {
