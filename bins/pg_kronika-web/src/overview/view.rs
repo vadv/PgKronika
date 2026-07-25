@@ -483,6 +483,21 @@ impl IndexView {
             .collect()
     }
 
+    /// Number of sealed segments whose retained span intersects `range`.
+    ///
+    /// Counted before any range query materializes rows, so an oversized span
+    /// is rejected up front rather than after the work.
+    pub(crate) fn selected_sealed_count(&self, range: CoverageSpan) -> usize {
+        self.sealed
+            .iter()
+            .filter(|entry| {
+                let identity = entry.facts.identity();
+                identity.source_max_ts_us >= range.start_us()
+                    && identity.source_min_ts_us < range.end_us()
+            })
+            .count()
+    }
+
     fn queryable_facts(&self) -> impl Iterator<Item = &SegmentFacts> {
         self.sealed.iter().map(SealedEntry::facts).chain(
             self.live_queryable
@@ -731,6 +746,29 @@ mod tests {
             view.fact_set_id(),
             again.fact_set_id(),
             "identical inputs derive an identical fact-set id"
+        );
+    }
+
+    #[test]
+    fn selected_sealed_count_reflects_range_intersection() {
+        let early = sealed_entry("143000.pgm", 1_000, 2_000);
+        let late = sealed_entry("143001.pgm", 5_000, 6_000);
+        let view = IndexView::new(3, vec![early, late], empty_live(), false);
+
+        assert_eq!(
+            view.selected_sealed_count(CoverageSpan::new(0, 10_000).expect("span")),
+            2,
+            "a range covering both segments selects both"
+        );
+        assert_eq!(
+            view.selected_sealed_count(CoverageSpan::new(0, 2_500).expect("span")),
+            1,
+            "a range touching only the first segment selects one"
+        );
+        assert_eq!(
+            view.selected_sealed_count(CoverageSpan::new(3_000, 4_000).expect("span")),
+            0,
+            "a range in the gap selects none"
         );
     }
 

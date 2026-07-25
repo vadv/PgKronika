@@ -38,6 +38,24 @@ use crate::{AppState, TimelineFlightRole};
 /// Absolute query span for the overview endpoint: 31 days.
 const MAX_OVERVIEW_SPAN_US: i64 = 31 * 24 * 3_600 * 1_000_000;
 
+/// Absolute cap on sealed segments a single request may select before any
+/// rows materialize (spec §14.3).
+const MAX_SELECTED_SEGMENTS: usize = 4_096;
+
+/// Rejects a request whose range selects more sealed segments than the cap,
+/// before any range query materializes rows.
+fn enforce_selected_segments(view: &IndexView, range: CoverageSpan) -> Result<(), ApiProblem> {
+    let selected = view.selected_sealed_count(range);
+    if selected > MAX_SELECTED_SEGMENTS {
+        return Err(ApiProblem::query_limit_exceeded(
+            crate::problem::LimitResource::SelectedSegments,
+            u64::try_from(MAX_SELECTED_SEGMENTS).unwrap_or(u64::MAX),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Response schema version echoed into every timeline response.
 const RESPONSE_SCHEMA_VERSION: u32 = kronika_analytics::overview::RESPONSE_SCHEMA_VERSION;
 
@@ -209,6 +227,7 @@ fn render_overview(
     view: &IndexView,
     request: OverviewRequest,
 ) -> Result<OverviewResponseDto, ApiProblem> {
+    enforce_selected_segments(view, request.range)?;
     let result = view
         .query_range(&[request.source], request.range, QUERY_LIMITS)
         .map_err(oracle_problem)?;
@@ -319,6 +338,7 @@ fn health_key(view: &IndexView, request: HealthRequest) -> ResponseKey {
 }
 
 fn render_health(view: &IndexView, request: HealthRequest) -> Result<Value, ApiProblem> {
+    enforce_selected_segments(view, request.range)?;
     let result = view
         .query_range(&[request.source], request.range, QUERY_LIMITS)
         .map_err(oracle_problem)?;
@@ -555,6 +575,7 @@ fn render_events(
     source_set_hash: [u8; 32],
     state: &AppState,
 ) -> Result<EventsResponseDto, ApiProblem> {
+    enforce_selected_segments(view, request.range)?;
     let result = view
         .query_range(&request.sources, request.range, QUERY_LIMITS)
         .map_err(oracle_problem)?;

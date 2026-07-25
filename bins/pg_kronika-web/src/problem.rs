@@ -219,6 +219,7 @@ closed_string_enum! {
         Clusters => "clusters",
         IncidentKeyBytes => "incident_key_bytes",
         TotalIncidentKeyBytes => "total_incident_key_bytes",
+        SelectedSegments => "selected_segments",
     }
 }
 

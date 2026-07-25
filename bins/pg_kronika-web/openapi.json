@@ -1756,7 +1756,7 @@
         "properties": {
           "resource": {
             "type": "string",
-            "enum": ["query_bytes", "query_parameters", "query_span_us", "window_positions", "rows", "cells", "bytes", "units", "sections", "identity_bytes", "series_points", "episodes", "clusters", "incident_key_bytes", "total_incident_key_bytes"]
+            "enum": ["query_bytes", "query_parameters", "query_span_us", "window_positions", "rows", "cells", "bytes", "units", "sections", "identity_bytes", "series_points", "episodes", "clusters", "incident_key_bytes", "total_incident_key_bytes", "selected_segments"]
           },
           "limit": { "type": "integer", "minimum": 0 },
           "observed": { "type": "integer", "minimum": 0 }
