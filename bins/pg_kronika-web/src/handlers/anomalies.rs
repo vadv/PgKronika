@@ -232,6 +232,11 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
     let mut sections_out = serde_json::Map::new();
     let mut skipped = Vec::new();
     let mut remaining_work = MAX_SCORE_WORK;
+    let mut sections_scanned = 0_u64;
+    let mut series_total = 0_u64;
+    let mut evaluated = 0_u64;
+    let mut section_episodes_dropped = 0_u64;
+    let mut global_episodes_dropped = 0_u64;
 
     for &name in &names {
         match scan_one_section(
@@ -246,8 +251,14 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
             Ok(section) => {
                 remaining_work -= section.work;
                 hits.extend(section.hits.into_iter().map(|hit| (name, hit)));
-                rank(&mut hits, limit);
+                global_episodes_dropped = global_episodes_dropped
+                    .saturating_add(u64::try_from(rank(&mut hits, limit)).unwrap_or(u64::MAX));
                 identities.insert(name, section.identity);
+                sections_scanned = sections_scanned.saturating_add(1);
+                series_total = series_total.saturating_add(section.counts.series_total);
+                evaluated = evaluated.saturating_add(section.counts.evaluated);
+                section_episodes_dropped =
+                    section_episodes_dropped.saturating_add(section.counts.episodes_truncated);
                 sections_out.insert(name.to_owned(), counts_to_json(&section.counts));
             }
             Err(reason) => {
@@ -259,17 +270,32 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
         }
     }
 
-    rank(&mut hits, limit);
+    global_episodes_dropped = global_episodes_dropped
+        .saturating_add(u64::try_from(rank(&mut hits, limit)).unwrap_or(u64::MAX));
     let episodes: Vec<Value> = hits
         .iter()
         .map(|(name, hit)| {
             let empty: &[&'static str] = &[];
             let identity = identities.get(name).map_or(empty, Vec::as_slice);
-            episode_to_json(name, identity, hit)
+            episode_to_json(name, identity, hit, &scan)
         })
         .collect();
+    let episodes_dropped_total = section_episodes_dropped.saturating_add(global_episodes_dropped);
+    let complete = skipped.is_empty() && episodes_dropped_total == 0;
+    let status = if !complete {
+        "partial"
+    } else if series_total == 0 {
+        "no_data"
+    } else if evaluated == 0 {
+        "insufficient_data"
+    } else if episodes.is_empty() {
+        "calm"
+    } else {
+        "signals_detected"
+    };
 
     Ok(Json(json!({
+        "schema_version": 1,
         "source_id": source,
         "from": from,
         "to": to,
@@ -278,6 +304,18 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
         "threshold": scan.threshold,
         "eps_rel": scan.eps_rel,
         "limit": limit,
+        "status": status,
+        "complete": complete,
+        "coverage": {
+            "sections_requested": names.len(),
+            "sections_scanned": sections_scanned,
+            "sections_skipped": skipped.len(),
+        },
+        "truncation": {
+            "section_episodes_dropped": section_episodes_dropped,
+            "global_episodes_dropped": global_episodes_dropped,
+            "episodes_dropped_total": episodes_dropped_total,
+        },
         "episodes": episodes,
         "sections": Value::Object(sections_out),
         "skipped": skipped,

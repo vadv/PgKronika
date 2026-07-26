@@ -8,8 +8,11 @@ use kronika_reader::{DiffPoint, Reason, SeriesDiff, SeriesValues, Value};
 use kronika_registry::ColumnClass;
 
 /// A score requires at least 20 reference and 3 window points.
-const MIN_REF: usize = 20;
-const MIN_CUR: usize = 3;
+pub(crate) const MIN_REF: usize = 20;
+pub(crate) const MIN_CUR: usize = 3;
+
+/// Stable machine identifier for the generic robust-window signal.
+pub(crate) const ROBUST_SIGNAL_ID: &str = "metric.robust_window_deviation.v1";
 
 /// Maximum point-position pairs scored by one HTTP request.
 pub(crate) const MAX_SCORE_WORK: usize = 50_000_000;
@@ -74,6 +77,8 @@ pub(crate) struct EpisodeHit {
     pub key: Vec<Value>,
     /// Scored column name.
     pub column: String,
+    /// Absolute scale floor used for this column class.
+    pub eps_abs: f64,
     /// The episode with its peak score.
     pub episode: Episode,
 }
@@ -324,6 +329,7 @@ fn scan_timeline(
         hits.push(EpisodeHit {
             key: key.to_vec(),
             column: column.to_owned(),
+            eps_abs: score.eps_abs,
             episode,
         });
     }
@@ -345,7 +351,7 @@ fn rank_section(hits: &mut Vec<EpisodeHit>, limit: usize) -> usize {
 /// Rank episodes across sections by peak `|m|`, descending, and truncate to
 /// `limit`. `sort_by` is stable, so ties keep the deterministic section and
 /// identity order they were collected in.
-pub(crate) fn rank(hits: &mut Vec<(&'static str, EpisodeHit)>, limit: usize) {
+pub(crate) fn rank(hits: &mut Vec<(&'static str, EpisodeHit)>, limit: usize) -> usize {
     hits.sort_by(|a, b| {
         b.1.episode
             .peak
@@ -353,7 +359,9 @@ pub(crate) fn rank(hits: &mut Vec<(&'static str, EpisodeHit)>, limit: usize) {
             .abs()
             .total_cmp(&a.1.episode.peak.m.abs())
     });
+    let removed = hits.len().saturating_sub(limit);
     hits.truncate(limit);
+    removed
 }
 
 #[cfg(test)]
@@ -520,7 +528,7 @@ mod tests {
 
         let mut ranked: Vec<(&'static str, EpisodeHit)> =
             hits.into_iter().map(|hit| ("s", hit)).collect();
-        rank(&mut ranked, 1);
+        assert_eq!(rank(&mut ranked, 1), 1);
         assert_eq!(ranked.len(), 1);
         assert_eq!(
             ranked[0].1.key,

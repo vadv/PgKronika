@@ -114,6 +114,10 @@ async fn anomalies_rank_the_archiver_spike_first_and_count_honestly() {
     let episodes = body["episodes"].as_array().expect("episodes is an array");
     assert!(!episodes.is_empty(), "the spike must surface as an episode");
     let top = &episodes[0];
+    assert_eq!(
+        top["signal_id"], "metric.robust_window_deviation.v1",
+        "every anomaly result has a stable machine id"
+    );
     assert_eq!(top["section"], "pg_stat_archiver");
     assert_eq!(top["column"], "archived_count");
     assert_eq!(top["direction"], "up");
@@ -121,6 +125,19 @@ async fn anomalies_rank_the_archiver_spike_first_and_count_honestly() {
     assert!(
         top["peak"]["m"].as_f64().expect("m is a number") > 3.5,
         "the peak clears the default threshold"
+    );
+    assert_eq!(
+        top["parameters"],
+        serde_json::json!({
+            "reference_model": "rest_of_continuous_period",
+            "retrospective": true,
+            "threshold": 3.5,
+            "eps_abs": 0.000001,
+            "eps_rel": 0.05,
+            "min_reference_points": 20,
+            "min_current_points": 3,
+        }),
+        "the detector parameters travel with the evidence"
     );
 
     let counters = &body["sections"]["pg_stat_archiver"];
@@ -130,6 +147,24 @@ async fn anomalies_rank_the_archiver_spike_first_and_count_honestly() {
     // three all-NULL gauge columns skip every one of the 40 rows.
     assert_eq!(counters["nodata_points"], 2 + 3 * 40);
     assert_eq!(body["skipped"], serde_json::json!([]));
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["status"], "signals_detected");
+    assert_eq!(body["complete"], true);
+    let scanned = body["sections"]
+        .as_object()
+        .expect("section counters")
+        .len();
+    assert_eq!(body["coverage"]["sections_requested"], scanned);
+    assert_eq!(body["coverage"]["sections_scanned"], scanned);
+    assert_eq!(body["coverage"]["sections_skipped"], 0);
+    assert_eq!(
+        body["truncation"],
+        serde_json::json!({
+            "section_episodes_dropped": 0,
+            "global_episodes_dropped": 0,
+            "episodes_dropped_total": 0,
+        })
+    );
 }
 
 #[tokio::test]
@@ -175,6 +210,62 @@ fn db_row(ts: i64, tick: i32) -> PgStatDatabaseV1 {
         datallowconn: None,
         datistemplate: None,
     }
+}
+
+fn write_two_section_spike_segment(dir: &std::path::Path) -> i64 {
+    const MINUTE: i64 = 60 * 1_000_000;
+    let mut archived = 0_i64;
+    let mut archiver = Vec::new();
+    let mut database = Vec::new();
+    for minute in 0..40_i32 {
+        let in_spike = (20..25).contains(&minute);
+        archived += if in_spike { 50 } else { 1 };
+        archiver.push(archiver_row(i64::from(minute) * MINUTE, archived));
+
+        let mut row = db_row(i64::from(minute) * MINUTE, minute);
+        row.numbackends = Some(if in_spike { 100 } else { 10 });
+        database.push(row);
+    }
+    let to = 39 * MINUTE;
+    let archiver_body = PgStatArchiver::encode(&archiver).expect("encode archiver");
+    let database_body = PgStatDatabaseV1::encode(&database).expect("encode database");
+    let bytes = build_part(
+        &[
+            SectionInput {
+                type_id: 1_008_001,
+                rows: 40,
+                body: &archiver_body,
+            },
+            SectionInput {
+                type_id: 1_005_001,
+                rows: 40,
+                body: &database_body,
+            },
+        ],
+        PartMeta {
+            min_ts: 0,
+            max_ts: to,
+            source_id: 7,
+        },
+    );
+    std::fs::write(dir.join("0.pgm"), &bytes).expect("write segment");
+    to
+}
+
+#[tokio::test]
+async fn global_episode_truncation_is_counted_and_makes_the_result_partial() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let to = write_two_section_spike_segment(dir.path());
+
+    let uri = format!("/v1/anomalies?source=7&from=0&to={to}&window=6m&step=2m&limit=1");
+    let (status, body) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["episodes"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["status"], "partial");
+    assert_eq!(body["complete"], false);
+    assert_eq!(body["truncation"]["section_episodes_dropped"], 0);
+    assert_eq!(body["truncation"]["global_episodes_dropped"], 1);
+    assert_eq!(body["truncation"]["episodes_dropped_total"], 1);
 }
 
 fn reset_row(ts: i64, track_io_timing: Option<bool>) -> ResetMetadata {

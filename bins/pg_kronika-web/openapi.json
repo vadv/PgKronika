@@ -827,11 +827,101 @@
         "type": "object",
         "additionalProperties": { "$ref": "#/components/schemas/DiffSection" }
       },
+      "AnomalyParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference_model", "retrospective", "threshold", "eps_abs", "eps_rel", "min_reference_points", "min_current_points"],
+        "properties": {
+          "reference_model": { "type": "string", "const": "rest_of_continuous_period" },
+          "retrospective": { "type": "boolean", "const": true },
+          "threshold": { "type": "number", "minimum": 0 },
+          "eps_abs": { "type": "number", "exclusiveMinimum": 0 },
+          "eps_rel": { "type": "number", "minimum": 0 },
+          "min_reference_points": { "type": "integer", "const": 20 },
+          "min_current_points": { "type": "integer", "const": 3 }
+        }
+      },
+      "AnomalyPeak": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["m", "med_cur", "med_ref", "mad_ref", "sigma_used", "n_cur", "n_ref"],
+        "properties": {
+          "m": { "type": "number" },
+          "med_cur": { "type": "number" },
+          "med_ref": { "type": "number" },
+          "mad_ref": { "type": "number", "minimum": 0 },
+          "sigma_used": { "type": "number", "exclusiveMinimum": 0 },
+          "n_cur": { "type": "integer", "minimum": 0 },
+          "n_ref": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "AnomalyEpisode": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signal_id", "section", "series", "column", "start", "end", "peak_ts", "direction", "parameters", "peak"],
+        "properties": {
+          "signal_id": { "type": "string", "const": "metric.robust_window_deviation.v1" },
+          "section": { "type": "string" },
+          "series": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/MachineValue" } },
+          "column": { "type": "string" },
+          "start": { "type": "integer", "format": "int64" },
+          "end": { "type": "integer", "format": "int64" },
+          "peak_ts": { "type": "integer", "format": "int64" },
+          "direction": { "type": "string", "enum": ["up", "down", "flat"] },
+          "parameters": { "$ref": "#/components/schemas/AnomalyParameters" },
+          "peak": { "$ref": "#/components/schemas/AnomalyPeak" }
+        }
+      },
+      "AnomalyNotEvaluated": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref_too_small", "cur_too_small", "all_no_data", "non_finite", "discontinuity"],
+        "properties": {
+          "ref_too_small": { "type": "integer", "minimum": 0 },
+          "cur_too_small": { "type": "integer", "minimum": 0 },
+          "all_no_data": { "type": "integer", "minimum": 0 },
+          "non_finite": { "type": "integer", "minimum": 0 },
+          "discontinuity": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "AnomalySectionCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["series_total", "evaluated", "not_evaluated", "nodata_points", "episodes_truncated"],
+        "properties": {
+          "series_total": { "type": "integer", "minimum": 0 },
+          "evaluated": { "type": "integer", "minimum": 0 },
+          "not_evaluated": { "$ref": "#/components/schemas/AnomalyNotEvaluated" },
+          "nodata_points": { "type": "integer", "minimum": 0 },
+          "episodes_truncated": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "AnomalyCoverage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sections_requested", "sections_scanned", "sections_skipped"],
+        "properties": {
+          "sections_requested": { "type": "integer", "minimum": 0 },
+          "sections_scanned": { "type": "integer", "minimum": 0 },
+          "sections_skipped": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "AnomalyTruncation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section_episodes_dropped", "global_episodes_dropped", "episodes_dropped_total"],
+        "properties": {
+          "section_episodes_dropped": { "type": "integer", "minimum": 0 },
+          "global_episodes_dropped": { "type": "integer", "minimum": 0 },
+          "episodes_dropped_total": { "type": "integer", "minimum": 0 }
+        }
+      },
       "AnomalyResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["source_id", "from", "to", "window_us", "step_us", "threshold", "eps_rel", "limit", "episodes", "sections", "skipped"],
+        "required": ["schema_version", "source_id", "from", "to", "window_us", "step_us", "threshold", "eps_rel", "limit", "status", "complete", "coverage", "truncation", "episodes", "sections", "skipped"],
         "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
           "source_id": { "type": "integer", "minimum": 0 },
           "from": { "type": "integer", "format": "int64" },
           "to": { "type": "integer", "format": "int64" },
@@ -840,8 +930,12 @@
           "threshold": { "type": "number", "minimum": 0 },
           "eps_rel": { "type": "number", "minimum": 0 },
           "limit": { "type": "integer", "minimum": 0 },
-          "episodes": { "type": "array", "items": { "$ref": "#/components/schemas/NeutralObject" } },
-          "sections": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/NeutralObject" } },
+          "status": { "type": "string", "enum": ["no_data", "partial", "insufficient_data", "calm", "signals_detected"] },
+          "complete": { "type": "boolean" },
+          "coverage": { "$ref": "#/components/schemas/AnomalyCoverage" },
+          "truncation": { "$ref": "#/components/schemas/AnomalyTruncation" },
+          "episodes": { "type": "array", "items": { "$ref": "#/components/schemas/AnomalyEpisode" } },
+          "sections": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/AnomalySectionCounts" } },
           "skipped": { "type": "array", "items": { "$ref": "#/components/schemas/SectionReason" } }
         }
       },

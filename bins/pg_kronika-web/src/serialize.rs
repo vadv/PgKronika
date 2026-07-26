@@ -5,7 +5,7 @@ use kronika_reader::{
 use kronika_registry::{ColumnClass, ColumnType, Semantics};
 use serde_json::{Value, json};
 
-use crate::anomaly::EpisodeHit;
+use crate::anomaly::{EpisodeHit, MIN_CUR, MIN_REF, ROBUST_SIGNAL_ID, ScanParams};
 
 /// Map one reader [`CellValue`] to its JSON form (see the API contract).
 pub(crate) fn value_to_json(value: &CellValue) -> Value {
@@ -130,7 +130,12 @@ const fn reason_name(reason: Reason) -> &'static str {
 
 /// Shape one ranked anomaly episode: the series it belongs to, the scored
 /// column, the episode interval, and every number behind the peak verdict.
-pub(crate) fn episode_to_json(section: &str, identity: &[&'static str], hit: &EpisodeHit) -> Value {
+pub(crate) fn episode_to_json(
+    section: &str,
+    identity: &[&'static str],
+    hit: &EpisodeHit,
+    scan: &ScanParams,
+) -> Value {
     let series: serde_json::Map<String, Value> = identity
         .iter()
         .zip(&hit.key)
@@ -138,6 +143,7 @@ pub(crate) fn episode_to_json(section: &str, identity: &[&'static str], hit: &Ep
         .collect();
     let peak = hit.episode.peak;
     json!({
+        "signal_id": ROBUST_SIGNAL_ID,
         "section": section,
         "series": series,
         "column": hit.column,
@@ -145,6 +151,15 @@ pub(crate) fn episode_to_json(section: &str, identity: &[&'static str], hit: &Ep
         "end": hit.episode.end,
         "peak_ts": hit.episode.peak_ts,
         "direction": direction_name(peak.dir),
+        "parameters": {
+            "reference_model": "rest_of_continuous_period",
+            "retrospective": true,
+            "threshold": scan.threshold,
+            "eps_abs": finite(hit.eps_abs),
+            "eps_rel": scan.eps_rel,
+            "min_reference_points": MIN_REF,
+            "min_current_points": MIN_CUR,
+        },
         "peak": {
             "m": finite(peak.m),
             "med_cur": finite(peak.med_cur),
