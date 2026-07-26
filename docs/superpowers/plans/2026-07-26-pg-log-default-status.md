@@ -1839,7 +1839,7 @@ git commit -m "feat(reader): read the latest logical section row"
 - Produces: required per-source JSON property `pg_log` with
   `{state,reason,observed_at,parser,source_path}`.
 
-- [ ] **Step 1: Update the old-store test first**
+- [x] **Step 1: Update the old-store test first**
 
 Change the existing `sources_fold_each_source_into_one_span` expected body so
 both sources retain their spans and receive:
@@ -1929,20 +1929,20 @@ async fn sections_catalog_exposes_pg_log_source_status() {
 }
 ```
 
-- [ ] **Step 2: Run the focused web tests and confirm the red state**
+- [x] **Step 2: Run the focused web tests and confirm the red state**
 
 Run:
 
 ```sh
 HOST="$(rustc +1.96.0 -vV | sed -n 's/^host: //p')"
-cargo +1.96.0 test -p pg-kronika-web sources_ --target "$HOST"
-cargo +1.96.0 test -p pg-kronika-web sections_catalog_exposes_pg_log_source_status --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-web sources_ --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-web sections_catalog_exposes_pg_log_source_status --target "$HOST"
 ```
 
 Expected: the old-store expected body differs and the new fixture has no
 `pg_log` field in the response.
 
-- [ ] **Step 3: Add strict PGM-code to API-name mapping**
+- [x] **Step 3: Add strict PGM-code to API-name mapping**
 
 Alias the reader value type and add private helpers in `handlers/v1.rs`:
 
@@ -2027,7 +2027,7 @@ fn pg_log_status_json(row: Option<&kronika_reader::OutRow>) -> Value {
 The fallback for an invalid stored row is intentionally the same conservative
 `unknown/no_status` shape; it never asserts that collection is healthy.
 
-- [ ] **Step 4: Query one latest row per catalogued source**
+- [x] **Step 4: Query one latest row per catalogued source**
 
 Clone the published snapshot once because the reader may refresh on a stale
 active part:
@@ -2053,7 +2053,7 @@ let pg_log = pg_log_status_json(status.as_ref());
 Return the unchanged `source_id`, `min_ts`, `max_ts`, `segments` fields plus
 `pg_log`. Do not derive staleness from wall-clock time.
 
-- [ ] **Step 5: Make the OpenAPI change additive**
+- [x] **Step 5: Make the OpenAPI change additive**
 
 Require `pg_log` on each item in `Sources` and add a referenced object schema:
 
@@ -2084,21 +2084,21 @@ Require `pg_log` on each item in `Sources` and add a referenced object schema:
 Set the per-source property to
 `{ "$ref": "#/components/schemas/PgLogSourceStatus" }`.
 
-- [ ] **Step 6: Run web and OpenAPI tests**
+- [x] **Step 6: Run web and OpenAPI tests**
 
 Run:
 
 ```sh
 HOST="$(rustc +1.96.0 -vV | sed -n 's/^host: //p')"
-cargo +1.96.0 test -p pg-kronika-web sources_ --target "$HOST"
-cargo +1.96.0 test -p pg-kronika-web sections_catalog_exposes_pg_log_source_status --target "$HOST"
-cargo +1.96.0 test -p pg-kronika-web openapi --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-web sources_ --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-web sections_catalog_exposes_pg_log_source_status --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-web openapi --target "$HOST"
 ```
 
 Expected: old PGM fixtures return `unknown/no_status`; the latest stored row
 wins; OpenAPI remains valid JSON and lists the new required object.
 
-- [ ] **Step 7: Commit the HTTP surface**
+- [x] **Step 7: Commit the HTTP surface**
 
 ```sh
 git add bins/pg_kronika-web/src/handlers/v1.rs bins/pg_kronika-web/src/tests/anomalies.rs bins/pg_kronika-web/openapi.json

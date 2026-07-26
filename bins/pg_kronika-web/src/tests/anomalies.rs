@@ -1,4 +1,38 @@
 use super::*;
+use kronika_registry::pg_log::PgLogSourceStatusV1;
+
+fn write_status_segment(
+    dir: &std::path::Path,
+    file: &str,
+    source: u64,
+    ts: i64,
+    state: u8,
+    reason: u8,
+    parser_kind: u8,
+) {
+    let body = PgLogSourceStatusV1::encode(&[PgLogSourceStatusV1 {
+        ts: Ts(ts),
+        state,
+        reason,
+        parser_kind,
+        source_path: None,
+        dict_dropped_fields: 0,
+    }])
+    .expect("encode status");
+    let part = build_part(
+        &[SectionInput {
+            type_id: 1_039_001,
+            rows: 1,
+            body: &body,
+        }],
+        PartMeta {
+            min_ts: ts,
+            max_ts: ts,
+            source_id: source,
+        },
+    );
+    std::fs::write(dir.join(file), part).expect("write status segment");
+}
 
 #[tokio::test]
 async fn sources_fold_each_source_into_one_span() {
@@ -12,11 +46,71 @@ async fn sources_fold_each_source_into_one_span() {
     assert_eq!(
         body,
         serde_json::json!({ "sources": [
-            { "source_id": 7, "min_ts": 1_000, "max_ts": 4_000, "segments": 2 },
-            { "source_id": 42, "min_ts": 1_500, "max_ts": 2_500, "segments": 1 }
+            {
+                "source_id": 7,
+                "min_ts": 1_000,
+                "max_ts": 4_000,
+                "segments": 2,
+                "pg_log": {
+                    "state": "unknown",
+                    "reason": "no_status",
+                    "observed_at": null,
+                    "parser": null,
+                    "source_path": null
+                }
+            },
+            {
+                "source_id": 42,
+                "min_ts": 1_500,
+                "max_ts": 2_500,
+                "segments": 1,
+                "pg_log": {
+                    "state": "unknown",
+                    "reason": "no_status",
+                    "observed_at": null,
+                    "parser": null,
+                    "source_path": null
+                }
+            }
         ] }),
         "each source folds its units into one span, ordered by source_id"
     );
+}
+
+#[tokio::test]
+async fn sources_returns_the_latest_pg_log_status_per_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_status_segment(dir.path(), "first.pgm", 7, 1_000, 0, 0, 0);
+    write_status_segment(dir.path(), "second.pgm", 7, 2_000, 2, 6, 0);
+
+    let (status, body) = serve(dir.path(), "/v1/sources").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["sources"][0]["pg_log"],
+        serde_json::json!({
+            "state": "unavailable",
+            "reason": "permission_denied",
+            "observed_at": 2_000,
+            "parser": "stderr",
+            "source_path": null
+        })
+    );
+}
+
+#[tokio::test]
+async fn sections_catalog_exposes_pg_log_source_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_bgwriter_segment(dir.path(), "one.pgm", 7, 0, 1);
+    let (status, body) = serve(dir.path(), "/v1/sections").await;
+    assert_eq!(status, StatusCode::OK);
+    let source_status = body["sections"]
+        .as_array()
+        .expect("sections array")
+        .iter()
+        .find(|section| section["name"] == "pg_log_source_status")
+        .expect("registered status section");
+    assert_eq!(source_status["semantics"], "on_change");
+    assert_eq!(source_status["sort_key"], serde_json::json!(["ts"]));
 }
 
 #[tokio::test]

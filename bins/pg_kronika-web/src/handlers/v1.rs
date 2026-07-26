@@ -5,7 +5,8 @@ use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, RawQuery, State};
 use kronika_reader::{
     GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, apply_collection_gating,
-    diff_section, gate_readings, logical_section, section, sections as query_sections,
+    diff_section, gate_readings, latest_section_row, logical_section, section,
+    sections as query_sections,
 };
 use kronika_registry::{
     ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
@@ -68,7 +69,8 @@ pub(crate) async fn sources(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiProblem> {
     QueryParams::parse(raw.as_deref(), &[])?;
-    let snapshot = state.snapshot();
+    let published = state.snapshot();
+    let mut snapshot = published.as_ref().clone();
     let mut spans: BTreeMap<u64, (i64, i64, usize)> = BTreeMap::new();
     for unit in snapshot.units() {
         let span = spans
@@ -78,13 +80,94 @@ pub(crate) async fn sources(
         span.1 = span.1.max(unit.max_ts);
         span.2 += 1;
     }
-    let sources: Vec<Value> = spans
-        .into_iter()
-        .map(|(source_id, (min_ts, max_ts, segments))| {
-            json!({ "source_id": source_id, "min_ts": min_ts, "max_ts": max_ts, "segments": segments })
-        })
-        .collect();
+    let mut sources = Vec::with_capacity(spans.len());
+    for (source_id, (min_ts, max_ts, segments)) in spans {
+        let status = latest_section_row(&mut snapshot, "pg_log_source_status", source_id)
+            .map_err(|error| query_error_response_without_cursor(&error))?;
+        let pg_log = pg_log_status_json(status.as_ref());
+        sources.push(json!({
+            "source_id": source_id,
+            "min_ts": min_ts,
+            "max_ts": max_ts,
+            "segments": segments,
+            "pg_log": pg_log,
+        }));
+    }
     Ok(Json(json!({ "sources": sources })))
+}
+
+fn unknown_pg_log_status() -> Value {
+    json!({
+        "state": "unknown",
+        "reason": "no_status",
+        "observed_at": null,
+        "parser": null,
+        "source_path": null,
+    })
+}
+
+fn reader_field<'a>(
+    row: &'a kronika_reader::OutRow,
+    name: &str,
+) -> Option<&'a kronika_reader::Value> {
+    row.iter()
+        .find(|(column, _)| column == name)
+        .map(|(_, value)| value)
+}
+
+fn pg_log_status_json(row: Option<&kronika_reader::OutRow>) -> Value {
+    let Some(row) = row else {
+        return unknown_pg_log_status();
+    };
+    let Some(kronika_reader::Value::Ts(observed_at)) = reader_field(row, "ts") else {
+        return unknown_pg_log_status();
+    };
+    let Some(kronika_reader::Value::U64(state)) = reader_field(row, "state") else {
+        return unknown_pg_log_status();
+    };
+    let Some(kronika_reader::Value::U64(reason)) = reader_field(row, "reason") else {
+        return unknown_pg_log_status();
+    };
+    let Some(kronika_reader::Value::U64(parser)) = reader_field(row, "parser_kind") else {
+        return unknown_pg_log_status();
+    };
+    let state = match *state {
+        0 => "collecting",
+        1 => "collecting_degraded",
+        2 => "unavailable",
+        3 => "disabled",
+        _ => return unknown_pg_log_status(),
+    };
+    let reason = match *reason {
+        0 => "none",
+        1 => "postgres_unavailable",
+        2 => "no_current_logfile",
+        3 => "unsupported_format",
+        4 => "discovery_query_failed",
+        5 => "missing_file",
+        6 => "permission_denied",
+        7 => "read_error",
+        _ => return unknown_pg_log_status(),
+    };
+    let parser = match *parser {
+        0 => "stderr",
+        1 => "csvlog",
+        2 => "unknown",
+        _ => return unknown_pg_log_status(),
+    };
+    let source_path = match reader_field(row, "source_path") {
+        Some(kronika_reader::Value::Str(path)) => Value::String(path.clone()),
+        Some(kronika_reader::Value::Blob { text, .. }) => Value::String(text.clone()),
+        Some(kronika_reader::Value::Null) | None => Value::Null,
+        _ => return unknown_pg_log_status(),
+    };
+    json!({
+        "state": state,
+        "reason": reason,
+        "observed_at": observed_at,
+        "parser": parser,
+        "source_path": source_path,
+    })
 }
 
 /// `GET /v1/sections` — static catalog of section types from the registry.

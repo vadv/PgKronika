@@ -641,6 +641,27 @@
           "format_version": { "type": "integer", "minimum": 1 }
         }
       },
+      "PgLogSourceStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["state", "reason", "observed_at", "parser", "source_path"],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": ["collecting", "collecting_degraded", "unavailable", "disabled", "unknown"]
+          },
+          "reason": {
+            "type": "string",
+            "enum": ["none", "postgres_unavailable", "no_current_logfile", "unsupported_format", "discovery_query_failed", "missing_file", "permission_denied", "read_error", "no_status"]
+          },
+          "observed_at": { "type": ["integer", "null"], "format": "int64" },
+          "parser": {
+            "type": ["string", "null"],
+            "enum": ["stderr", "csvlog", "unknown", null]
+          },
+          "source_path": { "type": ["string", "null"] }
+        }
+      },
       "Sources": {
         "type": "object",
         "additionalProperties": false,
@@ -651,12 +672,13 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["source_id", "min_ts", "max_ts", "segments"],
+              "required": ["source_id", "min_ts", "max_ts", "segments", "pg_log"],
               "properties": {
                 "source_id": { "type": "integer", "minimum": 0 },
                 "min_ts": { "type": "integer", "format": "int64" },
                 "max_ts": { "type": "integer", "format": "int64" },
-                "segments": { "type": "integer", "minimum": 0 }
+                "segments": { "type": "integer", "minimum": 0 },
+                "pg_log": { "$ref": "#/components/schemas/PgLogSourceStatus" }
               }
             }
           }
