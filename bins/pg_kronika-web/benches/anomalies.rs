@@ -38,6 +38,7 @@ use kronika_analytics as _;
 use kronika_reader as _;
 use metrics as _;
 use rust_embed as _;
+#[cfg(feature = "qualification")]
 use rustix as _;
 use serde as _;
 use serde_json as _;
