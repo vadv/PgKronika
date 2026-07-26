@@ -5,7 +5,7 @@
 //! directory. A separate `strace` pass records file-operation counts so syscall
 //! tracing cannot distort the reported latency samples.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
@@ -19,7 +19,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use kronika_analytics::overview::{CountLimits, CoverageSpan, OracleLimits, RawOracle};
-use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
+use kronika_format::{FrameHeader, PartMeta, ReadAt, SectionInput, build_part};
 use kronika_reader::{
     BlockKind, FactFile, FactOrigin, FactStore, FallbackConfig, LIMIT, LocalDirSnapshot,
     PersistError, PersistenceProbeOutcome, PgmUnit, SegmentContext, SegmentFacts,
@@ -28,22 +28,25 @@ use kronika_registry::pg_log::PgLogLifecycleV1;
 use kronika_registry::pg_stat_database::PgStatDatabaseV1;
 use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
-use kronika_registry::{Section, Ts};
+use kronika_registry::{Section, Ts, canonicalize_batches, registry};
+use kronika_writer::{Journal, JournalConfig, seal};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tower::ServiceExt as _;
 
 use crate::overview::live::LiveFoldStats;
 use crate::overview::loader::{LoaderIoSnapshot, LoaderQualificationSnapshot};
 use crate::{AppState, OverviewConfig, app};
 
-const ARTIFACT_SCHEMA: &str = "pgkronika-overview-parity-v1-evidence-v2";
-const FIXTURE_SCHEMA: &str = "overview-dense-hour-v2";
+const ARTIFACT_SCHEMA: &str = "pgkronika-overview-parity-v1-evidence-v3";
+const FIXTURE_SCHEMA: &str = "overview-dense-hour-v3";
 const SAMPLES: usize = 720;
 const CADENCE_US: i64 = 5_000_000;
 const ITERATIONS: usize = 20;
 const CONCURRENT_WORKERS: usize = 16;
 const SOURCE_ID: u64 = 7;
+const PGM_SEAL_PARTS: usize = 40;
 
 /// Prefix emitted by a qualification-enabled real server after its listener
 /// has bound successfully.
@@ -91,6 +94,13 @@ const MODES: [&str; 9] = [
 pub fn run_cli() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     match arguments.as_slice() {
+        [flag, root] if flag == "--pgm-seal-worker" => {
+            let outcome = run_pgm_seal_worker(Path::new(root));
+            println!(
+                "{}",
+                serde_json::to_string(&outcome).expect("serialize PGM seal worker result")
+            );
+        }
         [flag, mode, root] if flag == "--worker" => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -109,7 +119,8 @@ pub fn run_cli() {
         _ => {
             eprintln!(
                 "usage: overview_parity_qualification --output PATH\n\
-                 private: overview_parity_qualification --worker MODE ROOT"
+                 private: overview_parity_qualification --worker MODE ROOT\n\
+                 private: overview_parity_qualification --pgm-seal-worker ROOT"
             );
             std::process::exit(2);
         }
@@ -130,6 +141,7 @@ struct QualificationArtifact {
     budgets: Budgets,
     modes: Vec<ModeResult>,
     compact_performance: CompactPerformanceProfile,
+    pgm_compaction: PgmCompactionProfile,
     acceptance: Vec<AcceptanceEvidence>,
     limitations: Vec<&'static str>,
 }
@@ -184,6 +196,12 @@ struct FixtureProfile {
 
 #[derive(Debug, Serialize)]
 struct Accounting {
+    pgm_logical_bytes: usize,
+    pgm_allocated_bytes: u64,
+    ovf_logical_bytes: usize,
+    ovf_allocated_bytes: u64,
+    combined_logical_bytes: usize,
+    combined_allocated_bytes: u64,
     fact_file_logical_bytes: usize,
     fact_file_allocated_bytes: u64,
     header_and_directory_bytes: u64,
@@ -317,6 +335,55 @@ struct CompactModeResult {
     samples_ns: Vec<u128>,
 }
 
+#[derive(Debug, Serialize)]
+struct PgmCompactionProfile {
+    production_path: &'static str,
+    output_name: &'static str,
+    input_parts: usize,
+    registered_layouts: usize,
+    all_family_exact_equality: AllFamilyExactEquality,
+    seal_iterations: usize,
+    seal_wall_p50_ns: u128,
+    seal_wall_p95_ns: u128,
+    seal_wall_p99_ns: u128,
+    seal_cpu_p50_ns: u128,
+    seal_cpu_p95_ns: u128,
+    seal_cpu_p99_ns: u128,
+    seal_peak_rss_bytes: u64,
+    samples: Vec<PgmSealOutcome>,
+}
+
+#[derive(Debug, Serialize)]
+struct AllFamilyExactEquality {
+    gate_passed: bool,
+    fixture_classes: [&'static str; 4],
+    test_binary: &'static str,
+    test_path: &'static str,
+    roundtrip_test: &'static str,
+    determinism_test: &'static str,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PgmSealOutcome {
+    wall_ns: u128,
+    cpu_ns: u128,
+    process_peak_rss_bytes: u64,
+    proc_io: ProcIo,
+    source_journal_bytes: u64,
+    pgm_logical_bytes: u64,
+    pgm_allocated_bytes: u64,
+    spill_bytes: u64,
+    writer_write_bytes: u64,
+    write_amplification_numerator: u64,
+    write_amplification_denominator: u64,
+    admitted_memory_bytes: usize,
+    sections: usize,
+    rows: u64,
+    pgm_sha256: String,
+    exact_source_facts_equal: bool,
+    reader_reopen_equal: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 struct SyscallCounts {
     process_scope: bool,
@@ -361,6 +428,7 @@ fn run_coordinator(output: &Path) {
     fs::create_dir(&runtime_root).expect("create qualification runtime root");
 
     let executable = std::env::current_exe().expect("qualification executable");
+    let pgm_compaction = pgm_compaction_profile(&executable, &runtime_root, iterations);
     let mut modes = Vec::with_capacity(MODES.len());
     for mode in MODES {
         let mut samples = Vec::with_capacity(iterations);
@@ -375,15 +443,20 @@ fn run_coordinator(output: &Path) {
         modes.push(mode_result(mode, samples, syscalls));
     }
 
-    let dense = dense_hour_pgm(SOURCE_ID, 1_000_000, SAMPLES);
+    let profile_root = runtime_root.join("accounting-profile");
+    fs::create_dir(&profile_root).expect("create accounting profile directory");
+    let dense = write_dense_pgm(
+        &profile_root,
+        "dense-hour.pgm",
+        SOURCE_ID,
+        1_000_000,
+        SAMPLES,
+    );
     let unit = PgmUnit::open(dense.as_slice()).expect("open dense fixture");
     let facts = SegmentFacts::extract(&unit, &LIMIT).expect("extract dense fixture");
     let encoded = facts.encode(&LIMIT).expect("encode dense facts");
     let file = FactFile::admit(&encoded, facts.identity(), facts.lineage(), &LIMIT)
         .expect("admit dense facts");
-    let profile_root = runtime_root.join("accounting-profile");
-    fs::create_dir(&profile_root).expect("create accounting profile directory");
-    fs::write(profile_root.join("dense-hour.pgm"), &dense).expect("write profile PGM");
     FactStore::new(&profile_root)
         .publish(
             &facts,
@@ -391,10 +464,11 @@ fn run_coordinator(output: &Path) {
             &LIMIT,
         )
         .expect("publish profile OVF");
+    let pgm_meta = fs::metadata(profile_root.join("dense-hour.pgm")).expect("stat profile PGM");
     let sidecar_meta =
         fs::metadata(profile_root.join("dense-hour.ovf")).expect("stat profile sidecar");
 
-    let accounting = accounting(&facts, &file, encoded.len(), &sidecar_meta);
+    let accounting = accounting(&facts, &file, encoded.len(), &pgm_meta, &sidecar_meta);
     let compact_performance = compact_performance(&runtime_root, &dense, &facts);
     let artifact = QualificationArtifact {
         schema: ARTIFACT_SCHEMA,
@@ -418,9 +492,11 @@ fn run_coordinator(output: &Path) {
         accounting,
         modes,
         compact_performance,
+        pgm_compaction,
         acceptance: acceptance_evidence(),
         limitations: vec![
             "storage-cold/page-cache-cold is not measured or claimed",
+            "seal RSS is fresh-process high-water, not an isolated allocator delta",
             "deployment size budgets remain owner-deferred unless both approved values are configured",
             "charts remain owner-deferred and are absent from the qualification datasets",
             "the final PASS is assigned only by the same-head same-attempt CI acceptance job",
@@ -429,6 +505,207 @@ fn run_coordinator(output: &Path) {
     let json = serde_json::to_vec_pretty(&artifact).expect("serialize artifact");
     fs::write(output, json).expect("write qualification artifact");
     println!("{}", output.display());
+}
+
+fn pgm_compaction_profile(
+    executable: &Path,
+    runtime_root: &Path,
+    iterations: usize,
+) -> PgmCompactionProfile {
+    assert_eq!(
+        std::env::var("PGM_ALL_FAMILY_EXACT_GATE").as_deref(),
+        Ok("passed"),
+        "run the maintained all-layout exact oracle before release qualification"
+    );
+    let mut samples = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        let root = runtime_root.join(format!("pgm-seal-{iteration:02}"));
+        samples.push(spawn_pgm_seal_worker(executable, &root));
+    }
+    let mut wall = samples
+        .iter()
+        .map(|sample| sample.wall_ns)
+        .collect::<Vec<_>>();
+    wall.sort_unstable();
+    let mut cpu = samples
+        .iter()
+        .map(|sample| sample.cpu_ns)
+        .collect::<Vec<_>>();
+    cpu.sort_unstable();
+    let first = samples.first().expect("PGM seal samples");
+    for sample in &samples {
+        assert!(sample.spill_bytes > 0, "seal fixture did not spill");
+        assert_eq!(
+            sample.writer_write_bytes,
+            sample
+                .spill_bytes
+                .checked_add(sample.pgm_logical_bytes)
+                .expect("writer byte accounting"),
+            "writer bytes do not equal spill plus PGM"
+        );
+        assert_eq!(
+            sample.write_amplification_numerator, sample.writer_write_bytes,
+            "write-amplification numerator changed"
+        );
+        assert_eq!(
+            sample.write_amplification_denominator, sample.pgm_logical_bytes,
+            "write-amplification denominator changed"
+        );
+        assert_eq!(
+            sample.pgm_logical_bytes, first.pgm_logical_bytes,
+            "deterministic PGM length changed"
+        );
+        assert_eq!(
+            sample.pgm_sha256, first.pgm_sha256,
+            "deterministic PGM bytes changed"
+        );
+        assert!(
+            sample.exact_source_facts_equal && sample.reader_reopen_equal,
+            "production PGM did not preserve exact facts across reopen"
+        );
+    }
+    PgmCompactionProfile {
+        production_path: "kronika_writer::Journal -> seal -> kronika_reader::PgmUnit",
+        output_name: "1000000.pgm",
+        input_parts: PGM_SEAL_PARTS,
+        registered_layouts: registry().len(),
+        all_family_exact_equality: AllFamilyExactEquality {
+            gate_passed: true,
+            fixture_classes: ["dense", "reset-heavy", "nullable-heavy", "short-tail"],
+            test_binary: "kronika-reader::pgm_compaction_oracle",
+            test_path: "crates/kronika-reader/tests/pgm_compaction_oracle.rs",
+            roundtrip_test: "every_registered_layout_roundtrips_all_fixture_classes_exactly",
+            determinism_test: "all_layout_bytes_are_deterministic_under_window_reordering",
+        },
+        seal_iterations: samples.len(),
+        seal_wall_p50_ns: percentile(&wall, 50),
+        seal_wall_p95_ns: percentile(&wall, 95),
+        seal_wall_p99_ns: percentile(&wall, 99),
+        seal_cpu_p50_ns: percentile(&cpu, 50),
+        seal_cpu_p95_ns: percentile(&cpu, 95),
+        seal_cpu_p99_ns: percentile(&cpu, 99),
+        seal_peak_rss_bytes: samples
+            .iter()
+            .map(|sample| sample.process_peak_rss_bytes)
+            .max()
+            .unwrap_or(0),
+        samples,
+    }
+}
+
+fn spawn_pgm_seal_worker(executable: &Path, root: &Path) -> PgmSealOutcome {
+    let output = Command::new(executable)
+        .arg("--pgm-seal-worker")
+        .arg(root)
+        .output()
+        .expect("spawn PGM seal qualification worker");
+    require_success(&output, "pgm-seal");
+    serde_json::from_slice(&output.stdout).expect("decode PGM seal qualification worker")
+}
+
+fn run_pgm_seal_worker(root: &Path) -> PgmSealOutcome {
+    assert!(!root.exists(), "PGM seal root must start absent");
+    fs::create_dir(root).expect("create PGM seal root");
+    assert_eq!(
+        SAMPLES % PGM_SEAL_PARTS,
+        0,
+        "seal fixture must divide into equal parts"
+    );
+    let (mut journal, report) = Journal::open(&root.join("active.parts"), JournalConfig::default())
+        .expect("open PGM seal journal");
+    assert!(report.is_clean(), "fresh PGM seal journal is damaged");
+    let rows_per_part = SAMPLES / PGM_SEAL_PARTS;
+    for part_index in 0..PGM_SEAL_PARTS {
+        let row_offset = part_index
+            .checked_mul(rows_per_part)
+            .expect("seal fixture row offset");
+        let part = dense_hour_part(
+            SOURCE_ID,
+            1_000_000,
+            row_offset,
+            rows_per_part,
+            part_index == 0,
+        );
+        journal.append(&part).expect("append PGM seal fixture part");
+    }
+
+    let output = root.join("1000000.pgm");
+    let io_before = proc_io();
+    let cpu_before = process_cpu_ns();
+    let started = Instant::now();
+    let summary = seal(&journal, &output).expect("seal production PGM fixture");
+    let wall_ns = started.elapsed().as_nanos();
+    let cpu_ns = process_cpu_ns().saturating_sub(cpu_before);
+    let proc_io = proc_io().saturating_sub(io_before);
+    let process_peak_rss_bytes = process_peak_rss_bytes();
+
+    let pgm = fs::read(&output).expect("read production PGM fixture");
+    let metadata = fs::metadata(&output).expect("stat production PGM fixture");
+    let expected = dense_hour_part(SOURCE_ID, 1_000_000, 0, SAMPLES, true);
+    let pgm_logical_bytes = u64::try_from(pgm.len()).expect("PGM length fits u64");
+    PgmSealOutcome {
+        wall_ns,
+        cpu_ns,
+        process_peak_rss_bytes,
+        proc_io,
+        source_journal_bytes: summary.source_bytes,
+        pgm_logical_bytes,
+        pgm_allocated_bytes: metadata.blocks().saturating_mul(512),
+        spill_bytes: summary.spill_bytes,
+        writer_write_bytes: summary.write_bytes,
+        write_amplification_numerator: summary.write_bytes,
+        write_amplification_denominator: pgm_logical_bytes,
+        admitted_memory_bytes: summary.admitted_memory_bytes,
+        sections: summary.sections,
+        rows: summary.rows,
+        pgm_sha256: format!("{:x}", Sha256::digest(&pgm)),
+        exact_source_facts_equal: exact_pgm_sections_equal(&expected, &pgm),
+        reader_reopen_equal: exact_pgm_file_reopen_equal(&output),
+    }
+}
+
+fn exact_pgm_sections_equal(expected: &[u8], actual: &[u8]) -> bool {
+    let expected = PgmUnit::open(expected).expect("open expected PGM sections");
+    let actual = PgmUnit::open(actual).expect("open actual PGM sections");
+    exact_pgm_units_equal(&expected, &actual)
+}
+
+fn exact_pgm_file_reopen_equal(path: &Path) -> bool {
+    let first =
+        PgmUnit::open(File::open(path).expect("open production PGM")).expect("read production PGM");
+    let reopened = PgmUnit::open(File::open(path).expect("reopen production PGM"))
+        .expect("read reopened production PGM");
+    exact_pgm_units_equal(&first, &reopened)
+}
+
+fn exact_pgm_units_equal<L: ReadAt, R: ReadAt>(expected: &PgmUnit<L>, actual: &PgmUnit<R>) -> bool {
+    if expected.catalog().source_id != actual.catalog().source_id
+        || expected.catalog().min_ts != actual.catalog().min_ts
+        || expected.catalog().max_ts != actual.catalog().max_ts
+        || expected.catalog().entries.len() != actual.catalog().entries.len()
+    {
+        return false;
+    }
+    expected
+        .catalog()
+        .entries
+        .iter()
+        .zip(&actual.catalog().entries)
+        .all(|(expected_entry, actual_entry)| {
+            if expected_entry.type_id != actual_entry.type_id
+                || expected_entry.rows != actual_entry.rows
+            {
+                return false;
+            }
+            let expected = expected
+                .decode(expected_entry)
+                .expect("decode expected section");
+            let actual = actual.decode(actual_entry).expect("decode actual section");
+            canonicalize_batches(expected_entry.type_id, &expected.batches)
+                .expect("canonicalize expected section")
+                == canonicalize_batches(actual_entry.type_id, &actual.batches)
+                    .expect("canonicalize actual section")
+        })
 }
 
 fn prepare_mode(mode: &str, root: &Path) {
@@ -440,23 +717,16 @@ fn prepare_mode(mode: &str, root: &Path) {
                 let source = 100 + u64::try_from(worker).expect("worker source");
                 let start =
                     1_000_000 + i64::try_from(worker).expect("worker range") * 1_000_000_000;
-                let bytes = dense_hour_pgm(source, start, 32);
-                fs::write(root.join(format!("segment-{worker:02}.pgm")), bytes)
-                    .expect("write disjoint PGM");
+                write_dense_pgm(root, &format!("segment-{worker:02}.pgm"), source, start, 32);
             }
         }
         "live" => {
-            fs::write(
-                root.join("dense-hour.pgm"),
-                dense_hour_pgm(SOURCE_ID, 1_000_000, SAMPLES),
-            )
-            .expect("write live sealed PGM");
+            write_dense_pgm(root, "dense-hour.pgm", SOURCE_ID, 1_000_000, SAMPLES);
             let first = lifecycle_part(dense_end() + 10, 41);
             fs::write(root.join("active.parts"), framed(&first)).expect("write first active frame");
         }
         _ => {
-            let bytes = dense_hour_pgm(SOURCE_ID, 1_000_000, SAMPLES);
-            fs::write(root.join("dense-hour.pgm"), &bytes).expect("write dense PGM");
+            let bytes = write_dense_pgm(root, "dense-hour.pgm", SOURCE_ID, 1_000_000, SAMPLES);
             if matches!(mode, "restart-warm" | "oracle-profile") {
                 let facts = SegmentFacts::extract(
                     &PgmUnit::open(bytes.as_slice()).expect("open seed PGM"),
@@ -1633,9 +1903,42 @@ fn percentile(sorted: &[u128], percentile: usize) -> u128 {
     sorted[rank.min(sorted.len() - 1)]
 }
 
-fn dense_hour_pgm(source_id: u64, start_us: i64, samples: usize) -> Vec<u8> {
+fn write_dense_pgm(
+    root: &Path,
+    file_name: &str,
+    source_id: u64,
+    start_us: i64,
+    samples: usize,
+) -> Vec<u8> {
+    let (mut journal, report) = Journal::open(&root.join("active.parts"), JournalConfig::default())
+        .expect("open dense PGM journal");
+    assert!(report.is_clean(), "dense PGM journal is damaged");
+    assert!(
+        journal.parts().is_empty(),
+        "dense PGM journal was not reset"
+    );
+    let part = dense_hour_part(source_id, start_us, 0, samples, true);
+    journal.append(&part).expect("append dense PGM part");
+    let output = root.join(file_name);
+    seal(&journal, &output).expect("seal dense production PGM");
+    journal.reset().expect("reset dense PGM journal");
+    let bytes = fs::read(&output).expect("read dense production PGM");
+    PgmUnit::open(bytes.as_slice()).expect("reopen dense production PGM");
+    bytes
+}
+
+fn dense_hour_part(
+    source_id: u64,
+    start_us: i64,
+    row_offset: usize,
+    samples: usize,
+    include_reset: bool,
+) -> Vec<u8> {
     let database = (0..samples)
         .map(|index| {
+            let index = row_offset
+                .checked_add(index)
+                .expect("dense sample index overflow");
             let index = i64::try_from(index).expect("sample index");
             let index_f64 =
                 f64::from(u32::try_from(index).expect("sample index fits exact f64 integer range"));
@@ -1701,27 +2004,29 @@ fn dense_hour_pgm(source_id: u64, start_us: i64, samples: usize) -> Vec<u8> {
     let database_body = PgStatDatabaseV1::encode(&database).expect("encode dense database");
     let reset_body = ResetMetadata::encode(&reset).expect("encode dense reset");
     let coverage_body = SnapshotCoverageV1::encode(&coverage).expect("encode dense coverage");
+    let mut sections = vec![SectionInput {
+        type_id: 1_005_001,
+        rows: u32::try_from(database.len()).expect("database rows"),
+        body: &database_body,
+    }];
+    if include_reset {
+        sections.push(SectionInput {
+            type_id: 1_020_001,
+            rows: 1,
+            body: &reset_body,
+        });
+    }
+    sections.push(SectionInput {
+        type_id: 1_038_001,
+        rows: u32::try_from(coverage.len()).expect("coverage rows"),
+        body: &coverage_body,
+    });
+    let part_min_ts = start_us + i64::try_from(row_offset).expect("row offset") * CADENCE_US;
     build_part(
-        &[
-            SectionInput {
-                type_id: 1_005_001,
-                rows: u32::try_from(database.len()).expect("database rows"),
-                body: &database_body,
-            },
-            SectionInput {
-                type_id: 1_020_001,
-                rows: 1,
-                body: &reset_body,
-            },
-            SectionInput {
-                type_id: 1_038_001,
-                rows: u32::try_from(coverage.len()).expect("coverage rows"),
-                body: &coverage_body,
-            },
-        ],
+        &sections,
         PartMeta {
-            min_ts: start_us,
-            max_ts: start_us
+            min_ts: part_min_ts,
+            max_ts: part_min_ts
                 + i64::try_from(samples.saturating_sub(1)).expect("sample count") * CADENCE_US,
             source_id,
         },
@@ -1806,7 +2111,8 @@ fn accounting(
     facts: &SegmentFacts,
     file: &FactFile,
     fact_file_bytes: usize,
-    metadata: &fs::Metadata,
+    pgm_metadata: &fs::Metadata,
+    ovf_metadata: &fs::Metadata,
 ) -> Accounting {
     let stored_block_bytes = file
         .directory()
@@ -1856,9 +2162,22 @@ fn accounting(
         .checked_add(size_of::<Arc<SegmentFacts>>())
         .and_then(|bytes| bytes.checked_add(size_of::<kronika_reader::FactBuildKey>()))
         .expect("pinned fact size");
+    let pgm_logical_bytes = usize::try_from(pgm_metadata.len()).expect("PGM length fits usize");
+    let pgm_allocated_bytes = pgm_metadata.blocks().saturating_mul(512);
+    let ovf_allocated_bytes = ovf_metadata.blocks().saturating_mul(512);
     Accounting {
+        pgm_logical_bytes,
+        pgm_allocated_bytes,
+        ovf_logical_bytes: fact_file_bytes,
+        ovf_allocated_bytes,
+        combined_logical_bytes: pgm_logical_bytes
+            .checked_add(fact_file_bytes)
+            .expect("combined logical bytes"),
+        combined_allocated_bytes: pgm_allocated_bytes
+            .checked_add(ovf_allocated_bytes)
+            .expect("combined allocated bytes"),
         fact_file_logical_bytes: fact_file_bytes,
-        fact_file_allocated_bytes: metadata.blocks().saturating_mul(512),
+        fact_file_allocated_bytes: ovf_allocated_bytes,
         header_and_directory_bytes,
         stored_block_bytes,
         decoded_block_bytes,
@@ -2058,7 +2377,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_partition_reconciles_to_exact_compact_sealed_facts",
                 ),
                 ("mode", "qualification", "oracle-profile"),
             ],
@@ -2071,7 +2390,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_partition_reconciles_to_exact_compact_sealed_facts",
                 ),
                 (
                     "rust_test",
@@ -2187,7 +2506,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_partition_reconciles_to_exact_compact_sealed_facts",
                 ),
                 (
                     "rust_test",
@@ -2248,7 +2567,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
                 (
                     "rust_test",
                     "crates/kronika-reader/src/overview/live.rs",
-                    "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+                    "every_all_family_partition_reconciles_to_exact_compact_sealed_facts",
                 ),
             ],
             timeline_bdd: false,

@@ -81,6 +81,14 @@ BDD_SCENARIOS = (
         )
         for version in range(15, 19)
     ),
+    *(
+        (
+            "crates/kronika-bdd/features/pgm_compaction.feature",
+            f"PostgreSQL {version} publishes and serves one compact two-window PGM",
+            version,
+        )
+        for version in range(15, 19)
+    ),
 )
 
 def rust_evidence(binary: str, path: str, name: str) -> tuple[str, str, str, str]:
@@ -143,7 +151,7 @@ EXPECTED_EVIDENCE = (
         rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/live.rs",
-            "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+            "every_all_family_partition_reconciles_to_exact_compact_sealed_facts",
         ),
         mode_evidence("oracle-profile"),
         *TIMELINE_BDD_EVIDENCE,
@@ -152,7 +160,7 @@ EXPECTED_EVIDENCE = (
         rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/live.rs",
-            "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+            "every_all_family_partition_reconciles_to_exact_compact_sealed_facts",
         ),
         rust_evidence(
             "kronika-reader",
@@ -245,7 +253,7 @@ EXPECTED_EVIDENCE = (
         rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/live.rs",
-            "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+            "every_all_family_partition_reconciles_to_exact_compact_sealed_facts",
         ),
         rust_evidence(
             "pg-kronika-web",
@@ -292,7 +300,7 @@ EXPECTED_EVIDENCE = (
         rust_evidence(
             "kronika-reader",
             "crates/kronika-reader/src/overview/live.rs",
-            "every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts",
+            "every_all_family_partition_reconciles_to_exact_compact_sealed_facts",
         ),
     ),
     (
@@ -644,7 +652,7 @@ def exact_fields(
 ) -> None:
     check(
         set(value) == fields,
-        f"{label} does not match the exact v2 schema",
+        f"{label} does not match the declared schema",
         failures,
     )
 
@@ -741,7 +749,7 @@ def validate_fixture(fixture: dict[str, object], failures: list[str]) -> None:
         failures,
     )
     check(
-        fixture.get("schema_version") == "overview-dense-hour-v2",
+        fixture.get("schema_version") == "overview-dense-hour-v3",
         "wrong dense fixture schema",
         failures,
     )
@@ -803,6 +811,12 @@ def validate_accounting(
     exact_fields(
         accounting,
         {
+            "pgm_logical_bytes",
+            "pgm_allocated_bytes",
+            "ovf_logical_bytes",
+            "ovf_allocated_bytes",
+            "combined_logical_bytes",
+            "combined_allocated_bytes",
             "fact_file_logical_bytes",
             "fact_file_allocated_bytes",
             "header_and_directory_bytes",
@@ -821,6 +835,12 @@ def validate_accounting(
         failures,
     )
     fields = (
+        "pgm_logical_bytes",
+        "pgm_allocated_bytes",
+        "ovf_logical_bytes",
+        "ovf_allocated_bytes",
+        "combined_logical_bytes",
+        "combined_allocated_bytes",
         "fact_file_logical_bytes",
         "fact_file_allocated_bytes",
         "header_and_directory_bytes",
@@ -840,6 +860,26 @@ def validate_accounting(
         )
         for field in fields
     }
+    check(
+        values["ovf_logical_bytes"] == values["fact_file_logical_bytes"]
+        and values["ovf_allocated_bytes"] == values["fact_file_allocated_bytes"],
+        "OVF byte accounting differs from the fact file",
+        failures,
+    )
+    check(
+        values["combined_logical_bytes"]
+        == values["pgm_logical_bytes"] + values["ovf_logical_bytes"]
+        and values["combined_allocated_bytes"]
+        == values["pgm_allocated_bytes"] + values["ovf_allocated_bytes"],
+        "combined bytes do not equal PGM plus OVF",
+        failures,
+    )
+    check(
+        values["pgm_allocated_bytes"] >= values["pgm_logical_bytes"]
+        and values["ovf_allocated_bytes"] >= values["ovf_logical_bytes"],
+        "allocated PGM or OVF bytes are smaller than logical bytes",
+        failures,
+    )
     check(
         values["header_and_directory_bytes"] + values["stored_block_bytes"]
         == values["fact_file_logical_bytes"],
@@ -1660,16 +1700,18 @@ def validate_bdd_scenarios(
         actual.append((row.get("path"), row.get("name"), row.get("postgres")))
     check(
         tuple(actual) == BDD_SCENARIOS,
-        "final artifact does not name the exact PostgreSQL 15-18 timeline and lifecycle scenarios",
+        "final artifact does not name the exact PostgreSQL 15-18 timeline, lifecycle and PGM scenarios",
         failures,
     )
-    for path, name, _version in BDD_SCENARIOS:
+    for path, name, version in BDD_SCENARIOS:
         source = repo_root / path
         check(source.is_file(), f"BDD feature is absent: {path}", failures)
         if source.is_file():
             text = source.read_text(encoding="utf-8")
+            outline = name.replace(f"PostgreSQL {version}", "PostgreSQL <major>")
             check(
-                f"Scenario: {name}" in text,
+                f"Scenario: {name}" in text
+                or f"Scenario Outline: {outline}" in text,
                 f"BDD scenario is absent from {path}: {name}",
                 failures,
             )
@@ -1835,6 +1877,7 @@ def main() -> int:
         "budgets",
         "modes",
         "compact_performance",
+        "pgm_compaction",
         "acceptance",
         "limitations",
     }
@@ -1842,7 +1885,7 @@ def main() -> int:
         top_level_fields.add("final_ci")
     exact_fields(artifact, top_level_fields, "parity-v1 evidence artifact", failures)
     check(
-        artifact.get("schema") == "pgkronika-overview-parity-v1-evidence-v2",
+        artifact.get("schema") == "pgkronika-overview-parity-v1-evidence-v3",
         "wrong artifact schema",
         failures,
     )
@@ -1899,6 +1942,11 @@ def main() -> int:
         args.final,
         failures,
     )
+    as_mapping(
+        artifact.get("pgm_compaction"),
+        "PGM compaction qualification profile",
+        failures,
+    )
     validate_acceptance(
         as_list(artifact.get("acceptance"), "acceptance dossier", failures),
         final=args.final,
@@ -1908,6 +1956,7 @@ def main() -> int:
     limitations = as_list(artifact.get("limitations"), "limitations", failures)
     expected_limitations = {
         "storage-cold/page-cache-cold is not measured or claimed",
+        "seal RSS is fresh-process high-water, not an isolated allocator delta",
         "deployment size budgets remain owner-deferred unless both approved values are configured",
         "charts remain owner-deferred and are absent from the qualification datasets",
         "the final PASS is assigned only by the same-head same-attempt CI acceptance job",

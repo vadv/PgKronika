@@ -38,6 +38,16 @@ BDD_SCENARIOS = [
         }
         for version in range(15, 19)
     ],
+    *[
+        {
+            "path": "crates/kronika-bdd/features/pgm_compaction.feature",
+            "name": (
+                f"PostgreSQL {version} publishes and serves one compact two-window PGM"
+            ),
+            "postgres": version,
+        }
+        for version in range(15, 19)
+    ],
 ]
 
 RAW_FIELDS = {
@@ -53,6 +63,7 @@ RAW_FIELDS = {
     "budgets",
     "modes",
     "compact_performance",
+    "pgm_compaction",
     "acceptance",
     "limitations",
 }
@@ -114,8 +125,8 @@ def final_artifact(
     raw_digest: str,
 ) -> dict[str, object]:
     if set(raw) != RAW_FIELDS:
-        raise ValueError("raw artifact does not match the exact v2 schema")
-    if raw.get("schema") != "pgkronika-overview-parity-v1-evidence-v2":
+        raise ValueError("raw artifact does not match the exact v3 schema")
+    if raw.get("schema") != "pgkronika-overview-parity-v1-evidence-v3":
         raise ValueError("raw artifact has the wrong schema")
     if raw.get("git_head") != exact_head:
         raise ValueError("raw artifact head differs from the requested exact head")

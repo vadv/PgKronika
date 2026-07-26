@@ -28,6 +28,9 @@ VALIDATOR = load_script(
 FINALIZER = load_script(
     "finalize-overview-qualification.py", "overview_qualification_finalizer"
 )
+PGM_VALIDATOR = load_script(
+    "validate-pgm-size-reduction.py", "pgm_size_reduction_validator"
+)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -478,6 +481,129 @@ class CompactPerformanceValidationTests(unittest.TestCase):
                 self.assertIn(expected_failure, failures)
 
 
+def pgm_release_profile() -> dict[str, object]:
+    sample = {
+        "wall_ns": 100,
+        "cpu_ns": 80,
+        "process_peak_rss_bytes": 4096,
+        "proc_io": {
+            "rchar": 200,
+            "wchar": 100,
+            "syscr": 2,
+            "syscw": 2,
+            "read_bytes": 0,
+            "write_bytes": 4096,
+            "cancelled_write_bytes": 0,
+        },
+        "source_journal_bytes": 200,
+        "pgm_logical_bytes": 20,
+        "pgm_allocated_bytes": 4096,
+        "spill_bytes": 80,
+        "writer_write_bytes": 100,
+        "write_amplification_numerator": 100,
+        "write_amplification_denominator": 20,
+        "admitted_memory_bytes": 1024,
+        "sections": 3,
+        "rows": 1441,
+        "pgm_sha256": "d" * 64,
+        "exact_source_facts_equal": True,
+        "reader_reopen_equal": True,
+    }
+    samples = [
+        copy.deepcopy(sample) for _ in range(PGM_VALIDATOR.RELEASE_ITERATIONS)
+    ]
+    return {
+        "production_path": (
+            "kronika_writer::Journal -> seal -> kronika_reader::PgmUnit"
+        ),
+        "output_name": "1000000.pgm",
+        "input_parts": 40,
+        "registered_layouts": 75,
+        "all_family_exact_equality": {
+            "gate_passed": True,
+            "fixture_classes": [
+                "dense",
+                "reset-heavy",
+                "nullable-heavy",
+                "short-tail",
+            ],
+            "test_binary": "kronika-reader::pgm_compaction_oracle",
+            "test_path": "crates/kronika-reader/tests/pgm_compaction_oracle.rs",
+            "roundtrip_test": (
+                "every_registered_layout_roundtrips_all_fixture_classes_exactly"
+            ),
+            "determinism_test": (
+                "all_layout_bytes_are_deterministic_under_window_reordering"
+            ),
+        },
+        "seal_iterations": PGM_VALIDATOR.RELEASE_ITERATIONS,
+        "seal_wall_p50_ns": 100,
+        "seal_wall_p95_ns": 100,
+        "seal_wall_p99_ns": 100,
+        "seal_cpu_p50_ns": 80,
+        "seal_cpu_p95_ns": 80,
+        "seal_cpu_p99_ns": 80,
+        "seal_peak_rss_bytes": 4096,
+        "samples": samples,
+    }
+
+
+def pgm_release_storage_artifact() -> dict[str, object]:
+    return {
+        "pgm_compaction": pgm_release_profile(),
+        "fixture": {
+            "schema_version": "overview-dense-hour-v3",
+            "source_bytes": 20,
+        },
+        "accounting": {
+            "pgm_logical_bytes": 20,
+            "pgm_allocated_bytes": 4096,
+            "ovf_logical_bytes": 80,
+            "ovf_allocated_bytes": 4096,
+            "combined_logical_bytes": 100,
+            "combined_allocated_bytes": 8192,
+            "fact_file_logical_bytes": 80,
+            "fact_file_allocated_bytes": 4096,
+        },
+        "modes": [
+            mode_row(mode, iterations=PGM_VALIDATOR.RELEASE_ITERATIONS)
+            for mode in VALIDATOR.MODES
+        ],
+    }
+
+
+class PgmReleaseValidationTests(unittest.TestCase):
+    def test_production_profile_and_separate_pgm_ovf_accounting_pass(self) -> None:
+        PGM_VALIDATOR.check_release_pgm_profile(
+            {"pgm_compaction": pgm_release_profile()}
+        )
+        PGM_VALIDATOR.check_release_storage_and_queries(
+            pgm_release_storage_artifact()
+        )
+
+    def test_writer_write_amplification_tamper_is_rejected(self) -> None:
+        profile = pgm_release_profile()
+        profile["samples"][0]["writer_write_bytes"] = 99
+        with self.assertRaisesRegex(SystemExit, "spill plus PGM"):
+            PGM_VALIDATOR.check_release_pgm_profile(
+                {"pgm_compaction": profile}
+            )
+
+    def test_all_family_gate_tamper_is_rejected(self) -> None:
+        profile = pgm_release_profile()
+        profile["all_family_exact_equality"]["gate_passed"] = False
+        with self.assertRaisesRegex(SystemExit, "all-family exact-equality gate"):
+            PGM_VALIDATOR.check_release_pgm_profile(
+                {"pgm_compaction": profile}
+            )
+
+    def test_combined_storage_tamper_is_rejected(self) -> None:
+        artifact = pgm_release_storage_artifact()
+        artifact["accounting"]["combined_logical_bytes"] = 281
+        with self.assertRaisesRegex(SystemExit, "PGM plus OVF byte totals"):
+            PGM_VALIDATOR.check_release_storage_and_queries(artifact)
+
+
 class AcceptanceEvidenceTests(unittest.TestCase):
     def test_exact_evidence_manifest_resolves_to_real_tests(self) -> None:
         failures: list[str] = []
@@ -509,7 +635,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
 
 def raw_finalization_input() -> dict[str, object]:
     return {
-        "schema": "pgkronika-overview-parity-v1-evidence-v2",
+        "schema": "pgkronika-overview-parity-v1-evidence-v3",
         "git_head": "a" * 40,
         "git_dirty": False,
         "generated_unix_ms": 1,
@@ -527,6 +653,7 @@ def raw_finalization_input() -> dict[str, object]:
         "budgets": {},
         "modes": [],
         "compact_performance": compact_performance_profile(iterations=20),
+        "pgm_compaction": {},
         "acceptance": acceptance_rows(),
         "limitations": [],
     }
@@ -552,7 +679,7 @@ class FinalizationTests(unittest.TestCase):
         self.assertTrue(
             all(row["decision"] == "PASS" for row in final["acceptance"])
         )
-        self.assertEqual(len(final["final_ci"]["bdd_scenarios"]), 8)
+        self.assertEqual(len(final["final_ci"]["bdd_scenarios"]), 12)
         self.assertEqual(
             {
                 row["path"] for row in final["final_ci"]["bdd_scenarios"]
@@ -560,6 +687,7 @@ class FinalizationTests(unittest.TestCase):
             {
                 "crates/kronika-bdd/features/timeline_overview.feature",
                 "crates/kronika-bdd/features/timeline_web_lifecycle.feature",
+                "crates/kronika-bdd/features/pgm_compaction.feature",
             },
         )
 
@@ -577,7 +705,7 @@ class FinalizationTests(unittest.TestCase):
     def test_foreign_raw_field_is_rejected(self) -> None:
         raw = raw_finalization_input()
         raw["final_ci"] = {}
-        with self.assertRaisesRegex(ValueError, "exact v2 schema"):
+        with self.assertRaisesRegex(ValueError, "exact v3 schema"):
             FINALIZER.final_artifact(
                 raw,
                 exact_head="a" * 40,
@@ -654,7 +782,7 @@ class FinalizationTests(unittest.TestCase):
             failures=failures,
         )
         self.assertIn(
-            "final artifact does not name the exact PostgreSQL 15-18 timeline and lifecycle scenarios",
+            "final artifact does not name the exact PostgreSQL 15-18 timeline, lifecycle and PGM scenarios",
             failures,
         )
 
@@ -664,6 +792,12 @@ class AccountingAndChecksumTests(unittest.TestCase):
         failures: list[str] = []
         VALIDATOR.validate_accounting(
             {
+                "pgm_logical_bytes": 200,
+                "pgm_allocated_bytes": 4096,
+                "ovf_logical_bytes": 100,
+                "ovf_allocated_bytes": 4096,
+                "combined_logical_bytes": 300,
+                "combined_allocated_bytes": 8192,
                 "fact_file_logical_bytes": 100,
                 "fact_file_allocated_bytes": 4096,
                 "header_and_directory_bytes": 20,

@@ -80,22 +80,25 @@ jobs:
         with:
           ref: ${{ env.EXACT_SOURCE_HEAD }}
       - uses: Swatinem/rust-cache@v2
-      - name: Measure exact-head dense-hour modes
+      - name: Measure exact-head PGM and dense-hour modes
         run: |
           command -v strace
           python3 scripts/test_validate_overview_qualification.py
+          cargo test --release -p kronika-reader --test pgm_compaction_oracle
+          export PGM_ALL_FAMILY_EXACT_GATE=passed
           cargo run --release --manifest-path bins/pg_kronika-web/Cargo.toml --example overview_parity_qualification --features qualification -- --output target/qualification/overview.raw.json
+          python3 scripts/validate-pgm-size-reduction.py --release target/qualification/overview.raw.json "${EXACT_SOURCE_HEAD}"
           python3 scripts/validate-overview-qualification.py target/qualification/overview.raw.json --exact-head "${EXACT_SOURCE_HEAD}" --output target/qualification/validation.preliminary.json
           sha256sum target/qualification/overview.raw.json > target/qualification/overview.raw.json.sha256
           sha256sum target/qualification/validation.preliminary.json > target/qualification/validation.preliminary.json.sha256
           {
-            echo '## Overview qualification measurements'
+            echo '## PGM and overview qualification measurements'
             echo
             echo "- exact head: \`${EXACT_SOURCE_HEAD}\`"
             echo "- run attempt: \`${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}\`"
             echo "- raw artifact: \`overview-qualification-raw\`"
             echo
-            echo 'Nine production endpoint modes plus the §18.4.6 compact performance profile, with raw process, I/O, syscall, accounting, concurrency, recovery, and latency evidence, passed preliminary validation.'
+            echo 'The production PGM writer/reader, all-75-layout oracle, bounded spill seal profile, separate PGM/OVF accounting, and nine endpoint modes passed preliminary validation with raw latency, CPU, RSS, I/O, concurrency, and recovery evidence.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
@@ -205,6 +208,8 @@ jobs:
           path: target/qualification
       - name: Bind parity evidence to this exact green attempt
         run: |
+          python3 scripts/validate-pgm-size-reduction.py \
+            --release target/qualification/overview.raw.json "${EXACT_SOURCE_HEAD}"
           python3 scripts/finalize-overview-qualification.py \
             target/qualification/overview.raw.json \
             --output target/qualification/overview.final.json \
@@ -234,7 +239,7 @@ jobs:
             echo "- artifact: \`overview-parity-acceptance\`"
             echo "- decision: **PASS**"
             echo
-            echo 'All 18 rows are IMPLEMENTED and bound to the six successful predecessor jobs, the PostgreSQL 15–18 scenarios, the raw measurement checksum, and this final artifact checksum.'
+            echo 'All 18 rows and the production PGM release profile are bound to the six successful predecessor jobs, the PostgreSQL 15–18 scenarios, the all-75-layout oracle, the raw measurement checksum, and this final artifact checksum.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:

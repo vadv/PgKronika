@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "pgkronika.pgm-size-reduction.measurements/v1"
+RELEASE_ITERATIONS = 20
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ALL_CONTRACT_TYPE_IDS_SHA256 = (
     "afc32c2386a0312906afbdc0931afce1a4fcb02fa148da780860bf9bba5fa231"
@@ -136,10 +137,9 @@ def check_format_contract(summary: dict[str, Any]) -> None:
         "candidate must remain the single PGM container",
     )
     require(
-        contract["compatibility"]
-        == "one current writer, one current reader, one contract; prior internal layout is "
-        "rejected without migration, fallback or toggle",
-        "candidate clean-break contract",
+        contract["implementation"]
+        == "one writer, one reader and one compact PGM contract",
+        "single PGM implementation contract",
     )
     serialized = json.dumps(summary, sort_keys=True)
     forbidden_parallel_name = "PGM" + "2"
@@ -586,7 +586,356 @@ def validate(path: Path) -> None:
         fail(f"invalid summary structure: {error}")
 
 
+def check_release_pgm_profile(artifact: dict[str, Any]) -> None:
+    profile = artifact["pgm_compaction"]
+    require(
+        set(profile)
+        == {
+            "production_path",
+            "output_name",
+            "input_parts",
+            "registered_layouts",
+            "all_family_exact_equality",
+            "seal_iterations",
+            "seal_wall_p50_ns",
+            "seal_wall_p95_ns",
+            "seal_wall_p99_ns",
+            "seal_cpu_p50_ns",
+            "seal_cpu_p95_ns",
+            "seal_cpu_p99_ns",
+            "seal_peak_rss_bytes",
+            "samples",
+        },
+        "release PGM profile fields",
+    )
+    require(
+        profile["production_path"]
+        == "kronika_writer::Journal -> seal -> kronika_reader::PgmUnit",
+        "release measurement bypasses the production writer or reader",
+    )
+    require(
+        profile["output_name"] == "1000000.pgm",
+        "release output is not the timestamp-named PGM",
+    )
+    require(profile["input_parts"] == 40, "release spill fixture input count")
+    require(profile["registered_layouts"] == 75, "registered layout count")
+
+    exact = profile["all_family_exact_equality"]
+    require(
+        exact
+        == {
+            "gate_passed": True,
+            "fixture_classes": [
+                "dense",
+                "reset-heavy",
+                "nullable-heavy",
+                "short-tail",
+            ],
+            "test_binary": "kronika-reader::pgm_compaction_oracle",
+            "test_path": "crates/kronika-reader/tests/pgm_compaction_oracle.rs",
+            "roundtrip_test": (
+                "every_registered_layout_roundtrips_all_fixture_classes_exactly"
+            ),
+            "determinism_test": (
+                "all_layout_bytes_are_deterministic_under_window_reordering"
+            ),
+        },
+        "all-family exact-equality gate identity",
+    )
+    repository_root = Path(__file__).resolve().parents[1]
+    oracle = (repository_root / exact["test_path"]).read_text(encoding="utf-8")
+    require(exact["roundtrip_test"] in oracle, "all-family roundtrip test is absent")
+    require(exact["determinism_test"] in oracle, "all-family determinism test is absent")
+
+    samples = profile["samples"]
+    require(
+        isinstance(samples, list)
+        and len(samples) == RELEASE_ITERATIONS
+        and profile["seal_iterations"] == len(samples),
+        f"release seal requires exactly {RELEASE_ITERATIONS} samples",
+    )
+    wall: list[int] = []
+    cpu: list[int] = []
+    digests: set[str] = set()
+    pgm_lengths: set[int] = set()
+    for sample in samples:
+        require(
+            set(sample)
+            == {
+                "wall_ns",
+                "cpu_ns",
+                "process_peak_rss_bytes",
+                "proc_io",
+                "source_journal_bytes",
+                "pgm_logical_bytes",
+                "pgm_allocated_bytes",
+                "spill_bytes",
+                "writer_write_bytes",
+                "write_amplification_numerator",
+                "write_amplification_denominator",
+                "admitted_memory_bytes",
+                "sections",
+                "rows",
+                "pgm_sha256",
+                "exact_source_facts_equal",
+                "reader_reopen_equal",
+            },
+            "release PGM sample fields",
+        )
+        for field in (
+            "wall_ns",
+            "cpu_ns",
+            "process_peak_rss_bytes",
+            "source_journal_bytes",
+            "pgm_logical_bytes",
+            "pgm_allocated_bytes",
+            "spill_bytes",
+            "writer_write_bytes",
+            "write_amplification_numerator",
+            "write_amplification_denominator",
+            "admitted_memory_bytes",
+            "sections",
+            "rows",
+        ):
+            require(
+                isinstance(sample[field], int) and sample[field] > 0,
+                f"release PGM sample {field}",
+            )
+        require(sample["sections"] == 3, "release PGM section count")
+        require(sample["rows"] == 1_441, "release PGM row count")
+        require(
+            sample["spill_bytes"] + sample["pgm_logical_bytes"]
+            == sample["writer_write_bytes"],
+            "writer bytes are not spill plus PGM",
+        )
+        require(
+            sample["write_amplification_numerator"] == sample["writer_write_bytes"]
+            and sample["write_amplification_denominator"]
+            == sample["pgm_logical_bytes"],
+            "write-amplification rational",
+        )
+        require(
+            sample["pgm_allocated_bytes"] >= sample["pgm_logical_bytes"],
+            "allocated PGM bytes are smaller than logical bytes",
+        )
+        require(
+            sample["source_journal_bytes"] > sample["pgm_logical_bytes"],
+            "release fixture does not demonstrate compaction",
+        )
+        require(
+            sample["exact_source_facts_equal"] is True
+            and sample["reader_reopen_equal"] is True,
+            "production PGM semantic or reopen equality",
+        )
+        require(SHA256.fullmatch(sample["pgm_sha256"]) is not None, "release PGM digest")
+        proc_io = sample["proc_io"]
+        require(
+            set(proc_io)
+            == {
+                "rchar",
+                "wchar",
+                "syscr",
+                "syscw",
+                "read_bytes",
+                "write_bytes",
+                "cancelled_write_bytes",
+            },
+            "release seal process I/O fields",
+        )
+        require(
+            all(isinstance(value, int) and value >= 0 for value in proc_io.values()),
+            "release seal process I/O values",
+        )
+        require(
+            proc_io["wchar"] >= sample["writer_write_bytes"]
+            and proc_io["syscw"] > 0
+            and proc_io["write_bytes"] > 0,
+            "seal process write accounting is below writer bytes",
+        )
+        wall.append(sample["wall_ns"])
+        cpu.append(sample["cpu_ns"])
+        digests.add(sample["pgm_sha256"])
+        pgm_lengths.add(sample["pgm_logical_bytes"])
+
+    require(len(digests) == len(pgm_lengths) == 1, "release PGM is not deterministic")
+    require(
+        profile["seal_wall_p50_ns"] == nearest_rank(wall, 0.50)
+        and profile["seal_wall_p95_ns"] == nearest_rank(wall, 0.95)
+        and profile["seal_wall_p99_ns"] == nearest_rank(wall, 0.99),
+        "seal wall distributions",
+    )
+    require(
+        profile["seal_cpu_p50_ns"] == nearest_rank(cpu, 0.50)
+        and profile["seal_cpu_p95_ns"] == nearest_rank(cpu, 0.95)
+        and profile["seal_cpu_p99_ns"] == nearest_rank(cpu, 0.99),
+        "seal CPU distributions",
+    )
+    require(
+        profile["seal_peak_rss_bytes"]
+        == max(sample["process_peak_rss_bytes"] for sample in samples),
+        "seal RSS maximum",
+    )
+
+
+def check_release_storage_and_queries(artifact: dict[str, Any]) -> None:
+    fixture = artifact["fixture"]
+    accounting = artifact["accounting"]
+    seal_samples = artifact["pgm_compaction"]["samples"]
+    require(
+        fixture["schema_version"] == "overview-dense-hour-v3",
+        "release fixture schema",
+    )
+    require(
+        accounting["pgm_logical_bytes"] == fixture["source_bytes"],
+        "profile PGM bytes differ from the production fixture",
+    )
+    require(
+        all(
+            sample["pgm_logical_bytes"] == accounting["pgm_logical_bytes"]
+            for sample in seal_samples
+        ),
+        "timestamp-named PGM bytes differ from the query and OVF source",
+    )
+    require(
+        accounting["ovf_logical_bytes"] == accounting["fact_file_logical_bytes"]
+        and accounting["ovf_allocated_bytes"]
+        == accounting["fact_file_allocated_bytes"],
+        "OVF bytes differ from the fact file",
+    )
+    require(
+        accounting["combined_logical_bytes"]
+        == accounting["pgm_logical_bytes"] + accounting["ovf_logical_bytes"]
+        and accounting["combined_allocated_bytes"]
+        == accounting["pgm_allocated_bytes"] + accounting["ovf_allocated_bytes"],
+        "PGM plus OVF byte totals",
+    )
+    require(
+        accounting["pgm_allocated_bytes"] >= accounting["pgm_logical_bytes"]
+        and accounting["ovf_allocated_bytes"] >= accounting["ovf_logical_bytes"],
+        "allocated release storage bytes",
+    )
+
+    modes = {mode["mode"]: mode for mode in artifact["modes"]}
+    require(
+        set(modes)
+        == {
+            "derived-cold",
+            "restart-warm",
+            "process-hot",
+            "range-cold/facts-warm",
+            "live",
+            "concurrent-identical",
+            "concurrent-disjoint",
+            "memory-only",
+            "oracle-profile",
+        },
+        "release query mode inventory",
+    )
+    for name in ("derived-cold", "restart-warm", "process-hot", "oracle-profile"):
+        mode = modes[name]
+        require(
+            mode["iterations"] == RELEASE_ITERATIONS
+            and len(mode["samples"]) == RELEASE_ITERATIONS,
+            f"{name} release sample count",
+        )
+        require(
+            mode["wall_p50_ns"] > 0
+            and mode["wall_p95_ns"] > 0
+            and mode["cpu_p50_ns"] >= 0
+            and mode["peak_rss_bytes"] > 0,
+            f"{name} latency/resource measurement",
+        )
+        require(mode["samples"], f"{name} samples")
+        for sample in mode["samples"]:
+            require(
+                sample["proc_io"]["rchar"] > 0 and sample["proc_io"]["syscr"] > 0,
+                f"{name} process I/O measurement",
+            )
+    derived = modes["derived-cold"]["samples"]
+    require(
+        all(
+            sample["work"]["pgm_body_reads"] > 0
+            and sample["work"]["pgm_body_bytes"] > 0
+            and sample["work"]["sidecar_writes"] == 1
+            and sample["work"]["sidecar_write_bytes"]
+            == accounting["ovf_logical_bytes"]
+            for sample in derived
+        ),
+        "derived-cold does not measure production PGM to OVF",
+    )
+    restart = modes["restart-warm"]["samples"]
+    require(
+        all(
+            sample["work"]["pgm_body_reads"] == 0
+            and sample["work"]["fact_reads"] > 0
+            and sample["work"]["fact_stored_bytes"] > 0
+            and sample["work"]["sidecar_writes"] == 0
+            for sample in restart
+        ),
+        "restart-warm does not measure OVF reuse separately",
+    )
+    hot = modes["process-hot"]["samples"]
+    require(
+        all(
+            sample["work"]["pgm_body_reads"] == 0
+            and sample["work"]["fact_reads"] == 0
+            and sample["work"]["sidecar_writes"] == 0
+            for sample in hot
+        ),
+        "process-hot query performed storage I/O",
+    )
+    oracle = modes["oracle-profile"]["samples"]
+    require(
+        all(
+            sample["work"]["pgm_body_reads"] > 0
+            and sample["work"]["fact_reads"] > 0
+            and sample["work"]["successful_responses"] == 2
+            for sample in oracle
+        ),
+        "oracle profile does not compare raw PGM and OVF query paths",
+    )
+
+
+def validate_release(path: Path, exact_head: str | None) -> None:
+    try:
+        artifact = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=object_without_duplicate_keys,
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        fail(str(error))
+    try:
+        require(isinstance(artifact, dict), "release artifact root must be an object")
+        require(
+            artifact.get("schema") == "pgkronika-overview-parity-v1-evidence-v3",
+            "unknown release artifact schema",
+        )
+        require(artifact.get("git_dirty") is False, "release artifact came from a dirty tree")
+        head = artifact.get("git_head")
+        require(
+            isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head) is not None,
+            "release artifact git head",
+        )
+        if exact_head is not None:
+            require(head == exact_head, "release artifact head differs from requested exact head")
+        check_digest_and_path_hygiene(artifact)
+        check_release_pgm_profile(artifact)
+        check_release_storage_and_queries(artifact)
+    except (KeyError, TypeError, ValueError) as error:
+        fail(f"invalid release artifact structure: {error}")
+
+
 def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--release":
+        require(
+            3 <= len(sys.argv) <= 4,
+            "usage: validate-pgm-size-reduction.py --release ARTIFACT.json [EXACT_HEAD]",
+        )
+        path = Path(sys.argv[2])
+        exact_head = sys.argv[3] if len(sys.argv) == 4 else None
+        validate_release(path, exact_head)
+        print(f"validated production PGM release artifact {path}")
+        return
     require(len(sys.argv) <= 2, "usage: validate-pgm-size-reduction.py [SUMMARY.json]")
     path = Path(sys.argv[1]) if len(sys.argv) == 2 else DEFAULT_SUMMARY
     validate(path)

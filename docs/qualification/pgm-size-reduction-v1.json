@@ -19,7 +19,7 @@
   },
   "updated_pgm_contract": {
     "container": "PGM, replaced in place; sealed path remains N.pgm",
-    "compatibility": "one current writer, one current reader, one contract; prior internal layout is rejected without migration, fallback or toggle",
+    "implementation": "one writer, one reader and one compact PGM contract",
     "scope": "all data and dictionary sections",
     "data_sections": "one section per populated type_id",
     "dictionary_sections": "at most one dict.strings and one dict.blobs section",
