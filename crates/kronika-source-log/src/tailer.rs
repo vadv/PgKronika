@@ -459,7 +459,11 @@ fn seek_next_data(file: &File, offset: u64, file_size: u64) -> io::Result<Option
 }
 
 #[cfg(not(target_os = "linux"))]
-fn seek_next_data(_file: &File, offset: u64, file_size: u64) -> io::Result<Option<u64>> {
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the platform shim keeps the Linux implementation signature"
+)]
+const fn seek_next_data(_file: &File, offset: u64, file_size: u64) -> io::Result<Option<u64>> {
     if offset >= file_size {
         Ok(None)
     } else {

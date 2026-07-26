@@ -114,7 +114,7 @@ pub(crate) async fn only_source(dir: &Path) -> Result<u64> {
     }
 }
 
-/// The PostgreSQL log status nested under the only `/v1/sources` row.
+/// The `PostgreSQL` log status nested under the only `/v1/sources` row.
 pub(crate) async fn only_pg_log_status(dir: &Path) -> Result<Value> {
     let response = request(dir, "/v1/sources", &[]).await?;
     anyhow::ensure!(

@@ -2348,7 +2348,7 @@ git commit -m "test(bdd): cover PostgreSQL log discovery and rotation"
 - Consumes: implemented env defaults, exact state/reason codes and API shape.
 - Produces: English/Russian operator reference that distinguishes quiet, degraded, unavailable and disabled collection.
 
-- [ ] **Step 1: Rewrite the collector source section from observed behavior**
+- [x] **Step 1: Rewrite the collector source section from observed behavior**
 
 Rename “Optional PostgreSQL log source” and
 “Необязательный источник журналов PostgreSQL” so they describe a default
@@ -2379,7 +2379,7 @@ Update the table rows exactly:
 Keep the existing tail caps and parser limitations. Do not add host-target test
 commands to either product README.
 
-- [ ] **Step 2: Document the registry contract and compatibility**
+- [x] **Step 2: Document the registry contract and compatibility**
 
 In `docs/type-registry.md`, extend the PostgreSQL range to
 `1_001_001–1_039_001`.
@@ -2402,7 +2402,7 @@ Add concise matching rows to both registry README files. Use
 “записывает” or “завершает часть” in Russian prose; do not use
 “запечатывает”.
 
-- [ ] **Step 3: Review English/Russian parity and factual wording**
+- [x] **Step 3: Review English/Russian parity and factual wording**
 
 Perform four passes:
 

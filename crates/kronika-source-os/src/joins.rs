@@ -397,6 +397,7 @@ pub fn map_postgresql_storage(
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
@@ -568,6 +569,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn maps_relative_wal_symlink_to_the_longest_local_mount() {
         let root = tempdir().expect("fixture root");

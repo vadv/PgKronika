@@ -155,7 +155,7 @@ fn read_io_with_fs_creds(fs: &ProcFs, rel: &str, uid: u32, gid: u32) -> Option<P
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_io_with_fs_creds(_fs: &ProcFs, _rel: &str, _uid: u32, _gid: u32) -> Option<ProcIo> {
+const fn read_io_with_fs_creds(_fs: &ProcFs, _rel: &str, _uid: u32, _gid: u32) -> Option<ProcIo> {
     None
 }
 

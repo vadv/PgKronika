@@ -799,15 +799,13 @@ impl LogCollector {
         state: LogSourceState,
         reason: LogSourceReason,
     ) -> LogSourceStatus {
-        let (parser_kind, source_path) = if let Some(source) = &self.source {
-            (source.parser_kind, Some(source.path.clone()))
-        } else if let Some(path) = &self.config.path_override {
-            (self.config.parser_kind, Some(path.clone()))
-        } else if let Some(state) = &self.state {
-            (state.parser_kind, Some(state.path.clone()))
-        } else {
-            (self.config.parser_kind, None)
-        };
+        let (parser_kind, source_path) =
+            match (&self.source, &self.config.path_override, &self.state) {
+                (Some(source), _, _) => (source.parser_kind, Some(source.path.clone())),
+                (None, Some(path), _) => (self.config.parser_kind, Some(path.clone())),
+                (None, None, Some(state)) => (state.parser_kind, Some(state.path.clone())),
+                (None, None, None) => (self.config.parser_kind, None),
+            };
         LogSourceStatus {
             ts,
             state,
@@ -834,8 +832,9 @@ impl LogCollector {
             };
             collection.gaps.push(self.simple_gap(ts, reason));
         }
-        collection.source_status = update.row.clone();
-        collection.previous_source_status = update.row.as_ref().and(update.previous.clone());
+        collection.source_status.clone_from(&update.row);
+        collection.previous_source_status =
+            update.row.as_ref().and_then(|_| update.previous.clone());
         collection.source_status_changed = update.row.is_some() && update.changed;
         collection.next_discovery_in = self
             .next_discovery
@@ -888,7 +887,7 @@ const fn readable_status(discovery: DiscoveryStatus) -> (LogSourceState, LogSour
     }
 }
 
-fn read_error_status(kind: io::ErrorKind) -> (LogSourceState, LogSourceReason) {
+const fn read_error_status(kind: io::ErrorKind) -> (LogSourceState, LogSourceReason) {
     let reason = match kind {
         io::ErrorKind::NotFound => LogSourceReason::MissingFile,
         io::ErrorKind::PermissionDenied => LogSourceReason::PermissionDenied,
@@ -2289,7 +2288,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = LogConfig::disabled(dir.path());
         config.enabled = true;
-        config.discovery_interval = Duration::from_secs(60);
+        config.discovery_interval = Duration::from_mins(1);
         let mut collector = LogCollector::new(config).expect("collector");
         let now = Instant::now();
 

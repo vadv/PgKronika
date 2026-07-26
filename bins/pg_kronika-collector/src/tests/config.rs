@@ -24,7 +24,7 @@ fn explicit_false_disables_pg_log_independently_of_a_path_override() {
 fn pg_log_status_interval_defaults_to_five_minutes() {
     assert_eq!(
         resolve_log_status_interval(None).expect("default status interval"),
-        Duration::from_secs(300)
+        Duration::from_mins(5)
     );
 }
 

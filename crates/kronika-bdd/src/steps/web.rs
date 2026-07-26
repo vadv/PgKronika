@@ -80,7 +80,7 @@ async fn web_locale_neutral_problem(world: &mut BddWorld) -> Result<()> {
     web::assert_locale_neutral_problem(dir).await
 }
 
-/// Assert `/v1/sources` reports successful default PostgreSQL log collection.
+/// Assert `/v1/sources` reports successful default `PostgreSQL` log collection.
 #[then("the web API reports PostgreSQL log state collecting for the only source")]
 async fn web_pg_log_collecting(world: &mut BddWorld) -> Result<()> {
     let segment = world.harness.segment()?.clone();

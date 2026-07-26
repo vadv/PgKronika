@@ -23,7 +23,7 @@ use kronika_source_log::{
 };
 use kronika_writer::{Interner, Journal, SectionBuffers};
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_postgres::Client;
 
 pub(crate) async fn run_log_only_cycle(
@@ -128,43 +128,48 @@ pub(crate) async fn collect_log_batch(
     if collection.source_status.is_some() {
         log_collection_finish(PG_LOG_SOURCE_STATUS_TYPE_ID, "log", 1, started.elapsed());
     }
-    if let (Some(level), Some(status)) = (
-        source_status_log_level(&collection),
-        collection.source_status.as_ref(),
-    ) {
-        let previous = collection
-            .previous_source_status
-            .as_ref()
-            .map_or("unknown", |status| status.state.as_str());
-        let source_path = status
-            .source_path
-            .as_ref()
-            .map_or_else(String::new, |path| path.display().to_string());
-        let next_discovery_ms = collection.next_discovery_in.map(duration_ms).unwrap_or(0);
-        log_event(
-            level,
-            "pg_log_discovery",
-            &[
-                field("previous_state", previous),
-                field("state", status.state.as_str()),
-                field("reason", status.reason.as_str()),
-                field("parser", status.parser_kind.as_str()),
-                field("source_path", source_path.as_str()),
-                field("next_discovery_ms", next_discovery_ms),
-                field("error_rows", collection.errors.len()),
-                field("checkpoint_rows", collection.checkpoints.len()),
-                field("autovacuum_rows", collection.autovacuums.len()),
-                field("slow_query_rows", collection.slow_queries.len()),
-                field("lock_wait_rows", collection.lock_waits.len()),
-                field("lifecycle_rows", collection.lifecycles.len()),
-                field("temp_file_rows", collection.temp_files.len()),
-                field("gap_rows", collection.gaps.len()),
-                field("source_status_rows", 1_usize),
-                field("elapsed_ms", duration_ms(started.elapsed())),
-            ],
-        );
-    }
+    log_source_status_event(&collection, started.elapsed());
     collection
+}
+
+fn log_source_status_event(collection: &LogCollection, elapsed: Duration) {
+    let (Some(level), Some(status)) = (
+        source_status_log_level(collection),
+        collection.source_status.as_ref(),
+    ) else {
+        return;
+    };
+    let previous = collection
+        .previous_source_status
+        .as_ref()
+        .map_or("unknown", |status| status.state.as_str());
+    let source_path = status
+        .source_path
+        .as_ref()
+        .map_or_else(String::new, |path| path.display().to_string());
+    let next_discovery_ms = collection.next_discovery_in.map_or(0, duration_ms);
+    log_event(
+        level,
+        "pg_log_discovery",
+        &[
+            field("previous_state", previous),
+            field("state", status.state.as_str()),
+            field("reason", status.reason.as_str()),
+            field("parser", status.parser_kind.as_str()),
+            field("source_path", source_path.as_str()),
+            field("next_discovery_ms", next_discovery_ms),
+            field("error_rows", collection.errors.len()),
+            field("checkpoint_rows", collection.checkpoints.len()),
+            field("autovacuum_rows", collection.autovacuums.len()),
+            field("slow_query_rows", collection.slow_queries.len()),
+            field("lock_wait_rows", collection.lock_waits.len()),
+            field("lifecycle_rows", collection.lifecycles.len()),
+            field("temp_file_rows", collection.temp_files.len()),
+            field("gap_rows", collection.gaps.len()),
+            field("source_status_rows", 1_usize),
+            field("elapsed_ms", duration_ms(elapsed)),
+        ],
+    );
 }
 
 pub(crate) const fn source_status_log_level(collection: &LogCollection) -> Option<LogLevel> {

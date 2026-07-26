@@ -55,7 +55,9 @@ fn parse_btime(stat: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_os_instance_facts, parse_btime};
+    #[cfg(target_os = "linux")]
+    use super::collect_os_instance_facts;
+    use super::parse_btime;
 
     #[test]
     fn parse_btime_finds_the_line_between_others() {
@@ -80,6 +82,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn collect_reads_the_live_host() {
         let facts = collect_os_instance_facts().expect("running on Linux with /proc");

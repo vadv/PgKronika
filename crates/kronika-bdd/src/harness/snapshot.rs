@@ -42,7 +42,7 @@ pub(crate) async fn take(state: &mut HarnessState) -> Result<PathBuf> {
     Ok(segment)
 }
 
-/// Run timer-driven log collection across a real PostgreSQL stderr rotation,
+/// Run timer-driven log collection across a real `PostgreSQL` stderr rotation,
 /// then seal both source-status transitions into one segment.
 pub(crate) async fn take_across_log_rotation(state: &mut HarnessState) -> Result<PathBuf> {
     let cluster = state.cluster()?;
@@ -72,8 +72,8 @@ pub(crate) async fn take_across_log_rotation(state: &mut HarnessState) -> Result
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?;
-    let until_next_second =
-        Duration::from_secs(1) - Duration::from_nanos(u64::from(elapsed.subsec_nanos()));
+    let until_next_second = Duration::from_secs(1)
+        .saturating_sub(Duration::from_nanos(u64::from(elapsed.subsec_nanos())));
     sleep(until_next_second + Duration::from_millis(50)).await;
 
     let rotated: bool = connection

@@ -3,9 +3,10 @@
 [Русская версия](README.ru.md)
 
 `pg_kronika-collector` is the only process that connects to PostgreSQL and
-writes PGM data. It reads due PostgreSQL, Linux, cgroup, and optional stderr-log
-sources, appends one bounded collection window to `active.parts`, and seals the
-journal into `<first_timestamp>.pgm` when a rotation condition fires.
+writes PGM data. It reads due PostgreSQL, Linux, cgroup, and PostgreSQL
+stderr-log sources, appends one bounded collection window to `active.parts`,
+and seals the journal into `<first_timestamp>.pgm` when a rotation condition
+fires.
 
 The daemon prints `ready` and `sealed ...` state changes to stdout. Structured
 logfmt diagnostics go to stderr. A failed collection cycle is logged and
@@ -109,17 +110,42 @@ above its base disables that trigger.
 `SIGINT` stop the loop; any already synchronized journal frames remain for
 recovery and are sealed on the next start.
 
-## Optional PostgreSQL log source
+## PostgreSQL log source
+
+PostgreSQL log collection is enabled by default. Unless `KRONIKA_LOG_PATH` is
+set, each discovery attempt checks that `SHOW log_destination` contains
+`stderr`, then calls `pg_current_logfile('stderr')`. A relative result is
+resolved against `SHOW data_directory`, or against `KRONIKA_LOG_ROOT` when that
+override is set.
+
+The collector reports the outcome in `pg_log_source_status`:
+
+| `state` | Meaning |
+| --- | --- |
+| `collecting` | The supported file was opened and processed. This is also the result for a readable file with no new lines. |
+| `collecting_degraded` | The last known file was processed, but discovery could not be refreshed because no PostgreSQL client was available or the discovery query failed. Reading succeeded; this state alone does not prove data loss. |
+| `unavailable` | No supported file could be read. `reason` distinguishes `no_current_logfile`, `unsupported_format`, `missing_file`, `permission_denied`, `read_error`, and discovery failures without a known file. |
+| `disabled` | The operator explicitly set `KRONIKA_PG_LOG_ENABLED=0`. |
+
+A status row is written on the first observation, when the state, reason,
+parser, or path changes, and after the unchanged heartbeat interval. The latest
+row is exposed as the `pg_log` object in `GET /v1/sources`.
+
+The collector does not change PostgreSQL settings or file permissions. When no
+committed tail position exists, the first read of a newly discovered file
+starts at EOF. Set `KRONIKA_LOG_START_AT_BEGINNING=1` to read it from byte zero.
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `KRONIKA_PG_LOG_ENABLED` | true only when `KRONIKA_LOG_PATH` is set | Enable log collection. |
-| `KRONIKA_LOG_PATH` | unset | Explicit current log file. |
+| `KRONIKA_PG_LOG_ENABLED` | `true` | Attempt supported file-log discovery and reading; explicit `false` disables it. |
+| `KRONIKA_PG_LOG_INTERVAL_S` | `5` | Attempt to read the known file. |
+| `KRONIKA_LOG_DISCOVERY_INTERVAL_S` | `60` | Re-run PostgreSQL path discovery, including while no source exists. |
+| `KRONIKA_PG_LOG_STATUS_INTERVAL_S` | `300` | Emit an unchanged status heartbeat; must be greater than zero. |
+| `KRONIKA_LOG_PATH` | unset | Override the discovered path; does not override explicit disable. |
 | `KRONIKA_LOG_ROOT` | unset | Root used for PostgreSQL log discovery. |
 | `KRONIKA_LOG_FORMAT` | `stderr` | `stderr` is parsed; `csvlog` is accepted but reported as unsupported. |
 | `KRONIKA_LOG_STATE_PATH` | `<out>/pg_log_tail.state` | Durable tail position. |
 | `KRONIKA_LOG_START_AT_BEGINNING` | `false` | Start a newly discovered file at offset zero. |
-| `KRONIKA_LOG_DISCOVERY_INTERVAL_S` | `60` | Rediscovery interval. |
 
 The tailer applies fixed line, byte, time, backlog, and output caps. Rotation,
 truncation, binary input, backlog skips, and exhausted budgets become typed gap

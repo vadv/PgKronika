@@ -440,13 +440,13 @@ pub struct PgLogSourceStatusV1 {
     /// Observation time, unix microseconds.
     #[column(t)]
     pub ts: Ts,
-    /// `0` collecting, `1` collecting_degraded, `2` unavailable, `3` disabled.
+    /// `0` `collecting`, `1` `collecting_degraded`, `2` `unavailable`, `3` `disabled`.
     #[column(l)]
     pub state: u8,
-    /// `0` none through `7` read_error, as documented in the registry.
+    /// `0` `none` through `7` `read_error`, as documented in the registry.
     #[column(l)]
     pub reason: u8,
-    /// `0` stderr, `1` csvlog, `2` unknown.
+    /// `0` `stderr`, `1` `csvlog`, `2` `unknown`.
     #[column(l)]
     pub parser_kind: u8,
     /// Current or last known source path.

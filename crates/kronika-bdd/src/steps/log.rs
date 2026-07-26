@@ -15,7 +15,7 @@ fn stderr_log_fixture(world: &mut BddWorld, step: &Step) -> Result<()> {
     Ok(())
 }
 
-/// Keep one collector alive while PostgreSQL changes its current stderr file.
+/// Keep one collector alive while `PostgreSQL` changes its current stderr file.
 #[when("the running collector observes a PostgreSQL stderr log rotation")]
 async fn collector_observes_log_rotation(world: &mut BddWorld) -> Result<()> {
     snapshot::take_across_log_rotation(&mut world.harness).await?;
