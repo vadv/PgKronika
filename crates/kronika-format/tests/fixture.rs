@@ -5,14 +5,14 @@
 //! The bytes were generated independently from the documented layout and
 //! checked against the canonical CRC32C test vector.
 //!
-//! Layout of the 88-byte file:
+//! Layout of the 88-byte current-format file:
 //!
 //! ```text
-//!  0..4   magic "PGM1"
+//!  0..4   magic "PGMC"
 //!  4..8   section body 01 02 03 04 (opaque to the container)
 //!  8..40  catalog entry: type_id 1_006_001, offset 4, len 4, rows 1
 //! 40..80  catalog meta: ts 1_000_000..2_000_000, 1 entry, version 1
-//! 80..88  tail index: catalog_len 72, magic "PGM1"
+//! 80..88  tail index: catalog_len 72, magic "PGMC"
 //! ```
 
 use kronika_format::{Catalog, Entry, MAGIC, TAIL_INDEX_LEN, TailIndex, crc32c};
@@ -24,7 +24,18 @@ use sha2 as _;
 use tempfile as _;
 use xxhash_rust as _;
 
-const SEGMENT: &[u8] = include_bytes!("fixtures/minimal.pgm");
+// Kept as a literal so this test remains independent of the encoder. The
+// tracked `minimal.pgm` file is the deliberately obsolete pre-clean-break
+// fixture exercised below.
+const SEGMENT: &[u8] = &[
+    0x50, 0x47, 0x4d, 0x43, 0x01, 0x02, 0x03, 0x04, 0xb1, 0x59, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0xf4, 0x8c, 0x30, 0x29, 0x40, 0x42, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x80, 0x84, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x82, 0x90, 0x91, 0x37, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x00, 0x00, 0x00, 0x50, 0x47, 0x4d, 0x43,
+];
+const OBSOLETE_SEGMENT: &[u8] = include_bytes!("fixtures/minimal.pgm");
 
 #[test]
 fn fixture_decodes_to_expected_catalog() {
@@ -74,4 +85,14 @@ fn encode_reproduces_fixture_bytes_exactly() {
     // encode() returns catalog + tail index: everything after the last
     // section body.
     assert_eq!(catalog.encode(), &SEGMENT[catalog_start..]);
+}
+
+#[test]
+fn obsolete_fixture_is_rejected_without_a_legacy_decoder() {
+    assert_eq!(&OBSOLETE_SEGMENT[..4], b"PGM1");
+    let tail_bytes: [u8; TAIL_INDEX_LEN] =
+        OBSOLETE_SEGMENT[OBSOLETE_SEGMENT.len() - TAIL_INDEX_LEN..]
+            .try_into()
+            .expect("fixed-size tail");
+    assert!(TailIndex::decode(tail_bytes).is_err());
 }

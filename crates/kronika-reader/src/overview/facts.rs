@@ -3067,18 +3067,19 @@ mod tests {
 
     #[test]
     fn catalog_bound_is_checked_before_any_section_body_read() {
-        let body = PgLogLifecycleV1::encode(&[]).expect("encode empty lifecycle section");
+        let lifecycle = PgLogLifecycleV1::encode(&[]).expect("encode empty lifecycle section");
+        let gaps = PgLogGapV1::encode(&[]).expect("encode empty gap section");
         let bytes = build_part(
             &[
                 SectionInput {
                     type_id: 1_028_001,
                     rows: 0,
-                    body: &body,
+                    body: &lifecycle,
                 },
                 SectionInput {
-                    type_id: 1_028_001,
+                    type_id: 1_029_001,
                     rows: 0,
-                    body: &body,
+                    body: &gaps,
                 },
             ],
             PartMeta {

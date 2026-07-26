@@ -29,7 +29,7 @@ use crate::{CodecError, ColumnType, MAX_SECTION_BYTES, MAX_SECTION_ROWS, TypeCon
 pub const COMPACTION_ZSTD_LEVEL: i32 = 6;
 
 /// Maximum target data-page size for a compact section.
-pub const COMPACTION_PAGE_BYTES: usize = MAX_SECTION_BYTES;
+pub const COMPACTION_PAGE_BYTES: usize = 1024 * 1024;
 
 /// Default peak working-memory admission for one coalesced type.
 ///

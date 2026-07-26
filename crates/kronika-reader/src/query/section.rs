@@ -755,17 +755,12 @@ mod tests {
     }
 
     #[test]
-    fn multi_window_reads_all_entries_of_a_type() {
+    fn compact_section_reads_all_coalesced_rows_of_a_type() {
         let dir = tempfile::tempdir().unwrap();
-        // Two entries of the same type_id in one unit (a multi-window part).
-        let body_a = PgStatArchiver::encode(&[archiver_row(1000, 1)]).expect("encode");
-        let body_b = PgStatArchiver::encode(&[archiver_row(2000, 2)]).expect("encode");
-        let part = part_from(
-            &[(1_008_001, 1, body_a), (1_008_001, 1, body_b)],
-            1000,
-            2000,
-            7,
-        );
+        let body =
+            PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
+                .expect("encode");
+        let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
         fs::write(dir.path().join("1000.pgm"), &part).unwrap();
 
         let mut snap = LocalDirSnapshot::open(dir.path()).unwrap();

@@ -5,7 +5,10 @@
 //! the production extraction, identity, reset, coverage, and loss rules that
 //! the qualification suite is intended to prove.
 
-use kronika_format::{PartMeta, SectionInput, build_part};
+use std::collections::BTreeMap;
+
+use arrow_array::RecordBatch;
+use kronika_format::{PartMeta, SectionInput, build_part, crc32c};
 use kronika_registry::incident_gauges::{
     PgProcessCgroupMemoryV1, PgReplicationPhysicalV1, PgReplicationSlotRetentionV3,
     PgStorageMountV2,
@@ -18,7 +21,10 @@ use kronika_registry::pg_stat_database::PgStatDatabaseV4;
 use kronika_registry::replication_instance::ReplicationInstance;
 use kronika_registry::reset_metadata::ResetMetadata;
 use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
-use kronika_registry::{Section, StrId, Ts};
+use kronika_registry::{
+    Bytes, Section, StrId, Ts, VerifiedSection, canonicalize_batches, decode_any,
+    encode_compact_batch,
+};
 
 /// Schema version for [`all_family_fixture`].
 #[cfg(test)]
@@ -199,7 +205,40 @@ fn fixture_part(ts_us: i64, snapshot: u8) -> FixturePart {
 }
 
 fn build_fixture_part(sections: &[FixtureSection], min_ts_us: i64, max_ts_us: i64) -> Vec<u8> {
-    let inputs: Vec<_> = sections
+    let mut grouped = BTreeMap::<u32, (u32, Vec<RecordBatch>)>::new();
+    for section in sections {
+        let verified = VerifiedSection::verify(
+            Bytes::copy_from_slice(&section.body),
+            crc32c(&section.body),
+            crc32c,
+        )
+        .expect("fixture section CRC");
+        let decoded = decode_any(section.type_id, verified).expect("decode fixture section");
+        assert_eq!(
+            decoded.stats.rows,
+            usize::try_from(section.rows).expect("fixture rows fit usize")
+        );
+        let group = grouped.entry(section.type_id).or_default();
+        group.0 = group
+            .0
+            .checked_add(section.rows)
+            .expect("fixture row total fits u32");
+        group.1.extend(decoded.batches);
+    }
+    let compact: Vec<_> = grouped
+        .into_iter()
+        .map(|(type_id, (rows, batches))| {
+            let batch =
+                canonicalize_batches(type_id, &batches).expect("canonicalize fixture sections");
+            let body = encode_compact_batch(type_id, &batch).expect("compact fixture sections");
+            FixtureSection {
+                type_id,
+                rows,
+                body,
+            }
+        })
+        .collect();
+    let inputs: Vec<_> = compact
         .iter()
         .map(|section| SectionInput {
             type_id: section.type_id,

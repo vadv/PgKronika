@@ -952,9 +952,8 @@ mod tests {
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::pg_log::{PgLogErrorV1, PgLogLifecycleV1};
     use kronika_registry::{Section, StrId, Ts};
-    use kronika_writer::{Interner, dict};
+    use kronika_writer::{DictionaryError, Interner, Journal, JournalConfig, SealError, dict, seal};
 
-    use super::super::SourceError;
     use super::super::limits::LIMIT;
     use super::super::qualification_fixture::all_family_fixture;
     use super::*;
@@ -1107,22 +1106,42 @@ mod tests {
         max_ts: i64,
         source_id: u64,
     ) -> Vec<u8> {
-        let inputs: Vec<_> = sections
+        let parts: Vec<_> = sections
             .iter()
-            .map(|(type_id, rows, body)| SectionInput {
-                type_id: *type_id,
-                rows: *rows,
-                body,
+            .map(|(type_id, rows, body)| {
+                build_part(
+                    &[SectionInput {
+                        type_id: *type_id,
+                        rows: *rows,
+                        body,
+                    }],
+                    PartMeta {
+                        min_ts,
+                        max_ts,
+                        source_id,
+                    },
+                )
             })
             .collect();
-        build_part(
-            &inputs,
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id,
-            },
-        )
+        seal_part_bytes(&parts)
+    }
+
+    fn seal_part_bytes(parts: &[Vec<u8>]) -> Vec<u8> {
+        try_seal_part_bytes(parts).expect("seal fixture")
+    }
+
+    fn try_seal_part_bytes(parts: &[Vec<u8>]) -> Result<Vec<u8>, SealError> {
+        let directory = tempfile::tempdir().expect("seal directory");
+        let journal_path = directory.path().join("active.parts");
+        let output_path = directory.path().join("sealed.pgm");
+        let (mut journal, report) =
+            Journal::open(&journal_path, JournalConfig::default()).expect("open seal journal");
+        assert!(report.is_clean());
+        for part in parts {
+            journal.append(part).expect("append seal part");
+        }
+        seal(&journal, &output_path)?;
+        Ok(fs::read(output_path).expect("read sealed fixture"))
     }
 
     fn sealed_context() -> SegmentContext {
@@ -1754,39 +1773,8 @@ mod tests {
     }
 
     fn sealed_from_slices(slices: &[&[PgLogLifecycleV1]]) -> Vec<u8> {
-        let bodies: Vec<Vec<u8>> = slices
-            .iter()
-            .map(|rows| PgLogLifecycleV1::encode(rows).expect("encode section"))
-            .collect();
-        let inputs: Vec<SectionInput<'_>> = slices
-            .iter()
-            .zip(&bodies)
-            .map(|(rows, body)| SectionInput {
-                type_id: 1_028_001,
-                rows: u32::try_from(rows.len()).expect("row count fits"),
-                body,
-            })
-            .collect();
-        let min_ts = slices
-            .iter()
-            .flat_map(|rows| rows.iter())
-            .map(|row| row.ts.0)
-            .min()
-            .expect("non-empty seal");
-        let max_ts = slices
-            .iter()
-            .flat_map(|rows| rows.iter())
-            .map(|row| row.ts.0)
-            .max()
-            .expect("non-empty seal");
-        build_part(
-            &inputs,
-            PartMeta {
-                min_ts,
-                max_ts,
-                source_id: 7,
-            },
-        )
+        let parts: Vec<_> = slices.iter().map(|rows| lifecycle_part(rows)).collect();
+        seal_part_bytes(&parts)
     }
 
     fn store(sealed_bytes: &[u8]) -> (tempfile::TempDir, FactStore) {
@@ -1797,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    fn promotion_of_matching_parts_equals_a_cold_sealed_rebuild() {
+    fn compact_seal_rebuild_equals_a_cold_sealed_extraction() {
         let rows = stream();
         for split in [1_usize, 2, 3, 7] {
             let chunk = rows.len().div_ceil(split);
@@ -1815,29 +1803,29 @@ mod tests {
                 .expect("reconcile seal");
 
             assert!(
-                outcome.was_promoted(),
-                "matching provenance promotes at {split}"
+                !outcome.was_promoted(),
+                "compaction changes physical section provenance at {split} parts"
             );
             assert_eq!(
                 outcome.facts().observations(),
                 rebuilt.observations(),
-                "promoted observations and IDs equal the cold rebuild at {split}"
+                "reconciled observations and IDs equal the cold rebuild at {split}"
             );
             assert_eq!(
                 outcome.facts().coverage(),
                 rebuilt.coverage(),
-                "promoted coverage equals the cold rebuild at {split}"
+                "reconciled coverage equals the cold rebuild at {split}"
             );
             assert_eq!(outcome.persist_error(), None);
             let cached = store
                 .read(&sealed_unit, &context, &LIMIT)
-                .expect("promoted facts were published");
+                .expect("rebuilt facts were published");
             assert_eq!(cached.observations(), rebuilt.observations());
         }
     }
 
     #[test]
-    fn every_all_family_contiguous_partition_promotes_to_exact_cold_sealed_facts() {
+    fn every_all_family_partition_reconciles_to_exact_compact_sealed_facts() {
         let fixture = all_family_fixture();
         let sealed_bytes = fixture.sealed_bytes();
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open all-family seal");
@@ -1855,32 +1843,32 @@ mod tests {
             assert_eq!(live.chunks().len(), part_bytes.len());
 
             let (_cache_dir, store) = store(&sealed_bytes);
-            let promoted = reconcile_seal(&live, &sealed_unit, &context, &store, &LIMIT)
-                .expect("promote all-family facts");
-            assert!(
-                promoted.was_promoted(),
-                "matching {}-part catalog must remain promotion-eligible",
-                part_bytes.len()
+            let rebuilt = reconcile_seal(&live, &sealed_unit, &context, &store, &LIMIT)
+                .expect("reconcile all-family facts");
+            assert_eq!(
+                rebuilt.was_promoted(),
+                part_bytes.len() == 1,
+                "only an already-canonical single part has identical sealed provenance"
             );
             assert_eq!(
-                promoted.facts(),
+                rebuilt.facts(),
                 &cold,
-                "promotion from {} parts changed a canonical block",
+                "rebuild from {} parts changed a canonical block",
                 part_bytes.len()
             );
             assert_eq!(
                 &store
                     .read(&sealed_unit, &context, &LIMIT)
-                    .expect("read promoted all-family facts"),
+                    .expect("read rebuilt all-family facts"),
                 &cold,
-                "published restart-warm facts differ for {} parts",
+                "published restart-warm facts differ after {} parts",
                 part_bytes.len()
             );
         }
     }
 
     #[test]
-    fn promotion_survives_an_unwritable_cache() {
+    fn compact_rebuild_survives_an_unwritable_cache() {
         let rows = stream();
         let slices: Vec<&[PgLogLifecycleV1]> = rows.chunks(2).collect();
         let sealed_bytes = sealed_from_slices(&slices);
@@ -1903,9 +1891,9 @@ mod tests {
             fs::Permissions::from_mode(original_mode & 0o7777),
         )
         .expect("restore cache permissions");
-        let outcome = outcome.expect("promotion remains available");
+        let outcome = outcome.expect("rebuild remains available");
 
-        assert!(outcome.was_promoted());
+        assert!(!outcome.was_promoted());
         assert_eq!(
             outcome.persist_error(),
             Some(PersistError::PermissionDenied)
@@ -1914,7 +1902,7 @@ mod tests {
         assert_eq!(store.fallback_stats().resident_entries, 1);
         let fallback = store
             .load_or_build(&sealed_unit, &context, &LIMIT)
-            .expect("promoted fallback load");
+            .expect("rebuilt fallback load");
         assert_eq!(fallback.origin(), super::super::FactOrigin::FallbackHit);
         assert_eq!(
             fallback.pgm_body_read_stats(),
@@ -1923,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn equivalent_cross_part_dictionary_placement_promotes() {
+    fn equivalent_cross_part_dictionary_placement_rebuilds_exactly() {
         let value = b"same normalized pattern";
         let limits = DictLimits::new(64, 1_024).expect("dictionary limits");
         let (first_bytes, first_sections) = error_part(value, limits, false, 1_000);
@@ -1944,12 +1932,12 @@ mod tests {
         let (_cache_dir, store) = store(&sealed_bytes);
         let outcome = reconcile_seal(&builder.publish(), &sealed_unit, &context, &store, &LIMIT)
             .expect("reconcile");
-        assert!(outcome.was_promoted());
+        assert!(!outcome.was_promoted());
         assert_eq!(outcome.facts().observations(), rebuilt.observations());
     }
 
     #[test]
-    fn source_zero_dictionary_part_promotes_with_timestamped_parts() {
+    fn source_zero_dictionary_part_rebuilds_with_timestamped_parts() {
         let (dictionary_bytes, mut sealed_sections) = dictionary_only_part();
         let lifecycle_rows = [row(1_000, 2, None, None)];
         let lifecycle_body = PgLogLifecycleV1::encode(&lifecycle_rows).expect("encode lifecycle");
@@ -1970,12 +1958,12 @@ mod tests {
         let (_cache_dir, store) = store(&sealed_bytes);
         let outcome = reconcile_seal(&builder.publish(), &sealed_unit, &context, &store, &LIMIT)
             .expect("reconcile");
-        assert!(outcome.was_promoted());
+        assert!(!outcome.was_promoted());
         assert_eq!(outcome.facts().observations(), rebuilt.observations());
     }
 
     #[test]
-    fn source_zero_parts_promote_when_descriptors_match() {
+    fn source_zero_parts_rebuild_after_dictionary_compaction() {
         let (dictionary_bytes, sections) = dictionary_only_part();
         let sealed_bytes = seal_sections_for_source(&sections, 0, 0, 0);
         let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed dictionary");
@@ -1992,7 +1980,7 @@ mod tests {
         )
         .expect("reconcile");
 
-        assert!(outcome.was_promoted());
+        assert!(!outcome.was_promoted());
         assert!(
             outcome.persist_error().is_none(),
             "an empty timestamp envelope remains durably admissible"
@@ -2000,38 +1988,20 @@ mod tests {
     }
 
     #[test]
-    fn truncated_cross_part_dictionary_conflict_is_not_promoted() {
+    fn truncated_cross_part_dictionary_conflict_fails_the_seal() {
         let value = b"a pattern longer than the first truncation limit";
         let truncated_limits = DictLimits::new(1, 8).expect("truncated limits");
         let full_limits = DictLimits::new(1, 1_024).expect("full limits");
-        let (first_bytes, first_sections) = error_part(value, truncated_limits, false, 1_000);
-        let (second_bytes, second_sections) = error_part(value, full_limits, false, 2_000);
-        let mut sealed_sections = first_sections;
-        sealed_sections.extend(second_sections);
-        let sealed_bytes = seal_sections(&sealed_sections, 1_000, 2_000);
-        let sealed_unit = PgmUnit::open(sealed_bytes.as_slice()).expect("open sealed");
-
-        let mut builder = live_builder();
-        fold_bytes(
-            &mut builder,
-            &[first_bytes.as_slice(), second_bytes.as_slice()],
-        );
-
-        let (_cache_dir, store) = store(&sealed_bytes);
+        let (first_bytes, _first_sections) = error_part(value, truncated_limits, false, 1_000);
+        let (second_bytes, _second_sections) = error_part(value, full_limits, false, 2_000);
         assert!(matches!(
-            reconcile_seal(
-                &builder.publish(),
-                &sealed_unit,
-                &sealed_context(),
-                &store,
-                &LIMIT,
-            ),
-            Err(BuildError::Source(SourceError::Corrupt))
+            try_seal_part_bytes(&[first_bytes, second_bytes]),
+            Err(SealError::Dictionary(DictionaryError::Conflict { .. }))
         ));
     }
 
     #[test]
-    fn a_promoted_segment_answers_the_unsplit_counts() {
+    fn a_compact_rebuilt_segment_answers_the_unsplit_counts() {
         let rows = stream();
         let raw = raw_oracle(&rows);
         let raw_result = raw.query(full_span(), LIMITS).expect("raw query");
@@ -2044,16 +2014,16 @@ mod tests {
         fold_slices(&mut builder, &slices);
         let view = builder.publish();
         let (_dir, store) = store(&sealed_bytes);
-        let promoted =
+        let rebuilt =
             reconcile_seal(&view, &sealed_unit, &context, &store, &LIMIT).expect("reconcile seal");
-        assert!(promoted.was_promoted());
-        let promoted_result = promoted
+        assert!(!rebuilt.was_promoted());
+        let rebuilt_result = rebuilt
             .facts()
             .query(full_span(), LIMITS)
-            .expect("promoted query");
-        assert_eq!(promoted_result.counts(), raw_result.counts());
+            .expect("rebuilt query");
+        assert_eq!(rebuilt_result.counts(), raw_result.counts());
         assert_eq!(
-            promoted_result.observations().len(),
+            rebuilt_result.observations().len(),
             raw_result.observations().len()
         );
     }
@@ -2200,7 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn random_part_groupings_promote_to_the_cold_rebuild() {
+    fn random_part_groupings_rebuild_to_the_cold_compact_result() {
         let rows = long_stream(20);
         for seed in 0..256_u64 {
             let mut rng = Lcg::new(seed);
@@ -2224,7 +2194,10 @@ mod tests {
             let outcome =
                 reconcile_seal(&view, &sealed_unit, &context, &store, &LIMIT).expect("reconcile");
 
-            assert!(outcome.was_promoted(), "seed {seed} should promote");
+            assert!(
+                !outcome.was_promoted(),
+                "seed {seed} compact seal must rebuild from sealed bodies"
+            );
             assert_eq!(
                 outcome.facts().observations(),
                 rebuilt.observations(),
@@ -2476,7 +2449,7 @@ mod tests {
             shuffle(&mut rng, &mut promoted_chunks);
             let promoted = oracle_from_observation_chunks(&promoted_chunks, raw.coverage());
 
-            // Exercise the actual PGM → live chunks → promoted/rebuilt path for
+            // Exercise the actual PGM → live chunks → compact/rebuilt path for
             // every active-part count and the actual sealed-prefix path for
             // every sealed-segment count. The remaining seeds run the same
             // canonical production oracle over lightweight partition slices,
@@ -2504,11 +2477,16 @@ mod tests {
                 let live_parts = live.chunks().iter().map(Arc::as_ref).collect::<Vec<_>>();
                 let promoted_suffix =
                     SegmentFacts::try_promote_from_parts(&sealed_suffix, &live_parts, &LIMIT)
-                        .expect("attempt suffix promotion")
-                        .expect("matching active parts promote");
+                        .expect("attempt suffix promotion");
                 assert_eq!(
-                    promoted_suffix, rebuilt_suffix,
-                    "promotion changed canonical facts or physical IDs at seed {seed}"
+                    promoted_suffix, None,
+                    "compact section provenance must force a sealed rebuild at seed {seed}"
+                );
+                assert_eq!(
+                    SegmentFacts::extract(&sealed_suffix, &LIMIT)
+                        .expect("repeat sealed suffix rebuild"),
+                    rebuilt_suffix,
+                    "repeat compact rebuild changed canonical facts at seed {seed}"
                 );
             }
             if seed < MAX_SEALED_SEGMENTS as u64 {

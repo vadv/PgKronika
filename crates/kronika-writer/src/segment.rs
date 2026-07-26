@@ -935,8 +935,8 @@ fn create_runs(
                 .ok_or(SealError::ArithmeticOverflow {
                     what: "spill ordinal",
                 })?;
-            write_new_file(&path, &run_body)?;
             artifacts.track(path.clone());
+            write_new_file(&path, &run_body)?;
             runs.entry(entry.type_id).or_default().push(Run {
                 path,
                 rows: entry.rows,
@@ -1617,8 +1617,11 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, io::Error> {
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
-    file.write_all(bytes)?;
-    Ok(())
+    write_all_bytes(&mut file, bytes)
+}
+
+fn write_all_bytes(writer: &mut impl Write, bytes: &[u8]) -> Result<(), io::Error> {
+    writer.write_all(bytes)
 }
 
 fn remove_generated(path: &Path) -> Result<(), io::Error> {
@@ -1734,7 +1737,7 @@ impl Drop for Artifacts {
 
 #[cfg(test)]
 mod tests {
-    use kronika_format::DictLimits;
+    use kronika_format::{DictLimits, PartMeta, SectionInput, try_build_part};
     use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use parquet::basic::Encoding;
@@ -1768,6 +1771,75 @@ mod tests {
         buffers.push(bgwriter(ts)).expect("buffer not full");
         let part = buffers.flush(&[], 0).expect("encode").expect("a part");
         journal.append(&part).expect("append");
+    }
+
+    fn append_dictionary_batch(journal: &mut Journal, type_id: u32, batch: &RecordBatch) {
+        let body = encode_compact_ordered_batch(batch).expect("encode raw dictionary");
+        let part = try_build_part(
+            &[SectionInput {
+                type_id,
+                rows: u32::try_from(batch.num_rows()).expect("small dictionary"),
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: i64::MAX,
+                max_ts: i64::MIN,
+                source_id: 0,
+            },
+        )
+        .expect("dictionary part");
+        journal.append(&part).expect("append dictionary");
+    }
+
+    fn raw_string_batch(entries: &[(u64, &[u8])]) -> RecordBatch {
+        let ids = UInt64Array::from_iter_values(entries.iter().map(|(id, _bytes)| *id));
+        let bytes = BinaryArray::from_iter_values(entries.iter().map(|(_id, bytes)| *bytes));
+        RecordBatch::try_new(
+            string_dictionary_schema(),
+            vec![std::sync::Arc::new(ids), std::sync::Arc::new(bytes)],
+        )
+        .expect("string dictionary batch")
+    }
+
+    fn raw_blob_batch(entries: &[(u64, BlobValue)]) -> RecordBatch {
+        let ids = UInt64Array::from_iter_values(entries.iter().map(|(id, _value)| *id));
+        let stored =
+            BinaryArray::from_iter_values(entries.iter().map(|(_id, value)| value.bytes.as_slice()));
+        let full_len =
+            UInt64Array::from_iter_values(entries.iter().map(|(_id, value)| value.full_len));
+        let truncated: BooleanArray = entries
+            .iter()
+            .map(|(_id, value)| Some(value.truncated))
+            .collect();
+        let hashes: Vec<Option<[u8; 32]>> = entries
+            .iter()
+            .map(|(_id, value)| value.full_sha256)
+            .collect();
+        let hashes = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            hashes.into_iter(),
+            32,
+        )
+        .expect("blob hashes");
+        RecordBatch::try_new(
+            blob_dictionary_schema(),
+            vec![
+                std::sync::Arc::new(ids),
+                std::sync::Arc::new(stored),
+                std::sync::Arc::new(full_len),
+                std::sync::Arc::new(truncated),
+                std::sync::Arc::new(hashes),
+            ],
+        )
+        .expect("blob dictionary batch")
+    }
+
+    fn truncated_blob(bytes: &[u8], full_len: u64, hash: [u8; 32]) -> BlobValue {
+        BlobValue {
+            bytes: bytes.to_vec(),
+            full_len,
+            truncated: true,
+            full_sha256: Some(hash),
+        }
     }
 
     #[test]
@@ -1849,6 +1921,251 @@ mod tests {
             .find(|entry| entry.type_id == DICT_STRINGS_TYPE_ID)
             .expect("dictionary");
         assert_eq!(dictionary.rows, 1);
+    }
+
+    #[test]
+    fn matching_string_and_blob_placements_canonicalize_to_one_blob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut journal, _) =
+            Journal::open(&dir.path().join("active.parts"), JournalConfig::default())
+                .expect("journal");
+        let full = b"placement-value";
+        let id = kronika_format::StrId::of(full).expect("nonzero").get();
+        append_dictionary_batch(
+            &mut journal,
+            DICT_STRINGS_TYPE_ID,
+            &raw_string_batch(&[(id, full)]),
+        );
+        append_dictionary_batch(
+            &mut journal,
+            DICT_BLOBS_TYPE_ID,
+            &raw_blob_batch(&[(
+                id,
+                truncated_blob(
+                    &full[..4],
+                    full.len() as u64,
+                    Sha256::digest(full).into(),
+                ),
+            )]),
+        );
+        let output = dir.path().join("segment.pgm");
+        seal(&journal, &output).expect("matching placement");
+        let bytes = fs::read(output).expect("output");
+        let catalog = validate_part(&bytes).expect("catalog");
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .all(|entry| entry.type_id != DICT_STRINGS_TYPE_ID)
+        );
+        let blob = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.type_id == DICT_BLOBS_TYPE_ID)
+            .expect("one blob section");
+        assert_eq!(blob.rows, 1);
+    }
+
+    #[test]
+    fn dictionary_faults_fail_closed_without_output() {
+        enum Fault {
+            ConflictingDuplicate,
+            PlacementConflict,
+            Descending,
+            DuplicateInSection,
+        }
+        for fault in [
+            Fault::ConflictingDuplicate,
+            Fault::PlacementConflict,
+            Fault::Descending,
+            Fault::DuplicateInSection,
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let journal_path = dir.path().join("active.parts");
+            let (mut journal, _) =
+                Journal::open(&journal_path, JournalConfig::default()).expect("journal");
+            match fault {
+                Fault::ConflictingDuplicate => {
+                    append_dictionary_batch(
+                        &mut journal,
+                        DICT_BLOBS_TYPE_ID,
+                        &raw_blob_batch(&[(7, truncated_blob(b"a", 2, [1; 32]))]),
+                    );
+                    append_dictionary_batch(
+                        &mut journal,
+                        DICT_BLOBS_TYPE_ID,
+                        &raw_blob_batch(&[(7, truncated_blob(b"b", 2, [2; 32]))]),
+                    );
+                }
+                Fault::PlacementConflict => {
+                    let full = b"alpha";
+                    let id = kronika_format::StrId::of(full).expect("nonzero").get();
+                    append_dictionary_batch(
+                        &mut journal,
+                        DICT_STRINGS_TYPE_ID,
+                        &raw_string_batch(&[(id, full)]),
+                    );
+                    append_dictionary_batch(
+                        &mut journal,
+                        DICT_BLOBS_TYPE_ID,
+                        &raw_blob_batch(&[(id, truncated_blob(b"al", 6, [3; 32]))]),
+                    );
+                }
+                Fault::Descending => {
+                    let alpha = b"alpha";
+                    let beta = b"beta";
+                    let mut entries = [
+                        (
+                            kronika_format::StrId::of(alpha).expect("nonzero").get(),
+                            alpha.as_slice(),
+                        ),
+                        (
+                            kronika_format::StrId::of(beta).expect("nonzero").get(),
+                            beta.as_slice(),
+                        ),
+                    ];
+                    entries.sort_unstable_by_key(|(id, _bytes)| std::cmp::Reverse(*id));
+                    append_dictionary_batch(
+                        &mut journal,
+                        DICT_STRINGS_TYPE_ID,
+                        &raw_string_batch(&entries),
+                    );
+                }
+                Fault::DuplicateInSection => {
+                    let value = b"same";
+                    let id = kronika_format::StrId::of(value).expect("nonzero").get();
+                    append_dictionary_batch(
+                        &mut journal,
+                        DICT_STRINGS_TYPE_ID,
+                        &raw_string_batch(&[(id, value), (id, value)]),
+                    );
+                }
+            }
+            let before = fs::read(&journal_path).expect("journal bytes");
+            let output = dir.path().join("segment.pgm");
+            assert!(
+                matches!(seal(&journal, &output), Err(SealError::Dictionary(_))),
+                "fault must be rejected"
+            );
+            assert!(!output.exists());
+            assert_eq!(fs::read(journal_path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn body_catalog_and_truncation_faults_preserve_the_journal() {
+        enum Fault {
+            Body,
+            Catalog,
+            Truncate,
+        }
+        for fault in [Fault::Body, Fault::Catalog, Fault::Truncate] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let journal_path = dir.path().join("active.parts");
+            let (mut journal, _) =
+                Journal::open(&journal_path, JournalConfig::default()).expect("journal");
+            append_window(&mut journal, 1);
+            let part_ref = journal.parts()[0];
+            let part = journal.read_part(part_ref).expect("part");
+            let catalog = validate_part(&part).expect("part catalog");
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&journal_path)
+                .expect("journal mutator");
+            match fault {
+                Fault::Body => {
+                    let at = part_ref.offset
+                        + usize::try_from(catalog.entries[0].offset).expect("offset");
+                    let changed = [part[usize::try_from(catalog.entries[0].offset).unwrap()] ^ 0x80];
+                    file.write_all_at(&changed, at as u64).expect("corrupt body");
+                }
+                Fault::Catalog => {
+                    let tail_at = part.len() - TAIL_INDEX_LEN;
+                    let tail: [u8; TAIL_INDEX_LEN] =
+                        part[tail_at..].try_into().expect("tail");
+                    let tail = TailIndex::decode(tail).expect("tail index");
+                    let at = part_ref.offset + tail_at - tail.catalog_len as usize;
+                    let changed = [part[tail_at - tail.catalog_len as usize] ^ 0x40];
+                    file.write_all_at(&changed, at as u64)
+                        .expect("corrupt catalog");
+                }
+                Fault::Truncate => {
+                    file.set_len((journal.bytes() - 1) as u64)
+                        .expect("truncate journal");
+                }
+            }
+            file.sync_all().expect("sync fault");
+            let corrupted = fs::read(&journal_path).expect("fault bytes");
+            let output = dir.path().join("segment.pgm");
+            assert!(seal(&journal, &output).is_err());
+            assert!(!output.exists());
+            assert_eq!(fs::read(journal_path).unwrap(), corrupted);
+        }
+    }
+
+    struct ChunkWriter {
+        bytes: Vec<u8>,
+        chunk: usize,
+    }
+
+    impl Write for ChunkWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let take = bytes.len().min(self.chunk);
+            self.bytes.extend_from_slice(&bytes[..take]);
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct EnospcWriter {
+        file: File,
+        remaining: usize,
+    }
+
+    impl Write for EnospcWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::from_raw_os_error(28));
+            }
+            let take = bytes.len().min(self.remaining);
+            let written = self.file.write(&bytes[..take])?;
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    #[test]
+    fn write_all_handles_short_writes_and_enospc_cleanup_is_recoverable() {
+        let mut short = ChunkWriter {
+            bytes: Vec::new(),
+            chunk: 3,
+        };
+        write_all_bytes(&mut short, b"deterministic-short-write").expect("short writes retry");
+        assert_eq!(short.bytes, b"deterministic-short-write");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let partial = dir.path().join("partial.run");
+        let mut artifacts = Artifacts::default();
+        artifacts.track(partial.clone());
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&partial)
+            .expect("partial file");
+        let mut enospc = EnospcWriter { file, remaining: 5 };
+        let error = write_all_bytes(&mut enospc, b"larger-than-five")
+            .expect_err("injected ENOSPC propagates");
+        assert_eq!(error.raw_os_error(), Some(28));
+        drop(enospc);
+        drop(artifacts);
+        assert!(!partial.exists(), "only this attempt's partial is removed");
     }
 
     #[test]

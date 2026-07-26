@@ -596,4 +596,115 @@ mod tests {
             Err(ReadError::Codec(_))
         ));
     }
+
+    #[test]
+    fn obsolete_leading_and_tail_magic_fail_without_a_legacy_path() {
+        let mut leading = a_part();
+        leading[..4].copy_from_slice(b"PGM1");
+        assert!(matches!(
+            PgmUnit::open(leading.as_slice()),
+            Err(ReadError::BadMagic { actual }) if actual == *b"PGM1"
+        ));
+
+        let mut tail = a_part();
+        let end = tail.len();
+        tail[end - 4..].copy_from_slice(b"PGM1");
+        assert!(matches!(
+            PgmUnit::open(tail.as_slice()),
+            Err(ReadError::Tail(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_unknown_and_unpacked_catalogs_fail_at_open() {
+        let body = BgwriterCheckpointer::encode(&[BgwriterCheckpointer {
+            ts: kronika_registry::Ts(1),
+            checkpoints_timed: 0,
+            checkpoints_req: 0,
+            checkpoint_write_time: 0.0,
+            checkpoint_sync_time: 0.0,
+            buffers_checkpoint: 0,
+            restartpoints_timed: None,
+            restartpoints_req: None,
+            restartpoints_done: None,
+            buffers_clean: 0,
+            maxwritten_clean: 0,
+            buffers_backend: None,
+            buffers_backend_fsync: None,
+            buffers_alloc: 0,
+            bgwriter_stats_reset: kronika_registry::Ts(1),
+            checkpointer_stats_reset: None,
+        }])
+        .expect("section");
+
+        let container = |entries: Vec<Entry>, bodies: &[&[u8]]| {
+            let mut bytes = MAGIC.to_vec();
+            for body in bodies {
+                bytes.extend_from_slice(body);
+            }
+            bytes.extend_from_slice(
+                &Catalog {
+                    entries,
+                    min_ts: 1,
+                    max_ts: 1,
+                    source_id: 0,
+                    format_version: FORMAT_VERSION,
+                }
+                .try_encode()
+                .expect("catalog"),
+            );
+            bytes
+        };
+        let len = u64::try_from(body.len()).expect("body length");
+        let first = Entry {
+            type_id: 1_006_001,
+            flags: 0,
+            offset: MAGIC.len() as u64,
+            len,
+            rows: 1,
+            crc32c: crc32c(&body),
+        };
+        let duplicate = container(
+            vec![
+                first,
+                Entry {
+                    offset: first.offset + len,
+                    ..first
+                },
+            ],
+            &[&body, &body],
+        );
+        assert!(matches!(
+            PgmUnit::open(duplicate.as_slice()),
+            Err(ReadError::NonCanonicalCatalog {
+                type_id: 1_006_001
+            })
+        ));
+
+        let unknown = container(
+            vec![Entry {
+                type_id: 9_999_999,
+                ..first
+            }],
+            &[&body],
+        );
+        assert!(matches!(
+            PgmUnit::open(unknown.as_slice()),
+            Err(ReadError::UnknownType { type_id: 9_999_999 })
+        ));
+
+        let unpacked = container(
+            vec![Entry {
+                offset: first.offset + 1,
+                ..first
+            }],
+            &[&body],
+        );
+        assert!(matches!(
+            PgmUnit::open(unpacked.as_slice()),
+            Err(ReadError::NonCanonicalCatalog {
+                type_id: 1_006_001
+            })
+        ));
+    }
 }
