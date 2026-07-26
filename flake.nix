@@ -96,8 +96,8 @@
         commonArgs = {
           # Cargo-source filtering keeps only .rs files and manifests, which
           # drops the web UI assets rust-embed compiles into the binary; the
-          # bench directory is pinned too so a filter change cannot break the
-          # manifest's declared [[bench]] target.
+          # declared target directories are pinned too so a filter change
+          # cannot make a workspace manifest invalid.
           src = pkgs.lib.fileset.toSource {
             root = ./.;
             # maybeMissing: the BDD builder context carries only manifests and
@@ -106,19 +106,21 @@
               (craneLib.fileset.commonCargoSources ./.)
               (pkgs.lib.fileset.maybeMissing ./crates/kronika-reader/benches)
               (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/benches)
+              (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/examples)
               (pkgs.lib.fileset.maybeMissing ./bins/pg_kronika-web/static)
             ];
           };
           strictDeps = true;
           CARGO_BUILD_TARGET = pkgs.stdenv.hostPlatform.config;
-          # Limit the image build to the BDD runner and the collector.
+          # Limit the image build to the BDD runner, collector, and the real
+          # qualification-enabled web process driven by lifecycle scenarios.
           # `-p` replaces crane's default flags, so keep `--locked` here.
           #
           # The demo stand deliberately builds as a separate package
           # (`demoBins`): folding its web-viewer dependency tree into these
           # shared artifacts overflows the CI runner disk during the builder
           # image build.
-          cargoExtraArgs = "--locked -p kronika-bdd -p pg_kronika-collector";
+          cargoExtraArgs = "--locked -p kronika-bdd -p pg_kronika-collector -p pg_kronika-web --features pg_kronika-web/qualification";
           doCheck = false;
         };
 
@@ -179,6 +181,7 @@
               "LANG=C"
               "KRONIKA_FEATURES=${features}"
               "KRONIKA_COLLECTOR_BIN=${bins}/bin/pg_kronika-collector"
+              "KRONIKA_WEB_BIN=${bins}/bin/pg_kronika-web"
               "KRONIKA_PG_MATRIX=15=${postgresql_15_plans}/bin;16=${postgresql_16_plans}/bin;17=${postgresql_17_plans}/bin;18=${postgresql_18_plans}/bin"
             ];
           };

@@ -68,6 +68,24 @@ pub use refresh::{
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta};
 
+/// Returns the versioned registry-backed all-family parity qualification fixture.
+///
+/// This diagnostic surface exists only for cross-crate qualification tests and
+/// executables; production binaries do not enable the feature.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+#[must_use]
+pub fn qualification_all_family_pgm() -> Vec<u8> {
+    overview::qualification_all_family_pgm()
+}
+
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub use overview::{
+    QUALIFICATION_PUBLISH_BARRIER_ENV, QUALIFICATION_PUBLISH_BARRIER_READY,
+    QUALIFICATION_PUBLISH_BARRIER_RELEASE, QUALIFICATION_PUBLISH_FAULT_ENV,
+};
+
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::error::Error;

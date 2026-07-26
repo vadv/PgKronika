@@ -1,6 +1,8 @@
 //! Cancellation-safe exact-key coordination for sealed-fact loads.
 
 use std::collections::HashMap;
+#[cfg(feature = "qualification")]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use kronika_reader::FactBuildKey;
@@ -25,6 +27,10 @@ impl<T> Flight<T> {
 struct RegistryInner<T> {
     max_entries: usize,
     active: Mutex<HashMap<FactBuildKey, Arc<Flight<T>>>>,
+    #[cfg(feature = "qualification")]
+    leaders: AtomicU64,
+    #[cfg(feature = "qualification")]
+    waiters: AtomicU64,
 }
 
 /// Exact-`FactBuildKey` work registry with a hard active-entry bound.
@@ -56,6 +62,10 @@ where
             inner: Arc::new(RegistryInner {
                 max_entries,
                 active: Mutex::new(HashMap::new()),
+                #[cfg(feature = "qualification")]
+                leaders: AtomicU64::new(0),
+                #[cfg(feature = "qualification")]
+                waiters: AtomicU64::new(0),
             }),
         }
     }
@@ -91,6 +101,8 @@ where
         };
 
         if leader {
+            #[cfg(feature = "qualification")]
+            self.inner.leaders.fetch_add(1, AtomicOrdering::Relaxed);
             metrics::counter!("overview_singleflight_builds").increment(1);
             let inner = Arc::clone(&self.inner);
             let worker_flight = Arc::clone(&flight);
@@ -112,6 +124,8 @@ where
                 drop(active);
             });
         } else {
+            #[cfg(feature = "qualification")]
+            self.inner.waiters.fetch_add(1, AtomicOrdering::Relaxed);
             metrics::counter!("overview_singleflight_waiters").increment(1);
         }
 
@@ -133,6 +147,23 @@ where
     fn active(&self) -> usize {
         lock_active(&self.inner).len()
     }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) fn qualification_snapshot(&self) -> SingleflightSnapshot {
+        SingleflightSnapshot {
+            leaders: self.inner.leaders.load(AtomicOrdering::Relaxed),
+            waiters: self.inner.waiters.load(AtomicOrdering::Relaxed),
+            active: lock_active(&self.inner).len(),
+        }
+    }
+}
+
+#[cfg(feature = "qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SingleflightSnapshot {
+    pub(crate) leaders: u64,
+    pub(crate) waiters: u64,
+    pub(crate) active: usize,
 }
 
 fn lock_active<T>(
@@ -211,6 +242,60 @@ mod tests {
         assert_eq!(first.await.expect("first task"), Ok(7));
         assert_eq!(second.await.expect("second task"), Ok(7));
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn same_fact_key_with_distinct_lineages_runs_independently() {
+        let flights = FactSingleflight::new(4);
+        let fact_key = key(7).fact_key();
+        let first_key = FactBuildKey::new(fact_key, SegmentLineageId([0x11; 32]));
+        let second_key = FactBuildKey::new(fact_key, SegmentLineageId([0x22; 32]));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+
+        let first_flights = flights.clone();
+        let first_executions = Arc::clone(&executions);
+        let first_release = Arc::clone(&release);
+        let first = tokio::spawn(async move {
+            first_flights
+                .run(
+                    first_key,
+                    move || async move {
+                        first_executions.fetch_add(1, Ordering::SeqCst);
+                        first_release.notified().await;
+                        11_u8
+                    },
+                    || 0,
+                )
+                .await
+        });
+        let second_flights = flights.clone();
+        let second_executions = Arc::clone(&executions);
+        let second_release = Arc::clone(&release);
+        let second = tokio::spawn(async move {
+            second_flights
+                .run(
+                    second_key,
+                    move || async move {
+                        second_executions.fetch_add(1, Ordering::SeqCst);
+                        second_release.notified().await;
+                        22_u8
+                    },
+                    || 0,
+                )
+                .await
+        });
+
+        wait_for_active(&flights, 2).await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            2,
+            "equal logical facts in distinct physical lineages must not share work"
+        );
+        release.notify_waiters();
+        assert_eq!(first.await.expect("first lineage task"), Ok(11));
+        assert_eq!(second.await.expect("second lineage task"), Ok(22));
+        wait_for_active(&flights, 0).await;
     }
 
     #[tokio::test]

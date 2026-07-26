@@ -1,5 +1,7 @@
 //! Request-scoped sealed-fact loading over exact-key shared work.
 
+#[cfg(feature = "qualification")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -41,6 +43,8 @@ pub(crate) struct OverviewFactLoader {
     decoded: DecodedFactCache,
     flights: FactSingleflight<FactResult>,
     fallback_metrics: Arc<Mutex<FallbackStats>>,
+    #[cfg(feature = "qualification")]
+    qualification: Arc<LoaderCounters>,
     per_request_parallelism: usize,
     retry_after_seconds: u64,
 }
@@ -63,6 +67,8 @@ impl OverviewFactLoader {
             decoded: DecodedFactCache::new(decoded_cache_bytes, decoded_cache_entries),
             flights: FactSingleflight::new(max_flights),
             fallback_metrics: Arc::new(Mutex::new(FallbackStats::default())),
+            #[cfg(feature = "qualification")]
+            qualification: Arc::new(LoaderCounters::default()),
             per_request_parallelism: config.per_request_parallelism,
             retry_after_seconds: config.retry_after_seconds,
         })
@@ -149,6 +155,10 @@ impl OverviewFactLoader {
     ) -> Result<SealedEntry, FactLoadFailure> {
         let key = entry.fact_build_key();
         if let Some(facts) = self.decoded.get(key) {
+            #[cfg(feature = "qualification")]
+            self.qualification
+                .decoded_hits
+                .fetch_add(1, Ordering::Relaxed);
             return SealedEntry::from_descriptor(&entry, facts)
                 .ok_or(FactLoadFailure::IdentityMismatch);
         }
@@ -164,6 +174,8 @@ impl OverviewFactLoader {
         let store = self.store.clone();
         let admission = self.admission.clone();
         let decoded = self.decoded.clone();
+        #[cfg(feature = "qualification")]
+        let qualification = Arc::clone(&self.qualification);
         let retry_after_seconds = self.retry_after_seconds;
         let facts =
             self.flights
@@ -173,9 +185,14 @@ impl OverviewFactLoader {
                         if let Some(facts) = decoded.get(key) {
                             return Ok(facts);
                         }
-                        if let Some(facts) =
-                            load_cached(Arc::clone(&snapshot), worker_entry.clone(), store.clone())
-                                .await?
+                        if let Some(facts) = load_cached(
+                            Arc::clone(&snapshot),
+                            worker_entry.clone(),
+                            store.clone(),
+                            #[cfg(feature = "qualification")]
+                            Arc::clone(&qualification),
+                        )
+                        .await?
                         {
                             decoded.insert(key, Arc::clone(&facts));
                             return Ok(facts);
@@ -205,6 +222,8 @@ impl OverviewFactLoader {
                                     |error| FactLoadFailure::Source(SealedFactError::Build(error)),
                                 )?;
                                 record_load(&load);
+                                #[cfg(feature = "qualification")]
+                                qualification.record(&load);
                                 load.into_shared_facts()
                             };
                             Ok::<_, FactLoadFailure>(facts)
@@ -231,7 +250,14 @@ impl OverviewFactLoader {
         snapshot: Arc<LocalDirSnapshot>,
         entry: DescriptorEntry,
     ) -> Result<Option<Arc<SegmentFacts>>, FactLoadFailure> {
-        load_cached(snapshot, entry, self.store.clone()).await
+        load_cached(
+            snapshot,
+            entry,
+            self.store.clone(),
+            #[cfg(feature = "qualification")]
+            Arc::clone(&self.qualification),
+        )
+        .await
     }
 
     #[allow(
@@ -267,6 +293,17 @@ impl OverviewFactLoader {
             .set(current.resident_bytes as f64);
         *previous = current;
     }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) fn qualification_snapshot(&self) -> LoaderQualificationSnapshot {
+        LoaderQualificationSnapshot {
+            io: self.qualification.snapshot(),
+            flight: self.flights.qualification_snapshot(),
+            admission: self.admission.qualification_snapshot(),
+            decoded: self.decoded.qualification_snapshot(),
+            fallback: self.store.fallback_stats(),
+        }
+    }
 }
 
 fn spawn_load(
@@ -284,6 +321,7 @@ async fn load_cached(
     snapshot: Arc<LocalDirSnapshot>,
     entry: DescriptorEntry,
     store: FactStore,
+    #[cfg(feature = "qualification")] qualification: Arc<LoaderCounters>,
 ) -> Result<Option<Arc<SegmentFacts>>, FactLoadFailure> {
     tokio::task::spawn_blocking(move || {
         let descriptor = *entry.descriptor();
@@ -298,11 +336,101 @@ async fn load_cached(
             .map_err(|error| FactLoadFailure::Source(SealedFactError::Build(error)))?;
         Ok(load.map(|load| {
             record_load(&load);
+            #[cfg(feature = "qualification")]
+            qualification.record(&load);
             load.into_shared_facts()
         }))
     })
     .await
     .unwrap_or(Err(FactLoadFailure::WorkerFailed))
+}
+
+#[cfg(feature = "qualification")]
+#[derive(Debug, Default)]
+struct LoaderCounters {
+    decoded_hits: AtomicU64,
+    durable_hits: AtomicU64,
+    fallback_hits: AtomicU64,
+    source_builds: AtomicU64,
+    persistence_failures: AtomicU64,
+    pgm_body_reads: AtomicU64,
+    pgm_body_bytes: AtomicU64,
+    fact_reads: AtomicU64,
+    fact_stored_bytes: AtomicU64,
+    fact_decoded_bytes: AtomicU64,
+    fact_write_bytes: AtomicU64,
+}
+
+#[cfg(feature = "qualification")]
+impl LoaderCounters {
+    fn record(&self, load: &FactLoad) {
+        match load.origin() {
+            FactOrigin::CacheHit => &self.durable_hits,
+            FactOrigin::FallbackHit => &self.fallback_hits,
+            FactOrigin::Rebuilt => &self.source_builds,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        if load.persist_error().is_some() {
+            self.persistence_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        let pgm = load.pgm_body_read_stats();
+        self.pgm_body_reads
+            .fetch_add(pgm.read_calls, Ordering::Relaxed);
+        self.pgm_body_bytes
+            .fetch_add(pgm.stored_bytes_read, Ordering::Relaxed);
+        if let Some(fact) = load.fact_read_stats() {
+            self.fact_reads
+                .fetch_add(fact.read_calls, Ordering::Relaxed);
+            self.fact_stored_bytes
+                .fetch_add(fact.stored_bytes_read, Ordering::Relaxed);
+            self.fact_decoded_bytes
+                .fetch_add(fact.decoded_bytes, Ordering::Relaxed);
+        }
+        self.fact_write_bytes
+            .fetch_add(load.fact_write_bytes(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LoaderIoSnapshot {
+        LoaderIoSnapshot {
+            decoded_hits: self.decoded_hits.load(Ordering::Relaxed),
+            durable_hits: self.durable_hits.load(Ordering::Relaxed),
+            fallback_hits: self.fallback_hits.load(Ordering::Relaxed),
+            source_builds: self.source_builds.load(Ordering::Relaxed),
+            persistence_failures: self.persistence_failures.load(Ordering::Relaxed),
+            pgm_body_reads: self.pgm_body_reads.load(Ordering::Relaxed),
+            pgm_body_bytes: self.pgm_body_bytes.load(Ordering::Relaxed),
+            fact_reads: self.fact_reads.load(Ordering::Relaxed),
+            fact_stored_bytes: self.fact_stored_bytes.load(Ordering::Relaxed),
+            fact_decoded_bytes: self.fact_decoded_bytes.load(Ordering::Relaxed),
+            fact_write_bytes: self.fact_write_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(feature = "qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoaderIoSnapshot {
+    pub(crate) decoded_hits: u64,
+    pub(crate) durable_hits: u64,
+    pub(crate) fallback_hits: u64,
+    pub(crate) source_builds: u64,
+    pub(crate) persistence_failures: u64,
+    pub(crate) pgm_body_reads: u64,
+    pub(crate) pgm_body_bytes: u64,
+    pub(crate) fact_reads: u64,
+    pub(crate) fact_stored_bytes: u64,
+    pub(crate) fact_decoded_bytes: u64,
+    pub(crate) fact_write_bytes: u64,
+}
+
+#[cfg(feature = "qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoaderQualificationSnapshot {
+    pub(crate) io: LoaderIoSnapshot,
+    pub(crate) flight: super::singleflight::SingleflightSnapshot,
+    pub(crate) admission: super::admission::AdmissionSnapshot,
+    pub(crate) decoded: super::memory_cache::DecodedCacheSnapshot,
+    pub(crate) fallback: FallbackStats,
 }
 
 const fn map_admission_error(

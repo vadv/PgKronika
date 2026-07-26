@@ -84,6 +84,42 @@ pub enum MetricFactor {
 }
 
 impl MetricFactor {
+    /// Complete stable factor inventory in numeric-ID order.
+    pub const ALL: [Self; 32] = [
+        Self::PgDatabaseDeadlocks,
+        Self::PgDatabaseRecoveryConflicts,
+        Self::PgDatabaseChecksumFailures,
+        Self::PgDatabaseSessionsAbandoned,
+        Self::PgDatabaseSessionsFatal,
+        Self::PgDatabaseSessionsKilled,
+        Self::PgStatisticsResetAt,
+        Self::PgPostmasterStartTime,
+        Self::PgDatabaseConnections,
+        Self::PgDatabaseConnectionLimit,
+        Self::PgDatabaseFrozenXidAge,
+        Self::PgDatabaseMinMxidAge,
+        Self::PgRecoveryRole,
+        Self::PgTimeline,
+        Self::PgReplicationSenderState,
+        Self::PgReplicationReplayLag,
+        Self::PgReplicationSlotState,
+        Self::PgReplicationSenderSnapshotPopulation,
+        Self::PgReplicationSlotSnapshotPopulation,
+        Self::PgFilesystemTotalBytes,
+        Self::PgFilesystemAvailableBytes,
+        Self::OsCgroupMemoryCurrentBytes,
+        Self::OsCgroupMemoryMaxBytes,
+        Self::OsCgroupMemoryHighEvents,
+        Self::OsCgroupMemoryMaxEvents,
+        Self::OsCgroupOomEvents,
+        Self::OsCgroupOomKills,
+        Self::OsHostOomKills,
+        Self::CpuPressureUnsupported,
+        Self::MemoryPsiUnsupported,
+        Self::StorageThroughputUnsupported,
+        Self::BlockedSessionsUnsupported,
+    ];
+
     /// Stable factor ID used in persisted samples and health coverage.
     #[must_use]
     pub const fn id(self) -> FactorId {
@@ -386,14 +422,16 @@ mod tests {
 
     #[test]
     fn factor_codes_and_units_round_trip() {
-        for factor in [
-            MetricFactor::PgDatabaseDeadlocks,
-            MetricFactor::OsCgroupOomKills,
-            MetricFactor::BlockedSessionsUnsupported,
-        ] {
+        for factor in MetricFactor::ALL {
             assert_eq!(MetricFactor::from_id(factor.id()), Some(factor));
             assert!(!factor.wire_code().is_empty());
         }
+        assert!(
+            MetricFactor::ALL
+                .windows(2)
+                .all(|pair| pair[0].id() < pair[1].id()),
+            "the qualification inventory must stay in canonical ID order"
+        );
         for unit in [MetricUnit::Count, MetricUnit::Bytes, MetricUnit::StateCode] {
             assert_eq!(MetricUnit::from_code(unit.code()), Some(unit));
         }

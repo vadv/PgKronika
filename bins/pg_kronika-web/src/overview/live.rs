@@ -100,6 +100,25 @@ pub(crate) struct OverviewWriter {
     live: LiveBuilder,
     passes_since_gc: u64,
     view_generation: u64,
+    live_fold_stats: LiveFoldStats,
+}
+
+/// Exact source-body work performed while folding completed active parts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LiveFoldStats {
+    pub(crate) completed_parts: u64,
+    pub(crate) pgm_body_reads: u64,
+    pub(crate) pgm_body_bytes: u64,
+}
+
+impl LiveFoldStats {
+    fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            completed_parts: self.completed_parts.checked_add(other.completed_parts)?,
+            pgm_body_reads: self.pgm_body_reads.checked_add(other.pgm_body_reads)?,
+            pgm_body_bytes: self.pgm_body_bytes.checked_add(other.pgm_body_bytes)?,
+        })
+    }
 }
 
 impl OverviewWriter {
@@ -147,6 +166,7 @@ impl OverviewWriter {
             live,
             passes_since_gc: 0,
             view_generation: 0,
+            live_fold_stats: LiveFoldStats::default(),
         })
     }
 
@@ -217,16 +237,25 @@ impl OverviewWriter {
         self.refresh_sealed(snapshot, &mut sealed, &mut unavailable);
 
         let mut live = self.live.clone();
-        if let Err(first_error) = fold_refresh(&mut live, snapshot, delta) {
-            let mut rebuilt = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
-            let baseline = full_live_baseline(delta);
-            fold_refresh(&mut rebuilt, snapshot, &baseline).map_err(|_error| first_error)?;
-            live = rebuilt;
-        }
+        let fold_stats = match fold_refresh(&mut live, snapshot, delta) {
+            Ok(stats) => stats,
+            Err(first_error) => {
+                let mut rebuilt = LiveBuilder::new(LIMIT).map_err(OverviewBuildError::Config)?;
+                let baseline = full_live_baseline(delta);
+                let stats = fold_refresh(&mut rebuilt, snapshot, &baseline)
+                    .map_err(|_error| first_error)?;
+                live = rebuilt;
+                stats
+            }
+        };
 
         self.sealed = sealed;
         self.unavailable = unavailable;
         self.live = live;
+        self.live_fold_stats = self
+            .live_fold_stats
+            .checked_add(fold_stats)
+            .ok_or(OverviewBuildError::Live(LiveFoldError::Overflow))?;
         self.view_generation = snapshot.view_generation();
         let promotion_locators = delta
             .sealed_added
@@ -237,6 +266,11 @@ impl OverviewWriter {
             .collect::<BTreeSet<_>>();
         let promotion = PromotionCandidate::new(prior_live, promotion_locators);
         Ok(self.current_view(self.view_generation, promotion))
+    }
+
+    #[cfg(feature = "qualification")]
+    pub(crate) const fn qualification_live_fold_stats(&self) -> LiveFoldStats {
+        self.live_fold_stats
     }
 
     /// Seeds an empty writer from a snapshot bootstrap delta.
@@ -432,7 +466,8 @@ fn fold_refresh(
     builder: &mut LiveBuilder,
     snapshot: &LocalDirSnapshot,
     delta: &RefreshDelta,
-) -> Result<(), OverviewBuildError> {
+) -> Result<LiveFoldStats, OverviewBuildError> {
+    let mut stats = LiveFoldStats::default();
     builder
         .begin_refresh(delta)
         .map_err(OverviewBuildError::Live)?;
@@ -446,8 +481,15 @@ fn fold_refresh(
         if effect == FoldEffect::Folded {
             metrics::counter!("overview_live_folded_parts_total").increment(1);
         }
+        let reads = unit.body_read_stats();
+        stats.completed_parts = stats.completed_parts.saturating_add(1);
+        stats.pgm_body_reads = stats.pgm_body_reads.saturating_add(reads.read_calls);
+        stats.pgm_body_bytes = stats.pgm_body_bytes.saturating_add(reads.stored_bytes_read);
     }
-    builder.complete_refresh().map_err(OverviewBuildError::Live)
+    builder
+        .complete_refresh()
+        .map_err(OverviewBuildError::Live)?;
+    Ok(stats)
 }
 
 #[allow(
@@ -509,7 +551,9 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    use kronika_analytics::overview::{CountLimits, CoverageSpan, OracleLimits, RawOracle};
+    use kronika_analytics::overview::{
+        CountLimits, CoverageSpan, OracleLimits, RawOracle, notable_event_id,
+    };
     use kronika_format::{FrameHeader, PartMeta, SectionInput, build_part};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::pg_log::PgLogLifecycleV1;
@@ -862,14 +906,13 @@ mod tests {
             .expect("first live view");
         let range = CoverageSpan::new(0, 10_000).expect("range");
         let first_view = load_selected(&writer, &snapshot, first_descriptors, &[7], range).await;
-        assert_eq!(
-            first_view
-                .query(range, QUERY_LIMITS)
-                .expect("first query")
-                .observations()
-                .len(),
-            1
-        );
+        let first_result = first_view.query(range, QUERY_LIMITS).expect("first query");
+        assert_eq!(first_result.observations().len(), 1);
+        let first_public_ids = first_result
+            .observations()
+            .iter()
+            .map(|observation| notable_event_id(observation).expect("notable lifecycle event"))
+            .collect::<Vec<_>>();
 
         let second_part = lifecycle_part(std::slice::from_ref(&second));
         std::fs::OpenOptions::new()
@@ -884,13 +927,24 @@ mod tests {
             .assemble_with_live(&snapshot, &appended)
             .expect("appended live view");
         let second_view = load_selected(&writer, &snapshot, second_descriptors, &[7], range).await;
+        let second_result = second_view
+            .query(range, QUERY_LIMITS)
+            .expect("second query");
+        assert_eq!(second_result.observations().len(), 2);
+        let second_public_ids = second_result
+            .observations()
+            .iter()
+            .map(|observation| notable_event_id(observation).expect("notable lifecycle event"))
+            .collect::<Vec<_>>();
+        let live_observation_ids = second_result
+            .observations()
+            .iter()
+            .map(kronika_analytics::overview::EventObservation::observation_id)
+            .collect::<Vec<_>>();
         assert_eq!(
-            second_view
-                .query(range, QUERY_LIMITS)
-                .expect("second query")
-                .observations()
-                .len(),
-            2
+            &second_public_ids[..first_public_ids.len()],
+            first_public_ids,
+            "append must preserve the stable public identity of prior live rows"
         );
 
         let first_body =
@@ -930,14 +984,31 @@ mod tests {
             "the seal publication retains one bounded prior-live candidate"
         );
         let sealed_view = load_selected(&writer, &snapshot, sealed_descriptors, &[7], range).await;
+        let sealed_result = sealed_view
+            .query(range, QUERY_LIMITS)
+            .expect("sealed query");
         assert_eq!(
-            sealed_view
-                .query(range, QUERY_LIMITS)
-                .expect("sealed query")
-                .observations()
-                .len(),
+            sealed_result.observations().len(),
             2,
             "seal reconciliation neither drops nor duplicates live observations"
+        );
+        let sealed_public_ids = sealed_result
+            .observations()
+            .iter()
+            .map(|observation| notable_event_id(observation).expect("notable lifecycle event"))
+            .collect::<Vec<_>>();
+        let sealed_observation_ids = sealed_result
+            .observations()
+            .iter()
+            .map(kronika_analytics::overview::EventObservation::observation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sealed_public_ids, second_public_ids,
+            "ordinary live-to-sealed promotion must preserve semantic event IDs"
+        );
+        assert_ne!(
+            sealed_observation_ids, live_observation_ids,
+            "physical observation identity must still distinguish live and sealed lineages"
         );
         assert_eq!(
             ovf_files(dir.path()),

@@ -12,7 +12,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kronika_analytics::overview::{
     EntityKind, ErrorCategory, EventFact as CanonicalEventFact, EventObservation,
     EventPayload as CanonicalEventPayload, EvidenceQuality, IdentityQuality, LossReason,
-    LossSummary, NotableClass, NotablePolicy, ObservationPayload, Severity,
+    LossSummary, NotableClass, NotablePolicy, ObservationPayload, Severity, notable_event_id,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -144,6 +144,13 @@ pub(crate) struct CoverageSpanDto {
     pub(crate) to_us: i64,
 }
 
+/// One incomplete active-journal byte range.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct TailPendingDto {
+    pub(crate) from_offset_bytes: u64,
+    pub(crate) to_offset_bytes: u64,
+}
+
 /// Per-source publication freshness and independent quality axes.
 #[derive(Debug, Serialize)]
 pub(crate) struct SourceFreshnessDto {
@@ -176,7 +183,7 @@ pub(crate) struct TimelineMetaDto {
     pub(crate) available_sources: Vec<u64>,
     pub(crate) data_through_us: Option<i64>,
     pub(crate) store_data_through_us: Option<i64>,
-    pub(crate) tail_pending: Option<u64>,
+    pub(crate) tail_pending: Option<TailPendingDto>,
     pub(crate) source_status: &'static str,
     pub(crate) source_freshness: Vec<SourceFreshnessDto>,
     pub(crate) loss: Vec<SourceLossDto>,
@@ -280,7 +287,7 @@ impl EventFactProjection {
         }
         Some(EventFactPosition {
             sort_ts_us: observation.time().sort_ts_us,
-            event_id: semantic_event_id(observation)?,
+            event_id: notable_event_id(observation)?,
             event_instance_id: event_instance_id(observation),
         })
     }
@@ -428,69 +435,6 @@ const fn entity_kind_name(kind: EntityKind) -> &'static str {
     }
 }
 
-fn semantic_event_id(observation: &EventObservation) -> Option<[u8; 32]> {
-    let time = observation.time();
-    let mut hasher = Sha256::new();
-    hasher.update(b"pgk-overview-event-fact-v1");
-    hasher.update(observation.source_id().to_le_bytes());
-    hasher.update(observation.source_type_id().to_le_bytes());
-    hasher.update(time.sort_ts_us.to_le_bytes());
-    match time.occurred_at_us {
-        Some(occurred_at_us) => {
-            hasher.update([1]);
-            hasher.update(occurred_at_us.to_le_bytes());
-        }
-        None => hasher.update([0]),
-    }
-    hasher.update(observation.occurrence_count().to_le_bytes());
-    let kind = observation.payload().kind_code().as_bytes();
-    hasher.update(
-        u64::try_from(kind.len())
-            .expect("static event-kind length fits u64")
-            .to_le_bytes(),
-    );
-    hasher.update(kind);
-    hash_public_payload(&mut hasher, observation.payload())?;
-    Some(hasher.finalize().into())
-}
-
-fn hash_public_payload(hasher: &mut Sha256, payload: &ObservationPayload) -> Option<()> {
-    match payload {
-        ObservationPayload::ErrorGroup(error) => {
-            hasher.update(severity_name(error.severity).as_bytes());
-            hasher.update(category_name(error.category).as_bytes());
-            match error.sqlstate {
-                Some(code) => {
-                    hasher.update([1]);
-                    hasher.update(code.0);
-                }
-                None => hasher.update([0]),
-            }
-            hasher.update(error.dropped_field_count.0.to_le_bytes());
-        }
-        ObservationPayload::ChildSignalTermination(lifecycle)
-        | ObservationPayload::ChildProcessCrash(lifecycle)
-        | ObservationPayload::ShutdownRequested(lifecycle)
-        | ObservationPayload::ReadyObserved(lifecycle) => {
-            hash_optional_i32(hasher, lifecycle.pid);
-            hash_optional_i32(hasher, lifecycle.signal);
-            hasher.update(lifecycle.dropped_field_count.0.to_le_bytes());
-        }
-        _ => return None,
-    }
-    Some(())
-}
-
-fn hash_optional_i32(hasher: &mut Sha256, value: Option<i32>) {
-    match value {
-        Some(value) => {
-            hasher.update([1]);
-            hasher.update(value.to_le_bytes());
-        }
-        None => hasher.update([0]),
-    }
-}
-
 fn event_instance_id(observation: &EventObservation) -> [u8; 32] {
     let provenance = observation.provenance();
     let mut hasher = Sha256::new();
@@ -539,29 +483,11 @@ fn event_loss(loss: &LossSummary) -> EventLoss {
 }
 
 pub(crate) const fn severity_name(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Error => "error",
-        Severity::Fatal => "fatal",
-        Severity::Panic => "panic",
-        Severity::Warning => "warning",
-        Severity::Log => "log",
-    }
+    severity.wire_code()
 }
 
 pub(crate) const fn category_name(category: ErrorCategory) -> &'static str {
-    match category {
-        ErrorCategory::Lock => "lock",
-        ErrorCategory::Constraint => "constraint",
-        ErrorCategory::Serialization => "serialization",
-        ErrorCategory::Timeout => "timeout",
-        ErrorCategory::Connection => "connection",
-        ErrorCategory::Auth => "auth",
-        ErrorCategory::Syntax => "syntax",
-        ErrorCategory::Resource => "resource",
-        ErrorCategory::DataCorruption => "data_corruption",
-        ErrorCategory::System => "system",
-        ErrorCategory::Other => "other",
-    }
+    category.wire_code()
 }
 
 const fn identity_quality_name(quality: IdentityQuality) -> &'static str {

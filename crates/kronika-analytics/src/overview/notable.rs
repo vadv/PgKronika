@@ -15,6 +15,8 @@
 use core::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use sha2::{Digest as _, Sha256};
+
 use super::counts::{ErrorCategory, Severity, SqlState};
 use super::fact::{EventFact, EventKind};
 use super::observation::{EventObservation, ObservationPayload};
@@ -439,6 +441,73 @@ pub fn passes_min_severity(observation: &EventObservation, min_severity: Option<
         .is_none_or(|severity| severity_rank(severity) >= severity_rank(min_severity))
 }
 
+/// Derives the stable public identity of a retained notable-capable event.
+///
+/// The preimage deliberately excludes physical lineage and catalog ordinals.
+/// A completed active row and its ordinary sealed form therefore keep one
+/// `event_id`; a separate provenance-derived instance identity distinguishes
+/// equal semantic rows that were physically retained more than once.
+#[must_use]
+pub fn notable_event_id(observation: &EventObservation) -> Option<[u8; 32]> {
+    let time = observation.time();
+    let mut hasher = Sha256::new();
+    hasher.update(b"pgk-overview-event-fact-v1");
+    hasher.update(observation.source_id().to_le_bytes());
+    hasher.update(observation.source_type_id().to_le_bytes());
+    hasher.update(time.sort_ts_us.to_le_bytes());
+    match time.occurred_at_us {
+        Some(occurred_at_us) => {
+            hasher.update([1]);
+            hasher.update(occurred_at_us.to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update(observation.occurrence_count().to_le_bytes());
+    let kind = observation.payload().kind_code().as_bytes();
+    let kind_len = u64::try_from(kind.len()).ok()?;
+    hasher.update(kind_len.to_le_bytes());
+    hasher.update(kind);
+    hash_public_payload(&mut hasher, observation.payload())?;
+    Some(hasher.finalize().into())
+}
+
+fn hash_public_payload(hasher: &mut Sha256, payload: &ObservationPayload) -> Option<()> {
+    match payload {
+        ObservationPayload::ErrorGroup(error) => {
+            hasher.update(error.severity.wire_code().as_bytes());
+            hasher.update(error.category.wire_code().as_bytes());
+            match error.sqlstate {
+                Some(code) => {
+                    hasher.update([1]);
+                    hasher.update(code.0);
+                }
+                None => hasher.update([0]),
+            }
+            hasher.update(error.dropped_field_count.0.to_le_bytes());
+        }
+        ObservationPayload::ChildSignalTermination(lifecycle)
+        | ObservationPayload::ChildProcessCrash(lifecycle)
+        | ObservationPayload::ShutdownRequested(lifecycle)
+        | ObservationPayload::ReadyObserved(lifecycle) => {
+            hash_optional_i32(hasher, lifecycle.pid);
+            hash_optional_i32(hasher, lifecycle.signal);
+            hasher.update(lifecycle.dropped_field_count.0.to_le_bytes());
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn hash_optional_i32(hasher: &mut Sha256, value: Option<i32>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
 fn classify_error_group(
     severity: Severity,
     category: ErrorCategory,
@@ -537,6 +606,39 @@ mod tests {
             None,
         )
         .expect("valid error-group fixture")
+    }
+
+    #[test]
+    fn public_event_identity_ignores_lineage_but_retains_content() {
+        let first = error_group(0, 1_000, Severity::Panic, ErrorCategory::System, None);
+        let same_content = EventObservation::new(
+            SegmentIdentity::sealed(1, [9; 32], 7, b"alternate"),
+            first.source_type_id(),
+            ObservationProvenance {
+                section_body_id: SectionBodyId([0xCC; 32]),
+                catalog_entry_ordinal: 4,
+                row_ordinal: 17,
+                dictionary_context_id: DictionaryContextId([0xDD; 32]),
+                source_locator: None,
+            },
+            first.shape(),
+            first.time(),
+            first.occurrence_count(),
+            first.payload().clone(),
+            first.evidence_quality(),
+            first.quality_flags(),
+            first.loss().cloned(),
+        )
+        .expect("same public event in another physical lineage");
+        assert_ne!(first.observation_id(), same_content.observation_id());
+        assert_eq!(
+            notable_event_id(&first),
+            notable_event_id(&same_content),
+            "physical promotion must not change the public event ID"
+        );
+
+        let changed = error_group(1, 1_001, Severity::Panic, ErrorCategory::System, None);
+        assert_ne!(notable_event_id(&first), notable_event_id(&changed));
     }
 
     fn signal_termination(row_ordinal: u32, sort_ts_us: i64, signal: i32) -> EventObservation {

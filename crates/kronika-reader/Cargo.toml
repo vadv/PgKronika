@@ -8,6 +8,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Enables deterministic failure injection for the exact-head parity
+# qualification executable. Production binaries never enable this feature.
+qualification = []
+
 [dependencies]
 kronika-format = { path = "../kronika-format" }
 kronika-registry = { path = "../kronika-registry" }

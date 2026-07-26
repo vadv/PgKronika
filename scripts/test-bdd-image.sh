@@ -249,6 +249,8 @@ test_runtime_source_paths_are_complete_and_not_a_key() {
     || fail "runtime sources must include BDD runner source"
   printf '%s\n' "$paths" | grep -Fx -- bins/pg_kronika-collector/src/main.rs >/dev/null \
     || fail "runtime sources must include collector source"
+  printf '%s\n' "$paths" | grep -Fx -- bins/pg_kronika-web/examples/overview_qualification.rs >/dev/null \
+    || fail "runtime sources must include manifest-declared examples"
   if printf '%s\n' "$paths" | grep -Fx -- scripts/bdd-image.sh >/dev/null; then
     fail "runtime sources must exclude host-only helper"
   fi

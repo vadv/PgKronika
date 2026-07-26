@@ -8,10 +8,22 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Builds the exact-head parity qualification executable and its deterministic
+# persistence-fault hooks. The production server does not enable this feature.
+qualification = [
+  "dep:http-body-util",
+  "dep:kronika-format",
+  "dep:rustix",
+  "dep:tower",
+  "kronika-reader/qualification",
+]
+
 [dependencies]
 kronika-analytics = { path = "../../crates/kronika-analytics" }
 kronika-reader = { path = "../../crates/kronika-reader" }
 kronika-registry = { path = "../../crates/kronika-registry" }
+kronika-format = { path = "../../crates/kronika-format", optional = true }
 axum = "0.8"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
@@ -22,6 +34,7 @@ arc-swap = "1"
 base64 = "0.22"
 subtle = "2"
 rust-embed = { version = "8", features = ["mime-guess"] }
+rustix = { version = "1", features = ["time"], optional = true }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 tracing = "0.1"
@@ -29,9 +42,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower-http = { version = "0.6", features = ["trace"] }
 mimalloc = { version = "0.1", features = ["override"] }
 sha2 = "0.10"
+http-body-util = { version = "0.1", optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
 
 [dev-dependencies]
 kronika-format = { path = "../../crates/kronika-format" }
+kronika-reader = { path = "../../crates/kronika-reader", features = ["qualification"] }
 kronika-writer = { path = "../../crates/kronika-writer" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
@@ -41,6 +57,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "anomalies"
 harness = false
+
+[[example]]
+name = "overview_parity_qualification"
+path = "examples/overview_qualification.rs"
+required-features = ["qualification"]
 
 [lints]
 workspace = true

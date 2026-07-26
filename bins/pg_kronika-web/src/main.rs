@@ -89,6 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refresh = tokio::spawn(refresh_loop(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(cfg.addr.as_str()).await?;
+    #[cfg(feature = "qualification")]
+    pg_kronika_web::qualification::announce_process_ready(listener.local_addr()?)?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let router = app(state, auth, metrics_handle).layer(TraceLayer::new_for_http());

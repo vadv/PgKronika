@@ -107,6 +107,48 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// Complete stable canonical event taxonomy in numeric-code order.
+    pub const ALL: [Self; 38] = [
+        Self::PgLogErrorGroupObserved,
+        Self::PgLifecycleChildSignalTermination,
+        Self::PgLifecycleChildProcessCrash,
+        Self::PgLifecycleShutdownRequested,
+        Self::PgLifecycleReadyObserved,
+        Self::PgCheckpointStarted,
+        Self::PgCheckpointCompleted,
+        Self::PgCheckpointTooFrequentReported,
+        Self::PgMaintenanceAutovacuumReported,
+        Self::PgMaintenanceAutoanalyzeReported,
+        Self::PgQuerySlowGroupReported,
+        Self::PgLockWaitReported,
+        Self::PgLockAcquiredAfterWaitReported,
+        Self::PgTempFileReported,
+        Self::PgDatabaseDeadlockDelta,
+        Self::PgDatabaseRecoveryConflictDelta,
+        Self::PgDatabaseChecksumFailureDelta,
+        Self::PgDatabaseSessionsAbandonedDelta,
+        Self::PgDatabaseSessionsFatalDelta,
+        Self::PgDatabaseSessionsKilledDelta,
+        Self::PgStatisticsResetObserved,
+        Self::PgPostmasterStartChanged,
+        Self::PgRecoveryRoleChanged,
+        Self::PgTimelineChanged,
+        Self::PgReplicationSenderStateChanged,
+        Self::PgReplicationSenderDisappeared,
+        Self::PgReplicationSlotStateChanged,
+        Self::PgReplicationSlotLost,
+        Self::OsCgroupMemoryHighDelta,
+        Self::OsCgroupMemoryMaxDelta,
+        Self::OsCgroupOomDelta,
+        Self::OsCgroupOomKillDelta,
+        Self::OsHostOomKillDelta,
+        Self::OsFilesystemCapacityObservation,
+        Self::OsFilesystemCapacityZeroTransition,
+        Self::CollectorSnapshotGap,
+        Self::CollectorSourceReadFailure,
+        Self::CollectorVisibilityRestricted,
+    ];
+
     /// Stable numeric code used by the canonical fact codec.
     #[must_use]
     pub const fn code(self) -> u16 {
@@ -1786,10 +1828,15 @@ mod tests {
     }
 
     #[test]
-    fn log_gap_stays_coverage_only() {
-        assert_eq!(
-            EventKind::from_code(EventKind::OsCgroupOomKillDelta.code()),
-            Some(EventKind::OsCgroupOomKillDelta)
+    fn event_taxonomy_codes_round_trip_exhaustively() {
+        for kind in EventKind::ALL {
+            assert_eq!(EventKind::from_code(kind.code()), Some(kind));
+            assert!(!kind.wire_code().is_empty());
+        }
+        assert!(
+            EventKind::ALL
+                .windows(2)
+                .all(|pair| pair[0].code() < pair[1].code())
         );
     }
 

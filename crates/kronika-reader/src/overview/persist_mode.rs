@@ -174,7 +174,7 @@ impl PersistState {
         self.next_retry_at = Some(deadline_after(now, INITIAL_BACKOFF));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(super) const fn force_due(&mut self, now: Instant) {
         if self.failures != 0 {
             self.next_retry_at = Some(now);

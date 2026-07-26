@@ -8,13 +8,19 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::io::{self, Write as _};
+#[cfg(feature = "qualification")]
+use std::io::{BufRead as _, BufReader};
 use std::num::NonZeroU64;
+#[cfg(feature = "qualification")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "qualification")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "qualification"))]
 use std::collections::VecDeque;
 
 use kronika_analytics::overview::SegmentIdentity;
@@ -35,8 +41,73 @@ use crate::unit::{PgmBodyReadStats, PgmUnit};
 const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 const NAME_RETRIES: usize = 32;
 
+/// Qualification-only Unix socket used to stop a real web process immediately
+/// before the atomic sidecar rename.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub const QUALIFICATION_PUBLISH_BARRIER_ENV: &str =
+    "KRONIKA_WEB_QUALIFICATION_PUBLISH_BARRIER_SOCKET";
+
+/// Qualification-only publication fault consumed by the first sidecar write.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub const QUALIFICATION_PUBLISH_FAULT_ENV: &str = "KRONIKA_WEB_QUALIFICATION_PUBLISH_FAULT";
+
+/// Barrier message sent after a fully synced temporary sidecar is ready.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub const QUALIFICATION_PUBLISH_BARRIER_READY: &str = "before_commit";
+
+/// Exact release line accepted by the qualification publication barrier.
+#[cfg(feature = "qualification")]
+#[doc(hidden)]
+pub const QUALIFICATION_PUBLISH_BARRIER_RELEASE: &str = "continue\n";
+
 static PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static STORE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "qualification")]
+#[derive(Debug)]
+struct QualificationPublishBarrier {
+    socket: Option<PathBuf>,
+    armed: AtomicBool,
+}
+
+#[cfg(feature = "qualification")]
+impl QualificationPublishBarrier {
+    fn from_env() -> Self {
+        let socket = std::env::var_os(QUALIFICATION_PUBLISH_BARRIER_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        Self {
+            armed: AtomicBool::new(socket.is_some()),
+            socket,
+        }
+    }
+
+    fn wait_before_commit(&self, temporary_name: &str) -> Result<(), PersistError> {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let socket = self.socket.as_deref().ok_or(PersistError::TransientIo)?;
+        let mut stream = UnixStream::connect(socket).map_err(PersistError::from_io)?;
+        writeln!(
+            stream,
+            "{QUALIFICATION_PUBLISH_BARRIER_READY} {temporary_name}"
+        )
+        .map_err(PersistError::from_io)?;
+        stream.flush().map_err(PersistError::from_io)?;
+        let mut release = String::new();
+        BufReader::new(&mut stream)
+            .read_line(&mut release)
+            .map_err(PersistError::from_io)?;
+        if release == QUALIFICATION_PUBLISH_BARRIER_RELEASE {
+            Ok(())
+        } else {
+            Err(PersistError::TransientIo)
+        }
+    }
+}
 
 /// Why a fact-file write could not be published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +134,30 @@ pub enum PersistError {
     InvalidSidecarState,
     /// An unclassified I/O failure occurred and requires operator diagnosis.
     Io,
+}
+
+#[cfg(feature = "qualification")]
+fn qualification_publish_faults_from_env() -> VecDeque<PersistError> {
+    let Some(raw) = std::env::var_os(QUALIFICATION_PUBLISH_FAULT_ENV) else {
+        return VecDeque::new();
+    };
+    raw.to_str()
+        .and_then(|value| match value {
+            "read_only_filesystem" => Some(PersistError::ReadOnlyFilesystem),
+            "permission_denied" => Some(PersistError::PermissionDenied),
+            "no_space" => Some(PersistError::NoSpace),
+            "quota_exceeded" => Some(PersistError::QuotaExceeded),
+            "transient_io" => Some(PersistError::TransientIo),
+            "stale_filesystem" => Some(PersistError::StaleFilesystem),
+            "invalid_facts" => Some(PersistError::InvalidFacts),
+            "busy" => Some(PersistError::Busy),
+            "unsafe_path" => Some(PersistError::UnsafePath),
+            "invalid_sidecar_state" => Some(PersistError::InvalidSidecarState),
+            "io" => Some(PersistError::Io),
+            _ => None,
+        })
+        .into_iter()
+        .collect()
 }
 
 /// Stable operational class for a sidecar-persistence failure.
@@ -216,12 +311,14 @@ pub struct FactStore {
     publication_gate: Arc<Mutex<()>>,
     /// Write mode and retry backoff for sibling sidecars.
     persist: Arc<Mutex<PersistState>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     test_publish_faults: Arc<Mutex<VecDeque<PersistError>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     test_publish_attempts: Arc<AtomicU64>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     test_recovery_gc_attempts: Arc<AtomicU64>,
+    #[cfg(feature = "qualification")]
+    qualification_publish_barrier: Arc<QualificationPublishBarrier>,
 }
 
 struct PersistAttempt {
@@ -304,12 +401,23 @@ impl FactStore {
             owner: Arc::new(Mutex::new(None)),
             publication_gate: Arc::new(Mutex::new(())),
             persist: Arc::new(Mutex::new(PersistState::new(jitter_seed))),
-            #[cfg(test)]
-            test_publish_faults: Arc::new(Mutex::new(VecDeque::new())),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
+            test_publish_faults: Arc::new(Mutex::new({
+                #[cfg(feature = "qualification")]
+                {
+                    qualification_publish_faults_from_env()
+                }
+                #[cfg(not(feature = "qualification"))]
+                {
+                    VecDeque::new()
+                }
+            })),
+            #[cfg(any(test, feature = "qualification"))]
             test_publish_attempts: Arc::new(AtomicU64::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "qualification"))]
             test_recovery_gc_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "qualification")]
+            qualification_publish_barrier: Arc::new(QualificationPublishBarrier::from_env()),
         }
     }
 
@@ -665,7 +773,7 @@ impl FactStore {
         let Some(mark) = mark else {
             return false;
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "qualification"))]
         self.test_recovery_gc_attempts
             .fetch_add(1, Ordering::Relaxed);
         let outcome = self.collect_garbage(&mark);
@@ -679,7 +787,7 @@ impl FactStore {
         bytes: &[u8],
         bounds: &Bounds,
     ) -> Result<PathBuf, PersistError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "qualification"))]
         {
             self.test_publish_attempts.fetch_add(1, Ordering::Relaxed);
             let injected = lock_unpoisoned(&self.test_publish_faults).pop_front();
@@ -725,6 +833,14 @@ impl FactStore {
         let (temp_name, temp_file) = create_temp(&directory)?;
         let write_result = write_synced(temp_file, bytes);
         if let Err(error) = write_result {
+            unlink_ignoring_missing(&directory, &temp_name);
+            return Err(error);
+        }
+        #[cfg(feature = "qualification")]
+        if let Err(error) = self
+            .qualification_publish_barrier
+            .wait_before_commit(&temp_name)
+        {
             unlink_ignoring_missing(&directory, &temp_name);
             return Err(error);
         }
@@ -781,26 +897,63 @@ impl FactStore {
         Err(PersistError::TransientIo)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(super) fn inject_publish_faults(&self, faults: impl IntoIterator<Item = PersistError>) {
         *lock_unpoisoned(&self.test_publish_faults) = faults.into_iter().collect();
         self.test_publish_attempts.store(0, Ordering::Relaxed);
         self.test_recovery_gc_attempts.store(0, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(super) fn test_publish_attempts(&self) -> u64 {
         self.test_publish_attempts.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(super) fn test_recovery_gc_attempts(&self) -> u64 {
         self.test_recovery_gc_attempts.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qualification"))]
     pub(super) fn force_persistence_probe_due(&self) {
         self.with_persist(|persist| persist.force_due(Instant::now()));
+    }
+
+    /// Installs a deterministic persistence-failure sequence for the test-only
+    /// qualification executable.
+    ///
+    /// This hook is not present in production builds.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    pub fn qualification_inject_publish_faults(
+        &self,
+        faults: impl IntoIterator<Item = PersistError>,
+    ) {
+        self.inject_publish_faults(faults);
+    }
+
+    /// Makes the standing retry probe immediately due in a qualification build.
+    /// This hook is not present in production builds.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    pub fn qualification_force_persistence_probe_due(&self) {
+        self.force_persistence_probe_due();
+    }
+
+    /// Exact publication-attempt count for a qualification build.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn qualification_publish_attempts(&self) -> u64 {
+        self.test_publish_attempts()
+    }
+
+    /// Exact capacity-recovery GC attempt count for a qualification build.
+    #[cfg(feature = "qualification")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn qualification_recovery_gc_attempts(&self) -> u64 {
+        self.test_recovery_gc_attempts()
     }
 
     fn read_with_stats<R: ReadAt>(
@@ -1073,6 +1226,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::limits::LIMIT;
+    use super::super::qualification_fixture::all_family_fixture;
     use super::*;
 
     fn context() -> SegmentContext {
@@ -1326,6 +1480,58 @@ mod tests {
         store
             .read(&unit(&bytes_b), &context_b, &LIMIT)
             .expect("source B replacement");
+    }
+
+    #[test]
+    fn oversized_candidate_is_rebuilt_and_atomically_replaced() {
+        let directory = TempDir::new().expect("data directory");
+        let store = FactStore::new(directory.path());
+        let target_bytes = lifecycle_pgm(7);
+        let target_facts = built(&target_bytes);
+        let target_encoded = target_facts
+            .encode(&LIMIT)
+            .expect("encode target facts under absolute bounds");
+        write_pgm(&directory, &context(), &target_bytes);
+
+        let large_source = all_family_fixture().sealed_bytes();
+        let large_encoded = built(&large_source)
+            .encode(&LIMIT)
+            .expect("encode deliberately larger candidate");
+        assert!(
+            large_encoded.len() > target_encoded.len(),
+            "qualification candidate must exceed the target fact file"
+        );
+        let sidecar = directory.path().join(context().sidecar_file_name());
+        std::fs::write(&sidecar, &large_encoded).expect("seed oversized candidate");
+
+        let mut tight = LIMIT;
+        tight.fact_file_len =
+            u64::try_from(target_encoded.len()).expect("target fact length fits u64");
+        let source_before =
+            std::fs::read(directory.path().join(context().pgm_file_name())).expect("read source");
+        let loaded = store
+            .load_or_build(&unit(&target_bytes), &context(), &tight)
+            .expect("rebuild target below the configured bound");
+
+        assert_eq!(loaded.origin(), FactOrigin::Rebuilt);
+        assert_eq!(loaded.rebuild_reason(), Some(CacheRebuildReason::Oversized));
+        assert_eq!(loaded.persist_error(), None);
+        assert_eq!(loaded.facts(), &target_facts);
+        assert!(
+            std::fs::metadata(&sidecar)
+                .expect("replacement metadata")
+                .len()
+                <= tight.fact_file_len,
+            "replacement must satisfy the same admission bound"
+        );
+        store
+            .read(&unit(&target_bytes), &context(), &tight)
+            .expect("replacement is restart-admissible");
+        assert_eq!(
+            std::fs::read(directory.path().join(context().pgm_file_name())).expect("reread source"),
+            source_before,
+            "rebuild must not alter the source PGM"
+        );
     }
 
     #[test]

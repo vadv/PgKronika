@@ -7,7 +7,7 @@ portable performance promise.
 
 ## Dense-hour fixture
 
-`overview-dense-hour-v1` contains exactly 720 `pg_stat_database` snapshots at a
+`overview-dense-hour-v2` contains exactly 720 `pg_stat_database` snapshots at a
 five-second cadence, one reset-context row, and complete source-population
 coverage for every snapshot. Production extraction creates the canonical
 counter, gauge, reset, coverage, and event-fact blocks. The runner records:
@@ -56,18 +56,56 @@ new fact store for each iteration so no process-local fallback or decoded
 in-memory entry survives. The runner preserves these mode data directories next
 to its output artifact as supporting evidence.
 
+The nine mode results retain the complete production endpoint measurements.
+For HTTP modes, the production router and metrics recorder exist before the
+request timer starts; the measured request still includes fact loading,
+projection, response serialization, and body collection. Because HTTP and JSON
+dominate these endpoint results, the artifact also records the separate
+`compact sealed facts read + bucket` profile required by §18.4.6. The unchanged
+25%/25%/50% p95 gates apply to that compact profile, while both profiles and all
+raw samples remain in the artifact.
+
 “Cold” in this runner means newly constructed process-level reader and
 in-memory state. It does not evict the host page cache, and the artifact says
 `storage_cold=false`. A storage-cold result requires a separately controlled
 host/filesystem procedure and must not replace or relabel this measurement.
 
+## PostgreSQL and process-lifecycle BDD
+
+The exact evidence manifest names eight scenarios: one source-scoped timeline
+scenario and one real `pg_kronika-web` process-lifecycle scenario for each
+PostgreSQL major from 15 through 18. Run the lifecycle set with:
+
+```bash
+DEBUG=1 make test-bdd TAGS=@timeline_web_lifecycle
+DEBUG=1 make test-bdd TAGS='@timeline_web_lifecycle and @pg15'
+```
+
+The first command covers PostgreSQL 15–18; the second is a targeted PostgreSQL
+15 diagnostic. Every lifecycle scenario launches the actual `pg_kronika-web`
+executable over an isolated owned data directory, sends HTTP requests to the
+overview, events, health, cursor, and Prometheus endpoints, and starts new
+processes for restart assertions. Explicit post-bind readiness, graceful
+shutdown or asserted process death, and a publication barrier replace timing
+sleeps and retry loops.
+
+The scenarios prove creation and validation of the same-stem `N.ovf`, durable
+reuse without PGM body reads or rewrites, atomic recovery from corrupt and
+every stale identity class, rejection of interrupted temporary publication,
+bounded fallback followed by durable recovery, cancellation recovery,
+process-local cursor expiry, source preservation, and deterministic
+second-owner contention. The artifact validator accepts only the eight exact
+feature/scenario coordinates in the
+[qualification traceability table](overview-parity-v1-traceability.md).
+
 ## Local candidate
 
 ```bash
-cargo run --release -p kronika-reader --example overview_qualification -- \
-  --output target/qualification/overview.json
+cargo run --release --manifest-path bins/pg_kronika-web/Cargo.toml \
+  --example overview_parity_qualification --features qualification -- \
+  --output target/qualification/overview.raw.json
 python3 scripts/validate-overview-qualification.py \
-  target/qualification/overview.json
+  target/qualification/overview.raw.json
 ```
 
 The CI job runs final structural, I/O, and performance validation, then uploads
@@ -76,7 +114,7 @@ artifact from the exact release head, run:
 
 ```bash
 python3 scripts/validate-overview-qualification.py \
-  overview.json --exact-head GIT_SHA --final
+  overview.final.json --exact-head GIT_SHA --final
 ```
 
 Final parity evidence additionally requires every referenced test, BDD job,
