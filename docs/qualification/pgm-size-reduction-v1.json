@@ -1,0 +1,669 @@
+{
+  "schema": "pgkronika.pgm-size-reduction.measurements/v1",
+  "frozen_at_utc": "2026-07-26T11:24:00Z",
+  "repository": {
+    "url": "https://github.com/vadv/PgKronika",
+    "base_commit": "d3da437546b5d6aaa641f36ffbfa962b5597682e",
+    "base_tree": "e9b935d13eb0602a81cca1d073a78588e25a432b",
+    "base_ci": {
+      "workflow": "CI",
+      "run_id": 30194994479,
+      "conclusion": "success",
+      "postgresql_matrix": [
+        "15.18",
+        "16.14",
+        "17.10",
+        "18.4"
+      ]
+    }
+  },
+  "candidate_format": {
+    "container": "PGM, replaced in place; sealed path remains N.pgm",
+    "compatibility": "one current writer, one current reader, one contract; prior internal layout is rejected without migration, fallback or toggle",
+    "scope": "all data and dictionary sections",
+    "data_sections": "one section per populated type_id",
+    "dictionary_sections": "at most one dict.strings and one dict.blobs section",
+    "dictionary_policy": "strictly ordered verified IDs, identical-value deduplication, conflict rejection",
+    "sort_order": "registry canonical sort key",
+    "parquet_writer_version": "1.0",
+    "row_group_rows": 65536,
+    "data_page_bytes": 1048576,
+    "data_page_row_limit": 65536,
+    "column_encoding": "PLAIN",
+    "column_dictionary_enabled": false,
+    "statistics": "none",
+    "column_index": false,
+    "offset_index": false,
+    "compression": "ZSTD",
+    "compression_level": 6,
+    "created_by": ""
+  },
+  "host": {
+    "os": "Fedora Linux 41",
+    "kernel": "6.17.10-100.fc41.x86_64",
+    "filesystem": "ext4",
+    "filesystem_block_bytes": 4096,
+    "cpu": "AMD Ryzen 9 8945HS",
+    "physical_cores": 8,
+    "logical_cpus": 16,
+    "memory_kib": 63541348,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "prototype_binary": {
+      "target": "x86_64-unknown-linux-musl",
+      "linkage": "static-pie",
+      "sha256": "19f960fcabf3205888d0a0824adc6930595aabadba32693605360c0add552ff3"
+    },
+    "cache_policy": "page cache was not dropped",
+    "isolation": "shared host; no CPU, memory, or block-device isolation"
+  },
+  "method": {
+    "natural_producer": {
+      "postgresql": "17.10",
+      "duration_minutes": 46,
+      "collector_interval_seconds": 5,
+      "segment_max_age_seconds": 900,
+      "backends": 20,
+      "target_tps": 200,
+      "filler_tables": 300,
+      "filler_indexes": 500,
+      "large_scan_rows": 500000,
+      "transactions": 552020,
+      "scans": 277,
+      "lock_conflicts": 84,
+      "expected_errors": 370,
+      "transport": "Unix socket"
+    },
+    "identity_proof": [
+      "equal source_id, min_ts and max_ts",
+      "equal non-dictionary type_id sets",
+      "exact canonical Arrow RecordBatch equality for every non-dictionary type_id",
+      "equal normalized dictionary map",
+      "successful decode by the reader at the base commit"
+    ],
+    "percentile": "empirical nearest-rank: sorted[ceil(p*n)-1]",
+    "latency": "warm-cache observations, not service objectives",
+    "io": "pread64 return bytes are logical requested bytes, not block-device reads"
+  },
+  "natural_full_segments": [
+    {
+      "name": "1785059977507800.pgm",
+      "min_ts_us": 1785059977507800,
+      "max_ts_us": 1785060877652022,
+      "source_id": 0,
+      "source": {
+        "sha256": "749e67d88f3c7f36b62e94f449853e23970d4b9bced8f2a4bfa66df7f31cc1a8",
+        "bytes": 19430424,
+        "body_bytes": 19305668,
+        "framing_bytes": 124756,
+        "sections": 3897,
+        "catalog_rows": 140108,
+        "data_rows": 71638,
+        "dictionary_rows": 68470,
+        "compressed_chunk_bytes": 9717960,
+        "parquet_structural_bytes": 9587708,
+        "footer_bytes": 7372953,
+        "column_index_bytes": 1610664,
+        "offset_index_bytes": 604091
+      },
+      "candidate": {
+        "sha256": "8c684bda57b8624fcc28cd56d74b12ba4eb6b616ef33109aada717789fd02ba1",
+        "bytes": 549761,
+        "body_bytes": 548269,
+        "framing_bytes": 1492,
+        "sections": 45,
+        "data_families": 43,
+        "catalog_rows": 75053,
+        "data_rows": 71638,
+        "dictionary_ids": 3415,
+        "compressed_chunk_bytes": 494482,
+        "parquet_structural_bytes": 53787,
+        "footer_bytes": 53787,
+        "column_index_bytes": 0,
+        "offset_index_bytes": 0
+      },
+      "dictionary_rows_removed": 65055,
+      "ratio": 35.343401951030,
+      "saving_percent": 97.170617584,
+      "encode": {
+        "internal_wall_ns": 3666449943,
+        "process_wall_seconds": 3.67,
+        "user_seconds": 0.69,
+        "system_seconds": 2.86,
+        "cpu_percent": 97,
+        "max_rss_kib": 56444,
+        "filesystem_input_blocks": 0,
+        "filesystem_output_blocks": 1088,
+        "filesystem_block_bytes": 512
+      }
+    },
+    {
+      "name": "1785060877737577.pgm",
+      "min_ts_us": 1785060873475000,
+      "max_ts_us": 1785061777673439,
+      "source_id": 0,
+      "source": {
+        "sha256": "eebb80c43f18311d7366ec1e121acb84f505b6d28b0841594a7e37be0a82fa34",
+        "bytes": 19472521,
+        "body_bytes": 19344949,
+        "framing_bytes": 127572,
+        "sections": 3985,
+        "catalog_rows": 136099,
+        "data_rows": 69748,
+        "dictionary_rows": 66351,
+        "compressed_chunk_bytes": 9648265,
+        "parquet_structural_bytes": 9696684,
+        "footer_bytes": 7452687,
+        "column_index_bytes": 1632032,
+        "offset_index_bytes": 611965
+      },
+      "candidate": {
+        "sha256": "8303101271d5036c443763fb8e02a76a9a5d31f1cc6ff85552bc1d7e37e1e54c",
+        "bytes": 524989,
+        "body_bytes": 523497,
+        "framing_bytes": 1492,
+        "sections": 45,
+        "data_families": 43,
+        "catalog_rows": 73125,
+        "data_rows": 69748,
+        "dictionary_ids": 3377,
+        "compressed_chunk_bytes": 469736,
+        "parquet_structural_bytes": 53761,
+        "footer_bytes": 53761,
+        "column_index_bytes": 0,
+        "offset_index_bytes": 0
+      },
+      "dictionary_rows_removed": 62974,
+      "ratio": 37.091293341384,
+      "saving_percent": 97.303949499,
+      "encode": {
+        "internal_wall_ns": 3813024184,
+        "process_wall_seconds": 3.81,
+        "user_seconds": 0.65,
+        "system_seconds": 3.05,
+        "cpu_percent": 96,
+        "max_rss_kib": 55120,
+        "filesystem_input_blocks": 0,
+        "filesystem_output_blocks": 1040,
+        "filesystem_block_bytes": 512
+      }
+    },
+    {
+      "name": "1785061777869918.pgm",
+      "min_ts_us": 1785061775406000,
+      "max_ts_us": 1785062677839412,
+      "source_id": 0,
+      "source": {
+        "sha256": "ed85d14e14438ceb0fca200aaa40ff780b741b6db04ca3249b627ad0b301761a",
+        "bytes": 19329891,
+        "body_bytes": 19203375,
+        "framing_bytes": 126516,
+        "sections": 3952,
+        "catalog_rows": 135669,
+        "data_rows": 69537,
+        "dictionary_rows": 66132,
+        "compressed_chunk_bytes": 9599045,
+        "parquet_structural_bytes": 9604330,
+        "footer_bytes": 7380283,
+        "column_index_bytes": 1617374,
+        "offset_index_bytes": 606673
+      },
+      "candidate": {
+        "sha256": "35a43b9d8c23859283d31027a893496078994784526d3562aec5a2470021ae7a",
+        "bytes": 522016,
+        "body_bytes": 520524,
+        "framing_bytes": 1492,
+        "sections": 45,
+        "data_families": 43,
+        "catalog_rows": 72897,
+        "data_rows": 69537,
+        "dictionary_ids": 3360,
+        "compressed_chunk_bytes": 466807,
+        "parquet_structural_bytes": 53717,
+        "footer_bytes": 53717,
+        "column_index_bytes": 0,
+        "offset_index_bytes": 0
+      },
+      "dictionary_rows_removed": 62772,
+      "ratio": 37.029307530804,
+      "saving_percent": 97.299436401,
+      "encode": {
+        "internal_wall_ns": 3565299302,
+        "process_wall_seconds": 3.57,
+        "user_seconds": 0.64,
+        "system_seconds": 2.85,
+        "cpu_percent": 97,
+        "max_rss_kib": 55008,
+        "filesystem_input_blocks": 0,
+        "filesystem_output_blocks": 1024,
+        "filesystem_block_bytes": 512
+      },
+      "determinism": {
+        "repetitions": 2,
+        "byte_identical": true,
+        "sha256": "35a43b9d8c23859283d31027a893496078994784526d3562aec5a2470021ae7a"
+      }
+    }
+  ],
+  "natural_full_distribution": {
+    "count": 3,
+    "source_bytes_total": 58232836,
+    "candidate_bytes_total": 1596766,
+    "weighted_ratio": 36.469235943150,
+    "saving_percent": 97.257962844,
+    "candidate_bytes": {
+      "p50": 524989,
+      "p95": 549761,
+      "worst": 549761
+    },
+    "ratio": {
+      "p50": 37.029307530804,
+      "p95": 37.091293341384,
+      "worst": 35.343401951030
+    },
+    "encode_internal_wall_ns": {
+      "p50": 3666449943,
+      "p95": 3813024184,
+      "worst": 3813024184
+    },
+    "encode_cpu_seconds": {
+      "p50": 3.55,
+      "p95": 3.70,
+      "worst": 3.70
+    },
+    "encode_max_rss_kib": {
+      "p50": 55120,
+      "p95": 56444,
+      "worst": 56444
+    }
+  },
+  "natural_tail": {
+    "name": "1785062675482000.pgm",
+    "min_ts_us": 1785062675482000,
+    "max_ts_us": 1785062738002630,
+    "duration_seconds": 62.52063,
+    "source_id": 0,
+    "source": {
+      "sha256": "4f39c4fcfc94c0c829d587a7bd11b537829b301f9bebb285372fddcbd96b9aac",
+      "bytes": 1349538,
+      "body_bytes": 1340366,
+      "framing_bytes": 9172,
+      "sections": 285,
+      "catalog_rows": 9869,
+      "data_rows": 4978,
+      "dictionary_rows": 4891,
+      "compressed_chunk_bytes": 664826,
+      "parquet_structural_bytes": 675540,
+      "footer_bytes": 518786,
+      "column_index_bytes": 114000,
+      "offset_index_bytes": 42754
+    },
+    "candidate": {
+      "sha256": "1d4a0333e4b207390916b9b51ca99262fe6e30ca060e52b88482ce930de51d9e",
+      "bytes": 224339,
+      "body_bytes": 222879,
+      "framing_bytes": 1460,
+      "sections": 44,
+      "data_families": 42,
+      "catalog_rows": 7685,
+      "data_rows": 4978,
+      "dictionary_ids": 2707,
+      "compressed_chunk_bytes": 172627,
+      "parquet_structural_bytes": 50252,
+      "footer_bytes": 50252,
+      "column_index_bytes": 0,
+      "offset_index_bytes": 0
+    },
+    "dictionary_rows_removed": 2184,
+    "ratio": 6.015619219128,
+    "saving_percent": 83.376607402,
+    "nominal_candidate_bytes_distribution": {
+      "count": 1,
+      "p50": 224339,
+      "p95": 224339,
+      "worst": 224339,
+      "population_estimate": false
+    },
+    "encode": {
+      "internal_wall_ns": 783284147,
+      "process_wall_seconds": 0.78,
+      "user_seconds": 0.11,
+      "system_seconds": 0.65,
+      "cpu_percent": 97,
+      "max_rss_kib": 13184,
+      "filesystem_input_blocks": 0,
+      "filesystem_output_blocks": 440,
+      "filesystem_block_bytes": 512
+    }
+  },
+  "all_contract_fixture": {
+    "registered_contracts": 75,
+    "source": {
+      "name": "all-75-contracts-current-default.v3.pgm",
+      "sha256": "0ab7ea4a707765b2928aff853b5dacb3b9f7d4e77e8d18678ed20e00c5dc0f0d",
+      "bytes": 1735972,
+      "sections": 308,
+      "catalog_rows": 2432,
+      "data_rows": 2400,
+      "dictionary_rows": 32
+    },
+    "candidate": {
+      "name": "all-75-contracts-full-plain-wide-z6.v3.pgm",
+      "sha256": "511d7267844f382661feda636c8ce20c0ac89f4bede376031e8e039414f021ed",
+      "bytes": 263295,
+      "sections": 77,
+      "data_rows": 2400,
+      "dictionary_ids": 8,
+      "data_type_ids": 75
+    },
+    "ratio": 6.593258512315,
+    "saving_percent": 84.832992698,
+    "determinism": {
+      "repetitions": 2,
+      "byte_identical": true,
+      "sha256": "511d7267844f382661feda636c8ce20c0ac89f4bede376031e8e039414f021ed"
+    }
+  },
+  "segment_1_attribution": {
+    "source": {
+      "bytes": 19430424,
+      "compressed_chunk_bytes": 9717960,
+      "parquet_structural_bytes": 9587708,
+      "framing_bytes": 124756,
+      "sections": 3897
+    },
+    "data_coalesced_current_like": {
+      "bytes": 3660657,
+      "compressed_chunk_bytes": 2901776,
+      "parquet_structural_bytes": 738669,
+      "framing_bytes": 20212,
+      "sections": 630,
+      "saving_bytes": 15769767,
+      "saving_components": {
+        "compressed_chunks": 6816184,
+        "parquet_structural": 8849039,
+        "framing": 104544
+      }
+    },
+    "dictionary_deduplicated_current_like": {
+      "bytes": 16723406,
+      "compressed_chunk_bytes": 7627103,
+      "parquet_structural_bytes": 8990267,
+      "framing_bytes": 106036,
+      "sections": 3312,
+      "saving_bytes": 2707018,
+      "saving_components": {
+        "compressed_chunks": 2090857,
+        "parquet_structural": 597441,
+        "framing": 18720
+      }
+    },
+    "full_coalesced_deduplicated_current_like": {
+      "bytes": 953639,
+      "compressed_chunk_bytes": 810919,
+      "parquet_structural_bytes": 141228,
+      "footer_bytes": 108690,
+      "column_index_bytes": 23326,
+      "offset_index_bytes": 9212,
+      "framing_bytes": 1492,
+      "sections": 45,
+      "saving_bytes": 18476785
+    },
+    "incremental_profiles": [
+      {
+        "change": "disable statistics and page indexes",
+        "before_bytes": 953639,
+        "after_bytes": 845357,
+        "saving_bytes": 108282,
+        "compressed_chunk_saving_bytes": 28508,
+        "footer_saving_bytes": 47236,
+        "column_index_saving_bytes": 23326,
+        "offset_index_saving_bytes": 9212
+      },
+      {
+        "change": "disable Parquet dictionary encoding and use PLAIN",
+        "before_bytes": 845357,
+        "after_bytes": 633279,
+        "saving_bytes": 212078,
+        "compressed_chunk_saving_bytes": 204452,
+        "footer_saving_bytes": 7626
+      },
+      {
+        "change": "one data page per observed column chunk",
+        "before_bytes": 633279,
+        "after_bytes": 585580,
+        "saving_bytes": 47699,
+        "compressed_chunk_saving_bytes": 47665,
+        "footer_saving_bytes": 34
+      },
+      {
+        "change": "ZSTD level 3 to level 6",
+        "before_bytes": 585580,
+        "after_bytes": 549761,
+        "saving_bytes": 35819,
+        "compressed_chunk_saving_bytes": 35812,
+        "footer_saving_bytes": 7
+      }
+    ],
+    "final": {
+      "bytes": 549761,
+      "compressed_chunk_bytes": 494482,
+      "parquet_structural_bytes": 53787,
+      "framing_bytes": 1492,
+      "sections": 45,
+      "saving_bytes": 18880663,
+      "saving_components": {
+        "compressed_chunks": 9223478,
+        "parquet_structural": 9533921,
+        "framing": 123264
+      }
+    }
+  },
+  "reader_benchmarks": {
+    "direct_all_body_segment_1": {
+      "iterations": 10,
+      "source": {
+        "open_mean_ns": 325673,
+        "decode_mean_ns": 3133735919,
+        "stored_body_bytes_per_iteration": 19305668,
+        "rows_per_iteration": 75053,
+        "max_rss_kib": 6832
+      },
+      "candidate": {
+        "open_mean_ns": 21064,
+        "decode_mean_ns": 55172371,
+        "stored_body_bytes_per_iteration": 548269,
+        "rows_per_iteration": 75053,
+        "max_rss_kib": 23836
+      },
+      "decode_speedup": 56.799007587,
+      "strace_one_iteration": {
+        "source_pread64_calls": 3900,
+        "candidate_pread64_calls": 48
+      }
+    },
+    "targeted_segment_1": [
+      {
+        "type_id": 1001003,
+        "name": "pg_stat_activity",
+        "iterations": 50,
+        "source_decode_mean_ns": 279097890,
+        "candidate_decode_mean_ns": 2248442,
+        "source_stored_bytes_per_iteration": 1415185,
+        "candidate_stored_bytes_per_iteration": 44702
+      },
+      {
+        "type_id": 1002005,
+        "name": "pg_stat_statements",
+        "iterations": 50,
+        "source_decode_mean_ns": 112255352,
+        "candidate_decode_mean_ns": 12491042,
+        "source_stored_bytes_per_iteration": 2106237,
+        "candidate_stored_bytes_per_iteration": 111052
+      },
+      {
+        "type_id": 1100001,
+        "name": "os_process",
+        "iterations": 50,
+        "source_decode_mean_ns": 431259839,
+        "candidate_decode_mean_ns": 3953040,
+        "source_stored_bytes_per_iteration": 2104953,
+        "candidate_stored_bytes_per_iteration": 97270
+      }
+    ],
+    "snapshot_query_full_segments": {
+      "section": "pg_stat_activity",
+      "iterations_per_file": 10,
+      "limit": 100000,
+      "source_restart_mean_ns": [
+        425245,
+        434614,
+        430612
+      ],
+      "candidate_restart_mean_ns": [
+        68192,
+        71600,
+        92460
+      ],
+      "source_query_mean_ns": [
+        386064936,
+        403996340,
+        394622369
+      ],
+      "candidate_query_mean_ns": [
+        19561762,
+        19535552,
+        19228578
+      ],
+      "rows": [
+        7990,
+        8316,
+        8153
+      ],
+      "pairwise_page_sha256": [
+        "1d52c95266ed73b0e865e863bbf2872dfb4c58fa8060752fd27d7b6622b29e27",
+        "11d6a5a87370957bd646556cc7294bae3227bac4486f612ec166b6790b89a9c5",
+        "b810c9b6304591a4486d5a59fd003b4bebf42d66564e8a7e6af354fce190e2d8"
+      ],
+      "source_restart_distribution_ns": {
+        "p50": 430612,
+        "p95": 434614,
+        "worst": 434614
+      },
+      "candidate_restart_distribution_ns": {
+        "p50": 71600,
+        "p95": 92460,
+        "worst": 92460
+      },
+      "source_query_distribution_ns": {
+        "p50": 394622369,
+        "p95": 403996340,
+        "worst": 403996340
+      },
+      "candidate_query_distribution_ns": {
+        "p50": 19535552,
+        "p95": 19561762,
+        "worst": 19561762
+      },
+      "segment_1_strace_restart_plus_query": {
+        "source_pread64_calls": 835,
+        "source_pread64_bytes": 4454702,
+        "candidate_pread64_calls": 9,
+        "candidate_pread64_bytes": 113399,
+        "source_restart_catalog_bytes": 124756,
+        "candidate_restart_catalog_bytes": 1492
+      }
+    },
+    "snapshot_query_tail": {
+      "iterations": 10,
+      "rows": 473,
+      "source_restart_mean_ns": 69056,
+      "candidate_restart_mean_ns": 34484,
+      "source_query_mean_ns": 25638123,
+      "candidate_query_mean_ns": 3043994,
+      "pairwise_page_sha256": "002a9b31162ee9f849cf7c427322aa49c0a55b41d79dd160ecce946398542f29",
+      "population_estimate": false
+    }
+  },
+  "dictionary_and_fault_cases": [
+    {
+      "case": "identical duplicate across sections",
+      "result": "accepted and deduplicated"
+    },
+    {
+      "case": "reversed dictionary section order",
+      "result": "byte-identical candidate"
+    },
+    {
+      "case": "same ID with different value",
+      "result": "rejected before output publication"
+    },
+    {
+      "case": "same ID in strings and blobs with incompatible representation",
+      "result": "rejected before output publication"
+    },
+    {
+      "case": "descending IDs",
+      "result": "rejected by reader and research encoder"
+    },
+    {
+      "case": "same-section duplicate ID",
+      "result": "rejected by reader and research encoder"
+    },
+    {
+      "case": "section body corruption",
+      "result": "rejected by section CRC32C"
+    },
+    {
+      "case": "catalog corruption",
+      "result": "rejected by catalog CRC32C"
+    },
+    {
+      "case": "one-byte tail truncation",
+      "result": "rejected by tail-index validation"
+    }
+  ],
+  "ovf_interaction": {
+    "natural_46_minute_corpus": {
+      "source_result": "source integrity check failed on first segment",
+      "candidate_result": "source integrity check failed on first segment",
+      "ovf_bytes_reported": false,
+      "interpretation": "existing fact-builder limitation reproduced equally; no 46-minute OVF total is inferred"
+    },
+    "successful_two_segment_mechanism_corpus": {
+      "source": {
+        "pgm_bytes": 2427327,
+        "ovf_bytes": 85694,
+        "combined_bytes": 2513021,
+        "source_manifest_items": [
+          278,
+          256
+        ]
+      },
+      "candidate": {
+        "pgm_bytes": 303275,
+        "ovf_bytes": 70481,
+        "combined_bytes": 373756,
+        "source_manifest_items": [
+          42,
+          41
+        ]
+      },
+      "pgm_ratio": 8.003716099,
+      "combined_ratio": 6.723694068,
+      "ovf_reduction_bytes": 15213,
+      "all_non_manifest_fact_blocks_equal": true,
+      "ovf_codec": "None"
+    }
+  },
+  "limitations": [
+    "Only PostgreSQL 17.10 produced the three natural full segments and the tail.",
+    "The all-contract fixture is synthetic and covers registered layouts, not a live PostgreSQL 15, 16, or 18 producer.",
+    "The full-segment sample has n=3, so nearest-rank p95 equals the maximum.",
+    "The tail has n=1 and is not included in the full-segment distribution.",
+    "Warm page cache and a shared host make latency unsuitable as a service objective.",
+    "Prototype peak RSS materializes merged batches and is evidence for the prototype, not the bounded production architecture.",
+    "The 46-minute corpus cannot produce current OVF because the unchanged source and candidate hit the same existing fact-builder integrity rejection.",
+    "No retention-rate or hourly projection is inferred from this sample."
+  ]
+}
