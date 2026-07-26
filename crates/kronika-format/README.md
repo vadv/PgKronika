@@ -669,7 +669,4 @@ Sources of truth:
 - [`src/dictionary.rs`](src/dictionary.rs) for dictionary invariants;
 - [`kronika-registry`](../kronika-registry/README.md) for section schemas and
   Parquet limits;
-- [`kronika-writer`](../kronika-writer/README.md) for append and seal behavior;
-- [`docs/segment-format.md`](../../docs/segment-format.md) only as a historical
-  design note. Its proposed hot zones, charts, and compaction are not the
-  current v1 implementation.
+- [`kronika-writer`](../kronika-writer/README.md) for append and seal behavior.

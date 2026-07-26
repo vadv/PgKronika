@@ -4,6 +4,6 @@
 //! implemented. The placeholder prints an error and exits with status 2.
 
 fn main() {
-    eprintln!("pg_kronika-archiver: not implemented yet, see docs/plan.md");
+    eprintln!("pg_kronika-archiver: not implemented");
     std::process::exit(2);
 }

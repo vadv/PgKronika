@@ -1,67 +1,44 @@
 # Класс 1: PostgreSQL
 
-PostgreSQL-источники занимают диапазон `1_001_001` - `1_099_999`.
+PostgreSQL-источники занимают диапазон `1_001_001`–`1_099_999`. Точные схемы
+объявлены в
+[`crates/kronika-registry/src/codec`](../../crates/kronika-registry/src/codec),
+а правила и параметры чтения PostgreSQL описаны в
+[`postgresql-collection.md`](postgresql-collection.md).
 
 ## Сводная таблица
 
-| `type_id` | Источник | Период | Семантика | Сортировка |
-|-----------|----------|----------|-----------|------------|
-| `1_001_001` | `pg_stat_activity` (PG 10-12) | базовый шаг | `snapshot_full` | `(ts, pid)` |
-| `1_001_002` | `pg_stat_activity` (PG 13) | базовый шаг | `snapshot_full` | `(ts, pid)` |
-| `1_001_003` | `pg_stat_activity` (PG 14-18) | базовый шаг | `snapshot_full` | `(ts, pid)` |
-| `1_002_001` | `pg_stat_statements` (ext ≤ 1.7, PG 10-12) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
-| `1_002_002` | `pg_stat_statements` (ext 1.8, PG 13) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
-| `1_002_003` | `pg_stat_statements` (ext 1.9, PG 14) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
-| `1_002_004` | `pg_stat_statements` (ext 1.10, PG 15-16) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
-| `1_002_005` | `pg_stat_statements` (ext 1.11, PG 17) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
-| `1_002_006` | `pg_stat_statements` (ext 1.12, PG 18) | 30 с | `snapshot_full` | `(dbid, userid, ts)` |
-| `1_003_001` | `pg_store_plans`, форк ossc 1.10 | 5 мин | `snapshot_full` | `(dbid, userid, queryid, planid)` |
-| `1_004_001` | `pg_store_plans`, форк vadv | 5 мин | `snapshot_full` | `(dbid, userid, planid)` |
-| `1_005_001` | `pg_stat_database` (PG 10-11) | базовый шаг | `snapshot_full` | `(datid, ts)` |
-| `1_005_002` | `pg_stat_database` (PG 12-13) | базовый шаг | `snapshot_full` | `(datid, ts)` |
-| `1_005_003` | `pg_stat_database` (PG 14-17) | базовый шаг | `snapshot_full` | `(datid, ts)` |
-| `1_005_004` | `pg_stat_database` (PG 18) | базовый шаг | `snapshot_full` | `(datid, ts)` |
-| `1_006_001` | `pg_stat_bgwriter` + `pg_stat_checkpointer` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_007_001` | `pg_stat_wal` (PG 14-17) | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_007_002` | `pg_stat_wal` (PG 18) | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_008_001` | `pg_stat_archiver` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_009_001` | `pg_stat_io` (PG 16-17) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
-| `1_009_002` | `pg_stat_io` (PG 18) | базовый шаг | `snapshot_full` | `(backend_type, object, context, ts)` |
-| `1_010_001` | `pg_prepared_xacts` по базам | базовый шаг | `snapshot_full` | `(datname, ts)` |
-| `1_011_001` | `pg_locks`, граф ожиданий (PG 10-13) | по факту | `conditional_full` | `(root_pid, depth, pid)` |
-| `1_011_002` | `pg_locks`, граф ожиданий (PG 14-18, +`waitstart`) | по факту | `conditional_full` | `(root_pid, depth, pid)` |
-| `1_012_001` | `pg_stat_progress_vacuum` | базовый шаг | `conditional_full` | `(ts, pid)` |
-| `1_013_001` | `pg_stat_user_tables` + statio (PG 10-12) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
-| `1_013_002` | `pg_stat_user_tables` + statio (PG 13-15) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
-| `1_013_003` | `pg_stat_user_tables` + statio (PG 16-17) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
-| `1_013_004` | `pg_stat_user_tables` + statio (PG 18) | 30 с | `snapshot_full` | `(datid, relid, ts)` |
-| `1_014_001` | `pg_stat_user_indexes` + statio (PG 10-15) | 30 с | `snapshot_full` | `(datid, indexrelid, ts)` |
-| `1_014_002` | `pg_stat_user_indexes` + statio (PG 16-18) | 30 с | `snapshot_full` | `(datid, indexrelid, ts)` |
-| `1_015_001` | replication: статус инстанса | 30 с | `snapshot_full` | `(ts)` |
-| `1_016_001` | replication: реплики primary | 30 с | `snapshot_full` | `(application_name, pid, ts)` |
-| `1_017_001` | replication: слоты | 30 с | `snapshot_full` | `(slot_name, ts)` |
-| `1_018_001` | wraparound | 30 с | `snapshot_full` | `(datname, ts)` |
-| `1_019_001` | `pg_settings` | сегмент + 1 ч | `on_change` | `(name)` |
-| `1_020_001` | `reset_metadata` | сегмент | `snapshot_full` | `(ts)` |
-| `1_021_001` | `instance_metadata` | сегмент | `snapshot_full` | `(ts)` |
-| `1_022_001` | log: ошибки stderr, сгруппированные | поток | `event_stream` | `(severity, category, pattern, ts)` |
-| `1_023_001` | coverage | 30 с | `snapshot_full` | `(source_type_id, ts)` |
-| `1_024_001` | log: checkpoint events из stderr | поток | `event_stream` | `(ts, phase)` |
-| `1_025_001` | log: autovacuum/autoanalyze events из stderr | поток | `event_stream` | `(ts, kind, relation)` |
-| `1_026_001` | log: slow-query top-N из stderr | поток | `event_stream` | `(pattern, ts)` |
-| `1_027_001` | log: lock-wait events из stderr | поток | `event_stream` | `(ts, kind, pid)` |
-| `1_028_001` | log: lifecycle events из stderr | поток | `event_stream` | `(ts, kind)` |
-| `1_029_001` | log: пропуски и деградации tailer/parser | поток | `event_stream` | `(ts, reason)` |
-| `1_030_001` | log: temporary-file events из stderr | поток | `event_stream` | `(ts, size_bytes)` |
-| `1_031_001` | эффективные пределы заморозки XID/MXID | 30 с | `snapshot_full` | `(datid, relid, ts)` |
-| `1_032_001` | текущий vacuum с серверными часами | базовый шаг | `conditional_full` | `(pid, session_start_key, query_start_key, ts)` |
-| `1_033_001` | физическая репликация: состояние и разрывы | 30 с | `snapshot_full` | `(pid, backend_start_key, ts)` |
-| `1_034_001` | удержание WAL слотами (PG 15) | 30 с | `snapshot_full` | `(slot_name, ts)` |
-| `1_034_002` | удержание WAL слотами (PG 16) | 30 с | `snapshot_full` | `(slot_name, ts)` |
-| `1_034_003` | удержание WAL слотами (PG 17-18) | 30 с | `snapshot_full` | `(slot_name, ts)` |
-| `1_036_001` | хранилище PostgreSQL → mount, без путей | базовый шаг | `snapshot_full` | `(role, path_hash_hi, path_hash_lo, ts)` |
-| `1_036_002` | хранилище PostgreSQL → точное локальное block device, без путей | базовый шаг | `snapshot_full` | `(role, path_hash_hi, path_hash_lo, ts)` |
-| `1_037_001` | процесс PostgreSQL → memory cgroup, без путей | базовый шаг | `snapshot_full` | `(process_hash_hi, process_hash_lo, ts)` |
+| `type_id` | Логическая секция | Семантика |
+| --- | --- | --- |
+| `1_001_001`–`1_001_003` | `pg_stat_activity` для PG 10–18 | `snapshot_full` |
+| `1_002_001`–`1_002_006` | `pg_stat_statements` 1.7–1.12 | `snapshot_full` |
+| `1_003_001`, `1_004_001` | `pg_store_plans` ossc и vadv | `snapshot_full` |
+| `1_005_001`–`1_005_004` | `pg_stat_database` для PG 10–18 | `snapshot_full` |
+| `1_006_001` | bgwriter и checkpointer | `snapshot_full` |
+| `1_007_001`, `1_007_002` | статистика WAL | `snapshot_full` |
+| `1_008_001` | архивация WAL | `snapshot_full` |
+| `1_009_001`, `1_009_002` | статистика ввода-вывода | `snapshot_full` |
+| `1_010_001` | подготовленные транзакции | `snapshot_full` |
+| `1_011_001`, `1_011_002` | граф ожиданий блокировок | `conditional_full` |
+| `1_012_001` | `pg_stat_progress_vacuum` | `conditional_full` |
+| `1_013_001`–`1_013_004` | статистика таблиц | `snapshot_full` |
+| `1_014_001`, `1_014_002` | статистика индексов | `snapshot_full` |
+| `1_015_001`, `1_016_001`, `1_017_001` | состояние репликации, реплики и слоты | `snapshot_full` |
+| `1_019_001` | `pg_settings` | `on_change` |
+| `1_020_001`, `1_021_001` | reset- и instance-метаданные | `snapshot_full` |
+| `1_022_001`, `1_024_001`–`1_030_001` | типизированные события stderr | `event_stream` |
+| `1_023_001` | покрытие усечённых top-N источников | `snapshot_full` |
+| `1_031_001` | пределы заморозки XID/MXID | `snapshot_full` |
+| `1_032_001` | выполняющийся vacuum | `conditional_full` |
+| `1_033_001` | состояние физической репликации и разрывы | `snapshot_full` |
+| `1_034_001`–`1_034_003` | удержание WAL слотами | `snapshot_full` |
+| `1_036_001`, `1_036_002` | хранилище PostgreSQL и локальное устройство | `snapshot_full` |
+| `1_037_001` | процесс PostgreSQL и memory cgroup | `snapshot_full` |
+| `1_038_001` | полнота многорядного снимка | `snapshot_full` |
+
+Период не является свойством `type_id`: его задаёт планировщик коллектора.
+Версии PostgreSQL и расширений, точные ключи сортировки и схемы полей
+раскрыты ниже.
 
 ## `1_001_001` / `1_001_002` / `1_001_003` `pg_stat_activity`
 
@@ -122,9 +99,8 @@ state_change       ts?   G   // NULL у фоновых
 `1_001_002` — та же раскладка без `query_id`. `1_001_001` — без `query_id` и без
 `leader_pid`.
 
-Осознанно отложено: 1-секундный ASH-сэмпл активных строк (для AAS и профиля
-коротких ожиданий) — отдельный тип; граф ожиданий (`pg_blocking_pids`) — типы
-`1_011_001` / `1_011_002`.
+Граф ожиданий (`pg_blocking_pids`) хранится отдельно в `1_011_001` и
+`1_011_002`.
 
 ## `1_002_001`..`1_002_006` `pg_stat_statements`
 
@@ -548,7 +524,7 @@ prepared-транзакции в микросекундах, рассчитан�
 которые прошли guard по объёму. Если предварительная проверка не нашла ожиданий,
 отсутствие секции означает пустой граф ожиданий в этом окне сбора. Если сбор
 `1_011` упал или guard сработал, коллектор пропускает только эту секцию и пишет
-сообщение в лог; остальные секции снимка продолжают запечатываться.
+сообщение в лог; остальные секции снимка продолжают формироваться.
 
 Секция описывает узлы графа: каждый backend, участвующий в блокирующем компоненте,
 даёт одну строку. Направленные рёбра графа хранятся в колонке `blocked_by`
@@ -849,8 +825,8 @@ SQLSTATE 57014 — расширить и повторить базу, иначе
 
 Стартовая валидация: `DEFAULT_MAX_DATABASES * оси * N` для tables и indexes
 должно укладываться в лимит строк одной секции (`MAX_SECTION_ROWS` = 65536), иначе
-коллектор падает на старте с явной ошибкой — иначе переполнение всплыло бы только
-при запечатывании и потеряло бы весь сегмент.
+коллектор падает на старте с явной ошибкой — иначе переполнение обнаружилось бы
+только при формировании файла и потеряло бы весь сегмент.
 
 `pg_statio_user_indexes` сливается в строку через `LEFT JOIN` по `indexrelid`;
 `idx_blks_read`/`idx_blks_hit` берутся под `COALESCE(..., 0)` — гонка между
@@ -994,14 +970,6 @@ retained_bytes      i64?  G
 wal_status          str?  L   // reserved | extended | unreserved | lost, PG13+
 ```
 
-## `1_018_001` wraparound
-
-```text
-ts       ts   T
-datname  str  L
-age      i64  G   // age(datfrozenxid)
-```
-
 ## `1_019_001` `pg_settings`
 
 `on_change`, политика материализации `every_segment_last_known`. Около 350 строк
@@ -1102,10 +1070,8 @@ track_wal_io_timing            bool? L
   изменился или недоступен, код чтения всё равно должен разорвать ряд и пометить
   reset как неподтвержденный.
 - `NULL` в `*_reset_at` означает «источник недоступен», а не unix epoch.
-- `pg_stat_database_reset_max_at` — грубый маркер. Он подтверждает, что был
-  reset статистики на уровне базы, но не говорит, какая именно база сброшена.
-  Если понадобится точная атрибуция, будущая версия должна добавить
-  `stats_reset` по каждой базе в `1_005_001` или отдельный служебный тип.
+- `pg_stat_database_reset_max_at` — грубый маркер. Он подтверждает reset
+  статистики на уровне базы, но не указывает конкретную базу.
 
 Соответствие reset-полей типам:
 
@@ -1144,7 +1110,7 @@ btime                 ts    L   // /proc/stat btime
 самодостаточными: код чтения не должен знать эти значения из внешней
 конфигурации.
 
-## Логовые типы `1_022_001`, `1_024_001`, `1_026_001`, `1_028_001`, `1_029_001`
+## Логовые типы `1_022_001`, `1_024_001`–`1_030_001`
 
 Текущая область логов — ограниченный байтовый tailer для `stderr`,
 группировка ошибок, выбранные типизированные `LOG:` события и явные строки деградации.
@@ -1176,9 +1142,8 @@ btime                 ts    L   // /proc/stat btime
 
 Обычные `LOG:` строки не превращаются в ошибки и не пишутся в PGM. Typed
 pipeline принимает только известные stderr-шаблоны: checkpoint, autovacuum /
-autoanalyze, slow query, lock wait, lifecycle и temporary file. Полный
-байтовый `csvlog` parser остаётся поздним опциональным расширением, не
-near-term путём.
+autoanalyze, slow query, lock wait, lifecycle и temporary file. Формат
+`csvlog` не поддерживается.
 
 Языковая область stderr parser ограничена английскими PostgreSQL `msgid` и
 русскими NLS `msgstr`, сверенными по upstream веткам `REL_15_STABLE` ...
@@ -1194,8 +1159,7 @@ near-term путём.
 Для `stderr` SQLSTATE-like token эвристически извлекается только в начале
 сообщения из форм `XXXXX: ...` и `XXXXX:  ...`. Это best-effort разбор текста:
 ложные совпадения и пропуски допустимы.
-`database` и `username` в stderr-области остаются `NULL`. Их возможное
-заполнение относится к будущему `csvlog` parser. Обычные
+`database` и `username` в stderr-области остаются `NULL`. Обычные
 `LOG:` строки не пишутся в `pg_log_errors`; в stderr-области допускаются только
 отобранные `LOG:` события падения backend/postmaster и OOM/SIGKILL.
 
@@ -1421,7 +1385,7 @@ Coverage не делает top-N источник полным. Он сообщ�
 источника видел коллектор и почему остальное отсутствует. Если
 `unknown_total = true`, `total` нельзя трактовать как точное число строк.
 
-## Gauge-контракты `1_031`-`1_037`
+## Секции для диагностики инцидентов
 
 `1_031_001` хранит отдельные возраста и эффективные пределы XID и MXID для
 строки базы и ограниченного набора самых старых таблиц. Локальные параметры
@@ -1440,15 +1404,48 @@ Coverage не делает top-N источник полным. Он сообщ�
 не считается физической. Ключ `(pid, backend_start_key)` защищает от повторного
 использования PID.
 
-`1_034_001`-`1_034_003` разделены по версиям PostgreSQL: PG 16 добавляет
+`1_034_001`–`1_034_003` разделены по версиям PostgreSQL: PG 16 добавляет
 `conflicting`, PG 17 — `invalidation_reason`. `retained_bytes`,
 `safe_wal_size`, конечный `max_slot_wal_keep_size_bytes` и `wal_status_code`
 остаются разными наблюдениями; `NULL` не превращается в ноль.
 
-`1_036_001`, `1_036_002` и `1_037_001` создаются только co-located collector. Сырые пути
-PostgreSQL, mount и cgroup в формат не попадают. Storage join проверяет
-PID/start backend, неизменность его mount namespace и совпадение с namespace
-collector; ёмкость берётся по `f_bavail`. V2 записывает major/minor только
-для доказанного ненулевого локального block device. Cgroup join повторно читает start и
-membership вокруг чтения контроллера. `mapping_state = 1` означает доказанное
+`1_036_001`, `1_036_002` и `1_037_001` создаются только коллектором, который
+работает на одном узле с PostgreSQL. Сырые пути PostgreSQL, mount и cgroup в
+формат не попадают. Сопоставление хранилища проверяет PID и время запуска
+backend, неизменность пространства имён монтирования и его совпадение с
+пространством имён коллектора; доступная ёмкость берётся по `f_bavail`.
+`1_036_002` записывает major/minor
+только для доказанного ненулевого локального блочного устройства.
+Сопоставление cgroup повторно читает время запуска и принадлежность процесса к
+cgroup до и после чтения контроллера. `mapping_state = 1` означает доказанное
 соответствие, остальные коды — типизированную причину отсутствия данных.
+
+## `1_038_001` полнота снимка
+
+Одна строка описывает одну попытку прочитать многорядный источник. Эта секция
+не позволяет считать снимок полным только потому, что исходная секция
+присутствует и содержит строки. Для старых сегментов без `1_038_001` полнота
+остаётся неизвестной.
+
+```text
+ts                    ts   T
+source_type_id        u32  L
+collector_pid         u32  L
+collector_started_at  ts   L
+read_state            u8   L   // 0=complete, 1=source_limit,
+                               // 2=permission, 3=read_failure,
+                               // 4=collector_limit_or_loss
+visibility            u8   L   // 0=full, 1=restricted, 2=unknown
+source_total          u32  G   // строк замечено до отбрасывания коллектором
+collected             u32  G   // строк сохранено
+```
+
+`read_state=0` допустим только при `collected=source_total`. Даже при этом
+`visibility=1` означает, что PostgreSQL скрыл часть строк из-за прав доступа.
+Пара `(collector_pid, collector_started_at)` отделяет попытки разных сессий
+коллектора.
+
+`1_023_001` и `1_038_001` не дублируют друг друга. Первая секция объясняет
+конкретный top-N или иной усечённый отбор и его границу. Вторая хранит общий
+результат попытки чтения, включая отказ, ограниченную видимость и потерю на
+стороне коллектора.

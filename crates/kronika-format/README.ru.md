@@ -643,7 +643,4 @@ CRC32C покрывает каждое тело секции, каталог и 
 - [`kronika-registry`](../kronika-registry/README.ru.md) — схемы секций и
   ограничения Parquet;
 - [`kronika-writer`](../kronika-writer/README.ru.md) — дописывание частей и
-  seal;
-- [`docs/segment-format.md`](../../docs/segment-format.md) — только
-  историческая проектная заметка. Горячие зоны, диаграммы и уплотнение из неё
-  не входят в текущую реализацию v1.
+  формирование готового PGM.
