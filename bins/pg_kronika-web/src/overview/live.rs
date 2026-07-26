@@ -558,6 +558,7 @@ mod tests {
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::pg_log::PgLogLifecycleV1;
     use kronika_registry::{Section, Ts};
+    use kronika_writer::{Journal, JournalConfig, seal};
 
     use crate::overview::selection::SelectedSealedPlan;
     use crate::overview::view::{IndexView, SourceStatus};
@@ -947,31 +948,13 @@ mod tests {
             "append must preserve the stable public identity of prior live rows"
         );
 
-        let first_body =
-            PgLogLifecycleV1::encode(std::slice::from_ref(&first)).expect("first body");
-        let second_body =
-            PgLogLifecycleV1::encode(std::slice::from_ref(&second)).expect("second body");
-        let sealed = build_part(
-            &[
-                SectionInput {
-                    type_id: 1_028_001,
-                    rows: 1,
-                    body: &first_body,
-                },
-                SectionInput {
-                    type_id: 1_028_001,
-                    rows: 1,
-                    body: &second_body,
-                },
-            ],
-            PartMeta {
-                min_ts: first.ts.0,
-                max_ts: second.ts.0,
-                source_id: 7,
-            },
-        );
-        std::fs::write(dir.path().join("1000.pgm"), sealed).expect("write sealed segment");
-        std::fs::write(dir.path().join("active.parts"), []).expect("reset journal");
+        let journal_path = dir.path().join("active.parts");
+        let (mut journal, report) =
+            Journal::open(&journal_path, JournalConfig::default()).expect("reopen journal");
+        assert!(report.is_clean(), "the two complete frames must be clean");
+        let sealed = seal(&journal, &dir.path().join("1000.pgm")).expect("compact seal");
+        assert_eq!(sealed.rows, 2);
+        journal.reset().expect("reset journal after publication");
         let sealed_delta = snapshot.refresh_incremental_delta().expect("seal delta");
         assert_eq!(sealed_delta.sealed_added.len(), 1);
         let sealed_descriptors = writer

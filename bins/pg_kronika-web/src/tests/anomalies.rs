@@ -56,23 +56,21 @@ async fn sections_catalog_describes_archiver_from_the_registry() {
 }
 
 #[tokio::test]
-async fn segments_sum_rows_per_name_and_skip_dictionaries() {
+async fn segments_report_compact_rows_per_name_and_skip_dictionaries() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let archiver_a = PgStatArchiver::encode(&[archiver_row(1_000, 1), archiver_row(1_100, 2)])
-        .expect("encode archiver");
-    let archiver_b = PgStatArchiver::encode(&[archiver_row(1_200, 3)]).expect("encode archiver");
+    let archiver = PgStatArchiver::encode(&[
+        archiver_row(1_000, 1),
+        archiver_row(1_100, 2),
+        archiver_row(1_200, 3),
+    ])
+    .expect("encode archiver");
     let bgwriter = BgwriterCheckpointer::encode(&[]).expect("encode bgwriter");
     let bytes = build_part(
         &[
             SectionInput {
                 type_id: 1_008_001,
-                rows: 2,
-                body: &archiver_a,
-            },
-            SectionInput {
-                type_id: 1_008_001,
-                rows: 1,
-                body: &archiver_b,
+                rows: 3,
+                body: &archiver,
             },
             SectionInput {
                 type_id: 1_006_001,
@@ -99,7 +97,7 @@ async fn segments_sum_rows_per_name_and_skip_dictionaries() {
                 { "name": "pg_stat_bgwriter + pg_stat_checkpointer", "rows": 0 }
               ] }
         ] }),
-        "repeated type_ids of one name sum their rows; sections order by name"
+        "compact section rows are reported and sections order by name"
     );
 }
 #[tokio::test]
