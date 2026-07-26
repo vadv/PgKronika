@@ -132,7 +132,7 @@ async fn anomalies_rank_the_archiver_spike_first_and_count_honestly() {
             "reference_model": "rest_of_continuous_period",
             "retrospective": true,
             "threshold": 3.5,
-            "eps_abs": 0.000001,
+            "eps_abs": 0.000_001,
             "eps_rel": 0.05,
             "min_reference_points": 20,
             "min_current_points": 3,
@@ -157,12 +157,16 @@ async fn anomalies_rank_the_archiver_spike_first_and_count_honestly() {
     assert_eq!(body["coverage"]["sections_requested"], scanned);
     assert_eq!(body["coverage"]["sections_scanned"], scanned);
     assert_eq!(body["coverage"]["sections_skipped"], 0);
+    assert_eq!(body["coverage"]["plan_sections_analyzed"], 2);
     assert_eq!(
         body["truncation"],
         serde_json::json!({
             "section_episodes_dropped": 0,
             "global_episodes_dropped": 0,
             "episodes_dropped_total": 0,
+            "section_plan_signals_dropped": 0,
+            "global_plan_signals_dropped": 0,
+            "plan_signals_dropped_total": 0,
         })
     );
 }
@@ -214,20 +218,20 @@ fn db_row(ts: i64, tick: i32) -> PgStatDatabaseV1 {
 
 fn write_two_section_spike_segment(dir: &std::path::Path) -> i64 {
     const MINUTE: i64 = 60 * 1_000_000;
-    let mut archived = 0_i64;
-    let mut archiver = Vec::new();
+    let mut archived_count = 0_i64;
+    let mut archiver_rows = Vec::new();
     let mut database = Vec::new();
     for minute in 0..40_i32 {
         let in_spike = (20..25).contains(&minute);
-        archived += if in_spike { 50 } else { 1 };
-        archiver.push(archiver_row(i64::from(minute) * MINUTE, archived));
+        archived_count += if in_spike { 50 } else { 1 };
+        archiver_rows.push(archiver_row(i64::from(minute) * MINUTE, archived_count));
 
         let mut row = db_row(i64::from(minute) * MINUTE, minute);
         row.numbackends = Some(if in_spike { 100 } else { 10 });
         database.push(row);
     }
     let to = 39 * MINUTE;
-    let archiver_body = PgStatArchiver::encode(&archiver).expect("encode archiver");
+    let archiver_body = PgStatArchiver::encode(&archiver_rows).expect("encode archiver");
     let database_body = PgStatDatabaseV1::encode(&database).expect("encode database");
     let bytes = build_part(
         &[
@@ -266,6 +270,337 @@ async fn global_episode_truncation_is_counted_and_makes_the_result_partial() {
     assert_eq!(body["truncation"]["section_episodes_dropped"], 0);
     assert_eq!(body["truncation"]["global_episodes_dropped"], 1);
     assert_eq!(body["truncation"]["episodes_dropped_total"], 1);
+}
+
+const PLAN_MINUTE_US: i64 = 60 * 1_000_000;
+
+#[derive(Debug, Clone, Copy)]
+enum OsscPlanFixture {
+    DistributionAndBufferShift,
+    StableAcrossReset,
+}
+
+fn ossc_plan_row(
+    ts: i64,
+    planid: i64,
+    calls: i64,
+    shared_blks_read: i64,
+    first_call: i64,
+) -> kronika_registry::pg_store_plans::PgStorePlansOsscV1 {
+    kronika_registry::pg_store_plans::PgStorePlansOsscV1 {
+        ts: Ts(ts),
+        queryid: 7_777,
+        planid,
+        userid: 10,
+        dbid: 5,
+        datname: None,
+        usename: None,
+        plan: None,
+        calls,
+        total_time: 0.0,
+        min_time: 1.0,
+        max_time: 1.0,
+        mean_time: 1.0,
+        stddev_time: 0.0,
+        rows: calls,
+        shared_blks_hit: 0,
+        shared_blks_read,
+        shared_blks_dirtied: 0,
+        shared_blks_written: 0,
+        local_blks_hit: 0,
+        local_blks_read: 0,
+        local_blks_dirtied: 0,
+        local_blks_written: 0,
+        temp_blks_read: 0,
+        temp_blks_written: 0,
+        shared_blk_read_time: 0.0,
+        shared_blk_write_time: 0.0,
+        local_blk_read_time: 0.0,
+        local_blk_write_time: 0.0,
+        temp_blk_read_time: 0.0,
+        temp_blk_write_time: 0.0,
+        first_call: Ts(first_call),
+        last_call: Ts(ts),
+    }
+}
+
+fn plan_reset_row(
+    ts: i64,
+    reset_at: i64,
+    extension_version: StrId,
+    compute_query_id: StrId,
+) -> ResetMetadata {
+    ResetMetadata {
+        ts: Ts(ts),
+        postmaster_start_time: Ts(1),
+        pg_stat_database_reset_max_at: None,
+        pg_stat_statements_reset_at: None,
+        pg_store_plans_reset_at: Some(Ts(reset_at)),
+        pg_stat_bgwriter_reset_at: None,
+        pg_stat_checkpointer_reset_at: None,
+        pg_stat_wal_reset_at: None,
+        pg_stat_archiver_reset_at: None,
+        pg_stat_io_reset_at: None,
+        ext_pg_stat_statements_version: None,
+        ext_pg_store_plans_version: Some(extension_version),
+        compute_query_id: Some(compute_query_id),
+        track_io_timing: Some(true),
+        track_wal_io_timing: Some(false),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the end-to-end fixture constructs all four persisted provenance contracts beside the plan rows"
+)]
+fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixture) -> i64 {
+    use kronika_format::DictLimits;
+    use kronika_registry::instance_metadata::InstanceMetadata;
+    use kronika_registry::pg_store_plans::PgStorePlansOsscV1;
+    use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
+
+    const SNAPSHOTS: i64 = 60;
+    const RESET_MINUTE: i64 = 30;
+    let mut interner =
+        kronika_writer::Interner::new(DictLimits::new(64, 4096).expect("dictionary limits"));
+    let (extension_version, compute_query_id, hostname, node_self_id, kernel_version, boot_id) = {
+        let mut intern = |value: &str| {
+            interner
+                .intern(value.as_bytes())
+                .map(|id| StrId(id.get()))
+                .expect("intern plan fixture string")
+        };
+        (
+            intern("1.10"),
+            intern("auto"),
+            intern("plan-host"),
+            intern("plan-node"),
+            intern("test-kernel"),
+            intern("test-boot"),
+        )
+    };
+
+    let mut calls = [100_i64, 100];
+    let mut shared_reads = [100_i64, 100];
+    let mut first_calls = [0_i64, 0];
+    let mut plan_rows = Vec::with_capacity(usize::try_from(SNAPSHOTS * 2).expect("fixture rows"));
+    let mut coverage_rows =
+        Vec::with_capacity(usize::try_from(SNAPSHOTS).expect("fixture coverage"));
+
+    for minute in 0..SNAPSHOTS {
+        let ts = minute * PLAN_MINUTE_US;
+        if minute != 0 {
+            if matches!(fixture, OsscPlanFixture::StableAcrossReset) && minute == RESET_MINUTE {
+                calls = [0, 0];
+                shared_reads = [0, 0];
+                first_calls = [ts, ts];
+            } else {
+                let shifted = matches!(fixture, OsscPlanFixture::DistributionAndBufferShift)
+                    && (40..=50).contains(&minute);
+                let call_deltas = if shifted { [4, 6] } else { [9, 1] };
+                calls[0] += call_deltas[0];
+                calls[1] += call_deltas[1];
+                shared_reads[0] += if shifted {
+                    call_deltas[0] * 10
+                } else {
+                    call_deltas[0]
+                };
+                shared_reads[1] += call_deltas[1];
+            }
+        }
+        plan_rows.push(ossc_plan_row(
+            ts,
+            101,
+            calls[0],
+            shared_reads[0],
+            first_calls[0],
+        ));
+        plan_rows.push(ossc_plan_row(
+            ts,
+            202,
+            calls[1],
+            shared_reads[1],
+            first_calls[1],
+        ));
+        coverage_rows.push(SnapshotCoverageV1 {
+            ts: Ts(ts),
+            source_type_id: 1_003_001,
+            collector_pid: 42,
+            collector_started_at: Ts(0),
+            read_state: 0,
+            visibility: 0,
+            source_total: 2,
+            collected: 2,
+        });
+    }
+
+    let mut reset_rows = vec![plan_reset_row(0, 1, extension_version, compute_query_id)];
+    if matches!(fixture, OsscPlanFixture::StableAcrossReset) {
+        reset_rows.push(plan_reset_row(
+            RESET_MINUTE * PLAN_MINUTE_US,
+            RESET_MINUTE * PLAN_MINUTE_US,
+            extension_version,
+            compute_query_id,
+        ));
+    }
+    let metadata = InstanceMetadata {
+        ts: Ts(0),
+        hostname,
+        node_self_id,
+        pg_version_num: 150_000,
+        kernel_version,
+        pg_system_identifier: Some(99),
+        clock_ticks_per_sec: 100,
+        page_size_bytes: 4096,
+        boot_id,
+        btime: Ts(0),
+    };
+
+    let dictionary = kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
+    let plans = PgStorePlansOsscV1::encode(&plan_rows).expect("encode plan rows");
+    let coverage = SnapshotCoverageV1::encode(&coverage_rows).expect("encode plan coverage");
+    let resets = ResetMetadata::encode(&reset_rows).expect("encode plan reset metadata");
+    let metadata = InstanceMetadata::encode(&[metadata]).expect("encode plan instance metadata");
+    let mut sections: Vec<SectionInput<'_>> = dictionary
+        .iter()
+        .map(|section| SectionInput {
+            type_id: section.type_id,
+            rows: section.rows,
+            body: &section.body,
+        })
+        .collect();
+    sections.extend([
+        SectionInput {
+            type_id: 1_003_001,
+            rows: u32::try_from(plan_rows.len()).expect("plan row count"),
+            body: &plans,
+        },
+        SectionInput {
+            type_id: 1_038_001,
+            rows: u32::try_from(coverage_rows.len()).expect("coverage row count"),
+            body: &coverage,
+        },
+        SectionInput {
+            type_id: 1_020_001,
+            rows: u32::try_from(reset_rows.len()).expect("reset row count"),
+            body: &resets,
+        },
+        SectionInput {
+            type_id: 1_021_001,
+            rows: 1,
+            body: &metadata,
+        },
+    ]);
+    let to = (SNAPSHOTS - 1) * PLAN_MINUTE_US;
+    let bytes = build_part(
+        &sections,
+        PartMeta {
+            min_ts: 0,
+            max_ts: to,
+            source_id: 7,
+        },
+    );
+    std::fs::write(dir.join("0.pgm"), bytes).expect("write plan fixture segment");
+    to
+}
+
+#[tokio::test]
+async fn plan_signals_follow_registry_storage_diff_and_http_with_typed_evidence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let to =
+        write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::DistributionAndBufferShift);
+    let uri = format!(
+        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+    );
+    let (status, body) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let signals = body["plan_signals"].as_array().expect("plan_signals array");
+    let distribution = signals
+        .iter()
+        .find(|signal| signal["signal_id"] == "pg.query.plan_distribution_shift.v1")
+        .expect("distribution signal");
+    assert_eq!(
+        distribution["scope"],
+        serde_json::json!({
+            "dbid": 5,
+            "userid": 10,
+            "queryid": 7_777,
+            "query_identity": "dbid_userid_core_queryid",
+            "query_text_used": false,
+        })
+    );
+    assert_eq!(distribution["parameters"]["count_basis"], "calls_delta");
+    assert!(
+        distribution["evidence"]["total_variation"]
+            .as_f64()
+            .expect("total variation")
+            >= 0.20
+    );
+    assert_eq!(
+        distribution["evidence"]["plans"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    let buffer = signals
+        .iter()
+        .find(|signal| {
+            signal["signal_id"] == "pg.plan.buffer_work_per_call_increase.v1"
+                && signal["scope"]["planid"] == 101
+                && signal["dimension"]["column"] == "shared_blks_read"
+        })
+        .expect("same-plan shared-read signal");
+    assert_eq!(buffer["scope"]["queryid"], 7_777);
+    assert_eq!(buffer["parameters"]["normalization"], "calls_delta");
+    assert_eq!(buffer["dimension"]["unit"], "blocks_per_call");
+    assert!(
+        buffer["evidence"]["current_blocks_per_call"]
+            .as_f64()
+            .expect("current blocks per call")
+            > buffer["evidence"]["reference_blocks_per_call"]
+                .as_f64()
+                .expect("reference blocks per call")
+    );
+    assert_eq!(
+        buffer["interpretation"],
+        "observed_same_plan_association_not_causation"
+    );
+
+    assert_eq!(body["status"], "signals_detected");
+    assert_eq!(body["complete"], true);
+    assert_eq!(body["coverage"]["plan_sections_analyzed"], 1);
+    assert_eq!(
+        body["plan_analysis"]["pg_store_plans_ossc"]["status"],
+        "complete"
+    );
+    assert_eq!(
+        body["plan_analysis"]["pg_store_plans_ossc"]["quality"]["full_snapshots"],
+        60
+    );
+}
+
+#[tokio::test]
+async fn plan_signals_do_not_bridge_a_real_counter_reset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::StableAcrossReset);
+    let uri = format!(
+        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+    );
+    let (status, body) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["plan_signals"], serde_json::json!([]));
+    assert!(
+        body["plan_analysis"]["pg_store_plans_ossc"]["quality"]["reset_boundaries"]
+            .as_u64()
+            .expect("reset boundary count")
+            > 0
+    );
+    assert!(
+        body["plan_analysis"]["pg_store_plans_ossc"]["distribution"]["not_evaluated"]
+            ["discontinuity"]
+            .as_u64()
+            .expect("distribution discontinuities")
+            > 0
+    );
 }
 
 fn reset_row(ts: i64, track_io_timing: Option<bool>) -> ResetMetadata {

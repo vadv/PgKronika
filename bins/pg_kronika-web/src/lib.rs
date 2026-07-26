@@ -106,6 +106,7 @@ mod incident_input;
 mod incident_response;
 pub(crate) mod overview;
 mod params;
+mod plan_anomaly;
 mod problem;
 #[cfg(feature = "qualification")]
 #[doc(hidden)]
