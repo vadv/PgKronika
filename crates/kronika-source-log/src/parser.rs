@@ -33,7 +33,9 @@ impl ParserKind {
         }
     }
 
-    pub(crate) const fn as_state_value(self) -> &'static str {
+    /// Stable name used in persisted state and source-status output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Stderr => "stderr",
             Self::Csvlog => "csvlog",

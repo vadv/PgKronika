@@ -369,7 +369,7 @@ git commit -m "feat(collector): enable PostgreSQL log collection by default"
 - Consumes: `ParserKind`, `PathBuf`, `Duration`, `Instant`.
 - Produces: public `LogSourceState`, `LogSourceReason`, `LogSourceStatus`; crate-private `StatusTracker`, `StatusUpdate`.
 
-- [ ] **Step 1: Write failing tracker tests**
+- [x] **Step 1: Write failing tracker tests**
 
 Create the module with tests that pin first emission, change emission, heartbeat,
 transactional commit and outage deduplication:
@@ -488,7 +488,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the module tests and confirm the red state**
+- [x] **Step 2: Run the module tests and confirm the red state**
 
 Run:
 
@@ -500,7 +500,7 @@ cargo +1.96.0 test -p kronika-source-log status::tests --target "$HOST"
 Expected: compilation fails because the status types and tracker are not
 implemented.
 
-- [ ] **Step 3: Implement stable codes and names**
+- [x] **Step 3: Implement stable codes and names**
 
 Add the public types with exhaustive mappings:
 
@@ -616,7 +616,7 @@ pub struct LogSourceStatus {
 }
 ```
 
-- [ ] **Step 4: Implement staged tracker updates**
+- [x] **Step 4: Implement staged tracker updates**
 
 The tracker compares all fields except `ts`. `observe` clones tracker state and
 never mutates the committed tracker; `commit` applies the staged clone:
@@ -711,7 +711,7 @@ impl StatusTracker {
 }
 ```
 
-- [ ] **Step 5: Export the source contract types**
+- [x] **Step 5: Export the source contract types**
 
 In `lib.rs`, add `mod status`, re-export the three public types, and define:
 
@@ -736,7 +736,7 @@ pub const fn as_str(self) -> &'static str {
 Replace `as_state_value()` with `as_str()` in `TailState::render`; delete
 `as_state_value` so process logs and persisted state cannot drift.
 
-- [ ] **Step 6: Run tests and commit**
+- [x] **Step 6: Run tests and commit**
 
 Run:
 
