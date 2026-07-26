@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind one raw M6 qualification artifact to one green Actions attempt."""
+"""Bind one raw parity-v1 overview artifact to one green Actions attempt."""
 
 from __future__ import annotations
 
@@ -115,14 +115,14 @@ def final_artifact(
 ) -> dict[str, object]:
     if set(raw) != RAW_FIELDS:
         raise ValueError("raw artifact does not match the exact v2 schema")
-    if raw.get("schema") != "pgkronika-overview-qualification-v2":
+    if raw.get("schema") != "pgkronika-overview-parity-v1-evidence-v2":
         raise ValueError("raw artifact has the wrong schema")
     if raw.get("git_head") != exact_head:
         raise ValueError("raw artifact head differs from the requested exact head")
     if raw.get("git_dirty") is not False:
         raise ValueError("raw artifact came from a dirty tree")
     if run_attempt != "1":
-        raise ValueError("M6 finalization requires Actions attempt 1")
+        raise ValueError("overview parity finalization requires Actions attempt 1")
     ci = raw.get("ci")
     if not isinstance(ci, dict):
         raise ValueError("raw artifact has no CI profile")
@@ -169,11 +169,11 @@ def final_artifact(
         row["decision"] = "PASS"
 
     raw["final_ci"] = {
-        "schema": "pgkronika-overview-qualification-final-ci-v1",
+        "schema": "pgkronika-overview-parity-v1-acceptance-v1",
         "exact_head": exact_head,
         "run_id": run_id,
         "run_attempt": run_attempt,
-        "acceptance_job": "overview-m6-acceptance",
+        "acceptance_job": "overview-parity-acceptance",
         "jobs": jobs,
         "bdd_scenarios": [dict(row) for row in BDD_SCENARIOS],
         "raw_artifact_sha256": raw_digest,

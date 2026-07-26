@@ -403,7 +403,7 @@ fn main() {
     }));
 
     let artifact = QualificationArtifact {
-        schema: "pgkronika-overview-qualification-v1",
+        schema: "pgkronika-overview-parity-v1-evidence-v1",
         git_head: git_output(&["rev-parse", "HEAD"]),
         git_dirty: !git_output(&["status", "--porcelain"]).is_empty(),
         generated_unix_ms: std::time::SystemTime::now()

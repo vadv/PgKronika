@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Enables deterministic failure injection used only by the exact-head M6
+# Enables deterministic failure injection for the exact-head parity
 # qualification executable. Production binaries never enable this feature.
 qualification = []
 

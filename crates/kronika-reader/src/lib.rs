@@ -68,7 +68,7 @@ pub use refresh::{
 };
 pub use snapshot::{LocalDirSnapshot, OpenUnit, SealedFactError, UnitMeta};
 
-/// Returns the versioned registry-backed all-family M6 fixture.
+/// Returns the versioned registry-backed all-family parity qualification fixture.
 ///
 /// This diagnostic surface exists only for cross-crate qualification tests and
 /// executables; production binaries do not enable the feature.

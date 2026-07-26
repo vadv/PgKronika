@@ -1,4 +1,4 @@
-//! Exact-head Overview M6 qualification runner.
+//! Exact-head overview parity qualification runner.
 //!
 //! The public entry point exists only behind the `qualification` feature. Each
 //! timing sample runs in a fresh child process over a fresh owned data
@@ -37,7 +37,7 @@ use crate::overview::live::LiveFoldStats;
 use crate::overview::loader::{LoaderIoSnapshot, LoaderQualificationSnapshot};
 use crate::{AppState, OverviewConfig, app};
 
-const ARTIFACT_SCHEMA: &str = "pgkronika-overview-qualification-v2";
+const ARTIFACT_SCHEMA: &str = "pgkronika-overview-parity-v1-evidence-v2";
 const FIXTURE_SCHEMA: &str = "overview-dense-hour-v2";
 const SAMPLES: usize = 720;
 const CADENCE_US: i64 = 5_000_000;
@@ -108,8 +108,8 @@ pub fn run_cli() {
         [flag, output] if flag == "--output" => run_coordinator(Path::new(output)),
         _ => {
             eprintln!(
-                "usage: overview_m6_qualification --output PATH\n\
-                 private: overview_m6_qualification --worker MODE ROOT"
+                "usage: overview_parity_qualification --output PATH\n\
+                 private: overview_parity_qualification --worker MODE ROOT"
             );
             std::process::exit(2);
         }
@@ -2468,7 +2468,7 @@ fn acceptance_evidence() -> Vec<AcceptanceEvidence> {
 fn evidence_binary(kind: &str, path: &str) -> &'static str {
     match (kind, path) {
         ("mode" | "mode_set", "qualification") => {
-            "pg-kronika-web::example/overview_m6_qualification"
+            "pg-kronika-web::example/overview_parity_qualification"
         }
         ("rust_test", path) if path.starts_with("crates/kronika-reader/") => "kronika-reader",
         ("rust_test", path) if path.starts_with("crates/kronika-analytics/") => "kronika-analytics",

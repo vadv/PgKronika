@@ -82,7 +82,7 @@ jobs:
         run: |
           command -v strace
           python3 scripts/test_validate_overview_qualification.py
-          cargo run --release --manifest-path bins/pg_kronika-web/Cargo.toml --example overview_m6_qualification --features qualification -- --output target/qualification/overview.raw.json
+          cargo run --release --manifest-path bins/pg_kronika-web/Cargo.toml --example overview_parity_qualification --features qualification -- --output target/qualification/overview.raw.json
           python3 scripts/validate-overview-qualification.py target/qualification/overview.raw.json --exact-head "${EXACT_SOURCE_HEAD}" --output target/qualification/validation.preliminary.json
           sha256sum target/qualification/overview.raw.json > target/qualification/overview.raw.json.sha256
           sha256sum target/qualification/validation.preliminary.json > target/qualification/validation.preliminary.json.sha256
@@ -182,8 +182,8 @@ jobs:
       - name: Run the PostgreSQL matrix
         run: ./scripts/bdd-image.sh run
 
-  overview-m6-acceptance:
-    name: overview M6 acceptance
+  overview-parity-acceptance:
+    name: overview parity acceptance
     if: ${{ always() }}
     needs:
       - lint
@@ -201,7 +201,7 @@ jobs:
         with:
           name: overview-qualification-raw
           path: target/qualification
-      - name: Bind all M6 evidence to this exact green attempt
+      - name: Bind parity evidence to this exact green attempt
         run: |
           python3 scripts/finalize-overview-qualification.py \
             target/qualification/overview.raw.json \
@@ -225,18 +225,18 @@ jobs:
             --output target/qualification/validation.final.json
           sha256sum target/qualification/validation.final.json > target/qualification/validation.final.json.sha256
           {
-            echo '## Overview M6 acceptance'
+            echo '## Overview parity acceptance'
             echo
             echo "- exact head: \`${EXACT_SOURCE_HEAD}\`"
             echo "- Actions run/attempt: \`${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}\`"
-            echo "- artifact: \`overview-qualification-final\`"
+            echo "- artifact: \`overview-parity-acceptance\`"
             echo "- decision: **PASS**"
             echo
             echo 'All 18 rows are IMPLEMENTED and bound to the six successful predecessor jobs, the PostgreSQL 15–18 scenarios, the raw measurement checksum, and this final artifact checksum.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: overview-qualification-final
+          name: overview-parity-acceptance
           path: |
             target/qualification/overview.raw.json
             target/qualification/overview.raw.json.sha256

@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Builds the exact-head M6 qualification executable and its deterministic
+# Builds the exact-head parity qualification executable and its deterministic
 # persistence-fault hooks. The production server does not enable this feature.
 qualification = [
   "dep:http-body-util",
@@ -59,7 +59,7 @@ name = "anomalies"
 harness = false
 
 [[example]]
-name = "overview_m6_qualification"
+name = "overview_parity_qualification"
 path = "examples/overview_qualification.rs"
 required-features = ["qualification"]
 

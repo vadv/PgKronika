@@ -90,7 +90,7 @@ def rust_evidence(binary: str, path: str, name: str) -> tuple[str, str, str, str
 def mode_evidence(name: str) -> tuple[str, str, str, str]:
     return (
         "mode",
-        "pg-kronika-web::example/overview_m6_qualification",
+        "pg-kronika-web::example/overview_parity_qualification",
         "qualification",
         name,
     )
@@ -446,7 +446,7 @@ EXPECTED_EVIDENCE = (
     (
         (
             "mode_set",
-            "pg-kronika-web::example/overview_m6_qualification",
+            "pg-kronika-web::example/overview_parity_qualification",
             "qualification",
             "all-nine-modes",
         ),
@@ -792,7 +792,7 @@ def validate_fixture(fixture: dict[str, object], failures: list[str]) -> None:
     check(
         len(datasets) == len(expected_datasets)
         and set(datasets) == expected_datasets,
-        "dense fixture does not name the exact M6 auxiliary datasets",
+        "dense fixture does not name the exact parity qualification datasets",
         failures,
     )
 
@@ -1589,7 +1589,7 @@ def validate_acceptance(
             elif kind == "mode":
                 check(
                     path == "qualification"
-                    and binary == "pg-kronika-web::example/overview_m6_qualification"
+                    and binary == "pg-kronika-web::example/overview_parity_qualification"
                     and name in MODES,
                     f"acceptance row {index} has invalid mode evidence",
                     failures,
@@ -1599,7 +1599,7 @@ def validate_acceptance(
                 check(
                     index == 18
                     and path == "qualification"
-                    and binary == "pg-kronika-web::example/overview_m6_qualification"
+                    and binary == "pg-kronika-web::example/overview_parity_qualification"
                     and name == "all-nine-modes",
                     f"acceptance row {index} has invalid mode-set evidence",
                     failures,
@@ -1701,7 +1701,7 @@ def validate_final_ci(
         failures,
     )
     check(
-        final_ci.get("schema") == "pgkronika-overview-qualification-final-ci-v1",
+        final_ci.get("schema") == "pgkronika-overview-parity-v1-acceptance-v1",
         "final CI record has the wrong schema",
         failures,
     )
@@ -1718,7 +1718,7 @@ def validate_final_ci(
     )
     check(
         final_ci.get("run_attempt") == ci.get("run_attempt") == "1",
-        "M6 qualification is not from Actions attempt 1",
+        "overview parity qualification is not from Actions attempt 1",
         failures,
     )
     check(
@@ -1732,7 +1732,7 @@ def validate_final_ci(
         failures,
     )
     check(
-        final_ci.get("acceptance_job") == "overview-m6-acceptance",
+        final_ci.get("acceptance_job") == "overview-parity-acceptance",
         "final artifact names the wrong acceptance job",
         failures,
     )
@@ -1819,7 +1819,7 @@ def main() -> int:
     decoded = json.loads(args.artifact.read_text(encoding="utf-8"))
     failures: list[str] = []
     warnings: list[str] = []
-    artifact = as_mapping(decoded, "qualification artifact", failures)
+    artifact = as_mapping(decoded, "parity-v1 evidence artifact", failures)
     repo_root = args.repo_root.resolve()
 
     top_level_fields = {
@@ -1840,9 +1840,9 @@ def main() -> int:
     }
     if args.final:
         top_level_fields.add("final_ci")
-    exact_fields(artifact, top_level_fields, "qualification artifact", failures)
+    exact_fields(artifact, top_level_fields, "parity-v1 evidence artifact", failures)
     check(
-        artifact.get("schema") == "pgkronika-overview-qualification-v2",
+        artifact.get("schema") == "pgkronika-overview-parity-v1-evidence-v2",
         "wrong artifact schema",
         failures,
     )
@@ -1947,7 +1947,7 @@ def main() -> int:
     )
 
     result = {
-        "schema": "pgkronika-overview-qualification-validation-v2",
+        "schema": "pgkronika-overview-parity-v1-validation-v2",
         "exact_head": artifact.get("git_head"),
         "final": args.final,
         "artifact_sha256": artifact_digest,

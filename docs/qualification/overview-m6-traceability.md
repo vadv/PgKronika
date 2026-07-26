@@ -1,4 +1,4 @@
-# Overview M6 traceability
+# Overview parity-v1 acceptance traceability
 
 Base: `1a6f435ee1f9623b0d9c46cd87b51dd0eba15195` (merged PR #114).
 

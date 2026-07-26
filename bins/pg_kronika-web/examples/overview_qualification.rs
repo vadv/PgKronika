@@ -1,4 +1,4 @@
-//! Exact-head Overview M6 qualification entry point.
+//! Exact-head overview parity qualification entry point.
 
 // This target deliberately delegates to the feature-gated library module. The
 // package-level dependency lint checks every target independently.

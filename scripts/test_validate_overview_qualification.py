@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the strict M6 artifact/finalization contract."""
+"""Regression tests for the strict parity-v1 overview artifact contract."""
 
 from __future__ import annotations
 
@@ -509,7 +509,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
 
 def raw_finalization_input() -> dict[str, object]:
     return {
-        "schema": "pgkronika-overview-qualification-v2",
+        "schema": "pgkronika-overview-parity-v1-evidence-v2",
         "git_head": "a" * 40,
         "git_dirty": False,
         "generated_unix_ms": 1,
@@ -545,6 +545,10 @@ class FinalizationTests(unittest.TestCase):
             raw_digest="b" * 64,
         )
         self.assertEqual(final["final_ci"]["decision"], "PASS")
+        self.assertEqual(
+            final["final_ci"]["acceptance_job"],
+            "overview-parity-acceptance",
+        )
         self.assertTrue(
             all(row["decision"] == "PASS" for row in final["acceptance"])
         )

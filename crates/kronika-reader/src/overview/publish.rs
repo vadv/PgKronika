@@ -919,7 +919,7 @@ impl FactStore {
         self.with_persist(|persist| persist.force_due(Instant::now()));
     }
 
-    /// Installs a deterministic persistence-failure sequence for the M6
+    /// Installs a deterministic persistence-failure sequence for the test-only
     /// qualification executable.
     ///
     /// This hook is not present in production builds.
@@ -932,15 +932,15 @@ impl FactStore {
         self.inject_publish_faults(faults);
     }
 
-    /// Makes the standing retry probe immediately due in an M6 qualification
-    /// build. This hook is not present in production builds.
+    /// Makes the standing retry probe immediately due in a qualification build.
+    /// This hook is not present in production builds.
     #[cfg(feature = "qualification")]
     #[doc(hidden)]
     pub fn qualification_force_persistence_probe_due(&self) {
         self.force_persistence_probe_due();
     }
 
-    /// Exact publication-attempt count for an M6 qualification build.
+    /// Exact publication-attempt count for a qualification build.
     #[cfg(feature = "qualification")]
     #[doc(hidden)]
     #[must_use]
@@ -948,7 +948,7 @@ impl FactStore {
         self.test_publish_attempts()
     }
 
-    /// Exact capacity-recovery GC attempt count for an M6 qualification build.
+    /// Exact capacity-recovery GC attempt count for a qualification build.
     #[cfg(feature = "qualification")]
     #[doc(hidden)]
     #[must_use]

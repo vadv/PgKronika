@@ -73,18 +73,18 @@ host/filesystem procedure and must not replace or relabel this measurement.
 ## PostgreSQL and process-lifecycle BDD
 
 The exact evidence manifest names eight scenarios: one source-scoped timeline
-scenario and one real-web-process lifecycle scenario for each PostgreSQL major
-from 15 through 18. Run the lifecycle set with:
+scenario and one real `pg_kronika-web` process-lifecycle scenario for each
+PostgreSQL major from 15 through 18. Run the lifecycle set with:
 
 ```bash
 DEBUG=1 make test-bdd TAGS=@timeline_web_lifecycle
 DEBUG=1 make test-bdd TAGS='@timeline_web_lifecycle and @pg15'
 ```
 
-The first command covers PostgreSQL 15–18; the second is a targeted PG15
-diagnostic. Every lifecycle scenario launches the actual
-`pg_kronika-web` executable over an isolated owned data directory, sends real
-overview, events, health, cursor, and Prometheus HTTP requests, and starts new
+The first command covers PostgreSQL 15–18; the second is a targeted PostgreSQL
+15 diagnostic. Every lifecycle scenario launches the actual `pg_kronika-web`
+executable over an isolated owned data directory, sends HTTP requests to the
+overview, events, health, cursor, and Prometheus endpoints, and starts new
 processes for restart assertions. Explicit post-bind readiness, graceful
 shutdown or asserted process death, and a publication barrier replace timing
 sleeps and retry loops.
@@ -95,14 +95,13 @@ every stale identity class, rejection of interrupted temporary publication,
 bounded fallback followed by durable recovery, cancellation recovery,
 process-local cursor expiry, source preservation, and deterministic
 second-owner contention. The artifact validator accepts only the eight exact
-feature/scenario coordinates recorded in
-`docs/qualification/overview-m6-traceability.md`.
+feature/scenario coordinates in the qualification traceability table.
 
 ## Local candidate
 
 ```bash
 cargo run --release --manifest-path bins/pg_kronika-web/Cargo.toml \
-  --example overview_m6_qualification --features qualification -- \
+  --example overview_parity_qualification --features qualification -- \
   --output target/qualification/overview.raw.json
 python3 scripts/validate-overview-qualification.py \
   target/qualification/overview.raw.json
