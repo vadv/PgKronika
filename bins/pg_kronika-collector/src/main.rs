@@ -64,7 +64,7 @@ use pool_sources::{PoolReads, read_pool_sources};
 use scheduler::{DueSet, Scheduler, SourceKind};
 use segments::{
     SegmentState, append_window_and_maybe_seal, encode_window, open_collector_journal,
-    seal_open_segment,
+    seal_open_segment, verify_output_contract,
 };
 use service_sections::{collect_due_instance, collect_service_sections};
 use source_contracts::activity_dict_limits;
@@ -102,6 +102,7 @@ fn timer_sleep_delay(
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
+    verify_output_contract(&config.out_dir)?;
 
     // The journal lives next to sealed segments so windows survive restarts.
     // Recovered windows are sealed before connecting to PostgreSQL.

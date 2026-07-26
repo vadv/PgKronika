@@ -14,6 +14,9 @@ use crate::source::{ActivePart, LocalScan, SealedUnit, StoreError, StoreWarning}
 
 /// Upper bound on the catalog block size; guards against corrupt tail indices.
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
+/// Identity used only to recognize and reject the unreleased pre-compaction
+/// layout. It is never accepted or decoded.
+const REJECTED_PRE_COMPACTION_MAGIC: [u8; 4] = *b"PGM1";
 
 /// A storage directory containing sealed `.pgm` segments and an `active.parts`
 /// journal.
@@ -25,12 +28,14 @@ pub struct LocalDir {
 impl LocalDir {
     /// Open a local directory as a segment store.
     ///
-    /// Returns an error only if `root` cannot be read as a directory. Individual
-    /// files inside the directory are validated lazily during [`scan`](Self::scan).
+    /// Rejects a directory containing a pre-compaction `.pgm` identity so an
+    /// incompatible owned store cannot be mistaken for an empty current store.
+    /// Other individual files are validated lazily during [`scan`](Self::scan).
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if `root` is not a directory or cannot be accessed.
+    /// Returns an I/O error if `root` is not a directory, cannot be accessed,
+    /// or contains a rejected pre-compaction `.pgm` file.
     pub fn open(root: &Path) -> io::Result<Self> {
         let meta = fs::metadata(root)?;
         if !meta.is_dir() {
@@ -39,6 +44,7 @@ impl LocalDir {
                 "root is not a directory",
             ));
         }
+        reject_obsolete_sealed(root)?;
         Ok(Self {
             root: root.to_owned(),
         })
@@ -182,6 +188,9 @@ impl LocalDir {
         for path in pgm_paths {
             match read_catalog_from_path(&path) {
                 Ok(catalog) => sealed.push(SealedUnit { path, catalog }),
+                Err(StoreError::ObsoleteFormat { actual }) => {
+                    return Err(obsolete_store_error(&path, actual));
+                }
                 Err(err) => warnings.push(StoreWarning {
                     path,
                     reason: err.to_string(),
@@ -333,6 +342,43 @@ fn read_catalog_from_path(path: &Path) -> Result<Catalog, StoreError> {
     read_catalog(&file)
 }
 
+/// Reject only the known incompatible identity. Ordinary current-format
+/// corruption remains a per-file warning during `scan`.
+fn reject_obsolete_sealed(root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("pgm") {
+            continue;
+        }
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if file.metadata()?.len() < MAGIC.len() as u64 {
+            continue;
+        }
+        let mut magic = [0_u8; 4];
+        file.read_exact_at(&mut magic, 0)?;
+        if magic == REJECTED_PRE_COMPACTION_MAGIC {
+            return Err(obsolete_store_error(&path, magic));
+        }
+    }
+    Ok(())
+}
+
+fn obsolete_store_error(path: &Path, actual: [u8; 4]) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: {}",
+            path.display(),
+            StoreError::ObsoleteFormat { actual }
+        ),
+    )
+}
+
 /// Read and decode the end catalog from any [`ReadAt`] source.
 ///
 /// Reads only the tail index and catalog block; no section bodies are loaded.
@@ -345,6 +391,16 @@ fn read_catalog_from_path(path: &Path) -> Result<Catalog, StoreError> {
 /// the section area.
 pub fn read_catalog<R: ReadAt>(reader: &R) -> Result<Catalog, StoreError> {
     let len = reader.byte_len()?;
+
+    if len >= MAGIC.len() as u64 {
+        let mut leading_magic = [0_u8; 4];
+        reader.read_exact_at(&mut leading_magic, 0)?;
+        if leading_magic == REJECTED_PRE_COMPACTION_MAGIC {
+            return Err(StoreError::ObsoleteFormat {
+                actual: leading_magic,
+            });
+        }
+    }
 
     let tail_at = len
         .checked_sub(TAIL_INDEX_LEN as u64)
@@ -577,6 +633,18 @@ mod tests {
     }
 
     #[test]
+    fn read_catalog_identifies_rejected_pre_compaction_bytes() {
+        let mut buf = minimal_part_with_version(FORMAT_VERSION);
+        buf[..4].copy_from_slice(&REJECTED_PRE_COMPACTION_MAGIC);
+        assert!(matches!(
+            read_catalog(&buf.as_slice()),
+            Err(StoreError::ObsoleteFormat {
+                actual: REJECTED_PRE_COMPACTION_MAGIC
+            })
+        ));
+    }
+
+    #[test]
     fn read_catalog_unsupported_format_version() {
         // Valid part except format_version != FORMAT_VERSION.
         // Patch format_version to 99, then recompute catalog CRC.
@@ -699,6 +767,32 @@ mod tests {
         let scan = LocalDir::open(dir.path()).unwrap().scan().unwrap();
         assert_eq!(scan.sealed.len(), 1, "good segment still served");
         assert_eq!(scan.warnings.len(), 1, "bad segment produces one warning");
+    }
+
+    #[test]
+    fn obsolete_sealed_fails_open_and_preserves_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1000.pgm");
+        let bytes = b"PGM1 retained pre-compaction source";
+        fs::write(&path, bytes).unwrap();
+
+        let error = LocalDir::open(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("pre-compaction"));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn obsolete_sealed_appearing_after_open_fails_refresh_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDir::open(dir.path()).unwrap();
+        let path = dir.path().join("1000.pgm");
+        let bytes = b"PGM1 retained pre-compaction source";
+        fs::write(&path, bytes).unwrap();
+
+        let error = store.scan().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]

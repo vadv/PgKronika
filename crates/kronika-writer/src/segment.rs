@@ -37,7 +37,6 @@ use kronika_registry::{
     registry,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use sha2::{Digest, Sha256};
 
 use crate::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalError};
 
@@ -186,7 +185,7 @@ pub enum DictionaryError {
         /// Conflicting id.
         str_id: u64,
     },
-    /// String/blob placement rows for one id do not describe the same value.
+    /// One id appears in both string and blob placement sections.
     PlacementConflict {
         /// Conflicting id.
         str_id: u64,
@@ -1055,7 +1054,6 @@ impl NormalizedDictionary {
             btree_map::Entry::Occupied(slot) => match slot.get() {
                 DictionaryValue::String(existing) if existing == &value => Ok(()),
                 DictionaryValue::String(_) => Err(DictionaryError::Conflict { str_id: id }),
-                DictionaryValue::Blob(blob) if representations_agree(&value, blob) => Ok(()),
                 DictionaryValue::Blob(_) => Err(DictionaryError::PlacementConflict { str_id: id }),
             },
         }
@@ -1067,16 +1065,10 @@ impl NormalizedDictionary {
                 slot.insert(DictionaryValue::Blob(value));
                 Ok(())
             }
-            btree_map::Entry::Occupied(mut slot) => match slot.get() {
+            btree_map::Entry::Occupied(slot) => match slot.get() {
                 DictionaryValue::Blob(existing) if existing == &value => Ok(()),
                 DictionaryValue::Blob(_) => Err(DictionaryError::Conflict { str_id: id }),
-                DictionaryValue::String(full) if representations_agree(full, &value) => {
-                    slot.insert(DictionaryValue::Blob(value));
-                    Ok(())
-                }
-                DictionaryValue::String(_) => {
-                    Err(DictionaryError::PlacementConflict { str_id: id })
-                }
+                DictionaryValue::String(_) => Err(DictionaryError::PlacementConflict { str_id: id }),
             },
         }
     }
@@ -1188,21 +1180,6 @@ fn validate_blob(id: u64, value: &BlobValue) -> Result<(), DictionaryError> {
         Ok(())
     } else {
         Err(DictionaryError::BlobMetadata { str_id: id })
-    }
-}
-
-fn representations_agree(full: &[u8], blob: &BlobValue) -> bool {
-    if blob.full_len != full.len() as u64 {
-        return false;
-    }
-    if blob.truncated {
-        blob.bytes.len() < full.len()
-            && full.starts_with(&blob.bytes)
-            && blob
-                .full_sha256
-                .is_some_and(|hash| Sha256::digest(full).as_slice() == hash)
-    } else {
-        blob.bytes == full && blob.full_sha256.is_none()
     }
 }
 
@@ -1741,6 +1718,7 @@ mod tests {
     use kronika_registry::Ts;
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use parquet::basic::Encoding;
+    use sha2::{Digest as _, Sha256};
 
     use super::*;
     use crate::{Interner, JournalConfig, SectionBuffers, dict};
@@ -1924,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_string_and_blob_placements_canonicalize_to_one_blob() {
+    fn matching_string_and_blob_placements_are_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut journal, _) =
             Journal::open(&dir.path().join("active.parts"), JournalConfig::default())
@@ -1949,21 +1927,13 @@ mod tests {
             )]),
         );
         let output = dir.path().join("segment.pgm");
-        seal(&journal, &output).expect("matching placement");
-        let bytes = fs::read(output).expect("output");
-        let catalog = validate_part(&bytes).expect("catalog");
-        assert!(
-            catalog
-                .entries
-                .iter()
-                .all(|entry| entry.type_id != DICT_STRINGS_TYPE_ID)
-        );
-        let blob = catalog
-            .entries
-            .iter()
-            .find(|entry| entry.type_id == DICT_BLOBS_TYPE_ID)
-            .expect("one blob section");
-        assert_eq!(blob.rows, 1);
+        assert!(matches!(
+            seal(&journal, &output),
+            Err(SealError::Dictionary(DictionaryError::PlacementConflict {
+                str_id
+            })) if str_id == id
+        ));
+        assert!(!output.exists());
     }
 
     #[test]

@@ -10,6 +10,14 @@ use kronika_writer::{
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Fail before opening or mutating `active.parts` when the owned directory
+/// still contains a rejected pre-compaction sealed segment.
+pub(crate) fn verify_output_contract(out_dir: &Path) -> Result<()> {
+    kronika_store::LocalDir::open(out_dir)
+        .context("verify the output directory uses the current PGM contract")?;
+    Ok(())
+}
+
 /// The open (not yet sealed) segment: its file name comes from the first
 /// window's timestamp, its age from the moment that window was appended.
 #[derive(Debug, Default, Clone)]
