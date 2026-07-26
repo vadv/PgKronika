@@ -182,7 +182,11 @@ impl From<ReadError> for SourceError {
             | ReadError::Tail(_)
             | ReadError::BadCatalogLen { .. }
             | ReadError::Catalog(_)
+            | ReadError::NonCanonicalCatalog { .. }
+            | ReadError::UnknownType { .. }
+            | ReadError::TooManyCatalogEntries { .. }
             | ReadError::Codec(_)
+            | ReadError::DictionaryConflict { .. }
             | ReadError::CounterOverflow => Self::Corrupt,
         }
     }

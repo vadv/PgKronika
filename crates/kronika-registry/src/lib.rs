@@ -29,6 +29,7 @@
 extern crate self as kronika_registry;
 
 mod codec;
+mod compaction;
 mod contract;
 mod generic;
 mod pool;
@@ -51,6 +52,10 @@ pub use codec::{
     MAX_SECTION_ROWS, VerifiedSection, arrow_schema, nullable_bool, nullable_column, opt_bool,
     opt_primitive, read_list_i32, required_bool, required_column, write_bool, write_bool_nullable,
     write_list_i32, write_nullable, write_required,
+};
+pub use compaction::{
+    COMPACTION_MEMORY_LIMIT, COMPACTION_PAGE_BYTES, COMPACTION_ZSTD_LEVEL, canonicalize_batches,
+    compaction_memory_bound, encode_compact_batch, encode_compact_ordered_batch,
 };
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{

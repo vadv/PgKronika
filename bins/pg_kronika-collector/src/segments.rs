@@ -4,26 +4,29 @@ use crate::logging::{
 };
 use anyhow::{Context, Result};
 use kronika_writer::{
-    FlushedPart, Interner, Journal, JournalConfig, JournalError, SectionBuffers, dict, seal,
+    FlushedPart, Interner, Journal, JournalConfig, JournalError, SealAdmission, SealError,
+    SealOptions, SectionBuffers, dict, seal_with_options,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The open (not yet sealed) segment: its file name comes from the first
 /// window's timestamp, its age from the moment that window was appended.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct SegmentState {
     first_ts: Option<i64>,
     opened_at: Option<Instant>,
+    admission: SealAdmission,
 }
 
 impl SegmentState {
     /// Register the appended window; the first one opens the segment.
-    pub(crate) const fn on_window_appended(&mut self, ts: i64, now: Instant) {
+    pub(crate) fn on_window_appended(&mut self, ts: i64, now: Instant, admission: SealAdmission) {
         if self.first_ts.is_none() {
             self.first_ts = Some(ts);
             self.opened_at = Some(now);
         }
+        self.admission = admission;
     }
 
     /// Whether the open segment has reached `max_age`.
@@ -96,7 +99,15 @@ pub(crate) fn seal_open_segment(
     let journal_bytes = journal.bytes();
     let journal_parts = journal.parts().len();
     let started = Instant::now();
-    let summary = seal(journal, &dest).context("seal the segment")?;
+    let summary = seal_with_options(
+        journal,
+        &dest,
+        SealOptions {
+            limits: config.seal_limits,
+            cancelled: None,
+        },
+    )
+    .context("seal the segment")?;
     log_event(
         LogLevel::Info,
         "segment_seal_finish",
@@ -106,9 +117,14 @@ pub(crate) fn seal_open_segment(
             field("source_id", config.source_id),
             field("reason", reason),
             field("sections", summary.sections),
+            field("rows", summary.rows),
             field("segment_bytes", summary.bytes),
             field("journal_bytes", journal_bytes),
             field("journal_parts", journal_parts),
+            field("spill_bytes", summary.spill_bytes),
+            field("write_bytes", summary.write_bytes),
+            field("admitted_memory_bytes", summary.admitted_memory_bytes),
+            field("publication", format!("{:?}", summary.publication)),
             field("min_ts", summary.min_ts),
             field("max_ts", summary.max_ts),
             field("elapsed_ms", duration_ms(started.elapsed())),
@@ -125,6 +141,7 @@ pub(crate) fn seal_open_segment(
 pub(crate) fn open_collector_journal(
     out_dir: &Path,
     journal_max_bytes: u64,
+    seal_limits: kronika_writer::SealLimits,
 ) -> Result<(Journal, Option<PathBuf>)> {
     let journal_config = JournalConfig {
         max_journal_len: usize::try_from(journal_max_bytes)
@@ -142,31 +159,25 @@ pub(crate) fn open_collector_journal(
                 field("truncated_torn_tail", report.truncated_torn_tail),
             ],
         );
+        anyhow::bail!(
+            "active.parts contains non-torn damage; preserving it and refusing collection"
+        );
     }
     if journal.parts().is_empty() {
         return Ok((journal, None));
     }
-    match seal_recovered_journal(&mut journal, out_dir) {
-        Ok(dest) => Ok((journal, dest)),
-        // A journal this binary cannot re-read (e.g. written by an
-        // incompatible version) must not stop the daemon: drop it and start
-        // collecting fresh.
-        Err(err) => {
-            log_event(
-                LogLevel::Error,
-                "journal_recovery_seal_failure",
-                &[
-                    field("journal_bytes", journal.bytes()),
-                    field("journal_parts", journal.parts().len()),
-                    field("error", format!("{err:#}")),
-                ],
-            );
-            journal
-                .reset()
-                .context("reset the journal after a failed recovery seal")?;
-            Ok((journal, None))
-        }
-    }
+    let dest = seal_recovered_journal(&mut journal, out_dir, seal_limits).inspect_err(|err| {
+        log_event(
+            LogLevel::Error,
+            "journal_recovery_seal_failure",
+            &[
+                field("journal_bytes", journal.bytes()),
+                field("journal_parts", journal.parts().len()),
+                field("error", format!("{err:#}")),
+            ],
+        );
+    })?;
+    Ok((journal, dest))
 }
 
 /// Seal recovered windows under the earliest data timestamp they carry.
@@ -174,7 +185,11 @@ pub(crate) fn open_collector_journal(
 /// Parts without a data timestamp hold no rows (a dictionary needs a data
 /// section to be referenced from), so a journal made only of those is reset
 /// without producing a segment.
-fn seal_recovered_journal(journal: &mut Journal, out_dir: &Path) -> Result<Option<PathBuf>> {
+fn seal_recovered_journal(
+    journal: &mut Journal,
+    out_dir: &Path,
+    seal_limits: kronika_writer::SealLimits,
+) -> Result<Option<PathBuf>> {
     let mut first_ts: Option<i64> = None;
     for part in journal.parts().to_vec() {
         let body = journal.read_part(part).context("read a recovered part")?;
@@ -202,7 +217,15 @@ fn seal_recovered_journal(journal: &mut Journal, out_dir: &Path) -> Result<Optio
     let journal_bytes = journal.bytes();
     let journal_parts = journal.parts().len();
     let started = Instant::now();
-    let summary = seal(journal, &dest).context("seal the recovered segment")?;
+    let summary = seal_with_options(
+        journal,
+        &dest,
+        SealOptions {
+            limits: seal_limits,
+            cancelled: None,
+        },
+    )
+    .context("seal the recovered segment")?;
     log_event(
         LogLevel::Info,
         "segment_seal_finish",
@@ -211,9 +234,14 @@ fn seal_recovered_journal(journal: &mut Journal, out_dir: &Path) -> Result<Optio
             field("segment_id", first_ts),
             field("reason", "recovered"),
             field("sections", summary.sections),
+            field("rows", summary.rows),
             field("segment_bytes", summary.bytes),
             field("journal_bytes", journal_bytes),
             field("journal_parts", journal_parts),
+            field("spill_bytes", summary.spill_bytes),
+            field("write_bytes", summary.write_bytes),
+            field("admitted_memory_bytes", summary.admitted_memory_bytes),
+            field("publication", format!("{:?}", summary.publication)),
             field("min_ts", summary.min_ts),
             field("max_ts", summary.max_ts),
             field("elapsed_ms", duration_ms(started.elapsed())),
@@ -234,6 +262,68 @@ pub(crate) fn append_window_and_maybe_seal(
     flushed: &FlushedPart,
 ) -> Result<Vec<(PathBuf, &'static str)>> {
     let mut sealed = Vec::new();
+    let mut next_admission = match segment
+        .admission
+        .with_part(&flushed.body, config.seal_limits)
+    {
+        Ok(admission) => admission,
+        Err(error) if error.is_admission_boundary() && segment.first_ts.is_some() => {
+            let reason = admission_reason(&error);
+            sealed.push((seal_open_segment(journal, config, segment, reason)?, reason));
+            segment
+                .admission
+                .with_part(&flushed.body, config.seal_limits)
+                .context("one collection window exceeds seal admission")?
+        }
+        Err(error) => return Err(anyhow::Error::new(error).context("admit collection window")),
+    };
+
+    let projected = projected_journal_bytes(journal, flushed)?;
+    if segment.first_ts.is_some()
+        && config.segment_max_bytes > 0
+        && projected > config.segment_max_bytes
+    {
+        sealed.push((seal_open_segment(journal, config, segment, "size")?, "size"));
+        next_admission = segment
+            .admission
+            .with_part(&flushed.body, config.seal_limits)
+            .context("admit collection window after size seal")?;
+    }
+
+    if let Err(error) = journal.admit(&flushed.body) {
+        let boundary = matches!(
+            error,
+            JournalError::Full { .. } | JournalError::TooManyParts { .. }
+        );
+        if boundary && segment.first_ts.is_some() {
+            let reason = match error {
+                JournalError::Full { .. } => "journal-full",
+                JournalError::TooManyParts { .. } => "journal-parts",
+                _ => unreachable!("guarded journal boundary"),
+            };
+            log_event(
+                LogLevel::Warn,
+                "journal_admission_boundary",
+                &[
+                    field("reason", reason),
+                    field("journal_bytes", journal.bytes()),
+                    field("journal_parts", journal.parts().len()),
+                    field("part_bytes", flushed.summary.part_bytes),
+                ],
+            );
+            sealed.push((seal_open_segment(journal, config, segment, reason)?, reason));
+            next_admission = segment
+                .admission
+                .with_part(&flushed.body, config.seal_limits)
+                .context("admit collection window after journal seal")?;
+            journal
+                .admit(&flushed.body)
+                .context("one collection window exceeds the journal hard limits")?;
+        } else {
+            return Err(anyhow::Error::new(error).context("admit the part to the journal"));
+        }
+    }
+
     let append_started = Instant::now();
     let journal_bytes_before = journal.bytes();
     match journal.append(&flushed.body) {
@@ -246,37 +336,6 @@ pub(crate) fn append_window_and_maybe_seal(
             append_started.elapsed(),
             false,
         ),
-        Err(JournalError::Full { len, max }) if segment.first_ts.is_some() => {
-            log_event(
-                LogLevel::Warn,
-                "journal_full",
-                &[
-                    field("journal_bytes", len),
-                    field("journal_max_bytes", max),
-                    field("part_bytes", flushed.summary.part_bytes),
-                    field("sections", flushed.summary.sections.len()),
-                    field("section_rows", summary_rows(&flushed.summary)),
-                ],
-            );
-            sealed.push((
-                seal_open_segment(journal, config, segment, "journal-full")?,
-                "journal-full",
-            ));
-            let retry_started = Instant::now();
-            let journal_bytes_before = journal.bytes();
-            let part_ref = journal
-                .append(&flushed.body)
-                .context("append the window after an early seal")?;
-            log_journal_append(
-                &flushed.summary,
-                part_ref.offset,
-                part_ref.len,
-                journal_bytes_before,
-                journal.bytes(),
-                retry_started.elapsed(),
-                true,
-            );
-        }
         Err(other) => {
             log_event(
                 LogLevel::Error,
@@ -294,7 +353,7 @@ pub(crate) fn append_window_and_maybe_seal(
         }
     }
     let now = Instant::now();
-    segment.on_window_appended(ts, now);
+    segment.on_window_appended(ts, now, next_admission);
     let age = Duration::from_secs(config.segment_max_age_secs);
     if let Some(reason) = seal_reason(
         forced,
@@ -305,4 +364,30 @@ pub(crate) fn append_window_and_maybe_seal(
         sealed.push((seal_open_segment(journal, config, segment, reason)?, reason));
     }
     Ok(sealed)
+}
+
+fn projected_journal_bytes(journal: &Journal, flushed: &FlushedPart) -> Result<u64> {
+    let current = u64::try_from(journal.bytes()).context("journal bytes exceed u64")?;
+    let frame = u64::try_from(kronika_format::FRAME_HEADER_LEN)
+        .context("frame header length exceeds u64")?
+        .checked_add(u64::try_from(flushed.body.len()).context("collection part bytes exceed u64")?)
+        .context("collection frame length overflows u64")?;
+    current
+        .checked_add(frame)
+        .context("projected journal length overflows u64")
+}
+
+const fn admission_reason(error: &SealError) -> &'static str {
+    match error {
+        SealError::Resource {
+            resource: kronika_writer::SealResource::Memory,
+            ..
+        } => "memory-limit",
+        SealError::Resource {
+            resource: kronika_writer::SealResource::InputSections,
+            ..
+        } => "section-limit",
+        SealError::Codec(kronika_registry::CodecError::TooManyRows { .. }) => "row-limit",
+        _ => "admission-limit",
+    }
 }

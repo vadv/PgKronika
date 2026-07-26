@@ -44,8 +44,12 @@ fn segment_state_opens_on_the_first_window_only() {
     let mut segment = SegmentState::default();
     let now = Instant::now();
     assert!(!segment.age_expired(now, Duration::from_secs(1)));
-    segment.on_window_appended(100, now);
-    segment.on_window_appended(200, now + Duration::from_secs(5));
+    segment.on_window_appended(100, now, kronika_writer::SealAdmission::default());
+    segment.on_window_appended(
+        200,
+        now + Duration::from_secs(5),
+        kronika_writer::SealAdmission::default(),
+    );
     assert_eq!(
         segment.first_ts(),
         Some(100),
@@ -199,7 +203,8 @@ fn startup_seals_windows_a_dead_process_left_in_the_journal() {
     }
 
     let (journal, recovered) =
-        open_collector_journal(dir.path(), 1 << 30).expect("reopen the journal");
+        open_collector_journal(dir.path(), 1 << 30, kronika_writer::SealLimits::default())
+            .expect("reopen the journal");
     let dest = recovered.expect("leftover windows must become a segment");
     // client_row stamps ts = 1_000, which names the recovered file.
     assert_eq!(dest, dir.path().join("1000.pgm"));
@@ -211,7 +216,8 @@ fn startup_seals_windows_a_dead_process_left_in_the_journal() {
 fn startup_with_an_empty_journal_recovers_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (journal, recovered) =
-        open_collector_journal(dir.path(), 1 << 30).expect("open the journal");
+        open_collector_journal(dir.path(), 1 << 30, kronika_writer::SealLimits::default())
+            .expect("open the journal");
     assert!(recovered.is_none());
     assert!(journal.parts().is_empty());
 }

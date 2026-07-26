@@ -31,10 +31,11 @@ use kronika_format::{
 
 /// Default cap for the whole journal file, bytes.
 ///
-/// A starting value. [`Journal::append`] returns [`JournalError::Full`] when
-/// this cap is reached. The first frame after open/reset is exempt, so a tiny
-/// cap cannot wedge an empty journal.
+/// A starting value. [`Journal::append`] returns [`JournalError::Full`] before
+/// any frame, including the first, would cross this hard cap.
 pub const DEFAULT_MAX_JOURNAL_LEN: usize = 1024 * 1024 * 1024;
+/// Default maximum number of synchronized parts in one journal generation.
+pub const DEFAULT_MAX_JOURNAL_PARTS: usize = 65_536;
 
 /// Configuration of one journal file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,8 @@ pub struct JournalConfig {
     pub limits: JournalLimits,
     /// Cap for the whole journal file, bytes.
     pub max_journal_len: usize,
+    /// Cap for valid part frames retained in one generation.
+    pub max_parts: usize,
 }
 
 impl Default for JournalConfig {
@@ -50,6 +53,7 @@ impl Default for JournalConfig {
         Self {
             limits: JournalLimits::default(),
             max_journal_len: DEFAULT_MAX_JOURNAL_LEN,
+            max_parts: DEFAULT_MAX_JOURNAL_PARTS,
         }
     }
 }
@@ -75,6 +79,13 @@ pub enum JournalError {
         /// Current journal size, bytes.
         len: usize,
         /// The configured cap, bytes.
+        max: usize,
+    },
+    /// Appending another part would exceed the frame-count directory cap.
+    TooManyParts {
+        /// Current valid part count.
+        parts: usize,
+        /// Configured maximum.
         max: usize,
     },
     /// The part is not a valid PGM part.
@@ -105,6 +116,12 @@ impl fmt::Display for JournalError {
                     "journal of {len} bytes would exceed the cap of {max}; merge and reset first"
                 )
             }
+            Self::TooManyParts { parts, max } => {
+                write!(
+                    f,
+                    "journal with {parts} parts reached the cap of {max}; merge and reset first"
+                )
+            }
             Self::InvalidPart(err) => write!(f, "part is not a valid PGM part: {err}"),
             Self::StalePartRef { offset, len } => {
                 write!(
@@ -121,7 +138,10 @@ impl Error for JournalError {
         match self {
             Self::Io(err) => Some(err),
             Self::InvalidPart(err) => Some(err),
-            Self::PartTooLarge { .. } | Self::Full { .. } | Self::StalePartRef { .. } => None,
+            Self::PartTooLarge { .. }
+            | Self::Full { .. }
+            | Self::TooManyParts { .. }
+            | Self::StalePartRef { .. } => None,
         }
     }
 }
@@ -203,6 +223,12 @@ impl Journal {
         // The directory is the only per-frame state kept after recovery;
         // dropping the push-growth slack keeps it at exactly 16 B per part.
         scan.parts.shrink_to_fit();
+        if scan.parts.len() > config.max_parts {
+            return Err(JournalError::TooManyParts {
+                parts: scan.parts.len(),
+                max: config.max_parts,
+            });
+        }
 
         let has_incomplete_final_frame = scan
             .damages
@@ -246,26 +272,29 @@ impl Journal {
     /// journal is full, or the file write/sync fails. On error, in-memory
     /// state is unchanged.
     pub fn append(&mut self, part: &[u8]) -> Result<PartRef, JournalError> {
-        let part_len = part.len() as u64;
-        if part_len > self.config.limits.max_part_len {
-            return Err(JournalError::PartTooLarge {
+        self.admit(part)?;
+        let part_len =
+            u64::try_from(part.len()).map_err(|_overflow| JournalError::PartTooLarge {
                 len: part.len(),
                 max: self.config.limits.max_part_len,
-            });
-        }
-        // The cap decides when the writer must merge; the first frame is
-        // always allowed so that a tiny cap cannot wedge an empty journal.
-        let frame_len = FRAME_HEADER_LEN + part.len();
-        if self.end > 0 && self.end + frame_len > self.config.max_journal_len {
-            return Err(JournalError::Full {
+            })?;
+        let frame_len = FRAME_HEADER_LEN
+            .checked_add(part.len())
+            .ok_or(JournalError::Full {
                 len: self.end,
                 max: self.config.max_journal_len,
-            });
-        }
-        // An invalid body would be framed and synced, but the next recovery
-        // scan would report the frame as damage and skip it. Treat that as a
-        // writer bug and fail before writing.
-        validate_part(part).map_err(JournalError::InvalidPart)?;
+            })?;
+        let next_end = self.end.checked_add(frame_len).ok_or(JournalError::Full {
+            len: self.end,
+            max: self.config.max_journal_len,
+        })?;
+        let part_offset = self
+            .end
+            .checked_add(FRAME_HEADER_LEN)
+            .ok_or(JournalError::Full {
+                len: self.end,
+                max: self.config.max_journal_len,
+            })?;
 
         let header = FrameHeader { part_len }.encode();
         if let Err(err) = self.write_frame(&header, part) {
@@ -279,12 +308,61 @@ impl Journal {
         }
 
         let part_ref = PartRef {
-            offset: self.end + FRAME_HEADER_LEN,
+            offset: part_offset,
             len: part.len(),
         };
-        self.end += frame_len;
+        self.end = next_end;
         self.parts.push(part_ref);
         Ok(part_ref)
+    }
+
+    /// Validate a candidate part and exact append bounds without writing it.
+    ///
+    /// The collector uses this before sealing decisions so neither byte nor
+    /// part-directory hard limits are crossed and then repaired afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same size/count/format errors as [`Self::append`].
+    pub fn admit(&self, part: &[u8]) -> Result<(), JournalError> {
+        let part_len =
+            u64::try_from(part.len()).map_err(|_overflow| JournalError::PartTooLarge {
+                len: part.len(),
+                max: self.config.limits.max_part_len,
+            })?;
+        if part_len > self.config.limits.max_part_len {
+            return Err(JournalError::PartTooLarge {
+                len: part.len(),
+                max: self.config.limits.max_part_len,
+            });
+        }
+        let frame_len = FRAME_HEADER_LEN
+            .checked_add(part.len())
+            .ok_or(JournalError::Full {
+                len: self.end,
+                max: self.config.max_journal_len,
+            })?;
+        let next_end = self.end.checked_add(frame_len).ok_or(JournalError::Full {
+            len: self.end,
+            max: self.config.max_journal_len,
+        })?;
+        if next_end > self.config.max_journal_len {
+            return Err(JournalError::Full {
+                len: self.end,
+                max: self.config.max_journal_len,
+            });
+        }
+        if self.parts.len() >= self.config.max_parts {
+            return Err(JournalError::TooManyParts {
+                parts: self.parts.len(),
+                max: self.config.max_parts,
+            });
+        }
+        // An invalid body would be framed and synced, but the next recovery
+        // scan would report the frame as damage and skip it. Treat that as a
+        // writer bug and fail before writing.
+        validate_part(part).map_err(JournalError::InvalidPart)?;
+        Ok(())
     }
 
     /// The raw write sequence of one frame, separated so that the error
@@ -389,6 +467,7 @@ mod tests {
         JournalConfig {
             limits: small_limits(),
             max_journal_len: 1 << 20,
+            max_parts: 1024,
         }
     }
 
@@ -644,9 +723,10 @@ mod tests {
             limits: small_limits(),
             // Room for one frame, not two.
             max_journal_len: frame_len + frame_len / 2,
+            max_parts: 1024,
         };
         let (mut journal, _) = Journal::open(&path, config).expect("open");
-        journal.append(&part).expect("the first frame always fits");
+        journal.append(&part).expect("the first frame fits");
         assert!(matches!(
             journal.append(&part),
             Err(JournalError::Full { .. })

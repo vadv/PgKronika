@@ -7,10 +7,12 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
-use crate::{Catalog, DecodeError, Entry, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex, crc32c};
+use crate::{
+    Catalog, DecodeError, EncodeError, Entry, MAGIC, ReadAt, TAIL_INDEX_LEN, TailIndex, crc32c,
+};
 
 /// Magic bytes opening every journal frame.
-pub const FRAME_MAGIC: [u8; 4] = *b"PGMP";
+pub const FRAME_MAGIC: [u8; 4] = *b"PGMF";
 
 /// Size of a frame header on disk, bytes.
 pub const FRAME_HEADER_LEN: usize = 16;
@@ -99,7 +101,7 @@ impl fmt::Display for FrameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadMagic { actual } => {
-                write!(f, "frame magic is {actual:02x?}, expected \"PGMP\"")
+                write!(f, "frame magic is {actual:02x?}, expected \"PGMF\"")
             }
             Self::BadCrc { stored, computed } => {
                 write!(
@@ -140,6 +142,29 @@ pub enum PartError {
         /// `type_id` of the entry that failed validation.
         type_id: u32,
     },
+    /// Entries are not in strictly increasing `type_id` order.
+    NonCanonicalTypeOrder {
+        /// Previous entry id, or zero when the first id is invalid.
+        previous: u32,
+        /// Current entry id.
+        current: u32,
+    },
+    /// A section is not packed immediately after the preceding body.
+    NonCanonicalOffset {
+        /// `type_id` of the entry.
+        type_id: u32,
+        /// Required offset.
+        expected: u64,
+        /// Stored offset.
+        actual: u64,
+    },
+    /// A reserved catalog flag is non-zero.
+    ReservedFlags {
+        /// `type_id` of the entry.
+        type_id: u32,
+        /// Stored flags.
+        flags: u32,
+    },
     /// A section body does not match its catalog CRC32C.
     SectionCrc {
         /// `type_id` of the entry that failed validation.
@@ -158,7 +183,7 @@ impl fmt::Display for PartError {
                 write!(f, "part body of {actual} bytes is too short for a PGM part")
             }
             Self::BadMagic { actual } => {
-                write!(f, "part magic is {actual:02x?}, expected \"PGM1\"")
+                write!(f, "part magic is {actual:02x?}, expected \"PGMC\"")
             }
             Self::Tail(err) => write!(f, "part tail index: {err}"),
             Self::BadCatalogLen { catalog_len } => {
@@ -167,6 +192,25 @@ impl fmt::Display for PartError {
             Self::Catalog(err) => write!(f, "part catalog: {err}"),
             Self::SectionOutOfBounds { type_id } => {
                 write!(f, "section {type_id} points outside the part body")
+            }
+            Self::NonCanonicalTypeOrder { previous, current } => {
+                write!(
+                    f,
+                    "section type order is not canonical: {current} follows {previous}"
+                )
+            }
+            Self::NonCanonicalOffset {
+                type_id,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "section {type_id} starts at {actual}, expected packed offset {expected}"
+                )
+            }
+            Self::ReservedFlags { type_id, flags } => {
+                write!(f, "section {type_id} uses reserved flags {flags:#010x}")
             }
             Self::SectionCrc {
                 type_id,
@@ -257,17 +301,47 @@ fn decode_and_bound(bytes: &[u8]) -> Result<Catalog, PartError> {
 
     let catalog = Catalog::decode(&bytes[catalog_start..body_end]).map_err(PartError::Catalog)?;
 
+    let mut expected_offset = MAGIC.len() as u64;
+    let mut previous_type = 0_u32;
     for entry in &catalog.entries {
-        let in_bounds = entry.offset >= MAGIC.len() as u64
-            && entry
-                .offset
-                .checked_add(entry.len)
-                .is_some_and(|end| end <= catalog_start as u64);
-        if !in_bounds {
+        if entry.flags != 0 {
+            return Err(PartError::ReservedFlags {
+                type_id: entry.type_id,
+                flags: entry.flags,
+            });
+        }
+        if entry.type_id == 0 || entry.type_id <= previous_type {
+            return Err(PartError::NonCanonicalTypeOrder {
+                previous: previous_type,
+                current: entry.type_id,
+            });
+        }
+        if entry.offset != expected_offset {
+            return Err(PartError::NonCanonicalOffset {
+                type_id: entry.type_id,
+                expected: expected_offset,
+                actual: entry.offset,
+            });
+        }
+        let Some(end) = entry.offset.checked_add(entry.len) else {
+            return Err(PartError::SectionOutOfBounds {
+                type_id: entry.type_id,
+            });
+        };
+        if end > catalog_start as u64 {
             return Err(PartError::SectionOutOfBounds {
                 type_id: entry.type_id,
             });
         }
+        expected_offset = end;
+        previous_type = entry.type_id;
+    }
+    if expected_offset != catalog_start as u64 {
+        return Err(PartError::NonCanonicalOffset {
+            type_id: 0,
+            expected: expected_offset,
+            actual: catalog_start as u64,
+        });
     }
 
     Ok(catalog)
@@ -296,6 +370,41 @@ pub struct PartMeta {
     pub source_id: u64,
 }
 
+/// Why assembling a PGM part failed before allocation or truncating a field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartBuildError {
+    /// Two inputs use the same `type_id`, or an id is zero.
+    NonCanonicalTypeId {
+        /// Rejected id.
+        type_id: u32,
+    },
+    /// A checked byte-length or offset calculation overflowed.
+    LengthOverflow,
+    /// The end catalog exceeded its on-disk bounds.
+    Catalog(EncodeError),
+}
+
+impl fmt::Display for PartBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonCanonicalTypeId { type_id } => {
+                write!(f, "part has duplicate or zero section type id {type_id}")
+            }
+            Self::LengthOverflow => write!(f, "part byte length exceeds addressable bounds"),
+            Self::Catalog(error) => write!(f, "part catalog: {error}"),
+        }
+    }
+}
+
+impl Error for PartBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Catalog(error) => Some(error),
+            Self::NonCanonicalTypeId { .. } | Self::LengthOverflow => None,
+        }
+    }
+}
+
 /// Assemble section bodies into a self-contained PGM part.
 ///
 /// Offsets and CRCs are computed here.
@@ -305,29 +414,73 @@ pub struct PartMeta {
 /// If the encoded catalog block does not fit in `u32`.
 #[must_use]
 pub fn build_part(sections: &[SectionInput<'_>], meta: PartMeta) -> Vec<u8> {
+    try_build_part(sections, meta).expect("PGM part inputs must fit the current format")
+}
+
+/// Assemble section bodies into a canonical self-contained PGM part using
+/// checked length and offset calculations.
+///
+/// Inputs may arrive in any order; output entries are sorted by `type_id`.
+///
+/// # Errors
+///
+/// Returns [`PartBuildError`] for a zero/duplicate type id, arithmetic
+/// overflow, or an end catalog outside its on-disk bounds.
+pub fn try_build_part(
+    sections: &[SectionInput<'_>],
+    meta: PartMeta,
+) -> Result<Vec<u8>, PartBuildError> {
+    let mut ordered: Vec<&SectionInput<'_>> = sections.iter().collect();
+    ordered.sort_unstable_by_key(|section| section.type_id);
+    let mut previous = None;
+    for section in &ordered {
+        if section.type_id == 0 || previous == Some(section.type_id) {
+            return Err(PartBuildError::NonCanonicalTypeId {
+                type_id: section.type_id,
+            });
+        }
+        previous = Some(section.type_id);
+    }
+
     // The exact part length is known up front.
-    let bodies: usize = sections.iter().map(|section| section.body.len()).sum();
-    let capacity =
-        MAGIC.len() + bodies + sections.len() * crate::ENTRY_LEN + crate::META_LEN + TAIL_INDEX_LEN;
+    let bodies = ordered.iter().try_fold(0_usize, |total, section| {
+        total
+            .checked_add(section.body.len())
+            .ok_or(PartBuildError::LengthOverflow)
+    })?;
+    let catalog_entries = ordered
+        .len()
+        .checked_mul(crate::ENTRY_LEN)
+        .ok_or(PartBuildError::LengthOverflow)?;
+    let capacity = MAGIC
+        .len()
+        .checked_add(bodies)
+        .and_then(|value| value.checked_add(catalog_entries))
+        .and_then(|value| value.checked_add(crate::META_LEN))
+        .and_then(|value| value.checked_add(TAIL_INDEX_LEN))
+        .ok_or(PartBuildError::LengthOverflow)?;
     let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&MAGIC);
 
-    let entries = sections
+    let entries = ordered
         .iter()
         .map(|section| {
             // Catalog offsets are absolute from the part start.
-            let offset = out.len() as u64;
+            let offset =
+                u64::try_from(out.len()).map_err(|_overflow| PartBuildError::LengthOverflow)?;
             out.extend_from_slice(section.body);
-            Entry {
+            let len = u64::try_from(section.body.len())
+                .map_err(|_overflow| PartBuildError::LengthOverflow)?;
+            Ok(Entry {
                 type_id: section.type_id,
                 flags: 0,
                 offset,
-                len: section.body.len() as u64,
+                len,
                 rows: section.rows,
                 crc32c: crc32c(section.body),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, PartBuildError>>()?;
 
     let catalog = Catalog {
         entries,
@@ -336,8 +489,8 @@ pub fn build_part(sections: &[SectionInput<'_>], meta: PartMeta) -> Vec<u8> {
         source_id: meta.source_id,
         format_version: crate::FORMAT_VERSION,
     };
-    out.extend_from_slice(&catalog.encode());
-    out
+    out.extend_from_slice(&catalog.try_encode().map_err(PartBuildError::Catalog)?);
+    Ok(out)
 }
 
 /// Limits used while scanning a journal buffer.
@@ -968,7 +1121,7 @@ mod tests {
     #[test]
     fn frame_header_layout_is_byte_exact() {
         let encoded = FrameHeader { part_len: 88 }.encode();
-        assert_eq!(&encoded[..4], b"PGMP");
+        assert_eq!(&encoded[..4], b"PGMF");
         assert_eq!(&encoded[4..12], &88_u64.to_le_bytes());
         // The CRC pins the covered range: magic + length, little-endian.
         assert_eq!(

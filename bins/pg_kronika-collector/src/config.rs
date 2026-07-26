@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use kronika_registry::MAX_SECTION_ROWS;
+use kronika_registry::{COMPACTION_MEMORY_LIMIT, MAX_SECTION_ROWS};
 use kronika_source_log::{LogConfig, ParserKind as LogParserKind};
 use kronika_source_pg::pool::{DEFAULT_MAX_DATABASES, SessionConfig};
 use kronika_source_pg::replication_details::ReplicationDetailBounds;
 use kronika_source_pg::user_indexes::INDEX_TOPN_AXES;
 use kronika_source_pg::user_tables::TABLE_TOPN_AXES;
-use kronika_writer::DEFAULT_MAX_JOURNAL_LEN;
+use kronika_writer::{DEFAULT_MAX_INPUT_SECTIONS, DEFAULT_MAX_JOURNAL_LEN, SealLimits};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,6 +57,8 @@ pub(crate) struct Config {
     /// Hard cap of the on-disk journal file; reaching it seals the open
     /// segment early instead of failing the append.
     pub(crate) journal_max_bytes: u64,
+    /// Hard memory/disk/catalog resources for compact segment completion.
+    pub(crate) seal_limits: SealLimits,
     /// Ceiling for one cycle's database time before the sized pool sources
     /// (statements, tables, indexes) are deferred; `0` disables the budget.
     pub(crate) cycle_db_budget_ms: u64,
@@ -148,6 +150,31 @@ impl Config {
         let segment_max_age_secs = env_u64("KRONIKA_SEGMENT_MAX_AGE_S", 900)?;
         let journal_max_bytes =
             env_u64("KRONIKA_JOURNAL_MAX_BYTES", DEFAULT_MAX_JOURNAL_LEN as u64)?;
+        let seal_memory_bytes = usize::try_from(env_u64(
+            "KRONIKA_SEAL_MEMORY_MAX_BYTES",
+            COMPACTION_MEMORY_LIMIT as u64,
+        )?)
+        .context("KRONIKA_SEAL_MEMORY_MAX_BYTES exceeds usize")?;
+        let seal_spill_bytes = env_u64("KRONIKA_SEAL_SPILL_MAX_BYTES", journal_max_bytes)?;
+        let seal_output_bytes = env_u64("KRONIKA_SEAL_OUTPUT_MAX_BYTES", journal_max_bytes)?;
+        let seal_input_sections = usize::try_from(env_u64(
+            "KRONIKA_SEAL_MAX_INPUT_SECTIONS",
+            DEFAULT_MAX_INPUT_SECTIONS as u64,
+        )?)
+        .context("KRONIKA_SEAL_MAX_INPUT_SECTIONS exceeds usize")?;
+        anyhow::ensure!(
+            seal_memory_bytes > 0
+                && seal_spill_bytes > 0
+                && seal_output_bytes > 0
+                && seal_input_sections > 0,
+            "KRONIKA_SEAL_* hard limits must all be greater than zero"
+        );
+        let seal_limits = SealLimits {
+            max_memory_bytes: seal_memory_bytes,
+            max_spill_bytes: seal_spill_bytes,
+            max_output_bytes: seal_output_bytes,
+            max_input_sections: seal_input_sections,
+        };
         if segment_max_bytes > journal_max_bytes {
             log_event(
                 LogLevel::Warn,
@@ -201,6 +228,7 @@ impl Config {
             segment_max_bytes,
             segment_max_age_secs,
             journal_max_bytes,
+            seal_limits,
             cycle_db_budget_ms,
             activity_fast_interval_s,
             ash_active_threshold,

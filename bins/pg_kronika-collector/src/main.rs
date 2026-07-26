@@ -105,8 +105,11 @@ async fn main() -> Result<()> {
 
     // The journal lives next to sealed segments so windows survive restarts.
     // Recovered windows are sealed before connecting to PostgreSQL.
-    let (mut journal, recovered) =
-        open_collector_journal(&config.out_dir, config.journal_max_bytes)?;
+    let (mut journal, recovered) = open_collector_journal(
+        &config.out_dir,
+        config.journal_max_bytes,
+        config.seal_limits,
+    )?;
     if let Some(dest) = recovered {
         announce(&format!("sealed {} reason=recovered", dest.display()));
     }

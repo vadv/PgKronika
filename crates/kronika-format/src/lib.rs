@@ -32,7 +32,9 @@ use proptest as _;
 #[cfg(test)]
 use tempfile as _;
 
-pub use catalog::{Catalog, DecodeError, ENTRY_LEN, Entry, META_LEN, TAIL_INDEX_LEN, TailIndex};
+pub use catalog::{
+    Catalog, DecodeError, ENTRY_LEN, EncodeError, Entry, META_LEN, TAIL_INDEX_LEN, TailIndex,
+};
 pub use crc::{Crc32c, crc32c};
 pub use dictionary::{
     BlobEntry, DEFAULT_BLOB_THRESHOLD, DEFAULT_MAX_TOTAL_BYTES, DEFAULT_TRUNCATE_LIMIT, DictError,
@@ -41,18 +43,23 @@ pub use dictionary::{
 pub use dictionary::{EntrySnapshot, HotMark, Placement};
 pub use parts::{
     DEFAULT_MAX_PART_LEN, DEFAULT_RESYNC_CHUNK, DamageKind, DamageRegion, FRAME_HEADER_LEN,
-    FRAME_MAGIC, FrameError, FrameHeader, JournalLimits, PartError, PartMeta, PartRef, ScanReport,
-    SectionInput, build_part, scan_journal, scan_journal_streaming, scan_journal_streaming_from,
-    validate_part, validate_part_catalog,
+    FRAME_MAGIC, FrameError, FrameHeader, JournalLimits, PartBuildError, PartError, PartMeta,
+    PartRef, ScanReport, SectionInput, build_part, scan_journal, scan_journal_streaming,
+    scan_journal_streaming_from, try_build_part, validate_part, validate_part_catalog,
 };
 pub use read_at::ReadAt;
 pub use str_id::StrId;
 
 /// Segment magic bytes.
 ///
-/// A PGM file starts with `PGM1`, and the tail index also ends with `PGM1`.
+/// A current PGM file starts with `PGMC`, and the tail index also ends with
+/// `PGMC`.
 /// Readers use the second copy when opening a segment from the end.
-pub const MAGIC: [u8; 4] = *b"PGM1";
+///
+/// The unreleased pre-compaction encoding used different magic. Rejecting it
+/// here gives every runtime path one clean contract instead of a legacy
+/// decoder.
+pub const MAGIC: [u8; 4] = *b"PGMC";
 
 /// Version of the container layout.
 ///

@@ -25,8 +25,14 @@ mod segment;
 
 pub use buffer::{FlushSummary, FlushedPart, SectionBuffers, SectionFlushSummary};
 pub use interner::{FlushedEntry, Interner, SealedSegment};
-pub use journal::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalConfig, JournalError, OpenReport};
-pub use segment::{SealError, SealSummary, seal};
+pub use journal::{
+    DEFAULT_MAX_JOURNAL_LEN, DEFAULT_MAX_JOURNAL_PARTS, Journal, JournalConfig, JournalError,
+    OpenReport,
+};
+pub use segment::{
+    DEFAULT_MAX_INPUT_SECTIONS, DictionaryError, Publication, SealAdmission, SealError, SealLimits,
+    SealOptions, SealResource, SealSummary, seal, seal_with_options,
+};
 
 #[cfg(test)]
 mod composition_tests {

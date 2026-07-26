@@ -12,7 +12,7 @@ use kronika_format::{
 };
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_SECTION_BYTES,
-    Row, VerifiedSection, decode_any, decode_rows,
+    MAX_SECTION_ROWS, Row, VerifiedSection, decode_any, decode_rows, registry,
 };
 
 use crate::{Dictionary, ReadError, Stored, decode_dictionary};
@@ -335,12 +335,8 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
                     MapEntry::Vacant(slot) => {
                         slot.insert(value);
                     }
-                    // A later part may move the same id from `dict.strings` to
-                    // `dict.blobs`; the blob carries truncation metadata, so it wins.
-                    MapEntry::Occupied(mut slot) => {
-                        if matches!(value, Stored::Blob { .. }) {
-                            slot.insert(value);
-                        }
+                    MapEntry::Occupied(_slot) => {
+                        return Err(ReadError::DictionaryConflict { str_id });
                     }
                 }
             }
@@ -419,17 +415,61 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
             version: catalog.format_version,
         });
     }
+    let max_entries = registry()
+        .len()
+        .checked_add(2)
+        .ok_or(ReadError::CounterOverflow)?;
+    if catalog.entries.len() > max_entries {
+        return Err(ReadError::TooManyCatalogEntries {
+            entries: catalog.entries.len(),
+            max: max_entries,
+        });
+    }
+    let mut expected_offset = MAGIC.len() as u64;
+    let mut previous_type = 0_u32;
     for entry in &catalog.entries {
-        let in_bounds = entry.offset >= MAGIC.len() as u64
-            && entry
-                .offset
-                .checked_add(entry.len)
-                .is_some_and(|end| end <= catalog_at);
-        if !in_bounds {
+        let known = matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID)
+            || registry()
+                .iter()
+                .any(|contract| contract.type_id.get() == entry.type_id);
+        if !known {
+            return Err(ReadError::UnknownType {
+                type_id: entry.type_id,
+            });
+        }
+        if entry.flags != 0
+            || entry.type_id == 0
+            || entry.type_id <= previous_type
+            || entry.offset != expected_offset
+        {
+            return Err(ReadError::NonCanonicalCatalog {
+                type_id: entry.type_id,
+            });
+        }
+        if entry.len > MAX_SECTION_BYTES as u64 {
+            return Err(ReadError::SectionTooLarge { len: entry.len });
+        }
+        if entry.rows as usize > MAX_SECTION_ROWS {
+            return Err(ReadError::Codec(CodecError::TooManyRows {
+                rows: entry.rows as usize,
+                max: MAX_SECTION_ROWS,
+            }));
+        }
+        let Some(end) = entry.offset.checked_add(entry.len) else {
+            return Err(ReadError::SectionOutOfBounds {
+                type_id: entry.type_id,
+            });
+        };
+        if end > catalog_at {
             return Err(ReadError::SectionOutOfBounds {
                 type_id: entry.type_id,
             });
         }
+        expected_offset = end;
+        previous_type = entry.type_id;
+    }
+    if expected_offset != catalog_at {
+        return Err(ReadError::NonCanonicalCatalog { type_id: 0 });
     }
     Ok(OpenedCatalog {
         catalog,

@@ -140,6 +140,24 @@ pub enum ReadError {
         /// The entry's `type_id`.
         type_id: u32,
     },
+    /// Catalog entries are not unique, sorted, packed, and flag-free.
+    NonCanonicalCatalog {
+        /// Entry being validated, or zero for trailing unreferenced bytes.
+        type_id: u32,
+    },
+    /// A catalog entry has no current registry or dictionary contract.
+    UnknownType {
+        /// Unknown id.
+        type_id: u32,
+    },
+    /// The catalog contains more unique sections than the current registry can
+    /// produce.
+    TooManyCatalogEntries {
+        /// Entry count found.
+        entries: usize,
+        /// Maximum current data plus dictionary entry count.
+        max: usize,
+    },
     /// `decode` was called on a dictionary section; use
     /// [`dictionary`](Segment::dictionary) instead.
     DictionarySection {
@@ -190,6 +208,11 @@ pub enum ReadError {
         /// Rows produced by the section decoder.
         decoded: u64,
     },
+    /// A supposedly normalized PGM dictionary repeats an id.
+    DictionaryConflict {
+        /// Repeated id.
+        str_id: u64,
+    },
 }
 
 impl fmt::Display for ReadError {
@@ -198,13 +221,25 @@ impl fmt::Display for ReadError {
             Self::Io(err) => write!(f, "segment io: {err}"),
             Self::TooSmall { len } => write!(f, "file of {len} bytes is too small for a segment"),
             Self::BadMagic { actual } => {
-                write!(f, "segment magic is {actual:02x?}, expected \"PGM1\"")
+                write!(f, "segment magic is {actual:02x?}, expected \"PGMC\"")
             }
             Self::UnsupportedFormat { version } => {
                 write!(f, "segment format_version {version} is not supported")
             }
             Self::SectionOutOfBounds { type_id } => {
                 write!(f, "section {type_id} points outside the segment")
+            }
+            Self::NonCanonicalCatalog { type_id } => {
+                write!(f, "catalog is not canonical at section {type_id}")
+            }
+            Self::UnknownType { type_id } => {
+                write!(f, "catalog uses unknown type_id {type_id}")
+            }
+            Self::TooManyCatalogEntries { entries, max } => {
+                write!(
+                    f,
+                    "catalog has {entries} entries, above the current cap of {max}"
+                )
             }
             Self::DictionarySection { type_id } => {
                 write!(f, "section {type_id} is a dictionary; use dictionary()")
@@ -235,6 +270,9 @@ impl fmt::Display for ReadError {
                 f,
                 "section type {type_id} decoded {decoded} rows, but the catalog declares {declared}"
             ),
+            Self::DictionaryConflict { str_id } => {
+                write!(f, "normalized dictionary repeats id {str_id:#018x}")
+            }
         }
     }
 }
@@ -250,13 +288,17 @@ impl Error for ReadError {
             | Self::BadMagic { .. }
             | Self::UnsupportedFormat { .. }
             | Self::SectionOutOfBounds { .. }
+            | Self::NonCanonicalCatalog { .. }
+            | Self::UnknownType { .. }
+            | Self::TooManyCatalogEntries { .. }
             | Self::DictionarySection { .. }
             | Self::BadCatalogLen { .. }
             | Self::SectionTooLarge { .. }
             | Self::StaleSnapshot { .. }
             | Self::CounterOverflow
             | Self::CatalogOrdinalOutOfRange { .. }
-            | Self::CatalogRowCountMismatch { .. } => None,
+            | Self::CatalogRowCountMismatch { .. }
+            | Self::DictionaryConflict { .. } => None,
         }
     }
 }
