@@ -504,19 +504,27 @@ fn plan_analyzer_provenance(world: &mut BddWorld, section: String) -> Result<()>
                 && cell_u64(marker.get("collected")) == Some(plan_rows),
             "{section} coverage at {ts} is not exact: {marker:?}"
         );
-        let reset = exact_row_at(&resets, ts).with_context(|| {
-            format!("no coordinated reset_metadata for {section} timestamp {ts}")
-        })?;
+        let reset = exact_row_at(&resets, ts)
+            .with_context(|| format!("invalid reset_metadata for {section} timestamp {ts}"))?;
+        let extension_version = resolved_text(reset.get("ext_pg_store_plans_version"), &reset_dict)
+            .context("pg_store_plans extension version is absent or malformed")?;
+        let compute_query_id = resolved_text(reset.get("compute_query_id"), &reset_dict)
+            .context("compute_query_id is absent or malformed")?;
         ensure!(
-            resolved_nonempty(reset.get("ext_pg_store_plans_version"), &reset_dict)
-                && resolved_nonempty(reset.get("compute_query_id"), &reset_dict),
+            if type_id == 1_003_001 {
+                extension_version.starts_with("1.")
+                    && matches!(reset.get("pg_store_plans_reset_at"), Some(Cell::Ts(_)))
+            } else {
+                extension_version.starts_with("2.")
+                    && reset.get("pg_store_plans_reset_at") == Some(&Cell::Null)
+            } && matches!(compute_query_id, "auto" | "on" | "regress"),
             "{section} reset metadata does not carry extension/query-id context: {reset:?}"
         );
         let instance = latest_row_at(&instances, ts).with_context(|| {
             format!("no instance_metadata at or before {section} timestamp {ts}")
         })?;
         ensure!(
-            resolved_nonempty(instance.get("node_self_id"), &instance_dict)
+            resolved_text(instance.get("node_self_id"), &instance_dict).is_some()
                 && matches!(instance.get("pg_system_identifier"), Some(Cell::I64(_)))
                 && cell_i64(instance.get("pg_version_num"))
                     .is_some_and(|version| (15..=18).contains(&(version / 10_000))),
@@ -526,8 +534,18 @@ fn plan_analyzer_provenance(world: &mut BddWorld, section: String) -> Result<()>
     Ok(())
 }
 
-fn exact_row_at(rows: &[kronika_registry::Row], ts: i64) -> Option<&kronika_registry::Row> {
-    rows.iter().find(|row| row.get("ts") == Some(&Cell::Ts(ts)))
+fn exact_row_at(rows: &[kronika_registry::Row], ts: i64) -> Result<&kronika_registry::Row> {
+    let mut matches = rows
+        .iter()
+        .filter(|row| row.get("ts") == Some(&Cell::Ts(ts)));
+    let row = matches
+        .next()
+        .with_context(|| format!("no coordinated row at timestamp {ts}"))?;
+    ensure!(
+        matches.next().is_none(),
+        "conflicting coordinated rows at timestamp {ts}"
+    );
+    Ok(row)
 }
 
 fn latest_row_at(rows: &[kronika_registry::Row], ts: i64) -> Option<&kronika_registry::Row> {
@@ -539,17 +557,20 @@ fn latest_row_at(rows: &[kronika_registry::Row], ts: i64) -> Option<&kronika_reg
         })
 }
 
-fn resolved_nonempty(cell: Option<&Cell>, dictionary: &kronika_reader::Dictionary) -> bool {
+fn resolved_text<'a>(
+    cell: Option<&Cell>,
+    dictionary: &'a kronika_reader::Dictionary,
+) -> Option<&'a str> {
     let Some(Cell::StrId(id)) = cell else {
-        return false;
+        return None;
     };
-    matches!(
-        dictionary.resolve(*id),
-        Some(
-            kronika_reader::Resolved::String(bytes)
-                | kronika_reader::Resolved::Blob { bytes, .. }
-        ) if !bytes.is_empty()
-    )
+    let bytes = match dictionary.resolve(*id)? {
+        kronika_reader::Resolved::String(bytes) | kronika_reader::Resolved::Blob { bytes, .. } => {
+            bytes
+        }
+    };
+    let text = std::str::from_utf8(bytes).ok()?;
+    (!text.is_empty()).then_some(text)
 }
 
 fn cell_i64(cell: Option<&Cell>) -> Option<i64> {
