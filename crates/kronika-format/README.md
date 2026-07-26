@@ -41,10 +41,11 @@ $KRONIKA_OUT_DIR/
 ```
 
 There are no separate files for string values. While a segment is open,
-dictionary bodies live in the PGM parts inside `active.parts`. On completion,
-the writer copies those bodies unchanged into the finished `.pgm`.
+dictionary bodies live in self-contained PGM parts inside `active.parts`.
+Sealing decodes those parts, normalizes their dictionaries, and writes one
+compact PGM.
 
-The format crate owns the PGM and `PGMP` byte layouts, the end catalog,
+The format crate owns the PGM framing, journal-frame bytes, end catalog,
 CRC32C checksums, `StrId`, and the bounded dictionary model. It deliberately
 does not own:
 
@@ -59,26 +60,29 @@ does not own:
 
 ## From a collection window to a segment
 
-The current collector creates a fresh interner and row buffers for each
-non-empty collection cycle. The registry sorts each snapshot section by its
-contract key and encodes it. The writer adds dictionary sections, builds a
-self-contained PGM part, wraps it in a `PGMP` frame, appends it to
-`active.parts`, and calls `sync_data`.
+The collector creates a fresh interner and row buffers for each non-empty
+collection cycle. The registry sorts each snapshot section by its contract
+key and encodes it. The writer adds dictionary sections, builds a
+self-contained PGM part, wraps it in a 16-byte journal frame, appends it to
+`active.parts`, and synchronizes the append.
 
-The collector keeps appending windows until a size, age, forced-rotation, or
-journal-cap condition closes the segment. Sealing then:
+The collector keeps appending windows until age, size, forced rotation,
+journal pressure, or compact-output admission closes the segment. Sealing:
 
-1. validates the catalogs of the recorded parts;
-2. writes one leading PGM magic marker;
-3. copies every section body in journal and catalog order;
-4. rewrites their absolute offsets into one end catalog;
-5. synchronizes a sibling temporary file and publishes it without overwriting
-   an existing destination;
-6. resets `active.parts` only after publication succeeds.
+1. validates and admits every recorded part before publication work;
+2. decodes each data section and creates a canonically sorted run;
+3. merges runs with fixed fan-in 32, spilling bounded intermediate bodies
+   beside the destination;
+4. validates and deduplicates dictionary records by `str_id`;
+5. writes exactly one compact body for every present `type_id`, followed by
+   one end catalog and tail index;
+6. synchronizes the sibling temporary file, publishes without replacing a
+   different destination, and synchronizes the parent directory;
+7. lets the collector reset `active.parts` only after publication succeeds.
 
-This distinction matters for file size: the current `seal` path does **not**
-merge, deduplicate, or re-encode Parquet bodies. It removes the per-part
-framing and builds one catalog around the original bodies.
+Seal failure leaves the synchronized journal available for another attempt.
+The writer reports source, spill, output, write, and admitted-memory totals for
+release qualification and operator diagnostics.
 
 ### Windows, parts, sections, and bodies
 
@@ -90,51 +94,49 @@ The format description uses four different levels:
 - a **section** is one catalog entry: `type_id`, offset, length, row count, and
   CRC32C;
 - a **section body** is the byte range addressed by a catalog entry. The
-  current writer places one self-contained Parquet file in that range.
+  writer places one self-contained Parquet file in that range.
 
 While the segment is open, every part is wrapped in its own journal frame:
 
 ```text
 active.parts
 |
-+-- PGMP frame #1
++-- journal frame #1
 |   `-- PGM part for window #1
-|       |-- PGM magic
-|       |-- data section bodies
-|       |-- dict.strings / dict.blobs bodies
+|       |-- PGM marker
+|       |-- data and dictionary bodies
 |       |-- part catalog
 |       `-- tail index
 |
-`-- PGMP frame #2
+`-- journal frame #2
     `-- PGM part for window #2
-        |-- PGM magic
-        |-- data section bodies
-        |-- dict.strings / dict.blobs bodies
+        |-- PGM marker
+        |-- data and dictionary bodies
         |-- part catalog
         `-- tail index
 ```
 
-Within each part, the current writer places non-empty data bodies in ascending
+Within each part, the writer places non-empty data bodies in ascending
 `type_id` order, followed by `dict.strings` and then `dict.blobs`. An absent
-dictionary section occupies no space. This is current writer order, not a fixed
-format offset; readers locate every body through the catalog.
+dictionary section occupies no space. Readers locate every body through the
+catalog.
 
-Completing the segment removes the individual part framing:
+Completing the segment coalesces the parts:
 
 ```text
 active.parts                         <first_timestamp>.pgm
 
-PGMP [part for window #1]             PGM magic
-PGMP [part for window #2] -- seal() -> bodies from window #1, including its dictionaries
-...                                  bodies from window #2, including its dictionaries
-                                     ...
-                                     one shared end catalog
-                                     one tail index
+frame [part for window #1]             PGM marker
+frame [part for window #2] -- seal() -> one body per present type_id
+...                                   one normalized dict.strings body, if any
+                                      one normalized dict.blobs body, if any
+                                      one end catalog
+                                      one tail index
 ```
 
-The finished PGM has no explicit window-boundary markers. A body's originating
-window is not recorded; it can only be inferred from order and contents. The
-catalog describes sections, not window numbers.
+The finished PGM has no explicit window-boundary markers. Rows from every
+admitted window are in canonical registry order, and the catalog describes
+section types rather than collection windows.
 
 ## Sealed PGM layout
 
@@ -158,10 +160,9 @@ pgm_bytes = B + 32*N + 52
 catalog_len = 32*N + 40
 ```
 
-The 52 fixed bytes are the leading magic, catalog metadata, and tail index.
-There is no outer compression layer. These equations describe canonical writer
-output; the low-level validator does not require an arbitrary v1 input to be
-packed without unused gaps or overlapping section ranges.
+The 52 fixed bytes are the leading marker, catalog metadata, and tail index.
+There is no outer compression layer. Current PGM bodies are packed without
+gaps, and `type_id` values are strictly increasing.
 
 ### Catalog entry: 32 bytes
 
@@ -174,10 +175,8 @@ packed without unused gaps or overlapping section ranges.
 | 24 | `rows` | `u32` | Number of logical rows recorded for the body. |
 | 28 | `crc32c` | `u32` | CRC32C of this section body. |
 
-The same `type_id` can appear many times. In current collector output this
-usually means that consecutive collection windows each emitted a body for the
-same logical section. For chart types, repeated entries can instead describe
-different entities. Catalog order is significant and is preserved.
+Each present `type_id` appears exactly once. Catalog entries and their packed
+bodies are ordered by ascending `type_id`.
 
 ### Catalog metadata: 40 bytes
 
@@ -187,7 +186,7 @@ different entities. Catalog order is significant and is preserved.
 | 8 | `max_ts` | `i64` | Latest section timestamp, Unix microseconds. |
 | 16 | `source_id` | `u64` | Source identifier; zero means unspecified. |
 | 24 | `entry_count` | `u32` | Number of 32-byte entries before this block. |
-| 28 | `format_version` | `u32` | Container layout version; current writers store `1`. |
+| 28 | `format_version` | `u32` | Internal catalog contract value; writers store `1`. |
 | 32 | `crc32c` | `u32` | CRC32C of entries and metadata with this field zeroed. |
 | 36 | `reserved` | `u32` | Reserved; current writers store zero. |
 
@@ -215,7 +214,7 @@ A reader therefore starts at the end, not at the first section:
 
 ### Example: a snapshot and two dictionaries in one PGM
 
-The following simplified PGM for PostgreSQL 14-18 contains one
+The following simplified PGM for PostgreSQL 15-18 contains one
 `pg_stat_activity` body, one dictionary body for short string values, and one
 dictionary body for large values. Let their sizes be `S`, `T`, and `L`, with
 `B = S + T + L`.
@@ -246,9 +245,8 @@ offset
 ```
 
 For three bodies, `catalog_len = 3 * 32 + 40 = 136`, so the complete file is
-`B + 148` bytes. If the window has no large values, the `dict.blobs` body and
-its catalog entry are absent. Every non-empty window can add several bodies, so
-the same `type_id` commonly appears more than once in the finished catalog.
+`B + 148` bytes. If the segment has no large values, the `dict.blobs` body and
+its catalog entry are absent.
 
 In current PgKronika files, a data or dictionary body is normally a
 self-contained Parquet file, so it has its own `PAR1 ... PAR1` framing. The PGM
@@ -263,26 +261,37 @@ PGM magic, one four-byte body `01 02 03 04`, one catalog entry, metadata, and th
 tail. [`tests/fixture.rs`](tests/fixture.rs) records every offset and verifies
 that the encoder reproduces the fixture byte for byte.
 
-## What section bodies contain today
+## Compact section bodies
 
-`kronika-format` permits opaque bodies, but the current PgKronika writer uses
-self-contained Parquet for both snapshot and dictionary sections:
+`kronika-format` treats bodies as opaque bytes. The production writer
+uses this physical profile for every final data and dictionary body:
 
-- Zstd level 3 compresses column pages inside each Parquet body;
-- snapshot rows are sorted by the registry contract's canonical key, while
-  dictionary rows are sorted by `str_id`;
-- one body is limited to 65,536 rows and 8 MiB;
-- the decoder accepts no more than 16 row groups;
-- the redundant Arrow schema metadata is omitted and `created_by` is cleared
-  to an empty string.
+| Property | Current value |
+| --- | --- |
+| Rows | At most 65,536 |
+| Encoded body | At most 8 MiB |
+| Row groups | Exactly one |
+| Data pages | Exactly one per column chunk |
+| Value encoding | `PLAIN`; Parquet dictionary encoding disabled |
+| Compression | Zstandard level 6 |
+| Statistics and page indexes | Disabled |
+| Arrow schema metadata | Omitted |
+| `created_by` | Empty |
 
-Omitting the embedded Arrow schema removes a duplicate logical schema from
-every body; the exact saving depends on the section contract. The native
-Parquet schema remains because the decoder needs the physical column layout.
+Data rows use the registry's complete canonical order: declared sort-key
+columns first, then every remaining physical column as a deterministic
+tie-break. Equal physical rows retain multiplicity. Dictionary rows are
+strictly ordered by `str_id`.
 
-There is no whole-file Zstd pass. Each Parquet body's header and footer, the PGM
-catalog, and the PGM/PGMP framing are outside a shared Zstd stream. A reader can
-locate and verify one body without decompressing unrelated sections.
+Writer admission proves row, page, encoded-body, reader-work, memory, input,
+spill, and output bounds before publication. The reader validates container,
+schema, row, byte, decoded-memory, and CRC invariants; writer-specific Parquet
+choices are checked by writer tests, the all-layout oracle, lifecycle BDD, and
+release qualification.
+
+There is no whole-file compression pass. Each Parquet body, the PGM catalog,
+and journal framing remain independently addressable, so a reader can locate
+and verify one body without decompressing unrelated sections.
 
 ## Where string values physically live
 
@@ -346,12 +355,12 @@ byte range [X, X+T): self-contained Parquet body
 `-- "PAR1"
 ```
 
-The bytes belong to the `bytes` column chunk of the `dict.strings` body.
-Parquet may place the value in a dictionary or data page inside that chunk;
-Zstd-3 compresses the page. The `pg_stat_activity` body keeps only `H`. The PGM
-catalog stores the offset and length of the entire dictionary body, not of one
-value; finer offsets belong to Parquet metadata. Resolving `H` therefore
-requires decoding the dictionary body.
+The bytes belong to the `bytes` column chunk of the `dict.strings` body. They
+are PLAIN-encoded in its single Zstandard-6 data page. The
+`pg_stat_activity` body keeps only `H`. The PGM catalog stores the offset and
+length of the entire dictionary body, not of one value; finer offsets belong
+to Parquet metadata. Resolving `H` therefore requires decoding the dictionary
+body.
 
 The "after decoding" blocks show logical values, not on-disk bytes. The exact
 cost of the two references need not be 16 bytes, and encoding and compression
@@ -366,15 +375,15 @@ Reading follows the end catalog:
             -> decode Parquet
             -> datname=H
 
-(3) catalog + H -> every dict.strings and dict.blobs body
+(3) catalog + H -> dict.strings and/or dict.blobs body
                 -> decode record with str_id=H
                 -> b"postgres"
                 -> datname="postgres"
 ```
 
-PGM has no global `StrId -> offset` index. A full dictionary read visits every
-`dict.strings` and `dict.blobs` body and builds an in-memory map. The targeted
-overview path also reads dictionary bodies but retains only ids requested in
+PGM has no per-value `StrId -> offset` index. A full dictionary read visits the
+single body of each present dictionary type and builds an in-memory map. The
+targeted overview path reads the same bodies but retains only ids requested in
 advance.
 
 ### Large and truncated values
@@ -415,21 +424,14 @@ does not emit a third dictionary section. Those values are written into the
 ordinary `dict.strings` body; there is no `dict.hot_strings` body to find in the
 file.
 
-### Where deduplication stops
+### Segment-wide normalization
 
-One `SegmentDicts` instance detects hash collisions and keeps one copy of equal
-bytes. The current collector, however, creates a new interner for every
-collection cycle. Deduplication therefore applies within one window, not
-across the finished PGM.
-
-A full dictionary read combines repeated records by `str_id`: the first
-`dict.strings` record remains, every later `dict.blobs` record unconditionally
-replaces the current value, and later `dict.strings` records are ignored. This
-path does not compare duplicate bytes. The targeted overview resolver compares
-`bytes`, `full_len`, and `truncated` for selected duplicates and rejects
-contradictions. It requires `full_sha256` to be present for a truncated blob but
-does not compare the digest. Both paths combine records only in reader memory;
-they do not remove physical copies from the PGM.
+Each collection-window interner detects collisions and avoids duplicate bytes
+within its part. Seal then normalizes all parts for the segment. Equal
+`str_id` records with equal bytes and metadata collapse to one row. Conflicting
+bytes, truncation metadata, or placement in both dictionary sections fail the
+seal before publication. The resulting PGM contains each non-zero `str_id`
+exactly once and in ascending order.
 
 ## `active.parts` and crash recovery
 
@@ -437,24 +439,23 @@ they do not remove physical copies from the PGM.
 a 16-byte header followed by one complete PGM part:
 
 ```text
-"PGMP" | part_len: u64 | header_crc32c: u32 | PGM part
+internal frame marker | part_len: u64 | header_crc32c: u32 | PGM part
 ```
 
 The header checksum covers its first 12 bytes. The PGM part has its own
-PGM magic, bodies, catalog, and tail, so a frame can be validated before it is
+marker, bodies, catalog, and tail, so a frame can be validated before it is
 accepted.
 
-For a clean journal with `P` frames, `N` total section entries, and `B` total
-body bytes:
+For a clean journal with `P` frames, `N` total part-catalog entries, and `B`
+total part-body bytes:
 
 ```text
 active_parts_bytes = B + 32*N + 68*P
-sealed_pgm_bytes   = B + 32*N + 52
-seal_saves         = 68*P - 52
 ```
 
-This saving is only framing. With 70 windows it is 4,708 bytes; the Parquet
-bodies and all `N` catalog entries still remain.
+The sealed byte count cannot be derived by subtracting frame overhead: seal
+decodes and re-encodes the rows into fewer bodies and dictionary records. Its
+exact size is the final `B + 32*N + 52` measured after compaction.
 
 The default maximum accepted part is 64 MiB. The streaming recovery scanner
 keeps one PGM part body of at most `max_part_len` plus a resynchronization
@@ -465,134 +466,48 @@ Recovery classifies malformed regions instead of treating all damage alike:
 
 | Classification | Meaning | `Journal::open` | Collector startup |
 | --- | --- | --- | --- |
-| `TornTail` | The final frame is incomplete, or its valid header and declared length end exactly at EOF but the inner PGM fails validation. | Truncates to the last valid boundary. At most the final part is lost. | Processes valid preceding parts under the recovery rule below. |
-| `Middle { resumed_at }` | A malformed region is followed by another valid frame. | Preserves the bytes for diagnostics and reports valid parts on both sides. | If any valid parts were reported, processes them and then resets the entire journal. |
-| `QuarantinedTail` | A malformed terminal region has no later valid frame. | Preserves the bytes and reports valid earlier parts. | If any valid parts were reported, processes them and then resets the entire journal. |
+| `TornTail` | The final frame is incomplete, or a valid header declares a frame ending at EOF whose inner PGM fails validation. | Truncates to the last valid boundary. At most the final part is lost. | Seals valid preceding parts before connecting to PostgreSQL. |
+| `Middle { resumed_at }` | A malformed region is followed by another valid frame. | Preserves the bytes and reports the damage. | Fails closed, leaving `active.parts` untouched for diagnosis. |
+| `QuarantinedTail` | A malformed terminal region has no later valid frame. | Preserves the bytes and reports the damage. | Fails closed, leaving `active.parts` untouched for diagnosis. |
 
 On collector startup, recovered parts containing timestamped data are sealed
 immediately. Parts without any timestamped data are discarded by resetting the
 journal without creating a PGM. A successful seal resets the whole journal,
-including damaged bytes that `Journal::open` preserved. If the seal fails, the
-collector logs the failure, also resets the journal, and starts collecting
-fresh data. If recovery finds no valid part, no recovery PGM is created:
-`TornTail` has already been truncated, while other damaged bytes remain and
-new frames can be appended after them.
+after the destination and parent directory are synchronized. If seal fails,
+the journal stays intact and collector startup fails. Non-torn damage is never
+silently skipped or cleared.
 
 ## Where the bytes go
 
-For the current implementation, most size variation comes from section
-bodies, not the 52-byte container constant or 32-byte catalog entries.
+Most variation comes from Parquet bodies, not the 52 fixed container bytes.
+Seal removes structural repetition without dropping admitted rows:
 
-### What already reduces size without losing data
+| Mechanism | Effect |
+| --- | --- |
+| Per-type coalescing | Many collection-window bodies become one body and one Parquet footer. |
+| Dictionary normalization | Equal `str_id` records become one checked segment-wide record. |
+| Canonical sorting | Output is deterministic and similar values remain adjacent. |
+| PLAIN plus Zstandard-6 | Values avoid per-column Parquet dictionaries and use the fixed compression profile. |
+| No statistics or page indexes | Metadata not used by PGM queries is absent. |
+| Packed registry types | Physical integer widths and `StrId` columns follow the registered schema. |
 
-| Mechanism | What is removed or compressed | Scope |
-| --- | --- | --- |
-| `StrId` and dictionaries | Repeated short text becomes a value in a `u64` column; the bytes are written once. | One copy per window, not per finished PGM; Parquet determines the exact column size. |
-| Parquet and Zstd-3 | Pages of each column are encoded and compressed independently of other bodies. | Repetition across Parquet bodies is not used. |
-| Canonical sorting | Values with nearby keys become adjacent and output is deterministic. | Compression gain depends on the data and is not guaranteed. |
-| Narrow column types | For example, `pid` is stored as `i32`, not `i64`, and text labels move to dictionaries. | Each section contract fixes its column types. |
-| Omitted Arrow metadata | Each body omits a second logical Arrow schema and leaves `created_by` empty. | The physical schema and Parquet footer remain. |
+Collection limits are separate from compaction. Blob truncation, top-N caps,
+source intervals, and text budgets can omit data before it reaches the
+journal; the PGM writer never presents that as a storage saving.
 
-### What reduces size by discarding data
+The maintained release qualification uses the production `Journal -> seal ->
+PgmUnit` path. It requires 20 fresh-process seal samples, a spilling
+fixed-fan-in fixture, exact equality after reopen, and the all-75-layout
+oracle. It records actual PGM and OVF logical and allocated bytes separately,
+plus wall time, CPU, peak RSS, spill bytes, process I/O, write amplification,
+restart/query latency, and PGM/OVF read origins. Run and validate it through
+the commands in
+[`overview-parity-v1.md`](../../docs/qualification/overview-parity-v1.md).
 
-These are admission limits, not compression:
-
-| Mechanism | What is discarded | Cost |
-| --- | --- | --- |
-| `dict.blobs` truncation | The suffix after 64 KiB. | Full text cannot be recovered; its length and SHA-256 remain. |
-| `*_MAX_TABLES`, `*_MAX_INDEXES`, `*_MAX_STATEMENTS`, `*_MAX_PLANS` | Objects below the top-N cutoff. | Their observations do not enter the PGM. |
-| Source intervals | Snapshots between polling times. | Time resolution decreases. |
-| Plan-text budgets | Text beyond one read's limit. | Numeric plan statistics may remain without plan text. |
-
-Segment age and size limits only control file grouping. They change PGM count
-and a small amount of framing overhead, but do not merge Parquet bodies or
-remove repeated dictionary records.
-
-### Why logical data repeats across collection windows
-
-Each collection window writes a separate Parquet body for every non-empty
-type. A one-row snapshot still pays for a Parquet schema, column metadata, and
-footer. Over a 15-minute segment, the same type can therefore have dozens of
-small bodies and dozens of footers.
-
-Dictionary sections are also emitted per window. For `postgres`, the logical
-body contents after decoding look like:
-
-```text
-before completing the segment:
-
-active.parts
-|-- PGMP [part #1:
-|          pg_stat_activity body #1: pid=101, H; pid=102, H
-|          dict.strings #1: H -> b"postgres"]
-`-- PGMP [part #2:
-           pg_stat_activity body #2: pid=103, H
-           dict.strings #2: H -> b"postgres"]
-
-after completing the segment (`seal`):
-
-PGM magic
-|-- activity body #1
-|-- dict.strings body #1: H -> b"postgres"
-|-- activity body #2
-|-- dict.strings body #2: H -> b"postgres"
-|-- shared catalog
-`-- tail index
-
-3 StrId references | 1 unique H | 2 dictionary records on disk
-```
-
-The current segment-completion operation (`seal`) keeps both dictionary
-records and both self-contained `pg_stat_activity` bodies. The researched
-future in-place seal contract instead looks like:
-
-```text
-PGM header (single current internal identity)
-|-- one pg_stat_activity body
-|-- one dict.strings body: H -> b"postgres"
-|-- shared catalog
-`-- tail index
-
-3 StrId references | 1 unique H | 1 physical dictionary record
-```
-
-This cannot be implemented by concatenating bytes. It must decode Parquet,
-merge bodies with the same `type_id`, verify equal dictionary records, sort
-records by the canonical key, seal before a merged body would exceed a
-production limit, and encode again. Two bodies with the same `type_id` are not
-allowed in the finished PGM. This behavior is not part of the current `seal`.
-
-### Additional approaches that are not implemented
-
-| Approach | Source of the saving | Constraint |
-| --- | --- | --- |
-| Replace the current seal internals in place | Bodies with the same `type_id` merge and dictionary records deduplicate across windows. | Requires decode and re-encode, collision checks, canonical sorting, early seal before a limit, and a complete write/read verification cycle. |
-| One interner for the open segment | A repeated value is not emitted into the next window's dictionary. | Current PGM parts are self-contained. Referring to an earlier window's dictionary would break isolated frame reads and crash recovery. |
-| Higher Parquet Zstd level | Pages inside one body may become smaller. | Costs more CPU and still cannot use repetition across bodies. Level 3 is currently fixed in code. |
-| Outer compression for the whole PGM | One stream can see repeated dictionaries, footers, and similar windows. | Direct body access by `offset` is lost; this would replace PGM access semantics and is outside this research. |
-
-The first two approaches remove structural repetition. Raising the Zstd level
-only changes local compression and is not a substitute for section coalescing
-and dictionary deduplication.
-
-### Validated physical-reduction research
-
-The preliminary estimator is superseded. The current
-[physical PGM reduction research](../../docs/superpowers/specs/2026-07-26-pgm-size-reduction-research.md)
-writes complete reader-valid candidates, verifies exact canonical Arrow and
-dictionary equality, covers every registered contract, and records fault,
-resource, I/O, and separate PGM-plus-OVF evidence.
-
-Three natural full 15-minute files produced candidates of 549,761, 524,989,
-and 522,016 bytes, for reductions of 35.343x, 37.091x, and 37.029x.
-Candidate size has an empirical nearest-rank p50 of 524,989 bytes and
-p95/worst of 549,761 bytes. A separate 62.52-second tail reduced 6.016x and is
-not part of that distribution. The full-segment sample contains only three
-files; it does not support an hourly retention projection.
-
-The compact contract keeps the PGM name and `N.pgm` path. The implementation
-has one writer, one reader, and one physical contract. This research section
-does not itself change production behavior.
+The frozen
+[physical-reduction study](../../docs/superpowers/specs/2026-07-26-pgm-size-reduction-research.md)
+retains its corpus, checksums, limitations, and causal measurements. It is
+research evidence, not a deployment-size promise.
 
 ## Parameters that affect file size
 
@@ -601,7 +516,7 @@ amount and grouping of collected data through `pg_kronika-collector`:
 
 | Control | Default | What it changes |
 | --- | ---: | --- |
-| Per-source `*_INTERVAL_S` variables | 1-3600 s, depending on source | Raising an interval produces fewer snapshots and Parquet footers, at the cost of time resolution. `KRONIKA_INTERVAL_S=5` is only the scheduler tick. |
+| Per-source `*_INTERVAL_S` variables | 1-3600 s, depending on source | Raising an interval produces fewer snapshots, at the cost of time resolution. `KRONIKA_INTERVAL_S=5` is only the scheduler tick. |
 | `KRONIKA_PG_MAX_TABLES`, `KRONIKA_PG_MAX_INDEXES`, `KRONIKA_PG_MAX_STATEMENTS`, `KRONIKA_PG_MAX_PLANS` | `500` | Lower values reduce high-cardinality rows and dictionary text but omit lower-ranked objects. |
 | `KRONIKA_PG_MAX_PLAN_TEXT` | 32,768 bytes | Maximum stored text for one plan read. |
 | `KRONIKA_PG_PLAN_TEXT_BUDGET` | 8 MiB | Total plan-text budget per read; zero disables plan text. |
@@ -609,23 +524,23 @@ amount and grouping of collected data through `pg_kronika-collector`:
 | `KRONIKA_SEGMENT_MAX_AGE_S` | 900 s | Maximum age of an open segment. It mainly changes time span and file count. |
 | `KRONIKA_JOURNAL_MAX_BYTES` | 1 GiB | Before every append except the first frame, exceeding this threshold causes an early seal. It is not a target PGM size. |
 
-Changing source limits trades observability for disk use. Changing only segment
-age or rotation size does not remove repeated per-window footers or dictionary
-rows in the current writer. See the
+Changing source limits trades observability for disk use. Segment age and
+rotation size change how many windows are compacted into each PGM; they do not
+change the physical encoding profile. See the
 [collector configuration](../../bins/pg_kronika-collector/README.md)
 for every source interval and validation rule.
 
-## Integrity, limits, and compatibility
+## Integrity and limits
 
-CRC32C covers every section body, the catalog, and each `PGMP` header. It
+CRC32C covers every section body, the catalog, and each journal-frame header. It
 detects accidental corruption; it is not authentication, a signature, or
 encryption.
 
 `kronika-format` validates framing, catalog length and checksum, section
 bounds, and section checksums for complete parts. Higher layers add policy:
-the current sealed reader accepts container version 1 and caps catalog,
-section, row, and row-group sizes. An incompatible section schema receives a
-new `type_id`; changing the PGM framing is outside this contract.
+the sealed reader requires the internal catalog contract value and caps
+catalog, section, row, row-group, and decoded-work sizes. A section schema
+change receives a distinct registry `type_id`.
 
 Sources of truth:
 
