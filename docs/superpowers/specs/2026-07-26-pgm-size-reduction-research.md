@@ -18,8 +18,8 @@
 
 ## Краткий вывод
 
-Для готового `N.pgm` следует in place заменить текущую внутреннюю раскладку
-единым компактным физическим контрактом:
+Для готового `N.pgm` следует заменить текущую внутреннюю раскладку на месте
+(in place) единым компактным физическим контрактом:
 
 - одна секция на каждый непустой `type_id`;
 - не более одной секции `dict.strings` и одной `dict.blobs`;
@@ -33,9 +33,11 @@
 - детерминированный порядок секций и метаданных.
 
 Публичный формат и имя файла остаются прежними: PGM и `N.pgm`. Будущая
-реализация должна одним clean-break PR заменить существующие writer, reader
-и внутренний format contract. После этого файлы прежней раскладки не читаются,
-не преобразуются, не ищутся запасным путём и не включаются переключателем.
+реализация должна одним PR с чистым разрывом заменить существующие writer,
+reader и внутренний format contract. После этого файлы прежней раскладки не
+читаются, не преобразуются, не ищутся запасным путём и не включаются
+переключателем.
+
 В продукте остаются один PGM writer, один PGM reader и один контракт. Проект
 ещё не выпускался, поэтому чистый разрыв дешевле постоянной ветки
 совместимости.
@@ -52,7 +54,7 @@
 | худший коэффициент | 35,343x |
 
 При `n=3` empirical nearest-rank p95 неизбежно совпадает с максимумом. Это
-честное описание маленькой выборки, а не оценка хвоста генеральной
+описание наблюдаемой маленькой выборки, а не оценка хвоста генеральной
 совокупности.
 
 Отдельный восстановленный хвост длиной 62,52 секунды сократился с 1 349 538
@@ -71,11 +73,14 @@
 На естественных полных сегментах сохранились 43 из 43 семейств. На хвосте —
 42 из 42. Искусственный fixture охватывает все 75 зарегистрированных
 контрактов и сохраняет 2 400 из 2 400 строк данных.
+Полный отсортированный список `type_id` и SHA256 инвентаризации контрактов
+зафиксированы в machine-readable summary: так проверяется не только число
+семейств, но и отсутствие подмены одного контракта другим.
 
-Предыдущая приблизительная оценка около 17x не является итогом этого
-исследования. Она не создавала PGM, не проверяла round trip и оставляла
-непроверенные случаи словаря. В дальнейшем следует ссылаться только на
-распределение выше и явно указывать состав корпуса.
+Предыдущая приблизительная оценка не является итогом этого исследования.
+Она не создавала PGM, не проверяла round trip и оставляла непроверенные
+случаи словаря. В дальнейшем следует ссылаться только на распределение выше
+и явно указывать состав корпуса.
 
 ## 1. Границы исследования
 
@@ -125,8 +130,8 @@ Workflow CI №
 [`30194994479`](https://github.com/vadv/PgKronika/actions/runs/30194994479)
 завершился успешно на этой ревизии. BDD matrix использовал PostgreSQL
 15.18, 16.14, 17.10 и 18.4. Этот run подтверждает исходное поведение
-producer, reader и web до изменения формата. Он не подменяет будущую
-квалификацию обновлённой внутренней раскладки PGM.
+producer, reader и web до замены внутренней раскладки. Он не подменяет
+будущую квалификацию обновлённой внутренней раскладки PGM.
 
 ### 2.2. Естественная нагрузка
 
@@ -164,15 +169,35 @@ producer, reader и web до изменения формата. Он не под
 | Rust/Cargo | 1.96.0 |
 | prototype target | static PIE, `x86_64-unknown-linux-musl` |
 
+SHA256 исследовательского `pgm_lab`:
+
+```text
+19f960fcabf3205888d0a0824adc6930595aabadba32693605360c0add552ff3
+```
+
 Кэш страниц не сбрасывался. Узел не был изолирован по CPU, памяти или
 устройству хранения. Поэтому latency ниже — warm-cache observations, а не
 SLO. `pread64`-байты обозначают логически запрошенные байты; это не число
 физических чтений с накопителя.
 
+Прототип запускался с одной и той же грамматикой:
+
+```text
+pgm_lab compact SOURCE CANDIDATE full plain-wide-page 6 65536 1048576
+pgm_lab verify SOURCE CANDIDATE
+pgm_lab analyze SOURCE
+pgm_lab analyze CANDIDATE
+sha256sum SOURCE CANDIDATE
+```
+
+Повторный encode третьего сегмента и fixture завершался `sha256sum` и
+`cmp`. Пути в эксперименте намеренно не приводятся: они локальны, а
+идентификаторами служат имена файлов и полные SHA256.
+
 ### 2.4. Инвентарь естественных файлов
 
-Полные SHA256 находятся в JSON. Короткий префикс здесь нужен для чтения
-таблицы, а не служит идентификатором.
+Полные SHA256 находятся в JSON и приведены ниже. В таблице файлы обозначены
+своими числовыми именами.
 
 | Сегмент | Исходный PGM | Кандидат | Секции | Строки данных | Уникальные ID | Коэффициент |
 |---|---:|---:|---:|---:|---:|---:|
@@ -220,7 +245,7 @@ nearest_rank(values, p) = sort(values)[ceil(p * n) - 1]
 
 ## 3. Рекомендуемый физический контракт
 
-### 3.1. In-place clean break
+### 3.1. Чистый переход на месте
 
 PGM остаётся единственным основным container format и продолжает называться
 PGM. Путь готового сегмента остаётся `N.pgm`.
@@ -236,6 +261,9 @@ PGM. Путь готового сегмента остаётся `N.pgm`.
 идентификатор, а не название поколения продукта. Implementation PR может
 сменить эту пару вместе с раскладкой, но после изменения код принимает только
 одно текущее значение. Никакой второй версии формата рядом не появляется.
+Публичные названия PGM, расширение `.pgm` и HTTP API `/v1` из-за этого не
+меняются; согласование версий не добавляется. Внутренний идентификатор нельзя
+выдавать за новую версию продукта или API.
 
 В реализации отсутствуют:
 
@@ -261,23 +289,39 @@ PGM. Путь готового сегмента остаётся `N.pgm`.
 2. `dict.strings`, если непуст;
 3. `dict.blobs`, если непуст.
 
+Тела идут подряд сразу после header, без gaps и overlap; затем идут catalog
+и tail index. Reader до allocation ограничивает catalog length и entry count,
+проверяет уникальность `type_id`, монотонные offsets, bounds, rows, CRC32C и
+точное окончание последнего тела у catalog. Неизвестные flags и trailing
+bytes отклоняются.
+
 Внутри data-секции строки сортируются по полному каноническому sort key из
 реестра. Стабильность исходного catalog order не используется как
 доказательство порядка.
+
+Sort key не обязан быть уникальным. Для разных строк с одинаковым sort key
+writer применяет стабильный побитовый tie-breaker по всем остальным колонкам
+в порядке schema: маркер NULL, затем canonical physical representation.
+Для float сравниваются биты, поэтому NaN payload и signed zero сохраняются.
+Полностью одинаковые строки сохраняют multiplicity; их перестановка не меняет
+байты. Благодаря этому результат не зависит от разбиения и порядка входных
+sections.
 
 Действующие ограничения остаются абсолютными:
 
 - не более 65 536 строк в секции;
 - не более 8 МиБ закодированного тела;
 - одна группа строк для готовой секции;
-- одна data page на column chunk, пока section caps соблюдены.
+- одна data page на column chunk в пределах фиксированного page budget.
 
 Если добавление следующего collection window превысит строковый,
-словарный или байтовый предел хотя бы одного будущего объединённого типа,
-collector сначала запечатывает накопленный сегмент. Строки не отбрасываются и
-не делятся по двум одинаковым `type_id` внутри готового PGM. Одно окно,
-которое само нарушает предел, завершается прежней типизированной ошибкой
-источника или буфера.
+словарный, per-column page или байтовый предел хотя бы одного будущего
+объединённого типа, collector сначала запечатывает накопленный сегмент.
+Планировщик использует консервативные decoded-size bounds реестра и Parquet
+framing overhead, а не предполагаемый коэффициент сжатия. Строки не
+отбрасываются и не делятся по двум одинаковым `type_id` внутри готового PGM.
+Одно окно, которое само нарушает предел, завершается прежней типизированной
+ошибкой источника или буфера.
 
 ### 3.3. Словарь
 
@@ -333,9 +377,12 @@ ID в сумме по сегментам. Удалено 190 801 повторе�
 | offset index | disabled |
 | `created_by` | empty |
 
-На измеренном корпусе у каждого column chunk одна data page. Реализация
-должна закрепить это свойство тестом для предельных зарегистрированных схем,
-а не полагаться на эвристику Parquet writer.
+Параметр 1 МиБ — настройка writer, а не новый предел тела секции. На
+измеренном корпусе у каждого column chunk одна data page. Реализация должна
+закрепить одностраничность планировщиком и тестом для предельных
+зарегистрированных схем, включая допустимую единственную oversized value,
+а не полагаться на приблизительную эвристику Parquet writer. Если граница не
+доказывается до encode, окно не добавляется в текущий сегмент.
 
 Уровень 6 — инженерная точка, а не поиск математического оптимума.
 Дополнительный перебор уровней не входит в следующий PR, если новый корпус
@@ -354,9 +401,10 @@ ID в сумме по сегментам. Удалено 190 801 повторе�
 4. декодирует кандидат;
 5. требует точного равенства Arrow `RecordBatch`.
 
-Перед сравнением требуется равенство множеств `type_id`. Поэтому тип с
-нулём проверенных строк нельзя потерять незаметно: его отсутствие меняет
-множество.
+Перед сравнением требуется равенство множеств `type_id`, а затем точное
+равенство строк каждого присутствующего типа. Поэтому семейство нельзя
+потерять незаметно, даже если суммарное число строк случайно совпало.
+Ожидаемое отсутствие пустых зарегистрированных типов проверяется отдельно.
 
 Результат:
 
@@ -383,9 +431,13 @@ list, string/blob IDs, cumulative counters, gauges и labels.
 | dictionary rows/IDs | 32 | 8 |
 | коэффициент |  | 6,593x |
 
-SHA256 кандидата:
+Fixture использует ненулевой `source_id = 8099562711456768513` и диапазон
+`1780000000000000..1780000155000000`; оба поля совпали после encode.
+
+SHA256 source и кандидата:
 
 ```text
+0ab7ea4a707765b2928aff853b5dacb3b9f7d4e77e8d18678ed20e00c5dc0f0d
 511d7267844f382661feda636c8ce20c0ac89f4bede376031e8e039414f021ed
 ```
 
@@ -429,6 +481,14 @@ cmp    identical
 | повреждённый каталог | catalog CRC error | не публикует |
 | tail короче на один байт | tail-index error | не публикует |
 
+Корпус создан командой `pgm_lab fault-cases OUT_DIR` и содержит 11 файлов.
+Их имена, размеры и полные SHA256 находятся в JSON. Два результата для
+прямого и обратного порядка секций имеют один SHA256:
+
+```text
+8d7fc38fcda7c9a0412f4252d4d0a273994d7c3edec4a32bfb1f8518bb224e46
+```
+
 Обновлённый единственный PGM reader не должен сохранять last-wins для
 конфликтов. Конфликтный словарь означает повреждённый источник.
 
@@ -470,6 +530,10 @@ Parquet structural bytes состоят из:
 15 769 767 + 2 707 018 = 18 476 785
 19 430 424 -   953 639 = 18 476 785
 ```
+
+Каждая строка таблицы — отдельный сохранённый PGM. Полные SHA256 всех
+counterfactual и четырёх последовательных профилей находятся в JSON; это
+исключает подмену byte accounting расчётной моделью.
 
 Объединение data:
 
@@ -547,7 +611,7 @@ PGM framing уменьшается с 124 756 до 1 492 байт. Это эко
 
 ## 6. Стоимость encode и память
 
-### 6.1. Измеренный prototype
+### 6.1. Измеренный прототип
 
 | Сегмент | Wall, internal | User | System | CPU | Max RSS |
 |---|---:|---:|---:|---:|---:|
@@ -560,15 +624,18 @@ PGM framing уменьшается с 124 756 до 1 492 байт. Это эко
 | Метрика | p50 | p95 / worst |
 |---|---:|---:|
 | internal wall | 3,666 с | 3,813 с |
+| process wall | 3,67 с | 3,81 с |
 | user + system CPU | 3,55 с | 3,70 с |
 | max RSS | 55 120 КиБ | 56 444 КиБ |
 
-Filesystem input blocks равны нулю из-за прогретого page cache. Output:
-1 024, 1 040 и 1 088 блоков по 512 байт.
+Сырые счётчики GNU `time`/`getrusage` `File system inputs` равны нулю из-за
+прогретого page cache. `File system outputs` равны 1 088, 1 040 и 1 024 для
+сегментов 1–3. Linux описывает их как число случаев filesystem I/O, а не
+байты, поэтому отчёт не умножает их на предполагаемый размер блока.
 
-Prototype материализует объединённые batches целиком. Его RSS — измерение
-prototype и верхняя отправная точка, но не доказательство ограниченной
-production architecture.
+Прототип материализует объединённые batches целиком. Его RSS — верхняя
+измеренная точка для прототипа, но не доказательство ограниченной
+production-архитектуры.
 
 ### 6.2. Требуемая потоковая архитектура
 
@@ -578,16 +645,20 @@ RAM.
 Путь записи:
 
 1. Потоково просканировать journal frames и каталоги, проверить frame и
-   catalog bounds, собрать только ограниченные descriptors.
+   catalog bounds, собрать только ограниченные descriptors. Все размеры и
+   offsets проходят checked arithmetic; `try_reserve` предшествует росту
+   коллекций.
 2. До принятия очередного collection window вести per-type row/encoded-byte
-   budgets и dictionary cardinality. При прогнозируемом переполнении
-   запечатать предыдущий сегмент.
+   budgets, per-column page bounds и dictionary cardinality. При
+   прогнозируемом переполнении запечатать предыдущий сегмент.
 3. Для каждого `type_id` декодировать не более одного ограниченного input
    batch за раз.
 4. Проверить локальную сортировку. Несортированный batch превратить во
    временный run с фиксированным числом строк.
-5. Выполнить bounded-fan-in merge runs по полному sort key и подавать
-   небольшие output batches в один Parquet writer.
+5. Если диапазоны ключей последовательных batches не пересекаются, подавать
+   их в writer напрямую. Иначе выполнить bounded-fan-in merge runs. Оба пути
+   отдают небольшие output batches в один Parquet writer и используют
+   canonical physical row key из раздела 3.2 для tie.
 6. Dictionary sections сливать по ID тем же bounded merge. В памяти держать
    только головы runs и текущую группу одинакового ID.
 7. После каждого типа освободить reader, Arrow arrays и merge buffers до
@@ -609,10 +680,18 @@ RAM.
 не сбрасывает journal. Число fan-in и batch rows — константы внутри этого
 budget, а не неограниченные параметры среды.
 
+Оценка encoded bytes до Zstandard не может быть оптимистичной. Planner
+доказывает предел через верхнюю оценку несжатого размера зарегистрированной
+schema и ограниченный Parquet overhead, а готовое тело повторно проверяется
+против 8 МиБ. Ошибка окончательной проверки сохраняет journal и не публикует
+PGM.
+
 Временные runs ограничены валидированной длиной journal и отдельным disk
 budget. Они создаются рядом с итоговым файлом через `create_new`, имеют
 закрытую грамматику имён и не видны reader-у. Нельзя одновременно хранить
-неограниченное число поколений runs.
+неограниченное число поколений runs: одновременно допустимы только текущая и
+следующая merge generation, а каждый записанный байт предварительно
+резервируется в `SealDiskBudget`.
 
 Проверка памяти будущего PR обязана показать:
 
@@ -646,6 +725,13 @@ Max RSS прямого reader benchmark был 6 832 КиБ у source и 23 836 
 маленьких sections. Это ожидаемый компромисс; production query bounds и
 потоковый seal не отменяют необходимости контролировать reader peak.
 
+Предел 8 МиБ относится к закодированному телу и сам по себе не ограничивает
+decoded Arrow memory. Обновлённый reader до allocation вычисляет верхнюю
+оценку по schema, числу строк и Parquet metadata, списывает её с отдельного
+`ReadWorkBudget` и отклоняет oversized expansion типизированной ошибкой.
+Запрос не должен одновременно удерживать декодированные batches
+нескольких несвязанных типов.
+
 ### 7.2. Выборочное чтение
 
 Пятьдесят итераций каждого типа:
@@ -656,7 +742,7 @@ Max RSS прямого reader benchmark был 6 832 КиБ у source и 23 836 
 | `pg_stat_statements` | 112 255 352 нс | 12 491 042 нс | 2 106 237 | 111 052 |
 | `os_process` | 431 259 839 нс | 3 953 040 нс | 2 104 953 | 97 270 |
 
-### 7.3. Production-path snapshot query
+### 7.3. Запрос через production path
 
 Каждая итерация:
 
@@ -667,6 +753,11 @@ Max RSS прямого reader benchmark был 6 832 КиБ у source и 23 836 
 5. хеширует полный `SectionPage`.
 
 Во всех трёх парах совпали число строк и SHA256 страницы.
+
+`Restart` ниже — время повторного построения `LocalDirSnapshot`, то есть
+файловая часть restart path. Это не wall time запуска нового процесса,
+загрузки динамических библиотек или HTTP server. Настоящий web process
+restart остаётся обязательным BDD будущего PR.
 
 Restart mean:
 
@@ -701,8 +792,8 @@ OVF не является заменой или compressed representation PGM. P
 
 ### 8.1. Отрицательный результат 46-минутного корпуса
 
-Unchanged source и finalist запускались в отдельных no-cleanup каталогах и
-контейнерах. Оба остановились на первом сегменте:
+Исходные PGM без изменений и кандидат запускались в отдельных сохраняемых
+каталогах и контейнерах. Оба остановились на первом сегменте:
 
 ```text
 source integrity check failed
@@ -720,20 +811,33 @@ source integrity check failed
 
 ### 8.2. Успешный двухсегментный mechanism corpus
 
-На сохранённом корпусе, где current OVF строится успешно, к обоим PGM
-применён тот же finalist и заново построены sibling OVF.
+На сохранённом корпусе, где текущий OVF строится успешно, к обоим PGM
+применён тот же кандидат и заново построены sibling OVF.
 
 | Набор | PGM | OVF | PGM + OVF |
 |---|---:|---:|---:|
 | source | 2 427 327 | 85 694 | 2 513 021 |
-| finalist | 303 275 | 70 481 | 373 756 |
+| кандидат | 303 275 | 70 481 | 373 756 |
+
+Полный файловый инвентарь:
+
+```text
+source 1785056991081908.pgm 1309193 956cf15ca094dbcdc0a1f992279aae5d959c57e2c50967ea87e59b9659bb41a6
+source 1785056991081908.ovf   44081 5b8e15d726b9304ae5e915c15c59b57e3c9f4e8b77b703834946bcf9e3ecca52
+source 1785057052098068.pgm 1118134 d30a19bc21796ff8f2aaaa44a94df996d17e76975e1a0cfc0c7568de1f5a83ad
+source 1785057052098068.ovf   41613 5f062de5861705286ab9fce737389def8ea843ccfdb6569765e10f21d7f67416
+final  1785056991081908.pgm  161666 9be616860bfb3417005a7d5a100d6dc1f73a7de8eebc88f65c7b2b6fb53ebdc8
+final  1785056991081908.ovf   36164 0a6f3a3f12a71ef7e31c1388a8a5c385a09332e05bdf3153133bbea02870ecba
+final  1785057052098068.pgm  141609 d764770aa62a157e4582ac37532fca7dfcfd972ad404bf970c5397ba563fecd9
+final  1785057052098068.ovf   34317 4d1258cec08f379ad2875b1f67c76c46ddfe59795b8e2cdefbe345edc1f95b0e
+```
 
 Результат:
 
 - PGM-only: 8,003716x;
 - PGM+OVF: 6,723694x;
 - OVF уменьшается на 15 213 байт;
-- OVF составляет 3,530% source PGM и 23,240% finalist PGM.
+- OVF составляет 3,530% исходного PGM и 23,240% PGM-кандидата.
 
 Уменьшение OVF объясняется только `SourceManifest`: число manifest items
 меняется с 278/256 на 42/41 вслед за coalescing catalog entries. Item counts
@@ -742,6 +846,11 @@ source integrity check failed
 
 Итоговый отчёт всегда показывает три числа отдельно: PGM, OVF,
 PGM+OVF. Коэффициент сокращения PGM не включает OVF.
+
+`SourceManifest` OVF должен оставаться связан с единственной текущей
+внутренней identity PGM. После чистого перехода OVF с несовпадающей identity
+считается устаревшим и не читается; новый sibling строится только из текущего
+PGM штатным lifecycle. Это не вводит второй PGM reader.
 
 ## 9. PostgreSQL 15–18
 
@@ -778,21 +887,36 @@ writer не объединяет разные layouts под одним ID и н
 4. Flush userspace buffer.
 5. Вызвать `sync_all` temp-файла.
 6. Переоткрыть temp единственным обновлённым PGM reader-ом и проверить
-   framing, catalog,
-   section CRC, физические invariants и ожидаемую identity.
-7. Опубликовать без перезаписи существующего `N.pgm`: Linux
-   `renameat2(RENAME_NOREPLACE)` либо существующий hard-link protocol.
-8. `fsync` родительского дневного каталога.
-9. Удалить temp name.
-10. Ещё раз `fsync` каталога, чтобы cleanup имени был durable.
-11. Только после успешной публикации сбросить `active.parts` его собственным
+   framing, catalog, section CRC, физические invariants и ожидаемую identity.
+7. Опубликовать без перезаписи существующего `N.pgm`. Основной Linux-вариант
+   — `renameat2(RENAME_NOREPLACE)`: temp name исчезает в той же операции.
+   Допустимый вариант на том же filesystem — hard link, который оставляет
+   temp name до отдельного unlink. Обычный overwrite-rename запрещён.
+8. Вызвать `fsync` родительского дневного каталога, чтобы destination стал
+   durable.
+9. Только для hard-link protocol удалить собственный temp name и ещё раз
+   вызвать directory `fsync`.
+10. Только после успешной публикации сбросить `active.parts` его собственным
     crash-safe protocol.
 
 Crash до шага 8 не разрешает считать destination durable. Crash между
-шагами 8 и 11 может оставить и sealed PGM, и journal; snapshot deduplication
+шагами 8 и 10 может оставить и sealed PGM, и journal; snapshot deduplication
 обязана устранить точный дубль, а journal нельзя терять. Stale temp не
 считается PGM и удаляется только owner-ом по закрытой грамматике после
 проверки.
+
+Повтор после такого crash обязан быть идемпотентным. Если destination уже
+есть, writer с соблюдением тех же лимитов повторяет детерминированный plan и
+требует точного совпадения длины и SHA256 готовых байтов. Затем текущий reader
+проверяет `SegmentId`, `source_id`, временной диапазон, множества типов,
+строки и нормализованный словарь. Полное совпадение означает
+`AlreadyPublished` и разрешает durable reset journal; любое различие
+означает `DestinationConflict`. Ни один вариант не перезаписывает файл.
+
+Прежний `active.parts` или PGM не является пустым store. Collector/web
+останавливается с типизированной ошибкой несовместимой раскладки и сохраняет
+байты без reset, truncate или автоматического удаления. Разрыв совместимости
+не разрешает терять старый журнал.
 
 Ошибки, которые должны оставаться различимыми:
 
@@ -800,12 +924,19 @@ Crash до шага 8 не разрешает считать destination durable
 - unsupported or conflicting dictionary;
 - noncanonical row order;
 - row, byte, cardinality, work-memory или disk-work budget;
-- `AlreadyExists`;
+- `AlreadyPublished` и `DestinationConflict`;
 - `ENOSPC`, `EDQUOT`, `EROFS`, `EIO`;
 - file sync;
 - directory sync;
 - publish race;
 - post-write verification.
+
+Границы библиотек возвращают исчерпывающие типизированные enum с исходным
+`io::Error`, операцией и безопасным путём; binary может добавить контекст
+`anyhow` только снаружи. Повреждение, исчерпание бюджета, несовместимая
+раскладка, конфликт destination и повторяемая filesystem error не
+сворачиваются в одну строку. Allocation и integer overflow не должны
+приводить к panic.
 
 Ни одна ошибка не сбрасывает journal и не публикует частичный destination.
 
@@ -834,22 +965,29 @@ writer и reader по релизам нельзя: чистый разрыв н�
    - фиксированные writer properties;
    - `SealWorkBudget` и disk-work budget;
    - post-write verification;
-   - crash-safe no-replace publish.
+   - crash-safe no-replace publish;
+   - idempotent `AlreadyPublished` и typed `DestinationConflict`.
 4. `pg_kronika-collector`
    - per-type и dictionary projected budgets;
    - early seal до нарушения single-section contract;
+   - incompatible `active.parts` останавливает startup без reset/truncate;
    - метрики bytes, rows, sections, wall, CPU, budget high-water и failures.
 5. `kronika-reader`
    - единственный reader обновлённого PGM;
    - проверка единственности `type_id`, dictionary и physical properties;
-   - сохранение query, diff и OVF semantics.
+   - decoded-size bounds и `ReadWorkBudget` до allocation;
+   - сохранение query, diff и OVF semantics;
+   - привязка `SourceManifest` только к текущей PGM identity.
 6. `kronika-store`
    - явная диагностика прежней внутренней раскладки как incompatible store;
+   - ошибка startup вместо пустого snapshot;
    - без fallback и двойного листинга.
 7. demo, BDD и документация
    - новый reproducible fixture;
    - отчёт PGM/OVF/PGM+OVF;
-   - обновление crate README на русском и английском.
+   - удалить или заменить предварительный ignored estimator;
+   - обновление crate README на русском и английском;
+   - сохранить названия PGM, `.pgm` и HTTP API `/v1` без negotiation.
 
 UTC `YYYY/MM/DD` и sibling path реализуются по отдельному решению. Если оно
 уже в `main`, единственный PGM writer использует его API. Этот PR не
@@ -864,18 +1002,27 @@ UTC `YYYY/MM/DD` и sibling path реализуются по отдельном�
 - exact normalized dictionary equality;
 - identical duplicates, conflicts и strings/blobs overlap;
 - входные dictionary sections во всех перестановках;
+- входные data sections во всех перестановках и с разными batch boundaries;
 - descending и duplicate IDs;
+- duplicate data/dictionary `type_id` в итоговом catalog;
 - empty types и естественно отсутствующие families;
-- tie rows по полному sort key;
+- разные tie rows по sort key с canonical all-column tie-breaker;
 - min/max `i64`, NaN bit patterns, signed zero и nullable values;
-- предельные 65 536 rows и 8 МиБ;
+- предельные 65 536 rows, 1-МиБ page target и 8-МиБ section body;
+- exact writer properties, одна row group и доказанная одна data page на
+  допустимый column chunk;
 - projected early seal на одну строку/ID до переполнения;
 - deterministic bytes при 100 повторениях и разных chunk boundaries;
+- byte-identical результат direct-concatenation и external-merge путей;
 - corrupt body/catalog/tail;
+- повреждённый Parquet с пересчитанным внешним section CRC;
 - truncated input на каждой framing boundary;
 - unknown type, schema mismatch и oversized Parquet metadata;
-- отказ на прежней внутренней раскладке в writer, reader, store и web
-  startup.
+- compressed expansion выше `ReadWorkBudget` до Arrow allocation;
+- checked-arithmetic overflow и отказ `try_reserve`;
+- `AlreadyPublished` exact match и `DestinationConflict`;
+- отказ на прежней внутренней раскладке в writer, reader, store, collector и
+  web startup без изменения исходных байтов.
 
 Property tests должны генерировать несколько входных sections каждого типа,
 сравнивать обновлённый PGM с canonical in-memory oracle и проверять, что ни
@@ -908,7 +1055,8 @@ Fault injection после каждого шага раздела 10:
 - до/после file `sync_all`;
 - до/после no-replace publish;
 - до/после первого directory `fsync`;
-- до/после unlink temp;
+- до/после unlink temp в hard-link protocol;
+- до/после второго directory `fsync` в hard-link protocol;
 - до/после journal reset.
 
 После каждого simulated restart проверяются:
@@ -918,12 +1066,16 @@ Fault injection после каждого шага раздела 10:
 - допустимы оба с точной dedup;
 - частичный PGM никогда не виден;
 - существующий destination не перезаписан;
+- exact destination даёт `AlreadyPublished`, отличный —
+  `DestinationConflict`;
 - unknown temp не удалён;
-- собственный stale temp убирается идемпотентно.
+- собственный stale temp убирается идемпотентно;
+- несовместимый PGM или journal остаётся byte-identical.
 
 Матрица запускается минимум на ext4 и XFS. Для Linux syscall contract
 сохраняется `strace`; power-loss claims не выводятся из обычного process kill
-без fsync fault model.
+без fsync fault model. Network filesystems и cross-filesystem publish в этот
+контракт не входят; temp всегда создаётся в каталоге destination.
 
 ### 11.5. Benchmark acceptance
 
@@ -936,9 +1088,10 @@ cache mode:
 | те же сегменты | weighted reduction ≥ 32x |
 | encode | p95 ≤ 5 с |
 | encode RSS | p95 ≤ 96 МиБ |
+| full-decode reader RSS | p95 ≤ 32 МиБ на замороженном корпусе |
 | 1-ГиБ synthetic journal | peak incremental RSS ≤ 128 МиБ |
 | 256 МиБ → 1 ГиБ | рост peak RSS ≤ 10% |
-| restart | candidate p95 ≤ 150 мкс |
+| `LocalDirSnapshot` rebuild | candidate p95 ≤ 150 мкс |
 | `pg_stat_activity` query | candidate p95 ≤ 30 мс |
 | query I/O | ≤ 16 `pread64`, ≤ 150 КиБ |
 | determinism | exact bytes across repetitions |
@@ -958,8 +1111,9 @@ Implementation PR считается полным, когда:
 - английский и русский README владельцев синхронны;
 - operator docs явно предупреждают о несовместимости прежней внутренней
   раскладки;
+- публичные названия PGM, `.pgm` и HTTP API `/v1` не меняются;
 - PGM, OVF и combined totals разделены;
-- нет утверждения о 17x или MiB/hour без нового корпуса;
+- нет численной экстраполяции в MiB/hour из этого корпуса;
 - нет инструкции миграции или переключателя legacy;
 - все B/H/M review findings закрыты;
 - exact-head CI, включая PG15–18, зелёный.
@@ -998,10 +1152,18 @@ OVF производный и не заменяет источник. Это о�
 - Естественный producer — только PostgreSQL 17.10.
 - Полных сегментов три.
 - Хвост один и вынесен отдельно.
-- Fixture synthetic.
+- Fixture синтетический.
+- Все естественные файлы имеют `source_id = 0`; non-zero `source_id`
+  проверен fixture со значением `8099562711456768513`.
 - Page cache прогрет, узел общий.
-- Prototype не потоковый и целиком материализует merged batches.
-- 46-минутный OVF не построен из-за одинаковой ошибки source и finalist.
+- Измерения restart строят новый `LocalDirSnapshot`, но не запускают новый
+  процесс.
+- Прототип не потоковый и целиком материализует merged batches.
+- Исходный код прототипа не входит в PR; его запуск связан полным SHA256
+  бинарника, грамматикой команд и SHA256 файлов. Независимый production
+  encoder ещё предстоит реализовать.
+- 46-минутный OVF не построен из-за одинаковой ошибки исходного файла и
+  кандидата.
 - Корпус не даёт retention rate.
 - Компактная внутренняя раскладка PGM пока не реализована.
 
@@ -1030,21 +1192,23 @@ git diff --check
 cargo +1.96.0 fmt --all --check
 ```
 
-Measurement validator намеренно не кодирует PGM. Исследовательский encoder
-материализует вход целиком и не соответствует обязательным memory bounds;
-помещать его в production tree как будто это готовый инструмент опасно. Его
-выход идентифицируется полными hashes, а будущий bounded encoder входит
-целиком в один implementation PR раздела 11.
+Скрипт проверки измерений намеренно не кодирует PGM. Исследовательский
+encoder материализует вход целиком и не соответствует обязательным memory
+bounds; поэтому его нельзя помещать в production tree. Выход прототипа
+идентифицируется полными SHA256, а будущий bounded encoder входит целиком в
+один implementation PR раздела 11.
 
-Для повторной независимой квалификации нужны PGM с hashes из раздела 2.4.
-Порядок команд должен быть таким:
+Для повторной независимой квалификации нужны PGM с SHA256 из раздела 2.4.
+Перед запуском проверяется SHA256 `pgm_lab` из раздела 2.3. Порядок команд:
 
 ```text
-analyze SOURCE
-compact SOURCE CANDIDATE full plain-wide-page 6 65536 1048576
-verify SOURCE CANDIDATE
-analyze CANDIDATE
+sha256sum pgm_lab
+pgm_lab analyze SOURCE
+pgm_lab compact SOURCE CANDIDATE full plain-wide-page 6 65536 1048576
+pgm_lab verify SOURCE CANDIDATE
+pgm_lab analyze CANDIDATE
 sha256sum SOURCE CANDIDATE
+pgm_lab compact SOURCE REPEAT full plain-wide-page 6 65536 1048576
 cmp CANDIDATE REPEAT
 ```
 

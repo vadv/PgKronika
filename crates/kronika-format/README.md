@@ -543,12 +543,12 @@ after completing the segment (`seal`):
 ```
 
 The current segment-completion operation (`seal`) keeps both dictionary
-records and both self-contained `pg_stat_activity` bodies. A potential repack
-instead looks like:
+records and both self-contained `pg_stat_activity` bodies. The researched
+future in-place seal contract instead looks like:
 
 ```text
-"PGM1"
-|-- one or more larger pg_stat_activity bodies
+PGM header (single current internal identity)
+|-- one pg_stat_activity body
 |-- one dict.strings body: H -> b"postgres"
 |-- shared catalog
 `-- tail index
@@ -558,76 +558,43 @@ instead looks like:
 
 This cannot be implemented by concatenating bytes. It must decode Parquet,
 merge bodies with the same `type_id`, verify equal dictionary records, sort
-records by the canonical key, split output at production limits, and encode it
-again. This repack is not part of the current `seal`.
+records by the canonical key, seal before a merged body would exceed a
+production limit, and encode again. Two bodies with the same `type_id` are not
+allowed in the finished PGM. This behavior is not part of the current `seal`.
 
 ### Additional approaches that are not implemented
 
 | Approach | Source of the saving | Constraint |
 | --- | --- | --- |
-| Repack while completing the segment | Bodies with the same `type_id` merge and dictionary records deduplicate across windows. | Requires decode and re-encode, collision checks, canonical sorting, limit-aware splitting, and a complete write/read verification cycle. |
+| Replace the current seal internals in place | Bodies with the same `type_id` merge and dictionary records deduplicate across windows. | Requires decode and re-encode, collision checks, canonical sorting, early seal before a limit, and a complete write/read verification cycle. |
 | One interner for the open segment | A repeated value is not emitted into the next window's dictionary. | Current PGM parts are self-contained. If a later window refers to an earlier dictionary, isolated frame reads and crash recovery need a new contract. |
 | Higher Parquet Zstd level | Pages inside one body may become smaller. | Costs more CPU and still cannot use repetition across bodies. Level 3 is currently fixed in code. |
-| Outer compression for the whole PGM | One stream can see repeated dictionaries, footers, and similar windows. | Direct body access by `offset` is lost; this needs a new storage layer or format change. |
+| Outer compression for the whole PGM | One stream can see repeated dictionaries, footers, and similar windows. | Direct body access by `offset` is lost; this would replace PGM access semantics and is outside this research. |
 
 The first two approaches remove structural repetition. Raising the Zstd level
-only changes local compression and is not a substitute for repacking.
+only changes local compression and is not a substitute for section coalescing
+and dictionary deduplication.
 
-### Experimental 16.5-16.7x repack estimate
+### Validated physical-reduction research
 
-The repository contains the ignored
-[`repack_estimate`](../../bins/pg_kronika-demo/tests/repack_estimate.rs) test,
-which is run manually. It grouped bodies by `type_id` and, for each group that
-decoded, estimated one Zstd-3 Parquet body; a parse or write failure falls back
-to the original size. Within each dictionary `type_id`, it kept the first row
-for every `str_id` without checking that duplicate rows had equal remaining
-columns. The report says every body parsed, but the test does not assert that
-condition, and its original output and PGM inputs were not committed. The
-proposed transformation keeps the PGM v1 container layout.
+The preliminary estimator is superseded. The current
+[physical PGM reduction research](../../docs/superpowers/specs/2026-07-26-pgm-size-reduction-research.md)
+writes complete reader-valid candidates, verifies exact canonical Arrow and
+dictionary equality, covers every registered contract, and records fault,
+resource, I/O, and separate PGM-plus-OVF evidence.
 
-| Captured segment | Current PGM | Estimated repack | Ratio |
-| --- | ---: | ---: | ---: |
-| First 15 minutes | 17.8 MiB | about 1.08 MiB | 16.5x |
-| Second 15 minutes | 17.6 MiB | about 1.06 MiB | 16.7x |
-| Final 7 minutes | 5.4 MiB | about 0.53 MiB | 10.3x |
+Three natural full 15-minute files produced candidates of 549,761, 524,989,
+and 522,016 bytes, for reductions of 35.343x, 37.091x, and 37.029x.
+Candidate size has an empirical nearest-rank p50 of 524,989 bytes and
+p95/worst of 549,761 bytes. A separate 62.52-second tail reduced 6.016x and is
+not part of that distribution. The full-segment sample contains only three
+files; it does not support an hourly retention projection.
 
-The often quoted "17x" is the rounded 16.7x result, not a separate
-measurement. The main causes found in that dataset were:
-
-- one-row Parquet sections occupying 2.4-6.8 KiB each;
-- 458 lock-tree rows spread across 211 mostly empty sections and occupying
-  1.9 MiB;
-- 71,468 dictionary records but only about 3,200 unique `str_id` values, or
-  an average of roughly 22 records per unique value;
-- finished PGM files shrinking to 9-10% under an external `zstd -19` control
-  experiment: the files contained substantial repetition, but the experiment
-  did not separate dictionary, Parquet-footer, and snapshot contributions.
-
-These numbers show optimization headroom, not the compression ratio of the
-current implementation:
-
-- production `seal` still copies bodies without merging or deduplicating them;
-- the test estimated body sizes and did not write and round-trip a replacement
-  production PGM;
-- the experimental writer allowed a row group of 1,000,000 rows and did not
-  enforce the production limits of 65,536 rows and 8 MiB per section, so a
-  cap-compatible set of reader-valid v1 sections was not proven;
-- the source run lasted 37 minutes, not one hour; the note's 71 MiB/hour is
-  `17.8 MiB * 4`, while all three files totalled 40.8 MiB in 37 minutes
-  (about 66.2 MiB/hour);
-- the projected 4.3 MiB/hour after repack was also an extrapolation;
-- PostgreSQL log collection was disabled and `cross_source_join` failed in
-  that run; both paths were fixed later, so the measurement must be repeated on
-  a current stand with PostgreSQL log collection enabled and
-  `cross_source_join` working;
-- the original PGM files were not committed, and ignored tests do not run this
-  measurement in normal CI.
-
-The exact methodology, commands, and remaining correctness work are in
-[`2026-07-24-pgm-compaction.md`](../../docs/superpowers/plans/2026-07-24-pgm-compaction.md).
-Implementing compaction requires canonical re-sorting, dictionary validation,
-cap-aware section splitting, a semantic round trip, and new end-to-end
-measurements; it is not only a compression-level change.
+The recommendation replaces the existing PGM internals in place while keeping
+the PGM name and `N.pgm` path. A future implementation has one writer, one
+reader, and one current contract. It has no legacy reader, migration, fallback,
+feature flag, or offline rewrite. Production behavior is unchanged by this
+research documentation.
 
 ## Parameters that affect file size
 
