@@ -12,6 +12,7 @@ The analytics kernel is responsible for:
 
 - cumulative-counter differences and interval-derived rates;
 - robust anomaly scores and contiguous anomaly episodes;
+- call-normalized categorical-distribution and per-operation work comparisons;
 - checked counts, coverage, notable-event selection, and health evaluation for
   the timeline;
 - one bounded query contract for `overview` facts.
@@ -43,6 +44,10 @@ SeriesDiff + gauge values -> pg_kronika-web defines windows
         -> kronika-analytics::score_window / episodes
         -> pg_kronika-web ranks episodes and builds incidents
 
+plan call deltas and buffer deltas -> pg_kronika-web proves continuity
+        -> kronika-analytics::compare_distributions / compare_per_unit
+        -> pg_kronika-web adds typed, bounded plan evidence
+
 typed observations -> SegmentFacts / LiveView in kronika-reader
         -> IndexView in pg_kronika-web
         -> kronika-analytics::overview rules
@@ -66,6 +71,7 @@ needs explicit counting and ranking rules.
 | --- | --- | --- | --- |
 | `GET /v1/section/{name}/diff`, `GET /v1/sections/batch/diff` | Decoded rows and gaps; the reader groups cumulative columns by registry identity. | `diff_pair` computes each valid adjacent delta and per-second rate. The reader adds `FirstPoint` and `Gap`; web applies collection gates as `NotCollected`. A decrease remains `Reset`, and measured zero remains a value. | Each point has `delta`, `rate`, and `dt_micros`, or an explicit `nodata` reason. |
 | `GET /v1/anomalies`, input to `GET /v1/incidents` | Rate series for cumulative columns and value series for gauges. | Scores retrospective current/reference windows and groups adjacent above-threshold positions into episodes. | Anomaly intervals with series, metric, direction, and peak score. Web then clusters these episodes and runs incident lenses. |
+| Stored-plan evidence in `GET /v1/anomalies` | Call counts by plan and buffer-work totals from continuity-proven `pg_store_plans` intervals. | Compares call-normalized plan shares and work per call using explicit sample and effect gates. | Stable, typed plan-mixture and same-plan buffer signals. Web owns fork applicability, reset/gap/version boundaries, work limits, completeness, and JSON. |
 | `GET /v1/timeline/overview`, `/events`, `/health` | Typed log observations with provenance, occurrence counts, and coverage. | Folds checked counts, selects a bounded notable preview, and evaluates health only from eligible evidence. | Event digest and pages, coverage and loss metadata, and health points that remain `Unknown` when required evidence is missing. |
 
 `SegmentFacts` and `LiveView` in `kronika-reader` and `IndexView` in
@@ -78,7 +84,7 @@ checks whether alternate query paths mean the same thing.
 | Module | Purpose | Main entry points |
 | --- | --- | --- |
 | [`diff`](src/diff/mod.rs) | Lets the reader turn consecutive cumulative PGM samples into a value, reset, or invalid interval without treating no-data as zero. | `diff_pair`, `Scalar`, `DiffPoint`, `Reason` |
-| [`anomaly`](src/anomaly/mod.rs) | Lets the web adapters score retrospective windows and turn adjacent above-threshold positions into episodes. | `ScoreParams`, `score_window`, `episodes` |
+| [`anomaly`](src/anomaly/mod.rs) | Scores retrospective windows, folds adjacent triggers into episodes, compares normalized category mixtures, and compares work per operation. | `ScoreParams`, `score_window`, `episodes`, `DistributionParams`, `compare_distributions`, `PerUnitParams`, `compare_per_unit` |
 | [`overview::observation`](src/overview/observation.rs) | Gives reader-produced event facts validated payloads, provenance, and stable or view-scoped identities. | `EventObservation`, `SegmentIdentity`, `ObservationPayload` |
 | [`overview::counts`](src/overview/counts.rs) | Aggregates timeline errors by `(severity, category, SQLSTATE)` and lifecycle events with checked arithmetic. | `EventCounts`, `LifecycleCounts`, `CountLimits` |
 | [`overview::coverage`](src/overview/coverage.rs) | Preserves whether the reader actually covered a half-open time span instead of turning an absent measurement into zero. | `CoverageSpan`, `Coverage` |
@@ -107,6 +113,42 @@ an exact `i128` delta; the rate for both scalar variants is per second.
 `Scalar::Float` does not validate finiteness. A caller that requires finite
 delta and rate values must reject `NaN` and infinities before calling
 `diff_pair`.
+
+### Query-plan change evidence
+
+The plan kernels accept source-independent aggregates; they do not know about
+PostgreSQL forks, query IDs, plan IDs, snapshots, or HTTP.
+
+`compare_distributions` independently normalizes the reference and current
+category counts, then computes total-variation distance:
+
+```text
+reference_share[plan] = reference_calls[plan] / reference_calls_total
+current_share[plan]   = current_calls[plan] / current_calls_total
+total_variation       = 0.5 * sum(abs(current_share - reference_share))
+```
+
+Duplicate category rows are summed with checked arithmetic, zero-count rows
+have no effect, and category evidence is ordered by stable numeric identity.
+A uniform increase in all call counts is therefore stable. The default verdict
+requires 20 calls on each side and an inclusive `total_variation >= 0.20`;
+zero distance never triggers, even if a caller constructs a zero threshold.
+Memory is linear in the admitted distinct categories, which the adapter must
+bound before calling the kernel.
+
+`compare_per_unit` compares `work / operations` on the two sides. Its default
+verdict requires 20 operations on each side, a strict increase, at least
+`1.0` additional work unit per operation, and at least a `50%` relative
+increase. A zero-work reference has no finite relative ratio: any positive
+current rate passes the relative gate, but the absolute gate still applies.
+The function allocates no memory and retains exact integer totals alongside
+the derived finite rates.
+
+Both comparisons report evaluated evidence even when stable and return a typed
+reason when a sample gate or checked sum fails. They establish an observed
+association only. The web adapter decides whether stored snapshots form one
+continuous, applicable population and must not turn either verdict into a
+causal optimizer diagnosis.
 
 ### How PgKronika detects an anomaly
 
@@ -331,6 +373,8 @@ parameters above.
 | `ScoreParams::eps_abs` | Default `1e-9`; `ScoreParams::new` clamps it to at least `f64::MIN_POSITIVE`. | Absolute lower bound for anomaly scale `sigma`, in the units of the rate or gauge being scored. Web overrides it as described above. |
 | `ScoreParams::eps_rel` | Default `0.05`; `ScoreParams::new` clamps it to at least `0.0`. | Relative lower bound for anomaly scale, as a fraction of `abs(median(ref_))`. Web passes the query value above. |
 | `episodes::threshold` | No default; must be finite and at least `0.0`. | Keeps anomaly scan positions with strict `abs(m) > threshold`. A negative or non-finite value returns no episodes. |
+| `DistributionParams` | Default: 20 reference calls, 20 current calls, total variation `0.20`. Counts are clamped to at least one; a non-finite effect becomes `1.0`, otherwise it is clamped to `0.0..=1.0`. | Emits `Shift` only for a nonzero total-variation distance at or above the inclusive effect gate after both count gates pass. |
+| `PerUnitParams` | Default: 20 reference operations, 20 current operations, absolute increase `1.0`, relative increase `0.50`. Counts are clamped to at least one; negative effects become zero and non-finite effects become `f64::MAX`. | Emits `Increase` only when the exact cross-product comparison proves a strict rate increase and both inclusive effect gates pass. |
 | `HoldModel::max_gap_us` | No default; microseconds. | Longest interval for which the internal `time_weighted_mean` primitive may carry a gauge value forward. `0` provides no positive hold coverage; a hold never crosses a known gap. |
 | `NotablePolicy::response_cap` | `100` in `v1()`; `with_response_cap` accepts `1..=1000`. | Maximum ranked observation rows in the overview preview. The full retained input is still scanned; `total_notable` and `omitted_count` report pre-cap rows. |
 | `FactorPenalty::new(..., penalty, ...)` | No default; finite `0.0..=1.0`. | Penalty contributed by one covered factor to a generic health cell. Invalid values are rejected. |

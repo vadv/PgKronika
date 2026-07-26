@@ -5,7 +5,9 @@
 //! on statement text. The sealed `plan` value must resolve through the segment
 //! dictionary to a non-empty string.
 
-use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
+
+use anyhow::{Context, Result, bail, ensure};
 use cucumber::then;
 use kronika_registry::Cell;
 
@@ -13,6 +15,19 @@ use crate::BddWorld;
 use crate::harness::assert_row::decode_section;
 use crate::harness::dump;
 use crate::steps::common::parse_type_id;
+
+const BUFFER_COLUMNS: [&str; 10] = [
+    "shared_blks_hit",
+    "shared_blks_read",
+    "shared_blks_dirtied",
+    "shared_blks_written",
+    "local_blks_hit",
+    "local_blks_read",
+    "local_blks_dirtied",
+    "local_blks_written",
+    "temp_blks_read",
+    "temp_blks_written",
+];
 
 /// Use a separate scenario-database connection for live extension oracles.
 async fn oracle_client(world: &BddWorld) -> Result<tokio_postgres::Client> {
@@ -316,5 +331,240 @@ fn assert_plan_resolves(
         None => {
             bail!("section {type_id}: plan str_id={str_id} did not resolve through the dictionary")
         }
+    }
+}
+
+#[derive(Debug)]
+struct LiveBufferRow {
+    queryid: i64,
+    planid: i64,
+    buffers: [i64; BUFFER_COLUMNS.len()],
+}
+
+async fn live_buffer_row(
+    client: &tokio_postgres::Client,
+    pattern: &str,
+    ossc: bool,
+) -> Result<LiveBufferRow> {
+    let source = if ossc {
+        "pg_store_plans p"
+    } else {
+        "pg_store_plans(false) p"
+    };
+    let queryid = if ossc {
+        "p.queryid"
+    } else {
+        "p.queryid_stat_statements"
+    };
+    let sql = format!(
+        "SELECT {queryid}, p.planid, \
+                p.shared_blks_hit, p.shared_blks_read, \
+                p.shared_blks_dirtied, p.shared_blks_written, \
+                p.local_blks_hit, p.local_blks_read, \
+                p.local_blks_dirtied, p.local_blks_written, \
+                p.temp_blks_read, p.temp_blks_written \
+         FROM {source} \
+         JOIN pg_stat_statements s \
+           ON s.queryid = {queryid} \
+          AND s.dbid = p.dbid \
+          AND s.userid = p.userid \
+         WHERE s.query LIKE $1 \
+           AND p.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())"
+    );
+    let rows = client
+        .query(&sql, &[&pattern])
+        .await
+        .with_context(|| format!("live buffer oracle for pattern {pattern:?}"))?;
+    ensure!(
+        rows.len() == 1,
+        "live buffer oracle expected one row for {pattern:?}, got {}",
+        rows.len()
+    );
+    let row = &rows[0];
+    Ok(LiveBufferRow {
+        queryid: row.get(0),
+        planid: row.get(1),
+        buffers: std::array::from_fn(|index| row.get(index + 2)),
+    })
+}
+
+#[then(
+    regex = r"^section pg_store_plans\.vadv matches every buffer counter for query like '([^']+)'$"
+)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+async fn vadv_buffer_counters(world: &mut BddWorld, pattern: String) -> Result<()> {
+    assert_live_buffer_counters(world, &pattern, false).await
+}
+
+#[then(
+    regex = r"^section pg_store_plans\.ossc matches every buffer counter for query like '([^']+)'$"
+)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+async fn ossc_buffer_counters(world: &mut BddWorld, pattern: String) -> Result<()> {
+    assert_live_buffer_counters(world, &pattern, true).await
+}
+
+async fn assert_live_buffer_counters(world: &BddWorld, pattern: &str, ossc: bool) -> Result<()> {
+    let type_id = if ossc { 1_003_001 } else { 1_004_001 };
+    let query_column = if ossc {
+        "queryid"
+    } else {
+        "queryid_stat_statements"
+    };
+    let client = oracle_client(world).await?;
+    let expected = live_buffer_row(&client, pattern, ossc).await?;
+    let segment = world.harness.segment()?;
+    let failure_log = world.harness.failure_log()?;
+    let (rows, _) = decode_section(segment, type_id)?;
+    let stored = rows
+        .iter()
+        .find(|row| {
+            row.get(query_column) == Some(&Cell::I64(expected.queryid))
+                && row.get("planid") == Some(&Cell::I64(expected.planid))
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                dump::section_dump(
+                    &format!(
+                        "section {type_id}: no stored buffer row for {query_column}={} planid={}",
+                        expected.queryid, expected.planid
+                    ),
+                    &rows,
+                    &failure_log,
+                    &[],
+                )
+            )
+        })?;
+    let mut mismatches = Vec::new();
+    for (&column, value) in BUFFER_COLUMNS.iter().zip(expected.buffers) {
+        if stored.get(column) != Some(&Cell::I64(value)) {
+            mismatches.push(format!(
+                "{column}: stored {}, live {value}",
+                stored
+                    .get(column)
+                    .map_or_else(|| "<absent>".to_owned(), dump::render_cell)
+            ));
+        }
+    }
+    ensure!(
+        mismatches.is_empty(),
+        "{}",
+        dump::section_dump(
+            &format!("section {type_id}: split buffer counters differ from the live extension"),
+            &rows,
+            &failure_log,
+            &[("counter differences", mismatches.join("\n"))],
+        )
+    );
+    Ok(())
+}
+
+#[then(regex = r"^section (pg_store_plans\.(?:ossc|vadv)) has complete analyzer provenance$")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "cucumber step parameters must be owned String"
+)]
+fn plan_analyzer_provenance(world: &mut BddWorld, section: String) -> Result<()> {
+    let type_id = parse_type_id(&section)?;
+    let segment = world.harness.segment()?;
+    let (plans, _) = decode_section(segment, type_id)?;
+    let (coverage, _) = decode_section(segment, 1_038_001)?;
+    let (resets, reset_dict) = decode_section(segment, 1_020_001)?;
+    let (instances, instance_dict) = decode_section(segment, 1_021_001)?;
+    let mut rows_per_timestamp = BTreeMap::<i64, u64>::new();
+    for row in &plans {
+        let Some(Cell::Ts(ts)) = row.get("ts") else {
+            bail!("section {section} contains a row without a timestamp");
+        };
+        *rows_per_timestamp.entry(*ts).or_default() += 1;
+    }
+    ensure!(
+        !rows_per_timestamp.is_empty(),
+        "section {section} has no plan snapshots"
+    );
+    for (ts, plan_rows) in rows_per_timestamp {
+        let marker = coverage
+            .iter()
+            .find(|row| {
+                row.get("ts") == Some(&Cell::Ts(ts))
+                    && cell_u64(row.get("source_type_id")) == Some(u64::from(type_id))
+            })
+            .with_context(|| format!("no snapshot_coverage marker for {section} at {ts}"))?;
+        ensure!(
+            cell_u64(marker.get("read_state")) == Some(0)
+                && cell_u64(marker.get("visibility")) == Some(0)
+                && cell_u64(marker.get("source_total")) == Some(plan_rows)
+                && cell_u64(marker.get("collected")) == Some(plan_rows),
+            "{section} coverage at {ts} is not exact: {marker:?}"
+        );
+        let reset = latest_row_at(&resets, ts)
+            .with_context(|| format!("no reset_metadata at or before {section} timestamp {ts}"))?;
+        ensure!(
+            resolved_nonempty(reset.get("ext_pg_store_plans_version"), &reset_dict)
+                && resolved_nonempty(reset.get("compute_query_id"), &reset_dict),
+            "{section} reset metadata does not carry extension/query-id context: {reset:?}"
+        );
+        let instance = latest_row_at(&instances, ts).with_context(|| {
+            format!("no instance_metadata at or before {section} timestamp {ts}")
+        })?;
+        ensure!(
+            resolved_nonempty(instance.get("node_self_id"), &instance_dict)
+                && matches!(instance.get("pg_system_identifier"), Some(Cell::I64(_)))
+                && cell_i64(instance.get("pg_version_num"))
+                    .is_some_and(|version| (15..=18).contains(&(version / 10_000))),
+            "{section} instance identity is incomplete: {instance:?}"
+        );
+    }
+    Ok(())
+}
+
+fn latest_row_at(rows: &[kronika_registry::Row], ts: i64) -> Option<&kronika_registry::Row> {
+    rows.iter()
+        .filter(|row| matches!(row.get("ts"), Some(Cell::Ts(row_ts)) if *row_ts <= ts))
+        .max_by_key(|row| match row.get("ts") {
+            Some(Cell::Ts(row_ts)) => *row_ts,
+            _ => i64::MIN,
+        })
+}
+
+fn resolved_nonempty(cell: Option<&Cell>, dictionary: &kronika_reader::Dictionary) -> bool {
+    let Some(Cell::StrId(id)) = cell else {
+        return false;
+    };
+    matches!(
+        dictionary.resolve(*id),
+        Some(
+            kronika_reader::Resolved::String(bytes)
+                | kronika_reader::Resolved::Blob { bytes, .. }
+        ) if !bytes.is_empty()
+    )
+}
+
+fn cell_i64(cell: Option<&Cell>) -> Option<i64> {
+    match cell {
+        Some(Cell::I16(value)) => Some(i64::from(*value)),
+        Some(Cell::I32(value)) => Some(i64::from(*value)),
+        Some(Cell::I64(value)) => Some(*value),
+        Some(Cell::U32(value)) => Some(i64::from(*value)),
+        Some(Cell::U64(value)) => i64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn cell_u64(cell: Option<&Cell>) -> Option<u64> {
+    match cell {
+        Some(Cell::I16(value)) => u64::try_from(*value).ok(),
+        Some(Cell::I32(value)) => u64::try_from(*value).ok(),
+        Some(Cell::I64(value)) => u64::try_from(*value).ok(),
+        Some(Cell::U32(value)) => Some(u64::from(*value)),
+        Some(Cell::U64(value)) => Some(*value),
+        _ => None,
     }
 }

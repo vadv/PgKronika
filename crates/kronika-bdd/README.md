@@ -23,6 +23,25 @@ section, oracle values, collector output, and PostgreSQL logs. Matrix smoke
 also checks that each binary reports the declared major through
 `server_version_num`.
 
+## Query-plan evidence split
+
+Plan evidence uses two complementary, non-flaky paths:
+
+- `@plan_evidence` writes fixed upstream-compatible plan, coverage, reset, and
+  instance rows through the real PGM writer, starts the packaged web process,
+  and checks both stable plan signal IDs through `GET /v1/anomalies`. It does
+  not depend on an optimizer choosing a particular plan.
+- `@plan_collector` runs the real extensions on PostgreSQL 15-18. The upstream
+  and vadv scenarios compare all ten exposed buffer counters with an
+  independent live SQL oracle and require complete snapshot, reset,
+  extension-version, query-id-setting, node, system-id, and server-major
+  provenance in the sealed segment.
+
+This separation proves deterministic analyzer behavior through real storage
+and HTTP while independently proving the version- and fork-specific collector
+contract. Neither path uses retries, timing sleeps, or optimizer-forcing
+assertions.
+
 ## Commands
 
 Runner-only unit tests:
@@ -41,6 +60,13 @@ One tag expression:
 
 ```sh
 DEBUG=1 make test-bdd TAGS=@pg_log
+```
+
+Plan evidence and the live collector matrix can be selected independently:
+
+```sh
+DEBUG=1 make test-bdd TAGS=@plan_evidence
+DEBUG=1 make test-bdd TAGS=@plan_collector
 ```
 
 `TAGS` is validated and passed to Cucumber as `--tags`. `DEBUG=1` enables

@@ -276,9 +276,11 @@ const PLAN_MINUTE_US: i64 = 60 * 1_000_000;
 
 #[derive(Debug, Clone, Copy)]
 enum OsscPlanFixture {
+    ComputeQueryIdDisabled,
     DistributionAndBufferShift,
     PlanSetAddition,
     EvictionAndReentry,
+    MissingSystemIdentity,
     StableAcrossReset,
 }
 
@@ -365,6 +367,11 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
     const RESET_MINUTE: i64 = 30;
     let mut interner =
         kronika_writer::Interner::new(DictLimits::new(64, 4096).expect("dictionary limits"));
+    let query_id_setting = if matches!(fixture, OsscPlanFixture::ComputeQueryIdDisabled) {
+        "off"
+    } else {
+        "auto"
+    };
     let (extension_version, compute_query_id, hostname, node_self_id, kernel_version, boot_id) = {
         let mut intern = |value: &str| {
             interner
@@ -374,7 +381,7 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
         };
         (
             intern("1.10"),
-            intern("auto"),
+            intern(query_id_setting),
             intern("plan-host"),
             intern("plan-node"),
             intern("test-kernel"),
@@ -384,6 +391,7 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
 
     let set_addition = matches!(fixture, OsscPlanFixture::PlanSetAddition);
     let eviction = matches!(fixture, OsscPlanFixture::EvictionAndReentry);
+    let query_id_disabled = matches!(fixture, OsscPlanFixture::ComputeQueryIdDisabled);
     let mut calls = if set_addition {
         [100_i64, 0]
     } else {
@@ -440,7 +448,7 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
                 shared_reads[1] += call_deltas[1];
             }
         }
-        let empty_snapshot = eviction && minute == 40;
+        let empty_snapshot = query_id_disabled || (eviction && minute == 40);
         if !empty_snapshot {
             plan_rows.push(ossc_plan_row(
                 ts,
@@ -493,7 +501,8 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
         node_self_id,
         pg_version_num: 150_000,
         kernel_version,
-        pg_system_identifier: Some(99),
+        pg_system_identifier: (!matches!(fixture, OsscPlanFixture::MissingSystemIdentity))
+            .then_some(99),
         clock_ticks_per_sec: 100,
         page_size_bytes: 4096,
         boot_id,
@@ -545,6 +554,187 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
         },
     );
     std::fs::write(dir.join("0.pgm"), bytes).expect("write plan fixture segment");
+    to
+}
+
+fn vadv_plan_row(
+    ts: i64,
+    queryid_stat_statements: i64,
+    calls: i64,
+    shared_blks_read: i64,
+) -> kronika_registry::pg_store_plans::PgStorePlansVadvV1 {
+    kronika_registry::pg_store_plans::PgStorePlansVadvV1 {
+        ts: Ts(ts),
+        queryid_stat_statements,
+        planid: 101,
+        userid: 10,
+        dbid: 5,
+        datname: None,
+        usename: None,
+        plan: None,
+        calls,
+        slow_log_calls: 0,
+        total_time: 0.0,
+        min_time: 1.0,
+        max_time: 1.0,
+        mean_time: 1.0,
+        stddev_time: 0.0,
+        rows: calls,
+        shared_blks_hit: 0,
+        shared_blks_read,
+        shared_blks_dirtied: 0,
+        shared_blks_written: 0,
+        local_blks_hit: 0,
+        local_blks_read: 0,
+        local_blks_dirtied: 0,
+        local_blks_written: 0,
+        temp_blks_read: 0,
+        temp_blks_written: 0,
+        blk_read_time: 0.0,
+        blk_write_time: 0.0,
+        first_call: Ts(0),
+        last_call: Ts(ts),
+        total_plan_time: 0.0,
+        min_plan_time: 0.0,
+        max_plan_time: 0.0,
+        mean_plan_time: 0.0,
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the vadv end-to-end fixture co-locates fork-specific rows with all analyzer provenance sections"
+)]
+fn write_vadv_plan_anomaly_segment(dir: &std::path::Path) -> i64 {
+    use kronika_format::DictLimits;
+    use kronika_registry::instance_metadata::InstanceMetadata;
+    use kronika_registry::pg_store_plans::PgStorePlansVadvV1;
+    use kronika_registry::snapshot_coverage::SnapshotCoverageV1;
+
+    const SNAPSHOTS: i64 = 60;
+    let mut interner =
+        kronika_writer::Interner::new(DictLimits::new(64, 4096).expect("dictionary limits"));
+    let (extension_version, compute_query_id, hostname, node_self_id, kernel_version, boot_id) = {
+        let mut intern = |value: &str| {
+            interner
+                .intern(value.as_bytes())
+                .map(|id| StrId(id.get()))
+                .expect("intern vadv fixture string")
+        };
+        (
+            intern("2.1"),
+            intern("auto"),
+            intern("vadv-host"),
+            intern("vadv-node"),
+            intern("test-kernel"),
+            intern("test-boot"),
+        )
+    };
+
+    let mut calls = 100_i64;
+    let mut shared_reads = 100_i64;
+    let mut plan_rows = Vec::with_capacity(usize::try_from(SNAPSHOTS).expect("fixture rows"));
+    let mut coverage_rows =
+        Vec::with_capacity(usize::try_from(SNAPSHOTS).expect("fixture coverage"));
+    for minute in 0..SNAPSHOTS {
+        let ts = minute * PLAN_MINUTE_US;
+        if minute != 0 {
+            calls += 10;
+            shared_reads += if (40..=50).contains(&minute) { 100 } else { 10 };
+        }
+        let queryid_stat_statements = if minute < 30 { 7_777 } else { 8_888 };
+        plan_rows.push(vadv_plan_row(
+            ts,
+            queryid_stat_statements,
+            calls,
+            shared_reads,
+        ));
+        coverage_rows.push(SnapshotCoverageV1 {
+            ts: Ts(ts),
+            source_type_id: 1_004_001,
+            collector_pid: 42,
+            collector_started_at: Ts(0),
+            read_state: 0,
+            visibility: 0,
+            source_total: 1,
+            collected: 1,
+        });
+    }
+    let reset = ResetMetadata {
+        ts: Ts(0),
+        postmaster_start_time: Ts(1),
+        pg_stat_database_reset_max_at: None,
+        pg_stat_statements_reset_at: None,
+        pg_store_plans_reset_at: None,
+        pg_stat_bgwriter_reset_at: None,
+        pg_stat_checkpointer_reset_at: None,
+        pg_stat_wal_reset_at: None,
+        pg_stat_archiver_reset_at: None,
+        pg_stat_io_reset_at: None,
+        ext_pg_stat_statements_version: None,
+        ext_pg_store_plans_version: Some(extension_version),
+        compute_query_id: Some(compute_query_id),
+        track_io_timing: Some(true),
+        track_wal_io_timing: Some(false),
+    };
+    let metadata = InstanceMetadata {
+        ts: Ts(0),
+        hostname,
+        node_self_id,
+        pg_version_num: 170_000,
+        kernel_version,
+        pg_system_identifier: Some(99),
+        clock_ticks_per_sec: 100,
+        page_size_bytes: 4096,
+        boot_id,
+        btime: Ts(0),
+    };
+
+    let dictionary = kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
+    let plans = PgStorePlansVadvV1::encode(&plan_rows).expect("encode vadv plan rows");
+    let coverage = SnapshotCoverageV1::encode(&coverage_rows).expect("encode plan coverage");
+    let resets = ResetMetadata::encode(&[reset]).expect("encode plan reset metadata");
+    let metadata = InstanceMetadata::encode(&[metadata]).expect("encode plan instance metadata");
+    let mut sections: Vec<SectionInput<'_>> = dictionary
+        .iter()
+        .map(|section| SectionInput {
+            type_id: section.type_id,
+            rows: section.rows,
+            body: &section.body,
+        })
+        .collect();
+    sections.extend([
+        SectionInput {
+            type_id: 1_004_001,
+            rows: u32::try_from(plan_rows.len()).expect("plan row count"),
+            body: &plans,
+        },
+        SectionInput {
+            type_id: 1_038_001,
+            rows: u32::try_from(coverage_rows.len()).expect("coverage row count"),
+            body: &coverage,
+        },
+        SectionInput {
+            type_id: 1_020_001,
+            rows: 1,
+            body: &resets,
+        },
+        SectionInput {
+            type_id: 1_021_001,
+            rows: 1,
+            body: &metadata,
+        },
+    ]);
+    let to = (SNAPSHOTS - 1) * PLAN_MINUTE_US;
+    let bytes = build_part(
+        &sections,
+        PartMeta {
+            min_ts: 0,
+            max_ts: to,
+            source_id: 7,
+        },
+    );
+    std::fs::write(dir.join("0.pgm"), bytes).expect("write vadv plan fixture segment");
     to
 }
 
@@ -623,6 +813,44 @@ async fn plan_signals_follow_registry_storage_diff_and_http_with_typed_evidence(
 }
 
 #[tokio::test]
+async fn vadv_exposes_same_plan_buffers_without_claiming_query_mixture_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let to = write_vadv_plan_anomaly_segment(dir.path());
+    let uri = format!(
+        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_vadv"
+    );
+    let (status, body) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let signals = body["plan_signals"].as_array().expect("plan signals");
+    assert!(
+        signals
+            .iter()
+            .all(|signal| signal["signal_id"] != "pg.query.plan_distribution_shift.v1")
+    );
+    let buffer = signals
+        .iter()
+        .find(|signal| {
+            signal["signal_id"] == "pg.plan.buffer_work_per_call_increase.v1"
+                && signal["scope"]["planid"] == 101
+                && signal["dimension"]["column"] == "shared_blks_read"
+        })
+        .expect("vadv same-plan buffer signal");
+    assert_eq!(buffer["scope"]["queryid"], serde_json::Value::Null);
+    assert_eq!(buffer["scope"]["plan_identity"], "dbid_userid_planid");
+    assert_eq!(buffer["scope"]["query_attribution"], "unavailable");
+    let analysis = &body["plan_analysis"]["pg_store_plans_vadv"];
+    assert_eq!(analysis["status"], "complete");
+    assert_eq!(
+        analysis["applicability"]["plan_distribution"],
+        "not_applicable_queryid_not_in_identity"
+    );
+    assert_eq!(
+        analysis["distribution"]["not_evaluated"]["not_applicable"],
+        1
+    );
+}
+
+#[tokio::test]
 async fn plan_distribution_uses_calls_since_first_observation_for_a_new_plan() {
     let dir = tempfile::tempdir().expect("tempdir");
     let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::PlanSetAddition);
@@ -668,6 +896,50 @@ async fn full_empty_snapshot_breaks_evicted_plan_counters_before_reentry() {
         quality["membership_boundaries"]
             .as_u64()
             .expect("membership boundaries")
+            > 0
+    );
+}
+
+#[tokio::test]
+async fn compute_query_id_off_is_explicitly_not_applicable_for_ossc_distribution() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::ComputeQueryIdDisabled);
+    let uri = format!(
+        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+    );
+    let (status, body) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["plan_signals"], serde_json::json!([]));
+    let analysis = &body["plan_analysis"]["pg_store_plans_ossc"];
+    assert_eq!(analysis["status"], "complete");
+    assert_eq!(
+        analysis["applicability"]["plan_distribution"],
+        "not_applicable_compute_query_id_disabled"
+    );
+    assert_eq!(
+        analysis["distribution"]["not_evaluated"]["not_applicable"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn missing_system_identifier_makes_plan_evidence_partial() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::MissingSystemIdentity);
+    let uri = format!(
+        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+    );
+    let (status, body) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "partial");
+    assert_eq!(body["complete"], false);
+    assert_eq!(body["plan_signals"], serde_json::json!([]));
+    let analysis = &body["plan_analysis"]["pg_store_plans_ossc"];
+    assert_eq!(analysis["status"], "partial");
+    assert!(
+        analysis["quality"]["instance_identity_fallback_intervals"]
+            .as_u64()
+            .expect("missing system identity count")
             > 0
     );
 }
