@@ -587,6 +587,22 @@ fn decode_unit_stale_snapshot() {
 }
 
 #[test]
+fn open_unit_rejects_a_same_name_sealed_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("1000.pgm");
+    fs::write(&path, make_part(1000, 2000, 1)).unwrap();
+    let snap = LocalDirSnapshot::open(dir.path()).unwrap();
+
+    fs::write(&path, make_part(5000, 6000, 2)).unwrap();
+
+    let err = snap.open_unit(0).unwrap_err();
+    assert!(
+        matches!(err, ReadError::StaleSnapshot { unit_idx: 0 }),
+        "same-name sealed replacement must trigger StaleSnapshot, got: {err}"
+    );
+}
+
+#[test]
 fn missing_active_parts_is_empty_live_journal() {
     let dir = tempfile::tempdir().unwrap();
     let part = make_part(1000, 2000, 7);

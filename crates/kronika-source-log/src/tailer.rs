@@ -102,6 +102,7 @@ pub(crate) struct TailBatch {
     pub(crate) lines: Vec<TailLine>,
     pub(crate) gaps: TailGaps,
     pub(crate) next_state: Option<TailState>,
+    pub(crate) unread_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,8 +128,8 @@ pub(crate) fn read_batch(
     start_at_beginning: bool,
     caps: TailCaps,
 ) -> io::Result<TailBatch> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Ok(TailBatch {
                 lines: Vec::new(),
@@ -137,13 +138,29 @@ pub(crate) fn read_batch(
                     ..TailGaps::default()
                 },
                 next_state: state.cloned(),
+                unread_bytes: 0,
             });
         }
         Err(err) => return Err(err),
     };
+    read_opened_file(path, parser_kind, state, start_at_beginning, caps, file)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the tailer keeps offset, budgets, and newline state in one pass to make commit semantics auditable"
+)]
+fn read_opened_file(
+    path: &Path,
+    parser_kind: ParserKind,
+    state: Option<&TailState>,
+    start_at_beginning: bool,
+    caps: TailCaps,
+    mut file: File,
+) -> io::Result<TailBatch> {
+    let metadata = file.metadata()?;
     let identity = file_identity(&metadata);
     let file_size = metadata.len();
-    let mut file = File::open(path)?;
     let mut gaps = TailGaps::default();
     let mut skip_until_newline = false;
     let mut cursor = initial_offset(
@@ -168,6 +185,7 @@ pub(crate) fn read_batch(
                 cursor,
                 skip_until_newline,
             )),
+            unread_bytes: 0,
         });
     }
 
@@ -292,6 +310,7 @@ pub(crate) fn read_batch(
         committed
     };
 
+    let resume_offset = resume_offset.min(file_size);
     Ok(TailBatch {
         lines,
         gaps,
@@ -299,9 +318,10 @@ pub(crate) fn read_batch(
             path,
             parser_kind,
             identity,
-            resume_offset.min(file_size),
+            resume_offset,
             skip_until_newline || truncated_current,
         )),
+        unread_bytes: file_size.saturating_sub(resume_offset),
     })
 }
 
@@ -475,7 +495,7 @@ const fn seek_next_data(_file: &File, offset: u64, file_size: u64) -> io::Result
 mod tests {
     use std::io::Write as _;
 
-    use super::{MAX_LINE_LEN, TailCaps, read_batch};
+    use super::{MAX_LINE_LEN, TailCaps, read_batch, read_opened_file};
     use crate::ParserKind;
 
     #[test]
@@ -519,6 +539,31 @@ mod tests {
             .map(|line| std::str::from_utf8(&line.bytes).expect("utf8"))
             .collect();
         assert_eq!(lines, ["new 1", "new 2"]);
+    }
+
+    #[test]
+    fn metadata_and_bytes_come_from_the_same_open_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("postgresql.log");
+        let rotated = dir.path().join("postgresql.log.1");
+        std::fs::write(&path, "old inode\n").expect("write old file");
+        let opened = std::fs::File::open(&path).expect("open old file");
+
+        std::fs::rename(&path, &rotated).expect("rotate file");
+        std::fs::write(&path, "new inode\n").expect("write replacement");
+
+        let batch = read_opened_file(
+            &path,
+            ParserKind::Stderr,
+            None,
+            true,
+            TailCaps::default(),
+            opened,
+        )
+        .expect("read opened file");
+        assert_eq!(batch.lines.len(), 1);
+        assert_eq!(batch.lines[0].bytes, b"old inode");
+        assert_eq!(batch.unread_bytes, 0);
     }
 
     #[test]

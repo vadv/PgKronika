@@ -13,7 +13,10 @@ pub use cursor::Cursor;
 pub use diff::{ColumnDiff, DiffAt, SeriesDiff, diff_section};
 pub use gating::{GateReading, apply_collection_gating, apply_gating, gate_readings, select_gate};
 pub use gauge::{ColumnValues, SeriesValues, gauge_section};
-pub use latest::latest_section_row;
+pub use latest::{
+    SourceSummary, SourceSummaryError, SourceSummaryLimits, SourceSummaryResource,
+    latest_section_row, source_summaries,
+};
 pub use logical::{LogicalColumn, LogicalSection, logical_section};
 pub use section::{
     QueryError, QueryLimits, SectionPage, section, section_with_limits, sections,

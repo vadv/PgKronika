@@ -470,6 +470,9 @@ pub struct LogCollection {
     /// Time remaining before the next SQL discovery attempt.
     pub next_discovery_in: Option<Duration>,
     next_state: Option<TailState>,
+    next_source: Option<LogSource>,
+    rotation_bytes_skipped: u64,
+    consumes_pending_rotation: bool,
     pending_status: Option<StatusUpdate>,
 }
 
@@ -482,6 +485,7 @@ pub struct LogCollector {
     next_discovery: Option<Instant>,
     last_discovery: Option<DiscoveryStatus>,
     status_tracker: StatusTracker,
+    pending_rotation_bytes_skipped: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,6 +574,7 @@ impl LogCollector {
             next_discovery: None,
             last_discovery: None,
             status_tracker,
+            pending_rotation_bytes_skipped: 0,
         })
     }
 
@@ -606,8 +611,18 @@ impl LogCollector {
             return result;
         }
 
-        let discovery = self.refresh_source_at(client, now).await;
+        let (discovery, discovered_source) = self.refresh_source_at(client, now).await;
         result.discovery_status = Some(discovery);
+        if let Some(discovered_source) = discovered_source {
+            match self.source.as_ref() {
+                None => self.source = Some(discovered_source),
+                Some(current) if current != &discovered_source => {
+                    result.next_source = Some(discovered_source);
+                    result.rotation_bytes_skipped = self.pending_rotation_bytes_skipped;
+                }
+                Some(_) => {}
+            }
+        }
 
         let Some(source) = self.source.clone() else {
             self.stage_status(
@@ -674,7 +689,9 @@ impl LogCollector {
             source.parser_kind,
             batch.gaps,
             batch.next_state.as_ref(),
+            self.pending_rotation_bytes_skipped,
         ));
+        result.consumes_pending_rotation = self.pending_rotation_bytes_skipped != 0;
         if parse_gaps.invalid_utf8 != 0 {
             result.gaps.push(LogGap {
                 ts,
@@ -709,6 +726,9 @@ impl LogCollector {
             });
         }
         result.next_state = batch.next_state;
+        if result.next_source.is_some() {
+            result.rotation_bytes_skipped = batch.unread_bytes;
+        }
         let (state, reason) = readable_status(discovery);
         self.stage_status(&mut result, self.make_status(ts, state, reason), ts, now);
         result
@@ -721,12 +741,21 @@ impl LogCollector {
     /// Returns filesystem errors from saving the state file.
     pub fn commit(&mut self, collection: &LogCollection) -> io::Result<()> {
         if let Some(state) = &collection.next_state {
-            state.save(&self.config.state_path)?;
+            if self.state.as_ref() != Some(state) {
+                state.save(&self.config.state_path)?;
+            }
             self.state = Some(state.clone());
             self.source = Some(LogSource {
                 path: state.path.clone(),
                 parser_kind: state.parser_kind,
             });
+        }
+        if collection.consumes_pending_rotation {
+            self.pending_rotation_bytes_skipped = 0;
+        }
+        if let Some(source) = &collection.next_source {
+            self.source = Some(source.clone());
+            self.pending_rotation_bytes_skipped = collection.rotation_bytes_skipped;
         }
         if let Some(update) = &collection.pending_status {
             self.status_tracker.commit(update);
@@ -754,43 +783,45 @@ impl LogCollector {
         &mut self,
         client: Option<&Client>,
         now: Instant,
-    ) -> DiscoveryStatus {
+    ) -> (DiscoveryStatus, Option<LogSource>) {
         if let Some(path) = &self.config.path_override {
-            self.source = Some(LogSource {
-                path: path.clone(),
-                parser_kind: self.config.parser_kind,
-            });
             self.last_discovery = Some(DiscoveryStatus::Available);
-            return DiscoveryStatus::Available;
+            return (
+                DiscoveryStatus::Available,
+                Some(LogSource {
+                    path: path.clone(),
+                    parser_kind: self.config.parser_kind,
+                }),
+            );
         }
         if self.next_discovery.is_some_and(|deadline| now < deadline) {
-            return self
-                .last_discovery
-                .unwrap_or(DiscoveryStatus::PostgresUnavailable);
+            return (
+                self.last_discovery
+                    .unwrap_or(DiscoveryStatus::PostgresUnavailable),
+                None,
+            );
         }
         self.next_discovery = Some(now + self.config.discovery_interval);
         let Some(client) = client else {
             let status = DiscoveryStatus::PostgresUnavailable;
             self.last_discovery = Some(status);
-            return status;
+            return (status, None);
         };
-        let status = match discover(client, self.config.root_override.as_deref()).await {
-            Ok(source) => {
-                self.source = Some(source);
-                DiscoveryStatus::Available
-            }
-            Err(status) => {
-                if matches!(
-                    status,
-                    DiscoveryStatus::NoCurrentLogfile | DiscoveryStatus::UnsupportedFormat
-                ) {
-                    self.source = None;
+        let (status, discovered_source) =
+            match discover(client, self.config.root_override.as_deref()).await {
+                Ok(source) => (DiscoveryStatus::Available, Some(source)),
+                Err(status) => {
+                    if matches!(
+                        status,
+                        DiscoveryStatus::NoCurrentLogfile | DiscoveryStatus::UnsupportedFormat
+                    ) {
+                        self.source = None;
+                    }
+                    (status, None)
                 }
-                status
-            }
-        };
+            };
         self.last_discovery = Some(status);
-        status
+        (status, discovered_source)
     }
 
     fn make_status(
@@ -930,7 +961,7 @@ async fn show(client: &Client, name: &str) -> Result<String, DiscoveryStatus> {
 async fn current_logfile(client: &Client) -> Result<Option<String>, DiscoveryStatus> {
     client
         .query_one(
-            "/* pg_kronika:log */ SELECT pg_current_logfile('stderr')",
+            "/* pg_kronika:log */ SELECT pg_catalog.pg_current_logfile('stderr'::text)",
             &[],
         )
         .await
@@ -2059,6 +2090,7 @@ fn gaps_from_tail(
     parser_kind: ParserKind,
     gaps: TailGaps,
     state: Option<&TailState>,
+    rotation_bytes_skipped: u64,
 ) -> Vec<LogGap> {
     let mut rows = Vec::new();
     if gaps.backlog_bytes_skipped != 0 {
@@ -2101,12 +2133,13 @@ fn gaps_from_tail(
             ..file_state_fields(state)
         });
     }
-    if gaps.rotations != 0 {
+    if gaps.rotations != 0 || rotation_bytes_skipped != 0 {
         rows.push(LogGap {
             ts,
             source_path: Some(source_path.to_owned()),
             parser_kind,
             reason: GapReason::Rotation,
+            bytes_skipped: rotation_bytes_skipped,
             rotations: gaps.rotations,
             ..file_state_fields(state)
         });
@@ -2181,8 +2214,9 @@ mod tests {
     async fn quiet_read_emits_collecting_then_waits_for_heartbeat() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("postgresql.log");
+        let state_path = dir.path().join("state");
         std::fs::write(&log, "").expect("write empty log");
-        let mut config = fixture_config(log, dir.path().join("state"));
+        let mut config = fixture_config(log, state_path.clone());
         config.status_interval = Duration::from_mins(5);
         let mut collector = LogCollector::new(config).expect("collector");
         let now = Instant::now();
@@ -2199,6 +2233,8 @@ mod tests {
             .collect_at(None, 20, now + Duration::from_secs(299))
             .await;
         assert!(quiet.source_status.is_none());
+        std::fs::create_dir(state_path.with_extension("tmp"))
+            .expect("block an unnecessary state rewrite");
         collector.commit(&quiet).expect("commit quiet observation");
 
         let heartbeat = collector
@@ -2209,6 +2245,57 @@ mod tests {
             (LogSourceState::Collecting, LogSourceReason::None)
         );
         assert!(!heartbeat.source_status_changed);
+    }
+
+    #[tokio::test]
+    async fn rotation_drains_one_bounded_batch_then_prefers_the_new_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_log = dir.path().join("postgresql-old.log");
+        let new_log = dir.path().join("postgresql-new.log");
+        let state_path = dir.path().join("state");
+        std::fs::write(&old_log, "").expect("write old log");
+
+        let mut initial = LogCollector::new(fixture_config(old_log.clone(), state_path.clone()))
+            .expect("initial collector");
+        let initial_batch = initial.collect(None, 0).await;
+        initial.commit(&initial_batch).expect("persist old offset");
+        drop(initial);
+
+        let old_first = "2026-07-05 12:00:00 UTC [1]: ERROR:  old first failure\n";
+        let old_second = "2026-07-05 12:00:01 UTC [1]: ERROR:  old second failure\n";
+        std::fs::write(&old_log, format!("{old_first}{old_second}")).expect("append old tail");
+        std::fs::write(
+            &new_log,
+            "2026-07-05 12:00:02 UTC [1]: ERROR:  fresh failure\n",
+        )
+        .expect("write new log");
+
+        let mut config = fixture_config(new_log.clone(), state_path);
+        config.tail_caps.max_lines = 1;
+        let mut collector = LogCollector::new(config).expect("rotating collector");
+
+        let drained = collector.collect(None, 1).await;
+        assert_eq!(drained.errors.len(), 1);
+        assert!(drained.errors[0].sample.contains("old first failure"));
+        let old_offset = drained.next_state.as_ref().expect("old state").offset;
+        let skipped = std::fs::metadata(&old_log)
+            .expect("old metadata")
+            .len()
+            .saturating_sub(old_offset);
+        assert!(skipped > 0, "the bounded drain must leave an old tail");
+        collector.commit(&drained).expect("commit bounded drain");
+
+        let fresh = collector.collect(None, 2).await;
+        assert_eq!(fresh.errors.len(), 1);
+        assert!(fresh.errors[0].sample.contains("fresh failure"));
+        assert!(!fresh.errors[0].sample.contains("old second failure"));
+        let rotation = fresh
+            .gaps
+            .iter()
+            .find(|gap| gap.reason == GapReason::Rotation)
+            .expect("rotation gap");
+        assert_eq!(rotation.source_path.as_ref(), Some(&new_log));
+        assert_eq!(rotation.bytes_skipped, skipped);
     }
 
     #[tokio::test]

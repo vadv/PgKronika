@@ -4,9 +4,9 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, RawQuery, State};
 use kronika_reader::{
-    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, apply_collection_gating,
-    diff_section, gate_readings, latest_section_row, logical_section, section,
-    sections as query_sections,
+    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, SourceSummaryError,
+    SourceSummaryLimits, SourceSummaryResource, apply_collection_gating, diff_section,
+    gate_readings, logical_section, section, sections as query_sections, source_summaries,
 };
 use kronika_registry::{
     ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
@@ -69,31 +69,81 @@ pub(crate) async fn sources(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiProblem> {
     QueryParams::parse(raw.as_deref(), &[])?;
+    let permit = state
+        .try_acquire_analytic()
+        .map_err(|_capacity| ApiProblem::analytic_capacity_unavailable())?;
     let published = state.snapshot();
-    let mut snapshot = published.as_ref().clone();
-    let mut spans: BTreeMap<u64, (i64, i64, usize)> = BTreeMap::new();
-    for unit in snapshot.units() {
-        let span = spans
-            .entry(unit.source_id)
-            .or_insert((unit.min_ts, unit.max_ts, 0));
-        span.0 = span.0.min(unit.min_ts);
-        span.1 = span.1.max(unit.max_ts);
-        span.2 += 1;
-    }
-    let mut sources = Vec::with_capacity(spans.len());
-    for (source_id, (min_ts, max_ts, segments)) in spans {
-        let status = latest_section_row(&mut snapshot, "pg_log_source_status", source_id)
-            .map_err(|error| query_error_response_without_cursor(&error))?;
-        let pg_log = pg_log_status_json(status.as_ref());
+    let summaries = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut snapshot = published.as_ref().clone();
+        source_summaries(&mut snapshot, SourceSummaryLimits::default())
+    })
+    .await
+    .map_err(|join| {
+        let problem = ApiProblem::internal_error();
+        tracing::error!(
+            event = "api_source_summary_worker_failed",
+            request_id = problem.request_id(),
+            error = ?join,
+            "source summary worker failed"
+        );
+        problem
+    })?
+    .map_err(|error| source_summary_error_response(&error))?;
+
+    let mut sources = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let pg_log = pg_log_status_json(summary.latest_status.as_ref());
         sources.push(json!({
-            "source_id": source_id,
-            "min_ts": min_ts,
-            "max_ts": max_ts,
-            "segments": segments,
+            "source_id": summary.source_id,
+            "min_ts": summary.min_ts,
+            "max_ts": summary.max_ts,
+            "segments": summary.segments,
             "pg_log": pg_log,
         }));
     }
     Ok(Json(json!({ "sources": sources })))
+}
+
+fn source_summary_error_response(error: &SourceSummaryError) -> ApiProblem {
+    match error {
+        SourceSummaryError::LimitExceeded {
+            resource,
+            limit,
+            observed,
+        } => {
+            let resource = match resource {
+                SourceSummaryResource::Units => LimitResource::Units,
+                SourceSummaryResource::Rows => LimitResource::Rows,
+                SourceSummaryResource::Bytes => LimitResource::Bytes,
+            };
+            ApiProblem::query_limit_exceeded(resource, *limit, Some(*observed))
+        }
+        SourceSummaryError::IncompleteSnapshot {
+            unit_idx,
+            refreshes,
+        } => {
+            let problem = ApiProblem::store_read_failed();
+            tracing::warn!(
+                event = "api_source_summary_incomplete_snapshot",
+                request_id = problem.request_id(),
+                unit_idx,
+                refreshes,
+                "source summary remained stale after bounded retries"
+            );
+            problem
+        }
+        SourceSummaryError::Read(read) => {
+            let problem = ApiProblem::store_read_failed();
+            tracing::error!(
+                event = "api_store_read_failed",
+                request_id = problem.request_id(),
+                error = %read,
+                "source summary failed"
+            );
+            problem
+        }
+    }
 }
 
 fn unknown_pg_log_status() -> Value {

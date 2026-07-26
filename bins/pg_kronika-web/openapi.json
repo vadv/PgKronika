@@ -105,6 +105,7 @@
           "401": { "$ref": "#/components/responses/UnauthorizedProblem" },
           "405": { "$ref": "#/components/responses/MethodNotAllowedProblem" },
           "413": { "$ref": "#/components/responses/ApplicationProblem" },
+          "503": { "$ref": "#/components/responses/ApplicationProblem" },
           "500": { "$ref": "#/components/responses/ApplicationProblem" }
         }
       }

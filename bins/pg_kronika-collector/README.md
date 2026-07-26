@@ -114,9 +114,9 @@ recovery and are sealed on the next start.
 
 PostgreSQL log collection is enabled by default. Unless `KRONIKA_LOG_PATH` is
 set, each discovery attempt checks that `SHOW log_destination` contains
-`stderr`, then calls `pg_current_logfile('stderr')`. A relative result is
-resolved against `SHOW data_directory`, or against `KRONIKA_LOG_ROOT` when that
-override is set.
+`stderr`, then calls `pg_catalog.pg_current_logfile('stderr')`. A relative
+result is resolved against `SHOW data_directory`, or against
+`KRONIKA_LOG_ROOT` when that override is set.
 
 The collector reports the outcome in `pg_log_source_status`:
 
@@ -134,6 +134,14 @@ row is exposed as the `pg_log` object in `GET /v1/sources`.
 The collector does not change PostgreSQL settings or file permissions. When no
 committed tail position exists, the first read of a newly discovered file
 starts at EOF. Set `KRONIKA_LOG_START_AT_BEGINNING=1` to read it from byte zero.
+
+When discovery finds a different path, the collector reads the previous file
+once more under the normal per-cycle limits: at most 4096 lines, 1 MiB, and
+50 ms. After that result is committed, collection switches to the new file
+even if the old tail is not exhausted. The first committed cycle from the new
+file includes a `pg_log_gap` with `reason=rotation`; when the remaining old
+tail could be measured, `bytes_skipped` is the number of unread bytes. This
+keeps fresh-event delay to one bounded old-file read.
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |

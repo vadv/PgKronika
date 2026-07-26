@@ -57,10 +57,10 @@ pub use overview::{
 };
 pub use query::{
     ColumnDiff, ColumnValues, Cursor, DiffAt, Gap, GateReading, LogicalColumn, LogicalSection,
-    OutRow, QueryError, QueryLimits, SectionPage, SeriesDiff, SeriesValues, Value,
-    apply_collection_gating, apply_gating, diff_section, gate_readings, gauge_section,
-    latest_section_row, logical_section, section, section_with_limits, sections,
-    sections_with_limits, select_gate,
+    OutRow, QueryError, QueryLimits, SectionPage, SeriesDiff, SeriesValues, SourceSummary,
+    SourceSummaryError, SourceSummaryLimits, SourceSummaryResource, Value, apply_collection_gating,
+    apply_gating, diff_section, gate_readings, gauge_section, latest_section_row, logical_section,
+    section, section_with_limits, sections, sections_with_limits, select_gate, source_summaries,
 };
 pub use refresh::{
     ByteRange, CatalogDigest, JournalDelta, JournalGenerationId, JournalIdentity, PartDescriptor,
