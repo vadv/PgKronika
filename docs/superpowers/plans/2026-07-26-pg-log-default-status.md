@@ -1525,7 +1525,7 @@ git commit -m "feat(collector): write PostgreSQL log source status"
 - Consumes: `LocalDirSnapshot::{units,unit_catalog,open_unit,refresh}`, `logical_section`, `cell_to_value`.
 - Produces: `pub fn latest_section_row(&mut LocalDirSnapshot, &str, u64) -> Result<Option<OutRow>, QueryError>`.
 
-- [ ] **Step 1: Write failing latest-row tests**
+- [x] **Step 1: Write failing latest-row tests**
 
 In the new module, build real PGM parts with `PgLogSourceStatusV1`:
 
@@ -1633,7 +1633,10 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm the red state**
+The old-store case is strengthened in the implementation to use the requested
+source with a different registered section and assert zero `open_unit` calls.
+
+- [x] **Step 2: Run the focused tests and confirm the red state**
 
 Run:
 
@@ -1645,7 +1648,7 @@ cargo +1.96.0 test -p kronika-reader latest::tests --target "$HOST"
 Expected: compilation fails because `query::latest` and
 `latest_section_row` do not exist.
 
-- [ ] **Step 3: Implement catalog-first reverse search**
+- [x] **Step 3: Implement catalog-first reverse search**
 
 Make `MAX_REFRESH` and `compare_full` in `section.rs` visible to sibling query
 modules with `pub(super)`. Implement this algorithm in `latest.rs`:
@@ -1800,7 +1803,7 @@ This opens only catalog candidates and stops once every remaining unit has
 `max_ts` below the best decoded row timestamp. A store without the status type
 returns `None` after catalog inspection and opens no section bodies.
 
-- [ ] **Step 4: Export the query and run reader tests**
+- [x] **Step 4: Export the query and run reader tests**
 
 Add `mod latest` plus a `pub use` in `query/mod.rs`; re-export
 `latest_section_row` from `crates/kronika-reader/src/lib.rs`.
@@ -1816,7 +1819,7 @@ cargo +1.96.0 test -p kronika-reader query::section --target "$HOST"
 Expected: latest-row tests pass; batch section query still opens every selected
 unit only once.
 
-- [ ] **Step 5: Commit the bounded reader query**
+- [x] **Step 5: Commit the bounded reader query**
 
 ```sh
 git add crates/kronika-reader/src/query/latest.rs crates/kronika-reader/src/query/section.rs crates/kronika-reader/src/query/mod.rs crates/kronika-reader/src/lib.rs
