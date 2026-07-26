@@ -171,6 +171,7 @@ mod database;
 mod io;
 mod log;
 mod os;
+mod plan_anomalies;
 mod prepared_xacts;
 mod progress_vacuum;
 mod replication_details;

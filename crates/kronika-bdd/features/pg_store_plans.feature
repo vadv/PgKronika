@@ -1,3 +1,4 @@
+@plan_collector
 Feature: Collector writes pg_store_plans (vadv fork) to section pg_store_plans.vadv
   The PostgreSQL 17 and 18 test images include the vadv pg_store_plans fork and
   run with compute_query_id=on. The collector reads top plans without texts
@@ -30,6 +31,8 @@ Feature: Collector writes pg_store_plans (vadv fork) to section pg_store_plans.v
     When the collector snapshots the segment
     Then section pg_store_plans.vadv has a pg_store_plans row for query like '%kronika_psp_marker_a%' with calls = 3 and a resolvable plan
     And section pg_store_plans.vadv has a pg_store_plans row for query like '%kronika_psp_marker_b%' with calls = 2 and a resolvable plan
+    And section pg_store_plans.vadv matches every buffer counter for query like '%kronika_psp_marker_a%'
+    And section pg_store_plans.vadv has complete analyzer provenance
     And section pg_store_plans.ossc is absent from the segment
 
   @pg17 @serial
@@ -54,6 +57,8 @@ Feature: Collector writes pg_store_plans (vadv fork) to section pg_store_plans.v
       """
     When the collector snapshots the segment
     Then section pg_store_plans.vadv has a pg_store_plans row for query like '%kronika_psp_merge WHERE id = $1 AND%' with calls = 5 and a resolvable plan
+    And section pg_store_plans.vadv matches every buffer counter for query like '%kronika_psp_merge WHERE id = $1 AND%'
+    And section pg_store_plans.vadv has complete analyzer provenance
 
   @pg18 @serial
   Scenario: PG18 writes the same vadv layout
@@ -73,4 +78,6 @@ Feature: Collector writes pg_store_plans (vadv fork) to section pg_store_plans.v
       """
     When the collector snapshots the segment
     Then section pg_store_plans.vadv has a pg_store_plans row for query like '%kronika_psp_marker%' with calls = 1 and a resolvable plan
+    And section pg_store_plans.vadv matches every buffer counter for query like '%kronika_psp_marker%'
+    And section pg_store_plans.vadv has complete analyzer provenance
     And section pg_store_plans.ossc is absent from the segment

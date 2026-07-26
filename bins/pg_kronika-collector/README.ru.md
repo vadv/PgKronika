@@ -99,6 +99,11 @@ timeout. Пул открывает одно основное подключен�
 | Cgroup mapping | `KRONIKA_OS_CGROUP_MAPPING_INTERVAL_S` | 30 |
 | Журнал PostgreSQL | `KRONIKA_PG_LOG_INTERVAL_S` | 5 |
 
+Каждое фактическое чтение `pg_store_plans` добавляет согласованную строку
+reset-метаданных с точным `ts` снимка планов. Коллектор проверяет reset-состояние
+до и после чтения и отбрасывает снимок планов, если состояние изменилось или
+его не удалось прочитать.
+
 Activity ускоряется до `KRONIKA_PG_ACTIVITY_FAST_INTERVAL_S` (`1`), когда число
 активных client backends достигает `KRONIKA_PG_ASH_ACTIVE_THRESHOLD` (`20`).
 Репликация ускоряется до `KRONIKA_PG_REPLICATION_FAST_INTERVAL_S` (`10`), когда

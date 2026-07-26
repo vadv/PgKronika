@@ -79,6 +79,7 @@ Timeline resource policy defaults and constraints are:
 | Cold weighted capacity | 1 GiB each PGM/decoded/read/write, 2,097,152 rows, 16 file descriptors, 4 publications | Values are process-wide aggregate ceilings; byte and row charges round up to fixed scheduler quanta. |
 | Timeline query range | — | 31 days |
 | Materialized timeline query | — | 64 MiB cloned-observation charge; 1,048,576 observations/count inputs, 262,144 clipped coverage spans, 65,536 joint keys, 1,024 signal keys |
+| Anomaly projection | 50 results per evidence class | 10,000 window positions; 50,000,000 charged timeline-unit/position pairs; 10,000 generic episodes and 10,000 plan signals independently; 262,144 rows, 10,000,000 cells, and 64 MiB owned variable-width payload per section page |
 | Events page | 100 items | 1,000 items |
 | Notable preview | 100 items | Fixed by notable policy v1 |
 | Health line | — | 2,000 points |
@@ -155,7 +156,7 @@ analysis.
 | `GET /v1/timeline/overview` | exactly one `source`, `from`, `to` | Returns a source-scoped event digest, bounded notable preview, health summary, coverage, freshness, completeness, exactness, count semantics, and known loss. |
 | `GET /v1/timeline/events` | one or more repeatable `source`, `from`, `to`; optional `limit`, `cursor`, `min_severity`, `kind` | Returns a stable page of typed notable event facts and an opaque cursor when more events remain. |
 | `GET /v1/timeline/health` | exactly one `source`, `from`, `to`; optional integer-microsecond `step` | Returns at most 2,000 policy-evaluated health points plus coverage and the effective step. |
-| `GET /v1/anomalies` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `limit`, `section` | Finds intervals where counter rates or gauge values changed unusually during the selected period. It returns the affected series, metric, interval, direction, and peak statistics; ranks episodes by `abs(peak.m)`; and reports per-section evaluation counts plus any skipped sections. |
+| `GET /v1/anomalies` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `limit`, `section` | Finds unusual rate or gauge intervals and, for stored plans, call-normalized plan-mixture changes and same-plan buffer-work increases. It returns ranked `episodes`, ranked `plan_signals`, per-section evaluation counts, plan applicability and quality, coverage, truncation, and skipped work. |
 | `GET /v1/incidents` | `source`, `from`, `to`; optional `window`, `step`, `threshold`, `eps_rel`, `epsilon`, `max_cluster_span`, `section` | Groups anomaly episodes that are close in time into incident candidates. It returns findings and machine-readable evidence where the inputs support them, plus coverage, data quality, catalog state, and skipped work. |
 | `GET /` | none | Opens the embedded browser UI over the same local snapshot. |
 
@@ -258,11 +259,48 @@ See the [OpenAPI contract](openapi.json) and the
   timestamps did not advance or the scalar kinds were inconsistent.
 - Anomaly search compares each current window with the other usable points in
   the selected period. The strongest absolute peak score appears first.
+  Equal-score results use section, column/dimension, identity, and interval fields as
+  explicit tie-breakers, so input collection order cannot change truncation.
   `sections` reports evaluated and unevaluated window positions;
   `nodata_points` is an aggregate count, so the anomaly response does not split
   it into reset, gap, and collection-disabled totals. A window position that
   crosses a timeline break is counted under `not_evaluated.discontinuity`.
   Missing data is never replaced by zero.
+- Stored-plan analysis adds two stable evidence kinds. For upstream
+  `pg_store_plans`, `pg.query.plan_distribution_shift.v1` compares each
+  core-query-id plan mixture using call deltas normalized into plan shares. It
+  requires at least 20 calls on each side and total-variation distance of at
+  least `0.20`. The vadv fork keys rows by `(dbid, userid, planid)`, so its
+  `queryid_stat_statements` value is only best-effort attribution and plan
+  mixture is explicitly not applicable.
+- `pg.plan.buffer_work_per_call_increase.v1` works for both supported forks. It
+  compares one retained plan identity at a time, normalizes cumulative buffer
+  deltas by call deltas, and requires at least 20 calls on each side, at least
+  `1` additional block per call, and at least a `50%` increase. Shared and
+  local `hit/read/dirtied/written` and temp `read/written` remain ten separate
+  dimensions. The extension exposes no temp hit or dirtied counter.
+- Plan windows never bridge reset, extension-version, instance, coverage-gap,
+  or observed eviction boundaries. Each plan snapshot must have reset metadata
+  at its exact timestamp; an older row is not accepted as provenance. Full
+  snapshot coverage is required for plan-mixture claims. A retained plan row
+  from a proven top-N snapshot may
+  still support its own buffer comparison, but the response remains partial
+  for population completeness. Missing or paged plan/provenance pages,
+  reader-gap ranges, invalid rows, conflicting coverage or metadata, missing
+  system identity, unsupported versions, work limits, and evidence truncation
+  stay visible in `plan_analysis.quality`, top-level `coverage`, `truncation`,
+  `complete`, and `status`. Source absence is `complete` only when those inputs
+  prove the absence; otherwise its plan status is `partial`.
+- Top-level `coverage.plan_positions_evaluated` counts specialized detector
+  positions that reached a stable/changed verdict. It participates in
+  `no_data`, `insufficient_data`, and `calm` status selection independently of
+  generic-series positions.
+- Both plan detectors are retrospective observations: the reference is the
+  rest of the same continuous selected-period segment, including later
+  samples. They neither diagnose an optimizer regression nor activate the
+  causal `PG-PLAN-002` incident finding by themselves. `limit` independently
+  caps ranked numeric `episodes` and ranked `plan_signals`; the response
+  reports separate dropped counts for both.
 - Incident clustering preserves more detail about incomplete input:
   `data_quality` has separate `resets`, `gaps`, and `not_collected` counts,
   `coverage_by_section` lists gap intervals, and `skipped` explains work omitted

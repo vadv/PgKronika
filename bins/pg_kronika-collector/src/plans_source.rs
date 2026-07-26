@@ -2,8 +2,12 @@ use crate::config::Config;
 use crate::logging::{
     CollectionFamily, LogLevel, duration_ms, field, layout_id, log_event, section_name,
 };
-use crate::statements_source::{StatementsSource, all_statements_candidates, statement_client};
+use crate::reset_source::{ExtensionResetSource, collect_plan_reset_metadata, plan_reset_context};
+use crate::statements_source::{
+    StatementsSource, StatementsSourceCache, all_statements_candidates, statement_client,
+};
 use kronika_source_pg::pool::ConnectionPool;
+use kronika_source_pg::reset_metadata::{ResetBase, ResetExtensions};
 use kronika_source_pg::store_plans::{
     StorePlansOsscRow, StorePlansRow, collect_store_plans, collect_store_plans_ossc,
     fetch_plan_text, store_plans_extversion, store_plans_is_ossc, store_plans_is_vadv,
@@ -60,6 +64,14 @@ pub(crate) enum PlansRead {
     Ossc(Vec<StorePlansOsscRow>),
 }
 
+/// One plan read and the reset state that bracketed it.
+pub(crate) struct PlansSnapshot {
+    pub(crate) read: PlansRead,
+    pub(crate) source_total: u64,
+    pub(crate) snapshot_ts: i64,
+    pub(crate) reset: (ResetBase, ResetExtensions),
+}
+
 impl PlansRead {
     const fn is_empty(&self) -> bool {
         match self {
@@ -72,13 +84,6 @@ impl PlansRead {
         match self {
             Self::Vadv(rows) => rows.len(),
             Self::Ossc(rows) => rows.len(),
-        }
-    }
-
-    pub(crate) fn snapshot_ts(&self) -> Option<i64> {
-        match self {
-            Self::Vadv(rows) => rows.first().map(|row| row.ts),
-            Self::Ossc(rows) => rows.first().map(|row| row.ts),
         }
     }
 
@@ -118,6 +123,90 @@ pub(crate) fn plans_reread_delay(rows_empty: bool, interval: Duration) -> Durati
     }
 }
 
+enum SnapshotAttempt {
+    Collected(Box<PlansSnapshot>),
+    QueryFailed(tokio_postgres::Error),
+    ProvenanceUnavailable(anyhow::Error),
+    ProvenanceChanged,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a verified plan read coordinates the pool, server version, source identity, reset context, and fork"
+)]
+async fn collect_verified_plans(
+    pool: &ConnectionPool,
+    major: u32,
+    config: &Config,
+    statements_cache: &StatementsSourceCache,
+    client: &Client,
+    source: &StatementsSource,
+    extversion: &str,
+    fork: PlansFork,
+) -> SnapshotAttempt {
+    let statements = statements_cache
+        .selected
+        .as_ref()
+        .map(|cached| ExtensionResetSource {
+            client: statement_client(pool, &cached.source),
+            version: &cached.extversion,
+            label: cached.source.label(),
+        });
+    let plans = ExtensionResetSource {
+        client: Some(client),
+        version: extversion,
+        label: source.label(),
+    };
+    let before =
+        match collect_plan_reset_metadata(pool.main(), major, statements.as_ref(), &plans).await {
+            Ok(reset) => reset,
+            Err(error) => return SnapshotAttempt::ProvenanceUnavailable(error),
+        };
+    let snapshot_ts = before.0.ts;
+    let (read, source_total) = match collect_plans_for_fork(client, config, fork, snapshot_ts).await
+    {
+        Ok(read) => read,
+        Err(error) => return SnapshotAttempt::QueryFailed(error),
+    };
+    let after =
+        match collect_plan_reset_metadata(pool.main(), major, statements.as_ref(), &plans).await {
+            Ok(reset) => reset,
+            Err(error) => return SnapshotAttempt::ProvenanceUnavailable(error),
+        };
+    match store_plans_extversion(client).await {
+        Ok(Some(observed)) if observed == extversion => {}
+        Ok(_) => return SnapshotAttempt::ProvenanceChanged,
+        Err(error) => {
+            return SnapshotAttempt::ProvenanceUnavailable(
+                anyhow::Error::new(error).context("recheck pg_store_plans extension version"),
+            );
+        }
+    }
+    if plan_reset_context(&before) != plan_reset_context(&after) {
+        return SnapshotAttempt::ProvenanceChanged;
+    }
+    SnapshotAttempt::Collected(Box::new(PlansSnapshot {
+        read,
+        source_total,
+        snapshot_ts,
+        reset: before,
+    }))
+}
+
+fn log_provenance_skip(type_id: u32, source: &str, reason: &'static str, error: Option<&str>) {
+    let mut fields = vec![
+        field("collection", section_name(type_id)),
+        field("type_id", type_id),
+        field("layout_id", layout_id(type_id)),
+        field("source", source),
+        field("reason", reason),
+    ];
+    if let Some(error) = error {
+        fields.push(field("error", error));
+    }
+    log_event(LogLevel::Warn, "collection_skip", &fields);
+}
+
 /// One read attempt through the cached source; any failure invalidates it so
 /// the caller can decide when to rediscover.
 #[allow(
@@ -126,10 +215,12 @@ pub(crate) fn plans_reread_delay(rows_empty: bool, interval: Duration) -> Durati
 )]
 async fn try_cached_plans_read(
     pool: &ConnectionPool,
+    major: u32,
     config: &Config,
+    statements_cache: &StatementsSourceCache,
     cache: &mut PlansSourceCache,
     now: Instant,
-) -> Option<(PlansRead, u64)> {
+) -> Option<PlansSnapshot> {
     if let Some(cached) = cache.selected.clone() {
         let label = cached.source.label();
         let started = Instant::now();
@@ -137,10 +228,24 @@ async fn try_cached_plans_read(
         if let Some(client) = statement_client(pool, &cached.source) {
             match store_plans_extversion(client).await {
                 Ok(Some(extversion)) if extversion == cached.extversion => {
-                    match collect_plans_for_fork(client, config, cached.fork).await {
-                        Ok(read) => {
+                    match collect_verified_plans(
+                        pool,
+                        major,
+                        config,
+                        statements_cache,
+                        client,
+                        &cached.source,
+                        &cached.extversion,
+                        cached.fork,
+                    )
+                    .await
+                    {
+                        SnapshotAttempt::Collected(snapshot) => {
                             cache.next_read = Some(
-                                now + plans_reread_delay(read.0.is_empty(), config.plans_interval),
+                                now + plans_reread_delay(
+                                    snapshot.read.is_empty(),
+                                    config.plans_interval,
+                                ),
                             );
                             log_event(
                                 LogLevel::Debug,
@@ -152,14 +257,14 @@ async fn try_cached_plans_read(
                                     field("source", &label),
                                     field("cached_source", true),
                                     field("fork", cached.fork.as_str()),
-                                    field("rows", read.0.rows_len()),
-                                    field("source_total", read.1),
+                                    field("rows", snapshot.read.rows_len()),
+                                    field("source_total", snapshot.source_total),
                                     field("elapsed_ms", duration_ms(started.elapsed())),
                                 ],
                             );
-                            return Some(read);
+                            return Some(*snapshot);
                         }
-                        Err(err) => {
+                        SnapshotAttempt::QueryFailed(err) => {
                             log_event(
                                 LogLevel::Warn,
                                 "collection_probe_failure",
@@ -175,6 +280,29 @@ async fn try_cached_plans_read(
                                     field("elapsed_ms", duration_ms(started.elapsed())),
                                 ],
                             );
+                            cache.selected = None;
+                        }
+                        SnapshotAttempt::ProvenanceUnavailable(err) => {
+                            let error = err.to_string();
+                            log_provenance_skip(
+                                type_id,
+                                &label,
+                                "plan_provenance_unavailable",
+                                Some(&error),
+                            );
+                            cache.next_read =
+                                Some(now + plans_reread_delay(true, config.plans_interval));
+                            cache.selected = None;
+                        }
+                        SnapshotAttempt::ProvenanceChanged => {
+                            log_provenance_skip(
+                                type_id,
+                                &label,
+                                "plan_provenance_changed_during_read",
+                                None,
+                            );
+                            cache.next_read =
+                                Some(now + plans_reread_delay(true, config.plans_interval));
                             cache.selected = None;
                         }
                     }
@@ -258,7 +386,7 @@ async fn try_cached_plans_read(
 /// The statistics are instance-wide, read from the one database where the
 /// extension is installed; discovery walks `pool.main()` first, then the
 /// covered per-db connections. Returns `None` between paced reads and when no
-/// vadv 2.x source exists. All awaits finish here so the caller can intern
+/// supported source exists. All awaits finish here so the caller can intern
 /// without holding the `!Send` `Interner` across an await.
 #[allow(
     clippy::too_many_lines,
@@ -266,17 +394,21 @@ async fn try_cached_plans_read(
 )]
 pub(crate) async fn collect_store_plans_cached(
     pool: &ConnectionPool,
+    major: u32,
     config: &Config,
+    statements_cache: &StatementsSourceCache,
     cache: &mut PlansSourceCache,
     force: bool,
-) -> Option<(PlansRead, u64)> {
+) -> Option<PlansSnapshot> {
     let now = Instant::now();
     if !force && !cache.is_due(now) {
         return None;
     }
 
     let had_cached_source = cache.selected.is_some();
-    if let Some(read) = try_cached_plans_read(pool, config, cache, now).await {
+    if let Some(read) =
+        try_cached_plans_read(pool, major, config, statements_cache, cache, now).await
+    {
         return Some(read);
     }
 
@@ -384,15 +516,26 @@ pub(crate) async fn collect_store_plans_cached(
             );
             continue;
         }
-        match collect_plans_for_fork(candidate.client, config, fork).await {
-            Ok(read) => {
+        match collect_verified_plans(
+            pool,
+            major,
+            config,
+            statements_cache,
+            candidate.client,
+            &candidate.source,
+            &extversion,
+            fork,
+        )
+        .await
+        {
+            SnapshotAttempt::Collected(snapshot) => {
                 cache.selected = Some(CachedPlansSource {
-                    source: candidate.source,
+                    source: candidate.source.clone(),
                     extversion,
                     fork,
                 });
                 cache.next_read =
-                    Some(now + plans_reread_delay(read.0.is_empty(), config.plans_interval));
+                    Some(now + plans_reread_delay(snapshot.read.is_empty(), config.plans_interval));
                 log_event(
                     LogLevel::Debug,
                     "collection_finish",
@@ -402,14 +545,14 @@ pub(crate) async fn collect_store_plans_cached(
                         field("layout_id", layout_id(type_id)),
                         field("source", &label),
                         field("fork", fork.as_str()),
-                        field("rows", read.0.rows_len()),
-                        field("source_total", read.1),
+                        field("rows", snapshot.read.rows_len()),
+                        field("source_total", snapshot.source_total),
                         field("elapsed_ms", duration_ms(started.elapsed())),
                     ],
                 );
-                return Some(read);
+                return Some(*snapshot);
             }
-            Err(err) => {
+            SnapshotAttempt::QueryFailed(err) => {
                 log_event(
                     LogLevel::Warn,
                     "collection_skip",
@@ -424,6 +567,27 @@ pub(crate) async fn collect_store_plans_cached(
                         field("elapsed_ms", duration_ms(started.elapsed())),
                     ],
                 );
+            }
+            SnapshotAttempt::ProvenanceUnavailable(err) => {
+                cache.selected = Some(CachedPlansSource {
+                    source: candidate.source.clone(),
+                    extversion,
+                    fork,
+                });
+                cache.next_read = Some(now + plans_reread_delay(true, config.plans_interval));
+                let error = err.to_string();
+                log_provenance_skip(type_id, &label, "plan_provenance_unavailable", Some(&error));
+                return None;
+            }
+            SnapshotAttempt::ProvenanceChanged => {
+                cache.selected = Some(CachedPlansSource {
+                    source: candidate.source.clone(),
+                    extversion,
+                    fork,
+                });
+                cache.next_read = Some(now + plans_reread_delay(true, config.plans_interval));
+                log_provenance_skip(type_id, &label, "plan_provenance_changed_during_read", None);
+                return None;
             }
         }
     }
@@ -441,14 +605,17 @@ async fn collect_plans_for_fork(
     client: &Client,
     config: &Config,
     fork: PlansFork,
+    snapshot_ts: i64,
 ) -> Result<(PlansRead, u64), tokio_postgres::Error> {
     match fork {
         PlansFork::Vadv => {
-            let (rows, source_total) = collect_plans_with_texts(client, config).await?;
+            let (rows, source_total) =
+                collect_plans_with_texts(client, config, snapshot_ts).await?;
             Ok((PlansRead::Vadv(rows), source_total))
         }
         PlansFork::Ossc => {
-            let (rows, source_total) = collect_ossc_plans_with_budget(client, config).await?;
+            let (rows, source_total) =
+                collect_ossc_plans_with_budget(client, config, snapshot_ts).await?;
             Ok((PlansRead::Ossc(rows), source_total))
         }
     }
@@ -465,11 +632,12 @@ async fn collect_plans_for_fork(
 async fn collect_ossc_plans_with_budget(
     client: &Client,
     config: &Config,
+    snapshot_ts: i64,
 ) -> Result<(Vec<StorePlansOsscRow>, u64), tokio_postgres::Error> {
     let started = Instant::now();
     let text_cap = (config.plan_text_budget > 0).then_some(config.max_plan_text);
     let (mut rows, masked, source_total) =
-        collect_store_plans_ossc(client, config.max_plans, text_cap).await?;
+        collect_store_plans_ossc(client, config.max_plans, text_cap, snapshot_ts).await?;
     if masked > 0 {
         log_event(
             LogLevel::Warn,
@@ -527,9 +695,11 @@ async fn collect_ossc_plans_with_budget(
 async fn collect_plans_with_texts(
     client: &Client,
     config: &Config,
+    snapshot_ts: i64,
 ) -> Result<(Vec<StorePlansRow>, u64), tokio_postgres::Error> {
     let started = Instant::now();
-    let (mut rows, source_total) = collect_store_plans(client, config.max_plans).await?;
+    let (mut rows, source_total) =
+        collect_store_plans(client, config.max_plans, snapshot_ts).await?;
     let mut budget = config.plan_text_budget;
     let mut fetched = 0_usize;
     for row in &mut rows {

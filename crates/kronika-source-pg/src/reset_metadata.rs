@@ -142,6 +142,23 @@ pub async fn collect_reset_base(
     })
 }
 
+/// Query `compute_query_id` without substituting a fallback.
+const fn compute_query_id_query() -> &'static str {
+    marked!("SELECT current_setting('compute_query_id', true) AS compute_query_id")
+}
+
+/// Read `compute_query_id` from the session that owns a discovered extension
+/// source.
+///
+/// # Errors
+/// Returns the [`tokio_postgres::Error`] if the setting query fails.
+pub async fn compute_query_id_setting(
+    client: &Client,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    let row = client.query_one(compute_query_id_query(), &[]).await?;
+    Ok(row.get("compute_query_id"))
+}
+
 /// Read a single optional microsecond timestamp; absent rows collapse to `None`.
 async fn scalar_reset_us(client: &Client, sql: &str) -> Result<Option<i64>, tokio_postgres::Error> {
     let row = client.query_opt(sql, &[]).await?;
@@ -256,7 +273,9 @@ pub fn to_reset_metadata<E>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ResetBase, ResetExtensions, parse_bool_guc, to_reset_metadata};
+    use super::{
+        ResetBase, ResetExtensions, compute_query_id_query, parse_bool_guc, to_reset_metadata,
+    };
     use kronika_registry::{StrId, Ts};
 
     #[test]
@@ -265,6 +284,16 @@ mod tests {
         assert_eq!(parse_bool_guc("off"), Some(false));
         assert_eq!(parse_bool_guc("true"), None);
         assert_eq!(parse_bool_guc(""), None);
+    }
+
+    #[test]
+    fn plan_source_query_reads_compute_query_id_without_inventing_a_default() {
+        let query = compute_query_id_query();
+        assert!(
+            query.contains("current_setting('compute_query_id', true)"),
+            "{query}"
+        );
+        assert!(!query.contains("coalesce"), "{query}");
     }
 
     fn base() -> ResetBase {

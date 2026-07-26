@@ -8,8 +8,10 @@
 //!
 //! [`anomaly`] compares a current window with a reference window using a
 //! modified z-score, then groups consecutive above-threshold positions into
-//! episodes. Empty, discontinuous, undersized, or non-finite inputs produce an
-//! explicit not-evaluated reason rather than a score.
+//! episodes. It also provides count-normalized categorical-distribution and
+//! per-operation work comparisons. Empty, discontinuous, undersized,
+//! non-finite, or overflowing inputs produce an explicit not-evaluated reason
+//! rather than a score.
 //!
 //! The functions allocate in proportion to their input slices or returned
 //! episodes. These functions do not impose request ceilings; adapters such as
@@ -27,6 +29,9 @@ pub mod diff;
 pub mod overview;
 
 pub use anomaly::{
-    Direction, Episode, Evaluated, NotEvaluatedReason, ScoreParams, Scored, episodes, score_window,
+    CategoryCount, CategoryShareChange, ChangeNotEvaluatedReason, Direction, DistributionEvidence,
+    DistributionOutcome, DistributionParams, Episode, Evaluated, NotEvaluatedReason,
+    PerUnitEvidence, PerUnitOutcome, PerUnitParams, ScoreParams, Scored, WorkTotals,
+    compare_distributions, compare_per_unit, episodes, score_window,
 };
 pub use diff::{DiffPoint, Reason, Scalar, diff_pair};

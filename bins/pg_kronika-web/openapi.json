@@ -850,11 +850,401 @@
         "type": "object",
         "additionalProperties": { "$ref": "#/components/schemas/DiffSection" }
       },
+      "AnomalyParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference_model", "retrospective", "threshold", "eps_abs", "eps_rel", "min_reference_points", "min_current_points"],
+        "properties": {
+          "reference_model": { "type": "string", "const": "rest_of_continuous_period" },
+          "retrospective": { "type": "boolean", "const": true },
+          "threshold": { "type": "number", "minimum": 0 },
+          "eps_abs": { "type": "number", "exclusiveMinimum": 0 },
+          "eps_rel": { "type": "number", "minimum": 0 },
+          "min_reference_points": { "type": "integer", "const": 20 },
+          "min_current_points": { "type": "integer", "const": 3 }
+        }
+      },
+      "AnomalyPeak": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["m", "med_cur", "med_ref", "mad_ref", "sigma_used", "n_cur", "n_ref"],
+        "properties": {
+          "m": { "type": "number" },
+          "med_cur": { "type": "number" },
+          "med_ref": { "type": "number" },
+          "mad_ref": { "type": "number", "minimum": 0 },
+          "sigma_used": { "type": "number", "exclusiveMinimum": 0 },
+          "n_cur": { "type": "integer", "minimum": 0 },
+          "n_ref": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "AnomalyEpisode": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signal_id", "section", "series", "column", "start", "end", "peak_ts", "direction", "parameters", "peak"],
+        "properties": {
+          "signal_id": { "type": "string", "const": "metric.robust_window_deviation.v1" },
+          "section": { "type": "string" },
+          "series": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/MachineValue" } },
+          "column": { "type": "string" },
+          "start": { "type": "integer", "format": "int64" },
+          "end": { "type": "integer", "format": "int64" },
+          "peak_ts": { "type": "integer", "format": "int64" },
+          "direction": { "type": "string", "enum": ["up", "down", "flat"] },
+          "parameters": { "$ref": "#/components/schemas/AnomalyParameters" },
+          "peak": { "$ref": "#/components/schemas/AnomalyPeak" }
+        }
+      },
+      "PlanDistributionScope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dbid", "userid", "queryid", "query_identity", "query_text_used"],
+        "properties": {
+          "dbid": { "type": "integer", "minimum": 0 },
+          "userid": { "type": "integer", "minimum": 0 },
+          "queryid": { "type": "integer", "format": "int64" },
+          "query_identity": { "type": "string", "const": "dbid_userid_core_queryid" },
+          "query_text_used": { "type": "boolean", "const": false }
+        }
+      },
+      "PlanDistributionParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference_model", "retrospective", "window_us", "step_us", "count_basis", "min_reference_calls", "min_current_calls", "min_total_variation"],
+        "properties": {
+          "reference_model": { "type": "string", "const": "rest_of_continuous_period" },
+          "retrospective": { "type": "boolean", "const": true },
+          "window_us": { "type": "integer", "format": "int64", "minimum": 1 },
+          "step_us": { "type": "integer", "format": "int64", "minimum": 1 },
+          "count_basis": { "type": "string", "const": "calls_delta" },
+          "min_reference_calls": { "type": "integer", "minimum": 1 },
+          "min_current_calls": { "type": "integer", "minimum": 1 },
+          "min_total_variation": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      },
+      "PlanDistributionCoverage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["complete_for_evidence", "population", "queryid_applicability"],
+        "properties": {
+          "complete_for_evidence": { "type": "boolean", "const": true },
+          "population": { "type": "string", "const": "full_pg_store_plans_snapshots" },
+          "queryid_applicability": { "type": "string", "const": "exact_identity" }
+        }
+      },
+      "PlanShareEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["planid", "reference_calls", "current_calls", "reference_share", "current_share", "share_delta"],
+        "properties": {
+          "planid": { "type": "integer", "format": "int64" },
+          "reference_calls": { "type": "integer", "minimum": 0 },
+          "current_calls": { "type": "integer", "minimum": 0 },
+          "reference_share": { "type": "number", "minimum": 0, "maximum": 1 },
+          "current_share": { "type": "number", "minimum": 0, "maximum": 1 },
+          "share_delta": { "type": "number", "minimum": -1, "maximum": 1 }
+        }
+      },
+      "PlanDistributionEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference_calls", "current_calls", "total_variation", "max_abs_share_delta", "plans_total", "plans_omitted", "plans", "reference_only_planids_total", "reference_only_planids_omitted", "reference_only_planids", "current_only_planids_total", "current_only_planids_omitted", "current_only_planids", "reference_newly_observed_planids_total", "reference_newly_observed_planids_omitted", "reference_newly_observed_planids", "current_newly_observed_planids_total", "current_newly_observed_planids_omitted", "current_newly_observed_planids"],
+        "properties": {
+          "reference_calls": { "type": "integer", "minimum": 0 },
+          "current_calls": { "type": "integer", "minimum": 0 },
+          "total_variation": { "type": "number", "minimum": 0, "maximum": 1 },
+          "max_abs_share_delta": { "type": "number", "minimum": 0, "maximum": 1 },
+          "plans_total": { "type": "integer", "minimum": 0 },
+          "plans_omitted": { "type": "integer", "minimum": 0 },
+          "plans": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/PlanShareEvidence" } },
+          "reference_only_planids_total": { "type": "integer", "minimum": 0 },
+          "reference_only_planids_omitted": { "type": "integer", "minimum": 0 },
+          "reference_only_planids": { "type": "array", "maxItems": 32, "items": { "type": "integer", "format": "int64" } },
+          "current_only_planids_total": { "type": "integer", "minimum": 0 },
+          "current_only_planids_omitted": { "type": "integer", "minimum": 0 },
+          "current_only_planids": { "type": "array", "maxItems": 32, "items": { "type": "integer", "format": "int64" } },
+          "reference_newly_observed_planids_total": { "type": "integer", "minimum": 0 },
+          "reference_newly_observed_planids_omitted": { "type": "integer", "minimum": 0 },
+          "reference_newly_observed_planids": { "type": "array", "maxItems": 32, "items": { "type": "integer", "format": "int64" } },
+          "current_newly_observed_planids_total": { "type": "integer", "minimum": 0 },
+          "current_newly_observed_planids_omitted": { "type": "integer", "minimum": 0 },
+          "current_newly_observed_planids": { "type": "array", "maxItems": 32, "items": { "type": "integer", "format": "int64" } }
+        }
+      },
+      "PlanDistributionSignal": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signal_id", "section", "kind", "scope", "start", "end", "peak_ts", "severity", "parameters", "coverage", "evidence", "interpretation"],
+        "properties": {
+          "signal_id": { "type": "string", "const": "pg.query.plan_distribution_shift.v1" },
+          "section": { "type": "string", "const": "pg_store_plans_ossc" },
+          "kind": { "type": "string", "const": "plan_distribution_shift" },
+          "scope": { "$ref": "#/components/schemas/PlanDistributionScope" },
+          "start": { "type": "integer", "format": "int64" },
+          "end": { "type": "integer", "format": "int64" },
+          "peak_ts": { "type": "integer", "format": "int64" },
+          "severity": { "type": "number", "minimum": 0 },
+          "parameters": { "$ref": "#/components/schemas/PlanDistributionParameters" },
+          "coverage": { "$ref": "#/components/schemas/PlanDistributionCoverage" },
+          "evidence": { "$ref": "#/components/schemas/PlanDistributionEvidence" },
+          "interpretation": { "type": "string", "const": "observed_distribution_change" }
+        }
+      },
+      "PlanBufferScope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dbid", "userid", "queryid", "planid", "plan_identity", "query_attribution"],
+        "properties": {
+          "dbid": { "type": "integer", "minimum": 0 },
+          "userid": { "type": "integer", "minimum": 0 },
+          "queryid": { "type": ["integer", "null"], "format": "int64" },
+          "planid": { "type": "integer", "format": "int64" },
+          "plan_identity": { "type": "string", "enum": ["dbid_userid_queryid_planid", "dbid_userid_planid"] },
+          "query_attribution": { "type": "string", "enum": ["exact_identity", "unavailable"] }
+        }
+      },
+      "PlanBufferDimension": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["buffer_class", "operation", "column", "unit"],
+        "properties": {
+          "buffer_class": { "type": "string", "enum": ["shared", "local", "temp"] },
+          "operation": { "type": "string", "enum": ["hit", "read", "dirtied", "written"] },
+          "column": { "type": "string", "enum": ["shared_blks_hit", "shared_blks_read", "shared_blks_dirtied", "shared_blks_written", "local_blks_hit", "local_blks_read", "local_blks_dirtied", "local_blks_written", "temp_blks_read", "temp_blks_written"] },
+          "unit": { "type": "string", "const": "blocks_per_call" }
+        }
+      },
+      "PlanBufferParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference_model", "retrospective", "window_us", "step_us", "normalization", "min_reference_calls", "min_current_calls", "min_absolute_increase_blocks_per_call", "min_relative_increase"],
+        "properties": {
+          "reference_model": { "type": "string", "const": "rest_of_continuous_period" },
+          "retrospective": { "type": "boolean", "const": true },
+          "window_us": { "type": "integer", "format": "int64", "minimum": 1 },
+          "step_us": { "type": "integer", "format": "int64", "minimum": 1 },
+          "normalization": { "type": "string", "const": "calls_delta" },
+          "min_reference_calls": { "type": "integer", "minimum": 1 },
+          "min_current_calls": { "type": "integer", "minimum": 1 },
+          "min_absolute_increase_blocks_per_call": { "type": "number", "minimum": 0 },
+          "min_relative_increase": { "type": "number", "minimum": 0 }
+        }
+      },
+      "PlanBufferCoverage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["complete_for_evidence", "retained_plan_continuity", "reset_marker", "instance_identity", "parallelism"],
+        "properties": {
+          "complete_for_evidence": { "type": "boolean", "const": true },
+          "retained_plan_continuity": { "type": "string", "const": "every_observed_plan_snapshot" },
+          "reset_marker": { "type": "string", "enum": ["reset_metadata", "entry_first_call"] },
+          "instance_identity": { "type": "string", "const": "pg_system_identifier" },
+          "parallelism": { "type": "string", "const": "extension_execution_aggregate_not_worker_normalized" }
+        }
+      },
+      "PlanBufferEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference_calls", "reference_blocks", "current_calls", "current_blocks", "reference_blocks_per_call", "current_blocks_per_call", "delta_blocks_per_call", "relative_delta", "absolute_effect_met", "relative_effect_met"],
+        "properties": {
+          "reference_calls": { "type": "integer", "minimum": 0 },
+          "reference_blocks": { "type": "integer", "minimum": 0 },
+          "current_calls": { "type": "integer", "minimum": 0 },
+          "current_blocks": { "type": "integer", "minimum": 0 },
+          "reference_blocks_per_call": { "type": "number", "minimum": 0 },
+          "current_blocks_per_call": { "type": "number", "minimum": 0 },
+          "delta_blocks_per_call": { "type": "number" },
+          "relative_delta": { "type": ["number", "null"] },
+          "absolute_effect_met": { "type": "boolean" },
+          "relative_effect_met": { "type": "boolean" }
+        }
+      },
+      "PlanBufferSignal": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signal_id", "section", "kind", "scope", "dimension", "start", "end", "peak_ts", "severity", "parameters", "coverage", "evidence", "interpretation"],
+        "properties": {
+          "signal_id": { "type": "string", "const": "pg.plan.buffer_work_per_call_increase.v1" },
+          "section": { "type": "string", "enum": ["pg_store_plans_ossc", "pg_store_plans_vadv"] },
+          "kind": { "type": "string", "const": "buffer_work_per_call_increase" },
+          "scope": { "$ref": "#/components/schemas/PlanBufferScope" },
+          "dimension": { "$ref": "#/components/schemas/PlanBufferDimension" },
+          "start": { "type": "integer", "format": "int64" },
+          "end": { "type": "integer", "format": "int64" },
+          "peak_ts": { "type": "integer", "format": "int64" },
+          "severity": { "type": "number", "minimum": 0 },
+          "parameters": { "$ref": "#/components/schemas/PlanBufferParameters" },
+          "coverage": { "$ref": "#/components/schemas/PlanBufferCoverage" },
+          "evidence": { "$ref": "#/components/schemas/PlanBufferEvidence" },
+          "interpretation": { "type": "string", "const": "observed_same_plan_association_not_causation" }
+        }
+      },
+      "PlanSignal": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/PlanDistributionSignal" },
+          { "$ref": "#/components/schemas/PlanBufferSignal" }
+        ]
+      },
+      "PlanDetectorNotEvaluated": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference_too_small", "current_too_small", "count_overflow", "discontinuity", "not_applicable"],
+        "properties": {
+          "reference_too_small": { "type": "integer", "minimum": 0 },
+          "current_too_small": { "type": "integer", "minimum": 0 },
+          "count_overflow": { "type": "integer", "minimum": 0 },
+          "discontinuity": { "type": "integer", "minimum": 0 },
+          "not_applicable": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PlanDetectorCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["candidates", "positions", "evaluated", "stable", "changed", "not_evaluated"],
+        "properties": {
+          "candidates": { "type": "integer", "minimum": 0 },
+          "positions": { "type": "integer", "minimum": 0 },
+          "evaluated": { "type": "integer", "minimum": 0 },
+          "stable": { "type": "integer", "minimum": 0 },
+          "changed": { "type": "integer", "minimum": 0 },
+          "not_evaluated": { "$ref": "#/components/schemas/PlanDetectorNotEvaluated" }
+        }
+      },
+      "PlanQuality": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["snapshot_rows", "snapshots_total", "full_snapshots", "truncated_snapshots", "restricted_or_failed_snapshots", "coverage_unknown_snapshots", "support_pages_incomplete", "support_gap_ranges", "plan_gap_ranges", "invalid_support_rows", "snapshot_coverage_conflicts", "collection_coverage_missing", "collection_coverage_conflicts", "reset_metadata_conflicts", "instance_metadata_conflicts", "invalid_rows", "membership_boundaries", "plan_set_additions", "plan_set_removals", "counter_epoch_boundaries", "reset_boundaries", "plan_gap_intervals", "support_gap_intervals", "metadata_unknown_intervals", "extension_version_boundaries", "instance_boundaries", "instance_identity_unavailable_intervals", "unsupported_version_intervals", "query_id_disabled_intervals", "invalid_counter_intervals"],
+        "properties": {
+          "snapshot_rows": { "type": "integer", "minimum": 0 },
+          "snapshots_total": { "type": "integer", "minimum": 0 },
+          "full_snapshots": { "type": "integer", "minimum": 0 },
+          "truncated_snapshots": { "type": "integer", "minimum": 0 },
+          "restricted_or_failed_snapshots": { "type": "integer", "minimum": 0 },
+          "coverage_unknown_snapshots": { "type": "integer", "minimum": 0 },
+          "support_pages_incomplete": { "type": "integer", "minimum": 0 },
+          "support_gap_ranges": { "type": "integer", "minimum": 0 },
+          "plan_gap_ranges": { "type": "integer", "minimum": 0 },
+          "invalid_support_rows": { "type": "integer", "minimum": 0 },
+          "snapshot_coverage_conflicts": { "type": "integer", "minimum": 0 },
+          "collection_coverage_missing": { "type": "integer", "minimum": 0 },
+          "collection_coverage_conflicts": { "type": "integer", "minimum": 0 },
+          "reset_metadata_conflicts": { "type": "integer", "minimum": 0 },
+          "instance_metadata_conflicts": { "type": "integer", "minimum": 0 },
+          "invalid_rows": { "type": "integer", "minimum": 0 },
+          "membership_boundaries": { "type": "integer", "minimum": 0 },
+          "plan_set_additions": { "type": "integer", "minimum": 0 },
+          "plan_set_removals": { "type": "integer", "minimum": 0 },
+          "counter_epoch_boundaries": { "type": "integer", "minimum": 0 },
+          "reset_boundaries": { "type": "integer", "minimum": 0 },
+          "plan_gap_intervals": { "type": "integer", "minimum": 0 },
+          "support_gap_intervals": { "type": "integer", "minimum": 0 },
+          "metadata_unknown_intervals": { "type": "integer", "minimum": 0 },
+          "extension_version_boundaries": { "type": "integer", "minimum": 0 },
+          "instance_boundaries": { "type": "integer", "minimum": 0 },
+          "instance_identity_unavailable_intervals": { "type": "integer", "minimum": 0 },
+          "unsupported_version_intervals": { "type": "integer", "minimum": 0 },
+          "query_id_disabled_intervals": { "type": "integer", "minimum": 0 },
+          "invalid_counter_intervals": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PlanApplicability": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plan_distribution", "same_plan_buffers"],
+        "properties": {
+          "plan_distribution": { "type": "string", "enum": ["exact_queryid_identity", "mixed_compute_query_id", "not_applicable_compute_query_id_disabled", "unknown_compute_query_id_metadata", "not_applicable_queryid_not_in_identity"] },
+          "same_plan_buffers": { "type": "string", "const": "calls_normalized_identity" }
+        }
+      },
+      "PlanWork": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["performed", "required", "available"],
+        "properties": {
+          "performed": { "type": "integer", "minimum": 0 },
+          "required": { "type": "integer", "minimum": 0 },
+          "available": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PlanAnalysisTruncation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signals_dropped"],
+        "properties": {
+          "signals_dropped": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PlanAnalysis": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["family", "status", "complete", "applicability", "quality", "distribution", "buffers", "work", "truncation"],
+        "properties": {
+          "family": { "type": "string", "enum": ["ossc", "vadv"] },
+          "status": { "type": "string", "enum": ["source_absent", "work_limited", "complete", "partial"] },
+          "complete": { "type": "boolean" },
+          "applicability": { "$ref": "#/components/schemas/PlanApplicability" },
+          "quality": { "$ref": "#/components/schemas/PlanQuality" },
+          "distribution": { "$ref": "#/components/schemas/PlanDetectorCounts" },
+          "buffers": { "$ref": "#/components/schemas/PlanDetectorCounts" },
+          "work": { "$ref": "#/components/schemas/PlanWork" },
+          "truncation": { "$ref": "#/components/schemas/PlanAnalysisTruncation" }
+        }
+      },
+      "AnomalyNotEvaluated": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref_too_small", "cur_too_small", "all_no_data", "non_finite", "discontinuity"],
+        "properties": {
+          "ref_too_small": { "type": "integer", "minimum": 0 },
+          "cur_too_small": { "type": "integer", "minimum": 0 },
+          "all_no_data": { "type": "integer", "minimum": 0 },
+          "non_finite": { "type": "integer", "minimum": 0 },
+          "discontinuity": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "AnomalySectionCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["series_total", "evaluated", "not_evaluated", "nodata_points", "episodes_truncated"],
+        "properties": {
+          "series_total": { "type": "integer", "minimum": 0 },
+          "evaluated": { "type": "integer", "minimum": 0 },
+          "not_evaluated": { "$ref": "#/components/schemas/AnomalyNotEvaluated" },
+          "nodata_points": { "type": "integer", "minimum": 0 },
+          "episodes_truncated": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "AnomalyCoverage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sections_requested", "sections_scanned", "sections_skipped", "plan_sections_analyzed", "plan_positions_evaluated"],
+        "properties": {
+          "sections_requested": { "type": "integer", "minimum": 0 },
+          "sections_scanned": { "type": "integer", "minimum": 0 },
+          "sections_skipped": { "type": "integer", "minimum": 0 },
+          "plan_sections_analyzed": { "type": "integer", "minimum": 0 },
+          "plan_positions_evaluated": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "AnomalyTruncation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section_episodes_dropped", "global_episodes_dropped", "episodes_dropped_total", "section_plan_signals_dropped", "global_plan_signals_dropped", "plan_signals_dropped_total"],
+        "properties": {
+          "section_episodes_dropped": { "type": "integer", "minimum": 0 },
+          "global_episodes_dropped": { "type": "integer", "minimum": 0 },
+          "episodes_dropped_total": { "type": "integer", "minimum": 0 },
+          "section_plan_signals_dropped": { "type": "integer", "minimum": 0 },
+          "global_plan_signals_dropped": { "type": "integer", "minimum": 0 },
+          "plan_signals_dropped_total": { "type": "integer", "minimum": 0 }
+        }
+      },
       "AnomalyResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["source_id", "from", "to", "window_us", "step_us", "threshold", "eps_rel", "limit", "episodes", "sections", "skipped"],
+        "required": ["schema_version", "source_id", "from", "to", "window_us", "step_us", "threshold", "eps_rel", "limit", "status", "complete", "coverage", "truncation", "episodes", "plan_signals", "sections", "plan_analysis", "skipped"],
         "properties": {
+          "schema_version": { "type": "integer", "const": 1 },
           "source_id": { "type": "integer", "minimum": 0 },
           "from": { "type": "integer", "format": "int64" },
           "to": { "type": "integer", "format": "int64" },
@@ -862,9 +1252,15 @@
           "step_us": { "type": "integer", "format": "int64", "minimum": 1 },
           "threshold": { "type": "number", "minimum": 0 },
           "eps_rel": { "type": "number", "minimum": 0 },
-          "limit": { "type": "integer", "minimum": 0 },
-          "episodes": { "type": "array", "items": { "$ref": "#/components/schemas/NeutralObject" } },
-          "sections": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/NeutralObject" } },
+          "limit": { "type": "integer", "minimum": 0, "description": "Independent cap for generic episodes and specialized plan signals." },
+          "status": { "type": "string", "enum": ["no_data", "partial", "insufficient_data", "calm", "signals_detected"] },
+          "complete": { "type": "boolean" },
+          "coverage": { "$ref": "#/components/schemas/AnomalyCoverage" },
+          "truncation": { "$ref": "#/components/schemas/AnomalyTruncation" },
+          "episodes": { "type": "array", "items": { "$ref": "#/components/schemas/AnomalyEpisode" } },
+          "plan_signals": { "type": "array", "items": { "$ref": "#/components/schemas/PlanSignal" } },
+          "sections": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/AnomalySectionCounts" } },
+          "plan_analysis": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/PlanAnalysis" } },
           "skipped": { "type": "array", "items": { "$ref": "#/components/schemas/SectionReason" } }
         }
       },
