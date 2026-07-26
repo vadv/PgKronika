@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
@@ -128,6 +129,7 @@ struct QualificationArtifact {
     accounting: Accounting,
     budgets: Budgets,
     modes: Vec<ModeResult>,
+    compact_performance: CompactPerformanceProfile,
     acceptance: Vec<AcceptanceEvidence>,
     limitations: Vec<&'static str>,
 }
@@ -299,6 +301,22 @@ struct ModeResult {
     syscalls: SyscallCounts,
 }
 
+#[derive(Debug, Serialize)]
+struct CompactPerformanceProfile {
+    semantics: &'static str,
+    modes: Vec<CompactModeResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactModeResult {
+    mode: &'static str,
+    iterations: usize,
+    wall_p50_ns: u128,
+    wall_p95_ns: u128,
+    wall_p99_ns: u128,
+    samples_ns: Vec<u128>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 struct SyscallCounts {
     process_scope: bool,
@@ -377,6 +395,7 @@ fn run_coordinator(output: &Path) {
         fs::metadata(profile_root.join("dense-hour.ovf")).expect("stat profile sidecar");
 
     let accounting = accounting(&facts, &file, encoded.len(), &sidecar_meta);
+    let compact_performance = compact_performance(&runtime_root, &dense, &facts);
     let artifact = QualificationArtifact {
         schema: ARTIFACT_SCHEMA,
         git_head: command_output("git", &["rev-parse", "HEAD"]),
@@ -398,6 +417,7 @@ fn run_coordinator(output: &Path) {
         budgets: budgets(&accounting),
         accounting,
         modes,
+        compact_performance,
         acceptance: acceptance_evidence(),
         limitations: vec![
             "storage-cold/page-cache-cold is not measured or claimed",
@@ -553,10 +573,11 @@ async fn run_worker(mode: &str, root: &Path) -> WorkerOutcome {
 
 async fn http_cold(root: &Path, restart: bool) -> WorkerOutcome {
     let state = state(root, &OverviewConfig::new());
+    let service = qualification_service(state.clone());
     let before = state.overview_loader.qualification_snapshot();
     let measurement = Measurement::start();
     let body = request_json(
-        state.clone(),
+        &service,
         &format!(
             "/v1/timeline/overview?source={SOURCE_ID}&from=1000000&to={}",
             dense_end()
@@ -589,14 +610,15 @@ async fn http_cold(root: &Path, restart: bool) -> WorkerOutcome {
 
 async fn process_hot(root: &Path) -> WorkerOutcome {
     let state = state(root, &OverviewConfig::new());
+    let service = qualification_service(state.clone());
     let uri = format!(
         "/v1/timeline/overview?source={SOURCE_ID}&from=1000000&to={}",
         dense_end()
     );
-    drop(request_json(state.clone(), &uri).await);
+    drop(request_json(&service, &uri).await);
     let before = state.overview_loader.qualification_snapshot();
     let measurement = Measurement::start();
-    let body = request_json(state.clone(), &uri).await;
+    let body = request_json(&service, &uri).await;
     let after = state.overview_loader.qualification_snapshot();
     let work = loader_work(&before, &after, 1, body.len(), SAMPLES);
     assert_eq!(work.pgm_body_reads, 0, "a process-hot hit read PGM bodies");
@@ -611,9 +633,10 @@ async fn process_hot(root: &Path) -> WorkerOutcome {
 
 async fn range_cold(root: &Path) -> WorkerOutcome {
     let state = state(root, &OverviewConfig::new());
+    let service = qualification_service(state.clone());
     drop(
         request_json(
-            state.clone(),
+            &service,
             &format!(
                 "/v1/timeline/overview?source={SOURCE_ID}&from=1000000&to={}",
                 dense_end()
@@ -634,7 +657,7 @@ async fn range_cold(root: &Path) -> WorkerOutcome {
     let before = state.overview_loader.qualification_snapshot();
     let measurement = Measurement::start();
     let body = request_json(
-        state.clone(),
+        &service,
         "/v1/timeline/health?source=7&from=61000000&to=361000000&step=30000000",
     )
     .await;
@@ -802,6 +825,7 @@ async fn concurrent_disjoint(root: &Path) -> WorkerOutcome {
 
 async fn live_mode(root: &Path) -> WorkerOutcome {
     let state = state(root, &OverviewConfig::new());
+    let service = qualification_service(state.clone());
     let before_loader = state.overview_loader.qualification_snapshot();
     let before_live = live_stats(&state);
     let second = lifecycle_part(dense_end() + 20, 42);
@@ -845,7 +869,7 @@ async fn live_mode(root: &Path) -> WorkerOutcome {
         .republish_store_view(snapshot, &delta)
         .expect("publish appended live view");
     let body = request_json(
-        state.clone(),
+        &service,
         &format!(
             "/v1/timeline/events?source={SOURCE_ID}&from=1000000&to={}&limit=100",
             dense_end() + 100
@@ -1100,9 +1124,14 @@ fn state(root: &Path, config: &OverviewConfig) -> AppState {
     .expect("build qualification state")
 }
 
-async fn request_json(state: AppState, uri: &str) -> Vec<u8> {
+fn qualification_service(state: AppState) -> Router {
     let recorder = PrometheusBuilder::new().build_recorder();
-    let response = app(state, None, recorder.handle())
+    app(state, None, recorder.handle())
+}
+
+async fn request_json(service: &Router, uri: &str) -> Vec<u8> {
+    let response = service
+        .clone()
         .oneshot(
             Request::builder()
                 .uri(uri)
@@ -1367,6 +1396,130 @@ fn mode_result(
             .unwrap_or(0),
         samples,
         syscalls,
+    }
+}
+
+fn compact_performance(
+    runtime_root: &Path,
+    dense: &[u8],
+    expected: &SegmentFacts,
+) -> CompactPerformanceProfile {
+    let root = runtime_root.join("compact-performance");
+    fs::create_dir(&root).expect("create compact performance root");
+    let context = SegmentContext::new("dense-hour.pgm").expect("compact context");
+    let restart_root = root.join("restart-warm");
+    fs::create_dir(&restart_root).expect("create compact restart root");
+    fs::write(restart_root.join("dense-hour.pgm"), dense).expect("write compact restart PGM");
+    FactStore::new(&restart_root)
+        .publish(expected, &context, &LIMIT)
+        .expect("seed compact restart facts");
+    let full_range = CoverageSpan::new(1_000_000, dense_end()).expect("compact full range");
+    let derived_roots = (0..iterations())
+        .map(|iteration| {
+            let data_dir = root.join(format!("derived-cold-{iteration:02}"));
+            fs::create_dir(&data_dir).expect("create compact derived root");
+            fs::write(data_dir.join("dense-hour.pgm"), dense).expect("write compact derived PGM");
+            data_dir
+        })
+        .collect::<Vec<_>>();
+
+    let derived = measure_compact("derived-cold", |iteration| {
+        let data_dir = &derived_roots[iteration];
+        let snapshot = LocalDirSnapshot::open(data_dir).expect("open compact derived snapshot");
+        let descriptor = snapshot.sealed_descriptors()[0];
+        let context = snapshot
+            .sealed_context(&descriptor)
+            .expect("compact derived context");
+        let unit = snapshot
+            .open_sealed_by_descriptor(&descriptor)
+            .expect("open compact derived PGM");
+        let loaded = FactStore::new(data_dir)
+            .load_or_build(&unit, &context, &LIMIT)
+            .expect("compact derived build");
+        assert_eq!(
+            loaded.origin(),
+            FactOrigin::Rebuilt,
+            "compact derived path did not rebuild"
+        );
+        assert_eq!(loaded.facts(), expected, "compact derived facts diverged");
+        std::hint::black_box(
+            loaded
+                .facts()
+                .query(full_range, ORACLE_LIMITS)
+                .expect("compact derived query"),
+        );
+    });
+    let restart = measure_compact("restart-warm", |_iteration| {
+        let snapshot =
+            LocalDirSnapshot::open(&restart_root).expect("open compact restart snapshot");
+        let descriptor = snapshot.sealed_descriptors()[0];
+        let context = snapshot
+            .sealed_context(&descriptor)
+            .expect("compact restart context");
+        let unit = snapshot
+            .open_sealed_by_descriptor(&descriptor)
+            .expect("open compact restart PGM");
+        let loaded = FactStore::new(&restart_root)
+            .load_or_build(&unit, &context, &LIMIT)
+            .expect("compact restart read");
+        assert_eq!(
+            loaded.origin(),
+            FactOrigin::CacheHit,
+            "compact restart path did not read durable facts"
+        );
+        assert_eq!(
+            loaded.pgm_body_read_stats().read_calls,
+            0,
+            "compact restart path read PGM bodies"
+        );
+        assert_eq!(loaded.facts(), expected, "compact restart facts diverged");
+        std::hint::black_box(
+            loaded
+                .facts()
+                .query(full_range, ORACLE_LIMITS)
+                .expect("compact restart query"),
+        );
+    });
+    let process_hot = measure_compact("process-hot", |_iteration| {
+        std::hint::black_box(
+            expected
+                .query(full_range, ORACLE_LIMITS)
+                .expect("compact process-hot query"),
+        );
+    });
+    let range_cold = measure_compact("range-cold/facts-warm", |iteration| {
+        let offset = i64::try_from(iteration % 60).expect("compact iteration fits") * CADENCE_US;
+        let range = CoverageSpan::new(1_000_000 + offset, 1_000_000 + offset + 300_000_000)
+            .expect("compact partial range");
+        std::hint::black_box(
+            expected
+                .query(range, ORACLE_LIMITS)
+                .expect("compact range query"),
+        );
+    });
+
+    CompactPerformanceProfile {
+        semantics: "compact sealed facts read + bucket; excludes router, HTTP, JSON, and server bootstrap",
+        modes: vec![derived, restart, process_hot, range_cold],
+    }
+}
+
+fn measure_compact(mode: &'static str, mut operation: impl FnMut(usize)) -> CompactModeResult {
+    let mut samples = Vec::with_capacity(iterations());
+    for iteration in 0..iterations() {
+        let started = Instant::now();
+        operation(iteration);
+        samples.push(started.elapsed().as_nanos());
+    }
+    let mut sorted = samples.clone();
+    sorted.sort_unstable();
+    CompactModeResult {
+        mode,
+        iterations: samples.len(),
+        wall_p50_ns: percentile(&sorted, 50),
+        wall_p95_ns: percentile(&sorted, 95),
+        wall_p99_ns: percentile(&sorted, 99),
+        samples_ns: samples,
     }
 }
 

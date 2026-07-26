@@ -33,7 +33,7 @@ coordinates listed after the table.
 | 15 | `admission-singleflight-bounds` | `concurrent-identical`; `concurrent-disjoint`; decoded and durable admission-bypass tests; `same_fact_key_with_distinct_lineages_runs_independently`; request and waiter cancellation tests | IMPLEMENTED |
 | 16 | `memory-fallback-recovery` | `memory-only`; `production_fallback_enforces_lru_hour_byte_and_oversized_budgets`; `backoff_suppresses_a_second_publication_attempt`; `publication_failure_returns_fresh_facts_then_serves_the_fallback`; `lifecycle[15..18]` | IMPLEMENTED |
 | 17 | `quota-gc-safety` | exact quota and optional-quota tests; owner contention; reopened-inode accounting; source/symlink preservation; concurrent live GC; complete live-set sibling preservation; `lifecycle[15..18]` | IMPLEMENTED |
-| 18 | `nine-modes-one-profile` | exact `all-nine-modes` set: `derived-cold`, `restart-warm`, `process-hot`, `range-cold/facts-warm`, `live`, `concurrent-identical`, `concurrent-disjoint`, `memory-only`, `oracle-profile` | IMPLEMENTED |
+| 18 | `nine-modes-one-profile` | exact `all-nine-modes` endpoint set: `derived-cold`, `restart-warm`, `process-hot`, `range-cold/facts-warm`, `live`, `concurrent-identical`, `concurrent-disjoint`, `memory-only`, `oracle-profile`; separate §18.4.6 compact performance profile with all raw samples retained | IMPLEMENTED |
 
 The BDD manifest contains exactly eight scenarios:
 

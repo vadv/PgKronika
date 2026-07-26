@@ -93,7 +93,7 @@ jobs:
             echo "- run attempt: \`${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}\`"
             echo "- raw artifact: \`overview-qualification-raw\`"
             echo
-            echo 'Nine production-path modes and their raw process, I/O, syscall, accounting, concurrency, recovery, and latency evidence passed preliminary validation.'
+            echo 'Nine production endpoint modes plus the §18.4.6 compact performance profile, with raw process, I/O, syscall, accounting, concurrency, recovery, and latency evidence, passed preliminary validation.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:

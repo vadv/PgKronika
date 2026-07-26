@@ -52,6 +52,7 @@ RAW_FIELDS = {
     "accounting",
     "budgets",
     "modes",
+    "compact_performance",
     "acceptance",
     "limitations",
 }

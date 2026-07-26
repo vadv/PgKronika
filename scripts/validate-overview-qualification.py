@@ -24,6 +24,13 @@ MODES = (
     "oracle-profile",
 )
 
+COMPACT_MODES = (
+    "derived-cold",
+    "restart-warm",
+    "process-hot",
+    "range-cold/facts-warm",
+)
+
 REQUIREMENTS = (
     "restart-warm-zero-pgm",
     "raw-index-all-families",
@@ -1313,7 +1320,105 @@ def validate_modes(
             failures,
         )
 
-    if final and set(rows) == set(MODES):
+
+def validate_compact_performance(
+    profile: dict[str, object], final: bool, failures: list[str]
+) -> None:
+    exact_fields(
+        profile,
+        {"semantics", "modes"},
+        "compact performance profile",
+        failures,
+    )
+    check(
+        profile.get("semantics")
+        == (
+            "compact sealed facts read + bucket; excludes router, HTTP, JSON, "
+            "and server bootstrap"
+        ),
+        "compact performance profile has the wrong semantics",
+        failures,
+    )
+    raw_modes = as_list(
+        profile.get("modes"), "compact performance modes", failures
+    )
+    rows: dict[str, dict[str, object]] = {}
+    iterations_by_mode: dict[str, int] = {}
+    for index, raw_row in enumerate(raw_modes):
+        row = as_mapping(raw_row, f"compact mode row {index}", failures)
+        exact_fields(
+            row,
+            {
+                "mode",
+                "iterations",
+                "wall_p50_ns",
+                "wall_p95_ns",
+                "wall_p99_ns",
+                "samples_ns",
+            },
+            f"compact mode row {index}",
+            failures,
+        )
+        mode = row.get("mode")
+        check(
+            isinstance(mode, str) and mode in COMPACT_MODES,
+            f"compact mode row {index} has an unknown mode",
+            failures,
+        )
+        if not isinstance(mode, str) or mode not in COMPACT_MODES:
+            continue
+        check(mode not in rows, f"compact mode {mode} is duplicated", failures)
+        rows[mode] = row
+        iterations = nonnegative_integer(
+            row.get("iterations"),
+            f"compact {mode} iterations",
+            failures,
+            positive=True,
+        )
+        samples = [
+            nonnegative_integer(
+                sample,
+                f"compact {mode} sample {sample_index}",
+                failures,
+                positive=True,
+            )
+            for sample_index, sample in enumerate(
+                as_list(row.get("samples_ns"), f"compact {mode} samples", failures)
+            )
+        ]
+        iterations_by_mode[mode] = iterations
+        check(
+            iterations == len(samples),
+            f"compact {mode} iteration count differs from its samples",
+            failures,
+        )
+        check(
+            (iterations == 20) if final else (1 <= iterations <= 20),
+            f"compact {mode} does not have {'exactly 20' if final else '1..20'} samples",
+            failures,
+        )
+        if samples:
+            for field, percent in (
+                ("wall_p50_ns", 50),
+                ("wall_p95_ns", 95),
+                ("wall_p99_ns", 99),
+            ):
+                check(
+                    row.get(field) == percentile(samples, percent),
+                    f"compact {mode} {field} is not the exact sample percentile",
+                    failures,
+                )
+
+    check(
+        set(rows) == set(COMPACT_MODES) and len(raw_modes) == len(COMPACT_MODES),
+        "artifact does not contain the exact compact performance modes",
+        failures,
+    )
+    enforce_ratios = final or (
+        set(iterations_by_mode) == set(COMPACT_MODES)
+        and all(iterations == 20 for iterations in iterations_by_mode.values())
+    )
+    if enforce_ratios and set(rows) == set(COMPACT_MODES):
         cold = rows["derived-cold"].get("wall_p95_ns", 0)
         restart = rows["restart-warm"].get("wall_p95_ns", 0)
         hot = rows["process-hot"].get("wall_p95_ns", 0)
@@ -1321,17 +1426,17 @@ def validate_modes(
         if all(is_integer(value) for value in (cold, restart, hot, ranged)):
             check(
                 hot * 4 <= cold,
-                "process-hot p95 exceeds 25% of derived-cold",
+                "compact process-hot p95 exceeds 25% of derived-cold",
                 failures,
             )
             check(
                 restart * 4 <= cold,
-                "restart-warm p95 exceeds 25% of derived-cold",
+                "compact restart-warm p95 exceeds 25% of derived-cold",
                 failures,
             )
             check(
                 ranged * 2 <= cold,
-                "range-cold/facts-warm p95 exceeds 50% of derived-cold",
+                "compact range-cold/facts-warm p95 exceeds 50% of derived-cold",
                 failures,
             )
 
@@ -1729,6 +1834,7 @@ def main() -> int:
         "accounting",
         "budgets",
         "modes",
+        "compact_performance",
         "acceptance",
         "limitations",
     }
@@ -1781,6 +1887,15 @@ def main() -> int:
     )
     validate_modes(
         as_list(artifact.get("modes"), "qualification modes", failures),
+        args.final,
+        failures,
+    )
+    validate_compact_performance(
+        as_mapping(
+            artifact.get("compact_performance"),
+            "compact performance profile",
+            failures,
+        ),
         args.final,
         failures,
     )

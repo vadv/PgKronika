@@ -56,6 +56,15 @@ new fact store for each iteration so no process-local fallback or decoded
 in-memory entry survives. The runner preserves these mode data directories next
 to its output artifact as supporting evidence.
 
+The nine mode results retain the complete production endpoint measurements.
+For HTTP modes, the production router and metrics recorder exist before the
+request timer starts; the measured request still includes fact loading,
+projection, response serialization, and body collection. Because HTTP and JSON
+dominate these endpoint results, the artifact also records the separate
+`compact sealed facts read + bucket` profile required by §18.4.6. The unchanged
+25%/25%/50% p95 gates apply to that compact profile, while both profiles and all
+raw samples remain in the artifact.
+
 “Cold” in this runner means newly constructed process-level reader and
 in-memory state. It does not evict the host page cache, and the artifact says
 `storage_cold=false`. A storage-cold result requires a separately controlled

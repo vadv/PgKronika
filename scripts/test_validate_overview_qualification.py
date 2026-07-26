@@ -318,6 +318,39 @@ def mode_row(mode: str, *, iterations: int = 1) -> dict[str, object]:
     }
 
 
+def compact_mode_row(
+    mode: str, *, iterations: int = 1, wall_ns: int | None = None
+) -> dict[str, object]:
+    if wall_ns is None:
+        wall_ns = {
+            "derived-cold": 100,
+            "restart-warm": 20,
+            "process-hot": 20,
+            "range-cold/facts-warm": 40,
+        }[mode]
+    return {
+        "mode": mode,
+        "iterations": iterations,
+        "wall_p50_ns": wall_ns,
+        "wall_p95_ns": wall_ns,
+        "wall_p99_ns": wall_ns,
+        "samples_ns": [wall_ns] * iterations,
+    }
+
+
+def compact_performance_profile(*, iterations: int = 1) -> dict[str, object]:
+    return {
+        "semantics": (
+            "compact sealed facts read + bucket; excludes router, HTTP, JSON, "
+            "and server bootstrap"
+        ),
+        "modes": [
+            compact_mode_row(mode, iterations=iterations)
+            for mode in VALIDATOR.COMPACT_MODES
+        ],
+    }
+
+
 def acceptance_rows(*, final: bool = False) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for index, (requirement, evidence) in enumerate(
@@ -352,13 +385,24 @@ class ModeValidationTests(unittest.TestCase):
         )
         self.assertEqual(failures, [])
 
-    def test_final_profile_requires_twenty_samples_and_performance_ratios(self) -> None:
+    def test_final_profile_requires_twenty_samples(self) -> None:
         failures: list[str] = []
         VALIDATOR.validate_modes(
             [mode_row(mode, iterations=20) for mode in VALIDATOR.MODES],
             True,
             failures,
         )
+        self.assertEqual(failures, [])
+
+    def test_endpoint_timings_are_retained_without_compact_ratio_gating(self) -> None:
+        rows = [mode_row(mode, iterations=20) for mode in VALIDATOR.MODES]
+        restart = rows[1]
+        for sample in restart["samples"]:
+            sample["wall_ns"] = 80
+        for field in ("wall_p50_ns", "wall_p95_ns", "wall_p99_ns"):
+            restart[field] = 80
+        failures: list[str] = []
+        VALIDATOR.validate_modes(rows, True, failures)
         self.assertEqual(failures, [])
 
     def test_restart_pgm_body_read_is_rejected(self) -> None:
@@ -385,6 +429,53 @@ class ModeValidationTests(unittest.TestCase):
         self.assertIn(
             "live did not retain the exact four-byte incomplete tail", failures
         )
+
+
+class CompactPerformanceValidationTests(unittest.TestCase):
+    def test_preliminary_profile_accepts_one_sample_per_mode(self) -> None:
+        failures: list[str] = []
+        VALIDATOR.validate_compact_performance(
+            compact_performance_profile(), False, failures
+        )
+        self.assertEqual(failures, [])
+
+    def test_final_profile_requires_twenty_samples_and_exact_ratios(self) -> None:
+        failures: list[str] = []
+        VALIDATOR.validate_compact_performance(
+            compact_performance_profile(iterations=20), True, failures
+        )
+        self.assertEqual(failures, [])
+
+    def test_complete_preliminary_profile_enforces_exact_ratios(self) -> None:
+        cases = (
+            (
+                1,
+                "restart-warm",
+                26,
+                "compact restart-warm p95 exceeds 25% of derived-cold",
+            ),
+            (
+                2,
+                "process-hot",
+                26,
+                "compact process-hot p95 exceeds 25% of derived-cold",
+            ),
+            (
+                3,
+                "range-cold/facts-warm",
+                51,
+                "compact range-cold/facts-warm p95 exceeds 50% of derived-cold",
+            ),
+        )
+        for index, mode, wall_ns, expected_failure in cases:
+            with self.subTest(mode=mode):
+                profile = compact_performance_profile(iterations=20)
+                profile["modes"][index] = compact_mode_row(
+                    mode, iterations=20, wall_ns=wall_ns
+                )
+                failures: list[str] = []
+                VALIDATOR.validate_compact_performance(profile, False, failures)
+                self.assertIn(expected_failure, failures)
 
 
 class AcceptanceEvidenceTests(unittest.TestCase):
@@ -435,6 +526,7 @@ def raw_finalization_input() -> dict[str, object]:
         "accounting": {},
         "budgets": {},
         "modes": [],
+        "compact_performance": compact_performance_profile(iterations=20),
         "acceptance": acceptance_rows(),
         "limitations": [],
     }
