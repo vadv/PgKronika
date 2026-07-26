@@ -1,57 +1,63 @@
 # Класс 1: ОС и cgroup
 
-ОС-источники занимают диапазон `1_100_001` - `1_299_999`.
+ОС-источники занимают диапазон `1_100_001`–`1_299_999`. Точные схемы и
+семантика объявлены в
+[`crates/kronika-registry/src/codec`](../../crates/kronika-registry/src/codec);
+этот файл объясняет назначение полей и ограничения сбора.
 
-**Реализовано (Wave 1):** `1_102_001`-`1_107_001` (CPU, stat-прочее, meminfo,
-loadavg, vmstat, PSI). Каждая строка несёт колонку `scope` (`u8`:
-`0=host, 1=pod, 2=pod_net, 3=container, 4=unknown`); в Wave 1 procfs-core
-файлы протекают host-wide в контейнере, поэтому их `scope` = `host`.
-Корень procfs переопределяется `KRONIKA_PROC_ROOT` (по умолчанию `/proc`),
-период — `KRONIKA_OS_CORE_INTERVAL_S` (по умолчанию 10 с).
+Каждая строка содержит `scope`:
 
-**Реализовано (Wave 2):** `1_108_001`-`1_113_001` (diskstats, net/dev,
-net/snmp, net/netstat, mountinfo, topology). Scope-значения: diskstats
-(`1_108_001`), mountinfo (`1_112_001`) и topology (`1_113_001`) несут
-`scope=host` (данные уровня устройства/узла); сетевые секции (`1_109_001`,
-`1_110_001`, `1_111_001`) несут `scope=pod_net`, когда обнаружен контейнер
-(через cgroup), иначе `scope=host`.
+| Код | Область |
+| ---: | --- |
+| `0` | узел (`host`) |
+| `1` | pod |
+| `2` | сетевое пространство pod (`pod_net`) |
+| `3` | контейнер |
+| `4` | область не определена |
 
-**Реализовано (Wave 3):** `1_100_001`, `1_101_001`, `1_200_001`-`1_204_001`
-(processes, process status, PID-to-cgroup mapping, cgroup cpu/memory/io/pids).
-Эти секции несут `scope=container`, когда коллектор сам запущен в контейнере,
-иначе `scope=host`. Корень sysfs переопределяется `KRONIKA_SYS_ROOT`
-(по умолчанию `/sys`).
+CPU, память, диски, точки монтирования и topology описывают узел даже при
+запуске коллектора в контейнере. Сетевые секции получают `pod_net`, если
+контейнерное окружение доказано через cgroup. Процессы и cgroup получают
+`container` при запуске коллектора в контейнере, иначе `host`.
+
+Корни файловых систем можно переопределить через `KRONIKA_PROC_ROOT`
+(по умолчанию `/proc`) и `KRONIKA_SYS_ROOT` (по умолчанию `/sys`).
 
 ## Сводная таблица
 
-| `type_id` | Источник | Период | Семантика | Сортировка |
-|-----------|----------|----------|-----------|------------|
-| `1_100_001` | processes, горячий набор | 5 с | `snapshot_full` | `(pid, starttime, ts)` |
-| `1_101_001` | `/proc/PID/status`, расширенный набор | 30 с | `snapshot_full` | `(pid, starttime, ts)` |
-| `1_102_001` | `/proc/stat`: CPU | базовый шаг | `snapshot_full` | `(cpu_id, ts)` |
-| `1_103_001` | `/proc/stat`: прочее | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_104_001` | `/proc/meminfo` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_105_001` | `/proc/loadavg` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_106_001` | `/proc/vmstat` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_107_001` | `/proc/pressure/*` | базовый шаг | `snapshot_full` | `(resource, ts)` |
-| `1_108_001` | `/proc/diskstats` | базовый шаг | `snapshot_full` | `(major, minor, ts)` |
-| `1_109_001` | `/proc/net/dev` | базовый шаг | `snapshot_full` | `(iface, ts)` |
-| `1_110_001` | `/proc/net/snmp` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_111_001` | `/proc/net/netstat` | базовый шаг | `snapshot_full` | `(ts)` |
-| `1_112_001` | `mountinfo` | сегмент + по изменению | `on_change` | `(major, minor, mount_point, ts)` |
-| `1_113_001` | `cpuinfo` / topology | сегмент + по изменению | `on_change` | `(cpu_id, ts)` |
-| `1_200_001` | cgroup: process mapping | 30 с | `snapshot_full` | `(pid, starttime, ts)` |
-| `1_201_001` | cgroup: cpu | базовый шаг | `snapshot_full` | `(cgroup_path, ts)` |
-| `1_202_001` | cgroup: memory | базовый шаг | `snapshot_full` | `(cgroup_path, ts)` |
-| `1_203_001` | cgroup: io | базовый шаг | `snapshot_full` | `(cgroup_path, major, minor, ts)` |
-| `1_204_001` | cgroup: pids | базовый шаг | `snapshot_full` | `(cgroup_path, ts)` |
+| `type_id` | Источник | Семантика | Сортировка |
+|-----------|----------|-----------|------------|
+| `1_100_001` | processes, горячий набор | `snapshot_full` | `(pid, starttime, ts)` |
+| `1_101_001` | `/proc/PID/status`, расширенный набор | `snapshot_full` | `(pid, starttime, ts)` |
+| `1_102_001` | `/proc/stat`: CPU | `snapshot_full` | `(cpu_id, ts)` |
+| `1_103_001` | `/proc/stat`: прочее | `snapshot_full` | `(ts)` |
+| `1_104_001` | `/proc/meminfo` | `snapshot_full` | `(ts)` |
+| `1_105_001` | `/proc/loadavg` | `snapshot_full` | `(ts)` |
+| `1_106_001` | `/proc/vmstat` | `snapshot_full` | `(ts)` |
+| `1_107_001` | `/proc/pressure/*` | `snapshot_full` | `(resource, ts)` |
+| `1_108_001` | `/proc/diskstats` | `snapshot_full` | `(major, minor, ts)` |
+| `1_109_001` | `/proc/net/dev` | `snapshot_full` | `(iface, ts)` |
+| `1_110_001` | `/proc/net/snmp` | `snapshot_full` | `(ts)` |
+| `1_111_001` | `/proc/net/netstat` | `snapshot_full` | `(ts)` |
+| `1_112_001` | `mountinfo` | `on_change` | `(major, minor, mount_point, ts)` |
+| `1_113_001` | `cpuinfo` / topology | `on_change` | `(cpu_id, ts)` |
+| `1_200_001` | cgroup: process mapping | `snapshot_full` | `(pid, starttime, ts)` |
+| `1_201_001` | cgroup: cpu | `snapshot_full` | `(cgroup_path, ts)` |
+| `1_202_001` | cgroup: memory | `snapshot_full` | `(cgroup_path, ts)` |
+| `1_203_001` | cgroup: io | `snapshot_full` | `(cgroup_path, major, minor, ts)` |
+| `1_204_001` | cgroup: pids | `snapshot_full` | `(cgroup_path, ts)` |
 
-Периоды Wave 3 управляются отдельно:
+Период не является частью контракта `type_id`. Его задаёт планировщик
+коллектора:
 
-- `KRONIKA_OS_PROCESS_INTERVAL_S`, по умолчанию 5 с;
-- `KRONIKA_OS_PROCESS_STATUS_INTERVAL_S`, по умолчанию 30 с;
-- `KRONIKA_OS_CGROUP_INTERVAL_S`, по умолчанию 10 с;
-- `KRONIKA_OS_CGROUP_MAPPING_INTERVAL_S`, по умолчанию 30 с.
+| Переменная | Секции | По умолчанию |
+| --- | --- | ---: |
+| `KRONIKA_OS_CORE_INTERVAL_S` | `1_102`–`1_111` | 10 с |
+| `KRONIKA_OS_MOUNTTOPO_INTERVAL_S` | `1_112`, `1_113` | 60 с |
+| `KRONIKA_OS_PROCESS_INTERVAL_S` | `1_100` | 5 с |
+| `KRONIKA_OS_PROCESS_STATUS_INTERVAL_S` | `1_101` | 30 с |
+| `KRONIKA_OS_CGROUP_INTERVAL_S` | `1_201`–`1_204` | 10 с |
+| `KRONIKA_OS_CGROUP_MAPPING_INTERVAL_S` | `1_200` | 30 с |
 
 ## Бюджеты и права доступа
 
@@ -62,10 +68,9 @@ net/snmp, net/netstat, mountinfo, topology). Scope-значения: diskstats
 - `KRONIKA_OS_MAX_CGROUP_IO_ROWS`, по умолчанию 4096;
 - `KRONIKA_OS_CGROUP_MAX_DEPTH`, по умолчанию 8.
 
-Если лимит сработал, коллектор не должен молча выдавать частичный снимок как
-полный. Для частичного сбора пишется `collection_degraded` с `reason` и
-числом отброшенных строк. Отдельный лимит времени чтения `/proc` и `/sys`
-оставлен для будущей версии.
+Если лимит сработал, коллектор пишет структурированное событие
+`collection_degraded` с причиной и числом отброшенных строк. Это запись
+служебного журнала коллектора, а не отдельная секция PGM.
 
 Права доступа:
 
@@ -74,7 +79,7 @@ net/snmp, net/netstat, mountinfo, topology). Scope-значения: diskstats
 | `/proc/PID/io` | чужой uid, `hidepid`, Yama, SELinux/AppArmor, container PID namespace | недоступные io-колонки пишутся `NULL`, не `0` |
 | `/proc/PID/cmdline` | процесс исчез или доступ закрыт | `cmdline = NULL`, строка процесса может остаться |
 | `/sys/fs/cgroup` | rootless/container mode, отсутствующий контроллер, нестандартный mount layout | nullable-поля пишутся `NULL`; отсутствующий контроллер пропускается, а не имитируется строкой |
-| обход логов, cgroup и `/proc` | тайм-аут или отказ в доступе | событие/метрика коллектора с указанием источника |
+| обход cgroup и `/proc` | ошибка чтения или отказ в доступе | `collection_degraded` с указанием источника; затронутая секция или строка пропускается |
 
 ## `1_100_001` processes, горячий набор
 
@@ -132,7 +137,7 @@ read_bytes              i64?  C
 write_bytes             i64?  C
 cancelled_write_bytes   i64?  C
 exit_signal             i32   L
-scope                   u8    L   // 0=host или 3=container в Wave 3
+scope                   u8    L   // 0=host или 3=container
 ```
 
 `utime` и `stime` хранятся в единицах планировщика (`ticks`). Значение `hz`
@@ -159,10 +164,8 @@ threads                     u32   G
 fdsize                      u32   G
 voluntary_ctxt_switches     i64   C
 nonvoluntary_ctxt_switches  i64   C
-scope                       u8    L   // 0=host или 3=container в Wave 3
+scope                       u8    L   // 0=host или 3=container
 ```
-
-Кандидаты для будущих версий: число fd, `wchan`, `oom_score`.
 
 ## `1_102_001` `/proc/stat`: CPU
 
@@ -179,7 +182,7 @@ softirq     i64  C
 steal       i64  C
 guest       i64  C
 guest_nice  i64  C
-scope       u8   L   // 0=host в Wave 1
+scope       u8   L   // 0=host
 ```
 
 Значения хранятся в единицах планировщика (`ticks`).
@@ -193,14 +196,14 @@ processes      i64  C   // forks
 procs_running  i64  G
 procs_blocked  i64  G
 btime          ts   G   // unix microseconds
-scope          u8   L   // 0=host в Wave 1
+scope          u8   L   // 0=host
 ```
 
 `procs_blocked` полезен как быстрый индикатор D-state и возможного IO-затыка.
 
 ## `1_104_001` `/proc/meminfo`
 
-Wave 1 пишет поля ниже. `MemTotal` обязателен; остальные ключи, отсутствующие в
+`MemTotal` обязателен; остальные ключи, отсутствующие в
 ядре, пишутся как `NULL`. Значения в КБ, кроме `HugePages_*`, где исходное
 значение измеряется в штуках.
 
@@ -229,7 +232,7 @@ committed_as       i64? G
 huge_pages_total   i64? G
 huge_pages_free    i64? G
 hugepagesize       i64? G
-scope              u8   L   // 0=host в Wave 1
+scope              u8   L   // 0=host
 ```
 
 ## `1_105_001` `/proc/loadavg`
@@ -241,7 +244,7 @@ load5   f64  G
 load15  f64  G
 running i32  G
 total   i32  G
-scope   u8   L   // 0=host в Wave 1
+scope   u8   L   // 0=host
 ```
 
 ## `1_106_001` `/proc/vmstat`
@@ -262,7 +265,7 @@ pgsteal_direct  i64? C
 pgscan_kswapd   i64? C
 pgscan_direct   i64? C
 oom_kill        i64? C
-scope           u8   L   // 0=host в Wave 1
+scope           u8   L   // 0=host
 ```
 
 Остальные ключи добавляются как необязательные колонки текущей версии, если это
@@ -281,7 +284,7 @@ full_avg10    f64? G   // NULL для cpu
 full_avg60    f64? G   // NULL для cpu
 full_avg300   f64? G   // NULL для cpu
 full_total    i64? C   // NULL для cpu
-scope         u8   L   // 0=host в Wave 1
+scope         u8   L   // 0=host
 ```
 
 ## `1_108_001` `/proc/diskstats`
@@ -311,7 +314,7 @@ discard_sectors      i64?  C
 discard_time_ms      i64?  C
 flushes              i64?  C
 flush_time_ms        i64?  C
-scope                u8    L   // 0=host в Wave 2
+scope                u8    L   // 0=host
 ```
 
 ## `1_109_001` `/proc/net/dev`
@@ -337,7 +340,7 @@ tx_fifo        i64  C
 tx_colls       i64  C
 tx_carrier     i64  C
 tx_compressed  i64  C
-scope          u8   L   // 0=host или 2=pod_net в Wave 2
+scope          u8   L   // 0=host или 2=pod_net
 ```
 
 ## `1_110_001` `/proc/net/snmp`
@@ -360,7 +363,7 @@ udp_in_datagrams   i64  C
 udp_out_datagrams  i64  C
 udp_in_errors      i64  C
 udp_no_ports       i64  C
-scope              u8   L   // 0=host или 2=pod_net в Wave 2
+scope              u8   L   // 0=host или 2=pod_net
 ```
 
 ## `1_111_001` `/proc/net/netstat`
@@ -376,7 +379,7 @@ tcp_fast_retrans       i64  C
 tcp_slow_start_retrans i64  C
 tcp_ofo_queue          i64  C
 tcp_syn_retrans        i64  C
-scope                  u8   L   // 0=host или 2=pod_net в Wave 2
+scope                  u8   L   // 0=host или 2=pod_net
 ```
 
 Расширение остальными ключами требует проверки совместимости. При несовместимом
@@ -386,8 +389,8 @@ scope                  u8   L   // 0=host или 2=pod_net в Wave 2
 
 `on_change`, политика материализации `every_segment_last_known`. Нужен для
 атрибуции `diskstats` к точкам монтирования, поэтому актуальная копия полной
-таблицы mountinfo пишется в каждый сегмент даже без изменений. Wave 2 добавляет
-ёмкость ФС (`total_bytes`, `free_bytes`) через `statvfs(2)`: `NULL`, когда
+таблицы mountinfo пишется в каждый сегмент даже без изменений. Ёмкость ФС
+(`total_bytes`, `free_bytes`) читается через `statvfs(2)` и равна `NULL`, когда
 вызов не удался. Одна строка соответствует одной записи
 `/proc/self/mountinfo`; несколько mount points одного `(major, minor)` не
 схлопываются.
@@ -433,7 +436,7 @@ scope       u8   L
 
 ## cgroup `1_200_001` - `1_204_001`
 
-Сущность почти везде — `cgroup_path`. Wave 3 обходит дерево
+Сущность почти везде — `cgroup_path`. Коллектор обходит дерево
 `/sys/fs/cgroup` через `KRONIKA_SYS_ROOT`, ограничивая глубину и число строк
 настройками `KRONIKA_OS_MAX_CGROUPS`, `KRONIKA_OS_CGROUP_MAX_DEPTH` и
 `KRONIKA_OS_MAX_CGROUP_IO_ROWS`.
@@ -469,7 +472,7 @@ ts           ts   T
 pid          i32  L
 starttime    ts   L
 cgroup_path  str  L
-scope        u8   L   // 0=host или 3=container в Wave 3
+scope        u8   L   // 0=host или 3=container
 ```
 
 `cgroup_path` — значение соответствия `pid -> cgroup`, а не часть ключа
@@ -495,7 +498,7 @@ throttled_usec i64  C
 nr_throttled   i64  C
 quota_usec     i64  G   // -1 = max
 period_usec    i64  G
-scope          u8   L   // 0=host или 3=container в Wave 3
+scope          u8   L   // 0=host или 3=container
 ```
 
 `throttled_usec` и `nr_throttled` важны для диагностики скрытого CPU throttling
@@ -517,7 +520,7 @@ high_events  i64  C
 max_events   i64  C
 oom_events   i64  C
 oom_kill     i64  C
-scope        u8   L   // 0=host или 3=container в Wave 3
+scope        u8   L   // 0=host или 3=container
 ```
 
 В cgroup v2 значение `max` может быть строкой `max`; в PGM это `NULL`. В
@@ -539,7 +542,7 @@ rbytes       i64  C
 wbytes       i64  C
 rios         i64  C
 wios         i64  C
-scope        u8   L   // 0=host или 3=container в Wave 3
+scope        u8   L   // 0=host или 3=container
 ```
 
 ### `1_204_001` cgroup pids
@@ -549,8 +552,7 @@ ts           ts   T
 cgroup_path  str  L
 current      i64  G
 max          i64? G   // NULL = без лимита
-scope        u8   L   // 0=host или 3=container в Wave 3
+scope        u8   L   // 0=host или 3=container
 ```
 
-Диапазон `1_205_001` - `1_299_999` зарезервирован под cpuset, hugetlb и будущие
-контроллеры.
+Идентификаторы `1_205_001`–`1_299_999` пока не назначены.

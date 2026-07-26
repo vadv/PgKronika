@@ -183,6 +183,7 @@ Detailed limits and failure variants live in each crate's README and rustdoc.
 
 ## Documentation and validation
 
+- Documentation map and source-of-truth rules: [`docs/README.md`](docs/README.md)
 - Installation and first run: [Build and run the shortest path](#build-and-run-the-shortest-path)
 - Collector configuration: [`pg_kronika-collector` operator guide](bins/pg_kronika-collector/README.md)
 - JSON API and web configuration: [`pg_kronika-web` operator guide](bins/pg_kronika-web/README.md)
@@ -192,7 +193,7 @@ Detailed limits and failure variants live in each crate's README and rustdoc.
 - Overview parity evidence: [`docs/qualification/overview-parity-v1.md`](docs/qualification/overview-parity-v1.md)
 - BDD conventions and runner: [`docs/bdd-testing-guide.md`](docs/bdd-testing-guide.md) and [`kronika-bdd`](crates/kronika-bdd/)
 - Current architecture: [`docs/architecture.md`](docs/architecture.md)
-- Container reference: [`kronika-format`](crates/kronika-format/) and the historical design note [`docs/segment-format.md`](docs/segment-format.md)
+- PGM container reference: [`kronika-format`](crates/kronika-format/)
 
 For a documentation-only change, the repository's documented minimum gate is:
 

@@ -1,52 +1,62 @@
 # Подключения коллектора к PostgreSQL
 
-`pg_kronika-collector` обслуживает один экземпляр PostgreSQL. Он держит
-основное подключение для instance-wide источников и до 20 подключений к
-отдельным базам для database-local статистики.
+Один процесс `pg_kronika-collector` обслуживает один экземпляр PostgreSQL. Он
+использует основное подключение для общих данных экземпляра и не более 20
+подключений к отдельным базам для локальной статистики таблиц и индексов.
 
-## DSN и session contract
+Полный список переменных окружения находится в
+[`pg_kronika-collector`](../bins/pg_kronika-collector/README.ru.md). Источники
+истины для поведения подключений:
 
-`KRONIKA_PG_DSN` принимает URI или `key=value` в синтаксисе
-`tokio-postgres`. Код разбирает DSN в `tokio_postgres::Config`, после чего
-структурно задаёт базу для per-database подключения и
+- [`pool.rs`](../crates/kronika-source-pg/src/pool.rs);
+- [`config.rs`](../bins/pg_kronika-collector/src/config.rs);
+- [`pool_sources.rs`](../bins/pg_kronika-collector/src/pool_sources.rs).
+
+## Строка подключения и параметры сессии
+
+`KRONIKA_PG_DSN` принимает URI или запись `key=value`, которую понимает
+`tokio-postgres`. Коллектор разбирает её в `tokio_postgres::Config`, а для
+подключения к конкретной базе заменяет только имя базы и задаёт
 `application_name=pg_kronika-collector/<version>`.
 
-Для каждого подключения действуют:
+Каждое подключение получает:
 
-| Настройка | Дефолт |
-| --- | ---: |
-| connect timeout | 5 s |
-| TCP keepalive idle / interval / retries | 30 s / 10 s / 3 |
-| `statement_timeout` | 15 000 ms |
-| `lock_timeout` | 1 000 ms |
-| `idle_in_transaction_session_timeout` | 10 000 ms |
+| Параметр | Значение по умолчанию | Настройка |
+| --- | ---: | --- |
+| Время подключения | 5 с | Не настраивается |
+| TCP keepalive: ожидание / интервал / попытки | 30 с / 10 с / 3 | Не настраивается |
+| `statement_timeout` | 15 000 мс | `KRONIKA_PG_STATEMENT_TIMEOUT_MS` |
+| `lock_timeout` | 1 000 мс | `KRONIKA_PG_LOCK_TIMEOUT_MS` |
+| `idle_in_transaction_session_timeout` | 10 000 мс | `KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS` |
 
-Три PostgreSQL timeout настраиваются через
-`KRONIKA_PG_STATEMENT_TIMEOUT_MS`, `KRONIKA_PG_LOCK_TIMEOUT_MS` и
-`KRONIKA_PG_IDLE_IN_TX_TIMEOUT_MS`. Ноль запрещён, а `lock_timeout` должен быть
-меньше `statement_timeout`.
+Три тайм-аута PostgreSQL должны быть больше нуля, а `lock_timeout` — меньше
+`statement_timeout`. Неверное сочетание останавливает запуск с ошибкой
+конфигурации.
 
-TLS определяется DSN и возможностями `tokio-postgres` в текущей сборке;
-коллектор вызывает `NoTls`, поэтому встроенного TLS connector сейчас нет.
-Для удалённого подключения используйте доверенную сеть или защищённый tunnel.
+Текущая сборка вызывает `tokio_postgres::Config::connect(NoTls)`. Встроенного
+TLS-клиента нет, даже если строка подключения содержит настройки TLS. Для
+удалённого соединения нужен защищённый туннель или доверенная сеть.
 
 ## Основное подключение
 
-Через main client читаются instance-wide представления: activity, database,
-bgwriter/checkpointer, WAL, I/O, archiver, prepared transactions, vacuum
-progress, replication, locks, reset metadata, settings и timestamp окна.
+Через основное подключение читаются общие представления экземпляра:
 
-Перед циклом `ensure_main()` проверяет, не закрыт ли client. После reconnect
-major заново берётся из handshake `server_version`; соединение с другим major
-не продолжает использовать старую layout decision.
+- `pg_stat_activity`, `pg_stat_database`, блокировки и ход vacuum;
+- bgwriter, checkpointer, WAL, archiver и `pg_stat_io`;
+- prepared transactions и репликация;
+- `reset_metadata`, `instance_metadata` и `pg_settings`.
 
-Ошибка восстановления main connection пропускает PostgreSQL-часть цикла и
-пишется в log. Если log source наступил по расписанию, collector всё ещё может
-записать log-only window.
+Перед циклом коллектор проверяет, что клиент не закрыт. После повторного
+подключения мажорная версия PostgreSQL снова берётся из handshake, поэтому
+схема прежнего сервера не применяется к новому соединению.
+
+Если восстановить основное подключение не удалось, PostgreSQL-часть цикла
+пропускается. Источник stderr может независимо сформировать окно, если его
+чтение наступило по расписанию.
 
 ## Перечисление баз
 
-Pool refresh выполняет запрос:
+Список кандидатов строит PostgreSQL:
 
 ```sql
 SELECT datname
@@ -57,68 +67,83 @@ WHERE datallowconn
 ORDER BY datname
 ```
 
-После SQL отбрасываются имена из `KRONIKA_PG_EXCLUDE_DATABASES` (разделитель
-`;`). Первые 20 баз в порядке имени получают per-database connection. Остальные
-остаются в `uncovered`; cap не настраивается через environment.
+После запроса коллектор исключает имена из `KRONIKA_PG_EXCLUDE_DATABASES`.
+Разделитель списка — `;`. Первые 20 баз в алфавитном порядке получают
+подключение; остальные учитываются как непокрытые. Предел 20 сейчас не
+настраивается.
 
-`KRONIKA_PG_POOL_REFRESH_SECS` (`600`) задаёт период refresh, если pool уже не
-пуст. Закрытые clients удаляются и открываются снова. Ошибка подключения к
-одной базе не отменяет остальные, но её имя остаётся uncovered до успешного
-refresh.
+`KRONIKA_PG_POOL_REFRESH_SECS` по умолчанию равен 600 секундам. При обновлении
+закрытые клиенты удаляются и создаются заново. Ошибка одной базы не отменяет
+подключения к остальным; база остаётся непокрытой до успешного обновления.
 
-База из DSN — только начальная точка для main connection. Режима «собирать
-только `dbname` из DSN» нет.
+База из `KRONIKA_PG_DSN` является начальной точкой основного подключения.
+Режима «собирать только эту базу» нет.
 
-## Database-local источники и coverage
+## Какие данные требуют отдельной базы
 
-Per-database clients читают `pg_stat_user_tables` и
-`pg_stat_user_indexes`. `pg_stat_statements` и `pg_store_plans` —
-instance-wide данные расширений, но SQL objects существуют только в базе
-установки; collector ищет такую базу среди main и pool connections и кэширует
-выбранный client.
+Подключения к базам читают:
 
-Тяжёлые relation-size queries начинают со `statement_timeout=15000`. После
-SQLSTATE `57014` timeout удваивается до
-`KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS` (`60000`) и запрос к той же базе повторяется.
-SQLSTATE `55P03` считается lock contention и не расширяет timeout.
+- `pg_stat_user_tables` и `pg_statio_user_tables`;
+- `pg_stat_user_indexes` и `pg_statio_user_indexes`;
+- связанные каталоги и размеры отношений.
 
-Ошибки одной database-local выборки не теряют весь сегмент:
+`pg_stat_statements` и `pg_store_plans` содержат данные всего экземпляра, но
+объекты расширения существуют только в базе, где выполнен `CREATE EXTENSION`.
+Коллектор ищет такую базу среди основного и доступных локальных подключений,
+затем кэширует выбранный клиент. База с расширением, не попавшая в предел 20,
+не будет обнаружена.
 
-- timeout увеличивает `timeouts`;
-- SQLSTATE `42501` увеличивает `permission_skips`;
-- lock conflict и прочие query failures учитываются отдельно;
-- total становится unknown, если полное исходное множество неизвестно;
-- collected/total и причина попадают в `collection_coverage`.
+## Тайм-ауты, бюджет и неполнота
 
-Sized sources выполняются под общим `KRONIKA_CYCLE_DB_BUDGET_MS` (`15000`)
-в порядке statements, tables, indexes. Не вместившийся источник переносится на
-следующий tick и фиксируется в log, а не считается пустым.
+Тяжёлый запрос таблиц или индексов начинает работу с обычным
+`statement_timeout`. После SQLSTATE `57014` предел удваивается до
+`KRONIKA_PG_HEAVY_TIMEOUT_CAP_MS`, по умолчанию 60 000 мс, и запрос к этой базе
+повторяется. SQLSTATE `55P03` считается конфликтом блокировок и не увеличивает
+тайм-аут.
+
+`KRONIKA_CYCLE_DB_BUDGET_MS`, по умолчанию 15 000 мс, ограничивает суммарное
+время размерных источников в одном цикле. Порядок: statements, таблицы,
+индексы. Источник, которому не хватило остатка бюджета, переносится на
+следующий цикл и не считается пустым.
+
+Ошибка одной базы не отменяет готовый результат других баз. Коллектор отдельно
+учитывает:
+
+- тайм-аут;
+- недостаточные права;
+- конфликт блокировок;
+- другую ошибку запроса;
+- неизвестное полное число строк;
+- число собранных строк и применённый предел.
+
+Для top-N таблиц, индексов, statements и plans эти сведения попадают в
+`collection_coverage`. Отсутствие строки покрытия не является универсальным
+доказательством полноты любого другого источника.
 
 ## Права
 
-Минимальный login должен иметь `CONNECT` к нужным базам. Для полных данных
-других ролей обычно нужен `pg_monitor` или эквивалентный набор прав, например
-`pg_read_all_stats`. Недоступные поля PostgreSQL могут стать `NULL`, а
-database-local permission failure попадёт в coverage.
+Роль должна иметь `LOGIN` и `CONNECT` к нужным базам. Для видимости статистики
+чужих сеансов обычно требуется `pg_monitor`, `pg_read_all_stats` или
+эквивалентный более узкий набор прав.
+
+Недоступное nullable-поле может стать `NULL`. Ошибка всей локальной выборки
+фиксируется как неполное покрытие или пропуск, а не как нулевая метрика.
 
 Расширения необязательны:
 
-- `pg_stat_statements` собирается из одной базы, где extension установлен;
-- `pg_store_plans` поддерживает обнаруживаемые сигнатуры vadv и ossc forks;
-- отсутствующий extension не останавливает core collection;
-- `track_io_timing`, `track_wal_io_timing`, `compute_query_id` и extension
-  versions пишутся в reset metadata и используются collection gates.
+- отсутствие `pg_stat_statements` и `pg_store_plans` не останавливает основной
+  сбор;
+- версия и поддерживаемый вариант расширения определяют схему секции;
+- настройки `track_io_timing`, `track_wal_io_timing` и `compute_query_id`
+  сохраняются в `reset_metadata` и участвуют в интерпретации данных.
 
-Коллектор маркирует SQL комментарием с версией и source file. Запросы видны в
-`pg_stat_activity`, server log и statement instrumentation как работа
-PgKronika.
+Каждый SQL-запрос коллектора начинается с комментария
+`/* pg_kronika:<version> <source-file> */`. По нему запросы PgKronika можно
+отличить в `pg_stat_activity`, `pg_stat_statements` и журнале PostgreSQL.
 
-## Конфиденциальность DSN
+## Защита строки подключения
 
-DSN передаётся через environment и может содержать password. Ограничьте доступ
-к окружению процесса и service definition. Ни collector logs, ни segment
-announcements намеренно не печатают DSN, но его хранение и rotation остаются
-за оператором.
-
-Полный список environment variables находится в
-[`bins/pg_kronika-collector/README.ru.md`](../bins/pg_kronika-collector/README.ru.md).
+DSN передаётся через окружение и может содержать пароль. Ограничьте чтение
+окружения процесса и файла службы. Коллектор намеренно не печатает DSN в
+сообщениях о подключении и готовых сегментах, но хранение, выдача и смена
+секрета остаются обязанностью оператора.
