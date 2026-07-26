@@ -889,7 +889,7 @@ impl EventConfig {
     }
 
     #[cfg(test)]
-    const fn with(
+    pub(crate) const fn with(
         work_limit: u64,
         max_lens_evaluations: u64,
         max_findings: u64,

@@ -15,7 +15,7 @@
 //! anomaly or incident work; another request receives `503` instead of
 //! queueing. Incident diagnosis is a first slice: the endpoint clusters
 //! episodes, runs the active diagnostic lenses, still reports `complete=false`,
-//! and returns their findings with a partly dormant lens catalog.
+//! and reports request-specific evaluator and requirement status.
 #![allow(
     clippy::multiple_crate_versions,
     reason = "metrics-exporter-prometheus and axum pull duplicate transitive versions outside our control"

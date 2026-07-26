@@ -31,6 +31,14 @@ pub(crate) enum EntityJoinActivation {
 }
 
 impl EntityJoinActivation {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::SharedSnapshot => "shared_snapshot",
+            Self::SnapshotRelation => "snapshot_relation",
+            Self::LifetimeMapping => "lifetime_mapping",
+        }
+    }
+
     pub(crate) const fn producer(self) -> &'static str {
         match self {
             Self::SharedSnapshot => "shared_snapshot_producer",

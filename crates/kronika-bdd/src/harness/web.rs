@@ -207,6 +207,181 @@ pub(crate) async fn anomalies(dir: &Path, query: &str) -> Result<Value> {
     Ok(response.body)
 }
 
+/// Prove the storage-to-HTTP incident observability contract for collected data.
+pub(crate) async fn assert_incident_observability(dir: &Path) -> Result<()> {
+    let (source, from_us, max_us) = source_span(dir).await?;
+    let to_us = max_us
+        .checked_add(1)
+        .context("incident source range cannot form a half-open interval")?;
+    let response = incident_response(dir, source, from_us, to_us).await?;
+    anyhow::ensure!(
+        response["analysis_status"] != "no_data",
+        "collected source unexpectedly returned no_data: {response}"
+    );
+    assert_incident_catalog(&response, true, 14)
+}
+
+/// Prove that an early no-data return keeps the catalog but claims no diagnosis.
+pub(crate) async fn assert_incident_no_data_observability(dir: &Path) -> Result<()> {
+    let (source, from_us, max_us) = source_span(dir).await?;
+    let missing_source = source
+        .checked_add(1)
+        .context("source id cannot form a missing-source probe")?;
+    let to_us = max_us
+        .checked_add(1)
+        .context("incident source range cannot form a half-open interval")?;
+    let query_from_us = from_us
+        .checked_sub(5 * 60 * 1_000_000)
+        .context("incident no-data range underflowed")?;
+    let response = incident_response(dir, missing_source, query_from_us, to_us).await?;
+    anyhow::ensure!(
+        response["analysis_status"] == "no_data",
+        "missing source did not return no_data: {response}"
+    );
+    assert_incident_catalog(&response, false, 0)
+}
+
+async fn incident_response(dir: &Path, source: u64, from_us: i64, to_us: i64) -> Result<Value> {
+    let uri = format!("/v1/incidents?source={source}&from={from_us}&to={to_us}&window=5m&step=1m");
+    let response = request(dir, &uri, &[]).await?;
+    anyhow::ensure!(
+        response.status == 200,
+        "/v1/incidents returned status {}: {}",
+        response.status,
+        response.body
+    );
+    Ok(response.body)
+}
+
+fn assert_incident_catalog(
+    response: &Value,
+    diagnosis_available: bool,
+    evaluated_event_branches: usize,
+) -> Result<()> {
+    let catalog = &response["catalog"];
+    anyhow::ensure!(catalog["catalog_available"].as_bool() == Some(true));
+    anyhow::ensure!(catalog["diagnosis_available"] == diagnosis_available);
+    anyhow::ensure!(catalog["requirements_status"] == "incomplete");
+    anyhow::ensure!(
+        catalog["counts"]
+            == serde_json::json!({
+                "core_lenses": 28,
+                "event_branches": 14,
+                "evaluator_branches": 42,
+                "unique_lens_ids": 40,
+                "active_lens_ids": 40,
+                "inactive_lens_ids": 0,
+                "entity_join_requirements": 24,
+            }),
+        "wrong incident counts: {}",
+        catalog["counts"]
+    );
+    anyhow::ensure!(
+        catalog["registered_lens_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.len() == 40 && unique_strings(ids)),
+        "registered_lens_ids is not the exact unique catalog"
+    );
+    anyhow::ensure!(
+        catalog["inactive_lens_ids"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "inactive lens ids must be explicitly empty"
+    );
+    let evaluators = catalog["evaluators"]
+        .as_array()
+        .context("incident evaluators is not an array")?;
+    anyhow::ensure!(evaluators.len() == 42);
+    anyhow::ensure!(
+        evaluators
+            .iter()
+            .filter(|branch| branch["family"] == "event" && branch["status"] == "evaluated")
+            .count()
+            == evaluated_event_branches
+    );
+    let evaluated_ids = catalog["evaluated_lens_ids"]
+        .as_array()
+        .context("evaluated_lens_ids is not an array")?;
+    anyhow::ensure!(
+        evaluated_ids.len() == evaluated_event_branches && unique_strings(evaluated_ids)
+    );
+
+    let lenses = catalog["lenses"]
+        .as_array()
+        .context("active incident lenses is not an array")?;
+    anyhow::ensure!(lenses.len() == 28);
+    let requirements: Vec<_> = lenses
+        .iter()
+        .flat_map(|lens| lens["requirements"].as_array().into_iter().flatten())
+        .collect();
+    anyhow::ensure!(requirements.len() == 24);
+    for requirement in &requirements {
+        anyhow::ensure!(requirement["kind"] == "entity_join");
+        anyhow::ensure!(requirement["status"] == "unavailable");
+        let identity = &requirement["identity"];
+        anyhow::ensure!(identity["name"] == "incident_lens");
+        anyhow::ensure!(
+            matches!(identity["domain"].as_str(), Some("pg" | "os")),
+            "invalid requirement identity: {identity}"
+        );
+        anyhow::ensure!(
+            identity["value"]
+                .as_array()
+                .is_some_and(|value| value.len() == 1),
+            "requirement identity must name one owning lens: {identity}"
+        );
+        anyhow::ensure!(
+            requirement["conditions"]
+                .as_array()
+                .is_some_and(|conditions| conditions.len() == 3
+                    && conditions
+                        .iter()
+                        .all(|condition| condition["status"] == "unavailable")),
+            "requirement conditions are not the closed unavailable triple: {requirement}"
+        );
+    }
+    let wait_requirement = requirements
+        .iter()
+        .find(|requirement| requirement["requirement_id"] == "entity_join.activity_lock_waiter")
+        .context("activity/lock requirement is missing")?;
+    anyhow::ensure!(wait_requirement["identity"]["domain"] == "pg");
+    anyhow::ensure!(wait_requirement["identity"]["value"] == serde_json::json!(["PG-WAIT-019"]));
+    anyhow::ensure!(wait_requirement["activation"] == "shared_snapshot");
+    assert_no_presentation_fields(catalog)
+}
+
+fn unique_strings(values: &[Value]) -> bool {
+    values
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>()
+        .len()
+        == values.len()
+}
+
+fn assert_no_presentation_fields(value: &Value) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            for forbidden in ["title", "question", "text_locale"] {
+                anyhow::ensure!(
+                    !object.contains_key(forbidden),
+                    "incident machine catalog contains `{forbidden}`"
+                );
+            }
+            for child in object.values() {
+                assert_no_presentation_fields(child)?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                assert_no_presentation_fields(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Fetch one section's page for `source` over the widest possible window.
 pub(crate) async fn section_page(dir: &Path, name: &str, source: u64) -> Result<Value> {
     let uri = format!(

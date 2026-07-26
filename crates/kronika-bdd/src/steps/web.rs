@@ -110,3 +110,23 @@ async fn web_pg_log_collecting(world: &mut BddWorld) -> Result<()> {
     );
     Ok(())
 }
+
+/// Assert collected log data reaches the request-specific incident catalog.
+#[then("the incident API publishes exact active observability")]
+async fn incident_active_observability(world: &mut BddWorld) -> Result<()> {
+    let segment = world.harness.segment()?.clone();
+    let dir = segment
+        .parent()
+        .context("the sealed segment has no parent directory")?;
+    web::assert_incident_observability(dir).await
+}
+
+/// Assert an early no-data response retains catalog visibility without diagnosis.
+#[then("the incident API keeps no-data observability honest")]
+async fn incident_no_data_observability(world: &mut BddWorld) -> Result<()> {
+    let segment = world.harness.segment()?.clone();
+    let dir = segment
+        .parent()
+        .context("the sealed segment has no parent directory")?;
+    web::assert_incident_no_data_observability(dir).await
+}
