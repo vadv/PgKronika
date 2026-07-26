@@ -42,12 +42,69 @@ use parquet::basic::{Compression, Encoding};
 use parquet::file::reader::FileReader as _;
 use parquet::file::serialized_reader::SerializedFileReader;
 
-use crate::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalError};
+use crate::{
+    DEFAULT_MAX_JOURNAL_LEN, FilesystemError, FilesystemOperation, Journal, JournalError,
+};
 
 /// Maximum catalog sections accepted from one seal input by default.
 pub const DEFAULT_MAX_INPUT_SECTIONS: usize = 65_536;
 /// Maximum sorted runs decoded in one external-merge group.
 const MERGE_FAN_IN: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealFaultPoint {
+    BeforeTempFlush,
+    AfterTempFlush,
+    BeforeTempSync,
+    AfterTempSync,
+    BeforePublish,
+    AfterPublish,
+    BeforeFirstDirectorySync,
+    AfterFirstDirectorySync,
+    BeforeTempRemove,
+    AfterTempRemove,
+    BeforeSecondDirectorySync,
+    AfterSecondDirectorySync,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static INJECTED_SEAL_FAULT: std::cell::Cell<Option<(SealFaultPoint, i32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn maybe_fail(
+    point: SealFaultPoint,
+    operation: FilesystemOperation,
+    path: &Path,
+) -> Result<(), SealError> {
+    INJECTED_SEAL_FAULT.with(|injected| {
+        if injected.get().is_some_and(|(at, _errno)| at == point) {
+            let (_at, errno) = injected.take().expect("matched injected seal fault");
+            Err(seal_io(
+                operation,
+                path,
+                io::Error::from_raw_os_error(errno),
+            ))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "production and test fault hooks deliberately share one call-site signature"
+)]
+const fn maybe_fail(
+    _point: SealFaultPoint,
+    _operation: FilesystemOperation,
+    _path: &Path,
+) -> Result<(), SealError> {
+    Ok(())
+}
 
 /// Hard resources admitted before seal work begins.
 #[allow(
@@ -260,7 +317,7 @@ impl Error for DictionaryError {}
 #[derive(Debug)]
 pub enum SealError {
     /// A filesystem operation failed.
-    Io(io::Error),
+    Io(FilesystemError),
     /// Reading a part back from the journal failed.
     Journal(JournalError),
     /// A journal part did not validate as a current canonical PGM.
@@ -335,7 +392,7 @@ pub enum SealError {
 impl fmt::Display for SealError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => write!(f, "segment I/O: {error}"),
+            Self::Io(error) => write!(f, "segment {error}"),
             Self::Journal(error) => write!(f, "reading a journal part: {error}"),
             Self::Part(error) => write!(f, "invalid journal part: {error}"),
             Self::Codec(error) => write!(f, "section codec: {error}"),
@@ -433,8 +490,8 @@ impl SealError {
     }
 }
 
-impl From<io::Error> for SealError {
-    fn from(error: io::Error) -> Self {
+impl From<FilesystemError> for SealError {
+    fn from(error: FilesystemError) -> Self {
         Self::Io(error)
     }
 }
@@ -1729,6 +1786,10 @@ struct BuiltTemp {
     bytes: u64,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the linear write/flush/sync protocol keeps all durability boundaries explicit"
+)]
 fn write_compact_temp(
     tmp: &Path,
     plan: &SealPlan,
@@ -1737,9 +1798,15 @@ fn write_compact_temp(
     options: SealOptions<'_>,
     artifacts: &mut Artifacts,
 ) -> Result<BuiltTemp, SealError> {
-    let file = OpenOptions::new().create_new(true).write(true).open(tmp)?;
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(tmp)
+        .map_err(|error| seal_io(FilesystemOperation::CreateNew, tmp, error))?;
     let mut writer = BufWriter::new(file);
-    writer.write_all(&MAGIC)?;
+    writer
+        .write_all(&MAGIC)
+        .map_err(|error| seal_io(FilesystemOperation::Write, tmp, error))?;
     let mut offset = MAGIC.len() as u64;
     let mut entries = Vec::with_capacity(plan.types.len() + 2);
     let mut output_bytes = offset;
@@ -1762,6 +1829,7 @@ fn write_compact_temp(
         let body = read_run(run)?;
         VerifiedSection::verify(body.clone(), run.crc32c, crc32c)?;
         write_output_section(
+            tmp,
             &mut writer,
             &mut entries,
             &mut offset,
@@ -1783,6 +1851,7 @@ fn write_compact_temp(
     for section in dictionary.encode_sections()? {
         check_cancelled(options.cancelled)?;
         write_output_section(
+            tmp,
             &mut writer,
             &mut entries,
             &mut offset,
@@ -1813,11 +1882,35 @@ fn write_compact_temp(
         final_bytes,
         options.limits.max_output_bytes,
     )?;
-    writer.write_all(&encoded_catalog)?;
+    writer
+        .write_all(&encoded_catalog)
+        .map_err(|error| seal_io(FilesystemOperation::Write, tmp, error))?;
+    maybe_fail(
+        SealFaultPoint::BeforeTempFlush,
+        FilesystemOperation::Flush,
+        tmp,
+    )?;
     let file = writer
         .into_inner()
-        .map_err(io::IntoInnerError::into_error)?;
-    file.sync_all()?;
+        .map_err(io::IntoInnerError::into_error)
+        .map_err(|error| seal_io(FilesystemOperation::Flush, tmp, error))?;
+    maybe_fail(
+        SealFaultPoint::AfterTempFlush,
+        FilesystemOperation::Flush,
+        tmp,
+    )?;
+    maybe_fail(
+        SealFaultPoint::BeforeTempSync,
+        FilesystemOperation::SyncFile,
+        tmp,
+    )?;
+    file.sync_all()
+        .map_err(|error| seal_io(FilesystemOperation::SyncFile, tmp, error))?;
+    maybe_fail(
+        SealFaultPoint::AfterTempSync,
+        FilesystemOperation::SyncFile,
+        tmp,
+    )?;
     artifacts.track(tmp.to_owned());
     Ok(BuiltTemp {
         catalog,
@@ -1826,6 +1919,7 @@ fn write_compact_temp(
 }
 
 fn write_output_section(
+    path: &Path,
     writer: &mut BufWriter<File>,
     entries: &mut Vec<Entry>,
     offset: &mut u64,
@@ -1855,7 +1949,9 @@ fn write_output_section(
             reason: "output type order is not strictly increasing",
         });
     }
-    writer.write_all(&body)?;
+    writer
+        .write_all(&body)
+        .map_err(|error| seal_io(FilesystemOperation::Write, path, error))?;
     entries.push(Entry {
         type_id,
         flags: 0,
@@ -1874,8 +1970,12 @@ fn write_output_section(
 }
 
 fn read_run(run: &Run) -> Result<Bytes, SealError> {
-    let mut file = File::open(&run.path)?;
-    let actual = file.metadata()?.len();
+    let mut file = File::open(&run.path)
+        .map_err(|error| seal_io(FilesystemOperation::Open, &run.path, error))?;
+    let actual = file
+        .metadata()
+        .map_err(|error| seal_io(FilesystemOperation::Metadata, &run.path, error))?
+        .len();
     if actual != run.len {
         return Err(SealError::OutputVerification {
             reason: "spill run length changed",
@@ -1885,13 +1985,18 @@ fn read_run(run: &Run) -> Result<Bytes, SealError> {
         what: "spill run allocation",
     })?;
     let mut body = vec![0_u8; len];
-    file.read_exact(&mut body)?;
+    file.read_exact(&mut body)
+        .map_err(|error| seal_io(FilesystemOperation::Read, &run.path, error))?;
     Ok(Bytes::from(body))
 }
 
 fn verify_temp(path: &Path, expected: &Catalog, expected_len: u64) -> Result<(), SealError> {
-    let file = File::open(path)?;
-    let actual_len = file.metadata()?.len();
+    let file = File::open(path)
+        .map_err(|error| seal_io(FilesystemOperation::Open, path, error))?;
+    let actual_len = file
+        .metadata()
+        .map_err(|error| seal_io(FilesystemOperation::Metadata, path, error))?
+        .len();
     if actual_len != expected_len {
         return Err(SealError::OutputVerification {
             reason: "temporary length differs from the built length",
@@ -1904,7 +2009,8 @@ fn verify_temp(path: &Path, expected: &Catalog, expected_len: u64) -> Result<(),
                 reason: "temporary is shorter than a tail index",
             })?;
     let mut tail_bytes = [0_u8; TAIL_INDEX_LEN];
-    file.read_exact_at(&mut tail_bytes, tail_at)?;
+    file.read_exact_at(&mut tail_bytes, tail_at)
+        .map_err(|error| seal_io(FilesystemOperation::Read, path, error))?;
     let tail = TailIndex::decode(tail_bytes).map_err(PartError::Tail)?;
     let catalog_len = u64::from(tail.catalog_len);
     let catalog_at = tail_at
@@ -1917,7 +2023,8 @@ fn verify_temp(path: &Path, expected: &Catalog, expected_len: u64) -> Result<(),
             what: "temporary catalog allocation",
         })?;
     let mut catalog_bytes = vec![0_u8; catalog_len];
-    file.read_exact_at(&mut catalog_bytes, catalog_at)?;
+    file.read_exact_at(&mut catalog_bytes, catalog_at)
+        .map_err(|error| seal_io(FilesystemOperation::Read, path, error))?;
     let got = Catalog::decode(&catalog_bytes).map_err(PartError::Catalog)?;
     if &got != expected {
         return Err(SealError::OutputVerification {
@@ -1925,7 +2032,8 @@ fn verify_temp(path: &Path, expected: &Catalog, expected_len: u64) -> Result<(),
         });
     }
     let mut magic = [0_u8; 4];
-    file.read_exact_at(&mut magic, 0)?;
+    file.read_exact_at(&mut magic, 0)
+        .map_err(|error| seal_io(FilesystemOperation::Read, path, error))?;
     if magic != MAGIC {
         return Err(SealError::OutputVerification {
             reason: "reopened leading magic differs",
@@ -1949,7 +2057,8 @@ fn verify_temp(path: &Path, expected: &Catalog, expected_len: u64) -> Result<(),
                 .ok_or(SealError::ArithmeticOverflow {
                     what: "verification section offset",
                 })?;
-            file.read_exact_at(&mut scratch[..take], at)?;
+            file.read_exact_at(&mut scratch[..take], at)
+                .map_err(|error| seal_io(FilesystemOperation::Read, path, error))?;
             checksum.update(&scratch[..take]);
             consumed = consumed
                 .checked_add(take as u64)
@@ -1967,7 +2076,8 @@ fn verify_temp(path: &Path, expected: &Catalog, expected_len: u64) -> Result<(),
                 what: "physical verification body allocation",
             })?;
         let mut body = vec![0_u8; len];
-        file.read_exact_at(&mut body, entry.offset)?;
+        file.read_exact_at(&mut body, entry.offset)
+            .map_err(|error| seal_io(FilesystemOperation::Read, path, error))?;
         verify_compact_body(Bytes::from(body), entry.rows)?;
     }
     Ok(())
@@ -2062,11 +2172,51 @@ fn verify_compact_body(body: Bytes, expected_rows: u32) -> Result<(), SealError>
 }
 
 fn publish(tmp: &Path, dest: &Path) -> Result<Publication, SealError> {
+    maybe_fail(
+        SealFaultPoint::BeforePublish,
+        FilesystemOperation::PublishNoReplace,
+        dest,
+    )?;
     match fs::hard_link(tmp, dest) {
         Ok(()) => {
+            maybe_fail(
+                SealFaultPoint::AfterPublish,
+                FilesystemOperation::PublishNoReplace,
+                dest,
+            )?;
+            maybe_fail(
+                SealFaultPoint::BeforeFirstDirectorySync,
+                FilesystemOperation::SyncDirectory,
+                parent_directory(dest),
+            )?;
             sync_parent_dir(dest)?;
+            maybe_fail(
+                SealFaultPoint::AfterFirstDirectorySync,
+                FilesystemOperation::SyncDirectory,
+                parent_directory(dest),
+            )?;
+            maybe_fail(
+                SealFaultPoint::BeforeTempRemove,
+                FilesystemOperation::Remove,
+                tmp,
+            )?;
             remove_generated(tmp)?;
+            maybe_fail(
+                SealFaultPoint::AfterTempRemove,
+                FilesystemOperation::Remove,
+                tmp,
+            )?;
+            maybe_fail(
+                SealFaultPoint::BeforeSecondDirectorySync,
+                FilesystemOperation::SyncDirectory,
+                parent_directory(dest),
+            )?;
             sync_parent_dir(dest)?;
+            maybe_fail(
+                SealFaultPoint::AfterSecondDirectorySync,
+                FilesystemOperation::SyncDirectory,
+                parent_directory(dest),
+            )?;
             Ok(Publication::Created)
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -2079,21 +2229,39 @@ fn publish(tmp: &Path, dest: &Path) -> Result<Publication, SealError> {
             sync_parent_dir(dest)?;
             Ok(Publication::AlreadyPresent)
         }
-        Err(error) => Err(SealError::Io(error)),
+        Err(error) => Err(seal_io(
+            FilesystemOperation::PublishNoReplace,
+            dest,
+            error,
+        )),
     }
 }
 
-fn files_equal(left: &Path, right: &Path) -> Result<bool, io::Error> {
-    let mut left = File::open(left)?;
-    let mut right = File::open(right)?;
-    if left.metadata()?.len() != right.metadata()?.len() {
+fn files_equal(left_path: &Path, right_path: &Path) -> Result<bool, SealError> {
+    let mut left = File::open(left_path)
+        .map_err(|error| seal_io(FilesystemOperation::Open, left_path, error))?;
+    let mut right = File::open(right_path)
+        .map_err(|error| seal_io(FilesystemOperation::Open, right_path, error))?;
+    let left_len = left
+        .metadata()
+        .map_err(|error| seal_io(FilesystemOperation::Metadata, left_path, error))?
+        .len();
+    let right_len = right
+        .metadata()
+        .map_err(|error| seal_io(FilesystemOperation::Metadata, right_path, error))?
+        .len();
+    if left_len != right_len {
         return Ok(false);
     }
     let mut left_buf = vec![0_u8; 64 * 1024];
     let mut right_buf = vec![0_u8; 64 * 1024];
     loop {
-        let left_len = left.read(&mut left_buf)?;
-        let right_len = right.read(&mut right_buf)?;
+        let left_len = left
+            .read(&mut left_buf)
+            .map_err(|error| seal_io(FilesystemOperation::Read, left_path, error))?;
+        let right_len = right
+            .read(&mut right_buf)
+            .map_err(|error| seal_io(FilesystemOperation::Read, right_path, error))?;
         if left_len != right_len {
             return Ok(false);
         }
@@ -2106,31 +2274,48 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, io::Error> {
     }
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), SealError> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| seal_io(FilesystemOperation::CreateNew, path, error))?;
     write_all_bytes(&mut file, bytes)
+        .map_err(|error| seal_io(FilesystemOperation::Write, path, error))
 }
 
 fn write_all_bytes(writer: &mut impl Write, bytes: &[u8]) -> Result<(), io::Error> {
     writer.write_all(bytes)
 }
 
-fn remove_generated(path: &Path) -> Result<(), io::Error> {
+fn remove_generated(path: &Path) -> Result<(), SealError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+        Err(error) => Err(seal_io(FilesystemOperation::Remove, path, error)),
     }
 }
 
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        File::open(parent)?.sync_all()?;
+fn sync_parent_dir(path: &Path) -> Result<(), SealError> {
+    let parent = parent_directory(path);
+    if parent != path {
+        let directory = File::open(parent)
+            .map_err(|error| seal_io(FilesystemOperation::Open, parent, error))?;
+        directory
+            .sync_all()
+            .map_err(|error| seal_io(FilesystemOperation::SyncDirectory, parent, error))?;
     }
     Ok(())
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(path)
+}
+
+fn seal_io(operation: FilesystemOperation, path: &Path, source: io::Error) -> SealError {
+    FilesystemError::new(operation, path, source).into()
 }
 
 fn section_slice<'a>(part: &'a [u8], entry: &Entry) -> Result<&'a [u8], SealError> {
@@ -2224,6 +2409,46 @@ mod tests {
 
     use super::*;
     use crate::{Interner, JournalConfig, SectionBuffers, dict};
+
+    #[derive(Debug)]
+    struct SealFaultGuard;
+
+    impl Drop for SealFaultGuard {
+        fn drop(&mut self) {
+            INJECTED_SEAL_FAULT.with(|injected| injected.set(None));
+        }
+    }
+
+    fn inject_seal_fault(point: SealFaultPoint, errno: i32) -> SealFaultGuard {
+        INJECTED_SEAL_FAULT.with(|injected| {
+            assert!(
+                injected.replace(Some((point, errno))).is_none(),
+                "one seal fault may be active per test thread"
+            );
+        });
+        SealFaultGuard
+    }
+
+    const fn fault_operation(point: SealFaultPoint) -> FilesystemOperation {
+        match point {
+            SealFaultPoint::BeforeTempFlush | SealFaultPoint::AfterTempFlush => {
+                FilesystemOperation::Flush
+            }
+            SealFaultPoint::BeforeTempSync | SealFaultPoint::AfterTempSync => {
+                FilesystemOperation::SyncFile
+            }
+            SealFaultPoint::BeforePublish | SealFaultPoint::AfterPublish => {
+                FilesystemOperation::PublishNoReplace
+            }
+            SealFaultPoint::BeforeFirstDirectorySync
+            | SealFaultPoint::AfterFirstDirectorySync
+            | SealFaultPoint::BeforeSecondDirectorySync
+            | SealFaultPoint::AfterSecondDirectorySync => FilesystemOperation::SyncDirectory,
+            SealFaultPoint::BeforeTempRemove | SealFaultPoint::AfterTempRemove => {
+                FilesystemOperation::Remove
+            }
+        }
+    }
 
     fn bgwriter(ts: i64) -> BgwriterCheckpointer {
         BgwriterCheckpointer {
@@ -2743,6 +2968,126 @@ mod tests {
     }
 
     #[test]
+    fn every_publication_crash_point_is_retryable_without_journal_loss() {
+        const POINTS: &[(SealFaultPoint, bool)] = &[
+            (SealFaultPoint::BeforeTempFlush, false),
+            (SealFaultPoint::AfterTempFlush, false),
+            (SealFaultPoint::BeforeTempSync, false),
+            (SealFaultPoint::AfterTempSync, false),
+            (SealFaultPoint::BeforePublish, false),
+            (SealFaultPoint::AfterPublish, true),
+            (SealFaultPoint::BeforeFirstDirectorySync, true),
+            (SealFaultPoint::AfterFirstDirectorySync, true),
+            (SealFaultPoint::BeforeTempRemove, true),
+            (SealFaultPoint::AfterTempRemove, true),
+            (SealFaultPoint::BeforeSecondDirectorySync, true),
+            (SealFaultPoint::AfterSecondDirectorySync, true),
+        ];
+
+        for &(point, published) in POINTS {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let journal_path = dir.path().join("active.parts");
+            let (mut journal, _) =
+                Journal::open(&journal_path, JournalConfig::default()).expect("journal");
+            append_window(&mut journal, 1);
+            let before = fs::read(&journal_path).expect("journal bytes");
+            let destination = dir.path().join("segment.pgm");
+            let foreign = dir.path().join("foreign.tmp");
+            fs::write(&foreign, b"not owned by the seal").expect("foreign temp");
+
+            let guard = inject_seal_fault(point, 5);
+            let error = seal(&journal, &destination).expect_err("fault must stop this attempt");
+            drop(guard);
+            let SealError::Io(error) = error else {
+                panic!("fault point {point:?} did not return a filesystem error");
+            };
+            assert_eq!(error.operation(), fault_operation(point), "{point:?}");
+            assert_eq!(error.io_error().raw_os_error(), Some(5), "{point:?}");
+            assert_eq!(
+                fs::read(&journal_path).expect("journal retained"),
+                before,
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read(&foreign).expect("foreign temp retained"),
+                b"not owned by the seal",
+                "{point:?}"
+            );
+            assert_eq!(destination.exists(), published, "{point:?}");
+            if published {
+                validate_part(&fs::read(&destination).expect("published bytes"))
+                    .expect("published PGM is complete");
+            }
+            let retry = seal(&journal, &destination).expect("exact retry succeeds");
+            assert_eq!(
+                retry.publication,
+                if published {
+                    Publication::AlreadyPresent
+                } else {
+                    Publication::Created
+                },
+                "{point:?}"
+            );
+            let owned_prefix = "segment.pgm.";
+            assert!(
+                fs::read_dir(dir.path())
+                    .expect("directory")
+                    .filter_map(Result::ok)
+                    .all(|entry| !entry.file_name().to_string_lossy().starts_with(owned_prefix)),
+                "owned temporary names are gone after {point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_errno_classes_remain_typed_and_preserve_the_journal() {
+        for errno in [28, 122, 30, 5] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let journal_path = dir.path().join("active.parts");
+            let (mut journal, _) =
+                Journal::open(&journal_path, JournalConfig::default()).expect("journal");
+            append_window(&mut journal, 1);
+            let before = fs::read(&journal_path).expect("journal bytes");
+            let destination = dir.path().join("segment.pgm");
+
+            let guard = inject_seal_fault(SealFaultPoint::BeforeTempFlush, errno);
+            let error = seal(&journal, &destination).expect_err("injected filesystem failure");
+            drop(guard);
+            let SealError::Io(error) = error else {
+                panic!("errno {errno} was not retained as a filesystem error");
+            };
+            assert_eq!(error.operation(), FilesystemOperation::Flush);
+            assert_eq!(error.io_error().raw_os_error(), Some(errno));
+            assert_eq!(fs::read(&journal_path).expect("journal retained"), before);
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn real_create_failure_retains_operation_path_and_journal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal_path = dir.path().join("active.parts");
+        let (mut journal, _) =
+            Journal::open(&journal_path, JournalConfig::default()).expect("journal");
+        append_window(&mut journal, 1);
+        let before = fs::read(&journal_path).expect("journal bytes");
+        let destination = dir.path().join("missing").join("segment.pgm");
+
+        let error = seal(&journal, &destination).expect_err("destination parent is absent");
+        let SealError::Io(error) = error else {
+            panic!("create failure was not typed");
+        };
+        assert_eq!(error.operation(), FilesystemOperation::CreateNew);
+        assert_eq!(error.io_error().kind(), io::ErrorKind::NotFound);
+        assert!(
+            error.path().starts_with(dir.path().join("missing")),
+            "the generated run path stays inside the requested destination directory"
+        );
+        assert_eq!(fs::read(&journal_path).expect("journal retained"), before);
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn exact_existing_destination_is_idempotent_but_conflict_is_not_overwritten() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut journal, _) =
@@ -2763,6 +3108,106 @@ mod tests {
             Err(SealError::PublicationConflict { .. })
         ));
         assert_eq!(fs::read(conflict).unwrap(), before);
+    }
+
+    #[test]
+    fn no_replace_publication_races_deduplicate_exact_bytes_and_reject_conflicts() {
+        let exact_dir = tempfile::tempdir().expect("exact tempdir");
+        let (mut exact_journal, _) = Journal::open(
+            &exact_dir.path().join("active.parts"),
+            JournalConfig::default(),
+        )
+        .expect("exact journal");
+        append_window(&mut exact_journal, 1);
+        let exact_destination = exact_dir.path().join("segment.pgm");
+        let exact_barrier = std::sync::Barrier::new(3);
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                exact_barrier.wait();
+                seal(&exact_journal, &exact_destination)
+            });
+            let right = scope.spawn(|| {
+                exact_barrier.wait();
+                seal(&exact_journal, &exact_destination)
+            });
+            exact_barrier.wait();
+            (
+                left.join().expect("left seal thread"),
+                right.join().expect("right seal thread"),
+            )
+        });
+        let exact_publications = [
+            left.expect("left exact result").publication,
+            right.expect("right exact result").publication,
+        ];
+        assert_eq!(
+            exact_publications
+                .iter()
+                .filter(|&&outcome| outcome == Publication::Created)
+                .count(),
+            1
+        );
+        assert_eq!(
+            exact_publications
+                .iter()
+                .filter(|&&outcome| outcome == Publication::AlreadyPresent)
+                .count(),
+            1
+        );
+
+        let conflict_dir = tempfile::tempdir().expect("conflict tempdir");
+        let (mut first_journal, _) = Journal::open(
+            &conflict_dir.path().join("first.parts"),
+            JournalConfig::default(),
+        )
+        .expect("first journal");
+        append_window(&mut first_journal, 1);
+        let (mut second_journal, _) = Journal::open(
+            &conflict_dir.path().join("second.parts"),
+            JournalConfig::default(),
+        )
+        .expect("second journal");
+        append_window(&mut second_journal, 2);
+        let first_reference = conflict_dir.path().join("first-reference.pgm");
+        let second_reference = conflict_dir.path().join("second-reference.pgm");
+        seal(&first_journal, &first_reference).expect("first reference");
+        seal(&second_journal, &second_reference).expect("second reference");
+        let first_bytes = fs::read(first_reference).expect("first reference bytes");
+        let second_bytes = fs::read(second_reference).expect("second reference bytes");
+        assert_ne!(first_bytes, second_bytes);
+
+        let destination = conflict_dir.path().join("race.pgm");
+        let conflict_barrier = std::sync::Barrier::new(3);
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                conflict_barrier.wait();
+                seal(&first_journal, &destination)
+            });
+            let second = scope.spawn(|| {
+                conflict_barrier.wait();
+                seal(&second_journal, &destination)
+            });
+            conflict_barrier.wait();
+            (
+                first.join().expect("first seal thread"),
+                second.join().expect("second seal thread"),
+            )
+        });
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "only one distinct segment can win no-replace publication"
+        );
+        assert!(
+            [&first, &second]
+                .into_iter()
+                .any(|result| matches!(result, Err(SealError::PublicationConflict { .. })))
+        );
+        let published = fs::read(destination).expect("race destination");
+        assert!(
+            published == first_bytes || published == second_bytes,
+            "the winner is complete and byte-identical to one contender"
+        );
     }
 
     #[test]

@@ -20,11 +20,13 @@
 mod buffer;
 pub mod dict;
 mod interner;
+mod io_error;
 mod journal;
 mod segment;
 
 pub use buffer::{FlushSummary, FlushedPart, SectionBuffers, SectionFlushSummary};
 pub use interner::{FlushedEntry, Interner, SealedSegment};
+pub use io_error::{FilesystemError, FilesystemOperation};
 pub use journal::{
     DEFAULT_MAX_JOURNAL_LEN, DEFAULT_MAX_JOURNAL_PARTS, Journal, JournalConfig, JournalError,
     OpenReport,
