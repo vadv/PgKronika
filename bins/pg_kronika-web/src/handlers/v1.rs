@@ -4,8 +4,9 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, RawQuery, State};
 use kronika_reader::{
-    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, apply_collection_gating,
-    diff_section, gate_readings, logical_section, section, sections as query_sections,
+    GateReading, LogicalSection, QueryError, SectionPage, SeriesDiff, SourceSummaryError,
+    SourceSummaryLimits, SourceSummaryResource, apply_collection_gating, diff_section,
+    gate_readings, logical_section, section, sections as query_sections, source_summaries,
 };
 use kronika_registry::{
     ColumnClass, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, registry, section_name,
@@ -68,23 +69,155 @@ pub(crate) async fn sources(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiProblem> {
     QueryParams::parse(raw.as_deref(), &[])?;
-    let snapshot = state.snapshot();
-    let mut spans: BTreeMap<u64, (i64, i64, usize)> = BTreeMap::new();
-    for unit in snapshot.units() {
-        let span = spans
-            .entry(unit.source_id)
-            .or_insert((unit.min_ts, unit.max_ts, 0));
-        span.0 = span.0.min(unit.min_ts);
-        span.1 = span.1.max(unit.max_ts);
-        span.2 += 1;
+    let permit = state
+        .try_acquire_analytic()
+        .map_err(|_capacity| ApiProblem::analytic_capacity_unavailable())?;
+    let published = state.snapshot();
+    let summaries = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut snapshot = published.as_ref().clone();
+        source_summaries(&mut snapshot, SourceSummaryLimits::default())
+    })
+    .await
+    .map_err(|join| {
+        let problem = ApiProblem::internal_error();
+        tracing::error!(
+            event = "api_source_summary_worker_failed",
+            request_id = problem.request_id(),
+            error = ?join,
+            "source summary worker failed"
+        );
+        problem
+    })?
+    .map_err(|error| source_summary_error_response(&error))?;
+
+    let mut sources = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let pg_log = pg_log_status_json(summary.latest_status.as_ref());
+        sources.push(json!({
+            "source_id": summary.source_id,
+            "min_ts": summary.min_ts,
+            "max_ts": summary.max_ts,
+            "segments": summary.segments,
+            "pg_log": pg_log,
+        }));
     }
-    let sources: Vec<Value> = spans
-        .into_iter()
-        .map(|(source_id, (min_ts, max_ts, segments))| {
-            json!({ "source_id": source_id, "min_ts": min_ts, "max_ts": max_ts, "segments": segments })
-        })
-        .collect();
     Ok(Json(json!({ "sources": sources })))
+}
+
+fn source_summary_error_response(error: &SourceSummaryError) -> ApiProblem {
+    match error {
+        SourceSummaryError::LimitExceeded {
+            resource,
+            limit,
+            observed,
+        } => {
+            let resource = match resource {
+                SourceSummaryResource::Units => LimitResource::Units,
+                SourceSummaryResource::Rows => LimitResource::Rows,
+                SourceSummaryResource::Bytes => LimitResource::Bytes,
+            };
+            ApiProblem::query_limit_exceeded(resource, *limit, Some(*observed))
+        }
+        SourceSummaryError::IncompleteSnapshot {
+            unit_idx,
+            refreshes,
+        } => {
+            let problem = ApiProblem::store_read_failed();
+            tracing::warn!(
+                event = "api_source_summary_incomplete_snapshot",
+                request_id = problem.request_id(),
+                unit_idx,
+                refreshes,
+                "source summary remained stale after bounded retries"
+            );
+            problem
+        }
+        SourceSummaryError::Read(read) => {
+            let problem = ApiProblem::store_read_failed();
+            tracing::error!(
+                event = "api_store_read_failed",
+                request_id = problem.request_id(),
+                error = %read,
+                "source summary failed"
+            );
+            problem
+        }
+    }
+}
+
+fn unknown_pg_log_status() -> Value {
+    json!({
+        "state": "unknown",
+        "reason": "no_status",
+        "observed_at": null,
+        "parser": null,
+        "source_path": null,
+    })
+}
+
+fn reader_field<'a>(
+    row: &'a kronika_reader::OutRow,
+    name: &str,
+) -> Option<&'a kronika_reader::Value> {
+    row.iter()
+        .find(|(column, _)| column == name)
+        .map(|(_, value)| value)
+}
+
+fn pg_log_status_json(row: Option<&kronika_reader::OutRow>) -> Value {
+    let Some(row) = row else {
+        return unknown_pg_log_status();
+    };
+    let Some(kronika_reader::Value::Ts(observed_at)) = reader_field(row, "ts") else {
+        return unknown_pg_log_status();
+    };
+    let Some(kronika_reader::Value::U64(state)) = reader_field(row, "state") else {
+        return unknown_pg_log_status();
+    };
+    let Some(kronika_reader::Value::U64(reason)) = reader_field(row, "reason") else {
+        return unknown_pg_log_status();
+    };
+    let Some(kronika_reader::Value::U64(parser)) = reader_field(row, "parser_kind") else {
+        return unknown_pg_log_status();
+    };
+    let state = match *state {
+        0 => "collecting",
+        1 => "collecting_degraded",
+        2 => "unavailable",
+        3 => "disabled",
+        _ => return unknown_pg_log_status(),
+    };
+    let reason = match *reason {
+        0 => "none",
+        1 => "postgres_unavailable",
+        2 => "no_current_logfile",
+        3 => "unsupported_format",
+        4 => "discovery_query_failed",
+        5 => "missing_file",
+        6 => "permission_denied",
+        7 => "read_error",
+        _ => return unknown_pg_log_status(),
+    };
+    let parser = match *parser {
+        0 => "stderr",
+        1 => "csvlog",
+        2 => "unknown",
+        _ => return unknown_pg_log_status(),
+    };
+    let source_path = match reader_field(row, "source_path") {
+        Some(kronika_reader::Value::Str(path)) => Value::String(path.clone()),
+        Some(kronika_reader::Value::Blob { text, .. }) => Value::String(text.clone()),
+        Some(kronika_reader::Value::Null) | None => Value::Null,
+        _ => return unknown_pg_log_status(),
+    };
+    json!({
+        "state": state,
+        "reason": reason,
+        "observed_at": observed_at,
+        "parser": parser,
+        "source_path": source_path,
+    })
 }
 
 /// `GET /v1/sections` — static catalog of section types from the registry.

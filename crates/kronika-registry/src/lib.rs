@@ -155,6 +155,7 @@ pub const fn registry() -> &'static [TypeContract] {
         collection_coverage::CollectionCoverageV1::CONTRACT,
         pg_log::PgLogGapV1::CONTRACT,
         pg_log::PgLogTempFileV1::CONTRACT,
+        pg_log::PgLogSourceStatusV1::CONTRACT,
         incident_gauges::PgFreezeHorizonV1::CONTRACT,
         incident_gauges::PgVacuumObservationV1::CONTRACT,
         incident_gauges::PgReplicationPhysicalV1::CONTRACT,

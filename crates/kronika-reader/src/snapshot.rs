@@ -49,6 +49,8 @@ struct JournalPrefixDigest([u8; 32]);
 thread_local! {
     pub(crate) static OPEN_UNIT_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    pub(crate) static FORCED_STALE_OPEN_UNIT_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// A unit opened once for decoding many sections.
@@ -118,9 +120,17 @@ pub struct UnitMeta {
 
 /// Internal index: points into `scan.sealed` or `scan.active`.
 #[derive(Debug, Clone, Copy)]
-enum Handle {
+pub(crate) enum UnitHandle {
     Sealed(usize),
     Active(usize),
+}
+
+pub(crate) struct UnitDescriptor<'a> {
+    pub(crate) index: usize,
+    pub(crate) handle: UnitHandle,
+    pub(crate) meta: UnitMeta,
+    pub(crate) catalog: &'a Catalog,
+    pub(crate) eager_open_bytes: u64,
 }
 
 /// A read view of a `LocalDir` combining sealed and active units.
@@ -575,26 +585,7 @@ impl LocalDirSnapshot {
     #[must_use]
     pub fn units(&self) -> Vec<UnitMeta> {
         self.handles()
-            .map(|h| match h {
-                Handle::Sealed(i) => {
-                    let c = &self.scan.sealed[i].catalog;
-                    UnitMeta {
-                        source_id: c.source_id,
-                        min_ts: c.min_ts,
-                        max_ts: c.max_ts,
-                        live: false,
-                    }
-                }
-                Handle::Active(i) => {
-                    let c = &self.scan.active[i].catalog;
-                    UnitMeta {
-                        source_id: c.source_id,
-                        min_ts: c.min_ts,
-                        max_ts: c.max_ts,
-                        live: true,
-                    }
-                }
-            })
+            .map(|handle| self.meta_for_handle(handle))
             .collect()
     }
 
@@ -604,10 +595,7 @@ impl LocalDirSnapshot {
     #[must_use]
     pub fn unit_catalog(&self, idx: usize) -> Option<&Catalog> {
         let handle = self.handles().nth(idx)?;
-        Some(match handle {
-            Handle::Sealed(i) => &self.scan.sealed[i].catalog,
-            Handle::Active(i) => &self.scan.active[i].catalog,
-        })
+        Some(self.catalog_for_handle(handle))
     }
 
     /// Ordered sealed descriptors pinned by this snapshot.
@@ -644,7 +632,7 @@ impl LocalDirSnapshot {
             .handles()
             .nth(idx)
             .ok_or(SealedFactError::UnitOutOfRange { unit_idx: idx })?;
-        let Handle::Sealed(sealed_idx) = handle else {
+        let UnitHandle::Sealed(sealed_idx) = handle else {
             return Err(SealedFactError::LiveUnit { unit_idx: idx });
         };
         let sealed = &self.scan.sealed[sealed_idx];
@@ -865,7 +853,7 @@ impl LocalDirSnapshot {
             ))
         })?;
         match handle {
-            Handle::Sealed(i) => {
+            UnitHandle::Sealed(i) => {
                 let su = &self.scan.sealed[i];
                 let entry = su.catalog.entries.get(entry_idx).ok_or_else(|| {
                     ReadError::Io(io::Error::new(
@@ -876,7 +864,7 @@ impl LocalDirSnapshot {
                 let file = self.dir.open_sealed(su)?;
                 PgmUnit::open(file)?.decode(entry)
             }
-            Handle::Active(i) => {
+            UnitHandle::Active(i) => {
                 let ap = &self.scan.active[i];
                 let cached_entry = ap.catalog.entries.get(entry_idx).ok_or_else(|| {
                     ReadError::Io(io::Error::new(
@@ -921,7 +909,7 @@ impl LocalDirSnapshot {
             ))
         })?;
         match handle {
-            Handle::Sealed(i) => {
+            UnitHandle::Sealed(i) => {
                 let su = &self.scan.sealed[i];
                 let entry = su.catalog.entries.get(entry_idx).ok_or_else(|| {
                     ReadError::Io(io::Error::new(
@@ -932,7 +920,7 @@ impl LocalDirSnapshot {
                 let file = self.dir.open_sealed(su)?;
                 PgmUnit::open(file)?.decode_rows(entry)
             }
-            Handle::Active(i) => {
+            UnitHandle::Active(i) => {
                 let ap = &self.scan.active[i];
                 let cached_entry = ap.catalog.entries.get(entry_idx).ok_or_else(|| {
                     ReadError::Io(io::Error::new(
@@ -979,12 +967,12 @@ impl LocalDirSnapshot {
             ))
         })?;
         match handle {
-            Handle::Sealed(i) => {
+            UnitHandle::Sealed(i) => {
                 let su = &self.scan.sealed[i];
                 let file = self.dir.open_sealed(su)?;
                 PgmUnit::open(file)?.dictionary()
             }
-            Handle::Active(i) => {
+            UnitHandle::Active(i) => {
                 let ap = &self.scan.active[i];
                 let bytes = match self.dir.read_active_part(ap) {
                     Ok(b) => b,
@@ -1020,22 +1008,41 @@ impl LocalDirSnapshot {
     /// Returns [`ReadError`] when `idx` is out of range, the unit cannot be
     /// opened, or the active part changed since the snapshot was taken.
     pub fn open_unit(&self, idx: usize) -> Result<OpenUnit, ReadError> {
-        #[cfg(test)]
-        OPEN_UNIT_CALLS.with(|c| c.set(c.get() + 1));
-
         let handle = self.handles().nth(idx).ok_or_else(|| {
             ReadError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unit index {idx} is out of range"),
             ))
         })?;
+        self.open_unit_handle(idx, handle)
+    }
+
+    pub(crate) fn open_unit_handle(
+        &self,
+        idx: usize,
+        handle: UnitHandle,
+    ) -> Result<OpenUnit, ReadError> {
+        #[cfg(test)]
+        OPEN_UNIT_CALLS.with(|c| c.set(c.get() + 1));
+        #[cfg(test)]
+        if FORCED_STALE_OPEN_UNIT_CALLS.with(|calls| {
+            let remaining = calls.get();
+            calls.set(remaining.saturating_sub(1));
+            remaining != 0
+        }) {
+            return Err(ReadError::StaleSnapshot { unit_idx: idx });
+        }
         match handle {
-            Handle::Sealed(i) => {
+            UnitHandle::Sealed(i) => {
                 let su = &self.scan.sealed[i];
                 let file = self.dir.open_sealed(su)?;
-                Ok(OpenUnit::Sealed(PgmUnit::open(file)?))
+                let unit = PgmUnit::open(file)?;
+                if unit.catalog() != &su.catalog {
+                    return Err(ReadError::StaleSnapshot { unit_idx: idx });
+                }
+                Ok(OpenUnit::Sealed(unit))
             }
-            Handle::Active(i) => {
+            UnitHandle::Active(i) => {
                 let ap = &self.scan.active[i];
                 let bytes = match self.dir.read_active_part(ap) {
                     Ok(b) => b,
@@ -1057,9 +1064,44 @@ impl LocalDirSnapshot {
         }
     }
 
-    /// Iterator over `Handle` values in the same order as `units()`.
-    fn handles(&self) -> impl Iterator<Item = Handle> + '_ {
-        let sealed_iter = (0..self.scan.sealed.len()).map(Handle::Sealed);
+    pub(crate) fn unit_descriptors(&self) -> impl Iterator<Item = UnitDescriptor<'_>> {
+        self.handles().enumerate().map(|(index, handle)| {
+            let catalog = self.catalog_for_handle(handle);
+            UnitDescriptor {
+                index,
+                handle,
+                meta: self.meta_for_handle(handle),
+                catalog,
+                eager_open_bytes: match handle {
+                    UnitHandle::Sealed(_) => 0,
+                    UnitHandle::Active(i) => {
+                        u64::try_from(self.scan.active[i].part.len).unwrap_or(u64::MAX)
+                    }
+                },
+            }
+        })
+    }
+
+    fn catalog_for_handle(&self, handle: UnitHandle) -> &Catalog {
+        match handle {
+            UnitHandle::Sealed(i) => &self.scan.sealed[i].catalog,
+            UnitHandle::Active(i) => &self.scan.active[i].catalog,
+        }
+    }
+
+    fn meta_for_handle(&self, handle: UnitHandle) -> UnitMeta {
+        let catalog = self.catalog_for_handle(handle);
+        UnitMeta {
+            source_id: catalog.source_id,
+            min_ts: catalog.min_ts,
+            max_ts: catalog.max_ts,
+            live: matches!(handle, UnitHandle::Active(_)),
+        }
+    }
+
+    /// Iterator over handles in the same order as `units()`.
+    fn handles(&self) -> impl Iterator<Item = UnitHandle> + '_ {
+        let sealed_iter = (0..self.scan.sealed.len()).map(UnitHandle::Sealed);
 
         let active_iter = self
             .scan
@@ -1067,7 +1109,7 @@ impl LocalDirSnapshot {
             .iter()
             .enumerate()
             .filter(|(_, ap)| !self.scan.sealed.iter().any(|su| su.catalog == ap.catalog))
-            .map(|(i, _)| Handle::Active(i));
+            .map(|(i, _)| UnitHandle::Active(i));
 
         sealed_iter.chain(active_iter)
     }

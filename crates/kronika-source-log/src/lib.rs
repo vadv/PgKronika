@@ -23,6 +23,7 @@ mod collector;
 mod normalize;
 mod parser;
 mod state;
+mod status;
 mod tailer;
 
 pub use collector::{
@@ -33,6 +34,7 @@ pub use collector::{
 pub use normalize::ErrorCategory;
 pub use parser::{LogSeverity, ParserKind};
 pub use state::TailState;
+pub use status::{LogSourceReason, LogSourceState, LogSourceStatus};
 pub use tailer::{TailCaps, TailGaps};
 
 /// Type id for grouped log errors.
@@ -51,6 +53,8 @@ pub const PG_LOG_LIFECYCLE_TYPE_ID: u32 = 1_028_001;
 pub const PG_LOG_GAP_TYPE_ID: u32 = 1_029_001;
 /// Type id for temporary-file log events.
 pub const PG_LOG_TEMP_FILES_TYPE_ID: u32 = 1_030_001;
+/// Type id for `PostgreSQL` log source availability.
+pub const PG_LOG_SOURCE_STATUS_TYPE_ID: u32 = 1_039_001;
 
 /// Maximum normalized error pattern length, bytes.
 pub const MAX_PATTERN_BYTES: usize = 256;

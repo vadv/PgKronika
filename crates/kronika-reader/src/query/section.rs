@@ -15,7 +15,7 @@ use crate::{Cell, LocalDirSnapshot, ReadError, Resolved};
 
 /// How many times `sections` refreshes a stale snapshot before giving up on the
 /// stale unit and letting its time fall into a gap.
-const MAX_REFRESH: u32 = 2;
+pub(super) const MAX_REFRESH: u32 = 2;
 
 /// Maximum number of output cells retained by one query.
 const MAX_MATERIALIZED_CELLS: usize = 10_000_000;
@@ -508,7 +508,12 @@ fn compare_by_sort_key(a: &OutRow, b: &OutRow, sort_key: &[&str]) -> std::cmp::O
 /// Ties on the sort key break on the other `columns` (those not in `sort_key`,
 /// in `columns` order), so equal-sort-key rows still order deterministically —
 /// the property keyset pagination needs to tile a stream without gap or repeat.
-fn compare_full(a: &OutRow, b: &OutRow, columns: &[&str], sort_key: &[&str]) -> std::cmp::Ordering {
+pub(super) fn compare_full(
+    a: &OutRow,
+    b: &OutRow,
+    columns: &[&str],
+    sort_key: &[&str],
+) -> std::cmp::Ordering {
     let by_key = compare_by_sort_key(a, b, sort_key);
     if by_key != std::cmp::Ordering::Equal {
         return by_key;

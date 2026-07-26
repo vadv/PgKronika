@@ -1,7 +1,59 @@
 @pg_log
-Feature: PostgreSQL log-domain stderr fixtures
-  The collector reads deterministic stderr fixtures through KRONIKA_LOG_PATH.
-  The sealed rows contain grouped bounded facts, never raw line dumps.
+Feature: PostgreSQL stderr collection
+  The collector discovers and tails PostgreSQL stderr files by default. Live
+  scenarios prove the database-to-segment path; deterministic fixtures cover
+  the remaining parser cases. Sealed rows contain grouped bounded facts, never
+  raw line dumps.
+
+  @pg16 @serial
+  Scenario: default collection discovers a quiet PostgreSQL stderr file
+    Given a fresh database on PostgreSQL 16
+    When the collector snapshots the segment
+    Then section pg_log_source_status has a row with state = 0:
+      | reason              | 0 |
+      | parser_kind         | 0 |
+      | dict_dropped_fields | 0 |
+    And section pg_log_errors is absent from the segment
+    And the web API reports PostgreSQL log state collecting for the only source
+
+  @pg16 @serial
+  Scenario: collection follows a PostgreSQL stderr log rotation
+    Given a fresh database on PostgreSQL 16
+    When the running collector observes a PostgreSQL stderr log rotation
+    Then section pg_log_source_status has 2 rows
+    And pg_log_source_status contains two distinct source_path values
+
+  @live_statement_timeout @serial
+  Scenario Outline: a real statement timeout is collected on PostgreSQL <major>
+    Given a fresh database on PostgreSQL <major>
+    When the running collector captures a real PostgreSQL statement timeout
+    Then section pg_log_errors has a row with pattern = "canceling statement due to statement timeout":
+      | severity  | 0                                                               |
+      | category  | 3                                                               |
+      | sqlstate  | 57014                                                           |
+      | count     | 1                                                               |
+      | sample    | canceling statement due to statement timeout                    |
+      | statement | SELECT pg_sleep(0.2) /* pgkronika_bdd_statement_timeout */       |
+
+    @pg15
+    Examples: PostgreSQL 15
+      | major |
+      | 15    |
+
+    @pg16
+    Examples: PostgreSQL 16
+      | major |
+      | 16    |
+
+    @pg17
+    Examples: PostgreSQL 17
+      | major |
+      | 17    |
+
+    @pg18
+    Examples: PostgreSQL 18
+      | major |
+      | 18    |
 
   @pg16 @serial
   Scenario: stderr errors are grouped into pg_log_errors

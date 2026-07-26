@@ -424,11 +424,44 @@ pub struct PgLogGapV1 {
     pub parser_dropped_lines: u32,
 }
 
+/// Type `1_039_001`: availability of the `PostgreSQL` log source.
+///
+/// One row is emitted on first observation, on a state-key change, and as a
+/// bounded heartbeat. It describes collection quality, not `PostgreSQL`
+/// health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Section)]
+#[section(
+    id = 1_039_001,
+    name = "pg_log_source_status",
+    semantics = on_change,
+    sort_key("ts")
+)]
+pub struct PgLogSourceStatusV1 {
+    /// Observation time, unix microseconds.
+    #[column(t)]
+    pub ts: Ts,
+    /// `0` `collecting`, `1` `collecting_degraded`, `2` `unavailable`, `3` `disabled`.
+    #[column(l)]
+    pub state: u8,
+    /// `0` `none` through `7` `read_error`, as documented in the registry.
+    #[column(l)]
+    pub reason: u8,
+    /// `0` `stderr`, `1` `csvlog`, `2` `unknown`.
+    #[column(l)]
+    pub parser_kind: u8,
+    /// Current or last known source path.
+    #[column(l)]
+    pub source_path: Option<StrId>,
+    /// String fields dropped because dictionary interning failed.
+    #[column(g)]
+    pub dict_dropped_fields: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         PgLogAutovacuumV1, PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1,
-        PgLogLockWaitV1, PgLogSlowQueryV1, PgLogTempFileV1,
+        PgLogLockWaitV1, PgLogSlowQueryV1, PgLogSourceStatusV1, PgLogTempFileV1,
     };
     use crate::{Section, StrId, Ts, lint};
 
@@ -444,9 +477,62 @@ mod tests {
                 PgLogLifecycleV1::CONTRACT,
                 PgLogGapV1::CONTRACT,
                 PgLogTempFileV1::CONTRACT,
+                PgLogSourceStatusV1::CONTRACT,
             ]),
             Ok(())
         );
+    }
+
+    #[test]
+    fn source_status_contract_shape() {
+        let contract = PgLogSourceStatusV1::CONTRACT;
+        assert_eq!(contract.type_id.get(), 1_039_001);
+        assert_eq!(contract.name, "pg_log_source_status");
+        assert_eq!(contract.semantics, crate::Semantics::OnChange);
+        assert_eq!(contract.sort_key, ["ts"]);
+        assert_eq!(contract.columns.len(), 6);
+        assert_eq!(
+            contract.column("source_path").map(|column| column.nullable),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn source_status_roundtrip_preserves_every_state_and_nullable_path() {
+        crate::assert_roundtrips(&[
+            PgLogSourceStatusV1 {
+                ts: Ts(10),
+                state: 0,
+                reason: 0,
+                parser_kind: 0,
+                source_path: Some(StrId(7)),
+                dict_dropped_fields: 0,
+            },
+            PgLogSourceStatusV1 {
+                ts: Ts(20),
+                state: 1,
+                reason: 4,
+                parser_kind: 0,
+                source_path: Some(StrId(7)),
+                dict_dropped_fields: 0,
+            },
+            PgLogSourceStatusV1 {
+                ts: Ts(30),
+                state: 2,
+                reason: 6,
+                parser_kind: 2,
+                source_path: None,
+                dict_dropped_fields: 1,
+            },
+            PgLogSourceStatusV1 {
+                ts: Ts(40),
+                state: 3,
+                reason: 0,
+                parser_kind: 2,
+                source_path: None,
+                dict_dropped_fields: 0,
+            },
+        ]);
     }
 
     #[test]

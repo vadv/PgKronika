@@ -1,10 +1,43 @@
 use crate::config::{
-    validate_cardinality, validate_heavy_cap, validate_max_lock_rows, validate_max_plans,
-    validate_plan_text_limits, validate_replication_detail_bounds, validate_settings_row_count,
+    resolve_log_enabled, resolve_log_status_interval, validate_cardinality, validate_heavy_cap,
+    validate_max_lock_rows, validate_max_plans, validate_plan_text_limits,
+    validate_replication_detail_bounds, validate_settings_row_count,
 };
 use crate::plans_source::{plans_reread_delay, truncate_to_boundary};
 use kronika_registry::MAX_SECTION_ROWS;
 use kronika_source_pg::replication_details::ReplicationDetailBounds;
+use std::time::Duration;
+
+#[test]
+fn pg_log_is_enabled_when_the_flag_is_absent() {
+    assert!(resolve_log_enabled(None).expect("default log flag"));
+}
+
+#[test]
+fn explicit_false_disables_pg_log_independently_of_a_path_override() {
+    let path_override = Some("/var/lib/postgresql/log/postgresql.log");
+    assert!(path_override.is_some());
+    assert!(!resolve_log_enabled(Some("0")).expect("explicit false"));
+}
+
+#[test]
+fn pg_log_status_interval_defaults_to_five_minutes() {
+    assert_eq!(
+        resolve_log_status_interval(None).expect("default status interval"),
+        Duration::from_mins(5)
+    );
+}
+
+#[test]
+fn pg_log_status_interval_rejects_zero() {
+    let error =
+        resolve_log_status_interval(Some("0")).expect_err("a zero heartbeat interval must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("KRONIKA_PG_LOG_STATUS_INTERVAL_S")
+    );
+}
 
 #[test]
 fn cardinality_validation_passes_at_defaults() {

@@ -81,15 +81,35 @@ pub(crate) fn env_u64(key: &str, default: u64) -> Result<u64> {
     )
 }
 
+fn parse_bool(key: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("{key} must be one of 1/0, true/false, yes/no, on/off"),
+    }
+}
+
 fn env_bool(key: &str, default: bool) -> Result<bool> {
-    std::env::var(key).map_or_else(
-        |_| Ok(default),
-        |v| match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            _ => anyhow::bail!("{key} must be one of 1/0, true/false, yes/no, on/off"),
-        },
-    )
+    std::env::var(key).map_or_else(|_| Ok(default), |value| parse_bool(key, &value))
+}
+
+pub(crate) fn resolve_log_enabled(raw: Option<&str>) -> Result<bool> {
+    raw.map_or(Ok(true), |value| {
+        parse_bool("KRONIKA_PG_LOG_ENABLED", value)
+    })
+}
+
+pub(crate) fn resolve_log_status_interval(raw: Option<&str>) -> Result<Duration> {
+    let seconds = raw.map_or(Ok(300), |value| {
+        value
+            .parse::<u64>()
+            .context("KRONIKA_PG_LOG_STATUS_INTERVAL_S is not a u64")
+    })?;
+    anyhow::ensure!(
+        seconds > 0,
+        "KRONIKA_PG_LOG_STATUS_INTERVAL_S must be greater than 0"
+    );
+    Ok(Duration::from_secs(seconds))
 }
 
 impl Config {
@@ -257,7 +277,10 @@ fn log_config_from_env(out_dir: &Path) -> Result<LogConfig> {
         .ok()
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());
-    let enabled = env_bool("KRONIKA_PG_LOG_ENABLED", path_override.is_some())?;
+    let enabled_raw = std::env::var("KRONIKA_PG_LOG_ENABLED").ok();
+    let enabled = resolve_log_enabled(enabled_raw.as_deref())?;
+    let status_interval_raw = std::env::var("KRONIKA_PG_LOG_STATUS_INTERVAL_S").ok();
+    let status_interval = resolve_log_status_interval(status_interval_raw.as_deref())?;
     let root_override = std::env::var("KRONIKA_LOG_ROOT")
         .ok()
         .map(PathBuf::from)
@@ -281,6 +304,7 @@ fn log_config_from_env(out_dir: &Path) -> Result<LogConfig> {
         state_path,
         start_at_beginning: env_bool("KRONIKA_LOG_START_AT_BEGINNING", false)?,
         discovery_interval: Duration::from_secs(env_u64("KRONIKA_LOG_DISCOVERY_INTERVAL_S", 60)?),
+        status_interval,
         tail_caps: kronika_source_log::TailCaps::default(),
     })
 }

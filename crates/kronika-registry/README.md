@@ -331,12 +331,16 @@ nor defines its interval.
 | `ConditionalFull` | A full snapshot is emitted only when a collection condition holds. An absent body does not by itself mean an empty source. | `pg_locks`, `pg_stat_progress_vacuum`, and the vacuum observation. |
 | `EventStream` | The body contains events observed during the segment interval. | Typed PostgreSQL log events. |
 | `Changed` | Changed cumulative-counter rows plus an `is_baseline` row are emitted. | Supported by the `Semantics` enum and linter, but no current registered contract uses it. |
-| `OnChange` | A snapshot is emitted on change or after a periodic refresh. | `pg_settings`, `os_mountinfo`, and `os_topology`. |
+| `OnChange` | A snapshot is emitted on change or after a periodic refresh. | `pg_settings`, `os_mountinfo`, `os_topology`, and `pg_log_source_status`. |
 
 Collection semantics do not prove that a particular snapshot is complete.
 Top-N selection, timeouts, insufficient privileges, and collector-side loss
 are separate signals. If the source emits no completeness provenance, it
 cannot be inferred from `semantics`.
+
+| Logical section | What its `OnChange` row means |
+| --- | --- |
+| `pg_log_source_status` (`1_039_001`) | PostgreSQL log-source availability at the first observation, after a state/reason/parser/path change, or at the bounded heartbeat. A quiet successful read is `collecting`; this status is provenance and does not enter anomaly or health scoring. |
 
 ## Snapshot completeness
 

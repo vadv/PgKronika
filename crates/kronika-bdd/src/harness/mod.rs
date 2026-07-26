@@ -589,7 +589,6 @@ impl HarnessState {
     pub(crate) fn write_log_fixture(&mut self, filename: &str, content: &str) -> Result<PathBuf> {
         if self.log_fixture.is_none() {
             let dir = TempDir::new().context("create fixture PostgreSQL log root")?;
-            self.add_collector_env("KRONIKA_PG_LOG_ENABLED".to_owned(), "1".to_owned());
             self.add_collector_env("KRONIKA_LOG_FORMAT".to_owned(), "stderr".to_owned());
             self.add_collector_env("KRONIKA_LOG_START_AT_BEGINNING".to_owned(), "1".to_owned());
             self.add_collector_env(

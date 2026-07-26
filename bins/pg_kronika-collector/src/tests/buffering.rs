@@ -3,7 +3,14 @@ use crate::buffering::{
     push_progress_vacuum, push_replication_instance, push_statements, push_user_indexes,
     push_user_tables,
 };
+use crate::logging::LogLevel;
+use crate::pg_log_source::{push_log_collection, push_log_source_status, source_status_log_level};
 use crate::source_contracts::activity_dict_limits;
+use kronika_format::DictLimits;
+use kronika_source_log::{
+    LogCollection, LogCollector, LogConfig, LogSourceReason, LogSourceState, LogSourceStatus,
+    ParserKind,
+};
 use kronika_source_pg::archiver::ArchiverRow;
 use kronika_source_pg::database::{DatabaseRow, DatabaseVersion};
 use kronika_source_pg::io::{IoRow, IoVersion};
@@ -16,6 +23,98 @@ use kronika_source_pg::user_indexes::{UserIndexesRow, UserIndexesVersion};
 use kronika_source_pg::user_tables::{UserTablesRow, UserTablesVersion};
 use kronika_source_pg::{ActivityRow, ActivityVersion};
 use kronika_writer::{Interner, SectionBuffers, dict};
+use std::path::PathBuf;
+
+#[test]
+fn push_log_collection_buffers_source_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let collector = LogCollector::new(LogConfig::disabled(dir.path())).expect("log collector");
+    let mut collection = LogCollection::default();
+    collection.source_status = Some(LogSourceStatus {
+        ts: 1_000,
+        state: LogSourceState::Collecting,
+        reason: LogSourceReason::None,
+        parser_kind: ParserKind::Stderr,
+        source_path: Some(PathBuf::from("/pg/log/postgresql.log")),
+    });
+    collection.source_status_changed = true;
+    let mut buffers = SectionBuffers::new();
+    let mut interner = Interner::new(activity_dict_limits());
+
+    push_log_collection(
+        &mut buffers,
+        &mut interner,
+        &collector,
+        &mut collection,
+        1_000,
+    )
+    .expect("buffer status");
+    let dictionaries = dict::encode(interner.window()).expect("encode dictionary");
+    let part = buffers
+        .flush(&dictionaries, 7)
+        .expect("flush status")
+        .expect("status creates a part");
+    let catalog = kronika_format::validate_part(&part).expect("valid PGM");
+    assert!(
+        catalog
+            .entries
+            .iter()
+            .any(|entry| { entry.type_id == 1_039_001 && entry.rows == 1 })
+    );
+}
+
+#[test]
+fn source_status_survives_a_full_dictionary_without_its_path() {
+    let limits = DictLimits::new(1, 1)
+        .expect("minimal valid limits")
+        .with_max_total_bytes(1)
+        .expect("one-byte dictionary");
+    let mut interner = Interner::new(limits);
+    interner.intern(b"x").expect("fill dictionary");
+    let mut buffers = SectionBuffers::new();
+    let dropped = push_log_source_status(
+        &mut buffers,
+        &mut interner,
+        &LogSourceStatus {
+            ts: 1_000,
+            state: LogSourceState::Unavailable,
+            reason: LogSourceReason::PermissionDenied,
+            parser_kind: ParserKind::Stderr,
+            source_path: Some(PathBuf::from("/pg/log/postgresql.log")),
+        },
+    )
+    .expect("buffer status without path");
+    assert_eq!(dropped, 1);
+    let dictionaries = dict::encode(interner.window()).expect("encode dictionary");
+    let part = buffers
+        .flush(&dictionaries, 7)
+        .expect("flush status")
+        .expect("status row remains");
+    let catalog = kronika_format::validate_part(&part).expect("valid PGM");
+    assert!(
+        catalog
+            .entries
+            .iter()
+            .any(|entry| { entry.type_id == 1_039_001 && entry.rows == 1 })
+    );
+}
+
+#[test]
+fn status_process_log_level_distinguishes_transition_and_heartbeat() {
+    let mut collection = LogCollection::default();
+    assert_eq!(source_status_log_level(&collection), None);
+    collection.source_status = Some(LogSourceStatus {
+        ts: 1,
+        state: LogSourceState::Collecting,
+        reason: LogSourceReason::None,
+        parser_kind: ParserKind::Stderr,
+        source_path: None,
+    });
+    collection.source_status_changed = true;
+    assert_eq!(source_status_log_level(&collection), Some(LogLevel::Info));
+    collection.source_status_changed = false;
+    assert_eq!(source_status_log_level(&collection), Some(LogLevel::Debug));
+}
 
 fn client_row(pid: i32) -> ActivityRow {
     ActivityRow {

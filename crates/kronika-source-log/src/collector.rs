@@ -10,6 +10,9 @@ use tokio_postgres::Client;
 use crate::normalize::{ErrorCategory, classify_error, normalize_error};
 use crate::parser::{ContinuationKind, LogSeverity, ParsedLine, ParserKind, parse_stderr_line};
 use crate::state::TailState;
+use crate::status::{
+    LogSourceReason, LogSourceState, LogSourceStatus, StatusTracker, StatusUpdate,
+};
 use crate::tailer::{TailCaps, TailGaps, TailLine, read_batch};
 use crate::{MAX_PATTERN_BYTES, MAX_TEXT_BYTES, truncate_utf8, u32_saturating};
 
@@ -30,6 +33,8 @@ pub struct LogConfig {
     pub start_at_beginning: bool,
     /// Minimum interval between PG discovery queries.
     pub discovery_interval: Duration,
+    /// Interval between unchanged source-status heartbeats.
+    pub status_interval: Duration,
     /// Tailer caps.
     pub tail_caps: TailCaps,
 }
@@ -46,23 +51,26 @@ impl LogConfig {
             state_path: out_dir.join("pg_log_tail.state"),
             start_at_beginning: false,
             discovery_interval: Duration::from_mins(1),
+            status_interval: Duration::from_mins(5),
             tail_caps: TailCaps::default(),
         }
     }
 }
 
-/// Discovery outcome for structured collector logging.
+/// Result of the latest path-discovery attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryStatus {
-    /// Source is available.
+    /// A supported current file was discovered.
     Available,
-    /// Log destination is known but not implemented in this PR.
+    /// This cycle had no `PostgreSQL` client for discovery.
+    PostgresUnavailable,
+    /// `PostgreSQL` reported no current stderr file.
+    NoCurrentLogfile,
+    /// `log_destination` does not expose a supported file.
     UnsupportedFormat,
-    /// `PostgreSQL` could not report a usable log path.
-    SourceUnavailable,
-    /// Discovery query failed; the previous source, if any, remains usable.
+    /// A discovery SQL query failed.
     QueryFailed,
-    /// Log collection is disabled.
+    /// The source is explicitly disabled.
     Disabled,
 }
 
@@ -453,7 +461,19 @@ pub struct LogCollection {
     pub gaps: Vec<LogGap>,
     /// Discovery status for logs.
     pub discovery_status: Option<DiscoveryStatus>,
+    /// Status row emitted by this observation, if first/change/heartbeat is due.
+    pub source_status: Option<LogSourceStatus>,
+    /// Previous observed status when this observation emitted a row.
+    pub previous_source_status: Option<LogSourceStatus>,
+    /// Whether the emitted row changes the status key.
+    pub source_status_changed: bool,
+    /// Time remaining before the next SQL discovery attempt.
+    pub next_discovery_in: Option<Duration>,
     next_state: Option<TailState>,
+    next_source: Option<LogSource>,
+    rotation_bytes_skipped: u64,
+    consumes_pending_rotation: bool,
+    pending_status: Option<StatusUpdate>,
 }
 
 /// Stateful log collector.
@@ -463,7 +483,9 @@ pub struct LogCollector {
     state: Option<TailState>,
     source: Option<LogSource>,
     next_discovery: Option<Instant>,
-    disabled_reported: bool,
+    last_discovery: Option<DiscoveryStatus>,
+    status_tracker: StatusTracker,
+    pending_rotation_bytes_skipped: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,6 +562,7 @@ impl LogCollector {
     /// Returns I/O errors from reading the state file.
     pub fn new(config: LogConfig) -> io::Result<Self> {
         let state = TailState::load(&config.state_path)?;
+        let status_tracker = StatusTracker::new(config.status_interval, state.is_some());
         let source = state.as_ref().map(|state| LogSource {
             path: state.path.clone(),
             parser_kind: state.parser_kind,
@@ -549,7 +572,9 @@ impl LogCollector {
             state,
             source,
             next_discovery: None,
-            disabled_reported: false,
+            last_discovery: None,
+            status_tracker,
+            pending_rotation_bytes_skipped: 0,
         })
     }
 
@@ -560,59 +585,65 @@ impl LogCollector {
     }
 
     /// Collect one bounded log batch.
+    pub async fn collect(&mut self, client: Option<&Client>, ts: i64) -> LogCollection {
+        self.collect_at(client, ts, Instant::now()).await
+    }
+
     #[allow(
         clippy::too_many_lines,
-        reason = "collection keeps discovery, tail gaps, and commit state in one auditable boundary"
+        reason = "collection keeps discovery, read precedence, tail gaps, and commit state in one auditable boundary"
     )]
-    pub async fn collect(&mut self, client: Option<&Client>, ts: i64) -> LogCollection {
+    async fn collect_at(
+        &mut self,
+        client: Option<&Client>,
+        ts: i64,
+        now: Instant,
+    ) -> LogCollection {
+        let mut result = LogCollection::default();
         if !self.config.enabled {
-            let mut collection = LogCollection {
-                discovery_status: Some(DiscoveryStatus::Disabled),
-                ..LogCollection::default()
-            };
-            if !self.disabled_reported {
-                collection
-                    .gaps
-                    .push(self.simple_gap(ts, GapReason::Disabled));
-                self.disabled_reported = true;
-            }
-            return collection;
+            result.discovery_status = Some(DiscoveryStatus::Disabled);
+            self.stage_status(
+                &mut result,
+                self.make_status(ts, LogSourceState::Disabled, LogSourceReason::None),
+                ts,
+                now,
+            );
+            return result;
         }
 
-        let mut result = LogCollection::default();
-        let discovery = self.refresh_source(client).await;
+        let (discovery, discovered_source) = self.refresh_source_at(client, now).await;
         result.discovery_status = Some(discovery);
-        if matches!(
-            discovery,
-            DiscoveryStatus::UnsupportedFormat
-                | DiscoveryStatus::SourceUnavailable
-                | DiscoveryStatus::QueryFailed
-        ) {
-            let reason = match discovery {
-                DiscoveryStatus::UnsupportedFormat => GapReason::UnsupportedFormat,
-                DiscoveryStatus::QueryFailed => GapReason::QueryFailed,
-                _ => GapReason::SourceUnavailable,
-            };
-            result.gaps.push(self.simple_gap(ts, reason));
-            if discovery != DiscoveryStatus::QueryFailed {
-                return result;
+        if let Some(discovered_source) = discovered_source {
+            match self.source.as_ref() {
+                None => self.source = Some(discovered_source),
+                Some(current) if current != &discovered_source => {
+                    result.next_source = Some(discovered_source);
+                    result.rotation_bytes_skipped = self.pending_rotation_bytes_skipped;
+                }
+                Some(_) => {}
             }
         }
 
         let Some(source) = self.source.clone() else {
-            result
-                .gaps
-                .push(self.simple_gap(ts, GapReason::SourceUnavailable));
+            self.stage_status(
+                &mut result,
+                self.make_status(ts, LogSourceState::Unavailable, discovery_reason(discovery)),
+                ts,
+                now,
+            );
             return result;
         };
         if source.parser_kind != ParserKind::Stderr {
-            result.gaps.push(LogGap {
-                parser_kind: source.parser_kind,
-                reason: GapReason::UnsupportedFormat,
-                source_path: Some(source.path),
+            self.stage_status(
+                &mut result,
+                self.make_status(
+                    ts,
+                    LogSourceState::Unavailable,
+                    LogSourceReason::UnsupportedFormat,
+                ),
                 ts,
-                ..empty_gap()
-            });
+                now,
+            );
             return result;
         }
 
@@ -625,17 +656,24 @@ impl LogCollector {
         ) {
             Ok(batch) => batch,
             Err(err) => {
-                let reason = read_error_reason(err.kind());
-                result.gaps.push(LogGap {
-                    parser_kind: source.parser_kind,
-                    reason,
-                    source_path: Some(source.path),
-                    ts,
-                    ..empty_gap()
-                });
+                let (state, reason) = read_error_status(err.kind());
+                self.stage_status(&mut result, self.make_status(ts, state, reason), ts, now);
                 return result;
             }
         };
+        if batch.gaps.missing_files != 0 {
+            self.stage_status(
+                &mut result,
+                self.make_status(
+                    ts,
+                    LogSourceState::Unavailable,
+                    LogSourceReason::MissingFile,
+                ),
+                ts,
+                now,
+            );
+            return result;
+        }
         let mut parse_gaps = ParseGaps::default();
         let parsed = parse_stderr_records(&batch.lines, ts, &mut parse_gaps);
         result.errors = parsed.errors;
@@ -651,7 +689,9 @@ impl LogCollector {
             source.parser_kind,
             batch.gaps,
             batch.next_state.as_ref(),
+            self.pending_rotation_bytes_skipped,
         ));
+        result.consumes_pending_rotation = self.pending_rotation_bytes_skipped != 0;
         if parse_gaps.invalid_utf8 != 0 {
             result.gaps.push(LogGap {
                 ts,
@@ -686,6 +726,11 @@ impl LogCollector {
             });
         }
         result.next_state = batch.next_state;
+        if result.next_source.is_some() {
+            result.rotation_bytes_skipped = batch.unread_bytes;
+        }
+        let (state, reason) = readable_status(discovery);
+        self.stage_status(&mut result, self.make_status(ts, state, reason), ts, now);
         result
     }
 
@@ -695,15 +740,26 @@ impl LogCollector {
     ///
     /// Returns filesystem errors from saving the state file.
     pub fn commit(&mut self, collection: &LogCollection) -> io::Result<()> {
-        let Some(state) = &collection.next_state else {
-            return Ok(());
-        };
-        state.save(&self.config.state_path)?;
-        self.state = Some(state.clone());
-        self.source = Some(LogSource {
-            path: state.path.clone(),
-            parser_kind: state.parser_kind,
-        });
+        if let Some(state) = &collection.next_state {
+            if self.state.as_ref() != Some(state) {
+                state.save(&self.config.state_path)?;
+            }
+            self.state = Some(state.clone());
+            self.source = Some(LogSource {
+                path: state.path.clone(),
+                parser_kind: state.parser_kind,
+            });
+        }
+        if collection.consumes_pending_rotation {
+            self.pending_rotation_bytes_skipped = 0;
+        }
+        if let Some(source) = &collection.next_source {
+            self.source = Some(source.clone());
+            self.pending_rotation_bytes_skipped = collection.rotation_bytes_skipped;
+        }
+        if let Some(update) = &collection.pending_status {
+            self.status_tracker.commit(update);
+        }
         Ok(())
     }
 
@@ -723,40 +779,98 @@ impl LogCollector {
         });
     }
 
-    async fn refresh_source(&mut self, client: Option<&Client>) -> DiscoveryStatus {
+    async fn refresh_source_at(
+        &mut self,
+        client: Option<&Client>,
+        now: Instant,
+    ) -> (DiscoveryStatus, Option<LogSource>) {
         if let Some(path) = &self.config.path_override {
-            self.source = Some(LogSource {
-                path: path.clone(),
-                parser_kind: self.config.parser_kind,
-            });
-            return DiscoveryStatus::Available;
+            self.last_discovery = Some(DiscoveryStatus::Available);
+            return (
+                DiscoveryStatus::Available,
+                Some(LogSource {
+                    path: path.clone(),
+                    parser_kind: self.config.parser_kind,
+                }),
+            );
         }
-        let now = Instant::now();
-        if self.next_discovery.is_some_and(|deadline| now < deadline) && self.source.is_some() {
-            return DiscoveryStatus::Available;
+        if self.next_discovery.is_some_and(|deadline| now < deadline) {
+            return (
+                self.last_discovery
+                    .unwrap_or(DiscoveryStatus::PostgresUnavailable),
+                None,
+            );
         }
         self.next_discovery = Some(now + self.config.discovery_interval);
         let Some(client) = client else {
-            return if self.source.is_some() {
-                DiscoveryStatus::QueryFailed
-            } else {
-                DiscoveryStatus::SourceUnavailable
-            };
+            let status = DiscoveryStatus::PostgresUnavailable;
+            self.last_discovery = Some(status);
+            return (status, None);
         };
-        match discover(client, self.config.root_override.as_deref()).await {
-            Ok(Some(source)) => {
-                self.source = Some(source);
-                DiscoveryStatus::Available
-            }
-            Ok(None) => DiscoveryStatus::UnsupportedFormat,
-            Err(DiscoveryError::Unavailable | DiscoveryError::Query) => {
-                if self.source.is_some() {
-                    DiscoveryStatus::QueryFailed
-                } else {
-                    DiscoveryStatus::SourceUnavailable
+        let (status, discovered_source) =
+            match discover(client, self.config.root_override.as_deref()).await {
+                Ok(source) => (DiscoveryStatus::Available, Some(source)),
+                Err(status) => {
+                    if matches!(
+                        status,
+                        DiscoveryStatus::NoCurrentLogfile | DiscoveryStatus::UnsupportedFormat
+                    ) {
+                        self.source = None;
+                    }
+                    (status, None)
                 }
-            }
+            };
+        self.last_discovery = Some(status);
+        (status, discovered_source)
+    }
+
+    fn make_status(
+        &self,
+        ts: i64,
+        state: LogSourceState,
+        reason: LogSourceReason,
+    ) -> LogSourceStatus {
+        let (parser_kind, source_path) =
+            match (&self.source, &self.config.path_override, &self.state) {
+                (Some(source), _, _) => (source.parser_kind, Some(source.path.clone())),
+                (None, Some(path), _) => (self.config.parser_kind, Some(path.clone())),
+                (None, None, Some(state)) => (state.parser_kind, Some(state.path.clone())),
+                (None, None, None) => (self.config.parser_kind, None),
+            };
+        LogSourceStatus {
+            ts,
+            state,
+            reason,
+            parser_kind,
+            source_path,
         }
+    }
+
+    fn stage_status(
+        &self,
+        collection: &mut LogCollection,
+        status: LogSourceStatus,
+        ts: i64,
+        now: Instant,
+    ) {
+        let status_reason = status.reason;
+        let update = self.status_tracker.observe(status, now);
+        if update.outage_started {
+            let reason = match status_reason {
+                LogSourceReason::MissingFile => GapReason::MissingFile,
+                LogSourceReason::PermissionDenied => GapReason::PermissionDenied,
+                _ => GapReason::SourceUnavailable,
+            };
+            collection.gaps.push(self.simple_gap(ts, reason));
+        }
+        collection.source_status.clone_from(&update.row);
+        collection.previous_source_status =
+            update.row.as_ref().and_then(|_| update.previous.clone());
+        collection.source_status_changed = update.row.is_some() && update.changed;
+        collection.next_discovery_in = self
+            .next_discovery
+            .map(|deadline| deadline.saturating_duration_since(now));
+        collection.pending_status = Some(update);
     }
 
     fn simple_gap(&self, ts: i64, reason: GapReason) -> LogGap {
@@ -771,30 +885,55 @@ impl LogCollector {
     }
 }
 
-fn read_error_reason(kind: io::ErrorKind) -> GapReason {
-    if kind == io::ErrorKind::PermissionDenied {
-        GapReason::PermissionDenied
-    } else {
-        GapReason::SourceUnavailable
+const fn discovery_reason(status: DiscoveryStatus) -> LogSourceReason {
+    match status {
+        DiscoveryStatus::Available | DiscoveryStatus::Disabled => LogSourceReason::None,
+        DiscoveryStatus::PostgresUnavailable => LogSourceReason::PostgresUnavailable,
+        DiscoveryStatus::NoCurrentLogfile => LogSourceReason::NoCurrentLogfile,
+        DiscoveryStatus::UnsupportedFormat => LogSourceReason::UnsupportedFormat,
+        DiscoveryStatus::QueryFailed => LogSourceReason::DiscoveryQueryFailed,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiscoveryError {
-    Query,
-    Unavailable,
+const fn readable_status(discovery: DiscoveryStatus) -> (LogSourceState, LogSourceReason) {
+    match discovery {
+        DiscoveryStatus::Available => (LogSourceState::Collecting, LogSourceReason::None),
+        DiscoveryStatus::PostgresUnavailable => (
+            LogSourceState::CollectingDegraded,
+            LogSourceReason::PostgresUnavailable,
+        ),
+        DiscoveryStatus::QueryFailed => (
+            LogSourceState::CollectingDegraded,
+            LogSourceReason::DiscoveryQueryFailed,
+        ),
+        DiscoveryStatus::NoCurrentLogfile => (
+            LogSourceState::Unavailable,
+            LogSourceReason::NoCurrentLogfile,
+        ),
+        DiscoveryStatus::UnsupportedFormat => (
+            LogSourceState::Unavailable,
+            LogSourceReason::UnsupportedFormat,
+        ),
+        DiscoveryStatus::Disabled => (LogSourceState::Disabled, LogSourceReason::None),
+    }
 }
 
-async fn discover(
-    client: &Client,
-    root: Option<&Path>,
-) -> Result<Option<LogSource>, DiscoveryError> {
+const fn read_error_status(kind: io::ErrorKind) -> (LogSourceState, LogSourceReason) {
+    let reason = match kind {
+        io::ErrorKind::NotFound => LogSourceReason::MissingFile,
+        io::ErrorKind::PermissionDenied => LogSourceReason::PermissionDenied,
+        _ => LogSourceReason::ReadError,
+    };
+    (LogSourceState::Unavailable, reason)
+}
+
+async fn discover(client: &Client, root: Option<&Path>) -> Result<LogSource, DiscoveryStatus> {
     let destination = show(client, "log_destination").await?;
     if !destination.split(',').any(|value| value.trim() == "stderr") {
-        return Ok(None);
+        return Err(DiscoveryStatus::UnsupportedFormat);
     }
     let Some(path) = current_logfile(client).await? else {
-        return Err(DiscoveryError::Unavailable);
+        return Err(DiscoveryStatus::NoCurrentLogfile);
     };
     let full = if PathBuf::from(&path).is_absolute() {
         PathBuf::from(path)
@@ -804,29 +943,29 @@ async fn discover(
         let data_directory = show(client, "data_directory").await?;
         PathBuf::from(data_directory).join(path)
     };
-    Ok(Some(LogSource {
+    Ok(LogSource {
         path: full,
         parser_kind: ParserKind::Stderr,
-    }))
+    })
 }
 
-async fn show(client: &Client, name: &str) -> Result<String, DiscoveryError> {
+async fn show(client: &Client, name: &str) -> Result<String, DiscoveryStatus> {
     let query = format!("/* pg_kronika:log */ SHOW {name}");
     client
         .query_one(query.as_str(), &[])
         .await
-        .map_err(|_err| DiscoveryError::Query)
+        .map_err(|_err| DiscoveryStatus::QueryFailed)
         .map(|row| row.get(0))
 }
 
-async fn current_logfile(client: &Client) -> Result<Option<String>, DiscoveryError> {
+async fn current_logfile(client: &Client) -> Result<Option<String>, DiscoveryStatus> {
     client
         .query_one(
-            "/* pg_kronika:log */ SELECT pg_current_logfile('stderr')",
+            "/* pg_kronika:log */ SELECT pg_catalog.pg_current_logfile('stderr'::text)",
             &[],
         )
         .await
-        .map_err(|_err| DiscoveryError::Query)
+        .map_err(|_err| DiscoveryStatus::QueryFailed)
         .map(|row| {
             row.get::<_, Option<String>>(0)
                 .filter(|value| !value.is_empty())
@@ -1026,6 +1165,14 @@ fn parse_stderr_records(
                     && apply_lifecycle_detail(&mut records.lifecycles, last_lifecycle, text);
                 temp_statement_active = kind == ContinuationKind::Statement
                     && apply_temp_statement(&mut records.temp_files, last_temp_file, text);
+            }
+            Some(ParsedLine::DiagnosticMetadata) => {
+                last_continuation = None;
+                lock_detail_active = false;
+                lock_context_active = false;
+                lock_statement_active = false;
+                lifecycle_detail_active = false;
+                temp_statement_active = false;
             }
             None => {
                 last_key = None;
@@ -1951,6 +2098,7 @@ fn gaps_from_tail(
     parser_kind: ParserKind,
     gaps: TailGaps,
     state: Option<&TailState>,
+    rotation_bytes_skipped: u64,
 ) -> Vec<LogGap> {
     let mut rows = Vec::new();
     if gaps.backlog_bytes_skipped != 0 {
@@ -1993,23 +2141,14 @@ fn gaps_from_tail(
             ..file_state_fields(state)
         });
     }
-    if gaps.rotations != 0 {
+    if gaps.rotations != 0 || rotation_bytes_skipped != 0 {
         rows.push(LogGap {
             ts,
             source_path: Some(source_path.to_owned()),
             parser_kind,
             reason: GapReason::Rotation,
+            bytes_skipped: rotation_bytes_skipped,
             rotations: gaps.rotations,
-            ..file_state_fields(state)
-        });
-    }
-    if gaps.missing_files != 0 {
-        rows.push(LogGap {
-            ts,
-            source_path: Some(source_path.to_owned()),
-            parser_kind,
-            reason: GapReason::MissingFile,
-            missing_files: gaps.missing_files,
             ..file_state_fields(state)
         });
     }
@@ -2047,36 +2186,15 @@ fn file_state_fields(state: Option<&TailState>) -> LogGap {
     }
 }
 
-const fn empty_gap() -> LogGap {
-    LogGap {
-        ts: 0,
-        source_path: None,
-        parser_kind: ParserKind::Unknown,
-        reason: GapReason::SourceUnavailable,
-        dev: None,
-        inode: None,
-        offset: None,
-        bytes_skipped: 0,
-        truncated_lines: 0,
-        invalid_utf8: 0,
-        binary_dropped: 0,
-        rotations: 0,
-        missing_files: 0,
-        budget_exhaustions: 0,
-        dict_dropped_fields: 0,
-        parser_dropped_lines: 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AutovacuumKind, CheckpointPhase, GapReason, LifecycleKind, LockWaitKind, LogCollector,
-        LogConfig, read_error_reason,
+        AutovacuumKind, CheckpointPhase, DiscoveryStatus, GapReason, LifecycleKind, LockWaitKind,
+        LogCollection, LogCollector, LogConfig, discovery_reason, readable_status,
     };
-    use crate::{ErrorCategory, LogSeverity, ParserKind};
+    use crate::{ErrorCategory, LogSeverity, LogSourceReason, LogSourceState, ParserKind};
     use std::fmt::Write as _;
-    use std::io;
+    use std::time::{Duration, Instant};
 
     fn fixture_config(path: std::path::PathBuf, state_path: std::path::PathBuf) -> LogConfig {
         LogConfig {
@@ -2086,9 +2204,308 @@ mod tests {
             parser_kind: ParserKind::Stderr,
             state_path,
             start_at_beginning: true,
-            discovery_interval: std::time::Duration::from_mins(1),
+            discovery_interval: Duration::from_mins(1),
+            status_interval: Duration::from_mins(5),
             tail_caps: crate::TailCaps::default(),
         }
+    }
+
+    fn source_state(collection: &LogCollection) -> (LogSourceState, LogSourceReason) {
+        let status = collection
+            .source_status
+            .as_ref()
+            .expect("this observation emits status");
+        (status.state, status.reason)
+    }
+
+    #[tokio::test]
+    async fn quiet_read_emits_collecting_then_waits_for_heartbeat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        let state_path = dir.path().join("state");
+        std::fs::write(&log, "").expect("write empty log");
+        let mut config = fixture_config(log, state_path.clone());
+        config.status_interval = Duration::from_mins(5);
+        let mut collector = LogCollector::new(config).expect("collector");
+        let now = Instant::now();
+
+        let first = collector.collect_at(None, 10, now).await;
+        assert_eq!(
+            source_state(&first),
+            (LogSourceState::Collecting, LogSourceReason::None)
+        );
+        assert!(first.gaps.is_empty());
+        collector.commit(&first).expect("commit first");
+
+        let quiet = collector
+            .collect_at(None, 20, now + Duration::from_secs(299))
+            .await;
+        assert!(quiet.source_status.is_none());
+        std::fs::create_dir(state_path.with_extension("tmp"))
+            .expect("block an unnecessary state rewrite");
+        collector.commit(&quiet).expect("commit quiet observation");
+
+        let heartbeat = collector
+            .collect_at(None, 30, now + Duration::from_mins(5))
+            .await;
+        assert_eq!(
+            source_state(&heartbeat),
+            (LogSourceState::Collecting, LogSourceReason::None)
+        );
+        assert!(!heartbeat.source_status_changed);
+    }
+
+    #[tokio::test]
+    async fn rotation_drains_one_bounded_batch_then_prefers_the_new_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_log = dir.path().join("postgresql-old.log");
+        let new_log = dir.path().join("postgresql-new.log");
+        let state_path = dir.path().join("state");
+        std::fs::write(&old_log, "").expect("write old log");
+
+        let mut initial = LogCollector::new(fixture_config(old_log.clone(), state_path.clone()))
+            .expect("initial collector");
+        let initial_batch = initial.collect(None, 0).await;
+        initial.commit(&initial_batch).expect("persist old offset");
+        drop(initial);
+
+        let old_first = "2026-07-05 12:00:00 UTC [1]: ERROR:  old first failure\n";
+        let old_second = "2026-07-05 12:00:01 UTC [1]: ERROR:  old second failure\n";
+        std::fs::write(&old_log, format!("{old_first}{old_second}")).expect("append old tail");
+        std::fs::write(
+            &new_log,
+            "2026-07-05 12:00:02 UTC [1]: ERROR:  fresh failure\n",
+        )
+        .expect("write new log");
+
+        let mut config = fixture_config(new_log.clone(), state_path);
+        config.tail_caps.max_lines = 1;
+        let mut collector = LogCollector::new(config).expect("rotating collector");
+
+        let drained = collector.collect(None, 1).await;
+        assert_eq!(drained.errors.len(), 1);
+        assert!(drained.errors[0].sample.contains("old first failure"));
+        let old_offset = drained.next_state.as_ref().expect("old state").offset;
+        let skipped = std::fs::metadata(&old_log)
+            .expect("old metadata")
+            .len()
+            .saturating_sub(old_offset);
+        assert!(skipped > 0, "the bounded drain must leave an old tail");
+        collector.commit(&drained).expect("commit bounded drain");
+
+        let fresh = collector.collect(None, 2).await;
+        assert_eq!(fresh.errors.len(), 1);
+        assert!(fresh.errors[0].sample.contains("fresh failure"));
+        assert!(!fresh.errors[0].sample.contains("old second failure"));
+        let rotation = fresh
+            .gaps
+            .iter()
+            .find(|gap| gap.reason == GapReason::Rotation)
+            .expect("rotation gap");
+        assert_eq!(rotation.source_path.as_ref(), Some(&new_log));
+        assert_eq!(rotation.bytes_skipped, skipped);
+    }
+
+    #[tokio::test]
+    async fn a_continuous_missing_file_emits_one_gap_after_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(&log, "").expect("write log");
+        let mut collector =
+            LogCollector::new(fixture_config(log.clone(), dir.path().join("state")))
+                .expect("collector");
+        let now = Instant::now();
+        let healthy = collector.collect_at(None, 1, now).await;
+        collector.commit(&healthy).expect("commit healthy read");
+
+        std::fs::remove_file(&log).expect("remove log");
+        let first = collector
+            .collect_at(None, 2, now + Duration::from_secs(1))
+            .await;
+        assert_eq!(
+            source_state(&first),
+            (LogSourceState::Unavailable, LogSourceReason::MissingFile)
+        );
+        assert_eq!(
+            first
+                .gaps
+                .iter()
+                .filter(|gap| gap.reason == GapReason::MissingFile)
+                .count(),
+            1
+        );
+        collector.commit(&first).expect("commit first outage");
+
+        let repeated = collector
+            .collect_at(None, 3, now + Duration::from_secs(2))
+            .await;
+        assert!(repeated.source_status.is_none());
+        assert!(repeated.gaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_allows_a_later_outage_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(&log, "").expect("write log");
+        let mut collector =
+            LogCollector::new(fixture_config(log.clone(), dir.path().join("state")))
+                .expect("collector");
+        let now = Instant::now();
+        let healthy = collector.collect_at(None, 1, now).await;
+        collector.commit(&healthy).expect("commit healthy");
+        std::fs::remove_file(&log).expect("remove first");
+        let first = collector
+            .collect_at(None, 2, now + Duration::from_secs(1))
+            .await;
+        collector.commit(&first).expect("commit first outage");
+        std::fs::write(&log, "").expect("restore log");
+        let recovery = collector
+            .collect_at(None, 3, now + Duration::from_secs(2))
+            .await;
+        collector.commit(&recovery).expect("commit recovery");
+        std::fs::remove_file(&log).expect("remove second");
+        let second = collector
+            .collect_at(None, 4, now + Duration::from_secs(3))
+            .await;
+        assert_eq!(
+            second
+                .gaps
+                .iter()
+                .filter(|gap| gap.reason == GapReason::MissingFile)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_deadline_is_honored_before_any_source_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = LogConfig::disabled(dir.path());
+        config.enabled = true;
+        config.discovery_interval = Duration::from_mins(1);
+        let mut collector = LogCollector::new(config).expect("collector");
+        let now = Instant::now();
+
+        let first = collector.collect_at(None, 1, now).await;
+        assert_eq!(
+            source_state(&first),
+            (
+                LogSourceState::Unavailable,
+                LogSourceReason::PostgresUnavailable
+            )
+        );
+        assert!(first.gaps.is_empty());
+        collector.commit(&first).expect("commit first");
+        let deadline = collector.next_discovery;
+
+        let second = collector
+            .collect_at(None, 2, now + Duration::from_secs(5))
+            .await;
+        assert_eq!(collector.next_discovery, deadline);
+        assert!(second.source_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_saved_readable_path_degrades_when_postgres_is_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(&log, "").expect("write log");
+        let state_path = dir.path().join("state");
+        let now = Instant::now();
+        let mut first_process = LogCollector::new(fixture_config(log.clone(), state_path.clone()))
+            .expect("first collector");
+        let first = first_process.collect_at(None, 1, now).await;
+        first_process
+            .commit(&first)
+            .expect("persist valid tail state");
+        drop(first_process);
+
+        let mut config = fixture_config(log, state_path);
+        config.path_override = None;
+        let mut collector = LogCollector::new(config).expect("collector");
+
+        let batch = collector
+            .collect_at(None, 2, now + Duration::from_secs(1))
+            .await;
+        assert_eq!(
+            source_state(&batch),
+            (
+                LogSourceState::CollectingDegraded,
+                LogSourceReason::PostgresUnavailable
+            )
+        );
+        assert!(batch.gaps.is_empty());
+    }
+
+    #[test]
+    fn discovery_outcomes_map_to_status_reasons() {
+        assert_eq!(
+            discovery_reason(DiscoveryStatus::NoCurrentLogfile),
+            LogSourceReason::NoCurrentLogfile
+        );
+        assert_eq!(
+            discovery_reason(DiscoveryStatus::UnsupportedFormat),
+            LogSourceReason::UnsupportedFormat
+        );
+        assert_eq!(
+            readable_status(DiscoveryStatus::QueryFailed),
+            (
+                LogSourceState::CollectingDegraded,
+                LogSourceReason::DiscoveryQueryFailed
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_collection_emits_status_without_a_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut collector = LogCollector::new(LogConfig::disabled(dir.path())).expect("collector");
+        let now = Instant::now();
+        let first = collector.collect_at(None, 1, now).await;
+        assert_eq!(
+            source_state(&first),
+            (LogSourceState::Disabled, LogSourceReason::None)
+        );
+        assert!(first.gaps.is_empty());
+        collector.commit(&first).expect("commit disabled status");
+        let second = collector
+            .collect_at(None, 2, now + Duration::from_secs(1))
+            .await;
+        assert!(second.source_status.is_none());
+        assert!(second.gaps.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_permission_denial_is_status_without_a_gap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(&log, "").expect("write log");
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000))
+            .expect("remove read permission");
+        if std::fs::File::open(&log).is_ok() {
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600))
+                .expect("restore root-readable fixture");
+            return;
+        }
+        let mut collector =
+            LogCollector::new(fixture_config(log.clone(), dir.path().join("state")))
+                .expect("collector");
+        let batch = collector.collect_at(None, 1, Instant::now()).await;
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600))
+            .expect("restore read permission");
+
+        assert_eq!(
+            source_state(&batch),
+            (
+                LogSourceState::Unavailable,
+                LogSourceReason::PermissionDenied
+            )
+        );
+        assert!(batch.gaps.is_empty());
     }
 
     #[tokio::test]
@@ -2113,6 +2530,29 @@ mod tests {
             batch.errors[0].statement.as_deref(),
             Some("select * from a")
         );
+    }
+
+    #[tokio::test]
+    async fn preserves_statement_after_verbose_location_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:00:00 UTC [1]: ERROR:  57014: canceling statement due to statement timeout\n\
+             2026-07-05 12:00:00 UTC [1]: LOCATION:  ProcessInterrupts, postgres.c:3363\n\
+             2026-07-05 12:00:00 UTC [1]: STATEMENT:  SELECT pg_sleep(0.2)\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.errors.len(), 1);
+        let row = &batch.errors[0];
+        assert_eq!(row.category, ErrorCategory::Timeout);
+        assert_eq!(row.sqlstate.as_deref(), Some("57014"));
+        assert_eq!(row.statement.as_deref(), Some("SELECT pg_sleep(0.2)"));
     }
 
     #[tokio::test]
@@ -2635,25 +3075,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_collection_emits_explicit_gap_once() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut config = LogConfig::disabled(dir.path());
-        config.state_path = dir.path().join("state");
-        let mut collector = LogCollector::new(config).expect("collector");
-
-        let first = collector.collect(None, 1).await;
-        let second = collector.collect(None, 2).await;
-
-        assert!(
-            first
-                .gaps
-                .iter()
-                .any(|gap| gap.reason == GapReason::Disabled)
-        );
-        assert!(second.gaps.is_empty());
-    }
-
-    #[tokio::test]
     async fn timestamp_fallback_emits_explicit_gap() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("postgresql.log");
@@ -2709,18 +3130,6 @@ mod tests {
                 .gaps
                 .iter()
                 .any(|gap| gap.reason == GapReason::ParserDrop && gap.parser_dropped_lines == 1)
-        );
-    }
-
-    #[test]
-    fn permission_denied_is_a_distinct_gap_reason() {
-        assert_eq!(
-            read_error_reason(io::ErrorKind::PermissionDenied),
-            GapReason::PermissionDenied
-        );
-        assert_eq!(
-            read_error_reason(io::ErrorKind::NotFound),
-            GapReason::SourceUnavailable
         );
     }
 

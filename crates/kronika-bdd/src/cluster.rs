@@ -278,8 +278,17 @@ async fn run_initdb(bin: &PgBinary, data_dir: &Path) -> Result<()> {
         .append(true)
         .open(&conf)
         .with_context(|| format!("open {} to append GUCs", conf.display()))?;
-    std::io::Write::write_all(&mut file, b"track_io_timing = on\n")
-        .context("append track_io_timing to postgresql.conf")?;
+    std::io::Write::write_all(
+        &mut file,
+        b"track_io_timing = on\n\
+          logging_collector = on\n\
+          log_destination = 'stderr'\n\
+          log_directory = 'log'\n\
+          log_filename = 'postgresql-%Y%m%d%H%M%S.log'\n\
+          log_rotation_age = 0\n\
+          log_truncate_on_rotation = off\n",
+    )
+    .context("append BDD settings to postgresql.conf")?;
     Ok(())
 }
 

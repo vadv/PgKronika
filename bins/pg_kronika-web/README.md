@@ -213,6 +213,11 @@ See the [OpenAPI contract](openapi.json) and the
   before decoding, combine registered layout versions under one logical section
   name, and sort by the registry key. Exact duplicates between sealed segments
   and `active.parts` appear only once.
+- `/v1/sources` computes spans and latest `pg_log_source_status` rows in one
+  pass over one snapshot generation. A request is limited to 65,536 units,
+  1,048,576 status rows, and 64 MiB of admitted body reads. A stale unit
+  restarts the whole result; after two failed refreshes the server returns an
+  explicit store-read error instead of an older status with `200`.
 - Timeline facts remain isolated by source. The overview preview and event
   pages use the same typed `EventFact` projection: semantic `event_id`,
   provenance-bound `event_instance_id`, source and time fields, notable and
@@ -311,10 +316,11 @@ See the [OpenAPI contract](openapi.json) and the
   `{ "kind": "...", "params": { ... } }` reason schema. Lens ids, enum values,
   formulas, units, and evidence remain stable machine data; incident catalogs
   contain no localized title or question.
-- Only one anomaly, incident, or uncached timeline response projection runs at
-  a time. Equal timeline response misses share one response flight; cache hits
-  do not consume the slot. Another distinct heavy request receives `503` with
-  `code=analytic_capacity_unavailable` and `Retry-After: 1`; it is not queued.
+- Only one `/v1/sources`, anomaly, incident, or uncached timeline response
+  projection runs at a time. Equal timeline response misses share one response
+  flight; cache hits do not consume the slot. Another distinct heavy request
+  receives `503` with `code=analytic_capacity_unavailable` and
+  `Retry-After: 1`; it is not queued.
 
 Store scan warnings and damaged journal regions remain available to the reader
 and affect gaps/completeness. They are never converted to successful rows.

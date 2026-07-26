@@ -72,7 +72,7 @@ impl TailState {
             self.dev,
             self.inode,
             self.offset,
-            self.parser_kind.as_state_value(),
+            self.parser_kind.as_str(),
             self.skip_until_newline
         )
     }
