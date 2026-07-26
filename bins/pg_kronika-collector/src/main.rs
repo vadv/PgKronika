@@ -30,6 +30,7 @@ mod os_sources;
 mod pg_log_source;
 mod plans_source;
 mod pool_sources;
+mod reset_source;
 mod scheduler;
 mod segments;
 mod service_sections;
@@ -65,7 +66,7 @@ use segments::{
     SegmentState, append_window_and_maybe_seal, encode_window, open_collector_journal,
     seal_open_segment,
 };
-use service_sections::collect_service_sections;
+use service_sections::{collect_due_instance, collect_service_sections};
 use source_contracts::activity_dict_limits;
 use statements_source::StatementsSourceCache;
 use std::io::Write;
@@ -399,12 +400,21 @@ async fn snapshot_and_seal(
         cycle_start,
     )
     .await;
-    let store_plans_rows =
-        collect_store_plans_cached(pool, config, plans_cache, due.forced()).await;
+    let instance = collect_due_instance(pool, config, due).await?;
+    let store_plans_rows = collect_store_plans_cached(
+        pool,
+        major,
+        config,
+        statements_cache,
+        plans_cache,
+        due.forced(),
+    )
+    .await;
     let coverage = collect_coverage_records(
         major,
         config,
         &CoverageInputs {
+            default_ts: main_src.ts.0,
             tables: tables_cov,
             indexes: indexes_cov,
             statements: &statements,
@@ -413,8 +423,19 @@ async fn snapshot_and_seal(
     );
     // The extension caches stay warm across ticks: reset metadata reads the
     // info views through the same connections those sections use.
-    let service =
-        collect_service_sections(pool, major, config, statements_cache, plans_cache, due).await?;
+    let plan_reset = store_plans_rows
+        .as_ref()
+        .map(|snapshot| snapshot.reset.clone());
+    let service = collect_service_sections(
+        pool,
+        major,
+        statements_cache,
+        plans_cache,
+        due,
+        instance,
+        plan_reset,
+    )
+    .await?;
     let mut log_collection = if due.has(SourceKind::PgLog) {
         Some(collect_log_batch(log_collector, Some(pool.main()), main_src.ts.0).await)
     } else {
@@ -446,11 +467,11 @@ async fn snapshot_and_seal(
     push_plans_read(
         &mut buffers,
         &mut interner,
-        store_plans_rows.as_ref().map(|(read, _total)| read),
+        store_plans_rows.as_ref().map(|snapshot| &snapshot.read),
     )?;
     push_service_sections(&mut buffers, &mut interner, &service)?;
     push_os_sources(&mut buffers, &os)?;
-    push_coverage(&mut buffers, &mut interner, main_src.ts.0, &coverage)?;
+    push_coverage(&mut buffers, &mut interner, &coverage)?;
     let mut completeness = Vec::new();
     if let Some((version, rows, source_total)) = &statements {
         completeness.push(snapshot_coverage(
@@ -462,14 +483,17 @@ async fn snapshot_and_seal(
             rows.len(),
         ));
     }
-    if let Some((read, source_total)) = &store_plans_rows {
+    if let Some(snapshot) = &store_plans_rows {
         completeness.push(snapshot_coverage(
-            read.snapshot_ts().unwrap_or(main_src.ts.0),
-            read.type_id(),
-            u8::from(*source_total != u64::try_from(read.rows_len()).unwrap_or(u64::MAX)),
+            snapshot.snapshot_ts,
+            snapshot.read.type_id(),
+            u8::from(
+                snapshot.source_total
+                    != u64::try_from(snapshot.read.rows_len()).unwrap_or(u64::MAX),
+            ),
             0,
-            *source_total,
-            read.rows_len(),
+            snapshot.source_total,
+            snapshot.read.rows_len(),
         ));
     }
     push_snapshot_coverages(&mut buffers, &completeness)?;

@@ -152,7 +152,7 @@ pub async fn store_plans_is_vadv(client: &Client) -> Result<bool, tokio_postgres
 const fn store_plans_query() -> &'static str {
     marked!(
         "SELECT \
-             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             $2::int8 AS ts_us, \
              (SELECT count(*) FROM pg_store_plans(false)) AS source_total, \
              s.queryid, \
              s.queryid_stat_statements, \
@@ -206,8 +206,11 @@ const fn store_plans_query() -> &'static str {
 pub async fn collect_store_plans(
     client: &Client,
     max_plans: i64,
+    snapshot_ts: i64,
 ) -> Result<(Vec<StorePlansRow>, u64), tokio_postgres::Error> {
-    let rows = client.query(store_plans_query(), &[&max_plans]).await?;
+    let rows = client
+        .query(store_plans_query(), &[&max_plans, &snapshot_ts])
+        .await?;
     let source_total = rows
         .first()
         .map_or(0, |row| row.get::<_, i64>("source_total"));
@@ -398,6 +401,10 @@ mod tests {
     fn enumeration_query_reads_without_texts_and_caps_by_total_time() {
         let q = store_plans_query();
         assert!(q.contains("FROM pg_store_plans(false) s"), "{q}");
+        assert!(
+            q.contains("$2::int8 AS ts_us"),
+            "the collector supplies the coordinated reset timestamp: {q}"
+        );
         assert!(q.contains("ORDER BY s.total_time DESC"), "{q}");
         assert!(q.contains("LIMIT $1"), "{q}");
         assert!(q.contains("s.queryid_stat_statements"), "{q}");
@@ -529,7 +536,7 @@ pub struct StorePlansOsscRow {
 const fn store_plans_ossc_query() -> &'static str {
     marked!(
         "SELECT \
-             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             $3::int8 AS ts_us, \
              (SELECT count(*) FROM pg_store_plans) AS source_total, \
              s.queryid, \
              s.planid, \
@@ -578,7 +585,7 @@ const fn store_plans_ossc_query() -> &'static str {
 const fn store_plans_ossc_numeric_query() -> &'static str {
     marked!(
         "SELECT \
-             (extract(epoch from statement_timestamp()) * 1e6)::int8 AS ts_us, \
+             $2::int8 AS ts_us, \
              (SELECT count(*) FROM pg_store_plans) AS source_total, \
              s.queryid, \
              s.planid, \
@@ -637,16 +644,20 @@ pub async fn collect_store_plans_ossc(
     client: &Client,
     max_plans: i64,
     text_cap: Option<i32>,
+    snapshot_ts: i64,
 ) -> Result<(Vec<StorePlansOsscRow>, usize, u64), tokio_postgres::Error> {
     let rows = match text_cap {
         Some(cap) => {
             client
-                .query(store_plans_ossc_query(), &[&max_plans, &cap])
+                .query(store_plans_ossc_query(), &[&max_plans, &cap, &snapshot_ts])
                 .await?
         }
         None => {
             client
-                .query(store_plans_ossc_numeric_query(), &[&max_plans])
+                .query(
+                    store_plans_ossc_numeric_query(),
+                    &[&max_plans, &snapshot_ts],
+                )
                 .await?
         }
     };
@@ -811,6 +822,10 @@ mod ossc_tests {
     fn ossc_query_truncates_on_the_server_and_caps_by_total_time() {
         let q = store_plans_ossc_query();
         assert!(q.contains("FROM pg_store_plans s"), "{q}");
+        assert!(
+            q.contains("$3::int8 AS ts_us"),
+            "the collector supplies the coordinated reset timestamp: {q}"
+        );
         assert!(q.contains("left(s.plan, $2::int4) AS plan"), "{q}");
         assert!(q.contains("ORDER BY s.total_time DESC"), "{q}");
         assert!(q.contains("LIMIT $1"), "{q}");

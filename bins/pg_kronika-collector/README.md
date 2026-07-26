@@ -98,6 +98,11 @@ signal-driven collection only. Each source has its own base interval:
 | Cgroup mapping | `KRONIKA_OS_CGROUP_MAPPING_INTERVAL_S` | 30 |
 | PostgreSQL log | `KRONIKA_PG_LOG_INTERVAL_S` | 5 |
 
+Every actual `pg_store_plans` read also writes a coordinated reset-metadata
+row at the plan snapshot's exact timestamp. The collector samples reset state
+before and after the read and drops the plan snapshot if that state changes or
+cannot be read.
+
 Activity can accelerate to `KRONIKA_PG_ACTIVITY_FAST_INTERVAL_S` (`1`) when
 active client backends reach `KRONIKA_PG_ASH_ACTIVE_THRESHOLD` (`20`).
 Replication can accelerate to `KRONIKA_PG_REPLICATION_FAST_INTERVAL_S` (`10`)
