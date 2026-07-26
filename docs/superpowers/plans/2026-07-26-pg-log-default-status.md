@@ -222,7 +222,7 @@ git commit -m "feat(registry): add PostgreSQL log source status"
 - Consumes: existing boolean spelling accepted by `env_bool`.
 - Produces: `LogConfig::status_interval: Duration`, `resolve_log_enabled(Option<&str>)`, `resolve_log_status_interval(Option<&str>)`.
 
-- [ ] **Step 1: Write pure failing configuration tests**
+- [x] **Step 1: Write pure failing configuration tests**
 
 Export the two pure helpers as `pub(crate)` and add:
 
@@ -262,19 +262,19 @@ fn pg_log_status_interval_rejects_zero() {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm the red state**
+- [x] **Step 2: Run the focused tests and confirm the red state**
 
 Run:
 
 ```sh
 HOST="$(rustc +1.96.0 -vV | sed -n 's/^host: //p')"
-cargo +1.96.0 test -p pg-kronika-collector pg_log_ --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-collector pg_log_ --target "$HOST"
 ```
 
 Expected: compilation fails because both resolver functions and
 `LogConfig::status_interval` are absent.
 
-- [ ] **Step 3: Implement value resolution without mutating process env in tests**
+- [x] **Step 3: Implement value resolution without mutating process env in tests**
 
 Add:
 
@@ -321,7 +321,7 @@ Add `pub status_interval: Duration` to `LogConfig`; assign it in
 `log_config_from_env`, `LogConfig::disabled` and every test fixture. The disabled
 constructor uses `Duration::from_mins(5)`.
 
-- [ ] **Step 4: Remove the demo-only default**
+- [x] **Step 4: Remove the demo-only default**
 
 Replace `Collector::spawn` with:
 
@@ -335,13 +335,13 @@ Delete the comment claiming that the stand enables a source which the collector
 ships disabled. Keep `spawn_with` because `seal_tail` still passes
 `KRONIKA_INTERVAL_S=0`.
 
-- [ ] **Step 5: Run collector, source-log and demo checks**
+- [x] **Step 5: Run collector, source-log and demo checks**
 
 Run:
 
 ```sh
 HOST="$(rustc +1.96.0 -vV | sed -n 's/^host: //p')"
-cargo +1.96.0 test -p pg-kronika-collector config --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-collector config --target "$HOST"
 cargo +1.96.0 test -p kronika-source-log --target "$HOST"
 cargo +1.96.0 check -p pg-kronika-demo --target "$HOST"
 ```
@@ -349,7 +349,7 @@ cargo +1.96.0 check -p pg-kronika-demo --target "$HOST"
 Expected: all commands pass; no `LogConfig` initializer omits
 `status_interval`.
 
-- [ ] **Step 6: Commit the default and interval contract**
+- [x] **Step 6: Commit the default and interval contract**
 
 ```sh
 git add crates/kronika-source-log/src/collector.rs bins/pg_kronika-collector/src/config.rs bins/pg_kronika-collector/src/tests/config.rs bins/pg_kronika-demo/src/collector.rs

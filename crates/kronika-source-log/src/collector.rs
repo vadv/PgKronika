@@ -30,6 +30,8 @@ pub struct LogConfig {
     pub start_at_beginning: bool,
     /// Minimum interval between PG discovery queries.
     pub discovery_interval: Duration,
+    /// Interval between unchanged source-status heartbeats.
+    pub status_interval: Duration,
     /// Tailer caps.
     pub tail_caps: TailCaps,
 }
@@ -46,6 +48,7 @@ impl LogConfig {
             state_path: out_dir.join("pg_log_tail.state"),
             start_at_beginning: false,
             discovery_interval: Duration::from_mins(1),
+            status_interval: Duration::from_mins(5),
             tail_caps: TailCaps::default(),
         }
     }
@@ -2087,6 +2090,7 @@ mod tests {
             state_path,
             start_at_beginning: true,
             discovery_interval: std::time::Duration::from_mins(1),
+            status_interval: std::time::Duration::from_mins(5),
             tail_caps: crate::TailCaps::default(),
         }
     }
