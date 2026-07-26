@@ -46,8 +46,14 @@ use crate::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalError};
 
 /// Maximum catalog sections accepted from one seal input by default.
 pub const DEFAULT_MAX_INPUT_SECTIONS: usize = 65_536;
+/// Maximum sorted runs decoded in one external-merge group.
+const MERGE_FAN_IN: usize = 32;
 
 /// Hard resources admitted before seal work begins.
+#[allow(
+    clippy::struct_field_names,
+    reason = "the max prefix distinguishes caller-supplied ceilings from measured work"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealLimits {
     /// Peak estimated decoded/sort working memory.
@@ -72,21 +78,12 @@ impl Default for SealLimits {
 }
 
 /// Seal controls, including an optional cooperative cancellation flag.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SealOptions<'a> {
     /// Resource bounds checked before and during the seal.
     pub limits: SealLimits,
     /// When set, sealing stops between bounded units of work.
     pub cancelled: Option<&'a AtomicBool>,
-}
-
-impl Default for SealOptions<'_> {
-    fn default() -> Self {
-        Self {
-            limits: SealLimits::default(),
-            cancelled: None,
-        }
-    }
 }
 
 /// How the immutable destination became visible.
@@ -510,11 +507,20 @@ pub fn seal_with_options(
 
     let generation = next_generation();
     let mut artifacts = Artifacts::default();
-    let (runs, dictionary, spill_bytes) =
+    let (runs, dictionary, mut spill_bytes, mut next_run_ordinal) =
         create_runs(journal, dest, generation, options, &mut artifacts)?;
     if plan.total_rows == 0 {
         return Err(SealError::Empty);
     }
+    let runs = coalesce_runs(
+        runs,
+        dest,
+        generation,
+        &mut next_run_ordinal,
+        &mut spill_bytes,
+        options,
+        &mut artifacts,
+    )?;
     let tmp = artifact_path(dest, generation, "segment", 0);
     artifacts.track(tmp.clone());
     let built = write_compact_temp(&tmp, &plan, &runs, &dictionary, options, &mut artifacts)?;
@@ -675,6 +681,10 @@ struct SealPlan {
 }
 
 /// Validate and admit the whole job without retaining section bodies.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one streaming scan keeps cross-section admission invariants in a single pass"
+)]
 fn plan_seal(journal: &Journal, limits: SealLimits) -> Result<SealPlan, SealError> {
     let mut types = BTreeMap::<u32, TypePlan>::new();
     let mut total_rows = 0_u64;
@@ -1104,7 +1114,7 @@ fn create_runs(
     generation: u64,
     options: SealOptions<'_>,
     artifacts: &mut Artifacts,
-) -> Result<(RunsByType, NormalizedDictionary, u64), SealError> {
+) -> Result<(RunsByType, NormalizedDictionary, u64, u64), SealError> {
     let mut runs = RunsByType::new();
     let mut dictionary = NormalizedDictionary::default();
     let mut spill_bytes = 0_u64;
@@ -1168,7 +1178,206 @@ fn create_runs(
         }
     }
     dictionary.finish()?;
-    Ok((runs, dictionary, spill_bytes))
+    Ok((runs, dictionary, spill_bytes, ordinal))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "external merge carries the attempt identity and both hard budgets explicitly"
+)]
+fn coalesce_runs(
+    runs: RunsByType,
+    dest: &Path,
+    generation: u64,
+    next_ordinal: &mut u64,
+    spill_bytes: &mut u64,
+    options: SealOptions<'_>,
+    artifacts: &mut Artifacts,
+) -> Result<RunsByType, SealError> {
+    let mut coalesced = RunsByType::new();
+    for (type_id, type_runs) in runs {
+        let run = coalesce_type_runs(
+            type_id,
+            type_runs,
+            dest,
+            generation,
+            next_ordinal,
+            spill_bytes,
+            options,
+            artifacts,
+        )?;
+        coalesced.insert(type_id, vec![run]);
+    }
+    Ok(coalesced)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one type merge carries the attempt identity and both hard budgets explicitly"
+)]
+fn coalesce_type_runs(
+    type_id: u32,
+    mut current: Vec<Run>,
+    dest: &Path,
+    generation: u64,
+    next_ordinal: &mut u64,
+    spill_bytes: &mut u64,
+    options: SealOptions<'_>,
+    artifacts: &mut Artifacts,
+) -> Result<Run, SealError> {
+    if current.is_empty() {
+        return Err(SealError::OutputVerification {
+            reason: "a planned type has no external run",
+        });
+    }
+    while current.len() > 1 {
+        check_cancelled(options.cancelled)?;
+        let group_count = current.len().div_ceil(MERGE_FAN_IN);
+        let base_group_len = current.len() / group_count;
+        let larger_groups = current.len() % group_count;
+        let mut next = Vec::new();
+        next.try_reserve_exact(group_count)
+            .map_err(|_error| SealError::Resource {
+                resource: SealResource::Memory,
+                needed: u64::try_from(group_count)
+                    .ok()
+                    .and_then(|groups| groups.checked_mul(size_of::<Run>() as u64))
+                    .unwrap_or(u64::MAX),
+                limit: options.limits.max_memory_bytes as u64,
+            })?;
+        let mut start = 0_usize;
+        for group_index in 0..group_count {
+            let group_len = base_group_len + usize::from(group_index < larger_groups);
+            let end = start
+                .checked_add(group_len)
+                .ok_or(SealError::ArithmeticOverflow {
+                    what: "merge group end",
+                })?;
+            let merged = merge_run_group(
+                type_id,
+                &current[start..end],
+                dest,
+                generation,
+                next_ordinal,
+                spill_bytes,
+                options,
+                artifacts,
+            )?;
+            next.push(merged);
+            start = end;
+        }
+        if start != current.len() {
+            return Err(SealError::OutputVerification {
+                reason: "external merge did not consume its complete generation",
+            });
+        }
+        current = next;
+    }
+    current.pop().ok_or(SealError::OutputVerification {
+        reason: "external merge lost its final run",
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one merge group carries the attempt identity and both hard budgets explicitly"
+)]
+fn merge_run_group(
+    type_id: u32,
+    group: &[Run],
+    dest: &Path,
+    generation: u64,
+    next_ordinal: &mut u64,
+    spill_bytes: &mut u64,
+    options: SealOptions<'_>,
+    artifacts: &mut Artifacts,
+) -> Result<Run, SealError> {
+    if group.len() < 2 || group.len() > MERGE_FAN_IN {
+        return Err(SealError::OutputVerification {
+            reason: "external merge group is outside the fixed fan-in",
+        });
+    }
+    let rows = group.iter().try_fold(0_u64, |total, run| {
+        total
+            .checked_add(u64::from(run.rows))
+            .ok_or(SealError::ArithmeticOverflow {
+                what: "external merge rows",
+            })
+    })?;
+    let row_count =
+        usize::try_from(rows).map_err(|_overflow| SealError::ArithmeticOverflow {
+            what: "external merge row bound",
+        })?;
+    let memory = compaction_memory_bound(type_id, row_count)?;
+    admit_u64(
+        SealResource::Memory,
+        memory as u64,
+        options.limits.max_memory_bytes as u64,
+    )?;
+    let mut batches = Vec::new();
+    batches
+        .try_reserve_exact(group.len())
+        .map_err(|_error| SealError::Resource {
+            resource: SealResource::Memory,
+            needed: u64::try_from(group.len())
+                .ok()
+                .and_then(|runs| runs.checked_mul(size_of::<RecordBatch>() as u64))
+                .unwrap_or(u64::MAX),
+            limit: options.limits.max_memory_bytes as u64,
+        })?;
+    for run in group {
+        check_cancelled(options.cancelled)?;
+        let body = read_run(run)?;
+        let verified = VerifiedSection::verify(body, run.crc32c, crc32c)?;
+        let decoded = decode_any(type_id, verified)?;
+        if decoded.stats.rows != run.rows as usize {
+            return Err(SealError::RowCountMismatch {
+                type_id,
+                declared: run.rows,
+                decoded: decoded.stats.rows,
+            });
+        }
+        batches.extend(decoded.batches);
+    }
+    let rows_u32 = u32::try_from(rows).map_err(|_overflow| CodecError::TooManyRows {
+        rows: row_count,
+        max: MAX_SECTION_ROWS,
+    })?;
+    let canonical = canonicalize_batches(type_id, &batches)?;
+    let body = encode_compact_batch(type_id, &canonical)?;
+    let len = u64::try_from(body.len()).map_err(|_overflow| SealError::ArithmeticOverflow {
+        what: "merged spill run length",
+    })?;
+    let needed = spill_bytes
+        .checked_add(len)
+        .ok_or(SealError::ArithmeticOverflow {
+            what: "merged spill bytes",
+        })?;
+    admit_u64(
+        SealResource::SpillDisk,
+        needed,
+        options.limits.max_spill_bytes,
+    )?;
+    let path = artifact_path(dest, generation, "run", *next_ordinal);
+    *next_ordinal =
+        next_ordinal
+            .checked_add(1)
+            .ok_or(SealError::ArithmeticOverflow {
+                what: "merged spill ordinal",
+            })?;
+    artifacts.track(path.clone());
+    write_new_file(&path, &body)?;
+    let merged = Run {
+        path,
+        rows: rows_u32,
+        len,
+        crc32c: crc32c(&body),
+    };
+    for run in group {
+        remove_generated(&run.path)?;
+    }
+    *spill_bytes = needed;
+    Ok(merged)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1373,7 +1582,7 @@ impl NormalizedDictionary {
     }
 }
 
-fn check_dictionary_order(
+const fn check_dictionary_order(
     type_id: u32,
     previous: u64,
     current: u64,
@@ -1540,35 +1749,18 @@ fn write_compact_temp(
         let type_runs = runs.get(&type_id).ok_or(SealError::OutputVerification {
             reason: "a planned type has no spill run",
         })?;
-        let mut batches = Vec::new();
-        let mut run_rows = 0_u64;
-        for run in type_runs {
-            check_cancelled(options.cancelled)?;
-            let body = read_run(run)?;
-            let verified = VerifiedSection::verify(body, run.crc32c, crc32c)?;
-            let decoded = decode_any(type_id, verified)?;
-            if decoded.stats.rows != run.rows as usize {
-                return Err(SealError::RowCountMismatch {
-                    type_id,
-                    declared: run.rows,
-                    decoded: decoded.stats.rows,
-                });
-            }
-            run_rows =
-                run_rows
-                    .checked_add(u64::from(run.rows))
-                    .ok_or(SealError::ArithmeticOverflow {
-                        what: "coalesced run rows",
-                    })?;
-            batches.extend(decoded.batches);
-        }
-        if run_rows != type_plan.rows as u64 {
+        let [run] = type_runs.as_slice() else {
+            return Err(SealError::OutputVerification {
+                reason: "external merge did not produce exactly one final run",
+            });
+        };
+        if run.rows as usize != type_plan.rows {
             return Err(SealError::OutputVerification {
                 reason: "planned and spill row counts differ",
             });
         }
-        let canonical = canonicalize_batches(type_id, &batches)?;
-        let body = encode_compact_batch(type_id, &canonical)?;
+        let body = read_run(run)?;
+        VerifiedSection::verify(body.clone(), run.crc32c, crc32c)?;
         write_output_section(
             &mut writer,
             &mut entries,
@@ -1581,13 +1773,11 @@ fn write_compact_temp(
                         what: "final section rows",
                     }
                 })?,
-                body,
+                body: body.to_vec(),
             },
             options.limits.max_output_bytes,
         )?;
-        for run in type_runs {
-            remove_generated(&run.path)?;
-        }
+        remove_generated(&run.path)?;
     }
 
     for section in dictionary.encode_sections()? {
@@ -1643,10 +1833,14 @@ fn write_output_section(
     section: OutputSection,
     max_output_bytes: u64,
 ) -> Result<(), SealError> {
-    let len =
-        u64::try_from(section.body.len()).map_err(|_overflow| SealError::ArithmeticOverflow {
-            what: "output section length",
-        })?;
+    let OutputSection {
+        type_id,
+        rows,
+        body,
+    } = section;
+    let len = u64::try_from(body.len()).map_err(|_overflow| SealError::ArithmeticOverflow {
+        what: "output section length",
+    })?;
     let needed = output_bytes
         .checked_add(len)
         .ok_or(SealError::ArithmeticOverflow {
@@ -1655,20 +1849,20 @@ fn write_output_section(
     admit_u64(SealResource::OutputDisk, needed, max_output_bytes)?;
     if entries
         .last()
-        .is_some_and(|entry| entry.type_id >= section.type_id)
+        .is_some_and(|entry| entry.type_id >= type_id)
     {
         return Err(SealError::OutputVerification {
             reason: "output type order is not strictly increasing",
         });
     }
-    writer.write_all(&section.body)?;
+    writer.write_all(&body)?;
     entries.push(Entry {
-        type_id: section.type_id,
+        type_id,
         flags: 0,
         offset: *offset,
         len,
-        rows: section.rows,
-        crc32c: crc32c(&section.body),
+        rows,
+        crc32c: crc32c(&body),
     });
     *offset = offset
         .checked_add(len)
@@ -1900,7 +2094,10 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool, io::Error> {
     loop {
         let left_len = left.read(&mut left_buf)?;
         let right_len = right.read(&mut right_buf)?;
-        if left_len != right_len || left_buf[..left_len] != right_buf[..right_len] {
+        if left_len != right_len {
+            return Ok(false);
+        }
+        if left_buf[..left_len] != right_buf[..left_len] {
             return Ok(false);
         }
         if left_len == 0 {
@@ -1959,7 +2156,7 @@ const fn is_dictionary(type_id: u32) -> bool {
     matches!(type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID)
 }
 
-fn admit_u64(resource: SealResource, needed: u64, limit: u64) -> Result<(), SealError> {
+const fn admit_u64(resource: SealResource, needed: u64, limit: u64) -> Result<(), SealError> {
     if needed > limit {
         Err(SealError::Resource {
             resource,
@@ -2056,6 +2253,18 @@ mod tests {
         journal.append(&part).expect("append");
     }
 
+    fn append_rows(journal: &mut Journal, timestamps: &[i64]) {
+        let mut buffers = SectionBuffers::new();
+        for &ts in timestamps {
+            buffers.push(bgwriter(ts)).expect("buffer not full");
+        }
+        let part = buffers
+            .flush(&[], 0)
+            .expect("encode")
+            .expect("rows produce a part");
+        journal.append(&part).expect("append");
+    }
+
     fn append_dictionary_batch(journal: &mut Journal, type_id: u32, batch: &RecordBatch) {
         let body = encode_compact_ordered_batch(batch).expect("encode raw dictionary");
         let part = try_build_part(
@@ -2094,12 +2303,8 @@ mod tests {
             .iter()
             .map(|(_id, value)| Some(value.truncated))
             .collect();
-        let hashes: Vec<Option<[u8; 32]>> = entries
-            .iter()
-            .map(|(_id, value)| value.full_sha256)
-            .collect();
         let hashes = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-            hashes.into_iter(),
+            entries.iter().map(|(_id, value)| value.full_sha256),
             32,
         )
         .expect("blob hashes");
@@ -2176,6 +2381,72 @@ mod tests {
         seal(&a, &a_path).expect("seal a");
         seal(&b, &b_path).expect("seal b");
         assert_eq!(fs::read(a_path).unwrap(), fs::read(b_path).unwrap());
+    }
+
+    #[test]
+    fn external_merge_is_byte_identical_to_direct_and_disk_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let timestamps = (0..=MERGE_FAN_IN)
+            .rev()
+            .map(|value| i64::try_from(value).expect("fan-in index fits i64"))
+            .collect::<Vec<_>>();
+
+        let (mut direct, _) =
+            Journal::open(&dir.path().join("direct.parts"), JournalConfig::default())
+                .expect("direct journal");
+        append_rows(&mut direct, &timestamps);
+        let direct_path = dir.path().join("direct.pgm");
+        let direct_summary = seal(&direct, &direct_path).expect("direct seal");
+
+        let (mut external, _) =
+            Journal::open(&dir.path().join("external.parts"), JournalConfig::default())
+                .expect("external journal");
+        for &ts in &timestamps {
+            append_window(&mut external, ts);
+        }
+        let external_path = dir.path().join("external.pgm");
+        let external_summary = seal(&external, &external_path).expect("external seal");
+        assert_eq!(
+            fs::read(&direct_path).expect("direct bytes"),
+            fs::read(&external_path).expect("external bytes")
+        );
+        assert!(
+            external_summary.spill_bytes > direct_summary.spill_bytes,
+            "all external generations are charged to the disk-work budget"
+        );
+
+        let (mut bounded, _) =
+            Journal::open(&dir.path().join("bounded.parts"), JournalConfig::default())
+                .expect("bounded journal");
+        for &ts in &timestamps {
+            append_window(&mut bounded, ts);
+        }
+        let journal_before = fs::read(dir.path().join("bounded.parts")).expect("journal bytes");
+        let bounded_path = dir.path().join("bounded.pgm");
+        let error = seal_with_options(
+            &bounded,
+            &bounded_path,
+            SealOptions {
+                limits: SealLimits {
+                    max_spill_bytes: external_summary.spill_bytes - 1,
+                    ..SealLimits::default()
+                },
+                cancelled: None,
+            },
+        )
+        .expect_err("the aggregate generation budget is exact");
+        assert!(matches!(
+            error,
+            SealError::Resource {
+                resource: SealResource::SpillDisk,
+                ..
+            }
+        ));
+        assert!(!bounded_path.exists());
+        assert_eq!(
+            fs::read(dir.path().join("bounded.parts")).expect("journal retained"),
+            journal_before
+        );
     }
 
     #[test]
@@ -2412,9 +2683,9 @@ mod tests {
     }
 
     impl Write for ChunkWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            let take = bytes.len().min(self.chunk);
-            self.bytes.extend_from_slice(&bytes[..take]);
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let take = buf.len().min(self.chunk);
+            self.bytes.extend_from_slice(&buf[..take]);
             Ok(take)
         }
 
@@ -2429,12 +2700,12 @@ mod tests {
     }
 
     impl Write for EnospcWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if self.remaining == 0 {
                 return Err(io::Error::from_raw_os_error(28));
             }
-            let take = bytes.len().min(self.remaining);
-            let written = self.file.write(&bytes[..take])?;
+            let take = buf.len().min(self.remaining);
+            let written = self.file.write(&buf[..take])?;
             self.remaining -= written;
             Ok(written)
         }

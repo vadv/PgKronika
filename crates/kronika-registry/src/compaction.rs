@@ -51,6 +51,10 @@ const BODY_FRAMING_BYTES: usize = 64 * 1024;
 /// Footer/schema allowance per logical column.
 const BODY_COLUMN_FRAMING_BYTES: usize = 4 * 1024;
 /// Pre-encode bounds for one future compact section.
+#[allow(
+    clippy::struct_field_names,
+    reason = "the byte unit is part of each public resource-bound field's contract"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactSectionBound {
     /// One retained Arrow representation, including validity and list buffers.
