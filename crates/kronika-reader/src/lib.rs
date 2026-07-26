@@ -96,11 +96,10 @@ use std::path::Path;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, RecordBatch, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{Catalog, DecodeError, Entry};
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS,
-    MAX_SECTION_ROWS, READ_WORK_MEMORY_LIMIT,
+    MAX_SECTION_ROWS, READ_WORK_MEMORY_LIMIT, dictionary_schema_matches, read_work_memory,
 };
 use kronika_store::StoreError;
 
@@ -138,16 +137,6 @@ pub enum ReadError {
     /// A catalog entry points outside the segment's section area.
     SectionOutOfBounds {
         /// The entry's `type_id`.
-        type_id: u32,
-    },
-    /// Catalog entries are not unique, sorted, packed, and flag-free.
-    NonCanonicalCatalog {
-        /// Entry being validated, or zero for trailing unreferenced bytes.
-        type_id: u32,
-    },
-    /// A catalog entry has no current registry or dictionary contract.
-    UnknownType {
-        /// Unknown id.
         type_id: u32,
     },
     /// The catalog contains more unique sections than the current registry can
@@ -208,11 +197,6 @@ pub enum ReadError {
         /// Rows produced by the section decoder.
         decoded: u64,
     },
-    /// A supposedly normalized PGM dictionary repeats an id.
-    DictionaryConflict {
-        /// Repeated id.
-        str_id: u64,
-    },
 }
 
 impl fmt::Display for ReadError {
@@ -221,19 +205,13 @@ impl fmt::Display for ReadError {
             Self::Io(err) => write!(f, "segment io: {err}"),
             Self::TooSmall { len } => write!(f, "file of {len} bytes is too small for a segment"),
             Self::BadMagic { actual } => {
-                write!(f, "segment magic is {actual:02x?}, expected \"PGMC\"")
+                write!(f, "segment magic is {actual:02x?}, expected the PGM magic")
             }
             Self::UnsupportedFormat { version } => {
                 write!(f, "segment format_version {version} is not supported")
             }
             Self::SectionOutOfBounds { type_id } => {
                 write!(f, "section {type_id} points outside the segment")
-            }
-            Self::NonCanonicalCatalog { type_id } => {
-                write!(f, "catalog is not canonical at section {type_id}")
-            }
-            Self::UnknownType { type_id } => {
-                write!(f, "catalog uses unknown type_id {type_id}")
             }
             Self::TooManyCatalogEntries { entries, max } => {
                 write!(
@@ -270,9 +248,6 @@ impl fmt::Display for ReadError {
                 f,
                 "section type {type_id} decoded {decoded} rows, but the catalog declares {declared}"
             ),
-            Self::DictionaryConflict { str_id } => {
-                write!(f, "normalized dictionary repeats id {str_id:#018x}")
-            }
         }
     }
 }
@@ -288,8 +263,6 @@ impl Error for ReadError {
             | Self::BadMagic { .. }
             | Self::UnsupportedFormat { .. }
             | Self::SectionOutOfBounds { .. }
-            | Self::NonCanonicalCatalog { .. }
-            | Self::UnknownType { .. }
             | Self::TooManyCatalogEntries { .. }
             | Self::DictionarySection { .. }
             | Self::BadCatalogLen { .. }
@@ -297,8 +270,7 @@ impl Error for ReadError {
             | Self::StaleSnapshot { .. }
             | Self::CounterOverflow
             | Self::CatalogOrdinalOutOfRange { .. }
-            | Self::CatalogRowCountMismatch { .. }
-            | Self::DictionaryConflict { .. } => None,
+            | Self::CatalogRowCountMismatch { .. } => None,
         }
     }
 }
@@ -499,25 +471,14 @@ pub(crate) fn decode_dictionary_selected(
             max: READ_WORK_MEMORY_LIMIT,
         }
     })?;
-    let read_work = stored_len
-        .checked_add(declared.checked_mul(2).ok_or(
-            CodecError::ReadWorkBudgetExceeded {
-                needed: usize::MAX,
-                max: READ_WORK_MEMORY_LIMIT,
-            },
-        )?)
-        .and_then(|bytes| bytes.checked_add(1024 * 1024))
-        .ok_or(CodecError::ReadWorkBudgetExceeded {
-            needed: usize::MAX,
-            max: READ_WORK_MEMORY_LIMIT,
-        })?;
+    let read_work = read_work_memory(stored_len, declared)?;
     if read_work > READ_WORK_MEMORY_LIMIT {
         return Err(CodecError::ReadWorkBudgetExceeded {
             needed: read_work,
             max: READ_WORK_MEMORY_LIMIT,
         });
     }
-    if !dictionary_schema_matches(builder.schema(), is_blob) {
+    if !dictionary_schema_matches(builder.schema(), type_id) {
         return Err(CodecError::SchemaMismatch);
     }
 
@@ -617,31 +578,6 @@ pub(crate) fn decode_dictionary_selected(
     Ok((out, rows_scanned, decoded_bytes))
 }
 
-fn dictionary_schema_matches(schema: &Schema, is_blob: bool) -> bool {
-    let fields = schema.fields();
-    if is_blob {
-        fields.len() == 5
-            && field_matches(&fields[0], "str_id", &DataType::UInt64, false)
-            && field_matches(&fields[1], "stored_bytes", &DataType::Binary, false)
-            && field_matches(&fields[2], "full_len", &DataType::UInt64, false)
-            && field_matches(&fields[3], "truncated", &DataType::Boolean, false)
-            && field_matches(
-                &fields[4],
-                "full_sha256",
-                &DataType::FixedSizeBinary(32),
-                true,
-            )
-    } else {
-        fields.len() == 2
-            && field_matches(&fields[0], "str_id", &DataType::UInt64, false)
-            && field_matches(&fields[1], "bytes", &DataType::Binary, false)
-    }
-}
-
-fn field_matches(field: &Field, name: &str, data_type: &DataType, nullable: bool) -> bool {
-    field.name() == name && field.data_type() == data_type && field.is_nullable() == nullable
-}
-
 fn u64_column<'a>(
     batch: &'a RecordBatch,
     name: &'static str,
@@ -701,10 +637,10 @@ mod tests {
     use arrow_array::{BinaryArray, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use kronika_format::{PartMeta, SectionInput, build_part};
+    use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
     use kronika_registry::{
         CodecError, DICT_STRINGS_TYPE_ID, Section, encode_compact_ordered_batch,
     };
-    use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 
     use super::{ReadError, Resolved, Segment};
 

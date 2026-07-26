@@ -1993,7 +1993,6 @@ dependencies = [
  "kronika-source-log",
  "kronika-source-os",
  "kronika-source-pg",
- "kronika-store",
  "kronika-writer",
  "tempfile",
  "tokio",

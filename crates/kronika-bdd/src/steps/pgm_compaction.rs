@@ -2,40 +2,37 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use cucumber::{then, when};
 use kronika_reader::PgmUnit;
 use kronika_registry::Cell;
-use tokio::process::Command;
-use tokio::time::timeout;
 
 use crate::BddWorld;
 use crate::collector::Collector;
 use crate::harness::{pgm_compaction, web_lifecycle};
 
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const INSTANCE_METADATA_TYPE_ID: u32 = 1_021_001;
 
-#[when("the production collector recovers two completed windows after an abrupt stop")]
+#[when("the production collector recovers at least two completed windows after an abrupt stop")]
 async fn collect_two_windows_and_recover(world: &mut BddWorld) -> Result<()> {
     let cluster = world.harness.cluster()?;
     let mut extra_env = world.harness.collector_env().to_vec();
     extra_env.extend([
-        ("KRONIKA_INTERVAL_S".to_owned(), "0".to_owned()),
+        ("KRONIKA_INTERVAL_S".to_owned(), "1".to_owned()),
+        ("KRONIKA_PG_DATABASE_INTERVAL_S".to_owned(), "0".to_owned()),
+        ("KRONIKA_INSTANCE_INTERVAL_S".to_owned(), "0".to_owned()),
         ("KRONIKA_SEGMENT_MAX_AGE_S".to_owned(), "3600".to_owned()),
     ]);
 
-    let mut collector = Collector::spawn_with_env(cluster, &extra_env).await?;
-    collector.collect_window().await?;
-    collector.collect_window().await?;
+    let collector = Collector::spawn_with_env(cluster, &extra_env).await?;
+    let first = super::scheduler::wait_journal_grows(&collector, 0).await?;
+    super::scheduler::wait_journal_grows(&collector, first).await?;
     let journal_path = collector.output_dir()?.join("active.parts");
     let journal_before = fs::read(&journal_path).context("read completed two-window journal")?;
     ensure!(
         !journal_before.is_empty(),
-        "two acknowledged windows left an empty journal"
+        "completed windows left an empty journal"
     );
     let out_dir = collector.kill_abruptly().await?;
     ensure!(
@@ -150,64 +147,4 @@ async fn real_web_semantics_and_ovf_restart(world: &mut BddWorld) -> Result<()> 
     let baseline = web_lifecycle::establish_restart_baseline(&segment).await?;
     world.harness.set_web_lifecycle_baseline(baseline);
     Ok(())
-}
-
-#[then("collector and web reject an obsolete internal PGM without changing it")]
-async fn obsolete_internal_pgm_is_fail_fast(_world: &mut BddWorld) -> Result<()> {
-    let dir = tempfile::tempdir().context("create obsolete-store fixture")?;
-    let path = dir.path().join("retained.pgm");
-    let bytes = b"PGM1 retained pre-compaction source";
-    fs::write(&path, bytes).context("write obsolete-store fixture")?;
-
-    let collector_bin =
-        std::env::var("KRONIKA_COLLECTOR_BIN").context("KRONIKA_COLLECTOR_BIN is not set")?;
-    let mut collector = Command::new(collector_bin);
-    collector
-        .env("KRONIKA_PG_DSN", "postgresql://invalid.invalid/unused")
-        .env("KRONIKA_OUT_DIR", dir.path())
-        .env("KRONIKA_INTERVAL_S", "0")
-        .stdin(Stdio::null());
-    let collector_stderr = rejected_process(collector, "collector").await?;
-    ensure!(
-        collector_stderr.contains("pre-compaction")
-            || collector_stderr.contains("obsolete")
-            || collector_stderr.contains("current PGM contract"),
-        "collector rejection did not identify the incompatible PGM: {collector_stderr}"
-    );
-
-    let web_bin = std::env::var("KRONIKA_WEB_BIN").context("KRONIKA_WEB_BIN is not set")?;
-    let mut web = Command::new(web_bin);
-    web.env("KRONIKA_WEB_DIR", dir.path())
-        .env("KRONIKA_WEB_ADDR", "127.0.0.1:0")
-        .stdin(Stdio::null());
-    let web_stderr = rejected_process(web, "web").await?;
-    ensure!(
-        web_stderr.contains("pre-compaction")
-            || web_stderr.contains("obsolete")
-            || web_stderr.contains("current PGM contract"),
-        "web rejection did not identify the incompatible PGM: {web_stderr}"
-    );
-    ensure!(
-        fs::read(&path).context("reread obsolete PGM")? == bytes,
-        "a rejecting binary changed the obsolete PGM bytes"
-    );
-    Ok(())
-}
-
-async fn rejected_process(mut command: Command, label: &str) -> Result<String> {
-    let output = timeout(PROCESS_TIMEOUT, command.output())
-        .await
-        .with_context(|| format!("{label} did not reject the obsolete store in time"))?
-        .with_context(|| format!("run {label} against obsolete store"))?;
-    ensure!(
-        !output.status.success(),
-        "{label} accepted an obsolete internal PGM"
-    );
-    ensure!(
-        !String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line == "ready" || line.starts_with("pg_kronika-web ready ")),
-        "{label} announced readiness for an obsolete internal PGM"
-    );
-    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }

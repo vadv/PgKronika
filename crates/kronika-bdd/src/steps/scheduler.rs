@@ -67,7 +67,7 @@ async fn kill_and_restart(world: &mut BddWorld) -> Result<()> {
 }
 
 /// Wait until the journal file grows past `min` bytes.
-async fn wait_journal_grows(collector: &Collector, min: u64) -> Result<u64> {
+pub(super) async fn wait_journal_grows(collector: &Collector, min: u64) -> Result<u64> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let len = collector.journal_len();

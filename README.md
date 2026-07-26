@@ -134,7 +134,7 @@ allow lists with `cargo run -p xtask -- check-deps`.
 
 ## Contracts that affect operators
 
-- **Format and integrity.** PGM format version 1 uses little-endian framing,
+- **Format and integrity.** PGM uses little-endian framing,
   per-section CRC32C, and a CRC-protected end catalog. CRC detects accidental
   corruption; it is not authentication. Unknown or malformed data is reported
   or skipped with typed diagnostics rather than interpreted as valid rows.

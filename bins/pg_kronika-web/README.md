@@ -145,7 +145,7 @@ analysis.
 | `GET /healthz` | none | Confirms that the HTTP process is running. |
 | `GET /readyz` | none | Tells a health checker whether the directory snapshot was refreshed recently and reports its age. |
 | `GET /metrics` | none | Exposes Prometheus metrics for reader errors, data age, HTTP requests, RSS, and open file descriptors. |
-| `GET /v1/version` | none | Identifies the JSON API version and the PGM format version served by this build. |
+| `GET /v1/version` | none | Identifies the JSON API and internal PGM contract values served by this build. |
 | `GET /v1/sources` | none | Lists the collector sources present in the store, with the earliest and latest timestamp and the segment count for each source. |
 | `GET /v1/sections` | none | Shows which logical datasets can be queried and gives each dataset's semantics, sort key, and union of registered columns. |
 | `GET /v1/segments` | `source`, `from`, `to` | Shows which segments overlap the requested period and how many rows each section contains. It reads catalog metadata, not section bodies. |

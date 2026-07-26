@@ -201,11 +201,10 @@ ts | pid | datname | ... | state_change | leader_pid? | query_id?
 Here `?` means that the logical column allows `NULL`, including because an
 older layout did not contain that column.
 
-An old PGM needs no rewrite as long as the reader retains the old `type_id`
+A stored section remains readable while the reader retains its `type_id`
 contract. An unknown `type_id` does not become self-describing: the full
-contract is absent from the file. The format layer can still open the
-container and a reader can skip that section, but a direct `decode_any` call
-returns `UnknownType`.
+contract is absent from PGM, and a direct `decode_any` call returns
+`UnknownType`.
 
 Even adding a nullable column requires a new `type_id`. The decoder checks the
 exact Arrow column count, order, types, and nullability; it does not infer

@@ -6,22 +6,18 @@
 //! comparator, resource estimate, and Parquet properties beside the registry
 //! prevents the storage writer from inventing type-specific behavior.
 
-use std::cmp::Ordering;
 use std::sync::LazyLock;
 
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, ListArray, RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
+use arrow_array::RecordBatch;
 use arrow_select::concat::concat_batches;
-use arrow_select::take::take;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::codec::{
-    MAX_LIST_I32_VALUES_PER_SECTION, check_row_cap, schema_matches, validate_list_i32_batch,
+    MAX_LIST_I32_VALUES_PER_SECTION, check_row_cap, schema_matches, sort_canonical,
+    validate_list_i32_batch,
 };
 use crate::{CodecError, ColumnType, MAX_SECTION_BYTES, MAX_SECTION_ROWS, TypeContract, registry};
 
@@ -94,99 +90,63 @@ pub(crate) fn compact_section_bound_for_contract(
 ) -> Result<CompactSectionBound, CodecError> {
     check_row_cap(rows)?;
     let mut decoded_arrow_bytes = 0_usize;
-    let mut plain_body_bytes = checked_add(
+    let mut plain_body_bytes = add(
         BODY_FRAMING_BYTES,
-        checked_mul(
-            contract.columns.len(),
-            BODY_COLUMN_FRAMING_BYTES,
-            "compact body column framing",
-        )?,
-        "compact body framing",
+        mul(contract.columns.len(), BODY_COLUMN_FRAMING_BYTES)?,
     )?;
     let mut max_column_page_bytes = 0_usize;
 
     for column in contract.columns {
-        let validity = if column.nullable {
-            rows.div_ceil(8)
-        } else {
-            0
-        };
+        let validity = if column.nullable { rows.div_ceil(8) } else { 0 };
         let definition_levels = if column.nullable { rows } else { 0 };
-        let (arrow_values, parquet_values) = match column.ty {
-            ColumnType::I8 | ColumnType::U8 | ColumnType::Bool => {
-                let values = rows;
-                (values, values)
-            }
-            ColumnType::I16 | ColumnType::U16 => {
-                let values = checked_mul(rows, 2, "compact i16 column")?;
-                (values, values)
-            }
-            ColumnType::I32 | ColumnType::U32 | ColumnType::F32 => {
-                let values = checked_mul(rows, 4, "compact i32 column")?;
-                (values, values)
-            }
+        let width = match column.ty {
+            ColumnType::I8 | ColumnType::U8 | ColumnType::Bool => 1,
+            ColumnType::I16 | ColumnType::U16 => 2,
+            ColumnType::I32 | ColumnType::U32 | ColumnType::F32 => 4,
             ColumnType::I64
             | ColumnType::U64
             | ColumnType::F64
             | ColumnType::Ts
-            | ColumnType::StrId => {
-                let values = checked_mul(rows, 8, "compact i64 column")?;
-                (values, values)
-            }
-            ColumnType::ListI32 => {
-                let max_values = MAX_LIST_I32_VALUES_PER_SECTION.checked_add(rows).ok_or(
-                    CodecError::TooManyListValues {
-                        name: column.name,
-                        values: list_values,
-                        max: MAX_LIST_I32_VALUES_PER_SECTION,
-                    },
-                )?;
-                if list_values > max_values {
-                    return Err(CodecError::TooManyListValues {
-                        name: column.name,
-                        values: list_values,
-                        max: max_values,
-                    });
-                }
-                let children = list_values;
-                let child_values = checked_mul(children, 4, "compact list child bytes")?;
-                let offsets = checked_mul(
-                    rows.checked_add(1).ok_or(CodecError::SectionTooLarge {
-                        len: usize::MAX,
-                        max: COMPACTION_MEMORY_LIMIT,
-                    })?,
-                    4,
-                    "compact list offsets",
-                )?;
-                let arrow = checked_add(offsets, child_values, "compact list Arrow bytes")?;
-                // Repetition + definition levels are conservatively charged at
-                // two bytes per possible child and two bytes per parent.
-                let child_levels = checked_mul(children, 2, "compact list child levels")?;
-                let parent_levels = checked_mul(rows, 2, "compact list parent levels")?;
-                let parquet = checked_add(
-                    checked_add(child_values, child_levels, "compact list values and levels")?,
-                    parent_levels,
-                    "compact list page bytes",
-                )?;
-                (arrow, parquet)
-            }
+            | ColumnType::StrId => 8,
+            ColumnType::ListI32 => 0,
         };
-        decoded_arrow_bytes = checked_add(
-            decoded_arrow_bytes,
-            checked_add(arrow_values, validity, "compact Arrow column")?,
-            "compact Arrow batch",
-        )?;
-        let page = checked_add(
-            checked_add(
-                parquet_values,
-                definition_levels,
-                "compact column definition levels",
-            )?,
-            PAGE_FRAMING_BYTES,
-            "compact column page framing",
-        )?;
+        let (arrow_values, parquet_values) = if width > 0 {
+            let values = mul(rows, width)?;
+            (values, values)
+        } else {
+            let max_values = MAX_LIST_I32_VALUES_PER_SECTION.checked_add(rows).ok_or(
+                CodecError::TooManyListValues {
+                    name: column.name,
+                    values: list_values,
+                    max: MAX_LIST_I32_VALUES_PER_SECTION,
+                },
+            )?;
+            if list_values > max_values {
+                return Err(CodecError::TooManyListValues {
+                    name: column.name,
+                    values: list_values,
+                    max: max_values,
+                });
+            }
+            let child_values = mul(list_values, 4)?;
+            let offsets = mul(
+                rows.checked_add(1).ok_or(CodecError::SectionTooLarge {
+                    len: usize::MAX,
+                    max: COMPACTION_MEMORY_LIMIT,
+                })?,
+                4,
+            )?;
+            // Parquet repetition/definition levels are charged at two bytes
+            // per possible child and parent.
+            (
+                add(offsets, child_values)?,
+                add(add(child_values, mul(list_values, 2)?)?, mul(rows, 2)?)?,
+            )
+        };
+        decoded_arrow_bytes = add(decoded_arrow_bytes, add(arrow_values, validity)?)?;
+        let page = add(add(parquet_values, definition_levels)?, PAGE_FRAMING_BYTES)?;
         max_column_page_bytes = max_column_page_bytes.max(page);
-        plain_body_bytes = checked_add(plain_body_bytes, page, "compact PLAIN body")?;
+        plain_body_bytes = add(plain_body_bytes, page)?;
     }
 
     Ok(CompactSectionBound {
@@ -214,12 +174,7 @@ pub fn read_work_memory_bound(
     declared_uncompressed_bytes: usize,
 ) -> Result<usize, CodecError> {
     let contract = contract(type_id)?;
-    read_work_memory_bound_for_contract(
-        contract,
-        rows,
-        stored_bytes,
-        declared_uncompressed_bytes,
-    )
+    read_work_memory_bound_for_contract(contract, rows, stored_bytes, declared_uncompressed_bytes)
 }
 
 pub(crate) fn read_work_memory_bound_for_contract(
@@ -231,18 +186,17 @@ pub(crate) fn read_work_memory_bound_for_contract(
     // Parquet's checked declared size dominates list-child storage. Zero here
     // still charges Arrow offsets for the schema-derived floor.
     let section = compact_section_bound_for_contract(contract, rows, 0)?;
-    let decoded = section
-        .decoded_arrow_bytes
-        .max(declared_uncompressed_bytes);
-    checked_add(
-        checked_add(
-            stored_bytes,
-            checked_mul(decoded, 2, "read decode overlap")?,
-            "read stored and decoded bytes",
-        )?,
-        1024 * 1024,
-        "read bookkeeping",
-    )
+    let decoded = section.decoded_arrow_bytes.max(declared_uncompressed_bytes);
+    read_work_memory(stored_bytes, decoded)
+}
+
+/// Bound encoded plus overlapping decoded buffers for any Parquet section.
+///
+/// # Errors
+///
+/// Returns [`CodecError::SectionTooLarge`] if the estimate overflows.
+pub fn read_work_memory(stored_bytes: usize, decoded_bytes: usize) -> Result<usize, CodecError> {
+    add(add(stored_bytes, mul(decoded_bytes, 2)?)?, 1024 * 1024)
 }
 
 /// Parquet properties for every final data and dictionary section.
@@ -285,26 +239,10 @@ pub fn compaction_memory_bound(type_id: u32, rows: usize) -> Result<usize, Codec
     };
     let one_copy = compact_section_bound(type_id, rows, list_values)?.decoded_arrow_bytes;
 
-    let live_copies = checked_mul(one_copy, 4, "compaction live Arrow copies")?;
-    let indexes = checked_mul(
-        checked_mul(rows, size_of::<u32>(), "compaction row index")?,
-        2,
-        "compaction row indexes",
-    )?;
-    let bookkeeping = checked_add(
-        1024 * 1024,
-        checked_mul(
-            contract.columns.len(),
-            4096,
-            "compaction column bookkeeping",
-        )?,
-        "compaction bookkeeping",
-    )?;
-    checked_add(
-        checked_add(live_copies, indexes, "compaction data and indexes")?,
-        bookkeeping,
-        "compaction total estimate",
-    )
+    let live_copies = mul(one_copy, 4)?;
+    let indexes = mul(mul(rows, size_of::<u32>())?, 2)?;
+    let bookkeeping = add(1024 * 1024, mul(contract.columns.len(), 4096)?)?;
+    add(add(live_copies, indexes)?, bookkeeping)
 }
 
 /// Concatenate registered Arrow batches and put their rows in canonical order.
@@ -343,7 +281,7 @@ pub fn canonicalize_batches(
         return Ok(RecordBatch::new_empty(schema));
     }
     let merged = concat_batches(&schema, batches)?;
-    canonical_sort(&merged, contract)
+    sort_canonical(&merged, contract)
 }
 
 /// Encode one canonical compact Parquet body.
@@ -359,7 +297,7 @@ pub fn canonicalize_batches(
 /// a final body above [`MAX_SECTION_BYTES`].
 pub fn encode_compact_batch(type_id: u32, batch: &RecordBatch) -> Result<Vec<u8>, CodecError> {
     let canonical = canonicalize_batches(type_id, std::slice::from_ref(batch))?;
-    encode_canonical_batch(&canonical)
+    encode_compact_ordered_batch(&canonical)
 }
 
 /// Encode a row-capped batch already in its required canonical order.
@@ -390,172 +328,6 @@ pub fn encode_compact_ordered_batch(batch: &RecordBatch) -> Result<Vec<u8>, Code
     Ok(body)
 }
 
-/// Encode a batch already validated and canonically sorted by this module.
-fn encode_canonical_batch(batch: &RecordBatch) -> Result<Vec<u8>, CodecError> {
-    encode_compact_ordered_batch(batch)
-}
-
-/// Build the complete comparison-column sequence once per sort.
-fn canonical_sort(batch: &RecordBatch, contract: &TypeContract) -> Result<RecordBatch, CodecError> {
-    if batch.num_rows() <= 1 {
-        return Ok(batch.clone());
-    }
-    let mut order = Vec::with_capacity(contract.columns.len());
-    for &name in contract.sort_key {
-        let index = contract
-            .columns
-            .iter()
-            .position(|column| column.name == name)
-            .ok_or(CodecError::MissingColumn { name })?;
-        if !order.contains(&index) {
-            order.push(index);
-        }
-    }
-    for index in 0..contract.columns.len() {
-        if !order.contains(&index) {
-            order.push(index);
-        }
-    }
-    let comparable = contract
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            ComparableColumn::new(batch.column(index).as_ref(), column.ty, column.name)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut indices: Vec<u32> = (0..batch.num_rows())
-        .map(|index| {
-            u32::try_from(index).map_err(|_overflow| CodecError::TooManyRows {
-                rows: batch.num_rows(),
-                max: MAX_SECTION_ROWS,
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    indices.sort_unstable_by(|left, right| {
-        let left = *left as usize;
-        let right = *right as usize;
-        for &column in &order {
-            let ordering = comparable[column].compare(left, right);
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
-        }
-        Ordering::Equal
-    });
-    let indices = UInt32Array::from(indices);
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|column| take(column.as_ref(), &indices, None))
-        .collect::<Result<Vec<ArrayRef>, _>>()?;
-    Ok(RecordBatch::try_new(batch.schema(), columns)?)
-}
-
-/// One schema-checked Arrow column with an infallible row comparator.
-enum ComparableColumn<'a> {
-    I8(&'a Int8Array),
-    I16(&'a Int16Array),
-    I32(&'a Int32Array),
-    I64(&'a Int64Array),
-    U8(&'a UInt8Array),
-    U16(&'a UInt16Array),
-    U32(&'a UInt32Array),
-    U64(&'a UInt64Array),
-    F32(&'a Float32Array),
-    F64(&'a Float64Array),
-    Bool(&'a BooleanArray),
-    ListI32(&'a ListArray),
-}
-
-impl<'a> ComparableColumn<'a> {
-    fn new(array: &'a dyn Array, ty: ColumnType, name: &'static str) -> Result<Self, CodecError> {
-        macro_rules! downcast {
-            ($array:ty, $variant:ident) => {
-                array
-                    .as_any()
-                    .downcast_ref::<$array>()
-                    .map(Self::$variant)
-                    .ok_or(CodecError::ColumnType { name })
-            };
-        }
-        match ty {
-            ColumnType::I8 => downcast!(Int8Array, I8),
-            ColumnType::I16 => downcast!(Int16Array, I16),
-            ColumnType::I32 => downcast!(Int32Array, I32),
-            ColumnType::I64 | ColumnType::Ts => downcast!(Int64Array, I64),
-            ColumnType::U8 => downcast!(UInt8Array, U8),
-            ColumnType::U16 => downcast!(UInt16Array, U16),
-            ColumnType::U32 => downcast!(UInt32Array, U32),
-            ColumnType::U64 | ColumnType::StrId => downcast!(UInt64Array, U64),
-            ColumnType::F32 => downcast!(Float32Array, F32),
-            ColumnType::F64 => downcast!(Float64Array, F64),
-            ColumnType::Bool => downcast!(BooleanArray, Bool),
-            ColumnType::ListI32 => downcast!(ListArray, ListI32),
-        }
-    }
-
-    fn compare(&self, left: usize, right: usize) -> Ordering {
-        let null_order = |array: &dyn Array| match (array.is_null(left), array.is_null(right)) {
-            (true, true) => Some(Ordering::Equal),
-            (true, false) => Some(Ordering::Less),
-            (false, true) => Some(Ordering::Greater),
-            (false, false) => None,
-        };
-        macro_rules! scalar {
-            ($array:expr) => {
-                null_order(*$array).unwrap_or_else(|| $array.value(left).cmp(&$array.value(right)))
-            };
-        }
-        match self {
-            Self::I8(array) => scalar!(array),
-            Self::I16(array) => scalar!(array),
-            Self::I32(array) => scalar!(array),
-            Self::I64(array) => scalar!(array),
-            Self::U8(array) => scalar!(array),
-            Self::U16(array) => scalar!(array),
-            Self::U32(array) => scalar!(array),
-            Self::U64(array) => scalar!(array),
-            Self::F32(array) => null_order(*array).unwrap_or_else(|| {
-                array
-                    .value(left)
-                    .to_bits()
-                    .cmp(&array.value(right).to_bits())
-            }),
-            Self::F64(array) => null_order(*array).unwrap_or_else(|| {
-                array
-                    .value(left)
-                    .to_bits()
-                    .cmp(&array.value(right).to_bits())
-            }),
-            Self::Bool(array) => scalar!(array),
-            Self::ListI32(array) => {
-                null_order(*array).unwrap_or_else(|| compare_list(array, left, right))
-            }
-        }
-    }
-}
-
-fn compare_list(array: &ListArray, left: usize, right: usize) -> Ordering {
-    let left = array.value(left);
-    let right = array.value(right);
-    let left = left
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .expect("schema validation guarantees Int32 list children");
-    let right = right
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .expect("schema validation guarantees Int32 list children");
-    for index in 0..left.len().min(right.len()) {
-        let ordering = left.value(index).cmp(&right.value(index));
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    left.len().cmp(&right.len())
-}
-
 fn validate_lists(batch: &RecordBatch, contract: &TypeContract) -> Result<(), CodecError> {
     for column in contract
         .columns
@@ -574,14 +346,14 @@ fn contract(type_id: u32) -> Result<&'static TypeContract, CodecError> {
         .ok_or(CodecError::UnknownType { type_id })
 }
 
-fn checked_mul(left: usize, right: usize, _what: &'static str) -> Result<usize, CodecError> {
+fn mul(left: usize, right: usize) -> Result<usize, CodecError> {
     left.checked_mul(right).ok_or(CodecError::SectionTooLarge {
         len: usize::MAX,
         max: COMPACTION_MEMORY_LIMIT,
     })
 }
 
-fn checked_add(left: usize, right: usize, _what: &'static str) -> Result<usize, CodecError> {
+fn add(left: usize, right: usize) -> Result<usize, CodecError> {
     left.checked_add(right).ok_or(CodecError::SectionTooLarge {
         len: usize::MAX,
         max: COMPACTION_MEMORY_LIMIT,
@@ -625,39 +397,13 @@ mod tests {
         let b = PgStatArchiver {
             archived_count: 1,
             last_archived_wal: Some(StrId(8)),
-            ..a.clone()
+            ..a
         };
-        let forward = archiver_batch(&[a.clone(), b.clone()]);
+        let forward = archiver_batch(&[a, b]);
         let reverse = archiver_batch(&[b, a]);
         let forward = encode_compact_batch(1_008_001, &forward).expect("compact");
         let reverse = encode_compact_batch(1_008_001, &reverse).expect("compact");
         assert_eq!(forward, reverse, "complete tie-break yields exact bytes");
-    }
-
-    #[test]
-    fn float_bits_distinguish_signed_zero_and_nan_payloads() {
-        let floats = Float64Array::from(vec![
-            f64::from_bits(0x7ff8_0000_0000_0002),
-            -0.0,
-            0.0,
-            f64::from_bits(0x7ff8_0000_0000_0001),
-        ]);
-        let column = ComparableColumn::F64(&floats);
-        let mut rows = vec![0_usize, 1, 2, 3];
-        rows.sort_unstable_by(|left, right| column.compare(*left, *right));
-        let bits: Vec<u64> = rows
-            .iter()
-            .map(|&row| floats.value(row).to_bits())
-            .collect();
-        assert_eq!(
-            bits,
-            vec![
-                0,
-                0x7ff8_0000_0000_0001,
-                0x7ff8_0000_0000_0002,
-                0x8000_0000_0000_0000
-            ]
-        );
     }
 
     #[test]

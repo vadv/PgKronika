@@ -111,19 +111,6 @@ impl Collector {
         self.wait_sealed().await
     }
 
-    /// Ask the production daemon to append one full collection window without
-    /// rotating the open segment, then wait for its explicit completion event.
-    pub(crate) async fn collect_window(&mut self) -> Result<()> {
-        let raw = self.child.id().context("collector already exited")?;
-        let pid = Pid::from_raw(i32::try_from(raw).context("collector pid out of range")?);
-        kill(pid, Signal::SIGUSR1).context("send SIGUSR1 to the collector")?;
-        let line = next_line(&mut self.lines).await?;
-        if line != "collected" {
-            bail!("expected 'collected', got {line:?}");
-        }
-        Ok(())
-    }
-
     /// Wait for the collector to announce the next sealed segment on its own,
     /// without sending a signal — the internal-timer path.
     pub(crate) async fn wait_sealed(&mut self) -> Result<PathBuf> {

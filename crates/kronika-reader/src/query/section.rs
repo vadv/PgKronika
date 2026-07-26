@@ -757,9 +757,8 @@ mod tests {
     #[test]
     fn compact_section_reads_all_coalesced_rows_of_a_type() {
         let dir = tempfile::tempdir().unwrap();
-        let body =
-            PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
-                .expect("encode");
+        let body = PgStatArchiver::encode(&[archiver_row(1000, 1), archiver_row(2000, 2)])
+            .expect("encode");
         let part = part_from(&[(1_008_001, 2, body)], 1000, 2000, 7);
         fs::write(dir.path().join("1000.pgm"), &part).unwrap();
 

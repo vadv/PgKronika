@@ -103,6 +103,11 @@ fn all_layout_bytes_are_deterministic_under_window_reordering() -> TestResult {
     Ok(())
 }
 
+#[allow(
+    clippy::missing_assert_message,
+    clippy::too_many_lines,
+    reason = "one oracle keeps the complete producer-to-reader invariant sequence visible"
+)]
 fn roundtrip_fixture(class: FixtureClass, reverse: bool) -> TestResult<Vec<u8>> {
     let dir = tempfile::tempdir()?;
     let journal_path = dir.path().join("active.parts");
@@ -122,8 +127,7 @@ fn roundtrip_fixture(class: FixtureClass, reverse: bool) -> TestResult<Vec<u8>> 
         let row_start = window * rows_per_window;
         let mut bodies = Vec::<(u32, u32, Vec<u8>)>::new();
         for contract in registry() {
-            let batch =
-                synthetic_contract_batch(contract, class, row_start, rows_per_window)?;
+            let batch = synthetic_contract_batch(contract, class, row_start, rows_per_window)?;
             expected
                 .entry(contract.type_id.get())
                 .or_default()
@@ -171,17 +175,13 @@ fn roundtrip_fixture(class: FixtureClass, reverse: bool) -> TestResult<Vec<u8>> 
     let unit = PgmUnit::open(File::open(&output)?)?;
     assert_eq!(unit.catalog().source_id, SOURCE_ID);
     assert_eq!(unit.catalog().min_ts, MIN_TS);
-    let expected_max =
-        MIN_TS + i64::try_from(windows * rows_per_window - 1)? * 5_000_000;
+    let expected_max = MIN_TS + i64::try_from(windows * rows_per_window - 1)? * 5_000_000;
     assert_eq!(unit.catalog().max_ts, expected_max);
     assert_eq!(unit.catalog().entries.len(), EXPECTED_LAYOUTS + 2);
 
     let mut seen = 0_usize;
     for entry in &unit.catalog().entries {
-        if matches!(
-            entry.type_id,
-            DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID
-        ) {
+        if matches!(entry.type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID) {
             continue;
         }
         let source = expected.get(&entry.type_id).expect("expected family");
@@ -262,6 +262,15 @@ fn synthetic_contract_batch(
 #[allow(
     clippy::too_many_arguments,
     reason = "the registry-driven fixture supplies every physical column dimension explicitly"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::from_iter_instead_of_collect,
+    clippy::manual_midpoint,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    reason = "the all-layout test intentionally generates every Arrow width through one uniform fallible interface"
 )]
 fn synthetic_column(
     ty: ColumnType,
@@ -352,9 +361,7 @@ fn synthetic_column(
         ColumnType::StrId => Arc::new(UInt64Array::from_iter((0..rows).map(|row| {
             maybe(
                 null_at(row),
-                dictionary_id(&dictionary_bytes(
-                    (row_start + row + column_index) % 7 + 1,
-                )),
+                dictionary_id(&dictionary_bytes((row_start + row + column_index) % 7 + 1)),
             )
         }))),
         ColumnType::ListI32 => {
@@ -417,10 +424,8 @@ fn dictionary_bodies() -> TestResult<Vec<(u32, u32, Vec<u8>)>> {
     let stored = BinaryArray::from_iter_values([blob.as_slice()]);
     let full_len = UInt64Array::from_iter_values([blob.len() as u64]);
     let truncated = BooleanArray::from(vec![false]);
-    let hash = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-        [None::<[u8; 32]>].into_iter(),
-        32,
-    )?;
+    let hash =
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size([None::<[u8; 32]>].into_iter(), 32)?;
     let blob_batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("str_id", DataType::UInt64, false),

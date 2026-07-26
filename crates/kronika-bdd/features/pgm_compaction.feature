@@ -8,7 +8,7 @@ Feature: The current compact PGM survives collection and process boundaries
   Scenario Outline: PostgreSQL <major> publishes and serves one compact two-window PGM
     Given a fresh database on PostgreSQL <major>
     And a time-local fixed-semantics PostgreSQL stderr log fixture
-    When the production collector recovers two completed windows after an abrupt stop
+    When the production collector recovers at least two completed windows after an abrupt stop
     Then the sealed file has the one current compact physical PGM contract
     And both stored windows retain the exact PostgreSQL major through the current reader
     And real web processes preserve section diff overview anomaly and incident semantics through OVF restart
@@ -32,8 +32,3 @@ Feature: The current compact PGM survives collection and process boundaries
     Examples: PostgreSQL 18
       | major |
       | 18    |
-
-  @pg17
-  Scenario: obsolete internal files stop both production binaries without mutation
-    Given a fresh database on PostgreSQL 17
-    Then collector and web reject an obsolete internal PGM without changing it

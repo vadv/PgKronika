@@ -11,7 +11,7 @@
 //! ```text
 //! catalog entry: 32 B       metadata: 40 B            tail index: 8 B
 //!   type_id        u32        min_ts          i64       catalog_len u32
-//!   flags          u32        max_ts          i64       magic       "PGM1"
+//!   flags          u32        max_ts          i64       PGM magic   [u8; 4]
 //!   offset         u64        source_id       u64
 //!   len            u64        entry_count     u32
 //!   rows           u32        format_version  u32
@@ -126,7 +126,7 @@ impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadTailMagic { actual } => {
-                write!(f, "tail index magic is {actual:02x?}, expected \"PGM1\"")
+                write!(f, "tail index magic is {actual:02x?}, expected PGM magic")
             }
             Self::BadCatalogLen { actual } => {
                 write!(
@@ -203,23 +203,6 @@ impl Catalog {
         self.entries.len() * ENTRY_LEN + META_LEN
     }
 
-    /// Checked length of the catalog block, excluding the tail index.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EncodeError::CatalogTooLarge`] when multiplication/addition
-    /// overflows or the length cannot be represented by the on-disk `u32`.
-    pub fn checked_encoded_len(&self) -> Result<usize, EncodeError> {
-        let entries = self.entries.len();
-        let len = entries
-            .checked_mul(ENTRY_LEN)
-            .and_then(|bytes| bytes.checked_add(META_LEN))
-            .ok_or(EncodeError::CatalogTooLarge { entries })?;
-        u32::try_from(len).map_err(|_overflow| EncodeError::CatalogTooLarge { entries })?;
-        u32::try_from(entries).map_err(|_overflow| EncodeError::CatalogTooLarge { entries })?;
-        Ok(len)
-    }
-
     /// Encode catalog entries, metadata, and the tail index.
     ///
     /// The returned buffer starts immediately after the last section body and
@@ -243,18 +226,19 @@ impl Catalog {
     /// Returns [`EncodeError::CatalogTooLarge`] when the entry count or
     /// catalog length does not fit the on-disk fields.
     pub fn try_encode(&self) -> Result<Vec<u8>, EncodeError> {
-        let encoded_len = self.checked_encoded_len()?;
-        let catalog_len =
-            u32::try_from(encoded_len).map_err(|_overflow| EncodeError::CatalogTooLarge {
-                entries: self.entries.len(),
-            })?;
+        let entries = self.entries.len();
+        let encoded_len = entries
+            .checked_mul(ENTRY_LEN)
+            .and_then(|bytes| bytes.checked_add(META_LEN))
+            .ok_or(EncodeError::CatalogTooLarge { entries })?;
+        let catalog_len = u32::try_from(encoded_len)
+            .map_err(|_overflow| EncodeError::CatalogTooLarge { entries })?;
+        let entry_count =
+            u32::try_from(entries).map_err(|_overflow| EncodeError::CatalogTooLarge { entries })?;
 
-        let capacity =
-            encoded_len
-                .checked_add(TAIL_INDEX_LEN)
-                .ok_or(EncodeError::CatalogTooLarge {
-                    entries: self.entries.len(),
-                })?;
+        let capacity = encoded_len
+            .checked_add(TAIL_INDEX_LEN)
+            .ok_or(EncodeError::CatalogTooLarge { entries })?;
         let mut out = Vec::with_capacity(capacity);
         for e in &self.entries {
             out.extend_from_slice(&e.type_id.to_le_bytes());
@@ -267,11 +251,6 @@ impl Catalog {
         out.extend_from_slice(&self.min_ts.to_le_bytes());
         out.extend_from_slice(&self.max_ts.to_le_bytes());
         out.extend_from_slice(&self.source_id.to_le_bytes());
-        let entry_count = u32::try_from(self.entries.len()).map_err(|_overflow| {
-            EncodeError::CatalogTooLarge {
-                entries: self.entries.len(),
-            }
-        })?;
         out.extend_from_slice(&entry_count.to_le_bytes());
         out.extend_from_slice(&self.format_version.to_le_bytes());
         // CRC is computed over the whole catalog with this field zeroed,

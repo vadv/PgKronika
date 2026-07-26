@@ -4,8 +4,7 @@
 //! `KRONIKA_PG_DSN` and `KRONIKA_OUT_DIR`. The process opens one `PostgreSQL`
 //! instance, schedules each source independently, appends synchronized windows
 //! to `<out>/active.parts`, and rotates immutable `<timestamp>.pgm` segments by
-//! size, age, journal pressure, or `SIGUSR2`. `SIGUSR1` collects one complete
-//! window without forcing a seal; `SIGUSR2` collects one window and seals it.
+//! size, age, journal pressure, or `SIGUSR2`.
 //!
 //! `SIGTERM` and `SIGINT` stop the loop without discarding the journal. Startup
 //! recovery seals valid frames left by the preceding process before opening a
@@ -65,7 +64,7 @@ use pool_sources::{PoolReads, read_pool_sources};
 use scheduler::{DueSet, Scheduler, SourceKind};
 use segments::{
     SegmentState, append_window_and_maybe_seal, encode_window, open_collector_journal,
-    seal_open_segment, verify_output_contract,
+    seal_open_segment,
 };
 use service_sections::{collect_due_instance, collect_service_sections};
 use source_contracts::activity_dict_limits;
@@ -99,28 +98,10 @@ fn timer_sleep_delay(
     Some(delay)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Wake {
-    Timer,
-    Collect,
-    CollectAndSeal,
-}
-
-impl Wake {
-    const fn forces_sources(self) -> bool {
-        !matches!(self, Self::Timer)
-    }
-
-    const fn seals_after_collection(self) -> bool {
-        matches!(self, Self::CollectAndSeal)
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
     std::fs::create_dir_all(&config.out_dir).context("create the output directory")?;
-    verify_output_contract(&config.out_dir)?;
 
     // The journal lives next to sealed segments so windows survive restarts.
     // Recovered windows are sealed before connecting to PostgreSQL.
@@ -142,7 +123,6 @@ async fn main() -> Result<()> {
     .await
     .context("connect pool")?;
 
-    let mut sigusr1 = signal(SignalKind::user_defined1()).context("install the SIGUSR1 handler")?;
     let mut sigusr2 = signal(SignalKind::user_defined2()).context("install the SIGUSR2 handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("install the SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("install the SIGINT handler")?;
@@ -172,19 +152,18 @@ async fn main() -> Result<()> {
                 &segment,
             )
         };
-        let wake = tokio::select! {
-            Some(()) = sigusr1.recv() => Wake::Collect,
-            Some(()) = sigusr2.recv() => Wake::CollectAndSeal,
+        let forced = tokio::select! {
+            Some(()) = sigusr2.recv() => true,
             () = async {
                 match sleep {
                     Some(delay) => tokio::time::sleep(delay).await,
                     None => std::future::pending::<()>().await,
                 }
-            } => Wake::Timer,
+            } => false,
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
         };
-        let due = sched.plan(Instant::now(), wake.forces_sources());
+        let due = sched.plan(Instant::now(), forced);
         // The age valve runs on every tick, before collection: a tick whose
         // sources fail or return no rows must still close an expired segment.
         let age = Duration::from_secs(config.segment_max_age_secs);
@@ -206,7 +185,7 @@ async fn main() -> Result<()> {
         if due.is_empty() && !plans_cache.is_due(Instant::now()) {
             continue;
         }
-        let completed = run_collection_cycle(
+        run_collection_cycle(
             &mut pool,
             &mut journal,
             &config,
@@ -217,12 +196,8 @@ async fn main() -> Result<()> {
             &mut segment,
             &mut sched,
             &mut pool_budget,
-            wake.seals_after_collection(),
         )
         .await;
-        if completed && matches!(wake, Wake::Collect) {
-            announce("collected");
-        }
     }
     Ok(())
 }
@@ -232,7 +207,6 @@ async fn main() -> Result<()> {
 /// the daemon running.
 #[allow(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "the cycle owns daemon state transitions across pool, journal, scheduler, and logs"
 )]
 async fn run_collection_cycle(
@@ -246,8 +220,7 @@ async fn run_collection_cycle(
     segment: &mut SegmentState,
     sched: &mut Scheduler,
     pool_budget: &mut PoolBudget,
-    seal_after_collection: bool,
-) -> bool {
+) {
     if let Err(err) = pool.ensure_main().await {
         log_event(
             LogLevel::Error,
@@ -255,15 +228,7 @@ async fn run_collection_cycle(
             &[field("source", "main"), field("error", format!("{err:#}"))],
         );
         if due.has(SourceKind::PgLog) {
-            match run_log_only_cycle(
-                log_collector,
-                journal,
-                config,
-                segment,
-                seal_after_collection,
-            )
-            .await
-            {
+            match run_log_only_cycle(log_collector, journal, config, due, segment).await {
                 Ok(sealed) => {
                     for (dest, reason) in sealed {
                         sched.mark_segment_opened();
@@ -277,7 +242,7 @@ async fn run_collection_cycle(
                 ),
             }
         }
-        return false;
+        return;
     }
     if let Err(err) = pool
         .refresh(
@@ -311,7 +276,6 @@ async fn run_collection_cycle(
         due,
         segment,
         pool_budget,
-        seal_after_collection,
     )
     .await
     {
@@ -339,16 +303,12 @@ async fn run_collection_cycle(
                 sched.mark_segment_opened();
                 announce(&format!("sealed {} reason={reason}", dest.display()));
             }
-            true
         }
-        Err(err) => {
-            log_event(
-                LogLevel::Error,
-                "snapshot_failure",
-                &[field("error", format!("{err:#}"))],
-            );
-            false
-        }
+        Err(err) => log_event(
+            LogLevel::Error,
+            "snapshot_failure",
+            &[field("error", format!("{err:#}"))],
+        ),
     }
 }
 
@@ -399,7 +359,6 @@ async fn snapshot_and_seal(
     due: &DueSet,
     segment: &mut SegmentState,
     pool_budget: &mut PoolBudget,
-    seal_after_collection: bool,
 ) -> Result<CycleOutcome> {
     // Run every query first: SectionBuffers and Interner are `!Send` and must
     // not cross await points. Each source reads only when due.
@@ -568,7 +527,7 @@ async fn snapshot_and_seal(
         config,
         segment,
         main_src.ts.0,
-        seal_after_collection,
+        due.forced(),
         &flushed,
     )
     .context("append the collection window")?;

@@ -32,8 +32,8 @@ pub use journal::{
     OpenReport,
 };
 pub use segment::{
-    DEFAULT_MAX_INPUT_SECTIONS, DictionaryError, Publication, SealAdmission, SealError, SealLimits,
-    SealOptions, SealResource, SealSummary, seal, seal_with_options,
+    DEFAULT_MAX_INPUT_SECTIONS, Publication, SealAdmission, SealError, SealLimits, SealResource,
+    SealSummary, seal, seal_with_limits,
 };
 
 #[cfg(test)]

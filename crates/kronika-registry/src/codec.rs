@@ -555,7 +555,7 @@ pub(crate) fn encode_section(
     let schema = arrow_schema(contract);
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
     check_row_cap(batch.num_rows())?;
-    let batch = sort_by_sort_key(&batch, contract)?;
+    let batch = sort_canonical(&batch, contract)?;
 
     let options = ArrowWriterOptions::new()
         .with_properties(WRITER_PROPS.clone())
@@ -575,16 +575,24 @@ pub(crate) fn encode_section(
     Ok(buf)
 }
 
-/// Reorder `batch` by the contract's sort-key columns.
-fn sort_by_sort_key(
+/// Reorder by the sort key, then all remaining columns as deterministic ties.
+pub(crate) fn sort_canonical(
     batch: &RecordBatch,
     contract: &TypeContract,
 ) -> Result<RecordBatch, CodecError> {
-    if contract.sort_key.is_empty() || batch.num_rows() <= 1 {
+    if contract.columns.is_empty() || batch.num_rows() <= 1 {
         return Ok(batch.clone());
     }
-    let mut sort_columns = Vec::with_capacity(contract.sort_key.len());
-    for &name in contract.sort_key {
+    let mut names = contract.sort_key.to_vec();
+    names.extend(
+        contract
+            .columns
+            .iter()
+            .map(|column| column.name)
+            .filter(|name| !contract.sort_key.contains(name)),
+    );
+    let mut sort_columns = Vec::with_capacity(names.len());
+    for name in names {
         let values = batch
             .column_by_name(name)
             .ok_or(CodecError::MissingColumn { name })?;
@@ -791,15 +799,14 @@ fn capped_reader(
     for row_group in builder.metadata().row_groups() {
         for column in row_group.columns() {
             let raw = column.uncompressed_size();
-            let bytes = usize::try_from(raw)
-                .map_err(|_overflow| CodecError::InvalidDecodedSize { raw })?;
-            declared_uncompressed_bytes =
-                declared_uncompressed_bytes
-                    .checked_add(bytes)
-                    .ok_or(CodecError::ReadWorkBudgetExceeded {
-                        needed: usize::MAX,
-                        max: crate::READ_WORK_MEMORY_LIMIT,
-                    })?;
+            let bytes =
+                usize::try_from(raw).map_err(|_overflow| CodecError::InvalidDecodedSize { raw })?;
+            declared_uncompressed_bytes = declared_uncompressed_bytes.checked_add(bytes).ok_or(
+                CodecError::ReadWorkBudgetExceeded {
+                    needed: usize::MAX,
+                    max: crate::READ_WORK_MEMORY_LIMIT,
+                },
+            )?;
         }
     }
     let work = crate::compaction::read_work_memory_bound_for_contract(

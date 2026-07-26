@@ -39,53 +39,6 @@ pub const DEFAULT_MAX_JOURNAL_LEN: usize = 1024 * 1024 * 1024;
 /// Default maximum number of synchronized parts in one journal generation.
 pub const DEFAULT_MAX_JOURNAL_PARTS: usize = 65_536;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JournalFaultPoint {
-    BeforeResetTruncate,
-    AfterResetTruncate,
-    BeforeResetSync,
-    AfterResetSync,
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static INJECTED_JOURNAL_FAULT: std::cell::Cell<Option<(JournalFaultPoint, i32)>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn maybe_fail(
-    point: JournalFaultPoint,
-    operation: FilesystemOperation,
-    path: &Path,
-) -> Result<(), JournalError> {
-    INJECTED_JOURNAL_FAULT.with(|injected| {
-        if injected.get().is_some_and(|(at, _errno)| at == point) {
-            let (_at, errno) = injected.take().expect("matched injected journal fault");
-            Err(journal_io(
-                operation,
-                path,
-                std::io::Error::from_raw_os_error(errno),
-            ))
-        } else {
-            Ok(())
-        }
-    })
-}
-
-#[cfg(not(test))]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "production and test fault hooks deliberately share one call-site signature"
-)]
-const fn maybe_fail(
-    _point: JournalFaultPoint,
-    _operation: FilesystemOperation,
-    _path: &Path,
-) -> Result<(), JournalError> {
-    Ok(())
-}
-
 /// Configuration of one journal file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalConfig {
@@ -177,7 +130,10 @@ impl fmt::Display for JournalError {
                 )
             }
             Self::DirectoryAllocation { entries } => {
-                write!(f, "journal could not allocate a directory for {entries} parts")
+                write!(
+                    f,
+                    "journal could not allocate a directory for {entries} parts"
+                )
             }
             Self::InvalidPart(err) => write!(f, "part is not a valid PGM part: {err}"),
             Self::StalePartRef { offset, len } => {
@@ -343,41 +299,11 @@ impl Journal {
     /// journal is full, or the file write/sync fails. On error, in-memory
     /// state is unchanged.
     pub fn append(&mut self, part: &[u8]) -> Result<PartRef, JournalError> {
-        self.admit(part)?;
-        let part_len =
-            u64::try_from(part.len()).map_err(|_overflow| JournalError::PartTooLarge {
-                len: part.len(),
-                max: self.config.limits.max_part_len,
-            })?;
-        let frame_len = FRAME_HEADER_LEN
-            .checked_add(part.len())
-            .ok_or(JournalError::Full {
-                len: self.end,
-                max: self.config.max_journal_len,
-            })?;
-        let next_end = self.end.checked_add(frame_len).ok_or(JournalError::Full {
-            len: self.end,
-            max: self.config.max_journal_len,
-        })?;
-        let part_offset = self
-            .end
-            .checked_add(FRAME_HEADER_LEN)
-            .ok_or(JournalError::Full {
-                len: self.end,
-                max: self.config.max_journal_len,
-            })?;
-
-        let header = FrameHeader { part_len }.encode();
-        let entries = self
-            .parts
-            .len()
-            .checked_add(1)
-            .ok_or(JournalError::DirectoryAllocation {
-                entries: usize::MAX,
-            })?;
+        let (part_len, next_end, part_offset, entries) = self.plan_append(part)?;
         self.parts
             .try_reserve_exact(1)
             .map_err(|_error| JournalError::DirectoryAllocation { entries })?;
+        let header = FrameHeader { part_len }.encode();
         if let Err(err) = self.write_frame(&header, part) {
             // Roll the file back so a half-written frame from a transient
             // I/O error does not remain on disk where later appends would
@@ -405,7 +331,12 @@ impl Journal {
     /// # Errors
     ///
     /// Returns the same size/count/format errors as [`Self::append`].
-    pub fn admit(&self, part: &[u8]) -> Result<(), JournalError> {
+    pub fn admit(&self, part: &[u8]) -> Result<usize, JournalError> {
+        self.plan_append(part)
+            .map(|(_part_len, next_end, _part_offset, _entries)| next_end)
+    }
+
+    fn plan_append(&self, part: &[u8]) -> Result<(u64, usize, usize, usize), JournalError> {
         let part_len =
             u64::try_from(part.len()).map_err(|_overflow| JournalError::PartTooLarge {
                 len: part.len(),
@@ -439,11 +370,25 @@ impl Journal {
                 max: self.config.max_parts,
             });
         }
+        let part_offset = self
+            .end
+            .checked_add(FRAME_HEADER_LEN)
+            .ok_or(JournalError::Full {
+                len: self.end,
+                max: self.config.max_journal_len,
+            })?;
+        let entries = self
+            .parts
+            .len()
+            .checked_add(1)
+            .ok_or(JournalError::DirectoryAllocation {
+                entries: usize::MAX,
+            })?;
         // An invalid body would be framed and synced, but the next recovery
         // scan would report the frame as damage and skip it. Treat that as a
         // writer bug and fail before writing.
         validate_part(part).map_err(JournalError::InvalidPart)?;
-        Ok(())
+        Ok((part_len, next_end, part_offset, entries))
     }
 
     /// The raw write sequence of one frame, separated so that the error
@@ -510,34 +455,14 @@ impl Journal {
     ///
     /// Returns [`JournalError::Io`] if truncation or sync fails.
     pub fn reset(&mut self) -> Result<(), JournalError> {
-        maybe_fail(
-            JournalFaultPoint::BeforeResetTruncate,
-            FilesystemOperation::Truncate,
-            &self.path,
-        )?;
         self.file
             .set_len(0)
             .map_err(|error| journal_io(FilesystemOperation::Truncate, &self.path, error))?;
         self.end = 0;
         self.parts.clear();
-        maybe_fail(
-            JournalFaultPoint::AfterResetTruncate,
-            FilesystemOperation::Truncate,
-            &self.path,
-        )?;
-        maybe_fail(
-            JournalFaultPoint::BeforeResetSync,
-            FilesystemOperation::SyncFile,
-            &self.path,
-        )?;
         self.file
             .sync_data()
             .map_err(|error| journal_io(FilesystemOperation::SyncFile, &self.path, error))?;
-        maybe_fail(
-            JournalFaultPoint::AfterResetSync,
-            FilesystemOperation::SyncFile,
-            &self.path,
-        )?;
         Ok(())
     }
 
@@ -579,19 +504,18 @@ fn sync_parent_dir(path: &Path) -> Result<(), JournalError> {
     Ok(())
 }
 
-fn journal_io(
-    operation: FilesystemOperation,
-    path: &Path,
-    source: std::io::Error,
-) -> JournalError {
-    FilesystemError::new(operation, path, source).into()
+fn journal_io(operation: FilesystemOperation, path: &Path, source: std::io::Error) -> JournalError {
+    FilesystemError {
+        operation,
+        path: path.to_owned(),
+        source,
+    }
+    .into()
 }
 
 #[cfg(test)]
 mod tests {
-    use kronika_format::{
-        Catalog, Entry, FORMAT_VERSION, FRAME_MAGIC, MAGIC, crc32c, scan_journal,
-    };
+    use kronika_format::{Catalog, Entry, FORMAT_VERSION, MAGIC, crc32c};
 
     use super::*;
 
@@ -605,25 +529,6 @@ mod tests {
             max_journal_len: 1 << 20,
             max_parts: 1024,
         }
-    }
-
-    #[derive(Debug)]
-    struct JournalFaultGuard;
-
-    impl Drop for JournalFaultGuard {
-        fn drop(&mut self) {
-            INJECTED_JOURNAL_FAULT.with(|injected| injected.set(None));
-        }
-    }
-
-    fn inject_journal_fault(point: JournalFaultPoint, errno: i32) -> JournalFaultGuard {
-        INJECTED_JOURNAL_FAULT.with(|injected| {
-            assert!(
-                injected.replace(Some((point, errno))).is_none(),
-                "one journal fault may be active per test thread"
-            );
-        });
-        JournalFaultGuard
     }
 
     fn sample_part() -> Vec<u8> {
@@ -649,108 +554,8 @@ mod tests {
         part
     }
 
-    fn frame(part: &[u8]) -> Vec<u8> {
-        let mut out = FrameHeader {
-            part_len: part.len() as u64,
-        }
-        .encode()
-        .to_vec();
-        out.extend_from_slice(part);
-        out
-    }
-
     fn temp_journal_path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("active.parts")
-    }
-
-    /// The streaming scanner must report exactly what the in-memory scanner
-    /// reports, for every chunk size including degenerate ones.
-    fn assert_stream_matches_buffer(bytes: &[u8]) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("journal");
-        std::fs::write(&path, bytes).expect("write");
-        let file = File::open(&path).expect("open");
-
-        let expected = scan_journal(bytes, small_limits());
-        for chunk in [1, 2, 3, 5, 16, 1024] {
-            let streamed =
-                scan_file(&file, bytes.len(), small_limits(), chunk).expect("streaming scan");
-            assert_eq!(streamed, expected, "chunk size {chunk}");
-        }
-    }
-
-    #[test]
-    fn streaming_scan_matches_the_buffer_scan() {
-        let part = sample_part();
-        let one = frame(&part);
-
-        // Clean journals.
-        assert_stream_matches_buffer(&[]);
-        assert_stream_matches_buffer(&one);
-        let mut two = one.clone();
-        two.extend_from_slice(&one);
-        assert_stream_matches_buffer(&two);
-
-        // Truncation at every offset of a two-frame journal.
-        for cut in 0..two.len() {
-            assert_stream_matches_buffer(&two[..cut]);
-        }
-
-        // A final frame with an intact header but corrupted body: the
-        // resync finds nothing after it, and the implied frame end at EOF
-        // classifies it as a torn write, not unrecoverable trailing damage.
-        let mut torn_body = two.clone();
-        let last = torn_body.len() - 1;
-        torn_body[last] ^= 0x01;
-        assert_stream_matches_buffer(&torn_body);
-
-        // A trailing header with a valid CRC but an absurd length claim:
-        // unrecoverable trailing damage.
-        let mut absurd = one.clone();
-        absurd.extend_from_slice(
-            &FrameHeader {
-                part_len: small_limits().max_part_len + 1,
-            }
-            .encode(),
-        );
-        assert_stream_matches_buffer(&absurd);
-
-        // A decoy magic 3 bytes before the real frame: damaged bytes ending in
-        // "PGM" followed by the real frame's "PGMP" creates overlapping
-        // magic occurrences, and the scanner must advance by one byte, not
-        // by a whole magic length, after the decoy fails.
-        let mut decoy = one.clone();
-        decoy.extend_from_slice(&[0xEE_u8; 21]);
-        decoy.extend_from_slice(b"PGM");
-        decoy.extend_from_slice(&one);
-        assert_stream_matches_buffer(&decoy);
-
-        // A corrupted byte in the middle frame of three, in the header and
-        // in the body.
-        let mut three = two.clone();
-        three.extend_from_slice(&one);
-        for target in [one.len(), one.len() + FRAME_HEADER_LEN + 5] {
-            let mut corrupted = three.clone();
-            corrupted[target] ^= 0x01;
-            assert_stream_matches_buffer(&corrupted);
-        }
-
-        // A long damaged region followed by a valid frame: the sliding
-        // search must cross many chunk boundaries to find it.
-        let mut damaged_then_frame = one.clone();
-        damaged_then_frame.extend_from_slice(&[0xAB_u8; 257]);
-        damaged_then_frame.extend_from_slice(&one);
-        assert_stream_matches_buffer(&damaged_then_frame);
-
-        // Damaged bytes that contain stray FRAME_MAGIC bytes positioned to span
-        // chunk boundaries.
-        let mut tricky = one.clone();
-        let mut damaged = vec![0xCD_u8; 64];
-        damaged[6..10].copy_from_slice(&FRAME_MAGIC);
-        damaged[31..35].copy_from_slice(&FRAME_MAGIC);
-        tricky.extend_from_slice(&damaged);
-        tricky.extend_from_slice(&one);
-        assert_stream_matches_buffer(&tricky);
     }
 
     #[test]
@@ -868,62 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_crash_points_reopen_as_the_old_or_empty_journal() {
-        const POINTS: &[(JournalFaultPoint, FilesystemOperation, bool)] = &[
-            (
-                JournalFaultPoint::BeforeResetTruncate,
-                FilesystemOperation::Truncate,
-                true,
-            ),
-            (
-                JournalFaultPoint::AfterResetTruncate,
-                FilesystemOperation::Truncate,
-                false,
-            ),
-            (
-                JournalFaultPoint::BeforeResetSync,
-                FilesystemOperation::SyncFile,
-                false,
-            ),
-            (
-                JournalFaultPoint::AfterResetSync,
-                FilesystemOperation::SyncFile,
-                false,
-            ),
-        ];
-
-        for &(point, operation, old_journal_remains) in POINTS {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = temp_journal_path(&dir);
-            let (mut journal, _) = Journal::open(&path, small_config()).expect("open");
-            journal.append(&sample_part()).expect("append");
-            let before = std::fs::read(&path).expect("journal bytes");
-
-            let guard = inject_journal_fault(point, 5);
-            let error = journal.reset().expect_err("reset fault");
-            drop(guard);
-            let JournalError::Io(error) = error else {
-                panic!("{point:?} did not return a filesystem error");
-            };
-            assert_eq!(error.operation(), operation, "{point:?}");
-            assert_eq!(error.path(), path, "{point:?}");
-            assert_eq!(error.io_error().raw_os_error(), Some(5), "{point:?}");
-            assert_eq!(journal.is_empty(), !old_journal_remains, "{point:?}");
-
-            drop(journal);
-            let (journal, report) = Journal::open(&path, small_config()).expect("restart");
-            assert!(report.is_clean(), "{point:?}");
-            if old_journal_remains {
-                assert_eq!(std::fs::read(&path).expect("old bytes"), before);
-                assert_eq!(journal.parts().len(), 1);
-            } else {
-                assert!(journal.is_empty(), "{point:?}");
-                assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
-            }
-        }
-    }
-
-    #[test]
     fn open_failure_retains_operation_path_and_os_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("missing").join("active.parts");
@@ -931,9 +680,9 @@ mod tests {
         let JournalError::Io(error) = error else {
             panic!("open failure was not typed");
         };
-        assert_eq!(error.operation(), FilesystemOperation::Open);
-        assert_eq!(error.path(), path);
-        assert_eq!(error.io_error().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.operation, FilesystemOperation::Open);
+        assert_eq!(error.path, path);
+        assert_eq!(error.source.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

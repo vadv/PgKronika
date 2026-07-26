@@ -190,7 +190,7 @@ Product-owned reason всегда имеет одну форму:
 
 - Контракт `/v1` меняется in place до первого релиза. Promise совместимости с
   текущим checkout отсутствует.
-- Нет migration сохранённых данных: PGM codecs и raw values не меняются.
+- Сохранённые PGM не затрагиваются: codecs и raw values не меняются.
 - Все in-repo clients, snapshots и docs изменяются атомарно.
 - Rollback — только возврат git/deploy artifact; старый wire format не
   включается feature flag.

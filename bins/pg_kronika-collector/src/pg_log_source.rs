@@ -4,6 +4,7 @@ use crate::logging::{
     LogLevel, duration_ms, field, log_collection_finish, log_collection_start, log_count_degraded,
     log_event,
 };
+use crate::scheduler::DueSet;
 use crate::segments::{SegmentState, append_window_and_maybe_seal, encode_window};
 use crate::source_contracts::activity_dict_limits;
 use anyhow::{Context, Result};
@@ -28,8 +29,8 @@ pub(crate) async fn run_log_only_cycle(
     log_collector: &mut LogCollector,
     journal: &mut Journal,
     config: &Config,
+    due: &DueSet,
     segment: &mut SegmentState,
-    seal_after_collection: bool,
 ) -> Result<Vec<(PathBuf, &'static str)>> {
     let ts = system_ts_us();
     let mut collection = collect_log_batch(log_collector, None, ts).await;
@@ -47,15 +48,8 @@ pub(crate) async fn run_log_only_cycle(
         return Ok(Vec::new());
     }
     let flushed = encode_window(buffers, &interner, config)?;
-    let sealed = append_window_and_maybe_seal(
-        journal,
-        config,
-        segment,
-        ts,
-        seal_after_collection,
-        &flushed,
-    )
-    .context("append the log-only collection window")?;
+    let sealed = append_window_and_maybe_seal(journal, config, segment, ts, due.forced(), &flushed)
+        .context("append the log-only collection window")?;
     commit_log_collection(log_collector, Some(&collection));
     Ok(sealed)
 }

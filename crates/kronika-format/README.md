@@ -44,7 +44,7 @@ There are no separate files for string values. While a segment is open,
 dictionary bodies live in the PGM parts inside `active.parts`. On completion,
 the writer copies those bodies unchanged into the finished `.pgm`.
 
-The format crate owns the `PGM1` and `PGMP` byte layouts, the end catalog,
+The format crate owns the PGM and `PGMP` byte layouts, the end catalog,
 CRC32C checksums, `StrId`, and the bounded dictionary model. It deliberately
 does not own:
 
@@ -69,7 +69,7 @@ The collector keeps appending windows until a size, age, forced-rotation, or
 journal-cap condition closes the segment. Sealing then:
 
 1. validates the catalogs of the recorded parts;
-2. writes one leading `PGM1`;
+2. writes one leading PGM magic marker;
 3. copies every section body in journal and catalog order;
 4. rewrites their absolute offsets into one end catalog;
 5. synchronizes a sibling temporary file and publishes it without overwriting
@@ -85,7 +85,7 @@ framing and builds one catalog around the original bodies.
 The format description uses four different levels:
 
 - a **collection window** is one non-empty collector cycle;
-- a **PGM part** is a self-contained record of one window, with its own `PGM1`,
+- a **PGM part** is a self-contained record of one window, with its own PGM magic,
   bodies, catalog, and tail index;
 - a **section** is one catalog entry: `type_id`, offset, length, row count, and
   CRC32C;
@@ -99,7 +99,7 @@ active.parts
 |
 +-- PGMP frame #1
 |   `-- PGM part for window #1
-|       |-- "PGM1"
+|       |-- PGM magic
 |       |-- data section bodies
 |       |-- dict.strings / dict.blobs bodies
 |       |-- part catalog
@@ -107,7 +107,7 @@ active.parts
 |
 `-- PGMP frame #2
     `-- PGM part for window #2
-        |-- "PGM1"
+        |-- PGM magic
         |-- data section bodies
         |-- dict.strings / dict.blobs bodies
         |-- part catalog
@@ -124,7 +124,7 @@ Completing the segment removes the individual part framing:
 ```text
 active.parts                         <first_timestamp>.pgm
 
-PGMP [part for window #1]             "PGM1"
+PGMP [part for window #1]             PGM magic
 PGMP [part for window #2] -- seal() -> bodies from window #1, including its dictionaries
 ...                                  bodies from window #2, including its dictionaries
                                      ...
@@ -136,7 +136,7 @@ The finished PGM has no explicit window-boundary markers. A body's originating
 window is not recorded; it can only be inferred from order and contents. The
 catalog describes sections, not window numbers.
 
-## Sealed PGM v1 layout
+## Sealed PGM layout
 
 All integers are little-endian. In canonical output from the current writer,
 fields are packed without alignment padding. For `N` catalog entries and `B`
@@ -144,7 +144,7 @@ total bytes in all section bodies:
 
 ```text
 offset  size          contents
-0       4             "PGM1"
+0       4             PGM magic
 4       B             section body 0, section body 1, ... in catalog order
 4+B     32*N          catalog entries
 ...     40            catalog metadata
@@ -203,7 +203,7 @@ string reference.
 | Offset | Field | Type | Meaning |
 | ---: | --- | --- | --- |
 | 0 | `catalog_len` | `u32` | Entries plus the 40-byte metadata block; excludes the tail itself. |
-| 4 | `magic` | 4 bytes | `"PGM1"`. |
+| 4 | `magic` | 4 bytes | Opaque PGM marker. |
 
 A reader therefore starts at the end, not at the first section:
 
@@ -224,7 +224,7 @@ dictionary body for large values. Let their sizes be `S`, `T`, and `L`, with
 offset
 
 0       +----------------------------------------------------------+
-        | "PGM1"                                                   | 4 bytes
+        | PGM magic                                                | 4 bytes
 4       +----------------------------------------------------------+
         | body #0: pg_stat_activity, type_id=1_001_003             | S bytes
         | Parquet: ts | pid | datname=H | query=Q | ...            |
@@ -241,7 +241,7 @@ offset
 100+B   +----------------------------------------------------------+
         | catalog metadata                                         | 40 bytes
 140+B   +----------------------------------------------------------+
-        | catalog_len=136 | "PGM1"                                 | 8 bytes
+        | catalog_len=136 | PGM magic                              | 8 bytes
 148+B   +----------------------------------------------------------+
 ```
 
@@ -259,7 +259,7 @@ in the PGM.
 
 The repository also contains a byte-exact
 [`minimal.pgm`](tests/fixtures/minimal.pgm) fixture. It is 88 bytes:
-`PGM1`, one four-byte body `01 02 03 04`, one catalog entry, metadata, and the
+PGM magic, one four-byte body `01 02 03 04`, one catalog entry, metadata, and the
 tail. [`tests/fixture.rs`](tests/fixture.rs) records every offset and verifies
 that the encoder reproduces the fixture byte for byte.
 
@@ -313,7 +313,7 @@ bodies are omitted:
 ```text
 $KRONIKA_OUT_DIR/<first_timestamp>.pgm  (one file)
 
-[ "PGM1" ]
+[ PGM magic ]
 [ pg_stat_activity Parquet body, type_id=1_001_003
   after decoding:
   pid | datname
@@ -441,7 +441,7 @@ a 16-byte header followed by one complete PGM part:
 ```
 
 The header checksum covers its first 12 bytes. The PGM part has its own
-`PGM1`, bodies, catalog, and tail, so a frame can be validated before it is
+PGM magic, bodies, catalog, and tail, so a frame can be validated before it is
 accepted.
 
 For a clean journal with `P` frames, `N` total section entries, and `B` total
@@ -531,7 +531,7 @@ active.parts
 
 after completing the segment (`seal`):
 
-"PGM1"
+PGM magic
 |-- activity body #1
 |-- dict.strings body #1: H -> b"postgres"
 |-- activity body #2
@@ -567,7 +567,7 @@ allowed in the finished PGM. This behavior is not part of the current `seal`.
 | Approach | Source of the saving | Constraint |
 | --- | --- | --- |
 | Replace the current seal internals in place | Bodies with the same `type_id` merge and dictionary records deduplicate across windows. | Requires decode and re-encode, collision checks, canonical sorting, early seal before a limit, and a complete write/read verification cycle. |
-| One interner for the open segment | A repeated value is not emitted into the next window's dictionary. | Current PGM parts are self-contained. If a later window refers to an earlier dictionary, isolated frame reads and crash recovery need a new contract. |
+| One interner for the open segment | A repeated value is not emitted into the next window's dictionary. | Current PGM parts are self-contained. Referring to an earlier window's dictionary would break isolated frame reads and crash recovery. |
 | Higher Parquet Zstd level | Pages inside one body may become smaller. | Costs more CPU and still cannot use repetition across bodies. Level 3 is currently fixed in code. |
 | Outer compression for the whole PGM | One stream can see repeated dictionaries, footers, and similar windows. | Direct body access by `offset` is lost; this would replace PGM access semantics and is outside this research. |
 
@@ -590,11 +590,9 @@ p95/worst of 549,761 bytes. A separate 62.52-second tail reduced 6.016x and is
 not part of that distribution. The full-segment sample contains only three
 files; it does not support an hourly retention projection.
 
-The recommendation replaces the existing PGM internals in place while keeping
-the PGM name and `N.pgm` path. A future implementation has one writer, one
-reader, and one current contract. It has no legacy reader, migration, fallback,
-feature flag, or offline rewrite. Production behavior is unchanged by this
-research documentation.
+The compact contract keeps the PGM name and `N.pgm` path. The implementation
+has one writer, one reader, and one physical contract. This research section
+does not itself change production behavior.
 
 ## Parameters that affect file size
 
@@ -627,7 +625,7 @@ encryption.
 bounds, and section checksums for complete parts. Higher layers add policy:
 the current sealed reader accepts container version 1 and caps catalog,
 section, row, and row-group sizes. An incompatible section schema receives a
-new `type_id`; changing the PGM framing requires a new container version.
+new `type_id`; changing the PGM framing is outside this contract.
 
 Sources of truth:
 

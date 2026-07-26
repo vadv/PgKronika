@@ -70,15 +70,6 @@ pub enum StoreError {
     TooSmall,
     /// The first four bytes are not the PGM magic.
     BadMagic,
-    /// The file uses the rejected pre-compaction PGM identity.
-    ///
-    /// This is distinct from ordinary corruption so a store cannot silently
-    /// start as empty while incompatible source bytes remain in its owned
-    /// directory.
-    ObsoleteFormat {
-        /// Rejected leading magic found in the file.
-        actual: [u8; 4],
-    },
     /// The catalog declares a format version this build does not support.
     UnsupportedFormat {
         /// The `format_version` found in the catalog.
@@ -103,11 +94,7 @@ impl std::fmt::Display for StoreError {
                 )
             }
             Self::TooSmall => write!(f, "source is too small for a PGM segment"),
-            Self::BadMagic => write!(f, "source does not start with PGMC magic"),
-            Self::ObsoleteFormat { actual } => write!(
-                f,
-                "source starts with rejected pre-compaction magic {actual:02x?}; preserve it and migrate the store out of band"
-            ),
+            Self::BadMagic => write!(f, "source does not start with PGM magic"),
             Self::UnsupportedFormat { version } => {
                 write!(f, "unsupported format version {version}")
             }
@@ -126,7 +113,6 @@ impl std::error::Error for StoreError {
             Self::ActivePartTooLarge { .. }
             | Self::TooSmall
             | Self::BadMagic
-            | Self::ObsoleteFormat { .. }
             | Self::UnsupportedFormat { .. }
             | Self::BadCatalogLen
             | Self::OutOfBounds => None,

@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Filesystem operation that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +36,7 @@ pub enum FilesystemOperation {
 
 impl fmt::Display for FilesystemOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let operation = match self {
+        f.write_str(match self {
             Self::Open => "open",
             Self::CreateNew => "create-new",
             Self::Metadata => "metadata",
@@ -49,49 +49,19 @@ impl fmt::Display for FilesystemOperation {
             Self::SyncDirectory => "sync-directory",
             Self::PublishNoReplace => "publish-no-replace",
             Self::Remove => "remove",
-        };
-        f.write_str(operation)
+        })
     }
 }
 
-/// One filesystem failure with its operation, safe path, and original error.
+/// One filesystem failure with its operation, path, and original error.
 #[derive(Debug)]
 pub struct FilesystemError {
-    operation: FilesystemOperation,
-    path: PathBuf,
-    source: io::Error,
-}
-
-impl FilesystemError {
-    pub(crate) fn new(
-        operation: FilesystemOperation,
-        path: impl Into<PathBuf>,
-        source: io::Error,
-    ) -> Self {
-        Self {
-            operation,
-            path: path.into(),
-            source,
-        }
-    }
-
-    /// Return the failed operation.
-    #[must_use]
-    pub const fn operation(&self) -> FilesystemOperation {
-        self.operation
-    }
-
-    /// Return the path supplied to the failed operation.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Return the original operating-system error.
-    #[must_use]
-    pub const fn io_error(&self) -> &io::Error {
-        &self.source
-    }
+    /// Failed operation.
+    pub operation: FilesystemOperation,
+    /// Path supplied to the operation.
+    pub path: PathBuf,
+    /// Original operating-system error.
+    pub source: io::Error,
 }
 
 impl fmt::Display for FilesystemError {

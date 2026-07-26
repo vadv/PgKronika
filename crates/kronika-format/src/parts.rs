@@ -183,7 +183,7 @@ impl fmt::Display for PartError {
                 write!(f, "part body of {actual} bytes is too short for a PGM part")
             }
             Self::BadMagic { actual } => {
-                write!(f, "part magic is {actual:02x?}, expected \"PGMC\"")
+                write!(f, "part magic is {actual:02x?}, expected the PGM magic")
             }
             Self::Tail(err) => write!(f, "part tail index: {err}"),
             Self::BadCatalogLen { catalog_len } => {
@@ -567,49 +567,8 @@ impl ScanReport {
 /// Scan an in-memory journal buffer.
 #[must_use]
 pub fn scan_journal(bytes: &[u8], limits: JournalLimits) -> ScanReport {
-    let mut report = ScanReport::default();
-    let mut pos = 0_usize;
-
-    while pos < bytes.len() {
-        match frame_at(bytes, pos, limits) {
-            FrameCheck::Valid { body_len } => {
-                report.parts.push(PartRef {
-                    offset: pos + FRAME_HEADER_LEN,
-                    len: body_len,
-                });
-                pos += FRAME_HEADER_LEN + body_len;
-                report.valid_len = pos;
-            }
-            FrameCheck::Torn => {
-                report.damages.push(DamageRegion {
-                    from: pos,
-                    kind: DamageKind::TornTail,
-                });
-                return report;
-            }
-            FrameCheck::Damaged { implied_end } => {
-                if let Some(next) = resync(bytes, pos, implied_end, limits) {
-                    report.damages.push(DamageRegion {
-                        from: pos,
-                        kind: DamageKind::Middle { resumed_at: next },
-                    });
-                    pos = next;
-                    continue;
-                }
-                // A complete-looking final frame with a sane header is treated
-                // like an interrupted write; otherwise keep the damaged tail.
-                let kind = if implied_end == Some(bytes.len()) {
-                    DamageKind::TornTail
-                } else {
-                    DamageKind::QuarantinedTail
-                };
-                report.damages.push(DamageRegion { from: pos, kind });
-                return report;
-            }
-        }
-    }
-
-    report
+    scan_journal_streaming(&bytes, limits, DEFAULT_RESYNC_CHUNK)
+        .unwrap_or_else(|error| unreachable!("slice reads cannot fail: {error}"))
 }
 
 /// Scan a journal source frame by frame, keeping peak memory to one part body.
@@ -824,77 +783,6 @@ fn streaming_resync<R: ReadAt>(
         base += chunk_len;
     }
     Ok(None)
-}
-
-/// Outcome of checking one frame position.
-enum FrameCheck {
-    /// A valid frame with a validated part of this length.
-    Valid { body_len: usize },
-    /// The frame is cut off by the end of the buffer: header and length
-    /// are plausible (or the header itself is incomplete), nothing
-    /// follows. This is an incomplete write, not media damage.
-    Torn,
-    /// Damaged frame. `implied_end` is set only if the header gave a sane end.
-    Damaged { implied_end: Option<usize> },
-}
-
-fn frame_at(bytes: &[u8], pos: usize, limits: JournalLimits) -> FrameCheck {
-    let rem = bytes.len() - pos;
-    if rem < FRAME_HEADER_LEN {
-        return FrameCheck::Torn;
-    }
-    let mut header_bytes = [0_u8; FRAME_HEADER_LEN];
-    header_bytes.copy_from_slice(&bytes[pos..pos + FRAME_HEADER_LEN]);
-    let Ok(header) = FrameHeader::decode(header_bytes) else {
-        return FrameCheck::Damaged { implied_end: None };
-    };
-    if header.part_len > limits.max_part_len {
-        return FrameCheck::Damaged { implied_end: None };
-    }
-    let Ok(body_len) = usize::try_from(header.part_len) else {
-        return FrameCheck::Damaged { implied_end: None };
-    };
-    if rem - FRAME_HEADER_LEN < body_len {
-        // The header CRC is valid and the length is sane, but the body
-        // extends past the end: the write was cut mid-frame.
-        return FrameCheck::Torn;
-    }
-    let body = &bytes[pos + FRAME_HEADER_LEN..pos + FRAME_HEADER_LEN + body_len];
-    if validate_part(body).is_err() {
-        return FrameCheck::Damaged {
-            implied_end: Some(pos + FRAME_HEADER_LEN + body_len),
-        };
-    }
-    FrameCheck::Valid { body_len }
-}
-
-/// Find the next valid frame after damage.
-fn resync(
-    bytes: &[u8],
-    damaged_at: usize,
-    implied_end: Option<usize>,
-    limits: JournalLimits,
-) -> Option<usize> {
-    if let Some(boundary) = implied_end
-        && boundary < bytes.len()
-        && matches!(frame_at(bytes, boundary, limits), FrameCheck::Valid { .. })
-    {
-        return Some(boundary);
-    }
-    let mut cand = damaged_at + 1;
-    while cand + FRAME_HEADER_LEN <= bytes.len() {
-        match find_magic(&bytes[cand..]) {
-            Some(found) => {
-                let at = cand + found;
-                if let FrameCheck::Valid { .. } = frame_at(bytes, at, limits) {
-                    return Some(at);
-                }
-                cand = at + 1;
-            }
-            None => return None,
-        }
-    }
-    None
 }
 
 /// Position of the first `FRAME_MAGIC` occurrence in `haystack`.

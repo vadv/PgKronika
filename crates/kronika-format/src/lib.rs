@@ -52,14 +52,9 @@ pub use str_id::StrId;
 
 /// Segment magic bytes.
 ///
-/// A current PGM file starts with `PGMC`, and the tail index also ends with
-/// `PGMC`.
+/// Opaque internal marker at the start and tail of every PGM.
 /// Readers use the second copy when opening a segment from the end.
-///
-/// The unreleased pre-compaction encoding used different magic. Rejecting it
-/// here gives every runtime path one clean contract instead of a legacy
-/// decoder.
-pub const MAGIC: [u8; 4] = *b"PGMC";
+pub const MAGIC: [u8; 4] = *b"PGM1";
 
 /// Version of the container layout.
 ///

@@ -336,7 +336,7 @@ impl<R: kronika_format::ReadAt> PgmUnit<R> {
                         slot.insert(value);
                     }
                     MapEntry::Occupied(_slot) => {
-                        return Err(ReadError::DictionaryConflict { str_id });
+                        return Err(ReadError::Codec(CodecError::SchemaMismatch));
                     }
                 }
             }
@@ -433,18 +433,16 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
                 .iter()
                 .any(|contract| contract.type_id.get() == entry.type_id);
         if !known {
-            return Err(ReadError::UnknownType {
+            return Err(ReadError::Codec(CodecError::UnknownType {
                 type_id: entry.type_id,
-            });
+            }));
         }
         if entry.flags != 0
             || entry.type_id == 0
             || entry.type_id <= previous_type
             || entry.offset != expected_offset
         {
-            return Err(ReadError::NonCanonicalCatalog {
-                type_id: entry.type_id,
-            });
+            return Err(ReadError::Codec(CodecError::SchemaMismatch));
         }
         if entry.len > MAX_SECTION_BYTES as u64 {
             return Err(ReadError::SectionTooLarge { len: entry.len });
@@ -469,7 +467,7 @@ fn read_catalog_bytes<R: kronika_format::ReadAt>(
         previous_type = entry.type_id;
     }
     if expected_offset != catalog_at {
-        return Err(ReadError::NonCanonicalCatalog { type_id: 0 });
+        return Err(ReadError::Codec(CodecError::SchemaMismatch));
     }
     Ok(OpenedCatalog {
         catalog,
@@ -598,24 +596,6 @@ mod tests {
     }
 
     #[test]
-    fn obsolete_leading_and_tail_magic_fail_without_a_legacy_path() {
-        let mut leading = a_part();
-        leading[..4].copy_from_slice(b"PGM1");
-        assert!(matches!(
-            PgmUnit::open(leading.as_slice()),
-            Err(ReadError::BadMagic { actual }) if actual == *b"PGM1"
-        ));
-
-        let mut tail = a_part();
-        let end = tail.len();
-        tail[end - 4..].copy_from_slice(b"PGM1");
-        assert!(matches!(
-            PgmUnit::open(tail.as_slice()),
-            Err(ReadError::Tail(_))
-        ));
-    }
-
-    #[test]
     fn duplicate_unknown_and_unpacked_catalogs_fail_at_open() {
         let body = BgwriterCheckpointer::encode(&[BgwriterCheckpointer {
             ts: kronika_registry::Ts(1),
@@ -676,9 +656,7 @@ mod tests {
         );
         assert!(matches!(
             PgmUnit::open(duplicate.as_slice()),
-            Err(ReadError::NonCanonicalCatalog {
-                type_id: 1_006_001
-            })
+            Err(ReadError::Codec(CodecError::SchemaMismatch))
         ));
 
         let unknown = container(
@@ -690,7 +668,9 @@ mod tests {
         );
         assert!(matches!(
             PgmUnit::open(unknown.as_slice()),
-            Err(ReadError::UnknownType { type_id: 9_999_999 })
+            Err(ReadError::Codec(CodecError::UnknownType {
+                type_id: 9_999_999
+            }))
         ));
 
         let unpacked = container(
@@ -702,9 +682,7 @@ mod tests {
         );
         assert!(matches!(
             PgmUnit::open(unpacked.as_slice()),
-            Err(ReadError::NonCanonicalCatalog {
-                type_id: 1_006_001
-            })
+            Err(ReadError::Codec(CodecError::SchemaMismatch))
         ));
     }
 }

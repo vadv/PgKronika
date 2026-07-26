@@ -68,19 +68,6 @@ fn lifecycle_part(source_id: u64) -> Vec<u8> {
 }
 
 #[test]
-fn snapshot_rejects_obsolete_sealed_store_without_treating_it_as_empty() {
-    let source = tempfile::tempdir().expect("source directory");
-    let path = source.path().join("1500.pgm");
-    let bytes = b"PGM1 retained pre-compaction source";
-    fs::write(&path, bytes).expect("write obsolete source");
-
-    let error = LocalDirSnapshot::open(source.path()).expect_err("obsolete store must fail");
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert!(error.to_string().contains("pre-compaction"));
-    assert_eq!(fs::read(path).expect("source retained"), bytes);
-}
-
-#[test]
 fn sealed_snapshot_cache_hit_after_reopen_reads_no_pgm_bodies() {
     let source = tempfile::tempdir().expect("source directory");
     fs::write(source.path().join("1500.pgm"), lifecycle_part(7)).expect("write segment");

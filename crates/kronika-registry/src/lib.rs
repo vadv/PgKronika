@@ -56,7 +56,7 @@ pub use codec::{
 pub use compaction::{
     COMPACTION_MEMORY_LIMIT, COMPACTION_PAGE_BYTES, COMPACTION_ZSTD_LEVEL, CompactSectionBound,
     READ_WORK_MEMORY_LIMIT, canonicalize_batches, compact_section_bound, compaction_memory_bound,
-    encode_compact_batch, encode_compact_ordered_batch, read_work_memory_bound,
+    encode_compact_batch, encode_compact_ordered_batch, read_work_memory, read_work_memory_bound,
 };
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{
@@ -97,6 +97,37 @@ pub use arrow_array::types::{
 pub const DICT_STRINGS_TYPE_ID: u32 = 3_001_001;
 /// `type_id` of a `dict.blobs` section. See [`DICT_STRINGS_TYPE_ID`].
 pub const DICT_BLOBS_TYPE_ID: u32 = 3_002_001;
+
+/// Whether an Arrow schema is the exact schema of one dictionary section.
+#[must_use]
+pub fn dictionary_schema_matches(schema: &arrow_schema::Schema, type_id: u32) -> bool {
+    use arrow_schema::DataType;
+
+    let fields = schema.fields();
+    let is = |index: usize, name: &str, data_type: &DataType, nullable: bool| {
+        fields.get(index).is_some_and(|field| {
+            field.name() == name
+                && field.data_type() == data_type
+                && field.is_nullable() == nullable
+        })
+    };
+    match type_id {
+        DICT_STRINGS_TYPE_ID => {
+            fields.len() == 2
+                && is(0, "str_id", &DataType::UInt64, false)
+                && is(1, "bytes", &DataType::Binary, false)
+        }
+        DICT_BLOBS_TYPE_ID => {
+            fields.len() == 5
+                && is(0, "str_id", &DataType::UInt64, false)
+                && is(1, "stored_bytes", &DataType::Binary, false)
+                && is(2, "full_len", &DataType::UInt64, false)
+                && is(3, "truncated", &DataType::Boolean, false)
+                && is(4, "full_sha256", &DataType::FixedSizeBinary(32), true)
+        }
+        _ => false,
+    }
+}
 
 /// Return the registry section name for a raw `type_id`.
 #[must_use]

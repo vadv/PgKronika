@@ -5,18 +5,10 @@ use crate::logging::{
 use anyhow::{Context, Result};
 use kronika_writer::{
     FlushedPart, Interner, Journal, JournalConfig, JournalError, SealAdmission, SealError,
-    SealOptions, SectionBuffers, dict, seal_with_options,
+    SectionBuffers, dict, seal_with_limits,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-/// Fail before opening or mutating `active.parts` when the owned directory
-/// still contains a rejected pre-compaction sealed segment.
-pub(crate) fn verify_output_contract(out_dir: &Path) -> Result<()> {
-    kronika_store::LocalDir::open(out_dir)
-        .context("verify the output directory uses the current PGM contract")?;
-    Ok(())
-}
 
 /// The open (not yet sealed) segment: its file name comes from the first
 /// window's timestamp, its age from the moment that window was appended.
@@ -107,15 +99,8 @@ pub(crate) fn seal_open_segment(
     let journal_bytes = journal.bytes();
     let journal_parts = journal.parts().len();
     let started = Instant::now();
-    let summary = seal_with_options(
-        journal,
-        &dest,
-        SealOptions {
-            limits: config.seal_limits,
-            cancelled: None,
-        },
-    )
-    .context("seal the segment")?;
+    let summary =
+        seal_with_limits(journal, &dest, config.seal_limits).context("seal the segment")?;
     log_event(
         LogLevel::Info,
         "segment_seal_finish",
@@ -225,15 +210,8 @@ fn seal_recovered_journal(
     let journal_bytes = journal.bytes();
     let journal_parts = journal.parts().len();
     let started = Instant::now();
-    let summary = seal_with_options(
-        journal,
-        &dest,
-        SealOptions {
-            limits: seal_limits,
-            cancelled: None,
-        },
-    )
-    .context("seal the recovered segment")?;
+    let summary =
+        seal_with_limits(journal, &dest, seal_limits).context("seal the recovered segment")?;
     log_event(
         LogLevel::Info,
         "segment_seal_finish",
@@ -261,12 +239,16 @@ fn seal_recovered_journal(
     Ok(Some(dest))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ordered state transition admits, seals when needed, appends, and publishes paths"
+)]
 pub(crate) fn append_window_and_maybe_seal(
     journal: &mut Journal,
     config: &Config,
     segment: &mut SegmentState,
     ts: i64,
-    seal_after_collection: bool,
+    forced: bool,
     flushed: &FlushedPart,
 ) -> Result<Vec<(PathBuf, &'static str)>> {
     let mut sealed = Vec::new();
@@ -286,24 +268,15 @@ pub(crate) fn append_window_and_maybe_seal(
         Err(error) => return Err(anyhow::Error::new(error).context("admit collection window")),
     };
 
-    let projected = projected_journal_bytes(journal, flushed)?;
-    if segment.first_ts.is_some()
-        && config.segment_max_bytes > 0
-        && projected > config.segment_max_bytes
-    {
-        sealed.push((seal_open_segment(journal, config, segment, "size")?, "size"));
-        next_admission = segment
-            .admission
-            .with_part(&flushed.body, config.seal_limits)
-            .context("admit collection window after size seal")?;
-    }
-
-    if let Err(error) = journal.admit(&flushed.body) {
-        let boundary = matches!(
-            error,
-            JournalError::Full { .. } | JournalError::TooManyParts { .. }
-        );
-        if boundary && segment.first_ts.is_some() {
+    let projected = match journal.admit(&flushed.body) {
+        Ok(end) => end,
+        Err(error)
+            if segment.first_ts.is_some()
+                && matches!(
+                    error,
+                    JournalError::Full { .. } | JournalError::TooManyParts { .. }
+                ) =>
+        {
             let reason = match error {
                 JournalError::Full { .. } => "journal-full",
                 JournalError::TooManyParts { .. } => "journal-parts",
@@ -326,10 +299,25 @@ pub(crate) fn append_window_and_maybe_seal(
                 .context("admit collection window after journal seal")?;
             journal
                 .admit(&flushed.body)
-                .context("one collection window exceeds the journal hard limits")?;
-        } else {
+                .context("one collection window exceeds the journal hard limits")?
+        }
+        Err(error) => {
             return Err(anyhow::Error::new(error).context("admit the part to the journal"));
         }
+    };
+    if segment.first_ts.is_some()
+        && config.segment_max_bytes > 0
+        && u64::try_from(projected).context("projected journal bytes exceed u64")?
+            > config.segment_max_bytes
+    {
+        sealed.push((seal_open_segment(journal, config, segment, "size")?, "size"));
+        next_admission = segment
+            .admission
+            .with_part(&flushed.body, config.seal_limits)
+            .context("admit collection window after size seal")?;
+        journal
+            .admit(&flushed.body)
+            .context("one collection window exceeds the journal hard limits")?;
     }
 
     let append_started = Instant::now();
@@ -364,7 +352,7 @@ pub(crate) fn append_window_and_maybe_seal(
     segment.on_window_appended(ts, now, next_admission);
     let age = Duration::from_secs(config.segment_max_age_secs);
     if let Some(reason) = seal_reason(
-        seal_after_collection,
+        forced,
         journal.bytes(),
         config.segment_max_bytes,
         segment.age_expired(now, age),
@@ -372,17 +360,6 @@ pub(crate) fn append_window_and_maybe_seal(
         sealed.push((seal_open_segment(journal, config, segment, reason)?, reason));
     }
     Ok(sealed)
-}
-
-fn projected_journal_bytes(journal: &Journal, flushed: &FlushedPart) -> Result<u64> {
-    let current = u64::try_from(journal.bytes()).context("journal bytes exceed u64")?;
-    let frame = u64::try_from(kronika_format::FRAME_HEADER_LEN)
-        .context("frame header length exceeds u64")?
-        .checked_add(u64::try_from(flushed.body.len()).context("collection part bytes exceed u64")?)
-        .context("collection frame length overflows u64")?;
-    current
-        .checked_add(frame)
-        .context("projected journal length overflows u64")
 }
 
 const fn admission_reason(error: &SealError) -> &'static str {
@@ -396,6 +373,10 @@ const fn admission_reason(error: &SealError) -> &'static str {
             ..
         } => "section-limit",
         SealError::Resource {
+            resource: kronika_writer::SealResource::DictionaryEntries,
+            ..
+        } => "dictionary-limit",
+        SealError::Resource {
             resource: kronika_writer::SealResource::ColumnPage,
             ..
         } => "page-limit",
@@ -408,9 +389,6 @@ const fn admission_reason(error: &SealError) -> &'static str {
             ..
         } => "reader-memory-limit",
         SealError::Codec(kronika_registry::CodecError::TooManyRows { .. }) => "row-limit",
-        SealError::Dictionary(kronika_writer::DictionaryError::TooManyEntries { .. }) => {
-            "dictionary-limit"
-        }
         _ => "admission-limit",
     }
 }

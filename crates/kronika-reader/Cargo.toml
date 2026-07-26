@@ -19,13 +19,13 @@ kronika-registry = { path = "../kronika-registry" }
 kronika-analytics = { path = "../kronika-analytics" }
 kronika-store = { path = "../kronika-store" }
 arrow-array = "55"
-arrow-schema = "55"
 parquet = { version = "55", default-features = false, features = ["arrow", "zstd"] }
 sha2 = "0.10"
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 kronika-writer = { path = "../kronika-writer" }
+arrow-schema = "55"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"

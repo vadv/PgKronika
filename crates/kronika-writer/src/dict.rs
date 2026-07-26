@@ -2,7 +2,7 @@
 //!
 //! Encode `dict.strings` and `dict.blobs` section bodies.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, RecordBatch, UInt64Array,
@@ -10,23 +10,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{EntrySnapshot, Placement, SegmentDicts};
 use kronika_registry::{
-    CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
+    CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_SECTION_ROWS,
+    encode_compact_ordered_batch,
 };
-use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_writer::ArrowWriterOptions;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
-
-/// Parquet writer properties shared by dictionary sections.
-static DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
-    WriterProperties::builder()
-        .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
-        ))
-        .set_max_row_group_size(MAX_SECTION_ROWS)
-        .set_created_by(String::new())
-        .build()
-});
 
 /// One encoded dictionary section: its type id, row count, and Parquet body.
 #[derive(Debug, Clone)]
@@ -45,9 +31,19 @@ pub struct DictSection {
 ///
 /// Returns [`CodecError`] when row caps or Parquet encoding fail.
 pub fn encode(window: &SegmentDicts) -> Result<Vec<DictSection>, CodecError> {
+    encode_entries(window.entries())
+}
+
+#[allow(
+    single_use_lifetimes,
+    reason = "impl Trait cannot elide this item lifetime"
+)]
+pub(crate) fn encode_entries<'a>(
+    entries: impl IntoIterator<Item = EntrySnapshot<'a>>,
+) -> Result<Vec<DictSection>, CodecError> {
     let mut strings: Vec<EntrySnapshot<'_>> = Vec::new();
     let mut blobs: Vec<EntrySnapshot<'_>> = Vec::new();
-    for entry in window.entries() {
+    for entry in entries {
         match entry.placement {
             Placement::Strings => strings.push(entry),
             Placement::Blobs => blobs.push(entry),
@@ -131,20 +127,7 @@ fn section(type_id: u32, batch: &RecordBatch) -> Result<DictSection, CodecError>
         });
     }
 
-    let options = ArrowWriterOptions::new()
-        .with_properties(DICT_WRITER_PROPS.clone())
-        .with_skip_arrow_metadata(true);
-    let mut body = Vec::new();
-    let mut writer = ArrowWriter::try_new_with_options(&mut body, batch.schema(), options)?;
-    writer.write(batch)?;
-    writer.close()?;
-
-    if body.len() > MAX_SECTION_BYTES {
-        return Err(CodecError::SectionTooLarge {
-            len: body.len(),
-            max: MAX_SECTION_BYTES,
-        });
-    }
+    let body = encode_compact_ordered_batch(batch)?;
     Ok(DictSection {
         type_id,
         rows: u32::try_from(batch.num_rows()).unwrap_or(u32::MAX),

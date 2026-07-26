@@ -951,8 +951,8 @@ mod tests {
     };
     use kronika_format::{DictLimits, PartMeta, SectionInput, build_part};
     use kronika_registry::pg_log::{PgLogErrorV1, PgLogLifecycleV1};
-    use kronika_registry::{Section, StrId, Ts};
-    use kronika_writer::{DictionaryError, Interner, Journal, JournalConfig, SealError, dict, seal};
+    use kronika_registry::{CodecError, Section, StrId, Ts};
+    use kronika_writer::{Interner, Journal, JournalConfig, SealError, dict, seal};
 
     use super::super::limits::LIMIT;
     use super::super::qualification_fixture::all_family_fixture;
@@ -1130,6 +1130,10 @@ mod tests {
         try_seal_part_bytes(parts).expect("seal fixture")
     }
 
+    #[allow(
+        clippy::unwrap_in_result,
+        reason = "test setup failures are distinct from the SealError under assertion"
+    )]
     fn try_seal_part_bytes(parts: &[Vec<u8>]) -> Result<Vec<u8>, SealError> {
         let directory = tempfile::tempdir().expect("seal directory");
         let journal_path = directory.path().join("active.parts");
@@ -1996,7 +2000,7 @@ mod tests {
         let (second_bytes, _second_sections) = error_part(value, full_limits, false, 2_000);
         assert!(matches!(
             try_seal_part_bytes(&[first_bytes, second_bytes]),
-            Err(SealError::Dictionary(DictionaryError::Conflict { .. }))
+            Err(SealError::Codec(CodecError::SchemaMismatch))
         ));
     }
 

@@ -1,19 +1,9 @@
 use crate::buffering::push_activity;
 use crate::plans_source::PlansSourceCache;
 use crate::scheduler::{Intervals, Scheduler, SourceKind};
-use crate::segments::{SegmentState, open_collector_journal, seal_reason, verify_output_contract};
+use crate::segments::{SegmentState, open_collector_journal, seal_reason};
 use crate::source_contracts::activity_dict_limits;
-use crate::{Wake, timer_sleep_delay};
-
-#[test]
-fn signal_wakes_separate_collection_from_rotation() {
-    assert!(Wake::Collect.forces_sources());
-    assert!(!Wake::Collect.seals_after_collection());
-    assert!(Wake::CollectAndSeal.forces_sources());
-    assert!(Wake::CollectAndSeal.seals_after_collection());
-    assert!(!Wake::Timer.forces_sources());
-    assert!(!Wake::Timer.seals_after_collection());
-}
+use crate::timer_sleep_delay;
 use kronika_source_pg::{ActivityRow, ActivityVersion};
 use kronika_writer::{Interner, SectionBuffers, dict};
 
@@ -230,17 +220,4 @@ fn startup_with_an_empty_journal_recovers_nothing() {
             .expect("open the journal");
     assert!(recovered.is_none());
     assert!(journal.parts().is_empty());
-}
-
-#[test]
-fn collector_rejects_obsolete_sealed_store_without_touching_it() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("1000.pgm");
-    let bytes = b"PGM1 retained pre-compaction source";
-    std::fs::write(&path, bytes).expect("write obsolete fixture");
-
-    let error = verify_output_contract(dir.path()).expect_err("obsolete store must fail");
-    assert!(format!("{error:#}").contains("pre-compaction"));
-    assert_eq!(std::fs::read(path).expect("source retained"), bytes);
-    assert!(!dir.path().join("active.parts").exists());
 }
