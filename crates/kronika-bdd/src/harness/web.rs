@@ -114,6 +114,47 @@ pub(crate) async fn only_source(dir: &Path) -> Result<u64> {
     }
 }
 
+/// The PostgreSQL log status nested under the only `/v1/sources` row.
+pub(crate) async fn only_pg_log_status(dir: &Path) -> Result<Value> {
+    let response = request(dir, "/v1/sources", &[]).await?;
+    anyhow::ensure!(
+        response.status == 200,
+        "/v1/sources returned status {}: {}",
+        response.status,
+        response.body
+    );
+    let sources = response.body["sources"]
+        .as_array()
+        .context("`sources` is not an array")?;
+    let [source] = sources.as_slice() else {
+        bail!("expected exactly one source, got {}", sources.len());
+    };
+    source
+        .get("pg_log")
+        .cloned()
+        .context("the source has no `pg_log` status")
+}
+
+/// Verify that two source-status rows expose two different non-null log paths.
+pub(crate) async fn assert_two_log_source_paths(dir: &Path) -> Result<()> {
+    let source = only_source(dir).await?;
+    let page = section_page(dir, "pg_log_source_status", source).await?;
+    let rows = page["rows"].as_array().context("`rows` is not an array")?;
+    let paths = rows
+        .iter()
+        .map(|row| {
+            row["source_path"]
+                .as_str()
+                .context("`source_path` is not a string")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    anyhow::ensure!(
+        paths.len() == 2,
+        "expected two distinct PostgreSQL log paths, got {paths:?}; page: {page}"
+    );
+    Ok(())
+}
+
 /// The single source's id and time span, read through `/v1/sources`.
 pub(crate) async fn source_span(dir: &Path) -> Result<(u64, i64, i64)> {
     let response = request(dir, "/v1/sources", &[]).await?;

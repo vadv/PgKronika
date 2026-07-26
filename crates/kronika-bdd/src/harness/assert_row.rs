@@ -83,7 +83,8 @@ impl KeyMatch {
 
 /// Decode a section into generic rows and load the segment dictionary.
 ///
-/// Reads the catalog entry for `type_id`, CRC-checks the bytes, and decodes.
+/// Reads every catalog entry for `type_id`, CRC-checks the bytes, and decodes
+/// their rows in catalog order.
 ///
 /// # Errors
 ///
@@ -102,24 +103,34 @@ pub(crate) fn decode_section_labeled(
     use std::os::unix::fs::FileExt;
 
     let segment = Segment::open(path).context("open sealed segment")?;
-    let entry = segment
+    let entries = segment
         .catalog()
         .entries
         .iter()
-        .find(|entry| entry.type_id == type_id)
-        .with_context(|| format!("segment has no section {section_label}"))?;
-    let len = usize::try_from(entry.len)
-        .with_context(|| format!("section {section_label} len overflows usize"))?;
+        .filter(|entry| entry.type_id == type_id)
+        .collect::<Vec<_>>();
     anyhow::ensure!(
-        len <= MAX_SECTION_BYTES,
-        "section {section_label} of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
+        !entries.is_empty(),
+        "segment has no section {section_label}"
     );
-    let mut body = vec![0_u8; len];
-    std::fs::File::open(path)?.read_exact_at(&mut body, entry.offset)?;
-    let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
-        .map_err(|err| anyhow::anyhow!("section {section_label} crc check failed: {err}"))?;
-    let rows = decode_rows(type_id, verified)
-        .with_context(|| format!("generic decode of section {section_label}"))?;
+    let file = std::fs::File::open(path)?;
+    let mut rows = Vec::new();
+    for entry in entries {
+        let len = usize::try_from(entry.len)
+            .with_context(|| format!("section {section_label} len overflows usize"))?;
+        anyhow::ensure!(
+            len <= MAX_SECTION_BYTES,
+            "section {section_label} of {len} bytes is above the {MAX_SECTION_BYTES}-byte cap"
+        );
+        let mut body = vec![0_u8; len];
+        file.read_exact_at(&mut body, entry.offset)?;
+        let verified = VerifiedSection::verify(Bytes::from(body), entry.crc32c, crc32c)
+            .map_err(|err| anyhow::anyhow!("section {section_label} crc check failed: {err}"))?;
+        rows.extend(
+            decode_rows(type_id, verified)
+                .with_context(|| format!("generic decode of section {section_label}"))?,
+        );
+    }
     let dict = segment
         .dictionary()
         .context("read the segment dictionary")?;

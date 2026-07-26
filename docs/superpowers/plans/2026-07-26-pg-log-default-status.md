@@ -2121,7 +2121,7 @@ git commit -m "feat(web): expose PostgreSQL log source status"
 - Consumes: live `pg_current_logfile('stderr')`, collector timer and forced seal, in-process web router.
 - Produces: BDD evidence for default-on discovery, empty successful read, `/v1/sources`, and path change after rotation.
 
-- [ ] **Step 1: Add failing feature scenarios**
+- [x] **Step 1: Add failing feature scenarios**
 
 Add near the start of `pg_log.feature`:
 
@@ -2147,7 +2147,7 @@ Add near the start of `pg_log.feature`:
 
 Neither scenario may set `KRONIKA_PG_LOG_ENABLED` or `KRONIKA_LOG_PATH`.
 
-- [ ] **Step 2: Run the feature and confirm the red state**
+- [x] **Step 2: Run the feature and confirm the red state**
 
 Run:
 
@@ -2158,7 +2158,7 @@ TAGS='@pg_log and @pg16' make test-bdd
 Expected: the cluster has no discoverable current file and the two new step
 phrases are undefined.
 
-- [ ] **Step 3: Configure the throwaway PostgreSQL clusters for file logging**
+- [x] **Step 3: Configure the throwaway PostgreSQL clusters for file logging**
 
 Append these exact GUCs after `initdb` and before PostgreSQL starts:
 
@@ -2181,7 +2181,7 @@ Remove the redundant
 keep explicit `KRONIKA_LOG_FORMAT=stderr`,
 `KRONIKA_LOG_START_AT_BEGINNING=1`, state path and fixture path.
 
-- [ ] **Step 4: Add one long-running collector rotation helper**
+- [x] **Step 4: Add one long-running collector rotation helper**
 
 Add `snapshot::take_across_log_rotation`. It must:
 
@@ -2230,7 +2230,7 @@ anyhow::ensure!(after != before, "stderr path did not change");
 The helper returns an error if `before` is `NULL`, `pg_rotate_logfile()` returns
 `false`, or the path does not change.
 
-- [ ] **Step 5: Implement the BDD assertions through production readers**
+- [x] **Step 5: Implement the BDD assertions through production readers**
 
 Add these production-router helpers to `harness/web.rs`:
 
@@ -2315,7 +2315,7 @@ async fn web_pg_log_collecting(world: &mut BddWorld) -> Result<()> {
 The two-path assertion proves the second row came from a path transition rather
 than the 300-second heartbeat.
 
-- [ ] **Step 6: Run the log feature**
+- [x] **Step 6: Run the log feature**
 
 Run:
 
@@ -2327,7 +2327,7 @@ Expected: explicit fixture scenarios still pass; default discovery produces
 `collecting` with no event; rotation produces two distinct paths in one
 segment; `/v1/sources` reports the latest one.
 
-- [ ] **Step 7: Commit the live integration coverage**
+- [x] **Step 7: Commit the live integration coverage**
 
 ```sh
 git add crates/kronika-bdd/src/cluster.rs crates/kronika-bdd/src/harness/mod.rs crates/kronika-bdd/src/harness/snapshot.rs crates/kronika-bdd/src/harness/web.rs crates/kronika-bdd/src/steps/log.rs crates/kronika-bdd/src/steps/web.rs crates/kronika-bdd/features/pg_log.feature

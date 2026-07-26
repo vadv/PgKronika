@@ -1,7 +1,26 @@
 @pg_log
 Feature: PostgreSQL log-domain stderr fixtures
-  The collector reads deterministic stderr fixtures through KRONIKA_LOG_PATH.
-  The sealed rows contain grouped bounded facts, never raw line dumps.
+  The collector discovers PostgreSQL stderr files by default and can also read
+  deterministic fixtures through KRONIKA_LOG_PATH. The sealed rows contain
+  grouped bounded facts, never raw line dumps.
+
+  @pg16 @serial
+  Scenario: default collection discovers a quiet PostgreSQL stderr file
+    Given a fresh database on PostgreSQL 16
+    When the collector snapshots the segment
+    Then section pg_log_source_status has a row with state = 0:
+      | reason              | 0 |
+      | parser_kind         | 0 |
+      | dict_dropped_fields | 0 |
+    And section pg_log_errors is absent from the segment
+    And the web API reports PostgreSQL log state collecting for the only source
+
+  @pg16 @serial
+  Scenario: collection follows a PostgreSQL stderr log rotation
+    Given a fresh database on PostgreSQL 16
+    When the running collector observes a PostgreSQL stderr log rotation
+    Then section pg_log_source_status has 2 rows
+    And pg_log_source_status contains two distinct source_path values
 
   @pg16 @serial
   Scenario: stderr errors are grouped into pg_log_errors
