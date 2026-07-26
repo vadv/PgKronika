@@ -38,6 +38,209 @@ pub const COMPACTION_PAGE_BYTES: usize = 1024 * 1024;
 /// processes one type at a time and rejects a seal before crossing this bound.
 pub const COMPACTION_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
 
+/// Hard peak-work admission for decoding one compact PGM data section.
+///
+/// The input body, Parquet decode buffers, and retained Arrow arrays are all
+/// charged before the record-batch reader is built.
+pub const READ_WORK_MEMORY_LIMIT: usize = 32 * 1024 * 1024;
+
+/// Conservative framing allowance for one PLAIN data page.
+const PAGE_FRAMING_BYTES: usize = 16 * 1024;
+/// Conservative fixed/footer allowance for one compact Parquet body.
+const BODY_FRAMING_BYTES: usize = 64 * 1024;
+/// Footer/schema allowance per logical column.
+const BODY_COLUMN_FRAMING_BYTES: usize = 4 * 1024;
+/// Pre-encode bounds for one future compact section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactSectionBound {
+    /// One retained Arrow representation, including validity and list buffers.
+    pub decoded_arrow_bytes: usize,
+    /// Conservative PLAIN Parquet body bound before compression.
+    pub plain_body_bytes: usize,
+    /// Largest conservative PLAIN column-page bound.
+    pub max_column_page_bytes: usize,
+}
+
+/// Compute schema/row-derived bounds before a collection window is admitted.
+///
+/// The PLAIN body estimate assumes no compression. Fixed columns use their
+/// exact physical width plus conservative definition-level and page framing.
+/// `list_values` is the aggregate child-value count for the type's list
+/// column, or zero for a type without one. This lets the collector seal before
+/// a future column would require a second 1 MiB data page or a body could cross
+/// 8 MiB without assuming an average list length.
+///
+/// # Errors
+///
+/// Returns [`CodecError::UnknownType`], [`CodecError::TooManyRows`], or a
+/// checked-arithmetic [`CodecError::SectionTooLarge`].
+pub fn compact_section_bound(
+    type_id: u32,
+    rows: usize,
+    list_values: usize,
+) -> Result<CompactSectionBound, CodecError> {
+    let contract = contract(type_id)?;
+    compact_section_bound_for_contract(contract, rows, list_values)
+}
+
+pub(crate) fn compact_section_bound_for_contract(
+    contract: &TypeContract,
+    rows: usize,
+    list_values: usize,
+) -> Result<CompactSectionBound, CodecError> {
+    check_row_cap(rows)?;
+    let mut decoded_arrow_bytes = 0_usize;
+    let mut plain_body_bytes = checked_add(
+        BODY_FRAMING_BYTES,
+        checked_mul(
+            contract.columns.len(),
+            BODY_COLUMN_FRAMING_BYTES,
+            "compact body column framing",
+        )?,
+        "compact body framing",
+    )?;
+    let mut max_column_page_bytes = 0_usize;
+
+    for column in contract.columns {
+        let validity = if column.nullable {
+            rows.div_ceil(8)
+        } else {
+            0
+        };
+        let definition_levels = if column.nullable { rows } else { 0 };
+        let (arrow_values, parquet_values) = match column.ty {
+            ColumnType::I8 | ColumnType::U8 | ColumnType::Bool => {
+                let values = rows;
+                (values, values)
+            }
+            ColumnType::I16 | ColumnType::U16 => {
+                let values = checked_mul(rows, 2, "compact i16 column")?;
+                (values, values)
+            }
+            ColumnType::I32 | ColumnType::U32 | ColumnType::F32 => {
+                let values = checked_mul(rows, 4, "compact i32 column")?;
+                (values, values)
+            }
+            ColumnType::I64
+            | ColumnType::U64
+            | ColumnType::F64
+            | ColumnType::Ts
+            | ColumnType::StrId => {
+                let values = checked_mul(rows, 8, "compact i64 column")?;
+                (values, values)
+            }
+            ColumnType::ListI32 => {
+                let max_values = MAX_LIST_I32_VALUES_PER_SECTION.checked_add(rows).ok_or(
+                    CodecError::TooManyListValues {
+                        name: column.name,
+                        values: list_values,
+                        max: MAX_LIST_I32_VALUES_PER_SECTION,
+                    },
+                )?;
+                if list_values > max_values {
+                    return Err(CodecError::TooManyListValues {
+                        name: column.name,
+                        values: list_values,
+                        max: max_values,
+                    });
+                }
+                let children = list_values;
+                let child_values = checked_mul(children, 4, "compact list child bytes")?;
+                let offsets = checked_mul(
+                    rows.checked_add(1).ok_or(CodecError::SectionTooLarge {
+                        len: usize::MAX,
+                        max: COMPACTION_MEMORY_LIMIT,
+                    })?,
+                    4,
+                    "compact list offsets",
+                )?;
+                let arrow = checked_add(offsets, child_values, "compact list Arrow bytes")?;
+                // Repetition + definition levels are conservatively charged at
+                // two bytes per possible child and two bytes per parent.
+                let child_levels = checked_mul(children, 2, "compact list child levels")?;
+                let parent_levels = checked_mul(rows, 2, "compact list parent levels")?;
+                let parquet = checked_add(
+                    checked_add(child_values, child_levels, "compact list values and levels")?,
+                    parent_levels,
+                    "compact list page bytes",
+                )?;
+                (arrow, parquet)
+            }
+        };
+        decoded_arrow_bytes = checked_add(
+            decoded_arrow_bytes,
+            checked_add(arrow_values, validity, "compact Arrow column")?,
+            "compact Arrow batch",
+        )?;
+        let page = checked_add(
+            checked_add(
+                parquet_values,
+                definition_levels,
+                "compact column definition levels",
+            )?,
+            PAGE_FRAMING_BYTES,
+            "compact column page framing",
+        )?;
+        max_column_page_bytes = max_column_page_bytes.max(page);
+        plain_body_bytes = checked_add(plain_body_bytes, page, "compact PLAIN body")?;
+    }
+
+    Ok(CompactSectionBound {
+        decoded_arrow_bytes,
+        plain_body_bytes,
+        max_column_page_bytes,
+    })
+}
+
+/// Bound one section decode before Arrow arrays are allocated.
+///
+/// `declared_uncompressed_bytes` is the checked sum from Parquet column-chunk
+/// metadata. The greater of that declaration and the schema-derived Arrow
+/// representation is charged twice for decoder/output overlap, together with
+/// the retained encoded body and fixed reader bookkeeping.
+///
+/// # Errors
+///
+/// Returns the same schema/row/arithmetic failures as
+/// [`compact_section_bound`].
+pub fn read_work_memory_bound(
+    type_id: u32,
+    rows: usize,
+    stored_bytes: usize,
+    declared_uncompressed_bytes: usize,
+) -> Result<usize, CodecError> {
+    let contract = contract(type_id)?;
+    read_work_memory_bound_for_contract(
+        contract,
+        rows,
+        stored_bytes,
+        declared_uncompressed_bytes,
+    )
+}
+
+pub(crate) fn read_work_memory_bound_for_contract(
+    contract: &TypeContract,
+    rows: usize,
+    stored_bytes: usize,
+    declared_uncompressed_bytes: usize,
+) -> Result<usize, CodecError> {
+    // Parquet's checked declared size dominates list-child storage. Zero here
+    // still charges Arrow offsets for the schema-derived floor.
+    let section = compact_section_bound_for_contract(contract, rows, 0)?;
+    let decoded = section
+        .decoded_arrow_bytes
+        .max(declared_uncompressed_bytes);
+    checked_add(
+        checked_add(
+            stored_bytes,
+            checked_mul(decoded, 2, "read decode overlap")?,
+            "read stored and decoded bytes",
+        )?,
+        1024 * 1024,
+        "read bookkeeping",
+    )
+}
+
 /// Parquet properties for every final data and dictionary section.
 static COMPACT_WRITER_PROPERTIES: LazyLock<WriterProperties> = LazyLock::new(|| {
     WriterProperties::builder()
@@ -66,46 +269,17 @@ static COMPACT_WRITER_PROPERTIES: LazyLock<WriterProperties> = LazyLock::new(|| 
 /// [`CodecError::TooManyRows`] above the section cap, or
 /// [`CodecError::SectionTooLarge`] when checked arithmetic overflows.
 pub fn compaction_memory_bound(type_id: u32, rows: usize) -> Result<usize, CodecError> {
-    check_row_cap(rows)?;
     let contract = contract(type_id)?;
-    let mut one_copy = 0_usize;
-    for column in contract.columns {
-        let fixed = match column.ty {
-            ColumnType::I8 | ColumnType::U8 | ColumnType::Bool => 1,
-            ColumnType::I16 | ColumnType::U16 => 2,
-            ColumnType::I32 | ColumnType::U32 | ColumnType::F32 => 4,
-            ColumnType::I64
-            | ColumnType::U64
-            | ColumnType::F64
-            | ColumnType::Ts
-            | ColumnType::StrId => 8,
-            // List offsets; child storage is added once below.
-            ColumnType::ListI32 => 4,
-        };
-        one_copy = checked_add(
-            one_copy,
-            checked_mul(rows, fixed, "compaction fixed-width estimate")?,
-            "compaction column estimate",
-        )?;
-        if column.nullable {
-            one_copy = checked_add(one_copy, rows.div_ceil(8), "compaction validity estimate")?;
-        }
-    }
-    if contract
+    let list_values = if contract
         .columns
         .iter()
         .any(|column| column.ty == ColumnType::ListI32)
     {
-        one_copy = checked_add(
-            one_copy,
-            checked_mul(
-                MAX_LIST_I32_VALUES_PER_SECTION,
-                size_of::<i32>(),
-                "compaction list-child estimate",
-            )?,
-            "compaction list estimate",
-        )?;
-    }
+        MAX_LIST_I32_VALUES_PER_SECTION
+    } else {
+        0
+    };
+    let one_copy = compact_section_bound(type_id, rows, list_values)?.decoded_arrow_bytes;
 
     let live_copies = checked_mul(one_copy, 4, "compaction live Arrow copies")?;
     let indexes = checked_mul(
@@ -528,5 +702,41 @@ mod tests {
             compaction_memory_bound(999, 1),
             Err(CodecError::UnknownType { type_id: 999 })
         ));
+    }
+
+    #[test]
+    fn planner_bounds_page_body_and_reader_work_before_encode() {
+        let ordinary =
+            compact_section_bound(PgStatArchiver::CONTRACT.type_id.get(), 1_024, 0).expect("bound");
+        assert!(ordinary.max_column_page_bytes <= COMPACTION_PAGE_BYTES);
+        assert!(ordinary.plain_body_bytes <= MAX_SECTION_BYTES);
+        let read = read_work_memory_bound(
+            PgStatArchiver::CONTRACT.type_id.get(),
+            1_024,
+            ordinary.plain_body_bytes,
+            ordinary.plain_body_bytes,
+        )
+        .expect("read work");
+        assert!(read <= READ_WORK_MEMORY_LIMIT);
+
+        let list_page = compact_section_bound(
+            crate::pg_locks::PgLocksV2::CONTRACT.type_id.get(),
+            MAX_SECTION_ROWS,
+            MAX_LIST_I32_VALUES_PER_SECTION,
+        )
+        .expect("list bound");
+        assert!(
+            list_page.max_column_page_bytes > COMPACTION_PAGE_BYTES,
+            "the planner must early-seal before a worst-case lock list needs a second page"
+        );
+
+        let hostile = read_work_memory_bound(
+            PgStatArchiver::CONTRACT.type_id.get(),
+            MAX_SECTION_ROWS,
+            MAX_SECTION_BYTES,
+            READ_WORK_MEMORY_LIMIT,
+        )
+        .expect("checked hostile work");
+        assert!(hostile > READ_WORK_MEMORY_LIMIT);
     }
 }

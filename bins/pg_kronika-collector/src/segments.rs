@@ -395,7 +395,22 @@ const fn admission_reason(error: &SealError) -> &'static str {
             resource: kronika_writer::SealResource::InputSections,
             ..
         } => "section-limit",
+        SealError::Resource {
+            resource: kronika_writer::SealResource::ColumnPage,
+            ..
+        } => "page-limit",
+        SealError::Resource {
+            resource: kronika_writer::SealResource::SectionBody,
+            ..
+        } => "body-limit",
+        SealError::Resource {
+            resource: kronika_writer::SealResource::ReaderMemory,
+            ..
+        } => "reader-memory-limit",
         SealError::Codec(kronika_registry::CodecError::TooManyRows { .. }) => "row-limit",
+        SealError::Dictionary(kronika_writer::DictionaryError::TooManyEntries { .. }) => {
+            "dictionary-limit"
+        }
         _ => "admission-limit",
     }
 }

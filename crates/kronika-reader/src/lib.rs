@@ -100,7 +100,7 @@ use arrow_schema::{DataType, Field, Schema};
 use kronika_format::{Catalog, DecodeError, Entry};
 use kronika_registry::{
     Bytes, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, DecodedSection, MAX_ROW_GROUPS,
-    MAX_SECTION_ROWS,
+    MAX_SECTION_ROWS, READ_WORK_MEMORY_LIMIT,
 };
 use kronika_store::StoreError;
 
@@ -452,6 +452,7 @@ pub(crate) fn decode_dictionary_selected(
         DICT_BLOBS_TYPE_ID => true,
         _ => return Err(CodecError::UnknownType { type_id }),
     };
+    let stored_len = body.len();
     let builder = ParquetRecordBatchReaderBuilder::try_new(body)?;
     let groups = builder.metadata().num_row_groups();
     if groups > MAX_ROW_GROUPS {
@@ -474,8 +475,9 @@ pub(crate) fn decode_dictionary_selected(
     let mut declared_decoded_bytes = 0_u64;
     for row_group in builder.metadata().row_groups() {
         for column in row_group.columns() {
-            let bytes = u64::try_from(column.uncompressed_size())
-                .map_err(|_error| CodecError::SchemaMismatch)?;
+            let raw = column.uncompressed_size();
+            let bytes =
+                u64::try_from(raw).map_err(|_error| CodecError::InvalidDecodedSize { raw })?;
             declared_decoded_bytes =
                 declared_decoded_bytes
                     .checked_add(bytes)
@@ -489,6 +491,30 @@ pub(crate) fn decode_dictionary_selected(
         return Err(CodecError::SectionTooLarge {
             len: usize::try_from(declared_decoded_bytes).unwrap_or(usize::MAX),
             max: usize::try_from(bounds.decoded_block_len).unwrap_or(usize::MAX),
+        });
+    }
+    let declared = usize::try_from(declared_decoded_bytes).map_err(|_error| {
+        CodecError::ReadWorkBudgetExceeded {
+            needed: usize::MAX,
+            max: READ_WORK_MEMORY_LIMIT,
+        }
+    })?;
+    let read_work = stored_len
+        .checked_add(declared.checked_mul(2).ok_or(
+            CodecError::ReadWorkBudgetExceeded {
+                needed: usize::MAX,
+                max: READ_WORK_MEMORY_LIMIT,
+            },
+        )?)
+        .and_then(|bytes| bytes.checked_add(1024 * 1024))
+        .ok_or(CodecError::ReadWorkBudgetExceeded {
+            needed: usize::MAX,
+            max: READ_WORK_MEMORY_LIMIT,
+        })?;
+    if read_work > READ_WORK_MEMORY_LIMIT {
+        return Err(CodecError::ReadWorkBudgetExceeded {
+            needed: read_work,
+            max: READ_WORK_MEMORY_LIMIT,
         });
     }
     if !dictionary_schema_matches(builder.schema(), is_blob) {
@@ -670,8 +696,14 @@ fn reject_nulls(array: &dyn Array, name: &'static str) -> Result<(), CodecError>
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{BinaryArray, RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
     use kronika_format::{PartMeta, SectionInput, build_part};
-    use kronika_registry::Section;
+    use kronika_registry::{
+        CodecError, DICT_STRINGS_TYPE_ID, Section, encode_compact_ordered_batch,
+    };
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
 
     use super::{ReadError, Resolved, Segment};
@@ -790,5 +822,47 @@ mod tests {
             None,
             "an absent id resolves to None"
         );
+    }
+
+    #[test]
+    fn compressed_dictionary_expansion_is_rejected_before_arrow_batches() {
+        let mut entries = (0_u32..8_192)
+            .map(|ordinal| {
+                let mut value = vec![b'x'; 2_044];
+                value.extend_from_slice(&ordinal.to_le_bytes());
+                let id = kronika_format::StrId::of(&value)
+                    .expect("nonzero dictionary id")
+                    .get();
+                (id, value)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(id, _value)| *id);
+        let ids = UInt64Array::from_iter_values(entries.iter().map(|(id, _value)| *id));
+        let values =
+            BinaryArray::from_iter_values(entries.iter().map(|(_id, value)| value.as_slice()));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("str_id", DataType::UInt64, false),
+            Field::new("bytes", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(values)])
+            .expect("dictionary batch");
+        let body = encode_compact_ordered_batch(&batch).expect("compressible dictionary body");
+        assert!(
+            body.len() < kronika_registry::MAX_SECTION_BYTES,
+            "stored body remains within the format cap"
+        );
+        let (_dir, path) = segment_with(
+            &body,
+            DICT_STRINGS_TYPE_ID,
+            u32::try_from(entries.len()).expect("row count"),
+        );
+        let segment = Segment::open(&path).expect("catalog is admitted");
+        assert!(matches!(
+            segment.dictionary(),
+            Err(ReadError::Codec(CodecError::ReadWorkBudgetExceeded {
+                max: kronika_registry::READ_WORK_MEMORY_LIMIT,
+                ..
+            }))
+        ));
     }
 }

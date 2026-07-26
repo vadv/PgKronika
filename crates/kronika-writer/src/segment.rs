@@ -31,12 +31,16 @@ use kronika_format::{
     validate_part,
 };
 use kronika_registry::{
-    Bytes, COMPACTION_MEMORY_LIMIT, CodecError, DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID,
-    MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS, VerifiedSection, canonicalize_batches,
+    Bytes, COMPACTION_MEMORY_LIMIT, COMPACTION_PAGE_BYTES, CodecError, ColumnType,
+    DICT_BLOBS_TYPE_ID, DICT_STRINGS_TYPE_ID, MAX_ROW_GROUPS, MAX_SECTION_BYTES, MAX_SECTION_ROWS,
+    READ_WORK_MEMORY_LIMIT, VerifiedSection, canonicalize_batches, compact_section_bound,
     compaction_memory_bound, decode_any, encode_compact_batch, encode_compact_ordered_batch,
-    registry,
+    read_work_memory_bound, registry,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::{Compression, Encoding};
+use parquet::file::reader::FileReader as _;
+use parquet::file::serialized_reader::SerializedFileReader;
 
 use crate::{DEFAULT_MAX_JOURNAL_LEN, Journal, JournalError};
 
@@ -130,6 +134,12 @@ pub enum SealResource {
     OutputDisk,
     /// Number of input catalog entries.
     InputSections,
+    /// Projected PLAIN bytes for one final column data page.
+    ColumnPage,
+    /// Projected uncompressed PLAIN bytes for one final section body.
+    SectionBody,
+    /// Projected reader work for one final section.
+    ReaderMemory,
 }
 
 impl fmt::Display for SealResource {
@@ -139,6 +149,9 @@ impl fmt::Display for SealResource {
             Self::SpillDisk => "spill disk",
             Self::OutputDisk => "output disk",
             Self::InputSections => "input sections",
+            Self::ColumnPage => "column page",
+            Self::SectionBody => "section body",
+            Self::ReaderMemory => "reader memory",
         };
         f.write_str(name)
     }
@@ -411,7 +424,14 @@ impl SealError {
             Self::Resource {
                 resource: SealResource::Memory | SealResource::InputSections,
                 ..
+            } | Self::Resource {
+                resource:
+                    SealResource::ColumnPage
+                    | SealResource::SectionBody
+                    | SealResource::ReaderMemory,
+                ..
             } | Self::Codec(CodecError::TooManyRows { .. })
+                | Self::Dictionary(DictionaryError::TooManyEntries { .. })
         )
     }
 }
@@ -492,6 +512,9 @@ pub fn seal_with_options(
     let mut artifacts = Artifacts::default();
     let (runs, dictionary, spill_bytes) =
         create_runs(journal, dest, generation, options, &mut artifacts)?;
+    if plan.total_rows == 0 {
+        return Err(SealError::Empty);
+    }
     let tmp = artifact_path(dest, generation, "segment", 0);
     artifacts.track(tmp.clone());
     let built = write_compact_temp(&tmp, &plan, &runs, &dictionary, options, &mut artifacts)?;
@@ -526,6 +549,7 @@ pub fn seal_with_options(
 #[derive(Debug, Clone, Default)]
 struct TypePlan {
     rows: usize,
+    list_values: usize,
 }
 
 /// Incremental collector-side seal footprint.
@@ -537,6 +561,7 @@ struct TypePlan {
 #[derive(Debug, Clone, Default)]
 pub struct SealAdmission {
     types: BTreeMap<u32, TypePlan>,
+    dictionary_placements: BTreeMap<u64, u32>,
     dictionary_decoded_bytes: usize,
     dictionary_rows: usize,
     input_sections: usize,
@@ -583,14 +608,28 @@ impl SealAdmission {
                         what: "collector dictionary rows",
                     },
                 )?;
+                admit_dictionary_ids(
+                    &mut next.dictionary_placements,
+                    entry.type_id,
+                    &metadata.ids,
+                )?;
             } else {
-                ensure_registered(entry.type_id)?;
+                let metadata = inspect_data(body, entry)?;
+                if metadata.rows == 0 {
+                    continue;
+                }
                 let type_plan = next.types.entry(entry.type_id).or_default();
-                type_plan.rows = type_plan.rows.checked_add(entry.rows as usize).ok_or(
+                type_plan.rows = type_plan.rows.checked_add(metadata.rows).ok_or(
                     SealError::ArithmeticOverflow {
                         what: "collector rows per type",
                     },
                 )?;
+                type_plan.list_values = type_plan
+                    .list_values
+                    .checked_add(metadata.list_values)
+                    .ok_or(SealError::ArithmeticOverflow {
+                        what: "collector list values per type",
+                    })?;
                 if type_plan.rows > MAX_SECTION_ROWS {
                     return Err(CodecError::TooManyRows {
                         rows: type_plan.rows,
@@ -598,6 +637,7 @@ impl SealAdmission {
                     }
                     .into());
                 }
+                admit_compact_type(entry.type_id, type_plan)?;
             }
         }
         let dictionary = dictionary_memory_bound(
@@ -644,6 +684,7 @@ fn plan_seal(journal: &Journal, limits: SealLimits) -> Result<SealPlan, SealErro
     let mut input_sections = 0_usize;
     let mut dictionary_decoded_bytes = 0_usize;
     let mut dictionary_rows = 0_usize;
+    let mut dictionary_placements = BTreeMap::<u64, u32>::new();
 
     for &part_ref in journal.parts() {
         let part = journal.read_part(part_ref)?;
@@ -679,21 +720,28 @@ fn plan_seal(journal: &Journal, limits: SealLimits) -> Result<SealPlan, SealErro
                     .ok_or(SealError::ArithmeticOverflow {
                         what: "dictionary decoded bytes",
                     })?;
+                admit_dictionary_ids(
+                    &mut dictionary_placements,
+                    entry.type_id,
+                    &metadata.ids,
+                )?;
             } else {
-                ensure_registered(entry.type_id)?;
-                if entry.len > MAX_SECTION_BYTES as u64 {
-                    return Err(CodecError::SectionTooLarge {
-                        len: usize::try_from(entry.len).unwrap_or(usize::MAX),
-                        max: MAX_SECTION_BYTES,
-                    }
-                    .into());
+                let metadata = inspect_data(body, entry)?;
+                if metadata.rows == 0 {
+                    continue;
                 }
                 let type_plan = types.entry(entry.type_id).or_default();
-                type_plan.rows = type_plan.rows.checked_add(entry.rows as usize).ok_or(
+                type_plan.rows = type_plan.rows.checked_add(metadata.rows).ok_or(
                     SealError::ArithmeticOverflow {
                         what: "rows per type",
                     },
                 )?;
+                type_plan.list_values = type_plan
+                    .list_values
+                    .checked_add(metadata.list_values)
+                    .ok_or(SealError::ArithmeticOverflow {
+                        what: "list values per type",
+                    })?;
                 if type_plan.rows > MAX_SECTION_ROWS {
                     return Err(CodecError::TooManyRows {
                         rows: type_plan.rows,
@@ -701,6 +749,7 @@ fn plan_seal(journal: &Journal, limits: SealLimits) -> Result<SealPlan, SealErro
                     }
                     .into());
                 }
+                admit_compact_type(entry.type_id, type_plan)?;
                 total_rows = total_rows.checked_add(u64::from(entry.rows)).ok_or(
                     SealError::ArithmeticOverflow {
                         what: "segment data rows",
@@ -797,10 +846,124 @@ fn dictionary_memory_bound(
         })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DictionaryMetadata {
     rows: usize,
     decoded_bytes: usize,
+    ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DataMetadata {
+    rows: usize,
+    /// Conservative Parquet leaf-value count for all list columns.
+    ///
+    /// Parquet may count one definition-level value for an empty/null list, so
+    /// this can exceed the exact Arrow child count. Over-counting is safe for
+    /// page admission.
+    list_values: usize,
+}
+
+fn inspect_data(body: &[u8], entry: &Entry) -> Result<DataMetadata, SealError> {
+    if body.len() > MAX_SECTION_BYTES {
+        return Err(CodecError::SectionTooLarge {
+            len: body.len(),
+            max: MAX_SECTION_BYTES,
+        }
+        .into());
+    }
+    let contract = registry()
+        .iter()
+        .find(|contract| contract.type_id.get() == entry.type_id)
+        .ok_or(SealError::UnknownType {
+            type_id: entry.type_id,
+        })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(body))?;
+    let groups = builder.metadata().num_row_groups();
+    if groups > MAX_ROW_GROUPS {
+        return Err(CodecError::TooManyRowGroups {
+            groups,
+            max: MAX_ROW_GROUPS,
+        }
+        .into());
+    }
+    let raw_rows = builder.metadata().file_metadata().num_rows();
+    let rows =
+        usize::try_from(raw_rows).map_err(|_overflow| CodecError::InvalidRowCount { raw: raw_rows })?;
+    if rows > MAX_SECTION_ROWS {
+        return Err(CodecError::TooManyRows {
+            rows,
+            max: MAX_SECTION_ROWS,
+        }
+        .into());
+    }
+    if rows != entry.rows as usize {
+        return Err(SealError::RowCountMismatch {
+            type_id: entry.type_id,
+            declared: entry.rows,
+            decoded: rows,
+        });
+    }
+
+    let mut list_values = 0_usize;
+    if contract
+        .columns
+        .iter()
+        .any(|column| column.ty == ColumnType::ListI32)
+    {
+        for group in builder.metadata().row_groups() {
+            for column in group.columns() {
+                let is_list = column
+                    .column_path()
+                    .parts()
+                    .first()
+                    .is_some_and(|name| {
+                        contract.columns.iter().any(|contract_column| {
+                            contract_column.ty == ColumnType::ListI32
+                                && contract_column.name == name.as_str()
+                        })
+                    });
+                if !is_list {
+                    continue;
+                }
+                let raw = column.num_values();
+                let values = usize::try_from(raw)
+                    .map_err(|_overflow| CodecError::InvalidDecodedSize { raw })?;
+                list_values =
+                    list_values
+                        .checked_add(values)
+                        .ok_or(SealError::ArithmeticOverflow {
+                            what: "list value metadata",
+                        })?;
+            }
+        }
+    }
+    Ok(DataMetadata { rows, list_values })
+}
+
+fn admit_compact_type(type_id: u32, plan: &TypePlan) -> Result<(), SealError> {
+    let bound = compact_section_bound(type_id, plan.rows, plan.list_values)?;
+    admit_u64(
+        SealResource::ColumnPage,
+        bound.max_column_page_bytes as u64,
+        COMPACTION_PAGE_BYTES as u64,
+    )?;
+    admit_u64(
+        SealResource::SectionBody,
+        bound.plain_body_bytes as u64,
+        MAX_SECTION_BYTES as u64,
+    )?;
+    let read_work = read_work_memory_bound(
+        type_id,
+        plan.rows,
+        bound.plain_body_bytes,
+        bound.plain_body_bytes,
+    )?;
+    admit_u64(
+        SealResource::ReaderMemory,
+        read_work as u64,
+        READ_WORK_MEMORY_LIMIT as u64,
+    )
 }
 
 fn inspect_dictionary(
@@ -863,10 +1026,66 @@ fn inspect_dictionary(
                     })?;
         }
     }
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(rows)
+        .map_err(|_error| SealError::Resource {
+            resource: SealResource::Memory,
+            needed: rows
+                .checked_mul(size_of::<u64>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX),
+            limit: COMPACTION_MEMORY_LIMIT as u64,
+        })?;
+    let mut previous = 0_u64;
+    for batch in builder.with_batch_size(4096).build()? {
+        let batch = batch?;
+        let values = required_u64(&batch, "str_id", type_id)?;
+        for row in 0..batch.num_rows() {
+            let id = values.value(row);
+            check_dictionary_order(type_id, previous, id)?;
+            previous = id;
+            ids.push(id);
+        }
+    }
+    if ids.len() != rows {
+        return Err(DictionaryError::RowCount {
+            type_id,
+            declared: declared_rows,
+            actual: ids.len() as u64,
+        }
+        .into());
+    }
     Ok(DictionaryMetadata {
         rows,
         decoded_bytes,
+        ids,
     })
+}
+
+fn admit_dictionary_ids(
+    placements: &mut BTreeMap<u64, u32>,
+    type_id: u32,
+    ids: &[u64],
+) -> Result<(), SealError> {
+    for &id in ids {
+        match placements.entry(id) {
+            btree_map::Entry::Vacant(slot) => {
+                slot.insert(type_id);
+            }
+            btree_map::Entry::Occupied(slot) if *slot.get() == type_id => {}
+            btree_map::Entry::Occupied(_) => {
+                return Err(DictionaryError::PlacementConflict { str_id: id }.into());
+            }
+        }
+    }
+    if placements.len() > MAX_SECTION_ROWS {
+        return Err(DictionaryError::TooManyEntries {
+            entries: placements.len(),
+            max: MAX_SECTION_ROWS,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -910,6 +1129,9 @@ fn create_runs(
                     declared: entry.rows,
                     decoded: decoded.stats.rows,
                 });
+            }
+            if decoded.stats.rows == 0 {
+                continue;
             }
             let canonical = canonicalize_batches(entry.type_id, &decoded.batches)?;
             let run_body = encode_compact_batch(entry.type_id, &canonical)?;
@@ -1546,6 +1768,101 @@ fn verify_temp(path: &Path, expected: &Catalog, expected_len: u64) -> Result<(),
                 reason: "reopened section CRC differs",
             });
         }
+        let len =
+            usize::try_from(entry.len).map_err(|_overflow| SealError::ArithmeticOverflow {
+                what: "physical verification body allocation",
+            })?;
+        let mut body = vec![0_u8; len];
+        file.read_exact_at(&mut body, entry.offset)?;
+        verify_compact_body(Bytes::from(body), entry.rows)?;
+    }
+    Ok(())
+}
+
+fn verify_compact_body(body: Bytes, expected_rows: u32) -> Result<(), SealError> {
+    let reader = SerializedFileReader::new(body)?;
+    if reader.num_row_groups() != 1 {
+        return Err(SealError::OutputVerification {
+            reason: "compact section does not have exactly one row group",
+        });
+    }
+    let metadata = reader.metadata();
+    let file_metadata = metadata.file_metadata();
+    if file_metadata.num_rows() != i64::from(expected_rows) {
+        return Err(SealError::OutputVerification {
+            reason: "compact Parquet rows differ from the output catalog",
+        });
+    }
+    if file_metadata.created_by() != Some("") {
+        return Err(SealError::OutputVerification {
+            reason: "compact Parquet created_by is not empty",
+        });
+    }
+    if file_metadata
+        .key_value_metadata()
+        .is_some_and(|entries| !entries.is_empty())
+    {
+        return Err(SealError::OutputVerification {
+            reason: "compact Parquet carries key-value metadata",
+        });
+    }
+
+    let row_group = reader.get_row_group(0)?;
+    for column_index in 0..row_group.num_columns() {
+        let column = row_group.metadata().column(column_index);
+        if !matches!(column.compression(), Compression::ZSTD(_)) {
+            return Err(SealError::OutputVerification {
+                reason: "compact Parquet column is not Zstandard-compressed",
+            });
+        }
+        if !column.encodings().contains(&Encoding::PLAIN)
+            || column.encodings().iter().any(|encoding| {
+                matches!(
+                    encoding,
+                    Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+                )
+            })
+        {
+            return Err(SealError::OutputVerification {
+                reason: "compact Parquet column does not use the PLAIN profile",
+            });
+        }
+        if column.statistics().is_some()
+            || column.column_index_length().is_some()
+            || column.offset_index_length().is_some()
+        {
+            return Err(SealError::OutputVerification {
+                reason: "compact Parquet statistics or page indexes are present",
+            });
+        }
+        let pages = row_group.get_column_page_reader(column_index)?;
+        let mut data_pages = 0_usize;
+        for page in pages {
+            let page = page?;
+            if page.is_dictionary_page() {
+                return Err(SealError::OutputVerification {
+                    reason: "compact Parquet contains a dictionary page",
+                });
+            }
+            if page.is_data_page() {
+                data_pages =
+                    data_pages
+                        .checked_add(1)
+                        .ok_or(SealError::ArithmeticOverflow {
+                            what: "compact data page count",
+                        })?;
+                if page.encoding() != Encoding::PLAIN {
+                    return Err(SealError::OutputVerification {
+                        reason: "compact Parquet data page is not PLAIN",
+                    });
+                }
+            }
+        }
+        if data_pages != 1 {
+            return Err(SealError::OutputVerification {
+                reason: "compact Parquet column does not have exactly one data page",
+            });
+        }
     }
     Ok(())
 }
@@ -1638,17 +1955,6 @@ fn section_slice<'a>(part: &'a [u8], entry: &Entry) -> Result<&'a [u8], SealErro
         }))
 }
 
-fn ensure_registered(type_id: u32) -> Result<(), SealError> {
-    if registry()
-        .iter()
-        .any(|contract| contract.type_id.get() == type_id)
-    {
-        Ok(())
-    } else {
-        Err(SealError::UnknownType { type_id })
-    }
-}
-
 const fn is_dictionary(type_id: u32) -> bool {
     matches!(type_id, DICT_STRINGS_TYPE_ID | DICT_BLOBS_TYPE_ID)
 }
@@ -1715,9 +2021,8 @@ impl Drop for Artifacts {
 #[cfg(test)]
 mod tests {
     use kronika_format::{DictLimits, PartMeta, SectionInput, try_build_part};
-    use kronika_registry::Ts;
+    use kronika_registry::{Section as _, Ts};
     use kronika_registry::bgwriter_checkpointer::BgwriterCheckpointer;
-    use parquet::basic::Encoding;
     use sha2::{Digest as _, Sha256};
 
     use super::*;
@@ -2073,6 +2378,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reopen_rejects_noncompact_parquet_even_with_valid_outer_crc() {
+        let body = BgwriterCheckpointer::encode(&[bgwriter(1)]).expect("regular section");
+        let bytes = try_build_part(
+            &[SectionInput {
+                type_id: 1_006_001,
+                rows: 1,
+                body: &body,
+            }],
+            PartMeta {
+                min_ts: 1,
+                max_ts: 1,
+                source_id: 0,
+            },
+        )
+        .expect("valid outer PGM");
+        let catalog = validate_part(&bytes).expect("outer CRC and catalog are valid");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("noncompact.pgm");
+        fs::write(&path, &bytes).expect("write fixture");
+
+        assert!(
+            verify_temp(&path, &catalog, bytes.len() as u64).is_err(),
+            "post-write verification must inspect the inner Parquet profile"
+        );
+        assert_eq!(fs::read(path).expect("fixture retained"), bytes);
+    }
+
     struct ChunkWriter {
         bytes: Vec<u8>,
         chunk: usize,
@@ -2202,6 +2535,77 @@ mod tests {
         ));
         assert!(!destination.exists());
         assert_eq!(fs::read(journal_path).unwrap(), journal_before);
+    }
+
+    #[test]
+    fn projected_page_boundary_seals_before_the_overflowing_row() {
+        let type_id = kronika_registry::pg_locks::PgLocksV2::CONTRACT
+            .type_id
+            .get();
+        let mut last_good = 0_usize;
+        for rows in 1..=MAX_SECTION_ROWS {
+            let plan = TypePlan {
+                rows,
+                list_values: rows * 4,
+            };
+            match admit_compact_type(type_id, &plan) {
+                Ok(()) => last_good = rows,
+                Err(error) => {
+                    assert!(error.is_admission_boundary());
+                    break;
+                }
+            }
+        }
+        assert!(last_good > 0);
+        assert!(last_good < MAX_SECTION_ROWS);
+        admit_compact_type(
+            type_id,
+            &TypePlan {
+                rows: last_good,
+                list_values: last_good * 4,
+            },
+        )
+        .expect("last row within the one-page contract");
+        let error = admit_compact_type(
+            type_id,
+            &TypePlan {
+                rows: last_good + 1,
+                list_values: (last_good + 1) * 4,
+            },
+        )
+        .expect_err("next row crosses a projected hard bound");
+        assert!(error.is_admission_boundary());
+    }
+
+    #[test]
+    fn projected_dictionary_cardinality_stops_on_the_next_id() {
+        let mut placements = BTreeMap::new();
+        let ids = (1..=MAX_SECTION_ROWS as u64).collect::<Vec<_>>();
+        admit_dictionary_ids(&mut placements, DICT_STRINGS_TYPE_ID, &ids)
+            .expect("the exact dictionary cap is admitted");
+        let error = admit_dictionary_ids(
+            &mut placements,
+            DICT_STRINGS_TYPE_ID,
+            &[MAX_SECTION_ROWS as u64 + 1],
+        )
+        .expect_err("one more distinct id crosses the cap");
+        assert!(error.is_admission_boundary());
+        assert!(matches!(
+            error,
+            SealError::Dictionary(DictionaryError::TooManyEntries {
+                entries,
+                max: MAX_SECTION_ROWS
+            }) if entries == MAX_SECTION_ROWS + 1
+        ));
+
+        let mut overlap = BTreeMap::new();
+        admit_dictionary_ids(&mut overlap, DICT_STRINGS_TYPE_ID, &[7]).expect("string");
+        assert!(matches!(
+            admit_dictionary_ids(&mut overlap, DICT_BLOBS_TYPE_ID, &[7]),
+            Err(SealError::Dictionary(
+                DictionaryError::PlacementConflict { str_id: 7 }
+            ))
+        ));
     }
 
     #[test]

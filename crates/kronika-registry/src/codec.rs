@@ -107,6 +107,11 @@ pub enum CodecError {
         /// The raw `num_rows` from Parquet metadata.
         raw: i64,
     },
+    /// Parquet metadata reports a negative or unrepresentable decoded size.
+    InvalidDecodedSize {
+        /// Raw column-chunk `uncompressed_size`.
+        raw: i64,
+    },
     /// The section byte length is above [`MAX_SECTION_BYTES`].
     SectionTooLarge {
         /// The byte length that exceeded the cap.
@@ -119,6 +124,13 @@ pub enum CodecError {
         /// The row-group count that exceeded the cap.
         groups: usize,
         /// The enforced cap.
+        max: usize,
+    },
+    /// Metadata-derived decode work would cross the one-section reader budget.
+    ReadWorkBudgetExceeded {
+        /// Conservative peak bytes required.
+        needed: usize,
+        /// Hard one-section work limit.
         max: usize,
     },
     /// A column required by the contract is absent from the decoded file.
@@ -198,11 +210,20 @@ impl fmt::Display for CodecError {
             Self::InvalidRowCount { raw } => {
                 write!(f, "section claims an invalid row count of {raw}")
             }
+            Self::InvalidDecodedSize { raw } => {
+                write!(f, "section claims an invalid decoded size of {raw}")
+            }
             Self::SectionTooLarge { len, max } => {
                 write!(f, "section is {len} bytes, above the cap of {max}")
             }
             Self::TooManyRowGroups { groups, max } => {
                 write!(f, "section has {groups} row groups, above the cap of {max}")
+            }
+            Self::ReadWorkBudgetExceeded { needed, max } => {
+                write!(
+                    f,
+                    "section decode requires {needed} bytes of work, above the cap of {max}"
+                )
             }
             Self::MissingColumn { name } => write!(f, "decoded section lacks column {name:?}"),
             Self::ColumnType { name } => write!(f, "decoded column {name:?} has the wrong type"),
@@ -244,8 +265,10 @@ impl Error for CodecError {
             Self::Parquet(err) => Some(err),
             Self::TooManyRows { .. }
             | Self::InvalidRowCount { .. }
+            | Self::InvalidDecodedSize { .. }
             | Self::SectionTooLarge { .. }
             | Self::TooManyRowGroups { .. }
+            | Self::ReadWorkBudgetExceeded { .. }
             | Self::MissingColumn { .. }
             | Self::ColumnType { .. }
             | Self::NullInRequiredColumn { .. }
@@ -731,13 +754,17 @@ const DECODE_BATCH_SIZE: usize = if MAX_SECTION_ROWS < 8192 {
 /// Build a Parquet reader after byte, row-group, and claimed-row caps pass.
 ///
 /// Returns row-group and claimed-row counts for stats and preallocation.
-fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize, usize), CodecError> {
+fn capped_reader(
+    contract: &TypeContract,
+    bytes: Bytes,
+) -> Result<(ParquetRecordBatchReader, usize, usize), CodecError> {
     if bytes.len() > MAX_SECTION_BYTES {
         return Err(CodecError::SectionTooLarge {
             len: bytes.len(),
             max: MAX_SECTION_BYTES,
         });
     }
+    let stored_bytes = bytes.len();
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
 
     let groups = builder.metadata().num_row_groups();
@@ -760,6 +787,34 @@ fn capped_reader(bytes: Bytes) -> Result<(ParquetRecordBatchReader, usize, usize
         Err(_) => return Err(CodecError::InvalidRowCount { raw: claimed }),
     };
 
+    let mut declared_uncompressed_bytes = 0_usize;
+    for row_group in builder.metadata().row_groups() {
+        for column in row_group.columns() {
+            let raw = column.uncompressed_size();
+            let bytes = usize::try_from(raw)
+                .map_err(|_overflow| CodecError::InvalidDecodedSize { raw })?;
+            declared_uncompressed_bytes =
+                declared_uncompressed_bytes
+                    .checked_add(bytes)
+                    .ok_or(CodecError::ReadWorkBudgetExceeded {
+                        needed: usize::MAX,
+                        max: crate::READ_WORK_MEMORY_LIMIT,
+                    })?;
+        }
+    }
+    let work = crate::compaction::read_work_memory_bound_for_contract(
+        contract,
+        row_count,
+        stored_bytes,
+        declared_uncompressed_bytes,
+    )?;
+    if work > crate::READ_WORK_MEMORY_LIMIT {
+        return Err(CodecError::ReadWorkBudgetExceeded {
+            needed: work,
+            max: crate::READ_WORK_MEMORY_LIMIT,
+        });
+    }
+
     Ok((
         builder.with_batch_size(DECODE_BATCH_SIZE).build()?,
         groups,
@@ -773,7 +828,7 @@ pub(crate) fn decode_section<Row>(
     section: VerifiedSection,
     mut push_rows: impl FnMut(&RecordBatch, &mut Vec<Row>) -> Result<(), CodecError>,
 ) -> Result<Vec<Row>, CodecError> {
-    let (reader, _row_groups, claimed_rows) = capped_reader(section.into_bytes())?;
+    let (reader, _row_groups, claimed_rows) = capped_reader(contract, section.into_bytes())?;
     if !schema_matches(&reader.schema(), contract) {
         return Err(CodecError::SchemaMismatch);
     }
@@ -824,7 +879,7 @@ pub(crate) fn decode_batches(
 ) -> Result<DecodedSection, CodecError> {
     let bytes = section.into_bytes();
     let bytes_in = bytes.len();
-    let (reader, row_groups, claimed_rows) = capped_reader(bytes)?;
+    let (reader, row_groups, claimed_rows) = capped_reader(contract, bytes)?;
 
     if !schema_matches(&reader.schema(), contract) {
         return Err(CodecError::SchemaMismatch);
