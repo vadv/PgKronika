@@ -40,7 +40,10 @@ async fn collect_two_windows_and_recover(world: &mut BddWorld) -> Result<()> {
         "abrupt process stop changed acknowledged journal bytes"
     );
 
-    let recovered = Collector::spawn_with_env_in(cluster, &extra_env, out_dir).await?;
+    let mut restart_env = extra_env.clone();
+    restart_env.retain(|(key, _value)| key != "KRONIKA_INTERVAL_S");
+    restart_env.push(("KRONIKA_INTERVAL_S".to_owned(), "0".to_owned()));
+    let recovered = Collector::spawn_with_env_in(cluster, &restart_env, out_dir).await?;
     let [segment] = recovered.recovered_seals() else {
         anyhow::bail!(
             "restart announced {} recovered segments, expected exactly one",
@@ -59,7 +62,7 @@ async fn collect_two_windows_and_recover(world: &mut BddWorld) -> Result<()> {
     let first_restart_log = recovered.stderr_captured();
     let out_dir = recovered.stop_gracefully().await?;
 
-    let restarted = Collector::spawn_with_env_in(cluster, &extra_env, out_dir).await?;
+    let mut restarted = Collector::spawn_with_env_in(cluster, &restart_env, out_dir).await?;
     ensure!(
         restarted.recovered_seals().is_empty(),
         "a clean binary restart tried to recover the reset journal again"
@@ -67,6 +70,14 @@ async fn collect_two_windows_and_recover(world: &mut BddWorld) -> Result<()> {
     ensure!(
         fs::read(&segment).context("read compact PGM after clean binary restart")? == sealed_bytes,
         "clean collector restart changed the sealed PGM"
+    );
+    let post_restart = restarted
+        .snapshot()
+        .await
+        .context("collect and seal through SIGUSR2 after the clean restart")?;
+    ensure!(
+        post_restart != segment,
+        "post-restart SIGUSR2 collection reused the recovered segment path"
     );
     let second_restart_log = restarted.stderr_captured();
     let out_dir = restarted.stop_gracefully().await?;
