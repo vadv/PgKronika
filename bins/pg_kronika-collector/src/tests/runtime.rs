@@ -1,11 +1,19 @@
 use crate::buffering::push_activity;
 use crate::plans_source::PlansSourceCache;
 use crate::scheduler::{Intervals, Scheduler, SourceKind};
-use crate::segments::{
-    SegmentState, open_collector_journal, seal_reason, verify_output_contract,
-};
+use crate::segments::{SegmentState, open_collector_journal, seal_reason, verify_output_contract};
 use crate::source_contracts::activity_dict_limits;
-use crate::timer_sleep_delay;
+use crate::{Wake, timer_sleep_delay};
+
+#[test]
+fn signal_wakes_separate_collection_from_rotation() {
+    assert!(Wake::Collect.forces_sources());
+    assert!(!Wake::Collect.seals_after_collection());
+    assert!(Wake::CollectAndSeal.forces_sources());
+    assert!(Wake::CollectAndSeal.seals_after_collection());
+    assert!(!Wake::Timer.forces_sources());
+    assert!(!Wake::Timer.seals_after_collection());
+}
 use kronika_source_pg::{ActivityRow, ActivityVersion};
 use kronika_writer::{Interner, SectionBuffers, dict};
 

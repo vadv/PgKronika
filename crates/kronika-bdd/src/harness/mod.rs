@@ -26,6 +26,7 @@ pub(crate) mod assert_row;
 pub(crate) mod dump;
 pub(crate) mod expected;
 pub(crate) mod oracle;
+pub(crate) mod pgm_compaction;
 pub(crate) mod session;
 pub(crate) mod snapshot;
 pub(crate) mod web;

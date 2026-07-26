@@ -111,6 +111,19 @@ impl Collector {
         self.wait_sealed().await
     }
 
+    /// Ask the production daemon to append one full collection window without
+    /// rotating the open segment, then wait for its explicit completion event.
+    pub(crate) async fn collect_window(&mut self) -> Result<()> {
+        let raw = self.child.id().context("collector already exited")?;
+        let pid = Pid::from_raw(i32::try_from(raw).context("collector pid out of range")?);
+        kill(pid, Signal::SIGUSR1).context("send SIGUSR1 to the collector")?;
+        let line = next_line(&mut self.lines).await?;
+        if line != "collected" {
+            bail!("expected 'collected', got {line:?}");
+        }
+        Ok(())
+    }
+
     /// Wait for the collector to announce the next sealed segment on its own,
     /// without sending a signal — the internal-timer path.
     pub(crate) async fn wait_sealed(&mut self) -> Result<PathBuf> {
@@ -131,11 +144,36 @@ impl Collector {
             .map_or(0, |meta| meta.len())
     }
 
+    pub(crate) fn output_dir(&self) -> Result<&std::path::Path> {
+        self.out_dir
+            .as_ref()
+            .map(tempfile::TempDir::path)
+            .context("output directory already taken")
+    }
+
     /// Kill the collector without any chance to seal, keeping its output
     /// directory for the process that restarts in it.
     pub(crate) async fn kill_abruptly(mut self) -> Result<tempfile::TempDir> {
         self.child.start_kill().context("SIGKILL the collector")?;
         self.child.wait().await.context("reap the collector")?;
+        self.out_dir
+            .take()
+            .context("output directory already taken")
+    }
+
+    /// Stop after the daemon has reached its signal select loop and return the
+    /// unchanged owned output directory for another binary instance.
+    pub(crate) async fn stop_gracefully(mut self) -> Result<tempfile::TempDir> {
+        let raw = self.child.id().context("collector already exited")?;
+        let pid = Pid::from_raw(i32::try_from(raw).context("collector pid out of range")?);
+        kill(pid, Signal::SIGTERM).context("send SIGTERM to the collector")?;
+        let status = timeout(COLLECTOR_TIMEOUT, self.child.wait())
+            .await
+            .context("collector did not stop before the timeout")?
+            .context("reap the collector")?;
+        if !status.success() {
+            bail!("collector exited {status}: {}", self.stderr_captured());
+        }
         self.out_dir
             .take()
             .context("output directory already taken")

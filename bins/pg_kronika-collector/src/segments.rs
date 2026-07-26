@@ -266,7 +266,7 @@ pub(crate) fn append_window_and_maybe_seal(
     config: &Config,
     segment: &mut SegmentState,
     ts: i64,
-    forced: bool,
+    seal_after_collection: bool,
     flushed: &FlushedPart,
 ) -> Result<Vec<(PathBuf, &'static str)>> {
     let mut sealed = Vec::new();
@@ -364,7 +364,7 @@ pub(crate) fn append_window_and_maybe_seal(
     segment.on_window_appended(ts, now, next_admission);
     let age = Duration::from_secs(config.segment_max_age_secs);
     if let Some(reason) = seal_reason(
-        forced,
+        seal_after_collection,
         journal.bytes(),
         config.segment_max_bytes,
         segment.age_expired(now, age),

@@ -216,7 +216,8 @@ fn build_fixture_part(sections: &[FixtureSection], min_ts_us: i64, max_ts_us: i6
         let decoded = decode_any(section.type_id, verified).expect("decode fixture section");
         assert_eq!(
             decoded.stats.rows,
-            usize::try_from(section.rows).expect("fixture rows fit usize")
+            usize::try_from(section.rows).expect("fixture rows fit usize"),
+            "fixture section row accounting must survive decode"
         );
         let group = grouped.entry(section.type_id).or_default();
         group.0 = group

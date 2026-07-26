@@ -17,6 +17,10 @@ pub(crate) struct TimelineBaseline {
     overview: Value,
     events: Value,
     health: Value,
+    section: Value,
+    diff: Value,
+    anomalies: Value,
+    incidents: Value,
     sidecar: Vec<u8>,
 }
 
@@ -25,6 +29,10 @@ struct TimelineResponses {
     overview: Value,
     events: Value,
     health: Value,
+    section: Value,
+    diff: Value,
+    anomalies: Value,
+    incidents: Value,
 }
 
 /// Missing sibling → cold build → graceful restart → durable zero-PGM hit.
@@ -80,6 +88,10 @@ pub(crate) async fn establish_restart_baseline(
         overview: normalized(first_responses.overview),
         events: normalized(first_responses.events),
         health: normalized(first_responses.health),
+        section: normalized(first_responses.section),
+        diff: normalized(first_responses.diff),
+        anomalies: normalized(first_responses.anomalies),
+        incidents: normalized(first_responses.incidents),
         sidecar: canonical,
     })
 }
@@ -436,6 +448,22 @@ impl TimelineBaseline {
             normalized(responses.health.clone()) == self.health,
             "real-process health changed across lifecycle state"
         );
+        ensure!(
+            normalized(responses.section.clone()) == self.section,
+            "real-process section response changed across lifecycle state"
+        );
+        ensure!(
+            normalized(responses.diff.clone()) == self.diff,
+            "real-process diff response changed across lifecycle state"
+        );
+        ensure!(
+            normalized(responses.anomalies.clone()) == self.anomalies,
+            "real-process anomaly response changed across lifecycle state"
+        );
+        ensure!(
+            normalized(responses.incidents.clone()) == self.incidents,
+            "real-process incident response changed across lifecycle state"
+        );
         Ok(())
     }
 }
@@ -453,6 +481,22 @@ fn assert_timeline_equal(expected: &TimelineResponses, actual: &TimelineResponse
         normalized(expected.health.clone()) == normalized(actual.health.clone()),
         "health changed across a graceful real-process restart"
     );
+    ensure!(
+        normalized(expected.section.clone()) == normalized(actual.section.clone()),
+        "section rows changed across a graceful real-process restart"
+    );
+    ensure!(
+        normalized(expected.diff.clone()) == normalized(actual.diff.clone()),
+        "diffs changed across a graceful real-process restart"
+    );
+    ensure!(
+        normalized(expected.anomalies.clone()) == normalized(actual.anomalies.clone()),
+        "anomalies changed across a graceful real-process restart"
+    );
+    ensure!(
+        normalized(expected.incidents.clone()) == normalized(actual.incidents.clone()),
+        "incidents changed across a graceful real-process restart"
+    );
     Ok(())
 }
 
@@ -462,6 +506,29 @@ async fn timeline(client: WebClient, case: &WebCase) -> Result<TimelineResponses
     let overview = request_overview(client, case).await?;
     let events = client.get_json(&events_target(case, 1_000, None)).await?;
     let health = client.get_json(&health_target(case)).await?;
+    let section = client.get_json(&section_target(case)).await?;
+    let rows = section["rows"]
+        .as_array()
+        .context("real-process section response has no rows array")?;
+    ensure!(
+        !rows.is_empty(),
+        "real-process section response returned no instance metadata rows"
+    );
+    let diff = client.get_json(&diff_target(case)).await?;
+    ensure!(
+        diff["series"].is_array(),
+        "real-process diff response has no series array"
+    );
+    let anomalies = client.get_json(&anomalies_target(case)).await?;
+    ensure!(
+        anomalies["episodes"].is_array(),
+        "real-process anomaly response has no episodes array"
+    );
+    let incidents = client.get_json(&incidents_target(case)).await?;
+    ensure!(
+        incidents["incidents"].is_array(),
+        "real-process incident response has no incidents array"
+    );
     let healthz = client.get("/healthz").await?;
     ensure!(
         healthz.status == 200,
@@ -486,6 +553,10 @@ async fn timeline(client: WebClient, case: &WebCase) -> Result<TimelineResponses
         overview,
         events,
         health,
+        section,
+        diff,
+        anomalies,
+        incidents,
     })
 }
 
@@ -509,6 +580,42 @@ fn health_target(case: &WebCase) -> String {
         .expect("lifecycle range is nonempty");
     format!(
         "/v1/timeline/health?source={}&from={}&to={}&step={step}",
+        case.source_id(),
+        case.range_start_us(),
+        case.to_us()
+    )
+}
+
+fn section_target(case: &WebCase) -> String {
+    format!(
+        "/v1/section/instance_metadata?source={}&from={}&to={}&limit=10000",
+        case.source_id(),
+        case.range_start_us(),
+        case.to_us()
+    )
+}
+
+fn diff_target(case: &WebCase) -> String {
+    format!(
+        "/v1/section/pg_stat_database/diff?source={}&from={}&to={}",
+        case.source_id(),
+        case.range_start_us(),
+        case.to_us()
+    )
+}
+
+fn anomalies_target(case: &WebCase) -> String {
+    format!(
+        "/v1/anomalies?source={}&from={}&to={}&section=pg_stat_database",
+        case.source_id(),
+        case.range_start_us(),
+        case.to_us()
+    )
+}
+
+fn incidents_target(case: &WebCase) -> String {
+    format!(
+        "/v1/incidents?source={}&from={}&to={}&section=pg_stat_database",
         case.source_id(),
         case.range_start_us(),
         case.to_us()
@@ -597,6 +704,7 @@ fn remove_process_tokens(value: &mut Value) {
     match value {
         Value::Object(object) => {
             object.remove("next_cursor");
+            object.remove("data_age_seconds");
             for child in object.values_mut() {
                 remove_process_tokens(child);
             }
