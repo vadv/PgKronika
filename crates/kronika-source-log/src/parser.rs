@@ -56,6 +56,9 @@ pub(crate) enum ParsedLine<'a> {
         kind: ContinuationKind,
         text: &'a str,
     },
+    /// Verbose diagnostic metadata that must not detach later continuations
+    /// from the preceding error.
+    DiagnosticMetadata,
 }
 
 /// Structured stderr continuation payload.
@@ -113,6 +116,7 @@ const DETAIL_PREFIXES: &[&str] = &["DETAIL:  ", "ПОДРОБНОСТИ:  "];
 const HINT_PREFIXES: &[&str] = &["HINT:  ", "ПОДСКАЗКА:  "];
 const CONTEXT_PREFIXES: &[&str] = &["CONTEXT:  ", "КОНТЕКСТ:  "];
 const STATEMENT_PREFIXES: &[&str] = &["STATEMENT:  ", "ОПЕРАТОР:  "];
+const DIAGNOSTIC_METADATA_PREFIXES: &[&str] = &["LOCATION:  "];
 
 pub(crate) fn parse_stderr_line(line: &str) -> Option<ParsedLine<'_>> {
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -145,6 +149,13 @@ pub(crate) fn parse_stderr_line(line: &str) -> Option<ParsedLine<'_>> {
                 return Some(parsed);
             }
         }
+    }
+
+    if DIAGNOSTIC_METADATA_PREFIXES
+        .iter()
+        .any(|prefix| line.contains(prefix))
+    {
+        return Some(ParsedLine::DiagnosticMetadata);
     }
 
     None
@@ -363,6 +374,16 @@ mod tests {
                 kind: ContinuationKind::Context,
                 text: "while updating tuple"
             }
+        );
+    }
+
+    #[test]
+    fn recognizes_verbose_location_metadata() {
+        assert_eq!(
+            parse_stderr_line(
+                "2026-07-05 12:30:49 UTC [42]: LOCATION:  ProcessInterrupts, postgres.c:3363"
+            ),
+            Some(ParsedLine::DiagnosticMetadata)
         );
     }
 

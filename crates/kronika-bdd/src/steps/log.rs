@@ -22,6 +22,13 @@ async fn collector_observes_log_rotation(world: &mut BddWorld) -> Result<()> {
     Ok(())
 }
 
+/// Generate a real backend timeout after the collector has established EOF.
+#[when("the running collector captures a real PostgreSQL statement timeout")]
+async fn collector_captures_statement_timeout(world: &mut BddWorld) -> Result<()> {
+    snapshot::take_after_live_statement_timeout(&mut world.harness).await?;
+    Ok(())
+}
+
 /// Assert both status transitions retained their resolved physical paths.
 #[then("pg_log_source_status contains two distinct source_path values")]
 async fn two_log_source_paths(world: &mut BddWorld) -> Result<()> {

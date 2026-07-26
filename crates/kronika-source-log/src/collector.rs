@@ -1166,6 +1166,14 @@ fn parse_stderr_records(
                 temp_statement_active = kind == ContinuationKind::Statement
                     && apply_temp_statement(&mut records.temp_files, last_temp_file, text);
             }
+            Some(ParsedLine::DiagnosticMetadata) => {
+                last_continuation = None;
+                lock_detail_active = false;
+                lock_context_active = false;
+                lock_statement_active = false;
+                lifecycle_detail_active = false;
+                temp_statement_active = false;
+            }
             None => {
                 last_key = None;
                 last_continuation = None;
@@ -2522,6 +2530,29 @@ mod tests {
             batch.errors[0].statement.as_deref(),
             Some("select * from a")
         );
+    }
+
+    #[tokio::test]
+    async fn preserves_statement_after_verbose_location_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("postgresql.log");
+        std::fs::write(
+            &log,
+            "2026-07-05 12:00:00 UTC [1]: ERROR:  57014: canceling statement due to statement timeout\n\
+             2026-07-05 12:00:00 UTC [1]: LOCATION:  ProcessInterrupts, postgres.c:3363\n\
+             2026-07-05 12:00:00 UTC [1]: STATEMENT:  SELECT pg_sleep(0.2)\n",
+        )
+        .expect("write");
+        let mut collector =
+            LogCollector::new(fixture_config(log, dir.path().join("state"))).expect("collector");
+
+        let batch = collector.collect(None, 1).await;
+
+        assert_eq!(batch.errors.len(), 1);
+        let row = &batch.errors[0];
+        assert_eq!(row.category, ErrorCategory::Timeout);
+        assert_eq!(row.sqlstate.as_deref(), Some("57014"));
+        assert_eq!(row.statement.as_deref(), Some("SELECT pg_sleep(0.2)"));
     }
 
     #[tokio::test]
