@@ -683,6 +683,27 @@ fn assert_changed_success_schemas(document: &serde_json::Value) {
         document["components"]["schemas"]["DiffNoDataPoint"]["properties"]["nodata"]["enum"],
         serde_json::json!(["reset", "gap", "first_point", "anomaly", "not_collected"])
     );
+    assert_eq!(
+        document["components"]["schemas"]["PlanBufferCoverage"]["properties"]["instance_identity"]
+            ["const"],
+        "pg_system_identifier"
+    );
+    for schema in ["PlanQuality", "AnomalyCoverage"] {
+        let object = &document["components"]["schemas"][schema];
+        let required: std::collections::BTreeSet<_> = object["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        let properties: std::collections::BTreeSet<_> = object["properties"]
+            .as_object()
+            .expect("schema properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(required, properties, "{schema} fields must all be required");
+    }
 }
 
 fn assert_timeline_contract(document: &serde_json::Value) {

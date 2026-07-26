@@ -330,7 +330,7 @@ fn ossc_plan_row(
 
 fn plan_reset_row(
     ts: i64,
-    reset_at: i64,
+    reset_at: Option<i64>,
     extension_version: StrId,
     compute_query_id: StrId,
 ) -> ResetMetadata {
@@ -339,7 +339,7 @@ fn plan_reset_row(
         postmaster_start_time: Ts(1),
         pg_stat_database_reset_max_at: None,
         pg_stat_statements_reset_at: None,
-        pg_store_plans_reset_at: Some(Ts(reset_at)),
+        pg_store_plans_reset_at: reset_at.map(Ts),
         pg_stat_bgwriter_reset_at: None,
         pg_stat_checkpointer_reset_at: None,
         pg_stat_wal_reset_at: None,
@@ -486,15 +486,23 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
         });
     }
 
-    let mut reset_rows = vec![plan_reset_row(0, 1, extension_version, compute_query_id)];
-    if matches!(fixture, OsscPlanFixture::StableAcrossReset) {
-        reset_rows.push(plan_reset_row(
-            RESET_MINUTE * PLAN_MINUTE_US,
-            RESET_MINUTE * PLAN_MINUTE_US,
-            extension_version,
-            compute_query_id,
-        ));
-    }
+    let reset_rows = (0..SNAPSHOTS)
+        .map(|minute| {
+            let reset_at = if matches!(fixture, OsscPlanFixture::StableAcrossReset)
+                && minute >= RESET_MINUTE
+            {
+                RESET_MINUTE * PLAN_MINUTE_US
+            } else {
+                1
+            };
+            plan_reset_row(
+                minute * PLAN_MINUTE_US,
+                Some(reset_at),
+                extension_version,
+                compute_query_id,
+            )
+        })
+        .collect::<Vec<_>>();
     let metadata = InstanceMetadata {
         ts: Ts(0),
         hostname,
@@ -660,23 +668,16 @@ fn write_vadv_plan_anomaly_segment(dir: &std::path::Path) -> i64 {
             collected: 1,
         });
     }
-    let reset = ResetMetadata {
-        ts: Ts(0),
-        postmaster_start_time: Ts(1),
-        pg_stat_database_reset_max_at: None,
-        pg_stat_statements_reset_at: None,
-        pg_store_plans_reset_at: None,
-        pg_stat_bgwriter_reset_at: None,
-        pg_stat_checkpointer_reset_at: None,
-        pg_stat_wal_reset_at: None,
-        pg_stat_archiver_reset_at: None,
-        pg_stat_io_reset_at: None,
-        ext_pg_stat_statements_version: None,
-        ext_pg_store_plans_version: Some(extension_version),
-        compute_query_id: Some(compute_query_id),
-        track_io_timing: Some(true),
-        track_wal_io_timing: Some(false),
-    };
+    let resets = (0..SNAPSHOTS)
+        .map(|minute| {
+            plan_reset_row(
+                minute * PLAN_MINUTE_US,
+                None,
+                extension_version,
+                compute_query_id,
+            )
+        })
+        .collect::<Vec<_>>();
     let metadata = InstanceMetadata {
         ts: Ts(0),
         hostname,
@@ -693,7 +694,7 @@ fn write_vadv_plan_anomaly_segment(dir: &std::path::Path) -> i64 {
     let dictionary = kronika_writer::dict::encode(interner.window()).expect("encode dictionary");
     let plans = PgStorePlansVadvV1::encode(&plan_rows).expect("encode vadv plan rows");
     let coverage = SnapshotCoverageV1::encode(&coverage_rows).expect("encode plan coverage");
-    let resets = ResetMetadata::encode(&[reset]).expect("encode plan reset metadata");
+    let resets_body = ResetMetadata::encode(&resets).expect("encode plan reset metadata");
     let metadata = InstanceMetadata::encode(&[metadata]).expect("encode plan instance metadata");
     let mut sections: Vec<SectionInput<'_>> = dictionary
         .iter()
@@ -716,8 +717,8 @@ fn write_vadv_plan_anomaly_segment(dir: &std::path::Path) -> i64 {
         },
         SectionInput {
             type_id: 1_020_001,
-            rows: 1,
-            body: &resets,
+            rows: u32::try_from(resets.len()).expect("reset row count"),
+            body: &resets_body,
         },
         SectionInput {
             type_id: 1_021_001,
@@ -802,6 +803,12 @@ async fn plan_signals_follow_registry_storage_diff_and_http_with_typed_evidence(
     assert_eq!(body["status"], "signals_detected");
     assert_eq!(body["complete"], true);
     assert_eq!(body["coverage"]["plan_sections_analyzed"], 1);
+    assert!(
+        body["coverage"]["plan_positions_evaluated"]
+            .as_u64()
+            .expect("evaluated plan positions")
+            > 0
+    );
     assert_eq!(
         body["plan_analysis"]["pg_store_plans_ossc"]["status"],
         "complete"
@@ -937,7 +944,7 @@ async fn missing_system_identifier_makes_plan_evidence_partial() {
     let analysis = &body["plan_analysis"]["pg_store_plans_ossc"];
     assert_eq!(analysis["status"], "partial");
     assert!(
-        analysis["quality"]["instance_identity_fallback_intervals"]
+        analysis["quality"]["instance_identity_unavailable_intervals"]
             .as_u64()
             .expect("missing system identity count")
             > 0

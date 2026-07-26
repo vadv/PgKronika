@@ -504,8 +504,9 @@ fn plan_analyzer_provenance(world: &mut BddWorld, section: String) -> Result<()>
                 && cell_u64(marker.get("collected")) == Some(plan_rows),
             "{section} coverage at {ts} is not exact: {marker:?}"
         );
-        let reset = latest_row_at(&resets, ts)
-            .with_context(|| format!("no reset_metadata at or before {section} timestamp {ts}"))?;
+        let reset = exact_row_at(&resets, ts).with_context(|| {
+            format!("no coordinated reset_metadata for {section} timestamp {ts}")
+        })?;
         ensure!(
             resolved_nonempty(reset.get("ext_pg_store_plans_version"), &reset_dict)
                 && resolved_nonempty(reset.get("compute_query_id"), &reset_dict),
@@ -523,6 +524,10 @@ fn plan_analyzer_provenance(world: &mut BddWorld, section: String) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn exact_row_at(rows: &[kronika_registry::Row], ts: i64) -> Option<&kronika_registry::Row> {
+    rows.iter().find(|row| row.get("ts") == Some(&Cell::Ts(ts)))
 }
 
 fn latest_row_at(rows: &[kronika_registry::Row], ts: i64) -> Option<&kronika_registry::Row> {

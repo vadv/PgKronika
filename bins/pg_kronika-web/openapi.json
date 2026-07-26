@@ -1015,7 +1015,7 @@
           "complete_for_evidence": { "type": "boolean", "const": true },
           "retained_plan_continuity": { "type": "string", "const": "every_observed_plan_snapshot" },
           "reset_marker": { "type": "string", "enum": ["reset_metadata", "entry_first_call"] },
-          "instance_identity": { "type": "string", "enum": ["pg_system_identifier", "source_node_fallback"] },
+          "instance_identity": { "type": "string", "const": "pg_system_identifier" },
           "parallelism": { "type": "string", "const": "extension_execution_aggregate_not_worker_normalized" }
         }
       },
@@ -1090,7 +1090,7 @@
       "PlanQuality": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["snapshot_rows", "snapshots_total", "full_snapshots", "truncated_snapshots", "restricted_or_failed_snapshots", "coverage_unknown_snapshots", "collection_coverage_missing", "collection_coverage_conflicts", "invalid_rows", "membership_boundaries", "plan_set_additions", "plan_set_removals", "counter_epoch_boundaries", "reset_boundaries", "support_gap_intervals", "metadata_unknown_intervals", "extension_version_boundaries", "instance_boundaries", "instance_identity_fallback_intervals", "unsupported_version_intervals", "query_id_disabled_intervals", "invalid_counter_intervals"],
+        "required": ["snapshot_rows", "snapshots_total", "full_snapshots", "truncated_snapshots", "restricted_or_failed_snapshots", "coverage_unknown_snapshots", "support_pages_incomplete", "support_gap_ranges", "plan_gap_ranges", "invalid_support_rows", "snapshot_coverage_conflicts", "collection_coverage_missing", "collection_coverage_conflicts", "reset_metadata_conflicts", "instance_metadata_conflicts", "invalid_rows", "membership_boundaries", "plan_set_additions", "plan_set_removals", "counter_epoch_boundaries", "reset_boundaries", "plan_gap_intervals", "support_gap_intervals", "metadata_unknown_intervals", "extension_version_boundaries", "instance_boundaries", "instance_identity_unavailable_intervals", "unsupported_version_intervals", "query_id_disabled_intervals", "invalid_counter_intervals"],
         "properties": {
           "snapshot_rows": { "type": "integer", "minimum": 0 },
           "snapshots_total": { "type": "integer", "minimum": 0 },
@@ -1098,19 +1098,27 @@
           "truncated_snapshots": { "type": "integer", "minimum": 0 },
           "restricted_or_failed_snapshots": { "type": "integer", "minimum": 0 },
           "coverage_unknown_snapshots": { "type": "integer", "minimum": 0 },
+          "support_pages_incomplete": { "type": "integer", "minimum": 0 },
+          "support_gap_ranges": { "type": "integer", "minimum": 0 },
+          "plan_gap_ranges": { "type": "integer", "minimum": 0 },
+          "invalid_support_rows": { "type": "integer", "minimum": 0 },
+          "snapshot_coverage_conflicts": { "type": "integer", "minimum": 0 },
           "collection_coverage_missing": { "type": "integer", "minimum": 0 },
           "collection_coverage_conflicts": { "type": "integer", "minimum": 0 },
+          "reset_metadata_conflicts": { "type": "integer", "minimum": 0 },
+          "instance_metadata_conflicts": { "type": "integer", "minimum": 0 },
           "invalid_rows": { "type": "integer", "minimum": 0 },
           "membership_boundaries": { "type": "integer", "minimum": 0 },
           "plan_set_additions": { "type": "integer", "minimum": 0 },
           "plan_set_removals": { "type": "integer", "minimum": 0 },
           "counter_epoch_boundaries": { "type": "integer", "minimum": 0 },
           "reset_boundaries": { "type": "integer", "minimum": 0 },
+          "plan_gap_intervals": { "type": "integer", "minimum": 0 },
           "support_gap_intervals": { "type": "integer", "minimum": 0 },
           "metadata_unknown_intervals": { "type": "integer", "minimum": 0 },
           "extension_version_boundaries": { "type": "integer", "minimum": 0 },
           "instance_boundaries": { "type": "integer", "minimum": 0 },
-          "instance_identity_fallback_intervals": { "type": "integer", "minimum": 0 },
+          "instance_identity_unavailable_intervals": { "type": "integer", "minimum": 0 },
           "unsupported_version_intervals": { "type": "integer", "minimum": 0 },
           "query_id_disabled_intervals": { "type": "integer", "minimum": 0 },
           "invalid_counter_intervals": { "type": "integer", "minimum": 0 }
@@ -1186,12 +1194,13 @@
       "AnomalyCoverage": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["sections_requested", "sections_scanned", "sections_skipped", "plan_sections_analyzed"],
+        "required": ["sections_requested", "sections_scanned", "sections_skipped", "plan_sections_analyzed", "plan_positions_evaluated"],
         "properties": {
           "sections_requested": { "type": "integer", "minimum": 0 },
           "sections_scanned": { "type": "integer", "minimum": 0 },
           "sections_skipped": { "type": "integer", "minimum": 0 },
-          "plan_sections_analyzed": { "type": "integer", "minimum": 0 }
+          "plan_sections_analyzed": { "type": "integer", "minimum": 0 },
+          "plan_positions_evaluated": { "type": "integer", "minimum": 0 }
         }
       },
       "AnomalyTruncation": {

@@ -191,23 +191,25 @@ fn plan_evidence_pgm() -> Result<Vec<u8>> {
         });
     }
 
-    let reset = ResetMetadata {
-        ts: Ts(0),
-        postmaster_start_time: Ts(1),
-        pg_stat_database_reset_max_at: None,
-        pg_stat_statements_reset_at: None,
-        pg_store_plans_reset_at: Some(Ts(1)),
-        pg_stat_bgwriter_reset_at: None,
-        pg_stat_checkpointer_reset_at: None,
-        pg_stat_wal_reset_at: None,
-        pg_stat_archiver_reset_at: None,
-        pg_stat_io_reset_at: None,
-        ext_pg_stat_statements_version: None,
-        ext_pg_store_plans_version: Some(extension_version),
-        compute_query_id: Some(compute_query_id),
-        track_io_timing: Some(true),
-        track_wal_io_timing: Some(false),
-    };
+    let resets = (0..SNAPSHOTS)
+        .map(|minute| ResetMetadata {
+            ts: Ts(minute * MINUTE_US),
+            postmaster_start_time: Ts(1),
+            pg_stat_database_reset_max_at: None,
+            pg_stat_statements_reset_at: None,
+            pg_store_plans_reset_at: Some(Ts(1)),
+            pg_stat_bgwriter_reset_at: None,
+            pg_stat_checkpointer_reset_at: None,
+            pg_stat_wal_reset_at: None,
+            pg_stat_archiver_reset_at: None,
+            pg_stat_io_reset_at: None,
+            ext_pg_stat_statements_version: None,
+            ext_pg_store_plans_version: Some(extension_version),
+            compute_query_id: Some(compute_query_id),
+            track_io_timing: Some(true),
+            track_wal_io_timing: Some(false),
+        })
+        .collect::<Vec<_>>();
     let instance = InstanceMetadata {
         ts: Ts(0),
         hostname,
@@ -225,7 +227,7 @@ fn plan_evidence_pgm() -> Result<Vec<u8>> {
         kronika_writer::dict::encode(interner.window()).context("encode fixture dictionary")?;
     let plans_body = PgStorePlansOsscV1::encode(&plans).context("encode plan evidence")?;
     let coverage_body = SnapshotCoverageV1::encode(&coverage).context("encode plan coverage")?;
-    let reset_body = ResetMetadata::encode(&[reset]).context("encode plan reset metadata")?;
+    let reset_body = ResetMetadata::encode(&resets).context("encode plan reset metadata")?;
     let instance_body =
         InstanceMetadata::encode(&[instance]).context("encode plan instance metadata")?;
     let mut sections: Vec<SectionInput<'_>> = dictionary
@@ -249,7 +251,7 @@ fn plan_evidence_pgm() -> Result<Vec<u8>> {
         },
         SectionInput {
             type_id: 1_020_001,
-            rows: 1,
+            rows: u32::try_from(resets.len())?,
             body: &reset_body,
         },
         SectionInput {

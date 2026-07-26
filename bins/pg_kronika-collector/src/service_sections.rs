@@ -4,6 +4,7 @@ use crate::logging::{
     log_collection_start, log_event, section_name,
 };
 use crate::plans_source::PlansSourceCache;
+use crate::reset_source::{ExtensionResetSource, collect_reset_metadata};
 use crate::scheduler::{DueSet, SourceKind};
 use crate::statements_source::{StatementsSourceCache, statement_client};
 use anyhow::{Context, Result};
@@ -12,9 +13,7 @@ use kronika_source_pg::instance_metadata::{
     PgInstanceFacts, collect_pg_instance_facts, pg_system_identifier,
 };
 use kronika_source_pg::pool::ConnectionPool;
-use kronika_source_pg::reset_metadata::{
-    ResetBase, ResetExtensions, collect_reset_base, statements_reset_at, store_plans_reset_at,
-};
+use kronika_source_pg::reset_metadata::{ResetBase, ResetExtensions};
 use kronika_source_pg::settings::{SettingsRow, collect_settings};
 use std::time::Instant;
 use tokio_postgres::Client;
@@ -30,18 +29,32 @@ pub(crate) struct ServiceSections {
 pub(crate) async fn collect_service_sections(
     pool: &ConnectionPool,
     major: u32,
-    config: &Config,
     statements_cache: &StatementsSourceCache,
     plans_cache: &PlansSourceCache,
     due: &DueSet,
+    instance: Option<InstanceFacts>,
+    plan_reset: Option<(ResetBase, ResetExtensions)>,
 ) -> Result<ServiceSections> {
-    let reset = if due.has(SourceKind::ResetMetadata) {
-        Some(collect_reset_metadata_all(pool, major, statements_cache, plans_cache).await?)
-    } else {
-        None
-    };
-    let instance = if due.has(SourceKind::InstanceMetadata) {
-        Some(collect_instance_facts(pool.main(), config).await?)
+    let reset = if let Some(reset) = plan_reset {
+        Some(reset)
+    } else if due.has(SourceKind::ResetMetadata) {
+        let statements = statements_cache
+            .selected
+            .as_ref()
+            .map(|cached| ExtensionResetSource {
+                client: statement_client(pool, &cached.source),
+                version: &cached.extversion,
+                label: cached.source.label(),
+            });
+        let plans = plans_cache
+            .selected
+            .as_ref()
+            .map(|cached| ExtensionResetSource {
+                client: statement_client(pool, &cached.source),
+                version: &cached.extversion,
+                label: cached.source.label(),
+            });
+        Some(collect_reset_metadata(pool.main(), major, statements.as_ref(), plans.as_ref()).await?)
     } else {
         None
     };
@@ -71,70 +84,19 @@ pub(crate) async fn collect_service_sections(
     })
 }
 
-/// Assemble `reset_metadata`: the base from the main connection plus the
-/// extension info views read through the discovered statements and plans
-/// sources. An info-view failure degrades that one timestamp to `NULL`.
-async fn collect_reset_metadata_all(
+/// Collect a due instance fingerprint before any plan snapshot.
+///
+/// A newly opened segment must establish its instance identity before a plan
+/// row can refer to that identity at a later timestamp.
+pub(crate) async fn collect_due_instance(
     pool: &ConnectionPool,
-    major: u32,
-    statements_cache: &StatementsSourceCache,
-    plans_cache: &PlansSourceCache,
-) -> Result<(ResetBase, ResetExtensions)> {
-    let type_id = 1_020_001;
-    let started = Instant::now();
-    log_collection_start(type_id, "main");
-    let base = match collect_reset_base(pool.main(), major).await {
-        Ok(base) => {
-            log_collection_finish(type_id, "main", 1, started.elapsed());
-            base
-        }
-        Err(err) => {
-            log_collection_failure(type_id, "main", &err, started.elapsed());
-            return Err(err).context("collect reset metadata");
-        }
-    };
-    let mut ext = ResetExtensions::default();
-    if let Some(cached) = &statements_cache.selected {
-        ext.statements_version = Some(cached.extversion.clone());
-        if let Some(client) = statement_client(pool, &cached.source) {
-            match statements_reset_at(client).await {
-                Ok(reset) => ext.statements_reset_at = reset,
-                Err(err) => log_event(
-                    LogLevel::Warn,
-                    "collection_degraded",
-                    &[
-                        field("collection", section_name(type_id)),
-                        field("type_id", type_id),
-                        field("layout_id", layout_id(type_id)),
-                        field("source", cached.source.label()),
-                        field("reason", "pg_stat_statements_info_failed"),
-                        field("error", &err),
-                    ],
-                ),
-            }
-        }
+    config: &Config,
+    due: &DueSet,
+) -> Result<Option<InstanceFacts>> {
+    if due.has(SourceKind::InstanceMetadata) {
+        return Ok(Some(collect_instance_facts(pool.main(), config).await?));
     }
-    if let Some(cached) = &plans_cache.selected {
-        ext.store_plans_version = Some(cached.extversion.clone());
-        if let Some(client) = statement_client(pool, &cached.source) {
-            match store_plans_reset_at(client).await {
-                Ok(reset) => ext.store_plans_reset_at = reset,
-                Err(err) => log_event(
-                    LogLevel::Warn,
-                    "collection_degraded",
-                    &[
-                        field("collection", section_name(type_id)),
-                        field("type_id", type_id),
-                        field("layout_id", layout_id(type_id)),
-                        field("source", cached.source.label()),
-                        field("reason", "pg_store_plans_info_failed"),
-                        field("error", &err),
-                    ],
-                ),
-            }
-        }
-    }
-    Ok((base, ext))
+    Ok(None)
 }
 
 /// Fields written to `instance_metadata`, joined from `PostgreSQL` and the host.

@@ -14,7 +14,8 @@ pub(crate) const MIN_CUR: usize = 3;
 /// Stable machine identifier for the generic robust-window signal.
 pub(crate) const ROBUST_SIGNAL_ID: &str = "metric.robust_window_deviation.v1";
 
-/// Maximum point-position pairs scored by one HTTP request.
+/// Maximum timeline-unit/position pairs scored by one HTTP request. Each
+/// column charges its points plus one fixed unit for the position loop.
 pub(crate) const MAX_SCORE_WORK: usize = 50_000_000;
 
 /// Per-class absolute scale floors.
@@ -285,11 +286,15 @@ fn score_work(diffs: &[SeriesDiff], gauges: &[SeriesValues], positions: usize) -
     let diff_points = diffs
         .iter()
         .flat_map(|series| &series.columns)
-        .try_fold(0_usize, |sum, column| sum.checked_add(column.points.len()))?;
+        .try_fold(0_usize, |sum, column| {
+            sum.checked_add(column.points.len().checked_add(1)?)
+        })?;
     let gauge_points = gauges
         .iter()
         .flat_map(|series| &series.columns)
-        .try_fold(0_usize, |sum, column| sum.checked_add(column.points.len()))?;
+        .try_fold(0_usize, |sum, column| {
+            sum.checked_add(column.points.len().checked_add(1)?)
+        })?;
     diff_points
         .checked_add(gauge_points)?
         .checked_mul(positions)
@@ -333,24 +338,29 @@ fn scan_timeline(
             episode,
         });
     }
-    counts.episodes_truncated = counts
-        .episodes_truncated
-        .saturating_add(rank_section(hits, hit_limit) as u64);
+    if hits.len() > retention_ceiling(hit_limit) {
+        counts.episodes_truncated = counts
+            .episodes_truncated
+            .saturating_add(rank_section(hits, hit_limit) as u64);
+    }
+}
+
+const fn retention_ceiling(limit: usize) -> usize {
+    limit.saturating_mul(2)
 }
 
 fn rank_section(hits: &mut Vec<EpisodeHit>, limit: usize) -> usize {
     if hits.len() <= limit {
         return 0;
     }
-    let removed = hits.len() - limit;
-    hits.sort_by(|a, b| b.episode.peak.m.abs().total_cmp(&a.episode.peak.m.abs()));
+    hits.sort_by(compare_hits);
+    let removed = hits.len().saturating_sub(limit);
     hits.truncate(limit);
     removed
 }
 
-/// Rank episodes across sections by peak `|m|`, descending, and truncate to
-/// `limit`. `sort_by` is stable, so ties keep the deterministic section and
-/// identity order they were collected in.
+/// Rank episodes across sections by a total response-content order and truncate
+/// to `limit`.
 pub(crate) fn rank(hits: &mut Vec<(&'static str, EpisodeHit)>, limit: usize) -> usize {
     hits.sort_by(|a, b| {
         b.1.episode
@@ -358,18 +368,141 @@ pub(crate) fn rank(hits: &mut Vec<(&'static str, EpisodeHit)>, limit: usize) -> 
             .m
             .abs()
             .total_cmp(&a.1.episode.peak.m.abs())
+            .then_with(|| a.0.cmp(b.0))
+            .then_with(|| compare_hit_details(&a.1, &b.1))
     });
     let removed = hits.len().saturating_sub(limit);
     hits.truncate(limit);
     removed
 }
 
+fn compare_hits(left: &EpisodeHit, right: &EpisodeHit) -> std::cmp::Ordering {
+    right
+        .episode
+        .peak
+        .m
+        .abs()
+        .total_cmp(&left.episode.peak.m.abs())
+        .then_with(|| compare_hit_details(left, right))
+}
+
+fn compare_hit_details(left: &EpisodeHit, right: &EpisodeHit) -> std::cmp::Ordering {
+    left.column
+        .cmp(&right.column)
+        .then_with(|| compare_value_slices(&left.key, &right.key))
+        .then_with(|| left.episode.start.cmp(&right.episode.start))
+        .then_with(|| left.episode.end.cmp(&right.episode.end))
+        .then_with(|| left.episode.peak_ts.cmp(&right.episode.peak_ts))
+        .then_with(|| left.episode.peak.m.total_cmp(&right.episode.peak.m))
+        .then_with(|| {
+            direction_rank(left.episode.peak.dir).cmp(&direction_rank(right.episode.peak.dir))
+        })
+        .then_with(|| {
+            left.episode
+                .peak
+                .med_cur
+                .total_cmp(&right.episode.peak.med_cur)
+        })
+        .then_with(|| {
+            left.episode
+                .peak
+                .med_ref
+                .total_cmp(&right.episode.peak.med_ref)
+        })
+        .then_with(|| {
+            left.episode
+                .peak
+                .mad_ref
+                .total_cmp(&right.episode.peak.mad_ref)
+        })
+        .then_with(|| {
+            left.episode
+                .peak
+                .sigma_used
+                .total_cmp(&right.episode.peak.sigma_used)
+        })
+        .then_with(|| left.episode.peak.n_cur.cmp(&right.episode.peak.n_cur))
+        .then_with(|| left.episode.peak.n_ref.cmp(&right.episode.peak.n_ref))
+        .then_with(|| left.eps_abs.total_cmp(&right.eps_abs))
+}
+
+const fn direction_rank(direction: kronika_analytics::Direction) -> u8 {
+    match direction {
+        kronika_analytics::Direction::Down => 0,
+        kronika_analytics::Direction::Flat => 1,
+        kronika_analytics::Direction::Up => 2,
+    }
+}
+
+fn compare_value_slices(left: &[Value], right: &[Value]) -> std::cmp::Ordering {
+    for (left, right) in left.iter().zip(right) {
+        let order = compare_values(left, right);
+        if order != std::cmp::Ordering::Equal {
+            return order;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+#[allow(
+    clippy::match_same_arms,
+    reason = "each arm binds a different Value payload type"
+)]
+fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
+    const fn rank(value: &Value) -> u8 {
+        match value {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::I64(_) => 2,
+            Value::U64(_) => 3,
+            Value::F64(_) => 4,
+            Value::Ts(_) => 5,
+            Value::Str(_) => 6,
+            Value::Blob { .. } => 7,
+            Value::ListI32(_) => 8,
+        }
+    }
+
+    match (left, right) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
+        (Value::I64(left), Value::I64(right)) => left.cmp(right),
+        (Value::U64(left), Value::U64(right)) => left.cmp(right),
+        (Value::F64(left), Value::F64(right)) => left.total_cmp(right),
+        (Value::Ts(left), Value::Ts(right)) => left.cmp(right),
+        (Value::Str(left), Value::Str(right)) => left.as_bytes().cmp(right.as_bytes()),
+        (
+            Value::Blob {
+                text: left_text,
+                full_len: left_len,
+                truncated: left_truncated,
+            },
+            Value::Blob {
+                text: right_text,
+                full_len: right_len,
+                truncated: right_truncated,
+            },
+        ) => left_text
+            .as_bytes()
+            .cmp(right_text.as_bytes())
+            .then(left_len.cmp(right_len))
+            .then(left_truncated.cmp(right_truncated)),
+        (Value::ListI32(left), Value::ListI32(right)) => left.cmp(right),
+        _ => rank(left).cmp(&rank(right)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use kronika_analytics::{Direction, NotEvaluatedReason, ScoreParams, Scored};
+    use kronika_analytics::{
+        Direction, Episode, Evaluated, NotEvaluatedReason, ScoreParams, Scored,
+    };
     use kronika_reader::{ColumnValues, SeriesValues, Value};
 
-    use super::{EpisodeHit, ScanCounts, ScanParams, positions, rank, scan_section, score_series};
+    use super::{
+        EpisodeHit, ScanCounts, ScanParams, positions, rank, rank_section, scan_section,
+        score_series,
+    };
 
     const SEC: i64 = 1_000_000;
 
@@ -538,6 +671,47 @@ mod tests {
     }
 
     #[test]
+    fn equal_score_ranking_is_independent_of_collection_order() {
+        let hit = |id, column: &str| EpisodeHit {
+            key: vec![Value::I64(id)],
+            column: column.to_owned(),
+            eps_abs: 0.1,
+            episode: Episode {
+                start: 10,
+                end: 20,
+                peak_ts: 15,
+                peak: Evaluated {
+                    m: 7.0,
+                    dir: Direction::Up,
+                    med_cur: 20.0,
+                    med_ref: 10.0,
+                    mad_ref: 1.0,
+                    sigma_used: 1.4826,
+                    n_cur: 3,
+                    n_ref: 20,
+                },
+            },
+        };
+        let input = vec![
+            ("z", hit(2, "b")),
+            ("a", hit(2, "b")),
+            ("a", hit(1, "b")),
+            ("a", hit(2, "a")),
+        ];
+        let mut forward = input.clone();
+        let mut reverse: Vec<_> = input.into_iter().rev().collect();
+
+        assert_eq!(rank(&mut forward, usize::MAX), 0);
+        assert_eq!(rank(&mut reverse, usize::MAX), 0);
+        assert_eq!(forward, reverse);
+
+        let mut local = vec![hit(2, "b"), hit(1, "b")];
+        local.reverse();
+        assert_eq!(rank_section(&mut local, 1), 1);
+        assert_eq!(local[0].key, vec![Value::I64(1)]);
+    }
+
+    #[test]
     fn a_non_finite_rate_is_one_nodata_point_not_a_blinded_series() {
         use kronika_reader::{ColumnDiff, DiffAt, DiffPoint, Scalar, SeriesDiff};
         let points: Vec<DiffAt> = (0..40_i64)
@@ -586,6 +760,24 @@ mod tests {
         let scan = params(0, to, 10 * 60 * SEC, 2 * 60 * SEC);
         let err = scan_section(&[], &series, &scan, 1, 10).expect_err("budget must apply");
         assert!(err.required > err.available);
+    }
+
+    #[test]
+    fn empty_timelines_still_charge_each_window_position() {
+        let series = vec![gauge_series(1, Vec::new(), 0)];
+        let scan = params(0, 100 * SEC, 20 * SEC, 20 * SEC);
+        let expected = positions(&scan).len();
+
+        let (_, _, work) =
+            scan_section(&[], &series, &scan, usize::MAX, 10).expect("within budget");
+        assert_eq!(work, expected);
+        assert_eq!(
+            scan_section(&[], &series, &scan, expected.saturating_sub(1), 10),
+            Err(super::ScanLimit {
+                required: expected,
+                available: expected.saturating_sub(1),
+            })
+        );
     }
 
     #[test]

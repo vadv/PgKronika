@@ -1,6 +1,6 @@
 use crate::buffering::buffer_row;
 use crate::config::Config;
-use crate::plans_source::PlansRead;
+use crate::plans_source::{PlansRead, PlansSnapshot};
 use crate::source_contracts::{user_indexes_type_id, user_tables_type_id};
 use crate::statements_source::statements_type_id;
 use anyhow::Result;
@@ -89,6 +89,7 @@ impl SourceCoverage {
 /// One pending `1_023_001` row.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CoverageRecord {
+    ts: i64,
     source_type_id: u32,
     coverage: SourceCoverage,
     max_n: u32,
@@ -98,10 +99,11 @@ pub(crate) struct CoverageRecord {
 
 /// Inputs needed to assemble coverage for this snapshot's top-N reads.
 pub(crate) struct CoverageInputs<'a> {
+    pub(crate) default_ts: i64,
     pub(crate) tables: SourceCoverage,
     pub(crate) indexes: SourceCoverage,
     pub(crate) statements: &'a Option<(StatementsVersion, Vec<StatementsRow>, u64)>,
-    pub(crate) plans: &'a Option<(PlansRead, u64)>,
+    pub(crate) plans: &'a Option<PlansSnapshot>,
 }
 
 /// Assemble the `1_023_001` rows for every truncated top-N source.
@@ -113,6 +115,7 @@ pub(crate) fn collect_coverage_records(
     let mut records = Vec::new();
     if inputs.tables.truncated() {
         records.push(CoverageRecord {
+            ts: inputs.default_ts,
             source_type_id: user_tables_type_id(major),
             coverage: inputs.tables,
             max_n: u32::try_from(config.max_tables).unwrap_or(u32::MAX),
@@ -122,6 +125,7 @@ pub(crate) fn collect_coverage_records(
     }
     if inputs.indexes.truncated() {
         records.push(CoverageRecord {
+            ts: inputs.default_ts,
             source_type_id: user_indexes_type_id(major),
             coverage: inputs.indexes,
             max_n: u32::try_from(config.max_indexes).unwrap_or(u32::MAX),
@@ -153,6 +157,7 @@ fn statements_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<C
         other_skips: 0,
     };
     coverage.truncated().then(|| CoverageRecord {
+        ts: rows.first().map_or(inputs.default_ts, |row| row.ts),
         source_type_id: statements_type_id(*version),
         coverage,
         max_n: u32::try_from(config.max_statements).unwrap_or(u32::MAX),
@@ -167,7 +172,8 @@ fn statements_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<C
 /// is the smallest `total_time` that still made it into the section. The
 /// total rides in the enumeration statement itself.
 fn plans_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<CoverageRecord> {
-    let (read, source_total) = inputs.plans.as_ref()?;
+    let snapshot = inputs.plans.as_ref()?;
+    let read = &snapshot.read;
     let (collected, cutoff_value) = match read {
         PlansRead::Vadv(rows) => (
             rows.len() as u64,
@@ -179,7 +185,7 @@ fn plans_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<Covera
         ),
     };
     let coverage = SourceCoverage {
-        total: *source_total,
+        total: snapshot.source_total,
         collected,
         unknown_total: false,
         timeouts: 0,
@@ -187,6 +193,7 @@ fn plans_coverage(config: &Config, inputs: &CoverageInputs<'_>) -> Option<Covera
         other_skips: 0,
     };
     coverage.truncated().then(|| CoverageRecord {
+        ts: snapshot.snapshot_ts,
         source_type_id: read.type_id(),
         coverage,
         max_n: u32::try_from(config.max_plans).unwrap_or(u32::MAX),
@@ -218,13 +225,12 @@ const fn user_indexes_order_by(major: u32) -> &'static str {
 pub(crate) fn push_coverage(
     buffers: &mut SectionBuffers,
     interner: &mut Interner,
-    ts: i64,
     records: &[CoverageRecord],
 ) -> Result<()> {
     for record in records {
         let mut intern = |bytes: &[u8]| interner.intern(bytes).map(|id| StrId(id.get()));
         let row = CollectionCoverageV1 {
-            ts: Ts(ts),
+            ts: Ts(record.ts),
             source_type_id: record.source_type_id,
             total: u32::try_from(record.coverage.total).unwrap_or(u32::MAX),
             unknown_total: record.coverage.unknown_total,

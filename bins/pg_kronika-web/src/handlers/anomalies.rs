@@ -106,6 +106,26 @@ fn counts_to_json(counts: &ScanCounts) -> Value {
     })
 }
 
+const fn response_status(
+    complete: bool,
+    signals_present: bool,
+    series_total: u64,
+    generic_evaluated: u64,
+    plan_evaluated: u64,
+) -> &'static str {
+    if !complete {
+        "partial"
+    } else if signals_present {
+        "signals_detected"
+    } else if series_total == 0 && plan_evaluated == 0 {
+        "no_data"
+    } else if generic_evaluated == 0 && plan_evaluated == 0 {
+        "insufficient_data"
+    } else {
+        "calm"
+    }
+}
+
 fn parse_scan_params(params: &QueryParams) -> Result<(ScanParams, usize), ErrorResponse> {
     let from = parse_i64(params, QueryParameter::From)?;
     let to = parse_i64(params, QueryParameter::To)?;
@@ -254,6 +274,7 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
     let mut section_plan_signals_dropped = 0_u64;
     let mut global_plan_signals_dropped = 0_u64;
     let mut plan_sections_analyzed = 0_u64;
+    let mut plan_positions_evaluated = 0_u64;
     let mut plan_complete = true;
 
     for &name in &names {
@@ -283,6 +304,8 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
                 if let Some(mut plan) = section.plan.take() {
                     plan_sections_analyzed = plan_sections_analyzed.saturating_add(1);
                     plan_complete &= plan.complete();
+                    plan_positions_evaluated =
+                        plan_positions_evaluated.saturating_add(plan.evaluated());
                     section_plan_signals_dropped =
                         section_plan_signals_dropped.saturating_add(plan.signals_truncated());
                     plan_signals.extend(plan.take_signals());
@@ -326,17 +349,13 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
         && episodes_dropped_total == 0
         && plan_signals_dropped_total == 0
         && plan_complete;
-    let status = if !complete {
-        "partial"
-    } else if series_total == 0 {
-        "no_data"
-    } else if evaluated == 0 {
-        "insufficient_data"
-    } else if episodes.is_empty() && plan_signals.is_empty() {
-        "calm"
-    } else {
-        "signals_detected"
-    };
+    let status = response_status(
+        complete,
+        !episodes.is_empty() || !plan_signals.is_empty(),
+        series_total,
+        evaluated,
+        plan_positions_evaluated,
+    );
 
     Ok(Json(json!({
         "schema_version": 1,
@@ -355,6 +374,7 @@ fn run(state: &AppState, request: AnomalyRequest) -> Result<Json<Value>, ErrorRe
             "sections_scanned": sections_scanned,
             "sections_skipped": skipped.len(),
             "plan_sections_analyzed": plan_sections_analyzed,
+            "plan_positions_evaluated": plan_positions_evaluated,
         },
         "truncation": {
             "section_episodes_dropped": section_episodes_dropped,
@@ -485,4 +505,18 @@ fn scorable_columns(logical: &LogicalSection) -> (Vec<&'static str>, Vec<&'stati
         }
     }
     (cumulative, gauges)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_status;
+
+    #[test]
+    fn specialized_results_participate_in_top_level_status() {
+        assert_eq!(response_status(true, true, 1, 0, 1), "signals_detected");
+        assert_eq!(response_status(true, false, 1, 0, 1), "calm");
+        assert_eq!(response_status(true, false, 1, 0, 0), "insufficient_data");
+        assert_eq!(response_status(true, false, 0, 0, 0), "no_data");
+        assert_eq!(response_status(false, true, 1, 1, 1), "partial");
+    }
 }

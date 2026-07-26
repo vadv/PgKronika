@@ -79,6 +79,7 @@ Timeline resource policy defaults and constraints are:
 | Cold weighted capacity | 1 GiB each PGM/decoded/read/write, 2,097,152 rows, 16 file descriptors, 4 publications | Values are process-wide aggregate ceilings; byte and row charges round up to fixed scheduler quanta. |
 | Timeline query range | — | 31 days |
 | Materialized timeline query | — | 64 MiB cloned-observation charge; 1,048,576 observations/count inputs, 262,144 clipped coverage spans, 65,536 joint keys, 1,024 signal keys |
+| Anomaly projection | 50 results per evidence class | 10,000 window positions; 50,000,000 charged timeline-unit/position pairs; 10,000 generic episodes and 10,000 plan signals independently; 262,144 rows, 10,000,000 cells, and 64 MiB owned variable-width payload per section page |
 | Events page | 100 items | 1,000 items |
 | Notable preview | 100 items | Fixed by notable policy v1 |
 | Health line | — | 2,000 points |
@@ -253,6 +254,8 @@ See the [OpenAPI contract](openapi.json) and the
   timestamps did not advance or the scalar kinds were inconsistent.
 - Anomaly search compares each current window with the other usable points in
   the selected period. The strongest absolute peak score appears first.
+  Equal-score results use section, column/dimension, identity, and interval fields as
+  explicit tie-breakers, so input collection order cannot change truncation.
   `sections` reports evaluated and unevaluated window positions;
   `nodata_points` is an aggregate count, so the anomaly response does not split
   it into reset, gap, and collection-disabled totals. A window position that
@@ -272,13 +275,21 @@ See the [OpenAPI contract](openapi.json) and the
   local `hit/read/dirtied/written` and temp `read/written` remain ten separate
   dimensions. The extension exposes no temp hit or dirtied counter.
 - Plan windows never bridge reset, extension-version, instance, coverage-gap,
-  or observed eviction boundaries. Full snapshot coverage is required for
-  plan-mixture claims. A retained plan row from a proven top-N snapshot may
+  or observed eviction boundaries. Each plan snapshot must have reset metadata
+  at its exact timestamp; an older row is not accepted as provenance. Full
+  snapshot coverage is required for plan-mixture claims. A retained plan row
+  from a proven top-N snapshot may
   still support its own buffer comparison, but the response remains partial
-  for population completeness. Missing system identity, conflicting metadata,
-  unsupported versions, work limits, and evidence truncation stay visible in
-  `plan_analysis`, top-level `coverage`, `truncation`, `complete`, and
-  `status`.
+  for population completeness. Missing or paged plan/provenance pages,
+  reader-gap ranges, invalid rows, conflicting coverage or metadata, missing
+  system identity, unsupported versions, work limits, and evidence truncation
+  stay visible in `plan_analysis.quality`, top-level `coverage`, `truncation`,
+  `complete`, and `status`. Source absence is `complete` only when those inputs
+  prove the absence; otherwise its plan status is `partial`.
+- Top-level `coverage.plan_positions_evaluated` counts specialized detector
+  positions that reached a stable/changed verdict. It participates in
+  `no_data`, `insufficient_data`, and `calm` status selection independently of
+  generic-series positions.
 - Both plan detectors are retrospective observations: the reference is the
   rest of the same continuous selected-period segment, including later
   samples. They neither diagnose an optimizer regression nor activate the

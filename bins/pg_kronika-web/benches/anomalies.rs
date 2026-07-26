@@ -38,6 +38,7 @@ use kronika_analytics as _;
 use kronika_reader as _;
 use metrics as _;
 use rust_embed as _;
+use rustix as _;
 use serde as _;
 use serde_json as _;
 use sha2 as _;
@@ -268,23 +269,25 @@ fn build_fixture(dir: &Path) {
                 intern("benchmark-boot"),
             )
         };
-        let reset = ResetMetadata {
-            ts: Ts(first_tick * STEP),
-            postmaster_start_time: Ts(1),
-            pg_stat_database_reset_max_at: None,
-            pg_stat_statements_reset_at: None,
-            pg_store_plans_reset_at: Some(Ts(1)),
-            pg_stat_bgwriter_reset_at: None,
-            pg_stat_checkpointer_reset_at: None,
-            pg_stat_wal_reset_at: None,
-            pg_stat_archiver_reset_at: None,
-            pg_stat_io_reset_at: None,
-            ext_pg_stat_statements_version: None,
-            ext_pg_store_plans_version: Some(extension_version),
-            compute_query_id: Some(compute_query_id),
-            track_io_timing: Some(true),
-            track_wal_io_timing: Some(false),
-        };
+        let resets = (first_tick..first_tick + SNAPSHOTS_PER_SEGMENT)
+            .map(|tick| ResetMetadata {
+                ts: Ts(tick * STEP),
+                postmaster_start_time: Ts(1),
+                pg_stat_database_reset_max_at: None,
+                pg_stat_statements_reset_at: None,
+                pg_store_plans_reset_at: Some(Ts(1)),
+                pg_stat_bgwriter_reset_at: None,
+                pg_stat_checkpointer_reset_at: None,
+                pg_stat_wal_reset_at: None,
+                pg_stat_archiver_reset_at: None,
+                pg_stat_io_reset_at: None,
+                ext_pg_stat_statements_version: None,
+                ext_pg_store_plans_version: Some(extension_version),
+                compute_query_id: Some(compute_query_id),
+                track_io_timing: Some(true),
+                track_wal_io_timing: Some(false),
+            })
+            .collect::<Vec<_>>();
         let metadata = InstanceMetadata {
             ts: Ts(first_tick * STEP),
             hostname,
@@ -303,7 +306,7 @@ fn build_fixture(dir: &Path) {
         let plans_body = PgStorePlansOsscV1::encode(&plans).expect("encode plans");
         let plan_coverage_body =
             SnapshotCoverageV1::encode(&plan_coverage).expect("encode plan coverage");
-        let reset_body = ResetMetadata::encode(&[reset]).expect("encode reset metadata");
+        let reset_body = ResetMetadata::encode(&resets).expect("encode reset metadata");
         let metadata_body =
             InstanceMetadata::encode(&[metadata]).expect("encode instance metadata");
         let archiver_body = PgStatArchiver::encode(&archiver).expect("encode archiver");
@@ -335,7 +338,7 @@ fn build_fixture(dir: &Path) {
             },
             SectionInput {
                 type_id: 1_020_001,
-                rows: 1,
+                rows: u32::try_from(resets.len()).expect("reset row count"),
                 body: &reset_body,
             },
             SectionInput {
