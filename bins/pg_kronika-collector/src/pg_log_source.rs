@@ -10,15 +10,16 @@ use crate::source_contracts::activity_dict_limits;
 use anyhow::{Context, Result};
 use kronika_registry::pg_log::{
     PgLogAutovacuumV1, PgLogCheckpointV1, PgLogErrorV1, PgLogGapV1, PgLogLifecycleV1,
-    PgLogLockWaitV1, PgLogSlowQueryV1, PgLogTempFileV1,
+    PgLogLockWaitV1, PgLogSlowQueryV1, PgLogSourceStatusV1, PgLogTempFileV1,
 };
 use kronika_registry::{StrId, Ts};
 use kronika_source_log::{
-    AutovacuumEvent, CheckpointEvent, DiscoveryStatus as LogDiscoveryStatus, GroupedLogError,
-    LifecycleEvent, LockWaitEvent, LogCollection, LogCollector, LogGap, MAX_PATTERN_BYTES,
-    MAX_TEXT_BYTES, PG_LOG_AUTOVACUUM_TYPE_ID, PG_LOG_CHECKPOINTS_TYPE_ID, PG_LOG_ERRORS_TYPE_ID,
+    AutovacuumEvent, CheckpointEvent, GroupedLogError, LifecycleEvent, LockWaitEvent,
+    LogCollection, LogCollector, LogGap, LogSourceStatus, MAX_PATTERN_BYTES, MAX_TEXT_BYTES,
+    PG_LOG_AUTOVACUUM_TYPE_ID, PG_LOG_CHECKPOINTS_TYPE_ID, PG_LOG_ERRORS_TYPE_ID,
     PG_LOG_GAP_TYPE_ID, PG_LOG_LIFECYCLE_TYPE_ID, PG_LOG_LOCK_WAITS_TYPE_ID,
-    PG_LOG_SLOW_QUERIES_TYPE_ID, PG_LOG_TEMP_FILES_TYPE_ID, SlowQueryEvent, TempFileEvent,
+    PG_LOG_SLOW_QUERIES_TYPE_ID, PG_LOG_SOURCE_STATUS_TYPE_ID, PG_LOG_TEMP_FILES_TYPE_ID,
+    SlowQueryEvent, TempFileEvent,
 };
 use kronika_writer::{Interner, Journal, SectionBuffers};
 use std::path::PathBuf;
@@ -124,12 +125,32 @@ pub(crate) async fn collect_log_batch(
             started.elapsed(),
         );
     }
-    if let Some(status) = collection.discovery_status {
+    if collection.source_status.is_some() {
+        log_collection_finish(PG_LOG_SOURCE_STATUS_TYPE_ID, "log", 1, started.elapsed());
+    }
+    if let (Some(level), Some(status)) = (
+        source_status_log_level(&collection),
+        collection.source_status.as_ref(),
+    ) {
+        let previous = collection
+            .previous_source_status
+            .as_ref()
+            .map_or("unknown", |status| status.state.as_str());
+        let source_path = status
+            .source_path
+            .as_ref()
+            .map_or_else(String::new, |path| path.display().to_string());
+        let next_discovery_ms = collection.next_discovery_in.map(duration_ms).unwrap_or(0);
         log_event(
-            LogLevel::Debug,
+            level,
             "pg_log_discovery",
             &[
-                field("status", discovery_status_name(status)),
+                field("previous_state", previous),
+                field("state", status.state.as_str()),
+                field("reason", status.reason.as_str()),
+                field("parser", status.parser_kind.as_str()),
+                field("source_path", source_path.as_str()),
+                field("next_discovery_ms", next_discovery_ms),
                 field("error_rows", collection.errors.len()),
                 field("checkpoint_rows", collection.checkpoints.len()),
                 field("autovacuum_rows", collection.autovacuums.len()),
@@ -138,6 +159,7 @@ pub(crate) async fn collect_log_batch(
                 field("lifecycle_rows", collection.lifecycles.len()),
                 field("temp_file_rows", collection.temp_files.len()),
                 field("gap_rows", collection.gaps.len()),
+                field("source_status_rows", 1_usize),
                 field("elapsed_ms", duration_ms(started.elapsed())),
             ],
         );
@@ -145,14 +167,13 @@ pub(crate) async fn collect_log_batch(
     collection
 }
 
-const fn discovery_status_name(status: LogDiscoveryStatus) -> &'static str {
-    match status {
-        LogDiscoveryStatus::Available => "available",
-        LogDiscoveryStatus::PostgresUnavailable => "postgres_unavailable",
-        LogDiscoveryStatus::NoCurrentLogfile => "no_current_logfile",
-        LogDiscoveryStatus::UnsupportedFormat => "unsupported_format",
-        LogDiscoveryStatus::QueryFailed => "query_failed",
-        LogDiscoveryStatus::Disabled => "disabled",
+pub(crate) const fn source_status_log_level(collection: &LogCollection) -> Option<LogLevel> {
+    if collection.source_status.is_none() {
+        None
+    } else if collection.source_status_changed {
+        Some(LogLevel::Info)
+    } else {
+        Some(LogLevel::Debug)
     }
 }
 
@@ -201,6 +222,9 @@ fn push_log_sections(
     collection: &LogCollection,
 ) -> Result<u32> {
     let mut dropped = 0_u32;
+    if let Some(status) = &collection.source_status {
+        dropped = dropped.saturating_add(push_log_source_status(buffers, interner, status)?);
+    }
     for error in &collection.errors {
         dropped = dropped.saturating_add(push_log_error(buffers, interner, error)?);
     }
@@ -223,6 +247,30 @@ fn push_log_sections(
         dropped = dropped.saturating_add(push_log_temp_file(buffers, interner, temp_file)?);
     }
     dropped = dropped.saturating_add(push_log_gaps(buffers, interner, &collection.gaps)?);
+    Ok(dropped)
+}
+
+pub(crate) fn push_log_source_status(
+    buffers: &mut SectionBuffers,
+    interner: &mut Interner,
+    status: &LogSourceStatus,
+) -> Result<u32> {
+    let mut dropped = 0_u32;
+    let source_path = status.source_path.as_ref().and_then(|path| {
+        let value = path.to_string_lossy();
+        intern_log_text(interner, &value, MAX_TEXT_BYTES, &mut dropped)
+    });
+    buffer_row(
+        buffers,
+        PgLogSourceStatusV1 {
+            ts: Ts(status.ts),
+            state: status.state.code(),
+            reason: status.reason.code(),
+            parser_kind: status.parser_kind.code(),
+            source_path,
+            dict_dropped_fields: u8::try_from(dropped).unwrap_or(u8::MAX),
+        },
+    )?;
     Ok(dropped)
 }
 

@@ -1298,7 +1298,7 @@ git commit -m "feat(source-log): report log source availability"
 - Consumes: `LogCollection::source_status`, `PgLogSourceStatusV1`, `PG_LOG_SOURCE_STATUS_TYPE_ID`.
 - Produces: one buffered status row when `source_status=Some`, plus `info` transition and `debug` heartbeat process logs.
 
-- [ ] **Step 1: Write failing buffering and log-level tests**
+- [x] **Step 1: Write failing buffering and log-level tests**
 
 Add the required imports and these tests to `tests/buffering.rs`:
 
@@ -1403,20 +1403,20 @@ fn status_process_log_level_distinguishes_transition_and_heartbeat() {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm the red state**
+- [x] **Step 2: Run the focused tests and confirm the red state**
 
 Run:
 
 ```sh
 HOST="$(rustc +1.96.0 -vV | sed -n 's/^host: //p')"
-cargo +1.96.0 test -p pg-kronika-collector push_log_collection_buffers_source_status --target "$HOST"
-cargo +1.96.0 test -p pg-kronika-collector status_process_log_level --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-collector push_log_collection_buffers_source_status --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-collector status_process_log_level --target "$HOST"
 ```
 
 Expected: the first test finds no `1_039_001` entry and the second cannot import
 `source_status_log_level`.
 
-- [ ] **Step 3: Buffer a status row without dropping it on dictionary failure**
+- [x] **Step 3: Buffer a status row without dropping it on dictionary failure**
 
 Import `PgLogSourceStatusV1` and add:
 
@@ -1450,7 +1450,7 @@ Call it at the start of `push_log_sections` when `collection.source_status` is
 present. Include its dropped field count in the existing dictionary-full
 accounting; the status row remains buffered with `source_path=NULL`.
 
-- [ ] **Step 4: Replace per-cycle discovery logging**
+- [x] **Step 4: Replace per-cycle discovery logging**
 
 Add:
 
@@ -1492,20 +1492,20 @@ content, parsed SQL, detail or sample fields.
 Also call `log_collection_finish` for `PG_LOG_SOURCE_STATUS_TYPE_ID` with one
 row whenever `source_status.is_some()`.
 
-- [ ] **Step 5: Run collector tests**
+- [x] **Step 5: Run collector tests**
 
 Run:
 
 ```sh
 HOST="$(rustc +1.96.0 -vV | sed -n 's/^host: //p')"
-cargo +1.96.0 test -p pg-kronika-collector buffering --target "$HOST"
-cargo +1.96.0 test -p pg-kronika-collector --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-collector buffering --target "$HOST"
+cargo +1.96.0 test -p pg_kronika-collector --target "$HOST"
 ```
 
 Expected: status creates a PGM part even with no log events; existing event and
 gap buffering tests pass.
 
-- [ ] **Step 6: Commit the writer integration**
+- [x] **Step 6: Commit the writer integration**
 
 ```sh
 git add bins/pg_kronika-collector/src/pg_log_source.rs bins/pg_kronika-collector/src/tests/buffering.rs
