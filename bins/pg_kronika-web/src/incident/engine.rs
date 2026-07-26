@@ -165,6 +165,7 @@ pub(crate) struct EngineOutcome {
     pub span_splits: u64,
     pub complete: bool,
     pub skipped: Vec<EngineSkip>,
+    pub evaluated_lens_ids: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +296,7 @@ pub(crate) fn analyze(
     let mut skipped = Vec::new();
     let mut complete = true;
     let mut key_bytes = 0_usize;
+    let mut evaluated_lens_ids = BTreeSet::new();
 
     'clusters: for cluster in clustered.clusters {
         let context = EvalContext {
@@ -325,6 +327,7 @@ pub(crate) fn analyze(
                 complete = false;
                 break;
             }
+            evaluated_lens_ids.insert(lens.id());
 
             let mut sink = FindingSink::new(
                 &mut findings,
@@ -376,6 +379,7 @@ pub(crate) fn analyze(
         span_splits: clustered.span_splits,
         complete,
         skipped,
+        evaluated_lens_ids: evaluated_lens_ids.into_iter().collect(),
     })
 }
 
@@ -628,6 +632,7 @@ mod tests {
         assert!(outcome.incidents.is_empty());
         assert!(outcome.complete);
         assert!(outcome.skipped.is_empty());
+        assert!(outcome.evaluated_lens_ids.is_empty());
     }
 
     #[test]
@@ -658,6 +663,10 @@ mod tests {
         )
         .expect("valid");
         assert!(outcome.incidents[0].findings.is_empty());
+        assert!(
+            outcome.evaluated_lens_ids.is_empty(),
+            "a registered lens without a matching input must not be reported as executed"
+        );
     }
 
     #[test]
@@ -676,6 +685,7 @@ mod tests {
             outcome.incidents[0].findings[0].confidence(),
             Confidence::MEDIUM
         );
+        assert_eq!(outcome.evaluated_lens_ids, ["CACHE"]);
     }
 
     #[test]
@@ -986,6 +996,11 @@ mod tests {
                 observed: 2,
                 limit: 1,
             }
+        );
+        assert_eq!(
+            outcome.evaluated_lens_ids,
+            ["A"],
+            "the branch rejected by admission must not be reported as executed"
         );
     }
 }

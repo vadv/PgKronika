@@ -368,6 +368,54 @@ async fn incidents_propagate_storage_source_and_node_identity_to_engine_and_http
     assert_ne!(first_key, other_node_key);
 }
 
+fn assert_active_incident_catalog(body: &serde_json::Value) {
+    let catalog = &body["catalog"];
+    assert_eq!(catalog["status"], "partial");
+    assert_eq!(catalog["diagnosis_available"], true);
+    assert_eq!(catalog["applied"], serde_json::json!(ACTIVE_LENS_IDS));
+    assert_eq!(
+        catalog["counts"],
+        serde_json::json!({
+            "core_lenses": 28,
+            "event_branches": 14,
+            "evaluator_branches": 42,
+            "unique_lens_ids": 40,
+            "active_lens_ids": 40,
+            "inactive_lens_ids": 0,
+            "entity_join_requirements": 24,
+        })
+    );
+    assert_eq!(
+        catalog["registered_lens_ids"].as_array().map(Vec::len),
+        Some(40)
+    );
+    assert_eq!(catalog["evaluators"].as_array().map(Vec::len), Some(42));
+    assert_eq!(catalog["inactive_lens_ids"], serde_json::json!([]));
+    let active_lenses = catalog["lenses"].as_array().expect("active lens metadata");
+    assert_eq!(active_lenses.len(), 28);
+    assert_eq!(
+        active_lenses
+            .iter()
+            .flat_map(|lens| lens["requirements"].as_array().into_iter().flatten())
+            .count(),
+        24
+    );
+    let archiver = active_lenses
+        .iter()
+        .find(|lens| lens["lens_id"] == "PG-ARCH-017")
+        .expect("archiver lens metadata");
+    assert_eq!(archiver["evaluator_status"], "evaluated");
+    assert_eq!(archiver["requirements"][0]["kind"], "entity_join");
+    assert_eq!(
+        archiver["requirements"][0]["identity"],
+        serde_json::json!({
+            "domain": "pg",
+            "name": "incident_lens",
+            "value": ["PG-ARCH-017"],
+        })
+    );
+}
+
 #[tokio::test]
 async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
     let to = 39 * 60 * 1_000_000;
@@ -414,23 +462,7 @@ async fn incidents_surface_a_spike_and_stay_empty_when_calm() {
     assert_eq!(body["complete"], false);
     assert_eq!(body["clustering_complete"], true);
     assert_eq!(body["analysis_status"], "incidents_detected");
-    assert_eq!(body["catalog"]["status"], "partial");
-    assert_eq!(body["catalog"]["diagnosis_available"], true);
-    assert_eq!(
-        body["catalog"]["applied"],
-        serde_json::json!(ACTIVE_LENS_IDS)
-    );
-    let dormant = body["catalog"]["dormant"]
-        .as_array()
-        .expect("catalog lists dormant lenses");
-    assert_eq!(dormant.len(), 0, "all 28 core lenses are active");
-    assert!(
-        dormant
-            .iter()
-            .all(|entry| entry["lens_id"] != "PG-LOCK-012"),
-        "the lock lens is now active, not dormant"
-    );
-    assert!(dormant.is_empty());
+    assert_active_incident_catalog(&body);
     let incidents = body["incidents"].as_array().expect("incidents is an array");
     assert!(
         !incidents.is_empty(),
@@ -829,6 +861,11 @@ async fn incidents_distinguish_no_data_and_identity_quality() {
     assert_eq!(body["analysis_status"], "no_data");
     assert_eq!(body["complete"], false);
     assert_eq!(body["data_age_seconds"], serde_json::Value::Null);
+    assert_eq!(body["catalog"]["catalog_available"], true);
+    assert_eq!(body["catalog"]["diagnosis_available"], false);
+    assert_eq!(body["catalog"]["evaluated_lens_ids"], serde_json::json!([]));
+    assert_eq!(body["catalog"]["counts"]["evaluator_branches"], 42);
+    assert_eq!(body["catalog"]["counts"]["unique_lens_ids"], 40);
 
     let missing = tempfile::tempdir().expect("tempdir");
     let to = write_archiver_spike_segment(missing.path());
@@ -838,6 +875,8 @@ async fn incidents_distinguish_no_data_and_identity_quality() {
     assert_eq!(body["analysis_status"], "missing_node_identity");
     assert_eq!(body["complete"], false);
     assert_eq!(body["incidents"], serde_json::json!([]));
+    assert_eq!(body["catalog"]["diagnosis_available"], false);
+    assert_eq!(body["catalog"]["evaluated_lens_ids"], serde_json::json!([]));
 
     let conflicting = tempfile::tempdir().expect("tempdir");
     let rows = archiver_rows(true);
@@ -861,6 +900,8 @@ async fn incidents_distinguish_no_data_and_identity_quality() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["analysis_status"], "conflicting_node_identity");
     assert_eq!(body["complete"], false);
+    assert_eq!(body["catalog"]["diagnosis_available"], false);
+    assert_eq!(body["catalog"]["evaluated_lens_ids"], serde_json::json!([]));
 }
 
 #[tokio::test]

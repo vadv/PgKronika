@@ -307,11 +307,36 @@ See the [OpenAPI contract](openapi.json) and the
   by a limit. Requests are limited to 24 hours and have fixed ceilings for
   units, sections, materialized cells, series points, identity bytes, scoring
   work, and episodes.
+- The incident catalog derives and publishes 28 core lenses, 14 event
+  branches, 42 evaluator branches, 40 unique active lens IDs, zero inactive
+  IDs, and 24 unresolved strict `EntityJoin` requirements. `evaluators`
+  distinguishes registered core and event branches and reports whether each
+  branch ran for this request. `registered_lens_ids` is the bounded set of 40
+  stable IDs; `evaluated_lens_ids` contains only IDs admitted to actual
+  evaluation.
+- `catalog_available` reports catalog visibility. `diagnosis_available` is
+  independent and becomes true only when at least one evaluator runs; no
+  finding is required. It stays false for `no_data`, missing node identity,
+  conflicting node identity, and any request in which no branch reaches
+  evaluation because its input is absent or admission rejects it.
+- Each active core lens publishes only its declared strict `EntityJoin`
+  requirement, if any. The requirement has a locale-neutral machine ID,
+  owning lens identity (`domain`, `name`, `value`), contract, activation type,
+  and separate producer, provenance, and coverage conditions. All 24 remain
+  `unavailable`; the response does not activate or imply an unproved relation.
+  The legacy `applied`, `active_count`, `catalog_count`, and `dormant` fields
+  remain compatibility fields. `applied` contains the same ID set in its
+  legacy order; new clients should use the canonical IDs and `counts`.
 - Cross-section lock evidence requires an explicit producer-stored shared
   observation token and an exact `(snapshot timestamp, PID, backend_start)`
   match. Equal timestamps do not prove the relation. The current activity and
-  lock collectors use separate statements, so `cross_section_entity_join`
-  remains unavailable until the producer stores that token.
+  lock collectors use separate statements, so
+  `entity_join.activity_lock_waiter` reports its producer, provenance, and
+  coverage conditions as unavailable.
+- Existing OS inputs may still identify bounded candidates, but candidate
+  equality is marked `unproven`. Exact storage-device and
+  process-cgroup-device relation markers remain reserved for a future request
+  that satisfies the published lifetime-mapping conditions.
 - Product-owned incomplete-result explanations use the closed
   `{ "kind": "...", "params": { ... } }` reason schema. Lens ids, enum values,
   formulas, units, and evidence remain stable machine data; incident catalogs

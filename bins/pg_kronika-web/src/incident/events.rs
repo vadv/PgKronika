@@ -318,12 +318,28 @@ impl LogEventInputs {
     pub(crate) const fn overflow(&self) -> bool {
         self.overflow
     }
+
+    fn input_available(&self, section: &str) -> bool {
+        let has_rows = match section {
+            PG_LOG_ERRORS => !self.errors.is_empty(),
+            PG_LOG_LIFECYCLE => !self.lifecycle.is_empty(),
+            _ => false,
+        };
+        has_rows
+            || matches!(
+                self.coverage.get(section),
+                Some(LogCoverage::Unknown | LogCoverage::Gap)
+            )
+    }
 }
 
 /// A pure lens over bounded, typed log events. Output passes through `sink`, so
 /// the same evidence gate and work budget bound it as the numeric lenses.
 pub(crate) trait EventLens {
     fn id(&self) -> &'static str;
+    fn input_section(&self) -> &'static str {
+        PG_LOG_ERRORS
+    }
     fn confidence_cap(&self) -> ConfidenceCap;
     fn evaluate(&self, events: &LogEventInputs, sink: &mut FindingSink<'_>)
     -> Result<(), LimitHit>;
@@ -427,6 +443,10 @@ impl EventLens for BackendSigkillLens {
         Self::ID
     }
 
+    fn input_section(&self) -> &'static str {
+        PG_LOG_LIFECYCLE
+    }
+
     fn confidence_cap(&self) -> ConfidenceCap {
         ConfidenceCap::High
     }
@@ -453,6 +473,10 @@ impl BackendCrashLens {
 impl EventLens for BackendCrashLens {
     fn id(&self) -> &'static str {
         Self::ID
+    }
+
+    fn input_section(&self) -> &'static str {
+        PG_LOG_LIFECYCLE
     }
 
     fn confidence_cap(&self) -> ConfidenceCap {
@@ -865,7 +889,7 @@ impl EventConfig {
     }
 
     #[cfg(test)]
-    const fn with(
+    pub(crate) const fn with(
         work_limit: u64,
         max_lens_evaluations: u64,
         max_findings: u64,
@@ -897,6 +921,7 @@ pub(crate) struct EventOutcome {
     pub coverage: BTreeMap<&'static str, LogCoverage>,
     pub complete: bool,
     pub skipped: Vec<EngineSkip>,
+    pub evaluated_lens_ids: Vec<&'static str>,
 }
 
 const fn admit_event_lens(
@@ -961,8 +986,12 @@ pub(crate) fn evaluate_events(
     // branch is never exhaustive even when evaluation itself finishes.
     let mut complete = false;
     let mut evaluations = 0_u64;
+    let mut evaluated_lens_ids = Vec::new();
 
     for lens in lenses {
+        if !events.input_available(lens.input_section()) {
+            continue;
+        }
         if let Err(skip) = admit_event_lens(
             lens.id(),
             &mut evaluations,
@@ -973,6 +1002,7 @@ pub(crate) fn evaluate_events(
             complete = false;
             break;
         }
+        evaluated_lens_ids.push(lens.id());
         let mut sink = FindingSink::new(
             &mut findings,
             &mut budget,
@@ -999,6 +1029,7 @@ pub(crate) fn evaluate_events(
         coverage: events.coverage().clone(),
         complete,
         skipped,
+        evaluated_lens_ids,
     })
 }
 
@@ -1337,6 +1368,10 @@ mod tests {
             Some(&LogCoverage::NotCollected),
             "coverage keeps the absence honest",
         );
+        assert!(
+            outcome.evaluated_lens_ids.is_empty(),
+            "a branch with no input source must not be reported as executed"
+        );
     }
 
     #[test]
@@ -1474,6 +1509,38 @@ mod tests {
             vec!["PG-EVT-001", "PG-EVT-003", "PG-EVT-007"],
             "sigkill, panic, and deadlock each fire once; nothing else matches",
         );
+        assert_eq!(
+            outcome.evaluated_lens_ids,
+            event_catalog_ids(),
+            "all fourteen branches had an available source and executed"
+        );
         assert!(!outcome.complete, "stderr coverage is never exhaustive");
+    }
+
+    #[test]
+    fn event_admission_reports_only_branches_that_executed() {
+        let mut events = inputs_with(vec![error(0, Some("40P01"), 1)], Vec::new());
+        events.set_coverage(PG_LOG_ERRORS, LogCoverage::Unknown);
+        events.set_coverage(PG_LOG_LIFECYCLE, LogCoverage::NotCollected);
+        let catalog = event_catalog();
+        let lenses: Vec<&dyn EventLens> = catalog.iter().map(AsRef::as_ref).collect();
+
+        let outcome =
+            evaluate_events(&events, &lenses, &EventConfig::for_test()).expect("valid analysis");
+
+        assert_eq!(outcome.evaluated_lens_ids, event_catalog_ids()[2..]);
+
+        let limited = evaluate_events(
+            &events,
+            &lenses,
+            &EventConfig::with(u64::MAX, 1, u64::MAX, u64::MAX, u64::MAX),
+        )
+        .expect("bounded partial analysis");
+        assert_eq!(limited.evaluated_lens_ids, ["PG-EVT-003"]);
+        assert_eq!(
+            limited.skipped[0].lens_id,
+            Some("OS-FS-027"),
+            "the first unexecuted branch is named only in the skip record"
+        );
     }
 }

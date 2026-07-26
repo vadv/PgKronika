@@ -1,14 +1,14 @@
 //! JSON contract for incident clustering responses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kronika_reader::Gap;
 use serde_json::{Value, json};
 
 use crate::anomaly::ScanParams;
 use crate::incident::{
-    CounterEvidence, DormantLens, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence,
-    Finding, GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
+    CounterEvidence, EngineOutcome, EngineSkip, EpisodeRefV1, EventOutcome, Evidence, Finding,
+    GaugeEvidence, GaugeMeasurement, IdentityValue, Incident, LimitAxis, LogCoverage,
     SampledLockEdge, SourceWindow, SourceWindowGapReason,
 };
 use crate::incident_input::{
@@ -28,7 +28,7 @@ pub(crate) fn no_data_response(source: u64, scan: &ScanParams, data_age: Option<
         "incidents": Value::Array(Vec::new()),
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
+        "catalog": catalog_to_json(None, &[], &BTreeMap::new(), &[], &[]),
         "log": empty_log_json(),
         "data_quality": quality_to_json(&quality, "unknown"),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some(ApiReason::no_data())),
@@ -76,7 +76,7 @@ pub(crate) fn identity_response(
         "incidents": Value::Array(Vec::new()),
         "coverage_by_section": json!({}),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(None, &[], &BTreeMap::new()),
+        "catalog": catalog_to_json(None, &[], &BTreeMap::new(), &[], &[]),
         "log": empty_log_json(),
         "data_quality": quality_to_json(&quality, analysis_status),
         "skipped": skipped_to_json(&[], &[], 0, &quality, Some(issue.reason())),
@@ -126,7 +126,13 @@ pub(crate) fn build_response(
         "incidents": incidents,
         "coverage_by_section": coverage_to_json(coverage),
         "data_age_seconds": data_age.map_or(Value::Null, Value::from),
-        "catalog": catalog_to_json(Some(coverage), input_skipped, capability_by_section),
+        "catalog": catalog_to_json(
+            Some(coverage),
+            input_skipped,
+            capability_by_section,
+            &outcome.evaluated_lens_ids,
+            &log.evaluated_lens_ids,
+        ),
         "log": log_to_json(log),
         "data_quality": quality_to_json(quality, "available"),
         "skipped": skipped_to_json(
@@ -400,7 +406,8 @@ fn log_to_json(log: &EventOutcome) -> Value {
     json!({
         "schema_version": 1,
         "complete": log.complete,
-        "evaluated_lens_ids": applied_event_ids(),
+        "registered_lens_ids": registered_event_ids(),
+        "evaluated_lens_ids": log.evaluated_lens_ids,
         "catalog": event_catalog_to_json(),
         "findings": findings,
         "coverage": log_coverage_to_json(&log.coverage),
@@ -408,7 +415,7 @@ fn log_to_json(log: &EventOutcome) -> Value {
     })
 }
 
-fn applied_event_ids() -> Vec<Value> {
+fn registered_event_ids() -> Vec<Value> {
     crate::incident::event_catalog_ids()
         .into_iter()
         .map(Value::from)
@@ -441,7 +448,8 @@ fn empty_log_json() -> Value {
     json!({
         "schema_version": 1,
         "complete": false,
-        "evaluated_lens_ids": applied_event_ids(),
+        "registered_lens_ids": registered_event_ids(),
+        "evaluated_lens_ids": Value::Array(Vec::new()),
         "catalog": event_catalog_to_json(),
         "findings": Value::Array(Vec::new()),
         "coverage": json!({}),
@@ -491,6 +499,8 @@ fn catalog_to_json(
     coverage: Option<&BTreeMap<&'static str, Vec<Gap>>>,
     input_skipped: &[SectionSkip],
     capability_by_section: &BTreeMap<&'static str, CapabilityInputState>,
+    evaluated_core_lens_ids: &[&'static str],
+    evaluated_event_lens_ids: &[&'static str],
 ) -> Value {
     let mut applied_ids = crate::incident::active_catalog_ids();
     for id in crate::incident::event_catalog_ids() {
@@ -499,7 +509,55 @@ fn catalog_to_json(
         }
     }
     let applied: Vec<Value> = applied_ids.iter().copied().map(Value::from).collect();
-    let capabilities: Vec<Value> = CONTRACT_CAPABILITIES
+    let registered_ids = crate::incident::registered_lens_ids();
+    let registered: Vec<Value> = registered_ids.iter().copied().map(Value::from).collect();
+    let evaluated_core: BTreeSet<_> = evaluated_core_lens_ids.iter().copied().collect();
+    let evaluated_event: BTreeSet<_> = evaluated_event_lens_ids.iter().copied().collect();
+    let evaluated_ids: BTreeSet<_> = evaluated_core
+        .iter()
+        .chain(&evaluated_event)
+        .copied()
+        .collect();
+    let evaluated: Vec<Value> = evaluated_ids.iter().copied().map(Value::from).collect();
+    let counts = crate::incident::catalog_counts();
+    let lens_projection = lens_catalog_to_json(&evaluated_core);
+    let evaluators =
+        evaluator_catalog_to_json(&evaluated_core, &evaluated_event, counts.evaluator_branches);
+    let capabilities = capabilities_to_json(coverage, input_skipped, capability_by_section);
+    json!({
+        "schema_version": 1,
+        "status": "partial",
+        "requirements_status": if lens_projection.incomplete_requirements == 0 {
+            "complete"
+        } else {
+            "incomplete"
+        },
+        "catalog_available": true,
+        "diagnosis_available": !evaluated_ids.is_empty(),
+        "scope": "diagnostic_lenses",
+        "registered_lens_ids": registered,
+        "applied": applied,
+        "evaluated_lens_ids": evaluated,
+        "inactive_lens_ids": crate::incident::inactive_catalog()
+            .iter()
+            .map(|lens| Value::from(lens.lens_id()))
+            .collect::<Vec<_>>(),
+        "counts": catalog_counts_to_json(counts),
+        "evaluators": evaluators,
+        "lenses": lens_projection.entries,
+        "active_count": counts.active_lens_ids,
+        "catalog_count": counts.unique_lens_ids,
+        "capabilities": capabilities,
+        "dormant": Value::Array(Vec::new()),
+    })
+}
+
+fn capabilities_to_json(
+    coverage: Option<&BTreeMap<&'static str, Vec<Gap>>>,
+    input_skipped: &[SectionSkip],
+    capability_by_section: &BTreeMap<&'static str, CapabilityInputState>,
+) -> Vec<Value> {
+    CONTRACT_CAPABILITIES
         .iter()
         .map(|&(lens_id, section)| {
             if let Some(skip) = input_skipped.iter().find(|skip| skip.section == section) {
@@ -559,19 +617,135 @@ fn catalog_to_json(
                 },
             })
         })
+        .collect()
+}
+
+struct LensCatalogProjection {
+    entries: Vec<Value>,
+    incomplete_requirements: usize,
+}
+
+fn lens_catalog_to_json(evaluated_core: &BTreeSet<&'static str>) -> LensCatalogProjection {
+    let mut incomplete_requirements = 0_usize;
+    let entries = crate::incident::core_catalog()
+        .iter()
+        .map(|lens| {
+            let requirements = lens
+                .entity_join_contract()
+                .map_or_else(Vec::new, |contract| {
+                    incomplete_requirements = incomplete_requirements.saturating_add(1);
+                    let activation = contract.activation();
+                    vec![json!({
+                        "requirement_id": format!("entity_join.{}", contract.as_str()),
+                        "kind": "entity_join",
+                        "identity": {
+                            "domain": lens.domain().as_str(),
+                            "name": "incident_lens",
+                            "value": [lens.lens_id()],
+                        },
+                        "contract": contract.as_str(),
+                        "activation": activation.as_str(),
+                        "status": "unavailable",
+                        "conditions": [
+                            requirement_condition(
+                                "producer",
+                                activation.producer(),
+                                "producer_unavailable",
+                            ),
+                            requirement_condition(
+                                "provenance",
+                                activation.provenance(),
+                                "provenance_unavailable",
+                            ),
+                            requirement_condition(
+                                "coverage",
+                                activation.coverage(),
+                                "coverage_unavailable",
+                            ),
+                        ],
+                    })]
+                });
+            json!({
+                "lens_id": lens.lens_id(),
+                "slug": lens.slug(),
+                "domain": lens.domain().as_str(),
+                "confidence_cap": lens.confidence().as_str(),
+                "evaluator_status": if evaluated_core.contains(lens.lens_id()) {
+                    "evaluated"
+                } else {
+                    "not_evaluated"
+                },
+                "requirements_status": if requirements.is_empty() {
+                    "not_applicable"
+                } else {
+                    "incomplete"
+                },
+                "requirements": requirements,
+            })
+        })
         .collect();
+    LensCatalogProjection {
+        entries,
+        incomplete_requirements,
+    }
+}
+
+fn requirement_condition(kind: &str, condition_id: &str, reason: &str) -> Value {
     json!({
-        "schema_version": 1,
-        "status": "partial",
-        "requirements_status": "incomplete",
-        "diagnosis_available": !applied.is_empty(),
-        "scope": "diagnostic_lenses",
-        "applied": applied,
-        "active_count": applied_ids.len(),
-        "catalog_count": crate::incident::core_catalog().len()
-            + applied_ids.iter().filter(|id| id.starts_with("PG-EVT-")).count(),
-        "capabilities": capabilities,
-        "dormant": dormant_entries(crate::incident::core_catalog(), &applied_ids),
+        "kind": kind,
+        "condition_id": condition_id,
+        "status": "unavailable",
+        "reason": reason,
+    })
+}
+
+fn evaluator_catalog_to_json(
+    evaluated_core: &BTreeSet<&'static str>,
+    evaluated_event: &BTreeSet<&'static str>,
+    evaluator_count: usize,
+) -> Vec<Value> {
+    let mut evaluators = Vec::with_capacity(evaluator_count);
+    evaluators.extend(crate::incident::core_catalog().iter().map(|lens| {
+        evaluator_to_json(
+            "core",
+            lens.lens_id(),
+            lens.slug(),
+            evaluated_core.contains(lens.lens_id()),
+        )
+    }));
+    evaluators.extend(
+        crate::incident::event_catalog_metadata()
+            .iter()
+            .map(|branch| {
+                evaluator_to_json(
+                    "event",
+                    branch.lens_id,
+                    branch.slug,
+                    evaluated_event.contains(branch.lens_id),
+                )
+            }),
+    );
+    evaluators
+}
+
+fn evaluator_to_json(family: &str, lens_id: &str, slug: &str, evaluated: bool) -> Value {
+    json!({
+        "family": family,
+        "lens_id": lens_id,
+        "slug": slug,
+        "status": if evaluated { "evaluated" } else { "not_evaluated" },
+    })
+}
+
+fn catalog_counts_to_json(counts: crate::incident::IncidentCatalogCounts) -> Value {
+    json!({
+        "core_lenses": counts.core_lenses,
+        "event_branches": counts.event_branches,
+        "evaluator_branches": counts.evaluator_branches,
+        "unique_lens_ids": counts.unique_lens_ids,
+        "active_lens_ids": counts.active_lens_ids,
+        "inactive_lens_ids": counts.inactive_lens_ids,
+        "entity_join_requirements": counts.entity_join_requirements,
     })
 }
 
@@ -606,28 +780,6 @@ fn section_skip_reason(reason: SkipReason) -> ApiReason {
         }
         SkipReason::IncompleteSnapshot => ApiReason::incomplete_snapshot(),
     }
-}
-
-fn dormant_entries(catalog: &'static [DormantLens], applied: &[&'static str]) -> Vec<Value> {
-    catalog
-        .iter()
-        .filter(|lens| !applied.contains(&lens.lens_id()))
-        .map(|lens| {
-            let awaiting: Vec<_> = lens
-                .missing()
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect();
-            json!({
-                "lens_id": lens.lens_id(),
-                "slug": lens.slug(),
-                "domain": lens.domain().as_str(),
-                "confidence_cap": lens.confidence().as_str(),
-                "awaiting": awaiting,
-                "requirements_status": "incomplete",
-            })
-        })
-        .collect()
 }
 
 fn quality_to_json(quality: &InputQuality, node_identity: &str) -> Value {
@@ -774,11 +926,7 @@ mod tests {
         "PG-EVT-014",
     ];
 
-    const MAX_ENTRY_JSON_BYTES: usize = 256
-        + 2 * crate::incident::MAX_CATALOG_TOKEN_BYTES
-        + crate::incident::MAX_MISSING_PER_LENS * (crate::incident::MAX_CATALOG_TOKEN_BYTES + 3);
-    const MAX_CATALOG_JSON_BYTES: usize =
-        256 + crate::incident::MAX_DORMANT_LENSES * MAX_ENTRY_JSON_BYTES;
+    const MAX_CATALOG_JSON_BYTES: usize = 64 * 1_024;
 
     fn scan() -> ScanParams {
         ScanParams {
@@ -797,6 +945,7 @@ mod tests {
             coverage: BTreeMap::new(),
             complete: true,
             skipped: Vec::new(),
+            evaluated_lens_ids: Vec::new(),
         }
     }
 
@@ -994,6 +1143,7 @@ mod tests {
             span_splits: 0,
             complete: true,
             skipped: Vec::new(),
+            evaluated_lens_ids: Vec::new(),
         };
         let body = build_response(
             7,
@@ -1012,9 +1162,23 @@ mod tests {
         let log_json = &body["log"];
         assert_eq!(log_json["complete"], false);
         assert_eq!(
+            log_json["registered_lens_ids"].as_array().map(Vec::len),
+            Some(14)
+        );
+        assert_eq!(
             log_json["evaluated_lens_ids"].as_array().map(Vec::len),
-            Some(14),
-            "the fourteen event lenses are advertised as applied"
+            Some(12),
+            "only the error-source branches executed"
+        );
+        assert_eq!(body["catalog"]["diagnosis_available"], true);
+        assert_eq!(
+            body["catalog"]["evaluators"]
+                .as_array()
+                .expect("evaluator branches")
+                .iter()
+                .filter(|entry| entry["family"] == "event" && entry["status"] == "evaluated")
+                .count(),
+            12
         );
         let finding = &log_json["findings"][0];
         assert_eq!(finding["lens_id"], "PG-EVT-007");
@@ -1030,6 +1194,20 @@ mod tests {
         );
         assert_eq!(log_json["coverage"]["pg_log_errors"], "unknown");
         assert_eq!(log_json["coverage"]["pg_log_lifecycle"], "not_collected");
+
+        let limited = evaluate_events(
+            &events,
+            &lenses,
+            &EventConfig::with(u64::MAX, 1, u64::MAX, u64::MAX, u64::MAX),
+        )
+        .expect("bounded partial event evaluation");
+        let limited_json = log_to_json(&limited);
+        assert_eq!(
+            limited_json["registered_lens_ids"].as_array().map(Vec::len),
+            Some(14)
+        );
+        assert_eq!(limited_json["evaluated_lens_ids"], json!(["PG-EVT-003"]));
+        assert_eq!(limited_json["skipped"][0]["lens_id"], "OS-FS-027");
     }
 
     #[test]
@@ -1060,13 +1238,48 @@ mod tests {
 
     #[test]
     fn catalog_json_stays_within_its_static_budget() {
-        let catalog = catalog_to_json(None, &[], &BTreeMap::new());
-        assert_eq!(catalog, catalog_to_json(None, &[], &BTreeMap::new()));
+        let catalog = catalog_to_json(None, &[], &BTreeMap::new(), &[], &[]);
+        assert_eq!(
+            catalog,
+            catalog_to_json(None, &[], &BTreeMap::new(), &[], &[])
+        );
         let bytes = serde_json::to_vec(&catalog).expect("catalog JSON");
         assert!(!bytes.is_empty());
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
         assert!(catalog.get("log_dormant").is_none());
         assert!(catalog["dormant"].as_array().is_some_and(Vec::is_empty));
+        let registered: BTreeSet<_> = catalog["registered_lens_ids"]
+            .as_array()
+            .expect("registered IDs")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let applied: BTreeSet<_> = catalog["applied"]
+            .as_array()
+            .expect("legacy applied IDs")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(applied, registered);
+    }
+
+    fn assert_machine_only(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                for forbidden in ["title", "question", "text_locale"] {
+                    assert!(!object.contains_key(forbidden), "{forbidden}");
+                }
+                for child in object.values() {
+                    assert_machine_only(child);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    assert_machine_only(child);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[test]
@@ -1083,64 +1296,90 @@ mod tests {
             );
         }
 
-        let dormant = dormant_entries(crate::incident::core_catalog(), &[]);
-        assert_eq!(dormant.len(), crate::incident::MAX_DORMANT_LENSES);
-        for entry in &dormant {
-            let object = entry.as_object().expect("dormant catalog object");
-            assert!(object.get("title").is_none());
-            assert!(object.get("question").is_none());
-            assert!(object.get("text_locale").is_none());
-            assert_eq!(object.len(), 6);
-        }
+        let catalog = catalog_to_json(None, &[], &BTreeMap::new(), &[], &[]);
+        assert_machine_only(&catalog);
+        assert_eq!(catalog["lenses"].as_array().map(Vec::len), Some(28));
+        assert_eq!(catalog["evaluators"].as_array().map(Vec::len), Some(42));
     }
 
     #[test]
-    fn typed_entity_joins_project_only_the_stable_capability_token() {
-        let catalog = crate::incident::core_catalog();
-        let projected = dormant_entries(catalog, &[]);
-        let mut entity_join_entries = 0;
-        for lens in catalog {
-            let entry = projected
+    fn active_entity_join_requirements_are_typed_and_request_specific() {
+        let catalog = catalog_to_json(None, &[], &BTreeMap::new(), &["PG-WAIT-019"], &[]);
+        let lenses = catalog["lenses"].as_array().expect("active lens metadata");
+        assert_eq!(
+            lenses
                 .iter()
-                .find(|entry| entry["lens_id"] == lens.lens_id())
-                .expect("projected dormant lens");
-            let expected: Vec<_> = lens
-                .missing()
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect();
-            assert_eq!(entry["awaiting"], json!(expected), "{}", lens.lens_id());
-            if lens.entity_join_contract().is_some() {
-                entity_join_entries += 1;
-                assert_eq!(
-                    entry["awaiting"]
-                        .as_array()
-                        .expect("awaiting capability list")
-                        .iter()
-                        .filter(|capability| {
-                            capability.as_str() == Some("cross_section_entity_join")
-                        })
-                        .count(),
-                    1,
-                    "{}",
-                    lens.lens_id(),
-                );
-            }
-        }
-        assert_eq!(entity_join_entries, 24);
+                .flat_map(|lens| lens["requirements"].as_array().expect("lens requirements"))
+                .count(),
+            24
+        );
 
-        let encoded = serde_json::to_string(&projected).expect("dormant catalog JSON");
-        for internal_token in [
-            "activity_lock_waiter",
-            "backend_relation_horizon",
-            "shared_snapshot_producer",
-            "typed_relation_producer",
-            "stored_mapping_producer",
-            "shared_snapshot_token",
-            "snapshot_scoped_relation",
-            "overlapping_lifetime_mapping",
+        let wait = lenses
+            .iter()
+            .find(|lens| lens["lens_id"] == "PG-WAIT-019")
+            .expect("wait lens");
+        assert_eq!(wait["evaluator_status"], "evaluated");
+        assert_eq!(wait["requirements_status"], "incomplete");
+        assert_eq!(
+            wait["requirements"][0],
+            json!({
+                "requirement_id": "entity_join.activity_lock_waiter",
+                "kind": "entity_join",
+                "identity": {
+                    "domain": "pg",
+                    "name": "incident_lens",
+                    "value": ["PG-WAIT-019"],
+                },
+                "contract": "activity_lock_waiter",
+                "activation": "shared_snapshot",
+                "status": "unavailable",
+                "conditions": [
+                    {
+                        "kind": "producer",
+                        "condition_id": "shared_snapshot_producer",
+                        "status": "unavailable",
+                        "reason": "producer_unavailable",
+                    },
+                    {
+                        "kind": "provenance",
+                        "condition_id": "shared_snapshot_token",
+                        "status": "unavailable",
+                        "reason": "provenance_unavailable",
+                    },
+                    {
+                        "kind": "coverage",
+                        "condition_id": "both_inputs_complete",
+                        "status": "unavailable",
+                        "reason": "coverage_unavailable",
+                    },
+                ],
+            })
+        );
+        let lock = lenses
+            .iter()
+            .find(|lens| lens["lens_id"] == "PG-LOCK-012")
+            .expect("lock lens");
+        assert_eq!(lock["evaluator_status"], "not_evaluated");
+        assert_eq!(lock["requirements_status"], "not_applicable");
+        assert_eq!(lock["requirements"], json!([]));
+
+        let encoded = serde_json::to_string(&catalog).expect("active catalog JSON");
+        for generic_token in [
+            "typed_counter_deltas",
+            "typed_gauge_samples",
+            "paired_interval_inputs",
+            "source_period_provenance",
+            "request_input_coverage",
+            "track_planning_gate",
+            "store_plans_bridge",
+            "sampled_blocked_by_edges",
+            "lock_snapshot_coverage",
+            "sampled_activity_rows",
+            "pid_cgroup_mapping",
+            "incident_log_event_input",
+            "cross_section_entity_join",
         ] {
-            assert!(!encoded.contains(internal_token), "{internal_token}");
+            assert!(!encoded.contains(generic_token), "{generic_token}");
         }
     }
 
@@ -1149,7 +1388,7 @@ mod tests {
         let mut states = BTreeMap::new();
         states.insert("pg_freeze_horizon", CapabilityInputState::NotCollected);
         states.insert("pg_storage_mount", CapabilityInputState::Partial);
-        let catalog = catalog_to_json(Some(&BTreeMap::new()), &[], &states);
+        let catalog = catalog_to_json(Some(&BTreeMap::new()), &[], &states, &[], &[]);
         let capabilities = catalog["capabilities"].as_array().expect("capability list");
         let capability_entry = |lens_id| {
             capabilities
@@ -1203,7 +1442,16 @@ mod tests {
         assert_eq!(body["data_age_seconds"], Value::Null);
         assert!(body["skipped"].get("sections").is_some());
         assert_eq!(body["catalog"]["status"], "partial");
-        assert_eq!(body["catalog"]["diagnosis_available"], true);
+        assert_eq!(body["catalog"]["catalog_available"], true);
+        assert_eq!(body["catalog"]["diagnosis_available"], false);
+        assert_eq!(body["catalog"]["evaluated_lens_ids"], json!([]));
+        assert!(
+            body["catalog"]["evaluators"]
+                .as_array()
+                .is_some_and(|entries| entries
+                    .iter()
+                    .all(|entry| entry["status"] == "not_evaluated"))
+        );
         assert_eq!(body["catalog"]["applied"], json!(APPLIED_IDS));
         assert!(
             body["catalog"]["dormant"]
@@ -1223,6 +1471,8 @@ mod tests {
             let body = identity_response(7, &scan(), None, issue);
             assert_eq!(body["analysis_status"], expected);
             assert_eq!(body["data_quality"]["node_identity"], expected);
+            assert_eq!(body["catalog"]["diagnosis_available"], false);
+            assert_eq!(body["catalog"]["evaluated_lens_ids"], json!([]));
             assert_eq!(
                 body["skipped"]["analysis"][0]["reason"],
                 json!({ "kind": expected, "params": {} })
@@ -1247,6 +1497,7 @@ mod tests {
             span_splits: 0,
             complete: true,
             skipped: Vec::new(),
+            evaluated_lens_ids: Vec::new(),
         };
         let body = build_response(
             7,
@@ -1282,6 +1533,7 @@ mod tests {
             span_splits: 0,
             complete: true,
             skipped: Vec::new(),
+            evaluated_lens_ids: Vec::new(),
         };
         let body = build_response(
             7,
@@ -1323,6 +1575,7 @@ mod tests {
             span_splits: 0,
             complete: true,
             skipped: Vec::new(),
+            evaluated_lens_ids: Vec::new(),
         };
         let skipped = [
             SectionSkip {
@@ -1373,6 +1626,7 @@ mod tests {
             span_splits: 0,
             complete: false,
             skipped: Vec::new(),
+            evaluated_lens_ids: Vec::new(),
         };
         let quality = InputQuality {
             evaluated_positions: 1,

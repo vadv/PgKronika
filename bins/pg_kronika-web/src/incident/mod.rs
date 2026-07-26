@@ -3,6 +3,7 @@
 //! Reader preparation and HTTP/JSON adapters live outside this module.
 
 mod active;
+mod catalog;
 mod cluster;
 mod dispatch;
 mod engine;
@@ -28,6 +29,7 @@ pub(crate) use typed::{
 };
 
 pub(crate) use active::{active_catalog, active_catalog_ids};
+pub(crate) use catalog::{IncidentCatalogCounts, catalog_counts, registered_lens_ids};
 pub(crate) use dispatch::LimitAxis;
 pub(crate) use engine::{
     AnalyzeError, ClockRelation, EngineOutcome, EngineSkip, Incident, IncidentConfig, analyze,
@@ -52,8 +54,5 @@ pub(crate) use evidence::{
     reason = "engine tests use Lens while the HTTP endpoint exposes clustering only"
 )]
 pub(crate) use lens::Lens;
-#[cfg(test)]
-pub(crate) use lenses::dormant_catalog;
-pub(crate) use lenses::{DormantLens, core_catalog};
-#[cfg(test)]
-pub(crate) use lenses::{MAX_CATALOG_TOKEN_BYTES, MAX_DORMANT_LENSES, MAX_MISSING_PER_LENS};
+pub(crate) use lenses::core_catalog;
+pub(crate) use lenses::inactive_catalog;

@@ -1193,13 +1193,29 @@ fn writeback_ratio_uses_dirty_plus_writeback_at_one_timestamp() {
 }
 
 #[test]
-fn active_and_dormant_lenses_are_accounted_once() {
-    let active = active_catalog_ids();
-    assert_eq!(active.len(), 28);
-    assert_eq!(crate::incident::core_catalog().len(), active.len());
-    assert!(crate::incident::dormant_catalog().is_empty());
-    let unique: std::collections::BTreeSet<_> = active.iter().copied().collect();
-    assert_eq!(unique.len(), active.len());
+fn executable_lenses_match_the_neutral_catalog_metadata() {
+    let active_ids = active_catalog_ids();
+    assert_eq!(active_ids.len(), 28);
+    assert_eq!(crate::incident::core_catalog().len(), active_ids.len());
+    assert!(crate::incident::inactive_catalog().is_empty());
+    let unique: std::collections::BTreeSet<_> = active_ids.iter().copied().collect();
+    assert_eq!(unique.len(), active_ids.len());
+
+    let mismatches: Vec<_> = active_catalog()
+        .into_iter()
+        .filter_map(|evaluator| {
+            let metadata = crate::incident::core_catalog()
+                .iter()
+                .find(|entry| entry.lens_id() == evaluator.id())
+                .expect("every executable core lens has neutral metadata");
+            (metadata.confidence() != evaluator.confidence_cap()).then_some((
+                evaluator.id(),
+                metadata.confidence(),
+                evaluator.confidence_cap(),
+            ))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{mismatches:?}");
 }
 
 #[test]

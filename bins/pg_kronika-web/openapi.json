@@ -1296,40 +1296,152 @@
       "IncidentCatalog": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "status", "requirements_status", "diagnosis_available", "scope", "applied", "active_count", "catalog_count", "capabilities", "dormant"],
+        "required": ["schema_version", "status", "requirements_status", "catalog_available", "diagnosis_available", "scope", "registered_lens_ids", "evaluated_lens_ids", "inactive_lens_ids", "counts", "evaluators", "lenses", "applied", "active_count", "catalog_count", "capabilities", "dormant"],
         "properties": {
           "schema_version": { "type": "integer", "const": 1 },
           "status": { "type": "string", "const": "partial" },
           "requirements_status": { "type": "string", "const": "incomplete" },
+          "catalog_available": { "type": "boolean" },
           "diagnosis_available": { "type": "boolean" },
           "scope": { "type": "string", "const": "diagnostic_lenses" },
-          "applied": { "type": "array", "items": { "type": "string" } },
-          "active_count": { "type": "integer", "minimum": 0 },
-          "catalog_count": { "type": "integer", "minimum": 0 },
+          "registered_lens_ids": { "type": "array", "minItems": 40, "maxItems": 40, "uniqueItems": true, "items": { "$ref": "#/components/schemas/IncidentLensId" } },
+          "evaluated_lens_ids": { "type": "array", "maxItems": 40, "uniqueItems": true, "items": { "$ref": "#/components/schemas/IncidentLensId" } },
+          "inactive_lens_ids": { "type": "array", "maxItems": 0, "items": { "$ref": "#/components/schemas/IncidentLensId" } },
+          "counts": { "$ref": "#/components/schemas/IncidentCatalogCounts" },
+          "evaluators": { "type": "array", "minItems": 42, "maxItems": 42, "items": { "$ref": "#/components/schemas/IncidentEvaluator" } },
+          "lenses": { "type": "array", "minItems": 28, "maxItems": 28, "items": { "$ref": "#/components/schemas/ActiveIncidentLens" } },
+          "applied": { "type": "array", "minItems": 40, "maxItems": 40, "uniqueItems": true, "deprecated": true, "description": "Deprecated compatibility view of the registered ID set. Its order is legacy; registered_lens_ids is canonical.", "items": { "$ref": "#/components/schemas/IncidentLensId" } },
+          "active_count": { "type": "integer", "const": 40, "deprecated": true, "description": "Compatibility alias for counts.active_lens_ids." },
+          "catalog_count": { "type": "integer", "const": 40, "deprecated": true, "description": "Compatibility alias for counts.unique_lens_ids." },
           "capabilities": { "type": "array", "items": { "$ref": "#/components/schemas/LensCapability" } },
-          "dormant": { "type": "array", "items": { "$ref": "#/components/schemas/DormantLens" } }
+          "dormant": { "type": "array", "maxItems": 0, "deprecated": true, "description": "Compatibility field; use inactive_lens_ids and counts.inactive_lens_ids.", "items": { "$ref": "#/components/schemas/InactiveIncidentLens" } }
         }
+      },
+      "IncidentLensId": {
+        "type": "string",
+        "pattern": "^(PG|OS)-[A-Z0-9]+-[0-9]{3}$",
+        "maxLength": 20
+      },
+      "IncidentCatalogCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["core_lenses", "event_branches", "evaluator_branches", "unique_lens_ids", "active_lens_ids", "inactive_lens_ids", "entity_join_requirements"],
+        "properties": {
+          "core_lenses": { "type": "integer", "const": 28 },
+          "event_branches": { "type": "integer", "const": 14 },
+          "evaluator_branches": { "type": "integer", "const": 42 },
+          "unique_lens_ids": { "type": "integer", "const": 40 },
+          "active_lens_ids": { "type": "integer", "const": 40 },
+          "inactive_lens_ids": { "type": "integer", "const": 0 },
+          "entity_join_requirements": { "type": "integer", "const": 24 }
+        }
+      },
+      "IncidentEvaluator": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["family", "lens_id", "slug", "status"],
+        "properties": {
+          "family": { "type": "string", "enum": ["core", "event"] },
+          "lens_id": { "$ref": "#/components/schemas/IncidentLensId" },
+          "slug": { "type": "string", "pattern": "^[a-z0-9_]+$", "maxLength": 64 },
+          "status": { "type": "string", "enum": ["evaluated", "not_evaluated"] }
+        }
+      },
+      "ActiveIncidentLens": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lens_id", "slug", "domain", "confidence_cap", "evaluator_status", "requirements_status", "requirements"],
+        "properties": {
+          "lens_id": { "$ref": "#/components/schemas/IncidentLensId" },
+          "slug": { "type": "string", "pattern": "^[a-z0-9_]+$", "maxLength": 64 },
+          "domain": { "type": "string", "enum": ["pg", "os"] },
+          "confidence_cap": { "type": "string", "enum": ["low", "medium", "high"] },
+          "evaluator_status": { "type": "string", "enum": ["evaluated", "not_evaluated"] },
+          "requirements_status": { "type": "string", "enum": ["incomplete", "not_applicable"] },
+          "requirements": { "type": "array", "maxItems": 1, "items": { "$ref": "#/components/schemas/IncidentRequirement" } }
+        },
+        "allOf": [
+          { "if": { "properties": { "requirements_status": { "const": "not_applicable" } } }, "then": { "properties": { "requirements": { "maxItems": 0 } } } },
+          { "if": { "properties": { "requirements_status": { "const": "incomplete" } } }, "then": { "properties": { "requirements": { "minItems": 1 } } } }
+        ]
+      },
+      "IncidentRequirement": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["requirement_id", "kind", "identity", "contract", "activation", "status", "conditions"],
+        "properties": {
+          "requirement_id": {
+            "type": "string",
+            "enum": ["entity_join.query_database_temp", "entity_join.relation_query_plan", "entity_join.relation_vacuum", "entity_join.relation_vacuum_horizon", "entity_join.relation_index_wal", "entity_join.query_wal_checkpoint", "entity_join.relation_query_cache", "entity_join.pg_io_block_device", "entity_join.backend_relation_horizon", "entity_join.database_backend", "entity_join.replication_wal", "entity_join.slot_filesystem", "entity_join.archive_filesystem", "entity_join.backend_replication", "entity_join.activity_lock_waiter", "entity_join.host_pg_cpu", "entity_join.backend_cgroup_cpu", "entity_join.host_pg_memory", "entity_join.backend_cgroup_memory", "entity_join.pg_storage_block_device", "entity_join.writer_block_device", "entity_join.process_cgroup_device", "entity_join.pg_storage_filesystem", "entity_join.pg_endpoint_network"]
+          },
+          "kind": { "type": "string", "const": "entity_join" },
+          "identity": { "$ref": "#/components/schemas/IncidentRequirementIdentity" },
+          "contract": {
+            "type": "string",
+            "enum": ["query_database_temp", "relation_query_plan", "relation_vacuum", "relation_vacuum_horizon", "relation_index_wal", "query_wal_checkpoint", "relation_query_cache", "pg_io_block_device", "backend_relation_horizon", "database_backend", "replication_wal", "slot_filesystem", "archive_filesystem", "backend_replication", "activity_lock_waiter", "host_pg_cpu", "backend_cgroup_cpu", "host_pg_memory", "backend_cgroup_memory", "pg_storage_block_device", "writer_block_device", "process_cgroup_device", "pg_storage_filesystem", "pg_endpoint_network"]
+          },
+          "activation": { "type": "string", "enum": ["shared_snapshot", "snapshot_relation", "lifetime_mapping"] },
+          "status": { "type": "string", "const": "unavailable" },
+          "conditions": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "uniqueItems": true,
+            "items": { "$ref": "#/components/schemas/IncidentRequirementCondition" },
+            "allOf": [
+              { "contains": { "properties": { "kind": { "const": "producer" } }, "required": ["kind"] }, "minContains": 1, "maxContains": 1 },
+              { "contains": { "properties": { "kind": { "const": "provenance" } }, "required": ["kind"] }, "minContains": 1, "maxContains": 1 },
+              { "contains": { "properties": { "kind": { "const": "coverage" } }, "required": ["kind"] }, "minContains": 1, "maxContains": 1 }
+            ]
+          }
+        }
+      },
+      "IncidentRequirementIdentity": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["domain", "name", "value"],
+        "properties": {
+          "domain": { "type": "string", "enum": ["pg", "os"] },
+          "name": { "type": "string", "const": "incident_lens" },
+          "value": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "$ref": "#/components/schemas/IncidentLensId" } }
+        }
+      },
+      "IncidentRequirementCondition": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "condition_id", "status", "reason"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["producer", "provenance", "coverage"] },
+          "condition_id": { "type": "string", "enum": ["shared_snapshot_producer", "typed_relation_producer", "stored_mapping_producer", "shared_snapshot_token", "snapshot_scoped_relation", "overlapping_lifetime_mapping", "both_inputs_complete", "relation_and_inputs_complete", "mapping_and_inputs_complete"] },
+          "status": { "type": "string", "const": "unavailable" },
+          "reason": { "type": "string", "enum": ["producer_unavailable", "provenance_unavailable", "coverage_unavailable"] }
+        },
+        "allOf": [
+          { "if": { "properties": { "kind": { "const": "producer" } } }, "then": { "properties": { "condition_id": { "enum": ["shared_snapshot_producer", "typed_relation_producer", "stored_mapping_producer"] }, "reason": { "const": "producer_unavailable" } } } },
+          { "if": { "properties": { "kind": { "const": "provenance" } } }, "then": { "properties": { "condition_id": { "enum": ["shared_snapshot_token", "snapshot_scoped_relation", "overlapping_lifetime_mapping"] }, "reason": { "const": "provenance_unavailable" } } } },
+          { "if": { "properties": { "kind": { "const": "coverage" } } }, "then": { "properties": { "condition_id": { "enum": ["both_inputs_complete", "relation_and_inputs_complete", "mapping_and_inputs_complete"] }, "reason": { "const": "coverage_unavailable" } } } }
+        ]
       },
       "LensCapability": {
         "type": "object",
         "additionalProperties": false,
         "required": ["lens_id", "section", "status", "reason"],
         "properties": {
-          "lens_id": { "type": "string" },
+          "lens_id": { "$ref": "#/components/schemas/IncidentLensId" },
           "section": { "type": "string" },
           "status": { "type": "string", "enum": ["available", "partial", "not_collected"] },
           "reason": { "$ref": "#/components/schemas/Reason" }
         }
       },
-      "DormantLens": {
+      "InactiveIncidentLens": {
         "type": "object",
         "additionalProperties": false,
         "required": ["lens_id", "slug", "domain", "confidence_cap", "awaiting", "requirements_status"],
         "properties": {
-          "lens_id": { "type": "string" },
+          "lens_id": { "$ref": "#/components/schemas/IncidentLensId" },
           "slug": { "type": "string" },
-          "domain": { "type": "string" },
-          "confidence_cap": { "type": "string" },
+          "domain": { "type": "string", "enum": ["pg", "os"] },
+          "confidence_cap": { "type": "string", "enum": ["low", "medium", "high"] },
           "awaiting": { "type": "array", "items": { "type": "string" } },
           "requirements_status": { "type": "string", "const": "incomplete" }
         }
@@ -1337,14 +1449,15 @@
       "IncidentLog": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "complete", "evaluated_lens_ids", "catalog", "findings", "coverage", "skipped"],
+        "required": ["schema_version", "complete", "registered_lens_ids", "evaluated_lens_ids", "catalog", "findings", "coverage", "skipped"],
         "properties": {
           "schema_version": { "type": "integer", "const": 1 },
           "complete": { "type": "boolean" },
-          "evaluated_lens_ids": { "type": "array", "items": { "type": "string" } },
-          "catalog": { "type": "array", "items": { "$ref": "#/components/schemas/EventCatalogEntry" } },
+          "registered_lens_ids": { "type": "array", "minItems": 14, "maxItems": 14, "uniqueItems": true, "items": { "$ref": "#/components/schemas/IncidentLensId" } },
+          "evaluated_lens_ids": { "type": "array", "maxItems": 14, "uniqueItems": true, "items": { "$ref": "#/components/schemas/IncidentLensId" } },
+          "catalog": { "type": "array", "minItems": 14, "maxItems": 14, "items": { "$ref": "#/components/schemas/EventCatalogEntry" } },
           "findings": { "type": "array", "items": { "$ref": "#/components/schemas/NeutralObject" } },
-          "coverage": { "type": "object", "additionalProperties": { "type": "string" } },
+          "coverage": { "type": "object", "additionalProperties": { "type": "string", "enum": ["unknown", "gap", "not_collected"] } },
           "skipped": { "type": "array", "items": { "$ref": "#/components/schemas/EngineSkip" } }
         }
       },
@@ -1353,8 +1466,8 @@
         "additionalProperties": false,
         "required": ["lens_id", "slug", "source_format", "evidence_quality"],
         "properties": {
-          "lens_id": { "type": "string" },
-          "slug": { "type": "string" },
+          "lens_id": { "$ref": "#/components/schemas/IncidentLensId" },
+          "slug": { "type": "string", "pattern": "^[a-z0-9_]+$", "maxLength": 64 },
           "source_format": { "type": "string", "const": "stderr" },
           "evidence_quality": { "type": "string", "const": "heuristic_positive_observation" }
         }

@@ -1,14 +1,14 @@
-//! Dormant diagnostic catalog metadata.
+//! Stable metadata for the core diagnostic-lens catalog.
 
 use super::entity_join::EntityJoinContract;
 use super::evidence::ConfidenceCap;
 
-pub(crate) const MAX_DORMANT_LENSES: usize = 28;
-pub(crate) const MAX_MISSING_PER_LENS: usize = 6;
+pub(crate) const MAX_CORE_LENSES: usize = 28;
+pub(crate) const MAX_REQUIREMENTS_PER_LENS: usize = 6;
 pub(crate) const MAX_CATALOG_TOKEN_BYTES: usize = 40;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MissingCapability {
+pub(crate) enum CapabilityRequirement {
     CounterDeltas,
     GaugeSamples,
     PairedIntervals,
@@ -24,7 +24,7 @@ pub(crate) enum MissingCapability {
     IncidentLogEventInput,
 }
 
-impl MissingCapability {
+impl CapabilityRequirement {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CounterDeltas => "typed_counter_deltas",
@@ -85,16 +85,16 @@ impl Domain {
     }
 }
 
-/// Stable semantic metadata and known missing capabilities for one lens.
-pub(crate) struct DormantLens {
+/// Stable semantic metadata and design requirements for one core lens.
+pub(crate) struct LensMetadata {
     lens_id: &'static str,
     slug: &'static str,
     domain: Domain,
     confidence: ConfidenceCap,
-    missing: &'static [MissingCapability],
+    requirements: &'static [CapabilityRequirement],
 }
 
-impl DormantLens {
+impl LensMetadata {
     pub(crate) const fn lens_id(&self) -> &'static str {
         self.lens_id
     }
@@ -111,14 +111,14 @@ impl DormantLens {
         self.confidence
     }
 
-    pub(crate) const fn missing(&self) -> &'static [MissingCapability] {
-        self.missing
+    pub(crate) const fn requirements(&self) -> &'static [CapabilityRequirement] {
+        self.requirements
     }
 
     pub(crate) const fn entity_join_contract(&self) -> Option<EntityJoinContract> {
         let mut at = 0;
-        while at < self.missing.len() {
-            if let Some(contract) = self.missing[at].entity_join() {
+        while at < self.requirements.len() {
+            if let Some(contract) = self.requirements[at].entity_join() {
                 return Some(contract);
             }
             at += 1;
@@ -127,27 +127,27 @@ impl DormantLens {
     }
 }
 
+use CapabilityRequirement as Missing;
 use EntityJoinContract as Join;
-use MissingCapability as Missing;
 
-const DORMANT_CATALOG: &[DormantLens] = &[
-    DormantLens {
+const CORE_LENS_METADATA: &[LensMetadata] = &[
+    LensMetadata {
         lens_id: "PG-QRY-001",
         slug: "query_workload_shift",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-PLAN-002",
         slug: "plan_change",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::GaugeSamples,
             Missing::StorePlansBridge,
@@ -157,12 +157,12 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-TEMP-003",
         slug: "temp_spill",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::IncidentLogEventInput,
@@ -170,24 +170,24 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-ANALYZE-004",
         slug: "stale_statistics",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Low,
-        missing: &[
+        requirements: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::EntityJoin(Join::RelationQueryPlan),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-VACUUM-005",
         slug: "vacuum_backlog",
         domain: Domain::Pg,
-        confidence: ConfidenceCap::Medium,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::IncidentLogEventInput,
@@ -195,91 +195,91 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-FREEZE-006",
         slug: "xid_wraparound_risk",
         domain: Domain::Pg,
-        confidence: ConfidenceCap::Medium,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::GaugeSamples,
             Missing::IncidentLogEventInput,
             Missing::EntityJoin(Join::RelationVacuumHorizon),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-HOT-007",
         slug: "hot_update_failure",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::EntityJoin(Join::RelationIndexWal),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-CHKPT-008",
         slug: "requested_checkpoints",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::IncidentLogEventInput,
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-WAL-009",
         slug: "wal_amplification",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::EntityJoin(Join::QueryWalCheckpoint),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-CACHE-010",
         slug: "shared_buffer_misses",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::EntityJoin(Join::RelationQueryCache),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-IO-011",
         slug: "backend_io_latency",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::EntityJoin(Join::PgIoBlockDevice),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-LOCK-012",
         slug: "lock_wait_graph",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[Missing::BlockedByEdges, Missing::LockSnapshotCoverage],
+        requirements: &[Missing::BlockedByEdges, Missing::LockSnapshotCoverage],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-HORIZON-013",
         slug: "xmin_horizon_hold",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::ActivityRows,
@@ -289,12 +289,12 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-CONN-014",
         slug: "connection_saturation",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::ActivityRows,
@@ -302,47 +302,47 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-REPL-015",
         slug: "replication_lag",
         domain: Domain::Pg,
-        confidence: ConfidenceCap::Medium,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::EntityJoin(Join::ReplicationWal),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-SLOT-016",
         slug: "slot_wal_retention",
         domain: Domain::Pg,
-        confidence: ConfidenceCap::Medium,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::GaugeSamples,
             Missing::EntityJoin(Join::SlotFilesystem),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-ARCH-017",
         slug: "wal_archiving_failure",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::GaugeSamples,
             Missing::EntityJoin(Join::ArchiveFilesystem),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-SYNC-018",
         slug: "sync_replication_wait",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::ActivityRows,
             Missing::CounterDeltas,
             Missing::EntityJoin(Join::BackendReplication),
@@ -351,12 +351,12 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "PG-WAIT-019",
         slug: "internal_wait_concentration",
         domain: Domain::Pg,
         confidence: ConfidenceCap::Low,
-        missing: &[
+        requirements: &[
             Missing::ActivityRows,
             Missing::EntityJoin(Join::ActivityLockWaiter),
             // Period derivable from the activity snapshot cadence, an input the catalog does not yet feed.
@@ -364,48 +364,48 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "OS-CPU-020",
         slug: "cpu_saturation",
         domain: Domain::Os,
-        confidence: ConfidenceCap::Medium,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::EntityJoin(Join::HostPgCpu),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "OS-CGRP-021",
         slug: "cgroup_cpu_throttling",
         domain: Domain::Os,
         confidence: ConfidenceCap::Medium,
-        missing: &[
+        requirements: &[
             Missing::PidCgroupMapping,
             Missing::CounterDeltas,
             Missing::EntityJoin(Join::BackendCgroupCpu),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "OS-MEM-022",
         slug: "memory_reclaim",
         domain: Domain::Os,
-        confidence: ConfidenceCap::Medium,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::EntityJoin(Join::HostPgMemory),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "OS-CGMEM-023",
         slug: "cgroup_memory_limit",
         domain: Domain::Os,
-        confidence: ConfidenceCap::Medium,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::PidCgroupMapping,
             Missing::GaugeSamples,
             Missing::CounterDeltas,
@@ -413,60 +413,60 @@ const DORMANT_CATALOG: &[DormantLens] = &[
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "OS-BLOCK-024",
         slug: "block_device_latency",
         domain: Domain::Os,
-        confidence: ConfidenceCap::Medium,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::EntityJoin(Join::PgStorageBlockDevice),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "OS-WB-025",
         slug: "writeback_pressure",
         domain: Domain::Os,
         confidence: ConfidenceCap::Low,
-        missing: &[
+        requirements: &[
             Missing::GaugeSamples,
             Missing::CounterDeltas,
             Missing::EntityJoin(Join::WriterBlockDevice),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "OS-IOWHO-026",
         slug: "io_contender",
         domain: Domain::Os,
-        confidence: ConfidenceCap::Medium,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PidCgroupMapping,
             Missing::EntityJoin(Join::ProcessCgroupDevice),
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "OS-FS-027",
         slug: "filesystem_space",
         domain: Domain::Os,
-        confidence: ConfidenceCap::High,
-        missing: &[
+        confidence: ConfidenceCap::Low,
+        requirements: &[
             Missing::GaugeSamples,
             Missing::EntityJoin(Join::PgStorageFilesystem),
             Missing::IncidentLogEventInput,
             Missing::InputCoverage,
         ],
     },
-    DormantLens {
+    LensMetadata {
         lens_id: "OS-NET-028",
         slug: "network_errors",
         domain: Domain::Os,
         confidence: ConfidenceCap::Low,
-        missing: &[
+        requirements: &[
             Missing::CounterDeltas,
             Missing::PairedIntervals,
             Missing::EntityJoin(Join::PgEndpointNetwork),
@@ -475,13 +475,13 @@ const DORMANT_CATALOG: &[DormantLens] = &[
     },
 ];
 
-/// Returns all stable core-lens design entries.
-pub(crate) const fn core_catalog() -> &'static [DormantLens] {
-    DORMANT_CATALOG
+/// Returns all stable core-lens metadata entries.
+pub(crate) const fn core_catalog() -> &'static [LensMetadata] {
+    CORE_LENS_METADATA
 }
 
 /// No core lens is statically inactive. Runtime capability is request-specific.
-pub(crate) const fn dormant_catalog() -> &'static [DormantLens] {
+pub(crate) const fn inactive_catalog() -> &'static [LensMetadata] {
     &[]
 }
 
@@ -649,8 +649,8 @@ const fn slug_is_valid(value: &str) -> bool {
     true
 }
 
-const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
-    if catalog.is_empty() || catalog.len() > MAX_DORMANT_LENSES {
+const fn catalog_is_valid(catalog: &[LensMetadata]) -> bool {
+    if catalog.is_empty() || catalog.len() > MAX_CORE_LENSES {
         return false;
     }
     let mut lens_at = 0;
@@ -659,8 +659,8 @@ const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
         if lens.lens_id.is_empty()
             || lens.lens_id.len() > MAX_CATALOG_TOKEN_BYTES
             || !slug_is_valid(lens.slug)
-            || lens.missing.is_empty()
-            || lens.missing.len() > MAX_MISSING_PER_LENS
+            || lens.requirements.is_empty()
+            || lens.requirements.len() > MAX_REQUIREMENTS_PER_LENS
         {
             return false;
         }
@@ -674,8 +674,8 @@ const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
             previous_lens += 1;
         }
         let mut capability_at = 0;
-        while capability_at < lens.missing.len() {
-            let capability = lens.missing[capability_at];
+        while capability_at < lens.requirements.len() {
+            let capability = lens.requirements[capability_at];
             if capability.as_str().len() > MAX_CATALOG_TOKEN_BYTES {
                 return false;
             }
@@ -691,7 +691,7 @@ const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
             }
             let mut previous_capability = 0;
             while previous_capability < capability_at {
-                if lens.missing[previous_capability].kind_id() == capability.kind_id() {
+                if lens.requirements[previous_capability].kind_id() == capability.kind_id() {
                     return false;
                 }
                 previous_capability += 1;
@@ -704,8 +704,8 @@ const fn catalog_is_valid(catalog: &[DormantLens]) -> bool {
 }
 
 const _: () = assert!(
-    catalog_is_valid(DORMANT_CATALOG),
-    "dormant catalog violates static bounds"
+    catalog_is_valid(CORE_LENS_METADATA),
+    "core lens metadata violates static bounds"
 );
 
 #[cfg(test)]
@@ -896,14 +896,14 @@ mod tests {
     fn fixture(
         lens_id: &'static str,
         slug: &'static str,
-        missing: &'static [MissingCapability],
-    ) -> DormantLens {
-        DormantLens {
+        requirements: &'static [CapabilityRequirement],
+    ) -> LensMetadata {
+        LensMetadata {
             lens_id,
             slug,
             domain: Domain::Pg,
             confidence: ConfidenceCap::Medium,
-            missing,
+            requirements,
         }
     }
 
@@ -981,7 +981,7 @@ mod tests {
             .find(|lens| lens.lens_id() == "PG-LOCK-012")
             .expect("lock catalog entry");
         let requirements: Vec<_> = lock
-            .missing()
+            .requirements()
             .iter()
             .map(|capability| capability.as_str())
             .collect();
@@ -999,7 +999,7 @@ mod tests {
             .find(|lens| lens.lens_id() == "PG-WAIT-019")
             .expect("internal wait catalog entry");
         let requirements: Vec<_> = wait
-            .missing()
+            .requirements()
             .iter()
             .map(|capability| capability.as_str())
             .collect();
@@ -1040,7 +1040,7 @@ mod tests {
             .expect("xmin horizon catalog entry");
         assert!(
             horizon
-                .missing()
+                .requirements()
                 .iter()
                 .any(|capability| capability.as_str() == "cross_section_entity_join")
         );
@@ -1086,7 +1086,7 @@ mod tests {
 
     #[test]
     fn event_evidence_targets_existing_metric_lenses() {
-        let metric_ids: BTreeSet<_> = core_catalog().iter().map(DormantLens::lens_id).collect();
+        let metric_ids: BTreeSet<_> = core_catalog().iter().map(LensMetadata::lens_id).collect();
         let mut split_facts = BTreeSet::new();
         for candidate in EVENT_CANDIDATES {
             match candidate.disposition {

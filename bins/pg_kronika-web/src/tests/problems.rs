@@ -616,6 +616,12 @@ fn assert_params_schemas(document: &serde_json::Value) {
 }
 
 fn assert_changed_success_schemas(document: &serde_json::Value) {
+    assert_changed_schemas_are_closed(document);
+    assert_incident_catalog_schema(document);
+    assert_changed_schema_details(document);
+}
+
+fn assert_changed_schemas_are_closed(document: &serde_json::Value) {
     for schema in [
         "Sections",
         "SectionCatalogEntry",
@@ -658,8 +664,14 @@ fn assert_changed_success_schemas(document: &serde_json::Value) {
         "SectionReason",
         "IncidentResponse",
         "IncidentCatalog",
+        "IncidentCatalogCounts",
+        "IncidentEvaluator",
+        "ActiveIncidentLens",
+        "IncidentRequirement",
+        "IncidentRequirementIdentity",
+        "IncidentRequirementCondition",
         "LensCapability",
-        "DormantLens",
+        "InactiveIncidentLens",
         "IncidentLog",
         "EventCatalogEntry",
         "IncidentSkipped",
@@ -671,7 +683,17 @@ fn assert_changed_success_schemas(document: &serde_json::Value) {
             "{schema} must reject undeclared presentation fields"
         );
     }
-    for schema in ["DormantLens", "EventCatalogEntry"] {
+}
+
+fn assert_incident_catalog_schema(document: &serde_json::Value) {
+    for schema in [
+        "ActiveIncidentLens",
+        "IncidentRequirement",
+        "IncidentRequirementIdentity",
+        "IncidentRequirementCondition",
+        "InactiveIncidentLens",
+        "EventCatalogEntry",
+    ] {
         let properties = document["components"]["schemas"][schema]["properties"]
             .as_object()
             .expect("catalog properties");
@@ -679,6 +701,65 @@ fn assert_changed_success_schemas(document: &serde_json::Value) {
             assert!(!properties.contains_key(forbidden), "{schema}.{forbidden}");
         }
     }
+    let incident_counts = &document["components"]["schemas"]["IncidentCatalogCounts"]["properties"];
+    for (field, expected) in [
+        ("core_lenses", 28),
+        ("event_branches", 14),
+        ("evaluator_branches", 42),
+        ("unique_lens_ids", 40),
+        ("active_lens_ids", 40),
+        ("inactive_lens_ids", 0),
+        ("entity_join_requirements", 24),
+    ] {
+        assert_eq!(incident_counts[field]["const"], expected, "{field}");
+    }
+    assert_eq!(
+        document["components"]["schemas"]["IncidentRequirement"]["properties"]["requirement_id"]
+            ["enum"]
+            .as_array()
+            .map(Vec::len),
+        Some(24)
+    );
+    assert_eq!(
+        document["components"]["schemas"]["IncidentRequirement"]["properties"]["contract"]["enum"]
+            .as_array()
+            .map(Vec::len),
+        Some(24)
+    );
+    let incident_log = &document["components"]["schemas"]["IncidentLog"]["properties"];
+    assert_eq!(incident_log["catalog"]["minItems"], 14);
+    assert_eq!(incident_log["catalog"]["maxItems"], 14);
+    assert_eq!(
+        incident_log["coverage"]["additionalProperties"]["enum"],
+        serde_json::json!(["unknown", "gap", "not_collected"])
+    );
+    let condition_kinds = document["components"]["schemas"]["IncidentRequirement"]["properties"]
+        ["conditions"]["allOf"]
+        .as_array()
+        .expect("closed condition-kind triple");
+    assert_eq!(condition_kinds.len(), 3);
+    for condition in condition_kinds {
+        assert_eq!(condition["minContains"], 1);
+        assert_eq!(condition["maxContains"], 1);
+    }
+    let openapi_requirement_ids: std::collections::BTreeSet<_> = document["components"]["schemas"]
+        ["IncidentRequirement"]["properties"]["requirement_id"]["enum"]
+        .as_array()
+        .expect("requirement id enum")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let mut executable_requirement_ids = std::collections::BTreeSet::new();
+    for lens in crate::incident::core_catalog() {
+        if let Some(contract) = lens.entity_join_contract() {
+            executable_requirement_ids.insert(format!("entity_join.{}", contract.as_str()));
+        }
+    }
+    assert_eq!(openapi_requirement_ids, executable_requirement_ids);
+}
+
+fn assert_changed_schema_details(document: &serde_json::Value) {
     assert_eq!(
         document["components"]["schemas"]["DiffNoDataPoint"]["properties"]["nodata"]["enum"],
         serde_json::json!(["reset", "gap", "first_point", "anomaly", "not_collected"])

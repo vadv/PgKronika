@@ -420,8 +420,8 @@ impl Lens for BlockDeviceLens {
         let Some((major, minor)) = Self::device_pair(&identity) else {
             return Ok(());
         };
-        let mapping = if typed.is_postgres_storage_device(major, minor) {
-            "postgres_storage_exact"
+        let mapping = if typed.has_postgres_storage_device_candidate(major, minor) {
+            "postgres_storage_candidate_unproven"
         } else {
             "postgres_storage_unproven"
         };
@@ -476,7 +476,7 @@ struct ProcessIoCandidate {
     intervals: usize,
     observed_at_us: i64,
     source_window: SourceWindow,
-    postgres_backend: bool,
+    postgres_backend_candidate: bool,
     device: Option<(u64, u64)>,
 }
 
@@ -598,7 +598,7 @@ impl ProcessIoWhoLens {
             intervals: sums.intervals,
             observed_at_us,
             source_window: sums.source_window,
-            postgres_backend: typed.process_is_postgres_backend(
+            postgres_backend_candidate: typed.process_matches_postgres_backend_candidate(
                 pid,
                 starttime,
                 context.incident_start_us,
@@ -668,10 +668,12 @@ impl Lens for ProcessIoWhoLens {
             let Some((pid, starttime)) = Self::process_identity(&candidate.identity) else {
                 continue;
             };
-            let category = if candidate.postgres_backend {
-                "postgres_backend"
+            let category = if candidate.postgres_backend_candidate && candidate.device.is_some() {
+                "postgres_backend_cgroup_device_candidates_unproven"
+            } else if candidate.postgres_backend_candidate {
+                "postgres_backend_candidate_unproven"
             } else if candidate.device.is_some() {
-                "cgroup_device_association"
+                "cgroup_device_candidate_unproven"
             } else {
                 "process_association"
             };
@@ -853,7 +855,7 @@ mod tests {
         };
         assert_eq!(
             first.entity().identity()[0],
-            IdentityValue::Text("postgres_storage_exact".to_owned())
+            IdentityValue::Text("postgres_storage_candidate_unproven".to_owned())
         );
         assert_eq!(first.unit(), GaugeUnit::MillisecondsPerOperation);
         let Evidence::GaugeObservation(second) = &detected.incidents[0].findings[0].evidence()[1]
@@ -934,5 +936,74 @@ mod tests {
             &typed,
         );
         assert!(reset.incidents[0].findings.is_empty());
+    }
+
+    #[test]
+    fn process_io_candidates_do_not_claim_unavailable_relations() {
+        use super::super::typed::{
+            ActivityBackend, ActivitySnapshot, ProcessCgroupSample, SnapshotCompleteness,
+        };
+
+        let process: Arc<[IdentityValue]> =
+            Arc::from(vec![IdentityValue::I64(7), IdentityValue::I64(100)]);
+        let mut typed = TypedInputs::new();
+        for (column, value) in ProcessIoWhoLens::COLUMNS.iter().zip([100.0, 200.0, 0.0]) {
+            typed.insert_counter(
+                OS_PROCESS,
+                column,
+                Arc::clone(&process),
+                vec![(1, point(value)), (2, point(value))],
+            );
+        }
+        typed.insert_activity_snapshot(ActivitySnapshot {
+            ts: 1,
+            backends: vec![ActivityBackend {
+                pid: 7,
+                backend_start: 100,
+                xid_age: None,
+                xmin_age: None,
+                state: None,
+                wait_event_type: None,
+                wait_event: None,
+                xact_age_us: None,
+            }],
+            completeness: SnapshotCompleteness::Complete,
+        });
+        typed.insert_process_cgroups(vec![ProcessCgroupSample {
+            ts: 2,
+            pid: 7,
+            starttime: 100,
+            cgroup_path: "/postgres-candidate".into(),
+        }]);
+        let device: Arc<[IdentityValue]> = Arc::from(vec![
+            IdentityValue::Text("/postgres-candidate".to_owned()),
+            IdentityValue::U64(8),
+            IdentityValue::U64(0),
+        ]);
+        for column in ["rbytes", "wbytes"] {
+            typed.insert_counter(
+                "os_cgroup_io",
+                column,
+                Arc::clone(&device),
+                vec![(2, point(50.0))],
+            );
+        }
+
+        let result = outcome(
+            &ProcessIoWhoLens,
+            episode(OS_PROCESS, "read_bytes", process),
+            &typed,
+        );
+        let Evidence::GaugeObservation(row) = &result.incidents[0].findings[0].evidence()[0] else {
+            panic!("typed observation");
+        };
+        assert_eq!(
+            row.entity().identity()[0],
+            IdentityValue::Text("postgres_backend_cgroup_device_candidates_unproven".to_owned())
+        );
+        assert_eq!(
+            &row.entity().identity()[2..],
+            &[IdentityValue::U64(8), IdentityValue::U64(0)]
+        );
     }
 }

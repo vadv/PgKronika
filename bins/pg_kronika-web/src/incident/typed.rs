@@ -1132,7 +1132,10 @@ impl TypedInputs {
         &self.plans[start..end]
     }
 
-    pub(crate) fn process_is_postgres_backend(
+    /// Whether scalar fields make this OS process a possible `PostgreSQL`
+    /// backend. This is not a cross-domain identity relation: the current
+    /// adapter has no canonical session-to-process bridge or lifetime coverage.
+    pub(crate) fn process_matches_postgres_backend_candidate(
         &self,
         pid: i64,
         starttime: i64,
@@ -1174,7 +1177,10 @@ impl TypedInputs {
         }
     }
 
-    pub(crate) fn is_postgres_storage_device(&self, major: i64, minor: i64) -> bool {
+    /// Whether a request row mentioned this device as a `PostgreSQL` storage
+    /// candidate. The adapter intentionally lacks the lifetime, namespace, and
+    /// coverage needed to prove the storage-to-device mapping.
+    pub(crate) fn has_postgres_storage_device_candidate(&self, major: i64, minor: i64) -> bool {
         self.postgres_storage_devices.contains(&(major, minor))
     }
 
