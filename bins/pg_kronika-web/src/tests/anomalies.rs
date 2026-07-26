@@ -277,6 +277,8 @@ const PLAN_MINUTE_US: i64 = 60 * 1_000_000;
 #[derive(Debug, Clone, Copy)]
 enum OsscPlanFixture {
     DistributionAndBufferShift,
+    PlanSetAddition,
+    EvictionAndReentry,
     StableAcrossReset,
 }
 
@@ -380,8 +382,18 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
         )
     };
 
-    let mut calls = [100_i64, 100];
-    let mut shared_reads = [100_i64, 100];
+    let set_addition = matches!(fixture, OsscPlanFixture::PlanSetAddition);
+    let eviction = matches!(fixture, OsscPlanFixture::EvictionAndReentry);
+    let mut calls = if set_addition {
+        [100_i64, 0]
+    } else {
+        [100, 100]
+    };
+    let mut shared_reads = if set_addition {
+        [100_i64, 0]
+    } else {
+        [100, 100]
+    };
     let mut first_calls = [0_i64, 0];
     let mut plan_rows = Vec::with_capacity(usize::try_from(SNAPSHOTS * 2).expect("fixture rows"));
     let mut coverage_rows =
@@ -390,14 +402,34 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
     for minute in 0..SNAPSHOTS {
         let ts = minute * PLAN_MINUTE_US;
         if minute != 0 {
-            if matches!(fixture, OsscPlanFixture::StableAcrossReset) && minute == RESET_MINUTE {
+            if eviction && minute == 40 {
+                // A full zero-row snapshot below proves that both entries were
+                // absent; no counter delta may bridge it.
+            } else if eviction && minute == 41 {
+                calls = [9, 1];
+                shared_reads = [9, 1];
+                first_calls = [40 * PLAN_MINUTE_US + 1, 40 * PLAN_MINUTE_US + 1];
+            } else if matches!(fixture, OsscPlanFixture::StableAcrossReset)
+                && minute == RESET_MINUTE
+            {
                 calls = [0, 0];
                 shared_reads = [0, 0];
                 first_calls = [ts, ts];
             } else {
-                let shifted = matches!(fixture, OsscPlanFixture::DistributionAndBufferShift)
-                    && (40..=50).contains(&minute);
-                let call_deltas = if shifted { [4, 6] } else { [9, 1] };
+                let shifted = matches!(
+                    fixture,
+                    OsscPlanFixture::DistributionAndBufferShift | OsscPlanFixture::PlanSetAddition
+                ) && (40..=50).contains(&minute);
+                let call_deltas = if shifted {
+                    [4, 6]
+                } else if set_addition && minute < 40 {
+                    [10, 0]
+                } else {
+                    [9, 1]
+                };
+                if set_addition && minute == 40 {
+                    first_calls[1] = (minute - 1) * PLAN_MINUTE_US + 1;
+                }
                 calls[0] += call_deltas[0];
                 calls[1] += call_deltas[1];
                 shared_reads[0] += if shifted {
@@ -408,20 +440,32 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
                 shared_reads[1] += call_deltas[1];
             }
         }
-        plan_rows.push(ossc_plan_row(
-            ts,
-            101,
-            calls[0],
-            shared_reads[0],
-            first_calls[0],
-        ));
-        plan_rows.push(ossc_plan_row(
-            ts,
-            202,
-            calls[1],
-            shared_reads[1],
-            first_calls[1],
-        ));
+        let empty_snapshot = eviction && minute == 40;
+        if !empty_snapshot {
+            plan_rows.push(ossc_plan_row(
+                ts,
+                101,
+                calls[0],
+                shared_reads[0],
+                first_calls[0],
+            ));
+        }
+        if !empty_snapshot && (!set_addition || minute >= 40) {
+            plan_rows.push(ossc_plan_row(
+                ts,
+                202,
+                calls[1],
+                shared_reads[1],
+                first_calls[1],
+            ));
+        }
+        let plans_in_snapshot = if empty_snapshot {
+            0
+        } else if set_addition && minute < 40 {
+            1
+        } else {
+            2
+        };
         coverage_rows.push(SnapshotCoverageV1 {
             ts: Ts(ts),
             source_type_id: 1_003_001,
@@ -429,8 +473,8 @@ fn write_ossc_plan_anomaly_segment(dir: &std::path::Path, fixture: OsscPlanFixtu
             collector_started_at: Ts(0),
             read_state: 0,
             visibility: 0,
-            source_total: 2,
-            collected: 2,
+            source_total: plans_in_snapshot,
+            collected: plans_in_snapshot,
         });
     }
 
@@ -575,6 +619,56 @@ async fn plan_signals_follow_registry_storage_diff_and_http_with_typed_evidence(
     assert_eq!(
         body["plan_analysis"]["pg_store_plans_ossc"]["quality"]["full_snapshots"],
         60
+    );
+}
+
+#[tokio::test]
+async fn plan_distribution_uses_calls_since_first_observation_for_a_new_plan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::PlanSetAddition);
+    let uri = format!(
+        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+    );
+    let (status, body) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let distribution = body["plan_signals"]
+        .as_array()
+        .expect("plan signals")
+        .iter()
+        .find(|signal| signal["signal_id"] == "pg.query.plan_distribution_shift.v1")
+        .expect("plan-set change produces distribution evidence");
+    assert_eq!(
+        distribution["evidence"]["current_newly_observed_planids"],
+        serde_json::json!([202])
+    );
+    assert_eq!(
+        body["plan_analysis"]["pg_store_plans_ossc"]["quality"]["plan_set_additions"],
+        1
+    );
+    assert_eq!(
+        body["plan_analysis"]["pg_store_plans_ossc"]["quality"]["membership_boundaries"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn full_empty_snapshot_breaks_evicted_plan_counters_before_reentry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let to = write_ossc_plan_anomaly_segment(dir.path(), OsscPlanFixture::EvictionAndReentry);
+    let uri = format!(
+        "/v1/anomalies?source=7&from=0&to={to}&window=10m&step=2m&limit=200&section=pg_store_plans_ossc"
+    );
+    let (status, body) = serve(dir.path(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["plan_signals"], serde_json::json!([]));
+    let quality = &body["plan_analysis"]["pg_store_plans_ossc"]["quality"];
+    assert_eq!(quality["plan_set_removals"], 2);
+    assert_eq!(quality["plan_set_additions"], 2);
+    assert!(
+        quality["membership_boundaries"]
+            .as_u64()
+            .expect("membership boundaries")
+            > 0
     );
 }
 

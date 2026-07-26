@@ -925,7 +925,7 @@
       "PlanDistributionEvidence": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["reference_calls", "current_calls", "total_variation", "max_abs_share_delta", "plans_total", "plans_omitted", "plans"],
+        "required": ["reference_calls", "current_calls", "total_variation", "max_abs_share_delta", "plans_total", "plans_omitted", "plans", "reference_only_planids_total", "reference_only_planids_omitted", "reference_only_planids", "current_only_planids_total", "current_only_planids_omitted", "current_only_planids", "reference_newly_observed_planids_total", "reference_newly_observed_planids_omitted", "reference_newly_observed_planids", "current_newly_observed_planids_total", "current_newly_observed_planids_omitted", "current_newly_observed_planids"],
         "properties": {
           "reference_calls": { "type": "integer", "minimum": 0 },
           "current_calls": { "type": "integer", "minimum": 0 },
@@ -933,7 +933,19 @@
           "max_abs_share_delta": { "type": "number", "minimum": 0, "maximum": 1 },
           "plans_total": { "type": "integer", "minimum": 0 },
           "plans_omitted": { "type": "integer", "minimum": 0 },
-          "plans": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/PlanShareEvidence" } }
+          "plans": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/PlanShareEvidence" } },
+          "reference_only_planids_total": { "type": "integer", "minimum": 0 },
+          "reference_only_planids_omitted": { "type": "integer", "minimum": 0 },
+          "reference_only_planids": { "type": "array", "maxItems": 32, "items": { "type": "integer", "format": "int64" } },
+          "current_only_planids_total": { "type": "integer", "minimum": 0 },
+          "current_only_planids_omitted": { "type": "integer", "minimum": 0 },
+          "current_only_planids": { "type": "array", "maxItems": 32, "items": { "type": "integer", "format": "int64" } },
+          "reference_newly_observed_planids_total": { "type": "integer", "minimum": 0 },
+          "reference_newly_observed_planids_omitted": { "type": "integer", "minimum": 0 },
+          "reference_newly_observed_planids": { "type": "array", "maxItems": 32, "items": { "type": "integer", "format": "int64" } },
+          "current_newly_observed_planids_total": { "type": "integer", "minimum": 0 },
+          "current_newly_observed_planids_omitted": { "type": "integer", "minimum": 0 },
+          "current_newly_observed_planids": { "type": "array", "maxItems": 32, "items": { "type": "integer", "format": "int64" } }
         }
       },
       "PlanDistributionSignal": {
@@ -1078,7 +1090,7 @@
       "PlanQuality": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["snapshot_rows", "snapshots_total", "full_snapshots", "truncated_snapshots", "restricted_or_failed_snapshots", "coverage_unknown_snapshots", "collection_coverage_missing", "invalid_rows", "membership_boundaries", "counter_epoch_boundaries", "reset_boundaries", "metadata_unknown_intervals", "extension_version_boundaries", "instance_boundaries", "instance_identity_fallback_intervals", "unsupported_version_intervals", "query_id_disabled_intervals", "invalid_counter_intervals"],
+        "required": ["snapshot_rows", "snapshots_total", "full_snapshots", "truncated_snapshots", "restricted_or_failed_snapshots", "coverage_unknown_snapshots", "collection_coverage_missing", "collection_coverage_conflicts", "invalid_rows", "membership_boundaries", "plan_set_additions", "plan_set_removals", "counter_epoch_boundaries", "reset_boundaries", "support_gap_intervals", "metadata_unknown_intervals", "extension_version_boundaries", "instance_boundaries", "instance_identity_fallback_intervals", "unsupported_version_intervals", "query_id_disabled_intervals", "invalid_counter_intervals"],
         "properties": {
           "snapshot_rows": { "type": "integer", "minimum": 0 },
           "snapshots_total": { "type": "integer", "minimum": 0 },
@@ -1087,10 +1099,14 @@
           "restricted_or_failed_snapshots": { "type": "integer", "minimum": 0 },
           "coverage_unknown_snapshots": { "type": "integer", "minimum": 0 },
           "collection_coverage_missing": { "type": "integer", "minimum": 0 },
+          "collection_coverage_conflicts": { "type": "integer", "minimum": 0 },
           "invalid_rows": { "type": "integer", "minimum": 0 },
           "membership_boundaries": { "type": "integer", "minimum": 0 },
+          "plan_set_additions": { "type": "integer", "minimum": 0 },
+          "plan_set_removals": { "type": "integer", "minimum": 0 },
           "counter_epoch_boundaries": { "type": "integer", "minimum": 0 },
           "reset_boundaries": { "type": "integer", "minimum": 0 },
+          "support_gap_intervals": { "type": "integer", "minimum": 0 },
           "metadata_unknown_intervals": { "type": "integer", "minimum": 0 },
           "extension_version_boundaries": { "type": "integer", "minimum": 0 },
           "instance_boundaries": { "type": "integer", "minimum": 0 },
@@ -1105,7 +1121,7 @@
         "additionalProperties": false,
         "required": ["plan_distribution", "same_plan_buffers"],
         "properties": {
-          "plan_distribution": { "type": "string", "enum": ["exact_queryid_identity", "not_applicable_queryid_not_in_identity"] },
+          "plan_distribution": { "type": "string", "enum": ["exact_queryid_identity", "mixed_compute_query_id", "not_applicable_compute_query_id_disabled", "unknown_compute_query_id_metadata", "not_applicable_queryid_not_in_identity"] },
           "same_plan_buffers": { "type": "string", "const": "calls_normalized_identity" }
         }
       },

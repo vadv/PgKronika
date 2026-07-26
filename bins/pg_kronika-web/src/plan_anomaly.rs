@@ -42,6 +42,27 @@ enum PlanFamily {
     Vadv,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistributionApplicability {
+    ExactQueryIdIdentity,
+    MixedComputeQueryId,
+    ComputeQueryIdDisabled,
+    UnknownMetadata,
+    QueryIdNotInIdentity,
+}
+
+impl DistributionApplicability {
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ExactQueryIdIdentity => "exact_queryid_identity",
+            Self::MixedComputeQueryId => "mixed_compute_query_id",
+            Self::ComputeQueryIdDisabled => "not_applicable_compute_query_id_disabled",
+            Self::UnknownMetadata => "unknown_compute_query_id_metadata",
+            Self::QueryIdNotInIdentity => "not_applicable_queryid_not_in_identity",
+        }
+    }
+}
+
 impl PlanFamily {
     const fn from_section(section: &str) -> Option<Self> {
         match section.as_bytes() {
@@ -157,14 +178,51 @@ struct InstanceContext {
     system_identifier: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CollectionCoverageMarker {
+    total: u64,
+    unknown_total: bool,
+    collected: u64,
+    max_n: u64,
+    order_by: Option<String>,
+    cutoff_value: CollectionCutoff,
+    reason: u64,
+}
+
+impl CollectionCoverageMarker {
+    fn is_valid_plan_top_n(&self) -> bool {
+        self.reason == 0
+            && !self.unknown_total
+            && self.total > self.collected
+            && self.max_n != 0
+            && self.collected <= self.max_n
+            && self.order_by.as_deref() == Some("total_time")
+            && match self.cutoff_value {
+                CollectionCutoff::Finite(_) => self.collected != 0,
+                CollectionCutoff::Null => self.collected == 0,
+                CollectionCutoff::Invalid => false,
+            }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionCutoff {
+    Finite(u64),
+    Null,
+    Invalid,
+}
+
 /// Parsed provenance shared by both plan section scans.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PlanContext {
     coverage: BTreeMap<u32, BTreeMap<i64, SnapshotCoverage>>,
     conflicting_coverage: BTreeSet<(u32, i64)>,
-    top_n_coverage: BTreeSet<(u32, i64)>,
+    collection_coverage: BTreeMap<(u32, i64), CollectionCoverageMarker>,
+    conflicting_collection_coverage: BTreeSet<(u32, i64)>,
     reset: Vec<ResetContext>,
     instance: Vec<InstanceContext>,
+    coverage_gaps: Vec<(i64, i64)>,
+    collection_gaps: Vec<(i64, i64)>,
     reset_gaps: Vec<(i64, i64)>,
     instance_gaps: Vec<(i64, i64)>,
     pages_incomplete: bool,
@@ -182,8 +240,14 @@ impl PlanContext {
             };
             context.pages_incomplete |= page.next_cursor.is_some();
             match name {
-                "snapshot_coverage" => context.parse_snapshot_coverage(page),
-                "collection_coverage" => context.parse_collection_coverage(page),
+                "snapshot_coverage" => {
+                    context.coverage_gaps = gaps(page);
+                    context.parse_snapshot_coverage(page);
+                }
+                "collection_coverage" => {
+                    context.collection_gaps = gaps(page);
+                    context.parse_collection_coverage(page);
+                }
                 "reset_metadata" => {
                     context.reset_gaps = gaps(page);
                     context.parse_reset(page);
@@ -217,15 +281,48 @@ impl PlanContext {
 
     fn parse_collection_coverage(&mut self, page: &SectionPage) {
         for row in &page.rows {
-            let (Some(ts), Some(type_id), Some(reason)) = (
+            let (
+                Some(ts),
+                Some(type_id),
+                Some(total),
+                Some(unknown_total),
+                Some(collected),
+                Some(max_n),
+                Some(reason),
+            ) = (
                 timestamp(row, "ts"),
                 unsigned(row, "source_type_id").and_then(|value| u32::try_from(value).ok()),
+                unsigned(row, "total"),
+                boolean(row, "unknown_total"),
+                unsigned(row, "collected"),
+                unsigned(row, "max_n"),
                 unsigned(row, "reason"),
-            ) else {
+            )
+            else {
                 continue;
             };
-            if reason == 0 {
-                self.top_n_coverage.insert((type_id, ts));
+            let marker = CollectionCoverageMarker {
+                total,
+                unknown_total,
+                collected,
+                max_n,
+                order_by: text(row, "order_by"),
+                cutoff_value: match column(row, "cutoff_value") {
+                    Some(Value::F64(value)) if value.is_finite() => {
+                        CollectionCutoff::Finite(value.to_bits())
+                    }
+                    Some(Value::Null) => CollectionCutoff::Null,
+                    _ => CollectionCutoff::Invalid,
+                },
+                reason,
+            };
+            let key = (type_id, ts);
+            if self
+                .collection_coverage
+                .insert(key, marker.clone())
+                .is_some_and(|previous| previous != marker)
+            {
+                self.conflicting_collection_coverage.insert(key);
             }
         }
     }
@@ -269,10 +366,24 @@ impl PlanContext {
             .flatten()
     }
 
-    fn has_top_n_coverage(&self, family: PlanFamily) -> bool {
-        self.top_n_coverage
-            .iter()
-            .any(|&(type_id, _)| type_id == family.type_id())
+    fn has_top_n_coverage(&self, family: PlanFamily, ts: i64) -> bool {
+        let key = (family.type_id(), ts);
+        !self.conflicting_collection_coverage.contains(&key)
+            && self
+                .collection_coverage
+                .get(&key)
+                .is_some_and(CollectionCoverageMarker::is_valid_plan_top_n)
+    }
+
+    fn support_spans_gap(&self, from: i64, to: i64) -> bool {
+        [
+            &self.coverage_gaps,
+            &self.collection_gaps,
+            &self.reset_gaps,
+            &self.instance_gaps,
+        ]
+        .into_iter()
+        .any(|gaps| spans_gap(from, to, gaps))
     }
 
     fn extension_family_seen(&self, family: PlanFamily) -> bool {
@@ -281,6 +392,38 @@ impl PlanContext {
                 .as_deref()
                 .is_some_and(|version| family.supports_extension_version(version))
         })
+    }
+
+    fn distribution_applicability(&self, family: PlanFamily) -> DistributionApplicability {
+        if !family.supports_query_distribution() {
+            return DistributionApplicability::QueryIdNotInIdentity;
+        }
+        let mut enabled = false;
+        let mut disabled = false;
+        let mut unknown = false;
+        let mut relevant = false;
+        for row in &self.reset {
+            let Some(version) = row.extension_version.as_deref() else {
+                unknown = true;
+                continue;
+            };
+            if !family.supports_extension_version(version) {
+                unknown = true;
+                continue;
+            }
+            relevant = true;
+            match row.compute_query_id.as_deref() {
+                Some(value) if query_id_enabled(value) => enabled = true,
+                Some(_) => disabled = true,
+                None => unknown = true,
+            }
+        }
+        match (relevant, enabled, disabled, unknown) {
+            (true, true, false, false) => DistributionApplicability::ExactQueryIdIdentity,
+            (true, false, true, false) => DistributionApplicability::ComputeQueryIdDisabled,
+            (true, true, true, false) => DistributionApplicability::MixedComputeQueryId,
+            _ => DistributionApplicability::UnknownMetadata,
+        }
     }
 
     fn reset_at(&self, ts: i64) -> Option<&ResetContext> {
@@ -361,6 +504,13 @@ fn text(row: &OutRow, name: &str) -> Option<String> {
     }
 }
 
+fn boolean(row: &OutRow, name: &str) -> Option<bool> {
+    match column(row, name)? {
+        Value::Bool(value) => Some(*value),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct DetectorCounts {
     candidates: u64,
@@ -403,10 +553,14 @@ struct QualityCounts {
     restricted_or_failed_snapshots: u64,
     coverage_unknown_snapshots: u64,
     collection_coverage_missing: u64,
+    collection_coverage_conflicts: u64,
     invalid_rows: u64,
     membership_boundaries: u64,
+    plan_set_additions: u64,
+    plan_set_removals: u64,
     counter_epoch_boundaries: u64,
     reset_boundaries: u64,
+    support_gap_intervals: u64,
     metadata_unknown_intervals: u64,
     extension_version_boundaries: u64,
     instance_boundaries: u64,
@@ -426,10 +580,14 @@ impl QualityCounts {
             "restricted_or_failed_snapshots": self.restricted_or_failed_snapshots,
             "coverage_unknown_snapshots": self.coverage_unknown_snapshots,
             "collection_coverage_missing": self.collection_coverage_missing,
+            "collection_coverage_conflicts": self.collection_coverage_conflicts,
             "invalid_rows": self.invalid_rows,
             "membership_boundaries": self.membership_boundaries,
+            "plan_set_additions": self.plan_set_additions,
+            "plan_set_removals": self.plan_set_removals,
             "counter_epoch_boundaries": self.counter_epoch_boundaries,
             "reset_boundaries": self.reset_boundaries,
+            "support_gap_intervals": self.support_gap_intervals,
             "metadata_unknown_intervals": self.metadata_unknown_intervals,
             "extension_version_boundaries": self.extension_version_boundaries,
             "instance_boundaries": self.instance_boundaries,
@@ -447,6 +605,7 @@ enum ContinuityFailure {
     UnsupportedVersion,
     ExtensionVersion,
     Instance,
+    InstanceIdentityUnavailable,
     Reset,
     QueryIdDisabled,
 }
@@ -485,19 +644,17 @@ fn continuity(
         return Err(ContinuityFailure::ExtensionVersion);
     }
 
-    if require_query_id {
-        let query_id_enabled = |value: Option<&str>| {
-            value.is_some_and(|value| {
-                value.eq_ignore_ascii_case("auto")
-                    || value.eq_ignore_ascii_case("on")
-                    || value.eq_ignore_ascii_case("regress")
-            })
-        };
-        if !query_id_enabled(previous_reset.compute_query_id.as_deref())
-            || !query_id_enabled(current_reset.compute_query_id.as_deref())
-        {
-            return Err(ContinuityFailure::QueryIdDisabled);
-        }
+    if require_query_id
+        && (!previous_reset
+            .compute_query_id
+            .as_deref()
+            .is_some_and(query_id_enabled)
+            || !current_reset
+                .compute_query_id
+                .as_deref()
+                .is_some_and(query_id_enabled))
+    {
+        return Err(ContinuityFailure::QueryIdDisabled);
     }
 
     let reset_marker = match (previous_reset.plan_reset_at, current_reset.plan_reset_at) {
@@ -540,7 +697,7 @@ fn continuity(
         current_instance.system_identifier,
     ) {
         (Some(previous), Some(current)) if previous == current => "pg_system_identifier",
-        (None, None) => "source_node_fallback",
+        (None, None) => return Err(ContinuityFailure::InstanceIdentityUnavailable),
         (Some(_) | None, Some(_)) | (Some(_), None) => {
             return Err(ContinuityFailure::Instance);
         }
@@ -551,12 +708,21 @@ fn continuity(
     })
 }
 
+const fn query_id_enabled(value: &str) -> bool {
+    value.eq_ignore_ascii_case("auto")
+        || value.eq_ignore_ascii_case("on")
+        || value.eq_ignore_ascii_case("regress")
+}
+
 const fn tally_continuity_failure(quality: &mut QualityCounts, failure: ContinuityFailure) {
     match failure {
         ContinuityFailure::MetadataUnknown => quality.metadata_unknown_intervals += 1,
         ContinuityFailure::UnsupportedVersion => quality.unsupported_version_intervals += 1,
         ContinuityFailure::ExtensionVersion => quality.extension_version_boundaries += 1,
         ContinuityFailure::Instance => quality.instance_boundaries += 1,
+        ContinuityFailure::InstanceIdentityUnavailable => {
+            quality.instance_identity_fallback_intervals += 1;
+        }
         ContinuityFailure::Reset => quality.reset_boundaries += 1,
         ContinuityFailure::QueryIdDisabled => quality.query_id_disabled_intervals += 1,
     }
@@ -581,10 +747,28 @@ struct DistributionPeak {
     plans_total: usize,
     plans_omitted: usize,
     plans: Vec<PlanShareEvidence>,
+    reference_only_planids_total: usize,
+    reference_only_planids_omitted: usize,
+    reference_only_planids: Vec<i64>,
+    current_only_planids_total: usize,
+    current_only_planids_omitted: usize,
+    current_only_planids: Vec<i64>,
+    reference_newly_observed_planids_total: usize,
+    reference_newly_observed_planids_omitted: usize,
+    reference_newly_observed_planids: Vec<i64>,
+    current_newly_observed_planids_total: usize,
+    current_newly_observed_planids_omitted: usize,
+    current_newly_observed_planids: Vec<i64>,
 }
 
 impl DistributionPeak {
-    fn from_evidence(evidence: &DistributionEvidence) -> Self {
+    fn from_evidence(
+        evidence: &DistributionEvidence,
+        reference_members: &BTreeSet<i64>,
+        current_members: &BTreeSet<i64>,
+        reference_newly_observed: &BTreeSet<i64>,
+        current_newly_observed: &BTreeSet<i64>,
+    ) -> Self {
         let mut categories = evidence.categories.clone();
         categories.sort_by(|left, right| {
             right
@@ -606,6 +790,20 @@ impl DistributionPeak {
                 share_delta: category.share_delta,
             })
             .collect();
+        let (reference_only_planids_total, reference_only_planids_omitted, reference_only_planids) =
+            bounded_planids(reference_members.difference(current_members).copied());
+        let (current_only_planids_total, current_only_planids_omitted, current_only_planids) =
+            bounded_planids(current_members.difference(reference_members).copied());
+        let (
+            reference_newly_observed_planids_total,
+            reference_newly_observed_planids_omitted,
+            reference_newly_observed_planids,
+        ) = bounded_planids(reference_newly_observed.iter().copied());
+        let (
+            current_newly_observed_planids_total,
+            current_newly_observed_planids_omitted,
+            current_newly_observed_planids,
+        ) = bounded_planids(current_newly_observed.iter().copied());
         Self {
             reference_calls: evidence.reference_total,
             current_calls: evidence.current_total,
@@ -614,8 +812,36 @@ impl DistributionPeak {
             plans_total,
             plans_omitted: plans_total.saturating_sub(MAX_PLAN_SHARE_EVIDENCE),
             plans,
+            reference_only_planids_total,
+            reference_only_planids_omitted,
+            reference_only_planids,
+            current_only_planids_total,
+            current_only_planids_omitted,
+            current_only_planids,
+            reference_newly_observed_planids_total,
+            reference_newly_observed_planids_omitted,
+            reference_newly_observed_planids,
+            current_newly_observed_planids_total,
+            current_newly_observed_planids_omitted,
+            current_newly_observed_planids,
         }
     }
+}
+
+fn bounded_planids(planids: impl Iterator<Item = i64>) -> (usize, usize, Vec<i64>) {
+    let mut total = 0_usize;
+    let mut retained = Vec::new();
+    for planid in planids {
+        total = total.saturating_add(1);
+        if retained.len() < MAX_PLAN_SHARE_EVIDENCE {
+            retained.push(planid);
+        }
+    }
+    (
+        total,
+        total.saturating_sub(MAX_PLAN_SHARE_EVIDENCE),
+        retained,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -762,6 +988,18 @@ fn distribution_to_json(hit: &DistributionHit, scan: &ScanParams) -> JsonValue {
             "plans_total": hit.evidence.plans_total,
             "plans_omitted": hit.evidence.plans_omitted,
             "plans": plans,
+            "reference_only_planids_total": hit.evidence.reference_only_planids_total,
+            "reference_only_planids_omitted": hit.evidence.reference_only_planids_omitted,
+            "reference_only_planids": hit.evidence.reference_only_planids,
+            "current_only_planids_total": hit.evidence.current_only_planids_total,
+            "current_only_planids_omitted": hit.evidence.current_only_planids_omitted,
+            "current_only_planids": hit.evidence.current_only_planids,
+            "reference_newly_observed_planids_total": hit.evidence.reference_newly_observed_planids_total,
+            "reference_newly_observed_planids_omitted": hit.evidence.reference_newly_observed_planids_omitted,
+            "reference_newly_observed_planids": hit.evidence.reference_newly_observed_planids,
+            "current_newly_observed_planids_total": hit.evidence.current_newly_observed_planids_total,
+            "current_newly_observed_planids_omitted": hit.evidence.current_newly_observed_planids_omitted,
+            "current_newly_observed_planids": hit.evidence.current_newly_observed_planids,
         },
         "interpretation": "observed_distribution_change",
     })
@@ -834,6 +1072,7 @@ fn buffer_to_json(hit: &BufferHit, scan: &ScanParams) -> JsonValue {
 #[derive(Debug, Clone)]
 pub(crate) struct PlanScan {
     family: PlanFamily,
+    distribution_applicability: DistributionApplicability,
     source_present: bool,
     complete: bool,
     work: usize,
@@ -883,11 +1122,7 @@ impl PlanScan {
             "status": status,
             "complete": self.complete,
             "applicability": {
-                "plan_distribution": if self.family.supports_query_distribution() {
-                    "exact_queryid_identity"
-                } else {
-                    "not_applicable_queryid_not_in_identity"
-                },
+                "plan_distribution": self.distribution_applicability.wire_name(),
                 "same_plan_buffers": "calls_normalized_identity",
             },
             "quality": self.quality.to_json(),
@@ -1004,6 +1239,8 @@ struct PlanTimeline {
 struct DistributionPoint {
     ts: i64,
     counts: Vec<CategoryCount>,
+    members: Vec<i64>,
+    newly_observed_members: Vec<i64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1015,6 +1252,7 @@ struct QueryTimeline {
 #[derive(Debug, Clone, Copy)]
 struct RawPlanRow {
     first_call: i64,
+    calls: u64,
 }
 
 type Snapshots = BTreeMap<i64, BTreeMap<PlanIdentity, RawPlanRow>>;
@@ -1051,11 +1289,13 @@ fn scan_plan_family(
     max_work: usize,
     signal_limit: usize,
 ) -> PlanScan {
+    let distribution_applicability = context.distribution_applicability(family);
     let mut quality = QualityCounts {
         snapshot_rows: u64::try_from(page.rows.len()).unwrap_or(u64::MAX),
         ..QualityCounts::default()
     };
     let snapshots = parse_plan_rows(family, &page.rows, &mut quality);
+    let plan_gaps = gaps(page);
     tally_snapshot_coverage(family, &snapshots, context, &mut quality);
     let source_present = !snapshots.is_empty()
         || context
@@ -1073,9 +1313,16 @@ fn scan_plan_family(
         quality.coverage_unknown_snapshots += 1;
     }
     let (plan_timelines, calls) =
-        build_plan_timelines(family, diffs, &snapshots, context, &mut quality);
+        build_plan_timelines(family, diffs, &snapshots, &plan_gaps, context, &mut quality);
     let query_timelines = if family.supports_query_distribution() {
-        build_query_timelines(family, &snapshots, &calls, context, &mut quality)
+        build_query_timelines(
+            family,
+            &snapshots,
+            &calls,
+            &plan_gaps,
+            context,
+            &mut quality,
+        )
     } else {
         BTreeMap::new()
     };
@@ -1083,6 +1330,7 @@ fn scan_plan_family(
     let work_required = required_plan_work(&plan_timelines, &query_timelines, scan_positions.len());
     let mut result = PlanScan {
         family,
+        distribution_applicability,
         source_present,
         complete: false,
         work: 0,
@@ -1102,7 +1350,12 @@ fn scan_plan_family(
         return result;
     }
 
-    if family.supports_query_distribution() {
+    if matches!(
+        distribution_applicability,
+        DistributionApplicability::ExactQueryIdIdentity
+            | DistributionApplicability::MixedComputeQueryId
+            | DistributionApplicability::UnknownMetadata
+    ) {
         scan_distributions(
             &query_timelines,
             &scan_positions,
@@ -1123,10 +1376,13 @@ fn scan_plan_family(
     );
     result.work = work_required;
     result.complete = !context.pages_incomplete
+        && distribution_applicability != DistributionApplicability::UnknownMetadata
         && result.quality.coverage_unknown_snapshots == 0
         && result.quality.truncated_snapshots == 0
         && result.quality.restricted_or_failed_snapshots == 0
         && result.quality.collection_coverage_missing == 0
+        && result.quality.collection_coverage_conflicts == 0
+        && result.quality.support_gap_intervals == 0
         && result.quality.metadata_unknown_intervals == 0
         && result.quality.instance_identity_fallback_intervals == 0
         && result.signals_truncated == 0;
@@ -1148,9 +1404,13 @@ fn parse_plan_rows(family: PlanFamily, rows: &[OutRow], quality: &mut QualityCou
             quality.invalid_rows += 1;
             continue;
         };
+        let Some(calls) = unsigned(row, "calls") else {
+            quality.invalid_rows += 1;
+            continue;
+        };
         let snapshot = snapshots.entry(ts).or_default();
         if snapshot
-            .insert(identity, RawPlanRow { first_call })
+            .insert(identity, RawPlanRow { first_call, calls })
             .is_some()
         {
             quality.invalid_rows += 1;
@@ -1220,7 +1480,13 @@ fn tally_snapshot_coverage(
             Some(coverage) if coverage.is_full() => quality.full_snapshots += 1,
             Some(coverage) if coverage.is_truncated() => {
                 quality.truncated_snapshots += 1;
-                if !context.has_top_n_coverage(family) {
+                if context
+                    .conflicting_collection_coverage
+                    .contains(&(family.type_id(), ts))
+                {
+                    quality.collection_coverage_conflicts += 1;
+                }
+                if !context.has_top_n_coverage(family, ts) {
                     quality.collection_coverage_missing += 1;
                 }
             }
@@ -1234,6 +1500,7 @@ fn build_plan_timelines(
     family: PlanFamily,
     diffs: &[SeriesDiff],
     snapshots: &Snapshots,
+    plan_gaps: &[(i64, i64)],
     context: &PlanContext,
     quality: &mut QualityCounts,
 ) -> (
@@ -1268,6 +1535,7 @@ fn build_plan_timelines(
                 previous_ts,
                 current_ts,
                 snapshots,
+                plan_gaps,
                 context,
                 quality,
             );
@@ -1320,12 +1588,17 @@ fn build_plan_timelines(
     (timelines, calls_by_identity_ts)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "counter continuity combines one plan identity, adjacent rows, source gaps, and shared provenance"
+)]
 fn validate_plan_interval(
     family: PlanFamily,
     identity: PlanIdentity,
     previous_ts: i64,
     current_ts: i64,
     snapshots: &Snapshots,
+    plan_gaps: &[(i64, i64)],
     context: &PlanContext,
     quality: &mut QualityCounts,
 ) -> Option<Continuity> {
@@ -1333,10 +1606,16 @@ fn validate_plan_interval(
         quality.invalid_counter_intervals += 1;
         return None;
     }
+    if spans_gap(previous_ts, current_ts, plan_gaps)
+        || context.support_spans_gap(previous_ts, current_ts)
+    {
+        quality.support_gap_intervals += 1;
+        return None;
+    }
     let previous_coverage = context.coverage_at(family, previous_ts);
     let current_coverage = context.coverage_at(family, current_ts);
-    if !previous_coverage.is_some_and(SnapshotCoverage::is_retained_row_usable)
-        || !current_coverage.is_some_and(SnapshotCoverage::is_retained_row_usable)
+    if !snapshot_retained_rows_usable(context, family, previous_ts, previous_coverage)
+        || !snapshot_retained_rows_usable(context, family, current_ts, current_coverage)
     {
         quality.metadata_unknown_intervals += 1;
         return None;
@@ -1375,7 +1654,7 @@ fn validate_plan_interval(
                 coverage
                     .range((Excluded(previous_ts), Excluded(current_ts)))
                     .any(|(ts, coverage)| {
-                        !coverage.is_retained_row_usable()
+                        !snapshot_retained_rows_usable(context, family, *ts, Some(*coverage))
                             || snapshots
                                 .get(ts)
                                 .is_none_or(|rows| !rows.contains_key(&identity))
@@ -1386,16 +1665,26 @@ fn validate_plan_interval(
         return None;
     }
 
-    if continuity.instance_identity == "source_node_fallback" {
-        quality.instance_identity_fallback_intervals += 1;
-    }
     Some(continuity)
+}
+
+fn snapshot_retained_rows_usable(
+    context: &PlanContext,
+    family: PlanFamily,
+    ts: i64,
+    coverage: Option<SnapshotCoverage>,
+) -> bool {
+    coverage.is_some_and(|coverage| {
+        coverage.is_retained_row_usable()
+            && (!coverage.is_truncated() || context.has_top_n_coverage(family, ts))
+    })
 }
 
 fn build_query_timelines(
     family: PlanFamily,
     snapshots: &Snapshots,
     calls: &BTreeMap<(PlanIdentity, i64), CounterDelta>,
+    plan_gaps: &[(i64, i64)],
     context: &PlanContext,
     quality: &mut QualityCounts,
 ) -> BTreeMap<QueryIdentity, QueryTimeline> {
@@ -1404,13 +1693,14 @@ fn build_query_timelines(
     };
     let times: Vec<i64> = coverage.keys().copied().collect();
     let mut timelines = BTreeMap::<QueryIdentity, QueryTimeline>::new();
+    let empty_snapshot = BTreeMap::new();
     for pair in times.windows(2) {
         let previous_ts = pair[0];
         let current_ts = pair[1];
-        let previous_rows = snapshots.get(&previous_ts);
-        let current_rows = snapshots.get(&current_ts);
+        let previous_rows = snapshots.get(&previous_ts).unwrap_or(&empty_snapshot);
+        let current_rows = snapshots.get(&current_ts).unwrap_or(&empty_snapshot);
         let mut queries = BTreeSet::new();
-        for rows in [previous_rows, current_rows].into_iter().flatten() {
+        for rows in [previous_rows, current_rows] {
             queries.extend(rows.keys().filter_map(|identity| identity.query()));
         }
         for query in queries {
@@ -1423,6 +1713,7 @@ fn build_query_timelines(
                 previous_rows,
                 current_rows,
                 calls,
+                plan_gaps,
                 context,
                 quality,
             );
@@ -1448,14 +1739,22 @@ fn distribution_point(
     query: QueryIdentity,
     previous_ts: i64,
     current_ts: i64,
-    previous_rows: Option<&BTreeMap<PlanIdentity, RawPlanRow>>,
-    current_rows: Option<&BTreeMap<PlanIdentity, RawPlanRow>>,
+    previous_rows: &BTreeMap<PlanIdentity, RawPlanRow>,
+    current_rows: &BTreeMap<PlanIdentity, RawPlanRow>,
     calls: &BTreeMap<(PlanIdentity, i64), CounterDelta>,
+    plan_gaps: &[(i64, i64)],
     context: &PlanContext,
     quality: &mut QualityCounts,
 ) -> Option<DistributionPoint> {
     if query.queryid == 0 {
         quality.query_id_disabled_intervals += 1;
+        return None;
+    }
+    if current_ts <= previous_ts
+        || spans_gap(previous_ts, current_ts, plan_gaps)
+        || context.support_spans_gap(previous_ts, current_ts)
+    {
+        quality.support_gap_intervals += 1;
         return None;
     }
     let previous_coverage = context.coverage_at(family, previous_ts);
@@ -1466,38 +1765,68 @@ fn distribution_point(
         return None;
     }
     match continuity(context, family, previous_ts, current_ts, true) {
-        Ok(continuity) => {
-            if continuity.instance_identity == "source_node_fallback" {
-                quality.instance_identity_fallback_intervals += 1;
-            }
-        }
+        Ok(_) => {}
         Err(failure) => {
             tally_continuity_failure(quality, failure);
             return None;
         }
     }
 
-    let previous_members = query_members(previous_rows?, query);
-    let current_members = query_members(current_rows?, query);
-    if previous_members.is_empty() || previous_members != current_members {
+    let previous_members = query_members(previous_rows, query);
+    let current_members = query_members(current_rows, query);
+    let removed: Vec<_> = previous_members
+        .difference(&current_members)
+        .copied()
+        .collect();
+    quality.plan_set_removals = quality
+        .plan_set_removals
+        .saturating_add(u64::try_from(removed.len()).unwrap_or(u64::MAX));
+    if !removed.is_empty() || current_members.is_empty() {
         quality.membership_boundaries += 1;
         return None;
     }
+    let additions: BTreeSet<_> = current_members
+        .difference(&previous_members)
+        .copied()
+        .collect();
+    quality.plan_set_additions = quality
+        .plan_set_additions
+        .saturating_add(u64::try_from(additions.len()).unwrap_or(u64::MAX));
     let mut counts = Vec::with_capacity(current_members.len());
-    for identity in current_members {
-        let CounterDelta::Value(count) = calls
-            .get(&(identity, current_ts))
-            .copied()
-            .unwrap_or(CounterDelta::Invalid)
-        else {
-            quality.invalid_counter_intervals += 1;
-            return None;
+    let mut members = Vec::with_capacity(current_members.len());
+    for identity in &current_members {
+        let count = if additions.contains(identity) {
+            let Some(row) = current_rows.get(identity) else {
+                quality.invalid_rows += 1;
+                return None;
+            };
+            if row.first_call < previous_ts || row.first_call > current_ts {
+                quality.counter_epoch_boundaries += 1;
+                return None;
+            }
+            row.calls
+        } else {
+            let CounterDelta::Value(count) = calls
+                .get(&(*identity, current_ts))
+                .copied()
+                .unwrap_or(CounterDelta::Invalid)
+            else {
+                quality.invalid_counter_intervals += 1;
+                return None;
+            };
+            count
         };
         counts.push(CategoryCount::new(identity.planid, count));
+        members.push(identity.planid);
     }
     Some(DistributionPoint {
         ts: current_ts,
         counts,
+        members,
+        newly_observed_members: additions
+            .into_iter()
+            .map(|identity| identity.planid)
+            .collect(),
     })
 }
 
@@ -1546,6 +1875,21 @@ struct OpenDistribution {
     evidence: DistributionPeak,
 }
 
+#[derive(Debug, Default)]
+struct DistributionWindow {
+    counts: Vec<CategoryCount>,
+    members: BTreeSet<i64>,
+    newly_observed: BTreeSet<i64>,
+}
+
+impl DistributionWindow {
+    fn clear(&mut self) {
+        self.counts.clear();
+        self.members.clear();
+        self.newly_observed.clear();
+    }
+}
+
 fn scan_distributions(
     timelines: &BTreeMap<QueryIdentity, QueryTimeline>,
     scan_positions: &[i64],
@@ -1554,8 +1898,8 @@ fn scan_distributions(
     result: &mut PlanScan,
 ) {
     let params = DistributionParams::default();
-    let mut reference = Vec::new();
-    let mut current = Vec::new();
+    let mut reference = DistributionWindow::default();
+    let mut current = DistributionWindow::default();
     result.distribution.candidates = u64::try_from(timelines.len()).unwrap_or(u64::MAX);
     for (&query, timeline) in timelines {
         let mut open: Option<OpenDistribution> = None;
@@ -1576,7 +1920,11 @@ fn scan_distributions(
                     &mut reference,
                     &mut current,
                 );
-                Some(compare_distributions(&reference, &current, &params))
+                Some(compare_distributions(
+                    &reference.counts,
+                    &current.counts,
+                    &params,
+                ))
             };
             match outcome {
                 Some(DistributionOutcome::Shift(evidence)) => {
@@ -1589,7 +1937,13 @@ fn scan_distributions(
                             if severity > hit.severity {
                                 hit.peak_ts = position;
                                 hit.severity = severity;
-                                hit.evidence = DistributionPeak::from_evidence(&evidence);
+                                hit.evidence = DistributionPeak::from_evidence(
+                                    &evidence,
+                                    &reference.members,
+                                    &current.members,
+                                    &reference.newly_observed,
+                                    &current.newly_observed,
+                                );
                             }
                         }
                         None => {
@@ -1598,7 +1952,13 @@ fn scan_distributions(
                                 end: position,
                                 peak_ts: position,
                                 severity,
-                                evidence: DistributionPeak::from_evidence(&evidence),
+                                evidence: DistributionPeak::from_evidence(
+                                    &evidence,
+                                    &reference.members,
+                                    &current.members,
+                                    &reference.newly_observed,
+                                    &current.newly_observed,
+                                ),
                             });
                         }
                     }
@@ -1623,8 +1983,8 @@ fn fill_distribution_windows(
     timeline: &QueryTimeline,
     position: i64,
     window: i64,
-    reference: &mut Vec<CategoryCount>,
-    current: &mut Vec<CategoryCount>,
+    reference: &mut DistributionWindow,
+    current: &mut DistributionWindow,
 ) {
     reference.clear();
     current.clear();
@@ -1635,9 +1995,17 @@ fn fill_distribution_windows(
             continue;
         }
         if point.ts >= window_start && point.ts <= position {
-            current.extend_from_slice(&point.counts);
+            current.counts.extend_from_slice(&point.counts);
+            current.members.extend(point.members.iter().copied());
+            current
+                .newly_observed
+                .extend(point.newly_observed_members.iter().copied());
         } else {
-            reference.extend_from_slice(&point.counts);
+            reference.counts.extend_from_slice(&point.counts);
+            reference.members.extend(point.members.iter().copied());
+            reference
+                .newly_observed
+                .extend(point.newly_observed_members.iter().copied());
         }
     }
 }
@@ -1922,4 +2290,299 @@ fn segment_bounds(breaks: &[i64], position: i64) -> (i64, i64) {
         .unwrap_or(i64::MIN);
     let finish = breaks.get(end).copied().unwrap_or(i64::MAX);
     (start, finish)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn full_coverage() -> SnapshotCoverage {
+        SnapshotCoverage {
+            read_state: 0,
+            visibility: 0,
+            source_total: 2,
+            collected: 2,
+        }
+    }
+
+    fn plan(planid: i64) -> PlanIdentity {
+        PlanIdentity {
+            dbid: 5,
+            userid: 10,
+            queryid: Some(7_777),
+            planid,
+        }
+    }
+
+    fn query() -> QueryIdentity {
+        QueryIdentity {
+            dbid: 5,
+            userid: 10,
+            queryid: 7_777,
+        }
+    }
+
+    fn complete_context() -> PlanContext {
+        let mut context = PlanContext::default();
+        context.coverage.insert(
+            OSSC_TYPE_ID,
+            [(0, full_coverage()), (10, full_coverage())]
+                .into_iter()
+                .collect(),
+        );
+        context.reset.push(ResetContext {
+            ts: 0,
+            plan_reset_at: Some(1),
+            extension_version: Some("1.10".to_owned()),
+            compute_query_id: Some("auto".to_owned()),
+        });
+        context.instance.push(InstanceContext {
+            ts: 0,
+            node_self_id: Some("node-a".to_owned()),
+            pg_version_num: Some(150_000),
+            system_identifier: Some(99),
+        });
+        context
+    }
+
+    fn snapshot(entries: &[(PlanIdentity, RawPlanRow)]) -> BTreeMap<PlanIdentity, RawPlanRow> {
+        entries.iter().copied().collect()
+    }
+
+    fn collection_row(ts: i64, total: u64) -> OutRow {
+        vec![
+            ("ts".to_owned(), Value::Ts(ts)),
+            (
+                "source_type_id".to_owned(),
+                Value::U64(u64::from(OSSC_TYPE_ID)),
+            ),
+            ("total".to_owned(), Value::U64(total)),
+            ("unknown_total".to_owned(), Value::Bool(false)),
+            ("collected".to_owned(), Value::U64(50)),
+            ("max_n".to_owned(), Value::U64(50)),
+            ("order_by".to_owned(), Value::Str("total_time".to_owned())),
+            ("cutoff_value".to_owned(), Value::F64(1.0)),
+            ("reason".to_owned(), Value::U64(0)),
+        ]
+    }
+
+    #[test]
+    fn top_n_provenance_is_exact_timestamp_and_conflict_safe() {
+        let page = SectionPage {
+            section: "collection_coverage".to_owned(),
+            source_id: 7,
+            rows: vec![
+                collection_row(10, 100),
+                collection_row(20, 100),
+                collection_row(20, 101),
+            ],
+            gaps: Vec::new(),
+            next_cursor: None,
+        };
+        let mut context = PlanContext::default();
+        context.parse_collection_coverage(&page);
+
+        assert!(context.has_top_n_coverage(PlanFamily::Ossc, 10));
+        assert!(!context.has_top_n_coverage(PlanFamily::Ossc, 20));
+        assert!(!context.has_top_n_coverage(PlanFamily::Ossc, 30));
+        assert!(
+            context
+                .conflicting_collection_coverage
+                .contains(&(OSSC_TYPE_ID, 20))
+        );
+    }
+
+    #[test]
+    fn plan_addition_uses_only_raw_calls_proven_inside_the_interval() {
+        let first = plan(101);
+        let added = plan(202);
+        let previous = snapshot(&[(
+            first,
+            RawPlanRow {
+                first_call: 0,
+                calls: 100,
+            },
+        )]);
+        let current = snapshot(&[
+            (
+                first,
+                RawPlanRow {
+                    first_call: 0,
+                    calls: 110,
+                },
+            ),
+            (
+                added,
+                RawPlanRow {
+                    first_call: 5,
+                    calls: 30,
+                },
+            ),
+        ]);
+        let calls = std::iter::once(((first, 10), CounterDelta::Value(10))).collect();
+        let mut quality = QualityCounts::default();
+        let point = distribution_point(
+            PlanFamily::Ossc,
+            query(),
+            0,
+            10,
+            &previous,
+            &current,
+            &calls,
+            &[],
+            &complete_context(),
+            &mut quality,
+        )
+        .expect("new entry is bounded by full adjacent snapshots");
+
+        assert_eq!(
+            point.counts,
+            vec![CategoryCount::new(101, 10), CategoryCount::new(202, 30)]
+        );
+        assert_eq!(point.newly_observed_members, vec![202]);
+        assert_eq!(quality.plan_set_additions, 1);
+        assert_eq!(quality.membership_boundaries, 0);
+    }
+
+    #[test]
+    fn plan_addition_outside_the_interval_is_not_fabricated() {
+        let first = plan(101);
+        let added = plan(202);
+        let previous = snapshot(&[(
+            first,
+            RawPlanRow {
+                first_call: 0,
+                calls: 100,
+            },
+        )]);
+        let current = snapshot(&[
+            (
+                first,
+                RawPlanRow {
+                    first_call: 0,
+                    calls: 110,
+                },
+            ),
+            (
+                added,
+                RawPlanRow {
+                    first_call: -1,
+                    calls: 30,
+                },
+            ),
+        ]);
+        let calls = std::iter::once(((first, 10), CounterDelta::Value(10))).collect();
+        let mut quality = QualityCounts::default();
+
+        assert!(
+            distribution_point(
+                PlanFamily::Ossc,
+                query(),
+                0,
+                10,
+                &previous,
+                &current,
+                &calls,
+                &[],
+                &complete_context(),
+                &mut quality,
+            )
+            .is_none()
+        );
+        assert_eq!(quality.counter_epoch_boundaries, 1);
+    }
+
+    #[test]
+    fn removal_and_support_gap_are_explicit_discontinuities() {
+        let first = plan(101);
+        let removed = plan(202);
+        let previous = snapshot(&[
+            (
+                first,
+                RawPlanRow {
+                    first_call: 0,
+                    calls: 100,
+                },
+            ),
+            (
+                removed,
+                RawPlanRow {
+                    first_call: 0,
+                    calls: 10,
+                },
+            ),
+        ]);
+        let current = snapshot(&[(
+            first,
+            RawPlanRow {
+                first_call: 0,
+                calls: 110,
+            },
+        )]);
+        let calls = std::iter::once(((first, 10), CounterDelta::Value(10))).collect();
+        let mut quality = QualityCounts::default();
+        assert!(
+            distribution_point(
+                PlanFamily::Ossc,
+                query(),
+                0,
+                10,
+                &previous,
+                &current,
+                &calls,
+                &[],
+                &complete_context(),
+                &mut quality,
+            )
+            .is_none()
+        );
+        assert_eq!(quality.plan_set_removals, 1);
+        assert_eq!(quality.membership_boundaries, 1);
+
+        let mut context = complete_context();
+        context.coverage_gaps.push((4, 6));
+        let mut quality = QualityCounts::default();
+        assert!(
+            distribution_point(
+                PlanFamily::Ossc,
+                query(),
+                0,
+                10,
+                &current,
+                &current,
+                &calls,
+                &[],
+                &context,
+                &mut quality,
+            )
+            .is_none()
+        );
+        assert_eq!(quality.support_gap_intervals, 1);
+    }
+
+    #[test]
+    fn query_id_and_instance_applicability_fail_closed() {
+        let mut context = complete_context();
+        context.reset[0].compute_query_id = Some("off".to_owned());
+        assert_eq!(
+            context.distribution_applicability(PlanFamily::Ossc),
+            DistributionApplicability::ComputeQueryIdDisabled
+        );
+        context.reset.push(ResetContext {
+            ts: 5,
+            plan_reset_at: Some(1),
+            extension_version: Some("1.10".to_owned()),
+            compute_query_id: Some("on".to_owned()),
+        });
+        assert_eq!(
+            context.distribution_applicability(PlanFamily::Ossc),
+            DistributionApplicability::MixedComputeQueryId
+        );
+
+        context.instance[0].system_identifier = None;
+        assert_eq!(
+            continuity(&context, PlanFamily::Ossc, 0, 10, false),
+            Err(ContinuityFailure::InstanceIdentityUnavailable)
+        );
+    }
 }
