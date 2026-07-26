@@ -143,6 +143,7 @@ pub(crate) fn read_batch(
     };
     let identity = file_identity(&metadata);
     let file_size = metadata.len();
+    let mut file = File::open(path)?;
     let mut gaps = TailGaps::default();
     let mut skip_until_newline = false;
     let mut cursor = initial_offset(
@@ -178,7 +179,6 @@ pub(crate) fn read_batch(
         &mut gaps,
     );
 
-    let mut file = File::open(path)?;
     let mut verify_sparse_tail = false;
     if let Some(data_offset) = seek_next_data(&file, cursor, file_size)? {
         if data_offset > cursor {

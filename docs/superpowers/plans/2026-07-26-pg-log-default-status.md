@@ -756,6 +756,7 @@ git commit -m "feat(source-log): track PostgreSQL log source status"
 
 **Files:**
 - Modify: `crates/kronika-source-log/src/collector.rs`
+- Modify: `crates/kronika-source-log/src/tailer.rs`
 - Modify: `bins/pg_kronika-collector/src/pg_log_source.rs:139-151`
 - Test: `crates/kronika-source-log/src/collector.rs`
 
@@ -763,7 +764,7 @@ git commit -m "feat(source-log): track PostgreSQL log source status"
 - Consumes: `StatusTracker::new`, `StatusTracker::observe`, `StatusTracker::commit`, `LogSourceStatus`.
 - Produces: `LogCollection::{source_status,previous_source_status,source_status_changed,next_discovery_in}` and a staged update committed by `LogCollector::commit`.
 
-- [ ] **Step 1: Add failing end-to-end state-machine tests**
+- [x] **Step 1: Add failing end-to-end state-machine tests**
 
 Extend the existing collector tests. Use the existing `fixture_config`, add
 `status_interval`, and expose a test-only deterministic
@@ -1018,7 +1019,7 @@ async fn initial_permission_denial_is_status_without_a_gap() {
 Delete the old `disabled_collection_emits_explicit_gap_once` test after the new
 disabled test covers the revised contract.
 
-- [ ] **Step 2: Run the focused tests and confirm semantic failures**
+- [x] **Step 2: Run the focused tests and confirm semantic failures**
 
 Run:
 
@@ -1032,7 +1033,7 @@ cargo +1.96.0 test -p kronika-source-log collector::tests::discovery_deadline --
 Expected: tests fail because current code emits repeated gaps, suppresses the
 discovery deadline without a source, and has no status row.
 
-- [ ] **Step 3: Expand discovery outcomes and cache failures**
+- [x] **Step 3: Expand discovery outcomes and cache failures**
 
 Use this exhaustive discovery enum:
 
@@ -1103,7 +1104,7 @@ Keep the existing `Available`, `UnsupportedFormat` and `Disabled` arms. Task 5
 removes this per-cycle adapter after transition logging is available; this
 intermediate update keeps the Task 4 commit buildable.
 
-- [ ] **Step 4: Stage status and outage state in `LogCollection`**
+- [x] **Step 4: Stage status and outage state in `LogCollection`**
 
 Add these public diagnostic fields and one private pending update:
 
@@ -1161,7 +1162,7 @@ fn stage_status(
 For an explicit path `next_discovery` remains `None`, which is represented as
 zero only by the process-log adapter.
 
-- [ ] **Step 5: Apply read-result precedence**
+- [x] **Step 5: Apply read-result precedence**
 
 Restructure `collect_at` in this order:
 
@@ -1237,8 +1238,10 @@ fn read_error_status(kind: io::ErrorKind) -> (LogSourceState, LogSourceReason) {
 Remove the `missing_files` branch from `gaps_from_tail`; outage tracking now
 owns that gap. Preserve backlog, truncate, invalid UTF-8, binary, sparse,
 rotation, dictionary-full, budget, parser-drop and timestamp-fallback branches.
+Open the source file before the empty-file fast path in `read_batch`; a quiet
+file is `collecting` only when the collector can actually open it.
 
-- [ ] **Step 6: Commit staged tracker state only after output handling**
+- [x] **Step 6: Commit staged tracker state only after output handling**
 
 Remove the existing early return when `next_state` is absent. Persist tail
 state first, then confirm the tracker update:
@@ -1264,7 +1267,7 @@ If state-file persistence fails, the function returns before committing the
 status tracker. If no tail state exists, disabled and unavailable status still
 commit, so the next 5-second cycle does not repeat the row before heartbeat.
 
-- [ ] **Step 7: Run the entire source-log suite**
+- [x] **Step 7: Run the entire source-log suite**
 
 Run:
 
@@ -1277,7 +1280,7 @@ cargo +1.96.0 check -p pg-kronika-collector --target "$HOST"
 Expected: all parser/tailer tests retain their old results; new status tests
 pass; the disabled test no longer expects `GapReason::Disabled`.
 
-- [ ] **Step 8: Commit the collector state machine**
+- [x] **Step 8: Commit the collector state machine**
 
 ```sh
 git add crates/kronika-source-log/src/collector.rs bins/pg_kronika-collector/src/pg_log_source.rs

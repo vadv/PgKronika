@@ -148,8 +148,9 @@ pub(crate) async fn collect_log_batch(
 const fn discovery_status_name(status: LogDiscoveryStatus) -> &'static str {
     match status {
         LogDiscoveryStatus::Available => "available",
+        LogDiscoveryStatus::PostgresUnavailable => "postgres_unavailable",
+        LogDiscoveryStatus::NoCurrentLogfile => "no_current_logfile",
         LogDiscoveryStatus::UnsupportedFormat => "unsupported_format",
-        LogDiscoveryStatus::SourceUnavailable => "source_unavailable",
         LogDiscoveryStatus::QueryFailed => "query_failed",
         LogDiscoveryStatus::Disabled => "disabled",
     }
