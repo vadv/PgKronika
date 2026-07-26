@@ -1248,6 +1248,19 @@ mod tests {
         assert!(bytes.len() <= MAX_CATALOG_JSON_BYTES);
         assert!(catalog.get("log_dormant").is_none());
         assert!(catalog["dormant"].as_array().is_some_and(Vec::is_empty));
+        let registered: BTreeSet<_> = catalog["registered_lens_ids"]
+            .as_array()
+            .expect("registered IDs")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let applied: BTreeSet<_> = catalog["applied"]
+            .as_array()
+            .expect("legacy applied IDs")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(applied, registered);
     }
 
     fn assert_machine_only(value: &Value) {

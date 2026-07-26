@@ -726,6 +726,22 @@ fn assert_incident_catalog_schema(document: &serde_json::Value) {
             .map(Vec::len),
         Some(24)
     );
+    let incident_log = &document["components"]["schemas"]["IncidentLog"]["properties"];
+    assert_eq!(incident_log["catalog"]["minItems"], 14);
+    assert_eq!(incident_log["catalog"]["maxItems"], 14);
+    assert_eq!(
+        incident_log["coverage"]["additionalProperties"]["enum"],
+        serde_json::json!(["unknown", "gap", "not_collected"])
+    );
+    let condition_kinds = document["components"]["schemas"]["IncidentRequirement"]["properties"]
+        ["conditions"]["allOf"]
+        .as_array()
+        .expect("closed condition-kind triple");
+    assert_eq!(condition_kinds.len(), 3);
+    for condition in condition_kinds {
+        assert_eq!(condition["minContains"], 1);
+        assert_eq!(condition["maxContains"], 1);
+    }
     let openapi_requirement_ids: std::collections::BTreeSet<_> = document["components"]["schemas"]
         ["IncidentRequirement"]["properties"]["requirement_id"]["enum"]
         .as_array()

@@ -1310,7 +1310,7 @@
           "counts": { "$ref": "#/components/schemas/IncidentCatalogCounts" },
           "evaluators": { "type": "array", "minItems": 42, "maxItems": 42, "items": { "$ref": "#/components/schemas/IncidentEvaluator" } },
           "lenses": { "type": "array", "minItems": 28, "maxItems": 28, "items": { "$ref": "#/components/schemas/ActiveIncidentLens" } },
-          "applied": { "type": "array", "minItems": 40, "maxItems": 40, "uniqueItems": true, "deprecated": true, "description": "Compatibility alias for registered_lens_ids.", "items": { "$ref": "#/components/schemas/IncidentLensId" } },
+          "applied": { "type": "array", "minItems": 40, "maxItems": 40, "uniqueItems": true, "deprecated": true, "description": "Deprecated compatibility view of the registered ID set. Its order is legacy; registered_lens_ids is canonical.", "items": { "$ref": "#/components/schemas/IncidentLensId" } },
           "active_count": { "type": "integer", "const": 40, "deprecated": true, "description": "Compatibility alias for counts.active_lens_ids." },
           "catalog_count": { "type": "integer", "const": 40, "deprecated": true, "description": "Compatibility alias for counts.unique_lens_ids." },
           "capabilities": { "type": "array", "items": { "$ref": "#/components/schemas/LensCapability" } },
@@ -1382,7 +1382,18 @@
           },
           "activation": { "type": "string", "enum": ["shared_snapshot", "snapshot_relation", "lifetime_mapping"] },
           "status": { "type": "string", "const": "unavailable" },
-          "conditions": { "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true, "items": { "$ref": "#/components/schemas/IncidentRequirementCondition" } }
+          "conditions": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "uniqueItems": true,
+            "items": { "$ref": "#/components/schemas/IncidentRequirementCondition" },
+            "allOf": [
+              { "contains": { "properties": { "kind": { "const": "producer" } }, "required": ["kind"] }, "minContains": 1, "maxContains": 1 },
+              { "contains": { "properties": { "kind": { "const": "provenance" } }, "required": ["kind"] }, "minContains": 1, "maxContains": 1 },
+              { "contains": { "properties": { "kind": { "const": "coverage" } }, "required": ["kind"] }, "minContains": 1, "maxContains": 1 }
+            ]
+          }
         }
       },
       "IncidentRequirementIdentity": {
@@ -1444,9 +1455,9 @@
           "complete": { "type": "boolean" },
           "registered_lens_ids": { "type": "array", "minItems": 14, "maxItems": 14, "uniqueItems": true, "items": { "$ref": "#/components/schemas/IncidentLensId" } },
           "evaluated_lens_ids": { "type": "array", "maxItems": 14, "uniqueItems": true, "items": { "$ref": "#/components/schemas/IncidentLensId" } },
-          "catalog": { "type": "array", "items": { "$ref": "#/components/schemas/EventCatalogEntry" } },
+          "catalog": { "type": "array", "minItems": 14, "maxItems": 14, "items": { "$ref": "#/components/schemas/EventCatalogEntry" } },
           "findings": { "type": "array", "items": { "$ref": "#/components/schemas/NeutralObject" } },
-          "coverage": { "type": "object", "additionalProperties": { "type": "string" } },
+          "coverage": { "type": "object", "additionalProperties": { "type": "string", "enum": ["unknown", "gap", "not_collected"] } },
           "skipped": { "type": "array", "items": { "$ref": "#/components/schemas/EngineSkip" } }
         }
       },
@@ -1456,7 +1467,7 @@
         "required": ["lens_id", "slug", "source_format", "evidence_quality"],
         "properties": {
           "lens_id": { "$ref": "#/components/schemas/IncidentLensId" },
-          "slug": { "type": "string" },
+          "slug": { "type": "string", "pattern": "^[a-z0-9_]+$", "maxLength": 64 },
           "source_format": { "type": "string", "const": "stderr" },
           "evidence_quality": { "type": "string", "const": "heuristic_positive_observation" }
         }

@@ -66,6 +66,19 @@ mod tests {
     }
 
     #[test]
+    fn the_two_shared_ids_are_explicit_and_stable() {
+        let core_ids: BTreeSet<_> = core_catalog().iter().map(LensMetadata::lens_id).collect();
+        let event_ids: BTreeSet<_> = event_catalog_ids().into_iter().collect();
+        assert_eq!(
+            core_ids
+                .intersection(&event_ids)
+                .copied()
+                .collect::<Vec<_>>(),
+            ["OS-FS-027", "PG-CONN-014"]
+        );
+    }
+
+    #[test]
     fn event_metadata_and_evaluator_catalog_stay_aligned() {
         assert_eq!(
             event_catalog_metadata()

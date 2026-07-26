@@ -317,22 +317,26 @@ See the [OpenAPI contract](openapi.json) and the
 - `catalog_available` reports catalog visibility. `diagnosis_available` is
   independent and becomes true only when at least one evaluator runs; no
   finding is required. It stays false for `no_data`, missing node identity,
-  conflicting node identity, absent input branches, and branches rejected
-  before evaluation.
-- Each active core lens publishes only its reconfirmed strict `EntityJoin`
+  conflicting node identity, and any request in which no branch reaches
+  evaluation because its input is absent or admission rejects it.
+- Each active core lens publishes only its declared strict `EntityJoin`
   requirement, if any. The requirement has a locale-neutral machine ID,
   owning lens identity (`domain`, `name`, `value`), contract, activation type,
   and separate producer, provenance, and coverage conditions. All 24 remain
   `unavailable`; the response does not activate or imply an unproved relation.
   The legacy `applied`, `active_count`, `catalog_count`, and `dormant` fields
-  remain compatibility aliases; new clients should use the explicit IDs and
-  `counts`.
+  remain compatibility fields. `applied` contains the same ID set in its
+  legacy order; new clients should use the canonical IDs and `counts`.
 - Cross-section lock evidence requires an explicit producer-stored shared
   observation token and an exact `(snapshot timestamp, PID, backend_start)`
   match. Equal timestamps do not prove the relation. The current activity and
   lock collectors use separate statements, so
   `entity_join.activity_lock_waiter` reports its producer, provenance, and
   coverage conditions as unavailable.
+- Existing OS inputs may still identify bounded candidates, but candidate
+  equality is marked `unproven`. Exact storage-device and
+  process-cgroup-device relation markers remain reserved for a future request
+  that satisfies the published lifetime-mapping conditions.
 - Product-owned incomplete-result explanations use the closed
   `{ "kind": "...", "params": { ... } }` reason schema. Lens ids, enum values,
   formulas, units, and evidence remain stable machine data; incident catalogs
