@@ -95,7 +95,8 @@ every stale identity class, rejection of interrupted temporary publication,
 bounded fallback followed by durable recovery, cancellation recovery,
 process-local cursor expiry, source preservation, and deterministic
 second-owner contention. The artifact validator accepts only the eight exact
-feature/scenario coordinates in the qualification traceability table.
+feature/scenario coordinates in the
+[qualification traceability table](overview-parity-v1-traceability.md).
 
 ## Local candidate
 
