@@ -79,7 +79,7 @@ HOST="$(rustc +1.96.0 -vV | sed -n 's/^host: //p')"
 - Consumes: существующие `Section`, `StrId`, `Ts`, `Semantics::OnChange`.
 - Produces: `kronika_registry::pg_log::PgLogSourceStatusV1` с `CONTRACT.type_id=1_039_001`.
 
-- [ ] **Step 1: Write failing contract and round-trip tests**
+- [x] **Step 1: Write failing contract and round-trip tests**
 
 Добавить в существующий `mod tests`:
 
@@ -137,7 +137,7 @@ fn source_status_roundtrip_preserves_every_state_and_nullable_path() {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm the red state**
+- [x] **Step 2: Run the focused tests and confirm the red state**
 
 Run:
 
@@ -148,7 +148,7 @@ cargo +1.96.0 test -p kronika-registry pg_log::tests::source_status --target "$H
 
 Expected: compilation fails because `PgLogSourceStatusV1` does not exist.
 
-- [ ] **Step 3: Add the exact on-disk row and register it**
+- [x] **Step 3: Add the exact on-disk row and register it**
 
 Add beside the other log-domain rows:
 
@@ -190,7 +190,7 @@ Insert `pg_log::PgLogSourceStatusV1::CONTRACT` in `registry()` after the other
 log contracts and before Linux contracts. Do not renumber or reorder existing
 type ids.
 
-- [ ] **Step 4: Run registry tests and lint**
+- [x] **Step 4: Run registry tests and lint**
 
 Run:
 
@@ -202,7 +202,7 @@ cargo +1.96.0 test -p kronika-registry registry_lints_cleanly --target "$HOST"
 
 Expected: both commands pass; registry lint sees `1_039_001` exactly once.
 
-- [ ] **Step 5: Commit the registry contract**
+- [x] **Step 5: Commit the registry contract**
 
 ```sh
 git add crates/kronika-registry/src/codec/pg_log.rs crates/kronika-registry/src/lib.rs
