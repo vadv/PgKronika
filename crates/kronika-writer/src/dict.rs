@@ -15,7 +15,7 @@ use kronika_registry::{
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 /// Parquet writer properties shared by dictionary sections.
 static DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
@@ -24,6 +24,24 @@ static DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
             ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
         ))
         .set_max_row_group_size(MAX_SECTION_ROWS)
+        .set_created_by(String::new())
+        .build()
+});
+
+/// Final sealed-dictionary properties. Journal windows retain their cheap
+/// append profile; normalization uses this profile exactly once at seal.
+static SEALED_DICT_WRITER_PROPS: LazyLock<WriterProperties> = LazyLock::new(|| {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(kronika_registry::SEALED_ZSTD_LEVEL)
+                .expect("zstd level 6 is valid"),
+        ))
+        .set_max_row_group_size(MAX_SECTION_ROWS)
+        .set_data_page_size_limit(1024 * 1024)
+        .set_data_page_row_count_limit(MAX_SECTION_ROWS)
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_offset_index_disabled(true)
         .set_created_by(String::new())
         .build()
 });
@@ -45,9 +63,31 @@ pub struct DictSection {
 ///
 /// Returns [`CodecError`] when row caps or Parquet encoding fail.
 pub fn encode(window: &SegmentDicts) -> Result<Vec<DictSection>, CodecError> {
+    encode_entries_with_properties(window.entries(), &DICT_WRITER_PROPS)
+}
+
+/// Encode one normalized segment dictionary with the sealed PGM profile.
+#[allow(
+    single_use_lifetimes,
+    reason = "the named lifetime is required in this impl-Trait associated item on Rust 1.96"
+)]
+pub(crate) fn encode_sealed_entries<'a>(
+    entries: impl IntoIterator<Item = EntrySnapshot<'a>>,
+) -> Result<Vec<DictSection>, CodecError> {
+    encode_entries_with_properties(entries, &SEALED_DICT_WRITER_PROPS)
+}
+
+#[allow(
+    single_use_lifetimes,
+    reason = "the named lifetime is required in this impl-Trait associated item on Rust 1.96"
+)]
+fn encode_entries_with_properties<'a>(
+    entries: impl IntoIterator<Item = EntrySnapshot<'a>>,
+    properties: &WriterProperties,
+) -> Result<Vec<DictSection>, CodecError> {
     let mut strings: Vec<EntrySnapshot<'_>> = Vec::new();
     let mut blobs: Vec<EntrySnapshot<'_>> = Vec::new();
-    for entry in window.entries() {
+    for entry in entries {
         match entry.placement {
             Placement::Strings => strings.push(entry),
             Placement::Blobs => blobs.push(entry),
@@ -56,10 +96,10 @@ pub fn encode(window: &SegmentDicts) -> Result<Vec<DictSection>, CodecError> {
 
     let mut sections = Vec::new();
     if !strings.is_empty() {
-        sections.push(encode_strings(&mut strings)?);
+        sections.push(encode_strings(&mut strings, properties)?);
     }
     if !blobs.is_empty() {
-        sections.push(encode_blobs(&mut blobs)?);
+        sections.push(encode_blobs(&mut blobs, properties)?);
     }
     Ok(sections)
 }
@@ -77,7 +117,10 @@ const fn check_dict_rows(rows: usize) -> Result<(), CodecError> {
 }
 
 /// `dict.strings`: `str_id u64, bytes binary`, sorted by `str_id`.
-fn encode_strings(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, CodecError> {
+fn encode_strings(
+    entries: &mut [EntrySnapshot<'_>],
+    properties: &WriterProperties,
+) -> Result<DictSection, CodecError> {
     check_dict_rows(entries.len())?;
     entries.sort_unstable_by_key(|entry| entry.str_id.get());
     let ids = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.str_id.get()));
@@ -87,12 +130,15 @@ fn encode_strings(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, Code
         Field::new("bytes", DataType::Binary, false),
     ]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(bytes)])?;
-    section(DICT_STRINGS_TYPE_ID, &batch)
+    section(DICT_STRINGS_TYPE_ID, &batch, properties)
 }
 
 /// `dict.blobs`: `str_id`, `stored_bytes`, `full_len`, `truncated`, and the
 /// optional `full_sha256` present only for truncated values.
-fn encode_blobs(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, CodecError> {
+fn encode_blobs(
+    entries: &mut [EntrySnapshot<'_>],
+    properties: &WriterProperties,
+) -> Result<DictSection, CodecError> {
     check_dict_rows(entries.len())?;
     entries.sort_unstable_by_key(|entry| entry.str_id.get());
     let ids = UInt64Array::from_iter_values(entries.iter().map(|entry| entry.str_id.get()));
@@ -119,11 +165,15 @@ fn encode_blobs(entries: &mut [EntrySnapshot<'_>]) -> Result<DictSection, CodecE
         Arc::new(sha),
     ];
     let batch = RecordBatch::try_new(schema, columns)?;
-    section(DICT_BLOBS_TYPE_ID, &batch)
+    section(DICT_BLOBS_TYPE_ID, &batch, properties)
 }
 
 /// Write `batch` to a capped zstd Parquet body.
-fn section(type_id: u32, batch: &RecordBatch) -> Result<DictSection, CodecError> {
+fn section(
+    type_id: u32,
+    batch: &RecordBatch,
+    properties: &WriterProperties,
+) -> Result<DictSection, CodecError> {
     if batch.num_rows() > MAX_SECTION_ROWS {
         return Err(CodecError::TooManyRows {
             rows: batch.num_rows(),
@@ -132,7 +182,7 @@ fn section(type_id: u32, batch: &RecordBatch) -> Result<DictSection, CodecError>
     }
 
     let options = ArrowWriterOptions::new()
-        .with_properties(DICT_WRITER_PROPS.clone())
+        .with_properties(properties.clone())
         .with_skip_arrow_metadata(true);
     let mut body = Vec::new();
     let mut writer = ArrowWriter::try_new_with_options(&mut body, batch.schema(), options)?;

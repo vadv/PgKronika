@@ -48,9 +48,10 @@ mod sealed {
 pub use codec::pg_locks::{PgLocksV1, PgLocksV2};
 pub use codec::{
     CodecError, DecodeStats, DecodedSection, ListColumn, MAX_ROW_GROUPS, MAX_SECTION_BYTES,
-    MAX_SECTION_ROWS, VerifiedSection, arrow_schema, nullable_bool, nullable_column, opt_bool,
-    opt_primitive, read_list_i32, required_bool, required_column, write_bool, write_bool_nullable,
-    write_list_i32, write_nullable, write_required,
+    MAX_SECTION_ROWS, SEALED_ZSTD_LEVEL, VerifiedSection, arrow_schema, encode_sealed_batches,
+    nullable_bool, nullable_column, opt_bool, opt_primitive, read_list_i32, required_bool,
+    required_column, write_bool, write_bool_nullable, write_list_i32, write_nullable,
+    write_required,
 };
 // Only the in-crate derive and tests need the shared section-body entry points.
 pub use codec::{
